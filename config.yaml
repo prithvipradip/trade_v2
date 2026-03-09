@@ -1,0 +1,79 @@
+# ============================================================
+# AIT v2 - Autonomous Intelligent Trading Configuration
+# ============================================================
+
+trading:
+  mode: paper                          # paper | live
+  universe: [SPY, QQQ, AAPL, MSFT, NVDA, TSLA, AMD, AMZN, META, GOOGL]
+  scan_interval_seconds: 300           # 5 minutes between scans
+  max_daily_trades: 5
+  trading_hours_only: true             # Only trade during RTH (9:30-16:00 ET)
+
+account:
+  pdt_protection: true                 # Enable Pattern Day Trader guard
+  pdt_account_under_25k: true          # Set false if account >= $25k
+
+positions:
+  max_open_positions: 5
+  max_position_pct: 0.05               # 5% of portfolio per position
+  max_portfolio_delta: 0.30            # Net delta limit (absolute)
+  max_portfolio_risk_pct: 0.02         # 2% max portfolio risk
+
+risk:
+  max_daily_loss_pct: 0.02             # 2% daily loss limit → circuit breaker
+  max_consecutive_losses: 3            # Pause after 3 consecutive losses
+  pause_minutes_after_losses: 30       # Cool-down period
+  max_api_failures: 5                  # Halt after 5 API failures in 10 min
+  min_confidence: 0.65                 # Minimum ML confidence to trade
+
+options:
+  delta_range: [0.20, 0.50]            # Target delta for long options
+  dte_range: [14, 45]                  # Days to expiry range
+  min_open_interest: 100               # Liquidity filter
+  min_volume: 50                       # Daily volume filter
+  max_bid_ask_spread_pct: 0.10         # 10% max spread
+  strategies:
+    - long_call
+    - long_put
+    - covered_call
+    - cash_secured_put
+    - bull_call_spread
+    - bear_put_spread
+    - iron_condor
+    - long_straddle
+    - short_strangle
+
+ml:
+  ensemble_weights:
+    xgboost: 0.5
+    lightgbm: 0.5
+  retrain_interval_days: 7
+  lookback_days: 252                   # 1 year of trading days
+  min_training_samples: 100
+
+sentiment:
+  enabled: true
+  weight: 0.20                         # Sentiment contributes 20% to final signal
+  cache_ttl_seconds: 300               # 5 min cache
+  sources:
+    news: true
+    fear_greed: true
+    finbert: true
+
+notifications:
+  telegram:
+    enabled: true
+    send_trades: true
+    send_errors: true
+    send_daily_summary: true
+    send_circuit_breaker: true
+
+dashboard:
+  enabled: true
+  port: 8501
+
+logging:
+  level: INFO
+  file: logs/ait.log
+  max_bytes: 10485760                  # 10 MB
+  backup_count: 5
