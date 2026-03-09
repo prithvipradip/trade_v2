@@ -36,6 +36,7 @@ class Prediction:
     confidence: float  # 0.0 to 1.0
     probabilities: dict[str, float]  # {bullish: 0.6, bearish: 0.2, neutral: 0.2}
     features_used: int
+    model_version: str = ""
 
 
 class DirectionPredictor:
@@ -51,6 +52,8 @@ class DirectionPredictor:
         self._models: dict[str, object] = {}
         self._trained = False
         self._feature_names: list[str] = []
+        self._model_version: str = ""
+        self._cv_scores: dict[str, float] = {}
 
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -123,6 +126,7 @@ class DirectionPredictor:
             confidence=confidence,
             probabilities=probabilities,
             features_used=len(self._feature_names),
+            model_version=self._model_version,
         )
 
     def train(self, df: pd.DataFrame) -> dict[str, float]:
@@ -174,14 +178,30 @@ class DirectionPredictor:
 
         self._trained = bool(self._models)
         if self._trained:
+            from datetime import datetime
+            self._model_version = f"v-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            self._cv_scores = accuracies
             self._save_models()
-            log.info("ensemble_trained", accuracies=accuracies, features=len(self._feature_names))
+            log.info(
+                "ensemble_trained",
+                version=self._model_version,
+                accuracies=accuracies,
+                features=len(self._feature_names),
+            )
 
         return accuracies
 
-    def load_models(self) -> bool:
-        """Load previously trained models from disk."""
-        model_file = MODEL_DIR / "ensemble.pkl"
+    def load_models(self, version: str | None = None) -> bool:
+        """Load previously trained models from disk.
+
+        Args:
+            version: Specific version to load. None = latest (ensemble.pkl).
+        """
+        if version:
+            model_file = MODEL_DIR / f"ensemble_{version}.pkl"
+        else:
+            model_file = MODEL_DIR / "ensemble.pkl"
+
         if not model_file.exists():
             return False
 
@@ -191,29 +211,85 @@ class DirectionPredictor:
             self._models = data["models"]
             self._scaler = data["scaler"]
             self._feature_names = data["feature_names"]
+            self._model_version = data.get("version", "unknown")
+            self._cv_scores = data.get("cv_scores", {})
             self._trained = True
-            log.info("models_loaded", models=list(self._models.keys()))
+            log.info("models_loaded", version=self._model_version, models=list(self._models.keys()))
             return True
         except Exception as e:
             log.error("model_load_failed", error=str(e))
             return False
 
     def _save_models(self) -> None:
-        """Save trained models to disk."""
+        """Save trained models to disk with versioning."""
+        data = {
+            "models": self._models,
+            "scaler": self._scaler,
+            "feature_names": self._feature_names,
+            "version": self._model_version,
+            "cv_scores": self._cv_scores,
+        }
+
+        # Save as current (ensemble.pkl)
         model_file = MODEL_DIR / "ensemble.pkl"
         try:
             with open(model_file, "wb") as f:
-                pickle.dump(
-                    {
-                        "models": self._models,
-                        "scaler": self._scaler,
-                        "feature_names": self._feature_names,
-                    },
-                    f,
-                )
-            log.info("models_saved", path=str(model_file))
+                pickle.dump(data, f)
         except Exception as e:
             log.error("model_save_failed", error=str(e))
+            return
+
+        # Save versioned copy for rollback
+        if self._model_version:
+            versioned_file = MODEL_DIR / f"ensemble_{self._model_version}.pkl"
+            try:
+                with open(versioned_file, "wb") as f:
+                    pickle.dump(data, f)
+                log.info("models_saved", path=str(versioned_file), version=self._model_version)
+            except Exception as e:
+                log.warning("versioned_save_failed", error=str(e))
+
+            # Prune old versions (keep last 5)
+            self._prune_old_versions(keep=5)
+
+    def _prune_old_versions(self, keep: int = 5) -> None:
+        """Remove old model versions, keeping only the N most recent."""
+        versions = sorted(MODEL_DIR.glob("ensemble_v-*.pkl"))
+        if len(versions) > keep:
+            for old in versions[:-keep]:
+                old.unlink()
+                log.debug("pruned_old_model", path=str(old))
+
+    def rollback(self, version: str) -> bool:
+        """Roll back to a specific model version."""
+        log.info("model_rollback_requested", target_version=version)
+        return self.load_models(version=version)
+
+    def list_versions(self) -> list[dict]:
+        """List available model versions."""
+        versions = []
+        for f in sorted(MODEL_DIR.glob("ensemble_v-*.pkl")):
+            try:
+                with open(f, "rb") as fh:
+                    data = pickle.load(fh)
+                versions.append({
+                    "version": data.get("version", f.stem),
+                    "cv_scores": data.get("cv_scores", {}),
+                    "features": len(data.get("feature_names", [])),
+                    "file": str(f),
+                })
+            except Exception:
+                versions.append({"version": f.stem, "file": str(f)})
+
+        return versions
+
+    @property
+    def model_version(self) -> str:
+        return self._model_version
+
+    @property
+    def cv_scores(self) -> dict[str, float]:
+        return self._cv_scores
 
     def _create_labels(self, close: pd.Series) -> pd.Series:
         """Create 3-class labels from next-day returns.

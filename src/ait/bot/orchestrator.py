@@ -1,9 +1,9 @@
 """Main trading orchestrator — the bot's brain.
 
 Runs the complete trading loop:
-1. Pre-market: prepare data, train models, reconcile positions
+1. Pre-market: prepare data, train models, reconcile positions, run learning cycle
 2. Market hours: scan → predict → generate signals → validate → execute → monitor
-3. Post-market: reconcile, generate daily report
+3. Post-market: reconcile, learn from trades, generate daily report
 
 This is the single entry point for all trading logic.
 """
@@ -11,23 +11,30 @@ This is the single entry point for all trading logic.
 from __future__ import annotations
 
 import asyncio
+import time
 import traceback
 from datetime import date
 
 from ait.bot.scheduler import MarketScheduler, TradingPhase
-from ait.bot.state import DailyStats, StateManager
+from ait.bot.state import DailyStats, StateManager, TradeRecord, TradeStatus
 from ait.broker.account import AccountManager
+from ait.broker.contracts import ContractBuilder
 from ait.broker.ibkr_client import IBKRClient
+from ait.broker.orders import OrderBuilder
 from ait.config.settings import Settings
 from ait.data.historical import HistoricalDataStore
 from ait.data.market_data import MarketDataService
 from ait.data.options_chain import OptionsChainService
+from ait.data.quality import DataQualityValidator
 from ait.execution.executor import TradeExecutor
-from ait.execution.portfolio import PortfolioManager
+from ait.execution.portfolio import PortfolioManager, PositionStatus
 from ait.execution.reconciler import PositionReconciler
+from ait.learning.engine import LearningEngine
 from ait.ml.ensemble import DirectionPredictor
 from ait.ml.regime import RegimeDetector
 from ait.ml.trainer import ModelTrainer
+from ait.monitoring.analytics import TradeAnalytics
+from ait.monitoring.watchdog import Watchdog
 from ait.risk.circuit_breaker import CircuitBreaker
 from ait.risk.manager import RiskManager, TradeRequest
 from ait.risk.pdt_guard import PDTGuard
@@ -100,6 +107,22 @@ class TradingOrchestrator:
         self._scheduler = MarketScheduler()
         self._reconciler = PositionReconciler(ibkr_client, self._state)
 
+        # Self-learning
+        self._learning = LearningEngine(self._state)
+
+        # Data quality
+        self._data_quality = DataQualityValidator()
+
+        # Health monitoring
+        self._watchdog = Watchdog()
+        self._watchdog.register_component("trading_loop")
+        self._watchdog.register_component("ibkr")
+        self._watchdog.register_component("market_data")
+        self._watchdog.on_recovery("ibkr", self._ibkr.ensure_connected)
+
+        # Analytics
+        self._analytics = TradeAnalytics()
+
         # Notification callback (set by main.py)
         self._notify = None
 
@@ -108,6 +131,7 @@ class TradingOrchestrator:
     def set_notification_callback(self, callback) -> None:
         """Set async callback for sending notifications."""
         self._notify = callback
+        self._watchdog.set_alert_callback(callback)
 
     async def run(self) -> None:
         """Main loop — runs continuously, trading during market hours."""
@@ -138,7 +162,9 @@ class TradingOrchestrator:
                 break
             except Exception as e:
                 log.error("orchestrator_error", error=str(e), traceback=traceback.format_exc())
-                await asyncio.sleep(60)  # Brief pause on error
+                self._watchdog.record_error("trading_loop", str(e))
+                await self._watchdog.check_and_recover()
+                await asyncio.sleep(60)
 
         await self._shutdown()
 
@@ -162,18 +188,39 @@ class TradingOrchestrator:
 
         # 2. Reset daily counters
         self._circuit_breaker.check_daily_reset()
+        self._data_quality.reset_tracking()
 
-        # 3. Ensure ML models are trained
+        # 3. Run self-learning cycle (analyze yesterday's trades)
+        if self._settings.learning.enabled:
+            learning_result = self._learning.run_learning_cycle(
+                lookback_days=self._settings.learning.lookback_days
+            )
+            if learning_result["adaptations"] > 0:
+                msg = (
+                    f"LEARNING: {learning_result['adaptations']} adaptations applied\n"
+                    + "\n".join(
+                        f"  • {d['parameter']}: {d['old']} → {d['new']}"
+                        for d in learning_result["details"]
+                    )
+                )
+                await self._send_notification(msg)
+                log.info("learning_adaptations_applied", summary=learning_result)
+
+        # 4. Ensure ML models are trained
         await self._trainer.ensure_models_ready(self._settings.trading.universe)
 
-        # 4. Get VIX and market regime
+        # 5. Get VIX and market regime
         vix = await self._market_data.get_vix()
         spy_data = await self._market_data.get_historical("SPY", days=60)
         if spy_data is not None:
             regime = self._regime_detector.analyze(spy_data, vix)
             log.info("pre_market_regime", regime=regime.regime.value, vix=vix)
 
-        log.info("pre_market_complete")
+        log.info(
+            "pre_market_complete",
+            learning_overrides=self._learning.get_current_adaptations(),
+            model_version=self._predictor.model_version,
+        )
 
     async def _trading_loop(self) -> None:
         """Main trading loop during market hours."""
@@ -182,12 +229,13 @@ class TradingOrchestrator:
 
         while self._running and self._scheduler.get_current_phase() == TradingPhase.MARKET_OPEN:
             try:
+                self._watchdog.heartbeat("trading_loop")
                 await self._trading_cycle()
             except Exception as e:
                 log.error("trading_cycle_error", error=str(e))
                 self._circuit_breaker.record_api_failure()
+                self._watchdog.record_error("trading_loop", str(e))
 
-            # Wait for next scan
             await asyncio.sleep(scan_interval)
 
     async def _trading_cycle(self) -> None:
@@ -202,7 +250,7 @@ class TradingOrchestrator:
         exits_needed = [p for p in positions if p.should_exit]
         for pos in exits_needed:
             log.info("position_exit_triggered", symbol=pos.symbol, reason=pos.exit_reason)
-            # TODO: Execute exit order via executor
+            await self._execute_exit(pos)
 
         # 3. Check if we should avoid new trades (last 15 min)
         if self._scheduler.should_avoid_new_trades():
@@ -212,10 +260,17 @@ class TradingOrchestrator:
         # 4. Check fill status of pending orders
         await self._executor.check_fills()
 
-        # 5. Scan universe for new opportunities
+        # 5. Get effective universe (learning may have removed symbols)
+        adaptor = self._learning.adaptor
+        universe = [
+            s for s in self._settings.trading.universe
+            if adaptor.is_symbol_allowed(s)
+        ]
+
+        # 6. Scan universe for new opportunities
         vix = await self._market_data.get_vix()
 
-        for symbol in self._settings.trading.universe:
+        for symbol in universe:
             try:
                 await self._scan_symbol(symbol, vix)
             except Exception as e:
@@ -223,22 +278,32 @@ class TradingOrchestrator:
 
     async def _scan_symbol(self, symbol: str, vix: float | None) -> None:
         """Analyze a single symbol for trading opportunities."""
+        adaptor = self._learning.adaptor
+
         # Get historical data for features
         hist = await self._market_data.get_historical(symbol, days=60)
         if hist is None or hist.empty:
             return
+
+        # Data quality check on historical data
+        if "Close" in hist.columns:
+            prices = hist["Close"].tolist()
+            if not self._data_quality.validate_historical(symbol, prices):
+                return
 
         # ML prediction
         prediction = self._predictor.predict(hist)
         if prediction is None:
             return
 
-        # Check minimum confidence
-        if prediction.confidence < self._settings.risk.min_confidence:
+        # Use learning-adjusted confidence threshold
+        min_confidence = adaptor.get_confidence_override() or self._settings.risk.min_confidence
+        if prediction.confidence < min_confidence:
             log.debug(
                 "low_confidence_skip",
                 symbol=symbol,
                 confidence=prediction.confidence,
+                threshold=min_confidence,
             )
             return
 
@@ -261,7 +326,7 @@ class TradingOrchestrator:
         if regime.confidence > 0.8:
             from ait.ml.regime import MarketRegime
             if regime.regime == MarketRegime.HIGH_VOLATILITY:
-                direction = SignalDirection.NEUTRAL  # Play defensive in high vol
+                direction = SignalDirection.NEUTRAL
 
         # Get IV rank for strategy selection
         iv_rank = await self._estimate_iv_rank(symbol)
@@ -276,7 +341,7 @@ class TradingOrchestrator:
             c.filter_liquid(self._settings.options) for c in chains
         ]
 
-        # Generate signals across all strategies
+        # Generate signals across all enabled strategies (learning may have disabled some)
         for chain in filtered_chains:
             if not chain.calls and not chain.puts:
                 continue
@@ -290,12 +355,20 @@ class TradingOrchestrator:
                 historical_data=hist,
             )
 
-            # Try to execute the best signal
-            for signal in signals[:1]:  # Only the top signal per chain
-                await self._try_execute(signal, final_confidence, sentiment)
+            # Filter out signals from disabled strategies
+            signals = [
+                s for s in signals
+                if adaptor.is_strategy_enabled(s.strategy_name)
+            ]
 
-    async def _try_execute(self, signal, confidence: float, sentiment) -> None:
+            # Try to execute the best signal
+            for signal in signals[:1]:
+                await self._try_execute(signal, final_confidence, sentiment, regime)
+
+    async def _try_execute(self, signal, confidence: float, sentiment, regime) -> None:
         """Validate and execute a signal."""
+        adaptor = self._learning.adaptor
+
         # Build trade request for risk validation
         request = TradeRequest(
             symbol=signal.symbol,
@@ -320,17 +393,27 @@ class TradingOrchestrator:
             )
             return
 
+        # Apply learning-based sizing multiplier
+        strategy_mult = adaptor.get_strategy_multiplier(signal.strategy_name)
+        adjusted_size = max(1, int(validation.position_size * strategy_mult))
+
         # Execute
-        trade_id = await self._executor.execute_signal(signal, validation.position_size)
+        trade_id = await self._executor.execute_signal(signal, adjusted_size)
 
         if trade_id:
+            # Store regime context for learning
+            regime_str = regime.regime.value if regime else ""
+            self._state.set_state(f"trade_regime_{trade_id}", regime_str)
+
             msg = (
-                f"TRADE: {signal.action} {validation.position_size}x "
+                f"TRADE: {signal.action} {adjusted_size}x "
                 f"{signal.symbol} {signal.strategy_name}\n"
                 f"Entry: ${signal.entry_price:.2f} | "
                 f"Max Loss: ${signal.max_loss:.0f} | "
                 f"Confidence: {confidence:.0%}"
             )
+            if strategy_mult != 1.0:
+                msg += f"\nLearning multiplier: {strategy_mult:.2f}x"
             await self._send_notification(msg)
 
             # Update daily stats
@@ -338,16 +421,134 @@ class TradingOrchestrator:
             stats.trades_taken += 1
             self._state.update_daily_stats(stats)
 
+    async def _execute_exit(self, pos: PositionStatus) -> None:
+        """Execute an exit order for a position that needs to be closed."""
+        trade = self._find_trade_record(pos.trade_id)
+        if not trade:
+            log.error("exit_trade_not_found", trade_id=pos.trade_id)
+            return
+
+        if not await self._ibkr.ensure_connected():
+            log.error("exit_failed_no_connection", trade_id=pos.trade_id)
+            self._watchdog.record_error("ibkr", "disconnected during exit")
+            return
+
+        try:
+            # Build the closing order (reverse of entry)
+            if trade.contract_type in ("call", "put"):
+                contract = ContractBuilder.option(
+                    symbol=trade.symbol,
+                    expiry=trade.expiry,
+                    strike=trade.strike,
+                    right="C" if trade.contract_type == "call" else "P",
+                )
+                qualified = await self._ibkr.qualify_contract(contract)
+                if not qualified:
+                    log.error("exit_qualification_failed", trade_id=pos.trade_id)
+                    return
+
+                # Reverse direction: if we bought, now sell; if we sold, now buy
+                close_action = "SELL" if trade.direction.value == "long" else "BUY"
+                order = OrderBuilder.market(action=close_action, quantity=trade.quantity)
+                await self._ibkr.place_order(qualified, order)
+
+            elif trade.contract_type in ("spread", "iron_condor"):
+                # Multi-leg close: submit reverse combo order
+                import json
+                legs = json.loads(trade.legs)
+                if legs:
+                    await self._close_multi_leg(trade, legs)
+                else:
+                    log.warning("no_legs_data_for_close", trade_id=pos.trade_id)
+                    return
+
+            # Record the close
+            realized_pnl = pos.unrealized_pnl
+            self._state.close_trade(
+                trade_id=pos.trade_id,
+                exit_price=pos.current_price,
+                realized_pnl=realized_pnl,
+            )
+
+            # Update daily stats
+            stats = self._state.get_daily_stats()
+            stats.total_pnl += realized_pnl
+            if realized_pnl > 0:
+                stats.trades_won += 1
+            else:
+                stats.trades_lost += 1
+                self._circuit_breaker.record_loss(realized_pnl)
+            self._state.update_daily_stats(stats)
+
+            # Notify
+            msg = (
+                f"EXIT: {trade.symbol} {trade.strategy}\n"
+                f"Reason: {pos.exit_reason}\n"
+                f"P&L: ${realized_pnl:.2f} ({pos.pnl_pct:.1%})"
+            )
+            await self._send_notification(msg)
+
+            log.info(
+                "position_closed",
+                trade_id=pos.trade_id,
+                symbol=pos.symbol,
+                reason=pos.exit_reason,
+                pnl=realized_pnl,
+            )
+
+        except Exception as e:
+            log.error("exit_execution_failed", trade_id=pos.trade_id, error=str(e))
+            self._watchdog.record_error("trading_loop", f"exit failed: {e}")
+
+    async def _close_multi_leg(self, trade: TradeRecord, legs: list[dict]) -> None:
+        """Close a multi-leg position by reversing the combo."""
+        qualified_legs = []
+        for leg in legs:
+            contract = ContractBuilder.option(
+                symbol=trade.symbol,
+                expiry=leg.get("expiry", trade.expiry),
+                strike=leg["strike"],
+                right=leg["right"],
+            )
+            qualified = await self._ibkr.qualify_contract(contract)
+            if not qualified:
+                log.error("leg_exit_qualification_failed", trade_id=trade.trade_id, leg=leg)
+                return
+
+            # Reverse the action
+            original_action = leg.get("action", "BUY")
+            close_action = "SELL" if original_action == "BUY" else "BUY"
+            qualified_legs.append({
+                "conId": qualified.conId,
+                "action": close_action,
+                "ratio": leg.get("ratio", 1),
+            })
+
+        combo = ContractBuilder.combo(symbol=trade.symbol, legs=qualified_legs)
+        order = OrderBuilder.market(action="BUY", quantity=trade.quantity)
+        await self._ibkr.place_order(combo, order)
+
     async def _post_market(self) -> None:
-        """Post-market reconciliation and reporting."""
+        """Post-market reconciliation, learning, and reporting."""
         log.info("post_market_starting")
 
-        # Reconcile with IBKR
+        # 1. Reconcile with IBKR
         await self._reconciler.reconcile()
 
-        # Generate daily summary
+        # 2. Run self-learning cycle
+        if self._settings.learning.enabled:
+            learning_result = self._learning.run_learning_cycle(
+                lookback_days=self._settings.learning.lookback_days
+            )
+            log.info("post_market_learning", result=learning_result)
+
+        # 3. Generate analytics
+        metrics = self._analytics.get_performance(lookback_days=30)
+
+        # 4. Generate daily summary
         summary = await self._portfolio.get_portfolio_summary()
         stats = self._state.get_daily_stats()
+        health = self._watchdog.get_health()
 
         report = (
             f"DAILY SUMMARY ({date.today().isoformat()})\n"
@@ -355,33 +556,53 @@ class TradingOrchestrator:
             f"Won: {stats.trades_won} | Lost: {stats.trades_lost}\n"
             f"Realized P&L: ${stats.total_pnl:.2f}\n"
             f"Unrealized P&L: ${summary['total_unrealized_pnl']:.2f}\n"
-            f"Open Positions: {summary['open_positions']}"
+            f"Open Positions: {summary['open_positions']}\n"
+            f"\n30-Day Stats:\n"
+            f"  Win Rate: {metrics.win_rate:.0%} | "
+            f"Sharpe: {metrics.sharpe_ratio:.2f}\n"
+            f"  Max Drawdown: ${metrics.max_drawdown_dollars:.0f} | "
+            f"Profit Factor: {metrics.profit_factor:.1f}\n"
+            f"  Model: {self._predictor.model_version}\n"
+            f"  System: {health.status.value} | "
+            f"Memory: {health.memory_mb:.0f}MB"
         )
-        await self._send_notification(report)
 
-        log.info("post_market_complete", summary=summary)
+        overrides = self._learning.get_current_adaptations()
+        if overrides.get("disabled_strategies"):
+            report += f"\n  Learning disabled: {', '.join(overrides['disabled_strategies'])}"
+        if overrides.get("removed_symbols"):
+            report += f"\n  Learning removed: {', '.join(overrides['removed_symbols'])}"
+
+        await self._send_notification(report)
+        log.info("post_market_complete", summary=summary, metrics=vars(metrics))
 
     async def _shutdown(self) -> None:
         """Clean shutdown."""
         log.info("orchestrator_shutting_down")
-        await self._send_notification("Bot shutting down")
+        health = self._watchdog.get_summary()
+        await self._send_notification(f"Bot shutting down\n\n{health}")
 
     # --- Helpers ---
+
+    def _find_trade_record(self, trade_id: str) -> TradeRecord | None:
+        """Find a trade record by ID."""
+        open_trades = self._state.get_open_trades()
+        for t in open_trades:
+            if t.trade_id == trade_id:
+                return t
+        return None
 
     async def _estimate_iv_rank(self, symbol: str) -> float:
         """Estimate IV rank (0-100) from recent volatility data."""
         hist = await self._market_data.get_historical(symbol, days=252)
         if hist is None or len(hist) < 60:
-            return 50.0  # Default mid-range
+            return 50.0
 
         import numpy as np
         close = hist["Close"]
         log_returns = np.log(close / close.shift(1)).dropna()
 
-        # Current 20-day vol
         current_vol = float(log_returns.tail(20).std() * np.sqrt(252))
-
-        # 1-year vol range
         rolling_vol = log_returns.rolling(20).std() * np.sqrt(252)
         rolling_vol = rolling_vol.dropna()
 

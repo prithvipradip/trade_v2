@@ -51,6 +51,14 @@ ml:
   lookback_days: 252                   # 1 year of trading days
   min_training_samples: 100
 
+learning:
+  enabled: true                          # Self-learning: adapt strategies from past trades
+  lookback_days: 30                      # Analyze last 30 days of trades
+  max_adaptations_per_cycle: 3           # Max config changes per learning cycle
+  min_insight_confidence: 0.60           # Only act on insights above 60% confidence
+  min_confidence_floor: 0.50             # Never lower min_confidence below 50%
+  min_confidence_ceiling: 0.90           # Never raise min_confidence above 90%
+
 sentiment:
   enabled: true
   weight: 0.20                         # Sentiment contributes 20% to final signal

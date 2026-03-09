@@ -99,6 +99,15 @@ class SentimentConfig(BaseModel):
     sources: SentimentSourcesConfig = SentimentSourcesConfig()
 
 
+class LearningConfig(BaseModel):
+    enabled: bool = True
+    lookback_days: int = Field(default=30, ge=7, le=180)
+    max_adaptations_per_cycle: int = Field(default=3, ge=1, le=10)
+    min_insight_confidence: float = Field(default=0.60, ge=0.40, le=0.95)
+    min_confidence_floor: float = Field(default=0.50, ge=0.40, le=0.80)
+    min_confidence_ceiling: float = Field(default=0.90, ge=0.70, le=0.99)
+
+
 class TelegramConfig(BaseModel):
     enabled: bool = True
     send_trades: bool = True
@@ -154,6 +163,7 @@ class Settings(BaseModel):
     risk: RiskConfig = RiskConfig()
     options: OptionsConfig = OptionsConfig()
     ml: MLConfig = MLConfig()
+    learning: LearningConfig = LearningConfig()
     sentiment: SentimentConfig = SentimentConfig()
     notifications: NotificationsConfig = NotificationsConfig()
     dashboard: DashboardConfig = DashboardConfig()

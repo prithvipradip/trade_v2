@@ -49,14 +49,17 @@ class ModelTrainer:
     async def train_all_symbols(self, symbols: list[str]) -> dict[str, dict[str, float]]:
         """Fetch fresh data and train models for all symbols.
 
+        Auto-rollback if new model performs significantly worse than previous.
         Returns dict of {symbol: {model: accuracy}}.
         """
-        results = {}
+        # Save previous scores for comparison
+        prev_version = self._predictor.model_version
+        prev_scores = dict(self._predictor.cv_scores)
 
+        results = {}
         for symbol in symbols:
             log.info("training_symbol", symbol=symbol)
 
-            # Fetch and store historical data
             df = await self._market_data.get_historical(
                 symbol, days=self._config.lookback_days
             )
@@ -65,17 +68,46 @@ class ModelTrainer:
                 log.warning("no_data_for_training", symbol=symbol)
                 continue
 
-            # Save to historical store for future use
             self._store.save(symbol, df)
-
-            # Train ensemble
             accuracies = self._predictor.train(df)
             if accuracies:
                 results[symbol] = accuracies
 
         self._last_train_date = date.today()
-        log.info("training_complete", symbols_trained=len(results))
+
+        # Auto-rollback: if new model is significantly worse, revert
+        if prev_scores and results:
+            new_scores = self._predictor.cv_scores
+            if self._should_rollback(prev_scores, new_scores):
+                log.warning(
+                    "model_performance_degraded",
+                    prev_scores=prev_scores,
+                    new_scores=new_scores,
+                    rolling_back_to=prev_version,
+                )
+                if prev_version:
+                    self._predictor.rollback(prev_version)
+
+        log.info(
+            "training_complete",
+            symbols_trained=len(results),
+            version=self._predictor.model_version,
+        )
         return results
+
+    @staticmethod
+    def _should_rollback(
+        prev_scores: dict[str, float], new_scores: dict[str, float]
+    ) -> bool:
+        """Check if new model is worse enough to warrant rollback."""
+        if not prev_scores or not new_scores:
+            return False
+
+        prev_avg = sum(prev_scores.values()) / len(prev_scores)
+        new_avg = sum(new_scores.values()) / len(new_scores)
+
+        # Rollback if accuracy dropped by more than 5 percentage points
+        return new_avg < prev_avg - 0.05
 
     async def ensure_models_ready(self, symbols: list[str]) -> bool:
         """Ensure models are loaded or trained. Call on startup."""
