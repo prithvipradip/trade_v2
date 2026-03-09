@@ -20,6 +20,7 @@ from ait.utils.time import (
     MARKET_OPEN,
     POST_MARKET_END,
     PRE_MARKET_START,
+    get_market_close,
     is_market_open,
     is_trading_day,
     next_market_open,
@@ -47,14 +48,18 @@ class MarketScheduler:
             return TradingPhase.OFF_HOURS
 
         current_time = now.time()
+        close = get_market_close()
+        # On half-days the post-market window is 15 minutes after actual close
+        close_dt = datetime.combine(now.date(), close, tzinfo=ET)
+        post_market_end = (close_dt + timedelta(minutes=15)).time()
 
         if current_time < PRE_MARKET_START:
             return TradingPhase.OFF_HOURS
         elif current_time < MARKET_OPEN:
             return TradingPhase.PRE_MARKET
-        elif current_time < MARKET_CLOSE:
+        elif current_time < close:
             return TradingPhase.MARKET_OPEN
-        elif current_time < POST_MARKET_END:
+        elif current_time < post_market_end:
             return TradingPhase.POST_MARKET
         else:
             return TradingPhase.OFF_HOURS
@@ -103,7 +108,7 @@ class MarketScheduler:
             return 0
 
         now = now_et()
-        close = datetime.combine(now.date(), MARKET_CLOSE, tzinfo=ET)
+        close = datetime.combine(now.date(), get_market_close(), tzinfo=ET)
         return max(0, (close - now).total_seconds())
 
     def should_avoid_new_trades(self) -> bool:

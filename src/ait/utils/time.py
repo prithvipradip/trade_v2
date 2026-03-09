@@ -25,6 +25,28 @@ PRE_MARKET_START = time(9, 0)   # Start analysis 30 min before open
 POST_MARKET_END = time(16, 15)  # Final reconciliation 15 min after close
 
 
+def get_market_close(d: date | None = None) -> time:
+    """Return the market close time for a given date.
+
+    NYSE has early-close days (13:00 ET) such as the day before Independence
+    Day, the day after Thanksgiving, and Christmas Eve.  The
+    ``pandas_market_calendars`` library knows about these dates, so we query
+    the NYSE schedule and extract the close time when available.
+
+    Falls back to the regular-session close (16:00 ET) if the schedule is
+    empty or lacks a ``market_close`` column.
+    """
+    d = d or now_et().date()
+    schedule = _nyse.schedule(start_date=d, end_date=d)
+
+    if not schedule.empty and "market_close" in schedule.columns:
+        close_ts = schedule.iloc[0]["market_close"]
+        # Convert to ET and extract the time component
+        return close_ts.tz_convert(ET).time()
+
+    return MARKET_CLOSE
+
+
 def now_et() -> datetime:
     """Current time in Eastern timezone."""
     return datetime.now(ET)
@@ -42,7 +64,7 @@ def is_market_open() -> bool:
 
     # Check if current time is within RTH
     current_time = now.time()
-    return MARKET_OPEN <= current_time < MARKET_CLOSE
+    return MARKET_OPEN <= current_time < get_market_close(today)
 
 
 def is_trading_day(d: date | None = None) -> bool:
@@ -75,7 +97,7 @@ def time_to_market_close() -> timedelta | None:
     if not is_market_open():
         return None
     now = now_et()
-    close_dt = datetime.combine(now.date(), MARKET_CLOSE, tzinfo=ET)
+    close_dt = datetime.combine(now.date(), get_market_close(now.date()), tzinfo=ET)
     return close_dt - now
 
 

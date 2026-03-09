@@ -12,6 +12,7 @@ from ait.broker.account import AccountManager
 from ait.config.settings import PositionConfig, RiskConfig
 from ait.data.options_chain import OptionContract
 from ait.risk.circuit_breaker import CircuitBreaker
+from ait.risk.correlation import CorrelationGuard
 from ait.risk.pdt_guard import PDTGuard
 from ait.risk.position_sizer import PositionSizer
 from ait.utils.logging import get_logger
@@ -66,6 +67,7 @@ class RiskManager:
         circuit_breaker: CircuitBreaker,
         pdt_guard: PDTGuard,
         position_sizer: PositionSizer,
+        correlation_guard: CorrelationGuard | None = None,
     ) -> None:
         self._pos_config = position_config
         self._risk_config = risk_config
@@ -73,6 +75,7 @@ class RiskManager:
         self._circuit_breaker = circuit_breaker
         self._pdt_guard = pdt_guard
         self._sizer = position_sizer
+        self._correlation = correlation_guard or CorrelationGuard()
 
         # Track current positions for limit checks
         self._open_positions: list[dict] = []
@@ -91,10 +94,11 @@ class RiskManager:
         2. Confidence threshold
         3. Position count limit
         4. Duplicate position check
-        5. Buying power
-        6. Portfolio delta limit
-        7. PDT check (if applicable)
-        8. Position sizing
+        5. Correlation check (prevent correlated stacking)
+        6. Buying power
+        7. Portfolio delta limit
+        8. Daily loss check
+        9. Position sizing
         """
         # 1. Circuit breaker
         if self._circuit_breaker.is_tripped:
@@ -123,13 +127,21 @@ class RiskManager:
                     f"duplicate position: {request.symbol} {request.strategy} already open",
                 )
 
-        # 5. Buying power check
+        # 5. Correlation check (prevent stacking correlated positions)
+        open_symbols = [p.get("symbol") for p in self._open_positions if p.get("symbol")]
+        corr_allowed, corr_reason = self._correlation.check_correlation(
+            request.symbol, open_symbols
+        )
+        if not corr_allowed:
+            return TradeValidation(False, f"correlation block: {corr_reason}")
+
+        # 6. Buying power check
         account_value = await self._account.get_net_liquidation()
         estimated_cost = request.entry_price * request.contracts * 100
         if not await self._account.can_afford(estimated_cost):
             return TradeValidation(False, "insufficient buying power")
 
-        # 6. Portfolio delta limit
+        # 7. Portfolio delta limit
         if request.option:
             new_delta = abs(
                 self._portfolio_greeks.delta
@@ -142,11 +154,11 @@ class RiskManager:
                     f"portfolio delta {new_delta:.0f} would exceed limit {max_delta_value:.0f}",
                 )
 
-        # 7. Daily loss check
+        # 8. Daily loss check
         if not self._circuit_breaker.check_daily_loss(account_value):
             return TradeValidation(False, "daily loss limit reached")
 
-        # 8. Position sizing
+        # 9. Position sizing
         size = self._sizer.calculate(
             account_value=account_value,
             option_price=request.entry_price,

@@ -22,9 +22,11 @@ from ait.broker.contracts import ContractBuilder
 from ait.broker.ibkr_client import IBKRClient
 from ait.broker.orders import OrderBuilder
 from ait.config.settings import Settings
+from ait.data.earnings import EarningsCalendar
 from ait.data.historical import HistoricalDataStore
 from ait.data.market_data import MarketDataService
 from ait.data.options_chain import OptionsChainService
+from ait.data.options_flow import OptionsFlowDetector
 from ait.data.quality import DataQualityValidator
 from ait.execution.executor import TradeExecutor
 from ait.execution.portfolio import PortfolioManager, PositionStatus
@@ -36,6 +38,8 @@ from ait.ml.trainer import ModelTrainer
 from ait.monitoring.analytics import TradeAnalytics
 from ait.monitoring.watchdog import Watchdog
 from ait.risk.circuit_breaker import CircuitBreaker
+from ait.risk.correlation import CorrelationGuard
+from ait.risk.hedging import DeltaHedger
 from ait.risk.manager import RiskManager, TradeRequest
 from ait.risk.pdt_guard import PDTGuard
 from ait.risk.position_sizer import PositionSizer
@@ -76,11 +80,14 @@ class TradingOrchestrator:
         self._circuit_breaker = CircuitBreaker(settings.risk)
         self._pdt_guard = PDTGuard(settings.account, self._state)
         self._position_sizer = PositionSizer(settings.positions, settings.risk)
+        self._correlation_guard = CorrelationGuard()
         self._risk_manager = RiskManager(
             settings.positions, settings.risk,
             self._account, self._circuit_breaker,
             self._pdt_guard, self._position_sizer,
+            correlation_guard=self._correlation_guard,
         )
+        self._delta_hedger = DeltaHedger()
 
         # ML
         self._predictor = DirectionPredictor(settings.ml)
@@ -110,8 +117,10 @@ class TradingOrchestrator:
         # Self-learning
         self._learning = LearningEngine(self._state)
 
-        # Data quality
+        # Data quality & market intelligence
         self._data_quality = DataQualityValidator()
+        self._earnings = EarningsCalendar()
+        self._flow_detector = OptionsFlowDetector()
 
         # Health monitoring
         self._watchdog = Watchdog()
@@ -206,10 +215,16 @@ class TradingOrchestrator:
                 await self._send_notification(msg)
                 log.info("learning_adaptations_applied", summary=learning_result)
 
-        # 4. Ensure ML models are trained
+        # 4. Update correlation guard with recent price data
+        for symbol in self._settings.trading.universe:
+            hist = await self._market_data.get_historical(symbol, days=60)
+            if hist is not None and "Close" in hist.columns:
+                self._correlation_guard.update_price_data(symbol, hist["Close"])
+
+        # 5. Ensure ML models are trained
         await self._trainer.ensure_models_ready(self._settings.trading.universe)
 
-        # 5. Get VIX and market regime
+        # 6. Get VIX and market regime
         vix = await self._market_data.get_vix()
         spy_data = await self._market_data.get_historical("SPY", days=60)
         if spy_data is not None:
@@ -252,22 +267,25 @@ class TradingOrchestrator:
             log.info("position_exit_triggered", symbol=pos.symbol, reason=pos.exit_reason)
             await self._execute_exit(pos)
 
-        # 3. Check if we should avoid new trades (last 15 min)
+        # 3. Check portfolio delta hedging
+        await self._check_hedging()
+
+        # 4. Check if we should avoid new trades (last 15 min)
         if self._scheduler.should_avoid_new_trades():
             log.debug("skipping_new_trades", reason="close_to_market_close")
             return
 
-        # 4. Check fill status of pending orders
+        # 5. Check fill status of pending orders
         await self._executor.check_fills()
 
-        # 5. Get effective universe (learning may have removed symbols)
+        # 6. Get effective universe (learning may have removed symbols)
         adaptor = self._learning.adaptor
         universe = [
             s for s in self._settings.trading.universe
             if adaptor.is_symbol_allowed(s)
         ]
 
-        # 6. Scan universe for new opportunities
+        # 7. Scan universe for new opportunities
         vix = await self._market_data.get_vix()
 
         for symbol in universe:
@@ -328,6 +346,11 @@ class TradingOrchestrator:
             if regime.regime == MarketRegime.HIGH_VOLATILITY:
                 direction = SignalDirection.NEUTRAL
 
+        # Check earnings proximity — skip if too close to earnings
+        if self._earnings.is_near_earnings(symbol):
+            log.info("skipping_near_earnings", symbol=symbol)
+            return
+
         # Get IV rank for strategy selection
         iv_rank = await self._estimate_iv_rank(symbol)
 
@@ -340,6 +363,32 @@ class TradingOrchestrator:
         filtered_chains = [
             c.filter_liquid(self._settings.options) for c in chains
         ]
+
+        # Options flow analysis — detect unusual activity
+        underlying_price = hist["Close"].iloc[-1] if "Close" in hist.columns else 0
+        for chain in filtered_chains:
+            if chain.calls or chain.puts:
+                call_data = [
+                    {"strike": c.strike, "volume": c.volume, "open_interest": c.open_interest,
+                     "last_price": c.last, "delta": c.delta}
+                    for c in (chain.calls or [])
+                ]
+                put_data = [
+                    {"strike": p.strike, "volume": p.volume, "open_interest": p.open_interest,
+                     "last_price": p.last, "delta": p.delta}
+                    for p in (chain.puts or [])
+                ]
+                flow = self._flow_detector.analyze_chain(
+                    symbol, call_data, put_data, underlying_price
+                )
+                # Boost confidence if flow agrees with prediction direction
+                if flow.bias_strength > 0.5:
+                    if (flow.overall_bias == "bullish" and direction == SignalDirection.BULLISH) or \
+                       (flow.overall_bias == "bearish" and direction == SignalDirection.BEARISH):
+                        final_confidence = min(1.0, final_confidence + flow.bias_strength * 0.1)
+                        log.info("flow_confidence_boost", symbol=symbol, bias=flow.overall_bias,
+                                 boost=flow.bias_strength * 0.1)
+                break  # Only analyze first chain for flow
 
         # Generate signals across all enabled strategies (learning may have disabled some)
         for chain in filtered_chains:
@@ -368,6 +417,14 @@ class TradingOrchestrator:
     async def _try_execute(self, signal, confidence: float, sentiment, regime) -> None:
         """Validate and execute a signal."""
         adaptor = self._learning.adaptor
+
+        # Check if position would hold through earnings (IV crush risk)
+        if signal.expiry:
+            from datetime import date as date_cls
+            expiry_date = signal.expiry if isinstance(signal.expiry, date_cls) else date_cls.fromisoformat(str(signal.expiry))
+            if self._earnings.would_hold_through_earnings(signal.symbol, date.today(), expiry_date):
+                log.info("trade_blocked_earnings", symbol=signal.symbol, expiry=str(signal.expiry))
+                return
 
         # Build trade request for risk validation
         request = TradeRequest(
@@ -581,6 +638,37 @@ class TradingOrchestrator:
         log.info("orchestrator_shutting_down")
         health = self._watchdog.get_summary()
         await self._send_notification(f"Bot shutting down\n\n{health}")
+
+    async def _check_hedging(self) -> None:
+        """Check if portfolio delta needs hedging with SPY."""
+        try:
+            portfolio_greeks = self._risk_manager._portfolio_greeks
+            account_value = await self._account.get_net_liquidation()
+            spy_price = await self._market_data.get_current_price("SPY")
+
+            if not spy_price or account_value <= 0:
+                return
+
+            recommendation = self._delta_hedger.check_hedge_needed(
+                portfolio_greeks, account_value, spy_price
+            )
+
+            if recommendation:
+                cost = self._delta_hedger.calculate_hedge_cost(recommendation, spy_price)
+                msg = (
+                    f"HEDGE: {recommendation.action} {recommendation.quantity}x SPY\n"
+                    f"Reason: {recommendation.reason}\n"
+                    f"Estimated cost: ${cost:,.0f}"
+                )
+                await self._send_notification(msg)
+                log.info(
+                    "hedge_recommendation",
+                    action=recommendation.action,
+                    shares=recommendation.quantity,
+                    delta=recommendation.current_delta,
+                )
+        except Exception as e:
+            log.warning("hedging_check_failed", error=str(e))
 
     # --- Helpers ---
 
