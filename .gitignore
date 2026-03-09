@@ -15,8 +15,8 @@ env/
 .vscode/
 .idea/
 
-# Data (local only)
-data/
+# Data (local only — top-level runtime data, not src/ait/data/)
+/data/
 models/
 logs/
 reports/
