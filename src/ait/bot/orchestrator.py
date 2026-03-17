@@ -33,6 +33,7 @@ from ait.execution.portfolio import PortfolioManager, PositionStatus
 from ait.execution.reconciler import PositionReconciler
 from ait.learning.engine import LearningEngine
 from ait.ml.ensemble import DirectionPredictor
+from ait.ml.meta_label import MetaLabeler
 from ait.ml.regime import RegimeDetector
 from ait.ml.trainer import ModelTrainer
 from ait.monitoring.analytics import TradeAnalytics
@@ -95,6 +96,9 @@ class TradingOrchestrator:
         self._trainer = ModelTrainer(
             settings.ml, self._predictor, self._market_data, self._historical,
         )
+        self._meta_labeler = MetaLabeler(
+            min_probability=settings.meta_label.min_probability,
+        ) if settings.meta_label.enabled else None
 
         # Sentiment
         self._sentiment = SentimentEngine(
@@ -229,7 +233,18 @@ class TradingOrchestrator:
         # 5. Ensure ML models are trained
         await self._trainer.ensure_models_ready(self._settings.trading.universe)
 
-        # 6. Get VIX and market regime
+        # 6. Train/load meta-labeler (learns which signals to take vs skip)
+        if self._meta_labeler is not None:
+            if not self._meta_labeler.load_model():
+                training_data = self._meta_labeler.build_training_data(self._state)
+                if not training_data.empty:
+                    stats = self._meta_labeler.train(training_data)
+                    if stats:
+                        log.info("meta_labeler_trained", stats=stats)
+                else:
+                    log.info("meta_labeler_skipped", reason="insufficient trade history")
+
+        # 7. Get VIX and market regime
         vix = await self._market_data.get_vix()
         spy_data = await self._market_data.get_historical("SPY", days=60)
         if spy_data is not None:
@@ -387,6 +402,53 @@ class TradingOrchestrator:
         if self._earnings.is_near_earnings(symbol):
             log.info("skipping_near_earnings", symbol=symbol)
             return
+
+        # Meta-label gate: ask secondary model if this signal is worth taking.
+        # Uses primary confidence + market context to filter false positives.
+        if self._meta_labeler is not None and self._meta_labeler.is_trained:
+            from ait.ml.features import FeatureEngine
+            features_df = FeatureEngine().compute(hist)
+            last_features = {}
+            if not features_df.empty:
+                last_row = features_df.iloc[-1]
+                last_features = {
+                    "rsi_14": float(last_row.get("rsi_14", 0)),
+                    "rsi_7": float(last_row.get("rsi_7", 0)),
+                    "bb_position": float(last_row.get("bb_position", 0)),
+                    "volume_sma_20_ratio": float(last_row.get("volume_sma_20_ratio", 0)),
+                    "realized_vol_20": float(last_row.get("realized_vol_20", 0)),
+                    "atr_pct": float(last_row.get("atr_pct", 0)),
+                    "weekly_trend_aligned": float(last_row.get("weekly_trend_aligned", 0)),
+                    "volume_confirmation": float(last_row.get("volume_confirmation", 0)),
+                    "macd_hist": float(last_row.get("macd_hist", 0)),
+                    "price_vs_sma_20": float(last_row.get("price_vs_sma_20", 0)),
+                    "sma_10_20_cross": float(last_row.get("sma_10_20_cross", 0)),
+                }
+
+            from datetime import datetime as dt
+            meta_context = {
+                "primary_confidence": final_confidence,
+                "regime_trending_up": 1.0 if regime and regime.regime.value == "trending_up" else 0.0,
+                "regime_trending_down": 1.0 if regime and regime.regime.value == "trending_down" else 0.0,
+                "regime_high_vol": 1.0 if regime and regime.regime.value == "high_volatility" else 0.0,
+                "regime_range_bound": 1.0 if regime and regime.regime.value == "range_bound" else 0.0,
+                "vix": vix or 0,
+                "iv_rank": 0,  # Not yet fetched — will be available after more trades
+                "sentiment_score": sentiment.composite_score if sentiment and hasattr(sentiment, "composite_score") else 0,
+                "hour_of_day": dt.now().hour,
+                **last_features,
+            }
+
+            meta_signal = self._meta_labeler.predict(meta_context)
+            if meta_signal is not None and not meta_signal.take_trade:
+                log.info(
+                    "meta_label_reject",
+                    symbol=symbol,
+                    probability=f"{meta_signal.probability:.3f}",
+                    direction=direction.value,
+                    confidence=f"{final_confidence:.3f}",
+                )
+                return
 
         # Get IV rank for strategy selection
         iv_rank = await self._estimate_iv_rank(symbol)

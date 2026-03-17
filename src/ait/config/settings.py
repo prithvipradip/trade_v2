@@ -86,6 +86,12 @@ class MLConfig(BaseModel):
         return v
 
 
+class MetaLabelConfig(BaseModel):
+    enabled: bool = True
+    min_probability: float = Field(default=0.50, ge=0.30, le=0.80)
+    retrain_with_primary: bool = True  # Retrain when primary model retrains
+
+
 class SentimentSourcesConfig(BaseModel):
     news: bool = True
     fear_greed: bool = True
@@ -176,6 +182,7 @@ class Settings(BaseModel):
     risk: RiskConfig = RiskConfig()
     options: OptionsConfig = OptionsConfig()
     ml: MLConfig = MLConfig()
+    meta_label: MetaLabelConfig = MetaLabelConfig()
     exit: ExitConfig = ExitConfig()
     learning: LearningConfig = LearningConfig()
     sentiment: SentimentConfig = SentimentConfig()
