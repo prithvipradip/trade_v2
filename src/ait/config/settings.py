@@ -99,6 +99,19 @@ class SentimentConfig(BaseModel):
     sources: SentimentSourcesConfig = SentimentSourcesConfig()
 
 
+class ExitConfig(BaseModel):
+    trailing_stop_pct: float = Field(default=0.25, ge=0.10, le=0.50)
+    breakeven_trigger_pct: float = Field(default=0.30, ge=0.10, le=0.80)
+    partial_exit_levels: list[dict] = [
+        {"pnl_pct": 0.50, "close_pct": 0.33},
+        {"pnl_pct": 1.00, "close_pct": 0.33},
+    ]
+    time_decay_scaling: bool = True
+    volatility_adjusted_stops: bool = True
+    initial_stop_loss_pct: float = Field(default=0.50, ge=0.15, le=0.75)
+    auto_hedge: bool = False
+
+
 class LearningConfig(BaseModel):
     enabled: bool = True
     lookback_days: int = Field(default=30, ge=7, le=180)
@@ -163,6 +176,7 @@ class Settings(BaseModel):
     risk: RiskConfig = RiskConfig()
     options: OptionsConfig = OptionsConfig()
     ml: MLConfig = MLConfig()
+    exit: ExitConfig = ExitConfig()
     learning: LearningConfig = LearningConfig()
     sentiment: SentimentConfig = SentimentConfig()
     notifications: NotificationsConfig = NotificationsConfig()

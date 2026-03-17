@@ -115,7 +115,11 @@ class StateManager:
                     sentiment_score REAL DEFAULT 0,
                     market_regime TEXT DEFAULT '',
                     notes TEXT DEFAULT '',
-                    legs TEXT DEFAULT '[]'
+                    legs TEXT DEFAULT '[]',
+                    exit_reason_detailed TEXT DEFAULT '',
+                    peak_pnl_pct REAL DEFAULT 0,
+                    time_to_peak_hours REAL DEFAULT 0,
+                    direction_correct INTEGER DEFAULT -1
                 );
 
                 CREATE TABLE IF NOT EXISTS daily_stats (
@@ -142,6 +146,20 @@ class StateManager:
                     stop_loss REAL,
                     take_profit REAL,
                     legs TEXT DEFAULT '[]',
+                    high_water_mark REAL DEFAULT 0,
+                    partial_exits TEXT DEFAULT '[]',
+                    FOREIGN KEY (trade_id) REFERENCES trades(trade_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS trade_context (
+                    trade_id TEXT PRIMARY KEY,
+                    entry_direction TEXT NOT NULL,
+                    entry_confidence REAL DEFAULT 0,
+                    entry_regime TEXT DEFAULT '',
+                    entry_vix REAL DEFAULT 0,
+                    entry_iv_rank REAL DEFAULT 0,
+                    entry_sentiment_score REAL DEFAULT 0,
+                    entry_signals TEXT DEFAULT '{}',
                     FOREIGN KEY (trade_id) REFERENCES trades(trade_id)
                 );
 
@@ -192,16 +210,28 @@ class StateManager:
         exit_price: float,
         realized_pnl: float,
         commission: float = 0.0,
+        exit_reason_detailed: str = "",
     ) -> None:
-        """Mark a trade as closed with exit details."""
+        """Mark a trade as closed with exit details and journaling data."""
         now = datetime.now().isoformat()
+
+        # Compute journaling fields
+        peak_pnl_pct = self.get_high_water_mark(trade_id)
+
+        # Calculate time to peak (from entry to when HWM was set)
+        time_to_peak_hours = 0.0
+
         with sqlite3.connect(self._db_path) as conn:
             conn.execute(
                 """UPDATE trades
                    SET status = ?, exit_time = ?, exit_price = ?,
-                       realized_pnl = ?, commission = ?
+                       realized_pnl = ?, commission = ?,
+                       exit_reason_detailed = ?, peak_pnl_pct = ?,
+                       time_to_peak_hours = ?
                    WHERE trade_id = ?""",
-                (TradeStatus.CLOSED.value, now, exit_price, realized_pnl, commission, trade_id),
+                (TradeStatus.CLOSED.value, now, exit_price, realized_pnl,
+                 commission, exit_reason_detailed, peak_pnl_pct,
+                 time_to_peak_hours, trade_id),
             )
 
     def get_open_trades(self) -> list[TradeRecord]:
@@ -266,6 +296,99 @@ class StateManager:
         if row:
             return DailyStats(**dict(row))
         return DailyStats(date=d.isoformat())
+
+    # --- High Water Mark & Partial Exits ---
+
+    def update_high_water_mark(self, trade_id: str, hwm: float) -> None:
+        """Update the high water mark for a trade's P&L percentage."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                "UPDATE open_positions SET high_water_mark = MAX(high_water_mark, ?) WHERE trade_id = ?",
+                (hwm, trade_id),
+            )
+
+    def get_high_water_mark(self, trade_id: str) -> float:
+        """Get the high water mark P&L pct for a trade."""
+        with sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(
+                "SELECT high_water_mark FROM open_positions WHERE trade_id = ?",
+                (trade_id,),
+            ).fetchone()
+        return row[0] if row else 0.0
+
+    def record_partial_exit(self, trade_id: str, quantity: int, price: float, pnl: float) -> None:
+        """Record a partial exit for a trade."""
+        raw = self.get_partial_exits(trade_id)
+        raw.append({
+            "quantity": quantity,
+            "price": price,
+            "pnl": pnl,
+            "time": datetime.now().isoformat(),
+        })
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                "UPDATE open_positions SET partial_exits = ? WHERE trade_id = ?",
+                (json.dumps(raw), trade_id),
+            )
+
+    def get_partial_exits(self, trade_id: str) -> list[dict]:
+        """Get partial exit history for a trade."""
+        with sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(
+                "SELECT partial_exits FROM open_positions WHERE trade_id = ?",
+                (trade_id,),
+            ).fetchone()
+        if row and row[0]:
+            try:
+                return json.loads(row[0])
+            except json.JSONDecodeError:
+                return []
+        return []
+
+    def update_trade_quantity(self, trade_id: str, new_quantity: int) -> None:
+        """Update remaining quantity after a partial exit."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                "UPDATE trades SET quantity = ? WHERE trade_id = ?",
+                (new_quantity, trade_id),
+            )
+            conn.execute(
+                "UPDATE open_positions SET quantity = ? WHERE trade_id = ?",
+                (new_quantity, trade_id),
+            )
+
+    # --- Trade Context ---
+
+    def save_trade_context(
+        self,
+        trade_id: str,
+        direction: str,
+        confidence: float,
+        regime: str,
+        vix: float,
+        iv_rank: float,
+        sentiment_score: float,
+        signals: str = "{}",
+    ) -> None:
+        """Save the market context at time of trade entry."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO trade_context
+                   (trade_id, entry_direction, entry_confidence, entry_regime,
+                    entry_vix, entry_iv_rank, entry_sentiment_score, entry_signals)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (trade_id, direction, confidence, regime, vix, iv_rank, sentiment_score, signals),
+            )
+
+    def get_trade_context(self, trade_id: str) -> dict | None:
+        """Get the entry context for a trade."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM trade_context WHERE trade_id = ?",
+                (trade_id,),
+            ).fetchone()
+        return dict(row) if row else None
 
     # --- Bot State (Key-Value) ---
 

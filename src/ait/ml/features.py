@@ -56,6 +56,9 @@ class FeatureEngine:
         # --- Price Action Features ---
         features = self._add_price_action(features)
 
+        # --- Multi-Timeframe Features ---
+        features = self._add_multi_timeframe(features)
+
         # Drop rows with NaN from lookback calculations
         features = features.dropna()
 
@@ -82,6 +85,9 @@ class FeatureEngine:
             # Price action
             "daily_return", "gap", "body_size", "upper_wick", "lower_wick",
             "consecutive_up", "consecutive_down",
+            # Multi-timeframe
+            "weekly_trend_aligned", "weekly_rsi",
+            "weekly_momentum", "volume_confirmation",
         ]
 
     # --- Feature Groups ---
@@ -200,6 +206,43 @@ class FeatureEngine:
         down = (c < c.shift(1)).astype(int)
         df["consecutive_up"] = self._consecutive_count(up)
         df["consecutive_down"] = self._consecutive_count(down)
+
+        return df
+
+    def _add_multi_timeframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add multi-timeframe features by resampling daily data to weekly.
+
+        Cross-timeframe alignment is a strong confirmation signal —
+        when daily and weekly trends agree, the signal is more reliable.
+        """
+        close = df["Close"]
+        volume = df["Volume"]
+
+        # Weekly SMA trend (resample daily to weekly-equivalent with 5-day rolling)
+        weekly_close = close.rolling(5).mean()  # Simulated weekly close
+        weekly_sma = weekly_close.rolling(4).mean()  # ~4-week trend (20-day)
+        weekly_sma_prev = weekly_sma.shift(5)
+
+        # Weekly trend alignment: 1 = weekly trend up and daily up, -1 = both down, 0 = mixed
+        daily_trend = (close > df.get("sma_20", close.rolling(20).mean())).astype(float)
+        weekly_trend = (weekly_sma > weekly_sma_prev).astype(float)
+        df["weekly_trend_aligned"] = daily_trend * weekly_trend + (1 - daily_trend) * (1 - weekly_trend)
+
+        # Weekly RSI (using 5-day smoothed close)
+        df["weekly_rsi"] = self._rsi(weekly_close, 14)
+
+        # Weekly momentum (5-week / 25-day rate of change)
+        df["weekly_momentum"] = close.pct_change(25)
+
+        # Volume confirmation: above-average volume on trend-direction days
+        avg_volume = volume.rolling(20).mean()
+        daily_return = close.pct_change()
+        # Volume confirmation = 1 if volume is above average AND price moved in trend direction
+        vol_above_avg = (volume > avg_volume).astype(float)
+        trend_direction = (daily_return > 0).astype(float)  # 1 = up day
+        df["volume_confirmation"] = vol_above_avg * (
+            trend_direction * daily_trend + (1 - trend_direction) * (1 - daily_trend)
+        )
 
         return df
 

@@ -79,6 +79,9 @@ class StrategyAdaptor:
         self._removed_symbols: set[str] = set()
         self._confidence_override: float | None = None
         self._stop_loss_override: float | None = None
+        self._trailing_stop_overrides: dict[str, float] = {}
+        self._take_profit_overrides: dict[str, float] = {}
+        self._blocked_hours: set[int] = set()
 
         self._load_state()
 
@@ -138,6 +141,18 @@ class StrategyAdaptor:
         """Get the learned stop loss percentage, or None for default."""
         return self._stop_loss_override
 
+    def get_trailing_stop_override(self, strategy: str) -> float | None:
+        """Get learned trailing stop pct for a strategy, or None for default."""
+        return self._trailing_stop_overrides.get(strategy)
+
+    def get_take_profit_override(self, strategy: str) -> float | None:
+        """Get learned take profit pct for a strategy, or None for default."""
+        return self._take_profit_overrides.get(strategy)
+
+    def is_hour_allowed(self, hour: int) -> bool:
+        """Check if trading is allowed at this hour."""
+        return hour not in self._blocked_hours
+
     def get_all_overrides(self) -> dict:
         """Get all current learning overrides for logging/dashboard."""
         return {
@@ -146,6 +161,9 @@ class StrategyAdaptor:
             "removed_symbols": list(self._removed_symbols),
             "confidence_override": self._confidence_override,
             "stop_loss_override": self._stop_loss_override,
+            "trailing_stop_overrides": dict(self._trailing_stop_overrides),
+            "take_profit_overrides": dict(self._take_profit_overrides),
+            "blocked_hours": sorted(self._blocked_hours),
         }
 
     def reset(self) -> None:
@@ -155,6 +173,9 @@ class StrategyAdaptor:
         self._removed_symbols.clear()
         self._confidence_override = None
         self._stop_loss_override = None
+        self._trailing_stop_overrides.clear()
+        self._take_profit_overrides.clear()
+        self._blocked_hours.clear()
         self._save_state()
         log.info("learning_adaptations_reset")
 
@@ -176,8 +197,20 @@ class StrategyAdaptor:
         elif action == "tighten_stop_loss":
             return self._tighten_stop_loss(insight)
         elif action.startswith("reduce_trading_in_"):
-            # Regime-based: reduce position sizes during bad regimes
             return self._reduce_regime_exposure(action[18:], insight)
+        elif action.startswith("adjust_trailing_stop_"):
+            parts = action[len("adjust_trailing_stop_"):].rsplit("_", 1)
+            if len(parts) == 2:
+                return self._adjust_trailing_stop(parts[0], float(parts[1]), insight)
+        elif action.startswith("adjust_take_profit_"):
+            parts = action[len("adjust_take_profit_"):].rsplit("_", 1)
+            if len(parts) == 2:
+                return self._adjust_take_profit(parts[0], float(parts[1]), insight)
+        elif action.startswith("block_hour_"):
+            return self._block_hour(int(action[len("block_hour_"):]), insight)
+        elif action == "flag_ml_retrain":
+            log.warning("ml_retrain_flagged", insight=insight.insight)
+            return None
 
         return None
 
@@ -265,6 +298,57 @@ class StrategyAdaptor:
             insight_confidence=insight.confidence,
         )
 
+    def _adjust_trailing_stop(self, strategy: str, new_pct: float, insight: TradeInsight) -> Adaptation | None:
+        """Adjust trailing stop percentage for a strategy based on exit efficiency."""
+        new_pct = max(0.10, min(new_pct, 0.50))  # Bound: 10%-50%
+        current = self._trailing_stop_overrides.get(strategy, 0.25)
+        if abs(new_pct - current) < 0.03:
+            return None
+
+        self._trailing_stop_overrides[strategy] = new_pct
+        return Adaptation(
+            timestamp=datetime.now().isoformat(),
+            parameter=f"exit.trailing_stop.{strategy}",
+            old_value=f"{current:.2f}",
+            new_value=f"{new_pct:.2f}",
+            reason=insight.insight,
+            insight_confidence=insight.confidence,
+        )
+
+    def _adjust_take_profit(self, strategy: str, new_pct: float, insight: TradeInsight) -> Adaptation | None:
+        """Adjust take profit target for a strategy based on realized vs peak P&L."""
+        new_pct = max(0.20, min(new_pct, 2.0))  # Bound: 20%-200%
+        current = self._take_profit_overrides.get(strategy, 1.0)
+        if abs(new_pct - current) < 0.05:
+            return None
+
+        self._take_profit_overrides[strategy] = new_pct
+        return Adaptation(
+            timestamp=datetime.now().isoformat(),
+            parameter=f"exit.take_profit.{strategy}",
+            old_value=f"{current:.2f}",
+            new_value=f"{new_pct:.2f}",
+            reason=insight.insight,
+            insight_confidence=insight.confidence,
+        )
+
+    def _block_hour(self, hour: int, insight: TradeInsight) -> Adaptation | None:
+        """Block a specific hour from trading due to poor performance."""
+        if hour in self._blocked_hours:
+            return None
+        if not (9 <= hour <= 16):  # Only block market hours
+            return None
+
+        self._blocked_hours.add(hour)
+        return Adaptation(
+            timestamp=datetime.now().isoformat(),
+            parameter=f"trading.blocked_hours.{hour}",
+            old_value="allowed",
+            new_value="blocked",
+            reason=insight.insight,
+            insight_confidence=insight.confidence,
+        )
+
     def _reduce_regime_exposure(self, regime: str, insight: TradeInsight) -> Adaptation | None:
         """Log regime-based learning (applied via regime detector weight)."""
         # This is tracked but applied via the regime detector's integration
@@ -281,6 +365,9 @@ class StrategyAdaptor:
             "removed_symbols": list(self._removed_symbols),
             "confidence_override": self._confidence_override,
             "stop_loss_override": self._stop_loss_override,
+            "trailing_stop_overrides": self._trailing_stop_overrides,
+            "take_profit_overrides": self._take_profit_overrides,
+            "blocked_hours": list(self._blocked_hours),
         }
         self._state.set_state(self.STATE_KEY, json.dumps(data))
 
@@ -297,6 +384,9 @@ class StrategyAdaptor:
             self._removed_symbols = set(data.get("removed_symbols", []))
             self._confidence_override = data.get("confidence_override")
             self._stop_loss_override = data.get("stop_loss_override")
+            self._trailing_stop_overrides = data.get("trailing_stop_overrides", {})
+            self._take_profit_overrides = data.get("take_profit_overrides", {})
+            self._blocked_hours = set(data.get("blocked_hours", []))
             log.info("learning_state_loaded", overrides=self.get_all_overrides())
         except (json.JSONDecodeError, KeyError) as e:
             log.warning("learning_state_load_failed", error=str(e))

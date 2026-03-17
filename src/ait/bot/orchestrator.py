@@ -108,6 +108,7 @@ class TradingOrchestrator:
         self._portfolio = PortfolioManager(
             ibkr_client, self._market_data, self._state,
             self._circuit_breaker, self._pdt_guard,
+            exit_config=settings.exit,
         )
 
         # Scheduling
@@ -136,6 +137,10 @@ class TradingOrchestrator:
         self._notify = None
 
         self._running = False
+
+        # Signal queue for entry timing optimization
+        # Signals wait here until timing conditions are met (max 3 cycles)
+        self._signal_queue: dict[str, dict] = {}  # symbol → {signal, confidence, sentiment, regime, age}
 
     def set_notification_callback(self, callback) -> None:
         """Set async callback for sending notifications."""
@@ -260,32 +265,64 @@ class TradingOrchestrator:
             log.warning("trading_halted", reason=self._circuit_breaker.get_status().reason)
             return
 
-        # 2. Check and manage existing positions
+        # 2. Sync risk manager with live positions (fixes stale position tracking)
+        await self._sync_risk_manager_positions()
+
+        # 3. Check and manage existing positions
         positions = await self._portfolio.check_positions()
+
+        # Handle full exits
         exits_needed = [p for p in positions if p.should_exit]
         for pos in exits_needed:
             log.info("position_exit_triggered", symbol=pos.symbol, reason=pos.exit_reason)
             await self._execute_exit(pos)
 
-        # 3. Check portfolio delta hedging
+        # Handle partial exits (scale-out at profit milestones)
+        partial_exits = [p for p in positions if not p.should_exit and p.partial_exit_quantity > 0]
+        for pos in partial_exits:
+            log.info("partial_exit_triggered", symbol=pos.symbol, reason=pos.exit_reason,
+                     quantity=pos.partial_exit_quantity)
+            await self._execute_partial_exit(pos)
+
+        # 3b. Thesis re-evaluation — exit early if original thesis invalidated
+        remaining_positions = [p for p in positions if not p.should_exit and p.partial_exit_quantity == 0]
+        for pos in remaining_positions:
+            invalidated, reason = await self._check_thesis_valid(pos)
+            if invalidated:
+                log.info("thesis_invalidated", symbol=pos.symbol, reason=reason)
+                pos.should_exit = True
+                pos.exit_reason = f"thesis_invalidated: {reason}"
+                await self._execute_exit(pos)
+
+        # 4. Check portfolio delta hedging
         await self._check_hedging()
 
-        # 4. Check if we should avoid new trades (last 15 min)
+        # 5. Check if we should avoid new trades (last 15 min)
         if self._scheduler.should_avoid_new_trades():
             log.debug("skipping_new_trades", reason="close_to_market_close")
             return
 
-        # 5. Check fill status of pending orders
+        # 6. Check fill status of pending orders
         await self._executor.check_fills()
 
-        # 6. Get effective universe (learning may have removed symbols)
+        # 7. Get effective universe (learning may have removed symbols)
         adaptor = self._learning.adaptor
         universe = [
             s for s in self._settings.trading.universe
             if adaptor.is_symbol_allowed(s)
         ]
 
-        # 7. Scan universe for new opportunities
+        # 7b. Check if current hour is blocked by learning
+        from datetime import datetime as dt_now
+        current_hour = dt_now.now().hour
+        if not adaptor.is_hour_allowed(current_hour):
+            log.debug("hour_blocked_by_learning", hour=current_hour)
+            return
+
+        # 8. Process queued signals first (entry timing optimization)
+        await self._process_signal_queue()
+
+        # 9. Scan universe for new opportunities
         vix = await self._market_data.get_vix()
 
         for symbol in universe:
@@ -381,6 +418,18 @@ class TradingOrchestrator:
                 flow = self._flow_detector.analyze_chain(
                     symbol, call_data, put_data, underlying_price
                 )
+                # Hard gate: if strong flow disagrees with ML direction, reject entirely
+                if flow.bias_strength > 0.7:
+                    flow_disagrees = (
+                        (flow.overall_bias == "bearish" and direction == SignalDirection.BULLISH) or
+                        (flow.overall_bias == "bullish" and direction == SignalDirection.BEARISH)
+                    )
+                    if flow_disagrees:
+                        log.info("flow_hard_gate_reject", symbol=symbol,
+                                 flow_bias=flow.overall_bias, ml_direction=direction.value,
+                                 bias_strength=flow.bias_strength)
+                        return  # Skip this symbol entirely
+
                 # Boost confidence if flow agrees with prediction direction
                 if flow.bias_strength > 0.5:
                     if (flow.overall_bias == "bullish" and direction == SignalDirection.BULLISH) or \
@@ -410,9 +459,20 @@ class TradingOrchestrator:
                 if adaptor.is_strategy_enabled(s.strategy_name)
             ]
 
-            # Try to execute the best signal
+            # Try to execute the best signal (with entry timing check)
             for signal in signals[:1]:
-                await self._try_execute(signal, final_confidence, sentiment, regime)
+                if self._should_queue_signal(signal, hist):
+                    self._signal_queue[signal.symbol] = {
+                        "signal": signal,
+                        "confidence": final_confidence,
+                        "sentiment": sentiment,
+                        "regime": regime,
+                        "age": 0,
+                    }
+                    log.info("signal_queued", symbol=signal.symbol,
+                             strategy=signal.strategy_name, reason="entry_timing")
+                else:
+                    await self._try_execute(signal, final_confidence, sentiment, regime)
 
     async def _try_execute(self, signal, confidence: float, sentiment, regime) -> None:
         """Validate and execute a signal."""
@@ -458,9 +518,18 @@ class TradingOrchestrator:
         trade_id = await self._executor.execute_signal(signal, adjusted_size)
 
         if trade_id:
-            # Store regime context for learning
+            # Store full entry context for thesis re-evaluation and learning
             regime_str = regime.regime.value if regime else ""
             self._state.set_state(f"trade_regime_{trade_id}", regime_str)
+            self._state.save_trade_context(
+                trade_id=trade_id,
+                direction=signal.direction.value,
+                confidence=confidence,
+                regime=regime_str,
+                vix=await self._market_data.get_vix() or 0,
+                iv_rank=signal.iv_rank if hasattr(signal, "iv_rank") else 0,
+                sentiment_score=sentiment.composite_score if sentiment and hasattr(sentiment, "composite_score") else 0,
+            )
 
             msg = (
                 f"TRADE: {signal.action} {adjusted_size}x "
@@ -519,12 +588,13 @@ class TradingOrchestrator:
                     log.warning("no_legs_data_for_close", trade_id=pos.trade_id)
                     return
 
-            # Record the close
+            # Record the close with detailed exit reason
             realized_pnl = pos.unrealized_pnl
             self._state.close_trade(
                 trade_id=pos.trade_id,
                 exit_price=pos.current_price,
                 realized_pnl=realized_pnl,
+                exit_reason_detailed=pos.exit_reason,
             )
 
             # Update daily stats
@@ -556,6 +626,82 @@ class TradingOrchestrator:
         except Exception as e:
             log.error("exit_execution_failed", trade_id=pos.trade_id, error=str(e))
             self._watchdog.record_error("trading_loop", f"exit failed: {e}")
+
+    async def _execute_partial_exit(self, pos: PositionStatus) -> None:
+        """Execute a partial exit — close some contracts while keeping the rest open."""
+        trade = self._find_trade_record(pos.trade_id)
+        if not trade:
+            log.error("partial_exit_trade_not_found", trade_id=pos.trade_id)
+            return
+
+        if not await self._ibkr.ensure_connected():
+            log.error("partial_exit_failed_no_connection", trade_id=pos.trade_id)
+            return
+
+        try:
+            qty_to_close = pos.partial_exit_quantity
+
+            if trade.contract_type in ("call", "put"):
+                contract = ContractBuilder.option(
+                    symbol=trade.symbol,
+                    expiry=trade.expiry,
+                    strike=trade.strike,
+                    right="C" if trade.contract_type == "call" else "P",
+                )
+                qualified = await self._ibkr.qualify_contract(contract)
+                if not qualified:
+                    log.error("partial_exit_qualification_failed", trade_id=pos.trade_id)
+                    return
+
+                close_action = "SELL" if trade.direction.value == "long" else "BUY"
+                order = OrderBuilder.market(action=close_action, quantity=qty_to_close)
+                await self._ibkr.place_order(qualified, order)
+
+            # Record partial exit
+            partial_pnl = pos.unrealized_pnl * (qty_to_close / trade.quantity)
+            # Find which level was triggered
+            pnl_level = pos.pnl_pct
+            for level in self._settings.exit.partial_exit_levels:
+                if pos.pnl_pct >= level["pnl_pct"]:
+                    pnl_level = level["pnl_pct"]
+
+            self._state.record_partial_exit(
+                trade_id=pos.trade_id,
+                quantity=qty_to_close,
+                price=pos.current_price,
+                pnl=partial_pnl,
+            )
+
+            # Update remaining quantity
+            new_qty = trade.quantity - qty_to_close
+            self._state.update_trade_quantity(pos.trade_id, new_qty)
+
+            # Update daily stats with realized portion
+            stats = self._state.get_daily_stats()
+            stats.total_pnl += partial_pnl
+            if partial_pnl > 0:
+                stats.trades_won += 1
+            self._state.update_daily_stats(stats)
+
+            msg = (
+                f"PARTIAL EXIT: {trade.symbol} {trade.strategy}\n"
+                f"Closed {qty_to_close}/{trade.quantity} contracts\n"
+                f"P&L: ${partial_pnl:.2f} ({pos.pnl_pct:.1%})\n"
+                f"Remaining: {new_qty} contracts (trailing stop active)"
+            )
+            await self._send_notification(msg)
+
+            log.info(
+                "partial_exit_executed",
+                trade_id=pos.trade_id,
+                symbol=pos.symbol,
+                closed=qty_to_close,
+                remaining=new_qty,
+                pnl=partial_pnl,
+            )
+
+        except Exception as e:
+            log.error("partial_exit_failed", trade_id=pos.trade_id, error=str(e))
 
     async def _close_multi_leg(self, trade: TradeRecord, legs: list[dict]) -> None:
         """Close a multi-leg position by reversing the combo."""
@@ -660,17 +806,196 @@ class TradingOrchestrator:
                     f"Reason: {recommendation.reason}\n"
                     f"Estimated cost: ${cost:,.0f}"
                 )
+
+                # Auto-execute hedge if enabled
+                if self._settings.exit.auto_hedge:
+                    try:
+                        contract = ContractBuilder.stock("SPY")
+                        qualified = await self._ibkr.qualify_contract(contract)
+                        if qualified:
+                            order = OrderBuilder.market(
+                                action=recommendation.action,
+                                quantity=recommendation.quantity,
+                            )
+                            await self._ibkr.place_order(qualified, order)
+                            msg += "\nStatus: AUTO-EXECUTED"
+                            log.info(
+                                "hedge_auto_executed",
+                                action=recommendation.action,
+                                shares=recommendation.quantity,
+                            )
+                        else:
+                            msg += "\nStatus: FAILED (contract qualification)"
+                    except Exception as he:
+                        msg += f"\nStatus: FAILED ({he})"
+                        log.error("hedge_execution_failed", error=str(he))
+                else:
+                    msg += "\nStatus: MANUAL (auto_hedge disabled)"
+
                 await self._send_notification(msg)
                 log.info(
                     "hedge_recommendation",
                     action=recommendation.action,
                     shares=recommendation.quantity,
                     delta=recommendation.current_delta,
+                    auto_executed=self._settings.exit.auto_hedge,
                 )
         except Exception as e:
             log.warning("hedging_check_failed", error=str(e))
 
     # --- Helpers ---
+
+    def _should_queue_signal(self, signal, hist) -> bool:
+        """Check if a signal should be queued for better entry timing.
+
+        Queue bullish signals when RSI is high (overbought) — wait for pullback.
+        Queue bearish signals when RSI is low (oversold) — wait for bounce.
+        """
+        if signal.symbol in self._signal_queue:
+            return False  # Already queued
+
+        if hist is None or hist.empty or "Close" not in hist.columns:
+            return False
+
+        try:
+            close = hist["Close"]
+            # Calculate RSI-14
+            delta = close.diff()
+            gain = delta.where(delta > 0, 0.0).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs))
+            current_rsi = float(rsi.iloc[-1])
+
+            # For bullish trades, prefer entry on pullback (RSI < 60)
+            if signal.direction == SignalDirection.BULLISH and current_rsi > 65:
+                return True
+
+            # For bearish trades, prefer entry on bounce (RSI > 40)
+            if signal.direction == SignalDirection.BEARISH and current_rsi < 35:
+                return True
+
+        except Exception:
+            pass
+
+        return False
+
+    async def _process_signal_queue(self) -> None:
+        """Process queued signals — execute if timing improved or expire."""
+        expired = []
+
+        for symbol, entry in list(self._signal_queue.items()):
+            entry["age"] += 1
+
+            # Expire after 3 cycles (15 min at 5-min intervals)
+            if entry["age"] > 3:
+                expired.append(symbol)
+                log.info("signal_expired", symbol=symbol, strategy=entry["signal"].strategy_name)
+                continue
+
+            # Check if timing has improved
+            hist = await self._market_data.get_historical(symbol, days=60)
+            if not self._should_queue_signal(entry["signal"], hist):
+                # Timing improved — execute now
+                log.info("queued_signal_executing", symbol=symbol, age=entry["age"])
+                await self._try_execute(
+                    entry["signal"],
+                    entry["confidence"],
+                    entry["sentiment"],
+                    entry["regime"],
+                )
+                expired.append(symbol)
+
+        for symbol in expired:
+            self._signal_queue.pop(symbol, None)
+
+    async def _check_thesis_valid(self, pos: PositionStatus) -> tuple[bool, str]:
+        """Re-evaluate whether the original trade thesis still holds.
+
+        Returns (invalidated: bool, reason: str).
+        Checks: direction flip, regime shift, VIX spike.
+        """
+        try:
+            context = self._state.get_trade_context(pos.trade_id)
+            if not context:
+                return False, ""
+
+            entry_direction = context.get("entry_direction", "")
+            entry_regime = context.get("entry_regime", "")
+            entry_vix = context.get("entry_vix", 0)
+
+            # 1. Re-run ML prediction on fresh data
+            hist = await self._market_data.get_historical(pos.symbol, days=60)
+            if hist is not None and not hist.empty:
+                prediction = self._predictor.predict(hist)
+                if prediction and prediction.confidence > 0.70:
+                    # Direction has flipped with high confidence
+                    if entry_direction == "bullish" and prediction.direction == SignalDirection.BEARISH:
+                        return True, f"direction_flipped_to_bearish (conf={prediction.confidence:.0%})"
+                    if entry_direction == "bearish" and prediction.direction == SignalDirection.BULLISH:
+                        return True, f"direction_flipped_to_bullish (conf={prediction.confidence:.0%})"
+
+            # 2. Check regime shift
+            vix = await self._market_data.get_vix()
+            if hist is not None and not hist.empty:
+                regime = self._regime_detector.analyze(hist, vix)
+                if regime and regime.confidence > 0.70:
+                    from ait.ml.regime import MarketRegime
+                    current_regime = regime.regime.value
+                    # If entered during trending and now high volatility, thesis is suspect
+                    if entry_regime in ("trending_up", "trending_down") and current_regime == "high_volatility":
+                        return True, f"regime_shift ({entry_regime} → {current_regime})"
+
+            # 3. Check VIX spike (>30% increase since entry)
+            if vix and entry_vix and entry_vix > 0:
+                vix_change = (vix - entry_vix) / entry_vix
+                if vix_change > 0.30:
+                    return True, f"vix_spike ({entry_vix:.1f} → {vix:.1f}, +{vix_change:.0%})"
+
+        except Exception as e:
+            log.warning("thesis_check_failed", trade_id=pos.trade_id, error=str(e))
+
+        return False, ""
+
+    async def _sync_risk_manager_positions(self) -> None:
+        """Sync risk manager with current open positions and live Greeks.
+
+        Without this, position count limits, delta checks, duplicate
+        detection, and correlation guards all operate on stale data.
+        """
+        try:
+            open_trades = self._state.get_open_trades()
+            filled_trades = [t for t in open_trades if t.status in (TradeStatus.FILLED, TradeStatus.PARTIAL)]
+
+            # Try to get live Greeks from IBKR portfolio
+            ibkr_greeks: dict[str, dict] = {}
+            portfolio_items = self._ibkr.get_portfolio()
+            for item in portfolio_items:
+                key = item.contract.symbol
+                ibkr_greeks[key] = {
+                    "delta": getattr(item, "delta", 0) or 0,
+                    "gamma": getattr(item, "gamma", 0) or 0,
+                    "theta": getattr(item, "theta", 0) or 0,
+                    "vega": getattr(item, "vega", 0) or 0,
+                }
+
+            positions_for_risk = []
+            for trade in filled_trades:
+                greeks = ibkr_greeks.get(trade.symbol, {})
+                positions_for_risk.append({
+                    "symbol": trade.symbol,
+                    "strategy": trade.strategy,
+                    "quantity": trade.quantity,
+                    "delta": greeks.get("delta", 0),
+                    "gamma": greeks.get("gamma", 0),
+                    "theta": greeks.get("theta", 0),
+                    "vega": greeks.get("vega", 0),
+                })
+
+            self._risk_manager.update_positions(positions_for_risk)
+            log.debug("risk_manager_synced", position_count=len(positions_for_risk))
+        except Exception as e:
+            log.warning("risk_manager_sync_failed", error=str(e))
 
     def _find_trade_record(self, trade_id: str) -> TradeRecord | None:
         """Find a trade record by ID."""
