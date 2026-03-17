@@ -23,6 +23,7 @@ class BacktestResult:
     final_capital: float = 10_000.0
     start_date: date | None = None
     end_date: date | None = None
+    exit_mode: str = "fixed"
 
     # --- Core metrics as properties ---
 
@@ -112,7 +113,7 @@ class BacktestResult:
 
         lines = [
             "=" * 50,
-            "  BACKTEST RESULTS",
+            f"  BACKTEST RESULTS  (exit_mode={self.exit_mode})",
             "=" * 50,
             f"  Initial Capital: ${self.initial_capital:,.2f}",
             f"  Final Capital:   ${self.final_capital:,.2f}",

@@ -35,6 +35,9 @@ class Backtester:
         profit_target_pct: Profit target as fraction of entry price.
         max_hold_days: Maximum days to hold before forced exit (expiry sim).
         min_confidence: Minimum ML confidence to take a trade.
+        trailing_stop_enabled: Use dynamic trailing stop instead of fixed stop/TP.
+        trailing_stop_pct: Trailing distance as fraction of entry price (trailing mode).
+        breakeven_trigger_pct: HWM threshold to move stop to breakeven (trailing mode).
     """
 
     def __init__(
@@ -49,6 +52,9 @@ class Backtester:
         profit_target_pct: float = 1.00,
         max_hold_days: int = 30,
         min_confidence: float = 0.55,
+        trailing_stop_enabled: bool = False,
+        trailing_stop_pct: float = 0.25,
+        breakeven_trigger_pct: float = 0.30,
     ) -> None:
         self._data = self._prepare_data(data)
         self._strategies = strategies
@@ -60,6 +66,9 @@ class Backtester:
         self._profit_target_pct = profit_target_pct
         self._max_hold_days = max_hold_days
         self._min_confidence = min_confidence
+        self._trailing_stop_enabled = trailing_stop_enabled
+        self._trailing_stop_pct = trailing_stop_pct
+        self._breakeven_trigger_pct = breakeven_trigger_pct
 
         # Try to load the ML predictor (optional)
         self._predictor = self._load_predictor()
@@ -154,6 +163,7 @@ class Backtester:
                 "profit_target": round(entry_price * (1 + self._profit_target_pct), 2),
                 "expiry_date": str(today_date + timedelta(days=self._max_hold_days)),
                 "entry_commission": entry_cost,
+                "high_water_mark": 0.0,
             }
             open_positions.append(pos)
 
@@ -190,6 +200,40 @@ class Backtester:
         )
 
         return result
+
+    @classmethod
+    def compare_exit_modes(
+        cls, data: pd.DataFrame, strategies: list[str], **kwargs: Any
+    ) -> dict:
+        """Run backtest with both fixed and trailing stops, return comparison.
+
+        All keyword arguments are forwarded to the Backtester constructor.
+        Returns a dict with keys ``"fixed"`` and ``"trailing"``, each holding
+        a :class:`BacktestResult`, plus a ``"delta"`` sub-dict with key metric
+        differences (trailing minus fixed).
+        """
+        shared = {k: v for k, v in kwargs.items() if k != "trailing_stop_enabled"}
+
+        fixed_bt = cls(data, strategies, trailing_stop_enabled=False, **shared)
+        trailing_bt = cls(data, strategies, trailing_stop_enabled=True, **shared)
+
+        fixed_result = fixed_bt.run()
+        fixed_result.exit_mode = "fixed"
+
+        trailing_result = trailing_bt.run()
+        trailing_result.exit_mode = "trailing"
+
+        return {
+            "fixed": fixed_result,
+            "trailing": trailing_result,
+            "delta": {
+                "total_return": trailing_result.total_return - fixed_result.total_return,
+                "win_rate": trailing_result.win_rate - fixed_result.win_rate,
+                "sharpe_ratio": trailing_result.sharpe_ratio - fixed_result.sharpe_ratio,
+                "max_drawdown": trailing_result.max_drawdown - fixed_result.max_drawdown,
+                "profit_factor": trailing_result.profit_factor - fixed_result.profit_factor,
+            },
+        }
 
     # ------------------------------------------------------------------
     # Data preparation
@@ -364,9 +408,22 @@ class Backtester:
         """Check if a position should be exited.
 
         Returns exit info dict if exiting, None if holding.
+        Supports both fixed stop/take-profit and dynamic trailing stop modes.
         """
         current_option_price = row["Close"] * 0.04  # Same proxy as entry
 
+        if self._trailing_stop_enabled:
+            return self._check_exit_trailing(pos, current_option_price, current_date)
+
+        return self._check_exit_fixed(pos, current_option_price, current_date)
+
+    def _check_exit_fixed(
+        self,
+        pos: dict,
+        current_option_price: float,
+        current_date: date,
+    ) -> dict | None:
+        """Fixed stop-loss / take-profit exit logic (original behaviour)."""
         # Stop loss
         if current_option_price <= pos["stop_loss"]:
             exit_price = self._apply_slippage(pos["stop_loss"], is_entry=False)
@@ -390,6 +447,60 @@ class Backtester:
             }
 
         # Expiry
+        expiry = date.fromisoformat(pos["expiry_date"])
+        if current_date >= expiry:
+            exit_price = self._apply_slippage(current_option_price, is_entry=False)
+            pnl = self._calc_pnl(pos, exit_price)
+            return {
+                "exit_date": str(current_date),
+                "exit_price": round(exit_price, 2),
+                "pnl": round(pnl, 2),
+                "exit_reason": "expiry",
+            }
+
+        return None
+
+    def _check_exit_trailing(
+        self,
+        pos: dict,
+        current_option_price: float,
+        current_date: date,
+    ) -> dict | None:
+        """Dynamic trailing stop exit logic (mirrors PortfolioManager).
+
+        Three tiers:
+        1. HWM below breakeven trigger  -> use initial fixed stop (-stop_loss_pct)
+        2. HWM at/above breakeven trigger -> effective_stop = max(0, HWM - trailing_pct)
+        Exit when pnl_pct drops to or below the effective stop.
+        """
+        entry_price = pos["entry_price"]
+        pnl_pct = (current_option_price - entry_price) / entry_price
+
+        # Update high water mark
+        pos["high_water_mark"] = max(pos.get("high_water_mark", 0.0), pnl_pct)
+        hwm = pos["high_water_mark"]
+
+        # Determine effective stop level
+        if hwm < self._breakeven_trigger_pct:
+            # Tier 1: below breakeven trigger, use initial fixed stop
+            effective_stop = -self._stop_loss_pct
+            stop_label = "stop_loss"
+        else:
+            # Tier 2/3: above breakeven trigger, trail from HWM
+            effective_stop = max(0.0, hwm - self._trailing_stop_pct)
+            stop_label = "breakeven_stop" if effective_stop == 0.0 else "trailing_stop"
+
+        if pnl_pct <= effective_stop:
+            exit_price = self._apply_slippage(current_option_price, is_entry=False)
+            pnl = self._calc_pnl(pos, exit_price)
+            return {
+                "exit_date": str(current_date),
+                "exit_price": round(exit_price, 2),
+                "pnl": round(pnl, 2),
+                "exit_reason": stop_label,
+            }
+
+        # Expiry check still applies
         expiry = date.fromisoformat(pos["expiry_date"])
         if current_date >= expiry:
             exit_price = self._apply_slippage(current_option_price, is_entry=False)

@@ -102,13 +102,17 @@ def _tab_portfolio_overview(conn: sqlite3.Connection) -> None:
 
     st.divider()
 
-    # Open Positions
+    # Open Positions (with HWM from open_positions table)
     st.subheader("Open Positions")
     open_positions = _safe_query(
         conn,
-        "SELECT symbol, strategy, direction, entry_price, quantity, entry_time, "
-        "ml_confidence FROM trades WHERE status IN ('filled', 'partial') "
-        "ORDER BY entry_time DESC",
+        "SELECT t.symbol, t.strategy, t.direction, t.entry_price, t.quantity, "
+        "t.entry_time, t.ml_confidence, "
+        "COALESCE(op.high_water_mark, 0) as peak_pnl_pct "
+        "FROM trades t "
+        "LEFT JOIN open_positions op ON t.trade_id = op.trade_id "
+        "WHERE t.status IN ('filled', 'partial') "
+        "ORDER BY t.entry_time DESC",
     )
     if not open_positions.empty:
         st.dataframe(open_positions, use_container_width=True)
@@ -462,6 +466,161 @@ def _tab_self_learning(conn: sqlite3.Connection) -> None:
         st.info("No learning state entries found")
 
 
+def _tab_trade_intelligence(conn: sqlite3.Connection) -> None:
+    """New tab: exit management, meta-label, thesis invalidation insights."""
+    import streamlit as st
+
+    # --- Exit Management Overview ---
+    st.subheader("Dynamic Exit Management")
+
+    # Trades with journaling data
+    exit_data = _safe_query(
+        conn,
+        "SELECT symbol, strategy, exit_reason_detailed, peak_pnl_pct, "
+        "realized_pnl, direction_correct "
+        "FROM trades WHERE status = 'closed' AND exit_reason_detailed != '' "
+        "ORDER BY exit_time DESC LIMIT 50",
+    )
+
+    if not exit_data.empty:
+        # Exit reason breakdown
+        st.write("**Exit Reason Distribution**")
+        reason_counts = exit_data["exit_reason_detailed"].apply(
+            lambda x: x.split(":")[0] if ":" in str(x) else str(x)
+        ).value_counts()
+        reason_df = pd.DataFrame({
+            "Exit Reason": reason_counts.index,
+            "Count": reason_counts.values,
+        })
+        st.dataframe(reason_df, use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # Peak vs Realized P&L (profit giveback analysis)
+        st.write("**Peak vs Realized P&L (Profit Capture Efficiency)**")
+        has_peak = exit_data[exit_data["peak_pnl_pct"] > 0].copy()
+        if not has_peak.empty:
+            has_peak["capture_pct"] = has_peak.apply(
+                lambda r: (r["realized_pnl"] / (r["peak_pnl_pct"] * 100)) * 100
+                if r["peak_pnl_pct"] > 0 else 0, axis=1
+            )
+            avg_capture = has_peak["capture_pct"].mean()
+            avg_peak = has_peak["peak_pnl_pct"].mean()
+            c1, c2 = st.columns(2)
+            c1.metric("Avg Peak P&L %", f"{avg_peak:.1%}")
+            c2.metric("Avg Capture Efficiency", f"{avg_capture:.0f}%")
+
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=has_peak["symbol"],
+                y=has_peak["peak_pnl_pct"] * 100,
+                name="Peak P&L %",
+                marker_color="lightblue",
+            ))
+            fig.add_trace(go.Bar(
+                x=has_peak["symbol"],
+                y=has_peak["realized_pnl"],
+                name="Realized P&L $",
+                marker_color=["green" if p > 0 else "red" for p in has_peak["realized_pnl"]],
+            ))
+            fig.update_layout(barmode="group", height=350)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No trades with peak P&L data yet")
+
+        st.divider()
+
+        # Direction accuracy
+        st.write("**ML Direction Accuracy**")
+        known = exit_data[exit_data["direction_correct"].isin([0, 1])]
+        if not known.empty:
+            correct = known["direction_correct"].sum()
+            total = len(known)
+            dc1, dc2, dc3 = st.columns(3)
+            dc1.metric("Direction Correct", f"{correct}/{total}")
+            dc2.metric("Direction Accuracy", f"{correct / total * 100:.1f}%")
+
+            # Direction right but lost money = exit problem
+            right_but_lost = known[(known["direction_correct"] == 1) & (known["realized_pnl"] <= 0)]
+            dc3.metric("Right Direction, Lost $", f"{len(right_but_lost)}/{correct}")
+            if len(right_but_lost) > 0:
+                st.warning(
+                    f"{len(right_but_lost)} trades had correct direction but lost money — "
+                    "exit management is the bottleneck, not ML predictions."
+                )
+        else:
+            st.info("No direction accuracy data yet (needs trade context)")
+    else:
+        st.info("No exit intelligence data yet — trades need exit_reason_detailed")
+
+    st.divider()
+
+    # --- High Water Marks on Open Positions ---
+    st.subheader("Open Position Health")
+    open_hwm = _safe_query(
+        conn,
+        "SELECT op.trade_id, t.symbol, t.strategy, op.high_water_mark, "
+        "op.quantity, op.entry_price "
+        "FROM open_positions op "
+        "JOIN trades t ON op.trade_id = t.trade_id "
+        "WHERE t.status IN ('filled', 'partial') "
+        "ORDER BY op.high_water_mark DESC",
+    )
+    if not open_hwm.empty:
+        open_hwm["high_water_mark"] = open_hwm["high_water_mark"].apply(
+            lambda x: f"{x:.1%}" if x else "0%"
+        )
+        st.dataframe(open_hwm, use_container_width=True, hide_index=True)
+    else:
+        st.info("No open positions with HWM data")
+
+    st.divider()
+
+    # --- Partial Exit History ---
+    st.subheader("Partial Exits")
+    partial_data = _safe_query(
+        conn,
+        "SELECT op.trade_id, t.symbol, op.partial_exits "
+        "FROM open_positions op "
+        "JOIN trades t ON op.trade_id = t.trade_id "
+        "WHERE op.partial_exits != '[]'",
+    )
+    if not partial_data.empty:
+        for _, row in partial_data.iterrows():
+            try:
+                exits = json.loads(row["partial_exits"])
+                if exits:
+                    st.write(f"**{row['symbol']}** ({row['trade_id']})")
+                    exits_df = pd.DataFrame(exits)
+                    st.dataframe(exits_df, use_container_width=True, hide_index=True)
+            except (json.JSONDecodeError, TypeError):
+                pass
+    else:
+        st.info("No partial exits recorded yet")
+
+    st.divider()
+
+    # --- Meta-Label Stats ---
+    st.subheader("Meta-Label Filter")
+    meta_stats = _get_state_json(conn, "meta_label_stats")
+    if meta_stats and isinstance(meta_stats, dict):
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Accuracy", f"{meta_stats.get('accuracy', 0):.1%}")
+        m2.metric("Precision", f"{meta_stats.get('precision', 0):.1%}")
+        m3.metric("Trades Used", meta_stats.get("trades_used", 0))
+
+        top_features = meta_stats.get("top_features", {})
+        if top_features:
+            st.write("**Top Predictive Features**")
+            feat_df = pd.DataFrame([
+                {"Feature": k, "Importance": f"{v:.3f}"}
+                for k, v in top_features.items()
+            ])
+            st.dataframe(feat_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("Meta-labeler not yet trained (needs 30+ closed trades with context)")
+
+
 def _tab_system_health(conn: sqlite3.Connection) -> None:
     import streamlit as st
 
@@ -593,8 +752,9 @@ def main() -> None:
     end_date = st.sidebar.date_input("End date", value=date.today())
 
     # --- Tabs ---
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["Portfolio Overview", "Trade History", "Analytics", "Self-Learning", "System Health"]
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        ["Portfolio Overview", "Trade History", "Analytics",
+         "Trade Intelligence", "Self-Learning", "System Health"]
     )
 
     with tab1:
@@ -607,9 +767,12 @@ def main() -> None:
         _tab_analytics(conn)
 
     with tab4:
-        _tab_self_learning(conn)
+        _tab_trade_intelligence(conn)
 
     with tab5:
+        _tab_self_learning(conn)
+
+    with tab6:
         _tab_system_health(conn)
 
     conn.close()

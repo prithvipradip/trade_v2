@@ -51,6 +51,24 @@ ml:
   lookback_days: 252                   # 1 year of trading days
   min_training_samples: 100
 
+meta_label:
+  enabled: true                        # Secondary ML model filters false positive signals
+  min_probability: 0.50                # Min P(profitable) to take a trade (0.30-0.80)
+  retrain_with_primary: true           # Retrain when primary model retrains
+
+exit:
+  trailing_stop_pct: 0.25             # Trail 25% below high water mark
+  breakeven_trigger_pct: 0.30         # Move stop to breakeven at +30% P&L
+  initial_stop_loss_pct: 0.50         # Fixed stop before breakeven activates
+  partial_exit_levels:                 # Scale out at profit milestones
+    - pnl_pct: 0.50                   # At +50%: close 33%
+      close_pct: 0.33
+    - pnl_pct: 1.00                   # At +100%: close another 33%
+      close_pct: 0.33
+  time_decay_scaling: true            # Lower take-profit target as DTE decreases
+  volatility_adjusted_stops: true     # Widen stops for high-vol underlyings (ATR-based)
+  auto_hedge: false                   # Auto-execute delta hedges (enable after paper testing)
+
 learning:
   enabled: true                          # Self-learning: adapt strategies from past trades
   lookback_days: 30                      # Analyze last 30 days of trades
