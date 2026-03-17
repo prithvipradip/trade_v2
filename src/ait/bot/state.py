@@ -69,6 +69,12 @@ class TradeRecord:
     # Multi-leg details (JSON for spreads/condors)
     legs: str = "[]"
 
+    # Journaling (populated on close)
+    exit_reason_detailed: str = ""
+    peak_pnl_pct: float = 0.0
+    time_to_peak_hours: float = 0.0
+    direction_correct: int = -1  # -1 = unknown, 0 = wrong, 1 = correct
+
 
 @dataclass
 class DailyStats:
