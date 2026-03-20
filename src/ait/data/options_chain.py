@@ -208,11 +208,10 @@ class OptionsChainService:
             if not qualified:
                 return []
 
-            # Get available option chains
-            chains_data = self._ibkr.ib.reqSecDefOptParams(
+            # Get available option chains (use async version to avoid blocking event loop)
+            chains_data = await self._ibkr.ib.reqSecDefOptParamsAsync(
                 qualified.symbol, "", qualified.secType, qualified.conId
             )
-            await asyncio.sleep(1)
 
             if not chains_data:
                 return []
@@ -351,89 +350,113 @@ class OptionsChainService:
             puts=sorted(puts, key=lambda p: p.strike),
         )
 
+    def _fetch_yahoo_chain_sync(
+        self, symbol: str, price: float, min_dte: int, max_dte: int
+    ) -> list[OptionsChain]:
+        """Synchronous Yahoo Finance chain fetch (runs in executor)."""
+        import math
+
+        import yfinance as yf
+
+        ticker = yf.Ticker(symbol)
+        expiry_strings = ticker.options  # List of expiry date strings
+
+        if not expiry_strings:
+            return []
+
+        today = date.today()
+        chains = []
+
+        def _safe_int(val, default=0):
+            try:
+                v = float(val) if val is not None else default
+                return default if math.isnan(v) else int(v)
+            except (TypeError, ValueError):
+                return default
+
+        def _safe_float(val, default=0.0):
+            try:
+                v = float(val) if val is not None else default
+                return default if math.isnan(v) else v
+            except (TypeError, ValueError):
+                return default
+
+        for exp_str in expiry_strings:
+            exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+            dte = (exp_date - today).days
+            if not (min_dte <= dte <= max_dte):
+                continue
+
+            try:
+                opt_chain = ticker.option_chain(exp_str)
+            except Exception:
+                continue
+
+            calls = []
+            for _, row in opt_chain.calls.iterrows():
+                strike = _safe_float(row.get("strike"))
+                if not strike or abs(strike - price) > price * 0.20:
+                    continue
+                calls.append(
+                    OptionContract(
+                        symbol=symbol,
+                        expiry=exp_date,
+                        strike=strike,
+                        right="C",
+                        bid=_safe_float(row.get("bid")),
+                        ask=_safe_float(row.get("ask")),
+                        last=_safe_float(row.get("lastPrice")),
+                        volume=_safe_int(row.get("volume")),
+                        open_interest=_safe_int(row.get("openInterest")),
+                        implied_vol=_safe_float(row.get("impliedVolatility")),
+                    )
+                )
+
+            puts = []
+            for _, row in opt_chain.puts.iterrows():
+                strike = _safe_float(row.get("strike"))
+                if not strike or abs(strike - price) > price * 0.20:
+                    continue
+                puts.append(
+                    OptionContract(
+                        symbol=symbol,
+                        expiry=exp_date,
+                        strike=strike,
+                        right="P",
+                        bid=_safe_float(row.get("bid")),
+                        ask=_safe_float(row.get("ask")),
+                        last=_safe_float(row.get("lastPrice")),
+                        volume=_safe_int(row.get("volume")),
+                        open_interest=_safe_int(row.get("openInterest")),
+                        implied_vol=_safe_float(row.get("impliedVolatility")),
+                    )
+                )
+
+            if calls or puts:
+                chains.append(
+                    OptionsChain(
+                        symbol=symbol,
+                        underlying_price=price,
+                        expiry=exp_date,
+                        calls=sorted(calls, key=lambda c: c.strike),
+                        puts=sorted(puts, key=lambda p: p.strike),
+                    )
+                )
+
+            if len(chains) >= 3:
+                break
+
+        return chains
+
     async def _get_yahoo_chain(
         self, symbol: str, price: float, min_dte: int, max_dte: int
     ) -> list[OptionsChain]:
         """Fetch options chain from Yahoo Finance as fallback."""
         try:
-            import yfinance as yf
-
-            ticker = yf.Ticker(symbol)
-            expiry_strings = ticker.options  # List of expiry date strings
-
-            if not expiry_strings:
-                return []
-
-            today = date.today()
-            chains = []
-
-            for exp_str in expiry_strings:
-                exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
-                dte = (exp_date - today).days
-                if not (min_dte <= dte <= max_dte):
-                    continue
-
-                try:
-                    opt_chain = ticker.option_chain(exp_str)
-                except Exception:
-                    continue
-
-                calls = []
-                for _, row in opt_chain.calls.iterrows():
-                    strike = float(row["strike"])
-                    if abs(strike - price) > price * 0.20:
-                        continue
-                    calls.append(
-                        OptionContract(
-                            symbol=symbol,
-                            expiry=exp_date,
-                            strike=strike,
-                            right="C",
-                            bid=float(row.get("bid", 0)),
-                            ask=float(row.get("ask", 0)),
-                            last=float(row.get("lastPrice", 0)),
-                            volume=int(row.get("volume", 0) or 0),
-                            open_interest=int(row.get("openInterest", 0) or 0),
-                            implied_vol=float(row.get("impliedVolatility", 0) or 0),
-                        )
-                    )
-
-                puts = []
-                for _, row in opt_chain.puts.iterrows():
-                    strike = float(row["strike"])
-                    if abs(strike - price) > price * 0.20:
-                        continue
-                    puts.append(
-                        OptionContract(
-                            symbol=symbol,
-                            expiry=exp_date,
-                            strike=strike,
-                            right="P",
-                            bid=float(row.get("bid", 0)),
-                            ask=float(row.get("ask", 0)),
-                            last=float(row.get("lastPrice", 0)),
-                            volume=int(row.get("volume", 0) or 0),
-                            open_interest=int(row.get("openInterest", 0) or 0),
-                            implied_vol=float(row.get("impliedVolatility", 0) or 0),
-                        )
-                    )
-
-                if calls or puts:
-                    chains.append(
-                        OptionsChain(
-                            symbol=symbol,
-                            underlying_price=price,
-                            expiry=exp_date,
-                            calls=sorted(calls, key=lambda c: c.strike),
-                            puts=sorted(puts, key=lambda p: p.strike),
-                        )
-                    )
-
-                if len(chains) >= 3:
-                    break
-
-            return chains
-
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None, self._fetch_yahoo_chain_sync, symbol, price, min_dte, max_dte
+            )
         except Exception as e:
             log.warning("yahoo_chain_failed", symbol=symbol, error=str(e))
             return []

@@ -12,6 +12,7 @@ from ib_insync import (
     Order,
     StopOrder,
     BracketOrder,
+    TagValue,
 )
 
 from ait.utils.logging import get_logger
@@ -110,7 +111,7 @@ class OrderBuilder:
         order.orderType = "MKT"
         order.algoStrategy = "Adaptive"
         order.algoParams = [
-            {"tag": "adaptivePriority", "value": "Normal"},
+            TagValue("adaptivePriority", "Normal"),
         ]
         order.tif = "DAY"
         return order

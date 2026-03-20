@@ -48,6 +48,7 @@ from ait.sentiment.engine import SentimentEngine
 from ait.strategies.base import SignalDirection
 from ait.strategies.selector import StrategySelector
 from ait.utils.logging import get_logger
+from ait.utils.time import next_market_open
 
 log = get_logger("bot.orchestrator")
 
@@ -156,6 +157,9 @@ class TradingOrchestrator:
         self._running = True
         log.info("orchestrator_starting", mode=self._settings.trading.mode)
 
+        # Train models on startup if not yet trained (handles case where bot starts during market hours)
+        await self._trainer.ensure_models_ready(self._settings.trading.universe)
+
         while self._running:
             try:
                 phase = self._scheduler.get_current_phase()
@@ -172,7 +176,7 @@ class TradingOrchestrator:
                     await self._scheduler.wait_for_phase(TradingPhase.PRE_MARKET)
 
                 elif phase == TradingPhase.OFF_HOURS:
-                    log.info("off_hours", next_open=str(self._scheduler))
+                    log.info("off_hours", next_open=str(next_market_open()))
                     await self._scheduler.wait_for_phase(TradingPhase.PRE_MARKET)
 
             except KeyboardInterrupt:
@@ -666,7 +670,7 @@ class TradingOrchestrator:
                 stats.trades_won += 1
             else:
                 stats.trades_lost += 1
-                self._circuit_breaker.record_loss(realized_pnl)
+                self._circuit_breaker.record_trade_result(realized_pnl)
             self._state.update_daily_stats(stats)
 
             # Notify
@@ -732,6 +736,7 @@ class TradingOrchestrator:
                 quantity=qty_to_close,
                 price=pos.current_price,
                 pnl=partial_pnl,
+                pnl_level=pnl_level,
             )
 
             # Update remaining quantity
@@ -790,7 +795,30 @@ class TradingOrchestrator:
             })
 
         combo = ContractBuilder.combo(symbol=trade.symbol, legs=qualified_legs)
-        order = OrderBuilder.market(action="BUY", quantity=trade.quantity)
+
+        # Use a limit order instead of market to avoid poor fills on combos.
+        # Attempt to get the mid-price of the spread from IBKR.
+        limit_price = 0.01  # Aggressive fallback for credit spreads being closed
+        try:
+            qualified_combo = await self._ibkr.qualify_contract(combo)
+            if qualified_combo:
+                self._ibkr.ib.reqMktData(qualified_combo, "", False, False)
+                await asyncio.sleep(0.5)
+                ticker = self._ibkr.ib.ticker(qualified_combo)
+                if ticker:
+                    import math
+                    bid = ticker.bid if not math.isnan(ticker.bid) else None
+                    ask = ticker.ask if not math.isnan(ticker.ask) else None
+                    if bid is not None and ask is not None and bid > 0 and ask > 0:
+                        limit_price = round((bid + ask) / 2, 2)
+                    elif bid is not None and bid > 0:
+                        limit_price = round(bid, 2)
+                    elif ask is not None and ask > 0:
+                        limit_price = round(ask, 2)
+        except Exception as e:
+            log.warning("combo_mid_price_failed", error=str(e), fallback=limit_price)
+
+        order = OrderBuilder.combo_limit(action="BUY", quantity=trade.quantity, limit_price=limit_price)
         await self._ibkr.place_order(combo, order)
 
     async def _post_market(self) -> None:

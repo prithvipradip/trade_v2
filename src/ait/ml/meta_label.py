@@ -190,7 +190,6 @@ class MetaLabeler:
                 scale_pos_weight=n_negative / max(1, n_positive),
                 objective="binary:logistic",
                 eval_metric="logloss",
-                use_label_encoder=False,
                 verbosity=0,
                 n_jobs=-1,
             )

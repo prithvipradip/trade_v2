@@ -95,9 +95,23 @@ class EarningsCalendar:
             ticker = yf.Ticker(symbol)
             cal = ticker.calendar
 
-            if cal is not None and not cal.empty:
-                # yfinance returns earnings date in different formats
-                if hasattr(cal, "iloc"):
+            # yfinance calendar can be a dict or DataFrame depending on version
+            cal_empty = (
+                cal is None
+                or (isinstance(cal, dict) and not cal)
+                or (hasattr(cal, "empty") and cal.empty)
+            )
+            if not cal_empty:
+                # Dict format (newer yfinance)
+                if isinstance(cal, dict):
+                    for val in cal.values():
+                        if isinstance(val, list) and val:
+                            val = val[0]
+                        if isinstance(val, (datetime, date)):
+                            earnings_date = val if isinstance(val, date) else val.date()
+                            return EarningsInfo(symbol=symbol, next_earnings_date=earnings_date)
+
+                elif hasattr(cal, "iloc"):
                     # DataFrame format
                     earnings_date = None
                     for col in cal.columns:

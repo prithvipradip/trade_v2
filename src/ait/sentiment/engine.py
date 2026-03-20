@@ -112,11 +112,16 @@ class SentimentEngine:
         if self._finbert and self._news:
             total_sources += 1
             try:
-                # Get headlines and run FinBERT
+                import asyncio
+                # Get headlines and run FinBERT (blocking torch inference — run in thread)
                 articles = await self._news._fetch_news(symbol)
                 if articles:
                     headlines = [a.headline for a in articles[:10]]
-                    finbert_scores = self._finbert.analyze_batch(headlines)
+                    loop = asyncio.get_running_loop()
+                    finbert_scores = await asyncio.wait_for(
+                        loop.run_in_executor(None, self._finbert.analyze_batch, headlines),
+                        timeout=30.0,
+                    )
                     valid_scores = [s for s in finbert_scores if s is not None]
                     if valid_scores:
                         finbert_score = sum(valid_scores) / len(valid_scores)

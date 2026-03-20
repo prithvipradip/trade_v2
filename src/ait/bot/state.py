@@ -188,16 +188,23 @@ class StateManager:
     # --- Trade Management ---
 
     def record_trade(self, trade: TradeRecord) -> None:
-        """Insert or update a trade record."""
+        """Insert or update a trade record.
+
+        Uses INSERT OR IGNORE for new trades to avoid overwriting journaling
+        columns (exit_reason_detailed, peak_pnl_pct, time_to_peak_hours,
+        direction_correct) that are populated on close.
+        """
         with sqlite3.connect(self._db_path) as conn:
             conn.execute(
-                """INSERT OR REPLACE INTO trades
+                """INSERT OR IGNORE INTO trades
                    (trade_id, symbol, strategy, direction, status,
                     entry_time, entry_price, quantity, contract_type,
                     strike, expiry, exit_time, exit_price,
                     realized_pnl, commission, ml_confidence,
-                    sentiment_score, market_regime, notes, legs)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    sentiment_score, market_regime, notes, legs,
+                    exit_reason_detailed, peak_pnl_pct,
+                    time_to_peak_hours, direction_correct)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     trade.trade_id, trade.symbol, trade.strategy,
                     trade.direction.value, trade.status.value,
@@ -207,7 +214,16 @@ class StateManager:
                     trade.commission, trade.ml_confidence,
                     trade.sentiment_score, trade.market_regime,
                     trade.notes, trade.legs,
+                    "", 0.0, 0.0, -1,
                 ),
+            )
+
+    def update_trade_status(self, trade_id: str, status: TradeStatus) -> None:
+        """Update the status of an existing trade without touching journaling columns."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                "UPDATE trades SET status = ? WHERE trade_id = ?",
+                (status.value, trade_id),
             )
 
     def close_trade(
@@ -322,15 +338,30 @@ class StateManager:
             ).fetchone()
         return row[0] if row else 0.0
 
-    def record_partial_exit(self, trade_id: str, quantity: int, price: float, pnl: float) -> None:
-        """Record a partial exit for a trade."""
+    def record_partial_exit(
+        self,
+        trade_id: str,
+        quantity: int,
+        price: float,
+        pnl: float,
+        pnl_level: float | None = None,
+    ) -> None:
+        """Record a partial exit for a trade.
+
+        Args:
+            pnl_level: The milestone P&L level that triggered this partial exit.
+                       Stored so the same level is not re-triggered.
+        """
         raw = self.get_partial_exits(trade_id)
-        raw.append({
+        entry: dict = {
             "quantity": quantity,
             "price": price,
             "pnl": pnl,
             "time": datetime.now().isoformat(),
-        })
+        }
+        if pnl_level is not None:
+            entry["pnl_level"] = pnl_level
+        raw.append(entry)
         with sqlite3.connect(self._db_path) as conn:
             conn.execute(
                 "UPDATE open_positions SET partial_exits = ? WHERE trade_id = ?",

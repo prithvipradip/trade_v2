@@ -8,6 +8,7 @@ NO mock/fake data is ever returned.
 from __future__ import annotations
 
 import asyncio
+import math
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
@@ -134,8 +135,9 @@ class MarketDataService:
 
         # Yahoo fallback for VIX
         try:
-            ticker = yf.Ticker("^VIX")
-            data = ticker.history(period="1d")
+            loop = asyncio.get_running_loop()
+            ticker = await loop.run_in_executor(None, lambda: yf.Ticker("^VIX"))
+            data = await loop.run_in_executor(None, lambda: ticker.history(period="1d"))
             if not data.empty:
                 return float(data["Close"].iloc[-1])
         except Exception as e:
@@ -161,15 +163,21 @@ class MarketDataService:
             await asyncio.sleep(0.5)  # Brief wait for data
 
             ticker = self._ibkr.ib.ticker(qualified)
-            if ticker and (ticker.last > 0 or ticker.bid > 0):
-                return Quote(
-                    symbol=symbol,
-                    bid=ticker.bid if ticker.bid and ticker.bid > 0 else 0.0,
-                    ask=ticker.ask if ticker.ask and ticker.ask > 0 else 0.0,
-                    last=ticker.last if ticker.last and ticker.last > 0 else 0.0,
-                    volume=int(ticker.volume) if ticker.volume else 0,
-                    timestamp=datetime.now(),
-                )
+            if ticker:
+                bid = ticker.bid if not math.isnan(ticker.bid) else 0.0
+                ask = ticker.ask if not math.isnan(ticker.ask) else 0.0
+                last = ticker.last if not math.isnan(ticker.last) else 0.0
+                volume = int(ticker.volume) if not math.isnan(ticker.volume) else 0
+
+                if last > 0 or bid > 0:
+                    return Quote(
+                        symbol=symbol,
+                        bid=bid if bid > 0 else 0.0,
+                        ask=ask if ask > 0 else 0.0,
+                        last=last if last > 0 else 0.0,
+                        volume=volume,
+                        timestamp=datetime.now(),
+                    )
         except Exception as e:
             log.debug("ibkr_quote_failed", symbol=symbol, error=str(e))
 
@@ -184,15 +192,19 @@ class MarketDataService:
             end = date.today()
             start = end - timedelta(days=int(days * 1.5))  # Extra days for non-trading days
 
-            aggs = list(
-                self._polygon_client.list_aggs(
-                    ticker=symbol,
-                    multiplier=1,
-                    timespan="day",
-                    from_=start.strftime("%Y-%m-%d"),
-                    to=end.strftime("%Y-%m-%d"),
-                    limit=50000,
-                )
+            loop = asyncio.get_running_loop()
+            aggs = await loop.run_in_executor(
+                None,
+                lambda: list(
+                    self._polygon_client.list_aggs(
+                        ticker=symbol,
+                        multiplier=1,
+                        timespan="day",
+                        from_=start.strftime("%Y-%m-%d"),
+                        to=end.strftime("%Y-%m-%d"),
+                        limit=50000,
+                    )
+                ),
             )
 
             if not aggs:
@@ -238,8 +250,11 @@ class MarketDataService:
             else:
                 period = "2y"
 
-            ticker = yf.Ticker(symbol)
-            df = ticker.history(period=period, interval=interval)
+            loop = asyncio.get_running_loop()
+            ticker = await loop.run_in_executor(None, lambda: yf.Ticker(symbol))
+            df = await loop.run_in_executor(
+                None, lambda: ticker.history(period=period, interval=interval)
+            )
 
             if df is None or df.empty:
                 return None
@@ -256,12 +271,13 @@ class MarketDataService:
     async def _get_yahoo_quote(self, symbol: str) -> Quote | None:
         """Get quote from Yahoo Finance (slower, but always available)."""
         try:
-            ticker = yf.Ticker(symbol)
-            info = ticker.fast_info
+            loop = asyncio.get_running_loop()
+            ticker = await loop.run_in_executor(None, lambda: yf.Ticker(symbol))
+            info = await loop.run_in_executor(None, lambda: ticker.fast_info)
 
             last = float(info.last_price) if hasattr(info, "last_price") else 0.0
             if last <= 0:
-                data = ticker.history(period="1d")
+                data = await loop.run_in_executor(None, lambda: ticker.history(period="1d"))
                 if data.empty:
                     return None
                 last = float(data["Close"].iloc[-1])

@@ -95,15 +95,23 @@ class NewsSentiment:
 
     async def _fetch_news(self, symbol: str) -> list[NewsItem]:
         """Fetch news from available sources."""
+        import asyncio
+        loop = asyncio.get_running_loop()
         articles = []
 
-        # Finnhub company news
+        # Finnhub company news (blocking SDK — run in thread)
         if self._finnhub_client:
-            finnhub_articles = self._fetch_finnhub(symbol)
+            finnhub_articles = await asyncio.wait_for(
+                loop.run_in_executor(None, self._fetch_finnhub, symbol),
+                timeout=10.0,
+            )
             articles.extend(finnhub_articles)
 
-        # RSS feeds for general market sentiment
-        rss_articles = self._fetch_rss(symbol)
+        # RSS feeds (blocking — run in thread)
+        rss_articles = await asyncio.wait_for(
+            loop.run_in_executor(None, self._fetch_rss, symbol),
+            timeout=10.0,
+        )
         articles.extend(rss_articles)
 
         return articles

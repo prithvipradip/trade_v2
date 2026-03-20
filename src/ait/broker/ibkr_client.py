@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Union
 
 from ib_insync import IB, Contract, Order, Trade, util
 
@@ -151,10 +151,26 @@ class IBKRClient:
             )
             return None
 
-    async def cancel_order(self, trade: Trade) -> bool:
-        """Cancel a pending order."""
+    async def cancel_order(self, trade_or_id: Union[Trade, int]) -> bool:
+        """Cancel a pending order.
+
+        Args:
+            trade_or_id: Either a Trade object or an integer order ID.
+        """
         if not await self.ensure_connected():
             return False
+
+        if isinstance(trade_or_id, int):
+            # Look up the trade by order ID
+            order_id = trade_or_id
+            matching = [t for t in self._ib.trades() if t.order.orderId == order_id]
+            if not matching:
+                log.error("order_cancel_failed", order_id=order_id, error="no matching trade found")
+                return False
+            trade = matching[0]
+        else:
+            trade = trade_or_id
+
         try:
             self._ib.cancelOrder(trade.order)
             log.info("order_cancelled", order_id=trade.order.orderId)
@@ -162,6 +178,12 @@ class IBKRClient:
         except Exception as e:
             log.error("order_cancel_failed", order_id=trade.order.orderId, error=str(e))
             return False
+
+    def get_all_trades(self) -> list[Trade]:
+        """Get all trades (open and completed) from IBKR."""
+        if not self.connected:
+            return []
+        return self._ib.trades()
 
     def get_positions(self) -> list:
         """Get all current positions from IBKR."""

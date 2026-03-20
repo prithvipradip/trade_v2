@@ -9,6 +9,7 @@ When the bot restarts (crash, manual stop, etc.), this module:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -36,6 +37,34 @@ class PositionReconciler:
         self._ibkr = ibkr_client
         self._state = state
 
+    @staticmethod
+    def _normalize_expiry(expiry: str | None) -> str:
+        """Normalize expiry date to YYYY-MM-DD format.
+
+        IBKR returns lastTradeDateOrContractMonth in YYYYMMDD format,
+        while local trades may store YYYY-MM-DD. This normalizes both.
+        """
+        if not expiry:
+            return ""
+        # Strip any whitespace
+        expiry = expiry.strip()
+        # If already YYYY-MM-DD, return as-is
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", expiry):
+            return expiry
+        # Convert YYYYMMDD to YYYY-MM-DD
+        if re.match(r"^\d{8}$", expiry):
+            return f"{expiry[:4]}-{expiry[4:6]}-{expiry[6:8]}"
+        return expiry
+
+    @staticmethod
+    def _make_position_key(symbol: str, strike: float, right: str, expiry: str) -> str:
+        """Build a normalized position key: symbol:strike:right:expiry.
+
+        Drops secType/contract_type since it's redundant with right (C/P).
+        """
+        normalized_expiry = PositionReconciler._normalize_expiry(expiry)
+        return f"{symbol}:{strike}:{right}:{normalized_expiry}"
+
     async def reconcile(self) -> ReconciliationResult:
         """Perform full reconciliation between local state and IBKR.
 
@@ -47,12 +76,19 @@ class PositionReconciler:
         ibkr_positions = self._ibkr.get_positions()
         ibkr_portfolio = self._ibkr.get_portfolio()
 
-        # Build IBKR position map: (symbol, secType) → details
+        # Build IBKR position map using normalized keys
         ibkr_map: dict[str, dict] = {}
         for pos in ibkr_positions:
-            key = f"{pos.contract.symbol}:{pos.contract.secType}"
             if pos.contract.secType == "OPT":
-                key += f":{pos.contract.strike}:{pos.contract.right}:{pos.contract.lastTradeDateOrContractMonth}"
+                key = self._make_position_key(
+                    symbol=pos.contract.symbol,
+                    strike=pos.contract.strike,
+                    right=pos.contract.right,
+                    expiry=pos.contract.lastTradeDateOrContractMonth,
+                )
+            else:
+                # For stocks, just use symbol
+                key = f"{pos.contract.symbol}:STK"
             ibkr_map[key] = {
                 "symbol": pos.contract.symbol,
                 "sec_type": pos.contract.secType,
@@ -61,14 +97,21 @@ class PositionReconciler:
                 "contract": pos.contract,
             }
 
-        # Get local open trades
+        # Get local open trades and build map with matching normalized keys
         local_trades = self._state.get_open_trades()
         local_map: dict[str, dict] = {}
         for trade in local_trades:
-            key = f"{trade.symbol}:{trade.contract_type}"
             if trade.strike:
                 right = "C" if "call" in trade.strategy else "P"
-                key += f":{trade.strike}:{right}:{trade.expiry}"
+                key = self._make_position_key(
+                    symbol=trade.symbol,
+                    strike=trade.strike,
+                    right=right,
+                    expiry=trade.expiry or "",
+                )
+            else:
+                # Stock positions
+                key = f"{trade.symbol}:STK"
             local_map[key] = {"trade": trade}
 
         result = ReconciliationResult(

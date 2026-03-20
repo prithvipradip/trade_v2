@@ -29,12 +29,23 @@ class FinBERTAnalyzer:
             from transformers import pipeline
 
             log.info("loading_finbert_model")
-            self._pipeline = pipeline(
-                "sentiment-analysis",
-                model="ProsusAI/finbert",
-                device=-1,  # CPU only
-                top_k=None,
-            )
+            try:
+                self._pipeline = pipeline(
+                    "sentiment-analysis",
+                    model="ProsusAI/finbert",
+                    device=-1,  # CPU only
+                    top_k=None,
+                    local_files_only=True,
+                )
+            except Exception:
+                log.info("finbert_local_not_found, downloading")
+                self._pipeline = pipeline(
+                    "sentiment-analysis",
+                    model="ProsusAI/finbert",
+                    device=-1,  # CPU only
+                    top_k=None,
+                    local_files_only=False,
+                )
             self._loaded = True
             log.info("finbert_model_loaded")
             return True
@@ -84,7 +95,7 @@ class FinBERTAnalyzer:
     def analyze_batch(self, texts: list[str]) -> list[float | None]:
         """Analyze sentiment for multiple texts.
 
-        More efficient than calling analyze() in a loop.
+        More efficient than calling analyze() in a loop — uses batched inference.
         """
         if not texts:
             return []
@@ -92,7 +103,25 @@ class FinBERTAnalyzer:
         if not self._load_model():
             return [None] * len(texts)
 
-        results = []
-        for text in texts:
-            results.append(self.analyze(text))
-        return results
+        try:
+            truncated = [t[:512] for t in texts]
+            batch_results = self._pipeline(truncated, top_k=None)
+
+            scores: list[float | None] = []
+            for items in batch_results:
+                score = 0.0
+                if isinstance(items, list):
+                    for item in items:
+                        label = item["label"].lower()
+                        prob = item["score"]
+                        if label == "positive":
+                            score += prob
+                        elif label == "negative":
+                            score -= prob
+                scores.append(score)
+
+            return scores
+
+        except Exception as e:
+            log.debug("finbert_batch_failed", error=str(e))
+            return [None] * len(texts)

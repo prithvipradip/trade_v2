@@ -11,6 +11,7 @@ All data from Yahoo Finance — no paid APIs needed.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 
 import numpy as np
@@ -145,16 +146,21 @@ class FearGreedIndicator:
         Uses a small basket of major stocks as a proxy.
         """
         breadth_symbols = ["AAPL", "MSFT", "AMZN", "GOOGL", "META", "NVDA", "TSLA"]
+
+        results = await asyncio.gather(
+            *(self._market_data.get_historical(sym, days=10) for sym in breadth_symbols),
+            return_exceptions=True,
+        )
+
         positive = 0
         total = 0
-
-        for sym in breadth_symbols:
-            df = await self._market_data.get_historical(sym, days=10)
-            if df is not None and len(df) >= 5:
-                ret = float(df["Close"].pct_change(5).iloc[-1])
-                if ret > 0:
-                    positive += 1
-                total += 1
+        for df in results:
+            if isinstance(df, Exception) or df is None or len(df) < 5:
+                continue
+            ret = float(df["Close"].pct_change(5).iloc[-1])
+            if ret > 0:
+                positive += 1
+            total += 1
 
         if total == 0:
             return None
