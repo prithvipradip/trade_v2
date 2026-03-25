@@ -83,7 +83,7 @@ async def run_bot(args: argparse.Namespace) -> None:
         print("\nTo start paper trading:")
         print("1. Open TWS or IB Gateway")
         print("2. Login with your paper trading credentials")
-        print("3. Enable API connections in TWS: Edit → Global Configuration → API → Settings")
+        print("3. Enable API connections in TWS: Edit -> Global Configuration -> API -> Settings")
         print(f"4. Set socket port to {settings.ibkr.ibkr_port}")
         return
 

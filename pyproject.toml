@@ -33,6 +33,10 @@ dependencies = [
     # Dashboard
     "streamlit>=1.31",
     "plotly>=5.19",
+    # Monitoring
+    "psutil>=5.9",
+    # Analytics
+    "duckdb>=1.0",
     # Config & Logging
     "pydantic>=2.6",
     "pydantic-settings>=2.1",

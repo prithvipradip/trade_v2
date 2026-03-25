@@ -100,10 +100,19 @@ class StrategySelector:
 
         return ranked
 
+    # Strategies that profit from selling premium (short vega)
+    SELLING_STRATEGIES = frozenset({
+        "covered_call", "cash_secured_put", "iron_condor", "short_strangle",
+    })
+    # Strategies that profit from buying premium (long vega)
+    BUYING_STRATEGIES = frozenset({
+        "long_call", "long_put", "long_straddle",
+    })
+
     def _rank_signals(self, signals: list[Signal]) -> list[Signal]:
         """Rank signals by quality score.
 
-        Higher score = better opportunity.
+        Higher score = better opportunity. Uses IV-aware scoring.
         """
         if not signals:
             return []
@@ -122,14 +131,25 @@ class StrategySelector:
             if s.is_defined_risk:
                 points += 10
 
-            # IV rank alignment:
-            # High IV → selling strategies get bonus
-            # Low IV → buying strategies get bonus
-            is_selling = s.action == "SELL" or "short" in s.strategy_name or "iron" in s.strategy_name
-            if is_selling and s.iv_rank > 50:
-                points += 10  # Selling in high IV = good
-            elif not is_selling and s.iv_rank < 30:
-                points += 10  # Buying in low IV = good
+            # IV rank alignment (smooth scoring, not binary):
+            # Selling strategies score higher as IV rank increases
+            # Buying strategies score higher as IV rank decreases
+            is_selling = s.strategy_name in self.SELLING_STRATEGIES
+            is_buying = s.strategy_name in self.BUYING_STRATEGIES
+            iv = s.iv_rank  # 0-100
+
+            if is_selling:
+                # Linear bonus: 0 pts at IV rank 30, +15 pts at IV rank 80+
+                points += max(0, min(15, (iv - 30) * 0.30))
+            elif is_buying:
+                # Linear bonus: 0 pts at IV rank 50, +15 pts at IV rank 10
+                points += max(0, min(15, (50 - iv) * 0.375))
+
+            # Spread strategies (directional but defined risk) get moderate IV bonus
+            if s.strategy_name in ("bull_call_spread", "bear_put_spread"):
+                # Best in moderate IV (25-50), penalize extremes
+                iv_dist_from_ideal = abs(iv - 37.5)
+                points += max(0, 8 - iv_dist_from_ideal * 0.2)
 
             # Liquidity — penalize wide spreads
             if s.contract and s.contract.spread_pct > 0.05:
@@ -144,28 +164,36 @@ class StrategySelector:
     ) -> list[str]:
         """Get a list of recommended strategies given current conditions.
 
-        Useful for logging/dashboard — shows what the selector is considering.
+        Uses IV rank to determine optimal strategy type:
+        - Low IV (< 30): Buy premium (long options, debit spreads)
+        - Mid IV (30-50): Defined-risk directional (spreads)
+        - High IV (> 50): Sell premium (condors, strangles, covered)
         """
         recommendations = []
+        enabled = {s.name for s in self._strategies}
 
         if market_direction == SignalDirection.BULLISH:
             if iv_rank < 30:
                 recommendations.extend(["long_call", "bull_call_spread"])
             elif iv_rank > 50:
-                recommendations.extend(["bull_call_spread", "cash_secured_put"])
+                recommendations.extend(["cash_secured_put", "bull_call_spread", "covered_call"])
             else:
                 recommendations.extend(["bull_call_spread", "covered_call"])
 
         elif market_direction == SignalDirection.BEARISH:
             if iv_rank < 30:
                 recommendations.extend(["long_put", "bear_put_spread"])
-            else:
+            elif iv_rank > 50:
                 recommendations.extend(["bear_put_spread"])
+            else:
+                recommendations.extend(["bear_put_spread", "long_put"])
 
         elif market_direction == SignalDirection.NEUTRAL:
             if iv_rank > 50:
                 recommendations.extend(["iron_condor", "short_strangle"])
-            else:
+            elif iv_rank > 30:
                 recommendations.extend(["iron_condor"])
+            else:
+                recommendations.extend(["long_straddle"])
 
-        return [r for r in recommendations if r in [s.name for s in self._strategies]]
+        return [r for r in recommendations if r in enabled]

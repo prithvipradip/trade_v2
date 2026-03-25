@@ -119,11 +119,10 @@ class PortfolioManager:
             except ValueError:
                 pass
 
-        # Update high water mark
+        # Update high water mark — always persist so journaling data stays accurate
         prev_hwm = self._state.get_high_water_mark(trade.trade_id)
         hwm = max(prev_hwm, pnl_pct)
-        if hwm > prev_hwm:
-            self._state.update_high_water_mark(trade.trade_id, hwm)
+        self._state.update_high_water_mark(trade.trade_id, hwm)
 
         # Get learning overrides for stop/take-profit (if any)
         stop_loss_pct = self._exit_config.initial_stop_loss_pct

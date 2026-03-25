@@ -76,13 +76,15 @@ class DirectionPredictor:
 
         features = self._feature_engine.compute(df)
         if features.empty:
+            log.warning("prediction_skipped", reason="features_empty",
+                        input_rows=len(df))
             return None
 
         # Use only the last row (current prediction)
         X = features[self._feature_names].iloc[[-1]]
 
         try:
-            X_scaled = self._scaler.transform(X)
+            X_scaled = self._scaler.transform(X.values)
         except Exception as e:
             log.error("feature_scaling_failed", error=str(e))
             return None
@@ -158,23 +160,26 @@ class DirectionPredictor:
         X = features[self._feature_names].values
         y = features["target"].values.astype(int)
 
-        # Scale features
-        self._scaler.fit(X)
-        X_scaled = self._scaler.transform(X)
-
         # Time-series cross-validation
         tscv = TimeSeriesSplit(n_splits=5)
         accuracies = {}
 
-        # Train XGBoost
+        # Train XGBoost — scaler is fit only on training fold to prevent data leakage
         if "xgboost" in self._config.ensemble_weights:
-            acc = self._train_xgboost(X_scaled, y, tscv)
+            acc = self._train_xgboost(X, y, tscv)
             accuracies["xgboost"] = acc
 
         # Train LightGBM
         if "lightgbm" in self._config.ensemble_weights:
-            acc = self._train_lightgbm(X_scaled, y, tscv)
+            acc = self._train_lightgbm(X, y, tscv)
             accuracies["lightgbm"] = acc
+
+        # Final scaler fit on all data for inference going forward.
+        # Final models are retrained on scaled data so scaler + model are consistent.
+        self._scaler.fit(X)
+        X_scaled = self._scaler.transform(X)
+        for model in self._models.values():
+            model.fit(X_scaled, y)
 
         self._trained = bool(self._models)
         if self._trained:
@@ -261,9 +266,14 @@ class DirectionPredictor:
                 log.debug("pruned_old_model", path=str(old))
 
     def rollback(self, version: str) -> bool:
-        """Roll back to a specific model version."""
+        """Roll back to a specific model version. Falls back to latest if target missing."""
         log.info("model_rollback_requested", target_version=version)
-        return self.load_models(version=version)
+        success = self.load_models(version=version)
+        if not success:
+            log.warning("rollback_target_missing", version=version,
+                        hint="Loading latest available model instead")
+            success = self.load_models()  # Load latest ensemble.pkl
+        return success
 
     def list_versions(self) -> list[dict]:
         """List available model versions."""
@@ -292,20 +302,59 @@ class DirectionPredictor:
         return self._cv_scores
 
     def _create_labels(self, close: pd.Series) -> pd.Series:
-        """Create 3-class labels from next-day returns.
+        """Create 3-class labels from 5-day forward returns.
 
-        0 = bearish (return < -0.5%)
-        1 = neutral (-0.5% to +0.5%)
-        2 = bullish (return > +0.5%)
+        Using a 5-day lookahead matches the typical options holding period
+        (1-3 weeks) far better than next-day returns. Options need price to
+        move meaningfully over several days to overcome theta decay.
+
+        0 = bearish (5-day return < -1.5%)
+        1 = neutral (-1.5% to +1.5%)
+        2 = bullish (5-day return > +1.5%)
         """
-        next_return = close.pct_change().shift(-1)
+        fwd_return = close.pct_change(5).shift(-5)  # 5-day forward return
         labels = pd.Series(1, index=close.index, dtype=float)  # Default neutral
-        labels[next_return > 0.005] = 2  # Bullish
-        labels[next_return < -0.005] = 0  # Bearish
+        labels[fwd_return > 0.015] = 2   # Bullish: >+1.5% in 5 days
+        labels[fwd_return < -0.015] = 0  # Bearish: <-1.5% in 5 days
         return labels
 
+    def _walk_forward_split(
+        self, n_samples: int, n_splits: int = 5, gap: int = 5
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Walk-forward validation splits with purge gap.
+
+        Unlike TimeSeriesSplit, this uses:
+        - Expanding training window (all data up to split point)
+        - A gap between train and validation to avoid look-ahead bias
+        - Fixed-size validation windows
+
+        The gap prevents the model from memorizing recent patterns that
+        overlap with the validation period.
+        """
+        splits = []
+        val_size = max(20, n_samples // (n_splits + 2))
+
+        for i in range(n_splits):
+            val_end = n_samples - (n_splits - 1 - i) * val_size
+            val_start = val_end - val_size
+            train_end = val_start - gap  # Purge gap
+
+            if train_end < 50:  # Need minimum training data
+                continue
+
+            train_idx = np.arange(0, train_end)
+            val_idx = np.arange(val_start, val_end)
+            splits.append((train_idx, val_idx))
+
+        # Fallback to regular TimeSeriesSplit if walk-forward yields too few splits
+        if len(splits) < 2:
+            tscv = TimeSeriesSplit(n_splits=n_splits)
+            return list(tscv.split(np.arange(n_samples)))
+
+        return splits
+
     def _train_xgboost(self, X: np.ndarray, y: np.ndarray, tscv) -> float:
-        """Train XGBoost model."""
+        """Train XGBoost model with walk-forward validation."""
         try:
             from xgboost import XGBClassifier
 
@@ -322,19 +371,22 @@ class DirectionPredictor:
                 n_jobs=-1,
             )
 
-            # Cross-validate
+            # Walk-forward validation with purge gap
+            wf_splits = self._walk_forward_split(len(X))
             scores = []
-            for train_idx, val_idx in tscv.split(X):
-                model.fit(X[train_idx], y[train_idx])
-                score = model.score(X[val_idx], y[val_idx])
+            for train_idx, val_idx in wf_splits:
+                fold_scaler = StandardScaler()
+                X_train = fold_scaler.fit_transform(X[train_idx])
+                X_val = fold_scaler.transform(X[val_idx])
+                model.fit(X_train, y[train_idx])
+                score = model.score(X_val, y[val_idx])
                 scores.append(score)
 
-            # Final model on all data
-            model.fit(X, y)
+            # Final model stored (will be refit on fully-scaled data after CV)
             self._models["xgboost"] = model
 
             avg_acc = float(np.mean(scores))
-            log.info("xgboost_trained", cv_accuracy=f"{avg_acc:.3f}")
+            log.info("xgboost_trained", cv_accuracy=f"{avg_acc:.3f}", folds=len(scores))
             return avg_acc
 
         except ImportError:
@@ -342,7 +394,7 @@ class DirectionPredictor:
             return 0.0
 
     def _train_lightgbm(self, X: np.ndarray, y: np.ndarray, tscv) -> float:
-        """Train LightGBM model."""
+        """Train LightGBM model with walk-forward validation."""
         try:
             from lightgbm import LGBMClassifier
 
@@ -359,17 +411,22 @@ class DirectionPredictor:
                 n_jobs=-1,
             )
 
+            wf_splits = self._walk_forward_split(len(X))
             scores = []
-            for train_idx, val_idx in tscv.split(X):
-                model.fit(X[train_idx], y[train_idx])
-                score = model.score(X[val_idx], y[val_idx])
+            for train_idx, val_idx in wf_splits:
+                fold_scaler = StandardScaler()
+                X_train = fold_scaler.fit_transform(X[train_idx])
+                X_val = fold_scaler.transform(X[val_idx])
+                # Pass numpy arrays (no feature names) to avoid sklearn warning
+                model.fit(X_train, y[train_idx], feature_name="auto")
+                score = model.score(X_val, y[val_idx])
                 scores.append(score)
 
-            model.fit(X, y)
+            # Final model stored (will be refit on fully-scaled data after CV)
             self._models["lightgbm"] = model
 
             avg_acc = float(np.mean(scores))
-            log.info("lightgbm_trained", cv_accuracy=f"{avg_acc:.3f}")
+            log.info("lightgbm_trained", cv_accuracy=f"{avg_acc:.3f}", folds=len(scores))
             return avg_acc
 
         except ImportError:

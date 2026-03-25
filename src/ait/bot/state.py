@@ -1,14 +1,15 @@
-"""Persistent state management using SQLite.
+"""Persistent state management using SQLite + DuckDB analytics.
 
-Tracks trades, positions, daily P&L, and bot state across restarts.
-This is the bot's memory — survives crashes and restarts.
+SQLite: operational state (open positions, bot KV store, pending trades).
+DuckDB: analytics store (closed trades, daily stats, trade context).
+Dual-write on close_trade() and update_daily_stats().
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
@@ -97,9 +98,12 @@ class StateManager:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
         self._init_db()
+        self._duck = self._init_duckdb()
 
     def _init_db(self) -> None:
         with sqlite3.connect(self._db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS trades (
                     trade_id TEXT PRIMARY KEY,
@@ -185,6 +189,18 @@ class StateManager:
                 ON trades(symbol);
             """)
 
+    @staticmethod
+    def _init_duckdb():
+        """Initialize DuckDB analytics store (lazy — returns None if unavailable)."""
+        try:
+            from ait.monitoring.duckdb_analytics import DuckDBAnalytics
+            duck = DuckDBAnalytics()
+            log.info("duckdb_analytics_enabled")
+            return duck
+        except Exception as e:
+            log.warning("duckdb_unavailable", error=str(e))
+            return None
+
     # --- Trade Management ---
 
     def record_trade(self, trade: TradeRecord) -> None:
@@ -256,6 +272,18 @@ class StateManager:
                  time_to_peak_hours, trade_id),
             )
 
+            # Dual-write: sync closed trade to DuckDB analytics
+            if self._duck:
+                try:
+                    conn.row_factory = sqlite3.Row
+                    row = conn.execute(
+                        "SELECT * FROM trades WHERE trade_id = ?", (trade_id,)
+                    ).fetchone()
+                    if row:
+                        self._duck.ingest_trade(dict(row))
+                except Exception as e:
+                    log.warning("duckdb_trade_sync_failed", trade_id=trade_id, error=str(e))
+
     def get_open_trades(self) -> list[TradeRecord]:
         """Get all trades that are not closed/cancelled."""
         with sqlite3.connect(self._db_path) as conn:
@@ -290,7 +318,7 @@ class StateManager:
     # --- Daily Stats ---
 
     def update_daily_stats(self, stats: DailyStats) -> None:
-        """Update daily statistics."""
+        """Update daily statistics (SQLite + DuckDB)."""
         with sqlite3.connect(self._db_path) as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO daily_stats
@@ -304,6 +332,22 @@ class StateManager:
                     stats.day_trades_count, stats.circuit_breaker_triggered,
                 ),
             )
+
+        # Dual-write to DuckDB
+        if self._duck:
+            try:
+                self._duck.ingest_daily_stats({
+                    "date": stats.date,
+                    "trades_taken": stats.trades_taken,
+                    "trades_won": stats.trades_won,
+                    "trades_lost": stats.trades_lost,
+                    "total_pnl": stats.total_pnl,
+                    "max_drawdown": stats.max_drawdown,
+                    "day_trades_count": stats.day_trades_count,
+                    "circuit_breaker_triggered": stats.circuit_breaker_triggered,
+                })
+            except Exception as e:
+                log.warning("duckdb_daily_sync_failed", error=str(e))
 
     def get_daily_stats(self, d: date | None = None) -> DailyStats:
         """Get daily stats for a specific date (default: today)."""
@@ -407,7 +451,7 @@ class StateManager:
         sentiment_score: float,
         signals: str = "{}",
     ) -> None:
-        """Save the market context at time of trade entry."""
+        """Save the market context at time of trade entry (SQLite + DuckDB)."""
         with sqlite3.connect(self._db_path) as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO trade_context
@@ -416,6 +460,22 @@ class StateManager:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (trade_id, direction, confidence, regime, vix, iv_rank, sentiment_score, signals),
             )
+
+        # Dual-write to DuckDB
+        if self._duck:
+            try:
+                self._duck.ingest_trade_context({
+                    "trade_id": trade_id,
+                    "entry_direction": direction,
+                    "entry_confidence": confidence,
+                    "entry_regime": regime,
+                    "entry_vix": vix,
+                    "entry_iv_rank": iv_rank,
+                    "entry_sentiment_score": sentiment_score,
+                    "entry_signals": signals,
+                })
+            except Exception as e:
+                log.warning("duckdb_context_sync_failed", trade_id=trade_id, error=str(e))
 
     def get_trade_context(self, trade_id: str) -> dict | None:
         """Get the entry context for a trade."""

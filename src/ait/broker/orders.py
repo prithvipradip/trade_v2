@@ -117,6 +117,50 @@ class OrderBuilder:
         return order
 
     @staticmethod
+    def passive_limit(
+        action: str,
+        quantity: int,
+        bid: float,
+        ask: float,
+        improvement_pct: float = 0.20,
+    ) -> LimitOrder:
+        """Passive limit order with price improvement.
+
+        Places the order between the mid-price and the natural side,
+        giving us price improvement while still being more likely to fill
+        than sitting at the bid/ask.
+
+        For BUY: price = mid - (improvement_pct * half-spread)
+                 (below mid, toward bid — passive buyer)
+        For SELL: price = mid + (improvement_pct * half-spread)
+                 (above mid, toward ask — passive seller)
+
+        Args:
+            action: "BUY" or "SELL"
+            quantity: Number of contracts
+            bid: Current best bid
+            ask: Current best ask
+            improvement_pct: 0.0 = at mid, 1.0 = at natural side (bid/ask)
+        """
+        mid = (bid + ask) / 2
+        half_spread = (ask - bid) / 2
+
+        if action.upper() == "BUY":
+            # Passive: below mid, toward bid
+            price = mid - half_spread * improvement_pct
+        else:
+            # Passive: above mid, toward ask
+            price = mid + half_spread * improvement_pct
+
+        # Round to nearest penny, ensure within spread
+        price = round(price, 2)
+        price = max(bid, min(ask, price))
+
+        order = LimitOrder(action.upper(), quantity, price)
+        order.tif = "DAY"
+        return order
+
+    @staticmethod
     def calculate_spread_limit(
         mid_price: float,
         action: str,

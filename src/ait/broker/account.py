@@ -48,7 +48,15 @@ class AccountManager:
 
         values = await self._client.get_account_values()
         if not values:
-            log.warning("account_fetch_empty", using="cached_values")
+            stale_seconds = now - self._last_fetch
+            if self._last_fetch > 0 and stale_seconds > 300:
+                log.error(
+                    "account_data_stale",
+                    stale_seconds=int(stale_seconds),
+                    msg="Account data over 5 minutes old — risk calculations unreliable",
+                )
+            else:
+                log.warning("account_fetch_empty", using="cached_values")
             return self._snapshot
 
         self._snapshot = AccountSnapshot(

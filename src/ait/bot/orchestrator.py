@@ -26,6 +26,7 @@ from ait.data.earnings import EarningsCalendar
 from ait.data.historical import HistoricalDataStore
 from ait.data.market_data import MarketDataService
 from ait.data.options_chain import OptionsChainService
+from ait.data.multi_timeframe import MultiTimeframeAnalyzer
 from ait.data.options_flow import OptionsFlowDetector
 from ait.data.quality import DataQualityValidator
 from ait.execution.executor import TradeExecutor
@@ -44,9 +45,12 @@ from ait.risk.hedging import DeltaHedger
 from ait.risk.manager import RiskManager, TradeRequest
 from ait.risk.pdt_guard import PDTGuard
 from ait.risk.position_sizer import PositionSizer
+from ait.risk.capital_tiers import CapitalTierManager
 from ait.sentiment.engine import SentimentEngine
+from ait.learning.counterfactual import CounterfactualTracker
 from ait.strategies.base import SignalDirection
 from ait.strategies.selector import StrategySelector
+from ait.strategies.thompson import ThompsonSampler
 from ait.utils.logging import get_logger
 from ait.utils.time import next_market_open
 
@@ -127,6 +131,7 @@ class TradingOrchestrator:
         self._data_quality = DataQualityValidator()
         self._earnings = EarningsCalendar()
         self._flow_detector = OptionsFlowDetector()
+        self._mtf_analyzer = MultiTimeframeAnalyzer()
 
         # Health monitoring
         self._watchdog = Watchdog()
@@ -137,6 +142,15 @@ class TradingOrchestrator:
 
         # Analytics
         self._analytics = TradeAnalytics()
+
+        # Thompson sampling for strategy selection
+        self._thompson = ThompsonSampler()
+
+        # Counterfactual tracking for skipped trades
+        self._counterfactual = CounterfactualTracker()
+
+        # Capital tier manager — auto-selects strategies based on account size
+        self._capital_tiers = CapitalTierManager()
 
         # Notification callback (set by main.py)
         self._notify = None
@@ -228,11 +242,16 @@ class TradingOrchestrator:
                 await self._send_notification(msg)
                 log.info("learning_adaptations_applied", summary=learning_result)
 
-        # 4. Update correlation guard with recent price data
-        for symbol in self._settings.trading.universe:
-            hist = await self._market_data.get_historical(symbol, days=60)
+        # 4. Update correlation guard with recent price data (parallelized)
+        async def _fetch_and_update_corr(sym: str) -> None:
+            hist = await self._market_data.get_historical(sym, days=60)
             if hist is not None and "Close" in hist.columns:
-                self._correlation_guard.update_price_data(symbol, hist["Close"])
+                self._correlation_guard.update_price_data(sym, hist["Close"])
+
+        await asyncio.gather(
+            *[_fetch_and_update_corr(s) for s in self._settings.trading.universe],
+            return_exceptions=True,
+        )
 
         # 5. Ensure ML models are trained
         await self._trainer.ensure_models_ready(self._settings.trading.universe)
@@ -254,6 +273,9 @@ class TradingOrchestrator:
         if spy_data is not None:
             regime = self._regime_detector.analyze(spy_data, vix)
             log.info("pre_market_regime", regime=regime.regime.value, vix=vix)
+
+        # 8. Apply Thompson sampling decay (forget old outcomes gradually)
+        self._thompson.apply_decay()
 
         log.info(
             "pre_market_complete",
@@ -324,12 +346,27 @@ class TradingOrchestrator:
         # 6. Check fill status of pending orders
         await self._executor.check_fills()
 
-        # 7. Get effective universe (learning may have removed symbols)
+        # 7. Get effective universe (learning + capital tier filtering)
         adaptor = self._learning.adaptor
+
+        # Get current account value for capital tier decisions
+        account_snapshot = await self._account.get_snapshot()
+        current_capital = account_snapshot.net_liquidation if account_snapshot else 10_000.0
+        tier_config = self._capital_tiers.get_config(current_capital)
+
+        # Filter universe: learning restrictions + capital tier affordability
         universe = [
             s for s in self._settings.trading.universe
             if adaptor.is_symbol_allowed(s)
         ]
+        universe = self._capital_tiers.filter_universe(universe, current_capital)
+
+        log.debug("capital_tier_active",
+                  tier=tier_config.tier.value,
+                  capital=f"${current_capital:,.0f}",
+                  strategies=tier_config.allowed_strategies,
+                  max_positions=tier_config.max_positions,
+                  universe=universe)
 
         # 7b. Check if current hour is blocked by learning
         from datetime import datetime as dt_now
@@ -351,13 +388,39 @@ class TradingOrchestrator:
                 log.warning("symbol_scan_failed", symbol=symbol, error=str(e))
 
     async def _scan_symbol(self, symbol: str, vix: float | None) -> None:
-        """Analyze a single symbol for trading opportunities."""
+        """Analyze a single symbol for trading opportunities.
+
+        Parallelizes data fetches: historical, sentiment, and IV rank
+        are fetched concurrently with asyncio.gather.
+        """
         adaptor = self._learning.adaptor
 
-        # Get historical data for features
-        hist = await self._market_data.get_historical(symbol, days=60)
-        if hist is None or hist.empty:
+        # Parallel fetch: historical data, sentiment, IV rank, intraday
+        # 2 years of history for robust features (iv_rank, vol percentiles, trend)
+        hist_task = self._market_data.get_historical(symbol, days=504)
+        sentiment_task = self._sentiment.get_sentiment(symbol)
+        iv_rank_task = self._estimate_iv_rank(symbol)
+        intraday_task = self._market_data.get_intraday(symbol, interval="5m", days=1)
+
+        hist, sentiment, iv_rank, intraday = await asyncio.gather(
+            hist_task, sentiment_task, iv_rank_task, intraday_task,
+            return_exceptions=True,
+        )
+
+        # Handle exceptions from parallel fetches
+        if isinstance(hist, Exception):
+            log.warning("hist_data_error", symbol=symbol, error=str(hist))
             return
+        if hist is None or hist.empty:
+            log.warning("hist_data_empty", symbol=symbol,
+                        hint="No historical data — check market data subscription or data source")
+            return
+        if isinstance(sentiment, Exception):
+            sentiment = None
+        if isinstance(iv_rank, Exception):
+            iv_rank = 50.0
+        if isinstance(intraday, Exception):
+            intraday = None
 
         # Data quality check on historical data
         if "Close" in hist.columns:
@@ -368,7 +431,20 @@ class TradingOrchestrator:
         # ML prediction
         prediction = self._predictor.predict(hist)
         if prediction is None:
+            log.warning("ml_prediction_none", symbol=symbol)
             return
+
+        log.info("ml_prediction", symbol=symbol,
+                 direction=prediction.direction.value,
+                 confidence=f"{prediction.confidence:.3f}")
+
+        # Record prediction in drift detector for accuracy tracking
+        drift = self._trainer.drift_detector
+        drift.record_prediction(
+            trade_id=f"{symbol}-{prediction.direction.value}",
+            direction=prediction.direction.value,
+            confidence=prediction.confidence,
+        )
 
         # Use learning-adjusted confidence threshold
         min_confidence = adaptor.get_confidence_override() or self._settings.risk.min_confidence
@@ -379,19 +455,29 @@ class TradingOrchestrator:
                 confidence=prediction.confidence,
                 threshold=min_confidence,
             )
+            # Record counterfactual for low-confidence skips
+            self._counterfactual.record_skip(
+                symbol=symbol,
+                strategy="unknown",
+                direction=prediction.direction.value,
+                confidence=prediction.confidence,
+                entry_price=float(hist["Close"].iloc[-1]) if "Close" in hist.columns else 0,
+                reject_reason="low_confidence",
+            )
             return
 
         # Market regime
         regime = self._regime_detector.analyze(hist, vix)
 
-        # Sentiment (optional — graceful degradation)
-        sentiment = await self._sentiment.get_sentiment(symbol)
-
-        # Adjust confidence with sentiment
+        # Adjust confidence with sentiment (already fetched in parallel)
         final_confidence = prediction.confidence
-        if sentiment.sources_available > 0:
+        if sentiment and hasattr(sentiment, "sources_available") and sentiment.sources_available > 0:
             sentiment_adj = sentiment.composite_score * self._sentiment.weight
             final_confidence = max(0, min(1, final_confidence + sentiment_adj))
+
+        # Multi-timeframe analysis: boost/penalize confidence based on alignment
+        mtf = self._mtf_analyzer.analyze(hist, intraday)
+        final_confidence = max(0, min(1, final_confidence + mtf.confidence_boost))
 
         # Map ML direction to signal direction
         direction = prediction.direction
@@ -407,11 +493,13 @@ class TradingOrchestrator:
             log.info("skipping_near_earnings", symbol=symbol)
             return
 
+        # Pre-compute features once for meta-labeler (Phase 3.3)
+        from ait.ml.features import FeatureEngine
+        features_df = FeatureEngine().compute(hist)
+
         # Meta-label gate: ask secondary model if this signal is worth taking.
         # Uses primary confidence + market context to filter false positives.
         if self._meta_labeler is not None and self._meta_labeler.is_trained:
-            from ait.ml.features import FeatureEngine
-            features_df = FeatureEngine().compute(hist)
             last_features = {}
             if not features_df.empty:
                 last_row = features_df.iloc[-1]
@@ -437,7 +525,7 @@ class TradingOrchestrator:
                 "regime_high_vol": 1.0 if regime and regime.regime.value == "high_volatility" else 0.0,
                 "regime_range_bound": 1.0 if regime and regime.regime.value == "range_bound" else 0.0,
                 "vix": vix or 0,
-                "iv_rank": 0,  # Not yet fetched — will be available after more trades
+                "iv_rank": iv_rank,
                 "sentiment_score": sentiment.composite_score if sentiment and hasattr(sentiment, "composite_score") else 0,
                 "hour_of_day": dt.now().hour,
                 **last_features,
@@ -452,10 +540,18 @@ class TradingOrchestrator:
                     direction=direction.value,
                     confidence=f"{final_confidence:.3f}",
                 )
+                # Record counterfactual for meta-label rejects
+                self._counterfactual.record_skip(
+                    symbol=symbol,
+                    strategy="unknown",
+                    direction=direction.value,
+                    confidence=final_confidence,
+                    entry_price=float(hist["Close"].iloc[-1]) if "Close" in hist.columns else 0,
+                    reject_reason="meta_label_reject",
+                )
                 return
 
-        # Get IV rank for strategy selection
-        iv_rank = await self._estimate_iv_rank(symbol)
+        # IV rank already fetched in parallel above
 
         # Get options chains
         chains = await self._options_chain.get_chain(symbol)
@@ -525,6 +621,14 @@ class TradingOrchestrator:
                 if adaptor.is_strategy_enabled(s.strategy_name)
             ]
 
+            # Re-rank signals using Thompson sampling (exploration/exploitation)
+            if signals:
+                strategy_names = [s.strategy_name for s in signals]
+                ranked_names = self._thompson.rank_strategies(strategy_names)
+                # Build a name→signal map and reorder
+                sig_map = {s.strategy_name: s for s in signals}
+                signals = [sig_map[n] for n in ranked_names if n in sig_map]
+
             # Try to execute the best signal (with entry timing check)
             for signal in signals[:1]:
                 if self._should_queue_signal(signal, hist):
@@ -573,6 +677,15 @@ class TradingOrchestrator:
                 symbol=signal.symbol,
                 strategy=signal.strategy_name,
                 reason=validation.reason,
+            )
+            # Record counterfactual for risk-rejected trades
+            self._counterfactual.record_skip(
+                symbol=signal.symbol,
+                strategy=signal.strategy_name,
+                direction=signal.direction.value,
+                confidence=confidence,
+                entry_price=signal.entry_price,
+                reject_reason=f"risk_{validation.reason}",
             )
             return
 
@@ -672,6 +785,20 @@ class TradingOrchestrator:
                 stats.trades_lost += 1
                 self._circuit_breaker.record_trade_result(realized_pnl)
             self._state.update_daily_stats(stats)
+
+            # Update Thompson sampling with trade outcome
+            self._thompson.record_outcome(
+                strategy=trade.strategy,
+                won=realized_pnl > 0,
+                pnl=realized_pnl,
+            )
+
+            # Record drift outcome (actual direction for this trade)
+            actual_dir = "bullish" if realized_pnl > 0 else "bearish"
+            self._trainer.drift_detector.record_outcome(
+                trade_id=pos.trade_id,
+                actual_direction=actual_dir,
+            )
 
             # Notify
             msg = (
@@ -835,10 +962,32 @@ class TradingOrchestrator:
             )
             log.info("post_market_learning", result=learning_result)
 
-        # 3. Generate analytics
+        # 3. Evaluate counterfactual outcomes (what would skipped trades have done?)
+        if self._counterfactual.pending_count > 0:
+            prices = {}
+            for sym in self._settings.trading.universe:
+                price = await self._market_data.get_current_price(sym)
+                if price:
+                    prices[sym] = price
+            evaluated = self._counterfactual.evaluate_outcomes(prices)
+            if evaluated > 0:
+                cf_analysis = self._counterfactual.get_analysis()
+                log.info(
+                    "counterfactual_analysis",
+                    evaluated=evaluated,
+                    filter_accuracy=f"{cf_analysis['filter_accuracy']:.0%}",
+                    missed=cf_analysis.get("missed_opportunities", 0),
+                )
+
+        # 4. Check drift status
+        drift_report = self._trainer.drift_detector.check_drift()
+        if drift_report.is_drifting:
+            log.warning("post_market_drift", accuracy=f"{drift_report.accuracy:.2%}", reason=drift_report.reason)
+
+        # 5. Generate analytics
         metrics = self._analytics.get_performance(lookback_days=30)
 
-        # 4. Generate daily summary
+        # 6. Generate daily summary
         summary = await self._portfolio.get_portfolio_summary()
         stats = self._state.get_daily_stats()
         health = self._watchdog.get_health()
@@ -865,6 +1014,19 @@ class TradingOrchestrator:
             report += f"\n  Learning disabled: {', '.join(overrides['disabled_strategies'])}"
         if overrides.get("removed_symbols"):
             report += f"\n  Learning removed: {', '.join(overrides['removed_symbols'])}"
+
+        # Add drift and Thompson stats
+        if drift_report.samples > 0:
+            report += f"\n  Drift: accuracy={drift_report.accuracy:.0%}, samples={drift_report.samples}"
+        thompson_stats = self._thompson.get_stats()
+        if thompson_stats:
+            top = thompson_stats[0]
+            report += f"\n  Top strategy (Thompson): {top['strategy']} ({top['win_rate']:.0%} over {top['observations']} trades)"
+
+        # Counterfactual summary
+        cf = self._counterfactual.get_analysis()
+        if cf["evaluated"] > 0:
+            report += f"\n  Filters: {cf['filter_accuracy']:.0%} accurate, {cf.get('missed_opportunities', 0)} missed"
 
         await self._send_notification(report)
         log.info("post_market_complete", summary=summary, metrics=vars(metrics))
@@ -1059,7 +1221,7 @@ class TradingOrchestrator:
 
             # Try to get live Greeks from IBKR portfolio
             ibkr_greeks: dict[str, dict] = {}
-            portfolio_items = self._ibkr.get_portfolio()
+            portfolio_items = self._ibkr.get_portfolio() or []
             for item in portfolio_items:
                 key = item.contract.symbol
                 ibkr_greeks[key] = {

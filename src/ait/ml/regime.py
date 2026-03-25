@@ -29,6 +29,8 @@ class MarketRegime(str, Enum):
     RANGE_BOUND = "range_bound"
     HIGH_VOLATILITY = "high_volatility"
     LOW_VOLATILITY = "low_volatility"
+    IV_CRUSH = "iv_crush"  # Post-catalyst vol compression
+    MEAN_REVERTING = "mean_reverting"  # Choppy with autocorrelation < 0
 
 
 @dataclass
@@ -40,6 +42,8 @@ class RegimeAnalysis:
     trend_strength: float  # -1.0 (strong down) to +1.0 (strong up)
     volatility_level: float  # Annualized realized volatility
     vix_level: float | None
+    iv_rank: float  # 0.0 to 1.0, current vol vs 252-day range
+    hurst_exponent: float  # < 0.5 = mean-reverting, > 0.5 = trending
     details: dict[str, float]
 
 
@@ -64,6 +68,8 @@ class RegimeDetector:
                 trend_strength=0.0,
                 volatility_level=0.0,
                 vix_level=vix,
+                iv_rank=0.5,
+                hurst_exponent=0.5,
                 details={},
             )
 
@@ -75,12 +81,20 @@ class RegimeDetector:
         # --- Volatility Analysis ---
         vol = self._measure_volatility(close)
 
+        # --- IV Rank (vol percentile over 252 days) ---
+        iv_rank = self._measure_iv_rank(close)
+
+        # --- Hurst Exponent (mean-reversion vs trending) ---
+        hurst = self._estimate_hurst(close)
+
         # --- Regime Classification ---
-        regime, confidence = self._classify(trend_strength, vol, vix)
+        regime, confidence = self._classify(trend_strength, vol, vix, iv_rank, hurst)
 
         details = {
             "trend_strength": trend_strength,
             "realized_vol_20d": vol,
+            "iv_rank": iv_rank,
+            "hurst_exponent": hurst,
             "sma_20_slope": float(close.rolling(20).mean().pct_change(5).iloc[-1]),
             "rsi_14": float(self._rsi(close, 14).iloc[-1]),
             "price_vs_sma_50": float((close.iloc[-1] - close.rolling(50).mean().iloc[-1]) / close.rolling(50).mean().iloc[-1]),
@@ -92,6 +106,8 @@ class RegimeDetector:
             confidence=f"{confidence:.2f}",
             trend=f"{trend_strength:.2f}",
             vol=f"{vol:.2f}",
+            iv_rank=f"{iv_rank:.2f}",
+            hurst=f"{hurst:.2f}",
             vix=vix,
         )
 
@@ -101,6 +117,8 @@ class RegimeDetector:
             trend_strength=trend_strength,
             volatility_level=vol,
             vix_level=vix,
+            iv_rank=iv_rank,
+            hurst_exponent=hurst,
             details=details,
         )
 
@@ -135,21 +153,89 @@ class RegimeDetector:
         log_returns = np.log(close / close.shift(1)).dropna()
         return float(log_returns.tail(20).std() * np.sqrt(252))
 
+    def _measure_iv_rank(self, close: pd.Series) -> float:
+        """IV rank proxy: current 20-day vol percentile over 252 days."""
+        log_returns = np.log(close / close.shift(1)).dropna()
+        vol_20 = log_returns.rolling(20).std() * np.sqrt(252)
+        vol_20 = vol_20.dropna()
+
+        if len(vol_20) < 60:
+            return 0.5
+
+        current = float(vol_20.iloc[-1])
+        lookback = vol_20.tail(min(252, len(vol_20)))
+        vol_min = float(lookback.min())
+        vol_max = float(lookback.max())
+        vol_range = vol_max - vol_min
+
+        if vol_range <= 0:
+            return 0.5
+
+        return max(0.0, min(1.0, (current - vol_min) / vol_range))
+
+    def _estimate_hurst(self, close: pd.Series, max_lag: int = 20) -> float:
+        """Estimate Hurst exponent via rescaled range (R/S) method.
+
+        H < 0.5 → mean-reverting (good for iron condors, range strategies)
+        H = 0.5 → random walk
+        H > 0.5 → trending (good for directional strategies)
+        """
+        try:
+            log_returns = np.log(close / close.shift(1)).dropna().values
+            if len(log_returns) < max_lag * 2:
+                return 0.5
+
+            lags = range(2, max_lag + 1)
+            rs_values = []
+
+            for lag in lags:
+                rs_list = []
+                for start in range(0, len(log_returns) - lag, lag):
+                    chunk = log_returns[start:start + lag]
+                    mean_adj = chunk - chunk.mean()
+                    cumdev = np.cumsum(mean_adj)
+                    r = cumdev.max() - cumdev.min()
+                    s = chunk.std()
+                    if s > 0:
+                        rs_list.append(r / s)
+                if rs_list:
+                    rs_values.append((np.log(lag), np.log(np.mean(rs_list))))
+
+            if len(rs_values) < 3:
+                return 0.5
+
+            x = np.array([v[0] for v in rs_values])
+            y = np.array([v[1] for v in rs_values])
+            hurst = float(np.polyfit(x, y, 1)[0])
+            return max(0.0, min(1.0, hurst))
+        except Exception:
+            return 0.5
+
     def _classify(
         self,
         trend: float,
         vol: float,
         vix: float | None,
+        iv_rank: float = 0.5,
+        hurst: float = 0.5,
     ) -> tuple[MarketRegime, float]:
-        """Classify regime based on trend and volatility."""
+        """Classify regime based on trend, volatility, IV rank, and Hurst exponent."""
 
         # High volatility override (VIX > 30 or realized vol > 40%)
         if (vix and vix > 30) or vol > 0.40:
             return MarketRegime.HIGH_VOLATILITY, min(0.9, vol)
 
+        # IV Crush: vol was recently high but is rapidly compressing
+        # (iv_rank dropping from high, vol trend negative)
+        if iv_rank < 0.25 and vol < 0.20 and abs(trend) < 0.2:
+            return MarketRegime.IV_CRUSH, 0.7
+
+        # Mean-reverting: Hurst < 0.4 with no strong trend
+        if hurst < 0.40 and abs(trend) < 0.25:
+            return MarketRegime.MEAN_REVERTING, max(0.6, 1.0 - hurst)
+
         # Low volatility (VIX < 15 or realized vol < 12%)
         if (vix and vix < 15) or vol < 0.12:
-            # Still check for trend within low vol
             if abs(trend) > 0.3:
                 if trend > 0:
                     return MarketRegime.TRENDING_UP, abs(trend)

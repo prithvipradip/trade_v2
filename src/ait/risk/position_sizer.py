@@ -48,6 +48,11 @@ class PositionSizer:
         self._pos_config = position_config
         self._risk_config = risk_config
 
+    # Strategies that benefit from high IV (selling premium)
+    _SELLING_STRATEGIES = frozenset({
+        "covered_call", "cash_secured_put", "iron_condor", "short_strangle",
+    })
+
     def calculate(
         self,
         account_value: float,
@@ -56,6 +61,7 @@ class PositionSizer:
         implied_vol: float,
         strategy: str,
         underlying_price: float,
+        iv_rank: float = 50.0,
     ) -> PositionSize:
         """Calculate recommended position size.
 
@@ -66,6 +72,7 @@ class PositionSizer:
             implied_vol: Implied volatility of the option
             strategy: Strategy name (e.g., "bull_call_spread")
             underlying_price: Current price of underlying
+            iv_rank: IV rank percentile 0-100 (used for strategy-aware sizing)
 
         Returns:
             PositionSize with recommended contracts and reasoning
@@ -83,32 +90,48 @@ class PositionSizer:
         conf_adj = 0.5 + 0.5 * ((confidence - min_conf) / (1.0 - min_conf))
         conf_adj = max(0.3, min(1.0, conf_adj))
 
-        # Volatility adjustment: reduce size in high-vol environments
-        # IV < 20% → full size, IV > 60% → half size
-        vol_adj = 1.0
-        if implied_vol > 0.60:
+        # Volatility adjustment: smooth linear scale-down in high-vol environments
+        # IV <= 20% → full size (1.0), IV >= 60% → half size (0.5)
+        if implied_vol <= 0.20:
+            vol_adj = 1.0
+        elif implied_vol >= 0.60:
             vol_adj = 0.5
-        elif implied_vol > 0.40:
-            vol_adj = 0.7
-        elif implied_vol > 0.30:
-            vol_adj = 0.85
+        else:
+            # Linear interpolation: 1.0 at 20% → 0.5 at 60%
+            vol_adj = 1.0 - 0.5 * ((implied_vol - 0.20) / 0.40)
+
+        # IV rank alignment: boost size when IV conditions favor the strategy
+        # Selling strategies benefit from high IV rank (more premium to collect)
+        # Buying strategies benefit from low IV rank (cheaper options)
+        iv_rank_adj = 1.0
+        if strategy in self._SELLING_STRATEGIES:
+            # High IV rank → boost up to 1.2x; Low IV rank → reduce to 0.8x
+            iv_rank_adj = 0.8 + 0.4 * (iv_rank / 100.0)
+        else:
+            # Low IV rank → boost up to 1.2x; High IV rank → reduce to 0.8x
+            iv_rank_adj = 1.2 - 0.4 * (iv_rank / 100.0)
+        iv_rank_adj = max(0.8, min(1.2, iv_rank_adj))
 
         # Strategy adjustment
         strategy_adj = self.STRATEGY_RISK.get(strategy, 1.0)
 
         # Calculate contracts
-        adjusted_max = max_position_value * conf_adj * vol_adj * strategy_adj
+        adjusted_max = max_position_value * conf_adj * vol_adj * strategy_adj * iv_rank_adj
         max_contracts = int(adjusted_max / cost_per_contract)
-        contracts = max(1, min(max_contracts, 10))  # Floor 1, cap 10 contracts
 
-        # Max risk in dollars
+        # Scale cap with account size: 10 contracts per $100k, minimum 1
+        account_scale_cap = max(1, int(account_value / 10_000))
+        contracts = max(1, min(max_contracts, account_scale_cap))
+
+        # Max risk: for spreads, risk is the net debit (option_price already is net debit).
+        # For naked options, risk is the full premium paid.
         max_risk = contracts * cost_per_contract
 
         reason = (
             f"account=${account_value:.0f}, "
             f"max_pos={self._pos_config.max_position_pct:.0%}, "
             f"conf_adj={conf_adj:.2f}, vol_adj={vol_adj:.2f}, "
-            f"strat_adj={strategy_adj:.1f}"
+            f"iv_rank_adj={iv_rank_adj:.2f}, strat_adj={strategy_adj:.1f}"
         )
 
         log.debug(

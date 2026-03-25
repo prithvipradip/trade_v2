@@ -2,6 +2,9 @@
 
 Run separately: streamlit run src/ait/dashboard/app.py
 Tabs: Portfolio Overview, Trade History, Analytics, Self-Learning, System Health.
+
+Uses DuckDB for analytics-heavy queries (trade history, strategy breakdown,
+regime analysis) and SQLite for live operational state (open positions, KV store).
 """
 
 from __future__ import annotations
@@ -16,6 +19,15 @@ import pandas as pd
 import plotly.graph_objects as go
 
 DB_PATH = Path("data/ait_state.db")
+
+
+def _get_duck():
+    """Get DuckDB analytics instance (cached, returns None if unavailable)."""
+    try:
+        from ait.monitoring.duckdb_analytics import DuckDBAnalytics
+        return DuckDBAnalytics()
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -167,8 +179,9 @@ def _tab_trade_history(
 
     start_iso = start_date.isoformat()
     end_iso = end_date.isoformat()
+    duck = _get_duck()
 
-    # Recent trades
+    # Recent trades (still from SQLite — includes pending/open trades)
     st.subheader("Recent Trades")
     recent = _safe_query(
         conn,
@@ -185,43 +198,83 @@ def _tab_trade_history(
 
     st.divider()
 
-    # Strategy performance
+    # Strategy performance — use DuckDB when available
     st.subheader("Strategy Performance")
-    strategy_perf = _safe_query(
-        conn,
-        "SELECT strategy, COUNT(*) as trades, "
-        "SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins, "
-        "ROUND(SUM(CASE WHEN realized_pnl > 0 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1) as win_rate_pct, "
-        "ROUND(SUM(realized_pnl), 2) as total_pnl, "
-        "ROUND(AVG(realized_pnl), 2) as avg_pnl "
-        "FROM trades WHERE status = 'closed' AND date(entry_time) BETWEEN ? AND ? "
-        "GROUP BY strategy ORDER BY total_pnl DESC",
-        (start_iso, end_iso),
-    )
-    if not strategy_perf.empty:
+    strategy_data = None
+    if duck:
+        try:
+            lookback = (end_date - start_date).days or 60
+            strategy_data = duck.get_strategy_breakdown(lookback)
+        except Exception:
+            strategy_data = None
+
+    if strategy_data:
+        strategy_perf = pd.DataFrame(strategy_data)
         st.dataframe(strategy_perf, use_container_width=True)
     else:
-        st.info("No closed trades for strategy breakdown")
+        strategy_perf = _safe_query(
+            conn,
+            "SELECT strategy, COUNT(*) as trades, "
+            "SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins, "
+            "ROUND(SUM(CASE WHEN realized_pnl > 0 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1) as win_rate_pct, "
+            "ROUND(SUM(realized_pnl), 2) as total_pnl, "
+            "ROUND(AVG(realized_pnl), 2) as avg_pnl "
+            "FROM trades WHERE status = 'closed' AND date(entry_time) BETWEEN ? AND ? "
+            "GROUP BY strategy ORDER BY total_pnl DESC",
+            (start_iso, end_iso),
+        )
+        if not strategy_perf.empty:
+            st.dataframe(strategy_perf, use_container_width=True)
+        else:
+            st.info("No closed trades for strategy breakdown")
 
     st.divider()
 
-    # Symbol performance
+    # Symbol performance — use DuckDB when available
     st.subheader("Symbol Performance")
-    symbol_perf = _safe_query(
-        conn,
-        "SELECT symbol, COUNT(*) as trades, "
-        "SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins, "
-        "ROUND(SUM(CASE WHEN realized_pnl > 0 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1) as win_rate_pct, "
-        "ROUND(SUM(realized_pnl), 2) as total_pnl, "
-        "ROUND(AVG(realized_pnl), 2) as avg_pnl "
-        "FROM trades WHERE status = 'closed' AND date(entry_time) BETWEEN ? AND ? "
-        "GROUP BY symbol ORDER BY total_pnl DESC",
-        (start_iso, end_iso),
-    )
-    if not symbol_perf.empty:
+    symbol_data = None
+    if duck:
+        try:
+            lookback = (end_date - start_date).days or 60
+            symbol_data = duck.get_symbol_breakdown(lookback)
+        except Exception:
+            symbol_data = None
+
+    if symbol_data:
+        symbol_perf = pd.DataFrame(symbol_data)
         st.dataframe(symbol_perf, use_container_width=True)
     else:
-        st.info("No closed trades for symbol breakdown")
+        symbol_perf = _safe_query(
+            conn,
+            "SELECT symbol, COUNT(*) as trades, "
+            "SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins, "
+            "ROUND(SUM(CASE WHEN realized_pnl > 0 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1) as win_rate_pct, "
+            "ROUND(SUM(realized_pnl), 2) as total_pnl, "
+            "ROUND(AVG(realized_pnl), 2) as avg_pnl "
+            "FROM trades WHERE status = 'closed' AND date(entry_time) BETWEEN ? AND ? "
+            "GROUP BY symbol ORDER BY total_pnl DESC",
+            (start_iso, end_iso),
+        )
+        if not symbol_perf.empty:
+            st.dataframe(symbol_perf, use_container_width=True)
+        else:
+            st.info("No closed trades for symbol breakdown")
+
+    st.divider()
+
+    # NEW: Regime breakdown (DuckDB only — new analytics)
+    if duck:
+        st.subheader("Regime Performance")
+        try:
+            lookback = (end_date - start_date).days or 60
+            regime_data = duck.get_regime_breakdown(lookback)
+            if regime_data:
+                regime_df = pd.DataFrame(regime_data)
+                st.dataframe(regime_df, use_container_width=True)
+            else:
+                st.info("No regime data yet")
+        except Exception:
+            pass
 
 
 def _tab_analytics(conn: sqlite3.Connection) -> None:
@@ -360,6 +413,84 @@ def _tab_analytics(conn: sqlite3.Connection) -> None:
     sc1, sc2 = st.columns(2)
     sc1.metric("Best Win Streak", f"{max_win_streak}")
     sc2.metric("Worst Loss Streak", f"{max_loss_streak}")
+
+    # --- DuckDB-powered advanced analytics ---
+    duck = _get_duck()
+    if duck:
+        st.divider()
+
+        # Rolling Sharpe
+        st.subheader("Rolling Sharpe Ratio (20-day)")
+        try:
+            rolling = duck.get_rolling_sharpe(window_days=20, lookback_days=90)
+            if rolling:
+                roll_df = pd.DataFrame(rolling)
+                fig_rs = go.Figure()
+                fig_rs.add_trace(go.Scatter(
+                    x=roll_df["date"], y=roll_df["rolling_sharpe"],
+                    mode="lines", name="Rolling Sharpe",
+                    line=dict(color="orange", width=2),
+                ))
+                fig_rs.add_hline(y=0, line_dash="dash", line_color="gray")
+                fig_rs.update_layout(yaxis=dict(title="Sharpe Ratio"), height=300)
+                st.plotly_chart(fig_rs, use_container_width=True)
+            else:
+                st.info("Not enough daily data for rolling Sharpe")
+        except Exception:
+            pass
+
+        st.divider()
+
+        # Confidence band analysis
+        st.subheader("Win Rate by ML Confidence Band")
+        try:
+            bands = duck.get_confidence_band_analysis(lookback_days=90)
+            if bands:
+                band_df = pd.DataFrame(bands)
+                st.dataframe(band_df, use_container_width=True)
+            else:
+                st.info("No confidence band data")
+        except Exception:
+            pass
+
+        st.divider()
+
+        # Hourly performance
+        st.subheader("Performance by Hour of Day")
+        try:
+            hourly = duck.get_hourly_performance(lookback_days=90)
+            if hourly:
+                hourly_df = pd.DataFrame(hourly)
+                fig_h = go.Figure()
+                colors = ["green" if r["total_pnl"] >= 0 else "red" for r in hourly]
+                fig_h.add_trace(go.Bar(
+                    x=hourly_df["hour"], y=hourly_df["total_pnl"],
+                    name="P&L by Hour", marker_color=colors,
+                ))
+                fig_h.update_layout(
+                    xaxis=dict(title="Hour (ET)", dtick=1),
+                    yaxis=dict(title="Total P&L ($)"),
+                    height=300,
+                )
+                st.plotly_chart(fig_h, use_container_width=True)
+            else:
+                st.info("No hourly data")
+        except Exception:
+            pass
+
+        st.divider()
+
+        # IV Rank analysis
+        st.subheader("Strategy Performance by IV Rank")
+        try:
+            iv_data = duck.get_iv_rank_analysis(lookback_days=90)
+            if iv_data:
+                iv_df = pd.DataFrame(iv_data)
+                st.dataframe(iv_df, use_container_width=True)
+            else:
+                st.info("No IV rank data (needs trade context)")
+        except Exception:
+            pass
 
 
 def _tab_self_learning(conn: sqlite3.Connection) -> None:
@@ -725,6 +856,222 @@ def _tab_system_health(conn: sqlite3.Connection) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Backtest tab (walk-forward results)
+# ---------------------------------------------------------------------------
+
+_BACKTEST_RESULTS_FILE = Path("backtest_results.json")
+_UNIVERSE = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA", "AMD", "AMZN", "META", "GOOGL"]
+_STRATEGIES = ["long_call", "long_put", "bull_call_spread", "bear_put_spread", "iron_condor"]
+
+
+def _load_backtest_results() -> dict | None:
+    if _BACKTEST_RESULTS_FILE.exists():
+        try:
+            with open(_BACKTEST_RESULTS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+
+def _run_walkforward(symbols, strategies, capital, min_conf) -> dict:
+    import asyncio as _asyncio
+    from ait.backtesting.walkforward import WalkForwardBacktester, WalkForwardConfig
+
+    cfg = WalkForwardConfig(
+        train_days=365,
+        test_days=63,
+        step_days=21,
+        gap_days=5,
+        initial_capital=capital,
+        min_confidence=min_conf,
+        trailing_stop_enabled=True,
+    )
+    bt = WalkForwardBacktester(symbols, strategies, config=cfg)
+    result = _asyncio.run(bt.run())
+
+    trades = []
+    for w in result.windows:
+        for t in w.backtest_result.trades:
+            trades.append(t)
+
+    return {
+        "total_return": result.total_return,
+        "win_rate": result.win_rate,
+        "sharpe_ratio": result.sharpe_ratio,
+        "max_drawdown": result.max_drawdown,
+        "profit_factor": result.profit_factor,
+        "consistency": result.consistency,
+        "total_trades": result.total_trades,
+        "windows": len(result.windows),
+        "initial_capital": capital,
+        "final_capital": capital * (1 + result.total_return),
+        "trades": trades,
+        "strategy_results": result.strategy_results,
+        "symbol_results": {
+            sym: {
+                "total_return": r.total_return,
+                "total_trades": r.total_trades,
+                "win_rate": r.win_rate,
+                "sharpe_ratio": r.sharpe_ratio,
+            }
+            for sym, r in result.symbol_results.items()
+        },
+        "equity_curve": result.equity_curve().to_dict(orient="records"),
+        "run_at": datetime.now().isoformat(),
+        "symbols": symbols,
+        "strategies": strategies,
+    }
+
+
+def _tab_backtest() -> None:
+    import streamlit as st
+
+    st.header("Walk-Forward Backtest")
+    st.caption("Train ML on 1yr history, test on next 3 months, slide forward — real Black-Scholes pricing.")
+
+    # Config panel
+    with st.expander("Configure Backtest", expanded=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            symbols = st.multiselect("Symbols", _UNIVERSE, default=["SPY", "QQQ", "AAPL", "MSFT", "NVDA"])
+            capital = st.number_input("Capital ($)", min_value=5000, max_value=500_000, value=50_000, step=5000)
+        with col2:
+            strategies = st.multiselect("Strategies", _STRATEGIES, default=["bull_call_spread", "iron_condor"])
+            min_conf = st.slider("Min ML Confidence", 0.50, 0.90, 0.65, 0.05)
+
+        run = st.button("Run Backtest", type="primary")
+
+    if run:
+        if not symbols or not strategies:
+            st.error("Select at least 1 symbol and 1 strategy.")
+        else:
+            with st.spinner(f"Running walk-forward backtest on {', '.join(symbols)}... (~2-5 min)"):
+                try:
+                    data = _run_walkforward(symbols, strategies, capital, min_conf)
+                    with open(_BACKTEST_RESULTS_FILE, "w") as f:
+                        json.dump(data, f, default=str)
+                    st.success("Backtest complete!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Backtest failed: {e}")
+
+    results = _load_backtest_results()
+    if not results:
+        st.info("No backtest results yet. Run a backtest above.")
+        return
+
+    st.caption(f"Last run: {results.get('run_at', 'unknown')} | "
+               f"Symbols: {', '.join(results.get('symbols', []))} | "
+               f"Strategies: {', '.join(results.get('strategies', []))}")
+
+    # Top metrics
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total Return", f"{results['total_return']:.1%}",
+              delta=f"${results['final_capital'] - results['initial_capital']:,.0f}")
+    c2.metric("Win Rate", f"{results['win_rate']:.1%}")
+    c3.metric("Sharpe", f"{results['sharpe_ratio']:.2f}")
+    c4.metric("Max Drawdown", f"{results['max_drawdown']:.1%}")
+    c5.metric("Profit Factor", f"{results['profit_factor']:.2f}")
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Trades", results["total_trades"])
+    col2.metric("Windows", results["windows"])
+    col3.metric("Consistency", f"{results['consistency']:.0%} windows profitable")
+
+    st.divider()
+
+    # Equity curve
+    if results.get("equity_curve"):
+        st.subheader("Equity Curve")
+        curve_df = pd.DataFrame(results["equity_curve"])
+        if not curve_df.empty and "date" in curve_df.columns and "equity" in curve_df.columns:
+            curve_df["date"] = pd.to_datetime(curve_df["date"], errors="coerce")
+            curve_df = curve_df.dropna(subset=["date"]).sort_values("date")
+            fig_eq = go.Figure()
+            fig_eq.add_trace(go.Scatter(
+                x=curve_df["date"], y=curve_df["equity"],
+                mode="lines", fill="tozeroy",
+                line=dict(color="royalblue", width=2), name="Equity",
+            ))
+            fig_eq.add_hline(y=results["initial_capital"], line_dash="dash", line_color="gray",
+                             annotation_text="Starting Capital")
+            fig_eq.update_layout(yaxis=dict(title="Portfolio Value ($)"), height=350)
+            st.plotly_chart(fig_eq, use_container_width=True)
+
+    col_l, col_r = st.columns(2)
+
+    # Strategy breakdown
+    strat_data = results.get("strategy_results", {})
+    if strat_data:
+        with col_l:
+            st.subheader("Strategy Breakdown")
+            rows = []
+            for strat, d in strat_data.items():
+                rows.append({
+                    "Strategy": strat,
+                    "Trades": d["trades"],
+                    "Win Rate": f"{d['win_rate']:.0%}",
+                    "Total P&L": d["total_pnl"],
+                    "Avg P&L": round(d["avg_pnl"], 0),
+                })
+            strat_df = pd.DataFrame(rows).sort_values("Total P&L", ascending=False)
+
+            def _color_pnl(v):
+                return "color: green" if v > 0 else "color: red"
+
+            st.dataframe(
+                strat_df.style.applymap(_color_pnl, subset=["Total P&L", "Avg P&L"]),
+                use_container_width=True, hide_index=True,
+            )
+
+    # Symbol breakdown
+    sym_data = results.get("symbol_results", {})
+    if sym_data:
+        with col_r:
+            st.subheader("Symbol Breakdown")
+            rows = []
+            for sym, d in sym_data.items():
+                rows.append({
+                    "Symbol": sym,
+                    "Return": d["total_return"],
+                    "Trades": d["total_trades"],
+                    "Win Rate": f"{d['win_rate']:.0%}",
+                    "Sharpe": round(d["sharpe_ratio"], 2),
+                })
+            sym_df = pd.DataFrame(rows).sort_values("Return", ascending=False)
+
+            def _color_ret(v):
+                return "color: green" if v > 0 else "color: red"
+
+            st.dataframe(
+                sym_df.style.applymap(_color_ret, subset=["Return"]).format({"Return": "{:.1%}"}),
+                use_container_width=True, hide_index=True,
+            )
+
+    # Trade log
+    if results.get("trades"):
+        st.divider()
+        st.subheader("Trade Log")
+        trades_df = pd.DataFrame(results["trades"])
+        cols_order = ["symbol", "strategy", "trade_type", "direction", "entry_date",
+                      "exit_date", "exit_reason", "pnl", "contracts"]
+        cols_order = [c for c in cols_order if c in trades_df.columns]
+        trades_df = trades_df[cols_order].copy()
+        if "pnl" in trades_df.columns:
+            trades_df["pnl"] = trades_df["pnl"].round(2)
+
+        def _row_color(row):
+            color = "background-color: #d4edda" if row.get("pnl", 0) > 0 else "background-color: #f8d7da"
+            return [color if col == "pnl" else "" for col in row.index]
+
+        st.dataframe(
+            trades_df.style.apply(_row_color, axis=1),
+            use_container_width=True, height=400, hide_index=True,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -752,9 +1099,9 @@ def main() -> None:
     end_date = st.sidebar.date_input("End date", value=date.today())
 
     # --- Tabs ---
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
         ["Portfolio Overview", "Trade History", "Analytics",
-         "Trade Intelligence", "Self-Learning", "System Health"]
+         "Trade Intelligence", "Self-Learning", "System Health", "Backtest"]
     )
 
     with tab1:
@@ -774,6 +1121,9 @@ def main() -> None:
 
     with tab6:
         _tab_system_health(conn)
+
+    with tab7:
+        _tab_backtest()
 
     conn.close()
 

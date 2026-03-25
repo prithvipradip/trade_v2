@@ -126,6 +126,32 @@ class IBKRClient:
             log.error("contract_qualification_failed", contract=str(contract), error=str(e))
             return None
 
+    async def qualify_contracts_batch(self, contracts: list[Contract]) -> list[Contract | None]:
+        """Qualify multiple contracts in a single batch call.
+
+        Much faster than qualifying one at a time for multi-leg orders.
+        Returns a list of qualified contracts (or None for failures)
+        in the same order as the input.
+        """
+        if not contracts:
+            return []
+        if not await self.ensure_connected():
+            return [None] * len(contracts)
+        try:
+            qualified = await self._ib.qualifyContractsAsync(*contracts)
+            # qualifyContractsAsync returns the same contracts with details filled in.
+            # Contracts that failed qualification will have conId == 0.
+            result = []
+            for q in qualified:
+                if q.conId and q.conId > 0:
+                    result.append(q)
+                else:
+                    result.append(None)
+            return result
+        except Exception as e:
+            log.error("batch_qualification_failed", count=len(contracts), error=str(e))
+            return [None] * len(contracts)
+
     async def place_order(self, contract: Contract, order: Order) -> Trade | None:
         """Place an order and return the Trade object for tracking."""
         if not await self.ensure_connected():

@@ -219,8 +219,14 @@ class Watchdog:
     def _get_memory_mb() -> float:
         """Get current process memory usage in MB."""
         try:
-            import resource
-            usage = resource.getrusage(resource.RUSAGE_SELF)
-            return usage.ru_maxrss / (1024 * 1024)  # macOS returns bytes
+            import psutil
+            process = psutil.Process(os.getpid())
+            return process.memory_info().rss / (1024 * 1024)
         except (ImportError, AttributeError):
-            return 0.0
+            # Fallback for environments without psutil
+            try:
+                import resource
+                usage = resource.getrusage(resource.RUSAGE_SELF)
+                return usage.ru_maxrss / (1024 * 1024)
+            except (ImportError, AttributeError):
+                return 0.0

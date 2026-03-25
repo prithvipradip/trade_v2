@@ -74,7 +74,7 @@ class OptionsConfig(BaseModel):
 class MLConfig(BaseModel):
     ensemble_weights: dict[str, float] = {"xgboost": 0.5, "lightgbm": 0.5}
     retrain_interval_days: int = Field(default=7, ge=1, le=30)
-    lookback_days: int = Field(default=252, ge=60, le=1000)
+    lookback_days: int = Field(default=504, ge=60, le=2520)
     min_training_samples: int = Field(default=100, ge=30)
 
     @field_validator("ensemble_weights")

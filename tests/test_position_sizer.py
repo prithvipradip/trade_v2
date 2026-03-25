@@ -145,7 +145,7 @@ class TestVolatilityAdjustment:
         assert result.volatility_adjustment == 1.0
 
     def test_medium_vol_reduced(self, sizer: PositionSizer) -> None:
-        """IV ~35% should give vol_adj = 0.85."""
+        """IV ~35% should give smooth interpolated vol_adj."""
         result = sizer.calculate(
             account_value=100_000,
             option_price=1.00,
@@ -154,7 +154,8 @@ class TestVolatilityAdjustment:
             strategy="long_call",
             underlying_price=450.0,
         )
-        assert result.volatility_adjustment == 0.85
+        # Smooth linear: 1.0 - 0.5 * ((0.35 - 0.20) / 0.40) = 0.8125
+        assert result.volatility_adjustment == 0.8125
 
     def test_high_vol_half_size(self, sizer: PositionSizer) -> None:
         """IV > 60% should give vol_adj = 0.5."""
@@ -168,8 +169,8 @@ class TestVolatilityAdjustment:
         )
         assert result.volatility_adjustment == 0.5
 
-    def test_vol_40_to_60_gives_0_7(self, sizer: PositionSizer) -> None:
-        """IV in (40%, 60%] should give vol_adj = 0.7."""
+    def test_vol_40_to_60_gives_smooth(self, sizer: PositionSizer) -> None:
+        """IV at 50% should give smooth interpolated vol_adj."""
         result = sizer.calculate(
             account_value=100_000,
             option_price=1.00,
@@ -178,7 +179,8 @@ class TestVolatilityAdjustment:
             strategy="long_call",
             underlying_price=450.0,
         )
-        assert result.volatility_adjustment == 0.7
+        # Smooth linear: 1.0 - 0.5 * ((0.50 - 0.20) / 0.40) = 0.625
+        assert result.volatility_adjustment == 0.625
 
     def test_higher_vol_means_fewer_contracts(self, sizer: PositionSizer) -> None:
         """Higher IV should result in fewer or equal contracts."""
@@ -270,7 +272,7 @@ class TestStrategyRiskMultipliers:
 
 
 class TestFloorAndCap:
-    """Test floor of 1 contract, cap of 10."""
+    """Test floor of 1 contract, cap scales with account size."""
 
     def test_floor_of_1(self, sizer: PositionSizer) -> None:
         """Even with tiny account, should get at least 1 contract."""
@@ -284,14 +286,27 @@ class TestFloorAndCap:
         )
         assert result.contracts == 1
 
-    def test_cap_of_10(self, sizer: PositionSizer) -> None:
-        """Even with huge account and cheap options, cap at 10."""
+    def test_cap_scales_with_account(self, sizer: PositionSizer) -> None:
+        """Cap should scale with account size (1 per $10k)."""
         result = sizer.calculate(
             account_value=10_000_000,
             option_price=0.10,  # Very cheap
             confidence=1.0,
             implied_vol=0.10,
             strategy="long_straddle",  # 1.2x multiplier
+            underlying_price=450.0,
+        )
+        # $10M account → cap = 1000 contracts (1 per $10k)
+        assert result.contracts == 1000
+
+    def test_small_account_cap(self, sizer: PositionSizer) -> None:
+        """$100k account should cap at 10 contracts."""
+        result = sizer.calculate(
+            account_value=100_000,
+            option_price=0.10,
+            confidence=1.0,
+            implied_vol=0.10,
+            strategy="long_call",
             underlying_price=450.0,
         )
         assert result.contracts == 10

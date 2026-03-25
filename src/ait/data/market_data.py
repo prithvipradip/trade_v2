@@ -120,6 +120,44 @@ class MarketDataService:
 
         return df
 
+    async def get_intraday(
+        self,
+        symbol: str,
+        interval: str = "5m",
+        days: int = 1,
+    ) -> pd.DataFrame | None:
+        """Get intraday OHLCV data (5-min bars).
+
+        Used for multi-timeframe analysis and entry timing.
+        Yahoo Finance provides 5-min data for the last 60 days.
+        """
+        cache_key = f"intraday:{symbol}:{interval}:{days}"
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            period = f"{days}d" if days <= 5 else "1mo"
+            loop = asyncio.get_running_loop()
+            ticker = await loop.run_in_executor(None, lambda: yf.Ticker(symbol))
+            df = await loop.run_in_executor(
+                None, lambda: ticker.history(period=period, interval=interval)
+            )
+
+            if df is None or df.empty:
+                return None
+
+            df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+            df.index.name = "Datetime"
+
+            # Cache for 5 minutes (intraday data changes frequently)
+            self._cache.set(cache_key, df, ttl=300)
+            return df
+
+        except Exception as e:
+            log.debug("intraday_fetch_failed", symbol=symbol, interval=interval, error=str(e))
+            return None
+
     async def get_current_price(self, symbol: str) -> float | None:
         """Get the current price for a symbol."""
         quote = await self.get_quote(symbol)
@@ -129,9 +167,20 @@ class MarketDataService:
 
     async def get_vix(self) -> float | None:
         """Get current VIX level."""
-        quote = await self.get_quote("^VIX")
-        if quote:
-            return quote.last
+        # Try IBKR first — VIX is an index on CBOE, not a stock
+        if self._ibkr and self._ibkr.connected:
+            try:
+                from ib_insync import Index
+                contract = Index("VIX", "CBOE", "USD")
+                qualified = await self._ibkr.qualify_contract(contract)
+                if qualified:
+                    self._ibkr.ib.reqMktData(qualified, "", False, False)
+                    await asyncio.sleep(0.5)
+                    ticker = self._ibkr.ib.ticker(qualified)
+                    if ticker and not math.isnan(ticker.last) and ticker.last > 0:
+                        return float(ticker.last)
+            except Exception as e:
+                log.debug("vix_ibkr_failed", error=str(e))
 
         # Yahoo fallback for VIX
         try:
@@ -158,7 +207,9 @@ class MarketDataService:
             if not qualified:
                 return None
 
-            # Request market data
+            # Request delayed market data (type 3) for paper accounts
+            # without live data subscriptions, then request data
+            self._ibkr.ib.reqMarketDataType(3)  # 3 = delayed
             self._ibkr.ib.reqMktData(qualified, "", False, False)
             await asyncio.sleep(0.5)  # Brief wait for data
 

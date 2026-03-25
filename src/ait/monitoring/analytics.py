@@ -1,5 +1,9 @@
 """Trade analytics — comprehensive performance metrics.
 
+Uses DuckDB as primary analytics engine with SQLite fallback.
+DuckDB provides columnar vectorized execution for fast aggregations
+and window functions over trade history.
+
 Calculates:
 - Sharpe ratio, Sortino ratio
 - Maximum drawdown and recovery time
@@ -49,13 +53,55 @@ class PerformanceMetrics:
 
 
 class TradeAnalytics:
-    """Computes detailed trading analytics from the trade database."""
+    """Computes detailed trading analytics from the trade database.
+
+    Uses DuckDB as primary for read-heavy queries, with SQLite fallback.
+    """
 
     def __init__(self, db_path: Path = DB_PATH) -> None:
         self._db_path = db_path
+        self._duck = self._init_duck()
+
+    @staticmethod
+    def _init_duck():
+        try:
+            from ait.monitoring.duckdb_analytics import DuckDBAnalytics
+            return DuckDBAnalytics()
+        except Exception:
+            return None
 
     def get_performance(self, lookback_days: int = 30) -> PerformanceMetrics:
-        """Calculate comprehensive performance metrics."""
+        """Calculate comprehensive performance metrics.
+
+        Uses DuckDB when available for faster computation.
+        """
+        if self._duck:
+            try:
+                snap = self._duck.get_performance(lookback_days)
+                return PerformanceMetrics(
+                    total_trades=snap.total_trades,
+                    total_pnl=snap.total_pnl,
+                    win_rate=snap.win_rate,
+                    profit_factor=snap.profit_factor,
+                    sharpe_ratio=snap.sharpe_ratio,
+                    sortino_ratio=snap.sortino_ratio,
+                    max_drawdown_pct=snap.max_drawdown_pct,
+                    max_drawdown_dollars=snap.max_drawdown_dollars,
+                    avg_trade_pnl=snap.avg_trade_pnl,
+                    avg_win=snap.avg_win,
+                    avg_loss=snap.avg_loss,
+                    largest_win=snap.largest_win,
+                    largest_loss=snap.largest_loss,
+                    avg_hold_hours=snap.avg_hold_hours,
+                    consecutive_wins=snap.consecutive_wins,
+                    consecutive_losses=snap.consecutive_losses,
+                    current_streak=snap.current_streak,
+                    recovery_factor=snap.recovery_factor,
+                )
+            except Exception as e:
+                log.warning("duckdb_fallback", method="get_performance", error=str(e))
+
+        # SQLite fallback
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
         trades = self._get_closed_trades(cutoff)
 
@@ -120,6 +166,13 @@ class TradeAnalytics:
 
     def get_daily_pnl(self, lookback_days: int = 30) -> list[dict]:
         """Get daily P&L for charting."""
+        if self._duck:
+            try:
+                return self._duck.get_daily_pnl(lookback_days)
+            except Exception as e:
+                log.warning("duckdb_fallback", method="get_daily_pnl", error=str(e))
+
+        # SQLite fallback
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
 
         if not self._db_path.exists():
@@ -150,6 +203,13 @@ class TradeAnalytics:
 
     def get_strategy_breakdown(self, lookback_days: int = 60) -> list[dict]:
         """Get performance breakdown by strategy."""
+        if self._duck:
+            try:
+                return self._duck.get_strategy_breakdown(lookback_days)
+            except Exception as e:
+                log.warning("duckdb_fallback", method="get_strategy_breakdown", error=str(e))
+
+        # SQLite fallback
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
         trades = self._get_closed_trades(cutoff)
 
@@ -176,6 +236,13 @@ class TradeAnalytics:
 
     def get_symbol_breakdown(self, lookback_days: int = 60) -> list[dict]:
         """Get performance breakdown by symbol."""
+        if self._duck:
+            try:
+                return self._duck.get_symbol_breakdown(lookback_days)
+            except Exception as e:
+                log.warning("duckdb_fallback", method="get_symbol_breakdown", error=str(e))
+
+        # SQLite fallback
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
         trades = self._get_closed_trades(cutoff)
 

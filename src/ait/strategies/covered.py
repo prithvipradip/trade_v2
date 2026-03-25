@@ -71,7 +71,7 @@ class CoveredCall(Strategy):
             Signal(
                 symbol=symbol,
                 strategy_name=self.name,
-                direction=SignalDirection.NEUTRAL,
+                direction=SignalDirection.BULLISH,
                 confidence=confidence,
                 contract=target,
                 action="SELL",

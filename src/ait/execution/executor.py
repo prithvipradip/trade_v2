@@ -150,7 +150,11 @@ class TradeExecutor:
     async def _execute_single_leg(
         self, signal: Signal, contracts: int, trade_id: str
     ) -> Trade | None:
-        """Execute a single-leg option order."""
+        """Execute a single-leg option order.
+
+        Uses passive pricing when bid/ask is available for price improvement.
+        Falls back to standard limit order at signal entry_price.
+        """
         if not signal.contract:
             log.error("no_contract_in_signal", trade_id=trade_id)
             return None
@@ -167,33 +171,64 @@ class TradeExecutor:
             log.error("contract_qualification_failed", trade_id=trade_id)
             return None
 
-        order = OrderBuilder.limit(
-            action=signal.action,
-            quantity=contracts,
-            limit_price=signal.entry_price,
-        )
+        # Try passive pricing if bid/ask available on the contract
+        bid = getattr(signal.contract, "bid", 0) or 0
+        ask = getattr(signal.contract, "ask", 0) or 0
+
+        if bid > 0 and ask > 0 and ask > bid:
+            order = OrderBuilder.passive_limit(
+                action=signal.action,
+                quantity=contracts,
+                bid=bid,
+                ask=ask,
+            )
+            log.info(
+                "passive_order",
+                trade_id=trade_id,
+                bid=bid,
+                ask=ask,
+                limit=order.lmtPrice,
+            )
+        else:
+            order = OrderBuilder.limit(
+                action=signal.action,
+                quantity=contracts,
+                limit_price=signal.entry_price,
+            )
 
         return await self._ibkr.place_order(qualified, order)
 
     async def _execute_multi_leg(
         self, signal: Signal, contracts: int, trade_id: str
     ) -> Trade | None:
-        """Execute a multi-leg combo order (spreads, condors)."""
+        """Execute a multi-leg combo order (spreads, condors).
+
+        Uses batch contract qualification for speed — qualifies all legs
+        in a single IBKR call instead of one-at-a-time.
+        """
         if not signal.legs:
             log.error("no_legs_in_signal", trade_id=trade_id)
             return None
 
-        qualified_legs = []
+        # Build all leg contracts at once
+        ibkr_contracts = []
         for leg in signal.legs:
             opt_contract = leg["contract"]
-            ibkr_contract = ContractBuilder.option(
+            ibkr_contracts.append(ContractBuilder.option(
                 symbol=signal.symbol,
                 expiry=opt_contract.expiry,
                 strike=opt_contract.strike,
                 right=opt_contract.right,
-            )
-            qualified = await self._ibkr.qualify_contract(ibkr_contract)
+            ))
+
+        # Batch qualify all legs in one call
+        qualified_list = await self._ibkr.qualify_contracts_batch(ibkr_contracts)
+
+        qualified_legs = []
+        for i, qualified in enumerate(qualified_list):
             if not qualified:
+                leg = signal.legs[i]
+                opt_contract = leg["contract"]
                 log.error(
                     "leg_qualification_failed",
                     trade_id=trade_id,
@@ -204,8 +239,8 @@ class TradeExecutor:
 
             qualified_legs.append({
                 "conId": qualified.conId,
-                "action": leg["action"],
-                "ratio": leg.get("ratio", 1),
+                "action": signal.legs[i]["action"],
+                "ratio": signal.legs[i].get("ratio", 1),
             })
 
         combo = ContractBuilder.combo(
@@ -213,7 +248,16 @@ class TradeExecutor:
             legs=qualified_legs,
         )
 
-        is_credit = signal.action == "SELL"
+        # Determine if this is a credit spread by checking the legs:
+        # if more legs are selling than buying, it's a net credit trade.
+        # For debit spreads (bull call, bear put), entry_price is positive debit.
+        # For credit spreads (iron condor, short strangle), IBKR expects negative limit.
+        if signal.legs:
+            sell_count = sum(1 for leg in signal.legs if leg["action"] == "SELL")
+            buy_count = len(signal.legs) - sell_count
+            is_credit = sell_count > buy_count
+        else:
+            is_credit = signal.action == "SELL"
         limit_price = -signal.entry_price if is_credit else signal.entry_price
 
         order = OrderBuilder.combo_limit(

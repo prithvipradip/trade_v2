@@ -5,10 +5,11 @@ features from price data. All features are calculated from real data only.
 
 Features are organized into groups:
 - Momentum (RSI, MACD, rate of change)
-- Volatility (ATR, Bollinger Bands, realized vol)
+- Volatility (ATR, Bollinger Bands, realized vol, IV rank)
 - Volume (OBV, volume ratio, VWAP proxy)
 - Trend (moving averages, ADX proxy)
-- Options-specific (IV rank, put/call ratio — when available)
+- Options-specific (IV rank, vol ratio, vol regime)
+- Seasonality (day-of-week, month effects)
 """
 
 from __future__ import annotations
@@ -59,10 +60,69 @@ class FeatureEngine:
         # --- Multi-Timeframe Features ---
         features = self._add_multi_timeframe(features)
 
+        # --- IV & Volatility Regime Features ---
+        features = self._add_iv_features(features)
+
+        # --- Seasonality Features ---
+        features = self._add_seasonality(features)
+
         # Drop rows with NaN from lookback calculations
         features = features.dropna()
 
         log.debug("features_computed", rows=len(features), columns=len(features.columns))
+        return features
+
+    def compute_intraday_features(self, intraday_df: pd.DataFrame) -> dict[str, float]:
+        """Compute features from intraday (5-min) data for entry timing.
+
+        Returns a flat dict of intraday features that can be appended
+        to the daily feature set for enhanced predictions.
+        """
+        if intraday_df is None or len(intraday_df) < 20:
+            return {}
+
+        close = intraday_df["Close"]
+        volume = intraday_df["Volume"]
+        high = intraday_df["High"]
+        low = intraday_df["Low"]
+
+        features = {}
+
+        # VWAP and price position relative to it
+        typical = (high + low + close) / 3
+        cum_vol = volume.cumsum()
+        vwap = (typical * volume).cumsum() / cum_vol.replace(0, np.nan)
+        features["intraday_vwap_position"] = float(
+            (close.iloc[-1] - vwap.iloc[-1]) / vwap.iloc[-1]
+        ) if vwap.iloc[-1] > 0 else 0.0
+
+        # Intraday RSI (7-period on 5-min bars)
+        features["intraday_rsi"] = float(self._rsi(close, 7).iloc[-1])
+
+        # Intraday momentum (last 12 bars = 1 hour)
+        features["intraday_momentum_1h"] = float(close.pct_change(12).iloc[-1]) if len(close) > 12 else 0.0
+
+        # Intraday volatility (ATR as % of price)
+        tr = pd.concat([
+            high - low,
+            (high - close.shift(1)).abs(),
+            (low - close.shift(1)).abs(),
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(14).mean()
+        features["intraday_atr_pct"] = float(atr.iloc[-1] / close.iloc[-1]) if close.iloc[-1] > 0 else 0.0
+
+        # Volume profile: current vs session average
+        features["intraday_vol_ratio"] = float(
+            volume.iloc[-1] / volume.mean()
+        ) if volume.mean() > 0 else 1.0
+
+        # Price range compression (low range = breakout incoming)
+        recent_range = (high.tail(12).max() - low.tail(12).min()) / close.iloc[-1]
+        session_range = (high.max() - low.min()) / close.iloc[-1]
+        features["intraday_range_compression"] = float(
+            recent_range / session_range
+        ) if session_range > 0 else 1.0
+
         return features
 
     def get_feature_names(self) -> list[str]:
@@ -88,6 +148,11 @@ class FeatureEngine:
             # Multi-timeframe
             "weekly_trend_aligned", "weekly_rsi",
             "weekly_momentum", "volume_confirmation",
+            # IV & Volatility Regime
+            "iv_rank", "vol_ratio", "vol_trend", "vol_of_vol",
+            "vol_regime_expanding", "vol_mean_reversion_signal",
+            # Seasonality
+            "day_of_week", "month_of_year",
         ]
 
     # --- Feature Groups ---
@@ -244,6 +309,61 @@ class FeatureEngine:
             trend_direction * daily_trend + (1 - trend_direction) * (1 - daily_trend)
         )
 
+        return df
+
+    def _add_iv_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add implied volatility proxy and vol regime features.
+
+        Since we use OHLCV data (no live IV feed during feature computation),
+        we derive IV-proxy features from realized volatility patterns.
+        These capture the same dynamics: vol rank, vol expansion/compression,
+        and mean-reversion signals that drive options pricing.
+        """
+        close = df["Close"]
+        log_returns = np.log(close / close.shift(1))
+
+        # Rolling realized vol at multiple horizons
+        vol_5 = log_returns.rolling(5).std() * np.sqrt(252)
+        vol_10 = log_returns.rolling(10).std() * np.sqrt(252)
+        vol_20 = log_returns.rolling(20).std() * np.sqrt(252)
+        vol_60 = log_returns.rolling(60).std() * np.sqrt(252)
+
+        # IV Rank proxy: where is current 20-day vol relative to rolling range?
+        # min_periods=20 so feature is valid after just 40 total rows (20 for vol_20 + 20 more)
+        vol_252_min = vol_20.rolling(252, min_periods=20).min()
+        vol_252_max = vol_20.rolling(252, min_periods=20).max()
+        vol_range = (vol_252_max - vol_252_min).replace(0, np.nan)
+        df["iv_rank"] = ((vol_20 - vol_252_min) / vol_range).clip(0, 1)
+
+        # Vol ratio: short-term vs long-term (expansion when > 1, compression when < 1)
+        df["vol_ratio"] = (vol_10 / vol_60.replace(0, np.nan)).clip(0, 3)
+
+        # Vol trend: is volatility rising or falling? (5-day slope of 20-day vol)
+        df["vol_trend"] = vol_20.pct_change(5).clip(-1, 1)
+
+        # Volatility of volatility: how unstable is vol itself?
+        df["vol_of_vol"] = vol_20.rolling(20).std().clip(0, 1)
+
+        # Vol regime: expanding (short-term > long-term) = 1, compressing = 0
+        df["vol_regime_expanding"] = (vol_5 > vol_20).astype(float)
+
+        # Mean-reversion signal: when vol is extreme, expect reversion
+        # High iv_rank (>0.8) → expect vol to drop → sell premium
+        # Low iv_rank (<0.2) → expect vol to rise → buy premium
+        vol_zscore = ((vol_20 - vol_60) / vol_60.replace(0, np.nan)).clip(-3, 3)
+        df["vol_mean_reversion_signal"] = -vol_zscore  # Negative = expect reversion down
+
+        return df
+
+    def _add_seasonality(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add day-of-week and month seasonality features."""
+        idx = df.index
+        if hasattr(idx, "dayofweek"):
+            df["day_of_week"] = idx.dayofweek / 4.0  # Normalize 0-1 (Mon=0, Fri=1)
+            df["month_of_year"] = idx.month / 12.0  # Normalize 0-1
+        else:
+            df["day_of_week"] = 0.5
+            df["month_of_year"] = 0.5
         return df
 
     # --- Utilities ---

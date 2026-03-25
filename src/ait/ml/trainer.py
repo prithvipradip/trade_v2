@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta
 from ait.config.settings import MLConfig
 from ait.data.historical import HistoricalDataStore
 from ait.data.market_data import MarketDataService
+from ait.ml.drift import DriftDetector
 from ait.ml.ensemble import DirectionPredictor
 from ait.utils.logging import get_logger
 
@@ -18,7 +19,11 @@ log = get_logger("ml.trainer")
 
 
 class ModelTrainer:
-    """Manages ML model training lifecycle."""
+    """Manages ML model training lifecycle.
+
+    Integrates with DriftDetector to trigger retraining when the model's
+    prediction accuracy degrades below acceptable thresholds.
+    """
 
     def __init__(
         self,
@@ -32,9 +37,20 @@ class ModelTrainer:
         self._market_data = market_data
         self._store = historical_store
         self._last_train_date: date | None = None
+        self._drift_detector = DriftDetector()
+
+    @property
+    def drift_detector(self) -> DriftDetector:
+        return self._drift_detector
 
     def needs_training(self) -> bool:
-        """Check if models need retraining."""
+        """Check if models need retraining.
+
+        Triggers on:
+        1. First run (no model loaded)
+        2. Scheduled interval elapsed
+        3. Drift detector signals retraining needed
+        """
         # First run — always train
         if not self._predictor.is_trained:
             return True
@@ -44,7 +60,21 @@ class ModelTrainer:
             return True
 
         days_since = (date.today() - self._last_train_date).days
-        return days_since >= self._config.retrain_interval_days
+        if days_since >= self._config.retrain_interval_days:
+            return True
+
+        # Drift-triggered retraining
+        drift_report = self._drift_detector.check_drift()
+        if drift_report.should_retrain:
+            log.warning(
+                "drift_triggered_retrain",
+                accuracy=f"{drift_report.accuracy:.2%}",
+                reason=drift_report.reason,
+                samples=drift_report.samples,
+            )
+            return True
+
+        return False
 
     async def train_all_symbols(self, symbols: list[str]) -> dict[str, dict[str, float]]:
         """Fetch fresh data and train models for all symbols.
@@ -74,6 +104,7 @@ class ModelTrainer:
                 results[symbol] = accuracies
 
         self._last_train_date = date.today()
+        self._drift_detector.acknowledge_retrain()
 
         # Auto-rollback: if new model is significantly worse, revert
         if prev_scores and results:
