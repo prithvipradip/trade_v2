@@ -30,7 +30,7 @@ from ait.utils.logging import get_logger
 log = get_logger("backtesting.engine")
 
 # Strategies that collect premium (short theta)
-CREDIT_STRATEGIES = {"iron_condor", "short_strangle", "short_straddle", "covered_call", "cash_secured_put"}
+CREDIT_STRATEGIES = {"iron_condor", "short_strangle", "short_straddle", "covered_call", "cash_secured_put", "put_credit_spread"}
 # Strategies that pay premium (long theta)
 DEBIT_STRATEGIES = {"long_call", "long_put", "bull_call_spread", "bear_put_spread", "long_straddle"}
 
@@ -133,11 +133,20 @@ class Backtester:
                 continue
 
             direction, confidence = self._get_direction(hist)
-            if confidence < self._min_confidence:
+
+            # Tier-aware confidence: directional spreads need extreme conviction
+            if capital < 2000:
+                effective_min_conf = max(self._min_confidence, 0.85)
+            elif capital < 5000:
+                effective_min_conf = max(self._min_confidence, 0.65)
+            else:
+                effective_min_conf = self._min_confidence
+
+            if confidence < effective_min_conf:
                 continue
 
             # Bearish bets need slightly higher confidence (market has natural upward drift)
-            if direction == SignalDirection.BEARISH and confidence < self._min_confidence + 0.05:
+            if direction == SignalDirection.BEARISH and confidence < effective_min_conf + 0.05:
                 continue
 
             strategy = self._select_strategy(direction, hist, confidence)
@@ -262,8 +271,31 @@ class Backtester:
             log.debug("ml_predictor_unavailable", reason=str(e))
         return None
 
+    def _load_directional_model(self):
+        """Try to load the directional model for small account trading."""
+        try:
+            from ait.ml.directional import DirectionalModel
+            model = DirectionalModel()
+            if model.load():
+                return model
+        except Exception:
+            pass
+        return None
+
     def _get_direction(self, hist: pd.DataFrame) -> tuple[SignalDirection, float]:
-        """Get market direction prediction."""
+        """Get market direction prediction.
+
+        Small accounts (<$2k): mechanical put-selling (bullish bias + IV filter).
+        Larger accounts: ML ensemble for iron condor timing.
+        """
+        capital = getattr(self, '_current_capital', self._initial_capital)
+
+        # Small accounts: mechanical put credit spread strategy
+        # No ML — just sell puts when IV is high and trend is up
+        if capital < 2000:
+            return self._mechanical_put_signal(hist)
+
+        # Standard: use ensemble predictor
         if self._predictor is not None:
             try:
                 pred = self._predictor.predict(hist)
@@ -272,6 +304,45 @@ class Backtester:
             except Exception:
                 pass
         return self._simple_direction(hist)
+
+    def _mechanical_put_signal(self, hist: pd.DataFrame) -> tuple[SignalDirection, float]:
+        """Mechanical put credit spread signal for small accounts.
+
+        Rules (from Option Alpha 5-year SPY study):
+        1. Sell put spreads only (bullish bias — market up 70% of time)
+        2. Only when IV rank > 50 (fat premium)
+        3. Only when price > SMA50 (uptrend confirmed)
+        4. Skip if recent drop > 3% in 5 days (catching falling knife)
+        """
+        close = hist["Close"].values
+        if len(close) < 60:
+            return SignalDirection.NEUTRAL, 0.0
+
+        # IV rank proxy
+        from ait.backtesting.options_sim import realized_vol
+        rv_20 = realized_vol(close, window=20)
+        rv_long = realized_vol(close, window=60) if len(close) > 61 else rv_20
+        iv_rank = 0.5  # default
+        if rv_long > 0:
+            iv_rank = min(1.0, rv_20 / rv_long)
+
+        # Trend: price above SMA50
+        sma_50 = float(np.mean(close[-50:]))
+        price = float(close[-1])
+        above_sma50 = price > sma_50
+
+        # Recent momentum: not falling off a cliff
+        ret_5 = price / float(close[-5]) - 1 if len(close) >= 5 else 0.0
+        not_crashing = ret_5 > -0.03
+
+        # All conditions met = sell put spread
+        if iv_rank > 0.5 and above_sma50 and not_crashing:
+            # Confidence scales with IV rank — fatter premium = better trade
+            confidence = 0.70 + (iv_rank - 0.5) * 0.4  # 0.70 to 0.90
+            return SignalDirection.BULLISH, min(confidence, 0.95)
+
+        # Conditions not met = sit on hands
+        return SignalDirection.NEUTRAL, 0.0
 
     @staticmethod
     def _simple_direction(hist: pd.DataFrame) -> tuple[SignalDirection, float]:
@@ -315,11 +386,15 @@ class Backtester:
         capital = getattr(self, '_current_capital', self._initial_capital)
         condor_affordable = capital >= 2000 and has_condor
 
-        if condor_affordable:
+        if capital < 2000:
+            # Micro tier: put credit spreads (sell puts = collect premium, bullish bias)
+            candidates = available & {"put_credit_spread"}
+            if not candidates:
+                candidates = available & {"bull_call_spread"}
+        elif condor_affordable:
             candidates = available & {"iron_condor"}
         elif direction == SignalDirection.NEUTRAL:
-            # Small account neutral: use credit spreads
-            candidates = available & {"bull_call_spread", "bear_put_spread"}
+            candidates = available & CREDIT_STRATEGIES
         elif direction == SignalDirection.BULLISH:
             candidates = available & {"bull_call_spread", "long_call"}
         else:
@@ -502,7 +577,62 @@ class Backtester:
                 "high_water_mark": 0.0,
             }
 
-        # Other credit strategies can be added here
+        elif strategy == "put_credit_spread":
+            # Sell higher strike put, buy lower strike put = bullish credit spread
+            # Short put at 0.20 delta (OTM), long put further OTM for protection
+            short_put_strike = find_strike_by_delta(S, t, iv, -0.20, OptionType.PUT, r)
+
+            # Wing width: $1-2 for micro accounts, scales with capital
+            wing = max(1.0, min(S * 0.01, 5.0))  # ~1% of stock price, max $5
+            if capital < 2000:
+                wing = min(wing, 2.0)  # Cap at $2 for micro
+
+            long_put_strike = short_put_strike - wing
+
+            short_put_price = black_scholes_price(S, short_put_strike, t, r, iv, OptionType.PUT)
+            long_put_price = black_scholes_price(S, long_put_strike, t, r, iv, OptionType.PUT)
+
+            net_credit = short_put_price - long_put_price
+            if net_credit <= 0:
+                return None
+
+            max_loss_per_share = wing - net_credit
+            max_loss_per_contract = max_loss_per_share * 100
+
+            if max_loss_per_contract <= 0 or capital < max_loss_per_contract:
+                return None
+
+            # Position sizing
+            size_pct = 0.10 if capital < 2000 else self._position_size_pct
+            contracts = int(capital * size_pct / max_loss_per_contract)
+            if contracts < 1:
+                if max_loss_per_contract <= capital * 0.25:
+                    contracts = 1
+                else:
+                    return None
+
+            net_credit *= (1 - self._slippage_pct)
+
+            return {
+                "symbol": "SIM",
+                "strategy": "put_credit_spread",
+                "direction": SignalDirection.BULLISH.value,
+                "trade_type": "credit",
+                "entry_date": str(today_date),
+                "entry_price": round(net_credit, 4),
+                "contracts": contracts,
+                "n_legs": 2,
+                "short_put_strike": round(short_put_strike, 0),
+                "long_put_strike": round(long_put_strike, 0),
+                "strike": round(short_put_strike, 0),
+                "option_type": "put",
+                "entry_iv": round(iv, 4),
+                "underlying_at_entry": round(S, 2),
+                "max_loss_per_share": round(max_loss_per_share, 4),
+                "expiry_date": str(today_date + timedelta(days=dte)),
+                "high_water_mark": 0.0,
+            }
+
         return None
 
     def _finalize_spread_position(
@@ -515,9 +645,15 @@ class Backtester:
         cost_per_contract = net_cost * 100
         if cost_per_contract <= 0 or capital < cost_per_contract:
             return None
-        contracts = int(capital * self._position_size_pct / cost_per_contract)
+        # Tier-aware position sizing: micro accounts risk more per trade (fewer trades)
+        size_pct = 0.08 if capital < 2000 else self._position_size_pct
+        contracts = int(capital * size_pct / cost_per_contract)
         if contracts < 1:
-            return None
+            # Allow 1 contract only if affordable within 25% of capital
+            if cost_per_contract <= capital * 0.25:
+                contracts = 1
+            else:
+                return None
 
         direction = SignalDirection.BULLISH if "bull" in strategy else SignalDirection.BEARISH
 
@@ -567,6 +703,12 @@ class Backtester:
             lp = black_scholes_price(underlying, pos["long_put_strike"], t, r, iv, OptionType.PUT)
             # Cost to buy back the iron condor (close the position)
             return (sc + sp) - (lc + lp)
+
+        elif strategy == "put_credit_spread":
+            # Credit spread: cost to buy back = short put value - long put value
+            sp = black_scholes_price(underlying, pos["short_put_strike"], t, r, iv, OptionType.PUT)
+            lp = black_scholes_price(underlying, pos["long_put_strike"], t, r, iv, OptionType.PUT)
+            return sp - lp  # Cost to close (want this to decrease)
 
         elif strategy in ("bull_call_spread", "bear_put_spread"):
             # Reprice the spread
@@ -633,8 +775,12 @@ class Backtester:
 
     def _check_exit_fixed(self, pos: dict, pnl_pct: float, current_date: date) -> dict | None:
         """Fixed stop-loss / take-profit."""
+        # Tier-aware stop loss: tighter for small accounts doing directional bets
+        capital = getattr(self, '_current_capital', self._initial_capital)
+        stop = 0.25 if capital < 2000 else self._stop_loss_pct
+
         # Stop loss
-        if pnl_pct <= -self._stop_loss_pct:
+        if pnl_pct <= -stop:
             return {"exit_date": str(current_date), "exit_reason": "stop_loss"}
 
         # Profit target

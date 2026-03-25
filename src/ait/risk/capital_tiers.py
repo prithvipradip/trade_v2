@@ -44,9 +44,16 @@ class TierConfig:
     max_positions: int             # Max concurrent positions
     cash_reserve_pct: float        # Keep this % in cash always
 
+    # ML confidence
+    min_confidence: float          # Higher for directional, lower for neutral
+
     # Spread sizing
     max_wing_width: float          # Max width in dollars
     min_wing_width: float          # Min width in dollars
+
+    # Exit rules
+    stop_loss_pct: float           # Tighter for directional trades
+    profit_target_pct: float       # Take profits
 
     # Underlying filters
     max_underlying_price: float    # Skip stocks above this price
@@ -63,14 +70,17 @@ TIERS = {
         min_capital=0,
         max_capital=2_000,
         allowed_strategies=["bull_call_spread", "bear_put_spread"],
-        prefer_strategy="bear_put_spread",  # Credit spread (sell put spread)
-        max_risk_per_trade_pct=0.05,   # 5% = $35-100 per trade
+        prefer_strategy="bear_put_spread",
+        max_risk_per_trade_pct=0.10,    # 10% = $70 per trade on $700
         max_positions=2,
-        cash_reserve_pct=0.40,          # Keep 40% cash
-        max_wing_width=2.0,             # $1-2 wide spreads ($100-200 max loss)
+        cash_reserve_pct=0.40,
+        min_confidence=0.75,            # High conviction only — directional bets
+        max_wing_width=2.0,
         min_wing_width=1.0,
-        max_underlying_price=200.0,     # Skip SPY/NVDA/AMZN (too expensive)
-        preferred_underlyings=["AMD", "QQQ", "IWM", "SOFI", "PLTR"],
+        stop_loss_pct=0.25,             # Tight stops — can't afford big losses
+        profit_target_pct=0.50,
+        max_underlying_price=700.0,     # SPY/QQQ $1-wide spreads are ~$65-80 risk
+        preferred_underlyings=["SPY", "QQQ", "IWM", "AMD"],
     ),
     CapitalTier.SMALL: TierConfig(
         tier=CapitalTier.SMALL,
@@ -78,11 +88,14 @@ TIERS = {
         max_capital=5_000,
         allowed_strategies=["bull_call_spread", "bear_put_spread", "iron_condor"],
         prefer_strategy="iron_condor",
-        max_risk_per_trade_pct=0.05,
+        max_risk_per_trade_pct=0.07,
         max_positions=3,
         cash_reserve_pct=0.35,
+        min_confidence=0.65,            # Iron condors need less conviction
         max_wing_width=5.0,
         min_wing_width=2.0,
+        stop_loss_pct=0.35,
+        profit_target_pct=0.50,
         max_underlying_price=300.0,
         preferred_underlyings=["SPY", "QQQ", "IWM", "AMD", "AAPL"],
     ),
@@ -98,8 +111,11 @@ TIERS = {
         max_risk_per_trade_pct=0.05,
         max_positions=5,
         cash_reserve_pct=0.30,
+        min_confidence=0.55,
         max_wing_width=10.0,
         min_wing_width=5.0,
+        stop_loss_pct=0.35,
+        profit_target_pct=0.50,
         max_underlying_price=700.0,
         preferred_underlyings=["SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "NVDA", "AMD"],
     ),
@@ -115,8 +131,11 @@ TIERS = {
         max_risk_per_trade_pct=0.04,
         max_positions=8,
         cash_reserve_pct=0.25,
+        min_confidence=0.55,
         max_wing_width=25.0,
         min_wing_width=5.0,
+        stop_loss_pct=0.35,
+        profit_target_pct=0.50,
         max_underlying_price=float("inf"),
         preferred_underlyings=[
             "SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT",
