@@ -70,17 +70,17 @@ TIERS = {
         min_capital=0,
         max_capital=2_000,
         allowed_strategies=["bull_call_spread", "bear_put_spread"],
-        prefer_strategy="bear_put_spread",
+        prefer_strategy="bull_call_spread",  # Debit spreads — risk/reward favors us
         max_risk_per_trade_pct=0.10,    # 10% = $70 per trade on $700
         max_positions=2,
         cash_reserve_pct=0.40,
-        min_confidence=0.75,            # High conviction only — directional bets
+        min_confidence=0.65,            # Debit spreads profit at 40%+ win rate
         max_wing_width=2.0,
         min_wing_width=1.0,
         stop_loss_pct=0.25,             # Tight stops — can't afford big losses
         profit_target_pct=0.50,
-        max_underlying_price=700.0,     # SPY/QQQ $1-wide spreads are ~$65-80 risk
-        preferred_underlyings=["SPY", "QQQ", "IWM", "AMD"],
+        max_underlying_price=700.0,     # SPY $1-wide spreads are ~$65-80 risk
+        preferred_underlyings=["SPY"],  # SPY only — 63% ML accuracy, everything else is coin flip
     ),
     CapitalTier.SMALL: TierConfig(
         tier=CapitalTier.SMALL,

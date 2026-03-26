@@ -63,6 +63,9 @@ class FeatureEngine:
         # --- IV & Volatility Regime Features ---
         features = self._add_iv_features(features)
 
+        # --- Market Structure Features ---
+        features = self._add_market_structure(features)
+
         # --- Seasonality Features ---
         features = self._add_seasonality(features)
 
@@ -352,6 +355,65 @@ class FeatureEngine:
         # Low iv_rank (<0.2) → expect vol to rise → buy premium
         vol_zscore = ((vol_20 - vol_60) / vol_60.replace(0, np.nan)).clip(-3, 3)
         df["vol_mean_reversion_signal"] = -vol_zscore  # Negative = expect reversion down
+
+        return df
+
+    def _add_market_structure(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add market structure features for better directional prediction.
+
+        These capture regime, breadth, and fear dynamics that pure price
+        action features miss.
+        """
+        close = df["Close"]
+        high = df["High"]
+        low = df["Low"]
+        volume = df["Volume"]
+
+        # --- Put/Call proxy: ratio of down-volume to up-volume ---
+        # Can't get real P/C ratio from OHLCV, but this captures the same fear dynamic
+        price_change = close.diff()
+        up_vol = volume.where(price_change > 0, 0)
+        down_vol = volume.where(price_change < 0, 0)
+        up_vol_ma = up_vol.rolling(10, min_periods=5).sum()
+        down_vol_ma = down_vol.rolling(10, min_periods=5).sum()
+        df["put_call_proxy"] = (down_vol_ma / up_vol_ma.replace(0, np.nan)).clip(0, 3).fillna(1.0)
+
+        # --- VIX term structure proxy: short vol vs long vol ---
+        # Contango (short < long) = calm, backwardation (short > long) = fear
+        log_returns = np.log(close / close.shift(1))
+        vol_5 = log_returns.rolling(5).std() * np.sqrt(252)
+        vol_20 = log_returns.rolling(20).std() * np.sqrt(252)
+        vol_60 = log_returns.rolling(60).std() * np.sqrt(252)
+        df["vix_term_structure"] = (vol_5 / vol_60.replace(0, np.nan)).clip(0, 3).fillna(1.0)
+        # > 1 = backwardation (fear), < 1 = contango (calm)
+
+        # --- Skew proxy: downside vs upside realized moves ---
+        # Real skew measures OTM put vs OTM call IV; this proxies it
+        ret = close.pct_change()
+        downside_vol = ret.where(ret < 0, 0).rolling(20, min_periods=10).std() * np.sqrt(252)
+        upside_vol = ret.where(ret > 0, 0).rolling(20, min_periods=10).std() * np.sqrt(252)
+        df["skew_proxy"] = (downside_vol / upside_vol.replace(0, np.nan)).clip(0, 3).fillna(1.0)
+        # > 1 = more downside fear, < 1 = upside dominance
+
+        # --- Sector rotation proxy: relative performance short vs long term ---
+        # If recent returns >> long-term returns, momentum is strong
+        ret_5 = close.pct_change(5)
+        ret_60 = close.pct_change(60)
+        df["momentum_divergence"] = (ret_5 - ret_60).clip(-0.2, 0.2)
+
+        # --- Bear market indicator: price vs SMA200 ---
+        if len(close) >= 200:
+            sma_200 = close.rolling(200, min_periods=100).mean()
+            df["above_sma200"] = (close > sma_200).astype(float)
+            df["distance_sma200"] = ((close - sma_200) / sma_200).clip(-0.3, 0.3)
+        else:
+            df["above_sma200"] = 1.0
+            df["distance_sma200"] = 0.0
+
+        # --- Range compression: narrowing range often precedes big moves ---
+        atr_5 = (high - low).rolling(5).mean()
+        atr_20 = (high - low).rolling(20).mean()
+        df["range_compression"] = (atr_5 / atr_20.replace(0, np.nan)).clip(0, 3).fillna(1.0)
 
         return df
 

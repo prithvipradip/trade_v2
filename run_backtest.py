@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
         "--strategies",
         nargs="+",
         default=[
+            "put_credit_spread",
             "bull_call_spread",
             "bear_put_spread",
             "iron_condor",

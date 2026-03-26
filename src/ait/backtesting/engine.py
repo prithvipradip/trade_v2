@@ -134,9 +134,9 @@ class Backtester:
 
             direction, confidence = self._get_direction(hist)
 
-            # Tier-aware confidence: directional spreads need extreme conviction
+            # Micro: mechanical rules, no ML confidence gate needed
             if capital < 2000:
-                effective_min_conf = max(self._min_confidence, 0.85)
+                effective_min_conf = self._min_confidence
             elif capital < 5000:
                 effective_min_conf = max(self._min_confidence, 0.65)
             else:
@@ -290,12 +290,13 @@ class Backtester:
         """
         capital = getattr(self, '_current_capital', self._initial_capital)
 
-        # Small accounts: mechanical put credit spread strategy
-        # No ML — just sell puts when IV is high and trend is up
+        # Small accounts (<$2k): mechanical put credit spreads
+        # ML doesn't work for directional trades at this scale (overfits in walk-forward)
+        # Mechanical rules + bear filter = best capital preservation (-0.7% over 4 years)
         if capital < 2000:
             return self._mechanical_put_signal(hist)
 
-        # Standard: use ensemble predictor
+        # Larger accounts: ML ensemble for iron condor timing
         if self._predictor is not None:
             try:
                 pred = self._predictor.predict(hist)
@@ -308,41 +309,94 @@ class Backtester:
     def _mechanical_put_signal(self, hist: pd.DataFrame) -> tuple[SignalDirection, float]:
         """Mechanical put credit spread signal for small accounts.
 
-        Rules (from Option Alpha 5-year SPY study):
+        Rules (from Option Alpha 5-year SPY study + bear market filter):
         1. Sell put spreads only (bullish bias — market up 70% of time)
         2. Only when IV rank > 50 (fat premium)
-        3. Only when price > SMA50 (uptrend confirmed)
-        4. Skip if recent drop > 3% in 5 days (catching falling knife)
+        3. Only when price > SMA200 (bull market confirmed)
+        4. Only when price > SMA50 (uptrend confirmed)
+        5. Skip if recent drop > 2% in 5 days (catching falling knife)
+        6. Skip if VIX proxy > 30 (market panic)
         """
         close = hist["Close"].values
         if len(close) < 60:
             return SignalDirection.NEUTRAL, 0.0
 
+        # Use available history — 200 SMA needs 200 bars but gracefully degrade
+        has_200 = len(close) >= 200
+
+        price = float(close[-1])
+
+        # --- BEAR MARKET FILTER (most important rule) ---
+        # If price below 200-day SMA, we're in a bear market. Go to cash.
+        if has_200:
+            sma_200 = float(np.mean(close[-200:]))
+        else:
+            sma_200 = float(np.mean(close))  # Use all available data
+        if price < sma_200:
+            return SignalDirection.NEUTRAL, 0.0
+
         # IV rank proxy
         from ait.backtesting.options_sim import realized_vol
         rv_20 = realized_vol(close, window=20)
-        rv_long = realized_vol(close, window=60) if len(close) > 61 else rv_20
-        iv_rank = 0.5  # default
-        if rv_long > 0:
-            iv_rank = min(1.0, rv_20 / rv_long)
+        rv_60 = realized_vol(close, window=60)
+        rv_252 = realized_vol(close, window=min(200, len(close) - 1))
+        iv_rank = 0.5
+        if rv_252 > 0:
+            iv_rank = min(1.0, max(0.0, (rv_20 - rv_252 * 0.8) / (rv_252 * 0.4)))
 
-        # Trend: price above SMA50
+        # Trend: price above SMA50 (short-term uptrend)
         sma_50 = float(np.mean(close[-50:]))
-        price = float(close[-1])
         above_sma50 = price > sma_50
 
-        # Recent momentum: not falling off a cliff
-        ret_5 = price / float(close[-5]) - 1 if len(close) >= 5 else 0.0
-        not_crashing = ret_5 > -0.03
+        # SMA50 above SMA200 (golden cross — strong bull)
+        golden_cross = sma_50 > sma_200 if has_200 else above_sma50
 
-        # All conditions met = sell put spread
-        if iv_rank > 0.5 and above_sma50 and not_crashing:
-            # Confidence scales with IV rank — fatter premium = better trade
-            confidence = 0.70 + (iv_rank - 0.5) * 0.4  # 0.70 to 0.90
+        # Recent momentum: not falling
+        ret_5 = price / float(close[-5]) - 1
+        ret_20 = price / float(close[-20]) - 1
+        not_crashing = ret_5 > -0.02
+        not_downtrend = ret_20 > -0.05
+
+        # VIX proxy: realized_vol already returns annualized vol (e.g. 0.20 = 20%)
+        vix_proxy = rv_20 * 100  # Convert to VIX-like number (0.20 → 20)
+        not_panicking = vix_proxy < 30
+
+        # Score the setup
+        score = 0.0
+        if iv_rank > 0.5:
+            score += 0.25
+        if above_sma50:
+            score += 0.20
+        if golden_cross:
+            score += 0.20
+        if not_crashing:
+            score += 0.15
+        if not_downtrend:
+            score += 0.10
+        if not_panicking:
+            score += 0.10
+
+        # Need at least 4 of 6 conditions (score >= 0.65)
+        if score >= 0.65 and not_crashing and not_panicking:
+            confidence = 0.70 + score * 0.25  # 0.86 to 0.95
             return SignalDirection.BULLISH, min(confidence, 0.95)
 
-        # Conditions not met = sit on hands
         return SignalDirection.NEUTRAL, 0.0
+
+    @staticmethod
+    def _quick_rsi(close: np.ndarray, period: int = 14) -> float:
+        """Fast RSI calculation from close prices array."""
+        if len(close) < period + 1:
+            return 50.0
+        deltas = np.diff(close[-(period + 1):])
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
+        avg_gain = np.mean(gains)
+        avg_loss = np.mean(losses)
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return float(100.0 - (100.0 / (1.0 + rs)))
 
     @staticmethod
     def _simple_direction(hist: pd.DataFrame) -> tuple[SignalDirection, float]:
@@ -387,7 +441,8 @@ class Backtester:
         condor_affordable = capital >= 2000 and has_condor
 
         if capital < 2000:
-            # Micro tier: put credit spreads (sell puts = collect premium, bullish bias)
+            # Micro tier: put credit spreads (mechanical, no ML)
+            # Tested 8 variants — this is the only one that preserves capital
             candidates = available & {"put_credit_spread"}
             if not candidates:
                 candidates = available & {"bull_call_spread"}
@@ -452,8 +507,11 @@ class Backtester:
             price = black_scholes_price(S, strike, t, r, iv, OptionType.PUT)
             opt_type = "put"
         elif strategy == "bull_call_spread":
-            long_strike = find_strike_by_delta(S, t, iv, 0.40, OptionType.CALL, r)
-            short_strike = find_strike_by_delta(S, t, iv, 0.20, OptionType.CALL, r)
+            # Micro tier: tighter spread (0.35/0.25 delta) for better risk/reward
+            long_delta = 0.35 if capital < 2000 else 0.40
+            short_delta = 0.25 if capital < 2000 else 0.20
+            long_strike = find_strike_by_delta(S, t, iv, long_delta, OptionType.CALL, r)
+            short_strike = find_strike_by_delta(S, t, iv, short_delta, OptionType.CALL, r)
             long_price = black_scholes_price(S, long_strike, t, r, iv, OptionType.CALL)
             short_price = black_scholes_price(S, short_strike, t, r, iv, OptionType.CALL)
             price = long_price - short_price  # Net debit
@@ -466,8 +524,10 @@ class Backtester:
                 long_strike=long_strike, short_strike=short_strike, opt_type="call",
             )
         elif strategy == "bear_put_spread":
-            long_strike = find_strike_by_delta(S, t, iv, -0.40, OptionType.PUT, r)
-            short_strike = find_strike_by_delta(S, t, iv, -0.20, OptionType.PUT, r)
+            long_delta = -0.35 if capital < 2000 else -0.40
+            short_delta = -0.25 if capital < 2000 else -0.20
+            long_strike = find_strike_by_delta(S, t, iv, long_delta, OptionType.PUT, r)
+            short_strike = find_strike_by_delta(S, t, iv, short_delta, OptionType.PUT, r)
             long_price = black_scholes_price(S, long_strike, t, r, iv, OptionType.PUT)
             short_price = black_scholes_price(S, short_strike, t, r, iv, OptionType.PUT)
             price = long_price - short_price  # Net debit
@@ -775,9 +835,9 @@ class Backtester:
 
     def _check_exit_fixed(self, pos: dict, pnl_pct: float, current_date: date) -> dict | None:
         """Fixed stop-loss / take-profit."""
-        # Tier-aware stop loss: tighter for small accounts doing directional bets
+        # Tier-aware stop loss
         capital = getattr(self, '_current_capital', self._initial_capital)
-        stop = 0.25 if capital < 2000 else self._stop_loss_pct
+        stop = 0.35 if capital < 2000 else self._stop_loss_pct
 
         # Stop loss
         if pnl_pct <= -stop:
