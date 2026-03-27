@@ -233,10 +233,14 @@ class IBKRClient:
         """Get account summary values as a dict."""
         if not await self.ensure_connected():
             return {}
+        raw = self._ib.accountValues()
         values = {}
-        for av in self._ib.accountValues():
-            if av.currency == "USD" or av.currency == "":
+        for av in raw:
+            if av.currency in ("USD", "CAD", "BASE", ""):
                 values[av.tag] = av.value
+        nlv = values.get("NetLiquidation", "missing")
+        log.info("account_values_fetched", count=len(values), raw_count=len(raw),
+                 net_liquidation=nlv)
         return values
 
 

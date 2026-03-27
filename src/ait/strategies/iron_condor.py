@@ -35,12 +35,10 @@ class IronCondor(Strategy):
         iv_rank: float,
         historical_data: pd.DataFrame | None = None,
     ) -> list[Signal]:
-        # Iron condors are best in neutral markets with high IV
-        if market_direction != SignalDirection.NEUTRAL:
-            return []
-
-        # Need high IV to collect meaningful premium
-        if iv_rank < 40:
+        # Iron condors work in ANY direction — they profit from theta decay
+        # regardless of whether the market goes up, down, or sideways.
+        # Only skip in extreme low IV where premium isn't worth the risk.
+        if iv_rank < 15:
             return []
 
         liquid_calls = self._filter_liquid(chain.calls)

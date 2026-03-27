@@ -120,6 +120,11 @@ class StrategySelector:
         def score(s: Signal) -> float:
             points = 0.0
 
+            # IRON CONDOR PRIORITY — always preferred (theta collection, direction-neutral)
+            # This matches the backtest engine logic that proved +311% returns
+            if s.strategy_name == "iron_condor":
+                points += 50  # Massive bonus — iron condors are our primary strategy
+
             # Confidence (most important) — 0-40 points
             points += s.confidence * 40
 

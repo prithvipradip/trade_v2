@@ -48,6 +48,24 @@ class AccountManager:
 
         values = await self._client.get_account_values()
         if not values:
+            # Fallback: estimate NLV from portfolio positions
+            try:
+                positions = self._client.ib.positions()
+                if positions:
+                    total_value = sum(
+                        abs(p.position) * p.avgCost for p in positions
+                    )
+                    if total_value > 0:
+                        log.info("account_fallback_from_positions",
+                                 estimated_nlv=total_value, positions=len(positions))
+                        self._snapshot.net_liquidation = total_value
+                        self._snapshot.buying_power = total_value * 0.5
+                        self._snapshot.timestamp = now
+                        self._last_fetch = now
+                        return self._snapshot
+            except Exception as e:
+                log.debug("position_fallback_failed", error=str(e))
+
             stale_seconds = now - self._last_fetch
             if self._last_fetch > 0 and stale_seconds > 300:
                 log.error(

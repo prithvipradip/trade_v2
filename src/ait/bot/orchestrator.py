@@ -447,7 +447,12 @@ class TradingOrchestrator:
         )
 
         # Use learning-adjusted confidence threshold
-        min_confidence = adaptor.get_confidence_override() or self._settings.risk.min_confidence
+        # Iron condors don't need directional confidence — they profit from range/theta
+        # Lower the bar to 0.40 so condors can fire regardless of direction
+        base_confidence = adaptor.get_confidence_override() or self._settings.risk.min_confidence
+        has_iron_condor = "iron_condor" in [s.name if hasattr(s, 'name') else s
+                                             for s in self._settings.options.strategies]
+        min_confidence = 0.40 if has_iron_condor else base_confidence
         if prediction.confidence < min_confidence:
             log.debug(
                 "low_confidence_skip",
