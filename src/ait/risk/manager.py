@@ -112,7 +112,16 @@ class RiskManager:
                 f"confidence {request.confidence:.2f} < min {self._risk_config.min_confidence}",
             )
 
-        # 3. Position count limit
+        # 3a. Daily trade limit
+        if hasattr(request, 'daily_trades_taken') and hasattr(self._risk_config, 'max_daily_trades'):
+            max_daily = getattr(self._risk_config, 'max_daily_trades', 5)
+            if request.daily_trades_taken >= max_daily:
+                return TradeValidation(
+                    False,
+                    f"max daily trades reached ({request.daily_trades_taken}/{max_daily})",
+                )
+
+        # 3b. Position count limit
         if len(self._open_positions) >= self._pos_config.max_open_positions:
             return TradeValidation(
                 False,

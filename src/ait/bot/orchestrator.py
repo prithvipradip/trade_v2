@@ -653,6 +653,23 @@ class TradingOrchestrator:
         """Validate and execute a signal."""
         adaptor = self._learning.adaptor
 
+        # Check daily trade limit FIRST
+        daily_stats = self._state.get_daily_stats(date.today())
+        if daily_stats.trades_taken >= self._settings.trading.max_daily_trades:
+            log.info("max_daily_trades_reached",
+                     trades_taken=daily_stats.trades_taken,
+                     max=self._settings.trading.max_daily_trades)
+            return
+
+        # Check if this symbol already has a pending order
+        pending_symbols = set()
+        for oid, pending in self._executor._pending_orders.items():
+            if hasattr(pending, 'signal') and hasattr(pending.signal, 'symbol'):
+                pending_symbols.add(pending.signal.symbol)
+        if signal.symbol in pending_symbols:
+            log.debug("symbol_has_pending_order", symbol=signal.symbol)
+            return
+
         # Check if position would hold through earnings (IV crush risk)
         if signal.expiry:
             from datetime import date as date_cls
