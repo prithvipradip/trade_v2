@@ -88,7 +88,7 @@ sentiment:
 
 notifications:
   telegram:
-    enabled: false
+    enabled: true
     send_trades: true
     send_errors: true
     send_daily_summary: true

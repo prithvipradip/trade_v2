@@ -27,6 +27,7 @@ class TradeStatus(str, Enum):
     PARTIAL = "partial"
     CANCELLED = "cancelled"
     REJECTED = "rejected"
+    CLOSING = "closing"
     CLOSED = "closed"
 
 
@@ -272,6 +273,12 @@ class StateManager:
                  time_to_peak_hours, trade_id),
             )
 
+            # Clean up open_positions row now that trade is closed
+            conn.execute(
+                "DELETE FROM open_positions WHERE trade_id = ?",
+                (trade_id,),
+            )
+
             # Dual-write: sync closed trade to DuckDB analytics
             if self._duck:
                 try:
@@ -284,15 +291,63 @@ class StateManager:
                 except Exception as e:
                     log.warning("duckdb_trade_sync_failed", trade_id=trade_id, error=str(e))
 
+    def insert_open_position(
+        self,
+        trade_id: str,
+        symbol: str,
+        contract_type: str,
+        quantity: int,
+        entry_price: float,
+        legs: str = "[]",
+    ) -> None:
+        """Insert a row into open_positions so HWM / partial-exit tracking works.
+
+        Uses trade_id as position_id.  Called when an entry order fills.
+        """
+        now = datetime.now().isoformat()
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO open_positions
+                   (position_id, trade_id, symbol, contract_type, quantity,
+                    entry_price, entry_time, current_price, unrealized_pnl,
+                    stop_loss, take_profit, legs, high_water_mark, partial_exits)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    trade_id, trade_id, symbol, contract_type, quantity,
+                    entry_price, now, entry_price, 0.0,
+                    None, None, legs, 0.0, "[]",
+                ),
+            )
+        log.info("open_position_inserted", trade_id=trade_id, symbol=symbol)
+
+    def remove_open_position(self, trade_id: str) -> None:
+        """Remove a position from open_positions when it is fully closed."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                "DELETE FROM open_positions WHERE trade_id = ?",
+                (trade_id,),
+            )
+
     def get_open_trades(self) -> list[TradeRecord]:
         """Get all trades that are not closed/cancelled."""
         with sqlite3.connect(self._db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT * FROM trades WHERE status IN (?, ?, ?)",
-                (TradeStatus.PENDING.value, TradeStatus.FILLED.value, TradeStatus.PARTIAL.value),
+                "SELECT * FROM trades WHERE status IN (?, ?, ?, ?)",
+                (TradeStatus.PENDING.value, TradeStatus.FILLED.value,
+                 TradeStatus.PARTIAL.value, TradeStatus.CLOSING.value),
             ).fetchall()
         return [self._row_to_trade(r) for r in rows]
+
+    def get_trade_by_id(self, trade_id: str) -> TradeRecord | None:
+        """Get a single trade record by ID (any status)."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM trades WHERE trade_id = ?",
+                (trade_id,),
+            ).fetchone()
+        return self._row_to_trade(row) if row else None
 
     def get_trades_for_date(self, d: date) -> list[TradeRecord]:
         """Get all trades entered on a specific date."""

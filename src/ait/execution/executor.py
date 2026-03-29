@@ -47,6 +47,22 @@ class PendingOrder:
         return time.time() - self.submitted_at
 
 
+class PendingExitOrder:
+    """Tracks a pending exit/close order."""
+
+    __slots__ = ("trade_id", "exit_reason", "estimated_pnl", "submitted_at")
+
+    def __init__(self, trade_id: str, exit_reason: str, estimated_pnl: float) -> None:
+        self.trade_id = trade_id
+        self.exit_reason = exit_reason
+        self.estimated_pnl = estimated_pnl
+        self.submitted_at = time.time()
+
+    @property
+    def age_seconds(self) -> float:
+        return time.time() - self.submitted_at
+
+
 class TradeExecutor:
     """Executes trade signals by placing orders with IBKR."""
 
@@ -62,6 +78,7 @@ class TradeExecutor:
         self._circuit_breaker = circuit_breaker
         self._order_timeout = order_timeout
         self._pending_orders: dict[int, PendingOrder] = {}  # order_id → PendingOrder
+        self._pending_exit_orders: dict[int, PendingExitOrder] = {}  # order_id → PendingExitOrder
 
     async def execute_signal(self, signal: Signal, contracts: int) -> str | None:
         """Execute a trade signal. Returns trade_id on success, None on failure."""
@@ -268,10 +285,12 @@ class TradeExecutor:
 
         return await self._ibkr.place_order(combo, order)
 
-    async def check_fills(self) -> list[str]:
+    async def check_fills(self) -> tuple[list[str], list[dict]]:
         """Check for filled/cancelled/timed-out orders and update state.
 
-        Returns list of filled trade_ids.
+        Returns (filled_entry_trade_ids, completed_exits) where each
+        completed exit is a dict with trade_id, exit_price, realized_pnl,
+        exit_reason.
         """
         filled = []
         cancelled = []
@@ -334,7 +353,53 @@ class TradeExecutor:
         if cancelled:
             log.info("orders_cancelled", count=len(cancelled), trade_ids=cancelled)
 
-        return filled
+        # 3. Check pending EXIT orders — finalize CLOSING → CLOSED with real fill price
+        completed_exits = []
+        for order_id, pending_exit in list(self._pending_exit_orders.items()):
+            still_open = any(t.order.orderId == order_id for t in open_trades)
+            if still_open:
+                continue
+
+            exit_status = self._determine_exit_fill_status(order_id, all_trades)
+
+            if exit_status == "filled":
+                actual_exit_price = self._get_exit_fill_price(order_id, all_trades)
+                realized_pnl = pending_exit.estimated_pnl
+
+                self._state.close_trade(
+                    trade_id=pending_exit.trade_id,
+                    exit_price=actual_exit_price,
+                    realized_pnl=realized_pnl,
+                    exit_reason_detailed=pending_exit.exit_reason,
+                )
+                completed_exits.append({
+                    "trade_id": pending_exit.trade_id,
+                    "exit_price": actual_exit_price,
+                    "realized_pnl": realized_pnl,
+                    "exit_reason": pending_exit.exit_reason,
+                })
+                log.info(
+                    "exit_order_filled",
+                    trade_id=pending_exit.trade_id,
+                    actual_exit_price=actual_exit_price,
+                    realized_pnl=realized_pnl,
+                )
+                del self._pending_exit_orders[order_id]
+
+            elif exit_status == "cancelled":
+                # Exit order was cancelled/rejected — revert to FILLED so
+                # portfolio manager will re-trigger an exit next cycle.
+                self._state.update_trade_status(
+                    pending_exit.trade_id, TradeStatus.FILLED,
+                )
+                log.warning(
+                    "exit_order_cancelled",
+                    trade_id=pending_exit.trade_id,
+                    age_seconds=pending_exit.age_seconds,
+                )
+                del self._pending_exit_orders[order_id]
+
+        return filled, completed_exits
 
     async def _cancel_stale_orders(self) -> None:
         """Cancel orders that have been pending longer than the timeout."""
@@ -400,26 +465,62 @@ class TradeExecutor:
                 return int(trade.orderStatus.filled or 0)
         return 0
 
+    def _determine_exit_fill_status(self, order_id: int, all_trades: list) -> str:
+        """Determine whether an exit order filled or was cancelled."""
+        for trade in all_trades:
+            if trade.order.orderId == order_id:
+                status = trade.orderStatus.status.lower()
+                if status in ("filled",):
+                    return "filled"
+                elif status in ("cancelled", "inactive", "apicancelled"):
+                    return "cancelled"
+                elif status in ("submitted", "presubmitted"):
+                    return "pending"
+
+                filled_qty = trade.orderStatus.filled or 0
+                if filled_qty > 0:
+                    return "filled"
+                return "cancelled"
+
+        return "cancelled"
+
+    def _get_exit_fill_price(self, order_id: int, all_trades: list) -> float:
+        """Get the actual fill price for an exit order."""
+        for trade in all_trades:
+            if trade.order.orderId == order_id:
+                avg_price = trade.orderStatus.avgFillPrice
+                if avg_price and avg_price > 0:
+                    return avg_price
+        return 0.0
+
     def _update_trade_filled(self, pending: PendingOrder, actual_price: float) -> None:
         """Update a trade record to FILLED status with actual fill info."""
         signal = pending.signal
-        self._state.record_trade(
-            TradeRecord(
-                trade_id=pending.trade_id,
-                symbol=signal.symbol,
-                strategy=signal.strategy_name,
-                direction=(
-                    TradeDirection.LONG
-                    if signal.direction != SignalDirection.BEARISH
-                    else TradeDirection.SHORT
-                ),
-                status=TradeStatus.FILLED,
-                entry_time=datetime.now().isoformat(),
-                entry_price=actual_price,
-                quantity=pending.contracts,
-                contract_type=self._get_contract_type(signal),
-                notes=f"slippage={actual_price - signal.entry_price:.4f}",
-            )
+        contract_type = self._get_contract_type(signal)
+
+        # Update trade status to FILLED (record_trade uses INSERT OR IGNORE,
+        # so use update_trade_status for existing rows)
+        self._state.update_trade_status(pending.trade_id, TradeStatus.FILLED)
+
+        # Build legs JSON for open_positions
+        legs_json = json.dumps([
+            {
+                "strike": leg["contract"].strike,
+                "right": leg["contract"].right,
+                "action": leg["action"],
+                "expiry": str(leg["contract"].expiry),
+            }
+            for leg in signal.legs
+        ]) if signal.legs else "[]"
+
+        # Insert into open_positions so HWM / partial-exit tracking works
+        self._state.insert_open_position(
+            trade_id=pending.trade_id,
+            symbol=signal.symbol,
+            contract_type=contract_type,
+            quantity=pending.contracts,
+            entry_price=actual_price,
+            legs=legs_json,
         )
 
     def _update_trade_partial(self, pending: PendingOrder, filled_qty: int) -> None:
@@ -466,10 +567,34 @@ class TradeExecutor:
             )
         )
 
+    def register_exit_order(
+        self,
+        order_id: int,
+        trade_id: str,
+        exit_reason: str,
+        estimated_pnl: float,
+    ) -> None:
+        """Register an exit order for fill tracking.
+
+        Called by the orchestrator after placing a close order so that
+        check_fills() can detect when the exit actually fills and finalise
+        the trade with the real fill price.
+        """
+        self._pending_exit_orders[order_id] = PendingExitOrder(
+            trade_id=trade_id,
+            exit_reason=exit_reason,
+            estimated_pnl=estimated_pnl,
+        )
+        log.info(
+            "exit_order_registered",
+            order_id=order_id,
+            trade_id=trade_id,
+        )
+
     @property
     def pending_count(self) -> int:
-        """Number of orders currently pending fill."""
-        return len(self._pending_orders)
+        """Number of orders currently pending fill (entry + exit)."""
+        return len(self._pending_orders) + len(self._pending_exit_orders)
 
     @staticmethod
     def _get_contract_type(signal: Signal) -> str:

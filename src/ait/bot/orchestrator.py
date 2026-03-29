@@ -23,6 +23,7 @@ from ait.broker.ibkr_client import IBKRClient
 from ait.broker.orders import OrderBuilder
 from ait.config.settings import Settings
 from ait.data.earnings import EarningsCalendar
+from ait.data.economic_calendar import EconomicCalendar
 from ait.data.historical import HistoricalDataStore
 from ait.data.market_data import MarketDataService
 from ait.data.options_chain import OptionsChainService
@@ -130,6 +131,7 @@ class TradingOrchestrator:
         # Data quality & market intelligence
         self._data_quality = DataQualityValidator()
         self._earnings = EarningsCalendar()
+        self._economic_cal = EconomicCalendar()
         self._flow_detector = OptionsFlowDetector()
         self._mtf_analyzer = MultiTimeframeAnalyzer()
 
@@ -174,6 +176,8 @@ class TradingOrchestrator:
         # Train models on startup if not yet trained (handles case where bot starts during market hours)
         await self._trainer.ensure_models_ready(self._settings.trading.universe)
 
+        await self._send_notification(f"BOT STARTED | Mode: {self._settings.trading.mode} | {len(self._settings.trading.universe)} symbols")
+
         while self._running:
             try:
                 phase = self._scheduler.get_current_phase()
@@ -198,6 +202,7 @@ class TradingOrchestrator:
                 break
             except Exception as e:
                 log.error("orchestrator_error", error=str(e), traceback=traceback.format_exc())
+                await self._send_notification(f"ERROR: {str(e)}")
                 self._watchdog.record_error("trading_loop", str(e))
                 await self._watchdog.check_and_recover()
                 await asyncio.sleep(60)
@@ -304,6 +309,7 @@ class TradingOrchestrator:
         # 1. Check circuit breaker
         if self._circuit_breaker.is_tripped:
             log.warning("trading_halted", reason=self._circuit_breaker.get_status().reason)
+            await self._send_notification(f"CIRCUIT BREAKER: Trading halted - {self._circuit_breaker.get_status().reason}")
             return
 
         # 2. Sync risk manager with live positions (fixes stale position tracking)
@@ -343,8 +349,49 @@ class TradingOrchestrator:
             log.debug("skipping_new_trades", reason="close_to_market_close")
             return
 
-        # 6. Check fill status of pending orders
-        await self._executor.check_fills()
+        # 6. Check fill status of pending orders (entry + exit)
+        _filled_entries, completed_exits = await self._executor.check_fills()
+
+        # Process completed exits — update daily stats, Thompson, drift
+        for ex in completed_exits:
+            realized_pnl = ex["realized_pnl"]
+            trade_id = ex["trade_id"]
+
+            stats = self._state.get_daily_stats()
+            stats.total_pnl += realized_pnl
+            if realized_pnl > 0:
+                stats.trades_won += 1
+            else:
+                stats.trades_lost += 1
+                self._circuit_breaker.record_trade_result(realized_pnl)
+            self._state.update_daily_stats(stats)
+
+            trade = self._find_trade_by_id(trade_id)
+            if trade:
+                self._thompson.record_outcome(
+                    strategy=trade.strategy,
+                    won=realized_pnl > 0,
+                    pnl=realized_pnl,
+                )
+                actual_dir = "bullish" if realized_pnl > 0 else "bearish"
+                self._trainer.drift_detector.record_outcome(
+                    trade_id=trade_id,
+                    actual_direction=actual_dir,
+                )
+
+            msg = (
+                f"EXIT FILLED: {trade.symbol if trade else trade_id}\n"
+                f"Reason: {ex['exit_reason']}\n"
+                f"Exit price: {ex['exit_price']:.2f}\n"
+                f"P&L: ${realized_pnl:.2f}"
+            )
+            await self._send_notification(msg)
+            log.info(
+                "exit_fill_processed",
+                trade_id=trade_id,
+                pnl=realized_pnl,
+                exit_price=ex["exit_price"],
+            )
 
         # 7. Get effective universe (learning + capital tier filtering)
         adaptor = self._learning.adaptor
@@ -373,6 +420,11 @@ class TradingOrchestrator:
         current_hour = dt_now.now().hour
         if not adaptor.is_hour_allowed(current_hour):
             log.debug("hour_blocked_by_learning", hour=current_hour)
+            return
+
+        # 7c. Skip trading on/before major macro events (FOMC, CPI, NFP)
+        if self._economic_cal.should_skip_trading():
+            log.info("economic_event_skip", events=str(self._economic_cal.get_upcoming_events(days=2)))
             return
 
         # 8. Process queued signals first (entry timing optimization)
@@ -761,6 +813,8 @@ class TradingOrchestrator:
             return
 
         try:
+            exit_trade = None
+
             # Build the closing order (reverse of entry)
             if trade.contract_type in ("call", "put"):
                 contract = ContractBuilder.option(
@@ -777,65 +831,41 @@ class TradingOrchestrator:
                 # Reverse direction: if we bought, now sell; if we sold, now buy
                 close_action = "SELL" if trade.direction.value == "long" else "BUY"
                 order = OrderBuilder.market(action=close_action, quantity=trade.quantity)
-                await self._ibkr.place_order(qualified, order)
+                exit_trade = await self._ibkr.place_order(qualified, order)
 
             elif trade.contract_type in ("spread", "iron_condor"):
                 # Multi-leg close: submit reverse combo order
                 import json
                 legs = json.loads(trade.legs)
                 if legs:
-                    await self._close_multi_leg(trade, legs)
+                    exit_trade = await self._close_multi_leg(trade, legs)
                 else:
                     log.warning("no_legs_data_for_close", trade_id=pos.trade_id)
                     return
 
-            # Record the close with detailed exit reason
-            realized_pnl = pos.unrealized_pnl
-            self._state.close_trade(
-                trade_id=pos.trade_id,
-                exit_price=pos.current_price,
-                realized_pnl=realized_pnl,
-                exit_reason_detailed=pos.exit_reason,
-            )
+            if exit_trade is None:
+                log.error("exit_order_not_placed", trade_id=pos.trade_id)
+                return
 
-            # Update daily stats
-            stats = self._state.get_daily_stats()
-            stats.total_pnl += realized_pnl
-            if realized_pnl > 0:
-                stats.trades_won += 1
-            else:
-                stats.trades_lost += 1
-                self._circuit_breaker.record_trade_result(realized_pnl)
-            self._state.update_daily_stats(stats)
+            # Mark trade as CLOSING — actual close happens when the exit
+            # order fills (detected in executor.check_fills).
+            self._state.update_trade_status(pos.trade_id, TradeStatus.CLOSING)
 
-            # Update Thompson sampling with trade outcome
-            self._thompson.record_outcome(
-                strategy=trade.strategy,
-                won=realized_pnl > 0,
-                pnl=realized_pnl,
-            )
-
-            # Record drift outcome (actual direction for this trade)
-            actual_dir = "bullish" if realized_pnl > 0 else "bearish"
-            self._trainer.drift_detector.record_outcome(
-                trade_id=pos.trade_id,
-                actual_direction=actual_dir,
-            )
-
-            # Notify
-            msg = (
-                f"EXIT: {trade.symbol} {trade.strategy}\n"
-                f"Reason: {pos.exit_reason}\n"
-                f"P&L: ${realized_pnl:.2f} ({pos.pnl_pct:.1%})"
-            )
-            await self._send_notification(msg)
+            # Register the exit order with the executor for fill tracking
+            if exit_trade.order.orderId:
+                self._executor.register_exit_order(
+                    order_id=exit_trade.order.orderId,
+                    trade_id=pos.trade_id,
+                    exit_reason=pos.exit_reason,
+                    estimated_pnl=pos.unrealized_pnl,
+                )
 
             log.info(
-                "position_closed",
+                "exit_order_placed",
                 trade_id=pos.trade_id,
                 symbol=pos.symbol,
                 reason=pos.exit_reason,
-                pnl=realized_pnl,
+                status="CLOSING",
             )
 
         except Exception as e:
@@ -919,7 +949,7 @@ class TradingOrchestrator:
         except Exception as e:
             log.error("partial_exit_failed", trade_id=pos.trade_id, error=str(e))
 
-    async def _close_multi_leg(self, trade: TradeRecord, legs: list[dict]) -> None:
+    async def _close_multi_leg(self, trade: TradeRecord, legs: list[dict]):
         """Close a multi-leg position by reversing the combo."""
         qualified_legs = []
         for leg in legs:
@@ -968,7 +998,7 @@ class TradingOrchestrator:
             log.warning("combo_mid_price_failed", error=str(e), fallback=limit_price)
 
         order = OrderBuilder.combo_limit(action="BUY", quantity=trade.quantity, limit_price=limit_price)
-        await self._ibkr.place_order(combo, order)
+        return await self._ibkr.place_order(combo, order)
 
     async def _post_market(self) -> None:
         """Post-market reconciliation, learning, and reporting."""
@@ -1272,12 +1302,16 @@ class TradingOrchestrator:
             log.warning("risk_manager_sync_failed", error=str(e))
 
     def _find_trade_record(self, trade_id: str) -> TradeRecord | None:
-        """Find a trade record by ID."""
+        """Find a trade record by ID (open trades only)."""
         open_trades = self._state.get_open_trades()
         for t in open_trades:
             if t.trade_id == trade_id:
                 return t
         return None
+
+    def _find_trade_by_id(self, trade_id: str) -> TradeRecord | None:
+        """Find any trade record by ID (including closed)."""
+        return self._state.get_trade_by_id(trade_id)
 
     async def _estimate_iv_rank(self, symbol: str) -> float:
         """Estimate IV rank (0-100) from recent volatility data."""
