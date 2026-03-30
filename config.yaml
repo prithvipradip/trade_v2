@@ -52,7 +52,7 @@ ml:
   min_training_samples: 100
 
 meta_label:
-  enabled: true                        # Secondary ML model filters false positive signals
+  enabled: false                       # Disabled: trained on corrupted data, rejects everything. Re-enable after 50+ clean trades.
   min_probability: 0.50                # Min P(profitable) to take a trade (0.30-0.80)
   retrain_with_primary: true           # Retrain when primary model retrains
 
