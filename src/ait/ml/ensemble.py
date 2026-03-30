@@ -48,6 +48,11 @@ class DirectionPredictor:
     def __init__(self, config: MLConfig) -> None:
         self._config = config
         self._feature_engine = FeatureEngine()
+
+        # Per-symbol model storage: {symbol: {models, scaler, feature_names, scores}}
+        self._symbol_models: dict[str, dict] = {}
+
+        # Legacy single-model (used as fallback and for backtest compatibility)
         self._scaler = StandardScaler()
         self._models: dict[str, object] = {}
         self._trained = False
@@ -59,19 +64,30 @@ class DirectionPredictor:
 
     @property
     def is_trained(self) -> bool:
-        return self._trained
+        return self._trained or bool(self._symbol_models)
 
-    def predict(self, df: pd.DataFrame) -> Prediction | None:
+    def predict(self, df: pd.DataFrame, symbol: str = "") -> Prediction | None:
         """Predict direction for the latest data point.
 
         Args:
             df: OHLCV DataFrame with at least 60 rows of history.
+            symbol: Symbol name — uses per-symbol model if available.
 
         Returns:
             Prediction with direction and confidence, or None if model not trained.
         """
-        if not self._trained:
-            log.warning("prediction_skipped", reason="model not trained")
+        # Select the right model for this symbol
+        if symbol and symbol in self._symbol_models:
+            sym_data = self._symbol_models[symbol]
+            models = sym_data["models"]
+            scaler = sym_data["scaler"]
+            feature_names = sym_data["feature_names"]
+        elif self._trained:
+            models = self._models
+            scaler = self._scaler
+            feature_names = self._feature_names
+        else:
+            log.warning("prediction_skipped", reason="model not trained", symbol=symbol)
             return None
 
         features = self._feature_engine.compute(df)
@@ -81,17 +97,17 @@ class DirectionPredictor:
             return None
 
         # Use only the last row (current prediction)
-        X = features[self._feature_names].iloc[[-1]]
+        X = features[feature_names].iloc[[-1]]
 
         try:
-            X_scaled = self._scaler.transform(X.values)
+            X_scaled = scaler.transform(X.values)
         except Exception as e:
-            log.error("feature_scaling_failed", error=str(e))
+            log.error("feature_scaling_failed", error=str(e), symbol=symbol)
             return None
 
         # Get predictions from each model
         all_probas = []
-        for name, model in self._models.items():
+        for name, model in models.items():
             weight = self._config.ensemble_weights.get(name, 0.5)
             try:
                 proba = model.predict_proba(X_scaled)[0]
@@ -131,11 +147,12 @@ class DirectionPredictor:
             model_version=self._model_version,
         )
 
-    def train(self, df: pd.DataFrame) -> dict[str, float]:
+    def train(self, df: pd.DataFrame, symbol: str = "") -> dict[str, float]:
         """Train the ensemble on historical data.
 
         Args:
             df: OHLCV DataFrame with sufficient history.
+            symbol: If provided, stores model per-symbol (prevents cross-contamination).
 
         Returns:
             Dict of model accuracies.
@@ -186,6 +203,20 @@ class DirectionPredictor:
             from datetime import datetime
             self._model_version = f"v-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
             self._cv_scores = accuracies
+
+            # Store per-symbol model (deep copy so next train() doesn't overwrite)
+            if symbol:
+                import copy
+                self._symbol_models[symbol] = {
+                    "models": copy.deepcopy(self._models),
+                    "scaler": copy.deepcopy(self._scaler),
+                    "feature_names": list(self._feature_names),
+                    "cv_scores": dict(accuracies),
+                    "version": self._model_version,
+                }
+                log.info("symbol_model_stored", symbol=symbol,
+                         accuracies=accuracies, features=len(self._feature_names))
+
             self._save_models()
             log.info(
                 "ensemble_trained",
@@ -218,8 +249,11 @@ class DirectionPredictor:
             self._feature_names = data["feature_names"]
             self._model_version = data.get("version", "unknown")
             self._cv_scores = data.get("cv_scores", {})
+            self._symbol_models = data.get("symbol_models", {})
             self._trained = True
-            log.info("models_loaded", version=self._model_version, models=list(self._models.keys()))
+            log.info("models_loaded", version=self._model_version,
+                     models=list(self._models.keys()),
+                     per_symbol=list(self._symbol_models.keys()))
             return True
         except Exception as e:
             log.error("model_load_failed", error=str(e))
@@ -233,6 +267,7 @@ class DirectionPredictor:
             "feature_names": self._feature_names,
             "version": self._model_version,
             "cv_scores": self._cv_scores,
+            "symbol_models": self._symbol_models,
         }
 
         # Save as current (ensemble.pkl)

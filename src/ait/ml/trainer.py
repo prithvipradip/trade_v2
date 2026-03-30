@@ -99,7 +99,7 @@ class ModelTrainer:
                 continue
 
             self._store.save(symbol, df)
-            accuracies = self._predictor.train(df)
+            accuracies = self._predictor.train(df, symbol=symbol)
             if accuracies:
                 results[symbol] = accuracies
 

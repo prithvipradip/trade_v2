@@ -481,7 +481,7 @@ class TradingOrchestrator:
                 return
 
         # ML prediction
-        prediction = self._predictor.predict(hist)
+        prediction = self._predictor.predict(hist, symbol=symbol)
         if prediction is None:
             log.warning("ml_prediction_none", symbol=symbol)
             return
@@ -499,12 +499,8 @@ class TradingOrchestrator:
         )
 
         # Use learning-adjusted confidence threshold
-        # Iron condors don't need directional confidence — they profit from range/theta
-        # Lower the bar to 0.40 so condors can fire regardless of direction
-        base_confidence = adaptor.get_confidence_override() or self._settings.risk.min_confidence
-        has_iron_condor = "iron_condor" in [s.name if hasattr(s, 'name') else s
-                                             for s in self._settings.options.strategies]
-        min_confidence = 0.40 if has_iron_condor else base_confidence
+        # Use standard confidence threshold — per-symbol models are now accurate
+        min_confidence = adaptor.get_confidence_override() or self._settings.risk.min_confidence
         if prediction.confidence < min_confidence:
             log.debug(
                 "low_confidence_skip",
@@ -1231,7 +1227,7 @@ class TradingOrchestrator:
             # 1. Re-run ML prediction on fresh data
             hist = await self._market_data.get_historical(pos.symbol, days=60)
             if hist is not None and not hist.empty:
-                prediction = self._predictor.predict(hist)
+                prediction = self._predictor.predict(hist, symbol=symbol)
                 if prediction and prediction.confidence > 0.70:
                     # Direction has flipped with high confidence
                     if entry_direction == "bullish" and prediction.direction == SignalDirection.BEARISH:
