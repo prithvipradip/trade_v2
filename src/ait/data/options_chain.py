@@ -238,9 +238,11 @@ class OptionsChainService:
                 return []
 
             # Filter strikes around ATM (±20% of price)
+            # Skip non-standard (adjusted) strikes — e.g. .5 increments from stock splits
             strike_range = price * 0.20
             target_strikes = [
-                s for s in chain_def.strikes if abs(s - price) <= strike_range
+                s for s in chain_def.strikes
+                if abs(s - price) <= strike_range and s == int(s)
             ]
 
             # Fetch option contracts for each expiry

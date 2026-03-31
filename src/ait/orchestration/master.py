@@ -59,6 +59,7 @@ class BotManager:
 
     def __init__(self):
         self._proc: subprocess.Popen | None = None
+        self._log_handle = None
         self._restarts = 0
         self._max_restarts = 10
         self._last_restart: datetime | None = None
@@ -82,11 +83,11 @@ class BotManager:
             return
 
         _log("info", "bot_starting")
-        bot_log = open(LOGS_DIR / "bot_stdout.log", "a")
+        self._log_handle = open(LOGS_DIR / "bot_stdout.log", "a")
         self._proc = subprocess.Popen(
             [sys.executable, "-m", "ait.main", "--paper"],
             cwd=str(ROOT),
-            stdout=bot_log,
+            stdout=self._log_handle,
             stderr=subprocess.STDOUT,
             env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         )
@@ -102,7 +103,71 @@ class BotManager:
             self._proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
             self._proc.kill()
+        if self._log_handle:
+            self._log_handle.close()
+            self._log_handle = None
         _log("info", "bot_stopped")
+
+
+class WebServiceManager:
+    """Manages the dashboard (Streamlit) and web log viewer (Flask) subprocesses."""
+
+    def __init__(self):
+        self._dashboard_proc: subprocess.Popen | None = None
+        self._weblog_proc: subprocess.Popen | None = None
+
+    def start(self):
+        """Start both web services."""
+        self._start_dashboard()
+        self._start_weblog()
+
+    def _start_dashboard(self):
+        if self._dashboard_proc and self._dashboard_proc.poll() is None:
+            return
+        _log("info", "dashboard_starting", port=8501)
+        self._dashboard_proc = subprocess.Popen(
+            [sys.executable, "-m", "streamlit", "run",
+             str(ROOT / "src" / "ait" / "dashboard" / "app.py"),
+             "--server.port=8501", "--server.headless=true"],
+            cwd=str(ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        _log("info", "dashboard_started", pid=self._dashboard_proc.pid)
+
+    def _start_weblog(self):
+        if self._weblog_proc and self._weblog_proc.poll() is None:
+            return
+        _log("info", "weblog_starting", port=8502)
+        self._weblog_proc = subprocess.Popen(
+            [sys.executable, str(ROOT / "web_logs.py")],
+            cwd=str(ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        _log("info", "weblog_started", pid=self._weblog_proc.pid)
+
+    def health_check(self):
+        """Restart web services if they crashed."""
+        if self._dashboard_proc and self._dashboard_proc.poll() is not None:
+            _log("warn", "dashboard_crashed", restarting=True)
+            self._start_dashboard()
+        if self._weblog_proc and self._weblog_proc.poll() is not None:
+            _log("warn", "weblog_crashed", restarting=True)
+            self._start_weblog()
+
+    def stop(self):
+        for name, proc in [("dashboard", self._dashboard_proc), ("weblog", self._weblog_proc)]:
+            if proc and proc.poll() is None:
+                _log("info", f"{name}_stopping", pid=proc.pid)
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        self._dashboard_proc = None
+        self._weblog_proc = None
+        _log("info", "web_services_stopped")
 
     def health_check(self):
         """Check if bot is alive, restart if crashed."""
@@ -313,6 +378,7 @@ def main():
     _log("info", "orchestrator_starting", pid=os.getpid())
 
     bot = BotManager()
+    web = WebServiceManager()
     scheduler = BlockingScheduler(timezone="US/Eastern")
     shutdown = Event()
 
@@ -320,18 +386,24 @@ def main():
         _log("info", "shutdown_signal", signal=signum)
         shutdown.set()
         bot.stop()
+        web.stop()
         scheduler.shutdown(wait=False)
 
     signal.signal(signal.SIGINT, graceful_shutdown)
     signal.signal(signal.SIGTERM, graceful_shutdown)
 
-    # --- Start the trading bot ---
+    # --- Start the trading bot + web services ---
     bot.start()
+    web.start()
 
     # --- Schedule tasks ---
 
-    # Health check: every 2 minutes
-    scheduler.add_job(bot.health_check, "interval", minutes=2, id="health_check")
+    # Health check: every 2 minutes (bot + web services)
+    def combined_health_check():
+        bot.health_check()
+        web.health_check()
+
+    scheduler.add_job(combined_health_check, "interval", minutes=2, id="health_check")
 
     # Daily model retrain: 7:30 AM ET on trading days (Mon-Fri)
     scheduler.add_job(retrain_models,
@@ -362,6 +434,7 @@ def main():
     except (KeyboardInterrupt, SystemExit):
         _log("info", "orchestrator_shutting_down")
         bot.stop()
+        web.stop()
 
 
 if __name__ == "__main__":
