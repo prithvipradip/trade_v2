@@ -364,7 +364,15 @@ class TradeExecutor:
 
             if exit_status == "filled":
                 actual_exit_price = self._get_exit_fill_price(order_id, all_trades)
-                realized_pnl = pending_exit.estimated_pnl
+
+                # Calculate realized P&L from actual fill price, not estimate
+                trade_record = self._state.get_trade_by_id(pending_exit.trade_id)
+                if trade_record and actual_exit_price > 0:
+                    realized_pnl = self._calculate_realized_pnl(
+                        trade_record, actual_exit_price
+                    )
+                else:
+                    realized_pnl = pending_exit.estimated_pnl
 
                 self._state.close_trade(
                     trade_id=pending_exit.trade_id,
@@ -491,7 +499,39 @@ class TradeExecutor:
                 avg_price = trade.orderStatus.avgFillPrice
                 if avg_price and avg_price > 0:
                     return avg_price
+                # Fallback: check individual fills
+                if trade.fills:
+                    total_cost = sum(f.execution.price * f.execution.shares for f in trade.fills)
+                    total_shares = sum(f.execution.shares for f in trade.fills)
+                    if total_shares > 0:
+                        return total_cost / total_shares
         return 0.0
+
+    def _calculate_realized_pnl(self, trade, exit_price: float) -> float:
+        """Calculate realized P&L from entry and exit prices.
+
+        For options, multiplier is 100 (1 contract = 100 shares).
+        For credit strategies (iron condor, cash secured put), entry is credit received.
+        """
+        multiplier = 100  # options multiplier
+        entry = trade.entry_price
+        qty = trade.quantity
+
+        if trade.contract_type in ("iron_condor", "spread"):
+            # Credit/debit spreads: P&L = (entry_credit - exit_debit) * multiplier
+            pnl = (entry - exit_price) * multiplier * qty
+        elif trade.strategy == "cash_secured_put":
+            # Short put: P&L = (entry_premium - exit_premium) * multiplier
+            pnl = (entry - exit_price) * multiplier * qty
+        elif trade.contract_type in ("call", "put"):
+            # Long options: P&L = (exit - entry) * multiplier
+            pnl = (exit_price - entry) * multiplier * qty
+        elif trade.contract_type == "stock":
+            pnl = (exit_price - entry) * qty
+        else:
+            pnl = (exit_price - entry) * multiplier * qty
+
+        return round(pnl, 2)
 
     def _update_trade_filled(self, pending: PendingOrder, actual_price: float) -> None:
         """Update a trade record to FILLED status with actual fill info."""

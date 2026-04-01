@@ -153,11 +153,32 @@ class PositionReconciler:
                 result.discrepancies.append(msg)
                 log.warning("reconcile_stale_local", position=key, trade_id=trade.trade_id)
 
-                # Mark as closed in local state
+                # Try to get realized P&L from IBKR portfolio items
+                exit_price = 0.0
+                realized_pnl = 0.0
+                for item in ibkr_portfolio:
+                    sym = item.contract.symbol
+                    if sym == trade.symbol and item.position == 0 and item.realizedPNL != 0:
+                        realized_pnl = item.realizedPNL
+                        break
+
+                # If no IBKR data, estimate from entry price (assume worthless expiry)
+                if realized_pnl == 0 and trade.entry_price > 0:
+                    multiplier = 100 if trade.contract_type != "stock" else 1
+                    if trade.strategy in ("cash_secured_put", "iron_condor"):
+                        # Credit strategy expired worthless = full premium kept
+                        realized_pnl = trade.entry_price * multiplier * trade.quantity
+                    else:
+                        # Long option expired worthless = full loss
+                        realized_pnl = -trade.entry_price * multiplier * trade.quantity
+
+                log.info("reconcile_closing_stale", trade_id=trade.trade_id,
+                         exit_price=exit_price, realized_pnl=realized_pnl)
+
                 self._state.close_trade(
                     trade_id=trade.trade_id,
-                    exit_price=0,  # Unknown exit price
-                    realized_pnl=0,  # Unknown P&L
+                    exit_price=exit_price,
+                    realized_pnl=realized_pnl,
                 )
 
         # Update portfolio value in IBKR for reconciliation
