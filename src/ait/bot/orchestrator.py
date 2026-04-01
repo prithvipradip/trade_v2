@@ -697,16 +697,53 @@ class TradingOrchestrator:
                 else:
                     await self._try_execute(signal, final_confidence, sentiment, regime)
 
+    def _get_trade_budget(self) -> int:
+        """Return how many trades are allowed this scan based on time of day.
+
+        Reserves trades across the session instead of firing all at open:
+          - First hour (9:30-10:30):  2 trades max (high-conviction only)
+          - Mid-day (10:30-14:00):    up to 2 more
+          - Power hour (14:00-16:00): remaining budget
+        This way the bot can act on opportunities throughout the day.
+        """
+        from datetime import datetime as dt
+        max_trades = self._settings.trading.max_daily_trades
+        daily_stats = self._state.get_daily_stats(date.today())
+        taken = daily_stats.trades_taken
+
+        now = dt.now()
+        hour_min = now.hour + now.minute / 60.0
+
+        if hour_min < 10.5:      # 9:30-10:30 — first hour
+            budget = 2
+        elif hour_min < 14.0:    # 10:30-2:00 — mid-day
+            budget = 4
+        else:                    # 2:00-4:00 — power hour, release all
+            budget = max_trades
+
+        return min(budget, max_trades) - taken
+
     async def _try_execute(self, signal, confidence: float, sentiment, regime) -> None:
         """Validate and execute a signal."""
         adaptor = self._learning.adaptor
 
-        # Check daily trade limit FIRST
-        daily_stats = self._state.get_daily_stats(date.today())
-        if daily_stats.trades_taken >= self._settings.trading.max_daily_trades:
-            log.info("max_daily_trades_reached",
+        # Check trade budget (time-based pacing)
+        remaining = self._get_trade_budget()
+        if remaining <= 0:
+            daily_stats = self._state.get_daily_stats(date.today())
+            log.info("trade_budget_exhausted",
                      trades_taken=daily_stats.trades_taken,
-                     max=self._settings.trading.max_daily_trades)
+                     max=self._settings.trading.max_daily_trades,
+                     budget_remaining=remaining)
+            return
+
+        # First hour requires higher confidence (only take the best setups)
+        from datetime import datetime as dt
+        hour_min = dt.now().hour + dt.now().minute / 60.0
+        if hour_min < 10.5 and confidence < 0.85:
+            log.info("first_hour_confidence_gate",
+                     symbol=signal.symbol, confidence=f"{confidence:.2f}",
+                     required=0.85)
             return
 
         # Check if this symbol already has a pending order
