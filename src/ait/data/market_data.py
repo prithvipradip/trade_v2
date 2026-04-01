@@ -207,8 +207,9 @@ class MarketDataService:
             if not qualified:
                 return None
 
-            # Request live market data (type 1) — account has subscriptions
-            self._ibkr.ib.reqMarketDataType(1)  # 1 = live
+            # Type 4 = delayed-frozen: uses live data when available,
+            # falls back to frozen snapshot — avoids "competing session" on paper
+            self._ibkr.ib.reqMarketDataType(4)
             self._ibkr.ib.reqMktData(qualified, "", False, False)
             await asyncio.sleep(0.5)  # Brief wait for data
 

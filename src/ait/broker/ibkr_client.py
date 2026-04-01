@@ -54,6 +54,10 @@ class IBKRClient:
             self._connected = True
             self._reconnect_attempts = 0
 
+            # Type 4 = delayed-frozen: live when available, frozen fallback
+            # Avoids "competing live session" error on paper accounts
+            self._ib.reqMarketDataType(4)
+
             account = self._config.ibkr_account or (
                 self._ib.managedAccounts()[0] if self._ib.managedAccounts() else "unknown"
             )
