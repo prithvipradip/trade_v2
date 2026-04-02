@@ -132,8 +132,8 @@ class PortfolioManager:
         # Volatility-adjusted stops: widen stops for high-volatility underlyings
         if self._exit_config.volatility_adjusted_stops:
             vol_multiplier = await self._get_volatility_stop_multiplier(trade.symbol)
-            stop_loss_pct = min(0.75, stop_loss_pct * vol_multiplier)
-            trailing_stop_pct = min(0.50, trailing_stop_pct * vol_multiplier)
+            stop_loss_pct = min(0.50, stop_loss_pct * vol_multiplier)   # Cap at 50% max loss
+            trailing_stop_pct = min(0.35, trailing_stop_pct * vol_multiplier)
 
         # Determine dynamic stop level
         effective_stop = self._calculate_dynamic_stop(

@@ -193,6 +193,16 @@ class TradeExecutor:
         bid = getattr(signal.contract, "bid", 0) or 0
         ask = getattr(signal.contract, "ask", 0) or 0
 
+        # Reject if bid-ask spread is too wide (>15% of mid) — indicates stale/illiquid quote
+        if bid > 0 and ask > 0:
+            mid = (bid + ask) / 2
+            spread_pct = (ask - bid) / mid if mid > 0 else 1.0
+            if spread_pct > 0.15:
+                log.warning("wide_spread_rejected", trade_id=trade_id,
+                            bid=bid, ask=ask, spread_pct=f"{spread_pct:.1%}")
+                self._state.update_trade_status(trade_id, TradeStatus.CANCELLED)
+                return None
+
         if bid > 0 and ask > 0 and ask > bid:
             order = OrderBuilder.passive_limit(
                 action=signal.action,
@@ -329,14 +339,33 @@ class TradeExecutor:
             elif status == "partial":
                 filled_qty = self._get_filled_quantity(order_id, all_trades, pending)
                 self._update_trade_partial(pending, filled_qty)
-                log.warning(
-                    "trade_partial_fill",
-                    trade_id=pending.trade_id,
-                    symbol=pending.signal.symbol,
-                    filled=filled_qty,
-                    requested=pending.contracts,
-                )
-                # Don't remove from pending — will keep checking
+
+                # If partial fill has been sitting > 30s, cancel the remainder
+                # to avoid orphaned legs and stale prices
+                if pending.age_seconds > 30:
+                    log.warning(
+                        "partial_fill_cancelling_remainder",
+                        trade_id=pending.trade_id,
+                        symbol=pending.signal.symbol,
+                        filled=filled_qty,
+                        requested=pending.contracts,
+                        age_seconds=pending.age_seconds,
+                    )
+                    try:
+                        for t in open_trades:
+                            if t.order.orderId == order_id:
+                                self._ibkr.ib.cancelOrder(t.order)
+                                break
+                    except Exception as e:
+                        log.warning("partial_cancel_failed", error=str(e))
+                else:
+                    log.warning(
+                        "trade_partial_fill",
+                        trade_id=pending.trade_id,
+                        symbol=pending.signal.symbol,
+                        filled=filled_qty,
+                        requested=pending.contracts,
+                    )
 
             elif status == "cancelled":
                 self._update_trade_cancelled(pending)

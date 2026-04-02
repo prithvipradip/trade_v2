@@ -343,15 +343,34 @@ class DirectionPredictor:
         (1-3 weeks) far better than next-day returns. Options need price to
         move meaningfully over several days to overcome theta decay.
 
-        0 = bearish (5-day return < -1.5%)
-        1 = neutral (-1.5% to +1.5%)
-        2 = bullish (5-day return > +1.5%)
+        0 = bearish (5-day return < -1.0%)
+        1 = neutral (-1.0% to +1.0%)
+        2 = bullish (5-day return > +1.0%)
+
+        Narrower neutral band (±1.0% vs old ±1.5%) reduces class imbalance
+        and gives the model more directional training signal.
         """
         fwd_return = close.pct_change(5).shift(-5)  # 5-day forward return
         labels = pd.Series(1, index=close.index, dtype=float)  # Default neutral
-        labels[fwd_return > 0.015] = 2   # Bullish: >+1.5% in 5 days
-        labels[fwd_return < -0.015] = 0  # Bearish: <-1.5% in 5 days
+        labels[fwd_return > 0.01] = 2    # Bullish: >+1.0% in 5 days
+        labels[fwd_return < -0.01] = 0   # Bearish: <-1.0% in 5 days
         return labels
+
+    @staticmethod
+    def _compute_sample_weights(y: np.ndarray) -> np.ndarray:
+        """Compute sample weights to balance class distribution.
+
+        Minority classes (bullish/bearish) get higher weights so the model
+        doesn't just learn to always predict neutral.
+        """
+        from collections import Counter
+        counts = Counter(y)
+        total = len(y)
+        n_classes = len(counts)
+        weights = np.ones(len(y))
+        for cls, count in counts.items():
+            weights[y == cls] = total / (n_classes * count)
+        return weights
 
     def _walk_forward_split(
         self, n_samples: int, n_splits: int = 5, gap: int = 5
@@ -413,7 +432,8 @@ class DirectionPredictor:
                 fold_scaler = StandardScaler()
                 X_train = fold_scaler.fit_transform(X[train_idx])
                 X_val = fold_scaler.transform(X[val_idx])
-                model.fit(X_train, y[train_idx])
+                sw = self._compute_sample_weights(y[train_idx])
+                model.fit(X_train, y[train_idx], sample_weight=sw)
                 score = model.score(X_val, y[val_idx])
                 scores.append(score)
 
@@ -444,6 +464,7 @@ class DirectionPredictor:
                 metric="multi_logloss",
                 verbose=-1,
                 n_jobs=-1,
+                class_weight="balanced",  # Auto-balance class weights
             )
 
             wf_splits = self._walk_forward_split(len(X))

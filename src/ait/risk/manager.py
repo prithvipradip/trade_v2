@@ -150,6 +150,27 @@ class RiskManager:
         if not await self._account.can_afford(estimated_cost):
             return TradeValidation(False, "insufficient buying power")
 
+        # 6b. Per-position max risk — no single trade should risk more than 3% of account
+        max_risk_per_trade = account_value * 0.03
+        if hasattr(request, 'max_loss') and request.max_loss and request.max_loss > max_risk_per_trade:
+            return TradeValidation(
+                False,
+                f"position risk ${request.max_loss:.0f} exceeds 3% account limit ${max_risk_per_trade:.0f}",
+            )
+
+        # 6c. Concentration limit — no more than 20% of account in one symbol
+        symbol_exposure = sum(
+            abs(p.get("market_value", 0))
+            for p in self._open_positions
+            if p.get("symbol") == request.symbol
+        )
+        if (symbol_exposure + estimated_cost) > account_value * 0.20:
+            return TradeValidation(
+                False,
+                f"symbol concentration: {request.symbol} exposure "
+                f"${symbol_exposure + estimated_cost:.0f} exceeds 20% of ${account_value:.0f}",
+            )
+
         # 7. Portfolio delta limit
         if request.option:
             new_delta = abs(
@@ -209,10 +230,11 @@ class RiskManager:
             greeks.vega += pos.get("vega", 0) * qty * 100
 
         self._portfolio_greeks = greeks
-        log.debug(
+        log.info(
             "portfolio_greeks",
-            delta=greeks.delta,
-            gamma=greeks.gamma,
-            theta=greeks.theta,
-            vega=greeks.vega,
+            delta=f"{greeks.delta:.1f}",
+            gamma=f"{greeks.gamma:.2f}",
+            theta=f"{greeks.theta:.2f}",
+            vega=f"{greeks.vega:.2f}",
+            positions=len(self._open_positions),
         )
