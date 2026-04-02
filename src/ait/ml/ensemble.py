@@ -66,12 +66,18 @@ class DirectionPredictor:
     def is_trained(self) -> bool:
         return self._trained or bool(self._symbol_models)
 
-    def predict(self, df: pd.DataFrame, symbol: str = "") -> Prediction | None:
+    def predict(
+        self,
+        df: pd.DataFrame,
+        symbol: str = "",
+        market_context: dict | None = None,
+    ) -> Prediction | None:
         """Predict direction for the latest data point.
 
         Args:
             df: OHLCV DataFrame with at least 60 rows of history.
             symbol: Symbol name — uses per-symbol model if available.
+            market_context: Optional dict with cross-asset data (VIX, SPY).
 
         Returns:
             Prediction with direction and confidence, or None if model not trained.
@@ -90,7 +96,7 @@ class DirectionPredictor:
             log.warning("prediction_skipped", reason="model not trained", symbol=symbol)
             return None
 
-        features = self._feature_engine.compute(df)
+        features = self._feature_engine.compute(df, market_context=market_context)
         if features.empty:
             log.warning("prediction_skipped", reason="features_empty",
                         input_rows=len(df))
@@ -147,17 +153,23 @@ class DirectionPredictor:
             model_version=self._model_version,
         )
 
-    def train(self, df: pd.DataFrame, symbol: str = "") -> dict[str, float]:
+    def train(
+        self,
+        df: pd.DataFrame,
+        symbol: str = "",
+        market_context: dict | None = None,
+    ) -> dict[str, float]:
         """Train the ensemble on historical data.
 
         Args:
             df: OHLCV DataFrame with sufficient history.
             symbol: If provided, stores model per-symbol (prevents cross-contamination).
+            market_context: Optional dict with cross-asset data (VIX, SPY).
 
         Returns:
             Dict of model accuracies.
         """
-        features = self._feature_engine.compute(df)
+        features = self._feature_engine.compute(df, market_context=market_context)
         if len(features) < self._config.min_training_samples:
             log.warning(
                 "insufficient_training_data",

@@ -86,6 +86,9 @@ class ModelTrainer:
         prev_version = self._predictor.model_version
         prev_scores = dict(self._predictor.cv_scores)
 
+        # Fetch cross-asset data once (shared across all symbols)
+        market_context = await self._fetch_market_context()
+
         results = {}
         for symbol in symbols:
             log.info("training_symbol", symbol=symbol)
@@ -99,7 +102,9 @@ class ModelTrainer:
                 continue
 
             self._store.save(symbol, df)
-            accuracies = self._predictor.train(df, symbol=symbol)
+            accuracies = self._predictor.train(
+                df, symbol=symbol, market_context=market_context
+            )
             if accuracies:
                 results[symbol] = accuracies
 
@@ -125,6 +130,33 @@ class ModelTrainer:
             version=self._predictor.model_version,
         )
         return results
+
+    async def _fetch_market_context(self) -> dict[str, "pd.DataFrame"]:
+        """Fetch VIX and SPY historical data for cross-asset features."""
+        import pandas as pd
+
+        context = {}
+        lookback = self._config.lookback_days
+
+        # Fetch VIX
+        try:
+            vix_df = await self._market_data.get_historical("^VIX", days=lookback)
+            if vix_df is not None and len(vix_df) > 20:
+                context["vix"] = vix_df
+                log.info("market_context_vix", rows=len(vix_df))
+        except Exception as e:
+            log.warning("market_context_vix_failed", error=str(e))
+
+        # Fetch SPY (for relative strength)
+        try:
+            spy_df = await self._market_data.get_historical("SPY", days=lookback)
+            if spy_df is not None and len(spy_df) > 20:
+                context["spy"] = spy_df
+                log.info("market_context_spy", rows=len(spy_df))
+        except Exception as e:
+            log.warning("market_context_spy_failed", error=str(e))
+
+        return context
 
     @staticmethod
     def _should_rollback(

@@ -25,12 +25,19 @@ log = get_logger("ml.features")
 class FeatureEngine:
     """Computes features from OHLCV data for ML models."""
 
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    def compute(
+        self,
+        df: pd.DataFrame,
+        market_context: dict[str, pd.DataFrame] | None = None,
+    ) -> pd.DataFrame:
         """Compute all features from OHLCV DataFrame.
 
         Args:
             df: DataFrame with columns [Open, High, Low, Close, Volume]
                 indexed by date.
+            market_context: Optional dict with cross-asset data:
+                - "vix": DataFrame with VIX OHLCV (^VIX)
+                - "spy": DataFrame with SPY OHLCV (for relative strength)
 
         Returns:
             DataFrame with original columns plus computed features.
@@ -65,6 +72,9 @@ class FeatureEngine:
 
         # --- Market Structure Features ---
         features = self._add_market_structure(features)
+
+        # --- Cross-Asset Features (VIX, relative strength) ---
+        features = self._add_cross_asset(features, market_context)
 
         # --- Seasonality Features ---
         features = self._add_seasonality(features)
@@ -154,6 +164,11 @@ class FeatureEngine:
             # IV & Volatility Regime
             "iv_rank", "vol_ratio", "vol_trend", "vol_of_vol",
             "vol_regime_expanding", "vol_mean_reversion_signal",
+            # Cross-Asset (VIX + relative strength)
+            "vix_level", "vix_change_5d", "vix_change_20d",
+            "vix_zscore", "vix_term_spread",
+            "rel_strength_5d", "rel_strength_20d", "rel_strength_60d",
+            "spy_momentum_10d", "spy_rsi_14", "correlation_spy_20d",
             # Seasonality
             "day_of_week", "month_of_year",
         ]
@@ -414,6 +429,94 @@ class FeatureEngine:
         atr_5 = (high - low).rolling(5).mean()
         atr_20 = (high - low).rolling(20).mean()
         df["range_compression"] = (atr_5 / atr_20.replace(0, np.nan)).clip(0, 3).fillna(1.0)
+
+        return df
+
+    def _add_cross_asset(
+        self, df: pd.DataFrame, market_context: dict[str, pd.DataFrame] | None
+    ) -> pd.DataFrame:
+        """Add cross-asset features: VIX, relative strength vs SPY.
+
+        These capture broader market conditions that single-stock technicals miss.
+        The model needs to know if it's a risk-on or risk-off environment.
+        """
+        if not market_context:
+            # Fill with neutral defaults so feature count stays consistent
+            df["vix_level"] = 20.0
+            df["vix_change_5d"] = 0.0
+            df["vix_change_20d"] = 0.0
+            df["vix_zscore"] = 0.0
+            df["vix_term_spread"] = 0.0
+            df["rel_strength_5d"] = 0.0
+            df["rel_strength_20d"] = 0.0
+            df["rel_strength_60d"] = 0.0
+            df["spy_momentum_10d"] = 0.0
+            df["spy_rsi_14"] = 50.0
+            df["correlation_spy_20d"] = 0.0
+            return df
+
+        close = df["Close"]
+
+        # --- VIX Features ---
+        vix_df = market_context.get("vix")
+        if vix_df is not None and len(vix_df) > 20:
+            # Align VIX data to symbol's date index
+            vix_close = vix_df["Close"].reindex(df.index, method="ffill")
+
+            df["vix_level"] = (vix_close / 40.0).clip(0, 2)  # Normalize: 20 → 0.5, 40 → 1.0
+            df["vix_change_5d"] = vix_close.pct_change(5).clip(-0.5, 0.5)
+            df["vix_change_20d"] = vix_close.pct_change(20).clip(-0.5, 0.5)
+
+            # VIX z-score: how extreme is current VIX vs recent history
+            vix_mean = vix_close.rolling(60, min_periods=20).mean()
+            vix_std = vix_close.rolling(60, min_periods=20).std()
+            df["vix_zscore"] = ((vix_close - vix_mean) / vix_std.replace(0, np.nan)).clip(-3, 3).fillna(0)
+
+            # VIX term structure proxy: short-term vs long-term VIX movement
+            vix_5 = vix_close.rolling(5).mean()
+            vix_20 = vix_close.rolling(20).mean()
+            df["vix_term_spread"] = ((vix_5 - vix_20) / vix_20.replace(0, np.nan)).clip(-1, 1).fillna(0)
+        else:
+            df["vix_level"] = 0.5
+            df["vix_change_5d"] = 0.0
+            df["vix_change_20d"] = 0.0
+            df["vix_zscore"] = 0.0
+            df["vix_term_spread"] = 0.0
+
+        # --- Relative Strength vs SPY ---
+        spy_df = market_context.get("spy")
+        if spy_df is not None and len(spy_df) > 20:
+            spy_close = spy_df["Close"].reindex(df.index, method="ffill")
+
+            # Relative strength: stock return - SPY return over various windows
+            stock_ret_5 = close.pct_change(5)
+            stock_ret_20 = close.pct_change(20)
+            stock_ret_60 = close.pct_change(60)
+            spy_ret_5 = spy_close.pct_change(5)
+            spy_ret_20 = spy_close.pct_change(20)
+            spy_ret_60 = spy_close.pct_change(60)
+
+            df["rel_strength_5d"] = (stock_ret_5 - spy_ret_5).clip(-0.2, 0.2)
+            df["rel_strength_20d"] = (stock_ret_20 - spy_ret_20).clip(-0.3, 0.3)
+            df["rel_strength_60d"] = (stock_ret_60 - spy_ret_60).clip(-0.5, 0.5)
+
+            # SPY momentum as market regime signal
+            df["spy_momentum_10d"] = spy_close.pct_change(10).clip(-0.15, 0.15)
+
+            # SPY RSI — is broader market overbought/oversold?
+            df["spy_rsi_14"] = self._rsi(spy_close, 14) / 100.0  # Normalize 0-1
+
+            # Rolling correlation with SPY (high = moves with market, low = independent)
+            stock_ret = close.pct_change()
+            spy_ret = spy_close.pct_change()
+            df["correlation_spy_20d"] = stock_ret.rolling(20, min_periods=10).corr(spy_ret).clip(-1, 1).fillna(0)
+        else:
+            df["rel_strength_5d"] = 0.0
+            df["rel_strength_20d"] = 0.0
+            df["rel_strength_60d"] = 0.0
+            df["spy_momentum_10d"] = 0.0
+            df["spy_rsi_14"] = 0.5
+            df["correlation_spy_20d"] = 0.0
 
         return df
 

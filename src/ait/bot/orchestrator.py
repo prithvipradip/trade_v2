@@ -464,13 +464,33 @@ class TradingOrchestrator:
         # 9. Scan universe for new opportunities
         vix = await self._market_data.get_vix()
 
+        # Fetch cross-asset context once per scan cycle (VIX + SPY history for ML)
+        market_context = await self._build_market_context()
+
         for symbol in universe:
             try:
-                await self._scan_symbol(symbol, vix)
+                await self._scan_symbol(symbol, vix, market_context)
             except Exception as e:
                 log.warning("symbol_scan_failed", symbol=symbol, error=str(e))
 
-    async def _scan_symbol(self, symbol: str, vix: float | None) -> None:
+    async def _build_market_context(self) -> dict:
+        """Fetch VIX and SPY historical data for ML cross-asset features."""
+        context = {}
+        try:
+            vix_hist = await self._market_data.get_historical("^VIX", days=120)
+            if vix_hist is not None and len(vix_hist) > 20:
+                context["vix"] = vix_hist
+        except Exception:
+            pass
+        try:
+            spy_hist = await self._market_data.get_historical("SPY", days=120)
+            if spy_hist is not None and len(spy_hist) > 20:
+                context["spy"] = spy_hist
+        except Exception:
+            pass
+        return context
+
+    async def _scan_symbol(self, symbol: str, vix: float | None, market_context: dict | None = None) -> None:
         """Analyze a single symbol for trading opportunities.
 
         Parallelizes data fetches: historical, sentiment, and IV rank
@@ -511,8 +531,10 @@ class TradingOrchestrator:
             if not self._data_quality.validate_historical(symbol, prices):
                 return
 
-        # ML prediction
-        prediction = self._predictor.predict(hist, symbol=symbol)
+        # ML prediction (with cross-asset context)
+        prediction = self._predictor.predict(
+            hist, symbol=symbol, market_context=market_context
+        )
         if prediction is None:
             log.warning("ml_prediction_none", symbol=symbol)
             return
@@ -1292,10 +1314,10 @@ class TradingOrchestrator:
             entry_regime = context.get("entry_regime", "")
             entry_vix = context.get("entry_vix", 0)
 
-            # 1. Re-run ML prediction on fresh data
+            # 1. Re-run ML prediction on fresh data (no market_context here — lightweight check)
             hist = await self._market_data.get_historical(pos.symbol, days=60)
             if hist is not None and not hist.empty:
-                prediction = self._predictor.predict(hist, symbol=symbol)
+                prediction = self._predictor.predict(hist, symbol=symbol, market_context=None)
                 if prediction and prediction.confidence > 0.70:
                     # Direction has flipped with high confidence
                     if entry_direction == "bullish" and prediction.direction == SignalDirection.BEARISH:
