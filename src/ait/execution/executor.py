@@ -28,7 +28,8 @@ from ait.utils.logging import get_logger
 log = get_logger("execution.executor")
 
 # Order timeout: cancel unfilled orders after this many seconds
-DEFAULT_ORDER_TIMEOUT = 300  # 5 minutes
+# Options markets move fast — stale orders get bad fills or block capital
+DEFAULT_ORDER_TIMEOUT = 90  # 90 seconds
 
 
 class PendingOrder:

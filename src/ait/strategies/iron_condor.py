@@ -55,11 +55,14 @@ class IronCondor(Strategy):
         if not short_put:
             return []
 
-        long_put_candidates = [p for p in liquid_puts if p.strike < short_put.strike]
-        if not long_put_candidates:
+        # Buy protection at least 2 strikes below short put for meaningful width
+        long_put_candidates = sorted(
+            [p for p in liquid_puts if p.strike < short_put.strike],
+            key=lambda p: p.strike, reverse=True,
+        )
+        if len(long_put_candidates) < 2:
             return []
-        # Buy the next strike down
-        long_put = max(long_put_candidates, key=lambda p: p.strike)
+        long_put = long_put_candidates[1]  # Skip adjacent, take 2nd strike down
 
         # Call side (above price):
         # Sell call at delta ~0.20, buy call 1-2 strikes higher
@@ -67,10 +70,14 @@ class IronCondor(Strategy):
         if not short_call:
             return []
 
-        long_call_candidates = [c for c in liquid_calls if c.strike > short_call.strike]
-        if not long_call_candidates:
+        # Buy protection at least 2 strikes above short call for meaningful width
+        long_call_candidates = sorted(
+            [c for c in liquid_calls if c.strike > short_call.strike],
+            key=lambda c: c.strike,
+        )
+        if len(long_call_candidates) < 2:
             return []
-        long_call = min(long_call_candidates, key=lambda c: c.strike)
+        long_call = long_call_candidates[1]  # Skip adjacent, take 2nd strike up
 
         # Verify structure: long_put < short_put < price < short_call < long_call
         if not (long_put.strike < short_put.strike < price < short_call.strike < long_call.strike):

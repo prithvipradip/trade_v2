@@ -288,21 +288,52 @@ class TradingOrchestrator:
             model_version=self._predictor.model_version,
         )
 
+    async def _monitor_positions_fast(self) -> None:
+        """Fast position monitor — checks stops/exits every 30 seconds.
+
+        Runs between full scan cycles so positions aren't unprotected
+        for the full 5-minute scan interval.
+        """
+        try:
+            positions = await self._portfolio.check_positions()
+            exits_needed = [p for p in positions if p.should_exit]
+            for pos in exits_needed:
+                log.info("fast_monitor_exit", symbol=pos.symbol, reason=pos.exit_reason)
+                await self._execute_exit(pos)
+
+            # Also check pending order fills
+            await self._executor.check_fills()
+        except Exception as e:
+            log.debug("fast_monitor_error", error=str(e))
+
     async def _trading_loop(self) -> None:
-        """Main trading loop during market hours."""
+        """Main trading loop during market hours.
+
+        Full scan every 5 minutes, but positions monitored every 30 seconds.
+        """
         log.info("trading_loop_starting")
         scan_interval = self._settings.trading.scan_interval_seconds
+        monitor_interval = 30  # Check positions every 30 seconds
+        time_since_scan = 0
 
         while self._running and self._scheduler.get_current_phase() == TradingPhase.MARKET_OPEN:
             try:
                 self._watchdog.heartbeat("trading_loop")
-                await self._trading_cycle()
+
+                if time_since_scan >= scan_interval:
+                    # Full cycle: scan for new trades + check positions
+                    await self._trading_cycle()
+                    time_since_scan = 0
+                else:
+                    # Fast check: only monitor existing positions and fills
+                    await self._monitor_positions_fast()
             except Exception as e:
                 log.error("trading_cycle_error", error=str(e))
                 self._circuit_breaker.record_api_failure()
                 self._watchdog.record_error("trading_loop", str(e))
 
-            await asyncio.sleep(scan_interval)
+            await asyncio.sleep(monitor_interval)
+            time_since_scan += monitor_interval
 
     async def _trading_cycle(self) -> None:
         """Single trading cycle: scan all symbols, check positions, execute signals."""
