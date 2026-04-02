@@ -296,8 +296,21 @@ class TradingOrchestrator:
         """
         try:
             positions = await self._portfolio.check_positions()
-            exits_needed = [p for p in positions if p.should_exit]
+
+            # Skip positions already in CLOSING state (exit order already placed)
+            closing_ids = {
+                pe.trade_id for pe in self._executor._pending_exit_orders.values()
+            }
+            exits_needed = [
+                p for p in positions
+                if p.should_exit and p.trade_id not in closing_ids
+            ]
+
             for pos in exits_needed:
+                # Double-check trade isn't already CLOSING in DB
+                trade = self._find_trade_record(pos.trade_id)
+                if trade and trade.status == TradeStatus.CLOSING:
+                    continue
                 log.info("fast_monitor_exit", symbol=pos.symbol, reason=pos.exit_reason)
                 await self._execute_exit(pos)
 
