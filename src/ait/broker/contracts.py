@@ -45,7 +45,8 @@ class ContractBuilder:
         if isinstance(expiry, date):
             expiry_str = expiry.strftime("%Y%m%d")
         else:
-            expiry_str = expiry
+            # Normalize string format: "2026-04-17" → "20260417"
+            expiry_str = expiry.replace("-", "")
 
         # Validate right
         right = right.upper()
