@@ -1074,9 +1074,15 @@ class TradingOrchestrator:
 
         combo = ContractBuilder.combo(symbol=trade.symbol, legs=qualified_legs)
 
-        # Use a limit order instead of market to avoid poor fills on combos.
-        # Attempt to get the mid-price of the spread from IBKR.
-        limit_price = 0.01  # Aggressive fallback for credit spreads being closed
+        # Determine if we're closing a debit (long) or credit (short) position
+        # Debit close (straddles, long spreads) → we SELL the combo
+        # Credit close (iron condors, short spreads) → we BUY the combo back
+        sell_legs = sum(1 for lg in qualified_legs if lg["action"] == "SELL")
+        buy_legs = len(qualified_legs) - sell_legs
+        combo_action = "SELL" if sell_legs > buy_legs else "BUY"
+
+        # Try to get mid-price from IBKR for a limit order
+        limit_price = None
         try:
             qualified_combo = await self._ibkr.qualify_contract(combo)
             if qualified_combo:
@@ -1094,9 +1100,19 @@ class TradingOrchestrator:
                     elif ask is not None and ask > 0:
                         limit_price = round(ask, 2)
         except Exception as e:
-            log.warning("combo_mid_price_failed", error=str(e), fallback=limit_price)
+            log.warning("combo_mid_price_failed", error=str(e))
 
-        order = OrderBuilder.combo_limit(action="BUY", quantity=trade.quantity, limit_price=limit_price)
+        # Use market order as fallback if we couldn't get a limit price
+        if limit_price and limit_price > 0:
+            log.info("combo_exit_limit", symbol=trade.symbol, action=combo_action,
+                     limit_price=limit_price)
+            order = OrderBuilder.combo_limit(
+                action=combo_action, quantity=trade.quantity, limit_price=limit_price
+            )
+        else:
+            log.info("combo_exit_market_fallback", symbol=trade.symbol, action=combo_action)
+            order = OrderBuilder.market(action=combo_action, quantity=trade.quantity)
+
         return await self._ibkr.place_order(combo, order)
 
     async def _post_market(self) -> None:
