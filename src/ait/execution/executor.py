@@ -390,6 +390,11 @@ class TradeExecutor:
             if still_open:
                 continue
 
+            # Give exit orders time to appear in IBKR's trade list before checking
+            # Without this, fresh orders get falsely marked as "cancelled"
+            if pending_exit.age_seconds < 10:
+                continue
+
             exit_status = self._determine_exit_fill_status(order_id, all_trades)
 
             if exit_status == "filled":
@@ -434,6 +439,25 @@ class TradeExecutor:
                     "exit_order_cancelled",
                     trade_id=pending_exit.trade_id,
                     age_seconds=pending_exit.age_seconds,
+                )
+                del self._pending_exit_orders[order_id]
+
+            elif exit_status == "pending" and pending_exit.age_seconds > 300:
+                # Exit stuck pending for 5+ min — cancel and let portfolio re-trigger
+                log.warning(
+                    "exit_order_stale_pending",
+                    trade_id=pending_exit.trade_id,
+                    age_seconds=int(pending_exit.age_seconds),
+                )
+                try:
+                    for t in open_trades:
+                        if t.order.orderId == order_id:
+                            self._ibkr.ib.cancelOrder(t.order)
+                            break
+                except Exception:
+                    pass
+                self._state.update_trade_status(
+                    pending_exit.trade_id, TradeStatus.FILLED,
                 )
                 del self._pending_exit_orders[order_id]
 
@@ -520,7 +544,9 @@ class TradeExecutor:
                     return "filled"
                 return "cancelled"
 
-        return "cancelled"
+        # Order not found in IBKR trade list yet — assume still pending
+        # rather than falsely cancelling fresh orders
+        return "pending"
 
     def _get_exit_fill_price(self, order_id: int, all_trades: list) -> float:
         """Get the actual fill price for an exit order."""
