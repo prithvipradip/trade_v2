@@ -307,10 +307,6 @@ class TradingOrchestrator:
             ]
 
             for pos in exits_needed:
-                # Double-check trade isn't already CLOSING in DB
-                trade = self._find_trade_record(pos.trade_id)
-                if trade and trade.status == TradeStatus.CLOSING:
-                    continue
                 log.info("fast_monitor_exit", symbol=pos.symbol, reason=pos.exit_reason)
                 await self._execute_exit(pos)
 
