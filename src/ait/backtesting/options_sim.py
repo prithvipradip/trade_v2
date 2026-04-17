@@ -81,8 +81,8 @@ def black_scholes_price(
         sigma: Implied volatility (annualized)
         option_type: CALL or PUT
     """
-    if t <= 0:
-        # At expiry: intrinsic value only
+    if t <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        # At expiry or invalid inputs: intrinsic value only
         if option_type == OptionType.CALL:
             return max(S - K, 0.0)
         return max(K - S, 0.0)

@@ -505,7 +505,9 @@ class Backtester:
             max_loss_per_contract = max_loss_per_share * 100
 
             # Position sizing based on max loss (margin requirement)
-            if max_loss_per_contract <= 0 or capital < max_loss_per_contract:
+            import math
+            if (max_loss_per_contract <= 0 or math.isnan(max_loss_per_contract)
+                    or capital < max_loss_per_contract):
                 return None
             contracts = int(capital * self._position_size_pct / max_loss_per_contract)
             if contracts < 1:
