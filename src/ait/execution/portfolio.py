@@ -55,6 +55,7 @@ class PortfolioManager:
         circuit_breaker: CircuitBreaker,
         pdt_guard: PDTGuard,
         exit_config: ExitConfig | None = None,
+        earnings_calendar=None,
     ) -> None:
         self._ibkr = ibkr_client
         self._market_data = market_data
@@ -62,6 +63,7 @@ class PortfolioManager:
         self._circuit_breaker = circuit_breaker
         self._pdt_guard = pdt_guard
         self._exit_config = exit_config or ExitConfig()
+        self._earnings = earnings_calendar
 
     async def check_positions(self) -> list[PositionStatus]:
         """Check all open positions and determine which need action."""
@@ -170,6 +172,32 @@ class PortfolioManager:
         elif dte is not None and dte <= 5:
             should_exit = True
             exit_reason = f"expiry_approaching (DTE: {dte})"
+
+        # 3b. Delta breach — close if directional risk ballooned
+        # For neutral strategies (iron condor, straddle), delta should stay small
+        # If abs(delta) > 0.50, position has taken on large directional exposure
+        elif trade.strategy in ("iron_condor", "short_strangle", "long_straddle",
+                                 "cash_secured_put", "covered_call"):
+            pos_delta = self._get_position_delta(trade)
+            if pos_delta is not None and abs(pos_delta) > 0.50:
+                should_exit = True
+                exit_reason = f"delta_breach (|Δ|={abs(pos_delta):.2f} > 0.50)"
+
+        # 3c. IV crush pre-close — for SHORT premium strategies, close 2 days
+        # before earnings to capture theta without eating the earnings IV crush
+        elif self._earnings and trade.strategy in (
+            "iron_condor", "short_strangle", "cash_secured_put", "covered_call",
+        ):
+            try:
+                info = self._earnings.get_next_earnings(trade.symbol)
+                if info and info.next_earnings_date:
+                    from datetime import date as _d
+                    days_to_earnings = (info.next_earnings_date - _d.today()).days
+                    if 0 <= days_to_earnings <= 2 and pnl_pct > 0:
+                        should_exit = True
+                        exit_reason = f"pre_earnings_iv_crush (days={days_to_earnings}, pnl={pnl_pct:.1%})"
+            except Exception:
+                pass
 
         # 4. Check for partial exit milestones (only if not already exiting fully)
         if not should_exit and trade.quantity > 1:
@@ -290,6 +318,30 @@ class PortfolioManager:
                     return qty_to_close
 
         return 0
+
+    def _get_position_delta(self, trade) -> float | None:
+        """Fetch current aggregate delta for a position from IBKR.
+
+        Returns None if delta can't be determined (single strike, missing data).
+        For multi-leg strategies, sums delta across all legs.
+        """
+        try:
+            if not self._ibkr or not self._ibkr.connected:
+                return None
+            total_delta = 0.0
+            found_any = False
+            for item in self._ibkr.ib.portfolio():
+                if item.contract.symbol != trade.symbol:
+                    continue
+                if item.position == 0:
+                    continue
+                ticker = self._ibkr.ib.ticker(item.contract)
+                if ticker and ticker.modelGreeks and ticker.modelGreeks.delta is not None:
+                    total_delta += ticker.modelGreeks.delta * item.position
+                    found_any = True
+            return total_delta if found_any else None
+        except Exception:
+            return None
 
     async def _get_volatility_stop_multiplier(self, symbol: str) -> float:
         """Calculate a stop width multiplier based on the underlying's volatility.

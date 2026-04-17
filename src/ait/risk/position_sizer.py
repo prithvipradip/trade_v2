@@ -62,6 +62,7 @@ class PositionSizer:
         strategy: str,
         underlying_price: float,
         iv_rank: float = 50.0,
+        recent_losing_days: int = 0,
     ) -> PositionSize:
         """Calculate recommended position size.
 
@@ -115,8 +116,18 @@ class PositionSizer:
         # Strategy adjustment
         strategy_adj = self.STRATEGY_RISK.get(strategy, 1.0)
 
+        # Drawdown throttle: halve size after 3+ consecutive losing days,
+        # quarter size after 5+ — defensive during rough patches
+        if recent_losing_days >= 5:
+            drawdown_adj = 0.25
+        elif recent_losing_days >= 3:
+            drawdown_adj = 0.50
+        else:
+            drawdown_adj = 1.0
+
         # Calculate contracts
-        adjusted_max = max_position_value * conf_adj * vol_adj * strategy_adj * iv_rank_adj
+        adjusted_max = (max_position_value * conf_adj * vol_adj
+                        * strategy_adj * iv_rank_adj * drawdown_adj)
         max_contracts = int(adjusted_max / cost_per_contract)
 
         # Scale cap with account size: 10 contracts per $100k, minimum 1

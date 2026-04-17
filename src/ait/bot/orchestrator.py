@@ -93,6 +93,7 @@ class TradingOrchestrator:
             self._account, self._circuit_breaker,
             self._pdt_guard, self._position_sizer,
             correlation_guard=self._correlation_guard,
+            state=self._state,
         )
         self._delta_hedger = DeltaHedger()
 
@@ -112,6 +113,9 @@ class TradingOrchestrator:
             finnhub_api_key=settings.api_keys.finnhub_api_key,
         )
 
+        # Earnings calendar — needed by portfolio for IV-crush pre-close
+        self._earnings = EarningsCalendar()
+
         # Trading
         self._strategy_selector = StrategySelector(settings.options)
         self._executor = TradeExecutor(ibkr_client, self._state, self._circuit_breaker)
@@ -119,6 +123,7 @@ class TradingOrchestrator:
             ibkr_client, self._market_data, self._state,
             self._circuit_breaker, self._pdt_guard,
             exit_config=settings.exit,
+            earnings_calendar=self._earnings,
         )
 
         # Scheduling
@@ -130,7 +135,6 @@ class TradingOrchestrator:
 
         # Data quality & market intelligence
         self._data_quality = DataQualityValidator()
-        self._earnings = EarningsCalendar()
         self._economic_cal = EconomicCalendar()
         self._flow_detector = OptionsFlowDetector()
         self._mtf_analyzer = MultiTimeframeAnalyzer()

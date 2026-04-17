@@ -68,6 +68,7 @@ class RiskManager:
         pdt_guard: PDTGuard,
         position_sizer: PositionSizer,
         correlation_guard: CorrelationGuard | None = None,
+        state=None,
     ) -> None:
         self._pos_config = position_config
         self._risk_config = risk_config
@@ -76,10 +77,48 @@ class RiskManager:
         self._pdt_guard = pdt_guard
         self._sizer = position_sizer
         self._correlation = correlation_guard or CorrelationGuard()
+        self._state = state
 
         # Track current positions for limit checks
         self._open_positions: list[dict] = []
         self._portfolio_greeks = PortfolioGreeks()
+
+    def _count_correlated_positions(self, new_symbol: str, open_symbols: list[str]) -> int:
+        """Count open positions that are highly correlated with a new symbol.
+
+        Uses CorrelationGuard's sector groups as the quick heuristic.
+        """
+        from ait.risk.correlation import SECTOR_GROUPS
+        count = 0
+        new_groups = {g for g, syms in SECTOR_GROUPS.items() if new_symbol in syms}
+        for sym in open_symbols:
+            if not sym or sym == new_symbol:
+                continue
+            sym_groups = {g for g, syms in SECTOR_GROUPS.items() if sym in syms}
+            if new_groups & sym_groups:
+                count += 1
+        return count
+
+    def _count_recent_losing_days(self) -> int:
+        """Count consecutive losing days in recent trading history."""
+        if not self._state:
+            return 0
+        try:
+            from datetime import date, timedelta
+            today = date.today()
+            losing_streak = 0
+            for days_back in range(1, 11):  # Look back up to 10 days
+                d = today - timedelta(days=days_back)
+                stats = self._state.get_daily_stats(d)
+                if stats.trades_taken == 0:
+                    continue  # Skip non-trading days
+                if stats.total_pnl < 0:
+                    losing_streak += 1
+                else:
+                    break  # Streak ended
+            return losing_streak
+        except Exception:
+            return 0
 
     def update_positions(self, positions: list[dict]) -> None:
         """Update current position list from IBKR or state."""
@@ -188,6 +227,18 @@ class RiskManager:
         if not self._circuit_breaker.check_daily_loss(account_value):
             return TradeValidation(False, "daily loss limit reached")
 
+        # Count recent losing days for drawdown throttle
+        recent_losing_days = self._count_recent_losing_days()
+
+        # Correlation-adjusted sizing: reduce size when concentrated in correlated symbols
+        correlated_count = self._count_correlated_positions(request.symbol, open_symbols)
+        if correlated_count > 0:
+            # Pre-reduce entry_price effectively by trimming contracts later
+            # Log it so it's visible
+            log.info("correlation_size_reduction",
+                     symbol=request.symbol,
+                     correlated_open=correlated_count)
+
         # 9. Position sizing
         size = self._sizer.calculate(
             account_value=account_value,
@@ -196,10 +247,18 @@ class RiskManager:
             implied_vol=request.implied_vol,
             strategy=request.strategy,
             underlying_price=0,  # Not needed for final sizing
+            recent_losing_days=recent_losing_days,
         )
 
         # Use the smaller of requested and recommended size
         final_contracts = min(request.contracts, size.contracts)
+
+        # Correlation haircut: reduce size by 30% per correlated open position,
+        # capped at 70% reduction (floor at 30% of calculated size)
+        if correlated_count > 0:
+            haircut = max(0.30, 1.0 - 0.30 * correlated_count)
+            final_contracts = max(1, int(final_contracts * haircut))
+
         if final_contracts <= 0:
             return TradeValidation(False, "position sizer returned 0 contracts")
 
