@@ -286,7 +286,17 @@ class TradeExecutor:
             is_credit = sell_count > buy_count
         else:
             is_credit = signal.action == "SELL"
-        limit_price = -signal.entry_price if is_credit else signal.entry_price
+
+        # Aggressive pricing: accept ~$0.05 below mid to improve fill rate.
+        # Mid prices rarely fill on multi-leg combos — MMs take a few cents.
+        aggressive_offset = 0.05
+        if is_credit:
+            # Credit: we collect, so reduce the credit we demand by 5c
+            entry_px = max(0.01, signal.entry_price - aggressive_offset)
+            limit_price = -entry_px
+        else:
+            # Debit: we pay, so accept paying 5c more
+            limit_price = signal.entry_price + aggressive_offset
 
         order = OrderBuilder.combo_limit(
             action="BUY",
