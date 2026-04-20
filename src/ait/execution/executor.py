@@ -577,15 +577,23 @@ class TradeExecutor:
             # Credit/debit spreads: P&L = (entry_credit - exit_debit) * multiplier
             pnl = (entry - exit_price) * multiplier * qty
         elif trade.strategy == "cash_secured_put":
-            # Short put: P&L = (entry_premium - exit_premium) * multiplier
             pnl = (entry - exit_price) * multiplier * qty
         elif trade.contract_type in ("call", "put"):
-            # Long options: P&L = (exit - entry) * multiplier
             pnl = (exit_price - entry) * multiplier * qty
         elif trade.contract_type == "stock":
             pnl = (exit_price - entry) * qty
         else:
             pnl = (exit_price - entry) * multiplier * qty
+
+        # Subtract commissions: ~$0.65/contract/side (IBKR tiered pricing)
+        # Multi-leg strategies pay per leg both entering and exiting
+        legs_per_side = 1
+        if trade.contract_type == "iron_condor":
+            legs_per_side = 4
+        elif trade.contract_type == "spread" or trade.strategy == "long_straddle":
+            legs_per_side = 2
+        commission = 0.65 * legs_per_side * qty * 2  # entry + exit
+        pnl -= commission
 
         return round(pnl, 2)
 

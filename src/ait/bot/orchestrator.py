@@ -113,8 +113,9 @@ class TradingOrchestrator:
             finnhub_api_key=settings.api_keys.finnhub_api_key,
         )
 
-        # Earnings calendar — needed by portfolio for IV-crush pre-close
+        # Calendars — needed by portfolio for event-driven exits
         self._earnings = EarningsCalendar()
+        self._economic_cal = EconomicCalendar()
 
         # Trading
         self._strategy_selector = StrategySelector(settings.options)
@@ -124,6 +125,7 @@ class TradingOrchestrator:
             self._circuit_breaker, self._pdt_guard,
             exit_config=settings.exit,
             earnings_calendar=self._earnings,
+            economic_calendar=self._economic_cal,
         )
 
         # Scheduling
@@ -135,7 +137,6 @@ class TradingOrchestrator:
 
         # Data quality & market intelligence
         self._data_quality = DataQualityValidator()
-        self._economic_cal = EconomicCalendar()
         self._flow_detector = OptionsFlowDetector()
         self._mtf_analyzer = MultiTimeframeAnalyzer()
 
@@ -830,6 +831,7 @@ class TradingOrchestrator:
                 return
 
         # Build trade request for risk validation
+        current_vix = await self._market_data.get_vix() or 0.0
         request = TradeRequest(
             symbol=signal.symbol,
             strategy=signal.strategy_name,
@@ -840,6 +842,7 @@ class TradingOrchestrator:
             confidence=confidence,
             implied_vol=signal.contract.implied_vol if signal.contract else 0.30,
             max_loss=signal.max_loss if signal.is_defined_risk else None,
+            vix=current_vix,
         )
 
         validation = await self._risk_manager.validate_trade(request)

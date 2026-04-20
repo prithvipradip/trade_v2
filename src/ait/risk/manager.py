@@ -54,6 +54,7 @@ class TradeRequest:
     implied_vol: float = 0.30
     # For multi-leg strategies
     max_loss: float | None = None  # Defined risk strategies
+    vix: float = 0.0  # Current VIX level for regime-aware sizing
 
 
 class RiskManager:
@@ -150,6 +151,21 @@ class RiskManager:
                 False,
                 f"confidence {request.confidence:.2f} < min {self._risk_config.min_confidence}",
             )
+
+        # 2b. Weekend gap risk — require higher confidence after 2:30 PM ET Friday
+        # for undefined-risk short strategies (short_strangle). Iron condors are
+        # defined-risk so they're OK. Long straddles benefit from weekend vol.
+        from datetime import datetime as _dt
+        now = _dt.now()
+        is_friday_late = now.weekday() == 4 and (now.hour > 14 or
+                                                   (now.hour == 14 and now.minute >= 30))
+        if is_friday_late and request.strategy in ("short_strangle",):
+            if request.confidence < 0.90:
+                return TradeValidation(
+                    False,
+                    f"weekend_gap_risk: {request.strategy} requires 90% conf on Fri PM "
+                    f"(got {request.confidence:.2f})",
+                )
 
         # 3a. Daily trade limit
         if hasattr(request, 'daily_trades_taken') and hasattr(self._risk_config, 'max_daily_trades'):
@@ -248,6 +264,7 @@ class RiskManager:
             strategy=request.strategy,
             underlying_price=0,  # Not needed for final sizing
             recent_losing_days=recent_losing_days,
+            vix=request.vix,
         )
 
         # Use the smaller of requested and recommended size

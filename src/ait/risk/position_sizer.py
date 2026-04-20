@@ -63,6 +63,7 @@ class PositionSizer:
         underlying_price: float,
         iv_rank: float = 50.0,
         recent_losing_days: int = 0,
+        vix: float = 0.0,
     ) -> PositionSize:
         """Calculate recommended position size.
 
@@ -125,9 +126,18 @@ class PositionSizer:
         else:
             drawdown_adj = 1.0
 
+        # VIX regime adjustment: shrink positions in high-vol regimes where
+        # gamma risk is amplified. VIX>30 = crisis (half), VIX>25 = elevated (75%)
+        if vix >= 30:
+            vix_adj = 0.50
+        elif vix >= 25:
+            vix_adj = 0.75
+        else:
+            vix_adj = 1.0
+
         # Calculate contracts
         adjusted_max = (max_position_value * conf_adj * vol_adj
-                        * strategy_adj * iv_rank_adj * drawdown_adj)
+                        * strategy_adj * iv_rank_adj * drawdown_adj * vix_adj)
         max_contracts = int(adjusted_max / cost_per_contract)
 
         # Scale cap with account size: 10 contracts per $100k, minimum 1

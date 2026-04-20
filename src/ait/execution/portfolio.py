@@ -56,6 +56,7 @@ class PortfolioManager:
         pdt_guard: PDTGuard,
         exit_config: ExitConfig | None = None,
         earnings_calendar=None,
+        economic_calendar=None,
     ) -> None:
         self._ibkr = ibkr_client
         self._market_data = market_data
@@ -64,6 +65,7 @@ class PortfolioManager:
         self._pdt_guard = pdt_guard
         self._exit_config = exit_config or ExitConfig()
         self._earnings = earnings_calendar
+        self._economic_cal = economic_calendar
 
     async def check_positions(self) -> list[PositionStatus]:
         """Check all open positions and determine which need action."""
@@ -168,7 +170,31 @@ class PortfolioManager:
             should_exit = True
             exit_reason = f"take_profit_short (P&L: {pnl_pct:.1%})"
 
-        # 3. Time decay — close positions with 5 or fewer DTE
+        # 3. Assignment risk — ITM shorts on expiry day (DTE 0-1) MUST close
+        # Short puts ITM → stock gets put to you (cash drain)
+        # Short calls ITM → shares called away (may cause forced cover)
+        elif dte is not None and dte <= 1 and is_short and trade.strike:
+            try:
+                current_underlying = await self._market_data.get_current_price(trade.symbol)
+                if current_underlying:
+                    itm = False
+                    if trade.contract_type == "put" and current_underlying < trade.strike:
+                        itm = True
+                    elif trade.contract_type == "call" and current_underlying > trade.strike:
+                        itm = True
+                    if itm:
+                        should_exit = True
+                        exit_reason = (
+                            f"assignment_risk (short {trade.contract_type} ITM, "
+                            f"underlying=${current_underlying:.2f}, strike=${trade.strike:.2f})"
+                        )
+            except Exception:
+                pass
+            if not should_exit:
+                should_exit = True
+                exit_reason = f"expiry_approaching (DTE: {dte})"
+
+        # 3a. Time decay — close other positions with 5 or fewer DTE
         elif dte is not None and dte <= 5:
             should_exit = True
             exit_reason = f"expiry_approaching (DTE: {dte})"
@@ -196,6 +222,19 @@ class PortfolioManager:
                     if 0 <= days_to_earnings <= 2 and pnl_pct > 0:
                         should_exit = True
                         exit_reason = f"pre_earnings_iv_crush (days={days_to_earnings}, pnl={pnl_pct:.1%})"
+            except Exception:
+                pass
+
+        # 3d. Macro event flatten — close short-premium positions 1 day before
+        # FOMC/CPI/NFP to avoid vol expansion
+        if not should_exit and self._economic_cal and trade.strategy in (
+            "iron_condor", "short_strangle", "cash_secured_put", "covered_call",
+        ):
+            try:
+                days_to_event = self._economic_cal.days_until_next_event()
+                if days_to_event is not None and days_to_event <= 1:
+                    should_exit = True
+                    exit_reason = f"macro_event_flatten (days_to_event={days_to_event})"
             except Exception:
                 pass
 

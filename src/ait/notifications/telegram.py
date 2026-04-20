@@ -46,10 +46,11 @@ class TelegramNotifier:
             import aiohttp
 
             url = f"https://api.telegram.org/bot{self._token}/sendMessage"
+            # Plain text (no parse_mode) to avoid Markdown escape errors on
+            # special chars like $, (, ), _, *, ` in trade messages
             payload = {
                 "chat_id": self._chat_id,
                 "text": message[:4096],
-                "parse_mode": "Markdown",
                 "disable_web_page_preview": True,
             }
 
@@ -79,7 +80,7 @@ class TelegramNotifier:
         """Send a formatted trade alert."""
         emoji = "🟢" if action == "BUY" else "🔴"
         msg = (
-            f"{emoji} *{action}* {contracts}x {symbol}\n"
+            f"{emoji} {action} {contracts}x {symbol}\n"
             f"Strategy: {strategy}\n"
             f"Price: ${price:.2f}\n"
             f"Confidence: {confidence:.0%}"
@@ -88,15 +89,15 @@ class TelegramNotifier:
 
     async def send_error_alert(self, error: str) -> bool:
         """Send an error notification."""
-        msg = f"⚠️ *AIT ERROR*\n```\n{error[:500]}\n```"
+        msg = f"⚠️ AIT ERROR\n{error[:500]}"
         return await self.send(msg)
 
     async def send_circuit_breaker_alert(self, reason: str) -> bool:
         """Send circuit breaker trigger notification."""
-        msg = f"🛑 *CIRCUIT BREAKER TRIPPED*\nReason: {reason}"
+        msg = f"🛑 CIRCUIT BREAKER TRIPPED\nReason: {reason}"
         return await self.send(msg)
 
     async def send_daily_summary(self, summary: str) -> bool:
         """Send end-of-day summary."""
-        msg = f"📊 *Daily Summary*\n{summary}"
+        msg = f"📊 Daily Summary\n{summary}"
         return await self.send(msg)
