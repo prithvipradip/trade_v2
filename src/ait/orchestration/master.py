@@ -268,12 +268,9 @@ trainer = ModelTrainer(settings.ml, predictor, market_data, historical)
 
 async def train():
     symbols = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA", "AMD", "AMZN", "META", "GOOGL"]
-    for sym in symbols:
-        try:
-            await trainer.train_symbol(sym)
-            print(f"Trained: {sym}")
-        except Exception as e:
-            print(f"Failed {sym}: {e}")
+    results = await trainer.train_all_symbols(symbols)
+    for sym, acc in results.items():
+        print(f"Trained: {sym} -> {acc}")
 
 asyncio.run(train())
 """],
