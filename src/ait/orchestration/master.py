@@ -108,6 +108,27 @@ class BotManager:
             self._log_handle = None
         _log("info", "bot_stopped")
 
+    def health_check(self):
+        """Check if bot is alive, restart if crashed."""
+        if self.is_running:
+            _log("debug", "bot_healthy", pid=self._proc.pid)
+            return
+
+        exit_code = self._proc.returncode if self._proc else "never_started"
+        _log("warn", "bot_down", exit_code=exit_code, restarts=self._restarts)
+
+        # Reset restart counter if last restart was >1 hour ago
+        if self._last_restart and (datetime.now() - self._last_restart) > timedelta(hours=1):
+            self._restarts = 0
+
+        if self._restarts >= self._max_restarts:
+            _log("error", "bot_max_restarts_reached", max=self._max_restarts)
+            return
+
+        self._restarts += 1
+        _log("info", "bot_restarting", attempt=self._restarts)
+        self.start()
+
 
 class WebServiceManager:
     """Manages the dashboard (Streamlit) and web log viewer (Flask) subprocesses."""
@@ -168,27 +189,6 @@ class WebServiceManager:
         self._dashboard_proc = None
         self._weblog_proc = None
         _log("info", "web_services_stopped")
-
-    def health_check(self):
-        """Check if bot is alive, restart if crashed."""
-        if self.is_running:
-            _log("debug", "bot_healthy", pid=self._proc.pid)
-            return
-
-        exit_code = self._proc.returncode if self._proc else "never_started"
-        _log("warn", "bot_down", exit_code=exit_code, restarts=self._restarts)
-
-        # Reset restart counter if last restart was >1 hour ago
-        if self._last_restart and (datetime.now() - self._last_restart) > timedelta(hours=1):
-            self._restarts = 0
-
-        if self._restarts >= self._max_restarts:
-            _log("error", "bot_max_restarts_reached", max=self._max_restarts)
-            return
-
-        self._restarts += 1
-        _log("info", "bot_restarting", attempt=self._restarts)
-        self.start()
 
 
 # ---------------------------------------------------------------------------
