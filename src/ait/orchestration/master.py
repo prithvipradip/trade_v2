@@ -285,6 +285,18 @@ asyncio.run(train())
             bufsize=1,
         )
 
+        # Kill the process after 15 min regardless of whether it's producing output
+        import threading
+        timed_out = {"flag": False}
+
+        def _kill_on_timeout():
+            if proc.poll() is None:
+                timed_out["flag"] = True
+                proc.kill()
+
+        timer = threading.Timer(900, _kill_on_timeout)
+        timer.start()
+
         # Stream output live, save to log file, print to terminal
         try:
             with open(log_path, "w") as log_file:
@@ -294,9 +306,11 @@ asyncio.run(train())
                         print(f"[retrain] {line}", flush=True)
                         log_file.write(line + "\n")
                         log_file.flush()
-            proc.wait(timeout=900)  # 15 min max
-        except subprocess.TimeoutExpired:
-            proc.kill()
+            proc.wait()
+        finally:
+            timer.cancel()
+
+        if timed_out["flag"]:
             _log("error", "retrain_timeout", log=str(log_path))
             return
 
