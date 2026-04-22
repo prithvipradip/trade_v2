@@ -432,6 +432,28 @@ class FeatureEngine:
 
         return df
 
+    @staticmethod
+    def _normalize_index(df: pd.DataFrame) -> pd.DataFrame:
+        """Strip timezone and normalize to datetime64[ms] for reindex compatibility.
+
+        Different data sources (yfinance, Polygon, IBKR) return DataFrames with
+        different index dtypes. yfinance returns tz-aware timestamps, IBKR/cache
+        returns tz-naive, and reindex fails on mismatched tz. Normalize all to
+        tz-naive datetime64[ms].
+        """
+        if df is None or df.empty:
+            return df
+        try:
+            if getattr(df.index, "tz", None) is not None:
+                df = df.copy()
+                df.index = df.index.tz_localize(None).astype("datetime64[ms]")
+            elif str(df.index.dtype) != "datetime64[ms]":
+                df = df.copy()
+                df.index = df.index.astype("datetime64[ms]")
+        except Exception:
+            pass
+        return df
+
     def _add_cross_asset(
         self, df: pd.DataFrame, market_context: dict[str, pd.DataFrame] | None
     ) -> pd.DataFrame:
@@ -455,11 +477,14 @@ class FeatureEngine:
             df["correlation_spy_20d"] = 0.0
             return df
 
+        # Normalize index for cross-source compatibility (tz-aware vs tz-naive)
+        df = self._normalize_index(df)
         close = df["Close"]
 
         # --- VIX Features ---
         vix_df = market_context.get("vix")
         if vix_df is not None and len(vix_df) > 20:
+            vix_df = self._normalize_index(vix_df)
             # Align VIX data to symbol's date index
             vix_close = vix_df["Close"].reindex(df.index, method="ffill")
 
@@ -486,6 +511,7 @@ class FeatureEngine:
         # --- Relative Strength vs SPY ---
         spy_df = market_context.get("spy")
         if spy_df is not None and len(spy_df) > 20:
+            spy_df = self._normalize_index(spy_df)
             spy_close = spy_df["Close"].reindex(df.index, method="ffill")
 
             # Relative strength: stock return - SPY return over various windows
