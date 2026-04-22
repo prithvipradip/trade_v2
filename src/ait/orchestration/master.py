@@ -249,8 +249,11 @@ def retrain_models():
     """Deep model retrain — full walk-forward on all symbols."""
     _log("info", "retrain_starting")
     try:
-        result = subprocess.run(
-            [sys.executable, "-c", """
+        # Stream output live so user can see progress (and we don't silently
+        # time out with no clue what happened). Log to file AND terminal.
+        log_path = LOGS_DIR / f"retrain_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        proc = subprocess.Popen(
+            [sys.executable, "-u", "-c", """
 import sys
 sys.path.insert(0, 'src')
 from ait.config.settings import Settings
@@ -268,20 +271,36 @@ trainer = ModelTrainer(settings.ml, predictor, market_data, historical)
 
 async def train():
     symbols = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA", "AMD", "AMZN", "META", "GOOGL"]
+    print(f"[retrain] Training {len(symbols)} symbols...", flush=True)
     results = await trainer.train_all_symbols(symbols)
     for sym, acc in results.items():
-        print(f"Trained: {sym} -> {acc}")
+        print(f"Trained: {sym} -> {acc}", flush=True)
 
 asyncio.run(train())
 """],
             cwd=str(ROOT),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            timeout=300,
+            bufsize=1,
         )
-        _log("info", "retrain_complete", output=result.stdout[-200:] if result.stdout else "empty")
-    except subprocess.TimeoutExpired:
-        _log("error", "retrain_timeout")
+
+        # Stream output live, save to log file, print to terminal
+        try:
+            with open(log_path, "w") as log_file:
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line:
+                        print(f"[retrain] {line}", flush=True)
+                        log_file.write(line + "\n")
+                        log_file.flush()
+            proc.wait(timeout=900)  # 15 min max
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _log("error", "retrain_timeout", log=str(log_path))
+            return
+
+        _log("info", "retrain_complete", exit_code=proc.returncode, log=str(log_path))
     except Exception as e:
         _log("error", "retrain_failed", error=str(e))
 
