@@ -72,10 +72,19 @@ run_orchestrator.py (master process)
 
 | Software | Version | Purpose |
 |---|---|---|
-| Python | 3.11 – 3.13 | Bot runtime |
+| Python | 3.11 – 3.13* | Bot runtime |
 | Git | Any | Clone the repo |
 | Interactive Brokers Gateway | 1044+ | Order execution |
 | IBC (IB Controller) | 3.20+ | Gateway auto-start (optional) |
+
+> **\*Intel Mac users: use Python 3.11** — PyTorch dropped Intel Mac wheels from torch 2.3+, and Python 3.12/3.13 Intel Mac users can't install torch. On Python 3.11, torch 2.2.x works. Apple Silicon Macs and Windows/Linux can use any supported Python version.
+>
+> ```bash
+> # Intel Mac install:
+> brew install python@3.11
+> python3.11 -m venv venv && source venv/bin/activate
+> pip install -e .
+> ```
 
 ### Required Accounts & Keys
 
@@ -503,6 +512,25 @@ If configured, sends:
 ### "No module named 'ait'"
 - Run `pip install -e .` from project root
 - Activate the venv first: `venv\Scripts\activate` (Windows)
+
+### "Could not find a version that satisfies the requirement torch>=2.2"
+PyTorch has no pre-built wheel for your platform. Common causes:
+
+1. **Intel Mac + Python 3.12/3.13** — PyTorch dropped Intel Mac wheels from torch 2.3+.
+   **Fix:** Use Python 3.11. `brew install python@3.11`, then `python3.11 -m venv venv`.
+2. **Python too new** (3.14+ alpha) — use 3.11, 3.12, or 3.13.
+3. **Python 32-bit install** — torch requires 64-bit. Check: `python -c "import struct; print(struct.calcsize('P') * 8)"` (should print 64).
+4. **Pip is outdated** — upgrade: `python -m pip install --upgrade pip`
+5. **ARM Linux/other exotic arch** — install torch separately first from [pytorch.org](https://pytorch.org/get-started/locally/), then `pip install -e .`
+6. **Corporate proxy blocking PyPI** — try with `--index-url https://pypi.org/simple/`
+
+**Workaround if torch install is blocked:**
+FinBERT (sentiment) is the only thing needing torch. You can disable sentiment in `config.yaml`:
+```yaml
+sentiment:
+  enabled: false
+```
+Then edit `pyproject.toml` to remove `torch` and `transformers` from dependencies, and reinstall.
 
 ### Bot won't start
 - Check Gateway is running: `netstat -ano | grep 4002`
