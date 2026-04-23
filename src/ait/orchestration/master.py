@@ -285,33 +285,39 @@ asyncio.run(train())
             bufsize=1,
         )
 
-        # Kill the process after 15 min regardless of whether it's producing output
-        import threading
+        # Idle timeout: kill only if no output for 5 minutes (truly hung).
+        # Legitimate slow training on older hardware stays alive as long as
+        # it's producing progress output.
+        import threading, time
+        IDLE_LIMIT = 300  # 5 min of silence = assumed hung
+        last_output = {"ts": time.time()}
         timed_out = {"flag": False}
 
-        def _kill_on_timeout():
-            if proc.poll() is None:
-                timed_out["flag"] = True
-                proc.kill()
+        def _idle_killer():
+            while proc.poll() is None:
+                time.sleep(15)
+                if time.time() - last_output["ts"] > IDLE_LIMIT:
+                    timed_out["flag"] = True
+                    proc.kill()
+                    return
 
-        timer = threading.Timer(900, _kill_on_timeout)
-        timer.start()
+        killer_thread = threading.Thread(target=_idle_killer, daemon=True)
+        killer_thread.start()
 
         # Stream output live, save to log file, print to terminal
-        try:
-            with open(log_path, "w") as log_file:
-                for line in proc.stdout:
-                    line = line.rstrip()
-                    if line:
-                        print(f"[retrain] {line}", flush=True)
-                        log_file.write(line + "\n")
-                        log_file.flush()
-            proc.wait()
-        finally:
-            timer.cancel()
+        with open(log_path, "w") as log_file:
+            for line in proc.stdout:
+                last_output["ts"] = time.time()  # reset idle timer on activity
+                line = line.rstrip()
+                if line:
+                    print(f"[retrain] {line}", flush=True)
+                    log_file.write(line + "\n")
+                    log_file.flush()
+        proc.wait()
 
         if timed_out["flag"]:
-            _log("error", "retrain_timeout", log=str(log_path))
+            _log("error", "retrain_timeout_idle", log=str(log_path),
+                 idle_limit_seconds=IDLE_LIMIT)
             return
 
         _log("info", "retrain_complete", exit_code=proc.returncode, log=str(log_path))
