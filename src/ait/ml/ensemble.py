@@ -10,6 +10,7 @@ Output: direction + confidence score (0.0 to 1.0).
 from __future__ import annotations
 
 import pickle
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +18,14 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
+
+# Silence LightGBM's benign "X does not have valid feature names" warning
+# during walk-forward CV (we pass numpy arrays, not DataFrames)
+warnings.filterwarnings(
+    "ignore",
+    message="X does not have valid feature names",
+    category=UserWarning,
+)
 
 from ait.config.settings import MLConfig
 from ait.ml.features import FeatureEngine
@@ -106,7 +115,11 @@ class DirectionPredictor:
         X = features[feature_names].iloc[[-1]]
 
         try:
-            X_scaled = scaler.transform(X.values)
+            # Keep as DataFrame with feature names so LightGBM/sklearn agree
+            X_scaled = pd.DataFrame(
+                scaler.transform(X.values),
+                columns=feature_names,
+            )
         except Exception as e:
             log.error("feature_scaling_failed", error=str(e), symbol=symbol)
             return None
@@ -206,7 +219,10 @@ class DirectionPredictor:
         # Final scaler fit on all data for inference going forward.
         # Final models are retrained on scaled data so scaler + model are consistent.
         self._scaler.fit(X)
-        X_scaled = self._scaler.transform(X)
+        X_scaled = pd.DataFrame(
+            self._scaler.transform(X),
+            columns=self._feature_names,
+        )
         for model in self._models.values():
             model.fit(X_scaled, y)
 
@@ -442,8 +458,16 @@ class DirectionPredictor:
             scores = []
             for train_idx, val_idx in wf_splits:
                 fold_scaler = StandardScaler()
-                X_train = fold_scaler.fit_transform(X[train_idx])
-                X_val = fold_scaler.transform(X[val_idx])
+                # Wrap in DataFrame with feature names to keep sklearn + models
+                # aligned (silences feature-name warnings during CV)
+                X_train = pd.DataFrame(
+                    fold_scaler.fit_transform(X[train_idx]),
+                    columns=self._feature_names,
+                )
+                X_val = pd.DataFrame(
+                    fold_scaler.transform(X[val_idx]),
+                    columns=self._feature_names,
+                )
                 sw = self._compute_sample_weights(y[train_idx])
                 model.fit(X_train, y[train_idx], sample_weight=sw)
                 score = model.score(X_val, y[val_idx])
@@ -483,10 +507,17 @@ class DirectionPredictor:
             scores = []
             for train_idx, val_idx in wf_splits:
                 fold_scaler = StandardScaler()
-                X_train = fold_scaler.fit_transform(X[train_idx])
-                X_val = fold_scaler.transform(X[val_idx])
-                # Pass numpy arrays (no feature names) to avoid sklearn warning
-                model.fit(X_train, y[train_idx], feature_name="auto")
+                # Wrap in DataFrame with feature names to keep sklearn + LightGBM
+                # aligned — silences "feature names mismatch" warning during CV
+                X_train = pd.DataFrame(
+                    fold_scaler.fit_transform(X[train_idx]),
+                    columns=self._feature_names,
+                )
+                X_val = pd.DataFrame(
+                    fold_scaler.transform(X[val_idx]),
+                    columns=self._feature_names,
+                )
+                model.fit(X_train, y[train_idx])
                 score = model.score(X_val, y[val_idx])
                 scores.append(score)
 
