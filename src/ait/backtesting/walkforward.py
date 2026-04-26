@@ -154,20 +154,137 @@ class WalkForwardResult:
         profitable = sum(1 for w in self.windows if w.backtest_result.total_return > 0)
         return profitable / len(self.windows)
 
+    def _all_trades(self) -> list[dict]:
+        out = []
+        for w in self.windows:
+            out.extend(w.backtest_result.trades)
+        return out
+
+    @property
+    def sortino_ratio(self) -> float:
+        """Downside-only volatility ratio — better for option-selling skew."""
+        all_pnls = np.array([t.get("pnl", 0) for t in self._all_trades()])
+        if len(all_pnls) < 2:
+            return 0.0
+        mean_pnl = float(all_pnls.mean())
+        downside = all_pnls[all_pnls < 0]
+        if len(downside) < 2:
+            return float("inf") if mean_pnl > 0 else 0.0
+        ds_std = float(downside.std(ddof=1))
+        if ds_std == 0:
+            return 0.0
+        return (mean_pnl / ds_std) * float(np.sqrt(252))
+
+    @property
+    def avg_win(self) -> float:
+        wins = [t["pnl"] for t in self._all_trades() if t.get("pnl", 0) > 0]
+        return float(np.mean(wins)) if wins else 0.0
+
+    @property
+    def avg_loss(self) -> float:
+        losses = [abs(t["pnl"]) for t in self._all_trades() if t.get("pnl", 0) <= 0]
+        return float(np.mean(losses)) if losses else 0.0
+
+    @property
+    def win_loss_ratio(self) -> float:
+        if self.avg_loss == 0:
+            return float("inf") if self.avg_win > 0 else 0.0
+        return self.avg_win / self.avg_loss
+
+    @property
+    def expectancy(self) -> float:
+        wr = self.win_rate
+        return wr * self.avg_win - (1 - wr) * self.avg_loss
+
+    @property
+    def best_trade(self) -> float:
+        trades = self._all_trades()
+        return max((t.get("pnl", 0) for t in trades), default=0.0)
+
+    @property
+    def worst_trade(self) -> float:
+        trades = self._all_trades()
+        return min((t.get("pnl", 0) for t in trades), default=0.0)
+
+    @property
+    def capital_utilization(self) -> float:
+        """Avg % of initial capital deployed across the backtest period."""
+        trades = self._all_trades()
+        if not trades or not self.windows:
+            return 0.0
+        first_date = self.windows[0].test_start
+        last_date = self.windows[-1].test_end
+        total_days = max(1, (last_date - first_date).days)
+
+        from datetime import datetime, date as _date
+        def to_d(d):
+            if d is None: return None
+            if isinstance(d, _date) and not isinstance(d, datetime): return d
+            if hasattr(d, "date"): return d.date()
+            if isinstance(d, str):
+                try: return datetime.fromisoformat(d.split("T")[0]).date()
+                except Exception: return None
+            return None
+
+        capital_days = 0.0
+        for t in trades:
+            entry = to_d(t.get("entry_date"))
+            exit_ = to_d(t.get("exit_date"))
+            risk = t.get("max_loss") or t.get("cost") or abs(t.get("pnl", 0)) * 2
+            if entry and exit_ and risk:
+                hold = max(1, (exit_ - entry).days)
+                capital_days += risk * hold
+        return capital_days / (self.initial_capital * total_days) if self.initial_capital > 0 else 0.0
+
+    @property
+    def cash_drag_adjusted_return(self) -> float:
+        """Total return + idle-cash T-bill yield adjustment."""
+        if not self.windows:
+            return self.total_return
+        first_date = self.windows[0].test_start
+        last_date = self.windows[-1].test_end
+        years = max(0.01, (last_date - first_date).days / 365.25)
+        idle_pct = max(0, 1 - self.capital_utilization)
+        return self.total_return + (0.05 * idle_pct * years)
+
+    @property
+    def raroc(self) -> float:
+        """Return on capital actually deployed."""
+        util = self.capital_utilization
+        return self.total_return / util if util > 0 else 0.0
+
     def summary(self) -> str:
         lines = [
             "=" * 60,
             "  WALK-FORWARD BACKTEST RESULTS",
             "=" * 60,
-            f"  Windows:          {len(self.windows)}",
-            f"  Total Trades:     {self.total_trades}",
-            f"  Total Return:     {self.total_return:.2%}",
-            f"  Win Rate:         {self.win_rate:.2%}",
-            f"  Sharpe Ratio:     {self.sharpe_ratio:.2f}",
-            f"  Max Drawdown:     {self.max_drawdown:.2%}",
-            f"  Profit Factor:    {self.profit_factor:.2f}",
-            f"  Consistency:      {self.consistency:.0%} windows profitable",
-            f"  Avg Window Return:{self.avg_window_return:.2%}",
+            f"  Windows:           {len(self.windows)}",
+            f"  Total Trades:      {self.total_trades}",
+            f"  Total Return:      {self.total_return:.2%}",
+            f"  Cash-Drag Adj Ret: {self.cash_drag_adjusted_return:.2%}  (idle cash @ 5%)",
+            "-" * 60,
+            "  RISK-ADJUSTED",
+            f"  Sharpe Ratio:      {self.sharpe_ratio:.2f}",
+            f"  Sortino Ratio:     {self.sortino_ratio:.2f}  (downside-only vol)",
+            f"  Max Drawdown:      {self.max_drawdown:.2%}",
+            "-" * 60,
+            "  TRADE QUALITY",
+            f"  Win Rate:          {self.win_rate:.2%}",
+            f"  Avg Win:           ${self.avg_win:,.2f}",
+            f"  Avg Loss:          ${self.avg_loss:,.2f}",
+            f"  Win/Loss Ratio:    {self.win_loss_ratio:.2f}  (>1 = winners bigger)",
+            f"  Expectancy/Trade:  ${self.expectancy:,.2f}",
+            f"  Best Trade:        ${self.best_trade:,.2f}",
+            f"  Worst Trade:       ${self.worst_trade:,.2f}",
+            f"  Profit Factor:     {self.profit_factor:.2f}",
+            "-" * 60,
+            "  CAPITAL EFFICIENCY",
+            f"  Utilization:       {self.capital_utilization:.1%}  (avg % deployed)",
+            f"  RAROC:             {self.raroc:.1%}  (return on deployed)",
+            "-" * 60,
+            "  CONSISTENCY",
+            f"  Profitable Windows:{self.consistency:.0%}",
+            f"  Avg Window Return: {self.avg_window_return:.2%}",
             "-" * 60,
         ]
 
