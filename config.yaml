@@ -4,10 +4,11 @@
 
 trading:
   mode: paper                          # paper | live
-  # Universe pared down based on 4-year backtest:
-  # KEPT: SPY/QQQ/IWM/DIA (indices, big winners), PLTR/AMZN/NVDA/AMD/GOOGL (positive)
-  # DROPPED: MSFT (-14%), SOFI (-137%), AAPL (-205%), META (-508%), TSLA (-513%)
-  universe: [SPY, QQQ, IWM, DIA, PLTR, AMZN, NVDA, AMD, GOOGL]
+  # Universe pared down based on 4-year + 1-year backtests:
+  # KEPT: SPY/QQQ/IWM/DIA (indices), NVDA/AMZN/AMD (range-bound mature)
+  # DROPPED 4yr: MSFT, SOFI, AAPL, META, TSLA (catastrophic losses)
+  # DROPPED 1yr: GOOGL (-66%), PLTR (-33%) - became momentum stocks, hostile to iron condors
+  universe: [SPY, QQQ, IWM, DIA, NVDA, AMZN, AMD]
   scan_interval_seconds: 300           # 5 minutes between scans
   max_daily_trades: 5
   trading_hours_only: true             # Only trade during RTH (9:30-16:00 ET)
