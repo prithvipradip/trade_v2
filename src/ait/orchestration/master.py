@@ -274,17 +274,22 @@ from ait.config.settings import Settings
 from ait.data.market_data import MarketDataService
 from ait.data.historical import HistoricalDataStore
 from ait.ml.ensemble import DirectionPredictor
+from ait.ml.range_predictor import RangePredictor
 from ait.ml.trainer import ModelTrainer
 import asyncio
 
 settings = Settings()
 predictor = DirectionPredictor(settings.ml)
+range_pred = RangePredictor(threshold_pct=0.05, horizon_days=30)
 market_data = MarketDataService(None, polygon_api_key=settings.api_keys.polygon_api_key)
 historical = HistoricalDataStore()
-trainer = ModelTrainer(settings.ml, predictor, market_data, historical)
+trainer = ModelTrainer(
+    settings.ml, predictor, market_data, historical,
+    range_predictor=range_pred,
+)
 
 async def train():
-    symbols = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA", "AMD", "AMZN", "META", "GOOGL"]
+    symbols = list(settings.trading.universe)
     print(f"[retrain] Training {len(symbols)} symbols...", flush=True)
     results = await trainer.train_all_symbols(symbols)
     for sym, acc in results.items():
