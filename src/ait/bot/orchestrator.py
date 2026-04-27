@@ -101,8 +101,18 @@ class TradingOrchestrator:
         # ML
         self._predictor = DirectionPredictor(settings.ml)
         self._regime_detector = RegimeDetector()
+
+        # Range predictor (Tier 1) — used for iron condor confidence
+        from ait.ml.range_predictor import RangePredictor
+        self._range_predictor = RangePredictor(
+            threshold_pct=0.05,  # ±5%
+            horizon_days=30,
+        )
+        self._range_predictor.load_models()  # silent if no model yet
+
         self._trainer = ModelTrainer(
             settings.ml, self._predictor, self._market_data, self._historical,
+            range_predictor=self._range_predictor,
         )
         self._meta_labeler = MetaLabeler(
             min_probability=settings.meta_label.min_probability,
@@ -788,6 +798,27 @@ class TradingOrchestrator:
                 s for s in signals
                 if adaptor.is_strategy_enabled(s.strategy_name)
             ]
+
+            # Boost iron-condor confidence with range prediction (Tier 1 model)
+            # P(stays in ±5% over 30 days) is what iron condors actually need
+            if self._range_predictor and self._range_predictor.is_trained:
+                range_pred = self._range_predictor.predict(
+                    hist, symbol=symbol,
+                    market_context=market_context,
+                    live_signals=live_signals,
+                )
+                if range_pred:
+                    log.info("range_prediction", symbol=symbol,
+                             p_in_range=f"{range_pred.probability_in_range:.3f}",
+                             threshold=range_pred.threshold_pct,
+                             horizon_days=range_pred.horizon_days)
+                    # Override confidence for iron condors with range probability
+                    for s in signals:
+                        if s.strategy_name in ("iron_condor", "short_strangle"):
+                            s.confidence = range_pred.probability_in_range
+                        elif s.strategy_name == "long_straddle":
+                            # Straddles want OUT-of-range — invert
+                            s.confidence = 1 - range_pred.probability_in_range
 
             # Re-rank signals using Thompson sampling (exploration/exploitation)
             if signals:

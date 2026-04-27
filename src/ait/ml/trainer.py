@@ -31,6 +31,7 @@ class ModelTrainer:
         predictor: DirectionPredictor,
         market_data: MarketDataService,
         historical_store: HistoricalDataStore,
+        range_predictor=None,
     ) -> None:
         self._config = config
         self._predictor = predictor
@@ -38,6 +39,7 @@ class ModelTrainer:
         self._store = historical_store
         self._last_train_date: date | None = None
         self._drift_detector = DriftDetector()
+        self._range_predictor = range_predictor
 
     @property
     def drift_detector(self) -> DriftDetector:
@@ -107,6 +109,18 @@ class ModelTrainer:
             )
             if accuracies:
                 results[symbol] = accuracies
+
+            # Also train the range predictor (Tier 1 model for iron condors)
+            if self._range_predictor is not None:
+                try:
+                    range_acc = self._range_predictor.train(
+                        df, symbol=symbol, market_context=market_context
+                    )
+                    if range_acc:
+                        log.info("range_training_complete", symbol=symbol,
+                                 accuracies=range_acc)
+                except Exception as e:
+                    log.warning("range_training_failed", symbol=symbol, error=str(e))
 
         self._last_train_date = date.today()
         self._drift_detector.acknowledge_retrain()
