@@ -270,7 +270,7 @@ def retrain_models():
             [sys.executable, "-u", "-c", """
 import sys
 sys.path.insert(0, 'src')
-from ait.config.settings import Settings
+from ait.config.settings import load_settings
 from ait.data.market_data import MarketDataService
 from ait.data.historical import HistoricalDataStore
 from ait.ml.ensemble import DirectionPredictor
@@ -278,7 +278,7 @@ from ait.ml.range_predictor import RangePredictor
 from ait.ml.trainer import ModelTrainer
 import asyncio
 
-settings = Settings()
+settings = load_settings('config.yaml')
 predictor = DirectionPredictor(settings.ml)
 range_pred = RangePredictor(threshold_pct=0.05, horizon_days=30)
 market_data = MarketDataService(None, polygon_api_key=settings.api_keys.polygon_api_key)
