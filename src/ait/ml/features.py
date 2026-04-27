@@ -29,6 +29,7 @@ class FeatureEngine:
         self,
         df: pd.DataFrame,
         market_context: dict[str, pd.DataFrame] | None = None,
+        live_signals: dict | None = None,
     ) -> pd.DataFrame:
         """Compute all features from OHLCV DataFrame.
 
@@ -75,6 +76,11 @@ class FeatureEngine:
 
         # --- Cross-Asset Features (VIX, relative strength) ---
         features = self._add_cross_asset(features, market_context)
+
+        # --- Live Signal Features (sentiment, options flow) ---
+        # During training, live_signals=None → neutral defaults so feature
+        # count stays consistent. At prediction time, real values are passed.
+        features = self._add_live_signals(features, live_signals)
 
         # --- Seasonality Features ---
         features = self._add_seasonality(features)
@@ -169,6 +175,10 @@ class FeatureEngine:
             "vix_zscore", "vix_term_spread",
             "rel_strength_5d", "rel_strength_20d", "rel_strength_60d",
             "spy_momentum_10d", "spy_rsi_14", "correlation_spy_20d",
+            # Live signals (sentiment + options flow)
+            "sentiment_composite", "sentiment_news", "sentiment_finbert",
+            "fear_greed", "put_call_ratio",
+            "flow_bias_strength", "flow_bullish", "flow_bearish",
             # Seasonality
             "day_of_week", "month_of_year",
         ]
@@ -543,6 +553,39 @@ class FeatureEngine:
             df["spy_momentum_10d"] = 0.0
             df["spy_rsi_14"] = 0.5
             df["correlation_spy_20d"] = 0.0
+
+        return df
+
+    def _add_live_signals(
+        self, df: pd.DataFrame, live_signals: dict | None
+    ) -> pd.DataFrame:
+        """Add sentiment and options-flow features.
+
+        Defaults to neutral (0.0) values during training. Real values
+        passed at prediction time via live_signals dict.
+
+        Expected live_signals keys (all optional):
+          sentiment_composite, sentiment_news, sentiment_finbert,
+          fear_greed, put_call_ratio, flow_bias_strength, flow_bullish,
+          flow_bearish
+        """
+        defaults = {
+            "sentiment_composite": 0.0,
+            "sentiment_news": 0.0,
+            "sentiment_finbert": 0.0,
+            "fear_greed": 0.0,
+            "put_call_ratio": 1.0,
+            "flow_bias_strength": 0.0,
+            "flow_bullish": 0.0,
+            "flow_bearish": 0.0,
+        }
+
+        if live_signals:
+            for key, default in defaults.items():
+                df[key] = float(live_signals.get(key, default))
+        else:
+            for key, default in defaults.items():
+                df[key] = default
 
         return df
 

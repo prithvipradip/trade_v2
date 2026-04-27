@@ -136,6 +136,8 @@ class WebServiceManager:
     def __init__(self):
         self._dashboard_proc: subprocess.Popen | None = None
         self._weblog_proc: subprocess.Popen | None = None
+        self._dashboard_log = None
+        self._weblog_log = None
 
     def start(self):
         """Start both web services."""
@@ -146,27 +148,31 @@ class WebServiceManager:
         if self._dashboard_proc and self._dashboard_proc.poll() is None:
             return
         _log("info", "dashboard_starting", port=8501)
+        log_path = LOGS_DIR / "dashboard.log"
+        self._dashboard_log = open(log_path, "a")
         self._dashboard_proc = subprocess.Popen(
             [sys.executable, "-m", "streamlit", "run",
              str(ROOT / "src" / "ait" / "dashboard" / "app.py"),
              "--server.port=8501", "--server.headless=true"],
             cwd=str(ROOT),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=self._dashboard_log,
+            stderr=subprocess.STDOUT,
         )
-        _log("info", "dashboard_started", pid=self._dashboard_proc.pid)
+        _log("info", "dashboard_started", pid=self._dashboard_proc.pid, log=str(log_path))
 
     def _start_weblog(self):
         if self._weblog_proc and self._weblog_proc.poll() is None:
             return
         _log("info", "weblog_starting", port=8502)
+        log_path = LOGS_DIR / "weblog.log"
+        self._weblog_log = open(log_path, "a")
         self._weblog_proc = subprocess.Popen(
             [sys.executable, str(ROOT / "web_logs.py")],
             cwd=str(ROOT),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=self._weblog_log,
+            stderr=subprocess.STDOUT,
         )
-        _log("info", "weblog_started", pid=self._weblog_proc.pid)
+        _log("info", "weblog_started", pid=self._weblog_proc.pid, log=str(log_path))
 
     def health_check(self):
         """Restart web services if they crashed."""
@@ -186,8 +192,16 @@ class WebServiceManager:
                     proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+        for handle in (self._dashboard_log, self._weblog_log):
+            if handle:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
         self._dashboard_proc = None
         self._weblog_proc = None
+        self._dashboard_log = None
+        self._weblog_log = None
         _log("info", "web_services_stopped")
 
 

@@ -24,6 +24,7 @@ from ait.broker.orders import OrderBuilder
 from ait.config.settings import Settings
 from ait.data.earnings import EarningsCalendar
 from ait.data.economic_calendar import EconomicCalendar
+from ait.data.edgar_filings import EDGARMonitor
 from ait.data.historical import HistoricalDataStore
 from ait.data.market_data import MarketDataService
 from ait.data.options_chain import OptionsChainService
@@ -116,6 +117,10 @@ class TradingOrchestrator:
         # Calendars — needed by portfolio for event-driven exits
         self._earnings = EarningsCalendar()
         self._economic_cal = EconomicCalendar()
+
+        # SEC EDGAR 8-K monitor — flatten positions on material events
+        self._edgar = EDGARMonitor(tracked_symbols=settings.trading.universe)
+        self._edgar_check_count = 0
 
         # Trading
         self._strategy_selector = StrategySelector(settings.options)
@@ -317,8 +322,41 @@ class TradingOrchestrator:
 
             # Also check pending order fills
             await self._executor.check_fills()
+
+            # SEC 8-K material-event check every ~5 min (every 10th fast cycle)
+            self._edgar_check_count += 1
+            if self._edgar_check_count >= 10:
+                self._edgar_check_count = 0
+                await self._check_material_events()
         except Exception as e:
             log.debug("fast_monitor_error", error=str(e))
+
+    async def _check_material_events(self) -> None:
+        """Check for new SEC 8-K filings; flatten any held positions on the symbol."""
+        try:
+            # Only check symbols we currently hold positions in
+            open_trades = self._state.get_open_trades()
+            held_symbols = list({t.symbol for t in open_trades if t.symbol})
+            if not held_symbols:
+                return
+
+            new_filings = await self._edgar.check_for_material_events(held_symbols)
+            for filing in new_filings:
+                log.warning(
+                    "material_event_flatten",
+                    symbol=filing.symbol,
+                    accession=filing.accession_number,
+                )
+                await self._send_notification(
+                    f"⚠️ SEC 8-K filed for {filing.symbol} — flattening positions"
+                )
+                # Force-close all positions in that symbol
+                positions = await self._portfolio.check_positions()
+                for pos in positions:
+                    if pos.symbol == filing.symbol:
+                        await self._execute_exit(pos)
+        except Exception as e:
+            log.debug("material_event_check_failed", error=str(e))
 
     async def _trading_loop(self) -> None:
         """Main trading loop during market hours.
@@ -545,9 +583,19 @@ class TradingOrchestrator:
             if not self._data_quality.validate_historical(symbol, prices):
                 return
 
-        # ML prediction (with cross-asset context)
+        # Build live-signals dict for ML model (sentiment + options flow)
+        live_signals = {}
+        if sentiment:
+            live_signals["sentiment_composite"] = float(getattr(sentiment, "composite_score", 0))
+            live_signals["sentiment_news"] = float(getattr(sentiment, "news_score", 0) or 0)
+            live_signals["sentiment_finbert"] = float(getattr(sentiment, "finbert_score", 0) or 0)
+            live_signals["fear_greed"] = float(getattr(sentiment, "fear_greed_score", 0) or 0)
+
+        # ML prediction (with cross-asset context + live signals)
         prediction = self._predictor.predict(
-            hist, symbol=symbol, market_context=market_context
+            hist, symbol=symbol,
+            market_context=market_context,
+            live_signals=live_signals,
         )
         if prediction is None:
             log.warning("ml_prediction_none", symbol=symbol)

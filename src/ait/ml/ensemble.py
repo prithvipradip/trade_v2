@@ -80,6 +80,7 @@ class DirectionPredictor:
         df: pd.DataFrame,
         symbol: str = "",
         market_context: dict | None = None,
+        live_signals: dict | None = None,
     ) -> Prediction | None:
         """Predict direction for the latest data point.
 
@@ -105,7 +106,9 @@ class DirectionPredictor:
             log.warning("prediction_skipped", reason="model not trained", symbol=symbol)
             return None
 
-        features = self._feature_engine.compute(df, market_context=market_context)
+        features = self._feature_engine.compute(
+            df, market_context=market_context, live_signals=live_signals
+        )
         if features.empty:
             log.warning("prediction_skipped", reason="features_empty",
                         input_rows=len(df))
