@@ -38,7 +38,9 @@ class IronCondor(Strategy):
         # Iron condors work in ANY direction — they profit from theta decay
         # regardless of whether the market goes up, down, or sideways.
         # Only skip in extreme low IV where premium isn't worth the risk.
-        if iv_rank < 15:
+        # IV rank < 30 = premium too cheap, bad risk:reward for defined-risk
+        # Research: IV rank > 50 doubles win rate. 30 is the practical floor.
+        if iv_rank < 30:
             return []
 
         liquid_calls = self._filter_liquid(chain.calls)

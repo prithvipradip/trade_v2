@@ -800,7 +800,10 @@ class TradingOrchestrator:
             ]
 
             # Boost iron-condor confidence with range prediction (Tier 1 model)
-            # P(stays in ±5% over 30 days) is what iron condors actually need
+            # P(stays in ±5% over 30 days) is what iron condors actually need.
+            # Range probability has a different scale than directional confidence —
+            # binary baseline ~50%, so threshold 0.55 (vs 0.65 for direction).
+            RANGE_MIN_CONFIDENCE = 0.55
             if self._range_predictor and self._range_predictor.is_trained:
                 range_pred = self._range_predictor.predict(
                     hist, symbol=symbol,
@@ -819,6 +822,14 @@ class TradingOrchestrator:
                         elif s.strategy_name == "long_straddle":
                             # Straddles want OUT-of-range — invert
                             s.confidence = 1 - range_pred.probability_in_range
+
+                    # Apply range-specific threshold — drop signals below floor
+                    signals = [
+                        s for s in signals
+                        if s.strategy_name not in ("iron_condor", "short_strangle",
+                                                    "long_straddle")
+                        or s.confidence >= RANGE_MIN_CONFIDENCE
+                    ]
 
             # Re-rank signals using Thompson sampling (exploration/exploitation)
             if signals:
