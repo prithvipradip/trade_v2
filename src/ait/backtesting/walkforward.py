@@ -50,6 +50,7 @@ class WalkForwardConfig:
     profit_target_pct: float = 0.50         # Take profits at 50% (don't be greedy)
     max_hold_days: int = 21                 # 3 weeks max (avoid deep theta decay)
     min_confidence: float = 0.55
+    range_min_confidence: float = 0.55     # threshold for range model on iron condors
     trailing_stop_enabled: bool = True
     trailing_stop_pct: float = 0.25
     breakeven_trigger_pct: float = 0.30
@@ -432,6 +433,7 @@ class WalkForwardBacktester:
 
                 # Train ML model on training window for this symbol
                 predictor = self._train_window_model(train_df, symbol, i + 1)
+                range_predictor = self._train_window_range_model(train_df, symbol, i + 1)
                 if predictor and predictor.is_trained:
                     model_accuracy = max(
                         model_accuracy,
@@ -468,6 +470,10 @@ class WalkForwardBacktester:
                     trailing_stop_pct=self._config.trailing_stop_pct,
                     breakeven_trigger_pct=self._config.breakeven_trigger_pct,
                     predictor=predictor,
+                    range_predictor=range_predictor,
+                    range_min_confidence=getattr(
+                        self._config, "range_min_confidence", 0.55
+                    ),
                 )
                 result = bt.run()
 
@@ -532,9 +538,28 @@ class WalkForwardBacktester:
 
         return result
 
+    def _train_window_range_model(
+        self, train_df: pd.DataFrame, symbol: str, window_id: int
+    ):
+        """Train range predictor on this window's training data."""
+        try:
+            from ait.ml.range_predictor import RangePredictor
+            rp = RangePredictor(threshold_pct=0.05, horizon_days=30)
+            accs = rp.train(train_df, symbol=symbol)
+            if accs and rp.is_trained:
+                avg = sum(accs.values()) / len(accs)
+                log.info("window_range_model_trained",
+                         window=window_id, symbol=symbol,
+                         accuracy=f"{avg:.3f}")
+                return rp
+        except Exception as e:
+            log.debug("range_model_train_failed", window=window_id,
+                      symbol=symbol, error=str(e))
+        return None
+
     def _train_window_model(
         self, train_df: pd.DataFrame, symbol: str, window_id: int
-    ) -> DirectionPredictor | None:
+    ) -> "DirectionPredictor | None":
         """Train ML model on a training window's data.
 
         Returns a trained DirectionPredictor, or None if training fails.

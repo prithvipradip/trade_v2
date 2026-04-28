@@ -54,6 +54,8 @@ class Backtester:
         trailing_stop_pct: float = 0.25,
         breakeven_trigger_pct: float = 0.30,
         predictor: Any = None,
+        range_predictor: Any = None,
+        range_min_confidence: float = 0.55,
         context_bars: int = 0,
     ) -> None:
         self._data = self._prepare_data(data)
@@ -70,6 +72,8 @@ class Backtester:
         self._trailing_stop_pct = trailing_stop_pct
         self._breakeven_trigger_pct = breakeven_trigger_pct
         self._context_bars = context_bars
+        self._range_predictor = range_predictor
+        self._range_min_confidence = range_min_confidence
 
         self._predictor = predictor if predictor is not None else self._load_predictor()
 
@@ -146,6 +150,17 @@ class Backtester:
             strategy = self._select_strategy(direction, hist, confidence)
             if strategy is None:
                 continue
+
+            # Range model gate: for iron condors / strangles, replace confidence
+            # with P(stays in range). Skip if below range threshold.
+            if strategy in ("iron_condor", "short_strangle") and self._range_predictor is not None:
+                try:
+                    rp = self._range_predictor.predict(hist)
+                    if rp is None or rp.probability_in_range < self._range_min_confidence:
+                        continue  # bad range setup → skip
+                    confidence = rp.probability_in_range
+                except Exception:
+                    pass
 
             # --- 3. Build the trade ---
             pos = self._build_position(strategy, direction, row, hist, today_date, capital)

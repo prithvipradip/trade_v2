@@ -44,6 +44,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gap-days", type=int, default=5, help="Purge gap days")
     p.add_argument("--capital", type=float, default=50_000.0, help="Initial capital")
     p.add_argument("--min-confidence", type=float, default=0.65, help="Min ML confidence")
+    p.add_argument("--range-confidence", type=float, default=0.55,
+                   help="Min P(in_range) for iron condors (range model)")
+    p.add_argument("--iv-floor", type=float, default=30.0,
+                   help="Min IV rank for iron condors")
     p.add_argument("--trailing-stop", action="store_true", default=True, help="Enable trailing stops")
     p.add_argument("--compare-exits", action="store_true", help="Compare fixed vs trailing stops")
     return p.parse_args()
@@ -60,6 +64,10 @@ async def run_backtest(args: argparse.Namespace) -> None:
     print(f"  Trailing:   {'ON' if args.trailing_stop else 'OFF'}")
     print("=" * 60)
 
+    # Set IV floor for iron condor strategy (read by iron_condor.py via env)
+    import os
+    os.environ["AIT_IRON_CONDOR_IV_FLOOR"] = str(args.iv_floor)
+
     cfg = WalkForwardConfig(
         train_days=args.train_days,
         test_days=args.test_days,
@@ -67,6 +75,7 @@ async def run_backtest(args: argparse.Namespace) -> None:
         gap_days=args.gap_days,
         initial_capital=args.capital,
         min_confidence=args.min_confidence,
+        range_min_confidence=args.range_confidence,
         trailing_stop_enabled=args.trailing_stop,
     )
 
