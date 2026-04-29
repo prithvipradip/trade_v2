@@ -81,11 +81,49 @@ The model currently predicts 5-day directional outcome (35-42% accuracy on 3-cla
 - ❌ **Truth Social** — Only relevant during specific political events. Not worth maintaining a scraper.
 - ❌ **Stocktwits** — Same issues as Twitter, smaller scale.
 - ❌ **Bloomberg Terminal** — $24k/yr. Pro tool — not worth it for a retail bot.
-- ❌ **More technical indicator features** — Already have 60. Adding more degrades, not improves accuracy.
+- ❌ **More technical indicator features** — Already have 68. Adding more degrades, not improves accuracy.
 - ❌ **Reinforcement learning** — Sample-efficiency too poor for trading data. Backtest-first won't transfer.
+- ❌ **Survivorship-bias correction** — Only matters if expanding to small-cap/speculative names. Current 7-symbol universe is all liquid ETFs/megacaps that have not been delisted.
+
+---
+
+## Gold-Standard Engineering Wishlist
+
+Things that would push us from silver/bronze to gold across ML and engineering practices. Roughly ordered by ROI.
+
+### 🟢 Quick Wins (1-3 hours each)
+
+- [ ] **Pin random seeds** — Set `random_state=42` in XGBoost/LightGBM/StandardScaler + `np.random.seed(42)` in feature engine. Makes runs reproducible. Reproducibility 🥉 → 🥇.
+- [ ] **Feature importance tracking** — Log `model.feature_importances_` per fold per symbol. Reveals dead-weight features. Feature importance tracking 🥉 → 🥇.
+- [ ] **Bid-ask aware slippage in backtest** — Replace flat 1% with bid-ask-spread × contracts model. Uses existing IV data. Slippage 🥈 → 🥇.
+
+### 🟡 Medium Investment (4-8 hours each)
+
+- [ ] **Hyperparameter tuning (Optuna)** — Bayesian search per window for `max_depth`, `learning_rate`, `n_estimators`, `subsample`. May push accuracy 3-5%. RISK: overfitting if nested CV not done correctly. Hyperparameter tuning 🥉 → 🥇.
+- [ ] **Model calibration** — Apply isotonic regression / `CalibratedClassifierCV`. Makes "0.65 confidence threshold" actually mean 65% probability. Critical now that we threshold on probability. Model calibration 🥉 → 🥇.
+- [ ] **Per-VIX-regime models** — 3 models (low/mid/high VIX) per symbol. Routes prediction to regime-specific model. Specializes per market dynamics. Regime detection 🥈 → 🥇.
+
+### 🔴 Larger Investment (1-2 days each)
+
+- [ ] **True holdout set** — Reserve final 6 months as never-touched. Walk-forward on first 4.5y. Final OOS evaluation on holdout. Out-of-sample evaluation 🥈 → 🥇.
+- [ ] **Statistical drift detection** — KS tests on input distributions, PSI scores. Detects concept drift before accuracy degrades. Drift detection 🥈 → 🥇.
+- [ ] **Real options chain history** — $79/mo Polygon options addon. Replace Black-Scholes simulation with actual bid/ask. Single biggest backtest realism upgrade. Backtest realism 🥉 → 🥇. (Already in Tier 2 above.)
+
+### Engineering practices (less urgent but tracked)
+
+- [ ] **CI/CD pipeline** — Auto-run tests on PR, pre-commit hooks. CI/CD 🥉 → 🥇.
+- [ ] **Test coverage > 80%** — Currently sparse. Add unit tests for risk manager, executor, range predictor. Test coverage 🥉 → 🥇.
+- [ ] **Pinned dependency lockfile** — `pip-compile` to freeze exact versions. Prevents "works on my machine" drift. Dependency management 🥈 → 🥇.
+- [ ] **Secrets vault** — Move from `.env` plaintext to AWS Secrets Manager / 1Password CLI. Secrets management 🥉 → 🥇.
+- [ ] **SLO-based monitoring** — Define p99 latency / uptime SLOs, alert on breach. Monitoring 🥈 → 🥇.
+- [ ] **State recovery improvements** — Idempotent retries on every external call (IBKR, Polygon, Telegram). Idempotency 🥈 → 🥇.
+
+### What gold-standard looks like at the end
+
+When all of the above ship, AIT v2 becomes a **research-reproducible, production-grade quant platform** — same caliber as professional firms minus the multi-million-dollar data feeds (Bloomberg/CRSP/etc.).
 
 ---
 
 ## Last Updated
 
-2026-04-26
+2026-04-28
