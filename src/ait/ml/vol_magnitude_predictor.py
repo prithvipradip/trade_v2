@@ -198,6 +198,7 @@ class VolMagnitudePredictor:
     def _train_xgb(self, X: np.ndarray, y: np.ndarray) -> float:
         try:
             from xgboost import XGBClassifier
+            from sklearn.metrics import balanced_accuracy_score
             model = XGBClassifier(
                 n_estimators=200, max_depth=5, learning_rate=0.05,
                 subsample=0.8, colsample_bytree=0.8,
@@ -214,10 +215,11 @@ class VolMagnitudePredictor:
                     fold_scaler.transform(X[val_idx]), columns=self._feature_names,
                 )
                 model.fit(X_tr, y[tr_idx])
-                scores.append(model.score(X_val, y[val_idx]))
+                preds = model.predict(X_val)
+                scores.append(balanced_accuracy_score(y[val_idx], preds))
             self._models["xgboost"] = model
             avg = float(np.mean(scores)) if scores else 0.0
-            log.info("vol_mag_xgb_trained", cv_accuracy=f"{avg:.3f}", folds=len(scores))
+            log.info("vol_mag_xgb_trained", cv_balanced_acc=f"{avg:.3f}", folds=len(scores))
             return avg
         except ImportError:
             return 0.0
@@ -225,6 +227,7 @@ class VolMagnitudePredictor:
     def _train_lgb(self, X: np.ndarray, y: np.ndarray) -> float:
         try:
             from lightgbm import LGBMClassifier
+            from sklearn.metrics import balanced_accuracy_score
             model = LGBMClassifier(
                 n_estimators=200, max_depth=5, learning_rate=0.05,
                 subsample=0.8, colsample_bytree=0.8,
@@ -242,10 +245,11 @@ class VolMagnitudePredictor:
                     fold_scaler.transform(X[val_idx]), columns=self._feature_names,
                 )
                 model.fit(X_tr, y[tr_idx])
-                scores.append(model.score(X_val, y[val_idx]))
+                preds = model.predict(X_val)
+                scores.append(balanced_accuracy_score(y[val_idx], preds))
             self._models["lightgbm"] = model
             avg = float(np.mean(scores)) if scores else 0.0
-            log.info("vol_mag_lgb_trained", cv_accuracy=f"{avg:.3f}", folds=len(scores))
+            log.info("vol_mag_lgb_trained", cv_balanced_acc=f"{avg:.3f}", folds=len(scores))
             return avg
         except ImportError:
             return 0.0
@@ -273,18 +277,15 @@ class VolMagnitudePredictor:
         else:
             return None
 
-        # Edge-over-baseline check — skip predictions when model has no skill
+        # Edge-over-baseline check using BALANCED ACCURACY (baselines at 0.50)
         if sym_data is not None:
             cv_scores = sym_data.get("cv_scores", {})
-            base_rate = sym_data.get("big_move_rate", 0.5)
             if cv_scores:
-                avg_acc = sum(cv_scores.values()) / len(cv_scores)
-                naive_baseline = max(base_rate, 1 - base_rate)
-                edge = avg_acc - naive_baseline
+                avg_balanced_acc = sum(cv_scores.values()) / len(cv_scores)
+                edge = avg_balanced_acc - 0.50
                 if edge < self.MIN_EDGE_OVER_BASELINE:
                     log.debug("vol_mag_no_edge", symbol=symbol,
-                              accuracy=f"{avg_acc:.2f}",
-                              baseline=f"{naive_baseline:.2f}",
+                              balanced_accuracy=f"{avg_balanced_acc:.2f}",
                               edge=f"{edge:+.2f}")
                     return None
 
