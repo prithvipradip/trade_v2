@@ -156,11 +156,20 @@ class RangePredictor:
 
             if symbol:
                 import copy
+                importances = {}
+                for name, model in self._models.items():
+                    if hasattr(model, "feature_importances_"):
+                        try:
+                            arr = model.feature_importances_
+                            importances[name] = dict(zip(self._feature_names, arr.tolist()))
+                        except Exception:
+                            pass
                 self._symbol_models[symbol] = {
                     "models": copy.deepcopy(self._models),
                     "scaler": copy.deepcopy(self._scaler),
                     "feature_names": list(self._feature_names),
                     "cv_scores": dict(accuracies),
+                    "feature_importances": importances,
                     "in_range_rate": float(positive_rate),
                     "version": self._model_version,
                 }

@@ -1121,6 +1121,137 @@ def _run_walkforward(symbols, strategies, capital, min_conf) -> dict:
     }
 
 
+def _tab_feature_importance() -> None:
+    """Show which ML features are pulling weight vs dead-weight.
+
+    Loads saved models and reads model.feature_importances_ per symbol.
+    Reveals dead-weight features that could be cut.
+    """
+    import streamlit as st
+    import pickle
+    import pathlib
+
+    st.subheader("🧮 Feature Importance — what's helping the model?")
+    st.caption(
+        "Aggregated across all symbols and both ML models (XGBoost + LightGBM). "
+        "Higher = more predictive. Features with importance ~0 are dead weight "
+        "and could be removed without hurting accuracy."
+    )
+
+    models_dir = pathlib.Path(__file__).resolve().parents[3] / "models"
+    model_files = {
+        "Direction (3-class)": "ensemble.pkl",
+        "Range (iron condor)": "range.pkl",
+        "Vol Magnitude (straddle)": "vol_magnitude.pkl",
+    }
+
+    model_choice = st.selectbox(
+        "Which model?", list(model_files.keys()), index=1,
+    )
+    pkl_path = models_dir / model_files[model_choice]
+
+    if not pkl_path.exists():
+        st.warning(f"Model file not found: {pkl_path.name}. Run a retrain first.")
+        return
+
+    try:
+        with open(pkl_path, "rb") as f:
+            data = pickle.load(f)
+    except Exception as e:
+        st.error(f"Failed to load model: {e}")
+        return
+
+    sym_models = data.get("symbol_models", {})
+    if not sym_models:
+        st.info("No per-symbol models found. Retrain to populate.")
+        return
+
+    # Aggregate feature importance across symbols and sub-models (xgb + lgbm)
+    feature_totals = {}
+    feature_counts = {}
+    per_symbol_data = []
+    for symbol, sym_data in sym_models.items():
+        importances = sym_data.get("feature_importances", {})
+        if not importances:
+            continue
+        # Average across xgb + lgbm for this symbol
+        symbol_avg = {}
+        for model_name, imps in importances.items():
+            for feat, val in imps.items():
+                symbol_avg.setdefault(feat, []).append(val)
+        for feat, vals in symbol_avg.items():
+            avg = sum(vals) / len(vals) if vals else 0
+            feature_totals[feat] = feature_totals.get(feat, 0) + avg
+            feature_counts[feat] = feature_counts.get(feat, 0) + 1
+            per_symbol_data.append({"symbol": symbol, "feature": feat, "importance": avg})
+
+    if not feature_totals:
+        st.info(
+            "No feature_importances saved on the loaded models yet. "
+            "Re-run training (`python run_orchestrator.py --retrain`) — "
+            "the schema was added recently."
+        )
+        return
+
+    # Mean importance across symbols
+    feature_avg = {
+        feat: total / feature_counts[feat]
+        for feat, total in feature_totals.items()
+    }
+
+    importance_df = pd.DataFrame(
+        sorted(feature_avg.items(), key=lambda x: x[1], reverse=True),
+        columns=["feature", "avg_importance"],
+    )
+    importance_df["avg_importance"] = importance_df["avg_importance"].round(4)
+
+    col_l, col_r = st.columns(2)
+
+    with col_l:
+        st.write(f"**Top 15 features ({model_choice})**")
+        st.dataframe(importance_df.head(15), hide_index=True, use_container_width=True)
+
+    with col_r:
+        st.write(f"**Bottom 15 features (candidates to drop)**")
+        st.dataframe(
+            importance_df.tail(15).iloc[::-1],
+            hide_index=True, use_container_width=True,
+        )
+
+    st.divider()
+
+    # Per-symbol heatmap of top 20 features
+    st.write(f"**Per-symbol importance — top 20 features**")
+    if per_symbol_data:
+        per_df = pd.DataFrame(per_symbol_data)
+        top_20 = importance_df.head(20)["feature"].tolist()
+        per_df = per_df[per_df["feature"].isin(top_20)]
+        pivoted = per_df.pivot(index="feature", columns="symbol", values="importance")
+        pivoted = pivoted.reindex(top_20)
+        st.dataframe(pivoted.round(3), use_container_width=True)
+
+    st.divider()
+
+    # Action recommendations
+    dead_weight = importance_df[importance_df["avg_importance"] < 0.005]
+    st.write(f"**Action items**")
+    if len(dead_weight) > 0:
+        st.warning(
+            f"⚠️ {len(dead_weight)} features have <0.5% average importance "
+            f"across all symbols. Consider removing to reduce overfitting risk:"
+        )
+        st.write(", ".join(dead_weight["feature"].tolist()))
+    else:
+        st.success("✅ All features pulling weight (no dead weight detected).")
+
+    # Summary stats
+    st.caption(
+        f"Total features: {len(importance_df)}  ·  "
+        f"Symbols: {len(sym_models)}  ·  "
+        f"Model version: {data.get('version', 'unknown')}"
+    )
+
+
 def _tab_backtest() -> None:
     import streamlit as st
 
@@ -1296,10 +1427,12 @@ def main() -> None:
     end_date = st.sidebar.date_input("End date", value=date.today())
 
     # --- Tabs ---
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    tabs = st.tabs(
         ["Portfolio Overview", "Trade History", "Analytics",
-         "Trade Intelligence", "Self-Learning", "System Health", "Backtest"]
+         "Trade Intelligence", "Self-Learning", "System Health",
+         "Feature Importance", "Backtest"]
     )
+    tab1, tab2, tab3, tab4, tab5, tab6, tab_fi, tab7 = tabs
 
     with tab1:
         _tab_portfolio_overview(conn)
@@ -1318,6 +1451,9 @@ def main() -> None:
 
     with tab6:
         _tab_system_health(conn)
+
+    with tab_fi:
+        _tab_feature_importance()
 
     with tab7:
         _tab_backtest()
