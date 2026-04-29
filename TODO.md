@@ -12,6 +12,22 @@ Long-term improvements ranked by impact. Items in `[ACTIVE]` are being worked on
 
 ---
 
+## Event-Driven Strategies (left on the table)
+
+Currently the bot auto-flattens before FOMC/CPI/NFP, missing opportunities to profit from event-driven volatility. We're structurally short-vol; events are long-vol setups.
+
+- [ ] **FOMC-aware long straddle** — Enter long straddle 1 day before FOMC/CPI/NFP, exit within 30 min after announcement. Profits from IV expansion + directional move.
+- [ ] **Selective flatten** — Instead of force-closing all short-premium 1 day pre-event, only flatten positions where delta > 0.30 (near-the-money). Hold far-OTM positions through event for IV-crush profit.
+- [ ] **Earnings IV-crush capture** — Enter calendar spread or short straddle 1 day before earnings, close 1 hour after. Profits from post-earnings IV collapse.
+- [ ] **VIX expansion plays** — Buy VIX calls when VIX < 15 (cheap insurance / volatility long).
+
+These are higher-skill plays. Implementing them properly requires:
+- Event date awareness (have it: economic_calendar + earnings_calendar)
+- Pre/post-event IV tracking (don't have)
+- Faster execution loop near events (currently 30s, may need 5s)
+
+---
+
 ## Tier 1 — Change What We Predict (HIGHEST IMPACT)
 
 The model currently predicts 5-day directional outcome (35-42% accuracy on 3-class). Iron condors don't need direction — they need range. Switching the prediction target is higher-impact than any feature.
@@ -126,4 +142,4 @@ When all of the above ship, AIT v2 becomes a **research-reproducible, production
 
 ## Last Updated
 
-2026-04-28
+2026-04-29
