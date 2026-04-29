@@ -525,9 +525,14 @@ class TradingOrchestrator:
             return
 
         # 7c. Skip trading on/before major macro events (FOMC, CPI, NFP)
-        if self._economic_cal.should_skip_trading():
-            log.info("economic_event_skip", events=str(self._economic_cal.get_upcoming_events(days=2)))
-            return
+        # TEMPORARILY DISABLED — env var AIT_SKIP_MACRO_EVENTS=0 bypasses this
+        # to gather more paper trade data. Re-enable once we have 30+ trades.
+        import os
+        if os.environ.get("AIT_SKIP_MACRO_EVENTS", "0") == "1":
+            if self._economic_cal.should_skip_trading():
+                log.info("economic_event_skip",
+                         events=str(self._economic_cal.get_upcoming_events(days=2)))
+                return
 
         # 8. Process queued signals first (entry timing optimization)
         await self._process_signal_queue()

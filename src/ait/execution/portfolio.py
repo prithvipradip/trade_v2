@@ -226,10 +226,15 @@ class PortfolioManager:
                 pass
 
         # 3d. Macro event flatten — close short-premium positions 1 day before
-        # FOMC/CPI/NFP to avoid vol expansion
-        if not should_exit and self._economic_cal and trade.strategy in (
-            "iron_condor", "short_strangle", "cash_secured_put", "covered_call",
-        ):
+        # FOMC/CPI/NFP to avoid vol expansion. DISABLED for data-collection
+        # window — set AIT_SKIP_MACRO_EVENTS=1 to re-enable.
+        import os
+        if (os.environ.get("AIT_SKIP_MACRO_EVENTS", "0") == "1"
+                and not should_exit and self._economic_cal
+                and trade.strategy in (
+                    "iron_condor", "short_strangle",
+                    "cash_secured_put", "covered_call",
+                )):
             try:
                 days_to_event = self._economic_cal.days_until_next_event()
                 if days_to_event is not None and days_to_event <= 1:
