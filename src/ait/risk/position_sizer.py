@@ -42,6 +42,7 @@ class PositionSizer:
         "iron_condor": 0.4,      # Defined risk, both sides
         "long_straddle": 1.2,    # Double premium
         "short_strangle": 0.8,   # Undefined risk, margin required
+        "calendar_spread": 0.7,  # Defined risk (debit), 2 expiries
     }
 
     def __init__(self, position_config: PositionConfig, risk_config: RiskConfig) -> None:

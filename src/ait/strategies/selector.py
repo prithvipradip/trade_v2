@@ -11,6 +11,7 @@ import pandas as pd
 from ait.config.settings import OptionsConfig
 from ait.data.options_chain import OptionsChain
 from ait.strategies.base import Signal, SignalDirection, Strategy
+from ait.strategies.calendar import CalendarSpread
 from ait.strategies.covered import CashSecuredPut, CoveredCall
 from ait.strategies.iron_condor import IronCondor
 from ait.strategies.long_options import LongCall, LongPut
@@ -40,16 +41,47 @@ class StrategySelector:
     def __init__(self, config: OptionsConfig) -> None:
         self._config = config
         self._strategies: list[Strategy] = []
+        self._calendar = None  # multi-expiry strategy, separate path
 
         for name in config.strategies:
+            if name == "calendar_spread":
+                self._calendar = CalendarSpread()
+                continue
             cls = STRATEGY_MAP.get(name)
             if cls:
                 self._strategies.append(cls())
             else:
                 log.warning("unknown_strategy", name=name)
 
-        log.info("strategies_loaded", count=len(self._strategies),
-                 names=[s.name for s in self._strategies])
+        names = [s.name for s in self._strategies]
+        if self._calendar:
+            names.append(self._calendar.name)
+        log.info("strategies_loaded",
+                 count=len(self._strategies) + (1 if self._calendar else 0),
+                 names=names)
+
+    def generate_calendar_signals(
+        self,
+        symbol: str,
+        chains: list[OptionsChain],
+        market_direction: SignalDirection,
+        confidence: float,
+        iv_rank: float,
+    ) -> list[Signal]:
+        """Calendar spreads need 2+ expiry chains, separate code path."""
+        if self._calendar is None:
+            return []
+        try:
+            return self._calendar.generate_signals(
+                symbol=symbol,
+                chains=chains,
+                market_direction=market_direction,
+                confidence=confidence,
+                iv_rank=iv_rank,
+            )
+        except Exception as e:
+            log.warning("calendar_signal_error", symbol=symbol, error=str(e))
+            return []
 
     def generate_all_signals(
         self,

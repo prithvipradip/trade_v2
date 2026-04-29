@@ -779,6 +779,16 @@ class TradingOrchestrator:
                                  boost=flow.bias_strength * 0.1)
                 break  # Only analyze first chain for flow
 
+        # Calendar spreads need multiple expiry chains — generate once per symbol.
+        # Best in LOW IV (cheap premium to buy that may rise).
+        calendar_signals = self._strategy_selector.generate_calendar_signals(
+            symbol=symbol,
+            chains=filtered_chains,
+            market_direction=direction,
+            confidence=final_confidence,
+            iv_rank=iv_rank,
+        )
+
         # Generate signals across all enabled strategies (learning may have disabled some)
         for chain in filtered_chains:
             if not chain.calls and not chain.puts:
@@ -792,6 +802,11 @@ class TradingOrchestrator:
                 iv_rank=iv_rank,
                 historical_data=hist,
             )
+
+            # Inject calendar signals on the FIRST chain iteration only
+            if calendar_signals:
+                signals = list(signals) + calendar_signals
+                calendar_signals = []  # consume so we don't add twice
 
             # Filter out signals from disabled strategies
             signals = [

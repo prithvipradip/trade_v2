@@ -46,6 +46,7 @@ options:
     - iron_condor
     - long_straddle
     - short_strangle
+    - calendar_spread     # Low-IV complement to iron condor (active when IV rank < 50)
 
 ml:
   ensemble_weights:
