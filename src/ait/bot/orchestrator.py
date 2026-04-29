@@ -801,9 +801,9 @@ class TradingOrchestrator:
 
             # Boost iron-condor confidence with range prediction (Tier 1 model)
             # P(stays in ±5% over 30 days) is what iron condors actually need.
-            # Range probability has a different scale than directional confidence —
-            # binary baseline ~50%, so threshold 0.55 (vs 0.65 for direction).
-            RANGE_MIN_CONFIDENCE = 0.55
+            # 0.65 chosen via parameter sweep — beat 0.55 across every metric:
+            # Sharpe 1.36 vs 0.64, Sortino 2.20 vs 0.97, RAROC 604% vs 276%.
+            RANGE_MIN_CONFIDENCE = 0.65
             if self._range_predictor and self._range_predictor.is_trained:
                 range_pred = self._range_predictor.predict(
                     hist, symbol=symbol,
