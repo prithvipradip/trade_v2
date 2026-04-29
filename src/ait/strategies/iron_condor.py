@@ -39,9 +39,11 @@ class IronCondor(Strategy):
         # regardless of whether the market goes up, down, or sideways.
         # Only skip in extreme low IV where premium isn't worth the risk.
         # IV rank floor — read from env so we can backtest different values.
-        # Research: IV rank > 50 doubles win rate. Default 30 = practical balance.
+        # Default 20 (loosened from 30 for 2-week data-collection window —
+        # need 30+ paper trades to validate the bot before tightening).
+        # Research suggests IV rank > 50 is ideal but trades too rarely.
         import os
-        iv_floor = float(os.environ.get("AIT_IRON_CONDOR_IV_FLOOR", "30"))
+        iv_floor = float(os.environ.get("AIT_IRON_CONDOR_IV_FLOOR", "20"))
         if iv_rank < iv_floor:
             return []
 
