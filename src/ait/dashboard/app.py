@@ -346,8 +346,136 @@ def _tab_trade_history(
         st.info("No day-of-week data yet")
 
 
+def _live_vs_backtest_panel(conn: sqlite3.Connection) -> None:
+    """Compare live realized P&L vs the most recent backtest expectations.
+
+    Without this, every "the backtest says X" is a leap of faith.
+    """
+    import streamlit as st
+    import json
+    import pathlib
+    from datetime import date, timedelta
+
+    st.subheader("📊 Live vs Backtest")
+    st.caption(
+        "Annualized comparison of live performance against the most recent "
+        "backtest run. A negative gap means live is underperforming "
+        "simulation — investigate slippage, fills, or data quality."
+    )
+
+    # Find the latest backtest report
+    reports_dir = pathlib.Path(__file__).resolve().parents[3] / "reports"
+    backtest_files = sorted(reports_dir.glob("backtest_*.json"), reverse=True)
+    if not backtest_files:
+        st.info("No backtest reports yet. Run `python run_backtest.py` to generate one.")
+        return
+
+    latest = backtest_files[0]
+    try:
+        with open(latest) as f:
+            bt = json.load(f)
+    except Exception:
+        st.warning(f"Could not read {latest.name}")
+        return
+
+    # Parse backtest metrics (stored as strings like "+5.84%")
+    def _parse_pct(s):
+        if not s or s == "?":
+            return None
+        try:
+            return float(str(s).replace("%", "").replace("+", "").strip()) / 100
+        except (ValueError, AttributeError):
+            return None
+
+    bt_return = _parse_pct(bt.get("total_return"))
+    bt_sharpe = bt.get("sharpe", "?")
+    bt_win_rate = _parse_pct(bt.get("win_rate"))
+    bt_max_dd = _parse_pct(bt.get("max_drawdown"))
+
+    # Get live stats — last 30 days of closed trades
+    end = date.today()
+    start = end - timedelta(days=30)
+    live_trades = _safe_fetchall(
+        conn,
+        "SELECT realized_pnl, entry_time FROM trades "
+        "WHERE status = 'closed' AND date(entry_time) BETWEEN ? AND ?",
+        (start.isoformat(), end.isoformat()),
+    )
+    live_pnls = [t["realized_pnl"] for t in live_trades if t.get("realized_pnl")]
+    live_total_pnl = sum(live_pnls)
+    live_trade_count = len(live_trades)
+    live_wins = sum(1 for p in live_pnls if p > 0)
+    live_win_rate = live_wins / live_trade_count if live_trade_count > 0 else None
+
+    # Get account value for return calc
+    nlv_row = _safe_fetchall(
+        conn,
+        "SELECT value FROM bot_state WHERE key = 'account_value' LIMIT 1",
+    )
+    nlv = float(nlv_row[0]["value"]) if nlv_row else 250000.0
+    live_return_30d = (live_total_pnl / nlv) if nlv > 0 else 0
+
+    # Annualize: backtest is multi-year, live is 30 days
+    bt_period_years = 4.0  # rough — backtest covers ~4 years of test data
+    bt_annualized = (1 + bt_return) ** (1 / bt_period_years) - 1 if bt_return is not None else None
+    live_annualized = ((1 + live_return_30d) ** 12) - 1 if live_return_30d else 0
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric(
+        "Backtest Return (annualized)",
+        f"{bt_annualized:.1%}" if bt_annualized is not None else "n/a",
+    )
+    col2.metric(
+        "Live Return (annualized, last 30d)",
+        f"{live_annualized:.1%}",
+    )
+    if bt_annualized is not None and bt_annualized != 0:
+        gap = live_annualized - bt_annualized
+        col3.metric(
+            "Gap",
+            f"{gap:+.1%}",
+            delta=f"{(gap / abs(bt_annualized)):+.0%} vs backtest",
+        )
+    else:
+        col3.metric("Gap", "n/a")
+
+    st.write("**Detail:**")
+    detail = pd.DataFrame({
+        "metric": [
+            "Total Return", "Sharpe Ratio", "Win Rate", "Max Drawdown",
+            "Trade Count (30d)", "Total P&L (30d)",
+        ],
+        "Backtest": [
+            f"{bt_return:.1%}" if bt_return is not None else "n/a",
+            str(bt_sharpe),
+            f"{bt_win_rate:.1%}" if bt_win_rate is not None else "n/a",
+            f"{bt_max_dd:.1%}" if bt_max_dd is not None else "n/a",
+            "n/a",
+            "n/a",
+        ],
+        "Live (30d)": [
+            f"{live_return_30d:.2%}",
+            "n/a (need 100+ trades)",
+            f"{live_win_rate:.1%}" if live_win_rate is not None else "n/a",
+            "n/a",
+            str(live_trade_count),
+            f"${live_total_pnl:,.2f}",
+        ],
+    })
+    st.dataframe(detail, hide_index=True, use_container_width=True)
+
+    st.caption(
+        f"Backtest source: {latest.name}  ·  "
+        f"Live window: {start} → {end}  ·  "
+        f"Need 50+ live trades for statistical confidence."
+    )
+
+
 def _tab_analytics(conn: sqlite3.Connection) -> None:
     import streamlit as st
+
+    _live_vs_backtest_panel(conn)
+    st.divider()
 
     # Gather closed trades for analytics
     trades = _safe_fetchall(

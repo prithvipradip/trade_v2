@@ -199,6 +199,7 @@ class RangePredictor:
                 subsample=0.8, colsample_bytree=0.8,
                 objective="binary:logistic", eval_metric="logloss",
                 verbosity=0, n_jobs=-1,
+                random_state=42,
             )
             scores = []
             for tr_idx, val_idx in self._walk_forward_split(len(X)):
@@ -226,6 +227,7 @@ class RangePredictor:
                 subsample=0.8, colsample_bytree=0.8,
                 objective="binary", metric="binary_logloss",
                 verbose=-1, n_jobs=-1, class_weight="balanced",
+                random_state=42, deterministic=True,
             )
             scores = []
             for tr_idx, val_idx in self._walk_forward_split(len(X)):

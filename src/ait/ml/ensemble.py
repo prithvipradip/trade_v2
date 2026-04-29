@@ -454,6 +454,7 @@ class DirectionPredictor:
                 eval_metric="mlogloss",
                 verbosity=0,
                 n_jobs=-1,
+                random_state=42,
             )
 
             # Walk-forward validation with purge gap
@@ -504,6 +505,8 @@ class DirectionPredictor:
                 verbose=-1,
                 n_jobs=-1,
                 class_weight="balanced",  # Auto-balance class weights
+                random_state=42,
+                deterministic=True,
             )
 
             wf_splits = self._walk_forward_split(len(X))
