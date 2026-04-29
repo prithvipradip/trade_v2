@@ -108,8 +108,8 @@ class RangePredictor:
     ) -> dict[str, float]:
         """Train range model on historical data."""
         features = self._feature_engine.compute(df, market_context=market_context)
-        if len(features) < 200:  # Need more data for binary classification
-            log.warning("range_insufficient_data", rows=len(features), required=200)
+        if len(features) < 100:  # Need at least 100 rows for binary classification
+            log.warning("range_insufficient_data", rows=len(features), required=100)
             return {}
 
         # Create binary labels
