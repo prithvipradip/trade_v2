@@ -110,9 +110,18 @@ class TradingOrchestrator:
         )
         self._range_predictor.load_models()  # silent if no model yet
 
+        # Vol-magnitude predictor (Tier 1) — used for long straddle confidence
+        from ait.ml.vol_magnitude_predictor import VolMagnitudePredictor
+        self._vol_mag_predictor = VolMagnitudePredictor(
+            threshold_pct=0.07,  # ±7% (bigger than range threshold)
+            horizon_days=30,
+        )
+        self._vol_mag_predictor.load_models()
+
         self._trainer = ModelTrainer(
             settings.ml, self._predictor, self._market_data, self._historical,
             range_predictor=self._range_predictor,
+            vol_mag_predictor=self._vol_mag_predictor,
         )
         self._meta_labeler = MetaLabeler(
             min_probability=settings.meta_label.min_probability,
@@ -834,9 +843,24 @@ class TradingOrchestrator:
                     for s in signals:
                         if s.strategy_name in ("iron_condor", "short_strangle"):
                             s.confidence = range_pred.probability_in_range
-                        elif s.strategy_name == "long_straddle":
-                            # Straddles want OUT-of-range — invert
-                            s.confidence = 1 - range_pred.probability_in_range
+
+            # Vol-magnitude model (Tier 1) for long straddles — predicts P(big move)
+            # Direct signal for "buy volatility" strategies, more accurate than
+            # the previous "1 - range probability" hack.
+            if self._vol_mag_predictor and self._vol_mag_predictor.is_trained:
+                vm_pred = self._vol_mag_predictor.predict(
+                    hist, symbol=symbol,
+                    market_context=market_context,
+                    live_signals=live_signals,
+                )
+                if vm_pred:
+                    log.info("vol_mag_prediction", symbol=symbol,
+                             p_big_move=f"{vm_pred.probability_big_move:.3f}",
+                             threshold=vm_pred.threshold_pct,
+                             horizon_days=vm_pred.horizon_days)
+                    for s in signals:
+                        if s.strategy_name == "long_straddle":
+                            s.confidence = vm_pred.probability_big_move
 
                     # Apply range-specific threshold — drop signals below floor
                     signals = [

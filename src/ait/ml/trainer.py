@@ -32,6 +32,7 @@ class ModelTrainer:
         market_data: MarketDataService,
         historical_store: HistoricalDataStore,
         range_predictor=None,
+        vol_mag_predictor=None,
     ) -> None:
         self._config = config
         self._predictor = predictor
@@ -40,6 +41,7 @@ class ModelTrainer:
         self._last_train_date: date | None = None
         self._drift_detector = DriftDetector()
         self._range_predictor = range_predictor
+        self._vol_mag_predictor = vol_mag_predictor
 
     @property
     def drift_detector(self) -> DriftDetector:
@@ -121,6 +123,18 @@ class ModelTrainer:
                                  accuracies=range_acc)
                 except Exception as e:
                     log.warning("range_training_failed", symbol=symbol, error=str(e))
+
+            # Vol-magnitude predictor (Tier 1 model for long straddles)
+            if self._vol_mag_predictor is not None:
+                try:
+                    vm_acc = self._vol_mag_predictor.train(
+                        df, symbol=symbol, market_context=market_context
+                    )
+                    if vm_acc:
+                        log.info("vol_mag_training_complete", symbol=symbol,
+                                 accuracies=vm_acc)
+                except Exception as e:
+                    log.warning("vol_mag_training_failed", symbol=symbol, error=str(e))
 
         self._last_train_date = date.today()
         self._drift_detector.acknowledge_retrain()

@@ -275,17 +275,20 @@ from ait.data.market_data import MarketDataService
 from ait.data.historical import HistoricalDataStore
 from ait.ml.ensemble import DirectionPredictor
 from ait.ml.range_predictor import RangePredictor
+from ait.ml.vol_magnitude_predictor import VolMagnitudePredictor
 from ait.ml.trainer import ModelTrainer
 import asyncio
 
 settings = load_settings('config.yaml')
 predictor = DirectionPredictor(settings.ml)
 range_pred = RangePredictor(threshold_pct=0.05, horizon_days=30)
+vol_mag_pred = VolMagnitudePredictor(threshold_pct=0.07, horizon_days=30)
 market_data = MarketDataService(None, polygon_api_key=settings.api_keys.polygon_api_key)
 historical = HistoricalDataStore()
 trainer = ModelTrainer(
     settings.ml, predictor, market_data, historical,
     range_predictor=range_pred,
+    vol_mag_predictor=vol_mag_pred,
 )
 
 async def train():
