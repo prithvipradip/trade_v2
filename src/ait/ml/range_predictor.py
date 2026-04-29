@@ -249,6 +249,11 @@ class RangePredictor:
 
     # --- Prediction ---
 
+    # Minimum predictive edge (accuracy − base_rate) required to use the model.
+    # Below this, the model is just classifying based on majority class — no
+    # actual prediction skill. Returning None forces the strategy to skip.
+    MIN_EDGE_OVER_BASELINE = 0.10
+
     def predict(
         self,
         df: pd.DataFrame,
@@ -257,6 +262,7 @@ class RangePredictor:
         live_signals: dict | None = None,
     ) -> RangePrediction | None:
         """Predict P(stays in ±threshold% over horizon_days)."""
+        sym_data = None
         if symbol and symbol in self._symbol_models:
             sym_data = self._symbol_models[symbol]
             models = sym_data["models"]
@@ -268,6 +274,22 @@ class RangePredictor:
             feature_names = self._feature_names
         else:
             return None
+
+        # Edge-over-baseline check — skip predictions when model has no skill
+        if sym_data is not None:
+            cv_scores = sym_data.get("cv_scores", {})
+            base_rate = sym_data.get("in_range_rate", 0.5)
+            if cv_scores:
+                avg_acc = sum(cv_scores.values()) / len(cv_scores)
+                # For binary classification, baseline = max(base_rate, 1-base_rate)
+                naive_baseline = max(base_rate, 1 - base_rate)
+                edge = avg_acc - naive_baseline
+                if edge < self.MIN_EDGE_OVER_BASELINE:
+                    log.debug("range_no_edge", symbol=symbol,
+                              accuracy=f"{avg_acc:.2f}",
+                              baseline=f"{naive_baseline:.2f}",
+                              edge=f"{edge:+.2f}")
+                    return None
 
         features = self._feature_engine.compute(
             df, market_context=market_context, live_signals=live_signals,

@@ -241,6 +241,8 @@ class VolMagnitudePredictor:
         except ImportError:
             return 0.0
 
+    MIN_EDGE_OVER_BASELINE = 0.10
+
     def predict(
         self,
         df: pd.DataFrame,
@@ -249,6 +251,7 @@ class VolMagnitudePredictor:
         live_signals: dict | None = None,
     ) -> VolMagnitudePrediction | None:
         """Predict P(big move > threshold over horizon_days)."""
+        sym_data = None
         if symbol and symbol in self._symbol_models:
             sym_data = self._symbol_models[symbol]
             models = sym_data["models"]
@@ -260,6 +263,21 @@ class VolMagnitudePredictor:
             feature_names = self._feature_names
         else:
             return None
+
+        # Edge-over-baseline check — skip predictions when model has no skill
+        if sym_data is not None:
+            cv_scores = sym_data.get("cv_scores", {})
+            base_rate = sym_data.get("big_move_rate", 0.5)
+            if cv_scores:
+                avg_acc = sum(cv_scores.values()) / len(cv_scores)
+                naive_baseline = max(base_rate, 1 - base_rate)
+                edge = avg_acc - naive_baseline
+                if edge < self.MIN_EDGE_OVER_BASELINE:
+                    log.debug("vol_mag_no_edge", symbol=symbol,
+                              accuracy=f"{avg_acc:.2f}",
+                              baseline=f"{naive_baseline:.2f}",
+                              edge=f"{edge:+.2f}")
+                    return None
 
         features = self._feature_engine.compute(
             df, market_context=market_context, live_signals=live_signals,

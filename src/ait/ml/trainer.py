@@ -184,6 +184,17 @@ class ModelTrainer:
         except Exception as e:
             log.warning("market_context_spy_failed", error=str(e))
 
+        # Fetch macro data (FRED: yield curve + DXY)
+        try:
+            from ait.data.macro import MacroDataFetcher
+            fetcher = MacroDataFetcher()
+            macros = await fetcher.fetch_all(lookback_days=lookback * 2)
+            if macros:
+                context["macros"] = macros
+                log.info("market_context_macros", series=list(macros.keys()))
+        except Exception as e:
+            log.warning("market_context_macros_failed", error=str(e))
+
         return context
 
     @staticmethod

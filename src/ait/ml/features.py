@@ -77,6 +77,9 @@ class FeatureEngine:
         # --- Cross-Asset Features (VIX, relative strength) ---
         features = self._add_cross_asset(features, market_context)
 
+        # --- Macro Features (yield curve, DXY, rates) ---
+        features = self._add_macro(features, market_context)
+
         # --- Live Signal Features (sentiment, options flow) ---
         # During training, live_signals=None → neutral defaults so feature
         # count stays consistent. At prediction time, real values are passed.
@@ -175,6 +178,11 @@ class FeatureEngine:
             "vix_zscore", "vix_term_spread",
             "rel_strength_5d", "rel_strength_20d", "rel_strength_60d",
             "spy_momentum_10d", "spy_rsi_14", "correlation_spy_20d",
+            # Macro (yield curve + DXY from FRED)
+            "us_2y_yield_level", "us_10y_yield_level",
+            "yield_curve_spread", "yield_curve_inverted", "yield_curve_change_20d",
+            "dxy_level_norm", "dxy_change_5d", "dxy_change_20d",
+            "us_10y_change_20d",
             # Live signals (sentiment + options flow)
             "sentiment_composite", "sentiment_news", "sentiment_finbert",
             "fear_greed", "put_call_ratio",
@@ -553,6 +561,85 @@ class FeatureEngine:
             df["spy_momentum_10d"] = 0.0
             df["spy_rsi_14"] = 0.5
             df["correlation_spy_20d"] = 0.0
+
+        return df
+
+    def _add_macro(
+        self, df: pd.DataFrame, market_context: dict | None
+    ) -> pd.DataFrame:
+        """Add macro/cross-asset features from FRED.
+
+        Yield curve and DXY have known equity-impact patterns the
+        technical indicators miss. Defaults to neutral if data missing.
+        """
+        defaults = {
+            "us_2y_yield_level": 4.0,
+            "us_10y_yield_level": 4.0,
+            "yield_curve_spread": 0.0,
+            "yield_curve_inverted": 0.0,
+            "yield_curve_change_20d": 0.0,
+            "dxy_level_norm": 0.0,
+            "dxy_change_5d": 0.0,
+            "dxy_change_20d": 0.0,
+            "us_10y_change_20d": 0.0,
+        }
+
+        macros = (market_context or {}).get("macros") if market_context else None
+        if not macros:
+            for key, val in defaults.items():
+                df[key] = val
+            return df
+
+        idx = df.index
+
+        def reindex(series):
+            if series is None or series.empty:
+                return None
+            # Strip tz, coerce to datetime64[ms] for compatibility
+            try:
+                if getattr(series.index, "tz", None) is not None:
+                    series = series.copy()
+                    series.index = series.index.tz_localize(None)
+                series.index = series.index.astype("datetime64[ms]")
+            except Exception:
+                pass
+            return series.reindex(df.index, method="ffill")
+
+        y2 = reindex(macros.get("us_2y_yield"))
+        y10 = reindex(macros.get("us_10y_yield"))
+        curve = reindex(macros.get("yield_curve"))
+        dxy = reindex(macros.get("dxy"))
+
+        if y2 is not None:
+            df["us_2y_yield_level"] = y2.fillna(defaults["us_2y_yield_level"])
+        else:
+            df["us_2y_yield_level"] = defaults["us_2y_yield_level"]
+
+        if y10 is not None:
+            df["us_10y_yield_level"] = y10.fillna(defaults["us_10y_yield_level"])
+            df["us_10y_change_20d"] = y10.diff(20).clip(-2, 2).fillna(0)
+        else:
+            df["us_10y_yield_level"] = defaults["us_10y_yield_level"]
+            df["us_10y_change_20d"] = 0.0
+
+        if curve is not None:
+            df["yield_curve_spread"] = curve.fillna(0)
+            df["yield_curve_inverted"] = (curve < 0).astype(float)
+            df["yield_curve_change_20d"] = curve.diff(20).clip(-2, 2).fillna(0)
+        else:
+            df["yield_curve_spread"] = 0.0
+            df["yield_curve_inverted"] = 0.0
+            df["yield_curve_change_20d"] = 0.0
+
+        if dxy is not None:
+            # Normalize around typical 100 baseline
+            df["dxy_level_norm"] = ((dxy - 100) / 20).clip(-2, 2).fillna(0)
+            df["dxy_change_5d"] = dxy.pct_change(5).clip(-0.1, 0.1).fillna(0)
+            df["dxy_change_20d"] = dxy.pct_change(20).clip(-0.2, 0.2).fillna(0)
+        else:
+            df["dxy_level_norm"] = 0.0
+            df["dxy_change_5d"] = 0.0
+            df["dxy_change_20d"] = 0.0
 
         return df
 

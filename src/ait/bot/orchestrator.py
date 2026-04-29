@@ -545,7 +545,7 @@ class TradingOrchestrator:
                 log.warning("symbol_scan_failed", symbol=symbol, error=str(e))
 
     async def _build_market_context(self) -> dict:
-        """Fetch VIX and SPY historical data for ML cross-asset features."""
+        """Fetch VIX, SPY, and macro data for ML cross-asset features."""
         context = {}
         try:
             vix_hist = await self._market_data.get_historical("^VIX", days=120)
@@ -557,6 +557,16 @@ class TradingOrchestrator:
             spy_hist = await self._market_data.get_historical("SPY", days=120)
             if spy_hist is not None and len(spy_hist) > 20:
                 context["spy"] = spy_hist
+        except Exception:
+            pass
+        # Macro data (FRED: yield curve, DXY)
+        try:
+            from ait.data.macro import MacroDataFetcher
+            if not hasattr(self, "_macro_fetcher"):
+                self._macro_fetcher = MacroDataFetcher()
+            macros = await self._macro_fetcher.fetch_all(lookback_days=365)
+            if macros:
+                context["macros"] = macros
         except Exception:
             pass
         return context
