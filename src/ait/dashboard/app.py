@@ -276,6 +276,75 @@ def _tab_trade_history(
         except Exception:
             pass
 
+    st.divider()
+
+    # ML Confidence calibration — does the model's confidence predict outcomes?
+    st.subheader("ML Confidence Calibration")
+    st.caption(
+        "If model is well-calibrated, win rate should rise with confidence bucket. "
+        "If high-confidence trades don't win more, the threshold is meaningless."
+    )
+    conf_perf = _safe_query(
+        conn,
+        """
+        SELECT
+            CASE
+                WHEN ml_confidence < 0.55 THEN '1. low (<0.55)'
+                WHEN ml_confidence < 0.70 THEN '2. mid (0.55-0.70)'
+                WHEN ml_confidence < 0.85 THEN '3. high (0.70-0.85)'
+                ELSE '4. very_high (>=0.85)'
+            END as confidence_bucket,
+            COUNT(*) as trades,
+            SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins,
+            ROUND(SUM(CASE WHEN realized_pnl > 0 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1) as win_rate_pct,
+            ROUND(SUM(realized_pnl), 2) as total_pnl,
+            ROUND(AVG(realized_pnl), 2) as avg_pnl
+        FROM trades
+        WHERE status = 'closed'
+          AND date(entry_time) BETWEEN ? AND ?
+          AND ml_confidence > 0
+        GROUP BY confidence_bucket
+        ORDER BY confidence_bucket
+        """,
+        (start_iso, end_iso),
+    )
+    if not conf_perf.empty:
+        st.dataframe(conf_perf, use_container_width=True)
+    else:
+        st.info("Not enough data for confidence calibration yet")
+
+    st.divider()
+
+    # Day of week breakdown
+    st.subheader("Day-of-Week Performance")
+    dow_perf = _safe_query(
+        conn,
+        """
+        SELECT
+            CASE strftime('%w', entry_time)
+                WHEN '1' THEN '1. Monday'
+                WHEN '2' THEN '2. Tuesday'
+                WHEN '3' THEN '3. Wednesday'
+                WHEN '4' THEN '4. Thursday'
+                WHEN '5' THEN '5. Friday'
+            END as day_of_week,
+            COUNT(*) as trades,
+            ROUND(SUM(CASE WHEN realized_pnl > 0 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1) as win_rate_pct,
+            ROUND(SUM(realized_pnl), 2) as total_pnl,
+            ROUND(AVG(realized_pnl), 2) as avg_pnl
+        FROM trades
+        WHERE status = 'closed'
+          AND date(entry_time) BETWEEN ? AND ?
+        GROUP BY day_of_week
+        ORDER BY day_of_week
+        """,
+        (start_iso, end_iso),
+    )
+    if not dow_perf.empty:
+        st.dataframe(dow_perf, use_container_width=True)
+    else:
+        st.info("No day-of-week data yet")
+
 
 def _tab_analytics(conn: sqlite3.Connection) -> None:
     import streamlit as st
