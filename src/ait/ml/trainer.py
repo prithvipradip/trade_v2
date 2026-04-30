@@ -166,11 +166,22 @@ class ModelTrainer:
         context = {}
         lookback = self._config.lookback_days
 
+        def _normalize_index(df: "pd.DataFrame") -> "pd.DataFrame":
+            # Strip timezone and normalize to datetime64[ms] so reindex works
+            # against symbol DataFrames regardless of what the data source returns.
+            if df.index.tz is not None:
+                df = df.copy()
+                df.index = df.index.tz_localize(None).astype("datetime64[ms]")
+            elif df.index.dtype != "datetime64[ms]":
+                df = df.copy()
+                df.index = df.index.astype("datetime64[ms]")
+            return df
+
         # Fetch VIX
         try:
             vix_df = await self._market_data.get_historical("^VIX", days=lookback)
             if vix_df is not None and len(vix_df) > 20:
-                context["vix"] = vix_df
+                context["vix"] = _normalize_index(vix_df)
                 log.info("market_context_vix", rows=len(vix_df))
         except Exception as e:
             log.warning("market_context_vix_failed", error=str(e))
@@ -179,7 +190,7 @@ class ModelTrainer:
         try:
             spy_df = await self._market_data.get_historical("SPY", days=lookback)
             if spy_df is not None and len(spy_df) > 20:
-                context["spy"] = spy_df
+                context["spy"] = _normalize_index(spy_df)
                 log.info("market_context_spy", rows=len(spy_df))
         except Exception as e:
             log.warning("market_context_spy_failed", error=str(e))
