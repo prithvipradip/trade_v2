@@ -47,6 +47,7 @@ options:
     - long_straddle
     - short_strangle
     - calendar_spread     # Low-IV complement to iron condor (active when IV rank < 50)
+    - event_straddle      # Long straddle 0-1d before FOMC/CPI/NFP — long-vol complement
 
 ml:
   ensemble_weights:

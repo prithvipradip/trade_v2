@@ -813,6 +813,18 @@ class TradingOrchestrator:
             iv_rank=iv_rank,
         )
 
+        # Event-driven long straddles — fire 0-1 days before macro events.
+        # Profit from IV expansion + directional move when our short-vol
+        # strategies would be wrong-sided.
+        event_straddle_signals = self._strategy_selector.generate_event_straddle_signals(
+            symbol=symbol,
+            chains=filtered_chains,
+            market_direction=direction,
+            confidence=final_confidence,
+            iv_rank=iv_rank,
+            economic_cal=self._economic_cal,
+        )
+
         # Generate signals across all enabled strategies (learning may have disabled some)
         for chain in filtered_chains:
             if not chain.calls and not chain.puts:
@@ -831,6 +843,11 @@ class TradingOrchestrator:
             if calendar_signals:
                 signals = list(signals) + calendar_signals
                 calendar_signals = []  # consume so we don't add twice
+
+            # Inject event-straddle signals on the FIRST chain iteration only
+            if event_straddle_signals:
+                signals = list(signals) + event_straddle_signals
+                event_straddle_signals = []  # consume so we don't add twice
 
             # Filter out signals from disabled strategies
             signals = [
