@@ -134,6 +134,41 @@ class DuckDBAnalytics:
                 )
             """)
 
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS equity_stats (
+                    symbol              VARCHAR PRIMARY KEY,
+                    updated_at          TIMESTAMP NOT NULL,
+                    company_name        VARCHAR DEFAULT '',
+                    sector              VARCHAR DEFAULT '',
+                    industry            VARCHAR DEFAULT '',
+                    country             VARCHAR DEFAULT '',
+                    exchange            VARCHAR DEFAULT '',
+                    market_cap          BIGINT  DEFAULT 0,
+                    pe_ratio            DOUBLE  DEFAULT 0,
+                    forward_pe          DOUBLE  DEFAULT 0,
+                    pb_ratio            DOUBLE  DEFAULT 0,
+                    ps_ratio            DOUBLE  DEFAULT 0,
+                    ev_ebitda           DOUBLE  DEFAULT 0,
+                    eps                 DOUBLE  DEFAULT 0,
+                    book_value_ps       DOUBLE  DEFAULT 0,
+                    revenue_ps          DOUBLE  DEFAULT 0,
+                    dividend_yield      DOUBLE  DEFAULT 0,
+                    dividend_rate       DOUBLE  DEFAULT 0,
+                    payout_ratio        DOUBLE  DEFAULT 0,
+                    beta                DOUBLE  DEFAULT 0,
+                    week52_high         DOUBLE  DEFAULT 0,
+                    week52_low          DOUBLE  DEFAULT 0,
+                    avg_volume_30d      BIGINT  DEFAULT 0,
+                    float_shares        BIGINT  DEFAULT 0,
+                    shares_outstanding  BIGINT  DEFAULT 0,
+                    analyst_target_mean DOUBLE  DEFAULT 0,
+                    analyst_target_high DOUBLE  DEFAULT 0,
+                    analyst_target_low  DOUBLE  DEFAULT 0,
+                    analyst_rating      VARCHAR DEFAULT '',
+                    analyst_count       INTEGER DEFAULT 0
+                )
+            """)
+
         log.info("duckdb_initialized", path=str(self._db_path))
 
     # ------------------------------------------------------------------
@@ -615,3 +650,62 @@ class DuckDBAnalytics:
 
         log.info("sqlite_sync_complete", trades=count, daily_stats=len(daily), contexts=len(contexts))
         return count
+
+    # ------------------------------------------------------------------
+    # Equity stats (yfinance fundamentals)
+    # ------------------------------------------------------------------
+
+    def upsert_equity_stats(self, stats: dict) -> None:
+        """INSERT OR REPLACE into equity_stats — daily snapshot overwrites previous."""
+        with self._get_conn() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO equity_stats VALUES (
+                    $symbol, $updated_at, $company_name, $sector, $industry,
+                    $country, $exchange, $market_cap, $pe_ratio, $forward_pe,
+                    $pb_ratio, $ps_ratio, $ev_ebitda, $eps, $book_value_ps,
+                    $revenue_ps, $dividend_yield, $dividend_rate, $payout_ratio,
+                    $beta, $week52_high, $week52_low, $avg_volume_30d,
+                    $float_shares, $shares_outstanding,
+                    $analyst_target_mean, $analyst_target_high, $analyst_target_low,
+                    $analyst_rating, $analyst_count
+                )
+            """, stats)
+        log.debug("equity_stats_upserted", symbol=stats.get("symbol"))
+
+    def get_equity_stats(self, symbol: str) -> dict | None:
+        """Return latest fundamental snapshot for one symbol, or None."""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM equity_stats WHERE symbol = ?", [symbol]
+            ).fetchone()
+        if row is None:
+            return None
+        cols = [
+            "symbol", "updated_at", "company_name", "sector", "industry",
+            "country", "exchange", "market_cap", "pe_ratio", "forward_pe",
+            "pb_ratio", "ps_ratio", "ev_ebitda", "eps", "book_value_ps",
+            "revenue_ps", "dividend_yield", "dividend_rate", "payout_ratio",
+            "beta", "week52_high", "week52_low", "avg_volume_30d",
+            "float_shares", "shares_outstanding",
+            "analyst_target_mean", "analyst_target_high", "analyst_target_low",
+            "analyst_rating", "analyst_count",
+        ]
+        return dict(zip(cols, row))
+
+    def get_all_equity_stats(self) -> list[dict]:
+        """Return all equity stats rows (for dashboard display)."""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM equity_stats ORDER BY symbol"
+            ).fetchall()
+        cols = [
+            "symbol", "updated_at", "company_name", "sector", "industry",
+            "country", "exchange", "market_cap", "pe_ratio", "forward_pe",
+            "pb_ratio", "ps_ratio", "ev_ebitda", "eps", "book_value_ps",
+            "revenue_ps", "dividend_yield", "dividend_rate", "payout_ratio",
+            "beta", "week52_high", "week52_low", "avg_volume_30d",
+            "float_shares", "shares_outstanding",
+            "analyst_target_mean", "analyst_target_high", "analyst_target_low",
+            "analyst_rating", "analyst_count",
+        ]
+        return [dict(zip(cols, r)) for r in rows]

@@ -80,12 +80,23 @@ class ModelTrainer:
 
         return False
 
-    async def train_all_symbols(self, symbols: list[str]) -> dict[str, dict[str, float]]:
+    async def train_all_symbols(
+        self,
+        symbols: list[str],
+        optimize_hyperparams: bool = False,
+        optimize_n_trials: int = 50,
+    ) -> dict[str, dict[str, float]]:
         """Fetch fresh data and train models for all symbols.
+
+        When *optimize_hyperparams* is True, an Optuna search over XGBOOST_SPACE
+        and LIGHTGBM_SPACE is run before fitting the final models, and the best
+        hyperparams are injected into the predictor's model kwargs.
 
         Auto-rollback if new model performs significantly worse than previous.
         Returns dict of {symbol: {model: accuracy}}.
         """
+        if optimize_hyperparams:
+            self._apply_optimized_hyperparams(symbols, n_trials=optimize_n_trials)
         # Save previous scores for comparison
         prev_version = self._predictor.model_version
         prev_scores = dict(self._predictor.cv_scores)
@@ -221,6 +232,31 @@ class ModelTrainer:
 
         # Rollback if accuracy dropped by more than 5 percentage points
         return new_avg < prev_avg - 0.05
+
+    def _apply_optimized_hyperparams(self, symbols: list[str], n_trials: int = 50) -> None:
+        """Run Optuna over ML spaces and patch predictor model kwargs."""
+        try:
+            from ait.optimization.optimizer import StrategyOptimizer
+            optimizer = StrategyOptimizer(
+                symbols=symbols,
+                strategies=[],
+                n_trials=n_trials,
+                n_jobs=1,
+                objective="sharpe_ratio",
+                optimize_ml=True,
+                study_name="ml_hyperparams",
+            )
+            result = optimizer.run()
+            best = result.best_params
+            log.info("ml_hyperparams_optimized", best=best)
+
+            # Inject into predictor if it exposes model_kwargs
+            if hasattr(self._predictor, "model_kwargs"):
+                for key, val in best.items():
+                    model, _, param = key.partition("__")
+                    self._predictor.model_kwargs.setdefault(model, {})[param] = val
+        except Exception as e:
+            log.warning("ml_hyperparams_optimization_failed", error=str(e))
 
     async def ensure_models_ready(self, symbols: list[str]) -> bool:
         """Ensure models are loaded or trained. Call on startup."""

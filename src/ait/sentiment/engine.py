@@ -11,7 +11,8 @@ If sentiment sources fail, trading continues without them (graceful degradation)
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import statistics
+from dataclasses import dataclass, field
 
 from ait.config.settings import SentimentConfig
 from ait.data.cache import TTLCache
@@ -33,8 +34,9 @@ class SentimentResult:
     news_score: float | None
     fear_greed_score: float | None
     finbert_score: float | None
-    sources_available: int
-    total_sources: int
+    ib_news_score: float | None = field(default=None)
+    sources_available: int = 0
+    total_sources: int = 0
 
 
 class SentimentEngine:
@@ -45,9 +47,11 @@ class SentimentEngine:
         config: SentimentConfig,
         market_data: MarketDataService,
         finnhub_api_key: str = "",
+        fundamentals_store=None,  # FundamentalsStore | None — avoids circular import
     ) -> None:
         self._config = config
         self._cache = TTLCache(default_ttl=config.cache_ttl_seconds)
+        self._fundamentals_store = fundamentals_store
 
         # Initialize enabled sources
         self._news: NewsSentiment | None = None
@@ -84,6 +88,7 @@ class SentimentEngine:
         news_score = None
         fear_greed_score = None
         finbert_score = None
+        ib_news_score = None
 
         # 1. News sentiment
         if self._news:
@@ -130,6 +135,18 @@ class SentimentEngine:
             except Exception as e:
                 log.debug("finbert_error", symbol=symbol, error=str(e))
 
+        # 4. IB news sentiment (pre-scored at ingest time)
+        if self._fundamentals_store:
+            total_sources += 1
+            try:
+                news_rows = self._fundamentals_store.get_recent_news(symbol, hours=24)
+                if news_rows:
+                    ib_news_score = statistics.mean(n["sentiment"] for n in news_rows)
+                    scores.append((ib_news_score, self._config.ib_news_weight))
+                    available_sources += 1
+            except Exception as e:
+                log.debug("ib_news_sentiment_error", symbol=symbol, error=str(e))
+
         # Compute weighted composite
         if scores:
             total_weight = sum(w for _, w in scores)
@@ -143,6 +160,7 @@ class SentimentEngine:
             news_score=news_score,
             fear_greed_score=fear_greed_score,
             finbert_score=finbert_score,
+            ib_news_score=ib_news_score,
             sources_available=available_sources,
             total_sources=total_sources,
         )

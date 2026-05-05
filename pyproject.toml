@@ -37,6 +37,8 @@ dependencies = [
     "psutil>=5.9",
     # Analytics
     "duckdb>=1.0",
+    # Optimization
+    "optuna>=3.6",
     # Scheduling
     "apscheduler>=3.10",
     # Config & Logging
