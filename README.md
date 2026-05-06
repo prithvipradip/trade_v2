@@ -130,7 +130,9 @@ pip install -e .
 This installs all packages from `pyproject.toml`:
 - **Trading**: `ib_insync`, `yfinance`, `polygon-api-client`
 - **ML**: `xgboost`, `lightgbm`, `scikit-learn`, `scipy`
-- **Sentiment**: `transformers`, `torch`, `feedparser`, `finnhub-python`
+- **Sentiment**: `transformers>=4.38,<4.45`, `torch>=2.2,<2.3`, `feedparser`, `finnhub-python`
+  - `transformers<4.45` — versions 4.45+ added a security check (CVE-2025-32434) that blocks loading FinBERT's `.bin` weights when torch < 2.6
+  - `torch<2.3` / `numpy<2.0` — Intel Mac ceiling; PyTorch 2.2.x was compiled against NumPy 1.x and breaks with NumPy 2.x
 - **Options**: `py-vollib` (Greeks/IV calculations)
 - **Dashboard**: `streamlit`, `plotly`, `flask`
 - **Infrastructure**: `apscheduler`, `duckdb`, `structlog`, `pydantic`
@@ -545,6 +547,27 @@ sentiment:
   enabled: false
 ```
 Then edit `pyproject.toml` to remove `torch` and `transformers` from dependencies, and reinstall.
+
+### "Numpy is not available" / FinBERT returns None for every headline
+PyTorch 2.2.x was compiled against NumPy 1.x. NumPy 2.x breaks the C-level array API bridge at inference time, causing PyTorch to report "Failed to initialize NumPy: _ARRAY_API not found" and silently fall back to returning `None` for all FinBERT scores.
+
+**Fix:** Downgrade NumPy:
+```bash
+pip install "numpy<2.0"
+```
+The `pyproject.toml` already pins `numpy>=1.26,<2.0` for this reason — if you see this error, a manual `pip install numpy<2.0` restores it. Verify FinBERT is working:
+```bash
+python -c "from ait.sentiment.finbert import FinBERTAnalyzer; f = FinBERTAnalyzer(); print(f.analyze('Apple reports record earnings'))"
+# Should print a float near +0.9, not None
+```
+
+### FinBERT fails to load / "Unable to load weights from pytorch checkpoint"
+`transformers>=4.45` added a security check (CVE-2025-32434) that blocks loading `.bin` checkpoint files when torch < 2.6. `ProsusAI/finbert` only has `.bin` weights (no safetensors format). The project pins `transformers<4.45` to avoid this.
+
+If you upgraded transformers manually and see this error, restore the correct version:
+```bash
+pip install "transformers>=4.38,<4.45"
+```
 
 ### Bot won't start
 - Check Gateway is running: `netstat -ano | grep 4002`

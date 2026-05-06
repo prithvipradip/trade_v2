@@ -117,8 +117,10 @@ run_orchestrator.py          ← Master process (start here)
 | IBKR | Real-time quotes, order execution, news, analyst actions | Needs subscription |
 
 **IB news providers in use:**
-- General news: `BRFG + DJ-N + DJ-RTG + DJ-RTPRO + DJNL` → stored in `data/fundamentals.db/news`
+- General news: desired set `{BRFG, DJ-N, DJ-RTG, DJ-RTPRO, DJNL}` — filtered at startup via `reqNewsProviders()` to only subscribed codes (avoids Error 321 on accounts that lack a provider). Active set logged as `news_providers_active`.
 - Analyst actions: `BRFUPDN` (Briefing.com) → stored in `data/fundamentals.db/analyst_recommendations`
+
+**News/analyst fetch API contract:** Both `fetch_and_store_news()` and `fetch_and_store_analyst_actions()` return `(fetched, inserted)` — `fetched` is what IB returned; `inserted` is net-new DB rows. Callers use `fetched==0` to detect a dead feed, not `inserted==0` (which is normal after first run, since `INSERT OR IGNORE` deduplicates on subsequent fetches).
 
 ## IBKR Setup
 
@@ -343,4 +345,4 @@ Secrets in `.env`:
 
 ---
 
-*Last updated: 2026-05-05*
+*Last updated: 2026-05-06*

@@ -1038,8 +1038,10 @@ The IB news branch is active when `FundamentalsStore` is provided to `SentimentE
 | ML — Gradient Boosting | XGBoost + LightGBM | ≥ 2.0 / ≥ 4.3 |
 | ML — Framework | scikit-learn | ≥ 1.4 |
 | Options Greeks | py-vollib | ≥ 1.0.1 |
-| Sentiment | transformers (FinBERT) + torch | ≥ 4.38 / ≥ 2.2 |
-| Data | pandas + numpy + scipy | latest |
+| Sentiment | transformers (FinBERT) | ≥ 4.38, **< 4.45** (4.45+ blocks `.bin` weights on torch < 2.6) |
+| Sentiment | torch | ≥ 2.2, **< 2.3** (Intel Mac ceiling; 2.3+ dropped Intel wheels) |
+| Data | pandas + scipy | latest |
+| Data | numpy | **≥ 1.26, < 2.0** (torch 2.2.x compiled against NumPy 1.x; 2.x breaks inference) |
 | Market calendars | pandas-market-calendars | latest |
 | Market data (backup) | yfinance + polygon-api-client | latest |
 | Scheduling | APScheduler | ≥ 3.10 |
@@ -1053,7 +1055,7 @@ The IB news branch is active when `FundamentalsStore` is provided to `SentimentE
 | Notifications | Telegram Bot API | — |
 | Testing | pytest + pytest-asyncio | — |
 
-**Note on Apple Silicon / Intel Macs:** PyTorch 2.x requires Python 3.11 on Intel Macs. If you are on an Intel Mac, pin Python to 3.11.
+**Note on Intel Macs:** PyTorch 2.x requires Python 3.11 on Intel Macs (no wheels for 3.12+ on Intel). The latest available torch for Intel Mac is **2.2.x**, which was compiled against NumPy 1.x — `numpy>=2.0` breaks FinBERT inference with "Failed to initialize NumPy: _ARRAY_API not found". The pinned ranges `transformers<4.45`, `torch<2.3`, and `numpy<2.0` in `pyproject.toml` encode all three Intel Mac constraints. Apple Silicon and Linux/Windows users can use later versions of these packages (subject to their own platform support).
 
 ---
 
@@ -1296,4 +1298,4 @@ python run_backtest.py \
 
 ---
 
-*This document is a living reference. Last updated: 2026-05-05*
+*This document is a living reference. Last updated: 2026-05-06*
