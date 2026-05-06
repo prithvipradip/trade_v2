@@ -3,9 +3,13 @@
 Calls ib_insync's reqHistoricalNews + reqNewsArticle, strips IB headline
 encoding, scores sentiment, and persists to FundamentalsStore.
 
-Provider routing (per plan):
-- General news:    BRFG + DJ-N + DJ-RTG + DJ-RTPRO + DJNL
+Provider routing:
+- General news:    BRFG + DJ-N + DJ-RT + DJ-RTG + DJNL  (live account set)
 - Analyst actions: BRFUPDN (Briefing.com Analyst Actions only)
+
+At startup the service calls reqNewsProviders() and filters _DESIRED_NEWS_PROVIDERS
+down to only those actually subscribed on the connected account, avoiding
+Error 321 ("Not subscribed for provider X").
 """
 
 from __future__ import annotations
@@ -21,7 +25,8 @@ from ait.utils.logging import get_logger
 
 log = get_logger("data.ib_news")
 
-NEWS_PROVIDERS = "BRFG+DJ-N+DJ-RTG+DJ-RTPRO+DJNL"
+# Full desired set — service filters this to subscribed providers at init time.
+_DESIRED_NEWS_PROVIDERS = {"BRFG", "DJ-N", "DJ-RT", "DJ-RTG", "DJ-RTPRO", "DJNL"}
 ANALYST_PROVIDER = "BRFUPDN"
 
 # Regex patterns for parsing Briefing.com analyst action text
@@ -52,19 +57,22 @@ class IBNewsService:
         self._client = ib_client
         self._store = store
         self._sentiment_fn = sentiment_fn or (lambda _: 0.0)
+        self._news_providers = self._build_provider_string()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def fetch_and_store_news(self, symbol: str, hours_back: int = 24) -> int:
+    def fetch_and_store_news(self, symbol: str, hours_back: int = 24) -> tuple[int, int]:
         """Fetch general news for *symbol* and persist via INSERT OR IGNORE.
 
-        Returns the count of newly inserted articles.
+        Returns (fetched, inserted) — fetched is what IB returned, inserted is
+        net-new rows written.  Callers should use *fetched* to detect a dead
+        news feed and *inserted* to track incremental ingest.
         """
         con_id = self._resolve_con_id(symbol)
         if con_id is None:
-            return 0
+            return 0, 0
 
         end = datetime.now()
         start = end - timedelta(hours=hours_back)
@@ -72,40 +80,42 @@ class IBNewsService:
         try:
             raw = self._client.ib.reqHistoricalNews(
                 con_id,
-                NEWS_PROVIDERS,
+                self._news_providers,
                 start.strftime("%Y-%m-%d %H:%M:%S"),
                 end.strftime("%Y-%m-%d %H:%M:%S"),
                 totalResults=50,
             )
         except Exception as e:
             log.error("ib_news_fetch_failed", symbol=symbol, error=str(e))
-            return 0
+            return 0, 0
 
         rows = []
         for a in raw or []:
             headline = self._strip_prefix(a.headline)
+            a_time = a.time if isinstance(a.time, datetime) else datetime.fromisoformat(str(a.time))
             rows.append({
                 "article_id": a.articleId,
                 "symbol":     symbol,
                 "provider":   a.providerCode,
                 "headline":   headline,
                 "url":        "",
-                "published_at": a.time.isoformat() if hasattr(a.time, "isoformat") else str(a.time),
+                "published_at": a_time.isoformat(),
                 "sentiment":  self._sentiment_fn(headline),
             })
 
         inserted = self._store.insert_news(rows)
         log.info("news_fetched_and_stored", symbol=symbol, fetched=len(rows), inserted=inserted)
-        return inserted
+        return len(rows), inserted
 
-    def fetch_and_store_analyst_actions(self, symbol: str, hours_back: int = 168) -> int:
+    def fetch_and_store_analyst_actions(self, symbol: str, hours_back: int = 168) -> tuple[int, int]:
         """Fetch BRFUPDN analyst actions, parse article text, and persist.
 
-        Returns the count of newly inserted records.
+        Returns (fetched, inserted) — fetched is parsed records from IB,
+        inserted is net-new rows written.
         """
         con_id = self._resolve_con_id(symbol)
         if con_id is None:
-            return 0
+            return 0, 0
 
         end = datetime.now()
         start = end - timedelta(hours=hours_back)
@@ -120,7 +130,7 @@ class IBNewsService:
             )
         except Exception as e:
             log.error("analyst_news_fetch_failed", symbol=symbol, error=str(e))
-            return 0
+            return 0, 0
 
         recs = []
         for a in raw or []:
@@ -140,11 +150,27 @@ class IBNewsService:
             fetched=len(recs),
             inserted=inserted,
         )
-        return inserted
+        return len(recs), inserted
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _build_provider_string(self) -> str:
+        """Return '+'-joined provider codes filtered to those actually subscribed.
+
+        Calling reqNewsProviders() at init time avoids Error 321 when the
+        account lacks a provider in _DESIRED_NEWS_PROVIDERS (e.g. live accounts
+        have DJ-RT but not DJ-RTPRO; paper accounts differ again).
+        """
+        try:
+            available = {p.code for p in self._client.ib.reqNewsProviders()}
+        except Exception:
+            available = _DESIRED_NEWS_PROVIDERS  # best-effort fallback
+        subscribed = _DESIRED_NEWS_PROVIDERS & available
+        provider_str = "+".join(sorted(subscribed)) if subscribed else "BRFG"
+        log.info("news_providers_active", providers=provider_str)
+        return provider_str
 
     def _resolve_con_id(self, symbol: str) -> int | None:
         """Return IB contract conId for a plain equity symbol."""

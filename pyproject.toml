@@ -14,7 +14,7 @@ dependencies = [
     "yfinance>=0.2.36",
     "polygon-api-client>=1.14",
     "pandas>=2.2",
-    "numpy>=1.26",
+    "numpy>=1.26,<2.0",  # PyTorch 2.2.2 compiled against NumPy 1.x; 2.x breaks inference
     "pandas-market-calendars>=4.4",
     # ML (lightweight - no TensorFlow/PyTorch)
     "xgboost>=2.0",
@@ -24,8 +24,8 @@ dependencies = [
     "py-vollib>=1.0.1",
     "scipy>=1.12",
     # Sentiment
-    "transformers>=4.38",   # FinBERT
-    "torch>=2.2",           # CPU-only for FinBERT inference
+    "transformers>=4.38,<4.45",  # FinBERT; >=4.45 blocks torch.load when torch<2.6 (CVE-2025-32434)
+    "torch>=2.2,<2.3",          # CPU-only for FinBERT inference; Intel Mac ceiling
     "feedparser>=6.0",
     "finnhub-python>=2.4",
     # Notifications

@@ -75,8 +75,14 @@ def _fetch_news() -> None:
     ib = client.ib
     ib.connect(ibkr_cfg.ibkr_host, ibkr_cfg.ibkr_port, clientId=ibkr_cfg.ibkr_client_id + 10)
     try:
+        from ait.sentiment.finbert import FinBERTAnalyzer
+        finbert = FinBERTAnalyzer()
         store = FundamentalsStore()
-        svc = IBNewsService(ib_client=client, store=store)
+        svc = IBNewsService(
+            ib_client=client,
+            store=store,
+            sentiment_fn=lambda h: finbert.analyze(h) or 0.0,
+        )
         for symbol in symbols:
             n = svc.fetch_and_store_news(symbol, hours_back=24)
             a = svc.fetch_and_store_analyst_actions(symbol, hours_back=168)

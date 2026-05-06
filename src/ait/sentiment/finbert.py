@@ -29,23 +29,12 @@ class FinBERTAnalyzer:
             from transformers import pipeline
 
             log.info("loading_finbert_model")
-            try:
-                self._pipeline = pipeline(
-                    "sentiment-analysis",
-                    model="ProsusAI/finbert",
-                    device=-1,  # CPU only
-                    top_k=None,
-                    local_files_only=True,
-                )
-            except Exception:
-                log.info("finbert_local_not_found, downloading")
-                self._pipeline = pipeline(
-                    "sentiment-analysis",
-                    model="ProsusAI/finbert",
-                    device=-1,  # CPU only
-                    top_k=None,
-                    local_files_only=False,
-                )
+            self._pipeline = pipeline(
+                "sentiment-analysis",
+                model="ProsusAI/finbert",
+                device=-1,   # CPU only
+                top_k=None,  # return scores for all labels
+            )
             self._loaded = True
             log.info("finbert_model_loaded")
             return True

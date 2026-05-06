@@ -115,7 +115,9 @@ class FundamentalsStore:
 
     def get_recent_news(self, symbol: str, hours: int = 24) -> list[dict]:
         """Return news articles for *symbol* published in the last *hours* hours."""
-        cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+        # IB stores timestamps in local (wall-clock) time, not UTC.
+        # Using datetime.now() keeps the comparison in the same timezone.
+        cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
         nt = self._news_table
         with self._connect() as conn:
             rows = conn.execute(f"""
