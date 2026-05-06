@@ -474,7 +474,7 @@ class WalkForwardBacktester:
                     stop_loss_pct=window_cfg.stop_loss_pct,
                     profit_target_pct=window_cfg.profit_target_pct,
                     max_hold_days=window_cfg.max_hold_days,
-                    min_confidence=effective_min_conf,
+                    min_confidence=window_cfg.min_confidence if self._config.optimize_per_window else effective_min_conf,
                     trailing_stop_enabled=window_cfg.trailing_stop_enabled,
                     trailing_stop_pct=window_cfg.trailing_stop_pct,
                     breakeven_trigger_pct=window_cfg.breakeven_trigger_pct,
@@ -571,8 +571,7 @@ class WalkForwardBacktester:
                 initial_capital=self._config.initial_capital,
             )
             # Inject pre-loaded training data so the optimizer doesn't re-fetch
-            optimizer._data = {symbol: train_df}
-            result = optimizer.run()
+            result = optimizer.run(data={symbol: train_df})
             best = result.best_params
 
             # Build an updated config from best params, falling back to originals

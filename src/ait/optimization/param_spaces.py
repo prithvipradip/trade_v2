@@ -10,60 +10,37 @@ These are consumed by StrategyOptimizer._suggest_params().
 from __future__ import annotations
 
 IRON_CONDOR_SPACE: dict[str, tuple] = {
-    "delta_min":         ("float", 0.15, 0.30),
-    "delta_max":         ("float", 0.25, 0.45),
-    "dte_min":           ("int",   7,    21),
-    "dte_max":           ("int",   28,   60),
     "min_confidence":    ("float", 0.55, 0.80),
     "stop_loss_pct":     ("float", 0.30, 0.70),
     "profit_target_pct": ("float", 0.40, 0.80),
     "trailing_stop_pct": ("float", 0.15, 0.40),
-    "iv_floor":          ("int",   10,   30),
 }
 
 LONG_CALL_SPACE: dict[str, tuple] = {
-    "delta_target":      ("float", 0.40, 0.70),
-    "dte_min":           ("int",   14,   30),
-    "dte_max":           ("int",   45,   90),
     "min_confidence":    ("float", 0.60, 0.85),
     "stop_loss_pct":     ("float", 0.30, 0.60),
     "profit_target_pct": ("float", 0.60, 1.50),
 }
 
 LONG_PUT_SPACE: dict[str, tuple] = {
-    "delta_target":      ("float", 0.40, 0.70),
-    "dte_min":           ("int",   14,   30),
-    "dte_max":           ("int",   45,   90),
     "min_confidence":    ("float", 0.60, 0.85),
     "stop_loss_pct":     ("float", 0.30, 0.60),
     "profit_target_pct": ("float", 0.60, 1.50),
 }
 
 BULL_CALL_SPREAD_SPACE: dict[str, tuple] = {
-    "long_delta":        ("float", 0.40, 0.65),
-    "short_delta":       ("float", 0.20, 0.40),
-    "dte_min":           ("int",   14,   30),
-    "dte_max":           ("int",   45,   75),
     "min_confidence":    ("float", 0.60, 0.85),
     "stop_loss_pct":     ("float", 0.30, 0.65),
     "profit_target_pct": ("float", 0.50, 0.90),
 }
 
 BEAR_PUT_SPREAD_SPACE: dict[str, tuple] = {
-    "long_delta":        ("float", 0.40, 0.65),
-    "short_delta":       ("float", 0.20, 0.40),
-    "dte_min":           ("int",   14,   30),
-    "dte_max":           ("int",   45,   75),
     "min_confidence":    ("float", 0.60, 0.85),
     "stop_loss_pct":     ("float", 0.30, 0.65),
     "profit_target_pct": ("float", 0.50, 0.90),
 }
 
 PUT_CREDIT_SPREAD_SPACE: dict[str, tuple] = {
-    "short_delta":       ("float", 0.20, 0.40),
-    "long_delta":        ("float", 0.10, 0.25),
-    "dte_min":           ("int",   14,   30),
-    "dte_max":           ("int",   30,   60),
     "min_confidence":    ("float", 0.55, 0.80),
     "stop_loss_pct":     ("float", 0.30, 0.70),
     "profit_target_pct": ("float", 0.40, 0.80),

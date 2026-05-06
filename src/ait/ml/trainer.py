@@ -234,27 +234,136 @@ class ModelTrainer:
         return new_avg < prev_avg - 0.05
 
     def _apply_optimized_hyperparams(self, symbols: list[str], n_trials: int = 50) -> None:
-        """Run Optuna over ML spaces and patch predictor model kwargs."""
-        try:
-            from ait.optimization.optimizer import StrategyOptimizer
-            optimizer = StrategyOptimizer(
-                symbols=symbols,
-                strategies=[],
-                n_trials=n_trials,
-                n_jobs=1,
-                objective="sharpe_ratio",
-                optimize_ml=True,
-                study_name="ml_hyperparams",
-            )
-            result = optimizer.run()
-            best = result.best_params
-            log.info("ml_hyperparams_optimized", best=best)
+        """Run a dedicated Optuna search over ML hyperparameter spaces.
 
-            # Inject into predictor if it exposes model_kwargs
-            if hasattr(self._predictor, "model_kwargs"):
-                for key, val in best.items():
-                    model, _, param = key.partition("__")
-                    self._predictor.model_kwargs.setdefault(model, {})[param] = val
+        For each trial, XGBoost and LightGBM are constructed with suggested
+        hyperparameters and evaluated with walk-forward CV accuracy on a
+        representative training DataFrame.  The best params are then injected
+        into the predictor's model constructors via ``_xgb_kwargs`` /
+        ``_lgbm_kwargs`` so the next ``train()`` call uses them.
+        """
+        try:
+            import optuna
+
+            from ait.optimization.param_spaces import ML_SPACES
+
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+            # Collect one training DataFrame to use as the CV dataset.
+            # Prefer the first symbol that has stored historical data.
+            train_df: "pd.DataFrame | None" = None
+            for symbol in symbols:
+                try:
+                    df = self._store.load(symbol)
+                    if df is not None and len(df) >= self._config.min_training_samples:
+                        train_df = df
+                        break
+                except Exception:
+                    continue
+
+            if train_df is None:
+                log.warning("ml_hyperparams_skipped", reason="no_training_data_available")
+                return
+
+            # Build feature matrix once so each trial only re-fits the models.
+            from ait.ml.features import FeatureEngine
+            from sklearn.preprocessing import StandardScaler
+
+            engine = FeatureEngine()
+            features = engine.compute(train_df)
+            if len(features) < self._config.min_training_samples:
+                log.warning("ml_hyperparams_skipped", reason="insufficient_features",
+                            rows=len(features))
+                return
+
+            feature_names = [c for c in engine.get_feature_names() if c in features.columns]
+            features["target"] = self._predictor._create_labels(features["Close"])
+            features = features.dropna(subset=["target"])
+
+            import numpy as np
+            X = features[feature_names].values
+            y = features["target"].values.astype(int)
+            splits = self._predictor._walk_forward_split(len(X))
+
+            def _objective(trial: "optuna.Trial") -> float:
+                scores = []
+                for model_name, space in ML_SPACES.items():
+                    kwargs: dict = {}
+                    for param, spec in space.items():
+                        key = f"{model_name}__{param}"
+                        kwargs[param] = StrategyOptimizer_suggest_one(trial, key, spec)
+
+                    try:
+                        if model_name == "xgboost":
+                            from xgboost import XGBClassifier
+                            clf = XGBClassifier(
+                                **kwargs,
+                                objective="multi:softprob",
+                                num_class=3,
+                                eval_metric="mlogloss",
+                                verbosity=0,
+                                n_jobs=1,
+                                random_state=42,
+                            )
+                        elif model_name == "lightgbm":
+                            from lightgbm import LGBMClassifier
+                            clf = LGBMClassifier(
+                                **kwargs,
+                                objective="multiclass",
+                                num_class=3,
+                                metric="multi_logloss",
+                                verbose=-1,
+                                n_jobs=1,
+                                random_state=42,
+                            )
+                        else:
+                            continue
+
+                        fold_scores = []
+                        for train_idx, val_idx in splits:
+                            scaler = StandardScaler()
+                            X_tr = scaler.fit_transform(X[train_idx])
+                            X_val = scaler.transform(X[val_idx])
+                            sw = self._predictor._compute_sample_weights(y[train_idx])
+                            clf.fit(X_tr, y[train_idx], sample_weight=sw)
+                            fold_scores.append(clf.score(X_val, y[val_idx]))
+                        scores.append(float(np.mean(fold_scores)))
+                    except Exception as exc:
+                        log.debug("ml_trial_fold_failed", error=str(exc))
+                        raise optuna.TrialPruned()
+
+                return float(np.mean(scores)) if scores else 0.0
+
+            # Import helper from param_spaces side-car (avoids circular dep)
+            from ait.optimization.optimizer import StrategyOptimizer
+            StrategyOptimizer_suggest_one = StrategyOptimizer._suggest_one
+
+            study = optuna.create_study(
+                direction="maximize",
+                study_name="ml_hyperparams",
+                sampler=optuna.samplers.TPESampler(seed=42),
+                pruner=optuna.pruners.MedianPruner(n_warmup_steps=1),
+            )
+            study.optimize(_objective, n_trials=n_trials, n_jobs=1, catch=(Exception,))
+
+            best = study.best_params
+            log.info("ml_hyperparams_optimized", best=best, best_cv=study.best_value)
+
+            # Inject best hyperparams so the next train() call uses them.
+            xgb_kwargs: dict = {}
+            lgbm_kwargs: dict = {}
+            for key, val in best.items():
+                model, _, param = key.partition("__")
+                if model == "xgboost":
+                    xgb_kwargs[param] = val
+                elif model == "lightgbm":
+                    lgbm_kwargs[param] = val
+
+            if xgb_kwargs:
+                self._predictor._xgb_kwargs = xgb_kwargs
+            if lgbm_kwargs:
+                self._predictor._lgbm_kwargs = lgbm_kwargs
+
         except Exception as e:
             log.warning("ml_hyperparams_optimization_failed", error=str(e))
 

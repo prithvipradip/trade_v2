@@ -197,7 +197,8 @@ class IBNewsService:
     def _parse_analyst_text(symbol: str, feed_time: datetime, text: str) -> dict | None:
         """Parse structured Briefing.com article body into a flat dict.
 
-        Returns None if the essential fields (firm, action, rating) cannot be parsed.
+        Returns None if firm and action cannot be parsed (essential fields).
+        Rating is optional and may be empty string when not present in the text.
         """
         if not text:
             return None

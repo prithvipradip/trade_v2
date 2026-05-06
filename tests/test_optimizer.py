@@ -57,7 +57,8 @@ def _make_ohlcv(n: int = 300) -> pd.DataFrame:
 
 class TestParamSpaces:
     def test_iron_condor_space_has_required_keys(self):
-        required = {"delta_min", "delta_max", "dte_min", "dte_max", "min_confidence"}
+        # The space only contains params that Backtester actually accepts.
+        required = {"min_confidence", "stop_loss_pct", "profit_target_pct"}
         assert required.issubset(IRON_CONDOR_SPACE.keys())
 
     def test_all_strategy_spaces_have_min_confidence(self):
@@ -167,13 +168,31 @@ class TestOptimizationResult:
         assert "n_trials" in data
 
     def test_apply_to_config_writes_overrides(self, tmp_path: Path):
-        study = self._make_study(tmp_path)
+        """apply_to_config should write recognised params into real config sections."""
+        import optuna
+        import yaml
+
+        optuna.logging.set_verbosity(optuna.logging.ERROR)
+        study = optuna.create_study(direction="maximize")
+
+        def obj(trial):
+            # Use real param names so _PARAM_MAP picks them up
+            trial.suggest_float("iron_condor__min_confidence", 0.55, 0.80)
+            trial.suggest_float("iron_condor__stop_loss_pct", 0.30, 0.70)
+            trial.suggest_float("iron_condor__trailing_stop_pct", 0.15, 0.40)
+            return 1.0
+
+        study.optimize(obj, n_trials=2)
         result = OptimizationResult(study)
         cfg_path = str(tmp_path / "config.yaml")
         result.apply_to_config(cfg_path)
-        import yaml
+
         data = yaml.safe_load(Path(cfg_path).read_text())
-        assert "strategy_overrides" in data
+        # Recognised params are written into real config sections, not strategy_overrides
+        assert "risk" in data
+        assert "min_confidence" in data["risk"]
+        assert "exit" in data
+        assert "initial_stop_loss_pct" in data["exit"] or "trailing_stop_pct" in data["exit"]
 
 
 # ---------------------------------------------------------------------------
@@ -216,9 +235,7 @@ class TestStrategyOptimizer:
             n_trials=3,
             objective="sharpe_ratio",
         )
-        opt._data = {"SPY": _make_ohlcv(300)}
-
-        result = opt.run()
+        result = opt.run(data={"SPY": _make_ohlcv(300)})
         assert result is not None
         assert isinstance(result.best_params, dict)
         assert isinstance(result.best_value, float)
@@ -231,8 +248,7 @@ class TestStrategyOptimizer:
             n_trials=2,
             objective="composite",
         )
-        opt._data = {"SPY": _make_ohlcv(300)}
-        result = opt.run()
+        result = opt.run(data={"SPY": _make_ohlcv(300)})
         assert result is not None
 
     def test_study_name_uses_strategies_and_objective(self):
@@ -266,8 +282,7 @@ class TestStrategyOptimizer:
                 study_name=study_name,
                 storage=storage,
             )
-            opt._data = {"SPY": _make_ohlcv(300)}
-            result = opt.run()
+            result = opt.run(data={"SPY": _make_ohlcv(300)})
 
         # After two runs of 2 trials, total should be 4
         assert len(result.study.trials) == 4

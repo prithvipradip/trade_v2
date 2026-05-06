@@ -90,7 +90,7 @@ class StrategyOptimizer:
             storage=self._storage,
             load_if_exists=True,
             sampler=optuna.samplers.TPESampler(seed=42),
-            pruner=optuna.pruners.MedianPruner(n_warmup_steps=10),
+            pruner=optuna.pruners.MedianPruner(n_warmup_steps=1),
         )
 
         log.info(
@@ -182,13 +182,17 @@ class StrategyOptimizer:
         if df is None or len(df) < 60:
             raise ValueError(f"Insufficient data for {symbol}")
 
-        # Extract WalkForwardConfig-compatible params (drop strategy__ prefix)
+        # Extract Backtester-compatible params (drop strategy__ prefix).
+        # Only parameters that Backtester.__init__ actually accepts are included
+        # so Optuna optimises values that genuinely influence the objective.
         bt_kwargs: dict[str, Any] = {
-            "initial_capital": self._initial_capital,
-            "stop_loss_pct":   0.35,
-            "profit_target_pct": 0.50,
-            "min_confidence":  0.55,
-            "position_size_pct": 0.05,
+            "initial_capital":     self._initial_capital,
+            "stop_loss_pct":       0.35,
+            "profit_target_pct":   0.50,
+            "min_confidence":      0.55,
+            "position_size_pct":   0.05,
+            "trailing_stop_pct":   0.25,
+            "breakeven_trigger_pct": 0.30,
         }
         # Override with trial params that match Backtester signatures
         for key, val in params.items():

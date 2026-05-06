@@ -71,8 +71,29 @@ class OptimizationResult:
         return "\n".join(lines)
 
     def apply_to_config(self, config_path: str = "config.yaml") -> None:
-        """Write best params into config.yaml under strategy_overrides."""
+        """Write best params into config.yaml under the appropriate config sections.
+
+        Param keys use the ``strategy__param_name`` convention produced by
+        :class:`StrategyOptimizer`.  The following param names are mapped to
+        real config fields that the bot actually reads at runtime:
+
+        - ``min_confidence``       → ``risk.min_confidence``
+        - ``stop_loss_pct``        → ``exit.initial_stop_loss_pct``
+        - ``profit_target_pct``    → ``exit.partial_exit_levels`` (first level)
+        - ``trailing_stop_pct``    → ``exit.trailing_stop_pct``
+        - ``breakeven_trigger_pct`` → ``exit.breakeven_trigger_pct``
+
+        Any key that does not match a known mapping is silently skipped.
+        """
         import yaml
+
+        # Map bare param names → (section, field) in config.yaml
+        _PARAM_MAP: dict[str, tuple[str, str]] = {
+            "min_confidence":       ("risk", "min_confidence"),
+            "stop_loss_pct":        ("exit", "initial_stop_loss_pct"),
+            "trailing_stop_pct":    ("exit", "trailing_stop_pct"),
+            "breakeven_trigger_pct": ("exit", "breakeven_trigger_pct"),
+        }
 
         path = Path(config_path)
         data: dict = {}
@@ -80,13 +101,19 @@ class OptimizationResult:
             with open(path) as f:
                 data = yaml.safe_load(f) or {}
 
-        data.setdefault("strategy_overrides", {})
-        data["strategy_overrides"].update(self.best_params)
+        applied: dict[str, object] = {}
+        for key, val in self.best_params.items():
+            _, _, param_name = key.partition("__")
+            if param_name not in _PARAM_MAP:
+                continue
+            section, field = _PARAM_MAP[param_name]
+            data.setdefault(section, {})[field] = val
+            applied[key] = val
 
         with open(path, "w") as f:
             yaml.dump(data, f, default_flow_style=False, sort_keys=False)
 
-        log.info("config_updated_with_best_params", path=config_path, params=self.best_params)
+        log.info("config_updated_with_best_params", path=config_path, applied=applied)
 
     def save(self, path: str = "reports/optimization_result.json") -> None:
         """Persist best params and metrics to a JSON file."""

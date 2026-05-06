@@ -166,7 +166,7 @@ class FundamentalsStore:
 
     def get_analyst_recs(self, symbol: str, days: int = 30) -> list[dict]:
         """Return analyst actions for *symbol* issued in the last *days* days."""
-        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        cutoff = (datetime.utcnow() - timedelta(days=days)).date().isoformat()
         at = self._analyst_table
         with self._connect() as conn:
             rows = conn.execute(f"""

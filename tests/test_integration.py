@@ -13,13 +13,24 @@ Mirrors production as closely as possible:
 - Sentiment scores on rows inserted before this fix (when lambda _: 0.0 was
   the default) will remain 0.0 due to INSERT OR IGNORE; newly inserted rows
   will carry real FinBERT scores in [-1.0, +1.0].
+
+Run with:
+    RUN_INTEGRATION_TESTS=1 pytest tests/test_integration.py
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
+
+# Skip the entire module unless the user explicitly opts in.
+# This prevents slow, flaky network calls from running in the normal unit-test suite.
+pytestmark = pytest.mark.skipif(
+    not os.environ.get("RUN_INTEGRATION_TESTS"),
+    reason="Set RUN_INTEGRATION_TESTS=1 to run integration tests",
+)
 
 from ait.data.equity_stats import EquityStatsService
 from ait.data.fundamentals_db import FundamentalsStore
