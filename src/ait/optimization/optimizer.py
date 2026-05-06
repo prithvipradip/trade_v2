@@ -69,9 +69,18 @@ class StrategyOptimizer:
     # Public API
     # ------------------------------------------------------------------
 
-    def run(self) -> OptimizationResult:
-        """Fetch data, create/resume Optuna study, and run optimization."""
-        self._data = self._fetch_data()
+    def run(self, data: dict[str, pd.DataFrame] | None = None) -> OptimizationResult:
+        """Fetch data if needed, create/resume Optuna study, and run optimization.
+
+        Args:
+            data: Optional preloaded OHLCV data keyed by symbol. When provided,
+                this data is used as-is and no fetch is performed.
+        """
+        if data is not None:
+            self._data = data
+        elif not self._data:
+            self._data = self._fetch_data()
+
         if not self._data:
             raise RuntimeError("No market data fetched — check internet connection or symbol names.")
 
