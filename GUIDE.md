@@ -117,9 +117,14 @@ The system is designed to run 24/7 on a dedicated machine or cloud VM, requiring
 | **Portfolio Manager** | `src/ait/execution/portfolio.py` | Monitors open positions every 30 sec, triggers exits |
 | **Learning Engine** | `src/ait/learning/` | Post-market cycle: analyzes trade history, adapts strategy weights |
 | **Counterfactual Logger** | `src/ait/learning/counterfactual.py` | Records trades that were rejected — measures missed opportunity |
-| **Sentiment Engine** | `src/ait/sentiment/` | FinBERT + Finnhub news + Fear & Greed → sentiment score |
+| **Sentiment Engine** | `src/ait/sentiment/` | FinBERT + Finnhub + Fear & Greed + IB news → sentiment score |
+| **Equity Stats Service** | `src/ait/data/equity_stats.py` | yfinance fundamentals → DuckDB `equity_stats` table (daily refresh) |
+| **Fundamentals Store** | `src/ait/data/fundamentals_db.py` | SQLite CRUD for IB news and analyst recommendations |
+| **IB News Service** | `src/ait/data/ib_news.py` | Fetches IB news (BRFG/DJ-N) + analyst actions (BRFUPDN), parses and persists |
+| **Strategy Optimizer** | `src/ait/optimization/optimizer.py` | Optuna TPE Bayesian search over strategy + ML parameter spaces |
+| **Optimization Results** | `src/ait/optimization/results.py` | Top-N trial summary, JSON save, apply best params to config |
 | **Analytics** | `src/ait/monitoring/analytics.py` | Win rate, Sharpe, drawdown — tracked per strategy |
-| **DuckDB Analytics** | `src/ait/monitoring/duckdb_analytics.py` | Fast analytical queries on closed trades |
+| **DuckDB Analytics** | `src/ait/monitoring/duckdb_analytics.py` | Closed trades + equity_stats table; fast analytical queries |
 | **Watchdog** | `src/ait/monitoring/watchdog.py` | Monitors memory, latency, error rates, IBKR connection |
 | **Dashboard** | `src/ait/dashboard/app.py` | Streamlit web UI on port 8501 |
 | **Telegram Notifier** | `src/ait/notifications/` | Sends trade alerts and daily summaries |
@@ -830,13 +835,16 @@ When a trade is rejected, the system tracks what would have happened. After the 
 1. Interactive Brokers (ib_insync)
    ├─ Real-time quotes (bid/ask/last/volume)
    ├─ Historical OHLCV (daily and 5-min bars)
-   └─ Options chains (all expirations and strikes)
+   ├─ Options chains (all expirations and strikes)
+   ├─ News headlines (BRFG, DJ-N, DJ-RTG, DJ-RTPRO, DJNL) → fundamentals.db
+   └─ Analyst recommendations (BRFUPDN / Briefing.com) → fundamentals.db
         ↓ on failure
 2. Polygon.io (API key required)
    └─ Historical daily data (free tier: 5 calls/minute)
         ↓ on failure
 3. Yahoo Finance (yfinance — no key required)
-   └─ Historical OHLCV, fallback for anything above
+   ├─ Historical OHLCV, fallback for anything above
+   └─ Equity fundamentals (P/E, beta, sector, analyst targets) → equity_stats table
 ```
 
 Options chain data only comes from IBKR. If IBKR disconnects, no new trades can be entered, but the 30-second monitor loop continues to manage existing positions using the last-known underlying price.
@@ -876,8 +884,10 @@ FNSPID is the most immediately applicable for training — it covers all AIT uni
 | Store | Technology | What's in it |
 |---|---|---|
 | `data/ait_state.db` | SQLite | Open trades, open_positions (HWM/partials), trade_context, KV store |
-| `data/ait_analytics.duckdb` | DuckDB | Closed trades, daily stats, trade context — fast analytical queries |
+| `data/ait_analytics.duckdb` | DuckDB | Closed trades, daily stats, trade context, equity_stats — fast analytical queries |
 | `data/historical.db` | SQLite | OHLCV cache — avoids refetching the same data |
+| `data/fundamentals.db` | SQLite | IB news headlines (scored) + analyst recommendations (firm/action/rating/target) |
+| `data/optuna.db` | SQLite | Optuna study history — created on demand, supports resumable runs |
 | `data/thompson_state.json` | JSON | Thompson sampler win/loss counts per strategy |
 | `data/counterfactual_log.json` | JSON | Rejected trade outcomes |
 | `models/ensemble.pkl` | Pickle | Current trained direction XGBoost + LightGBM models |
@@ -1002,6 +1012,21 @@ AIT_IRON_CONDOR_IV_FLOOR=15      # Min IV rank to enter iron condors
 AIT_SKIP_MACRO_EVENTS=0          # Set to 1 to flatten positions before FOMC/CPI/NFP
 ```
 
+### Sentiment — IB News Weight
+```yaml
+sentiment:
+  ib_news_weight: 0.20            # Weight of IB-sourced pre-scored news (0.0 disables)
+```
+The IB news branch is active when `FundamentalsStore` is provided to `SentimentEngine` and `data/fundamentals.db` contains recent news rows for the symbol.
+
+### Walk-Forward Optimization
+```yaml
+# These fields are on WalkForwardConfig, not config.yaml
+# Pass them as CLI flags to run_backtest.py:
+#   --optimize-per-window     enable per-window Optuna tuning
+#   --optimize-n-trials 50    trials per window (default 50)
+```
+
 ---
 
 ## 1.17 Technology Stack
@@ -1020,6 +1045,7 @@ AIT_SKIP_MACRO_EVENTS=0          # Set to 1 to flatten positions before FOMC/CPI
 | Scheduling | APScheduler | ≥ 3.10 |
 | Operational state | SQLite (built-in) | — |
 | Analytics | DuckDB | ≥ 1.0 |
+| Parameter optimization | Optuna | ≥ 3.6 |
 | Dashboard | Streamlit + Plotly | ≥ 1.31 / ≥ 5.19 |
 | Log viewer | Flask | — |
 | Structured logging | structlog | ≥ 24.1 |
@@ -1183,11 +1209,76 @@ python run_backtest.py --compare-exits           # Fixed vs trailing stops
 
 ## 1.20 Parameter Optimization
 
-**Short answer: automated parameter optimization does not currently exist.** All strategy parameters are set manually in `config.yaml` and validated by running the backtester.
+The system includes a fully integrated **Optuna-based Bayesian parameter optimizer** (`src/ait/optimization/`). It uses the TPE sampler with MedianPruner to find optimal strategy parameters and ML hyperparameters in far fewer trials than grid search.
 
-### What Can Be Tuned
+### Running the Optimizer
 
-**Backtester CLI flags** (fast iteration, no restart needed):
+```bash
+# Strategy parameters — iron condor + sharpe objective, 100 trials
+python run_optimizer.py \
+  --strategies iron_condor \
+  --symbols SPY QQQ \
+  --n-trials 100 \
+  --objective sharpe_ratio \
+  --storage sqlite:///data/optuna.db   # optional: enables resumable studies
+
+# ML hyperparameters (XGBoost + LightGBM)
+python run_optimizer.py \
+  --strategies iron_condor \
+  --symbols SPY QQQ \
+  --optimize-ml \
+  --n-trials 50
+
+# Apply best params back to config.yaml
+python run_optimizer.py --strategies iron_condor --symbols SPY --n-trials 20 --apply
+
+# Resume a previous study (trials accumulate across runs)
+python run_optimizer.py \
+  --study-name iron_condor_study \
+  --storage sqlite:///data/optuna.db \
+  --n-trials 50    # adds 50 more trials to the existing study
+```
+
+### Objective Functions
+
+| Objective | Formula | Best when |
+|---|---|---|
+| `sharpe_ratio` | P&L / σ(P&L) | Risk-adjusted return |
+| `composite` | `0.4×sharpe + 0.4×win_rate − 0.2×|max_drawdown|` | Balanced tuning |
+| `profit_factor` | gross_wins / gross_losses (capped at 10) | Raw edge focus |
+| `win_rate` | % of profitable trades | Consistency focus |
+
+### Parameter Spaces
+
+Each strategy has a defined search space in `param_spaces.py`:
+
+| Parameter (iron condor) | Search Range |
+|---|---|
+| `delta_min` | float [0.15, 0.30] |
+| `delta_max` | float [0.25, 0.45] |
+| `dte_min` | int [7, 21] |
+| `dte_max` | int [28, 60] |
+| `min_confidence` | float [0.55, 0.80] |
+| `stop_loss_pct` | float [0.30, 0.70] |
+| `profit_target_pct` | float [0.40, 0.80] |
+| `iv_floor` | int [10, 30] |
+
+ML model spaces (`xgboost`, `lightgbm`) cover `n_estimators`, `learning_rate`, `max_depth`, `subsample`, `colsample_bytree`, and model-specific params.
+
+### Walk-Forward Integration
+
+Set `optimize_per_window: true` in `WalkForwardConfig` (or pass `--optimize-per-window` to `run_backtest.py`) to run Optuna on each training slice before testing it. Each window finds its own best parameters — this is computationally expensive but produces the most realistic out-of-sample results.
+
+```bash
+python run_backtest.py \
+  --symbols SPY QQQ \
+  --optimize-per-window \
+  --optimize-n-trials 50   # Optuna trials per walk-forward window
+```
+
+### Manual Tuning (still valid for quick iteration)
+
+**Backtester CLI flags** (no restart needed):
 
 | Parameter | CLI flag | Default | Controls |
 |---|---|---|---|
@@ -1196,18 +1287,6 @@ python run_backtest.py --compare-exits           # Fixed vs trailing stops
 | Range model threshold | `--range-confidence` | 0.55 | Min P(in range) for condors |
 | Trailing vs fixed stops | `--trailing-stop` / `--compare-exits` | On | Exit style comparison |
 
-**`config.yaml` parameters** (require bot restart):
-
-| Parameter | Location | Controls |
-|---|---|---|
-| Delta range for short strikes | `options.delta_range` | How far OTM the short legs are |
-| DTE range | `options.dte_range` | Expiration window (14–45 days default) |
-| Take-profit target | `exit` section | When to close winning positions |
-| Stop-loss level | `exit.initial_stop_loss_pct` | When to close losing positions |
-| Max open positions | `positions.max_open_positions` | Portfolio concentration |
-
-### Current Manual Tuning Workflow
-
 ```
 1. Run baseline: python run_backtest.py --iv-floor 30
 2. Run candidate: python run_backtest.py --iv-floor 20
@@ -1215,10 +1294,6 @@ python run_backtest.py --compare-exits           # Fixed vs trailing stops
 4. If improvement across multiple metrics: update config.yaml
 ```
 
-### ML Hyperparameters
-
-XGBoost/LightGBM hyperparameters are set to reasonable defaults in `src/ait/ml/ensemble.py` and are not exposed in `config.yaml`. Proper Bayesian tuning (e.g., with Optuna) would need to be added to the training pipeline. This is tracked in `TODO.md` under "Hyperparameter tuning (Optuna)."
-
 ---
 
-*This document is a living reference. Last updated: 2026-04-30*
+*This document is a living reference. Last updated: 2026-05-05*

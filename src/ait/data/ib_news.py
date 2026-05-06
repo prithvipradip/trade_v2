@@ -160,9 +160,11 @@ class IBNewsService:
 
     @staticmethod
     def _strip_prefix(headline: str) -> str:
-        """Remove '{A:...:K:...:C:...}!' prefix that IB injects into headlines."""
-        if headline.startswith("{") and "!" in headline:
-            return headline.split("!", 1)[1]
+        """Remove '{A:...:K:...:C:...}[!]' prefix that IB injects into headlines."""
+        if headline.startswith("{") and "}" in headline:
+            after_brace = headline.split("}", 1)[1]
+            # Some providers use '}!' separator, others use '}' directly
+            return after_brace.lstrip("!")
         return headline
 
     @staticmethod

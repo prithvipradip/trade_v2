@@ -25,9 +25,11 @@ DEFAULT_DB_PATH = Path("data/fundamentals.db")
 class FundamentalsStore:
     """SQLite CRUD layer for news and analyst recommendations."""
 
-    def __init__(self, db_path: Path = DEFAULT_DB_PATH) -> None:
+    def __init__(self, db_path: Path = DEFAULT_DB_PATH, table_prefix: str = "") -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
+        self._news_table = f"{table_prefix}news"
+        self._analyst_table = f"{table_prefix}analyst_recommendations"
         self._init_schema()
 
     # ------------------------------------------------------------------
@@ -40,9 +42,11 @@ class FundamentalsStore:
         return conn
 
     def _init_schema(self) -> None:
+        nt = self._news_table
+        at = self._analyst_table
         with self._connect() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS news (
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {nt} (
                     article_id   TEXT PRIMARY KEY,
                     symbol       TEXT NOT NULL,
                     provider     TEXT NOT NULL,
@@ -53,12 +57,12 @@ class FundamentalsStore:
                     sentiment    REAL DEFAULT 0.0
                 )
             """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_news_symbol_date
-                    ON news(symbol, published_at DESC)
+            conn.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_{nt}_symbol_date
+                    ON {nt}(symbol, published_at DESC)
             """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS analyst_recommendations (
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {at} (
                     id           TEXT PRIMARY KEY,
                     symbol       TEXT NOT NULL,
                     issued_at    TEXT NOT NULL,
@@ -73,9 +77,9 @@ class FundamentalsStore:
                     UNIQUE(symbol, issued_at, firm)
                 )
             """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_analyst_symbol_date
-                    ON analyst_recommendations(symbol, issued_at DESC)
+            conn.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_{at}_symbol_date
+                    ON {at}(symbol, issued_at DESC)
             """)
         log.info("fundamentals_db_initialized", path=str(self._db_path))
 
@@ -88,10 +92,11 @@ class FundamentalsStore:
         if not articles:
             return 0
         inserted = 0
+        nt = self._news_table
         with self._connect() as conn:
             for a in articles:
-                cur = conn.execute("""
-                    INSERT OR IGNORE INTO news
+                cur = conn.execute(f"""
+                    INSERT OR IGNORE INTO {nt}
                         (article_id, symbol, provider, headline, url, published_at, sentiment)
                     VALUES
                         (:article_id, :symbol, :provider, :headline, :url, :published_at, :sentiment)
@@ -111,11 +116,12 @@ class FundamentalsStore:
     def get_recent_news(self, symbol: str, hours: int = 24) -> list[dict]:
         """Return news articles for *symbol* published in the last *hours* hours."""
         cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+        nt = self._news_table
         with self._connect() as conn:
-            rows = conn.execute("""
+            rows = conn.execute(f"""
                 SELECT article_id, symbol, provider, headline, url,
                        published_at, fetched_at, sentiment
-                FROM news
+                FROM {nt}
                 WHERE symbol = ? AND published_at >= ?
                 ORDER BY published_at DESC
             """, [symbol, cutoff]).fetchall()
@@ -130,10 +136,11 @@ class FundamentalsStore:
         if not recs:
             return 0
         inserted = 0
+        at = self._analyst_table
         with self._connect() as conn:
             for r in recs:
-                cur = conn.execute("""
-                    INSERT OR IGNORE INTO analyst_recommendations
+                cur = conn.execute(f"""
+                    INSERT OR IGNORE INTO {at}
                         (id, symbol, issued_at, published_at, firm, action,
                          rating, price_target, prior_target, raw_text)
                     VALUES
@@ -158,11 +165,12 @@ class FundamentalsStore:
     def get_analyst_recs(self, symbol: str, days: int = 30) -> list[dict]:
         """Return analyst actions for *symbol* issued in the last *days* days."""
         cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        at = self._analyst_table
         with self._connect() as conn:
-            rows = conn.execute("""
+            rows = conn.execute(f"""
                 SELECT id, symbol, issued_at, published_at, fetched_at,
                        firm, action, rating, price_target, prior_target, raw_text
-                FROM analyst_recommendations
+                FROM {at}
                 WHERE symbol = ? AND issued_at >= ?
                 ORDER BY issued_at DESC
             """, [symbol, cutoff]).fetchall()

@@ -60,7 +60,7 @@ class EquityStatsService:
     def __init__(self, analytics: DuckDBAnalytics) -> None:
         self._analytics = analytics
 
-    def refresh_symbol(self, symbol: str) -> bool:
+    def refresh_symbol(self, symbol: str, table: str = "equity_stats") -> bool:
         """Fetch one symbol from yfinance and upsert into DuckDB.
 
         Returns True on success, False if the fetch or upsert failed.
@@ -71,23 +71,24 @@ class EquityStatsService:
                 log.warning("equity_stats_empty_info", symbol=symbol)
                 return False
             stats = self._map_fields(symbol, info)
-            self._analytics.upsert_equity_stats(stats)
+            self._analytics.upsert_equity_stats(stats, table=table)
             log.info(
                 "equity_stats_refreshed",
                 symbol=symbol,
                 sector=stats.get("sector", ""),
                 pe_ratio=stats.get("pe_ratio", 0),
+                table=table,
             )
             return True
         except Exception as e:
             log.warning("equity_stats_fetch_failed", symbol=symbol, error=str(e))
             return False
 
-    def refresh_all(self, symbols: list[str]) -> dict[str, bool]:
+    def refresh_all(self, symbols: list[str], table: str = "equity_stats") -> dict[str, bool]:
         """Refresh all symbols; returns {symbol: success} mapping."""
         results: dict[str, bool] = {}
         for symbol in symbols:
-            results[symbol] = self.refresh_symbol(symbol)
+            results[symbol] = self.refresh_symbol(symbol, table=table)
         ok = sum(results.values())
         log.info("equity_stats_batch_complete", total=len(symbols), ok=ok, failed=len(symbols) - ok)
         return results

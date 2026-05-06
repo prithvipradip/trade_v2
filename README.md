@@ -134,6 +134,7 @@ This installs all packages from `pyproject.toml`:
 - **Options**: `py-vollib` (Greeks/IV calculations)
 - **Dashboard**: `streamlit`, `plotly`, `flask`
 - **Infrastructure**: `apscheduler`, `duckdb`, `structlog`, `pydantic`
+- **Optimization**: `optuna` (Bayesian hyperparameter search)
 
 ### 4. Install Interactive Brokers Gateway
 
@@ -313,8 +314,20 @@ python run_orchestrator.py --retrain
 # Generate daily report
 python run_orchestrator.py --report
 
+# Refresh equity fundamental stats (yfinance → DuckDB)
+python run_orchestrator.py --refresh-fundamentals
+
+# Fetch IB news + analyst recommendations → fundamentals.db
+python run_orchestrator.py --fetch-news
+
 # Run walk-forward backtest
 python run_backtest.py --symbols SPY QQQ AAPL --capital 50000
+
+# Walk-forward backtest with per-window Optuna optimization
+python run_backtest.py --symbols SPY QQQ --optimize-per-window --optimize-n-trials 50
+
+# Run Optuna strategy parameter search
+python run_optimizer.py --strategies iron_condor --symbols SPY QQQ --n-trials 100 --objective sharpe_ratio
 
 # View live logs (color-coded)
 python tail_logs.py
@@ -391,6 +404,7 @@ Composite sentiment score per symbol (-1.0 to +1.0):
 - **News** (weight 35%) from Finnhub headlines
 - **Fear & Greed** (weight 40%) from VIX + breadth + momentum
 - **FinBERT** (weight 25%) — local NLP model on headlines
+- **IB News** (weight 20%, configurable) — pre-scored headlines from `fundamentals.db` (when available)
 
 ### Learning Engine ([src/ait/learning/engine.py](src/ait/learning/engine.py))
 Post-market analysis:
@@ -551,6 +565,7 @@ trade_v2/
 ├── pyproject.toml              ← Python package config
 ├── run_orchestrator.py         ← Master entry point
 ├── run_backtest.py             ← CLI backtester
+├── run_optimizer.py            ← Optuna strategy/ML parameter optimizer
 ├── tail_logs.py                ← Terminal log viewer
 ├── web_logs.py                 ← Flask log viewer (port 8502)
 ├── start_bot.bat               ← Windows launcher
@@ -604,7 +619,10 @@ trade_v2/
 │   │   ├── economic_calendar.py ← FOMC/CPI/NFP calendar
 │   │   ├── multi_timeframe.py  ← Daily + intraday
 │   │   ├── quality.py          ← Data validation
-│   │   └── cache.py            ← TTL cache
+│   │   ├── cache.py            ← TTL cache
+│   │   ├── equity_stats.py     ← yfinance fundamentals → DuckDB
+│   │   ├── fundamentals_db.py  ← SQLite store for IB news + analyst recs
+│   │   └── ib_news.py          ← IB news + analyst action fetcher
 │   ├── learning/
 │   │   ├── engine.py           ← Post-market learning cycle
 │   │   ├── analyzer.py         ← Trade pattern analysis
@@ -623,10 +641,15 @@ trade_v2/
 │   │   └── telegram.py         ← Telegram alerts
 │   ├── backtesting/
 │   │   ├── engine.py           ← Single-window backtester
-│   │   ├── walkforward.py      ← Rolling windows
+│   │   ├── walkforward.py      ← Rolling windows (optimize_per_window support)
 │   │   ├── options_sim.py      ← Black-Scholes pricing
 │   │   ├── learner.py          ← In-backtest learning
 │   │   └── result.py           ← Metrics calculator
+│   ├── optimization/
+│   │   ├── optimizer.py        ← StrategyOptimizer (Optuna TPE)
+│   │   ├── param_spaces.py     ← Parameter spaces per strategy + ML model
+│   │   ├── objectives.py       ← Objective functions (sharpe, composite, etc.)
+│   │   └── results.py          ← OptimizationResult + reporting
 │   ├── config/
 │   │   └── settings.py         ← Pydantic config models
 │   └── utils/
@@ -635,8 +658,10 @@ trade_v2/
 ├── tests/                      ← Unit tests
 ├── data/                       ← Runtime artifacts (gitignored)
 │   ├── ait_state.db            ← SQLite trading state
-│   ├── ait_analytics.duckdb    ← Analytics database
+│   ├── ait_analytics.duckdb    ← Analytics database (incl. equity_stats table)
 │   ├── historical.db           ← OHLCV cache
+│   ├── fundamentals.db         ← IB news + analyst recommendations (SQLite)
+│   ├── optuna.db               ← Optuna study storage (SQLite, created on demand)
 │   ├── counterfactual_log.json
 │   └── thompson_state.json
 ├── models/                     ← Trained models (gitignored)
@@ -656,8 +681,9 @@ trade_v2/
 ### Running Tests
 
 ```bash
-pytest                                      # All tests
+pytest                                      # All tests (unit + integration)
 pytest tests/test_risk.py -v                # Specific file
+pytest tests/test_integration.py -v        # Integration tests (requires live IB Gateway)
 pytest --cov=src/ait                        # With coverage
 ```
 
