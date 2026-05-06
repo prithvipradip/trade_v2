@@ -84,9 +84,14 @@ def _fetch_news() -> None:
             sentiment_fn=lambda h: finbert.analyze(h) or 0.0,
         )
         for symbol in symbols:
-            n = svc.fetch_and_store_news(symbol, hours_back=24)
-            a = svc.fetch_and_store_analyst_actions(symbol, hours_back=168)
-            print(f"  {symbol:8s}  news={n:3d} inserted  analyst={a:3d} inserted")
+            news_fetched, news_inserted = svc.fetch_and_store_news(symbol, hours_back=24)
+            analyst_fetched, analyst_inserted = svc.fetch_and_store_analyst_actions(
+                symbol, hours_back=168
+            )
+            print(
+                f"  {symbol:8s}  news={news_inserted:3d} inserted ({news_fetched:3d} fetched)  "
+                f"analyst={analyst_inserted:3d} inserted ({analyst_fetched:3d} fetched)"
+            )
     finally:
         ib.disconnect()
     print("Done.")
