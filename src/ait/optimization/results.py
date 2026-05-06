@@ -79,7 +79,6 @@ class OptimizationResult:
 
         - ``min_confidence``       → ``risk.min_confidence``
         - ``stop_loss_pct``        → ``exit.initial_stop_loss_pct``
-        - ``profit_target_pct``    → ``exit.partial_exit_levels`` (first level)
         - ``trailing_stop_pct``    → ``exit.trailing_stop_pct``
         - ``breakeven_trigger_pct`` → ``exit.breakeven_trigger_pct``
 

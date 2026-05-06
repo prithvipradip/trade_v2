@@ -462,6 +462,15 @@ class WalkForwardBacktester:
                 avg_mult = sum(strategy_mults) / len(strategy_mults) if strategy_mults else 1.0
                 effective_position_size = self._config.position_size_pct * min(avg_mult, 2.0)
 
+                # When per-window optimization is active the optimized window_cfg
+                # is the source of truth for min_confidence; otherwise defer to
+                # the self-learning subsystem.
+                confidence_threshold = (
+                    window_cfg.min_confidence
+                    if self._config.optimize_per_window
+                    else effective_min_conf
+                )
+
                 # Each symbol gets its proportional share of capital
                 bt = Backtester(
                     data=test_with_context,
@@ -474,7 +483,7 @@ class WalkForwardBacktester:
                     stop_loss_pct=window_cfg.stop_loss_pct,
                     profit_target_pct=window_cfg.profit_target_pct,
                     max_hold_days=window_cfg.max_hold_days,
-                    min_confidence=window_cfg.min_confidence if self._config.optimize_per_window else effective_min_conf,
+                    min_confidence=confidence_threshold,
                     trailing_stop_enabled=window_cfg.trailing_stop_enabled,
                     trailing_stop_pct=window_cfg.trailing_stop_pct,
                     breakeven_trigger_pct=window_cfg.breakeven_trigger_pct,
