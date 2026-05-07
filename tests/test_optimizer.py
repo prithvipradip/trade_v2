@@ -308,9 +308,7 @@ class TestStrategyOptimizer:
                 )
 
         class _FakeYF:
-            @staticmethod
-            def Ticker(symbol: str) -> _FakeTicker:  # noqa: N802 - mimics yfinance API
-                return _FakeTicker(symbol)
+            Ticker = _FakeTicker
 
         original_yf = sys.modules.get("yfinance")
         sys.modules["yfinance"] = _FakeYF
