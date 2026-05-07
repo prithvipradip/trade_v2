@@ -217,6 +217,7 @@ class StrategyOptimizer:
         data = {}
         weekend_holiday_buffer_days = 30
         min_period_days = 90
+        min_required_rows = 60
         requested_days = max(1, int(self._train_days))
         period_days = max(
             requested_days + weekend_holiday_buffer_days,
@@ -228,7 +229,7 @@ class StrategyOptimizer:
                 if df is not None and len(df) > 0:
                     df = df.tail(requested_days)
                     df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-                    if len(df) >= 60:
+                    if len(df) >= min_required_rows:
                         data[symbol] = df
                         log.info(
                             "data_fetched_for_optimizer",
