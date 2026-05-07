@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from datetime import datetime, timedelta
 from typing import Callable
 
@@ -77,6 +78,9 @@ class IBNewsService:
         end = datetime.now()
         start = end - timedelta(hours=hours_back)
 
+        t_hist = time.monotonic()
+        log.info("req_historical_news_start", symbol=symbol, providers=self._news_providers,
+                 hours_back=hours_back)
         try:
             raw = self._client.ib.reqHistoricalNews(
                 con_id,
@@ -86,13 +90,22 @@ class IBNewsService:
                 totalResults=50,
             )
         except Exception as e:
-            log.error("ib_news_fetch_failed", symbol=symbol, error=str(e))
+            log.error("ib_news_fetch_failed", symbol=symbol, error=str(e),
+                      elapsed_s=round(time.monotonic() - t_hist, 2))
             return 0, 0
+        log.info("req_historical_news_done", symbol=symbol, article_count=len(raw or []),
+                 elapsed_s=round(time.monotonic() - t_hist, 2))
 
         rows = []
-        for a in raw or []:
+        for i, a in enumerate(raw or []):
             headline = self._strip_prefix(a.headline)
             a_time = a.time if isinstance(a.time, datetime) else datetime.fromisoformat(str(a.time))
+            t_sent = time.monotonic()
+            sentiment = self._sentiment_fn(headline)
+            sent_elapsed = round(time.monotonic() - t_sent, 3)
+            if sent_elapsed > 1.0:
+                log.warning("slow_sentiment_score", article_index=i, article_id=a.articleId,
+                            elapsed_s=sent_elapsed)
             rows.append({
                 "article_id": a.articleId,
                 "symbol":     symbol,
@@ -100,11 +113,14 @@ class IBNewsService:
                 "headline":   headline,
                 "url":        "",
                 "published_at": a_time.isoformat(),
-                "sentiment":  self._sentiment_fn(headline),
+                "sentiment":  sentiment,
             })
+        log.info("sentiment_scoring_done", symbol=symbol, article_count=len(rows))
 
+        t_insert = time.monotonic()
         inserted = self._store.insert_news(rows)
-        log.info("news_fetched_and_stored", symbol=symbol, fetched=len(rows), inserted=inserted)
+        log.info("news_fetched_and_stored", symbol=symbol, fetched=len(rows), inserted=inserted,
+                 insert_elapsed_s=round(time.monotonic() - t_insert, 3))
         return len(rows), inserted
 
     def fetch_and_store_analyst_actions(self, symbol: str, hours_back: int = 168) -> tuple[int, int]:
@@ -120,6 +136,8 @@ class IBNewsService:
         end = datetime.now()
         start = end - timedelta(hours=hours_back)
 
+        t_hist = time.monotonic()
+        log.info("req_analyst_news_start", symbol=symbol, hours_back=hours_back)
         try:
             raw = self._client.ib.reqHistoricalNews(
                 con_id,
@@ -129,19 +147,29 @@ class IBNewsService:
                 totalResults=50,
             )
         except Exception as e:
-            log.error("analyst_news_fetch_failed", symbol=symbol, error=str(e))
+            log.error("analyst_news_fetch_failed", symbol=symbol, error=str(e),
+                      elapsed_s=round(time.monotonic() - t_hist, 2))
             return 0, 0
+        log.info("req_analyst_news_done", symbol=symbol, article_count=len(raw or []),
+                 elapsed_s=round(time.monotonic() - t_hist, 2))
 
         recs = []
-        for a in raw or []:
+        for i, a in enumerate(raw or []):
+            t_art = time.monotonic()
+            log.info("req_news_article_start", symbol=symbol, article_index=i,
+                     article_id=a.articleId, provider=a.providerCode)
             try:
                 article = self._client.ib.reqNewsArticle(a.providerCode, a.articleId, [])
                 text = getattr(article, "articleText", "") or ""
+                log.info("req_news_article_done", symbol=symbol, article_index=i,
+                         article_id=a.articleId, text_len=len(text),
+                         elapsed_s=round(time.monotonic() - t_art, 2))
                 parsed = self._parse_analyst_text(symbol, a.time, text)
                 if parsed:
                     recs.append(parsed)
             except Exception as e:
-                log.warning("analyst_article_fetch_failed", article_id=a.articleId, error=str(e))
+                log.warning("analyst_article_fetch_failed", article_id=a.articleId,
+                            elapsed_s=round(time.monotonic() - t_art, 2), error=str(e))
 
         inserted = self._store.insert_analyst_rec(recs)
         log.info(
@@ -163,25 +191,29 @@ class IBNewsService:
         account lacks a provider in _DESIRED_NEWS_PROVIDERS (e.g. live accounts
         have DJ-RT but not DJ-RTPRO; paper accounts differ again).
         """
+        t0 = time.monotonic()
         try:
             available = {p.code for p in self._client.ib.reqNewsProviders()}
         except Exception:
             available = _DESIRED_NEWS_PROVIDERS  # best-effort fallback
         subscribed = _DESIRED_NEWS_PROVIDERS & available
         provider_str = "+".join(sorted(subscribed)) if subscribed else "BRFG"
-        log.info("news_providers_active", providers=provider_str)
+        log.info("news_providers_active", providers=provider_str, elapsed_s=round(time.monotonic() - t0, 2))
         return provider_str
 
     def _resolve_con_id(self, symbol: str) -> int | None:
         """Return IB contract conId for a plain equity symbol."""
         from ib_insync import Stock
+        t0 = time.monotonic()
         try:
             contract = Stock(symbol, "SMART", "USD")
             qualified = self._client.ib.qualifyContracts(contract)
             if qualified:
-                return qualified[0].conId
+                con_id = qualified[0].conId
+                log.info("con_id_resolved", symbol=symbol, con_id=con_id, elapsed_s=round(time.monotonic() - t0, 2))
+                return con_id
         except Exception as e:
-            log.warning("con_id_resolution_failed", symbol=symbol, error=str(e))
+            log.warning("con_id_resolution_failed", symbol=symbol, error=str(e), elapsed_s=round(time.monotonic() - t0, 2))
         return None
 
     @staticmethod

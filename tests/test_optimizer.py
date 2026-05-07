@@ -57,12 +57,9 @@ def _make_ohlcv(n: int = 300) -> pd.DataFrame:
 
 class TestParamSpaces:
     def test_iron_condor_space_has_required_keys(self):
-        # The space only contains params that Backtester actually accepts.
-        required = {"min_confidence", "stop_loss_pct", "profit_target_pct"}
+        required = {"min_confidence", "stop_loss_pct", "profit_target_pct",
+                    "delta_short", "max_hold_days", "iv_floor"}
         assert required.issubset(IRON_CONDOR_SPACE.keys())
-        # Strategy-specific params that Backtester cannot consume are excluded.
-        removed = {"delta_min", "delta_max", "dte_min", "dte_max", "iv_floor"}
-        assert not removed.intersection(IRON_CONDOR_SPACE.keys())
 
     def test_all_strategy_spaces_have_min_confidence(self):
         for name, space in STRATEGY_SPACES.items():

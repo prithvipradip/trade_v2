@@ -186,13 +186,17 @@ class StrategyOptimizer:
         # Only parameters that Backtester.__init__ actually accepts are included
         # so Optuna optimises values that genuinely influence the objective.
         bt_kwargs: dict[str, Any] = {
-            "initial_capital":     self._initial_capital,
-            "stop_loss_pct":       0.35,
-            "profit_target_pct":   0.50,
-            "min_confidence":      0.55,
-            "position_size_pct":   0.05,
-            "trailing_stop_pct":   0.25,
+            "initial_capital":       self._initial_capital,
+            "stop_loss_pct":         0.35,
+            "profit_target_pct":     0.50,
+            "min_confidence":        0.55,
+            "position_size_pct":     0.05,
+            "trailing_stop_pct":     0.25,
             "breakeven_trigger_pct": 0.30,
+            "max_hold_days":         30,
+            "delta_short":           0.20,
+            "delta_long":            0.30,
+            "iv_floor":              0.10,
         }
         # Override with trial params that match Backtester signatures
         for key, val in params.items():

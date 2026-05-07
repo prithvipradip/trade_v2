@@ -704,11 +704,14 @@ trade_v2/
 ### Running Tests
 
 ```bash
-pytest                                      # All tests (unit + integration)
-pytest tests/test_risk.py -v                # Specific file
-pytest tests/test_integration.py -v        # Integration tests (requires live IB Gateway)
-pytest --cov=src/ait                        # With coverage
+pytest                                      # Unit tests only (no IB connection required)
+pytest tests/test_risk.py -v               # Specific file
+RUN_INTEGRATION_TESTS=1 pytest tests/test_integration.py -v   # Integration tests (requires live IB Gateway)
+RUN_INTEGRATION_TESTS=1 pytest             # All tests including integration
+pytest --cov=src/ait                       # With coverage
 ```
+
+`test_integration.py` is gated by the `RUN_INTEGRATION_TESTS=1` env var and skipped entirely in the normal test run. It requires IB Gateway running on port 4001 (live) or 4002 (paper). The suite typically completes in ~20 seconds — `reqHistoricalNews` and `reqNewsArticle` calls each take <0.2s; FinBERT's cold model load on first inference adds ~7s once per session.
 
 ### Code Style
 

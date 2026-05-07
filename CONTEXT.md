@@ -62,7 +62,7 @@ run_orchestrator.py          ← Master process (start here)
 | `src/ait/data/earnings.py` | Earnings calendar — blocks trades near earnings |
 | `src/ait/data/equity_stats.py` | yfinance equity fundamentals → DuckDB equity_stats table |
 | `src/ait/data/fundamentals_db.py` | SQLite CRUD for IB news + analyst recommendations |
-| `src/ait/data/ib_news.py` | IB news (BRFG/DJ-N) + analyst actions (BRFUPDN) fetcher |
+| `src/ait/data/ib_news.py` | IB news (BRFG/DJ-N) + analyst actions (BRFUPDN) fetcher; structured timing logs around every blocking IB API call (`reqNewsProviders`, `qualifyContracts`, `reqHistoricalNews`, `reqNewsArticle`, per-article sentiment) |
 | `src/ait/optimization/optimizer.py` | StrategyOptimizer — Optuna TPE + MedianPruner |
 | `src/ait/optimization/param_spaces.py` | Parameter spaces per strategy and ML model |
 | `src/ait/optimization/objectives.py` | Objective functions (sharpe_ratio, composite, etc.) |
@@ -198,6 +198,7 @@ run_orchestrator.py          ← Master process (start here)
 
 ### Sentiment
 - [x] FinBERT local NLP model
+- [x] FinBERT tokenizer loaded explicitly with `clean_up_tokenization_spaces=True` (suppresses `transformers` FutureWarning)
 - [x] Finnhub news integration
 - [x] Fear & Greed index (VIX-based)
 - [x] Composite sentiment score per symbol
@@ -215,12 +216,25 @@ run_orchestrator.py          ← Master process (start here)
 ### Parameter Optimization
 - [x] Optuna `StrategyOptimizer` — Bayesian/TPE with MedianPruner
 - [x] Per-strategy parameter spaces (iron_condor, long_call, bull_call_spread, bear_put_spread, put_credit_spread)
+- [x] `delta_short` / `delta_long` / `iv_floor` / `max_hold_days` wired into `Backtester.__init__` and searchable by optimizer
+- [x] `profit_target_pct` cap at 0.50 for credit trades removed — optimizer can explore the full range
 - [x] ML hyperparameter spaces (XGBoost, LightGBM)
 - [x] Objective functions: sharpe_ratio, composite, profit_factor, win_rate
 - [x] Walk-forward `optimize_per_window` integration
 - [x] Resumable studies via SQLite storage (`load_if_exists=True`)
 - [x] `run_optimizer.py` CLI
 - [x] `OptimizationResult` — summary table, JSON save, apply_to_config
+
+### Integration Tests (`tests/test_integration.py`)
+- Gated by `RUN_INTEGRATION_TESTS=1` env var — skipped entirely in the normal `pytest` run
+- Requires IB Gateway on port 4001 (live) or 4002 (paper)
+- Writes to isolated tables (`test_equity_stats`, `test_news`, `test_analyst_recommendations`) — never touches production data
+- Typically completes in ~20 seconds: IB API calls (`reqHistoricalNews`, `reqNewsArticle`) each take <0.2s; FinBERT cold model load adds ~7s once per session
+- `test_fetch_aapl_analyst_actions_second_fetch` replaced `test_fetch_spy_analyst_actions` — SPY is an ETF and receives no analyst upgrade/downgrade coverage, causing that test to always skip via `_require_news`
+
+### Backtester Modelling Improvements (fixed)
+- **Dynamic IV during hold** — `_reprice_position` now calls `_get_current_iv` which blends `entry_iv` (70%) with current `realized_vol × 1.15` (30%); vega P&L is now non-zero
+- **Volatility skew** — `_get_leg_iv` applies a linear log-moneyness skew: OTM puts +1% IV per 10% below ATM, OTM calls +0.2% IV per 10% above ATM; controlled by `skew_factor` param (default 1.0, 0.0 = flat)
 
 ---
 

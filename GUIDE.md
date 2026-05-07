@@ -1186,9 +1186,16 @@ python run_backtest.py --compare-exits           # Fixed vs trailing stops
 
 **Data:** Yahoo Finance (5 years of daily OHLCV). No IBKR connection required.
 
-**Options pricing:** Black-Scholes with `IV = realized_vol × 1.15` to simulate the typical IV premium over realized vol.
+**Options pricing:** Black-Scholes with `IV = realized_vol × 1.15` as a flat IV estimate. The `iv_floor`, `delta_short`, and `delta_long` parameters are now wired into the engine and searchable by the optimizer (`src/ait/backtesting/engine.py`).
 
 **The Tier 1 range model is included:** When backtesting iron condors, the `RangePredictor` is trained per window and gates entries, matching the live system's behavior.
+
+### Backtester Modelling
+
+| Feature | Implementation |
+|---|---|
+| **Dynamic IV during hold** | `_get_current_iv` blends entry IV (70%) with current realized vol × 1.15 (30%); vega P&L is non-zero |
+| **Volatility skew** | `_get_leg_iv` applies linear log-moneyness skew: OTM puts +1% IV per 10% below ATM, OTM calls +0.2% per 10% above; `skew_factor=0.0` restores flat IV |
 
 ### Interpreting Results
 
@@ -1254,16 +1261,17 @@ python run_optimizer.py \
 
 Each strategy has a defined search space in `param_spaces.py`:
 
-| Parameter (iron condor) | Search Range |
-|---|---|
-| `delta_min` | float [0.15, 0.30] |
-| `delta_max` | float [0.25, 0.45] |
-| `dte_min` | int [7, 21] |
-| `dte_max` | int [28, 60] |
-| `min_confidence` | float [0.55, 0.80] |
-| `stop_loss_pct` | float [0.30, 0.70] |
-| `profit_target_pct` | float [0.40, 0.80] |
-| `iv_floor` | int [10, 30] |
+| Parameter (iron condor) | Search Range | Effect |
+|---|---|---|
+| `delta_short` | float [0.15, 0.30] | Delta of the short call and put legs |
+| `max_hold_days` | int [14, 45] | Entry DTE / max hold duration |
+| `min_confidence` | float [0.55, 0.80] | ML confidence gate before entering |
+| `stop_loss_pct` | float [0.30, 0.70] | Exit when unrealised loss reaches this % of premium |
+| `profit_target_pct` | float [0.30, 0.70] | Exit at this % profit (no arbitrary 50% cap) |
+| `trailing_stop_pct` | float [0.15, 0.40] | Trail behind HWM once breakeven is triggered |
+| `iv_floor` | float [0.08, 0.25] | Minimum IV used in Black-Scholes pricing |
+
+Debit strategies (`long_call`, `long_put`, `bull_call_spread`, `bear_put_spread`) also search over `delta_long` [0.25–0.55] and `max_hold_days` [14–60].
 
 ML model spaces (`xgboost`, `lightgbm`) cover `n_estimators`, `learning_rate`, `max_depth`, `subsample`, `colsample_bytree`, and model-specific params.
 

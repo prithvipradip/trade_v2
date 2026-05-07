@@ -57,6 +57,10 @@ class Backtester:
         range_predictor: Any = None,
         range_min_confidence: float = 0.55,
         context_bars: int = 0,
+        delta_short: float = 0.20,
+        delta_long: float = 0.30,
+        iv_floor: float = 0.10,
+        skew_factor: float = 1.0,
     ) -> None:
         self._data = self._prepare_data(data)
         self._strategies = strategies
@@ -74,6 +78,10 @@ class Backtester:
         self._context_bars = context_bars
         self._range_predictor = range_predictor
         self._range_min_confidence = range_min_confidence
+        self._delta_short = delta_short
+        self._delta_long = delta_long
+        self._iv_floor = iv_floor
+        self._skew_factor = skew_factor
 
         self._predictor = predictor if predictor is not None else self._load_predictor()
 
@@ -114,7 +122,7 @@ class Backtester:
             # --- 1. Check exits on open positions ---
             still_open = []
             for pos in open_positions:
-                exit_info = self._check_exit(pos, row, today_date)
+                exit_info = self._check_exit(pos, row, today_date, hist)
                 if exit_info is not None:
                     pos.update(exit_info)
                     capital += pos["pnl"]
@@ -179,7 +187,7 @@ class Backtester:
         last_row = self._data.iloc[-1]
         last_date = dates[-1].date() if hasattr(dates[-1], "date") else dates[-1]
         for pos in open_positions:
-            exit_info = self._force_close(pos, last_row, last_date)
+            exit_info = self._force_close(pos, last_row, last_date, self._data)
             pos.update(exit_info)
             capital += pos["pnl"]
             trades.append(pos)
@@ -377,12 +385,28 @@ class Backtester:
     # Position building — full BS pricing for each strategy type
     # ------------------------------------------------------------------
 
+    def _get_leg_iv(self, base_iv: float, strike: float, underlying: float,
+                    option_type: OptionType) -> float:
+        """Apply vol skew: OTM puts carry extra IV, OTM calls carry mild extra IV.
+
+        Linear model in log-moneyness space:
+        - Put: +1% IV per 10% below ATM (e.g. 20% OTM put → +2% IV)
+        - Call: +0.2% IV per 10% above ATM
+        skew_factor=0.0 restores flat IV; default 1.0 approximates market skew.
+        """
+        log_m = np.log(strike / underlying)
+        if option_type == OptionType.PUT:
+            skew_adj = self._skew_factor * max(0.0, -log_m) * 0.10
+        else:
+            skew_adj = self._skew_factor * max(0.0, log_m) * 0.02
+        return max(base_iv + skew_adj, self._iv_floor)
+
     def _get_iv(self, hist: pd.DataFrame) -> float:
         """Estimate implied volatility from realized vol with a premium."""
         close_arr = hist["Close"].values
         rv = realized_vol(close_arr, window=20)
         iv = rv * 1.15  # IV premium over realized vol
-        return max(iv, 0.10)
+        return max(iv, self._iv_floor)
 
     def _build_position(
         self,
@@ -413,21 +437,22 @@ class Backtester:
         """Build a debit (long option/spread) position."""
 
         if strategy == "long_call":
-            strike = find_strike_by_delta(S, t, iv, 0.30, OptionType.CALL, r)
-            price = black_scholes_price(S, strike, t, r, iv, OptionType.CALL)
+            strike = find_strike_by_delta(S, t, iv, self._delta_long, OptionType.CALL, r)
+            price = black_scholes_price(S, strike, t, r,
+                self._get_leg_iv(iv, strike, S, OptionType.CALL), OptionType.CALL)
             opt_type = "call"
         elif strategy == "long_put":
-            strike = find_strike_by_delta(S, t, iv, -0.30, OptionType.PUT, r)
-            price = black_scholes_price(S, strike, t, r, iv, OptionType.PUT)
+            strike = find_strike_by_delta(S, t, iv, -self._delta_long, OptionType.PUT, r)
+            price = black_scholes_price(S, strike, t, r,
+                self._get_leg_iv(iv, strike, S, OptionType.PUT), OptionType.PUT)
             opt_type = "put"
         elif strategy == "bull_call_spread":
-            # Micro tier: tighter spread (0.35/0.25 delta) for better risk/reward
-            long_delta = 0.40
-            short_delta = 0.20
-            long_strike = find_strike_by_delta(S, t, iv, long_delta, OptionType.CALL, r)
-            short_strike = find_strike_by_delta(S, t, iv, short_delta, OptionType.CALL, r)
-            long_price = black_scholes_price(S, long_strike, t, r, iv, OptionType.CALL)
-            short_price = black_scholes_price(S, short_strike, t, r, iv, OptionType.CALL)
+            long_strike = find_strike_by_delta(S, t, iv, self._delta_long, OptionType.CALL, r)
+            short_strike = find_strike_by_delta(S, t, iv, self._delta_short, OptionType.CALL, r)
+            long_price = black_scholes_price(S, long_strike, t, r,
+                self._get_leg_iv(iv, long_strike, S, OptionType.CALL), OptionType.CALL)
+            short_price = black_scholes_price(S, short_strike, t, r,
+                self._get_leg_iv(iv, short_strike, S, OptionType.CALL), OptionType.CALL)
             price = long_price - short_price  # Net debit
             strike = long_strike
             opt_type = "call"
@@ -438,12 +463,14 @@ class Backtester:
                 long_strike=long_strike, short_strike=short_strike, opt_type="call",
             )
         elif strategy == "bear_put_spread":
-            long_delta = -0.40
-            short_delta = -0.20
+            long_delta = -self._delta_long
+            short_delta = -self._delta_short
             long_strike = find_strike_by_delta(S, t, iv, long_delta, OptionType.PUT, r)
             short_strike = find_strike_by_delta(S, t, iv, short_delta, OptionType.PUT, r)
-            long_price = black_scholes_price(S, long_strike, t, r, iv, OptionType.PUT)
-            short_price = black_scholes_price(S, short_strike, t, r, iv, OptionType.PUT)
+            long_price = black_scholes_price(S, long_strike, t, r,
+                self._get_leg_iv(iv, long_strike, S, OptionType.PUT), OptionType.PUT)
+            short_price = black_scholes_price(S, short_strike, t, r,
+                self._get_leg_iv(iv, short_strike, S, OptionType.PUT), OptionType.PUT)
             price = long_price - short_price  # Net debit
             strike = long_strike
             opt_type = "put"
@@ -493,9 +520,8 @@ class Backtester:
         P&L is inverted: collect premium upfront, buy back cheaper later.
         """
         if strategy == "iron_condor":
-            # Short legs at 0.20 delta
-            short_call_strike = find_strike_by_delta(S, t, iv, 0.20, OptionType.CALL, r)
-            short_put_strike = find_strike_by_delta(S, t, iv, -0.20, OptionType.PUT, r)
+            short_call_strike = find_strike_by_delta(S, t, iv, self._delta_short, OptionType.CALL, r)
+            short_put_strike = find_strike_by_delta(S, t, iv, -self._delta_short, OptionType.PUT, r)
 
             # Wings: use 1-sigma expected move (68% probability price stays inside)
             # Full expected_move width means ~68% chance of expiring at max profit
@@ -504,11 +530,15 @@ class Backtester:
             long_call_strike = short_call_strike + wing_width
             long_put_strike = short_put_strike - wing_width
 
-            # Price all legs
-            short_call_price = black_scholes_price(S, short_call_strike, t, r, iv, OptionType.CALL)
-            short_put_price = black_scholes_price(S, short_put_strike, t, r, iv, OptionType.PUT)
-            long_call_price = black_scholes_price(S, long_call_strike, t, r, iv, OptionType.CALL)
-            long_put_price = black_scholes_price(S, long_put_strike, t, r, iv, OptionType.PUT)
+            # Price each leg with its own skewed IV
+            short_call_price = black_scholes_price(S, short_call_strike, t, r,
+                self._get_leg_iv(iv, short_call_strike, S, OptionType.CALL), OptionType.CALL)
+            short_put_price = black_scholes_price(S, short_put_strike, t, r,
+                self._get_leg_iv(iv, short_put_strike, S, OptionType.PUT), OptionType.PUT)
+            long_call_price = black_scholes_price(S, long_call_strike, t, r,
+                self._get_leg_iv(iv, long_call_strike, S, OptionType.CALL), OptionType.CALL)
+            long_put_price = black_scholes_price(S, long_put_strike, t, r,
+                self._get_leg_iv(iv, long_put_strike, S, OptionType.PUT), OptionType.PUT)
 
             # Net credit received
             net_credit = (short_call_price + short_put_price) - (long_call_price + long_put_price)
@@ -555,15 +585,16 @@ class Backtester:
 
         elif strategy == "put_credit_spread":
             # Sell higher strike put, buy lower strike put = bullish credit spread
-            # Short put at 0.20 delta (OTM), long put further OTM for protection
-            short_put_strike = find_strike_by_delta(S, t, iv, -0.20, OptionType.PUT, r)
+            short_put_strike = find_strike_by_delta(S, t, iv, -self._delta_short, OptionType.PUT, r)
 
             wing = max(1.0, min(S * 0.01, 5.0))  # ~1% of stock price, max $5
 
             long_put_strike = short_put_strike - wing
 
-            short_put_price = black_scholes_price(S, short_put_strike, t, r, iv, OptionType.PUT)
-            long_put_price = black_scholes_price(S, long_put_strike, t, r, iv, OptionType.PUT)
+            short_put_price = black_scholes_price(S, short_put_strike, t, r,
+                self._get_leg_iv(iv, short_put_strike, S, OptionType.PUT), OptionType.PUT)
+            long_put_price = black_scholes_price(S, long_put_strike, t, r,
+                self._get_leg_iv(iv, long_put_strike, S, OptionType.PUT), OptionType.PUT)
 
             net_credit = short_put_price - long_put_price
             if net_credit <= 0:
@@ -653,14 +684,28 @@ class Backtester:
     # Exit logic — handles both debit and credit positions
     # ------------------------------------------------------------------
 
-    def _reprice_position(self, pos: dict, underlying: float, days_held: int) -> float:
+    def _get_current_iv(self, pos: dict, hist: pd.DataFrame | None) -> float:
+        """Mean-reverting IV: blends entry IV with current realized vol.
+
+        Weights 70% toward entry IV (forward-looking anchor) and 30% toward
+        the current realized vol × 1.15 premium, so vega P&L is non-zero
+        without wild swings driven purely by realized vol noise.
+        """
+        entry_iv = pos["entry_iv"]
+        if hist is None or len(hist) < 21:
+            return entry_iv
+        rv = realized_vol(hist["Close"].values, window=20) * 1.15
+        return max(0.70 * entry_iv + 0.30 * rv, self._iv_floor)
+
+    def _reprice_position(self, pos: dict, underlying: float, days_held: int,
+                          hist: pd.DataFrame | None = None) -> float:
         """Reprice a position at the current underlying using Black-Scholes.
 
         Returns the current value per share:
         - For debit positions: current option/spread value (want it to go UP)
         - For credit positions: current cost to buy back (want it to go DOWN)
         """
-        iv = pos["entry_iv"]
+        iv = self._get_current_iv(pos, hist)
         dte_remaining = max(self._max_hold_days - days_held, 0)
         t = max(dte_remaining / 365.0, 0.0001)
         r = 0.05
@@ -668,44 +713,52 @@ class Backtester:
         strategy = pos["strategy"]
 
         if strategy == "iron_condor":
-            # Reprice all 4 legs
-            sc = black_scholes_price(underlying, pos["short_call_strike"], t, r, iv, OptionType.CALL)
-            sp = black_scholes_price(underlying, pos["short_put_strike"], t, r, iv, OptionType.PUT)
-            lc = black_scholes_price(underlying, pos["long_call_strike"], t, r, iv, OptionType.CALL)
-            lp = black_scholes_price(underlying, pos["long_put_strike"], t, r, iv, OptionType.PUT)
-            # Cost to buy back the iron condor (close the position)
+            sc = black_scholes_price(underlying, pos["short_call_strike"], t, r,
+                self._get_leg_iv(iv, pos["short_call_strike"], underlying, OptionType.CALL), OptionType.CALL)
+            sp = black_scholes_price(underlying, pos["short_put_strike"], t, r,
+                self._get_leg_iv(iv, pos["short_put_strike"], underlying, OptionType.PUT), OptionType.PUT)
+            lc = black_scholes_price(underlying, pos["long_call_strike"], t, r,
+                self._get_leg_iv(iv, pos["long_call_strike"], underlying, OptionType.CALL), OptionType.CALL)
+            lp = black_scholes_price(underlying, pos["long_put_strike"], t, r,
+                self._get_leg_iv(iv, pos["long_put_strike"], underlying, OptionType.PUT), OptionType.PUT)
             return (sc + sp) - (lc + lp)
 
         elif strategy == "put_credit_spread":
-            # Credit spread: cost to buy back = short put value - long put value
-            sp = black_scholes_price(underlying, pos["short_put_strike"], t, r, iv, OptionType.PUT)
-            lp = black_scholes_price(underlying, pos["long_put_strike"], t, r, iv, OptionType.PUT)
-            return sp - lp  # Cost to close (want this to decrease)
+            sp = black_scholes_price(underlying, pos["short_put_strike"], t, r,
+                self._get_leg_iv(iv, pos["short_put_strike"], underlying, OptionType.PUT), OptionType.PUT)
+            lp = black_scholes_price(underlying, pos["long_put_strike"], t, r,
+                self._get_leg_iv(iv, pos["long_put_strike"], underlying, OptionType.PUT), OptionType.PUT)
+            return sp - lp
 
         elif strategy in ("bull_call_spread", "bear_put_spread"):
-            # Reprice the spread
             long_strike = pos["long_strike"]
             short_strike = pos["short_strike"]
             if pos["option_type"] == "call":
-                long_val = black_scholes_price(underlying, long_strike, t, r, iv, OptionType.CALL)
-                short_val = black_scholes_price(underlying, short_strike, t, r, iv, OptionType.CALL)
+                long_val = black_scholes_price(underlying, long_strike, t, r,
+                    self._get_leg_iv(iv, long_strike, underlying, OptionType.CALL), OptionType.CALL)
+                short_val = black_scholes_price(underlying, short_strike, t, r,
+                    self._get_leg_iv(iv, short_strike, underlying, OptionType.CALL), OptionType.CALL)
             else:
-                long_val = black_scholes_price(underlying, long_strike, t, r, iv, OptionType.PUT)
-                short_val = black_scholes_price(underlying, short_strike, t, r, iv, OptionType.PUT)
-            return long_val - short_val  # Spread value
+                long_val = black_scholes_price(underlying, long_strike, t, r,
+                    self._get_leg_iv(iv, long_strike, underlying, OptionType.PUT), OptionType.PUT)
+                short_val = black_scholes_price(underlying, short_strike, t, r,
+                    self._get_leg_iv(iv, short_strike, underlying, OptionType.PUT), OptionType.PUT)
+            return long_val - short_val
 
         else:
             # Single-leg option
             opt_type = OptionType.CALL if pos["option_type"] == "call" else OptionType.PUT
-            return black_scholes_price(underlying, pos["strike"], t, r, iv, opt_type)
+            return black_scholes_price(underlying, pos["strike"], t, r,
+                self._get_leg_iv(iv, pos["strike"], underlying, opt_type), opt_type)
 
-    def _check_exit(self, pos: dict, row: pd.Series, current_date: date) -> dict | None:
+    def _check_exit(self, pos: dict, row: pd.Series, current_date: date,
+                    hist: pd.DataFrame | None = None) -> dict | None:
         """Check if a position should be exited."""
         underlying = row["Close"]
         entry_date = date.fromisoformat(pos["entry_date"])
         days_held = (current_date - entry_date).days
 
-        current_value = self._reprice_position(pos, underlying, days_held)
+        current_value = self._reprice_position(pos, underlying, days_held, hist)
 
         trade_type = pos.get("trade_type", "debit")
         entry_price = pos["entry_price"]
@@ -755,9 +808,6 @@ class Backtester:
 
         # Profit target
         target = self._profit_target_pct
-        if pos.get("trade_type") == "credit":
-            # For credit trades: take profit at 50% of max credit collected
-            target = min(self._profit_target_pct, 0.50)
         if pnl_pct >= target:
             return {"exit_date": str(current_date), "exit_reason": "profit_target"}
 
@@ -810,11 +860,12 @@ class Backtester:
 
         return raw_pnl - total_commission
 
-    def _force_close(self, pos: dict, last_row: pd.Series, last_date: date) -> dict:
+    def _force_close(self, pos: dict, last_row: pd.Series, last_date: date,
+                     hist: pd.DataFrame | None = None) -> dict:
         """Force-close a position at end of backtest."""
         entry_date = date.fromisoformat(pos["entry_date"])
         days_held = (last_date - entry_date).days
-        current_value = self._reprice_position(pos, last_row["Close"], days_held)
+        current_value = self._reprice_position(pos, last_row["Close"], days_held, hist)
 
         trade_type = pos.get("trade_type", "debit")
         if trade_type == "credit":

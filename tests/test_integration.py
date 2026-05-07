@@ -284,10 +284,11 @@ class TestIBAnalystIntegration:
         assert first["action"] != "", "action should be non-empty"
         assert len(first["id"]) == 16
 
-    def test_fetch_spy_analyst_actions(
+    def test_fetch_aapl_analyst_actions_second_fetch(
         self, news_service: IBNewsService, fundamentals_store: FundamentalsStore
     ):
-        fetched, _inserted = news_service.fetch_and_store_analyst_actions("SPY", hours_back=168)
+        """Second fetch for AAPL — verifies the service works across multiple calls."""
+        fetched, _inserted = news_service.fetch_and_store_analyst_actions("AAPL", hours_back=168)
         _require_news(fetched, 168)
 
     def test_analyst_insert_is_idempotent(

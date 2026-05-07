@@ -12,38 +12,54 @@ from __future__ import annotations
 IRON_CONDOR_SPACE: dict[str, tuple] = {
     "min_confidence":    ("float", 0.55, 0.80),
     "stop_loss_pct":     ("float", 0.30, 0.70),
-    "profit_target_pct": ("float", 0.40, 0.80),
+    "profit_target_pct": ("float", 0.30, 0.70),
     "trailing_stop_pct": ("float", 0.15, 0.40),
+    "delta_short":       ("float", 0.15, 0.30),
+    "max_hold_days":     ("int",   14,   45),
+    "iv_floor":          ("float", 0.08, 0.25),
 }
 
 LONG_CALL_SPACE: dict[str, tuple] = {
     "min_confidence":    ("float", 0.60, 0.85),
     "stop_loss_pct":     ("float", 0.30, 0.60),
     "profit_target_pct": ("float", 0.60, 1.50),
+    "delta_long":        ("float", 0.25, 0.55),
+    "max_hold_days":     ("int",   14,   60),
+    "iv_floor":          ("float", 0.08, 0.25),
 }
 
 LONG_PUT_SPACE: dict[str, tuple] = {
     "min_confidence":    ("float", 0.60, 0.85),
     "stop_loss_pct":     ("float", 0.30, 0.60),
     "profit_target_pct": ("float", 0.60, 1.50),
+    "delta_long":        ("float", 0.25, 0.55),
+    "max_hold_days":     ("int",   14,   60),
+    "iv_floor":          ("float", 0.08, 0.25),
 }
 
 BULL_CALL_SPREAD_SPACE: dict[str, tuple] = {
     "min_confidence":    ("float", 0.60, 0.85),
     "stop_loss_pct":     ("float", 0.30, 0.65),
     "profit_target_pct": ("float", 0.50, 0.90),
+    "delta_long":        ("float", 0.30, 0.55),
+    "max_hold_days":     ("int",   14,   60),
 }
 
 BEAR_PUT_SPREAD_SPACE: dict[str, tuple] = {
     "min_confidence":    ("float", 0.60, 0.85),
     "stop_loss_pct":     ("float", 0.30, 0.65),
     "profit_target_pct": ("float", 0.50, 0.90),
+    "delta_long":        ("float", 0.30, 0.55),
+    "max_hold_days":     ("int",   14,   60),
 }
 
 PUT_CREDIT_SPREAD_SPACE: dict[str, tuple] = {
     "min_confidence":    ("float", 0.55, 0.80),
     "stop_loss_pct":     ("float", 0.30, 0.70),
-    "profit_target_pct": ("float", 0.40, 0.80),
+    "profit_target_pct": ("float", 0.30, 0.70),
+    "delta_short":       ("float", 0.15, 0.30),
+    "max_hold_days":     ("int",   14,   45),
+    "iv_floor":          ("float", 0.08, 0.25),
 }
 
 XGBOOST_SPACE: dict[str, tuple] = {

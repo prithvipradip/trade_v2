@@ -26,12 +26,17 @@ class FinBERTAnalyzer:
             return self._pipeline is not None
 
         try:
-            from transformers import pipeline
+            from transformers import AutoTokenizer, pipeline
 
             log.info("loading_finbert_model")
+            tokenizer = AutoTokenizer.from_pretrained(
+                "ProsusAI/finbert",
+                clean_up_tokenization_spaces=True,
+            )
             self._pipeline = pipeline(
                 "sentiment-analysis",
                 model="ProsusAI/finbert",
+                tokenizer=tokenizer,
                 device=-1,   # CPU only
                 top_k=None,  # return scores for all labels
             )
