@@ -215,8 +215,11 @@ class StrategyOptimizer:
         import yfinance as yf
 
         data = {}
+        # Pull a modest extra window for weekends/market holidays, while
+        # keeping a sane floor for shorter train_days requests.
         weekend_holiday_buffer_days = 30
         min_period_days = 90
+        # Backtester requires enough rows to compute indicators robustly.
         min_required_rows = 60
         requested_days = max(1, int(self._train_days))
         period_days = max(
