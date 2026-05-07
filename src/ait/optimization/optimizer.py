@@ -105,7 +105,6 @@ class StrategyOptimizer:
             self._objective_fn,
             n_trials=self._n_trials,
             n_jobs=self._n_jobs,
-            catch=(Exception,),
         )
 
         log.info(
@@ -216,13 +215,22 @@ class StrategyOptimizer:
         import yfinance as yf
 
         data = {}
+        requested_days = max(1, int(self._train_days))
+        period_days = max(requested_days + 30, 90)  # buffer for weekends/holidays
         for symbol in self._symbols:
             try:
-                df = yf.Ticker(symbol).history(period="5y", interval="1d")
-                if df is not None and len(df) > 100:
+                df = yf.Ticker(symbol).history(period=f"{period_days}d", interval="1d")
+                if df is not None and len(df) > 0:
+                    df = df.tail(requested_days)
                     df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-                    data[symbol] = df
-                    log.info("data_fetched_for_optimizer", symbol=symbol, rows=len(df))
+                    if len(df) >= 60:
+                        data[symbol] = df
+                        log.info(
+                            "data_fetched_for_optimizer",
+                            symbol=symbol,
+                            rows=len(df),
+                            requested_days=requested_days,
+                        )
             except Exception as e:
                 log.warning("data_fetch_failed", symbol=symbol, error=str(e))
         return data

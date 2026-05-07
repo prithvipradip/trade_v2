@@ -344,7 +344,7 @@ class ModelTrainer:
                 sampler=optuna.samplers.TPESampler(seed=42),
                 pruner=optuna.pruners.MedianPruner(n_warmup_steps=1),
             )
-            study.optimize(_objective, n_trials=n_trials, n_jobs=1, catch=(Exception,))
+            study.optimize(_objective, n_trials=n_trials, n_jobs=1)
 
             best = study.best_params
             log.info("ml_hyperparams_optimized", best=best, best_cv=study.best_value)

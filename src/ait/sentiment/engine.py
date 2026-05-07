@@ -136,7 +136,7 @@ class SentimentEngine:
                 log.debug("finbert_error", symbol=symbol, error=str(e))
 
         # 4. IB news sentiment (pre-scored at ingest time)
-        if self._fundamentals_store:
+        if self._fundamentals_store and self._config.ib_news_weight > 0:
             total_sources += 1
             try:
                 news_rows = self._fundamentals_store.get_recent_news(symbol, hours=24)

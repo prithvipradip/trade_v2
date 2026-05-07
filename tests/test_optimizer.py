@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -156,6 +157,22 @@ class TestOptimizationResult:
         assert "OPTUNA OPTIMIZATION RESULTS" in s
         assert "Best value" in s
 
+    def test_summary_sort_keeps_zero_above_negative(self):
+        import optuna
+
+        optuna.logging.set_verbosity(optuna.logging.ERROR)
+        study = optuna.create_study(direction="maximize")
+
+        t0 = study.ask()
+        study.tell(t0, 0.0)
+        t1 = study.ask()
+        study.tell(t1, -1.0)
+
+        result = OptimizationResult(study)
+        summary = result.summary(top_n=2)
+
+        assert summary.find(" 0.0000") < summary.find("-1.0000")
+
     def test_save_creates_json(self, tmp_path: Path):
         study = self._make_study(tmp_path)
         result = OptimizationResult(study)
@@ -267,6 +284,54 @@ class TestStrategyOptimizer:
             study_name="my_custom_study",
         )
         assert opt._study_name == "my_custom_study"
+
+    def test_fetch_data_respects_train_days(self):
+        calls: dict[str, str] = {}
+
+        class _FakeTicker:
+            def __init__(self, symbol: str) -> None:
+                self.symbol = symbol
+
+            def history(self, period: str, interval: str) -> pd.DataFrame:
+                calls["period"] = period
+                calls["interval"] = interval
+                dates = pd.date_range(end=date.today(), periods=300, freq="B")
+                return pd.DataFrame(
+                    {
+                        "Open": np.linspace(100, 110, len(dates)),
+                        "High": np.linspace(101, 111, len(dates)),
+                        "Low": np.linspace(99, 109, len(dates)),
+                        "Close": np.linspace(100, 110, len(dates)),
+                        "Volume": np.full(len(dates), 1_000_000),
+                    },
+                    index=dates,
+                )
+
+        class _FakeYF:
+            @staticmethod
+            def Ticker(symbol: str) -> _FakeTicker:  # noqa: N802 - mimics yfinance API
+                return _FakeTicker(symbol)
+
+        original_yf = sys.modules.get("yfinance")
+        sys.modules["yfinance"] = _FakeYF
+        try:
+            opt = StrategyOptimizer(
+                symbols=["SPY"],
+                strategies=["iron_condor"],
+                train_days=120,
+            )
+            data = opt._fetch_data()
+        finally:
+            if original_yf is None:
+                del sys.modules["yfinance"]
+            else:
+                sys.modules["yfinance"] = original_yf
+
+        assert "SPY" in data
+        assert len(data["SPY"]) == 120
+        assert calls["period"].endswith("d")
+        assert int(calls["period"][:-1]) >= 120
+        assert calls["interval"] == "1d"
 
     def test_resumable_study_with_storage(self, tmp_path: Path):
         """A study with file-based storage can be resumed (trial count accumulates)."""

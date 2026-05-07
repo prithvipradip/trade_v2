@@ -43,7 +43,10 @@ class OptimizationResult:
             t for t in self.study.trials
             if t.state == optuna.trial.TrialState.COMPLETE
         ]
-        completed.sort(key=lambda t: t.value or float("-inf"), reverse=True)
+        completed.sort(
+            key=lambda t: t.value if t.value is not None else float("-inf"),
+            reverse=True,
+        )
         top = completed[:top_n]
 
         lines = [
