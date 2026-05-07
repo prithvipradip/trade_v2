@@ -33,6 +33,10 @@ log = get_logger("optimization.optimizer")
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+_FETCH_WEEKEND_HOLIDAY_BUFFER_DAYS = 30
+_FETCH_MIN_PERIOD_DAYS = 90
+_MIN_BACKTEST_ROWS = 60
+
 
 class StrategyOptimizer:
     """Bayesian strategy + ML hyperparameter optimizer."""
@@ -178,7 +182,7 @@ class StrategyOptimizer:
         # Use first available symbol for speed (full multi-symbol adds overhead)
         symbol = self._symbols[0]
         df = self._data.get(symbol)
-        if df is None or len(df) < 60:
+        if df is None or len(df) < _MIN_BACKTEST_ROWS:
             raise ValueError(f"Insufficient data for {symbol}")
 
         # Extract Backtester-compatible params (drop strategy__ prefix).
@@ -215,16 +219,10 @@ class StrategyOptimizer:
         import yfinance as yf
 
         data = {}
-        # Pull a modest extra window for weekends/market holidays, while
-        # keeping a sane floor for shorter train_days requests.
-        weekend_holiday_buffer_days = 30
-        min_period_days = 90
-        # Keep this aligned with _run_backtest(), which rejects dataframes < 60 rows.
-        min_required_rows = 60
         requested_days = max(1, int(self._train_days))
         period_days = max(
-            requested_days + weekend_holiday_buffer_days,
-            min_period_days,
+            requested_days + _FETCH_WEEKEND_HOLIDAY_BUFFER_DAYS,
+            _FETCH_MIN_PERIOD_DAYS,
         )
         for symbol in self._symbols:
             try:
@@ -232,7 +230,7 @@ class StrategyOptimizer:
                 if df is not None and len(df) > 0:
                     df = df.tail(requested_days)
                     df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-                    if len(df) >= min_required_rows:
+                    if len(df) >= _MIN_BACKTEST_ROWS:
                         data[symbol] = df
                         log.info(
                             "data_fetched_for_optimizer",

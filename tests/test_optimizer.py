@@ -285,7 +285,7 @@ class TestStrategyOptimizer:
         )
         assert opt._study_name == "my_custom_study"
 
-    def test_fetch_data_respects_train_days(self):
+    def test_fetch_data_respects_train_days(self, monkeypatch: pytest.MonkeyPatch):
         calls: dict[str, str] = {}
 
         class _FakeTicker:
@@ -310,20 +310,14 @@ class TestStrategyOptimizer:
         class _FakeYF:
             Ticker = _FakeTicker
 
-        original_yf = sys.modules.get("yfinance")
-        sys.modules["yfinance"] = _FakeYF
-        try:
-            opt = StrategyOptimizer(
-                symbols=["SPY"],
-                strategies=["iron_condor"],
-                train_days=120,
-            )
-            data = opt._fetch_data()
-        finally:
-            if original_yf is None:
-                del sys.modules["yfinance"]
-            else:
-                sys.modules["yfinance"] = original_yf
+        monkeypatch.setitem(sys.modules, "yfinance", _FakeYF)
+
+        opt = StrategyOptimizer(
+            symbols=["SPY"],
+            strategies=["iron_condor"],
+            train_days=120,
+        )
+        data = opt._fetch_data()
 
         assert "SPY" in data
         assert len(data["SPY"]) == 120
