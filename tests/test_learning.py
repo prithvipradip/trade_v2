@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -54,17 +55,20 @@ def _make_trade(
     trade_id, symbol, strategy, direction, status,
     entry_price, exit_price, pnl, confidence,
 ):
+    now = datetime.now()
+    entry_time = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S")
+    exit_time  = (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S")
     return TradeRecord(
         trade_id=trade_id,
         symbol=symbol,
         strategy=strategy,
         direction=TradeDirection(direction),
         status=TradeStatus(status),
-        entry_time="2026-03-01T10:00:00",
+        entry_time=entry_time,
         entry_price=entry_price,
         quantity=1,
         contract_type="call" if "call" in strategy else "put" if "put" in strategy else "spread",
-        exit_time="2026-03-01T14:00:00",
+        exit_time=exit_time,
         exit_price=exit_price,
         realized_pnl=pnl,
         ml_confidence=confidence,
@@ -269,7 +273,8 @@ class TestLearningEngine:
     def test_learning_cycle_no_data(self, tmp_path):
         db_path = tmp_path / "empty.db"
         state = StateManager(db_path)
-        engine = LearningEngine(state)
+        analyzer = TradeAnalyzer(db_path)  # point at empty DB, not production
+        engine = LearningEngine(state, analyzer)
 
         result = engine.run_learning_cycle(lookback_days=30)
         assert result["insights"] == 0

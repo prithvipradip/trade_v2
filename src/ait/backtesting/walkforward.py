@@ -55,6 +55,8 @@ class WalkForwardConfig:
     trailing_stop_pct: float = 0.25
     breakeven_trigger_pct: float = 0.30
     max_concurrent_positions: int = 3
+    optimize_per_window: bool = False
+    optimize_n_trials: int = 50
 
 
 @dataclass
@@ -431,6 +433,13 @@ class WalkForwardBacktester:
 
                 active_symbols += 1
 
+                # Per-window parameter optimization (optional)
+                window_cfg = self._config
+                if self._config.optimize_per_window:
+                    window_cfg = self._optimize_window_params(
+                        train_df, symbol, i + 1, active_strategies
+                    ) or self._config
+
                 # Train ML model on training window for this symbol
                 predictor = self._train_window_model(train_df, symbol, i + 1)
                 range_predictor = self._train_window_range_model(train_df, symbol, i + 1)
@@ -453,26 +462,35 @@ class WalkForwardBacktester:
                 avg_mult = sum(strategy_mults) / len(strategy_mults) if strategy_mults else 1.0
                 effective_position_size = self._config.position_size_pct * min(avg_mult, 2.0)
 
+                # When per-window optimization is active the optimized window_cfg
+                # is the source of truth for min_confidence; otherwise defer to
+                # the self-learning subsystem.
+                confidence_threshold = (
+                    window_cfg.min_confidence
+                    if self._config.optimize_per_window
+                    else effective_min_conf
+                )
+
                 # Each symbol gets its proportional share of capital
                 bt = Backtester(
                     data=test_with_context,
                     context_bars=context_bars,
                     strategies=active_strategies,
                     initial_capital=per_symbol_capital,
-                    commission_per_contract=self._config.commission_per_contract,
-                    slippage_pct=self._config.slippage_pct,
+                    commission_per_contract=window_cfg.commission_per_contract,
+                    slippage_pct=window_cfg.slippage_pct,
                     position_size_pct=effective_position_size,
-                    stop_loss_pct=self._config.stop_loss_pct,
-                    profit_target_pct=self._config.profit_target_pct,
-                    max_hold_days=self._config.max_hold_days,
-                    min_confidence=effective_min_conf,
-                    trailing_stop_enabled=self._config.trailing_stop_enabled,
-                    trailing_stop_pct=self._config.trailing_stop_pct,
-                    breakeven_trigger_pct=self._config.breakeven_trigger_pct,
+                    stop_loss_pct=window_cfg.stop_loss_pct,
+                    profit_target_pct=window_cfg.profit_target_pct,
+                    max_hold_days=window_cfg.max_hold_days,
+                    min_confidence=confidence_threshold,
+                    trailing_stop_enabled=window_cfg.trailing_stop_enabled,
+                    trailing_stop_pct=window_cfg.trailing_stop_pct,
+                    breakeven_trigger_pct=window_cfg.breakeven_trigger_pct,
                     predictor=predictor,
                     range_predictor=range_predictor,
                     range_min_confidence=getattr(
-                        self._config, "range_min_confidence", 0.55
+                        window_cfg, "range_min_confidence", 0.55
                     ),
                 )
                 result = bt.run()
@@ -537,6 +555,52 @@ class WalkForwardBacktester:
         log.info("self_learning_final_state", summary=learner.summary())
 
         return result
+
+    def _optimize_window_params(
+        self,
+        train_df: pd.DataFrame,
+        symbol: str,
+        window_id: int,
+        strategies: list[str],
+    ) -> WalkForwardConfig | None:
+        """Run Optuna on the training slice and return an updated config.
+
+        Returns None on any failure (caller falls back to original config).
+        """
+        try:
+            from ait.optimization.optimizer import StrategyOptimizer
+
+            optimizer = StrategyOptimizer(
+                symbols=[symbol],
+                strategies=strategies,
+                n_trials=self._config.optimize_n_trials,
+                n_jobs=1,
+                objective="composite",
+                study_name=f"wf_window_{window_id}_{symbol}",
+                initial_capital=self._config.initial_capital,
+            )
+            # Inject pre-loaded training data so the optimizer doesn't re-fetch
+            result = optimizer.run(data={symbol: train_df})
+            best = result.best_params
+
+            # Build an updated config from best params, falling back to originals
+            import dataclasses
+            cfg_dict = dataclasses.asdict(self._config)
+            for key, val in best.items():
+                _, _, param_name = key.partition("__")
+                if param_name in cfg_dict:
+                    cfg_dict[param_name] = val
+            new_cfg = WalkForwardConfig(**cfg_dict)
+            log.info(
+                "window_params_optimized",
+                window=window_id,
+                symbol=symbol,
+                best_value=result.best_value,
+            )
+            return new_cfg
+        except Exception as e:
+            log.warning("window_optimization_failed", window=window_id, symbol=symbol, error=str(e))
+            return None
 
     def _train_window_range_model(
         self, train_df: pd.DataFrame, symbol: str, window_id: int

@@ -103,6 +103,7 @@ class SentimentConfig(BaseModel):
     weight: float = Field(default=0.20, ge=0.0, le=0.50)
     cache_ttl_seconds: int = Field(default=300, ge=60, le=3600)
     sources: SentimentSourcesConfig = SentimentSourcesConfig()
+    ib_news_weight: float = Field(default=0.20, ge=0.0, le=0.50)
 
 
 class ExitConfig(BaseModel):

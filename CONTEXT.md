@@ -37,6 +37,7 @@ run_orchestrator.py          ← Master process (start here)
 |------|---------|
 | `run_orchestrator.py` | Master entry point — starts everything |
 | `run_backtest.py` | CLI for walk-forward backtesting |
+| `run_optimizer.py` | CLI for Optuna strategy/ML parameter optimization |
 | `tail_logs.py` | Color-coded live log viewer |
 | `start_bot.bat` | Windows launcher |
 | `config.yaml` | All configuration (strategies, risk, ML, etc.) |
@@ -56,9 +57,16 @@ run_orchestrator.py          ← Master process (start here)
 | `src/ait/broker/account.py` | Account snapshot, margin, buying power |
 | `src/ait/risk/capital_tiers.py` | Auto-scales strategies based on account size |
 | `src/ait/risk/manager.py` | Risk validation before every trade |
-| `src/ait/sentiment/engine.py` | Composite sentiment (FinBERT + news + fear/greed) |
+| `src/ait/sentiment/engine.py` | Composite sentiment (FinBERT + Finnhub + fear/greed + IB news) |
 | `src/ait/data/market_data.py` | Polygon → Yahoo fallback data chain |
 | `src/ait/data/earnings.py` | Earnings calendar — blocks trades near earnings |
+| `src/ait/data/equity_stats.py` | yfinance equity fundamentals → DuckDB equity_stats table |
+| `src/ait/data/fundamentals_db.py` | SQLite CRUD for IB news + analyst recommendations |
+| `src/ait/data/ib_news.py` | IB news (BRFG/DJ-N) + analyst actions (BRFUPDN) fetcher; structured timing logs around every blocking IB API call (`reqNewsProviders`, `qualifyContracts`, `reqHistoricalNews`, `reqNewsArticle`, per-article sentiment) |
+| `src/ait/optimization/optimizer.py` | StrategyOptimizer — Optuna TPE + MedianPruner |
+| `src/ait/optimization/param_spaces.py` | Parameter spaces per strategy and ML model |
+| `src/ait/optimization/objectives.py` | Objective functions (sharpe_ratio, composite, etc.) |
+| `src/ait/optimization/results.py` | OptimizationResult + summary/save/apply_to_config |
 | `src/ait/dashboard/app.py` | Streamlit dashboard at localhost:8501 |
 | `src/ait/orchestration/master.py` | Master scheduler (APScheduler) |
 | `src/ait/orchestration/gateway.py` | IB Gateway auto-start via IBC |
@@ -102,11 +110,17 @@ run_orchestrator.py          ← Master process (start here)
 
 | Source | What | Free Tier |
 |--------|------|-----------|
-| Yahoo Finance | Historical OHLCV, fallback for everything | Unlimited |
+| Yahoo Finance | Historical OHLCV + equity fundamentals (equity_stats) | Unlimited |
 | Polygon.io | Historical daily data (primary) | 5 calls/min |
 | Finnhub | News sentiment | 60 calls/min |
 | FinBERT | NLP sentiment from news headlines | Local model |
-| IBKR | Real-time quotes, order execution | Needs subscription |
+| IBKR | Real-time quotes, order execution, news, analyst actions | Needs subscription |
+
+**IB news providers in use:**
+- General news: desired set `{BRFG, DJ-N, DJ-RTG, DJ-RTPRO, DJNL}` — filtered at startup via `reqNewsProviders()` to only subscribed codes (avoids Error 321 on accounts that lack a provider). Active set logged as `news_providers_active`.
+- Analyst actions: `BRFUPDN` (Briefing.com) → stored in `data/fundamentals.db/analyst_recommendations`
+
+**News/analyst fetch API contract:** Both `fetch_and_store_news()` and `fetch_and_store_analyst_actions()` return `(fetched, inserted)` — `fetched` is what IB returned; `inserted` is net-new DB rows. Callers use `fetched==0` to detect a dead feed, not `inserted==0` (which is normal after first run, since `INSERT OR IGNORE` deduplicates on subsequent fetches).
 
 ## IBKR Setup
 
@@ -184,15 +198,43 @@ run_orchestrator.py          ← Master process (start here)
 
 ### Sentiment
 - [x] FinBERT local NLP model
+- [x] FinBERT tokenizer loaded explicitly with `clean_up_tokenization_spaces=True` (suppresses `transformers` FutureWarning)
 - [x] Finnhub news integration
 - [x] Fear & Greed index (VIX-based)
 - [x] Composite sentiment score per symbol
+- [x] IB news sentiment integration (pre-scored at ingest, weight 0.20)
 
 ### Data
 - [x] Polygon → Yahoo fallback chain
 - [x] TTL caching for all data
 - [x] Multi-timeframe analysis (daily + 5min)
 - [x] Options flow detection (unusual activity)
+- [x] Equity descriptive stats (yfinance → DuckDB `equity_stats` table, daily refresh)
+- [x] IB news archive (BRFG/DJ-N/etc → SQLite `fundamentals.db`)
+- [x] IB analyst recommendations (BRFUPDN → SQLite `fundamentals.db`, structured parsing)
+
+### Parameter Optimization
+- [x] Optuna `StrategyOptimizer` — Bayesian/TPE with MedianPruner
+- [x] Per-strategy parameter spaces (iron_condor, long_call, bull_call_spread, bear_put_spread, put_credit_spread)
+- [x] `delta_short` / `delta_long` / `iv_floor` / `max_hold_days` wired into `Backtester.__init__` and searchable by optimizer
+- [x] `profit_target_pct` cap at 0.50 for credit trades removed — optimizer can explore the full range
+- [x] ML hyperparameter spaces (XGBoost, LightGBM)
+- [x] Objective functions: sharpe_ratio, composite, profit_factor, win_rate
+- [x] Walk-forward `optimize_per_window` integration
+- [x] Resumable studies via SQLite storage (`load_if_exists=True`)
+- [x] `run_optimizer.py` CLI
+- [x] `OptimizationResult` — summary table, JSON save, apply_to_config
+
+### Integration Tests (`tests/test_integration.py`)
+- Gated by `RUN_INTEGRATION_TESTS=1` env var — skipped entirely in the normal `pytest` run
+- Requires IB Gateway on port 4001 (live) or 4002 (paper)
+- Writes to isolated tables (`test_equity_stats`, `test_news`, `test_analyst_recommendations`) — never touches production data
+- Typically completes in ~20 seconds: IB API calls (`reqHistoricalNews`, `reqNewsArticle`) each take <0.2s; FinBERT cold model load adds ~7s once per session
+- `test_fetch_aapl_analyst_actions_second_fetch` replaced `test_fetch_spy_analyst_actions` — SPY is an ETF and receives no analyst upgrade/downgrade coverage, causing that test to always skip via `_require_news`
+
+### Backtester Modelling Improvements (fixed)
+- **Dynamic IV during hold** — `_reprice_position` now calls `_get_current_iv` which blends `entry_iv` (70%) with current `realized_vol × 1.15` (30%); vega P&L is now non-zero
+- **Volatility skew** — `_get_leg_iv` applies a linear log-moneyness skew: OTM puts +1% IV per 10% below ATM, OTM calls +0.2% IV per 10% above ATM; controlled by `skew_factor` param (default 1.0, 0.0 = flat)
 
 ---
 
@@ -224,17 +266,19 @@ run_orchestrator.py          ← Master process (start here)
 4. **[ ] Verify bot places trades** — ML predictions are now firing. Next market open, confirm trades actually execute on IBKR paper account.
 
 ### Medium Priority
-5. **[ ] Dashboard upgrade** — Add capital tier display, live ML predictions, current positions table, real-time P&L chart.
+5. **[ ] Dashboard upgrade** — Add capital tier display, live ML predictions, current positions table, real-time P&L chart. Consider adding equity_stats view and analyst recommendation feed.
 6. **[ ] VIX contract fix verification** — Changed from ^VIX (stock) to VIX (index on CBOE). Need to confirm it resolves during market hours.
 7. **[ ] Delayed market data type** — Set to type 3 (delayed) for paper account. Verify it eliminates Error 10089 warnings.
 8. **[ ] Earnings calendar live test** — Verify the bot actually skips trades near earnings dates.
+9. **[ ] Run optimizer on production parameters** — Use `run_optimizer.py --n-trials 200 --storage sqlite:///data/optuna.db` to find better iron condor params; apply with `--apply`.
 
 ### Lower Priority
-9. **[ ] Meta-labeler tuning** — Secondary ML model filters false positive signals. Needs more trade data to train properly.
-10. **[ ] Thompson sampling validation** — Strategy selection via multi-armed bandit. Needs trade history to be useful.
-11. **[ ] Add more cheap tickers** — Research other liquid, cheap options for micro tier (RIOT, SNAP, F, LCID, etc.)
-12. **[ ] Position adjustment rules** — Roll untested side when tested side delta hits 25. Research showed 86% win rate with adjustments.
-13. **[ ] 45 DTE entry experiment** — Backtest 45 DTE entry + 21 DTE exit vs current 21-day hold. Research was SPX-specific, need to validate on our universe.
+10. **[ ] Meta-labeler tuning** — Secondary ML model filters false positive signals. Needs more trade data to train properly.
+11. **[ ] Thompson sampling validation** — Strategy selection via multi-armed bandit. Needs trade history to be useful.
+12. **[ ] Add more cheap tickers** — Research other liquid, cheap options for micro tier (RIOT, SNAP, F, LCID, etc.)
+13. **[ ] Position adjustment rules** — Roll untested side when tested side delta hits 25. Research showed 86% win rate with adjustments.
+14. **[ ] 45 DTE entry experiment** — Backtest 45 DTE entry + 21 DTE exit vs current 21-day hold. Research was SPX-specific, need to validate on our universe.
+15. **[ ] Wire analyst recommendations into strategy decisions** — `fundamentals_db.get_analyst_recs()` is stored but not yet used in the entry pipeline. Could boost/suppress entries based on recent analyst consensus.
 
 ---
 
@@ -265,6 +309,9 @@ python run_orchestrator.py
 # Run backtest
 python run_backtest.py --symbols SPY QQQ AMD --capital 700
 
+# Backtest with per-window Optuna optimization
+python run_backtest.py --symbols SPY QQQ --optimize-per-window --optimize-n-trials 50
+
 # Check bot status
 python run_orchestrator.py --status
 
@@ -276,6 +323,15 @@ python run_orchestrator.py --backtest
 
 # Generate daily report
 python run_orchestrator.py --report
+
+# Refresh equity fundamentals (yfinance → DuckDB)
+python run_orchestrator.py --refresh-fundamentals
+
+# Fetch IB news + analyst actions → fundamentals.db
+python run_orchestrator.py --fetch-news
+
+# Run Optuna strategy parameter optimizer
+python run_optimizer.py --strategies iron_condor --symbols SPY QQQ --n-trials 100 --objective sharpe_ratio
 
 # View live logs
 python tail_logs.py
@@ -303,4 +359,4 @@ Secrets in `.env`:
 
 ---
 
-*Last updated: 2026-03-25*
+*Last updated: 2026-05-06*

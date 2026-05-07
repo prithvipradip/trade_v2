@@ -69,6 +69,11 @@ class DirectionPredictor:
         self._model_version: str = ""
         self._cv_scores: dict[str, float] = {}
 
+        # Optional override dicts injected by ModelTrainer._apply_optimized_hyperparams()
+        # so that the next train() call uses Optuna-tuned hyperparameters.
+        self._xgb_kwargs: dict = {}
+        self._lgbm_kwargs: dict = {}
+
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
     @property
@@ -454,7 +459,7 @@ class DirectionPredictor:
         try:
             from xgboost import XGBClassifier
 
-            model = XGBClassifier(
+            base_kwargs = dict(
                 n_estimators=200,
                 max_depth=5,
                 learning_rate=0.05,
@@ -467,6 +472,8 @@ class DirectionPredictor:
                 n_jobs=-1,
                 random_state=42,
             )
+            base_kwargs.update(self._xgb_kwargs)
+            model = XGBClassifier(**base_kwargs)
 
             # Walk-forward validation with purge gap
             wf_splits = self._walk_forward_split(len(X))
@@ -504,7 +511,7 @@ class DirectionPredictor:
         try:
             from lightgbm import LGBMClassifier
 
-            model = LGBMClassifier(
+            base_kwargs = dict(
                 n_estimators=200,
                 max_depth=5,
                 learning_rate=0.05,
@@ -519,6 +526,8 @@ class DirectionPredictor:
                 random_state=42,
                 deterministic=True,
             )
+            base_kwargs.update(self._lgbm_kwargs)
+            model = LGBMClassifier(**base_kwargs)
 
             wf_splits = self._walk_forward_split(len(X))
             scores = []
