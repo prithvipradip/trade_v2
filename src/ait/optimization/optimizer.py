@@ -215,8 +215,13 @@ class StrategyOptimizer:
         import yfinance as yf
 
         data = {}
+        weekend_holiday_buffer_days = 30
+        min_period_days = 90
         requested_days = max(1, int(self._train_days))
-        period_days = max(requested_days + 30, 90)  # buffer for weekends/holidays
+        period_days = max(
+            requested_days + weekend_holiday_buffer_days,
+            min_period_days,
+        )
         for symbol in self._symbols:
             try:
                 df = yf.Ticker(symbol).history(period=f"{period_days}d", interval="1d")
