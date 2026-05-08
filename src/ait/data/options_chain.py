@@ -62,7 +62,13 @@ class OptionContract:
 
     @property
     def is_liquid(self) -> bool:
-        return self.volume >= 50 and self.open_interest >= 100 and self.spread_pct < 0.15
+        # Env-tunable so we can loosen on paper / delayed-data accounts where
+        # `volume` is often 0 because it's a live tick stream we don't get.
+        import os
+        min_vol = int(os.environ.get("AIT_LIQ_MIN_VOLUME", "50"))
+        min_oi = int(os.environ.get("AIT_LIQ_MIN_OI", "100"))
+        max_spread = float(os.environ.get("AIT_LIQ_MAX_SPREAD", "0.15"))
+        return self.volume >= min_vol and self.open_interest >= min_oi and self.spread_pct < max_spread
 
 
 @dataclass
