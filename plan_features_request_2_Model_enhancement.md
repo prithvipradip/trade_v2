@@ -750,6 +750,190 @@ python scripts/run_fractal_diagnostics.py \
 
 ---
 
+### Phase 9: IBKR as Primary Intraday Data Source + 2-Year Backfill
+**Files:** `src/ait/data/market_data.py`, `src/ait/data/historical.py`, `src/ait/bot/orchestrator.py`, `scripts/backfill_intraday.py`
+
+**Motivation:** The current `get_intraday()` implementation is Yahoo Finance only. Using Yahoo for training data while trading against IBKR live prices introduces data source inconsistency: different split-adjustment timing, extended-hours bar contamination in Yahoo, and minor price divergences that compound into biased VLMC session features. IBKR must be the primary source for intraday bars so that training data and live inference use the same prices.
+
+The second issue is depth: 7 days of 5-min bars is insufficient for MFDFA (requires ≥500 bars ≈ 7 sessions) and walk-forward validation of VLMC features requires at least 1 year of daily sessions. 2 years (≈730 calendar days, ≈504 trading days, ≈39,312 5-min bars per symbol) enables full walk-forward IC analysis on VLMC features.
+
+**9.1 — Add `_get_ibkr_intraday()` to `MarketDataService`**
+
+```python
+async def _get_ibkr_intraday(
+    self,
+    symbol: str,
+    duration: str = "7 D",          # "7 D", "1 M", "6 M", "1 Y"
+    bar_size: str = "5 mins",
+) -> pd.DataFrame | None:
+    """Fetch intraday bars from IBKR via reqHistoricalDataAsync.
+
+    Args:
+        symbol:   Ticker string.
+        duration: IBKR duration string — "7 D", "1 M", "6 M", "1 Y".
+                  Max per request for 5-min bars is "6 M" before IBKR
+                  rejects with "invalid duration".
+        bar_size: "5 mins" for standard intraday.
+    """
+    if not self._ibkr or not self._ibkr.connected:
+        return None
+    try:
+        from ib_insync import Stock
+        contract = Stock(symbol, "SMART", "USD")
+        qualified = await self._ibkr.qualify_contract(contract)
+        if not qualified:
+            return None
+
+        bars = await self._ibkr.ib.reqHistoricalDataAsync(
+            qualified,
+            endDateTime="",          # empty = now
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow="TRADES",
+            useRTH=True,
+            formatDate=1,
+        )
+        if not bars:
+            return None
+
+        df = util.df(bars)
+        df = df.rename(columns={
+            "date": "Datetime", "open": "Open", "high": "High",
+            "low": "Low", "close": "Close", "volume": "Volume",
+        })
+        df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True)
+        df.set_index("Datetime", inplace=True)
+        return df[["Open", "High", "Low", "Close", "Volume"]]
+    except Exception as e:
+        log.debug("ibkr_intraday_failed", symbol=symbol, error=str(e))
+        return None
+```
+
+**9.2 — Update `get_intraday()` to IBKR → Yahoo fallback chain**
+
+Change `get_intraday()` to:
+1. Try `_get_ibkr_intraday(symbol, duration="7 D")` first.
+2. Fall back to Yahoo only if IBKR is unavailable or returns empty.
+
+The `days` parameter maps to IBKR duration strings:
+
+| `days` value | IBKR `durationStr` |
+|---|---|
+| ≤ 7 | "7 D" |
+| ≤ 30 | "1 M" |
+| ≤ 180 | "6 M" |
+| > 180 | "1 Y" (or paginated — see backfill) |
+
+**9.3 — Incremental daily fetch in orchestrator**
+
+The orchestrator's `_scan_symbol()` should replace its `get_intraday(days=7)` call with an incremental fetch: only request bars since `get_latest_intraday_timestamp()`. This avoids re-downloading bars already stored in SQLite.
+
+```python
+# In orchestrator._scan_symbol():
+last_ts = self._historical.get_latest_intraday_timestamp(symbol)
+if last_ts is None:
+    # First run — fetch 7 days to seed the DB
+    intraday = await self._market_data.get_intraday(symbol, interval="5m", days=7)
+else:
+    # Only fetch new bars since last stored timestamp
+    intraday = await self._market_data.get_intraday_since(symbol, since=last_ts)
+```
+
+Add `get_intraday_since(symbol, since: pd.Timestamp)` to `MarketDataService` — uses IBKR `endDateTime=""` and a `durationStr` computed from `now - since`.
+
+**9.4 — Extend `cleanup_old_intraday` retention to 2 years**
+
+Change `cleanup_old_intraday(keep_days=10)` call in orchestrator to `cleanup_old_intraday(keep_days=730)`. 2 years of 5-min data per symbol = ~39,312 rows × ~20 symbols = ~786K rows in `intraday_prices`. SQLite handles this comfortably (< 50 MB with the existing schema).
+
+**9.5 — Bulk backfill script: `scripts/backfill_intraday.py`**
+
+A one-time (and repeatable) script that backfills 2 years of 5-min bars per symbol from IBKR into SQLite. Must handle IBKR's pacing rule (60 requests per 10 minutes per client) and the 6-month-per-request cap for 5-min bars.
+
+```bash
+python scripts/backfill_intraday.py \
+    --symbols SPY QQQ AAPL NVDA MSFT \
+    --years 2 \
+    --bar-size "5 mins"
+```
+
+**Pagination logic:**
+
+For 2 years with max 6-month chunks:
+1. Split the 2-year window into 4 × 6-month segments (most-recent first).
+2. For each segment, call `reqHistoricalDataAsync` with `durationStr="6 M"` and `endDateTime` set to the end of that segment.
+3. Upsert into `intraday_prices` via `HistoricalDataStore.save_intraday()`.
+4. Pause 1 second between requests (well within 60/10-min pacing limit).
+
+**IBKR pacing constraints:**
+- Max 60 historical data requests per 10 minutes per client ID
+- Max 6 months of 5-min data per request
+- For 5 symbols × 4 requests each = 20 requests total — no pacing issue
+
+**CLI:**
+```python
+argparse arguments:
+  --symbols    list of tickers (required)
+  --years      how many years back to fetch (default: 2)
+  --bar-size   IBKR bar size string (default: "5 mins")
+  --db-path    SQLite DB path (default: data/historical.db)
+  --dry-run    print request plan without executing
+```
+
+---
+
+### Phase 10: VLMC Session Structure Diagnostic Reports
+**Files:** `src/ait/diagnostics/fractal_report.py`, `tests/test_fractal_diagnostics.py`
+
+**Motivation:** Phase 8 generates diagnostics only for fractal features (Hurst, PSD, MFDFA). The 13 VLMC session structure features have no diagnostic coverage: we cannot currently validate that `session_vwap_position`, `session_volume_front_load`, and `power_hour_momentum` are computing correctly or whether they carry predictive signal. Phase 10 adds VLMC-specific plots following the same Plotly HTML pattern as Phase 8.
+
+**New functions to add to `fractal_report.py`:**
+
+```python
+def plot_session_vwap_trajectory(symbol: str, intraday_df: pd.DataFrame) -> go.Figure
+def plot_volume_profile_distribution(symbol: str, intraday_df: pd.DataFrame) -> go.Figure
+def plot_session_feature_ic_analysis(features_df: pd.DataFrame, labels: pd.Series) -> go.Figure
+def plot_power_hour_patterns(symbol: str, intraday_df: pd.DataFrame) -> go.Figure
+```
+
+**What each plot validates:**
+
+| Function | What to check |
+|---|---|
+| `plot_session_vwap_trajectory` | Rolling average of `session_vwap_position` across all sessions. Strongly trending markets should show persistent above/below VWAP closing. Mean-reverting regimes should be near zero. |
+| `plot_volume_profile_distribution` | Histogram of `session_volume_front_load` values. Should be roughly uniform or slightly front-loaded (equities). Heavy back-loading > 0.6 may indicate ETF rebalancing artifacts. |
+| `plot_session_feature_ic_analysis` | IC bar chart for all 13 VLMC features vs. 5-day forward return. `power_hour_momentum` and `closing_imbalance` are expected to have the highest IC. |
+| `plot_power_hour_patterns` | Scatter: `power_hour_momentum` vs. next-day return. Should show mild positive correlation for trending markets. |
+
+**Update `generate_report()` to include VLMC plots:**
+
+```python
+# In generate_report(), after fetching intraday_df (requires Phase 9 backfill):
+if intraday_df is not None and not intraday_df.empty:
+    plots.extend([
+        plot_session_vwap_trajectory(symbol, intraday_df),
+        plot_volume_profile_distribution(symbol, intraday_df),
+        plot_session_feature_ic_analysis(features_df, labels),
+        plot_power_hour_patterns(symbol, intraday_df),
+    ])
+```
+
+`generate_report()` must be updated to also accept intraday data. It fetches intraday from the SQLite store (`HistoricalDataStore.load_intraday(symbol, days=730)`) rather than making a live IBKR call — diagnostic tool runs offline against the stored DB.
+
+**Updated CLI (no flag changes needed — VLMC plots included automatically):**
+
+```bash
+python scripts/run_fractal_diagnostics.py \
+    --symbols SPY QQQ AAPL NVDA \
+    --start 2022-01-01 \
+    --end 2025-12-31 \
+    --output reports/fractal/ \
+    --format html
+```
+
+Output now includes both fractal and VLMC sections in each per-symbol HTML.
+
+---
+
 ### Effort Estimates
 
 Estimates assume one developer, familiarity with the codebase, and include unit test writing.
@@ -764,7 +948,9 @@ Estimates assume one developer, familiarity with the codebase, and include unit 
 | **6** | Intraday fractal + VLMC session features | **2–3 days** | VWAP session boundary logic is the tricky part (today's bars only). Can reuse Phase 1 wavelet code for intraday path. |
 | **7** | Dependency addition (`pywavelets`, `shap`) | **0.1 days** | Trivial. Verify install on Intel Mac. |
 | **8** | Diagnostic report tool | **1–1.5 days** | Plotly charts + SHAP integration + IC computation + CLI. Low risk — diagnostic-only. |
-| **Total (Phases 1–8)** | | **~9–11.5 days** | All backtested + live-validated changes plus diagnostics. |
+| **9** | IBKR intraday source + 2-year backfill | **2–3 days** | `_get_ibkr_intraday()` + pagination logic + incremental orchestrator fetch + backfill script. Main risk: IBKR pacing and `reqHistoricalDataAsync` not available when TWS is disconnected — must degrade gracefully to Yahoo. |
+| **10** | VLMC diagnostic reports | **1 day** | 4 new plot functions + `generate_report()` update. Depends on Phase 9 backfill (needs stored intraday data). Low risk — diagnostic-only. |
+| **Total (Phases 1–10)** | | **~12–15.5 days** | Full fractal + VLMC feature stack with consistent IBKR data source, 2-year intraday history, and complete diagnostic coverage. |
 
 **Deferred work (separate branches):**
 
@@ -785,11 +971,12 @@ Estimates assume one developer, familiarity with the codebase, and include unit 
 | `src/ait/backtesting/engine.py` | Add fractal gate in `_select_strategy()`, 3 new constructor kwargs | Iron condors gated on regime stability |
 | `src/ait/backtesting/walkforward.py` | 3 new `WalkForwardConfig` fields, propagate to Backtester | Per-window threshold optimization |
 | `src/ait/data/historical.py` | Add `intraday_prices` SQLite table + 4 new methods (`save_intraday`, `load_intraday`, `get_latest_intraday_timestamp`, `cleanup_old_intraday`) | Required for MFDFA on intraday data; DB schema migration on first run |
-| `src/ait/data/market_data.py` | Change `get_intraday()` default from `days=1` to `days=7` | Fetches 7 days of 5-min bars from Yahoo; no new IB function needed |
+| `src/ait/data/market_data.py` | Add `_get_ibkr_intraday()` + `get_intraday_since()`; change fallback chain to IBKR→Yahoo; `get_intraday()` default `days=7` | IBKR becomes primary source for consistent training/trading data |
 | `src/ait/bot/orchestrator.py` | In `_scan_symbol()`: call `save_intraday()` after fetch, `load_intraday()` for full history before feature computation | Enables MFDFA from first startup (DB-warm) |
 | `pyproject.toml` | Add `pywavelets>=1.4`, `shap>=0.42` | New dependencies |
 | `src/ait/diagnostics/fractal_report.py` | New module — 7 Plotly chart functions + `generate_report()` | Diagnostic only; no trading pipeline effect |
 | `scripts/run_fractal_diagnostics.py` | New CLI script — calls `generate_report()` with argparse | Run on demand post-backtest |
+| `scripts/backfill_intraday.py` | New CLI script — paginated IBKR backfill for 2 years of 5-min bars per symbol | One-time run before walk-forward validation of VLMC features; repeatable to fill gaps |
 
 **No changes required:**
 - `src/ait/ml/range_predictor.py` — uses `FeatureEngine.compute()` → gets fractal features automatically
@@ -800,7 +987,6 @@ Estimates assume one developer, familiarity with the codebase, and include unit 
 - `src/ait/optimization/optimizer.py` — no change; picks up new param spaces via existing dict registration
 - `src/ait/backtesting/walkforward.py` window slicing — no change
 - Walk-forward 5-day purge gap — no change; fractal features don't add label leakage
-- **No new IB/IBKR function required** — Yahoo Finance already provides 5-min bars up to 60 days; IBKR `reqHistoricalData()` for intraday is not needed and adds pagination/pacing complexity
 
 **Retraining required:** After adding new features to `FeatureEngine`, saved models (`models/ensemble.pkl`, `models/range.pkl`, `models/vol_magnitude.pkl`) will have a feature name mismatch and must be retrained. The existing daily 7:30 AM retrain schedule handles this on the next run.
 
@@ -808,7 +994,7 @@ Estimates assume one developer, familiarity with the codebase, and include unit 
 
 ## 10. Diagnostic Reports
 
-A standalone diagnostic tool generates plots and predictive metrics for fractal features. It has no effect on the trading pipeline and can be run at any time against historical data.
+A standalone diagnostic tool generates plots and predictive metrics for fractal and VLMC session structure features. It has no effect on the trading pipeline and can be run at any time against the stored SQLite data.
 
 ### 10.1 Feature Health Plots
 
@@ -887,7 +1073,46 @@ python scripts/run_fractal_diagnostics.py \
 
 Output: `reports/fractal/fractal_report_SPY.html` (interactive Plotly) per symbol + `reports/fractal/ic_summary.csv` with IC metrics for all features × all walk-forward windows.
 
-**Dependencies:** `plotly>=5.0` (already in the project if used elsewhere, otherwise add), `shap>=0.42`.
+**Dependencies:** `plotly>=5.0` (already in the project), `shap>=0.42`.
+
+### 10.6 VLMC Session Structure Diagnostic Plots
+
+Four additional plots are generated per symbol when intraday data is available in the SQLite store (requires Phase 9 backfill).
+
+**`plot_session_vwap_trajectory(symbol, intraday_df)`**
+- Aggregates `session_vwap_position` (close vs. session VWAP) across all stored sessions.
+- Rolling 20-session mean and ±1σ band.
+- **What to check:** Trending markets should show persistent positive/negative VWAP position. Mean-reverting markets should oscillate around zero. Systematic bias (e.g., always below VWAP) may indicate a VWAP computation bug (check session boundary filtering).
+
+**`plot_volume_profile_distribution(symbol, intraday_df)`**
+- Histogram of `session_volume_front_load` and `session_volume_shape` across all sessions.
+- Overlays expected U-curve distribution (high volume at open and close).
+- **What to check:** `session_volume_front_load` > 0.45 is typical for US equities. Values uniformly distributed at 0.33 suggest the session boundary filter is not working (treating entire 7-day window as one session). Heavy back-loading (> 0.6) may indicate ETF creation/redemption artifacts.
+
+**`plot_session_feature_ic_analysis(features_df, labels)`**
+- IC (Spearman ρ) for all 13 VLMC session features vs. 5-day forward return.
+- Same bar chart format as the fractal IC plot.
+- **Expected findings:** `power_hour_momentum` and `closing_imbalance` expected to show the highest |IC| (0.04–0.10 range). `session_vwap_q1/q2/q3` will have lower IC — they measure intraday trajectory, not direction. Features with IC < 0.02 and no statistical significance should be flagged for potential removal.
+
+**`plot_power_hour_patterns(symbol, intraday_df)`**
+- Scatter plot: `power_hour_momentum` (x-axis) vs. next-session open return (y-axis) per day.
+- Colour-coded by `power_hour_vol_accel` (blue = decelerating, red = accelerating).
+- **What to check:** Should show mild positive slope (continuation) in trending markets. Flat scatter with no slope means `power_hour_momentum` has no predictive content for this symbol — expected for highly mean-reverting assets (e.g., short-dated inverse ETFs).
+
+**Updated CLI (VLMC plots are included automatically if intraday data exists):**
+
+```bash
+# Full report: fractal + VLMC
+python scripts/run_fractal_diagnostics.py \
+    --symbols SPY QQQ AAPL NVDA \
+    --start 2022-01-01 \
+    --end 2025-12-31 \
+    --output reports/fractal/ \
+    --format html
+
+# If intraday DB is populated (after backfill_intraday.py), VLMC plots appear automatically.
+# If DB is empty for a symbol, VLMC section is omitted with a logged warning.
+```
 
 ---
 
@@ -1815,7 +2040,223 @@ class TestCLIEntryPoint:
 
 ---
 
-### 11.9 End-to-End Integration Tests
+### 11.9 Phase 9 — IBKR Intraday Source + Backfill
+
+**Files:** `tests/test_ibkr_intraday.py`, `tests/test_market_data.py` (extended)
+
+```python
+"""Tests for Phase 9: IBKR as primary intraday data source."""
+
+from __future__ import annotations
+
+import asyncio
+import subprocess
+import sys
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import numpy as np
+import pandas as pd
+import pytest
+
+
+def _make_intraday(n_bars: int = 78, days: int = 1) -> pd.DataFrame:
+    """Synthetic intraday DataFrame with DatetimeIndex (UTC)."""
+    from datetime import datetime, timezone, timedelta
+    start = datetime(2026, 4, 28, 13, 30, tzinfo=timezone.utc)
+    idx = pd.DatetimeIndex(
+        [start + timedelta(minutes=5 * i) for i in range(n_bars * days)], tz="UTC"
+    )
+    price = 100.0 * np.exp(np.cumsum(np.random.default_rng(0).normal(0, 0.001, len(idx))))
+    return pd.DataFrame({
+        "Open": price, "High": price * 1.001, "Low": price * 0.999,
+        "Close": price, "Volume": np.random.randint(1000, 5000, len(idx)),
+    }, index=idx)
+
+
+class TestMarketDataServiceIBKRIntraday:
+
+    def test_get_intraday_returns_none_when_ibkr_disconnected(self) -> None:
+        """When IBKR is disconnected, get_intraday() must fall back to Yahoo
+        (or return None on network failure) — must never raise."""
+        from ait.data.market_data import MarketDataService
+        mock_ibkr = MagicMock()
+        mock_ibkr.connected = False
+        svc = MarketDataService(ibkr_client=mock_ibkr)
+
+        async def run():
+            with patch("yfinance.Ticker") as mock_yf:
+                mock_ticker = MagicMock()
+                mock_ticker.history.return_value = pd.DataFrame()
+                mock_yf.return_value = mock_ticker
+                result = await svc.get_intraday("SPY", interval="5m", days=7)
+            return result
+
+        result = asyncio.get_event_loop().run_until_complete(run())
+        assert result is None or isinstance(result, pd.DataFrame)
+
+    def test_ibkr_intraday_result_has_correct_columns(self) -> None:
+        """_get_ibkr_intraday() output must have OHLCV columns."""
+        from ait.data.market_data import MarketDataService
+        mock_ibkr = MagicMock()
+        mock_ibkr.connected = True
+
+        svc = MarketDataService(ibkr_client=mock_ibkr)
+
+        fake_df = _make_intraday(78)
+
+        async def run():
+            with patch.object(svc, "_get_ibkr_intraday", return_value=fake_df):
+                result = await svc.get_intraday("SPY", interval="5m", days=7)
+            return result
+
+        result = asyncio.get_event_loop().run_until_complete(run())
+        assert result is not None
+        assert set(result.columns) >= {"Open", "High", "Low", "Close", "Volume"}
+
+    def test_get_intraday_since_returns_only_new_bars(self) -> None:
+        """get_intraday_since() must return bars strictly after the given timestamp."""
+        from ait.data.market_data import MarketDataService
+        mock_ibkr = MagicMock()
+        mock_ibkr.connected = True
+        svc = MarketDataService(ibkr_client=mock_ibkr)
+
+        df = _make_intraday(78)
+        cutoff = df.index[40]
+
+        async def run():
+            with patch.object(svc, "_get_ibkr_intraday", return_value=df):
+                result = await svc.get_intraday_since("SPY", since=cutoff)
+            return result
+
+        result = asyncio.get_event_loop().run_until_complete(run())
+        if result is not None and not result.empty:
+            assert result.index.min() > cutoff, (
+                "get_intraday_since must exclude bars at or before the cutoff timestamp"
+            )
+
+
+class TestBackfillScript:
+
+    def test_backfill_script_exists(self) -> None:
+        assert Path("scripts/backfill_intraday.py").exists(), (
+            "scripts/backfill_intraday.py must exist (Phase 9)"
+        )
+
+    def test_backfill_help_exits_zero(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "scripts/backfill_intraday.py", "--help"],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 0
+
+    def test_backfill_requires_symbols(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "scripts/backfill_intraday.py"],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode != 0
+
+    def test_backfill_dry_run_exits_zero(self, tmp_path: Path) -> None:
+        result = subprocess.run(
+            [sys.executable, "scripts/backfill_intraday.py",
+             "--symbols", "SPY", "--years", "1", "--dry-run",
+             "--db-path", str(tmp_path / "test.db")],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0, f"dry-run failed:\n{result.stderr}"
+```
+
+---
+
+### 11.10 Phase 10 — VLMC Diagnostic Reports
+
+**File:** `tests/test_fractal_diagnostics.py` (extended)
+
+```python
+class TestVLMCDiagnosticPlots:
+
+    def _make_intraday_multi_session(self, n_sessions: int = 20) -> pd.DataFrame:
+        """Build n_sessions × 78 bars of synthetic intraday data."""
+        from datetime import datetime, timezone, timedelta
+        bars_per_session = 78
+        start = datetime(2026, 1, 2, 13, 30, tzinfo=timezone.utc)
+        idx = []
+        for day in range(n_sessions):
+            session_start = start + timedelta(days=day)
+            # Skip weekends (crude)
+            while session_start.weekday() >= 5:
+                session_start += timedelta(days=1)
+            idx.extend([
+                session_start + timedelta(minutes=5 * bar)
+                for bar in range(bars_per_session)
+            ])
+        idx = pd.DatetimeIndex(idx, tz="UTC")
+        price = 100.0 * np.exp(np.cumsum(np.random.default_rng(42).normal(0, 0.001, len(idx))))
+        return pd.DataFrame({
+            "Open": price, "High": price * 1.001, "Low": price * 0.999,
+            "Close": price, "Volume": np.random.randint(1000, 5000, len(idx)),
+        }, index=idx)
+
+    def _features_df_with_vlmc(self, rows: int = 100) -> pd.DataFrame:
+        rng = np.random.default_rng(42)
+        dates = pd.date_range("2023-01-01", periods=rows, freq="B")
+        return pd.DataFrame({
+            "session_vwap_position":     rng.normal(0.0, 0.01, rows),
+            "session_volume_front_load": rng.uniform(0.3, 0.6, rows),
+            "session_volume_shape":      rng.uniform(-0.1, 0.1, rows),
+            "power_hour_momentum":       rng.normal(0.0, 0.005, rows),
+            "power_hour_vol_accel":      rng.normal(0.0, 0.1, rows),
+            "closing_imbalance":         rng.normal(0.0, 0.003, rows),
+            "closing_range_position":    rng.uniform(0.2, 0.8, rows),
+            "fwd_return_5d":             rng.normal(0.001, 0.02, rows),
+        }, index=dates)
+
+    def test_plot_session_vwap_trajectory_exists(self) -> None:
+        from ait.diagnostics import fractal_report
+        assert callable(getattr(fractal_report, "plot_session_vwap_trajectory", None)), (
+            "plot_session_vwap_trajectory missing from ait.diagnostics.fractal_report"
+        )
+
+    def test_plot_volume_profile_distribution_exists(self) -> None:
+        from ait.diagnostics import fractal_report
+        assert callable(getattr(fractal_report, "plot_volume_profile_distribution", None))
+
+    def test_plot_session_feature_ic_analysis_exists(self) -> None:
+        from ait.diagnostics import fractal_report
+        assert callable(getattr(fractal_report, "plot_session_feature_ic_analysis", None))
+
+    def test_plot_power_hour_patterns_exists(self) -> None:
+        from ait.diagnostics import fractal_report
+        assert callable(getattr(fractal_report, "plot_power_hour_patterns", None))
+
+    def test_plot_session_vwap_trajectory_returns_object(self) -> None:
+        from ait.diagnostics.fractal_report import plot_session_vwap_trajectory
+        fig = plot_session_vwap_trajectory("SPY", self._make_intraday_multi_session())
+        assert fig is not None
+
+    def test_plot_volume_profile_distribution_returns_object(self) -> None:
+        from ait.diagnostics.fractal_report import plot_volume_profile_distribution
+        fig = plot_volume_profile_distribution("SPY", self._make_intraday_multi_session())
+        assert fig is not None
+
+    def test_plot_session_feature_ic_analysis_returns_object(self) -> None:
+        from ait.diagnostics.fractal_report import plot_session_feature_ic_analysis
+        df = self._features_df_with_vlmc()
+        fig = plot_session_feature_ic_analysis(
+            df, pd.Series(df["fwd_return_5d"].values, index=df.index)
+        )
+        assert fig is not None
+
+    def test_plot_power_hour_patterns_returns_object(self) -> None:
+        from ait.diagnostics.fractal_report import plot_power_hour_patterns
+        fig = plot_power_hour_patterns("SPY", self._make_intraday_multi_session())
+        assert fig is not None
+```
+
+---
+
+### 11.11 End-to-End Integration Tests
 
 **File:** `tests/test_fractal_integration.py`
 
@@ -1953,7 +2394,7 @@ kill %1
 
 ---
 
-### 11.11 Regime Signal Validation (Manual — Post-Backtest)
+### 11.13 Regime Signal Validation (Manual — Post-Backtest)
 
 After the walk-forward smoke test, export feature values and verify against known market history. These are human checks, not automated tests — a mismatch signals a numerical bug in an estimator.
 
@@ -1968,7 +2409,7 @@ After the walk-forward smoke test, export feature values and verify against know
 
 ---
 
-### 11.12 Iron Condor Gate Counterfactual Validation (Manual)
+### 11.14 Iron Condor Gate Counterfactual Validation (Manual)
 
 From `BacktestResult.trades` after the per-window backtest, compare gated vs. non-gated iron condor entries. The gate is validated when:
 
@@ -1983,7 +2424,7 @@ If gated trades would have had a higher win rate than non-gated trades, the `hur
 
 ---
 
-### 11.13 Per-Phase Completion Criteria
+### 11.15 Per-Phase Completion Criteria
 
 A phase is done only when its specific pytest target passes with zero failures.
 
@@ -1996,11 +2437,13 @@ A phase is done only when its specific pytest target passes with zero failures.
 | 5 | `pytest tests/test_intraday_store.py tests/test_market_data.py` |
 | 6 | `pytest tests/test_intraday_features.py` |
 | 7 | `pytest tests/test_fractal_features.py -k "TestDependencies"` |
-| 8 | `pytest tests/test_fractal_diagnostics.py` |
-| All phases | `pytest tests/ -k "fractal" -v` — zero failures |
+| 8 | `pytest tests/test_fractal_diagnostics.py -k "TestFractalReportImport or TestFractalReportSmoke or TestCLIEntryPoint"` |
+| 9 | `pytest tests/test_ibkr_intraday.py tests/test_market_data.py -k "TestMarketDataServiceIBKRIntraday or TestBackfillScript"` |
+| 10 | `pytest tests/test_fractal_diagnostics.py -k "TestVLMCDiagnosticPlots"` |
+| All phases | `pytest tests/ -k "fractal or intraday or backfill or vlmc" -v` — zero failures |
 
 ---
 
-*Plan authored: 2026-05-06*
+*Plan authored: 2026-05-06. Updated 2026-05-07: added Phase 9 (IBKR intraday + 2-year backfill), Phase 10 (VLMC diagnostics), and clarifications on data sources, VLMC bar resolution, and diagnostic coverage.*
 *Branch: features-request-2*
 *Related plan: `/Users/ahmednagi/.claude/plans/would-the-above-work-dazzling-bunny.md`*

@@ -15,7 +15,7 @@ run_orchestrator.py          ← Master process (start here)
   │           │     ├── MarketScheduler  ← Pre-market / Open / Post-market / Off-hours
   │           │     ├── ModelTrainer     ← XGBoost + LightGBM ensemble
   │           │     ├── SentimentEngine  ← FinBERT + Finnhub + Fear/Greed
-  │           │     ├── StrategySelector ← Iron condors preferred, spreads as fallback
+  │           │     ├── StrategySelector ← Multi-strategy simultaneous execution per window; wing widths and strangle deltas are IV-scaled and Optuna-optimized
   │           │     ├── CapitalTierMgr   ← Auto-scales strategies to account size
   │           │     ├── RiskManager      ← Circuit breaker, PDT guard, position sizing
   │           │     ├── TradeExecutor    ← Places orders via IBKR
@@ -58,7 +58,7 @@ run_orchestrator.py          ← Master process (start here)
 | `src/ait/risk/capital_tiers.py` | Auto-scales strategies based on account size |
 | `src/ait/risk/manager.py` | Risk validation before every trade |
 | `src/ait/sentiment/engine.py` | Composite sentiment (FinBERT + Finnhub + fear/greed + IB news) |
-| `src/ait/data/market_data.py` | Polygon → Yahoo fallback data chain |
+| `src/ait/data/market_data.py` | `load_daily_ohlcv()` — IB store (5-min resampled) → Yahoo fallback; real-time quotes from IBKR |
 | `src/ait/data/earnings.py` | Earnings calendar — blocks trades near earnings |
 | `src/ait/data/equity_stats.py` | yfinance equity fundamentals → DuckDB equity_stats table |
 | `src/ait/data/fundamentals_db.py` | SQLite CRUD for IB news + analyst recommendations |
@@ -108,13 +108,13 @@ run_orchestrator.py          ← Master process (start here)
 
 ## Data Sources
 
-| Source | What | Free Tier |
-|--------|------|-----------|
-| Yahoo Finance | Historical OHLCV + equity fundamentals (equity_stats) | Unlimited |
-| Polygon.io | Historical daily data (primary) | 5 calls/min |
+| Source | What | Notes |
+|--------|------|-------|
+| IBKR 5-min SQLite store | Primary daily OHLCV (resampled from 5-min bars); intraday VLMC features | Requires IB backfill; 2 years stored locally |
+| Yahoo Finance | Daily OHLCV fallback (when IB store has <60 bars); equity fundamentals (P/E, beta, sector) | Unlimited; no key required |
 | Finnhub | News sentiment | 60 calls/min |
 | FinBERT | NLP sentiment from news headlines | Local model |
-| IBKR | Real-time quotes, order execution, news, analyst actions | Needs subscription |
+| IBKR | Real-time quotes, order execution, options chains, news, analyst actions | Needs subscription |
 
 **IB news providers in use:**
 - General news: desired set `{BRFG, DJ-N, DJ-RTG, DJ-RTPRO, DJNL}` — filtered at startup via `reqNewsProviders()` to only subscribed codes (avoids Error 321 on accounts that lack a provider). Active set logged as `news_providers_active`.
@@ -205,7 +205,8 @@ run_orchestrator.py          ← Master process (start here)
 - [x] IB news sentiment integration (pre-scored at ingest, weight 0.20)
 
 ### Data
-- [x] Polygon → Yahoo fallback chain
+- [x] IB store → Yahoo fallback chain for daily OHLCV (`load_daily_ohlcv()` in `market_data.py`)
+- [x] VLMC intraday features merged into ML training via `FeatureEngine.compute(intraday_store=...)` 
 - [x] TTL caching for all data
 - [x] Multi-timeframe analysis (daily + 5min)
 - [x] Options flow detection (unusual activity)
@@ -215,15 +216,27 @@ run_orchestrator.py          ← Master process (start here)
 
 ### Parameter Optimization
 - [x] Optuna `StrategyOptimizer` — Bayesian/TPE with MedianPruner
-- [x] Per-strategy parameter spaces (iron_condor, long_call, bull_call_spread, bear_put_spread, put_credit_spread)
-- [x] `delta_short` / `delta_long` / `iv_floor` / `max_hold_days` wired into `Backtester.__init__` and searchable by optimizer
+- [x] Per-strategy parameter spaces (iron_condor, long_call, bull_call_spread, bear_put_spread, put_credit_spread, short_strangle, long_strangle)
+- [x] `delta_short` / `delta_long` / `iv_floor` / `wing_floor_dollars` / `max_hold_days` wired into `Backtester.__init__` and searchable by optimizer
+- [x] `wing_k` — vol-scaled wing multiplier: `wing = wing_k × price × IV × √(DTE/365)`; Optuna-optimized per window [0.30–2.00]; `wing_floor_dollars` remains as hard minimum floor
+- [x] `delta_iv_scale` — IV-driven delta scaling for strangles: 0=static, 1=full response; high IV → lower effective delta → further OTM strikes
+- [x] `BacktestConfig` added to `settings.py` — `initial_capital`, `position_size_pct`, `wing_floor_dollars`, `iv_floor`, `wing_k`, `delta_iv_scale` all read from `config.yaml`; no code changes needed to adjust capital size or spread width
 - [x] `profit_target_pct` cap at 0.50 for credit trades removed — optimizer can explore the full range
 - [x] ML hyperparameter spaces (XGBoost, LightGBM)
 - [x] Objective functions: sharpe_ratio, composite, profit_factor, win_rate
+- [x] Min-trade penalty (two-tier) — hard floor: < 3 trades always scores −100; quadratic penalty: `(actual/min_trades)²` between 3 and `optimize_min_trades`; prevents degenerate low-sample Sharpe inflation
+- [x] Early stopping — `_EarlyStopCallback` halts a window study after `optimize_patience` consecutive non-improving trials (0 = disabled)
+- [x] Conditional warm-start — enqueues prior window's best params if OOS `win_rate ≥ 75%` AND `total_trades ≥ 5`; cold-starts otherwise
+- [x] `range_threshold_pct` config field; `RangePredictor` `horizon_days` auto-linked to `max_hold_days` per window
+- [x] `min_confidence` search range capped at 0.70 (upper bound) across all strategy spaces — prevents Optuna from selecting values of 0.72–0.85 that generate 0 OOS trades in 63-day test windows
 - [x] Walk-forward `optimize_per_window` integration
 - [x] Resumable studies via SQLite storage (`load_if_exists=True`)
 - [x] `run_optimizer.py` CLI
 - [x] `OptimizationResult` — summary table, JSON save, apply_to_config
+
+### New Strategies (engine)
+- [x] `short_strangle` — sell OTM call + sell OTM put (no wings); IV-scaled delta: high IV → go further OTM; margin modeled as 20% of underlying per side
+- [x] `long_strangle` — buy OTM call + buy OTM put; profit from large moves or IV expansion; IV-scaled delta; repriced correctly in `_reprice_position`
 
 ### Integration Tests (`tests/test_integration.py`)
 - Gated by `RUN_INTEGRATION_TESTS=1` env var — skipped entirely in the normal `pytest` run
@@ -251,6 +264,14 @@ run_orchestrator.py          ← Master process (start here)
 - **+138% total return**
 - Sharpe 1.51
 - +49.62% alpha over buy-and-hold
+
+### QQQ integration test (2-yr walk-forward, 2024-2026, multi-strategy)
+- **−21% return** (18 windows, 50 Optuna trials each)
+- QQQ 2025 had multiple large directional moves (Liberation Day tariff shock in April, +15% recovery, further volatility Q3-Q4) that are hostile to iron condors
+- Iron_condor was the only profitable strategy (+$1.6K, ~36-40% win rate) across the test period
+- Directional fallback strategies (bear_put_spread, bull_call_spread) lost heavily because ML model directional accuracy is ~22% (too low for reliable directional bets)
+- Range predictor gate (52% accuracy) blocks iron_condors in volatile conditions — no fallback to directional strategies (directional fallback was tried and reverted; it worsened total losses by $35K)
+- **Key lesson**: Iron condors are the reliable core; directional/volatility strategies require significantly higher ML directional accuracy to be profitable
 
 ### Small account ($700)
 - Backtest pending...
@@ -350,6 +371,10 @@ All in `config.yaml`:
 - `ml.retrain_interval_days` — days between retrains (7)
 - `options.strategies` — allowed strategy types
 - `learning.enabled` — self-learning on/off
+- `backtest.initial_capital` — starting capital for walk-forward / integration tests (default $100,000)
+- `backtest.position_size_pct` — fraction of capital risked per trade on a max-loss basis (default 0.05); raise to 0.20 for accounts < $10k
+- `backtest.wing_floor_dollars` — minimum iron condor wing width in dollars (default 5.0); lower to 1.0 for cheap underlyings like MARA, SOFI, RIOT
+- `backtest.iv_floor` — minimum synthetic IV used in Black-Scholes pricing (default 0.20); prevents near-zero credits in calm markets
 
 Secrets in `.env`:
 - `IBKR_HOST`, `IBKR_PORT`, `IBKR_CLIENT_ID`, `IBKR_ACCOUNT`
@@ -359,4 +384,4 @@ Secrets in `.env`:
 
 ---
 
-*Last updated: 2026-05-06*
+*Last updated: 2026-05-08*

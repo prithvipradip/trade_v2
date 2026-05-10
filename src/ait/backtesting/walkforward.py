@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -42,10 +43,14 @@ class WalkForwardConfig:
     test_days: int = 63          # ~3 months test window
     step_days: int = 21          # ~1 month step between windows
     gap_days: int = 5            # Purge gap between train and test
-    initial_capital: float = 10_000.0
+    initial_capital: float = 100_000.0
     commission_per_contract: float = 0.65
     slippage_pct: float = 0.03  # 3% realistic for multi-leg options
     position_size_pct: float = 0.05
+    wing_floor_dollars: float = 5.0
+    wing_k: float = 1.0
+    iv_floor: float = 0.20
+    delta_iv_scale: float = 0.0
     stop_loss_pct: float = 0.35            # Cut losses at 35% (options decay fast)
     profit_target_pct: float = 0.50         # Take profits at 50% (don't be greedy)
     max_hold_days: int = 21                 # 3 weeks max (avoid deep theta decay)
@@ -57,6 +62,12 @@ class WalkForwardConfig:
     max_concurrent_positions: int = 3
     optimize_per_window: bool = False
     optimize_n_trials: int = 50
+    optimize_patience: int = 0       # 0 = disabled; N = stop after N non-improving trials
+    optimize_min_trades: int = 10    # Penalise trials with fewer trades than this floor
+    range_threshold_pct: float = 0.05  # Target move % for range model; links to strategy profitability
+    hurst_regime_threshold: float = 0.20
+    hurst_regime_penalty: float = 0.10
+    multifractal_max_width: float = 0.50
 
 
 @dataclass
@@ -364,10 +375,12 @@ class WalkForwardBacktester:
         symbols: list[str],
         strategies: list[str],
         config: WalkForwardConfig | None = None,
+        db_path: "Path | None" = None,
     ) -> None:
         self._symbols = symbols
         self._strategies = strategies
         self._config = config or WalkForwardConfig()
+        self._db_path = db_path
 
     async def run(self, data: dict[str, pd.DataFrame] | None = None) -> WalkForwardResult:
         """Run walk-forward backtest.
@@ -392,6 +405,7 @@ class WalkForwardBacktester:
 
         # Run each window
         window_results = []
+        prev_best_params: dict | None = None   # best Optuna params from prior window
         for i, (train_start, train_end, test_start, test_end) in enumerate(windows):
             log.info(
                 "running_window",
@@ -414,6 +428,8 @@ class WalkForwardBacktester:
             all_symbol_trades = []
             model_accuracy = 0.0
             active_symbols = 0
+            curr_best_params: dict | None = None
+            prev_oos = window_results[-1].backtest_result if window_results else None
             # Use full capital per symbol for position sizing — splitting by symbol count
             # makes iron condors impossible on stocks priced >$50 (max_loss_per_contract too large)
             per_symbol_capital = self._config.initial_capital
@@ -436,13 +452,23 @@ class WalkForwardBacktester:
                 # Per-window parameter optimization (optional)
                 window_cfg = self._config
                 if self._config.optimize_per_window:
-                    window_cfg = self._optimize_window_params(
-                        train_df, symbol, i + 1, active_strategies
-                    ) or self._config
+                    new_cfg, best_params = self._optimize_window_params(
+                        train_df, symbol, i + 1, active_strategies,
+                        prior_oos_result=prev_oos,
+                        prior_best_params=prev_best_params,
+                    )
+                    window_cfg = new_cfg or self._config
+                    if best_params is not None:
+                        curr_best_params = best_params
 
                 # Train ML model on training window for this symbol
+                # intraday_store is opened inside _train_window_model using self._db_path
                 predictor = self._train_window_model(train_df, symbol, i + 1)
-                range_predictor = self._train_window_range_model(train_df, symbol, i + 1)
+                range_predictor = self._train_window_range_model(
+                    train_df, symbol, i + 1,
+                    max_hold_days=window_cfg.max_hold_days,
+                    threshold_pct=self._config.range_threshold_pct,
+                )
                 if predictor and predictor.is_trained:
                     model_accuracy = max(
                         model_accuracy,
@@ -492,6 +518,19 @@ class WalkForwardBacktester:
                     range_min_confidence=getattr(
                         window_cfg, "range_min_confidence", 0.55
                     ),
+                    hurst_regime_threshold=getattr(
+                        window_cfg, "hurst_regime_threshold", 0.20
+                    ),
+                    hurst_regime_penalty=getattr(
+                        window_cfg, "hurst_regime_penalty", 0.10
+                    ),
+                    multifractal_max_width=getattr(
+                        window_cfg, "multifractal_max_width", 0.50
+                    ),
+                    iv_floor=window_cfg.iv_floor,
+                    wing_floor_dollars=window_cfg.wing_floor_dollars,
+                    wing_k=window_cfg.wing_k,
+                    delta_iv_scale=window_cfg.delta_iv_scale,
                 )
                 result = bt.run()
 
@@ -530,6 +569,10 @@ class WalkForwardBacktester:
                         adaptations=[a["change"] for a in learning_summary["adaptations"]],
                     )
 
+            # Carry forward best params for next window's warm-start decision
+            if curr_best_params is not None:
+                prev_best_params = curr_best_params
+
         # Build aggregated results
         result = WalkForwardResult(
             windows=window_results,
@@ -562,13 +605,43 @@ class WalkForwardBacktester:
         symbol: str,
         window_id: int,
         strategies: list[str],
-    ) -> WalkForwardConfig | None:
-        """Run Optuna on the training slice and return an updated config.
+        prior_oos_result: "BacktestResult | None" = None,
+        prior_best_params: "dict | None" = None,
+    ) -> "tuple[WalkForwardConfig | None, dict | None]":
+        """Run Optuna on the training slice and return (updated_config, best_params).
 
-        Returns None on any failure (caller falls back to original config).
+        Conditionally warm-starts from prior_best_params if the prior window's
+        out-of-sample result was strong (win_rate >= 0.75 and trades >= 5).
+        Returns (None, None) on any failure (caller falls back to original config).
         """
         try:
+            from ait.ml.features import FeatureEngine
             from ait.optimization.optimizer import StrategyOptimizer
+
+            try:
+                features_cache = FeatureEngine().compute(train_df)
+            except Exception:
+                features_cache = None
+
+            # Warm-start only if prior window generalised well
+            warm_params: dict | None = None
+            if prior_best_params and prior_oos_result is not None:
+                if (prior_oos_result.win_rate >= 0.75
+                        and prior_oos_result.total_trades >= 5):
+                    warm_params = prior_best_params
+                    log.info(
+                        "warm_start_from_prior_window",
+                        window=window_id,
+                        prior_win_rate=f"{prior_oos_result.win_rate:.2%}",
+                        prior_trades=prior_oos_result.total_trades,
+                    )
+                else:
+                    log.info(
+                        "cold_start_prior_window_weak",
+                        window=window_id,
+                        prior_win_rate=f"{prior_oos_result.win_rate:.2%}",
+                        prior_trades=prior_oos_result.total_trades,
+                    )
 
             optimizer = StrategyOptimizer(
                 symbols=[symbol],
@@ -578,9 +651,17 @@ class WalkForwardBacktester:
                 objective="composite",
                 study_name=f"wf_window_{window_id}_{symbol}",
                 initial_capital=self._config.initial_capital,
+                features_cache=features_cache,
+                position_size_pct=self._config.position_size_pct,
+                wing_floor_dollars=self._config.wing_floor_dollars,
+                wing_k=self._config.wing_k,
+                iv_floor=self._config.iv_floor,
+                delta_iv_scale=self._config.delta_iv_scale,
+                patience=self._config.optimize_patience,
+                min_trades=self._config.optimize_min_trades,
             )
             # Inject pre-loaded training data so the optimizer doesn't re-fetch
-            result = optimizer.run(data={symbol: train_df})
+            result = optimizer.run(data={symbol: train_df}, prior_params=warm_params)
             best = result.best_params
 
             # Build an updated config from best params, falling back to originals
@@ -597,18 +678,23 @@ class WalkForwardBacktester:
                 symbol=symbol,
                 best_value=result.best_value,
             )
-            return new_cfg
+            return new_cfg, best
         except Exception as e:
             log.warning("window_optimization_failed", window=window_id, symbol=symbol, error=str(e))
-            return None
+            return None, None
 
     def _train_window_range_model(
-        self, train_df: pd.DataFrame, symbol: str, window_id: int
+        self,
+        train_df: pd.DataFrame,
+        symbol: str,
+        window_id: int,
+        max_hold_days: int = 30,
+        threshold_pct: float = 0.05,
     ):
         """Train range predictor on this window's training data."""
         try:
             from ait.ml.range_predictor import RangePredictor
-            rp = RangePredictor(threshold_pct=0.05, horizon_days=30)
+            rp = RangePredictor(threshold_pct=threshold_pct, horizon_days=max_hold_days)
             accs = rp.train(train_df, symbol=symbol)
             if accs and rp.is_trained:
                 avg = sum(accs.values()) / len(accs)
@@ -630,9 +716,16 @@ class WalkForwardBacktester:
         Each window gets a fresh model to prevent data leakage.
         """
         try:
+            intraday_store = None
+            if self._db_path is not None:
+                from ait.data.historical import HistoricalDataStore
+                intraday_store = HistoricalDataStore(db_path=self._db_path)
+
             ml_config = MLConfig()
             predictor = DirectionPredictor(ml_config)
-            accuracies = predictor.train(train_df)
+            accuracies = predictor.train(
+                train_df, symbol=symbol, intraday_store=intraday_store
+            )
 
             if accuracies:
                 avg_acc = sum(accuracies.values()) / len(accuracies)
@@ -689,25 +782,22 @@ class WalkForwardBacktester:
         return windows
 
     async def _fetch_data(self) -> dict[str, pd.DataFrame]:
-        """Fetch historical data for all symbols from Yahoo Finance."""
-        import yfinance as yf
+        """Load daily OHLCV from IB store (fallback: Yahoo Finance)."""
+        from ait.data.market_data import load_daily_ohlcv
 
         data = {}
-        total_days = self._config.train_days + self._config.test_days + 100
+        fetch_days = self._config.train_days + self._config.test_days + 100
 
         for symbol in self._symbols:
             try:
                 loop = asyncio.get_running_loop()
-                ticker = await loop.run_in_executor(None, lambda s=symbol: yf.Ticker(s))
-
-                # Always fetch 5y so training windows have enough data for ML
-                period = "5y"
                 df = await loop.run_in_executor(
-                    None, lambda t=ticker: t.history(period=period, interval="1d")
+                    None,
+                    lambda s=symbol: load_daily_ohlcv(
+                        s, days=fetch_days, db_path=self._db_path
+                    ),
                 )
-
                 if df is not None and len(df) > 100:
-                    df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
                     data[symbol] = df
                     log.info("data_fetched", symbol=symbol, rows=len(df))
             except Exception as e:

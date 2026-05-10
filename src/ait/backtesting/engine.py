@@ -59,8 +59,15 @@ class Backtester:
         context_bars: int = 0,
         delta_short: float = 0.20,
         delta_long: float = 0.30,
-        iv_floor: float = 0.10,
+        iv_floor: float = 0.20,
+        wing_floor_dollars: float = 5.0,
+        wing_k: float = 1.0,
+        delta_iv_scale: float = 0.0,
         skew_factor: float = 1.0,
+        hurst_regime_threshold: float = 0.20,
+        hurst_regime_penalty: float = 0.10,
+        multifractal_max_width: float = 0.50,
+        features_cache: pd.DataFrame | None = None,
     ) -> None:
         self._data = self._prepare_data(data)
         self._strategies = strategies
@@ -81,7 +88,14 @@ class Backtester:
         self._delta_short = delta_short
         self._delta_long = delta_long
         self._iv_floor = iv_floor
+        self._wing_floor_dollars = wing_floor_dollars
+        self._wing_k = wing_k
+        self._delta_iv_scale = delta_iv_scale
         self._skew_factor = skew_factor
+        self._hurst_regime_threshold = hurst_regime_threshold
+        self._hurst_regime_penalty = hurst_regime_penalty
+        self._multifractal_max_width = multifractal_max_width
+        self._features_cache = features_cache
 
         self._predictor = predictor if predictor is not None else self._load_predictor()
 
@@ -144,7 +158,21 @@ class Backtester:
             if open_positions:
                 continue
 
-            direction, confidence = self._get_direction(hist)
+            direction, confidence, features_df = self._get_direction(hist)
+
+            # Apply fractal regime gate to confidence for credit strategies.
+            # Features are already computed inside _get_direction — reuse them.
+            if not features_df.empty:
+                last_f = features_df.iloc[-1]
+                spread = float(last_f.get("hurst_scale_spread", 0.0))
+                mf_w   = float(last_f.get("multifractal_width",  0.0))
+                if spread > self._hurst_regime_threshold and self._hurst_regime_threshold > 0:
+                    penalty = self._hurst_regime_penalty * (
+                        spread / self._hurst_regime_threshold
+                    )
+                    confidence = max(0.0, confidence - penalty)
+                if mf_w > 0 and mf_w > self._multifractal_max_width:
+                    confidence = max(0.0, confidence - self._hurst_regime_penalty)
 
             effective_min_conf = self._min_confidence
 
@@ -155,7 +183,7 @@ class Backtester:
             if direction == SignalDirection.BEARISH and confidence < effective_min_conf + 0.05:
                 continue
 
-            strategy = self._select_strategy(direction, hist, confidence)
+            strategy = self._select_strategy(direction, hist, confidence, features_df)
             if strategy is None:
                 continue
 
@@ -299,21 +327,33 @@ class Backtester:
             pass
         return None
 
-    def _get_direction(self, hist: pd.DataFrame) -> tuple[SignalDirection, float]:
-        """Get market direction prediction.
+    def _get_direction(
+        self, hist: pd.DataFrame
+    ) -> tuple[SignalDirection, float, pd.DataFrame]:
+        """Get market direction prediction and pre-computed feature matrix.
 
-        Small accounts (<$2k): mechanical put-selling (bullish bias + IV filter).
-        Larger accounts: ML ensemble for iron condor timing.
+        Returns (direction, confidence, features_df). The features_df is shared
+        with the fractal gate and _select_strategy to avoid double computation.
         """
-        # ML ensemble for iron condor timing
+        from ait.ml.features import FeatureEngine
+        if self._features_cache is not None and not self._features_cache.empty:
+            today = pd.Timestamp(hist.index[-1]).normalize()
+            mask = self._features_cache.index <= today
+            features_df = self._features_cache[mask]
+            if features_df.empty:
+                features_df = FeatureEngine().compute(hist)
+        else:
+            features_df = FeatureEngine().compute(hist)
+
         if self._predictor is not None:
             try:
                 pred = self._predictor.predict(hist)
                 if pred is not None:
-                    return pred.direction, pred.confidence
+                    return pred.direction, pred.confidence, features_df
             except Exception:
                 pass
-        return self._simple_direction(hist)
+        direction, confidence = self._simple_direction(hist)
+        return direction, confidence, features_df
 
     @staticmethod
     def _quick_rsi(close: np.ndarray, period: int = 14) -> float:
@@ -349,7 +389,13 @@ class Backtester:
     # Strategy selection — now IV-aware
     # ------------------------------------------------------------------
 
-    def _select_strategy(self, direction: SignalDirection, hist: pd.DataFrame, confidence: float = 0.65) -> str | None:
+    def _select_strategy(
+        self,
+        direction: SignalDirection,
+        hist: pd.DataFrame,
+        confidence: float = 0.65,
+        features_df: pd.DataFrame | None = None,
+    ) -> str | None:
         """Pick a strategy based on direction, IV regime, and available strategies.
 
         High IV → prefer credit strategies (sell expensive premium)
@@ -480,6 +526,44 @@ class Backtester:
                 strategy, "debit", price, S, iv, dte, today_date, capital,
                 long_strike=long_strike, short_strike=short_strike, opt_type="put",
             )
+        elif strategy == "long_strangle":
+            # Buy OTM call + buy OTM put — profit from large moves in either direction.
+            # Delta is IV-scaled: high IV → go further OTM for cheaper entry on vol expansion.
+            iv_scale = max(0.5, min(1.5, self._iv_floor / iv))
+            effective_delta = self._delta_long * (1.0 + self._delta_iv_scale * (iv_scale - 1.0))
+            effective_delta = max(0.05, min(0.45, effective_delta))
+            call_strike = find_strike_by_delta(S, t, iv, effective_delta, OptionType.CALL, r)
+            put_strike  = find_strike_by_delta(S, t, iv, -effective_delta, OptionType.PUT, r)
+
+            call_price = black_scholes_price(S, call_strike, t, r,
+                self._get_leg_iv(iv, call_strike, S, OptionType.CALL), OptionType.CALL)
+            put_price  = black_scholes_price(S, put_strike, t, r,
+                self._get_leg_iv(iv, put_strike, S, OptionType.PUT), OptionType.PUT)
+
+            total_cost = (call_price + put_price) * (1 + self._slippage_pct)
+            cost_per_contract = total_cost * 100
+            if cost_per_contract <= 0 or capital < cost_per_contract:
+                return None
+
+            contracts = int(capital * self._position_size_pct / cost_per_contract)
+            if contracts < 1:
+                if cost_per_contract <= capital * 0.25:
+                    contracts = 1
+                else:
+                    return None
+
+            return {
+                "symbol": "SIM", "strategy": "long_strangle",
+                "direction": SignalDirection.NEUTRAL.value, "trade_type": "debit",
+                "entry_date": str(today_date), "entry_price": round(total_cost, 4),
+                "contracts": contracts, "n_legs": 2,
+                "long_call_strike": round(call_strike, 0),
+                "long_put_strike": round(put_strike, 0),
+                "strike": round(S, 0), "option_type": "strangle",
+                "entry_iv": round(iv, 4), "underlying_at_entry": round(S, 2),
+                "expiry_date": str(today_date + timedelta(days=dte)),
+                "high_water_mark": 0.0,
+            }
         else:
             return None
 
@@ -523,10 +607,10 @@ class Backtester:
             short_call_strike = find_strike_by_delta(S, t, iv, self._delta_short, OptionType.CALL, r)
             short_put_strike = find_strike_by_delta(S, t, iv, -self._delta_short, OptionType.PUT, r)
 
-            # Wings: use 1-sigma expected move (68% probability price stays inside)
-            # Full expected_move width means ~68% chance of expiring at max profit
+            # Wings: vol-scaled by wing_k; wing_floor_dollars is the hard safety minimum.
+            # wing_k=1.0 → 1-sigma expected move; wing_k=2.0 → 2-sigma (wider, safer).
             expected_move = S * iv * (dte / 365.0) ** 0.5
-            wing_width = max(expected_move, S * 0.05, 5.0)
+            wing_width = max(self._wing_k * expected_move, self._wing_floor_dollars)
             long_call_strike = short_call_strike + wing_width
             long_put_strike = short_put_strike - wing_width
 
@@ -587,7 +671,8 @@ class Backtester:
             # Sell higher strike put, buy lower strike put = bullish credit spread
             short_put_strike = find_strike_by_delta(S, t, iv, -self._delta_short, OptionType.PUT, r)
 
-            wing = max(1.0, min(S * 0.01, 5.0))  # ~1% of stock price, max $5
+            expected_move = S * iv * (dte / 365.0) ** 0.5
+            wing = max(self._wing_k * expected_move * 0.5, self._wing_floor_dollars)
 
             long_put_strike = short_put_strike - wing
 
@@ -633,6 +718,45 @@ class Backtester:
                 "entry_iv": round(iv, 4),
                 "underlying_at_entry": round(S, 2),
                 "max_loss_per_share": round(max_loss_per_share, 4),
+                "expiry_date": str(today_date + timedelta(days=dte)),
+                "high_water_mark": 0.0,
+            }
+
+        elif strategy == "short_strangle":
+            # Sell OTM call + sell OTM put — no wings (naked short premium).
+            # Delta is IV-scaled: high IV → go further OTM for more breathing room.
+            iv_scale = max(0.5, min(1.5, self._iv_floor / iv))
+            effective_delta = self._delta_short * (1.0 + self._delta_iv_scale * (iv_scale - 1.0))
+            effective_delta = max(0.05, min(0.45, effective_delta))
+            short_call = find_strike_by_delta(S, t, iv, effective_delta, OptionType.CALL, r)
+            short_put  = find_strike_by_delta(S, t, iv, -effective_delta, OptionType.PUT, r)
+
+            call_price = black_scholes_price(S, short_call, t, r,
+                self._get_leg_iv(iv, short_call, S, OptionType.CALL), OptionType.CALL)
+            put_price  = black_scholes_price(S, short_put, t, r,
+                self._get_leg_iv(iv, short_put, S, OptionType.PUT), OptionType.PUT)
+
+            net_credit = call_price + put_price
+            if net_credit <= 0:
+                return None
+
+            # Margin approx: 20% of underlying per strangle (standard naked-option requirement)
+            margin_per_contract = S * 0.20 * 100
+            contracts = int(capital * self._position_size_pct / margin_per_contract)
+            if contracts < 1:
+                return None
+
+            net_credit *= (1 - self._slippage_pct)
+
+            return {
+                "symbol": "SIM", "strategy": "short_strangle",
+                "direction": SignalDirection.NEUTRAL.value, "trade_type": "credit",
+                "entry_date": str(today_date), "entry_price": round(net_credit, 4),
+                "contracts": contracts, "n_legs": 2,
+                "short_call_strike": round(short_call, 0),
+                "short_put_strike": round(short_put, 0),
+                "strike": round(S, 0), "option_type": "strangle",
+                "entry_iv": round(iv, 4), "underlying_at_entry": round(S, 2),
                 "expiry_date": str(today_date + timedelta(days=dte)),
                 "high_water_mark": 0.0,
             }
@@ -744,6 +868,20 @@ class Backtester:
                 short_val = black_scholes_price(underlying, short_strike, t, r,
                     self._get_leg_iv(iv, short_strike, underlying, OptionType.PUT), OptionType.PUT)
             return long_val - short_val
+
+        elif strategy == "short_strangle":
+            sc = black_scholes_price(underlying, pos["short_call_strike"], t, r,
+                self._get_leg_iv(iv, pos["short_call_strike"], underlying, OptionType.CALL), OptionType.CALL)
+            sp = black_scholes_price(underlying, pos["short_put_strike"], t, r,
+                self._get_leg_iv(iv, pos["short_put_strike"], underlying, OptionType.PUT), OptionType.PUT)
+            return sc + sp  # Cost to buy back (want DOWN for profit)
+
+        elif strategy == "long_strangle":
+            lc = black_scholes_price(underlying, pos["long_call_strike"], t, r,
+                self._get_leg_iv(iv, pos["long_call_strike"], underlying, OptionType.CALL), OptionType.CALL)
+            lp = black_scholes_price(underlying, pos["long_put_strike"], t, r,
+                self._get_leg_iv(iv, pos["long_put_strike"], underlying, OptionType.PUT), OptionType.PUT)
+            return lc + lp  # Current value (want UP for profit)
 
         else:
             # Single-leg option

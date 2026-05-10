@@ -86,6 +86,7 @@ class DirectionPredictor:
         symbol: str = "",
         market_context: dict | None = None,
         live_signals: dict | None = None,
+        intraday_store: "HistoricalDataStore | None" = None,
     ) -> Prediction | None:
         """Predict direction for the latest data point.
 
@@ -93,6 +94,7 @@ class DirectionPredictor:
             df: OHLCV DataFrame with at least 60 rows of history.
             symbol: Symbol name — uses per-symbol model if available.
             market_context: Optional dict with cross-asset data (VIX, SPY).
+            intraday_store: Optional store for VLMC intraday feature enrichment.
 
         Returns:
             Prediction with direction and confidence, or None if model not trained.
@@ -112,7 +114,8 @@ class DirectionPredictor:
             return None
 
         features = self._feature_engine.compute(
-            df, market_context=market_context, live_signals=live_signals
+            df, market_context=market_context, live_signals=live_signals,
+            intraday_store=intraday_store, symbol=symbol,
         )
         if features.empty:
             log.warning("prediction_skipped", reason="features_empty",
@@ -179,6 +182,7 @@ class DirectionPredictor:
         df: pd.DataFrame,
         symbol: str = "",
         market_context: dict | None = None,
+        intraday_store: "HistoricalDataStore | None" = None,
     ) -> dict[str, float]:
         """Train the ensemble on historical data.
 
@@ -186,11 +190,15 @@ class DirectionPredictor:
             df: OHLCV DataFrame with sufficient history.
             symbol: If provided, stores model per-symbol (prevents cross-contamination).
             market_context: Optional dict with cross-asset data (VIX, SPY).
+            intraday_store: Optional store for VLMC intraday feature enrichment.
 
         Returns:
             Dict of model accuracies.
         """
-        features = self._feature_engine.compute(df, market_context=market_context)
+        features = self._feature_engine.compute(
+            df, market_context=market_context,
+            intraday_store=intraday_store, symbol=symbol,
+        )
         if len(features) < self._config.min_training_samples:
             log.warning(
                 "insufficient_training_data",

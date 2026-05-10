@@ -48,6 +48,25 @@ options:
     - short_strangle
     - calendar_spread     # Low-IV complement to iron condor (active when IV rank < 50)
 
+backtest:
+  initial_capital: 100000              # Starting capital for walk-forward / integration tests
+  position_size_pct: 0.05             # 5% of capital risked per trade (max-loss basis)
+                                       # Raise to 0.20 for accounts < $10k (increases concentration risk)
+  wing_floor_dollars: 5.0             # Hard minimum spread width in dollars (safety floor only)
+                                       # Wing sizing is now primarily driven by wing_k × expected_move
+                                       # Lower to 0.5 for sub-$10 stocks (e.g. SOFI)
+  wing_k: 1.0                         # Vol-scaled wing multiplier: wing = wing_k × price × IV × √(DTE/365)
+                                       # Optuna optimizes per walk-forward window [0.3 – 2.0]
+                                       # 0.5 = half-sigma (tight), 1.0 = 1-sigma, 2.0 = 2-sigma (wide)
+  iv_floor: 0.20                      # Min synthetic IV for option pricing
+                                       # 0.20 = SPY/QQQ in normal markets
+                                       # 0.30+ for high-vol stocks (NVDA, AMD)
+  delta_iv_scale: 0.0                 # IV-driven delta scaling for strangles only: 0=static, 1=full IV response
+                                       # High IV → lower effective delta → further OTM strikes
+  optimize_n_trials: 50               # Optuna trials per walk-forward window
+  optimize_patience: 20               # Early stopping: halt after N consecutive non-improving trials (0=disabled)
+  optimize_min_trades: 10             # Min trades for full score; < 3 → always −100; 3–9 → quadratic penalty
+
 ml:
   ensemble_weights:
     xgboost: 0.5

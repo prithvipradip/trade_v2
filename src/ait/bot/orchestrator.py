@@ -584,15 +584,14 @@ class TradingOrchestrator:
         """
         adaptor = self._learning.adaptor
 
-        # Parallel fetch: historical data, sentiment, IV rank, intraday
+        # Parallel fetch: historical data, sentiment, IV rank
         # 2 years of history for robust features (iv_rank, vol percentiles, trend)
         hist_task = self._market_data.get_historical(symbol, days=504)
         sentiment_task = self._sentiment.get_sentiment(symbol)
         iv_rank_task = self._estimate_iv_rank(symbol)
-        intraday_task = self._market_data.get_intraday(symbol, interval="5m", days=1)
 
-        hist, sentiment, iv_rank, intraday = await asyncio.gather(
-            hist_task, sentiment_task, iv_rank_task, intraday_task,
+        hist, sentiment, iv_rank = await asyncio.gather(
+            hist_task, sentiment_task, iv_rank_task,
             return_exceptions=True,
         )
 
@@ -608,8 +607,26 @@ class TradingOrchestrator:
             sentiment = None
         if isinstance(iv_rank, Exception):
             iv_rank = 50.0
-        if isinstance(intraday, Exception):
+
+        # Incremental intraday fetch: only request bars not yet stored in SQLite.
+        # On first run (no stored data) fetches a full 7-day seed window.
+        # Extends retention to 2 years so MFDFA and walk-forward VLMC analysis
+        # have the maximum available history.
+        try:
+            last_ts = self._historical.get_latest_intraday_timestamp(symbol)
+            if last_ts is None:
+                intraday = await self._market_data.get_intraday(symbol, interval="5m", days=7)
+            else:
+                intraday = await self._market_data.get_intraday_since(symbol, since=last_ts)
+        except Exception as e:
+            log.debug("intraday_fetch_error", symbol=symbol, error=str(e))
             intraday = None
+
+        # Persist new bars; reload full 2-year window for fractal feature computation.
+        if intraday is not None and not intraday.empty:
+            self._historical.save_intraday(symbol, intraday)
+            self._historical.cleanup_old_intraday(keep_days=730)
+        intraday_full = self._historical.load_intraday(symbol, days=730)
 
         # Data quality check on historical data
         if "Close" in hist.columns:
@@ -624,6 +641,13 @@ class TradingOrchestrator:
             live_signals["sentiment_news"] = float(getattr(sentiment, "news_score", 0) or 0)
             live_signals["sentiment_finbert"] = float(getattr(sentiment, "finbert_score", 0) or 0)
             live_signals["fear_greed"] = float(getattr(sentiment, "fear_greed_score", 0) or 0)
+
+        # Intraday fractal + VLMC features (Phase 6): computed from the full 7-day
+        # SQLite history. Merged into live_signals before predict() so the ML model
+        # receives today's intraday structure alongside the daily bar features.
+        from ait.ml.features import FeatureEngine as _FE
+        intraday_fractal = _FE().compute_intraday_features(intraday_full)
+        live_signals.update(intraday_fractal)
 
         # ML prediction (with cross-asset context + live signals)
         prediction = self._predictor.predict(

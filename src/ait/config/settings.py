@@ -71,6 +71,34 @@ class OptionsConfig(BaseModel):
         return v
 
 
+class BacktestConfig(BaseModel):
+    initial_capital: float = Field(default=100_000.0, ge=1_000.0, le=10_000_000.0)
+    position_size_pct: float = Field(default=0.05, ge=0.01, le=0.50,
+        description="Fraction of capital risked per trade (max-loss basis).")
+    wing_floor_dollars: float = Field(default=5.0, ge=0.50, le=50.0,
+        description="Hard minimum spread width in dollars (safety floor only). "
+                    "Wing sizing is now primarily driven by wing_k × expected_move.")
+    wing_k: float = Field(default=1.0, ge=0.1, le=3.0,
+        description="Vol-scaled wing multiplier: wing_width = wing_k × price × IV × sqrt(DTE/365). "
+                    "Optuna optimizes this per walk-forward window. "
+                    "1.0 = 1-sigma expected move. wing_floor_dollars is the hard minimum.")
+    iv_floor: float = Field(default=0.20, ge=0.05, le=1.0,
+        description="Minimum synthetic IV used for option pricing. "
+                    "Prevents near-zero credits in calm markets.")
+    delta_iv_scale: float = Field(default=0.0, ge=0.0, le=1.0,
+        description="IV-driven delta scaling for strangles. "
+                    "0=static delta, 1=full IV response. "
+                    "High IV → lower effective delta → further OTM strikes.")
+    optimize_n_trials: int = Field(default=50, ge=5, le=500,
+        description="Optuna trials per walk-forward window.")
+    optimize_patience: int = Field(default=20, ge=0, le=500,
+        description="Early stopping: halt after this many consecutive non-improving trials. "
+                    "0 = disabled.")
+    optimize_min_trades: int = Field(default=10, ge=1, le=100,
+        description="Min trade count for full objective score. "
+                    "Trials below this are penalised quadratically; < 3 trades always scores −100.")
+
+
 class MLConfig(BaseModel):
     ensemble_weights: dict[str, float] = {"xgboost": 0.5, "lightgbm": 0.5}
     retrain_interval_days: int = Field(default=7, ge=1, le=30)
@@ -182,6 +210,7 @@ class Settings(BaseModel):
     positions: PositionConfig = PositionConfig()
     risk: RiskConfig = RiskConfig()
     options: OptionsConfig = OptionsConfig()
+    backtest: BacktestConfig = BacktestConfig()
     ml: MLConfig = MLConfig()
     meta_label: MetaLabelConfig = MetaLabelConfig()
     exit: ExitConfig = ExitConfig()

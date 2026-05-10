@@ -9,18 +9,26 @@ These are consumed by StrategyOptimizer._suggest_params().
 
 from __future__ import annotations
 
+FRACTAL_GATE_SPACE: dict[str, tuple] = {
+    "hurst_regime_threshold": ("float", 0.08, 0.30),
+    "hurst_regime_penalty":   ("float", 0.0,  0.25),
+    "multifractal_max_width": ("float", 0.30, 0.65),
+}
+
 IRON_CONDOR_SPACE: dict[str, tuple] = {
-    "min_confidence":    ("float", 0.55, 0.80),
+    "min_confidence":    ("float", 0.55, 0.70),
     "stop_loss_pct":     ("float", 0.30, 0.70),
     "profit_target_pct": ("float", 0.30, 0.70),
     "trailing_stop_pct": ("float", 0.15, 0.40),
     "delta_short":       ("float", 0.15, 0.30),
     "max_hold_days":     ("int",   14,   45),
-    "iv_floor":          ("float", 0.08, 0.25),
+    "iv_floor":          ("float", 0.15, 0.40),
+    "wing_k":            ("float", 0.30, 2.00),
+    **FRACTAL_GATE_SPACE,
 }
 
 LONG_CALL_SPACE: dict[str, tuple] = {
-    "min_confidence":    ("float", 0.60, 0.85),
+    "min_confidence":    ("float", 0.60, 0.70),
     "stop_loss_pct":     ("float", 0.30, 0.60),
     "profit_target_pct": ("float", 0.60, 1.50),
     "delta_long":        ("float", 0.25, 0.55),
@@ -29,7 +37,7 @@ LONG_CALL_SPACE: dict[str, tuple] = {
 }
 
 LONG_PUT_SPACE: dict[str, tuple] = {
-    "min_confidence":    ("float", 0.60, 0.85),
+    "min_confidence":    ("float", 0.60, 0.70),
     "stop_loss_pct":     ("float", 0.30, 0.60),
     "profit_target_pct": ("float", 0.60, 1.50),
     "delta_long":        ("float", 0.25, 0.55),
@@ -38,7 +46,7 @@ LONG_PUT_SPACE: dict[str, tuple] = {
 }
 
 BULL_CALL_SPREAD_SPACE: dict[str, tuple] = {
-    "min_confidence":    ("float", 0.60, 0.85),
+    "min_confidence":    ("float", 0.60, 0.70),
     "stop_loss_pct":     ("float", 0.30, 0.65),
     "profit_target_pct": ("float", 0.50, 0.90),
     "delta_long":        ("float", 0.30, 0.55),
@@ -46,20 +54,43 @@ BULL_CALL_SPREAD_SPACE: dict[str, tuple] = {
 }
 
 BEAR_PUT_SPREAD_SPACE: dict[str, tuple] = {
-    "min_confidence":    ("float", 0.60, 0.85),
+    "min_confidence":    ("float", 0.60, 0.70),
     "stop_loss_pct":     ("float", 0.30, 0.65),
     "profit_target_pct": ("float", 0.50, 0.90),
     "delta_long":        ("float", 0.30, 0.55),
     "max_hold_days":     ("int",   14,   60),
 }
 
+SHORT_STRANGLE_SPACE: dict[str, tuple] = {
+    "min_confidence":    ("float", 0.55, 0.70),
+    "stop_loss_pct":     ("float", 0.30, 0.70),
+    "profit_target_pct": ("float", 0.30, 0.70),
+    "trailing_stop_pct": ("float", 0.15, 0.40),
+    "delta_short":       ("float", 0.10, 0.25),
+    "max_hold_days":     ("int",   14,   45),
+    "iv_floor":          ("float", 0.15, 0.40),
+    "delta_iv_scale":    ("float", 0.0,  1.0),
+    **FRACTAL_GATE_SPACE,
+}
+
+LONG_STRANGLE_SPACE: dict[str, tuple] = {
+    "min_confidence":    ("float", 0.60, 0.70),
+    "stop_loss_pct":     ("float", 0.30, 0.60),
+    "profit_target_pct": ("float", 0.50, 2.00),
+    "delta_long":        ("float", 0.10, 0.35),
+    "max_hold_days":     ("int",   14,   45),
+    "iv_floor":          ("float", 0.15, 0.40),
+    "delta_iv_scale":    ("float", 0.0,  1.0),
+}
+
 PUT_CREDIT_SPREAD_SPACE: dict[str, tuple] = {
-    "min_confidence":    ("float", 0.55, 0.80),
+    "min_confidence":    ("float", 0.55, 0.70),
     "stop_loss_pct":     ("float", 0.30, 0.70),
     "profit_target_pct": ("float", 0.30, 0.70),
     "delta_short":       ("float", 0.15, 0.30),
     "max_hold_days":     ("int",   14,   45),
     "iv_floor":          ("float", 0.08, 0.25),
+    "wing_k":            ("float", 0.30, 2.00),
 }
 
 XGBOOST_SPACE: dict[str, tuple] = {
@@ -84,6 +115,8 @@ LIGHTGBM_SPACE: dict[str, tuple] = {
 # Keyed by strategy name as used in WalkForwardBacktester / Backtester
 STRATEGY_SPACES: dict[str, dict[str, tuple]] = {
     "iron_condor":       IRON_CONDOR_SPACE,
+    "short_strangle":    SHORT_STRANGLE_SPACE,
+    "long_strangle":     LONG_STRANGLE_SPACE,
     "long_call":         LONG_CALL_SPACE,
     "long_put":          LONG_PUT_SPACE,
     "bull_call_spread":  BULL_CALL_SPREAD_SPACE,

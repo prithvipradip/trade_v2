@@ -13,7 +13,7 @@ import pytest
 
 from ait.optimization.objectives import OBJECTIVES
 from ait.optimization.optimizer import StrategyOptimizer
-from ait.optimization.param_spaces import IRON_CONDOR_SPACE, STRATEGY_SPACES, ML_SPACES
+from ait.optimization.param_spaces import IRON_CONDOR_SPACE, STRATEGY_SPACES, ML_SPACES, SHORT_STRANGLE_SPACE
 from ait.optimization.results import OptimizationResult
 from ait.backtesting.result import BacktestResult
 from ait.backtesting.walkforward import WalkForwardConfig
@@ -42,7 +42,7 @@ def _make_ohlcv(n: int = 300) -> pd.DataFrame:
     """Minimal OHLCV DataFrame for testing."""
     rng = np.random.default_rng(42)
     closes = 400 + np.cumsum(rng.normal(0, 1.5, n))
-    dates = pd.date_range(end=date.today(), periods=n, freq="B")
+    dates = pd.date_range(start="2023-01-01", periods=n, freq="B")
     return pd.DataFrame({
         "Open":   closes * 0.999,
         "High":   closes * 1.005,
@@ -83,6 +83,27 @@ class TestParamSpaces:
                 if spec[0] in ("int", "float"):
                     low, high = spec[1], spec[2]
                     assert low < high, f"{name}: low={low} must be < high={high}"
+
+    def test_iron_condor_space_has_wing_k(self):
+        assert "wing_k" in IRON_CONDOR_SPACE
+        low, high = IRON_CONDOR_SPACE["wing_k"][1], IRON_CONDOR_SPACE["wing_k"][2]
+        assert low < 1.0 < high, "wing_k search range must bracket the default value 1.0"
+
+    def test_short_strangle_space_has_delta_iv_scale(self):
+        assert "delta_iv_scale" in SHORT_STRANGLE_SPACE
+        low, high = SHORT_STRANGLE_SPACE["delta_iv_scale"][1], SHORT_STRANGLE_SPACE["delta_iv_scale"][2]
+        assert low == pytest.approx(0.0)
+        assert high == pytest.approx(1.0)
+
+    def test_long_strangle_in_strategy_spaces(self):
+        assert "long_strangle" in STRATEGY_SPACES
+        assert "min_confidence" in STRATEGY_SPACES["long_strangle"]
+        assert "delta_long" in STRATEGY_SPACES["long_strangle"]
+        assert "delta_iv_scale" in STRATEGY_SPACES["long_strangle"]
+
+    def test_all_new_strategies_in_strategy_spaces(self):
+        for name in ("short_strangle", "long_strangle", "put_credit_spread"):
+            assert name in STRATEGY_SPACES, f"{name} missing from STRATEGY_SPACES"
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +255,18 @@ class TestWalkForwardConfigOptimizer:
             cfg = WalkForwardConfig(optimize_n_trials=n)
             assert cfg.optimize_n_trials == n
 
+    def test_default_wing_k_is_1(self):
+        cfg = WalkForwardConfig()
+        assert cfg.wing_k == pytest.approx(1.0)
+
+    def test_wing_k_propagated_to_config(self):
+        cfg = WalkForwardConfig(wing_k=0.5)
+        assert cfg.wing_k == pytest.approx(0.5)
+
+    def test_default_delta_iv_scale_is_0(self):
+        cfg = WalkForwardConfig()
+        assert cfg.delta_iv_scale == pytest.approx(0.0)
+
 
 # ---------------------------------------------------------------------------
 # StrategyOptimizer (fast integration test with injected data)
@@ -286,31 +319,13 @@ class TestStrategyOptimizer:
         assert opt._study_name == "my_custom_study"
 
     def test_fetch_data_respects_train_days(self, monkeypatch: pytest.MonkeyPatch):
-        calls: dict[str, str] = {}
+        """_fetch_data() trims to train_days rows from load_daily_ohlcv output."""
+        big_df = _make_ohlcv(300)
 
-        class _FakeTicker:
-            def __init__(self, symbol: str) -> None:
-                self.symbol = symbol
-
-            def history(self, period: str, interval: str) -> pd.DataFrame:
-                calls["period"] = period
-                calls["interval"] = interval
-                dates = pd.date_range(end=date.today(), periods=300, freq="B")
-                return pd.DataFrame(
-                    {
-                        "Open": np.linspace(100, 110, len(dates)),
-                        "High": np.linspace(101, 111, len(dates)),
-                        "Low": np.linspace(99, 109, len(dates)),
-                        "Close": np.linspace(100, 110, len(dates)),
-                        "Volume": np.full(len(dates), 1_000_000),
-                    },
-                    index=dates,
-                )
-
-        class _FakeYF:
-            Ticker = _FakeTicker
-
-        monkeypatch.setitem(sys.modules, "yfinance", _FakeYF)
+        monkeypatch.setattr(
+            "ait.data.market_data.load_daily_ohlcv",
+            lambda symbol, days, db_path=None: big_df,
+        )
 
         opt = StrategyOptimizer(
             symbols=["SPY"],
@@ -321,9 +336,6 @@ class TestStrategyOptimizer:
 
         assert "SPY" in data
         assert len(data["SPY"]) == 120
-        assert calls["period"].endswith("d")
-        assert int(calls["period"][:-1]) >= 120
-        assert calls["interval"] == "1d"
 
     def test_resumable_study_with_storage(self, tmp_path: Path):
         """A study with file-based storage can be resumed (trial count accumulates)."""
@@ -343,3 +355,26 @@ class TestStrategyOptimizer:
 
         # After two runs of 2 trials, total should be 4
         assert len(result.study.trials) == 4
+
+
+# ---------------------------------------------------------------------------
+# wing_k optimization
+# ---------------------------------------------------------------------------
+
+class TestWingKOptimization:
+    def test_wing_k_appears_in_best_params(self):
+        """Optuna must suggest wing_k as part of iron_condor optimization."""
+        opt = StrategyOptimizer(
+            symbols=["SPY"], strategies=["iron_condor"], n_trials=3,
+        )
+        result = opt.run(data={"SPY": _make_ohlcv(300)})
+        param_names = [k.split("__")[-1] for k in result.best_params]
+        assert "wing_k" in param_names, (
+            f"wing_k not found in best_params keys: {list(result.best_params.keys())}"
+        )
+
+    def test_wing_k_in_put_credit_spread_space(self):
+        from ait.optimization.param_spaces import PUT_CREDIT_SPREAD_SPACE
+        assert "wing_k" in PUT_CREDIT_SPREAD_SPACE
+        low, high = PUT_CREDIT_SPREAD_SPACE["wing_k"][1], PUT_CREDIT_SPREAD_SPACE["wing_k"][2]
+        assert low < 1.0 < high

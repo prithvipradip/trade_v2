@@ -50,6 +50,14 @@ class TestWalkForwardConfig:
         cfg = WalkForwardConfig(train_days=120, test_days=30, step_days=10)
         assert cfg.train_days == 120
 
+    def test_wing_k_default_is_1(self) -> None:
+        cfg = WalkForwardConfig()
+        assert cfg.wing_k == pytest.approx(1.0)
+
+    def test_delta_iv_scale_default_is_0(self) -> None:
+        cfg = WalkForwardConfig()
+        assert cfg.delta_iv_scale == pytest.approx(0.0)
+
 
 class TestWalkForwardResult:
 
@@ -227,3 +235,310 @@ class TestWalkForwardBacktester:
         ]
         result = WalkForwardResult(windows=windows, initial_capital=10000)
         assert result.consistency == 0.5  # Half profitable
+
+
+# ---------------------------------------------------------------------------
+# Fix regression tests — capital sizing and features cache
+# ---------------------------------------------------------------------------
+
+def _make_spy_ohlcv(n: int = 60, start: float = 400.0) -> pd.DataFrame:
+    idx = pd.date_range("2023-01-03", periods=n, freq="B")
+    prices = pd.Series(start + pd.Series(range(n)) * 0.2, index=idx)
+    return pd.DataFrame({
+        "Open":   prices * 0.999,
+        "High":   prices * 1.005,
+        "Low":    prices * 0.995,
+        "Close":  prices,
+        "Volume": 1_000_000,
+    }, index=idx)
+
+
+def test_walkforward_config_default_capital_is_100k() -> None:
+    cfg = WalkForwardConfig()
+    assert cfg.initial_capital == 100_000.0
+
+
+class TestFeaturesCache:
+    """Backtester features_cache parameter wires up correctly."""
+
+    def test_features_cache_skips_recompute(self, monkeypatch) -> None:
+        from ait.backtesting.engine import Backtester
+        from ait.ml.features import FeatureEngine
+
+        df = _make_spy_ohlcv(60)
+        # Build a minimal synthetic cache with the same index as df so every bar hits
+        fake_cache = pd.DataFrame(
+            {"hurst_wavelet": 0.5, "psd_beta": -1.5},
+            index=df.index,
+        )
+        assert not fake_cache.empty
+
+        calls: list[int] = []
+        original = FeatureEngine.compute
+        monkeypatch.setattr(
+            FeatureEngine, "compute",
+            lambda self, d: calls.append(1) or original(self, d),
+        )
+
+        bt = Backtester(
+            data=df, strategies=["iron_condor"],
+            initial_capital=100_000, iv_floor=0.20, features_cache=fake_cache,
+        )
+        bt.run()
+        assert len(calls) == 0, "FeatureEngine.compute must not be called when features_cache is provided"
+
+    def test_features_cache_fallback_when_none(self, monkeypatch) -> None:
+        from ait.backtesting.engine import Backtester
+        from ait.ml.features import FeatureEngine
+
+        df = _make_spy_ohlcv(60)
+
+        calls: list[int] = []
+        original = FeatureEngine.compute
+        monkeypatch.setattr(
+            FeatureEngine, "compute",
+            lambda self, d: calls.append(1) or original(self, d),
+        )
+
+        bt = Backtester(
+            data=df, strategies=["iron_condor"],
+            initial_capital=100_000, iv_floor=0.20, features_cache=None,
+        )
+        bt.run()
+        assert len(calls) > 0, "FeatureEngine.compute must be called when no cache is provided"
+
+
+# ---------------------------------------------------------------------------
+# wing_k dynamic sizing tests
+# ---------------------------------------------------------------------------
+
+class TestWingKDynamicSizing:
+    """Verify wing_k drives wing width from vol, not the static floor."""
+
+    def _make_df(self, price: float = 500.0, n: int = 60) -> pd.DataFrame:
+        idx = pd.date_range("2023-01-03", periods=n, freq="B")
+        p = pd.Series([price] * n, index=idx)
+        return pd.DataFrame({
+            "Open": p, "High": p * 1.01, "Low": p * 0.99, "Close": p, "Volume": 1_000_000,
+        })
+
+    def test_wing_k_1_produces_vol_scaled_width(self):
+        """wing_k=1.0 → wing_width ≈ expected_move, well above wing_floor_dollars."""
+        import datetime
+        from ait.backtesting.engine import Backtester
+
+        bt = Backtester(
+            data=self._make_df(500.0), strategies=["iron_condor"],
+            initial_capital=100_000, iv_floor=0.25, wing_floor_dollars=5.0, wing_k=1.0,
+        )
+        pos = bt._build_credit_position(
+            "iron_condor", S=500.0, iv=0.25, t=30 / 365, r=0.05, dte=30,
+            today_date=datetime.date(2023, 3, 1), capital=100_000,
+        )
+        assert pos is not None
+        wing_used = pos["long_call_strike"] - pos["short_call_strike"]
+        # expected_move ≈ 500 × 0.25 × √(30/365) ≈ 16.4 → well above $5 floor
+        assert wing_used > 5.0, f"wing_width={wing_used} should exceed floor of $5"
+        assert wing_used > 10.0, f"expected_move ~16, got {wing_used}"
+
+    def test_wing_floor_is_hard_minimum(self):
+        """wing_k=0.001 (near zero) → wing_width falls back to wing_floor_dollars."""
+        import datetime
+        from ait.backtesting.engine import Backtester
+
+        bt = Backtester(
+            data=self._make_df(500.0), strategies=["iron_condor"],
+            initial_capital=100_000, iv_floor=0.20, wing_floor_dollars=5.0, wing_k=0.001,
+        )
+        pos = bt._build_credit_position(
+            "iron_condor", S=500.0, iv=0.20, t=30 / 365, r=0.05, dte=30,
+            today_date=datetime.date(2023, 3, 1), capital=100_000,
+        )
+        if pos is not None:
+            wing_used = pos["long_call_strike"] - pos["short_call_strike"]
+            assert wing_used >= 5.0, "Wing must never go below wing_floor_dollars"
+
+    def test_higher_wing_k_produces_wider_wings(self):
+        """wing_k=2.0 should produce wider wings than wing_k=0.5."""
+        import datetime
+        from ait.backtesting.engine import Backtester
+
+        today = datetime.date(2023, 3, 1)
+        kwargs = dict(S=500.0, iv=0.25, t=30 / 365, r=0.05, dte=30,
+                      today_date=today, capital=100_000)
+
+        bt_narrow = Backtester(data=self._make_df(500.0), strategies=["iron_condor"],
+                               initial_capital=100_000, iv_floor=0.20,
+                               wing_floor_dollars=1.0, wing_k=0.5)
+        bt_wide = Backtester(data=self._make_df(500.0), strategies=["iron_condor"],
+                             initial_capital=100_000, iv_floor=0.20,
+                             wing_floor_dollars=1.0, wing_k=2.0)
+
+        pos_narrow = bt_narrow._build_credit_position("iron_condor", **kwargs)
+        pos_wide = bt_wide._build_credit_position("iron_condor", **kwargs)
+
+        if pos_narrow and pos_wide:
+            wing_narrow = pos_narrow["long_call_strike"] - pos_narrow["short_call_strike"]
+            wing_wide = pos_wide["long_call_strike"] - pos_wide["short_call_strike"]
+            assert wing_wide > wing_narrow, (
+                f"wide wing_k=2.0 ({wing_wide}) should exceed narrow wing_k=0.5 ({wing_narrow})"
+            )
+
+
+# ---------------------------------------------------------------------------
+# New strategy tests
+# ---------------------------------------------------------------------------
+
+class TestNewStrategies:
+    """Verify short_strangle and long_strangle build and reprice correctly."""
+
+    def _make_df(self, price: float = 450.0, n: int = 60) -> pd.DataFrame:
+        idx = pd.date_range("2023-01-03", periods=n, freq="B")
+        p = pd.Series([price] * n, index=idx)
+        return pd.DataFrame({
+            "Open": p, "High": p * 1.01, "Low": p * 0.99, "Close": p, "Volume": 1_000_000,
+        })
+
+    def test_short_strangle_builds_non_none(self):
+        import datetime
+        from ait.backtesting.engine import Backtester
+
+        # position_size_pct=0.50 so capital×50% = $50k > margin_per_contract ($9k) → ≥1 contract
+        bt = Backtester(data=self._make_df(), strategies=["short_strangle"],
+                        initial_capital=100_000, iv_floor=0.20, position_size_pct=0.50)
+        pos = bt._build_credit_position(
+            "short_strangle", S=450.0, iv=0.20, t=30 / 365, r=0.05, dte=30,
+            today_date=datetime.date(2023, 3, 1), capital=100_000,
+        )
+        assert pos is not None
+        assert pos["strategy"] == "short_strangle"
+        assert "short_call_strike" in pos
+        assert "short_put_strike" in pos
+        assert pos["trade_type"] == "credit"
+
+    def test_short_strangle_reprice_positive(self):
+        """Cost to buy back a short strangle must be positive."""
+        import datetime
+        from ait.backtesting.engine import Backtester
+
+        bt = Backtester(data=self._make_df(), strategies=["short_strangle"],
+                        initial_capital=100_000, iv_floor=0.20, position_size_pct=0.50)
+        pos = bt._build_credit_position(
+            "short_strangle", S=450.0, iv=0.20, t=30 / 365, r=0.05, dte=30,
+            today_date=datetime.date(2023, 3, 1), capital=100_000,
+        )
+        assert pos is not None
+        current_val = bt._reprice_position(pos, underlying=450.0, days_held=5)
+        assert current_val > 0
+
+    def test_long_strangle_builds_non_none(self):
+        import datetime
+        from ait.backtesting.engine import Backtester
+        from ait.strategies.base import SignalDirection
+
+        bt = Backtester(data=self._make_df(), strategies=["long_strangle"],
+                        initial_capital=100_000, iv_floor=0.20)
+        pos = bt._build_debit_position(
+            "long_strangle", direction=SignalDirection.NEUTRAL,
+            S=450.0, iv=0.20, t=30 / 365, r=0.05, dte=30,
+            today_date=datetime.date(2023, 3, 1), capital=100_000,
+        )
+        assert pos is not None
+        assert pos["strategy"] == "long_strangle"
+        assert "long_call_strike" in pos
+        assert "long_put_strike" in pos
+        assert pos["trade_type"] == "debit"
+
+    def test_long_strangle_reprice_increases_after_large_move(self):
+        """Long strangle value should increase when underlying moves significantly."""
+        import datetime
+        from ait.backtesting.engine import Backtester
+        from ait.strategies.base import SignalDirection
+
+        bt = Backtester(data=self._make_df(), strategies=["long_strangle"],
+                        initial_capital=100_000, iv_floor=0.20)
+        pos = bt._build_debit_position(
+            "long_strangle", direction=SignalDirection.NEUTRAL,
+            S=450.0, iv=0.20, t=30 / 365, r=0.05, dte=30,
+            today_date=datetime.date(2023, 3, 1), capital=100_000,
+        )
+        assert pos is not None
+        val_flat = bt._reprice_position(pos, underlying=450.0, days_held=1)
+        val_moved = bt._reprice_position(pos, underlying=490.0, days_held=1)
+        assert val_moved > val_flat, "Long strangle should gain value after large underlying move"
+
+    def test_short_strangle_delta_scales_with_iv(self):
+        """Higher current IV → lower effective delta → further OTM strikes."""
+        import datetime
+        from ait.backtesting.engine import Backtester
+
+        today = datetime.date(2023, 3, 1)
+        df = self._make_df(450.0)
+
+        bt = Backtester(data=df, strategies=["short_strangle"],
+                        initial_capital=100_000, iv_floor=0.20,
+                        delta_short=0.20, delta_iv_scale=1.0, position_size_pct=0.50)
+
+        pos_low_iv = bt._build_credit_position(
+            "short_strangle", S=450.0, iv=0.20,
+            t=30 / 365, r=0.05, dte=30, today_date=today, capital=100_000,
+        )
+        pos_high_iv = bt._build_credit_position(
+            "short_strangle", S=450.0, iv=0.40,
+            t=30 / 365, r=0.05, dte=30, today_date=today, capital=100_000,
+        )
+
+        if pos_low_iv and pos_high_iv:
+            assert pos_high_iv["short_call_strike"] >= pos_low_iv["short_call_strike"], (
+                "High IV should push short call strike further OTM (higher)"
+            )
+
+    def test_delta_iv_scale_zero_is_static(self):
+        """delta_iv_scale=0 vs 1: at high IV, scale=1 places strikes further OTM than scale=0."""
+        import datetime
+        from ait.backtesting.engine import Backtester
+
+        today = datetime.date(2023, 3, 1)
+        df = self._make_df(450.0)
+
+        # scale=0: effective_delta = delta_short = 0.20 regardless of IV
+        bt_static = Backtester(data=df, strategies=["short_strangle"],
+                               initial_capital=100_000, iv_floor=0.20,
+                               delta_short=0.20, delta_iv_scale=0.0, position_size_pct=0.50)
+        # scale=1: high IV → effective_delta = 0.20 × (0.20/0.40) = 0.10 → further OTM
+        bt_scaled = Backtester(data=df, strategies=["short_strangle"],
+                               initial_capital=100_000, iv_floor=0.20,
+                               delta_short=0.20, delta_iv_scale=1.0, position_size_pct=0.50)
+
+        kwargs = dict(S=450.0, iv=0.40, t=30 / 365, r=0.05, dte=30,
+                      today_date=today, capital=100_000)
+        pos_static = bt_static._build_credit_position("short_strangle", **kwargs)
+        pos_scaled = bt_scaled._build_credit_position("short_strangle", **kwargs)
+
+        if pos_static and pos_scaled:
+            assert pos_scaled["short_call_strike"] >= pos_static["short_call_strike"], (
+                "delta_iv_scale=1 at 2× iv_floor should push call strike further OTM than scale=0"
+            )
+
+    def test_multi_strategy_run_includes_all_strategies(self):
+        """Walk-forward with full strategy list must complete without error."""
+        import asyncio
+
+        strategies = [
+            "iron_condor", "put_credit_spread", "short_strangle",
+            "bull_call_spread", "bear_put_spread", "long_strangle",
+        ]
+        data = {"SPY": _make_ohlcv(1000, start_price=450)}
+        cfg = WalkForwardConfig(
+            train_days=350, test_days=63, step_days=63, gap_days=5,
+            initial_capital=100_000, wing_k=1.0,
+        )
+        bt = WalkForwardBacktester(["SPY"], strategies, config=cfg)
+        result = asyncio.run(bt.run(data=data))
+
+        assert isinstance(result, WalkForwardResult)
+        assert result.total_trades >= 0
+        executed = {t["strategy"] for w in result.windows for t in w.backtest_result.trades}
+        assert executed.issubset(set(strategies) | {""}), (
+            f"Unexpected strategies found: {executed - set(strategies)}"
+        )
