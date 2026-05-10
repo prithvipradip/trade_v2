@@ -46,7 +46,7 @@ run_orchestrator.py          ← Master process (start here)
 | `src/ait/bot/orchestrator.py` | Trading brain — scan/predict/trade loop |
 | `src/ait/bot/scheduler.py` | Market phase management |
 | `src/ait/ml/ensemble.py` | XGBoost + LightGBM direction predictor |
-| `src/ait/ml/features.py` | 49 technical features (RSI, MACD, BB, vol, etc.) |
+| `src/ait/ml/features.py` | 81 stationary features (RSI, normalized MACD, BB breach signals, vol, etc.) |
 | `src/ait/ml/trainer.py` | Model training with drift detection + rollback |
 | `src/ait/backtesting/engine.py` | Backtest engine with Black-Scholes options sim |
 | `src/ait/backtesting/walkforward.py` | Walk-forward backtester (train 1yr, test 3mo) |
@@ -100,7 +100,7 @@ run_orchestrator.py          ← Master process (start here)
 ## ML Pipeline
 
 - **Models**: XGBoost + LightGBM ensemble (50/50 weighted)
-- **Features**: 49 technical indicators (RSI, MACD, Bollinger, volume, volatility, iv_rank, etc.)
+- **Features**: 81 stationary technical indicators (all normalized — no raw price levels; MACD divided by close, BB breach signals replace raw BB levels)
 - **Labels**: 5-day forward return — Bullish (>+1.5%), Bearish (<-1.5%), Neutral
 - **Training**: 2 years of daily data (504 trading days), walk-forward cross-validation
 - **Retraining**: Daily at 7:30 AM ET, automatic rollback if accuracy degrades
@@ -145,7 +145,7 @@ run_orchestrator.py          ← Master process (start here)
 
 ### ML
 - [x] XGBoost + LightGBM ensemble
-- [x] 49 technical features
+- [x] 81 stationary technical features (MACD normalized by close, BB breach signals, raw price levels excluded)
 - [x] Walk-forward cross-validation with purge gap
 - [x] 5-day forward return labels (±1.5%)
 - [x] Model versioning, save/load/rollback

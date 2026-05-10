@@ -217,10 +217,10 @@ Features are organized in groups:
 
 | Group | Examples |
 |---|---|
-| Momentum | RSI-14, RSI-7, MACD, MACD histogram, ROC-5/10/20 |
-| Volatility | ATR-14, Bollinger width/position, realized vol 10d/20d |
+| Momentum | RSI-14, RSI-7, MACD/signal/hist (normalized by close), ROC-5/10/20 |
+| Volatility | ATR% of price, BB width/position, BB breach signals (`bb_pct_above_upper`, `bb_pct_below_lower`), realized vol 10d/20d |
 | Volume | OBV change, volume/SMA-20 ratio, volume trend |
-| Trend | SMA-10/20/50, EMA-12/26, MA slopes, MA crossover signal |
+| Trend | MA slopes (5-day % change), price vs. SMA-20/50 ratios, MA crossover signal (raw SMA/EMA price levels excluded) |
 | Price action | Daily return, gap, candle body/wick sizes, consecutive up/down days |
 | Multi-timeframe | Weekly trend alignment, weekly RSI, volume confirmation |
 | IV & vol regime | IV rank proxy, vol ratio (short/long term), vol trend, vol-of-vol |
@@ -228,6 +228,8 @@ Features are organized in groups:
 | Macro | 2Y/10Y yield levels, yield curve spread/inversion, DXY level/change |
 | Live signals | Sentiment composite/news/FinBERT, fear/greed, put/call ratio, flow bias *(see note below)* |
 | Seasonality | Day of week, month of year |
+
+> **Feature stationarity:** All 81 features are stationary (price-level independent). Raw SMA/EMA price levels and raw ATR dollars are excluded. MACD is normalized by dividing by close price. Bollinger Band breach signals (`bb_pct_above_upper`, `bb_pct_below_lower`) replace raw `bb_upper`/`bb_lower` levels. This ensures the model generalizes across different price regimes (e.g., QQQ at $480 in 2024 vs $540 in 2025).
 
 > **Note on live signal features:** The 8 sentiment and options flow features (`sentiment_composite`, `fear_greed`, `put_call_ratio`, etc.) are always set to their neutral defaults (0.0 or 1.0) during training. The model therefore learns near-zero weights for them. At inference time, real values are passed in but they have minimal effect on the prediction. In practice, sentiment influences the final trade decision as a **post-ML confidence adjustment** (Step 4 below), not as a model input. See Section 1.18 Design Decision 10 for rationale.
 

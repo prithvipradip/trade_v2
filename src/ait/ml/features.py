@@ -388,14 +388,14 @@ class FeatureEngine:
             # Momentum
             "rsi_14", "rsi_7", "macd", "macd_signal", "macd_hist",
             "roc_5", "roc_10", "roc_20",
-            # Volatility
-            "atr_14", "atr_pct", "bb_upper", "bb_lower", "bb_width",
-            "bb_position", "realized_vol_20", "realized_vol_10",
+            # Volatility (all normalized — no raw price levels)
+            "atr_pct", "bb_width", "bb_position",
+            "bb_pct_above_upper", "bb_pct_below_lower",
+            "realized_vol_20", "realized_vol_10",
             "high_low_range",
             # Volume
             "volume_sma_20_ratio", "obv_change", "volume_trend",
-            # Trend
-            "sma_10", "sma_20", "sma_50", "ema_12", "ema_26",
+            # Trend (slopes + ratios only — raw SMA/EMA price levels excluded)
             "sma_10_slope", "sma_20_slope",
             "price_vs_sma_20", "price_vs_sma_50",
             "sma_10_20_cross",
@@ -440,10 +440,10 @@ class FeatureEngine:
         df["rsi_14"] = self._rsi(close, 14)
         df["rsi_7"] = self._rsi(close, 7)
 
-        # MACD
+        # MACD — normalized by price so it's stationary across time and price levels
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
-        df["macd"] = ema12 - ema26
+        df["macd"] = (ema12 - ema26) / close
         df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
         df["macd_hist"] = df["macd"] - df["macd_signal"]
 
@@ -475,6 +475,9 @@ class FeatureEngine:
         df["bb_lower"] = sma20 - 2 * std20
         df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / sma20
         df["bb_position"] = (close - df["bb_lower"]) / (df["bb_upper"] - df["bb_lower"])
+        # Breach signals: how far outside the bands is price? 0 when inside.
+        df["bb_pct_above_upper"] = ((close - df["bb_upper"]) / close).clip(lower=0)
+        df["bb_pct_below_lower"] = ((df["bb_lower"] - close) / close).clip(lower=0)
 
         # Realized volatility
         log_returns = np.log(close / close.shift(1))
