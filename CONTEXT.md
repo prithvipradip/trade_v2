@@ -206,7 +206,7 @@ run_orchestrator.py          ← Master process (start here)
 
 ### Data
 - [x] IB store → Yahoo fallback chain for daily OHLCV (`load_daily_ohlcv()` in `market_data.py`)
-- [x] VLMC intraday features merged into ML training via `FeatureEngine.compute(intraday_store=...)` 
+- [x] VLMC intraday features merged into ML training via `FeatureEngine.compute(intraday_store=...)` — used by both DirectionPredictor and RangePredictor 
 - [x] TTL caching for all data
 - [x] Multi-timeframe analysis (daily + 5min)
 - [x] Options flow detection (unusual activity)

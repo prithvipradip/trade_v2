@@ -854,6 +854,7 @@ When a trade is rejected, the system tracks what would have happened. After the 
    │    Used for: ML training, walk-forward backtesting, diagnostics
    ├─ Intraday VLMC features computed per session from 5-min bars
    │    Merged into ML feature set via FeatureEngine.compute(intraday_store=...)
+   │    Used by both DirectionPredictor and RangePredictor — model decides relevance via feature importance
    ├─ Options chains (all expirations and strikes)
    ├─ News headlines (BRFG, DJ-N, DJ-RTG, DJ-RTPRO, DJNL) → fundamentals.db
    └─ Analyst recommendations (BRFUPDN / Briefing.com) → fundamentals.db

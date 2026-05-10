@@ -694,8 +694,12 @@ class WalkForwardBacktester:
         """Train range predictor on this window's training data."""
         try:
             from ait.ml.range_predictor import RangePredictor
+            intraday_store = None
+            if self._db_path is not None:
+                from ait.data.historical import HistoricalDataStore
+                intraday_store = HistoricalDataStore(db_path=self._db_path)
             rp = RangePredictor(threshold_pct=threshold_pct, horizon_days=max_hold_days)
-            accs = rp.train(train_df, symbol=symbol)
+            accs = rp.train(train_df, symbol=symbol, intraday_store=intraday_store)
             if accs and rp.is_trained:
                 avg = sum(accs.values()) / len(accs)
                 log.info("window_range_model_trained",

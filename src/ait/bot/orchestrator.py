@@ -872,6 +872,7 @@ class TradingOrchestrator:
                     hist, symbol=symbol,
                     market_context=market_context,
                     live_signals=live_signals,
+                    intraday_store=self._historical,
                 )
                 if range_pred:
                     log.info("range_prediction", symbol=symbol,
