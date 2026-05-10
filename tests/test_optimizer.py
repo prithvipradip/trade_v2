@@ -378,3 +378,13 @@ class TestWingKOptimization:
         assert "wing_k" in PUT_CREDIT_SPREAD_SPACE
         low, high = PUT_CREDIT_SPREAD_SPACE["wing_k"][1], PUT_CREDIT_SPREAD_SPACE["wing_k"][2]
         assert low < 1.0 < high
+
+    def test_iron_condor_space_has_max_entry_vol(self):
+        from ait.optimization.param_spaces import IRON_CONDOR_SPACE
+        assert "max_entry_vol_annual" in IRON_CONDOR_SPACE
+        low, high = IRON_CONDOR_SPACE["max_entry_vol_annual"][1], IRON_CONDOR_SPACE["max_entry_vol_annual"][2]
+        assert low < 0.60 < high, "Liberation Day vol (~60%) must be inside the search range"
+
+    def test_short_strangle_space_has_max_entry_vol(self):
+        from ait.optimization.param_spaces import SHORT_STRANGLE_SPACE
+        assert "max_entry_vol_annual" in SHORT_STRANGLE_SPACE

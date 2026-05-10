@@ -58,6 +58,8 @@ backtest:
   wing_k: 1.0                         # Vol-scaled wing multiplier (Optuna optimizes per window)
   iv_floor: 0.20                      # Min synthetic IV (SOFI has decent vol in normal markets)
   delta_iv_scale: 0.0                 # IV-driven delta scaling for strangles: 0=static, 1=full IV response
+  max_concurrent_positions: 3         # Max simultaneous open positions
+  max_entry_vol_annual: 0.80          # Skip iron condor entry when 10-day annualized vol > threshold
   optimize_n_trials: 50               # Optuna trials per walk-forward window
   optimize_patience: 20               # Early stopping: halt after N consecutive non-improving trials (0=disabled)
   optimize_min_trades: 10             # Min trades for full score; < 3 → always −100; 3–9 → quadratic penalty

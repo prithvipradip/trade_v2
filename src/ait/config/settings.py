@@ -89,6 +89,14 @@ class BacktestConfig(BaseModel):
         description="IV-driven delta scaling for strangles. "
                     "0=static delta, 1=full IV response. "
                     "High IV → lower effective delta → further OTM strikes.")
+    max_concurrent_positions: int = Field(default=1, ge=1, le=5,
+        description="Maximum number of simultaneously open positions. "
+                    "1 = original single-position behavior. "
+                    "3 = up to 3 concurrent iron condors / strangles.")
+    max_entry_vol_annual: float = Field(default=0.80, ge=0.15, le=1.50,
+        description="Maximum 10-day realized vol (annualized) allowed for iron condor / "
+                    "short strangle entry. Entries above this are skipped. "
+                    "Optuna tunes per window in range [0.25, 0.90].")
     optimize_n_trials: int = Field(default=50, ge=5, le=500,
         description="Optuna trials per walk-forward window.")
     optimize_patience: int = Field(default=20, ge=0, le=500,

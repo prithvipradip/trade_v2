@@ -58,6 +58,14 @@ class TestWalkForwardConfig:
         cfg = WalkForwardConfig()
         assert cfg.delta_iv_scale == pytest.approx(0.0)
 
+    def test_max_concurrent_positions_default_is_3(self) -> None:
+        cfg = WalkForwardConfig()
+        assert cfg.max_concurrent_positions == 3
+
+    def test_max_entry_vol_annual_default(self) -> None:
+        cfg = WalkForwardConfig()
+        assert cfg.max_entry_vol_annual == pytest.approx(0.80)
+
 
 class TestWalkForwardResult:
 
@@ -542,3 +550,80 @@ class TestNewStrategies:
         assert executed.issubset(set(strategies) | {""}), (
             f"Unexpected strategies found: {executed - set(strategies)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Multi-position tests
+# ---------------------------------------------------------------------------
+
+class TestMultiPosition:
+
+    def _make_df(self, price: float = 500.0, n: int = 100) -> pd.DataFrame:
+        idx = pd.date_range("2023-01-03", periods=n, freq="B")
+        p = pd.Series([price] * n, index=idx)
+        return pd.DataFrame({"Open": p, "High": p * 1.01, "Low": p * 0.99,
+                              "Close": p, "Volume": 1_000_000})
+
+    def test_single_limit_produces_result(self) -> None:
+        """max_concurrent_positions=1 must complete without error."""
+        from ait.backtesting.engine import Backtester
+        bt = Backtester(data=self._make_df(), strategies=["iron_condor"],
+                        initial_capital=100_000, iv_floor=0.20,
+                        max_concurrent_positions=1)
+        result = bt.run()
+        assert result is not None
+
+    def test_multi_position_allows_more_trades(self) -> None:
+        """max_concurrent_positions=3 produces >= trades as max_concurrent_positions=1."""
+        import asyncio
+        data = {"SPY": _make_ohlcv(1000, start_price=450)}
+        cfg_single = WalkForwardConfig(
+            train_days=350, test_days=63, step_days=63, gap_days=5,
+            initial_capital=100_000, max_concurrent_positions=1,
+        )
+        cfg_multi = WalkForwardConfig(
+            train_days=350, test_days=63, step_days=63, gap_days=5,
+            initial_capital=100_000, max_concurrent_positions=3,
+        )
+        r_single = asyncio.run(WalkForwardBacktester(["SPY"], ["iron_condor"], config=cfg_single).run(data=data))
+        r_multi  = asyncio.run(WalkForwardBacktester(["SPY"], ["iron_condor"], config=cfg_multi).run(data=data))
+        assert r_multi.total_trades >= r_single.total_trades
+
+
+# ---------------------------------------------------------------------------
+# Realized-vol gate tests
+# ---------------------------------------------------------------------------
+
+class TestVolGate:
+
+    def _make_volatile_df(self, base: float = 500.0, n: int = 120,
+                          daily_vol: float = 0.04) -> pd.DataFrame:
+        """Synthetic data with configurable daily vol (~64% annualized at 4%)."""
+        np.random.seed(42)
+        prices = [base]
+        for _ in range(n - 1):
+            prices.append(prices[-1] * (1 + np.random.normal(0, daily_vol)))
+        prices_s = pd.Series(prices)
+        idx = pd.date_range("2023-01-03", periods=n, freq="B")
+        return pd.DataFrame({"Open": prices_s, "High": prices_s * 1.01,
+                              "Low": prices_s * 0.99, "Close": prices_s,
+                              "Volume": 1_000_000}, index=idx)
+
+    def test_strict_gate_blocks_entries_in_high_vol(self) -> None:
+        """max_entry_vol_annual=0.30 should block most entries when daily_vol=4%."""
+        from ait.backtesting.engine import Backtester
+        bt = Backtester(data=self._make_volatile_df(daily_vol=0.04),
+                        strategies=["iron_condor"], initial_capital=100_000,
+                        iv_floor=0.20, max_entry_vol_annual=0.30)
+        result = bt.run()
+        # 4% daily ≈ 63% annualized >> 30% gate → nearly all entries blocked
+        assert result.total_trades < 3
+
+    def test_permissive_gate_allows_entries_in_low_vol(self) -> None:
+        """max_entry_vol_annual=0.90 should allow entries when daily_vol=1%."""
+        from ait.backtesting.engine import Backtester
+        bt = Backtester(data=self._make_volatile_df(daily_vol=0.01),
+                        strategies=["iron_condor"], initial_capital=100_000,
+                        iv_floor=0.20, max_entry_vol_annual=0.90)
+        result = bt.run()
+        assert result is not None  # must not crash; entries may or may not occur

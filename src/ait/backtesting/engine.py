@@ -68,6 +68,8 @@ class Backtester:
         hurst_regime_penalty: float = 0.10,
         multifractal_max_width: float = 0.50,
         features_cache: pd.DataFrame | None = None,
+        max_concurrent_positions: int = 1,
+        max_entry_vol_annual: float = 0.80,
     ) -> None:
         self._data = self._prepare_data(data)
         self._strategies = strategies
@@ -96,6 +98,8 @@ class Backtester:
         self._hurst_regime_penalty = hurst_regime_penalty
         self._multifractal_max_width = multifractal_max_width
         self._features_cache = features_cache
+        self._max_concurrent_positions = max_concurrent_positions
+        self._max_entry_vol_annual = max_entry_vol_annual
 
         self._predictor = predictor if predictor is not None else self._load_predictor()
 
@@ -154,8 +158,8 @@ class Backtester:
             # Track current capital for strategy selection
             self._current_capital = capital
 
-            # --- 2. Generate new signal (one trade per day max) ---
-            if open_positions:
+            # --- 2. Generate new signal (skip if at position limit) ---
+            if len(open_positions) >= self._max_concurrent_positions:
                 continue
 
             direction, confidence, features_df = self._get_direction(hist)
@@ -197,6 +201,21 @@ class Backtester:
                     confidence = rp.probability_in_range
                 except Exception:
                     pass
+
+            # Realized-vol entry gate: iron condors / short strangles cannot profit
+            # during high-volatility regimes (e.g. tariff shocks, VIX > 40).
+            if strategy in ("iron_condor", "short_strangle"):
+                recent_close = hist["Close"].iloc[-11:]
+                if len(recent_close) >= 11:
+                    vol_10d = recent_close.pct_change().std() * (252 ** 0.5)
+                    if vol_10d > self._max_entry_vol_annual:
+                        log.debug(
+                            "vol_gate_skip",
+                            strategy=strategy,
+                            vol_10d=f"{vol_10d:.2%}",
+                            max_vol=f"{self._max_entry_vol_annual:.2%}",
+                        )
+                        continue
 
             # --- 3. Build the trade ---
             pos = self._build_position(strategy, direction, row, hist, today_date, capital)

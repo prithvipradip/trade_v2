@@ -229,6 +229,8 @@ run_orchestrator.py          ← Master process (start here)
 - [x] Conditional warm-start — enqueues prior window's best params if OOS `win_rate ≥ 75%` AND `total_trades ≥ 5`; cold-starts otherwise
 - [x] `range_threshold_pct` config field; `RangePredictor` `horizon_days` auto-linked to `max_hold_days` per window
 - [x] `min_confidence` search range capped at 0.70 (upper bound) across all strategy spaces — prevents Optuna from selecting values of 0.72–0.85 that generate 0 OOS trades in 63-day test windows
+- [x] `max_concurrent_positions` — wires up pre-existing `WalkForwardConfig` field (was defined but unused); engine now allows N simultaneous positions; default 3 in config (was blocked by `if open_positions: continue`)
+- [x] `max_entry_vol_annual` — hard realized-vol gate for iron condor / short strangle entries; skip when 10-day annualized realized vol exceeds threshold; Optuna-tuned per window [0.25, 0.90]
 - [x] Walk-forward `optimize_per_window` integration
 - [x] Resumable studies via SQLite storage (`load_if_exists=True`)
 - [x] `run_optimizer.py` CLI

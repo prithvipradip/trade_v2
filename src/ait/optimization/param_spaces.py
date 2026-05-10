@@ -16,14 +16,15 @@ FRACTAL_GATE_SPACE: dict[str, tuple] = {
 }
 
 IRON_CONDOR_SPACE: dict[str, tuple] = {
-    "min_confidence":    ("float", 0.55, 0.70),
-    "stop_loss_pct":     ("float", 0.30, 0.70),
-    "profit_target_pct": ("float", 0.30, 0.70),
-    "trailing_stop_pct": ("float", 0.15, 0.40),
-    "delta_short":       ("float", 0.15, 0.30),
-    "max_hold_days":     ("int",   14,   45),
-    "iv_floor":          ("float", 0.15, 0.40),
-    "wing_k":            ("float", 0.30, 2.00),
+    "min_confidence":       ("float", 0.55, 0.70),
+    "stop_loss_pct":        ("float", 0.30, 0.70),
+    "profit_target_pct":    ("float", 0.30, 0.70),
+    "trailing_stop_pct":    ("float", 0.15, 0.40),
+    "delta_short":          ("float", 0.15, 0.30),
+    "max_hold_days":        ("int",   14,   45),
+    "iv_floor":             ("float", 0.15, 0.40),
+    "wing_k":               ("float", 0.30, 2.00),
+    "max_entry_vol_annual": ("float", 0.25, 0.90),
     **FRACTAL_GATE_SPACE,
 }
 
@@ -62,14 +63,15 @@ BEAR_PUT_SPREAD_SPACE: dict[str, tuple] = {
 }
 
 SHORT_STRANGLE_SPACE: dict[str, tuple] = {
-    "min_confidence":    ("float", 0.55, 0.70),
-    "stop_loss_pct":     ("float", 0.30, 0.70),
-    "profit_target_pct": ("float", 0.30, 0.70),
-    "trailing_stop_pct": ("float", 0.15, 0.40),
-    "delta_short":       ("float", 0.10, 0.25),
-    "max_hold_days":     ("int",   14,   45),
-    "iv_floor":          ("float", 0.15, 0.40),
-    "delta_iv_scale":    ("float", 0.0,  1.0),
+    "min_confidence":       ("float", 0.55, 0.70),
+    "stop_loss_pct":        ("float", 0.30, 0.70),
+    "profit_target_pct":    ("float", 0.30, 0.70),
+    "trailing_stop_pct":    ("float", 0.15, 0.40),
+    "delta_short":          ("float", 0.10, 0.25),
+    "max_hold_days":        ("int",   14,   45),
+    "iv_floor":             ("float", 0.15, 0.40),
+    "delta_iv_scale":       ("float", 0.0,  1.0),
+    "max_entry_vol_annual": ("float", 0.25, 0.90),
     **FRACTAL_GATE_SPACE,
 }
 

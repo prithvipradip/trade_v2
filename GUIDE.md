@@ -1049,6 +1049,17 @@ backtest:
                                    # 1.0 = full IV response: high IV → go further OTM
                                    # Formula: effective_delta = delta × (1 + scale × (iv_floor/iv − 1))
                                    # Optuna-optimized per window for short_strangle and long_strangle.
+  max_concurrent_positions: 3     # Maximum simultaneously open positions.
+                                   # 1 = original single-position behavior (one trade at a time).
+                                   # 3 = up to 3 concurrent iron condors / strangles per symbol.
+                                   # Capital per trade = position_size_pct × current_capital (unchanged).
+                                   # Total max exposure = max_concurrent_positions × position_size_pct.
+  max_entry_vol_annual: 0.80      # Hard realized-vol gate for iron condor and short strangle entries.
+                                   # Skip entry when 10-day realized vol (annualized) > this threshold.
+                                   # 0.25 = conservative (blocks when 10-day std > ~1.6% daily)
+                                   # 0.80 = permissive default (blocks only extreme vol spikes)
+                                   # QQQ Liberation Day April 2025: realized vol hit ~65% → blocked.
+                                   # Optuna-optimized per window [0.25, 0.90].
   optimize_patience: 20           # Early stopping: halt a window's Optuna run after this many
                                    # consecutive trials with no improvement in best_value.
                                    # 0 = disabled (run all n_trials regardless).
@@ -1346,6 +1357,7 @@ Each strategy has a defined search space in `param_spaces.py`:
 | `trailing_stop_pct` | float [0.15, 0.40] | Trail behind HWM once breakeven is triggered |
 | `iv_floor` | float [0.15, 0.40] | Minimum IV used in Black-Scholes pricing |
 | `wing_k` | float [0.30, 2.00] | Vol-scaled wing multiplier — iron condor and put_credit_spread only. 1.0 = 1-sigma expected move. |
+| `max_entry_vol_annual` | float [0.25, 0.90] | Hard realized-vol gate: skip iron condor / short strangle entry when 10-day annualized vol exceeds threshold. Prevents entries during Liberation Day-style vol spikes. |
 
 Debit strategies (`long_call`, `long_put`, `bull_call_spread`, `bear_put_spread`) also search over `delta_long` [0.25–0.55] and `max_hold_days` [14–60].
 

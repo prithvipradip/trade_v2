@@ -60,6 +60,7 @@ class WalkForwardConfig:
     trailing_stop_pct: float = 0.25
     breakeven_trigger_pct: float = 0.30
     max_concurrent_positions: int = 3
+    max_entry_vol_annual: float = 0.80
     optimize_per_window: bool = False
     optimize_n_trials: int = 50
     optimize_patience: int = 0       # 0 = disabled; N = stop after N non-improving trials
@@ -531,6 +532,8 @@ class WalkForwardBacktester:
                     wing_floor_dollars=window_cfg.wing_floor_dollars,
                     wing_k=window_cfg.wing_k,
                     delta_iv_scale=window_cfg.delta_iv_scale,
+                    max_concurrent_positions=window_cfg.max_concurrent_positions,
+                    max_entry_vol_annual=window_cfg.max_entry_vol_annual,
                 )
                 result = bt.run()
 
@@ -659,6 +662,8 @@ class WalkForwardBacktester:
                 delta_iv_scale=self._config.delta_iv_scale,
                 patience=self._config.optimize_patience,
                 min_trades=self._config.optimize_min_trades,
+                max_concurrent_positions=self._config.max_concurrent_positions,
+                max_entry_vol_annual=self._config.max_entry_vol_annual,
             )
             # Inject pre-loaded training data so the optimizer doesn't re-fetch
             result = optimizer.run(data={symbol: train_df}, prior_params=warm_params)

@@ -79,6 +79,8 @@ class StrategyOptimizer:
         delta_iv_scale: float = 0.0,
         patience: int = 0,
         min_trades: int = 10,
+        max_concurrent_positions: int = 1,
+        max_entry_vol_annual: float = 0.80,
     ) -> None:
         if objective not in OBJECTIVES:
             raise ValueError(f"Unknown objective '{objective}'. Choose from: {list(OBJECTIVES)}")
@@ -101,6 +103,8 @@ class StrategyOptimizer:
         self._delta_iv_scale = delta_iv_scale
         self._patience = patience
         self._min_trades = min_trades
+        self._max_concurrent_positions = max_concurrent_positions
+        self._max_entry_vol_annual = max_entry_vol_annual
         self._data: dict[str, pd.DataFrame] = {}
 
     # ------------------------------------------------------------------
@@ -264,8 +268,10 @@ class StrategyOptimizer:
             "delta_long":            0.30,
             "iv_floor":              self._iv_floor,
             "wing_floor_dollars":    self._wing_floor_dollars,
-            "wing_k":                self._wing_k,
-            "delta_iv_scale":        self._delta_iv_scale,
+            "wing_k":                    self._wing_k,
+            "delta_iv_scale":            self._delta_iv_scale,
+            "max_concurrent_positions":  self._max_concurrent_positions,
+            "max_entry_vol_annual":      self._max_entry_vol_annual,
         }
         # Override with trial params that match Backtester signatures
         for key, val in params.items():
