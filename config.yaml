@@ -33,9 +33,9 @@ risk:
 options:
   delta_range: [0.20, 0.50]            # Target delta for long options
   dte_range: [14, 45]                  # Days to expiry range
-  min_open_interest: 100               # Liquidity filter
-  min_volume: 50                       # Daily volume filter
-  max_bid_ask_spread_pct: 0.10         # 10% max spread
+  min_open_interest: 10                # Loosened: paper account on delayed data
+  min_volume: 0                        # Delayed feeds report volume=0; relaxed pydantic floor too
+  max_bid_ask_spread_pct: 0.40         # Loosened: stale-quote spreads run wider
   strategies:
     - long_call
     - long_put
