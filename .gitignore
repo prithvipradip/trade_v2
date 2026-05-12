@@ -19,7 +19,7 @@ env/
 /data/
 models/
 logs/
-reports/
+reports/integration_test/
 
 # Secrets
 .env

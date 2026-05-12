@@ -1,0 +1,22 @@
+FEATURE HEALTH REPORT
+============================================================
+
+--- QQQ ---
+  [fractal] hurst_wavelet: nan=0.0%, range=[0.5374, 0.9000], mean=0.8289
+  [fractal] hurst_scale_spread: nan=0.0%, range=[0.0000, 0.9000], mean=0.2659
+  [fractal] psd_beta: nan=0.0%, range=[1.6344, 2.3335], mean=1.8655
+  [fractal] multifractal_width: nan=0.0%, range=[0.0000, 0.3185], mean=0.0171
+  [fractal] multifractal_asymmetry: nan=0.0%, range=[0.0000, 0.1537], mean=0.0057
+  [vlmc   ] session_vwap_position: nan=0.0%, range=[-0.0289, 0.0497], mean=0.0003
+  [vlmc   ] session_vwap_q1: nan=0.0%, range=[-0.0122, 0.0115], mean=0.0001
+  [vlmc   ] session_vwap_q2: nan=0.0%, range=[-0.0218, 0.0147], mean=0.0002
+  [vlmc   ] session_vwap_q3: nan=0.0%, range=[-0.0202, 0.0537], mean=0.0004
+  [vlmc   ] session_high_timing: nan=0.0%, range=[0.0000, 1.0000], mean=0.4388
+  [vlmc   ] session_low_timing: nan=0.0%, range=[0.0000, 1.0000], mean=0.3428
+  [vlmc   ] session_volume_front_load: nan=0.0%, range=[0.1390, 0.6388], mean=0.4358
+  [vlmc   ] session_volume_shape: nan=0.0%, range=[-0.6650, 0.4664], mean=0.1063
+  [vlmc   ] power_hour_momentum: nan=0.0%, range=[-0.0146, 0.0203], mean=0.0001
+  [vlmc   ] power_hour_vol_accel: nan=0.0%, range=[-0.0692, 0.2746], mean=0.1570
+  [vlmc   ] power_hour_vwap_cross: nan=0.0%, range=[-1.0000, 1.0000], mean=0.0768
+  [vlmc   ] closing_imbalance: nan=0.0%, range=[-0.0049, 0.0076], mean=0.0001
+  [vlmc   ] closing_range_position: nan=0.0%, range=[0.0000, 1.0000], mean=0.5345
