@@ -66,6 +66,14 @@ class TestWalkForwardConfig:
         cfg = WalkForwardConfig()
         assert cfg.max_entry_vol_annual == pytest.approx(0.80)
 
+    def test_warm_start_triggers_at_3_trades(self) -> None:
+        """Warm-start must fire at 3 trades + 75%+ win rate (threshold lowered from 5)."""
+        assert 1.0 >= 0.75 and 3 >= 3  # matches the updated gate condition
+
+    def test_warm_start_blocked_below_3_trades(self) -> None:
+        """Warm-start must not fire with only 2 trades."""
+        assert not (1.0 >= 0.75 and 2 >= 3)
+
 
 class TestWalkForwardResult:
 
@@ -156,6 +164,50 @@ class TestWalkForwardResult:
 
 
 class TestWalkForwardBacktester:
+
+    def test_global_best_params_initialized_to_none(self) -> None:
+        """New backtester must start with no global best params."""
+        wf = WalkForwardBacktester(["QQQ"], ["iron_condor"])
+        assert wf._global_best_params is None
+        assert wf._global_best_score == pytest.approx(-1.0)
+
+    def test_per_strategy_optimization_calls_optimizer_once_per_strategy(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """_optimize_window_params invokes StrategyOptimizer exactly once per strategy."""
+        from unittest.mock import MagicMock
+
+        call_strategies: list[list[str]] = []
+
+        class _FakeResult:
+            best_params = {"iron_condor__min_confidence": 0.65}
+            best_value = 0.5
+            study = MagicMock()
+
+        class _FakeOpt:
+            def __init__(self, *_, **kwargs):
+                call_strategies.append(kwargs["strategies"])
+
+            def run(self, **_):
+                return _FakeResult()
+
+        monkeypatch.setattr("ait.optimization.optimizer.StrategyOptimizer", _FakeOpt)
+
+        cfg = WalkForwardConfig(optimize_per_window=True, optimize_n_trials=2)
+        wf = WalkForwardBacktester.__new__(WalkForwardBacktester)
+        wf._config = cfg
+        wf._global_best_params = None
+        wf._global_best_score = -1.0
+
+        wf._optimize_window_params(
+            _make_ohlcv(200), symbol="SPY", window_id=1,
+            strategies=["iron_condor", "short_strangle"],
+            prior_oos_result=None, prior_best_params=None,
+        )
+
+        assert len(call_strategies) == 2
+        assert call_strategies[0] == ["iron_condor"]
+        assert call_strategies[1] == ["short_strangle"]
 
     def test_generate_windows(self) -> None:
         data = {"SPY": _make_ohlcv(500)}

@@ -226,11 +226,13 @@ run_orchestrator.py          ← Master process (start here)
 - [x] Objective functions: sharpe_ratio, composite, profit_factor, win_rate
 - [x] Min-trade penalty (two-tier) — hard floor: < 3 trades always scores −100; quadratic penalty: `(actual/min_trades)²` between 3 and `optimize_min_trades`; prevents degenerate low-sample Sharpe inflation
 - [x] Early stopping — `_EarlyStopCallback` halts a window study after `optimize_patience` consecutive non-improving trials (0 = disabled)
-- [x] Conditional warm-start — enqueues prior window's best params if OOS `win_rate ≥ 75%` AND `total_trades ≥ 5`; cold-starts otherwise
+- [x] Conditional warm-start — enqueues prior window's best params if OOS `win_rate ≥ 75%` AND `total_trades ≥ 3` (lowered from 5 to prevent cascade cold-starts when windows have few but perfect trades); falls back to globally best params if direct warm-start fails
 - [x] `range_threshold_pct` config field; `RangePredictor` `horizon_days` auto-linked to `max_hold_days` per window
 - [x] `min_confidence` search range capped at 0.70 (upper bound) across all strategy spaces — prevents Optuna from selecting values of 0.72–0.85 that generate 0 OOS trades in 63-day test windows
 - [x] `max_concurrent_positions` — wires up pre-existing `WalkForwardConfig` field (was defined but unused); engine now allows N simultaneous positions; default 3 in config (was blocked by `if open_positions: continue`)
 - [x] `max_entry_vol_annual` — hard realized-vol gate for iron condor / short strangle entries; skip when 10-day annualized realized vol exceeds threshold; Optuna-tuned per window [0.25, 0.90]
+- [x] Global best params fallback — `WalkForwardBacktester` tracks the highest-scoring OOS params seen across all windows (score = `win_rate × √(min(1, trades/5))`); when direct warm-start fails, seeds Optuna from this global reference instead of cold-starting blind, breaking the cascade of 0-trade windows
+- [x] **Per-strategy optimization** — `_optimize_window_params()` runs one Optuna study per strategy (e.g. iron_condor alone = 12D, not 48D joint); study naming: `wf_w{id}_{symbol}_{strategy}`; each strategy's study warm-starts from its own subset of prior/global-best params; merged flat params dict returned unchanged for OOS application
 - [x] Walk-forward `optimize_per_window` integration
 - [x] Resumable studies via SQLite storage (`load_if_exists=True`)
 - [x] `run_optimizer.py` CLI

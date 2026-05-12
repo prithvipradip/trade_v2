@@ -6,7 +6,6 @@ import json
 import sys
 from datetime import date, timedelta
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -291,6 +290,16 @@ class TestStrategyOptimizer:
         assert isinstance(result.best_value, float)
         assert len(result.study.trials) == 3
 
+    def test_single_strategy_returns_only_that_strategys_params(self):
+        """strategies=['iron_condor'] → every best_params key must start with 'iron_condor__'."""
+        opt = StrategyOptimizer(
+            symbols=["SPY"], strategies=["iron_condor"], n_trials=2,
+        )
+        result = opt.run(data={"SPY": _make_ohlcv(300)})
+        assert result.best_params
+        unexpected = [k for k in result.best_params if not k.startswith("iron_condor__")]
+        assert not unexpected, f"Unexpected param keys: {unexpected}"
+
     def test_composite_objective_run(self):
         opt = StrategyOptimizer(
             symbols=["SPY"],
@@ -388,3 +397,4 @@ class TestWingKOptimization:
     def test_short_strangle_space_has_max_entry_vol(self):
         from ait.optimization.param_spaces import SHORT_STRANGLE_SPACE
         assert "max_entry_vol_annual" in SHORT_STRANGLE_SPACE
+

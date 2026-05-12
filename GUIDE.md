@@ -1387,7 +1387,9 @@ All three flags are optional — if omitted, the values are read from `optimize_
 
 **Early stopping (`optimize_patience`):** Once the best objective value has not improved for N consecutive trials, the window's study is halted. This prevents wasted compute when the optimizer has already converged, and avoids over-exploring a degenerate region. Set to 0 to disable and always run all `wf-trials`.
 
-**Conditional warm-start:** Before each window's optimization begins, the system checks the previous window's out-of-sample result. If `win_rate ≥ 75%` AND `total_trades ≥ 5`, the previous window's best parameters are enqueued as the first trial of the new study — giving the optimizer a head start in a region already known to generalise. If either condition fails, the study starts cold (standard random/TPE initialisation). This prevents warm-starting from an overfitted prior window that happened to look good in training but failed in testing.
+**Per-strategy studies:** Each window runs one Optuna study *per strategy* rather than a single joint study over all strategies. For example, iron_condor alone is a 12-dimensional space; the prior joint study was 48D (6 strategies × ~8 params). At a fixed budget of 50 trials, 12D yields ~4 trials/dimension vs. ~1 trial/dimension in the joint study — a 4× gain in search efficiency. Each strategy's study is named `wf_w{window_id}_{symbol}_{strategy}`. After all per-strategy studies complete, their best params are merged into the same flat `{strategy}__{param}` dict used by the rest of the system. This design directly supports the goal of deploying one strategy per ticker (e.g. iron_condor for QQQ) — each strategy's best value and params are independently comparable.
+
+**Conditional warm-start (per-strategy):** Before each strategy's study begins, the system checks the previous window's OOS result. If `win_rate ≥ 75%` AND `total_trades ≥ 3`, that strategy's subset of prior best params is enqueued as the first trial. If that condition fails, the system falls back to the same strategy's subset of the **globally best params** seen across all prior windows (tracked by score = `win_rate × √(min(1, trades/5))`). Only if neither source exists does the study start fully cold. This per-strategy warm-start ensures iron_condor never inherits contaminated params from short_strangle and vice versa.
 
 **Range predictor gate:** For iron_condor and short_strangle, the engine calls the range predictor before entering. If `P(in_range) < range_min_confidence` (default 0.55), the signal is skipped entirely — no fallback to directional strategies. Directional strategies (bear_put_spread, bull_call_spread, long_strangle) were tested as range-gate fallbacks but produced consistent losses because the ML model's directional accuracy (~22%) is too low to support them. The correct behaviour when iron_condor is blocked is to pass on the trade.
 
@@ -1413,4 +1415,4 @@ All three flags are optional — if omitted, the values are read from `optimize_
 
 ---
 
-*This document is a living reference. Last updated: 2026-05-10*
+*This document is a living reference. Last updated: 2026-05-11*

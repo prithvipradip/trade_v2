@@ -560,13 +560,14 @@ async def _section_e_walkforward(
     )
 
     try:
-        bt = WalkForwardBacktester(args.symbols, args.strategies, config=config, db_path=Path(args.db_path))
+        out.mkdir(parents=True, exist_ok=True)
+        bt = WalkForwardBacktester(args.symbols, args.strategies, config=config,
+                                   db_path=Path(args.db_path), progress_dir=out)
         result = await bt.run(data=ticker_data if ticker_data else None)
 
         summary_text = result.summary()
         print(f"\n{summary_text}")
 
-        out.mkdir(parents=True, exist_ok=True)
         (out / "walkforward_summary.txt").write_text(summary_text, encoding="utf-8")
         ec = result.equity_curve()
         if not ec.empty:
