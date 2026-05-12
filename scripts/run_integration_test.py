@@ -914,6 +914,23 @@ def _create_run_archive(
             "profit_factor":   0.0,
         }
 
+        # Reconstruct the CLI command from args for reproducibility
+        cli_parts = [
+            "python scripts/run_integration_test.py",
+            f"--symbols {' '.join(args.symbols)}",
+            f"--config {args.config}",
+            f"--years {args.years:.0f}",
+            f"--port {args.port}",
+            f"--strategies {' '.join(args.strategies)}",
+        ]
+        if args.wf_trials is not None:
+            cli_parts.append(f"--wf-trials {args.wf_trials}")
+        if args.wf_patience is not None:
+            cli_parts.append(f"--wf-patience {args.wf_patience}")
+        if args.skip_backfill:
+            cli_parts.append("--skip-backfill")
+        cli_command = " ".join(cli_parts)
+
         metadata = {
             "run_id":           run_id,
             "run_date":         datetime.now(tz=timezone.utc).strftime("%Y-%m-%d"),
@@ -930,6 +947,7 @@ def _create_run_archive(
             "initial_capital":  wf_cfg_fields.get("initial_capital", 100_000.0),
             "position_size_pct": wf_cfg_fields.get("position_size_pct", 0.05),
             "backtest_period":  backtest_period,
+            "cli_command":      cli_command,
             "git_branch":       git_branch,
             "git_commit":       git_commit,
             "summary":          summary,
@@ -968,7 +986,9 @@ def _create_run_archive(
                     "initial_capital":   wf_cfg_fields.get("initial_capital", 100_000.0),
                     "position_size_pct": wf_cfg_fields.get("position_size_pct", 0.05),
                     "optimization":      "per_strategy",
+                    "backtest_period":   backtest_period,
                 })
+                mlflow.set_tag("cli_command", cli_command)
                 mlflow.log_metrics({
                     "total_pnl":        summary["total_pnl"],
                     "total_return_pct": summary["total_return_pct"],

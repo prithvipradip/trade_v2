@@ -34,8 +34,8 @@ def _read_initial_capital_from_snapshot(run_dir: Path) -> float | None:
         return None
 
 
-def import_run(run_dir: Path, client, experiment_id: str) -> str:
-    """Import one run directory into MLflow. Returns 'imported' or 'skipped'."""
+def import_run(run_dir: Path, client, experiment_id: str, force: bool = False) -> str:
+    """Import one run directory into MLflow. Returns 'imported', 'skipped', or 'replaced'."""
     meta_file = Path(run_dir) / "run_metadata.json"
     if not meta_file.exists():
         return "skipped"
@@ -48,7 +48,11 @@ def import_run(run_dir: Path, client, experiment_id: str) -> str:
         filter_string=f"tags.run_id = '{run_id_tag}'",
     )
     if existing:
-        return "skipped"
+        if not force:
+            return "skipped"
+        # Delete existing runs so we can re-import with updated fields
+        for r in existing:
+            client.delete_run(r.info.run_id)
 
     mlflow_run = client.create_run(
         experiment_id=experiment_id,
@@ -60,6 +64,7 @@ def import_run(run_dir: Path, client, experiment_id: str) -> str:
             "git_commit":   meta.get("git_commit", ""),
             "git_branch":   meta.get("git_branch", ""),
             "optimization": meta.get("optimization", ""),
+            "cli_command":  meta.get("cli_command", ""),
         },
     )
     mlflow_run_id = mlflow_run.info.run_id
@@ -80,6 +85,7 @@ def import_run(run_dir: Path, client, experiment_id: str) -> str:
         "initial_capital":    str(float(initial_capital)) if initial_capital is not None else "",
         "position_size_pct":  str(meta.get("position_size_pct", "")),
         "optimization":       str(meta.get("optimization", "")),
+        "backtest_period":    str(meta.get("backtest_period", "")),
     }
     for key, val in params.items():
         if val:
@@ -110,7 +116,7 @@ def import_run(run_dir: Path, client, experiment_id: str) -> str:
     return "imported"
 
 
-def backfill(runs_dir: Path, symbol: str | None = None) -> None:
+def backfill(runs_dir: Path, symbol: str | None = None, force: bool = False) -> None:
     """Import all matching run archives into MLflow."""
     import mlflow
     from mlflow.tracking import MlflowClient
@@ -140,7 +146,7 @@ def backfill(runs_dir: Path, symbol: str | None = None) -> None:
         else:
             experiment_id = exp.experiment_id
 
-        status = import_run(run_dir, client, experiment_id)
+        status = import_run(run_dir, client, experiment_id, force=force)
         run_id_tag = meta.get("run_id", run_dir.name)
         print(f"  {status.upper()}: {run_id_tag} → experiment {experiment_name!r}")
 
@@ -157,6 +163,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--runs-dir", default=str(_RUNS_DIR), metavar="DIR",
         help=f"Directory containing run archives (default: {_RUNS_DIR}).",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Delete and re-import runs that already exist in MLflow.",
     )
     return parser.parse_args(argv)
 
@@ -175,10 +185,10 @@ def main(argv: list[str] | None = None) -> int:
         exp = mlflow.get_experiment_by_name(experiment_name)
         experiment_id = exp.experiment_id if exp else mlflow.create_experiment(experiment_name)
         client = MlflowClient()
-        status = import_run(run_dir, client, experiment_id)
+        status = import_run(run_dir, client, experiment_id, force=args.force)
         print(f"  {status.upper()}: {run_dir.name} → experiment {experiment_name!r}")
     else:
-        backfill(Path(args.runs_dir), symbol=args.symbol)
+        backfill(Path(args.runs_dir), symbol=args.symbol, force=args.force)
 
     print("Done. Run `mlflow ui` to browse experiments.")
     return 0
