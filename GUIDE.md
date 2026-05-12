@@ -1413,18 +1413,39 @@ python scripts/run_integration_test.py --symbols QQQ --config config_QQQ_test.ya
 # Compare all QQQ runs in the terminal
 python scripts/compare_runs.py --symbol QQQ
 
-# Visual comparison in MLflow UI
-mlflow ui  # open http://localhost:5000 → experiment "walkforward_QQQ"
+# Visual comparison in MLflow UI (use IP, not localhost — MLflow 3.x security middleware)
+mlflow ui  # open http://127.0.0.1:5000 → experiment "walkforward_QQQ"
 
-# Import existing archives (run once after install)
+# Import existing archives into MLflow (run once after install, or after adding a new archive)
 python scripts/backfill_mlflow.py --symbol QQQ
+
+# Re-import a run to pick up updated fields (e.g. after adding backtest_period/cli_command)
+python scripts/backfill_mlflow.py --symbol QQQ --force
 ```
 
+**What each MLflow run stores:**
+
+| Location | Field | Example |
+|----------|-------|---------|
+| Parameters | `backtest_period` | `2024-05-02 to 2026-05-08` |
+| Parameters | `train_days`, `test_days`, `step_days` | `365`, `63`, `21` |
+| Parameters | `initial_capital`, `wf_trials` | `100000.0`, `50` |
+| Tags | `cli_command` | exact command to reproduce the run |
+| Tags | `git_commit`, `git_branch` | `fa283217`, `features-request-2` |
+| Metrics | `sharpe_ratio`, `total_pnl`, `win_rate` | run-level summary |
+| Metrics (stepped) | `w_pnl`, `w_trades`, `w_win_rate` | per-window, at `step=window_id` |
+
 **Selecting the best run:** Sort by `sharpe_ratio` (default) in `compare_runs.py` or the MLflow UI table. The best run is the one with the highest Sharpe that also has reasonable trade count (≥ 30) and max_drawdown_pct < 20%.
+
+**Reproducing a past run:** Copy the `cli_command` tag from the MLflow run page and run it verbatim. The exact git commit is also stored — check it out first if exact reproducibility is needed.
 
 **Exporting params for production (paper trading):** Once you've chosen a run, export the most recently trained window's best params into a production config:
 
 ```bash
+# Preview the changes first (no file written)
+python scripts/export_production_params.py --symbol QQQ --dry-run
+
+# Write the production config
 python scripts/export_production_params.py \
     --run-dir reports/runs/QQQ_2Y_iron_condor_per_strategy_20260512 \
     --base-config config_QQQ_test.yaml \
@@ -1433,7 +1454,7 @@ python scripts/export_production_params.py \
 
 The script prints every changed parameter (old → new), the source window (e.g. W16, 8 trades, win_rate=75%), and the initial capital used during training. The `TradingOrchestrator` reads `config_QQQ_production.yaml` at startup — point `--config` at it and the paper account will use the optimized parameters.
 
-**Run naming convention:** Each archived run is named `{symbol}_{train_days}d_{strategy}_{YYYYMMDD}` (e.g. `QQQ_365d_iron_condor_20260512`). The date in the name is the run date, not the test period — use `run_metadata.json → backtest_period` for the actual data range.
+**Run naming convention:** Each archived run is named `{symbol}_{train_days}d_{strategy}_{YYYYMMDD}` (e.g. `QQQ_365d_iron_condor_20260512`). The date in the name is the run date, not the test period — use `run_metadata.json → backtest_period` (or the MLflow `backtest_period` param) for the actual data range.
 
 ### Manual Tuning (still valid for quick iteration)
 
