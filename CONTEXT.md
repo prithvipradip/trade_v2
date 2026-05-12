@@ -237,6 +237,10 @@ run_orchestrator.py          ← Master process (start here)
 - [x] Resumable studies via SQLite storage (`load_if_exists=True`)
 - [x] `run_optimizer.py` CLI
 - [x] `OptimizationResult` — summary table, JSON save, apply_to_config
+- [x] **Experiment tracking (MLflow)** — `run_integration_test.py` auto-logs each walk-forward run to MLflow experiment `walkforward_{symbol}` (local file backend, gitignored `mlruns/`). Params logged: `train_days`, `test_days`, `step_days`, `gap_days`, `wf_trials`, `strategy`, `initial_capital`, `position_size_pct`. Summary metrics: `total_pnl`, `win_rate`, `sharpe_ratio`, `max_drawdown_pct`, `total_trades`. Per-window step metrics at `step=window_id`. `scripts/backfill_mlflow.py` imports existing `reports/runs/` archives idempotently (supports older archives missing `initial_capital` via `config_snapshot.yaml` fallback).
+- [x] **Run archive** — each integration test run is permanently saved to `reports/runs/{run_id}/` (git-committed) containing per-window JSONs, equity curve, config snapshot, and `run_metadata.json` (includes `initial_capital`, `position_size_pct`, git commit/branch, and per-window `best_params`). `reports/integration_test/` remains ephemeral (gitignored).
+- [x] **Production param export** — `scripts/export_production_params.py` reads the last active window's `best_params` from a run archive, strips the `{strategy}__` prefix, maps to config sections, and writes a production-ready YAML (`config_{symbol}_production.yaml`). Prints a diff including initial capital and source window. Supports `--dry-run`.
+- [x] **Run comparison CLI** — `scripts/compare_runs.py --symbol QQQ` prints all archived runs sorted by sharpe, showing train/test/step days, initial capital, trades, win rate, sharpe, drawdown, and PnL.
 
 ### New Strategies (engine)
 - [x] `short_strangle` — sell OTM call + sell OTM put (no wings); IV-scaled delta: high IV → go further OTM; margin modeled as 20% of underlying per side
@@ -269,7 +273,9 @@ run_orchestrator.py          ← Master process (start here)
 - Sharpe 1.51
 - +49.62% alpha over buy-and-hold
 
-### QQQ integration test (2-yr walk-forward, 2024-2026, multi-strategy)
+### QQQ integration test (2-yr walk-forward, 2024-2026, iron_condor, per-strategy)
+- Archived: `reports/runs/QQQ_2Y_iron_condor_per_strategy_20260512/` (git commit fa28321)
+- MLflow experiment: `walkforward_QQQ` (run `mlflow ui` to browse; backfill via `scripts/backfill_mlflow.py`)
 - **−21% return** (18 windows, 50 Optuna trials each)
 - QQQ 2025 had multiple large directional moves (Liberation Day tariff shock in April, +15% recovery, further volatility Q3-Q4) that are hostile to iron condors
 - Iron_condor was the only profitable strategy (+$1.6K, ~36-40% win rate) across the test period

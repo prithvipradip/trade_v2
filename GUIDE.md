@@ -1395,6 +1395,46 @@ All three flags are optional — if omitted, the values are read from `optimize_
 
 **QQQ 2025 integration test findings (18-window walk-forward):** QQQ 2025 was a hostile environment for iron condors — multiple large directional moves (Liberation Day tariff shock −15% in April, subsequent recovery, further Q3 volatility). Iron_condor was the only profitable strategy (+$1.6K, ~40% win rate). All other strategies lost. The `min_confidence` cap at 0.70 was critical — without it, Optuna consistently selects 0.72–0.85 which results in 0 OOS trades per window. With the cap: 0 OOS trades → 3–5 OOS trades per window, and the optimization objective scores become meaningful (training Sharpe 15–50+). Poor overall return reflects the 2024–2026 period difficulty for options-selling strategies on QQQ, not a code defect.
 
+---
+
+### Experiment Comparison and Production Deployment
+
+**Running multiple experiments:** To compare different window configurations (train_days, test_days, step_days), run `run_integration_test.py` multiple times with different YAML configs. Each run is automatically archived under `reports/runs/{run_id}/` and logged to MLflow experiment `walkforward_{symbol}`.
+
+```bash
+# Run with default 365/63/21 config
+python scripts/run_integration_test.py --symbols QQQ --config config_QQQ_test.yaml \
+    --strategies iron_condor --skip-backfill
+
+# Run with shorter test window (edit config first: test_days=42, step_days=14)
+python scripts/run_integration_test.py --symbols QQQ --config config_QQQ_test.yaml \
+    --strategies iron_condor --skip-backfill
+
+# Compare all QQQ runs in the terminal
+python scripts/compare_runs.py --symbol QQQ
+
+# Visual comparison in MLflow UI
+mlflow ui  # open http://localhost:5000 → experiment "walkforward_QQQ"
+
+# Import existing archives (run once after install)
+python scripts/backfill_mlflow.py --symbol QQQ
+```
+
+**Selecting the best run:** Sort by `sharpe_ratio` (default) in `compare_runs.py` or the MLflow UI table. The best run is the one with the highest Sharpe that also has reasonable trade count (≥ 30) and max_drawdown_pct < 20%.
+
+**Exporting params for production (paper trading):** Once you've chosen a run, export the most recently trained window's best params into a production config:
+
+```bash
+python scripts/export_production_params.py \
+    --run-dir reports/runs/QQQ_2Y_iron_condor_per_strategy_20260512 \
+    --base-config config_QQQ_test.yaml \
+    --output config_QQQ_production.yaml
+```
+
+The script prints every changed parameter (old → new), the source window (e.g. W16, 8 trades, win_rate=75%), and the initial capital used during training. The `TradingOrchestrator` reads `config_QQQ_production.yaml` at startup — point `--config` at it and the paper account will use the optimized parameters.
+
+**Run naming convention:** Each archived run is named `{symbol}_{train_days}d_{strategy}_{YYYYMMDD}` (e.g. `QQQ_365d_iron_condor_20260512`). The date in the name is the run date, not the test period — use `run_metadata.json → backtest_period` for the actual data range.
+
 ### Manual Tuning (still valid for quick iteration)
 
 **Backtester CLI flags** (no restart needed):

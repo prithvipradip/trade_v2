@@ -21,6 +21,9 @@ models/
 logs/
 reports/integration_test/
 
+# MLflow experiment tracking (ephemeral; reports/runs/ is the git-committed archive)
+mlruns/
+
 # Secrets
 .env
 *.key

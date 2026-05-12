@@ -842,6 +842,166 @@ def _section_h_document(
 
 
 # ---------------------------------------------------------------------------
+# Section I — Archive run + MLflow logging
+# ---------------------------------------------------------------------------
+
+def _create_run_archive(
+    args: argparse.Namespace,
+    out: Path,
+    wf: dict,
+    wf_cfg_fields: dict,
+) -> Path | None:
+    """Copy integration-test outputs to a versioned reports/runs/ subdirectory
+    and log the run to MLflow.  Returns the archive path, or None on error."""
+    import shutil
+    import subprocess
+
+    try:
+        now_str = datetime.now(tz=timezone.utc).strftime("%Y%m%d")
+        symbol = args.symbols[0] if args.symbols else "UNKNOWN"
+        strategies_str = "_".join(sorted(args.strategies)) if args.strategies else "all"
+        run_id = f"{symbol}_{wf_cfg_fields.get('train_days',365)}d_{strategies_str}_{now_str}"
+
+        runs_dir = Path("reports/runs") / run_id
+        runs_dir.mkdir(parents=True, exist_ok=True)
+
+        # Copy all artifacts from integration_test output dir
+        for src in out.iterdir():
+            dst = runs_dir / src.name
+            if src.is_file():
+                shutil.copy2(src, dst)
+
+        # Config snapshot
+        cfg_src = Path(args.config)
+        if cfg_src.exists():
+            shutil.copy2(cfg_src, runs_dir / "config_snapshot.yaml")
+
+        # Git metadata
+        try:
+            git_branch = subprocess.check_output(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True
+            ).strip()
+            git_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], text=True
+            ).strip()
+        except Exception:
+            git_branch = "unknown"
+            git_commit = "unknown"
+
+        # Per-window data from window_*.json files
+        windows = []
+        for wf_file in sorted(runs_dir.glob("window_*.json")):
+            try:
+                w = json.loads(wf_file.read_text())
+                windows.append(w)
+            except Exception:
+                pass
+
+        # Compute date range from windows
+        dates = [w.get("test_start") for w in windows if w.get("test_start")]
+        dates += [w.get("test_end") for w in windows if w.get("test_end")]
+        backtest_period = f"{min(dates)} to {max(dates)}" if dates else "unknown"
+
+        active_windows = sum(1 for w in windows if w.get("trades", 0) > 0)
+
+        summary = {
+            "total_trades":    wf.get("total_trades", 0),
+            "total_pnl":       wf.get("total_return", 0.0) * wf_cfg_fields.get("initial_capital", 100_000),
+            "total_return_pct": 100 * wf.get("total_return", 0.0),
+            "win_rate":        wf.get("win_rate", 0.0),
+            "sharpe_ratio":    wf.get("sharpe_ratio", 0.0),
+            "max_drawdown_pct": abs(wf.get("max_drawdown", 0.0)),
+            "profit_factor":   0.0,
+        }
+
+        metadata = {
+            "run_id":           run_id,
+            "run_date":         datetime.now(tz=timezone.utc).strftime("%Y-%m-%d"),
+            "symbol":           symbol,
+            "strategy":         strategies_str,
+            "optimization":     "per_strategy",
+            "n_windows":        len(windows),
+            "active_windows":   active_windows,
+            "train_days":       wf_cfg_fields.get("train_days", 365),
+            "test_days":        wf_cfg_fields.get("test_days", 63),
+            "step_days":        wf_cfg_fields.get("step_days", 21),
+            "gap_days":         wf_cfg_fields.get("gap_days", 5),
+            "wf_trials":        wf_cfg_fields.get("optimize_n_trials", 50),
+            "initial_capital":  wf_cfg_fields.get("initial_capital", 100_000.0),
+            "position_size_pct": wf_cfg_fields.get("position_size_pct", 0.05),
+            "backtest_period":  backtest_period,
+            "git_branch":       git_branch,
+            "git_commit":       git_commit,
+            "summary":          summary,
+            "windows":          windows,
+        }
+
+        import json as _json
+        (runs_dir / "run_metadata.json").write_text(
+            _json.dumps(metadata, indent=2), encoding="utf-8"
+        )
+        print(f"\n  → Run archived: {runs_dir.resolve()}")
+        print(f"    run_id={run_id}, windows={len(windows)}, active={active_windows}, "
+              f"trades={wf.get('total_trades', 0)}")
+
+        # MLflow logging (optional — skipped gracefully if mlflow not installed)
+        try:
+            import mlflow
+            from mlflow.tracking import MlflowClient
+
+            mlflow.set_experiment(f"walkforward_{symbol}")
+            with mlflow.start_run(
+                run_name=run_id,
+                tags={
+                    "run_id": run_id, "symbol": symbol, "strategy": strategies_str,
+                    "git_commit": git_commit, "git_branch": git_branch,
+                },
+            ):
+                mlflow.log_params({
+                    "symbol":            symbol,
+                    "strategy":          strategies_str,
+                    "train_days":        wf_cfg_fields.get("train_days", 365),
+                    "test_days":         wf_cfg_fields.get("test_days", 63),
+                    "step_days":         wf_cfg_fields.get("step_days", 21),
+                    "gap_days":          wf_cfg_fields.get("gap_days", 5),
+                    "wf_trials":         wf_cfg_fields.get("optimize_n_trials", 50),
+                    "initial_capital":   wf_cfg_fields.get("initial_capital", 100_000.0),
+                    "position_size_pct": wf_cfg_fields.get("position_size_pct", 0.05),
+                    "optimization":      "per_strategy",
+                })
+                mlflow.log_metrics({
+                    "total_pnl":        summary["total_pnl"],
+                    "total_return_pct": summary["total_return_pct"],
+                    "win_rate":         summary["win_rate"],
+                    "sharpe_ratio":     summary["sharpe_ratio"],
+                    "max_drawdown_pct": summary["max_drawdown_pct"],
+                    "total_trades":     float(summary["total_trades"]),
+                })
+                for w in windows:
+                    step = w.get("window", 0)
+                    mlflow.log_metrics({
+                        "w_pnl":      w.get("pnl", 0.0),
+                        "w_trades":   float(w.get("trades", 0)),
+                        "w_win_rate": w.get("win_rate", 0.0),
+                        "w_sharpe":   w.get("sharpe", 0.0),
+                    }, step=step)
+                mlflow.log_artifacts(str(runs_dir))
+            print(f"    MLflow: logged to experiment 'walkforward_{symbol}'")
+        except ImportError:
+            pass  # mlflow not installed — silently skip
+        except Exception as e:
+            print(f"    MLflow logging skipped: {e}")
+
+        return runs_dir
+
+    except Exception as e:
+        print(f"\n  Archive ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -867,11 +1027,23 @@ async def _main(args: argparse.Namespace) -> int:
     # E & F — Walk-Forward + Ablation (shared data fetch so window counts match)
     wf: dict = {}
     ablation: dict = {}
+    wf_cfg_fields: dict = {}
     if not args.skip_walkforward:
         print("\nFetching daily OHLCV for walk-forward sections…")
         shared_daily_data = _fetch_daily_data(args)
         wf = await _section_e_walkforward(args, out, shared_daily_data)
         ablation = await _section_f_ablation(args, out, shared_daily_data)
+
+        # Capture WalkForwardConfig fields for archival
+        from ait.config.settings import load_settings
+        _bc = load_settings(args.config).backtest
+        _n_trials = args.wf_trials if args.wf_trials is not None else _bc.optimize_n_trials
+        wf_cfg_fields = {
+            "train_days": 365, "test_days": 63, "step_days": 21, "gap_days": 5,
+            "optimize_n_trials": _n_trials,
+            "initial_capital": _bc.initial_capital,
+            "position_size_pct": _bc.position_size_pct,
+        }
     else:
         print("\nSECTIONS E & F — Walk-forward SKIPPED (--skip-walkforward)")
 
@@ -881,6 +1053,10 @@ async def _main(args: argparse.Namespace) -> int:
     # H — Document
     elapsed = time.time() - t_start
     _section_h_document(args, out, qc, feat_health, ic_df, wf, ablation, elapsed)
+
+    # I — Archive + MLflow (only when walk-forward ran and produced trades)
+    if wf and "error" not in wf and wf.get("total_trades", 0) > 0:
+        _create_run_archive(args, out, wf, wf_cfg_fields)
 
     print(f"\n{'='*60}")
     print(f"Integration test complete in {elapsed/60:.1f} minutes.")
