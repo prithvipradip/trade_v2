@@ -21,8 +21,7 @@ models/
 logs/
 reports/integration_test/
 
-# MLflow experiment tracking (ephemeral; reports/runs/ is the git-committed archive)
-mlruns/
+# MLflow experiment tracking (data/mlflow.db + data/mlruns/ — covered by /data/ above)
 
 # Secrets
 .env

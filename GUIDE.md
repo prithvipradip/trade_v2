@@ -1414,7 +1414,8 @@ python scripts/run_integration_test.py --symbols QQQ --config config_QQQ_test.ya
 python scripts/compare_runs.py --symbol QQQ
 
 # Visual comparison in MLflow UI (use IP, not localhost — MLflow 3.x security middleware)
-mlflow ui  # open http://127.0.0.1:5000 → experiment "walkforward_QQQ"
+# MLFLOW_TRACKING_URI is set in .env — source it or pass --backend-store-uri directly:
+mlflow ui --backend-store-uri sqlite:///data/mlflow.db  # open http://127.0.0.1:5000
 
 # Import existing archives into MLflow (run once after install, or after adding a new archive)
 python scripts/backfill_mlflow.py --symbol QQQ
