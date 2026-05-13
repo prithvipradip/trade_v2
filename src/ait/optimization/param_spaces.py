@@ -16,7 +16,7 @@ FRACTAL_GATE_SPACE: dict[str, tuple] = {
 }
 
 IRON_CONDOR_SPACE: dict[str, tuple] = {
-    "min_confidence":       ("float", 0.55, 0.70),
+    "min_confidence":       ("float", 0.55, 0.65),
     "stop_loss_pct":        ("float", 0.30, 0.70),
     "profit_target_pct":    ("float", 0.30, 0.70),
     "trailing_stop_pct":    ("float", 0.15, 0.40),
