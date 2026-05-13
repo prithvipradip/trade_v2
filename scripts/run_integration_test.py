@@ -115,6 +115,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--gap-days", type=int, default=5,
         help="Purge gap between train end and test start (default: 5).",
     )
+    parser.add_argument(
+        "--optuna-seed", type=int, default=42,
+        help="TPESampler seed for Optuna reproducibility (default: 42).",
+    )
     _DEFAULT_STRATEGIES = [
         "iron_condor", "put_credit_spread", "short_strangle",
         "bull_call_spread", "bear_put_spread", "long_strangle",
@@ -567,6 +571,7 @@ async def _section_e_walkforward(
         optimize_n_trials=_n_trials,
         optimize_patience=_patience,
         optimize_min_trades=_min_trades,
+        optimize_seed=args.optuna_seed,
         initial_capital=_bc.initial_capital,
         position_size_pct=_bc.position_size_pct,
         wing_floor_dollars=_bc.wing_floor_dollars,
@@ -942,6 +947,7 @@ def _create_run_archive(
             f"--test-days {args.test_days}",
             f"--step-days {args.step_days}",
             f"--gap-days {args.gap_days}",
+            f"--optuna-seed {args.optuna_seed}",
         ]
         if args.wf_trials is not None:
             cli_parts.append(f"--wf-trials {args.wf_trials}")
@@ -950,6 +956,14 @@ def _create_run_archive(
         if args.skip_backfill:
             cli_parts.append("--skip-backfill")
         cli_command = " ".join(cli_parts)
+
+        # Serialize search space bounds for the strategies used in this run
+        from ait.optimization.param_spaces import STRATEGY_SPACES
+        search_space = {
+            strat: {k: list(v) for k, v in STRATEGY_SPACES[strat].items()}
+            for strat in args.strategies
+            if strat in STRATEGY_SPACES
+        }
 
         metadata = {
             "run_id":           run_id,
@@ -964,8 +978,10 @@ def _create_run_archive(
             "step_days":        wf_cfg_fields.get("step_days", 21),
             "gap_days":         wf_cfg_fields.get("gap_days", 5),
             "wf_trials":        wf_cfg_fields.get("optimize_n_trials", 50),
+            "optuna_seed":      wf_cfg_fields.get("optuna_seed", 42),
             "initial_capital":  wf_cfg_fields.get("initial_capital", 100_000.0),
             "position_size_pct": wf_cfg_fields.get("position_size_pct", 0.05),
+            "search_space":     search_space,
             "backtest_period":  backtest_period,
             "cli_command":      cli_command,
             "git_branch":       git_branch,
@@ -995,6 +1011,7 @@ def _create_run_archive(
                     "git_commit": git_commit, "git_branch": git_branch,
                 },
             ):
+                import json as _json_mlflow
                 mlflow.log_params({
                     "symbol":            symbol,
                     "strategy":          strategies_str,
@@ -1003,10 +1020,12 @@ def _create_run_archive(
                     "step_days":         wf_cfg_fields.get("step_days", 21),
                     "gap_days":          wf_cfg_fields.get("gap_days", 5),
                     "wf_trials":         wf_cfg_fields.get("optimize_n_trials", 50),
+                    "optuna_seed":       wf_cfg_fields.get("optuna_seed", 42),
                     "initial_capital":   wf_cfg_fields.get("initial_capital", 100_000.0),
                     "position_size_pct": wf_cfg_fields.get("position_size_pct", 0.05),
                     "optimization":      "per_strategy",
                     "backtest_period":   backtest_period,
+                    "search_space":      _json_mlflow.dumps(search_space),
                 })
                 mlflow.set_tag("cli_command", cli_command)
                 mlflow.log_metrics({
@@ -1084,6 +1103,7 @@ async def _main(args: argparse.Namespace) -> int:
             "step_days":  args.step_days,
             "gap_days":   args.gap_days,
             "optimize_n_trials": _n_trials,
+            "optuna_seed": args.optuna_seed,
             "initial_capital": _bc.initial_capital,
             "position_size_pct": _bc.position_size_pct,
         }

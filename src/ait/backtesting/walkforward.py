@@ -66,6 +66,7 @@ class WalkForwardConfig:
     optimize_n_trials: int = 50
     optimize_patience: int = 0       # 0 = disabled; N = stop after N non-improving trials
     optimize_min_trades: int = 10    # Penalise trials with fewer trades than this floor
+    optimize_seed: int = 42          # TPESampler seed — fix for reproducibility
     range_threshold_pct: float = 0.05  # Target move % for range model; links to strategy profitability
     hurst_regime_threshold: float = 0.20
     hurst_regime_penalty: float = 0.10
@@ -750,6 +751,7 @@ class WalkForwardBacktester:
                     min_trades=self._config.optimize_min_trades,
                     max_concurrent_positions=self._config.max_concurrent_positions,
                     max_entry_vol_annual=self._config.max_entry_vol_annual,
+                    seed=self._config.optimize_seed,
                 )
                 res = opt.run(data={symbol: train_df}, prior_params=warm)
                 all_best_params.update(res.best_params)

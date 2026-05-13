@@ -74,6 +74,9 @@ def import_run(run_dir: Path, client, experiment_id: str, force: bool = False) -
     if initial_capital is None:
         initial_capital = _read_initial_capital_from_snapshot(Path(run_dir))
 
+    search_space_raw = meta.get("search_space", {})
+    search_space_str = json.dumps(search_space_raw) if search_space_raw else ""
+
     params = {
         "symbol":             str(meta.get("symbol", "")),
         "strategy":           str(meta.get("strategy", "")),
@@ -82,10 +85,12 @@ def import_run(run_dir: Path, client, experiment_id: str, force: bool = False) -
         "step_days":          str(meta.get("step_days", "")),
         "gap_days":           str(meta.get("gap_days", "")),
         "wf_trials":          str(meta.get("wf_trials", "")),
+        "optuna_seed":        str(meta.get("optuna_seed", "")),
         "initial_capital":    str(float(initial_capital)) if initial_capital is not None else "",
         "position_size_pct":  str(meta.get("position_size_pct", "")),
         "optimization":       str(meta.get("optimization", "")),
         "backtest_period":    str(meta.get("backtest_period", "")),
+        "search_space":       search_space_str,
     }
     for key, val in params.items():
         if val:

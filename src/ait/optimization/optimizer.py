@@ -81,6 +81,7 @@ class StrategyOptimizer:
         min_trades: int = 10,
         max_concurrent_positions: int = 1,
         max_entry_vol_annual: float = 0.80,
+        seed: int = 42,
     ) -> None:
         if objective not in OBJECTIVES:
             raise ValueError(f"Unknown objective '{objective}'. Choose from: {list(OBJECTIVES)}")
@@ -105,6 +106,7 @@ class StrategyOptimizer:
         self._min_trades = min_trades
         self._max_concurrent_positions = max_concurrent_positions
         self._max_entry_vol_annual = max_entry_vol_annual
+        self._seed = seed
         self._data: dict[str, pd.DataFrame] = {}
 
     # ------------------------------------------------------------------
@@ -138,7 +140,7 @@ class StrategyOptimizer:
             study_name=self._study_name,
             storage=self._storage,
             load_if_exists=True,
-            sampler=optuna.samplers.TPESampler(seed=42),
+            sampler=optuna.samplers.TPESampler(seed=self._seed),
             pruner=optuna.pruners.MedianPruner(n_warmup_steps=1),
         )
 

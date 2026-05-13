@@ -26,5 +26,70 @@
     "max_drawdown_pct": 0.0006142969413201224,
     "profit_factor": 0.0
   },
-  "windows": []
+  "windows": [],
+  "optuna_seed": 42,
+  "search_space": {
+    "iron_condor": {
+      "min_confidence": [
+        "float",
+        0.55,
+        0.7
+      ],
+      "stop_loss_pct": [
+        "float",
+        0.3,
+        0.7
+      ],
+      "profit_target_pct": [
+        "float",
+        0.3,
+        0.7
+      ],
+      "trailing_stop_pct": [
+        "float",
+        0.15,
+        0.4
+      ],
+      "delta_short": [
+        "float",
+        0.15,
+        0.3
+      ],
+      "max_hold_days": [
+        "int",
+        14,
+        45
+      ],
+      "iv_floor": [
+        "float",
+        0.15,
+        0.4
+      ],
+      "wing_k": [
+        "float",
+        0.3,
+        2.0
+      ],
+      "max_entry_vol_annual": [
+        "float",
+        0.25,
+        0.9
+      ],
+      "hurst_regime_threshold": [
+        "float",
+        0.08,
+        0.3
+      ],
+      "hurst_regime_penalty": [
+        "float",
+        0.0,
+        0.25
+      ],
+      "multifractal_max_width": [
+        "float",
+        0.3,
+        0.65
+      ]
+    }
+  }
 }
