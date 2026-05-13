@@ -1,0 +1,30 @@
+{
+  "run_id": "QQQ_365d_iron_condor_20260513",
+  "run_date": "2026-05-13",
+  "symbol": "QQQ",
+  "strategy": "iron_condor",
+  "optimization": "per_strategy",
+  "n_windows": 0,
+  "active_windows": 0,
+  "train_days": 365,
+  "test_days": 42,
+  "step_days": 14,
+  "gap_days": 5,
+  "wf_trials": 50,
+  "initial_capital": 100000.0,
+  "position_size_pct": 0.05,
+  "backtest_period": "unknown",
+  "cli_command": "python scripts/run_integration_test.py --symbols QQQ --config config_QQQ_test.yaml --years 2 --port 4002 --strategies iron_condor --train-days 365 --test-days 42 --step-days 14 --gap-days 5 --wf-trials 50 --skip-backfill",
+  "git_branch": "features-request-2",
+  "git_commit": "0b132d7cf54356285be21222e146e11909ea73aa",
+  "summary": {
+    "total_trades": 13,
+    "total_pnl": 8114.698913568005,
+    "total_return_pct": 8.114698913568006,
+    "win_rate": 0.9230769230769231,
+    "sharpe_ratio": 25.35324024360863,
+    "max_drawdown_pct": 0.0006142969413201224,
+    "profit_factor": 0.0
+  },
+  "windows": []
+}

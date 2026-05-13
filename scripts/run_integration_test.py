@@ -99,6 +99,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--wf-min-trades", type=int, default=None,
         help="Min trades floor for objective penalty (default: from config optimize_min_trades, fallback 10).",
     )
+    parser.add_argument(
+        "--train-days", type=int, default=365,
+        help="Walk-forward training window in calendar days (default: 365).",
+    )
+    parser.add_argument(
+        "--test-days", type=int, default=63,
+        help="Walk-forward test window in calendar days (default: 63).",
+    )
+    parser.add_argument(
+        "--step-days", type=int, default=21,
+        help="Days to advance each walk-forward window (default: 21).",
+    )
+    parser.add_argument(
+        "--gap-days", type=int, default=5,
+        help="Purge gap between train end and test start (default: 5).",
+    )
     _DEFAULT_STRATEGIES = [
         "iron_condor", "put_credit_spread", "short_strangle",
         "bull_call_spread", "bear_put_spread", "long_strangle",
@@ -543,10 +559,10 @@ async def _section_e_walkforward(
     print(f"{'='*60}")
 
     config = WalkForwardConfig(
-        train_days=365,
-        test_days=63,
-        step_days=21,
-        gap_days=5,
+        train_days=args.train_days,
+        test_days=args.test_days,
+        step_days=args.step_days,
+        gap_days=args.gap_days,
         optimize_per_window=True,
         optimize_n_trials=_n_trials,
         optimize_patience=_patience,
@@ -612,10 +628,10 @@ async def _section_f_ablation(
     _min_trades = args.wf_min_trades if args.wf_min_trades is not None else _bc.optimize_min_trades
 
     config = WalkForwardConfig(
-        train_days=365,
-        test_days=63,
-        step_days=21,
-        gap_days=5,
+        train_days=args.train_days,
+        test_days=args.test_days,
+        step_days=args.step_days,
+        gap_days=args.gap_days,
         optimize_per_window=False,
         optimize_min_trades=_min_trades,
         initial_capital=_bc.initial_capital,
@@ -922,6 +938,10 @@ def _create_run_archive(
             f"--years {args.years:.0f}",
             f"--port {args.port}",
             f"--strategies {' '.join(args.strategies)}",
+            f"--train-days {args.train_days}",
+            f"--test-days {args.test_days}",
+            f"--step-days {args.step_days}",
+            f"--gap-days {args.gap_days}",
         ]
         if args.wf_trials is not None:
             cli_parts.append(f"--wf-trials {args.wf_trials}")
@@ -1059,7 +1079,10 @@ async def _main(args: argparse.Namespace) -> int:
         _bc = load_settings(args.config).backtest
         _n_trials = args.wf_trials if args.wf_trials is not None else _bc.optimize_n_trials
         wf_cfg_fields = {
-            "train_days": 365, "test_days": 63, "step_days": 21, "gap_days": 5,
+            "train_days": args.train_days,
+            "test_days":  args.test_days,
+            "step_days":  args.step_days,
+            "gap_days":   args.gap_days,
             "optimize_n_trials": _n_trials,
             "initial_capital": _bc.initial_capital,
             "position_size_pct": _bc.position_size_pct,
