@@ -16,7 +16,9 @@ FRACTAL_GATE_SPACE: dict[str, tuple] = {
 }
 
 IRON_CONDOR_SPACE: dict[str, tuple] = {
-    "min_confidence":       ("float", 0.55, 0.65),
+    # min_confidence and max_entry_vol_annual intentionally excluded — they are regime
+    # filters whose in-sample optima don't generalise OOS (overfitting pressure sink).
+    # They remain fixed at config defaults (0.55 and 0.80 respectively).
     "stop_loss_pct":        ("float", 0.30, 0.70),
     "profit_target_pct":    ("float", 0.30, 0.70),
     "trailing_stop_pct":    ("float", 0.15, 0.40),
@@ -24,7 +26,6 @@ IRON_CONDOR_SPACE: dict[str, tuple] = {
     "max_hold_days":        ("int",   14,   45),
     "iv_floor":             ("float", 0.15, 0.40),
     "wing_k":               ("float", 0.30, 2.00),
-    "max_entry_vol_annual": ("float", 0.45, 0.90),
     **FRACTAL_GATE_SPACE,
 }
 
