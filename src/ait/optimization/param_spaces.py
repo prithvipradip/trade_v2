@@ -24,7 +24,7 @@ IRON_CONDOR_SPACE: dict[str, tuple] = {
     "max_hold_days":        ("int",   14,   45),
     "iv_floor":             ("float", 0.15, 0.40),
     "wing_k":               ("float", 0.30, 2.00),
-    "max_entry_vol_annual": ("float", 0.25, 0.90),
+    "max_entry_vol_annual": ("float", 0.45, 0.90),
     **FRACTAL_GATE_SPACE,
 }
 

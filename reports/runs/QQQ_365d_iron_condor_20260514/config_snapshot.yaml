@@ -1,0 +1,127 @@
+# ============================================================
+# AIT v2 - QQQ Integration Test Configuration
+# ============================================================
+# Changes from config.yaml:
+#   trading.universe:           [QQQ]    (single ticker test)
+#   backtest.initial_capital:   100000   (standard account — QQQ options are expensive)
+#   backtest.position_size_pct: 0.05     (5% = $5,000/position, fits 1–2 QQQ iron condors)
+#   backtest.wing_floor_dollars: 5.00    (QQQ $480–520; $5 wings are standard and viable)
+#   backtest.iv_floor:          0.20     (QQQ has healthy implied volatility)
+# ============================================================
+
+trading:
+  mode: paper
+  universe: [QQQ]
+  scan_interval_seconds: 300
+  max_daily_trades: 5
+  trading_hours_only: true
+
+account:
+  pdt_protection: true
+  pdt_account_under_25k: false
+
+positions:
+  max_open_positions: 5
+  max_position_pct: 0.05
+  max_portfolio_delta: 0.30
+  max_portfolio_risk_pct: 0.02
+
+risk:
+  max_daily_loss_pct: 0.02
+  max_consecutive_losses: 3
+  pause_minutes_after_losses: 30
+  max_api_failures: 5
+  min_confidence: 0.65
+
+options:
+  delta_range: [0.20, 0.50]
+  dte_range: [14, 45]
+  min_open_interest: 100
+  min_volume: 50
+  max_bid_ask_spread_pct: 0.10
+  strategies:
+    - long_call
+    - long_put
+    - covered_call
+    - cash_secured_put
+    - bull_call_spread
+    - bear_put_spread
+    - iron_condor
+    - long_straddle
+    - short_strangle
+    - calendar_spread
+
+backtest:
+  initial_capital: 100000             # Standard account ($100k) — QQQ options require real buying power
+  position_size_pct: 0.05             # 5% = $5,000/position, fits 1–2 QQQ iron condors comfortably
+  wing_floor_dollars: 5.00            # Hard minimum spread width (safety floor only)
+  wing_k: 1.0                         # Vol-scaled wing multiplier (Optuna optimizes per window)
+                                       # At QQQ~$500, IV~20%, DTE=30: expected wing ≈ $26 >> $5 floor
+  iv_floor: 0.20                      # Min synthetic IV (QQQ typically has IV > 20% in normal markets)
+  delta_iv_scale: 0.0                 # IV-driven delta scaling for strangles: 0=static, 1=full IV response
+  max_concurrent_positions: 3         # Max simultaneous open positions
+  max_entry_vol_annual: 0.80          # Skip iron condor entry when 10-day annualized vol > threshold
+  optimize_n_trials: 50               # Optuna trials per walk-forward window
+  optimize_patience: 20               # Early stopping: halt after N consecutive non-improving trials (0=disabled)
+  optimize_min_trades: 10             # Min trades for full score; < 3 → always −100; 3–9 → quadratic penalty
+
+ml:
+  ensemble_weights:
+    xgboost: 0.5
+    lightgbm: 0.5
+  retrain_interval_days: 7
+  lookback_days: 504
+  min_training_samples: 100
+
+meta_label:
+  enabled: false
+  min_probability: 0.50
+  retrain_with_primary: true
+
+exit:
+  trailing_stop_pct: 0.25
+  breakeven_trigger_pct: 0.30
+  initial_stop_loss_pct: 0.50
+  partial_exit_levels:
+    - pnl_pct: 0.50
+      close_pct: 0.33
+    - pnl_pct: 1.00
+      close_pct: 0.33
+  time_decay_scaling: true
+  volatility_adjusted_stops: true
+  auto_hedge: false
+
+learning:
+  enabled: true
+  lookback_days: 30
+  max_adaptations_per_cycle: 3
+  min_insight_confidence: 0.60
+  min_confidence_floor: 0.50
+  min_confidence_ceiling: 0.90
+
+sentiment:
+  enabled: true
+  weight: 0.20
+  cache_ttl_seconds: 300
+  sources:
+    news: true
+    fear_greed: true
+    finbert: true
+
+notifications:
+  telegram:
+    enabled: true
+    send_trades: true
+    send_errors: true
+    send_daily_summary: true
+    send_circuit_breaker: true
+
+dashboard:
+  enabled: true
+  port: 8501
+
+logging:
+  level: INFO
+  file: logs/ait.log
+  max_bytes: 10485760
+  backup_count: 5
