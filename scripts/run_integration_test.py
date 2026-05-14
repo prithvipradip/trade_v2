@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -603,6 +604,7 @@ async def _section_e_walkforward(
             "win_rate": result.win_rate,
             "consistency": result.consistency,
             "n_windows": len(result.windows),
+            "profit_factor": result.profit_factor,
         }
 
     except Exception as e:
@@ -878,7 +880,7 @@ def _create_run_archive(
     import subprocess
 
     try:
-        now_str = datetime.now(tz=timezone.utc).strftime("%Y%m%d")
+        now_str = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M")
         symbol = args.symbols[0] if args.symbols else "UNKNOWN"
         strategies_str = "_".join(sorted(args.strategies)) if args.strategies else "all"
         run_id = f"{symbol}_{wf_cfg_fields.get('train_days',365)}d_{strategies_str}_{now_str}"
@@ -911,7 +913,7 @@ def _create_run_archive(
 
         # Per-window data from window_*.json files
         windows = []
-        for wf_file in sorted(runs_dir.glob("window_*.json")):
+        for wf_file in sorted(out.glob("window_*.json")):
             try:
                 w = json.loads(wf_file.read_text())
                 windows.append(w)
@@ -932,7 +934,7 @@ def _create_run_archive(
             "win_rate":        wf.get("win_rate", 0.0),
             "sharpe_ratio":    wf.get("sharpe_ratio", 0.0),
             "max_drawdown_pct": abs(wf.get("max_drawdown", 0.0)),
-            "profit_factor":   0.0,
+            "profit_factor":   wf.get("profit_factor", 0.0),
         }
 
         # Reconstruct the CLI command from args for reproducibility
@@ -990,9 +992,8 @@ def _create_run_archive(
             "windows":          windows,
         }
 
-        import json as _json
         (runs_dir / "run_metadata.json").write_text(
-            _json.dumps(metadata, indent=2), encoding="utf-8"
+            json.dumps(metadata, indent=2), encoding="utf-8"
         )
         print(f"\n  → Run archived: {runs_dir.resolve()}")
         print(f"    run_id={run_id}, windows={len(windows)}, active={active_windows}, "
@@ -1003,6 +1004,11 @@ def _create_run_archive(
             import mlflow
             from mlflow.tracking import MlflowClient
 
+            tracking_uri = (
+                __import__("os").environ.get("MLFLOW_TRACKING_URI")
+                or "sqlite:///data/mlflow.db"
+            )
+            mlflow.set_tracking_uri(tracking_uri)
             mlflow.set_experiment(f"walkforward_{symbol}")
             with mlflow.start_run(
                 run_name=run_id,
@@ -1011,7 +1017,6 @@ def _create_run_archive(
                     "git_commit": git_commit, "git_branch": git_branch,
                 },
             ):
-                import json as _json_mlflow
                 mlflow.log_params({
                     "symbol":            symbol,
                     "strategy":          strategies_str,
@@ -1025,7 +1030,7 @@ def _create_run_archive(
                     "position_size_pct": wf_cfg_fields.get("position_size_pct", 0.05),
                     "optimization":      "per_strategy",
                     "backtest_period":   backtest_period,
-                    "search_space":      _json_mlflow.dumps(search_space),
+                    "search_space":      json.dumps(search_space),
                 })
                 mlflow.set_tag("cli_command", cli_command)
                 mlflow.log_metrics({
