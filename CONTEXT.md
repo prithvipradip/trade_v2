@@ -228,7 +228,8 @@ run_orchestrator.py          ← Master process (start here)
 - [x] Early stopping — `_EarlyStopCallback` halts a window study after `optimize_patience` consecutive non-improving trials (0 = disabled)
 - [x] Conditional warm-start — enqueues prior window's best params if OOS `win_rate ≥ 75%` AND `total_trades ≥ 3` (lowered from 5 to prevent cascade cold-starts when windows have few but perfect trades); falls back to globally best params if direct warm-start fails
 - [x] `range_threshold_pct` config field; `RangePredictor` `horizon_days` auto-linked to `max_hold_days` per window
-- [x] `min_confidence` search range capped at 0.70 (upper bound) across all strategy spaces — prevents Optuna from selecting values of 0.72–0.85 that generate 0 OOS trades in 63-day test windows
+- [x] `min_confidence` search range capped at 0.70 (upper bound) for strategies that include it — prevents Optuna from selecting values of 0.72–0.85 that generate 0 OOS trades in 63-day test windows
+- [x] **`min_confidence` and `max_entry_vol_annual` removed from `IRON_CONDOR_SPACE`** — Experiments 2–4 showed Optuna reliably finds degenerate in-sample solutions via these regime-filter params (parking `min_confidence` at ceiling or `max_entry_vol_annual` at floor blocks all OOS trades). Removing them from iron_condor's search space (Experiment 5) yielded +183% OOS return vs +9% ablation. Both params remain active at config defaults; they are simply not searchable for iron_condor.
 - [x] `max_concurrent_positions` — wires up pre-existing `WalkForwardConfig` field (was defined but unused); engine now allows N simultaneous positions; default 3 in config (was blocked by `if open_positions: continue`)
 - [x] `max_entry_vol_annual` — hard realized-vol gate for iron condor / short strangle entries; skip when 10-day annualized realized vol exceeds threshold; Optuna-tuned per window [0.25, 0.90]
 - [x] Global best params fallback — `WalkForwardBacktester` tracks the highest-scoring OOS params seen across all windows (score = `win_rate × √(min(1, trades/5))`); when direct warm-start fails, seeds Optuna from this global reference instead of cold-starting blind, breaking the cascade of 0-trade windows
@@ -237,8 +238,8 @@ run_orchestrator.py          ← Master process (start here)
 - [x] Resumable studies via SQLite storage (`load_if_exists=True`)
 - [x] `run_optimizer.py` CLI
 - [x] `OptimizationResult` — summary table, JSON save, apply_to_config
-- [x] **Experiment tracking (MLflow)** — `run_integration_test.py` auto-logs each walk-forward run to MLflow experiment `walkforward_{symbol}` (local file backend, gitignored `mlruns/`). Params logged: `train_days`, `test_days`, `step_days`, `gap_days`, `wf_trials`, `strategy`, `initial_capital`, `position_size_pct`, `backtest_period` (e.g. `2024-05-02 to 2026-05-08`). Tags: `cli_command` (exact command to reproduce the run), `git_commit`, `git_branch`, `optimization`. Summary metrics: `total_pnl`, `win_rate`, `sharpe_ratio`, `max_drawdown_pct`, `total_trades`. Per-window step metrics at `step=window_id`. `scripts/backfill_mlflow.py --symbol QQQ` imports existing `reports/runs/` archives idempotently; `--force` deletes and re-imports to pick up updated fields. Older archives missing `initial_capital` fall back to `config_snapshot.yaml`. MLflow backend: `data/mlflow.db` (SQLite) + `data/mlruns/` artifacts — both covered by the `/data/` gitignore; `MLFLOW_TRACKING_URI=sqlite:///data/mlflow.db` is set in `.env`. UI: `mlflow ui --backend-store-uri sqlite:///data/mlflow.db` then open `http://127.0.0.1:5000` (use IP, not `localhost`, due to MLflow 3.x security middleware).
-- [x] **Run archive** — each integration test run is permanently saved to `reports/runs/{run_id}/` (git-committed) containing per-window JSONs, equity curve, config snapshot, and `run_metadata.json` (includes `initial_capital`, `position_size_pct`, git commit/branch, and per-window `best_params`). `reports/integration_test/` remains ephemeral (gitignored).
+- [x] **Experiment tracking (MLflow)** — `run_integration_test.py` auto-logs each walk-forward run to MLflow experiment `walkforward_{symbol}`. Both `run_integration_test.py` and `backfill_mlflow.py` write to the same database: `data/mlflow.db` (override with `MLFLOW_TRACKING_URI` env var). Params logged: `train_days`, `test_days`, `step_days`, `gap_days`, `wf_trials`, `strategy`, `initial_capital`, `position_size_pct`, `backtest_period` (e.g. `2024-05-02 to 2026-05-08`). Tags: `cli_command`, `git_commit`, `git_branch`, `optimization`. Summary metrics: `total_pnl`, `win_rate`, `sharpe_ratio`, `max_drawdown_pct`, `total_trades`, `profit_factor`. Per-window step metrics (`w_pnl`, `w_trades`, `w_win_rate`, `w_sharpe`) at `step=window_id`. `scripts/backfill_mlflow.py --symbol QQQ` imports existing `reports/runs/` archives idempotently; `--force` deletes and re-imports. UI: `mlflow ui --backend-store-uri sqlite:///data/mlflow.db --port 5001` then open `http://127.0.0.1:5001` (use IP, not `localhost`, due to MLflow 3.x security middleware; port 5000 is blocked by Chrome on macOS).
+- [x] **Run archive** — each integration test run is permanently saved to `reports/runs/{run_id}/` (git-committed) containing per-window JSONs, equity curve, config snapshot, and `run_metadata.json` (includes `initial_capital`, `position_size_pct`, git commit/branch, per-window `best_params`, `n_windows`, `active_windows`, and `profit_factor`). Run ID format: `{symbol}_{train_days}d_{strategy}_{YYYYMMDD_HHMM}` (UTC, includes hour+minute to prevent same-day collisions). `reports/integration_test/` remains ephemeral (gitignored).
 - [x] **Production param export** — `scripts/export_production_params.py` reads the last active window's `best_params` from a run archive, strips the `{strategy}__` prefix, maps to config sections, and writes a production-ready YAML (`config_{symbol}_production.yaml`). Prints a diff including initial capital and source window. Supports `--dry-run`.
 - [x] **Run comparison CLI** — `scripts/compare_runs.py --symbol QQQ` prints all archived runs sorted by sharpe, showing train/test/step days, initial capital, trades, win rate, sharpe, drawdown, and PnL.
 
@@ -273,15 +274,26 @@ run_orchestrator.py          ← Master process (start here)
 - Sharpe 1.51
 - +49.62% alpha over buy-and-hold
 
-### QQQ integration test (2-yr walk-forward, 2024-2026, iron_condor, per-strategy)
-- Archived: `reports/runs/QQQ_2Y_iron_condor_per_strategy_20260512/` (git commit fa28321)
-- MLflow experiment: `walkforward_QQQ` (run `mlflow ui` to browse; backfill via `scripts/backfill_mlflow.py`)
-- **−21% return** (18 windows, 50 Optuna trials each)
-- QQQ 2025 had multiple large directional moves (Liberation Day tariff shock in April, +15% recovery, further volatility Q3-Q4) that are hostile to iron condors
-- Iron_condor was the only profitable strategy (+$1.6K, ~36-40% win rate) across the test period
-- Directional fallback strategies (bear_put_spread, bull_call_spread) lost heavily because ML model directional accuracy is ~22% (too low for reliable directional bets)
-- Range predictor gate (52% accuracy) blocks iron_condors in volatile conditions — no fallback to directional strategies (directional fallback was tried and reverted; it worsened total losses by $35K)
-- **Key lesson**: Iron condors are the reliable core; directional/volatility strategies require significantly higher ML directional accuracy to be profitable
+### QQQ integration tests (28-window walk-forward, 365/42/14/5 config, 2024-2026)
+
+Five experiments were run to diagnose optimizer overfitting. All use iron_condor, 50 Optuna trials/window, per-strategy optimization.
+
+| Archive | Config | Optimized | Ablation | Sharpe | Trades | Profit Factor |
+|---|---|---|---|---|---|---|
+| `QQQ_2Y_iron_condor_per_strategy_20260512` | 365d/63d, all params | −21% | ~+9% | — | — | — |
+| `QQQ_365d_iron_condor_20260513_1831` | 365d/42d, all params | ~0% | — | — | — | 0.0 |
+| `QQQ_365d_iron_condor_20260514_1308` | 365d/42d, all params | −16% | ~+9% | — | ~2 | 63.87 |
+| `QQQ_365d_iron_condor_20260514_2359` | 365d/42d, +vol gate | −21% | ~+9% | — | ~9 | 6.55 |
+| **`QQQ_365d_iron_condor_20260514_1142`** | **365d/42d, no regime filters** | **+183%** | **+9%** | **23.95** | **91** | **89.39** |
+
+MLflow experiment: `walkforward_QQQ` (browse via `mlflow ui --backend-store-uri sqlite:///data/mlflow.db --port 5001`; backfill via `scripts/backfill_mlflow.py`).
+
+**Root cause of Experiments 1–4 failure:** Optuna found degenerate in-sample solutions by parking `min_confidence` at ceiling or `max_entry_vol_annual` at floor — blocking all OOS trades per window. **Fix (Experiment 5):** removed both from the iron_condor search space. Params remain fixed at config defaults; they are simply not searchable.
+
+**Key lessons:**
+- Regime-filter params (`min_confidence`, `max_entry_vol_annual`) are overfitting pressure sinks — exclude from optimizer search space for iron_condor
+- Iron condors are the reliable core for QQQ; directional strategies require significantly higher ML directional accuracy (~22% is too low)
+- Ablation (+9%) shows market baseline; optimization (+183%) demonstrates genuine edge when search space is correctly scoped
 
 ### Small account ($700)
 - Backtest pending...
@@ -394,4 +406,4 @@ Secrets in `.env`:
 
 ---
 
-*Last updated: 2026-05-08*
+*Last updated: 2026-05-14*

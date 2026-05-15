@@ -1351,13 +1351,16 @@ Each strategy has a defined search space in `param_spaces.py`:
 |---|---|---|
 | `delta_short` | float [0.15, 0.30] | Delta of the short call and put legs |
 | `max_hold_days` | int [14, 45] | Entry DTE / max hold duration |
-| `min_confidence` | float [0.55, 0.70] | ML confidence gate before entering. Upper bound capped at 0.70 — values above 0.70 were empirically found to produce 0 OOS trades in 63-day test windows (Optuna would otherwise converge to 0.72–0.85, making the strategy too selective). |
 | `stop_loss_pct` | float [0.30, 0.70] | Exit when unrealised loss reaches this % of premium |
 | `profit_target_pct` | float [0.30, 0.70] | Exit at this % profit (no arbitrary 50% cap) |
 | `trailing_stop_pct` | float [0.15, 0.40] | Trail behind HWM once breakeven is triggered |
 | `iv_floor` | float [0.15, 0.40] | Minimum IV used in Black-Scholes pricing |
 | `wing_k` | float [0.30, 2.00] | Vol-scaled wing multiplier — iron condor and put_credit_spread only. 1.0 = 1-sigma expected move. |
-| `max_entry_vol_annual` | float [0.25, 0.90] | Hard realized-vol gate: skip iron condor / short strangle entry when 10-day annualized vol exceeds threshold. Prevents entries during Liberation Day-style vol spikes. |
+| `hurst_regime_threshold` | float [0.08, 0.30] | Fractal gate: min Hurst exponent required to enter |
+| `hurst_regime_penalty` | float [0.00, 0.25] | Score penalty when Hurst is near the threshold |
+| `multifractal_max_width` | float [0.30, 0.65] | Fractal gate: max multifractal spectrum width allowed |
+
+> **`min_confidence` and `max_entry_vol_annual` are intentionally excluded from the iron condor search space.** Experiments 2–4 showed that Optuna reliably finds degenerate in-sample solutions by parking `min_confidence` at ceiling (0.70) or `max_entry_vol_annual` at floor, which blocks all OOS trades across consecutive test windows. Removing both from the search space (Experiment 5) produced +183% OOS return vs +9% ablation baseline — the first experiment where optimization dramatically outperformed no-optimization. Both parameters remain active at their config defaults (`min_confidence=0.55`, `max_entry_vol_annual=0.80`); they are simply not searchable. `min_confidence` remains in the search space for debit strategies (`long_call`, `long_put`, `bull_call_spread`, `bear_put_spread`) and `short_strangle`, where overfitting pressure is lower.
 
 Debit strategies (`long_call`, `long_put`, `bull_call_spread`, `bear_put_spread`) also search over `delta_long` [0.25–0.55] and `max_hold_days` [14–60].
 
@@ -1393,7 +1396,18 @@ All three flags are optional — if omitted, the values are read from `optimize_
 
 **Range predictor gate:** For iron_condor and short_strangle, the engine calls the range predictor before entering. If `P(in_range) < range_min_confidence` (default 0.55), the signal is skipped entirely — no fallback to directional strategies. Directional strategies (bear_put_spread, bull_call_spread, long_strangle) were tested as range-gate fallbacks but produced consistent losses because the ML model's directional accuracy (~22%) is too low to support them. The correct behaviour when iron_condor is blocked is to pass on the trade.
 
-**QQQ 2025 integration test findings (18-window walk-forward):** QQQ 2025 was a hostile environment for iron condors — multiple large directional moves (Liberation Day tariff shock −15% in April, subsequent recovery, further Q3 volatility). Iron_condor was the only profitable strategy (+$1.6K, ~40% win rate). All other strategies lost. The `min_confidence` cap at 0.70 was critical — without it, Optuna consistently selects 0.72–0.85 which results in 0 OOS trades per window. With the cap: 0 OOS trades → 3–5 OOS trades per window, and the optimization objective scores become meaningful (training Sharpe 15–50+). Poor overall return reflects the 2024–2026 period difficulty for options-selling strategies on QQQ, not a code defect.
+**QQQ 2025 integration test findings (28-window walk-forward, 365/42/14/5 config):** Five experiments were run on QQQ 2024–2026 to diagnose and fix optimizer overfitting:
+
+| Experiment | Search space | Optimized return | Ablation return | Trades | Sharpe |
+|---|---|---|---|---|---|
+| Exp 2 (baseline) | All params incl. `min_confidence` + `max_entry_vol_annual` | ~0% (0 trades, most windows) | — | — | — |
+| Exp 3 | Same | −16% | ~+9% | ~2 | — |
+| Exp 4 | Added vol gate | −21% | ~+9% | ~9 | — |
+| **Exp 5** | **Removed `min_confidence` + `max_entry_vol_annual` from iron_condor** | **+183%** | **+9%** | **91** | **23.95** |
+
+**Root cause of Experiments 2–4 failure:** Optuna found degenerate in-sample solutions by maximising `min_confidence` toward the ceiling or driving `max_entry_vol_annual` to the floor, which blocked all OOS trades. With 0 OOS trades the objective is undefined and any comparison is meaningless. Removing both regime filters from the search space entirely resolved this — the optimizer could only tune structural parameters (delta, hold days, stops, wing width), producing genuine edge.
+
+**Fix:** `min_confidence` and `max_entry_vol_annual` are fixed at config defaults for iron_condor and no longer searchable. See the Parameter Spaces table above.
 
 ---
 
@@ -1434,8 +1448,8 @@ python scripts/backfill_mlflow.py --symbol QQQ --force
 | Parameters | `initial_capital`, `wf_trials` | `100000.0`, `50` |
 | Tags | `cli_command` | exact command to reproduce the run |
 | Tags | `git_commit`, `git_branch` | `fa283217`, `features-request-2` |
-| Metrics | `sharpe_ratio`, `total_pnl`, `win_rate` | run-level summary |
-| Metrics (stepped) | `w_pnl`, `w_trades`, `w_win_rate` | per-window, at `step=window_id` |
+| Metrics | `sharpe_ratio`, `total_pnl`, `win_rate`, `profit_factor` | run-level summary |
+| Metrics (stepped) | `w_pnl`, `w_trades`, `w_win_rate`, `w_sharpe` | per-window, at `step=window_id` |
 
 **Selecting the best run:** Sort by `sharpe_ratio` (default) in `compare_runs.py` or the MLflow UI table. The best run is the one with the highest Sharpe that also has reasonable trade count (≥ 30) and max_drawdown_pct < 20%.
 
@@ -1456,7 +1470,9 @@ python scripts/export_production_params.py \
 
 The script prints every changed parameter (old → new), the source window (e.g. W16, 8 trades, win_rate=75%), and the initial capital used during training. The `TradingOrchestrator` reads `config_QQQ_production.yaml` at startup — point `--config` at it and the paper account will use the optimized parameters.
 
-**Run naming convention:** Each archived run is named `{symbol}_{train_days}d_{strategy}_{YYYYMMDD}` (e.g. `QQQ_365d_iron_condor_20260512`). The date in the name is the run date, not the test period — use `run_metadata.json → backtest_period` (or the MLflow `backtest_period` param) for the actual data range.
+**Run naming convention:** Each archived run is named `{symbol}_{train_days}d_{strategy}_{YYYYMMDD_HHMM}` (e.g. `QQQ_365d_iron_condor_20260514_1142`). The timestamp is UTC and includes hour+minute to prevent collisions when multiple experiments run on the same calendar day. The date in the name is the archive date, not the test period — use `run_metadata.json → backtest_period` (or the MLflow `backtest_period` param) for the actual data range.
+
+**MLflow tracking URI:** `run_integration_test.py` writes to `data/mlflow.db` by default (same as `backfill_mlflow.py`). Override with `MLFLOW_TRACKING_URI` env var if needed. Do not delete `mlflow.db` from the project root if it exists — it is a stale artifact from before this fix and can be removed.
 
 ### Manual Tuning (still valid for quick iteration)
 
