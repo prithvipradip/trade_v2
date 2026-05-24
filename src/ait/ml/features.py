@@ -382,9 +382,32 @@ class FeatureEngine:
 
         return features
 
-    def get_feature_names(self) -> list[str]:
-        """Get list of all feature column names (excluding OHLCV)."""
-        return [
+    # The 26 VLMC / intraday feature names produced by compute_intraday_features().
+    # Returned by get_feature_names() when an intraday_store was used during compute().
+    VLMC_FEATURE_NAMES: list[str] = [
+        # Original 6 intraday features
+        "intraday_vwap_position", "intraday_rsi", "intraday_momentum_1h",
+        "intraday_atr_pct", "intraday_vol_ratio", "intraday_range_compression",
+        # Phase 6a: intraday fractal (7 features)
+        "hurst_wavelet_intraday", "hurst_scale_spread_intraday",
+        "wavelet_L3_energy", "wavelet_L4_energy", "wavelet_L5_energy",
+        "psd_beta_intraday", "mfdfa_width_intraday",
+        # Phase 6b: VLMC session structure (13 features)
+        "session_vwap_position", "session_vwap_q1", "session_vwap_q2", "session_vwap_q3",
+        "session_high_timing", "session_low_timing",
+        "session_volume_front_load", "session_volume_shape",
+        "power_hour_momentum", "power_hour_vol_accel", "power_hour_vwap_cross",
+        "closing_imbalance", "closing_range_position",
+    ]
+
+    def get_feature_names(self, include_vlmc: bool = False) -> list[str]:
+        """Get list of all feature column names (excluding OHLCV).
+
+        include_vlmc: if True, appends the 26 VLMC intraday feature names.
+        Pass include_vlmc=True after calling compute() with an intraday_store
+        to get the full 83-feature list used by the trained model (Gap A).
+        """
+        base = [
             # Momentum
             "rsi_14", "rsi_7", "macd", "macd_signal", "macd_hist",
             "roc_5", "roc_10", "roc_20",
@@ -430,6 +453,9 @@ class FeatureEngine:
             "hurst_short", "hurst_long", "hurst_scale_spread",
             "multifractal_width", "multifractal_asymmetry",
         ]
+        if include_vlmc:
+            return base + self.VLMC_FEATURE_NAMES
+        return base
 
     # --- Feature Groups ---
 

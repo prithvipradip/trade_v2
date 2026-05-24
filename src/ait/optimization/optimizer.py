@@ -82,6 +82,8 @@ class StrategyOptimizer:
         max_concurrent_positions: int = 1,
         max_entry_vol_annual: float = 0.80,
         seed: int = 42,
+        intraday_store: "Any | None" = None,
+        symbol: str | None = None,
     ) -> None:
         if objective not in OBJECTIVES:
             raise ValueError(f"Unknown objective '{objective}'. Choose from: {list(OBJECTIVES)}")
@@ -107,6 +109,8 @@ class StrategyOptimizer:
         self._max_concurrent_positions = max_concurrent_positions
         self._max_entry_vol_annual = max_entry_vol_annual
         self._seed = seed
+        self._intraday_store = intraday_store
+        self._symbol = symbol
         self._data: dict[str, pd.DataFrame] = {}
 
     # ------------------------------------------------------------------
@@ -285,6 +289,7 @@ class StrategyOptimizer:
             data=df,
             strategies=self._strategies,
             features_cache=self._features_cache,
+            symbol=self._symbol or symbol,
             **bt_kwargs,
         )
         return bt.run()

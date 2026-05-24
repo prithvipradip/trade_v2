@@ -250,6 +250,117 @@ class MetaLabeler:
             log.warning("xgboost_not_installed_for_meta_label")
             return {}
 
+    def build_training_data_from_backtest(
+        self,
+        trades: list[dict],
+        features_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Build MetaLabeler training data from walk-forward backtest trade outcomes.
+
+        For each trade's entry date, looks up the corresponding FeatureEngine row
+        and merges with signal-level context stored in the trade dict (entry_confidence,
+        entry_regime, entry_iv_rank, entry_vix_level).  Provides all 20 META_FEATURES
+        — solving the "9/20 features hardcoded to 0" problem that corrupted live training.
+
+        Args:
+            trades: Closed trade dicts from Backtester.run().  Each must have
+                'entry_date' (ISO date string) and 'pnl'.  Optional keys:
+                'entry_confidence', 'entry_regime', 'entry_iv_rank', 'entry_vix_level'.
+            features_df: FeatureEngine DataFrame indexed by DatetimeIndex (or similar
+                date-like index).  Must contain the full set of base feature columns.
+
+        Returns:
+            DataFrame with META_FEATURES columns plus 'profitable' (1/0).
+        """
+        if not trades or features_df.empty:
+            return pd.DataFrame()
+
+        # Normalise features_df index to plain date objects for O(1) lookup
+        try:
+            feat_by_date: dict = {}
+            for idx, row in features_df.iterrows():
+                d = idx.date() if hasattr(idx, "date") else idx
+                feat_by_date[d] = row
+        except Exception:
+            return pd.DataFrame()
+
+        # Helper: derive one-hot regime from stored entry_regime string or features
+        def _regime_flags(entry_regime: str, feat_row: "pd.Series | None") -> tuple:
+            if entry_regime:
+                return (
+                    1.0 if entry_regime == "trending_up"   else 0.0,
+                    1.0 if entry_regime == "trending_down"  else 0.0,
+                    1.0 if entry_regime == "high_volatility" else 0.0,
+                    1.0 if entry_regime == "range_bound"    else 0.0,
+                )
+            if feat_row is not None:
+                vol_exp = float(feat_row.get("vol_regime_expanding", 0.0)) > 0.5
+                px_sma  = float(feat_row.get("price_vs_sma_20", 0.0))
+                if vol_exp:
+                    if px_sma > 0.02:  return (1.0, 0.0, 0.0, 0.0)
+                    if px_sma < -0.02: return (0.0, 1.0, 0.0, 0.0)
+                    return (0.0, 0.0, 1.0, 0.0)
+                return (0.0, 0.0, 0.0, 1.0)
+            return (0.0, 0.0, 0.0, 1.0)  # default: range_bound
+
+        rows = []
+        for trade in trades:
+            pnl = trade.get("pnl", None)
+            if pnl is None:
+                continue
+
+            entry_date_raw = trade.get("entry_date")
+            if not entry_date_raw:
+                continue
+            try:
+                from datetime import date as _date
+                entry_d = (
+                    entry_date_raw
+                    if isinstance(entry_date_raw, _date)
+                    else _date.fromisoformat(str(entry_date_raw)[:10])
+                )
+            except (ValueError, TypeError):
+                continue
+
+            feat = feat_by_date.get(entry_d)
+            entry_regime = trade.get("entry_regime", "")
+            reg_tu, reg_td, reg_hv, reg_rb = _regime_flags(entry_regime, feat)
+
+            def _fv(key: str, default: float = 0.0) -> float:
+                if feat is not None:
+                    v = feat.get(key, default)
+                    try:
+                        return float(v) if not (v != v) else default  # NaN guard
+                    except (TypeError, ValueError):
+                        return default
+                return default
+
+            rows.append({
+                "primary_confidence":   trade.get("entry_confidence", 0.60),
+                "regime_trending_up":   reg_tu,
+                "regime_trending_down": reg_td,
+                "regime_high_vol":      reg_hv,
+                "regime_range_bound":   reg_rb,
+                "vix":                  trade.get("entry_vix_level", _fv("vix_level", 0.5)),
+                "iv_rank":              trade.get("entry_iv_rank",   _fv("iv_rank",   0.5)),
+                "sentiment_score":      0.0,  # not available in backtest
+                "rsi_14":               _fv("rsi_14",           50.0),
+                "rsi_7":                _fv("rsi_7",            50.0),
+                "bb_position":          _fv("bb_position",       0.5),
+                "volume_sma_20_ratio":  _fv("volume_sma_20_ratio", 1.0),
+                "realized_vol_20":      _fv("realized_vol_20",  0.20),
+                "atr_pct":              _fv("atr_pct",           0.01),
+                "weekly_trend_aligned": _fv("weekly_trend_aligned", 0.5),
+                "volume_confirmation":  _fv("volume_confirmation",  0.0),
+                "hour_of_day":          10,  # backtest entries are effectively at open
+                "macd_hist":            _fv("macd_hist",         0.0),
+                "price_vs_sma_20":      _fv("price_vs_sma_20",   0.0),
+                "sma_10_20_cross":      _fv("sma_10_20_cross",   0.5),
+                "profitable":           1 if pnl > 0 else 0,
+            })
+
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+
     def build_training_data(self, state_manager) -> pd.DataFrame:
         """Build training DataFrame from trade history.
 
@@ -326,6 +437,24 @@ class MetaLabeler:
         except Exception as e:
             log.error("meta_label_load_failed", error=str(e))
             return False
+
+    def save_to_path(self, path: "str | Path") -> None:
+        """Save trained model to an explicit path (for per-window walk-forward artifacts)."""
+        data = {
+            "model": self._model,
+            "scaler": self._scaler,
+            "feature_names": self._feature_names,
+            "version": self._model_version,
+            "training_stats": self._training_stats,
+        }
+        dest = Path(path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(dest, "wb") as f:
+                pickle.dump(data, f)
+            log.info("meta_label_saved_to_path", path=str(dest))
+        except Exception as e:
+            log.error("meta_label_save_to_path_failed", path=str(dest), error=str(e))
 
     def _save_model(self) -> None:
         """Save trained meta-label model to disk."""

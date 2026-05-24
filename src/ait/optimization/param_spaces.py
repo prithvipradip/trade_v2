@@ -15,6 +15,13 @@ FRACTAL_GATE_SPACE: dict[str, tuple] = {
     "multifractal_max_width": ("float", 0.30, 0.65),
 }
 
+# Per-leg options bid-ask spread model params (applied to all credit strategies)
+SPREAD_MODEL_SPACE: dict[str, tuple] = {
+    "spread_base":            ("float", 0.02, 0.08),
+    "spread_iv_sensitivity":  ("float", 0.05, 0.20),
+    "spread_dte_sensitivity": ("float", 0.001, 0.015),
+}
+
 IRON_CONDOR_SPACE: dict[str, tuple] = {
     # min_confidence and max_entry_vol_annual intentionally excluded — they are regime
     # filters whose in-sample optima don't generalise OOS (overfitting pressure sink).
@@ -27,6 +34,7 @@ IRON_CONDOR_SPACE: dict[str, tuple] = {
     "iv_floor":             ("float", 0.15, 0.40),
     "wing_k":               ("float", 0.30, 2.00),
     **FRACTAL_GATE_SPACE,
+    **SPREAD_MODEL_SPACE,
 }
 
 LONG_CALL_SPACE: dict[str, tuple] = {
@@ -74,6 +82,7 @@ SHORT_STRANGLE_SPACE: dict[str, tuple] = {
     "delta_iv_scale":       ("float", 0.0,  1.0),
     "max_entry_vol_annual": ("float", 0.25, 0.90),
     **FRACTAL_GATE_SPACE,
+    **SPREAD_MODEL_SPACE,
 }
 
 LONG_STRANGLE_SPACE: dict[str, tuple] = {
@@ -94,6 +103,7 @@ PUT_CREDIT_SPREAD_SPACE: dict[str, tuple] = {
     "max_hold_days":     ("int",   14,   45),
     "iv_floor":          ("float", 0.08, 0.25),
     "wing_k":            ("float", 0.30, 2.00),
+    **SPREAD_MODEL_SPACE,
 }
 
 XGBOOST_SPACE: dict[str, tuple] = {

@@ -62,34 +62,60 @@ def load_daily_ohlcv(
     Tries to resample stored 5-min bars to daily OHLCV. Falls back to
     Yahoo Finance when fewer than 60 trading days are available in the store.
 
+    Also left-joins stored IBKR implied_vol snapshots (from daily IV backfill)
+    onto the returned DataFrame as an `implied_vol` column. Rows without stored
+    IV have NaN in that column; callers should check before using.
+
     Args:
         symbol:  Ticker symbol.
         days:    Calendar days of history requested (default 2 years).
         db_path: Path to SQLite DB; uses production DB_PATH if None.
 
     Returns:
-        DataFrame with DatetimeIndex and [Open, High, Low, Close, Volume].
+        DataFrame with DatetimeIndex and [Open, High, Low, Close, Volume, implied_vol].
     """
-    from pathlib import Path as _Path
     from ait.data.historical import HistoricalDataStore, DB_PATH as _DEFAULT_DB
 
     store = HistoricalDataStore(db_path=db_path or _DEFAULT_DB)
     df = store.resample_to_daily(symbol, days=days)
 
-    if len(df) >= 60:
+    if len(df) < 60:
+        log.info("daily_ohlcv_yahoo_fallback", symbol=symbol, ib_rows=len(df))
+        try:
+            start = (date.today() - timedelta(days=days + 30)).isoformat()
+            ydf = yf.Ticker(symbol).history(start=start, interval="1d")
+            if not ydf.empty:
+                df = ydf[["Open", "High", "Low", "Close", "Volume"]].copy()
+        except Exception as exc:
+            log.warning("yahoo_fallback_failed", symbol=symbol, error=str(exc))
+            if df.empty:
+                return pd.DataFrame()
+    else:
         log.info("daily_ohlcv_from_ib_store", symbol=symbol, rows=len(df))
+
+    if df.empty:
         return df
 
-    log.info("daily_ohlcv_yahoo_fallback", symbol=symbol, ib_rows=len(df))
+    # Left-join stored IBKR implied_vol snapshots (NaN where not available)
     try:
-        start = (date.today() - timedelta(days=days + 30)).isoformat()
-        ydf = yf.Ticker(symbol).history(start=start, interval="1d")
-        if not ydf.empty:
-            return ydf[["Open", "High", "Low", "Close", "Volume"]].copy()
+        iv_series = store.load_daily_iv(symbol, days=days)
+        if not iv_series.empty:
+            # Align index timezone: df may be tz-naive or tz-aware
+            iv_idx = iv_series.index
+            df_idx = df.index
+            if hasattr(df_idx, "tzinfo") and df_idx.tzinfo is not None and iv_idx.tzinfo is None:
+                iv_idx = iv_idx.tz_localize("UTC")
+            elif hasattr(df_idx, "tzinfo") and df_idx.tzinfo is None and iv_idx.tzinfo is not None:
+                iv_idx = iv_idx.tz_localize(None)
+            iv_aligned = pd.Series(iv_series.values, index=iv_idx, name="implied_vol")
+            df = df.join(iv_aligned, how="left")
+        else:
+            df["implied_vol"] = float("nan")
     except Exception as exc:
-        log.warning("yahoo_fallback_failed", symbol=symbol, error=str(exc))
+        log.debug("iv_join_failed", symbol=symbol, error=str(exc))
+        df["implied_vol"] = float("nan")
 
-    return pd.DataFrame()
+    return df
 
 
 class MarketDataService:

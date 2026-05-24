@@ -642,18 +642,21 @@ class TradingOrchestrator:
             live_signals["sentiment_finbert"] = float(getattr(sentiment, "finbert_score", 0) or 0)
             live_signals["fear_greed"] = float(getattr(sentiment, "fear_greed_score", 0) or 0)
 
-        # Intraday fractal + VLMC features (Phase 6): computed from the full 7-day
-        # SQLite history. Merged into live_signals before predict() so the ML model
-        # receives today's intraday structure alongside the daily bar features.
-        from ait.ml.features import FeatureEngine as _FE
-        intraday_fractal = _FE().compute_intraday_features(intraday_full)
-        live_signals.update(intraday_fractal)
+        # Intraday fractal + VLMC features (Fix 2c): pass intraday_store directly to
+        # predict() so the predictor computes VLMC features via the same
+        # _merge_intraday_features() code path used during training. This ensures
+        # session-tiering and feature alignment are consistent between training and live.
+        # The old compute_intraday_features() → live_signals path is removed to eliminate
+        # the training/inference VLMC feature mismatch identified in Gap B.
+        # Sentinel fractal features (hurst_scale_spread, multifractal_width) needed for
+        # the fractal penalty below are still accessible via features_df or live_signals.
 
-        # ML prediction (with cross-asset context + live signals)
+        # ML prediction (with cross-asset context, live signals, and intraday_store)
         prediction = self._predictor.predict(
             hist, symbol=symbol,
             market_context=market_context,
             live_signals=live_signals,
+            intraday_store=self._historical,
         )
         if prediction is None:
             log.warning("ml_prediction_none", symbol=symbol)
@@ -671,9 +674,15 @@ class TradingOrchestrator:
             confidence=prediction.confidence,
         )
 
-        # Use learning-adjusted confidence threshold
-        # Use standard confidence threshold — per-symbol models are now accurate
-        min_confidence = adaptor.get_confidence_override() or self._settings.risk.min_confidence
+        # Use learning-adjusted confidence threshold.
+        # In paper_trading_mode, bypass adaptor override so the live confidence
+        # threshold matches the backtest's fixed value (Fix 6a / Gap Z8).
+        paper_mode = self._settings.learning.paper_trading_mode
+        min_confidence = (
+            (adaptor.get_confidence_override() or self._settings.risk.min_confidence)
+            if not paper_mode
+            else self._settings.risk.min_confidence
+        )
         if prediction.confidence < min_confidence:
             log.debug(
                 "low_confidence_skip",
@@ -705,6 +714,32 @@ class TradingOrchestrator:
         mtf = self._mtf_analyzer.analyze(hist, intraday)
         final_confidence = max(0, min(1, final_confidence + mtf.confidence_boost))
 
+        # Pre-compute daily features once — used for fractal penalty and meta-labeler below.
+        from ait.ml.features import FeatureEngine
+        features_df = FeatureEngine().compute(hist)
+
+        # Fractal regime confidence penalty (Gap Z5): mirrors backtest engine logic.
+        # If hurst_scale_spread or multifractal_width indicate chaotic fractal regime,
+        # penalise confidence by hurst_regime_penalty so the live bot is as conservative
+        # as the backtest during chaotic periods.
+        # hurst_scale_spread and multifractal_width are daily fractal features computed
+        # from the pre-ML features_df (they are NOT intraday-only features).
+        hurst_scale_spread = float(features_df.iloc[-1].get("hurst_scale_spread", 0.0)) if not features_df.empty else 0.0
+        multifractal_width = float(features_df.iloc[-1].get("multifractal_width", 0.0)) if not features_df.empty else 0.0
+        bc = self._settings.backtest
+        if (hurst_scale_spread > bc.hurst_regime_threshold
+                or multifractal_width > bc.multifractal_max_width):
+            penalty = bc.hurst_regime_penalty
+            final_confidence = max(0.0, final_confidence - penalty)
+            log.debug(
+                "fractal_penalty_applied",
+                symbol=symbol,
+                hurst_scale_spread=f"{hurst_scale_spread:.3f}",
+                multifractal_width=f"{multifractal_width:.3f}",
+                penalty=penalty,
+                final_confidence=f"{final_confidence:.3f}",
+            )
+
         # Map ML direction to signal direction
         direction = prediction.direction
 
@@ -719,13 +754,9 @@ class TradingOrchestrator:
             log.info("skipping_near_earnings", symbol=symbol)
             return
 
-        # Pre-compute features once for meta-labeler (Phase 3.3)
-        from ait.ml.features import FeatureEngine
-        features_df = FeatureEngine().compute(hist)
-
         # Meta-label gate: ask secondary model if this signal is worth taking.
-        # Uses primary confidence + market context to filter false positives.
-        if self._meta_labeler is not None and self._meta_labeler.is_trained:
+        # Bypassed in paper_trading_mode so backtest and paper P&L are comparable (Gap Z1 interim).
+        if not paper_mode and self._meta_labeler is not None and self._meta_labeler.is_trained:
             last_features = {}
             if not features_df.empty:
                 last_row = features_df.iloc[-1]
@@ -806,8 +837,9 @@ class TradingOrchestrator:
                 flow = self._flow_detector.analyze_chain(
                     symbol, call_data, put_data, underlying_price
                 )
-                # Hard gate: if strong flow disagrees with ML direction, reject entirely
-                if flow.bias_strength > 0.7:
+                # Hard gate: if strong flow disagrees with ML direction, reject entirely.
+                # Bypassed in paper_trading_mode — backtest has no flow data (Gap Z7).
+                if not paper_mode and flow.bias_strength > 0.7:
                     flow_disagrees = (
                         (flow.overall_bias == "bearish" and direction == SignalDirection.BULLISH) or
                         (flow.overall_bias == "bullish" and direction == SignalDirection.BEARISH)
@@ -910,8 +942,9 @@ class TradingOrchestrator:
                         or s.confidence >= RANGE_MIN_CONFIDENCE
                     ]
 
-            # Re-rank signals using Thompson sampling (exploration/exploitation)
-            if signals:
+            # Re-rank signals using Thompson sampling (exploration/exploitation).
+            # Bypassed in paper_trading_mode — backtest uses deterministic strategy priority (Gap Z2).
+            if signals and not paper_mode:
                 strategy_names = [s.strategy_name for s in signals]
                 ranked_names = self._thompson.rank_strategies(strategy_names)
                 # Build a name→signal map and reorder
@@ -1037,6 +1070,20 @@ class TradingOrchestrator:
         # Apply learning-based sizing multiplier
         strategy_mult = adaptor.get_strategy_multiplier(signal.strategy_name)
         adjusted_size = max(1, int(validation.position_size * strategy_mult))
+
+        # Apply adaptor exit overrides to the signal (Gap Z8 / Fix 6a).
+        # Bypassed in paper_trading_mode so exit params match the backtest's fixed values.
+        _paper_mode = self._settings.learning.paper_trading_mode
+        if not _paper_mode:
+            sl_override = adaptor.get_stop_loss_override()
+            if sl_override is not None and signal.stop_loss is not None:
+                signal.stop_loss = signal.entry_price * (1 - sl_override) if signal.entry_price else signal.stop_loss
+            ts_override = adaptor.get_trailing_stop_override(signal.strategy_name)
+            if ts_override is not None:
+                signal.trailing_stop_pct = ts_override  # stored on signal for executor
+            tp_override = adaptor.get_take_profit_override(signal.strategy_name)
+            if tp_override is not None:
+                signal.profit_target_pct = tp_override  # stored on signal for executor
 
         # Execute
         trade_id = await self._executor.execute_signal(signal, adjusted_size)

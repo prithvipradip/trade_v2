@@ -7,7 +7,7 @@ Avoids re-downloading data that's already been fetched.
 from __future__ import annotations
 
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, time
 from pathlib import Path
 
 import pandas as pd
@@ -47,9 +47,17 @@ class HistoricalDataStore:
                     low REAL,
                     close REAL,
                     volume INTEGER,
+                    implied_vol REAL,
                     PRIMARY KEY (symbol, date)
                 )
             """)
+            # Migrate existing tables that pre-date the implied_vol column
+            try:
+                conn.execute(
+                    f"ALTER TABLE {self._daily_table} ADD COLUMN implied_vol REAL"
+                )
+            except sqlite3.OperationalError:
+                pass  # column already exists
             conn.execute(f"""
                 CREATE INDEX IF NOT EXISTS idx_{self._daily_table}_symbol
                 ON {self._daily_table}(symbol, date)
@@ -155,6 +163,68 @@ class HistoricalDataStore:
             ).fetchall()
         return [r[0] for r in rows]
 
+    def save_daily_iv(self, symbol: str, iv_series: "pd.Series") -> int:
+        """Update implied_vol on existing daily_prices rows for a symbol.
+
+        iv_series must be a pandas Series with date or datetime index and
+        float values (e.g. 0.25 = 25% IV). Only rows that already exist in
+        daily_prices are updated — dates with no OHLCV are silently skipped.
+        Returns the number of rows updated.
+        """
+        if iv_series is None or iv_series.empty:
+            return 0
+
+        rows = []
+        for idx, val in iv_series.items():
+            if pd.isna(val):
+                continue
+            if isinstance(idx, pd.Timestamp):
+                date_str = idx.date().isoformat()
+            elif isinstance(idx, datetime):
+                date_str = idx.date().isoformat()
+            else:
+                date_str = str(idx)
+            rows.append((float(val), symbol, date_str))
+
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                f"UPDATE {self._daily_table} SET implied_vol = ? "
+                "WHERE symbol = ? AND date = ?",
+                rows,
+            )
+
+        log.debug("daily_iv_saved", symbol=symbol, rows=len(rows))
+        return len(rows)
+
+    def load_daily_iv(
+        self,
+        symbol: str,
+        days: int = 504,
+    ) -> "pd.Series":
+        """Load stored implied_vol values for a symbol.
+
+        Returns a Series with DatetimeIndex, values are float IV (or NaN where
+        implied_vol was not stored).  Only rows with non-NULL implied_vol are
+        returned — callers should left-join against the OHLCV index.
+        """
+        from datetime import timedelta, timezone
+        cutoff = (datetime.now(tz=timezone.utc) - timedelta(days=days + 30)).date().isoformat()
+
+        with sqlite3.connect(self._db_path) as conn:
+            df = pd.read_sql_query(
+                f"""SELECT date, implied_vol FROM {self._daily_table}
+                   WHERE symbol = ? AND date >= ? AND implied_vol IS NOT NULL
+                   ORDER BY date""",
+                conn,
+                params=(symbol, cutoff),
+            )
+
+        if df.empty:
+            return pd.Series(dtype=float, name="implied_vol")
+
+        df["date"] = pd.to_datetime(df["date"])
+        return df.set_index("date")["implied_vol"].rename("implied_vol")
+
     # ------------------------------------------------------------------
     # Intraday data (5-min bars)
     # ------------------------------------------------------------------
@@ -225,6 +295,58 @@ class HistoricalDataStore:
         df.columns = ["Open", "High", "Low", "Close", "Volume"]
         df.index.name = "Datetime"
         return df
+
+    def load_intraday_range(
+        self,
+        symbol: str,
+        start_date: date,
+        end_date: date,
+        interval: str = "5m",
+    ) -> pd.DataFrame:
+        """Load intraday bars for a specific date range (inclusive).
+
+        Used by the backfill script and walk-forward engine to fetch historical
+        5-min data for a known date window without a rolling-days cutoff.
+        """
+        start_str = str(start_date)
+        end_str = str(end_date) + "T23:59:59"
+
+        with sqlite3.connect(self._db_path) as conn:
+            df = pd.read_sql_query(
+                f"""SELECT datetime, open, high, low, close, volume
+                   FROM {self._intraday_table}
+                   WHERE symbol = ? AND interval = ?
+                     AND datetime >= ? AND datetime <= ?
+                   ORDER BY datetime""",
+                conn,
+                params=(symbol, interval, start_str, end_str),
+            )
+
+        if df.empty:
+            return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+
+        df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+        df.set_index("datetime", inplace=True)
+        df.columns = ["Open", "High", "Low", "Close", "Volume"]
+        df.index.name = "Datetime"
+        return df
+
+    @staticmethod
+    def slice_intraday_up_to(
+        intraday_df: pd.DataFrame,
+        cutoff_time: time,
+    ) -> pd.DataFrame:
+        """Return only intraday bars whose time component ≤ cutoff_time.
+
+        Works on a DataFrame with a DatetimeIndex (timezone-aware or naive).
+        Used by the intraday backtest engine to construct partial daily bars
+        without look-ahead from future bars in the same session.
+        """
+        if intraday_df.empty:
+            return intraday_df
+        times = intraday_df.index.time
+        mask = times <= cutoff_time
+        return intraday_df.loc[mask]
 
     def resample_to_daily(self, symbol: str, days: int = 730) -> pd.DataFrame:
         """Resample stored 5-min bars to daily OHLCV.

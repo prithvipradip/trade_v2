@@ -71,6 +71,16 @@ class WalkForwardConfig:
     hurst_regime_threshold: float = 0.20
     hurst_regime_penalty: float = 0.10
     multifractal_max_width: float = 0.50
+    # Intraday execution params (Fix 1 / Gap H)
+    scan_interval_minutes: int = 60        # how often to scan for signals during a session
+    entry_window_start_et: str = "10:30"   # earliest allowed entry time (ET)
+    entry_window_end_et: str = "15:30"     # latest allowed entry time (ET)
+    limit_order_timeout_bars: int = 3      # cancel limit order after N 5-min bars without fill
+    # Options spread model params (Fix 5 / Gap E)
+    spread_base: float = 0.03             # base half-spread per leg ($)
+    spread_iv_sensitivity: float = 0.10   # additional spread per unit IV above 0.20
+    spread_dte_sensitivity: float = 0.005 # additional spread per DTE below 21
+    spread_cap: float = 0.15              # maximum half-spread per leg ($)
 
 
 @dataclass
@@ -482,6 +492,20 @@ class WalkForwardBacktester:
                         max(predictor.cv_scores.values()) if predictor.cv_scores else 0.0,
                     )
 
+                # Train MetaLabeler on training-window trade outcomes (Gap Z1 long-term)
+                _meta_artifact = (
+                    self._progress_dir / f"window_{i + 1:03d}" / symbol
+                    if self._progress_dir else None
+                )
+                meta_labeler = self._train_window_meta_labeler(
+                    train_df=train_df,
+                    symbol=symbol,
+                    window_id=i + 1,
+                    predictor=predictor,
+                    window_cfg=window_cfg,
+                    artifact_dir=_meta_artifact,
+                )
+
                 # Prepend training data context so ML features can be computed
                 # (feature engine needs 50+ bars of rolling history)
                 context_bars = 60
@@ -540,6 +564,7 @@ class WalkForwardBacktester:
                     delta_iv_scale=window_cfg.delta_iv_scale,
                     max_concurrent_positions=window_cfg.max_concurrent_positions,
                     max_entry_vol_annual=window_cfg.max_entry_vol_annual,
+                    meta_labeler=meta_labeler,
                 )
                 result = bt.run()
 
@@ -642,6 +667,24 @@ class WalkForwardBacktester:
             for t in br.trades:
                 s = t.get("strategy", "unknown")
                 strategy_counts[s] = strategy_counts.get(s, 0) + 1
+
+            # Per-trade detail: intraday-aware fields (Gap I)
+            trades_detail = [
+                {
+                    "symbol":       t.get("symbol", ""),
+                    "strategy":     t.get("strategy", ""),
+                    "entry_date":   str(t.get("entry_date", "")),
+                    "entry_time":   str(t.get("entry_time", t.get("entry_date", ""))),
+                    "exit_date":    str(t.get("exit_date", "")),
+                    "exit_time":    str(t.get("exit_time",  t.get("exit_date", ""))),
+                    "exit_reason":  t.get("exit_reason", ""),
+                    "pnl":          round(t.get("pnl", 0), 2),
+                    "entry_confidence": t.get("entry_confidence"),
+                    "entry_regime": t.get("entry_regime", ""),
+                }
+                for t in br.trades
+            ]
+
             payload = {
                 "window": window_id,
                 "test_start": str(window_result.test_start),
@@ -654,6 +697,7 @@ class WalkForwardBacktester:
                 "max_drawdown": round(br.max_drawdown * 100, 4),
                 "strategies": strategy_counts,
                 "best_params": best_params or {},
+                "trades_detail": trades_detail,
             }
         else:
             payload = {
@@ -698,7 +742,15 @@ class WalkForwardBacktester:
             from ait.optimization.optimizer import StrategyOptimizer
 
             try:
-                features_cache = FeatureEngine().compute(train_df)
+                # Pass intraday_store+symbol so VLMC features appear in features_cache,
+                # matching the training path used by _train_window_model (Gap B fix).
+                _intraday_store = None
+                if self._db_path is not None:
+                    from ait.data.historical import HistoricalDataStore
+                    _intraday_store = HistoricalDataStore(db_path=self._db_path)
+                features_cache = FeatureEngine().compute(
+                    train_df, intraday_store=_intraday_store, symbol=symbol
+                )
             except Exception:
                 features_cache = None
 
@@ -752,6 +804,8 @@ class WalkForwardBacktester:
                     max_concurrent_positions=self._config.max_concurrent_positions,
                     max_entry_vol_annual=self._config.max_entry_vol_annual,
                     seed=self._config.optimize_seed,
+                    intraday_store=_intraday_store,
+                    symbol=symbol,
                 )
                 res = opt.run(data={symbol: train_df}, prior_params=warm)
                 all_best_params.update(res.best_params)
@@ -839,6 +893,116 @@ class WalkForwardBacktester:
             log.debug("window_model_training_failed", symbol=symbol, window=window_id, error=str(e))
 
         return None
+
+    def _train_window_meta_labeler(
+        self,
+        train_df: pd.DataFrame,
+        symbol: str,
+        window_id: int,
+        predictor: "DirectionPredictor | None",
+        window_cfg: "WalkForwardConfig",
+        artifact_dir: "Path | None" = None,
+    ) -> "MetaLabeler | None":
+        """Train MetaLabeler on trade outcomes from the training window (Gap Z1 long-term).
+
+        Runs a shadow Backtester on the TRAINING data using the just-trained direction
+        predictor, collects closed trades with their entry context, looks up the
+        corresponding FeatureEngine rows, and trains the MetaLabeler on those outcomes.
+        Saves 'meta_labeler.pkl' alongside model.pkl in the window artifact directory.
+
+        Returns a trained MetaLabeler, or None if insufficient data / training failed.
+        """
+        from ait.ml.features import FeatureEngine
+        from ait.ml.meta_label import MetaLabeler
+
+        try:
+            # Build the feature matrix for the training window (same call as training path)
+            intraday_store = None
+            if self._db_path is not None:
+                from ait.data.historical import HistoricalDataStore
+                intraday_store = HistoricalDataStore(db_path=self._db_path)
+
+            features_df = FeatureEngine().compute(
+                train_df, intraday_store=intraday_store, symbol=symbol
+            )
+
+            # Shadow Backtester: run on training data to get labelled trade outcomes.
+            # Use a reduced context prefix (same 60-bar convention as the OOS run).
+            context_bars = 60
+            if len(train_df) <= context_bars:
+                return None
+
+            train_head = train_df.head(len(train_df) - context_bars)  # actual training slice
+            train_with_ctx = train_df  # full training window already has its own context
+
+            shadow_bt = Backtester(
+                data=train_with_ctx,
+                context_bars=0,
+                strategies=["iron_condor"],  # meta-labeler targets the primary strategy
+                initial_capital=window_cfg.initial_capital,
+                commission_per_contract=window_cfg.commission_per_contract,
+                slippage_pct=window_cfg.slippage_pct,
+                position_size_pct=window_cfg.position_size_pct,
+                stop_loss_pct=window_cfg.stop_loss_pct,
+                profit_target_pct=window_cfg.profit_target_pct,
+                max_hold_days=window_cfg.max_hold_days,
+                min_confidence=window_cfg.min_confidence,
+                trailing_stop_enabled=window_cfg.trailing_stop_enabled,
+                trailing_stop_pct=window_cfg.trailing_stop_pct,
+                breakeven_trigger_pct=window_cfg.breakeven_trigger_pct,
+                predictor=predictor,
+                iv_floor=window_cfg.iv_floor,
+                wing_floor_dollars=window_cfg.wing_floor_dollars,
+                wing_k=window_cfg.wing_k,
+                max_concurrent_positions=window_cfg.max_concurrent_positions,
+                max_entry_vol_annual=window_cfg.max_entry_vol_annual,
+            )
+            shadow_result = shadow_bt.run()
+
+            if not shadow_result.trades:
+                log.debug(
+                    "meta_labeler_no_shadow_trades",
+                    window=window_id,
+                    symbol=symbol,
+                )
+                return None
+
+            meta_labeler = MetaLabeler()
+            training_df = meta_labeler.build_training_data_from_backtest(
+                trades=shadow_result.trades,
+                features_df=features_df,
+            )
+
+            if training_df.empty:
+                return None
+
+            stats = meta_labeler.train(training_df)
+            if not stats:
+                return None
+
+            log.info(
+                "meta_labeler_window_trained",
+                window=window_id,
+                symbol=symbol,
+                trades=len(shadow_result.trades),
+                accuracy=f"{stats.get('accuracy', 0):.3f}",
+                precision=f"{stats.get('precision', 0):.3f}",
+            )
+
+            if artifact_dir is not None:
+                from pathlib import Path as _Path
+                meta_labeler.save_to_path(_Path(artifact_dir) / "meta_labeler.pkl")
+
+            return meta_labeler
+
+        except Exception as e:
+            log.debug(
+                "meta_labeler_training_failed",
+                window=window_id,
+                symbol=symbol,
+                error=str(e),
+            )
+            return None
 
     def benchmark_buy_hold(self, data: dict[str, pd.DataFrame]) -> dict[str, float]:
         """Compute buy-and-hold return for each symbol as a benchmark."""

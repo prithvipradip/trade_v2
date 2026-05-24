@@ -70,12 +70,34 @@ class Backtester:
         features_cache: pd.DataFrame | None = None,
         max_concurrent_positions: int = 1,
         max_entry_vol_annual: float = 0.80,
+        # Options bid-ask spread model (per-leg, IV/DTE-aware)
+        spread_base: float = 0.03,
+        spread_iv_sensitivity: float = 0.10,
+        spread_dte_sensitivity: float = 0.005,
+        spread_cap: float = 0.15,
+        # Cross-asset market context forwarded from walk-forward engine (Gap Z3)
+        market_context: dict | None = None,
+        # Earnings-aware skip (Gap Z4): if symbol is given, skip entries near earnings dates
+        symbol: str | None = None,
+        earnings_skip_days: int = 2,
+        # Intraday engine (Fix 1): 5-min execution loop
+        intraday_store: Any = None,
+        scan_interval_minutes: int = 60,
+        entry_window_start_et: str = "10:30",
+        entry_window_end_et: str = "15:30",
+        limit_order_timeout_bars: int = 3,
+        # Per-window MetaLabeler for OOS signal filtering (Gap Z1)
+        meta_labeler: Any = None,
     ) -> None:
         self._data = self._prepare_data(data)
         self._strategies = strategies
         self._initial_capital = initial_capital
         self._commission = commission_per_contract
         self._slippage_pct = slippage_pct
+        self._spread_base = spread_base
+        self._spread_iv_sensitivity = spread_iv_sensitivity
+        self._spread_dte_sensitivity = spread_dte_sensitivity
+        self._spread_cap = spread_cap
         self._position_size_pct = position_size_pct
         self._stop_loss_pct = stop_loss_pct
         self._profit_target_pct = profit_target_pct
@@ -100,6 +122,15 @@ class Backtester:
         self._features_cache = features_cache
         self._max_concurrent_positions = max_concurrent_positions
         self._max_entry_vol_annual = max_entry_vol_annual
+        self._market_context = market_context
+        self._symbol = symbol or ""
+        self._earnings_dates: set[date] = self._load_earnings_dates(symbol, earnings_skip_days)
+        self._intraday_store = intraday_store
+        self._scan_interval_minutes = scan_interval_minutes
+        self._entry_window_start_et = entry_window_start_et
+        self._entry_window_end_et = entry_window_end_et
+        self._limit_order_timeout_bars = limit_order_timeout_bars
+        self._meta_labeler = meta_labeler
 
         self._predictor = predictor if predictor is not None else self._load_predictor()
 
@@ -139,8 +170,36 @@ class Backtester:
 
             # --- 1. Check exits on open positions ---
             still_open = []
+            # Load today's intraday bars once for the whole exit loop (Fix 1c)
+            _session_for_exit = None
+            if self._intraday_store is not None:
+                _sym = self._symbol
+                if _sym:
+                    _session_for_exit = self._intraday_store.load_intraday_range(
+                        symbol=_sym, start_date=today_date, end_date=today_date
+                    )
+
             for pos in open_positions:
-                exit_info = self._check_exit(pos, row, today_date, hist)
+                # Thesis re-evaluation: exit early if ML direction strongly contradicts entry (Gap Z6).
+                thesis_exit = self._check_thesis_invalidation(pos, hist)
+                if thesis_exit is not None:
+                    underlying = row["Close"]
+                    days_held = (today_date - date.fromisoformat(pos["entry_date"])).days
+                    current_val = self._reprice_position(pos, underlying, days_held, hist)
+                    thesis_exit["pnl"] = round(self._calc_pnl(pos, current_val), 2)
+                    thesis_exit["exit_price"] = round(current_val, 4)
+                    pos.update(thesis_exit)
+                    capital += pos["pnl"]
+                    trades.append(pos)
+                    log.debug("thesis_invalidated", strategy=pos["strategy"], pnl=f"{pos['pnl']:.2f}")
+                    continue
+
+                # Intraday exit check (Fix 1c): scan 5-min bars for stops/targets.
+                intraday_exit = None
+                if _session_for_exit is not None and not _session_for_exit.empty:
+                    intraday_exit = self._check_intraday_exit(pos, _session_for_exit, today_date)
+
+                exit_info = intraday_exit or self._check_exit(pos, row, today_date, hist)
                 if exit_info is not None:
                     pos.update(exit_info)
                     capital += pos["pnl"]
@@ -162,7 +221,7 @@ class Backtester:
             if len(open_positions) >= self._max_concurrent_positions:
                 continue
 
-            direction, confidence, features_df = self._get_direction(hist)
+            direction, confidence, features_df = self._get_direction(hist, market_context=self._market_context)
 
             # Apply fractal regime gate to confidence for credit strategies.
             # Features are already computed inside _get_direction — reuse them.
@@ -187,15 +246,56 @@ class Backtester:
             if direction == SignalDirection.BEARISH and confidence < effective_min_conf + 0.05:
                 continue
 
+            # MetaLabeler gate (Gap Z1): applied during OOS evaluation when a trained
+            # per-window model is provided, exactly mirroring the live orchestrator.
+            if self._meta_labeler is not None and self._meta_labeler.is_trained:
+                meta_ctx: dict = {"primary_confidence": float(confidence)}
+                if not features_df.empty:
+                    last_f = features_df.iloc[-1]
+                    vol_exp = float(last_f.get("vol_regime_expanding", 0.0)) > 0.5
+                    px_sma  = float(last_f.get("price_vs_sma_20", 0.0))
+                    meta_ctx.update({
+                        "regime_trending_up":   1.0 if (vol_exp and px_sma > 0.02)   else 0.0,
+                        "regime_trending_down":  1.0 if (vol_exp and px_sma < -0.02)  else 0.0,
+                        "regime_high_vol":       1.0 if (vol_exp and abs(px_sma) <= 0.02) else 0.0,
+                        "regime_range_bound":    0.0 if vol_exp else 1.0,
+                        "vix":                   float(last_f.get("vix_level", 0.5)),
+                        "iv_rank":               float(last_f.get("iv_rank", 0.5)),
+                        "rsi_14":                float(last_f.get("rsi_14", 50.0)),
+                        "rsi_7":                 float(last_f.get("rsi_7",  50.0)),
+                        "bb_position":           float(last_f.get("bb_position", 0.5)),
+                        "volume_sma_20_ratio":   float(last_f.get("volume_sma_20_ratio", 1.0)),
+                        "realized_vol_20":       float(last_f.get("realized_vol_20", 0.20)),
+                        "atr_pct":               float(last_f.get("atr_pct", 0.01)),
+                        "weekly_trend_aligned":  float(last_f.get("weekly_trend_aligned", 0.5)),
+                        "volume_confirmation":   float(last_f.get("volume_confirmation", 0.0)),
+                        "macd_hist":             float(last_f.get("macd_hist", 0.0)),
+                        "price_vs_sma_20":       px_sma,
+                        "sma_10_20_cross":       float(last_f.get("sma_10_20_cross", 0.5)),
+                    })
+                meta_ctx.setdefault("sentiment_score", 0.0)
+                meta_ctx.setdefault("hour_of_day", 10)
+                try:
+                    meta_signal = self._meta_labeler.predict(meta_ctx)
+                    if meta_signal is not None and not meta_signal.take_trade:
+                        continue
+                except Exception:
+                    pass  # meta-labeler errors are non-fatal
+
             strategy = self._select_strategy(direction, hist, confidence, features_df)
             if strategy is None:
+                continue
+
+            # Earnings proximity skip (Gap Z4): matches live orchestrator behaviour.
+            if today_date in self._earnings_dates:
+                log.debug("earnings_skip", date=str(today_date), strategy=strategy)
                 continue
 
             # Range model gate: for iron condors / strangles, replace confidence
             # with P(stays in range). Skip if below range threshold.
             if strategy in ("iron_condor", "short_strangle") and self._range_predictor is not None:
                 try:
-                    rp = self._range_predictor.predict(hist)
+                    rp = self._range_predictor.predict(hist, market_context=self._market_context)
                     if rp is None or rp.probability_in_range < self._range_min_confidence:
                         continue  # bad range setup → skip
                     confidence = rp.probability_in_range
@@ -218,9 +318,75 @@ class Backtester:
                         continue
 
             # --- 3. Build the trade ---
+            # Intraday entry window gate (Fix 1g / Gap D): when 5-min data is available,
+            # only enter during the configured ET window and simulate a limit-order fill.
+            entry_time_str: str | None = None
+            if self._intraday_store is not None:
+                from ait.data.historical import HistoricalDataStore
+                session_bars = self._intraday_store.load_intraday_range(
+                    symbol=self._symbol,
+                    start_date=today_date,
+                    end_date=today_date,
+                )
+                if not session_bars.empty:
+                    # Find first bar in the entry window
+                    window_bars = session_bars[
+                        session_bars.index.to_series().apply(
+                            lambda ts: self._is_in_entry_window(ts.time())
+                        )
+                    ]
+                    if window_bars.empty:
+                        continue  # No bars in window today — skip entry
+
+                    # Use VWAP of first scan bar as limit price (mid-market proxy)
+                    first_scan_bar = window_bars.iloc[0]
+                    scan_time = window_bars.index[0]
+                    entry_time_str = scan_time.isoformat()
+
+                    # Build partial hist up to scan time for feature computation
+                    hist_partial = HistoricalDataStore.slice_intraday_up_to(
+                        session_bars, scan_time.time()
+                    )
+                    if hist_partial.empty:
+                        limit_price = float(first_scan_bar["Close"])
+                    else:
+                        limit_price = float(hist_partial["Close"].iloc[-1])
+
+                    # Try to fill limit order on subsequent bars
+                    bars_after_scan = window_bars.iloc[1:]
+                    filled, bars_waited = self._try_limit_fill(
+                        limit_price, bars_after_scan, self._limit_order_timeout_bars
+                    )
+                    if not filled:
+                        continue  # Limit order expired without fill — skip entry
+
             pos = self._build_position(strategy, direction, row, hist, today_date, capital)
             if pos is None:
                 continue
+
+            if entry_time_str:
+                pos["entry_time"] = entry_time_str
+
+            # Store signal context for MetaLabeler training (Gap Z9)
+            pos["entry_confidence"] = round(float(confidence), 4)
+            pos["entry_direction"] = direction.value if hasattr(direction, "value") else str(direction)
+            if not features_df.empty:
+                last_f = features_df.iloc[-1]
+                pos["entry_iv_rank"] = round(float(last_f.get("iv_rank", 0.0)), 4)
+                pos["entry_vix_level"] = round(float(last_f.get("vix_level", 0.0)), 4)
+                vol_expanding = float(last_f.get("vol_regime_expanding", 0.0)) > 0.5
+                px_vs_sma = float(last_f.get("price_vs_sma_20", 0.0))
+                if vol_expanding:
+                    if px_vs_sma > 0.02:
+                        pos["entry_regime"] = "trending_up"
+                    elif px_vs_sma < -0.02:
+                        pos["entry_regime"] = "trending_down"
+                    else:
+                        pos["entry_regime"] = "high_volatility"
+                else:
+                    pos["entry_regime"] = "range_bound"
+            else:
+                pos["entry_regime"] = "range_bound"  # default when history too short
 
             # Deduct commission
             n_legs = pos.get("n_legs", 1)
@@ -335,6 +501,112 @@ class Backtester:
             log.debug("ml_predictor_unavailable", reason=str(e))
         return None
 
+    @staticmethod
+    def _load_earnings_dates(symbol: str | None, skip_days: int) -> set[date]:
+        """Pre-fetch historical earnings dates from yfinance (Gap Z4).
+
+        Returns the set of all calendar dates within skip_days of any earnings
+        announcement, so the main loop can do an O(1) membership test.
+        Returns an empty set if symbol is None or yfinance is unavailable.
+        """
+        if not symbol or skip_days <= 0:
+            return set()
+        try:
+            import yfinance as yf
+            from datetime import timedelta
+            ticker = yf.Ticker(symbol)
+            eds = getattr(ticker, "earnings_dates", None)
+            if eds is None or (hasattr(eds, "empty") and eds.empty):
+                return set()
+            danger_dates: set[date] = set()
+            for idx_val in eds.index:
+                ed = idx_val.date() if hasattr(idx_val, "date") else idx_val
+                for delta in range(-1, skip_days + 1):  # 1 day after through skip_days before
+                    danger_dates.add(ed + timedelta(days=delta))
+            log.debug("earnings_dates_loaded", symbol=symbol, count=len(danger_dates))
+            return danger_dates
+        except Exception as e:
+            log.debug("earnings_dates_load_failed", symbol=symbol, error=str(e))
+            return set()
+
+    def _parse_et_time(self, time_str: str):
+        """Parse an HH:MM Eastern Time string into a datetime.time object."""
+        from datetime import time as dt_time
+        h, m = time_str.split(":")
+        return dt_time(int(h), int(m))
+
+    def _is_in_entry_window(self, bar_time) -> bool:
+        """Return True if bar_time (datetime.time) is within the entry window."""
+        from datetime import time as dt_time
+        start = self._parse_et_time(self._entry_window_start_et)
+        end = self._parse_et_time(self._entry_window_end_et)
+        t = bar_time if isinstance(bar_time, dt_time) else bar_time.time()
+        return start <= t < end
+
+    def _check_intraday_exit(
+        self, pos: dict, session_bars: "pd.DataFrame", current_date: date
+    ) -> dict | None:
+        """Check intraday 5-min bars for stop-loss or profit-target triggers.
+
+        Returns exit dict if triggered on any bar, else None.
+        """
+        if session_bars is None or session_bars.empty:
+            return None
+
+        entry_price = pos["entry_price"]
+        trade_type = pos.get("trade_type", pos.get("position_type", "debit"))
+        expiry_str = pos.get("expiry_date") or pos.get("exit_date")
+        if not expiry_str:
+            return None
+        expiry = date.fromisoformat(str(expiry_str)[:10])
+
+        for bar_ts, bar_row in session_bars.iterrows():
+            underlying = bar_row["Close"]
+            days_held = (current_date - date.fromisoformat(pos["entry_date"])).days
+
+            current_val = self._reprice_position(pos, underlying, days_held, None)
+            remaining_dte = max(0, (expiry - current_date).days)
+            exit_half_spread = self._options_half_spread(
+                float(pos.get("entry_iv", 0.25)), remaining_dte
+            )
+            if trade_type == "credit":
+                current_val *= (1 + exit_half_spread)
+                pnl_pct = (entry_price - current_val) / entry_price if entry_price > 0 else 0.0
+            else:
+                current_val *= (1 - exit_half_spread)
+                pnl_pct = (current_val - entry_price) / entry_price if entry_price > 0 else 0.0
+
+            # Check stop / profit
+            if self._trailing_stop_enabled:
+                result = self._check_exit_trailing(pos, pnl_pct, current_date)
+            else:
+                result = self._check_exit_fixed(pos, pnl_pct, current_date)
+
+            if result is not None:
+                bar_dt = bar_ts.isoformat() if hasattr(bar_ts, "isoformat") else str(bar_ts)
+                pnl = self._calc_pnl(pos, current_val)
+                result["pnl"] = round(pnl, 2)
+                result["exit_price"] = round(current_val, 4)
+                result["exit_time"] = bar_dt
+                return result
+
+        return None
+
+    def _try_limit_fill(
+        self, limit_price: float, session_bars: "pd.DataFrame", timeout_bars: int
+    ) -> "tuple[bool, int]":
+        """Simulate limit order fill on subsequent 5-min bars.
+
+        Returns (filled, bars_waited). filled=True if Low ≤ limit_price ≤ High
+        within timeout_bars.
+        """
+        for i, (_, bar) in enumerate(session_bars.iterrows()):
+            if i >= timeout_bars:
+                break
+            if bar["Low"] <= limit_price <= bar["High"]:
+                return True, i + 1
+        return False, min(len(session_bars), timeout_bars)
+
     def _load_directional_model(self):
         """Try to load the directional model for small account trading."""
         try:
@@ -347,12 +619,16 @@ class Backtester:
         return None
 
     def _get_direction(
-        self, hist: pd.DataFrame
+        self,
+        hist: pd.DataFrame,
+        market_context: dict | None = None,
     ) -> tuple[SignalDirection, float, pd.DataFrame]:
         """Get market direction prediction and pre-computed feature matrix.
 
         Returns (direction, confidence, features_df). The features_df is shared
         with the fractal gate and _select_strategy to avoid double computation.
+        market_context (VIX, SPY, macro) is forwarded to the predictor and
+        range predictor so they use cross-asset features, matching live inference (Gap Z3).
         """
         from ait.ml.features import FeatureEngine
         if self._features_cache is not None and not self._features_cache.empty:
@@ -366,7 +642,7 @@ class Backtester:
 
         if self._predictor is not None:
             try:
-                pred = self._predictor.predict(hist)
+                pred = self._predictor.predict(hist, market_context=market_context)
                 if pred is not None:
                     return pred.direction, pred.confidence, features_df
             except Exception:
@@ -466,11 +742,47 @@ class Backtester:
             skew_adj = self._skew_factor * max(0.0, log_m) * 0.02
         return max(base_iv + skew_adj, self._iv_floor)
 
-    def _get_iv(self, hist: pd.DataFrame) -> float:
-        """Estimate implied volatility from realized vol with a premium."""
+    def _options_half_spread(self, iv: float, dte: int) -> float:
+        """Compute the per-leg half bid-ask spread for an OTM option.
+
+        Models the empirical relationship between IV, DTE, and spread width:
+        - Higher IV → wider spreads (market makers demand more edge)
+        - Lower DTE → wider spreads (gamma risk increases near expiry)
+
+        Returns the half-spread as a fraction of the option mid price.
+        """
+        iv_term = self._spread_iv_sensitivity * max(0.0, iv - 0.20)
+        dte_term = self._spread_dte_sensitivity * max(0.0, 21 - dte)
+        return min(self._spread_cap, self._spread_base + iv_term + dte_term)
+
+    def _get_iv(self, hist: pd.DataFrame, market_context: dict | None = None) -> float:
+        """Return IV for the current bar, in priority order:
+
+        1. Stored IBKR daily implied_vol from the backfill (most realistic).
+        2. VIX proxy from market_context (interim: VIX / 100 * 1.05).
+        3. Synthetic fallback: realized_vol * 1.15 (original formula).
+
+        Always applies iv_floor as a hard minimum.
+        """
+        # Priority 1: stored IBKR IV
+        if "implied_vol" in hist.columns:
+            last_iv = hist["implied_vol"].dropna()
+            if not last_iv.empty:
+                stored = float(last_iv.iloc[-1])
+                if stored > 0:
+                    return max(stored, self._iv_floor)
+
+        # Priority 2: VIX proxy from market context
+        if market_context:
+            vix = market_context.get("vix_close") or market_context.get("vix")
+            if vix and vix > 0:
+                iv = float(vix) / 100.0 * 1.05
+                return max(iv, self._iv_floor)
+
+        # Priority 3: synthetic fallback
         close_arr = hist["Close"].values
         rv = realized_vol(close_arr, window=20)
-        iv = rv * 1.15  # IV premium over realized vol
+        iv = rv * 1.15
         return max(iv, self._iv_floor)
 
     def _build_position(
@@ -481,10 +793,11 @@ class Backtester:
         hist: pd.DataFrame,
         today_date: date,
         capital: float,
+        market_context: dict | None = None,
     ) -> dict | None:
         """Build a position dict with proper BS pricing for the strategy type."""
         underlying = row["Close"]
-        iv = self._get_iv(hist)
+        iv = self._get_iv(hist, market_context=market_context)
         dte = self._max_hold_days
         t = dte / 365.0
         r = 0.05
@@ -643,8 +956,16 @@ class Backtester:
             long_put_price = black_scholes_price(S, long_put_strike, t, r,
                 self._get_leg_iv(iv, long_put_strike, S, OptionType.PUT), OptionType.PUT)
 
-            # Net credit received
+            # Net credit received at mid prices
             net_credit = (short_call_price + short_put_price) - (long_call_price + long_put_price)
+            if net_credit <= 0:
+                return None
+
+            # Per-leg spread cost: 4 legs × half-spread (sell at bid, buy at ask)
+            half_spread = self._options_half_spread(iv, dte)
+            avg_leg_mid = (short_call_price + short_put_price + long_call_price + long_put_price) / 4
+            spread_cost = 4 * half_spread * avg_leg_mid
+            net_credit = max(0.0, net_credit - spread_cost)
             if net_credit <= 0:
                 return None
 
@@ -660,9 +981,6 @@ class Backtester:
             contracts = int(capital * self._position_size_pct / max_loss_per_contract)
             if contracts < 1:
                 return None
-
-            # Apply slippage: we receive less credit than mid
-            net_credit *= (1 - self._slippage_pct)
 
             return {
                 "symbol": "SIM",
@@ -704,6 +1022,13 @@ class Backtester:
             if net_credit <= 0:
                 return None
 
+            # Per-leg spread cost: 2 legs
+            half_spread = self._options_half_spread(iv, dte)
+            avg_leg_mid = (short_put_price + long_put_price) / 2
+            net_credit = max(0.0, net_credit - 2 * half_spread * avg_leg_mid)
+            if net_credit <= 0:
+                return None
+
             max_loss_per_share = wing - net_credit
             max_loss_per_contract = max_loss_per_share * 100
 
@@ -718,8 +1043,6 @@ class Backtester:
                     contracts = 1
                 else:
                     return None
-
-            net_credit *= (1 - self._slippage_pct)
 
             return {
                 "symbol": "SIM",
@@ -759,13 +1082,18 @@ class Backtester:
             if net_credit <= 0:
                 return None
 
+            # Per-leg spread cost: 2 legs (both short)
+            half_spread = self._options_half_spread(iv, dte)
+            avg_leg_mid = (call_price + put_price) / 2
+            net_credit = max(0.0, net_credit - 2 * half_spread * avg_leg_mid)
+            if net_credit <= 0:
+                return None
+
             # Margin approx: 20% of underlying per strangle (standard naked-option requirement)
             margin_per_contract = S * 0.20 * 100
             contracts = int(capital * self._position_size_pct / margin_per_contract)
             if contracts < 1:
                 return None
-
-            net_credit *= (1 - self._slippage_pct)
 
             return {
                 "symbol": "SIM", "strategy": "short_strangle",
@@ -834,7 +1162,7 @@ class Backtester:
         the current realized vol × 1.15 premium, so vega P&L is non-zero
         without wild swings driven purely by realized vol noise.
         """
-        entry_iv = pos["entry_iv"]
+        entry_iv = pos.get("entry_iv") or pos.get("iv", self._iv_floor)
         if hist is None or len(hist) < 21:
             return entry_iv
         rv = realized_vol(hist["Close"].values, window=20) * 1.15
@@ -908,6 +1236,56 @@ class Backtester:
             return black_scholes_price(underlying, pos["strike"], t, r,
                 self._get_leg_iv(iv, pos["strike"], underlying, opt_type), opt_type)
 
+    def _check_thesis_invalidation(
+        self, pos: dict, hist: pd.DataFrame
+    ) -> dict | None:
+        """Return exit dict if the ML direction strongly contradicts the entry thesis.
+
+        A NEUTRAL (iron condor / short strangle) entry is invalidated when the
+        current ML prediction is STRONGLY directional (confidence ≥ 0.80).
+        A directional entry (BULLISH/BEARISH) is invalidated when the prediction
+        flips to the opposite direction with confidence ≥ 0.80.
+
+        Returns None if no invalidation, or {"exit_date", "exit_reason"} dict.
+        """
+        if self._predictor is None:
+            return None
+        # Only re-evaluate after at least 2 days held (avoid same-bar noise)
+        entry_date = date.fromisoformat(pos["entry_date"])
+        if not hasattr(hist.index[-1], "date"):
+            return None
+        current_date = hist.index[-1].date() if hasattr(hist.index[-1], "date") else hist.index[-1]
+        if (current_date - entry_date).days < 2:
+            return None
+
+        try:
+            pred = self._predictor.predict(hist)
+        except Exception:
+            return None
+        if pred is None or pred.confidence < 0.80:
+            return None
+
+        entry_dir = pos.get("direction", SignalDirection.NEUTRAL.value)
+        pred_dir = pred.direction.value if hasattr(pred.direction, "value") else str(pred.direction)
+
+        invalidated = False
+        if entry_dir == SignalDirection.NEUTRAL.value:
+            # Iron condor / short strangle: strong directional signal invalidates the range thesis
+            if pred_dir in (SignalDirection.BULLISH.value, SignalDirection.BEARISH.value):
+                invalidated = True
+        elif entry_dir == SignalDirection.BULLISH.value and pred_dir == SignalDirection.BEARISH.value:
+            invalidated = True
+        elif entry_dir == SignalDirection.BEARISH.value and pred_dir == SignalDirection.BULLISH.value:
+            invalidated = True
+
+        if invalidated:
+            return {
+                "exit_date": str(current_date),
+                "exit_time": str(current_date),
+                "exit_reason": f"thesis_invalidated:{pred_dir}@{pred.confidence:.2f}",
+            }
+        return None
+
     def _check_exit(self, pos: dict, row: pd.Series, current_date: date,
                     hist: pd.DataFrame | None = None) -> dict | None:
         """Check if a position should be exited."""
@@ -935,11 +1313,15 @@ class Backtester:
             else:
                 pnl_pct = 0.0
 
-        # Apply slippage to current value for exit
+        # Apply per-leg bid-ask spread at exit (scales with current IV and remaining DTE)
+        exit_iv = float(pos.get("entry_iv", 0.25))
+        expiry = date.fromisoformat(pos["expiry_date"])
+        remaining_dte = max(0, (expiry - current_date).days)
+        exit_half_spread = self._options_half_spread(exit_iv, remaining_dte)
         if trade_type == "credit":
-            current_value *= (1 + self._slippage_pct)  # Buy back at ask
+            current_value *= (1 + exit_half_spread)  # Buy back at ask
         else:
-            current_value *= (1 - self._slippage_pct)  # Sell at bid
+            current_value *= (1 - exit_half_spread)  # Sell at bid
 
         if self._trailing_stop_enabled:
             result = self._check_exit_trailing(pos, pnl_pct, current_date)
@@ -951,6 +1333,8 @@ class Backtester:
             pnl = self._calc_pnl(pos, current_value)
             result["pnl"] = round(pnl, 2)
             result["exit_price"] = round(current_value, 4)
+            if "exit_time" not in result:
+                result["exit_time"] = result.get("exit_date")  # EOD exit — no intraday timestamp
             return result
 
         return None
@@ -1025,14 +1409,19 @@ class Backtester:
         current_value = self._reprice_position(pos, last_row["Close"], days_held, hist)
 
         trade_type = pos.get("trade_type", "debit")
+        exit_iv = float(pos.get("entry_iv", 0.25))
+        expiry = date.fromisoformat(pos["expiry_date"])
+        remaining_dte = max(0, (expiry - last_date).days)
+        exit_half_spread = self._options_half_spread(exit_iv, remaining_dte)
         if trade_type == "credit":
-            current_value *= (1 + self._slippage_pct)
+            current_value *= (1 + exit_half_spread)
         else:
-            current_value *= (1 - self._slippage_pct)
+            current_value *= (1 - exit_half_spread)
 
         pnl = self._calc_pnl(pos, current_value)
         return {
             "exit_date": str(last_date),
+            "exit_time": str(last_date),
             "exit_price": round(current_value, 4),
             "pnl": round(pnl, 2),
             "exit_reason": "backtest_end",

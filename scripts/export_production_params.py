@@ -43,6 +43,15 @@ _PARAM_MAP: dict[str, tuple[str, str]] = {
     "multifractal_max_width": ("backtest", "multifractal_max_width"),
     "delta_long":             ("backtest", "delta_long"),
     "delta_iv_scale":         ("backtest", "delta_iv_scale"),
+    # Spread model params (Fix 5 / Gap E)
+    "spread_base":            ("backtest", "spread_base"),
+    "spread_iv_sensitivity":  ("backtest", "spread_iv_sensitivity"),
+    "spread_dte_sensitivity": ("backtest", "spread_dte_sensitivity"),
+    # Intraday execution params (Fix 1 / Gap H)
+    "scan_interval_minutes":  ("backtest", "scan_interval_minutes"),
+    "entry_window_start_et":  ("backtest", "entry_window_start_et"),
+    "entry_window_end_et":    ("backtest", "entry_window_end_et"),
+    "limit_order_timeout_bars": ("backtest", "limit_order_timeout_bars"),
 }
 
 

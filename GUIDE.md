@@ -1264,7 +1264,7 @@ python run_backtest.py --compare-exits           # Fixed vs trailing stops
 
 **Data:** IB SQLite store (5-min bars resampled to daily, up to 2 years) via `load_daily_ohlcv()`. Falls back to Yahoo Finance when IB data is unavailable. A completed IB backfill (`--years 2`) is needed for best results.
 
-**Options pricing:** Black-Scholes with `IV = realized_vol × 1.15` as a flat IV estimate. The `iv_floor`, `delta_short`, and `delta_long` parameters are now wired into the engine and searchable by the optimizer (`src/ait/backtesting/engine.py`).
+**Options pricing:** Black-Scholes using stored IBKR implied vol when available (from `daily_prices.implied_vol`), falling back to `realized_vol × 1.15` when the column is absent or null. `iv_floor`, `delta_short`, `delta_long`, and the per-leg bid-ask spread params (`spread_base`, `spread_iv_sensitivity`, `spread_dte_sensitivity`) are searchable by Optuna.
 
 **The Tier 1 range model is included:** When backtesting iron condors, the `RangePredictor` is trained per window and gates entries, matching the live system's behavior.
 
@@ -1272,8 +1272,14 @@ python run_backtest.py --compare-exits           # Fixed vs trailing stops
 
 | Feature | Implementation |
 |---|---|
-| **Dynamic IV during hold** | `_get_current_iv` blends entry IV (70%) with current realized vol × 1.15 (30%); vega P&L is non-zero |
+| **Dynamic IV during hold** | `_get_current_iv` uses stored IBKR implied vol when available; falls back to realized vol × 1.15; blends entry IV (70%) with current estimate (30%) |
 | **Volatility skew** | `_get_leg_iv` applies linear log-moneyness skew: OTM puts +1% IV per 10% below ATM, OTM calls +0.2% per 10% above; `skew_factor=0.0` restores flat IV |
+| **Bid-ask spread** | `_options_half_spread` models per-leg spread as a function of IV and remaining DTE; applied at both entry (mid − half-spread) and exit (mid + half-spread); params searchable by Optuna |
+| **Intraday stop/target** | Exits checked against 5-min bars within each session (not only at EOD); entry and exit timestamps stored as ISO datetime strings in `entry_time` / `exit_time` fields |
+| **MetaLabeler gate** | When a trained per-window `MetaLabeler` is provided, each signal is filtered through a binary take/skip classifier before entering; trained on the same window's simulated trade outcomes |
+| **Trade dict fields** | Each closed trade includes: `entry_date`, `entry_time`, `exit_date`, `exit_time`, `exit_reason`, `entry_confidence`, `entry_regime`, `entry_iv_rank`, `entry_vix_level`, `pnl`, `exit_price` |
+| **Thesis re-evaluation** | `_check_thesis_invalidation()` checks at each daily bar whether the ML predictor strongly contradicts the original position direction; triggers early exit if invalidated |
+| **Fractal regime gate** | Confidence penalised when `hurst_scale_spread > hurst_regime_threshold` or `multifractal_width > multifractal_max_width`; same thresholds as exported production params |
 
 ### Interpreting Results
 

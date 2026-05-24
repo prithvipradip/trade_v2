@@ -211,7 +211,11 @@ class DirectionPredictor:
         features["target"] = self._create_labels(features["Close"])
         features = features.dropna(subset=["target"])
 
-        self._feature_names = self._feature_engine.get_feature_names()
+        # Include VLMC names when intraday_store was used (Gap A fix).
+        # The filter below drops any that are absent (e.g. empty store).
+        self._feature_names = self._feature_engine.get_feature_names(
+            include_vlmc=intraday_store is not None
+        )
         # Only use features that exist in the DataFrame
         self._feature_names = [f for f in self._feature_names if f in features.columns]
 
