@@ -50,7 +50,7 @@ class WalkForwardConfig:
     position_size_pct: float = 0.05
     wing_floor_dollars: float = 5.0
     wing_k: float = 1.0
-    iv_floor: float = 0.20
+    iv_floor: float = 0.12
     delta_iv_scale: float = 0.0
     stop_loss_pct: float = 0.35            # Cut losses at 35% (options decay fast)
     profit_target_pct: float = 0.50         # Take profits at 50% (don't be greedy)
@@ -413,6 +413,16 @@ class WalkForwardBacktester:
             log.error("no_data_for_backtest")
             return WalkForwardResult(initial_capital=self._config.initial_capital)
 
+        # Load VIX data for the full backtest period (yfinance fallback when not in DB).
+        # Used as Priority-2 IV proxy and as a live feature for the MetaLabeler.
+        from ait.data.market_data import load_daily_ohlcv as _load_ohlcv
+        try:
+            _vix_full: pd.DataFrame = _load_ohlcv(
+                "^VIX", days=self._config.train_days + 900, db_path=self._db_path
+            )
+        except Exception:
+            _vix_full = pd.DataFrame()
+
         # Generate walk-forward windows
         windows = self._generate_windows(data)
         log.info("walk_forward_windows", count=len(windows))
@@ -497,6 +507,13 @@ class WalkForwardBacktester:
                     self._progress_dir / f"window_{i + 1:03d}" / symbol
                     if self._progress_dir else None
                 )
+                # VIX slice for the training window (shadow MetaLabeler Backtester)
+                _vix_train_ctx: dict | None = None
+                if not _vix_full.empty:
+                    _vix_t = _vix_full.reindex(train_df.index, method="ffill").dropna(how="all")
+                    if not _vix_t.empty:
+                        _vix_train_ctx = {"vix": _vix_t}
+
                 meta_labeler = self._train_window_meta_labeler(
                     train_df=train_df,
                     symbol=symbol,
@@ -504,6 +521,7 @@ class WalkForwardBacktester:
                     predictor=predictor,
                     window_cfg=window_cfg,
                     artifact_dir=_meta_artifact,
+                    vix_ctx=_vix_train_ctx,
                 )
 
                 # Prepend training data context so ML features can be computed
@@ -527,6 +545,13 @@ class WalkForwardBacktester:
                     if self._config.optimize_per_window
                     else effective_min_conf
                 )
+
+                # Align VIX to this window's date range for IV estimation
+                _vix_ctx: dict | None = None
+                if not _vix_full.empty:
+                    _vix_w = _vix_full.reindex(test_with_context.index, method="ffill").dropna(how="all")
+                    if not _vix_w.empty:
+                        _vix_ctx = {"vix": _vix_w}
 
                 # Each symbol gets its proportional share of capital
                 bt = Backtester(
@@ -564,7 +589,12 @@ class WalkForwardBacktester:
                     delta_iv_scale=window_cfg.delta_iv_scale,
                     max_concurrent_positions=window_cfg.max_concurrent_positions,
                     max_entry_vol_annual=window_cfg.max_entry_vol_annual,
+                    spread_base=window_cfg.spread_base,
+                    spread_iv_sensitivity=window_cfg.spread_iv_sensitivity,
+                    spread_dte_sensitivity=window_cfg.spread_dte_sensitivity,
+                    spread_cap=window_cfg.spread_cap,
                     meta_labeler=meta_labeler,
+                    market_context=_vix_ctx,
                 )
                 result = bt.run()
 
@@ -902,6 +932,7 @@ class WalkForwardBacktester:
         predictor: "DirectionPredictor | None",
         window_cfg: "WalkForwardConfig",
         artifact_dir: "Path | None" = None,
+        vix_ctx: "dict | None" = None,
     ) -> "MetaLabeler | None":
         """Train MetaLabeler on trade outcomes from the training window (Gap Z1 long-term).
 
@@ -956,6 +987,11 @@ class WalkForwardBacktester:
                 wing_k=window_cfg.wing_k,
                 max_concurrent_positions=window_cfg.max_concurrent_positions,
                 max_entry_vol_annual=window_cfg.max_entry_vol_annual,
+                spread_base=window_cfg.spread_base,
+                spread_iv_sensitivity=window_cfg.spread_iv_sensitivity,
+                spread_dte_sensitivity=window_cfg.spread_dte_sensitivity,
+                spread_cap=window_cfg.spread_cap,
+                market_context=vix_ctx,
             )
             shadow_result = shadow_bt.run()
 

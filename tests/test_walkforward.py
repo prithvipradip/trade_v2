@@ -679,3 +679,78 @@ class TestVolGate:
                         iv_floor=0.20, max_entry_vol_annual=0.90)
         result = bt.run()
         assert result is not None  # must not crash; entries may or may not occur
+
+
+# ---------------------------------------------------------------------------
+# Spread param wiring tests
+# ---------------------------------------------------------------------------
+
+class TestSpreadParamsWiring:
+    """Verify that non-default spread params flow from WalkForwardConfig to Backtester."""
+
+    def test_spread_params_defaults_on_config(self) -> None:
+        cfg = WalkForwardConfig()
+        assert hasattr(cfg, "spread_base")
+        assert hasattr(cfg, "spread_iv_sensitivity")
+        assert hasattr(cfg, "spread_dte_sensitivity")
+        assert hasattr(cfg, "spread_cap")
+
+    def test_spread_params_custom_values_stored(self) -> None:
+        cfg = WalkForwardConfig(
+            spread_base=0.01,
+            spread_iv_sensitivity=0.03,
+            spread_dte_sensitivity=0.001,
+            spread_cap=0.05,
+        )
+        assert cfg.spread_base == pytest.approx(0.01)
+        assert cfg.spread_iv_sensitivity == pytest.approx(0.03)
+        assert cfg.spread_dte_sensitivity == pytest.approx(0.001)
+        assert cfg.spread_cap == pytest.approx(0.05)
+
+    def test_spread_params_passed_to_oos_backtester(self) -> None:
+        """OOS Backtester must receive spread params from WalkForwardConfig."""
+        import asyncio
+        from unittest.mock import patch
+        from ait.backtesting.engine import Backtester
+        from ait.backtesting.result import BacktestResult
+
+        captured_kwargs: list[dict] = []
+        original_init = Backtester.__init__
+
+        def capturing_init(self_bt, *args, **kwargs):
+            captured_kwargs.append(dict(kwargs))
+            original_init(self_bt, *args, **kwargs)
+
+        def fast_run(self_bt):
+            return BacktestResult(trades=[])
+
+        # Small dataset: 200 days, train=150, test=30 → ~2 windows, runs in ~2s
+        data = _make_ohlcv(days=200)
+        cfg = WalkForwardConfig(
+            train_days=150,
+            test_days=30,
+            step_days=30,
+            gap_days=0,
+            optimize_per_window=False,
+            optimize_n_trials=1,
+            spread_base=0.007,
+            spread_iv_sensitivity=0.025,
+            spread_dte_sensitivity=0.0008,
+            spread_cap=0.06,
+        )
+
+        with patch.object(Backtester, "__init__", capturing_init), \
+             patch.object(Backtester, "run", fast_run):
+            asyncio.run(
+                WalkForwardBacktester(["QQQ"], ["iron_condor"], config=cfg).run(
+                    data={"QQQ": data}
+                )
+            )
+
+        oos_calls = [kw for kw in captured_kwargs if "spread_base" in kw]
+        assert oos_calls, "No Backtester call contained spread_base"
+        for kw in oos_calls:
+            assert kw["spread_base"] == pytest.approx(0.007), \
+                f"spread_base mismatch: {kw['spread_base']}"
+            assert kw["spread_cap"] == pytest.approx(0.06), \
+                f"spread_cap mismatch: {kw['spread_cap']}"

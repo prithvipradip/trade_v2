@@ -23,18 +23,21 @@ SPREAD_MODEL_SPACE: dict[str, tuple] = {
 }
 
 IRON_CONDOR_SPACE: dict[str, tuple] = {
-    # min_confidence and max_entry_vol_annual intentionally excluded — they are regime
-    # filters whose in-sample optima don't generalise OOS (overfitting pressure sink).
-    # They remain fixed at config defaults (0.55 and 0.80 respectively).
-    "stop_loss_pct":        ("float", 0.30, 0.70),
-    "profit_target_pct":    ("float", 0.30, 0.70),
-    "trailing_stop_pct":    ("float", 0.15, 0.40),
-    "delta_short":          ("float", 0.15, 0.30),
-    "max_hold_days":        ("int",   14,   45),
-    "iv_floor":             ("float", 0.15, 0.40),
-    "wing_k":               ("float", 0.30, 2.00),
+    # Excluded from search space (P8/P9):
+    #   min_confidence, max_entry_vol_annual, iv_floor — regime gates; in-sample optima
+    #   don't generalise OOS (P8: iv_floor creates train/OOS mismatch). Fixed in config.
+    #   spread_* — calibrated from real market data; must stay fixed (removing prevents
+    #   Optuna from fighting the calibration and recreating P8-style friction mismatch).
+    "stop_loss_pct":          ("float", 0.30, 0.70),
+    "profit_target_pct":      ("float", 0.30, 0.70),
+    # trailing_stop_fraction: fraction of profit_target_pct — optimizer derives the actual
+    # trailing_stop_pct as trailing_stop_fraction × profit_target_pct. Keeps trailing stop
+    # coherent relative to target rather than as an independent dimension that can cancel it.
+    "trailing_stop_fraction": ("float", 0.30, 0.90),
+    "delta_short":            ("float", 0.15, 0.30),
+    "max_hold_days":          ("int",   14,   40),
+    "wing_k":                 ("float", 0.30, 2.00),
     **FRACTAL_GATE_SPACE,
-    **SPREAD_MODEL_SPACE,
 }
 
 LONG_CALL_SPACE: dict[str, tuple] = {
@@ -75,14 +78,13 @@ SHORT_STRANGLE_SPACE: dict[str, tuple] = {
     "min_confidence":       ("float", 0.55, 0.70),
     "stop_loss_pct":        ("float", 0.30, 0.70),
     "profit_target_pct":    ("float", 0.30, 0.70),
-    "trailing_stop_pct":    ("float", 0.15, 0.40),
-    "delta_short":          ("float", 0.10, 0.25),
-    "max_hold_days":        ("int",   14,   45),
+    "trailing_stop_fraction": ("float", 0.30, 0.90),
+    "delta_short":            ("float", 0.10, 0.25),
+    "max_hold_days":          ("int",   14,   40),
     "iv_floor":             ("float", 0.15, 0.40),
     "delta_iv_scale":       ("float", 0.0,  1.0),
     "max_entry_vol_annual": ("float", 0.25, 0.90),
     **FRACTAL_GATE_SPACE,
-    **SPREAD_MODEL_SPACE,
 }
 
 LONG_STRANGLE_SPACE: dict[str, tuple] = {
@@ -103,7 +105,6 @@ PUT_CREDIT_SPREAD_SPACE: dict[str, tuple] = {
     "max_hold_days":     ("int",   14,   45),
     "iv_floor":          ("float", 0.08, 0.25),
     "wing_k":            ("float", 0.30, 2.00),
-    **SPREAD_MODEL_SPACE,
 }
 
 XGBOOST_SPACE: dict[str, tuple] = {

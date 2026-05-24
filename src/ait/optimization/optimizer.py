@@ -278,12 +278,22 @@ class StrategyOptimizer:
             "delta_iv_scale":            self._delta_iv_scale,
             "max_concurrent_positions":  self._max_concurrent_positions,
             "max_entry_vol_annual":      self._max_entry_vol_annual,
+            "hurst_regime_threshold":    0.20,
+            "hurst_regime_penalty":      0.10,
+            "multifractal_max_width":    0.50,
         }
         # Override with trial params that match Backtester signatures
         for key, val in params.items():
             _, _, param_name = key.partition("__")
             if param_name in bt_kwargs:
                 bt_kwargs[param_name] = val
+
+        # Derived params: trailing_stop_fraction → trailing_stop_pct relative to profit target.
+        # Ensures trailing stop is always a coherent fraction of profit_target, not independent.
+        for key, val in params.items():
+            _, _, param_name = key.partition("__")
+            if param_name == "trailing_stop_fraction":
+                bt_kwargs["trailing_stop_pct"] = val * bt_kwargs["profit_target_pct"]
 
         bt = Backtester(
             data=df,

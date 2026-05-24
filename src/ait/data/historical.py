@@ -34,6 +34,8 @@ class HistoricalDataStore:
         self._db_path = db_path
         self._daily_table = f"{table_prefix}daily_prices"
         self._intraday_table = f"{table_prefix}intraday_prices"
+        self._spread_samples_table = f"{table_prefix}option_spread_samples"
+        self._spread_params_table = f"{table_prefix}option_spread_params"
         self._init_db()
 
     def _init_db(self) -> None:
@@ -78,6 +80,35 @@ class HistoricalDataStore:
             conn.execute(f"""
                 CREATE INDEX IF NOT EXISTS idx_{self._intraday_table}_symbol_dt
                 ON {self._intraday_table}(symbol, interval, datetime)
+            """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._spread_samples_table} (
+                    symbol          TEXT    NOT NULL,
+                    sample_date     TEXT    NOT NULL,
+                    right           TEXT    NOT NULL,
+                    strike          REAL    NOT NULL,
+                    dte             INTEGER NOT NULL,
+                    iv              REAL    NOT NULL,
+                    bid             REAL    NOT NULL,
+                    ask             REAL    NOT NULL,
+                    mid             REAL    NOT NULL,
+                    half_spread_pct REAL    NOT NULL,
+                    PRIMARY KEY (symbol, sample_date, right, strike, dte)
+                )
+            """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._spread_params_table} (
+                    symbol                TEXT    NOT NULL PRIMARY KEY,
+                    calibrated_on         TEXT    NOT NULL,
+                    spread_base           REAL    NOT NULL,
+                    spread_iv_sensitivity REAL    NOT NULL,
+                    spread_iv_threshold   REAL    NOT NULL,
+                    spread_dte_sensitivity REAL   NOT NULL,
+                    spread_dte_threshold  INTEGER NOT NULL,
+                    spread_cap            REAL    NOT NULL,
+                    sample_count          INTEGER NOT NULL,
+                    rmse                  REAL
+                )
             """)
 
     def save(self, symbol: str, df: pd.DataFrame) -> int:
@@ -164,12 +195,13 @@ class HistoricalDataStore:
         return [r[0] for r in rows]
 
     def save_daily_iv(self, symbol: str, iv_series: "pd.Series") -> int:
-        """Update implied_vol on existing daily_prices rows for a symbol.
+        """Upsert implied_vol into daily_prices for a symbol.
 
         iv_series must be a pandas Series with date or datetime index and
-        float values (e.g. 0.25 = 25% IV). Only rows that already exist in
-        daily_prices are updated — dates with no OHLCV are silently skipped.
-        Returns the number of rows updated.
+        float values (e.g. 0.25 = 25% IV). Rows that already exist get their
+        implied_vol updated; rows that don't exist are inserted with NULL OHLCV
+        so the IV is available even before OHLCV data arrives.
+        Returns the number of rows upserted.
         """
         if iv_series is None or iv_series.empty:
             return 0
@@ -184,13 +216,20 @@ class HistoricalDataStore:
                 date_str = idx.date().isoformat()
             else:
                 date_str = str(idx)
-            rows.append((float(val), symbol, date_str))
+            rows.append((symbol, date_str, float(val)))
 
         with sqlite3.connect(self._db_path) as conn:
+            # Insert skeleton row if the date is not yet present, then set IV.
+            # INSERT OR IGNORE leaves existing OHLCV untouched; the UPDATE
+            # then stamps implied_vol on both new and pre-existing rows.
+            conn.executemany(
+                f"INSERT OR IGNORE INTO {self._daily_table} (symbol, date) VALUES (?, ?)",
+                [(symbol, date_str) for symbol, date_str, _ in rows],
+            )
             conn.executemany(
                 f"UPDATE {self._daily_table} SET implied_vol = ? "
                 "WHERE symbol = ? AND date = ?",
-                rows,
+                [(iv, sym, date_str) for sym, date_str, iv in rows],
             )
 
         log.debug("daily_iv_saved", symbol=symbol, rows=len(rows))
@@ -411,3 +450,93 @@ class HistoricalDataStore:
                 (symbol, interval),
             ).fetchone()
         return result[0] if result else 0
+
+    # ------------------------------------------------------------------
+    # Option spread calibration data
+    # ------------------------------------------------------------------
+
+    def save_spread_samples(self, symbol: str, df: pd.DataFrame) -> int:
+        """Bulk INSERT OR IGNORE spread samples from DataFrame.
+
+        DataFrame must have columns: sample_date, right, strike, dte, iv,
+        bid, ask, mid, half_spread_pct. Returns number of rows inserted.
+        """
+        if df is None or df.empty:
+            return 0
+
+        rows = []
+        for _, row in df.iterrows():
+            rows.append((
+                symbol,
+                str(row["sample_date"]),
+                str(row["right"]),
+                float(row["strike"]),
+                int(row["dte"]),
+                float(row["iv"]),
+                float(row["bid"]),
+                float(row["ask"]),
+                float(row["mid"]),
+                float(row["half_spread_pct"]),
+            ))
+
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                f"""INSERT OR IGNORE INTO {self._spread_samples_table}
+                   (symbol, sample_date, right, strike, dte, iv, bid, ask, mid, half_spread_pct)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                rows,
+            )
+
+        log.debug("spread_samples_saved", symbol=symbol, rows=len(rows))
+        return len(rows)
+
+    def save_spread_params(self, symbol: str, params: dict) -> None:
+        """INSERT OR REPLACE fitted spread model params for a symbol."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                f"""INSERT OR REPLACE INTO {self._spread_params_table}
+                   (symbol, calibrated_on, spread_base, spread_iv_sensitivity,
+                    spread_iv_threshold, spread_dte_sensitivity, spread_dte_threshold,
+                    spread_cap, sample_count, rmse)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    symbol,
+                    params["calibrated_on"],
+                    float(params["spread_base"]),
+                    float(params["spread_iv_sensitivity"]),
+                    float(params["spread_iv_threshold"]),
+                    float(params["spread_dte_sensitivity"]),
+                    int(params["spread_dte_threshold"]),
+                    float(params["spread_cap"]),
+                    int(params["sample_count"]),
+                    float(params["rmse"]) if params.get("rmse") is not None else None,
+                ),
+            )
+        log.debug("spread_params_saved", symbol=symbol)
+
+    def load_spread_params(self, symbol: str) -> dict | None:
+        """Load fitted spread params for a symbol. Returns None if not calibrated."""
+        with sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(
+                f"""SELECT symbol, calibrated_on, spread_base, spread_iv_sensitivity,
+                           spread_iv_threshold, spread_dte_sensitivity, spread_dte_threshold,
+                           spread_cap, sample_count, rmse
+                   FROM {self._spread_params_table} WHERE symbol = ?""",
+                (symbol,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return {
+            "symbol": row[0],
+            "calibrated_on": row[1],
+            "spread_base": row[2],
+            "spread_iv_sensitivity": row[3],
+            "spread_iv_threshold": row[4],
+            "spread_dte_sensitivity": row[5],
+            "spread_dte_threshold": row[6],
+            "spread_cap": row[7],
+            "sample_count": row[8],
+            "rmse": row[9],
+        }

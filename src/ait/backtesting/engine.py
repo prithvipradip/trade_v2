@@ -59,7 +59,7 @@ class Backtester:
         context_bars: int = 0,
         delta_short: float = 0.20,
         delta_long: float = 0.30,
-        iv_floor: float = 0.20,
+        iv_floor: float = 0.12,
         wing_floor_dollars: float = 5.0,
         wing_k: float = 1.0,
         delta_iv_scale: float = 0.0,
@@ -759,10 +759,13 @@ class Backtester:
         """Return IV for the current bar, in priority order:
 
         1. Stored IBKR daily implied_vol from the backfill (most realistic).
-        2. VIX proxy from market_context (interim: VIX / 100 * 1.05).
-        3. Synthetic fallback: realized_vol * 1.15 (original formula).
+        2. VIX proxy from market_context — accepts scalar or full DataFrame.
+           QQQ IV ≈ VIX × 1.10 (QQQ carries a small premium over SPX vol).
+        3. Synthetic fallback: realized_vol × 1.15.
 
-        Always applies iv_floor as a hard minimum.
+        Returns raw estimated IV without flooring. Credit-strategy entry gating
+        (iv < iv_floor → no trade) is enforced separately in _build_position so
+        that _get_iv remains a pure estimation function.
         """
         # Priority 1: stored IBKR IV
         if "implied_vol" in hist.columns:
@@ -770,20 +773,28 @@ class Backtester:
             if not last_iv.empty:
                 stored = float(last_iv.iloc[-1])
                 if stored > 0:
-                    return max(stored, self._iv_floor)
+                    return stored
 
-        # Priority 2: VIX proxy from market context
+        # Priority 2: VIX proxy from market context (scalar or DataFrame)
         if market_context:
             vix = market_context.get("vix_close") or market_context.get("vix")
-            if vix and vix > 0:
-                iv = float(vix) / 100.0 * 1.05
-                return max(iv, self._iv_floor)
+            if vix is not None:
+                if hasattr(vix, "reindex"):
+                    # Full VIX DataFrame — align to current hist and take last value
+                    vix_aligned = vix["Close"].reindex(hist.index, method="ffill")
+                    if not vix_aligned.empty:
+                        vix_val = float(vix_aligned.iloc[-1])
+                        if vix_val > 0:
+                            return vix_val / 100.0 * 1.10
+                else:
+                    vix_val = float(vix)
+                    if vix_val > 0:
+                        return vix_val / 100.0 * 1.05
 
         # Priority 3: synthetic fallback
         close_arr = hist["Close"].values
         rv = realized_vol(close_arr, window=20)
-        iv = rv * 1.15
-        return max(iv, self._iv_floor)
+        return rv * 1.15
 
     def _build_position(
         self,
@@ -801,6 +812,11 @@ class Backtester:
         dte = self._max_hold_days
         t = dte / 365.0
         r = 0.05
+
+        # Entry gate for credit strategies: insufficient IV → premiums too small to
+        # justify spread costs and risk. Honest no-trade rather than fake-pricing at floor.
+        if strategy in CREDIT_STRATEGIES and iv < self._iv_floor:
+            return None
 
         if strategy in CREDIT_STRATEGIES:
             return self._build_credit_position(strategy, underlying, iv, t, r, dte, today_date, capital)

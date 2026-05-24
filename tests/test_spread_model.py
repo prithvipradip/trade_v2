@@ -92,20 +92,23 @@ class TestSpreadReducesNetCredit:
 
 
 class TestParamSpacesContainSpread:
-    """T5-6: spread params present in STRATEGY_SPACES."""
+    """T5-6: spread params are NOT in STRATEGY_SPACES (P9 fix).
 
-    def test_iron_condor_has_spread_params(self) -> None:
-        ic_space = STRATEGY_SPACES.get("iron_condor", {})
-        assert "spread_base" in ic_space, \
-            "spread_base must be in iron_condor param space"
-        assert "spread_iv_sensitivity" in ic_space, \
-            "spread_iv_sensitivity must be in iron_condor param space"
+    Spread params are fixed config wired via WalkForwardConfig → Backtester;
+    they must not appear as Optuna search dimensions to avoid wasted dims.
+    """
 
-    def test_spread_base_range_is_plausible(self) -> None:
+    def test_iron_condor_excludes_spread_params(self) -> None:
         ic_space = STRATEGY_SPACES.get("iron_condor", {})
-        spec = ic_space.get("spread_base")
-        assert spec is not None
-        kind, low, high = spec[0], spec[1], spec[2]
-        assert kind == "float"
-        assert 0.01 <= low <= 0.05
-        assert 0.05 <= high <= 0.15
+        for key in ("spread_base", "spread_iv_sensitivity",
+                    "spread_dte_sensitivity", "spread_cap"):
+            assert key not in ic_space, (
+                f"{key} must NOT be in iron_condor param space — "
+                "spread params are fixed config, not Optuna dims (P9)"
+            )
+
+    def test_spread_defaults_on_walkforward_config(self) -> None:
+        from ait.backtesting.walkforward import WalkForwardConfig
+        cfg = WalkForwardConfig()
+        assert 0.0 < cfg.spread_base < 0.10
+        assert cfg.spread_cap > cfg.spread_base

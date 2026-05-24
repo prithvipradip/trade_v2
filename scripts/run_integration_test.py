@@ -579,6 +579,10 @@ async def _section_e_walkforward(
         wing_k=_bc.wing_k,
         iv_floor=_bc.iv_floor,
         delta_iv_scale=_bc.delta_iv_scale,
+        spread_base=_bc.spread_base,
+        spread_iv_sensitivity=_bc.spread_iv_sensitivity,
+        spread_dte_sensitivity=_bc.spread_dte_sensitivity,
+        spread_cap=_bc.spread_cap,
     )
 
     try:
@@ -647,6 +651,10 @@ async def _section_f_ablation(
         wing_k=_bc.wing_k,
         iv_floor=_bc.iv_floor,
         delta_iv_scale=_bc.delta_iv_scale,
+        spread_base=_bc.spread_base,
+        spread_iv_sensitivity=_bc.spread_iv_sensitivity,
+        spread_dte_sensitivity=_bc.spread_dte_sensitivity,
+        spread_cap=_bc.spread_cap,
     )
 
     try:

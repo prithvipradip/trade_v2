@@ -43,39 +43,65 @@ class TestGetIV:
         result = bt._get_iv(hist)
         assert result == pytest.approx(0.35, abs=0.001)
 
-    def test_respects_iv_floor_when_stored_iv_is_low(self) -> None:
+    def test_get_iv_returns_raw_stored_iv(self) -> None:
+        # _get_iv no longer floors — it returns raw estimates. Credit-strategy entry
+        # gating (iv < iv_floor → return None) is enforced in _build_position instead.
         bt = _make_backtester(iv_floor=0.20)
         hist = _make_ohlcv(60)
-        hist["implied_vol"] = 0.10  # below floor
+        hist["implied_vol"] = 0.10  # below floor — _get_iv returns it as-is
         result = bt._get_iv(hist)
-        assert result >= 0.20
+        assert result == pytest.approx(0.10, abs=0.001)
 
     def test_fallback_when_column_absent(self) -> None:
         bt = _make_backtester(iv_floor=0.20)
         hist = _make_ohlcv(60)
         assert "implied_vol" not in hist.columns
         result = bt._get_iv(hist)
-        assert result >= bt._iv_floor
         assert result > 0
+        assert np.isfinite(result)
 
     def test_fallback_when_value_is_nan(self) -> None:
         bt = _make_backtester(iv_floor=0.20)
         hist = _make_ohlcv(60)
         hist["implied_vol"] = float("nan")
         result = bt._get_iv(hist)
-        # NaN → synthetic fallback; must be >= floor and finite
-        assert result >= bt._iv_floor
+        assert result > 0
         assert np.isfinite(result)
 
-    def test_vix_proxy_produces_plausible_iv(self) -> None:
+    def test_vix_proxy_scalar_produces_plausible_iv(self) -> None:
         bt = _make_backtester(iv_floor=0.20)
         hist = _make_ohlcv(60)
-        # Inject vix-like market context
         market_ctx = {"vix_close": 22.0}
         result = bt._get_iv(hist, market_context=market_ctx)
-        # Should be at least the floor and something reasonable
-        assert result >= 0.20
+        assert pytest.approx(result, abs=0.01) == 22.0 / 100.0 * 1.05
         assert result < 2.0
+
+    def test_vix_proxy_dataframe_produces_plausible_iv(self) -> None:
+        bt = _make_backtester(iv_floor=0.20)
+        hist = _make_ohlcv(60)
+        # Pass VIX as a DataFrame (the format walkforward uses)
+        vix_df = pd.DataFrame({"Close": [18.0] * 60}, index=hist.index)
+        market_ctx = {"vix": vix_df}
+        result = bt._get_iv(hist, market_context=market_ctx)
+        assert pytest.approx(result, abs=0.01) == 18.0 / 100.0 * 1.10
+        assert result < 2.0
+
+    def test_credit_entry_blocked_when_iv_below_floor(self) -> None:
+        # Entry gate: _build_position returns None for credit strategies when iv < iv_floor.
+        bt = _make_backtester(iv_floor=0.20)
+        hist = _make_ohlcv(90)
+        hist["implied_vol"] = 0.10  # raw IV below floor
+        row = hist.iloc[-1]
+        from ait.backtesting.engine import SignalDirection
+        result = bt._build_position(
+            strategy="iron_condor",
+            direction=SignalDirection.NEUTRAL,
+            row=row,
+            hist=hist,
+            today_date=hist.index[-1].date(),
+            capital=50_000,
+        )
+        assert result is None, "Credit strategy must be blocked when IV < iv_floor"
 
 
 class TestIVEffect:

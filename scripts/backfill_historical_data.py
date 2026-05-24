@@ -62,6 +62,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help='IBKR bar size for intraday mode (default: "5 mins").',
     )
     parser.add_argument(
+        "--what-to-show", default="MIDPOINT",
+        choices=["TRADES", "MIDPOINT", "BID", "ASK"],
+        help="IBKR whatToShow for intraday bars (default: MIDPOINT). "
+             "TRADES requires a market data subscription; MIDPOINT works on paper accounts.",
+    )
+    parser.add_argument(
         "--db-path", default="data/historical.db", metavar="PATH",
         help="SQLite DB path (default: data/historical.db).",
     )
@@ -76,12 +82,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="IBKR client ID (default: 90 — must not conflict with bot).",
     )
     parser.add_argument(
-        "--chunk-months", type=int, default=6, choices=[1, 2, 3, 6],
-        help="Months per IBKR request chunk for intraday (default: 6).",
+        "--chunk-months", type=int, default=1, choices=[1, 2, 3, 6],
+        help="Months per IBKR request chunk for intraday (default: 1). "
+             "Smaller chunks are more reliable; 6 can time out on slow connections.",
     )
     parser.add_argument(
-        "--pause-secs", type=float, default=1.0, metavar="SECS",
-        help="Pause between requests to respect IBKR pacing (default: 1.0 s).",
+        "--pause-secs", type=float, default=10.0, metavar="SECS",
+        help="Pause between requests to respect IBKR pacing (default: 10.0 s). "
+             "IBKR allows 60 requests per 10 min; 10 s keeps well under the limit.",
     )
     parser.add_argument(
         "--table-prefix", default="", metavar="PREFIX",
@@ -128,6 +136,7 @@ async def _backfill_intraday_symbol(
     symbol: str,
     chunks: list[tuple[datetime, str]],
     bar_size: str,
+    what_to_show: str,
     store,
     pause_secs: float,
     dry_run: bool,
@@ -166,7 +175,7 @@ async def _backfill_intraday_symbol(
                 endDateTime=end_str,
                 durationStr=duration,
                 barSizeSetting=bar_size,
-                whatToShow="TRADES",
+                whatToShow=what_to_show,
                 useRTH=True,
                 formatDate=1,
             )
@@ -319,7 +328,8 @@ async def _main(args: argparse.Namespace) -> int:
     print(f"Backfill plan: {len(args.symbols)} symbol(s), mode={args.mode}")
     if do_intraday:
         print(f"  intraday: {len(intraday_chunks)} chunk(s) × {len(args.symbols)} = "
-              f"{len(intraday_chunks) * len(args.symbols)} IBKR requests")
+              f"{len(intraday_chunks) * len(args.symbols)} IBKR requests "
+              f"[whatToShow={args.what_to_show}]")
     if do_iv:
         print(f"  daily iv: {int(max(1, args.years))} chunk(s) × {len(args.symbols)} = "
               f"{int(max(1, args.years)) * len(args.symbols)} IBKR requests")
@@ -348,6 +358,11 @@ async def _main(args: argparse.Namespace) -> int:
         print(f"ERROR: could not connect to IBKR: {e}")
         return 1
 
+    # Allow up to 5 minutes per historical data request (default is 60 s, which
+    # is too short for a 6-month 5-min bar chunk — IBKR can take 90–180 s to
+    # stream ~10,000 bars).
+    ib.RequestTimeout = 300
+
     print("Connected. Starting backfill...\n")
     t_start = time.time()
     grand_total = 0
@@ -358,7 +373,7 @@ async def _main(args: argparse.Namespace) -> int:
         if do_intraday:
             print(f"  Backfilling 5-min bars for {sym}...")
             n = await _backfill_intraday_symbol(
-                ib, sym, intraday_chunks, args.bar_size,
+                ib, sym, intraday_chunks, args.bar_size, args.what_to_show,
                 store, pause_secs=args.pause_secs, dry_run=args.dry_run,
             )
             print(f"  [{sym}] intraday total rows upserted: {n}")

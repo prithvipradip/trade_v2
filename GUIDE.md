@@ -1041,9 +1041,12 @@ backtest:
                                    # 0.3 = tight (high theta, high gamma risk)
                                    # 1.0 = 1-sigma expected move (balanced default)
                                    # 2.0 = wide (low theta, low assignment risk)
-  iv_floor: 0.20                  # Min synthetic IV for option pricing
-                                   # 0.20 = SPY/QQQ in normal markets
-                                   # 0.30+ for high-vol stocks (NVDA, AMD)
+  iv_floor: 0.12                  # Credit-strategy entry gate: skip iron condor / short strangle
+                                   # when estimated IV < this threshold (default 0.12).
+                                   # This is NOT a pricing floor — _get_iv() returns raw IV.
+                                   # IV estimation priority: (1) stored IBKR implied_vol,
+                                   # (2) VIX daily closes loaded via yfinance (vix/100 × 1.10 for QQQ),
+                                   # (3) realized_vol × 1.15 fallback.
   delta_iv_scale: 0.0             # IV-driven delta scaling for strangles (short and long).
                                    # 0.0 = static delta regardless of current IV (default)
                                    # 1.0 = full IV response: high IV → go further OTM
@@ -1264,7 +1267,7 @@ python run_backtest.py --compare-exits           # Fixed vs trailing stops
 
 **Data:** IB SQLite store (5-min bars resampled to daily, up to 2 years) via `load_daily_ohlcv()`. Falls back to Yahoo Finance when IB data is unavailable. A completed IB backfill (`--years 2`) is needed for best results.
 
-**Options pricing:** Black-Scholes using stored IBKR implied vol when available (from `daily_prices.implied_vol`), falling back to `realized_vol × 1.15` when the column is absent or null. `iv_floor`, `delta_short`, `delta_long`, and the per-leg bid-ask spread params (`spread_base`, `spread_iv_sensitivity`, `spread_dte_sensitivity`) are searchable by Optuna.
+**Options pricing:** Black-Scholes using stored IBKR implied vol when available (from `daily_prices.implied_vol`), falling back to VIX daily closes (`vix/100 × 1.10` for QQQ, loaded via yfinance), then `realized_vol × 1.15`. `delta_short`, `delta_long`, and structural params are searchable by Optuna. Spread params (`spread_base`, `spread_iv_sensitivity`, `spread_dte_sensitivity`, `spread_cap`) and `iv_floor` are fixed config values — not Optuna search dimensions for iron_condor (see P7, P8, P9).
 
 **The Tier 1 range model is included:** When backtesting iron condors, the `RangePredictor` is trained per window and gates entries, matching the live system's behavior.
 
@@ -1356,17 +1359,21 @@ Each strategy has a defined search space in `param_spaces.py`:
 | Parameter (iron condor) | Search Range | Effect |
 |---|---|---|
 | `delta_short` | float [0.15, 0.30] | Delta of the short call and put legs |
-| `max_hold_days` | int [14, 45] | Entry DTE / max hold duration |
+| `max_hold_days` | int [14, 40] | Entry DTE / max hold duration (≤ 40 to stay inside 42d test window) |
 | `stop_loss_pct` | float [0.30, 0.70] | Exit when unrealised loss reaches this % of premium |
-| `profit_target_pct` | float [0.30, 0.70] | Exit at this % profit (no arbitrary 50% cap) |
-| `trailing_stop_pct` | float [0.15, 0.40] | Trail behind HWM once breakeven is triggered |
-| `iv_floor` | float [0.15, 0.40] | Minimum IV used in Black-Scholes pricing |
-| `wing_k` | float [0.30, 2.00] | Vol-scaled wing multiplier — iron condor and put_credit_spread only. 1.0 = 1-sigma expected move. |
+| `profit_target_pct` | float [0.30, 0.70] | Exit at this % profit |
+| `trailing_stop_fraction` | float [0.30, 0.90] | Derived trailing stop: `trailing_stop_pct = fraction × profit_target_pct`; keeps trailing stop logically coupled to profit target |
+| `wing_k` | float [0.30, 2.00] | Vol-scaled wing multiplier. 1.0 = 1-sigma expected move. |
 | `hurst_regime_threshold` | float [0.08, 0.30] | Fractal gate: min Hurst exponent required to enter |
 | `hurst_regime_penalty` | float [0.00, 0.25] | Score penalty when Hurst is near the threshold |
 | `multifractal_max_width` | float [0.30, 0.65] | Fractal gate: max multifractal spectrum width allowed |
 
-> **`min_confidence` and `max_entry_vol_annual` are intentionally excluded from the iron condor search space.** Experiments 2–4 showed that Optuna reliably finds degenerate in-sample solutions by parking `min_confidence` at ceiling (0.70) or `max_entry_vol_annual` at floor, which blocks all OOS trades across consecutive test windows. Removing both from the search space (Experiment 5) produced +183% OOS return vs +9% ablation baseline — the first experiment where optimization dramatically outperformed no-optimization. Both parameters remain active at their config defaults (`min_confidence=0.55`, `max_entry_vol_annual=0.80`); they are simply not searchable. `min_confidence` remains in the search space for debit strategies (`long_call`, `long_put`, `bull_call_spread`, `bear_put_spread`) and `short_strangle`, where overfitting pressure is lower.
+> **Intentionally excluded from the iron condor search space (P5, P8, P9):**
+> - `min_confidence`, `max_entry_vol_annual` — regime gates; Optuna parks them at extremes to produce 0-trade OOS solutions (Exp 2–4). Fixed at config defaults (P5).
+> - `iv_floor` — credit-strategy entry gate; Optuna finds different values for train vs OOS, creating a regime wall. Fixed at config default 0.12 (P8).
+> - `spread_base`, `spread_iv_sensitivity`, `spread_dte_sensitivity`, `spread_cap` — fixed config values wired via WalkForwardConfig → Backtester; not Optuna dims (P7, P9).
+>
+> All excluded params remain active at their config defaults. `min_confidence` remains searchable for debit strategies (`long_call`, `long_put`, `bull_call_spread`, `bear_put_spread`) and `short_strangle`, where overfitting pressure is lower.
 
 Debit strategies (`long_call`, `long_put`, `bull_call_spread`, `bear_put_spread`) also search over `delta_long` [0.25–0.55] and `max_hold_days` [14–60].
 
@@ -1402,18 +1409,21 @@ All three flags are optional — if omitted, the values are read from `optimize_
 
 **Range predictor gate:** For iron_condor and short_strangle, the engine calls the range predictor before entering. If `P(in_range) < range_min_confidence` (default 0.55), the signal is skipped entirely — no fallback to directional strategies. Directional strategies (bear_put_spread, bull_call_spread, long_strangle) were tested as range-gate fallbacks but produced consistent losses because the ML model's directional accuracy (~22%) is too low to support them. The correct behaviour when iron_condor is blocked is to pass on the trade.
 
-**QQQ 2025 integration test findings (28-window walk-forward, 365/42/14/5 config):** Five experiments were run on QQQ 2024–2026 to diagnose and fix optimizer overfitting:
+**QQQ integration test findings (walk-forward, 365/42/14/5 config, 2024–2026):** Six experiments run to diagnose optimizer overfitting and fix infrastructure bugs:
 
-| Experiment | Search space | Optimized return | Ablation return | Trades | Sharpe |
+| Experiment | Search space / Key change | Optimized return | Ablation return | Trades | Sharpe |
 |---|---|---|---|---|---|
-| Exp 2 (baseline) | All params incl. `min_confidence` + `max_entry_vol_annual` | ~0% (0 trades, most windows) | — | — | — |
+| Exp 2 | All params incl. `min_confidence` + `max_entry_vol_annual` | ~0% (0 OOS trades) | — | — | — |
 | Exp 3 | Same | −16% | ~+9% | ~2 | — |
 | Exp 4 | Added vol gate | −21% | ~+9% | ~9 | — |
-| **Exp 5** | **Removed `min_confidence` + `max_entry_vol_annual` from iron_condor** | **+183%** | **+9%** | **91** | **23.95** |
+| **Exp 5** | **Removed `min_confidence` + `max_entry_vol_annual` from search space** | **+183%** | **+9%** | **91** | **23.95** |
+| Exp 6 | Spread wiring fixed; spread params + `iv_floor` removed from search space; VIX-based IV | +11.88% | +22.68% | 14 / 36 | 39 / 9.7 |
 
-**Root cause of Experiments 2–4 failure:** Optuna found degenerate in-sample solutions by maximising `min_confidence` toward the ceiling or driving `max_entry_vol_annual` to the floor, which blocked all OOS trades. With 0 OOS trades the objective is undefined and any comparison is meaningless. Removing both regime filters from the search space entirely resolved this — the optimizer could only tune structural parameters (delta, hold days, stops, wing width), producing genuine edge.
+**Root cause of Experiments 2–4 failure:** Optuna maximised `min_confidence` toward the ceiling or drove `max_entry_vol_annual` to the floor, blocking all OOS trades. Removing both from the search space resolved this.
 
-**Fix:** `min_confidence` and `max_entry_vol_annual` are fixed at config defaults for iron_condor and no longer searchable. See the Parameter Spaces table above.
+**Exp 6 finding:** Ablation (+22.68%, 36 trades) outperformed optimization (+11.88%, 14 trades). Root cause: `iv_floor` in the search space created a train/OOS mismatch during the 2025–2026 vol regime shift, and 6 wasted search dimensions (spread params + fractal params not applied to training) consumed Optuna's trial budget. Both fixed for Exp 7.
+
+**Current fix for iron_condor search space (Exp 7 onwards):** `min_confidence`, `max_entry_vol_annual`, `iv_floor`, and all spread params are fixed at config defaults — not searchable. See Parameter Spaces table above.
 
 ---
 

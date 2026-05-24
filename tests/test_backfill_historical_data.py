@@ -344,3 +344,141 @@ class TestLoadIntradayRange:
             ts_date = ts.date() if hasattr(ts, "date") else pd.Timestamp(ts).date()
             assert start <= ts_date <= end, \
                 f"Bar at {ts_date} outside requested range [{start}, {end}]"
+
+
+# ---------------------------------------------------------------------------
+# T0-9: option_spread_samples table
+# ---------------------------------------------------------------------------
+
+def _make_spread_samples(n: int = 10) -> pd.DataFrame:
+    """Build a minimal spread samples DataFrame."""
+    rows = []
+    base_date = dt.date(2024, 1, 15)
+    for i in range(n):
+        d = base_date + dt.timedelta(days=i * 30)
+        rows.append({
+            "sample_date": str(d),
+            "right": "C" if i % 2 == 0 else "P",
+            "strike": 480.0 + i,
+            "dte": 14 + i,
+            "iv": 0.20 + i * 0.01,
+            "bid": 1.00,
+            "ask": 1.10,
+            "mid": 1.05,
+            "half_spread_pct": 0.048,
+        })
+    return pd.DataFrame(rows)
+
+
+class TestSpreadSamplesTable:
+    """T0-9: option_spread_samples round-trips correctly."""
+
+    def test_spread_samples_table_created(self) -> None:
+        store = _temp_store()
+        with sqlite3.connect(store._db_path) as conn:
+            cols = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(option_spread_samples)"
+                ).fetchall()
+            }
+        expected = {
+            "symbol", "sample_date", "right", "strike", "dte",
+            "iv", "bid", "ask", "mid", "half_spread_pct",
+        }
+        assert expected <= cols
+
+    def test_save_and_load_spread_samples(self) -> None:
+        store = _temp_store()
+        df = _make_spread_samples(n=5)
+        stored = store.save_spread_samples("QQQ", df)
+        assert stored == 5
+
+        with sqlite3.connect(store._db_path) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM option_spread_samples WHERE symbol = 'QQQ'"
+            ).fetchone()[0]
+        assert count == 5
+
+    def test_spread_samples_upsert_idempotency(self) -> None:
+        store = _temp_store()
+        df = _make_spread_samples(n=5)
+        store.save_spread_samples("QQQ", df)
+        store.save_spread_samples("QQQ", df)  # second call should not duplicate
+
+        with sqlite3.connect(store._db_path) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM option_spread_samples WHERE symbol = 'QQQ'"
+            ).fetchone()[0]
+        assert count == 5, "Duplicate save should not insert extra rows"
+
+    def test_save_spread_samples_empty_df(self) -> None:
+        store = _temp_store()
+        stored = store.save_spread_samples("QQQ", pd.DataFrame())
+        assert stored == 0
+
+
+# ---------------------------------------------------------------------------
+# T0-10: option_spread_params round-trip
+# ---------------------------------------------------------------------------
+
+_SAMPLE_PARAMS = {
+    "calibrated_on": "2024-06-01",
+    "spread_base": 0.012,
+    "spread_iv_sensitivity": 0.048,
+    "spread_iv_threshold": 0.15,
+    "spread_dte_sensitivity": 0.002,
+    "spread_dte_threshold": 21,
+    "spread_cap": 0.08,
+    "sample_count": 120,
+    "rmse": 0.0031,
+}
+
+
+class TestSpreadParamsTable:
+    """T0-10: option_spread_params round-trips correctly."""
+
+    def test_save_and_load_spread_params(self) -> None:
+        store = _temp_store()
+        store.save_spread_params("QQQ", _SAMPLE_PARAMS)
+        result = store.load_spread_params("QQQ")
+
+        assert result is not None
+        assert result["symbol"] == "QQQ"
+        assert result["spread_base"] == pytest.approx(0.012, rel=1e-4)
+        assert result["spread_iv_sensitivity"] == pytest.approx(0.048, rel=1e-4)
+        assert result["spread_cap"] == pytest.approx(0.08, rel=1e-4)
+        assert result["sample_count"] == 120
+        assert result["rmse"] == pytest.approx(0.0031, rel=1e-3)
+
+    def test_load_spread_params_missing_symbol(self) -> None:
+        store = _temp_store()
+        result = store.load_spread_params("MISSING")
+        assert result is None
+
+    def test_save_spread_params_upsert(self) -> None:
+        store = _temp_store()
+        store.save_spread_params("QQQ", _SAMPLE_PARAMS)
+        updated = dict(_SAMPLE_PARAMS)
+        updated["spread_base"] = 0.025
+        store.save_spread_params("QQQ", updated)
+
+        result = store.load_spread_params("QQQ")
+        assert result is not None
+        assert result["spread_base"] == pytest.approx(0.025, rel=1e-4)
+
+    def test_spread_params_table_created(self) -> None:
+        store = _temp_store()
+        with sqlite3.connect(store._db_path) as conn:
+            cols = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(option_spread_params)"
+                ).fetchall()
+            }
+        expected = {
+            "symbol", "calibrated_on", "spread_base", "spread_iv_sensitivity",
+            "spread_iv_threshold", "spread_dte_sensitivity", "spread_dte_threshold",
+            "spread_cap", "sample_count", "rmse",
+        }
+        assert expected <= cols

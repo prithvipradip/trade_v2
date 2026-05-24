@@ -57,12 +57,15 @@ def _make_ohlcv(n: int = 300) -> pd.DataFrame:
 
 class TestParamSpaces:
     def test_iron_condor_space_has_required_keys(self):
-        required = {"min_confidence", "stop_loss_pct", "profit_target_pct",
-                    "delta_short", "max_hold_days", "iv_floor"}
+        required = {"stop_loss_pct", "profit_target_pct", "delta_short", "max_hold_days", "wing_k"}
         assert required.issubset(IRON_CONDOR_SPACE.keys())
 
-    def test_all_strategy_spaces_have_min_confidence(self):
+    def test_non_iron_condor_spaces_have_min_confidence(self):
+        # iron_condor removed min_confidence from its search space (uses fixed value);
+        # all other strategies still include it.
         for name, space in STRATEGY_SPACES.items():
+            if name == "iron_condor":
+                continue
             assert "min_confidence" in space, f"{name} missing min_confidence"
 
     def test_strategy_spaces_dict_covers_major_strategies(self):
@@ -216,7 +219,9 @@ class TestOptimizationResult:
             # Use real param names so _PARAM_MAP picks them up
             trial.suggest_float("iron_condor__min_confidence", 0.55, 0.80)
             trial.suggest_float("iron_condor__stop_loss_pct", 0.30, 0.70)
-            trial.suggest_float("iron_condor__trailing_stop_pct", 0.15, 0.40)
+            # trailing_stop_fraction replaced trailing_stop_pct — apply_to_config maps
+            # the raw stop_loss_pct directly; trailing_stop_fraction is a derived param
+            # handled by the optimizer, not written to config by apply_to_config.
             return 1.0
 
         study.optimize(obj, n_trials=2)
@@ -229,7 +234,7 @@ class TestOptimizationResult:
         assert "risk" in data
         assert "min_confidence" in data["risk"]
         assert "exit" in data
-        assert "initial_stop_loss_pct" in data["exit"] or "trailing_stop_pct" in data["exit"]
+        assert "initial_stop_loss_pct" in data["exit"]
 
 
 # ---------------------------------------------------------------------------
@@ -388,11 +393,14 @@ class TestWingKOptimization:
         low, high = PUT_CREDIT_SPREAD_SPACE["wing_k"][1], PUT_CREDIT_SPREAD_SPACE["wing_k"][2]
         assert low < 1.0 < high
 
-    def test_iron_condor_space_has_max_entry_vol(self):
+    def test_iron_condor_regime_gates_excluded_from_space(self):
+        # iv_floor and max_entry_vol_annual are regime gates; in-sample optima don't
+        # generalise OOS (P8). Both are fixed in config, not optimized by Optuna.
+        # spread_* are calibrated from real data and must stay fixed (P9).
         from ait.optimization.param_spaces import IRON_CONDOR_SPACE
-        assert "max_entry_vol_annual" in IRON_CONDOR_SPACE
-        low, high = IRON_CONDOR_SPACE["max_entry_vol_annual"][1], IRON_CONDOR_SPACE["max_entry_vol_annual"][2]
-        assert low < 0.60 < high, "Liberation Day vol (~60%) must be inside the search range"
+        for excluded in ("iv_floor", "max_entry_vol_annual",
+                         "spread_base", "spread_iv_sensitivity", "spread_dte_sensitivity"):
+            assert excluded not in IRON_CONDOR_SPACE, f"{excluded} should not be in IRON_CONDOR_SPACE"
 
     def test_short_strangle_space_has_max_entry_vol(self):
         from ait.optimization.param_spaces import SHORT_STRANGLE_SPACE

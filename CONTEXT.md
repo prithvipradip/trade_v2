@@ -217,7 +217,7 @@ run_orchestrator.py          ← Master process (start here)
 ### Parameter Optimization
 - [x] Optuna `StrategyOptimizer` — Bayesian/TPE with MedianPruner
 - [x] Per-strategy parameter spaces (iron_condor, long_call, bull_call_spread, bear_put_spread, put_credit_spread, short_strangle, long_strangle)
-- [x] `delta_short` / `delta_long` / `iv_floor` / `wing_floor_dollars` / `max_hold_days` wired into `Backtester.__init__` and searchable by optimizer
+- [x] `delta_short` / `delta_long` / `wing_floor_dollars` / `max_hold_days` wired into `Backtester.__init__` and searchable by optimizer; `iv_floor` is wired but fixed as a config gate (not searched by Optuna for iron_condor — see P8)
 - [x] `wing_k` — vol-scaled wing multiplier: `wing = wing_k × price × IV × √(DTE/365)`; Optuna-optimized per window [0.30–2.00]; `wing_floor_dollars` remains as hard minimum floor
 - [x] `delta_iv_scale` — IV-driven delta scaling for strangles: 0=static, 1=full response; high IV → lower effective delta → further OTM strikes
 - [x] `BacktestConfig` added to `settings.py` — `initial_capital`, `position_size_pct`, `wing_floor_dollars`, `iv_floor`, `wing_k`, `delta_iv_scale` all read from `config.yaml`; no code changes needed to adjust capital size or spread width
@@ -274,26 +274,30 @@ run_orchestrator.py          ← Master process (start here)
 - Sharpe 1.51
 - +49.62% alpha over buy-and-hold
 
-### QQQ integration tests (28-window walk-forward, 365/42/14/5 config, 2024-2026)
+### QQQ integration tests (walk-forward, 365/42/14/5 config, 2024-2026)
 
-Five experiments were run to diagnose optimizer overfitting. All use iron_condor, 50 Optuna trials/window, per-strategy optimization.
+Six experiments run to diagnose optimizer overfitting and fix infrastructure bugs. All use iron_condor, 50 Optuna trials/window, per-strategy optimization.
 
-| Archive | Config | Optimized | Ablation | Sharpe | Trades | Profit Factor |
+| Archive | Windows | Optimized | Ablation | Sharpe | Trades | Key Change |
 |---|---|---|---|---|---|---|
-| `QQQ_2Y_iron_condor_per_strategy_20260512` | 365d/63d, all params | −21% | ~+9% | — | — | — |
-| `QQQ_365d_iron_condor_20260513_1831` | 365d/42d, all params | ~0% | — | — | — | 0.0 |
-| `QQQ_365d_iron_condor_20260514_1308` | 365d/42d, all params | −16% | ~+9% | — | ~2 | 63.87 |
-| `QQQ_365d_iron_condor_20260514_2359` | 365d/42d, +vol gate | −21% | ~+9% | — | ~9 | 6.55 |
-| **`QQQ_365d_iron_condor_20260514_1142`** | **365d/42d, no regime filters** | **+183%** | **+9%** | **23.95** | **91** | **89.39** |
+| `QQQ_2Y_iron_condor_per_strategy_20260512` | 18 | −21% | ~+9% | — | — | First integration test |
+| `QQQ_365d_iron_condor_20260513_1831` | 28 | ~0% | — | — | — | Shorter windows |
+| `QQQ_365d_iron_condor_20260514_1308` | 28 | −16% | ~+9% | — | ~2 | Repeat to confirm |
+| `QQQ_365d_iron_condor_20260514_2359` | 28 | −21% | ~+9% | — | ~9 | Vol gate |
+| **`QQQ_365d_iron_condor_20260514_1142`** | **28** | **+183%** | **+9%** | **23.95** | **91** | **No regime filters** |
+| `QQQ_365d_iron_condor_20260524_1825` | 24 | +11.88% | +22.68% | 39.12 / 9.70 | 14 / 36 | Spread wiring + calibration |
 
 MLflow experiment: `walkforward_QQQ` (browse via `mlflow ui --backend-store-uri sqlite:///data/mlflow.db --port 5001`; backfill via `scripts/backfill_mlflow.py`).
 
-**Root cause of Experiments 1–4 failure:** Optuna found degenerate in-sample solutions by parking `min_confidence` at ceiling or `max_entry_vol_annual` at floor — blocking all OOS trades per window. **Fix (Experiment 5):** removed both from the iron_condor search space. Params remain fixed at config defaults; they are simply not searchable.
+**Root cause of Experiments 1–4 failure:** Optuna found degenerate in-sample solutions by parking `min_confidence` at ceiling or `max_entry_vol_annual` at floor — blocking all OOS trades per window. **Fix (Experiment 5):** removed both from the iron_condor search space.
+
+**Exp 6 finding:** Ablation (+22.68%) beat the optimized run (+11.88%) — Optuna's `min_trades` filter reduced trade frequency below the baseline. Also: 13/24 windows went inactive (W12–W24) due to `iv_floor` train/OOS mismatch during the 2025–2026 vol regime shift.
 
 **Key lessons:**
-- Regime-filter params (`min_confidence`, `max_entry_vol_annual`) are overfitting pressure sinks — exclude from optimizer search space for iron_condor
-- Iron condors are the reliable core for QQQ; directional strategies require significantly higher ML directional accuracy (~22% is too low)
-- Ablation (+9%) shows market baseline; optimization (+183%) demonstrates genuine edge when search space is correctly scoped
+- Regime-filter params (`min_confidence`, `max_entry_vol_annual`, `iv_floor`) are overfitting pressure sinks — fix in config, don't let Optuna search them for iron_condor
+- Spread params are fixed config wired through WalkForwardConfig → Backtester, not Optuna dims
+- Iron condors are the reliable core for QQQ; directional strategies require significantly higher ML directional accuracy
+- VIX time series must be used for IV estimation — a constant `iv_floor` silently corrupts MetaLabeler features
 
 ### Small account ($700)
 - Backtest pending...
@@ -396,7 +400,7 @@ All in `config.yaml`:
 - `backtest.initial_capital` — starting capital for walk-forward / integration tests (default $100,000)
 - `backtest.position_size_pct` — fraction of capital risked per trade on a max-loss basis (default 0.05); raise to 0.20 for accounts < $10k
 - `backtest.wing_floor_dollars` — minimum iron condor wing width in dollars (default 5.0); lower to 1.0 for cheap underlyings like MARA, SOFI, RIOT
-- `backtest.iv_floor` — minimum synthetic IV used in Black-Scholes pricing (default 0.20); prevents near-zero credits in calm markets
+- `backtest.iv_floor` — credit-strategy entry gate: skip iron condor / short strangle when IV < this threshold (default 0.12); NOT a pricing floor — `_get_iv()` returns raw IV; VIX is loaded as a time series and used as Priority 2 IV estimate (`vix / 100 × 1.10` for QQQ)
 
 Secrets in `.env`:
 - `IBKR_HOST`, `IBKR_PORT`, `IBKR_CLIENT_ID`, `IBKR_ACCOUNT`
@@ -406,4 +410,4 @@ Secrets in `.env`:
 
 ---
 
-*Last updated: 2026-05-14*
+*Last updated: 2026-05-24*
