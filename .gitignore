@@ -22,6 +22,8 @@ logs/
 reports/integration_test/
 
 # MLflow experiment tracking (data/mlflow.db + data/mlruns/ — covered by /data/ above)
+mlflow.db
+mlruns/
 
 # Secrets
 .env
