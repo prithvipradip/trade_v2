@@ -27,13 +27,40 @@ class TestVLMCReportImport:
             )
 
 
+def _make_daily_ohlcv(n_days: int = 400, days_ago: int = 0) -> pd.DataFrame:
+    """Synthetic daily OHLCV DataFrame with a rolling date index."""
+    rng = np.random.default_rng(99)
+    end = datetime.date.today() - datetime.timedelta(days=days_ago)
+    dates = pd.bdate_range(end=end, periods=n_days)
+    close = 500.0 * np.cumprod(1 + rng.normal(0, 0.01, n_days))
+    return pd.DataFrame({
+        "Open":   close * (1 - rng.uniform(0, 0.003, n_days)),
+        "High":   close * (1 + rng.uniform(0, 0.005, n_days)),
+        "Low":    close * (1 - rng.uniform(0, 0.005, n_days)),
+        "Close":  close,
+        "Volume": rng.integers(3_000_000, 10_000_000, n_days).astype(float),
+    }, index=dates)
+
+
 class TestVLMCDiagnosticPlots:
 
-    def _make_intraday_multi_session(self, n_sessions: int = 20) -> pd.DataFrame:
-        """Build n_sessions × 78 bars of synthetic intraday data."""
+    def _make_intraday_multi_session(
+        self, n_sessions: int = 20, days_ago: int = 200
+    ) -> pd.DataFrame:
+        """Build n_sessions × 78 bars of synthetic intraday data.
+
+        ``days_ago`` anchors the first session relative to today so the
+        generated data always stays within yfinance's ~500-day lookback.
+        """
         from datetime import datetime, timezone, timedelta
         bars_per_session = 78
-        start = datetime(2026, 1, 2, 13, 30, tzinfo=timezone.utc)
+        anchor = datetime.today() - timedelta(days=days_ago)
+        # advance to a weekday if the anchor lands on a weekend
+        while anchor.weekday() >= 5:
+            anchor += timedelta(days=1)
+        start = anchor.replace(hour=13, minute=30, second=0, microsecond=0).replace(
+            tzinfo=timezone.utc
+        )
         idx = []
         day_offset = 0
         session_count = 0
@@ -99,32 +126,56 @@ class TestVLMCDiagnosticPlots:
         assert fig is not None
 
     def test_generate_report_with_intraday_db_creates_html(self, tmp_path: Path) -> None:
-        """generate_report() produces HTML even when intraday DB is missing."""
+        """generate_report() produces HTML when IB intraday data is in the DB.
+
+        Seeds 120 intraday sessions (~120 daily bars after resampling) so that
+        load_daily_ohlcv() uses IB data rather than falling back to yfinance.
+        This mirrors real run conditions where an IB backfill has been completed.
+        """
+        from ait.data.historical import HistoricalDataStore
         from ait.diagnostics.report import generate_report
+
+        store = HistoricalDataStore(db_path=tmp_path / "test.db")
+        intraday = self._make_intraday_multi_session(n_sessions=120, days_ago=200)
+        store.save_intraday("SPY", intraday, interval="5m")
+
+        # Derive date range from the seeded data; leave 30 sessions as warm-up
+        daily_idx = pd.to_datetime(
+            intraday.index.normalize().unique().sort_values()
+        )
+        start = daily_idx[30].date().isoformat()
+        end   = daily_idx[-1].date().isoformat()
+
         generate_report(
             symbols=["SPY"],
-            start="2023-01-01",
-            end="2023-12-31",
+            start=start,
+            end=end,
             output_dir=str(tmp_path),
             fmt="html",
-            db_path=str(tmp_path / "nonexistent.db"),
+            db_path=str(tmp_path / "test.db"),
         )
         html_files = list(tmp_path.glob("*.html"))
         assert len(html_files) >= 1
 
     def test_generate_report_with_real_intraday_db_includes_vlmc(self, tmp_path: Path) -> None:
-        """generate_report() includes VLMC plots when intraday data is in the DB."""
+        """generate_report() includes VLMC plots when IB intraday data is in the DB."""
         from ait.data.historical import HistoricalDataStore
         from ait.diagnostics.report import generate_report
 
         store = HistoricalDataStore(db_path=tmp_path / "test.db")
-        intraday = self._make_intraday_multi_session(30)
+        intraday = self._make_intraday_multi_session(n_sessions=120, days_ago=200)
         store.save_intraday("SPY", intraday, interval="5m")
+
+        daily_idx = pd.to_datetime(
+            intraday.index.normalize().unique().sort_values()
+        )
+        start = daily_idx[30].date().isoformat()
+        end   = daily_idx[-1].date().isoformat()
 
         generate_report(
             symbols=["SPY"],
-            start="2023-01-01",
-            end="2023-12-31",
+            start=start,
+            end=end,
             output_dir=str(tmp_path),
             fmt="html",
             db_path=str(tmp_path / "test.db"),

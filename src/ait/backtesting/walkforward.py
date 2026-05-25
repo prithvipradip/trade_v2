@@ -527,8 +527,10 @@ class WalkForwardBacktester:
                     vix_ctx=_vix_train_ctx,
                 )
 
-                # Prepend training data context so ML features can be computed
-                # (feature engine needs 50+ bars of rolling history)
+                # Prepend training data context so ML features can be computed.
+                # vol_60 is the longest non-min_periods rolling window (60 bars);
+                # with 60 context rows + 1 OOS row = 61-row hist, exactly 1 valid
+                # feature row survives dropna → predictions work from the first OOS bar.
                 context_bars = 60
                 test_with_context = pd.concat([train_df.tail(context_bars), test_df])
 

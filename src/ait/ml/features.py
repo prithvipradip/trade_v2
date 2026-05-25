@@ -55,7 +55,10 @@ class FeatureEngine:
             log.warning("insufficient_data_for_features", rows=len(df) if df is not None else 0)
             return pd.DataFrame()
 
-        features = df.copy()
+        # Start with OHLCV only — auxiliary columns like implied_vol are all-NaN
+        # when no IB IV data exists, which causes dropna() to eliminate all rows.
+        ohlcv_cols = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in df.columns]
+        features = df[ohlcv_cols].copy()
 
         # --- Momentum Features ---
         features = self._add_momentum(features)
