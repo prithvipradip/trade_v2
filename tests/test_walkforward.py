@@ -13,6 +13,7 @@ from ait.backtesting.walkforward import (
     WalkForwardConfig,
     WalkForwardResult,
     WindowResult,
+    _window_task_mp,
 )
 from ait.backtesting.result import BacktestResult
 
@@ -754,3 +755,115 @@ class TestSpreadParamsWiring:
                 f"spread_base mismatch: {kw['spread_base']}"
             assert kw["spread_cap"] == pytest.approx(0.06), \
                 f"spread_cap mismatch: {kw['spread_cap']}"
+
+
+# ---------------------------------------------------------------------------
+# Window-level parallelism tests (ProcessPoolExecutor / optimize_n_jobs)
+# ---------------------------------------------------------------------------
+
+class TestWindowLevelParallelism:
+    """Verify _run_single_window and the parallel dispatch path are correct."""
+
+    def test_window_task_mp_is_picklable(self) -> None:
+        """_window_task_mp must be picklable — it lives at module level, not a closure."""
+        import pickle
+        # If this raises, ProcessPoolExecutor would fail at task submission
+        pickle.dumps(_window_task_mp)
+
+    def test_run_single_window_insufficient_data_returns_none(self) -> None:
+        """_run_single_window returns (None, None) when training slice is too short."""
+        from datetime import date
+
+        # Only 10 rows — far below the 50-row minimum for train_df
+        data = {"SPY": _make_ohlcv(10)}
+        cfg = WalkForwardConfig(train_days=100, test_days=30, gap_days=5)
+        bt = WalkForwardBacktester(["SPY"], ["iron_condor"], config=cfg)
+
+        wr, params = bt._run_single_window(
+            window_id=1,
+            train_start=date(2023, 1, 1),
+            train_end=date(2023, 4, 11),
+            test_start=date(2023, 4, 16),
+            test_end=date(2023, 5, 16),
+            data=data,
+            vix_full=pd.DataFrame(),
+            learner=None,
+            prev_best_params=None,
+            prev_oos=None,
+        )
+        assert wr is None
+
+    def test_run_single_window_with_learner_none_uses_config_defaults(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With learner=None (parallel mode) all strategies remain active and
+        position_size_pct equals the config value (no learner scaling)."""
+        from datetime import date
+        from unittest.mock import MagicMock
+        from ait.backtesting.engine import Backtester
+        from ait.backtesting.result import BacktestResult
+
+        captured: list[dict] = []
+        original_init = Backtester.__init__
+
+        def capturing_init(self_bt, *args, **kwargs):
+            captured.append(kwargs)
+            original_init(self_bt, *args, **kwargs)
+
+        def fast_run(self_bt):
+            return BacktestResult(trades=[])
+
+        monkeypatch.setattr(Backtester, "__init__", capturing_init)
+        monkeypatch.setattr(Backtester, "run", fast_run)
+
+        data = {"SPY": _make_ohlcv(500)}
+        cfg = WalkForwardConfig(
+            train_days=300, test_days=50, gap_days=5,
+            position_size_pct=0.07,
+        )
+        bt = WalkForwardBacktester(["SPY"], ["iron_condor"], config=cfg)
+
+        from datetime import date
+        bt._run_single_window(
+            window_id=1,
+            train_start=date(2023, 1, 1),
+            train_end=date(2023, 10, 28),
+            test_start=date(2023, 11, 2),
+            test_end=date(2023, 12, 22),
+            data=data,
+            vix_full=pd.DataFrame(),
+            learner=None,
+        )
+
+        assert captured, "Backtester.__init__ must have been called"
+        assert captured[0]["position_size_pct"] == pytest.approx(0.07), (
+            "Parallel mode must use raw config position_size_pct — no learner scaling"
+        )
+
+    def test_optimize_n_jobs_field_exists_on_config(self) -> None:
+        """WalkForwardConfig must expose optimize_n_jobs with default 1."""
+        cfg = WalkForwardConfig()
+        assert hasattr(cfg, "optimize_n_jobs")
+        assert cfg.optimize_n_jobs == 1
+
+    def test_parallel_run_completes_without_error(self) -> None:
+        """optimize_n_jobs=2 must produce a valid WalkForwardResult (smoke test)."""
+        import asyncio
+        from unittest.mock import patch
+        from ait.backtesting.engine import Backtester
+        from ait.backtesting.result import BacktestResult
+
+        data = {"SPY": _make_ohlcv(700, start_price=450)}
+        cfg = WalkForwardConfig(
+            train_days=300,
+            test_days=60,
+            step_days=60,
+            gap_days=5,
+            optimize_n_jobs=2,
+        )
+        bt = WalkForwardBacktester(["SPY"], ["iron_condor"], config=cfg)
+        result = asyncio.run(bt.run(data=data))
+
+        assert isinstance(result, WalkForwardResult)
+        # With 700 days / 300 train / 60 test / 60 step → ~5 windows; at least 1 expected
+        assert len(result.windows) >= 1

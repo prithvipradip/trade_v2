@@ -517,7 +517,7 @@ Active window detail:
 - `max_hold_days` range: [14, 40] → **[10, 21]** — forces trades to complete within 30-day OOS window, eliminating most backtest_end exits
 - `test_days`: 42 → **30**, `step_days`: 14 → **30** — non-overlapping windows (step = test)
 - `wf_trials`: 50 → **200** — 4× search budget for better 9D coverage
-- `wf_n_jobs`: 1 → **6** — parallel Optuna workers across 6 of 12 CPUs; ~6× wall-clock speedup
+- `wf_n_jobs`: 1 → **6** — **window-level** parallelism via `ProcessPoolExecutor` (commit `ae102df`); each window runs in its own subprocess, bypassing the Python GIL. Note: Optuna's trial-level `n_jobs` uses threading with in-memory storage → GIL prevents CPU-bound parallelism; the fix was to dispatch entire windows to separate processes instead.
 - `wf_min_trades`: 10 → **7** — lower floor since shorter holds = fewer trades/window
 
 ---

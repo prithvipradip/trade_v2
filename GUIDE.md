@@ -1397,9 +1397,12 @@ python scripts/run_integration_test.py \
   --wf-trials 50        # Optuna trials per walk-forward window (overrides config optimize_n_trials)
   --wf-patience 20      # Stop early if no improvement for 20 consecutive trials (overrides config optimize_patience)
   --wf-min-trades 10    # Penalise trials producing fewer than 10 trades (overrides config optimize_min_trades)
+  --wf-n-jobs 6         # Run 6 walk-forward windows in parallel (uses all 6 CPUs simultaneously)
 ```
 
-All three flags are optional — if omitted, the values are read from `optimize_n_trials`, `optimize_patience`, and `optimize_min_trades` in `config.yaml` (defaults: 50, 20, 10).
+All four flags are optional — if omitted, the values are read from the corresponding config fields (defaults: 50, 20, 10, 1).
+
+**Window-level parallelism (`--wf-n-jobs`):** When `n_jobs > 1`, walk-forward windows run in parallel using `concurrent.futures.ProcessPoolExecutor`. Each window is an independent subprocess — no shared state. This bypasses the Python GIL (which blocks CPU-bound threading) and achieves true CPU parallelism: `--wf-n-jobs 6` on a 12-core machine yields ~600% CPU utilisation. Trade-off: warm-starting (seeding Optuna from a prior window's best params) and `BacktestLearner` adaptation between windows are disabled in parallel mode. On a 12-core machine, `--wf-n-jobs 6` is recommended (leaves 6 cores for the OS and other processes). Keep Optuna trial-level `n_jobs=1` (the default) — Optuna's in-memory storage uses threading which is GIL-bound and does not parallelise CPU-bound backtesting code.
 
 **Early stopping (`optimize_patience`):** Once the best objective value has not improved for N consecutive trials, the window's study is halted. This prevents wasted compute when the optimizer has already converged, and avoids over-exploring a degenerate region. Set to 0 to disable and always run all `wf-trials`.
 
@@ -1424,7 +1427,7 @@ All three flags are optional — if omitted, the values are read from `optimize_
 
 **Exp 6 finding:** Ablation (+22.68%) outperformed optimization (+11.88%). Root cause: `iv_floor` train/OOS mismatch during the 2025–2026 vol regime shift; 6 wasted search dimensions consumed Optuna's trial budget. Both fixed for Exp 7.
 
-**Exp 7 finding:** All Experiments 1–6 silently ran on a naive price-momentum fallback (confidence ≈ 0.50) because `load_daily_ohlcv()` appends an `implied_vol` column (all-NaN), which `FeatureEngine.compute()` passed through to `dropna()` — eliminating every row. Fixed in commit `38d4ae8`: FeatureEngine now starts from OHLCV-only columns. First experiment with real ML predictions (confidence 0.73–0.96). Ablation again outperformed optimization (5× gap); structural issues identified: OOS window overlap and backtest_end B-S bias. **Exp 8 launched** with 30-day non-overlapping windows, max_hold_days=[10,21], 200 trials, n_jobs=6.
+**Exp 7 finding:** All Experiments 1–6 silently ran on a naive price-momentum fallback (confidence ≈ 0.50) because `load_daily_ohlcv()` appends an `implied_vol` column (all-NaN), which `FeatureEngine.compute()` passed through to `dropna()` — eliminating every row. Fixed in commit `38d4ae8`: FeatureEngine now starts from OHLCV-only columns. First experiment with real ML predictions (confidence 0.73–0.96). Ablation again outperformed optimization (5× gap); structural issues identified: OOS window overlap and backtest_end B-S bias. **Exp 8 launched** with 30-day non-overlapping windows, max_hold_days=[10,21], 200 trials, `--wf-n-jobs 6` (window-level parallelism via `ProcessPoolExecutor`, commit `ae102df`; prior attempt using Optuna `n_jobs=6` was GIL-bound threading and did not achieve CPU parallelism).
 
 **Current fix for iron_condor search space (Exp 7 onwards):** `min_confidence`, `max_entry_vol_annual`, `iv_floor`, and all spread params are fixed at config defaults — not searchable. See Parameter Spaces table above.
 
