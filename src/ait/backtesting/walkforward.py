@@ -81,7 +81,7 @@ class WalkForwardConfig:
     spread_iv_sensitivity: float = 0.10   # additional spread per unit IV above 0.20
     spread_dte_sensitivity: float = 0.005 # additional spread per DTE below 21
     spread_cap: float = 0.15              # maximum half-spread per leg ($)
-    optimize_n_jobs: int = 1              # parallel Optuna workers per window (n_jobs=1 = sequential)
+    optimize_n_jobs: int = 1              # parallel walk-forward windows (n_jobs=1 = sequential)
 
 
 @dataclass
@@ -368,6 +368,38 @@ class WalkForwardResult:
         return df.sort_values("date").reset_index(drop=True)
 
 
+def _window_task_mp(args: tuple) -> tuple:
+    """Worker for ProcessPoolExecutor window-level parallelism.
+
+    Must live at module level (not a closure) so it is picklable.
+    Each call creates a fresh WalkForwardBacktester with no cross-window state:
+    warm-starting and BacktestLearner adaptation are disabled.
+    """
+    (window_id, train_start, train_end, test_start, test_end,
+     data, vix_full, config, symbols, strategies, db_path, progress_dir) = args
+
+    bt = WalkForwardBacktester(
+        symbols=symbols,
+        strategies=strategies,
+        config=config,
+        db_path=db_path,
+        progress_dir=progress_dir,
+    )
+    wr, best_params = bt._run_single_window(
+        window_id=window_id,
+        train_start=train_start,
+        train_end=train_end,
+        test_start=test_start,
+        test_end=test_end,
+        data=data,
+        vix_full=vix_full,
+        learner=None,
+        prev_best_params=None,
+        prev_oos=None,
+    )
+    return window_id, wr, best_params
+
+
 class WalkForwardBacktester:
     """Walk-forward backtester with multi-symbol, multi-strategy support.
 
@@ -431,234 +463,76 @@ class WalkForwardBacktester:
         windows = self._generate_windows(data)
         log.info("walk_forward_windows", count=len(windows))
 
-        # Self-learning adapter — adapts between windows
-        learner = BacktestLearner(base_confidence=self._config.min_confidence)
-
-        # Run each window
+        # Run each window — parallel or sequential depending on optimize_n_jobs
         window_results = []
-        prev_best_params: dict | None = None   # best Optuna params from prior window
-        for i, (train_start, train_end, test_start, test_end) in enumerate(windows):
-            log.info(
-                "running_window",
-                window=i + 1,
-                train=f"{train_start} to {train_end}",
-                test=f"{test_start} to {test_end}",
-            )
 
-            # Get adapted config from learner (starts at defaults, improves each window)
-            learned_config = learner.get_config()
-            effective_min_conf = learned_config["min_confidence"]
-            active_strategies = [
-                s for s in self._strategies
-                if learner.is_strategy_enabled(s)
+        if self._config.optimize_n_jobs > 1:
+            # Window-level parallelism via ProcessPoolExecutor (bypasses the GIL).
+            # Each worker process creates a fresh WalkForwardBacktester, so there is
+            # no cross-window state: warm-starting and BacktestLearner adaptation are
+            # disabled.  Progress JSON files are written independently per window with
+            # no conflicts (each window has a unique file name).
+            from concurrent.futures import ProcessPoolExecutor
+
+            args_list = [
+                (
+                    i + 1, train_start, train_end, test_start, test_end,
+                    data, _vix_full, self._config,
+                    self._symbols, self._strategies,
+                    self._db_path, self._progress_dir,
+                )
+                for i, (train_start, train_end, test_start, test_end) in enumerate(windows)
             ]
-            if not active_strategies:
-                active_strategies = self._strategies  # Safety: never disable everything
+            with ProcessPoolExecutor(max_workers=self._config.optimize_n_jobs) as executor:
+                mp_results = list(executor.map(_window_task_mp, args_list))
 
-            # Slice data for this window
-            all_symbol_trades = []
-            model_accuracy = 0.0
-            active_symbols = 0
-            curr_best_params: dict | None = None
-            prev_oos = window_results[-1].backtest_result if window_results else None
-            # Use full capital per symbol for position sizing — splitting by symbol count
-            # makes iron condors impossible on stocks priced >$50 (max_loss_per_contract too large)
-            per_symbol_capital = self._config.initial_capital
+            for _wid, wr, curr_best_params in sorted(mp_results, key=lambda x: x[0]):
+                if wr is not None:
+                    window_results.append(wr)
+                    if curr_best_params is not None:
+                        br = wr.backtest_result
+                        score = br.win_rate * (min(1.0, br.total_trades / 5) ** 0.5)
+                        if score > self._global_best_score:
+                            self._global_best_score = score
+                            self._global_best_params = curr_best_params
 
-            for symbol, df in data.items():
-                # Skip symbols the learner has disabled
-                if not learner.is_symbol_allowed(symbol):
-                    log.info("learner_skipping_symbol", symbol=symbol, window=i + 1)
-                    continue
-
-                # Use string slicing to handle both tz-aware and tz-naive indexes
-                train_df = df[str(train_start):str(train_end)]
-                test_df = df[str(test_start):str(test_end)]
-
-                if len(train_df) < 50 or len(test_df) < 5:
-                    continue
-
-                active_symbols += 1
-
-                # Per-window parameter optimization (optional)
-                window_cfg = self._config
-                if self._config.optimize_per_window:
-                    new_cfg, best_params = self._optimize_window_params(
-                        train_df, symbol, i + 1, active_strategies,
-                        prior_oos_result=prev_oos,
-                        prior_best_params=prev_best_params,
-                    )
-                    window_cfg = new_cfg or self._config
-                    if best_params is not None:
-                        curr_best_params = best_params
-
-                # Train ML model on training window for this symbol
-                # intraday_store is opened inside _train_window_model using self._db_path
-                predictor = self._train_window_model(train_df, symbol, i + 1)
-                range_predictor = self._train_window_range_model(
-                    train_df, symbol, i + 1,
-                    max_hold_days=window_cfg.max_hold_days,
-                    threshold_pct=self._config.range_threshold_pct,
-                )
-                if predictor and predictor.is_trained:
-                    model_accuracy = max(
-                        model_accuracy,
-                        max(predictor.cv_scores.values()) if predictor.cv_scores else 0.0,
-                    )
-
-                # Train MetaLabeler on training-window trade outcomes (Gap Z1 long-term)
-                _meta_artifact = (
-                    self._progress_dir / f"window_{i + 1:03d}" / symbol
-                    if self._progress_dir else None
-                )
-                # VIX slice for the training window (shadow MetaLabeler Backtester)
-                _vix_train_ctx: dict | None = None
-                if not _vix_full.empty:
-                    _vix_t = _vix_full.reindex(train_df.index, method="ffill").dropna(how="all")
-                    if not _vix_t.empty:
-                        _vix_train_ctx = {"vix": _vix_t}
-
-                meta_labeler = self._train_window_meta_labeler(
-                    train_df=train_df,
-                    symbol=symbol,
-                    window_id=i + 1,
-                    predictor=predictor,
-                    window_cfg=window_cfg,
-                    artifact_dir=_meta_artifact,
-                    vix_ctx=_vix_train_ctx,
-                )
-
-                # Prepend training data context so ML features can be computed.
-                # vol_60 is the longest non-min_periods rolling window (60 bars);
-                # with 60 context rows + 1 OOS row = 61-row hist, exactly 1 valid
-                # feature row survives dropna → predictions work from the first OOS bar.
-                context_bars = 60
-                test_with_context = pd.concat([train_df.tail(context_bars), test_df])
-
-                # Get position size scaling from learner (per-strategy multipliers)
-                # Use the average multiplier across active strategies as an overall scaling
-                strategy_mults = [
-                    learner.get_strategy_multiplier(s) for s in active_strategies
-                ]
-                avg_mult = sum(strategy_mults) / len(strategy_mults) if strategy_mults else 1.0
-                effective_position_size = self._config.position_size_pct * min(avg_mult, 2.0)
-
-                # When per-window optimization is active the optimized window_cfg
-                # is the source of truth for min_confidence; otherwise defer to
-                # the self-learning subsystem.
-                confidence_threshold = (
-                    window_cfg.min_confidence
-                    if self._config.optimize_per_window
-                    else effective_min_conf
-                )
-
-                # Align VIX to this window's date range for IV estimation
-                _vix_ctx: dict | None = None
-                if not _vix_full.empty:
-                    _vix_w = _vix_full.reindex(test_with_context.index, method="ffill").dropna(how="all")
-                    if not _vix_w.empty:
-                        _vix_ctx = {"vix": _vix_w}
-
-                # Each symbol gets its proportional share of capital
-                bt = Backtester(
-                    data=test_with_context,
-                    context_bars=context_bars,
-                    strategies=active_strategies,
-                    initial_capital=per_symbol_capital,
-                    commission_per_contract=window_cfg.commission_per_contract,
-                    slippage_pct=window_cfg.slippage_pct,
-                    position_size_pct=effective_position_size,
-                    stop_loss_pct=window_cfg.stop_loss_pct,
-                    profit_target_pct=window_cfg.profit_target_pct,
-                    max_hold_days=window_cfg.max_hold_days,
-                    min_confidence=confidence_threshold,
-                    trailing_stop_enabled=window_cfg.trailing_stop_enabled,
-                    trailing_stop_pct=window_cfg.trailing_stop_pct,
-                    breakeven_trigger_pct=window_cfg.breakeven_trigger_pct,
-                    predictor=predictor,
-                    range_predictor=range_predictor,
-                    range_min_confidence=getattr(
-                        window_cfg, "range_min_confidence", 0.55
-                    ),
-                    hurst_regime_threshold=getattr(
-                        window_cfg, "hurst_regime_threshold", 0.20
-                    ),
-                    hurst_regime_penalty=getattr(
-                        window_cfg, "hurst_regime_penalty", 0.10
-                    ),
-                    multifractal_max_width=getattr(
-                        window_cfg, "multifractal_max_width", 0.50
-                    ),
-                    iv_floor=window_cfg.iv_floor,
-                    wing_floor_dollars=window_cfg.wing_floor_dollars,
-                    wing_k=window_cfg.wing_k,
-                    delta_iv_scale=window_cfg.delta_iv_scale,
-                    max_concurrent_positions=window_cfg.max_concurrent_positions,
-                    max_entry_vol_annual=window_cfg.max_entry_vol_annual,
-                    spread_base=window_cfg.spread_base,
-                    spread_iv_sensitivity=window_cfg.spread_iv_sensitivity,
-                    spread_dte_sensitivity=window_cfg.spread_dte_sensitivity,
-                    spread_cap=window_cfg.spread_cap,
-                    meta_labeler=meta_labeler,
-                    market_context=_vix_ctx,
-                )
-                result = bt.run()
-
-                # Tag trades with symbol
-                for t in result.trades:
-                    t["symbol"] = symbol
-                all_symbol_trades.extend(result.trades)
-
-            # Aggregate window result
-            if all_symbol_trades:
-                total_pnl = sum(t.get("pnl", 0) for t in all_symbol_trades)
-                window_capital = self._config.initial_capital
-                window_result = WindowResult(
+        else:
+            # Sequential: warm-starting and BacktestLearner adaptation are active.
+            learner = BacktestLearner(base_confidence=self._config.min_confidence)
+            prev_best_params: dict | None = None
+            for i, (train_start, train_end, test_start, test_end) in enumerate(windows):
+                prev_oos = window_results[-1].backtest_result if window_results else None
+                wr, curr_best_params = self._run_single_window(
                     window_id=i + 1,
                     train_start=train_start,
                     train_end=train_end,
                     test_start=test_start,
                     test_end=test_end,
-                    backtest_result=BacktestResult(
-                        trades=all_symbol_trades,
-                        initial_capital=window_capital,
-                        final_capital=window_capital + total_pnl,
-                        start_date=test_start,
-                        end_date=test_end,
-                    ),
-                    model_accuracy=model_accuracy,
+                    data=data,
+                    vix_full=_vix_full,
+                    learner=learner,
+                    prev_best_params=prev_best_params,
+                    prev_oos=prev_oos,
                 )
-                window_results.append(window_result)
-                self._write_window_progress(i + 1, window_result, curr_best_params)
+                if wr is not None:
+                    window_results.append(wr)
+                    if curr_best_params is not None:
+                        br = wr.backtest_result
+                        score = br.win_rate * (min(1.0, br.total_trades / 5) ** 0.5)
+                        if score > self._global_best_score:
+                            self._global_best_score = score
+                            self._global_best_params = curr_best_params
+                    learning_summary = learner.process_window(wr.backtest_result.trades, i + 1)
+                    if learning_summary.get("adaptations"):
+                        log.info(
+                            "self_learning_adapted",
+                            window=i + 1,
+                            adaptations=[a["change"] for a in learning_summary["adaptations"]],
+                        )
+                    if curr_best_params is not None:
+                        prev_best_params = curr_best_params
 
-                # Track globally best Optuna params by OOS quality score
-                if curr_best_params is not None:
-                    br = window_result.backtest_result
-                    score = br.win_rate * (min(1.0, br.total_trades / 5) ** 0.5)
-                    if score > self._global_best_score:
-                        self._global_best_score = score
-                        self._global_best_params = curr_best_params
-
-                # Feed this window's trades into the learner for next-window adaptation
-                learning_summary = learner.process_window(all_symbol_trades, i + 1)
-                if learning_summary.get("adaptations"):
-                    log.info(
-                        "self_learning_adapted",
-                        window=i + 1,
-                        adaptations=[a["change"] for a in learning_summary["adaptations"]],
-                    )
-            else:
-                self._write_window_progress(i + 1, None, curr_best_params,
-                                            train_start=train_start, train_end=train_end,
-                                            test_start=test_start, test_end=test_end)
-
-            # Carry forward best params for next window's warm-start decision.
-            # Only update when OOS produced trades — keeps prev_best_params aligned
-            # with prev_oos (which only contains windows that had trades). Without
-            # this guard, a 0-trade window's Optuna params would overwrite the last
-            # profitable params, causing warm-start to seed from degenerate values.
-            if curr_best_params is not None and all_symbol_trades:
-                prev_best_params = curr_best_params
+            log.info("self_learning_final_state", summary=learner.summary())
 
         # Build aggregated results
         result = WalkForwardResult(
@@ -681,10 +555,203 @@ class WalkForwardBacktester:
             sharpe=f"{result.sharpe_ratio:.2f}",
         )
 
-        # Log final learner state
-        log.info("self_learning_final_state", summary=learner.summary())
-
         return result
+
+    def _run_single_window(
+        self,
+        window_id: int,
+        train_start: "date",
+        train_end: "date",
+        test_start: "date",
+        test_end: "date",
+        data: "dict[str, pd.DataFrame]",
+        vix_full: "pd.DataFrame",
+        learner: "BacktestLearner | None" = None,
+        prev_best_params: "dict | None" = None,
+        prev_oos: "BacktestResult | None" = None,
+    ) -> "tuple[WindowResult | None, dict | None]":
+        """Run optimization, ML training, and backtest for one window.
+
+        Returns (window_result, best_params).  window_result is None when no
+        trades are generated.  Pass learner=None in parallel mode — the method
+        then uses static config defaults (no cross-window adaptation).
+        """
+        log.info(
+            "running_window",
+            window=window_id,
+            train=f"{train_start} to {train_end}",
+            test=f"{test_start} to {test_end}",
+        )
+
+        if learner is not None:
+            learned_config = learner.get_config()
+            effective_min_conf = learned_config["min_confidence"]
+            active_strategies = [
+                s for s in self._strategies if learner.is_strategy_enabled(s)
+            ]
+            if not active_strategies:
+                active_strategies = self._strategies
+        else:
+            effective_min_conf = self._config.min_confidence
+            active_strategies = list(self._strategies)
+
+        all_symbol_trades: list = []
+        model_accuracy = 0.0
+        active_symbols = 0
+        curr_best_params: dict | None = None
+        # Use full capital per symbol — splitting by symbol count makes iron condors
+        # impossible on stocks priced >$50 (max_loss_per_contract too large).
+        per_symbol_capital = self._config.initial_capital
+
+        for symbol, df in data.items():
+            if learner is not None and not learner.is_symbol_allowed(symbol):
+                log.info("learner_skipping_symbol", symbol=symbol, window=window_id)
+                continue
+
+            train_df = df[str(train_start):str(train_end)]
+            test_df = df[str(test_start):str(test_end)]
+
+            if len(train_df) < 50 or len(test_df) < 5:
+                continue
+
+            active_symbols += 1
+
+            window_cfg = self._config
+            if self._config.optimize_per_window:
+                new_cfg, best_params = self._optimize_window_params(
+                    train_df, symbol, window_id, active_strategies,
+                    prior_oos_result=prev_oos,
+                    prior_best_params=prev_best_params,
+                )
+                window_cfg = new_cfg or self._config
+                if best_params is not None:
+                    curr_best_params = best_params
+
+            predictor = self._train_window_model(train_df, symbol, window_id)
+            range_predictor = self._train_window_range_model(
+                train_df, symbol, window_id,
+                max_hold_days=window_cfg.max_hold_days,
+                threshold_pct=self._config.range_threshold_pct,
+            )
+            if predictor and predictor.is_trained:
+                model_accuracy = max(
+                    model_accuracy,
+                    max(predictor.cv_scores.values()) if predictor.cv_scores else 0.0,
+                )
+
+            _meta_artifact = (
+                self._progress_dir / f"window_{window_id:03d}" / symbol
+                if self._progress_dir else None
+            )
+            _vix_train_ctx: dict | None = None
+            if not vix_full.empty:
+                _vix_t = vix_full.reindex(train_df.index, method="ffill").dropna(how="all")
+                if not _vix_t.empty:
+                    _vix_train_ctx = {"vix": _vix_t}
+
+            meta_labeler = self._train_window_meta_labeler(
+                train_df=train_df,
+                symbol=symbol,
+                window_id=window_id,
+                predictor=predictor,
+                window_cfg=window_cfg,
+                artifact_dir=_meta_artifact,
+                vix_ctx=_vix_train_ctx,
+            )
+
+            # Prepend training data context so ML features can be computed.
+            # vol_60 is the longest non-min_periods rolling window (60 bars).
+            context_bars = 60
+            test_with_context = pd.concat([train_df.tail(context_bars), test_df])
+
+            if learner is not None:
+                strategy_mults = [
+                    learner.get_strategy_multiplier(s) for s in active_strategies
+                ]
+                avg_mult = sum(strategy_mults) / len(strategy_mults) if strategy_mults else 1.0
+                effective_position_size = self._config.position_size_pct * min(avg_mult, 2.0)
+            else:
+                effective_position_size = self._config.position_size_pct
+
+            confidence_threshold = (
+                window_cfg.min_confidence
+                if self._config.optimize_per_window
+                else effective_min_conf
+            )
+
+            _vix_ctx: dict | None = None
+            if not vix_full.empty:
+                _vix_w = vix_full.reindex(test_with_context.index, method="ffill").dropna(how="all")
+                if not _vix_w.empty:
+                    _vix_ctx = {"vix": _vix_w}
+
+            bt = Backtester(
+                data=test_with_context,
+                context_bars=context_bars,
+                strategies=active_strategies,
+                initial_capital=per_symbol_capital,
+                commission_per_contract=window_cfg.commission_per_contract,
+                slippage_pct=window_cfg.slippage_pct,
+                position_size_pct=effective_position_size,
+                stop_loss_pct=window_cfg.stop_loss_pct,
+                profit_target_pct=window_cfg.profit_target_pct,
+                max_hold_days=window_cfg.max_hold_days,
+                min_confidence=confidence_threshold,
+                trailing_stop_enabled=window_cfg.trailing_stop_enabled,
+                trailing_stop_pct=window_cfg.trailing_stop_pct,
+                breakeven_trigger_pct=window_cfg.breakeven_trigger_pct,
+                predictor=predictor,
+                range_predictor=range_predictor,
+                range_min_confidence=getattr(window_cfg, "range_min_confidence", 0.55),
+                hurst_regime_threshold=getattr(window_cfg, "hurst_regime_threshold", 0.20),
+                hurst_regime_penalty=getattr(window_cfg, "hurst_regime_penalty", 0.10),
+                multifractal_max_width=getattr(window_cfg, "multifractal_max_width", 0.50),
+                iv_floor=window_cfg.iv_floor,
+                wing_floor_dollars=window_cfg.wing_floor_dollars,
+                wing_k=window_cfg.wing_k,
+                delta_iv_scale=window_cfg.delta_iv_scale,
+                max_concurrent_positions=window_cfg.max_concurrent_positions,
+                max_entry_vol_annual=window_cfg.max_entry_vol_annual,
+                spread_base=window_cfg.spread_base,
+                spread_iv_sensitivity=window_cfg.spread_iv_sensitivity,
+                spread_dte_sensitivity=window_cfg.spread_dte_sensitivity,
+                spread_cap=window_cfg.spread_cap,
+                meta_labeler=meta_labeler,
+                market_context=_vix_ctx,
+            )
+            result = bt.run()
+
+            for t in result.trades:
+                t["symbol"] = symbol
+            all_symbol_trades.extend(result.trades)
+
+        if all_symbol_trades:
+            total_pnl = sum(t.get("pnl", 0) for t in all_symbol_trades)
+            window_capital = self._config.initial_capital
+            window_result = WindowResult(
+                window_id=window_id,
+                train_start=train_start,
+                train_end=train_end,
+                test_start=test_start,
+                test_end=test_end,
+                backtest_result=BacktestResult(
+                    trades=all_symbol_trades,
+                    initial_capital=window_capital,
+                    final_capital=window_capital + total_pnl,
+                    start_date=test_start,
+                    end_date=test_end,
+                ),
+                model_accuracy=model_accuracy,
+            )
+            self._write_window_progress(window_id, window_result, curr_best_params)
+            return window_result, curr_best_params
+        else:
+            self._write_window_progress(
+                window_id, None, curr_best_params,
+                train_start=train_start, train_end=train_end,
+                test_start=test_start, test_end=test_end,
+            )
+            return None, curr_best_params
 
     def _write_window_progress(
         self,
@@ -825,7 +892,7 @@ class WalkForwardBacktester:
                     symbols=[symbol],
                     strategies=[strategy],
                     n_trials=self._config.optimize_n_trials,
-                    n_jobs=self._config.optimize_n_jobs,
+                    n_jobs=1,
                     objective="composite",
                     study_name=f"wf_w{window_id}_{symbol}_{strategy}",
                     initial_capital=self._config.initial_capital,
