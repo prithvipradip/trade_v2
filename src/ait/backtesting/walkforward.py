@@ -420,6 +420,9 @@ class WalkForwardBacktester:
             _vix_full: pd.DataFrame = _load_ohlcv(
                 "^VIX", days=self._config.train_days + 900, db_path=self._db_path
             )
+            # yfinance may return tz-aware index; normalize to tz-naive to match OHLCV data
+            if not _vix_full.empty and _vix_full.index.tz is not None:
+                _vix_full.index = _vix_full.index.tz_localize(None)
         except Exception:
             _vix_full = pd.DataFrame()
 
