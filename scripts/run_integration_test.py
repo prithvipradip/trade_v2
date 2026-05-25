@@ -101,6 +101,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Min trades floor for objective penalty (default: from config optimize_min_trades, fallback 10).",
     )
     parser.add_argument(
+        "--wf-n-jobs", type=int, default=None,
+        help="Parallel Optuna workers per walk-forward window (default: 1 = sequential).",
+    )
+    parser.add_argument(
         "--train-days", type=int, default=365,
         help="Walk-forward training window in calendar days (default: 365).",
     )
@@ -558,6 +562,7 @@ async def _section_e_walkforward(
     _n_trials   = args.wf_trials     if args.wf_trials     is not None else _bc.optimize_n_trials
     _patience   = args.wf_patience   if args.wf_patience   is not None else _bc.optimize_patience
     _min_trades = args.wf_min_trades if args.wf_min_trades is not None else _bc.optimize_min_trades
+    _n_jobs     = args.wf_n_jobs     if args.wf_n_jobs     is not None else 1
 
     print(f"\n{'='*60}")
     print(f"SECTION E — Walk-Forward (optimize_per_window=True, trials={_n_trials}, patience={_patience}, min_trades={_min_trades})")
@@ -572,6 +577,7 @@ async def _section_e_walkforward(
         optimize_n_trials=_n_trials,
         optimize_patience=_patience,
         optimize_min_trades=_min_trades,
+        optimize_n_jobs=_n_jobs,
         optimize_seed=args.optuna_seed,
         initial_capital=_bc.initial_capital,
         position_size_pct=_bc.position_size_pct,

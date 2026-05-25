@@ -1409,19 +1409,22 @@ All three flags are optional — if omitted, the values are read from `optimize_
 
 **Range predictor gate:** For iron_condor and short_strangle, the engine calls the range predictor before entering. If `P(in_range) < range_min_confidence` (default 0.55), the signal is skipped entirely — no fallback to directional strategies. Directional strategies (bear_put_spread, bull_call_spread, long_strangle) were tested as range-gate fallbacks but produced consistent losses because the ML model's directional accuracy (~22%) is too low to support them. The correct behaviour when iron_condor is blocked is to pass on the trade.
 
-**QQQ integration test findings (walk-forward, 365/42/14/5 config, 2024–2026):** Six experiments run to diagnose optimizer overfitting and fix infrastructure bugs:
+**QQQ integration test findings (walk-forward, 2024–2026):** Seven experiments run to diagnose optimizer overfitting, fix infrastructure bugs, and activate ML predictions:
 
-| Experiment | Search space / Key change | Optimized return | Ablation return | Trades | Sharpe |
-|---|---|---|---|---|---|
-| Exp 2 | All params incl. `min_confidence` + `max_entry_vol_annual` | ~0% (0 OOS trades) | — | — | — |
-| Exp 3 | Same | −16% | ~+9% | ~2 | — |
-| Exp 4 | Added vol gate | −21% | ~+9% | ~9 | — |
-| **Exp 5** | **Removed `min_confidence` + `max_entry_vol_annual` from search space** | **+183%** | **+9%** | **91** | **23.95** |
-| Exp 6 | Spread wiring fixed; spread params + `iv_floor` removed from search space; VIX-based IV | +11.88% | +22.68% | 14 / 36 | 39 / 9.7 |
+| Experiment | Config | Key change | Optimized return | Ablation return | Trades | Sharpe |
+|---|---|---|---|---|---|---|
+| Exp 2 | 365/42/14/5 | All params incl. `min_confidence` + `max_entry_vol_annual` | ~0% | — | — | — |
+| Exp 3 | 365/42/14/5 | Same | −16% | ~+9% | ~2 | — |
+| Exp 4 | 365/42/14/5 | Added vol gate | −21% | ~+9% | ~9 | — |
+| **Exp 5** | 365/42/14/5 | **Removed `min_confidence` + `max_entry_vol_annual`** | **+183%** | **+9%** | **91** | **23.95** |
+| Exp 6 | 365/42/14/5 | Spread wiring fixed; spread params + `iv_floor` removed; VIX-based IV | +11.88% | +22.68% | 14 / 36 | 39 / 9.7 |
+| **Exp 7** | 365/42/14/5 | **ML fix: FeatureEngine OHLCV-only input; first real XGBoost/LightGBM predictions** | **+1.95%** | **+10.41%** | **18 / 34** | **3.89 / 4.98** |
 
 **Root cause of Experiments 2–4 failure:** Optuna maximised `min_confidence` toward the ceiling or drove `max_entry_vol_annual` to the floor, blocking all OOS trades. Removing both from the search space resolved this.
 
-**Exp 6 finding:** Ablation (+22.68%, 36 trades) outperformed optimization (+11.88%, 14 trades). Root cause: `iv_floor` in the search space created a train/OOS mismatch during the 2025–2026 vol regime shift, and 6 wasted search dimensions (spread params + fractal params not applied to training) consumed Optuna's trial budget. Both fixed for Exp 7.
+**Exp 6 finding:** Ablation (+22.68%) outperformed optimization (+11.88%). Root cause: `iv_floor` train/OOS mismatch during the 2025–2026 vol regime shift; 6 wasted search dimensions consumed Optuna's trial budget. Both fixed for Exp 7.
+
+**Exp 7 finding:** All Experiments 1–6 silently ran on a naive price-momentum fallback (confidence ≈ 0.50) because `load_daily_ohlcv()` appends an `implied_vol` column (all-NaN), which `FeatureEngine.compute()` passed through to `dropna()` — eliminating every row. Fixed in commit `38d4ae8`: FeatureEngine now starts from OHLCV-only columns. First experiment with real ML predictions (confidence 0.73–0.96). Ablation again outperformed optimization (5× gap); structural issues identified: OOS window overlap and backtest_end B-S bias. **Exp 8 launched** with 30-day non-overlapping windows, max_hold_days=[10,21], 200 trials, n_jobs=6.
 
 **Current fix for iron_condor search space (Exp 7 onwards):** `min_confidence`, `max_entry_vol_annual`, `iv_floor`, and all spread params are fixed at config defaults — not searchable. See Parameter Spaces table above.
 

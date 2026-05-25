@@ -276,16 +276,17 @@ run_orchestrator.py          ← Master process (start here)
 
 ### QQQ integration tests (walk-forward, 365/42/14/5 config, 2024-2026)
 
-Six experiments run to diagnose optimizer overfitting and fix infrastructure bugs. All use iron_condor, 50 Optuna trials/window, per-strategy optimization.
+Seven experiments run to diagnose optimizer overfitting, fix infrastructure bugs, and activate ML predictions. All use iron_condor, per-strategy optimization.
 
-| Archive | Windows | Optimized | Ablation | Sharpe | Trades | Key Change |
-|---|---|---|---|---|---|---|
-| `QQQ_2Y_iron_condor_per_strategy_20260512` | 18 | −21% | ~+9% | — | — | First integration test |
-| `QQQ_365d_iron_condor_20260513_1831` | 28 | ~0% | — | — | — | Shorter windows |
-| `QQQ_365d_iron_condor_20260514_1308` | 28 | −16% | ~+9% | — | ~2 | Repeat to confirm |
-| `QQQ_365d_iron_condor_20260514_2359` | 28 | −21% | ~+9% | — | ~9 | Vol gate |
-| **`QQQ_365d_iron_condor_20260514_1142`** | **28** | **+183%** | **+9%** | **23.95** | **91** | **No regime filters** |
-| `QQQ_365d_iron_condor_20260524_1825` | 24 | +11.88% | +22.68% | 39.12 / 9.70 | 14 / 36 | Spread wiring + calibration |
+| Archive | Config | Windows | Optimized | Ablation | Sharpe | Trades | Key Change |
+|---|---|---|---|---|---|---|---|
+| `QQQ_2Y_iron_condor_per_strategy_20260512` | 365/63/21/5 | 18 | −21% | ~+9% | — | — | First integration test |
+| `QQQ_365d_iron_condor_20260513_1831` | 365/42/14/5 | 28 | ~0% | — | — | — | Shorter windows |
+| `QQQ_365d_iron_condor_20260514_1308` | 365/42/14/5 | 28 | −16% | ~+9% | — | ~2 | Repeat to confirm |
+| `QQQ_365d_iron_condor_20260514_2359` | 365/42/14/5 | 28 | −21% | ~+9% | — | ~9 | Vol gate |
+| **`QQQ_365d_iron_condor_20260514_1142`** | 365/42/14/5 | **28** | **+183%** | **+9%** | **23.95** | **91** | **No regime filters** |
+| `QQQ_365d_iron_condor_20260524_1825` | 365/42/14/5 | 24 | +11.88% | +22.68% | 39.12 / 9.70 | 14 / 36 | Spread wiring + calibration |
+| **`QQQ_365d_iron_condor_20260525_1802`** | 365/42/14/5 | **24** | **+1.95%** | **+10.41%** | **3.89 / 4.98** | **18 / 34** | **ML fix: OHLCV-only FeatureEngine; first real XGBoost/LightGBM predictions** |
 
 MLflow experiment: `walkforward_QQQ` (browse via `mlflow ui --backend-store-uri sqlite:///data/mlflow.db --port 5001`; backfill via `scripts/backfill_mlflow.py`).
 
@@ -293,11 +294,14 @@ MLflow experiment: `walkforward_QQQ` (browse via `mlflow ui --backend-store-uri 
 
 **Exp 6 finding:** Ablation (+22.68%) beat the optimized run (+11.88%) — Optuna's `min_trades` filter reduced trade frequency below the baseline. Also: 13/24 windows went inactive (W12–W24) due to `iv_floor` train/OOS mismatch during the 2025–2026 vol regime shift.
 
+**Exp 7 finding:** All Experiments 1–6 silently ran on a naive price-momentum fallback (confidence ≈ 0.50) because `load_daily_ohlcv()` appends an `implied_vol` column (all-NaN), which `FeatureEngine.compute()` passed through to `dropna()` — eliminating every row. Fixed in commit `38d4ae8`: FeatureEngine now starts from OHLCV-only columns. With ML active, ablation still outperformed optimization by 5×. Two structural issues identified: OOS window overlap (step < test) and backtest_end B-S bias. **Exp 8 now running** with 30-day non-overlapping windows, max_hold_days=[10,21], 200 Optuna trials, n_jobs=6.
+
 **Key lessons:**
 - Regime-filter params (`min_confidence`, `max_entry_vol_annual`, `iv_floor`) are overfitting pressure sinks — fix in config, don't let Optuna search them for iron_condor
 - Spread params are fixed config wired through WalkForwardConfig → Backtester, not Optuna dims
 - Iron condors are the reliable core for QQQ; directional strategies require significantly higher ML directional accuracy
 - VIX time series must be used for IV estimation — a constant `iv_floor` silently corrupts MetaLabeler features
+- `FeatureEngine.compute()` must receive OHLCV-only input — auxiliary columns (e.g. `implied_vol`) with NaN values silently disable ML via `dropna()`
 
 ### Small account ($700)
 - Backtest pending...

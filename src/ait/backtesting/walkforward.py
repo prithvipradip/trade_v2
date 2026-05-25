@@ -81,6 +81,7 @@ class WalkForwardConfig:
     spread_iv_sensitivity: float = 0.10   # additional spread per unit IV above 0.20
     spread_dte_sensitivity: float = 0.005 # additional spread per DTE below 21
     spread_cap: float = 0.15              # maximum half-spread per leg ($)
+    optimize_n_jobs: int = 1              # parallel Optuna workers per window (n_jobs=1 = sequential)
 
 
 @dataclass
@@ -824,7 +825,7 @@ class WalkForwardBacktester:
                     symbols=[symbol],
                     strategies=[strategy],
                     n_trials=self._config.optimize_n_trials,
-                    n_jobs=1,
+                    n_jobs=self._config.optimize_n_jobs,
                     objective="composite",
                     study_name=f"wf_w{window_id}_{symbol}_{strategy}",
                     initial_capital=self._config.initial_capital,

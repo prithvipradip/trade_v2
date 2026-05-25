@@ -16,6 +16,7 @@
 | 4 | `QQQ_365d_iron_condor_20260514_2359` | 365/42/14/5, 28 W | +21.36% | ~+9% | 29 | 10.86 | 9/28 | Vol gate adjustment |
 | 5 | `QQQ_365d_iron_condor_20260514_1142` | 365/42/14/5, 28 W | **+183.14%** | **+9.00%** | **91** | **23.95** | **18/28** | **Removed regime filters from search space** |
 | 6 | `QQQ_365d_iron_condor_20260524_1825` | 365/42/14/5, 24 W | +11.88% | **+22.68%** | 14 / **36** | 39.12 / **9.70** | 7/24 / **13/24** | Spread model wiring fixed + calibration |
+| 7 | `QQQ_365d_iron_condor_20260525_1802` | 365/42/14/5, 24 W | +1.95% | +10.41% | 18 / 34 | 3.89 / 4.98 | 6/24 / 13/24 | ML fix (implied_vol NaN bug); first real XGBoost/LightGBM predictions |
 
 Config format: `train_days / test_days / step_days / gap_days`.
 All experiments: QQQ, iron_condor only, 50 Optuna trials per window, TPE sampler seed 42, $100k initial capital.
@@ -332,6 +333,22 @@ These are standing conclusions drawn from the experiments above. Review and upda
 **Evidence:** When IBKR-stored `implied_vol` is absent and realized_vol × 1.15 < `iv_floor`, the old `_get_iv()` returned a constant 20% floor. This silently poisoned (a) iron condor premium calculations across all low-vol windows, and (b) the MetaLabeler `vix_level` feature (hardcoded to 20.0 for all shadow-backtest trades). The feature had zero information content — but zero variance is harder to detect than wrong values.
 **Rule:** `_get_iv()` must never floor its return value. Load `^VIX` daily closes via yfinance at walkforward startup, pass per-window slices as `market_context={"vix": pd.DataFrame}`, and use them as Priority 2 IV estimate (`vix_val / 100 × 1.10` for QQQ). The entry gate (`iv < iv_floor → skip credit strategy`) belongs in `_build_position()`, not in `_get_iv()`.
 
+### P11 — FeatureEngine must receive OHLCV-only input; never df.copy() with auxiliary columns
+**Evidence:** `load_daily_ohlcv()` appends an `implied_vol` column (all-NaN when no IB IV data exists). The old `features = df.copy()` included it; `features.dropna()` eliminated every row → `prediction_skipped` on every bar → all Experiments 1–6 ran on the naive `_simple_direction` fallback (5d/20d price momentum, confidence ≈ 0.50), not XGBoost/LightGBM. Fixed in commit `38d4ae8`: `FeatureEngine.compute()` now starts from OHLCV-only columns.
+**Rule:** If `FeatureEngine.compute()` ever needs extra input columns (e.g. a future IV column it actually reads), handle them explicitly before dropna — never rely on df.copy() passthrough.
+
+### P12 — OOS window overlap (step < test) distorts aggregate metrics
+**Evidence:** Exp 7 used step=14d, test=42d → 67% overlap between consecutive windows. The active cluster (W01–W05, May–Aug 2025) was triple-counted in the window-level metrics; the 17-window dead zone was similarly inflated. True independent evaluation requires step = test.
+**Rule:** Use step_days = test_days for unbiased aggregate metrics. Accept fewer windows (≈12 at 30d/30d vs 24 at 14d/42d) in exchange for independent OOS measurements.
+
+### P13 — backtest_end exits are B-S mark-to-market estimates, not realized P&L
+**Evidence:** Most profitable Exp 7 OOS trades exited as `backtest_end`. The engine reprices via Black-Scholes with IV = 0.70×entry_IV + 0.30×realized_vol and t = (max_hold_days − days_held) / 365. With max_hold_days clustering at 30–40 in a 42-day window, most trades never reach expiry or a natural exit within the OOS period.
+**Rule:** OOS window length should exceed max_hold_days by a meaningful margin (≥9 days), OR max_hold_days should be constrained to fit within the window. When most trades exit as backtest_end, reported P&L is model-dependent and may not reflect realizable performance.
+
+### P14 — Optuna never voluntarily chose max_hold_days below 26 in a [14, 40] search space
+**Evidence:** Exp 7 observed distribution: mean 31.8, median 32, min observed 18 (W07 only), 70% of windows chose ≥30. Lower half of range [14–25] was almost never selected.
+**Implication:** Restricting to [10, 21] forces unexplored territory. The preference for 26–40 is either (a) genuine — longer holds capture more theta decay, or (b) an artifact of backtest_end inflation. Exp 8 ([10,21] range with 30-day non-overlapping windows) tests this.
+
 ---
 
 ## Experiment 6 — Spread Model Wiring Fix + Market Regime Drop-Off
@@ -423,6 +440,88 @@ All changes listed below are **already implemented** in the codebase and will ta
 
 ---
 
+## Experiment 7 — ML Predictions Activated (implied_vol NaN Bug Fixed)
+
+**Archive:** `QQQ_365d_iron_condor_20260525_1802`
+**Date:** 2026-05-25
+
+### Setup
+- Walk-forward config: 365d / 42d / 14d / 5d → **24 windows** (same as Exp 6)
+- Test period covered: 2025-05-14 to 2026-05-13
+- Key change from Exp 6: Fixed `FeatureEngine.compute()` to use OHLCV-only input (commit `38d4ae8`), eliminating the `implied_vol=NaN` poisoning that silently disabled ML predictions in ALL previous experiments (Exp 1–6). First experiment with real XGBoost/LightGBM predictions driving entry decisions (confidence 0.73–0.96 vs ~0.50 before fix).
+
+### Assumptions Going In
+- With ML working, entry confidence would be higher and more selective
+- Regime-aware entries (high confidence = model sees favorable conditions) would produce better per-trade quality than the naive momentum fallback
+- The dead zone from Exp 6 (W12–W24 inactive) was partially a ML failure — with ML active, some of those windows might reactivate
+
+### Results — Optimized (Section E)
+
+| Metric | Value |
+|--------|-------|
+| Total return | +1.95% (+$1,964) |
+| Cash-drag adj. return | +6.90% |
+| Total trades | 18 |
+| Win rate | 72.2% |
+| Sharpe ratio | 3.89 |
+| Sortino ratio | 3.60 |
+| Max drawdown | 1.75% |
+| Profit factor | 1.98 |
+| Avg win / avg loss | $305 / $401 |
+| Capital utilization | 0.7% |
+| Active windows | **6/24** |
+
+Active window detail:
+- W01 (May 14–Jun 25, 2025): 4T, +$1,324, Sharpe 20.1
+- W02 (May 28–Jul 9, 2025): 1T, +$88, Sharpe 0.0
+- W04 (Jun 25–Aug 6, 2025): 6T, +$1,384, Sharpe 11.3 (3 profit-target, 3 stop-loss in late-Jul selloff)
+- W05 (Jul 9–Aug 20, 2025): 2T, +$710, Sharpe 19.0
+- W23 (Mar 18–Apr 29, 2026): 3T, +$272, Sharpe 16.9, conf 0.84, all `backtest_end` — range-bound regime (QQQ recovering post-tariff)
+- W24 (Apr 1–May 13, 2026): 2T, -$1,814, Sharpe -53.8, conf 0.73–0.88 — both stop-loss (entered Apr 7–8 into tariff crash; regimes: `high_volatility` / `trending_up`)
+- W03, W06–W22: 0 trades each (17 consecutive inactive windows)
+
+### Results — Ablation (Section F)
+
+| Metric | Value |
+|--------|-------|
+| Total return | +10.41% (+$10,208) |
+| Cash-drag adj. return | +15.09% |
+| Total trades | 34 |
+| Win rate | 64.7% |
+| Sharpe ratio | 4.98 |
+| Sortino ratio | 6.10 |
+| Max drawdown | 5.42% |
+| Profit factor | 2.16 |
+| Avg win / avg loss | $865 / $736 |
+| Capital utilization | 2.4% |
+| Active windows | **13/24** |
+
+### Observations
+- **W24 reveals the direction gate problem (see Q11).** The engine entered iron condors on Apr 7–8 into the tariff crash — logged regimes `high_volatility` and `trending_up`. High direction confidence in a trending market is exactly the wrong signal for a market-neutral strategy. Both stopped out within a week.
+- **The dead zone (W06–W22, Aug 2025–Mar 2026) persisted despite ML being active.** ML is NOT the cause — the optimizer correctly found no iron condor parameter set meeting min_trades=10 during high-volatility training periods.
+- **W23 broke the dead zone.** QQQ's range-bound recovery from the April tariff selloff reactivated the strategy — confirms the regime gating is working as intended.
+- **Ablation (Section F) outperformed optimized (Section E) by 5.3×** (+10.41% vs +1.95%). The per-window optimizer is overfitting to noisy training samples (9D space, ~35 effective trials, 10–30 trades per trial evaluation).
+- **Capital utilization 0.7%** — $99,300 of $100,000 sat idle. The optimization gate is extremely selective; 18 trades over a full year's OOS coverage.
+- **Entry confidences 0.73–0.96** (range model output) confirm ML is driving entries, vs ~0.50 naive fallback in Exp 1–6.
+
+### What We Learned
+- **ML fix was real but not the root cause of the dead zone.** Inactive windows were caused by regime mismatch (high-vol OOS after low-vol training), not ML failure.
+- **With ML active, the strategy is MORE selective.** Exp 6 had 7 active windows; Exp 7 had 6 (but with a loss window included). The ML predictor is tighter than the naive fallback.
+- **Direction model gate is architecturally wrong for iron condors (Q11).** W24's entries into a crash prove it. High directional confidence → trending market → wing breach.
+- **Two structural measurement problems confirmed:**
+  1. OOS overlap (67%): the 6 active windows are not independent measurements
+  2. backtest_end bias: majority of profitable trades exit via B-S mark-to-market, not realized P&L
+- **Q6 answered:** Removing `iv_floor` from the search space did NOT recover the inactive windows. Dead zone is regime-driven, not parameter-driven.
+
+### What Changed for Next Experiment (Exp 8)
+- `max_hold_days` range: [14, 40] → **[10, 21]** — forces trades to complete within 30-day OOS window, eliminating most backtest_end exits
+- `test_days`: 42 → **30**, `step_days`: 14 → **30** — non-overlapping windows (step = test)
+- `wf_trials`: 50 → **200** — 4× search budget for better 9D coverage
+- `wf_n_jobs`: 1 → **6** — parallel Optuna workers across 6 of 12 CPUs; ~6× wall-clock speedup
+- `wf_min_trades`: 10 → **7** — lower floor since shorter holds = fewer trades/window
+
+---
+
 ## Open Questions
 
 These are unresolved questions that future experiments should address:
@@ -432,8 +531,12 @@ These are unresolved questions that future experiments should address:
 - **Q3:** How stable are the best-params across adjacent windows? Do optimized params drift significantly, or do similar values recur?
 - **Q4 (partially answered):** Real-world spread impact is modest at ≈3% half-spread for liquid QQQ options. IV sensitivity is effectively 0. The backtester defaults were approximately correct.
 - **Q5:** Would increasing Optuna trials per window (e.g. 100 vs 50) improve results further, or has the 9D space already converged sufficiently at 50 trials?
-- **Q6:** Does removing `iv_floor` from the search space (fixing it in config) recover the inactive windows? Does more regime coverage lead to better or worse per-window quality?
+- **Q6 (answered):** Removing `iv_floor` from the search space did NOT recover inactive windows. Dead zone is regime-driven — the optimizer correctly finds no profitable IC configuration when training-period volatility mismatches OOS volatility.
 - **Q7:** The Exp 6 ablation (+22.68%) outperformed the optimized run (+11.88%). Does Optuna's optimization add net value, or does the `min_trades` filter + search overhead reduce trade frequency below the ablation baseline? Is there a configuration where optimization beats ablation on both return AND trade count?
+- **Q8:** Does restricting max_hold_days to [10,21] with 30-day non-overlapping windows eliminate the backtest_end bias and produce more reliable OOS metrics? Do shorter-hold iron condors show comparable risk-adjusted returns?
+- **Q9:** Does the 30-day non-overlapping window design produce meaningfully different conclusions from the 42-day overlapping design? Is the Exp 7 dead zone confirmed or partially an overlap artifact?
+- **Q10:** Should the range model threshold (currently fixed at ±5%) be derived from the actual iron condor wing widths (wing_k, delta_short, IV) rather than being a constant? Does the mismatch between the ±5% training label and the actual strike placement degrade range model signal quality?
+- **Q11:** Is the direction model an appropriate first gate for iron condors? Iron condors are market-neutral — high direction confidence signals a trending regime, which is exactly when they fail (W24 confirms this). Should the direction gate be removed (range model only) or inverted (skip entry when direction confidence is too high)?
 
 ---
 
