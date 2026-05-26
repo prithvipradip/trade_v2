@@ -20,7 +20,8 @@ env/
 models/
 logs/
 reports/integration_test/
-reports/runs/
+reports/runs/**/*.log
+reports/runs/**/*.html
 
 # MLflow experiment tracking (data/mlflow.db + data/mlruns/ — covered by /data/ above)
 mlflow.db

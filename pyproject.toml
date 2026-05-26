@@ -82,6 +82,7 @@ select = ["E", "F", "I", "N", "W", "UP"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["."]
 markers = [
     "ibkr: live tests requiring IB Gateway on 127.0.0.1:4002 (run with -m ibkr)",
 ]
