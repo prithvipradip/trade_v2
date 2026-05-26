@@ -2,7 +2,7 @@
 
 > **Purpose:** A living record of what each experiment taught us. Covers what we configured, what we assumed, what the results showed, and what we changed as a consequence. Update this file after every experiment.
 
-> **How to add an entry:** Copy the template at the bottom of this file, fill it in, and append it as the next numbered section. Update the Principles Distilled section if the experiment reinforced or invalidated anything there.
+> **How to add an entry:** Copy the template at the bottom of this file, fill it in, and append it as the next numbered section. Update the Principles Distilled section if the experiment reinforced or invalidated anything there. Commit the experiment's `reports/runs/{run_id}/` archive to the `data/experiment-archives` branch — not to the feature PR (see GUIDE.md → "Committing experiment archives").
 
 ---
 
