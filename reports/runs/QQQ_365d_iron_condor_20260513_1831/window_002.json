@@ -1,0 +1,27 @@
+{
+  "window": 2,
+  "test_start": "2025-03-30",
+  "test_end": "2025-05-11",
+  "pnl": 0.0,
+  "return_pct": 0.0,
+  "trades": 0,
+  "win_rate": 0.0,
+  "sharpe": 0.0,
+  "max_drawdown": 0.0,
+  "strategies": {},
+  "best_params": {
+    "iron_condor__min_confidence": 0.664233635931935,
+    "iron_condor__stop_loss_pct": 0.5912101550266424,
+    "iron_condor__profit_target_pct": 0.3795921791609381,
+    "iron_condor__trailing_stop_pct": 0.36839992728873283,
+    "iron_condor__delta_short": 0.2338550559552672,
+    "iron_condor__max_hold_days": 33,
+    "iron_condor__iv_floor": 0.3280578157918625,
+    "iron_condor__wing_k": 1.3581724458147129,
+    "iron_condor__max_entry_vol_annual": 0.3570878923261931,
+    "iron_condor__hurst_regime_threshold": 0.1456863027575357,
+    "iron_condor__hurst_regime_penalty": 0.24161311600563334,
+    "iron_condor__multifractal_max_width": 0.34468990674901695
+  },
+  "note": "no_trades"
+}
