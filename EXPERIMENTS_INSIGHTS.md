@@ -19,6 +19,7 @@
 | 7 | `QQQ_365d_iron_condor_20260525_1802` | 365/42/14/5, 24 W | +1.95% | +10.41% | 18 / 34 | 3.89 / 4.98 | 6/24 / 13/24 | ML fix (implied_vol NaN bug); first real XGBoost/LightGBM predictions |
 | 8 | `QQQ_365d_iron_condor_20260526_0302` | 365/30/30/5, 12 W | +0.51% | +6.02% | 20 / 14 | 1.68 / 14.25 | 6/12 / 6/12 | Non-overlapping 30d windows; max_hold=[10,21]; 200 trials; n_jobs=6 (ProcessPoolExecutor) |
 | 9 | `QQQ_365d_iron_condor_20260526_1409` | 365/30/30/5, 12 W | +4.37% | +3.86% | 29 / 38 | **5.41** / 3.05 | **9/12** / 9/12 | Removed IC direction gate (Change A) + wing-derived range threshold (Change B) |
+| 10 | TBD | 365/30/30/5, 12 W | TBD | TBD | TBD | TBD | TBD | ML models fed into Optuna (Change C); reverts wing-derived threshold (Change B) |
 
 Config format: `train_days / test_days / step_days / gap_days`.
 All experiments: QQQ, iron_condor only, 50 Optuna trials per window, TPE sampler seed 42, $100k initial capital.
@@ -364,6 +365,12 @@ These are standing conclusions drawn from the experiments above. Review and upda
 ### P17 — Dead zone (Sep 2025–May 2026) is unambiguously regime-driven, not a window-design artifact
 
 ### P18 — Removing the direction gate reverses the Section E < Section F trend: optimized now beats ablation
+
+### P19 — Optuna optimizes against a different signal than OOS when ML models are not passed to the optimizer
+**Evidence:** In Exps 7–9, `StrategyOptimizer._run_backtest()` created a `Backtester` with no `range_predictor` and no `predictor`. Every Optuna trial evaluated params using `_simple_direction` (5d/20d price momentum fallback) with no range model gate. OOS ran with XGBoost direction model (direction gate bypassed for IC) + trained range model gate. The optimizer was selecting structural params (stop_loss, profit_target, max_hold, delta_short) that work well under a different, more permissive signal than what executes in OOS.
+**Implication:** Optuna's min_trades filter (≥7) counted ALL entries on training data including those the range model would have blocked. Best-params may favor high-trade-count configurations that get significantly filtered down in OOS, wasting the optimization budget.
+**Fix (Change C, Exp 10):** Train range model BEFORE Optuna and pass it to `StrategyOptimizer`. Every trial now evaluates under the same entry conditions as OOS. Direction model also passed but has no effect on IC (direction gate already bypassed by Change A).
+**Rule:** ML models used for entry decisions in OOS must be available during Optuna training-set evaluation. Any mismatch between Optuna signal and OOS signal wastes optimization budget.
 **Evidence:** Exp 9 is the first experiment across all 9 runs where Section E outperforms Section F. Removing the direction model as an iron condor gate (Change A) unlocked 3 additional active windows (W05, W06, W09) and raised optimized Sharpe from 1.68 (Exp 8) to 5.41. Ablation Sharpe dropped to 3.05, below optimized.
 **Interpretation:** The direction gate was filtering out valid iron condor setups (where the model saw high directional confidence = trending = IC failure condition). Without the gate, per-window Optuna can identify parameter sets that enter on higher range model confidence alone. The ablation (which also bypasses the gate via the same engine change) still gets more trades (38 vs 29) but with lower per-trade quality, confirming that optimization is now adding real selection value.
 **Rule:** For market-neutral strategies, the direction model should not gate entry. Range model alone is the appropriate signal. Use direction model only for directional strategies (spreads, covered calls).
@@ -739,9 +746,64 @@ New vs Exp 8: W05, W06, W08, W09, W11 now active (were zero-trade in Exp 8). W07
 
 ### What Changed for Next Experiment (Exp 10)
 
-- **Investigate Change B calibration:** W03's 0.10-confidence entries warrant scrutiny. Clamp minimum derived threshold higher (e.g. 0.04 instead of 0.02) or enforce a minimum range model confidence regardless of derived threshold.
-- **IC label horizon alignment (deferred from Exp 9):** Direction model uses 5-day return label; iron condors hold 10–21 days. Moot for IC now (direction gate removed), but still applies for directional strategies. Deferred until directional strategies are tested.
-- **Change C (Exp 9 plan):** Restructure `_run_single_window()` to retrain range model AFTER Optuna selects best_params, using the derived threshold. Currently Change B computes the threshold post-optimization but the range model is trained pre-optimization with a global threshold. The derived threshold is applied at OOS time but not at training time — a mismatch.
+- **[Change C]** Train direction model and range model (global 0.05 threshold) BEFORE Optuna. Pass `range_predictor` to `StrategyOptimizer` so every trial runs under the same entry conditions as OOS. — `src/ait/backtesting/walkforward.py`, `src/ait/optimization/optimizer.py`
+- **Revert Change B:** Remove wing-derived threshold derivation (`_derive_range_threshold`). Use fixed 0.05 for both Optuna evaluation and OOS. One consistent range model threshold per window.
+- Window config and Optuna budget: unchanged (365/30/30/5, 200 trials, patience 50, min_trades 7, n_jobs 6) to isolate Change C's effect.
+
+---
+
+## Experiment 10 — Optuna Consistency Fix: ML Models Fed Into Optimization
+
+**Archive:** TBD (running)
+**Date:** 2026-05-26
+
+### Setup
+- Walk-forward config: 365d / 30d / 30d / 5d → **12 windows** (identical to Exp 9)
+- Changes from Exp 9:
+  - **[Change C]** Range predictor and direction predictor trained BEFORE `_optimize_window_params()`. Both passed to `StrategyOptimizer` → `Backtester` in every Optuna trial. Optuna now evaluates parameter sets under the same entry conditions as OOS.
+  - **Reverts Change B:** Fixed range threshold (0.05) replaces wing-derived threshold. One consistent model used for both optimization and OOS.
+- Optuna: unchanged (200 trials, patience 50, min_trades 7, n_jobs 6)
+
+### Assumptions Going In
+- Optuna's current signal mismatch (no range gate during trials, full ML in OOS) wastes optimization budget — it selects params optimized for unfiltered entries that get reduced in OOS
+- Passing the range model to Optuna will cause it to find params that produce ≥7 trades that *also* pass range model filtering, giving structurally better param sets
+- Active window count and win rate should improve or hold steady; per-trade quality should improve
+
+### Results — Optimized (Section E)
+
+| Metric | Value |
+|--------|-------|
+| Total return | TBD |
+| Total P&L | TBD |
+| Total trades | TBD |
+| Win rate | TBD |
+| Sharpe ratio | TBD |
+| Sortino ratio | TBD |
+| Max drawdown | TBD |
+| Profit factor | TBD |
+| Expectancy/trade | TBD |
+| Active windows | TBD / 12 |
+
+### Results — Ablation (Section F)
+
+| Metric | Value |
+|--------|-------|
+| Total return | TBD |
+| Total trades | TBD |
+| Sharpe ratio | TBD |
+| Active windows | TBD / 12 |
+
+### Observations
+
+*To be filled after run completes.*
+
+### What We Learned
+
+*To be filled after run completes.*
+
+### What Changed for Next Experiment
+
+*To be determined based on Exp 10 results.*
 
 ---
 

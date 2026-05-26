@@ -84,6 +84,7 @@ class StrategyOptimizer:
         seed: int = 42,
         intraday_store: "Any | None" = None,
         symbol: str | None = None,
+        range_predictor: "Any | None" = None,
     ) -> None:
         if objective not in OBJECTIVES:
             raise ValueError(f"Unknown objective '{objective}'. Choose from: {list(OBJECTIVES)}")
@@ -111,6 +112,7 @@ class StrategyOptimizer:
         self._seed = seed
         self._intraday_store = intraday_store
         self._symbol = symbol
+        self._range_predictor = range_predictor
         self._data: dict[str, pd.DataFrame] = {}
 
     # ------------------------------------------------------------------
@@ -300,6 +302,7 @@ class StrategyOptimizer:
             strategies=self._strategies,
             features_cache=self._features_cache,
             symbol=self._symbol or symbol,
+            range_predictor=self._range_predictor,
             **bt_kwargs,
         )
         return bt.run()

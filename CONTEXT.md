@@ -300,6 +300,8 @@ MLflow experiment: `walkforward_QQQ` (browse via `mlflow ui --backend-store-uri 
 
 **Exp 9 finding (completed 2026-05-26, archive `QQQ_365d_iron_condor_20260526_1409`):** Removed IC direction gate + wing-derived range threshold (Changes A + B). Section E: +4.37%, Sharpe 5.41, 29 trades, 9/12 active. Section F (ablation): +3.86%, Sharpe 3.05, 38 trades. **Section E beats Section F for the first time (P18).** Three dead-zone windows recovered (W05, W06, W09). Core dead zone (W07 Nov–Dec 2025, W10 Feb–Mar 2026, W12 Apr–May 2026) persists — range model correctly predicts low in-range probability in high-vol regimes.
 
+**Exp 10 (running as of 2026-05-26):** Change C — train range predictor before Optuna and pass it to every trial via StrategyOptimizer. Reverts Change B (fixed 0.05 threshold). Key finding from Exp 9: Optuna was evaluating trial params with no ML models (simple direction fallback, no range gate) while OOS used full ML stack — fundamental signal mismatch. See P19.
+
 **Key lessons:**
 - Regime-filter params (`min_confidence`, `max_entry_vol_annual`, `iv_floor`) are overfitting pressure sinks — fix in config, don't let Optuna search them for iron_condor
 - Spread params are fixed config wired through WalkForwardConfig → Backtester, not Optuna dims
