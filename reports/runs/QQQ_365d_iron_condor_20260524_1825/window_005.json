@@ -1,0 +1,67 @@
+{
+  "window": 5,
+  "test_start": "2025-07-09",
+  "test_end": "2025-08-20",
+  "pnl": 2021.22,
+  "return_pct": 2.0212,
+  "trades": 3,
+  "win_rate": 1.0,
+  "sharpe": 34.1525,
+  "max_drawdown": 0.0,
+  "strategies": {
+    "iron_condor": 3
+  },
+  "best_params": {
+    "iron_condor__stop_loss_pct": 0.5423132115171584,
+    "iron_condor__profit_target_pct": 0.4453363481826834,
+    "iron_condor__trailing_stop_pct": 0.18790123635038652,
+    "iron_condor__delta_short": 0.21741409645931908,
+    "iron_condor__max_hold_days": 21,
+    "iron_condor__iv_floor": 0.3994560818412529,
+    "iron_condor__wing_k": 1.0929556165639305,
+    "iron_condor__hurst_regime_threshold": 0.19707113578239038,
+    "iron_condor__hurst_regime_penalty": 0.13975808956848834,
+    "iron_condor__multifractal_max_width": 0.34080321273279396,
+    "iron_condor__spread_base": 0.030747161692072363,
+    "iron_condor__spread_iv_sensitivity": 0.1781196491970449,
+    "iron_condor__spread_dte_sensitivity": 0.006873831390810078
+  },
+  "trades_detail": [
+    {
+      "symbol": "QQQ",
+      "strategy": "iron_condor",
+      "entry_date": "2025-07-10",
+      "entry_time": "2025-07-10",
+      "exit_date": "2025-07-31",
+      "exit_time": "2025-07-31",
+      "exit_reason": "expiry",
+      "pnl": 1014.67,
+      "entry_confidence": 0.7867,
+      "entry_regime": "range_bound"
+    },
+    {
+      "symbol": "QQQ",
+      "strategy": "iron_condor",
+      "entry_date": "2025-08-08",
+      "entry_time": "2025-08-08",
+      "exit_date": "2025-08-20",
+      "exit_time": "2025-08-20",
+      "exit_reason": "backtest_end",
+      "pnl": 607.66,
+      "entry_confidence": 0.5938,
+      "entry_regime": "high_volatility"
+    },
+    {
+      "symbol": "QQQ",
+      "strategy": "iron_condor",
+      "entry_date": "2025-08-11",
+      "entry_time": "2025-08-11",
+      "exit_date": "2025-08-20",
+      "exit_time": "2025-08-20",
+      "exit_reason": "backtest_end",
+      "pnl": 398.89,
+      "entry_confidence": 0.566,
+      "entry_regime": "high_volatility"
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "window": 5,
+  "test_start": "2025-07-09",
+  "test_end": "2025-08-20",
+  "pnl": 709.79,
+  "return_pct": 0.7098,
+  "trades": 2,
+  "win_rate": 1.0,
+  "sharpe": 19.0448,
+  "max_drawdown": 0.0,
+  "strategies": {
+    "iron_condor": 2
+  },
+  "best_params": {
+    "iron_condor__stop_loss_pct": 0.6274815968862008,
+    "iron_condor__profit_target_pct": 0.4909398480621431,
+    "iron_condor__trailing_stop_fraction": 0.4113347094894444,
+    "iron_condor__delta_short": 0.20411130318161877,
+    "iron_condor__max_hold_days": 28,
+    "iron_condor__wing_k": 1.8306613749522127,
+    "iron_condor__hurst_regime_threshold": 0.24836940672418423,
+    "iron_condor__hurst_regime_penalty": 0.12921201629868298,
+    "iron_condor__multifractal_max_width": 0.33631120050259905
+  },
+  "trades_detail": [
+    {
+      "symbol": "QQQ",
+      "strategy": "iron_condor",
+      "entry_date": "2025-07-09",
+      "entry_time": "2025-07-09",
+      "exit_date": "2025-08-06",
+      "exit_time": "2025-08-06",
+      "exit_reason": "expiry",
+      "pnl": 564.07,
+      "entry_confidence": 0.6777,
+      "entry_regime": "range_bound"
+    },
+    {
+      "symbol": "QQQ",
+      "strategy": "iron_condor",
+      "entry_date": "2025-08-08",
+      "entry_time": "2025-08-08",
+      "exit_date": "2025-08-20",
+      "exit_time": "2025-08-20",
+      "exit_reason": "backtest_end",
+      "pnl": 145.72,
+      "entry_confidence": 0.6871,
+      "entry_regime": "high_volatility"
+    }
+  ]
+}

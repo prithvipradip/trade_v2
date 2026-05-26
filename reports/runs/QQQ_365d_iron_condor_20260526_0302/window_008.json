@@ -1,0 +1,24 @@
+{
+  "window": 8,
+  "test_start": "2025-12-10",
+  "test_end": "2026-01-09",
+  "pnl": 0.0,
+  "return_pct": 0.0,
+  "trades": 0,
+  "win_rate": 0.0,
+  "sharpe": 0.0,
+  "max_drawdown": 0.0,
+  "strategies": {},
+  "best_params": {
+    "iron_condor__stop_loss_pct": 0.4638342671368019,
+    "iron_condor__profit_target_pct": 0.30871218452940385,
+    "iron_condor__trailing_stop_fraction": 0.5167937982850718,
+    "iron_condor__delta_short": 0.18440499703326343,
+    "iron_condor__max_hold_days": 19,
+    "iron_condor__wing_k": 1.7187785820909518,
+    "iron_condor__hurst_regime_threshold": 0.19639533094742698,
+    "iron_condor__hurst_regime_penalty": 0.23856815715391438,
+    "iron_condor__multifractal_max_width": 0.598586738471095
+  },
+  "note": "no_trades"
+}
