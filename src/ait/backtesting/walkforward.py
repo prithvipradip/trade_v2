@@ -368,6 +368,25 @@ class WalkForwardResult:
         return df.sort_values("date").reset_index(drop=True)
 
 
+def _derive_range_threshold(best_params: dict, train_df: "pd.DataFrame") -> float:
+    """Derive range-model threshold from the Optuna-selected wing geometry.
+
+    Uses the Black-Scholes short-strike distance approximation:
+        threshold ≈ N⁻¹(1 − delta_short) × realized_vol × sqrt(max_hold / 252)
+
+    This replaces the fixed 5% label used during range-model training, so the
+    model learns to predict whether price stays within the *actual* short-strike
+    boundary rather than an arbitrary constant.  Clamped to [0.02, 0.15].
+    """
+    from scipy.stats import norm  # lazy import — scipy not always used at module level
+    delta_short = float(best_params.get("iron_condor__delta_short", 0.15))
+    max_hold = int(best_params.get("iron_condor__max_hold_days", 20))
+    iv_est = max(0.10, train_df["Close"].pct_change().std() * (252 ** 0.5))
+    d1 = norm.ppf(1.0 - delta_short)
+    threshold = d1 * iv_est * ((max_hold / 252) ** 0.5)
+    return float(np.clip(threshold, 0.02, 0.15))
+
+
 def _window_task_mp(args: tuple) -> tuple:
     """Worker for ProcessPoolExecutor window-level parallelism.
 
@@ -628,10 +647,26 @@ class WalkForwardBacktester:
                     curr_best_params = best_params
 
             predictor = self._train_window_model(train_df, symbol, window_id)
+
+            # Derive range threshold from optimized wing geometry when available.
+            # Falls back to config default (0.05) when optimization is off or
+            # best_params don't contain iron_condor keys.
+            _range_threshold = self._config.range_threshold_pct
+            if (curr_best_params is not None
+                    and "iron_condor__delta_short" in curr_best_params):
+                _range_threshold = _derive_range_threshold(curr_best_params, train_df)
+                log.debug(
+                    "range_threshold_derived",
+                    window=window_id, symbol=symbol,
+                    threshold_pct=f"{_range_threshold:.4f}",
+                    delta_short=curr_best_params.get("iron_condor__delta_short"),
+                    max_hold=curr_best_params.get("iron_condor__max_hold_days"),
+                )
+
             range_predictor = self._train_window_range_model(
                 train_df, symbol, window_id,
                 max_hold_days=window_cfg.max_hold_days,
-                threshold_pct=self._config.range_threshold_pct,
+                threshold_pct=_range_threshold,
             )
             if predictor and predictor.is_trained:
                 model_accuracy = max(

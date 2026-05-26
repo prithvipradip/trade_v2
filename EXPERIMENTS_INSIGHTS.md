@@ -17,6 +17,7 @@
 | 5 | `QQQ_365d_iron_condor_20260514_1142` | 365/42/14/5, 28 W | **+183.14%** | **+9.00%** | **91** | **23.95** | **18/28** | **Removed regime filters from search space** |
 | 6 | `QQQ_365d_iron_condor_20260524_1825` | 365/42/14/5, 24 W | +11.88% | **+22.68%** | 14 / **36** | 39.12 / **9.70** | 7/24 / **13/24** | Spread model wiring fixed + calibration |
 | 7 | `QQQ_365d_iron_condor_20260525_1802` | 365/42/14/5, 24 W | +1.95% | +10.41% | 18 / 34 | 3.89 / 4.98 | 6/24 / 13/24 | ML fix (implied_vol NaN bug); first real XGBoost/LightGBM predictions |
+| 8 | `QQQ_365d_iron_condor_20260526_0302` | 365/30/30/5, 12 W | +0.51% | +6.02% | 20 / 14 | 1.68 / 14.25 | 6/12 / 6/12 | Non-overlapping 30d windows; max_hold=[10,21]; 200 trials; n_jobs=6 (ProcessPoolExecutor) |
 
 Config format: `train_days / test_days / step_days / gap_days`.
 All experiments: QQQ, iron_condor only, 50 Optuna trials per window, TPE sampler seed 42, $100k initial capital.
@@ -349,6 +350,21 @@ These are standing conclusions drawn from the experiments above. Review and upda
 **Evidence:** Exp 7 observed distribution: mean 31.8, median 32, min observed 18 (W07 only), 70% of windows chose ≥30. Lower half of range [14–25] was almost never selected.
 **Implication:** Restricting to [10, 21] forces unexplored territory. The preference for 26–40 is either (a) genuine — longer holds capture more theta decay, or (b) an artifact of backtest_end inflation. Exp 8 ([10,21] range with 30-day non-overlapping windows) tests this.
 
+### P15 — Ablation (fixed global-best params) consistently outperforms per-window Optuna when training signal is sparse
+**Evidence:** Exp 6: ablation +22.68% vs optimised +11.88%. Exp 7: ablation +10.41% vs +1.95%. Exp 8: ablation +6.02% / Sharpe 14.25 vs optimised +0.51% / Sharpe 1.68. The pattern is consistent across three experiments.
+**Why:** With only 7–10 minimum trades required per Optuna trial and a 9D search space, the optimizer fits noise. The global-best params (from the most data-rich training window) generalise better than window-specific "optimal" params.
+**Rule:** Treat Section F (ablation) as the primary performance signal. Section E (optimised) measures how well the optimizer can extrapolate — currently it cannot.
+
+### P16 — Optimization wall-clock time is regime-dependent: high-vol training windows run ~2× more Optuna trials
+**Evidence:** Exp 8 timing analysis. Pre-selloff training windows (W01–W06, training ending before Aug 2025): patience fired at ~54–118 trials, total ~141–292 min. Post-selloff training windows (W08–W11, training spanning Aug–Dec 2025): patience fired at ~145–160 trials, total ~354–386 min.
+**Why:** Mixed-regime training data (calm + volatile) creates a rougher objective-function landscape with more local optima. The optimizer finds marginal improvements sporadically, repeatedly resetting the patience counter. Low-vol training data has a smoother landscape — Optuna converges fast.
+**Rule:** When estimating run time for future experiments, add ~2× multiplier for windows whose training period includes a major vol event.
+
+### P17 — Dead zone (Sep 2025–May 2026) is unambiguously regime-driven, not a window-design artifact
+**Evidence:** Exp 7 (14d step / 42d test, 24 windows, 67% overlap) and Exp 8 (30d step / 30d test, 12 windows, 0% overlap) both show zero trades across Sep 2025–May 2026. Identical dead zone under two structurally different window designs rules out OOS overlap as an explanation.
+**Why:** The training period for windows covering this OOS spans the Aug–Dec 2025 high-vol selloff. Optuna cannot find an iron condor config with ≥7 profitable trades in training when realized vol exceeds the max_entry_vol gate (~80%). No config → no OOS trades.
+**Rule:** The dead zone will persist in any experiment that uses Aug–Dec 2025 as a training window. Only architectural changes (Exp 9: remove direction gate, derive range threshold from wing geometry) can potentially reactivate it.
+
 ---
 
 ## Experiment 6 — Spread Model Wiring Fix + Market Regime Drop-Off
@@ -522,6 +538,92 @@ Active window detail:
 
 ---
 
+## Experiment 8 — Non-Overlapping Windows + Restricted max_hold + Parallel Optimization
+
+**Archive:** `QQQ_365d_iron_condor_20260526_0302`
+**Date:** 2026-05-25/26
+
+### Setup
+- Walk-forward config: 365d / 30d / 30d / 5d → **12 windows** (non-overlapping OOS)
+- Test period covered: 2025-05-14 to 2026-05-09
+- Key changes from Exp 7:
+  - `test_days`: 42 → 30; `step_days`: 14 → 30 (non-overlapping, step = test)
+  - `max_hold_days` range: [14, 40] → **[10, 21]** — forces trades to complete within 30-day window
+  - Optuna trials: 50 → **200**; patience: 20 → **50**
+  - `min_trades`: 10 → **7** (fewer trades expected with shorter hold)
+  - `optimize_n_jobs`: 1 → **6** (window-level ProcessPoolExecutor parallelism, commit `ae102df`)
+
+### Assumptions Going In
+- Non-overlapping windows would eliminate the triple-counting artifact from Exp 7 and give cleaner aggregate metrics
+- Restricting max_hold_days to [10, 21] would force trades to complete within the 30-day OOS window, eliminating most backtest_end exits
+- 200 Optuna trials would give the 9D optimizer better coverage and beat the Exp 7 per-window quality
+
+### Results — Optimized (Section E)
+
+| Metric | Value |
+|--------|-------|
+| Total return | +0.51% (+5.02% cash-adj @ 5% idle) |
+| Total P&L | +$521 |
+| Total trades | 20 |
+| Win rate | 55% |
+| Sharpe ratio | 1.68 |
+| Sortino ratio | 2.11 |
+| Max drawdown | 1.30% |
+| Profit factor | 1.32 |
+| Win/loss ratio | 1.08 |
+| Expectancy/trade | $26 |
+| Active windows | **6/12** |
+
+Per-window detail:
+
+| W | Test Period | T | WR | P&L | Sharpe | b_end | max_hold |
+|---|-------------|---|----|-----|--------|-------|---------|
+| W01 | May→Jun 2025 | 3 | 100% | +$887 | 162.1 | 3/3 | 18d |
+| W02 | Jun→Jul 2025 | 6 | 83% | +$956 | 16.5 | 3/6 | 20d |
+| W03 | Jul→Aug 2025 | 1 | 0% | -$113 | 0.0 | 1/1 | 21d |
+| W04 | Aug→Sep 2025 | 1 | 0% | -$538 | 0.0 | 0/1 (stop) | 14d |
+| W05–W08, W10, W12 | Sep 2025–May 2026 | 0 | — | — | — | — | — |
+| W09 | Jan→Feb 2026 | 3 | 33% | -$51 | -5.0 | 0/3 (natural) | 20d |
+| W11 | Mar→Apr 2026 | 6 | 33% | -$621 | -7.2 | 2/6 | 21d |
+
+### Results — Ablation (Section F)
+
+| Metric | Value |
+|--------|-------|
+| Total return | **+6.02%** (+10.50% cash-adj) |
+| Total P&L | +$5,910 |
+| Total trades | 14 |
+| Win rate | 64% |
+| Sharpe ratio | **14.25** |
+| Sortino ratio | 154.43 |
+| Max drawdown | **0.18%** |
+| Profit factor | **14.15** |
+| Win/loss ratio | 7.86 |
+| Active windows | 6/12 |
+
+### Observations
+- **Dead zone confirmed as regime-driven (P17):** W05–W08, W10, W12 (Sep 2025–May 2026) all zero trades — identical to Exp 7's dead zone despite completely different window geometry. Non-overlapping design rules out overlap artifact.
+- **backtest_end bias reduced but not eliminated:** W01 3/3, W02 3/6, W03 1/1 still backtest_end. Trades entered in the last 10 days of a 30-day window still hit the boundary even with max_hold=18-21d. W09 is the success case — 3/3 natural exits (trades entered early enough in the window). W04 is the clean stop-loss.
+- **Section F >> Section E by a wide margin (P15):** Ablation Sharpe 14.25 vs optimized 1.68; return 6% vs 0.5%. This is the third consecutive experiment where ablation dominates. 200 trials × 7-trade minimum is still fitting noise on a 9D space.
+- **Profitable windows still concentrated in May–Jul 2025:** W01+W02 contributed +$1,843 of the +$521 optimized total. W03, W04 were losses. The strategy's alpha is geographically concentrated in the pre-selloff low-vol regime.
+- **max_hold_days in [10, 21]:** Optuna chose 14d (W04, fitted to Aug selloff), 18-21d (all others). The upper bound is always chosen when possible — consistent with P14 (optimizer prefers longer holds for more theta).
+- **Optimization convergence timing (P16):** Pre-selloff training windows ran ~54–118 trials (141–292 min). Post-selloff training windows ran ~145–160 trials (354–386 min). ~2× more trials needed for mixed-regime landscapes.
+
+### What We Learned
+- **Q8 (answered):** Restricting max_hold_days to [10, 21] partially reduces backtest_end exits. Late-window entries still hit the boundary. True elimination would require enforcing a minimum entry gap from OOS end, not just capping hold duration.
+- **Q9 (answered):** Non-overlapping windows produce identical structural conclusions to overlapping. The dead zone, profitable cluster, and ablation >> optimized pattern are robust to window design. Exp 7 findings were real.
+- **P15 reinforced:** Three consecutive ablation >> optimized results. Per-window Optuna with sparse training signal reliably overfits. Next step: either (a) use ablation params as the baseline for live trading, or (b) fix the optimizer's signal quality (Exp 9 architectural changes).
+- **Direction model as iron condor gate is suspicious:** The bearish entries in W04 (stop-loss, Aug selloff) and W11 (33% WR) were allowed because direction confidence was high. For a market-neutral strategy, high directional confidence is a warning signal, not an entry trigger.
+
+### What Changed for Next Experiment (Exp 9)
+
+- **[Change A]** Remove direction model as iron condor / short_strangle entry gate. Use range model alone (`probability_in_range ≥ range_min_confidence`). Direction model is kept active for directional strategies (put/call credit spreads). — `src/ait/backtesting/engine.py`
+- **[Change B]** Derive range model threshold from actual wing geometry after Optuna selects best_params. Currently fixed at ±5% regardless of selected delta_short and wing_k. Will recompute `threshold_pct` from the chosen strikes before OOS backtest. — `src/ait/backtesting/walkforward.py`
+- Window config: unchanged (365/30/30/5, 12 windows) to isolate the architectural effect
+- Optuna: unchanged (200 trials, patience 50, min_trades 7, n_jobs 6)
+
+---
+
 ## Open Questions
 
 These are unresolved questions that future experiments should address:
@@ -532,11 +634,13 @@ These are unresolved questions that future experiments should address:
 - **Q4 (partially answered):** Real-world spread impact is modest at ≈3% half-spread for liquid QQQ options. IV sensitivity is effectively 0. The backtester defaults were approximately correct.
 - **Q5:** Would increasing Optuna trials per window (e.g. 100 vs 50) improve results further, or has the 9D space already converged sufficiently at 50 trials?
 - **Q6 (answered):** Removing `iv_floor` from the search space did NOT recover inactive windows. Dead zone is regime-driven — the optimizer correctly finds no profitable IC configuration when training-period volatility mismatches OOS volatility.
-- **Q7:** The Exp 6 ablation (+22.68%) outperformed the optimized run (+11.88%). Does Optuna's optimization add net value, or does the `min_trades` filter + search overhead reduce trade frequency below the ablation baseline? Is there a configuration where optimization beats ablation on both return AND trade count?
-- **Q8:** Does restricting max_hold_days to [10,21] with 30-day non-overlapping windows eliminate the backtest_end bias and produce more reliable OOS metrics? Do shorter-hold iron condors show comparable risk-adjusted returns?
-- **Q9:** Does the 30-day non-overlapping window design produce meaningfully different conclusions from the 42-day overlapping design? Is the Exp 7 dead zone confirmed or partially an overlap artifact?
-- **Q10:** Should the range model threshold (currently fixed at ±5%) be derived from the actual iron condor wing widths (wing_k, delta_short, IV) rather than being a constant? Does the mismatch between the ±5% training label and the actual strike placement degrade range model signal quality?
-- **Q11:** Is the direction model an appropriate first gate for iron condors? Iron condors are market-neutral — high direction confidence signals a trending regime, which is exactly when they fail (W24 confirms this). Should the direction gate be removed (range model only) or inverted (skip entry when direction confidence is too high)?
+- **Q7:** The ablation consistently beats per-window Optuna (Exp 6, 7, 8). Does Optuna's optimization add net value at all with current training data density? Is there a minimum trade count per trial that makes optimization viable?
+- **Q8 (answered):** Restricting max_hold_days to [10, 21] reduces but does not eliminate backtest_end exits. Late-window entries still hit the OOS boundary regardless of hold cap.
+- **Q9 (answered):** Non-overlapping window design produces identical structural conclusions. Exp 7's dead zone and ablation >> optimized pattern were real, not overlap artifacts.
+- **Q10:** Should the range model threshold (currently fixed at ±5%) be derived from the actual iron condor wing widths (wing_k, delta_short, IV) rather than being a constant? Does the mismatch between the ±5% training label and the actual strike placement degrade range model signal quality? (Exp 9 Change B addresses this.)
+- **Q11:** Is the direction model an appropriate first gate for iron condors? Iron condors are market-neutral — high direction confidence signals a trending regime, which is exactly when they fail. Should the direction gate be removed (range model only)? (Exp 9 Change A addresses this.)
+- **Q12:** Does removing the direction gate (Change A) recover any of the dead-zone windows, or does the dead zone persist because the range model also predicts low probability during high-vol regimes?
+- **Q13:** Does deriving the range threshold from wing geometry (Change B) improve range model signal quality, or is the ±5% label too coarse for the model to learn a useful signal regardless of threshold?
 
 ---
 
@@ -592,4 +696,4 @@ Copy this section to add a new experiment:
 
 ---
 
-*Last updated: 2026-05-24*
+*Last updated: 2026-05-26*

@@ -232,8 +232,16 @@ class TestWalkForwardBacktester:
         assert "portfolio" in benchmark
         assert isinstance(benchmark["SPY"], float)
 
-    def test_run_with_data(self) -> None:
+    def test_run_with_data(self, monkeypatch) -> None:
         import asyncio
+
+        # Patch out ML training so both direction and range models fall back to
+        # _simple_direction (deterministic given seed=42 synthetic data). Without
+        # this, real XGBoost on random-walk data may predict no high-confidence
+        # signals and produce 0 trades — unrelated to the walk-forward structure.
+        monkeypatch.setattr(WalkForwardBacktester, "_train_window_model", lambda *a, **kw: None)
+        monkeypatch.setattr(WalkForwardBacktester, "_train_window_range_model", lambda *a, **kw: None)
+        monkeypatch.setattr(WalkForwardBacktester, "_train_window_meta_labeler", lambda *a, **kw: None)
 
         data = {
             "SPY": _make_ohlcv(1000, start_price=450),
@@ -626,9 +634,18 @@ class TestMultiPosition:
         result = bt.run()
         assert result is not None
 
-    def test_multi_position_allows_more_trades(self) -> None:
+    def test_multi_position_allows_more_trades(self, monkeypatch) -> None:
         """max_concurrent_positions=3 produces >= trades as max_concurrent_positions=1."""
         import asyncio
+
+        # Patch out ML training: both runs must see identical signals so the only
+        # variable is max_concurrent_positions. Real XGBoost trains a slightly
+        # different model each call (thread non-determinism), which would make the
+        # trade counts incomparable and the assertion flaky.
+        monkeypatch.setattr(WalkForwardBacktester, "_train_window_model", lambda *a, **kw: None)
+        monkeypatch.setattr(WalkForwardBacktester, "_train_window_range_model", lambda *a, **kw: None)
+        monkeypatch.setattr(WalkForwardBacktester, "_train_window_meta_labeler", lambda *a, **kw: None)
+
         data = {"SPY": _make_ohlcv(1000, start_price=450)}
         cfg_single = WalkForwardConfig(
             train_days=350, test_days=63, step_days=63, gap_days=5,

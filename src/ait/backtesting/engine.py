@@ -239,12 +239,16 @@ class Backtester:
 
             effective_min_conf = self._min_confidence
 
-            if confidence < effective_min_conf:
-                continue
-
-            # Bearish bets need slightly higher confidence (market has natural upward drift)
-            if direction == SignalDirection.BEARISH and confidence < effective_min_conf + 0.05:
-                continue
+            # Iron condors and short strangles are market-neutral: high directional
+            # confidence signals a trending regime — exactly when they fail. Skip the
+            # direction gate for these strategies; the range model below is the sole
+            # entry filter. Directional strategies still require confidence ≥ min_conf.
+            _neutral_only = bool(set(self._strategies) & {"iron_condor", "short_strangle"})
+            if not _neutral_only:
+                if confidence < effective_min_conf:
+                    continue
+                if direction == SignalDirection.BEARISH and confidence < effective_min_conf + 0.05:
+                    continue
 
             # MetaLabeler gate (Gap Z1): applied during OOS evaluation when a trained
             # per-window model is provided, exactly mirroring the live orchestrator.
