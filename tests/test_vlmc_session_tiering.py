@@ -126,12 +126,10 @@ class TestHurstWaveletShortSession:
         # Only 20 bars — less than minimum needed for wavelet decomposition
         short_session = _make_intraday(session_date, n_bars=20)
         fe = FeatureEngine()
-        # Call the helper directly; should not raise
-        try:
-            result = fe._compute_hurst_wavelet(short_session["Close"])
-            assert result == pytest.approx(0.0, abs=0.01) or np.isfinite(result)
-        except AttributeError:
-            pass  # method may have a different name — skip rather than fail
+        if not hasattr(fe, "_hurst_wavelet"):
+            pytest.skip("FeatureEngine._hurst_wavelet is unavailable")
+        result, _ = fe._hurst_wavelet(short_session["Close"].to_numpy())
+        assert result == pytest.approx(0.0, abs=0.01) or np.isfinite(result)
 
 
 class TestComputeBaseFeatures:

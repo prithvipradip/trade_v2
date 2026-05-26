@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from ait.ml.features import FeatureEngine
 
@@ -63,7 +62,6 @@ class TestFeatureEngineCompute:
         df = _make_ohlcv()
         fe = FeatureEngine()
         result = fe.compute(df)
-        base_names = fe.get_feature_names(include_vlmc=False)
         for col in ["rsi_14", "rsi_7", "bb_position", "macd_hist", "atr_pct"]:
             assert col in result.columns, f"Base feature {col} missing"
 

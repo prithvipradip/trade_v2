@@ -103,10 +103,14 @@ def load_daily_ohlcv(
             # Align index timezone: df may be tz-naive or tz-aware
             iv_idx = iv_series.index
             df_idx = df.index
-            if hasattr(df_idx, "tzinfo") and df_idx.tzinfo is not None and iv_idx.tzinfo is None:
-                iv_idx = iv_idx.tz_localize("UTC")
-            elif hasattr(df_idx, "tzinfo") and df_idx.tzinfo is None and iv_idx.tzinfo is not None:
+            df_tz = getattr(df_idx, "tz", None)
+            iv_tz = getattr(iv_idx, "tz", None)
+            if df_tz is not None and iv_tz is None:
+                iv_idx = iv_idx.tz_localize(df_tz)
+            elif df_tz is None and iv_tz is not None:
                 iv_idx = iv_idx.tz_localize(None)
+            elif df_tz is not None and iv_tz is not None and str(iv_tz) != str(df_tz):
+                iv_idx = iv_idx.tz_convert(df_tz)
             iv_aligned = pd.Series(iv_series.values, index=iv_idx, name="implied_vol")
             df = df.join(iv_aligned, how="left")
         else:
@@ -245,10 +249,11 @@ class MarketDataService:
 
         if df is not None and not df.empty:
             # Return only bars strictly after the cutoff
-            idx = df.index
-            if idx.tzinfo is None:
-                idx = idx.tz_localize("UTC")
-            return df[idx > since_utc]
+            if getattr(df.index, "tz", None) is None:
+                df.index = df.index.tz_localize("UTC")
+            else:
+                df.index = df.index.tz_convert("UTC")
+            return df[df.index > since_utc]
 
         return None
 
@@ -381,7 +386,7 @@ class MarketDataService:
 
             df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
             df.index.name = "Datetime"
-            if df.index.tzinfo is None:
+            if getattr(df.index, "tz", None) is None:
                 df.index = df.index.tz_localize("UTC")
             else:
                 df.index = df.index.tz_convert("UTC")
