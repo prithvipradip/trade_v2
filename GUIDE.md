@@ -1503,6 +1503,44 @@ The script prints every changed parameter (old → new), the source window (e.g.
 
 **Run naming convention:** Each archived run is named `{symbol}_{train_days}d_{strategy}_{YYYYMMDD_HHMM}` (e.g. `QQQ_365d_iron_condor_20260514_1142`). The timestamp is UTC and includes hour+minute to prevent collisions when multiple experiments run on the same calendar day. The date in the name is the archive date, not the test period — use `run_metadata.json → backtest_period` (or the MLflow `backtest_period` param) for the actual data range.
 
+**Committing experiment archives — use the `data/experiment-archives` branch:**
+
+Experiment result directories (`reports/runs/{run_id}/`) are data artifacts, not code. They must **never** be committed to feature branches or PRs — Copilot's review limit is 20,000 lines and a single experiment adds ~2,000 lines of JSON/CSV/text. Instead, all archives go to the dedicated `data/experiment-archives` branch:
+
+```bash
+# After an experiment finishes and reports/runs/{run_id}/ is created:
+git checkout data/experiment-archives
+
+# Stage only the scientific record — log and HTML files are excluded by .gitignore
+git add reports/runs/{run_id}/
+
+# Commit with a descriptive message
+git commit -m "data: add {run_id} archive (Exp N results)"
+
+# Push to remote
+git push origin data/experiment-archives
+
+# Return to your feature/work branch
+git checkout <your-branch>
+```
+
+**What to include / exclude in the archive commit:**
+
+| Include (tracked) | Exclude (gitignored) |
+|---|---|
+| `window_*.json` | `*.log` |
+| `run_metadata.json` | `*.html` |
+| `walkforward_summary.txt` | |
+| `ablation_summary.txt` | |
+| `equity_curve.csv` | |
+| `config_snapshot.yaml` | |
+| `RESULTS.md` | |
+| `ic_decay.csv`, `ic_summary.csv` | |
+
+The `.gitignore` on `data/experiment-archives` already excludes `*.log` and `*.html` via `reports/runs/**/*.log` and `reports/runs/**/*.html` patterns — a plain `git add reports/runs/{run_id}/` is safe.
+
+Daily monitoring snapshots (`reports/daily_YYYYMMDD.json`) also belong on this branch, not on feature PRs.
+
 **MLflow tracking URI:** `run_integration_test.py` writes to `data/mlflow.db` by default (same as `backfill_mlflow.py`). Override with `MLFLOW_TRACKING_URI` env var if needed. Do not delete `mlflow.db` from the project root if it exists — it is a stale artifact from before this fix and can be removed.
 
 ### Manual Tuning (still valid for quick iteration)
