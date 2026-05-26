@@ -1423,6 +1423,7 @@ All four flags are optional — if omitted, the values are read from the corresp
 | Exp 6 | 365/42/14/5 | Spread wiring fixed; spread params + `iv_floor` removed; VIX-based IV | +11.88% | +22.68% | 14 / 36 | 39 / 9.7 |
 | **Exp 7** | 365/42/14/5 | **ML fix: FeatureEngine OHLCV-only input; first real XGBoost/LightGBM predictions** | **+1.95%** | **+10.41%** | **18 / 34** | **3.89 / 4.98** |
 | **Exp 8** | 365/30/30/5 | **Non-overlapping windows; max_hold=[10,21]; 200 trials; n_jobs=6** | **+0.51%** | **+6.02%** | **20 / 14** | **1.68 / 14.25** |
+| **Exp 9** | 365/30/30/5 | **Remove IC direction gate (Change A); wing-derived range threshold (Change B)** | **+4.37%** | **+3.86%** | **29 / 38** | **5.41 / 3.05** |
 
 **Root cause of Experiments 2–4 failure:** Optuna maximised `min_confidence` toward the ceiling or drove `max_entry_vol_annual` to the floor, blocking all OOS trades. Removing both from the search space resolved this.
 
@@ -1430,7 +1431,9 @@ All four flags are optional — if omitted, the values are read from the corresp
 
 **Exp 7 finding:** All Experiments 1–6 silently ran on a naive price-momentum fallback (confidence ≈ 0.50) because `load_daily_ohlcv()` appends an `implied_vol` column (all-NaN), which `FeatureEngine.compute()` passed through to `dropna()` — eliminating every row. Fixed in commit `38d4ae8`: FeatureEngine now starts from OHLCV-only columns. First experiment with real ML predictions (confidence 0.73–0.96). Ablation again outperformed optimization (5× gap); structural issues identified: OOS window overlap and backtest_end B-S bias.
 
-**Exp 8 finding (completed 2026-05-26):** Non-overlapping 30-day windows confirm Exp 7 findings — dead zone (Sep 2025–May 2026) is regime-driven, not an overlap artifact. backtest_end exits reduced but not eliminated (late-window entries still hit boundary). Ablation Sharpe 14.25 vs optimized 1.68 — three consecutive experiments where ablation beats optimization. **Exp 9 launched** with two architectural changes: (A) remove direction model gate for iron_condor (use range model only), (B) derive range threshold from wing geometry post-Optuna.
+**Exp 8 finding (completed 2026-05-26):** Non-overlapping 30-day windows confirm Exp 7 findings — dead zone (Sep 2025–May 2026) is regime-driven, not an overlap artifact. backtest_end exits reduced but not eliminated (late-window entries still hit boundary). Ablation Sharpe 14.25 vs optimized 1.68 — three consecutive experiments where ablation beats optimization.
+
+**Exp 9 finding (completed 2026-05-26, archive `QQQ_365d_iron_condor_20260526_1409`):** Removing the iron condor direction gate (Change A) + wing-derived range threshold (Change B) reversed the ablation dominance pattern for the first time. Section E: +4.37%, Sharpe 5.41, 29 trades, 9/12 active. Section F (ablation): +3.86%, Sharpe 3.05, 38 trades. Three windows recovered from dead zone (W05 Sep–Oct 2025, W06 Oct–Nov 2025, W09 Jan–Feb 2026). Core dead zone (W07, W10, W12) persists — range model correctly rejects high-vol regimes. P18: optimization now beats ablation when entry gate quality is correct.
 
 **Current fix for iron_condor search space (Exp 7 onwards):** `min_confidence`, `max_entry_vol_annual`, `iv_floor`, and all spread params are fixed at config defaults — not searchable. See Parameter Spaces table above.
 

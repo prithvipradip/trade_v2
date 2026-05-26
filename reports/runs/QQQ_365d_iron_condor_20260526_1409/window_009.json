@@ -1,0 +1,75 @@
+{
+  "window": 9,
+  "test_start": "2026-01-09",
+  "test_end": "2026-02-08",
+  "pnl": 473.51,
+  "return_pct": 0.4735,
+  "trades": 4,
+  "win_rate": 0.75,
+  "sharpe": 4.8611,
+  "max_drawdown": 0.3802,
+  "strategies": {
+    "iron_condor": 4
+  },
+  "best_params": {
+    "iron_condor__stop_loss_pct": 0.45832378229363935,
+    "iron_condor__profit_target_pct": 0.48165053151401044,
+    "iron_condor__trailing_stop_fraction": 0.8156199191601903,
+    "iron_condor__delta_short": 0.15668335076706957,
+    "iron_condor__max_hold_days": 20,
+    "iron_condor__wing_k": 1.9987718696934025,
+    "iron_condor__hurst_regime_threshold": 0.10013595212067194,
+    "iron_condor__hurst_regime_penalty": 0.006657336088581541,
+    "iron_condor__multifractal_max_width": 0.5983679852954373
+  },
+  "trades_detail": [
+    {
+      "symbol": "QQQ",
+      "strategy": "iron_condor",
+      "entry_date": "2026-01-13",
+      "entry_time": "2026-01-13",
+      "exit_date": "2026-02-02",
+      "exit_time": "2026-02-02",
+      "exit_reason": "expiry",
+      "pnl": 559.78,
+      "entry_confidence": 0.5683,
+      "entry_regime": "high_volatility"
+    },
+    {
+      "symbol": "QQQ",
+      "strategy": "iron_condor",
+      "entry_date": "2026-01-22",
+      "entry_time": "2026-01-22",
+      "exit_date": "2026-02-04",
+      "exit_time": "2026-02-04",
+      "exit_reason": "trailing_stop",
+      "pnl": 161.22,
+      "entry_confidence": 0.6666,
+      "entry_regime": "range_bound"
+    },
+    {
+      "symbol": "QQQ",
+      "strategy": "iron_condor",
+      "entry_date": "2026-02-02",
+      "entry_time": "2026-02-02",
+      "exit_date": "2026-02-04",
+      "exit_time": "2026-02-04",
+      "exit_reason": "stop_loss",
+      "pnl": -382.98,
+      "entry_confidence": 0.9717,
+      "entry_regime": "high_volatility"
+    },
+    {
+      "symbol": "QQQ",
+      "strategy": "iron_condor",
+      "entry_date": "2026-01-21",
+      "entry_time": "2026-01-21",
+      "exit_date": "2026-02-05",
+      "exit_time": "2026-02-05",
+      "exit_reason": "trailing_stop",
+      "pnl": 135.49,
+      "entry_confidence": 0.5911,
+      "entry_regime": "range_bound"
+    }
+  ]
+}

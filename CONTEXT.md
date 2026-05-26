@@ -296,7 +296,9 @@ MLflow experiment: `walkforward_QQQ` (browse via `mlflow ui --backend-store-uri 
 
 **Exp 7 finding:** All Experiments 1–6 silently ran on a naive price-momentum fallback (confidence ≈ 0.50) because `load_daily_ohlcv()` appends an `implied_vol` column (all-NaN), which `FeatureEngine.compute()` passed through to `dropna()` — eliminating every row. Fixed in commit `38d4ae8`: FeatureEngine now starts from OHLCV-only columns. With ML active, ablation still outperformed optimization by 5×. Two structural issues identified: OOS window overlap (step < test) and backtest_end B-S bias.
 
-**Exp 8 finding (completed 2026-05-26, archive `QQQ_365d_iron_condor_20260526_0302`):** 30-day non-overlapping windows (365/30/30/5, 12 W), max_hold_days=[10,21], 200 trials, n_jobs=6. Section E: +0.51%, Sharpe 1.68, 20 trades, 6/12 active. Section F (ablation): +6.02%, Sharpe 14.25, 14 trades. Key findings: (1) dead zone (Sep 2025–May 2026) confirmed regime-driven — identical to Exp 7 despite no overlap; (2) backtest_end bias reduced but not eliminated (late-window entries still hit boundary); (3) ablation >> optimization for third consecutive experiment (P15). **Exp 9 now running** with two architectural changes: remove direction gate for iron_condor (use range model alone), derive range threshold from wing geometry post-Optuna. Same window config (365/30/30/5) to isolate architectural effect.
+**Exp 8 finding (completed 2026-05-26, archive `QQQ_365d_iron_condor_20260526_0302`):** 30-day non-overlapping windows (365/30/30/5, 12 W), max_hold_days=[10,21], 200 trials, n_jobs=6. Section E: +0.51%, Sharpe 1.68, 20 trades, 6/12 active. Section F (ablation): +6.02%, Sharpe 14.25, 14 trades. Key findings: (1) dead zone (Sep 2025–May 2026) confirmed regime-driven — identical to Exp 7 despite no overlap; (2) backtest_end bias reduced but not eliminated (late-window entries still hit boundary); (3) ablation >> optimization for third consecutive experiment (P15).
+
+**Exp 9 finding (completed 2026-05-26, archive `QQQ_365d_iron_condor_20260526_1409`):** Removed IC direction gate + wing-derived range threshold (Changes A + B). Section E: +4.37%, Sharpe 5.41, 29 trades, 9/12 active. Section F (ablation): +3.86%, Sharpe 3.05, 38 trades. **Section E beats Section F for the first time (P18).** Three dead-zone windows recovered (W05, W06, W09). Core dead zone (W07 Nov–Dec 2025, W10 Feb–Mar 2026, W12 Apr–May 2026) persists — range model correctly predicts low in-range probability in high-vol regimes.
 
 **Key lessons:**
 - Regime-filter params (`min_confidence`, `max_entry_vol_annual`, `iv_floor`) are overfitting pressure sinks — fix in config, don't let Optuna search them for iron_condor
@@ -304,6 +306,7 @@ MLflow experiment: `walkforward_QQQ` (browse via `mlflow ui --backend-store-uri 
 - Iron condors are the reliable core for QQQ; directional strategies require significantly higher ML directional accuracy
 - VIX time series must be used for IV estimation — a constant `iv_floor` silently corrupts MetaLabeler features
 - `FeatureEngine.compute()` must receive OHLCV-only input — auxiliary columns (e.g. `implied_vol`) with NaN values silently disable ML via `dropna()`
+- Direction model is NOT an appropriate gate for iron condor — high directional confidence signals trending regime (IC failure condition). Range model alone is the correct entry filter for market-neutral strategies
 
 ### Small account ($700)
 - Backtest pending...
