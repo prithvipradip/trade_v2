@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
@@ -146,14 +147,18 @@ class TestVLMCDiagnosticPlots:
         start = daily_idx[30].date().isoformat()
         end   = daily_idx[-1].date().isoformat()
 
-        generate_report(
-            symbols=["SPY"],
-            start=start,
-            end=end,
-            output_dir=str(tmp_path),
-            fmt="html",
-            db_path=str(tmp_path / "test.db"),
-        )
+        mock_ticker = MagicMock()
+        mock_ticker.history.return_value = pd.DataFrame()
+        with patch("ait.diagnostics.report.yf") as mock_yf:
+            mock_yf.Ticker.return_value = mock_ticker
+            generate_report(
+                symbols=["SPY"],
+                start=start,
+                end=end,
+                output_dir=str(tmp_path),
+                fmt="html",
+                db_path=str(tmp_path / "test.db"),
+            )
         html_files = list(tmp_path.glob("*.html"))
         assert len(html_files) >= 1
 
@@ -172,14 +177,18 @@ class TestVLMCDiagnosticPlots:
         start = daily_idx[30].date().isoformat()
         end   = daily_idx[-1].date().isoformat()
 
-        generate_report(
-            symbols=["SPY"],
-            start=start,
-            end=end,
-            output_dir=str(tmp_path),
-            fmt="html",
-            db_path=str(tmp_path / "test.db"),
-        )
+        mock_ticker = MagicMock()
+        mock_ticker.history.return_value = pd.DataFrame()
+        with patch("ait.diagnostics.report.yf") as mock_yf:
+            mock_yf.Ticker.return_value = mock_ticker
+            generate_report(
+                symbols=["SPY"],
+                start=start,
+                end=end,
+                output_dir=str(tmp_path),
+                fmt="html",
+                db_path=str(tmp_path / "test.db"),
+            )
         html_files = list(tmp_path.glob("*.html"))
         assert len(html_files) >= 1
         content = html_files[0].read_text()
