@@ -1,5 +1,0 @@
-{
-  "entries": [
-    "2026-04-22 20:11:48 [info     ] duckdb_initialized             component=monitoring.duckdb path=data/ait_analytics.duckdb"
-  ]
-}
