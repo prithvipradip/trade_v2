@@ -127,7 +127,8 @@ class ModelTrainer:
             if self._range_predictor is not None:
                 try:
                     range_acc = self._range_predictor.train(
-                        df, symbol=symbol, market_context=market_context
+                        df, symbol=symbol, market_context=market_context,
+                        intraday_store=self._store,
                     )
                     if range_acc:
                         log.info("range_training_complete", symbol=symbol,

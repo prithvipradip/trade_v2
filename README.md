@@ -128,7 +128,7 @@ pip install -e .
 ```
 
 This installs all packages from `pyproject.toml`:
-- **Trading**: `ib_insync`, `yfinance`, `polygon-api-client`
+- **Trading**: `ib_insync`, `polygon-api-client`; `yfinance` (fallback data source — no key required)
 - **ML**: `xgboost`, `lightgbm`, `scikit-learn`, `scipy`
 - **Sentiment**: `transformers>=4.38,<4.45`, `torch>=2.2,<2.3`, `feedparser`, `finnhub-python`
   - `transformers<4.45` — versions 4.45+ added a security check (CVE-2025-32434) that blocks loading FinBERT's `.bin` weights when torch < 2.6
@@ -420,15 +420,17 @@ Post-market analysis:
 
 ## Trading Strategies
 
-| Strategy | Market View | Risk Profile | Best When |
-|---|---|---|---|
-| **Iron Condor** | Neutral | Defined (both sides) | IV rank > 50, range-bound |
-| **Short Strangle** | Neutral | Undefined | IV rank > 70, very high premium |
-| **Long Straddle** | Volatility breakout | Defined (debit) | Low IV, expected big move |
-| **Cash-Secured Put** | Bullish | Undefined (buy stock if assigned) | IV rank > 40, want to own |
-| **Covered Call** | Slightly bullish | Capped upside | Own stock, want income |
-| **Bull Call Spread** | Bullish | Defined (debit) | Bullish with cost control |
-| **Bear Put Spread** | Bearish | Defined (debit) | Bearish with cost control |
+All strategies run simultaneously per walk-forward window. Wing widths and strangle deltas adapt dynamically to current implied volatility via `wing_k` and `delta_iv_scale` — both Optuna-optimized per window.
+
+| Strategy | Market View | Risk Profile | Best When | Dynamic Param |
+|---|---|---|---|---|
+| **Iron Condor** | Neutral | Defined (both sides) | IV rank > 50, range-bound | `wing_k` scales wing width to IV |
+| **Put Credit Spread** | Bullish | Defined | IV rank > 40, directional bias | `wing_k` scales spread width to IV |
+| **Short Strangle** | Neutral | Undefined (naked) | IV rank > 70, very high premium | `delta_iv_scale` moves strikes further OTM when IV is elevated |
+| **Long Strangle** | Volatility breakout | Defined (debit) | Low IV, expected large move or IV spike | `delta_iv_scale` moves strikes further OTM to reduce entry cost |
+| **Bull Call Spread** | Bullish | Defined (debit) | Bullish with cost control | Delta-driven via BS |
+| **Bear Put Spread** | Bearish | Defined (debit) | Bearish with cost control | Delta-driven via BS |
+| **Long Call / Put** | Directional | Defined (debit) | High-conviction directional move | Delta-driven via BS |
 
 The bot auto-selects based on:
 - ML direction prediction

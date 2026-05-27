@@ -37,6 +37,8 @@ dependencies = [
     "psutil>=5.9",
     # Analytics
     "duckdb>=1.0",
+    # Fractal analysis
+    "pywavelets>=1.4",
     # Optimization
     "optuna>=3.6",
     # Scheduling
@@ -57,6 +59,11 @@ dev = [
     "pytest-cov>=4.1",
     "ruff>=0.2",
     "mypy>=1.8",
+    "packaging>=23.0",
+]
+research = [
+    "mlflow>=2.0",
+    "shap>=0.42",
 ]
 
 [project.scripts]
@@ -75,6 +82,10 @@ select = ["E", "F", "I", "N", "W", "UP"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "ibkr: live tests requiring IB Gateway on 127.0.0.1:4002 (run with -m ibkr)",
+]
 
 [tool.mypy]
 python_version = "3.11"

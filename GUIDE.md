@@ -217,10 +217,10 @@ Features are organized in groups:
 
 | Group | Examples |
 |---|---|
-| Momentum | RSI-14, RSI-7, MACD, MACD histogram, ROC-5/10/20 |
-| Volatility | ATR-14, Bollinger width/position, realized vol 10d/20d |
+| Momentum | RSI-14, RSI-7, MACD/signal/hist (normalized by close), ROC-5/10/20 |
+| Volatility | ATR% of price, BB width/position, BB breach signals (`bb_pct_above_upper`, `bb_pct_below_lower`), realized vol 10d/20d |
 | Volume | OBV change, volume/SMA-20 ratio, volume trend |
-| Trend | SMA-10/20/50, EMA-12/26, MA slopes, MA crossover signal |
+| Trend | MA slopes (5-day % change), price vs. SMA-20/50 ratios, MA crossover signal (raw SMA/EMA price levels excluded) |
 | Price action | Daily return, gap, candle body/wick sizes, consecutive up/down days |
 | Multi-timeframe | Weekly trend alignment, weekly RSI, volume confirmation |
 | IV & vol regime | IV rank proxy, vol ratio (short/long term), vol trend, vol-of-vol |
@@ -228,6 +228,8 @@ Features are organized in groups:
 | Macro | 2Y/10Y yield levels, yield curve spread/inversion, DXY level/change |
 | Live signals | Sentiment composite/news/FinBERT, fear/greed, put/call ratio, flow bias *(see note below)* |
 | Seasonality | Day of week, month of year |
+
+> **Feature stationarity:** All 81 features are stationary (price-level independent). Raw SMA/EMA price levels and raw ATR dollars are excluded. MACD is normalized by dividing by close price. Bollinger Band breach signals (`bb_pct_above_upper`, `bb_pct_below_lower`) replace raw `bb_upper`/`bb_lower` levels. This ensures the model generalizes across different price regimes (e.g., QQQ at $480 in 2024 vs $540 in 2025).
 
 > **Note on live signal features:** The 8 sentiment and options flow features (`sentiment_composite`, `fear_greed`, `put_call_ratio`, etc.) are always set to their neutral defaults (0.0 or 1.0) during training. The model therefore learns near-zero weights for them. At inference time, real values are passed in but they have minimal effect on the prediction. In practice, sentiment influences the final trade decision as a **post-ML confidence adjustment** (Step 4 below), not as a model input. See Section 1.18 Design Decision 10 for rationale.
 
@@ -546,7 +548,7 @@ Scheduled Jobs (run by APScheduler, independently):
 
 ## 1.9 Trading Strategies
 
-All strategies inherit from `BaseStrategy` and implement a `generate_signals()` method. The system currently supports **9 strategies** organized into 3 groups:
+All strategies inherit from `BaseStrategy` and implement a `generate_signals()` method. The system currently supports **11 strategies** organized into 3 groups:
 
 ### Group 1: Premium Selling (favor high IV environments)
 
@@ -557,13 +559,26 @@ All strategies inherit from `BaseStrategy` and implement a `generate_signals()` 
 - Entry requirement: IV rank ≥ 15% (configurable via `AIT_IRON_CONDOR_IV_FLOOR`)
 - Confidence used: `RangePredictor` output (P(stays in ±5%) ≥ 0.65), not direction model
 - Target: close at 50% of credit; stop at 2× credit received
+- Wing width: `wing_k × price × IV × √(DTE/365)` — Optuna-optimized per walk-forward window
 
 **Cash-Secured Put** — `strategies/covered.py`
 - Sell an OTM put, hold enough cash to buy the stock if assigned
 
 **Short Strangle** — `strategies/straddles.py`
-- Sell OTM call + OTM put simultaneously (undefined risk)
-- Only used in appropriate account tiers; requires 90% confidence on Friday afternoons
+- Sell OTM call + OTM put simultaneously (undefined risk, no wings)
+- Profits from time decay in stable-IV environments where the underlying stays range-bound
+- Delta is IV-scaled: `effective_delta = delta_short × (1 + delta_iv_scale × (iv_floor/current_iv − 1))`
+  - High IV → lower effective delta → further OTM strikes → more breathing room
+  - `delta_iv_scale=0` (default): static delta regardless of IV
+  - `delta_iv_scale=1`: full IV response (Optuna-optimized per window)
+- Margin requirement: ~20% of underlying × 100 (standard naked-option margin approximation)
+
+**Long Strangle** — `strategies/straddles.py`
+- Buy OTM call + OTM put simultaneously (defined risk, debit)
+- Profits from large directional moves or IV expansion in either direction
+- Delta is IV-scaled: same formula as short strangle but further OTM when IV is high reduces cost of entry on an expected vol expansion
+- Requires larger underlying moves to be profitable (both legs need to overcome entry cost)
+- Best when: low IV rank with an anticipated catalyst (earnings, macro event)
 
 ### Group 2: Defined-Risk Spreads (directional with limited loss)
 
@@ -834,20 +849,24 @@ When a trade is rejected, the system tracks what would have happened. After the 
 ```
 1. Interactive Brokers (ib_insync)
    ├─ Real-time quotes (bid/ask/last/volume)
-   ├─ Historical OHLCV (daily and 5-min bars)
+   ├─ 5-min historical bars → SQLite store (primary source for daily OHLCV)
+   │    Resampled to daily via HistoricalDataStore.resample_to_daily()
+   │    Used for: ML training, walk-forward backtesting, diagnostics
+   ├─ Intraday VLMC features computed per session from 5-min bars
+   │    Merged into ML feature set via FeatureEngine.compute(intraday_store=...)
+   │    Used by both DirectionPredictor and RangePredictor — model decides relevance via feature importance
    ├─ Options chains (all expirations and strikes)
    ├─ News headlines (BRFG, DJ-N, DJ-RTG, DJ-RTPRO, DJNL) → fundamentals.db
    └─ Analyst recommendations (BRFUPDN / Briefing.com) → fundamentals.db
-        ↓ on failure
-2. Polygon.io (API key required)
-   └─ Historical daily data (free tier: 5 calls/minute)
-        ↓ on failure
-3. Yahoo Finance (yfinance — no key required)
-   ├─ Historical OHLCV, fallback for anything above
+        ↓ when IB store has < 60 days of data
+2. Yahoo Finance (yfinance — no key required)
+   ├─ Daily OHLCV fallback (when IB SQLite store is empty or insufficient)
    └─ Equity fundamentals (P/E, beta, sector, analyst targets) → equity_stats table
 ```
 
 Options chain data only comes from IBKR. If IBKR disconnects, no new trades can be entered, but the 30-second monitor loop continues to manage existing positions using the last-known underlying price.
+
+**Key implication for backtesting:** The walk-forward backtester and optimizer now load daily OHLCV from the IB SQLite store (via `load_daily_ohlcv()` in `src/ait/data/market_data.py`), ensuring the same data source is used in both production and backtesting. A 2-year IB backfill is required before running a walk-forward test.
 
 ### Data Fetch Frequency and Cache TTLs
 
@@ -855,7 +874,7 @@ Understanding what is fetched live vs. served from cache is important for unders
 
 | Data Type | Cache TTL | Fetch Frequency During Market Hours | Used For |
 |---|---|---|---|
-| Daily OHLCV (504 bars) | 1 hour | ~Once per trading day | ML feature computation, IV rank |
+| Daily OHLCV (IB store resampled, up to 2 years) | 1 hour | ~Once per trading day | ML feature computation, IV rank |
 | Intraday 5-min bars | 5 minutes | Every scan cycle | Multi-timeframe features, entry timing |
 | Real-time quote (underlying) | 15 seconds | At most 4 times/min per symbol | Position monitoring, order pricing |
 | Options chain | None (always fresh) | Every 5 minutes | Strategy signal generation |
@@ -1005,12 +1024,74 @@ exit:
   volatility_adjusted_stops: true
 ```
 
-### Iron Condor IV Floor
-```bash
-# In environment or .env file — not in config.yaml
-AIT_IRON_CONDOR_IV_FLOOR=15      # Min IV rank to enter iron condors
-AIT_SKIP_MACRO_EVENTS=0          # Set to 1 to flatten positions before FOMC/CPI/NFP
+### Backtest / Walk-Forward Settings
+```yaml
+backtest:
+  initial_capital: 100000         # Starting capital ($100k default, min $1k)
+  position_size_pct: 0.05         # 5% of capital risked per trade (max-loss basis)
+                                   # Raise to 0.20 for accounts < $10k
+  wing_floor_dollars: 5.0         # Hard minimum wing width in dollars (safety floor only).
+                                   # In practice, the vol-scaled wing_k formula drives width;
+                                   # this floor only activates when IV × DTE is very low.
+                                   # Lower to 1.0 for cheap underlyings (MARA, SOFI, RIOT)
+                                   # Lower to 0.5 for sub-$10 stocks
+  wing_k: 1.0                     # Vol-scaled wing multiplier.
+                                   # wing_width = wing_k × price × IV × √(DTE/365)
+                                   # Optuna optimizes this per walk-forward window [0.3 – 2.0].
+                                   # 0.3 = tight (high theta, high gamma risk)
+                                   # 1.0 = 1-sigma expected move (balanced default)
+                                   # 2.0 = wide (low theta, low assignment risk)
+  iv_floor: 0.12                  # Credit-strategy entry gate: skip iron condor / short strangle
+                                   # when estimated IV < this threshold (default 0.12).
+                                   # This is NOT a pricing floor — _get_iv() returns raw IV.
+                                   # IV estimation priority: (1) stored IBKR implied_vol,
+                                   # (2) VIX daily closes loaded via yfinance (vix/100 × 1.10 for QQQ),
+                                   # (3) realized_vol × 1.15 fallback.
+  delta_iv_scale: 0.0             # IV-driven delta scaling for strangles (short and long).
+                                   # 0.0 = static delta regardless of current IV (default)
+                                   # 1.0 = full IV response: high IV → go further OTM
+                                   # Formula: effective_delta = delta × (1 + scale × (iv_floor/iv − 1))
+                                   # Optuna-optimized per window for short_strangle and long_strangle.
+  max_concurrent_positions: 3     # Maximum simultaneously open positions.
+                                   # 1 = original single-position behavior (one trade at a time).
+                                   # 3 = up to 3 concurrent iron condors / strangles per symbol.
+                                   # Capital per trade = position_size_pct × current_capital (unchanged).
+                                   # Total max exposure = max_concurrent_positions × position_size_pct.
+  max_entry_vol_annual: 0.80      # Hard realized-vol gate for iron condor and short strangle entries.
+                                   # Skip entry when 10-day realized vol (annualized) > this threshold.
+                                   # 0.25 = conservative (blocks when 10-day std > ~1.6% daily)
+                                   # 0.80 = permissive default (blocks only extreme vol spikes)
+                                   # QQQ Liberation Day April 2025: realized vol hit ~65% → blocked.
+                                   # Optuna-optimized per window [0.25, 0.90].
+  optimize_patience: 20           # Early stopping: halt a window's Optuna run after this many
+                                   # consecutive trials with no improvement in best_value.
+                                   # 0 = disabled (run all n_trials regardless).
+                                   # Set via --wf-patience CLI flag.
+  optimize_min_trades: 10         # Minimum trade count for a full objective score (two-tier):
+                                   #   < 3 trades  → always scores −100 (hard floor, never wins)
+                                   #   3–9 trades  → score × (actual/10)²  (quadratic penalty)
+                                   #   ≥ 10 trades → no penalty
+                                   # Prevents degenerate parameter sets with near-zero return
+                                   # std from inflating the Sharpe to unrealistic values.
+                                   # Set via --wf-min-trades CLI flag.
+  range_threshold_pct: 0.05       # Target move % for the range predictor model.
+                                   # 0.05 = predict whether price moves ≥5% within the horizon.
+                                   # horizon_days is automatically linked to max_hold_days so the
+                                   # model predicts over the same period the strategy actually holds.
 ```
+
+**Minimum capital by spread width** (at default `position_size_pct: 0.05`):
+
+| `wing_floor_dollars` | Max loss/contract | Min capital |
+|---|---|---|
+| 20.0 (default SPY) | $2,000 | **$40,000** |
+| 5.0 (default) | $500 | **$10,000** |
+| 1.0 | $100 | **$2,000** |
+| 0.5 | $50 | **$1,000** |
+
+Note: with `wing_k=1.0` on QQQ (price ≈ $500, IV ≈ 20%, DTE = 30), the expected move is ≈ $27 — well above any `wing_floor_dollars` value. The floor only activates for very low-IV, short-DTE entries.
+
+These values are read by `run_integration_test.py` and `WalkForwardBacktester` automatically — no code changes needed.
 
 ### Sentiment — IB News Weight
 ```yaml
@@ -1021,8 +1102,8 @@ The IB news branch is active when `FundamentalsStore` is provided to `SentimentE
 
 ### Walk-Forward Optimization
 ```yaml
-# These fields are on WalkForwardConfig, not config.yaml
-# Pass them as CLI flags to run_backtest.py:
+# Capital, position sizing, and spread settings come from config.yaml backtest section.
+# Window/trial settings are CLI flags to run_backtest.py:
 #   --optimize-per-window     enable per-window Optuna tuning
 #   --optimize-n-trials 50    trials per window (default 50)
 ```
@@ -1184,9 +1265,9 @@ python run_backtest.py --compare-exits           # Fixed vs trailing stops
 
 ### How the Backtester Works
 
-**Data:** Yahoo Finance (5 years of daily OHLCV). No IBKR connection required.
+**Data:** IB SQLite store (5-min bars resampled to daily, up to 2 years) via `load_daily_ohlcv()`. Falls back to Yahoo Finance when IB data is unavailable. A completed IB backfill (`--years 2`) is needed for best results.
 
-**Options pricing:** Black-Scholes with `IV = realized_vol × 1.15` as a flat IV estimate. The `iv_floor`, `delta_short`, and `delta_long` parameters are now wired into the engine and searchable by the optimizer (`src/ait/backtesting/engine.py`).
+**Options pricing:** Black-Scholes using stored IBKR implied vol when available (from `daily_prices.implied_vol`), falling back to VIX daily closes (`vix/100 × 1.10` for QQQ, loaded via yfinance), then `realized_vol × 1.15`. `delta_short`, `delta_long`, and structural params are searchable by Optuna. Spread params (`spread_base`, `spread_iv_sensitivity`, `spread_dte_sensitivity`, `spread_cap`) and `iv_floor` are fixed config values — not Optuna search dimensions for iron_condor (see P7, P8, P9).
 
 **The Tier 1 range model is included:** When backtesting iron condors, the `RangePredictor` is trained per window and gates entries, matching the live system's behavior.
 
@@ -1194,8 +1275,14 @@ python run_backtest.py --compare-exits           # Fixed vs trailing stops
 
 | Feature | Implementation |
 |---|---|
-| **Dynamic IV during hold** | `_get_current_iv` blends entry IV (70%) with current realized vol × 1.15 (30%); vega P&L is non-zero |
+| **Dynamic IV during hold** | `_get_current_iv` uses stored IBKR implied vol when available; falls back to realized vol × 1.15; blends entry IV (70%) with current estimate (30%) |
 | **Volatility skew** | `_get_leg_iv` applies linear log-moneyness skew: OTM puts +1% IV per 10% below ATM, OTM calls +0.2% per 10% above; `skew_factor=0.0` restores flat IV |
+| **Bid-ask spread** | `_options_half_spread` models per-leg spread as a function of IV and remaining DTE; applied at both entry (mid − half-spread) and exit (mid + half-spread); params searchable by Optuna |
+| **Intraday stop/target** | Exits checked against 5-min bars within each session (not only at EOD); entry and exit timestamps stored as ISO datetime strings in `entry_time` / `exit_time` fields |
+| **MetaLabeler gate** | When a trained per-window `MetaLabeler` is provided, each signal is filtered through a binary take/skip classifier before entering; trained on the same window's simulated trade outcomes |
+| **Trade dict fields** | Each closed trade includes: `entry_date`, `entry_time`, `exit_date`, `exit_time`, `exit_reason`, `entry_confidence`, `entry_regime`, `entry_iv_rank`, `entry_vix_level`, `pnl`, `exit_price` |
+| **Thesis re-evaluation** | `_check_thesis_invalidation()` checks at each daily bar whether the ML predictor strongly contradicts the original position direction; triggers early exit if invalidated |
+| **Fractal regime gate** | Confidence penalised when `hurst_scale_spread > hurst_regime_threshold` or `multifractal_width > multifractal_max_width`; same thresholds as exported production params |
 
 ### Interpreting Results
 
@@ -1257,6 +1344,14 @@ python run_optimizer.py \
 | `profit_factor` | gross_wins / gross_losses (capped at 10) | Raw edge focus |
 | `win_rate` | % of profitable trades | Consistency focus |
 
+**Min-trade penalty (two-tier):** Applied after the objective is computed, before returning the value to Optuna:
+
+- **Hard floor (< 3 trades):** Always returns −100 regardless of Sharpe or win rate. A parameter set that barely trades is never a viable winner.
+- **Quadratic penalty (3 to `optimize_min_trades`):** Score is multiplied by `(actual / min_trades)²`. Quadratic rather than linear because linear (×0.5 at 5 trades) still leaves inflated-Sharpe overfit trials competitive; quadratic (×0.25 at 5 trades) reliably pushes them below healthy 10–15 trade results.
+- **No penalty (`optimize_min_trades` and above):** Score is returned unchanged.
+
+Example at `optimize_min_trades = 10`: a trial with 5 trades and composite 14.4 scores 14.4 × 0.25 = **3.6**, which loses to a 12-trade trial scoring **6.3** — the correct preference.
+
 ### Parameter Spaces
 
 Each strategy has a defined search space in `param_spaces.py`:
@@ -1264,14 +1359,31 @@ Each strategy has a defined search space in `param_spaces.py`:
 | Parameter (iron condor) | Search Range | Effect |
 |---|---|---|
 | `delta_short` | float [0.15, 0.30] | Delta of the short call and put legs |
-| `max_hold_days` | int [14, 45] | Entry DTE / max hold duration |
-| `min_confidence` | float [0.55, 0.80] | ML confidence gate before entering |
+| `max_hold_days` | int [14, 40] | Entry DTE / max hold duration (≤ 40 to stay inside 42d test window) |
 | `stop_loss_pct` | float [0.30, 0.70] | Exit when unrealised loss reaches this % of premium |
-| `profit_target_pct` | float [0.30, 0.70] | Exit at this % profit (no arbitrary 50% cap) |
-| `trailing_stop_pct` | float [0.15, 0.40] | Trail behind HWM once breakeven is triggered |
-| `iv_floor` | float [0.08, 0.25] | Minimum IV used in Black-Scholes pricing |
+| `profit_target_pct` | float [0.30, 0.70] | Exit at this % profit |
+| `trailing_stop_fraction` | float [0.30, 0.90] | Derived trailing stop: `trailing_stop_pct = fraction × profit_target_pct`; keeps trailing stop logically coupled to profit target |
+| `wing_k` | float [0.30, 2.00] | Vol-scaled wing multiplier. 1.0 = 1-sigma expected move. |
+| `hurst_regime_threshold` | float [0.08, 0.30] | Fractal gate: min Hurst exponent required to enter |
+| `hurst_regime_penalty` | float [0.00, 0.25] | Score penalty when Hurst is near the threshold |
+| `multifractal_max_width` | float [0.30, 0.65] | Fractal gate: max multifractal spectrum width allowed |
+
+> **Intentionally excluded from the iron condor search space (P5, P8, P9):**
+> - `min_confidence`, `max_entry_vol_annual` — regime gates; Optuna parks them at extremes to produce 0-trade OOS solutions (Exp 2–4). Fixed at config defaults (P5).
+> - `iv_floor` — credit-strategy entry gate; Optuna finds different values for train vs OOS, creating a regime wall. Fixed at config default 0.12 (P8).
+> - `spread_base`, `spread_iv_sensitivity`, `spread_dte_sensitivity`, `spread_cap` — fixed config values wired via WalkForwardConfig → Backtester; not Optuna dims (P7, P9).
+>
+> All excluded params remain active at their config defaults. `min_confidence` remains searchable for debit strategies (`long_call`, `long_put`, `bull_call_spread`, `bear_put_spread`) and `short_strangle`, where overfitting pressure is lower.
 
 Debit strategies (`long_call`, `long_put`, `bull_call_spread`, `bear_put_spread`) also search over `delta_long` [0.25–0.55] and `max_hold_days` [14–60].
+
+Strangle strategies (`short_strangle`, `long_strangle`) add the following parameters:
+
+| Parameter | Search Range | Effect |
+|---|---|---|
+| `delta_iv_scale` | float [0.0, 1.0] | IV-driven delta scaling: 0=static, 1=full response. High IV → lower delta → further OTM strikes. |
+| `delta_short` / `delta_long` | float [0.10, 0.35] | Base delta for OTM leg placement before IV scaling |
+| `profit_target_pct` | float [0.50, 2.00] | Higher ceiling needed — strangles require large moves to hit target |
 
 ML model spaces (`xgboost`, `lightgbm`) cover `n_estimators`, `learning_rate`, `max_depth`, `subsample`, `colsample_bytree`, and model-specific params.
 
@@ -1280,11 +1392,156 @@ ML model spaces (`xgboost`, `lightgbm`) cover `n_estimators`, `learning_rate`, `
 Set `optimize_per_window: true` in `WalkForwardConfig` (or pass `--optimize-per-window` to `run_backtest.py`) to run Optuna on each training slice before testing it. Each window finds its own best parameters — this is computationally expensive but produces the most realistic out-of-sample results.
 
 ```bash
-python run_backtest.py \
-  --symbols SPY QQQ \
-  --optimize-per-window \
-  --optimize-n-trials 50   # Optuna trials per walk-forward window
+python scripts/run_integration_test.py \
+  --symbols QQQ \
+  --wf-trials 50        # Optuna trials per walk-forward window (overrides config optimize_n_trials)
+  --wf-patience 20      # Stop early if no improvement for 20 consecutive trials (overrides config optimize_patience)
+  --wf-min-trades 10    # Penalise trials producing fewer than 10 trades (overrides config optimize_min_trades)
+  --wf-n-jobs 6         # Run 6 walk-forward windows in parallel (uses all 6 CPUs simultaneously)
 ```
+
+All four flags are optional — if omitted, the values are read from the corresponding config fields (defaults: 50, 20, 10, 1).
+
+**Window-level parallelism (`--wf-n-jobs`):** When `n_jobs > 1`, walk-forward windows run in parallel using `concurrent.futures.ProcessPoolExecutor`. Each window is an independent subprocess — no shared state. This bypasses the Python GIL (which blocks CPU-bound threading) and achieves true CPU parallelism: `--wf-n-jobs 6` on a 12-core machine yields ~600% CPU utilisation. Trade-off: warm-starting (seeding Optuna from a prior window's best params) and `BacktestLearner` adaptation between windows are disabled in parallel mode. On a 12-core machine, `--wf-n-jobs 6` is recommended (leaves 6 cores for the OS and other processes). Keep Optuna trial-level `n_jobs=1` (the default) — Optuna's in-memory storage uses threading which is GIL-bound and does not parallelise CPU-bound backtesting code.
+
+**Early stopping (`optimize_patience`):** Once the best objective value has not improved for N consecutive trials, the window's study is halted. This prevents wasted compute when the optimizer has already converged, and avoids over-exploring a degenerate region. Set to 0 to disable and always run all `wf-trials`.
+
+**Per-strategy studies:** Each window runs one Optuna study *per strategy* rather than a single joint study over all strategies. For example, iron_condor alone is a 12-dimensional space; the prior joint study was 48D (6 strategies × ~8 params). At a fixed budget of 50 trials, 12D yields ~4 trials/dimension vs. ~1 trial/dimension in the joint study — a 4× gain in search efficiency. Each strategy's study is named `wf_w{window_id}_{symbol}_{strategy}`. After all per-strategy studies complete, their best params are merged into the same flat `{strategy}__{param}` dict used by the rest of the system. This design directly supports the goal of deploying one strategy per ticker (e.g. iron_condor for QQQ) — each strategy's best value and params are independently comparable.
+
+**Conditional warm-start (per-strategy):** Before each strategy's study begins, the system checks the previous window's OOS result. If `win_rate ≥ 75%` AND `total_trades ≥ 3`, that strategy's subset of prior best params is enqueued as the first trial. If that condition fails, the system falls back to the same strategy's subset of the **globally best params** seen across all prior windows (tracked by score = `win_rate × √(min(1, trades/5))`). Only if neither source exists does the study start fully cold. This per-strategy warm-start ensures iron_condor never inherits contaminated params from short_strangle and vice versa.
+
+**Range predictor gate:** For iron_condor and short_strangle, the engine calls the range predictor before entering. If `P(in_range) < range_min_confidence` (default 0.55), the signal is skipped entirely — no fallback to directional strategies. Directional strategies (bear_put_spread, bull_call_spread, long_strangle) were tested as range-gate fallbacks but produced consistent losses because the ML model's directional accuracy (~22%) is too low to support them. The correct behaviour when iron_condor is blocked is to pass on the trade.
+
+**QQQ integration test findings (walk-forward, 2024–2026):** Seven experiments run to diagnose optimizer overfitting, fix infrastructure bugs, and activate ML predictions:
+
+| Experiment | Config | Key change | Optimized return | Ablation return | Trades | Sharpe |
+|---|---|---|---|---|---|---|
+| Exp 2 | 365/42/14/5 | All params incl. `min_confidence` + `max_entry_vol_annual` | ~0% | — | — | — |
+| Exp 3 | 365/42/14/5 | Same | −16% | ~+9% | ~2 | — |
+| Exp 4 | 365/42/14/5 | Added vol gate | −21% | ~+9% | ~9 | — |
+| **Exp 5** | 365/42/14/5 | **Removed `min_confidence` + `max_entry_vol_annual`** | **+183%** | **+9%** | **91** | **23.95** |
+| Exp 6 | 365/42/14/5 | Spread wiring fixed; spread params + `iv_floor` removed; VIX-based IV | +11.88% | +22.68% | 14 / 36 | 39 / 9.7 |
+| **Exp 7** | 365/42/14/5 | **ML fix: FeatureEngine OHLCV-only input; first real XGBoost/LightGBM predictions** | **+1.95%** | **+10.41%** | **18 / 34** | **3.89 / 4.98** |
+| **Exp 8** | 365/30/30/5 | **Non-overlapping windows; max_hold=[10,21]; 200 trials; n_jobs=6** | **+0.51%** | **+6.02%** | **20 / 14** | **1.68 / 14.25** |
+| **Exp 9** | 365/30/30/5 | **Remove IC direction gate (Change A); wing-derived range threshold (Change B)** | **+4.37%** | **+3.86%** | **29 / 38** | **5.41 / 3.05** |
+| **Exp 10** | 365/30/30/5 | **ML models fed into Optuna (Change C); reverts wing-derived threshold** | TBD | TBD | TBD | TBD |
+
+**Root cause of Experiments 2–4 failure:** Optuna maximised `min_confidence` toward the ceiling or drove `max_entry_vol_annual` to the floor, blocking all OOS trades. Removing both from the search space resolved this.
+
+**Exp 6 finding:** Ablation (+22.68%) outperformed optimization (+11.88%). Root cause: `iv_floor` train/OOS mismatch during the 2025–2026 vol regime shift; 6 wasted search dimensions consumed Optuna's trial budget. Both fixed for Exp 7.
+
+**Exp 7 finding:** All Experiments 1–6 silently ran on a naive price-momentum fallback (confidence ≈ 0.50) because `load_daily_ohlcv()` appends an `implied_vol` column (all-NaN), which `FeatureEngine.compute()` passed through to `dropna()` — eliminating every row. Fixed in commit `38d4ae8`: FeatureEngine now starts from OHLCV-only columns. First experiment with real ML predictions (confidence 0.73–0.96). Ablation again outperformed optimization (5× gap); structural issues identified: OOS window overlap and backtest_end B-S bias.
+
+**Exp 8 finding (completed 2026-05-26):** Non-overlapping 30-day windows confirm Exp 7 findings — dead zone (Sep 2025–May 2026) is regime-driven, not an overlap artifact. backtest_end exits reduced but not eliminated (late-window entries still hit boundary). Ablation Sharpe 14.25 vs optimized 1.68 — three consecutive experiments where ablation beats optimization.
+
+**Exp 9 finding (completed 2026-05-26, archive `QQQ_365d_iron_condor_20260526_1409`):** Removing the iron condor direction gate (Change A) + wing-derived range threshold (Change B) reversed the ablation dominance pattern for the first time. Section E: +4.37%, Sharpe 5.41, 29 trades, 9/12 active. Section F (ablation): +3.86%, Sharpe 3.05, 38 trades. Three windows recovered from dead zone (W05 Sep–Oct 2025, W06 Oct–Nov 2025, W09 Jan–Feb 2026). Core dead zone (W07, W10, W12) persists — range model correctly rejects high-vol regimes. P18: optimization now beats ablation when entry gate quality is correct.
+
+**Exp 10 (running as of 2026-05-26):** Change C — range predictor trained before Optuna and passed into every trial evaluation. Reverts wing-derived threshold (Change B). Goal: make Optuna optimize under the same entry conditions as OOS. See P19.
+
+**Current fix for iron_condor search space (Exp 7 onwards):** `min_confidence`, `max_entry_vol_annual`, `iv_floor`, and all spread params are fixed at config defaults — not searchable. See Parameter Spaces table above.
+
+---
+
+### Experiment Comparison and Production Deployment
+
+**Running multiple experiments:** To compare different window configurations (train_days, test_days, step_days), run `run_integration_test.py` multiple times with different YAML configs. Each run is automatically archived under `reports/runs/{run_id}/` and logged to MLflow experiment `walkforward_{symbol}`.
+
+```bash
+# Run with default 365/63/21 config
+python scripts/run_integration_test.py --symbols QQQ --config config_QQQ_test.yaml \
+    --strategies iron_condor --skip-backfill
+
+# Run with shorter test window (edit config first: test_days=42, step_days=14)
+python scripts/run_integration_test.py --symbols QQQ --config config_QQQ_test.yaml \
+    --strategies iron_condor --skip-backfill
+
+# Compare all QQQ runs in the terminal
+python scripts/compare_runs.py --symbol QQQ
+
+# Visual comparison in MLflow UI (use IP, not localhost — MLflow 3.x security middleware)
+# MLFLOW_TRACKING_URI is set in .env — always pass --backend-store-uri explicitly:
+# (port 5000 is blocked by Chrome on macOS; use 5001 or any other port)
+mlflow ui --backend-store-uri sqlite:///data/mlflow.db --port 5001  # open http://127.0.0.1:5001
+
+# Import existing archives into MLflow (run once after install, or after adding a new archive)
+python scripts/backfill_mlflow.py --symbol QQQ
+
+# Re-import a run to pick up updated fields (e.g. after adding backtest_period/cli_command)
+python scripts/backfill_mlflow.py --symbol QQQ --force
+```
+
+**What each MLflow run stores:**
+
+| Location | Field | Example |
+|----------|-------|---------|
+| Parameters | `backtest_period` | `2024-05-02 to 2026-05-08` |
+| Parameters | `train_days`, `test_days`, `step_days` | `365`, `63`, `21` |
+| Parameters | `initial_capital`, `wf_trials` | `100000.0`, `50` |
+| Tags | `cli_command` | exact command to reproduce the run |
+| Tags | `git_commit`, `git_branch` | `fa283217`, `features-request-2` |
+| Metrics | `sharpe_ratio`, `total_pnl`, `win_rate`, `profit_factor` | run-level summary |
+| Metrics (stepped) | `w_pnl`, `w_trades`, `w_win_rate`, `w_sharpe` | per-window, at `step=window_id` |
+
+**Selecting the best run:** Sort by `sharpe_ratio` (default) in `compare_runs.py` or the MLflow UI table. The best run is the one with the highest Sharpe that also has reasonable trade count (≥ 30) and max_drawdown_pct < 20%.
+
+**Reproducing a past run:** Copy the `cli_command` tag from the MLflow run page and run it verbatim. The exact git commit is also stored — check it out first if exact reproducibility is needed.
+
+**Exporting params for production (paper trading):** Once you've chosen a run, export the most recently trained window's best params into a production config:
+
+```bash
+# Preview the changes first (no file written)
+python scripts/export_production_params.py --symbol QQQ --dry-run
+
+# Write the production config
+python scripts/export_production_params.py \
+    --run-dir reports/runs/QQQ_2Y_iron_condor_per_strategy_20260512 \
+    --base-config config_QQQ_test.yaml \
+    --output config_QQQ_production.yaml
+```
+
+The script prints every changed parameter (old → new), the source window (e.g. W16, 8 trades, win_rate=75%), and the initial capital used during training. The `TradingOrchestrator` reads `config_QQQ_production.yaml` at startup — point `--config` at it and the paper account will use the optimized parameters.
+
+**Run naming convention:** Each archived run is named `{symbol}_{train_days}d_{strategy}_{YYYYMMDD_HHMM}` (e.g. `QQQ_365d_iron_condor_20260514_1142`). The timestamp is UTC and includes hour+minute to prevent collisions when multiple experiments run on the same calendar day. The date in the name is the archive date, not the test period — use `run_metadata.json → backtest_period` (or the MLflow `backtest_period` param) for the actual data range.
+
+**Committing experiment archives — use the `data/experiment-archives` branch:**
+
+Experiment result directories (`reports/runs/{run_id}/`) are data artifacts, not code. They must **never** be committed to feature branches or PRs — Copilot's review limit is 20,000 lines and a single experiment adds ~2,000 lines of JSON/CSV/text. Instead, all archives go to the dedicated `data/experiment-archives` branch:
+
+```bash
+# After an experiment finishes and reports/runs/{run_id}/ is created:
+git checkout data/experiment-archives
+
+# Stage only the scientific record — log and HTML files are excluded by .gitignore
+git add reports/runs/{run_id}/
+
+# Commit with a descriptive message
+git commit -m "data: add {run_id} archive (Exp N results)"
+
+# Push to remote
+git push origin data/experiment-archives
+
+# Return to your feature/work branch
+git checkout <your-branch>
+```
+
+**What to include / exclude in the archive commit:**
+
+| Include (tracked) | Exclude (gitignored) |
+|---|---|
+| `window_*.json` | `*.log` |
+| `run_metadata.json` | `*.html` |
+| `walkforward_summary.txt` | |
+| `ablation_summary.txt` | |
+| `equity_curve.csv` | |
+| `config_snapshot.yaml` | |
+| `RESULTS.md` | |
+| `ic_decay.csv`, `ic_summary.csv` | |
+
+The `.gitignore` on `data/experiment-archives` already excludes `*.log` and `*.html` via `reports/runs/**/*.log` and `reports/runs/**/*.html` patterns — a plain `git add reports/runs/{run_id}/` is safe.
+
+Daily monitoring snapshots (`reports/daily_YYYYMMDD.json`) also belong on this branch, not on feature PRs.
+
+**MLflow tracking URI:** `run_integration_test.py` writes to `data/mlflow.db` by default (same as `backfill_mlflow.py`). Override with `MLFLOW_TRACKING_URI` env var if needed. Do not delete `mlflow.db` from the project root if it exists — it is a stale artifact from before this fix and can be removed.
 
 ### Manual Tuning (still valid for quick iteration)
 
@@ -1306,4 +1563,4 @@ python run_backtest.py \
 
 ---
 
-*This document is a living reference. Last updated: 2026-05-06*
+*This document is a living reference. Last updated: 2026-05-11*

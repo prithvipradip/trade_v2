@@ -15,7 +15,7 @@ run_orchestrator.py          ← Master process (start here)
   │           │     ├── MarketScheduler  ← Pre-market / Open / Post-market / Off-hours
   │           │     ├── ModelTrainer     ← XGBoost + LightGBM ensemble
   │           │     ├── SentimentEngine  ← FinBERT + Finnhub + Fear/Greed
-  │           │     ├── StrategySelector ← Iron condors preferred, spreads as fallback
+  │           │     ├── StrategySelector ← Multi-strategy simultaneous execution per window; wing widths and strangle deltas are IV-scaled and Optuna-optimized
   │           │     ├── CapitalTierMgr   ← Auto-scales strategies to account size
   │           │     ├── RiskManager      ← Circuit breaker, PDT guard, position sizing
   │           │     ├── TradeExecutor    ← Places orders via IBKR
@@ -46,7 +46,7 @@ run_orchestrator.py          ← Master process (start here)
 | `src/ait/bot/orchestrator.py` | Trading brain — scan/predict/trade loop |
 | `src/ait/bot/scheduler.py` | Market phase management |
 | `src/ait/ml/ensemble.py` | XGBoost + LightGBM direction predictor |
-| `src/ait/ml/features.py` | 49 technical features (RSI, MACD, BB, vol, etc.) |
+| `src/ait/ml/features.py` | 81 stationary features (RSI, normalized MACD, BB breach signals, vol, etc.) |
 | `src/ait/ml/trainer.py` | Model training with drift detection + rollback |
 | `src/ait/backtesting/engine.py` | Backtest engine with Black-Scholes options sim |
 | `src/ait/backtesting/walkforward.py` | Walk-forward backtester (train 1yr, test 3mo) |
@@ -58,7 +58,7 @@ run_orchestrator.py          ← Master process (start here)
 | `src/ait/risk/capital_tiers.py` | Auto-scales strategies based on account size |
 | `src/ait/risk/manager.py` | Risk validation before every trade |
 | `src/ait/sentiment/engine.py` | Composite sentiment (FinBERT + Finnhub + fear/greed + IB news) |
-| `src/ait/data/market_data.py` | Polygon → Yahoo fallback data chain |
+| `src/ait/data/market_data.py` | `load_daily_ohlcv()` — IB store (5-min resampled) → Yahoo fallback; real-time quotes from IBKR |
 | `src/ait/data/earnings.py` | Earnings calendar — blocks trades near earnings |
 | `src/ait/data/equity_stats.py` | yfinance equity fundamentals → DuckDB equity_stats table |
 | `src/ait/data/fundamentals_db.py` | SQLite CRUD for IB news + analyst recommendations |
@@ -100,7 +100,7 @@ run_orchestrator.py          ← Master process (start here)
 ## ML Pipeline
 
 - **Models**: XGBoost + LightGBM ensemble (50/50 weighted)
-- **Features**: 49 technical indicators (RSI, MACD, Bollinger, volume, volatility, iv_rank, etc.)
+- **Features**: 81 stationary technical indicators (all normalized — no raw price levels; MACD divided by close, BB breach signals replace raw BB levels)
 - **Labels**: 5-day forward return — Bullish (>+1.5%), Bearish (<-1.5%), Neutral
 - **Training**: 2 years of daily data (504 trading days), walk-forward cross-validation
 - **Retraining**: Daily at 7:30 AM ET, automatic rollback if accuracy degrades
@@ -108,13 +108,13 @@ run_orchestrator.py          ← Master process (start here)
 
 ## Data Sources
 
-| Source | What | Free Tier |
-|--------|------|-----------|
-| Yahoo Finance | Historical OHLCV + equity fundamentals (equity_stats) | Unlimited |
-| Polygon.io | Historical daily data (primary) | 5 calls/min |
+| Source | What | Notes |
+|--------|------|-------|
+| IBKR 5-min SQLite store | Primary daily OHLCV (resampled from 5-min bars); intraday VLMC features | Requires IB backfill; 2 years stored locally |
+| Yahoo Finance | Daily OHLCV fallback (when IB store has <60 bars); equity fundamentals (P/E, beta, sector) | Unlimited; no key required |
 | Finnhub | News sentiment | 60 calls/min |
 | FinBERT | NLP sentiment from news headlines | Local model |
-| IBKR | Real-time quotes, order execution, news, analyst actions | Needs subscription |
+| IBKR | Real-time quotes, order execution, options chains, news, analyst actions | Needs subscription |
 
 **IB news providers in use:**
 - General news: desired set `{BRFG, DJ-N, DJ-RTG, DJ-RTPRO, DJNL}` — filtered at startup via `reqNewsProviders()` to only subscribed codes (avoids Error 321 on accounts that lack a provider). Active set logged as `news_providers_active`.
@@ -145,7 +145,7 @@ run_orchestrator.py          ← Master process (start here)
 
 ### ML
 - [x] XGBoost + LightGBM ensemble
-- [x] 49 technical features
+- [x] 81 stationary technical features (MACD normalized by close, BB breach signals, raw price levels excluded)
 - [x] Walk-forward cross-validation with purge gap
 - [x] 5-day forward return labels (±1.5%)
 - [x] Model versioning, save/load/rollback
@@ -205,7 +205,8 @@ run_orchestrator.py          ← Master process (start here)
 - [x] IB news sentiment integration (pre-scored at ingest, weight 0.20)
 
 ### Data
-- [x] Polygon → Yahoo fallback chain
+- [x] IB store → Yahoo fallback chain for daily OHLCV (`load_daily_ohlcv()` in `market_data.py`)
+- [x] VLMC intraday features merged into ML training via `FeatureEngine.compute(intraday_store=...)` — used by both DirectionPredictor and RangePredictor 
 - [x] TTL caching for all data
 - [x] Multi-timeframe analysis (daily + 5min)
 - [x] Options flow detection (unusual activity)
@@ -215,15 +216,36 @@ run_orchestrator.py          ← Master process (start here)
 
 ### Parameter Optimization
 - [x] Optuna `StrategyOptimizer` — Bayesian/TPE with MedianPruner
-- [x] Per-strategy parameter spaces (iron_condor, long_call, bull_call_spread, bear_put_spread, put_credit_spread)
-- [x] `delta_short` / `delta_long` / `iv_floor` / `max_hold_days` wired into `Backtester.__init__` and searchable by optimizer
+- [x] Per-strategy parameter spaces (iron_condor, long_call, bull_call_spread, bear_put_spread, put_credit_spread, short_strangle, long_strangle)
+- [x] `delta_short` / `delta_long` / `wing_floor_dollars` / `max_hold_days` wired into `Backtester.__init__` and searchable by optimizer; `iv_floor` is wired but fixed as a config gate (not searched by Optuna for iron_condor — see P8)
+- [x] `wing_k` — vol-scaled wing multiplier: `wing = wing_k × price × IV × √(DTE/365)`; Optuna-optimized per window [0.30–2.00]; `wing_floor_dollars` remains as hard minimum floor
+- [x] `delta_iv_scale` — IV-driven delta scaling for strangles: 0=static, 1=full response; high IV → lower effective delta → further OTM strikes
+- [x] `BacktestConfig` added to `settings.py` — `initial_capital`, `position_size_pct`, `wing_floor_dollars`, `iv_floor`, `wing_k`, `delta_iv_scale` all read from `config.yaml`; no code changes needed to adjust capital size or spread width
 - [x] `profit_target_pct` cap at 0.50 for credit trades removed — optimizer can explore the full range
 - [x] ML hyperparameter spaces (XGBoost, LightGBM)
 - [x] Objective functions: sharpe_ratio, composite, profit_factor, win_rate
+- [x] Min-trade penalty (two-tier) — hard floor: < 3 trades always scores −100; quadratic penalty: `(actual/min_trades)²` between 3 and `optimize_min_trades`; prevents degenerate low-sample Sharpe inflation
+- [x] Early stopping — `_EarlyStopCallback` halts a window study after `optimize_patience` consecutive non-improving trials (0 = disabled)
+- [x] Conditional warm-start — enqueues prior window's best params if OOS `win_rate ≥ 75%` AND `total_trades ≥ 3` (lowered from 5 to prevent cascade cold-starts when windows have few but perfect trades); falls back to globally best params if direct warm-start fails
+- [x] `range_threshold_pct` config field; `RangePredictor` `horizon_days` auto-linked to `max_hold_days` per window
+- [x] `min_confidence` search range capped at 0.70 (upper bound) for strategies that include it — prevents Optuna from selecting values of 0.72–0.85 that generate 0 OOS trades in 63-day test windows
+- [x] **`min_confidence` and `max_entry_vol_annual` removed from `IRON_CONDOR_SPACE`** — Experiments 2–4 showed Optuna reliably finds degenerate in-sample solutions via these regime-filter params (parking `min_confidence` at ceiling or `max_entry_vol_annual` at floor blocks all OOS trades). Removing them from iron_condor's search space (Experiment 5) yielded +183% OOS return vs +9% ablation. Both params remain active at config defaults; they are simply not searchable for iron_condor.
+- [x] `max_concurrent_positions` — wires up pre-existing `WalkForwardConfig` field (was defined but unused); engine now allows N simultaneous positions; default 3 in config (was blocked by `if open_positions: continue`)
+- [x] `max_entry_vol_annual` — hard realized-vol gate for iron condor / short strangle entries; skip when 10-day annualized realized vol exceeds threshold; Optuna-tuned per window [0.25, 0.90]
+- [x] Global best params fallback — `WalkForwardBacktester` tracks the highest-scoring OOS params seen across all windows (score = `win_rate × √(min(1, trades/5))`); when direct warm-start fails, seeds Optuna from this global reference instead of cold-starting blind, breaking the cascade of 0-trade windows
+- [x] **Per-strategy optimization** — `_optimize_window_params()` runs one Optuna study per strategy (e.g. iron_condor alone = 12D, not 48D joint); study naming: `wf_w{id}_{symbol}_{strategy}`; each strategy's study warm-starts from its own subset of prior/global-best params; merged flat params dict returned unchanged for OOS application
 - [x] Walk-forward `optimize_per_window` integration
 - [x] Resumable studies via SQLite storage (`load_if_exists=True`)
 - [x] `run_optimizer.py` CLI
 - [x] `OptimizationResult` — summary table, JSON save, apply_to_config
+- [x] **Experiment tracking (MLflow)** — `run_integration_test.py` auto-logs each walk-forward run to MLflow experiment `walkforward_{symbol}`. Both `run_integration_test.py` and `backfill_mlflow.py` write to the same database: `data/mlflow.db` (override with `MLFLOW_TRACKING_URI` env var). Params logged: `train_days`, `test_days`, `step_days`, `gap_days`, `wf_trials`, `strategy`, `initial_capital`, `position_size_pct`, `backtest_period` (e.g. `2024-05-02 to 2026-05-08`). Tags: `cli_command`, `git_commit`, `git_branch`, `optimization`. Summary metrics: `total_pnl`, `win_rate`, `sharpe_ratio`, `max_drawdown_pct`, `total_trades`, `profit_factor`. Per-window step metrics (`w_pnl`, `w_trades`, `w_win_rate`, `w_sharpe`) at `step=window_id`. `scripts/backfill_mlflow.py --symbol QQQ` imports existing `reports/runs/` archives idempotently; `--force` deletes and re-imports. UI: `mlflow ui --backend-store-uri sqlite:///data/mlflow.db --port 5001` then open `http://127.0.0.1:5001` (use IP, not `localhost`, due to MLflow 3.x security middleware; port 5000 is blocked by Chrome on macOS).
+- [x] **Run archive** — each integration test run is permanently saved to `reports/runs/{run_id}/` containing per-window JSONs, equity curve, config snapshot, and `run_metadata.json` (includes `initial_capital`, `position_size_pct`, git commit/branch, per-window `best_params`, `n_windows`, `active_windows`, and `profit_factor`). Run ID format: `{symbol}_{train_days}d_{strategy}_{YYYYMMDD_HHMM}` (UTC, includes hour+minute to prevent same-day collisions). `reports/integration_test/` remains ephemeral (gitignored). **Git workflow:** archives are committed to the `data/experiment-archives` branch — never to feature branches or PRs (each archive is ~2k lines; keeping them in PRs exceeds Copilot's 20k review limit). See GUIDE.md → "Committing experiment archives" for the exact workflow.
+- [x] **Production param export** — `scripts/export_production_params.py` reads the last active window's `best_params` from a run archive, strips the `{strategy}__` prefix, maps to config sections, and writes a production-ready YAML (`config_{symbol}_production.yaml`). Prints a diff including initial capital and source window. Supports `--dry-run`.
+- [x] **Run comparison CLI** — `scripts/compare_runs.py --symbol QQQ` prints all archived runs sorted by sharpe, showing train/test/step days, initial capital, trades, win rate, sharpe, drawdown, and PnL.
+
+### New Strategies (engine)
+- [x] `short_strangle` — sell OTM call + sell OTM put (no wings); IV-scaled delta: high IV → go further OTM; margin modeled as 20% of underlying per side
+- [x] `long_strangle` — buy OTM call + buy OTM put; profit from large moves or IV expansion; IV-scaled delta; repriced correctly in `_reprice_position`
 
 ### Integration Tests (`tests/test_integration.py`)
 - Gated by `RUN_INTEGRATION_TESTS=1` env var — skipped entirely in the normal `pytest` run
@@ -251,6 +273,42 @@ run_orchestrator.py          ← Master process (start here)
 - **+138% total return**
 - Sharpe 1.51
 - +49.62% alpha over buy-and-hold
+
+### QQQ integration tests (walk-forward, 365/42/14/5 config, 2024-2026)
+
+Seven experiments run to diagnose optimizer overfitting, fix infrastructure bugs, and activate ML predictions. All use iron_condor, per-strategy optimization.
+
+| Archive | Config | Windows | Optimized | Ablation | Sharpe | Trades | Key Change |
+|---|---|---|---|---|---|---|---|
+| `QQQ_2Y_iron_condor_per_strategy_20260512` | 365/63/21/5 | 18 | −21% | ~+9% | — | — | First integration test |
+| `QQQ_365d_iron_condor_20260513_1831` | 365/42/14/5 | 28 | ~0% | — | — | — | Shorter windows |
+| `QQQ_365d_iron_condor_20260514_1308` | 365/42/14/5 | 28 | −16% | ~+9% | — | ~2 | Repeat to confirm |
+| `QQQ_365d_iron_condor_20260514_2359` | 365/42/14/5 | 28 | −21% | ~+9% | — | ~9 | Vol gate |
+| **`QQQ_365d_iron_condor_20260514_1142`** | 365/42/14/5 | **28** | **+183%** | **+9%** | **23.95** | **91** | **No regime filters** |
+| `QQQ_365d_iron_condor_20260524_1825` | 365/42/14/5 | 24 | +11.88% | +22.68% | 39.12 / 9.70 | 14 / 36 | Spread wiring + calibration |
+| **`QQQ_365d_iron_condor_20260525_1802`** | 365/42/14/5 | **24** | **+1.95%** | **+10.41%** | **3.89 / 4.98** | **18 / 34** | **ML fix: OHLCV-only FeatureEngine; first real XGBoost/LightGBM predictions** |
+
+MLflow experiment: `walkforward_QQQ` (browse via `mlflow ui --backend-store-uri sqlite:///data/mlflow.db --port 5001`; backfill via `scripts/backfill_mlflow.py`).
+
+**Root cause of Experiments 1–4 failure:** Optuna found degenerate in-sample solutions by parking `min_confidence` at ceiling or `max_entry_vol_annual` at floor — blocking all OOS trades per window. **Fix (Experiment 5):** removed both from the iron_condor search space.
+
+**Exp 6 finding:** Ablation (+22.68%) beat the optimized run (+11.88%) — Optuna's `min_trades` filter reduced trade frequency below the baseline. Also: 13/24 windows went inactive (W12–W24) due to `iv_floor` train/OOS mismatch during the 2025–2026 vol regime shift.
+
+**Exp 7 finding:** All Experiments 1–6 silently ran on a naive price-momentum fallback (confidence ≈ 0.50) because `load_daily_ohlcv()` appends an `implied_vol` column (all-NaN), which `FeatureEngine.compute()` passed through to `dropna()` — eliminating every row. Fixed in commit `38d4ae8`: FeatureEngine now starts from OHLCV-only columns. With ML active, ablation still outperformed optimization by 5×. Two structural issues identified: OOS window overlap (step < test) and backtest_end B-S bias.
+
+**Exp 8 finding (completed 2026-05-26, archive `QQQ_365d_iron_condor_20260526_0302`):** 30-day non-overlapping windows (365/30/30/5, 12 W), max_hold_days=[10,21], 200 trials, n_jobs=6. Section E: +0.51%, Sharpe 1.68, 20 trades, 6/12 active. Section F (ablation): +6.02%, Sharpe 14.25, 14 trades. Key findings: (1) dead zone (Sep 2025–May 2026) confirmed regime-driven — identical to Exp 7 despite no overlap; (2) backtest_end bias reduced but not eliminated (late-window entries still hit boundary); (3) ablation >> optimization for third consecutive experiment (P15).
+
+**Exp 9 finding (completed 2026-05-26, archive `QQQ_365d_iron_condor_20260526_1409`):** Removed IC direction gate + wing-derived range threshold (Changes A + B). Section E: +4.37%, Sharpe 5.41, 29 trades, 9/12 active. Section F (ablation): +3.86%, Sharpe 3.05, 38 trades. **Section E beats Section F for the first time (P18).** Three dead-zone windows recovered (W05, W06, W09). Core dead zone (W07 Nov–Dec 2025, W10 Feb–Mar 2026, W12 Apr–May 2026) persists — range model correctly predicts low in-range probability in high-vol regimes.
+
+**Exp 10 (running as of 2026-05-26):** Change C — train range predictor before Optuna and pass it to every trial via StrategyOptimizer. Reverts Change B (fixed 0.05 threshold). Key finding from Exp 9: Optuna was evaluating trial params with no ML models (simple direction fallback, no range gate) while OOS used full ML stack — fundamental signal mismatch. See P19.
+
+**Key lessons:**
+- Regime-filter params (`min_confidence`, `max_entry_vol_annual`, `iv_floor`) are overfitting pressure sinks — fix in config, don't let Optuna search them for iron_condor
+- Spread params are fixed config wired through WalkForwardConfig → Backtester, not Optuna dims
+- Iron condors are the reliable core for QQQ; directional strategies require significantly higher ML directional accuracy
+- VIX time series must be used for IV estimation — a constant `iv_floor` silently corrupts MetaLabeler features
+- `FeatureEngine.compute()` must receive OHLCV-only input — auxiliary columns (e.g. `implied_vol`) with NaN values silently disable ML via `dropna()`
+- Direction model is NOT an appropriate gate for iron condor — high directional confidence signals trending regime (IC failure condition). Range model alone is the correct entry filter for market-neutral strategies
 
 ### Small account ($700)
 - Backtest pending...
@@ -350,6 +408,10 @@ All in `config.yaml`:
 - `ml.retrain_interval_days` — days between retrains (7)
 - `options.strategies` — allowed strategy types
 - `learning.enabled` — self-learning on/off
+- `backtest.initial_capital` — starting capital for walk-forward / integration tests (default $100,000)
+- `backtest.position_size_pct` — fraction of capital risked per trade on a max-loss basis (default 0.05); raise to 0.20 for accounts < $10k
+- `backtest.wing_floor_dollars` — minimum iron condor wing width in dollars (default 5.0); lower to 1.0 for cheap underlyings like MARA, SOFI, RIOT
+- `backtest.iv_floor` — credit-strategy entry gate: skip iron condor / short strangle when IV < this threshold (default 0.12); NOT a pricing floor — `_get_iv()` returns raw IV; VIX is loaded as a time series and used as Priority 2 IV estimate (`vix / 100 × 1.10` for QQQ)
 
 Secrets in `.env`:
 - `IBKR_HOST`, `IBKR_PORT`, `IBKR_CLIENT_ID`, `IBKR_ACCOUNT`
@@ -359,4 +421,4 @@ Secrets in `.env`:
 
 ---
 
-*Last updated: 2026-05-06*
+*Last updated: 2026-05-24*

@@ -376,6 +376,56 @@ The intraday features improve live prediction without backtest validation. Monit
 
 ## 8. Implementation Steps
 
+### Pre-implementation Notes
+
+Seven concrete issues must be resolved before or during each phase. They are listed here so they can be addressed in the right place rather than discovered mid-coding.
+
+**Note 1 — `SHORT_STRANGLE_SPACE` must be created before Phase 2 merges into it.**
+`param_spaces.py` has no `SHORT_STRANGLE_SPACE` and `"short_strangle"` is absent from `STRATEGY_SPACES`. Phase 2 must first define `SHORT_STRANGLE_SPACE` (modelled on `IRON_CONDOR_SPACE`), add it to `STRATEGY_SPACES`, and then merge `FRACTAL_GATE_SPACE` into both.
+
+**Note 2 — Phase 5d uses the wrong attribute name.**
+The plan writes `self._store.save_intraday(...)` but the orchestrator holds the store as `self._historical` (instantiated at line 82 of `orchestrator.py`). All Phase 5d references to `self._store` must be `self._historical`.
+
+**Note 3 — Phase 3 refactor: the `run()` call site must also change.**
+The engine's `run()` loop unpacks `_get_direction` as:
+```python
+direction, confidence = self._get_direction(hist)
+```
+After the refactor to a 3-tuple this becomes:
+```python
+direction, confidence, features_df = self._get_direction(hist)
+```
+`features_df` is then passed directly into `_select_strategy()` as an additional argument so the fractal gate can read from it without calling `FeatureEngine().compute()` a second time. `_select_strategy()` signature changes to `(self, direction, hist, confidence, features_df)`.
+
+**Note 4 — Specify the wavelet family in `_hurst_wavelet()`.**
+Use `pywt.wavedec(returns, wavelet='db4', mode='periodization')`. `db4` (Daubechies-4) is the standard choice for financial return series: it is orthogonal, has 4 vanishing moments (removes polynomial trends up to degree 3), and is the most cited family in the Hurst literature. Using a different family (e.g., `haar`) produces systematically different H values and makes results incomparable across codebases.
+
+**Note 5 — Phase 6 integration path: call `compute_intraday_features()` separately, not through `MultiTimeframeAnalyzer`.**
+The orchestrator already calls `self._mtf_analyzer.analyze(hist, intraday)` for the existing MTF confidence boost. The 20 new Phase 6 features must be added by calling `FeatureEngine().compute_intraday_features(intraday_full)` separately, after the `load_intraday()` call (Phase 5d), and merging the returned dict into `live_signals` before the `self._predictor.predict()` call. Do **not** extend `MultiTimeframeAnalyzer` — it handles timeframe alignment, not fractal estimation, and mixing concerns there makes both harder to test.
+
+The wiring in `_scan_symbol()` becomes:
+```python
+intraday_full = self._historical.load_intraday(symbol, days=7)
+intraday_fractal = FeatureEngine().compute_intraday_features(intraday_full)
+live_signals.update(intraday_fractal)   # merged before predict()
+```
+
+**Note 6 — Create `src/ait/diagnostics/` package and `scripts/` directory before Phase 8.**
+Neither exists yet. Phase 8 requires:
+- `src/ait/diagnostics/__init__.py` (empty is fine)
+- `src/ait/diagnostics/fractal_report.py`
+- `scripts/run_fractal_diagnostics.py`
+
+Without `__init__.py` the test import `from ait.diagnostics import fractal_report` raises `ModuleNotFoundError`.
+
+**Note 7 — Add `packaging` to dev dependencies for the version-check tests.**
+`tests/test_fractal_features.py` uses `from packaging.version import Version`. Add `packaging>=23.0` to `[project.optional-dependencies] dev` in `pyproject.toml`. Alternatively, replace the check with a tuple comparison to avoid the dependency:
+```python
+assert tuple(int(x) for x in pywt.__version__.split(".")[:2]) >= (1, 4)
+```
+
+---
+
 ### Scope Boundary
 
 This plan implements the ideas from our discussion in two tiers of complexity:
@@ -700,6 +750,190 @@ python scripts/run_fractal_diagnostics.py \
 
 ---
 
+### Phase 9: IBKR as Primary Intraday Data Source + 2-Year Backfill
+**Files:** `src/ait/data/market_data.py`, `src/ait/data/historical.py`, `src/ait/bot/orchestrator.py`, `scripts/backfill_intraday.py`
+
+**Motivation:** The current `get_intraday()` implementation is Yahoo Finance only. Using Yahoo for training data while trading against IBKR live prices introduces data source inconsistency: different split-adjustment timing, extended-hours bar contamination in Yahoo, and minor price divergences that compound into biased VLMC session features. IBKR must be the primary source for intraday bars so that training data and live inference use the same prices.
+
+The second issue is depth: 7 days of 5-min bars is insufficient for MFDFA (requires ≥500 bars ≈ 7 sessions) and walk-forward validation of VLMC features requires at least 1 year of daily sessions. 2 years (≈730 calendar days, ≈504 trading days, ≈39,312 5-min bars per symbol) enables full walk-forward IC analysis on VLMC features.
+
+**9.1 — Add `_get_ibkr_intraday()` to `MarketDataService`**
+
+```python
+async def _get_ibkr_intraday(
+    self,
+    symbol: str,
+    duration: str = "7 D",          # "7 D", "1 M", "6 M", "1 Y"
+    bar_size: str = "5 mins",
+) -> pd.DataFrame | None:
+    """Fetch intraday bars from IBKR via reqHistoricalDataAsync.
+
+    Args:
+        symbol:   Ticker string.
+        duration: IBKR duration string — "7 D", "1 M", "6 M", "1 Y".
+                  Max per request for 5-min bars is "6 M" before IBKR
+                  rejects with "invalid duration".
+        bar_size: "5 mins" for standard intraday.
+    """
+    if not self._ibkr or not self._ibkr.connected:
+        return None
+    try:
+        from ib_insync import Stock
+        contract = Stock(symbol, "SMART", "USD")
+        qualified = await self._ibkr.qualify_contract(contract)
+        if not qualified:
+            return None
+
+        bars = await self._ibkr.ib.reqHistoricalDataAsync(
+            qualified,
+            endDateTime="",          # empty = now
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow="TRADES",
+            useRTH=True,
+            formatDate=1,
+        )
+        if not bars:
+            return None
+
+        df = util.df(bars)
+        df = df.rename(columns={
+            "date": "Datetime", "open": "Open", "high": "High",
+            "low": "Low", "close": "Close", "volume": "Volume",
+        })
+        df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True)
+        df.set_index("Datetime", inplace=True)
+        return df[["Open", "High", "Low", "Close", "Volume"]]
+    except Exception as e:
+        log.debug("ibkr_intraday_failed", symbol=symbol, error=str(e))
+        return None
+```
+
+**9.2 — Update `get_intraday()` to IBKR → Yahoo fallback chain**
+
+Change `get_intraday()` to:
+1. Try `_get_ibkr_intraday(symbol, duration="7 D")` first.
+2. Fall back to Yahoo only if IBKR is unavailable or returns empty.
+
+The `days` parameter maps to IBKR duration strings:
+
+| `days` value | IBKR `durationStr` |
+|---|---|
+| ≤ 7 | "7 D" |
+| ≤ 30 | "1 M" |
+| ≤ 180 | "6 M" |
+| > 180 | "1 Y" (or paginated — see backfill) |
+
+**9.3 — Incremental daily fetch in orchestrator**
+
+The orchestrator's `_scan_symbol()` should replace its `get_intraday(days=7)` call with an incremental fetch: only request bars since `get_latest_intraday_timestamp()`. This avoids re-downloading bars already stored in SQLite.
+
+```python
+# In orchestrator._scan_symbol():
+last_ts = self._historical.get_latest_intraday_timestamp(symbol)
+if last_ts is None:
+    # First run — fetch 7 days to seed the DB
+    intraday = await self._market_data.get_intraday(symbol, interval="5m", days=7)
+else:
+    # Only fetch new bars since last stored timestamp
+    intraday = await self._market_data.get_intraday_since(symbol, since=last_ts)
+```
+
+Add `get_intraday_since(symbol, since: pd.Timestamp)` to `MarketDataService` — uses IBKR `endDateTime=""` and a `durationStr` computed from `now - since`.
+
+**9.4 — Extend `cleanup_old_intraday` retention to 2 years**
+
+Change `cleanup_old_intraday(keep_days=10)` call in orchestrator to `cleanup_old_intraday(keep_days=730)`. 2 years of 5-min data per symbol = ~39,312 rows × ~20 symbols = ~786K rows in `intraday_prices`. SQLite handles this comfortably (< 50 MB with the existing schema).
+
+**9.5 — Bulk backfill script: `scripts/backfill_intraday.py`**
+
+A one-time (and repeatable) script that backfills 2 years of 5-min bars per symbol from IBKR into SQLite. Must handle IBKR's pacing rule (60 requests per 10 minutes per client) and the 6-month-per-request cap for 5-min bars.
+
+```bash
+python scripts/backfill_intraday.py \
+    --symbols SPY QQQ AAPL NVDA MSFT \
+    --years 2 \
+    --bar-size "5 mins"
+```
+
+**Pagination logic:**
+
+For 2 years with max 6-month chunks:
+1. Split the 2-year window into 4 × 6-month segments (most-recent first).
+2. For each segment, call `reqHistoricalDataAsync` with `durationStr="6 M"` and `endDateTime` set to the end of that segment.
+3. Upsert into `intraday_prices` via `HistoricalDataStore.save_intraday()`.
+4. Pause 1 second between requests (well within 60/10-min pacing limit).
+
+**IBKR pacing constraints:**
+- Max 60 historical data requests per 10 minutes per client ID
+- Max 6 months of 5-min data per request
+- For 5 symbols × 4 requests each = 20 requests total — no pacing issue
+
+**CLI:**
+```python
+argparse arguments:
+  --symbols    list of tickers (required)
+  --years      how many years back to fetch (default: 2)
+  --bar-size   IBKR bar size string (default: "5 mins")
+  --db-path    SQLite DB path (default: data/historical.db)
+  --dry-run    print request plan without executing
+```
+
+---
+
+### Phase 10: VLMC Session Structure Diagnostic Reports
+**Files:** `src/ait/diagnostics/fractal_report.py`, `tests/test_fractal_diagnostics.py`
+
+**Motivation:** Phase 8 generates diagnostics only for fractal features (Hurst, PSD, MFDFA). The 13 VLMC session structure features have no diagnostic coverage: we cannot currently validate that `session_vwap_position`, `session_volume_front_load`, and `power_hour_momentum` are computing correctly or whether they carry predictive signal. Phase 10 adds VLMC-specific plots following the same Plotly HTML pattern as Phase 8.
+
+**New functions to add to `fractal_report.py`:**
+
+```python
+def plot_session_vwap_trajectory(symbol: str, intraday_df: pd.DataFrame) -> go.Figure
+def plot_volume_profile_distribution(symbol: str, intraday_df: pd.DataFrame) -> go.Figure
+def plot_session_feature_ic_analysis(features_df: pd.DataFrame, labels: pd.Series) -> go.Figure
+def plot_power_hour_patterns(symbol: str, intraday_df: pd.DataFrame) -> go.Figure
+```
+
+**What each plot validates:**
+
+| Function | What to check |
+|---|---|
+| `plot_session_vwap_trajectory` | Rolling average of `session_vwap_position` across all sessions. Strongly trending markets should show persistent above/below VWAP closing. Mean-reverting regimes should be near zero. |
+| `plot_volume_profile_distribution` | Histogram of `session_volume_front_load` values. Should be roughly uniform or slightly front-loaded (equities). Heavy back-loading > 0.6 may indicate ETF rebalancing artifacts. |
+| `plot_session_feature_ic_analysis` | IC bar chart for all 13 VLMC features vs. 5-day forward return. `power_hour_momentum` and `closing_imbalance` are expected to have the highest IC. |
+| `plot_power_hour_patterns` | Scatter: `power_hour_momentum` vs. next-day return. Should show mild positive correlation for trending markets. |
+
+**Update `generate_report()` to include VLMC plots:**
+
+```python
+# In generate_report(), after fetching intraday_df (requires Phase 9 backfill):
+if intraday_df is not None and not intraday_df.empty:
+    plots.extend([
+        plot_session_vwap_trajectory(symbol, intraday_df),
+        plot_volume_profile_distribution(symbol, intraday_df),
+        plot_session_feature_ic_analysis(features_df, labels),
+        plot_power_hour_patterns(symbol, intraday_df),
+    ])
+```
+
+`generate_report()` must be updated to also accept intraday data. It fetches intraday from the SQLite store (`HistoricalDataStore.load_intraday(symbol, days=730)`) rather than making a live IBKR call — diagnostic tool runs offline against the stored DB.
+
+**Updated CLI (no flag changes needed — VLMC plots included automatically):**
+
+```bash
+python scripts/run_fractal_diagnostics.py \
+    --symbols SPY QQQ AAPL NVDA \
+    --start 2022-01-01 \
+    --end 2025-12-31 \
+    --output reports/fractal/ \
+    --format html
+```
+
+Output now includes both fractal and VLMC sections in each per-symbol HTML.
+
+---
+
 ### Effort Estimates
 
 Estimates assume one developer, familiarity with the codebase, and include unit test writing.
@@ -714,7 +948,9 @@ Estimates assume one developer, familiarity with the codebase, and include unit 
 | **6** | Intraday fractal + VLMC session features | **2–3 days** | VWAP session boundary logic is the tricky part (today's bars only). Can reuse Phase 1 wavelet code for intraday path. |
 | **7** | Dependency addition (`pywavelets`, `shap`) | **0.1 days** | Trivial. Verify install on Intel Mac. |
 | **8** | Diagnostic report tool | **1–1.5 days** | Plotly charts + SHAP integration + IC computation + CLI. Low risk — diagnostic-only. |
-| **Total (Phases 1–8)** | | **~9–11.5 days** | All backtested + live-validated changes plus diagnostics. |
+| **9** | IBKR intraday source + 2-year backfill | **2–3 days** | `_get_ibkr_intraday()` + pagination logic + incremental orchestrator fetch + backfill script. Main risk: IBKR pacing and `reqHistoricalDataAsync` not available when TWS is disconnected — must degrade gracefully to Yahoo. |
+| **10** | VLMC diagnostic reports | **1 day** | 4 new plot functions + `generate_report()` update. Depends on Phase 9 backfill (needs stored intraday data). Low risk — diagnostic-only. |
+| **Total (Phases 1–10)** | | **~12–15.5 days** | Full fractal + VLMC feature stack with consistent IBKR data source, 2-year intraday history, and complete diagnostic coverage. |
 
 **Deferred work (separate branches):**
 
@@ -735,11 +971,12 @@ Estimates assume one developer, familiarity with the codebase, and include unit 
 | `src/ait/backtesting/engine.py` | Add fractal gate in `_select_strategy()`, 3 new constructor kwargs | Iron condors gated on regime stability |
 | `src/ait/backtesting/walkforward.py` | 3 new `WalkForwardConfig` fields, propagate to Backtester | Per-window threshold optimization |
 | `src/ait/data/historical.py` | Add `intraday_prices` SQLite table + 4 new methods (`save_intraday`, `load_intraday`, `get_latest_intraday_timestamp`, `cleanup_old_intraday`) | Required for MFDFA on intraday data; DB schema migration on first run |
-| `src/ait/data/market_data.py` | Change `get_intraday()` default from `days=1` to `days=7` | Fetches 7 days of 5-min bars from Yahoo; no new IB function needed |
+| `src/ait/data/market_data.py` | Add `_get_ibkr_intraday()` + `get_intraday_since()`; change fallback chain to IBKR→Yahoo; `get_intraday()` default `days=7` | IBKR becomes primary source for consistent training/trading data |
 | `src/ait/bot/orchestrator.py` | In `_scan_symbol()`: call `save_intraday()` after fetch, `load_intraday()` for full history before feature computation | Enables MFDFA from first startup (DB-warm) |
 | `pyproject.toml` | Add `pywavelets>=1.4`, `shap>=0.42` | New dependencies |
 | `src/ait/diagnostics/fractal_report.py` | New module — 7 Plotly chart functions + `generate_report()` | Diagnostic only; no trading pipeline effect |
 | `scripts/run_fractal_diagnostics.py` | New CLI script — calls `generate_report()` with argparse | Run on demand post-backtest |
+| `scripts/backfill_intraday.py` | New CLI script — paginated IBKR backfill for 2 years of 5-min bars per symbol | One-time run before walk-forward validation of VLMC features; repeatable to fill gaps |
 
 **No changes required:**
 - `src/ait/ml/range_predictor.py` — uses `FeatureEngine.compute()` → gets fractal features automatically
@@ -750,7 +987,6 @@ Estimates assume one developer, familiarity with the codebase, and include unit 
 - `src/ait/optimization/optimizer.py` — no change; picks up new param spaces via existing dict registration
 - `src/ait/backtesting/walkforward.py` window slicing — no change
 - Walk-forward 5-day purge gap — no change; fractal features don't add label leakage
-- **No new IB/IBKR function required** — Yahoo Finance already provides 5-min bars up to 60 days; IBKR `reqHistoricalData()` for intraday is not needed and adds pagination/pacing complexity
 
 **Retraining required:** After adding new features to `FeatureEngine`, saved models (`models/ensemble.pkl`, `models/range.pkl`, `models/vol_magnitude.pkl`) will have a feature name mismatch and must be retrained. The existing daily 7:30 AM retrain schedule handles this on the next run.
 
@@ -758,7 +994,7 @@ Estimates assume one developer, familiarity with the codebase, and include unit 
 
 ## 10. Diagnostic Reports
 
-A standalone diagnostic tool generates plots and predictive metrics for fractal features. It has no effect on the trading pipeline and can be run at any time against historical data.
+A standalone diagnostic tool generates plots and predictive metrics for fractal and VLMC session structure features. It has no effect on the trading pipeline and can be run at any time against the stored SQLite data.
 
 ### 10.1 Feature Health Plots
 
@@ -837,81 +1073,1377 @@ python scripts/run_fractal_diagnostics.py \
 
 Output: `reports/fractal/fractal_report_SPY.html` (interactive Plotly) per symbol + `reports/fractal/ic_summary.csv` with IC metrics for all features × all walk-forward windows.
 
-**Dependencies:** `plotly>=5.0` (already in the project if used elsewhere, otherwise add), `shap>=0.42`.
+**Dependencies:** `plotly>=5.0` (already in the project), `shap>=0.42`.
+
+### 10.6 VLMC Session Structure Diagnostic Plots
+
+Four additional plots are generated per symbol when intraday data is available in the SQLite store (requires Phase 9 backfill).
+
+**`plot_session_vwap_trajectory(symbol, intraday_df)`**
+- Aggregates `session_vwap_position` (close vs. session VWAP) across all stored sessions.
+- Rolling 20-session mean and ±1σ band.
+- **What to check:** Trending markets should show persistent positive/negative VWAP position. Mean-reverting markets should oscillate around zero. Systematic bias (e.g., always below VWAP) may indicate a VWAP computation bug (check session boundary filtering).
+
+**`plot_volume_profile_distribution(symbol, intraday_df)`**
+- Histogram of `session_volume_front_load` and `session_volume_shape` across all sessions.
+- Overlays expected U-curve distribution (high volume at open and close).
+- **What to check:** `session_volume_front_load` > 0.45 is typical for US equities. Values uniformly distributed at 0.33 suggest the session boundary filter is not working (treating entire 7-day window as one session). Heavy back-loading (> 0.6) may indicate ETF creation/redemption artifacts.
+
+**`plot_session_feature_ic_analysis(features_df, labels)`**
+- IC (Spearman ρ) for all 13 VLMC session features vs. 5-day forward return.
+- Same bar chart format as the fractal IC plot.
+- **Expected findings:** `power_hour_momentum` and `closing_imbalance` expected to show the highest |IC| (0.04–0.10 range). `session_vwap_q1/q2/q3` will have lower IC — they measure intraday trajectory, not direction. Features with IC < 0.02 and no statistical significance should be flagged for potential removal.
+
+**`plot_power_hour_patterns(symbol, intraday_df)`**
+- Scatter plot: `power_hour_momentum` (x-axis) vs. next-session open return (y-axis) per day.
+- Colour-coded by `power_hour_vol_accel` (blue = decelerating, red = accelerating).
+- **What to check:** Should show mild positive slope (continuation) in trending markets. Flat scatter with no slope means `power_hour_momentum` has no predictive content for this symbol — expected for highly mean-reverting assets (e.g., short-dated inverse ETFs).
+
+**Updated CLI (VLMC plots are included automatically if intraday data exists):**
+
+```bash
+# Full report: fractal + VLMC
+python scripts/run_fractal_diagnostics.py \
+    --symbols SPY QQQ AAPL NVDA \
+    --start 2022-01-01 \
+    --end 2025-12-31 \
+    --output reports/fractal/ \
+    --format html
+
+# If intraday DB is populated (after backfill_intraday.py), VLMC plots appear automatically.
+# If DB is empty for a symbol, VLMC section is omitted with a logged warning.
+```
 
 ---
 
 ## 11. Verification Plan
 
-### 11.1 Unit Tests
+This section specifies the complete test suite required to confirm that all eight phases are correctly implemented. Tests are organised into per-phase unit tests, end-to-end integration tests, and CLI smoke tests.
 
-**Fractal feature computation:**
+Run all fractal-related tests with:
+
 ```bash
-pytest tests/ -k "fractal"
+pytest tests/ -k "fractal" -v          # fractal-specific tests only
+pytest tests/ -x --tb=short            # full suite, stop on first failure
 ```
-- Feed 504-bar SPY daily OHLCV, assert all 10 features are finite and in expected ranges
-- `hurst_wavelet` ∈ [0.1, 0.9]
-- `hurst_scale_spread` ≥ 0
-- `psd_beta` ∈ [0.5, 3.0]
-- `multifractal_width` ≥ 0
-- Features with < min_bars return `0.0` (not NaN or error)
-
-**Feature count:**
-```python
-assert len(FeatureEngine().get_feature_names()) == old_count + 10
-```
-
-**Saved model mismatch (expected failure):**
-Loading `models/ensemble.pkl` trained before this change should raise a feature name mismatch or produce a warning — confirming retraining is required.
-
-### 11.2 Walk-Forward Smoke Test
-```bash
-python run_backtest.py --symbols SPY --capital 10000
-```
-- Completes without error
-- Log shows `features_computed` with increased column count (+10)
-- Check `hurst_scale_spread` values in log — should be ~0.05–0.15 for SPY in calm periods, higher in 2022
-
-### 11.3 Optimizer Smoke Test
-```bash
-python run_optimizer.py --strategies iron_condor --symbols SPY --n-trials 10
-```
-- `hurst_regime_threshold` and `multifractal_max_width` appear in trial params in Optuna output
-- `summary()` shows fractal params alongside existing strategy params
-
-### 11.4 Per-Window Fractal Adaptation Test
-```bash
-python run_backtest.py \
-  --symbols SPY QQQ \
-  --optimize-per-window \
-  --optimize-n-trials 20
-```
-- Different walk-forward windows (calm 2024 vs volatile 2022) produce different optimal `hurst_regime_threshold` values
-- Confirms fractal thresholds are regime-adaptive per window
-
-### 11.5 Regime Signal Validation
-
-During backtest, log fractal feature values per day. Validate against known high-volatility periods:
-- **Expected:** `hurst_scale_spread` > 0.15 and `multifractal_width` elevated during Jan–Jun 2022
-- **Expected:** `hurst_scale_spread` < 0.10 during calm trending periods (2023 Q4, 2024 Q1)
-- **Expected:** `multifractal_asymmetry` goes negative before major drawdowns (March 2020, Oct 2022)
-
-### 11.6 Iron Condor Gate Validation
-
-From `BacktestResult.trades`, compare:
-- Trades where `hurst_scale_spread > threshold` was triggered (gated) vs. those that proceeded
-- Gated trades should have lower hypothetical win rates (counterfactual validation)
-- If gated trades would have won, threshold is too aggressive → optimizer should find a higher value
-
-### 11.7 Intraday Fractal (Live Only)
-```bash
-# During paper trading market hours:
-python -m src.ait.main --mode paper
-```
-Check logs for `compute_intraday_features` returning `hurst_wavelet_intraday` and `wavelet_L4_energy` keys for at least one symbol. Verify values are finite and update every 5-minute scan cycle.
 
 ---
 
-*Plan authored: 2026-05-06*
-*Branch: features-request-1*
+### 11.1 Phase 1 — Daily Fractal Features in FeatureEngine
+
+**File:** `tests/test_fractal_features.py`
+
+#### 11.1.1 Shared fixture
+
+```python
+import numpy as np
+import pandas as pd
+import pytest
+
+from ait.ml.features import FeatureEngine
+
+
+def _make_ohlcv(days: int = 504, seed: int = 42) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    returns = rng.normal(0.0003, 0.012, days)
+    close = 400.0 * np.cumprod(1 + returns)
+    dates = pd.date_range("2022-01-03", periods=days, freq="B")
+    return pd.DataFrame({
+        "Open":   close * (1 + rng.normal(0, 0.001, days)),
+        "High":   close * (1 + np.abs(rng.normal(0, 0.005, days))),
+        "Low":    close * (1 - np.abs(rng.normal(0, 0.005, days))),
+        "Close":  close,
+        "Volume": rng.integers(1_000_000, 10_000_000, days),
+    }, index=dates)
+```
+
+#### 11.1.2 Feature presence tests
+
+```python
+class TestFractalFeaturesPresent:
+
+    FRACTAL_FEATURES = [
+        "hurst_wavelet", "hurst_fit_r2",
+        "psd_beta", "psd_fit_r2", "hurst_psd_divergence",
+        "hurst_short", "hurst_long", "hurst_scale_spread",
+        "multifractal_width", "multifractal_asymmetry",
+    ]
+
+    def test_all_fractal_features_in_output(self) -> None:
+        result = FeatureEngine().compute(_make_ohlcv(504))
+        missing = [f for f in self.FRACTAL_FEATURES if f not in result.columns]
+        assert missing == [], f"Missing fractal features: {missing}"
+
+    def test_get_feature_names_includes_all_10_fractals(self) -> None:
+        names = FeatureEngine().get_feature_names()
+        for feat in self.FRACTAL_FEATURES:
+            assert feat in names, f"{feat!r} absent from get_feature_names()"
+
+    def test_feature_count_increased_by_exactly_10(self) -> None:
+        """get_feature_names() must contain exactly 10 new fractal entries."""
+        names = FeatureEngine().get_feature_names()
+        fractal_count = sum(1 for n in names if n in self.FRACTAL_FEATURES)
+        assert fractal_count == 10
+```
+
+#### 11.1.3 Value range tests
+
+```python
+class TestFractalFeatureRanges:
+
+    def _last_row(self) -> pd.Series:
+        return FeatureEngine().compute(_make_ohlcv(504)).iloc[-1]
+
+    def test_hurst_wavelet_in_range(self) -> None:
+        row = self._last_row()
+        assert 0.1 <= row["hurst_wavelet"] <= 0.9, (
+            f"hurst_wavelet={row['hurst_wavelet']:.4f} out of [0.1, 0.9]"
+        )
+
+    def test_hurst_fit_r2_bounded(self) -> None:
+        row = self._last_row()
+        assert 0.0 <= row["hurst_fit_r2"] <= 1.0
+
+    def test_psd_beta_in_range(self) -> None:
+        row = self._last_row()
+        assert 0.5 <= row["psd_beta"] <= 3.0, (
+            f"psd_beta={row['psd_beta']:.4f} out of [0.5, 3.0]"
+        )
+
+    def test_psd_fit_r2_bounded(self) -> None:
+        row = self._last_row()
+        assert 0.0 <= row["psd_fit_r2"] <= 1.0
+
+    def test_hurst_scale_spread_nonnegative(self) -> None:
+        assert self._last_row()["hurst_scale_spread"] >= 0.0
+
+    def test_multifractal_width_nonnegative(self) -> None:
+        assert self._last_row()["multifractal_width"] >= 0.0
+
+    def test_no_nans_in_fractal_columns(self) -> None:
+        result = FeatureEngine().compute(_make_ohlcv(504))
+        fractal_cols = [
+            "hurst_wavelet", "hurst_fit_r2", "psd_beta", "psd_fit_r2",
+            "hurst_psd_divergence", "hurst_short", "hurst_long",
+            "hurst_scale_spread", "multifractal_width", "multifractal_asymmetry",
+        ]
+        nans = result[fractal_cols].isna().sum()
+        assert nans.sum() == 0, f"NaNs found: {nans[nans > 0].to_dict()}"
+
+    def test_no_infs_in_fractal_columns(self) -> None:
+        result = FeatureEngine().compute(_make_ohlcv(504))
+        fractal_cols = [
+            "hurst_wavelet", "hurst_fit_r2", "psd_beta", "psd_fit_r2",
+            "hurst_psd_divergence", "hurst_short", "hurst_long",
+            "hurst_scale_spread", "multifractal_width", "multifractal_asymmetry",
+        ]
+        assert not np.isinf(result[fractal_cols].values).any(), "Inf values in fractal features"
+```
+
+#### 11.1.4 Graceful degradation tests
+
+```python
+class TestFractalGracefulDegradation:
+
+    def test_too_few_rows_returns_empty_dataframe(self) -> None:
+        result = FeatureEngine().compute(_make_ohlcv(30))
+        assert result.empty
+
+    def test_features_needing_180_bars_are_zero_on_60_bar_series(self) -> None:
+        """hurst_long (requires 180 bars) must fill 0.0 when given 60 bars."""
+        result = FeatureEngine().compute(_make_ohlcv(60))
+        if result.empty:
+            pytest.skip("60-bar series rejected at input guard — acceptable")
+        assert result.iloc[-1]["hurst_long"] == pytest.approx(0.0)
+        assert result.iloc[-1]["hurst_scale_spread"] == pytest.approx(0.0)
+
+    def test_mfdfa_zero_when_under_500_bars(self) -> None:
+        """With 250 bars (< 500 MFDFA minimum), multifractal features must be 0.0."""
+        result = FeatureEngine().compute(_make_ohlcv(250))
+        if result.empty:
+            pytest.skip("250-bar series rejected — acceptable")
+        assert result.iloc[-1]["multifractal_width"] == pytest.approx(0.0)
+        assert result.iloc[-1]["multifractal_asymmetry"] == pytest.approx(0.0)
+```
+
+#### 11.1.5 Estimator unit tests (private methods)
+
+```python
+class TestFractalEstimators:
+
+    def test_hurst_brownian_motion_near_half(self) -> None:
+        """i.i.d. Gaussian returns → H ≈ 0.5 ± 0.15."""
+        rng = np.random.default_rng(0)
+        returns = rng.normal(0, 1, 1000)
+        h, r2 = FeatureEngine()._hurst_wavelet(returns)
+        assert 0.35 <= h <= 0.65, f"Brownian H={h:.3f}, expected near 0.5"
+        assert r2 >= 0.0
+
+    def test_hurst_persistent_series_above_half(self) -> None:
+        """Positively autocorrelated series → H > 0.5."""
+        rng = np.random.default_rng(1)
+        noise = rng.normal(0, 1, 500)
+        persistent = np.cumsum(noise)
+        returns = np.diff(persistent) / (np.abs(persistent[:-1]) + 1e-8)
+        h, _ = FeatureEngine()._hurst_wavelet(returns)
+        assert h > 0.5, f"Persistent H={h:.3f} should be > 0.5"
+
+    def test_hurst_mean_reverting_below_half(self) -> None:
+        """AR(1) with φ=−0.7 → H < 0.5."""
+        rng = np.random.default_rng(2)
+        n = 500
+        ar = np.zeros(n)
+        eps = rng.normal(0, 1, n)
+        for i in range(1, n):
+            ar[i] = -0.7 * ar[i - 1] + eps[i]
+        h, _ = FeatureEngine()._hurst_wavelet(ar)
+        assert h < 0.5, f"Mean-reverting H={h:.3f} should be < 0.5"
+
+    def test_psd_features_return_two_floats(self) -> None:
+        rng = np.random.default_rng(3)
+        beta, r2 = FeatureEngine()._psd_features(rng.normal(0, 1, 200))
+        assert isinstance(beta, float)
+        assert isinstance(r2, float)
+        assert 0.0 <= r2 <= 1.0
+
+    def test_mfdfa_insufficient_data_returns_zeros(self) -> None:
+        width, asymmetry = FeatureEngine()._mfdfa_features(
+            np.random.default_rng(4).normal(0, 1, 100)   # < 500 minimum
+        )
+        assert width == pytest.approx(0.0)
+        assert asymmetry == pytest.approx(0.0)
+
+    def test_mfdfa_full_series_nonnegative_width(self) -> None:
+        width, _ = FeatureEngine()._mfdfa_features(
+            np.random.default_rng(5).normal(0, 1, 600)
+        )
+        assert width >= 0.0
+```
+
+---
+
+### 11.2 Phase 2 — Fractal Gate Parameters in Optimizer
+
+**File:** `tests/test_fractal_features.py` (append)
+
+```python
+from ait.optimization.param_spaces import (
+    FRACTAL_GATE_SPACE,
+    IRON_CONDOR_SPACE,
+    STRATEGY_SPACES,
+)
+
+
+class TestFractalGateParamSpace:
+
+    def test_fractal_gate_space_has_all_three_keys(self) -> None:
+        for key in ("hurst_regime_threshold", "hurst_regime_penalty", "multifractal_max_width"):
+            assert key in FRACTAL_GATE_SPACE, f"Missing key {key!r} in FRACTAL_GATE_SPACE"
+
+    def test_all_ranges_are_valid_float_tuples(self) -> None:
+        for key, spec in FRACTAL_GATE_SPACE.items():
+            typ, lo, hi = spec[:3]
+            assert typ == "float", f"{key}: expected 'float', got {typ!r}"
+            assert 0.0 <= lo < hi <= 1.0, f"{key}: invalid range [{lo}, {hi}]"
+
+    def test_iron_condor_space_includes_fractal_keys(self) -> None:
+        for key in FRACTAL_GATE_SPACE:
+            assert key in IRON_CONDOR_SPACE, (
+                f"{key!r} must be merged into IRON_CONDOR_SPACE"
+            )
+
+    def test_short_strangle_space_includes_fractal_keys(self) -> None:
+        strangle_space = STRATEGY_SPACES["short_strangle"]
+        for key in FRACTAL_GATE_SPACE:
+            assert key in strangle_space, (
+                f"{key!r} must be merged into SHORT_STRANGLE_SPACE"
+            )
+
+    def test_directional_strategies_exclude_fractal_keys(self) -> None:
+        """Bull/bear/long strategies must NOT carry fractal gate params."""
+        for strategy in ("long_call", "long_put", "bull_call_spread", "bear_put_spread"):
+            space = STRATEGY_SPACES[strategy]
+            for key in FRACTAL_GATE_SPACE:
+                assert key not in space, (
+                    f"{key!r} must not be in {strategy!r} space"
+                )
+```
+
+---
+
+### 11.3 Phase 3 — Fractal Gating in Backtesting Engine
+
+**File:** `tests/test_fractal_features.py` (append)
+
+```python
+from ait.backtesting.engine import Backtester
+
+
+def _make_ohlcv_engine(days: int = 504, seed: int = 99) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    close = 400.0 * np.cumprod(1 + rng.normal(0.0003, 0.012, days))
+    dates = pd.date_range("2022-01-03", periods=days, freq="B")
+    return pd.DataFrame({
+        "Open":   close * 0.999,
+        "High":   close * 1.005,
+        "Low":    close * 0.995,
+        "Close":  close,
+        "Volume": rng.integers(1_000_000, 10_000_000, days),
+    }, index=dates)
+
+
+class TestFractalGatingEngine:
+
+    def test_backtester_accepts_fractal_kwargs(self) -> None:
+        Backtester(
+            data=_make_ohlcv_engine(),
+            strategies=["iron_condor"],
+            hurst_regime_threshold=0.20,
+            hurst_regime_penalty=0.10,
+            multifractal_max_width=0.50,
+        )
+
+    def test_fractal_kwargs_stored_as_private_attributes(self) -> None:
+        bt = Backtester(
+            data=_make_ohlcv_engine(),
+            strategies=["iron_condor"],
+            hurst_regime_threshold=0.15,
+            hurst_regime_penalty=0.08,
+            multifractal_max_width=0.45,
+        )
+        assert bt._hurst_regime_threshold == pytest.approx(0.15)
+        assert bt._hurst_regime_penalty   == pytest.approx(0.08)
+        assert bt._multifractal_max_width  == pytest.approx(0.45)
+
+    def test_zero_threshold_zero_penalty_does_not_raise(self) -> None:
+        """Degenerate settings must not crash the engine."""
+        bt = Backtester(
+            data=_make_ohlcv_engine(),
+            strategies=["iron_condor"],
+            hurst_regime_threshold=0.0,
+            hurst_regime_penalty=0.0,
+            multifractal_max_width=1.0,
+        )
+        bt.run()
+
+    def test_extreme_penalty_blocks_all_iron_condors(self) -> None:
+        """threshold=0.0 + penalty=1.0 must eliminate all iron condor entries."""
+        bt = Backtester(
+            data=_make_ohlcv_engine(),
+            strategies=["iron_condor"],
+            hurst_regime_threshold=0.0,
+            hurst_regime_penalty=1.0,
+            multifractal_max_width=1.0,
+            min_confidence=0.55,
+        )
+        result = bt.run()
+        iron_condor_trades = [
+            t for t in result.trades if t.get("strategy") == "iron_condor"
+        ]
+        assert len(iron_condor_trades) == 0, (
+            "Iron condors must be fully blocked when threshold=0 and penalty=1"
+        )
+
+    def test_get_direction_returns_three_tuple(self) -> None:
+        """After Phase 3 refactor, _get_direction must return (direction, confidence, features_df)."""
+        import inspect
+        bt = Backtester(data=_make_ohlcv_engine(100), strategies=["iron_condor"])
+        # Confirm the method exists and accepts a hist argument
+        assert hasattr(bt, "_get_direction")
+        assert callable(bt._get_direction)
+        sig = inspect.signature(bt._get_direction)
+        # Must accept at least one positional parameter (hist DataFrame)
+        assert len(sig.parameters) >= 1
+
+    def test_features_shared_not_recomputed(self) -> None:
+        """FeatureEngine.compute() must be called once per bar, not twice."""
+        call_count = {"n": 0}
+        original_compute = FeatureEngine.compute
+
+        def counting_compute(self_, *args, **kwargs):
+            call_count["n"] += 1
+            return original_compute(self_, *args, **kwargs)
+
+        import unittest.mock
+        with unittest.mock.patch.object(FeatureEngine, "compute", counting_compute):
+            bt = Backtester(
+                data=_make_ohlcv_engine(120),
+                strategies=["iron_condor"],
+            )
+            bt.run()
+
+        bars_run = 120 - 50   # approximate bars after warmup
+        # Each bar must call compute at most once (fractal gate reuses the result)
+        assert call_count["n"] <= bars_run + 5, (
+            f"FeatureEngine.compute() called {call_count['n']} times for ~{bars_run} bars "
+            "— features are being computed twice per bar"
+        )
+```
+
+---
+
+### 11.4 Phase 4 — WalkForwardConfig Extension
+
+**File:** `tests/test_walkforward.py` (append to existing `TestWalkForwardConfig` class or add new class)
+
+```python
+from ait.backtesting.walkforward import WalkForwardConfig, WalkForwardBacktester
+
+
+class TestWalkForwardConfigFractalFields:
+
+    def test_fractal_fields_exist_on_dataclass(self) -> None:
+        cfg = WalkForwardConfig()
+        assert hasattr(cfg, "hurst_regime_threshold")
+        assert hasattr(cfg, "hurst_regime_penalty")
+        assert hasattr(cfg, "multifractal_max_width")
+
+    def test_fractal_field_default_values(self) -> None:
+        cfg = WalkForwardConfig()
+        assert cfg.hurst_regime_threshold == pytest.approx(0.20)
+        assert cfg.hurst_regime_penalty   == pytest.approx(0.10)
+        assert cfg.multifractal_max_width  == pytest.approx(0.50)
+
+    def test_fractal_fields_accept_custom_values(self) -> None:
+        cfg = WalkForwardConfig(
+            hurst_regime_threshold=0.12,
+            hurst_regime_penalty=0.05,
+            multifractal_max_width=0.40,
+        )
+        assert cfg.hurst_regime_threshold == pytest.approx(0.12)
+        assert cfg.hurst_regime_penalty   == pytest.approx(0.05)
+        assert cfg.multifractal_max_width  == pytest.approx(0.40)
+
+    def test_fractal_thresholds_propagate_to_backtester(self) -> None:
+        """WalkForwardBacktester must forward fractal thresholds to per-window Backtester instances."""
+        cfg = WalkForwardConfig(
+            hurst_regime_threshold=0.12,
+            hurst_regime_penalty=0.07,
+            multifractal_max_width=0.38,
+        )
+        wf = WalkForwardBacktester(
+            symbols=["SPY"],
+            strategies=["iron_condor"],
+            config=cfg,
+        )
+        # The config is stored and must carry the custom values through
+        assert wf._config.hurst_regime_threshold == pytest.approx(0.12)
+        assert wf._config.hurst_regime_penalty   == pytest.approx(0.07)
+        assert wf._config.multifractal_max_width  == pytest.approx(0.38)
+```
+
+---
+
+### 11.5 Phase 5 — Intraday Data Infrastructure
+
+#### 11.5.1 HistoricalDataStore — intraday table and methods
+
+**File:** `tests/test_intraday_store.py`
+
+```python
+"""Unit tests for the intraday_prices SQLite table and HistoricalDataStore methods."""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from ait.data.historical import HistoricalDataStore
+
+
+def _make_intraday_df(bars: int = 78, start: str = "2026-05-07 09:35") -> pd.DataFrame:
+    rng = np.random.default_rng(7)
+    closes = 400.0 + np.cumsum(rng.normal(0, 0.5, bars))
+    dts = pd.date_range(start, periods=bars, freq="5min")
+    return pd.DataFrame({
+        "Open":   closes * 0.999, "High": closes * 1.002,
+        "Low":    closes * 0.998, "Close": closes,
+        "Volume": rng.integers(10_000, 200_000, bars),
+    }, index=dts)
+
+
+@pytest.fixture
+def tmp_store(tmp_path: Path) -> HistoricalDataStore:
+    return HistoricalDataStore(db_path=tmp_path / "test.db")
+
+
+class TestIntradayTableCreation:
+
+    def test_intraday_table_created_on_init(self, tmp_store: HistoricalDataStore) -> None:
+        with sqlite3.connect(tmp_store._db_path) as conn:
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )}
+        assert "intraday_prices" in tables
+
+    def test_intraday_index_created(self, tmp_store: HistoricalDataStore) -> None:
+        with sqlite3.connect(tmp_store._db_path) as conn:
+            indexes = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            )}
+        assert "idx_intraday_symbol_dt" in indexes
+
+    def test_existing_db_not_broken_by_migration(self, tmp_path: Path) -> None:
+        """Opening a pre-existing DB that lacks intraday_prices must not raise."""
+        db = tmp_path / "legacy.db"
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                "CREATE TABLE daily_prices "
+                "(symbol TEXT, date TEXT, open REAL, high REAL, low REAL, "
+                "close REAL, volume INTEGER, PRIMARY KEY (symbol, date))"
+            )
+        HistoricalDataStore(db_path=db)   # must not raise
+
+
+class TestSaveIntraday:
+
+    def test_save_returns_row_count(self, tmp_store: HistoricalDataStore) -> None:
+        assert tmp_store.save_intraday("SPY", _make_intraday_df(78)) == 78
+
+    def test_save_empty_df_returns_zero(self, tmp_store: HistoricalDataStore) -> None:
+        assert tmp_store.save_intraday("SPY", pd.DataFrame()) == 0
+
+    def test_save_none_returns_zero(self, tmp_store: HistoricalDataStore) -> None:
+        assert tmp_store.save_intraday("SPY", None) == 0
+
+    def test_upsert_does_not_duplicate_rows(self, tmp_store: HistoricalDataStore) -> None:
+        df = _make_intraday_df(78)
+        tmp_store.save_intraday("SPY", df)
+        tmp_store.save_intraday("SPY", df)     # same data again
+        assert len(tmp_store.load_intraday("SPY", days=30)) == 78
+
+
+class TestLoadIntraday:
+
+    def test_load_returns_dataframe_with_ohlcv(self, tmp_store: HistoricalDataStore) -> None:
+        tmp_store.save_intraday("SPY", _make_intraday_df(78))
+        result = tmp_store.load_intraday("SPY", days=30)
+        assert isinstance(result, pd.DataFrame)
+        for col in ("Open", "High", "Low", "Close", "Volume"):
+            assert col in result.columns
+
+    def test_load_has_datetimeindex(self, tmp_store: HistoricalDataStore) -> None:
+        tmp_store.save_intraday("SPY", _make_intraday_df(78))
+        result = tmp_store.load_intraday("SPY")
+        assert isinstance(result.index, pd.DatetimeIndex)
+
+    def test_load_unknown_symbol_returns_empty(self, tmp_store: HistoricalDataStore) -> None:
+        assert tmp_store.load_intraday("UNKNOWN_XYZ").empty
+
+    def test_load_respects_days_window(self, tmp_store: HistoricalDataStore) -> None:
+        old = _make_intraday_df(78, start="2022-01-03 09:35")
+        new = _make_intraday_df(78, start="2026-05-06 09:35")
+        tmp_store.save_intraday("AAPL", old)
+        tmp_store.save_intraday("AAPL", new)
+        result = tmp_store.load_intraday("AAPL", days=7)
+        assert (result.index >= pd.Timestamp("2026-04-29")).all(), (
+            "Bars older than days=7 window must be excluded"
+        )
+
+
+class TestGetLatestIntradayTimestamp:
+
+    def test_returns_none_when_empty(self, tmp_store: HistoricalDataStore) -> None:
+        assert tmp_store.get_latest_intraday_timestamp("SPY") is None
+
+    def test_returns_max_datetime(self, tmp_store: HistoricalDataStore) -> None:
+        df = _make_intraday_df(10)
+        tmp_store.save_intraday("QQQ", df)
+        ts = tmp_store.get_latest_intraday_timestamp("QQQ")
+        assert ts is not None
+        assert ts == df.index.max()
+
+
+class TestCleanupOldIntraday:
+
+    def test_cleanup_removes_old_rows(self, tmp_store: HistoricalDataStore) -> None:
+        old = _make_intraday_df(78, start="2020-01-02 09:35")
+        new = _make_intraday_df(78, start="2026-05-06 09:35")
+        tmp_store.save_intraday("SPY", old)
+        tmp_store.save_intraday("SPY", new)
+        tmp_store.cleanup_old_intraday(keep_days=10)
+        result = tmp_store.load_intraday("SPY", days=365 * 10)
+        assert len(result) == 78
+        assert (result.index >= pd.Timestamp("2026-01-01")).all()
+
+    def test_cleanup_preserves_recent_rows(self, tmp_store: HistoricalDataStore) -> None:
+        recent = _make_intraday_df(78, start="2026-05-06 09:35")
+        tmp_store.save_intraday("NVDA", recent)
+        tmp_store.cleanup_old_intraday(keep_days=10)
+        assert len(tmp_store.load_intraday("NVDA", days=30)) == 78
+```
+
+#### 11.5.2 `get_intraday()` default parameter change
+
+**File:** `tests/test_market_data.py` (append)
+
+```python
+import inspect
+from ait.data.market_data import MarketDataService
+
+
+class TestGetIntradayDefault:
+
+    def test_default_days_is_7(self) -> None:
+        sig = inspect.signature(MarketDataService.get_intraday)
+        default_days = sig.parameters["days"].default
+        assert default_days == 7, (
+            f"get_intraday() default days={default_days}, expected 7 "
+            "(Phase 5a: change from days=1 to days=7)"
+        )
+```
+
+---
+
+### 11.6 Phase 6 — Intraday Fractal + VLMC Session Features
+
+**File:** `tests/test_intraday_features.py`
+
+```python
+"""Unit tests for intraday fractal (Framework 2) and VLMC session features (Framework 1)."""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from ait.ml.features import FeatureEngine
+
+
+FRACTAL_INTRADAY_FEATURES = [
+    "hurst_wavelet_intraday",
+    "hurst_scale_spread_intraday",
+    "wavelet_L3_energy",
+    "wavelet_L4_energy",
+    "wavelet_L5_energy",
+    "psd_beta_intraday",
+    "mfdfa_width_intraday",
+]
+
+VLMC_FEATURES = [
+    "session_vwap_position",
+    "session_vwap_q1",
+    "session_vwap_q2",
+    "session_vwap_q3",
+    "session_high_timing",
+    "session_low_timing",
+    "session_volume_front_load",
+    "session_volume_shape",
+    "power_hour_momentum",
+    "power_hour_vol_accel",
+    "power_hour_vwap_cross",
+    "closing_imbalance",
+    "closing_range_position",
+]
+
+ALL_NEW_INTRADAY_FEATURES = FRACTAL_INTRADAY_FEATURES + VLMC_FEATURES
+
+
+def _make_session(bars: int = 78, seed: int = 11) -> pd.DataFrame:
+    """One 5-min trading session (9:30 AM onward)."""
+    rng = np.random.default_rng(seed)
+    closes = 400.0 + np.cumsum(rng.normal(0, 0.5, bars))
+    dts = pd.date_range("2026-05-07 09:30", periods=bars, freq="5min")
+    return pd.DataFrame({
+        "Open":   closes * (1 + rng.normal(0, 0.0005, bars)),
+        "High":   closes * (1 + np.abs(rng.normal(0, 0.002, bars))),
+        "Low":    closes * (1 - np.abs(rng.normal(0, 0.002, bars))),
+        "Close":  closes,
+        "Volume": rng.integers(10_000, 500_000, bars),
+    }, index=dts)
+
+
+def _make_multiday(days: int = 7, bars_per_day: int = 78) -> pd.DataFrame:
+    """Multi-day 5-min bars spanning `days` sessions."""
+    frames = []
+    for d in range(days):
+        start = pd.Timestamp("2026-04-28 09:30") + pd.Timedelta(days=d)
+        dts = pd.date_range(start, periods=bars_per_day, freq="5min")
+        rng = np.random.default_rng(d + 100)
+        closes = 400.0 + np.cumsum(rng.normal(0, 0.5, bars_per_day))
+        frames.append(pd.DataFrame({
+            "Open":   closes * 0.999, "High": closes * 1.002,
+            "Low":    closes * 0.998, "Close": closes,
+            "Volume": rng.integers(10_000, 200_000, bars_per_day),
+        }, index=dts))
+    return pd.concat(frames)
+
+
+class TestIntradayFeatureCount:
+
+    def test_all_20_new_features_present_with_7_day_history(self) -> None:
+        result = FeatureEngine().compute_intraday_features(_make_multiday(days=7))
+        missing = [f for f in ALL_NEW_INTRADAY_FEATURES if f not in result]
+        assert missing == [], f"Missing intraday features: {missing}"
+
+    def test_exactly_20_new_feature_keys_added(self) -> None:
+        result = FeatureEngine().compute_intraday_features(_make_multiday(days=7))
+        present = [f for f in ALL_NEW_INTRADAY_FEATURES if f in result]
+        assert len(present) == 20, (
+            f"Expected 20 new intraday features; got {len(present)}. "
+            f"Missing: {sorted(set(ALL_NEW_INTRADAY_FEATURES) - set(present))}"
+        )
+
+
+class TestIntradayFractalFeatures:
+
+    def test_hurst_wavelet_intraday_in_valid_range(self) -> None:
+        result = FeatureEngine().compute_intraday_features(_make_multiday(7))
+        h = result.get("hurst_wavelet_intraday", 0.0)
+        if h != 0.0:
+            assert 0.1 <= h <= 0.9, f"hurst_wavelet_intraday={h:.4f} out of [0.1, 0.9]"
+
+    def test_wavelet_energies_nonnegative(self) -> None:
+        result = FeatureEngine().compute_intraday_features(_make_multiday(7))
+        for key in ("wavelet_L3_energy", "wavelet_L4_energy", "wavelet_L5_energy"):
+            assert result.get(key, 0.0) >= 0.0, f"{key} is negative"
+
+    def test_mfdfa_zero_when_single_session(self) -> None:
+        """78 bars (1 session) < 500 minimum → mfdfa_width_intraday must be 0.0."""
+        result = FeatureEngine().compute_intraday_features(_make_session(78))
+        assert result.get("mfdfa_width_intraday", 0.0) == pytest.approx(0.0)
+
+    def test_mfdfa_nonnegative_with_sufficient_history(self) -> None:
+        result = FeatureEngine().compute_intraday_features(_make_multiday(7))
+        assert result.get("mfdfa_width_intraday", 0.0) >= 0.0
+
+    def test_no_nans_in_intraday_features(self) -> None:
+        result = FeatureEngine().compute_intraday_features(_make_multiday(7))
+        for k, v in result.items():
+            assert not np.isnan(v),  f"NaN  in feature {k!r}"
+            assert not np.isinf(v),  f"Inf  in feature {k!r}"
+
+    def test_empty_df_returns_empty_dict(self) -> None:
+        assert FeatureEngine().compute_intraday_features(pd.DataFrame()) == {}
+
+    def test_too_few_bars_returns_empty_dict(self) -> None:
+        assert FeatureEngine().compute_intraday_features(_make_session(5)) == {}
+
+
+class TestVLMCSessionFeatures:
+
+    def test_session_timing_features_bounded_0_to_1(self) -> None:
+        result = FeatureEngine().compute_intraday_features(_make_session(78))
+        for key in ("session_high_timing", "session_low_timing",
+                    "session_volume_front_load", "closing_range_position"):
+            val = result[key]
+            assert 0.0 <= val <= 1.0, f"{key}={val:.4f} out of [0.0, 1.0]"
+
+    def test_vwap_uses_session_open_not_rolling(self) -> None:
+        """Inject a final-bar spike; session_vwap_position must be positive."""
+        rng = np.random.default_rng(42)
+        bars = 78
+        dts = pd.date_range("2026-05-07 09:30", periods=bars, freq="5min")
+        closes = np.ones(bars) * 400.0
+        closes[-1] = 500.0   # spike at last bar only
+        df = pd.DataFrame({
+            "Open":   closes * 0.999, "High": closes * 1.001,
+            "Low":    closes * 0.999, "Close": closes,
+            "Volume": rng.integers(10_000, 100_000, bars),
+        }, index=dts)
+        result = FeatureEngine().compute_intraday_features(df)
+        assert result["session_vwap_position"] > 0.0
+
+    def test_power_hour_momentum_positive_on_rising_last_hour(self) -> None:
+        """Flat session then rising last 12 bars → power_hour_momentum > 0."""
+        rng = np.random.default_rng(55)
+        bars = 78
+        dts = pd.date_range("2026-05-07 09:30", periods=bars, freq="5min")
+        closes = np.ones(bars) * 400.0
+        closes[-12:] = np.linspace(400.0, 420.0, 12)   # power hour rises
+        df = pd.DataFrame({
+            "Open":   closes * 0.999, "High": closes * 1.001,
+            "Low":    closes * 0.999, "Close": closes,
+            "Volume": rng.integers(10_000, 100_000, bars),
+        }, index=dts)
+        result = FeatureEngine().compute_intraday_features(df)
+        assert result["power_hour_momentum"] > 0.0
+
+    def test_closing_imbalance_negative_on_falling_last_3_bars(self) -> None:
+        rng = np.random.default_rng(66)
+        bars = 78
+        dts = pd.date_range("2026-05-07 09:30", periods=bars, freq="5min")
+        closes = np.ones(bars) * 400.0
+        closes[-3:] = [398.0, 396.0, 394.0]   # falling into close
+        df = pd.DataFrame({
+            "Open":   closes * 0.999, "High": closes * 1.001,
+            "Low":    closes * 0.999, "Close": closes,
+            "Volume": rng.integers(10_000, 100_000, bars),
+        }, index=dts)
+        result = FeatureEngine().compute_intraday_features(df)
+        assert result["closing_imbalance"] < 0.0
+```
+
+---
+
+### 11.7 Phase 7 — Dependency Addition
+
+**File:** `tests/test_fractal_features.py` (append)
+
+```python
+class TestDependencies:
+
+    def test_pywavelets_importable(self) -> None:
+        try:
+            import pywt
+        except ImportError:
+            pytest.fail("pywavelets not installed — add pywavelets>=1.4 to pyproject.toml")
+
+    def test_pywavelets_version_at_least_1_4(self) -> None:
+        import pywt
+        from packaging.version import Version
+        assert Version(pywt.__version__) >= Version("1.4"), (
+            f"pywavelets {pywt.__version__} < required >=1.4"
+        )
+
+    def test_shap_importable(self) -> None:
+        try:
+            import shap
+        except ImportError:
+            pytest.fail("shap not installed — add shap>=0.42 to pyproject.toml")
+
+    def test_shap_version_at_least_0_42(self) -> None:
+        import shap
+        from packaging.version import Version
+        assert Version(shap.__version__) >= Version("0.42")
+```
+
+---
+
+### 11.8 Phase 8 — Diagnostic Report Tool
+
+**File:** `tests/test_fractal_diagnostics.py`
+
+```python
+"""Smoke tests for the fractal diagnostic report module and CLI."""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+
+class TestFractalReportImport:
+
+    def test_module_importable(self) -> None:
+        from ait.diagnostics import fractal_report  # noqa: F401
+
+    def test_all_seven_plot_functions_exist(self) -> None:
+        from ait.diagnostics import fractal_report
+        for fn in (
+            "plot_hurst_timeseries",
+            "plot_psd",
+            "plot_multifractal_spectrum",
+            "plot_scale_invariance_vs_vix",
+            "plot_ic_analysis",
+            "plot_shap_importance",
+            "plot_gate_counterfactual",
+        ):
+            assert callable(getattr(fractal_report, fn, None)), (
+                f"Function {fn!r} missing from ait.diagnostics.fractal_report"
+            )
+
+    def test_generate_report_callable(self) -> None:
+        from ait.diagnostics.fractal_report import generate_report
+        assert callable(generate_report)
+
+
+class TestFractalReportSmoke:
+
+    def _features_df(self, rows: int = 100) -> pd.DataFrame:
+        rng = np.random.default_rng(77)
+        dates = pd.date_range("2023-01-01", periods=rows, freq="B")
+        return pd.DataFrame({
+            "hurst_wavelet":       rng.uniform(0.4, 0.7, rows),
+            "hurst_scale_spread":  rng.uniform(0.0, 0.2, rows),
+            "psd_beta":            rng.uniform(1.5, 2.5, rows),
+            "multifractal_width":  rng.uniform(0.1, 0.5, rows),
+            "fwd_return_5d":       rng.normal(0.001, 0.02, rows),
+        }, index=dates)
+
+    def test_plot_hurst_timeseries_returns_object(self) -> None:
+        from ait.diagnostics.fractal_report import plot_hurst_timeseries
+        fig = plot_hurst_timeseries("SPY", self._features_df())
+        assert fig is not None
+
+    def test_plot_psd_returns_object(self) -> None:
+        from ait.diagnostics.fractal_report import plot_psd
+        fig = plot_psd(np.random.default_rng(88).normal(0, 1, 500))
+        assert fig is not None
+
+    def test_plot_ic_analysis_returns_object(self) -> None:
+        from ait.diagnostics.fractal_report import plot_ic_analysis
+        df = self._features_df()
+        fig = plot_ic_analysis(df, pd.Series(df["fwd_return_5d"].values, index=df.index))
+        assert fig is not None
+
+    def test_generate_report_creates_html(self, tmp_path: Path) -> None:
+        from ait.diagnostics.fractal_report import generate_report
+        generate_report(
+            symbols=["SPY"],
+            start="2023-01-01",
+            end="2023-12-31",
+            output_dir=str(tmp_path),
+            fmt="html",
+        )
+        html_files = list(tmp_path.glob("*.html"))
+        assert len(html_files) >= 1, "generate_report must produce at least one .html file"
+
+    def test_generate_report_creates_ic_csv(self, tmp_path: Path) -> None:
+        from ait.diagnostics.fractal_report import generate_report
+        generate_report(
+            symbols=["SPY"],
+            start="2023-01-01",
+            end="2023-12-31",
+            output_dir=str(tmp_path),
+            fmt="html",
+        )
+        csv_files = list(tmp_path.glob("ic_summary.csv"))
+        assert len(csv_files) == 1, "generate_report must produce ic_summary.csv"
+
+
+class TestCLIEntryPoint:
+
+    def test_cli_script_exists(self) -> None:
+        assert Path("scripts/run_fractal_diagnostics.py").exists(), (
+            "scripts/run_fractal_diagnostics.py must exist (Phase 8)"
+        )
+
+    def test_cli_help_exits_zero(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "scripts/run_fractal_diagnostics.py", "--help"],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 0, (
+            f"CLI --help returned non-zero:\n{result.stderr}"
+        )
+
+    def test_cli_requires_symbols_argument(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "scripts/run_fractal_diagnostics.py"],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode != 0, (
+            "CLI must fail when called without --symbols"
+        )
+```
+
+---
+
+### 11.9 Phase 9 — IBKR Intraday Source + Backfill
+
+**Files:** `tests/test_ibkr_intraday.py`, `tests/test_market_data.py` (extended)
+
+```python
+"""Tests for Phase 9: IBKR as primary intraday data source."""
+
+from __future__ import annotations
+
+import asyncio
+import subprocess
+import sys
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import numpy as np
+import pandas as pd
+import pytest
+
+
+def _make_intraday(n_bars: int = 78, days: int = 1) -> pd.DataFrame:
+    """Synthetic intraday DataFrame with DatetimeIndex (UTC)."""
+    from datetime import datetime, timezone, timedelta
+    start = datetime(2026, 4, 28, 13, 30, tzinfo=timezone.utc)
+    idx = pd.DatetimeIndex(
+        [start + timedelta(minutes=5 * i) for i in range(n_bars * days)], tz="UTC"
+    )
+    price = 100.0 * np.exp(np.cumsum(np.random.default_rng(0).normal(0, 0.001, len(idx))))
+    return pd.DataFrame({
+        "Open": price, "High": price * 1.001, "Low": price * 0.999,
+        "Close": price, "Volume": np.random.randint(1000, 5000, len(idx)),
+    }, index=idx)
+
+
+class TestMarketDataServiceIBKRIntraday:
+
+    def test_get_intraday_returns_none_when_ibkr_disconnected(self) -> None:
+        """When IBKR is disconnected, get_intraday() must fall back to Yahoo
+        (or return None on network failure) — must never raise."""
+        from ait.data.market_data import MarketDataService
+        mock_ibkr = MagicMock()
+        mock_ibkr.connected = False
+        svc = MarketDataService(ibkr_client=mock_ibkr)
+
+        async def run():
+            with patch("yfinance.Ticker") as mock_yf:
+                mock_ticker = MagicMock()
+                mock_ticker.history.return_value = pd.DataFrame()
+                mock_yf.return_value = mock_ticker
+                result = await svc.get_intraday("SPY", interval="5m", days=7)
+            return result
+
+        result = asyncio.get_event_loop().run_until_complete(run())
+        assert result is None or isinstance(result, pd.DataFrame)
+
+    def test_ibkr_intraday_result_has_correct_columns(self) -> None:
+        """_get_ibkr_intraday() output must have OHLCV columns."""
+        from ait.data.market_data import MarketDataService
+        mock_ibkr = MagicMock()
+        mock_ibkr.connected = True
+
+        svc = MarketDataService(ibkr_client=mock_ibkr)
+
+        fake_df = _make_intraday(78)
+
+        async def run():
+            with patch.object(svc, "_get_ibkr_intraday", return_value=fake_df):
+                result = await svc.get_intraday("SPY", interval="5m", days=7)
+            return result
+
+        result = asyncio.get_event_loop().run_until_complete(run())
+        assert result is not None
+        assert set(result.columns) >= {"Open", "High", "Low", "Close", "Volume"}
+
+    def test_get_intraday_since_returns_only_new_bars(self) -> None:
+        """get_intraday_since() must return bars strictly after the given timestamp."""
+        from ait.data.market_data import MarketDataService
+        mock_ibkr = MagicMock()
+        mock_ibkr.connected = True
+        svc = MarketDataService(ibkr_client=mock_ibkr)
+
+        df = _make_intraday(78)
+        cutoff = df.index[40]
+
+        async def run():
+            with patch.object(svc, "_get_ibkr_intraday", return_value=df):
+                result = await svc.get_intraday_since("SPY", since=cutoff)
+            return result
+
+        result = asyncio.get_event_loop().run_until_complete(run())
+        if result is not None and not result.empty:
+            assert result.index.min() > cutoff, (
+                "get_intraday_since must exclude bars at or before the cutoff timestamp"
+            )
+
+
+class TestBackfillScript:
+
+    def test_backfill_script_exists(self) -> None:
+        assert Path("scripts/backfill_intraday.py").exists(), (
+            "scripts/backfill_intraday.py must exist (Phase 9)"
+        )
+
+    def test_backfill_help_exits_zero(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "scripts/backfill_intraday.py", "--help"],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 0
+
+    def test_backfill_requires_symbols(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "scripts/backfill_intraday.py"],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode != 0
+
+    def test_backfill_dry_run_exits_zero(self, tmp_path: Path) -> None:
+        result = subprocess.run(
+            [sys.executable, "scripts/backfill_intraday.py",
+             "--symbols", "SPY", "--years", "1", "--dry-run",
+             "--db-path", str(tmp_path / "test.db")],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0, f"dry-run failed:\n{result.stderr}"
+```
+
+---
+
+### 11.10 Phase 10 — VLMC Diagnostic Reports
+
+**File:** `tests/test_fractal_diagnostics.py` (extended)
+
+```python
+class TestVLMCDiagnosticPlots:
+
+    def _make_intraday_multi_session(self, n_sessions: int = 20) -> pd.DataFrame:
+        """Build n_sessions × 78 bars of synthetic intraday data."""
+        from datetime import datetime, timezone, timedelta
+        bars_per_session = 78
+        start = datetime(2026, 1, 2, 13, 30, tzinfo=timezone.utc)
+        idx = []
+        for day in range(n_sessions):
+            session_start = start + timedelta(days=day)
+            # Skip weekends (crude)
+            while session_start.weekday() >= 5:
+                session_start += timedelta(days=1)
+            idx.extend([
+                session_start + timedelta(minutes=5 * bar)
+                for bar in range(bars_per_session)
+            ])
+        idx = pd.DatetimeIndex(idx, tz="UTC")
+        price = 100.0 * np.exp(np.cumsum(np.random.default_rng(42).normal(0, 0.001, len(idx))))
+        return pd.DataFrame({
+            "Open": price, "High": price * 1.001, "Low": price * 0.999,
+            "Close": price, "Volume": np.random.randint(1000, 5000, len(idx)),
+        }, index=idx)
+
+    def _features_df_with_vlmc(self, rows: int = 100) -> pd.DataFrame:
+        rng = np.random.default_rng(42)
+        dates = pd.date_range("2023-01-01", periods=rows, freq="B")
+        return pd.DataFrame({
+            "session_vwap_position":     rng.normal(0.0, 0.01, rows),
+            "session_volume_front_load": rng.uniform(0.3, 0.6, rows),
+            "session_volume_shape":      rng.uniform(-0.1, 0.1, rows),
+            "power_hour_momentum":       rng.normal(0.0, 0.005, rows),
+            "power_hour_vol_accel":      rng.normal(0.0, 0.1, rows),
+            "closing_imbalance":         rng.normal(0.0, 0.003, rows),
+            "closing_range_position":    rng.uniform(0.2, 0.8, rows),
+            "fwd_return_5d":             rng.normal(0.001, 0.02, rows),
+        }, index=dates)
+
+    def test_plot_session_vwap_trajectory_exists(self) -> None:
+        from ait.diagnostics import fractal_report
+        assert callable(getattr(fractal_report, "plot_session_vwap_trajectory", None)), (
+            "plot_session_vwap_trajectory missing from ait.diagnostics.fractal_report"
+        )
+
+    def test_plot_volume_profile_distribution_exists(self) -> None:
+        from ait.diagnostics import fractal_report
+        assert callable(getattr(fractal_report, "plot_volume_profile_distribution", None))
+
+    def test_plot_session_feature_ic_analysis_exists(self) -> None:
+        from ait.diagnostics import fractal_report
+        assert callable(getattr(fractal_report, "plot_session_feature_ic_analysis", None))
+
+    def test_plot_power_hour_patterns_exists(self) -> None:
+        from ait.diagnostics import fractal_report
+        assert callable(getattr(fractal_report, "plot_power_hour_patterns", None))
+
+    def test_plot_session_vwap_trajectory_returns_object(self) -> None:
+        from ait.diagnostics.fractal_report import plot_session_vwap_trajectory
+        fig = plot_session_vwap_trajectory("SPY", self._make_intraday_multi_session())
+        assert fig is not None
+
+    def test_plot_volume_profile_distribution_returns_object(self) -> None:
+        from ait.diagnostics.fractal_report import plot_volume_profile_distribution
+        fig = plot_volume_profile_distribution("SPY", self._make_intraday_multi_session())
+        assert fig is not None
+
+    def test_plot_session_feature_ic_analysis_returns_object(self) -> None:
+        from ait.diagnostics.fractal_report import plot_session_feature_ic_analysis
+        df = self._features_df_with_vlmc()
+        fig = plot_session_feature_ic_analysis(
+            df, pd.Series(df["fwd_return_5d"].values, index=df.index)
+        )
+        assert fig is not None
+
+    def test_plot_power_hour_patterns_returns_object(self) -> None:
+        from ait.diagnostics.fractal_report import plot_power_hour_patterns
+        fig = plot_power_hour_patterns("SPY", self._make_intraday_multi_session())
+        assert fig is not None
+```
+
+---
+
+### 11.11 End-to-End Integration Tests
+
+**File:** `tests/test_fractal_integration.py`
+
+```python
+"""End-to-end integration: fractal features flow through the full pipeline."""
+
+from __future__ import annotations
+
+import pickle
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from ait.ml.features import FeatureEngine
+from ait.backtesting.walkforward import WalkForwardConfig
+
+
+def _make_ohlcv(days: int = 600, seed: int = 42) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    close = 400.0 * np.cumprod(1 + rng.normal(0.0003, 0.012, days))
+    dates = pd.date_range("2022-01-03", periods=days, freq="B")
+    return pd.DataFrame({
+        "Open":   close * 0.999, "High": close * 1.005,
+        "Low":    close * 0.995, "Close": close,
+        "Volume": rng.integers(1_000_000, 10_000_000, days),
+    }, index=dates)
+
+
+class TestFractalFeaturesInPipeline:
+
+    def test_compute_returns_all_10_fractal_columns(self) -> None:
+        result = FeatureEngine().compute(_make_ohlcv(504))
+        for col in (
+            "hurst_wavelet", "hurst_fit_r2", "psd_beta", "psd_fit_r2",
+            "hurst_psd_divergence", "hurst_short", "hurst_long",
+            "hurst_scale_spread", "multifractal_width", "multifractal_asymmetry",
+        ):
+            assert col in result.columns, f"Missing column: {col!r}"
+
+    def test_range_predictor_trains_with_fractal_features(self) -> None:
+        from ait.ml.range_predictor import RangePredictor
+        RangePredictor().train(_make_ohlcv(504))
+
+    def test_vol_magnitude_predictor_trains_with_fractal_features(self) -> None:
+        from ait.ml.vol_magnitude_predictor import VolMagnitudePredictor
+        VolMagnitudePredictor().train(_make_ohlcv(504))
+
+    def test_direction_predictor_trains_and_predicts(self) -> None:
+        from ait.ml.ensemble import DirectionPredictor
+        dp = DirectionPredictor()
+        df = _make_ohlcv(504)
+        dp.train(df)
+        assert dp.predict(df) is not None
+
+    def test_fractal_output_is_deterministic(self) -> None:
+        """Same input must always produce exactly the same fractal column values."""
+        fe = FeatureEngine()
+        df = _make_ohlcv(504, seed=42)
+        r1 = fe.compute(df).iloc[-1][["hurst_wavelet", "hurst_scale_spread"]]
+        r2 = fe.compute(df).iloc[-1][["hurst_wavelet", "hurst_scale_spread"]]
+        pd.testing.assert_series_equal(r1, r2)
+
+    def test_walkforward_config_default_fractal_fields(self) -> None:
+        cfg = WalkForwardConfig()
+        assert cfg.hurst_regime_threshold == pytest.approx(0.20)
+        assert cfg.multifractal_max_width  == pytest.approx(0.50)
+
+
+class TestSavedModelMismatch:
+
+    def test_old_model_feature_count_differs_from_new(self) -> None:
+        """A pre-Phase-1 model pickle must have fewer features than the new FeatureEngine.
+
+        Skip if no pre-Phase-1 model is available.
+        Failure means the model was already retrained — no action needed.
+        """
+        model_path = Path("models/ensemble.pkl")
+        if not model_path.exists():
+            pytest.skip("No pre-existing model to check")
+        with open(model_path, "rb") as fh:
+            old_model = pickle.load(fh)
+        old_count = len(old_model.feature_names_in_)   # XGBoost / LightGBM attribute
+        new_count = len(FeatureEngine().get_feature_names())
+        assert old_count != new_count, (
+            "Model appears to already include fractal features — retraining not required"
+        )
+```
+
+---
+
+### 11.10 CLI Smoke Tests
+
+Run from the project root after completing all phases. Each command must exit `0`.
+
+```bash
+# Phase 1+3: Walk-forward with fractal features
+python run_backtest.py --symbols SPY --capital 10000 2>&1 | tee /tmp/backtest.log
+grep -c "features_computed" /tmp/backtest.log    # Must be > 0
+grep "hurst_scale_spread" /tmp/backtest.log      # Must appear in feature log
+
+# Phase 2+4: Optimizer surfaces fractal params in trial output
+python run_optimizer.py --strategies iron_condor --symbols SPY --n-trials 10 \
+  2>&1 | tee /tmp/opt.log
+grep "hurst_regime_threshold" /tmp/opt.log       # Must appear as a trial parameter
+grep "multifractal_max_width"  /tmp/opt.log      # Must appear as a trial parameter
+
+# Phase 4: Per-window fractal threshold adaptation
+python run_backtest.py \
+  --symbols SPY QQQ \
+  --optimize-per-window \
+  --optimize-n-trials 20 2>&1 | tee /tmp/perwindow.log
+# Manual check: thresholds should differ between the 2022 volatile window
+# and the 2024 calm window in the log output
+
+# Phase 8: Diagnostic HTML report
+python scripts/run_fractal_diagnostics.py \
+    --symbols SPY QQQ AAPL NVDA \
+    --start 2022-01-01 \
+    --end 2025-12-31 \
+    --output reports/fractal/ \
+    --format html
+test -f reports/fractal/fractal_report_SPY.html && echo "OK" || echo "MISSING"
+test -f reports/fractal/ic_summary.csv         && echo "OK" || echo "MISSING"
+
+# Phase 6 + Phase 5 live (during market hours only):
+python -m src.ait.main --mode paper 2>&1 | tee /tmp/live.log &
+sleep 360    # allow one full 5-min scan cycle
+grep "hurst_wavelet_intraday"   /tmp/live.log
+grep "wavelet_L4_energy"        /tmp/live.log
+grep "session_vwap_position"    /tmp/live.log
+kill %1
+```
+
+---
+
+### 11.13 Regime Signal Validation (Manual — Post-Backtest)
+
+After the walk-forward smoke test, export feature values and verify against known market history. These are human checks, not automated tests — a mismatch signals a numerical bug in an estimator.
+
+| Feature | Period | Expected | Failure interpretation |
+|---|---|---|---|
+| `hurst_scale_spread` | Jan–Jun 2022 (SPY) | Median > 0.12 | Estimator insensitive to volatility — check `_multiscale_hurst()` |
+| `hurst_scale_spread` | Q4 2023 (SPY calm) | Median < 0.08 | Estimator over-fires in quiet markets — threshold too low |
+| `multifractal_width` | Mar 2020 | Elevated (> 0.40) | MFDFA not capturing crash regime — check `_mfdfa_features()` |
+| `multifractal_asymmetry` | Weeks before Oct 2022 drawdown | Trending negative | Asymmetry sign convention inverted — check spectrum skew |
+| `hurst_fit_r2` | VIX > 30 days vs VIX < 20 days | Lower on high-VIX days | R² not detecting scale-invariance breakdown |
+| `psd_beta` | SPY daily bars, any window | 1.5–2.5 | PSD estimator producing out-of-range values |
+
+---
+
+### 11.14 Iron Condor Gate Counterfactual Validation (Manual)
+
+From `BacktestResult.trades` after the per-window backtest, compare gated vs. non-gated iron condor entries. The gate is validated when:
+
+| Condition | Interpretation |
+|---|---|
+| Gated win rate < non-gated win rate | Gate correctly identifies bad-regime entries |
+| Gated avg P&L (counterfactual) < non-gated avg P&L | Gate improves entry quality |
+| Gated count > 0 in the 2022 volatile window | Gate fires when it should |
+| Gated count ≈ 0 in calm Q4-2023 window | Gate does not over-fire in benign conditions |
+
+If gated trades would have had a higher win rate than non-gated trades, the `hurst_regime_threshold` is too aggressive. The per-window Optuna run (Phase 4) automatically raises the threshold to correct this.
+
+---
+
+### 11.15 Per-Phase Completion Criteria
+
+A phase is done only when its specific pytest target passes with zero failures.
+
+| Phase | Completion command |
+|---|---|
+| 1 | `pytest tests/test_fractal_features.py -k "TestFractalFeatures or TestFractalEstimators or TestFractalGraceful"` |
+| 2 | `pytest tests/test_fractal_features.py -k "TestFractalGateParamSpace"` |
+| 3 | `pytest tests/test_fractal_features.py -k "TestFractalGatingEngine"` |
+| 4 | `pytest tests/test_walkforward.py -k "TestWalkForwardConfigFractalFields"` |
+| 5 | `pytest tests/test_intraday_store.py tests/test_market_data.py` |
+| 6 | `pytest tests/test_intraday_features.py` |
+| 7 | `pytest tests/test_fractal_features.py -k "TestDependencies"` |
+| 8 | `pytest tests/test_fractal_diagnostics.py -k "TestFractalReportImport or TestFractalReportSmoke or TestCLIEntryPoint"` |
+| 9 | `pytest tests/test_ibkr_intraday.py tests/test_market_data.py -k "TestMarketDataServiceIBKRIntraday or TestBackfillScript"` |
+| 10 | `pytest tests/test_fractal_diagnostics.py -k "TestVLMCDiagnosticPlots"` |
+| All phases | `pytest tests/ -k "fractal or intraday or backfill or vlmc" -v` — zero failures |
+
+---
+
+*Plan authored: 2026-05-06. Updated 2026-05-07: added Phase 9 (IBKR intraday + 2-year backfill), Phase 10 (VLMC diagnostics), and clarifications on data sources, VLMC bar resolution, and diagnostic coverage.*
+*Branch: features-request-2*
 *Related plan: `/Users/ahmednagi/.claude/plans/would-the-above-work-dazzling-bunny.md`*

@@ -105,9 +105,13 @@ class RangePredictor:
         df: pd.DataFrame,
         symbol: str = "",
         market_context: dict | None = None,
+        intraday_store=None,
     ) -> dict[str, float]:
         """Train range model on historical data."""
-        features = self._feature_engine.compute(df, market_context=market_context)
+        features = self._feature_engine.compute(
+            df, market_context=market_context,
+            intraday_store=intraday_store, symbol=symbol,
+        )
         if len(features) < 100:  # Need at least 100 rows for binary classification
             log.warning("range_insufficient_data", rows=len(features), required=100)
             return {}
@@ -274,6 +278,7 @@ class RangePredictor:
         symbol: str = "",
         market_context: dict | None = None,
         live_signals: dict | None = None,
+        intraday_store=None,
     ) -> RangePrediction | None:
         """Predict P(stays in ±threshold% over horizon_days)."""
         sym_data = None
@@ -305,6 +310,7 @@ class RangePredictor:
 
         features = self._feature_engine.compute(
             df, market_context=market_context, live_signals=live_signals,
+            intraday_store=intraday_store, symbol=symbol,
         )
         if features.empty:
             return None
