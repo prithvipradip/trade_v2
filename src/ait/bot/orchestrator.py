@@ -711,7 +711,9 @@ class TradingOrchestrator:
             final_confidence = max(0, min(1, final_confidence + sentiment_adj))
 
         # Multi-timeframe analysis: boost/penalize confidence based on alignment
-        mtf = self._mtf_analyzer.analyze(hist, intraday)
+        # Use intraday_full (full SQLite history) not the incremental fetch — the
+        # MTF analyser needs ≥20 bars and the incremental fetch is often just a few.
+        mtf = self._mtf_analyzer.analyze(hist, intraday_full)
         final_confidence = max(0, min(1, final_confidence + mtf.confidence_boost))
 
         # Pre-compute daily features once — used for fractal penalty and meta-labeler below.
