@@ -65,7 +65,7 @@ class TestFeatureEngineCompute:
         for col in ["rsi_14", "rsi_7", "bb_position", "macd_hist", "atr_pct"]:
             assert col in result.columns, f"Base feature {col} missing"
 
-    def test_compute_without_intraday_returns_57_base_columns(self) -> None:
+    def test_compute_without_intraday_excludes_vlmc_columns(self) -> None:
         df = _make_ohlcv()
         fe = FeatureEngine()
         result = fe.compute(df)
@@ -77,8 +77,9 @@ class TestFeatureEngineCompute:
     def test_empty_intraday_store_graceful_fallback(self) -> None:
         """T3-6: empty intraday store → base features only, no exception."""
         import tempfile
-        from ait.data.historical import HistoricalDataStore
         from pathlib import Path
+
+        from ait.data.historical import HistoricalDataStore
 
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "test.db"
@@ -95,33 +96,33 @@ class TestEnsemblePredictorFeatureNames:
     """T3-2: predictor._feature_names includes VLMC names after training with intraday data."""
 
     def test_predictor_without_intraday_has_no_vlmc_features(self) -> None:
-        from ait.ml.ensemble import DirectionPredictor
         from ait.config.settings import MLConfig
+        from ait.ml.ensemble import DirectionPredictor
 
         df = _make_ohlcv(days=200)
         predictor = DirectionPredictor(MLConfig())
         predictor.train(df, symbol="QQQ")
-        if predictor.is_trained:
-            vlmc_in_predictor = [
-                f for f in predictor._feature_names
-                if f in FeatureEngine.VLMC_FEATURE_NAMES
-            ]
-            # Without intraday_store, no VLMC features should be selected
-            assert len(vlmc_in_predictor) == 0, \
-                f"Unexpected VLMC features in predictor: {vlmc_in_predictor}"
+        assert predictor.is_trained, "Expected predictor to train on deterministic synthetic data"
+        vlmc_in_predictor = [
+            f for f in predictor._feature_names
+            if f in FeatureEngine.VLMC_FEATURE_NAMES
+        ]
+        # Without intraday_store, no VLMC features should be selected
+        assert len(vlmc_in_predictor) == 0, \
+            f"Unexpected VLMC features in predictor: {vlmc_in_predictor}"
 
 
 class TestNoFeatureCountMismatch:
     """T3-4: predict() with and without intraday_store doesn't raise KeyError."""
 
     def test_predict_without_intraday_does_not_raise(self) -> None:
-        from ait.ml.ensemble import DirectionPredictor
         from ait.config.settings import MLConfig
+        from ait.ml.ensemble import DirectionPredictor
 
         df = _make_ohlcv(days=200)
         predictor = DirectionPredictor(MLConfig())
         predictor.train(df, symbol="QQQ")
-        if predictor.is_trained:
-            result = predictor.predict(df.tail(100))
-            # Must not raise — result can be None for insufficient confidence
-            # but should not be an exception
+        assert predictor.is_trained, "Expected predictor to train on deterministic synthetic data"
+        predictor.predict(df.tail(100))
+        # Must not raise — result can be None for insufficient confidence
+        # but should not be an exception

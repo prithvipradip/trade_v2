@@ -56,7 +56,8 @@ class TestFeatureEngineVLMCConstant:
         names = FeatureEngine.VLMC_FEATURE_NAMES
         # These must be present — they are the original 6 intraday features
         for expected in ["intraday_vwap_position", "intraday_rsi",
-                         "intraday_momentum_1h", "intraday_atr_pct"]:
+                         "intraday_momentum_1h", "intraday_atr_pct",
+                         "intraday_vol_ratio", "intraday_range_compression"]:
             assert expected in names, f"{expected} missing from VLMC_FEATURE_NAMES"
 
     def test_session_structure_features_in_vlmc_list(self) -> None:
@@ -119,7 +120,7 @@ class TestSliceIntradayUpTo:
 
 
 class TestHurstWaveletShortSession:
-    """T2-6: hurst_wavelet_intraday returns 0.0 for very short sessions."""
+    """T2-6: hurst_wavelet_intraday falls back to 0.5 for very short sessions."""
 
     def test_short_session_returns_default(self) -> None:
         session_date = date(2024, 2, 5)
@@ -129,7 +130,8 @@ class TestHurstWaveletShortSession:
         if not hasattr(fe, "_hurst_wavelet"):
             pytest.skip("FeatureEngine._hurst_wavelet is unavailable")
         result, _ = fe._hurst_wavelet(short_session["Close"].to_numpy())
-        assert result == pytest.approx(0.0, abs=0.01) or np.isfinite(result)
+        assert result == pytest.approx(0.5, abs=0.01)
+        assert np.isfinite(result)
 
 
 class TestComputeBaseFeatures:
