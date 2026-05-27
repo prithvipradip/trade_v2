@@ -303,6 +303,7 @@ class StrategyOptimizer:
             features_cache=self._features_cache,
             symbol=self._symbol or symbol,
             range_predictor=self._range_predictor,
+            intraday_store=self._intraday_store,
             **bt_kwargs,
         )
         return bt.run()

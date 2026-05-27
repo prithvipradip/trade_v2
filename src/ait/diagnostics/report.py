@@ -54,9 +54,10 @@ def generate_report(
 ) -> None:
     """Generate fractal + VLMC diagnostic report for each symbol.
 
-    Fetches daily data via Yahoo Finance, computes fractal features,
-    loads intraday data from SQLite for VLMC plots, and writes one HTML
-    file per symbol plus ic_summary.csv.
+    Fetches daily data via the IB SQLite store (``load_daily_ohlcv``), falling
+    back to Yahoo Finance when fewer than 50 trading days are available in the
+    store.  Computes fractal features, loads intraday data from SQLite for VLMC
+    plots, and writes one HTML file per symbol plus ic_summary.csv.
 
     Args:
         symbols:    List of ticker symbols (e.g., ["SPY", "QQQ"]).
