@@ -537,13 +537,19 @@ def _section_d_ic_decay(args: argparse.Namespace, out: Path) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def _fetch_daily_data(args: argparse.Namespace) -> "dict[str, pd.DataFrame]":
-    """Load daily OHLCV once (IB store first, Yahoo fallback) so E & F share identical date ranges."""
-    from ait.data.market_data import load_daily_ohlcv
+    """Load daily OHLCV once (test_intraday_prices table) so E & F share identical date ranges.
 
+    Uses HistoricalDataStore directly with TABLE_PREFIX so the walk-forward receives the full
+    backfilled history (test_intraday_prices), not the shorter production intraday_prices table.
+    fetch_days covers train_days + test_days + buffer to support long training windows.
+    """
+    from ait.data.historical import HistoricalDataStore
+
+    fetch_days = max(int(args.years * 366) + 30, args.train_days + args.test_days + 100)
+    store = HistoricalDataStore(db_path=Path(args.db_path), table_prefix=TABLE_PREFIX)
     ticker_data: dict[str, pd.DataFrame] = {}
     for sym in args.symbols:
-        df = load_daily_ohlcv(sym, days=int(args.years * 366) + 30,
-                               db_path=Path(args.db_path))
+        df = store.resample_to_daily(sym, days=fetch_days)
         if not df.empty:
             ticker_data[sym] = df
     return ticker_data
