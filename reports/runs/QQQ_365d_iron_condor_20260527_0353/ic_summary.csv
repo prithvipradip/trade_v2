@@ -1,0 +1,6 @@
+symbol,feature,feature_type,ic,p_value,n_obs
+QQQ,hurst_wavelet,fractal,0.08733266130095145,0.09526694839369972,366
+QQQ,hurst_scale_spread,fractal,0.0019960382807176313,0.9696431324626122,366
+QQQ,psd_beta,fractal,0.09997350468196131,0.0560234694021808,366
+QQQ,multifractal_width,fractal,0.0,,366
+QQQ,multifractal_asymmetry,fractal,0.0,,366
