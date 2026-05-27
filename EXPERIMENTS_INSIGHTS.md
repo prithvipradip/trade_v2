@@ -639,24 +639,26 @@ Per-window detail:
 
 ## Open Questions
 
-These are unresolved questions that future experiments should address:
+These are unresolved questions that future experiments should address.
 
 - **Q1:** Does the current search space (9D structural params for iron_condor) have any remaining degenerate dimensions? Are there structural params that Optuna can exploit to produce near-zero-trade solutions?
 - **Q2:** Are the experiment results specific to QQQ, or would SPY, IWM, or individual stocks show the same optimization advantage?
 - **Q3:** How stable are the best-params across adjacent windows? Do optimized params drift significantly, or do similar values recur?
-- **Q4 (partially answered):** Real-world spread impact is modest at ≈3% half-spread for liquid QQQ options. IV sensitivity is effectively 0. The backtester defaults were approximately correct.
-- **Q5:** Would increasing Optuna trials per window (e.g. 100 vs 50) improve results further, or has the 9D space already converged sufficiently at 50 trials?
+- **Q4 (answered):** Real-world spread impact is modest at ≈3% half-spread for liquid QQQ options. IV sensitivity is effectively 0. The backtester defaults were approximately correct. Calibrated in Exp 6.
+- **Q5 (reframed):** ~~Would increasing Optuna trials per window (e.g. 100 vs 50) improve results?~~ We are now at 200 trials. With E > F established (Exps 9–10), the real question is: **does 200 trials have diminishing returns vs 100?** Is there a trial count below 200 that recovers most of the optimization benefit at lower compute cost?
 - **Q6 (answered):** Removing `iv_floor` from the search space did NOT recover inactive windows. Dead zone is regime-driven — the optimizer correctly finds no profitable IC configuration when training-period volatility mismatches OOS volatility.
-- **Q7:** The ablation consistently beats per-window Optuna (Exp 6, 7, 8). Does Optuna's optimization add net value at all with current training data density? Is there a minimum trade count per trial that makes optimization viable?
+- **Q7 (answered):** ~~Does Optuna add net value at all? Is there a minimum trade count per trial that makes optimization viable?~~ **Answered by Exps 9–10.** The ablation dominance in Exps 6–8 was architectural (wrong direction gate + signal mismatch between Optuna and OOS), not a training data density problem. With Changes A and C in place, E > F consistently. The optimizer adds real value when given the correct signal.
 - **Q8 (answered):** Restricting max_hold_days to [10, 21] reduces but does not eliminate backtest_end exits. Late-window entries still hit the OOS boundary regardless of hold cap.
 - **Q9 (answered):** Non-overlapping window design produces identical structural conclusions. Exp 7's dead zone and ablation >> optimized pattern were real, not overlap artifacts.
-- **Q10:** Should the range model threshold (currently fixed at ±5%) be derived from the actual iron condor wing widths (wing_k, delta_short, IV) rather than being a constant? Does the mismatch between the ±5% training label and the actual strike placement degrade range model signal quality? (Exp 9 Change B addresses this.)
-- **Q11:** Is the direction model an appropriate first gate for iron condors? Iron condors are market-neutral — high direction confidence signals a trending regime, which is exactly when they fail. Should the direction gate be removed (range model only)? (Exp 9 Change A addresses this.)
+- **Q10:** Should the range model threshold (currently fixed at ±5%) be derived from the actual iron condor wing widths (wing_k, delta_short, IV) rather than being a constant? Change B (Exp 9) attempted this but was reverted in Exp 10 due to ambiguous results. De-prioritised for now — fixed 0.05 works well enough — but the signal-quality mismatch between training label and actual strike placement remains a valid concern for future investigation.
+- **Q11 (answered):** ~~Is the direction model an appropriate first gate for iron condors?~~ **Answered by Exp 9, confirmed by Exp 10.** Change A (direction gate removal) is permanent for IC and short_strangle. Range model alone gates entry. High directional confidence indicates a trending regime in which iron condors fail — gating on it was architecturally incorrect.
 - **Q12 (answered):** Removing the direction gate (Change A) recovered 3 windows (W05 Sep–Oct 2025, W06 Oct–Nov 2025, and W09 Jan–Feb 2026) but not W07, W10, W11, W12. Dead zone core (Nov 2025–Apr 2026) is regime-driven AND range-model-driven: during high-vol periods the range model predicts low in-range probability regardless of direction gate.
-- **Q13 (partially answered):** Wing-derived range threshold (Change B) may have contributed to recovery of W03 (Jul–Aug 2025), where entry_confidence was 0.10 — unusually low, suggesting the derived threshold was narrower than the fixed 5%, allowing lower-confidence range entries. Full signal-quality impact unclear without controlled ablation.
-- **Q14:** W03 produced 3 profitable trades at avg_conf=0.10. Is a near-zero range model confidence entry economically justifiable, or is this a threshold calibration artifact from the B-S approximation?
-- **Q15:** ~~Exp 9 Section E now beats Section F (Sharpe 5.41 vs 3.05). Does this hold in Exp 10, or was it a single-experiment result?~~ **Answered by Exp 10** — E > F confirmed again (5.70 vs 3.05). P18 is robust across two consecutive experiments with proper signal alignment (Change A + Change C).
+- **Q13 (closed — not pursued):** ~~Wing-derived range threshold (Change B) contribution to W03 recovery was unclear.~~ Change B was reverted in Exp 10. W03 recovered anyway under Change C with the fixed 0.05 threshold (+$1,066 from 6 trades), confirming the window's recovery was due to signal alignment (Change C), not the wing-derived threshold. Wing-derived threshold is a dead end at current architecture maturity.
+- **Q14 (superseded):** ~~W03 produced 3 profitable trades at avg_conf=0.10.~~ The 0.10 figure was specific to Exp 9's wing-derived threshold (Change B). With Change B reverted in Exp 10, W03 no longer shows anomalously low confidence. No longer relevant.
+- **Q15 (answered):** ~~Does E > F hold in Exp 10, or was Exp 9 a one-off?~~ **Answered by Exp 10** — E > F confirmed again (Sharpe 5.70 vs 3.05). P18 is robust across two consecutive experiments with proper signal alignment (Change A + Change C).
 - **Q16:** Four inactive windows persist (W07 Nov–Dec 2025, W08 Dec 2025–Jan 2026, W10 Feb–Mar 2026, W12 Apr–May 2026). These coincide with the most volatile OOS periods. Can any architectural change unlock them, or is iron condor fundamentally incompatible with these regimes? Does extending train_days to 730d give the ML models enough high-vol examples to find viable IC params?
+- **Q17:** Should the direction predictor be removed from Optuna's pass-through entirely? Change A already bypasses it as an IC entry gate, so it has no effect on optimization trials. It still gets trained and passed every window — wasted compute per P19's scope. Removing it would reduce per-window setup time with no impact on results.
+- **Q18:** Is W11 (Mar–Apr 2026, 5T, 40% WR, −$415) a genuine adverse regime or an optimization overfitting artifact? The range model allowed entry but the window was a loss. Understanding whether the model failed or the market moved adversarially within the prediction horizon informs how much to trust the range model in borderline regimes.
 
 ---
 
@@ -888,4 +890,4 @@ Copy this section to add a new experiment:
 
 ---
 
-*Last updated: 2026-05-27 (Exp 10 complete)*
+*Last updated: 2026-05-27 (Exp 10 complete; open questions audited)*
