@@ -368,6 +368,194 @@ class WalkForwardResult:
         return df.sort_values("date").reset_index(drop=True)
 
 
+def _json_numpy_default(o: object) -> object:
+    """Custom JSON default handler that converts numpy scalars to Python native types."""
+    try:
+        import numpy as np
+        if isinstance(o, np.integer):
+            return int(o)
+        if isinstance(o, np.floating):
+            return float(o)
+        if isinstance(o, np.bool_):
+            return bool(o)
+    except ImportError:
+        pass
+    raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+
+
+def _build_optuna_window_data(
+    results: list,
+    strategies: list[str],
+    window_id: int,
+    symbol: str,
+    n_trials_requested: int = 50,
+    patience: int = 0,
+) -> dict:
+    """Serialize Optuna trial data from one or more per-strategy OptimizationResult
+    objects into a flat dict for the dashboard (Layer 2b).
+
+    Returns ``{"trials": [...], "meta": {...}}``.
+    """
+    trials_out = []
+    trial_offset = 0
+    early_stopped = False
+    stop_reason = ""
+
+    for res in results:
+        study = getattr(res, "study", None)
+        if study is None:
+            trial_offset += n_trials_requested
+            continue
+        for t in study.trials:
+            dur = None
+            if t.datetime_start and t.datetime_complete:
+                dur = round((t.datetime_complete - t.datetime_start).total_seconds(), 1)
+            trials_out.append({
+                "number":       trial_offset + t.number,
+                "state":        t.state.name,
+                "value":        round(float(t.value), 4) if t.value is not None else None,
+                "params":       t.params,
+                "sharpe":       t.user_attrs.get("sharpe"),
+                "win_rate":     t.user_attrs.get("win_rate"),
+                "max_drawdown": t.user_attrs.get("max_drawdown"),
+                "n_trades":     t.user_attrs.get("n_trades"),
+                "duration_s":   dur,
+                "intermediate": round(float(t.value), 4) if t.value is not None else None,
+            })
+        trial_offset += len(study.trials)
+        if getattr(res, "early_stopped", False):
+            early_stopped = True
+            stop_reason = getattr(res, "stop_reason", "")
+
+    if not early_stopped:
+        n_pruned = sum(1 for t in trials_out if t["state"] == "PRUNED")
+        suffix = f" {n_pruned} trial(s) pruned by MedianPruner." if n_pruned else ""
+        stop_reason = f"Completed all {len(trials_out)} trials.{suffix}"
+
+    study_names = [f"wf_w{window_id}_{symbol}_{s}" for s in strategies]
+    meta = {
+        "study_name":       ", ".join(study_names),
+        "n_trials_requested": n_trials_requested * len(strategies),
+        "n_trials_run":     len(trials_out),
+        "status":           "early_stopped" if early_stopped else "completed",
+        "stop_reason":      stop_reason,
+        "sampler":          "TPESampler(seed=42)",
+        "pruner":           "MedianPruner(n_warmup_steps=1)",
+        "patience":         patience,
+    }
+    return {"trials": trials_out, "meta": meta}
+
+
+def _save_window_timeseries(
+    test_df: "pd.DataFrame",
+    predictor: "Any",
+    range_predictor: "Any",
+    vix_ctx: "dict | None",
+    progress_dir: "Path",
+    symbol: str,
+    window_id: int,
+) -> None:
+    """Compute features + ML predictions for each test-period bar and append them
+    to ``timeseries_bars.json`` in the experiment directory (Layer 2c).
+
+    The file is keyed by experiment (one file per run, not per window) so the
+    dashboard can load all windows in a single request.
+    """
+    try:
+        import json as _json
+        from ait.ml.features import FeatureEngine
+
+        feat_df = FeatureEngine().compute(test_df, market_context=vix_ctx)
+        if feat_df.empty:
+            return
+
+        bars_out = []
+        for ts, row in test_df.iterrows():
+            date_str = ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]
+            bar: dict = {
+                "time":   date_str,
+                "symbol": symbol,
+                "open":   round(float(row.get("Open", 0)), 4),
+                "high":   round(float(row.get("High", 0)), 4),
+                "low":    round(float(row.get("Low", 0)), 4),
+                "close":  round(float(row.get("Close", 0)), 4),
+                "volume": int(row.get("Volume", 0)),
+                "window": window_id,
+            }
+            # Features for this bar
+            if date_str in feat_df.index.strftime("%Y-%m-%d").tolist():
+                f = feat_df[feat_df.index.strftime("%Y-%m-%d") == date_str]
+                if not f.empty:
+                    fr = f.iloc[0]
+                    _FEAT_KEYS = [
+                        "rsi_14", "macd", "macd_signal", "macd_hist",
+                        "sma_20", "sma_50", "bb_upper", "bb_lower", "bb_position",
+                        "atr_pct", "realized_vol_20", "iv_rank", "vix_level",
+                        "hurst_wavelet", "sentiment_composite", "put_call_ratio",
+                    ]
+                    for k in _FEAT_KEYS:
+                        v = fr.get(k) if k in fr.index else None
+                        bar[k] = round(float(v), 4) if v is not None and not _isnan(v) else None
+                    vol20 = fr.get("volume_sma_20_ratio")
+                    bar["volume_ratio"] = round(float(vol20), 4) if vol20 is not None and not _isnan(vol20) else None
+
+            # ML predictions
+            bar["dir_class"] = None
+            bar["dir_conf"] = None
+            bar["p_up"] = None
+            bar["p_down"] = None
+            bar["p_neutral"] = None
+            bar["range_prob"] = None
+            bar["meta_take"] = None
+            try:
+                if predictor is not None and predictor.is_trained:
+                    hist_up_to = test_df[test_df.index <= ts]
+                    sig = predictor.predict(hist_up_to, market_context=vix_ctx)
+                    if sig is not None:
+                        bar["dir_class"] = sig.direction.value if hasattr(sig.direction, "value") else str(sig.direction)
+                        bar["dir_conf"] = round(float(sig.confidence), 4)
+            except Exception:
+                pass
+            try:
+                if range_predictor is not None and range_predictor.is_trained:
+                    hist_up_to = test_df[test_df.index <= ts]
+                    rp = range_predictor.predict(hist_up_to, market_context=vix_ctx)
+                    if rp is not None:
+                        bar["range_prob"] = round(float(rp.probability_in_range), 4)
+            except Exception:
+                pass
+
+            bars_out.append(bar)
+
+        if not bars_out:
+            return
+
+        # Merge into the experiment-wide timeseries file (append / replace window entries)
+        ts_path = progress_dir / "timeseries_bars.json"
+        existing: list = []
+        if ts_path.exists():
+            try:
+                existing = _json.loads(ts_path.read_text(encoding="utf-8"))
+            except Exception:
+                existing = []
+        # Drop any existing bars for this window+symbol so we can replace them
+        existing = [b for b in existing if not (b.get("window") == window_id and b.get("symbol") == symbol)]
+        existing.extend(bars_out)
+        existing.sort(key=lambda b: (b.get("time", ""), b.get("symbol", "")))
+        ts_path.write_text(_json.dumps(existing), encoding="utf-8")
+
+    except Exception:
+        pass  # timeseries save is best-effort; never break the backtest
+
+
+def _isnan(v: object) -> bool:
+    try:
+        import math
+        return math.isnan(float(v))  # type: ignore[arg-type]
+    except Exception:
+        return False
+
+
 def _window_task_mp(args: tuple) -> tuple:
     """Worker for ProcessPoolExecutor window-level parallelism.
 
@@ -599,6 +787,7 @@ class WalkForwardBacktester:
         model_accuracy = 0.0
         active_symbols = 0
         curr_best_params: dict | None = None
+        _optuna_meta: dict | None = None
         # Use full capital per symbol — splitting by symbol count makes iron condors
         # impossible on stocks priced >$50 (max_loss_per_contract too large).
         per_symbol_capital = self._config.initial_capital
@@ -630,7 +819,7 @@ class WalkForwardBacktester:
 
             window_cfg = self._config
             if self._config.optimize_per_window:
-                new_cfg, best_params = self._optimize_window_params(
+                new_cfg, best_params, _optuna_meta = self._optimize_window_params(
                     train_df, symbol, window_id, active_strategies,
                     prior_oos_result=prev_oos,
                     prior_best_params=prev_best_params,
@@ -644,6 +833,20 @@ class WalkForwardBacktester:
                     model_accuracy,
                     max(predictor.cv_scores.values()) if predictor.cv_scores else 0.0,
                 )
+
+            # Collect per-model fitted weights + CV scores for window JSON export.
+            _model_weights: dict = {}
+            if range_predictor is not None and range_predictor.fitted_weights:
+                rp_sym = getattr(range_predictor, "_symbol_models", {}).get(symbol, {})
+                _model_weights["range_predictor"] = {
+                    "fitted_weights": dict(range_predictor.fitted_weights),
+                    "cv_scores": dict(rp_sym.get("cv_scores", {})),
+                }
+            if predictor is not None and predictor.fitted_weights:
+                _model_weights["direction_predictor"] = {
+                    "fitted_weights": dict(predictor.fitted_weights),
+                    "cv_scores": dict(predictor.cv_scores or {}),
+                }
 
             _meta_artifact = (
                 self._progress_dir / f"window_{window_id:03d}" / symbol
@@ -731,6 +934,18 @@ class WalkForwardBacktester:
                 t["symbol"] = symbol
             all_symbol_trades.extend(result.trades)
 
+            # Save per-bar timeseries for dashboard (Layer 2c)
+            if self._progress_dir is not None:
+                _save_window_timeseries(
+                    test_df=test_df,
+                    predictor=predictor,
+                    range_predictor=range_predictor,
+                    vix_ctx=_vix_ctx,
+                    progress_dir=self._progress_dir,
+                    symbol=symbol,
+                    window_id=window_id,
+                )
+
         if all_symbol_trades:
             total_pnl = sum(t.get("pnl", 0) for t in all_symbol_trades)
             window_capital = self._config.initial_capital
@@ -749,13 +964,15 @@ class WalkForwardBacktester:
                 ),
                 model_accuracy=model_accuracy,
             )
-            self._write_window_progress(window_id, window_result, curr_best_params)
+            self._write_window_progress(window_id, window_result, curr_best_params,
+                                         optuna_meta=_optuna_meta, model_weights=_model_weights)
             return window_result, curr_best_params
         else:
             self._write_window_progress(
                 window_id, None, curr_best_params,
                 train_start=train_start, train_end=train_end,
                 test_start=test_start, test_end=test_end,
+                optuna_meta=_optuna_meta, model_weights=_model_weights,
             )
             return None, curr_best_params
 
@@ -764,6 +981,8 @@ class WalkForwardBacktester:
         window_id: int,
         window_result: "WindowResult | None",
         best_params: "dict | None" = None,
+        optuna_meta: "dict | None" = None,
+        model_weights: "dict | None" = None,
         **date_kwargs,
     ) -> None:
         if self._progress_dir is None:
@@ -777,19 +996,41 @@ class WalkForwardBacktester:
                 s = t.get("strategy", "unknown")
                 strategy_counts[s] = strategy_counts.get(s, 0) + 1
 
-            # Per-trade detail: intraday-aware fields (Gap I)
+            # Per-trade detail: intraday-aware fields + dashboard enrichment (Layer 2a)
+            def _hold_days(t: dict) -> int:
+                try:
+                    from datetime import date as _date
+                    return (_date.fromisoformat(str(t["exit_date"])) - _date.fromisoformat(str(t["entry_date"]))).days
+                except Exception:
+                    return 0
+
             trades_detail = [
                 {
-                    "symbol":       t.get("symbol", ""),
-                    "strategy":     t.get("strategy", ""),
-                    "entry_date":   str(t.get("entry_date", "")),
-                    "entry_time":   str(t.get("entry_time", t.get("entry_date", ""))),
-                    "exit_date":    str(t.get("exit_date", "")),
-                    "exit_time":    str(t.get("exit_time",  t.get("exit_date", ""))),
-                    "exit_reason":  t.get("exit_reason", ""),
-                    "pnl":          round(t.get("pnl", 0), 2),
+                    "symbol":           t.get("symbol", ""),
+                    "strategy":         t.get("strategy", ""),
+                    "entry_date":       str(t.get("entry_date", "")),
+                    "entry_time":       str(t.get("entry_time", t.get("entry_date", ""))),
+                    "exit_date":        str(t.get("exit_date", "")),
+                    "exit_time":        str(t.get("exit_time",  t.get("exit_date", ""))),
+                    "exit_reason":      t.get("exit_reason", ""),
+                    "pnl":              round(t.get("pnl", 0), 2),
                     "entry_confidence": t.get("entry_confidence"),
-                    "entry_regime": t.get("entry_regime", ""),
+                    "entry_regime":     t.get("entry_regime", ""),
+                    # Layer 2a additions
+                    "contracts":        t.get("contracts"),
+                    "n_legs":           t.get("n_legs"),
+                    "hold_days":        _hold_days(t),
+                    "entry_price":      t.get("entry_price"),
+                    "exit_price":       t.get("exit_price"),
+                    "entry_iv_rank":    t.get("entry_iv_rank"),
+                    "entry_vix_level":  t.get("entry_vix_level"),
+                    "credit":           t.get("credit"),
+                    "max_loss":         t.get("max_loss"),
+                    "return_pct":       round(t["pnl"] / t["max_loss"], 4)
+                                        if t.get("max_loss") and t["max_loss"] != 0 else None,
+                    "legs":             t.get("legs", []),
+                    "decision":         t.get("decision", {}),
+                    "features_at_entry": t.get("features_at_entry", {}),
                 }
                 for t in br.trades
             ]
@@ -824,8 +1065,17 @@ class WalkForwardBacktester:
                 "note": "no_trades",
             }
 
+        # Optuna trial history (Layer 2b) — only present when optimize_per_window=True
+        if optuna_meta is not None:
+            payload["optuna_trials"] = optuna_meta.get("trials", [])
+            payload["optuna_meta"] = optuna_meta.get("meta", {})
+
+        # Per-model fitted ensemble weights + CV scores
+        if model_weights:
+            payload["model_weights"] = model_weights
+
         path = self._progress_dir / f"window_{window_id:03d}.json"
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        path.write_text(json.dumps(payload, indent=2, default=_json_numpy_default), encoding="utf-8")
         log.info("window_progress_written", window=window_id, path=str(path),
                  pnl=payload["pnl"], trades=payload["trades"])
 
@@ -838,8 +1088,8 @@ class WalkForwardBacktester:
         prior_oos_result: "BacktestResult | None" = None,
         prior_best_params: "dict | None" = None,
         range_predictor: "Any | None" = None,
-    ) -> "tuple[WalkForwardConfig | None, dict | None]":
-        """Run Optuna on the training slice and return (updated_config, best_params).
+    ) -> "tuple[WalkForwardConfig | None, dict | None, dict | None]":
+        """Run Optuna on the training slice and return (updated_config, best_params, optuna_meta).
 
         Runs one Optuna study per strategy (per-strategy optimization) so each
         strategy's ~12D space gets full coverage at the trial budget rather than
@@ -868,6 +1118,7 @@ class WalkForwardBacktester:
             # Each study seeds from its own subset of prior/global-best params.
             all_best_params: dict = {}
             best_values: dict[str, float] = {}
+            _all_optuna_results: list = []
 
             for strategy in strategies:
                 warm: dict | None = None
@@ -921,6 +1172,17 @@ class WalkForwardBacktester:
                 res = opt.run(data={symbol: train_df}, prior_params=warm)
                 all_best_params.update(res.best_params)
                 best_values[strategy] = res.best_value
+                # Collect trial data for dashboard (Layer 2b)
+                _all_optuna_results.append(res)
+
+            # Merge Optuna trial data across per-strategy studies into a single
+            # flat list for the dashboard.  Each trial gets a unique number offset
+            # so they don't collide when multiple strategies are optimized.
+            _optuna_meta = _build_optuna_window_data(
+                _all_optuna_results, strategies, window_id, symbol,
+                n_trials_requested=self._config.optimize_n_trials,
+                patience=self._config.optimize_patience,
+            )
 
             # Build an updated config from merged best params, falling back to originals
             import dataclasses
@@ -936,10 +1198,10 @@ class WalkForwardBacktester:
                 symbol=symbol,
                 best_values=best_values,
             )
-            return new_cfg, all_best_params
+            return new_cfg, all_best_params, _optuna_meta
         except Exception as e:
             log.warning("window_optimization_failed", window=window_id, symbol=symbol, error=str(e))
-            return None, None
+            return None, None, None
 
     def _train_window_range_model(
         self,

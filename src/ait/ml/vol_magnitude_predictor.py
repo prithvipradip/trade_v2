@@ -149,6 +149,17 @@ class VolMagnitudePredictor:
             from datetime import datetime
             self._model_version = f"volmag-v-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
+            # Fit ensemble weights from per-model CV edge over 0.50 baseline.
+            _baseline = 0.50
+            _edges = {m: max(0.0, acc - _baseline) for m, acc in accuracies.items()}
+            _total = sum(_edges.values())
+            fitted_weights = (
+                {m: e / _total for m, e in _edges.items()}
+                if _total > 0
+                else {m: 0.5 for m in accuracies}
+            )
+            self._fitted_weights: dict[str, float] = fitted_weights
+
             if symbol:
                 import copy
                 importances = {}
@@ -164,6 +175,7 @@ class VolMagnitudePredictor:
                     "scaler": copy.deepcopy(self._scaler),
                     "feature_names": list(self._feature_names),
                     "cv_scores": dict(accuracies),
+                    "fitted_weights": dict(fitted_weights),
                     "feature_importances": importances,
                     "big_move_rate": float(positive_rate),
                     "version": self._model_version,
@@ -174,12 +186,17 @@ class VolMagnitudePredictor:
                 "vol_mag_trained",
                 symbol=symbol,
                 accuracies=accuracies,
+                fitted_weights=fitted_weights,
                 big_move_rate=f"{positive_rate:.2%}",
                 threshold=self._threshold,
                 horizon=self._horizon,
             )
 
         return accuracies
+
+    @property
+    def fitted_weights(self) -> "dict[str, float] | None":
+        return getattr(self, "_fitted_weights", None)
 
     def _walk_forward_split(self, n: int, n_splits: int = 4, gap: int = 5):
         splits = []
@@ -304,10 +321,11 @@ class VolMagnitudePredictor:
             log.error("vol_mag_scaling_failed", symbol=symbol, error=str(e))
             return None
 
+        fw = (sym_data or {}).get("fitted_weights") or getattr(self, "_fitted_weights", None)
         weighted_p = 0.0
         total_weight = 0.0
         for name, model in models.items():
-            w = self._weights.get(name, 0.5)
+            w = fw.get(name, 0.5) if fw else self._weights.get(name, 0.5)
             try:
                 p = float(model.predict_proba(X_scaled)[0][1])
                 weighted_p += w * p
