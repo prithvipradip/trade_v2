@@ -1271,6 +1271,108 @@ python run_backtest.py --compare-exits           # Fixed vs trailing stops
 
 **The Tier 1 range model is included:** When backtesting iron condors, the `RangePredictor` is trained per window and gates entries, matching the live system's behavior.
 
+### Per-Window Execution Flow (Order of Operations)
+
+This is the exact sequence of steps the walk-forward engine executes for **each** train/test window pair. Understanding this order is critical for interpreting results and diagnosing issues.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  STEP 1 — WINDOW SLICING                                            │
+│  The full history is divided into non-overlapping train/test pairs. │
+│  e.g. 730d train / 30d test / 30d step / 5d gap → ~11 windows.    │
+│  Each window's test period is genuinely out-of-sample.              │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │ (repeated for every window)
+                             ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  STEP 2 — ML MODEL TRAINING (once per window, on training data)     │
+│                                                                     │
+│  2a. Direction Predictor  — XGBoost binary classifier.             │
+│      Predicts whether price will move up or down over the next      │
+│      N days. NOT used as an entry gate for iron condors (Change A   │
+│      removed it). Still trained and passed to OOS backtest.         │
+│                                                                     │
+│  2b. Range Predictor  — XGBoost + LightGBM ensemble (50/50).       │
+│      Predicts P(price stays within ±5% over next N days).           │
+│      This IS the iron condor entry gate. Entry fires only when      │
+│      range confidence ≥ threshold.                                  │
+│      Ensemble = one XGBClassifier + one LGBMClassifier, probabi-   │
+│      lities averaged. Not a RandomForest. XGBoost/LightGBM are     │
+│      themselves internally tree ensembles (boosted), but the        │
+│      "ensemble" here means two separate model types blended.        │
+│                                                                     │
+│  2c. Meta-Labeler  — XGBoost binary classifier.                    │
+│      Trained on TRADE OUTCOMES from a shadow backtest run on the    │
+│      training data (with the direction predictor). Predicts         │
+│      "given these features at entry, will this trade be             │
+│      profitable?" — a second-order signal-quality filter applied    │
+│      on top of the range model gate.                                │
+│      Key difference from 2a/2b: its training labels are P&L        │
+│      outcomes, not future price moves. It answers "should we        │
+│      actually take this trade?" not "what will price do?"           │
+│                                                                     │
+│  ── Models NOT trained per walk-forward window ──                   │
+│  VolMagnitudePredictor  — exists in the codebase but is NOT wired  │
+│  into the walk-forward training loop. Predicts P(|max return over   │
+│  N days| > implied_vol_threshold) — i.e. P(big move). Its output   │
+│  is the long straddle confidence (complement of range model).       │
+│  NOT an ARCH/GARCH model — it is a supervised XGBoost + LightGBM   │
+│  binary classifier using the same fractal/VLMC features as the      │
+│  range model. It does not model the volatility process directly.    │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  STEP 3 — OPTUNA OPTIMIZATION (on training data, models frozen)     │
+│                                                                     │
+│  The trained ML models from Step 2 are frozen and passed to        │
+│  StrategyOptimizer. This was the key fix in Exp 10 (Change C):     │
+│  before this, models were trained AFTER Optuna, causing Optuna      │
+│  to optimize against a different signal than what ran in OOS.       │
+│                                                                     │
+│  For each of 200 Optuna trials:                                     │
+│  • Optuna (TPE sampler) proposes a candidate parameter set          │
+│    (stop_loss_pct, profit_target_pct, delta_short, wing_k, etc.)   │
+│  • The Backtester iterates over EVERY sample point in the           │
+│    training data using those params + the frozen ML models.         │
+│    Yes — each trial processes all training rows. The frozen ML      │
+│    outputs do not change between trials; only structural params do. │
+│  • The objective (composite Sharpe + trade-count penalty) is        │
+│    computed on training-set P&L.                                    │
+│  • Optuna uses the result to decide the next candidate.             │
+│  Patience=50: study stops if 50 consecutive trials show no          │
+│  improvement. Max 200 trials total.                                 │
+│                                                                     │
+│  What Optuna searches (structural params only — no entry gates):    │
+│    stop_loss_pct, profit_target_pct, trailing_stop_fraction,        │
+│    delta_short, max_hold_days, wing_k, hurst_regime_threshold,      │
+│    hurst_regime_penalty, multifractal_max_width                     │
+│  What Optuna does NOT touch:                                        │
+│    ML model weights/trees (frozen), min_confidence (fixed config),  │
+│    max_entry_vol_annual (fixed config) — see P1, P5.               │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  STEP 4 — OOS EVALUATION (test window, models frozen, best params)  │
+│                                                                     │
+│  The frozen ML models + Optuna's best params are applied to the     │
+│  held-out test window. No retraining occurs. The ML models see      │
+│  OOS data for the first time. P&L from this step is the reported   │
+│  OOS window result.                                                 │
+│                                                                     │
+│  What is fixed (from training):  ML model weights, best_params     │
+│  What is new (OOS):              price bars, entry signals, exits   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Key invariants to remember:**
+- ML models are trained **once per window** before Optuna starts — never inside the trial loop.
+- Every Optuna trial iterates over **all training rows** using the frozen ML outputs.
+- The OOS test window is **never seen** during training or optimization.
+- `VolMagnitudePredictor` is **not** currently part of the walk-forward loop (wired for live trading only).
+- `MetaLabeler` trains on **trade outcomes** (P&L labels), not raw price moves — a second-order classifier.
+
 ### Backtester Modelling
 
 | Feature | Implementation |

@@ -639,6 +639,8 @@ Per-window detail:
 
 ## Open Questions
 
+> **System mechanics reference:** For a detailed explanation of the per-window order of operations (ML training → Optuna → OOS evaluation), ML model descriptions (Range Predictor, Direction Predictor, Meta-Labeler, VolMagnitudePredictor), and what Optuna does and does not touch, see **GUIDE.md § 1.19 — "Per-Window Execution Flow"**.
+
 These are unresolved questions that future experiments should address.
 
 - **Q1 (answered — pre-run analysis, Exp 11):** ~~Does the current search space (9D structural params for iron_condor) have any remaining degenerate dimensions?~~ **Analysed from Exp 10 Exp 10 window_001–012.json best_params.** Three findings: (1) `hurst_regime_threshold` hit the upper boundary (0.297 vs max 0.30) in both W01 and W02 — the two earliest windows, where training data is oldest and highest-vol coverage is thinnest. W03–W12 were well within range. (2) `hurst_regime_penalty` flipped from near-maximum (0.247 in W01) to near-minimum (0.004 in W02) between adjacent windows — a degeneracy signal indicating the optimizer sees a flat landscape for this parameter. (3) `wing_k` was driven to the upper boundary (2.00) in both dead-zone windows W08 and W10 — the optimizer widened wings maximally trying to capture premium in high-vol OOS periods, but entries still failed the range-model gate. `multifractal_max_width` showed no meaningful boundary hugging. **Conclusion:** Mild degeneracy in `hurst_regime_penalty` (flat landscape) and `hurst_regime_threshold` in early windows only. No structural fix needed — 730d training (Exp 11) should give more stable signal in the fractal dims by covering more high-vol regimes in training.
