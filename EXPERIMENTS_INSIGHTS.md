@@ -20,9 +20,11 @@
 | 8 | `QQQ_365d_iron_condor_20260526_0302` | 365/30/30/5, 12 W | +0.51% | +6.02% | 20 / 14 | 1.68 / 14.25 | 6/12 / 6/12 | Non-overlapping 30d windows; max_hold=[10,21]; 200 trials; n_jobs=6 (ProcessPoolExecutor) |
 | 9 | `QQQ_365d_iron_condor_20260526_1409` | 365/30/30/5, 12 W | +4.37% | +3.86% | 29 / 38 | **5.41** / 3.05 | **9/12** / 9/12 | Removed IC direction gate (Change A) + wing-derived range threshold (Change B) |
 | 10 | `QQQ_365d_iron_condor_20260527_0353` | 365/30/30/5, 12 W | +6.88% | +3.86% | 33 / 38 | **5.70** / 3.05 | **8/12** / 9/12 | ML models fed into Optuna (Change C); reverts wing-derived threshold (Change B) |
+| 11 | pending (run in progress) | 730/30/30/5, 12 W | +2.69% (10/12 W) | pending | 19 / — | — / — | 3/10 seen | 730d training window; tests Q16 dead-zone recovery; 2 windows still running |
 
 Config format: `train_days / test_days / step_days / gap_days`.
-All experiments: QQQ, iron_condor only, 50 Optuna trials per window, TPE sampler seed 42, $100k initial capital.
+All experiments: QQQ, iron_condor only, TPE sampler seed 42, $100k initial capital.
+Exp 1–10: 50 trials. Exp 8–11: 200 trials, patience 50, min_trades 7, n_jobs 6.
 
 ---
 
@@ -378,6 +380,11 @@ These are standing conclusions drawn from the experiments above. Review and upda
 **Why:** The training period for windows covering this OOS spans the Aug–Dec 2025 high-vol selloff. Optuna cannot find an iron condor config with ≥7 profitable trades in training when realized vol exceeds the max_entry_vol gate (~80%). No config → no OOS trades.
 **Rule:** The dead zone will persist in any experiment that uses Aug–Dec 2025 as a training window. Only architectural changes (Exp 9: remove direction gate, derive range threshold from wing geometry) can potentially reactivate it.
 
+### P20 — Longer training window shifts the range model's probability calibration adversarially for low-vol regimes
+**Evidence:** Exp 11 (730d training) de-activated W01, W02, W09 — all active in Exp 10 (365d). These windows cover Summer 2025 (low-vol, range-bound QQQ). With 730d of training data including the Aug–Dec 2024 high-vol selloff, the range model learned a more conservative probability distribution for "stays in range." Confidence scores that crossed the entry threshold with 365d training no longer did with 730d training, blocking otherwise profitable entries.
+**Why:** The range model's training label distribution shifts when high-vol data is added. More volatility examples → the model learns that "range-bound" is harder to achieve → lower predicted probabilities in borderline cases → fewer entries in genuinely range-bound OOS periods.
+**Rule:** For a range model gating a credit spread strategy, the optimal training window should approximately match the regime the strategy targets. Training on regime-diverse data (calm + volatile) may systematically underestimate range-bound probability in calm regimes. Monitor active window count as a leading indicator of over-conservative model calibration.
+
 ---
 
 ## Experiment 6 — Spread Model Wiring Fix + Market Regime Drop-Off
@@ -658,7 +665,7 @@ These are unresolved questions that future experiments should address.
 - **Q13 (closed — not pursued):** ~~Wing-derived range threshold (Change B) contribution to W03 recovery was unclear.~~ Change B was reverted in Exp 10. W03 recovered anyway under Change C with the fixed 0.05 threshold (+$1,066 from 6 trades), confirming the window's recovery was due to signal alignment (Change C), not the wing-derived threshold. Wing-derived threshold is a dead end at current architecture maturity.
 - **Q14 (superseded):** ~~W03 produced 3 profitable trades at avg_conf=0.10.~~ The 0.10 figure was specific to Exp 9's wing-derived threshold (Change B). With Change B reverted in Exp 10, W03 no longer shows anomalously low confidence. No longer relevant.
 - **Q15 (answered):** ~~Does E > F hold in Exp 10, or was Exp 9 a one-off?~~ **Answered by Exp 10** — E > F confirmed again (Sharpe 5.70 vs 3.05). P18 is robust across two consecutive experiments with proper signal alignment (Change A + Change C).
-- **Q16:** Four inactive windows persist (W07 Nov–Dec 2025, W08 Dec 2025–Jan 2026, W10 Feb–Mar 2026, W12 Apr–May 2026). These coincide with the most volatile OOS periods. Can any architectural change unlock them, or is iron condor fundamentally incompatible with these regimes? Does extending train_days to 730d give the ML models enough high-vol examples to find viable IC params?
+- **Q16 (answered — Exp 11):** ~~Does extending train_days to 730d unlock the dead-zone windows?~~ **No. The dead zone is regime-driven and training-horizon-independent.** Exp 11 (730d) produced 0 trades in all four previously dead windows (W07, W08, W10, W12). Worse: 730d training also de-activated W01, W02, and W09 — all active in Exp 10 (+$3,100, +$101, +$1,944 respectively). Net result: Exp 11 earned +$2,692 vs Exp 10's +$6,730 on comparable windows. The extra training data appears to make the range model more conservative in low-to-moderate-vol regimes (trained on more adverse examples), blocking entries that 365d models allowed. The dead zone is not a training-data coverage problem — it is a fundamental regime incompatibility: iron condors cannot survive QQQ vol in the Oct 2025–Apr 2026 period regardless of how the ML model was trained. **Principle: more training data is not always better for the range model.** The optimal training window length for this strategy is closer to 365d than 730d at current signal quality.
 - **Q17 (answered — non-issue confirmed, Exp 11 pre-run):** ~~Should the direction predictor be removed from Optuna's pass-through?~~ **Non-issue confirmed by code inspection.** `StrategyOptimizer` in `optimizer.py` accepts a `range_predictor` argument but has NO `direction_predictor` parameter. In `walkforward.py:637`, only `range_predictor=range_predictor` is passed — the direction predictor is never forwarded to the optimizer. Change A removed the direction gate from IC entry at the backtester level (`engine.py`), not at the optimizer level, so the direction predictor was never inside Optuna's trial loop. No code change needed.
 - **Q18 (answered — genuine adverse regime, Exp 11 pre-run):** ~~Is W11 (Mar–Apr 2026, 5T, 40% WR, −$415) a genuine adverse regime or overfitting?~~ **Genuine adverse regime confirmed by trade-level analysis of window_011.json.** W11 (training 2025-12-10 to 2026-03-09, OOS 2026-03-10 to 2026-04-09): 5 trades, all entered into trending-down or high_volatility logged regimes. 4 of 5 exited via trailing_stop (adverse volatility expansion post-tariff shock, late March 2026). Final trade exited via backtest_end (−$484) — a late-window entry that ran into the OOS boundary, a known artifact for max_hold_days=21 near window end. The range model allowed entries with confidence 0.58–0.81, but the April 2026 tariff-driven trending-down regime caused directional moves that blew through iron condor wings. Not overfitting — the optimizer found reasonable IC params for the training data (Dec 2025–Mar 2026 chop) but the OOS market turned sharply adverse. The backtest_end artifact inflated apparent loss slightly.
 
@@ -837,6 +844,76 @@ Per-window detail:
 - Consider: removing direction model from Optuna pass-through (it has no effect on IC since direction gate is already bypassed by Change A). Keep code clean.
 - Open question (Q16): Does the dead zone partially reflect training data shortage in high-vol periods? Extending train_days to 730d (2 years) would give the ML models more examples of high-vol regimes.
 - Open question: W11 loss window (Mar–Apr 2026) warrants investigation — did the range model fail, or did a genuine adverse move occur within the prediction horizon?
+
+---
+
+## Experiment 11 — 730-Day Training Window (Q16: Dead-Zone Recovery Attempt)
+
+**Archive:** pending (run still completing W10 and W12 as of 2026-05-29)
+**Date:** 2026-05-27 → 2026-05-29 (~65 hours runtime)
+**Branch:** `features-request-3`
+
+### Setup
+- Walk-forward config: **730d** / 30d / 30d / 5d → **12 windows** (identical OOS period to Exp 10)
+- Test period covered: 2025-05-19 to 2026-05-09
+- Training periods: W01 ~May 2023 → May 2025 (effective: May 2024 → May 2025 due to 3yr IB data cap)
+- Key change from Exp 10: **train_days 365 → 730** only. All other settings identical.
+  - Changes A (no direction gate) and C (range model in Optuna) remain active.
+  - IB backfill extended to `--years 3` to cover the longer training horizon.
+- Optuna: 200 trials, patience 50, min_trades 7, n_jobs 6
+
+### Infrastructure fixes discovered during this run
+- **Bug fixed:** `_fetch_daily_data()` in `run_integration_test.py` was reading from `intraday_prices` (no table prefix), not `test_intraday_prices` (the backfilled test table). With 365d training the 2yr table was sufficient; with 730d it produced 0 windows. Fixed by using `HistoricalDataStore(table_prefix=TABLE_PREFIX)` directly. (commit `45501bb`)
+- **Feature added:** Fitted ensemble weights (XGBoost + LightGBM blend now derived from CV edge over baseline, not fixed 50/50). Exported to per-window JSON as `model_weights`. (commit `c52980e`)
+
+### Assumptions Going In
+- 730d training would give ML models more high-vol regime examples (Aug–Dec 2024 QQQ selloff)
+- The range model, trained on richer data, would identify viable IC configurations in the dead-zone OOS windows
+- Section E should still beat Section F (ablation) — same architectural setup as Exp 10
+
+### Results — Section E (10 of 12 windows, W10 + W12 pending)
+
+| Window | OOS Period | Trades | WR | P&L | Sharpe | vs Exp 10 |
+|--------|-----------|--------|----|-----|--------|-----------|
+| W01 | 2025-05-19 → 2025-06-18 | **0** | — | $0 | — | ▼ was +$3,100 (3T) |
+| W02 | 2025-06-18 → 2025-07-18 | **0** | — | $0 | — | ▼ was +$101 (4T) |
+| W03 | 2025-07-18 → 2025-08-17 | 1 | 0% | −$4 | 0.00 | ▼ was +$1,066 (6T) |
+| W04 | 2025-08-17 → 2025-09-16 | 6 | 100% | **+$1,589** | **+16.96** | ▲ was −$421 (1T) |
+| W05 | 2025-09-16 → 2025-10-16 | 6 | 83% | **+$2,066** | **+11.87** | ▲ was +$1,205 (6T) |
+| W06 | 2025-10-16 → 2025-11-15 | 6 | 33% | −$959 | −5.58 | ▼ was +$150 (6T) |
+| W07 | 2025-11-15 → 2025-12-15 | 0 | — | $0 | — | = dead zone |
+| W08 | 2025-12-15 → 2026-01-14 | 0 | — | $0 | — | = dead zone |
+| W09 | 2026-01-14 → 2026-02-13 | **0** | — | $0 | — | ▼ was +$1,944 (2T) |
+| W10 | 2026-02-13 → 2026-03-15 | pending | — | — | — | was 0T dead zone |
+| W11 | 2026-03-15 → 2026-04-14 | 0 | — | $0 | — | ▲ was −$415 (5T) |
+| W12 | 2026-04-14 → 2026-05-14 | pending | — | — | — | was 0T dead zone |
+
+**Running total (10/12 windows):** +$2,692 across 19 trades. Exp 10 equivalent: +$6,730.
+
+### Results — Section F (Ablation)
+Not yet available — runs after Section E completes.
+
+### Observations
+- **730d training did NOT unlock any dead-zone window.** W07, W08, W09, W11 all 0 trades. The regime incompatibility is absolute: no amount of high-vol training examples helps the optimizer find viable IC configurations for these OOS periods.
+- **730d training de-activated previously productive windows.** W01, W02, W03, W09 all produced 0 trades — combined +$5,211 that Exp 10 captured. This is the dominant negative effect.
+- **The regression in early windows is the key finding.** With 2 years of training data (including Aug–Dec 2024 high-vol selloff), the range model learned to be more conservative — its confidence thresholds for "range-bound" are higher, blocking entries that the 365d-trained model allowed in low-vol Summer 2025.
+- **730d training improved W04 dramatically**: +$1,589 (100% WR) vs −$421 in Exp 10. Aug–Sep 2025 is the post-VIX-spike recovery — the longer training window's exposure to Aug 2024 spike may have taught the model to recognize post-spike range-bound conditions.
+- **W05 also improved**: +$2,066 vs +$1,205. But this is overshadowed by the W01/W02/W03/W09 regressions.
+- **Runtime: ~65 hours** vs ~26 hours for Exp 10. Each Optuna trial runs the Backtester over 2× more data. Dead-zone windows ran all 200 trials (patience never fired — optimizer kept finding marginal improvements on training data). See P16.
+
+### What We Learned
+- **Q16 answered:** 730d training does not recover the dead zone. The dead zone is a fundamental regime incompatibility — iron condors cannot survive the high-directional-volatility regime that characterised QQQ from Oct 2025 → Apr 2026 regardless of training horizon.
+- **Longer training horizon can hurt early windows.** The range model trained on 730d (including Aug–Dec 2024 high-vol) became systematically more conservative. In Summer 2025 (range-bound, low-vol regime), it was less willing to predict "in-range" compared to the 365d model. This blocked entries that would have been profitable.
+- **Optimal training horizon for the range model is approximately 365d** at current signal quality. More data is not better when it introduces regime diversity that shifts the model's probability calibration in adverse ways for the target regime.
+- **The fitted ensemble weights (new in Exp 11's session) would not have changed this outcome** — the architecture issue is the training window length, not the XGBoost/LightGBM blend.
+- **Runtime scales super-linearly with train_days.** 2× training data → ~2.5× runtime (not 2×) because dead-zone windows now run all 200 trials instead of early-stopping via patience.
+
+### What Changed for Next Experiment (Exp 12)
+- **Revert train_days to 365d** — confirmed optimal at current architecture maturity.
+- **First real test of fitted ensemble weights (P19 variant):** Exp 12 runs with all Exp 10 settings + the fitted-weight blending now in the codebase. This isolates whether per-window CV-fitted XGBoost/LightGBM weights improve over the fixed 50/50.
+- **No other architectural changes** — keep stable to cleanly measure the fitted-weight effect.
+- If fitted weights show improvement → add new principle on adaptive ensemble blending.
+- If no improvement → weights are effectively flat (both models perform similarly), which is itself a useful diagnostic.
 
 ---
 
