@@ -21,6 +21,7 @@
 | 9 | `QQQ_365d_iron_condor_20260526_1409` | 365/30/30/5, 12 W | +4.37% | +3.86% | 29 / 38 | **5.41** / 3.05 | **9/12** / 9/12 | Removed IC direction gate (Change A) + wing-derived range threshold (Change B) |
 | 10 | `QQQ_365d_iron_condor_20260527_0353` | 365/30/30/5, 12 W | +6.88% | +3.86% | 33 / 38 | **5.70** / 3.05 | **8/12** / 9/12 | ML models fed into Optuna (Change C); reverts wing-derived threshold (Change B) |
 | 11 | `QQQ_730d_iron_condor_20260530_0531` | 730/30/30/5, 12 W | +2.69% | +2.41% | 19 / 22 | 5.25 / 3.38 | 4/12 | 730d training; Q16 answered: dead zones not recoverable by training horizon |
+| 12 | pending | 365/60/60/5, 12 W | — | — | — | — | — | 60d OOS windows; max_hold [14,45]; Change D (intraday OOS); fitted weights; entry 09:30 |
 
 Config format: `train_days / test_days / step_days / gap_days`.
 All experiments: QQQ, iron_condor only, TPE sampler seed 42, $100k initial capital.
@@ -938,6 +939,76 @@ Per-window detail:
 - **No other architectural changes** — keep stable to cleanly measure the fitted-weight effect.
 - If fitted weights show improvement → add new principle on adaptive ensemble blending.
 - If no improvement → weights are effectively flat (both models perform similarly), which is itself a useful diagnostic.
+
+---
+
+## Experiment 12 — 60-Day Windows + Relaxed max_hold + Intraday OOS + Fitted Weights
+
+**Archive:** pending
+**Date:** 2026-05-30 (running)
+**Branch:** `features-request-3`
+
+### Setup
+- Walk-forward config: **365d** / **60d** / **60d** / 5d → **12 windows**
+- Test period covered: 2024-06-09 to 2026-05-30 (2 years of OOS — extends back to 2024 vs Exp 10-11's 1yr)
+- W01 training starts: ~2023-06-05. Data available from 2023-05-16 ✓ (3yr backfill from Exp 11)
+- Key changes from Exp 11:
+  - **train_days 730 → 365** (reverted — Exp 11 confirmed 365d is better)
+  - **test_days 30 → 60** (wider OOS windows → more trades per window, better stats)
+  - **step_days 30 → 60** (non-overlapping maintained: step = test)
+  - **max_hold_days [10, 21] → [14, 45]** (relaxed: 60d window gives 15d end buffer vs 9d in 30d setup)
+  - **Change D**: OOS Backtester now uses intraday store — 09:30–15:30 ET entry window + limit fill simulation active in OOS (previously daily-only)
+  - **Entry window 09:30** (was 10:30 — captures full session for limit orders)
+  - **Fitted ensemble weights**: XGBoost/LightGBM blend derived from CV edge over baseline per window (not fixed 50/50)
+  - **limit_price + fill_time** fields captured on every OOS trade
+- Optuna: 200 trials, patience 50, min_trades 7, n_jobs 6 (unchanged)
+- Data: 3yr backfill already in test DB from Exp 11; `--skip-backfill` not used, IB refreshes to today
+
+### Assumptions Going In
+- 60d OOS windows reduce the "no trades" problem: fewer windows with 0 trades from chance/timing
+- Relaxed max_hold_days allows genuine theta harvesting over the full range Optuna historically preferred ([26, 40] in Exp 7)
+- Change D (intraday OOS) makes results more realistic and slightly reduces trade count (some days limit won't fill)
+- Fitted ensemble weights may improve per-trade quality vs Exp 10's fixed 50/50
+- E > F should hold (P18 established across Exp 9-11)
+- OOS extending back to June 2024 covers Aug 2024 VIX spike in OOS — tests a more diverse regime
+
+### Assumptions Going In (Risks)
+- Dead zone (Oct 2025–Apr 2026) now spans ~4 of 12 windows instead of 6/12 — results may look better not because strategy improved but due to dilution with 2024 windows
+- 60d max_hold=45 with late-window entries still risks backtest_end exits — expect some but fewer than pre-Exp-8
+- Change D is a new variable: OOS trade count will differ from Exps 9-11, making direct comparison harder
+
+### Launch Command
+```bash
+python scripts/run_integration_test.py \
+  --symbols QQQ \
+  --config config_QQQ_test.yaml \
+  --strategies iron_condor \
+  --train-days 365 \
+  --test-days 60 \
+  --step-days 60 \
+  --gap-days 5 \
+  --optuna-seed 42 \
+  --wf-trials 200 \
+  --wf-patience 50 \
+  --wf-min-trades 7 \
+  --wf-n-jobs 6 \
+  --years 3
+```
+
+### Results — Section E
+*(pending)*
+
+### Results — Section F
+*(pending)*
+
+### Observations
+*(pending)*
+
+### What We Learned
+*(pending)*
+
+### What Changed for Next Experiment
+*(pending)*
 
 ---
 
