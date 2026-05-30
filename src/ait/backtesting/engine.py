@@ -83,7 +83,7 @@ class Backtester:
         # Intraday engine (Fix 1): 5-min execution loop
         intraday_store: Any = None,
         scan_interval_minutes: int = 60,
-        entry_window_start_et: str = "10:30",
+        entry_window_start_et: str = "09:30",
         entry_window_end_et: str = "15:30",
         limit_order_timeout_bars: int = 3,
         # Per-window MetaLabeler for OOS signal filtering (Gap Z1)

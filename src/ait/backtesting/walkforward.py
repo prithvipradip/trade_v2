@@ -73,7 +73,7 @@ class WalkForwardConfig:
     multifractal_max_width: float = 0.50
     # Intraday execution params (Fix 1 / Gap H)
     scan_interval_minutes: int = 60        # how often to scan for signals during a session
-    entry_window_start_et: str = "10:30"   # earliest allowed entry time (ET)
+    entry_window_start_et: str = "09:30"   # earliest allowed entry time (ET)
     entry_window_end_et: str = "15:30"     # latest allowed entry time (ET)
     limit_order_timeout_bars: int = 3      # cancel limit order after N 5-min bars without fill
     # Options spread model params (Fix 5 / Gap E)
