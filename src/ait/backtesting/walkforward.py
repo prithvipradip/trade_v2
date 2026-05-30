@@ -611,11 +611,13 @@ class WalkForwardBacktester:
         config: WalkForwardConfig | None = None,
         db_path: "Path | None" = None,
         progress_dir: "Path | None" = None,
+        table_prefix: str = "",
     ) -> None:
         self._symbols = symbols
         self._strategies = strategies
         self._config = config or WalkForwardConfig()
         self._db_path = db_path
+        self._table_prefix = table_prefix
         self._progress_dir = Path(progress_dir) if progress_dir else None
         self._global_best_params: dict | None = None
         self._global_best_score: float = -1.0
@@ -901,7 +903,7 @@ class WalkForwardBacktester:
             _oos_intraday_store = None
             if self._db_path is not None:
                 from ait.data.historical import HistoricalDataStore
-                _oos_intraday_store = HistoricalDataStore(db_path=self._db_path)
+                _oos_intraday_store = HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
 
             bt = Backtester(
                 data=test_with_context,
@@ -1120,7 +1122,7 @@ class WalkForwardBacktester:
                 _intraday_store = None
                 if self._db_path is not None:
                     from ait.data.historical import HistoricalDataStore
-                    _intraday_store = HistoricalDataStore(db_path=self._db_path)
+                    _intraday_store = HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
                 features_cache = FeatureEngine().compute(
                     train_df, intraday_store=_intraday_store, symbol=symbol
                 )
@@ -1230,7 +1232,7 @@ class WalkForwardBacktester:
             intraday_store = None
             if self._db_path is not None:
                 from ait.data.historical import HistoricalDataStore
-                intraday_store = HistoricalDataStore(db_path=self._db_path)
+                intraday_store = HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
             rp = RangePredictor(threshold_pct=threshold_pct, horizon_days=max_hold_days)
             accs = rp.train(train_df, symbol=symbol, intraday_store=intraday_store)
             if accs and rp.is_trained:
@@ -1256,7 +1258,7 @@ class WalkForwardBacktester:
             intraday_store = None
             if self._db_path is not None:
                 from ait.data.historical import HistoricalDataStore
-                intraday_store = HistoricalDataStore(db_path=self._db_path)
+                intraday_store = HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
 
             ml_config = MLConfig()
             predictor = DirectionPredictor(ml_config)
@@ -1307,7 +1309,7 @@ class WalkForwardBacktester:
             intraday_store = None
             if self._db_path is not None:
                 from ait.data.historical import HistoricalDataStore
-                intraday_store = HistoricalDataStore(db_path=self._db_path)
+                intraday_store = HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
 
             features_df = FeatureEngine().compute(
                 train_df, intraday_store=intraday_store, symbol=symbol

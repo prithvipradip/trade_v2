@@ -600,7 +600,8 @@ async def _section_e_walkforward(
     try:
         out.mkdir(parents=True, exist_ok=True)
         bt = WalkForwardBacktester(args.symbols, args.strategies, config=config,
-                                   db_path=Path(args.db_path), progress_dir=out)
+                                   db_path=Path(args.db_path), progress_dir=out,
+                                   table_prefix=TABLE_PREFIX)
         result = await bt.run(data=ticker_data if ticker_data else None)
 
         summary_text = result.summary()
@@ -670,7 +671,8 @@ async def _section_f_ablation(
     )
 
     try:
-        bt = WalkForwardBacktester(args.symbols, args.strategies, config=config, db_path=Path(args.db_path))
+        bt = WalkForwardBacktester(args.symbols, args.strategies, config=config,
+                                   db_path=Path(args.db_path), table_prefix=TABLE_PREFIX)
         result = await bt.run(data=ticker_data if ticker_data else None)
 
         summary_text = result.summary()
