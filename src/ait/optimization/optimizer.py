@@ -45,6 +45,7 @@ class _EarlyStopCallback:
         self._patience = patience
         self._best = float("-inf")
         self._no_improve = 0
+        self.triggered_at: int | None = None  # trial number that triggered the stop
 
     def __call__(self, study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
         if study.best_value > self._best:
@@ -53,7 +54,17 @@ class _EarlyStopCallback:
         else:
             self._no_improve += 1
         if self._no_improve >= self._patience:
+            self.triggered_at = trial.number
             study.stop()
+
+    @property
+    def stop_reason(self) -> str:
+        if self.triggered_at is not None:
+            return (
+                f"Early-stopped: {self._patience} consecutive non-improving trials "
+                f"(patience reached at trial {self.triggered_at})."
+            )
+        return ""
 
 
 class StrategyOptimizer:
@@ -154,8 +165,10 @@ class StrategyOptimizer:
             study.enqueue_trial(prior_params)
 
         callbacks = []
+        early_stop_cb: _EarlyStopCallback | None = None
         if self._patience > 0:
-            callbacks.append(_EarlyStopCallback(self._patience))
+            early_stop_cb = _EarlyStopCallback(self._patience)
+            callbacks.append(early_stop_cb)
 
         log.info(
             "optuna_study_starting",
@@ -175,12 +188,27 @@ class StrategyOptimizer:
             callbacks=callbacks or None,
         )
 
+        early_stopped = early_stop_cb is not None and early_stop_cb.triggered_at is not None
+        stop_reason = (
+            early_stop_cb.stop_reason if early_stopped
+            else f"Completed all {len(study.trials)} trials."
+        )
+        if early_stopped and early_stop_cb is not None:
+            n_pruned = len([t for t in study.trials if t.state.name == "PRUNED"])
+            if n_pruned:
+                stop_reason += f" {n_pruned} trial(s) pruned by MedianPruner."
+
+        result = OptimizationResult(study)
+        result.stop_reason = stop_reason
+        result.early_stopped = early_stopped
+
         log.info(
             "optuna_study_complete",
             best_value=study.best_value,
             best_params=study.best_params,
+            early_stopped=early_stopped,
         )
-        return OptimizationResult(study)
+        return result
 
     # ------------------------------------------------------------------
     # Internal
@@ -207,6 +235,12 @@ class StrategyOptimizer:
             return -100.0
         if self._min_trades > 0 and result.total_trades < self._min_trades:
             value *= (result.total_trades / self._min_trades) ** 2
+
+        # Store per-trial metrics for dashboard Optuna tab (Layer 2b).
+        trial.set_user_attr("sharpe",        round(float(result.sharpe_ratio), 4))
+        trial.set_user_attr("win_rate",      round(float(result.win_rate), 4))
+        trial.set_user_attr("max_drawdown",  round(float(result.max_drawdown), 4))
+        trial.set_user_attr("n_trades",      int(result.total_trades))
 
         # Report intermediate value for pruning (single-step — step=0)
         trial.report(value, step=0)
