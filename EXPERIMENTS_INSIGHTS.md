@@ -20,7 +20,7 @@
 | 8 | `QQQ_365d_iron_condor_20260526_0302` | 365/30/30/5, 12 W | +0.51% | +6.02% | 20 / 14 | 1.68 / 14.25 | 6/12 / 6/12 | Non-overlapping 30d windows; max_hold=[10,21]; 200 trials; n_jobs=6 (ProcessPoolExecutor) |
 | 9 | `QQQ_365d_iron_condor_20260526_1409` | 365/30/30/5, 12 W | +4.37% | +3.86% | 29 / 38 | **5.41** / 3.05 | **9/12** / 9/12 | Removed IC direction gate (Change A) + wing-derived range threshold (Change B) |
 | 10 | `QQQ_365d_iron_condor_20260527_0353` | 365/30/30/5, 12 W | +6.88% | +3.86% | 33 / 38 | **5.70** / 3.05 | **8/12** / 9/12 | ML models fed into Optuna (Change C); reverts wing-derived threshold (Change B) |
-| 11 | pending (run in progress) | 730/30/30/5, 12 W | +2.69% (10/12 W) | pending | 19 / — | — / — | 3/10 seen | 730d training window; tests Q16 dead-zone recovery; 2 windows still running |
+| 11 | `QQQ_730d_iron_condor_20260530_0531` | 730/30/30/5, 12 W | +2.69% | +2.41% | 19 / 22 | 5.25 / 3.38 | 4/12 | 730d training; Q16 answered: dead zones not recoverable by training horizon |
 
 Config format: `train_days / test_days / step_days / gap_days`.
 All experiments: QQQ, iron_condor only, TPE sampler seed 42, $100k initial capital.
@@ -849,8 +849,8 @@ Per-window detail:
 
 ## Experiment 11 — 730-Day Training Window (Q16: Dead-Zone Recovery Attempt)
 
-**Archive:** pending (run still completing W10 and W12 as of 2026-05-29)
-**Date:** 2026-05-27 → 2026-05-29 (~65 hours runtime)
+**Archive:** `QQQ_730d_iron_condor_20260530_0531`
+**Date:** 2026-05-27 → 2026-05-30 (3408 minutes / ~56.8 hours runtime)
 **Branch:** `features-request-3`
 
 ### Setup
@@ -884,14 +884,38 @@ Per-window detail:
 | W07 | 2025-11-15 → 2025-12-15 | 0 | — | $0 | — | = dead zone |
 | W08 | 2025-12-15 → 2026-01-14 | 0 | — | $0 | — | = dead zone |
 | W09 | 2026-01-14 → 2026-02-13 | **0** | — | $0 | — | ▼ was +$1,944 (2T) |
-| W10 | 2026-02-13 → 2026-03-15 | pending | — | — | — | was 0T dead zone |
+| W10 | 2026-02-13 → 2026-03-15 | 0 | — | $0 | — | = dead zone |
 | W11 | 2026-03-15 → 2026-04-14 | 0 | — | $0 | — | ▲ was −$415 (5T) |
-| W12 | 2026-04-14 → 2026-05-14 | pending | — | — | — | was 0T dead zone |
+| W12 | 2026-04-14 → 2026-05-14 | 0 | — | $0 | — | = dead zone |
 
-**Running total (10/12 windows):** +$2,692 across 19 trades. Exp 10 equivalent: +$6,730.
+**Final total:** +$2,692 across 19 trades, 4 active windows. Exp 10: +$6,730, 8 active windows.
+
+### Results — Section E (final)
+
+| Metric | Value |
+|--------|-------|
+| Total return | +2.69% (+4.30% cash-adj) |
+| Total trades | 19 |
+| Win rate | 68.4% |
+| Sharpe ratio | **5.25** |
+| Sortino ratio | 8.03 |
+| Max drawdown | 1.19% |
+| Profit factor | 2.69 |
+| Expectancy/trade | $141.69 |
+| Active windows | **4 / 12** |
+| Runtime | 3,408 min (~56.8 hours) |
 
 ### Results — Section F (Ablation)
-Not yet available — runs after Section E completes.
+
+| Metric | Value |
+|--------|-------|
+| Total return | +2.41% (+4.02% cash-adj) |
+| Total trades | 22 |
+| Win rate | 59.1% |
+| Sharpe ratio | 3.38 |
+| Max drawdown | 2.27% |
+| Profit factor | 1.88 |
+| Active windows | 4 / 12 |
 
 ### Observations
 - **730d training did NOT unlock any dead-zone window.** W07, W08, W09, W11 all 0 trades. The regime incompatibility is absolute: no amount of high-vol training examples helps the optimizer find viable IC configurations for these OOS periods.
