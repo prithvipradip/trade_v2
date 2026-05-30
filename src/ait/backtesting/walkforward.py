@@ -894,6 +894,15 @@ class WalkForwardBacktester:
                 if not _vix_w.empty:
                     _vix_ctx = {"vix": _vix_w}
 
+            # Change D: pass intraday_store to OOS Backtester so entries are
+            # gated by the 10:30–15:30 ET entry window and limit-fill simulation,
+            # matching the live-trading execution model. Also enables capture of
+            # limit_price and fill_time on every OOS trade.
+            _oos_intraday_store = None
+            if self._db_path is not None:
+                from ait.data.historical import HistoricalDataStore
+                _oos_intraday_store = HistoricalDataStore(db_path=self._db_path)
+
             bt = Backtester(
                 data=test_with_context,
                 context_bars=context_bars,
@@ -927,6 +936,8 @@ class WalkForwardBacktester:
                 spread_cap=window_cfg.spread_cap,
                 meta_labeler=meta_labeler,
                 market_context=_vix_ctx,
+                intraday_store=_oos_intraday_store,
+                symbol=symbol,
             )
             result = bt.run()
 
