@@ -1021,6 +1021,8 @@ class WalkForwardBacktester:
                     "n_legs":           t.get("n_legs"),
                     "hold_days":        _hold_days(t),
                     "entry_price":      t.get("entry_price"),
+                    "limit_price":      t.get("limit_price"),
+                    "fill_time":        t.get("fill_time"),
                     "exit_price":       t.get("exit_price"),
                     "entry_iv_rank":    t.get("entry_iv_rank"),
                     "entry_vix_level":  t.get("entry_vix_level"),
