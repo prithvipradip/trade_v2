@@ -21,7 +21,8 @@
 | 9 | `QQQ_365d_iron_condor_20260526_1409` | 365/30/30/5, 12 W | +4.37% | +3.86% | 29 / 38 | **5.41** / 3.05 | **9/12** / 9/12 | Removed IC direction gate (Change A) + wing-derived range threshold (Change B) |
 | 10 | `QQQ_365d_iron_condor_20260527_0353` | 365/30/30/5, 12 W | +6.88% | +3.86% | 33 / 38 | **5.70** / 3.05 | **8/12** / 9/12 | ML models fed into Optuna (Change C); reverts wing-derived threshold (Change B) |
 | 11 | `QQQ_730d_iron_condor_20260530_0531` | 730/30/30/5, 12 W | +2.69% | +2.41% | 19 / 22 | 5.25 / 3.38 | 4/12 | 730d training; Q16 answered: dead zones not recoverable by training horizon |
-| 12 | pending | 365/60/60/5, 12 W | — | — | — | — | — | 60d OOS windows; max_hold [14,45]; Change D (intraday OOS); fitted weights; entry 09:30 |
+| 12 | `QQQ_365d_iron_condor_20260531_1723` | 365/60/60/5, 12 W | −5.92% | +4.30% | 40 / 22 | −6.43 / 2.85 | 7/12 | 60d OOS windows; max_hold [14,40]; Change D (intraday OOS); fitted weights; entry 09:30 |
+| 13 | pending | 365/60/60/5, 12 W | — | — | — | — | — | GARCH ensemble member; max_concurrent=1; VIX fix; adaptive range threshold active |
 
 Config format: `train_days / test_days / step_days / gap_days`.
 All experiments: QQQ, iron_condor only, TPE sampler seed 42, $100k initial capital.
@@ -944,38 +945,186 @@ Per-window detail:
 
 ## Experiment 12 — 60-Day Windows + Relaxed max_hold + Intraday OOS + Fitted Weights
 
-**Archive:** pending
-**Date:** 2026-05-30 (running)
+**Archive:** `QQQ_365d_iron_condor_20260531_1723`
+**Date:** 2026-05-31
 **Branch:** `features-request-3`
+**Run time:** ~711 minutes (12 hours)
 
 ### Setup
 - Walk-forward config: **365d** / **60d** / **60d** / 5d → **12 windows**
-- Test period covered: 2024-06-09 to 2026-05-30 (2 years of OOS — extends back to 2024 vs Exp 10-11's 1yr)
-- W01 training starts: ~2023-06-05. Data available from 2023-05-16 ✓ (3yr backfill from Exp 11)
+- OOS period covered: 2024-05-19 → 2026-05-09 (2 years)
+- W01 training starts: ~2023-05-16. Data available from 2023-05-16 ✓ (3yr backfill)
 - Key changes from Exp 11:
   - **train_days 730 → 365** (reverted — Exp 11 confirmed 365d is better)
   - **test_days 30 → 60** (wider OOS windows → more trades per window, better stats)
   - **step_days 30 → 60** (non-overlapping maintained: step = test)
-  - **max_hold_days [10, 21] → [14, 45]** (relaxed: 60d window gives 15d end buffer vs 9d in 30d setup)
-  - **Change D**: OOS Backtester now uses intraday store — 09:30–15:30 ET entry window + limit fill simulation active in OOS (previously daily-only)
-  - **Entry window 09:30** (was 10:30 — captures full session for limit orders)
-  - **Fitted ensemble weights**: XGBoost/LightGBM blend derived from CV edge over baseline per window (not fixed 50/50)
-  - **limit_price + fill_time** fields captured on every OOS trade
+  - **max_hold_days [10, 21] → [14, 40]** (relaxed; 60d window gives 20d end buffer)
+  - **Change D**: OOS Backtester uses intraday store — 09:30–15:30 ET entry window + limit fill simulation active in OOS
+  - **Entry window 09:30** (was 10:30)
+  - **Fitted ensemble weights**: XGBoost/LightGBM blend derived from CV edge per window (not fixed 50/50)
+  - **limit_price + fill_time** captured on every OOS trade
+  - **Adaptive range threshold**: `threshold = clip(rvol_60d × √(horizon/252) × 1.25, 0.02, 0.15)` — replaces fixed 5%
+  - **Range model OOS edge tracking**: `model_weights.range_predictor.oos_scores` in window JSON
 - Optuna: 200 trials, patience 50, min_trades 7, n_jobs 6 (unchanged)
-- Data: 3yr backfill already in test DB from Exp 11; `--skip-backfill` not used, IB refreshes to today
 
 ### Assumptions Going In
-- 60d OOS windows reduce the "no trades" problem: fewer windows with 0 trades from chance/timing
-- Relaxed max_hold_days allows genuine theta harvesting over the full range Optuna historically preferred ([26, 40] in Exp 7)
-- Change D (intraday OOS) makes results more realistic and slightly reduces trade count (some days limit won't fill)
-- Fitted ensemble weights may improve per-trade quality vs Exp 10's fixed 50/50
-- E > F should hold (P18 established across Exp 9-11)
-- OOS extending back to June 2024 covers Aug 2024 VIX spike in OOS — tests a more diverse regime
+- 60d OOS windows reduce the "no trades" problem
+- Relaxed max_hold allows genuine theta harvesting (Optuna historically preferred [26, 40])
+- Change D makes results more realistic; slight trade count reduction expected
+- Fitted weights improve per-trade quality vs fixed 50/50
+- Adaptive threshold prevents single-class label failures in low-vol windows (W03 bug from pre-run testing)
+- OOS back to June 2024 covers Aug 2024 VIX spike — more diverse regime sample
 
 ### Assumptions Going In (Risks)
-- Dead zone (Oct 2025–Apr 2026) now spans ~4 of 12 windows instead of 6/12 — results may look better not because strategy improved but due to dilution with 2024 windows
-- 60d max_hold=45 with late-window entries still risks backtest_end exits — expect some but fewer than pre-Exp-8
-- Change D is a new variable: OOS trade count will differ from Exps 9-11, making direct comparison harder
+- Dead zone (Oct 2025–Apr 2026) diluted across 12 windows vs 6/12 in prior exps
+- 60d windows with up to 3 simultaneous positions still expose concentrated directional risk
+- VIX feature stuck at normalized 0.5 (bug identified post-run: `features_cache` built without VIX context)
+- Change D is a new variable — direct comparison with Exps 9-11 harder
+
+### Launch Command
+```bash
+python scripts/run_integration_test.py \
+  --symbols QQQ \
+  --config config_QQQ_test.yaml \
+  --strategies iron_condor \
+  --train-days 365 \
+  --test-days 60 \
+  --step-days 60 \
+  --gap-days 5 \
+  --optuna-seed 42 \
+  --wf-trials 200 \
+  --wf-patience 50 \
+  --wf-min-trades 7 \
+  --wf-n-jobs 6 \
+  --years 3
+```
+
+### Results — Section E (Optimized)
+
+| Metric | Value |
+|--------|-------|
+| Total return | **−5.92%** |
+| Total PnL | **−$5,924** |
+| Total trades | 40 |
+| Win rate | 47.5% |
+| Sharpe ratio | −6.43 |
+| Sortino ratio | −10.26 |
+| Max drawdown | 5.92% |
+| Profit factor | 0.33 |
+| Avg win | $156 |
+| Avg loss | $424 |
+| Active windows | 7 / 12 |
+| Dead windows | 5 / 12 |
+
+**Per-window breakdown:**
+
+| W# | OOS Period | Trades | WR | PnL | Sharpe |
+|----|-----------|--------|-----|-----|--------|
+| W01 | May–Jul 2024 | 9 | 33% | −$3,051 | −18.0 |
+| W02 | Jul–Sep 2024 | 0 | — | $0 | — |
+| W03 | Sep–Nov 2024 | 0 | — | $0 | — |
+| W04 | Nov 2024–Jan 2025 | 0 | — | $0 | — |
+| W05 | Jan–Mar 2025 | 3 | **100%** | +$1,369 | +18.5 |
+| W06 | Mar–May 2025 | 3 | 0% | −$617 | −19.9 |
+| W07 | May–Jul 2025 | 6 | 50% | −$670 | −6.8 |
+| W08 | Jul–Sep 2025 | 9 | 67% | +$151 | +1.2 |
+| W09 | Sep–Nov 2025 | 4 | **100%** | +$455 | +21.0 |
+| W10 | Nov 2025–Jan 2026 | 0 | — | $0 | — |
+| W11 | Jan–Mar 2026 | 0 | — | $0 | — |
+| W12 | Mar–May 2026 | 6 | 0% | −$3,562 | −46.5 |
+
+### Results — Section F (Ablation / Baseline)
+
+| Metric | Value |
+|--------|-------|
+| Total return (baseline) | **+4.30%** |
+| Sharpe (baseline) | **+2.85** |
+| Win rate (baseline) | 58.3% |
+| Total trades (baseline) | 22 |
+| Active windows (baseline) | — |
+
+**E < F** — optimization hurt vs baseline in this run. Optimized: −5.92% / Sharpe −6.43. Baseline: +4.30% / Sharpe +2.85. Delta: −10.22 Sharpe points.
+
+### Observations
+
+1. **Two catastrophic windows define the loss**: W01 (−$3,051) and W12 (−$3,562) together account for −$6,613. Strip them out and W02–W11 net to +$689. Both disasters share the same structural cause.
+
+2. **W01 root cause — position concentration + Jun/Jul 2024 trend**: Three ICs entered on consecutive days (Jun 5–7) stacked simultaneously; all three stopped out on Jun 17 during a sharp trending move (−$1,581). Then three more consecutive entries (Jul 9–12) were hit by the CrowdStrike-week selloff on Jul 17 (−$1,631). `max_concurrent_positions=3` allowed this stacking.
+
+3. **W12 root cause — Liberation Day (Apr 2, 2026)**: Three ICs entered Mar 13–17 were open when QQQ dropped sharply in late March. Then T4–T6 (Mar 26–30) entered directly into Liberation Day tariff shock (Apr 2). All 6 stopped out at 0% WR (−$3,562). Again, simultaneous positions hitting one macro event.
+
+4. **VIX stuck at 20.0 flat confirmed across all trades in W01 and W12**: `features_cache` was built without VIX market context — `FeatureEngine().compute(train_df)` called with no `market_context` argument. No-context fallback wrote literal `20.0` (not the normalized `0.5`) to `vix_level`, then the cache took priority over recomputation. The range model and directional predictor both received stale VIX throughout the run.
+
+5. **Dead window problem persists**: 5/12 windows dead (W02–W04, W10–W11). The range gate or min_confidence threshold is filtering out all entries across these periods. W02–W04 covers the low-volatility 2023–2024 bull run; W10–W11 covers the post-Liberation Day recovery.
+
+6. **E < F (P18 violated)**: This is the first time since Exp 8 that optimization hurt vs baseline. The baseline ran with `max_concurrent=3` and different stop/target params — it may have simply gotten lucky on W12 by not entering during the Liberation Day window. Not conclusive evidence that optimization is harmful.
+
+7. **Range predictor CV scores reasonable but not decisive**: Scores 0.39–0.71 across windows. The model cleared entries in W12 despite `trending_down` regime labels — suggesting the range model was fooled by low realized vol in the training window (pre–Liberation Day) and didn't anticipate the shock.
+
+8. **Fitted weights showed clear model preference**: Several windows went all-in on one model (W09: LGB=1.00; W11: XGB=1.00). This is working as designed but the CV scores themselves are low (direction predictor at 0.19–0.43 across all windows — barely above chance).
+
+### What We Learned
+
+- **P19 (position concentration is the primary risk)**: Both disaster windows are concentration events, not model failures. `max_concurrent_positions=3` allows stacking that turns individual bad trades into correlated cluster losses. Fix: `max_concurrent_positions=1`.
+
+- **P20 (VIX feature was silently wrong throughout)**: `features_cache` built without VIX context means the VIX feature contributed no real signal. All 40 trades had `entry_vix_level=20.0` (or normalized `0.5`) regardless of actual VIX. Fix: pass `market_context=vix_ctx` to `FeatureEngine().compute()` in `_optimize_window_params`.
+
+- **P21 (60d windows alone don't solve the dead zone problem)**: W02–W04 and W10–W11 remain dead despite wider windows. The issue is range-gate + min_confidence filtering, not window width. The 60d windows did improve trade count in active windows (W08 had 9 trades vs ~3–4 typical in 30d runs).
+
+- **P22 (the range predictor is purely ML — no statistical volatility model)**: The range predictor can't anticipate regime-change events because it learns from lagged features. Adding a GARCH model that directly forecasts conditional variance would have raised uncertainty (wider distribution, lower P(in range)) in the high-realized-vol windows preceding W01 and W12.
+
+- **Adaptive range threshold working**: No single-class failures in production (vs W03 crash in pre-run testing). The rvol-based threshold is functionally correct.
+
+### What Changed for Next Experiment (Exp 13)
+
+1. **`max_concurrent_positions: 3 → 1`** — eliminates position stacking; one IC at a time. Expected: fewer total trades per window (~3–4 sequential vs 6–9 stacked), but elimination of cluster losses.
+
+2. **VIX fix**: `_optimize_window_params` now builds `_vix_train_ctx_opt` before calling `FeatureEngine().compute()`, threading real VIX into `features_cache`. The features_cache no-context fallback also corrected from `20.0` → `0.5` (normalized).
+
+3. **GARCH ensemble member**: A third member joins the range predictor ensemble — a parametric volatility model (GARCH/GJR-GARCH/EGARCH/ARCH with Normal/Student-t/Skewed-t/GED/CTS innovation distributions). GARCH directly estimates conditional variance from the return process, orthogonal to the ML feature-based approach. Expected to raise P(in range) sensitivity to volatility regime changes. See `docs/GARCH_METHODOLOGY.md` for full mathematical specification.
+
+4. **`max_hold_days` cap confirmed at 40** (was accidentally set to 45 in Exp 12 config, corrected to 40 in param_spaces.py).
+
+---
+
+## Experiment 13 — GARCH Ensemble + Position Concentration Fix + VIX Fix
+
+**Archive:** pending
+**Date:** pending
+**Branch:** `features-request-3`
+
+### Setup
+- Walk-forward config: **365d** / **60d** / **60d** / 5d → **12 windows** (identical to Exp 12)
+- OOS period covered: 2024-05-19 → 2026-05-09 (same as Exp 12 — direct comparison)
+- Key changes from Exp 12:
+  - **`max_concurrent_positions: 3 → 1`**: one iron condor open at a time; eliminates cluster losses
+  - **VIX feature fixed**: `features_cache` now built with real VIX context; no-context fallback corrected from `20.0` → `0.5`
+  - **GARCH range predictor**: third ensemble member; fitted-weight system extended to three models; GARCH variant (GARCH/GJR/EGARCH/ARCH) and innovation distribution (Normal/Student-t/Skewed-t/GED/CTS) selected per window by BIC; full variant × distribution competition grid stored in window JSON
+  - **`max_hold_days` upper bound**: 40 (was 45 in Exp 12 actual run, corrected in param_spaces.py)
+  - **Adaptive range threshold**: already active in Exp 12; confirmed working
+- Optuna: 200 trials, patience 50, min_trades 7, n_jobs 6 (unchanged)
+
+### Assumptions Going In
+- `max_concurrent=1` eliminates W01/W12-style cluster losses. Trade count drops to ~3–4/window but individual position quality should improve
+- VIX fix gives range predictor and direction predictor real volatility context; expected to improve range model accuracy in high-vol windows
+- GARCH ensemble member provides a volatility-process-aware signal that should reduce P(in range) when conditional variance is elevated — exactly what was needed in W01 and W12
+- Exp 12 and 13 share identical window dates → direct apples-to-apples comparison of fixes
+- E > F should re-establish (P18 violated in Exp 12 due to structural bugs, not optimization quality)
+
+### Assumptions Going In (Risks)
+- `max_concurrent=1` may produce too few trades for statistically meaningful per-window win rates (3–4 trades is a very small sample)
+- GARCH may not converge on short or low-variance training windows — fallback chain (ARCH → constant vol) handles this but GARCH contribution may be zero for some windows
+- GARCH adds training time per window — total run time may increase ~20–40%
+- Same dead window problem may persist (W02–W04, W10–W11) — `max_concurrent=1` doesn't affect entry gating
+
+### Open Questions for Exp 13 Analysis
+- **Q_E13_1**: Does `max_concurrent=1` eliminate cluster losses entirely, or do single-position stop-losses still produce comparable losses?
+- **Q_E13_2**: Does the VIX fix materially change Optuna's selected params vs Exp 12?
+- **Q_E13_3**: Which GARCH variant + distribution wins most often across windows? Does CTS outperform simpler distributions?
+- **Q_E13_4**: Does GARCH receive meaningful fitted weight (>10%) or does its CV accuracy fall below the 0.50 baseline in most windows?
+- **Q_E13_5**: Does the compounding horizon method produce higher P(in range) accuracy than sqrt_scale (measured by Brier score vs realized outcomes)?
+- **Q_E13_6**: Does fixing VIX re-establish E > F (optimization > baseline)?
+- **Q_E13_7**: Do W02–W04 and W10–W11 remain dead, or does the GARCH gate open entries in those periods?
 
 ### Launch Command
 ```bash
