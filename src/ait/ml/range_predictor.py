@@ -120,12 +120,26 @@ class RangePredictor:
         features["target"] = self._create_labels(features["Close"])
         features = features.dropna(subset=["target"])
 
-        # Class balance check
+        # Class balance check — hard exit on single-class data before attempting fit.
+        # sklearn/XGBoost raise cryptic errors when y has only one unique value;
+        # catch it here with a clear diagnostic instead.
         positive_rate = features["target"].mean()
-        if positive_rate < 0.05 or positive_rate > 0.95:
+        n_pos = int(features["target"].sum())
+        n_neg = len(features) - n_pos
+        if n_pos == 0 or n_neg == 0:
+            log.warning(
+                "range_single_class", symbol=symbol,
+                in_range_pct=f"{positive_rate:.1%}",
+                n_in_range=n_pos, n_breakout=n_neg,
+                hint=f"±{self._threshold:.0%} threshold produces only one class over {self._horizon}d "
+                     f"in this training window — cannot train binary classifier",
+            )
+            return {}
+        if positive_rate < 0.05 or positive_rate > 0.98:
             log.warning(
                 "range_imbalanced", symbol=symbol,
                 in_range_pct=f"{positive_rate:.1%}",
+                n_in_range=n_pos, n_breakout=n_neg,
                 hint=f"Threshold {self._threshold:.0%} may be too tight/loose",
             )
 
@@ -137,8 +151,12 @@ class RangePredictor:
 
         accuracies = {}
 
+        # scale_pos_weight balances XGBoost on imbalanced classes (LightGBM
+        # already uses class_weight="balanced"). Value = n_negative / n_positive.
+        _spw = n_neg / n_pos if n_pos > 0 else 1.0
+
         if "xgboost" in self._weights:
-            acc = self._train_xgb(X, y)
+            acc = self._train_xgb(X, y, scale_pos_weight=_spw)
             accuracies["xgboost"] = acc
 
         if "lightgbm" in self._weights:
@@ -222,7 +240,7 @@ class RangePredictor:
             splits.append((train_idx, val_idx))
         return splits
 
-    def _train_xgb(self, X: np.ndarray, y: np.ndarray) -> float:
+    def _train_xgb(self, X: np.ndarray, y: np.ndarray, scale_pos_weight: float = 1.0) -> float:
         try:
             from xgboost import XGBClassifier
             from sklearn.metrics import balanced_accuracy_score
@@ -232,6 +250,7 @@ class RangePredictor:
                 objective="binary:logistic", eval_metric="logloss",
                 verbosity=0, n_jobs=-1,
                 random_state=42,
+                scale_pos_weight=scale_pos_weight,
             )
             scores = []
             for tr_idx, val_idx in self._walk_forward_split(len(X)):
