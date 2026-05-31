@@ -126,13 +126,17 @@ class RangePredictor:
         positive_rate = features["target"].mean()
         n_pos = int(features["target"].sum())
         n_neg = len(features) - n_pos
-        if n_pos == 0 or n_neg == 0:
+        # Require at least 10 examples of each class — fewer than that and CV folds
+        # will routinely produce single-class training splits, causing sklearn to crash.
+        _MIN_CLASS_SAMPLES = 10
+        if n_pos < _MIN_CLASS_SAMPLES or n_neg < _MIN_CLASS_SAMPLES:
             log.warning(
                 "range_single_class", symbol=symbol,
                 in_range_pct=f"{positive_rate:.1%}",
                 n_in_range=n_pos, n_breakout=n_neg,
-                hint=f"±{self._threshold:.0%} threshold produces only one class over {self._horizon}d "
-                     f"in this training window — cannot train binary classifier",
+                min_required=_MIN_CLASS_SAMPLES,
+                hint=f"±{self._threshold:.0%} threshold produces too few minority-class "
+                     f"examples to train reliably — cannot train binary classifier",
             )
             return {}
         if positive_rate < 0.05 or positive_rate > 0.98:
@@ -254,6 +258,8 @@ class RangePredictor:
             )
             scores = []
             for tr_idx, val_idx in self._walk_forward_split(len(X)):
+                if len(np.unique(y[tr_idx])) < 2:
+                    continue  # skip fold — training split is single-class
                 fold_scaler = StandardScaler()
                 X_tr = pd.DataFrame(
                     fold_scaler.fit_transform(X[tr_idx]), columns=self._feature_names,
@@ -285,6 +291,8 @@ class RangePredictor:
             )
             scores = []
             for tr_idx, val_idx in self._walk_forward_split(len(X)):
+                if len(np.unique(y[tr_idx])) < 2:
+                    continue  # skip fold — training split is single-class
                 fold_scaler = StandardScaler()
                 X_tr = pd.DataFrame(
                     fold_scaler.fit_transform(X[tr_idx]), columns=self._feature_names,

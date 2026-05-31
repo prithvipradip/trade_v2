@@ -115,13 +115,15 @@ class VolMagnitudePredictor:
         positive_rate = features["target"].mean()
         n_pos = int(features["target"].sum())
         n_neg = len(features) - n_pos
-        if n_pos == 0 or n_neg == 0:
+        _MIN_CLASS_SAMPLES = 10
+        if n_pos < _MIN_CLASS_SAMPLES or n_neg < _MIN_CLASS_SAMPLES:
             log.warning(
                 "vol_mag_single_class", symbol=symbol,
                 big_move_pct=f"{positive_rate:.1%}",
                 n_big_move=n_pos, n_small_move=n_neg,
-                hint=f"±{self._threshold:.0%} threshold produces only one class — "
-                     f"cannot train binary classifier",
+                min_required=_MIN_CLASS_SAMPLES,
+                hint=f"±{self._threshold:.0%} threshold produces too few minority-class "
+                     f"examples to train reliably — cannot train binary classifier",
             )
             return {}
         if positive_rate < 0.05 or positive_rate > 0.98:
@@ -239,6 +241,8 @@ class VolMagnitudePredictor:
             )
             scores = []
             for tr_idx, val_idx in self._walk_forward_split(len(X)):
+                if len(np.unique(y[tr_idx])) < 2:
+                    continue
                 fold_scaler = StandardScaler()
                 X_tr = pd.DataFrame(
                     fold_scaler.fit_transform(X[tr_idx]), columns=self._feature_names,
@@ -269,6 +273,8 @@ class VolMagnitudePredictor:
             )
             scores = []
             for tr_idx, val_idx in self._walk_forward_split(len(X)):
+                if len(np.unique(y[tr_idx])) < 2:
+                    continue
                 fold_scaler = StandardScaler()
                 X_tr = pd.DataFrame(
                     fold_scaler.fit_transform(X[tr_idx]), columns=self._feature_names,
