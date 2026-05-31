@@ -1,0 +1,58 @@
+============================================================
+  WALK-FORWARD BACKTEST RESULTS
+============================================================
+  Windows:           12
+  Total Trades:      40
+  Total Return:      -5.92%
+  Cash-Drag Adj Ret: N/A  (multi-month run; see equity_curve.csv)
+------------------------------------------------------------
+  RISK-ADJUSTED
+  Sharpe Ratio:      -6.43
+  Sortino Ratio:     -10.26  (downside-only vol)
+  Max Drawdown:      5.92%
+------------------------------------------------------------
+  TRADE QUALITY
+  Win Rate:          47.50%
+  Avg Win:           $156.40
+  Avg Loss:          $423.61
+  Win/Loss Ratio:    0.37  (>1 = winners bigger)
+  Expectancy/Trade:  $-148.11
+  Best Trade:        $896.34
+  Worst Trade:       $-998.81
+  Profit Factor:     0.33
+------------------------------------------------------------
+  CAPITAL EFFICIENCY
+  Utilization:       3.2%  (avg % deployed)
+  RAROC:             -181.9%  (return on deployed)
+------------------------------------------------------------
+  CONSISTENCY
+  Profitable Windows: 3/12 (25%)
+  Active Windows:     7/12 (58%)
+  Dead Windows:       5/12 (42%)
+  Avg Window Return: -0.49%
+------------------------------------------------------------
+  STRATEGY BREAKDOWN:
+    iron_condor               | trades= 40 | win=48% | pnl=$-5,924
+  SYMBOL BREAKDOWN:
+    QQQ      | return=-5.92% | trades= 40 | sharpe=-6.43
+------------------------------------------------------------
+  PER-WINDOW BREAKDOWN:
+  W01  2024-05-19 -> 2024-07-18 | trades=  9 | WR= 33% | pnl=$  -3,051 | sharpe=-18.0
+  W02  2024-07-18 -> 2024-09-16 | trades=  0 | WR=  0% | pnl=$       0 | [dead]
+  W03  2024-09-16 -> 2024-11-15 | trades=  0 | WR=  0% | pnl=$       0 | [dead]
+  W04  2024-11-15 -> 2025-01-14 | trades=  0 | WR=  0% | pnl=$       0 | [dead]
+  W05  2025-01-14 -> 2025-03-15 | trades=  3 | WR=100% | pnl=$  +1,369 | sharpe=+18.5
+  W06  2025-03-15 -> 2025-05-14 | trades=  3 | WR=  0% | pnl=$    -617 | sharpe=-19.9
+  W07  2025-05-14 -> 2025-07-13 | trades=  6 | WR= 50% | pnl=$    -670 | sharpe= -6.8
+  W08  2025-07-13 -> 2025-09-11 | trades=  9 | WR= 67% | pnl=$    +151 | sharpe= +1.2
+  W09  2025-09-11 -> 2025-11-10 | trades=  4 | WR=100% | pnl=$    +455 | sharpe=+21.0
+  W10  2025-11-10 -> 2026-01-09 | trades=  0 | WR=  0% | pnl=$       0 | [dead]
+  W11  2026-01-09 -> 2026-03-10 | trades=  0 | WR=  0% | pnl=$       0 | [dead]
+  W12  2026-03-10 -> 2026-05-09 | trades=  6 | WR=  0% | pnl=$  -3,562 | sharpe=-46.5
+============================================================
+  NOTE: walkforward_summary.txt was regenerated post-run.
+  The live-run version captured only 7 of 12 windows
+  (script written summary before W11-W12 completed).
+  This version reflects all 12 window results from
+  the individual window_NNN.json files.
+============================================================
