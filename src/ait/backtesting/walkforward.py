@@ -813,10 +813,9 @@ class WalkForwardBacktester:
             # params against _simple_direction fallback with no range gate — a
             # different signal than what ran in OOS.
             predictor = self._train_window_model(train_df, symbol, window_id)
-            range_predictor, _range_model_status = self._train_window_range_model(
+            range_predictor, _range_model_status, _range_threshold = self._train_window_range_model(
                 train_df, symbol, window_id,
                 max_hold_days=self._config.max_hold_days,
-                threshold_pct=self._config.range_threshold_pct,
             )
 
             window_cfg = self._config
@@ -842,11 +841,15 @@ class WalkForwardBacktester:
                 rp_sym = getattr(range_predictor, "_symbol_models", {}).get(symbol, {})
                 _model_weights["range_predictor"] = {
                     "status": _range_model_status,
+                    "threshold_pct": round(_range_threshold, 4),
                     "fitted_weights": dict(range_predictor.fitted_weights),
                     "cv_scores": dict(rp_sym.get("cv_scores", {})),
                 }
             else:
-                _model_weights["range_predictor"] = {"status": _range_model_status}
+                _model_weights["range_predictor"] = {
+                    "status": _range_model_status,
+                    "threshold_pct": round(_range_threshold, 4),
+                }
             if predictor is not None and predictor.fitted_weights:
                 _model_weights["direction_predictor"] = {
                     "fitted_weights": dict(predictor.fitted_weights),
@@ -964,7 +967,7 @@ class WalkForwardBacktester:
             if range_predictor is not None and range_predictor.is_trained:
                 _oos_scores = self._evaluate_range_model_oos(
                     range_predictor, test_df, symbol,
-                    threshold_pct=self._config.range_threshold_pct,
+                    threshold_pct=_range_threshold,
                     horizon_days=self._config.max_hold_days,
                 )
                 if _oos_scores and "range_predictor" in _model_weights:
@@ -1360,20 +1363,52 @@ class WalkForwardBacktester:
             log.debug("range_oos_eval_failed", symbol=symbol, error=str(e))
             return {}
 
+    @staticmethod
+    def _adaptive_range_threshold(
+        train_df: pd.DataFrame,
+        horizon_days: int,
+        lookback_days: int = 60,
+        multiplier: float = 1.25,
+        low_clip: float = 0.02,
+        high_clip: float = 0.15,
+    ) -> float:
+        """Derive a regime-adaptive range threshold from recent realized volatility.
+
+        Uses the last `lookback_days` of training data to estimate 1-day realized
+        vol, then scales to the horizon via √(horizon/252). The 1.25× multiplier
+        places the threshold at ~1.25 standard deviations — an iron condor survives
+        ~85% of moves under a normal distribution at this width.
+
+        Clipped to [low_clip, high_clip] to prevent degenerate extremes.
+
+        Example outputs for QQQ:
+          Quiet bull run (rvol≈15%): threshold ≈ 4.3% for 21d horizon
+          Normal regime (rvol≈20%): threshold ≈ 5.7%
+          High-vol spike (rvol≈35%): threshold ≈ 10.1%
+        """
+        recent = train_df["Close"].pct_change().tail(lookback_days).dropna()
+        if len(recent) < 10:
+            return 0.05  # insufficient data — fall back to fixed default
+        rvol_annual = float(recent.std() * np.sqrt(252))
+        raw = rvol_annual * np.sqrt(horizon_days / 252) * multiplier
+        return float(np.clip(raw, low_clip, high_clip))
+
     def _train_window_range_model(
         self,
         train_df: pd.DataFrame,
         symbol: str,
         window_id: int,
         max_hold_days: int = 30,
-        threshold_pct: float = 0.05,
-    ) -> "tuple[Any | None, str]":
+    ) -> "tuple[Any | None, str, float]":
         """Train range predictor on this window's training data.
 
-        Returns (predictor, status) where status is 'ok' or a failure reason.
+        Returns (predictor, status, threshold_used) where:
+        - status is 'ok' or a failure reason
+        - threshold_used is the adaptive ±X% range threshold applied
         Callers must check status — a None predictor means no range gate is
         available and OOS entries should be blocked for iron condors.
         """
+        threshold_pct = self._adaptive_range_threshold(train_df, horizon_days=max_hold_days)
         try:
             from ait.ml.range_predictor import RangePredictor
             intraday_store = None
@@ -1386,9 +1421,10 @@ class WalkForwardBacktester:
                 avg = sum(accs.values()) / len(accs)
                 log.info("window_range_model_trained",
                          window=window_id, symbol=symbol,
-                         accuracy=f"{avg:.3f}")
-                return rp, "ok"
-            return None, "training_returned_no_accuracy"
+                         accuracy=f"{avg:.3f}",
+                         threshold_pct=f"{threshold_pct:.3f}")
+                return rp, "ok", threshold_pct
+            return None, "training_returned_no_accuracy", threshold_pct
         except Exception as e:
             reason = str(e)
             log.warning(
@@ -1396,9 +1432,10 @@ class WalkForwardBacktester:
                 window=window_id,
                 symbol=symbol,
                 error=reason,
+                threshold_pct=f"{threshold_pct:.3f}",
                 action="OOS IC entries will be blocked — no range gate available",
             )
-            return None, f"exception: {reason}"
+            return None, f"exception: {reason}", threshold_pct
 
     def _train_window_model(
         self, train_df: pd.DataFrame, symbol: str, window_id: int
