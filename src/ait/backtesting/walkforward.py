@@ -813,7 +813,7 @@ class WalkForwardBacktester:
             # params against _simple_direction fallback with no range gate — a
             # different signal than what ran in OOS.
             predictor = self._train_window_model(train_df, symbol, window_id)
-            range_predictor = self._train_window_range_model(
+            range_predictor, _range_model_status = self._train_window_range_model(
                 train_df, symbol, window_id,
                 max_hold_days=self._config.max_hold_days,
                 threshold_pct=self._config.range_threshold_pct,
@@ -841,9 +841,12 @@ class WalkForwardBacktester:
             if range_predictor is not None and range_predictor.fitted_weights:
                 rp_sym = getattr(range_predictor, "_symbol_models", {}).get(symbol, {})
                 _model_weights["range_predictor"] = {
+                    "status": _range_model_status,
                     "fitted_weights": dict(range_predictor.fitted_weights),
                     "cv_scores": dict(rp_sym.get("cv_scores", {})),
                 }
+            else:
+                _model_weights["range_predictor"] = {"status": _range_model_status}
             if predictor is not None and predictor.fitted_weights:
                 _model_weights["direction_predictor"] = {
                     "fitted_weights": dict(predictor.fitted_weights),
@@ -896,8 +899,21 @@ class WalkForwardBacktester:
                 if not _vix_w.empty:
                     _vix_ctx = {"vix": _vix_w}
 
+            # When the range model failed to train, block all OOS IC entries by
+            # raising range_min_confidence to an unreachable value. Without a range
+            # gate, iron condors have no entry signal and should not trade.
+            _oos_range_min_conf = getattr(window_cfg, "range_min_confidence", 0.55)
+            if range_predictor is None and _range_model_status != "ok":
+                log.warning(
+                    "range_model_absent_blocking_oos",
+                    window=window_id, symbol=symbol,
+                    status=_range_model_status,
+                    action="setting range_min_confidence=1.0 to block OOS IC entries",
+                )
+                _oos_range_min_conf = 1.0
+
             # Change D: pass intraday_store to OOS Backtester so entries are
-            # gated by the 10:30–15:30 ET entry window and limit-fill simulation,
+            # gated by the 09:30–15:30 ET entry window and limit-fill simulation,
             # matching the live-trading execution model. Also enables capture of
             # limit_price and fill_time on every OOS trade.
             _oos_intraday_store = None
@@ -922,7 +938,7 @@ class WalkForwardBacktester:
                 breakeven_trigger_pct=window_cfg.breakeven_trigger_pct,
                 predictor=predictor,
                 range_predictor=range_predictor,
-                range_min_confidence=getattr(window_cfg, "range_min_confidence", 0.55),
+                range_min_confidence=_oos_range_min_conf,
                 hurst_regime_threshold=getattr(window_cfg, "hurst_regime_threshold", 0.20),
                 hurst_regime_penalty=getattr(window_cfg, "hurst_regime_penalty", 0.10),
                 multifractal_max_width=getattr(window_cfg, "multifractal_max_width", 0.50),
@@ -1225,8 +1241,13 @@ class WalkForwardBacktester:
         window_id: int,
         max_hold_days: int = 30,
         threshold_pct: float = 0.05,
-    ):
-        """Train range predictor on this window's training data."""
+    ) -> "tuple[Any | None, str]":
+        """Train range predictor on this window's training data.
+
+        Returns (predictor, status) where status is 'ok' or a failure reason.
+        Callers must check status — a None predictor means no range gate is
+        available and OOS entries should be blocked for iron condors.
+        """
         try:
             from ait.ml.range_predictor import RangePredictor
             intraday_store = None
@@ -1240,11 +1261,18 @@ class WalkForwardBacktester:
                 log.info("window_range_model_trained",
                          window=window_id, symbol=symbol,
                          accuracy=f"{avg:.3f}")
-                return rp
+                return rp, "ok"
+            return None, "training_returned_no_accuracy"
         except Exception as e:
-            log.debug("range_model_train_failed", window=window_id,
-                      symbol=symbol, error=str(e))
-        return None
+            reason = str(e)
+            log.warning(
+                "range_model_train_failed",
+                window=window_id,
+                symbol=symbol,
+                error=reason,
+                action="OOS IC entries will be blocked — no range gate available",
+            )
+            return None, f"exception: {reason}"
 
     def _train_window_model(
         self, train_df: pd.DataFrame, symbol: str, window_id: int
