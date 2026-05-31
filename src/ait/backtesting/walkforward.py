@@ -959,6 +959,17 @@ class WalkForwardBacktester:
             )
             result = bt.run()
 
+            # Evaluate range predictor on OOS data — measures how well CV edge
+            # generalised to the test window and exposes train/test gap per model.
+            if range_predictor is not None and range_predictor.is_trained:
+                _oos_scores = self._evaluate_range_model_oos(
+                    range_predictor, test_df, symbol,
+                    threshold_pct=self._config.range_threshold_pct,
+                    horizon_days=self._config.max_hold_days,
+                )
+                if _oos_scores and "range_predictor" in _model_weights:
+                    _model_weights["range_predictor"]["oos_scores"] = _oos_scores
+
             for t in result.trades:
                 t["symbol"] = symbol
             all_symbol_trades.extend(result.trades)
@@ -1233,6 +1244,121 @@ class WalkForwardBacktester:
         except Exception as e:
             log.warning("window_optimization_failed", window=window_id, symbol=symbol, error=str(e))
             return None, None, None
+
+    def _evaluate_range_model_oos(
+        self,
+        range_predictor: "Any",
+        test_df: pd.DataFrame,
+        symbol: str,
+        threshold_pct: float = 0.05,
+        horizon_days: int = 30,
+    ) -> dict:
+        """Evaluate range predictor accuracy on OOS test data.
+
+        Computes per-model and ensemble balanced accuracy on the test window,
+        using the same labelling logic as training. Returns a dict with
+        per-model OOS balanced accuracy and edge-over-baseline so the
+        train/test generalisation gap is visible in the window JSON.
+
+        Returns empty dict if evaluation is not possible (too few rows,
+        single-class labels, or models not available).
+        """
+        try:
+            from sklearn.metrics import balanced_accuracy_score
+            import numpy as _np
+
+            # Need horizon_days future rows to label — check for sufficient data
+            if len(test_df) <= horizon_days + 5:
+                return {}
+
+            # Create OOS labels using same logic as RangePredictor._create_labels
+            close = test_df["Close"]
+            labels = {}
+            for t in range(len(close) - horizon_days):
+                base = close.iloc[t]
+                future = close.iloc[t + 1: t + 1 + horizon_days]
+                max_dev = float((future / base - 1).abs().max())
+                labels[t] = 1 if max_dev < threshold_pct else 0
+            if not labels:
+                return {}
+
+            label_idx = list(labels.keys())
+            y_true = _np.array([labels[i] for i in label_idx])
+            if len(_np.unique(y_true)) < 2:
+                return {}  # single-class OOS — can't score
+
+            # Get features for the labelable rows
+            rp_sym = getattr(range_predictor, "_symbol_models", {}).get(symbol, {})
+            models = rp_sym.get("models", getattr(range_predictor, "_models", {}))
+            scaler = rp_sym.get("scaler", getattr(range_predictor, "_scaler", None))
+            feature_names = rp_sym.get("feature_names",
+                                       getattr(range_predictor, "_feature_names", []))
+            if not models or scaler is None or not feature_names:
+                return {}
+
+            feat_engine = getattr(range_predictor, "_feature_engine", None)
+            if feat_engine is None:
+                return {}
+
+            features = feat_engine.compute(test_df)
+            if features.empty or len(features) <= horizon_days:
+                return {}
+
+            # Align features to labelled rows
+            feat_rows = features.iloc[label_idx]
+            missing = [f for f in feature_names if f not in feat_rows.columns]
+            if missing:
+                return {}
+
+            X = feat_rows[feature_names]
+            try:
+                X_scaled = pd.DataFrame(
+                    scaler.transform(X.values), columns=feature_names,
+                )
+            except Exception:
+                return {}
+
+            # Score each model individually
+            oos_scores: dict = {}
+            ensemble_proba = _np.zeros(len(y_true))
+            weights = getattr(range_predictor, "_fitted_weights", None) or {}
+            total_weight = sum(weights.get(n, 0.5) for n in models)
+
+            for name, model in models.items():
+                try:
+                    proba = model.predict_proba(X_scaled)[:, 1]
+                    preds = (proba >= 0.5).astype(int)
+                    bal_acc = float(balanced_accuracy_score(y_true, preds))
+                    oos_scores[name] = round(bal_acc, 4)
+                    w = weights.get(name, 0.5) / total_weight if total_weight > 0 else 0.5
+                    ensemble_proba += w * proba
+                except Exception:
+                    continue
+
+            if not oos_scores:
+                return {}
+
+            # Ensemble score
+            ensemble_preds = (ensemble_proba >= 0.5).astype(int)
+            oos_scores["ensemble"] = round(
+                float(balanced_accuracy_score(y_true, ensemble_preds)), 4
+            )
+
+            # Edge = balanced_acc - 0.50 baseline
+            baseline = 0.50
+            oos_edge = {k: round(v - baseline, 4) for k, v in oos_scores.items()}
+
+            log.debug(
+                "range_oos_evaluated",
+                window=symbol, symbol=symbol,
+                oos_scores=oos_scores, oos_edge=oos_edge,
+                n_samples=len(y_true),
+            )
+            return {"balanced_accuracy": oos_scores, "edge": oos_edge}
+
+        except Exception as e:
+            log.debug("range_oos_eval_failed", symbol=symbol, error=str(e))
+            return {}
 
     def _train_window_range_model(
         self,
