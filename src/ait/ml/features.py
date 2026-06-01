@@ -753,8 +753,10 @@ class FeatureEngine:
         The model needs to know if it's a risk-on or risk-off environment.
         """
         if not market_context:
-            # Fill with neutral defaults so feature count stays consistent
-            df["vix_level"] = 20.0
+            # Fill with neutral defaults so feature count stays consistent.
+            # 0.5 = normalised VIX 20 (vix_close/40) — matches the else-branch
+            # below and avoids the misleading literal 20.0 appearing in trade logs.
+            df["vix_level"] = 0.5
             df["vix_change_5d"] = 0.0
             df["vix_change_20d"] = 0.0
             df["vix_zscore"] = 0.0

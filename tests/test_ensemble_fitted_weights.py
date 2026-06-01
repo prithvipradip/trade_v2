@@ -47,7 +47,7 @@ class TestRangePredictorFittedWeights:
         rp.train(df, symbol="QQQ")
         assert rp.is_trained
         fw = rp._symbol_models["QQQ"]["fitted_weights"]
-        assert set(fw.keys()) == {"xgboost", "lightgbm"}
+        assert {"xgboost", "lightgbm"} <= set(fw.keys())  # garch may also be present
 
     def test_fitted_weights_sum_to_one(self):
         from ait.ml.range_predictor import RangePredictor
@@ -68,7 +68,7 @@ class TestRangePredictorFittedWeights:
         rp = RangePredictor(threshold_pct=0.05, horizon_days=10)
         rp.train(_make_ohlcv(), symbol="QQQ")
         assert rp.fitted_weights is not None
-        assert set(rp.fitted_weights.keys()) == {"xgboost", "lightgbm"}
+        assert {"xgboost", "lightgbm"} <= set(rp.fitted_weights.keys())  # garch may also be present
 
     def test_property_returns_none_before_train(self):
         from ait.ml.range_predictor import RangePredictor

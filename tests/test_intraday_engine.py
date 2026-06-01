@@ -117,7 +117,7 @@ class TestLimitOrderFill:
                 dt.datetime(2024, 1, 5, 10, 45),
             ]),
         )
-        filled, bars_waited = bt._try_limit_fill(limit_price, session_bars, timeout_bars=3)
+        filled, bars_waited, fill_time = bt._try_limit_fill(limit_price, session_bars, timeout_bars=3)
         assert filled is True  # must fill within timeout
 
     def test_limit_order_cancels_after_timeout(self) -> None:
@@ -134,7 +134,7 @@ class TestLimitOrderFill:
                 for h, m in [(10, 35), (10, 40), (10, 45), (10, 50)]
             ]),
         )
-        filled, bars_waited = bt._try_limit_fill(limit_price, session_bars, timeout_bars=3)
+        filled, bars_waited, fill_time = bt._try_limit_fill(limit_price, session_bars, timeout_bars=3)
         assert filled is False
 
 

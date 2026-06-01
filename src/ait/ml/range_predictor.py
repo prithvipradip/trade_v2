@@ -61,10 +61,21 @@ class RangePredictor:
         threshold_pct: float = 0.05,
         horizon_days: int = 30,
         ensemble_weights: dict[str, float] | None = None,
+        enable_garch: bool = False,
     ) -> None:
         self._threshold = threshold_pct
         self._horizon = horizon_days
-        self._weights = ensemble_weights or {"xgboost": 0.5, "lightgbm": 0.5}
+        self._enable_garch = enable_garch
+        # When GARCH is enabled, use equal three-way split as the prior (weights
+        # are replaced by fitted CV-edge weights after training).
+        # If caller passes explicit ensemble_weights, respect them as-is for
+        # backward compat (e.g. tests that pass {"xgboost":0.5,"lightgbm":0.5}).
+        if ensemble_weights is not None:
+            self._weights = ensemble_weights
+        elif enable_garch:
+            self._weights = {"xgboost": 0.333, "lightgbm": 0.333, "garch": 0.334}
+        else:
+            self._weights = {"xgboost": 0.5, "lightgbm": 0.5}
         self._models: dict = {}
         self._symbol_models: dict[str, dict] = {}
         self._scaler = StandardScaler()
@@ -167,6 +178,11 @@ class RangePredictor:
             acc = self._train_lgb(X, y)
             accuracies["lightgbm"] = acc
 
+        if self._enable_garch and "garch" in self._weights:
+            garch_acc = self._train_garch(features["Close"])
+            if garch_acc > 0:
+                accuracies["garch"] = garch_acc
+
         # Final fit on all data
         self._scaler.fit(X)
         X_scaled = pd.DataFrame(
@@ -185,10 +201,11 @@ class RangePredictor:
             _baseline = 0.50
             _edges = {m: max(0.0, acc - _baseline) for m, acc in accuracies.items()}
             _total = sum(_edges.values())
+            n_models = len(accuracies)
             fitted_weights = (
                 {m: e / _total for m, e in _edges.items()}
                 if _total > 0
-                else {m: 0.5 for m in accuracies}
+                else {m: 1.0 / n_models for m in accuracies}
             )
             self._fitted_weights: dict[str, float] = fitted_weights
 
@@ -202,6 +219,7 @@ class RangePredictor:
                             importances[name] = dict(zip(self._feature_names, arr.tolist()))
                         except Exception:
                             pass
+                _garch_state = getattr(self, "_garch_state", None)
                 self._symbol_models[symbol] = {
                     "models": copy.deepcopy(self._models),
                     "scaler": copy.deepcopy(self._scaler),
@@ -211,6 +229,17 @@ class RangePredictor:
                     "feature_importances": importances,
                     "in_range_rate": float(positive_rate),
                     "version": self._model_version,
+                    # GARCH ensemble member metadata
+                    "garch_state":   _garch_state,
+                    "garch_variant": (_garch_state or {}).get("selected_variant"),
+                    "garch_dist":    (_garch_state or {}).get("selected_dist"),
+                    "garch_dist_bic": (_garch_state or {}).get("selected_bic"),
+                    "garch_jb_pvalue": (_garch_state or {}).get("jb_pvalue"),
+                    "garch_resid_skewness": (_garch_state or {}).get("resid_skewness"),
+                    "garch_fallback": (_garch_state or {}).get("fallback_used"),
+                    "garch_stable_attempted": (_garch_state or {}).get("garch_stable_attempted"),
+                    "garch_stable_converged": (_garch_state or {}).get("garch_stable_converged"),
+                    "garch_all_variants": (_garch_state or {}).get("garch_all_variants", {}),
                 }
 
             self._save_models()
@@ -225,6 +254,45 @@ class RangePredictor:
             )
 
         return accuracies
+
+    def _train_garch(self, close: pd.Series) -> float:
+        """CV-evaluate GARCH range model. Returns mean balanced accuracy or 0.0.
+
+        Mirrors _train_xgb/_train_lgb pattern but operates on the Close price
+        series directly (GARCH uses returns, not the feature matrix).
+        Stores the full-training-data GARCH state in self._garch_state.
+        """
+        try:
+            from ait.ml.garch_range_predictor import GARCHRangeModel
+        except ImportError:
+            log.warning("garch_not_available", hint="pip install arch>=7.2")
+            return 0.0
+
+        garch = GARCHRangeModel()
+        splits = self._walk_forward_split(len(close))
+        acc = garch.cv_score(
+            close=close,
+            horizon_days=self._horizon,
+            threshold_pct=self._threshold,
+            splits=splits,
+            create_labels_fn=self._create_labels,
+        )
+
+        # Fit on full training data — stored for predict()
+        try:
+            self._garch_state: dict = garch.fit(close, self._horizon, self._threshold)
+        except Exception as e:
+            log.warning("garch_full_fit_failed", error=str(e))
+            self._garch_state = {}
+
+        log.info(
+            "range_garch_trained",
+            cv_balanced_acc=f"{acc:.3f}",
+            variant=self._garch_state.get("selected_variant"),
+            dist=self._garch_state.get("selected_dist"),
+            fallback=self._garch_state.get("fallback_used"),
+        )
+        return acc
 
     @property
     def fitted_weights(self) -> "dict[str, float] | None":
@@ -381,6 +449,19 @@ class RangePredictor:
                 total_weight += w
             except Exception:
                 continue
+
+        # GARCH ensemble contribution
+        garch_state = (sym_data or {}).get("garch_state") or getattr(self, "_garch_state", None)
+        if garch_state:
+            w_garch = (fw or {}).get("garch", 0.0)
+            if w_garch > 0:
+                try:
+                    from ait.ml.garch_range_predictor import GARCHRangeModel
+                    p_garch = GARCHRangeModel().predict_p_in_range(garch_state)
+                    weighted_p += w_garch * p_garch
+                    total_weight += w_garch
+                except Exception:
+                    pass
 
         if total_weight == 0:
             return None

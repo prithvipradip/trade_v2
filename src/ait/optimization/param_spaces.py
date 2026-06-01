@@ -35,10 +35,9 @@ IRON_CONDOR_SPACE: dict[str, tuple] = {
     # coherent relative to target rather than as an independent dimension that can cancel it.
     "trailing_stop_fraction": ("float", 0.30, 0.90),
     "delta_short":            ("float", 0.15, 0.30),
-    # Relaxed to [14, 45] for Exp 12: 60-day OOS windows give 15-day end buffer
-    # (60-45=15 vs 30-21=9 in Exp 8-11). Allows genuine theta harvesting over
-    # longer holds without backtest_end boundary inflation.
-    "max_hold_days":          ("int",   14,   45),
+    # [14, 40]: 60-day OOS windows give a 20-day end buffer (60-40=20), keeping
+    # backtest_end exits rare while still allowing meaningful theta harvesting.
+    "max_hold_days":          ("int",   14,   40),
     "wing_k":                 ("float", 0.30, 2.00),
     **FRACTAL_GATE_SPACE,
 }

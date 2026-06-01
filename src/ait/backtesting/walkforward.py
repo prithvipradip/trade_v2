@@ -60,7 +60,7 @@ class WalkForwardConfig:
     trailing_stop_enabled: bool = True
     trailing_stop_pct: float = 0.25
     breakeven_trigger_pct: float = 0.30
-    max_concurrent_positions: int = 3
+    max_concurrent_positions: int = 1
     max_entry_vol_annual: float = 0.80
     optimize_per_window: bool = False
     optimize_n_trials: int = 50
@@ -790,6 +790,7 @@ class WalkForwardBacktester:
         active_symbols = 0
         curr_best_params: dict | None = None
         _optuna_meta: dict | None = None
+        _model_weights: dict = {}  # initialised here so it's always bound even if loop is empty
         # Use full capital per symbol — splitting by symbol count makes iron condors
         # impossible on stocks priced >$50 (max_loss_per_contract too large).
         per_symbol_capital = self._config.initial_capital
@@ -813,10 +814,23 @@ class WalkForwardBacktester:
             # params against _simple_direction fallback with no range gate — a
             # different signal than what ran in OOS.
             predictor = self._train_window_model(train_df, symbol, window_id)
-            range_predictor, _range_model_status, _range_threshold = self._train_window_range_model(
+            _range_result = self._train_window_range_model(
                 train_df, symbol, window_id,
                 max_hold_days=self._config.max_hold_days,
             )
+            # Guard: tests may monkeypatch _train_window_range_model to return None
+            if _range_result is None or not isinstance(_range_result, tuple):
+                range_predictor, _range_model_status, _range_threshold = None, "skipped", 0.05
+            else:
+                range_predictor, _range_model_status, _range_threshold = _range_result
+
+            # Build VIX context for the training slice so features_cache has real
+            # VIX values instead of the neutral 0.5 fill used when no context is provided.
+            _vix_train_ctx_opt: dict | None = None
+            if not vix_full.empty:
+                _vix_t_opt = vix_full.reindex(train_df.index, method="ffill").dropna(how="all")
+                if not _vix_t_opt.empty:
+                    _vix_train_ctx_opt = {"vix": _vix_t_opt}
 
             window_cfg = self._config
             if self._config.optimize_per_window:
@@ -825,6 +839,7 @@ class WalkForwardBacktester:
                     prior_oos_result=prev_oos,
                     prior_best_params=prev_best_params,
                     range_predictor=range_predictor,
+                    vix_ctx=_vix_train_ctx_opt,
                 )
                 window_cfg = new_cfg or self._config
                 if best_params is not None:
@@ -839,15 +854,28 @@ class WalkForwardBacktester:
             _model_weights: dict = {}
             if range_predictor is not None and range_predictor.fitted_weights:
                 rp_sym = getattr(range_predictor, "_symbol_models", {}).get(symbol, {})
+                _garch_state = rp_sym.get("garch_state") or {}
                 _model_weights["range_predictor"] = {
-                    "status": _range_model_status,
-                    "threshold_pct": round(_range_threshold, 4),
-                    "fitted_weights": dict(range_predictor.fitted_weights),
-                    "cv_scores": dict(rp_sym.get("cv_scores", {})),
+                    "status":          _range_model_status,
+                    "threshold_pct":   round(_range_threshold, 4),
+                    "fitted_weights":  dict(range_predictor.fitted_weights),
+                    "cv_scores":       dict(rp_sym.get("cv_scores", {})),
+                    # GARCH metadata
+                    "garch_selected_variant":   rp_sym.get("garch_variant"),
+                    "garch_selected_dist":      rp_sym.get("garch_dist"),
+                    "garch_selected_bic":       rp_sym.get("garch_dist_bic"),
+                    "garch_fallback":           rp_sym.get("garch_fallback"),
+                    "garch_jb_pvalue":          rp_sym.get("garch_jb_pvalue"),
+                    "garch_resid_skewness":     rp_sym.get("garch_resid_skewness"),
+                    "garch_stable_attempted":   rp_sym.get("garch_stable_attempted"),
+                    "garch_stable_converged":   rp_sym.get("garch_stable_converged"),
+                    "p_in_range_compounding":   _garch_state.get("p_in_range_compounding"),
+                    "p_in_range_sqrt_scale":    _garch_state.get("p_in_range_sqrt_scale"),
+                    "garch_all_variants":       rp_sym.get("garch_all_variants", {}),
                 }
             else:
                 _model_weights["range_predictor"] = {
-                    "status": _range_model_status,
+                    "status":        _range_model_status,
                     "threshold_pct": round(_range_threshold, 4),
                 }
             if predictor is not None and predictor.fitted_weights:
@@ -1133,6 +1161,7 @@ class WalkForwardBacktester:
         prior_oos_result: "BacktestResult | None" = None,
         prior_best_params: "dict | None" = None,
         range_predictor: "Any | None" = None,
+        vix_ctx: "dict | None" = None,
     ) -> "tuple[WalkForwardConfig | None, dict | None, dict | None]":
         """Run Optuna on the training slice and return (updated_config, best_params, optuna_meta).
 
@@ -1154,7 +1183,8 @@ class WalkForwardBacktester:
                     from ait.data.historical import HistoricalDataStore
                     _intraday_store = HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
                 features_cache = FeatureEngine().compute(
-                    train_df, intraday_store=_intraday_store, symbol=symbol
+                    train_df, intraday_store=_intraday_store, symbol=symbol,
+                    market_context=vix_ctx,
                 )
             except Exception:
                 features_cache = None
@@ -1415,7 +1445,8 @@ class WalkForwardBacktester:
             if self._db_path is not None:
                 from ait.data.historical import HistoricalDataStore
                 intraday_store = HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
-            rp = RangePredictor(threshold_pct=threshold_pct, horizon_days=max_hold_days)
+            rp = RangePredictor(threshold_pct=threshold_pct, horizon_days=max_hold_days,
+                                enable_garch=True)
             accs = rp.train(train_df, symbol=symbol, intraday_store=intraday_store)
             if accs and rp.is_trained:
                 avg = sum(accs.values()) / len(accs)
