@@ -180,7 +180,10 @@ class RangePredictor:
 
         if self._enable_garch and "garch" in self._weights:
             garch_acc = self._train_garch(features["Close"])
-            if garch_acc > 0:
+            # None = no valid CV folds (insufficient data) → omit from accuracies
+            # 0.0–1.0 = valid AUROC score → include, even if 0.5 (no edge still
+            # participates in equal-weight tie-breaking with XGB/LGB)
+            if garch_acc is not None:
                 accuracies["garch"] = garch_acc
 
         # Final fit on all data
@@ -255,8 +258,13 @@ class RangePredictor:
 
         return accuracies
 
-    def _train_garch(self, close: pd.Series) -> float:
-        """CV-evaluate GARCH range model. Returns mean balanced accuracy or 0.0.
+    def _train_garch(self, close: pd.Series) -> "float | None":
+        """CV-evaluate GARCH range model. Returns mean AUROC, or None if no valid folds.
+
+        Returns None (not 0.0) when all CV folds fail — caller omits GARCH from
+        accuracies dict entirely, producing nan in window JSON (honest: unevaluable).
+        Returns 0.0–1.0 for valid AUROC; 0.5 = no edge but still participates in
+        equal-weight tie-breaking.
 
         Mirrors _train_xgb/_train_lgb pattern but operates on the Close price
         series directly (GARCH uses returns, not the feature matrix).

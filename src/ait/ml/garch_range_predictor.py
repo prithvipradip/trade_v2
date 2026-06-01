@@ -59,7 +59,11 @@ _ARCH_DISTS: list[str] = ["normal", "t", "skewt", "ged"]
 
 _FFT_GRID_N = 2048       # FFT grid size for CTS PDF inversion
 _FFT_GRID_RANGE = 20.0   # Standardised residual range [-20, 20]
-_MIN_RETURNS = 60        # Minimum observations to attempt GARCH fit
+_MIN_RETURNS = 40        # Minimum observations to attempt GARCH fit.
+                         # 60 was too conservative: with 365-day training windows
+                         # split into 4 CV folds (gap=5), fold 0 yields only 43-59
+                         # returns — always below 60, causing nan AUROC for every
+                         # window. ARCH/GARCH fit reliably on 40+ observations.
 _CTS_ALPHA_SPECIAL = 1.0  # Singularity in Γ(-α) at α=1
 
 
@@ -799,7 +803,11 @@ class GARCHRangeModel:
                 continue
 
         if not scores:
-            return 0.0
+            # No valid folds — return None so caller can distinguish "failed to
+            # score" from "scored but no edge". None → key absent from accuracies
+            # → nan in window JSON (honest signal: GARCH could not be evaluated).
+            log.warning("garch_cv_score_no_valid_folds")
+            return None
         avg = float(np.mean(scores))
         log.info("garch_cv_score", auroc=f"{avg:.3f}", folds=len(scores))
         return avg
