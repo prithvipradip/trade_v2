@@ -303,8 +303,8 @@ class RangePredictor:
 
         log.info(
             "range_garch_trained",
-            cv_auroc=f"{acc:.3f}",
-            cv_edge=f"{acc - 0.5:+.3f}",
+            cv_auroc="None" if acc is None else f"{acc:.3f}",
+            cv_edge="None" if acc is None else f"{acc - 0.5:+.3f}",
             variant=self._garch_state.get("selected_variant"),
             dist=self._garch_state.get("selected_dist"),
             fallback=self._garch_state.get("fallback_used"),
