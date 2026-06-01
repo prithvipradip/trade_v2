@@ -27,6 +27,23 @@ if TYPE_CHECKING:
 
 log = get_logger("ml.garch_range")
 
+
+def _coerce_json(obj):
+    """Recursively coerce numpy scalars and arrays to JSON-native Python types."""
+    if isinstance(obj, dict):
+        return {k: _coerce_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_coerce_json(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return None if np.isnan(obj) else float(obj)
+    return obj
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -316,20 +333,28 @@ class GARCHRangeModel:
         best_state: dict | None = None
         all_variants: dict = {}
 
+        _strip_keys = {"arch_result", "_vol_kwargs", "cts_params"}
         for variant_name, vol_kwargs in _VARIANTS:
             variant_result = self._fit_variant(
                 returns, variant_name, vol_kwargs, horizon_days, threshold_pct,
             )
-            all_variants[variant_name] = variant_result
+            # Keep full result internally for CV; strip non-serialisable objects
+            # for the window JSON (arch_result, vol_kwargs, cts_params numpy array).
+            all_variants[variant_name] = {
+                k: v for k, v in variant_result.items() if k not in _strip_keys
+            }
             if variant_result["converged"] and variant_result["bic"] < best_bic:
                 best_bic = variant_result["bic"]
-                best_state = variant_result
+                best_state = variant_result  # keep full result for sigma/P computation
 
         if best_state is None:
             log.warning("garch_all_variants_failed", fallback="constant_vol")
             state = self._constant_vol_fallback(returns, horizon_days, threshold_pct,
                                                 reason="all_variants_failed")
         else:
+            # Copy best_state but keep arch_result and _vol_kwargs accessible
+            # internally (for residual diagnostics below); they are stripped at the
+            # end before the dict is returned to the caller.
             state = best_state.copy()
             state["fallback_used"] = None
 
@@ -354,6 +379,16 @@ class GARCHRangeModel:
             fallback=state.get("fallback_used"),
             p_compounding=f"{state.get('p_in_range_compounding', float('nan')):.3f}",
         )
+
+        # Strip non-serialisable objects before returning — the state dict is
+        # stored in _symbol_models and serialised to the window JSON.
+        state.pop("arch_result", None)
+        state.pop("_vol_kwargs", None)
+        if isinstance(state.get("cts_params"), np.ndarray):
+            state["cts_params"] = state["cts_params"].tolist()
+
+        # Coerce any remaining numpy scalars to Python natives (bool_, float64, etc.)
+        state = _coerce_json(state)
         return state
 
     def predict_p_in_range(self, state: dict) -> float:

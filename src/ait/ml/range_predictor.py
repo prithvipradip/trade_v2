@@ -278,9 +278,17 @@ class RangePredictor:
             create_labels_fn=self._create_labels,
         )
 
-        # Fit on full training data — stored for predict()
+        # Fit on full training data — stored for predict().
+        # Strip non-serialisable objects (arch result, vol kwargs) before storing —
+        # the state dict ends up in _symbol_models which gets serialised to window JSON.
         try:
-            self._garch_state: dict = garch.fit(close, self._horizon, self._threshold)
+            raw_state = garch.fit(close, self._horizon, self._threshold)
+            self._garch_state: dict = {
+                k: v for k, v in raw_state.items()
+                if k not in ("arch_result", "_vol_kwargs", "cts_params")
+            }
+            if raw_state.get("cts_params") is not None:
+                self._garch_state["cts_params"] = raw_state["cts_params"].tolist()
         except Exception as e:
             log.warning("garch_full_fit_failed", error=str(e))
             self._garch_state = {}
