@@ -433,10 +433,11 @@ class GARCHRangeModel:
             "sigma_sqrt_scale": round(float(sigma_sqrt), 6),
             "p_in_range_compounding": round(float(p_comp), 4),
             "p_in_range_sqrt_scale": round(float(p_sqrt), 4),
-            "arch_result": best_result,    # kept for std_resid extraction
+            "arch_result": best_result,    # kept for std_resid extraction and rolling CV
             "cts_params": best_cts_params,
             "dist_race": dist_race,
             "selected_bic": round(best_bic, 2),
+            "_vol_kwargs": vol_kwargs,     # stored so cv_score can refit with same spec
         }
 
     def _fit_cts_to_variant(
@@ -680,20 +681,23 @@ class GARCHRangeModel:
     ) -> float:
         """Walk-forward CV balanced accuracy for GARCH P(in range).
 
-        Parameters
-        ----------
-        close : pd.Series
-            Full training Close price series.
-        horizon_days : int
-            Forecast horizon.
-        threshold_pct : float
-            ±threshold for in-range label.
-        splits : list of (train_idx, val_idx)
-            From RangePredictor._walk_forward_split().
-        create_labels_fn : callable
-            RangePredictor._create_labels — creates binary in-range labels.
+        GARCH produces a calibrated probability P(in range) per day via rolling
+        forecasts. Scoring it with binary balanced accuracy fails because P(in
+        range) at QQQ-like vol levels rarely straddles any fixed threshold —
+        it sits in a narrow band (e.g. 0.38–0.75) that always falls entirely
+        above or below 0.5, giving mechanically degenerate scores.
+
+        Instead we score with AUROC (Area Under the ROC Curve), which measures
+        rank-order discrimination — does higher P(in range) correctly rank
+        days that actually stayed in range above days that broke out? AUROC=0.5
+        means no skill (same baseline as balanced accuracy=0.5), AUROC=0.6 is
+        meaningful, same edge-over-0.5 structure as the fitted-weight formula.
+
+        Rolling per-day forecasts: arch's forecast(start=...) produces a
+        separate h-day variance forecast for each validation day, conditioning
+        on all returns up to that day, giving genuinely per-day probabilities.
         """
-        from sklearn.metrics import balanced_accuracy_score
+        from sklearn.metrics import roc_auc_score
 
         scores = []
         for tr_idx, val_idx in splits:
@@ -701,29 +705,66 @@ class GARCHRangeModel:
                 tr_close = close.iloc[tr_idx]
                 val_close = close.iloc[val_idx]
 
-                # Fit GARCH on training returns
-                state = self.fit(tr_close, horizon_days, threshold_pct)
-
                 # True labels on validation window
                 val_labels = create_labels_fn(val_close).dropna()
                 if len(val_labels) == 0:
                     continue
-
-                # Single P(in range) from fitted state applied uniformly to all val days
-                # (re-forecasting per-day would require refitting — too expensive for CV)
-                p = self.predict_p_in_range(state)
-                y_pred = np.full(len(val_labels), int(p >= 0.5))
                 y_true = val_labels.values.astype(int)
+                if len(np.unique(y_true)) < 2:
+                    continue  # AUROC undefined with one class
+
+                # Fit GARCH on training slice
+                state = self.fit(tr_close, horizon_days, threshold_pct)
+                arch_result = state.get("arch_result")
+
+                if arch_result is None:
+                    # Constant-vol fallback: single P applied to all days
+                    p_scores = np.full(len(y_true), self.predict_p_in_range(state))
+                else:
+                    try:
+                        # Rolling forecasts: refit on combined train+val, extract
+                        # forecasts starting at first validation day.
+                        combined_returns = self._log_returns(
+                            pd.concat([tr_close, val_close])
+                        ) * 100
+                        vol_spec = state.get("_vol_kwargs", dict(vol="GARCH", p=1, q=1))
+                        dist = state.get("selected_dist", "normal")
+                        from arch import arch_model
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            am = arch_model(combined_returns, mean="Constant",
+                                            dist=dist, **vol_spec)
+                            res_full = am.fit(disp="off", show_warning=False,
+                                              options={"maxiter": 300})
+
+                        start_idx = len(tr_close) - 1
+                        fc = res_full.forecast(
+                            horizon=horizon_days, start=start_idx,
+                            method="analytic", reindex=False,
+                        )
+                        var_per_day = fc.variance.sum(axis=1).values
+                        sigma_per_day = np.sqrt(np.maximum(var_per_day, 1e-10)) / 100.0
+
+                        p_scores = np.array([
+                            self._p_in_range(s, threshold_pct, dist, res_full, None)
+                            for s in sigma_per_day
+                        ])
+                        n = min(len(y_true), len(p_scores))
+                        p_scores = p_scores[:n]
+                        y_true = y_true[:n]
+                    except Exception:
+                        p_scores = np.full(len(y_true), self.predict_p_in_range(state))
 
                 if len(np.unique(y_true)) < 2:
-                    continue  # skip single-class validation fold
-
-                scores.append(balanced_accuracy_score(y_true, y_pred))
+                    continue
+                # AUROC: does higher P(in range) correctly rank in-range days above breakouts?
+                auroc = float(roc_auc_score(y_true, p_scores))
+                scores.append(auroc)
             except Exception:
                 continue
 
         if not scores:
             return 0.0
         avg = float(np.mean(scores))
-        log.info("garch_cv_score", balanced_acc=f"{avg:.3f}", folds=len(scores))
+        log.info("garch_cv_score", auroc=f"{avg:.3f}", folds=len(scores))
         return avg

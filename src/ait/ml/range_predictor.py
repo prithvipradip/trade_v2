@@ -287,7 +287,8 @@ class RangePredictor:
 
         log.info(
             "range_garch_trained",
-            cv_balanced_acc=f"{acc:.3f}",
+            cv_auroc=f"{acc:.3f}",
+            cv_edge=f"{acc - 0.5:+.3f}",
             variant=self._garch_state.get("selected_variant"),
             dist=self._garch_state.get("selected_dist"),
             fallback=self._garch_state.get("fallback_used"),
