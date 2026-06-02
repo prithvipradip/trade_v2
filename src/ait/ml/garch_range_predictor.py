@@ -386,8 +386,9 @@ class GARCHRangeModel:
 
         # Strip non-serialisable objects before returning — the state dict is
         # stored in _symbol_models and serialised to the window JSON.
+        # _vol_kwargs is a plain dict (e.g. {'vol':'GARCH','p':1,'q':1}) — kept
+        # so cv_score rolling refit uses the same variant spec as the BIC winner.
         state.pop("arch_result", None)
-        state.pop("_vol_kwargs", None)
         if isinstance(state.get("cts_params"), np.ndarray):
             state["cts_params"] = state["cts_params"].tolist()
 
@@ -754,10 +755,18 @@ class GARCHRangeModel:
 
                 # Fit GARCH on training slice
                 state = self.fit(tr_close, horizon_days, threshold_pct)
-                arch_result = state.get("arch_result")
 
-                if arch_result is None:
-                    # Constant-vol fallback: single P applied to all days
+                # Use rolling forecasts when a real GARCH variant was fitted
+                # (indicated by _vol_kwargs being present). arch_result is
+                # stripped from state for JSON serialisation, so we gate on
+                # _vol_kwargs instead.
+                has_garch_fit = (
+                    state.get("_vol_kwargs") is not None
+                    and state.get("fallback_used") is None
+                )
+
+                if not has_garch_fit:
+                    # Constant-vol or failed fit — single P applied to all days
                     p_scores = np.full(len(y_true), self.predict_p_in_range(state))
                 else:
                     try:
@@ -777,9 +786,13 @@ class GARCHRangeModel:
                                               options={"maxiter": 300})
 
                         start_idx = len(tr_close) - 1
+                        # EGARCH does not support analytic multi-step forecasts;
+                        # fall back to simulation for it.
+                        variant = state.get("selected_variant", "")
+                        fc_method = "simulation" if "EGARCH" in variant else "analytic"
                         fc = res_full.forecast(
                             horizon=horizon_days, start=start_idx,
-                            method="analytic", reindex=False,
+                            method=fc_method, reindex=False,
                         )
                         var_per_day = fc.variance.sum(axis=1).values
                         sigma_per_day = np.sqrt(np.maximum(var_per_day, 1e-10)) / 100.0

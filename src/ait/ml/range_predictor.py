@@ -94,6 +94,16 @@ class RangePredictor:
 
     # --- Label creation ---
 
+    def _create_labels_horizon(self, close: pd.Series, horizon: int) -> pd.Series:
+        """Like _create_labels but uses an explicit horizon instead of self._horizon."""
+        labels = pd.Series(np.nan, index=close.index, dtype=float)
+        for t in range(len(close) - horizon):
+            base = close.iloc[t]
+            future = close.iloc[t + 1: t + 1 + horizon]
+            max_dev = float((future / base - 1).abs().max())
+            labels.iloc[t] = 1.0 if max_dev < self._threshold else 0.0
+        return labels
+
     def _create_labels(self, close: pd.Series) -> pd.Series:
         """Label = 1 if the max abs return over the next N days < threshold.
 
@@ -278,12 +288,19 @@ class RangePredictor:
 
         garch = GARCHRangeModel()
         splits = self._walk_forward_split(len(close))
+
+        # CV scored at a SHORT horizon (5d) so P(in range) varies widely across
+        # validation days (±5% over 5d: quiet ~0.95, shock day ~0.30 → 3× spread
+        # vs 21d: quiet ~0.85, shock ~0.50 → too narrow for AUROC to discriminate).
+        # The full-horizon fit below still uses self._horizon (21d) for OOS prediction.
+        _CV_HORIZON = 5
+        _cv_labels_fn = lambda c: self._create_labels_horizon(c, _CV_HORIZON)
         acc = garch.cv_score(
             close=close,
-            horizon_days=self._horizon,
+            horizon_days=_CV_HORIZON,
             threshold_pct=self._threshold,
             splits=splits,
-            create_labels_fn=self._create_labels,
+            create_labels_fn=_cv_labels_fn,
         )
 
         # Fit on full training data — stored for predict().
@@ -293,7 +310,9 @@ class RangePredictor:
             raw_state = garch.fit(close, self._horizon, self._threshold)
             self._garch_state: dict = {
                 k: v for k, v in raw_state.items()
-                if k not in ("arch_result", "_vol_kwargs", "cts_params")
+                if k not in ("arch_result", "cts_params")
+                # _vol_kwargs is a plain serialisable dict — kept so CV rolling
+                # refit uses the same variant spec as the BIC-winning fit.
             }
             if raw_state.get("cts_params") is not None:
                 self._garch_state["cts_params"] = raw_state["cts_params"].tolist()
