@@ -855,6 +855,7 @@ class WalkForwardBacktester:
             if range_predictor is not None and range_predictor.fitted_weights:
                 rp_sym = getattr(range_predictor, "_symbol_models", {}).get(symbol, {})
                 _garch_state = rp_sym.get("garch_state") or {}
+                _ms_garch_state = rp_sym.get("ms_garch_state") or {}
                 _model_weights["range_predictor"] = {
                     "status":          _range_model_status,
                     "threshold_pct":   round(_range_threshold, 4),
@@ -872,6 +873,13 @@ class WalkForwardBacktester:
                     "p_in_range_compounding":   _garch_state.get("p_in_range_compounding"),
                     "p_in_range_sqrt_scale":    _garch_state.get("p_in_range_sqrt_scale"),
                     "garch_all_variants":       rp_sym.get("garch_all_variants", {}),
+                    # MS-GARCH metadata
+                    "ms_garch_converged":   rp_sym.get("ms_garch_converged"),
+                    "ms_garch_bic":         rp_sym.get("ms_garch_bic"),
+                    "ms_garch_regime0":     rp_sym.get("ms_garch_regime0"),
+                    "ms_garch_regime1":     rp_sym.get("ms_garch_regime1"),
+                    "ms_garch_transitions": rp_sym.get("ms_garch_transitions"),
+                    "ms_garch_p_in_range":  _ms_garch_state.get("p_in_range_compounding"),
                 }
             else:
                 _model_weights["range_predictor"] = {

@@ -417,6 +417,127 @@ Models below 50% balanced accuracy contribute zero weight. The weights are then 
 
 ---
 
+## 16. Markov-Switching GARCH (MS-GARCH)
+
+### 16.1 Motivation
+
+Single-regime GARCH has a structural weakness for range prediction: **persistence mis-attribution after shocks**. When a volatility spike hits (e.g. a macro event), GARCH correctly raises its forecast. But as the shock dissipates, the exponential decay of the GARCH recursion keeps forecasted volatility elevated for many periods — even after the market has clearly returned to a calm regime. This causes rank-inversion: P(in range) stays depressed when it should recover, leading to systematic over-caution in post-shock windows.
+
+**Markov-Switching GARCH** (Gray 1996; Haas et al. 2004) solves this by maintaining two independent GARCH regimes — one for calm periods (regime 0) and one for stressed periods (regime 1) — and inferring the probability of being in each regime via a Hamilton (1989) filter. After a shock, the filter rapidly up-weights regime 0 (calm), and the blended forecast correctly predicts lower future vol.
+
+### 16.2 Model Specification
+
+The 2-regime MS-GARCH(1,1) is:
+
+```
+r_t = σ_t · ε_t,   ε_t | S_t ~ N(0, 1)
+
+σ²_{t,k} = ω_k + α_k · r²_{t-1} + β_k · σ²_{t-1,k},   k ∈ {0, 1}
+
+S_t | S_{t-1} ~ Markov chain with transition matrix:
+  P = [[p₀₀,  1-p₀₀],
+       [1-p₁₁, p₁₁ ]]
+```
+
+**Parameters (8 total):** ω₀, α₀, β₀ (calm GARCH), ω₁, α₁, β₁ (stressed GARCH), p₀₀ (calm persistence), p₁₁ (stressed persistence).
+
+**Stationarity:** requires α_k + β_k < 1 for both regimes independently.
+
+### 16.3 EM Estimation
+
+Parameters are estimated by Expectation-Maximisation, alternating between:
+
+**E-step — Hamilton Filter (forward pass):**
+
+```
+ξ_{t|t-1,k} = Σ_j P_{jk} · ξ_{t-1|t-1,j}          (predict)
+
+ξ_{t|t,k} ∝ f(r_t | S_t=k, σ²_{t,k}) · ξ_{t|t-1,k}  (update)
+```
+
+where f is the Gaussian density evaluated at regime k's conditional variance. This produces filtered probabilities ξ_{t|t} = P(S_t=k | r₁,...,r_t).
+
+**E-step — Kim (1994) Smoother (backward pass):**
+
+```
+ξ_{t|T,k} = ξ_{t|t,k} · Σ_j [P_{kj} · ξ_{t+1|T,j} / ξ_{t+1|t,j}]
+```
+
+This gives smoothed probabilities ξ_{t|T} = P(S_t=k | r₁,...,r_T) using the full sample.
+
+**M-step — Weighted MLE per regime:**
+
+For each regime k, minimise the weighted negative log-likelihood:
+
+```
+L_k(ω_k, α_k, β_k) = -Σ_t ξ_{t|T,k} · [-½ log σ²_{t,k} - ½ r²_t / σ²_{t,k}]
+```
+
+using L-BFGS-B with constraints ω_k > 0, α_k ≥ 0, β_k ≥ 0, α_k + β_k < 1.
+
+Transition probabilities are updated from smoothed marginals:
+
+```
+p̂_kk = Σ_{t=1}^{T-1} ξ_{t|T,k} · ξ_{t+1|T,k} / Σ_{t=1}^{T-1} ξ_{t|T,k}
+```
+
+**Convergence:** EM terminates when |log L_t − log L_{t-1}| < 10⁻⁶ or after 200 iterations.
+
+### 16.4 Multi-Step Volatility Forecast
+
+The h-step ahead combined variance is computed by propagating regime probabilities through the transition matrix:
+
+```
+π_{t+h} = P^h · π_{t|t}                    (regime probs h steps ahead)
+
+σ²_{t+h,k} = ω_k + (α_k + β_k) · σ²_{t+h-1,k}   (per-regime GARCH recursion)
+
+σ²_total(h) = Σ_{h'=1}^{h} π_{t+h'} · σ²_{t+h'}  (probability-weighted sum)
+```
+
+**Range probability:**
+
+```
+P(|r_h| < τ) = 2·Φ(τ / √σ²_total(h)) − 1
+```
+
+where Φ is the standard Normal CDF and τ is the threshold (e.g. 0.05 for ±5%).
+
+### 16.5 BIC and Model Selection
+
+MS-GARCH has k=8 free parameters:
+
+```
+BIC = −2·log L + 8·log(T)
+```
+
+This BIC competes directly with the 4 arch-based variants × 5 distributions in `GARCHRangeModel.fit()`. If MS-GARCH wins the BIC race, its `p_in_range_compounding` is used in the ensemble and its regime diagnostics (regime0/regime1 params, transition matrix, smoothed probs) are stored in the window JSON under `ms_garch_*` keys.
+
+### 16.6 Implementation Notes
+
+- **File:** `src/ait/ml/msgarch.py` — `MarkovSwitchingGARCH` class
+- **Integration:** `GARCHRangeModel._fit_msgarch()` wraps the fit and returns a BIC-comparable result dict; `GARCHRangeModel.cv_score_msgarch()` runs walk-forward AUROC evaluation
+- **Minimum observations:** 60 (more robust than the 40 minimum for arch variants, because EM requires stable regime assignment)
+- **Starting values:** regime 0 initialised to calm-half returns (below median |r|), regime 1 to stressed-half; p₀₀=0.97, p₁₁=0.90
+- **Regime labelling:** regime 0 is statistically the lower-vol regime by construction (initialised with calm_var < stressed_var), but swapping is possible — inspect `regime0_params.omega` vs `regime1_params.omega` after fitting
+
+### 16.7 Window JSON Output
+
+When MS-GARCH is trained as an independent ensemble member (`enable_msgarch=True`), the following keys appear in the window JSON under `range_predictor`:
+
+| Key | Description |
+|---|---|
+| `ms_garch_converged` | Whether EM converged within tolerance |
+| `ms_garch_bic` | BIC of the fitted MS-GARCH model |
+| `ms_garch_regime0` | {omega, alpha, beta, persistence} for calm regime |
+| `ms_garch_regime1` | {omega, alpha, beta, persistence} for stressed regime |
+| `ms_garch_transitions` | {p00, p11, p01, p10} transition matrix entries |
+| `ms_garch_p_in_range` | P(in range) from MS-GARCH alone (h-step Normal) |
+
+When MS-GARCH wins the BIC race inside `GARCHRangeModel.fit()` (i.e. `garch_selected_variant == "MS-GARCH"`), it is the source of `p_in_range_compounding` for the arch-based GARCH ensemble slot.
+
+---
+
 ## 15. References
 
 1. **Engle, R.F. (1982)**. "Autoregressive Conditional Heteroscedasticity with Estimates of the Variance of United Kingdom Inflation." *Econometrica* 50(4): 987–1007.
@@ -432,3 +553,11 @@ Models below 50% balanced accuracy contribute zero weight. The weights are then 
 6. **Kim, Y.S., Rachev, S.T. & Chung, D.M.** "The Modified Tempered Stable Distribution, GARCH-Models and Option Pricing." Available: https://methods.stat.kit.edu/download/doc_secure1/KimRachevChung.pdf
 
 7. **Massing, T. (2024)**. "Parametric Estimation of Tempered Stable Laws." *ALEA — Latin American Journal of Probability and Mathematical Statistics* 21: 59. arXiv:2303.07060v4. Available: https://alea.impa.br/articles/v21/21-59.pdf
+
+8. **Hamilton, J.D. (1989)**. "A New Approach to the Economic Analysis of Nonstationary Time Series and the Business Cycle." *Econometrica* 57(2): 357–384.
+
+9. **Gray, S.F. (1996)**. "Modeling the Conditional Distribution of Interest Rates as a Regime-Switching Process." *Journal of Financial Economics* 42(1): 27–62.
+
+10. **Haas, M., Mittnik, S. & Paolella, M.S. (2004)**. "A New Approach to Markov-Switching GARCH Models." *Journal of Financial Econometrics* 2(4): 493–530.
+
+11. **Kim, C.-J. (1994)**. "Dynamic Linear Models with Markov-Switching." *Journal of Econometrics* 60(1–2): 1–22.

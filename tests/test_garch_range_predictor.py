@@ -138,7 +138,11 @@ class TestGARCHRangeModelFit:
 
     def test_dist_race_has_all_distributions(self, garch_model, price_normal):
         state = garch_model.fit(price_normal, horizon_days=21, threshold_pct=0.05)
+        # Only arch-based variants run a dist_race; MS-GARCH uses EM (no dist_race).
+        _ARCH_VARIANTS = {"GARCH(1,1)", "GJR-GARCH", "EGARCH(1,1)", "ARCH(1)"}
         for v_name, v_data in state["garch_all_variants"].items():
+            if v_name not in _ARCH_VARIANTS:
+                continue
             if v_data.get("converged"):
                 dist_race = v_data["dist_race"]
                 for dist in ["normal", "t", "skewt", "ged", "cts"]:

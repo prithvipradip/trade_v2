@@ -62,18 +62,22 @@ class RangePredictor:
         horizon_days: int = 30,
         ensemble_weights: dict[str, float] | None = None,
         enable_garch: bool = False,
+        enable_msgarch: bool = False,
     ) -> None:
         self._threshold = threshold_pct
         self._horizon = horizon_days
         self._enable_garch = enable_garch
-        # When GARCH is enabled, use equal three-way split as the prior (weights
-        # are replaced by fitted CV-edge weights after training).
-        # If caller passes explicit ensemble_weights, respect them as-is for
-        # backward compat (e.g. tests that pass {"xgboost":0.5,"lightgbm":0.5}).
+        self._enable_msgarch = enable_msgarch
+        # Equal prior weights updated by CV edge after training.
+        # Caller-supplied ensemble_weights respected as-is for backward compat.
         if ensemble_weights is not None:
             self._weights = ensemble_weights
+        elif enable_garch and enable_msgarch:
+            self._weights = {"xgboost": 0.25, "lightgbm": 0.25, "garch": 0.25, "msgarch": 0.25}
         elif enable_garch:
             self._weights = {"xgboost": 0.333, "lightgbm": 0.333, "garch": 0.334}
+        elif enable_msgarch:
+            self._weights = {"xgboost": 0.333, "lightgbm": 0.333, "msgarch": 0.334}
         else:
             self._weights = {"xgboost": 0.5, "lightgbm": 0.5}
         self._models: dict = {}
@@ -196,6 +200,11 @@ class RangePredictor:
             if garch_acc is not None:
                 accuracies["garch"] = garch_acc
 
+        if self._enable_msgarch and "msgarch" in self._weights:
+            msgarch_acc = self._train_msgarch(features["Close"])
+            if msgarch_acc is not None:
+                accuracies["msgarch"] = msgarch_acc
+
         # Final fit on all data
         self._scaler.fit(X)
         X_scaled = pd.DataFrame(
@@ -233,6 +242,7 @@ class RangePredictor:
                         except Exception:
                             pass
                 _garch_state = getattr(self, "_garch_state", None)
+                _ms_garch_state = getattr(self, "_ms_garch_state", None)
                 self._symbol_models[symbol] = {
                     "models": copy.deepcopy(self._models),
                     "scaler": copy.deepcopy(self._scaler),
@@ -253,6 +263,13 @@ class RangePredictor:
                     "garch_stable_attempted": (_garch_state or {}).get("garch_stable_attempted"),
                     "garch_stable_converged": (_garch_state or {}).get("garch_stable_converged"),
                     "garch_all_variants": (_garch_state or {}).get("garch_all_variants", {}),
+                    # MS-GARCH ensemble member metadata
+                    "ms_garch_state":     _ms_garch_state,
+                    "ms_garch_converged": (_ms_garch_state or {}).get("converged"),
+                    "ms_garch_bic":       (_ms_garch_state or {}).get("bic"),
+                    "ms_garch_regime0":   (_ms_garch_state or {}).get("msgarch_state", {}).get("regime0"),
+                    "ms_garch_regime1":   (_ms_garch_state or {}).get("msgarch_state", {}).get("regime1"),
+                    "ms_garch_transitions": (_ms_garch_state or {}).get("msgarch_state", {}).get("transition"),
                 }
 
             self._save_models()
@@ -327,6 +344,54 @@ class RangePredictor:
             variant=self._garch_state.get("selected_variant"),
             dist=self._garch_state.get("selected_dist"),
             fallback=self._garch_state.get("fallback_used"),
+        )
+        return acc
+
+    def _train_msgarch(self, close: pd.Series) -> "float | None":
+        """CV-evaluate MS-GARCH range model. Returns mean AUROC, or None if no valid folds.
+
+        Same contract as _train_garch(): None means unevaluable (omit from accuracies),
+        0.0–1.0 means valid AUROC.  Stores full-training-data MS-GARCH state in
+        self._ms_garch_state for use in predict() and window JSON serialisation.
+        """
+        try:
+            from ait.ml.garch_range_predictor import GARCHRangeModel
+        except ImportError:
+            log.warning("msgarch_not_available")
+            return None
+
+        garch = GARCHRangeModel()
+        splits = self._walk_forward_split(len(close))
+
+        _CV_HORIZON = 5
+        _cv_labels_fn = lambda c: self._create_labels_horizon(c, _CV_HORIZON)
+        acc = garch.cv_score_msgarch(
+            close=close,
+            horizon_days=_CV_HORIZON,
+            threshold_pct=self._threshold,
+            splits=splits,
+            create_labels_fn=_cv_labels_fn,
+        )
+
+        # Fit on full training data via _fit_msgarch (BIC-comparable result dict).
+        try:
+            import numpy as _np
+            returns = _np.diff(_np.log(close.dropna().values))
+            ms_result = garch._fit_msgarch(returns, self._horizon, self._threshold)
+            # Strip the live object — store only the serialisable state dict.
+            ms_result.pop("_msgarch_obj", None)
+            ms_result.pop("arch_result", None)
+            self._ms_garch_state: dict = ms_result
+        except Exception as e:
+            log.warning("msgarch_full_fit_failed", error=str(e))
+            self._ms_garch_state = {}
+
+        log.info(
+            "range_msgarch_trained",
+            cv_auroc="None" if acc is None else f"{acc:.3f}",
+            cv_edge="None" if acc is None else f"{acc - 0.5:+.3f}",
+            converged=self._ms_garch_state.get("converged"),
+            bic=self._ms_garch_state.get("bic"),
         )
         return acc
 
@@ -496,6 +561,19 @@ class RangePredictor:
                     p_garch = GARCHRangeModel().predict_p_in_range(garch_state)
                     weighted_p += w_garch * p_garch
                     total_weight += w_garch
+                except Exception:
+                    pass
+
+        # MS-GARCH ensemble contribution
+        ms_garch_state = (sym_data or {}).get("ms_garch_state") or getattr(self, "_ms_garch_state", None)
+        if ms_garch_state:
+            w_ms = (fw or {}).get("msgarch", 0.0)
+            if w_ms > 0:
+                try:
+                    from ait.ml.garch_range_predictor import GARCHRangeModel
+                    p_ms = GARCHRangeModel().predict_p_in_range(ms_garch_state)
+                    weighted_p += w_ms * p_ms
+                    total_weight += w_ms
                 except Exception:
                     pass
 
