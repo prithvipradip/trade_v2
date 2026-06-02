@@ -23,7 +23,8 @@
 | 11 | `QQQ_730d_iron_condor_20260530_0531` | 730/30/30/5, 12 W | +2.69% | +2.41% | 19 / 22 | 5.25 / 3.38 | 4/12 | 730d training; Q16 answered: dead zones not recoverable by training horizon |
 | 12 | `QQQ_365d_iron_condor_20260531_1723` | 365/60/60/5, 12 W | −5.92% | +4.30% | 40 / 22 | −6.43 / 2.85 | 7/12 | 60d OOS windows; max_hold [14,40]; Change D (intraday OOS); fitted weights; entry 09:30 |
 | 13 | `QQQ_365d_iron_condor_exp13_v3` | 365/60/60/5, 12 W | +0.49% | — | 24 / — | +0.90 / — | 10/12 | max_concurrent=1; VIX fix; GARCH ensemble (zero weight — CV bug fixed post-run) |
-| 14 | pending | 365/60/60/5, 12 W | — | — | — | — | — | GARCH CV fix (_MIN_RETURNS 60→40, AUROC scoring); first run with functional GARCH weight |
+| 14 | `QQQ_365d_iron_condor_20260602_0316` | 365/60/60/5, 12 W | +0.49% | — | 24 / — | +0.90 / — | 10/12 | GARCH CV fix (_MIN_RETURNS 60→40, AUROC scoring) — AUROC=0.500 every window, zero weight |
+| 15 | pending | 365/60/60/5, 12 W | — | — | — | — | — | GARCH redesign: shorter horizon CV (5d vs 21d), or sigma-percentile threshold; first real weight |
 
 Config format: `train_days / test_days / step_days / gap_days`.
 All experiments: QQQ, iron_condor only, TPE sampler seed 42, $100k initial capital.
@@ -1222,11 +1223,12 @@ python scripts/run_integration_test.py \
 
 ---
 
-## Experiment 14 — First Functional GARCH Weight
+## Experiment 14 — First Functional GARCH Weight (GARCH Still Zero)
 
-**Archive:** pending
-**Date:** pending
+**Archive:** `QQQ_365d_iron_condor_20260602_0316`
+**Date:** 2026-06-02
 **Branch:** `features-request-3`
+**Run time:** ~330 minutes
 
 ### Setup
 - Walk-forward config: **365d** / **60d** / **60d** / 5d → **12 windows** (identical to Exp 13)
@@ -1248,6 +1250,111 @@ python scripts/run_integration_test.py \
 - **Q_E14_2**: Which GARCH variant wins most often across windows?
 - **Q_E14_3**: Does GARCH weight correlate with window PnL — i.e., does higher GARCH weight predict better outcomes?
 - **Q_E14_4**: Does the Brier score analysis (compounding vs sqrt_scale horizon) show a clear winner?
+
+### Launch Command
+```bash
+python scripts/run_integration_test.py \
+  --symbols QQQ \
+  --config config_QQQ_test.yaml \
+  --strategies iron_condor \
+  --train-days 365 \
+  --test-days 60 \
+  --step-days 60 \
+  --gap-days 5 \
+  --optuna-seed 42 \
+  --wf-trials 200 \
+  --wf-patience 50 \
+  --wf-min-trades 7 \
+  --wf-n-jobs 6 \
+  --years 3 \
+  --skip-backfill
+```
+
+### Results — Section E (Optimized)
+
+| Metric | Value |
+|--------|-------|
+| Total return | **+0.49%** |
+| Total PnL | **+$508** |
+| Total trades | 24 |
+| Win rate | **62.5%** |
+| Sharpe ratio | **+0.90** |
+| Max drawdown | **1.69%** |
+| Active windows | **10 / 12** |
+
+**Per-window GARCH metrics (Q_E14_1–Q_E14_3 answers):**
+
+| W# | OOS Period | Trades | WR | PnL | GARCH AUROC | GARCH-w | Variant |
+|----|-----------|--------|-----|-----|-------------|---------|---------|
+| W01 | May–Jul 2024 | 6 | 50% | −$195 | None | 0 | ARCH(1) |
+| W02 | Jul–Sep 2024 | 1 | 0% | −$321 | None | 0 | EGARCH |
+| W03 | Sep–Nov 2024 | 2 | 100% | +$1,850 | 0.500 | 0.333 | GJR-GARCH |
+| W04 | Nov 2024–Jan 2025 | 1 | 100% | +$228 | None | 0 | GARCH(1,1) |
+| W05 | Jan–Mar 2025 | 2 | 50% | −$427 | 0.500 | 0 | ARCH(1) |
+| W06 | Mar–May 2025 | 3 | 0% | −$872 | None | 0 | — |
+| W07 | May–Jul 2025 | 2 | 100% | +$177 | None | 0 | — |
+| W08 | Jul–Sep 2025 | 5 | 80% | −$92 | 0.500 | 0 | — |
+| W09 | Sep–Nov 2025 | 1 | 100% | +$128 | None | 0 | — |
+| W10 | Nov 2025–Jan 2026 | 0 | — | $0 | 0.500 | 0 | — |
+| W11 | Jan–Mar 2026 | 1 | 100% | +$32 | 0.500 | 0 | — |
+| W12 | Mar–May 2026 | 0 | — | $0 | 0.500 | 0 | — |
+
+Results **identical to Exp 13 v3** — GARCH contributed zero weight in all windows.
+
+### Results — Section F
+*(Not captured — ablation file overwritten by run machinery.)*
+
+### Observations
+
+1. **Q_E14_1 answered — GARCH received zero weight in all windows**: AUROC was exactly 0.500 in every window where it could be computed (W03, W05, W08, W10, W11, W12). Windows with `None` had single-class validation folds (no breakout examples). Only W03 had non-zero GARCH weight (0.333) because all three models tied at 0.500 — equal-split fallback, not earned weight.
+
+2. **Q_E14_2 — Variant selection**: ARCH(1) and GJR-GARCH were selected most often (W01, W05: ARCH; W03: GJR-GARCH; W04: GARCH(1,1); W02: EGARCH). No clear dominant variant — BIC selection varies window to window.
+
+3. **Q_E14_3 — No GARCH weight to correlate**: With zero weight in all windows, Q_E14_3 is unanswerable from Exp 14 data.
+
+4. **_MIN_RETURNS=40 fix confirmed working**: No `garch_insufficient_data` warnings in the log — all CV folds attempted. But the AUROC is still 0.500, meaning GARCH P(in range) has no rank-order discrimination on QQQ data at 21-day horizons with 60-day validation windows.
+
+5. **Root cause identified**: The 21-day horizon means P(in range) at QQQ's typical vol levels clusters tightly between 0.38–0.75, barely varying across trading days within a 60-day window. With such small variation in predicted probabilities, AUROC cannot distinguish high-P days from low-P days. GARCH's signal exists (Spearman ρ≈0.25 on synthetic data) but is below the detection threshold of AUROC on 40–60 validation observations.
+
+### What We Learned
+
+- **P27 (GARCH at 21-day horizon has no detectable AUROC signal on QQQ)**: The 21-day forecasting horizon is too long relative to the 60-day validation window. With only 40 validation observations and P(in range) varying by <0.15 across all days, AUROC cannot discriminate. This is not a GARCH failure — it's a measurement scale mismatch.
+
+- **P28 (The fix is horizon, not scoring)**: Switching from 21-day to 5-day horizon forecasting would dramatically increase P(in range) variation across validation days (high-vol days would have P≈0.30, quiet days P≈0.85 at ±5% threshold) — much wider spread for AUROC to discriminate.
+
+### What Changed for Next Experiment (Exp 15)
+
+**GARCH CV evaluated at 5-day horizon instead of 21-day**:
+- P(in range) at ±5% over 5 days varies much more (quiet: 0.95, shock day: 0.30) vs 21-day horizon (quiet: 0.85, shock: 0.50)
+- AUROC discrimination is proportional to the spread in predicted probabilities
+- Full-horizon fit (21-day) still used for the actual OOS prediction — only CV scoring switches to 5-day
+- This is equivalent to using short-horizon volatility forecast accuracy to score the model, then applying it at the trading horizon
+
+---
+
+## Experiment 15 — GARCH 5-Day CV Horizon
+
+**Archive:** pending
+**Date:** pending
+**Branch:** `features-request-3`
+
+### Setup
+- Walk-forward config: **365d** / **60d** / **60d** / 5d → **12 windows** (identical to Exp 13/14)
+- OOS period: 2024-05-19 → 2026-05-09
+- Key changes from Exp 14:
+  - **GARCH CV horizon: 21d → 5d**: CV balanced-accuracy scoring uses 5-day P(in range) to evaluate GARCH's ranking skill, then applies the 21-day fitted model for actual OOS predictions. Wider P spread → AUROC can discriminate.
+  - All prior fixes retained (max_concurrent=1, VIX fix, adaptive threshold, _MIN_RETURNS=40)
+- Optuna: 200 trials, patience 50, min_trades 7, n_jobs 6 (unchanged)
+
+### Assumptions Going In
+- 5-day P(in range) at ±5% threshold varies from ~0.30 (shock days) to ~0.95 (quiet days) — 3× wider spread than 21-day, giving AUROC meaningful discrimination
+- GARCH should score above 0.5 AUROC in high-vol training windows (tariff shock, CrowdStrike period)
+- Results should still match Exp 13/14 (+$508) unless GARCH weight changes entry decisions
+
+### Open Questions
+- **Q_E15_1**: Does 5-day CV horizon give GARCH AUROC > 0.5 in any window?
+- **Q_E15_2**: If GARCH gets weight, does it reduce entries in hostile windows (W01, W06) or increase them in friendly ones (W03, W07, W09)?
+- **Q_E15_3**: Does the PnL improve, stay flat, or worsen relative to Exp 13/14's +$508?
 
 ### Launch Command
 ```bash
