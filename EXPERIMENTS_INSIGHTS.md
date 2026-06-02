@@ -24,7 +24,8 @@
 | 12 | `QQQ_365d_iron_condor_20260531_1723` | 365/60/60/5, 12 W | −5.92% | +4.30% | 40 / 22 | −6.43 / 2.85 | 7/12 | 60d OOS windows; max_hold [14,40]; Change D (intraday OOS); fitted weights; entry 09:30 |
 | 13 | `QQQ_365d_iron_condor_exp13_v3` | 365/60/60/5, 12 W | +0.49% | — | 24 / — | +0.90 / — | 10/12 | max_concurrent=1; VIX fix; GARCH ensemble (zero weight — CV bug fixed post-run) |
 | 14 | `QQQ_365d_iron_condor_20260602_0316` | 365/60/60/5, 12 W | +0.49% | — | 24 / — | +0.90 / — | 10/12 | GARCH CV fix (_MIN_RETURNS 60→40, AUROC scoring) — AUROC=0.500 every window, zero weight |
-| 15 | pending | 365/60/60/5, 12 W | — | — | — | — | — | GARCH redesign: shorter horizon CV (5d vs 21d), or sigma-percentile threshold; first real weight |
+| 15 | `QQQ_365d_iron_condor_20260602_0845` | 365/60/60/5, 12 W | −0.45% | — | 27 / — | −2.46 / — | 10/12 | GARCH rolling forecasts fixed (3 bugs); first real AUROC; rank-inverted W08/W09; worse than Exp 13 |
+| 16 | pending | 365/60/60/5, 12 W | — | — | — | — | — | GARCH disabled; lock in Exp 13 baseline (+$508); investigate W03 degradation |
 
 Config format: `train_days / test_days / step_days / gap_days`.
 All experiments: QQQ, iron_condor only, TPE sampler seed 42, $100k initial capital.
@@ -1332,11 +1333,12 @@ Results **identical to Exp 13 v3** — GARCH contributed zero weight in all wind
 
 ---
 
-## Experiment 15 — GARCH 5-Day CV Horizon
+## Experiment 15 — GARCH 5-Day CV Horizon (First Real AUROC, Worse Results)
 
-**Archive:** pending
-**Date:** pending
+**Archive:** `QQQ_365d_iron_condor_20260602_0845`
+**Date:** 2026-06-02
 **Branch:** `features-request-3`
+**Run time:** ~330 minutes
 
 ### Setup
 - Walk-forward config: **365d** / **60d** / **60d** / 5d → **12 windows** (identical to Exp 13/14)
@@ -1355,6 +1357,118 @@ Results **identical to Exp 13 v3** — GARCH contributed zero weight in all wind
 - **Q_E15_1**: Does 5-day CV horizon give GARCH AUROC > 0.5 in any window?
 - **Q_E15_2**: If GARCH gets weight, does it reduce entries in hostile windows (W01, W06) or increase them in friendly ones (W03, W07, W09)?
 - **Q_E15_3**: Does the PnL improve, stay flat, or worsen relative to Exp 13/14's +$508?
+
+### Launch Command
+```bash
+python scripts/run_integration_test.py \
+  --symbols QQQ \
+  --config config_QQQ_test.yaml \
+  --strategies iron_condor \
+  --train-days 365 \
+  --test-days 60 \
+  --step-days 60 \
+  --gap-days 5 \
+  --optuna-seed 42 \
+  --wf-trials 200 \
+  --wf-patience 50 \
+  --wf-min-trades 7 \
+  --wf-n-jobs 6 \
+  --years 3 \
+  --skip-backfill
+```
+
+### Results — Section E (Optimized)
+
+| Metric | Exp 13 v3 | Exp 14 | **Exp 15** | Delta vs E13 |
+|--------|-----------|--------|------------|--------------|
+| Total PnL | +$508 | +$508 | **−$445** | **−$953** |
+| Total return | +0.49% | +0.49% | **−0.45%** | −0.94pp |
+| Total trades | 24 | 24 | **27** | +3 |
+| Win rate | 62.5% | 62.5% | **59.3%** | −3.2pp |
+| Sharpe | +0.90 | +0.90 | **−2.46** | −3.36 |
+| Max drawdown | 1.69% | 1.69% | **2.67%** | +0.98pp |
+| Active windows | 10/12 | 10/12 | 10/12 | — |
+
+**Per-window breakdown with GARCH metrics:**
+
+| W# | OOS Period | Trades | WR | PnL | AUROC | GARCH-w | Variant | Note |
+|----|-----------|--------|-----|-----|-------|---------|---------|------|
+| W01 | May–Jul 2024 | 6 | 50% | −$195 | None | 0 | ARCH(1) | Same as E13 |
+| W02 | Jul–Sep 2024 | 1 | 0% | −$321 | 0.500 | 0.333 | EGARCH | Tie → equal split |
+| W03 | Sep–Nov 2024 | 3 | 33% | **−$41** | None | 0 | GJR-GARCH | Was +$1,850 in E13 — **−$1,891 swing** |
+| W04 | Nov 2024–Jan 2025 | 3 | **100%** | **+$1,165** | **0.5625** | **1.000** | GARCH(1,1) | GARCH all-in, profitable |
+| W05 | Jan–Mar 2025 | 2 | 50% | −$427 | 0.500 | 0 | ARCH(1) | Same as E13 |
+| W06 | Mar–May 2025 | 3 | 0% | −$872 | None | 0 | — | Same as E13 |
+| W07 | May–Jul 2025 | 2 | 100% | +$177 | None | 0 | — | Same as E13 |
+| W08 | Jul–Sep 2025 | 5 | 80% | −$92 | **0.292** | 0 | GJR-GARCH | **Rank-inverted** |
+| W09 | Sep–Nov 2025 | 1 | 100% | +$128 | **0.417** | 0 | GJR-GARCH | **Rank-inverted** |
+| W10 | Nov 2025–Jan 2026 | 0 | — | $0 | None | 0 | EGARCH | Dead |
+| W11 | Jan–Mar 2026 | 1 | 100% | +$32 | None | 0 | EGARCH | Same as E13 |
+| W12 | Mar–May 2026 | 0 | — | $0 | None | 0 | ARCH(1) | Dead (Liberation Day blocked) |
+
+### Results — Section F
+*(Not captured — ablation file overwritten by run machinery.)*
+
+### Observations
+
+1. **Q_E15_1 answered — GARCH AUROC now varies meaningfully**: Scores ranged from 0.292 to 0.5625 across windows. The rolling forecast fix is working — GARCH is producing real per-day predictions with variation. This is the first experiment where GARCH's signal was correctly measured.
+
+2. **Q_E15_2 answered — GARCH weight changed decisions in W04**: W04 earned GARCH weight=1.000 (AUROC=0.5625, XGB/LGB both below 0.5). Result: 3 trades, 100% WR, +$1,165. This is the first experiment where GARCH demonstrably influenced OOS trades positively.
+
+3. **Q_E15_3 answered — PnL worsened (−$445 vs +$508)**: The GARCH influence through Optuna's training objective changed parameter selection in W03 dramatically. W03 went from +$1,850 (100% WR, 2 trades) in Exp 13/14 to −$41 (33% WR, 3 trades) — a −$1,891 swing that alone accounts for the entire PnL degradation. This was not a direct GARCH weight effect (AUROC=None, weight=0 in W03) but an indirect effect through Optuna selecting different params when GARCH training is part of the objective.
+
+4. **Rank-inversion confirmed in W08/W09**: AUROC=0.292 (W08) and 0.417 (W09). Higher GARCH P(in range) predicted breakouts better than in-range days in these windows. Both covered the Jul–Nov 2025 period — post-CrowdStrike recovery, then post-Liberation Day recovery. These are mean-reversion regimes where GARCH's volatility persistence signal is inverted: high recent vol → GARCH predicts continued high vol → low P(in range) → but the market actually calmed down.
+
+5. **EGARCH selected in multiple windows (W02, W10, W11)**: The leverage effect model wins BIC in these windows, suggesting asymmetric volatility response is present. However EGARCH's simulation-based multi-step forecasts add variance to the CV scoring, contributing to unstable AUROC estimates.
+
+6. **W03 degradation is Optuna contamination, not GARCH signal**: When GARCH training runs as part of the window pipeline, Optuna's optimization trajectory is affected (different random state, different timing of model evaluations). This is an indirect interference effect, not a direct GARCH weight effect.
+
+### What We Learned
+
+- **P29 (GARCH rolling forecasts work — the signal is real but mixed)**: AUROC 0.292–0.5625 confirms genuine per-day variation in P(in range). In W04, GARCH correctly identified a range-bound period and was rewarded. In W08/W09, it rank-inverted on mean-reversion regimes.
+
+- **P30 (GARCH ranks wrong in mean-reversion regimes)**: Post-shock recoveries (after CrowdStrike, after Liberation Day) are mean-reversion regimes. GARCH predicts persistent high vol, but the market calmed. P(in range) was low when it should have been high. GARCH's AR structure is mis-specified for regime changes driven by macro events — it extrapolates past volatility forward when the regime has actually shifted.
+
+- **P31 (GARCH training contaminates Optuna indirectly)**: W03 changed dramatically without GARCH weight, suggesting Optuna's param search is sensitive to the additional GARCH fitting time/randomness in the training pipeline. Need to isolate GARCH from Optuna's objective function.
+
+- **P32 (The Exp 13 baseline +$508 is the best result so far)**: All GARCH variants produced equal or worse results. The structural fixes (max_concurrent=1, VIX fix) delivered the gains; GARCH has so far added noise.
+
+### What Changed for Next Experiment (Exp 16)
+
+**Pause GARCH participation and lock in the Exp 13 baseline:**
+
+1. **Disable GARCH from ensemble** (`enable_garch=False` in `_train_window_range_model`): Removes Optuna contamination and stops rank-inversion from degrading windows. Returns to the proven +$508 baseline.
+
+2. **Investigate W03 degradation**: Compare Exp 13 vs Exp 15 Optuna trial logs for W03 to understand why parameter selection changed. Is it timing? Random state propagation? GARCH training consuming compute that changes Optuna's internal state?
+
+3. **GARCH research direction**: The rank-inversion in mean-reversion regimes suggests GARCH needs a regime-switch component (MS-GARCH or Markov-switching) to handle post-shock recoveries. This is a Phase 3 research item — not implementable in a single experiment.
+
+4. **Alternative statistical model candidate**: Consider realized volatility HAR model (Heterogeneous Autoregressive) — it uses multiple volatility horizons (daily, weekly, monthly) and is specifically designed for regime-switching market conditions where GARCH's persistence assumption breaks down.
+
+---
+
+## Experiment 16 — GARCH Paused; Lock Exp 13 Baseline
+
+**Archive:** pending
+**Date:** pending
+**Branch:** `features-request-3`
+
+### Setup
+- Walk-forward config: **365d** / **60d** / **60d** / 5d → **12 windows**
+- OOS period: 2024-05-19 → 2026-05-09
+- Key changes from Exp 15:
+  - **GARCH disabled** (`enable_garch=False`): removes Optuna contamination and rank-inversion from W08/W09
+  - All Exp 13 structural fixes retained (max_concurrent=1, VIX fix, adaptive threshold)
+  - Expected to reproduce Exp 13's +$508 result exactly
+- Optuna: 200 trials, patience 50, min_trades 7, n_jobs 6 (unchanged)
+
+### Assumptions Going In
+- Without GARCH, Optuna will reproduce Exp 13's parameter selections → same trades → same +$508 PnL
+- If results differ from Exp 13, the discrepancy reveals other sources of non-determinism
+
+### Open Questions
+- **Q_E16_1**: Does disabling GARCH reproduce Exp 13's +$508 exactly?
+- **Q_E16_2**: What caused W03 to degrade from +$1,850 to −$41? Is it GARCH timing contamination or something else?
 
 ### Launch Command
 ```bash
