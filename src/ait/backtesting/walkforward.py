@@ -1473,8 +1473,10 @@ class WalkForwardBacktester:
             if self._db_path is not None:
                 from ait.data.historical import HistoricalDataStore
                 intraday_store = HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
+            # Exp 16: all statistical models disabled — no RNG contamination of Optuna.
+            # Re-enable with subprocess isolation in Exp 17.
             rp = RangePredictor(threshold_pct=threshold_pct, horizon_days=max_hold_days,
-                                enable_garch=True, enable_oujump=True)
+                                enable_garch=False, enable_msgarch=False, enable_oujump=False)
             accs = rp.train(train_df, symbol=symbol, intraday_store=intraday_store)
             if accs and rp.is_trained:
                 avg = sum(accs.values()) / len(accs)
