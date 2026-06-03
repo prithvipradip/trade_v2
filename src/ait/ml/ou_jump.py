@@ -541,6 +541,153 @@ class OUKouGARCH:
 
         return result
 
+    def oos_aekf_diagnostics(
+        self,
+        oos_returns: np.ndarray,
+        horizon_days: int,
+        threshold_pct: float,
+    ) -> dict:
+        """Step the AEKF forward over OOS returns using frozen MLE params.
+
+        Produces per-day innovations, κ path, direction drifts, and realized
+        volatility — the raw material for Brier score, direction AUROC, and
+        AEKF stability diagnostics in _evaluate_range_model_oos().
+
+        Args:
+            oos_returns:   1-D array of OOS log-returns (length T_oos)
+            horizon_days:  forecast horizon used to compute realized vol labels
+            threshold_pct: ±range threshold used to compute binary range labels
+
+        Returns dict with:
+            innovations     — (T_oos,) Kalman innovations ν_t = x_t - x̂_t|t-1
+            kappa_path      — (T_oos,) filtered κ_t over OOS
+            mu_path         — (T_oos,) filtered μ_t over OOS
+            drift_path      — (T_oos,) κ_t·(μ_t - X_t), the direction signal
+            sigma_path      — (T_oos,) conditional vol σ_t (GARCH recursion)
+            p_scores        — (T_labelable,) P(in range) per labelable day
+            y_realized      — (T_labelable,) 1 if |cum-return| < threshold else 0
+            rvol_realized   — (T_labelable,) realized σ over next horizon_days
+            lb_pvalue       — Ljung-Box p-value on ν_t² (ARCH in innovations)
+            lb_acf_pvalue   — Ljung-Box p-value on ν_t (autocorrelation)
+        """
+        if self._params is None:
+            return {}
+
+        oos_returns = np.asarray(oos_returns, dtype=float)
+        n = len(oos_returns)
+        if n < horizon_days + 1:
+            return {}
+
+        p = self._params
+
+        # Initialise AEKF from training end-state
+        X_T, kappa_T, mu_T = self._aekf.final_state if self._aekf else (
+            float(self._log_prices[-1]) if self._log_prices is not None else p.mu,
+            p.kappa, p.mu,
+        )
+        uncond_var = p.omega / max(1.0 - p.alpha - p.beta, 1e-6)
+        sigma2_last = float(self._sigma2_path[-1]) if self._sigma2_path is not None else uncond_var
+
+        aekf = AdaptiveEKF(
+            x0=X_T, kappa_init=kappa_T, mu_init=mu_T,
+            sigma2_init=sigma2_last,
+        )
+        aekf._z = np.array([X_T, kappa_T, mu_T])
+
+        innovations  = np.empty(n)
+        kappa_path   = np.empty(n)
+        mu_path      = np.empty(n)
+        drift_path   = np.empty(n)
+        sigma_path   = np.empty(n)
+
+        # Reconstruct cumulative log-prices from OOS returns
+        log_prices_oos = X_T + np.concatenate([[0.0], np.cumsum(oos_returns)])
+
+        sigma2_t = sigma2_last
+        prev_r2  = oos_returns[0] ** 2 if n > 0 else sigma2_last
+
+        for t in range(n):
+            sigma2_t = float(
+                p.omega + p.alpha * prev_r2 + p.beta * sigma2_t
+            )
+            sigma2_t = max(sigma2_t, _MIN_VAR)
+            prev_r2  = oos_returns[t] ** 2
+
+            x_obs = float(log_prices_oos[t + 1])
+            X_f, k_f, m_f = aekf.update(x_obs, sigma2_t)
+
+            innovations[t] = aekf._innovations[-1]
+            kappa_path[t]  = k_f
+            mu_path[t]     = m_f
+            drift_path[t]  = k_f * (m_f - x_obs)
+            sigma_path[t]  = float(np.sqrt(sigma2_t))
+
+        # Build labelable slice (can assign horizon_days forward labels)
+        n_labelable = n - horizon_days
+        p_scores      = np.empty(n_labelable)
+        y_realized    = np.empty(n_labelable, dtype=int)
+        rvol_realized = np.empty(n_labelable)
+
+        for t in range(n_labelable):
+            # P(in range): Normal approx from GARCH+OU h-step sigma
+            persist = p.alpha + p.beta
+            if persist >= 1.0 - 1e-6:
+                sigma2_h = sigma_path[t] ** 2 * horizon_days
+            else:
+                uncond = p.omega / max(1.0 - persist, 1e-8)
+                sigma2_h = (
+                    horizon_days * uncond
+                    + (sigma_path[t] ** 2 - uncond)
+                    * (1.0 - persist ** horizon_days)
+                    / max(1.0 - persist, 1e-8)
+                )
+            two_kappa_h = 2.0 * kappa_path[t] * horizon_days * _DT
+            if two_kappa_h < 1e-6:
+                ou_f = horizon_days * _DT
+            else:
+                ou_f = (1.0 - np.exp(-two_kappa_h)) / (2.0 * kappa_path[t])
+
+            jump_var = p.lam * (horizon_days * _DT) * (
+                2.0 * p.p_up / p.eta1 ** 2 + 2.0 * (1.0 - p.p_up) / p.eta2 ** 2
+            )
+            sigma_h = float(np.sqrt(max(
+                sigma2_h * (ou_f / max(horizon_days * _DT, _MIN_VAR)) + jump_var,
+                _MIN_VAR,
+            )))
+            t_std = threshold_pct / max(sigma_h, 1e-8)
+            p_scores[t] = float(np.clip(2.0 * stats.norm.cdf(t_std) - 1.0, 0.0, 1.0))
+
+            # Realized label and vol
+            fwd = oos_returns[t + 1: t + 1 + horizon_days]
+            cum_ret = float(np.sum(fwd))
+            y_realized[t]    = 1 if abs(cum_ret) < threshold_pct else 0
+            rvol_realized[t] = float(np.std(fwd)) * np.sqrt(252) if len(fwd) > 1 else float(np.nan)
+
+        # Innovation diagnostics
+        lb_pvalue = lb_acf_pvalue = float("nan")
+        if len(innovations) >= 10:
+            try:
+                from statsmodels.stats.diagnostic import acorr_ljungbox
+                lb_sq  = acorr_ljungbox(innovations ** 2, lags=[10], return_df=True)
+                lb_acf = acorr_ljungbox(innovations,      lags=[10], return_df=True)
+                lb_pvalue     = float(lb_sq["lb_pvalue"].iloc[0])
+                lb_acf_pvalue = float(lb_acf["lb_pvalue"].iloc[0])
+            except Exception:
+                pass
+
+        return {
+            "innovations":     innovations,
+            "kappa_path":      kappa_path,
+            "mu_path":         mu_path,
+            "drift_path":      drift_path,
+            "sigma_path":      sigma_path,
+            "p_scores":        p_scores,
+            "y_realized":      y_realized,
+            "rvol_realized":   rvol_realized,
+            "lb_pvalue":       lb_pvalue,
+            "lb_acf_pvalue":   lb_acf_pvalue,
+        }
+
     @property
     def is_fitted(self) -> bool:
         return self._params is not None

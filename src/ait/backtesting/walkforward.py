@@ -1316,109 +1316,453 @@ class WalkForwardBacktester:
     ) -> dict:
         """Evaluate range predictor accuracy on OOS test data.
 
-        Computes per-model and ensemble balanced accuracy on the test window,
-        using the same labelling logic as training. Returns a dict with
-        per-model OOS balanced accuracy and edge-over-baseline so the
-        train/test generalisation gap is visible in the window JSON.
+        Computes per-model probability scoring metrics (Brier score, log loss,
+        Brier skill score, realized-vol MAE) and balanced accuracy, plus AEKF
+        direction diagnostics for the OU-Kou-GARCH member.  All metrics are
+        stored under ``oos_scores`` in the window JSON so train/test
+        generalisation gaps are visible per model.
 
-        Returns empty dict if evaluation is not possible (too few rows,
-        single-class labels, or models not available).
+        Returns empty dict if evaluation is not possible.
         """
-        try:
-            from sklearn.metrics import balanced_accuracy_score
-            import numpy as _np
+        import numpy as _np
+        from sklearn.metrics import balanced_accuracy_score, roc_auc_score
 
-            # Need horizon_days future rows to label — check for sufficient data
+        try:
+            # ----------------------------------------------------------------
+            # 1. Build OOS range labels and realized-vol series
+            # ----------------------------------------------------------------
             if len(test_df) <= horizon_days + 5:
                 return {}
 
-            # Create OOS labels using same logic as RangePredictor._create_labels
-            close = test_df["Close"]
-            labels = {}
-            for t in range(len(close) - horizon_days):
-                base = close.iloc[t]
-                future = close.iloc[t + 1: t + 1 + horizon_days]
-                max_dev = float((future / base - 1).abs().max())
-                labels[t] = 1 if max_dev < threshold_pct else 0
-            if not labels:
-                return {}
+            close = test_df["Close"].values
+            oos_returns = _np.diff(_np.log(close))
+            n_close = len(close)
 
-            label_idx = list(labels.keys())
-            y_true = _np.array([labels[i] for i in label_idx])
-            if len(_np.unique(y_true)) < 2:
-                return {}  # single-class OOS — can't score
-
-            # Get features for the labelable rows
-            rp_sym = getattr(range_predictor, "_symbol_models", {}).get(symbol, {})
-            models = rp_sym.get("models", getattr(range_predictor, "_models", {}))
-            scaler = rp_sym.get("scaler", getattr(range_predictor, "_scaler", None))
-            feature_names = rp_sym.get("feature_names",
-                                       getattr(range_predictor, "_feature_names", []))
-            if not models or scaler is None or not feature_names:
-                return {}
-
-            feat_engine = getattr(range_predictor, "_feature_engine", None)
-            if feat_engine is None:
-                return {}
-
-            features = feat_engine.compute(test_df)
-            if features.empty or len(features) <= horizon_days:
-                return {}
-
-            # Align features to labelled rows
-            feat_rows = features.iloc[label_idx]
-            missing = [f for f in feature_names if f not in feat_rows.columns]
-            if missing:
-                return {}
-
-            X = feat_rows[feature_names]
-            try:
-                X_scaled = pd.DataFrame(
-                    scaler.transform(X.values), columns=feature_names,
+            labels_dict: dict[int, int] = {}
+            rvol_realized: dict[int, float] = {}
+            for t in range(n_close - horizon_days):
+                base   = close[t]
+                future = close[t + 1: t + 1 + horizon_days]
+                max_dev = float(_np.max(_np.abs(future / base - 1)))
+                labels_dict[t] = 1 if max_dev < threshold_pct else 0
+                # Realized annualised vol over the horizon window
+                fwd_rets = _np.diff(_np.log(close[t: t + 1 + horizon_days]))
+                rvol_realized[t] = (
+                    float(_np.std(fwd_rets) * _np.sqrt(252))
+                    if len(fwd_rets) > 1 else float("nan")
                 )
-            except Exception:
+
+            if not labels_dict:
                 return {}
 
-            # Score each model individually
-            oos_scores: dict = {}
-            ensemble_proba = _np.zeros(len(y_true))
-            weights = getattr(range_predictor, "_fitted_weights", None) or {}
-            total_weight = sum(weights.get(n, 0.5) for n in models)
+            label_idx = list(labels_dict.keys())
+            y_true     = _np.array([labels_dict[i] for i in label_idx])
+            rvol_true  = _np.array([rvol_realized[i] for i in label_idx])
+            base_rate  = float(_np.mean(y_true))
 
-            for name, model in models.items():
-                try:
-                    proba = model.predict_proba(X_scaled)[:, 1]
-                    preds = (proba >= 0.5).astype(int)
-                    bal_acc = float(balanced_accuracy_score(y_true, preds))
-                    oos_scores[name] = round(bal_acc, 4)
-                    w = weights.get(name, 0.5) / total_weight if total_weight > 0 else 0.5
-                    ensemble_proba += w * proba
-                except Exception:
-                    continue
-
-            if not oos_scores:
+            if len(_np.unique(y_true)) < 2:
                 return {}
 
-            # Ensemble score
-            ensemble_preds = (ensemble_proba >= 0.5).astype(int)
-            oos_scores["ensemble"] = round(
-                float(balanced_accuracy_score(y_true, ensemble_preds)), 4
+            # ----------------------------------------------------------------
+            # 2. ML model scoring (XGBoost / LightGBM)
+            # ----------------------------------------------------------------
+            rp_sym       = getattr(range_predictor, "_symbol_models", {}).get(symbol, {})
+            models       = rp_sym.get("models", getattr(range_predictor, "_models", {}))
+            scaler       = rp_sym.get("scaler", getattr(range_predictor, "_scaler", None))
+            feature_names = rp_sym.get(
+                "feature_names", getattr(range_predictor, "_feature_names", [])
             )
+            feat_engine  = getattr(range_predictor, "_feature_engine", None)
+            weights      = rp_sym.get("fitted_weights") or getattr(range_predictor, "_fitted_weights", None) or {}
 
-            # Edge = balanced_acc - 0.50 baseline
-            baseline = 0.50
-            oos_edge = {k: round(v - baseline, 4) for k, v in oos_scores.items()}
+            ml_scores:    dict[str, dict] = {}
+            ensemble_proba = _np.zeros(len(y_true))
+            total_weight   = sum(weights.get(n, 0.5) for n in models) if models else 1.0
+
+            if models and scaler is not None and feature_names and feat_engine is not None:
+                features = feat_engine.compute(test_df)
+                if not features.empty and len(features) > horizon_days:
+                    feat_rows = features.iloc[label_idx]
+                    if not any(f not in feat_rows.columns for f in feature_names):
+                        X = feat_rows[feature_names]
+                        try:
+                            X_sc = pd.DataFrame(
+                                scaler.transform(X.values), columns=feature_names,
+                            )
+                            for name, model in models.items():
+                                try:
+                                    proba = model.predict_proba(X_sc)[:, 1]
+                                    ml_scores[name] = self._prob_score_metrics(
+                                        y_true, proba, base_rate
+                                    )
+                                    w = weights.get(name, 0.5) / total_weight if total_weight > 0 else 0.5
+                                    ensemble_proba += w * proba
+                                except Exception:
+                                    continue
+                        except Exception:
+                            pass
+
+            # Ensemble score over ML members only (statistical members added below)
+            if ml_scores:
+                ml_scores["ensemble_ml"] = self._prob_score_metrics(
+                    y_true, ensemble_proba, base_rate
+                )
+
+            # ----------------------------------------------------------------
+            # 3. Statistical model rolling OOS scoring
+            # ----------------------------------------------------------------
+            stat_scores: dict[str, dict] = {}
+
+            try:
+                from ait.ml.garch_range_predictor import GARCHRangeModel
+                grm = GARCHRangeModel()
+
+                # GARCH/GJR/EGARCH/ARCH rolling forecasts
+                garch_state = rp_sym.get("garch_state") or {}
+                if garch_state and garch_state.get("_vol_kwargs") is not None:
+                    p_garch = grm.roll_garch_forecasts(
+                        garch_state, oos_returns, horizon_days, threshold_pct
+                    )
+                    if len(p_garch) == len(y_true):
+                        rvol_pred_garch = self._garch_rvol_forecast(
+                            garch_state, oos_returns, horizon_days
+                        )
+                        stat_scores["garch"] = self._prob_score_metrics(
+                            y_true, p_garch, base_rate,
+                            rvol_pred=rvol_pred_garch, rvol_true=rvol_true,
+                        )
+
+                # MS-GARCH rolling forecasts
+                ms_garch_state = rp_sym.get("ms_garch_state") or {}
+                if ms_garch_state:
+                    p_ms = grm.roll_msgarch_forecasts(
+                        ms_garch_state, oos_returns, horizon_days, threshold_pct
+                    )
+                    if len(p_ms) == len(y_true):
+                        stat_scores["msgarch"] = self._prob_score_metrics(
+                            y_true, p_ms, base_rate
+                        )
+
+                # OU-Kou-GARCH rolling forecasts + AEKF diagnostics
+                ou_jump_state = rp_sym.get("ou_jump_state") or {}
+                aekf_metrics:  dict = {}
+                if ou_jump_state:
+                    p_ou, drifts, sigma_ou = grm.roll_oujump_forecasts(
+                        ou_jump_state, oos_returns, horizon_days, threshold_pct
+                    )
+                    if len(p_ou) == len(y_true):
+                        stat_scores["oujump"] = self._prob_score_metrics(
+                            y_true, p_ou, base_rate,
+                            rvol_pred=sigma_ou[:len(y_true)] if len(sigma_ou) >= len(y_true) else None,
+                            rvol_true=rvol_true,
+                        )
+
+                    # AEKF direction diagnostics from oos_aekf_diagnostics()
+                    try:
+                        from ait.ml.ou_jump import OUKouGARCH
+                        _ou_tmp = OUKouGARCH()
+                        # Reconstruct just enough state for oos_aekf_diagnostics
+                        _ou_tmp._params   = None  # will be rebuilt inside method
+                        aekf_raw = self._aekf_oos_eval(
+                            ou_jump_state, oos_returns, horizon_days, threshold_pct, y_true, rvol_true
+                        )
+                        if aekf_raw:
+                            aekf_metrics = aekf_raw
+                    except Exception:
+                        pass
+
+            except Exception:
+                pass
+
+            # ----------------------------------------------------------------
+            # 4. Full ensemble combined score
+            # ----------------------------------------------------------------
+            all_scores = {**ml_scores, **stat_scores}
+            if all_scores:
+                # Build combined weighted ensemble proba
+                combined_proba = _np.zeros(len(y_true))
+                combined_w     = 0.0
+                for name, w in weights.items():
+                    m_scores = all_scores.get(name, {})
+                    if "p_scores" in m_scores and w > 0:
+                        combined_proba += w * _np.asarray(m_scores["p_scores"])
+                        combined_w += w
+                if combined_w > 0:
+                    combined_proba /= combined_w
+                    all_scores["ensemble"] = self._prob_score_metrics(
+                        y_true, combined_proba, base_rate
+                    )
+
+            # Strip p_scores arrays from output (not JSON-serialisable and large)
+            def _strip_arrays(d: dict) -> dict:
+                return {k: v for k, v in d.items() if k != "p_scores"}
+
+            result: dict = {
+                "n_samples":   len(y_true),
+                "base_rate":   round(base_rate, 4),
+                "ml":          {k: _strip_arrays(v) for k, v in ml_scores.items()},
+                "statistical": {k: _strip_arrays(v) for k, v in stat_scores.items()},
+            }
+            if "ensemble" in all_scores:
+                result["ensemble"] = _strip_arrays(all_scores["ensemble"])
+            if aekf_metrics:
+                result["aekf"] = aekf_metrics
 
             log.debug(
                 "range_oos_evaluated",
-                window=symbol, symbol=symbol,
-                oos_scores=oos_scores, oos_edge=oos_edge,
+                symbol=symbol,
                 n_samples=len(y_true),
+                ml_models=list(ml_scores.keys()),
+                stat_models=list(stat_scores.keys()),
             )
-            return {"balanced_accuracy": oos_scores, "edge": oos_edge}
+            return result
 
         except Exception as e:
             log.debug("range_oos_eval_failed", symbol=symbol, error=str(e))
+            return {}
+
+    @staticmethod
+    def _prob_score_metrics(
+        y_true: "np.ndarray",
+        p_scores: "np.ndarray",
+        base_rate: float,
+        rvol_pred: "np.ndarray | None" = None,
+        rvol_true: "np.ndarray | None" = None,
+    ) -> dict:
+        """Compute probability scoring metrics for one model's OOS predictions.
+
+        Metrics:
+          brier_score      — mean squared probability error: E[(p - y)²]
+          brier_skill      — 1 − Brier / Brier_baseline  (+ = better than climatology)
+          log_loss         — mean negative log-likelihood: −E[y·log(p) + (1−y)·log(1−p)]
+          auroc            — Area Under ROC Curve (rank discrimination)
+          balanced_acc     — balanced accuracy at 0.5 decision threshold
+          mean_confidence  — mean(max(p, 1−p)); how assertive the model is
+          rvol_mae         — mean |σ_predicted − σ_realized| annualised (if provided)
+          rvol_bias        — mean(σ_predicted − σ_realized); + = over-estimates vol
+        """
+        import numpy as _np
+        from sklearn.metrics import balanced_accuracy_score, roc_auc_score
+
+        p = _np.asarray(p_scores, dtype=float)
+        y = _np.asarray(y_true,   dtype=float)
+        p = _np.clip(p, 1e-7, 1.0 - 1e-7)
+
+        n = len(y)
+        result: dict = {"p_scores": p.tolist()}  # kept internally; stripped before JSON
+
+        # Brier score
+        brier = float(_np.mean((p - y) ** 2))
+        brier_base = float(base_rate * (1.0 - base_rate))
+        brier_skill = float(1.0 - brier / brier_base) if brier_base > 0 else float("nan")
+        result["brier_score"]  = round(brier, 5)
+        result["brier_skill"]  = round(brier_skill, 4)
+
+        # Log loss (cross-entropy)
+        ll = float(-_np.mean(y * _np.log(p) + (1.0 - y) * _np.log(1.0 - p)))
+        result["log_loss"] = round(ll, 5)
+
+        # AUROC
+        try:
+            result["auroc"] = round(float(roc_auc_score(y, p)), 4)
+        except Exception:
+            result["auroc"] = float("nan")
+
+        # Balanced accuracy at 0.5 threshold
+        try:
+            preds = (p >= 0.5).astype(int)
+            result["balanced_acc"] = round(float(balanced_accuracy_score(y.astype(int), preds)), 4)
+        except Exception:
+            result["balanced_acc"] = float("nan")
+
+        # Mean confidence (assertiveness)
+        result["mean_confidence"] = round(float(_np.mean(_np.maximum(p, 1.0 - p))), 4)
+
+        # Realized vol MAE and bias
+        if rvol_pred is not None and rvol_true is not None:
+            rp = _np.asarray(rvol_pred, dtype=float)
+            rt = _np.asarray(rvol_true, dtype=float)
+            finite = _np.isfinite(rp) & _np.isfinite(rt)
+            if finite.sum() >= 2:
+                result["rvol_mae"]  = round(float(_np.mean(_np.abs(rp[finite] - rt[finite]))), 5)
+                result["rvol_bias"] = round(float(_np.mean(rp[finite] - rt[finite])), 5)
+
+        return result
+
+    @staticmethod
+    def _garch_rvol_forecast(
+        state: dict,
+        oos_returns: "np.ndarray",
+        horizon_days: int,
+    ) -> "np.ndarray | None":
+        """Per-day h-step annualised vol forecast from frozen GARCH params.
+
+        Uses the analytic GARCH variance recursion (no refit) to produce a
+        rolling forecast of realized vol for the rvol_mae metric.
+        """
+        import numpy as _np
+        try:
+            vol_kwargs  = state.get("_vol_kwargs")
+            if vol_kwargs is None:
+                return None
+            import warnings
+            from arch import arch_model
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                am  = arch_model(oos_returns * 100, mean="Constant", **vol_kwargs)
+                res = am.fit(disp="off", show_warning=False, options={"maxiter": 200})
+            n = len(oos_returns)
+            n_labelable = n - horizon_days
+            sigma_h = _np.empty(n_labelable)
+            for t in range(n_labelable):
+                try:
+                    fc = res.forecast(horizon=horizon_days, start=t, method="analytic", reindex=False)
+                    var_h = float(fc.variance.iloc[0].sum())
+                    sigma_h[t] = float(_np.sqrt(max(var_h, 1e-10))) / 100.0 * _np.sqrt(252)
+                except Exception:
+                    sigma_h[t] = float("nan")
+            return sigma_h
+        except Exception:
+            return None
+
+    def _aekf_oos_eval(
+        self,
+        ou_jump_state: dict,
+        oos_returns: "np.ndarray",
+        horizon_days: int,
+        threshold_pct: float,
+        y_true: "np.ndarray",
+        rvol_true: "np.ndarray",
+    ) -> dict:
+        """Compute AEKF OOS diagnostics from a stored OU-Kou-GARCH state dict.
+
+        Rebuilds an OUKouGARCH object from the state dict and calls
+        oos_aekf_diagnostics() to get the full AEKF step-forward metrics.
+
+        Returns a dict of scalar AEKF diagnostics for the window JSON.
+        """
+        import numpy as _np
+        from sklearn.metrics import roc_auc_score
+        try:
+            from ait.ml.ou_jump import OUKouGARCH, OUKouGARCHParams, AdaptiveEKF, _MIN_VAR, _DT
+
+            inner = ou_jump_state.get("oujump_state") or {}
+            params_raw  = inner.get("params") or {}
+            aekf_final  = inner.get("aekf_final_state") or {}
+            if not params_raw or not aekf_final:
+                return {}
+
+            from scipy import stats as _stats
+
+            # Reconstruct a minimal OUKouGARCH for oos_aekf_diagnostics
+            p = OUKouGARCHParams(
+                kappa=float(params_raw.get("kappa",  0.1)),
+                mu=   float(params_raw.get("mu",     0.0)),
+                omega=float(params_raw.get("omega",  1e-6)),
+                alpha=float(params_raw.get("alpha",  0.05)),
+                beta= float(params_raw.get("beta",   0.90)),
+                lam=  float(params_raw.get("lambda", 0.05)),
+                p_up= float(params_raw.get("p_up",   0.5)),
+                eta1= float(params_raw.get("eta1",   50.0)),
+                eta2= float(params_raw.get("eta2",   50.0)),
+            )
+            X_T   = float(aekf_final.get("X_T",     p.mu))
+            k_T   = float(aekf_final.get("kappa_T", p.kappa))
+            m_T   = float(aekf_final.get("mu_T",    p.mu))
+            uncond = p.omega / max(1.0 - p.alpha - p.beta, 1e-6)
+
+            ou = OUKouGARCH()
+            ou._params      = p
+            ou._loglik      = float(inner.get("loglik", 0.0))
+            ou._n_obs       = int(inner.get("n_obs", 0))
+            ou._converged   = bool(inner.get("converged", False))
+            ou._n_iter      = int(inner.get("n_iter", 0))
+            log_prices_stub = _np.array([X_T])
+            ou._log_prices  = log_prices_stub
+            sigma2_stub     = _np.array([uncond])
+            ou._sigma2_path = sigma2_stub
+
+            # Rebuild AEKF at training end-state
+            aekf = AdaptiveEKF(x0=X_T, kappa_init=k_T, mu_init=m_T,
+                               sigma2_init=uncond)
+            aekf._z = _np.array([X_T, k_T, m_T])
+            ou._aekf = aekf
+
+            raw = ou.oos_aekf_diagnostics(oos_returns, horizon_days, threshold_pct)
+            if not raw:
+                return {}
+
+            innovations  = raw["innovations"]
+            kappa_path   = raw["kappa_path"]
+            drift_path   = raw["drift_path"]
+            p_ou         = raw["p_scores"]
+            y_oos        = raw["y_realized"]
+            lb_pvalue    = raw["lb_pvalue"]
+            lb_acf       = raw["lb_acf_pvalue"]
+
+            # Direction accuracy: fraction where sign(drift) == sign(realized return)
+            n_lab  = min(len(drift_path), len(y_true))
+            if n_lab > 0:
+                drift_sign    = (_np.asarray(drift_path[:n_lab]) > 0).astype(int)
+                # y_true=1 means price stayed in range; for direction we compare to
+                # realized return direction over horizon (positive return = bullish)
+                # Compute realized h-day log return sign from oos_returns
+                n_r = len(oos_returns)
+                realized_dir = _np.array([
+                    1 if _np.sum(oos_returns[t + 1: t + 1 + horizon_days]) > 0 else 0
+                    for t in range(min(n_lab, n_r - horizon_days))
+                ])
+                nd = min(len(drift_sign), len(realized_dir))
+                dir_accuracy = float(_np.mean(drift_sign[:nd] == realized_dir[:nd])) if nd > 0 else float("nan")
+
+                # Direction AUROC: |drift| as score, realized_dir as label
+                try:
+                    dir_auroc = float(roc_auc_score(
+                        realized_dir[:nd],
+                        _np.abs(drift_path[:nd]),
+                    ))
+                except Exception:
+                    dir_auroc = float("nan")
+
+                # Direction Brier
+                if len(p_ou) >= nd and len(y_oos) >= nd:
+                    dir_brier_base = float(_np.mean(realized_dir[:nd])) * (1.0 - float(_np.mean(realized_dir[:nd])))
+                    # Use normalised |drift| mapped to [0,1] as confidence
+                    drift_conf = _np.clip(_np.abs(drift_path[:nd]) / (3.0 * float(_np.std(drift_path[:nd])) + 1e-8), 0.0, 1.0)
+                    dir_brier  = float(_np.mean((drift_conf - realized_dir[:nd]) ** 2))
+                    dir_brier_skill = float(1.0 - dir_brier / dir_brier_base) if dir_brier_base > 0 else float("nan")
+                else:
+                    dir_brier = dir_brier_skill = float("nan")
+            else:
+                dir_accuracy = dir_auroc = dir_brier = dir_brier_skill = float("nan")
+
+            # AEKF stability metrics
+            kappa_mean = float(_np.mean(kappa_path))
+            kappa_std  = float(_np.std(kappa_path))
+            kappa_cv   = kappa_std / max(kappa_mean, 1e-8)
+            kappa_min  = float(_np.min(kappa_path))
+            kappa_max  = float(_np.max(kappa_path))
+
+            # Innovation whiteness: fraction of |ν_t| > 2σ_ν (outlier rate)
+            sigma_nu  = float(_np.std(innovations))
+            outlier_rate = float(_np.mean(_np.abs(innovations) > 2.0 * sigma_nu))
+
+            return {
+                "lb_innovations_sq_pvalue":  round(lb_pvalue,    5) if _np.isfinite(lb_pvalue)    else None,
+                "lb_innovations_acf_pvalue": round(lb_acf,       5) if _np.isfinite(lb_acf)       else None,
+                "innovation_outlier_rate":   round(outlier_rate, 4),
+                "kappa_oos_mean":            round(kappa_mean,   5),
+                "kappa_oos_cv":              round(kappa_cv,     4),
+                "kappa_oos_min":             round(kappa_min,    5),
+                "kappa_oos_max":             round(kappa_max,    5),
+                "direction_accuracy":        round(dir_accuracy, 4) if _np.isfinite(dir_accuracy)    else None,
+                "direction_auroc":           round(dir_auroc,    4) if _np.isfinite(dir_auroc)       else None,
+                "direction_brier":           round(dir_brier,    5) if _np.isfinite(dir_brier)       else None,
+                "direction_brier_skill":     round(dir_brier_skill, 4) if _np.isfinite(dir_brier_skill) else None,
+            }
+
+        except Exception as e:
+            log.debug("aekf_oos_eval_failed", error=str(e))
             return {}
 
     @staticmethod

@@ -257,6 +257,111 @@ class MarkovSwitchingGARCH:
             "final_probs":       self.final_regime_probs,
         }
 
+    def load_from_state_dict(self, state: dict) -> bool:
+        """Reconstruct a fitted MS-GARCH from a to_state_dict() snapshot.
+
+        Used by roll_msgarch_forecasts() to avoid re-fitting on OOS data.
+        Returns True on success, False if the state dict is incomplete.
+        """
+        try:
+            r0 = state.get("regime0") or {}
+            r1 = state.get("regime1") or {}
+            tr = state.get("transition") or {}
+            fp = state.get("final_probs") or [0.5, 0.5]
+
+            self._params = MSGARCHParams(
+                omega=[float(r0.get("omega", 1e-6)), float(r1.get("omega", 1e-6))],
+                alpha=[float(r0.get("alpha", 0.05)), float(r1.get("alpha", 0.10))],
+                beta= [float(r0.get("beta",  0.90)), float(r1.get("beta",  0.85))],
+                p00=  float(tr.get("p00", 0.97)),
+                p11=  float(tr.get("p11", 0.90)),
+            )
+            # Initialise filter state at training end-state
+            self._current_filtered = np.array([float(fp[0]), float(fp[1])], dtype=float)
+            # Initialise per-regime last variance to unconditional variance
+            p = self._params
+            self._sigma2_last = np.array([
+                p.omega[k] / max(1.0 - p.alpha[k] - p.beta[k], 1e-6)
+                for k in range(_N_REGIMES)
+            ])
+            self._loglik   = float(state.get("loglik", 0.0))
+            self._converged = bool(state.get("converged", False))
+            self._n_iter   = int(state.get("n_iter", 0))
+            return True
+        except Exception:
+            return False
+
+    def step_filter(self, r: float) -> None:
+        """Update Hamilton filter state by one OOS observation.
+
+        Updates ``_current_filtered`` (regime probabilities) and
+        ``_sigma2_last`` (per-regime conditional variances) using
+        frozen MLE parameters.  Called repeatedly over OOS returns
+        by roll_msgarch_forecasts().
+        """
+        if self._params is None or not hasattr(self, "_current_filtered"):
+            return
+
+        p = self._params
+        P = np.array([[p.p00, 1 - p.p00],
+                      [1 - p.p11, p.p11]])
+
+        # Update per-regime conditional variance: σ²_{t|k} = ω_k + α_k·r² + β_k·σ²_{t-1|k}
+        r2 = r * r
+        self._sigma2_last = np.array([
+            max(p.omega[k] + p.alpha[k] * r2 + p.beta[k] * self._sigma2_last[k], _MIN_VAR)
+            for k in range(_N_REGIMES)
+        ])
+
+        # Predict regime: π_t = P.T @ π_{t-1}
+        predicted = P.T @ self._current_filtered
+        predicted = np.clip(predicted, 1e-300, None)
+
+        # Update with likelihood
+        densities = np.array([
+            self._normal_density(r, self._sigma2_last[k]) for k in range(_N_REGIMES)
+        ])
+        joint = densities * predicted
+        total = joint.sum()
+        if total > 0 and np.isfinite(total):
+            self._current_filtered = joint / total
+        else:
+            self._current_filtered = predicted
+
+    def p_in_range_from_filter(self, horizon: int, threshold_pct: float) -> float:
+        """P(in range) using the current step_filter regime state.
+
+        Used in roll_msgarch_forecasts() after stepping the filter forward
+        through OOS observations.
+        """
+        if self._params is None or not hasattr(self, "_current_filtered"):
+            return 0.5
+        if not hasattr(self, "_sigma2_last"):
+            return self.p_in_range(horizon, threshold_pct)
+
+        p = self._params
+        pi = self._current_filtered
+
+        # h-step variance per regime via analytic GARCH recursion
+        sigma2_h = 0.0
+        for k in range(_N_REGIMES):
+            persist = p.alpha[k] + p.beta[k]
+            uncond_k = p.omega[k] / max(1.0 - persist, 1e-6)
+            if persist >= 1.0 - 1e-6:
+                var_k = self._sigma2_last[k] * horizon
+            else:
+                var_k = (
+                    horizon * uncond_k
+                    + (self._sigma2_last[k] - uncond_k)
+                    * (1.0 - persist ** horizon)
+                    / max(1.0 - persist, 1e-8)
+                )
+            sigma2_h += float(pi[k]) * max(var_k, _MIN_VAR)
+
+        sigma_h = float(np.sqrt(max(sigma2_h, _MIN_VAR)))
+        t_std = threshold_pct / max(sigma_h, 1e-8)
+        return float(np.clip(2.0 * stats.norm.cdf(t_std) - 1.0, 0.0, 1.0))
+
     # ------------------------------------------------------------------
     # Private: Hamilton filter (E-step forward pass)
     # ------------------------------------------------------------------
