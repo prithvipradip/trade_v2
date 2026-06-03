@@ -26,6 +26,8 @@
 | 14 | `QQQ_365d_iron_condor_20260602_0316` | 365/60/60/5, 12 W | +0.49% | — | 24 / — | +0.90 / — | 10/12 | GARCH CV fix (_MIN_RETURNS 60→40, AUROC scoring) — AUROC=0.500 every window, zero weight |
 | 15 | `QQQ_365d_iron_condor_20260602_0845` | 365/60/60/5, 12 W | −0.45% | — | 27 / — | −2.46 / — | 10/12 | GARCH rolling forecasts fixed (3 bugs); first real AUROC; rank-inverted W08/W09; worse than Exp 13 |
 | 16 | `QQQ_365d_iron_condor_20260603_0617` | 365/60/60/5, 12 W | −1.38% | — | 25 / — | −2.26 / — | 10/12 | GARCH disabled; W03 still −$41 (not GARCH); P31 disproved for W03; 10/12 windows stable |
+| 17 | `QQQ_365d_iron_condor_20260603_exp17_partial` | 365/60/60/5, 4/12 W | — | — | — | — | — | KILLED 4/12 — P36 found (single-class CV folds); stat models got zero weight; Q_E17_1 answered |
+| 17v2 | pending | 365/60/60/5, 12 W | — | — | — | — | — | P36 fix; MS-GARCH + OU-Kou-GARCH with real CV AUROC; sequential pre-training |
 
 Config format: `train_days / test_days / step_days / gap_days`.
 All experiments: QQQ, iron_condor only, TPE sampler seed 42, $100k initial capital.
@@ -1617,11 +1619,12 @@ Enable MS-GARCH and OU-Kou-GARCH as standalone ensemble members with RNG isolati
 
 ---
 
-## Experiment 17 — MS-GARCH + OU-Kou-GARCH with RNG Isolation
+## Experiment 17 — MS-GARCH + OU-Kou-GARCH with Sequential Pre-Training (PARTIAL — killed)
 
-**Archive:** pending
-**Date:** pending
+**Archive:** `QQQ_365d_iron_condor_20260603_exp17_partial` (4/12 windows only)
+**Date:** 2026-06-03
 **Branch:** `features-request-3`
+**Status:** KILLED — superseded by Exp 17v2
 
 ### Context
 
@@ -1713,6 +1716,88 @@ python scripts/run_integration_test.py \
 ```
 
 Note: `enable_msgarch=True` and `enable_oujump=True` are now the defaults on `WalkForwardBacktester`. No additional flags needed — statistical models activate automatically with RNG isolation.
+
+### Results — Section E (Partial — 4/12 windows)
+
+| W | PnL | Trades | WR | ms_w | ou_w | Notes |
+|---|-----|--------|----|------|------|-------|
+| W01 | −$195 | 6 | 50% | 0 | 0 | Params = E16 ✓ — Q_E17_1 answered |
+| W02 | −$321 | 1 | 0% | 0 | 0 | Params = E16 ✓ |
+| W04 | +$205 | 1 | 100% | 0 | 0 | Params differ from E16 (different Optuna trajectory) |
+| W06 | $0 | 0 | — | 0 | 0 | Range gate blocked, no trades |
+| W03–W12 | — | — | — | — | — | Not completed — experiment killed |
+
+### Observations
+
+1. **Q_E17_1 answered (partially)**: W01 and W02 best_params are byte-identical to E16. Sequential pre-training (statistical models trained before Optuna starts) does not contaminate the Optuna RNG — the isolation goal is achieved without subprocess overhead.
+
+2. **P36 discovered mid-run**: All statistical models returned `cv_auroc=None` because single-class CV folds were silently dropped. MS-GARCH and OU-Kou-GARCH converged correctly in pre-training (BICs −630 to −786) but received zero fitted weight — they never participated in the ensemble or triggered OOS evaluation. The core questions (Q_E17_2 through Q_E17_7) are unanswerable from this run.
+
+3. **Pre-training architecture validated**: Sequential pre-training of 12 windows took 18m 45s — fast enough. No subprocess timeouts, no semaphore leaks. All 12 MS-GARCH and OU-Kou-GARCH models converged.
+
+### What We Learned
+
+- **Sequential pre-training before ProcessPoolExecutor is the correct architecture**: eliminates CPU contention and Optuna RNG contamination simultaneously without subprocess complexity.
+- **P36 is a silent failure mode**: the experiment appeared to run correctly but produced a degenerate result (all statistical weights = 0). Without per-experiment sanity checks on fitted_weights, this would have been invisible.
+- **The right experiment is E17v2 with the P36 fix**: single-class folds scoring 0.5 will allow MS-GARCH and OU-Kou-GARCH to earn genuine weights wherever they have CV edge.
+
+### What Changed for Next Experiment (Exp 17v2)
+
+- **P36 fix**: single-class CV folds score 0.5 instead of being dropped (`_MIN_FOLD_LABELS=10` still skips genuinely short folds). All other setup identical to E17.
+
+---
+
+## Experiment 17v2 — MS-GARCH + OU-Kou-GARCH with CV Single-Class Fix
+
+**Archive:** pending
+**Date:** 2026-06-03
+**Branch:** `features-request-3`
+
+### Context
+
+Exp 17 was killed at 4/12 windows after discovering P36: single-class CV folds were silently dropped, causing all statistical models to return `cv_auroc=None` and zero fitted weight. The core questions about MS-GARCH/OU-Kou-GARCH signal quality (Q_E17_2 through Q_E17_7) were unanswerable. Exp 17v2 is identical to E17 in all respects except the P36 fix is active.
+
+**What changes with the fix:** In low-vol windows (W10–W12, threshold ~5%, in-range rate ~85%), some CV folds have all-positive labels. Previously these were dropped, leaving only 1–2 scorable folds and often returning `None`. Now they score 0.5. This means MS-GARCH and OU-Kou-GARCH will receive a real AUROC based on the folds where mixed classes exist, and will get positive fitted weight wherever that AUROC > 0.50.
+
+### Setup
+
+- Walk-forward config: **365d** / **60d** / **60d** / 5d → **12 windows** (same as E13–E17)
+- OOS period: 2024-05-19 → 2026-05-09
+- Key changes from Exp 17 (partial):
+  - **P36 fix**: `GARCHRangeModel._MIN_FOLD_LABELS=10`; single-class folds score 0.5
+  - All else identical: sequential pre-training, MS-GARCH + OU-Kou-GARCH enabled, plain GARCH disabled
+- Optuna: 200 trials, patience 50, min_trades 7, n_jobs 6, seed 42
+
+### Open Questions (carried from E17)
+
+- **Q_E17_1**: Do all 12 stable windows (excl. W03) match E16 best_params? (Partial answer from E17: W01, W02 confirmed yes.)
+- **Q_E17_2**: Does MS-GARCH fix W08/W09 rank inversion? (`oos_scores.statistical.msgarch.rvol_bias` near zero vs GARCH's large positive bias in E15.)
+- **Q_E17_3**: Does OU-Kou-GARCH win any BIC races? (`garch_all_variants["OU-Kou-GARCH"].bic` vs MS-GARCH per window.)
+- **Q_E17_4**: Does the OU-Kou-GARCH direction signal have OOS skill? (`oos_scores.aekf.direction_auroc` > 0.52 in windows with positive fitted weight.)
+- **Q_E17_5**: Do CV AUROC scores correlate with OOS Brier Skill Scores? (Scatter: `cv_scores` vs `oos_scores.brier_skill` per model per window.)
+- **Q_E17_6**: Does the range gate do real work? (In windows where model OOS AUROC improves, does PnL also improve?)
+- **Q_E17_7**: Is the AEKF filtering correctly? (`oos_scores.aekf.lb_innovations_acf_pvalue` > 0.05 in most windows.)
+- **Q_E17_8**: Do zero-contribution windows still match E16 exactly?
+
+### Launch Command
+```bash
+python scripts/run_integration_test.py \
+  --symbols QQQ \
+  --config config_QQQ_test.yaml \
+  --strategies iron_condor \
+  --train-days 365 \
+  --test-days 60 \
+  --step-days 60 \
+  --gap-days 5 \
+  --optuna-seed 42 \
+  --wf-trials 200 \
+  --wf-patience 50 \
+  --wf-min-trades 7 \
+  --wf-n-jobs 6 \
+  --years 3 \
+  --skip-backfill \
+  --console-log-level WARNING
+```
 
 ### Results — Section E
 *(pending)*
