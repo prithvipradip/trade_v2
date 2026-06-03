@@ -1,0 +1,49 @@
+{
+  "run_id": "QQQ_365d_iron_condor_20260603_exp17_partial",
+  "run_date": "2026-06-03",
+  "symbol": "QQQ",
+  "strategy": "iron_condor",
+  "status": "PARTIAL \u2014 killed at 4/12 windows; P36 (single-class CV fold bug) prevented statistical model weights",
+  "n_windows_completed": 4,
+  "n_windows_total": 12,
+  "key_findings": [
+    "Q_E17_1 answered: W01 and W02 best_params identical to E16 \u2014 sequential pre-training does not contaminate Optuna RNG",
+    "Q_E17_2/Q_E17_4/Q_E17_7: unanswerable \u2014 P36 caused AUROC=None for all statistical models, zero fitted weight",
+    "P36 discovered: single-class CV folds were silently dropped causing AUROC=None; fixed for Exp 17v2",
+    "Pre-training timing: 18m 45s for 12 windows sequentially (confirmed viable)",
+    "All 12 MS-GARCH and OU-Kou-GARCH models converged in pre-training (BICs -630 to -786)"
+  ],
+  "windows": [
+    {
+      "window": 1,
+      "pnl": -195.32,
+      "trades": 6,
+      "win_rate": 0.5,
+      "params_match_e16": null
+    },
+    {
+      "window": 2,
+      "pnl": -321.09,
+      "trades": 1,
+      "win_rate": 0.0,
+      "params_match_e16": null
+    },
+    {
+      "window": 4,
+      "pnl": 204.72,
+      "trades": 1,
+      "win_rate": 1.0,
+      "params_match_e16": null
+    },
+    {
+      "window": 6,
+      "pnl": 0.0,
+      "trades": 0,
+      "win_rate": 0.0,
+      "params_match_e16": null
+    }
+  ],
+  "git_branch": "features-request-3",
+  "git_commit": "b51879f",
+  "superseded_by": "QQQ_365d_iron_condor_exp17v2 (Exp 17 V2 with P36 fix)"
+}
