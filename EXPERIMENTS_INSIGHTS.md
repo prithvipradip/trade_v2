@@ -25,7 +25,7 @@
 | 13 | `QQQ_365d_iron_condor_exp13_v3` | 365/60/60/5, 12 W | +0.49% | — | 24 / — | +0.90 / — | 10/12 | max_concurrent=1; VIX fix; GARCH ensemble (zero weight — CV bug fixed post-run) |
 | 14 | `QQQ_365d_iron_condor_20260602_0316` | 365/60/60/5, 12 W | +0.49% | — | 24 / — | +0.90 / — | 10/12 | GARCH CV fix (_MIN_RETURNS 60→40, AUROC scoring) — AUROC=0.500 every window, zero weight |
 | 15 | `QQQ_365d_iron_condor_20260602_0845` | 365/60/60/5, 12 W | −0.45% | — | 27 / — | −2.46 / — | 10/12 | GARCH rolling forecasts fixed (3 bugs); first real AUROC; rank-inverted W08/W09; worse than Exp 13 |
-| 16 | pending | 365/60/60/5, 12 W | — | — | — | — | — | GARCH disabled; lock in Exp 13 baseline (+$508); investigate W03 degradation |
+| 16 | `QQQ_365d_iron_condor_20260603_0617` | 365/60/60/5, 12 W | −1.38% | — | 25 / — | −2.26 / — | 10/12 | GARCH disabled; W03 still −$41 (not GARCH); P31 disproved for W03; 10/12 windows stable |
 
 Config format: `train_days / test_days / step_days / gap_days`.
 All experiments: QQQ, iron_condor only, TPE sampler seed 42, $100k initial capital.
@@ -1449,8 +1449,8 @@ python scripts/run_integration_test.py \
 
 ## Experiment 16 — GARCH Paused; Lock Exp 13 Baseline
 
-**Archive:** pending
-**Date:** pending
+**Archive:** `QQQ_365d_iron_condor_20260603_0617`
+**Date:** 2026-06-03
 **Branch:** `features-request-3`
 
 ### Context: Why GARCH Is Paused
@@ -1512,22 +1512,96 @@ python scripts/run_integration_test.py \
 ```
 
 ### Results — Section E
-*(pending)*
+
+| Metric | Value |
+|--------|-------|
+| Total return | **−1.38%** |
+| Total PnL | **−$1,382** |
+| Total trades | 25 |
+| Win rate | 56% |
+| Sharpe ratio | **−2.26** |
+| Sortino ratio | −3.58 |
+| Max drawdown | 2.65% |
+| Profit factor | 0.66 |
+| Avg win | $188 |
+| Avg loss | $365 |
+| Active windows | **10 / 12** |
+| Dead windows | 2 / 12 (W10, W12) |
+
+**Per-window breakdown (vs Exp 13 and Exp 15):**
+
+| W# | OOS Period | Trades | WR | PnL (E16) | PnL (E15) | PnL (E13) | Notes |
+|----|-----------|--------|-----|-----------|-----------|-----------|-------|
+| W01 | May–Jul 2024 | 6 | 50% | −$195 | −$195 | −$195 | Identical to E13 ✓ |
+| W02 | Jul–Sep 2024 | 1 | 0% | −$321 | −$321 | −$321 | Identical to E13 ✓ |
+| W03 | Sep–Nov 2024 | 3 | 33% | **−$41** | **−$41** | **+$1,850** | Still degraded — GARCH NOT the cause |
+| W04 | Nov 2024–Jan 2025 | 1 | 100% | +$228 | +$1,165 | +$228 | Matches E13; GARCH W04 boost was GARCH-specific |
+| W05 | Jan–Mar 2025 | 2 | 50% | −$427 | −$427 | −$427 | Identical to E13 ✓ |
+| W06 | Mar–May 2025 | 3 | 0% | −$872 | −$872 | −$872 | Identical to E13 ✓ |
+| W07 | May–Jul 2025 | 2 | 100% | +$177 | +$177 | +$177 | Identical to E13 ✓ |
+| W08 | Jul–Sep 2025 | 5 | 80% | −$92 | −$92 | −$92 | Identical to E13 ✓ |
+| W09 | Sep–Nov 2025 | 1 | 100% | +$128 | +$128 | +$128 | Identical to E13 ✓ |
+| W10 | Nov 2025–Jan 2026 | 0 | — | $0 | $0 | $0 | Dead (inactive) |
+| W11 | Jan–Mar 2026 | 1 | 100% | +$32 | +$32 | +$32 | Identical to E13 ✓ |
+| W12 | Mar–May 2026 | 0 | — | $0 | $0 | $0 | Dead (inactive) |
+
+**Run ID:** `QQQ_365d_iron_condor_20260603_0617`
 
 ### Results — Section F
-*(pending)*
+
+**Per-window PnL vs baseline comparison:**
+
+- 10 of 12 windows are **dollar-for-dollar identical** to Exp 13 (W01, W02, W04–W12)
+- W03: −$41 in both E15 and E16 — degradation is not GARCH-related
+- W04: +$228 in E16, matching E13 exactly (the E15 +$1,165 was driven by GARCH getting weight=1.0 in W04; that bonus is correctly gone in E16)
+- W03 best_params in E16 are byte-for-byte identical to E15 best_params — the same non-GARCH non-determinism source landed on the same worse local optimum in both experiments
+
+**Summary vs baselines:**
+
+| Experiment | Total PnL | W03 PnL | W04 PnL | Statistical Models |
+|-----------|-----------|---------|---------|-------------------|
+| Exp 13 | +$508 | +$1,850 | +$228 | GARCH (zero weight, bug) |
+| Exp 15 | −$445 | −$41 | +$1,165 | GARCH (active, rank-inverted W08/W09) |
+| Exp 16 | **−$1,382** | **−$41** | +$228 | None |
 
 ### Observations
-*(pending)*
+
+1. **W03 degradation is NOT caused by GARCH** — this is the central finding. Disabling GARCH entirely (no RNG contamination possible) produces the same W03 result (−$41, same best_params) as Exp 15. The Optuna RNG contamination hypothesis (P31) was a valid explanation for why W03 differed from E13, but the actual non-determinism source that shifted W03 is not GARCH. Q_E16_1 is answered: **No**, GARCH removal does not reproduce the +$508 baseline.
+
+2. **10 windows are perfectly stable** — W01, W02, W04–W12 are identical to Exp 13 to the dollar. The system is deterministic for these windows regardless of whether GARCH is active or not. The instability is localized to W03 (and W04 via GARCH weight, which is now understood as a GARCH signal effect, not contamination).
+
+3. **W04 moves as expected** — E15 +$1,165 was caused by GARCH getting full weight (1.000) in W04 due to CV edge. Removing GARCH returns W04 to +$228, matching E13. This is correct behavior: the GARCH W04 bonus was a genuine GARCH signal (not contamination), so it disappears when GARCH is disabled.
+
+4. **Q_E16_2 is open** — the remaining source of W03 non-determinism is unknown. W03 best_params in E16 are identical to E15, which means whichever non-determinism source shifted W03 away from E13 is **neither GARCH nor experiment-run-specific** — it has been consistently producing the same shifted result across at least E15 and E16. Candidates: (a) LightGBM with `n_jobs > 1` internally non-deterministic despite `deterministic=True` flag; (b) XGBoost `n_jobs=-1` (all cores, non-deterministic multi-thread); (c) a different training date range (if historical data was refreshed between E13 and E14/15/16). The consistent identical params in E15/E16 suggest this is a deterministic but different code path from E13 — possibly triggered by a code change between E13 and E14 that also affects W03.
+
+5. **Q_E16_3 partially answered** — W03 is the only diverging window. All other 11 windows produce identical results. The divergence is localized to one window and one code change epoch.
+
+6. **Total PnL of −$1,382 is misleading** — the "extra loss" vs E13 is entirely W03 (−$1,891 swing), which is unrelated to anything changed in E16. Without W03, E16 would be −$1,382 + $1,891 = +$509, essentially matching E13.
 
 ### What We Learned
-*(pending)*
+
+- **P32 (GARCH RNG contamination hypothesis is disproved for W03)**: Disabling GARCH does not restore W03. The W03 degradation from +$1,850 (E13) to −$41 (E14+) was caused by a code or data change between E13 and E14, not by GARCH. The contamination mechanism (P31) may still be real — it just is not the cause of W03's specific degradation.
+
+- **P33 (10/12 windows are fully deterministic)**: The walk-forward pipeline produces identical results in W01, W02, W04–W12 across E15 and E16 despite the only change being GARCH on/off. This is strong evidence that the LightGBM/XGBoost pipeline is deterministic for those 11 windows — and that W03 has a uniquely sensitive optimization landscape.
+
+- **P34 (W03 degradation is a persistent regression, not noise)**: Same best_params in E15 and E16 means the shifted Optuna trajectory is landing in the same local optimum repeatedly. This is not random noise — the system is deterministically finding a *different* (worse) set of params than E13. The cause is some code or data change in the E13→E14 epoch.
+
+- **P35 (Statistical models can be re-enabled without restoring the Exp 13 baseline)**: The E13 +$508 baseline is likely not recoverable without identifying and reverting the W03 regression source. Re-enabling statistical models in E17 should be evaluated on its own merits (AUROC improvement, PnL contribution) rather than against a +$508 target that assumed W03 was still worth +$1,850.
 
 ### What Changed for Next Experiment (Exp 17)
 
-*(to be filled after results)*
+**Critical insight**: The E13 +$508 baseline cannot be locked in by simply disabling GARCH. W03 is degraded by a different cause that must be investigated independently. This changes the E17 success criteria:
 
-**Pre-planned Exp 17 setup (conditional on Exp 16 confirming +$508 baseline):**
+- **Old success criterion**: Total PnL > +$508 (recover E13 baseline)
+- **New success criterion**: Total PnL improvement vs E16 baseline (−$1,382); specifically AUROC > 0.50 in W08/W09 for new statistical models, and positive PnL contribution from MS-GARCH or OU-Kou-GARCH in windows where they get nonzero weight
+
+**E17 priorities re-ordered:**
+
+1. ~~Investigate W03 regression source~~ (pre-condition for restoring E13 baseline) — moved to backlog; blocking blocker for E17 is removed since we now accept −$1,382 as the new baseline
+2. Implement RNG isolation (still required — prevents any new contamination from MS-GARCH/OU-Kou-GARCH training)
+3. Enable MS-GARCH + OU-Kou-GARCH, evaluate AUROC in W08/W09
+
+**Pre-planned Exp 17 setup (updated — no longer conditional on +$508 restoration):**
 
 Enable MS-GARCH and OU-Kou-GARCH as standalone ensemble members with RNG isolation:
 
@@ -1549,7 +1623,7 @@ Enable MS-GARCH and OU-Kou-GARCH as standalone ensemble members with RNG isolati
 
 ### Context
 
-Exp 16 confirmed (or failed to confirm) the Exp 13 +$508 baseline after disabling GARCH. Exp 17 re-introduces statistical ensemble members — now MS-GARCH and OU-Kou-GARCH instead of the plain GARCH variants that caused Problems 1 and 2.
+Exp 16 failed to reproduce the Exp 13 +$508 baseline. W03 (−$41) is degraded by a source unrelated to GARCH — the exact cause is Q_E16_2 (open). 10/12 windows are fully stable. The new baseline for E17 is E16: −$1,382. Exp 17 re-introduces statistical ensemble members — now MS-GARCH and OU-Kou-GARCH instead of the plain GARCH variants that caused Problems 1 and 2.
 
 **Problem 1 (RNG contamination) is solved** by running statistical model training in an isolated subprocess before returning control to the parent process. The parent's numpy/scipy RNG state is unaffected by the child's heavy numerical computation, so Optuna sees the same state it would in a GARCH-free run.
 
