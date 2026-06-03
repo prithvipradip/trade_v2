@@ -1429,7 +1429,7 @@ python scripts/run_integration_test.py \
 
 - **P30 (GARCH ranks wrong in mean-reversion regimes)**: Post-shock recoveries (after CrowdStrike, after Liberation Day) are mean-reversion regimes. GARCH predicts persistent high vol, but the market calmed. P(in range) was low when it should have been high. GARCH's AR structure is mis-specified for regime changes driven by macro events — it extrapolates past volatility forward when the regime has actually shifted.
 
-- **P31 (GARCH training contaminates Optuna indirectly)**: W03 changed dramatically without GARCH weight, suggesting Optuna's param search is sensitive to the additional GARCH fitting time/randomness in the training pipeline. Need to isolate GARCH from Optuna's objective function.
+- **P31 (GARCH training contaminates Optuna's RNG state indirectly)**: W03 swung from +$1,850 (Exp 13, no GARCH) to −$41 (Exp 15, GARCH enabled) despite GARCH having zero weight in W03 (AUROC=None). The mechanism: (1) GARCH fitting runs *before* Optuna in the pipeline sequence (`_train_window_range_model` → `_optimize_window_params`). GARCH calls `scipy.optimize.minimize`, `numpy.linalg`, and the `arch` library — all of which consume from Python's global `numpy.random` state and scipy's internal RNG buffers. (2) When Optuna then launches with `n_jobs=6` (parallel trials), the TPE sampler's suggestion sequence depends on the RNG state it inherits at startup. GARCH's consumption of ~30–90 seconds of heavy numerical computation shifts that state by an unknown offset before Optuna sees it. (3) Because Optuna's parallel workers share process-level state, the interleaving of 6 concurrent trials with the shifted RNG produces a different suggestion trajectory than without GARCH — even though seed=42 is set. The result is that Optuna explores a different region of the 9D parameter space for W03 and finds a worse local optimum. **Key insight**: GARCH can degrade windows it never touches by corrupting the upstream parameter search. The fix options are: (a) run GARCH after Optuna (breaks objective alignment), (b) isolate GARCH in a subprocess with its own RNG fork, (c) disable GARCH until the RNG isolation is implemented.
 
 - **P32 (The Exp 13 baseline +$508 is the best result so far)**: All GARCH variants produced equal or worse results. The structural fixes (max_concurrent=1, VIX fix) delivered the gains; GARCH has so far added noise.
 
@@ -1453,22 +1453,44 @@ python scripts/run_integration_test.py \
 **Date:** pending
 **Branch:** `features-request-3`
 
+### Context: Why GARCH Is Paused
+
+Exp 15 confirmed that GARCH training — even when it contributes zero weight to a window — can degrade that window's PnL by perturbing Optuna's RNG state before the parameter search runs. The mechanism is documented in P31. Specifically, W03 swung from +$1,850 to −$41 despite GARCH having no influence on W03's trades. This is not a GARCH signal failure; it is a pipeline sequencing problem.
+
+There are two distinct GARCH problems to solve before re-enabling it:
+
+**Problem 1 — RNG contamination (pipeline ordering):**
+GARCH fitting runs before Optuna. It consumes global numpy/scipy RNG state. Optuna then inherits a shifted state, producing a different TPE suggestion trajectory and landing on different (worse) hyperparameters for some windows.
+
+*Fix required*: Isolate GARCH fitting in a subprocess with a forked RNG so it cannot mutate the parent process's random state. Alternatively, move GARCH to run after Optuna — but this breaks the objective alignment from Change C (Exp 10), where the range predictor must be active during Optuna's training-slice evaluations.
+
+**Problem 2 — Rank inversion in mean-reversion regimes (signal quality):**
+W08 (AUROC=0.292) and W09 (AUROC=0.417) showed GARCH inversely ranked the days — higher P(in range) predicted breakouts. This happens in post-shock recovery windows where realized vol is falling but GARCH's exponential-decay AR structure keeps forecasting persistent high vol. GARCH extrapolates past volatility forward; mean-reversion regimes require a model that explicitly captures the pull back to equilibrium.
+
+*Fix required*: MS-GARCH (regime-switching) and/or OU-Kou-GARCH (mean-reversion + jump diffusion) — both implemented in `features-request-3`. Neither fix is active yet because the RNG isolation (Problem 1) must be solved first, otherwise enabling any new statistical model re-introduces the contamination.
+
+Exp 16 disables all statistical ensemble members (`enable_garch=False`) and confirms the Exp 13 +$508 baseline is recoverable before layering in the new models.
+
+---
+
 ### Setup
 - Walk-forward config: **365d** / **60d** / **60d** / 5d → **12 windows**
 - OOS period: 2024-05-19 → 2026-05-09
 - Key changes from Exp 15:
-  - **GARCH disabled** (`enable_garch=False`): removes Optuna contamination and rank-inversion from W08/W09
+  - **GARCH disabled** (`enable_garch=False` in `_train_window_range_model`): removes both RNG contamination and rank-inversion
   - All Exp 13 structural fixes retained (max_concurrent=1, VIX fix, adaptive threshold)
+  - MS-GARCH and OU-Kou-GARCH implemented but not enabled (flags default to False)
   - Expected to reproduce Exp 13's +$508 result exactly
 - Optuna: 200 trials, patience 50, min_trades 7, n_jobs 6 (unchanged)
 
 ### Assumptions Going In
-- Without GARCH, Optuna will reproduce Exp 13's parameter selections → same trades → same +$508 PnL
-- If results differ from Exp 13, the discrepancy reveals other sources of non-determinism
+- Without any statistical model training before Optuna, the RNG state entering the TPE sampler will match Exp 13 exactly → same suggestion trajectory → same best_params → same trades → same +$508 PnL
+- If results still differ from Exp 13, there is a separate non-determinism source unrelated to GARCH (e.g. LightGBM/XGBoost internal RNG, OS scheduling)
 
 ### Open Questions
-- **Q_E16_1**: Does disabling GARCH reproduce Exp 13's +$508 exactly?
-- **Q_E16_2**: What caused W03 to degrade from +$1,850 to −$41? Is it GARCH timing contamination or something else?
+- **Q_E16_1**: Does disabling GARCH reproduce Exp 13's +$508 exactly, per-window?
+- **Q_E16_2**: If W03 still differs, what is the remaining source of non-determinism? (Candidates: LightGBM `deterministic=True` may not fully fix parallel threads; XGBoost `n_jobs=-1` uses all cores non-deterministically; Optuna's TPE uses internal state that may also depend on wall-clock timing of parallel workers.)
+- **Q_E16_3**: How many windows match Exp 13's exact best_params? A per-window params diff against Exp 13's JSON will isolate any remaining divergence.
 
 ### Launch Command
 ```bash
@@ -1488,6 +1510,105 @@ python scripts/run_integration_test.py \
   --years 3 \
   --skip-backfill
 ```
+
+### Results — Section E
+*(pending)*
+
+### Results — Section F
+*(pending)*
+
+### Observations
+*(pending)*
+
+### What We Learned
+*(pending)*
+
+### What Changed for Next Experiment (Exp 17)
+
+*(to be filled after results)*
+
+**Pre-planned Exp 17 setup (conditional on Exp 16 confirming +$508 baseline):**
+
+Enable MS-GARCH and OU-Kou-GARCH as standalone ensemble members with RNG isolation:
+
+1. **RNG isolation**: Before calling `_train_window_range_model`, fork the numpy/scipy RNG state into the subprocess using `multiprocessing` with `spawn` start method (not `fork`, which shares state). The statistical model fitting runs in the child process; the parent RNG state is unaffected. This preserves Optuna's deterministic suggestion trajectory while allowing statistical model training.
+
+2. **Enable new models**: `RangePredictor(enable_garch=False, enable_msgarch=True, enable_oujump=True)` — 4-way equal-weight prior (XGB 0.25, LGB 0.25, MS-GARCH 0.25, OU-Kou-GARCH 0.25), replaced by CV-edge fitted weights after training.
+
+3. **Hypothesis**: MS-GARCH's regime filter correctly identifies the post-shock recovery in W08/W09 (calm regime probability increases rapidly after shock → higher P(in range) → correct direction). OU-Kou-GARCH's OU drift term explicitly captures the mean-reversion force → P(in range) compressed correctly for above-equilibrium prices. Both should reverse the rank-inversion that degraded W08/W09.
+
+4. **Success criteria**: Total PnL > +$508 (Exp 13 baseline) with W08/W09 AUROC > 0.50 for the new model ensemble members.
+
+---
+
+## Experiment 17 — MS-GARCH + OU-Kou-GARCH with RNG Isolation
+
+**Archive:** pending
+**Date:** pending
+**Branch:** `features-request-3`
+
+### Context
+
+Exp 16 confirmed (or failed to confirm) the Exp 13 +$508 baseline after disabling GARCH. Exp 17 re-introduces statistical ensemble members — now MS-GARCH and OU-Kou-GARCH instead of the plain GARCH variants that caused Problems 1 and 2.
+
+**Problem 1 (RNG contamination) is solved** by running statistical model training in an isolated subprocess before returning control to the parent process. The parent's numpy/scipy RNG state is unaffected by the child's heavy numerical computation, so Optuna sees the same state it would in a GARCH-free run.
+
+**Problem 2 (rank inversion in mean-reversion regimes) is addressed** by design:
+- MS-GARCH: after a shock, the Hamilton filter rapidly up-weights the calm regime (Regime 0). The blended forecast drops quickly as the calm-regime GARCH dominates → P(in range) rises correctly in post-shock recovery windows (W08/W09 in Exp 15).
+- OU-Kou-GARCH: the OU drift term κ(μ − X_t) explicitly models mean reversion. When price is above equilibrium post-shock (vol elevated, price recovering), the drift is negative (BEARISH) but the *variance forecast* is compressed by the OU factor ξ_h — predicting lower long-horizon vol than plain GARCH would, raising P(in range) appropriately.
+
+### The RNG Isolation Approach
+
+Before enabling Exp 17, the RNG isolation must be implemented in `walkforward.py`. The required change is:
+
+```python
+# In _run_single_window(), replace the current sequential call:
+#   _range_result = self._train_window_range_model(...)
+# with a subprocess-isolated version:
+
+import multiprocessing as mp
+
+def _train_range_model_isolated(train_df, symbol, window_id, max_hold_days, result_queue):
+    """Run in a subprocess so parent RNG state is unaffected."""
+    result = self._train_window_range_model(train_df, symbol, window_id, max_hold_days)
+    result_queue.put(result)
+
+ctx = mp.get_context("spawn")   # "spawn" does not inherit parent RNG — critical
+q = ctx.Queue()
+p = ctx.Process(target=_train_range_model_isolated, args=(..., q))
+p.start(); p.join()
+_range_result = q.get()
+```
+
+The `spawn` context (vs `fork`) is critical: `fork` copies the parent's memory including its RNG state, which means the child's RNG consumption still affects what any shared memory or global state looks like after the child exits. `spawn` starts a fresh interpreter, giving the child a clean RNG, and the parent's state is completely unmodified.
+
+*Note*: `spawn` is slower than `fork` (fresh interpreter start per window). Since we have 12 windows, the overhead is acceptable (~2–5 seconds per window for process startup vs ~30–90 seconds for model fitting).
+
+### Setup
+*(to be filled when Exp 16 results are in)*
+
+- Walk-forward config: **365d** / **60d** / **60d** / 5d → **12 windows** (same as Exp 13–16)
+- Key changes from Exp 16:
+  - **RNG isolation**: statistical model training runs in `spawn` subprocess — parent Optuna RNG unaffected
+  - **MS-GARCH enabled** (`enable_msgarch=True`)
+  - **OU-Kou-GARCH enabled** (`enable_oujump=True`)
+  - Plain GARCH remains disabled (`enable_garch=False`) — still subject to rank-inversion, not yet fixed
+  - 4-way equal-weight prior: XGB 0.25, LGB 0.25, MS-GARCH 0.25, OU-Kou-GARCH 0.25
+
+### Assumptions Going In
+- RNG isolation preserves Exp 13/16 baseline PnL in windows where the new models contribute zero weight (AUROC=None or <0.5)
+- MS-GARCH correctly identifies calm regime in W08/W09 post-shock recovery → AUROC > 0.50 → positive fitted weight
+- OU-Kou-GARCH's mean-reversion drift provides a direction signal orthogonal to XGB/LGB features → complementary CV edge
+- Combined: total PnL > +$508 (Exp 13 baseline)
+
+### Open Questions
+- **Q_E17_1**: Does RNG isolation fully prevent Optuna contamination? (Test: compare W03 best_params vs Exp 13.)
+- **Q_E17_2**: Does MS-GARCH fix the W08/W09 rank inversion? (Test: compare AUROC for MS-GARCH vs Exp 15 GARCH in those windows.)
+- **Q_E17_3**: Does OU-Kou-GARCH win any BIC races? (Test: check `garch_all_variants["OU-Kou-GARCH"]` in window JSONs — BIC vs MS-GARCH and GARCH variants.)
+- **Q_E17_4**: Does the direction signal from OU-Kou-GARCH (`ou_jump_direction`, `ou_jump_confidence`) correlate with actual W03/W04 outcomes? (Research: cross-tab direction signal vs OOS trade result.)
+
+### Launch Command
+*(to be filled — same flags as Exp 16 once RNG isolation is implemented)*
 
 ### Results — Section E
 *(pending)*
