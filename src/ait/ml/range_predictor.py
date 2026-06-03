@@ -63,23 +63,24 @@ class RangePredictor:
         ensemble_weights: dict[str, float] | None = None,
         enable_garch: bool = False,
         enable_msgarch: bool = False,
+        enable_oujump: bool = False,
     ) -> None:
         self._threshold = threshold_pct
         self._horizon = horizon_days
         self._enable_garch = enable_garch
         self._enable_msgarch = enable_msgarch
+        self._enable_oujump = enable_oujump
         # Equal prior weights updated by CV edge after training.
         # Caller-supplied ensemble_weights respected as-is for backward compat.
         if ensemble_weights is not None:
             self._weights = ensemble_weights
-        elif enable_garch and enable_msgarch:
-            self._weights = {"xgboost": 0.25, "lightgbm": 0.25, "garch": 0.25, "msgarch": 0.25}
-        elif enable_garch:
-            self._weights = {"xgboost": 0.333, "lightgbm": 0.333, "garch": 0.334}
-        elif enable_msgarch:
-            self._weights = {"xgboost": 0.333, "lightgbm": 0.333, "msgarch": 0.334}
         else:
-            self._weights = {"xgboost": 0.5, "lightgbm": 0.5}
+            _active = ["xgboost", "lightgbm"]
+            if enable_garch:   _active.append("garch")
+            if enable_msgarch: _active.append("msgarch")
+            if enable_oujump:  _active.append("oujump")
+            _w = 1.0 / len(_active)
+            self._weights = {m: _w for m in _active}
         self._models: dict = {}
         self._symbol_models: dict[str, dict] = {}
         self._scaler = StandardScaler()
@@ -205,6 +206,11 @@ class RangePredictor:
             if msgarch_acc is not None:
                 accuracies["msgarch"] = msgarch_acc
 
+        if self._enable_oujump and "oujump" in self._weights:
+            oujump_acc = self._train_oujump(features["Close"])
+            if oujump_acc is not None:
+                accuracies["oujump"] = oujump_acc
+
         # Final fit on all data
         self._scaler.fit(X)
         X_scaled = pd.DataFrame(
@@ -243,6 +249,7 @@ class RangePredictor:
                             pass
                 _garch_state = getattr(self, "_garch_state", None)
                 _ms_garch_state = getattr(self, "_ms_garch_state", None)
+                _ou_jump_state = getattr(self, "_ou_jump_state", None)
                 self._symbol_models[symbol] = {
                     "models": copy.deepcopy(self._models),
                     "scaler": copy.deepcopy(self._scaler),
@@ -270,6 +277,13 @@ class RangePredictor:
                     "ms_garch_regime0":   (_ms_garch_state or {}).get("msgarch_state", {}).get("regime0"),
                     "ms_garch_regime1":   (_ms_garch_state or {}).get("msgarch_state", {}).get("regime1"),
                     "ms_garch_transitions": (_ms_garch_state or {}).get("msgarch_state", {}).get("transition"),
+                    # OU-Kou-GARCH ensemble member metadata
+                    "ou_jump_state":      _ou_jump_state,
+                    "ou_jump_converged":  (_ou_jump_state or {}).get("converged"),
+                    "ou_jump_bic":        (_ou_jump_state or {}).get("bic"),
+                    "ou_jump_direction":  (_ou_jump_state or {}).get("ou_jump_direction"),
+                    "ou_jump_confidence": (_ou_jump_state or {}).get("ou_jump_confidence"),
+                    "ou_jump_params":     (_ou_jump_state or {}).get("oujump_state", {}).get("params"),
                 }
 
             self._save_models()
@@ -392,6 +406,56 @@ class RangePredictor:
             cv_edge="None" if acc is None else f"{acc - 0.5:+.3f}",
             converged=self._ms_garch_state.get("converged"),
             bic=self._ms_garch_state.get("bic"),
+        )
+        return acc
+
+    def _train_oujump(self, close: pd.Series) -> "float | None":
+        """CV-evaluate OU-Kou-GARCH model. Returns mean AUROC, or None if no valid folds.
+
+        Same contract as _train_garch() / _train_msgarch():
+          None   → unevaluable (omit from accuracies; nan in window JSON)
+          float  → valid AUROC in [0, 1]; even 0.5 participates in weighting
+
+        Stores full-training-data state in self._ou_jump_state.
+        """
+        try:
+            from ait.ml.garch_range_predictor import GARCHRangeModel
+        except ImportError:
+            log.warning("oujump_not_available")
+            return None
+
+        garch = GARCHRangeModel()
+        splits = self._walk_forward_split(len(close))
+
+        _CV_HORIZON = 5
+        _cv_labels_fn = lambda c: self._create_labels_horizon(c, _CV_HORIZON)
+        acc = garch.cv_score_oujump(
+            close=close,
+            horizon_days=_CV_HORIZON,
+            threshold_pct=self._threshold,
+            splits=splits,
+            create_labels_fn=_cv_labels_fn,
+        )
+
+        # Fit on full training data via _fit_oujump (returns BIC-comparable dict)
+        try:
+            import numpy as _np
+            returns = _np.diff(_np.log(close.dropna().values))
+            ou_result = garch._fit_oujump(returns, self._horizon, self._threshold)
+            ou_result.pop("_oujump_obj", None)
+            ou_result.pop("arch_result", None)
+            self._ou_jump_state: dict = ou_result
+        except Exception as e:
+            log.warning("oujump_full_fit_failed", error=str(e))
+            self._ou_jump_state = {}
+
+        log.info(
+            "range_oujump_trained",
+            cv_auroc="None" if acc is None else f"{acc:.3f}",
+            cv_edge="None" if acc is None else f"{acc - 0.5:+.3f}",
+            converged=self._ou_jump_state.get("converged"),
+            bic=self._ou_jump_state.get("bic"),
+            direction=self._ou_jump_state.get("ou_jump_direction"),
         )
         return acc
 
@@ -574,6 +638,19 @@ class RangePredictor:
                     p_ms = GARCHRangeModel().predict_p_in_range(ms_garch_state)
                     weighted_p += w_ms * p_ms
                     total_weight += w_ms
+                except Exception:
+                    pass
+
+        # OU-Kou-GARCH ensemble contribution
+        ou_jump_state = (sym_data or {}).get("ou_jump_state") or getattr(self, "_ou_jump_state", None)
+        if ou_jump_state:
+            w_ou = (fw or {}).get("oujump", 0.0)
+            if w_ou > 0:
+                try:
+                    from ait.ml.garch_range_predictor import GARCHRangeModel
+                    p_ou = GARCHRangeModel().predict_p_in_range(ou_jump_state)
+                    weighted_p += w_ou * p_ou
+                    total_weight += w_ou
                 except Exception:
                     pass
 

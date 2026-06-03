@@ -2,6 +2,8 @@
 
 ## Overview
 
+> **See also**: [OU_KOU_GARCH_METHODOLOGY.md](OU_KOU_GARCH_METHODOLOGY.md) — the OU-Kou-GARCH + Adaptive EKF model (6th BIC competitor, direction signal output).
+
 This document is a complete mathematical and implementation reference for the GARCH/ARCH volatility models used as a third member of the range predictor ensemble in the AIT v2 walk-forward backtester.
 
 The range predictor answers one question: **P(price stays within ±threshold% over the next N days)**. XGBoost and LightGBM answer this by learning from lagged cross-sectional features (IV rank, Hurst exponent, realized vol, etc.). The GARCH model answers it differently — by directly modelling the return variance process and computing the probability analytically from the forecasted volatility distribution.

@@ -880,6 +880,26 @@ class WalkForwardBacktester:
                     "ms_garch_regime1":     rp_sym.get("ms_garch_regime1"),
                     "ms_garch_transitions": rp_sym.get("ms_garch_transitions"),
                     "ms_garch_p_in_range":  _ms_garch_state.get("p_in_range_compounding"),
+                    # OU-Kou-GARCH + AEKF metadata
+                    **({} if not (_ou_jump_state := rp_sym.get("ou_jump_state") or {})
+                       else {
+                        "ou_jump_converged":         rp_sym.get("ou_jump_converged"),
+                        "ou_jump_bic":               rp_sym.get("ou_jump_bic"),
+                        "ou_jump_direction":         rp_sym.get("ou_jump_direction"),
+                        "ou_jump_confidence":        rp_sym.get("ou_jump_confidence"),
+                        "ou_jump_params":            rp_sym.get("ou_jump_params"),
+                        "ou_jump_p_in_range":        _ou_jump_state.get("p_in_range_compounding"),
+                        "ou_jump_loglik":            _ou_jump_state.get("loglik"),
+                        "ou_jump_aic":               (_ou_jump_state.get("diagnostics") or {}).get("aic"),
+                        "ou_jump_jb_pvalue":         (_ou_jump_state.get("diagnostics") or {}).get("jb_pvalue"),
+                        "ou_jump_resid_skewness":    (_ou_jump_state.get("diagnostics") or {}).get("resid_skewness"),
+                        "ou_jump_resid_kurtosis":    (_ou_jump_state.get("diagnostics") or {}).get("resid_kurtosis"),
+                        "ou_jump_ljung_box_pvalue":  (_ou_jump_state.get("diagnostics") or {}).get("ljung_box_pvalue"),
+                        "ou_jump_half_life_days":    (_ou_jump_state.get("diagnostics") or {}).get("ou_half_life_days"),
+                        "ou_jump_intensity_annual":  (_ou_jump_state.get("diagnostics") or {}).get("jump_intensity_annual"),
+                        "ou_jump_persistence":       (_ou_jump_state.get("diagnostics") or {}).get("diffusion_persistence"),
+                        "ou_jump_aekf_kappa_cv":     (_ou_jump_state.get("diagnostics") or {}).get("aekf_kappa_cv"),
+                    }),
                 }
             else:
                 _model_weights["range_predictor"] = {
@@ -1454,7 +1474,7 @@ class WalkForwardBacktester:
                 from ait.data.historical import HistoricalDataStore
                 intraday_store = HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
             rp = RangePredictor(threshold_pct=threshold_pct, horizon_days=max_hold_days,
-                                enable_garch=True)
+                                enable_garch=True, enable_oujump=True)
             accs = rp.train(train_df, symbol=symbol, intraday_store=intraday_store)
             if accs and rp.is_trained:
                 avg = sum(accs.values()) / len(accs)

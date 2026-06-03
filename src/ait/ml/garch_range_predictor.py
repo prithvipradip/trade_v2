@@ -56,6 +56,7 @@ _VARIANTS: list[tuple[str, dict]] = [
 ]
 
 _MIN_OBS_MSGARCH = 60  # MarkovSwitchingGARCH requires ≥60 observations
+_MIN_OBS_OUJUMP  = 60  # OUKouGARCH requires ≥60 observations
 
 _ARCH_DISTS: list[str] = ["normal", "t", "skewt", "ged"]
 
@@ -339,7 +340,7 @@ class GARCHRangeModel:
         best_state: dict | None = None
         all_variants: dict = {}
 
-        _strip_keys = {"arch_result", "_vol_kwargs", "cts_params", "_msgarch_obj"}
+        _strip_keys = {"arch_result", "_vol_kwargs", "cts_params", "_msgarch_obj", "_oujump_obj"}
         for variant_name, vol_kwargs in _VARIANTS:
             variant_result = self._fit_variant(
                 returns, variant_name, vol_kwargs, horizon_days, threshold_pct,
@@ -361,6 +362,15 @@ class GARCHRangeModel:
         if msgarch_result["converged"] and msgarch_result["bic"] < best_bic:
             best_bic = msgarch_result["bic"]
             best_state = msgarch_result
+
+        # OU-Kou-GARCH as 6th BIC competitor
+        oujump_result = self._fit_oujump(returns, horizon_days, threshold_pct)
+        all_variants["OU-Kou-GARCH"] = {
+            k: v for k, v in oujump_result.items() if k not in _strip_keys
+        }
+        if oujump_result["converged"] and oujump_result["bic"] < best_bic:
+            best_bic = oujump_result["bic"]
+            best_state = oujump_result
 
         if best_state is None:
             log.warning("garch_all_variants_failed", fallback="constant_vol")
@@ -401,6 +411,7 @@ class GARCHRangeModel:
         # so cv_score rolling refit uses the same variant spec as the BIC winner.
         state.pop("arch_result", None)
         state.pop("_msgarch_obj", None)
+        state.pop("_oujump_obj", None)
         if isinstance(state.get("cts_params"), np.ndarray):
             state["cts_params"] = state["cts_params"].tolist()
 
@@ -553,6 +564,65 @@ class GARCHRangeModel:
             "cts_params":            None,
             "dist_race":             {},
             "_vol_kwargs":           None,
+        }
+
+    def _fit_oujump(
+        self,
+        returns: np.ndarray,
+        horizon_days: int,
+        threshold_pct: float,
+    ) -> dict:
+        """Fit OU-Kou-GARCH + AEKF and return a BIC-comparable result dict.
+
+        Same shape as _fit_msgarch() so it participates in the best-BIC race
+        in fit() without special-casing. The fitted OUKouGARCH object is stored
+        under '_oujump_obj' (stripped before JSON serialisation).
+        """
+        if len(returns) < _MIN_OBS_OUJUMP:
+            return {"converged": False, "bic": float("inf"),
+                    "selected_variant": "OU-Kou-GARCH", "selected_dist": None}
+
+        try:
+            from ait.ml.ou_jump import OUKouGARCH
+        except ImportError:
+            return {"converged": False, "bic": float("inf"),
+                    "selected_variant": "OU-Kou-GARCH", "selected_dist": None}
+
+        try:
+            model = OUKouGARCH()
+            model.fit(returns)
+        except Exception as e:
+            log.debug("oujump_fit_failed", error=str(e)[:80])
+            return {"converged": False, "bic": float("inf"),
+                    "selected_variant": "OU-Kou-GARCH", "selected_dist": None}
+
+        bic = model.bic()
+        if not np.isfinite(bic):
+            return {"converged": False, "bic": float("inf"),
+                    "selected_variant": "OU-Kou-GARCH", "selected_dist": None}
+
+        sigma_h = model.forecast_sigma_h(horizon_days)
+        p_comp = model.p_in_range(horizon_days, threshold_pct)
+        direction, dir_conf = model.direction_signal()
+
+        return {
+            "converged":              True,
+            "selected_variant":       "OU-Kou-GARCH",
+            "selected_dist":          "kou_dejd",
+            "bic":                    round(bic, 2),
+            "selected_bic":           round(bic, 2),
+            "sigma_compounding":      round(float(sigma_h), 6),
+            "sigma_sqrt_scale":       round(float(sigma_h), 6),
+            "p_in_range_compounding": round(float(p_comp), 4),
+            "p_in_range_sqrt_scale":  round(float(p_comp), 4),
+            "oujump_state":           model.to_state_dict(),
+            "_oujump_obj":            model,      # stripped before JSON serialisation
+            "arch_result":            None,
+            "cts_params":             None,
+            "dist_race":              {},
+            "_vol_kwargs":            None,
+            "ou_jump_direction":      direction,
+            "ou_jump_confidence":     round(dir_conf, 6),
         }
 
     def _fit_cts_to_variant(
@@ -844,6 +914,65 @@ class GARCHRangeModel:
             return None
         avg = float(np.mean(scores))
         log.info("msgarch_cv_score", auroc=f"{avg:.3f}", folds=len(scores))
+        return avg
+
+    def cv_score_oujump(
+        self,
+        close: pd.Series,
+        horizon_days: int,
+        threshold_pct: float,
+        splits: list[tuple[np.ndarray, np.ndarray]],
+        create_labels_fn,
+    ) -> "float | None":
+        """Walk-forward CV AUROC for the OU-Kou-GARCH model alone.
+
+        Same scoring contract as cv_score_msgarch(): returns mean AUROC across
+        folds, or None when no valid folds exist. Re-fits from scratch on each
+        training slice; per-fold P(in range) is a single scalar applied to all
+        validation-day labels (the same approximation used by cv_score_msgarch).
+        """
+        from sklearn.metrics import roc_auc_score
+
+        try:
+            from ait.ml.ou_jump import OUKouGARCH
+        except ImportError:
+            return None
+
+        scores = []
+        for tr_idx, val_idx in splits:
+            try:
+                tr_close  = close.iloc[tr_idx]
+                val_close = close.iloc[val_idx]
+
+                val_labels = create_labels_fn(val_close).dropna()
+                if len(val_labels) == 0:
+                    continue
+                y_true = val_labels.values.astype(int)
+                if len(np.unique(y_true)) < 2:
+                    continue
+
+                tr_returns = self._log_returns(tr_close)
+                if len(tr_returns) < _MIN_OBS_OUJUMP:
+                    continue
+
+                model = OUKouGARCH()
+                try:
+                    model.fit(tr_returns)
+                except Exception:
+                    continue
+
+                p = model.p_in_range(horizon_days, threshold_pct)
+                p_scores = np.full(len(y_true), p)
+                auroc = float(roc_auc_score(y_true, p_scores))
+                scores.append(auroc)
+            except Exception:
+                continue
+
+        if not scores:
+            log.warning("oujump_cv_score_no_valid_folds")
+            return None
+        avg = float(np.mean(scores))
+        log.info("oujump_cv_score", auroc=f"{avg:.3f}", folds=len(scores))
         return avg
 
     def cv_score(
