@@ -347,18 +347,24 @@ For GARCH, the Close price series (not the feature matrix) is used in CV — GAR
 
 ### Per-Fold Evaluation
 
-For each fold:
+For each fold, two checks gate whether the fold is scored:
+
+1. **Minimum size floor** (`_MIN_FOLD_LABELS = 10`): folds with fewer than 10 labelable rows are skipped entirely — genuine data shortage, not class imbalance.
+2. **Single-class handling**: if all labels in the fold are the same class (e.g. all in-range in a quiet low-vol period), the fold scores **0.5** (no-skill baseline) rather than being discarded. Discarding single-class folds is incorrect: the fold is real information — the model had no discriminatory opportunity, so the no-skill score is the right answer. Silently dropping the fold allows a model to report AUROC from only 1 valid fold out of 4, masking the regime in which it has zero signal.
+
+For folds that pass both checks:
 1. Compute log returns from training Close prices
 2. Fit GARCH (best variant × distribution by BIC on training data)
-3. Forecast σ_h for the horizon
-4. Compute P(in range) → threshold at 0.5 → binary prediction
-5. Compare to actual in-range labels (`_create_labels`) on validation Close prices
-6. Measure balanced accuracy (sensitivity + specificity) / 2
+3. Roll forecasts across validation days: per-day h-step σ_t using arch's `forecast(start=t)`
+4. Compute per-day P(in range) from σ_t
+5. Score with **AUROC** (rank discrimination): does higher P(in range) correctly rank in-range days above breakout days? AUROC=0.5 = no skill, same baseline as balanced accuracy.
+
+The same single-class handling applies identically to `cv_score_msgarch()` and `cv_score_oujump()`.
 
 ### Edge-Over-Baseline Weighting
 
 ```
-edge_garch  = max(0, cv_balanced_acc_garch  − 0.50)
+edge_garch  = max(0, cv_auroc_garch  − 0.50)
 edge_xgb    = max(0, cv_balanced_acc_xgb    − 0.50)
 edge_lgb    = max(0, cv_balanced_acc_lgb    − 0.50)
 total_edge  = edge_garch + edge_xgb + edge_lgb
@@ -366,7 +372,9 @@ total_edge  = edge_garch + edge_xgb + edge_lgb
 weight_garch = edge_garch / total_edge   (0 if total_edge = 0)
 ```
 
-Models below 50% balanced accuracy contribute zero weight. The weights are then normalised so they sum to 1.0. This is the same formula used for the XGB/LGB pair in Exp 10+.
+Models at or below the 0.50 baseline contribute zero weight. The weights are then normalised so they sum to 1.0.
+
+**When AUROC = None:** A model returns `None` only when every fold failed both gating checks (all folds either too short or the model itself failed to fit). This is rare in practice with 365-day training windows — it indicates a genuine inability to evaluate the model on this window, not just class imbalance. `None` → model excluded from ensemble for this window.
 
 ---
 

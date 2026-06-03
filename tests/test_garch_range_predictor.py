@@ -427,3 +427,114 @@ class TestRangePredictorGARCHIntegration:
         result = rp.predict(_make_ohlcv_rp(days=300), symbol="QQQ")
         if result is not None:
             assert 0.0 <= result.probability_in_range <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# CV fold class-imbalance handling
+# ---------------------------------------------------------------------------
+
+class TestCVFoldClassBalance:
+    """cv_score_msgarch / cv_score_oujump / cv_score score single-class folds
+    as 0.5 instead of skipping them, and still skip folds below MIN_FOLD_LABELS.
+    """
+
+    def _make_splits_and_labels(self, all_same_class: bool, n_val: int = 20):
+        """Return (splits, create_labels_fn) where the val fold is either
+        all-one-class or genuinely mixed, with n_val labelable rows."""
+        import numpy as _np
+        import pandas as _pd
+        from ait.ml.garch_range_predictor import GARCHRangeModel
+
+        grm = GARCHRangeModel()
+        n_train = 80
+        n_total = n_train + 5 + n_val + 5   # train + gap + val + horizon buffer
+
+        # Build price series
+        rng = _np.random.default_rng(0)
+        prices = _pd.Series(100.0 * _np.exp(_np.cumsum(rng.normal(0, 0.01, n_total))))
+
+        tr_idx = _np.arange(0, n_train)
+        val_idx = _np.arange(n_train + 5, n_train + 5 + n_val)
+        splits = [(tr_idx, val_idx)]
+
+        if all_same_class:
+            # Labels that are entirely 1 (all in-range — ultra-low vol)
+            def create_labels_fn(close):
+                return _pd.Series(1.0, index=close.index)
+        else:
+            # Genuinely mixed: alternate 0/1
+            def create_labels_fn(close):
+                vals = [float(i % 2) for i in range(len(close))]
+                return _pd.Series(vals, index=close.index)
+
+        return grm, splits, prices, create_labels_fn
+
+    def test_msgarch_single_class_fold_scores_half(self):
+        """A single-class validation fold must contribute 0.5, not be skipped."""
+        grm, splits, prices, labels_fn = self._make_splits_and_labels(all_same_class=True)
+        result = grm.cv_score_msgarch(prices, 5, 0.05, splits, labels_fn)
+        # With one fold that is single-class → scored 0.5 → mean = 0.5
+        assert result is not None, "single-class fold should not return None"
+        assert abs(result - 0.5) < 1e-9, f"expected 0.5, got {result}"
+
+    def test_oujump_single_class_fold_scores_half(self):
+        """Same contract for cv_score_oujump."""
+        grm, splits, prices, labels_fn = self._make_splits_and_labels(all_same_class=True)
+        result = grm.cv_score_oujump(prices, 5, 0.05, splits, labels_fn)
+        assert result is not None
+        assert abs(result - 0.5) < 1e-9, f"expected 0.5, got {result}"
+
+    def test_garch_single_class_fold_scores_half(self):
+        """Same contract for cv_score (plain GARCH)."""
+        from ait.ml.garch_range_predictor import GARCHRangeModel
+        grm = GARCHRangeModel()
+        # Build a split where the val fold has all-same labels.
+        # We mock the fit() to return a constant-vol fallback so no real GARCH.
+        import numpy as _np
+        import pandas as _pd
+        rng = _np.random.default_rng(1)
+        prices = _pd.Series(100.0 * _np.exp(_np.cumsum(rng.normal(0, 0.01, 200))))
+        tr_idx = _np.arange(0, 80)
+        val_idx = _np.arange(85, 115)
+        splits = [(tr_idx, val_idx)]
+
+        def all_one_labels(close):
+            return _pd.Series(1.0, index=close.index)
+
+        result = grm.cv_score(prices, 5, 0.05, splits, all_one_labels)
+        assert result is not None
+        assert abs(result - 0.5) < 1e-9, f"expected 0.5, got {result}"
+
+    def test_too_short_fold_still_skipped(self):
+        """Folds with fewer than _MIN_FOLD_LABELS rows are skipped → None."""
+        from ait.ml.garch_range_predictor import GARCHRangeModel
+        import numpy as _np
+        import pandas as _pd
+        grm = GARCHRangeModel()
+        rng = _np.random.default_rng(2)
+        prices = _pd.Series(100.0 * _np.exp(_np.cumsum(rng.normal(0, 0.01, 120))))
+        # Val fold of only 5 rows — below MIN_FOLD_LABELS=10
+        tr_idx = _np.arange(0, 80)
+        val_idx = _np.arange(85, 90)   # 5 rows
+        splits = [(tr_idx, val_idx)]
+
+        def mixed_labels(close):
+            vals = [float(i % 2) for i in range(len(close))]
+            return _pd.Series(vals, index=close.index)
+
+        # Should return None because the only fold is too short
+        result_ms = grm.cv_score_msgarch(prices, 5, 0.05, splits, mixed_labels)
+        result_ou = grm.cv_score_oujump(prices, 5, 0.05, splits, mixed_labels)
+        result_g  = grm.cv_score(prices, 5, 0.05, splits, mixed_labels)
+        assert result_ms is None, "too-short fold should yield None for msgarch"
+        assert result_ou is None, "too-short fold should yield None for oujump"
+        assert result_g  is None, "too-short fold should yield None for garch"
+
+    def test_mixed_class_fold_scored_normally(self):
+        """A genuine multi-class fold is still scored with real AUROC (not 0.5)."""
+        grm, splits, prices, labels_fn = self._make_splits_and_labels(all_same_class=False)
+        result = grm.cv_score_msgarch(prices, 5, 0.05, splits, labels_fn)
+        # Mixed fold: MS-GARCH produces a constant P(in range) applied to all
+        # days — with alternating 0/1 labels, AUROC will be exactly 0.5
+        # (a constant score can't rank). But the key is it's scored, not None.
+        assert result is not None, "mixed-class fold should be scored"

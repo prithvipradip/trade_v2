@@ -137,6 +137,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "bull_call_spread bear_put_spread long_strangle)."
         ),
     )
+    parser.add_argument(
+        "--console-log-level",
+        default="WARNING",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help=(
+            "Minimum log level printed to stdout (default: WARNING). "
+            "DEBUG/INFO always captured in logs/ait.log regardless. "
+            "Use WARNING to prevent stdout from growing large when running "
+            "background experiments."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1092,6 +1103,16 @@ def _create_run_archive(
 # ---------------------------------------------------------------------------
 
 async def _main(args: argparse.Namespace) -> int:
+    # Configure logging early: DEBUG/INFO go to logs/ait.log; stdout gets
+    # console_log_level (default WARNING) to prevent the tmp task-output
+    # buffer from filling up during long experiments.
+    from ait.config.settings import LoggingConfig
+    from ait.utils.logging import setup_logging
+    setup_logging(
+        LoggingConfig(level="DEBUG", file="logs/ait.log"),
+        console_level=getattr(args, "console_log_level", "WARNING"),
+    )
+
     out = Path(args.output_dir)
     t_start = time.time()
 

@@ -256,6 +256,13 @@ Look at `statistical.garch.rvol_bias` in W08 and W09.  If it is strongly positiv
 
 The fitted weights use CV AUROC (training time).  The OOS Brier Skill Score is the out-of-sample counterpart.  A model with positive CV AUROC but negative OOS BSS is over-fitting in training.  In future experiments, consider using `max(0, OOS_BSS)` as the weight source instead of (or alongside) CV AUROC to reduce in-sample optimism.
 
+**CV AUROC = None vs 0.5:** A statistical model returns `cv_auroc = None` only when every fold failed both gating checks (see `GARCH_METHODOLOGY.md §12`):
+
+- `None` — model could not be evaluated at all on this window (all folds too short or model fit failed). Model excluded from ensemble; falls back to equal prior if any other statistical model has a finite score.
+- `0.5` — model was evaluated but had zero discriminatory skill (all single-class folds, or genuine AUROC=0.5). Model gets weight = 0 (no edge over baseline) but is not excluded.
+
+**Single-class fold handling (Exp 17+ fix):** In low-volatility windows (e.g. W10–W12 with adaptive threshold ~5%), the in-range rate can reach 85–95%, making some CV folds all-positive. Prior to Exp 17's CV fix, these folds were silently dropped, causing `cv_auroc = None` even when the model had genuine signal in the mixed-class folds. The fix (implemented in `GARCHRangeModel._MIN_FOLD_LABELS = 10`) scores single-class folds as 0.5 and only skips folds with fewer than 10 labelable rows.
+
 ### AEKF sanity check
 
 Before trusting the OU-Kou-GARCH direction signal in a given window:

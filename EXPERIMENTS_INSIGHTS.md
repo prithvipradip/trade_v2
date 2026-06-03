@@ -1588,6 +1588,8 @@ python scripts/run_integration_test.py \
 
 - **P35 (Statistical models can be re-enabled without restoring the Exp 13 baseline)**: The E13 +$508 baseline is likely not recoverable without identifying and reverting the W03 regression source. Re-enabling statistical models in E17 should be evaluated on its own merits (AUROC improvement, PnL contribution) rather than against a +$508 target that assumed W03 was still worth +$1,850.
 
+- **P36 (CV AUROC=None from single-class folds, not model failure)**: In Exp 17, all statistical models (MS-GARCH, OU-Kou-GARCH) returned `cv_auroc=None` for most windows despite converging successfully. Root cause: `_walk_forward_split()` produces 4 folds of ~50 rows each; with an adaptive threshold of 5–8.5% and QQQ's typical in-range rate of 65–75%, early folds can have all-positive labels (no breakouts), making AUROC undefined. The old code silently dropped these folds; with only 1–2 valid folds remaining, the model reported `None` rather than a meaningful score, defaulting to equal prior weight (0.25) instead of earned weight. Fix: single-class folds score 0.5 (no-skill baseline) instead of being discarded. Folds below 10 labelable rows are still skipped (genuine data shortage). Implemented in `GARCHRangeModel._MIN_FOLD_LABELS=10` and all three `cv_score*` methods. Takes effect from Exp 18.
+
 ### What Changed for Next Experiment (Exp 17)
 
 **Critical insight**: The E13 +$508 baseline cannot be locked in by simply disabling GARCH. W03 is degraded by a different cause that must be investigated independently. This changes the E17 success criteria:
@@ -1663,14 +1665,15 @@ The `spawn` context (vs `fork`) is critical: `fork` copies the parent's memory i
 - Walk-forward config: **365d** / **60d** / **60d** / 5d → **12 windows** (same as Exp 13–16)
 - OOS period: 2024-05-19 → 2026-05-09
 - Key changes from Exp 16:
-  - **RNG isolation**: `_train_window_range_model_isolated()` runs statistical model training in a `spawn` subprocess — parent Optuna RNG completely unaffected (fixes P31/P32). Implemented in `walkforward.py`.
+  - **Sequential pre-training** (`_pretrain_range_models()`): all 12 windows train statistical models sequentially in the parent process *before* `ProcessPoolExecutor` launches. This eliminates both the subprocess timeout problem (CPU contention with Optuna workers) and the Optuna RNG contamination risk (Optuna has not started yet when statistical models train). Replaces the earlier spawn-subprocess isolation approach. Pre-training took 18m 45s for 12 windows in the E17 run.
   - **MS-GARCH enabled** (`enable_msgarch=True` on `WalkForwardBacktester`)
   - **OU-Kou-GARCH enabled** (`enable_oujump=True` on `WalkForwardBacktester`)
   - Plain GARCH remains disabled (`enable_garch=False`) — rank-inversion not yet fixed
   - 4-way equal-weight prior: XGB 0.25, LGB 0.25, MS-GARCH 0.25, OU-Kou-GARCH 0.25 (replaced by CV-edge fitted weights after training)
   - **New OOS metrics**: per-model Brier score, log loss, Brier skill score, rvol MAE/bias, AUROC — all in `model_weights.range_predictor.oos_scores` window JSON
   - **AEKF OOS block**: `oos_scores.aekf` — innovation LB tests, κ stability, direction accuracy/AUROC/Brier for OU-Kou-GARCH
-  - Subprocess timeout: 480s per window (fallback to ML-only if exceeded)
+  - **Console log level**: `--console-log-level WARNING` added to run script — DEBUG/INFO go only to `logs/ait.log`, stdout stays quiet to prevent background task buffer overflow
+  - **Single-class CV fold fix (P36)**: discovered mid-run; takes effect from Exp 18
 - Optuna: 200 trials, patience 50, min_trades 7, n_jobs 6 (unchanged)
 
 ### Assumptions Going In

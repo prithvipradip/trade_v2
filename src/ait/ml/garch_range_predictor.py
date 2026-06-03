@@ -856,6 +856,13 @@ class GARCHRangeModel:
     # Walk-forward CV scoring (called by RangePredictor._train_garch)
     # ------------------------------------------------------------------
 
+    # Minimum labelable rows in a validation fold to attempt scoring.
+    # Folds shorter than this are genuinely too small (data shortage) and are
+    # skipped entirely.  Single-class folds above this floor are scored 0.5
+    # (the no-skill baseline) rather than skipped — a single-class fold is real
+    # information: the model had no opportunity to discriminate in that regime.
+    _MIN_FOLD_LABELS = 10
+
     def cv_score_msgarch(
         self,
         close: pd.Series,
@@ -870,6 +877,12 @@ class GARCHRangeModel:
         or None when no valid folds exist.  MS-GARCH is re-fit from scratch on
         each training slice (no rolling arch result to reuse), so per-fold
         P(in range) is a single scalar applied to all validation-day labels.
+
+        Single-class folds (all in-range or all breakout) score 0.5 rather than
+        being skipped.  This prevents low-volatility windows from producing
+        AUROC=None purely because the threshold makes all labels 1 in some folds.
+        Folds with fewer than _MIN_FOLD_LABELS labelable rows are still skipped
+        (genuine data shortage, not class imbalance).
         """
         from sklearn.metrics import roc_auc_score
 
@@ -879,16 +892,22 @@ class GARCHRangeModel:
             return None
 
         scores = []
+        n_single_class = 0
         for tr_idx, val_idx in splits:
             try:
                 tr_close = close.iloc[tr_idx]
                 val_close = close.iloc[val_idx]
 
                 val_labels = create_labels_fn(val_close).dropna()
-                if len(val_labels) == 0:
+                if len(val_labels) < self._MIN_FOLD_LABELS:
                     continue
                 y_true = val_labels.values.astype(int)
+
+                # Single-class fold: model had no chance to discriminate.
+                # Score 0.5 (no-skill baseline) rather than discarding the fold.
                 if len(np.unique(y_true)) < 2:
+                    scores.append(0.5)
+                    n_single_class += 1
                     continue
 
                 tr_returns = self._log_returns(tr_close)
@@ -913,7 +932,8 @@ class GARCHRangeModel:
             log.warning("msgarch_cv_score_no_valid_folds")
             return None
         avg = float(np.mean(scores))
-        log.info("msgarch_cv_score", auroc=f"{avg:.3f}", folds=len(scores))
+        log.info("msgarch_cv_score", auroc=f"{avg:.3f}",
+                 folds=len(scores), single_class_folds=n_single_class)
         return avg
 
     def cv_score_oujump(
@@ -930,6 +950,9 @@ class GARCHRangeModel:
         folds, or None when no valid folds exist. Re-fits from scratch on each
         training slice; per-fold P(in range) is a single scalar applied to all
         validation-day labels (the same approximation used by cv_score_msgarch).
+
+        Single-class folds score 0.5 rather than being skipped — see
+        cv_score_msgarch() docstring for the rationale.
         """
         from sklearn.metrics import roc_auc_score
 
@@ -939,16 +962,20 @@ class GARCHRangeModel:
             return None
 
         scores = []
+        n_single_class = 0
         for tr_idx, val_idx in splits:
             try:
                 tr_close  = close.iloc[tr_idx]
                 val_close = close.iloc[val_idx]
 
                 val_labels = create_labels_fn(val_close).dropna()
-                if len(val_labels) == 0:
+                if len(val_labels) < self._MIN_FOLD_LABELS:
                     continue
                 y_true = val_labels.values.astype(int)
+
                 if len(np.unique(y_true)) < 2:
+                    scores.append(0.5)
+                    n_single_class += 1
                     continue
 
                 tr_returns = self._log_returns(tr_close)
@@ -972,7 +999,8 @@ class GARCHRangeModel:
             log.warning("oujump_cv_score_no_valid_folds")
             return None
         avg = float(np.mean(scores))
-        log.info("oujump_cv_score", auroc=f"{avg:.3f}", folds=len(scores))
+        log.info("oujump_cv_score", auroc=f"{avg:.3f}",
+                 folds=len(scores), single_class_folds=n_single_class)
         return avg
 
     def cv_score(
@@ -1004,6 +1032,7 @@ class GARCHRangeModel:
         from sklearn.metrics import roc_auc_score
 
         scores = []
+        n_single_class = 0
         for tr_idx, val_idx in splits:
             try:
                 tr_close = close.iloc[tr_idx]
@@ -1011,11 +1040,15 @@ class GARCHRangeModel:
 
                 # True labels on validation window
                 val_labels = create_labels_fn(val_close).dropna()
-                if len(val_labels) == 0:
+                if len(val_labels) < self._MIN_FOLD_LABELS:
                     continue
                 y_true = val_labels.values.astype(int)
+
+                # Single-class fold: score 0.5 (no-skill) rather than discard.
                 if len(np.unique(y_true)) < 2:
-                    continue  # AUROC undefined with one class
+                    scores.append(0.5)
+                    n_single_class += 1
+                    continue
 
                 # Fit GARCH on training slice
                 state = self.fit(tr_close, horizon_days, threshold_pct)
@@ -1071,8 +1104,13 @@ class GARCHRangeModel:
                     except Exception:
                         p_scores = np.full(len(y_true), self.predict_p_in_range(state))
 
+                # After rolling forecast, re-check class balance (truncation may
+                # have reduced to single class — score 0.5 rather than discard).
                 if len(np.unique(y_true)) < 2:
+                    scores.append(0.5)
+                    n_single_class += 1
                     continue
+
                 # AUROC: does higher P(in range) correctly rank in-range days above breakouts?
                 auroc = float(roc_auc_score(y_true, p_scores))
                 scores.append(auroc)
@@ -1086,7 +1124,8 @@ class GARCHRangeModel:
             log.warning("garch_cv_score_no_valid_folds")
             return None
         avg = float(np.mean(scores))
-        log.info("garch_cv_score", auroc=f"{avg:.3f}", folds=len(scores))
+        log.info("garch_cv_score", auroc=f"{avg:.3f}",
+                 folds=len(scores), single_class_folds=n_single_class)
         return avg
 
     # ------------------------------------------------------------------

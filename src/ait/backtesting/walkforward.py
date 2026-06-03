@@ -619,9 +619,14 @@ def _window_task_mp(args: tuple) -> tuple:
     Must live at module level (not a closure) so it is picklable.
     Each call creates a fresh WalkForwardBacktester with no cross-window state:
     warm-starting and BacktestLearner adaptation are disabled.
+
+    Accepts an optional pre-trained range_predictor per symbol (dict keyed by
+    symbol) so statistical models are not re-trained inside the worker.  When
+    provided, _run_single_window skips _train_window_range_model entirely.
     """
     (window_id, train_start, train_end, test_start, test_end,
-     data, vix_full, config, symbols, strategies, db_path, progress_dir) = args
+     data, vix_full, config, symbols, strategies, db_path, progress_dir,
+     pretrained_range) = args
 
     bt = WalkForwardBacktester(
         symbols=symbols,
@@ -641,6 +646,7 @@ def _window_task_mp(args: tuple) -> tuple:
         learner=None,
         prev_best_params=None,
         prev_oos=None,
+        pretrained_range=pretrained_range,
     )
     return window_id, wr, best_params
 
@@ -725,6 +731,17 @@ class WalkForwardBacktester:
             # no cross-window state: warm-starting and BacktestLearner adaptation are
             # disabled.  Progress JSON files are written independently per window with
             # no conflicts (each window has a unique file name).
+            #
+            # Statistical model pre-training (Exp 17+ fix for subprocess timeout):
+            # MS-GARCH and OU-Kou-GARCH are trained sequentially here in the parent
+            # process BEFORE the ProcessPoolExecutor launches.  This eliminates CPU
+            # contention between statistical model subprocesses and Optuna workers.
+            # It also removes the need for spawn-subprocess isolation at this stage
+            # because Optuna has not started yet — no RNG contamination is possible.
+            pretrained_range_by_window: list[dict] = self._pretrain_range_models(
+                windows, data, _vix_full
+            )
+
             from concurrent.futures import ProcessPoolExecutor
 
             args_list = [
@@ -733,6 +750,7 @@ class WalkForwardBacktester:
                     data, _vix_full, self._config,
                     self._symbols, self._strategies,
                     self._db_path, self._progress_dir,
+                    pretrained_range_by_window[i],
                 )
                 for i, (train_start, train_end, test_start, test_end) in enumerate(windows)
             ]
@@ -822,6 +840,7 @@ class WalkForwardBacktester:
         learner: "BacktestLearner | None" = None,
         prev_best_params: "dict | None" = None,
         prev_oos: "BacktestResult | None" = None,
+        pretrained_range: "dict | None" = None,
     ) -> "tuple[WindowResult | None, dict | None]":
         """Run optimization, ML training, and backtest for one window.
 
@@ -877,10 +896,17 @@ class WalkForwardBacktester:
             # params against _simple_direction fallback with no range gate — a
             # different signal than what ran in OOS.
             predictor = self._train_window_model(train_df, symbol, window_id)
-            _range_result = self._train_window_range_model(
-                train_df, symbol, window_id,
-                max_hold_days=self._config.max_hold_days,
-            )
+
+            # Use pre-trained range predictor when provided (parallel mode with
+            # _pretrain_range_models()).  Fall back to training in-process when
+            # running sequentially or when pre-training was skipped.
+            if pretrained_range is not None and symbol in pretrained_range:
+                _range_result = pretrained_range[symbol]
+            else:
+                _range_result = self._train_window_range_model(
+                    train_df, symbol, window_id,
+                    max_hold_days=self._config.max_hold_days,
+                )
             # Guard: tests may monkeypatch _train_window_range_model to return None
             if _range_result is None or not isinstance(_range_result, tuple):
                 range_predictor, _range_model_status, _range_threshold = None, "skipped", 0.05
@@ -1858,6 +1884,57 @@ class WalkForwardBacktester:
         raw = rvol_annual * np.sqrt(horizon_days / 252) * multiplier
         return float(np.clip(raw, low_clip, high_clip))
 
+    def _pretrain_range_models(
+        self,
+        windows: "list[tuple]",
+        data: "dict[str, pd.DataFrame]",
+        vix_full: "pd.DataFrame",
+    ) -> "list[dict]":
+        """Train range predictors sequentially for all windows before Optuna starts.
+
+        Returns a list (one entry per window) of dicts keyed by symbol, each
+        containing the trained RangePredictor (or None on failure) plus the
+        status string and threshold float — the same tuple _train_window_range_model
+        returns, but wrapped in a dict so multiple symbols can be pre-trained.
+
+        Running this sequentially in the parent process before ProcessPoolExecutor
+        launches means:
+          - No CPU contention with Optuna workers (they haven't started yet)
+          - No subprocess timeout risk from resource starvation
+          - Optuna's RNG state is untouched (statistical fitting runs before Optuna)
+          - The spawn-subprocess isolation is no longer needed for this phase
+        """
+        results: list[dict] = []
+        n_windows = len(windows)
+        for i, (train_start, train_end, _test_start, _test_end) in enumerate(windows):
+            window_id = i + 1
+            per_symbol: dict[str, "tuple[Any | None, str, float]"] = {}
+            for symbol, df in data.items():
+                train_df = df[str(train_start):str(train_end)]
+                if len(train_df) < 50:
+                    per_symbol[symbol] = (None, "insufficient_train_data", 0.05)
+                    continue
+                log.info(
+                    "pretraining_range_model",
+                    window=window_id,
+                    symbol=symbol,
+                    n_windows=n_windows,
+                )
+                # Train directly in-process — Optuna hasn't started, no RNG risk.
+                per_symbol[symbol] = self._train_window_range_model_inprocess(
+                    train_df=train_df,
+                    symbol=symbol,
+                    window_id=window_id,
+                    max_hold_days=self._config.max_hold_days,
+                    threshold_pct=self._adaptive_range_threshold(
+                        train_df, horizon_days=self._config.max_hold_days
+                    ),
+                    enable_msgarch=getattr(self, "_enable_msgarch", True),
+                    enable_oujump=getattr(self, "_enable_oujump", True),
+                )
+            results.append(per_symbol)
+        return results
+
     def _train_window_range_model(
         self,
         train_df: pd.DataFrame,
@@ -1867,15 +1944,17 @@ class WalkForwardBacktester:
     ) -> "tuple[Any | None, str, float]":
         """Train range predictor on this window's training data.
 
-        Returns (predictor, status, threshold_used) where:
-        - status is 'ok' or a failure reason
-        - threshold_used is the adaptive ±X% range threshold applied
-        Callers must check status — a None predictor means no range gate is
-        available and OOS entries should be blocked for iron condors.
+        In parallel mode this is only called as a fallback (when pretrained_range
+        is not supplied).  In sequential mode it runs directly in-process since
+        Optuna has not started yet and there is no RNG contamination risk.
+
+        Returns (predictor, status, threshold_used).
         """
         threshold_pct = self._adaptive_range_threshold(train_df, horizon_days=max_hold_days)
-        return self._train_window_range_model_isolated(
-            train_df, symbol, window_id, max_hold_days, threshold_pct
+        return self._train_window_range_model_inprocess(
+            train_df, symbol, window_id, max_hold_days, threshold_pct,
+            enable_msgarch=getattr(self, "_enable_msgarch", True),
+            enable_oujump=getattr(self, "_enable_oujump", True),
         )
 
     def _train_window_range_model_isolated(
@@ -1939,6 +2018,8 @@ class WalkForwardBacktester:
         if proc.is_alive():
             proc.terminate()
             proc.join(timeout=5)
+            queue.close()
+            queue.join_thread()
             log.warning(
                 "range_model_subprocess_timeout",
                 window=window_id, symbol=symbol,
@@ -1952,6 +2033,8 @@ class WalkForwardBacktester:
 
         exit_code = proc.exitcode
         if exit_code != 0:
+            queue.close()
+            queue.join_thread()
             log.warning(
                 "range_model_subprocess_failed",
                 window=window_id, symbol=symbol,
@@ -1971,10 +2054,18 @@ class WalkForwardBacktester:
                 window=window_id, symbol=symbol,
                 action="falling back to ML-only in-process training",
             )
+            queue.close()
+            queue.join_thread()
             return self._train_window_range_model_inprocess(
                 train_df, symbol, window_id, max_hold_days, threshold_pct,
                 enable_msgarch=False, enable_oujump=False,
             )
+
+        # Explicit queue cleanup prevents semaphore leaks on macOS (resource_tracker
+        # warning: "leaked semaphore objects"). Queue uses a background thread +
+        # OS semaphore that must be released before the Queue goes out of scope.
+        queue.close()
+        queue.join_thread()
 
         rp, status, thr = result
         if status == "ok" and rp is not None:
