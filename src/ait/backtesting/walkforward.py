@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import multiprocessing as _mp
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -32,6 +33,62 @@ from ait.config.settings import MLConfig
 from ait.ml.ensemble import DirectionPredictor
 from ait.strategies.base import SignalDirection
 from ait.utils.logging import get_logger
+
+
+# ---------------------------------------------------------------------------
+# Module-level worker for RNG-isolated statistical model training
+# ---------------------------------------------------------------------------
+# Must be at module level (not a nested function) so the `spawn` start method
+# can import and pickle it in the child interpreter.
+
+def _range_model_worker(
+    queue: "_mp.Queue",
+    train_df: "pd.DataFrame",
+    symbol: str,
+    window_id: int,
+    max_hold_days: int,
+    threshold_pct: float,
+    db_path: "Path | None",
+    table_prefix: str,
+    enable_msgarch: bool,
+    enable_oujump: bool,
+) -> None:
+    """Train RangePredictor with statistical models in an isolated subprocess.
+
+    Runs inside a `spawn`-started child process so that scipy/numpy RNG state
+    consumed by MS-GARCH EM and OU-Kou-GARCH MLE never propagates back to the
+    parent process where Optuna's TPE sampler is running.
+
+    Places (range_predictor, status, threshold_pct) into `queue` on success,
+    or (None, error_reason, threshold_pct) on failure.  The parent reads from
+    the queue after joining the process.
+    """
+    try:
+        from ait.ml.range_predictor import RangePredictor
+
+        intraday_store = None
+        if db_path is not None:
+            from ait.data.historical import HistoricalDataStore
+            intraday_store = HistoricalDataStore(
+                db_path=db_path, table_prefix=table_prefix
+            )
+
+        rp = RangePredictor(
+            threshold_pct=threshold_pct,
+            horizon_days=max_hold_days,
+            enable_garch=False,       # plain GARCH: rank-inversion problem not yet fixed
+            enable_msgarch=enable_msgarch,
+            enable_oujump=enable_oujump,
+        )
+        accs = rp.train(train_df, symbol=symbol, intraday_store=intraday_store)
+
+        if accs and rp.is_trained:
+            queue.put((rp, "ok", threshold_pct))
+        else:
+            queue.put((None, "training_returned_no_accuracy", threshold_pct))
+
+    except Exception as exc:
+        queue.put((None, f"exception: {exc}", threshold_pct))
 
 log = get_logger("backtesting.walkforward")
 
@@ -612,6 +669,8 @@ class WalkForwardBacktester:
         db_path: "Path | None" = None,
         progress_dir: "Path | None" = None,
         table_prefix: str = "",
+        enable_msgarch: bool = True,
+        enable_oujump: bool = True,
     ) -> None:
         self._symbols = symbols
         self._strategies = strategies
@@ -621,6 +680,10 @@ class WalkForwardBacktester:
         self._progress_dir = Path(progress_dir) if progress_dir else None
         self._global_best_params: dict | None = None
         self._global_best_score: float = -1.0
+        # Statistical ensemble members — trained in spawn-isolated subprocess
+        # (Exp 17+) to prevent Optuna RNG contamination (P31/P32).
+        self._enable_msgarch = enable_msgarch
+        self._enable_oujump  = enable_oujump
 
     async def run(self, data: dict[str, pd.DataFrame] | None = None) -> WalkForwardResult:
         """Run walk-forward backtest.
@@ -1811,31 +1874,180 @@ class WalkForwardBacktester:
         available and OOS entries should be blocked for iron condors.
         """
         threshold_pct = self._adaptive_range_threshold(train_df, horizon_days=max_hold_days)
+        return self._train_window_range_model_isolated(
+            train_df, symbol, window_id, max_hold_days, threshold_pct
+        )
+
+    def _train_window_range_model_isolated(
+        self,
+        train_df: pd.DataFrame,
+        symbol: str,
+        window_id: int,
+        max_hold_days: int,
+        threshold_pct: float,
+        _timeout: int = 480,
+    ) -> "tuple[Any | None, str, float]":
+        """Train RangePredictor with statistical models in a spawn-isolated subprocess.
+
+        Statistical model fitting (MS-GARCH EM, OU-Kou-GARCH MLE) consumes
+        numpy/scipy global RNG state.  Running this in a `spawn` subprocess
+        guarantees the parent process RNG — used by Optuna's TPE sampler — is
+        completely unaffected by statistical model training (Exp 17 fix for
+        Problem 1: RNG contamination documented in P31/P32).
+
+        Fallback chain on subprocess failure:
+          1. Timeout (> _timeout seconds) → fall back to ML-only in-process training
+          2. OOM kill (exit code -9) → same fallback
+          3. Any other exception → same fallback, log reason
+
+        The fallback never raises; it always returns a valid (predictor, status,
+        threshold) tuple so the window continues without a statistical ensemble.
+        """
+        enable_msgarch = getattr(self, "_enable_msgarch", True)
+        enable_oujump  = getattr(self, "_enable_oujump",  True)
+
+        # If no statistical models are requested, skip subprocess overhead.
+        if not enable_msgarch and not enable_oujump:
+            return self._train_window_range_model_inprocess(
+                train_df, symbol, window_id, max_hold_days, threshold_pct,
+                enable_msgarch=False, enable_oujump=False,
+            )
+
+        ctx = _mp.get_context("spawn")
+        queue: "_mp.Queue" = ctx.Queue()
+
+        proc = ctx.Process(
+            target=_range_model_worker,
+            args=(
+                queue,
+                train_df,
+                symbol,
+                window_id,
+                max_hold_days,
+                threshold_pct,
+                self._db_path,
+                self._table_prefix,
+                enable_msgarch,
+                enable_oujump,
+            ),
+            daemon=True,
+        )
+
+        proc.start()
+        proc.join(timeout=_timeout)
+
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+            log.warning(
+                "range_model_subprocess_timeout",
+                window=window_id, symbol=symbol,
+                timeout_s=_timeout,
+                action="falling back to ML-only in-process training",
+            )
+            return self._train_window_range_model_inprocess(
+                train_df, symbol, window_id, max_hold_days, threshold_pct,
+                enable_msgarch=False, enable_oujump=False,
+            )
+
+        exit_code = proc.exitcode
+        if exit_code != 0:
+            log.warning(
+                "range_model_subprocess_failed",
+                window=window_id, symbol=symbol,
+                exit_code=exit_code,
+                action="falling back to ML-only in-process training",
+            )
+            return self._train_window_range_model_inprocess(
+                train_df, symbol, window_id, max_hold_days, threshold_pct,
+                enable_msgarch=False, enable_oujump=False,
+            )
+
+        try:
+            result = queue.get_nowait()
+        except Exception:
+            log.warning(
+                "range_model_subprocess_empty_queue",
+                window=window_id, symbol=symbol,
+                action="falling back to ML-only in-process training",
+            )
+            return self._train_window_range_model_inprocess(
+                train_df, symbol, window_id, max_hold_days, threshold_pct,
+                enable_msgarch=False, enable_oujump=False,
+            )
+
+        rp, status, thr = result
+        if status == "ok" and rp is not None:
+            avg_acc = (
+                sum(rp.fitted_weights.values()) / len(rp.fitted_weights)
+                if rp.fitted_weights else 0.0
+            )
+            log.info(
+                "window_range_model_trained",
+                window=window_id, symbol=symbol,
+                mode="isolated_subprocess",
+                accuracy=f"{avg_acc:.3f}",
+                threshold_pct=f"{threshold_pct:.3f}",
+                fitted_weights=rp.fitted_weights,
+            )
+        else:
+            log.warning(
+                "range_model_train_failed",
+                window=window_id, symbol=symbol,
+                error=status,
+                threshold_pct=f"{threshold_pct:.3f}",
+                action="OOS IC entries will be blocked — no range gate available",
+            )
+
+        return rp, status, thr
+
+    def _train_window_range_model_inprocess(
+        self,
+        train_df: pd.DataFrame,
+        symbol: str,
+        window_id: int,
+        max_hold_days: int,
+        threshold_pct: float,
+        enable_msgarch: bool = False,
+        enable_oujump: bool = False,
+    ) -> "tuple[Any | None, str, float]":
+        """In-process fallback: trains ML models only (no statistical members).
+
+        Used when subprocess isolation fails or statistical models are disabled.
+        Never contaminates parent RNG when statistical models are disabled.
+        """
         try:
             from ait.ml.range_predictor import RangePredictor
             intraday_store = None
             if self._db_path is not None:
                 from ait.data.historical import HistoricalDataStore
-                intraday_store = HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
-            # Exp 16: all statistical models disabled — no RNG contamination of Optuna.
-            # Re-enable with subprocess isolation in Exp 17.
-            rp = RangePredictor(threshold_pct=threshold_pct, horizon_days=max_hold_days,
-                                enable_garch=False, enable_msgarch=False, enable_oujump=False)
+                intraday_store = HistoricalDataStore(
+                    db_path=self._db_path, table_prefix=self._table_prefix
+                )
+            rp = RangePredictor(
+                threshold_pct=threshold_pct,
+                horizon_days=max_hold_days,
+                enable_garch=False,
+                enable_msgarch=enable_msgarch,
+                enable_oujump=enable_oujump,
+            )
             accs = rp.train(train_df, symbol=symbol, intraday_store=intraday_store)
             if accs and rp.is_trained:
                 avg = sum(accs.values()) / len(accs)
-                log.info("window_range_model_trained",
-                         window=window_id, symbol=symbol,
-                         accuracy=f"{avg:.3f}",
-                         threshold_pct=f"{threshold_pct:.3f}")
+                log.info(
+                    "window_range_model_trained",
+                    window=window_id, symbol=symbol,
+                    mode="inprocess",
+                    accuracy=f"{avg:.3f}",
+                    threshold_pct=f"{threshold_pct:.3f}",
+                )
                 return rp, "ok", threshold_pct
             return None, "training_returned_no_accuracy", threshold_pct
         except Exception as e:
             reason = str(e)
             log.warning(
                 "range_model_train_failed",
-                window=window_id,
-                symbol=symbol,
+                window=window_id, symbol=symbol,
                 error=reason,
                 threshold_pct=f"{threshold_pct:.3f}",
                 action="OOS IC entries will be blocked — no range gate available",

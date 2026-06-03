@@ -1659,30 +1659,57 @@ The `spawn` context (vs `fork`) is critical: `fork` copies the parent's memory i
 *Note*: `spawn` is slower than `fork` (fresh interpreter start per window). Since we have 12 windows, the overhead is acceptable (~2–5 seconds per window for process startup vs ~30–90 seconds for model fitting).
 
 ### Setup
-*(to be filled when Exp 16 results are in)*
 
 - Walk-forward config: **365d** / **60d** / **60d** / 5d → **12 windows** (same as Exp 13–16)
+- OOS period: 2024-05-19 → 2026-05-09
 - Key changes from Exp 16:
-  - **RNG isolation**: statistical model training runs in `spawn` subprocess — parent Optuna RNG unaffected
-  - **MS-GARCH enabled** (`enable_msgarch=True`)
-  - **OU-Kou-GARCH enabled** (`enable_oujump=True`)
-  - Plain GARCH remains disabled (`enable_garch=False`) — still subject to rank-inversion, not yet fixed
-  - 4-way equal-weight prior: XGB 0.25, LGB 0.25, MS-GARCH 0.25, OU-Kou-GARCH 0.25
+  - **RNG isolation**: `_train_window_range_model_isolated()` runs statistical model training in a `spawn` subprocess — parent Optuna RNG completely unaffected (fixes P31/P32). Implemented in `walkforward.py`.
+  - **MS-GARCH enabled** (`enable_msgarch=True` on `WalkForwardBacktester`)
+  - **OU-Kou-GARCH enabled** (`enable_oujump=True` on `WalkForwardBacktester`)
+  - Plain GARCH remains disabled (`enable_garch=False`) — rank-inversion not yet fixed
+  - 4-way equal-weight prior: XGB 0.25, LGB 0.25, MS-GARCH 0.25, OU-Kou-GARCH 0.25 (replaced by CV-edge fitted weights after training)
+  - **New OOS metrics**: per-model Brier score, log loss, Brier skill score, rvol MAE/bias, AUROC — all in `model_weights.range_predictor.oos_scores` window JSON
+  - **AEKF OOS block**: `oos_scores.aekf` — innovation LB tests, κ stability, direction accuracy/AUROC/Brier for OU-Kou-GARCH
+  - Subprocess timeout: 480s per window (fallback to ML-only if exceeded)
+- Optuna: 200 trials, patience 50, min_trades 7, n_jobs 6 (unchanged)
 
 ### Assumptions Going In
-- RNG isolation preserves Exp 13/16 baseline PnL in windows where the new models contribute zero weight (AUROC=None or <0.5)
-- MS-GARCH correctly identifies calm regime in W08/W09 post-shock recovery → AUROC > 0.50 → positive fitted weight
-- OU-Kou-GARCH's mean-reversion drift provides a direction signal orthogonal to XGB/LGB features → complementary CV edge
-- Combined: total PnL > +$508 (Exp 13 baseline)
+- RNG isolation preserves E16 baseline PnL in W01, W02, W04–W12 (the 11 stable windows)
+- W03 remains −$41 regardless — its degradation source is unrelated to statistical models (Q_E16_2 open)
+- MS-GARCH correctly identifies calm regime in W08/W09 post-shock recovery → lower rvol_bias → AUROC > 0.50 → positive fitted weight → PnL improvement
+- OU-Kou-GARCH direction signal is orthogonal to XGB/LGB cross-sectional features → complementary CV edge in mean-reverting windows (W04, W07, W09)
+- Per-model Brier skill score (OOS) correlates with CV AUROC (training) — if not, CV AUROC is a misleading weight signal
 
 ### Open Questions
-- **Q_E17_1**: Does RNG isolation fully prevent Optuna contamination? (Test: compare W03 best_params vs Exp 13.)
-- **Q_E17_2**: Does MS-GARCH fix the W08/W09 rank inversion? (Test: compare AUROC for MS-GARCH vs Exp 15 GARCH in those windows.)
-- **Q_E17_3**: Does OU-Kou-GARCH win any BIC races? (Test: check `garch_all_variants["OU-Kou-GARCH"]` in window JSONs — BIC vs MS-GARCH and GARCH variants.)
-- **Q_E17_4**: Does the direction signal from OU-Kou-GARCH (`ou_jump_direction`, `ou_jump_confidence`) correlate with actual W03/W04 outcomes? (Research: cross-tab direction signal vs OOS trade result.)
+- **Q_E17_1**: Does RNG isolation preserve E16 best_params in W01, W02, W04–W12? (Test: per-window params diff vs E16 for all 11 stable windows.)
+- **Q_E17_2**: Does MS-GARCH fix W08/W09 rank inversion? (Test: `oos_scores.statistical.msgarch.rvol_bias` in W08/W09 — should be near zero vs GARCH's large positive bias in E15.)
+- **Q_E17_3**: Does OU-Kou-GARCH win any BIC races? (Test: `garch_all_variants["OU-Kou-GARCH"].bic` vs `garch_all_variants["MS-GARCH"].bic` per window.)
+- **Q_E17_4**: Does the OU-Kou-GARCH direction signal have OOS skill? (Test: `oos_scores.aekf.direction_auroc` > 0.52 in windows where OU-Kou-GARCH gets positive fitted weight.)
+- **Q_E17_5**: Do CV AUROC scores correlate with OOS Brier Skill Scores? (Research: scatter plot of `cv_scores` vs `oos_scores.brier_skill` per model per window — if uncorrelated, CV AUROC is overfitting the fold structure.)
+- **Q_E17_6**: Does the range gate do real work or is it a passive bystander? (Research: in windows where model OOS AUROC improves vs E15/E16, does PnL also improve? If AUROC improves but PnL doesn't, the gate isn't the binding constraint.)
+- **Q_E17_7**: Is the AEKF filtering correctly? (Test: `oos_scores.aekf.lb_innovations_acf_pvalue` > 0.05 in most windows — innovations should be approximately white noise.)
+- **Q_E17_8**: In windows where statistical models get zero fitted weight, do the 11 stable windows match E16 exactly? (Confirms isolation works even in zero-contribution windows.)
 
 ### Launch Command
-*(to be filled — same flags as Exp 16 once RNG isolation is implemented)*
+```bash
+python scripts/run_integration_test.py \
+  --symbols QQQ \
+  --config config_QQQ_test.yaml \
+  --strategies iron_condor \
+  --train-days 365 \
+  --test-days 60 \
+  --step-days 60 \
+  --gap-days 5 \
+  --optuna-seed 42 \
+  --wf-trials 200 \
+  --wf-patience 50 \
+  --wf-min-trades 7 \
+  --wf-n-jobs 6 \
+  --years 3 \
+  --skip-backfill
+```
+
+Note: `enable_msgarch=True` and `enable_oujump=True` are now the defaults on `WalkForwardBacktester`. No additional flags needed — statistical models activate automatically with RNG isolation.
 
 ### Results — Section E
 *(pending)*
