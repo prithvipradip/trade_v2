@@ -873,16 +873,13 @@ class GARCHRangeModel:
     ) -> "float | None":
         """Walk-forward CV AUROC for the MS-GARCH model alone.
 
-        Same scoring contract as cv_score(): returns mean AUROC across folds,
-        or None when no valid folds exist.  MS-GARCH is re-fit from scratch on
-        each training slice (no rolling arch result to reuse), so per-fold
-        P(in range) is a single scalar applied to all validation-day labels.
+        Fits MS-GARCH on each training slice, then steps the Hamilton filter
+        forward one day at a time through the validation slice to produce a
+        per-day P(in range) sequence.  This gives genuine AUROC discrimination
+        (varying probabilities across days) rather than a constant scalar.
 
-        Single-class folds (all in-range or all breakout) score 0.5 rather than
-        being skipped.  This prevents low-volatility windows from producing
-        AUROC=None purely because the threshold makes all labels 1 in some folds.
-        Folds with fewer than _MIN_FOLD_LABELS labelable rows are still skipped
-        (genuine data shortage, not class imbalance).
+        Single-class folds score 0.5 (safety net); folds below _MIN_FOLD_LABELS
+        are skipped (genuine data shortage).
         """
         from sklearn.metrics import roc_auc_score
 
@@ -895,7 +892,7 @@ class GARCHRangeModel:
         n_single_class = 0
         for tr_idx, val_idx in splits:
             try:
-                tr_close = close.iloc[tr_idx]
+                tr_close  = close.iloc[tr_idx]
                 val_close = close.iloc[val_idx]
 
                 val_labels = create_labels_fn(val_close).dropna()
@@ -903,8 +900,6 @@ class GARCHRangeModel:
                     continue
                 y_true = val_labels.values.astype(int)
 
-                # Single-class fold: model had no chance to discriminate.
-                # Score 0.5 (no-skill baseline) rather than discarding the fold.
                 if len(np.unique(y_true)) < 2:
                     scores.append(0.5)
                     n_single_class += 1
@@ -920,10 +915,27 @@ class GARCHRangeModel:
                 except Exception:
                     continue
 
-                p = ms.p_in_range(horizon_days, threshold_pct)
-                p_scores = np.full(len(y_true), p)
+                # Per-day rolling forecasts: step Hamilton filter through val slice.
+                # roll_msgarch_forecasts expects the _fit_msgarch wrapper shape:
+                # {"msgarch_state": ms.to_state_dict(), ...}
+                val_returns = self._log_returns(val_close)
+                ms_state = {"msgarch_state": ms.to_state_dict()}
+                p_scores = self.roll_msgarch_forecasts(
+                    ms_state, val_returns, horizon_days, threshold_pct
+                )
+                # Align p_scores with y_true (both drop the last horizon_days rows)
+                n = min(len(p_scores), len(y_true))
+                if n < self._MIN_FOLD_LABELS:
+                    continue
+                p_scores = p_scores[:n]
+                y_true_aligned = y_true[:n]
 
-                auroc = float(roc_auc_score(y_true, p_scores))
+                if len(np.unique(y_true_aligned)) < 2:
+                    scores.append(0.5)
+                    n_single_class += 1
+                    continue
+
+                auroc = float(roc_auc_score(y_true_aligned, p_scores))
                 scores.append(auroc)
             except Exception:
                 continue
@@ -946,13 +958,12 @@ class GARCHRangeModel:
     ) -> "float | None":
         """Walk-forward CV AUROC for the OU-Kou-GARCH model alone.
 
-        Same scoring contract as cv_score_msgarch(): returns mean AUROC across
-        folds, or None when no valid folds exist. Re-fits from scratch on each
-        training slice; per-fold P(in range) is a single scalar applied to all
-        validation-day labels (the same approximation used by cv_score_msgarch).
+        Fits OU-Kou-GARCH on each training slice, then steps the AEKF forward
+        one day at a time through the validation slice to produce a per-day
+        P(in range) sequence.  Mirrors cv_score_msgarch() design.
 
-        Single-class folds score 0.5 rather than being skipped — see
-        cv_score_msgarch() docstring for the rationale.
+        Single-class folds score 0.5 (safety net); folds below _MIN_FOLD_LABELS
+        are skipped (genuine data shortage).
         """
         from sklearn.metrics import roc_auc_score
 
@@ -988,9 +999,25 @@ class GARCHRangeModel:
                 except Exception:
                     continue
 
-                p = model.p_in_range(horizon_days, threshold_pct)
-                p_scores = np.full(len(y_true), p)
-                auroc = float(roc_auc_score(y_true, p_scores))
+                # Per-day rolling forecasts: step AEKF through val slice.
+                # roll_oujump_forecasts expects {"oujump_state": model.to_state_dict()}
+                val_returns = self._log_returns(val_close)
+                ou_state = {"oujump_state": model.to_state_dict()}
+                p_scores, _, _ = self.roll_oujump_forecasts(
+                    ou_state, val_returns, horizon_days, threshold_pct
+                )
+                n = min(len(p_scores), len(y_true))
+                if n < self._MIN_FOLD_LABELS:
+                    continue
+                p_scores = p_scores[:n]
+                y_true_aligned = y_true[:n]
+
+                if len(np.unique(y_true_aligned)) < 2:
+                    scores.append(0.5)
+                    n_single_class += 1
+                    continue
+
+                auroc = float(roc_auc_score(y_true_aligned, p_scores))
                 scores.append(auroc)
             except Exception:
                 continue
