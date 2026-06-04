@@ -88,6 +88,8 @@ class Backtester:
         limit_order_timeout_bars: int = 3,
         # Per-window MetaLabeler for OOS signal filtering (Gap Z1)
         meta_labeler: Any = None,
+        # H2 val-split: skip new entries before this date (full df still used for feature warmup)
+        eval_start_date: "date | None" = None,
     ) -> None:
         self._data = self._prepare_data(data)
         self._strategies = strategies
@@ -131,6 +133,7 @@ class Backtester:
         self._entry_window_end_et = entry_window_end_et
         self._limit_order_timeout_bars = limit_order_timeout_bars
         self._meta_labeler = meta_labeler
+        self._eval_start_date = eval_start_date
 
         self._predictor = predictor if predictor is not None else self._load_predictor()
 
@@ -219,6 +222,10 @@ class Backtester:
 
             # --- 2. Generate new signal (skip if at position limit) ---
             if len(open_positions) >= self._max_concurrent_positions:
+                continue
+
+            # H2 val-split: skip new entries before eval_start_date (exits still processed above)
+            if self._eval_start_date is not None and today_date < self._eval_start_date:
                 continue
 
             direction, confidence, features_df = self._get_direction(hist, market_context=self._market_context)

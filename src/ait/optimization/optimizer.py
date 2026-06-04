@@ -304,17 +304,15 @@ class StrategyOptimizer:
         if df is None or len(df) < _MIN_BACKTEST_ROWS:
             raise ValueError(f"Insufficient data for {symbol}")
 
+        eval_start_date = None
         if self._val_split and len(df) >= _MIN_BACKTEST_ROWS * 2:
-            # H2: split into train/val. Params are fit on train, scored on val.
+            # H2: split 80/20. Full df is passed to Backtester for feature warmup;
+            # eval_start_date restricts new entries to the val slice only.
             split_idx = max(_MIN_BACKTEST_ROWS, int(len(df) * (1.0 - _VAL_SPLIT_RATIO)))
-            train_df = df.iloc[:split_idx]
-            val_df   = df.iloc[split_idx:]
-            if len(val_df) < _MIN_BACKTEST_ROWS // 2:
-                # val slice too short — fall back to full window
-                val_df = df
-        else:
-            train_df = df
-            val_df   = df
+            val_start = df.index[split_idx]
+            eval_start_date = val_start.date() if hasattr(val_start, "date") else val_start
+            if len(df) - split_idx < _MIN_BACKTEST_ROWS // 2:
+                eval_start_date = None  # val slice too short — fall back to full window
 
         # Extract Backtester-compatible params (drop strategy__ prefix).
         # Only parameters that Backtester.__init__ actually accepts are included
@@ -353,15 +351,16 @@ class StrategyOptimizer:
             if param_name == "trailing_stop_fraction":
                 bt_kwargs["trailing_stop_pct"] = val * bt_kwargs["profit_target_pct"]
 
-        # H2: run on val_df so the objective is scored on held-out data.
-        # In non-val_split mode val_df == df, so behaviour is unchanged.
+        # H2: pass full df for feature warmup; eval_start_date restricts new entries
+        # to the val slice. In non-val_split mode eval_start_date is None (no restriction).
         bt = Backtester(
-            data=val_df,
+            data=df,
             strategies=self._strategies,
             features_cache=self._features_cache,
             symbol=self._symbol or symbol,
             range_predictor=self._range_predictor,
             intraday_store=self._intraday_store,
+            eval_start_date=eval_start_date,
             **bt_kwargs,
         )
         return bt.run()

@@ -31,6 +31,7 @@
 | 17v3 | `QQQ_365d_iron_condor_20260604_0826` | 365/60/60/5, 12 W | −0.96% / −$962 | +2.35% / +$2,382 | 26 / 51 | −2.03 / 1.61 | 10/12 | P37+P38 fix confirmed; W02 first window with non-zero stat weights (ms=0.7, ou=0.3); AEKF direction AUROC strong |
 | 18 | `QQQ_365d_iron_condor_20260604_1641` | 365/60/60/5, 12 W | +1.67% / +$1,670 | +2.35% / +$2,382 | 28 / 51 | **+3.14** / 1.61 | 11/12 | **H1 confirmed**: 6-param space; optimized beats ablation on Sharpe for first time (3.14 vs 1.61) |
 | 19 | pending | 365/60/60/5, 12 W | — | — | — | — | — | **H2 test**: train/val split inside Optuna objective (80/20); isolates in-sample overfitting |
+| 20 | pending | 365/60/60/5, 12 W | — | — | — | — | — | **Signal quality**: AEKF entry veto + fractal hard-veto + DirectionPredictor CV→AUROC + rising IV filter |
 
 Config format: `train_days / test_days / step_days / gap_days`.
 All experiments: QQQ, iron_condor only, TPE sampler seed 42, $100k initial capital.
@@ -2114,6 +2115,93 @@ python scripts/run_integration_test.py \
 
 ---
 
+## Experiment 20 — Signal Quality: AEKF Gate + Fractal Hard-Veto + Direction CV Fix (Planned)
+
+**Archive:** pending
+**Date:** pending (after Exp 19 completes)
+**Git branch:** `features-request-3`
+
+### Context
+
+Three independent signal quality problems were identified from analysis of Exp 18 window JSONs. All three touch the same entry decision chain in `engine.py` and are bundled into one experiment so their combined effect can be measured cleanly against the Exp 19 baseline.
+
+---
+
+### Change 1 — Wire AEKF Direction Signal into Iron Condor Entry Gate
+
+**Problem:** The AEKF drift signal (`κ_T · (μ_T − X_T)`) has OOS direction AUROC of 0.87–1.0 across multiple Exp 18 windows. It is computed, stored in the window JSON, and measured — but it is never consulted at trade entry time. Iron condors currently bypass the direction gate entirely (`_neutral_only = True` → direction confidence check skipped).
+
+**Root cause evidence:** W12 — three consecutive stop-loss hits in `trending_down` regime (2026-03-10 to 2026-04-01). AEKF correctly produced BEARISH signal at train-end (conf=0.12). The fractal gate flagged anti-persistence (`pass=False`) on all three trades. Neither signal blocked entry because neither is wired as a veto for iron condors.
+
+**Fix:** Add an AEKF direction strength check to the iron condor entry path. When the AEKF drift magnitude (normalised confidence) exceeds a threshold, suppress iron condor entries — a strong directional signal means the market is trending, not ranging, which is exactly when iron condors fail.
+
+**Proposed implementation (`engine.py`):**
+- After the fractal gate block, add: if `ou_jump_direction` is available from the range predictor's trained state and `ou_jump_confidence > AEKF_VETO_THRESHOLD` (proposed: 0.60), skip iron condor entry regardless of range gate pass.
+- `AEKF_VETO_THRESHOLD = 0.60` — only veto when AEKF is highly confident (top ~40% of historical drift distribution). Low-confidence BEARISH signals (like W12's 0.12) would not veto; high-confidence signals (W09's 0.79, W05's 0.61) would.
+- Note: W12's confidence was only 0.12 so even this fix wouldn't have helped W12 directly. The fractal hard-veto (Change 2) is the primary W12 fix.
+
+**Files:** `src/ait/backtesting/engine.py`, `src/ait/backtesting/walkforward.py` (surface new config param)
+
+---
+
+### Change 2 — Fractal Gate Hard-Veto in Trending Regimes
+
+**Problem:** The fractal gate currently applies a *penalty* to confidence when `hurst_spread > hurst_regime_threshold`. It does not block entry outright. In W12 all three trades had `fractal_gate.pass=False` (anti-persistent / trending) yet still entered because the penalty (`hurst_regime_penalty=0.145`) was too small to push `range_gate.prob` below the 0.55 threshold.
+
+**Root cause evidence (W12):**
+- Trade 1: `hurst_spread=0.749`, `threshold=0.147`, `pass=False` → penalty applied → `confidence` reduced, but `range_gate.prob=0.671` still cleared 0.55 → trade taken.
+- Same pattern on trades 2 and 3. The fractal gate was correctly identifying a trending regime but the soft penalty was ineffective.
+
+**Fix:** Convert the fractal gate from a soft penalty to a hard veto for iron condors when `hurst_spread` significantly exceeds the threshold. Proposed rule: if `hurst_spread > hurst_regime_threshold * 1.5` (i.e. spread is 50% above threshold — clearly trending, not borderline), skip iron condor entry entirely.
+
+The 1.5× multiplier is the proposed starting point; it avoids blocking borderline cases where the spread is only marginally above threshold (which could be noise), while catching the clear trending cases like W12 where spread was 5× threshold.
+
+**Files:** `src/ait/backtesting/engine.py`, `src/ait/backtesting/walkforward.py` (surface `hurst_hard_veto_multiplier` as a tunable config param, defaulting to 1.5)
+
+---
+
+### Change 3 — Fix DirectionPredictor CV Metric: Accuracy → AUROC
+
+**Problem:** `DirectionPredictor` CV scores are consistently below 0.333 (3-class random chance) across all 12 Exp 18 windows:
+- XGBoost: 0.19–0.41, LightGBM: 0.21–0.43
+- All fitted weights land at 0.5/0.5 (equal split, no discrimination)
+- Both models effectively contribute nothing to direction prediction
+
+**Root cause:** The CV metric is raw 3-class accuracy evaluated on imbalanced folds. QQQ training windows are often trend-dominated (e.g. 60% BULLISH, 30% NEUTRAL, 10% BEARISH). The XGBoost/LightGBM models are trained with `sample_weights` to balance classes, so they predict the minority class more often than a naive "always majority" baseline would. On an imbalanced test fold this produces accuracy *below* the naive baseline — hence sub-0.333 scores.
+
+The AEKF's OOS direction AUROC (0.87–1.0) proves the direction *signal* is present in the data. The issue is purely the measurement metric used for CV weighting.
+
+**Fix:** Replace accuracy with **one-vs-rest AUROC** (BULLISH vs not-BULLISH) as the CV scoring metric in `DirectionPredictor._train_xgboost()` and `_train_lightgbm()`. AUROC is threshold-independent — it measures ranking quality, not hard-threshold classification accuracy, and is immune to class imbalance. The fitted weights formula baseline changes from `1/3` (accuracy) to `0.5` (AUROC).
+
+**Files:** `src/ait/ml/ensemble.py` (`_train_xgboost`, `_train_lightgbm`, fitted-weights baseline constant)
+
+---
+
+### Change 4 — Rising IV Rank Filter
+
+**Problem:** W12 trades 2 and 3 had escalating IV rank (0.47 → 0.68 → 0.82). Rising IV rank during a downtrend is a sign of persistent directional stress, not a vol-selling opportunity. The vol gate only has a hard ceiling (`max_entry_vol_annual=0.80`); it doesn't detect the *trend* in IV rank.
+
+**Fix:** Add an IV rank trend check to the iron condor entry path. If IV rank has increased by more than `iv_rank_rise_threshold` (proposed: 0.20) over the last 3 trade entries (or last 10 days), suppress new iron condor entries. This is a lightweight filter — it only fires when IV is both elevated and rising, which is the signature of a trending sell-off.
+
+**Files:** `src/ait/backtesting/engine.py`
+
+---
+
+### Dependencies and Sequencing
+
+- Changes 1–4 are independent of each other and can be implemented in parallel.
+- All four require Exp 19 results first to establish the correct baseline Sharpe to measure against.
+- Change 3 (DirectionPredictor CV fix) may interact with fitted weights in range predictor — if direction CV scores improve, the ensemble weighting could shift, slightly changing range gate probabilities. This is expected and desirable.
+- The `hurst_hard_veto_multiplier` (Change 2) and `AEKF_VETO_THRESHOLD` (Change 1) should be surfaced as config params (not hardcoded) so they can be tuned in a follow-up experiment if needed.
+
+### Prediction
+
+If Changes 1 and 2 are effective, W12 should stop losing (or at least reduce the 3-trade consecutive loss). If Change 3 is effective, DirectionPredictor CV scores should rise above 0.5, resulting in non-trivial fitted weights for XGBoost/LightGBM in the direction ensemble. Change 4 is a defensive filter with minimal expected impact on winning windows but should prevent W12-style IV escalation entries.
+
+Overall Sharpe impact is hard to predict without running it — the fixes address tail-risk (trending regime losses) more than they improve average performance. Expect max drawdown reduction more than Sharpe improvement.
+
+---
+
 ## Experiment Template
 
 Copy this section to add a new experiment:
@@ -2166,4 +2254,4 @@ Copy this section to add a new experiment:
 
 ---
 
-*Last updated: 2026-06-04 (Exp 18 archived; Exp 19 setup)*
+*Last updated: 2026-06-04 (Exp 18 archived; Exp 19 running; Exp 20 planned)*
