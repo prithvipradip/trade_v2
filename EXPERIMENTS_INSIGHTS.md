@@ -28,7 +28,7 @@
 | 16 | `QQQ_365d_iron_condor_20260603_0617` | 365/60/60/5, 12 W | −1.38% | — | 25 / — | −2.26 / — | 10/12 | GARCH disabled; W03 still −$41 (not GARCH); P31 disproved for W03; 10/12 windows stable |
 | 17 | `QQQ_365d_iron_condor_20260603_exp17_partial` | 365/60/60/5, 4/12 W | — | — | — | — | — | KILLED 4/12 — P36 found (single-class CV folds); stat models got zero weight; Q_E17_1 answered |
 | 17v2 | `QQQ_365d_iron_condor_20260603_exp17_partial` (partial) | 365/60/60/5, 0/12 W | — | — | — | — | — | KILLED — P37 found; CV threshold mismatch → all folds single-class → stat models still zero weight |
-| 17v3 | pending | 365/60/60/5, 12 W | — | — | — | — | — | P37 fix (sqrt-of-time CV threshold scaling); first run with real MS-GARCH/OU-Kou fitted weights |
+| 17v3 | pending | 365/60/60/5, 12 W | — | — | — | — | — | P37+P38 fix (scaled threshold + rolling CV); first run with real MS-GARCH/OU-Kou fitted weights |
 
 Config format: `train_days / test_days / step_days / gap_days`.
 All experiments: QQQ, iron_condor only, TPE sampler seed 42, $100k initial capital.
@@ -1593,6 +1593,8 @@ python scripts/run_integration_test.py \
 
 - **P36 (CV AUROC=None from single-class folds, not model failure)**: In Exp 17, all statistical models (MS-GARCH, OU-Kou-GARCH) returned `cv_auroc=None` for most windows despite converging successfully. Root cause: `_walk_forward_split()` produces 4 folds of ~50 rows each; with an adaptive threshold of 5–8.5% and QQQ's typical in-range rate of 65–75%, early folds can have all-positive labels (no breakouts), making AUROC undefined. The old code silently dropped these folds; with only 1–2 valid folds remaining, the model reported `None` rather than a meaningful score, defaulting to equal prior weight (0.25) instead of earned weight. Fix: single-class folds score 0.5 (no-skill baseline) instead of being discarded. Folds below 10 labelable rows are still skipped (genuine data shortage). Implemented in `GARCHRangeModel._MIN_FOLD_LABELS=10` and all three `cv_score*` methods. Takes effect from Exp 18.
 
+- **P38 (CV AUROC always exactly 0.500 — constant per-fold score can never rank)**: Discovered during E17v3 pre-training monitoring. Both `cv_score_msgarch` and `cv_score_oujump` computed a single scalar `p = model.p_in_range(horizon, threshold)` and applied it identically to all validation days via `np.full(len(y_true), p)`. `roc_auc_score` of a constant predictor is always exactly 0.5 regardless of the label distribution — the model has zero ranking ability by construction. P37's threshold fix and P36's 0.5 scoring were both irrelevant to this deeper problem. Fix: use `roll_msgarch_forecasts()` and `roll_oujump_forecasts()` inside CV to produce per-day probability sequences by stepping the Hamilton filter / AEKF forward through the validation slice. Validated: MS-GARCH CV AUROC 0.471, OU-Kou 0.447 on 300-day GBM (was constant 0.500). Applied in `cv_score_msgarch` and `cv_score_oujump` in [garch_range_predictor.py](src/ait/ml/garch_range_predictor.py). Takes effect from E17v3 relaunch.
+
 - **P37 (CV threshold mismatch causes persistent all-positive folds in Exp 17v2)**: The P36 fix (score 0.5) masked but did not cure the underlying label imbalance. In Exp 17v2, `single_class_folds=4` was logged for **every** window and every statistical model — i.e., 100% of folds were single-class. Root cause: the CV uses a 5-day horizon (`_CV_HORIZON=5`) but the **same threshold** as the 21-day training labels. Over 5 days, QQQ rarely exceeds a 4–6% threshold calibrated for 21-day moves; P(in-range over 5d) ≈ 90–99% at typical thresholds → labels are almost always 1 → single-class. Fix: scale the CV threshold by `√(cv_horizon / full_horizon)` — a 5.5% 21-day threshold becomes 2.7% at 5 days, matching typical 5-day move distributions and producing 45–75% in-range rates per fold (both classes present). Applied to `_train_garch`, `_train_msgarch`, and `_train_oujump` in [range_predictor.py](src/ait/ml/range_predictor.py). Statistical note: this is the same square-root-of-time scaling used by `_adaptive_range_threshold()` — it is not ad hoc. Takes effect from Exp 18.
 
 ### What Changed for Next Experiment (Exp 17)
@@ -1796,7 +1798,9 @@ Pre-training logs confirmed:
 
 Both P36 and P37 are now fixed. This is the first experiment where MS-GARCH and OU-Kou-GARCH can receive non-zero fitted weights based on real CV AUROC discrimination. The pre-training architecture (sequential before Optuna) is unchanged.
 
-**What P37 changes:** `_cv_threshold = self._threshold * sqrt(_CV_HORIZON / self._horizon)`. At typical settings (threshold=5.5%, horizon=21d, cv_horizon=5d): `_cv_threshold = 5.5% * sqrt(5/21) ≈ 2.68%`. At this level, QQQ's typical 5-day moves produce 25–55% in-range rates per fold — both classes present — allowing real AUROC computation. Validated with simulation and unit tests (`TestCVThresholdScaling`).
+**What P37 changes:** `_cv_threshold = self._threshold * sqrt(_CV_HORIZON / self._horizon)`. At typical settings (threshold=5.5%, horizon=21d, cv_horizon=5d): `_cv_threshold = 5.5% * sqrt(5/21) ≈ 2.68%`. Reduces all-positive-label folds.
+
+**What P38 changes (the critical fix):** `cv_score_msgarch` and `cv_score_oujump` now call `roll_msgarch_forecasts()` / `roll_oujump_forecasts()` to produce a per-day P(in range) sequence over each validation fold, instead of a single constant scalar. A constant predictor always scores AUROC=0.5 regardless of labels — this was the root cause of zero fitted weight in all previous attempts. With rolling per-day probabilities, genuine AUROC discrimination is possible. Validated: MS-GARCH 0.471, OU-Kou 0.447 on GBM test data.
 
 ### Setup
 
