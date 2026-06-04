@@ -105,6 +105,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Parallel Optuna workers per walk-forward window (default: 1 = sequential).",
     )
     parser.add_argument(
+        "--wf-val-split", action="store_true", default=False,
+        help="H2: score Optuna objective on held-out 20%% val slice instead of full training window.",
+    )
+    parser.add_argument(
         "--train-days", type=int, default=365,
         help="Walk-forward training window in calendar days (default: 365).",
     )
@@ -580,6 +584,7 @@ async def _section_e_walkforward(
     _patience   = args.wf_patience   if args.wf_patience   is not None else _bc.optimize_patience
     _min_trades = args.wf_min_trades if args.wf_min_trades is not None else _bc.optimize_min_trades
     _n_jobs     = args.wf_n_jobs     if args.wf_n_jobs     is not None else 1
+    _val_split  = args.wf_val_split
 
     print(f"\n{'='*60}")
     print(f"SECTION E — Walk-Forward (optimize_per_window=True, trials={_n_trials}, patience={_patience}, min_trades={_min_trades})")
@@ -596,6 +601,7 @@ async def _section_e_walkforward(
         optimize_min_trades=_min_trades,
         optimize_n_jobs=_n_jobs,
         optimize_seed=args.optuna_seed,
+        optimize_val_split=_val_split,
         initial_capital=_bc.initial_capital,
         position_size_pct=_bc.position_size_pct,
         wing_floor_dollars=_bc.wing_floor_dollars,

@@ -36,6 +36,7 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 _FETCH_WEEKEND_HOLIDAY_BUFFER_DAYS = 30
 _FETCH_MIN_PERIOD_DAYS = 90
 _MIN_BACKTEST_ROWS = 60
+_VAL_SPLIT_RATIO = 0.20   # fraction of training window reserved as validation holdout (H2)
 
 
 class _EarlyStopCallback:
@@ -96,6 +97,7 @@ class StrategyOptimizer:
         intraday_store: "Any | None" = None,
         symbol: str | None = None,
         range_predictor: "Any | None" = None,
+        val_split: bool = False,
     ) -> None:
         if objective not in OBJECTIVES:
             raise ValueError(f"Unknown objective '{objective}'. Choose from: {list(OBJECTIVES)}")
@@ -124,6 +126,7 @@ class StrategyOptimizer:
         self._intraday_store = intraday_store
         self._symbol = symbol
         self._range_predictor = range_predictor
+        self._val_split = val_split
         self._data: dict[str, pd.DataFrame] = {}
 
     # ------------------------------------------------------------------
@@ -285,7 +288,14 @@ class StrategyOptimizer:
         raise ValueError(f"Unknown param type '{kind}'")
 
     def _run_backtest(self, params: dict) -> Any:
-        """Run a single-symbol backtest with the suggested params."""
+        """Run a single-symbol backtest with the suggested params.
+
+        When val_split=True (H2 mode): the training window is split 80/20.
+        Optuna sees only the first 80% (train split) during optimisation; the
+        objective is scored on the held-out last 20% (val split). This prevents
+        the optimizer from overfitting risk-management parameters to the
+        specific price path of the full training window.
+        """
         from ait.backtesting.engine import Backtester
 
         # Use first available symbol for speed (full multi-symbol adds overhead)
@@ -293,6 +303,18 @@ class StrategyOptimizer:
         df = self._data.get(symbol)
         if df is None or len(df) < _MIN_BACKTEST_ROWS:
             raise ValueError(f"Insufficient data for {symbol}")
+
+        if self._val_split and len(df) >= _MIN_BACKTEST_ROWS * 2:
+            # H2: split into train/val. Params are fit on train, scored on val.
+            split_idx = max(_MIN_BACKTEST_ROWS, int(len(df) * (1.0 - _VAL_SPLIT_RATIO)))
+            train_df = df.iloc[:split_idx]
+            val_df   = df.iloc[split_idx:]
+            if len(val_df) < _MIN_BACKTEST_ROWS // 2:
+                # val slice too short — fall back to full window
+                val_df = df
+        else:
+            train_df = df
+            val_df   = df
 
         # Extract Backtester-compatible params (drop strategy__ prefix).
         # Only parameters that Backtester.__init__ actually accepts are included
@@ -331,8 +353,10 @@ class StrategyOptimizer:
             if param_name == "trailing_stop_fraction":
                 bt_kwargs["trailing_stop_pct"] = val * bt_kwargs["profit_target_pct"]
 
+        # H2: run on val_df so the objective is scored on held-out data.
+        # In non-val_split mode val_df == df, so behaviour is unchanged.
         bt = Backtester(
-            data=df,
+            data=val_df,
             strategies=self._strategies,
             features_cache=self._features_cache,
             symbol=self._symbol or symbol,

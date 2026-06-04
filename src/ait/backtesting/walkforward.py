@@ -139,6 +139,7 @@ class WalkForwardConfig:
     spread_dte_sensitivity: float = 0.005 # additional spread per DTE below 21
     spread_cap: float = 0.15              # maximum half-spread per leg ($)
     optimize_n_jobs: int = 1              # parallel walk-forward windows (n_jobs=1 = sequential)
+    optimize_val_split: bool = False      # H2: score Optuna objective on held-out 20% val slice
 
 
 @dataclass
@@ -1360,6 +1361,7 @@ class WalkForwardBacktester:
                     intraday_store=_intraday_store,
                     symbol=symbol,
                     range_predictor=range_predictor,
+                    val_split=self._config.optimize_val_split,
                 )
                 res = opt.run(data={symbol: train_df}, prior_params=warm)
                 all_best_params.update(res.best_params)

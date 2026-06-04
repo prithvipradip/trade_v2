@@ -28,12 +28,10 @@ IRON_CONDOR_SPACE: dict[str, tuple] = {
     #   don't generalise OOS (P8: iv_floor creates train/OOS mismatch). Fixed in config.
     #   spread_* — calibrated from real market data; must stay fixed (removing prevents
     #   Optuna from fighting the calibration and recreating P8-style friction mismatch).
-    "stop_loss_pct":          ("float", 0.30, 0.70),
-    "profit_target_pct":      ("float", 0.30, 0.70),
-    # trailing_stop_fraction: fraction of profit_target_pct — optimizer derives the actual
-    # trailing_stop_pct as trailing_stop_fraction × profit_target_pct. Keeps trailing stop
-    # coherent relative to target rather than as an independent dimension that can cancel it.
-    "trailing_stop_fraction": ("float", 0.30, 0.90),
+    # Exp 18 (H1 test): stop_loss_pct, profit_target_pct, trailing_stop_fraction frozen at
+    #   ablation defaults (0.35, 0.50, 0.70). These are risk-management constants that
+    #   don't vary by market regime — optimising them per window overfit train-path noise.
+    #   Only the 3 regime-specific params + fractal gate remain in the search space (6 total).
     "delta_short":            ("float", 0.15, 0.30),
     # [14, 40]: 60-day OOS windows give a 20-day end buffer (60-40=20), keeping
     # backtest_end exits rare while still allowing meaningful theta harvesting.
