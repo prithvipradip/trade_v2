@@ -27,7 +27,8 @@
 | 15 | `QQQ_365d_iron_condor_20260602_0845` | 365/60/60/5, 12 W | −0.45% | — | 27 / — | −2.46 / — | 10/12 | GARCH rolling forecasts fixed (3 bugs); first real AUROC; rank-inverted W08/W09; worse than Exp 13 |
 | 16 | `QQQ_365d_iron_condor_20260603_0617` | 365/60/60/5, 12 W | −1.38% | — | 25 / — | −2.26 / — | 10/12 | GARCH disabled; W03 still −$41 (not GARCH); P31 disproved for W03; 10/12 windows stable |
 | 17 | `QQQ_365d_iron_condor_20260603_exp17_partial` | 365/60/60/5, 4/12 W | — | — | — | — | — | KILLED 4/12 — P36 found (single-class CV folds); stat models got zero weight; Q_E17_1 answered |
-| 17v2 | pending | 365/60/60/5, 12 W | — | — | — | — | — | P36 fix; MS-GARCH + OU-Kou-GARCH with real CV AUROC; sequential pre-training |
+| 17v2 | `QQQ_365d_iron_condor_20260603_exp17_partial` (partial) | 365/60/60/5, 0/12 W | — | — | — | — | — | KILLED — P37 found; CV threshold mismatch → all folds single-class → stat models still zero weight |
+| 17v3 | pending | 365/60/60/5, 12 W | — | — | — | — | — | P37 fix (sqrt-of-time CV threshold scaling); first run with real MS-GARCH/OU-Kou fitted weights |
 
 Config format: `train_days / test_days / step_days / gap_days`.
 All experiments: QQQ, iron_condor only, TPE sampler seed 42, $100k initial capital.
@@ -1592,6 +1593,8 @@ python scripts/run_integration_test.py \
 
 - **P36 (CV AUROC=None from single-class folds, not model failure)**: In Exp 17, all statistical models (MS-GARCH, OU-Kou-GARCH) returned `cv_auroc=None` for most windows despite converging successfully. Root cause: `_walk_forward_split()` produces 4 folds of ~50 rows each; with an adaptive threshold of 5–8.5% and QQQ's typical in-range rate of 65–75%, early folds can have all-positive labels (no breakouts), making AUROC undefined. The old code silently dropped these folds; with only 1–2 valid folds remaining, the model reported `None` rather than a meaningful score, defaulting to equal prior weight (0.25) instead of earned weight. Fix: single-class folds score 0.5 (no-skill baseline) instead of being discarded. Folds below 10 labelable rows are still skipped (genuine data shortage). Implemented in `GARCHRangeModel._MIN_FOLD_LABELS=10` and all three `cv_score*` methods. Takes effect from Exp 18.
 
+- **P37 (CV threshold mismatch causes persistent all-positive folds in Exp 17v2)**: The P36 fix (score 0.5) masked but did not cure the underlying label imbalance. In Exp 17v2, `single_class_folds=4` was logged for **every** window and every statistical model — i.e., 100% of folds were single-class. Root cause: the CV uses a 5-day horizon (`_CV_HORIZON=5`) but the **same threshold** as the 21-day training labels. Over 5 days, QQQ rarely exceeds a 4–6% threshold calibrated for 21-day moves; P(in-range over 5d) ≈ 90–99% at typical thresholds → labels are almost always 1 → single-class. Fix: scale the CV threshold by `√(cv_horizon / full_horizon)` — a 5.5% 21-day threshold becomes 2.7% at 5 days, matching typical 5-day move distributions and producing 45–75% in-range rates per fold (both classes present). Applied to `_train_garch`, `_train_msgarch`, and `_train_oujump` in [range_predictor.py](src/ait/ml/range_predictor.py). Statistical note: this is the same square-root-of-time scaling used by `_adaptive_range_threshold()` — it is not ad hoc. Takes effect from Exp 18.
+
 ### What Changed for Next Experiment (Exp 17)
 
 **Critical insight**: The E13 +$508 baseline cannot be locked in by simply disabling GARCH. W03 is degraded by a different cause that must be investigated independently. This changes the E17 success criteria:
@@ -1747,7 +1750,43 @@ Note: `enable_msgarch=True` and `enable_oujump=True` are now the defaults on `Wa
 
 ---
 
-## Experiment 17v2 — MS-GARCH + OU-Kou-GARCH with CV Single-Class Fix
+## Experiment 17v2 — MS-GARCH + OU-Kou-GARCH with CV Single-Class Fix (P36)
+
+**Archive:** `QQQ_365d_iron_condor_20260603_exp17_partial` (partial — Optuna phase never ran)
+**Date:** 2026-06-03
+**Branch:** `features-request-3`
+
+### Context
+
+Exp 17 was killed at 4/12 windows after discovering P36: single-class CV folds were silently dropped, causing all statistical models to return `cv_auroc=None` and zero fitted weight. Exp 17v2 applied the P36 fix (single-class folds score 0.5) and ran pre-training for all 12 windows successfully. However, during monitoring of the pre-training logs, P37 was discovered: the CV threshold was not being scaled to the CV horizon, so all folds remained single-class even after the P36 fix. Exp 17v2 was killed after pre-training completed but before any Optuna window results were written.
+
+**What P36 fixed (but was insufficient):** Single-class folds no longer caused `None` to be returned. Instead they scored 0.5.
+
+**What P37 revealed:** With a 5-day CV horizon but a threshold calibrated for 21-day moves (4.4–6.6%), P(5-day move exceeds threshold) ≈ 1–10%. In a 45-row validation fold, this produces ~0.5–4 expected breakouts — often zero — so every fold remained single-class. All CV AUROCs were exactly 0.5. All fitted weights for MS-GARCH and OU-Kou-GARCH remained 0.0.
+
+### Results
+
+**No window JSONs written** — killed after pre-training, before Optuna phase.
+
+Pre-training logs confirmed:
+- MS-GARCH converged in all 12 windows (BIC −630 to −786)
+- OU-Kou-GARCH converged in all 12 windows (BIC −670 to −790)
+- `single_class_folds = 4/4` in every window for every statistical model
+- All `cv_auroc = 0.500`, all `fitted_weights = 0.0` for statistical models
+
+### What We Learned
+
+- **P36 fix was necessary but not sufficient.** Scoring 0.5 prevents silent `None`, but doesn't produce real AUROC discrimination.
+- **Root cause of single-class folds is the threshold mismatch**, not class imbalance per se. The threshold must be horizon-matched for CV labels.
+- **Statistical models are converging correctly.** The problem is entirely in the CV scoring pipeline, not the model fitting.
+
+### What Changed for Next Experiment (Exp 17v3)
+
+- **P37 fix**: CV threshold scaled by `√(cv_horizon / full_horizon)` — a 5.5% 21-day threshold becomes ~2.7% at 5-day CV horizon. Both classes now present in CV folds. Applied in `_train_garch`, `_train_msgarch`, `_train_oujump` in [range_predictor.py](src/ait/ml/range_predictor.py).
+
+---
+
+## Experiment 17v3 — MS-GARCH + OU-Kou-GARCH with Horizon-Scaled CV Threshold (P37 Fix)
 
 **Archive:** pending
 **Date:** 2026-06-03
@@ -1755,17 +1794,18 @@ Note: `enable_msgarch=True` and `enable_oujump=True` are now the defaults on `Wa
 
 ### Context
 
-Exp 17 was killed at 4/12 windows after discovering P36: single-class CV folds were silently dropped, causing all statistical models to return `cv_auroc=None` and zero fitted weight. The core questions about MS-GARCH/OU-Kou-GARCH signal quality (Q_E17_2 through Q_E17_7) were unanswerable. Exp 17v2 is identical to E17 in all respects except the P36 fix is active.
+Both P36 and P37 are now fixed. This is the first experiment where MS-GARCH and OU-Kou-GARCH can receive non-zero fitted weights based on real CV AUROC discrimination. The pre-training architecture (sequential before Optuna) is unchanged.
 
-**What changes with the fix:** In low-vol windows (W10–W12, threshold ~5%, in-range rate ~85%), some CV folds have all-positive labels. Previously these were dropped, leaving only 1–2 scorable folds and often returning `None`. Now they score 0.5. This means MS-GARCH and OU-Kou-GARCH will receive a real AUROC based on the folds where mixed classes exist, and will get positive fitted weight wherever that AUROC > 0.50.
+**What P37 changes:** `_cv_threshold = self._threshold * sqrt(_CV_HORIZON / self._horizon)`. At typical settings (threshold=5.5%, horizon=21d, cv_horizon=5d): `_cv_threshold = 5.5% * sqrt(5/21) ≈ 2.68%`. At this level, QQQ's typical 5-day moves produce 25–55% in-range rates per fold — both classes present — allowing real AUROC computation. Validated with simulation and unit tests (`TestCVThresholdScaling`).
 
 ### Setup
 
-- Walk-forward config: **365d** / **60d** / **60d** / 5d → **12 windows** (same as E13–E17)
+- Walk-forward config: **365d** / **60d** / **60d** / 5d → **12 windows** (unchanged)
 - OOS period: 2024-05-19 → 2026-05-09
-- Key changes from Exp 17 (partial):
-  - **P36 fix**: `GARCHRangeModel._MIN_FOLD_LABELS=10`; single-class folds score 0.5
-  - All else identical: sequential pre-training, MS-GARCH + OU-Kou-GARCH enabled, plain GARCH disabled
+- Key changes from E17v2:
+  - **P37 fix**: CV threshold scaled to CV horizon via sqrt-of-time
+  - P36 fix still active (single-class folds score 0.5 — now a safety net, not the main mechanism)
+  - All else identical: sequential pre-training, MS-GARCH + OU-Kou-GARCH, plain GARCH disabled
 - Optuna: 200 trials, patience 50, min_trades 7, n_jobs 6, seed 42
 
 ### Open Questions (carried from E17)

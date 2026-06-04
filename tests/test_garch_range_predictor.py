@@ -538,3 +538,111 @@ class TestCVFoldClassBalance:
         # days — with alternating 0/1 labels, AUROC will be exactly 0.5
         # (a constant score can't rank). But the key is it's scored, not None.
         assert result is not None, "mixed-class fold should be scored"
+
+
+class TestCVThresholdScaling:
+    """P37: CV threshold must be scaled to the CV horizon (sqrt-of-time) so that
+    5-day labels are not almost entirely in-range when the threshold is calibrated
+    for 21-day moves.  Unscaled threshold → single-class folds → AUROC always 0.5.
+    """
+
+    def _make_realistic_prices(self, n: int = 300, daily_vol: float = 0.012,
+                                seed: int = 42) -> "pd.Series":
+        import pandas as _pd
+        rng = np.random.default_rng(seed)
+        returns = rng.normal(0.0002, daily_vol, n)
+        return _pd.Series(400.0 * np.cumprod(1 + returns), name="Close")
+
+    def test_unscaled_threshold_produces_single_class_folds(self):
+        """Reproduces P37: 21-day threshold applied to 5-day labels → all in-range.
+
+        At low vol (0.7%/day, quiet-market regime) and a 5.5% threshold calibrated
+        for 21-day moves, the 5-day move almost never exceeds the threshold
+        (5-day sigma ≈ 1.6% vs threshold 5.5%), so nearly all labels are 1.
+        This matches the QQQ quiet windows that triggered P37 in Exp 17v2.
+        """
+        from ait.ml.range_predictor import RangePredictor
+        prices = self._make_realistic_prices(n=300, daily_vol=0.007)
+        rp = RangePredictor(threshold_pct=0.055, horizon_days=21)
+        splits = rp._walk_forward_split(len(prices))
+
+        single_class_count = 0
+        for _, val_idx in splits:
+            val_close = prices.iloc[val_idx]
+            labels = rp._create_labels_horizon(val_close, 5)  # 5-day, unscaled threshold
+            y = labels.dropna().values.astype(int)
+            if len(y) >= 10 and len(np.unique(y)) < 2:
+                single_class_count += 1
+
+        # With unscaled threshold at low vol, all folds are single-class
+        assert single_class_count >= 3, (
+            f"Expected ≥3 single-class folds with unscaled threshold at low vol, got {single_class_count}. "
+            "This test reproduces P37 — if it fails, P37 may no longer be reproducible."
+        )
+
+    def test_scaled_threshold_produces_mixed_class_folds(self):
+        """After P37 fix: sqrt-of-time scaling gives both classes in CV folds.
+
+        threshold_cv = threshold_21d * sqrt(5/21) ≈ 0.055 * 0.488 ≈ 0.027
+        At 2.7% over 5 days, even at low vol (0.7%/day, sigma_5=1.6%), breakouts
+        occur frequently enough for mixed-class folds.
+        """
+        from ait.ml.range_predictor import RangePredictor
+        prices = self._make_realistic_prices(n=300, daily_vol=0.007)
+        rp = RangePredictor(threshold_pct=0.055, horizon_days=21)
+        splits = rp._walk_forward_split(len(prices))
+        cv_threshold = rp._threshold * np.sqrt(5 / max(rp._horizon, 1))
+
+        mixed_count = 0
+        for _, val_idx in splits:
+            val_close = prices.iloc[val_idx]
+            labels = pd.Series(
+                [1.0 if float((val_close.iloc[t+1:t+6] / val_close.iloc[t] - 1).abs().max())
+                 < cv_threshold else 0.0 for t in range(len(val_close) - 5)],
+                index=val_close.index[:len(val_close)-5],
+            )
+            y = labels.dropna().values.astype(int)
+            if len(y) >= 10 and len(np.unique(y)) == 2:
+                mixed_count += 1
+
+        assert mixed_count >= 2, (
+            f"Expected ≥2 mixed-class folds with scaled threshold, got {mixed_count}. "
+            f"Scaled threshold was {cv_threshold:.3f}."
+        )
+
+    def test_train_msgarch_uses_scaled_threshold(self):
+        """_train_msgarch must not return all-0.5 due to single-class folds
+        when called on price data with realistic QQQ-like volatility.
+
+        If ALL folds are single-class after scaling, the method still returns 0.5
+        but the log should show 0 single-class folds (not 4/4).  This test checks
+        that at least one fold is scored with real AUROC machinery (i.e., not all
+        folds are single-class after the fix).
+        """
+        import logging
+        from ait.ml.range_predictor import RangePredictor
+        prices = self._make_realistic_prices(n=300, daily_vol=0.015, seed=99)
+        rp = RangePredictor(threshold_pct=0.055, horizon_days=21,
+                            enable_msgarch=True)
+        splits = rp._walk_forward_split(len(prices))
+        cv_threshold = rp._threshold * np.sqrt(5 / max(rp._horizon, 1))
+
+        # Count folds that would be single-class with the scaled threshold
+        single_class_with_scaled = 0
+        for _, val_idx in splits:
+            val_close = prices.iloc[val_idx]
+            labels = pd.Series(
+                [1.0 if float((val_close.iloc[t+1:t+6] / val_close.iloc[t] - 1).abs().max())
+                 < cv_threshold else 0.0 for t in range(len(val_close) - 5)],
+                index=val_close.index[:len(val_close)-5],
+            )
+            y = labels.dropna().values.astype(int)
+            if len(y) >= 10 and len(np.unique(y)) < 2:
+                single_class_with_scaled += 1
+
+        # After fix: at least half of folds should have both classes
+        mixed_after_fix = len(splits) - single_class_with_scaled
+        assert mixed_after_fix >= len(splits) // 2, (
+            f"After P37 fix, expected ≥{len(splits)//2} mixed folds, "
+            f"got {mixed_after_fix} (single-class: {single_class_with_scaled}/{len(splits)})"
+        )

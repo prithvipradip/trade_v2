@@ -324,12 +324,18 @@ class RangePredictor:
         # validation days (±5% over 5d: quiet ~0.95, shock day ~0.30 → 3× spread
         # vs 21d: quiet ~0.85, shock ~0.50 → too narrow for AUROC to discriminate).
         # The full-horizon fit below still uses self._horizon (21d) for OOS prediction.
+        #
+        # Threshold scaled to the CV horizon via sqrt-of-time: a 5% threshold over
+        # 21 days corresponds to ~2.4% over 5 days. Using the full 21d threshold
+        # with a 5d horizon makes almost every day "in range" → all-positive folds
+        # → AUROC undefined (P36). Scale by sqrt(cv_h / full_h) to match.
         _CV_HORIZON = 5
+        _cv_threshold = self._threshold * np.sqrt(_CV_HORIZON / max(self._horizon, 1))
         _cv_labels_fn = lambda c: self._create_labels_horizon(c, _CV_HORIZON)
         acc = garch.cv_score(
             close=close,
             horizon_days=_CV_HORIZON,
-            threshold_pct=self._threshold,
+            threshold_pct=_cv_threshold,
             splits=splits,
             create_labels_fn=_cv_labels_fn,
         )
@@ -378,11 +384,12 @@ class RangePredictor:
         splits = self._walk_forward_split(len(close))
 
         _CV_HORIZON = 5
+        _cv_threshold = self._threshold * np.sqrt(_CV_HORIZON / max(self._horizon, 1))
         _cv_labels_fn = lambda c: self._create_labels_horizon(c, _CV_HORIZON)
         acc = garch.cv_score_msgarch(
             close=close,
             horizon_days=_CV_HORIZON,
-            threshold_pct=self._threshold,
+            threshold_pct=_cv_threshold,
             splits=splits,
             create_labels_fn=_cv_labels_fn,
         )
@@ -428,11 +435,12 @@ class RangePredictor:
         splits = self._walk_forward_split(len(close))
 
         _CV_HORIZON = 5
+        _cv_threshold = self._threshold * np.sqrt(_CV_HORIZON / max(self._horizon, 1))
         _cv_labels_fn = lambda c: self._create_labels_horizon(c, _CV_HORIZON)
         acc = garch.cv_score_oujump(
             close=close,
             horizon_days=_CV_HORIZON,
-            threshold_pct=self._threshold,
+            threshold_pct=_cv_threshold,
             splits=splits,
             create_labels_fn=_cv_labels_fn,
         )
