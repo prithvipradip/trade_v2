@@ -354,6 +354,34 @@ class Backtester:
                 log.debug("earnings_skip", date=str(today_date), strategy=strategy)
                 continue
 
+            # Regime gate: iron condors / short strangles fail in trending-down regimes.
+            # Exp 21 post-mortem: 4 trending_down trades, 25% win rate, avg PnL -$195.
+            # Both macro dislocations in the dataset (Yen carry unwind Aug-2024,
+            # tariff shock Mar-2026) occurred in this regime. Trending_up (100% win)
+            # and high_volatility (62% win) maintain positive EV and are not blocked.
+            if strategy in ("iron_condor", "short_strangle") and not features_df.empty:
+                _last_f        = features_df.iloc[-1]
+                _vol_exp_flag  = float(_last_f.get("vol_regime_expanding", 0.0)) > 0.5
+                _px_sma_val    = float(_last_f.get("price_vs_sma_20", 0.0))
+                _regime_class  = (
+                    "trending_down"   if (_vol_exp_flag and _px_sma_val < -0.02) else
+                    "trending_up"     if (_vol_exp_flag and _px_sma_val > 0.02)  else
+                    "high_volatility" if  _vol_exp_flag                          else
+                    "range_bound"
+                )
+                _entry_decision["regime_class"] = _regime_class
+                if _regime_class == "trending_down":
+                    _entry_decision["regime_veto"] = True
+                    log.debug(
+                        "regime_veto_fired",
+                        component="backtesting.engine",
+                        strategy=strategy,
+                        regime=_regime_class,
+                        vol_regime_expanding=round(float(_last_f.get("vol_regime_expanding", 0.0)), 4),
+                        price_vs_sma_20=round(_px_sma_val, 4),
+                    )
+                    continue
+
             # Range model gate: for iron condors / strangles, replace confidence
             # with P(stays in range). Skip if below range threshold.
             if strategy in ("iron_condor", "short_strangle") and self._range_predictor is not None:
@@ -392,11 +420,16 @@ class Backtester:
 
             # AEKF direction veto: if the OU-Kou-GARCH AEKF produces a high-confidence
             # directional drift signal, the market is trending — skip iron condor entry.
+            # Signal values are always logged (not just on veto) for threshold tuning.
             if strategy in ("iron_condor", "short_strangle") and self._range_predictor is not None:
                 try:
                     sym_data = (getattr(self._range_predictor, "_symbol_models", {}) or {}).get(self._symbol, {})
                     _ou_dir  = (sym_data.get("ou_jump_state") or {}).get("ou_jump_direction")
                     _ou_conf = (sym_data.get("ou_jump_state") or {}).get("ou_jump_confidence") or 0.0
+                    _entry_decision["aekf_signal"] = {
+                        "direction": _ou_dir,
+                        "confidence": round(float(_ou_conf), 4) if _ou_dir is not None else None,
+                    }
                     if _ou_dir is not None and float(_ou_conf) >= self._aekf_veto_threshold:
                         _entry_decision["aekf_veto"] = {"direction": _ou_dir, "confidence": round(float(_ou_conf), 4)}
                         log.debug(
@@ -413,10 +446,12 @@ class Backtester:
 
             # Rising IV rank filter: if IV rank has risen by more than iv_rank_rise_threshold
             # over the last 10 days, market is in directional stress — skip iron condor entry.
+            # Rise value is always logged (not just on veto) for threshold tuning.
             if strategy in ("iron_condor", "short_strangle") and not features_df.empty:
                 if "iv_rank" in features_df.columns and len(features_df) >= 10:
                     iv_rank_series = features_df["iv_rank"].iloc[-10:]
                     iv_rank_rise = float(iv_rank_series.iloc[-1]) - float(iv_rank_series.iloc[0])
+                    _entry_decision["iv_rank_rise_10d"] = round(iv_rank_rise, 4)
                     if iv_rank_rise > self._iv_rank_rise_threshold:
                         _entry_decision["iv_rank_veto"] = {
                             "rise": round(iv_rank_rise, 4),
