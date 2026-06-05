@@ -260,9 +260,9 @@ class DirectionPredictor:
             self._model_version = f"v-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
             self._cv_scores = accuracies
 
-            # Fit ensemble weights from per-model CV edge over 1/3 baseline.
-            # DirectionPredictor is a 3-class classifier, so random baseline = 33.3%.
-            _baseline = 1.0 / 3.0
+            # Fit ensemble weights from per-model CV edge over 0.5 AUROC baseline.
+            # AUROC random baseline = 0.5 (one-vs-rest, any number of classes).
+            _baseline = 0.5
             _edges = {m: max(0.0, acc - _baseline) for m, acc in accuracies.items()}
             _total = sum(_edges.values())
             fitted_weights = (
@@ -531,14 +531,21 @@ class DirectionPredictor:
                 )
                 sw = self._compute_sample_weights(y[train_idx])
                 model.fit(X_train, y[train_idx], sample_weight=sw)
-                score = model.score(X_val, y[val_idx])
+                # AUROC (one-vs-rest) is immune to class imbalance; raw accuracy
+                # on imbalanced folds produces sub-random scores (< 1/3 baseline).
+                try:
+                    from sklearn.metrics import roc_auc_score
+                    proba = model.predict_proba(X_val)
+                    score = roc_auc_score(y[val_idx], proba, multi_class="ovr", average="macro")
+                except Exception:
+                    score = model.score(X_val, y[val_idx])
                 scores.append(score)
 
             # Final model stored (will be refit on fully-scaled data after CV)
             self._models["xgboost"] = model
 
             avg_acc = float(np.mean(scores))
-            log.info("xgboost_trained", cv_accuracy=f"{avg_acc:.3f}", folds=len(scores))
+            log.info("xgboost_trained", cv_auroc=f"{avg_acc:.3f}", folds=len(scores))
             return avg_acc
 
         except ImportError:
@@ -583,14 +590,21 @@ class DirectionPredictor:
                     columns=self._feature_names,
                 )
                 model.fit(X_train, y[train_idx])
-                score = model.score(X_val, y[val_idx])
+                # AUROC (one-vs-rest) is immune to class imbalance; raw accuracy
+                # on imbalanced folds produces sub-random scores (< 1/3 baseline).
+                try:
+                    from sklearn.metrics import roc_auc_score
+                    proba = model.predict_proba(X_val)
+                    score = roc_auc_score(y[val_idx], proba, multi_class="ovr", average="macro")
+                except Exception:
+                    score = model.score(X_val, y[val_idx])
                 scores.append(score)
 
             # Final model stored (will be refit on fully-scaled data after CV)
             self._models["lightgbm"] = model
 
             avg_acc = float(np.mean(scores))
-            log.info("lightgbm_trained", cv_accuracy=f"{avg_acc:.3f}", folds=len(scores))
+            log.info("lightgbm_trained", cv_auroc=f"{avg_acc:.3f}", folds=len(scores))
             return avg_acc
 
         except ImportError:

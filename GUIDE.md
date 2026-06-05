@@ -943,7 +943,33 @@ The `Watchdog` runs inside the bot process and monitors:
 - **API response times** — flags latency spikes
 - **Error rates** — alerts if > 10 errors occur in a window
 
-### Dashboard
+### Walk-Forward Analysis Dashboard
+
+A standalone React dashboard for post-experiment analysis. No build step — served directly from the filesystem.
+
+**Run after each walk-forward experiment:**
+```bash
+# 1. Export real data (reads reports/runs/, writes wf_data.js)
+python -m ait.dashboard.walkforward.export --runs-dir reports/runs
+
+# 2. Serve (run from the walkforward/ directory)
+cd src/ait/dashboard/walkforward
+python -m http.server 8080
+```
+Open **http://localhost:8080** (use `Cmd+Shift+R` after re-exporting to bust the browser cache).
+
+**Three tabs:**
+| Tab | What it shows |
+|---|---|
+| Experiment Analysis | Candlestick chart + feature sub-panes + trade table with cross-linking; click any trade to open the decision-chain drawer (direction → range gate → vol gate → meta-label → fractal gate) with iron condor legs and features at entry |
+| Optuna Optimization | Per-window trial history, objective scatter, parameter-vs-objective, best params, pruned-trial count and stop reason |
+| Predictor Models | Per-member CV skill across windows (grouped bars), fitted-weight evolution, reliability/calibration curves with member toggles, GARCH-family detail (MS-GARCH regimes, OU-Kou-GARCH drift) |
+
+**Data-plot dictionary:** All info-box definitions live in `src/ait/dashboard/walkforward/metric-info.js` (`window.PM_INFO`). Edit there to update wording — the JSX never needs changing.
+
+**Experiment dropdown:** All experiments found in `reports/runs/` appear in the dropdown. The dashboard defaults to the most recently run experiment with enriched data.
+
+### Streamlit Live Dashboard
 
 The Streamlit dashboard at `http://localhost:8501` shows:
 - Current open positions (entry price, current P&L, HWM, Greeks)

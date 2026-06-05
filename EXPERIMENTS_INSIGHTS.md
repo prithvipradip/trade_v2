@@ -4,6 +4,8 @@
 
 > **How to add an entry:** Copy the template at the bottom of this file, fill it in, and append it as the next numbered section. Update the Principles Distilled section if the experiment reinforced or invalidated anything there. Commit the experiment's `reports/runs/{run_id}/` archive to the `data/experiment-archives` branch — not to the feature PR (see GUIDE.md → "Committing experiment archives").
 
+> **Visualise any experiment:** After running, export with `python -m ait.dashboard.walkforward.export --runs-dir reports/runs` and open `http://localhost:8080` (see GUIDE.md → "Walk-Forward Analysis Dashboard"). Experiments from Exp 10 onward have full enrichment: trade drawer with decision chain + legs + features at entry, Optuna trial history, and Predictor Models tab (CV skill, calibration, GARCH detail).
+
 ---
 
 ## Summary Table
@@ -30,7 +32,7 @@
 | 17v2 | `QQQ_365d_iron_condor_20260603_exp17_partial` (partial) | 365/60/60/5, 0/12 W | — | — | — | — | — | KILLED — P37 found; CV threshold mismatch → all folds single-class → stat models still zero weight |
 | 17v3 | `QQQ_365d_iron_condor_20260604_0826` | 365/60/60/5, 12 W | −0.96% / −$962 | +2.35% / +$2,382 | 26 / 51 | −2.03 / 1.61 | 10/12 | P37+P38 fix confirmed; W02 first window with non-zero stat weights (ms=0.7, ou=0.3); AEKF direction AUROC strong |
 | 18 | `QQQ_365d_iron_condor_20260604_1641` | 365/60/60/5, 12 W | +1.67% / +$1,670 | +2.35% / +$2,382 | 28 / 51 | **+3.14** / 1.61 | 11/12 | **H1 confirmed**: 6-param space; optimized beats ablation on Sharpe for first time (3.14 vs 1.61) |
-| 19 | pending | 365/60/60/5, 12 W | — | — | — | — | — | **H2 test**: train/val split inside Optuna objective (80/20); isolates in-sample overfitting |
+| 19 | `QQQ_365d_iron_condor_20260604_2147` | 365/60/60/5, 12 W | +2.61% / +$2,610 | — | 40 | 2.94 | 11/12 | **H2 rejected**: val-split degraded vs Exp 18 (Sharpe 2.94 vs 3.14); W10 0-trade from 335.65 overfitted val-slice |
 | 20 | pending | 365/60/60/5, 12 W | — | — | — | — | — | **Signal quality**: AEKF entry veto + fractal hard-veto + DirectionPredictor CV→AUROC + rising IV filter |
 
 Config format: `train_days / test_days / step_days / gap_days`.
@@ -390,6 +392,10 @@ These are standing conclusions drawn from the experiments above. Review and upda
 **Evidence:** Exp 7 (14d step / 42d test, 24 windows, 67% overlap) and Exp 8 (30d step / 30d test, 12 windows, 0% overlap) both show zero trades across Sep 2025–May 2026. Identical dead zone under two structurally different window designs rules out OOS overlap as an explanation.
 **Why:** The training period for windows covering this OOS spans the Aug–Dec 2025 high-vol selloff. Optuna cannot find an iron condor config with ≥7 profitable trades in training when realized vol exceeds the max_entry_vol gate (~80%). No config → no OOS trades.
 **Rule:** The dead zone will persist in any experiment that uses Aug–Dec 2025 as a training window. Only architectural changes (Exp 9: remove direction gate, derive range threshold from wing geometry) can potentially reactivate it.
+
+### P21 — Val-slice holdout requires sufficient trade density to give the optimizer a reliable signal
+**Evidence:** Exp 19 (H2). A 20% holdout of a 365-day training window yields ~52 bars. At the iron condor's observed frequency of 2–7 trades per 60-day OOS window, a 52-bar val slice produces only 1–3 trades in expectation. One lucky trade → Sharpe >100 in val slice (W10: 335.65); one unlucky trade → negative objective (W4: −0.16). The optimizer cannot distinguish genuine parameter quality from val-slice luck.
+**Rule:** Do not use a holdout val split inside the Optuna objective unless the val slice is expected to contain ≥15 trades. For the current iron condor frequency, this requires either >1,000-day training windows or a higher-frequency strategy. At 365d/6-param iron condor, the full training window is the correct Optuna objective surface.
 
 ### P20 — Longer training window shifts the range model's probability calibration adversarially for low-vol regimes
 **Evidence:** Exp 11 (730d training) de-activated W01, W02, W09 — all active in Exp 10 (365d). These windows cover Summer 2025 (low-vol, range-bound QQQ). With 730d of training data including the Aug–Dec 2024 high-vol selloff, the range model learned a more conservative probability distribution for "stays in range." Confidence scores that crossed the entry threshold with 365d training no longer did with 730d training, blocking otherwise profitable entries.
@@ -2051,7 +2057,7 @@ python scripts/run_integration_test.py \
 
 ## Experiment 19 — Train/Val Split Inside Optuna Objective (H2 Test)
 
-**Archive:** pending
+**Archive:** `QQQ_365d_iron_condor_20260604_2147`
 **Date:** 2026-06-04
 **Git branch:** `features-request-3`
 
@@ -2105,25 +2111,102 @@ python scripts/run_integration_test.py \
   > logs/exp19_stdout.log 2>&1
 ```
 
-### Results — pending
+### Results
 
-### Observations — pending
+| Metric | Value |
+|--------|-------|
+| Total return | +2.61% (+$2,610) |
+| Cash-drag adj. return | +12.24% |
+| Total trades | 40 |
+| Win rate | 55.00% |
+| Sharpe ratio | 2.94 |
+| Sortino ratio | 8.91 |
+| Max drawdown | 1.62% |
+| Profit factor | 1.58 |
+| Win/loss ratio | 1.29 |
+| Avg win / avg loss | $324.61 / $251.73 |
+| Expectancy/trade | $65.26 |
+| Best / worst trade | +$801.83 / −$541.19 |
+| Capital utilization | 2.3% |
+| RAROC | 112.3% |
+| Profitable windows | 64% (7/11 active) |
+| Active windows | **11 / 12** |
 
-### What We Learned — pending
+Per-window detail:
 
-### What Changed for Next Experiment — pending
+| Window | PnL | Trades | Notes |
+|--------|-----|--------|-------|
+| W1 | −$451.50 | 7 | Loss |
+| W2 | −$768.52 | 5 | Loss |
+| W3 | +$223.81 | 3 | Win |
+| W4 | +$442.53 | 1 | Win |
+| W5 | +$785.59 | 4 | Win |
+| W6 | −$252.60 | 1 | Loss |
+| W7 | +$1,168.42 | 5 | Win |
+| W8 | +$210.89 | 6 | Win |
+| W9 | +$408.00 | 2 | Win |
+| W10 | $0.00 | 0 | **INACTIVE** — overfitted val-slice params (best_value=335.65) produced 0 OOS entries |
+| W11 | +$1,571.32 | 3 | Win |
+| W12 | −$727.64 | 3 | Loss |
+
+**Comparison vs Exp 18 (baseline):**
+
+| Metric | Exp 19 (H2) | Exp 18 (H1) | Δ |
+|--------|------------|------------|---|
+| Sharpe | 2.94 | 3.14 | −0.20 |
+| Total return | +2.61% | +1.67% | +0.94% |
+| Max drawdown | 1.62% | 0.89% | +0.73% |
+| Profit factor | 1.58 | 1.77 | −0.19 |
+| Trades | 40 | 28 | +12 |
+| Profitable windows | 64% | 75% | −11% |
+| Active windows | 11/12 | 11/12 | = |
+
+**Notable val-slice Optuna objectives (confirmed from log):**
+- W10: 335.65 → 0 OOS trades (extreme overfitting)
+- W8: 19.61 → 6 OOS trades, +$211 (held up in OOS)
+- W2: 1.60 → 5 OOS trades, −$769 (did not generalise)
+- W6: 1.60 (ran full 200 trials, no early stop) → 1 OOS trade, −$253
+
+### Observations
+
+- **H2 hypothesis rejected.** The val-split made things marginally worse, not better. Sharpe dropped from 3.14 to 2.94, max drawdown increased from 0.89% to 1.62%, and profitable window rate dropped from 75% to 64%.
+- **W10 is the clearest evidence against H2.** A val-slice best_value of 335.65 is only achievable with 1–2 lucky large-premium trades in a 52-bar window. Those params are so specific to that small price path that they produce 0 OOS trades — the definition of overfit. The 52-bar val slice is too small to give the optimizer a reliable signal.
+- **The feature warmup fix was correct and necessary.** After the initial H2 implementation was killed and fixed (eval_start_date approach), `features_computed rows` were 96–129 (full warmup) in OOS, not 32–60. The fix itself was valid engineering; the problem is the hypothesis, not the implementation.
+- **More trades (40 vs 28) but lower quality.** The val-split constraint caused Optuna to find params that happen to have more trades in the 52-bar val slice, but those params don't reliably select higher-quality OOS entries.
+- **W6 early-stop never triggered (full 200 trials).** The val-slice signal was so noisy that patience=50 never detected a stable best — the optimizer could not converge, another sign that 52 bars is insufficient training signal.
+
+### What We Learned
+
+- **P21 — Val slices must be large enough to contain a reliable distribution of trade outcomes.** A 52-bar val slice (~10 weeks) supports only 1–3 complete iron condor cycles. A single lucky trade produces Sharpe >100 in sample; a single unlucky trade sends the objective negative. The optimizer has nothing reliable to maximise. Rule: val slice must contain ≥15 trades in expectation for the current strategy frequency — requiring ~5–8× more data per slice than we have at 365d training.
+- **The 6-param fix in Exp 18 was already the correct architectural improvement.** Reducing from 9 to 6 params removed the risk-management parameters that were absorbing overfitting pressure. H2 was testing whether residual overfitting remained in the 6-param fit — the answer is: not meaningfully. The small positive return gap vs ablation is within noise at this sample size.
+- **H2 is a valid technique in the right conditions** (large data, high-frequency strategies where 20% = hundreds of trades). For a strategy that trades 2–7 times per 52-bar window, it introduces more noise than it removes.
+- **`--wf-val-split` flag retained in codebase** but not used by default (`val_split=False`). Future high-frequency or multi-symbol expansions may benefit from it.
+
+### What Changed for Next Experiment (Exp 20)
+
+- `--wf-val-split` flag **not passed** — val split disabled, back to full 365d training window for Optuna (identical to Exp 18/Exp 16)
+- All four Exp 20 signal quality changes implemented (see Experiment 20 section): AEKF entry veto, fractal hard-veto, DirectionPredictor CV→AUROC, rising IV rank filter
 
 ---
 
-## Experiment 20 — Signal Quality: AEKF Gate + Fractal Hard-Veto + Direction CV Fix (Planned)
+## Experiment 20 — Signal Quality: AEKF Gate + Fractal Hard-Veto + Direction CV Fix
 
 **Archive:** pending
-**Date:** pending (after Exp 19 completes)
+**Date:** pending (running)
 **Git branch:** `features-request-3`
 
 ### Context
 
-Three independent signal quality problems were identified from analysis of Exp 18 window JSONs. All three touch the same entry decision chain in `engine.py` and are bundled into one experiment so their combined effect can be measured cleanly against the Exp 19 baseline.
+Three independent signal quality problems were identified from analysis of Exp 18 window JSONs. All three touch the same entry decision chain in `engine.py` and are bundled into one experiment so their combined effect can be measured cleanly against the Exp 19 baseline (Sharpe 2.94).
+
+### Implementation Status (2026-06-04)
+
+All 4 changes implemented and wired. Two bugs caught and fixed before launch:
+
+1. **Hard veto floor** (`engine.py:272`): veto threshold is now `max(hurst_regime_threshold, 0.20) × 1.5`, so Optuna can't accidentally collapse it below 0.30 regardless of what threshold value it explores during optimization.
+2. **IV rank threshold** (`engine.py:72`): raised default from 0.20 → 0.30 so only genuinely escalating vol environments (e.g. tariff-shock severity) trigger the filter, not routine market noise.
+
+**Files changed:** `src/ait/backtesting/engine.py`, `src/ait/ml/ensemble.py`, `src/ait/backtesting/walkforward.py` (config fields + OOS Backtester wiring)
 
 ---
 
@@ -2181,7 +2264,7 @@ The AEKF's OOS direction AUROC (0.87–1.0) proves the direction *signal* is pre
 
 **Problem:** W12 trades 2 and 3 had escalating IV rank (0.47 → 0.68 → 0.82). Rising IV rank during a downtrend is a sign of persistent directional stress, not a vol-selling opportunity. The vol gate only has a hard ceiling (`max_entry_vol_annual=0.80`); it doesn't detect the *trend* in IV rank.
 
-**Fix:** Add an IV rank trend check to the iron condor entry path. If IV rank has increased by more than `iv_rank_rise_threshold` (proposed: 0.20) over the last 3 trade entries (or last 10 days), suppress new iron condor entries. This is a lightweight filter — it only fires when IV is both elevated and rising, which is the signature of a trending sell-off.
+**Fix:** Add an IV rank trend check to the iron condor entry path. If IV rank has increased by more than `iv_rank_rise_threshold` (0.30 after pre-launch correction from 0.20) over the last 10 days, suppress new iron condor entries. This is a lightweight filter — it only fires when IV is both elevated and rising, which is the signature of a trending sell-off.
 
 **Files:** `src/ait/backtesting/engine.py`
 
@@ -2189,10 +2272,10 @@ The AEKF's OOS direction AUROC (0.87–1.0) proves the direction *signal* is pre
 
 ### Dependencies and Sequencing
 
-- Changes 1–4 are independent of each other and can be implemented in parallel.
-- All four require Exp 19 results first to establish the correct baseline Sharpe to measure against.
+- Changes 1–4 are independent of each other and were implemented in parallel.
+- Baseline is Exp 19 (Sharpe 2.94); Exp 18 (Sharpe 3.14) is the secondary reference for max drawdown comparison.
 - Change 3 (DirectionPredictor CV fix) may interact with fitted weights in range predictor — if direction CV scores improve, the ensemble weighting could shift, slightly changing range gate probabilities. This is expected and desirable.
-- The `hurst_hard_veto_multiplier` (Change 2) and `AEKF_VETO_THRESHOLD` (Change 1) should be surfaced as config params (not hardcoded) so they can be tuned in a follow-up experiment if needed.
+- `hurst_hard_veto_multiplier`, `aekf_veto_threshold`, and `iv_rank_rise_threshold` are all surfaced as `WalkForwardConfig` fields, passable via YAML, so they can be tuned in a follow-up experiment if needed.
 
 ### Prediction
 
@@ -2254,4 +2337,4 @@ Copy this section to add a new experiment:
 
 ---
 
-*Last updated: 2026-06-04 (Exp 18 archived; Exp 19 running; Exp 20 planned)*
+*Last updated: 2026-06-04 (Exp 19 complete — H2 rejected; Exp 20 implemented and running)*

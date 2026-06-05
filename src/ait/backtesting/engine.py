@@ -66,7 +66,10 @@ class Backtester:
         skew_factor: float = 1.0,
         hurst_regime_threshold: float = 0.20,
         hurst_regime_penalty: float = 0.10,
+        hurst_hard_veto_multiplier: float = 1.5,
         multifractal_max_width: float = 0.50,
+        aekf_veto_threshold: float = 0.60,
+        iv_rank_rise_threshold: float = 0.30,
         features_cache: pd.DataFrame | None = None,
         max_concurrent_positions: int = 1,
         max_entry_vol_annual: float = 0.80,
@@ -120,7 +123,10 @@ class Backtester:
         self._skew_factor = skew_factor
         self._hurst_regime_threshold = hurst_regime_threshold
         self._hurst_regime_penalty = hurst_regime_penalty
+        self._hurst_hard_veto_multiplier = hurst_hard_veto_multiplier
         self._multifractal_max_width = multifractal_max_width
+        self._aekf_veto_threshold = aekf_veto_threshold
+        self._iv_rank_rise_threshold = iv_rank_rise_threshold
         self._features_cache = features_cache
         self._max_concurrent_positions = max_concurrent_positions
         self._max_entry_vol_annual = max_entry_vol_annual
@@ -258,6 +264,16 @@ class Backtester:
                     "pass": _hurst_pass,
                 }
                 if spread > self._hurst_regime_threshold and self._hurst_regime_threshold > 0:
+                    # Hard veto for iron condors / strangles when spread is clearly
+                    # trending (not borderline): skip entry entirely.
+                    # Floor at 0.20 so a low Optuna-optimized threshold can't make
+                    # the veto fire on nearly every bar.
+                    _neutral_strat = bool(set(self._strategies) & {"iron_condor", "short_strangle"})
+                    _veto_base = max(self._hurst_regime_threshold, 0.20)
+                    _hard_veto_threshold = _veto_base * self._hurst_hard_veto_multiplier
+                    if _neutral_strat and self._hurst_hard_veto_multiplier > 0 and spread > _hard_veto_threshold:
+                        _entry_decision["fractal_gate"]["hard_veto"] = True
+                        continue
                     penalty = self._hurst_regime_penalty * (
                         spread / self._hurst_regime_threshold
                     )
@@ -363,6 +379,32 @@ class Backtester:
                             vol_10d=f"{vol_10d:.2%}",
                             max_vol=f"{self._max_entry_vol_annual:.2%}",
                         )
+                        continue
+
+            # AEKF direction veto: if the OU-Kou-GARCH AEKF produces a high-confidence
+            # directional drift signal, the market is trending — skip iron condor entry.
+            if strategy in ("iron_condor", "short_strangle") and self._range_predictor is not None:
+                try:
+                    sym_data = (getattr(self._range_predictor, "_symbol_models", {}) or {}).get(self._symbol, {})
+                    _ou_dir  = (sym_data.get("ou_jump_state") or {}).get("ou_jump_direction")
+                    _ou_conf = (sym_data.get("ou_jump_state") or {}).get("ou_jump_confidence") or 0.0
+                    if _ou_dir is not None and float(_ou_conf) >= self._aekf_veto_threshold:
+                        _entry_decision["aekf_veto"] = {"direction": _ou_dir, "confidence": round(float(_ou_conf), 4)}
+                        continue
+                except Exception:
+                    pass
+
+            # Rising IV rank filter: if IV rank has risen by more than iv_rank_rise_threshold
+            # over the last 10 days, market is in directional stress — skip iron condor entry.
+            if strategy in ("iron_condor", "short_strangle") and not features_df.empty:
+                if "iv_rank" in features_df.columns and len(features_df) >= 10:
+                    iv_rank_series = features_df["iv_rank"].iloc[-10:]
+                    iv_rank_rise = float(iv_rank_series.iloc[-1]) - float(iv_rank_series.iloc[0])
+                    if iv_rank_rise > self._iv_rank_rise_threshold:
+                        _entry_decision["iv_rank_veto"] = {
+                            "rise": round(iv_rank_rise, 4),
+                            "threshold": self._iv_rank_rise_threshold,
+                        }
                         continue
 
             # --- 3. Build the trade ---

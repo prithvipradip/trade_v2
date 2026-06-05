@@ -127,7 +127,10 @@ class WalkForwardConfig:
     range_threshold_pct: float = 0.05  # Target move % for range model; links to strategy profitability
     hurst_regime_threshold: float = 0.20
     hurst_regime_penalty: float = 0.10
+    hurst_hard_veto_multiplier: float = 1.5   # Exp 20: fractal hard-veto; floor ensures veto >= max(threshold,0.20)*1.5
     multifractal_max_width: float = 0.50
+    aekf_veto_threshold: float = 0.60         # Exp 20: suppress IC entry when AEKF drift confidence >= this
+    iv_rank_rise_threshold: float = 0.30      # Exp 20: suppress IC entry when IV rank rose > this over last 10 days
     # Intraday execution params (Fix 1 / Gap H)
     scan_interval_minutes: int = 60        # how often to scan for signals during a session
     entry_window_start_et: str = "09:30"   # earliest allowed entry time (ET)
@@ -951,6 +954,7 @@ class WalkForwardBacktester:
                     "threshold_pct":   round(_range_threshold, 4),
                     "fitted_weights":  dict(range_predictor.fitted_weights),
                     "cv_scores":       dict(rp_sym.get("cv_scores", {})),
+                    "in_range_rate":   rp_sym.get("in_range_rate"),
                     # GARCH metadata
                     "garch_selected_variant":   rp_sym.get("garch_variant"),
                     "garch_selected_dist":      rp_sym.get("garch_dist"),
@@ -1090,7 +1094,10 @@ class WalkForwardBacktester:
                 range_min_confidence=_oos_range_min_conf,
                 hurst_regime_threshold=getattr(window_cfg, "hurst_regime_threshold", 0.20),
                 hurst_regime_penalty=getattr(window_cfg, "hurst_regime_penalty", 0.10),
+                hurst_hard_veto_multiplier=getattr(window_cfg, "hurst_hard_veto_multiplier", 1.5),
                 multifractal_max_width=getattr(window_cfg, "multifractal_max_width", 0.50),
+                aekf_veto_threshold=getattr(window_cfg, "aekf_veto_threshold", 0.60),
+                iv_rank_rise_threshold=getattr(window_cfg, "iv_rank_rise_threshold", 0.30),
                 iv_floor=window_cfg.iv_floor,
                 wing_floor_dollars=window_cfg.wing_floor_dollars,
                 wing_k=window_cfg.wing_k,
