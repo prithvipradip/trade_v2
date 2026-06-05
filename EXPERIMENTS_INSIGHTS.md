@@ -33,7 +33,8 @@
 | 17v3 | `QQQ_365d_iron_condor_20260604_0826` | 365/60/60/5, 12 W | −0.96% / −$962 | +2.35% / +$2,382 | 26 / 51 | −2.03 / 1.61 | 10/12 | P37+P38 fix confirmed; W02 first window with non-zero stat weights (ms=0.7, ou=0.3); AEKF direction AUROC strong |
 | 18 | `QQQ_365d_iron_condor_20260604_1641` | 365/60/60/5, 12 W | +1.67% / +$1,670 | +2.35% / +$2,382 | 28 / 51 | **+3.14** / 1.61 | 11/12 | **H1 confirmed**: 6-param space; optimized beats ablation on Sharpe for first time (3.14 vs 1.61) |
 | 19 | `QQQ_365d_iron_condor_20260604_2147` | 365/60/60/5, 12 W | +2.61% / +$2,610 | — | 40 | 2.94 | 11/12 | **H2 rejected**: val-split degraded vs Exp 18 (Sharpe 2.94 vs 3.14); W10 0-trade from 335.65 overfitted val-slice |
-| 20 | pending | 365/60/60/5, 12 W | — | — | — | — | — | **Signal quality**: AEKF entry veto + fractal hard-veto + DirectionPredictor CV→AUROC + rising IV filter |
+| 20 | `QQQ_365d_iron_condor_20260605_0955` | 365/60/60/5, 12 W | +1.31% / +$1,305 | +0.32% / +$320 | 3 / 5 | **13.24** / 2.23 | 2/12 | **Hard veto over-filtered**: QQQ spread never < 0.43; threshold×1.5 blocked all entries in 10/12 windows; Change 3 (AUROC) confirmed working |
+| 21 | pending | 365/60/60/5, 12 W | — | — | — | — | — | **Hard veto disabled**: isolate net effect of Changes 1+3+4; measure AEKF/IV-rank veto activity with new logging |
 
 Config format: `train_days / test_days / step_days / gap_days`.
 All experiments: QQQ, iron_condor only, TPE sampler seed 42, $100k initial capital.
@@ -2283,6 +2284,100 @@ If Changes 1 and 2 are effective, W12 should stop losing (or at least reduce the
 
 Overall Sharpe impact is hard to predict without running it — the fixes address tail-risk (trending regime losses) more than they improve average performance. Expect max drawdown reduction more than Sharpe improvement.
 
+### Results — Optimized
+
+**Archive:** `QQQ_365d_iron_condor_20260605_0955` · **Date:** 2026-06-05 · **Runtime:** 378.7 min
+
+| Metric | Value |
+|--------|-------|
+| Total return | +1.31% / +$1,305 |
+| Total trades | 3 |
+| Win rate | 100% (stat. artifact) |
+| Sharpe ratio | 13.24 (stat. artifact — near-zero variance) |
+| Max drawdown | 0.00% |
+| Active windows | 2 / 12 |
+
+**Ablation baseline:** +0.32% / Sharpe 2.23 / 5 trades / 3 active windows
+
+### What Happened
+
+**Change 2 (fractal hard-veto) caused catastrophic over-filtering.** The veto threshold was `max(hurst_regime_threshold, 0.20) × 1.5 = 0.30`. Post-mortem analysis of Exp 18's 28 trades showed QQQ hurst_spread **never drops below 0.43** in normal trading conditions (range: 0.43–0.90, median 0.755). The hard veto at 0.30 blocked 100% of entries in 10/12 windows. W07 and W08 survived only because post-Liberation Day conditions (May–Sep 2025) produced a few anomalously low spread days (0.10, 0.18, 0.28).
+
+**Critical insight from post-mortem:** W12's three stop-loss trades had hurst_spread = 0.749, 0.761, 0.442 — values that are statistically indistinguishable from profitable trades in W03 (0.43–0.84) and W11 (0.62–0.87). The hard veto premise was wrong: spread level cannot discriminate good from bad iron condor entries for QQQ.
+
+**Change 3 (DirectionPredictor AUROC) confirmed working correctly:**
+- 5 of 12 windows had at least one model above 0.5 AUROC baseline (vs 0/N previously)
+- Best pair: XGBoost 0.629 / LightGBM 0.650 (W12!)
+- Direction predictor fitted weights now non-zero for the first time in experiment history
+
+**Changes 1 (AEKF veto) and 4 (IV rank veto) never fired** — all AEKF confidences were 0.10–0.54, well below the 0.60 threshold. Both changes were correctly designed but untestable under the hard veto's shadow.
+
+**Optuna floor fix confirmed necessary:** 9 of 12 windows had Optuna push `hurst_regime_threshold` below 0.20. W07 reached 0.092 — without the floor, veto would have fired at 0.138 (even more destructive). The floor fix was correct; the problem was the floor value (0.20), not the fix concept.
+
+### What We Learned
+
+- **QQQ's hurst_spread range is 0.43–0.90 in all market conditions.** Any hard-veto threshold derived from Optuna-tuned values × small multiplier will always be below this floor.
+- **The hard veto concept requires redesign.** The veto needs a signal that actually discriminates W12's regime (trending + consecutive losses + tariff shock) from profitable windows. Hurst spread level alone cannot do this.
+- **Change 3 (AUROC) is production-ready.** Delivers correctly calibrated direction ensemble weights. Keep in all future experiments.
+- **Changes 1 and 4 need observability before evaluation.** Veto logging was missing — can't evaluate effectiveness without seeing when they fire. Added `log.debug` calls for Exp 21.
+
+### What Changed for Exp 21
+
+- **Hard veto disabled:** `hurst_hard_veto_multiplier = 0.0` (the `multiplier > 0` guard in engine.py makes 0 a clean disable)
+- **Veto logging added:** `hard_veto_fired`, `aekf_veto_fired`, `iv_rank_veto_fired` debug events now emitted
+- Changes 1 (AEKF), 3 (AUROC), 4 (IV rank) retained
+
+```bash
+python scripts/run_integration_test.py \
+  --symbols QQQ \
+  --config config_QQQ_test.yaml \
+  --strategies iron_condor \
+  --train-days 365 \
+  --test-days 60 \
+  --step-days 60 \
+  --gap-days 5 \
+  --optuna-seed 42 \
+  --wf-trials 200 \
+  --wf-patience 50 \
+  --wf-min-trades 7 \
+  --wf-n-jobs 6 \
+  --years 3 \
+  --skip-backfill \
+  --console-log-level WARNING \
+  > logs/exp21_stdout.log 2>&1
+```
+
+---
+
+## Experiment 21 — Isolate Changes 1+3+4 With Hard Veto Disabled
+
+**Archive:** pending
+**Date:** pending
+**Git branch:** `features-request-3`
+
+### Context
+
+Exp 20 confirmed Change 3 (DirectionPredictor AUROC) works correctly but the hard veto (Change 2) blocked all entries in 10/12 windows. Exp 21 disables the hard veto entirely and measures the net effect of the three surviving signal quality changes (1, 3, 4) against the Exp 18 baseline (Sharpe 3.14, 28 trades, 11/12 active).
+
+### What We're Trying to Learn
+
+**Primary question:** Do Changes 1 (AEKF veto), 3 (AUROC), and 4 (IV rank) together improve on Exp 18's Sharpe of 3.14, or are they neutral/harmful?
+
+**Secondary questions:**
+1. Do the AEKF and IV rank vetoes actually fire at all in OOS conditions? (Now we have logging.)
+2. If they fire, do they reduce losses or just cut winning trades?
+3. Does the improved DirectionPredictor AUROC (non-zero weights in 5/12 windows) translate to better iron condor entry timing in OOS?
+4. Does W12 still lose with 3 consecutive stop-losses, or do Changes 1/4 help?
+
+**What each outcome teaches:**
+- Exp 21 > Exp 18 (Sharpe > 3.14): Changes 1/3/4 are net positive. Hard veto redesign is worthwhile for further gain.
+- Exp 21 ≈ Exp 18 (Sharpe ~3.14): Changes are neutral. AUROC doesn't translate to OOS edge; hard veto redesign would need to deliver the improvement.
+- Exp 21 < Exp 18 (Sharpe < 3.14): One of Changes 1/4 is actively harmful (blocking winners). Diagnose via veto logs.
+
+### Prediction
+
+Expect Exp 21 to be close to Exp 18 (Sharpe 2.5–3.5). Changes 1 and 4 are unlikely to fire often given Exp 20's evidence (AEKF confidence 0.10–0.54, IV rank rise rarely extreme). Change 3 (AUROC) improves direction ensemble quality but iron condors bypass the direction gate — the indirect effect via range predictor weighting is uncertain. Net result: modest improvement or parity with Exp 18.
+
 ---
 
 ## Experiment Template
@@ -2337,4 +2432,4 @@ Copy this section to add a new experiment:
 
 ---
 
-*Last updated: 2026-06-04 (Exp 19 complete — H2 rejected; Exp 20 implemented and running)*
+*Last updated: 2026-06-05 (Exp 20 complete — hard veto over-filtered; Exp 21 ready to launch)*

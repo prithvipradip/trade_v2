@@ -264,15 +264,24 @@ class Backtester:
                     "pass": _hurst_pass,
                 }
                 if spread > self._hurst_regime_threshold and self._hurst_regime_threshold > 0:
-                    # Hard veto for iron condors / strangles when spread is clearly
-                    # trending (not borderline): skip entry entirely.
-                    # Floor at 0.20 so a low Optuna-optimized threshold can't make
-                    # the veto fire on nearly every bar.
+                    # Hard veto disabled (multiplier=0): Exp 20 post-mortem showed QQQ
+                    # hurst_spread never drops below ~0.43 in normal conditions, so any
+                    # threshold derived from Optuna-optimized values (0.09–0.29) × 1.5
+                    # blocks ALL entries. W12's bad-trade spreads (0.44–0.76) are
+                    # indistinguishable from profitable-trade spreads in other windows.
                     _neutral_strat = bool(set(self._strategies) & {"iron_condor", "short_strangle"})
                     _veto_base = max(self._hurst_regime_threshold, 0.20)
                     _hard_veto_threshold = _veto_base * self._hurst_hard_veto_multiplier
                     if _neutral_strat and self._hurst_hard_veto_multiplier > 0 and spread > _hard_veto_threshold:
                         _entry_decision["fractal_gate"]["hard_veto"] = True
+                        log.debug(
+                            "hard_veto_fired",
+                            component="backtesting.engine",
+                            strategy=strategy,
+                            hurst_spread=round(spread, 4),
+                            hard_veto_threshold=round(_hard_veto_threshold, 4),
+                            hurst_regime_threshold=round(self._hurst_regime_threshold, 4),
+                        )
                         continue
                     penalty = self._hurst_regime_penalty * (
                         spread / self._hurst_regime_threshold
@@ -390,6 +399,14 @@ class Backtester:
                     _ou_conf = (sym_data.get("ou_jump_state") or {}).get("ou_jump_confidence") or 0.0
                     if _ou_dir is not None and float(_ou_conf) >= self._aekf_veto_threshold:
                         _entry_decision["aekf_veto"] = {"direction": _ou_dir, "confidence": round(float(_ou_conf), 4)}
+                        log.debug(
+                            "aekf_veto_fired",
+                            component="backtesting.engine",
+                            strategy=strategy,
+                            ou_direction=_ou_dir,
+                            ou_confidence=round(float(_ou_conf), 4),
+                            threshold=self._aekf_veto_threshold,
+                        )
                         continue
                 except Exception:
                     pass
@@ -405,6 +422,13 @@ class Backtester:
                             "rise": round(iv_rank_rise, 4),
                             "threshold": self._iv_rank_rise_threshold,
                         }
+                        log.debug(
+                            "iv_rank_veto_fired",
+                            component="backtesting.engine",
+                            strategy=strategy,
+                            iv_rank_rise=round(iv_rank_rise, 4),
+                            threshold=self._iv_rank_rise_threshold,
+                        )
                         continue
 
             # --- 3. Build the trade ---
