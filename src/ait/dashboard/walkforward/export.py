@@ -622,14 +622,47 @@ def _build_model_perf(windows_raw: list[dict], bars: list[dict]) -> tuple[dict, 
         return bins
 
     def _calib_set(cv: dict, members: list, ensemble_skill: float,
-                   baseline: float, span: float, lo: float, hi: float, nbins: int) -> dict:
-        out: dict = {"ensemble": _reliability_bins(ensemble_skill, lo, hi, nbins)}
+                   baseline: float, span: float, lo: float, hi: float, nbins: int,
+                   oos_scores: dict | None = None, predictor_type: str = "range") -> dict:
+        """Build calibration bins per member + ensemble.
+
+        Uses real bins from oos_scores when available; falls back to synthetic
+        bins derived from CV skill when not.
+        """
+        # Range: real bins come from oos_scores["ml"][member]["calibration_bins"]
+        # and oos_scores["ensemble"]["calibration_bins"]
+        # Direction: real bins come from oos_scores["members"][member]["calibration_bins"]
+        # and oos_scores["ensemble"]["calibration_bins"]
+        def _real_bins_range(member: str) -> list | None:
+            if not oos_scores:
+                return None
+            for section in ("ml", "statistical"):
+                b = (oos_scores.get(section) or {}).get(member, {}).get("calibration_bins")
+                if b:
+                    return b
+            return None
+
+        def _real_bins_dir(member: str) -> list | None:
+            if not oos_scores:
+                return None
+            return (oos_scores.get("members") or {}).get(member, {}).get("calibration_bins")
+
+        _real_bins = _real_bins_range if predictor_type == "range" else _real_bins_dir
+
+        # Ensemble bins
+        ens_bins = None
+        if oos_scores:
+            ens_bins = (oos_scores.get("ensemble") or {}).get("calibration_bins")
+        out: dict = {"ensemble": ens_bins if ens_bins else _reliability_bins(ensemble_skill, lo, hi, nbins)}
+
         for m in members:
             v = cv.get(m)
-            if v is None:
-                continue
-            member_skill = max(0.0, min(1.0, (v - baseline) / max(span, 1e-9)))
-            out[m] = _reliability_bins(member_skill, lo, hi, nbins)
+            real = _real_bins(m)
+            if real:
+                out[m] = real
+            elif v is not None:
+                member_skill = max(0.0, min(1.0, (v - baseline) / max(span, 1e-9)))
+                out[m] = _reliability_bins(member_skill, lo, hi, nbins)
         return out
 
     def _ou_params(mw: dict) -> dict | None:
@@ -749,7 +782,8 @@ def _build_model_perf(windows_raw: list[dict], bars: list[dict]) -> tuple[dict, 
                 "confidence_floor": 0.70,
                 "n_signals": w.get("trades", 0) if not d_gated else 0,
                 "version": dp.get("version", ""),
-                "calibration": _calib_set(d_cv, D_MEMBERS, d_skill, 0.5, 0.25, 0.40, 0.92, 8),
+                "calibration": _calib_set(d_cv, D_MEMBERS, d_skill, 0.5, 0.25, 0.40, 0.92, 8,
+                                          oos_scores=dp.get("oos_scores"), predictor_type="directional"),
             },
             "range": {
                 "predictor": "range",
@@ -773,7 +807,8 @@ def _build_model_perf(windows_raw: list[dict], bars: list[dict]) -> tuple[dict, 
                                if r_gated else None,
                 "n_signals": w.get("trades", 0) if not r_gated else 0,
                 "version": rp.get("version", ""),
-                "calibration": _calib_set(r_cv, R_MEMBERS, r_skill, 0.5, 0.22, 0.20, 0.92, 9),
+                "calibration": _calib_set(r_cv, R_MEMBERS, r_skill, 0.5, 0.22, 0.20, 0.92, 9,
+                                          oos_scores=rp.get("oos_scores"), predictor_type="range"),
                 "garch_meta": {
                     "variant":         rp.get("garch_selected_variant", "GARCH(1,1)"),
                     "dist":            rp.get("garch_selected_dist", "studentst"),

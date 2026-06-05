@@ -127,7 +127,7 @@ class WalkForwardConfig:
     range_threshold_pct: float = 0.05  # Target move % for range model; links to strategy profitability
     hurst_regime_threshold: float = 0.20
     hurst_regime_penalty: float = 0.10
-    hurst_hard_veto_multiplier: float = 1.5   # Exp 20: fractal hard-veto; floor ensures veto >= max(threshold,0.20)*1.5
+    hurst_hard_veto_multiplier: float = 0.0   # 0=disabled; Exp 20 post-mortem: QQQ spread never < 0.43, any multiplier blocks all entries
     multifractal_max_width: float = 0.50
     aekf_veto_threshold: float = 0.60         # Exp 20: suppress IC entry when AEKF drift confidence >= this
     iv_rank_rise_threshold: float = 0.30      # Exp 20: suppress IC entry when IV rank rose > this over last 10 days
@@ -1115,8 +1115,8 @@ class WalkForwardBacktester:
             )
             result = bt.run()
 
-            # Evaluate range predictor on OOS data — measures how well CV edge
-            # generalised to the test window and exposes train/test gap per model.
+            # Evaluate range predictor on OOS data — calibration bins + Brier/AUROC
+            # per model (train/test generalisation gap visible in the dashboard).
             if range_predictor is not None and range_predictor.is_trained:
                 _oos_scores = self._evaluate_range_model_oos(
                     range_predictor, test_df, symbol,
@@ -1125,6 +1125,16 @@ class WalkForwardBacktester:
                 )
                 if _oos_scores and "range_predictor" in _model_weights:
                     _model_weights["range_predictor"]["oos_scores"] = _oos_scores
+
+            # Evaluate directional predictor on OOS data — confidence calibration
+            # bins per member (predicted confidence vs actual accuracy).
+            if predictor is not None and predictor.is_trained:
+                _dir_oos = self._evaluate_direction_model_oos(
+                    predictor, test_df, symbol,
+                    horizon_days=self._config.max_hold_days,
+                )
+                if _dir_oos and "direction_predictor" in _model_weights:
+                    _model_weights["direction_predictor"]["oos_scores"] = _dir_oos
 
             for t in result.trades:
                 t["symbol"] = symbol
@@ -1470,17 +1480,27 @@ class WalkForwardBacktester:
             feature_names = rp_sym.get(
                 "feature_names", getattr(range_predictor, "_feature_names", [])
             )
-            feat_engine  = getattr(range_predictor, "_feature_engine", None)
             weights      = rp_sym.get("fitted_weights") or getattr(range_predictor, "_fitted_weights", None) or {}
 
             ml_scores:    dict[str, dict] = {}
             ensemble_proba = _np.zeros(len(y_true))
             total_weight   = sum(weights.get(n, 0.5) for n in models) if models else 1.0
 
-            if models and scaler is not None and feature_names and feat_engine is not None:
-                features = feat_engine.compute(test_df)
-                if not features.empty and len(features) > horizon_days:
-                    feat_rows = features.iloc[label_idx]
+            if models and scaler is not None and feature_names:
+                try:
+                    from ait.ml.features import FeatureEngine as _FE
+                    _feat_engine = _FE()
+                except Exception:
+                    _feat_engine = None
+                features = _feat_engine.compute(test_df) if _feat_engine is not None else None
+                if features is not None and not features.empty and len(features) > horizon_days:
+                    # Align feature rows to labellable timesteps
+                    valid_idx = [i for i in label_idx if i < len(features)]
+                    if valid_idx:
+                        feat_rows = features.iloc[valid_idx]
+                        y_true_ml = _np.array([labels_dict[i] for i in valid_idx])
+                    else:
+                        feat_rows, y_true_ml = features.iloc[label_idx], y_true
                     if not any(f not in feat_rows.columns for f in feature_names):
                         X = feat_rows[feature_names]
                         try:
@@ -1491,10 +1511,10 @@ class WalkForwardBacktester:
                                 try:
                                     proba = model.predict_proba(X_sc)[:, 1]
                                     ml_scores[name] = self._prob_score_metrics(
-                                        y_true, proba, base_rate
+                                        y_true_ml, proba, base_rate
                                     )
                                     w = weights.get(name, 0.5) / total_weight if total_weight > 0 else 0.5
-                                    ensemble_proba += w * proba
+                                    ensemble_proba += w * proba[:len(ensemble_proba)]
                                 except Exception:
                                     continue
                         except Exception:
@@ -1591,7 +1611,7 @@ class WalkForwardBacktester:
                         y_true, combined_proba, base_rate
                     )
 
-            # Strip p_scores arrays from output (not JSON-serialisable and large)
+            # Strip raw p_scores array; calibration_bins (pre-computed) are kept
             def _strip_arrays(d: dict) -> dict:
                 return {k: v for k, v in d.items() if k != "p_scores"}
 
@@ -1685,7 +1705,181 @@ class WalkForwardBacktester:
                 result["rvol_mae"]  = round(float(_np.mean(_np.abs(rp[finite] - rt[finite]))), 5)
                 result["rvol_bias"] = round(float(_np.mean(rp[finite] - rt[finite])), 5)
 
+        # Calibration bins: predicted probability vs empirical frequency.
+        # Format: [{p, actual, n}, ...] — same shape the dashboard ReliabilityChart
+        # expects so export.py can pass them through directly.
+        nbins = 9
+        bins = []
+        for b in range(nbins):
+            lo, hi = b / nbins, (b + 1) / nbins
+            mask = (p >= lo) & (p < hi)
+            n_bin = int(mask.sum())
+            if n_bin > 0:
+                bins.append({
+                    "p":      round((lo + hi) / 2, 3),
+                    "actual": round(float(y[mask].mean()), 3),
+                    "n":      n_bin,
+                })
+        result["calibration_bins"] = bins
+
         return result
+
+    def _evaluate_direction_model_oos(
+        self,
+        predictor: "Any",
+        test_df: "pd.DataFrame",
+        symbol: str,
+        horizon_days: int = 30,
+        return_threshold_pct: float = 0.02,
+    ) -> dict:
+        """Evaluate directional predictor calibration on OOS test data.
+
+        Computes per-member confidence calibration bins (predicted confidence vs
+        actual accuracy) and overall OOS AUROC for XGBoost and LightGBM.
+        Returns empty dict when evaluation is not possible.
+
+        Calibration semantics: bins predicted confidence p (= max class probability)
+        against the fraction of predictions at that confidence level that were
+        actually correct (1-vs-rest accuracy).  Stored as
+        ``calibration_bins: [{p, actual, n}]`` so the dashboard ReliabilityChart
+        can render them directly without synthetic approximation.
+        """
+        import numpy as _np
+
+        try:
+            sym_data = getattr(predictor, "_symbol_models", {}).get(symbol, {})
+            models       = sym_data.get("models") or getattr(predictor, "_models", {})
+            scaler       = sym_data.get("scaler") or getattr(predictor, "_scaler", None)
+            feature_names = sym_data.get("feature_names") or getattr(predictor, "_feature_names", [])
+
+            if not models or scaler is None or not feature_names:
+                return {}
+            if len(test_df) < horizon_days + 20:
+                return {}
+
+            from ait.ml.features import FeatureEngine as _FE
+            features = _FE().compute(test_df)
+            if features.empty:
+                return {}
+
+            # Build forward-return labels for each bar (3-class)
+            close = test_df["Close"].values
+            n_label = len(close) - horizon_days
+            if n_label < 10:
+                return {}
+
+            y_class = []  # 0=bearish, 1=neutral, 2=bullish
+            for t in range(n_label):
+                fwd_ret = (close[t + horizon_days] - close[t]) / close[t]
+                if fwd_ret > return_threshold_pct:
+                    y_class.append(2)
+                elif fwd_ret < -return_threshold_pct:
+                    y_class.append(0)
+                else:
+                    y_class.append(1)
+            y_class_arr = _np.array(y_class)
+
+            # Align features to labellable bars
+            feat_rows = features.iloc[:n_label]
+            if any(f not in feat_rows.columns for f in feature_names):
+                return {}
+
+            X = feat_rows[feature_names]
+            try:
+                X_sc = pd.DataFrame(scaler.transform(X.values), columns=feature_names)
+            except Exception:
+                return {}
+
+            member_scores: dict[str, dict] = {}
+            ensemble_conf = _np.zeros(n_label)
+            total_w = sum(
+                getattr(predictor, "_fitted_weights", {}).get(n, 0.5) for n in models
+            ) or 1.0
+
+            for name, model in models.items():
+                try:
+                    proba = model.predict_proba(X_sc)          # (n, 3)
+                    conf  = _np.max(proba, axis=1)             # max-class confidence
+                    pred  = _np.argmax(proba, axis=1)          # predicted class index
+                    correct = (pred == y_class_arr).astype(float)
+
+                    # Confidence calibration bins
+                    nbins, calib = 8, []
+                    for b in range(nbins):
+                        lo, hi = b / nbins, (b + 1) / nbins
+                        mask = (conf >= lo) & (conf < hi)
+                        n_bin = int(mask.sum())
+                        if n_bin > 0:
+                            calib.append({
+                                "p":      round((lo + hi) / 2, 3),
+                                "actual": round(float(correct[mask].mean()), 3),
+                                "n":      n_bin,
+                            })
+
+                    # Per-class AUROC (one-vs-rest, macro)
+                    from sklearn.metrics import roc_auc_score
+                    try:
+                        auroc = round(float(roc_auc_score(
+                            y_class_arr, proba, multi_class="ovr", average="macro"
+                        )), 4)
+                    except Exception:
+                        auroc = None
+
+                    overall_acc = round(float(correct.mean()), 4)
+                    w = getattr(predictor, "_fitted_weights", {}).get(name, 0.5)
+                    member_scores[name] = {
+                        "calibration_bins": calib,
+                        "auroc": auroc,
+                        "accuracy": overall_acc,
+                        "n_samples": n_label,
+                    }
+                    ensemble_conf += (w / total_w) * conf
+
+                except Exception:
+                    continue
+
+            if not member_scores:
+                return {}
+
+            # Ensemble confidence calibration
+            all_preds = _np.array([
+                _np.argmax(
+                    sum(
+                        (getattr(predictor, "_fitted_weights", {}).get(n, 0.5) / total_w)
+                        * models[n].predict_proba(X_sc)
+                        for n in models
+                    ),
+                    axis=1,
+                )
+            ])
+            ensemble_correct = (all_preds[0] == y_class_arr).astype(float)
+            nbins, ens_calib = 8, []
+            for b in range(nbins):
+                lo, hi = b / nbins, (b + 1) / nbins
+                mask = (ensemble_conf >= lo) & (ensemble_conf < hi)
+                n_bin = int(mask.sum())
+                if n_bin > 0:
+                    ens_calib.append({
+                        "p":      round((lo + hi) / 2, 3),
+                        "actual": round(float(ensemble_correct[mask].mean()), 3),
+                        "n":      n_bin,
+                    })
+
+            return {
+                "n_samples":       n_label,
+                "horizon_days":    horizon_days,
+                "return_threshold": return_threshold_pct,
+                "members":         member_scores,
+                "ensemble": {
+                    "calibration_bins": ens_calib,
+                    "accuracy": round(float(ensemble_correct.mean()), 4),
+                    "n_samples": n_label,
+                },
+            }
+
+        except Exception as e:
+            log.debug("direction_oos_eval_failed", symbol=symbol, error=str(e))
+            return {}
 
     @staticmethod
     def _garch_rvol_forecast(
