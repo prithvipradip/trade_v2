@@ -38,6 +38,7 @@
 | 22 | `QQQ_365d_iron_condor_20260606_0237` | 365/60/60/5, 12 W | +5.2% / +$5,179 | +2.0% / +$2,000 | 25 / — | 6.55 / 1.88 | 8/12 | **Regime gate threshold too loose**: gate fired correctly (W12: -$534→-$264) but -0.02 threshold blocks mild corrections; W02 Optuna adaptation -$1,016 regression; un-optimized baseline 0.74→1.88 confirms gate signal |
 | 23 | `QQQ_365d_iron_condor_20260606_0747` | 365/60/60/5, 12 W | +7.6% / +$7,600 | +3.1% / +$3,100 | 32 / — | **8.209** / 1.90 | 8/12 | **New series high**: threshold -0.05 restored W02 profitable trades (+$1,109 vs +$760), W07 +$4,000, new best Sharpe; W12 still -$534 (entries at -2–5% below SMA, not blocked) |
 | 24 | *(killed — signal failure)* | 365/60/60/5, partial | — | — | — | — | — | **10d return gate reverted**: Sep/Oct 2023 training corrections overlap with W12 signal range; gate distorted W01/W02 Optuna training → 0 trades; no clean threshold exists |
+| 25 | *(pending)* | 365/60/60/5, 12 W | — | — | — | — | — | **context_bars 60→252**: enables proper iv_rank (needs 252d vol range); diagnostic run to collect iv_rank_rise_10d values across all windows before setting any threshold |
 
 Config format: `train_days / test_days / step_days / gap_days`.
 All experiments: QQQ, iron_condor only, TPE sampler seed 42, $100k initial capital.
@@ -2868,7 +2869,53 @@ W12's 10d return range (−5.25% to −7%) completely overlaps with:
 ### What Changed
 
 - Gate code **reverted** in engine.py; tests removed. Exp 23 result (Sharpe 8.209) remains the series high.
-- For next experiment, consider multi-symbol expansion (SPY) or ensemble ML improvements rather than entry filters targeting W12.
+- For next experiment: fix `context_bars` so `iv_rank` is properly computed in OOS, then collect per-window data before designing any new gate.
+
+---
+
+## Experiment 25 — context_bars 60 → 252: Proper iv_rank in OOS
+
+**Archive:** *(pending)*
+**Date:** 2026-06-06 (pre-run)
+**Git branch:** `features-request-3`
+
+### Context
+
+Every experiment from Exp 21 onward has shown `iv_rank_rise_10d=N/A` for early OOS entries. The root cause: the OOS backtester prepends only 60 context bars from training (`context_bars=60` in walkforward.py). `iv_rank` is computed as `(vol_20 − vol_252_min) / (vol_252_max − vol_252_min)` using `vol_20.rolling(252, min_periods=20)`. With only 60 bars of context, the 252-day vol range covers only 60 days — the rank is essentially meaningless and fluctuates wildly.
+
+The Optuna training path is unaffected: it uses `features_cache` built from the full 365d `train_df`, so training already has correct `iv_rank` values. This is a pure OOS fix.
+
+With `context_bars=252`, the OOS backtester gets 1 year of training bars prepended. By the first allowable entry date, `iv_rank` reflects the full 252-day vol distribution — identical quality to training.
+
+### What We're Testing
+
+**Primary:** Diagnostic — collect actual `iv_rank_rise_10d` values in decision dicts for all windows with proper context. No new gate added. If the values cleanly separate W12 (losing) from all profitable windows, design a threshold in Exp 26.
+
+**Secondary:** Does changing context_bars affect walk-forward performance at all? Expect: identical or very slightly different results because the regime gate and vol gate don't use `iv_rank`. Sharpe and return should be approximately the same as Exp 23.
+
+**Key questions:**
+1. What is `iv_rank_rise_10d` for W12 entries (Mar 2026)?
+2. What is `iv_rank_rise_10d` for W02 entries (Jun–Aug 2024)?
+3. What is the range across all other profitable windows?
+
+### Implementation
+
+Single line change in [walkforward.py](src/ait/backtesting/walkforward.py):
+
+```python
+# Before
+context_bars = 60
+
+# After — min() guard handles early windows where train_df < 252 bars
+context_bars = min(252, len(train_df))
+```
+
+No engine changes. No new gates. No test changes needed (the walkforward unit tests don't exercise `context_bars` directly).
+
+### Setup
+
+- Walk-forward config: **365d / 60d / 60d / 5d → 12 windows** (unchanged)
+- Key change from Exp 23: `context_bars` 60 → 252; everything else identical
 
 ---
 
@@ -2924,4 +2971,4 @@ Copy this section to add a new experiment:
 
 ---
 
-*Last updated: 2026-06-06 (Exp 24 killed — 10d price return gate reverted; signal overlaps with Sep/Oct 2023 training corrections and Yen carry OOS entries; Exp 23 Sharpe 8.209 remains series high)*
+*Last updated: 2026-06-06 (Exp 25 pre-run — context_bars 60→252 to fix iv_rank OOS quality; diagnostic run to collect per-window iv_rank_rise_10d values)*

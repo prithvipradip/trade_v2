@@ -1027,8 +1027,9 @@ class WalkForwardBacktester:
             )
 
             # Prepend training data context so ML features can be computed.
-            # vol_60 is the longest non-min_periods rolling window (60 bars).
-            context_bars = 60
+            # iv_rank uses vol_20.rolling(252) — needs 252 bars to be meaningful.
+            # Capped at actual train_df length so early windows still work.
+            context_bars = min(252, len(train_df))
             test_with_context = pd.concat([train_df.tail(context_bars), test_df])
 
             if learner is not None:
