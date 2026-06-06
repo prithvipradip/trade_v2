@@ -1598,13 +1598,13 @@ All four flags are optional — if omitted, the values are read from the corresp
 **Running multiple experiments:** To compare different window configurations (train_days, test_days, step_days), run `run_integration_test.py` multiple times with different YAML configs. Each run is automatically archived under `reports/runs/{run_id}/` and logged to MLflow experiment `walkforward_{symbol}`.
 
 ```bash
-# Run with default 365/63/21 config
+# Run with default 365/63/21 config — --archive-data auto-commits results to data/experiment-archives
 python scripts/run_integration_test.py --symbols QQQ --config config_QQQ_test.yaml \
-    --strategies iron_condor --skip-backfill
+    --strategies iron_condor --skip-backfill --archive-data
 
 # Run with shorter test window (edit config first: test_days=42, step_days=14)
 python scripts/run_integration_test.py --symbols QQQ --config config_QQQ_test.yaml \
-    --strategies iron_condor --skip-backfill
+    --strategies iron_condor --skip-backfill --archive-data
 
 # Compare all QQQ runs in the terminal
 python scripts/compare_runs.py --symbol QQQ
@@ -1656,39 +1656,46 @@ The script prints every changed parameter (old → new), the source window (e.g.
 
 **Committing experiment archives — use the `data/experiment-archives` branch:**
 
-Experiment result directories (`reports/runs/{run_id}/`) are data artifacts, not code. They must **never** be committed to feature branches or PRs — Copilot's review limit is 20,000 lines and a single experiment adds ~2,000 lines of JSON/CSV/text. Instead, all archives go to the dedicated `data/experiment-archives` branch:
+Experiment result directories (`reports/runs/{run_id}/`) are data artifacts, not code. They must **never** be committed to feature branches or PRs — a single experiment adds ~2,000 lines of JSON/CSV/text and exceeds Copilot's review file limit. Instead, all archives go to the dedicated `data/experiment-archives` branch.
+
+`reports/runs/` is listed in `.gitignore` on all source branches, so it can never be accidentally staged in a feature PR.
+
+**Recommended: automated via `--archive-data` flag**
+
+Pass `--archive-data` to `run_integration_test.py` and the script handles the branch switch, commit, push, and return automatically:
 
 ```bash
-# After an experiment finishes and reports/runs/{run_id}/ is created:
+python scripts/run_integration_test.py \
+    --symbols QQQ --config config_QQQ_test.yaml \
+    --strategies iron_condor --skip-backfill \
+    --archive-data
+```
+
+The script will:
+1. Run the full pipeline as normal
+2. Write the run artifacts to `reports/runs/{run_id}/` locally
+3. Switch to `data/experiment-archives`, commit the run directory, push, and switch back — all without touching your working tree (dirty changes are auto-stashed and restored)
+
+**Manual fallback** (if `--archive-data` is not used, or if the auto-push fails):
+
+```bash
 git checkout data/experiment-archives
-
-# Stage only the scientific record — log and HTML files are excluded by .gitignore
 git add reports/runs/{run_id}/
-
-# Commit with a descriptive message
-git commit -m "data: add {run_id} archive (Exp N results)"
-
-# Push to remote
+git commit -m "archive: {run_id}"
 git push origin data/experiment-archives
-
-# Return to your feature/work branch
 git checkout <your-branch>
 ```
 
-**What to include / exclude in the archive commit:**
+**What is included / excluded:**
 
-| Include (tracked) | Exclude (gitignored) |
+| Tracked (committed) | Gitignored (excluded) |
 |---|---|
-| `window_*.json` | `*.log` |
+| `window_*.json` | `*.log` (lives in `logs/`) |
 | `run_metadata.json` | `*.html` |
 | `walkforward_summary.txt` | |
 | `ablation_summary.txt` | |
-| `equity_curve.csv` | |
-| `config_snapshot.yaml` | |
-| `RESULTS.md` | |
-| `ic_decay.csv`, `ic_summary.csv` | |
-
-The `.gitignore` on `data/experiment-archives` already excludes `*.log` and `*.html` via `reports/runs/**/*.log` and `reports/runs/**/*.html` patterns — a plain `git add reports/runs/{run_id}/` is safe.
+| `equity_curve.csv`, `ic_decay.csv`, `ic_summary.csv` | |
+| `config_snapshot.yaml`, `RESULTS.md` | |
 
 Daily monitoring snapshots (`reports/daily_YYYYMMDD.json`) also belong on this branch, not on feature PRs.
 

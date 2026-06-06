@@ -152,6 +152,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "background experiments."
         ),
     )
+    parser.add_argument(
+        "--archive-data",
+        action="store_true",
+        help=(
+            "After archiving to reports/runs/, commit the run directory to the "
+            "'data/experiment-archives' git branch and push. Keeps experiment "
+            "artifacts out of source-code PRs. Requires a clean or stash-able "
+            "working tree and push access to origin."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1105,6 +1115,66 @@ def _create_run_archive(
 
 
 # ---------------------------------------------------------------------------
+# Section J — Git archive to data/experiment-archives branch
+# ---------------------------------------------------------------------------
+
+def _archive_to_data_branch(runs_dir: Path, run_id: str) -> bool:
+    """Commit run_dir to data/experiment-archives and push.
+
+    Stashes any dirty working tree before switching branches and restores
+    it afterwards, so the caller's branch is always left intact.
+    Returns True on success, False on any git error (non-fatal).
+    """
+    import subprocess
+
+    def _git(*cmd: str) -> str:
+        return subprocess.check_output(["git", *cmd], text=True, stderr=subprocess.STDOUT).strip()
+
+    DATA_BRANCH = "data/experiment-archives"
+    current_branch = "unknown"
+    stashed = False
+
+    try:
+        current_branch = _git("rev-parse", "--abbrev-ref", "HEAD")
+
+        # Stash dirty working tree (including untracked) so branch switch is clean.
+        dirty = _git("status", "--porcelain")
+        if dirty:
+            _git("stash", "push", "--include-untracked", "-m", f"auto-stash/{run_id}")
+            stashed = True
+
+        _git("checkout", DATA_BRANCH)
+        _git("add", str(runs_dir))
+
+        # Nothing new to commit (e.g. re-run of same id)?
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"], capture_output=True
+        ).returncode
+        if staged == 0:
+            print(f"    Git archive: nothing new to commit for {run_id}")
+            return True
+
+        _git("commit", "-m", f"archive: {run_id}")
+        _git("push", "origin", DATA_BRANCH)
+        print(f"    Git archive: {run_id} → {DATA_BRANCH} (pushed)")
+        return True
+
+    except subprocess.CalledProcessError as e:
+        print(f"    Git archive ERROR: {e.output.strip()}")
+        return False
+    except Exception as e:
+        print(f"    Git archive ERROR: {e}")
+        return False
+    finally:
+        try:
+            _git("checkout", current_branch)
+            if stashed:
+                _git("stash", "pop")
+        except Exception as e:
+            print(f"    WARNING: could not restore branch '{current_branch}': {e}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1173,7 +1243,9 @@ async def _main(args: argparse.Namespace) -> int:
 
     # I — Archive + MLflow (only when walk-forward ran and produced trades)
     if wf and "error" not in wf and wf.get("total_trades", 0) > 0:
-        _create_run_archive(args, out, wf, wf_cfg_fields)
+        runs_dir = _create_run_archive(args, out, wf, wf_cfg_fields)
+        if runs_dir is not None and getattr(args, "archive_data", False):
+            _archive_to_data_branch(runs_dir, runs_dir.name)
 
     print(f"\n{'='*60}")
     print(f"Integration test complete in {elapsed/60:.1f} minutes.")
