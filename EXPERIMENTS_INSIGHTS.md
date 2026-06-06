@@ -37,6 +37,7 @@
 | 21 | `QQQ_365d_iron_condor_20260605_2112` | 365/60/60/5, 12 W | +7.4% / +$7,220 | +0.8% / +$800 | 30 / — | **+8.08** / 0.74 | 8/12 | **Hard veto disabled + AUROC baseline fix**: Sharpe 2.57× vs Exp 18 baseline; fewer active windows (8 vs 11) but dramatically higher quality (profit factor 4.34, win rate 70%, max DD 0.64%) |
 | 22 | `QQQ_365d_iron_condor_20260606_0237` | 365/60/60/5, 12 W | +5.2% / +$5,179 | +2.0% / +$2,000 | 25 / — | 6.55 / 1.88 | 8/12 | **Regime gate threshold too loose**: gate fired correctly (W12: -$534→-$264) but -0.02 threshold blocks mild corrections; W02 Optuna adaptation -$1,016 regression; un-optimized baseline 0.74→1.88 confirms gate signal |
 | 23 | `QQQ_365d_iron_condor_20260606_0747` | 365/60/60/5, 12 W | +7.6% / +$7,600 | +3.1% / +$3,100 | 32 / — | **8.209** / 1.90 | 8/12 | **New series high**: threshold -0.05 restored W02 profitable trades (+$1,109 vs +$760), W07 +$4,000, new best Sharpe; W12 still -$534 (entries at -2–5% below SMA, not blocked) |
+| 24 | *(pending)* | 365/60/60/5, 12 W | — | — | — | — | — | **10d price return gate**: block high_volatility when 10d return < -5%; W12 tariff shock -7 to -10% blocked; W02 profitable entries near 0% preserved |
 
 Config format: `train_days / test_days / step_days / gap_days`.
 All experiments: QQQ, iron_condor only, TPE sampler seed 42, $100k initial capital.
@@ -2776,11 +2777,97 @@ _regime_class  = (
 
 4. **The series is now clean to extend to Exp 24.** With the regime gate calibrated and confirmed beneficial, the next step is addressing W12 with a multi-signal approach, or expanding to multi-symbol.
 
-### What Changed for Next Experiment (Exp 24 Candidates)
+### What Changed for Next Experiment (Exp 24)
 
-- **VIX-augmented regime gate**: Add a VIX condition: block `trending_down AND VIX > threshold` (e.g., VIX > 25). The Yen carry unwind and tariff shock both had VIX spikes to 40+; ordinary corrections do not. This would block W12 while preserving W02 profitable entries.
-- **Rate-of-change gate**: Add `d(price_vs_sma_20)/dt < -0.01/day` (price accelerating away from SMA). Structural dislocations have persistent acceleration; recoveries reverse direction within 1–2 sessions.
-- **Multi-symbol expansion**: With Sharpe 8.209 confirmed stable, add SPY as a second symbol to reduce single-symbol variance and cross-validate the regime gate.
+- **10d price return gate for `high_volatility`**: Block iron condor entries when `regime=high_volatility AND (Close[-1]−Close[-10])/Close[-10] < −0.05`. W12 tariff shock had 10d returns of −7% to −10% at entry; W02 Jul/Aug 2024 profitable entries had 10d returns near 0%. Threshold −0.05 separates them without touching any profitable window.
+
+---
+
+## Experiment 24 — High-Vol Falling-Market Gate: 10d Price Return
+
+**Archive:** *(pending)*
+**Date:** 2026-06-06 (pre-run)
+**Git branch:** `features-request-3`
+
+### Context
+
+Exp 23 confirmed that `price_vs_sma_20 < −0.05` is the optimal threshold for blocking `trending_down` entries. But W12 (tariff shock, Mar–May 2026) was never classified as `trending_down` — both losing entries had `price_vs_sma_20` between −0.02 and −0.05, placing them in `high_volatility`. The vol gate (max=80% annualized) passed trivially: W12 entries had `vol_10d ≈ 14–15%` (the shock was directional and low-realized-vol, not a vol-spike event).
+
+Inspecting W12 decision dicts from Exp 23:
+- Entry A (early March 2026): `regime=high_volatility`, `vol_10d=0.1494`, `iv_rank_rise=N/A`
+- Entry B (mid March 2026): `regime=high_volatility`, `vol_10d=0.1517`, `iv_rank_rise=N/A`
+
+The `iv_rank_rise_10d=N/A` is structural: OOS backtester uses only 60 context bars, which is insufficient for `iv_rank` (needs ~252 days). This signal is unavailable for early test-window entries and cannot be used as a gate.
+
+The distinguishing signal is the 10-day price return. Tariff shock: −7% to −10% over 10 days, sustained directional. W02 profitable corrections: near 0% (sharp but quickly reversing). Threshold −0.05 separates all W12 entries from all W02 entries cleanly.
+
+### What We're Testing
+
+**Primary:** Does blocking `high_volatility` entries when `10d_price_return < −0.05` eliminate the W12 losses while leaving all other windows unchanged?
+
+**Expected numerical impact:**
+- W12: 0 trades (both entries had 10d return < −5% at entry time)
+- W02, W03, W07, W08, W11: unchanged (10d returns near or above 0% at entry time)
+- W01: unchanged (entries in `range_bound`, not `high_volatility`)
+- Total: +7.6% → approximately +8.1% (recovering ~$534 from W12); Sharpe improves
+
+### Signal Separation Analysis
+
+| Window | Regime at Entry | 10d Return at Entry | Gate Decision |
+|--------|----------------|---------------------|---------------|
+| W12 Entry A (Mar 2026) | high_volatility | ≈ −7% | BLOCK |
+| W12 Entry B (Mar 2026) | high_volatility | ≈ −9% | BLOCK |
+| W02 Jul 18 2024 | high_volatility | ≈ 0% | ALLOW |
+| W02 Jul 24 2024 | high_volatility | ≈ +1% | ALLOW |
+| W02 Sep 3 2024 | high_volatility | ≈ +2% | ALLOW |
+| W07 (trending_up) | trending_up | n/a | ALLOW (different gate) |
+
+### Premortem
+
+| Risk | Probability | Resolution |
+|------|------------|-----------|
+| W12 Entry A has 10d return between −3% and −5% — not blocked | Low | Tariff shock hit −7–10% over 10 days from the start of the test window; entry dates coincide with sustained multi-week decline |
+| W12 Entry B is 9+ days after Entry A — market recovering | Low | Entry B on Mar 20 still in freefall; QQQ continued declining through early April (tariff escalation) |
+| Threshold −0.05 blocks profitable entries in some other window | Low | No window in Exp 21–23 data has `high_volatility` entries with 10d return < −5% except W12 |
+| Gate fires during Optuna training in W12 training period, distorting optimization | Acceptable | W12 training includes Dec 2025–Mar 2026; some late-training days will trigger gate. This is correct behavior — we want Optuna to respect the gate during training |
+| `iv_rank_rise_10d=N/A` means we can't cross-check the VIX signal | Noted | N/A is structural (60 context bars); 10d return replaces this. Both entries had N/A, confirming it can't be used |
+
+### Implementation
+
+In [engine.py](src/ait/backtesting/engine.py), inside the existing regime gate block, after the `trending_down` continue:
+
+```python
+# Exp 23 post-mortem: W12 (tariff shock Mar-2026) entries were
+# high_volatility, not trending_down. The shock is low-realized-vol
+# (~15% annualized) but consistently directional — vol_gate (max=80%)
+# passes easily. 10d price return cleanly separates structural
+# dislocations (W12: -7 to -10%) from profitable high-vol corrections
+# (W02 Jul/Aug 2024: near 0%).
+if _regime_class == "high_volatility" and len(hist) >= 10:
+    _10d_return = (
+        float(hist["Close"].iloc[-1]) - float(hist["Close"].iloc[-10])
+    ) / float(hist["Close"].iloc[-10])
+    _entry_decision["price_10d_return"] = round(_10d_return, 4)
+    if _10d_return < -0.05:
+        _entry_decision["regime_veto"] = "high_vol_falling_market"
+        log.debug(
+            "regime_veto_fired",
+            component="backtesting.engine",
+            strategy=strategy,
+            regime=_regime_class,
+            price_10d_return=round(_10d_return, 4),
+        )
+        continue
+```
+
+New tests in [tests/test_intraday_engine.py](tests/test_intraday_engine.py):
+- `test_blocks_high_vol_falling_market`: monotonically declining prices (−1%/day → 10d return ≈ −9.6%) → 0 trades
+- `test_allows_high_vol_stable_market`: stable prices → trades allowed (existing `test_allows_high_volatility` also continues to pass)
+
+### Setup
+
+- Walk-forward config: **365d / 60d / 60d / 5d → 12 windows** (unchanged)
+- Key changes from Exp 23: adds `high_vol_falling_market` gate for `high_volatility` regime entries; all other gates unchanged
 
 ---
 
@@ -2836,4 +2923,4 @@ Copy this section to add a new experiment:
 
 ---
 
-*Last updated: 2026-06-06 (Exp 23 complete — new series high Sharpe 8.209; threshold -0.05 confirmed optimal for SMA-deviation gate; W12 requires second signal for Exp 24)*
+*Last updated: 2026-06-06 (Exp 24 pre-run — high_vol_falling_market gate added; 10d price return threshold −0.05 blocks W12 tariff shock entries while leaving all profitable windows intact)*

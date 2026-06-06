@@ -388,6 +388,41 @@ class TestRegimeGate:
             result = bt.run()
         assert result.total_trades == 0
 
+    def test_blocks_high_vol_falling_market(self) -> None:
+        """No iron condor entries when high_volatility + 10d price return < -5%.
+
+        Uses a monotonically declining price series (−1%/day) so every 10-day
+        return is ≈ −9.6%, well below the −5% threshold.
+        """
+        days = 200
+        dates = pd.date_range("2024-01-02", periods=days, freq="B")
+        close = 500.0 * (0.99 ** np.arange(days))
+        daily = pd.DataFrame(
+            {"Open": close, "High": close * 1.001, "Low": close * 0.999,
+             "Close": close, "Volume": np.full(days, 5_000_000, dtype=float)},
+            index=dates,
+        )
+        bt = Backtester(
+            data=daily,
+            strategies=["iron_condor"],
+            iv_floor=0.0,
+            initial_capital=100_000,
+        )
+        features = _make_features_df(vol_regime_expanding=1.0, price_vs_sma_20=0.0)
+        with patch.object(bt, "_get_direction",
+                          return_value=(SignalDirection.NEUTRAL, 0.70, features)):
+            result = bt.run()
+        assert result.total_trades == 0
+
+    def test_allows_high_vol_stable_market(self) -> None:
+        """Iron condor entries allowed when high_volatility but 10d return near zero."""
+        bt = self._bt()
+        features = _make_features_df(vol_regime_expanding=1.0, price_vs_sma_20=0.0)
+        with patch.object(bt, "_get_direction",
+                          return_value=(SignalDirection.NEUTRAL, 0.70, features)):
+            result = bt.run()
+        assert result.total_trades > 0
+
 
 class TestObservabilityLogging:
     """AEKF signal and IV rank rise are logged in decision dict for every entry."""

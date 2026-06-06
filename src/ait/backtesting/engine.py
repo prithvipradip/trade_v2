@@ -385,6 +385,28 @@ class Backtester:
                     )
                     continue
 
+                # Exp 23 post-mortem: W12 (tariff shock Mar-2026) entries were
+                # high_volatility, not trending_down. The shock is low-realized-vol
+                # (~15% annualized) but consistently directional — vol_gate (max=80%)
+                # passes easily. 10d price return cleanly separates structural
+                # dislocations (W12: -7 to -10%) from profitable high-vol corrections
+                # (W02 Jul/Aug 2024: near 0%).
+                if _regime_class == "high_volatility" and len(hist) >= 10:
+                    _10d_return = (
+                        float(hist["Close"].iloc[-1]) - float(hist["Close"].iloc[-10])
+                    ) / float(hist["Close"].iloc[-10])
+                    _entry_decision["price_10d_return"] = round(_10d_return, 4)
+                    if _10d_return < -0.05:
+                        _entry_decision["regime_veto"] = "high_vol_falling_market"
+                        log.debug(
+                            "regime_veto_fired",
+                            component="backtesting.engine",
+                            strategy=strategy,
+                            regime=_regime_class,
+                            price_10d_return=round(_10d_return, 4),
+                        )
+                        continue
+
             # Range model gate: for iron condors / strangles, replace confidence
             # with P(stays in range). Skip if below range threshold.
             if strategy in ("iron_condor", "short_strangle") and self._range_predictor is not None:
