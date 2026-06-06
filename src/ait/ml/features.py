@@ -425,6 +425,7 @@ class FeatureEngine:
             "sma_10_slope", "sma_20_slope",
             "price_vs_sma_20", "price_vs_sma_50",
             "sma_10_20_cross",
+            "above_sma200", "distance_sma200",
             # Price action
             "daily_return", "gap", "body_size", "upper_wick", "lower_wick",
             "consecutive_up", "consecutive_down",

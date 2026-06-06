@@ -629,7 +629,7 @@ def _window_task_mp(args: tuple) -> tuple:
     provided, _run_single_window skips _train_window_range_model entirely.
     """
     (window_id, train_start, train_end, test_start, test_end,
-     data, vix_full, config, symbols, strategies, db_path, progress_dir,
+     data, vix_full, spy_full, config, symbols, strategies, db_path, progress_dir,
      pretrained_range) = args
 
     bt = WalkForwardBacktester(
@@ -647,6 +647,7 @@ def _window_task_mp(args: tuple) -> tuple:
         test_end=test_end,
         data=data,
         vix_full=vix_full,
+        spy_full=spy_full,
         learner=None,
         prev_best_params=None,
         prev_oos=None,
@@ -709,8 +710,9 @@ class WalkForwardBacktester:
             log.error("no_data_for_backtest")
             return WalkForwardResult(initial_capital=self._config.initial_capital)
 
-        # Load VIX data for the full backtest period (yfinance fallback when not in DB).
-        # Used as Priority-2 IV proxy and as a live feature for the MetaLabeler.
+        # Load VIX and SPY data for the full backtest period (yfinance fallback when not in DB).
+        # VIX: Priority-2 IV proxy and live feature for the MetaLabeler.
+        # SPY: cross-asset features (relative strength, momentum, correlation) for the ML model.
         from ait.data.market_data import load_daily_ohlcv as _load_ohlcv
         try:
             _vix_full: pd.DataFrame = _load_ohlcv(
@@ -721,6 +723,14 @@ class WalkForwardBacktester:
                 _vix_full.index = _vix_full.index.tz_localize(None)
         except Exception:
             _vix_full = pd.DataFrame()
+        try:
+            _spy_full: pd.DataFrame = _load_ohlcv(
+                "SPY", days=self._config.train_days + 900, db_path=self._db_path
+            )
+            if not _spy_full.empty and _spy_full.index.tz is not None:
+                _spy_full.index = _spy_full.index.tz_localize(None)
+        except Exception:
+            _spy_full = pd.DataFrame()
 
         # Generate walk-forward windows
         windows = self._generate_windows(data)
@@ -751,7 +761,7 @@ class WalkForwardBacktester:
             args_list = [
                 (
                     i + 1, train_start, train_end, test_start, test_end,
-                    data, _vix_full, self._config,
+                    data, _vix_full, _spy_full, self._config,
                     self._symbols, self._strategies,
                     self._db_path, self._progress_dir,
                     pretrained_range_by_window[i],
@@ -785,6 +795,7 @@ class WalkForwardBacktester:
                     test_end=test_end,
                     data=data,
                     vix_full=_vix_full,
+                    spy_full=_spy_full,
                     learner=learner,
                     prev_best_params=prev_best_params,
                     prev_oos=prev_oos,
@@ -841,6 +852,7 @@ class WalkForwardBacktester:
         test_end: "date",
         data: "dict[str, pd.DataFrame]",
         vix_full: "pd.DataFrame",
+        spy_full: "pd.DataFrame | None" = None,
         learner: "BacktestLearner | None" = None,
         prev_best_params: "dict | None" = None,
         prev_oos: "BacktestResult | None" = None,
@@ -899,7 +911,10 @@ class WalkForwardBacktester:
             # Previously models were trained after optimization, so Optuna evaluated
             # params against _simple_direction fallback with no range gate — a
             # different signal than what ran in OOS.
-            predictor = self._train_window_model(train_df, symbol, window_id)
+            predictor = self._train_window_model(
+                train_df, symbol, window_id,
+                vix_full=vix_full, spy_full=spy_full,
+            )
 
             # Use pre-trained range predictor when provided (parallel mode with
             # _pretrain_range_models()).  Fall back to training in-process when
@@ -917,13 +932,20 @@ class WalkForwardBacktester:
             else:
                 range_predictor, _range_model_status, _range_threshold = _range_result
 
-            # Build VIX context for the training slice so features_cache has real
-            # VIX values instead of the neutral 0.5 fill used when no context is provided.
+            # Build market context for the training slice (VIX + SPY) so features_cache
+            # has real cross-asset values instead of neutral defaults.
             _vix_train_ctx_opt: dict | None = None
+            _ctx_opt: dict = {}
             if not vix_full.empty:
                 _vix_t_opt = vix_full.reindex(train_df.index, method="ffill").dropna(how="all")
                 if not _vix_t_opt.empty:
-                    _vix_train_ctx_opt = {"vix": _vix_t_opt}
+                    _ctx_opt["vix"] = _vix_t_opt
+            if spy_full is not None and not spy_full.empty:
+                _spy_t_opt = spy_full.reindex(train_df.index, method="ffill").dropna(how="all")
+                if not _spy_t_opt.empty:
+                    _ctx_opt["spy"] = _spy_t_opt
+            if _ctx_opt:
+                _vix_train_ctx_opt = _ctx_opt
 
             window_cfg = self._config
             if self._config.optimize_per_window:
@@ -1011,10 +1033,17 @@ class WalkForwardBacktester:
                 if self._progress_dir else None
             )
             _vix_train_ctx: dict | None = None
+            _ctx_train: dict = {}
             if not vix_full.empty:
                 _vix_t = vix_full.reindex(train_df.index, method="ffill").dropna(how="all")
                 if not _vix_t.empty:
-                    _vix_train_ctx = {"vix": _vix_t}
+                    _ctx_train["vix"] = _vix_t
+            if spy_full is not None and not spy_full.empty:
+                _spy_t = spy_full.reindex(train_df.index, method="ffill").dropna(how="all")
+                if not _spy_t.empty:
+                    _ctx_train["spy"] = _spy_t
+            if _ctx_train:
+                _vix_train_ctx = _ctx_train
 
             meta_labeler = self._train_window_meta_labeler(
                 train_df=train_df,
@@ -1048,10 +1077,17 @@ class WalkForwardBacktester:
             )
 
             _vix_ctx: dict | None = None
+            _ctx_oos: dict = {}
             if not vix_full.empty:
                 _vix_w = vix_full.reindex(test_with_context.index, method="ffill").dropna(how="all")
                 if not _vix_w.empty:
-                    _vix_ctx = {"vix": _vix_w}
+                    _ctx_oos["vix"] = _vix_w
+            if spy_full is not None and not spy_full.empty:
+                _spy_w = spy_full.reindex(test_with_context.index, method="ffill").dropna(how="all")
+                if not _spy_w.empty:
+                    _ctx_oos["spy"] = _spy_w
+            if _ctx_oos:
+                _vix_ctx = _ctx_oos
 
             # When the range model failed to train, block all OOS IC entries by
             # raising range_min_confidence to an unreachable value. Without a range
@@ -2350,7 +2386,12 @@ class WalkForwardBacktester:
             return None, f"exception: {reason}", threshold_pct
 
     def _train_window_model(
-        self, train_df: pd.DataFrame, symbol: str, window_id: int
+        self,
+        train_df: pd.DataFrame,
+        symbol: str,
+        window_id: int,
+        vix_full: "pd.DataFrame | None" = None,
+        spy_full: "pd.DataFrame | None" = None,
     ) -> "DirectionPredictor | None":
         """Train ML model on a training window's data.
 
@@ -2363,10 +2404,22 @@ class WalkForwardBacktester:
                 from ait.data.historical import HistoricalDataStore
                 intraday_store = HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
 
+            _train_ctx: dict = {}
+            if vix_full is not None and not vix_full.empty:
+                _vix_t = vix_full.reindex(train_df.index, method="ffill").dropna(how="all")
+                if not _vix_t.empty:
+                    _train_ctx["vix"] = _vix_t
+            if spy_full is not None and not spy_full.empty:
+                _spy_t = spy_full.reindex(train_df.index, method="ffill").dropna(how="all")
+                if not _spy_t.empty:
+                    _train_ctx["spy"] = _spy_t
+            _market_ctx = _train_ctx if _train_ctx else None
+
             ml_config = MLConfig()
             predictor = DirectionPredictor(ml_config)
             accuracies = predictor.train(
-                train_df, symbol=symbol, intraday_store=intraday_store
+                train_df, symbol=symbol, intraday_store=intraday_store,
+                market_context=_market_ctx,
             )
 
             if accuracies:
