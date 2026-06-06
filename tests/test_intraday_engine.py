@@ -324,7 +324,7 @@ class TestRegimeGate:
     def test_blocks_trending_down(self) -> None:
         """No iron condor entries when vol expanding and price below SMA20."""
         bt = self._bt()
-        features = _make_features_df(vol_regime_expanding=1.0, price_vs_sma_20=-0.05)
+        features = _make_features_df(vol_regime_expanding=1.0, price_vs_sma_20=-0.06)
         with patch.object(bt, "_get_direction",
                           return_value=(SignalDirection.NEUTRAL, 0.70, features)):
             result = bt.run()
@@ -382,7 +382,7 @@ class TestRegimeGate:
         side-effect (zero trades) plus the log event by checking total_trades == 0.
         """
         bt = self._bt()
-        features = _make_features_df(vol_regime_expanding=1.0, price_vs_sma_20=-0.05)
+        features = _make_features_df(vol_regime_expanding=1.0, price_vs_sma_20=-0.06)
         with patch.object(bt, "_get_direction",
                           return_value=(SignalDirection.NEUTRAL, 0.70, features)):
             result = bt.run()

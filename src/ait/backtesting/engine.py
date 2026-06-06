@@ -359,12 +359,15 @@ class Backtester:
             # Both macro dislocations in the dataset (Yen carry unwind Aug-2024,
             # tariff shock Mar-2026) occurred in this regime. Trending_up (100% win)
             # and high_volatility (62% win) maintain positive EV and are not blocked.
+            # Exp 22: threshold -0.02 was too loose — blocked profitable 2-4% corrections
+            # in W02, causing Optuna to adapt badly. Both structural failures cleared -0.05
+            # (Yen carry -6-8%, tariff shock -8-10%); raised to -0.05 for Exp 23.
             if strategy in ("iron_condor", "short_strangle") and not features_df.empty:
                 _last_f        = features_df.iloc[-1]
                 _vol_exp_flag  = float(_last_f.get("vol_regime_expanding", 0.0)) > 0.5
                 _px_sma_val    = float(_last_f.get("price_vs_sma_20", 0.0))
                 _regime_class  = (
-                    "trending_down"   if (_vol_exp_flag and _px_sma_val < -0.02) else
+                    "trending_down"   if (_vol_exp_flag and _px_sma_val < -0.05) else
                     "trending_up"     if (_vol_exp_flag and _px_sma_val > 0.02)  else
                     "high_volatility" if  _vol_exp_flag                          else
                     "range_bound"
