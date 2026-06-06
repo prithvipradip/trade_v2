@@ -12,15 +12,15 @@
 
 | # | Archive | Config | Opt. Return | Ablation | Trades | Sharpe | Active W | Key Change |
 |---|---------|--------|-------------|----------|--------|--------|----------|------------|
-| 1 | `QQQ_2Y_iron_condor_per_strategy_20260512` | 365/63/21/5, 18 W | +44.87% | — | 50 | 17.70 | 11/18 | First integration test |
+| 1 | ~~`QQQ_2Y_iron_condor_per_strategy_20260512`~~ ⚠️ | 365/63/21/5, 18 W | +44.87% | — | 50 | 17.70 | 11/18 | First integration test |
 | 2 | `QQQ_365d_iron_condor_20260513_1831` | 365/42/14/5, 28 W | +8.11% | ~+9% | 13 | 25.35 | 6/28 | Shorter windows |
 | 3 | `QQQ_365d_iron_condor_20260514_1308` | 365/42/14/5, 28 W | +5.45% | ~+9% | 8 | 24.17 | 2/28 | Repeat to confirm Exp 2 |
 | 4 | `QQQ_365d_iron_condor_20260514_2359` | 365/42/14/5, 28 W | +21.36% | ~+9% | 29 | 10.86 | 9/28 | Vol gate adjustment |
 | 5 | `QQQ_365d_iron_condor_20260514_1142` | 365/42/14/5, 28 W | **+183.14%** | **+9.00%** | **91** | **23.95** | **18/28** | **Removed regime filters from search space** |
-| 6 | `QQQ_365d_iron_condor_20260524_1825` | 365/42/14/5, 24 W | +11.88% | **+22.68%** | 14 / **36** | 39.12 / **9.70** | 7/24 / **13/24** | Spread model wiring fixed + calibration |
-| 7 | `QQQ_365d_iron_condor_20260525_1802` | 365/42/14/5, 24 W | +1.95% | +10.41% | 18 / 34 | 3.89 / 4.98 | 6/24 / 13/24 | ML fix (implied_vol NaN bug); first real XGBoost/LightGBM predictions |
-| 8 | `QQQ_365d_iron_condor_20260526_0302` | 365/30/30/5, 12 W | +0.51% | +6.02% | 20 / 14 | 1.68 / 14.25 | 6/12 / 6/12 | Non-overlapping 30d windows; max_hold=[10,21]; 200 trials; n_jobs=6 (ProcessPoolExecutor) |
-| 9 | `QQQ_365d_iron_condor_20260526_1409` | 365/30/30/5, 12 W | +4.37% | +3.86% | 29 / 38 | **5.41** / 3.05 | **9/12** / 9/12 | Removed IC direction gate (Change A) + wing-derived range threshold (Change B) |
+| 6 | ~~`QQQ_365d_iron_condor_20260524_1825`~~ ⚠️ | 365/42/14/5, 24 W | +11.88% | **+22.68%** | 14 / **36** | 39.12 / **9.70** | 7/24 / **13/24** | Spread model wiring fixed + calibration |
+| 7 | ~~`QQQ_365d_iron_condor_20260525_1802`~~ ⚠️ | 365/42/14/5, 24 W | +1.95% | +10.41% | 18 / 34 | 3.89 / 4.98 | 6/24 / 13/24 | ML fix (implied_vol NaN bug); first real XGBoost/LightGBM predictions |
+| 8 | ~~`QQQ_365d_iron_condor_20260526_0302`~~ ⚠️ | 365/30/30/5, 12 W | +0.51% | +6.02% | 20 / 14 | 1.68 / 14.25 | 6/12 / 6/12 | Non-overlapping 30d windows; max_hold=[10,21]; 200 trials; n_jobs=6 (ProcessPoolExecutor) |
+| 9 | ~~`QQQ_365d_iron_condor_20260526_1409`~~ ⚠️ | 365/30/30/5, 12 W | +4.37% | +3.86% | 29 / 38 | **5.41** / 3.05 | **9/12** / 9/12 | Removed IC direction gate (Change A) + wing-derived range threshold (Change B) |
 | 10 | `QQQ_365d_iron_condor_20260527_0353` | 365/30/30/5, 12 W | +6.88% | +3.86% | 33 / 38 | **5.70** / 3.05 | **8/12** / 9/12 | ML models fed into Optuna (Change C); reverts wing-derived threshold (Change B) |
 | 11 | `QQQ_730d_iron_condor_20260530_0531` | 730/30/30/5, 12 W | +2.69% | +2.41% | 19 / 22 | 5.25 / 3.38 | 4/12 | 730d training; Q16 answered: dead zones not recoverable by training horizon |
 | 12 | `QQQ_365d_iron_condor_20260531_1723` | 365/60/60/5, 12 W | −5.92% | +4.30% | 40 / 22 | −6.43 / 2.85 | 7/12 | 60d OOS windows; max_hold [14,40]; Change D (intraday OOS); fitted weights; entry 09:30 |
@@ -44,12 +44,25 @@ Config format: `train_days / test_days / step_days / gap_days`.
 All experiments: QQQ, iron_condor only, TPE sampler seed 42, $100k initial capital.
 Exp 1–10: 50 trials. Exp 8–11: 200 trials, patience 50, min_trades 7, n_jobs 6.
 
+> **⚠️ Lost archives (5 experiments):** The `data/experiment-archives` branch is missing the run directories for Exp 1, 6, 7, 8, and 9. Exp 1 was never committed to the branch (pre-dates the archiving workflow). Exp 6–9 were added but subsequently deleted by an accidental `git rm` in a prior commit and are not recoverable from git history. Results and parameters are fully preserved in this document. Re-run commands are in each experiment's section below. **To re-run exactly**, check out the git commit noted in the section header first — the search space has evolved since those experiments.
+
 ---
 
 ## Experiment 1 — First Integration Test
 
-**Archive:** `QQQ_2Y_iron_condor_per_strategy_20260512`
+**Archive:** ~~`QQQ_2Y_iron_condor_per_strategy_20260512`~~ ⚠️ **Lost — never committed to `data/experiment-archives`**
 **Date:** 2026-05-11 · Git commit: `fa283217`
+
+> **To re-run:** The search space at this commit was 12-dimensional (included `min_confidence` and `max_entry_vol_annual`). Check out the exact commit first to reproduce the original conditions.
+> ```bash
+> git checkout fa283217
+> python scripts/run_integration_test.py \
+>     --symbols QQQ --config config_QQQ_test.yaml \
+>     --strategies iron_condor --skip-backfill \
+>     --train-days 365 --test-days 63 --step-days 21 --gap-days 5 \
+>     --wf-trials 50 --archive-data
+> # Restore your branch afterwards: git checkout -
+> ```
 
 ### Setup
 - Walk-forward config: 365d train / 63d test / 21d step / 5d gap → **18 windows**
@@ -411,8 +424,20 @@ These are standing conclusions drawn from the experiments above. Review and upda
 
 ## Experiment 6 — Spread Model Wiring Fix + Market Regime Drop-Off
 
-**Archive:** `QQQ_365d_iron_condor_20260524_1825`
+**Archive:** ~~`QQQ_365d_iron_condor_20260524_1825`~~ ⚠️ **Lost — deleted from `data/experiment-archives` by accidental `git rm`**
 **Date:** 2026-05-24
+
+> **To re-run:** Spread wiring bugs A/B/C were fixed at this point; calibrated spread params are in config. The search space no longer includes `iv_floor`, `spread_*`, or wasted fractal dims. Use the commit from the date above (check `git log --after=2026-05-23 --before=2026-05-25 --oneline`).
+> ```bash
+> # Find and checkout the commit from 2026-05-24
+> git checkout <commit-from-2026-05-24>
+> python scripts/run_integration_test.py \
+>     --symbols QQQ --config config_QQQ_test.yaml \
+>     --strategies iron_condor --skip-backfill \
+>     --train-days 365 --test-days 42 --step-days 14 --gap-days 5 \
+>     --wf-trials 50 --archive-data
+> git checkout -
+> ```
 
 ### Setup
 - Walk-forward config: 365d train / 42d test / 14d step / 5d gap → **24 windows**
@@ -500,8 +525,19 @@ All changes listed below are **already implemented** in the codebase and will ta
 
 ## Experiment 7 — ML Predictions Activated (implied_vol NaN Bug Fixed)
 
-**Archive:** `QQQ_365d_iron_condor_20260525_1802`
+**Archive:** ~~`QQQ_365d_iron_condor_20260525_1802`~~ ⚠️ **Lost — deleted from `data/experiment-archives` by accidental `git rm`**
 **Date:** 2026-05-25
+
+> **To re-run:** The key change at this commit was the `FeatureEngine.compute()` fix (commit `38d4ae8`) — OHLCV-only input, no `implied_vol`. Same window config and search space as Exp 6.
+> ```bash
+> git checkout 38d4ae8   # or any commit from 2026-05-25
+> python scripts/run_integration_test.py \
+>     --symbols QQQ --config config_QQQ_test.yaml \
+>     --strategies iron_condor --skip-backfill \
+>     --train-days 365 --test-days 42 --step-days 14 --gap-days 5 \
+>     --wf-trials 50 --archive-data
+> git checkout -
+> ```
 
 ### Setup
 - Walk-forward config: 365d / 42d / 14d / 5d → **24 windows** (same as Exp 6)
@@ -582,8 +618,20 @@ Active window detail:
 
 ## Experiment 8 — Non-Overlapping Windows + Restricted max_hold + Parallel Optimization
 
-**Archive:** `QQQ_365d_iron_condor_20260526_0302`
+**Archive:** ~~`QQQ_365d_iron_condor_20260526_0302`~~ ⚠️ **Lost — deleted from `data/experiment-archives` by accidental `git rm`**
 **Date:** 2026-05-25/26
+
+> **To re-run:** Key change was `ProcessPoolExecutor` window-level parallelism (commit `ae102df`). 200 trials, patience 50, min_trades 7, n_jobs 6, non-overlapping 30d windows.
+> ```bash
+> git checkout ae102df   # or any commit from 2026-05-26 before the Exp 9 changes
+> python scripts/run_integration_test.py \
+>     --symbols QQQ --config config_QQQ_test.yaml \
+>     --strategies iron_condor --skip-backfill \
+>     --train-days 365 --test-days 30 --step-days 30 --gap-days 5 \
+>     --wf-trials 200 --wf-patience 50 --wf-min-trades 7 --wf-n-jobs 6 \
+>     --archive-data
+> git checkout -
+> ```
 
 ### Setup
 - Walk-forward config: 365d / 30d / 30d / 5d → **12 windows** (non-overlapping OOS)
@@ -695,8 +743,20 @@ These are unresolved questions that future experiments should address.
 
 ## Experiment 9 — Direction Gate Removed + Wing-Derived Range Threshold
 
-**Archive:** `QQQ_365d_iron_condor_20260526_1409`
+**Archive:** ~~`QQQ_365d_iron_condor_20260526_1409`~~ ⚠️ **Lost — deleted from `data/experiment-archives` by accidental `git rm`**
 **Date:** 2026-05-26
+
+> **To re-run:** Change A (direction gate removed from IC entry) and Change B (wing-derived range threshold) were both live at this commit. Same window config and Optuna settings as Exp 8.
+> ```bash
+> git checkout <commit-from-2026-05-26-after-exp8>  # check git log for the Change A commit
+> python scripts/run_integration_test.py \
+>     --symbols QQQ --config config_QQQ_test.yaml \
+>     --strategies iron_condor --skip-backfill \
+>     --train-days 365 --test-days 30 --step-days 30 --gap-days 5 \
+>     --wf-trials 200 --wf-patience 50 --wf-min-trades 7 --wf-n-jobs 6 \
+>     --archive-data
+> git checkout -
+> ```
 
 ### Setup
 - Walk-forward config: 365d / 30d / 30d / 5d → **12 windows** (identical to Exp 8)
