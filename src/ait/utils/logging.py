@@ -23,7 +23,8 @@ def setup_logging(
     """Configure structured logging for the entire application.
 
     Args:
-        config:        LoggingConfig (level controls the file handler floor).
+        config:        LoggingConfig (level controls default console threshold;
+                       file handler always records DEBUG).
         console_level: Optional override for the console handler level.
                        When running long experiments, pass "WARNING" to keep
                        stdout quiet (DEBUG/INFO go only to the rotating file).
@@ -39,7 +40,11 @@ def setup_logging(
     root_logger.setLevel(logging.DEBUG)  # capture everything; handlers filter
 
     # Remove existing handlers
-    root_logger.handlers.clear()
+    for handler in list(root_logger.handlers):
+        try:
+            handler.close()
+        finally:
+            root_logger.removeHandler(handler)
 
     # Console handler — human-readable, filtered to console_level
     console = logging.StreamHandler(sys.stdout)

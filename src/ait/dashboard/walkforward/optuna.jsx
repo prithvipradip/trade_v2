@@ -192,7 +192,7 @@ function OptunaTab({ data }) {
         <Metric label="Best objective" value={fmtNum(study.best_value, 4)} tone="up" sub={`trial #${study.best_trial}`} />
         <Metric label="Completion" value={fmtPct(completion, 0)} sub={`${study.n_trials_run}/${study.n_trials_requested}`} />
         <Metric label="Pruned" value={study.n_pruned} sub="by MedianPruner" />
-        <Metric label="OOS window return" value={win ? fmtPct(win.return_pct / 100) : "–"} tone={win && win.return_pct >= 0 ? "up" : "down"} sub={`win ${win ? fmtolike(win) : ""}`} />
+        <Metric label="OOS window return" value={win ? fmtPct(win.return_pct) : "–"} tone={win && win.return_pct >= 0 ? "up" : "down"} sub={`win ${win ? fmtolike(win) : ""}`} />
       </div>
 
       {study._has_trial_history ? (
