@@ -72,7 +72,8 @@ button,select,input{font-family:inherit;color:inherit;}
 .exp-name{margin:0;font-size:20px;font-weight:700;letter-spacing:-.02em;}
 .exp-meta{display:flex;flex-wrap:wrap;gap:6px 20px;margin-top:7px;font-size:12px;color:var(--text-dim);}
 .exp-meta b{color:var(--text-mute);font-weight:600;margin-right:5px;text-transform:uppercase;font-size:10px;letter-spacing:.05em;}
-.metric-strip{display:flex;gap:0;margin-top:14px;overflow-x:auto;}
+.metric-strip{display:flex;gap:0;margin-top:14px;overflow-x:auto;flex-wrap:wrap;}
+.window-metrics-badge{width:100%;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--accent);margin-bottom:6px;padding-bottom:6px;border-bottom:1px solid var(--border);}
 .metric{padding:8px 20px 14px 0;margin-right:20px;border-right:1px solid var(--border);min-width:max-content;flex:0 0 auto;}
 .metric:last-child{border-right:none;}
 .metric-label{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-mute);font-weight:600;white-space:nowrap;}
@@ -403,15 +404,15 @@ button,select,input{font-family:inherit;color:inherit;}
 <!-- Mock data (always loaded). When real data is ready, place wf_data.js
      in this directory — it will re-assign window.AIT and take precedence. -->
 <script src="data.js?v=942710e9"></script>
-<script src="wf_data.js?v=51e176d6" onerror="void 0"></script>
+<script src="wf_data.js?v=e9a0f136" onerror="void 0"></script>
 <script src="metric-info.js?v=1c18ec0a"></script>
 
-<script src="charts.js?v=96c7e2ab"></script>
+<script src="charts.js?v=f32f9568"></script>
 <script type="text/babel" src="tweaks-panel.jsx?v=5cdc2a46"></script>
-<script type="text/babel" src="components.jsx?v=c6ad4cf5"></script>
+<script type="text/babel" src="components.jsx?v=0a9d451d"></script>
 <script type="text/babel" src="panels.jsx?v=b724fb7a"></script>
 <script type="text/babel" src="optuna.jsx?v=49c298eb"></script>
 <script type="text/babel" src="predictor-models.jsx?v=5b6f83b3"></script>
-<script type="text/babel" src="app.jsx?v=903b082e"></script>
+<script type="text/babel" src="app.jsx?v=a9b199e3"></script>
 </body>
 </html>

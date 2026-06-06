@@ -927,10 +927,10 @@ def _create_run_archive(
         runs_dir = Path("reports/runs") / run_id
         runs_dir.mkdir(parents=True, exist_ok=True)
 
-        # Copy all artifacts from integration_test output dir
+        # Copy all artifacts from integration_test output dir (exclude .log — lives in logs/)
         for src in out.iterdir():
             dst = runs_dir / src.name
-            if src.is_file():
+            if src.is_file() and src.suffix != ".log":
                 shutil.copy2(src, dst)
 
         # Config snapshot

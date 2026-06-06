@@ -48,9 +48,46 @@ function App() {
 
   const toggleSeries = useCallback(k => setActiveSeries(s => { const n = new Set(s); n.has(k) ? n.delete(k) : n.add(k); return n; }), []);
 
-  const windowRange = selectedWindow === "all" ? null : (() => { const w = data.windows.find(w => w.window_id === selectedWindow); return w ? [w.test_start, w.test_end] : null; })();
+  const selectedWindowObj = selectedWindow === "all" ? null : data.windows.find(w => w.window_id === selectedWindow) || null;
+  const windowRange = selectedWindowObj ? [selectedWindowObj.test_start, selectedWindowObj.test_end] : null;
+
+  // trades and viewData must be declared before windowMetrics (which uses trades)
   const trades = useMemo(() => selectedWindow === "all" ? data.trades : data.trades.filter(t => t.window_id === selectedWindow), [selectedWindow, data]);
   const viewData = useMemo(() => ({ ...data, trades }), [trades, data]);
+
+  // Per-window metric strip — computed from the already-filtered trades + window object.
+  const windowMetrics = useMemo(() => {
+    if (!selectedWindowObj) return null;
+    const w = selectedWindowObj;
+    const pnls = trades.map(t => t.pnl).filter(p => p != null);
+    const wins = trades.filter(t => t.pnl > 0);
+    const losses = trades.filter(t => t.pnl <= 0);
+    const grossWin  = wins.reduce((a, t)   => a + t.pnl, 0);
+    const grossLoss = Math.abs(losses.reduce((a, t) => a + t.pnl, 0));
+    const mean = pnls.length ? pnls.reduce((a, x) => a + x, 0) / pnls.length : 0;
+    const downside = pnls.filter(p => p < mean);
+    let sortino = null;
+    if (downside.length >= 2) {
+      const dsStd = Math.sqrt(downside.reduce((a, p) => a + (p - mean) ** 2, 0) / (downside.length - 1));
+      if (dsStd > 0) sortino = (mean / dsStd) * Math.sqrt(252);
+    }
+    const holdDays = trades.map(t => t.hold_days).filter(d => d != null && d > 0);
+    return {
+      total_return:   w.return_pct,
+      sharpe_ratio:   w.sharpe,
+      sortino_ratio:  sortino != null ? Math.round(sortino * 100) / 100 : null,
+      win_rate:       w.win_rate,
+      profit_factor:  grossLoss > 0 ? Math.round((grossWin / grossLoss) * 100) / 100 : null,
+      max_drawdown:   w.max_drawdown,
+      pnl:            w.pnl,
+      expectancy:     pnls.length ? Math.round(mean * 100) / 100 : null,
+      total_trades:   w.trades,
+      avg_hold_days:  holdDays.length ? Math.round(holdDays.reduce((a, d) => a + d, 0) / holdDays.length * 10) / 10 : null,
+      avg_win:        wins.length  ? Math.round(grossWin  / wins.length  * 100) / 100 : null,
+      avg_loss:       losses.length ? Math.round(grossLoss / losses.length * 100) / 100 : null,
+      _window:        w,
+    };
+  }, [selectedWindowObj, trades]);
 
   const onSelectTrade = useCallback(t => setSelectedTrade(t), []);
   const onHoverChart = useCallback(t => setHoverTime(t), []);
@@ -86,7 +123,7 @@ function App() {
 
       {tab === "analysis" && (
         <main className="analysis">
-          <ExperimentHeader exp={data.experiment} />
+          <ExperimentHeader exp={data.experiment} windowMetrics={windowMetrics} />
           <div className="workspace">
             <SeriesPanel active={activeSeries} onToggle={toggleSeries} windows={data.windows} selectedWindow={selectedWindow} onWindow={setSelectedWindow} hasPredictions={!!data._has_predictions} />
             <div className="work-main">
@@ -112,7 +149,8 @@ function App() {
                 {showChart && (
                   <div className="chart-wrap">
                     <ChartArea data={viewData} activeSeries={activeSeries} theme={theme}
-                      onHover={onHoverChart} onPin={onSelectTrade} pinned={selectedTrade} extHoverTime={tableHoverTime} />
+                      onHover={onHoverChart} onPin={onSelectTrade} pinned={selectedTrade} extHoverTime={tableHoverTime}
+                      windowRange={windowRange} />
                   </div>
                 )}
                 {showTable && (

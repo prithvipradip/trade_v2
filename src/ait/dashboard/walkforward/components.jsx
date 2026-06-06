@@ -26,8 +26,42 @@ function Metric({ label, value, tone, sub }) {
 }
 
 /* ---------- experiment header ---------- */
-function ExperimentHeader({ exp }) {
+function ExperimentHeader({ exp, windowMetrics }) {
   const r = exp.results;
+  const w = windowMetrics;
+
+  // Metric strip: window-level when a window is selected, overall otherwise.
+  const strip = w ? (
+    <div className="metric-strip">
+      <div className="window-metrics-badge">
+        Window {w._window.window_id} · OOS {w._window.test_start} → {w._window.test_end}
+      </div>
+      <Metric label="Return" value={fmtPct(w.total_return)} tone={w.total_return >= 0 ? "up" : "down"} sub="this window" />
+      <Metric label="Sharpe" value={fmtNum(w.sharpe_ratio)} />
+      <Metric label="Sortino" value={w.sortino_ratio != null ? fmtNum(w.sortino_ratio) : "–"} />
+      <Metric label="Win Rate" value={fmtPct(w.win_rate)} />
+      <Metric label="Profit Factor" value={w.profit_factor != null ? fmtNum(w.profit_factor) : "–"} tone={w.profit_factor != null ? (w.profit_factor >= 1 ? "up" : "down") : null} />
+      <Metric label="Max Drawdown" value={fmtPct(w.max_drawdown)} tone="down" />
+      <Metric label="P&L" value={fmtMoney(w.pnl)} tone={w.pnl >= 0 ? "up" : "down"} sub="window total" />
+      <Metric label="Expectancy" value={w.expectancy != null ? fmtMoney(w.expectancy) : "–"} tone={w.expectancy != null ? (w.expectancy >= 0 ? "up" : "down") : null} sub="per trade" />
+      <Metric label="Trades" value={w.total_trades} sub={w.avg_hold_days != null ? `avg hold ${w.avg_hold_days}d` : ""} />
+      <Metric label="Avg Win / Loss" value={w.avg_win != null ? fmtMoney(w.avg_win) : "–"} sub={w.avg_loss != null ? `loss ${fmtMoney(-w.avg_loss)}` : ""} />
+    </div>
+  ) : (
+    <div className="metric-strip">
+      <Metric label="Total Return" value={fmtPct(r.total_return)} tone={r.total_return >= 0 ? "up" : "down"} />
+      <Metric label="Sharpe" value={fmtNum(r.sharpe_ratio)} />
+      <Metric label="Sortino" value={r.sortino_ratio != null ? fmtNum(r.sortino_ratio) : "–"} />
+      <Metric label="Win Rate" value={fmtPct(r.win_rate)} />
+      <Metric label="Profit Factor" value={fmtNum(r.profit_factor)} tone={r.profit_factor >= 1 ? "up" : "down"} />
+      <Metric label="Max Drawdown" value={fmtPct(r.max_drawdown)} tone="down" />
+      <Metric label="Consistency" value={fmtPct(r.consistency, 0)} sub={`${Math.round(r.consistency * r.windows)}/${r.windows} windows +`} />
+      <Metric label="Expectancy" value={fmtMoney(r.expectancy)} tone={r.expectancy >= 0 ? "up" : "down"} sub="per trade" />
+      <Metric label="Trades" value={r.total_trades} sub={`avg hold ${r.avg_hold_days}d`} />
+      <Metric label="Final Capital" value={fmtMoney(r.final_capital)} sub={`from ${fmtMoney(exp.config.initial_capital)}`} />
+    </div>
+  );
+
   return (
     <div className="exp-header">
       <div className="exp-id-row">
@@ -43,22 +77,11 @@ function ExperimentHeader({ exp }) {
             <span><b>Range</b> {exp.date_range.start} → {exp.date_range.end}</span>
             <span><b>Objective</b> {exp.config.objective}</span>
             <span><b>Windows</b> {r.windows} · train {exp.config.train_days}d / test {exp.config.test_days}d / step {exp.config.step_days}d</span>
-            <span><b>Run</b> {exp.run_at.replace("T", " ")} · {Math.round(exp.duration_sec / 60)}m · sha {exp.git_sha}</span>
+            <span><b>Run</b> {exp.run_at.replace("T", " ")} · sha {exp.git_sha}</span>
           </div>
         </div>
       </div>
-      <div className="metric-strip">
-        <Metric label="Total Return" value={fmtPct(r.total_return)} tone={r.total_return >= 0 ? "up" : "down"} />
-        <Metric label="Sharpe" value={fmtNum(r.sharpe_ratio)} />
-        <Metric label="Sortino" value={fmtNum(r.sortino_ratio)} />
-        <Metric label="Win Rate" value={fmtPct(r.win_rate)} />
-        <Metric label="Profit Factor" value={fmtNum(r.profit_factor)} tone={r.profit_factor >= 1 ? "up" : "down"} />
-        <Metric label="Max Drawdown" value={fmtPct(r.max_drawdown)} tone="down" />
-        <Metric label="Consistency" value={fmtPct(r.consistency, 0)} sub={`${Math.round(r.consistency * r.windows)}/${r.windows} windows +`} />
-        <Metric label="Expectancy" value={fmtMoney(r.expectancy)} tone={r.expectancy >= 0 ? "up" : "down"} sub="per trade" />
-        <Metric label="Trades" value={r.total_trades} sub={`avg hold ${r.avg_hold_days}d`} />
-        <Metric label="Final Capital" value={fmtMoney(r.final_capital)} sub={`from ${fmtMoney(exp.config.initial_capital)}`} />
-      </div>
+      {strip}
     </div>
   );
 }
@@ -115,7 +138,7 @@ function SeriesPanel({ active, onToggle, windows, selectedWindow, onWindow, hasP
 }
 
 /* ---------- chart bridge ---------- */
-function ChartArea({ data, activeSeries, theme, onHover, onPin, pinned, extHoverTime }) {
+function ChartArea({ data, activeSeries, theme, onHover, onPin, pinned, extHoverTime, windowRange }) {
   const ref = useRef();
   const chartRef = useRef();
   const onHoverRef = useRef(onHover); onHoverRef.current = onHover;
@@ -128,12 +151,15 @@ function ChartArea({ data, activeSeries, theme, onHover, onPin, pinned, extHover
 
   useEffect(() => {
     if (!chartRef.current) return;
+    // windowRange is passed into render() so the zoom is applied atomically
+    // inside chart construction — no separate effect needed (avoids race condition
+    // where fitContent() in render() would clobber a subsequent setWindowRange()).
     chartRef.current.render({
-      data, activeSeries, theme,
+      data, activeSeries, theme, windowRange,
       onHover: t => onHoverRef.current && onHoverRef.current(t),
       onMarkerClick: tr => onPinRef.current && onPinRef.current(tr),
     });
-  }, [activeSeries, theme, data]);
+  }, [activeSeries, theme, data, windowRange]);
 
   useEffect(() => {
     if (!chartRef.current) return;
