@@ -24,6 +24,14 @@ function Gauge({ value, threshold, label, color }) {
   );
 }
 
+const fmtDatetime = (s) => {
+  if (!s) return "–";
+  const clean = String(s).replace("T", " ").replace(/([+-]\d{2}:\d{2}|Z)$/, "").trim();
+  const [date, time] = clean.split(" ");
+  if (!time) return date;
+  return `${date}  ${time.slice(0, 5)}`;
+};
+
 function DecisionPanel({ trade, onClose }) {
   if (!trade) return null;
 
@@ -90,6 +98,19 @@ function DecisionPanel({ trade, onClose }) {
         </div>
 
         <div className="drawer-section">
+          <div className="drawer-heading">Execution</div>
+          <div className="kv-grid">
+            <div className="kv"><span>Order placed</span><b className="mono">{fmtDatetime(trade.entry_time)}</b></div>
+            <div className="kv"><span>Underlying at scan</span><b className="mono">{trade.limit_price != null ? fmtNum(trade.limit_price) : "–"}</b></div>
+            {trade.fill_time && <div className="kv"><span>Fill confirmed</span><b className="mono">{fmtDatetime(trade.fill_time)}</b></div>}
+            <div className="kv"><span>Spread credit (open)</span><b className="mono">{trade.entry_price != null ? fmtMoney(trade.entry_price) : "–"}</b></div>
+            <div className="kv"><span>Spread cost (close)</span><b className="mono">{trade.exit_price != null ? fmtMoney(trade.exit_price) : "–"}<span className="dim" style={{fontSize:"10px",marginLeft:"4px"}}>per share · ×100×contracts−comm = P&L</span></b></div>
+            <div className="kv"><span>Exit time</span><b className="mono">{fmtDatetime(trade.exit_time)}</b></div>
+            <div className="kv"><span>Underlying at exit</span><b className="mono">{trade.exit_underlying != null ? fmtNum(trade.exit_underlying) : "–"}</b></div>
+          </div>
+        </div>
+
+        <div className="drawer-section">
           <div className="drawer-heading">Decision chain</div>
           {hasDecision ? (
             <div className="stepper">
@@ -138,7 +159,6 @@ function DecisionPanel({ trade, onClose }) {
             <div className="kv"><span>Net credit</span><b className="mono">{fmtMoney(trade.credit)}</b></div>
             <div className="kv"><span>Max loss</span><b className="mono">{fmtMoney(trade.max_loss)}</b></div>
             <div className="kv"><span>Contracts</span><b className="mono">{trade.contracts ?? "–"}</b></div>
-            <div className="kv"><span>Entry / exit px</span><b className="mono">{fmtNum(trade.entry_price)} / {fmtNum(trade.exit_price)}</b></div>
           </div>
         </div>
 

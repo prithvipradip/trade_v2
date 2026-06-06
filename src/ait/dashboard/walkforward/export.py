@@ -74,6 +74,27 @@ def _safe(x, default=None):
     return x
 
 
+def _sortino_from_pnls(pnls: list) -> float | None:
+    """Trade-based Sortino ratio (annualised, sqrt(252) factor).
+
+    Uses mean PnL as the target return and downside deviation computed from
+    trades that fell *below* the mean.  Returns None when undefined (fewer
+    than 2 downside observations or zero downside std).
+    """
+    pnls = [p for p in pnls if p is not None]
+    if len(pnls) < 2:
+        return None
+    mean = sum(pnls) / len(pnls)
+    downside = [p for p in pnls if p < mean]
+    if len(downside) < 2:
+        return None
+    ds_var = sum((p - mean) ** 2 for p in downside) / (len(downside) - 1)
+    ds_std = ds_var ** 0.5
+    if ds_std == 0:
+        return None
+    return _round((mean / ds_std) * (252 ** 0.5), 2)
+
+
 def _iso(d) -> str | None:
     if d is None:
         return None
@@ -145,6 +166,22 @@ def _compute_features(bars: list[dict]) -> list[dict]:
         feat_df = FeatureEngine().compute(df)
         if feat_df.empty:
             return []
+
+        # FeatureEngine's internal dropna() is aggressive: cross-asset features
+        # (VIX-derived, macro yields, SPY correlations) go NaN when external data
+        # stops ~2–3 weeks before the last bar.  This causes the RSI, MACD, Hurst
+        # lines to also stop early even though they're fully computable from OHLCV.
+        # Fix: reindex to all bar dates and forward-fill so the tail renders fully.
+        # The ffill'd cross-asset values (e.g. VIX level from 3 weeks ago) are
+        # visually indistinguishable for chart display purposes.
+        all_dates = df.index
+        if len(feat_df) < len(all_dates):
+            feat_df = feat_df.reindex(all_dates).ffill()
+            # Still drop the early warmup rows (start of series) where OHLCV
+            # features haven't accumulated enough data — only forward-fill the tail.
+            core_cols = [c for c in ("rsi_14", "macd", "sma_20", "realized_vol_20") if c in feat_df.columns]
+            if core_cols:
+                feat_df = feat_df.dropna(subset=core_cols)
 
         # Rename columns to dashboard keys
         feat_df = feat_df.rename(columns=_FEATURE_RENAME)
@@ -238,7 +275,7 @@ def build_ait(report_dir: Path) -> dict:
             "cash_drag_adjusted_return": None,
             "win_rate": _round(summary.get("win_rate", 0), 4),
             "sharpe_ratio": _round(summary.get("sharpe_ratio", 0), 2),
-            "sortino_ratio": None,
+            "sortino_ratio": _sortino_from_pnls([t["pnl"] for t in all_trades if _HAS_PANDAS]),
             "max_drawdown": _round(summary.get("max_drawdown_pct", 0), 4),
             "profit_factor": _round(summary.get("profit_factor", 0), 2),
             "consistency": _round(profitable_windows / n_windows, 4) if n_windows else 0,
@@ -279,7 +316,9 @@ def build_ait(report_dir: Path) -> dict:
             "return_pct": _round(w.get("return_pct", 0) / 100, 4),
             "win_rate": _round(w.get("win_rate", 0), 4),
             "sharpe": _round(w.get("sharpe", 0), 4),
-            "max_drawdown": _round(w.get("max_drawdown", 0), 4),
+            # walkforward.py stores max_drawdown as fraction * 100; convert back to fraction
+            # so fmtPct() in the dashboard renders it correctly (e.g. 0.05 → "5.0%")
+            "max_drawdown": _round(w.get("max_drawdown", 0) / 100, 4),
             "strategies": w.get("strategies", {}),
             "best_params": w.get("best_params", {}),
         })
@@ -471,10 +510,13 @@ def _build_trades(windows_raw: list[dict], symbol: str) -> list[dict]:
                 "exit_date": exit_date,
                 "entry_time": t.get("entry_time", entry_date),
                 "exit_time": t.get("exit_time", exit_date),
+                "limit_price": _round(t.get("limit_price"), 4),
+                "fill_time": t.get("fill_time"),
                 "entry_idx": None,   # filled after bars loaded
                 "exit_idx": None,
-                "entry_price": None,
-                "exit_price": None,
+                "entry_price": _round(t.get("entry_price"), 4),
+                "exit_price": _round(t.get("exit_price"), 4),
+                "exit_underlying": _round(t.get("exit_underlying"), 4),
                 "exit_reason": t.get("exit_reason", ""),
                 "pnl": _round(t.get("pnl", 0), 2),
                 "return_pct": None,   # requires max_loss — Layer 2a

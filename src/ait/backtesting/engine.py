@@ -788,6 +788,7 @@ class Backtester:
                 pnl = self._calc_pnl(pos, current_val)
                 result["pnl"] = round(pnl, 2)
                 result["exit_price"] = round(current_val, 4)
+                result["exit_underlying"] = round(float(underlying), 4)
                 result["exit_time"] = bar_dt
                 return result
 
@@ -1551,6 +1552,7 @@ class Backtester:
             pnl = self._calc_pnl(pos, current_value)
             result["pnl"] = round(pnl, 2)
             result["exit_price"] = round(current_value, 4)
+            result["exit_underlying"] = round(float(underlying), 4)
             if "exit_time" not in result:
                 result["exit_time"] = result.get("exit_date")  # EOD exit — no intraday timestamp
             return result

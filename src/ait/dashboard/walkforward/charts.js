@@ -84,10 +84,11 @@
     }
 
     render(opts) {
-      const prevRange = this.priceChart ? this.priceChart.timeScale().getVisibleLogicalRange() : null;
+      const prevRange = this.priceChart ? this.priceChart.timeScale().getVisibleRange() : null;
       if (opts.data) this.data = opts.data;
       if (opts.activeSeries) this.activeSeries = opts.activeSeries;
       if (opts.theme) this.theme = opts.theme;
+      if (opts.windowRange !== undefined) this._windowRange = opts.windowRange;
       this.onHover = opts.onHover || this.onHover;
       this.onMarkerClick = opts.onMarkerClick || this.onMarkerClick;
       this.destroy();
@@ -137,7 +138,9 @@
       const priceReadout = (time, seriesData) => {
         const b = seriesData.get(candle);
         const f = this._featAt(time);
-        let html = `<span class="wf-lg-title">QQQ · 1D</span>`;
+        let html = time
+          ? `<span class="wf-lg-title">${time} · QQQ · 1D</span>`
+          : `<span class="wf-lg-title">QQQ · 1D</span>`;
         if (b) {
           const c = b.close >= b.open ? "wf-up" : "wf-down";
           html += ` <span class="wf-lg ${c}">O ${b.open?.toFixed(2)}</span><span class="wf-lg ${c}">H ${b.high?.toFixed(2)}</span><span class="wf-lg ${c}">L ${b.low?.toFixed(2)}</span><span class="wf-lg ${c}">C ${b.close?.toFixed(2)}</span>`;
@@ -168,9 +171,16 @@
       }
 
       this._wireSync();
-      // restore zoom
-      if (prevRange) { try { this.priceChart.timeScale().setVisibleLogicalRange(prevRange); } catch (e) {} }
-      else this.priceChart.timeScale().fitContent();
+      // Apply zoom: window range takes priority, then restore prev user zoom, else fit all.
+      if (this._windowRange) {
+        try { this.priceChart.timeScale().setVisibleRange({ from: this._windowRange[0], to: this._windowRange[1] }); } catch (e) {
+          this.priceChart.timeScale().fitContent();
+        }
+      } else if (prevRange) {
+        try { this.priceChart.timeScale().setVisibleRange(prevRange); } catch (e) {}
+      } else {
+        this.priceChart.timeScale().fitContent();
+      }
 
       if (this._pinned) this.pinTrade(this._pinned, false);
     }
@@ -279,11 +289,11 @@
       const syncRange = (src) => {
         if (this._syncing) return;
         this._syncing = true;
-        const r = src.timeScale().getVisibleLogicalRange();
-        if (r) charts.forEach(c => { if (c !== src) c.timeScale().setVisibleLogicalRange(r); });
+        const r = src.timeScale().getVisibleRange();
+        if (r) charts.forEach(c => { if (c !== src) { try { c.timeScale().setVisibleRange(r); } catch (e) {} } });
         this._syncing = false;
       };
-      charts.forEach(c => c.timeScale().subscribeVisibleLogicalRangeChange(() => syncRange(c)));
+      charts.forEach(c => c.timeScale().subscribeVisibleTimeRangeChange(() => syncRange(c)));
 
       // crosshair sync + readouts + hover callback
       this.charts.forEach(entry => {
@@ -337,12 +347,35 @@
           this._strikeLines.push(pl);
         });
         if (recenter) {
-          const ei = trade.entry_idx, xi = trade.exit_idx;
-          try { this.priceChart.timeScale().setVisibleLogicalRange({ from: Math.max(0, ei - 15), to: xi + 15 }); } catch (e) {}
+          const bars = this.data.bars;
+          const fromDate = bars[Math.max(0, trade.entry_idx - 15)]?.time ?? trade.entry_date;
+          const toDate   = bars[Math.min(bars.length - 1, trade.exit_idx + 15)]?.time ?? trade.exit_date;
+          this.charts.forEach(c => { try { c.chart.timeScale().setVisibleRange({ from: fromDate, to: toDate }); } catch (e) {} });
         }
       }
     }
     unpin() { this.pinTrade(null, false); }
+
+    // Zoom all panes to the given OOS window date range (YYYY-MM-DD strings).
+    // Adds a small margin so the first and last candle aren't flush against the edge.
+    setWindowRange(start, end) {
+      if (!this.priceChart) return;
+      try {
+        const from = start, to = end;
+        this.charts.forEach(c => {
+          try { c.chart.timeScale().setVisibleRange({ from, to }); } catch (e) {}
+        });
+      } catch (e) {}
+    }
+
+    // Reset all panes to show the full dataset.
+    fitAll() {
+      if (!this.priceChart) return;
+      try {
+        this.priceChart.timeScale().fitContent();
+        // Sub-panes sync via subscribeVisibleTimeRangeChange wiring.
+      } catch (e) {}
+    }
   }
 
   window.WFChart = WFChart;
