@@ -1,0 +1,1422 @@
+{
+  "window": 4,
+  "test_start": "2024-11-15",
+  "test_end": "2025-01-14",
+  "pnl": 442.53,
+  "return_pct": 0.4425,
+  "trades": 1,
+  "win_rate": 1.0,
+  "sharpe": 0.0,
+  "max_drawdown": 0.0,
+  "strategies": {
+    "iron_condor": 1
+  },
+  "best_params": {
+    "iron_condor__delta_short": 0.18832378772525368,
+    "iron_condor__max_hold_days": 21,
+    "iron_condor__wing_k": 1.9778982699131067,
+    "iron_condor__hurst_regime_threshold": 0.15581858118920036,
+    "iron_condor__hurst_regime_penalty": 0.19044513319369888,
+    "iron_condor__multifractal_max_width": 0.6493348296654756
+  },
+  "trades_detail": [
+    {
+      "symbol": "QQQ",
+      "strategy": "iron_condor",
+      "entry_date": "2024-12-31",
+      "entry_time": "2024-12-31T14:30:00+00:00",
+      "exit_date": "2025-01-14",
+      "exit_time": "2025-01-14",
+      "exit_reason": "backtest_end",
+      "pnl": 442.53,
+      "entry_confidence": 0.5762,
+      "entry_regime": "range_bound",
+      "contracts": 1,
+      "n_legs": 4,
+      "hold_days": 14,
+      "entry_price": 6.1154,
+      "limit_price": 517.05,
+      "fill_time": "2024-12-31T14:35:00+00:00",
+      "exit_price": 1.6381,
+      "entry_iv_rank": 0.7607,
+      "entry_vix_level": 0.5,
+      "credit": 611.54,
+      "max_loss": 4882.22,
+      "return_pct": 0.0906,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 490.0,
+          "premium": 2.5685
+        },
+        {
+          "type": "long_put",
+          "strike": 435.0,
+          "premium": 1.3454
+        },
+        {
+          "type": "short_call",
+          "strike": 537.0,
+          "premium": 2.4462
+        },
+        {
+          "type": "long_call",
+          "strike": 592.0,
+          "premium": 1.2231
+        }
+      ],
+      "decision": {
+        "direction_class": "bearish",
+        "direction_conf": 0.5762,
+        "range_gate": {
+          "prob": 0.5762,
+          "threshold": 0.55,
+          "pass": true
+        },
+        "vol_gate": {
+          "vol_10d": 0.2265,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.8128,
+          "threshold": 0.15581858118920036,
+          "pass": false
+        },
+        "regime": "range_bound",
+        "earnings_skip": false
+      },
+      "features_at_entry": {
+        "rsi_14": 44.36,
+        "macd_hist": -0.00438,
+        "bb_position": 0.065,
+        "atr_pct": 0.0178,
+        "realized_vol_20": 0.2021,
+        "iv_rank": 0.761,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.788,
+        "sentiment_composite": 0.0,
+        "put_call_ratio": 1.0
+      }
+    }
+  ],
+  "optuna_trials": [
+    {
+      "number": 0,
+      "state": "COMPLETE",
+      "value": 1.7503,
+      "params": {
+        "iron_condor__delta_short": 0.20618101782710435,
+        "iron_condor__max_hold_days": 39,
+        "iron_condor__wing_k": 1.5443897010793888,
+        "iron_condor__hurst_regime_threshold": 0.21170486652334802,
+        "iron_condor__hurst_regime_penalty": 0.03900466011060913,
+        "iron_condor__multifractal_max_width": 0.3545980821176709
+      },
+      "sharpe": 7.9782,
+      "win_rate": 0.6,
+      "max_drawdown": 0.0031,
+      "n_trades": 5,
+      "duration_s": 26.0,
+      "intermediate": 1.7503
+    },
+    {
+      "number": 1,
+      "state": "COMPLETE",
+      "value": 1.3079,
+      "params": {
+        "iron_condor__delta_short": 0.15871254182522992,
+        "iron_condor__max_hold_days": 37,
+        "iron_condor__wing_k": 1.321895519963455,
+        "iron_condor__hurst_regime_threshold": 0.23577596711513,
+        "iron_condor__hurst_regime_penalty": 0.005146123573950612,
+        "iron_condor__multifractal_max_width": 0.639468448256698
+      },
+      "sharpe": 3.9517,
+      "win_rate": 0.5,
+      "max_drawdown": 0.0023,
+      "n_trades": 6,
+      "duration_s": 24.3,
+      "intermediate": 1.3079
+    },
+    {
+      "number": 2,
+      "state": "COMPLETE",
+      "value": 0.7744,
+      "params": {
+        "iron_condor__delta_short": 0.27486639612006325,
+        "iron_condor__max_hold_days": 19,
+        "iron_condor__wing_k": 0.609102444252071,
+        "iron_condor__hurst_regime_threshold": 0.12034899216775544,
+        "iron_condor__hurst_regime_penalty": 0.07606056073988443,
+        "iron_condor__multifractal_max_width": 0.48366475107128326
+      },
+      "sharpe": 1.4981,
+      "win_rate": 0.4444,
+      "max_drawdown": 0.0132,
+      "n_trades": 9,
+      "duration_s": 24.8,
+      "intermediate": 0.7744
+    },
+    {
+      "number": 3,
+      "state": "COMPLETE",
+      "value": 3.1447,
+      "params": {
+        "iron_condor__delta_short": 0.21479175279631735,
+        "iron_condor__max_hold_days": 21,
+        "iron_condor__wing_k": 1.3401499210280452,
+        "iron_condor__hurst_regime_threshold": 0.1106886493434492,
+        "iron_condor__hurst_regime_penalty": 0.07303616213380454,
+        "iron_condor__multifractal_max_width": 0.4282266451527921
+      },
+      "sharpe": 7.2387,
+      "win_rate": 0.625,
+      "max_drawdown": 0.004,
+      "n_trades": 8,
+      "duration_s": 24.7,
+      "intermediate": 3.1447
+    },
+    {
+      "number": 4,
+      "state": "COMPLETE",
+      "value": 0.1724,
+      "params": {
+        "iron_condor__delta_short": 0.21841049763255538,
+        "iron_condor__max_hold_days": 35,
+        "iron_condor__wing_k": 0.6394454296692116,
+        "iron_condor__hurst_regime_threshold": 0.19313157645099455,
+        "iron_condor__hurst_regime_penalty": 0.14810364221551062,
+        "iron_condor__multifractal_max_width": 0.3162576444519992
+      },
+      "sharpe": 0.4488,
+      "win_rate": 0.4,
+      "max_drawdown": 0.0084,
+      "n_trades": 5,
+      "duration_s": 23.0,
+      "intermediate": 0.1724
+    },
+    {
+      "number": 5,
+      "state": "COMPLETE",
+      "value": -3.1053,
+      "params": {
+        "iron_condor__delta_short": 0.24113172778521574,
+        "iron_condor__max_hold_days": 18,
+        "iron_condor__wing_k": 0.41058770807497513,
+        "iron_condor__hurst_regime_threshold": 0.2887548181957333,
+        "iron_condor__hurst_regime_penalty": 0.24140800826863984,
+        "iron_condor__multifractal_max_width": 0.5829390718407614
+      },
+      "sharpe": -7.9414,
+      "win_rate": 0.2,
+      "max_drawdown": 0.0439,
+      "n_trades": 10,
+      "duration_s": 26.4,
+      "intermediate": -3.1053
+    },
+    {
+      "number": 6,
+      "state": "COMPLETE",
+      "value": 0.555,
+      "params": {
+        "iron_condor__delta_short": 0.1956920653760056,
+        "iron_condor__max_hold_days": 16,
+        "iron_condor__wing_k": 1.4631961450706668,
+        "iron_condor__hurst_regime_threshold": 0.17683354862271228,
+        "iron_condor__hurst_regime_penalty": 0.030509558711194706,
+        "iron_condor__multifractal_max_width": 0.4733119185389446
+      },
+      "sharpe": 0.8933,
+      "win_rate": 0.5,
+      "max_drawdown": 0.0117,
+      "n_trades": 12,
+      "duration_s": 27.0,
+      "intermediate": 0.555
+    },
+    {
+      "number": 7,
+      "state": "COMPLETE",
+      "value": 0.9904,
+      "params": {
+        "iron_condor__delta_short": 0.15515827816728275,
+        "iron_condor__max_hold_days": 38,
+        "iron_condor__wing_k": 0.7399259687200288,
+        "iron_condor__hurst_regime_threshold": 0.225754902557876,
+        "iron_condor__hurst_regime_penalty": 0.07792776902235274,
+        "iron_condor__multifractal_max_width": 0.48202380741223383
+      },
+      "sharpe": 2.8726,
+      "win_rate": 0.5,
+      "max_drawdown": 0.0049,
+      "n_trades": 6,
+      "duration_s": 24.3,
+      "intermediate": 0.9904
+    },
+    {
+      "number": 8,
+      "state": "COMPLETE",
+      "value": 2.9287,
+      "params": {
+        "iron_condor__delta_short": 0.23200654190149195,
+        "iron_condor__max_hold_days": 18,
+        "iron_condor__wing_k": 1.9482938671997496,
+        "iron_condor__hurst_regime_threshold": 0.2505292211394452,
+        "iron_condor__hurst_regime_penalty": 0.23487473539104728,
+        "iron_condor__multifractal_max_width": 0.6131895726496771
+      },
+      "sharpe": 6.6575,
+      "win_rate": 0.6667,
+      "max_drawdown": 0.0047,
+      "n_trades": 9,
+      "duration_s": 24.6,
+      "intermediate": 2.9287
+    },
+    {
+      "number": 9,
+      "state": "COMPLETE",
+      "value": 0.2881,
+      "params": {
+        "iron_condor__delta_short": 0.23968499682166278,
+        "iron_condor__max_hold_days": 38,
+        "iron_condor__wing_k": 0.45043725348826313,
+        "iron_condor__hurst_regime_threshold": 0.12311622973221194,
+        "iron_condor__hurst_regime_penalty": 0.011306822227634516,
+        "iron_condor__multifractal_max_width": 0.41386561576714254
+      },
+      "sharpe": 1.0172,
+      "win_rate": 0.4,
+      "max_drawdown": 0.0114,
+      "n_trades": 5,
+      "duration_s": 25.6,
+      "intermediate": 0.2881
+    },
+    {
+      "number": 10,
+      "state": "COMPLETE",
+      "value": 0.917,
+      "params": {
+        "iron_condor__delta_short": 0.29177048163455804,
+        "iron_condor__max_hold_days": 26,
+        "iron_condor__wing_k": 1.0309612374582728,
+        "iron_condor__hurst_regime_threshold": 0.08395161263526028,
+        "iron_condor__hurst_regime_penalty": 0.14947026670184654,
+        "iron_condor__multifractal_max_width": 0.5415864757492008
+      },
+      "sharpe": 2.6255,
+      "win_rate": 0.5,
+      "max_drawdown": 0.0103,
+      "n_trades": 6,
+      "duration_s": 26.9,
+      "intermediate": 0.917
+    },
+    {
+      "number": 11,
+      "state": "COMPLETE",
+      "value": 2.7549,
+      "params": {
+        "iron_condor__delta_short": 0.2534090525229545,
+        "iron_condor__max_hold_days": 24,
+        "iron_condor__wing_k": 1.9098351898632542,
+        "iron_condor__hurst_regime_threshold": 0.28040956032993525,
+        "iron_condor__hurst_regime_penalty": 0.24809721477297475,
+        "iron_condor__multifractal_max_width": 0.41355727275621923
+      },
+      "sharpe": 6.319,
+      "win_rate": 0.5714,
+      "max_drawdown": 0.0064,
+      "n_trades": 7,
+      "duration_s": 25.7,
+      "intermediate": 2.7549
+    },
+    {
+      "number": 12,
+      "state": "COMPLETE",
+      "value": 3.7347,
+      "params": {
+        "iron_condor__delta_short": 0.18832378772525368,
+        "iron_condor__max_hold_days": 21,
+        "iron_condor__wing_k": 1.9778982699131067,
+        "iron_condor__hurst_regime_threshold": 0.15581858118920036,
+        "iron_condor__hurst_regime_penalty": 0.19044513319369888,
+        "iron_condor__multifractal_max_width": 0.6493348296654756
+      },
+      "sharpe": 8.6243,
+      "win_rate": 0.7143,
+      "max_drawdown": 0.0036,
+      "n_trades": 7,
+      "duration_s": 28.7,
+      "intermediate": 3.7347
+    },
+    {
+      "number": 13,
+      "state": "COMPLETE",
+      "value": 2.4209,
+      "params": {
+        "iron_condor__delta_short": 0.1823754061069328,
+        "iron_condor__max_hold_days": 23,
+        "iron_condor__wing_k": 1.7294720844683367,
+        "iron_condor__hurst_regime_threshold": 0.1515313574651215,
+        "iron_condor__hurst_regime_penalty": 0.19014900881611876,
+        "iron_condor__multifractal_max_width": 0.5370207792016167
+      },
+      "sharpe": 5.4289,
+      "win_rate": 0.625,
+      "max_drawdown": 0.0033,
+      "n_trades": 8,
+      "duration_s": 27.6,
+      "intermediate": 2.4209
+    },
+    {
+      "number": 14,
+      "state": "COMPLETE",
+      "value": -0.2998,
+      "params": {
+        "iron_condor__delta_short": 0.19796930969885415,
+        "iron_condor__max_hold_days": 29,
+        "iron_condor__wing_k": 1.0455747067659367,
+        "iron_condor__hurst_regime_threshold": 0.08893045049309506,
+        "iron_condor__hurst_regime_penalty": 0.10972123330702872,
+        "iron_condor__multifractal_max_width": 0.40558715955026664
+      },
+      "sharpe": -1.1733,
+      "win_rate": 0.4286,
+      "max_drawdown": 0.0094,
+      "n_trades": 7,
+      "duration_s": 26.8,
+      "intermediate": -0.2998
+    },
+    {
+      "number": 15,
+      "state": "COMPLETE",
+      "value": 2.0516,
+      "params": {
+        "iron_condor__delta_short": 0.18149218358346686,
+        "iron_condor__max_hold_days": 30,
+        "iron_condor__wing_k": 1.2363057756059435,
+        "iron_condor__hurst_regime_threshold": 0.14939106361278365,
+        "iron_condor__hurst_regime_penalty": 0.1891919139359217,
+        "iron_condor__multifractal_max_width": 0.539926612845127
+      },
+      "sharpe": 4.6303,
+      "win_rate": 0.5,
+      "max_drawdown": 0.0026,
+      "n_trades": 8,
+      "duration_s": 26.6,
+      "intermediate": 2.0516
+    },
+    {
+      "number": 16,
+      "state": "COMPLETE",
+      "value": -0.6636,
+      "params": {
+        "iron_condor__delta_short": 0.17525563593124355,
+        "iron_condor__max_hold_days": 14,
+        "iron_condor__wing_k": 1.682226974367269,
+        "iron_condor__hurst_regime_threshold": 0.12310437748140596,
+        "iron_condor__hurst_regime_penalty": 0.1944279008767352,
+        "iron_condor__multifractal_max_width": 0.37161033739878935
+      },
+      "sharpe": -2.0542,
+      "win_rate": 0.4,
+      "max_drawdown": 0.0095,
+      "n_trades": 15,
+      "duration_s": 30.9,
+      "intermediate": -0.6636
+    },
+    {
+      "number": 17,
+      "state": "COMPLETE",
+      "value": 1.3798,
+      "params": {
+        "iron_condor__delta_short": 0.2153296470649575,
+        "iron_condor__max_hold_days": 21,
+        "iron_condor__wing_k": 0.8956375056622965,
+        "iron_condor__hurst_regime_threshold": 0.15993498516014296,
+        "iron_condor__hurst_regime_penalty": 0.10493757443043865,
+        "iron_condor__multifractal_max_width": 0.4508696710209469
+      },
+      "sharpe": 2.9548,
+      "win_rate": 0.5,
+      "max_drawdown": 0.0104,
+      "n_trades": 8,
+      "duration_s": 27.1,
+      "intermediate": 1.3798
+    },
+    {
+      "number": 18,
+      "state": "COMPLETE",
+      "value": 1.5092,
+      "params": {
+        "iron_condor__delta_short": 0.2642494099965326,
+        "iron_condor__max_hold_days": 31,
+        "iron_condor__wing_k": 1.4427503625007614,
+        "iron_condor__hurst_regime_threshold": 0.10909740199367257,
+        "iron_condor__hurst_regime_penalty": 0.15231498905262814,
+        "iron_condor__multifractal_max_width": 0.511915215569564
+      },
+      "sharpe": 4.6375,
+      "win_rate": 0.5,
+      "max_drawdown": 0.004,
+      "n_trades": 6,
+      "duration_s": 26.4,
+      "intermediate": 1.5092
+    },
+    {
+      "number": 19,
+      "state": "COMPLETE",
+      "value": 2.2167,
+      "params": {
+        "iron_condor__delta_short": 0.16424590541756412,
+        "iron_condor__max_hold_days": 22,
+        "iron_condor__wing_k": 1.7272167581206368,
+        "iron_condor__hurst_regime_threshold": 0.17849494404868335,
+        "iron_condor__hurst_regime_penalty": 0.06376426730347405,
+        "iron_condor__multifractal_max_width": 0.600877456318443
+      },
+      "sharpe": 4.9873,
+      "win_rate": 0.5556,
+      "max_drawdown": 0.002,
+      "n_trades": 9,
+      "duration_s": 27.8,
+      "intermediate": 2.2167
+    },
+    {
+      "number": 20,
+      "state": "COMPLETE",
+      "value": 1.7471,
+      "params": {
+        "iron_condor__delta_short": 0.19645511695750742,
+        "iron_condor__max_hold_days": 26,
+        "iron_condor__wing_k": 1.8303652225311084,
+        "iron_condor__hurst_regime_threshold": 0.14046764877895782,
+        "iron_condor__hurst_regime_penalty": 0.21765700028798485,
+        "iron_condor__multifractal_max_width": 0.30829339402704137
+      },
+      "sharpe": 5.4461,
+      "win_rate": 0.5,
+      "max_drawdown": 0.0021,
+      "n_trades": 6,
+      "duration_s": 29.4,
+      "intermediate": 1.7471
+    },
+    {
+      "number": 21,
+      "state": "COMPLETE",
+      "value": 2.9263,
+      "params": {
+        "iron_condor__delta_short": 0.23210136155491984,
+        "iron_condor__max_hold_days": 18,
+        "iron_condor__wing_k": 1.9977134316272291,
+        "iron_condor__hurst_regime_threshold": 0.25907861522712294,
+        "iron_condor__hurst_regime_penalty": 0.21492084194417366,
+        "iron_condor__multifractal_max_width": 0.6448426494167009
+      },
+      "sharpe": 6.6514,
+      "win_rate": 0.6667,
+      "max_drawdown": 0.0048,
+      "n_trades": 9,
+      "duration_s": 27.4,
+      "intermediate": 2.9263
+    },
+    {
+      "number": 22,
+      "state": "COMPLETE",
+      "value": 2.4596,
+      "params": {
+        "iron_condor__delta_short": 0.2263432486158009,
+        "iron_condor__max_hold_days": 20,
+        "iron_condor__wing_k": 1.9782214013282164,
+        "iron_condor__hurst_regime_threshold": 0.2063794894619156,
+        "iron_condor__hurst_regime_penalty": 0.2126826183268272,
+        "iron_condor__multifractal_max_width": 0.5996167452152723
+      },
+      "sharpe": 5.526,
+      "win_rate": 0.625,
+      "max_drawdown": 0.0041,
+      "n_trades": 8,
+      "duration_s": 27.2,
+      "intermediate": 2.4596
+    },
+    {
+      "number": 23,
+      "state": "COMPLETE",
+      "value": 0.5991,
+      "params": {
+        "iron_condor__delta_short": 0.207800460042061,
+        "iron_condor__max_hold_days": 16,
+        "iron_condor__wing_k": 1.5754445271667015,
+        "iron_condor__hurst_regime_threshold": 0.2541566331918719,
+        "iron_condor__hurst_regime_penalty": 0.18160875252081027,
+        "iron_condor__multifractal_max_width": 0.6202217047697846
+      },
+      "sharpe": 1.042,
+      "win_rate": 0.4615,
+      "max_drawdown": 0.0115,
+      "n_trades": 13,
+      "duration_s": 28.9,
+      "intermediate": 0.5991
+    },
+    {
+      "number": 24,
+      "state": "COMPLETE",
+      "value": 2.3969,
+      "params": {
+        "iron_condor__delta_short": 0.2506699986887322,
+        "iron_condor__max_hold_days": 24,
+        "iron_condor__wing_k": 1.7884156690897324,
+        "iron_condor__hurst_regime_threshold": 0.10363757608601322,
+        "iron_condor__hurst_regime_penalty": 0.16356369574429985,
+        "iron_condor__multifractal_max_width": 0.5635673698687825
+      },
+      "sharpe": 5.4226,
+      "win_rate": 0.5714,
+      "max_drawdown": 0.0035,
+      "n_trades": 7,
+      "duration_s": 26.4,
+      "intermediate": 2.3969
+    },
+    {
+      "number": 25,
+      "state": "COMPLETE",
+      "value": -1.8223,
+      "params": {
+        "iron_condor__delta_short": 0.22315617445510996,
+        "iron_condor__max_hold_days": 14,
+        "iron_condor__wing_k": 1.3450712650029562,
+        "iron_condor__hurst_regime_threshold": 0.17555180347905436,
+        "iron_condor__hurst_regime_penalty": 0.12037360749106608,
+        "iron_condor__multifractal_max_width": 0.4431503748746133
+      },
+      "sharpe": -4.9031,
+      "win_rate": 0.3571,
+      "max_drawdown": 0.0196,
+      "n_trades": 14,
+      "duration_s": 32.3,
+      "intermediate": -1.8223
+    },
+    {
+      "number": 26,
+      "state": "COMPLETE",
+      "value": 0.1582,
+      "params": {
+        "iron_condor__delta_short": 0.1904506063570421,
+        "iron_condor__max_hold_days": 16,
+        "iron_condor__wing_k": 1.8722338124250963,
+        "iron_condor__hurst_regime_threshold": 0.13717643062046625,
+        "iron_condor__hurst_regime_penalty": 0.2375433073995573,
+        "iron_condor__multifractal_max_width": 0.6219157287582426
+      },
+      "sharpe": -0.0288,
+      "win_rate": 0.4286,
+      "max_drawdown": 0.0086,
+      "n_trades": 14,
+      "duration_s": 30.4,
+      "intermediate": 0.1582
+    },
+    {
+      "number": 27,
+      "state": "COMPLETE",
+      "value": 2.9609,
+      "params": {
+        "iron_condor__delta_short": 0.20951794887846356,
+        "iron_condor__max_hold_days": 21,
+        "iron_condor__wing_k": 1.5997069831059965,
+        "iron_condor__hurst_regime_threshold": 0.16799765202250622,
+        "iron_condor__hurst_regime_penalty": 0.09448010194441607,
+        "iron_condor__multifractal_max_width": 0.5790661455621545
+      },
+      "sharpe": 6.779,
+      "win_rate": 0.625,
+      "max_drawdown": 0.0036,
+      "n_trades": 8,
+      "duration_s": 28.0,
+      "intermediate": 2.9609
+    },
+    {
+      "number": 28,
+      "state": "COMPLETE",
+      "value": 0.7474,
+      "params": {
+        "iron_condor__delta_short": 0.17237006503304064,
+        "iron_condor__max_hold_days": 28,
+        "iron_condor__wing_k": 1.5824439178721226,
+        "iron_condor__hurst_regime_threshold": 0.1620191981406753,
+        "iron_condor__hurst_regime_penalty": 0.09517294784585484,
+        "iron_condor__multifractal_max_width": 0.571631227309795
+      },
+      "sharpe": 1.4957,
+      "win_rate": 0.375,
+      "max_drawdown": 0.0046,
+      "n_trades": 8,
+      "duration_s": 28.3,
+      "intermediate": 0.7474
+    },
+    {
+      "number": 29,
+      "state": "COMPLETE",
+      "value": 1.4417,
+      "params": {
+        "iron_condor__delta_short": 0.21262898126455052,
+        "iron_condor__max_hold_days": 32,
+        "iron_condor__wing_k": 1.5154566528952857,
+        "iron_condor__hurst_regime_threshold": 0.19691325259272185,
+        "iron_condor__hurst_regime_penalty": 0.05114182064104876,
+        "iron_condor__multifractal_max_width": 0.36716019781340714
+      },
+      "sharpe": 4.4074,
+      "win_rate": 0.5,
+      "max_drawdown": 0.0031,
+      "n_trades": 6,
+      "duration_s": 28.2,
+      "intermediate": 1.4417
+    },
+    {
+      "number": 30,
+      "state": "COMPLETE",
+      "value": -0.4656,
+      "params": {
+        "iron_condor__delta_short": 0.20133544890673435,
+        "iron_condor__max_hold_days": 25,
+        "iron_condor__wing_k": 1.1375448527726495,
+        "iron_condor__hurst_regime_threshold": 0.10310501410836648,
+        "iron_condor__hurst_regime_penalty": 0.12577278038374107,
+        "iron_condor__multifractal_max_width": 0.33923939260238956
+      },
+      "sharpe": -1.5337,
+      "win_rate": 0.375,
+      "max_drawdown": 0.0105,
+      "n_trades": 8,
+      "duration_s": 28.9,
+      "intermediate": -0.4656
+    },
+    {
+      "number": 31,
+      "state": "COMPLETE",
+      "value": 2.0584,
+      "params": {
+        "iron_condor__delta_short": 0.23244848135057952,
+        "iron_condor__max_hold_days": 21,
+        "iron_condor__wing_k": 1.616403916520284,
+        "iron_condor__hurst_regime_threshold": 0.20891535553138607,
+        "iron_condor__hurst_regime_penalty": 0.09096939371691631,
+        "iron_condor__multifractal_max_width": 0.6172635647213808
+      },
+      "sharpe": 4.6474,
+      "win_rate": 0.5,
+      "max_drawdown": 0.0027,
+      "n_trades": 8,
+      "duration_s": 27.9,
+      "intermediate": 2.0584
+    },
+    {
+      "number": 32,
+      "state": "COMPLETE",
+      "value": 2.2209,
+      "params": {
+        "iron_condor__delta_short": 0.2127921431203879,
+        "iron_condor__max_hold_days": 19,
+        "iron_condor__wing_k": 1.3387376525339074,
+        "iron_condor__hurst_regime_threshold": 0.24892287953183878,
+        "iron_condor__hurst_regime_penalty": 0.036224336656903264,
+        "iron_condor__multifractal_max_width": 0.6403398464593802
+      },
+      "sharpe": 4.9307,
+      "win_rate": 0.625,
+      "max_drawdown": 0.0066,
+      "n_trades": 8,
+      "duration_s": 26.7,
+      "intermediate": 2.2209
+    },
+    {
+      "number": 33,
+      "state": "COMPLETE",
+      "value": 2.5115,
+      "params": {
+        "iron_condor__delta_short": 0.18714392213365605,
+        "iron_condor__max_hold_days": 22,
+        "iron_condor__wing_k": 1.7851639510972153,
+        "iron_condor__hurst_regime_threshold": 0.2254824837700837,
+        "iron_condor__hurst_regime_penalty": 0.22596417698085727,
+        "iron_condor__multifractal_max_width": 0.5100539102379429
+      },
+      "sharpe": 5.6554,
+      "win_rate": 0.625,
+      "max_drawdown": 0.0033,
+      "n_trades": 8,
+      "duration_s": 27.9,
+      "intermediate": 2.5115
+    },
+    {
+      "number": 34,
+      "state": "COMPLETE",
+      "value": 0.6799,
+      "params": {
+        "iron_condor__delta_short": 0.20601477537282553,
+        "iron_condor__max_hold_days": 18,
+        "iron_condor__wing_k": 1.894084068497933,
+        "iron_condor__hurst_regime_threshold": 0.16854296409604835,
+        "iron_condor__hurst_regime_penalty": 0.12626657444390038,
+        "iron_condor__multifractal_max_width": 0.5940825343691508
+      },
+      "sharpe": 1.2585,
+      "win_rate": 0.4444,
+      "max_drawdown": 0.0066,
+      "n_trades": 9,
+      "duration_s": 27.5,
+      "intermediate": 0.6799
+    },
+    {
+      "number": 35,
+      "state": "COMPLETE",
+      "value": 2.6901,
+      "params": {
+        "iron_condor__delta_short": 0.22532890198838365,
+        "iron_condor__max_hold_days": 19,
+        "iron_condor__wing_k": 1.6510080074986158,
+        "iron_condor__hurst_regime_threshold": 0.13461440081898313,
+        "iron_condor__hurst_regime_penalty": 0.07202356265055458,
+        "iron_condor__multifractal_max_width": 0.6207261005562537
+      },
+      "sharpe": 6.1024,
+      "win_rate": 0.625,
+      "max_drawdown": 0.0044,
+      "n_trades": 8,
+      "duration_s": 26.8,
+      "intermediate": 2.6901
+    },
+    {
+      "number": 36,
+      "state": "COMPLETE",
+      "value": 2.3667,
+      "params": {
+        "iron_condor__delta_short": 0.24125578089631922,
+        "iron_condor__max_hold_days": 17,
+        "iron_condor__wing_k": 1.3969514242044927,
+        "iron_condor__hurst_regime_threshold": 0.19065759305529853,
+        "iron_condor__hurst_regime_penalty": 0.05125151104551781,
+        "iron_condor__multifractal_max_width": 0.5605052062255048
+      },
+      "sharpe": 5.2545,
+      "win_rate": 0.6667,
+      "max_drawdown": 0.0089,
+      "n_trades": 9,
+      "duration_s": 25.2,
+      "intermediate": 2.3667
+    },
+    {
+      "number": 37,
+      "state": "COMPLETE",
+      "value": -0.2148,
+      "params": {
+        "iron_condor__delta_short": 0.1645408513628006,
+        "iron_condor__max_hold_days": 20,
+        "iron_condor__wing_k": 1.2616940259535487,
+        "iron_condor__hurst_regime_threshold": 0.2752375123201647,
+        "iron_condor__hurst_regime_penalty": 0.16835644224877783,
+        "iron_condor__multifractal_max_width": 0.648504855149536
+      },
+      "sharpe": -0.9769,
+      "win_rate": 0.4444,
+      "max_drawdown": 0.0092,
+      "n_trades": 9,
+      "duration_s": 26.7,
+      "intermediate": -0.2148
+    },
+    {
+      "number": 38,
+      "state": "COMPLETE",
+      "value": 3.1453,
+      "params": {
+        "iron_condor__delta_short": 0.2529274254715873,
+        "iron_condor__max_hold_days": 23,
+        "iron_condor__wing_k": 1.5149810966185706,
+        "iron_condor__hurst_regime_threshold": 0.22370995317723094,
+        "iron_condor__hurst_regime_penalty": 0.1384332014489103,
+        "iron_condor__multifractal_max_width": 0.5848084209502677
+      },
+      "sharpe": 7.2936,
+      "win_rate": 0.5714,
+      "max_drawdown": 0.0037,
+      "n_trades": 7,
+      "duration_s": 26.0,
+      "intermediate": 3.1453
+    },
+    {
+      "number": 39,
+      "state": "COMPLETE",
+      "value": 1.3886,
+      "params": {
+        "iron_condor__delta_short": 0.29128007141474693,
+        "iron_condor__max_hold_days": 23,
+        "iron_condor__wing_k": 1.4872396134621368,
+        "iron_condor__hurst_regime_threshold": 0.22374021447617898,
+        "iron_condor__hurst_regime_penalty": 0.021235046806876212,
+        "iron_condor__multifractal_max_width": 0.5100844076629851
+      },
+      "sharpe": 2.9746,
+      "win_rate": 0.5,
+      "max_drawdown": 0.006,
+      "n_trades": 8,
+      "duration_s": 26.8,
+      "intermediate": 1.3886
+    },
+    {
+      "number": 40,
+      "state": "COMPLETE",
+      "value": 1.2503,
+      "params": {
+        "iron_condor__delta_short": 0.25116520094458583,
+        "iron_condor__max_hold_days": 27,
+        "iron_condor__wing_k": 1.192519624056708,
+        "iron_condor__hurst_regime_threshold": 0.18242954545843423,
+        "iron_condor__hurst_regime_penalty": 0.14074174080560037,
+        "iron_condor__multifractal_max_width": 0.4496073693034891
+      },
+      "sharpe": 3.757,
+      "win_rate": 0.5,
+      "max_drawdown": 0.0046,
+      "n_trades": 6,
+      "duration_s": 26.8,
+      "intermediate": 1.2503
+    },
+    {
+      "number": 41,
+      "state": "COMPLETE",
+      "value": 1.9665,
+      "params": {
+        "iron_condor__delta_short": 0.2741973400800557,
+        "iron_condor__max_hold_days": 21,
+        "iron_condor__wing_k": 1.9372985409435695,
+        "iron_condor__hurst_regime_threshold": 0.2647742838797506,
+        "iron_condor__hurst_regime_penalty": 0.08582259766787828,
+        "iron_condor__multifractal_max_width": 0.5881904377201167
+      },
+      "sharpe": 4.4182,
+      "win_rate": 0.5,
+      "max_drawdown": 0.0041,
+      "n_trades": 8,
+      "duration_s": 25.6,
+      "intermediate": 1.9665
+    },
+    {
+      "number": 42,
+      "state": "COMPLETE",
+      "value": 0.2535,
+      "params": {
+        "iron_condor__delta_short": 0.2597217961106926,
+        "iron_condor__max_hold_days": 23,
+        "iron_condor__wing_k": 1.7431872776149295,
+        "iron_condor__hurst_regime_threshold": 0.23936447361616225,
+        "iron_condor__hurst_regime_penalty": 0.20712839602787808,
+        "iron_condor__multifractal_max_width": 0.629219912390198
+      },
+      "sharpe": 0.2629,
+      "win_rate": 0.375,
+      "max_drawdown": 0.0083,
+      "n_trades": 8,
+      "duration_s": 27.1,
+      "intermediate": 0.2535
+    },
+    {
+      "number": 43,
+      "state": "COMPLETE",
+      "value": 1.4727,
+      "params": {
+        "iron_condor__delta_short": 0.23761683099327904,
+        "iron_condor__max_hold_days": 25,
+        "iron_condor__wing_k": 1.4036611956844731,
+        "iron_condor__hurst_regime_threshold": 0.23934590170908204,
+        "iron_condor__hurst_regime_penalty": 0.23181573582353426,
+        "iron_condor__multifractal_max_width": 0.6098488983953632
+      },
+      "sharpe": 3.1841,
+      "win_rate": 0.5,
+      "max_drawdown": 0.0049,
+      "n_trades": 8,
+      "duration_s": 26.1,
+      "intermediate": 1.4727
+    },
+    {
+      "number": 44,
+      "state": "COMPLETE",
+      "value": 2.7765,
+      "params": {
+        "iron_condor__delta_short": 0.22002747532874145,
+        "iron_condor__max_hold_days": 20,
+        "iron_condor__wing_k": 1.5508914231106752,
+        "iron_condor__hurst_regime_threshold": 0.29463058078463245,
+        "iron_condor__hurst_regime_penalty": 0.138904224707583,
+        "iron_condor__multifractal_max_width": 0.5791767057604108
+      },
+      "sharpe": 6.3181,
+      "win_rate": 0.625,
+      "max_drawdown": 0.0038,
+      "n_trades": 8,
+      "duration_s": 26.2,
+      "intermediate": 2.7765
+    },
+    {
+      "number": 45,
+      "state": "COMPLETE",
+      "value": 1.7499,
+      "params": {
+        "iron_condor__delta_short": 0.24436938893060595,
+        "iron_condor__max_hold_days": 35,
+        "iron_condor__wing_k": 1.655678708799055,
+        "iron_condor__hurst_regime_threshold": 0.21752669074288256,
+        "iron_condor__hurst_regime_penalty": 0.24954480734332224,
+        "iron_condor__multifractal_max_width": 0.46807821170173874
+      },
+      "sharpe": 7.9764,
+      "win_rate": 0.6,
+      "max_drawdown": 0.0036,
+      "n_trades": 5,
+      "duration_s": 26.3,
+      "intermediate": 1.7499
+    },
+    {
+      "number": 46,
+      "state": "COMPLETE",
+      "value": 0.0794,
+      "params": {
+        "iron_condor__delta_short": 0.23131840412825172,
+        "iron_condor__max_hold_days": 40,
+        "iron_condor__wing_k": 1.0562417006176072,
+        "iron_condor__hurst_regime_threshold": 0.15254944902007755,
+        "iron_condor__hurst_regime_penalty": 0.10395839171059879,
+        "iron_condor__multifractal_max_width": 0.43064070852225556
+      },
+      "sharpe": -0.0084,
+      "win_rate": 0.4,
+      "max_drawdown": 0.0049,
+      "n_trades": 5,
+      "duration_s": 25.9,
+      "intermediate": 0.0794
+    },
+    {
+      "number": 47,
+      "state": "COMPLETE",
+      "value": 3.1228,
+      "params": {
+        "iron_condor__delta_short": 0.20347525382270462,
+        "iron_condor__max_hold_days": 22,
+        "iron_condor__wing_k": 1.276819846579808,
+        "iron_condor__hurst_regime_threshold": 0.1126167830971698,
+        "iron_condor__hurst_regime_penalty": 0.1670628148937161,
+        "iron_condor__multifractal_max_width": 0.529896861724221
+      },
+      "sharpe": 7.1838,
+      "win_rate": 0.625,
+      "max_drawdown": 0.0036,
+      "n_trades": 8,
+      "duration_s": 25.6,
+      "intermediate": 3.1228
+    },
+    {
+      "number": 48,
+      "state": "COMPLETE",
+      "value": 1.8008,
+      "params": {
+        "iron_condor__delta_short": 0.2043299468237335,
+        "iron_condor__max_hold_days": 22,
+        "iron_condor__wing_k": 0.8706033735844783,
+        "iron_condor__hurst_regime_threshold": 0.11398724953906912,
+        "iron_condor__hurst_regime_penalty": 0.17169491346625673,
+        "iron_condor__multifractal_max_width": 0.39491371650221774
+      },
+      "sharpe": 4.0061,
+      "win_rate": 0.5,
+      "max_drawdown": 0.0081,
+      "n_trades": 8,
+      "duration_s": 26.1,
+      "intermediate": 1.8008
+    },
+    {
+      "number": 49,
+      "state": "COMPLETE",
+      "value": 2.566,
+      "params": {
+        "iron_condor__delta_short": 0.19028630240125546,
+        "iron_condor__max_hold_days": 24,
+        "iron_condor__wing_k": 1.2933340346930253,
+        "iron_condor__hurst_regime_threshold": 0.09089178556809617,
+        "iron_condor__hurst_regime_penalty": 0.1555845813693071,
+        "iron_condor__multifractal_max_width": 0.49573266871534755
+      },
+      "sharpe": 5.8452,
+      "win_rate": 0.5714,
+      "max_drawdown": 0.0031,
+      "n_trades": 7,
+      "duration_s": 26.1,
+      "intermediate": 2.566
+    },
+    {
+      "number": 50,
+      "state": "COMPLETE",
+      "value": 1.5412,
+      "params": {
+        "iron_condor__delta_short": 0.21071758033971796,
+        "iron_condor__max_hold_days": 26,
+        "iron_condor__wing_k": 1.1889149510087433,
+        "iron_condor__hurst_regime_threshold": 0.13130946398565355,
+        "iron_condor__hurst_regime_penalty": 0.17770389770338213,
+        "iron_condor__multifractal_max_width": 0.5520886117248792
+      },
+      "sharpe": 3.3551,
+      "win_rate": 0.5,
+      "max_drawdown": 0.0042,
+      "n_trades": 8,
+      "duration_s": 25.0,
+      "intermediate": 1.5412
+    },
+    {
+      "number": 51,
+      "state": "COMPLETE",
+      "value": 2.0037,
+      "params": {
+        "iron_condor__delta_short": 0.19695747323057966,
+        "iron_condor__max_hold_days": 19,
+        "iron_condor__wing_k": 1.1022388192096622,
+        "iron_condor__hurst_regime_threshold": 0.08089523113216092,
+        "iron_condor__hurst_regime_penalty": 0.19914555881110568,
+        "iron_condor__multifractal_max_width": 0.5354130531710348
+      },
+      "sharpe": 4.4585,
+      "win_rate": 0.5556,
+      "max_drawdown": 0.0098,
+      "n_trades": 9,
+      "duration_s": 25.8,
+      "intermediate": 2.0037
+    },
+    {
+      "number": 52,
+      "state": "COMPLETE",
+      "value": 2.9229,
+      "params": {
+        "iron_condor__delta_short": 0.21835373002530972,
+        "iron_condor__max_hold_days": 17,
+        "iron_condor__wing_k": 0.9712929676400235,
+        "iron_condor__hurst_regime_threshold": 0.14574321111751437,
+        "iron_condor__hurst_regime_penalty": 0.0616271620186668,
+        "iron_condor__multifractal_max_width": 0.5805502549203836
+      },
+      "sharpe": 6.6458,
+      "win_rate": 0.6667,
+      "max_drawdown": 0.0105,
+      "n_trades": 9,
+      "duration_s": 24.5,
+      "intermediate": 2.9229
+    },
+    {
+      "number": 53,
+      "state": "COMPLETE",
+      "value": 1.514,
+      "params": {
+        "iron_condor__delta_short": 0.1825781847433285,
+        "iron_condor__max_hold_days": 21,
+        "iron_condor__wing_k": 1.4500943132171682,
+        "iron_condor__hurst_regime_threshold": 0.12711744110332235,
+        "iron_condor__hurst_regime_penalty": 0.138944068569835,
+        "iron_condor__multifractal_max_width": 0.5227949214838623
+      },
+      "sharpe": 3.1628,
+      "win_rate": 0.625,
+      "max_drawdown": 0.0059,
+      "n_trades": 8,
+      "duration_s": 25.3,
+      "intermediate": 1.514
+    },
+    {
+      "number": 54,
+      "state": "COMPLETE",
+      "value": 0.7684,
+      "params": {
+        "iron_condor__delta_short": 0.26120373243416417,
+        "iron_condor__max_hold_days": 22,
+        "iron_condor__wing_k": 1.8414820509778382,
+        "iron_condor__hurst_regime_threshold": 0.11694523754190653,
+        "iron_condor__hurst_regime_penalty": 0.11156088469740148,
+        "iron_condor__multifractal_max_width": 0.6047569764409639
+      },
+      "sharpe": 1.5494,
+      "win_rate": 0.375,
+      "max_drawdown": 0.0067,
+      "n_trades": 8,
+      "duration_s": 27.6,
+      "intermediate": 0.7684
+    },
+    {
+      "number": 55,
+      "state": "COMPLETE",
+      "value": 0.6963,
+      "params": {
+        "iron_condor__delta_short": 0.17523518285745368,
+        "iron_condor__max_hold_days": 15,
+        "iron_condor__wing_k": 1.373336690988994,
+        "iron_condor__hurst_regime_threshold": 0.0970977798380732,
+        "iron_condor__hurst_regime_penalty": 0.20210460226848356,
+        "iron_condor__multifractal_max_width": 0.6330985379632253
+      },
+      "sharpe": 1.2079,
+      "win_rate": 0.5385,
+      "max_drawdown": 0.0115,
+      "n_trades": 13,
+      "duration_s": 30.3,
+      "intermediate": 0.6963
+    },
+    {
+      "number": 56,
+      "state": "COMPLETE",
+      "value": -0.7164,
+      "params": {
+        "iron_condor__delta_short": 0.15021750176891302,
+        "iron_condor__max_hold_days": 18,
+        "iron_condor__wing_k": 0.586207433734553,
+        "iron_condor__hurst_regime_threshold": 0.16356647764679633,
+        "iron_condor__hurst_regime_penalty": 0.18859223732959665,
+        "iron_condor__multifractal_max_width": 0.5538819292583257
+      },
+      "sharpe": -2.1824,
+      "win_rate": 0.4,
+      "max_drawdown": 0.0175,
+      "n_trades": 10,
+      "duration_s": 28.8,
+      "intermediate": -0.7164
+    },
+    {
+      "number": 57,
+      "state": "COMPLETE",
+      "value": 2.5128,
+      "params": {
+        "iron_condor__delta_short": 0.20075127745701585,
+        "iron_condor__max_hold_days": 23,
+        "iron_condor__wing_k": 1.961481067061599,
+        "iron_condor__hurst_regime_threshold": 0.2034863908501539,
+        "iron_condor__hurst_regime_penalty": 0.15457767725136592,
+        "iron_condor__multifractal_max_width": 0.4660385263410005
+      },
+      "sharpe": 5.713,
+      "win_rate": 0.5714,
+      "max_drawdown": 0.0047,
+      "n_trades": 7,
+      "duration_s": 27.8,
+      "intermediate": 2.5128
+    },
+    {
+      "number": 58,
+      "state": "COMPLETE",
+      "value": 1.4017,
+      "params": {
+        "iron_condor__delta_short": 0.26858370924997843,
+        "iron_condor__max_hold_days": 20,
+        "iron_condor__wing_k": 1.7008603035648506,
+        "iron_condor__hurst_regime_threshold": 0.2463359457249082,
+        "iron_condor__hurst_regime_penalty": 0.08036317607713282,
+        "iron_condor__multifractal_max_width": 0.48885158826282643
+      },
+      "sharpe": 3.0084,
+      "win_rate": 0.5,
+      "max_drawdown": 0.0082,
+      "n_trades": 8,
+      "duration_s": 26.7,
+      "intermediate": 1.4017
+    },
+    {
+      "number": 59,
+      "state": "COMPLETE",
+      "value": 2.8687,
+      "params": {
+        "iron_condor__delta_short": 0.19195003082685116,
+        "iron_condor__max_hold_days": 25,
+        "iron_condor__wing_k": 1.794366590331904,
+        "iron_condor__hurst_regime_threshold": 0.2721693190520671,
+        "iron_condor__hurst_regime_penalty": 0.1635939356802516,
+        "iron_condor__multifractal_max_width": 0.5679257737181875
+      },
+      "sharpe": 6.6025,
+      "win_rate": 0.5714,
+      "max_drawdown": 0.0044,
+      "n_trades": 7,
+      "duration_s": 24.6,
+      "intermediate": 2.8687
+    },
+    {
+      "number": 60,
+      "state": "COMPLETE",
+      "value": 2.5874,
+      "params": {
+        "iron_condor__delta_short": 0.2289474651024953,
+        "iron_condor__max_hold_days": 17,
+        "iron_condor__wing_k": 1.5073148070512496,
+        "iron_condor__hurst_regime_threshold": 0.17025234047740004,
+        "iron_condor__hurst_regime_penalty": 0.1183922318775114,
+        "iron_condor__multifractal_max_width": 0.5917143943483019
+      },
+      "sharpe": 5.8059,
+      "win_rate": 0.6667,
+      "max_drawdown": 0.0079,
+      "n_trades": 9,
+      "duration_s": 26.8,
+      "intermediate": 2.5874
+    },
+    {
+      "number": 61,
+      "state": "COMPLETE",
+      "value": 2.9096,
+      "params": {
+        "iron_condor__delta_short": 0.23442146647229992,
+        "iron_condor__max_hold_days": 18,
+        "iron_condor__wing_k": 1.9194113156716661,
+        "iron_condor__hurst_regime_threshold": 0.26113858876408025,
+        "iron_condor__hurst_regime_penalty": 0.22217198274203065,
+        "iron_condor__multifractal_max_width": 0.643932766009188
+      },
+      "sharpe": 6.6096,
+      "win_rate": 0.6667,
+      "max_drawdown": 0.0048,
+      "n_trades": 9,
+      "duration_s": 24.9,
+      "intermediate": 2.9096
+    },
+    {
+      "number": 62,
+      "state": "COMPLETE",
+      "value": 2.3728,
+      "params": {
+        "iron_condor__delta_short": 0.22191263386035098,
+        "iron_condor__max_hold_days": 20,
+        "iron_condor__wing_k": 1.9746998139750973,
+        "iron_condor__hurst_regime_threshold": 0.2861309540601533,
+        "iron_condor__hurst_regime_penalty": 0.23975240692090993,
+        "iron_condor__multifractal_max_width": 0.6319129743851537
+      },
+      "sharpe": 5.3089,
+      "win_rate": 0.625,
+      "max_drawdown": 0.0041,
+      "n_trades": 8,
+      "duration_s": 25.9,
+      "intermediate": 2.3728
+    }
+  ],
+  "optuna_meta": {
+    "study_name": "wf_w4_QQQ_iron_condor",
+    "n_trials_requested": 200,
+    "n_trials_run": 63,
+    "status": "early_stopped",
+    "stop_reason": "Early-stopped: 50 consecutive non-improving trials (patience reached at trial 62).",
+    "sampler": "TPESampler(seed=42)",
+    "pruner": "MedianPruner(n_warmup_steps=1)",
+    "patience": 50
+  },
+  "model_weights": {
+    "range_predictor": {
+      "status": "ok",
+      "threshold_pct": 0.0648,
+      "fitted_weights": {
+        "xgboost": 0.25,
+        "lightgbm": 0.25,
+        "msgarch": 0.25,
+        "oujump": 0.25
+      },
+      "cv_scores": {
+        "xgboost": 0.4499861078034453,
+        "lightgbm": 0.46736326109391124,
+        "msgarch": 0.5,
+        "oujump": 0.3333333333333333
+      },
+      "garch_selected_variant": null,
+      "garch_selected_dist": null,
+      "garch_selected_bic": null,
+      "garch_fallback": null,
+      "garch_jb_pvalue": null,
+      "garch_resid_skewness": null,
+      "garch_stable_attempted": null,
+      "garch_stable_converged": null,
+      "p_in_range_compounding": null,
+      "p_in_range_sqrt_scale": null,
+      "garch_all_variants": {},
+      "ms_garch_converged": true,
+      "ms_garch_bic": -653.62,
+      "ms_garch_regime0": {
+        "omega": 1.49e-06,
+        "alpha": 0.05515,
+        "beta": 0.01514,
+        "persistence": 0.07028
+      },
+      "ms_garch_regime1": {
+        "omega": 1.169e-05,
+        "alpha": 0.08393,
+        "beta": 0.85909,
+        "persistence": 0.94302
+      },
+      "ms_garch_transitions": {
+        "p00": 0.1297,
+        "p11": 0.85083,
+        "p01": 0.8703,
+        "p10": 0.14917
+      },
+      "ms_garch_p_in_range": 0.7569,
+      "ou_jump_converged": true,
+      "ou_jump_bic": -644.94,
+      "ou_jump_direction": "BEARISH",
+      "ou_jump_confidence": 0.339055,
+      "ou_jump_params": {
+        "kappa": 6.03553,
+        "mu": 0.085038,
+        "omega": 7.83e-06,
+        "alpha": 0.049788,
+        "beta": 0.896185,
+        "lambda": 0.025339,
+        "p_up": 0.499976,
+        "eta1": 50.0,
+        "eta2": 50.0
+      },
+      "ou_jump_p_in_range": 0.2134,
+      "ou_jump_loglik": null,
+      "ou_jump_aic": null,
+      "ou_jump_jb_pvalue": null,
+      "ou_jump_resid_skewness": null,
+      "ou_jump_resid_kurtosis": null,
+      "ou_jump_ljung_box_pvalue": null,
+      "ou_jump_half_life_days": null,
+      "ou_jump_intensity_annual": null,
+      "ou_jump_persistence": null,
+      "ou_jump_aekf_kappa_cv": null,
+      "oos_scores": {
+        "n_samples": 18,
+        "base_rate": 0.6667,
+        "ml": {},
+        "statistical": {},
+        "aekf": {
+          "lb_innovations_sq_pvalue": 0.99078,
+          "lb_innovations_acf_pvalue": 1e-05,
+          "innovation_outlier_rate": 0.0263,
+          "kappa_oos_mean": 6.03399,
+          "kappa_oos_cv": 0.0,
+          "kappa_oos_min": 6.03395,
+          "kappa_oos_max": 6.0341,
+          "direction_accuracy": 0.3529,
+          "direction_auroc": 0.9545,
+          "direction_brier": 0.13546,
+          "direction_brier_skill": 0.4069
+        }
+      }
+    },
+    "direction_predictor": {
+      "fitted_weights": {
+        "xgboost": 0.5,
+        "lightgbm": 0.5
+      },
+      "cv_scores": {
+        "xgboost": 0.4,
+        "lightgbm": 0.4
+      }
+    }
+  }
+}
