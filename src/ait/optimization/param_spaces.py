@@ -31,12 +31,17 @@ IRON_CONDOR_SPACE: dict[str, tuple] = {
     # Exp 18 (H1 test): stop_loss_pct, profit_target_pct, trailing_stop_fraction frozen at
     #   ablation defaults (0.35, 0.50, 0.70). These are risk-management constants that
     #   don't vary by market regime — optimising them per window overfit train-path noise.
-    #   Only the 3 regime-specific params + fractal gate remain in the search space (6 total).
+    #   Only the 3 regime-specific params + fractal gate + iv_rank gate remain in the search space (7 total).
     "delta_short":            ("float", 0.15, 0.30),
     # [14, 40]: 60-day OOS windows give a 20-day end buffer (60-40=20), keeping
     # backtest_end exits rare while still allowing meaningful theta harvesting.
     "max_hold_days":          ("int",   14,   40),
     "wing_k":                 ("float", 0.30, 2.00),
+    # Exp 26: iv_rank_rise gate threshold tunable per window. Fixed 0.30 was blocking
+    # profitable W01/W02 entries (gradual IV drift pre-crash) once context_bars=252
+    # made iv_rank meaningful. Range [0.25, 0.60]: 0.25 fires on sustained rises,
+    # 0.60 only fires on genuine spikes (Yen-carry / tariff-shock level events).
+    "iv_rank_rise_threshold": ("float", 0.25, 0.60),
     **FRACTAL_GATE_SPACE,
 }
 
