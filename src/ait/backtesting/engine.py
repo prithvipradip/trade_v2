@@ -239,11 +239,10 @@ class Backtester:
             # Decision-chain dict — populated as each gate is evaluated;
             # attached to the trade record so the dashboard can render the
             # full entry reasoning without re-running the backtest.
-            _dir_conf_orig = confidence
             _entry_decision: dict = {
                 "direction_class": direction.value if hasattr(direction, "value") else str(direction),
                 "direction_conf": round(float(confidence), 4),
-                "range_gate": {"prob": None, "threshold": self._range_min_confidence, "pass": True},
+                "range_gate": {"prob": None, "threshold": self._range_min_confidence, "pass": None},
                 "vol_gate": {"vol_10d": None, "max": self._max_entry_vol_annual, "pass": True},
                 "meta_label": {"take": True, "prob": None, "threshold": 0.5},
                 "fractal_gate": {"hurst_spread": 0.0, "threshold": self._hurst_regime_threshold, "pass": True},
@@ -264,11 +263,9 @@ class Backtester:
                     "pass": _hurst_pass,
                 }
                 if spread > self._hurst_regime_threshold and self._hurst_regime_threshold > 0:
-                    # Hard veto disabled (multiplier=0): Exp 20 post-mortem showed QQQ
-                    # hurst_spread never drops below ~0.43 in normal conditions, so any
-                    # threshold derived from Optuna-optimized values (0.09–0.29) × 1.5
-                    # blocks ALL entries. W12's bad-trade spreads (0.44–0.76) are
-                    # indistinguishable from profitable-trade spreads in other windows.
+                    # Hard veto is optional: it only applies when multiplier > 0.
+                    # Exp 20 post-mortem showed QQQ hurst_spread rarely drops below
+                    # ~0.43 in normal conditions; overly tight thresholds can block all entries.
                     _neutral_strat = bool(set(self._strategies) & {"iron_condor", "short_strangle"})
                     _veto_base = max(self._hurst_regime_threshold, 0.20)
                     _hard_veto_threshold = _veto_base * self._hurst_hard_veto_multiplier
@@ -569,10 +566,10 @@ class Backtester:
             if pos.get("strategy") == "iron_condor":
                 ep = pos.get("entry_price", 0.0)  # net credit per share
                 pos["legs"] = [
-                    {"type": "short_put",  "strike": pos.get("short_put_strike"),  "premium": round(ep * 0.42, 4)},
-                    {"type": "long_put",   "strike": pos.get("long_put_strike"),   "premium": round(ep * 0.22, 4)},
-                    {"type": "short_call", "strike": pos.get("short_call_strike"), "premium": round(ep * 0.40, 4)},
-                    {"type": "long_call",  "strike": pos.get("long_call_strike"),  "premium": round(ep * 0.20, 4)},
+                    {"type": "short_put",  "strike": pos.get("short_put_strike"),  "premium": round(ep * 0.62, 4)},
+                    {"type": "long_put",   "strike": pos.get("long_put_strike"),   "premium": round(-ep * 0.12, 4)},
+                    {"type": "short_call", "strike": pos.get("short_call_strike"), "premium": round(ep * 0.62, 4)},
+                    {"type": "long_call",  "strike": pos.get("long_call_strike"),  "premium": round(-ep * 0.12, 4)},
                 ]
                 contracts = pos.get("contracts", 1)
                 pos["credit"]   = round(ep * 100 * contracts, 2)

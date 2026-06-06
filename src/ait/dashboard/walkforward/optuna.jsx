@@ -131,18 +131,35 @@ function ParamScatter({ study, param }) {
 }
 
 function OptunaTab({ data }) {
-  const wids = Object.keys(data.optuna_studies).map(Number);
-  const [wid, setWid] = useState(wids[0]);
-  const study = data.optuna_studies[wid];
-  const paramKeys = Object.keys(study.best_params || {});
+  const studies = data?.optuna_studies || {};
+  const wids = Object.keys(studies).map(Number);
+  const [wid, setWid] = useState(wids[0] ?? null);
+  const study = wid != null ? studies[wid] : null;
+  const paramKeys = Object.keys(study?.best_params || {});
   const [param, setParam] = useState(paramKeys[0]);
   const [q, setQ] = useState("");
   const [hoverTrial, setHoverTrial] = useState(null);
 
+  useEffect(() => {
+    if (wid == null && wids.length) setWid(wids[0]);
+  }, [wid, wids]);
   useEffect(() => { if (!paramKeys.includes(param)) setParam(paramKeys[0]); }, [wid]);
 
+  if (!study) {
+    return (
+      <div className="optuna-tab">
+        <div className="no-trial-notice">
+          <div className="no-trial-icon">◈</div>
+          <div className="no-trial-text">
+            <b>Optuna study data is not available for this experiment.</b>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   const filteredTrials = useMemo(() => {
-    let rows = study.trials;
+    let rows = study.trials || [];
     if (q === "pruned") rows = rows.filter(t => t.value == null);
     else if (q === "complete") rows = rows.filter(t => t.value != null);
     return [...rows].sort((a, b) => (b.value ?? -Infinity) - (a.value ?? -Infinity));

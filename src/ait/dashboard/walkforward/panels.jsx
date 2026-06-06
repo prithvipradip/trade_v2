@@ -51,9 +51,10 @@ function DecisionPanel({ trade, onClose }) {
       detail: <>3-class ensemble → <b>{d.direction_class}</b> @ conf <b className="mono">{fmtNum(d.direction_conf)}</b>. Iron condor is market-neutral, so the directional gate is bypassed — the range model is the entry filter.</>,
     },
     {
-      title: "Range model gate", state: rg.pass ? "pass" : "fail",
+      title: "Range model gate",
+      state: rg.pass === true ? "pass" : rg.pass === false ? "fail" : "info",
       detail: <>P(price stays in range) = <b className="mono">{fmtNum(rg.prob)}</b> vs threshold <span className="mono">{fmtNum(rg.threshold)}</span>.
-        <Gauge value={rg.prob || 0} threshold={rg.threshold || 0.55} label={"P(range) " + fmtNum(rg.prob)} color="var(--c-data)" /></>,
+        <Gauge value={rg.prob ?? 0} threshold={rg.threshold || 0.55} label={"P(range) " + fmtNum(rg.prob)} color="var(--c-data)" /></>,
     },
     {
       title: "Volatility entry gate", state: vg.pass !== false ? "pass" : "fail",

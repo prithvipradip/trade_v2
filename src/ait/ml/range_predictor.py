@@ -99,14 +99,17 @@ class RangePredictor:
 
     # --- Label creation ---
 
-    def _create_labels_horizon(self, close: pd.Series, horizon: int) -> pd.Series:
+    def _create_labels_horizon(
+        self, close: pd.Series, horizon: int, threshold: float | None = None,
+    ) -> pd.Series:
         """Like _create_labels but uses an explicit horizon instead of self._horizon."""
+        threshold_used = self._threshold if threshold is None else float(threshold)
         labels = pd.Series(np.nan, index=close.index, dtype=float)
         for t in range(len(close) - horizon):
             base = close.iloc[t]
             future = close.iloc[t + 1: t + 1 + horizon]
             max_dev = float((future / base - 1).abs().max())
-            labels.iloc[t] = 1.0 if max_dev < self._threshold else 0.0
+            labels.iloc[t] = 1.0 if max_dev < threshold_used else 0.0
         return labels
 
     def _create_labels(self, close: pd.Series) -> pd.Series:
@@ -315,7 +318,7 @@ class RangePredictor:
             from ait.ml.garch_range_predictor import GARCHRangeModel
         except ImportError:
             log.warning("garch_not_available", hint="pip install arch>=7.2")
-            return 0.0
+            return None
 
         garch = GARCHRangeModel()
         splits = self._walk_forward_split(len(close))
@@ -331,7 +334,7 @@ class RangePredictor:
         # → AUROC undefined (P36). Scale by sqrt(cv_h / full_h) to match.
         _CV_HORIZON = 5
         _cv_threshold = self._threshold * np.sqrt(_CV_HORIZON / max(self._horizon, 1))
-        _cv_labels_fn = lambda c: self._create_labels_horizon(c, _CV_HORIZON)
+        _cv_labels_fn = lambda c: self._create_labels_horizon(c, _CV_HORIZON, _cv_threshold)
         acc = garch.cv_score(
             close=close,
             horizon_days=_CV_HORIZON,
@@ -385,7 +388,7 @@ class RangePredictor:
 
         _CV_HORIZON = 5
         _cv_threshold = self._threshold * np.sqrt(_CV_HORIZON / max(self._horizon, 1))
-        _cv_labels_fn = lambda c: self._create_labels_horizon(c, _CV_HORIZON)
+        _cv_labels_fn = lambda c: self._create_labels_horizon(c, _CV_HORIZON, _cv_threshold)
         acc = garch.cv_score_msgarch(
             close=close,
             horizon_days=_CV_HORIZON,
@@ -436,7 +439,7 @@ class RangePredictor:
 
         _CV_HORIZON = 5
         _cv_threshold = self._threshold * np.sqrt(_CV_HORIZON / max(self._horizon, 1))
-        _cv_labels_fn = lambda c: self._create_labels_horizon(c, _CV_HORIZON)
+        _cv_labels_fn = lambda c: self._create_labels_horizon(c, _CV_HORIZON, _cv_threshold)
         acc = garch.cv_score_oujump(
             close=close,
             horizon_days=_CV_HORIZON,
@@ -612,10 +615,15 @@ class RangePredictor:
 
         # Weighted ensemble of binary probabilities — prefer fitted weights when available.
         fw = (sym_data or {}).get("fitted_weights") or getattr(self, "_fitted_weights", None)
+        def _weight(name: str, default: float) -> float:
+            if fw and name in fw:
+                return float(fw[name])
+            return float(self._weights.get(name, default))
+
         weighted_p = 0.0
         total_weight = 0.0
         for name, model in models.items():
-            w = fw.get(name, 0.5) if fw else self._weights.get(name, 0.5)
+            w = _weight(name, 0.5)
             try:
                 p = float(model.predict_proba(X_scaled)[0][1])  # P(class=1)
                 weighted_p += w * p
@@ -626,7 +634,7 @@ class RangePredictor:
         # GARCH ensemble contribution
         garch_state = (sym_data or {}).get("garch_state") or getattr(self, "_garch_state", None)
         if garch_state:
-            w_garch = fw.get("garch", self._weights.get("garch", 0.0)) if fw else self._weights.get("garch", 0.0)
+            w_garch = _weight("garch", 0.0)
             if w_garch > 0:
                 try:
                     from ait.ml.garch_range_predictor import GARCHRangeModel
@@ -639,7 +647,7 @@ class RangePredictor:
         # MS-GARCH ensemble contribution
         ms_garch_state = (sym_data or {}).get("ms_garch_state") or getattr(self, "_ms_garch_state", None)
         if ms_garch_state:
-            w_ms = fw.get("msgarch", self._weights.get("msgarch", 0.0)) if fw else self._weights.get("msgarch", 0.0)
+            w_ms = _weight("msgarch", 0.0)
             if w_ms > 0:
                 try:
                     from ait.ml.garch_range_predictor import GARCHRangeModel
@@ -652,7 +660,7 @@ class RangePredictor:
         # OU-Kou-GARCH ensemble contribution
         ou_jump_state = (sym_data or {}).get("ou_jump_state") or getattr(self, "_ou_jump_state", None)
         if ou_jump_state:
-            w_ou = fw.get("oujump", self._weights.get("oujump", 0.0)) if fw else self._weights.get("oujump", 0.0)
+            w_ou = _weight("oujump", 0.0)
             if w_ou > 0:
                 try:
                     from ait.ml.garch_range_predictor import GARCHRangeModel

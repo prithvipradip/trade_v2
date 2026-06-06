@@ -175,14 +175,9 @@ def test_subprocess_timeout_falls_back_to_inprocess(monkeypatch):
     wf = _wf_backtester(enable_msgarch=True, enable_oujump=True)
     threshold = wf._adaptive_range_threshold(df, horizon_days=21)
 
-    # Patch Process.join to simulate a timeout (process stays alive)
-    original_join = mp.Process.join
-
-    def _never_finishes(self, timeout=None):
-        # Do nothing — pretend process is still running
-        pass
-
-    monkeypatch.setattr(mp.Process, "join", _never_finishes)
+    # Patch process lifecycle to simulate timeout without spawning a subprocess
+    monkeypatch.setattr(mp.Process, "start", lambda self: None)
+    monkeypatch.setattr(mp.Process, "join", lambda self, timeout=None: None)
     monkeypatch.setattr(mp.Process, "is_alive", lambda self: True)
     monkeypatch.setattr(mp.Process, "terminate", lambda self: None)
 
