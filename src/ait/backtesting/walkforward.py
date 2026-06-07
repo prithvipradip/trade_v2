@@ -515,17 +515,31 @@ def _build_optuna_window_data(
     return {"trials": trials_out, "meta": meta}
 
 
+_TIMESERIES_FEAT_KEYS = [
+    "rsi_14", "macd", "macd_signal", "macd_hist",
+    "sma_20", "sma_50", "bb_upper", "bb_lower", "bb_position",
+    "atr_pct", "realized_vol_20", "iv_rank", "vix_level",
+    "hurst_wavelet", "sentiment_composite", "put_call_ratio",
+]
+
+
 def _save_window_timeseries(
     test_df: "pd.DataFrame",
+    full_context_df: "pd.DataFrame",
     predictor: "Any",
     range_predictor: "Any",
     vix_ctx: "dict | None",
     progress_dir: "Path",
     symbol: str,
     window_id: int,
+    precomputed_features: "pd.DataFrame | None" = None,
 ) -> None:
     """Compute features + ML predictions for each test-period bar and append them
     to ``timeseries_bars.json`` in the experiment directory (Layer 2c).
+
+    Features are computed ONCE on the full context+OOS window (O(1) instead of
+    O(N²) FeatureEngine calls). Per-bar ML predictions use predict_from_features()
+    which bypasses FeatureEngine entirely — no redundant feature computation.
 
     The file is keyed by experiment (one file per run, not per window) so the
     dashboard can load all windows in a single request.
@@ -534,9 +548,17 @@ def _save_window_timeseries(
         import json as _json
         from ait.ml.features import FeatureEngine
 
-        feat_df = FeatureEngine().compute(test_df, market_context=vix_ctx)
+        # Use pre-computed features if provided (shared from OOS Backtester setup),
+        # otherwise compute once on full context+OOS. O(1) instead of O(N²).
+        if precomputed_features is not None and not precomputed_features.empty:
+            feat_df = precomputed_features
+        else:
+            feat_df = FeatureEngine().compute(full_context_df, market_context=vix_ctx)
         if feat_df.empty:
             return
+
+        # Align to OOS period only via index reindex (safe against minor index gaps)
+        oos_feat_df = feat_df.reindex(test_df.index)
 
         bars_out = []
         for ts, row in test_df.iterrows():
@@ -551,24 +573,18 @@ def _save_window_timeseries(
                 "volume": int(row.get("Volume", 0)),
                 "window": window_id,
             }
-            # Features for this bar
-            if date_str in feat_df.index.strftime("%Y-%m-%d").tolist():
-                f = feat_df[feat_df.index.strftime("%Y-%m-%d") == date_str]
-                if not f.empty:
-                    fr = f.iloc[0]
-                    _FEAT_KEYS = [
-                        "rsi_14", "macd", "macd_signal", "macd_hist",
-                        "sma_20", "sma_50", "bb_upper", "bb_lower", "bb_position",
-                        "atr_pct", "realized_vol_20", "iv_rank", "vix_level",
-                        "hurst_wavelet", "sentiment_composite", "put_call_ratio",
-                    ]
-                    for k in _FEAT_KEYS:
-                        v = fr.get(k) if k in fr.index else None
-                        bar[k] = round(float(v), 4) if v is not None and not _isnan(v) else None
-                    vol20 = fr.get("volume_sma_20_ratio")
-                    bar["volume_ratio"] = round(float(vol20), 4) if vol20 is not None and not _isnan(vol20) else None
 
-            # ML predictions
+            feat_row = oos_feat_df.loc[ts] if ts in oos_feat_df.index else None
+
+            # Features for this bar (O(1) lookup — no date-string scan)
+            if feat_row is not None and not feat_row.isna().all():
+                for k in _TIMESERIES_FEAT_KEYS:
+                    v = feat_row.get(k) if k in feat_row.index else None
+                    bar[k] = round(float(v), 4) if v is not None and not _isnan(v) else None
+                vol20 = feat_row.get("volume_sma_20_ratio")
+                bar["volume_ratio"] = round(float(vol20), 4) if vol20 is not None and not _isnan(vol20) else None
+
+            # ML predictions via predict_from_features — O(1), no FeatureEngine re-run
             bar["dir_class"] = None
             bar["dir_conf"] = None
             bar["p_up"] = None
@@ -576,23 +592,26 @@ def _save_window_timeseries(
             bar["p_neutral"] = None
             bar["range_prob"] = None
             bar["meta_take"] = None
-            try:
-                if predictor is not None and predictor.is_trained:
-                    hist_up_to = test_df[test_df.index <= ts]
-                    sig = predictor.predict(hist_up_to, market_context=vix_ctx)
-                    if sig is not None:
-                        bar["dir_class"] = sig.direction.value if hasattr(sig.direction, "value") else str(sig.direction)
-                        bar["dir_conf"] = round(float(sig.confidence), 4)
-            except Exception:
-                pass
-            try:
-                if range_predictor is not None and range_predictor.is_trained:
-                    hist_up_to = test_df[test_df.index <= ts]
-                    rp = range_predictor.predict(hist_up_to, market_context=vix_ctx)
-                    if rp is not None:
-                        bar["range_prob"] = round(float(rp.probability_in_range), 4)
-            except Exception:
-                pass
+
+            if feat_row is not None:
+                try:
+                    if predictor is not None and predictor.is_trained:
+                        sig = predictor.predict_from_features(feat_row, symbol=symbol)
+                        if sig is not None:
+                            bar["dir_class"] = sig.direction.value if hasattr(sig.direction, "value") else str(sig.direction)
+                            bar["dir_conf"] = round(float(sig.confidence), 4)
+                            bar["p_up"] = round(float(sig.probabilities.get("bullish", 0)), 4)
+                            bar["p_down"] = round(float(sig.probabilities.get("bearish", 0)), 4)
+                            bar["p_neutral"] = round(float(sig.probabilities.get("neutral", 0)), 4)
+                except Exception:
+                    pass
+                try:
+                    if range_predictor is not None and range_predictor.is_trained:
+                        rp = range_predictor.predict_from_features(feat_row, symbol=symbol)
+                        if rp is not None:
+                            bar["range_prob"] = round(float(rp.probability_in_range), 4)
+                except Exception:
+                    pass
 
             bars_out.append(bar)
 
@@ -607,7 +626,6 @@ def _save_window_timeseries(
                 existing = _json.loads(ts_path.read_text(encoding="utf-8"))
             except Exception:
                 existing = []
-        # Drop any existing bars for this window+symbol so we can replace them
         existing = [b for b in existing if not (b.get("window") == window_id and b.get("symbol") == symbol)]
         existing.extend(bars_out)
         existing.sort(key=lambda b: (b.get("time", ""), b.get("symbol", "")))
@@ -1110,6 +1128,18 @@ class WalkForwardBacktester:
                 )
                 _oos_range_min_conf = 1.0
 
+            # Pre-compute OOS feature matrix once — shared by the OOS Backtester,
+            # timeseries export, and both model evaluators.  Eliminates ~120
+            # redundant FeatureEngine calls per window (2 per bar × 60 bars in
+            # the old path where no features_cache was passed to the Backtester).
+            _oos_feat_cache: "pd.DataFrame | None" = None
+            try:
+                from ait.ml.features import FeatureEngine as _FE_oos
+                _c = _FE_oos().compute(test_with_context, market_context=_vix_ctx)
+                _oos_feat_cache = _c if not _c.empty else None
+            except Exception:
+                pass
+
             # Change D: pass intraday_store to OOS Backtester so entries are
             # gated by the 09:30–15:30 ET entry window and limit-fill simulation,
             # matching the live-trading execution model. Also enables capture of
@@ -1124,6 +1154,7 @@ class WalkForwardBacktester:
                 context_bars=context_bars,
                 strategies=active_strategies,
                 initial_capital=per_symbol_capital,
+                features_cache=_oos_feat_cache,
                 commission_per_contract=window_cfg.commission_per_contract,
                 slippage_pct=window_cfg.slippage_pct,
                 position_size_pct=effective_position_size,
@@ -1167,6 +1198,7 @@ class WalkForwardBacktester:
                     range_predictor, test_df, symbol,
                     threshold_pct=_range_threshold,
                     horizon_days=self._config.max_hold_days,
+                    precomputed_features=_oos_feat_cache,
                 )
                 if _oos_scores and "range_predictor" in _model_weights:
                     _model_weights["range_predictor"]["oos_scores"] = _oos_scores
@@ -1177,6 +1209,7 @@ class WalkForwardBacktester:
                 _dir_oos = self._evaluate_direction_model_oos(
                     predictor, test_df, symbol,
                     horizon_days=self._config.max_hold_days,
+                    precomputed_features=_oos_feat_cache,
                 )
                 if _dir_oos and "direction_predictor" in _model_weights:
                     _model_weights["direction_predictor"]["oos_scores"] = _dir_oos
@@ -1189,12 +1222,14 @@ class WalkForwardBacktester:
             if self._progress_dir is not None:
                 _save_window_timeseries(
                     test_df=test_df,
+                    full_context_df=test_with_context,
                     predictor=predictor,
                     range_predictor=range_predictor,
                     vix_ctx=_vix_ctx,
                     progress_dir=self._progress_dir,
                     symbol=symbol,
                     window_id=window_id,
+                    precomputed_features=_oos_feat_cache,
                 )
 
         if all_symbol_trades:
@@ -1466,6 +1501,7 @@ class WalkForwardBacktester:
         symbol: str,
         threshold_pct: float = 0.05,
         horizon_days: int = 30,
+        precomputed_features: "pd.DataFrame | None" = None,
     ) -> dict:
         """Evaluate range predictor accuracy on OOS test data.
 
@@ -1532,12 +1568,14 @@ class WalkForwardBacktester:
             total_weight   = sum(weights.get(n, 0.5) for n in models) if models else 1.0
 
             if models and scaler is not None and feature_names:
-                try:
-                    from ait.ml.features import FeatureEngine as _FE
-                    _feat_engine = _FE()
-                except Exception:
-                    _feat_engine = None
-                features = _feat_engine.compute(test_df) if _feat_engine is not None else None
+                if precomputed_features is not None and not precomputed_features.empty:
+                    features = precomputed_features.reindex(test_df.index)
+                else:
+                    try:
+                        from ait.ml.features import FeatureEngine as _FE
+                        features = _FE().compute(test_df)
+                    except Exception:
+                        features = None
                 if features is not None and not features.empty and len(features) > horizon_days:
                     # Align feature rows to labellable timesteps
                     valid_idx = [i for i in label_idx if i < len(features)]
@@ -1776,6 +1814,7 @@ class WalkForwardBacktester:
         symbol: str,
         horizon_days: int = 30,
         return_threshold_pct: float = 0.02,
+        precomputed_features: "pd.DataFrame | None" = None,
     ) -> dict:
         """Evaluate directional predictor calibration on OOS test data.
 
@@ -1802,9 +1841,12 @@ class WalkForwardBacktester:
             if len(test_df) < horizon_days + 20:
                 return {}
 
-            from ait.ml.features import FeatureEngine as _FE
-            features = _FE().compute(test_df)
-            if features.empty:
+            if precomputed_features is not None and not precomputed_features.empty:
+                features = precomputed_features.reindex(test_df.index)
+            else:
+                from ait.ml.features import FeatureEngine as _FE
+                features = _FE().compute(test_df)
+            if features is None or features.empty:
                 return {}
 
             # Build forward-return labels for each bar (3-class)
@@ -2504,6 +2546,7 @@ class WalkForwardBacktester:
                 trailing_stop_pct=window_cfg.trailing_stop_pct,
                 breakeven_trigger_pct=window_cfg.breakeven_trigger_pct,
                 predictor=predictor,
+                features_cache=features_df,
                 iv_floor=window_cfg.iv_floor,
                 wing_floor_dollars=window_cfg.wing_floor_dollars,
                 wing_k=window_cfg.wing_k,

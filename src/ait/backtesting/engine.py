@@ -758,15 +758,13 @@ class Backtester:
             return None
         expiry = date.fromisoformat(str(expiry_str)[:10])
 
-        for bar_ts, bar_row in session_bars.iterrows():
-            underlying = bar_row["Close"]
-            days_held = (current_date - date.fromisoformat(pos["entry_date"])).days
+        days_held = (current_date - date.fromisoformat(pos["entry_date"])).days
+        remaining_dte = max(0, (expiry - current_date).days)
+        exit_half_spread = self._options_half_spread(float(pos.get("entry_iv", 0.25)), remaining_dte)
 
+        for row in session_bars.itertuples(index=True):
+            underlying = row.Close
             current_val = self._reprice_position(pos, underlying, days_held, None)
-            remaining_dte = max(0, (expiry - current_date).days)
-            exit_half_spread = self._options_half_spread(
-                float(pos.get("entry_iv", 0.25)), remaining_dte
-            )
             if trade_type == "credit":
                 current_val *= (1 + exit_half_spread)
                 pnl_pct = (entry_price - current_val) / entry_price if entry_price > 0 else 0.0
@@ -781,6 +779,7 @@ class Backtester:
                 result = self._check_exit_fixed(pos, pnl_pct, current_date)
 
             if result is not None:
+                bar_ts = row.Index
                 bar_dt = bar_ts.isoformat() if hasattr(bar_ts, "isoformat") else str(bar_ts)
                 pnl = self._calc_pnl(pos, current_val)
                 result["pnl"] = round(pnl, 2)
@@ -799,12 +798,13 @@ class Backtester:
         Returns (filled, bars_waited, fill_time_iso). fill_time_iso is the ISO
         timestamp of the bar where Low ≤ limit_price ≤ High, or None if unfilled.
         """
-        for i, (ts, bar) in enumerate(session_bars.iterrows()):
-            if i >= timeout_bars:
-                break
-            if bar["Low"] <= limit_price <= bar["High"]:
-                fill_ts = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
-                return True, i + 1, fill_ts
+        bars = session_bars.iloc[:timeout_bars]
+        mask = (bars["Low"] <= limit_price) & (limit_price <= bars["High"])
+        if mask.any():
+            first = int(mask.values.argmax())
+            ts = bars.index[first]
+            fill_ts = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+            return True, first + 1, fill_ts
         return False, min(len(session_bars), timeout_bars), None
 
     def _load_directional_model(self):
@@ -831,18 +831,28 @@ class Backtester:
         range predictor so they use cross-asset features, matching live inference (Gap Z3).
         """
         from ait.ml.features import FeatureEngine
+        _cache_hit = False
         if self._features_cache is not None and not self._features_cache.empty:
             today = pd.Timestamp(hist.index[-1]).normalize()
             mask = self._features_cache.index <= today
             features_df = self._features_cache[mask]
             if features_df.empty:
                 features_df = FeatureEngine().compute(hist)
+            else:
+                _cache_hit = True
         else:
             features_df = FeatureEngine().compute(hist)
 
         if self._predictor is not None:
             try:
-                pred = self._predictor.predict(hist, market_context=market_context)
+                if _cache_hit and not features_df.empty and hasattr(self._predictor, "predict_from_features"):
+                    # Cache available — predict_from_features bypasses the FeatureEngine
+                    # re-run inside predict(), reducing OOS cost from O(N) to O(1) per bar.
+                    pred = self._predictor.predict_from_features(
+                        features_df.iloc[-1], symbol=self._symbol or ""
+                    )
+                else:
+                    pred = self._predictor.predict(hist, market_context=market_context)
                 if pred is not None:
                     return pred.direction, pred.confidence, features_df
             except Exception:

@@ -1435,6 +1435,44 @@ This is the exact sequence of steps the walk-forward engine executes for **each*
 | **Thesis re-evaluation** | `_check_thesis_invalidation()` checks at each daily bar whether the ML predictor strongly contradicts the original position direction; triggers early exit if invalidated |
 | **Fractal regime gate** | Confidence penalised when `hurst_scale_spread > hurst_regime_threshold` or `multifractal_width > multifractal_max_width`; same thresholds as exported production params |
 
+### Walk-Forward Performance Architecture
+
+The walk-forward engine applies several optimizations to keep per-window runtime manageable. Understanding these matters when debugging slowdowns or extending the system.
+
+**FeatureEngine call reduction (key bottleneck)**
+
+`FeatureEngine.compute()` is the dominant per-window CPU cost (~1–3s on 365 + 60 daily bars). The naive implementation called it once per OOS bar (O(N) calls), and the old `_save_window_timeseries` called it once per bar × all bars = O(N²). The current architecture reduces this to exactly **1 FeatureEngine call per OOS subsystem phase**:
+
+| Phase | Before | After | Saving |
+|-------|--------|-------|--------|
+| Optuna training loop (200 trials) | 1 call per trial | `features_cache` built once before trials, reused | ~200× |
+| OOS Backtester (engine.py `_get_direction`) | 1 call per bar | `_oos_feat_cache` passed in; `_cache_hit → predict_from_features()` | ~60× |
+| `_evaluate_range_model_oos` | 1 call on test slice | `precomputed_features=_oos_feat_cache` passed in | 1× (was already cheap) |
+| `_evaluate_direction_model_oos` | 1 call on test slice | `precomputed_features=_oos_feat_cache` passed in | 1× |
+| MetaLabeler shadow backtester | separate call on train_df | `features_cache=features_df` passed in (was already computed) | 1× |
+| `_save_window_timeseries` (timeseries export) | 1 call per OOS bar (O(N²)) | `precomputed_features=_oos_feat_cache` + `reindex` per bar | ~60× |
+
+The `_oos_feat_cache` is a single `FeatureEngine().compute(test_with_context, market_context=vix_ctx)` call made once per window right before the OOS Backtester is constructed. All downstream consumers receive it as a parameter.
+
+**`predict_from_features()` — bypassing FeatureEngine in the prediction hot path**
+
+Both `DirectionPredictor` and `RangePredictor` expose a `predict_from_features(feature_row: pd.Series)` method. Unlike `predict(hist)`, which calls `FeatureEngine.compute(hist)` internally, `predict_from_features` takes a pre-computed feature row and goes directly to `scaler.transform → model.predict_proba`. This is used in two places:
+
+1. `engine.py _get_direction`: when `_oos_feat_cache` is available and has a row for the current bar date, `predict_from_features(features_df.iloc[-1])` is called instead of `predict(hist)`. The `_cache_hit` flag controls this path.
+2. `_save_window_timeseries`: iterates OOS bars using `oos_feat_df.loc[ts]` lookups (O(1) pandas reindex) and calls `predict_from_features` per bar.
+
+**Intraday loop optimizations (engine.py)**
+
+`_check_intraday_exit` iterates 5-minute bars within each session. The loop uses `itertuples()` (not `iterrows()`) to avoid pandas Series construction overhead (~10μs vs ~75μs per row). Three loop-invariant values (`days_held`, `remaining_dte`, `exit_half_spread`) are computed once before the loop.
+
+`_try_limit_fill` is fully vectorized: instead of iterating bars to find the first fill, it computes `mask = (bars["Low"] <= limit_price) & (limit_price <= bars["High"])` and uses `mask.values.argmax()` to locate the first hit in a single numpy operation.
+
+**Adding new OOS consumers — what to wire up**
+
+If you add a new per-window OOS analysis step, pass `precomputed_features=_oos_feat_cache` to avoid triggering a new FeatureEngine call. The `_oos_feat_cache` variable is available in the window loop in [walkforward.py](src/ait/backtesting/walkforward.py) from the block that precedes the OOS Backtester construction.
+
+---
+
 ### Interpreting Results
 
 | Metric | What it means | Good threshold |

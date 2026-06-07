@@ -185,6 +185,77 @@ class DirectionPredictor:
             model_version=self._model_version,
         )
 
+    def predict_from_features(
+        self,
+        feature_row: "pd.Series",
+        symbol: str = "",
+    ) -> "Prediction | None":
+        """Make a prediction from a pre-computed feature row, bypassing FeatureEngine.
+
+        Used by _save_window_timeseries for O(1) per-bar predictions instead of
+        re-running FeatureEngine on 252+ rows for each bar.
+        """
+        sym_data: dict | None = None
+        if symbol and symbol in self._symbol_models:
+            sym_data = self._symbol_models[symbol]
+            models = sym_data["models"]
+            scaler = sym_data["scaler"]
+            feature_names = sym_data["feature_names"]
+        elif self._trained:
+            models = self._models
+            scaler = self._scaler
+            feature_names = self._feature_names
+        else:
+            return None
+
+        try:
+            X = pd.DataFrame(
+                [feature_row.reindex(feature_names).fillna(0.0).values],
+                columns=feature_names,
+            )
+            X_scaled = pd.DataFrame(
+                scaler.transform(X.values),
+                columns=feature_names,
+            )
+        except Exception as e:
+            log.error("feature_scaling_failed", error=str(e), symbol=symbol)
+            return None
+
+        fw = (
+            (sym_data or {}).get("fitted_weights")
+            or getattr(self, "_fitted_weights", None)
+        )
+        all_probas = []
+        total_weight = 0.0
+        for name, model in models.items():
+            weight = fw.get(name, 0.5) if fw else self._config.ensemble_weights.get(name, 0.5)
+            try:
+                proba = model.predict_proba(X_scaled)[0]
+                all_probas.append(proba * weight)
+                total_weight += weight
+            except Exception as e:
+                log.warning("model_prediction_failed", model=name, error=str(e))
+
+        if not all_probas:
+            return None
+
+        avg_proba = np.sum(all_probas, axis=0) / (total_weight or 1.0)
+        pred_class = int(np.argmax(avg_proba))
+        confidence = float(avg_proba[pred_class])
+        direction = self.LABELS[pred_class]
+        probabilities = {
+            "bearish": float(avg_proba[0]),
+            "neutral": float(avg_proba[1]),
+            "bullish": float(avg_proba[2]),
+        }
+        return Prediction(
+            direction=direction,
+            confidence=confidence,
+            probabilities=probabilities,
+            features_used=len(feature_names),
+            model_version=self._model_version,
+        )
+
     def train(
         self,
         df: pd.DataFrame,

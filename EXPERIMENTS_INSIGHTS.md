@@ -38,7 +38,8 @@
 | 22 | `QQQ_365d_iron_condor_20260606_0237` | 365/60/60/5, 12 W | +5.2% / +$5,179 | +2.0% / +$2,000 | 25 / — | 6.55 / 1.88 | 8/12 | **Regime gate threshold too loose**: gate fired correctly (W12: -$534→-$264) but -0.02 threshold blocks mild corrections; W02 Optuna adaptation -$1,016 regression; un-optimized baseline 0.74→1.88 confirms gate signal |
 | 23 | `QQQ_365d_iron_condor_20260606_0747` | 365/60/60/5, 12 W | +7.6% / +$7,600 | +3.1% / +$3,100 | 32 / — | **8.209** / 1.90 | 8/12 | **New series high**: threshold -0.05 restored W02 profitable trades (+$1,109 vs +$760), W07 +$4,000, new best Sharpe; W12 still -$534 (entries at -2–5% below SMA, not blocked) |
 | 24 | *(killed — signal failure)* | 365/60/60/5, partial | — | — | — | — | — | **10d return gate reverted**: Sep/Oct 2023 training corrections overlap with W12 signal range; gate distorted W01/W02 Optuna training → 0 trades; no clean threshold exists |
-| 25 | *(pending)* | 365/60/60/5, 12 W | — | — | — | — | — | **context_bars 60→252**: enables proper iv_rank (needs 252d vol range); diagnostic run to collect iv_rank_rise_10d values across all windows before setting any threshold |
+| 25 | `QQQ_365d_..._iron_condor_..._20260607_1353` | 365/63/21/5, 33 W ⚠️ | −2.55% / −$2,550 | — | 63 | −0.71 | 21/33 | **context_bars 252 confirmed**: iv_rank_rise_10d now populated for all entries; losses mean rise=+0.127 vs wins mean=−0.057; signal exists but overlaps require per-window Optuna tuning; ran with OLD step config (21d) |
+| 26 | *(pending)* | 365/60/60/5, 12 W | — | — | — | — | — | **iv_rank_rise_threshold in search space** [0.25, 0.60]: Optuna tunes gate per window; 200 trials / patience 50 / non-overlapping 60d windows |
 
 Config format: `train_days / test_days / step_days / gap_days`.
 All experiments: QQQ, iron_condor only, TPE sampler seed 42, $100k initial capital.
@@ -2935,28 +2936,16 @@ W12's 10d return range (−5.25% to −7%) completely overlaps with:
 
 ## Experiment 25 — context_bars 60 → 252: Proper iv_rank in OOS
 
-**Archive:** *(pending)*
-**Date:** 2026-06-06 (pre-run)
-**Git branch:** `features-request-3`
+**Archive:** `QQQ_365d_bear_put_spread_bull_call_spread_iron_condor_long_strangle_put_credit_spread_short_strangle_20260607_1353`
+**Date:** 2026-06-07 · Git branch: `features-request-3`
+
+> ⚠️ **Ran with OLD walk-forward defaults.** This experiment was launched before the `test_days`/`step_days` defaults were updated to 60/60. It ran with `test_days=63`, `step_days=21` → **33 overlapping windows** (not the planned 12 non-overlapping). Results are directionally valid but not directly comparable to Exp 21–23. The `context_bars=252` change itself was correctly applied.
 
 ### Context
 
-Every experiment from Exp 21 onward has shown `iv_rank_rise_10d=N/A` for early OOS entries. The root cause: the OOS backtester prepends only 60 context bars from training (`context_bars=60` in walkforward.py). `iv_rank` is computed as `(vol_20 − vol_252_min) / (vol_252_max − vol_252_min)` using `vol_20.rolling(252, min_periods=20)`. With only 60 bars of context, the 252-day vol range covers only 60 days — the rank is essentially meaningless and fluctuates wildly.
+Every experiment from Exp 21 onward showed `iv_rank_rise_10d` either missing or computed on only 60 bars of context. The root cause: `context_bars=60` in walkforward.py meant the OOS backtester received only 60 training bars prepended. `iv_rank` is computed as `(vol_20 − vol_252_min) / (vol_252_max − vol_252_min)` using `vol_20.rolling(252, min_periods=20)`. With 60 context bars, the 252-day range window covers only 60 days — values are noisy and not comparable to training.
 
-The Optuna training path is unaffected: it uses `features_cache` built from the full 365d `train_df`, so training already has correct `iv_rank` values. This is a pure OOS fix.
-
-With `context_bars=252`, the OOS backtester gets 1 year of training bars prepended. By the first allowable entry date, `iv_rank` reflects the full 252-day vol distribution — identical quality to training.
-
-### What We're Testing
-
-**Primary:** Diagnostic — collect actual `iv_rank_rise_10d` values in decision dicts for all windows with proper context. No new gate added. If the values cleanly separate W12 (losing) from all profitable windows, design a threshold in Exp 26.
-
-**Secondary:** Does changing context_bars affect walk-forward performance at all? Expect: identical or very slightly different results because the regime gate and vol gate don't use `iv_rank`. Sharpe and return should be approximately the same as Exp 23.
-
-**Key questions:**
-1. What is `iv_rank_rise_10d` for W12 entries (Mar 2026)?
-2. What is `iv_rank_rise_10d` for W02 entries (Jun–Aug 2024)?
-3. What is the range across all other profitable windows?
+Changing `context_bars=min(252, len(train_df))` gives the OOS backtester a full year of context, so `iv_rank` reflects the same vol distribution it saw during Optuna training.
 
 ### Implementation
 
@@ -2970,12 +2959,168 @@ context_bars = 60
 context_bars = min(252, len(train_df))
 ```
 
-No engine changes. No new gates. No test changes needed (the walkforward unit tests don't exercise `context_bars` directly).
+### Results — Optimized (Section E)
+
+| Metric | Value |
+|--------|-------|
+| Total return | −2.55% / −$2,550 |
+| Total P&L | −$2,550.41 |
+| Total trades | 63 |
+| Win rate | 55.6% |
+| Sharpe ratio | −0.71 |
+| Max drawdown | 8.57% |
+| Profit factor | 0.90 |
+| Active windows | 21 / 33 |
+| Cash-drag adj. return | +6.82% (idle cash @ 5%) |
+
+> Results are not comparable to Exp 23 (Sharpe 8.21) due to the 63d/21d overlapping window config. The 33-window run spans May 2024 → May 2026 with heavy overlap across losing Q1 2025 and Q1 2026 tariff-shock windows.
+
+### Per-Window Breakdown
+
+| W | Test start | Test end | PnL | Trades | Win% | Sharpe |
+|---|-----------|---------|-----|--------|------|--------|
+| 01 | 2024-05-19 | 2024-07-21 | −$138 | 2 | 50% | −2.66 |
+| 02 | 2024-06-09 | 2024-08-11 | $0 | 0 | — | — |
+| 03 | 2024-06-30 | 2024-09-01 | $0 | 0 | — | — |
+| 04 | 2024-07-21 | 2024-09-22 | −$2,486 | 7 | 43% | −7.93 |
+| 05 | 2024-08-11 | 2024-10-13 | $0 | 0 | — | — |
+| 06 | 2024-09-01 | 2024-11-03 | +$2,728 | 2 | 100% | +48.67 |
+| 07 | 2024-09-22 | 2024-11-24 | +$1,742 | 3 | 100% | +10.19 |
+| 08 | 2024-10-13 | 2024-12-15 | −$414 | 3 | 67% | −2.40 |
+| 09 | 2024-11-03 | 2025-01-05 | −$61 | 6 | 50% | −0.18 |
+| 10 | 2024-11-24 | 2025-01-26 | +$2,707 | 3 | 100% | +19.12 |
+| 11 | 2024-12-15 | 2025-02-16 | $0 | 0 | — | — |
+| 12 | 2025-01-05 | 2025-03-09 | −$1,465 | 5 | 40% | −4.11 |
+| 13 | 2025-01-26 | 2025-03-30 | −$1,248 | 5 | 40% | −3.62 |
+| 14 | 2025-02-16 | 2025-04-20 | −$4,045 | 4 | 0% | −141.56 |
+| 15 | 2025-03-09 | 2025-05-11 | −$637 | 2 | 50% | −10.12 |
+| 16 | 2025-03-30 | 2025-06-01 | −$892 | 1 | 0% | — |
+| 17 | 2025-04-20 | 2025-06-22 | +$3,097 | 4 | 100% | +21.86 |
+| 18 | 2025-05-11 | 2025-07-13 | +$1,374 | 2 | 100% | +97.13 |
+| 19 | 2025-06-01 | 2025-08-03 | +$1,557 | 1 | 100% | — |
+| 20–25 | 2025-06-22 → 2025-12-07 | — | $0 | 0 | — | — |
+| 26 | 2025-10-26 | 2025-12-28 | +$72 | 1 | 100% | — |
+| 27 | 2025-11-16 | 2026-01-18 | +$701 | 1 | 100% | — |
+| 28 | 2025-12-07 | 2026-02-08 | $0 | 0 | — | — |
+| 29 | 2025-12-28 | 2026-03-01 | −$412 | 2 | 50% | −2.79 |
+| 30 | 2026-01-18 | 2026-03-22 | +$118 | 1 | 100% | — |
+| 31 | 2026-02-08 | 2026-04-12 | −$2,315 | 3 | 0% | −32.51 |
+| 32 | 2026-03-01 | 2026-05-03 | $0 | 0 | — | — |
+| 33 | 2026-03-22 | 2026-05-24 | −$2,535 | 5 | 40% | −9.75 |
+
+### iv_rank_rise_10d Analysis — Primary Goal
+
+All 63 entries now have valid `iv_rank_rise_10d` values in their decision dicts (stored as `decision.iv_rank_rise_10d`). This confirms the `context_bars=252` fix is working.
+
+**Signal summary:**
+
+| Cohort | n | Mean iv_rank_rise_10d | Min | Max |
+|--------|---|----------------------|-----|-----|
+| Winning trades | 35 | **−0.057** | −0.604 | +0.290 |
+| Losing trades | 28 | **+0.127** | −0.193 | +0.518 |
+
+The signal is real: rising IV rank at entry correlates with losses. Losing trades had a 10-day IV rank increase of +0.127 on average; winning trades had a slight IV rank decrease of −0.057.
+
+**Selected high-signal entries:**
+
+| Entry date | iv_rank | iv_rank_rise_10d | PnL | Note |
+|-----------|---------|-----------------|-----|------|
+| W04 Jul 29 2024 | 0.96 | +0.518 | −$992 | Yen carry crash — peak fear entry |
+| W01 Jul 17 2024 | 0.65 | +0.424 | −$360 | Pre-crash entry |
+| W09 Nov 7 2024 | 0.46 | +0.310 | −$922 | Post-election reversal confusion |
+| W33 Mar 31 2026 | 0.31 | +0.141 | −$1,240 | Tariff shock |
+| W17 May 16 2025 | 0.41 | −0.580 | +$65 | Post-tariff recovery — IV falling sharply |
+| W19 Jun 2 2025 | 0.18 | −0.147 | +$1,557 | Summer calm — IV low and falling |
+
+**Why a fixed threshold cannot cleanly separate win/loss:**
+
+Losing trades span rise values from −0.19 to +0.52. Winning trades span −0.60 to +0.29. Overlap is substantial. A threshold around 0.30 would block most of the highest-loss entries but also block some winning trades. The correct approach (Exp 26) is to let Optuna search the threshold [0.25, 0.60] per window using the full training data signal.
+
+### Observations
+
+1. **W04 (Jul–Sep 2024)** was the worst window (−$2,486): 3 losing trades entered during the Yen carry unwind and the August 2024 QQQ crash. All had rising IV rank (0.38 to 0.52). The parameter set optimized on 2023–2024 training didn't account for this regime.
+
+2. **W14 (Feb–Apr 2025)** Sharpe −141.56 from only 4 trades — all 4 lost. This is the Q1 2025 selloff (DeepSeek + tariff fears). All iv_rank_rise values were modest (−0.035 to +0.125), meaning the IV rise gate alone wouldn't have saved this window. Optuna will need to tune other parameters.
+
+3. **W17 and W18 (Apr–Jul 2025)** were strongly profitable: the post-tariff-shock recovery (IV falling rapidly from high levels). IV rank was falling sharply (−0.58 to −0.12) at entry — the opposite of losing windows.
+
+4. **W31 and W33** (Mar–May 2026, tariff shock) show modest iv_rank_rise (0.02–0.15). The gate would need a threshold around 0.10–0.15 to block these, which would also block many profitable entries in calmer windows.
+
+5. **6 windows with 0 trades (W20–W25, W28, W32)**: Dead zones from Jun–Dec 2025. The Optuna search consistently finds no entries meeting criteria during this low-vol period. Consistent with prior experiments.
+
+### What We Learned
+
+1. **`context_bars=252` works as intended.** All `iv_rank_rise_10d` values in decision dicts are now real numbers, not N/A. The diagnostic goal is achieved.
+
+2. **The iv_rank_rise signal is predictive but not clean.** There is a statistically meaningful difference between win/loss cohorts (−0.057 vs +0.127 mean), but the distributions overlap heavily. No single fixed threshold works across all windows — different windows have different base IV levels and regimes.
+
+3. **Per-window Optuna tuning is the right approach.** Because different windows (Yen carry crash vs. tariff shock vs. post-shock recovery) require very different thresholds, a fixed global threshold would damage some windows. Letting Optuna search [0.25, 0.60] per window and score it against that window's training data is the correct path.
+
+4. **Rising IV rank is a meaningful anti-entry signal for iron condors.** When IV rank is rising rapidly, the market is pricing in continued uncertainty — a short-vol strategy should wait for IV to stabilize or fall. The Yen carry (W04) and election reversal (W09) entries all show this pattern.
+
+5. **Overlapping windows overcount the same calendar events.** W12/W13/W14 all cover parts of Q1 2025. W31/W33 both cover March–April 2026. The reported aggregate PnL double-counts the losses from the same market event. The 60d/60d non-overlapping config used from Exp 12 onward correctly prevents this.
+
+### What Changed for Exp 26
+
+- `iv_rank_rise_threshold` added to Optuna search space: `("float", 0.25, 0.60)` (already in `param_spaces.py`, passed through `walkforward.py` → `engine.py`)
+- Trials: 200, patience: 50 (same as Exp 21–23)
+- Walk-forward: 365d / 60d / 60d / 5d → 12 non-overlapping windows
+- All performance improvements from this session committed: vectorized `_save_window_timeseries`, single FeatureEngine per OOS window, `itertuples` intraday loops, vectorized `_try_limit_fill`
+
+---
+
+## Experiment 26 — iv_rank_rise_threshold in Search Space
+
+**Archive:** *(pending)*
+**Date:** *(pre-run)* · Git branch: `features-request-3`
+
+### Context
+
+Exp 25 confirmed that `iv_rank_rise_10d` has predictive signal: losing trades have a mean 10-day IV rank increase of +0.127 versus −0.057 for winning trades. However, the distributions overlap substantially — no single global threshold cleanly separates the two cohorts. The signal quality varies by market regime (Yen carry crash entries look similar to tariff shock entries at entry time).
+
+The prior `iv_rank_rise_threshold` in walkforward.py was hardcoded at 0.30. Exp 26 moves this into the Optuna search space so each window's 365-day training data determines the right threshold for its own vol regime.
+
+### What We're Testing
+
+**Primary:** Does allowing Optuna to tune `iv_rank_rise_threshold` per window improve walk-forward Sharpe? Compare against Exp 23 baseline (Sharpe 8.21 with fixed 0.30).
+
+**Secondary:** Which windows use a tight threshold (aggressive gate) vs. a loose one? Do windows covering high-vol events choose lower thresholds (letting more IV-rising trades through because they're all high-IV)?
+
+**Key questions:**
+1. Does W12 (Mar 2026, tariff shock) find a threshold that blocks the bad entries while keeping good ones?
+2. What threshold does W07 (Sep–Nov 2024, series high window) converge to?
+3. Does the overall Sharpe exceed Exp 23's 8.21?
+
+### Implementation
+
+`iv_rank_rise_threshold` is already wired end-to-end:
+- [param_spaces.py](src/ait/optimization/param_spaces.py): `"iv_rank_rise_threshold": ("float", 0.25, 0.60)`
+- [walkforward.py](src/ait/backtesting/walkforward.py): passes `iv_rank_rise_threshold=` to `BacktestEngine`
+- [engine.py](src/ait/backtesting/engine.py): uses it in `_can_enter_iron_condor`
+
+No new code needed — parameter is already in the search space. Run with 200 trials, patience 50.
 
 ### Setup
 
-- Walk-forward config: **365d / 60d / 60d / 5d → 12 windows** (unchanged)
-- Key change from Exp 23: `context_bars` 60 → 252; everything else identical
+- Walk-forward config: **365d / 60d / 60d / 5d → 12 non-overlapping windows**
+- Trials: 200 per window, patience 50
+- Key change from Exp 23: `iv_rank_rise_threshold` [0.25, 0.60] in search space (was fixed 0.30)
+- All performance optimizations from this session active (vectorized timeseries, single FeatureEngine per OOS window)
+
+### Run Command
+
+```bash
+python -u scripts/run_integration_test.py \
+    --symbols QQQ --years 3 --skip-backfill \
+    --wf-n-jobs 6 --wf-trials 200 --wf-patience 50
+```
+
+### Assumptions Going In
+
+- Optuna will find per-window thresholds that improve on the fixed 0.30 baseline
+- High-vol windows (Yen carry, tariff shock) will need tighter thresholds (~0.25)
+- Calm windows may relax the threshold to ~0.55 to allow more entries
+- Overall Sharpe should at minimum match Exp 23 (8.21); targeting > 10.0
 
 ---
 

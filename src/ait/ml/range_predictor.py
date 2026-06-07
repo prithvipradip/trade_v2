@@ -683,6 +683,116 @@ class RangePredictor:
             model_version=self._model_version,
         )
 
+    def predict_from_features(
+        self,
+        feature_row: "pd.Series",
+        symbol: str = "",
+    ) -> "RangePrediction | None":
+        """Make a prediction from a pre-computed feature row, bypassing FeatureEngine.
+
+        Used by _save_window_timeseries for O(1) per-bar predictions instead of
+        re-running FeatureEngine on 252+ rows for each bar. GARCH/MS-GARCH/OU-Jump
+        state contributions are preserved — they are state-based, not feature-based.
+        """
+        sym_data = None
+        if symbol and symbol in self._symbol_models:
+            sym_data = self._symbol_models[symbol]
+            models = sym_data["models"]
+            scaler = sym_data["scaler"]
+            feature_names = sym_data["feature_names"]
+        elif self._trained:
+            models = self._models
+            scaler = self._scaler
+            feature_names = self._feature_names
+        else:
+            return None
+
+        if sym_data is not None:
+            cv_scores = sym_data.get("cv_scores", {})
+            if cv_scores:
+                avg_balanced_acc = sum(cv_scores.values()) / len(cv_scores)
+                edge = avg_balanced_acc - 0.50
+                if edge < self.MIN_EDGE_OVER_BASELINE:
+                    return None
+
+        try:
+            X = pd.DataFrame(
+                [feature_row.reindex(feature_names).fillna(0.0).values],
+                columns=feature_names,
+            )
+            X_scaled = pd.DataFrame(
+                scaler.transform(X.values), columns=feature_names,
+            )
+        except Exception as e:
+            log.error("range_scaling_failed", symbol=symbol, error=str(e))
+            return None
+
+        fw = (sym_data or {}).get("fitted_weights") or getattr(self, "_fitted_weights", None)
+        def _weight(name: str, default: float) -> float:
+            if fw and name in fw:
+                return float(fw[name])
+            return float(self._weights.get(name, default))
+
+        weighted_p = 0.0
+        total_weight = 0.0
+        for name, model in models.items():
+            w = _weight(name, 0.5)
+            try:
+                p = float(model.predict_proba(X_scaled)[0][1])
+                weighted_p += w * p
+                total_weight += w
+            except Exception:
+                continue
+
+        garch_state = (sym_data or {}).get("garch_state") or getattr(self, "_garch_state", None)
+        if garch_state:
+            w_garch = _weight("garch", 0.0)
+            if w_garch > 0:
+                try:
+                    from ait.ml.garch_range_predictor import GARCHRangeModel
+                    p_garch = GARCHRangeModel().predict_p_in_range(garch_state)
+                    weighted_p += w_garch * p_garch
+                    total_weight += w_garch
+                except Exception:
+                    pass
+
+        ms_garch_state = (sym_data or {}).get("ms_garch_state") or getattr(self, "_ms_garch_state", None)
+        if ms_garch_state:
+            w_ms = _weight("msgarch", 0.0)
+            if w_ms > 0:
+                try:
+                    from ait.ml.garch_range_predictor import GARCHRangeModel
+                    p_ms = GARCHRangeModel().predict_p_in_range(ms_garch_state)
+                    weighted_p += w_ms * p_ms
+                    total_weight += w_ms
+                except Exception:
+                    pass
+
+        ou_jump_state = (sym_data or {}).get("ou_jump_state") or getattr(self, "_ou_jump_state", None)
+        if ou_jump_state:
+            w_ou = _weight("oujump", 0.0)
+            if w_ou > 0:
+                try:
+                    from ait.ml.garch_range_predictor import GARCHRangeModel
+                    p_ou = GARCHRangeModel().predict_p_in_range(ou_jump_state)
+                    weighted_p += w_ou * p_ou
+                    total_weight += w_ou
+                except Exception:
+                    pass
+
+        if total_weight == 0:
+            return None
+        p_in_range = weighted_p / total_weight
+
+        return RangePrediction(
+            probability_in_range=p_in_range,
+            threshold_pct=self._threshold,
+            horizon_days=self._horizon,
+            confidence=max(p_in_range, 1 - p_in_range),
+            features_used=len(feature_names),
+            model_version=self._model_version,
+        )
+
     # --- Persistence ---
 
     def _save_models(self) -> None:
