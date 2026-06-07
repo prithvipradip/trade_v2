@@ -1545,17 +1545,72 @@ Example at `optimize_min_trades = 10`: a trial with 5 trades and composite 14.4 
 
 Each strategy has a defined search space in `param_spaces.py`:
 
-| Parameter (iron condor) | Search Range | Effect |
-|---|---|---|
-| `delta_short` | float [0.15, 0.30] | Delta of the short call and put legs |
-| `max_hold_days` | int [14, 40] | Entry DTE / max hold duration (≤ 40 to stay inside 42d test window) |
-| `stop_loss_pct` | float [0.30, 0.70] | Exit when unrealised loss reaches this % of premium |
-| `profit_target_pct` | float [0.30, 0.70] | Exit at this % profit |
-| `trailing_stop_fraction` | float [0.30, 0.90] | Derived trailing stop: `trailing_stop_pct = fraction × profit_target_pct`; keeps trailing stop logically coupled to profit target |
-| `wing_k` | float [0.30, 2.00] | Vol-scaled wing multiplier. 1.0 = 1-sigma expected move. |
-| `hurst_regime_threshold` | float [0.08, 0.30] | Fractal gate: min Hurst exponent required to enter |
-| `hurst_regime_penalty` | float [0.00, 0.25] | Score penalty when Hurst is near the threshold |
-| `multifractal_max_width` | float [0.30, 0.65] | Fractal gate: max multifractal spectrum width allowed |
+#### Iron Condor Parameters
+
+**`delta_short` — float [0.15, 0.30]**
+The option delta of the two short legs (the OTM call and OTM put you sell). Delta is a proxy for how far out-of-the-money the strike is — roughly, the market's implied probability of expiring in-the-money.
+- **Lower (0.15):** Strikes are ~2 standard deviations OTM. ~85% probability of max profit. Less premium collected but the underlying has a wide range to move without breaching. Better in high-vol regimes where the market swings a lot.
+- **Higher (0.30):** Strikes are ~1 standard deviation OTM. ~70% probability of max profit. More premium collected but you get tested more often. Better in calm, range-bound regimes.
+- Interacts with `wing_k`: `delta_short` sets *where* the short strikes are; `wing_k` sets how far the protective long legs sit beyond them.
+
+**`max_hold_days` — int [14, 40]**
+Both the entry DTE (days to expiration at open) and the maximum number of calendar days the position is allowed to remain open. These are the same value: you open a condor with `max_hold_days` DTE remaining and exit at or before expiration.
+- **Lower (14):** Short-duration condors. Less theta time but faster resolution. Appropriate when you expect a sharp near-term range.
+- **Higher (40):** More theta decay time. More premium via higher absolute IV on longer-dated options. More exposure to trend reversals during the hold.
+- Capped at 40 to ensure the position resolves well inside the 60-day OOS test window.
+
+**`wing_k` — float [0.30, 2.00]**
+Scales the distance between the short and long strikes (the wing width). The formula is:
+`wing_width = wing_k × price × IV × √(DTE/365)`
+At `wing_k=1.0`, the wings are exactly 1 expected move wide (1 sigma). This sets your maximum loss per contract.
+- **Lower (0.30):** Narrow wings. Less max loss, less premium from the spread's credit. Requires the underlying to stay in a tighter range to be profitable.
+- **Higher (2.00):** Wide wings. Higher max loss, but also more credit since the spread captures a wider range of the options curve. Appropriate when you want to sell rich premium without capping the credit too tightly.
+
+**`stop_loss_pct` — float [0.30, 0.70]** *(frozen at 0.35 for iron condor — see note below)*
+Exit the position when the unrealised loss reaches this fraction of the credit collected at entry. E.g. 0.50 means exit when you've lost 50% of what you took in.
+
+**`profit_target_pct` — float [0.30, 0.70]** *(frozen at 0.50 for iron condor)*
+Exit when unrealised profit reaches this fraction of the entry credit. E.g. 0.50 means take profit at 50% of max credit.
+
+**`trailing_stop_fraction` — float [0.30, 0.90]** *(frozen at 0.70 for iron condor)*
+`trailing_stop_pct = trailing_stop_fraction × profit_target_pct`. Keeps the trailing stop logically coupled to the profit target — as you set a more aggressive profit target, the trailing stop tightens proportionally to lock in gains.
+
+> **Note — `stop_loss_pct`, `profit_target_pct`, `trailing_stop_fraction` are frozen for iron condor.** Exp 18 (H1 test) showed these are risk-management constants that don't vary by market regime. Letting Optuna tune them caused it to overfit the training-path noise rather than learn regime-specific entry behaviour. They remain in the search space for debit strategies where they have more legitimate per-window variation.
+
+**`hurst_regime_threshold` — float [0.08, 0.30]**
+The minimum Hurst exponent spread required before entering. The Hurst exponent measures how *trending* vs *mean-reverting* the underlying is: Hurst > 0.5 = trending, Hurst < 0.5 = mean-reverting/ranging, Hurst ≈ 0.5 = random walk. The `hurst_scale_spread` is computed across multiple timescales.
+- **Iron condors are range strategies** — they profit when the underlying stays put. A strongly trending market (high Hurst spread) is bad for condors; the underlying is more likely to keep moving in one direction and breach a short strike.
+- **Lower threshold (0.08):** Gate fires only in strongly trending regimes. More entries allowed; less filtering.
+- **Higher threshold (0.30):** Gate fires more often; filters out moderately trending markets too. Fewer entries but higher quality.
+
+**`hurst_regime_penalty` — float [0.00, 0.25]**
+A soft confidence penalty applied when `hurst_scale_spread` is above threshold but not so high that entry is blocked outright. Instead of a hard veto, the confidence score is reduced by `hurst_regime_penalty`. Allows Optuna to tune how aggressively to discount borderline regimes.
+- **0.00:** No soft penalty — the hard threshold is the only guard.
+- **0.25:** Significant score reduction near the threshold boundary; effectively widens the "grey zone" around the hard gate.
+
+**`multifractal_max_width` — float [0.30, 0.65]**
+Maximum allowed multifractal spectrum width. The multifractal spectrum measures how *irregular* the price process is across scales — a wide spectrum indicates the market has mixed scaling behaviour (periods of extreme quiet and extreme bursts), which implies hidden tail risk that a condor is exposed to.
+- **Lower (0.30):** Tight filter — only enter in markets with uniform, smooth fractal structure.
+- **Higher (0.65):** Lenient — allows entry even in moderately irregular markets.
+
+**`iv_rank_rise_threshold` — float [0.25, 0.60]** *(added Exp 26)*
+Gate that blocks entry when implied volatility rank has *risen* more than this amount over the past 10 trading days. A rising IV rank means the market is pricing in increasing uncertainty — exactly the wrong environment for selling short vol via an iron condor. The position needs IV to stay flat or fall (so the options you sold decay in value).
+- **Lower (0.25):** Tight gate — blocks entries whenever IV has risen meaningfully. Fewer trades but avoids entering into rising-uncertainty regimes.
+- **Higher (0.60):** Loose gate — only blocks entry during genuine IV spikes (Yen-carry or tariff-shock level events). More entries, accepts moderate IV drift.
+- Exp 25 data showed losing trades had a mean 10-day IV rise of +0.127 vs −0.057 for winning trades, confirming the signal. No single global threshold separates the two cleanly, which is why per-window Optuna tuning (Exp 26) is the right approach.
+
+| Parameter | Range | Frozen? | Primary effect |
+|-----------|-------|---------|----------------|
+| `delta_short` | [0.15, 0.30] | No | Short strike placement — premium vs. safety trade-off |
+| `max_hold_days` | [14, 40] | No | DTE at entry + max hold duration |
+| `wing_k` | [0.30, 2.00] | No | Wing width = max loss per contract |
+| `iv_rank_rise_threshold` | [0.25, 0.60] | No | Blocks entry when IV has been rising (Exp 26+) |
+| `hurst_regime_threshold` | [0.08, 0.30] | No | Hard fractal gate — blocks trending markets |
+| `hurst_regime_penalty` | [0.00, 0.25] | No | Soft confidence penalty near threshold |
+| `multifractal_max_width` | [0.30, 0.65] | No | Blocks irregular/bursty price processes |
+| `stop_loss_pct` | [0.30, 0.70] | **Yes (0.35)** | Exit when loss = X% of credit |
+| `profit_target_pct` | [0.30, 0.70] | **Yes (0.50)** | Take profit at X% of credit |
+| `trailing_stop_fraction` | [0.30, 0.90] | **Yes (0.70)** | Trailing stop tied to profit target |
 
 > **Intentionally excluded from the iron condor search space (P5, P8, P9):**
 > - `min_confidence`, `max_entry_vol_annual` — regime gates; Optuna parks them at extremes to produce 0-trade OOS solutions (Exp 2–4). Fixed at config defaults (P5).
