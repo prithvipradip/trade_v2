@@ -309,9 +309,9 @@ class Backtester:
                     vol_exp = float(last_f.get("vol_regime_expanding", 0.0)) > 0.5
                     px_sma  = float(last_f.get("price_vs_sma_20", 0.0))
                     meta_ctx.update({
-                        "regime_trending_up":   1.0 if (vol_exp and px_sma > 0.02)   else 0.0,
-                        "regime_trending_down":  1.0 if (vol_exp and px_sma < -0.02)  else 0.0,
-                        "regime_high_vol":       1.0 if (vol_exp and abs(px_sma) <= 0.02) else 0.0,
+                        "regime_trending_up":   1.0 if (vol_exp and px_sma > 0.02)               else 0.0,
+                        "regime_trending_down":  1.0 if (vol_exp and px_sma < -0.05)               else 0.0,
+                        "regime_high_vol":       1.0 if (vol_exp and -0.05 <= px_sma <= 0.02)      else 0.0,
                         "regime_range_bound":    0.0 if vol_exp else 1.0,
                         "vix":                   float(last_f.get("vix_level", 0.5)),
                         "iv_rank":               float(last_f.get("iv_rank", 0.5)),

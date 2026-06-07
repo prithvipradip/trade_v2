@@ -48,7 +48,10 @@ function DecisionPanel({ trade, onClose }) {
   const steps = hasDecision ? [
     {
       title: "Direction model", state: "info",
-      detail: <>3-class ensemble → <b>{d.direction_class}</b> @ conf <b className="mono">{fmtNum(d.direction_conf)}</b>. Iron condor is market-neutral, so the directional gate is bypassed — the range model is the entry filter.</>,
+      detail: <>3-class ensemble → <b>{d.direction_class}</b> @ conf <b className="mono">{fmtNum(d.direction_conf)}</b>.{" "}
+        {(trade.strategy === "iron_condor" || trade.strategy === "short_strangle")
+          ? "Market-neutral strategy — the directional gate is bypassed; the range model is the entry filter."
+          : "Directional confidence must meet the minimum threshold to proceed."}</>,
     },
     {
       title: "Range model gate",
