@@ -9,17 +9,16 @@ share a single run across all tests that need the same configuration:
   - wf_plain:  no per-window Optuna (fast ablation path)
   - wf_optuna: optimize_per_window=True, n_trials=3
 
-Skip unless RUN_DASHBOARD_TESTS=1 env var is set (full walk-forward run can
-take several minutes).
-
-Run:
-    RUN_DASHBOARD_TESTS=1 pytest tests/test_walkforward_dashboard.py -v
+INTENTIONAL DESIGN DECISION — do not add a pytestmark skip gate here:
+These tests run in ~6 minutes (down from ~32 min) thanks to module-scoped
+fixtures that share two WalkForwardBacktester runs across all 31 tests.
+They must stay in the default suite to catch regressions in the dashboard
+enrichment path. An env-var gate was proposed and explicitly rejected.
 """
 
 from __future__ import annotations
 
 import json
-import os
 from datetime import date
 from pathlib import Path
 
@@ -32,11 +31,6 @@ from ait.backtesting.walkforward import (
     WalkForwardConfig,
     _build_optuna_window_data,
     _isnan,
-)
-
-pytestmark = pytest.mark.skipif(
-    not os.getenv("RUN_DASHBOARD_TESTS"),
-    reason="set RUN_DASHBOARD_TESTS=1 to run (full walk-forward run, several minutes)",
 )
 
 
