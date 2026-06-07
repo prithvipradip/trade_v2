@@ -677,6 +677,7 @@ async def _section_f_ablation(
     _bc = _settings.backtest
 
     _min_trades = args.wf_min_trades if args.wf_min_trades is not None else _bc.optimize_min_trades
+    _n_jobs     = args.wf_n_jobs     if args.wf_n_jobs     is not None else 1
 
     config = WalkForwardConfig(
         train_days=args.train_days,
@@ -685,6 +686,7 @@ async def _section_f_ablation(
         gap_days=args.gap_days,
         optimize_per_window=False,
         optimize_min_trades=_min_trades,
+        optimize_n_jobs=_n_jobs,
         initial_capital=_bc.initial_capital,
         position_size_pct=_bc.position_size_pct,
         wing_floor_dollars=_bc.wing_floor_dollars,
