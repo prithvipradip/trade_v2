@@ -534,7 +534,7 @@ class Backtester:
                 if vol_expanding:
                     if px_vs_sma > 0.02:
                         pos["entry_regime"] = "trending_up"
-                    elif px_vs_sma < -0.02:
+                    elif px_vs_sma < -0.05:
                         pos["entry_regime"] = "trending_down"
                     else:
                         pos["entry_regime"] = "high_volatility"
@@ -580,8 +580,8 @@ class Backtester:
             elif pos.get("strategy") in ("put_credit_spread", "call_credit_spread"):
                 ep = pos.get("entry_price", 0.0)
                 pos["legs"] = [
-                    {"type": "short", "strike": pos.get("short_put_strike") or pos.get("short_call_strike"), "premium": round(ep * 0.60, 4)},
-                    {"type": "long",  "strike": pos.get("long_put_strike")  or pos.get("long_call_strike"),  "premium": round(ep * 0.40, 4)},
+                    {"type": "short", "strike": pos.get("short_put_strike") or pos.get("short_call_strike"), "premium": round(ep * 1.05, 4)},
+                    {"type": "long",  "strike": pos.get("long_put_strike")  or pos.get("long_call_strike"),  "premium": round(-ep * 0.05, 4)},
                 ]
                 contracts = pos.get("contracts", 1)
                 pos["credit"]   = round(ep * 100 * contracts, 2)
