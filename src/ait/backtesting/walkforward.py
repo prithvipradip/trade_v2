@@ -141,7 +141,15 @@ class WalkForwardConfig:
     spread_iv_sensitivity: float = 0.10   # additional spread per unit IV above 0.20
     spread_dte_sensitivity: float = 0.005 # additional spread per DTE below 21
     spread_cap: float = 0.15              # maximum half-spread per leg ($)
-    optimize_n_jobs: int = 1              # parallel walk-forward windows (n_jobs=1 = sequential)
+    optimize_n_jobs: int = 1              # Number of walk-forward WINDOWS to run in parallel via
+                                          # ProcessPoolExecutor. Despite the "optimize_" prefix this
+                                          # controls WINDOW-LEVEL parallelism, NOT Optuna trial-level
+                                          # parallelism. It applies equally to optimized runs
+                                          # (optimize_per_window=True) and ablation runs
+                                          # (optimize_per_window=False). Optuna's own trial-level
+                                          # n_jobs is always 1 (threading is GIL-bound; window-level
+                                          # process parallelism is the effective speedup path).
+                                          # Set via --wf-n-jobs CLI flag (default: 1 = sequential).
     optimize_val_split: bool = False      # H2: score Optuna objective on held-out 20% val slice
 
 

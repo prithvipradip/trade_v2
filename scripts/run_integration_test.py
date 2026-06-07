@@ -102,7 +102,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--wf-n-jobs", type=int, default=None,
-        help="Parallel Optuna workers per walk-forward window (default: 1 = sequential).",
+        help="Number of walk-forward WINDOWS to run in parallel (default: 1 = sequential). "
+             "Controls window-level ProcessPoolExecutor parallelism, NOT Optuna trial-level "
+             "parallelism. Applies to both the optimized (Section E) and ablation (Section F) runs.",
     )
     parser.add_argument(
         "--wf-val-split", action="store_true", default=False,
