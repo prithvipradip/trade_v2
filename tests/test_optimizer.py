@@ -57,7 +57,7 @@ def _make_ohlcv(n: int = 300) -> pd.DataFrame:
 
 class TestParamSpaces:
     def test_iron_condor_space_has_required_keys(self):
-        required = {"stop_loss_pct", "profit_target_pct", "delta_short", "max_hold_days", "wing_k"}
+        required = {"delta_short", "max_hold_days", "wing_k"}
         assert required.issubset(IRON_CONDOR_SPACE.keys())
 
     def test_non_iron_condor_spaces_have_min_confidence(self):

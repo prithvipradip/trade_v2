@@ -68,6 +68,9 @@ run_orchestrator.py          ← Master process (start here)
 | `src/ait/optimization/objectives.py` | Objective functions (sharpe_ratio, composite, etc.) |
 | `src/ait/optimization/results.py` | OptimizationResult + summary/save/apply_to_config |
 | `src/ait/dashboard/app.py` | Streamlit dashboard at localhost:8501 |
+| `src/ait/dashboard/walkforward/index.html` | Walk-Forward Analysis Dashboard (static React, no build step) |
+| `src/ait/dashboard/walkforward/export.py` | Exports `reports/runs/` → `wf_data.js` for the dashboard |
+| `src/ait/dashboard/walkforward/metric-info.js` | Data-plot dictionary — all info-box definitions (`window.PM_INFO`) |
 | `src/ait/orchestration/master.py` | Master scheduler (APScheduler) |
 | `src/ait/orchestration/gateway.py` | IB Gateway auto-start via IBC |
 | `src/ait/learning/engine.py` | Post-market self-learning cycle |
@@ -324,7 +327,7 @@ MLflow experiment: `walkforward_QQQ` (browse via `mlflow ui --backend-store-uri 
 4. **[ ] Verify bot places trades** — ML predictions are now firing. Next market open, confirm trades actually execute on IBKR paper account.
 
 ### Medium Priority
-5. **[ ] Dashboard upgrade** — Add capital tier display, live ML predictions, current positions table, real-time P&L chart. Consider adding equity_stats view and analyst recommendation feed.
+5. **[x] Walk-Forward Analysis Dashboard** — Implemented at `src/ait/dashboard/walkforward/`. Three tabs: Experiment Analysis (chart + trade drawer + decision chain), Optuna Optimization (trial history + param scatter), Predictor Models (per-member CV skill, reliability curves, GARCH-family detail). Export with `python -m ait.dashboard.walkforward.export --runs-dir reports/runs`, serve with `python -m http.server 8080`.
 6. **[ ] VIX contract fix verification** — Changed from ^VIX (stock) to VIX (index on CBOE). Need to confirm it resolves during market hours.
 7. **[ ] Delayed market data type** — Set to type 3 (delayed) for paper account. Verify it eliminates Error 10089 warnings.
 8. **[ ] Earnings calendar live test** — Verify the bot actually skips trades near earnings dates.
@@ -394,8 +397,13 @@ python run_optimizer.py --strategies iron_condor --symbols SPY QQQ --n-trials 10
 # View live logs
 python tail_logs.py
 
-# Dashboard
+# Streamlit dashboard (live bot monitoring)
 streamlit run src/ait/dashboard/app.py
+
+# Walk-Forward Analysis Dashboard (experiment post-analysis)
+python -m ait.dashboard.walkforward.export --runs-dir reports/runs
+cd src/ait/dashboard/walkforward && python -m http.server 8080
+# → open http://localhost:8080 (Cmd+Shift+R after re-export)
 ```
 
 ## Configuration

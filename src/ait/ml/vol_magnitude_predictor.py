@@ -113,10 +113,24 @@ class VolMagnitudePredictor:
         features = features.dropna(subset=["target"])
 
         positive_rate = features["target"].mean()
-        if positive_rate < 0.05 or positive_rate > 0.95:
+        n_pos = int(features["target"].sum())
+        n_neg = len(features) - n_pos
+        _MIN_CLASS_SAMPLES = 10
+        if n_pos < _MIN_CLASS_SAMPLES or n_neg < _MIN_CLASS_SAMPLES:
+            log.warning(
+                "vol_mag_single_class", symbol=symbol,
+                big_move_pct=f"{positive_rate:.1%}",
+                n_big_move=n_pos, n_small_move=n_neg,
+                min_required=_MIN_CLASS_SAMPLES,
+                hint=f"±{self._threshold:.0%} threshold produces too few minority-class "
+                     f"examples to train reliably — cannot train binary classifier",
+            )
+            return {}
+        if positive_rate < 0.05 or positive_rate > 0.98:
             log.warning(
                 "vol_mag_imbalanced", symbol=symbol,
                 big_move_pct=f"{positive_rate:.1%}",
+                n_big_move=n_pos, n_small_move=n_neg,
                 hint=f"Threshold {self._threshold:.0%} may need tuning",
             )
 
@@ -128,8 +142,10 @@ class VolMagnitudePredictor:
 
         accuracies = {}
 
+        _spw = n_neg / n_pos if n_pos > 0 else 1.0
+
         if "xgboost" in self._weights:
-            acc = self._train_xgb(X, y)
+            acc = self._train_xgb(X, y, scale_pos_weight=_spw)
             accuracies["xgboost"] = acc
 
         if "lightgbm" in self._weights:
@@ -149,6 +165,17 @@ class VolMagnitudePredictor:
             from datetime import datetime
             self._model_version = f"volmag-v-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
+            # Fit ensemble weights from per-model CV edge over 0.50 baseline.
+            _baseline = 0.50
+            _edges = {m: max(0.0, acc - _baseline) for m, acc in accuracies.items()}
+            _total = sum(_edges.values())
+            fitted_weights = (
+                {m: e / _total for m, e in _edges.items()}
+                if _total > 0
+                else {m: 0.5 for m in accuracies}
+            )
+            self._fitted_weights: dict[str, float] = fitted_weights
+
             if symbol:
                 import copy
                 importances = {}
@@ -164,6 +191,7 @@ class VolMagnitudePredictor:
                     "scaler": copy.deepcopy(self._scaler),
                     "feature_names": list(self._feature_names),
                     "cv_scores": dict(accuracies),
+                    "fitted_weights": dict(fitted_weights),
                     "feature_importances": importances,
                     "big_move_rate": float(positive_rate),
                     "version": self._model_version,
@@ -174,12 +202,17 @@ class VolMagnitudePredictor:
                 "vol_mag_trained",
                 symbol=symbol,
                 accuracies=accuracies,
+                fitted_weights=fitted_weights,
                 big_move_rate=f"{positive_rate:.2%}",
                 threshold=self._threshold,
                 horizon=self._horizon,
             )
 
         return accuracies
+
+    @property
+    def fitted_weights(self) -> "dict[str, float] | None":
+        return getattr(self, "_fitted_weights", None)
 
     def _walk_forward_split(self, n: int, n_splits: int = 4, gap: int = 5):
         splits = []
@@ -195,7 +228,7 @@ class VolMagnitudePredictor:
             splits.append((train_idx, val_idx))
         return splits
 
-    def _train_xgb(self, X: np.ndarray, y: np.ndarray) -> float:
+    def _train_xgb(self, X: np.ndarray, y: np.ndarray, scale_pos_weight: float = 1.0) -> float:
         try:
             from xgboost import XGBClassifier
             from sklearn.metrics import balanced_accuracy_score
@@ -204,9 +237,12 @@ class VolMagnitudePredictor:
                 subsample=0.8, colsample_bytree=0.8,
                 objective="binary:logistic", eval_metric="logloss",
                 verbosity=0, n_jobs=-1, random_state=42,
+                scale_pos_weight=scale_pos_weight,
             )
             scores = []
             for tr_idx, val_idx in self._walk_forward_split(len(X)):
+                if len(np.unique(y[tr_idx])) < 2:
+                    continue
                 fold_scaler = StandardScaler()
                 X_tr = pd.DataFrame(
                     fold_scaler.fit_transform(X[tr_idx]), columns=self._feature_names,
@@ -237,6 +273,8 @@ class VolMagnitudePredictor:
             )
             scores = []
             for tr_idx, val_idx in self._walk_forward_split(len(X)):
+                if len(np.unique(y[tr_idx])) < 2:
+                    continue
                 fold_scaler = StandardScaler()
                 X_tr = pd.DataFrame(
                     fold_scaler.fit_transform(X[tr_idx]), columns=self._feature_names,
@@ -304,10 +342,11 @@ class VolMagnitudePredictor:
             log.error("vol_mag_scaling_failed", symbol=symbol, error=str(e))
             return None
 
+        fw = (sym_data or {}).get("fitted_weights") or getattr(self, "_fitted_weights", None)
         weighted_p = 0.0
         total_weight = 0.0
         for name, model in models.items():
-            w = self._weights.get(name, 0.5)
+            w = fw.get(name, 0.5) if fw else self._weights.get(name, 0.5)
             try:
                 p = float(model.predict_proba(X_scaled)[0][1])
                 weighted_p += w * p

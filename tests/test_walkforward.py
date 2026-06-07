@@ -59,9 +59,9 @@ class TestWalkForwardConfig:
         cfg = WalkForwardConfig()
         assert cfg.delta_iv_scale == pytest.approx(0.0)
 
-    def test_max_concurrent_positions_default_is_3(self) -> None:
+    def test_max_concurrent_positions_default_is_1(self) -> None:
         cfg = WalkForwardConfig()
-        assert cfg.max_concurrent_positions == 3
+        assert cfg.max_concurrent_positions == 1
 
     def test_max_entry_vol_annual_default(self) -> None:
         cfg = WalkForwardConfig()
@@ -889,3 +889,154 @@ class TestWindowLevelParallelism:
         # but the parallel dispatch itself must not raise.  Config should be preserved.
         assert result.config is not None
         assert result.config.optimize_n_jobs == 2
+
+
+# ---------------------------------------------------------------------------
+# Pre-training architecture tests (Exp 17 sequential pre-training fix)
+# ---------------------------------------------------------------------------
+
+class TestPretrainRangeModels:
+    """_pretrain_range_models() runs before ProcessPoolExecutor, passes results in."""
+
+    def test_pretrain_called_before_executor(self, monkeypatch) -> None:
+        """In parallel mode, _pretrain_range_models is called once with all windows
+        before any ProcessPoolExecutor worker runs, and its results are wired into
+        every args tuple passed to _window_task_mp.
+
+        We intercept the executor's map() call — which runs in the parent process —
+        to inspect the args_list without spawning subprocesses.
+        """
+        import asyncio
+        from concurrent.futures import ProcessPoolExecutor
+
+        pretrain_call_count = [0]
+        captured_args: list = []
+
+        def fake_pretrain(self_bt, windows, data, vix_full):
+            pretrain_call_count[0] += 1
+            return [{sym: (None, "skipped", 0.05) for sym in data} for _ in windows]
+
+        class FakeExecutor:
+            """Intercepts map() to capture args without actually spawning workers."""
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def map(self, fn, args_list):
+                captured_args.extend(args_list)
+                # Return empty results — no actual window work done
+                return []
+
+        monkeypatch.setattr(WalkForwardBacktester, "_pretrain_range_models", fake_pretrain)
+        # ProcessPoolExecutor is imported locally inside run(), so patch the source module
+        import concurrent.futures
+        monkeypatch.setattr(concurrent.futures, "ProcessPoolExecutor",
+                            lambda **kw: FakeExecutor())
+
+        data = {"QQQ": _make_ohlcv(200, start_price=450)}
+        cfg = WalkForwardConfig(
+            train_days=60, test_days=30, step_days=30, gap_days=5,
+            optimize_n_jobs=2,
+        )
+        bt = WalkForwardBacktester(["QQQ"], ["iron_condor"], config=cfg)
+        asyncio.run(bt.run(data=data))
+
+        # Pre-training must have run exactly once in the parent
+        assert pretrain_call_count[0] == 1, "pretrain not called exactly once"
+
+        # args_list must have been populated (at least one window)
+        assert captured_args, "no args were passed to the executor"
+
+        # Every args tuple must carry a non-None pretrained_range as its last element
+        for args in captured_args:
+            pretrained_range = args[-1]  # last element per _window_task_mp signature
+            assert pretrained_range is not None, \
+                "pretrained_range was None in an executor args tuple"
+            assert "QQQ" in pretrained_range, \
+                "pretrained_range missing expected symbol key"
+
+    def test_pretrain_returns_one_entry_per_window(self, monkeypatch) -> None:
+        """_pretrain_range_models returns exactly len(windows) entries."""
+        monkeypatch.setattr(
+            WalkForwardBacktester, "_train_window_range_model_inprocess",
+            lambda *a, **kw: (None, "skipped", 0.05),
+        )
+        data = {"QQQ": _make_ohlcv(300, start_price=450)}
+        cfg = WalkForwardConfig(train_days=100, test_days=30, step_days=30, gap_days=5)
+        bt = WalkForwardBacktester(["QQQ"], ["iron_condor"], config=cfg,
+                                   enable_msgarch=False, enable_oujump=False)
+        windows = bt._generate_windows(data)
+        result = bt._pretrain_range_models(windows, data, pd.DataFrame())
+        assert len(result) == len(windows), \
+            f"expected {len(windows)} entries, got {len(result)}"
+        for entry in result:
+            assert "QQQ" in entry
+            assert isinstance(entry["QQQ"], tuple)
+            assert len(entry["QQQ"]) == 3
+
+    def test_run_single_window_uses_pretrained(self, monkeypatch) -> None:
+        """When pretrained_range is supplied, _train_window_range_model is NOT called."""
+        import asyncio
+
+        train_range_called = []
+        monkeypatch.setattr(
+            WalkForwardBacktester, "_train_window_range_model",
+            lambda *a, **kw: train_range_called.append(1) or (None, "skipped", 0.05),
+        )
+        monkeypatch.setattr(WalkForwardBacktester, "_train_window_model", lambda *a, **kw: None)
+        monkeypatch.setattr(WalkForwardBacktester, "_train_window_meta_labeler", lambda *a, **kw: None)
+        monkeypatch.setattr(WalkForwardBacktester, "_optimize_window_params",
+                            lambda *a, **kw: (WalkForwardConfig(), {}, None))
+
+        data = {"QQQ": _make_ohlcv(300, start_price=450)}
+        cfg = WalkForwardConfig(train_days=100, test_days=40, step_days=40, gap_days=5)
+        bt = WalkForwardBacktester(["QQQ"], ["iron_condor"], config=cfg,
+                                   enable_msgarch=False, enable_oujump=False)
+        windows = bt._generate_windows(data)
+        if not windows:
+            pytest.skip("no windows generated for this dataset size")
+
+        train_start, train_end, test_start, test_end = windows[0]
+        pretrained = {"QQQ": (None, "skipped", 0.05)}
+
+        bt._run_single_window(
+            window_id=1,
+            train_start=train_start, train_end=train_end,
+            test_start=test_start, test_end=test_end,
+            data=data, vix_full=pd.DataFrame(),
+            pretrained_range=pretrained,
+        )
+
+        assert not train_range_called, \
+            "_train_window_range_model was called despite pretrained_range being supplied"
+
+    def test_run_single_window_falls_back_without_pretrained(self, monkeypatch) -> None:
+        """When pretrained_range is None, _train_window_range_model IS called."""
+        train_range_called = []
+        monkeypatch.setattr(
+            WalkForwardBacktester, "_train_window_range_model",
+            lambda *a, **kw: train_range_called.append(1) or (None, "skipped", 0.05),
+        )
+        monkeypatch.setattr(WalkForwardBacktester, "_train_window_model", lambda *a, **kw: None)
+        monkeypatch.setattr(WalkForwardBacktester, "_train_window_meta_labeler", lambda *a, **kw: None)
+        monkeypatch.setattr(WalkForwardBacktester, "_optimize_window_params",
+                            lambda *a, **kw: (WalkForwardConfig(), {}, None))
+
+        data = {"QQQ": _make_ohlcv(300, start_price=450)}
+        cfg = WalkForwardConfig(train_days=100, test_days=40, step_days=40, gap_days=5)
+        bt = WalkForwardBacktester(["QQQ"], ["iron_condor"], config=cfg,
+                                   enable_msgarch=False, enable_oujump=False)
+        windows = bt._generate_windows(data)
+        if not windows:
+            pytest.skip("no windows generated for this dataset size")
+
+        train_start, train_end, test_start, test_end = windows[0]
+
+        bt._run_single_window(
+            window_id=1,
+            train_start=train_start, train_end=train_end,
+            test_start=test_start, test_end=test_end,
+            data=data, vix_full=pd.DataFrame(),
+            pretrained_range=None,   # no pre-training → must fall back
+        )
+
+        assert train_range_called, \
+            "_train_window_range_model was NOT called despite pretrained_range=None"

@@ -468,6 +468,25 @@ Every trade passes through 13+ risk checks. Key protections:
 
 ## Monitoring & Dashboards
 
+### Walk-Forward Analysis Dashboard ([http://localhost:8080](http://localhost:8080))
+Interactive analysis dashboard for walk-forward experiment results. Three tabs:
+- **Experiment Analysis** — candlestick chart with trade entry/exit markers, feature sub-panes (RSI, MACD, Bollinger, IV/VIX, Hurst, Sentiment), trade table with hover-to-chart linking, per-trade decision-chain drawer (direction model → range gate → vol gate → meta-label → fractal gate → regime), iron condor leg structure, features at entry.
+- **Optuna Optimization** — per-window trial history, objective-value scatter, parameter-vs-objective plots, best params, pruned-trial breakdown.
+- **Predictor Models** — per-window CV skill (grouped bars), fitted ensemble-weight evolution, member-vs-baseline bars, reliability/calibration curve with per-member toggles, GARCH-family detail (variant, BIC, MS-GARCH regime vols, OU-Kou-GARCH drift params).
+
+**To open:**
+```bash
+# Export real experiment data (run once after each walk-forward)
+python -m ait.dashboard.walkforward.export --runs-dir reports/runs
+
+# Serve the dashboard
+cd src/ait/dashboard/walkforward
+python -m http.server 8080
+# → open http://localhost:8080 in browser (Cmd+Shift+R to bust cache after re-export)
+```
+
+**Data-plot dictionary:** `src/ait/dashboard/walkforward/metric-info.js` — single source of truth for all info-box definitions (hover ⓘ icons). Edit there to update wording without touching JSX.
+
 ### Streamlit Dashboard ([http://localhost:8501](http://localhost:8501))
 Tabs:
 - **Portfolio Overview**: Account value, open positions, today's P&L
@@ -661,7 +680,12 @@ trade_v2/
 │   │   ├── master.py           ← Master process (scheduler)
 │   │   └── gateway.py          ← IBC auto-start
 │   ├── dashboard/
-│   │   └── app.py              ← Streamlit dashboard
+│   │   ├── app.py              ← Streamlit dashboard (live bot monitoring)
+│   │   └── walkforward/        ← Walk-Forward Analysis Dashboard (static HTML)
+│   │       ├── index.html      ← Entry point (python -m http.server 8080)
+│   │       ├── export.py       ← Exports reports/runs/ → wf_data.js
+│   │       ├── metric-info.js  ← Data-plot dictionary (info-box definitions)
+│   │       └── *.jsx / *.js    ← React components (no build step needed)
 │   ├── notifications/
 │   │   └── telegram.py         ← Telegram alerts
 │   ├── backtesting/

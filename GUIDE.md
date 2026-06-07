@@ -943,7 +943,33 @@ The `Watchdog` runs inside the bot process and monitors:
 - **API response times** — flags latency spikes
 - **Error rates** — alerts if > 10 errors occur in a window
 
-### Dashboard
+### Walk-Forward Analysis Dashboard
+
+A standalone React dashboard for post-experiment analysis. No build step — served directly from the filesystem.
+
+**Run after each walk-forward experiment:**
+```bash
+# 1. Export real data (reads reports/runs/, writes wf_data.js)
+python -m ait.dashboard.walkforward.export --runs-dir reports/runs
+
+# 2. Serve (run from the walkforward/ directory)
+cd src/ait/dashboard/walkforward
+python -m http.server 8080
+```
+Open **http://localhost:8080** (use `Cmd+Shift+R` after re-exporting to bust the browser cache).
+
+**Three tabs:**
+| Tab | What it shows |
+|---|---|
+| Experiment Analysis | Candlestick chart + feature sub-panes + trade table with cross-linking; click any trade to open the decision-chain drawer (direction → range gate → vol gate → meta-label → fractal gate) with iron condor legs and features at entry |
+| Optuna Optimization | Per-window trial history, objective scatter, parameter-vs-objective, best params, pruned-trial count and stop reason |
+| Predictor Models | Per-member CV skill across windows (grouped bars), fitted-weight evolution, reliability/calibration curves with member toggles, GARCH-family detail (MS-GARCH regimes, OU-Kou-GARCH drift) |
+
+**Data-plot dictionary:** All info-box definitions live in `src/ait/dashboard/walkforward/metric-info.js` (`window.PM_INFO`). Edit there to update wording — the JSX never needs changing.
+
+**Experiment dropdown:** All experiments found in `reports/runs/` appear in the dropdown. The dashboard defaults to the most recently run experiment with enriched data.
+
+### Streamlit Live Dashboard
 
 The Streamlit dashboard at `http://localhost:8501` shows:
 - Current open positions (entry price, current P&L, HWM, Greeks)
@@ -1271,6 +1297,131 @@ python run_backtest.py --compare-exits           # Fixed vs trailing stops
 
 **The Tier 1 range model is included:** When backtesting iron condors, the `RangePredictor` is trained per window and gates entries, matching the live system's behavior.
 
+### Per-Window Execution Flow (Order of Operations)
+
+This is the exact sequence of steps the walk-forward engine executes for **each** train/test window pair. Understanding this order is critical for interpreting results and diagnosing issues.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  STEP 1 — WINDOW SLICING                                            │
+│  The full history is divided into non-overlapping train/test pairs. │
+│  e.g. 730d train / 30d test / 30d step / 5d gap → ~11 windows.    │
+│  Each window's test period is genuinely out-of-sample.              │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │ (repeated for every window)
+                             ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  STEP 2 — PRICE-MOVE ML TRAINING (once per window, training data)   │
+│                                                                     │
+│  2a. Direction Predictor  — XGBoost binary classifier.             │
+│      Predicts whether price will move up or down over the next      │
+│      N days. NOT used as an entry gate for iron condors (Change A   │
+│      removed it). Still trained and passed to OOS backtest for      │
+│      other strategy types and thesis re-evaluation.                 │
+│                                                                     │
+│  2b. Range Predictor  — XGBoost + LightGBM ensemble (50/50).       │
+│      Predicts P(price stays within ±5% over next N days).           │
+│      This IS the iron condor entry gate. Entry fires only when      │
+│      range confidence ≥ threshold.                                  │
+│      Ensemble = one XGBClassifier + one LGBMClassifier, probabi-   │
+│      lities averaged. Not a RandomForest. XGBoost/LightGBM are     │
+│      themselves internally boosted tree ensembles; the "ensemble"   │
+│      here means two separate model families blended together.       │
+│                                                                     │
+│  ── Model NOT trained per walk-forward window ──                    │
+│  VolMagnitudePredictor  — exists in the codebase but is NOT wired  │
+│  into the walk-forward training loop. Predicts P(|max return over   │
+│  N days| > implied_vol_threshold) — i.e. P(big move). Its output   │
+│  is the long straddle confidence (complement of range model).       │
+│  NOT an ARCH/GARCH model — it is a supervised XGBoost + LightGBM   │
+│  binary classifier using the same fractal/VLMC features as the      │
+│  range model. It does not model the volatility process directly.    │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  STEP 3 — OPTUNA OPTIMIZATION (on training data, models frozen)     │
+│                                                                     │
+│  The Direction and Range models from Step 2 are frozen and passed   │
+│  to StrategyOptimizer. Key fix in Exp 10 (Change C): before this,  │
+│  models were trained AFTER Optuna, so Optuna optimized against a    │
+│  different signal than what ran in OOS.                             │
+│                                                                     │
+│  For each of 200 Optuna trials:                                     │
+│  • Optuna (TPE sampler) proposes a candidate parameter set          │
+│    (stop_loss_pct, profit_target_pct, delta_short, wing_k, etc.)   │
+│  • The Backtester iterates over EVERY sample point in the           │
+│    training data using those params + the frozen ML models.         │
+│    Each trial processes all training rows. The frozen ML outputs    │
+│    do not change between trials; only structural params do.         │
+│  • The objective (composite Sharpe + trade-count penalty) is        │
+│    computed on training-set P&L.                                    │
+│  • Optuna uses the result to propose the next candidate.            │
+│  Patience=50: study stops if 50 consecutive trials show no          │
+│  improvement. Max 200 trials total.                                 │
+│                                                                     │
+│  What Optuna searches (structural params only — no entry gates):    │
+│    stop_loss_pct, profit_target_pct, trailing_stop_fraction,        │
+│    delta_short, max_hold_days, wing_k, hurst_regime_threshold,      │
+│    hurst_regime_penalty, multifractal_max_width                     │
+│  What Optuna does NOT touch:                                        │
+│    ML model weights/trees (frozen), min_confidence (fixed config),  │
+│    max_entry_vol_annual (fixed config) — see P1, P5.               │
+│                                                                     │
+│  Output: best_params → window_cfg (the winning parameter set)       │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  STEP 4 — META-LABELER TRAINING (training data, best_params known)  │
+│                                                                     │
+│  The Meta-Labeler is trained AFTER Optuna, using Optuna's           │
+│  best_params (window_cfg). This ordering is intentional and         │
+│  critical: the Meta-Labeler needs to know stop_loss_pct, wing_k,   │
+│  delta_short, profit_target_pct, etc. to generate meaningful labels.│
+│                                                                     │
+│  Process:                                                           │
+│  • A "shadow" Backtester runs on the training data using            │
+│    window_cfg (the Optuna-optimised params) + Direction Predictor.  │
+│  • Each simulated trade's outcome (profit/loss) becomes a binary    │
+│    label: 1 = profitable, 0 = loss.                                 │
+│  • The FeatureEngine row for each trade's entry date is the         │
+│    feature vector.                                                  │
+│  • XGBoost trains on these (features → P&L label) pairs.           │
+│                                                                     │
+│  What this model answers: "Given this market state at entry,        │
+│  will THIS trade (with this specific wing_k, stop_loss, etc.)       │
+│  be profitable?" It is tightly coupled to window_cfg — a           │
+│  different Optuna outcome would produce a different Meta-Labeler.   │
+│                                                                     │
+│  Key difference from Steps 2a/2b: training labels are trade P&L    │
+│  outcomes, not future price moves. It is a second-order filter:     │
+│  not "what will price do?" but "should we take this specific trade?"│
+└────────────────────────────┬────────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  STEP 5 — OOS EVALUATION (test window, everything frozen)           │
+│                                                                     │
+│  All artifacts from Steps 2–4 are frozen and applied to the         │
+│  held-out test window. No retraining occurs. The models see OOS     │
+│  data for the first time. P&L from this step is the reported        │
+│  OOS window result.                                                 │
+│                                                                     │
+│  Fixed (from training):  Direction model, Range model, Meta-Labeler │
+│                          weights, best_params (window_cfg)          │
+│  New (OOS only):         price bars, entry signals, exits           │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Key invariants to remember:**
+- Direction and Range models are trained **before** Optuna — frozen during the trial loop.
+- Every Optuna trial iterates over **all training rows** using the frozen ML outputs.
+- Meta-Labeler is trained **after** Optuna — it requires best_params to generate its training labels.
+- Meta-Labeler labels are trade P&L outcomes under best_params, not raw price moves.
+- The OOS test window is **never seen** during Steps 2–4.
+- `VolMagnitudePredictor` is **not** currently part of the walk-forward loop (wired for live trading only).
+
 ### Backtester Modelling
 
 | Feature | Implementation |
@@ -1283,6 +1434,44 @@ python run_backtest.py --compare-exits           # Fixed vs trailing stops
 | **Trade dict fields** | Each closed trade includes: `entry_date`, `entry_time`, `exit_date`, `exit_time`, `exit_reason`, `entry_confidence`, `entry_regime`, `entry_iv_rank`, `entry_vix_level`, `pnl`, `exit_price` |
 | **Thesis re-evaluation** | `_check_thesis_invalidation()` checks at each daily bar whether the ML predictor strongly contradicts the original position direction; triggers early exit if invalidated |
 | **Fractal regime gate** | Confidence penalised when `hurst_scale_spread > hurst_regime_threshold` or `multifractal_width > multifractal_max_width`; same thresholds as exported production params |
+
+### Walk-Forward Performance Architecture
+
+The walk-forward engine applies several optimizations to keep per-window runtime manageable. Understanding these matters when debugging slowdowns or extending the system.
+
+**FeatureEngine call reduction (key bottleneck)**
+
+`FeatureEngine.compute()` is the dominant per-window CPU cost (~1–3s on 365 + 60 daily bars). The naive implementation called it once per OOS bar (O(N) calls), and the old `_save_window_timeseries` called it once per bar × all bars = O(N²). The current architecture reduces this to exactly **1 FeatureEngine call per OOS subsystem phase**:
+
+| Phase | Before | After | Saving |
+|-------|--------|-------|--------|
+| Optuna training loop (200 trials) | 1 call per trial | `features_cache` built once before trials, reused | ~200× |
+| OOS Backtester (engine.py `_get_direction`) | 1 call per bar | `_oos_feat_cache` passed in; `_cache_hit → predict_from_features()` | ~60× |
+| `_evaluate_range_model_oos` | 1 call on test slice | `precomputed_features=_oos_feat_cache` passed in | 1× (was already cheap) |
+| `_evaluate_direction_model_oos` | 1 call on test slice | `precomputed_features=_oos_feat_cache` passed in | 1× |
+| MetaLabeler shadow backtester | separate call on train_df | `features_cache=features_df` passed in (was already computed) | 1× |
+| `_save_window_timeseries` (timeseries export) | 1 call per OOS bar (O(N²)) | `precomputed_features=_oos_feat_cache` + `reindex` per bar | ~60× |
+
+The `_oos_feat_cache` is a single `FeatureEngine().compute(test_with_context, market_context=vix_ctx)` call made once per window right before the OOS Backtester is constructed. All downstream consumers receive it as a parameter.
+
+**`predict_from_features()` — bypassing FeatureEngine in the prediction hot path**
+
+Both `DirectionPredictor` and `RangePredictor` expose a `predict_from_features(feature_row: pd.Series)` method. Unlike `predict(hist)`, which calls `FeatureEngine.compute(hist)` internally, `predict_from_features` takes a pre-computed feature row and goes directly to `scaler.transform → model.predict_proba`. This is used in two places:
+
+1. `engine.py _get_direction`: when `_oos_feat_cache` is available and has a row for the current bar date, `predict_from_features(features_df.iloc[-1])` is called instead of `predict(hist)`. The `_cache_hit` flag controls this path.
+2. `_save_window_timeseries`: iterates OOS bars using `oos_feat_df.loc[ts]` lookups (O(1) pandas reindex) and calls `predict_from_features` per bar.
+
+**Intraday loop optimizations (engine.py)**
+
+`_check_intraday_exit` iterates 5-minute bars within each session. The loop uses `itertuples()` (not `iterrows()`) to avoid pandas Series construction overhead (~10μs vs ~75μs per row). Three loop-invariant values (`days_held`, `remaining_dte`, `exit_half_spread`) are computed once before the loop.
+
+`_try_limit_fill` is fully vectorized: instead of iterating bars to find the first fill, it computes `mask = (bars["Low"] <= limit_price) & (limit_price <= bars["High"])` and uses `mask.values.argmax()` to locate the first hit in a single numpy operation.
+
+**Adding new OOS consumers — what to wire up**
+
+If you add a new per-window OOS analysis step, pass `precomputed_features=_oos_feat_cache` to avoid triggering a new FeatureEngine call. The `_oos_feat_cache` variable is available in the window loop in [walkforward.py](src/ait/backtesting/walkforward.py) from the block that precedes the OOS Backtester construction.
+
+---
 
 ### Interpreting Results
 
@@ -1356,17 +1545,72 @@ Example at `optimize_min_trades = 10`: a trial with 5 trades and composite 14.4 
 
 Each strategy has a defined search space in `param_spaces.py`:
 
-| Parameter (iron condor) | Search Range | Effect |
-|---|---|---|
-| `delta_short` | float [0.15, 0.30] | Delta of the short call and put legs |
-| `max_hold_days` | int [14, 40] | Entry DTE / max hold duration (≤ 40 to stay inside 42d test window) |
-| `stop_loss_pct` | float [0.30, 0.70] | Exit when unrealised loss reaches this % of premium |
-| `profit_target_pct` | float [0.30, 0.70] | Exit at this % profit |
-| `trailing_stop_fraction` | float [0.30, 0.90] | Derived trailing stop: `trailing_stop_pct = fraction × profit_target_pct`; keeps trailing stop logically coupled to profit target |
-| `wing_k` | float [0.30, 2.00] | Vol-scaled wing multiplier. 1.0 = 1-sigma expected move. |
-| `hurst_regime_threshold` | float [0.08, 0.30] | Fractal gate: min Hurst exponent required to enter |
-| `hurst_regime_penalty` | float [0.00, 0.25] | Score penalty when Hurst is near the threshold |
-| `multifractal_max_width` | float [0.30, 0.65] | Fractal gate: max multifractal spectrum width allowed |
+#### Iron Condor Parameters
+
+**`delta_short` — float [0.15, 0.30]**
+The option delta of the two short legs (the OTM call and OTM put you sell). Delta is a proxy for how far out-of-the-money the strike is — roughly, the market's implied probability of expiring in-the-money.
+- **Lower (0.15):** Strikes are ~2 standard deviations OTM. ~85% probability of max profit. Less premium collected but the underlying has a wide range to move without breaching. Better in high-vol regimes where the market swings a lot.
+- **Higher (0.30):** Strikes are ~1 standard deviation OTM. ~70% probability of max profit. More premium collected but you get tested more often. Better in calm, range-bound regimes.
+- Interacts with `wing_k`: `delta_short` sets *where* the short strikes are; `wing_k` sets how far the protective long legs sit beyond them.
+
+**`max_hold_days` — int [14, 40]**
+Both the entry DTE (days to expiration at open) and the maximum number of calendar days the position is allowed to remain open. These are the same value: you open a condor with `max_hold_days` DTE remaining and exit at or before expiration.
+- **Lower (14):** Short-duration condors. Less theta time but faster resolution. Appropriate when you expect a sharp near-term range.
+- **Higher (40):** More theta decay time. More premium via higher absolute IV on longer-dated options. More exposure to trend reversals during the hold.
+- Capped at 40 to ensure the position resolves well inside the 60-day OOS test window.
+
+**`wing_k` — float [0.30, 2.00]**
+Scales the distance between the short and long strikes (the wing width). The formula is:
+`wing_width = wing_k × price × IV × √(DTE/365)`
+At `wing_k=1.0`, the wings are exactly 1 expected move wide (1 sigma). This sets your maximum loss per contract.
+- **Lower (0.30):** Narrow wings. Less max loss, less premium from the spread's credit. Requires the underlying to stay in a tighter range to be profitable.
+- **Higher (2.00):** Wide wings. Higher max loss, but also more credit since the spread captures a wider range of the options curve. Appropriate when you want to sell rich premium without capping the credit too tightly.
+
+**`stop_loss_pct` — float [0.30, 0.70]** *(frozen at 0.35 for iron condor — see note below)*
+Exit the position when the unrealised loss reaches this fraction of the credit collected at entry. E.g. 0.50 means exit when you've lost 50% of what you took in.
+
+**`profit_target_pct` — float [0.30, 0.70]** *(frozen at 0.50 for iron condor)*
+Exit when unrealised profit reaches this fraction of the entry credit. E.g. 0.50 means take profit at 50% of max credit.
+
+**`trailing_stop_fraction` — float [0.30, 0.90]** *(frozen at 0.70 for iron condor)*
+`trailing_stop_pct = trailing_stop_fraction × profit_target_pct`. Keeps the trailing stop logically coupled to the profit target — as you set a more aggressive profit target, the trailing stop tightens proportionally to lock in gains.
+
+> **Note — `stop_loss_pct`, `profit_target_pct`, `trailing_stop_fraction` are frozen for iron condor.** Exp 18 (H1 test) showed these are risk-management constants that don't vary by market regime. Letting Optuna tune them caused it to overfit the training-path noise rather than learn regime-specific entry behaviour. They remain in the search space for debit strategies where they have more legitimate per-window variation.
+
+**`hurst_regime_threshold` — float [0.08, 0.30]**
+The minimum Hurst exponent spread required before entering. The Hurst exponent measures how *trending* vs *mean-reverting* the underlying is: Hurst > 0.5 = trending, Hurst < 0.5 = mean-reverting/ranging, Hurst ≈ 0.5 = random walk. The `hurst_scale_spread` is computed across multiple timescales.
+- **Iron condors are range strategies** — they profit when the underlying stays put. A strongly trending market (high Hurst spread) is bad for condors; the underlying is more likely to keep moving in one direction and breach a short strike.
+- **Lower threshold (0.08):** Gate fires only in strongly trending regimes. More entries allowed; less filtering.
+- **Higher threshold (0.30):** Gate fires more often; filters out moderately trending markets too. Fewer entries but higher quality.
+
+**`hurst_regime_penalty` — float [0.00, 0.25]**
+A soft confidence penalty applied when `hurst_scale_spread` is above threshold but not so high that entry is blocked outright. Instead of a hard veto, the confidence score is reduced by `hurst_regime_penalty`. Allows Optuna to tune how aggressively to discount borderline regimes.
+- **0.00:** No soft penalty — the hard threshold is the only guard.
+- **0.25:** Significant score reduction near the threshold boundary; effectively widens the "grey zone" around the hard gate.
+
+**`multifractal_max_width` — float [0.30, 0.65]**
+Maximum allowed multifractal spectrum width. The multifractal spectrum measures how *irregular* the price process is across scales — a wide spectrum indicates the market has mixed scaling behaviour (periods of extreme quiet and extreme bursts), which implies hidden tail risk that a condor is exposed to.
+- **Lower (0.30):** Tight filter — only enter in markets with uniform, smooth fractal structure.
+- **Higher (0.65):** Lenient — allows entry even in moderately irregular markets.
+
+**`iv_rank_rise_threshold` — float [0.25, 0.60]** *(added Exp 26)*
+Gate that blocks entry when implied volatility rank has *risen* more than this amount over the past 10 trading days. A rising IV rank means the market is pricing in increasing uncertainty — exactly the wrong environment for selling short vol via an iron condor. The position needs IV to stay flat or fall (so the options you sold decay in value).
+- **Lower (0.25):** Tight gate — blocks entries whenever IV has risen meaningfully. Fewer trades but avoids entering into rising-uncertainty regimes.
+- **Higher (0.60):** Loose gate — only blocks entry during genuine IV spikes (Yen-carry or tariff-shock level events). More entries, accepts moderate IV drift.
+- Exp 25 data showed losing trades had a mean 10-day IV rise of +0.127 vs −0.057 for winning trades, confirming the signal. No single global threshold separates the two cleanly, which is why per-window Optuna tuning (Exp 26) is the right approach.
+
+| Parameter | Range | Frozen? | Primary effect |
+|-----------|-------|---------|----------------|
+| `delta_short` | [0.15, 0.30] | No | Short strike placement — premium vs. safety trade-off |
+| `max_hold_days` | [14, 40] | No | DTE at entry + max hold duration |
+| `wing_k` | [0.30, 2.00] | No | Wing width = max loss per contract |
+| `iv_rank_rise_threshold` | [0.25, 0.60] | No | Blocks entry when IV has been rising (Exp 26+) |
+| `hurst_regime_threshold` | [0.08, 0.30] | No | Hard fractal gate — blocks trending markets |
+| `hurst_regime_penalty` | [0.00, 0.25] | No | Soft confidence penalty near threshold |
+| `multifractal_max_width` | [0.30, 0.65] | No | Blocks irregular/bursty price processes |
+| `stop_loss_pct` | [0.30, 0.70] | **Yes (0.35)** | Exit when loss = X% of credit |
+| `profit_target_pct` | [0.30, 0.70] | **Yes (0.50)** | Take profit at X% of credit |
+| `trailing_stop_fraction` | [0.30, 0.90] | **Yes (0.70)** | Trailing stop tied to profit target |
 
 > **Intentionally excluded from the iron condor search space (P5, P8, P9):**
 > - `min_confidence`, `max_entry_vol_annual` — regime gates; Optuna parks them at extremes to produce 0-trade OOS solutions (Exp 2–4). Fixed at config defaults (P5).
@@ -1402,7 +1646,9 @@ python scripts/run_integration_test.py \
 
 All four flags are optional — if omitted, the values are read from the corresponding config fields (defaults: 50, 20, 10, 1).
 
-**Window-level parallelism (`--wf-n-jobs`):** When `n_jobs > 1`, walk-forward windows run in parallel using `concurrent.futures.ProcessPoolExecutor`. Each window is an independent subprocess — no shared state. This bypasses the Python GIL (which blocks CPU-bound threading) and achieves true CPU parallelism: `--wf-n-jobs 6` on a 12-core machine yields ~600% CPU utilisation. Trade-off: warm-starting (seeding Optuna from a prior window's best params) and `BacktestLearner` adaptation between windows are disabled in parallel mode. On a 12-core machine, `--wf-n-jobs 6` is recommended (leaves 6 cores for the OS and other processes). Keep Optuna trial-level `n_jobs=1` (the default) — Optuna's in-memory storage uses threading which is GIL-bound and does not parallelise CPU-bound backtesting code.
+**Window-level parallelism (`--wf-n-jobs`):** When `n_jobs > 1`, walk-forward windows run in parallel using `concurrent.futures.ProcessPoolExecutor`. Each window is an independent subprocess — no shared state. This bypasses the Python GIL (which blocks CPU-bound threading) and achieves true CPU parallelism: `--wf-n-jobs 6` on a 12-core machine yields ~600% CPU utilisation. Trade-off: warm-starting (seeding Optuna from a prior window's best params) and `BacktestLearner` adaptation between windows are disabled in parallel mode. On a 12-core machine, `--wf-n-jobs 6` is recommended (leaves 6 cores for the OS and other processes).
+
+> **Naming note — `--wf-n-jobs` is NOT Optuna trial-level parallelism.** Despite the parameter being stored as `optimize_n_jobs` internally, it controls **window-level** parallelism only. It applies equally to the optimised walk-forward (Section E) and the ablation baseline (Section F) — both run their windows through the same `ProcessPoolExecutor`. Optuna's own trial-level `n_jobs` is always kept at 1: Optuna's in-memory storage uses threading, which is GIL-bound and cannot parallelise CPU-bound backtest code. The effective speedup path is dispatching entire windows to separate processes, which is exactly what `--wf-n-jobs` does.
 
 **Early stopping (`optimize_patience`):** Once the best objective value has not improved for N consecutive trials, the window's study is halted. This prevents wasted compute when the optimizer has already converged, and avoids over-exploring a degenerate region. Set to 0 to disable and always run all `wf-trials`.
 
@@ -1447,13 +1693,13 @@ All four flags are optional — if omitted, the values are read from the corresp
 **Running multiple experiments:** To compare different window configurations (train_days, test_days, step_days), run `run_integration_test.py` multiple times with different YAML configs. Each run is automatically archived under `reports/runs/{run_id}/` and logged to MLflow experiment `walkforward_{symbol}`.
 
 ```bash
-# Run with default 365/63/21 config
+# Run with default 365/60/60 config (non-overlapping windows) — --archive-data auto-commits results to data/experiment-archives
 python scripts/run_integration_test.py --symbols QQQ --config config_QQQ_test.yaml \
-    --strategies iron_condor --skip-backfill
+    --strategies iron_condor --skip-backfill --archive-data
 
 # Run with shorter test window (edit config first: test_days=42, step_days=14)
 python scripts/run_integration_test.py --symbols QQQ --config config_QQQ_test.yaml \
-    --strategies iron_condor --skip-backfill
+    --strategies iron_condor --skip-backfill --archive-data
 
 # Compare all QQQ runs in the terminal
 python scripts/compare_runs.py --symbol QQQ
@@ -1475,7 +1721,7 @@ python scripts/backfill_mlflow.py --symbol QQQ --force
 | Location | Field | Example |
 |----------|-------|---------|
 | Parameters | `backtest_period` | `2024-05-02 to 2026-05-08` |
-| Parameters | `train_days`, `test_days`, `step_days` | `365`, `63`, `21` |
+| Parameters | `train_days`, `test_days`, `step_days` | `365`, `60`, `60` |
 | Parameters | `initial_capital`, `wf_trials` | `100000.0`, `50` |
 | Tags | `cli_command` | exact command to reproduce the run |
 | Tags | `git_commit`, `git_branch` | `fa283217`, `features-request-2` |
@@ -1505,39 +1751,46 @@ The script prints every changed parameter (old → new), the source window (e.g.
 
 **Committing experiment archives — use the `data/experiment-archives` branch:**
 
-Experiment result directories (`reports/runs/{run_id}/`) are data artifacts, not code. They must **never** be committed to feature branches or PRs — Copilot's review limit is 20,000 lines and a single experiment adds ~2,000 lines of JSON/CSV/text. Instead, all archives go to the dedicated `data/experiment-archives` branch:
+Experiment result directories (`reports/runs/{run_id}/`) are data artifacts, not code. They must **never** be committed to feature branches or PRs — a single experiment adds ~2,000 lines of JSON/CSV/text and exceeds Copilot's review file limit. Instead, all archives go to the dedicated `data/experiment-archives` branch.
+
+`reports/runs/` is listed in `.gitignore` on all source branches, so it can never be accidentally staged in a feature PR.
+
+**Recommended: automated via `--archive-data` flag**
+
+Pass `--archive-data` to `run_integration_test.py` and the script handles the branch switch, commit, push, and return automatically:
 
 ```bash
-# After an experiment finishes and reports/runs/{run_id}/ is created:
+python scripts/run_integration_test.py \
+    --symbols QQQ --config config_QQQ_test.yaml \
+    --strategies iron_condor --skip-backfill \
+    --archive-data
+```
+
+The script will:
+1. Run the full pipeline as normal
+2. Write the run artifacts to `reports/runs/{run_id}/` locally
+3. Switch to `data/experiment-archives`, commit the run directory, push, and switch back — all without touching your working tree (dirty changes are auto-stashed and restored)
+
+**Manual fallback** (if `--archive-data` is not used, or if the auto-push fails):
+
+```bash
 git checkout data/experiment-archives
-
-# Stage only the scientific record — log and HTML files are excluded by .gitignore
-git add reports/runs/{run_id}/
-
-# Commit with a descriptive message
-git commit -m "data: add {run_id} archive (Exp N results)"
-
-# Push to remote
+git add -f reports/runs/{run_id}/
+git commit -m "archive: {run_id}"
 git push origin data/experiment-archives
-
-# Return to your feature/work branch
 git checkout <your-branch>
 ```
 
-**What to include / exclude in the archive commit:**
+**What is included / excluded:**
 
-| Include (tracked) | Exclude (gitignored) |
+| Tracked (committed) | Gitignored (excluded) |
 |---|---|
-| `window_*.json` | `*.log` |
+| `window_*.json` | `*.log` (lives in `logs/`) |
 | `run_metadata.json` | `*.html` |
 | `walkforward_summary.txt` | |
 | `ablation_summary.txt` | |
-| `equity_curve.csv` | |
-| `config_snapshot.yaml` | |
-| `RESULTS.md` | |
-| `ic_decay.csv`, `ic_summary.csv` | |
-
-The `.gitignore` on `data/experiment-archives` already excludes `*.log` and `*.html` via `reports/runs/**/*.log` and `reports/runs/**/*.html` patterns — a plain `git add reports/runs/{run_id}/` is safe.
+| `equity_curve.csv`, `ic_decay.csv`, `ic_summary.csv` | |
+| `config_snapshot.yaml`, `RESULTS.md` | |
 
 Daily monitoring snapshots (`reports/daily_YYYYMMDD.json`) also belong on this branch, not on feature PRs.
 

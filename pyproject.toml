@@ -39,6 +39,8 @@ dependencies = [
     "duckdb>=1.0",
     # Fractal analysis
     "pywavelets>=1.4",
+    # Volatility models (GARCH/ARCH ensemble member for range predictor)
+    "arch>=7.2",
     # Optimization
     "optuna>=3.6",
     # Scheduling

@@ -100,6 +100,7 @@ class DirectionPredictor:
             Prediction with direction and confidence, or None if model not trained.
         """
         # Select the right model for this symbol
+        sym_data: dict | None = None
         if symbol and symbol in self._symbol_models:
             sym_data = self._symbol_models[symbol]
             models = sym_data["models"]
@@ -135,13 +136,20 @@ class DirectionPredictor:
             log.error("feature_scaling_failed", error=str(e), symbol=symbol)
             return None
 
-        # Get predictions from each model
+        # Get predictions from each model — prefer fitted weights when available,
+        # fall back to config ensemble_weights.
+        fw = (
+            (sym_data or {}).get("fitted_weights")
+            or getattr(self, "_fitted_weights", None)
+        )
         all_probas = []
+        total_weight = 0.0
         for name, model in models.items():
-            weight = self._config.ensemble_weights.get(name, 0.5)
+            weight = fw.get(name, 0.5) if fw else self._config.ensemble_weights.get(name, 0.5)
             try:
                 proba = model.predict_proba(X_scaled)[0]
                 all_probas.append(proba * weight)
+                total_weight += weight
             except Exception as e:
                 log.warning("model_prediction_failed", model=name, error=str(e))
 
@@ -149,7 +157,7 @@ class DirectionPredictor:
             return None
 
         # Weighted average of probabilities
-        avg_proba = np.sum(all_probas, axis=0) / sum(self._config.ensemble_weights.values())
+        avg_proba = np.sum(all_probas, axis=0) / (total_weight or 1.0)
 
         # Get prediction
         pred_class = int(np.argmax(avg_proba))
@@ -174,6 +182,77 @@ class DirectionPredictor:
             confidence=confidence,
             probabilities=probabilities,
             features_used=len(self._feature_names),
+            model_version=self._model_version,
+        )
+
+    def predict_from_features(
+        self,
+        feature_row: "pd.Series",
+        symbol: str = "",
+    ) -> "Prediction | None":
+        """Make a prediction from a pre-computed feature row, bypassing FeatureEngine.
+
+        Used by _save_window_timeseries for O(1) per-bar predictions instead of
+        re-running FeatureEngine on 252+ rows for each bar.
+        """
+        sym_data: dict | None = None
+        if symbol and symbol in self._symbol_models:
+            sym_data = self._symbol_models[symbol]
+            models = sym_data["models"]
+            scaler = sym_data["scaler"]
+            feature_names = sym_data["feature_names"]
+        elif self._trained:
+            models = self._models
+            scaler = self._scaler
+            feature_names = self._feature_names
+        else:
+            return None
+
+        try:
+            X = pd.DataFrame(
+                [feature_row.reindex(feature_names).fillna(0.0).values],
+                columns=feature_names,
+            )
+            X_scaled = pd.DataFrame(
+                scaler.transform(X.values),
+                columns=feature_names,
+            )
+        except Exception as e:
+            log.error("feature_scaling_failed", error=str(e), symbol=symbol)
+            return None
+
+        fw = (
+            (sym_data or {}).get("fitted_weights")
+            or getattr(self, "_fitted_weights", None)
+        )
+        all_probas = []
+        total_weight = 0.0
+        for name, model in models.items():
+            weight = fw.get(name, 0.5) if fw else self._config.ensemble_weights.get(name, 0.5)
+            try:
+                proba = model.predict_proba(X_scaled)[0]
+                all_probas.append(proba * weight)
+                total_weight += weight
+            except Exception as e:
+                log.warning("model_prediction_failed", model=name, error=str(e))
+
+        if not all_probas:
+            return None
+
+        avg_proba = np.sum(all_probas, axis=0) / (total_weight or 1.0)
+        pred_class = int(np.argmax(avg_proba))
+        confidence = float(avg_proba[pred_class])
+        direction = self.LABELS[pred_class]
+        probabilities = {
+            "bearish": float(avg_proba[0]),
+            "neutral": float(avg_proba[1]),
+            "bullish": float(avg_proba[2]),
+        }
+        return Prediction(
+            direction=direction,
+            confidence=confidence,
+            probabilities=probabilities,
+            features_used=len(feature_names),
             model_version=self._model_version,
         )
 
@@ -252,6 +331,18 @@ class DirectionPredictor:
             self._model_version = f"v-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
             self._cv_scores = accuracies
 
+            # Fit ensemble weights from per-model CV edge over 0.5 AUROC baseline.
+            # AUROC random baseline = 0.5 (one-vs-rest, any number of classes).
+            _baseline = 0.5
+            _edges = {m: max(0.0, acc - _baseline) for m, acc in accuracies.items()}
+            _total = sum(_edges.values())
+            fitted_weights = (
+                {m: e / _total for m, e in _edges.items()}
+                if _total > 0
+                else {m: 0.5 for m in accuracies}
+            )
+            self._fitted_weights: dict[str, float] = fitted_weights
+
             # Store per-symbol model (deep copy so next train() doesn't overwrite)
             if symbol:
                 import copy
@@ -270,21 +361,28 @@ class DirectionPredictor:
                     "scaler": copy.deepcopy(self._scaler),
                     "feature_names": list(self._feature_names),
                     "cv_scores": dict(accuracies),
+                    "fitted_weights": dict(fitted_weights),
                     "feature_importances": importances,
                     "version": self._model_version,
                 }
                 log.info("symbol_model_stored", symbol=symbol,
-                         accuracies=accuracies, features=len(self._feature_names))
+                         accuracies=accuracies, fitted_weights=fitted_weights,
+                         features=len(self._feature_names))
 
             self._save_models()
             log.info(
                 "ensemble_trained",
                 version=self._model_version,
                 accuracies=accuracies,
+                fitted_weights=fitted_weights,
                 features=len(self._feature_names),
             )
 
         return accuracies
+
+    @property
+    def fitted_weights(self) -> "dict[str, float] | None":
+        return getattr(self, "_fitted_weights", None)
 
     def load_models(self, version: str | None = None) -> bool:
         """Load previously trained models from disk.
@@ -504,14 +602,21 @@ class DirectionPredictor:
                 )
                 sw = self._compute_sample_weights(y[train_idx])
                 model.fit(X_train, y[train_idx], sample_weight=sw)
-                score = model.score(X_val, y[val_idx])
+                # AUROC (one-vs-rest) is immune to class imbalance; raw accuracy
+                # on imbalanced folds produces sub-random scores (< 1/3 baseline).
+                try:
+                    from sklearn.metrics import roc_auc_score
+                    proba = model.predict_proba(X_val)
+                    score = roc_auc_score(y[val_idx], proba, multi_class="ovr", average="macro")
+                except Exception:
+                    score = model.score(X_val, y[val_idx])
                 scores.append(score)
 
             # Final model stored (will be refit on fully-scaled data after CV)
             self._models["xgboost"] = model
 
             avg_acc = float(np.mean(scores))
-            log.info("xgboost_trained", cv_accuracy=f"{avg_acc:.3f}", folds=len(scores))
+            log.info("xgboost_trained", cv_auroc=f"{avg_acc:.3f}", folds=len(scores))
             return avg_acc
 
         except ImportError:
@@ -556,14 +661,21 @@ class DirectionPredictor:
                     columns=self._feature_names,
                 )
                 model.fit(X_train, y[train_idx])
-                score = model.score(X_val, y[val_idx])
+                # AUROC (one-vs-rest) is immune to class imbalance; raw accuracy
+                # on imbalanced folds produces sub-random scores (< 1/3 baseline).
+                try:
+                    from sklearn.metrics import roc_auc_score
+                    proba = model.predict_proba(X_val)
+                    score = roc_auc_score(y[val_idx], proba, multi_class="ovr", average="macro")
+                except Exception:
+                    score = model.score(X_val, y[val_idx])
                 scores.append(score)
 
             # Final model stored (will be refit on fully-scaled data after CV)
             self._models["lightgbm"] = model
 
             avg_acc = float(np.mean(scores))
-            log.info("lightgbm_trained", cv_accuracy=f"{avg_acc:.3f}", folds=len(scores))
+            log.info("lightgbm_trained", cv_auroc=f"{avg_acc:.3f}", folds=len(scores))
             return avg_acc
 
         except ImportError:

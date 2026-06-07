@@ -102,19 +102,25 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--wf-n-jobs", type=int, default=None,
-        help="Parallel Optuna workers per walk-forward window (default: 1 = sequential).",
+        help="Number of walk-forward WINDOWS to run in parallel (default: 1 = sequential). "
+             "Controls window-level ProcessPoolExecutor parallelism, NOT Optuna trial-level "
+             "parallelism. Applies to both the optimized (Section E) and ablation (Section F) runs.",
+    )
+    parser.add_argument(
+        "--wf-val-split", action="store_true", default=False,
+        help="H2: score Optuna objective on held-out 20%% val slice instead of full training window.",
     )
     parser.add_argument(
         "--train-days", type=int, default=365,
         help="Walk-forward training window in calendar days (default: 365).",
     )
     parser.add_argument(
-        "--test-days", type=int, default=63,
-        help="Walk-forward test window in calendar days (default: 63).",
+        "--test-days", type=int, default=60,
+        help="Walk-forward test window in calendar days (default: 60).",
     )
     parser.add_argument(
-        "--step-days", type=int, default=21,
-        help="Days to advance each walk-forward window (default: 21).",
+        "--step-days", type=int, default=60,
+        help="Days to advance each walk-forward window (default: 60, non-overlapping).",
     )
     parser.add_argument(
         "--gap-days", type=int, default=5,
@@ -135,6 +141,27 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Strategies to run per walk-forward window "
             "(default: iron_condor put_credit_spread short_strangle "
             "bull_call_spread bear_put_spread long_strangle)."
+        ),
+    )
+    parser.add_argument(
+        "--console-log-level",
+        default="WARNING",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help=(
+            "Minimum log level printed to stdout (default: WARNING). "
+            "DEBUG/INFO always captured in logs/ait.log regardless. "
+            "Use WARNING to prevent stdout from growing large when running "
+            "background experiments."
+        ),
+    )
+    parser.add_argument(
+        "--archive-data",
+        action="store_true",
+        help=(
+            "After archiving to reports/runs/, commit the run directory to the "
+            "'data/experiment-archives' git branch and push. Keeps experiment "
+            "artifacts out of source-code PRs. Requires a clean or stash-able "
+            "working tree and push access to origin."
         ),
     )
     return parser.parse_args(argv)
@@ -537,13 +564,19 @@ def _section_d_ic_decay(args: argparse.Namespace, out: Path) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def _fetch_daily_data(args: argparse.Namespace) -> "dict[str, pd.DataFrame]":
-    """Load daily OHLCV once (IB store first, Yahoo fallback) so E & F share identical date ranges."""
-    from ait.data.market_data import load_daily_ohlcv
+    """Load daily OHLCV once (test_intraday_prices table) so E & F share identical date ranges.
 
+    Uses HistoricalDataStore directly with TABLE_PREFIX so the walk-forward receives the full
+    backfilled history (test_intraday_prices), not the shorter production intraday_prices table.
+    fetch_days covers train_days + test_days + buffer to support long training windows.
+    """
+    from ait.data.historical import HistoricalDataStore
+
+    fetch_days = max(int(args.years * 366) + 30, args.train_days + args.test_days + 100)
+    store = HistoricalDataStore(db_path=Path(args.db_path), table_prefix=TABLE_PREFIX)
     ticker_data: dict[str, pd.DataFrame] = {}
     for sym in args.symbols:
-        df = load_daily_ohlcv(sym, days=int(args.years * 366) + 30,
-                               db_path=Path(args.db_path))
+        df = store.resample_to_daily(sym, days=fetch_days)
         if not df.empty:
             ticker_data[sym] = df
     return ticker_data
@@ -563,6 +596,7 @@ async def _section_e_walkforward(
     _patience   = args.wf_patience   if args.wf_patience   is not None else _bc.optimize_patience
     _min_trades = args.wf_min_trades if args.wf_min_trades is not None else _bc.optimize_min_trades
     _n_jobs     = args.wf_n_jobs     if args.wf_n_jobs     is not None else 1
+    _val_split  = args.wf_val_split
 
     print(f"\n{'='*60}")
     print(f"SECTION E — Walk-Forward (optimize_per_window=True, trials={_n_trials}, patience={_patience}, min_trades={_min_trades})")
@@ -579,6 +613,7 @@ async def _section_e_walkforward(
         optimize_min_trades=_min_trades,
         optimize_n_jobs=_n_jobs,
         optimize_seed=args.optuna_seed,
+        optimize_val_split=_val_split,
         initial_capital=_bc.initial_capital,
         position_size_pct=_bc.position_size_pct,
         wing_floor_dollars=_bc.wing_floor_dollars,
@@ -594,7 +629,8 @@ async def _section_e_walkforward(
     try:
         out.mkdir(parents=True, exist_ok=True)
         bt = WalkForwardBacktester(args.symbols, args.strategies, config=config,
-                                   db_path=Path(args.db_path), progress_dir=out)
+                                   db_path=Path(args.db_path), progress_dir=out,
+                                   table_prefix=TABLE_PREFIX)
         result = await bt.run(data=ticker_data if ticker_data else None)
 
         summary_text = result.summary()
@@ -643,6 +679,7 @@ async def _section_f_ablation(
     _bc = _settings.backtest
 
     _min_trades = args.wf_min_trades if args.wf_min_trades is not None else _bc.optimize_min_trades
+    _n_jobs     = args.wf_n_jobs     if args.wf_n_jobs     is not None else 1
 
     config = WalkForwardConfig(
         train_days=args.train_days,
@@ -651,6 +688,7 @@ async def _section_f_ablation(
         gap_days=args.gap_days,
         optimize_per_window=False,
         optimize_min_trades=_min_trades,
+        optimize_n_jobs=_n_jobs,
         initial_capital=_bc.initial_capital,
         position_size_pct=_bc.position_size_pct,
         wing_floor_dollars=_bc.wing_floor_dollars,
@@ -664,7 +702,8 @@ async def _section_f_ablation(
     )
 
     try:
-        bt = WalkForwardBacktester(args.symbols, args.strategies, config=config, db_path=Path(args.db_path))
+        bt = WalkForwardBacktester(args.symbols, args.strategies, config=config,
+                                   db_path=Path(args.db_path), table_prefix=TABLE_PREFIX)
         result = await bt.run(data=ticker_data if ticker_data else None)
 
         summary_text = result.summary()
@@ -902,10 +941,10 @@ def _create_run_archive(
         runs_dir = Path("reports/runs") / run_id
         runs_dir.mkdir(parents=True, exist_ok=True)
 
-        # Copy all artifacts from integration_test output dir
+        # Copy all artifacts from integration_test output dir (exclude .log — lives in logs/)
         for src in out.iterdir():
             dst = runs_dir / src.name
-            if src.is_file():
+            if src.is_file() and src.suffix != ".log":
                 shutil.copy2(src, dst)
 
         # Config snapshot
@@ -1080,10 +1119,80 @@ def _create_run_archive(
 
 
 # ---------------------------------------------------------------------------
+# Section J — Git archive to data/experiment-archives branch
+# ---------------------------------------------------------------------------
+
+def _archive_to_data_branch(runs_dir: Path, run_id: str) -> bool:
+    """Commit run_dir to data/experiment-archives and push.
+
+    Stashes any dirty working tree before switching branches and restores
+    it afterwards, so the caller's branch is always left intact.
+    Returns True on success, False on any git error (non-fatal).
+    """
+    import subprocess
+
+    def _git(*cmd: str) -> str:
+        return subprocess.check_output(["git", *cmd], text=True, stderr=subprocess.STDOUT).strip()
+
+    DATA_BRANCH = "data/experiment-archives"
+    current_branch = "unknown"
+    stashed = False
+
+    try:
+        current_branch = _git("rev-parse", "--abbrev-ref", "HEAD")
+
+        # Stash dirty working tree (including untracked) so branch switch is clean.
+        dirty = _git("status", "--porcelain")
+        if dirty:
+            _git("stash", "push", "--include-untracked", "-m", f"auto-stash/{run_id}")
+            stashed = True
+
+        _git("checkout", DATA_BRANCH)
+        _git("add", "-f", str(runs_dir))
+
+        # Nothing new to commit (e.g. re-run of same id)?
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"], capture_output=True
+        ).returncode
+        if staged == 0:
+            print(f"    Git archive: nothing new to commit for {run_id}")
+            return True
+
+        _git("commit", "-m", f"archive: {run_id}")
+        _git("push", "origin", DATA_BRANCH)
+        print(f"    Git archive: {run_id} → {DATA_BRANCH} (pushed)")
+        return True
+
+    except subprocess.CalledProcessError as e:
+        print(f"    Git archive ERROR: {e.output.strip()}")
+        return False
+    except Exception as e:
+        print(f"    Git archive ERROR: {e}")
+        return False
+    finally:
+        try:
+            _git("checkout", current_branch)
+            if stashed:
+                _git("stash", "pop")
+        except Exception as e:
+            print(f"    WARNING: could not restore branch '{current_branch}': {e}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 async def _main(args: argparse.Namespace) -> int:
+    # Configure logging early: DEBUG/INFO go to logs/ait.log; stdout gets
+    # console_log_level (default WARNING) to prevent the tmp task-output
+    # buffer from filling up during long experiments.
+    from ait.config.settings import LoggingConfig
+    from ait.utils.logging import setup_logging
+    setup_logging(
+        LoggingConfig(level="DEBUG", file="logs/ait.log"),
+        console_level=getattr(args, "console_log_level", "WARNING"),
+    )
+
     out = Path(args.output_dir)
     t_start = time.time()
 
@@ -1138,7 +1247,9 @@ async def _main(args: argparse.Namespace) -> int:
 
     # I — Archive + MLflow (only when walk-forward ran and produced trades)
     if wf and "error" not in wf and wf.get("total_trades", 0) > 0:
-        _create_run_archive(args, out, wf, wf_cfg_fields)
+        runs_dir = _create_run_archive(args, out, wf, wf_cfg_fields)
+        if runs_dir is not None and getattr(args, "archive_data", False):
+            _archive_to_data_branch(runs_dir, runs_dir.name)
 
     print(f"\n{'='*60}")
     print(f"Integration test complete in {elapsed/60:.1f} minutes.")
