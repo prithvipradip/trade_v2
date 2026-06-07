@@ -8,11 +8,14 @@ The WalkForwardBacktester is expensive to run, so two module-scoped fixtures
 share a single run across all tests that need the same configuration:
   - wf_plain:  no per-window Optuna (fast ablation path)
   - wf_optuna: optimize_per_window=True, n_trials=3
+
+Set RUN_WF_DASHBOARD_TESTS=1 to run this module (opt-in, CI default: skip).
 """
 
 from __future__ import annotations
 
 import json
+import os
 from datetime import date
 from pathlib import Path
 
@@ -25,6 +28,14 @@ from ait.backtesting.walkforward import (
     WalkForwardConfig,
     _build_optuna_window_data,
     _isnan,
+)
+
+# Skip the entire module unless the user explicitly opts in.
+# A full walk-forward run can take many minutes; it should not block the
+# default CI suite or local unit-test runs.
+pytestmark = pytest.mark.skipif(
+    not os.environ.get("RUN_WF_DASHBOARD_TESTS"),
+    reason="Set RUN_WF_DASHBOARD_TESTS=1 to run (full walk-forward run required)",
 )
 
 

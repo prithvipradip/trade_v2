@@ -98,6 +98,7 @@ function TrialsChart({ study, onHoverTrial }) {
 /* ---- param vs objective scatter ---- */
 function ParamScatter({ study, param }) {
   const [ref, { w, h }] = useSize();
+  const [hover, setHover] = useState(null);
   const pad = { l: 52, r: 16, t: 16, b: 34 };
   const pts = study.trials.filter(t => t.value != null).map(t => ({ x: t.params[param], y: t.value, n: t.number, best: t.number === study.best_trial }));
   if (!pts.length) return <div className="plot-host" ref={ref} />;
@@ -105,7 +106,6 @@ function ParamScatter({ study, param }) {
   const xMin = Math.min(...xs), xMax = Math.max(...xs), yMin = Math.min(...ys), yMax = Math.max(...ys);
   const X = v => pad.l + ((v - xMin) / (xMax - xMin || 1)) * (w - pad.l - pad.r);
   const Y = v => pad.t + (1 - (v - yMin) / (yMax - yMin || 1)) * (h - pad.t - pad.b);
-  const [hover, setHover] = useState(null);
   return (
     <div className="plot-host" ref={ref}>
       <svg width={w} height={h} onMouseLeave={() => setHover(null)}>
@@ -145,6 +145,13 @@ function OptunaTab({ data }) {
   }, [wid, wids]);
   useEffect(() => { if (!paramKeys.includes(param)) setParam(paramKeys[0]); }, [wid]);
 
+  const filteredTrials = useMemo(() => {
+    let rows = (study?.trials) || [];
+    if (q === "pruned") rows = rows.filter(t => t.value == null);
+    else if (q === "complete") rows = rows.filter(t => t.value != null);
+    return [...rows].sort((a, b) => (b.value ?? -Infinity) - (a.value ?? -Infinity));
+  }, [study, q]);
+
   if (!study) {
     return (
       <div className="optuna-tab">
@@ -157,13 +164,6 @@ function OptunaTab({ data }) {
       </div>
     );
   }
-
-  const filteredTrials = useMemo(() => {
-    let rows = study.trials || [];
-    if (q === "pruned") rows = rows.filter(t => t.value == null);
-    else if (q === "complete") rows = rows.filter(t => t.value != null);
-    return [...rows].sort((a, b) => (b.value ?? -Infinity) - (a.value ?? -Infinity));
-  }, [study, q]);
 
   const win = data.windows.find(w => w.window_id === wid);
   const completion = study.n_trials_run / study.n_trials_requested;

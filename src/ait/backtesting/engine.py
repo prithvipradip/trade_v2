@@ -274,7 +274,7 @@ class Backtester:
                         log.debug(
                             "hard_veto_fired",
                             component="backtesting.engine",
-                            strategy=strategy,
+                            strategies=self._strategies,
                             hurst_spread=round(spread, 4),
                             hard_veto_threshold=round(_hard_veto_threshold, 4),
                             hurst_regime_threshold=round(self._hurst_regime_threshold, 4),
@@ -448,8 +448,8 @@ class Backtester:
             # over the last 10 days, market is in directional stress — skip iron condor entry.
             # Rise value is always logged (not just on veto) for threshold tuning.
             if strategy in ("iron_condor", "short_strangle") and not features_df.empty:
-                if "iv_rank" in features_df.columns and len(features_df) >= 10:
-                    iv_rank_series = features_df["iv_rank"].iloc[-10:]
+                if "iv_rank" in features_df.columns and len(features_df) >= 11:
+                    iv_rank_series = features_df["iv_rank"].iloc[-11:]
                     iv_rank_rise = float(iv_rank_series.iloc[-1]) - float(iv_rank_series.iloc[0])
                     _entry_decision["iv_rank_rise_10d"] = round(iv_rank_rise, 4)
                     if iv_rank_rise > self._iv_rank_rise_threshold:
@@ -565,11 +565,14 @@ class Backtester:
             # Iron condor leg structure for the dashboard drawer
             if pos.get("strategy") == "iron_condor":
                 ep = pos.get("entry_price", 0.0)  # net credit per share
+                # Each spread contributes ep/2 to the net credit.
+                # Short leg = ep/2 + wing_cost; long leg = -wing_cost (debit).
+                # Using wing_cost = ep*0.05 so net = 2*(0.55-0.05)*ep = ep.
                 pos["legs"] = [
-                    {"type": "short_put",  "strike": pos.get("short_put_strike"),  "premium": round(ep * 0.62, 4)},
-                    {"type": "long_put",   "strike": pos.get("long_put_strike"),   "premium": round(-ep * 0.12, 4)},
-                    {"type": "short_call", "strike": pos.get("short_call_strike"), "premium": round(ep * 0.62, 4)},
-                    {"type": "long_call",  "strike": pos.get("long_call_strike"),  "premium": round(-ep * 0.12, 4)},
+                    {"type": "short_put",  "strike": pos.get("short_put_strike"),  "premium": round(ep * 0.55, 4)},
+                    {"type": "long_put",   "strike": pos.get("long_put_strike"),   "premium": round(-ep * 0.05, 4)},
+                    {"type": "short_call", "strike": pos.get("short_call_strike"), "premium": round(ep * 0.55, 4)},
+                    {"type": "long_call",  "strike": pos.get("long_call_strike"),  "premium": round(-ep * 0.05, 4)},
                 ]
                 contracts = pos.get("contracts", 1)
                 pos["credit"]   = round(ep * 100 * contracts, 2)

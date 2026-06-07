@@ -634,7 +634,7 @@ class RangePredictor:
         # GARCH ensemble contribution
         garch_state = (sym_data or {}).get("garch_state") or getattr(self, "_garch_state", None)
         if garch_state:
-            w_garch = _weight("garch", 0.0)
+            w_garch = _weight("garch", 0.5)
             if w_garch > 0:
                 try:
                     from ait.ml.garch_range_predictor import GARCHRangeModel
@@ -647,7 +647,7 @@ class RangePredictor:
         # MS-GARCH ensemble contribution
         ms_garch_state = (sym_data or {}).get("ms_garch_state") or getattr(self, "_ms_garch_state", None)
         if ms_garch_state:
-            w_ms = _weight("msgarch", 0.0)
+            w_ms = _weight("msgarch", 0.5)
             if w_ms > 0:
                 try:
                     from ait.ml.garch_range_predictor import GARCHRangeModel
@@ -660,7 +660,7 @@ class RangePredictor:
         # OU-Kou-GARCH ensemble contribution
         ou_jump_state = (sym_data or {}).get("ou_jump_state") or getattr(self, "_ou_jump_state", None)
         if ou_jump_state:
-            w_ou = _weight("oujump", 0.0)
+            w_ou = _weight("oujump", 0.5)
             if w_ou > 0:
                 try:
                     from ait.ml.garch_range_predictor import GARCHRangeModel
@@ -746,7 +746,7 @@ class RangePredictor:
 
         garch_state = (sym_data or {}).get("garch_state") or getattr(self, "_garch_state", None)
         if garch_state:
-            w_garch = _weight("garch", 0.0)
+            w_garch = _weight("garch", 0.5)
             if w_garch > 0:
                 try:
                     from ait.ml.garch_range_predictor import GARCHRangeModel
@@ -758,7 +758,7 @@ class RangePredictor:
 
         ms_garch_state = (sym_data or {}).get("ms_garch_state") or getattr(self, "_ms_garch_state", None)
         if ms_garch_state:
-            w_ms = _weight("msgarch", 0.0)
+            w_ms = _weight("msgarch", 0.5)
             if w_ms > 0:
                 try:
                     from ait.ml.garch_range_predictor import GARCHRangeModel
@@ -770,7 +770,7 @@ class RangePredictor:
 
         ou_jump_state = (sym_data or {}).get("ou_jump_state") or getattr(self, "_ou_jump_state", None)
         if ou_jump_state:
-            w_ou = _weight("oujump", 0.0)
+            w_ou = _weight("oujump", 0.5)
             if w_ou > 0:
                 try:
                     from ait.ml.garch_range_predictor import GARCHRangeModel

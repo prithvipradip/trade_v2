@@ -390,7 +390,6 @@ class TestWriteWfData:
         report_dir.mkdir()
         _minimal_metadata(report_dir)
         out = tmp_path / "wf_data.js"
-        _minimal_metadata(report_dir)
         ait = build_ait(report_dir)
         write_wf_data(ait, out)
         content = out.read_text()

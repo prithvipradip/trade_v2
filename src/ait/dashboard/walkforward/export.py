@@ -266,7 +266,7 @@ def build_ait(report_dir: Path) -> dict:
             "objective": "composite",
             "min_confidence": 0.55,
             "range_min_confidence": 0.55,
-            "max_concurrent_positions": 3,
+            "max_concurrent_positions": 1,
             "optimize_patience": 20,
             "optimize_seed": meta.get("optuna_seed", 42),
         },

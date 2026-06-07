@@ -232,14 +232,9 @@ def test_enable_flags_control_subprocess_models():
     """When enable_msgarch=False and enable_oujump=False, the isolated path
     skips the subprocess entirely and goes directly to in-process training.
     """
-    import multiprocessing as mp
-
     df = _make_ohlcv(400)
     wf = _wf_backtester(enable_msgarch=False, enable_oujump=False)
     threshold = wf._adaptive_range_threshold(df, horizon_days=21)
-
-    spawn_calls = []
-    original_process = mp.get_context("spawn").Process
 
     # Should not create any spawn Process when both flags are False
     rp, status, thr = wf._train_window_range_model_isolated(

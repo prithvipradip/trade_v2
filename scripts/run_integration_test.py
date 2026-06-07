@@ -1148,7 +1148,7 @@ def _archive_to_data_branch(runs_dir: Path, run_id: str) -> bool:
             stashed = True
 
         _git("checkout", DATA_BRANCH)
-        _git("add", str(runs_dir))
+        _git("add", "-f", str(runs_dir))
 
         # Nothing new to commit (e.g. re-run of same id)?
         staged = subprocess.run(

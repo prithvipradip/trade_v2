@@ -301,15 +301,6 @@
           const time = param.time || null;
           // update all readouts
           this.charts.forEach(c => c.readout && c.readout(time, param.seriesData || new Map()));
-          // sync crosshair to other charts
-          if (!this._syncing) {
-            this._syncing = true;
-            this.charts.forEach(c => {
-              if (c.chart === entry.chart) return;
-              const anySeries = c.chart && c._firstSeries;
-            });
-            this._syncing = false;
-          }
           if (this.onHover) this.onHover(time);
         });
         entry.chart.subscribeClick(param => {

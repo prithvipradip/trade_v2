@@ -1720,7 +1720,7 @@ The script will:
 
 ```bash
 git checkout data/experiment-archives
-git add reports/runs/{run_id}/
+git add -f reports/runs/{run_id}/
 git commit -m "archive: {run_id}"
 git push origin data/experiment-archives
 git checkout <your-branch>
