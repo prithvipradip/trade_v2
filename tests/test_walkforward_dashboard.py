@@ -4,8 +4,10 @@ Verifies that walk-forward window JSON files contain the new fields added for
 the dashboard: enriched trades_detail (legs, decision, features_at_entry) and
 Optuna trial history.
 
-These tests intentionally stay fast by using a small synthetic price series
-and a minimal Optuna trial budget (n_trials=3).
+The WalkForwardBacktester is expensive to run, so two module-scoped fixtures
+share a single run across all tests that need the same configuration:
+  - wf_plain:  no per-window Optuna (fast ablation path)
+  - wf_optuna: optimize_per_window=True, n_trials=3
 """
 
 from __future__ import annotations
@@ -75,13 +77,29 @@ def _run_wf(tmp_path: Path, optimize: bool = False, n_trials: int = 3) -> list[d
 
 
 # ---------------------------------------------------------------------------
+# Module-scoped fixtures — one real WalkForwardBacktester run per config,
+# shared across all tests that use the same configuration.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def wf_plain(tmp_path_factory):
+    """Non-optimized walk-forward run, shared by all tests that don't need Optuna."""
+    return _run_wf(tmp_path_factory.mktemp("wf_plain"))
+
+
+@pytest.fixture(scope="module")
+def wf_optuna(tmp_path_factory):
+    """Optimized walk-forward run (3 trials), shared by all Optuna-related tests."""
+    return _run_wf(tmp_path_factory.mktemp("wf_optuna"), optimize=True, n_trials=3)
+
+
+# ---------------------------------------------------------------------------
 # Layer 2a — enriched trades_detail
 # ---------------------------------------------------------------------------
 
 class TestTradesDetailEnrichment:
-    def test_hold_days_in_trades_detail(self, tmp_path):
-        windows = _run_wf(tmp_path)
-        trades = [t for w in windows for t in w.get("trades_detail", [])]
+    def test_hold_days_in_trades_detail(self, wf_plain):
+        trades = [t for w in wf_plain for t in w.get("trades_detail", [])]
         if not trades:
             pytest.skip("no trades generated with this random seed — adjust _make_ohlcv")
         for t in trades:
@@ -89,51 +107,45 @@ class TestTradesDetailEnrichment:
             assert isinstance(t["hold_days"], int)
             assert t["hold_days"] >= 0
 
-    def test_contracts_in_trades_detail(self, tmp_path):
-        windows = _run_wf(tmp_path)
-        trades = [t for w in windows for t in w.get("trades_detail", [])]
+    def test_contracts_in_trades_detail(self, wf_plain):
+        trades = [t for w in wf_plain for t in w.get("trades_detail", [])]
         if not trades:
             pytest.skip("no trades")
         for t in trades:
             assert "contracts" in t
 
-    def test_n_legs_in_trades_detail(self, tmp_path):
-        windows = _run_wf(tmp_path)
-        trades = [t for w in windows for t in w.get("trades_detail", [])]
+    def test_n_legs_in_trades_detail(self, wf_plain):
+        trades = [t for w in wf_plain for t in w.get("trades_detail", [])]
         if not trades:
             pytest.skip("no trades")
         for t in trades:
             assert "n_legs" in t
 
-    def test_entry_iv_rank_in_trades_detail(self, tmp_path):
-        windows = _run_wf(tmp_path)
-        trades = [t for w in windows for t in w.get("trades_detail", [])]
+    def test_entry_iv_rank_in_trades_detail(self, wf_plain):
+        trades = [t for w in wf_plain for t in w.get("trades_detail", [])]
         if not trades:
             pytest.skip("no trades")
         for t in trades:
             assert "entry_iv_rank" in t
 
-    def test_entry_vix_level_in_trades_detail(self, tmp_path):
-        windows = _run_wf(tmp_path)
-        trades = [t for w in windows for t in w.get("trades_detail", [])]
+    def test_entry_vix_level_in_trades_detail(self, wf_plain):
+        trades = [t for w in wf_plain for t in w.get("trades_detail", [])]
         if not trades:
             pytest.skip("no trades")
         for t in trades:
             assert "entry_vix_level" in t
 
-    def test_legs_field_present(self, tmp_path):
-        windows = _run_wf(tmp_path)
-        trades = [t for w in windows for t in w.get("trades_detail", [])]
+    def test_legs_field_present(self, wf_plain):
+        trades = [t for w in wf_plain for t in w.get("trades_detail", [])]
         if not trades:
             pytest.skip("no trades")
         for t in trades:
             assert "legs" in t
             assert isinstance(t["legs"], list)
 
-    def test_iron_condor_has_four_legs(self, tmp_path):
-        windows = _run_wf(tmp_path)
+    def test_iron_condor_has_four_legs(self, wf_plain):
         ic_trades = [
-            t for w in windows for t in w.get("trades_detail", [])
+            t for w in wf_plain for t in w.get("trades_detail", [])
             if t.get("strategy") == "iron_condor" and t.get("legs")
         ]
         if not ic_trades:
@@ -143,19 +155,17 @@ class TestTradesDetailEnrichment:
             leg_types = {leg["type"] for leg in t["legs"]}
             assert leg_types == {"short_put", "long_put", "short_call", "long_call"}
 
-    def test_decision_field_present(self, tmp_path):
-        windows = _run_wf(tmp_path)
-        trades = [t for w in windows for t in w.get("trades_detail", [])]
+    def test_decision_field_present(self, wf_plain):
+        trades = [t for w in wf_plain for t in w.get("trades_detail", [])]
         if not trades:
             pytest.skip("no trades")
         for t in trades:
             assert "decision" in t
             assert isinstance(t["decision"], dict)
 
-    def test_decision_has_required_keys(self, tmp_path):
-        windows = _run_wf(tmp_path)
+    def test_decision_has_required_keys(self, wf_plain):
         trades = [
-            t for w in windows for t in w.get("trades_detail", [])
+            t for w in wf_plain for t in w.get("trades_detail", [])
             if t.get("decision")
         ]
         if not trades:
@@ -167,10 +177,9 @@ class TestTradesDetailEnrichment:
                 f"Missing decision keys: {required - t['decision'].keys()}"
             )
 
-    def test_decision_range_gate_has_subkeys(self, tmp_path):
-        windows = _run_wf(tmp_path)
+    def test_decision_range_gate_has_subkeys(self, wf_plain):
         trades = [
-            t for w in windows for t in w.get("trades_detail", [])
+            t for w in wf_plain for t in w.get("trades_detail", [])
             if t.get("decision", {}).get("range_gate")
         ]
         if not trades:
@@ -180,19 +189,17 @@ class TestTradesDetailEnrichment:
             assert "threshold" in rg
             assert "pass" in rg
 
-    def test_features_at_entry_present(self, tmp_path):
-        windows = _run_wf(tmp_path)
-        trades = [t for w in windows for t in w.get("trades_detail", [])]
+    def test_features_at_entry_present(self, wf_plain):
+        trades = [t for w in wf_plain for t in w.get("trades_detail", [])]
         if not trades:
             pytest.skip("no trades")
         for t in trades:
             assert "features_at_entry" in t
             assert isinstance(t["features_at_entry"], dict)
 
-    def test_features_at_entry_has_rsi(self, tmp_path):
-        windows = _run_wf(tmp_path)
+    def test_features_at_entry_has_rsi(self, wf_plain):
         trades = [
-            t for w in windows for t in w.get("trades_detail", [])
+            t for w in wf_plain for t in w.get("trades_detail", [])
             if t.get("features_at_entry")
         ]
         if not trades:
@@ -200,10 +207,9 @@ class TestTradesDetailEnrichment:
         for t in trades:
             assert "rsi_14" in t["features_at_entry"]
 
-    def test_features_at_entry_has_hurst(self, tmp_path):
-        windows = _run_wf(tmp_path)
+    def test_features_at_entry_has_hurst(self, wf_plain):
         trades = [
-            t for w in windows for t in w.get("trades_detail", [])
+            t for w in wf_plain for t in w.get("trades_detail", [])
             if t.get("features_at_entry")
         ]
         if not trades:
@@ -211,11 +217,10 @@ class TestTradesDetailEnrichment:
         for t in trades:
             assert "hurst_wavelet" in t["features_at_entry"]
 
-    def test_return_pct_none_without_layer2a_max_loss(self, tmp_path):
+    def test_return_pct_none_without_layer2a_max_loss(self, wf_plain):
         # return_pct requires max_loss which is now stored — if max_loss is present
         # and nonzero, return_pct should be computed; if max_loss is None, it's None.
-        windows = _run_wf(tmp_path)
-        trades = [t for w in windows for t in w.get("trades_detail", [])]
+        trades = [t for w in wf_plain for t in w.get("trades_detail", [])]
         if not trades:
             pytest.skip("no trades")
         for t in trades:
@@ -231,54 +236,47 @@ class TestTradesDetailEnrichment:
 # ---------------------------------------------------------------------------
 
 class TestOptunaTrialExport:
-    def test_optuna_trials_present_when_optimizing(self, tmp_path):
-        windows = _run_wf(tmp_path, optimize=True, n_trials=3)
-        active = [w for w in windows if w.get("trades", 0) > 0 or w.get("best_params")]
+    def test_optuna_trials_present_when_optimizing(self, wf_optuna):
+        active = [w for w in wf_optuna if w.get("trades", 0) > 0 or w.get("best_params")]
         if not active:
             pytest.skip("no active windows")
         for w in active:
             assert "optuna_trials" in w, f"window {w['window']} missing optuna_trials"
 
-    def test_optuna_trials_absent_when_not_optimizing(self, tmp_path):
-        windows = _run_wf(tmp_path, optimize=False)
-        for w in windows:
+    def test_optuna_trials_absent_when_not_optimizing(self, wf_plain):
+        for w in wf_plain:
             assert "optuna_trials" not in w
 
-    def test_optuna_meta_present_when_optimizing(self, tmp_path):
-        windows = _run_wf(tmp_path, optimize=True, n_trials=3)
-        active = [w for w in windows if "optuna_trials" in w]
+    def test_optuna_meta_present_when_optimizing(self, wf_optuna):
+        active = [w for w in wf_optuna if "optuna_trials" in w]
         if not active:
             pytest.skip("no optimized windows")
         for w in active:
             assert "optuna_meta" in w
 
-    def test_optuna_meta_has_status(self, tmp_path):
-        windows = _run_wf(tmp_path, optimize=True, n_trials=3)
-        active = [w for w in windows if w.get("optuna_meta")]
+    def test_optuna_meta_has_status(self, wf_optuna):
+        active = [w for w in wf_optuna if w.get("optuna_meta")]
         if not active:
             pytest.skip("no optuna_meta")
         for w in active:
             assert w["optuna_meta"]["status"] in ("completed", "early_stopped")
 
-    def test_optuna_trial_schema(self, tmp_path):
-        windows = _run_wf(tmp_path, optimize=True, n_trials=3)
-        all_trials = [t for w in windows for t in w.get("optuna_trials", [])]
+    def test_optuna_trial_schema(self, wf_optuna):
+        all_trials = [t for w in wf_optuna for t in w.get("optuna_trials", [])]
         if not all_trials:
             pytest.skip("no trials")
         required = {"number", "state", "value", "params"}
         for t in all_trials:
             assert required.issubset(t.keys()), f"Missing trial keys: {required - t.keys()}"
 
-    def test_optuna_trial_user_attrs_present(self, tmp_path):
-        windows = _run_wf(tmp_path, optimize=True, n_trials=3)
+    def test_optuna_trial_user_attrs_present(self, wf_optuna):
         complete = [
-            t for w in windows for t in w.get("optuna_trials", [])
+            t for w in wf_optuna for t in w.get("optuna_trials", [])
             if t.get("state") == "COMPLETE"
         ]
         if not complete:
             pytest.skip("no COMPLETE trials")
         for t in complete:
-            # sharpe/win_rate/max_drawdown/n_trades set via set_user_attr
             assert "n_trades" in t, "n_trades missing from complete trial"
 
 
