@@ -113,12 +113,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Walk-forward training window in calendar days (default: 365).",
     )
     parser.add_argument(
-        "--test-days", type=int, default=63,
-        help="Walk-forward test window in calendar days (default: 63).",
+        "--test-days", type=int, default=60,
+        help="Walk-forward test window in calendar days (default: 60).",
     )
     parser.add_argument(
-        "--step-days", type=int, default=21,
-        help="Days to advance each walk-forward window (default: 21).",
+        "--step-days", type=int, default=60,
+        help="Days to advance each walk-forward window (default: 60, non-overlapping).",
     )
     parser.add_argument(
         "--gap-days", type=int, default=5,

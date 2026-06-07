@@ -1598,7 +1598,7 @@ All four flags are optional — if omitted, the values are read from the corresp
 **Running multiple experiments:** To compare different window configurations (train_days, test_days, step_days), run `run_integration_test.py` multiple times with different YAML configs. Each run is automatically archived under `reports/runs/{run_id}/` and logged to MLflow experiment `walkforward_{symbol}`.
 
 ```bash
-# Run with default 365/63/21 config — --archive-data auto-commits results to data/experiment-archives
+# Run with default 365/60/60 config (non-overlapping windows) — --archive-data auto-commits results to data/experiment-archives
 python scripts/run_integration_test.py --symbols QQQ --config config_QQQ_test.yaml \
     --strategies iron_condor --skip-backfill --archive-data
 
@@ -1626,7 +1626,7 @@ python scripts/backfill_mlflow.py --symbol QQQ --force
 | Location | Field | Example |
 |----------|-------|---------|
 | Parameters | `backtest_period` | `2024-05-02 to 2026-05-08` |
-| Parameters | `train_days`, `test_days`, `step_days` | `365`, `63`, `21` |
+| Parameters | `train_days`, `test_days`, `step_days` | `365`, `60`, `60` |
 | Parameters | `initial_capital`, `wf_trials` | `100000.0`, `50` |
 | Tags | `cli_command` | exact command to reproduce the run |
 | Tags | `git_commit`, `git_branch` | `fa283217`, `features-request-2` |
