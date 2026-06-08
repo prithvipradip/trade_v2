@@ -201,17 +201,17 @@
       if (A.has("pane:ml")) defs.push({ key: "ml", title: "ML Predictions", build: (chart) => {
         chart.priceScale("right").applyOptions({ scaleMargins: { top: 0.15, bottom: 0.1 }, mode: 0 });
         const rp = chart.addLineSeries({ color: t.rangeProb, lineWidth: 2, priceLineVisible: false, lastValueVisible: false });
-        rp.setData(data.predictions.map(p => ({ time: p.time, value: p.range_prob })));
+        rp.setData(data.predictions.filter(p => p.range_prob != null).map(p => ({ time: p.time, value: p.range_prob })));
         const dc = chart.addLineSeries({ color: t.dirConf, lineWidth: 1.5, priceLineVisible: false, lastValueVisible: false });
-        dc.setData(data.predictions.map(p => ({ time: p.time, value: p.dir_conf })));
+        dc.setData(data.predictions.filter(p => p.dir_conf != null).map(p => ({ time: p.time, value: p.dir_conf })));
         const guide = chart.addLineSeries({ color: t.guide, lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-        guide.setData(data.predictions.map(p => ({ time: p.time, value: 0.55 })));
+        guide.setData(data.predictions.filter(p => p.range_prob != null).map(p => ({ time: p.time, value: 0.55 })));
         return { readout: (time) => {
           const p = this._predAt(time);
           this.charts.find(c => c.key === "ml").legend.innerHTML =
             `<span class="wf-lg-title">ML Predictions</span>` +
-            `<span class="wf-lg" style="color:${t.rangeProb}">P(in-range) ${p ? p.range_prob.toFixed(2) : "–"}</span>` +
-            `<span class="wf-lg" style="color:${t.dirConf}">Dir conf ${p ? p.dir_conf.toFixed(2) : "–"}</span>` +
+            `<span class="wf-lg" style="color:${t.rangeProb}">P(in-range) ${p && p.range_prob != null ? p.range_prob.toFixed(2) : "–"}</span>` +
+            `<span class="wf-lg" style="color:${t.dirConf}">Dir conf ${p && p.dir_conf != null ? p.dir_conf.toFixed(2) : "–"}</span>` +
             (p ? `<span class="wf-lg">${p.dir_class}</span>` : "");
         } };
       } });
