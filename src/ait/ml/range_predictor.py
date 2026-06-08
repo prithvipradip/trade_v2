@@ -64,6 +64,7 @@ class RangePredictor:
         enable_garch: bool = False,
         enable_msgarch: bool = False,
         enable_oujump: bool = False,
+        min_edge_over_baseline: float = 0.05,
     ) -> None:
         self._threshold = threshold_pct
         self._horizon = horizon_days
@@ -88,6 +89,7 @@ class RangePredictor:
         self._feature_engine = FeatureEngine()
         self._trained = False
         self._model_version = ""
+        self._min_edge_over_baseline = min_edge_over_baseline
 
     @property
     def is_trained(self) -> bool:
@@ -556,11 +558,6 @@ class RangePredictor:
 
     # --- Prediction ---
 
-    # Minimum predictive edge (accuracy − base_rate) required to use the model.
-    # Below this, the model is just classifying based on majority class — no
-    # actual prediction skill. Returning None forces the strategy to skip.
-    MIN_EDGE_OVER_BASELINE = 0.10
-
     def predict(
         self,
         df: pd.DataFrame,
@@ -568,6 +565,7 @@ class RangePredictor:
         market_context: dict | None = None,
         live_signals: dict | None = None,
         intraday_store=None,
+        min_edge_override: float | None = None,
     ) -> RangePrediction | None:
         """Predict P(stays in ±threshold% over horizon_days)."""
         sym_data = None
@@ -583,18 +581,25 @@ class RangePredictor:
         else:
             return None
 
-        # Edge-over-baseline check — skip predictions when model has no skill.
-        # cv_scores stores BALANCED ACCURACY (sensitivity+specificity)/2 which
-        # baselines at 0.50 for ANY class distribution. Cleaner than raw accuracy.
+        # Edge-over-baseline check — skip predictions when the ensemble has no skill.
+        # Uses fitted weights (which zero out anti-predictive models) so a bad
+        # ensemble member can't veto a good one. Falls back to simple average when
+        # no fitted weights are available.
+        # Threshold: min_edge_override (from Backtester/Optuna) → instance default.
         if sym_data is not None:
             cv_scores = sym_data.get("cv_scores", {})
             if cv_scores:
-                avg_balanced_acc = sum(cv_scores.values()) / len(cv_scores)
-                edge = avg_balanced_acc - 0.50  # balanced acc baseline = 50%
-                if edge < self.MIN_EDGE_OVER_BASELINE:
+                fw = sym_data.get("fitted_weights") or {}
+                if fw:
+                    # Weighted edge: anti-predictive models get weight=0 from CV calibration
+                    edge = sum(fw.get(m, 0.0) * (s - 0.50) for m, s in cv_scores.items())
+                else:
+                    edge = sum(cv_scores.values()) / len(cv_scores) - 0.50
+                _threshold = min_edge_override if min_edge_override is not None else self._min_edge_over_baseline
+                if edge < _threshold:
                     log.debug("range_no_edge", symbol=symbol,
-                              balanced_accuracy=f"{avg_balanced_acc:.2f}",
-                              edge=f"{edge:+.2f}")
+                              weighted_edge=f"{edge:+.3f}",
+                              threshold=f"{_threshold:.3f}")
                     return None
 
         features = self._feature_engine.compute(
@@ -710,9 +715,12 @@ class RangePredictor:
         if sym_data is not None:
             cv_scores = sym_data.get("cv_scores", {})
             if cv_scores:
-                avg_balanced_acc = sum(cv_scores.values()) / len(cv_scores)
-                edge = avg_balanced_acc - 0.50
-                if edge < self.MIN_EDGE_OVER_BASELINE:
+                fw = sym_data.get("fitted_weights") or {}
+                if fw:
+                    edge = sum(fw.get(m, 0.0) * (s - 0.50) for m, s in cv_scores.items())
+                else:
+                    edge = sum(cv_scores.values()) / len(cv_scores) - 0.50
+                if edge < self._min_edge_over_baseline:
                     return None
 
         try:

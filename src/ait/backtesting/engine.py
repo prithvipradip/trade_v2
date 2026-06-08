@@ -71,6 +71,7 @@ class Backtester:
         aekf_veto_threshold: float = 0.60,
         iv_rank_rise_threshold: float = 0.30,
         pct_from_60d_high_threshold: float = -1.0,
+        min_edge_over_baseline: float = 0.05,
         features_cache: pd.DataFrame | None = None,
         max_concurrent_positions: int = 1,
         max_entry_vol_annual: float = 0.80,
@@ -129,6 +130,7 @@ class Backtester:
         self._aekf_veto_threshold = aekf_veto_threshold
         self._iv_rank_rise_threshold = iv_rank_rise_threshold
         self._pct_from_60d_high_threshold = pct_from_60d_high_threshold
+        self._min_edge_over_baseline = min_edge_over_baseline
         self._features_cache = features_cache
         self._max_concurrent_positions = max_concurrent_positions
         self._max_entry_vol_annual = max_entry_vol_annual
@@ -388,7 +390,12 @@ class Backtester:
             # with P(stays in range). Skip if below range threshold.
             if strategy in ("iron_condor", "short_strangle") and self._range_predictor is not None:
                 try:
-                    rp = self._range_predictor.predict(hist, market_context=self._market_context)
+                    rp = self._range_predictor.predict(
+                        hist,
+                        symbol=self._symbol,
+                        market_context=self._market_context,
+                        min_edge_override=self._min_edge_over_baseline,
+                    )
                     if rp is None or rp.probability_in_range < self._range_min_confidence:
                         continue  # bad range setup → skip
                     _entry_decision["range_gate"] = {

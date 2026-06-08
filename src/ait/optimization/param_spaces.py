@@ -39,16 +39,16 @@ IRON_CONDOR_SPACE: dict[str, tuple] = {
     "wing_k":                 ("float", 0.30, 2.00),
     # Exp 26: iv_rank_rise gate threshold tunable per window. Fixed 0.30 was blocking
     # profitable W01/W02 entries (gradual IV drift pre-crash) once context_bars=252
-    # made iv_rank meaningful. Exp 27: upper bound widened 0.60→0.70 because W12 slow
-    # grind (rise=0.021) bypasses this gate entirely — need more room for the new
-    # pct_from_60d_high gate to handle structural drawdown environments.
-    "iv_rank_rise_threshold": ("float", 0.25, 0.70),
-    # Exp 27: block entry when market is in a sustained drawdown from 60-day high.
-    # Catches slow-grind bear phases (W12 tariff shock: -16% from 60d high) that
-    # iv_rank_rise misses because IV rises gradually rather than spiking.
-    # Range [-0.15, -0.05]: -0.05 fires on shallow 5% pullbacks, -0.15 only blocks
-    # deep structural drawdowns. Default -1.0 = disabled (ablation baseline).
-    "pct_from_60d_high_threshold": ("float", -0.15, -0.05),
+    # made iv_rank meaningful. Range [0.25, 0.60]: 0.25 fires on sustained rises,
+    # 0.60 only fires on genuine spikes (Yen-carry / tariff-shock level events).
+    # Exp 27 tried widening to 0.70 + adding pct_from_60d_high gate — reverted in
+    # Exp 28 (gate was too blunt, over-blocked W06/W07/W08).
+    "iv_rank_rise_threshold": ("float", 0.25, 0.60),
+    # Exp 28: min weighted CV edge required for range predictor to make predictions.
+    # Fixes Bug 1 (engine now passes symbol → MIN_EDGE check actually fires) and
+    # Bug 2 (uses fitted weights so anti-predictive members don't veto good ones).
+    # Range [0.02, 0.15]: 0.02 = accept almost any skill, 0.15 = require strong edge.
+    "min_edge_over_baseline": ("float", 0.02, 0.15),
     **FRACTAL_GATE_SPACE,
 }
 
