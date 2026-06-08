@@ -669,14 +669,25 @@ The Tier 1 models achieve 65–75% accuracy on their respective binary questions
 
 ### Models
 
-Two models run in parallel and their outputs are averaged (50/50):
+The **Direction Predictor** uses two models in parallel, probabilities averaged (50/50):
 
 | Model | Library | Strength |
 |---|---|---|
 | XGBoost | `xgboost >= 2.0` | Fast, handles sparse features well |
 | LightGBM | `lightgbm >= 4.3` | Efficient on large datasets, good with categorical features |
 
-**Per-symbol models:** Each symbol gets its own model pair. If a symbol has insufficient data (< 100 samples), it falls back to a universal model.
+The **Range Predictor** uses a four-member ensemble with CV-weighted blending (not equal weights):
+
+| Model | Type | Role |
+|---|---|---|
+| XGBoost | Supervised binary classifier | Price-range boundary features |
+| LightGBM | Supervised binary classifier | Efficient on high-dim feature sets |
+| MS-GARCH | Markov-switching volatility model | Regime-aware vol forecast |
+| OU-Kou-GARCH | Jump-diffusion + GARCH hybrid | Jump risk and mean-reversion signal |
+
+Blending weights are derived from per-fold CV balanced accuracy on the training window. An ensemble member whose CV score does not beat 0.50 + `min_edge_over_baseline` is excluded from that window's blend. See [docs/WALKFORWARD_PROCESS.md](docs/WALKFORWARD_PROCESS.md) for the full gate architecture.
+
+**Per-symbol models:** Each symbol gets its own model set. If a symbol has insufficient data (< 100 samples), it falls back to a universal model.
 
 ### Training Pipeline
 
@@ -944,6 +955,8 @@ The `Watchdog` runs inside the bot process and monitors:
 - **Error rates** — alerts if > 10 errors occur in a window
 
 ### Walk-Forward Analysis Dashboard
+
+> **User guide:** [docs/WALKFORWARD_DASHBOARD.md](docs/WALKFORWARD_DASHBOARD.md) — full reference for all three tabs, every metric, and how to interpret results.
 
 A standalone React dashboard for post-experiment analysis. No build step — served directly from the filesystem.
 
@@ -1299,6 +1312,8 @@ python run_backtest.py --compare-exits           # Fixed vs trailing stops
 
 ### Per-Window Execution Flow (Order of Operations)
 
+> **Deep-dive reference:** [docs/WALKFORWARD_PROCESS.md](docs/WALKFORWARD_PROCESS.md) — covers the full 5-step window flow, range predictor ensemble mechanics, two-layer gate architecture with code references, and Optuna search-space rationale.
+
 This is the exact sequence of steps the walk-forward engine executes for **each** train/test window pair. Understanding this order is critical for interpreting results and diagnosing issues.
 
 ```
@@ -1319,14 +1334,17 @@ This is the exact sequence of steps the walk-forward engine executes for **each*
 │      removed it). Still trained and passed to OOS backtest for      │
 │      other strategy types and thesis re-evaluation.                 │
 │                                                                     │
-│  2b. Range Predictor  — XGBoost + LightGBM ensemble (50/50).       │
+│  2b. Range Predictor  — 4-member ensemble with CV-weighted blend.   │
+│      Members: XGBoost, LightGBM, MS-GARCH, OU-Kou-GARCH.           │
 │      Predicts P(price stays within ±5% over next N days).           │
-│      This IS the iron condor entry gate. Entry fires only when      │
-│      range confidence ≥ threshold.                                  │
-│      Ensemble = one XGBClassifier + one LGBMClassifier, probabi-   │
-│      lities averaged. Not a RandomForest. XGBoost/LightGBM are     │
-│      themselves internally boosted tree ensembles; the "ensemble"   │
-│      here means two separate model families blended together.       │
+│      This IS the iron condor entry gate (Layer 2, Gate A). Entry    │
+│      fires only when range confidence ≥ range_min_confidence.       │
+│      Blending weights = per-fold CV balanced accuracy on training    │
+│      data. Members with edge < min_edge_over_baseline excluded       │
+│      from that window's blend (Layer 1 skill gate).                 │
+│      If the entire ensemble fails training, _oos_range_min_conf     │
+│      is set to 1.0 — an unreachable threshold that blocks all IC    │
+│      entries for that OOS window.                                    │
 │                                                                     │
 │  ── Model NOT trained per walk-forward window ──                    │
 │  VolMagnitudePredictor  — exists in the codebase but is NOT wired  │
@@ -1360,13 +1378,17 @@ This is the exact sequence of steps the walk-forward engine executes for **each*
 │  Patience=50: study stops if 50 consecutive trials show no          │
 │  improvement. Max 200 trials total.                                 │
 │                                                                     │
-│  What Optuna searches (structural params only — no entry gates):    │
-│    stop_loss_pct, profit_target_pct, trailing_stop_fraction,        │
-│    delta_short, max_hold_days, wing_k, hurst_regime_threshold,      │
-│    hurst_regime_penalty, multifractal_max_width                     │
+│  What Optuna searches (structural params + regime/gate params):     │
+│    delta_short, max_hold_days, wing_k,                              │
+│    iv_rank_rise_threshold [0.25, 0.60],                             │
+│    min_edge_over_baseline [0.02, 0.15]  ← Exp 28 addition          │
+│    hurst_regime_threshold, hurst_regime_penalty,                    │
+│    multifractal_max_width                                           │
 │  What Optuna does NOT touch:                                        │
-│    ML model weights/trees (frozen), min_confidence (fixed config),  │
-│    max_entry_vol_annual (fixed config) — see P1, P5.               │
+│    ML model weights/trees (frozen), stop_loss_pct / profit_target_  │
+│    pct / trailing_stop_fraction (frozen risk-mgmt constants),       │
+│    range_min_confidence (fixed config), max_entry_vol_annual        │
+│    (fixed config), aekf_veto_threshold (fixed config) — see P1, P5.│
 │                                                                     │
 │  Output: best_params → window_cfg (the winning parameter set)       │
 └────────────────────────────┬────────────────────────────────────────┘
@@ -1656,7 +1678,20 @@ All four flags are optional — if omitted, the values are read from the corresp
 
 **Conditional warm-start (per-strategy):** Before each strategy's study begins, the system checks the previous window's OOS result. If `win_rate ≥ 75%` AND `total_trades ≥ 3`, that strategy's subset of prior best params is enqueued as the first trial. If that condition fails, the system falls back to the same strategy's subset of the **globally best params** seen across all prior windows (tracked by score = `win_rate × √(min(1, trades/5))`). Only if neither source exists does the study start fully cold. This per-strategy warm-start ensures iron_condor never inherits contaminated params from short_strangle and vice versa.
 
-**Range predictor gate:** For iron_condor and short_strangle, the engine calls the range predictor before entering. If `P(in_range) < range_min_confidence` (default 0.55), the signal is skipped entirely — no fallback to directional strategies. Directional strategies (bear_put_spread, bull_call_spread, long_strangle) were tested as range-gate fallbacks but produced consistent losses because the ML model's directional accuracy (~22%) is too low to support them. The correct behaviour when iron_condor is blocked is to pass on the trade.
+**Entry gate architecture (iron_condor):** Two layers of gating control whether a bar's signal becomes a trade. See [docs/WALKFORWARD_PROCESS.md](docs/WALKFORWARD_PROCESS.md) for the full decision-flow diagram.
+
+*Layer 1 — Skill gate* (inside `RangePredictor.predict_from_features()`): If the ensemble's average CV balanced accuracy does not beat 0.50 by at least `min_edge_over_baseline` (Optuna-searchable [0.02, 0.15]), `predict()` returns `None`. No prediction is emitted for that bar.
+
+*Layer 2 — Sequential entry gates* (inside `Backtester._should_enter()`):
+| Gate | Parameter | Fixed/Searchable | Blocks when |
+|---|---|---|---|
+| A — Range confidence | `range_min_confidence` | Fixed (0.55) | `P(in_range) < 0.55` or no prediction |
+| B — Realized vol ceiling | `max_entry_vol_annual` | Fixed (0.80) | 10-day realized vol > 80% annualised |
+| C — AEKF direction veto | `aekf_veto_threshold` | Fixed (0.60) | OU-Kou-GARCH AEKF signals strong directional move |
+| D — IV rank rise | `iv_rank_rise_threshold` | Optuna [0.25, 0.60] | IV rank rising faster than threshold |
+| E — Fractal regime | `hurst_regime_threshold`, `multifractal_max_width` | Optuna | Market in trending/multifractal regime |
+
+All five gates must pass for an iron condor to be entered. If any gate blocks, the signal is skipped with no directional fallback — directional strategies produced consistent losses under range-gate misses (~22% directional accuracy).
 
 **QQQ integration test findings (walk-forward, 2024–2026):** Seven experiments run to diagnose optimizer overfitting, fix infrastructure bugs, and activate ML predictions:
 
