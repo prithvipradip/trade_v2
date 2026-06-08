@@ -468,27 +468,36 @@ def _load_timeseries(report_dir: Path, symbol: str) -> list[dict]:
 
 
 def _features_from_timeseries(ts_bars: list[dict]) -> list[dict]:
-    """Extract feature columns from timeseries_bars.json records."""
-    rows = []
+    """Extract feature columns from timeseries_bars.json records.
+
+    Adjacent walk-forward windows share a boundary date (end of window N == start
+    of window N+1), so ts_bars can contain duplicate timestamps.  Keep the last
+    occurrence per date (later window has more training context) and preserve
+    ascending time order so lightweight-charts doesn't throw on duplicate times.
+    """
+    seen: dict = {}
     for b in ts_bars:
         entry: dict = {"time": b["time"]}
         for k in _DASHBOARD_FEATURE_KEYS:
             entry[k] = b.get(k)
-        rows.append(entry)
-    return rows
+        seen[b["time"]] = entry  # later window overwrites earlier for same date
+    return list(seen.values())
 
 
 def _predictions_from_timeseries(ts_bars: list[dict]) -> list[dict]:
-    """Extract ML prediction columns from timeseries_bars.json records."""
+    """Extract ML prediction columns from timeseries_bars.json records.
+
+    Deduplicates by time for the same reason as _features_from_timeseries.
+    """
     pred_keys = ("dir_class", "dir_conf", "p_up", "p_down", "p_neutral",
                  "range_prob", "vol_magnitude", "meta_take")
-    rows = []
+    seen: dict = {}
     for b in ts_bars:
         entry: dict = {"time": b["time"]}
         for k in pred_keys:
             entry[k] = b.get(k)
-        rows.append(entry)
-    return rows
+        seen[b["time"]] = entry
+    return list(seen.values())
 
 
 def _build_trades(windows_raw: list[dict], symbol: str) -> list[dict]:
