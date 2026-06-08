@@ -64,6 +64,7 @@
   - [Exp 25 — context_bars 60 → 252: Proper iv_rank in OOS](#experiment-25--context_bars-60--252-proper-iv_rank-in-oos)
   - [Exp 26 — iv_rank_rise_threshold in Search Space](#experiment-26--iv_rank_rise_threshold-in-search-space)
   - [Exp 27 — Drawdown-from-60d-High Gate](#experiment-27--drawdown-from-60d-high-gate)
+  - [Exp 28 — Range Predictor Quality Gate (Bug 1+2 Fixed)](#experiment-28--range-predictor-quality-gate-bug-12-fixed)
 - [Experiment Template](#experiment-template)
 
 ---
@@ -100,7 +101,8 @@
 | 24 | *(killed — signal failure)* | 365/60/60/5, partial | — | — | — | — | — | **10d return gate reverted**: Sep/Oct 2023 training corrections overlap with W12 signal range; gate distorted W01/W02 Optuna training → 0 trades; no clean threshold exists |
 | 25 | `QQQ_365d_..._iron_condor_..._20260607_1353` | 365/63/21/5, 33 W ⚠️ | −2.55% / −$2,550 | — | 63 | −0.71 | 21/33 | **context_bars 252 confirmed**: iv_rank_rise_10d now populated for all entries; losses mean rise=+0.127 vs wins mean=−0.057; signal exists but overlaps require per-window Optuna tuning; ran with OLD step config (21d) |
 | 26 | `QQQ_365d_iron_condor_20260607_2323` | 365/60/60/5, 12 W | +3.76% / +$3,713 | +3.04% / +$3,024 | 15 / 23 | **10.50** / 4.58 | 7/12 | **New series high Sharpe 10.50**: per-window iv_rank_rise_threshold tuning works; thresholds span 0.278–0.578; opt beats ablation (+10.50 vs +4.58); W12 tariff shock still loses (1 trade −$247) |
-| 27 | *(running)* | 365/60/60/5, 12 W | — | — | — | — | — | **pct_from_60d_high gate**: new drawdown gate [-0.15,-0.05] + iv_rank_rise upper bound widened 0.60→0.70 + 250 trials; targets W12 slow-grind failure mode |
+| 27 | `QQQ_365d_iron_condor_20260608_0507` | 365/60/60/5, 12 W | +1.13% / +$1,130 | +3.04% / +$3,024 | 11 / 23 | 4.72 / 4.58 | 5/12 | **pct_from_60d_high gate failed**: W06/W07/W08 over-blocked by -0.073–-0.097 thresholds on normal bull pullbacks; W12 still loses (-$240, threshold -0.102 but entry at -10.2% drawdown, gate too loose); opt regressed from 10.50 to 4.72 |
+| 28 | *(pending)* | 365/60/60/5, 12 W | — | — | — | — | — | **Range predictor quality gate (Bug 1+2 fixed)**: symbol now passed to predict(); weighted-edge MIN_EDGE replaces simple average; min_edge_over_baseline [0.02,0.15] in search space; drawdown gate removed |
 
 Config format: `train_days / test_days / step_days / gap_days`.
 All experiments: QQQ, iron_condor only, TPE sampler seed 42, $100k initial capital.
@@ -3327,7 +3329,155 @@ Stacking two independent gates risks 0-trade windows in regimes where both fire 
 
 ### Results — Optimized
 
-*(Pending — experiment running)*
+| Metric | Value |
+|--------|-------|
+| Total return | +1.13% / +$1,130 |
+| Total P&L | +$1,130 |
+| Total trades | 11 |
+| Win rate | 63.64% |
+| Sharpe ratio | **4.72** |
+| Sortino ratio | 11.68 |
+| Max drawdown | 0.44% |
+| Profit factor | 1.90 |
+| Active windows | 5/12 |
+
+### Results — Ablation
+
+| Metric | Value |
+|--------|-------|
+| Total return | +3.04% / +$3,024 |
+| Total trades | 23 |
+| Win rate | 52% |
+| Sharpe ratio | 4.58 |
+| Active windows | 7/12 |
+
+*(Ablation uses frozen defaults from Exp 18; same parameters as Exp 26 ablation — identical result.)*
+
+### Per-Window Breakdown
+
+| Window | OOS Period | Trades | P&L | Win Rate | iv_rise_thr | pct_high_thr | Notes |
+|--------|-----------|--------|-----|----------|-------------|--------------|-------|
+| W01 | 2024-05-19 → 2024-07-18 | 1 | +$441 | 100% | 0.463 | −0.140 | |
+| W02 | 2024-07-18 → 2024-09-16 | 0 | — | — | 0.519 | −0.134 | Dead zone |
+| W03 | 2024-09-16 → 2024-11-15 | 2 | +$206 | 50% | 0.261 | −0.089 | |
+| W04 | 2024-11-15 → 2025-01-14 | 4 | +$644 | 75% | 0.258 | −0.148 | |
+| W05 | 2025-01-14 → 2025-03-15 | 0 | — | — | 0.519 | −0.134 | Dead zone |
+| W06 | 2025-03-15 → 2025-05-14 | 0 | — | — | 0.562 | **−0.083** | **Over-blocked** — was profitable in Exp 26 |
+| W07 | 2025-05-14 → 2025-07-13 | 0 | — | — | 0.300 | **−0.097** | **Over-blocked** — was profitable in Exp 26 |
+| W08 | 2025-07-13 → 2025-09-11 | 0 | — | — | 0.373 | **−0.073** | **Over-blocked** — was profitable in Exp 26 |
+| W09 | 2025-09-11 → 2025-11-10 | 0 | — | — | 0.519 | −0.134 | Dead zone |
+| W10 | 2025-11-10 → 2026-01-09 | 0 | — | — | 0.519 | −0.134 | Dead zone |
+| W11 | 2026-01-09 → 2026-03-10 | 3 | +$78 | 67% | 0.255 | −0.091 | |
+| W12 | 2026-03-10 → 2026-05-09 | 1 | −$240 | 0% | 0.613 | **−0.102** | **Gate failed**: entry at −10.2% from 60d high, threshold −0.102 too loose |
+
+### Observations
+
+1. **W06/W07/W08 over-blocked.** Thresholds landed at −0.073 to −0.097 — shallow enough to fire on normal bull-market corrections. All three were profitable in Exp 26 (contributed positive P&L). The gate converted them from winners to dead zones.
+
+2. **W12 still loses.** Entry was made on Mar 10, 2026, when QQQ was ~10.2% below its 60-day rolling high. The threshold of −0.102 should have fired — but the tariff shock drop accelerated *after* the OOS entry date. The gate is backward-looking and cannot catch an entry that precedes the full drawdown. Timing mismatch is fundamental, not a threshold calibration problem.
+
+3. **Trade count collapsed.** 15 trades (Exp 26) → 11 trades (Exp 27). Net effect: 3 profitable windows replaced by dead zones, 1 losing trade survived.
+
+4. **Ablation unchanged from Exp 26.** Frozen-params ablation produces identical 4.58 / +$3,024 result — confirming no infrastructure change affected baseline behavior.
+
+5. **iv_rank_rise upper bound widening (0.60 → 0.70) didn't compensate.** The drawdown gate killed 3 more windows than the iv_rank gate opened up. Net is negative.
+
+### What We Learned
+
+1. **Binary drawdown gates are wrong architecture for W12.** The tariff crash was not a sustained drawdown at entry time — it was a cascade that deepened *after* entry. A threshold on `pct_from_60d_high` can only block entries that are *already* deep in drawdown. By the time QQQ is −16%, the entry opportunity has passed. The gate doesn't solve W12; it just misses the first entry and then misses the recovery.
+
+2. **-0.07 to -0.10 is bull-market noise territory.** Normal QQQ corrections in a rising market routinely hit −8% to −10% from the recent high. Any threshold in this zone will fire on legitimate range-bound entries. There is no clean separator between "correction in a bull market" and "start of a crash" at this threshold granularity.
+
+3. **`pct_from_60d_high_threshold` removed from Exp 28 search space.** The gate is architecturally flawed for the problem it was designed to solve. It will remain in `engine.py` as dead code (default −1.0 = disabled) for potential future use with a forward-looking signal (e.g., VIX above 30 AND drawdown > 15%).
+
+4. **W12 requires a regime-aware forward signal, not a drawdown filter.** VIX > 30 at entry time or a GARCH-predicted volatility spike are the next candidates. Deferred to Exp 29+.
+
+### What Changed for Exp 28
+
+- `pct_from_60d_high_threshold` removed from search space (gate disabled, default −1.0)
+- `iv_rank_rise_threshold` upper bound reverted 0.70 → 0.60
+- Two bugs fixed in `RangePredictor.predict()`:
+  - **Bug 1**: `symbol` was never passed → `sym_data` was always `None` → MIN_EDGE check was dead code in all prior experiments
+  - **Bug 2**: MIN_EDGE used simple average of all model scores; anti-predictive models (oujump AUROC=0.25) dragged down good ones (msgarch AUROC=0.75). Fixed to use fitted-weights-aware edge
+- `min_edge_over_baseline` added to search space [0.02, 0.15] — Optuna can now find the right quality threshold per window
+- Total search space: 8 params (same count as Exp 27)
+
+---
+
+## Experiment 28 — Range Predictor Quality Gate (Bug 1+2 Fixed)
+
+**Archive:** *(pending)*
+**Date:** 2026-06-08
+**Status:** Running
+
+### Setup
+
+- Walk-forward config: 365d train / 60d test / 60d step / 5d gap → **12 windows**
+- Test period covered: May 2023 – May 2026 (3 years)
+- Strategies: iron_condor only
+- Optuna: 250 trials, patience 50, min_trades 10, n_jobs 6
+- context_bars: min(252, len(train_df))
+- Branch: `Validation-branch-1`
+- Run command:
+  ```
+  python -u scripts/run_integration_test.py --symbols QQQ --years 3 --skip-backfill \
+    --strategies iron_condor --wf-n-jobs 6 --wf-trials 250 --wf-patience 50
+  ```
+- Log: `logs/exp28_stdout.log`
+
+**Search space (8 params):**
+
+| Parameter | Range | Change vs Exp 27 |
+|-----------|-------|-----------------|
+| `delta_short` | [0.15, 0.30] | unchanged |
+| `max_hold_days` | [14, 40] | unchanged |
+| `wing_k` | [0.30, 2.00] | unchanged |
+| `iv_rank_rise_threshold` | [0.25, **0.60**] | upper bound reverted 0.70→0.60 |
+| `min_edge_over_baseline` | [**0.02, 0.15**] | **NEW** — replaces `pct_from_60d_high_threshold` |
+| `hurst_regime_threshold` | [0.08, 0.30] | unchanged |
+| `hurst_regime_penalty` | [0.00, 0.25] | unchanged |
+| `multifractal_max_width` | [0.30, 0.65] | unchanged |
+
+**Frozen params (ablation defaults):** stop_loss_pct=0.35, profit_target_pct=0.50, trailing_stop_fraction=0.70
+
+### Motivation
+
+Two bugs were silently present since Exp 12 (the first experiment using `RangePredictor`):
+
+**Bug 1 — symbol never passed:** `engine.py` called `self._range_predictor.predict(hist, market_context=...)` without `symbol=self._symbol`. Inside `predict()`, the guard is `if symbol and symbol in self._symbol_models`. Empty string is falsy, so `sym_data` was always `None`. The entire MIN_EDGE quality gate was dead code. `RangePredictor` was making predictions in all windows regardless of CV skill.
+
+**Bug 2 — average-based edge check:** Even with sym_data populated, the MIN_EDGE check computed `mean(cv_scores) - 0.50`. If oujump AUROC=0.25 and msgarch AUROC=0.75, average edge = 0.00 — the predictor would be silenced even though msgarch is genuinely useful. After Bug 1 fix, this would incorrectly veto skilled models in mixed-quality windows. Fixed to use fitted-weights-aware edge: anti-predictive models get weight=0 during calibration, so they no longer drag down the edge calculation.
+
+With both bugs fixed, `min_edge_over_baseline` now actually controls prediction quality. Adding it to the search space lets Optuna decide per window: loose threshold (0.02–0.05) for windows where the predictor is skilled, tight threshold (0.10–0.15) for windows with borderline CV scores.
+
+**Target:** Recover and exceed Exp 26's Sharpe 10.50. Exp 27 (4.72) is the failure baseline to avoid.
+
+### Assumptions Going In
+
+1. **Windows with genuine range predictor skill will benefit.** W01–W04 had non-zero fitted weights in Exp 26. With Bug 1 fixed, these windows can now use the predictor's quality gate as intended. Optuna should converge to low `min_edge_over_baseline` (0.02–0.05) in these windows. (Medium confidence.)
+
+2. **W06/W07/W08 recover.** These windows were over-blocked by the drawdown gate. With `pct_from_60d_high_threshold` removed, they should revert to Exp 26 behavior (profitable). (High confidence — direct revert.)
+
+3. **W05/W09/W10 remain dead zones.** These windows had 0 trades in every experiment from Exp 18 onward. They are structural dead zones driven by market regime, not parameter tuning. (High confidence.)
+
+4. **W12 still loses.** The root cause is regime-shift (tariff crash not in training data). No parameter change addresses this. (High confidence.)
+
+5. **Sharpe exceeds 10.50.** Recovering W06/W07/W08 + potential quality-gate improvement in active windows should push the Sharpe above Exp 26's baseline. (Medium confidence — depends on per-window predictor skill.)
+
+### Premortem Analysis
+
+**Risk 1: Bug fix reveals predictor is mostly noise (medium)**
+If most windows have low weighted edge (<0.02), `min_edge_over_baseline` converges to near-zero and the bug fix changes nothing. The predictor was already making predictions before (Bug 1 bypassed the check), so behavior may be unchanged.
+
+**Risk 2: W06/W07/W08 were dead for another reason (low)**
+These windows had 0 trades in Exp 27 due to the drawdown gate. With gate removed, they should produce trades. If they don't, there's a second gating mechanism (possibly iv_rank_rise_threshold at a tight value) — investigate per-window params.
+
+**Risk 3: Optuna overfits `min_edge_over_baseline` in thin windows (low-medium)**
+In windows with few training trades, Optuna may push `min_edge_over_baseline` to 0.15 to silence the predictor entirely as a noise-suppression hack. This is legitimate behavior — it means the predictor has no signal in that window — but it makes the parameter's contribution hard to distinguish from a simple "predictor off" flag.
+
+### Results — Optimized
+
+*(Pending)*
 
 ### Results — Ablation
 
@@ -3399,4 +3549,4 @@ Copy this section to add a new experiment:
 
 ---
 
-*Last updated: 2026-06-06 (Exp 25 pre-run — context_bars 60→252 to fix iv_rank OOS quality; diagnostic run to collect per-window iv_rank_rise_10d values)*
+*Last updated: 2026-06-08 (Exp 27 results + Exp 28 section added — drawdown gate failed, range predictor bugs fixed)*
