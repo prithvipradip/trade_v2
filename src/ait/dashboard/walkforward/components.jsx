@@ -151,24 +151,30 @@ function ChartArea({ data, activeSeries, theme, onHover, onPin, pinned, extHover
 
   useEffect(() => {
     if (!chartRef.current) return;
-    // windowRange is passed into render() so the zoom is applied atomically
-    // inside chart construction — no separate effect needed (avoids race condition
-    // where fitContent() in render() would clobber a subsequent setWindowRange()).
-    chartRef.current.render({
-      data, activeSeries, theme, windowRange,
-      onHover: t => onHoverRef.current && onHoverRef.current(t),
-      onMarkerClick: tr => onPinRef.current && onPinRef.current(tr),
-    });
+    try {
+      // windowRange is passed into render() so the zoom is applied atomically
+      // inside chart construction — no separate effect needed (avoids race condition
+      // where fitContent() in render() would clobber a subsequent setWindowRange()).
+      chartRef.current.render({
+        data, activeSeries, theme, windowRange,
+        onHover: t => onHoverRef.current && onHoverRef.current(t),
+        onMarkerClick: tr => onPinRef.current && onPinRef.current(tr),
+      });
+    } catch (e) { console.error("chart render error:", e); }
   }, [activeSeries, theme, data, windowRange]);
 
   useEffect(() => {
     if (!chartRef.current) return;
-    if (pinned) chartRef.current.pinTrade(pinned, true); else chartRef.current.unpin();
+    try {
+      if (pinned) chartRef.current.pinTrade(pinned, true); else chartRef.current.unpin();
+    } catch (e) { console.error("pinTrade error:", e); }
   }, [pinned]);
 
   useEffect(() => {
     if (!chartRef.current) return;
-    if (extHoverTime) chartRef.current.setHoverTime(extHoverTime); else chartRef.current.clearHover();
+    try {
+      if (extHoverTime) chartRef.current.setHoverTime(extHoverTime); else chartRef.current.clearHover();
+    } catch (e) {}
   }, [extHoverTime]);
 
   return <div className="chart-host" ref={ref} />;
