@@ -70,6 +70,7 @@ class Backtester:
         multifractal_max_width: float = 0.50,
         aekf_veto_threshold: float = 0.60,
         iv_rank_rise_threshold: float = 0.30,
+        pct_from_60d_high_threshold: float = -1.0,
         features_cache: pd.DataFrame | None = None,
         max_concurrent_positions: int = 1,
         max_entry_vol_annual: float = 0.80,
@@ -127,6 +128,7 @@ class Backtester:
         self._multifractal_max_width = multifractal_max_width
         self._aekf_veto_threshold = aekf_veto_threshold
         self._iv_rank_rise_threshold = iv_rank_rise_threshold
+        self._pct_from_60d_high_threshold = pct_from_60d_high_threshold
         self._features_cache = features_cache
         self._max_concurrent_positions = max_concurrent_positions
         self._max_entry_vol_annual = max_entry_vol_annual
@@ -463,6 +465,30 @@ class Backtester:
                             strategy=strategy,
                             iv_rank_rise=round(iv_rank_rise, 4),
                             threshold=self._iv_rank_rise_threshold,
+                        )
+                        continue
+
+            # Drawdown-from-60d-high gate: block iron condor entry when the underlying is
+            # in a sustained decline relative to its 60-day rolling high.  Catches slow-grind
+            # bear phases that iv_rank_rise misses (W12 tariff shock: rise=0.021 but -16% from high).
+            # Default threshold -1.0 disables the gate; Optuna tunes per window in [-0.15, -0.05].
+            if strategy == "iron_condor" and self._pct_from_60d_high_threshold > -0.99:
+                _close_series = hist["Close"]
+                _rolling_high = _close_series.rolling(min(60, len(_close_series))).max().iloc[-1]
+                if _rolling_high and _rolling_high > 0:
+                    _pct_from_high = (float(_close_series.iloc[-1]) - float(_rolling_high)) / float(_rolling_high)
+                    _entry_decision["pct_from_60d_high"] = round(_pct_from_high, 4)
+                    if _pct_from_high < self._pct_from_60d_high_threshold:
+                        _entry_decision["drawdown_veto"] = {
+                            "pct_from_high": round(_pct_from_high, 4),
+                            "threshold": self._pct_from_60d_high_threshold,
+                        }
+                        log.debug(
+                            "drawdown_veto_fired",
+                            component="backtesting.engine",
+                            strategy=strategy,
+                            pct_from_high=round(_pct_from_high, 4),
+                            threshold=self._pct_from_60d_high_threshold,
                         )
                         continue
 

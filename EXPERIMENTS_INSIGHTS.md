@@ -8,6 +8,66 @@
 
 ---
 
+## Table of Contents
+
+- [Summary Table](#summary-table)
+- [Principles Distilled](#principles-distilled)
+  - [P1 — Regime filters out of search space](#p1--regime-filter-params-must-not-be-in-the-optimizer-search-space)
+  - [P2 — Ablation is a mandatory baseline](#p2--ablation-is-a-mandatory-baseline)
+  - [P3 — Active window count over Sharpe](#p3--active-window-count-matters-more-than-sharpe-or-win-rate-in-small-samples)
+  - [P4 — Shorter test windows expose overfitting](#p4--shorter-test-windows-expose-overfitting-more-clearly)
+  - [P5 — Search space dimensions reflect problem geometry](#p5--optimization-search-space-dimensions-should-reflect-the-problem-geometry)
+  - [P6 — Archive infrastructure must be reliable](#p6--archive-infrastructure-must-be-reliable-before-experiment-data-can-be-trusted)
+  - [P7 — Spread model params fully wired](#p7--spread-model-parameters-must-be-fully-wired-yaml--walkforwardconfig--backtester)
+  - [P8 — iv_floor in search space creates train/OOS mismatch](#p8--iv_floor-in-the-optuna-search-space-creates-trainoos-mismatch)
+  - [P9 — Unforwarded params are wasted dimensions](#p9--search-space-params-not-forwarded-to-the-backtester-are-wasted-dimensions)
+  - [P10 — VIX must be a time series](#p10--vix-must-be-loaded-as-a-time-series-for-iv-estimation-a-constant-is-always-wrong)
+  - [P11 — FeatureEngine must receive OHLCV-only input](#p11--featureengine-must-receive-ohlcv-only-input-never-dfcopy-with-auxiliary-columns)
+  - [P12 — OOS window overlap distorts metrics](#p12--oos-window-overlap-step--test-distorts-aggregate-metrics)
+  - [P13 — backtest_end exits are estimates](#p13--backtest_end-exits-are-b-s-mark-to-market-estimates-not-realized-pl)
+  - [P14 — Optuna max_hold_days floor](#p14--optuna-never-voluntarily-chose-max_hold_days-below-26-in-a-14-40-search-space)
+  - [P15 — Ablation beats per-window Optuna when signal is sparse](#p15--ablation-fixed-global-best-params-consistently-outperforms-per-window-optuna-when-training-signal-is-sparse)
+  - [P16 — Wall-clock time is regime-dependent](#p16--optimization-wall-clock-time-is-regime-dependent-high-vol-training-windows-run-2-more-optuna-trials)
+  - [P17 — Dead zone is regime-driven](#p17--dead-zone-sep-2025may-2026-is-unambiguously-regime-driven-not-a-window-design-artifact)
+  - [P18 — Removing direction gate reverses Opt < Abl trend](#p18--removing-the-direction-gate-reverses-the-section-e--section-f-trend-optimized-now-beats-ablation)
+  - [P19 — Optuna needs ML models in optimizer](#p19--optuna-optimizes-against-a-different-signal-than-oos-when-ml-models-are-not-passed-to-the-optimizer)
+  - [P20 — Longer training shifts range model calibration](#p20--longer-training-window-shifts-the-range-models-probability-calibration-adversarially-for-low-vol-regimes)
+  - [P21 — Val-slice requires sufficient trade density](#p21--val-slice-holdout-requires-sufficient-trade-density-to-give-the-optimizer-a-reliable-signal)
+- [Open Questions](#open-questions)
+- **Experiments**
+  - [Exp 1 — First Integration Test](#experiment-1--first-integration-test)
+  - [Exp 2 — Baseline with Shorter Windows](#experiment-2--baseline-with-shorter-windows)
+  - [Exp 3 — Confirming the Pattern](#experiment-3--confirming-the-pattern)
+  - [Exp 4 — Vol Gate Adjustment](#experiment-4--vol-gate-adjustment)
+  - [Exp 5 — Removing Regime Filters from Search Space](#experiment-5--removing-regime-filters-from-search-space)
+  - [Exp 6 — Spread Model Wiring Fix + Market Regime Drop-Off](#experiment-6--spread-model-wiring-fix--market-regime-drop-off)
+  - [Exp 7 — ML Predictions Activated (implied_vol NaN Bug Fixed)](#experiment-7--ml-predictions-activated-implied_vol-nan-bug-fixed)
+  - [Exp 8 — Non-Overlapping Windows + Restricted max_hold + Parallel Optimization](#experiment-8--non-overlapping-windows--restricted-max_hold--parallel-optimization)
+  - [Exp 9 — Direction Gate Removed + Wing-Derived Range Threshold](#experiment-9--direction-gate-removed--wing-derived-range-threshold)
+  - [Exp 10 — Optuna Consistency Fix: ML Models Fed Into Optimization](#experiment-10--optuna-consistency-fix-ml-models-fed-into-optimization)
+  - [Exp 11 — 730-Day Training Window (Q16: Dead-Zone Recovery Attempt)](#experiment-11--730-day-training-window-q16-dead-zone-recovery-attempt)
+  - [Exp 12 — 60-Day Windows + Relaxed max_hold + Intraday OOS + Fitted Weights](#experiment-12--60-day-windows--relaxed-max_hold--intraday-oos--fitted-weights)
+  - [Exp 13 — GARCH Ensemble + Position Concentration Fix + VIX Fix](#experiment-13--garch-ensemble--position-concentration-fix--vix-fix)
+  - [Exp 14 — First Functional GARCH Weight (GARCH Still Zero)](#experiment-14--first-functional-garch-weight-garch-still-zero)
+  - [Exp 15 — GARCH 5-Day CV Horizon (First Real AUROC, Worse Results)](#experiment-15--garch-5-day-cv-horizon-first-real-auroc-worse-results)
+  - [Exp 16 — GARCH Paused; Lock Exp 13 Baseline](#experiment-16--garch-paused-lock-exp-13-baseline)
+  - [Exp 17 — MS-GARCH + OU-Kou-GARCH Sequential Pre-Training (KILLED)](#experiment-17--ms-garch--ou-kou-garch-with-sequential-pre-training-partial--killed)
+  - [Exp 17v2 — MS-GARCH + OU-Kou-GARCH CV Single-Class Fix (P36)](#experiment-17v2--ms-garch--ou-kou-garch-with-cv-single-class-fix-p36)
+  - [Exp 17v3 — MS-GARCH + OU-Kou-GARCH Horizon-Scaled CV Threshold (P37 Fix)](#experiment-17v3--ms-garch--ou-kou-garch-with-horizon-scaled-cv-threshold-p37-fix)
+  - [Exp 18 — Reduced Search Space: 6 Params vs 9 (H1 Test)](#experiment-18--reduced-search-space-6-params-vs-9-h1-test)
+  - [Exp 19 — Train/Val Split Inside Optuna Objective (H2 Test)](#experiment-19--trainval-split-inside-optuna-objective-h2-test)
+  - [Exp 20 — Signal Quality: AEKF Gate + Fractal Hard-Veto + Direction CV Fix](#experiment-20--signal-quality-aekf-gate--fractal-hard-veto--direction-cv-fix)
+  - [Exp 21 — Isolate Changes 1+3+4 With Hard Veto Disabled](#experiment-21--isolate-changes-134-with-hard-veto-disabled)
+  - [Exp 22 — Regime Gate: Block Iron Condor Entries in Trending-Down Regime](#experiment-22--regime-gate-block-iron-condor-entries-in-trending-down-regime)
+  - [Exp 23 — Tighten Regime Threshold: price_vs_sma_20 < -0.05](#experiment-23--tighten-regime-threshold-price_vs_sma_20--005)
+  - [Exp 24 — High-Vol Falling-Market Gate (KILLED — Signal Failure)](#experiment-24--high-vol-falling-market-gate-killed--signal-failure)
+  - [Exp 25 — context_bars 60 → 252: Proper iv_rank in OOS](#experiment-25--context_bars-60--252-proper-iv_rank-in-oos)
+  - [Exp 26 — iv_rank_rise_threshold in Search Space](#experiment-26--iv_rank_rise_threshold-in-search-space)
+  - [Exp 27 — Drawdown-from-60d-High Gate](#experiment-27--drawdown-from-60d-high-gate)
+- [Experiment Template](#experiment-template)
+
+---
+
 ## Summary Table
 
 | # | Archive | Config | Opt. Return | Ablation | Trades | Sharpe | Active W | Key Change |
@@ -40,10 +100,11 @@
 | 24 | *(killed — signal failure)* | 365/60/60/5, partial | — | — | — | — | — | **10d return gate reverted**: Sep/Oct 2023 training corrections overlap with W12 signal range; gate distorted W01/W02 Optuna training → 0 trades; no clean threshold exists |
 | 25 | `QQQ_365d_..._iron_condor_..._20260607_1353` | 365/63/21/5, 33 W ⚠️ | −2.55% / −$2,550 | — | 63 | −0.71 | 21/33 | **context_bars 252 confirmed**: iv_rank_rise_10d now populated for all entries; losses mean rise=+0.127 vs wins mean=−0.057; signal exists but overlaps require per-window Optuna tuning; ran with OLD step config (21d) |
 | 26 | `QQQ_365d_iron_condor_20260607_2323` | 365/60/60/5, 12 W | +3.76% / +$3,713 | +3.04% / +$3,024 | 15 / 23 | **10.50** / 4.58 | 7/12 | **New series high Sharpe 10.50**: per-window iv_rank_rise_threshold tuning works; thresholds span 0.278–0.578; opt beats ablation (+10.50 vs +4.58); W12 tariff shock still loses (1 trade −$247) |
+| 27 | *(running)* | 365/60/60/5, 12 W | — | — | — | — | — | **pct_from_60d_high gate**: new drawdown gate [-0.15,-0.05] + iv_rank_rise upper bound widened 0.60→0.70 + 250 trials; targets W12 slow-grind failure mode |
 
 Config format: `train_days / test_days / step_days / gap_days`.
 All experiments: QQQ, iron_condor only, TPE sampler seed 42, $100k initial capital.
-Exp 1–10: 50 trials. Exp 8–11: 200 trials, patience 50, min_trades 7, n_jobs 6.
+Exp 1–10: 50 trials. Exp 8–11: 200 trials, patience 50, min_trades 7, n_jobs 6. Exp 12–26: 200 trials, patience 50, min_trades 10, n_jobs 6. Exp 27+: 250 trials, patience 50, min_trades 10, n_jobs 6.
 
 > **⚠️ Lost archives (5 experiments):** The `data/experiment-archives` branch is missing the run directories for Exp 1, 6, 7, 8, and 9. Exp 1 was never committed to the branch (pre-dates the archiving workflow). Exp 6–9 were added but subsequently deleted by an accidental `git rm` in a prior commit and are not recoverable from git history. Results and parameters are fully preserved in this document. Re-run commands are in each experiment's section below. **To re-run exactly**, check out the git commit noted in the section header first — the search space has evolved since those experiments.
 
@@ -3188,9 +3249,101 @@ python -u scripts/run_integration_test.py \
 
 ### What Changed for Exp 27
 
-- W12 (tariff shock) analysis: consider adding a macro entry gate — "don't enter if QQQ is down >X% from N-day high" in the search space
-- Consider expanding the 3-year data window to 4 years to capture more training regimes for the Q1 2026 windows
-- `iv_rank_rise_threshold` stays in the search space; the range [0.25, 0.60] was appropriate
+- W12 (tariff shock) analysis: added `pct_from_60d_high_threshold` gate in search space [-0.15, -0.05]
+- `iv_rank_rise_threshold` upper bound widened from 0.60 → 0.70 to give Optuna more room now that the drawdown gate handles the slow-grind case
+- Trials increased from 200 → 250 (8-param space vs 7)
+- 4-year data window deferred — 3 years kept to maintain comparability
+
+---
+
+## Experiment 27 — Drawdown-from-60d-High Gate
+
+**Archive:** *(pending)*
+**Date:** 2026-06-07
+**Status:** Running
+
+### Setup
+
+- Walk-forward config: 365d train / 60d test / 60d step / 5d gap → **12 windows**
+- Test period covered: May 2023 – May 2026 (3 years)
+- Strategies: iron_condor only
+- Optuna: 250 trials, patience 50, min_trades 10, n_jobs 6
+- context_bars: min(252, len(train_df))
+- Run command:
+  ```
+  python -u scripts/run_integration_test.py --symbols QQQ --years 3 --skip-backfill \
+    --strategies iron_condor --wf-n-jobs 6 --wf-trials 250 --wf-patience 50
+  ```
+- Log: `logs/exp27_stdout.log`
+
+**Search space (8 params):**
+
+| Parameter | Range | Change vs Exp 26 |
+|-----------|-------|-----------------|
+| `delta_short` | [0.15, 0.30] | unchanged |
+| `max_hold_days` | [14, 40] | unchanged |
+| `wing_k` | [0.30, 2.00] | unchanged |
+| `iv_rank_rise_threshold` | [0.25, **0.70**] | upper bound widened 0.60→0.70 |
+| `pct_from_60d_high_threshold` | [**-0.15, -0.05**] | **NEW** — drawdown gate |
+| `hurst_regime_threshold` | [0.08, 0.30] | unchanged |
+| `hurst_regime_penalty` | [0.00, 0.25] | unchanged |
+| `multifractal_max_width` | [0.30, 0.65] | unchanged |
+
+**Frozen params (ablation defaults):** stop_loss_pct=0.35, profit_target_pct=0.50, trailing_stop_fraction=0.70
+
+### Motivation
+
+Exp 26 identified two distinct failure modes:
+1. **Fast IV spike** (Yen-carry, election) — caught by `iv_rank_rise_threshold`
+2. **Slow persistent decline** (W12 tariff shock: −16% from 60d high, iv_rank_rise=0.021) — completely missed by the IV-rise gate
+
+W12 was the single largest drag on every experiment from Exp 21 onward. The `pct_from_60d_high` gate targets type-2 failures directly: if QQQ has been grinding down from its 60-day rolling high by more than the threshold, skip the entry.
+
+**Default (ablation):** `-1.0` (disabled — gate never fires, preserving comparability)
+
+### Assumptions Going In
+
+1. **W12 will be blocked** — tariff shock peak-to-trough was ≈−16%, well inside the [-0.15, -0.05] search range. A threshold in [-0.15, -0.12] should fire. (Medium confidence — W12 is the target, but the slow drawdown started gradually and Optuna must find the right window for this specific window's training data.)
+
+2. **Win rate and profit factor will improve** — removing the one confirmed bad trade type (slow-grind entries) should push win rate above Exp 26's 73% and profit factor above 6.34. (Medium-high confidence.)
+
+3. **Trade count recovers toward 18–23** — widening `iv_rank_rise_threshold` to 0.70 should re-admit some marginal entries that 0.60 blocked, partially offsetting any new blocks from the drawdown gate. (Medium confidence — depends on Optuna's per-window tuning.)
+
+4. **Sharpe exceeds 10.50** — combination of W12 blocking + trade count recovery should lift both win rate and denominator stability. (Low-medium confidence — W12 was only 1 loss out of 15 trades; the delta is limited.)
+
+### Premortem Analysis
+
+**Risk 1: Optuna distortion (medium)**
+With 8 params and 250 trials, Optuna may overfit the drawdown threshold in training windows that don't resemble OOS. Mitigation: `patience=50` and `min_trades=10` both push back against degenerate solutions that block everything.
+
+**Risk 2: W12 not fully blocked (medium)**
+The tariff shock's drawdown at OOS entry (Mar 10) was ≈−16% from the 60-day high. If training data shows entries at -8% to -12% drawdown that were also bad, Optuna may converge to a threshold like -0.12 — which would catch W12. But if training data is sparse near that zone, it may not. We'll verify directly in the per-window breakdown.
+
+**Risk 3: W04 over-blocked (low)**
+W04 had an 18% correction in training data (Oct 2023) but recovered quickly. If the threshold lands at -0.05 to -0.08, it might block some legitimate recovery entries. Monitor W04 trade count vs Exp 26.
+
+**Risk 4: Trade count collapse (low-medium)**
+Stacking two independent gates risks 0-trade windows in regimes where both fire simultaneously. With 5 dead zones already, adding more is costly. The widened iv_rank_rise upper bound (0.70) is intended to compensate — if it doesn't, Exp 28 may need to loosen one gate.
+
+### Results — Optimized
+
+*(Pending — experiment running)*
+
+### Results — Ablation
+
+*(Pending)*
+
+### Per-Window Breakdown
+
+*(Pending)*
+
+### Observations
+
+*(Pending)*
+
+### What We Learned
+
+*(Pending)*
 
 ---
 

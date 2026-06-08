@@ -39,9 +39,16 @@ IRON_CONDOR_SPACE: dict[str, tuple] = {
     "wing_k":                 ("float", 0.30, 2.00),
     # Exp 26: iv_rank_rise gate threshold tunable per window. Fixed 0.30 was blocking
     # profitable W01/W02 entries (gradual IV drift pre-crash) once context_bars=252
-    # made iv_rank meaningful. Range [0.25, 0.60]: 0.25 fires on sustained rises,
-    # 0.60 only fires on genuine spikes (Yen-carry / tariff-shock level events).
-    "iv_rank_rise_threshold": ("float", 0.25, 0.60),
+    # made iv_rank meaningful. Exp 27: upper bound widened 0.60→0.70 because W12 slow
+    # grind (rise=0.021) bypasses this gate entirely — need more room for the new
+    # pct_from_60d_high gate to handle structural drawdown environments.
+    "iv_rank_rise_threshold": ("float", 0.25, 0.70),
+    # Exp 27: block entry when market is in a sustained drawdown from 60-day high.
+    # Catches slow-grind bear phases (W12 tariff shock: -16% from 60d high) that
+    # iv_rank_rise misses because IV rises gradually rather than spiking.
+    # Range [-0.15, -0.05]: -0.05 fires on shallow 5% pullbacks, -0.15 only blocks
+    # deep structural drawdowns. Default -1.0 = disabled (ablation baseline).
+    "pct_from_60d_high_threshold": ("float", -0.15, -0.05),
     **FRACTAL_GATE_SPACE,
 }
 
