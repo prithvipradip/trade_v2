@@ -329,13 +329,15 @@
       if (trade) {
         const t = THEMES[this.theme];
         trade.legs.forEach(leg => {
-          const isShort = leg.type.startsWith("short");
-          const pl = this.candle.createPriceLine({
-            price: leg.strike, color: isShort ? t.down : t.bb, lineWidth: 1,
-            lineStyle: isShort ? 0 : 2, axisLabelVisible: true,
-            title: leg.type.replace("_", " ") + " " + leg.strike,
-          });
-          this._strikeLines.push(pl);
+          try {
+            const isShort = leg.type && leg.type.startsWith("short");
+            const pl = this.candle.createPriceLine({
+              price: leg.strike, color: isShort ? t.down : t.bb, lineWidth: 1,
+              lineStyle: isShort ? 0 : 2, axisLabelVisible: true,
+              title: (leg.type || "").replace("_", " ") + " " + leg.strike,
+            });
+            this._strikeLines.push(pl);
+          } catch (e) {}
         });
         if (recenter) {
           const bars = this.data.bars;
