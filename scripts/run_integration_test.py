@@ -1196,6 +1196,16 @@ async def _main(args: argparse.Namespace) -> int:
     out = Path(args.output_dir)
     t_start = time.time()
 
+    # Purge stale window files from previous runs so they don't bleed into
+    # the current run's archive metadata (window_*.json files accumulate
+    # across runs since the output dir is reused).
+    out.mkdir(parents=True, exist_ok=True)
+    stale = list(out.glob("window_*.json"))
+    if stale:
+        for f in stale:
+            f.unlink()
+        print(f"\n  Purged {len(stale)} stale window file(s) from {out}")
+
     # A — Backfill
     if not args.skip_backfill:
         await _section_a_backfill(args, out)

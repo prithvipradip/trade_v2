@@ -1,0 +1,36 @@
+============================================================
+  WALK-FORWARD BACKTEST RESULTS
+============================================================
+  Windows:           7
+  Total Trades:      15
+  Total Return:      3.76%
+  Cash-Drag Adj Ret: 13.52%  (idle cash @ 5%)
+------------------------------------------------------------
+  RISK-ADJUSTED
+  Sharpe Ratio:      10.50
+  Sortino Ratio:     33.40  (downside-only vol)
+  Max Drawdown:      0.39%
+------------------------------------------------------------
+  TRADE QUALITY
+  Win Rate:          73.33%
+  Avg Win:           $400.76
+  Avg Loss:          $173.80
+  Win/Loss Ratio:    2.31  (>1 = winners bigger)
+  Expectancy/Trade:  $247.54
+  Best Trade:        $1,046.74
+  Worst Trade:       $-296.83
+  Profit Factor:     6.34
+------------------------------------------------------------
+  CAPITAL EFFICIENCY
+  Utilization:       0.9%  (avg % deployed)
+  RAROC:             397.0%  (return on deployed)
+------------------------------------------------------------
+  CONSISTENCY
+  Profitable Windows:71%
+  Avg Window Return: 0.53%
+------------------------------------------------------------
+  STRATEGY BREAKDOWN:
+    iron_condor               | trades= 15 | win=73% | pnl=$3,713
+  SYMBOL BREAKDOWN:
+    QQQ      | return=3.71% | trades= 15 | sharpe=10.50
+============================================================

@@ -1,0 +1,3 @@
+DATA QUALITY REPORT
+============================================================
+[QQQ] [PASS] 58,225 bars | 751 sessions | 2023-05-26 → 2026-05-29 | coverage=99.4% | sparse=9 | neg_close=0 | high<low=0
