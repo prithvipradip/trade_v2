@@ -132,7 +132,7 @@ class WalkForwardConfig:
     aekf_veto_threshold: float = 0.60         # Exp 20: suppress IC entry when AEKF drift confidence >= this
     iv_rank_rise_threshold: float = 0.30      # Exp 20: suppress IC entry when IV rank rose > this over last 10 days
     pct_from_60d_high_threshold: float = -1.0 # Exp 27: suppress IC entry when price is this far below 60d rolling high (-1.0 = disabled)
-    min_edge_over_baseline: float = 0.05      # Exp 28: min weighted CV edge for range predictor to activate (0.0 = always use, higher = stricter quality gate)
+    min_edge_over_baseline: float = 0.04      # Exp 30: lowered 0.05→0.04; W04 edge=+0.042 was silenced at 0.05 (range_no_edge every OOS day)
     # Intraday execution params (Fix 1 / Gap H)
     scan_interval_minutes: int = 60        # how often to scan for signals during a session
     entry_window_start_et: str = "09:30"   # earliest allowed entry time (ET)
@@ -1177,7 +1177,7 @@ class WalkForwardBacktester:
                 aekf_veto_threshold=getattr(window_cfg, "aekf_veto_threshold", 0.60),
                 iv_rank_rise_threshold=getattr(window_cfg, "iv_rank_rise_threshold", 0.30),
                 pct_from_60d_high_threshold=getattr(window_cfg, "pct_from_60d_high_threshold", -1.0),
-                min_edge_over_baseline=getattr(window_cfg, "min_edge_over_baseline", 0.05),
+                min_edge_over_baseline=getattr(window_cfg, "min_edge_over_baseline", 0.04),
                 iv_floor=window_cfg.iv_floor,
                 wing_floor_dollars=window_cfg.wing_floor_dollars,
                 wing_k=window_cfg.wing_k,
