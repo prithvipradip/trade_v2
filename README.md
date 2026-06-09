@@ -128,12 +128,15 @@ pip install -e .
 ```
 
 This installs all packages from `pyproject.toml`:
-- **Trading**: `ib_insync`, `yfinance`, `polygon-api-client`
+- **Trading**: `ib_insync`, `polygon-api-client`; `yfinance` (fallback data source — no key required)
 - **ML**: `xgboost`, `lightgbm`, `scikit-learn`, `scipy`
-- **Sentiment**: `transformers`, `torch`, `feedparser`, `finnhub-python`
+- **Sentiment**: `transformers>=4.38,<4.45`, `torch>=2.2,<2.3`, `feedparser`, `finnhub-python`
+  - `transformers<4.45` — versions 4.45+ added a security check (CVE-2025-32434) that blocks loading FinBERT's `.bin` weights when torch < 2.6
+  - `torch<2.3` / `numpy<2.0` — Intel Mac ceiling; PyTorch 2.2.x was compiled against NumPy 1.x and breaks with NumPy 2.x
 - **Options**: `py-vollib` (Greeks/IV calculations)
 - **Dashboard**: `streamlit`, `plotly`, `flask`
 - **Infrastructure**: `apscheduler`, `duckdb`, `structlog`, `pydantic`
+- **Optimization**: `optuna` (Bayesian hyperparameter search)
 
 ### 4. Install Interactive Brokers Gateway
 
@@ -313,8 +316,20 @@ python run_orchestrator.py --retrain
 # Generate daily report
 python run_orchestrator.py --report
 
+# Refresh equity fundamental stats (yfinance → DuckDB)
+python run_orchestrator.py --refresh-fundamentals
+
+# Fetch IB news + analyst recommendations → fundamentals.db
+python run_orchestrator.py --fetch-news
+
 # Run walk-forward backtest
 python run_backtest.py --symbols SPY QQQ AAPL --capital 50000
+
+# Walk-forward backtest with per-window Optuna optimization
+python run_backtest.py --symbols SPY QQQ --optimize-per-window --optimize-n-trials 50
+
+# Run Optuna strategy parameter search
+python run_optimizer.py --strategies iron_condor --symbols SPY QQQ --n-trials 100 --objective sharpe_ratio
 
 # View live logs (color-coded)
 python tail_logs.py
@@ -391,6 +406,7 @@ Composite sentiment score per symbol (-1.0 to +1.0):
 - **News** (weight 35%) from Finnhub headlines
 - **Fear & Greed** (weight 40%) from VIX + breadth + momentum
 - **FinBERT** (weight 25%) — local NLP model on headlines
+- **IB News** (weight 20%, configurable) — pre-scored headlines from `fundamentals.db` (when available)
 
 ### Learning Engine ([src/ait/learning/engine.py](src/ait/learning/engine.py))
 Post-market analysis:
@@ -404,15 +420,17 @@ Post-market analysis:
 
 ## Trading Strategies
 
-| Strategy | Market View | Risk Profile | Best When |
-|---|---|---|---|
-| **Iron Condor** | Neutral | Defined (both sides) | IV rank > 50, range-bound |
-| **Short Strangle** | Neutral | Undefined | IV rank > 70, very high premium |
-| **Long Straddle** | Volatility breakout | Defined (debit) | Low IV, expected big move |
-| **Cash-Secured Put** | Bullish | Undefined (buy stock if assigned) | IV rank > 40, want to own |
-| **Covered Call** | Slightly bullish | Capped upside | Own stock, want income |
-| **Bull Call Spread** | Bullish | Defined (debit) | Bullish with cost control |
-| **Bear Put Spread** | Bearish | Defined (debit) | Bearish with cost control |
+All strategies run simultaneously per walk-forward window. Wing widths and strangle deltas adapt dynamically to current implied volatility via `wing_k` and `delta_iv_scale` — both Optuna-optimized per window.
+
+| Strategy | Market View | Risk Profile | Best When | Dynamic Param |
+|---|---|---|---|---|
+| **Iron Condor** | Neutral | Defined (both sides) | IV rank > 50, range-bound | `wing_k` scales wing width to IV |
+| **Put Credit Spread** | Bullish | Defined | IV rank > 40, directional bias | `wing_k` scales spread width to IV |
+| **Short Strangle** | Neutral | Undefined (naked) | IV rank > 70, very high premium | `delta_iv_scale` moves strikes further OTM when IV is elevated |
+| **Long Strangle** | Volatility breakout | Defined (debit) | Low IV, expected large move or IV spike | `delta_iv_scale` moves strikes further OTM to reduce entry cost |
+| **Bull Call Spread** | Bullish | Defined (debit) | Bullish with cost control | Delta-driven via BS |
+| **Bear Put Spread** | Bearish | Defined (debit) | Bearish with cost control | Delta-driven via BS |
+| **Long Call / Put** | Directional | Defined (debit) | High-conviction directional move | Delta-driven via BS |
 
 The bot auto-selects based on:
 - ML direction prediction
@@ -449,6 +467,25 @@ Every trade passes through 13+ risk checks. Key protections:
 ---
 
 ## Monitoring & Dashboards
+
+### Walk-Forward Analysis Dashboard ([http://localhost:8080](http://localhost:8080))
+Interactive analysis dashboard for walk-forward experiment results. Three tabs:
+- **Experiment Analysis** — candlestick chart with trade entry/exit markers, feature sub-panes (RSI, MACD, Bollinger, IV/VIX, Hurst, Sentiment), trade table with hover-to-chart linking, per-trade decision-chain drawer (direction model → range gate → vol gate → meta-label → fractal gate → regime), iron condor leg structure, features at entry.
+- **Optuna Optimization** — per-window trial history, objective-value scatter, parameter-vs-objective plots, best params, pruned-trial breakdown.
+- **Predictor Models** — per-window CV skill (grouped bars), fitted ensemble-weight evolution, member-vs-baseline bars, reliability/calibration curve with per-member toggles, GARCH-family detail (variant, BIC, MS-GARCH regime vols, OU-Kou-GARCH drift params).
+
+**To open:**
+```bash
+# Export real experiment data (run once after each walk-forward)
+python -m ait.dashboard.walkforward.export --runs-dir reports/runs
+
+# Serve the dashboard
+cd src/ait/dashboard/walkforward
+python -m http.server 8080
+# → open http://localhost:8080 in browser (Cmd+Shift+R to bust cache after re-export)
+```
+
+**Data-plot dictionary:** `src/ait/dashboard/walkforward/metric-info.js` — single source of truth for all info-box definitions (hover ⓘ icons). Edit there to update wording without touching JSX.
 
 ### Streamlit Dashboard ([http://localhost:8501](http://localhost:8501))
 Tabs:
@@ -532,6 +569,27 @@ sentiment:
 ```
 Then edit `pyproject.toml` to remove `torch` and `transformers` from dependencies, and reinstall.
 
+### "Numpy is not available" / FinBERT returns None for every headline
+PyTorch 2.2.x was compiled against NumPy 1.x. NumPy 2.x breaks the C-level array API bridge at inference time, causing PyTorch to report "Failed to initialize NumPy: _ARRAY_API not found" and silently fall back to returning `None` for all FinBERT scores.
+
+**Fix:** Downgrade NumPy:
+```bash
+pip install "numpy<2.0"
+```
+The `pyproject.toml` already pins `numpy>=1.26,<2.0` for this reason — if you see this error, a manual `pip install numpy<2.0` restores it. Verify FinBERT is working:
+```bash
+python -c "from ait.sentiment.finbert import FinBERTAnalyzer; f = FinBERTAnalyzer(); print(f.analyze('Apple reports record earnings'))"
+# Should print a float near +0.9, not None
+```
+
+### FinBERT fails to load / "Unable to load weights from pytorch checkpoint"
+`transformers>=4.45` added a security check (CVE-2025-32434) that blocks loading `.bin` checkpoint files when torch < 2.6. `ProsusAI/finbert` only has `.bin` weights (no safetensors format). The project pins `transformers<4.45` to avoid this.
+
+If you upgraded transformers manually and see this error, restore the correct version:
+```bash
+pip install "transformers>=4.38,<4.45"
+```
+
 ### Bot won't start
 - Check Gateway is running: `netstat -ano | grep 4002`
 - Check logs: `tail logs/orchestrator.log`
@@ -551,6 +609,7 @@ trade_v2/
 ├── pyproject.toml              ← Python package config
 ├── run_orchestrator.py         ← Master entry point
 ├── run_backtest.py             ← CLI backtester
+├── run_optimizer.py            ← Optuna strategy/ML parameter optimizer
 ├── tail_logs.py                ← Terminal log viewer
 ├── web_logs.py                 ← Flask log viewer (port 8502)
 ├── start_bot.bat               ← Windows launcher
@@ -604,7 +663,10 @@ trade_v2/
 │   │   ├── economic_calendar.py ← FOMC/CPI/NFP calendar
 │   │   ├── multi_timeframe.py  ← Daily + intraday
 │   │   ├── quality.py          ← Data validation
-│   │   └── cache.py            ← TTL cache
+│   │   ├── cache.py            ← TTL cache
+│   │   ├── equity_stats.py     ← yfinance fundamentals → DuckDB
+│   │   ├── fundamentals_db.py  ← SQLite store for IB news + analyst recs
+│   │   └── ib_news.py          ← IB news + analyst action fetcher
 │   ├── learning/
 │   │   ├── engine.py           ← Post-market learning cycle
 │   │   ├── analyzer.py         ← Trade pattern analysis
@@ -618,15 +680,25 @@ trade_v2/
 │   │   ├── master.py           ← Master process (scheduler)
 │   │   └── gateway.py          ← IBC auto-start
 │   ├── dashboard/
-│   │   └── app.py              ← Streamlit dashboard
+│   │   ├── app.py              ← Streamlit dashboard (live bot monitoring)
+│   │   └── walkforward/        ← Walk-Forward Analysis Dashboard (static HTML)
+│   │       ├── index.html      ← Entry point (python -m http.server 8080)
+│   │       ├── export.py       ← Exports reports/runs/ → wf_data.js
+│   │       ├── metric-info.js  ← Data-plot dictionary (info-box definitions)
+│   │       └── *.jsx / *.js    ← React components (no build step needed)
 │   ├── notifications/
 │   │   └── telegram.py         ← Telegram alerts
 │   ├── backtesting/
 │   │   ├── engine.py           ← Single-window backtester
-│   │   ├── walkforward.py      ← Rolling windows
+│   │   ├── walkforward.py      ← Rolling windows (optimize_per_window support)
 │   │   ├── options_sim.py      ← Black-Scholes pricing
 │   │   ├── learner.py          ← In-backtest learning
 │   │   └── result.py           ← Metrics calculator
+│   ├── optimization/
+│   │   ├── optimizer.py        ← StrategyOptimizer (Optuna TPE)
+│   │   ├── param_spaces.py     ← Parameter spaces per strategy + ML model
+│   │   ├── objectives.py       ← Objective functions (sharpe, composite, etc.)
+│   │   └── results.py          ← OptimizationResult + reporting
 │   ├── config/
 │   │   └── settings.py         ← Pydantic config models
 │   └── utils/
@@ -635,8 +707,10 @@ trade_v2/
 ├── tests/                      ← Unit tests
 ├── data/                       ← Runtime artifacts (gitignored)
 │   ├── ait_state.db            ← SQLite trading state
-│   ├── ait_analytics.duckdb    ← Analytics database
+│   ├── ait_analytics.duckdb    ← Analytics database (incl. equity_stats table)
 │   ├── historical.db           ← OHLCV cache
+│   ├── fundamentals.db         ← IB news + analyst recommendations (SQLite)
+│   ├── optuna.db               ← Optuna study storage (SQLite, created on demand)
 │   ├── counterfactual_log.json
 │   └── thompson_state.json
 ├── models/                     ← Trained models (gitignored)
@@ -656,10 +730,14 @@ trade_v2/
 ### Running Tests
 
 ```bash
-pytest                                      # All tests
-pytest tests/test_risk.py -v                # Specific file
-pytest --cov=src/ait                        # With coverage
+pytest                                      # Unit tests only (no IB connection required)
+pytest tests/test_risk.py -v               # Specific file
+RUN_INTEGRATION_TESTS=1 pytest tests/test_integration.py -v   # Integration tests (requires live IB Gateway)
+RUN_INTEGRATION_TESTS=1 pytest             # All tests including integration
+pytest --cov=src/ait                       # With coverage
 ```
+
+`test_integration.py` is gated by the `RUN_INTEGRATION_TESTS=1` env var and skipped entirely in the normal test run. It requires IB Gateway running on port 4001 (live) or 4002 (paper). The suite typically completes in ~20 seconds — `reqHistoricalNews` and `reqNewsArticle` calls each take <0.2s; FinBERT's cold model load on first inference adds ~7s once per session.
 
 ### Code Style
 

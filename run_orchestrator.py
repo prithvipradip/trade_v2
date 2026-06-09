@@ -10,10 +10,12 @@ Starts the full trading system:
 - Log cleanup (monthly)
 
 Usage:
-    python run_orchestrator.py              # Start everything
-    python run_orchestrator.py --status     # Show scheduled jobs
-    python run_orchestrator.py --backtest   # Run backtest now
-    python run_orchestrator.py --retrain    # Retrain models now
+    python run_orchestrator.py                    # Start everything
+    python run_orchestrator.py --status           # Show scheduled jobs
+    python run_orchestrator.py --backtest         # Run backtest now
+    python run_orchestrator.py --retrain          # Retrain models now
+    python run_orchestrator.py --refresh-fundamentals  # Refresh equity stats (yfinance)
+    python run_orchestrator.py --fetch-news       # Fetch IB news + analyst actions
 """
 
 import argparse
@@ -46,12 +48,85 @@ from ait.orchestration.master import (
 )
 
 
+def _refresh_fundamentals() -> None:
+    """Force-refresh equity stats for all configured symbols via yfinance."""
+    from ait.config.settings import load_settings
+    from ait.monitoring.duckdb_analytics import DuckDBAnalytics
+    from ait.data.equity_stats import EquityStatsService
+
+    settings = load_settings()
+    symbols = settings.trading.universe
+    print(f"Refreshing equity stats for {len(symbols)} symbols: {', '.join(symbols)}")
+
+    analytics = DuckDBAnalytics()
+    svc = EquityStatsService(analytics)
+    results = svc.refresh_all(symbols)
+
+    ok = sum(results.values())
+    print(f"Done: {ok}/{len(symbols)} symbols refreshed successfully.")
+    for sym, success in results.items():
+        status = "OK" if success else "FAILED"
+        print(f"  {sym:8s}  {status}")
+
+
+def _fetch_news() -> None:
+    """Fetch IB news + analyst actions for all configured symbols.
+
+    Requires an active IB Gateway / TWS connection.
+    """
+    from ait.config.settings import load_settings, IBKREnvConfig
+    from ait.broker.ibkr_client import IBKRClient
+    from ait.data.fundamentals_db import FundamentalsStore
+    from ait.data.ib_news import IBNewsService
+
+    settings = load_settings()
+    symbols = settings.trading.universe
+    print(f"Fetching IB news for {len(symbols)} symbols: {', '.join(symbols)}")
+
+    ibkr_cfg = IBKREnvConfig()
+    client = IBKRClient(ibkr_cfg)
+
+    ib = client.ib
+    ib.connect(ibkr_cfg.ibkr_host, ibkr_cfg.ibkr_port, clientId=ibkr_cfg.ibkr_client_id + 10)
+    try:
+        from ait.sentiment.finbert import FinBERTAnalyzer
+        finbert = FinBERTAnalyzer()
+        store = FundamentalsStore()
+        svc = IBNewsService(
+            ib_client=client,
+            store=store,
+            sentiment_fn=lambda h: finbert.analyze(h) or 0.0,
+        )
+        for symbol in symbols:
+            news_fetched, news_inserted = svc.fetch_and_store_news(symbol, hours_back=24)
+            analyst_fetched, analyst_inserted = svc.fetch_and_store_analyst_actions(
+                symbol, hours_back=168
+            )
+            print(
+                f"  {symbol:8s}  news={news_inserted:3d} inserted ({news_fetched:3d} fetched)  "
+                f"analyst={analyst_inserted:3d} inserted ({analyst_fetched:3d} fetched)"
+            )
+    finally:
+        ib.disconnect()
+    print("Done.")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AIT v2 Master Orchestrator")
     parser.add_argument("--status", action="store_true", help="Check bot status")
     parser.add_argument("--backtest", action="store_true", help="Run backtest now")
     parser.add_argument("--retrain", action="store_true", help="Retrain ML models now")
     parser.add_argument("--report", action="store_true", help="Generate daily report now")
+    parser.add_argument(
+        "--refresh-fundamentals",
+        action="store_true",
+        help="Force-refresh equity fundamental stats from yfinance",
+    )
+    parser.add_argument(
+        "--fetch-news",
+        action="store_true",
+        help="Fetch IB news + analyst actions for all symbols (requires IB connection)",
+    )
     args = parser.parse_args()
 
     if args.status:
@@ -66,5 +141,9 @@ if __name__ == "__main__":
     elif args.report:
         print("Generating daily report...")
         daily_report()
+    elif args.refresh_fundamentals:
+        _refresh_fundamentals()
+    elif args.fetch_news:
+        _fetch_news()
     else:
         main()

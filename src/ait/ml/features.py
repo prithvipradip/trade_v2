@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pywt
 
 from ait.utils.logging import get_logger
 
@@ -30,6 +31,8 @@ class FeatureEngine:
         df: pd.DataFrame,
         market_context: dict[str, pd.DataFrame] | None = None,
         live_signals: dict | None = None,
+        intraday_store: "HistoricalDataStore | None" = None,
+        symbol: str = "",
     ) -> pd.DataFrame:
         """Compute all features from OHLCV DataFrame.
 
@@ -39,6 +42,10 @@ class FeatureEngine:
             market_context: Optional dict with cross-asset data:
                 - "vix": DataFrame with VIX OHLCV (^VIX)
                 - "spy": DataFrame with SPY OHLCV (for relative strength)
+            intraday_store: Optional HistoricalDataStore instance. When provided
+                along with symbol, per-day VLMC intraday features are computed
+                from stored 5-min bars and merged into the feature DataFrame.
+            symbol: Ticker symbol — required when intraday_store is provided.
 
         Returns:
             DataFrame with original columns plus computed features.
@@ -48,7 +55,10 @@ class FeatureEngine:
             log.warning("insufficient_data_for_features", rows=len(df) if df is not None else 0)
             return pd.DataFrame()
 
-        features = df.copy()
+        # Start with OHLCV only — auxiliary columns like implied_vol are all-NaN
+        # when no IB IV data exists, which causes dropna() to eliminate all rows.
+        ohlcv_cols = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in df.columns]
+        features = df[ohlcv_cols].copy()
 
         # --- Momentum Features ---
         features = self._add_momentum(features)
@@ -80,6 +90,9 @@ class FeatureEngine:
         # --- Macro Features (yield curve, DXY, rates) ---
         features = self._add_macro(features, market_context)
 
+        # --- Fractal / Multi-Scale Features ---
+        features = self._add_fractal_features(features)
+
         # --- Live Signal Features (sentiment, options flow) ---
         # During training, live_signals=None → neutral defaults so feature
         # count stays consistent. At prediction time, real values are passed.
@@ -91,14 +104,74 @@ class FeatureEngine:
         # Drop rows with NaN from lookback calculations
         features = features.dropna()
 
+        # --- VLMC Intraday Features (merged per day from IB 5-min store) ---
+        if intraday_store is not None and symbol:
+            features = self._merge_intraday_features(features, intraday_store, symbol)
+
         log.debug("features_computed", rows=len(features), columns=len(features.columns))
         return features
+
+    def _merge_intraday_features(
+        self,
+        features: pd.DataFrame,
+        intraday_store: "HistoricalDataStore",
+        symbol: str,
+    ) -> pd.DataFrame:
+        """Compute per-day VLMC features from 5-min sessions and left-join onto features."""
+        try:
+            intraday = intraday_store.load_intraday(symbol, days=len(features) + 10)
+            if intraday.empty:
+                return features
+
+            intraday = intraday.copy()
+            intraday.index = pd.to_datetime(intraday.index)
+
+            rows: list[dict] = []
+            for d, session in intraday.groupby(intraday.index.date):
+                if len(session) < 10:
+                    continue
+                try:
+                    feats = self.compute_intraday_features(session)
+                    if feats:
+                        feats["_date"] = pd.Timestamp(d)
+                        rows.append(feats)
+                except Exception:
+                    pass
+
+            if not rows:
+                return features
+
+            vlmc_df = pd.DataFrame(rows).set_index("_date")
+            vlmc_df.index = pd.to_datetime(vlmc_df.index)
+
+            # Normalise both indexes to tz-naive date for alignment
+            feat_idx = features.index.normalize().tz_localize(None) if features.index.tz else features.index.normalize()
+            vlmc_df.index = vlmc_df.index.tz_localize(None) if vlmc_df.index.tz else vlmc_df.index
+
+            features = features.copy()
+            features.index = feat_idx
+            merged = features.join(vlmc_df, how="left")
+            log.debug(
+                "vlmc_features_merged",
+                symbol=symbol,
+                vlmc_cols=len(vlmc_df.columns),
+                matched_days=vlmc_df.index.isin(feat_idx).sum(),
+            )
+            return merged
+        except Exception as exc:
+            log.warning("vlmc_merge_failed", symbol=symbol, error=str(exc))
+            return features
 
     def compute_intraday_features(self, intraday_df: pd.DataFrame) -> dict[str, float]:
         """Compute features from intraday (5-min) data for entry timing.
 
         Returns a flat dict of intraday features that can be appended
         to the daily feature set for enhanced predictions.
+
+        Includes the original 6 features plus 20 new Phase-6 features:
+        - 7 intraday fractal features (wavelet Hurst, PSD, MFDFA)
+        - 13 VLMC session structure features (VWAP trajectory, volume profile,
+          power-hour momentum, closing imbalance)
         """
         if intraday_df is None or len(intraday_df) < 20:
             return {}
@@ -108,62 +181,251 @@ class FeatureEngine:
         high = intraday_df["High"]
         low = intraday_df["Low"]
 
-        features = {}
+        features: dict[str, float] = {}
 
-        # VWAP and price position relative to it
+        # ------------------------------------------------------------------
+        # Original 6 intraday features (unchanged)
+        # ------------------------------------------------------------------
+
         typical = (high + low + close) / 3
         cum_vol = volume.cumsum()
-        vwap = (typical * volume).cumsum() / cum_vol.replace(0, np.nan)
+        vwap_full = (typical * volume).cumsum() / cum_vol.replace(0, np.nan)
         features["intraday_vwap_position"] = float(
-            (close.iloc[-1] - vwap.iloc[-1]) / vwap.iloc[-1]
-        ) if vwap.iloc[-1] > 0 else 0.0
+            (close.iloc[-1] - vwap_full.iloc[-1]) / vwap_full.iloc[-1]
+        ) if vwap_full.iloc[-1] > 0 else 0.0
 
-        # Intraday RSI (7-period on 5-min bars)
         features["intraday_rsi"] = float(self._rsi(close, 7).iloc[-1])
+        features["intraday_momentum_1h"] = (
+            float(close.pct_change(12).iloc[-1]) if len(close) > 12 else 0.0
+        )
 
-        # Intraday momentum (last 12 bars = 1 hour)
-        features["intraday_momentum_1h"] = float(close.pct_change(12).iloc[-1]) if len(close) > 12 else 0.0
-
-        # Intraday volatility (ATR as % of price)
         tr = pd.concat([
             high - low,
             (high - close.shift(1)).abs(),
             (low - close.shift(1)).abs(),
         ], axis=1).max(axis=1)
         atr = tr.rolling(14).mean()
-        features["intraday_atr_pct"] = float(atr.iloc[-1] / close.iloc[-1]) if close.iloc[-1] > 0 else 0.0
-
-        # Volume profile: current vs session average
-        features["intraday_vol_ratio"] = float(
-            volume.iloc[-1] / volume.mean()
-        ) if volume.mean() > 0 else 1.0
-
-        # Price range compression (low range = breakout incoming)
+        features["intraday_atr_pct"] = (
+            float(atr.iloc[-1] / close.iloc[-1]) if close.iloc[-1] > 0 else 0.0
+        )
+        features["intraday_vol_ratio"] = (
+            float(volume.iloc[-1] / volume.mean()) if volume.mean() > 0 else 1.0
+        )
         recent_range = (high.tail(12).max() - low.tail(12).min()) / close.iloc[-1]
         session_range = (high.max() - low.min()) / close.iloc[-1]
-        features["intraday_range_compression"] = float(
-            recent_range / session_range
-        ) if session_range > 0 else 1.0
+        features["intraday_range_compression"] = (
+            float(recent_range / session_range) if session_range > 0 else 1.0
+        )
+
+        # ------------------------------------------------------------------
+        # Phase 6a: Intraday fractal features (Framework 2)
+        # Applied to log-prices for Hurst/PSD; log-returns for MFDFA.
+        # ------------------------------------------------------------------
+
+        log_prices  = np.log(close.values + 1e-12)
+        log_returns = np.diff(log_prices)
+        n = len(log_prices)
+
+        # Hurst from wavelet variance on intraday log-prices (min 78 bars = 1 session)
+        if n >= 78:
+            h_intra, _ = self._hurst_wavelet(log_prices)
+            features["hurst_wavelet_intraday"] = float(h_intra)
+        else:
+            features["hurst_wavelet_intraday"] = 0.0
+
+        # Multi-scale Hurst spread (min 200 bars ≈ 3 sessions)
+        if n >= 200:
+            h_short, h_long = self._multiscale_hurst(log_prices)
+            features["hurst_scale_spread_intraday"] = float(abs(h_short - h_long))
+        else:
+            features["hurst_scale_spread_intraday"] = 0.0
+
+        # Wavelet energy at levels 3-5 (40-min, 80-min, 2.7-hour timescales)
+        if n >= 40:
+            try:
+                coeffs = pywt.wavedec(log_prices, wavelet="db4", mode="periodization")
+                n_levels = len(coeffs) - 1
+                energy: dict[int, float] = {}
+                for k, detail in enumerate(coeffs[1:], start=1):
+                    actual_level = n_levels - k + 1
+                    if len(detail) >= 4:
+                        energy[actual_level] = float(np.sum(detail ** 2))
+                total_e = sum(energy.values()) + 1e-12
+                for lvl, key in ((3, "wavelet_L3_energy"), (4, "wavelet_L4_energy"),
+                                 (5, "wavelet_L5_energy")):
+                    features[key] = float(energy.get(lvl, 0.0) / total_e)
+            except Exception:
+                features["wavelet_L3_energy"] = 0.0
+                features["wavelet_L4_energy"] = 0.0
+                features["wavelet_L5_energy"] = 0.0
+        else:
+            features["wavelet_L3_energy"] = 0.0
+            features["wavelet_L4_energy"] = 0.0
+            features["wavelet_L5_energy"] = 0.0
+
+        # PSD exponent on intraday log-prices (min 100 bars)
+        if n >= 100:
+            beta, _ = self._psd_features(log_prices)
+            features["psd_beta_intraday"] = float(beta)
+        else:
+            features["psd_beta_intraday"] = 0.0
+
+        # MFDFA width on intraday log-returns (min 500 bars ≈ 7 sessions)
+        if len(log_returns) >= 500:
+            mf_w, _ = self._mfdfa_features(log_returns)
+            features["mfdfa_width_intraday"] = float(mf_w)
+        else:
+            features["mfdfa_width_intraday"] = 0.0
+
+        # ------------------------------------------------------------------
+        # Phase 6b: VLMC session structure features (Framework 1)
+        # Computed from today's session bars only (9:30 AM onward).
+        # ------------------------------------------------------------------
+
+        # Isolate today's session: bars whose date matches the last bar's date.
+        last_dt = intraday_df.index[-1]
+        if hasattr(last_dt, "date"):
+            today_date = last_dt.date()
+        else:
+            today_date = pd.Timestamp(last_dt).date()
+
+        today_mask = pd.Series(intraday_df.index).apply(
+            lambda x: (x.date() if hasattr(x, "date") else pd.Timestamp(x).date())
+            == today_date
+        ).values
+        session = intraday_df[today_mask]
+
+        if len(session) < 3:
+            for key in (
+                "session_vwap_position", "session_vwap_q1", "session_vwap_q2",
+                "session_vwap_q3", "session_high_timing", "session_low_timing",
+                "session_volume_front_load", "session_volume_shape",
+                "power_hour_momentum", "power_hour_vol_accel", "power_hour_vwap_cross",
+                "closing_imbalance", "closing_range_position",
+            ):
+                features[key] = 0.0
+        else:
+            s_close  = session["Close"]
+            s_high   = session["High"]
+            s_low    = session["Low"]
+            s_vol    = session["Volume"]
+            s_n      = len(session)
+
+            # Session VWAP computed from the session open (not trailing)
+            s_typical = (s_high + s_low + s_close) / 3
+            s_cumvol  = s_vol.cumsum()
+            s_vwap    = (s_typical * s_vol).cumsum() / s_cumvol.replace(0, np.nan)
+            last_vwap = float(s_vwap.iloc[-1]) if s_vwap.iloc[-1] > 0 else float(s_close.iloc[-1])
+
+            features["session_vwap_position"] = float(
+                (s_close.iloc[-1] - last_vwap) / last_vwap
+            ) if last_vwap > 0 else 0.0
+
+            # VWAP position at quartile breakpoints
+            for qi, key in ((s_n // 4, "session_vwap_q1"),
+                            (s_n // 2, "session_vwap_q2"),
+                            (3 * s_n // 4, "session_vwap_q3")):
+                idx = max(0, min(qi, s_n - 1))
+                v = float(s_vwap.iloc[idx]) if s_vwap.iloc[idx] > 0 else float(s_close.iloc[idx])
+                features[key] = float(
+                    (s_close.iloc[idx] - v) / v
+                ) if v > 0 else 0.0
+
+            # Timing of session high / low (fraction of session elapsed)
+            high_idx = int(s_high.values.argmax())
+            low_idx  = int(s_low.values.argmin())
+            features["session_high_timing"] = float(high_idx / max(s_n - 1, 1))
+            features["session_low_timing"]  = float(low_idx  / max(s_n - 1, 1))
+
+            # Volume shape: front-loaded vs back-loaded vs U-shaped
+            third = max(s_n // 3, 1)
+            vol_first  = float(s_vol.iloc[:third].sum())
+            vol_last   = float(s_vol.iloc[-third:].sum())
+            vol_total  = float(s_vol.sum()) + 1e-8
+            features["session_volume_front_load"] = float(vol_first / vol_total)
+            features["session_volume_shape"]      = float((vol_first - vol_last) / vol_total)
+
+            # Power-hour features: last 12 bars (≈60 min)
+            ph_n = min(12, s_n)
+            ph = session.iloc[-ph_n:]
+            ph_close = ph["Close"]
+            ph_vol   = ph["Volume"]
+            features["power_hour_momentum"] = float(
+                np.log(ph_close.iloc[-1] / ph_close.iloc[0] + 1e-12)
+            ) if len(ph_close) > 1 else 0.0
+
+            if len(ph_vol) > 2:
+                x = np.arange(len(ph_vol), dtype=float)
+                slope, _ = np.polyfit(x, ph_vol.values.astype(float), 1)
+                features["power_hour_vol_accel"] = float(slope / (ph_vol.mean() + 1e-8))
+            else:
+                features["power_hour_vol_accel"] = 0.0
+
+            features["power_hour_vwap_cross"] = float(
+                np.sign(ph_close.iloc[-1] - ph_close.iloc[0])
+            )
+
+            # Closing imbalance: last 3 bars
+            cb = session.iloc[-3:]
+            cb_close = cb["Close"]
+            cb_high  = cb["High"]
+            cb_low   = cb["Low"]
+            features["closing_imbalance"] = float(
+                np.mean(np.diff(np.log(cb_close.values + 1e-12)))
+            ) if len(cb_close) > 1 else 0.0
+            cb_range = float(cb_high.max() - cb_low.min())
+            features["closing_range_position"] = float(
+                (cb_close.iloc[-1] - cb_low.min()) / cb_range
+            ) if cb_range > 0 else 0.5
+
+        # Replace any NaN / Inf introduced above
+        for k, v in list(features.items()):
+            if not np.isfinite(v):
+                features[k] = 0.0
 
         return features
 
-    def get_feature_names(self) -> list[str]:
-        """Get list of all feature column names (excluding OHLCV)."""
-        return [
+    # The 26 VLMC / intraday feature names produced by compute_intraday_features().
+    # Returned by get_feature_names() when an intraday_store was used during compute().
+    VLMC_FEATURE_NAMES: list[str] = [
+        # Original 6 intraday features
+        "intraday_vwap_position", "intraday_rsi", "intraday_momentum_1h",
+        "intraday_atr_pct", "intraday_vol_ratio", "intraday_range_compression",
+        # Phase 6a: intraday fractal (7 features)
+        "hurst_wavelet_intraday", "hurst_scale_spread_intraday",
+        "wavelet_L3_energy", "wavelet_L4_energy", "wavelet_L5_energy",
+        "psd_beta_intraday", "mfdfa_width_intraday",
+        # Phase 6b: VLMC session structure (13 features)
+        "session_vwap_position", "session_vwap_q1", "session_vwap_q2", "session_vwap_q3",
+        "session_high_timing", "session_low_timing",
+        "session_volume_front_load", "session_volume_shape",
+        "power_hour_momentum", "power_hour_vol_accel", "power_hour_vwap_cross",
+        "closing_imbalance", "closing_range_position",
+    ]
+
+    def get_feature_names(self, include_vlmc: bool = False) -> list[str]:
+        """Get list of all feature column names (excluding OHLCV).
+
+        include_vlmc: if True, appends the 26 VLMC intraday feature names.
+        Pass include_vlmc=True after calling compute() with an intraday_store
+        to get the full 83-feature list used by the trained model (Gap A).
+        """
+        base = [
             # Momentum
             "rsi_14", "rsi_7", "macd", "macd_signal", "macd_hist",
             "roc_5", "roc_10", "roc_20",
-            # Volatility
-            "atr_14", "atr_pct", "bb_upper", "bb_lower", "bb_width",
-            "bb_position", "realized_vol_20", "realized_vol_10",
+            # Volatility (all normalized — no raw price levels)
+            "atr_pct", "bb_width", "bb_position",
+            "bb_pct_above_upper", "bb_pct_below_lower",
+            "realized_vol_20", "realized_vol_10",
             "high_low_range",
             # Volume
             "volume_sma_20_ratio", "obv_change", "volume_trend",
-            # Trend
-            "sma_10", "sma_20", "sma_50", "ema_12", "ema_26",
+            # Trend (slopes + ratios only — raw SMA/EMA price levels excluded)
             "sma_10_slope", "sma_20_slope",
             "price_vs_sma_20", "price_vs_sma_50",
             "sma_10_20_cross",
+            "above_sma200", "distance_sma200",
             # Price action
             "daily_return", "gap", "body_size", "upper_wick", "lower_wick",
             "consecutive_up", "consecutive_down",
@@ -189,7 +451,15 @@ class FeatureEngine:
             "flow_bias_strength", "flow_bullish", "flow_bearish",
             # Seasonality
             "day_of_week", "month_of_year",
+            # Fractal / multi-scale
+            "hurst_wavelet", "hurst_fit_r2",
+            "psd_beta", "psd_fit_r2", "hurst_psd_divergence",
+            "hurst_short", "hurst_long", "hurst_scale_spread",
+            "multifractal_width", "multifractal_asymmetry",
         ]
+        if include_vlmc:
+            return base + self.VLMC_FEATURE_NAMES
+        return base
 
     # --- Feature Groups ---
 
@@ -200,10 +470,10 @@ class FeatureEngine:
         df["rsi_14"] = self._rsi(close, 14)
         df["rsi_7"] = self._rsi(close, 7)
 
-        # MACD
+        # MACD — normalized by price so it's stationary across time and price levels
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
-        df["macd"] = ema12 - ema26
+        df["macd"] = (ema12 - ema26) / close
         df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
         df["macd_hist"] = df["macd"] - df["macd_signal"]
 
@@ -235,6 +505,9 @@ class FeatureEngine:
         df["bb_lower"] = sma20 - 2 * std20
         df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / sma20
         df["bb_position"] = (close - df["bb_lower"]) / (df["bb_upper"] - df["bb_lower"])
+        # Breach signals: how far outside the bands is price? 0 when inside.
+        df["bb_pct_above_upper"] = ((close - df["bb_upper"]) / close).clip(lower=0)
+        df["bb_pct_below_lower"] = ((df["bb_lower"] - close) / close).clip(lower=0)
 
         # Realized volatility
         log_returns = np.log(close / close.shift(1))
@@ -481,8 +754,10 @@ class FeatureEngine:
         The model needs to know if it's a risk-on or risk-off environment.
         """
         if not market_context:
-            # Fill with neutral defaults so feature count stays consistent
-            df["vix_level"] = 20.0
+            # Fill with neutral defaults so feature count stays consistent.
+            # 0.5 = normalised VIX 20 (vix_close/40) — matches the else-branch
+            # below and avoids the misleading literal 20.0 appearing in trade logs.
+            df["vix_level"] = 0.5
             df["vix_change_5d"] = 0.0
             df["vix_change_20d"] = 0.0
             df["vix_zscore"] = 0.0
@@ -703,3 +978,210 @@ class FeatureEngine:
         """Count consecutive 1s in a binary series."""
         groups = binary_series.ne(binary_series.shift()).cumsum()
         return binary_series.groupby(groups).cumsum()
+
+    # ------------------------------------------------------------------
+    # Fractal / multi-scale estimators
+    # ------------------------------------------------------------------
+
+    def _hurst_wavelet(self, series: np.ndarray) -> tuple[float, float]:
+        """Estimate Hurst exponent via wavelet variance slope.
+
+        Apply to log-price levels (not returns). For fBm: σ²(j) ∝ 2^(2H·j),
+        so the slope of log(σ²) vs log(scale) gives 2H. Uses db4 wavelet.
+
+        Returns (hurst, fit_r2). Falls back to (0.5, 0.0) when data is too short.
+        """
+        if len(series) < 50:
+            return 0.5, 0.0
+        try:
+            coeffs = pywt.wavedec(series, wavelet="db4", mode="periodization")
+            # pywt returns [cA_n, cD_n, cD_{n-1}, ..., cD_1]: coarsest detail first.
+            # Actual wavelet level for coeffs[k] (k=1..) = n_levels - k + 1.
+            n_levels = len(coeffs) - 1
+            detail_vars = []
+            scales = []
+            for k, detail in enumerate(coeffs[1:], start=1):
+                actual_level = n_levels - k + 1   # coarsest→highest level
+                if len(detail) >= 4:
+                    detail_vars.append(np.log(np.var(detail) + 1e-12))
+                    scales.append(np.log(2.0) * actual_level)   # log(2^j)
+            if len(scales) < 3:
+                return 0.5, 0.0
+            x = np.array(scales)
+            y = np.array(detail_vars)
+            slope, intercept = np.polyfit(x, y, 1)
+            hurst = float(np.clip(slope / 2.0, 0.1, 0.9))
+            # R² of the log-log fit
+            y_hat = slope * x + intercept
+            ss_res = np.sum((y - y_hat) ** 2)
+            ss_tot = np.sum((y - y.mean()) ** 2)
+            r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+            return hurst, float(np.clip(r2, 0.0, 1.0))
+        except Exception:
+            return 0.5, 0.0
+
+    def _psd_features(self, series: np.ndarray) -> tuple[float, float]:
+        """Estimate power-law exponent β from the periodogram.
+
+        Apply to log-price levels. For fBm: S(f) ∝ f^(-β), β = 2H + 1.
+        β≈2 = Brownian motion (H=0.5). Returns (beta, fit_r2).
+        Falls back to (2.0, 0.0) on failure.
+        """
+        if len(series) < 60:
+            return 2.0, 0.0
+        try:
+            from scipy.signal import periodogram
+            freqs, psd = periodogram(series)
+            # Ignore DC component and high-freq noise; keep middle 80% of spectrum
+            mask = (freqs > 0) & (freqs < freqs[-1] * 0.8)
+            if mask.sum() < 4:
+                return 2.0, 0.0
+            log_f = np.log(freqs[mask])
+            log_p = np.log(psd[mask] + 1e-12)
+            slope, intercept = np.polyfit(log_f, log_p, 1)
+            beta = float(np.clip(-slope, 0.5, 4.0))
+            y_hat = slope * log_f + intercept
+            ss_res = np.sum((log_p - y_hat) ** 2)
+            ss_tot = np.sum((log_p - log_p.mean()) ** 2)
+            r2 = float(np.clip(1.0 - ss_res / ss_tot, 0.0, 1.0)) if ss_tot > 0 else 0.0
+            return beta, r2
+        except Exception:
+            return 2.0, 0.0
+
+    def _multiscale_hurst(self, series: np.ndarray) -> tuple[float, float]:
+        """Compute Hurst at a short window (60 bars) and a long window (180 bars).
+
+        Apply to log-price levels. Returns (hurst_short, hurst_long).
+        Fills (0.0, 0.0) when insufficient data.
+        """
+        SHORT_WIN = 60
+        LONG_WIN = 180
+        if len(series) < LONG_WIN:
+            if len(series) >= SHORT_WIN:
+                h_short, _ = self._hurst_wavelet(series[-SHORT_WIN:])
+                return h_short, 0.0
+            return 0.0, 0.0
+        h_short, _ = self._hurst_wavelet(series[-SHORT_WIN:])
+        h_long, _ = self._hurst_wavelet(series[-LONG_WIN:])
+        return float(h_short), float(h_long)
+
+    def _mfdfa_features(self, returns: np.ndarray) -> tuple[float, float]:
+        """Multifractal DFA: compute spectrum width Δα and asymmetry.
+
+        Requires ≥500 data points. Returns (width, asymmetry) = (0.0, 0.0) otherwise.
+
+        width     = h(q_min) - h(q_max)   — breadth of multifractal spectrum
+        asymmetry = skew of h(q) curve    — negative → crash-risk signal
+        """
+        MIN_BARS = 500
+        if len(returns) < MIN_BARS:
+            return 0.0, 0.0
+        try:
+            q_vals = np.array([-5.0, -3.0, -1.0, 1.0, 3.0, 5.0])
+            scales = np.array([8, 16, 32, 64, 128])
+            h_q = np.zeros(len(q_vals))
+            for qi, q in enumerate(q_vals):
+                log_scales, log_fq = [], []
+                for s in scales:
+                    if s > len(returns) // 4:
+                        continue
+                    n_segs = len(returns) // s
+                    if n_segs < 2:
+                        continue
+                    fluctuations = []
+                    for seg in range(n_segs):
+                        seg_data = returns[seg * s:(seg + 1) * s]
+                        trend = np.polyfit(np.arange(s), seg_data, 1)
+                        detrended = seg_data - np.polyval(trend, np.arange(s))
+                        fluctuations.append(np.mean(detrended ** 2))
+                    fluctuations = np.array(fluctuations)
+                    if q == 0:
+                        fq = np.exp(0.5 * np.mean(np.log(fluctuations + 1e-12)))
+                    else:
+                        fq = np.mean(fluctuations ** (q / 2)) ** (1.0 / q)
+                    if fq > 0:
+                        log_scales.append(np.log(s))
+                        log_fq.append(np.log(fq + 1e-12))
+                if len(log_scales) >= 3:
+                    slope, _ = np.polyfit(log_scales, log_fq, 1)
+                    h_q[qi] = float(np.clip(slope, 0.0, 1.5))
+                else:
+                    h_q[qi] = 0.5
+            width = float(np.clip(h_q.max() - h_q.min(), 0.0, 2.0))
+            # Asymmetry: skew of h(q) — negative means large negative returns dominate
+            h_mean = h_q.mean()
+            h_std = h_q.std()
+            asymmetry = float(
+                np.mean(((h_q - h_mean) / (h_std + 1e-8)) ** 3)
+            ) if h_std > 1e-8 else 0.0
+            return width, asymmetry
+        except Exception:
+            return 0.0, 0.0
+
+    def _add_fractal_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add 10 daily fractal features to the feature DataFrame.
+
+        All features use graceful degradation: columns fill 0.0 when there are
+        insufficient bars for a given estimator. XGBoost/LightGBM learn to ignore
+        systematically-zero features for early walk-forward windows.
+        """
+        if df is None or len(df) < 50:
+            for col in (
+                "hurst_wavelet", "hurst_fit_r2",
+                "psd_beta", "psd_fit_r2", "hurst_psd_divergence",
+                "hurst_short", "hurst_long", "hurst_scale_spread",
+                "multifractal_width", "multifractal_asymmetry",
+            ):
+                df[col] = 0.0
+            return df
+
+        # Hurst / PSD: computed on log-price levels → gives H≈0.5–0.7 for equities
+        # MFDFA: computed on log-returns → standard detrended fluctuation input
+        log_prices = np.log(df["Close"].values)
+        log_returns = np.diff(log_prices)   # length = n-1
+
+        # Expanding-window computation: each row i uses data up to that row.
+        # O(n²) but called once per training cycle (n≤504 → acceptable ~0.5 s).
+        n = len(df)
+        hw_vals  = np.zeros(n)
+        hr2_vals = np.zeros(n)
+        pb_vals  = np.full(n, 2.0)
+        pr2_vals = np.zeros(n)
+        hs_vals  = np.zeros(n)
+        hl_vals  = np.zeros(n)
+        mw_vals  = np.zeros(n)
+        ma_vals  = np.zeros(n)
+
+        for i in range(49, n):
+            lp = log_prices[:i + 1]          # log-price window up to row i
+            lr = log_returns[:i]             # return window (length i)
+            if len(lp) < 50:
+                continue
+            hw_vals[i], hr2_vals[i] = self._hurst_wavelet(lp)
+            pb_vals[i], pr2_vals[i] = self._psd_features(lp)
+            hs_vals[i], hl_vals[i]  = self._multiscale_hurst(lp)
+            if len(lr) >= 500:
+                mw_vals[i], ma_vals[i] = self._mfdfa_features(lr)
+
+        df = df.copy()
+        df["hurst_wavelet"]       = hw_vals
+        df["hurst_fit_r2"]        = hr2_vals
+        df["psd_beta"]            = pb_vals
+        df["psd_fit_r2"]          = pr2_vals
+        df["hurst_short"]         = hs_vals
+        df["hurst_long"]          = hl_vals
+        df["hurst_scale_spread"]  = np.abs(hs_vals - hl_vals)
+        # PSD-implied Hurst: H = (β - 1) / 2
+        psd_h = np.clip((pb_vals - 1.0) / 2.0, 0.05, 0.95)
+        df["hurst_psd_divergence"] = np.abs(hw_vals - psd_h)
+        df["multifractal_width"]   = mw_vals
+        df["multifractal_asymmetry"] = ma_vals
+
+        # Replace any residual NaN/Inf with 0.0
+        fractal_cols = [
+            "hurst_wavelet", "hurst_fit_r2", "psd_beta", "psd_fit_r2",
+            "hurst_psd_divergence", "hurst_short", "hurst_long",
+            "hurst_scale_spread", "multifractal_width", "multifractal_asymmetry",
+        ]
+        df[fractal_cols] = df[fractal_cols].replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        return df

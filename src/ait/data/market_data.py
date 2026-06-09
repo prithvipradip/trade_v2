@@ -1,8 +1,12 @@
 """Unified market data service with fallback chain.
 
-Data source priority: IBKR → Polygon (free tier) → Yahoo Finance
+Data source priority: IBKR → Yahoo Finance
 Each source has proper error handling — if one fails, the next is tried.
 NO mock/fake data is ever returned.
+
+For daily OHLCV used in ML training and backtesting, use load_daily_ohlcv()
+which reads from the IB SQLite store (resampled from 5-min bars) and falls
+back to Yahoo Finance only when insufficient IB data is available.
 """
 
 from __future__ import annotations
@@ -46,6 +50,76 @@ class Quote:
         if self.mid <= 0:
             return 0.0
         return (self.ask - self.bid) / self.mid
+
+
+def load_daily_ohlcv(
+    symbol: str,
+    days: int = 730,
+    db_path: "Path | None" = None,
+) -> pd.DataFrame:
+    """Load daily OHLCV — IB SQLite store first, Yahoo Finance fallback.
+
+    Tries to resample stored 5-min bars to daily OHLCV. Falls back to
+    Yahoo Finance when fewer than 60 trading days are available in the store.
+
+    Also left-joins stored IBKR implied_vol snapshots (from daily IV backfill)
+    onto the returned DataFrame as an `implied_vol` column. Rows without stored
+    IV have NaN in that column; callers should check before using.
+
+    Args:
+        symbol:  Ticker symbol.
+        days:    Calendar days of history requested (default 2 years).
+        db_path: Path to SQLite DB; uses production DB_PATH if None.
+
+    Returns:
+        DataFrame with DatetimeIndex and [Open, High, Low, Close, Volume, implied_vol].
+    """
+    from ait.data.historical import HistoricalDataStore, DB_PATH as _DEFAULT_DB
+
+    store = HistoricalDataStore(db_path=db_path or _DEFAULT_DB)
+    df = store.resample_to_daily(symbol, days=days)
+
+    if len(df) < 60:
+        log.info("daily_ohlcv_yahoo_fallback", symbol=symbol, ib_rows=len(df))
+        try:
+            start = (date.today() - timedelta(days=days + 30)).isoformat()
+            ydf = yf.Ticker(symbol).history(start=start, interval="1d")
+            if not ydf.empty:
+                df = ydf[["Open", "High", "Low", "Close", "Volume"]].copy()
+        except Exception as exc:
+            log.warning("yahoo_fallback_failed", symbol=symbol, error=str(exc))
+            if df.empty:
+                return pd.DataFrame()
+    else:
+        log.info("daily_ohlcv_from_ib_store", symbol=symbol, rows=len(df))
+
+    if df.empty:
+        return df
+
+    # Left-join stored IBKR implied_vol snapshots (NaN where not available)
+    try:
+        iv_series = store.load_daily_iv(symbol, days=days)
+        if not iv_series.empty:
+            # Align index timezone: df may be tz-naive or tz-aware
+            iv_idx = iv_series.index
+            df_idx = df.index
+            df_tz = getattr(df_idx, "tz", None)
+            iv_tz = getattr(iv_idx, "tz", None)
+            if df_tz is not None and iv_tz is None:
+                iv_idx = iv_idx.tz_localize(df_tz)
+            elif df_tz is None and iv_tz is not None:
+                iv_idx = iv_idx.tz_localize(None)
+            elif df_tz is not None and iv_tz is not None and str(iv_tz) != str(df_tz):
+                iv_idx = iv_idx.tz_convert(df_tz)
+            iv_aligned = pd.Series(iv_series.values, index=iv_idx, name="implied_vol")
+            df = df.join(iv_aligned, how="left")
+        else:
+            df["implied_vol"] = float("nan")
+    except Exception as exc:
+        log.debug("iv_join_failed", symbol=symbol, error=str(exc))
+        df["implied_vol"] = float("nan")
+
+    return df
 
 
 class MarketDataService:
@@ -124,39 +198,64 @@ class MarketDataService:
         self,
         symbol: str,
         interval: str = "5m",
-        days: int = 1,
+        days: int = 7,
     ) -> pd.DataFrame | None:
-        """Get intraday OHLCV data (5-min bars).
+        """Get intraday OHLCV data (5-min bars). IBKR → Yahoo fallback.
 
-        Used for multi-timeframe analysis and entry timing.
-        Yahoo Finance provides 5-min data for the last 60 days.
+        IBKR is the primary source for consistent training/trading data.
+        Yahoo Finance is used only when IBKR is unavailable.
         """
         cache_key = f"intraday:{symbol}:{interval}:{days}"
         cached = self._cache.get(cache_key)
         if cached is not None:
             return cached
 
-        try:
-            period = f"{days}d" if days <= 5 else "1mo"
-            loop = asyncio.get_running_loop()
-            ticker = await loop.run_in_executor(None, lambda: yf.Ticker(symbol))
-            df = await loop.run_in_executor(
-                None, lambda: ticker.history(period=period, interval=interval)
-            )
+        df = None
 
-            if df is None or df.empty:
-                return None
+        # Try IBKR first (consistent with live trading data)
+        if interval == "5m":
+            duration = self._days_to_ibkr_duration(days)
+            df = await self._get_ibkr_intraday(symbol, duration=duration)
 
-            df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-            df.index.name = "Datetime"
+        # Fallback to Yahoo (max 60 days of 5-min data)
+        if df is None:
+            df = await self._get_yahoo_intraday(symbol, interval=interval, days=days)
 
-            # Cache for 5 minutes (intraday data changes frequently)
+        if df is not None and not df.empty:
             self._cache.set(cache_key, df, ttl=300)
-            return df
 
-        except Exception as e:
-            log.debug("intraday_fetch_failed", symbol=symbol, interval=interval, error=str(e))
-            return None
+        return df
+
+    async def get_intraday_since(
+        self,
+        symbol: str,
+        since: "pd.Timestamp",
+    ) -> pd.DataFrame | None:
+        """Get intraday 5-min bars strictly after `since` timestamp.
+
+        Used by the orchestrator for incremental fetching — only downloads
+        bars not yet stored in SQLite, rather than re-fetching the full window.
+        """
+        from datetime import timezone
+        now = pd.Timestamp.now(tz=timezone.utc)
+        since_utc = since.tz_convert("UTC") if since.tzinfo else since.tz_localize("UTC")
+        elapsed_days = max(1, int((now - since_utc).total_seconds() / 86400) + 1)
+
+        duration = self._days_to_ibkr_duration(elapsed_days)
+        df = await self._get_ibkr_intraday(symbol, duration=duration)
+
+        if df is None:
+            df = await self._get_yahoo_intraday(symbol, interval="5m", days=elapsed_days)
+
+        if df is not None and not df.empty:
+            # Return only bars strictly after the cutoff
+            if getattr(df.index, "tz", None) is None:
+                df.index = df.index.tz_localize("UTC")
+            else:
+                df.index = df.index.tz_convert("UTC")
+            return df[df.index > since_utc]
+
+        return None
 
     async def get_current_price(self, symbol: str) -> float | None:
         """Get the current price for a symbol."""
@@ -195,6 +294,108 @@ class MarketDataService:
         return None
 
     # --- Private data source methods ---
+
+    @staticmethod
+    def _days_to_ibkr_duration(days: int) -> str:
+        """Convert a number of calendar days to an IBKR durationStr for 5-min bars."""
+        if days <= 14:
+            return f"{days} D"
+        elif days <= 60:
+            return "1 M"
+        elif days <= 120:
+            return "3 M"
+        elif days <= 180:
+            return "6 M"
+        else:
+            return "1 Y"
+
+    async def _get_ibkr_intraday(
+        self,
+        symbol: str,
+        duration: str = "7 D",
+        bar_size: str = "5 mins",
+    ) -> pd.DataFrame | None:
+        """Fetch intraday bars from IBKR via reqHistoricalDataAsync.
+
+        Returns DataFrame with UTC DatetimeIndex and OHLCV columns,
+        or None if IBKR is unavailable or returns no data.
+        """
+        if not self._ibkr or not self._ibkr.connected:
+            return None
+
+        try:
+            contract = Stock(symbol, "SMART", "USD")
+            qualified = await self._ibkr.qualify_contract(contract)
+            if not qualified:
+                return None
+
+            bars = await self._ibkr.ib.reqHistoricalDataAsync(
+                qualified,
+                endDateTime="",       # empty = now
+                durationStr=duration,
+                barSizeSetting=bar_size,
+                whatToShow="TRADES",
+                useRTH=True,
+                formatDate=1,
+            )
+            if not bars:
+                return None
+
+            df = util.df(bars)
+            df = df.rename(columns={
+                "date": "Datetime",
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "volume": "Volume",
+            })
+            df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True)
+            df.set_index("Datetime", inplace=True)
+            df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+            df.index.name = "Datetime"
+            log.debug(
+                "ibkr_intraday_fetched",
+                symbol=symbol,
+                duration=duration,
+                bars=len(df),
+            )
+            return df
+
+        except Exception as e:
+            log.debug("ibkr_intraday_failed", symbol=symbol, duration=duration, error=str(e))
+            return None
+
+    async def _get_yahoo_intraday(
+        self,
+        symbol: str,
+        interval: str = "5m",
+        days: int = 7,
+    ) -> pd.DataFrame | None:
+        """Get intraday data from Yahoo Finance (fallback; max 60 days of 5-min data)."""
+        try:
+            period = f"{min(days, 59)}d" if days <= 59 else "1mo"
+            loop = asyncio.get_running_loop()
+            ticker = await loop.run_in_executor(None, lambda: yf.Ticker(symbol))
+            df = await loop.run_in_executor(
+                None, lambda: ticker.history(period=period, interval=interval)
+            )
+
+            if df is None or df.empty:
+                return None
+
+            df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+            df.index.name = "Datetime"
+            if getattr(df.index, "tz", None) is None:
+                df.index = df.index.tz_localize("UTC")
+            else:
+                df.index = df.index.tz_convert("UTC")
+            log.debug("yahoo_intraday_fetched", symbol=symbol, bars=len(df))
+            return df
+
+        except Exception as e:
+            log.debug("yahoo_intraday_failed", symbol=symbol, interval=interval, error=str(e))
+            return None
 
     async def _get_ibkr_quote(self, symbol: str) -> Quote | None:
         """Get quote from IBKR."""

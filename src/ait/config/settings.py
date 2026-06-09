@@ -71,6 +71,67 @@ class OptionsConfig(BaseModel):
         return v
 
 
+class BacktestConfig(BaseModel):
+    initial_capital: float = Field(default=100_000.0, ge=1_000.0, le=10_000_000.0)
+    position_size_pct: float = Field(default=0.05, ge=0.01, le=0.50,
+        description="Fraction of capital risked per trade (max-loss basis).")
+    wing_floor_dollars: float = Field(default=5.0, ge=0.50, le=50.0,
+        description="Hard minimum spread width in dollars (safety floor only). "
+                    "Wing sizing is now primarily driven by wing_k × expected_move.")
+    wing_k: float = Field(default=1.0, ge=0.1, le=3.0,
+        description="Vol-scaled wing multiplier: wing_width = wing_k × price × IV × sqrt(DTE/365). "
+                    "Optuna optimizes this per walk-forward window. "
+                    "1.0 = 1-sigma expected move. wing_floor_dollars is the hard minimum.")
+    iv_floor: float = Field(default=0.20, ge=0.05, le=1.0,
+        description="Minimum synthetic IV used for option pricing. "
+                    "Prevents near-zero credits in calm markets.")
+    delta_iv_scale: float = Field(default=0.0, ge=0.0, le=1.0,
+        description="IV-driven delta scaling for strangles. "
+                    "0=static delta, 1=full IV response. "
+                    "High IV → lower effective delta → further OTM strikes.")
+    max_concurrent_positions: int = Field(default=1, ge=1, le=5,
+        description="Maximum number of simultaneously open positions. "
+                    "1 = original single-position behavior. "
+                    "3 = up to 3 concurrent iron condors / strangles.")
+    max_entry_vol_annual: float = Field(default=0.80, ge=0.15, le=1.50,
+        description="Maximum 10-day realized vol (annualized) allowed for iron condor / "
+                    "short strangle entry. Entries above this are skipped. "
+                    "Optuna tunes per window in range [0.25, 0.90].")
+    optimize_n_trials: int = Field(default=50, ge=5, le=500,
+        description="Optuna trials per walk-forward window.")
+    optimize_patience: int = Field(default=20, ge=0, le=500,
+        description="Early stopping: halt after this many consecutive non-improving trials. "
+                    "0 = disabled.")
+    optimize_min_trades: int = Field(default=10, ge=1, le=100,
+        description="Min trade count for full objective score. "
+                    "Trials below this are penalised quadratically; < 3 trades always scores −100.")
+    # Intraday execution params (Fix 1 / Gap H)
+    scan_interval_minutes: int = Field(default=60, ge=5, le=240,
+        description="How often (minutes) to scan for entry signals within a trading session.")
+    entry_window_start_et: str = Field(default="10:30",
+        description="Earliest allowed entry time (ET). Signals before this are ignored.")
+    entry_window_end_et: str = Field(default="15:30",
+        description="Latest allowed entry time (ET). No new entries after this time.")
+    limit_order_timeout_bars: int = Field(default=3, ge=1, le=20,
+        description="Cancel a pending limit order after this many 5-min bars without a fill.")
+    # Options spread model params (Fix 5)
+    spread_base: float = Field(default=0.03, ge=0.005, le=0.20,
+        description="Base per-leg half-spread cost ($). Represents minimum friction in liquid markets.")
+    spread_iv_sensitivity: float = Field(default=0.10, ge=0.0, le=0.50,
+        description="Additional half-spread per unit of IV above 0.20. Higher IV → wider market.")
+    spread_dte_sensitivity: float = Field(default=0.005, ge=0.0, le=0.05,
+        description="Additional half-spread per DTE below 21. Near-expiry options are wider.")
+    spread_cap: float = Field(default=0.15, ge=0.01, le=0.50,
+        description="Maximum per-leg half-spread ($). Prevents unrealistic spread in stress regimes.")
+    # Fractal regime params (Gap Z5) — also used by live orchestrator for parity with backtest
+    hurst_regime_threshold: float = Field(default=0.20, ge=0.05, le=0.50,
+        description="Hurst scale-spread above which fractal confidence penalty is applied.")
+    hurst_regime_penalty: float = Field(default=0.10, ge=0.0, le=0.30,
+        description="Confidence deducted when fractal regime is chaotic.")
+    multifractal_max_width: float = Field(default=0.50, ge=0.20, le=0.80,
+        description="Multifractal width above which fractal confidence penalty is applied.")
+
+
 class MLConfig(BaseModel):
     ensemble_weights: dict[str, float] = {"xgboost": 0.5, "lightgbm": 0.5}
     retrain_interval_days: int = Field(default=7, ge=1, le=30)
@@ -103,6 +164,7 @@ class SentimentConfig(BaseModel):
     weight: float = Field(default=0.20, ge=0.0, le=0.50)
     cache_ttl_seconds: int = Field(default=300, ge=60, le=3600)
     sources: SentimentSourcesConfig = SentimentSourcesConfig()
+    ib_news_weight: float = Field(default=0.20, ge=0.0, le=0.50)
 
 
 class ExitConfig(BaseModel):
@@ -125,6 +187,14 @@ class LearningConfig(BaseModel):
     min_insight_confidence: float = Field(default=0.60, ge=0.40, le=0.95)
     min_confidence_floor: float = Field(default=0.50, ge=0.40, le=0.80)
     min_confidence_ceiling: float = Field(default=0.90, ge=0.70, le=0.99)
+    paper_trading_mode: bool = Field(
+        default=False,
+        description=(
+            "When True, disables all live-only overlays (adaptor confidence/stop/trailing/"
+            "take-profit overrides, Thompson sampling reranking, meta-labeler gate, options flow gate) "
+            "to produce a clean backtest-equivalent paper-trading run for P&L comparison."
+        ),
+    )
 
 
 class TelegramConfig(BaseModel):
@@ -181,6 +251,7 @@ class Settings(BaseModel):
     positions: PositionConfig = PositionConfig()
     risk: RiskConfig = RiskConfig()
     options: OptionsConfig = OptionsConfig()
+    backtest: BacktestConfig = BacktestConfig()
     ml: MLConfig = MLConfig()
     meta_label: MetaLabelConfig = MetaLabelConfig()
     exit: ExitConfig = ExitConfig()

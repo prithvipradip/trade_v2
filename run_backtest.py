@@ -50,6 +50,10 @@ def parse_args() -> argparse.Namespace:
                    help="Min IV rank for iron condors")
     p.add_argument("--trailing-stop", action="store_true", default=True, help="Enable trailing stops")
     p.add_argument("--compare-exits", action="store_true", help="Compare fixed vs trailing stops")
+    p.add_argument("--optimize-per-window", action="store_true", default=False,
+                   help="Run Optuna optimization on each training window before testing")
+    p.add_argument("--optimize-n-trials", type=int, default=50,
+                   help="Number of Optuna trials per walk-forward window (requires --optimize-per-window)")
     return p.parse_args()
 
 
@@ -77,6 +81,8 @@ async def run_backtest(args: argparse.Namespace) -> None:
         min_confidence=args.min_confidence,
         range_min_confidence=args.range_confidence,
         trailing_stop_enabled=args.trailing_stop,
+        optimize_per_window=args.optimize_per_window,
+        optimize_n_trials=args.optimize_n_trials,
     )
 
     bt = WalkForwardBacktester(

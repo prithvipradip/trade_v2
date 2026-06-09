@@ -16,31 +16,49 @@ import structlog
 from ait.config.settings import LoggingConfig
 
 
-def setup_logging(config: LoggingConfig) -> None:
-    """Configure structured logging for the entire application."""
+def setup_logging(
+    config: LoggingConfig,
+    console_level: str | None = None,
+) -> None:
+    """Configure structured logging for the entire application.
+
+    Args:
+        config:        LoggingConfig (level controls default console threshold;
+                       file handler always records DEBUG).
+        console_level: Optional override for the console handler level.
+                       When running long experiments, pass "WARNING" to keep
+                       stdout quiet (DEBUG/INFO go only to the rotating file).
+                       Defaults to config.level when not set.
+    """
     log_path = Path(config.file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
+    _console_level = console_level or config.level
+
     # Standard library logging for file output
     root_logger = logging.getLogger()
-    root_logger.setLevel(getattr(logging, config.level))
+    root_logger.setLevel(logging.DEBUG)  # capture everything; handlers filter
 
     # Remove existing handlers
-    root_logger.handlers.clear()
+    for handler in list(root_logger.handlers):
+        try:
+            handler.close()
+        finally:
+            root_logger.removeHandler(handler)
 
-    # Console handler — human-readable
+    # Console handler — human-readable, filtered to console_level
     console = logging.StreamHandler(sys.stdout)
-    console.setLevel(getattr(logging, config.level))
+    console.setLevel(getattr(logging, _console_level))
     console.setFormatter(logging.Formatter("%(message)s"))
     root_logger.addHandler(console)
 
-    # File handler — rotating logs
+    # File handler — rotating logs, always captures DEBUG
     file_handler = RotatingFileHandler(
         config.file,
         maxBytes=config.max_bytes,
         backupCount=config.backup_count,
     )
-    file_handler.setLevel(logging.DEBUG)  # Always capture DEBUG to file
+    file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter("%(message)s"))
     root_logger.addHandler(file_handler)
 
