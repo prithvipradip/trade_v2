@@ -1,0 +1,14 @@
+date,equity,pnl,strategy,symbol,window
+2024-06-12,100212.55,212.55,iron_condor,QQQ,1
+2024-09-26,100224.24,11.69,iron_condor,QQQ,3
+2024-10-14,100717.8,493.56,iron_condor,QQQ,3
+2024-11-15,100795.17,77.37,iron_condor,QQQ,3
+2024-11-15,100665.06,-130.11,iron_condor,QQQ,3
+2025-04-03,100400.47,-264.59,iron_condor,QQQ,6
+2025-05-12,100417.31,16.84,iron_condor,QQQ,6
+2025-05-14,100337.64,-79.67,iron_condor,QQQ,6
+2025-06-04,101622.56,1284.92,iron_condor,QQQ,7
+2025-06-25,102687.3,1064.74,iron_condor,QQQ,7
+2026-02-23,102924.55,237.25,iron_condor,QQQ,11
+2026-03-03,102508.19,-416.36,iron_condor,QQQ,11
+2026-03-10,102797.6,289.41,iron_condor,QQQ,11
