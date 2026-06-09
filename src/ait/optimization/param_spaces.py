@@ -10,7 +10,11 @@ These are consumed by StrategyOptimizer._suggest_params().
 from __future__ import annotations
 
 FRACTAL_GATE_SPACE: dict[str, tuple] = {
-    "hurst_regime_threshold": ("float", 0.08, 0.30),
+    # Exp 29: floor raised 0.08 → 0.15 to prevent hard-veto overfitting.
+    # Exp 28 W06 found hurst_thr=0.108 (veto threshold=0.162) — fires on all normal
+    # trading days (OOS spreads 0.45–0.48), killing the window. 0.15 gives a minimum
+    # veto threshold of 0.225, keeping the gate sensible without fixing it.
+    "hurst_regime_threshold": ("float", 0.15, 0.30),
     "hurst_regime_penalty":   ("float", 0.0,  0.25),
     "multifractal_max_width": ("float", 0.30, 0.65),
 }
@@ -44,11 +48,9 @@ IRON_CONDOR_SPACE: dict[str, tuple] = {
     # Exp 27 tried widening to 0.70 + adding pct_from_60d_high gate — reverted in
     # Exp 28 (gate was too blunt, over-blocked W06/W07/W08).
     "iv_rank_rise_threshold": ("float", 0.25, 0.60),
-    # Exp 28: min weighted CV edge required for range predictor to make predictions.
-    # Fixes Bug 1 (engine now passes symbol → MIN_EDGE check actually fires) and
-    # Bug 2 (uses fitted weights so anti-predictive members don't veto good ones).
-    # Range [0.02, 0.15]: 0.02 = accept almost any skill, 0.15 = require strong edge.
-    "min_edge_over_baseline": ("float", 0.02, 0.15),
+    # Exp 28: added min_edge_over_baseline [0.02, 0.15] to search space. Active windows
+    # converged to 0.033–0.040; borderline windows to 0.083–0.120. Frozen at 0.05 for
+    # Exp 29 — removes one search dimension, reduces overfitting pressure on Optuna.
     **FRACTAL_GATE_SPACE,
 }
 
