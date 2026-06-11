@@ -194,15 +194,22 @@ class PortfolioManager:
                 unrealized_pnl = (current_price - trade.entry_price) * trade.quantity
         else:
             unrealized_pnl = self._option_position_unrealized(trade)
-            if unrealized_pnl is None:
-                log.warning(
-                    "cannot_price_position",
-                    trade_id=trade.trade_id,
-                    symbol=trade.symbol,
-                    strategy=trade.strategy,
-                    reason="no IBKR marks for one or more legs; skipping exit evaluation",
-                )
-                return None
+
+        # Missing marks must NOT make the position unmanageable: skip only
+        # the P&L-driven rules (stop/take-profit/partials) but keep the
+        # DTE-based safety exits (assignment risk, expiry close) alive —
+        # otherwise a position with no marks rides to expiry unprotected.
+        marks_missing = unrealized_pnl is None
+        if marks_missing:
+            unrealized_pnl = 0.0
+            log.warning(
+                "cannot_price_position",
+                trade_id=trade.trade_id,
+                symbol=trade.symbol,
+                strategy=trade.strategy,
+                reason="no IBKR marks for one or more legs; P&L exit rules "
+                       "skipped this tick, DTE safety exits still active",
+            )
 
         cost_basis = abs(trade.entry_price) * trade.quantity * multiplier
         pnl_pct = unrealized_pnl / cost_basis if cost_basis > 0 else 0.0
@@ -216,10 +223,12 @@ class PortfolioManager:
             except ValueError:
                 pass
 
-        # Update high water mark — always persist so journaling data stays accurate
+        # Update high water mark — always persist so journaling data stays
+        # accurate (but never let a marks-missing 0.0 touch it)
         prev_hwm = self._state.get_high_water_mark(trade.trade_id)
         hwm = max(prev_hwm, pnl_pct)
-        self._state.update_high_water_mark(trade.trade_id, hwm)
+        if not marks_missing:
+            self._state.update_high_water_mark(trade.trade_id, hwm)
 
         # Get learning overrides for stop/take-profit (if any)
         stop_loss_pct = self._exit_config.initial_stop_loss_pct
@@ -245,8 +254,9 @@ class PortfolioManager:
         exit_reason = ""
         partial_exit_quantity = 0
 
-        # 1. Dynamic stop loss (trailing/breakeven)
-        if pnl_pct <= effective_stop:
+        # 1. Dynamic stop loss (trailing/breakeven) — needs real marks: a
+        # marks-missing pnl_pct of 0.0 would spuriously trip a breakeven stop
+        if not marks_missing and pnl_pct <= effective_stop:
             should_exit = True
             if hwm >= breakeven_trigger and effective_stop >= 0:
                 exit_reason = f"trailing_stop (P&L: {pnl_pct:.1%}, peak: {hwm:.1%}, stop: {effective_stop:.1%})"
@@ -255,11 +265,11 @@ class PortfolioManager:
             else:
                 exit_reason = f"stop_loss (P&L: {pnl_pct:.1%})"
 
-        # 2. Take profit (time-decay adjusted)
-        elif not is_credit and pnl_pct >= take_profit_long:
+        # 2. Take profit (time-decay adjusted) — needs real marks
+        elif not marks_missing and not is_credit and pnl_pct >= take_profit_long:
             should_exit = True
             exit_reason = f"take_profit (P&L: {pnl_pct:.1%}, target: {take_profit_long:.1%})"
-        elif is_credit and pnl_pct >= take_profit_short:
+        elif not marks_missing and is_credit and pnl_pct >= take_profit_short:
             should_exit = True
             exit_reason = f"take_profit_short (P&L: {pnl_pct:.1%}, target: {take_profit_short:.1%})"
 
@@ -336,8 +346,9 @@ class PortfolioManager:
             except Exception:
                 pass
 
-        # 4. Check for partial exit milestones (only if not already exiting fully)
-        if not should_exit and trade.quantity > 1:
+        # 4. Check for partial exit milestones (only if not already exiting
+        # fully, and only with real marks)
+        if not should_exit and not marks_missing and trade.quantity > 1:
             partial_exit_quantity = self._check_partial_exit(
                 trade.trade_id, pnl_pct, trade.quantity,
             )

@@ -325,3 +325,135 @@ class TestReconcilerMatching:
         # debit expired worthless -> full loss, correctly signed + flagged
         assert kwargs["realized_pnl"] == pytest.approx(-2400.0)
         assert kwargs["exit_reason_detailed"] == "reconciler_estimate_expired_worthless"
+
+
+# ---------------------------------------------------------------------------
+# 5. exit-path fixes (2026-06-11 round 2)
+
+
+class TestExitFillPriceSigned:
+    def _executor(self):
+        ex = TradeExecutor.__new__(TradeExecutor)
+        return ex
+
+    def _bag_trade(self, order_id=1, avg=float("nan"), fills=(), qty=1):
+        t = MagicMock()
+        t.order.orderId = order_id
+        t.order.totalQuantity = qty
+        t.orderStatus.avgFillPrice = avg
+        t.orderStatus.status = "Filled"
+        t.orderStatus.filled = qty
+        t.contract.secType = "BAG"
+        t.fills = list(fills)
+        return t
+
+    def test_negative_avg_fill_price_accepted(self):
+        # Closing a debit straddle via reversed legs: as-defined price is
+        # negative (credit received). The old code rejected it.
+        ex = self._executor()
+        assert ex._get_exit_fill_price(1, [self._bag_trade(avg=-30.0)]) == -30.0
+
+    def test_bag_fills_fallback_is_side_aware(self):
+        # 2-leg combo close, 1 contract: SELL call @2.00, SELL put @0.80
+        # net received = 2.80/contract -> as-defined price = -2.80
+        def fill(side, price, shares):
+            f = MagicMock()
+            f.execution.side = side
+            f.execution.price = price
+            f.execution.shares = shares
+            return f
+        ex = self._executor()
+        t = self._bag_trade(avg=float("nan"), qty=1,
+                            fills=[fill("SLD", 2.00, 100), fill("SLD", 0.80, 100)])
+        assert ex._get_exit_fill_price(1, [t]) == pytest.approx(-2.80)
+
+    def test_bag_mixed_side_fills(self):
+        # closing a debit vertical: SELL long leg @2.00, BUY short leg @0.80
+        # net received = 1.20 -> as-defined -1.20 (NOT the naive VWAP 1.40)
+        def fill(side, price, shares):
+            f = MagicMock()
+            f.execution.side = side
+            f.execution.price = price
+            f.execution.shares = shares
+            return f
+        ex = self._executor()
+        t = self._bag_trade(avg=float("nan"), qty=1,
+                            fills=[fill("SLD", 2.00, 100), fill("BOT", 0.80, 100)])
+        assert ex._get_exit_fill_price(1, [t]) == pytest.approx(-1.20)
+
+
+class TestCloseDirection:
+    """The close action must reverse the POSITION (credit=buy back,
+    debit=sell), never the market bias stored in trade.direction."""
+
+    def test_credit_strategies_close_with_buy(self):
+        for strat in ("cash_secured_put", "covered_call", "iron_condor", "short_strangle"):
+            close_action = "BUY" if strat in CREDIT_STRATEGIES else "SELL"
+            assert close_action == "BUY", strat
+
+    def test_debit_strategies_close_with_sell(self):
+        for strat in ("long_call", "long_put", "long_straddle", "event_straddle",
+                      "bull_call_spread", "bear_put_spread", "calendar_spread"):
+            close_action = "BUY" if strat in CREDIT_STRATEGIES else "SELL"
+            assert close_action == "SELL", strat
+
+
+class TestLegFields:
+    def test_contract_shaped_leg(self):
+        c = MagicMock()
+        c.strike = 635.0
+        c.right = "C"
+        c.expiry = "2026-07-17"
+        strike, right, expiry = TradeExecutor._leg_fields({"contract": c, "action": "BUY"})
+        assert (strike, right, expiry) == (635.0, "C", "2026-07-17")
+
+    def test_dict_shaped_leg_event_straddle(self):
+        # event_straddle/calendar emit plain dicts — these used to KeyError
+        leg = {"strike": 600.0, "right": "P", "action": "BUY", "expiry": "2026-06-17"}
+        strike, right, expiry = TradeExecutor._leg_fields(leg)
+        assert (strike, right, expiry) == (600.0, "P", "2026-06-17")
+
+
+class TestMarksMissingSafetyExits:
+    """Missing IBKR marks must not disable DTE-based safety exits."""
+
+    @pytest.mark.asyncio
+    async def test_expiring_position_still_closed_without_marks(self):
+        from datetime import date as _date, timedelta
+        from ait.execution.portfolio import PortfolioManager
+        mgr = PortfolioManager.__new__(PortfolioManager)
+        mgr._ibkr = MagicMock()
+        mgr._ibkr.ib.portfolio.return_value = []   # no marks at all
+        mgr._state = MagicMock()
+        mgr._state.get_high_water_mark.return_value = 0.0
+        mgr._market_data = MagicMock()
+        async def _price(symbol):
+            return 600.0
+        mgr._market_data.get_current_price = _price
+        from ait.config.settings import ExitConfig
+        mgr._exit_config = ExitConfig()
+        mgr._earnings = None
+        mgr._economic_cal = None
+        async def _vol_mult(symbol):
+            return 1.0
+        mgr._get_volatility_stop_multiplier = _vol_mult
+        mgr._pdt_guard = MagicMock()
+        mgr._pdt_guard.would_be_day_trade.return_value = False
+
+        legs = json.dumps([
+            {"strike": 635.0, "right": "C", "action": "BUY", "expiry": "2026-06-15"},
+            {"strike": 635.0, "right": "P", "action": "BUY", "expiry": "2026-06-15"},
+        ])
+        trade = FakeTrade(24.0, 1, "spread", "long_straddle", legs=legs,
+                          expiry=(_date.today() + timedelta(days=3)).isoformat())
+        trade.direction = MagicMock()
+        trade.direction.value = "long"
+        trade.trade_id = "T-MARKS"
+        trade.entry_time = "2026-06-01T10:00:00"
+
+        status = await mgr._evaluate_position(trade)
+        # Old behavior: returned None (position invisible / unexitable).
+        # New behavior: still evaluated; DTE<=5 rule forces the close.
+        assert status is not None
+        assert status.should_exit
+        assert "expiry_approaching" in status.exit_reason

@@ -170,14 +170,24 @@ class PositionReconciler:
                 log.warning("reconcile_new_ibkr_position", position=key)
 
         # Check local positions not in IBKR (may have been closed while bot was down).
-        # SAFETY: if IBKR reports ZERO positions while we hold open local trades,
-        # the position list is almost certainly stale/unsynced (fresh connect,
-        # Gateway reset) — refuse to mass-close on it.
-        if not ibkr_map and local_entries:
+        # SAFETY: if IBKR reports ZERO OPTION positions while we hold open
+        # local OPTION trades, the position list is almost certainly
+        # stale/unsynced (fresh connect, Gateway reset, reqPositions timeout
+        # that ib_insync only logs) — refuse to mass-close on it. Checking
+        # options specifically: an unrelated stock position (e.g. an
+        # assignment artifact) must not disarm this guard.
+        ibkr_has_options = any(
+            v.get("sec_type") == "OPT" for v in ibkr_map.values()
+        )
+        local_has_options = any(
+            t.contract_type != "stock" for t, _ in local_entries
+        )
+        if local_has_options and not ibkr_has_options:
             log.warning(
                 "reconcile_skipping_stale_close",
                 open_local_trades=len(local_entries),
-                reason="IBKR returned zero positions; refusing to mass-close local trades",
+                reason="IBKR shows no option positions while local option "
+                       "trades are open; refusing to mass-close",
             )
             local_entries = []
 
@@ -185,6 +195,22 @@ class PositionReconciler:
         # any surviving leg means the position (or part of it) is still live.
         for trade, keys in local_entries:
             if not keys.isdisjoint(ibkr_map):
+                # Some legs alive. If OTHERS are missing, this is a partial
+                # assignment/exercise — flag it loudly; the position needs
+                # human attention (we never auto-close half a structure).
+                missing = [k for k in keys if k not in ibkr_map]
+                if missing:
+                    msg = (
+                        f"PARTIAL legs missing for {trade.trade_id} "
+                        f"({trade.strategy}): {missing} — possible assignment"
+                    )
+                    result.discrepancies.append(msg)
+                    log.warning(
+                        "reconcile_partial_legs_missing",
+                        trade_id=trade.trade_id,
+                        strategy=trade.strategy,
+                        missing_legs=missing,
+                    )
                 continue
             result.stale_local += 1
             msg = f"Local position not in IBKR (likely closed): {trade.trade_id}"
