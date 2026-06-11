@@ -465,7 +465,10 @@ class TradingOrchestrator:
                 stats.trades_won += 1
             else:
                 stats.trades_lost += 1
-                self._circuit_breaker.record_trade_result(realized_pnl)
+            # Feed ALL results to the breaker, not just losses — its daily
+            # P&L must net wins against losses or it trips on any losing
+            # streak within an otherwise green day.
+            self._circuit_breaker.record_trade_result(realized_pnl)
             self._state.update_daily_stats(stats)
 
             trade = self._find_trade_by_id(trade_id)

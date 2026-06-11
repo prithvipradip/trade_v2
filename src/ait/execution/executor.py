@@ -22,7 +22,7 @@ from ait.broker.ibkr_client import IBKRClient
 from ait.broker.orders import OrderBuilder
 from ait.bot.state import StateManager, TradeDirection, TradeRecord, TradeStatus
 from ait.risk.circuit_breaker import CircuitBreaker
-from ait.strategies.base import Signal, SignalDirection
+from ait.strategies.base import CREDIT_STRATEGIES, Signal, SignalDirection
 from ait.utils.logging import get_logger
 
 log = get_logger("execution.executor")
@@ -410,26 +410,37 @@ class TradeExecutor:
             if exit_status == "filled":
                 actual_exit_price = self._get_exit_fill_price(order_id, all_trades)
 
-                # Calculate realized P&L from actual fill price, not estimate
+                # Calculate realized P&L from actual fill price when known.
+                # 0.0 is a real price (closed at worthless); only None means
+                # "no fill data" — then fall back to the estimate and FLAG it
+                # so downstream analytics can exclude these rows.
                 trade_record = self._state.get_trade_by_id(pending_exit.trade_id)
-                if trade_record and actual_exit_price > 0:
+                exit_reason = pending_exit.exit_reason
+                if trade_record and actual_exit_price is not None:
                     realized_pnl = self._calculate_realized_pnl(
                         trade_record, actual_exit_price
                     )
                 else:
                     realized_pnl = pending_exit.estimated_pnl
+                    exit_reason = f"{exit_reason}|pnl_estimate_no_fill_price"
+                    log.warning(
+                        "exit_fill_price_missing",
+                        trade_id=pending_exit.trade_id,
+                        order_id=order_id,
+                        estimated_pnl=realized_pnl,
+                    )
 
                 self._state.close_trade(
                     trade_id=pending_exit.trade_id,
-                    exit_price=actual_exit_price,
+                    exit_price=actual_exit_price if actual_exit_price is not None else 0.0,
                     realized_pnl=realized_pnl,
-                    exit_reason_detailed=pending_exit.exit_reason,
+                    exit_reason_detailed=exit_reason,
                 )
                 completed_exits.append({
                     "trade_id": pending_exit.trade_id,
-                    "exit_price": actual_exit_price,
+                    "exit_price": actual_exit_price if actual_exit_price is not None else 0.0,
                     "realized_pnl": realized_pnl,
-                    "exit_reason": pending_exit.exit_reason,
+                    "exit_reason": exit_reason,
                 })
                 log.info(
                     "exit_order_filled",
@@ -558,41 +569,56 @@ class TradeExecutor:
         # rather than falsely cancelling fresh orders
         return "pending"
 
-    def _get_exit_fill_price(self, order_id: int, all_trades: list) -> float:
-        """Get the actual fill price for an exit order."""
+    def _get_exit_fill_price(self, order_id: int, all_trades: list) -> float | None:
+        """Get the actual fill price for an exit order.
+
+        Returns None when no fill data is available. 0.0 (or a tiny negative
+        float residue from combo pricing) is a LEGITIMATE fill price for a
+        position closed at/near worthless — callers must distinguish
+        "no data" (None) from "filled at ~zero".
+        """
         for trade in all_trades:
             if trade.order.orderId == order_id:
                 avg_price = trade.orderStatus.avgFillPrice
                 if avg_price and avg_price > 0:
                     return avg_price
-                # Fallback: check individual fills
+                # Fallback: per-fill VWAP across executions
                 if trade.fills:
                     total_cost = sum(f.execution.price * f.execution.shares for f in trade.fills)
                     total_shares = sum(f.execution.shares for f in trade.fills)
                     if total_shares > 0:
                         return total_cost / total_shares
-        return 0.0
+                # Order is known to IBKR but reported no usable price; a
+                # filled combo can legitimately average to ~0.0
+                if (trade.orderStatus.filled or 0) > 0:
+                    return 0.0
+                return None
+        return None
+
+    # Entry cash-flow direction lives in CREDIT_STRATEGIES (strategies/base.py).
+    # Everything not listed there is DEBIT — long options, straddles,
+    # calendars, and debit spreads (bull_call_spread / bear_put_spread are
+    # DEBIT despite having 2 legs like a credit spread).
+    CREDIT_STRATEGIES = CREDIT_STRATEGIES
 
     def _calculate_realized_pnl(self, trade, exit_price: float) -> float:
         """Calculate realized P&L from entry and exit prices.
 
-        For options, multiplier is 100 (1 contract = 100 shares).
-        For credit strategies (iron condor, cash secured put), entry is credit received.
+        Direction is decided by the STRATEGY's cash-flow sign, not leg count:
+        a long straddle and a credit spread both have 2 legs but opposite
+        P&L formulas. contract_type alone is ambiguous here.
         """
         multiplier = 100  # options multiplier
         entry = trade.entry_price
         qty = trade.quantity
 
-        if trade.contract_type in ("iron_condor", "spread"):
-            # Credit/debit spreads: P&L = (entry_credit - exit_debit) * multiplier
-            pnl = (entry - exit_price) * multiplier * qty
-        elif trade.strategy == "cash_secured_put":
-            pnl = (entry - exit_price) * multiplier * qty
-        elif trade.contract_type in ("call", "put"):
-            pnl = (exit_price - entry) * multiplier * qty
-        elif trade.contract_type == "stock":
+        if trade.contract_type == "stock":
             pnl = (exit_price - entry) * qty
+        elif trade.strategy in self.CREDIT_STRATEGIES:
+            # Credit: collected `entry` to open, pay `exit_price` to close
+            pnl = (entry - exit_price) * multiplier * qty
         else:
+            # Debit: paid `entry` to open, receive `exit_price` on close
             pnl = (exit_price - entry) * multiplier * qty
 
         # Subtract commissions: ~$0.65/contract/side (IBKR tiered pricing)
@@ -600,7 +626,9 @@ class TradeExecutor:
         legs_per_side = 1
         if trade.contract_type == "iron_condor":
             legs_per_side = 4
-        elif trade.contract_type == "spread" or trade.strategy == "long_straddle":
+        elif trade.contract_type == "spread" or trade.strategy in (
+            "long_straddle", "event_straddle", "short_strangle", "calendar_spread",
+        ):
             legs_per_side = 2
         commission = 0.65 * legs_per_side * qty * 2  # entry + exit
         pnl -= commission

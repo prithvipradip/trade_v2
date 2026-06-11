@@ -9,12 +9,14 @@ When the bot restarts (crash, manual stop, etc.), this module:
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
 
 from ait.broker.ibkr_client import IBKRClient
 from ait.bot.state import StateManager, TradeStatus
+from ait.strategies.base import CREDIT_STRATEGIES
 from ait.utils.logging import get_logger
 
 log = get_logger("execution.reconciler")
@@ -97,22 +99,45 @@ class PositionReconciler:
                 "contract": pos.contract,
             }
 
-        # Get local open trades and build map with matching normalized keys
+        # Get local open trades. Multi-leg positions live in IBKR as 2-4
+        # SEPARATE option positions, so each local trade maps to a SET of
+        # leg keys (from its legs JSON) — a single synthesized key can never
+        # match a condor's 4 legs and historically caused every multi-leg
+        # trade to be declared stale and force-closed at the first sweep.
         local_trades = self._state.get_open_trades()
-        local_map: dict[str, dict] = {}
+        local_entries: list[tuple] = []  # (trade, set_of_leg_keys)
+        local_map: dict[str, dict] = {}  # any leg key -> {"trade": trade}
         for trade in local_trades:
-            if trade.strike:
+            keys: set[str] = set()
+            try:
+                legs = json.loads(trade.legs) if trade.legs else []
+            except (ValueError, TypeError):
+                legs = []
+            if legs:
+                for leg in legs:
+                    try:
+                        keys.add(self._make_position_key(
+                            symbol=trade.symbol,
+                            strike=float(leg["strike"]),
+                            right=str(leg["right"]),
+                            expiry=str(leg.get("expiry", "")),
+                        ))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+            if not keys and trade.strike:
                 right = "C" if "call" in trade.strategy else "P"
-                key = self._make_position_key(
+                keys.add(self._make_position_key(
                     symbol=trade.symbol,
                     strike=trade.strike,
                     right=right,
                     expiry=trade.expiry or "",
-                )
-            else:
+                ))
+            if not keys:
                 # Stock positions
-                key = f"{trade.symbol}:STK"
-            local_map[key] = {"trade": trade}
+                keys.add(f"{trade.symbol}:STK")
+            local_entries.append((trade, keys))
+            for key in keys:
+                local_map[key] = {"trade": trade}
 
         result = ReconciliationResult(
             matched=0,
@@ -144,42 +169,85 @@ class PositionReconciler:
                 result.discrepancies.append(msg)
                 log.warning("reconcile_new_ibkr_position", position=key)
 
-        # Check local positions not in IBKR (may have been closed while bot was down)
-        for key, local_data in local_map.items():
-            if key not in ibkr_map:
-                result.stale_local += 1
-                trade = local_data["trade"]
-                msg = f"Local position not in IBKR (likely closed): {key}"
-                result.discrepancies.append(msg)
-                log.warning("reconcile_stale_local", position=key, trade_id=trade.trade_id)
+        # Check local positions not in IBKR (may have been closed while bot was down).
+        # SAFETY: if IBKR reports ZERO positions while we hold open local trades,
+        # the position list is almost certainly stale/unsynced (fresh connect,
+        # Gateway reset) — refuse to mass-close on it.
+        if not ibkr_map and local_entries:
+            log.warning(
+                "reconcile_skipping_stale_close",
+                open_local_trades=len(local_entries),
+                reason="IBKR returned zero positions; refusing to mass-close local trades",
+            )
+            local_entries = []
+
+        # A multi-leg trade is stale only when NONE of its legs exist in IBKR;
+        # any surviving leg means the position (or part of it) is still live.
+        for trade, keys in local_entries:
+            if not keys.isdisjoint(ibkr_map):
+                continue
+            result.stale_local += 1
+            msg = f"Local position not in IBKR (likely closed): {trade.trade_id}"
+            result.discrepancies.append(msg)
+            log.warning("reconcile_stale_local", trade_id=trade.trade_id,
+                        symbol=trade.symbol, strategy=trade.strategy)
 
                 # Try to get realized P&L from IBKR portfolio items
-                exit_price = 0.0
-                realized_pnl = 0.0
-                for item in ibkr_portfolio:
-                    sym = item.contract.symbol
-                    if sym == trade.symbol and item.position == 0 and item.realizedPNL != 0:
-                        realized_pnl = item.realizedPNL
-                        break
+            exit_price = 0.0
+            realized_pnl = 0.0
+            exit_reason = "reconciler_ibkr_realized"
+            found_ibkr_pnl = False
+            for item in ibkr_portfolio:
+                sym = item.contract.symbol
+                if sym == trade.symbol and item.position == 0 and item.realizedPNL != 0:
+                    realized_pnl = item.realizedPNL
+                    found_ibkr_pnl = True
+                    break
 
-                # If no IBKR data, estimate from entry price (assume worthless expiry)
-                if realized_pnl == 0 and trade.entry_price > 0:
-                    multiplier = 100 if trade.contract_type != "stock" else 1
-                    if trade.strategy in ("cash_secured_put", "iron_condor"):
-                        # Credit strategy expired worthless = full premium kept
+            if not found_ibkr_pnl and trade.entry_price > 0:
+                # No IBKR data. Only assume "expired worthless" when the
+                # position has actually reached expiry; a position that
+                # vanished mid-life was closed at an unknown price and
+                # recording a full win/loss would be fiction.
+                expired = False
+                if trade.expiry:
+                    try:
+                        expired = datetime.fromisoformat(trade.expiry).date() <= datetime.now().date()
+                    except ValueError:
+                        pass
+
+                multiplier = 100 if trade.contract_type != "stock" else 1
+                if expired:
+                    if trade.strategy in CREDIT_STRATEGIES:
+                        # Credit expired worthless = full premium kept
                         realized_pnl = trade.entry_price * multiplier * trade.quantity
                     else:
-                        # Long option expired worthless = full loss
+                        # Debit expired worthless = full loss
                         realized_pnl = -trade.entry_price * multiplier * trade.quantity
+                    exit_reason = "reconciler_estimate_expired_worthless"
+                else:
+                    # Unknown exit — record neutral P&L and flag for review
+                    # rather than inventing a number.
+                    realized_pnl = 0.0
+                    exit_reason = "reconciler_unknown_exit"
+                    log.warning(
+                        "reconcile_unknown_exit",
+                        trade_id=trade.trade_id,
+                        symbol=trade.symbol,
+                        strategy=trade.strategy,
+                        note="position gone from IBKR before expiry; true exit price unrecoverable",
+                    )
 
-                log.info("reconcile_closing_stale", trade_id=trade.trade_id,
-                         exit_price=exit_price, realized_pnl=realized_pnl)
+            log.info("reconcile_closing_stale", trade_id=trade.trade_id,
+                     exit_price=exit_price, realized_pnl=realized_pnl,
+                     exit_reason=exit_reason)
 
-                self._state.close_trade(
-                    trade_id=trade.trade_id,
-                    exit_price=exit_price,
-                    realized_pnl=realized_pnl,
-                )
+            self._state.close_trade(
+                trade_id=trade.trade_id,
+                exit_price=exit_price,
+                realized_pnl=realized_pnl,
+                exit_reason_detailed=exit_reason,
+            )
 
         # Update portfolio value in IBKR for reconciliation
         for item in ibkr_portfolio:
