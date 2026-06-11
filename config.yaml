@@ -28,7 +28,7 @@ risk:
   max_consecutive_losses: 3            # Pause after 3 consecutive losses
   pause_minutes_after_losses: 30       # Cool-down period
   max_api_failures: 5                  # Halt after 5 API failures in 10 min
-  min_confidence: 0.65                 # Minimum ML confidence to trade
+  min_confidence: 0.55                 # Lowered for GARCH ensemble (range predictor outputs 0.58-0.62 in calm markets)
 
 options:
   delta_range: [0.20, 0.50]            # Target delta for long options
