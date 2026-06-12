@@ -234,17 +234,65 @@ class IBKRClient:
         return self._ib.portfolio()
 
     async def get_account_values(self) -> dict[str, str]:
-        """Get account summary values as a dict."""
+        """Get account summary values, normalized to USD.
+
+        IBKR reports each tag once per currency. For a CAD-base account,
+        NetLiquidation/BuyingPower/etc. arrive in CAD only, while option
+        costs downstream are in USD — comparing them directly silently
+        skewed every risk limit. Here we pick the authoritative base-currency
+        total for each tag and convert it to USD using IBKR's own
+        ExchangeRate, so the whole risk layer is denominated consistently.
+
+        ExchangeRate for currency C = units of BASE per 1 unit of C. The USD
+        rate (e.g. 1.3976 CAD per USD) converts base totals to USD via
+        division. A USD-base account has rate 1.0 and is unchanged.
+        """
         if not await self.ensure_connected():
             return {}
         raw = self._ib.accountValues()
-        values = {}
+
+        # FX + base-currency detection from the ExchangeRate rows.
+        usd_to_base = 1.0
+        base_ccy: str | None = None
         for av in raw:
-            if av.currency in ("USD", "CAD", "BASE", ""):
-                values[av.tag] = av.value
-        nlv = values.get("NetLiquidation", "missing")
+            if av.tag != "ExchangeRate":
+                continue
+            try:
+                rate = float(av.value)
+            except ValueError:
+                continue
+            if av.currency == "USD":
+                usd_to_base = rate
+            elif av.currency not in ("BASE", "USD", "") and abs(rate - 1.0) < 1e-9:
+                base_ccy = av.currency  # base currency has rate 1.0
+
+        # Collect each tag's base-currency total (the "BASE" row is the
+        # authoritative multi-currency total; the base-currency-code row is
+        # the fallback). Keep USD-only rows separately for tags that have no
+        # base total at all.
+        base_vals: dict[str, str] = {}
+        usd_vals: dict[str, str] = {}
+        for av in raw:
+            if av.currency == "BASE":
+                base_vals[av.tag] = av.value           # always wins
+            elif base_ccy and av.currency == base_ccy:
+                base_vals.setdefault(av.tag, av.value)  # only if no BASE row
+            elif av.currency == "USD":
+                usd_vals[av.tag] = av.value
+
+        values: dict[str, str] = {}
+        for tag in set(base_vals) | set(usd_vals):
+            if tag in base_vals:
+                try:
+                    values[tag] = f"{float(base_vals[tag]) / usd_to_base:.2f}"
+                except (ValueError, ZeroDivisionError):
+                    values[tag] = base_vals[tag]
+            else:
+                values[tag] = usd_vals[tag]  # already USD
+
         log.info("account_values_fetched", count=len(values), raw_count=len(raw),
-                 net_liquidation=nlv)
+                 net_liquidation=values.get("NetLiquidation", "missing"),
+                 base_currency=base_ccy or "USD", usd_to_base=round(usd_to_base, 4))
         return values
 
 
