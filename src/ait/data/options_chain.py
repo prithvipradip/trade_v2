@@ -7,6 +7,7 @@ Calculates Greeks using py_vollib for proper Black-Scholes pricing.
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
@@ -64,7 +65,6 @@ class OptionContract:
     def is_liquid(self) -> bool:
         # Env-tunable so we can loosen on paper / delayed-data accounts where
         # `volume` is often 0 because it's a live tick stream we don't get.
-        import os
         try:
             min_vol = int(os.environ.get("AIT_LIQ_MIN_VOLUME", "50"))
         except (ValueError, TypeError):

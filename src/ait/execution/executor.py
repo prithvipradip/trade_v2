@@ -685,7 +685,7 @@ class TradeExecutor:
                 "expiry": expiry,
             }
             for leg in signal.legs
-            for strike, right, expiry in (self._leg_fields(leg),)
+            for strike, right, expiry in [self._leg_fields(leg)]
         ]) if signal.legs else "[]"
 
         # Insert into open_positions so HWM / partial-exit tracking works

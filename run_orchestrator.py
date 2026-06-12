@@ -34,9 +34,10 @@ if _env_file.exists():
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, val = line.partition("=")
-        val = val.strip().strip('"').strip("'")
-        # strip inline comments (e.g. `value  # comment`)
+        val = val.strip()
+        # strip inline comments before quotes so quoted values are handled correctly
         val = val.split("#")[0].rstrip()
+        val = val.strip('"').strip("'")
         key = key.strip()
         if key and key not in os.environ:
             os.environ[key] = val
