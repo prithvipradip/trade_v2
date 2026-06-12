@@ -675,15 +675,17 @@ class TradeExecutor:
         # so use update_trade_status for existing rows)
         self._state.update_trade_status(pending.trade_id, TradeStatus.FILLED)
 
-        # Build legs JSON for open_positions
+        # Build legs JSON for open_positions (handles both contract-shaped and
+        # plain-dict legs via _leg_fields so dict-shaped legs don't crash here)
         legs_json = json.dumps([
             {
-                "strike": leg["contract"].strike,
-                "right": leg["contract"].right,
+                "strike": strike,
+                "right": right,
                 "action": leg["action"],
-                "expiry": str(leg["contract"].expiry),
+                "expiry": expiry,
             }
             for leg in signal.legs
+            for strike, right, expiry in (self._leg_fields(leg),)
         ]) if signal.legs else "[]"
 
         # Insert into open_positions so HWM / partial-exit tracking works

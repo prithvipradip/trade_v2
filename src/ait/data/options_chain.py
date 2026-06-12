@@ -65,9 +65,18 @@ class OptionContract:
         # Env-tunable so we can loosen on paper / delayed-data accounts where
         # `volume` is often 0 because it's a live tick stream we don't get.
         import os
-        min_vol = int(os.environ.get("AIT_LIQ_MIN_VOLUME", "50"))
-        min_oi = int(os.environ.get("AIT_LIQ_MIN_OI", "100"))
-        max_spread = float(os.environ.get("AIT_LIQ_MAX_SPREAD", "0.15"))
+        try:
+            min_vol = int(os.environ.get("AIT_LIQ_MIN_VOLUME", "50"))
+        except (ValueError, TypeError):
+            min_vol = 50
+        try:
+            min_oi = int(os.environ.get("AIT_LIQ_MIN_OI", "100"))
+        except (ValueError, TypeError):
+            min_oi = 100
+        try:
+            max_spread = float(os.environ.get("AIT_LIQ_MAX_SPREAD", "0.15"))
+        except (ValueError, TypeError):
+            max_spread = 0.15
         return self.volume >= min_vol and self.open_interest >= min_oi and self.spread_pct < max_spread
 
 

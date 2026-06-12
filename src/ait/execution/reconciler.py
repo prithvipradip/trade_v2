@@ -218,7 +218,7 @@ class PositionReconciler:
             log.warning("reconcile_stale_local", trade_id=trade.trade_id,
                         symbol=trade.symbol, strategy=trade.strategy)
 
-                # Try to get realized P&L from IBKR portfolio items
+            # Try to get realized P&L from IBKR portfolio items
             exit_price = 0.0
             realized_pnl = 0.0
             exit_reason = "reconciler_ibkr_realized"
