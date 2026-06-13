@@ -281,16 +281,9 @@ class TradeExecutor:
             legs=qualified_legs,
         )
 
-        # Determine if this is a credit spread by checking the legs:
-        # if more legs are selling than buying, it's a net credit trade.
-        # For debit spreads (bull call, bear put), entry_price is positive debit.
-        # For credit spreads (iron condor, short strangle), IBKR expects negative limit.
-        if signal.legs:
-            sell_count = sum(1 for leg in signal.legs if leg["action"] == "SELL")
-            buy_count = len(signal.legs) - sell_count
-            is_credit = sell_count > buy_count
-        else:
-            is_credit = signal.action == "SELL"
+        # Determine credit/debit from strategy cash-flow sign.
+        # Leg counts are ambiguous (e.g. iron condor has 2 BUY + 2 SELL but is CREDIT).
+        is_credit = signal.strategy_name in self.CREDIT_STRATEGIES
 
         # Aggressive pricing: accept ~$0.05 below mid to improve fill rate.
         # Mid prices rarely fill on multi-leg combos — MMs take a few cents.
@@ -550,8 +543,10 @@ class TradeExecutor:
         for trade in all_trades:
             if trade.order.orderId == order_id:
                 avg_price = trade.orderStatus.avgFillPrice
-                if avg_price and avg_price > 0:
+                if avg_price is not None and not math.isnan(avg_price) and avg_price != 0:
                     return avg_price
+                if (trade.orderStatus.filled or 0) > 0:
+                    return 0.0
 
         return pending.signal.entry_price  # Fallback to expected price
 

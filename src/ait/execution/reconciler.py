@@ -106,7 +106,7 @@ class PositionReconciler:
         # trade to be declared stale and force-closed at the first sweep.
         local_trades = self._state.get_open_trades()
         local_entries: list[tuple] = []  # (trade, set_of_leg_keys)
-        local_map: dict[str, dict] = {}  # any leg key -> {"trade": trade}
+        local_map: dict[str, list] = {}  # any leg key -> [trade, ...]
         for trade in local_trades:
             keys: set[str] = set()
             try:
@@ -137,7 +137,7 @@ class PositionReconciler:
                 keys.add(f"{trade.symbol}:STK")
             local_entries.append((trade, keys))
             for key in keys:
-                local_map[key] = {"trade": trade}
+                local_map.setdefault(key, []).append(trade)
 
         result = ReconciliationResult(
             matched=0,
@@ -151,15 +151,16 @@ class PositionReconciler:
             if key in local_map:
                 result.matched += 1
                 # Check quantity matches
-                local_trade = local_map[key]["trade"]
-                if abs(ibkr_pos["quantity"]) != abs(local_trade.quantity):
+                matching_trades = local_map[key]
+                local_qty = sum(abs(t.quantity) for t in matching_trades)
+                if abs(ibkr_pos["quantity"]) != local_qty:
                     msg = (
                         f"Quantity mismatch for {key}: "
-                        f"IBKR={ibkr_pos['quantity']}, local={local_trade.quantity}"
+                        f"IBKR={ibkr_pos['quantity']}, local_total={local_qty}"
                     )
                     result.discrepancies.append(msg)
                     log.warning("reconcile_quantity_mismatch", position=key,
-                                ibkr_qty=ibkr_pos["quantity"], local_qty=local_trade.quantity)
+                                ibkr_qty=ibkr_pos["quantity"], local_qty=local_qty)
             else:
                 result.new_from_ibkr += 1
                 msg = (

@@ -35,9 +35,15 @@ if _env_file.exists():
             continue
         key, _, val = line.partition("=")
         val = val.strip()
-        # strip inline comments before quotes so quoted values are handled correctly
-        val = val.split("#")[0].rstrip()
-        val = val.strip('"').strip("'")
+        if val and val[0] in {'"', "'"}:
+            quote = val[0]
+            end = val.find(quote, 1)
+            if end != -1:
+                val = val[1:end]
+            else:
+                val = val[1:]
+        else:
+            val = val.split("#", 1)[0].rstrip()
         key = key.strip()
         if key and key not in os.environ:
             os.environ[key] = val
