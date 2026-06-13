@@ -45,8 +45,8 @@ class RiskConfig(BaseModel):
 class OptionsConfig(BaseModel):
     delta_range: list[float] = [0.20, 0.50]
     dte_range: list[int] = [14, 45]
-    min_open_interest: int = Field(default=100, ge=10)
-    min_volume: int = Field(default=50, ge=10)
+    min_open_interest: int = Field(default=100, ge=0)
+    min_volume: int = Field(default=50, ge=0)
     max_bid_ask_spread_pct: float = Field(default=0.10, ge=0.01, le=0.50)
     strategies: list[str] = [
         "long_call",

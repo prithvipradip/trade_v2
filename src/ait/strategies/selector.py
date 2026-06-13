@@ -13,6 +13,7 @@ from ait.data.options_chain import OptionsChain
 from ait.strategies.base import Signal, SignalDirection, Strategy
 from ait.strategies.calendar import CalendarSpread
 from ait.strategies.covered import CashSecuredPut, CoveredCall
+from ait.strategies.event_straddle import EventStraddle
 from ait.strategies.iron_condor import IronCondor
 from ait.strategies.long_options import LongCall, LongPut
 from ait.strategies.spreads import BearPutSpread, BullCallSpread
@@ -42,10 +43,14 @@ class StrategySelector:
         self._config = config
         self._strategies: list[Strategy] = []
         self._calendar = None  # multi-expiry strategy, separate path
+        self._event_straddle = None  # needs economic_cal + multi-expiry, separate path
 
         for name in config.strategies:
             if name == "calendar_spread":
                 self._calendar = CalendarSpread()
+                continue
+            if name == "event_straddle":
+                self._event_straddle = EventStraddle()
                 continue
             cls = STRATEGY_MAP.get(name)
             if cls:
@@ -56,8 +61,12 @@ class StrategySelector:
         names = [s.name for s in self._strategies]
         if self._calendar:
             names.append(self._calendar.name)
+        if self._event_straddle:
+            names.append(self._event_straddle.name)
         log.info("strategies_loaded",
-                 count=len(self._strategies) + (1 if self._calendar else 0),
+                 count=len(self._strategies)
+                       + (1 if self._calendar else 0)
+                       + (1 if self._event_straddle else 0),
                  names=names)
 
     def generate_calendar_signals(
@@ -81,6 +90,31 @@ class StrategySelector:
             )
         except Exception as e:
             log.warning("calendar_signal_error", symbol=symbol, error=str(e))
+            return []
+
+    def generate_event_straddle_signals(
+        self,
+        symbol: str,
+        chains: list[OptionsChain],
+        market_direction: SignalDirection,
+        confidence: float,
+        iv_rank: float,
+        economic_cal=None,
+    ) -> list[Signal]:
+        """Event-driven straddle: needs economic_cal + multi-expiry, separate path."""
+        if self._event_straddle is None:
+            return []
+        try:
+            return self._event_straddle.generate_signals(
+                symbol=symbol,
+                chains=chains,
+                market_direction=market_direction,
+                confidence=confidence,
+                iv_rank=iv_rank,
+                economic_cal=economic_cal,
+            )
+        except Exception as e:
+            log.warning("event_straddle_signal_error", symbol=symbol, error=str(e))
             return []
 
     def generate_all_signals(
@@ -138,7 +172,7 @@ class StrategySelector:
     })
     # Strategies that profit from buying premium (long vega)
     BUYING_STRATEGIES = frozenset({
-        "long_call", "long_put", "long_straddle",
+        "long_call", "long_put", "long_straddle", "event_straddle",
     })
 
     def _rank_signals(self, signals: list[Signal]) -> list[Signal]:

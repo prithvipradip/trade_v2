@@ -19,10 +19,34 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
+
+# Load .env early so AIT_LIQ_* and any other env-var overrides reach the bot
+# subprocesses spawned by BotManager.
+_env_file = Path(__file__).parent / ".env"
+if _env_file.exists():
+    for raw in _env_file.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        val = val.strip()
+        if val and val[0] in {'"', "'"}:
+            quote = val[0]
+            end = val.find(quote, 1)
+            if end != -1:
+                val = val[1:end]
+            else:
+                val = val[1:]
+        else:
+            val = val.split("#", 1)[0].rstrip()
+        key = key.strip()
+        if key and key not in os.environ:
+            os.environ[key] = val
 
 from ait.orchestration.master import (
     BotManager,

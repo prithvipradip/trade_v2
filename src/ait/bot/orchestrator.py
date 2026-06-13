@@ -50,7 +50,7 @@ from ait.risk.position_sizer import PositionSizer
 from ait.risk.capital_tiers import CapitalTierManager
 from ait.sentiment.engine import SentimentEngine
 from ait.learning.counterfactual import CounterfactualTracker
-from ait.strategies.base import SignalDirection
+from ait.strategies.base import CREDIT_STRATEGIES, SignalDirection
 from ait.strategies.selector import StrategySelector
 from ait.strategies.thompson import ThompsonSampler
 from ait.utils.logging import get_logger
@@ -317,6 +317,56 @@ class TradingOrchestrator:
             model_version=self._predictor.model_version,
         )
 
+    async def _process_completed_exits(self, completed_exits: list[dict]) -> None:
+        """Book completed exits: daily stats, circuit breaker, Thompson, drift.
+
+        Must be called from EVERY check_fills() call site — most exits fill
+        during the 30s fast monitor, and discarding its return used to mean
+        the breaker/learning never saw them.
+        """
+        for ex in completed_exits:
+            realized_pnl = ex["realized_pnl"]
+            trade_id = ex["trade_id"]
+
+            stats = self._state.get_daily_stats()
+            stats.total_pnl += realized_pnl
+            if realized_pnl > 0:
+                stats.trades_won += 1
+            else:
+                stats.trades_lost += 1
+            # Feed ALL results to the breaker, not just losses — its daily
+            # P&L must net wins against losses or it trips on any losing
+            # streak within an otherwise green day.
+            self._circuit_breaker.record_trade_result(realized_pnl)
+            self._state.update_daily_stats(stats)
+
+            trade = self._find_trade_by_id(trade_id)
+            if trade:
+                self._thompson.record_outcome(
+                    strategy=trade.strategy,
+                    won=realized_pnl > 0,
+                    pnl=realized_pnl,
+                )
+                actual_dir = "bullish" if realized_pnl > 0 else "bearish"
+                self._trainer.drift_detector.record_outcome(
+                    trade_id=trade_id,
+                    actual_direction=actual_dir,
+                )
+
+            msg = (
+                f"EXIT FILLED: {trade.symbol if trade else trade_id}\n"
+                f"Reason: {ex['exit_reason']}\n"
+                f"Exit price: {ex['exit_price']:.2f}\n"
+                f"P&L: ${realized_pnl:.2f}"
+            )
+            await self._send_notification(msg)
+            log.info(
+                "exit_fill_processed",
+                trade_id=trade_id,
+                pnl=realized_pnl,
+                exit_price=ex["exit_price"],
+            )
+
     async def _monitor_positions_fast(self) -> None:
         """Fast position monitor — checks stops/exits every 30 seconds.
 
@@ -339,8 +389,10 @@ class TradingOrchestrator:
                 log.info("fast_monitor_exit", symbol=pos.symbol, reason=pos.exit_reason)
                 await self._execute_exit(pos)
 
-            # Also check pending order fills
-            await self._executor.check_fills()
+            # Also check pending order fills — and BOOK the completed exits
+            # (stats/breaker/Thompson); they used to be silently discarded.
+            _entries, completed_exits = await self._executor.check_fills()
+            await self._process_completed_exits(completed_exits)
 
             # SEC 8-K material-event check every ~5 min (every 10th fast cycle)
             self._edgar_check_count += 1
@@ -453,47 +505,7 @@ class TradingOrchestrator:
 
         # 6. Check fill status of pending orders (entry + exit)
         _filled_entries, completed_exits = await self._executor.check_fills()
-
-        # Process completed exits — update daily stats, Thompson, drift
-        for ex in completed_exits:
-            realized_pnl = ex["realized_pnl"]
-            trade_id = ex["trade_id"]
-
-            stats = self._state.get_daily_stats()
-            stats.total_pnl += realized_pnl
-            if realized_pnl > 0:
-                stats.trades_won += 1
-            else:
-                stats.trades_lost += 1
-                self._circuit_breaker.record_trade_result(realized_pnl)
-            self._state.update_daily_stats(stats)
-
-            trade = self._find_trade_by_id(trade_id)
-            if trade:
-                self._thompson.record_outcome(
-                    strategy=trade.strategy,
-                    won=realized_pnl > 0,
-                    pnl=realized_pnl,
-                )
-                actual_dir = "bullish" if realized_pnl > 0 else "bearish"
-                self._trainer.drift_detector.record_outcome(
-                    trade_id=trade_id,
-                    actual_direction=actual_dir,
-                )
-
-            msg = (
-                f"EXIT FILLED: {trade.symbol if trade else trade_id}\n"
-                f"Reason: {ex['exit_reason']}\n"
-                f"Exit price: {ex['exit_price']:.2f}\n"
-                f"P&L: ${realized_pnl:.2f}"
-            )
-            await self._send_notification(msg)
-            log.info(
-                "exit_fill_processed",
-                trade_id=trade_id,
-                pnl=realized_pnl,
-                exit_price=ex["exit_price"],
-            )
+        await self._process_completed_exits(completed_exits)
 
         # 7. Get effective universe (learning + capital tier filtering)
         adaptor = self._learning.adaptor
@@ -871,6 +883,18 @@ class TradingOrchestrator:
             iv_rank=iv_rank,
         )
 
+        # Event-driven long straddles — fire 0-1 days before macro events.
+        # Profit from IV expansion + directional move when our short-vol
+        # strategies would be wrong-sided.
+        event_straddle_signals = self._strategy_selector.generate_event_straddle_signals(
+            symbol=symbol,
+            chains=filtered_chains,
+            market_direction=direction,
+            confidence=final_confidence,
+            iv_rank=iv_rank,
+            economic_cal=self._economic_cal,
+        )
+
         # Generate signals across all enabled strategies (learning may have disabled some)
         for chain in filtered_chains:
             if not chain.calls and not chain.puts:
@@ -889,6 +913,11 @@ class TradingOrchestrator:
             if calendar_signals:
                 signals = list(signals) + calendar_signals
                 calendar_signals = []  # consume so we don't add twice
+
+            # Inject event-straddle signals on the FIRST chain iteration only
+            if event_straddle_signals:
+                signals = list(signals) + event_straddle_signals
+                event_straddle_signals = []  # consume so we don't add twice
 
             # Filter out signals from disabled strategies
             signals = [
@@ -1148,8 +1177,10 @@ class TradingOrchestrator:
                     log.error("exit_qualification_failed", trade_id=pos.trade_id)
                     return
 
-                # Reverse direction: if we bought, now sell; if we sold, now buy
-                close_action = "SELL" if trade.direction.value == "long" else "BUY"
+                # Reverse the POSITION, not the market bias: trade.direction
+                # stores the signal's view (CSP is "long"/bullish but we SOLD
+                # the put). Credit strategies buy back; debit strategies sell.
+                close_action = "BUY" if trade.strategy in CREDIT_STRATEGIES else "SELL"
                 order = OrderBuilder.market(action=close_action, quantity=trade.quantity)
                 exit_trade = await self._ibkr.place_order(qualified, order)
 
@@ -1218,9 +1249,22 @@ class TradingOrchestrator:
                     log.error("partial_exit_qualification_failed", trade_id=pos.trade_id)
                     return
 
-                close_action = "SELL" if trade.direction.value == "long" else "BUY"
+                close_action = "BUY" if trade.strategy in CREDIT_STRATEGIES else "SELL"
                 order = OrderBuilder.market(action=close_action, quantity=qty_to_close)
                 await self._ibkr.place_order(qualified, order)
+            else:
+                # Multi-leg partials are NOT supported: the old code fell
+                # through here without placing ANY order, then recorded the
+                # "partial exit" anyway — booking phantom realized P&L and
+                # decrementing quantity while IBKR still held everything.
+                # Refuse loudly; the position stays managed as a whole.
+                log.warning(
+                    "partial_exit_unsupported_multi_leg",
+                    trade_id=pos.trade_id,
+                    strategy=trade.strategy,
+                    contract_type=trade.contract_type,
+                )
+                return
 
             # Record partial exit
             partial_pnl = pos.unrealized_pnl * (qty_to_close / trade.quantity)
@@ -1295,12 +1339,13 @@ class TradingOrchestrator:
 
         combo = ContractBuilder.combo(symbol=trade.symbol, legs=qualified_legs)
 
-        # Determine if we're closing a debit (long) or credit (short) position
-        # Debit close (straddles, long spreads) → we SELL the combo
-        # Credit close (iron condors, short spreads) → we BUY the combo back
-        sell_legs = sum(1 for lg in qualified_legs if lg["action"] == "SELL")
-        buy_legs = len(qualified_legs) - sell_legs
-        combo_action = "SELL" if sell_legs > buy_legs else "BUY"
+        # The legs above are ALREADY reversed, so the combo order must be
+        # BUY — IBKR executes a BUY combo's legs exactly as defined, while a
+        # SELL combo flips every leg. The old "SELL if mostly-sell-legs"
+        # logic double-reversed all-BUY entries (long/event straddles): the
+        # "exit" bought the straddle AGAIN instead of closing it. Entry
+        # combos use the same always-BUY convention (executor.py).
+        combo_action = "BUY"
 
         # Try to get mid-price from IBKR for a limit order
         limit_price = None
@@ -1312,19 +1357,23 @@ class TradingOrchestrator:
                 ticker = self._ibkr.ib.ticker(qualified_combo)
                 if ticker:
                     import math
-                    bid = ticker.bid if not math.isnan(ticker.bid) else None
-                    ask = ticker.ask if not math.isnan(ticker.ask) else None
-                    if bid is not None and ask is not None and bid > 0 and ask > 0:
+                    # Combo quotes are SIGNED: closing a debit position
+                    # (reversed legs = net sell) quotes NEGATIVE — we receive
+                    # credit. Only 0/NaN means "no quote".
+                    bid = ticker.bid if not math.isnan(ticker.bid) and ticker.bid != 0 else None
+                    ask = ticker.ask if not math.isnan(ticker.ask) and ticker.ask != 0 else None
+                    if bid is not None and ask is not None:
                         limit_price = round((bid + ask) / 2, 2)
-                    elif bid is not None and bid > 0:
+                    elif bid is not None:
                         limit_price = round(bid, 2)
-                    elif ask is not None and ask > 0:
+                    elif ask is not None:
                         limit_price = round(ask, 2)
         except Exception as e:
             log.warning("combo_mid_price_failed", error=str(e))
 
-        # Use market order as fallback if we couldn't get a limit price
-        if limit_price and limit_price > 0:
+        # Use market order as fallback if we couldn't get a limit price.
+        # Negative limits are valid (closing a debit position nets a credit).
+        if limit_price is not None and limit_price != 0:
             log.info("combo_exit_limit", symbol=trade.symbol, action=combo_action,
                      limit_price=limit_price)
             order = OrderBuilder.combo_limit(

@@ -11,6 +11,7 @@ Responsible for:
 from __future__ import annotations
 
 import json
+import math
 import time
 import uuid
 from datetime import datetime
@@ -22,7 +23,7 @@ from ait.broker.ibkr_client import IBKRClient
 from ait.broker.orders import OrderBuilder
 from ait.bot.state import StateManager, TradeDirection, TradeRecord, TradeStatus
 from ait.risk.circuit_breaker import CircuitBreaker
-from ait.strategies.base import Signal, SignalDirection
+from ait.strategies.base import CREDIT_STRATEGIES, Signal, SignalDirection
 from ait.utils.logging import get_logger
 
 log = get_logger("execution.executor")
@@ -102,10 +103,10 @@ class TradeExecutor:
             # Record trade in state
             legs_json = json.dumps([
                 {
-                    "strike": leg["contract"].strike,
-                    "right": leg["contract"].right,
+                    "strike": self._leg_fields(leg)[0],
+                    "right": self._leg_fields(leg)[1],
                     "action": leg["action"],
-                    "expiry": str(leg["contract"].expiry),
+                    "expiry": self._leg_fields(leg)[2],
                 }
                 for leg in signal.legs
             ]) if signal.legs else "[]"
@@ -238,15 +239,20 @@ class TradeExecutor:
             log.error("no_legs_in_signal", trade_id=trade_id)
             return None
 
-        # Build all leg contracts at once
+        # Build all leg contracts at once. Legs come in two shapes:
+        # {"contract": OptionContract, "action": ...} from most strategies,
+        # or plain {"strike", "right", "expiry", "action"} dicts from
+        # event_straddle/calendar — _leg_fields handles both (the old
+        # leg["contract"] access KeyError'd and silently killed every
+        # event_straddle/calendar signal).
         ibkr_contracts = []
         for leg in signal.legs:
-            opt_contract = leg["contract"]
+            strike, right, expiry = self._leg_fields(leg)
             ibkr_contracts.append(ContractBuilder.option(
                 symbol=signal.symbol,
-                expiry=opt_contract.expiry,
-                strike=opt_contract.strike,
-                right=opt_contract.right,
+                expiry=expiry,
+                strike=strike,
+                right=right,
             ))
 
         # Batch qualify all legs in one call
@@ -255,13 +261,12 @@ class TradeExecutor:
         qualified_legs = []
         for i, qualified in enumerate(qualified_list):
             if not qualified:
-                leg = signal.legs[i]
-                opt_contract = leg["contract"]
+                strike, right, _ = self._leg_fields(signal.legs[i])
                 log.error(
                     "leg_qualification_failed",
                     trade_id=trade_id,
-                    strike=opt_contract.strike,
-                    right=opt_contract.right,
+                    strike=strike,
+                    right=right,
                 )
                 return None
 
@@ -276,16 +281,9 @@ class TradeExecutor:
             legs=qualified_legs,
         )
 
-        # Determine if this is a credit spread by checking the legs:
-        # if more legs are selling than buying, it's a net credit trade.
-        # For debit spreads (bull call, bear put), entry_price is positive debit.
-        # For credit spreads (iron condor, short strangle), IBKR expects negative limit.
-        if signal.legs:
-            sell_count = sum(1 for leg in signal.legs if leg["action"] == "SELL")
-            buy_count = len(signal.legs) - sell_count
-            is_credit = sell_count > buy_count
-        else:
-            is_credit = signal.action == "SELL"
+        # Determine credit/debit from strategy cash-flow sign.
+        # Leg counts are ambiguous (e.g. iron condor has 2 BUY + 2 SELL but is CREDIT).
+        is_credit = signal.strategy_name in self.CREDIT_STRATEGIES
 
         # Aggressive pricing: accept ~$0.05 below mid to improve fill rate.
         # Mid prices rarely fill on multi-leg combos — MMs take a few cents.
@@ -410,26 +408,48 @@ class TradeExecutor:
             if exit_status == "filled":
                 actual_exit_price = self._get_exit_fill_price(order_id, all_trades)
 
-                # Calculate realized P&L from actual fill price, not estimate
+                # Calculate realized P&L from actual fill price when known.
+                # 0.0 is a real price (closed at worthless); only None means
+                # "no fill data" — then fall back to the estimate and FLAG it
+                # so downstream analytics can exclude these rows.
                 trade_record = self._state.get_trade_by_id(pending_exit.trade_id)
-                if trade_record and actual_exit_price > 0:
+                exit_reason = pending_exit.exit_reason
+                if trade_record and actual_exit_price is not None:
+                    # Multi-leg DEBIT exits fill via a reversed-legs combo,
+                    # whose as-defined price is NEGATIVE (we receive credit).
+                    # _calculate_realized_pnl expects exit_price = value
+                    # received per contract, so flip the sign. Credit
+                    # strategies buy back at a positive as-defined price —
+                    # already the "cost to close" the formula expects.
+                    if (
+                        trade_record.contract_type in ("spread", "iron_condor")
+                        and trade_record.strategy not in CREDIT_STRATEGIES
+                    ):
+                        actual_exit_price = -actual_exit_price
                     realized_pnl = self._calculate_realized_pnl(
                         trade_record, actual_exit_price
                     )
                 else:
                     realized_pnl = pending_exit.estimated_pnl
+                    exit_reason = f"{exit_reason}|pnl_estimate_no_fill_price"
+                    log.warning(
+                        "exit_fill_price_missing",
+                        trade_id=pending_exit.trade_id,
+                        order_id=order_id,
+                        estimated_pnl=realized_pnl,
+                    )
 
                 self._state.close_trade(
                     trade_id=pending_exit.trade_id,
-                    exit_price=actual_exit_price,
+                    exit_price=actual_exit_price if actual_exit_price is not None else 0.0,
                     realized_pnl=realized_pnl,
-                    exit_reason_detailed=pending_exit.exit_reason,
+                    exit_reason_detailed=exit_reason,
                 )
                 completed_exits.append({
                     "trade_id": pending_exit.trade_id,
-                    "exit_price": actual_exit_price,
+                    "exit_price": actual_exit_price if actual_exit_price is not None else 0.0,
                     "realized_pnl": realized_pnl,
-                    "exit_reason": pending_exit.exit_reason,
+                    "exit_reason": exit_reason,
                 })
                 log.info(
                     "exit_order_filled",
@@ -523,8 +543,10 @@ class TradeExecutor:
         for trade in all_trades:
             if trade.order.orderId == order_id:
                 avg_price = trade.orderStatus.avgFillPrice
-                if avg_price and avg_price > 0:
+                if avg_price is not None and not math.isnan(avg_price) and avg_price != 0:
                     return avg_price
+                if (trade.orderStatus.filled or 0) > 0:
+                    return 0.0
 
         return pending.signal.entry_price  # Fallback to expected price
 
@@ -558,41 +580,71 @@ class TradeExecutor:
         # rather than falsely cancelling fresh orders
         return "pending"
 
-    def _get_exit_fill_price(self, order_id: int, all_trades: list) -> float:
-        """Get the actual fill price for an exit order."""
+    def _get_exit_fill_price(self, order_id: int, all_trades: list) -> float | None:
+        """Get the actual fill price for an exit order.
+
+        Returns the SIGNED as-defined price: combo (BAG) fills are negative
+        when the as-defined legs net a credit — the normal case when closing
+        a debit position via reversed legs. Single contracts are unsigned
+        (IBKR convention). Returns None only when no fill data is available;
+        0.0 is a LEGITIMATE price (closed at worthless).
+        """
         for trade in all_trades:
-            if trade.order.orderId == order_id:
-                avg_price = trade.orderStatus.avgFillPrice
-                if avg_price and avg_price > 0:
-                    return avg_price
-                # Fallback: check individual fills
-                if trade.fills:
+            if trade.order.orderId != order_id:
+                continue
+            avg_price = trade.orderStatus.avgFillPrice
+            if avg_price and not math.isnan(avg_price):
+                return avg_price
+            # Fallback: reconstruct from per-leg executions
+            if trade.fills:
+                if getattr(trade.contract, "secType", "") == "BAG":
+                    # Side-aware net: (sold proceeds - bought costs) per
+                    # contract, then negate to match IBKR's as-defined
+                    # convention (negative = combo nets a credit). A naive
+                    # side-blind VWAP of leg premiums is meaningless here.
+                    qty = trade.order.totalQuantity or 0
+                    if qty > 0:
+                        net = 0.0
+                        for f in trade.fills:
+                            sign = 1.0 if f.execution.side == "SLD" else -1.0
+                            net += sign * f.execution.price * f.execution.shares
+                        return -net / (100.0 * qty)
+                else:
                     total_cost = sum(f.execution.price * f.execution.shares for f in trade.fills)
                     total_shares = sum(f.execution.shares for f in trade.fills)
                     if total_shares > 0:
                         return total_cost / total_shares
-        return 0.0
+            # Order is known to IBKR but reported no usable price; a
+            # filled combo can legitimately average to ~0.0
+            if (trade.orderStatus.filled or 0) > 0:
+                return 0.0
+            return None
+        return None
+
+    # Entry cash-flow direction lives in CREDIT_STRATEGIES (strategies/base.py).
+    # Everything not listed there is DEBIT — long options, straddles,
+    # calendars, and debit spreads (bull_call_spread / bear_put_spread are
+    # DEBIT despite having 2 legs like a credit spread).
+    CREDIT_STRATEGIES = CREDIT_STRATEGIES
 
     def _calculate_realized_pnl(self, trade, exit_price: float) -> float:
         """Calculate realized P&L from entry and exit prices.
 
-        For options, multiplier is 100 (1 contract = 100 shares).
-        For credit strategies (iron condor, cash secured put), entry is credit received.
+        Direction is decided by the STRATEGY's cash-flow sign, not leg count:
+        a long straddle and a credit spread both have 2 legs but opposite
+        P&L formulas. contract_type alone is ambiguous here.
         """
         multiplier = 100  # options multiplier
         entry = trade.entry_price
         qty = trade.quantity
 
-        if trade.contract_type in ("iron_condor", "spread"):
-            # Credit/debit spreads: P&L = (entry_credit - exit_debit) * multiplier
-            pnl = (entry - exit_price) * multiplier * qty
-        elif trade.strategy == "cash_secured_put":
-            pnl = (entry - exit_price) * multiplier * qty
-        elif trade.contract_type in ("call", "put"):
-            pnl = (exit_price - entry) * multiplier * qty
-        elif trade.contract_type == "stock":
+        if trade.contract_type == "stock":
             pnl = (exit_price - entry) * qty
+        elif trade.strategy in self.CREDIT_STRATEGIES:
+            # Credit: collected `entry` to open, pay `exit_price` to close
+            pnl = (entry - exit_price) * multiplier * qty
         else:
+            # Debit: paid `entry` to open, receive `exit_price` on close
             pnl = (exit_price - entry) * multiplier * qty
 
         # Subtract commissions: ~$0.65/contract/side (IBKR tiered pricing)
@@ -600,7 +652,9 @@ class TradeExecutor:
         legs_per_side = 1
         if trade.contract_type == "iron_condor":
             legs_per_side = 4
-        elif trade.contract_type == "spread" or trade.strategy == "long_straddle":
+        elif trade.contract_type == "spread" or trade.strategy in (
+            "long_straddle", "event_straddle", "short_strangle", "calendar_spread",
+        ):
             legs_per_side = 2
         commission = 0.65 * legs_per_side * qty * 2  # entry + exit
         pnl -= commission
@@ -616,15 +670,17 @@ class TradeExecutor:
         # so use update_trade_status for existing rows)
         self._state.update_trade_status(pending.trade_id, TradeStatus.FILLED)
 
-        # Build legs JSON for open_positions
+        # Build legs JSON for open_positions (handles both contract-shaped and
+        # plain-dict legs via _leg_fields so dict-shaped legs don't crash here)
         legs_json = json.dumps([
             {
-                "strike": leg["contract"].strike,
-                "right": leg["contract"].right,
+                "strike": strike,
+                "right": right,
                 "action": leg["action"],
-                "expiry": str(leg["contract"].expiry),
+                "expiry": expiry,
             }
             for leg in signal.legs
+            for strike, right, expiry in [self._leg_fields(leg)]
         ]) if signal.legs else "[]"
 
         # Insert into open_positions so HWM / partial-exit tracking works
@@ -709,6 +765,19 @@ class TradeExecutor:
     def pending_count(self) -> int:
         """Number of orders currently pending fill (entry + exit)."""
         return len(self._pending_orders) + len(self._pending_exit_orders)
+
+    @staticmethod
+    def _leg_fields(leg: dict) -> tuple[float, str, str]:
+        """(strike, right, expiry) from either leg shape.
+
+        Most strategies emit {"contract": OptionContract, "action": ...};
+        event_straddle/calendar emit plain {"strike", "right", "expiry",
+        "action"} dicts. Both must execute.
+        """
+        contract = leg.get("contract")
+        if contract is not None:
+            return float(contract.strike), str(contract.right), str(contract.expiry)
+        return float(leg["strike"]), str(leg["right"]), str(leg["expiry"])
 
     @staticmethod
     def _get_contract_type(signal: Signal) -> str:

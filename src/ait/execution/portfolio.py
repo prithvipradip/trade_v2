@@ -11,11 +11,14 @@ Continuously monitors open positions and triggers exits when:
 
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
 from ait.bot.state import StateManager, TradeRecord, TradeStatus
 from ait.broker.ibkr_client import IBKRClient
+from ait.strategies.base import CREDIT_STRATEGIES
 from ait.config.settings import ExitConfig
 from ait.data.market_data import MarketDataService
 from ait.risk.circuit_breaker import CircuitBreaker
@@ -47,6 +50,9 @@ class PositionStatus:
 class PortfolioManager:
     """Monitors open positions and manages exits with dynamic stop management."""
 
+    # Entry cash-flow direction — shared source of truth in strategies/base.py
+    CREDIT_STRATEGIES = CREDIT_STRATEGIES
+
     def __init__(
         self,
         ibkr_client: IBKRClient,
@@ -73,12 +79,13 @@ class PortfolioManager:
         if not open_trades:
             return []
 
+        option_marks = self._get_option_marks()
         statuses = []
         for trade in open_trades:
             if trade.status not in (TradeStatus.FILLED, TradeStatus.PARTIAL):
                 continue
 
-            status = await self._evaluate_position(trade)
+            status = await self._evaluate_position(trade, option_marks)
             if status:
                 statuses.append(status)
 
@@ -93,25 +100,128 @@ class PortfolioManager:
 
         return statuses
 
-    async def _evaluate_position(self, trade: TradeRecord) -> PositionStatus | None:
+    def _get_option_marks(self) -> dict[tuple, float]:
+        """Index current IBKR option marks by (symbol, expiry, strike, right)."""
+        marks: dict[tuple, float] = {}
+        for item in self._ibkr.ib.portfolio():
+            c = item.contract
+            if c.secType != "OPT":
+                continue
+            price = item.marketPrice
+            if price is None or math.isnan(price):
+                continue
+            expiry_key = c.lastTradeDateOrContractMonth.replace("-", "")[:8]
+            marks[(c.symbol, expiry_key, float(c.strike), c.right)] = float(price)
+        return marks
+
+    def _option_position_unrealized(
+        self, trade: TradeRecord, marks: dict[tuple, float] | None = None
+    ) -> float | None:
+        """Unrealized P&L for an option position from IBKR per-leg marks.
+
+        Computes the position's current liquidation value per contract
+        (sum of leg marks, signed by whether we are long or short each leg)
+        and compares it against the signed entry cash flow:
+        debit position: paid entry  -> unrealized = (net_liq - entry) * 100 * qty
+        credit position: received entry -> unrealized = (net_liq + entry) * 100 * qty
+        (net_liq is negative for credit positions: it's what we'd pay to close)
+
+        Returns None when any leg has no usable IBKR mark — callers should
+        skip exit evaluation rather than act on a partial price.
+        """
+        try:
+            legs = json.loads(trade.legs) if trade.legs else []
+        except (ValueError, TypeError):
+            legs = []
+
+        if not legs:
+            # Single-contract trade (long_call/long_put/covered_call/CSP):
+            # synthesize a one-leg description from the trade row.
+            if trade.contract_type == "call":
+                right = "C"
+            elif trade.contract_type == "put":
+                right = "P"
+            else:
+                return None
+            if not trade.expiry or not trade.strike:
+                return None
+            # Buy/sell is the POSITION polarity, not the market bias.
+            # trade.direction encodes the signal's view (BULLISH/BEARISH),
+            # so a cash-secured put (BULLISH) would wrongly read as "BUY".
+            # Credit strategies are premium SELLERS; everything else BUYS.
+            action = "SELL" if trade.strategy in self.CREDIT_STRATEGIES else "BUY"
+            legs = [{"strike": trade.strike, "right": right,
+                     "action": action, "expiry": trade.expiry}]
+
+        if marks is None:
+            marks = self._get_option_marks()
+
+        net_liq = 0.0  # current value of the position per contract, from our side
+        for leg in legs:
+            expiry_key = str(leg.get("expiry", "")).replace("-", "")[:8]
+            key = (trade.symbol, expiry_key, float(leg["strike"]), leg["right"])
+            mark = marks.get(key)
+            if mark is None:
+                return None
+            sign = 1.0 if str(leg.get("action", "BUY")).upper() == "BUY" else -1.0
+            net_liq += sign * mark
+
+        if trade.strategy in self.CREDIT_STRATEGIES:
+            signed_entry = -abs(trade.entry_price)
+        else:
+            signed_entry = abs(trade.entry_price)
+
+        return (net_liq - signed_entry) * 100 * trade.quantity
+
+    async def _evaluate_position(
+        self, trade: TradeRecord, option_marks: dict[tuple, float] | None = None
+    ) -> PositionStatus | None:
         """Evaluate a single position for exit conditions."""
         current_price = await self._market_data.get_current_price(trade.symbol)
         if current_price is None:
             log.warning("cannot_evaluate_position", symbol=trade.symbol, reason="no price")
             return None
 
-        # Calculate unrealized P&L
+        # Calculate unrealized P&L.
+        # For options this must be priced from the OPTION position's market
+        # value (per-leg marks from IBKR), never from the underlying price:
+        # (stock_price - option_premium) is meaningless and historically
+        # produced 2800%+ phantom "profits" that tripped take-profit exits.
         multiplier = 100  # Options multiplier
         if trade.contract_type == "stock":
             multiplier = 1
 
         is_short = trade.direction.value == "short"
-        if is_short:
-            unrealized_pnl = (trade.entry_price - current_price) * trade.quantity * multiplier
+        # Premium polarity for exit routing: credit strategies (we SOLD
+        # premium) target a 50% buyback and can be assigned; debit strategies
+        # (we BOUGHT premium) ride the long-side target. Cannot use is_short
+        # here — iron_condor/short_strangle are stored direction=long/neutral.
+        is_credit = trade.strategy in self.CREDIT_STRATEGIES
+        if trade.contract_type == "stock":
+            if is_short:
+                unrealized_pnl = (trade.entry_price - current_price) * trade.quantity
+            else:
+                unrealized_pnl = (current_price - trade.entry_price) * trade.quantity
         else:
-            unrealized_pnl = (current_price - trade.entry_price) * trade.quantity * multiplier
+            unrealized_pnl = self._option_position_unrealized(trade, option_marks)
 
-        cost_basis = trade.entry_price * trade.quantity * multiplier
+        # Missing marks must NOT make the position unmanageable: skip only
+        # the P&L-driven rules (stop/take-profit/partials) but keep the
+        # DTE-based safety exits (assignment risk, expiry close) alive —
+        # otherwise a position with no marks rides to expiry unprotected.
+        marks_missing = unrealized_pnl is None
+        if marks_missing:
+            unrealized_pnl = 0.0
+            log.warning(
+                "cannot_price_position",
+                trade_id=trade.trade_id,
+                symbol=trade.symbol,
+                strategy=trade.strategy,
+                reason="no IBKR marks for one or more legs; P&L exit rules "
+                       "skipped this tick, DTE safety exits still active",
+            )
+
+        cost_basis = abs(trade.entry_price) * trade.quantity * multiplier
         pnl_pct = unrealized_pnl / cost_basis if cost_basis > 0 else 0.0
 
         # Days to expiry
@@ -123,10 +233,12 @@ class PortfolioManager:
             except ValueError:
                 pass
 
-        # Update high water mark — always persist so journaling data stays accurate
+        # Update high water mark — always persist so journaling data stays
+        # accurate (but never let a marks-missing 0.0 touch it)
         prev_hwm = self._state.get_high_water_mark(trade.trade_id)
         hwm = max(prev_hwm, pnl_pct)
-        self._state.update_high_water_mark(trade.trade_id, hwm)
+        if not marks_missing:
+            self._state.update_high_water_mark(trade.trade_id, hwm)
 
         # Get learning overrides for stop/take-profit (if any)
         stop_loss_pct = self._exit_config.initial_stop_loss_pct
@@ -152,8 +264,9 @@ class PortfolioManager:
         exit_reason = ""
         partial_exit_quantity = 0
 
-        # 1. Dynamic stop loss (trailing/breakeven)
-        if pnl_pct <= effective_stop:
+        # 1. Dynamic stop loss (trailing/breakeven) — needs real marks: a
+        # marks-missing pnl_pct of 0.0 would spuriously trip a breakeven stop
+        if not marks_missing and pnl_pct <= effective_stop:
             should_exit = True
             if hwm >= breakeven_trigger and effective_stop >= 0:
                 exit_reason = f"trailing_stop (P&L: {pnl_pct:.1%}, peak: {hwm:.1%}, stop: {effective_stop:.1%})"
@@ -162,18 +275,18 @@ class PortfolioManager:
             else:
                 exit_reason = f"stop_loss (P&L: {pnl_pct:.1%})"
 
-        # 2. Take profit (time-decay adjusted)
-        elif not is_short and pnl_pct >= take_profit_long:
+        # 2. Take profit (time-decay adjusted) — needs real marks
+        elif not marks_missing and not is_credit and pnl_pct >= take_profit_long:
             should_exit = True
             exit_reason = f"take_profit (P&L: {pnl_pct:.1%}, target: {take_profit_long:.1%})"
-        elif is_short and pnl_pct >= take_profit_short:
+        elif not marks_missing and is_credit and pnl_pct >= take_profit_short:
             should_exit = True
-            exit_reason = f"take_profit_short (P&L: {pnl_pct:.1%})"
+            exit_reason = f"take_profit_short (P&L: {pnl_pct:.1%}, target: {take_profit_short:.1%})"
 
         # 3. Assignment risk — ITM shorts on expiry day (DTE 0-1) MUST close
         # Short puts ITM → stock gets put to you (cash drain)
         # Short calls ITM → shares called away (may cause forced cover)
-        elif dte is not None and dte <= 1 and is_short and trade.strike:
+        elif dte is not None and dte <= 1 and is_credit and trade.strike:
             try:
                 current_underlying = await self._market_data.get_current_price(trade.symbol)
                 if current_underlying:
@@ -243,8 +356,9 @@ class PortfolioManager:
             except Exception:
                 pass
 
-        # 4. Check for partial exit milestones (only if not already exiting fully)
-        if not should_exit and trade.quantity > 1:
+        # 4. Check for partial exit milestones (only if not already exiting
+        # fully, and only with real marks)
+        if not should_exit and not marks_missing and trade.quantity > 1:
             partial_exit_quantity = self._check_partial_exit(
                 trade.trade_id, pnl_pct, trade.quantity,
             )
