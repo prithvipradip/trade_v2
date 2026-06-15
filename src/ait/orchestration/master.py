@@ -50,6 +50,43 @@ def _log(level: str, event: str, **kw):
         f.write(line + "\n")
 
 
+# Cached Telegram creds (read once); None until resolved, () if unavailable.
+_TG_CREDS: tuple | None = None
+
+
+def _alert(message: str) -> None:
+    """Send a supervisor-level Telegram alert (best-effort, synchronous).
+
+    The supervisor is the only thing that survives a bot crash, so dead-bot
+    and restart-exhaustion notifications must originate here, not in the bot.
+    """
+    global _TG_CREDS
+    if _TG_CREDS is None:
+        try:
+            from ait.config.settings import load_settings
+            s = load_settings()
+            _TG_CREDS = (s.api_keys.telegram_bot_token, s.api_keys.telegram_chat_id)
+        except Exception as e:  # noqa: BLE001
+            _log("warn", "alert_creds_unavailable", error=str(e))
+            _TG_CREDS = ()
+    if not _TG_CREDS or not _TG_CREDS[0] or not _TG_CREDS[1]:
+        return
+    token, chat_id = _TG_CREDS
+    try:
+        import urllib.request
+        import urllib.parse
+        data = urllib.parse.urlencode({
+            "chat_id": chat_id,
+            "text": f"AIT SUPERVISOR: {message}",
+            "disable_web_page_preview": "true",
+        }).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage", data=data)
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:  # noqa: BLE001
+        _log("warn", "alert_send_failed", error=str(e))
+
+
 # ---------------------------------------------------------------------------
 # Bot process management
 # ---------------------------------------------------------------------------
@@ -63,6 +100,7 @@ class BotManager:
         self._restarts = 0
         self._max_restarts = 10
         self._last_restart: datetime | None = None
+        self._last_gateway_alert: datetime | None = None
 
     @property
     def is_running(self) -> bool:
@@ -80,6 +118,14 @@ class BotManager:
         gw_port = int(os.environ.get("IBKR_PORT", "4002"))
         if not ensure_gateway(port=gw_port):
             _log("error", "bot_start_aborted", reason="gateway_not_available")
+            # Alert at most once per 30 min so a long Gateway outage pings
+            # once rather than every 2-min health check.
+            now = datetime.now()
+            if (self._last_gateway_alert is None
+                    or (now - self._last_gateway_alert) > timedelta(minutes=30)):
+                self._last_gateway_alert = now
+                _alert(f"cannot start bot — IB Gateway not available on port {gw_port}. "
+                       f"Is Gateway/TWS logged in?")
             return
 
         _log("info", "bot_starting")
@@ -117,16 +163,29 @@ class BotManager:
         exit_code = self._proc.returncode if self._proc else "never_started"
         _log("warn", "bot_down", exit_code=exit_code, restarts=self._restarts)
 
-        # Reset restart counter if last restart was >1 hour ago
-        if self._last_restart and (datetime.now() - self._last_restart) > timedelta(hours=1):
+        # Reset restart counter if last restart was >30 min ago — a transient
+        # overnight Gateway drop shouldn't burn the budget toward a permanent
+        # give-up the next time something briefly hiccups.
+        if self._last_restart and (datetime.now() - self._last_restart) > timedelta(minutes=30):
             self._restarts = 0
 
         if self._restarts >= self._max_restarts:
             _log("error", "bot_max_restarts_reached", max=self._max_restarts)
+            _alert(
+                f"BOT DOWN — gave up after {self._max_restarts} restart attempts "
+                f"(last exit_code={exit_code}). Manual intervention needed; "
+                f"check bot_stdout.log."
+            )
             return
 
         self._restarts += 1
         _log("info", "bot_restarting", attempt=self._restarts)
+        # Warn early — by restart #3 something is genuinely wrong, not a blip.
+        if self._restarts >= 3:
+            _alert(
+                f"bot restarting (attempt {self._restarts}/{self._max_restarts}, "
+                f"exit_code={exit_code}). Will alert again if it gives up."
+            )
         self.start()
 
 
@@ -434,6 +493,7 @@ def _append_health_metric(metrics: dict):
 
 def main():
     _log("info", "orchestrator_starting", pid=os.getpid())
+    _alert("supervisor started — bot + web services coming up.")
 
     bot = BotManager()
     web = WebServiceManager()

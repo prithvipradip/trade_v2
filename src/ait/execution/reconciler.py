@@ -30,6 +30,7 @@ class ReconciliationResult:
     new_from_ibkr: int  # Positions in IBKR not in local state
     stale_local: int  # Local positions not found in IBKR
     discrepancies: list[str]  # Human-readable descriptions
+    promoted: int = 0  # PENDING/CLOSING trades found live in IBKR -> FILLED
 
 
 class PositionReconciler:
@@ -147,11 +148,25 @@ class PositionReconciler:
         )
 
         # Check IBKR positions against local state
+        promoted_ids: set[str] = set()
         for key, ibkr_pos in ibkr_map.items():
             if key in local_map:
                 result.matched += 1
-                # Check quantity matches
                 local_trade = local_map[key]["trade"]
+                # Recover orphaned entries: a trade still marked PENDING (or
+                # CLOSING) whose legs are LIVE in IBKR actually filled — the
+                # in-memory fill tracker was lost on restart. Promote it to
+                # FILLED so the portfolio monitor manages it (check_positions
+                # only evaluates FILLED/PARTIAL).
+                if (local_trade.status in (TradeStatus.PENDING, TradeStatus.CLOSING)
+                        and local_trade.trade_id not in promoted_ids):
+                    self._state.update_trade_status(local_trade.trade_id, TradeStatus.FILLED)
+                    promoted_ids.add(local_trade.trade_id)
+                    result.promoted += 1
+                    log.warning("reconcile_promoted_to_filled",
+                                trade_id=local_trade.trade_id, symbol=local_trade.symbol,
+                                strategy=local_trade.strategy, prior_status=local_trade.status.value)
+                # Check quantity matches
                 if abs(ibkr_pos["quantity"]) != abs(local_trade.quantity):
                     msg = (
                         f"Quantity mismatch for {key}: "

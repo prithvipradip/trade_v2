@@ -306,6 +306,28 @@ class TestReconcilerMatching:
         rec._state.close_trade.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_pending_trade_with_live_legs_promoted_to_filled(self):
+        # Orphan recovery: a trade stuck PENDING after a restart whose legs
+        # are live in IBKR must be promoted to FILLED so the monitor manages it.
+        from ait.bot.state import TradeStatus
+        legs = json.dumps([
+            {"strike": 635.0, "right": "C", "action": "BUY", "expiry": "2026-07-17"},
+            {"strike": 635.0, "right": "P", "action": "BUY", "expiry": "2026-07-17"},
+        ])
+        trade = FakeTrade(24.0, 1, "spread", "long_straddle", legs=legs)
+        trade.status = TradeStatus.PENDING
+        rec = self._reconciler(
+            [self._ibkr_pos("SPY", "20260717", 635.0, "C"),
+             self._ibkr_pos("SPY", "20260717", 635.0, "P")],
+            [trade],
+        )
+        result = await rec.reconcile()
+        assert result.promoted == 1
+        rec._state.update_trade_status.assert_called_once()
+        args = rec._state.update_trade_status.call_args[0]
+        assert args[1] == TradeStatus.FILLED
+
+    @pytest.mark.asyncio
     async def test_truly_gone_position_closed_with_flag(self):
         legs = json.dumps([
             {"strike": 635.0, "right": "C", "action": "BUY", "expiry": "2020-01-17"},

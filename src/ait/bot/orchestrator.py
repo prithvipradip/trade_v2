@@ -205,6 +205,20 @@ class TradingOrchestrator:
         # Train models on startup if not yet trained (handles case where bot starts during market hours)
         await self._trainer.ensure_models_ready(self._settings.trading.universe)
 
+        # Reconcile on EVERY startup, not just at pre/post-market. A restart
+        # mid-day (common — Gateway drops, machine wake) otherwise leaves
+        # orders placed before the death stuck in PENDING forever: the
+        # in-memory fill tracker is gone, so check_fills never advances them,
+        # and they're never monitored for exits. Startup reconcile recovers
+        # them against IBKR's actual positions.
+        try:
+            recon = await self._reconciler.reconcile()
+            log.info("startup_reconcile_done",
+                     matched=recon.matched, promoted=recon.promoted,
+                     stale_closed=recon.stale_local, new_from_ibkr=recon.new_from_ibkr)
+        except Exception as e:
+            log.error("startup_reconcile_failed", error=str(e))
+
         await self._send_notification(f"BOT STARTED | Mode: {self._settings.trading.mode} | {len(self._settings.trading.universe)} symbols")
 
         while self._running:
