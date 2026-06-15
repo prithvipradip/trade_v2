@@ -281,16 +281,9 @@ class TradeExecutor:
             legs=qualified_legs,
         )
 
-        # Determine if this is a credit spread by checking the legs:
-        # if more legs are selling than buying, it's a net credit trade.
-        # For debit spreads (bull call, bear put), entry_price is positive debit.
-        # For credit spreads (iron condor, short strangle), IBKR expects negative limit.
-        if signal.legs:
-            sell_count = sum(1 for leg in signal.legs if leg["action"] == "SELL")
-            buy_count = len(signal.legs) - sell_count
-            is_credit = sell_count > buy_count
-        else:
-            is_credit = signal.action == "SELL"
+        # Determine credit/debit from strategy cash-flow sign.
+        # Leg counts are ambiguous (e.g. iron condor has 2 BUY + 2 SELL but is CREDIT).
+        is_credit = signal.strategy_name in self.CREDIT_STRATEGIES
 
         # Aggressive pricing: accept ~$0.05 below mid to improve fill rate.
         # Mid prices rarely fill on multi-leg combos — MMs take a few cents.
@@ -550,8 +543,10 @@ class TradeExecutor:
         for trade in all_trades:
             if trade.order.orderId == order_id:
                 avg_price = trade.orderStatus.avgFillPrice
-                if avg_price and avg_price > 0:
+                if avg_price is not None and not math.isnan(avg_price) and avg_price != 0:
                     return avg_price
+                if (trade.orderStatus.filled or 0) > 0:
+                    return 0.0
 
         return pending.signal.entry_price  # Fallback to expected price
 
@@ -675,15 +670,17 @@ class TradeExecutor:
         # so use update_trade_status for existing rows)
         self._state.update_trade_status(pending.trade_id, TradeStatus.FILLED)
 
-        # Build legs JSON for open_positions
+        # Build legs JSON for open_positions (handles both contract-shaped and
+        # plain-dict legs via _leg_fields so dict-shaped legs don't crash here)
         legs_json = json.dumps([
             {
-                "strike": leg["contract"].strike,
-                "right": leg["contract"].right,
+                "strike": strike,
+                "right": right,
                 "action": leg["action"],
-                "expiry": str(leg["contract"].expiry),
+                "expiry": expiry,
             }
             for leg in signal.legs
+            for strike, right, expiry in [self._leg_fields(leg)]
         ]) if signal.legs else "[]"
 
         # Insert into open_positions so HWM / partial-exit tracking works

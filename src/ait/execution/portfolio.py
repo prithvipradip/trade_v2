@@ -79,12 +79,13 @@ class PortfolioManager:
         if not open_trades:
             return []
 
+        option_marks = self._get_option_marks()
         statuses = []
         for trade in open_trades:
             if trade.status not in (TradeStatus.FILLED, TradeStatus.PARTIAL):
                 continue
 
-            status = await self._evaluate_position(trade)
+            status = await self._evaluate_position(trade, option_marks)
             if status:
                 statuses.append(status)
 
@@ -99,7 +100,23 @@ class PortfolioManager:
 
         return statuses
 
-    def _option_position_unrealized(self, trade: TradeRecord) -> float | None:
+    def _get_option_marks(self) -> dict[tuple, float]:
+        """Index current IBKR option marks by (symbol, expiry, strike, right)."""
+        marks: dict[tuple, float] = {}
+        for item in self._ibkr.ib.portfolio():
+            c = item.contract
+            if c.secType != "OPT":
+                continue
+            price = item.marketPrice
+            if price is None or math.isnan(price):
+                continue
+            expiry_key = c.lastTradeDateOrContractMonth.replace("-", "")[:8]
+            marks[(c.symbol, expiry_key, float(c.strike), c.right)] = float(price)
+        return marks
+
+    def _option_position_unrealized(
+        self, trade: TradeRecord, marks: dict[tuple, float] | None = None
+    ) -> float | None:
         """Unrealized P&L for an option position from IBKR per-leg marks.
 
         Computes the position's current liquidation value per contract
@@ -136,17 +153,8 @@ class PortfolioManager:
             legs = [{"strike": trade.strike, "right": right,
                      "action": action, "expiry": trade.expiry}]
 
-        # Index current IBKR option marks by (symbol, expiry, strike, right)
-        marks: dict[tuple, float] = {}
-        for item in self._ibkr.ib.portfolio():
-            c = item.contract
-            if c.secType != "OPT":
-                continue
-            price = item.marketPrice
-            if price is None or math.isnan(price):
-                continue
-            expiry_key = c.lastTradeDateOrContractMonth.replace("-", "")[:8]
-            marks[(c.symbol, expiry_key, float(c.strike), c.right)] = float(price)
+        if marks is None:
+            marks = self._get_option_marks()
 
         net_liq = 0.0  # current value of the position per contract, from our side
         for leg in legs:
@@ -165,7 +173,9 @@ class PortfolioManager:
 
         return (net_liq - signed_entry) * 100 * trade.quantity
 
-    async def _evaluate_position(self, trade: TradeRecord) -> PositionStatus | None:
+    async def _evaluate_position(
+        self, trade: TradeRecord, option_marks: dict[tuple, float] | None = None
+    ) -> PositionStatus | None:
         """Evaluate a single position for exit conditions."""
         current_price = await self._market_data.get_current_price(trade.symbol)
         if current_price is None:
@@ -193,7 +203,7 @@ class PortfolioManager:
             else:
                 unrealized_pnl = (current_price - trade.entry_price) * trade.quantity
         else:
-            unrealized_pnl = self._option_position_unrealized(trade)
+            unrealized_pnl = self._option_position_unrealized(trade, option_marks)
 
         # Missing marks must NOT make the position unmanageable: skip only
         # the P&L-driven rules (stop/take-profit/partials) but keep the

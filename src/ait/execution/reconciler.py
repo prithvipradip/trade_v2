@@ -107,7 +107,7 @@ class PositionReconciler:
         # trade to be declared stale and force-closed at the first sweep.
         local_trades = self._state.get_open_trades()
         local_entries: list[tuple] = []  # (trade, set_of_leg_keys)
-        local_map: dict[str, dict] = {}  # any leg key -> {"trade": trade}
+        local_map: dict[str, list] = {}  # any leg key -> [trade, ...]
         for trade in local_trades:
             keys: set[str] = set()
             try:
@@ -138,7 +138,7 @@ class PositionReconciler:
                 keys.add(f"{trade.symbol}:STK")
             local_entries.append((trade, keys))
             for key in keys:
-                local_map[key] = {"trade": trade}
+                local_map.setdefault(key, []).append(trade)
 
         result = ReconciliationResult(
             matched=0,
@@ -152,29 +152,32 @@ class PositionReconciler:
         for key, ibkr_pos in ibkr_map.items():
             if key in local_map:
                 result.matched += 1
-                local_trade = local_map[key]["trade"]
+                matching_trades = local_map[key]
                 # Recover orphaned entries: a trade still marked PENDING (or
                 # CLOSING) whose legs are LIVE in IBKR actually filled — the
                 # in-memory fill tracker was lost on restart. Promote it to
                 # FILLED so the portfolio monitor manages it (check_positions
                 # only evaluates FILLED/PARTIAL).
-                if (local_trade.status in (TradeStatus.PENDING, TradeStatus.CLOSING)
-                        and local_trade.trade_id not in promoted_ids):
-                    self._state.update_trade_status(local_trade.trade_id, TradeStatus.FILLED)
-                    promoted_ids.add(local_trade.trade_id)
-                    result.promoted += 1
-                    log.warning("reconcile_promoted_to_filled",
-                                trade_id=local_trade.trade_id, symbol=local_trade.symbol,
-                                strategy=local_trade.strategy, prior_status=local_trade.status.value)
+                for local_trade in matching_trades:
+                    if (local_trade.status in (TradeStatus.PENDING, TradeStatus.CLOSING)
+                            and local_trade.trade_id not in promoted_ids):
+                        self._state.update_trade_status(local_trade.trade_id, TradeStatus.FILLED)
+                        promoted_ids.add(local_trade.trade_id)
+                        result.promoted += 1
+                        log.warning("reconcile_promoted_to_filled",
+                                    trade_id=local_trade.trade_id, symbol=local_trade.symbol,
+                                    strategy=local_trade.strategy,
+                                    prior_status=local_trade.status.value)
                 # Check quantity matches
-                if abs(ibkr_pos["quantity"]) != abs(local_trade.quantity):
+                local_qty = sum(abs(t.quantity) for t in matching_trades)
+                if abs(ibkr_pos["quantity"]) != local_qty:
                     msg = (
                         f"Quantity mismatch for {key}: "
-                        f"IBKR={ibkr_pos['quantity']}, local={local_trade.quantity}"
+                        f"IBKR={ibkr_pos['quantity']}, local_total={local_qty}"
                     )
                     result.discrepancies.append(msg)
                     log.warning("reconcile_quantity_mismatch", position=key,
-                                ibkr_qty=ibkr_pos["quantity"], local_qty=local_trade.quantity)
+                                ibkr_qty=ibkr_pos["quantity"], local_qty=local_qty)
             else:
                 result.new_from_ibkr += 1
                 msg = (
@@ -233,7 +236,7 @@ class PositionReconciler:
             log.warning("reconcile_stale_local", trade_id=trade.trade_id,
                         symbol=trade.symbol, strategy=trade.strategy)
 
-                # Try to get realized P&L from IBKR portfolio items
+            # Try to get realized P&L from IBKR portfolio items
             exit_price = 0.0
             realized_pnl = 0.0
             exit_reason = "reconciler_ibkr_realized"

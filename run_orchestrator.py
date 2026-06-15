@@ -34,7 +34,17 @@ if _env_file.exists():
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, val = line.partition("=")
-        key, val = key.strip(), val.strip().strip('"').strip("'")
+        val = val.strip()
+        if val and val[0] in {'"', "'"}:
+            quote = val[0]
+            end = val.find(quote, 1)
+            if end != -1:
+                val = val[1:end]
+            else:
+                val = val[1:]
+        else:
+            val = val.split("#", 1)[0].rstrip()
+        key = key.strip()
         if key and key not in os.environ:
             os.environ[key] = val
 

@@ -7,6 +7,8 @@ Calculates Greeks using py_vollib for proper Black-Scholes pricing.
 from __future__ import annotations
 
 import asyncio
+import os
+from functools import lru_cache
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
@@ -20,6 +22,24 @@ from ait.data.market_data import MarketDataService
 from ait.utils.logging import get_logger
 
 log = get_logger("data.options")
+
+
+def _parse_env_override(raw: str | None, cast, default):
+    if raw is None:
+        return default
+    try:
+        return cast(raw.split("#", 1)[0].strip())
+    except (ValueError, TypeError):
+        return default
+
+
+@lru_cache(maxsize=1)
+def _liquidity_thresholds() -> tuple[int, int, float]:
+    return (
+        _parse_env_override(os.environ.get("AIT_LIQ_MIN_VOLUME"), int, 50),
+        _parse_env_override(os.environ.get("AIT_LIQ_MIN_OI"), int, 100),
+        _parse_env_override(os.environ.get("AIT_LIQ_MAX_SPREAD"), float, 0.15),
+    )
 
 
 @dataclass
@@ -64,10 +84,7 @@ class OptionContract:
     def is_liquid(self) -> bool:
         # Env-tunable so we can loosen on paper / delayed-data accounts where
         # `volume` is often 0 because it's a live tick stream we don't get.
-        import os
-        min_vol = int(os.environ.get("AIT_LIQ_MIN_VOLUME", "50"))
-        min_oi = int(os.environ.get("AIT_LIQ_MIN_OI", "100"))
-        max_spread = float(os.environ.get("AIT_LIQ_MAX_SPREAD", "0.15"))
+        min_vol, min_oi, max_spread = _liquidity_thresholds()
         return self.volume >= min_vol and self.open_interest >= min_oi and self.spread_pct < max_spread
 
 
