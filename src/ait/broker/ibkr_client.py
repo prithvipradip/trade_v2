@@ -42,37 +42,60 @@ class IBKRClient:
         return self._connected and self._ib.isConnected()
 
     async def connect(self) -> bool:
-        """Connect to IBKR TWS/Gateway."""
-        try:
-            await self._ib.connectAsync(
-                host=self._config.ibkr_host,
-                port=self._config.ibkr_port,
-                clientId=self._config.ibkr_client_id,
-                timeout=15,
-                readonly=False,
-            )
-            self._connected = True
-            self._reconnect_attempts = 0
+        """Connect to IBKR TWS/Gateway.
 
-            # Type 4 = delayed-frozen: live when available, frozen fallback
-            # Avoids "competing live session" error on paper accounts
-            self._ib.reqMarketDataType(4)
+        Falls back to alternate client IDs on Error 326 ("client id already
+        in use"). A bot that restarts faster than IBKR releases the old
+        session's client id would otherwise crash-loop forever: connect
+        fails -> bot exits -> supervisor restarts -> same id still held.
+        """
+        base_id = self._config.ibkr_client_id
+        # Try the configured id first, then a few deterministic-ish fallbacks.
+        # offsets vary per attempt; not random so resume/journaling is stable.
+        candidate_ids = [base_id] + [base_id + 100 + i for i in range(5)]
+        for client_id in candidate_ids:
+            try:
+                await self._ib.connectAsync(
+                    host=self._config.ibkr_host,
+                    port=self._config.ibkr_port,
+                    clientId=client_id,
+                    timeout=15,
+                    readonly=False,
+                )
+                self._connected = True
+                self._reconnect_attempts = 0
 
-            account = self._config.ibkr_account or (
-                self._ib.managedAccounts()[0] if self._ib.managedAccounts() else "unknown"
-            )
-            log.info(
-                "ibkr_connected",
-                host=self._config.ibkr_host,
-                port=self._config.ibkr_port,
-                account=account,
-            )
-            return True
+                # Type 4 = delayed-frozen: live when available, frozen fallback
+                # Avoids "competing live session" error on paper accounts
+                self._ib.reqMarketDataType(4)
 
-        except Exception as e:
-            log.error("ibkr_connection_failed", error=str(e))
-            self._connected = False
-            return False
+                account = self._config.ibkr_account or (
+                    self._ib.managedAccounts()[0] if self._ib.managedAccounts() else "unknown"
+                )
+                log.info(
+                    "ibkr_connected",
+                    host=self._config.ibkr_host,
+                    port=self._config.ibkr_port,
+                    account=account,
+                    client_id=client_id,
+                    fallback=client_id != base_id,
+                )
+                return True
+
+            except Exception as e:
+                # Clean up a half-open socket before trying the next id.
+                try:
+                    if self._ib.isConnected():
+                        self._ib.disconnect()
+                except Exception:
+                    pass
+                log.warning("ibkr_connect_attempt_failed",
+                            client_id=client_id, error=str(e) or type(e).__name__)
+                continue
+
+        log.error("ibkr_connection_failed", tried_ids=candidate_ids)
+        self._connected = False
+        return False
 
     async def disconnect(self) -> None:
         """Gracefully disconnect from IBKR."""
