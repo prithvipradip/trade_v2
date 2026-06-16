@@ -158,6 +158,17 @@ class BotManager:
         """Check if bot is alive, restart if crashed."""
         if self.is_running:
             _log("debug", "bot_healthy", pid=self._proc.pid)
+            # Reset the restart budget once the bot has been continuously
+            # healthy for a sustained stretch. Without this, restart attempts
+            # spent during a transient overnight Gateway outage are never
+            # forgiven — the bot recovers and runs fine for hours, but the
+            # next single blip trips max_restarts and the supervisor gives up
+            # permanently (exactly what happened on 2026-06-16, FOMC eve).
+            if (self._restarts > 0 and self._last_restart
+                    and (datetime.now() - self._last_restart) > timedelta(minutes=30)):
+                _log("info", "restart_budget_reset", was=self._restarts,
+                     healthy_minutes=int((datetime.now() - self._last_restart).total_seconds() / 60))
+                self._restarts = 0
             return
 
         exit_code = self._proc.returncode if self._proc else "never_started"
