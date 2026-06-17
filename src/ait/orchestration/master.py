@@ -87,6 +87,20 @@ def _alert(message: str) -> None:
         _log("warn", "alert_send_failed", error=str(e))
 
 
+def _gateway_listening(port: int, host: str = "127.0.0.1") -> bool:
+    """Cheap check: is something accepting connections on the Gateway port?
+
+    Used to distinguish "IB Gateway is down" (external, transient — don't
+    spend restart budget) from "the bot itself keeps dying" (a real fault).
+    """
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=3):
+            return True
+    except OSError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Bot process management
 # ---------------------------------------------------------------------------
@@ -174,9 +188,30 @@ class BotManager:
         exit_code = self._proc.returncode if self._proc else "never_started"
         _log("warn", "bot_down", exit_code=exit_code, restarts=self._restarts)
 
+        # If IB Gateway itself is unreachable, the bot can't start through no
+        # fault of its own — IB's daily maintenance can take it down for 30-60
+        # min overnight. Do NOT spend restart budget on this: keep retrying
+        # indefinitely and alert once. Spending budget here is what repeatedly
+        # tripped max_restarts and left the bot dead for whole sessions
+        # (incl. FOMC eve 2026-06-16 and FOMC morning 2026-06-17).
+        gw_port = int(os.environ.get("IBKR_PORT", "4002"))
+        if not _gateway_listening(gw_port):
+            _log("info", "bot_restart_deferred_gateway_down", port=gw_port)
+            now = datetime.now()
+            if (self._last_gateway_alert is None
+                    or (now - self._last_gateway_alert) > timedelta(minutes=30)):
+                self._last_gateway_alert = now
+                _alert(f"IB Gateway unreachable on port {gw_port} (likely daily "
+                       f"maintenance). Bot start deferred; will resume "
+                       f"automatically when Gateway returns. No budget spent.")
+            return
+
+        # Gateway is up — a fresh start attempt may have cleared whatever was
+        # wrong; reset the gateway-alert latch so the next outage re-alerts.
+        self._last_gateway_alert = None
+
         # Reset restart counter if last restart was >30 min ago — a transient
-        # overnight Gateway drop shouldn't burn the budget toward a permanent
-        # give-up the next time something briefly hiccups.
+        # blip shouldn't burn the budget toward a permanent give-up.
         if self._last_restart and (datetime.now() - self._last_restart) > timedelta(minutes=30):
             self._restarts = 0
 
