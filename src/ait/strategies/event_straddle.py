@@ -59,42 +59,55 @@ class EventStraddle:
 
         try:
             days_to_event = economic_cal.days_until_next_event()
-        except Exception:
+        except Exception as e:
+            log.debug("event_straddle_no_calendar", symbol=symbol, error=str(e))
             return []
         if days_to_event is None or days_to_event > 1 or days_to_event < 0:
-            return []
+            return []  # not in the event window — silent by design (every scan)
+
+        # Past the event-window gate: from here, a bail is worth logging so a
+        # misfire on event day is never invisible again (it was — the strategy
+        # had never once fired because of a silent chain-DTE mismatch).
+        log.info("event_straddle_window_open",
+                 symbol=symbol, days_to_event=days_to_event, iv_rank=iv_rank)
 
         # Skip if IV already inflated — the move is priced in
         if iv_rank > 70:
-            log.info("event_straddle_skip_high_iv",
-                     symbol=symbol, iv_rank=iv_rank)
+            log.info("event_straddle_skip_high_iv", symbol=symbol, iv_rank=iv_rank)
             return []
 
         if not chains:
+            log.info("event_straddle_skip_no_chains", symbol=symbol)
             return []
 
-        # Pick the nearest expiry — captures event-day move best
+        # Pick the NEAREST available expiry. The orchestrator fetches chains in
+        # the configured dte_range (e.g. 14-45), so demanding dte <= 14 here
+        # found nothing and bailed silently — the strategy never fired. Take
+        # the soonest expiry available; an event straddle on the front-month
+        # still captures the event-day IV expansion and move.
         today = date.today()
-        chains_sorted = sorted(
-            [c for c in chains if c.expiry is not None],
+        candidates = sorted(
+            [c for c in chains if c.expiry is not None and (c.expiry - today).days > 0],
             key=lambda c: c.expiry,
         )
-        chain = None
-        for c in chains_sorted:
-            dte = (c.expiry - today).days
-            if 0 < dte <= 14:  # weekly to bi-weekly expiry
-                chain = c
-                break
+        chain = candidates[0] if candidates else None
         if chain is None:
+            log.info("event_straddle_skip_no_expiry", symbol=symbol,
+                     chains_seen=len(chains))
             return []
 
         price = chain.underlying_price
         if price <= 0:
+            log.info("event_straddle_skip_no_price", symbol=symbol)
             return []
 
         liquid_calls = self._filter_liquid(chain.calls)
         liquid_puts = self._filter_liquid(chain.puts)
         if not liquid_calls or not liquid_puts:
+            log.info("event_straddle_skip_illiquid", symbol=symbol,
+                     dte=(chain.expiry - date.today()).days,
+                     n_calls=len(chain.calls), n_puts=len(chain.puts),
+                     liquid_calls=len(liquid_calls), liquid_puts=len(liquid_puts))
             return []
 
         # ATM strike — closest to current price
@@ -103,6 +116,7 @@ class EventStraddle:
             & set(p.strike for p in liquid_puts)
         )
         if not common_strikes:
+            log.info("event_straddle_skip_no_common_strike", symbol=symbol)
             return []
         atm_strike = min(common_strikes, key=lambda s: abs(s - price))
 
