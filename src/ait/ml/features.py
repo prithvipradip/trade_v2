@@ -101,6 +101,17 @@ class FeatureEngine:
         # --- Seasonality Features ---
         features = self._add_seasonality(features)
 
+        # Safety net: a single ENTIRELY-NaN column (e.g. a degraded live feed
+        # with no volume or no IV) would otherwise make the dropna() below
+        # wipe every row, silently killing all predictions. Neutral-fill any
+        # all-NaN column with 0 instead, and log which ones so the underlying
+        # data problem stays visible.
+        all_nan = [c for c in features.columns if features[c].isna().all()]
+        if all_nan:
+            log.warning("features_all_nan_columns_filled",
+                        count=len(all_nan), columns=all_nan[:20])
+            features[all_nan] = features[all_nan].fillna(0.0)
+
         # Drop rows with NaN from lookback calculations
         features = features.dropna()
 
@@ -523,16 +534,32 @@ class FeatureEngine:
         volume = df["Volume"]
         close = df["Close"]
 
-        # Volume relative to 20-day average
+        # Volume features must degrade gracefully when volume is zero/missing.
+        # Delayed and free-tier feeds (Polygon/Yahoo/IBKR delayed) frequently
+        # report volume=0, which makes every one of these features NaN for ALL
+        # rows; the downstream dropna() then empties the whole feature matrix
+        # and the bot silently stops predicting (observed live 2026-06-22).
+        # Neutral fills keep the rows: ratio 1.0 = "normal" volume, change 0.0.
         vol_sma20 = volume.rolling(20).mean()
-        df["volume_sma_20_ratio"] = volume / vol_sma20.replace(0, np.nan)
+        df["volume_sma_20_ratio"] = (
+            (volume / vol_sma20.replace(0, np.nan))
+            .replace([np.inf, -np.inf], np.nan)
+        )
 
-        # OBV (On-Balance Volume) change
         obv = (np.sign(close.diff()) * volume).cumsum()
-        df["obv_change"] = obv.pct_change(5)
+        df["obv_change"] = obv.pct_change(5).replace([np.inf, -np.inf], np.nan)
 
-        # Volume trend (5-day slope)
-        df["volume_trend"] = volume.rolling(5).mean() / volume.rolling(20).mean()
+        df["volume_trend"] = (
+            (volume.rolling(5).mean() / volume.rolling(20).mean())
+            .replace([np.inf, -np.inf], np.nan)
+        )
+
+        # Fill ONLY the volume columns with neutral values. Leading lookback
+        # warmup rows stay NaN via the price features and are still dropped as
+        # intended; this only rescues rows lost purely to a zero-volume feed.
+        df["volume_sma_20_ratio"] = df["volume_sma_20_ratio"].fillna(1.0)
+        df["obv_change"] = df["obv_change"].fillna(0.0)
+        df["volume_trend"] = df["volume_trend"].fillna(1.0)
 
         return df
 
