@@ -996,8 +996,14 @@ class TradingOrchestrator:
                 sig_map = {s.strategy_name: s for s in signals}
                 signals = [sig_map[n] for n in ranked_names if n in sig_map]
 
-            # Try to execute the best signal (with entry timing check)
-            for signal in signals[:1]:
+            # Try the best signal; if it's risk-REJECTED, fall through to the
+            # next-ranked strategy rather than abandoning the symbol. The old
+            # code attempted only signals[:1], so a single un-executable top
+            # signal (e.g. CC/CSP whose assignment notional exceeds the 3% cap)
+            # meant zero trades even when a viable iron_condor ranked just
+            # behind it. Cap the fall-through so we never place more than one
+            # trade per symbol per scan (we break on the first handled signal).
+            for signal in signals[:4]:
                 if self._should_queue_signal(signal, hist):
                     self._signal_queue[signal.symbol] = {
                         "signal": signal,
@@ -1008,8 +1014,11 @@ class TradingOrchestrator:
                     }
                     log.info("signal_queued", symbol=signal.symbol,
                              strategy=signal.strategy_name, reason="entry_timing")
-                else:
-                    await self._try_execute(signal, final_confidence, sentiment, regime)
+                    break
+                handled = await self._try_execute(signal, final_confidence, sentiment, regime)
+                if handled:
+                    break  # executed or symbol-level block — done with this symbol
+                # else: risk-rejected — try the next-ranked strategy
 
     def _get_trade_budget(self) -> int:
         """Return how many trades are allowed this scan based on time of day.
@@ -1037,8 +1046,17 @@ class TradingOrchestrator:
 
         return min(budget, max_trades) - taken
 
-    async def _try_execute(self, signal, confidence: float, sentiment, regime) -> None:
-        """Validate and execute a signal."""
+    async def _try_execute(self, signal, confidence: float, sentiment, regime) -> bool:
+        """Validate and execute a signal.
+
+        Returns True when the symbol is "handled" (executed, or blocked for a
+        symbol-level reason like budget/pending/earnings) and the caller
+        should stop. Returns False ONLY when the signal was risk-REJECTED, so
+        the caller can fall through to the next-ranked strategy — otherwise a
+        single un-executable top signal (e.g. a CC/CSP whose assignment
+        notional exceeds the per-trade cap) abandons the symbol even though a
+        viable iron_condor was sitting right behind it.
+        """
         adaptor = self._learning.adaptor
 
         # Check trade budget (time-based pacing)
@@ -1049,7 +1067,7 @@ class TradingOrchestrator:
                      trades_taken=daily_stats.trades_taken,
                      max=self._settings.trading.max_daily_trades,
                      budget_remaining=remaining)
-            return
+            return True
 
         # First hour requires higher confidence (only take the best setups)
         from datetime import datetime as dt
@@ -1058,7 +1076,7 @@ class TradingOrchestrator:
             log.info("first_hour_confidence_gate",
                      symbol=signal.symbol, confidence=f"{confidence:.2f}",
                      required=0.85)
-            return
+            return True  # same confidence for all signals — trying another won't help
 
         # Check if this symbol already has a pending order
         pending_symbols = set()
@@ -1067,7 +1085,7 @@ class TradingOrchestrator:
                 pending_symbols.add(pending.signal.symbol)
         if signal.symbol in pending_symbols:
             log.debug("symbol_has_pending_order", symbol=signal.symbol)
-            return
+            return True  # symbol already busy
 
         # Check if position would hold through earnings (IV crush risk)
         if signal.expiry:
@@ -1075,7 +1093,7 @@ class TradingOrchestrator:
             expiry_date = signal.expiry if isinstance(signal.expiry, date_cls) else date_cls.fromisoformat(str(signal.expiry))
             if self._earnings.would_hold_through_earnings(signal.symbol, date.today(), expiry_date):
                 log.info("trade_blocked_earnings", symbol=signal.symbol, expiry=str(signal.expiry))
-                return
+                return True  # symbol blocked through earnings
 
         # Build trade request for risk validation
         current_vix = await self._market_data.get_vix() or 0.0
@@ -1110,7 +1128,7 @@ class TradingOrchestrator:
                 entry_price=signal.entry_price,
                 reject_reason=f"risk_{validation.reason}",
             )
-            return
+            return False  # rejected — let the caller try the next-ranked strategy
 
         # Apply learning-based sizing multiplier
         strategy_mult = adaptor.get_strategy_multiplier(signal.strategy_name)
@@ -1162,6 +1180,10 @@ class TradingOrchestrator:
             stats = self._state.get_daily_stats()
             stats.trades_taken += 1
             self._state.update_daily_stats(stats)
+
+        # Risk passed and an execution was attempted — the symbol is handled
+        # for this scan whether or not the order ultimately filled.
+        return True
 
     async def _execute_exit(self, pos: PositionStatus) -> None:
         """Execute an exit order for a position that needs to be closed."""
