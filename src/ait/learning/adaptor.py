@@ -214,9 +214,20 @@ class StrategyAdaptor:
 
         return None
 
+    # Core strategies the learning engine may never auto-disable. iron_condor
+    # is the primary income strategy and the only defined-risk neutral play
+    # that fits the per-trade risk cap; auto-disabling it (which happened on
+    # corrupted P&L data, 2026-06-23) silently halts all trading. A human can
+    # still disable it via config.
+    PROTECTED_STRATEGIES = frozenset({"iron_condor"})
+
     def _disable_strategy(self, strategy: str, insight: TradeInsight) -> Adaptation | None:
         """Disable a consistently losing strategy."""
         if strategy in self._disabled_strategies:
+            return None
+        if strategy in self.PROTECTED_STRATEGIES:
+            log.info("strategy_disable_blocked_protected",
+                     strategy=strategy, reason=insight.insight)
             return None
 
         self._disabled_strategies.add(strategy)
