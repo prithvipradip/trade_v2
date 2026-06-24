@@ -213,6 +213,22 @@ class RiskManager:
                 f"position risk ${request.max_loss:.0f} exceeds 3% account limit ${max_risk_per_trade:.0f}",
             )
 
+        # 6b-2. AGGREGATE capital-at-risk — the sum of defined-risk across ALL
+        # open positions plus this one must stay under a portfolio cap. The
+        # per-trade 3% check alone lets the account stack many trades into a
+        # large concentrated bet; this bounds the whole book.
+        PORTFOLIO_RISK_CAP_PCT = 0.10  # 10% of account across all open risk
+        portfolio_cap = account_value * PORTFOLIO_RISK_CAP_PCT
+        open_risk = sum(float(p.get("max_loss", 0) or 0) for p in self._open_positions)
+        new_risk = request.max_loss if (getattr(request, "max_loss", None) and request.max_loss) else estimated_cost
+        if open_risk + new_risk > portfolio_cap:
+            return TradeValidation(
+                False,
+                f"aggregate risk ${open_risk + new_risk:.0f} (open ${open_risk:.0f} "
+                f"+ new ${new_risk:.0f}) exceeds {PORTFOLIO_RISK_CAP_PCT:.0%} "
+                f"portfolio cap ${portfolio_cap:.0f}",
+            )
+
         # 6c. Concentration limit — no more than 20% of account in one symbol
         symbol_exposure = sum(
             abs(p.get("market_value", 0))

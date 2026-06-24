@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import time
 import traceback
-from datetime import date
+from datetime import date, datetime, timedelta
 
 from ait.bot.scheduler import MarketScheduler, TradingPhase
 from ait.bot.state import DailyStats, StateManager, TradeRecord, TradeStatus
@@ -200,6 +200,8 @@ class TradingOrchestrator:
     async def run(self) -> None:
         """Main loop — runs continuously, trading during market hours."""
         self._running = True
+        from datetime import datetime as _dt
+        self._started_at = _dt.now()  # for the post-restart settling guard
         log.info("orchestrator_starting", mode=self._settings.trading.mode)
 
         # Train models on startup if not yet trained (handles case where bot starts during market hours)
@@ -1069,8 +1071,20 @@ class TradingOrchestrator:
                      budget_remaining=remaining)
             return True
 
-        # First hour requires higher confidence (only take the best setups)
         from datetime import datetime as dt
+
+        # GUARD #5 — post-restart settling period. Don't trade in the first few
+        # minutes after startup: the bot trades on its very first scan, and with
+        # frequent restarts that means re-evaluating and firing immediately each
+        # time. Let positions/state settle and reconcile first.
+        SETTLE_SECONDS = 300  # 5 min
+        started = getattr(self, "_started_at", None)
+        if started is not None and (dt.now() - started).total_seconds() < SETTLE_SECONDS:
+            log.info("settling_period_skip", symbol=signal.symbol,
+                     seconds_since_start=int((dt.now() - started).total_seconds()))
+            return True  # whole-bot pause — not a per-signal reject
+
+        # First hour requires higher confidence (only take the best setups)
         hour_min = dt.now().hour + dt.now().minute / 60.0
         if hour_min < 10.5 and confidence < 0.85:
             log.info("first_hour_confidence_gate",
@@ -1078,7 +1092,38 @@ class TradingOrchestrator:
                      required=0.85)
             return True  # same confidence for all signals — trying another won't help
 
-        # Check if this symbol already has a pending order
+        # GUARD #2 — per-symbol+strategy cooldown. Refuse re-entry on the same
+        # symbol+strategy within the window regardless of fill status; a simple
+        # DB-backed backstop that survives restarts and doesn't depend on the
+        # (fragile) in-memory pending tracker.
+        COOLDOWN_MINUTES = 120
+        try:
+            cutoff = dt.now() - timedelta(minutes=COOLDOWN_MINUTES)
+            for rt in self._state.get_recent_trades(n=30):
+                if rt.symbol == signal.symbol and rt.strategy == signal.strategy_name:
+                    try:
+                        entered = datetime.fromisoformat(rt.entry_time)
+                    except (ValueError, TypeError):
+                        continue
+                    if entered >= cutoff:
+                        log.info("cooldown_skip", symbol=signal.symbol,
+                                 strategy=signal.strategy_name,
+                                 minutes_ago=int((dt.now() - entered).total_seconds() / 60))
+                        return True  # symbol+strategy recently traded
+        except Exception as e:  # noqa: BLE001
+            log.debug("cooldown_check_failed", error=str(e))
+
+        # GUARD #3 — working IBKR orders. Catch in-flight orders the local DB
+        # hasn't caught up on (e.g. placed but not yet recorded/filled).
+        try:
+            for t in (self._ibkr.get_open_orders() or []):
+                if getattr(t.contract, "symbol", None) == signal.symbol:
+                    log.info("working_order_skip", symbol=signal.symbol)
+                    return True
+        except Exception as e:  # noqa: BLE001
+            log.debug("working_order_check_failed", error=str(e))
+
+        # Check if this symbol already has a pending order (in-memory tracker)
         pending_symbols = set()
         for oid, pending in self._executor._pending_orders.items():
             if hasattr(pending, 'signal') and hasattr(pending.signal, 'symbol'):
@@ -1155,6 +1200,12 @@ class TradingOrchestrator:
             # Store full entry context for thesis re-evaluation and learning
             regime_str = regime.regime.value if regime else ""
             self._state.set_state(f"trade_regime_{trade_id}", regime_str)
+            # Persist max_loss so the aggregate capital-at-risk guard can sum
+            # it across open positions (survives restarts via the state DB).
+            self._state.set_state(
+                f"trade_maxloss_{trade_id}",
+                str(signal.max_loss if signal.is_defined_risk else 0.0),
+            )
             self._state.save_trade_context(
                 trade_id=trade_id,
                 direction=signal.direction.value,
@@ -1690,7 +1741,16 @@ class TradingOrchestrator:
         """
         try:
             open_trades = self._state.get_open_trades()
-            filled_trades = [t for t in open_trades if t.status in (TradeStatus.FILLED, TradeStatus.PARTIAL)]
+            # Include PENDING/CLOSING, not just FILLED: orders sitting pending
+            # (fill not yet confirmed on delayed data) must still count toward
+            # the duplicate, max-position, and aggregate-risk guards — otherwise
+            # the bot re-places the same setup every cycle until the daily cap
+            # (observed 2026-06-23: 2x SPY + 2x IWM iron_condor duplicates).
+            filled_trades = [
+                t for t in open_trades
+                if t.status in (TradeStatus.FILLED, TradeStatus.PARTIAL,
+                                TradeStatus.PENDING, TradeStatus.CLOSING)
+            ]
 
             # Try to get live Greeks from IBKR portfolio
             ibkr_greeks: dict[str, dict] = {}
@@ -1707,6 +1767,7 @@ class TradingOrchestrator:
             positions_for_risk = []
             for trade in filled_trades:
                 greeks = ibkr_greeks.get(trade.symbol, {})
+                ml = self._state.get_state(f"trade_maxloss_{trade.trade_id}", "")
                 positions_for_risk.append({
                     "symbol": trade.symbol,
                     "strategy": trade.strategy,
@@ -1715,6 +1776,7 @@ class TradingOrchestrator:
                     "gamma": greeks.get("gamma", 0),
                     "theta": greeks.get("theta", 0),
                     "vega": greeks.get("vega", 0),
+                    "max_loss": float(ml) if ml else 0.0,
                 })
 
             self._risk_manager.update_positions(positions_for_risk)
