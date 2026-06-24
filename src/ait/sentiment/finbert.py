@@ -25,6 +25,18 @@ class FinBERTAnalyzer:
         if self._loaded:
             return self._pipeline is not None
 
+        # HARD GUARD: importing transformers pulls in torch, whose native DLL
+        # loader segfaults (access violation) on some machines and takes the
+        # WHOLE process down — a crash try/except cannot catch. FinBERT is
+        # therefore opt-IN: only load when AIT_ENABLE_FINBERT=1 on a host where
+        # torch is known good. Otherwise skip silently (news + fear_greed still
+        # provide sentiment).
+        import os
+        if os.environ.get("AIT_ENABLE_FINBERT", "0") != "1":
+            log.info("finbert_disabled", reason="AIT_ENABLE_FINBERT != 1 (torch unsafe)")
+            self._loaded = True
+            return False
+
         try:
             from transformers import AutoTokenizer, pipeline
 

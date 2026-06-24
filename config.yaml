@@ -113,7 +113,9 @@ sentiment:
   sources:
     news: true
     fear_greed: true
-    finbert: true
+    finbert: false   # DISABLED: torch DLL load segfaults the whole process on
+                     # this machine (c0000005 in torch _load_dll_libraries,
+                     # crashed the bot every 30-60 min). news + fear_greed remain.
 
 notifications:
   telegram:
