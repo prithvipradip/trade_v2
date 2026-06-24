@@ -17,9 +17,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import faulthandler
 import signal
 import sys
 from pathlib import Path
+
+# Dump the Python stack on a native crash (segfault / access violation) to
+# stderr -> bot_stdout.log. The bot was dying every 30-60 min to a c0000005
+# access violation in a C-extension (2026-06-24); this names the exact call
+# site on the next crash so we can pin the culprit library.
+faulthandler.enable()
 
 from ait.bot.orchestrator import TradingOrchestrator
 from ait.broker.ibkr_client import IBKRClient
