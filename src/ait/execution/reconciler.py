@@ -68,12 +68,54 @@ class PositionReconciler:
         normalized_expiry = PositionReconciler._normalize_expiry(expiry)
         return f"{symbol}:{strike}:{right}:{normalized_expiry}"
 
+    # A PENDING order older than this is definitively dead: the fill-timeout
+    # is minutes (limit_order_timeout_bars × 5 min, ~15 min), so 30 min with
+    # no confirmed fill means the order never filled (or filled-and-expired).
+    # These orphans otherwise persist forever (the in-memory fill tracker is
+    # lost on restart) and, with the pending-aware dedup guard, actively BLOCK
+    # all new trades on the symbol + correlated symbols.
+    STALE_PENDING_MINUTES = 30
+
+    def _sweep_stale_pending(self) -> int:
+        """Close PENDING trades too old to still be live working orders.
+
+        Age-based, so RECENT pendings (awaiting a legitimate fill) are left
+        alone and still dedup correctly; only long-dead orphans are cleared.
+        Runs before the IBKR-empty mass-close guard because an unfilled order
+        opened no position — closing it as never-filled risks nothing.
+        """
+        closed = 0
+        try:
+            now = datetime.now()
+            for t in self._state.get_open_trades():
+                if t.status != TradeStatus.PENDING:
+                    continue
+                try:
+                    age_min = (now - datetime.fromisoformat(t.entry_time)).total_seconds() / 60
+                except (ValueError, TypeError):
+                    continue
+                if age_min >= self.STALE_PENDING_MINUTES:
+                    self._state.close_trade(
+                        trade_id=t.trade_id, exit_price=0.0, realized_pnl=0.0,
+                        exit_reason_detailed="stale_pending_never_filled",
+                    )
+                    closed += 1
+                    log.warning("reconcile_stale_pending_closed",
+                                trade_id=t.trade_id, symbol=t.symbol,
+                                strategy=t.strategy, age_min=int(age_min))
+        except Exception as e:  # noqa: BLE001
+            log.warning("sweep_stale_pending_failed", error=str(e))
+        return closed
+
     async def reconcile(self) -> ReconciliationResult:
         """Perform full reconciliation between local state and IBKR.
 
         This should be called on every bot startup.
         """
         log.info("reconciliation_starting")
+
+        # Clear long-dead PENDING orphans first (see _sweep_stale_pending).
+        self._sweep_stale_pending()
 
         # Get IBKR positions
         ibkr_positions = self._ibkr.get_positions()

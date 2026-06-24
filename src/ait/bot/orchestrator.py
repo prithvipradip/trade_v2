@@ -1740,6 +1740,14 @@ class TradingOrchestrator:
         detection, and correlation guards all operate on stale data.
         """
         try:
+            # First clear long-dead PENDING orphans so they don't keep
+            # blocking new trades via the pending-aware dedup/correlation
+            # guards (orders stuck pending never resolve on their own once the
+            # in-memory fill tracker is lost). Runs every cycle, age-gated.
+            swept = self._reconciler._sweep_stale_pending()
+            if swept:
+                log.info("stale_pending_swept", count=swept)
+
             open_trades = self._state.get_open_trades()
             # Include PENDING/CLOSING, not just FILLED: orders sitting pending
             # (fill not yet confirmed on delayed data) must still count toward
