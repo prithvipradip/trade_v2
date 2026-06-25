@@ -65,9 +65,16 @@ class IBKRClient:
                 self._connected = True
                 self._reconnect_attempts = 0
 
-                # Type 4 = delayed-frozen: live when available, frozen fallback
-                # Avoids "competing live session" error on paper accounts
-                self._ib.reqMarketDataType(4)
+                # Market data type. Default 4 = delayed-frozen, because this
+                # account has NO live API data entitlement (verified
+                # 2026-06-25: type 1 returns nan + Error 10089 "requires
+                # additional subscription for API"; only delayed works). Once
+                # a real live subscription is active for the API, set
+                # AIT_MARKET_DATA_TYPE=1 to switch to real-time.
+                import os
+                _mdt = int(os.environ.get("AIT_MARKET_DATA_TYPE", "4"))
+                self._ib.reqMarketDataType(_mdt)
+                log.info("market_data_type_set", type=_mdt)
 
                 account = self._config.ibkr_account or (
                     self._ib.managedAccounts()[0] if self._ib.managedAccounts() else "unknown"
