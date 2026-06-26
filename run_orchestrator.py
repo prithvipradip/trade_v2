@@ -23,6 +23,17 @@ import os
 import sys
 from pathlib import Path
 
+# OpenMP conflict guard. XGBoost and LightGBM each bundle their own OpenMP
+# runtime; loading both on Windows causes an access-violation crash inside
+# xgboost's native training (observed 2026-06-26: segfault in xgboost
+# core.update during vol_magnitude fit, killing the whole process — a crash
+# try/except cannot catch). KMP_DUPLICATE_LIB_OK lets the duplicate runtimes
+# coexist; single-threaded OpenMP avoids the conflicting parallel path.
+# Must be set BEFORE numpy/xgboost/lightgbm import anywhere, and propagates
+# to the bot + retrain subprocesses via inherited env.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 # Load .env early so AIT_LIQ_* and any other env-var overrides reach the bot
