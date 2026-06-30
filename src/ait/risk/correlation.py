@@ -33,16 +33,17 @@ class CorrelationGuard:
         self,
         max_correlation: float = 0.75,
         lookback_days: int = 60,
-        max_correlated_positions: int = 3,
+        max_correlated_positions: int = 1,
     ) -> None:
         self._max_corr = max_correlation
         self._lookback = lookback_days
-        # Allow up to N positions correlated above the threshold before
-        # blocking. Binary blocking (max=1) meant a single index position
-        # (SPY/QQQ/IWM/DIA all correlate ~0.95) froze the entire index
-        # universe — the bot could hold exactly one position. Allowing a few
-        # gives diversified premium collection across strikes/expiries while
-        # still capping concentration.
+        # Max positions correlated above the threshold allowed at once. Set to
+        # 1 (conservative, by user choice 2026-06-29): only ONE position per
+        # correlated cluster — so at most one index bet (SPY/QQQ/IWM/DIA all
+        # correlate ~0.95) at a time. This avoids stacking the same bet. It's
+        # viable now that combo exits actually fill (marketable-exit fix): the
+        # bot closes a position and rotates to the next rather than freezing.
+        # Raise this to allow diversified premium across correlated names.
         self._max_correlated = max_correlated_positions
         self._corr_cache = TTLCache(default_ttl=3600, max_size=500)  # 1hr cache
         self._price_data: dict[str, pd.Series] = {}
