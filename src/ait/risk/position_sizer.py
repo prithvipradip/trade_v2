@@ -144,7 +144,10 @@ class PositionSizer:
 
         # Scale cap with account size: 10 contracts per $100k, minimum 1
         account_scale_cap = max(1, int(account_value / 10_000))
-        contracts = max(1, min(max_contracts, account_scale_cap))
+        # Hard per-trade contract cap (config) — keep cost-per-trade small so
+        # the book can hold many more concurrent positions (learning volume).
+        hard_cap = self._pos_config.max_contracts_per_trade
+        contracts = max(1, min(max_contracts, account_scale_cap, hard_cap))
 
         # Max risk: for spreads, risk is the net debit (option_price already is net debit).
         # For naked options, risk is the full premium paid.

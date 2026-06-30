@@ -20,6 +20,7 @@ account:
 positions:
   max_open_positions: 8                # Raised for higher trade volume / faster learning
   max_position_pct: 0.05               # 5% of portfolio per position
+  max_contracts_per_trade: 1           # Learning mode: 1 contract/trade = min cost = max # of trades
   max_portfolio_delta: 0.30            # Net delta limit (absolute)
   max_portfolio_risk_pct: 0.02         # 2% max portfolio risk
 

@@ -32,6 +32,10 @@ class PositionConfig(BaseModel):
     max_position_pct: float = Field(default=0.05, ge=0.01, le=0.25)
     max_portfolio_delta: float = Field(default=0.30, ge=0.05, le=1.0)
     max_portfolio_risk_pct: float = Field(default=0.02, ge=0.005, le=0.10)
+    max_contracts_per_trade: int = Field(default=10, ge=1, le=100,
+        description="Hard cap on contracts per trade. Low values (e.g. 1) keep "
+                    "cost-per-trade minimal so the account can hold many more "
+                    "concurrent positions — maximizes trade COUNT for learning.")
 
 
 class RiskConfig(BaseModel):

@@ -339,6 +339,30 @@ class IBKRClient:
             elif av.currency not in ("BASE", "USD", "") and abs(rate - 1.0) < 1e-9:
                 base_ccy = av.currency  # base currency has rate 1.0
 
+        # Fallback base-currency detection: some accounts (e.g. this CAD-base
+        # paper account, DUN603821) send NO ExchangeRate rows at all, so the
+        # loop above leaves base_ccy=None. Without it, every core balance tag
+        # (reported only in CAD) is dropped below and NetLiquidation resolves
+        # to 0 — which silently zeroes the whole risk layer and blocks ALL
+        # trading. Infer the base currency from the currency the core balance
+        # tags are actually denominated in.
+        if base_ccy is None:
+            from collections import Counter
+            ccy_counts = Counter(
+                av.currency for av in raw
+                if av.tag in ("NetLiquidation", "BuyingPower", "AvailableFunds",
+                              "ExcessLiquidity", "TotalCashValue", "CashBalance")
+                and av.currency not in ("BASE", "USD", "")
+            )
+            if ccy_counts:
+                base_ccy = ccy_counts.most_common(1)[0][0]
+                # No ExchangeRate row → can't convert precisely. usd_to_base
+                # stays 1.0 (base value used as-is). Logged below so the
+                # approximation is visible; refine with a real FX rate later.
+                log.warning("account_base_ccy_inferred_no_fx",
+                            base_ccy=base_ccy,
+                            note="no ExchangeRate row; using base value as USD (approx)")
+
         # Collect each tag's base-currency total (the "BASE" row is the
         # authoritative multi-currency total; the base-currency-code row is
         # the fallback). Keep USD-only rows separately for tags that have no
