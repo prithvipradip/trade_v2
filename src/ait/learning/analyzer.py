@@ -586,6 +586,9 @@ class TradeAnalyzer:
             rows = conn.execute(
                 """SELECT * FROM trades
                    WHERE status = 'closed' AND entry_time >= ?
+                     AND COALESCE(exit_reason_detailed, '') NOT LIKE '%migrated%'
+                     AND COALESCE(exit_reason_detailed, '') NOT LIKE '%pending%'
+                     AND COALESCE(exit_reason_detailed, '') NOT LIKE '%never_filled%'
                    ORDER BY entry_time""",
                 (since,),
             ).fetchall()
