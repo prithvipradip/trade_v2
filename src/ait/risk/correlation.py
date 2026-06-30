@@ -33,9 +33,17 @@ class CorrelationGuard:
         self,
         max_correlation: float = 0.75,
         lookback_days: int = 60,
+        max_correlated_positions: int = 3,
     ) -> None:
         self._max_corr = max_correlation
         self._lookback = lookback_days
+        # Allow up to N positions correlated above the threshold before
+        # blocking. Binary blocking (max=1) meant a single index position
+        # (SPY/QQQ/IWM/DIA all correlate ~0.95) froze the entire index
+        # universe — the bot could hold exactly one position. Allowing a few
+        # gives diversified premium collection across strikes/expiries while
+        # still capping concentration.
+        self._max_correlated = max_correlated_positions
         self._corr_cache = TTLCache(default_ttl=3600, max_size=500)  # 1hr cache
         self._price_data: dict[str, pd.Series] = {}
 
@@ -57,15 +65,22 @@ class CorrelationGuard:
             # Same symbol — allow (duplicate check is in risk manager)
             return True, "same symbol handled by duplicate check"
 
-        for existing in open_symbols:
-            corr = self._get_correlation(new_symbol, existing)
-            if corr is not None and abs(corr) > self._max_corr:
-                reason = (
-                    f"{new_symbol} correlation with open position {existing}: "
-                    f"{corr:.2f} > max {self._max_corr:.2f}"
-                )
-                log.info("correlation_block", new=new_symbol, existing=existing, correlation=corr)
-                return False, reason
+        # Count how many existing positions are correlated above the threshold.
+        # Block only once that count reaches the cap, so a few correlated
+        # positions are allowed (diversified premium) but not unlimited stacking.
+        correlated = [
+            existing for existing in open_symbols
+            if (c := self._get_correlation(new_symbol, existing)) is not None
+            and abs(c) > self._max_corr
+        ]
+        if len(correlated) >= self._max_correlated:
+            reason = (
+                f"{new_symbol} correlated with {len(correlated)} open positions "
+                f"{correlated} (cap {self._max_correlated})"
+            )
+            log.info("correlation_block", new=new_symbol,
+                     correlated_count=len(correlated), cap=self._max_correlated)
+            return False, reason
 
         return True, "correlation check passed"
 

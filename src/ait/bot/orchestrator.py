@@ -1449,12 +1449,24 @@ class TradingOrchestrator:
                     # credit. Only 0/NaN means "no quote".
                     bid = ticker.bid if not math.isnan(ticker.bid) and ticker.bid != 0 else None
                     ask = ticker.ask if not math.isnan(ticker.ask) and ticker.ask != 0 else None
-                    if bid is not None and ask is not None:
-                        limit_price = round((bid + ask) / 2, 2)
-                    elif bid is not None:
-                        limit_price = round(bid, 2)
-                    elif ask is not None:
-                        limit_price = round(ask, 2)
+                    # An EXIT must FILL — a take-profit/stop that sits unfilled
+                    # lets a winner reverse or a loss deepen. Price at the
+                    # MARKETABLE side and cross the spread by a buffer, instead
+                    # of the mid (which never crosses, so the order timed out
+                    # and re-placed every 30s forever — the IWM strangle sat
+                    # on a +54% gain it couldn't take). BUY pays up to the ask,
+                    # SELL accepts down to the bid.
+                    EXIT_CROSS = 0.10
+                    if combo_action == "BUY":
+                        if ask is not None:
+                            limit_price = round(ask + EXIT_CROSS, 2)
+                        elif bid is not None:
+                            limit_price = round(bid + EXIT_CROSS, 2)
+                    else:  # SELL
+                        if bid is not None:
+                            limit_price = round(bid - EXIT_CROSS, 2)
+                        elif ask is not None:
+                            limit_price = round(ask - EXIT_CROSS, 2)
         except Exception as e:
             log.warning("combo_mid_price_failed", error=str(e))
 
