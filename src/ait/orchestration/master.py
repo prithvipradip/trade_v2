@@ -241,13 +241,38 @@ class WebServiceManager:
     def __init__(self):
         self._dashboard_proc: subprocess.Popen | None = None
         self._weblog_proc: subprocess.Popen | None = None
+        self._status_proc: subprocess.Popen | None = None
         self._dashboard_log = None
         self._weblog_log = None
+        self._status_log = None
 
     def start(self):
-        """Start both web services."""
+        """Start all web services."""
         self._start_dashboard()
         self._start_weblog()
+        self._start_status()
+
+    def _start_status(self):
+        """Lightweight live status dashboard (http://localhost:8503).
+
+        Reliable real-time view of bot health, positions, today's activity,
+        and real-exit P&L — reads the DB/logs directly, no IBKR clientId
+        conflict. Separate from the heavy Streamlit app on 8501.
+        """
+        if self._status_proc and self._status_proc.poll() is None:
+            return
+        _log("info", "status_dashboard_starting", port=8503)
+        log_path = LOGS_DIR / "status_server.log"
+        self._status_log = open(log_path, "a")
+        self._status_proc = subprocess.Popen(
+            [sys.executable, str(ROOT / "status_server.py")],
+            cwd=str(ROOT),
+            stdout=self._status_log,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        )
+        _log("info", "status_dashboard_started", pid=self._status_proc.pid,
+             url="http://localhost:8503")
 
     def _start_dashboard(self):
         if self._dashboard_proc and self._dashboard_proc.poll() is None:
@@ -287,9 +312,13 @@ class WebServiceManager:
         if self._weblog_proc and self._weblog_proc.poll() is not None:
             _log("warn", "weblog_crashed", restarting=True)
             self._start_weblog()
+        if self._status_proc and self._status_proc.poll() is not None:
+            _log("warn", "status_dashboard_crashed", restarting=True)
+            self._start_status()
 
     def stop(self):
-        for name, proc in [("dashboard", self._dashboard_proc), ("weblog", self._weblog_proc)]:
+        for name, proc in [("dashboard", self._dashboard_proc), ("weblog", self._weblog_proc),
+                           ("status", self._status_proc)]:
             if proc and proc.poll() is None:
                 _log("info", f"{name}_stopping", pid=proc.pid)
                 proc.terminate()
