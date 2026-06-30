@@ -217,7 +217,7 @@ class RiskManager:
         # open positions plus this one must stay under a portfolio cap. The
         # per-trade 3% check alone lets the account stack many trades into a
         # large concentrated bet; this bounds the whole book.
-        PORTFOLIO_RISK_CAP_PCT = 0.10  # 10% of account across all open risk
+        PORTFOLIO_RISK_CAP_PCT = 0.20  # 20% of account across all open risk (raised 2026-06-30 for higher trade volume / learning; per-trade 3% cap unchanged)
         portfolio_cap = account_value * PORTFOLIO_RISK_CAP_PCT
         open_risk = sum(float(p.get("max_loss", 0) or 0) for p in self._open_positions)
         new_risk = request.max_loss if (getattr(request, "max_loss", None) and request.max_loss) else estimated_cost

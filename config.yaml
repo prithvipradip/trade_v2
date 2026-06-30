@@ -10,7 +10,7 @@ trading:
   # DROPPED 1yr: GOOGL (-66%), PLTR (-33%) - became momentum stocks, hostile to iron condors
   universe: [SPY, QQQ, IWM, DIA, NVDA, AMZN, AMD]
   scan_interval_seconds: 300           # 5 minutes between scans
-  max_daily_trades: 5
+  max_daily_trades: 12                  # Raised for higher trade volume / faster learning
   trading_hours_only: true             # Only trade during RTH (9:30-16:00 ET)
 
 account:
@@ -18,7 +18,7 @@ account:
   pdt_account_under_25k: true          # Set false if account >= $25k
 
 positions:
-  max_open_positions: 5
+  max_open_positions: 8                # Raised for higher trade volume / faster learning
   max_position_pct: 0.05               # 5% of portfolio per position
   max_portfolio_delta: 0.30            # Net delta limit (absolute)
   max_portfolio_risk_pct: 0.02         # 2% max portfolio risk
@@ -28,7 +28,7 @@ risk:
   max_consecutive_losses: 3            # Pause after 3 consecutive losses
   pause_minutes_after_losses: 30       # Cool-down period
   max_api_failures: 5                  # Halt after 5 API failures in 10 min
-  min_confidence: 0.55                 # Lowered for GARCH ensemble (range predictor outputs 0.58-0.62 in calm markets)
+  min_confidence: 0.50                 # At learning floor — capture more marginal signals to learn from (was 0.55)
 
 options:
   delta_range: [0.20, 0.50]            # Target delta for long options
