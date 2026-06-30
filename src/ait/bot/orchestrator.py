@@ -400,7 +400,7 @@ class TradingOrchestrator:
             # Read-only guardrail: re-probe at most every 20 min so mid-session
             # read-only (Gateway daily restart relogging read-only) is caught
             # and alerted, not just at startup.
-            now = _dt.now()
+            now = datetime.now()
             last = getattr(self, "_last_readonly_check", None)
             if last is None or (now - last).total_seconds() >= 1200:
                 self._last_readonly_check = now
