@@ -223,6 +223,13 @@ class TradingOrchestrator:
 
         await self._send_notification(f"BOT STARTED | Mode: {self._settings.trading.mode} | {len(self._settings.trading.universe)} symbols")
 
+        # Read-only guardrail: verify the Gateway session can actually place
+        # orders. Read-only sessions silently reject every order (Error 321)
+        # while the bot logs 'trade_executed', so nothing fills and it's
+        # invisible for a whole day. Alert the moment it's detected.
+        self._readonly_alerted = False
+        await self._check_trading_enabled()
+
         while self._running:
             try:
                 phase = self._scheduler.get_current_phase()
@@ -390,6 +397,15 @@ class TradingOrchestrator:
         for the full 5-minute scan interval.
         """
         try:
+            # Read-only guardrail: re-probe at most every 20 min so mid-session
+            # read-only (Gateway daily restart relogging read-only) is caught
+            # and alerted, not just at startup.
+            now = _dt.now()
+            last = getattr(self, "_last_readonly_check", None)
+            if last is None or (now - last).total_seconds() >= 1200:
+                self._last_readonly_check = now
+                await self._check_trading_enabled()
+
             positions = await self._portfolio.check_positions()
 
             # Skip positions already in CLOSING state (exit order already placed)
@@ -1047,6 +1063,35 @@ class TradingOrchestrator:
             budget = max_trades
 
         return min(budget, max_trades) - taken
+
+    async def _check_trading_enabled(self) -> bool:
+        """Probe whether orders can actually be placed; alert loudly if not.
+
+        Guardrail against the silent read-only lock. Called at startup and
+        periodically. On read-only it fires a single Telegram alert (until it
+        recovers) so the user knows immediately to restart Gateway — instead
+        of finding out at end of day that nothing traded.
+        """
+        try:
+            can_trade = await self._ibkr.verify_can_trade()
+        except Exception:
+            return True  # never let the probe itself break the loop
+        if not can_trade:
+            if not getattr(self, "_readonly_alerted", False):
+                self._readonly_alerted = True
+                await self._send_notification(
+                    "READ-ONLY: IB Gateway is rejecting all orders (Error 321). "
+                    "Nothing can trade or exit until you RESTART GATEWAY and log "
+                    "in as IB API. The bot will keep checking and tell you when "
+                    "it clears."
+                )
+                log.critical("trading_disabled_alerted")
+        else:
+            if getattr(self, "_readonly_alerted", False):
+                self._readonly_alerted = False
+                await self._send_notification("Trading ENABLED again — Gateway accepts orders. Resuming.")
+                log.info("trading_reenabled")
+        return can_trade
 
     async def _try_execute(self, signal, confidence: float, sentiment, regime) -> bool:
         """Validate and execute a signal.

@@ -119,6 +119,49 @@ class IBKRClient:
         log.warning("ibkr_not_connected", action="reconnecting")
         return await self._reconnect()
 
+    async def verify_can_trade(self) -> bool:
+        """Detect whether the Gateway session can actually place orders.
+
+        The recurring silent killer: Gateway logs in READ-ONLY (session-level,
+        not the API checkbox), so every order is rejected with Error 321 while
+        the bot still logs 'trade_executed' — nothing fills, and it's invisible
+        until end of day. This probes it directly by placing a guaranteed
+        non-fillable limit (BUY 1 SPY @ $1, far below market) and checking
+        whether Gateway ACCEPTS it (PreSubmitted/Submitted) or rejects it as
+        read-only. The probe order is cancelled immediately; on a paper account
+        it can never fill. Returns True if orders work, False if read-only.
+        """
+        if not self.connected:
+            return False
+        try:
+            from ib_insync import LimitOrder, Stock
+            spy = Stock("SPY", "SMART", "USD")
+            q = await self._ib.qualifyContractsAsync(spy)
+            if not q:
+                return True  # can't probe; don't false-alarm
+            order = LimitOrder("BUY", 1, 1.00, tif="DAY")
+            trade = self._ib.placeOrder(q[0], order)
+            await asyncio.sleep(2.5)
+            msgs = " ".join(le.message for le in trade.log if le.message)
+            status = trade.orderStatus.status
+            read_only = "Read-Only" in msgs or "read-only" in msgs.lower()
+            try:
+                self._ib.cancelOrder(order)  # never leave the probe live
+            except Exception:
+                pass
+            if read_only:
+                log.critical("trading_blocked_read_only",
+                             detail="Gateway session is READ-ONLY — orders rejected (Error 321). "
+                                    "Restart IB Gateway and log in as IB API to clear.")
+                return False
+            if status in ("PreSubmitted", "Submitted", "Filled", "Cancelled"):
+                log.info("trading_verified", status=status)
+                return True
+            return True  # unknown/transient — don't false-alarm
+        except Exception as e:  # noqa: BLE001
+            log.warning("verify_can_trade_error", error=str(e))
+            return True  # probe failed for another reason; don't block
+
     async def _reconnect(self) -> bool:
         """Attempt to reconnect with exponential backoff."""
         while self._reconnect_attempts < self._max_reconnect_attempts:
