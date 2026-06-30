@@ -28,6 +28,7 @@ class IBKRClient:
         self._reconnect_attempts = 0
         self._max_reconnect_attempts = 5
         self._reconnect_delay = 5  # seconds
+        self._fx_cache: dict[str, float] = {}  # ccy -> units per 1 USD, cached per session
 
         # Wire up disconnect handler
         self._ib.disconnectedEvent += self._on_disconnect
@@ -306,6 +307,38 @@ class IBKRClient:
             return []
         return self._ib.portfolio()
 
+    async def _fx_usd_to(self, ccy: str) -> float | None:
+        """Fetch the USD->ccy spot rate (units of ccy per 1 USD), cached.
+
+        Used when the account is non-USD base and IBKR sends no ExchangeRate
+        rows, so balances can be converted to USD instead of being treated
+        1:1. The rate barely moves intraday, so cache it for the session.
+        """
+        if ccy == "USD":
+            return 1.0
+        if ccy in self._fx_cache:
+            return self._fx_cache[ccy]
+        try:
+            from ib_insync import Forex
+            contract = Forex(f"USD{ccy}")  # e.g. USDCAD => CAD per 1 USD
+            await self._ib.qualifyContractsAsync(contract)
+            tickers = await self._ib.reqTickersAsync(contract)
+            rate = None
+            if tickers:
+                t = tickers[0]
+                for cand in (t.marketPrice(), t.close, t.last, t.bid, t.ask):
+                    if cand and cand == cand and cand > 0:  # not None/NaN/<=0
+                        rate = float(cand)
+                        break
+            if rate and rate > 0:
+                self._fx_cache[ccy] = rate
+                log.info("fx_rate_fetched", pair=f"USD{ccy}", rate=round(rate, 4))
+                return rate
+            log.warning("fx_rate_unavailable", pair=f"USD{ccy}")
+        except Exception as e:  # noqa: BLE001
+            log.warning("fx_fetch_failed", ccy=ccy, error=str(e))
+        return None
+
     async def get_account_values(self) -> dict[str, str]:
         """Get account summary values, normalized to USD.
 
@@ -356,12 +389,20 @@ class IBKRClient:
             )
             if ccy_counts:
                 base_ccy = ccy_counts.most_common(1)[0][0]
-                # No ExchangeRate row → can't convert precisely. usd_to_base
-                # stays 1.0 (base value used as-is). Logged below so the
-                # approximation is visible; refine with a real FX rate later.
-                log.warning("account_base_ccy_inferred_no_fx",
-                            base_ccy=base_ccy,
-                            note="no ExchangeRate row; using base value as USD (approx)")
+                # No ExchangeRate row → fetch the real USD->base spot so
+                # balances convert correctly instead of being treated 1:1
+                # (which overstated buying power). Fall back to 1.0 (raw, with
+                # a warning) only if the FX fetch fails — still better than 0.
+                fx = await self._fx_usd_to(base_ccy)
+                if fx and fx > 0:
+                    usd_to_base = fx
+                    log.info("account_base_ccy_inferred_fx", base_ccy=base_ccy,
+                             usd_to_base=round(fx, 4))
+                else:
+                    log.warning("account_base_ccy_inferred_no_fx",
+                                base_ccy=base_ccy,
+                                note="no ExchangeRate row and FX fetch failed; "
+                                     "using base value as USD (approx, overstated)")
 
         # Collect each tag's base-currency total (the "BASE" row is the
         # authoritative multi-currency total; the base-currency-code row is

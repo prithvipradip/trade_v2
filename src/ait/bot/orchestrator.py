@@ -1014,6 +1014,17 @@ class TradingOrchestrator:
                 sig_map = {s.strategy_name: s for s in signals}
                 signals = [sig_map[n] for n in ranked_names if n in sig_map]
 
+            # Defined-risk bias: float capped-loss strategies (iron_condor,
+            # spreads) ahead of undefined-risk ones (short_strangle), keeping
+            # the learned/ranked order WITHIN each group. This is a stable
+            # partition, so Thompson still explores among defined-risk
+            # strategies; undefined-risk stays only as a last-resort fallback.
+            # Serves: capital efficiency + bounded downside ("don't run out of
+            # money") without starving volume.
+            if signals:
+                signals = ([s for s in signals if s.is_defined_risk]
+                           + [s for s in signals if not s.is_defined_risk])
+
             # Try the best signal; if it's risk-REJECTED, fall through to the
             # next-ranked strategy rather than abandoning the symbol. The old
             # code attempted only signals[:1], so a single un-executable top
@@ -1277,8 +1288,18 @@ class TradingOrchestrator:
             stats.trades_taken += 1
             self._state.update_daily_stats(stats)
 
-        # Risk passed and an execution was attempted — the symbol is handled
-        # for this scan whether or not the order ultimately filled.
+        if not trade_id:
+            # Risk passed but the order couldn't be built/placed (e.g. combo
+            # leg qualification failed — the long-standing reason iron_condor
+            # silently never fills). Treat like a reject so the caller falls
+            # through to the next-ranked strategy instead of abandoning the
+            # symbol. Logged distinctly so the build failure is visible.
+            log.info("execution_attempt_failed_fallthrough",
+                     symbol=signal.symbol, strategy=signal.strategy_name)
+            return False
+
+        # Risk passed and the order was placed — the symbol is handled
+        # for this scan whether or not the order ultimately fills.
         return True
 
     async def _execute_exit(self, pos: PositionStatus) -> None:
