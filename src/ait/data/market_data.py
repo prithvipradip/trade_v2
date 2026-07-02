@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
@@ -417,9 +418,9 @@ class MarketDataService:
             if not qualified:
                 return None
 
-            # Type 4 = delayed-frozen: uses live data when available,
-            # falls back to frozen snapshot — avoids "competing session" on paper
-            self._ibkr.ib.reqMarketDataType(4)
+            # Market data type from env (same knob as ibkr_client): 1=live,
+            # 4=delayed-frozen. Live now that Network B/C + OPRA are subscribed.
+            self._ibkr.ib.reqMarketDataType(int(os.environ.get("AIT_MARKET_DATA_TYPE", "4")))
             self._ibkr.ib.reqMktData(qualified, "", False, False)
             ticker = None
             try:
