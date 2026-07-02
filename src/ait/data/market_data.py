@@ -274,8 +274,17 @@ class MarketDataService:
                 qualified = await self._ibkr.qualify_contract(contract)
                 if qualified:
                     self._ibkr.ib.reqMktData(qualified, "", False, False)
-                    await asyncio.sleep(0.5)
-                    ticker = self._ibkr.ib.ticker(qualified)
+                    ticker = None
+                    try:
+                        await asyncio.sleep(0.5)
+                        ticker = self._ibkr.ib.ticker(qualified)
+                    finally:
+                        # Pair req with cancel — a leaked streaming sub errors
+                        # (10091) forever and floods the API thread → crash.
+                        try:
+                            self._ibkr.ib.cancelMktData(qualified)
+                        except Exception:
+                            pass
                     if ticker and not math.isnan(ticker.last) and ticker.last > 0:
                         return float(ticker.last)
             except Exception as e:
@@ -412,9 +421,17 @@ class MarketDataService:
             # falls back to frozen snapshot — avoids "competing session" on paper
             self._ibkr.ib.reqMarketDataType(4)
             self._ibkr.ib.reqMktData(qualified, "", False, False)
-            await asyncio.sleep(0.5)  # Brief wait for data
-
-            ticker = self._ibkr.ib.ticker(qualified)
+            ticker = None
+            try:
+                await asyncio.sleep(0.5)  # Brief wait for data
+                ticker = self._ibkr.ib.ticker(qualified)
+            finally:
+                # Pair req with cancel — a leaked streaming sub errors (10091)
+                # forever and floods the API thread → native crash.
+                try:
+                    self._ibkr.ib.cancelMktData(qualified)
+                except Exception:
+                    pass
             if ticker:
                 bid = ticker.bid if not math.isnan(ticker.bid) else 0.0
                 ask = ticker.ask if not math.isnan(ticker.ask) else 0.0

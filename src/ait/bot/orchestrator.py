@@ -1506,8 +1506,21 @@ class TradingOrchestrator:
             qualified_combo = await self._ibkr.qualify_contract(combo)
             if qualified_combo:
                 self._ibkr.ib.reqMktData(qualified_combo, "", False, False)
-                await asyncio.sleep(0.5)
-                ticker = self._ibkr.ib.ticker(qualified_combo)
+                ticker = None
+                try:
+                    await asyncio.sleep(0.5)
+                    ticker = self._ibkr.ib.ticker(qualified_combo)
+                finally:
+                    # ALWAYS cancel the streaming subscription. A leaked
+                    # snapshot=False sub streams (and, if unentitled, errors
+                    # 10091) forever; repeated exit-pricing attempts pile these
+                    # up into a market-data flood that crashes the ib_insync
+                    # message thread (native access violation). Cancelling here
+                    # keeps req/cancel paired 1:1.
+                    try:
+                        self._ibkr.ib.cancelMktData(qualified_combo)
+                    except Exception:
+                        pass
                 if ticker:
                     import math
                     # Combo quotes are SIGNED: closing a debit position
