@@ -285,16 +285,23 @@ class TradeExecutor:
         # Leg counts are ambiguous (e.g. iron condor has 2 BUY + 2 SELL but is CREDIT).
         is_credit = signal.strategy_name in self.CREDIT_STRATEGIES
 
-        # Aggressive pricing: accept ~$0.05 below mid to improve fill rate.
-        # Mid prices rarely fill on multi-leg combos — MMs take a few cents.
-        aggressive_offset = 0.05
+        # Marketable pricing: a flat 5c off mid almost never fills a multi-leg
+        # combo — the bid/ask spread is routinely 10-20% of mid, so the order
+        # sat unfilled and got reconciled as stale_pending_never_filled. Cross
+        # toward the fill by a PROPORTIONAL amount (15% of the quote, min 10c)
+        # so orders actually execute on live quotes. Bounded to a marketable
+        # LIMIT (not a market order) so entry price stays capped.
+        aggressive_offset = max(0.10, round(0.15 * abs(signal.entry_price), 2))
         if is_credit:
-            # Credit: we collect, so reduce the credit we demand by 5c
+            # Credit: we collect — accept less credit to get filled.
             entry_px = max(0.01, signal.entry_price - aggressive_offset)
             limit_price = -entry_px
         else:
-            # Debit: we pay, so accept paying 5c more
+            # Debit: we pay — accept paying more to get filled.
             limit_price = signal.entry_price + aggressive_offset
+        log.info("combo_entry_priced", strategy=signal.strategy_name,
+                 target=signal.entry_price, offset=aggressive_offset,
+                 limit=limit_price, is_credit=is_credit)
 
         order = OrderBuilder.combo_limit(
             action="BUY",
