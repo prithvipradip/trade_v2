@@ -33,6 +33,26 @@ log = get_logger("execution.executor")
 DEFAULT_ORDER_TIMEOUT = 90  # 90 seconds
 
 
+def combo_entry_limit(entry_price: float, is_credit: bool) -> tuple[float, float]:
+    """Marketable limit for a multi-leg combo entry.
+
+    A flat 5c off mid almost never fills a combo — the spread is routinely
+    10-20% of mid, so orders sat unfilled and were reconciled as
+    stale_pending_never_filled. Cross toward the fill by a PROPORTIONAL
+    amount (15% of the quote, min 10c), bounded to a marketable LIMIT (not a
+    market order) so the entry price stays capped.
+
+    Returns (limit_price, offset). Credit combos quote NEGATIVE limits
+    (always-BUY convention: negative = we collect).
+    """
+    offset = max(0.10, round(0.15 * abs(entry_price), 2))
+    if is_credit:
+        # Credit: we collect — accept less credit to get filled.
+        return -max(0.01, entry_price - offset), offset
+    # Debit: we pay — accept paying more to get filled.
+    return entry_price + offset, offset
+
+
 class PendingOrder:
     """Tracks a pending order with its submission time."""
 
@@ -285,20 +305,9 @@ class TradeExecutor:
         # Leg counts are ambiguous (e.g. iron condor has 2 BUY + 2 SELL but is CREDIT).
         is_credit = signal.strategy_name in self.CREDIT_STRATEGIES
 
-        # Marketable pricing: a flat 5c off mid almost never fills a multi-leg
-        # combo — the bid/ask spread is routinely 10-20% of mid, so the order
-        # sat unfilled and got reconciled as stale_pending_never_filled. Cross
-        # toward the fill by a PROPORTIONAL amount (15% of the quote, min 10c)
-        # so orders actually execute on live quotes. Bounded to a marketable
-        # LIMIT (not a market order) so entry price stays capped.
-        aggressive_offset = max(0.10, round(0.15 * abs(signal.entry_price), 2))
-        if is_credit:
-            # Credit: we collect — accept less credit to get filled.
-            entry_px = max(0.01, signal.entry_price - aggressive_offset)
-            limit_price = -entry_px
-        else:
-            # Debit: we pay — accept paying more to get filled.
-            limit_price = signal.entry_price + aggressive_offset
+        limit_price, aggressive_offset = combo_entry_limit(
+            signal.entry_price, is_credit
+        )
         log.info("combo_entry_priced", strategy=signal.strategy_name,
                  target=signal.entry_price, offset=aggressive_offset,
                  limit=limit_price, is_credit=is_credit)

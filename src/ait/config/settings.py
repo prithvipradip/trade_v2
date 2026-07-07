@@ -31,7 +31,12 @@ class PositionConfig(BaseModel):
     max_open_positions: int = Field(default=5, ge=1, le=20)
     max_position_pct: float = Field(default=0.05, ge=0.01, le=0.25)
     max_portfolio_delta: float = Field(default=0.30, ge=0.05, le=1.0)
-    max_portfolio_risk_pct: float = Field(default=0.02, ge=0.005, le=0.10)
+    max_portfolio_risk_pct: float = Field(default=0.20, ge=0.005, le=0.50,
+        description="Aggregate capital-at-risk across ALL open positions as a "
+                    "fraction of NLV. Was a phantom knob (never read) while the "
+                    "real cap was hardcoded 0.20 in manager.py — now wired "
+                    "(audit 2026-07-07 item 3.3). Default matches the "
+                    "2026-06-30 operating value.")
     max_contracts_per_trade: int = Field(default=10, ge=1, le=100,
         description="Hard cap on contracts per trade. Low values (e.g. 1) keep "
                     "cost-per-trade minimal so the account can hold many more "
@@ -44,6 +49,15 @@ class RiskConfig(BaseModel):
     pause_minutes_after_losses: int = Field(default=30, ge=5, le=120)
     max_api_failures: int = Field(default=5, ge=2, le=20)
     min_confidence: float = Field(default=0.65, ge=0.50, le=0.95)
+    max_position_risk_pct: float = Field(default=0.03, ge=0.005, le=0.10,
+        description="Per-trade max_loss cap as a fraction of NLV (was "
+                    "hardcoded 0.03 in manager.py — audit item 3.3).")
+    max_correlation: float = Field(default=0.75, ge=0.30, le=0.99,
+        description="Correlation above which two symbols count as the same bet.")
+    max_correlated_positions: int = Field(default=2, ge=1, le=8,
+        description="Max simultaneous positions within one correlated cluster "
+                    "(SPY/QQQ/IWM/DIA correlate ~0.95). Was a CorrelationGuard "
+                    "code default — audit item 3.3.")
 
 
 class OptionsConfig(BaseModel):
@@ -141,6 +155,10 @@ class MLConfig(BaseModel):
     retrain_interval_days: int = Field(default=7, ge=1, le=30)
     lookback_days: int = Field(default=504, ge=60, le=2520)
     min_training_samples: int = Field(default=100, ge=30)
+    range_min_confidence: float = Field(default=0.65, ge=0.50, le=0.90,
+        description="Floor for model-overridden signal confidence (range/"
+                    "vol-mag). 0.65 beat 0.55 across every backtest metric. "
+                    "Was hardcoded in orchestrator — audit item 3.3.")
 
     @field_validator("ensemble_weights")
     @classmethod
@@ -172,6 +190,10 @@ class SentimentConfig(BaseModel):
 
 
 class ExitConfig(BaseModel):
+    exit_cross_amount: float = Field(default=0.10, ge=0.01, le=0.50,
+        description="How far a combo EXIT limit crosses the spread so the "
+                    "close actually fills (was hardcoded EXIT_CROSS in "
+                    "orchestrator — audit item 3.3).")
     trailing_stop_pct: float = Field(default=0.25, ge=0.10, le=0.50)
     breakeven_trigger_pct: float = Field(default=0.30, ge=0.10, le=0.80)
     partial_exit_levels: list[dict] = [

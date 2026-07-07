@@ -167,14 +167,10 @@ class RiskManager:
                     f"(got {request.confidence:.2f})",
                 )
 
-        # 3a. Daily trade limit
-        if hasattr(request, 'daily_trades_taken') and hasattr(self._risk_config, 'max_daily_trades'):
-            max_daily = getattr(self._risk_config, 'max_daily_trades', 5)
-            if request.daily_trades_taken >= max_daily:
-                return TradeValidation(
-                    False,
-                    f"max daily trades reached ({request.daily_trades_taken}/{max_daily})",
-                )
+        # (Dead daily-trade gate removed — audit 2026-07-07 item 3.3: it
+        # checked a field TradeRequest never had AND a config key that lives
+        # on TradingConfig, so it could never fire. The real daily budget is
+        # enforced in orchestrator._get_trade_budget.)
 
         # 3b. Position count limit
         if len(self._open_positions) >= self._pos_config.max_open_positions:
@@ -216,19 +212,23 @@ class RiskManager:
         if not await self._account.can_afford(estimated_cost):
             return TradeValidation(False, "insufficient buying power")
 
-        # 6b. Per-position max risk — no single trade should risk more than 3% of account
-        max_risk_per_trade = account_value * 0.03
+        # 6b. Per-position max risk (config: risk.max_position_risk_pct)
+        _per_trade_pct = self._risk_config.max_position_risk_pct
+        max_risk_per_trade = account_value * _per_trade_pct
         if hasattr(request, 'max_loss') and request.max_loss and request.max_loss > max_risk_per_trade:
             return TradeValidation(
                 False,
-                f"position risk ${request.max_loss:.0f} exceeds 3% account limit ${max_risk_per_trade:.0f}",
+                f"position risk ${request.max_loss:.0f} exceeds "
+                f"{_per_trade_pct:.0%} account limit ${max_risk_per_trade:.0f}",
             )
 
         # 6b-2. AGGREGATE capital-at-risk — the sum of defined-risk across ALL
         # open positions plus this one must stay under a portfolio cap. The
         # per-trade 3% check alone lets the account stack many trades into a
         # large concentrated bet; this bounds the whole book.
-        PORTFOLIO_RISK_CAP_PCT = 0.20  # 20% of account across all open risk (raised 2026-06-30 for higher trade volume / learning; per-trade 3% cap unchanged)
+        # Config-wired (audit item 3.3): positions.max_portfolio_risk_pct was
+        # a phantom knob while this literal ruled. Default 0.20 (2026-06-30).
+        PORTFOLIO_RISK_CAP_PCT = self._pos_config.max_portfolio_risk_pct
         portfolio_cap = account_value * PORTFOLIO_RISK_CAP_PCT
         open_risk = sum(float(p.get("max_loss", 0) or 0) for p in self._open_positions)
         new_risk = request.max_loss if (getattr(request, "max_loss", None) and request.max_loss) else estimated_cost

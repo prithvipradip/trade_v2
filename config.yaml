@@ -22,7 +22,9 @@ positions:
   max_position_pct: 0.05               # 5% of portfolio per position
   max_contracts_per_trade: 1           # Learning mode: 1 contract/trade = min cost = max # of trades
   max_portfolio_delta: 0.30            # Net delta limit (absolute)
-  max_portfolio_risk_pct: 0.02         # 2% max portfolio risk
+  max_portfolio_risk_pct: 0.20         # Aggregate open capital-at-risk cap (now WIRED — was a
+                                       # phantom 0.02 never read while manager hardcoded 0.20;
+                                       # audit 2026-07-07 item 3.3. 0.20 = operating value since 06-30)
 
 risk:
   max_daily_loss_pct: 0.02             # 2% daily loss limit → circuit breaker
@@ -30,6 +32,9 @@ risk:
   pause_minutes_after_losses: 30       # Cool-down period
   max_api_failures: 5                  # Halt after 5 API failures in 10 min
   min_confidence: 0.50                 # At learning floor — capture more marginal signals to learn from (was 0.55)
+  max_position_risk_pct: 0.03          # Per-trade max_loss cap vs NLV (was hardcoded in manager.py)
+  max_correlation: 0.75                # Correlation above which symbols count as the same bet
+  max_correlated_positions: 2          # Positions per correlated cluster (was code default)
 
 options:
   delta_range: [0.20, 0.50]            # Target delta for long options
@@ -80,6 +85,7 @@ ml:
   retrain_interval_days: 7
   lookback_days: 504                   # 2 years of trading days
   min_training_samples: 100
+  range_min_confidence: 0.65           # Floor for range/vol-mag model-overridden confidence (was hardcoded)
 
 meta_label:
   enabled: false                       # Disabled: trained on corrupted data, rejects everything. Re-enable after 50+ clean trades.
@@ -87,6 +93,7 @@ meta_label:
   retrain_with_primary: true           # Retrain when primary model retrains
 
 exit:
+  exit_cross_amount: 0.10             # How far combo exits cross the spread to guarantee fills (was hardcoded)
   trailing_stop_pct: 0.25             # Trail 25% below high water mark
   breakeven_trigger_pct: 0.30         # Move stop to breakeven at +30% P&L
   initial_stop_loss_pct: 0.50         # Fixed stop before breakeven activates

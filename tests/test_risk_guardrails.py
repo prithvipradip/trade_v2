@@ -17,8 +17,8 @@ from ait.risk.manager import RiskManager, TradeRequest
 
 def _manager(net_liq=200_000.0, open_positions=None):
     pos_config = MagicMock(max_open_positions=5, max_position_pct=0.05,
-                           max_portfolio_delta=1.0, max_portfolio_risk_pct=0.02)
-    risk_config = MagicMock(min_confidence=0.50)
+                           max_portfolio_delta=1.0, max_portfolio_risk_pct=0.20)
+    risk_config = MagicMock(min_confidence=0.50, max_position_risk_pct=0.10)
     account = MagicMock()
     account.get_net_liquidation = AsyncMock(return_value=net_liq)
     account.can_afford = AsyncMock(return_value=True)
@@ -52,11 +52,12 @@ class TestAggregateRiskCap:
         assert v.approved, v.reason
 
     @pytest.mark.asyncio
-    async def test_aggregate_exceeds_10pct_rejected(self):
-        # Open book already at $19k risk; +$2k would push past the $20k (10%) cap.
+    async def test_aggregate_exceeds_cap_rejected(self):
+        # Cap raised 10% -> 20% on 2026-06-30 (higher trade volume for
+        # learning). Open book at $39k risk on $200k; +$2k pushes past $40k.
         existing = [
-            {"symbol": "QQQ", "strategy": "iron_condor", "max_loss": 9500},
-            {"symbol": "IWM", "strategy": "iron_condor", "max_loss": 9500},
+            {"symbol": "QQQ", "strategy": "iron_condor", "max_loss": 19500},
+            {"symbol": "IWM", "strategy": "iron_condor", "max_loss": 19500},
         ]
         rm = _manager(net_liq=200_000, open_positions=existing)
         v = await rm.validate_trade(_req(symbol="DIA", max_loss=2000))

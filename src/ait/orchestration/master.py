@@ -201,6 +201,19 @@ class BotManager:
         """Check if bot is alive, restart if crashed."""
         if self.is_running:
             _log("debug", "bot_healthy", pid=self._proc.pid)
+            # Fresh-models marker (audit item 3.1): the daily retrain wrote new
+            # models the running bot won't load until its 7-day timer. One
+            # controlled restart (retrain finishes pre-market) picks them up.
+            marker = ROOT / "models" / ".retrained"
+            if marker.exists():
+                try:
+                    marker.unlink()
+                except Exception:
+                    pass
+                _log("info", "bot_restart_for_fresh_models")
+                self.stop()
+                self.start()
+                return
             # Reset the restart budget once the bot has been continuously
             # healthy for a sustained stretch. Without this, restart attempts
             # spent during a transient overnight Gateway outage are never
@@ -468,6 +481,15 @@ asyncio.run(train())
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            # OpenMP pinning (audit 2026-07-07 item 3.1): xgboost+lightgbm in
+            # an unpinned subprocess is the exact native-crash class already
+            # seen live (access violation in xgboost core.update). Also stops
+            # full-core saturation while the trading bot runs.
+            env={**os.environ,
+                 "PYTHONIOENCODING": "utf-8",
+                 "KMP_DUPLICATE_LIB_OK": "TRUE",
+                 "OMP_NUM_THREADS": "1",
+                 "OPENBLAS_NUM_THREADS": "1"},
         )
 
         # Idle timeout: kill only if no output for 5 minutes (truly hung).
@@ -503,9 +525,29 @@ asyncio.run(train())
         if timed_out["flag"]:
             _log("error", "retrain_timeout_idle", log=str(log_path),
                  idle_limit_seconds=IDLE_LIMIT)
+            _alert(f"model retrain HUNG (no output {IDLE_LIMIT}s) — killed. "
+                   f"Models are stale. Log: {log_path.name}")
+            return
+
+        if proc.returncode != 0:
+            # A hard native crash (OpenMP/DLL segfault) exits nonzero without
+            # hanging — previously logged silently, leaving stale models with
+            # no one the wiser (audit item 3.1).
+            _log("error", "retrain_failed_nonzero", exit_code=proc.returncode,
+                 log=str(log_path))
+            _alert(f"model retrain FAILED (exit {proc.returncode}) — models "
+                   f"stale. Log: {log_path.name}")
             return
 
         _log("info", "retrain_complete", exit_code=proc.returncode, log=str(log_path))
+        # Schedule-unification (audit item 3.1): fresh models were written to
+        # disk, but the live bot only reloads on its own 7-day timer — daily
+        # retrains sat unused. Drop a marker; BotManager.health_check restarts
+        # the bot once (pre-market, harmless) so it loads today's models.
+        try:
+            (ROOT / "models" / ".retrained").write_text(datetime.now().isoformat())
+        except Exception as e:
+            _log("warning", "retrain_marker_failed", error=str(e))
     except Exception as e:
         _log("error", "retrain_failed", error=str(e))
 

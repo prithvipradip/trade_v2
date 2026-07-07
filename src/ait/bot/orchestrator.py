@@ -88,7 +88,12 @@ class TradingOrchestrator:
         self._circuit_breaker = CircuitBreaker(settings.risk)
         self._pdt_guard = PDTGuard(settings.account, self._state)
         self._position_sizer = PositionSizer(settings.positions, settings.risk)
-        self._correlation_guard = CorrelationGuard()
+        # Config-wired (audit item 3.3) — was CorrelationGuard() with code
+        # defaults, untunable without a code edit.
+        self._correlation_guard = CorrelationGuard(
+            max_correlation=settings.risk.max_correlation,
+            max_correlated_positions=settings.risk.max_correlated_positions,
+        )
         self._risk_manager = RiskManager(
             settings.positions, settings.risk,
             self._account, self._circuit_breaker,
@@ -971,7 +976,7 @@ class TradingOrchestrator:
             # P(stays in ±5% over 30 days) is what iron condors actually need.
             # 0.65 chosen via parameter sweep — beat 0.55 across every metric:
             # Sharpe 1.36 vs 0.64, Sortino 2.20 vs 0.97, RAROC 604% vs 276%.
-            RANGE_MIN_CONFIDENCE = 0.65
+            RANGE_MIN_CONFIDENCE = self._settings.ml.range_min_confidence
             model_overridden: set[str] = set()  # strategies whose confidence came from a payoff-matched model
             if self._range_predictor and self._range_predictor.is_trained:
                 range_pred = self._range_predictor.predict(
@@ -1637,7 +1642,7 @@ class TradingOrchestrator:
                     # and re-placed every 30s forever — the IWM strangle sat
                     # on a +54% gain it couldn't take). BUY pays up to the ask,
                     # SELL accepts down to the bid.
-                    EXIT_CROSS = 0.10
+                    EXIT_CROSS = self._settings.exit.exit_cross_amount
                     if combo_action == "BUY":
                         if ask is not None:
                             limit_price = round(ask + EXIT_CROSS, 2)
@@ -1981,6 +1986,11 @@ class TradingOrchestrator:
                     "theta": greeks.get("theta", 0),
                     "vega": greeks.get("vega", 0),
                     "max_loss": float(ml) if ml else 0.0,
+                    # Concentration-gate repair (audit item 3.3): the 20%
+                    # symbol-concentration gate reads market_value, which was
+                    # never populated → exposure always 0 → gate dead. Entry
+                    # notional is a reasonable standing proxy.
+                    "market_value": abs(trade.entry_price) * trade.quantity * 100,
                 })
 
             self._risk_manager.update_positions(positions_for_risk)

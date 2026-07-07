@@ -296,8 +296,10 @@ class TestFloorAndCap:
             strategy="long_straddle",  # 1.2x multiplier
             underlying_price=450.0,
         )
-        # $10M account → cap = 1000 contracts (1 per $10k)
-        assert result.contracts == 1000
+        # $10M account: account-scale cap would allow 1000, but the hard
+        # per-trade cap (max_contracts_per_trade, default 10 — added
+        # 2026-07-02 to keep cost-per-trade minimal) binds first.
+        assert result.contracts == 10
 
     def test_small_account_cap(self, sizer: PositionSizer) -> None:
         """$100k account should cap at 10 contracts."""

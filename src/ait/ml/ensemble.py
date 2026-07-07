@@ -427,13 +427,25 @@ class DirectionPredictor:
             "symbol_models": self._symbol_models,
         }
 
-        # Save as current (ensemble.pkl)
+        # Save as current (ensemble.pkl) — ATOMIC: write tmp then os.replace,
+        # so a concurrent reader (live bot) or a second writer (7:30 retrain
+        # subprocess vs mid-day bot train) can never observe/produce a
+        # half-written pickle. A corrupted-model event was already referenced
+        # in adaptor.py (2026-06-23). Audit 2026-07-07 item 3.1.
+        import os as _os
         model_file = MODEL_DIR / "ensemble.pkl"
+        tmp_file = MODEL_DIR / "ensemble.pkl.tmp"
         try:
-            with open(model_file, "wb") as f:
+            with open(tmp_file, "wb") as f:
                 pickle.dump(data, f)
+            _os.replace(tmp_file, model_file)
         except Exception as e:
             log.error("model_save_failed", error=str(e))
+            try:
+                if tmp_file.exists():
+                    tmp_file.unlink()
+            except Exception:
+                pass
             return
 
         # Save versioned copy for rollback
