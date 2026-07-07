@@ -31,8 +31,12 @@ class StrategyArm:
     """One arm of the multi-armed bandit."""
 
     name: str
-    wins: int = 0
-    losses: int = 0
+    # Floats, not ints: daily decay must shrink counts fractionally.
+    # int truncation (`int(1 * 0.995) = 0`) zeroed any 1-win arm every day,
+    # so the bandit could never accumulate signal at low trade volume
+    # (audit 2026-07-07 item 2.5). Beta(alpha, beta) accepts floats natively.
+    wins: float = 0.0
+    losses: float = 0.0
     total_pnl: float = 0.0
 
     @property
@@ -44,7 +48,7 @@ class StrategyArm:
         return 1.0 + self.losses
 
     @property
-    def observations(self) -> int:
+    def observations(self) -> float:
         return self.wins + self.losses
 
     @property
@@ -129,8 +133,10 @@ class ThompsonSampler:
         Call this periodically (e.g., daily) to gradually forget old outcomes.
         """
         for arm in self._arms.values():
-            arm.wins = max(0, int(arm.wins * self._decay_factor))
-            arm.losses = max(0, int(arm.losses * self._decay_factor))
+            # Float decay — see StrategyArm: int truncation destroyed
+            # low-count arms (audit item 2.5).
+            arm.wins = max(0.0, arm.wins * self._decay_factor)
+            arm.losses = max(0.0, arm.losses * self._decay_factor)
 
         log.info("thompson_decay_applied", arms=len(self._arms))
         self._save_state()

@@ -476,7 +476,15 @@ class RangePredictor:
     def fitted_weights(self) -> "dict[str, float] | None":
         return getattr(self, "_fitted_weights", None)
 
-    def _walk_forward_split(self, n: int, n_splits: int = 4, gap: int = 5):
+    def _walk_forward_split(self, n: int, n_splits: int = 4, gap: int | None = None):
+        # LEAKAGE FIX (audit 2026-07-07 item 2.4): labels look `horizon` days
+        # forward and OVERLAP, so a gap smaller than the horizon lets ~
+        # (horizon - gap) days of each training fold's label window bleed
+        # into validation — inflating CV accuracy, which feeds the
+        # edge-vs-threshold gate that decides whether iron condors trade at
+        # all. The purge gap must be >= the label horizon.
+        if gap is None:
+            gap = max(5, int(self._horizon))
         splits = []
         fold = n // (n_splits + 1)
         for i in range(n_splits):

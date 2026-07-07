@@ -199,9 +199,20 @@ class RiskManager:
         if not corr_allowed:
             return TradeValidation(False, f"correlation block: {corr_reason}")
 
-        # 6. Buying power check
+        # 6. Buying power check.
+        # For CREDIT strategies entry_price is money RECEIVED — the old
+        # `entry_price*contracts*100` check asked "can we afford income?"
+        # (always yes) and never measured the capital the position consumes
+        # (audit 2026-07-07 item 2.1). Capital consumed for credit trades is
+        # approximated by the max_loss/tail estimate (now stress-based for
+        # strangles); debit trades still pay the premium up front.
         account_value = await self._account.get_net_liquidation()
-        estimated_cost = request.entry_price * request.contracts * 100
+        from ait.strategies.base import CREDIT_STRATEGIES
+        is_credit = request.strategy in CREDIT_STRATEGIES
+        if is_credit and getattr(request, "max_loss", None):
+            estimated_cost = float(request.max_loss)
+        else:
+            estimated_cost = request.entry_price * request.contracts * 100
         if not await self._account.can_afford(estimated_cost):
             return TradeValidation(False, "insufficient buying power")
 

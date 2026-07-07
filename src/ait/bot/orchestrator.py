@@ -1274,9 +1274,35 @@ class TradingOrchestrator:
             )
             return False  # rejected — let the caller try the next-ranked strategy
 
-        # Apply learning-based sizing multiplier
+        # Apply learning-based sizing multiplier.
+        # GATE-BYPASS FIX (audit 2026-07-07 item 2.3): the multiplier used to
+        # inflate size AFTER validate_trade, so every dollar-based gate
+        # (buying power, 3% per-trade, 20% aggregate, delta) had checked a
+        # smaller trade than the one executed. If the multiplier scales size
+        # up, re-validate at the actual size; on rejection fall back to the
+        # gate-approved size.
         strategy_mult = adaptor.get_strategy_multiplier(signal.strategy_name)
         adjusted_size = max(1, int(validation.position_size * strategy_mult))
+        if adjusted_size > request.contracts:
+            scale = adjusted_size / max(1, request.contracts)
+            revalidation = await self._risk_manager.validate_trade(TradeRequest(
+                symbol=request.symbol,
+                strategy=request.strategy,
+                direction=request.direction,
+                contracts=adjusted_size,
+                entry_price=request.entry_price,
+                option=request.option,
+                confidence=request.confidence,
+                implied_vol=request.implied_vol,
+                max_loss=(request.max_loss * scale) if request.max_loss else None,
+                vix=request.vix,
+            ))
+            if not revalidation.approved:
+                log.info("multiplier_size_rejected_using_base",
+                         symbol=signal.symbol, strategy=signal.strategy_name,
+                         wanted=adjusted_size, using=validation.position_size,
+                         reason=revalidation.reason)
+                adjusted_size = max(1, validation.position_size)
 
         # Apply adaptor exit overrides to the signal (Gap Z8 / Fix 6a).
         # Bypassed in paper_trading_mode so exit params match the backtest's fixed values.
@@ -1447,7 +1473,41 @@ class TradingOrchestrator:
 
                 close_action = "BUY" if trade.strategy in CREDIT_STRATEGIES else "SELL"
                 order = OrderBuilder.market(action=close_action, quantity=qty_to_close)
-                await self._ibkr.place_order(qualified, order)
+                exit_trade = await self._ibkr.place_order(qualified, order)
+
+                # PHANTOM-P&L FIX (audit 2026-07-07 item 2.2): the old code
+                # booked an ESTIMATED partial P&L (pos.unrealized_pnl pro-rata)
+                # with the UNDERLYING's price recorded as the option fill —
+                # before the order even filled. Book on the real fill only.
+                fill_price = None
+                if exit_trade is not None:
+                    for _ in range(20):  # up to ~10s — market orders on liquid options fill in seconds
+                        await asyncio.sleep(0.5)
+                        st = exit_trade.orderStatus
+                        if st.status == "Filled" and st.avgFillPrice:
+                            fill_price = float(st.avgFillPrice)
+                            break
+                        if st.status in ("Cancelled", "Inactive", "ApiCancelled"):
+                            break
+                if fill_price is None:
+                    # Not filled in time: cancel so a re-trigger next cycle
+                    # can't double-sell, and book NOTHING.
+                    try:
+                        if exit_trade is not None:
+                            self._ibkr.ib.cancelOrder(exit_trade.order)
+                    except Exception:
+                        pass
+                    log.warning("partial_exit_unfilled_not_booked",
+                                trade_id=pos.trade_id, symbol=pos.symbol)
+                    return
+
+                # Realized P&L from the actual option fill (0.65/contract
+                # closing commission, matching executor convention).
+                if trade.strategy in CREDIT_STRATEGIES:
+                    partial_pnl = (trade.entry_price - fill_price) * qty_to_close * 100
+                else:
+                    partial_pnl = (fill_price - trade.entry_price) * qty_to_close * 100
+                partial_pnl -= 0.65 * qty_to_close
             else:
                 # Multi-leg partials are NOT supported: the old code fell
                 # through here without placing ANY order, then recorded the
@@ -1462,9 +1522,8 @@ class TradingOrchestrator:
                 )
                 return
 
-            # Record partial exit
-            partial_pnl = pos.unrealized_pnl * (qty_to_close / trade.quantity)
-            # Find which level was triggered
+            # Record partial exit (real fill price + fill-derived P&L; the
+            # estimate-based booking was removed — item 2.2)
             pnl_level = pos.pnl_pct
             for level in self._settings.exit.partial_exit_levels:
                 if pos.pnl_pct >= level["pnl_pct"]:
@@ -1473,7 +1532,7 @@ class TradingOrchestrator:
             self._state.record_partial_exit(
                 trade_id=pos.trade_id,
                 quantity=qty_to_close,
-                price=pos.current_price,
+                price=fill_price,
                 pnl=partial_pnl,
                 pnl_level=pnl_level,
             )
