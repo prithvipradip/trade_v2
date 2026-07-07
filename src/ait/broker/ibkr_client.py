@@ -186,6 +186,14 @@ class IBKRClient:
                 log.error("ibkr_reconnect_failed", attempt=self._reconnect_attempts, error=str(e))
 
         log.critical("ibkr_reconnect_exhausted", attempts=self._max_reconnect_attempts)
+        # WEDGE FIX (audit 2026-07-07 item 1.5): the counter previously never
+        # reset after exhaustion, so every future ensure_connected() hit
+        # `while max < max` and returned False instantly FOREVER — a long
+        # Gateway outage permanently bricked the bot until process restart.
+        # Reset so the next ensure_connected() gets a fresh backoff cycle
+        # (the supervisor's health checks arrive minutes apart, so this does
+        # not busy-loop).
+        self._reconnect_attempts = 0
         return False
 
     def _on_disconnect(self) -> None:
@@ -399,10 +407,19 @@ class IBKRClient:
                     log.info("account_base_ccy_inferred_fx", base_ccy=base_ccy,
                              usd_to_base=round(fx, 4))
                 else:
-                    log.warning("account_base_ccy_inferred_no_fx",
-                                base_ccy=base_ccy,
-                                note="no ExchangeRate row and FX fetch failed; "
-                                     "using base value as USD (approx, overstated)")
+                    # HARD STOP (audit 2026-07-07 item 1.6): previously fell
+                    # back to usd_to_base=1.0, silently treating CAD as USD —
+                    # every balance and %-based risk cap inflated ~39%. The
+                    # _fx_usd_to cache means this only triggers when NO good
+                    # rate was ever fetched this session; in that case return
+                    # empty so AccountManager treats it as a failed fetch and
+                    # keeps its last-good (correctly converted) snapshot
+                    # instead of trading on inflated numbers.
+                    log.error("account_fx_unavailable_blocking",
+                              base_ccy=base_ccy,
+                              note="no ExchangeRate row and FX fetch failed; "
+                                   "refusing to mis-report CAD balances as USD")
+                    return {}
 
         # Collect each tag's base-currency total (the "BASE" row is the
         # authoritative multi-currency total; the base-currency-code row is

@@ -113,6 +113,7 @@ def get_status() -> dict:
         "today": {ev: _count_event_today(ev) for ev in
                   ("ml_prediction", "signals_generated", "trade_executed", "trade_rejected")},
         "open_positions": [],
+        "unrealized_total": 0.0,
         "pnl_today": 0.0, "pnl_today_n": 0,
         "pnl_life": 0.0, "pnl_life_n": 0,
     }
@@ -121,11 +122,18 @@ def get_status() -> dict:
         con.row_factory = sqlite3.Row
         out["open_positions"] = [
             {"symbol": r["symbol"], "strategy": r["strategy"], "status": r["status"],
-             "entry": r["entry_price"], "since": r["entry_time"][:16]}
+             "entry": r["entry_price"], "since": r["entry_time"][:16],
+             "unrealized": round(r["unrealized_pnl"] or 0.0, 2),
+             "pnl_pct": round((r["pnl_pct"] or 0.0) * 100, 1),
+             "marked": (r["mark_time"] or "")[:16]}
             for r in con.execute(
-                "SELECT symbol,strategy,status,entry_price,entry_time FROM trades "
-                "WHERE status NOT IN ('closed') ORDER BY entry_time DESC")
+                "SELECT t.symbol, t.strategy, t.status, t.entry_price, t.entry_time, "
+                "       op.unrealized_pnl, op.pnl_pct, op.mark_time "
+                "FROM trades t LEFT JOIN open_positions op ON op.trade_id = t.trade_id "
+                "WHERE t.status NOT IN ('closed') ORDER BY t.entry_time DESC")
         ]
+        out["unrealized_total"] = round(
+            sum(p["unrealized"] for p in out["open_positions"]), 2)
         real = ("AND exit_reason_detailed NOT LIKE '%migrated%' "
                 "AND exit_reason_detailed NOT LIKE '%pending%' "
                 "AND exit_reason_detailed NOT LIKE '%never_filled%'")
@@ -154,9 +162,10 @@ def main() -> None:
     print("\nTODAY")
     for ev, n in s["today"].items():
         print(f"  {ev:18}: {n}")
-    print(f"\nOPEN POSITIONS ({len(s['open_positions'])})")
+    print(f"\nOPEN POSITIONS ({len(s['open_positions'])})   unrealized total: ${s['unrealized_total']:+,.2f}")
     for p in s["open_positions"]:
-        print(f"  {p['symbol']:5} {p['strategy']:16} {p['status']:8} entry={p['entry']}  since {p['since']}")
+        print(f"  {p['symbol']:5} {p['strategy']:16} {p['status']:8} entry={p['entry']}  "
+              f"unreal=${p['unrealized']:+8.2f} ({p['pnl_pct']:+.1f}%)  since {p['since']}")
     print("\nREALIZED P&L  (real exits only)")
     print(f"  today   : ${s['pnl_today']:>10,.2f}  ({s['pnl_today_n']} closed)")
     print(f"  lifetime: ${s['pnl_life']:>10,.2f}  ({s['pnl_life_n']} closed)")

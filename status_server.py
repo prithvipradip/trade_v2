@@ -63,10 +63,17 @@ async function tick(){
     `<div class="big ${s.pnl_today>=0?'ok':'bad'}">$${s.pnl_today.toFixed(2)}</div>`+
     row('today closed', s.pnl_today_n)+
     row('lifetime', '$'+s.pnl_life.toFixed(2), s.pnl_life>=0?'ok':'bad')+
-    row('lifetime closed', s.pnl_life_n);
+    row('lifetime closed', s.pnl_life_n)+
+    row('open unrealized', (s.unrealized_total>=0?'+$':'-$')+Math.abs(s.unrealized_total||0).toFixed(2),
+        (s.unrealized_total||0)>=0?'ok':'bad');
   if(s.open_positions.length){
-    let r='<table>'; for(const p of s.open_positions)
-      r+=`<tr><td><b>${p.symbol}</b></td><td>${p.strategy}</td><td>${p.status}</td><td>entry ${p.entry}</td><td>${p.since}</td></tr>`;
+    let r='<table><tr class="k"><td>sym</td><td>strategy</td><td>status</td><td>entry</td><td>unrealized</td><td>%</td><td>since</td></tr>';
+    for(const p of s.open_positions){
+      const u=p.unrealized||0, cls=u>0?'ok':(u<0?'bad':'k');
+      r+=`<tr><td><b>${p.symbol}</b></td><td>${p.strategy}</td><td>${p.status}</td>`+
+         `<td>${p.entry}</td><td class="${cls}"><b>${u>=0?'+':''}$${u.toFixed(2)}</b></td>`+
+         `<td class="${cls}">${(p.pnl_pct||0)>=0?'+':''}${p.pnl_pct||0}%</td><td>${p.since}</td></tr>`;
+    }
     E('pos').innerHTML=r+'</table>';
   } else E('pos').innerHTML='<span class="k">none — flat</span>';
  }catch(e){ E('asof').textContent='dashboard offline / bot stopped'; E('dot').style.background='#f85149'; }

@@ -727,23 +727,33 @@ class TradingOrchestrator:
             if not paper_mode
             else self._settings.risk.min_confidence
         )
-        if prediction.confidence < min_confidence:
+        # Market-neutral strategies (iron_condor, short_strangle) must NOT be
+        # vetoed by low DIRECTIONAL confidence: low directional conviction =
+        # range-bound = their ideal regime, and high directional confidence =
+        # trending = their worst. The backtest already skips this gate for
+        # neutral strategies (engine.py _neutral_only); live didn't — audit
+        # 2026-07-07 item 1.2 (documented cause of entering the tariff crash).
+        # On low directional confidence we now continue in neutral-only mode:
+        # directional strategies are dropped downstream and neutral ones are
+        # gated solely by the range model + RANGE_MIN_CONFIDENCE floor.
+        neutral_only = prediction.confidence < min_confidence
+        if neutral_only:
             log.debug(
-                "low_confidence_skip",
+                "low_confidence_neutral_only",
                 symbol=symbol,
                 confidence=prediction.confidence,
                 threshold=min_confidence,
             )
-            # Record counterfactual for low-confidence skips
+            # Record counterfactual for the directional skip (we may still
+            # trade a neutral strategy on this symbol via the range model)
             self._counterfactual.record_skip(
                 symbol=symbol,
                 strategy="unknown",
                 direction=prediction.direction.value,
                 confidence=prediction.confidence,
                 entry_price=float(hist["Close"].iloc[-1]) if "Close" in hist.columns else 0,
-                reject_reason="low_confidence",
+                reject_reason="low_confidence_directional",
             )
-            return
 
         # Market regime
         regime = self._regime_detector.analyze(hist, vix)
@@ -962,6 +972,7 @@ class TradingOrchestrator:
             # 0.65 chosen via parameter sweep — beat 0.55 across every metric:
             # Sharpe 1.36 vs 0.64, Sortino 2.20 vs 0.97, RAROC 604% vs 276%.
             RANGE_MIN_CONFIDENCE = 0.65
+            model_overridden: set[str] = set()  # strategies whose confidence came from a payoff-matched model
             if self._range_predictor and self._range_predictor.is_trained:
                 range_pred = self._range_predictor.predict(
                     hist, symbol=symbol,
@@ -978,6 +989,7 @@ class TradingOrchestrator:
                     for s in signals:
                         if s.strategy_name in ("iron_condor", "short_strangle"):
                             s.confidence = range_pred.probability_in_range
+                            model_overridden.add(s.strategy_name)
 
             # Vol-magnitude model (Tier 1) for long straddles — predicts P(big move)
             # Direct signal for "buy volatility" strategies, more accurate than
@@ -996,14 +1008,32 @@ class TradingOrchestrator:
                     for s in signals:
                         if s.strategy_name == "long_straddle":
                             s.confidence = vm_pred.probability_big_move
+                            model_overridden.add(s.strategy_name)
 
-                    # Apply range-specific threshold — drop signals below floor
-                    signals = [
-                        s for s in signals
-                        if s.strategy_name not in ("iron_condor", "short_strangle",
-                                                    "long_straddle")
-                        or s.confidence >= RANGE_MIN_CONFIDENCE
-                    ]
+            # Model-confidence floor — applies whenever a payoff-matched model
+            # overrode a signal's confidence, REGARDLESS of which models are
+            # trained. (Was nested inside the vol-mag block, so an untrained
+            # vol-mag model silently skipped the iron-condor floor — audit
+            # 2026-07-07, quick-win under item 1.2.)
+            signals = [
+                s for s in signals
+                if s.strategy_name not in model_overridden
+                or s.confidence >= RANGE_MIN_CONFIDENCE
+            ]
+
+            # Neutral-only mode (directional confidence below threshold):
+            #  - drop directional strategies — no directional basis to trade;
+            #  - drop neutral strategies that were NOT range-model-overridden —
+            #    without the range model there is no basis at all.
+            if neutral_only:
+                signals = [
+                    s for s in signals
+                    if s.strategy_name in ("iron_condor", "short_strangle")
+                    and s.strategy_name in model_overridden
+                ]
+                if signals:
+                    log.info("neutral_only_candidates", symbol=symbol,
+                             strategies=[s.strategy_name for s in signals])
 
             # Re-rank signals using Thompson sampling (exploration/exploitation).
             # Bypassed in paper_trading_mode — backtest uses deterministic strategy priority (Gap Z2).
@@ -1033,10 +1063,23 @@ class TradingOrchestrator:
             # behind it. Cap the fall-through so we never place more than one
             # trade per symbol per scan (we break on the first handled signal).
             for signal in signals[:4]:
+                # Confidence divergence fix (audit 2026-07-07): when a
+                # payoff-matched model (range / vol-mag) overrode this signal's
+                # confidence, THAT number — not the directional final_confidence
+                # — is what justifies the trade, so it must be what risk
+                # validation, sizing, and trade_context see. Previously the
+                # range probability never reached risk sizing, and in
+                # neutral-only mode the low directional confidence would have
+                # auto-failed the risk manager's own confidence gate.
+                eff_conf = (
+                    signal.confidence
+                    if signal.strategy_name in model_overridden
+                    else final_confidence
+                )
                 if self._should_queue_signal(signal, hist):
                     self._signal_queue[signal.symbol] = {
                         "signal": signal,
-                        "confidence": final_confidence,
+                        "confidence": eff_conf,
                         "sentiment": sentiment,
                         "regime": regime,
                         "age": 0,
@@ -1044,7 +1087,7 @@ class TradingOrchestrator:
                     log.info("signal_queued", symbol=signal.symbol,
                              strategy=signal.strategy_name, reason="entry_timing")
                     break
-                handled = await self._try_execute(signal, final_confidence, sentiment, regime)
+                handled = await self._try_execute(signal, eff_conf, sentiment, regime)
                 if handled:
                     break  # executed or symbol-level block — done with this symbol
                 # else: risk-rejected — try the next-ranked strategy
@@ -1794,7 +1837,10 @@ class TradingOrchestrator:
             # 1. Re-run ML prediction on fresh data (no market_context here — lightweight check)
             hist = await self._market_data.get_historical(pos.symbol, days=60)
             if hist is not None and not hist.empty:
-                prediction = self._predictor.predict(hist, symbol=symbol, market_context=None)
+                # NOTE: was `symbol=symbol` (undefined) — a swallowed NameError
+                # that killed this entire thesis check (incl. regime/VIX branches
+                # below) on every call since it was written. Audit 2026-07-07 item 1.1.
+                prediction = self._predictor.predict(hist, symbol=pos.symbol, market_context=None)
                 if prediction and prediction.confidence > 0.70:
                     # Direction has flipped with high confidence
                     if entry_direction == "bullish" and prediction.direction == SignalDirection.BEARISH:

@@ -239,6 +239,10 @@ class PortfolioManager:
         hwm = max(prev_hwm, pnl_pct)
         if not marks_missing:
             self._state.update_high_water_mark(trade.trade_id, hwm)
+            # Persist the live mark so status/dashboard show real per-position
+            # unrealized P&L (guarded: a marks-missing tick must never
+            # overwrite a real mark with 0.0). Audit 2026-07-07 item 1.4.
+            self._state.update_position_mark(trade.trade_id, unrealized_pnl, pnl_pct)
 
         # Get learning overrides for stop/take-profit (if any)
         stop_loss_pct = self._exit_config.initial_stop_loss_pct

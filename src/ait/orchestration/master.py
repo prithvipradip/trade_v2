@@ -143,6 +143,14 @@ class BotManager:
             return
 
         _log("info", "bot_starting")
+        # Size-capped rotation for the bot's stdout sink. This file grew to
+        # 2 GB unbounded (audit 2026-07-07 item 1.3): raw append, never
+        # rotated, and mtime-based cleanup can never touch a continuously
+        # written file. A subprocess stdout fd can't use RotatingFileHandler,
+        # so rotate here at start time — the only moment the handle is closed
+        # (Windows cannot rename an open file). Bot restarts are frequent
+        # enough that this bounds growth in practice.
+        self._rotate_stdout_log()
         self._log_handle = open(LOGS_DIR / "bot_stdout.log", "a")
         self._proc = subprocess.Popen(
             [sys.executable, "-m", "ait.main", "--paper"],
@@ -153,6 +161,27 @@ class BotManager:
         )
         self._last_restart = datetime.now()
         _log("info", "bot_started", pid=self._proc.pid)
+
+    _STDOUT_LOG_MAX_BYTES = 50 * 1024 * 1024  # rotate above 50 MB
+    _STDOUT_LOG_BACKUPS = 2                    # keep .1 and .2
+
+    def _rotate_stdout_log(self) -> None:
+        """Shift bot_stdout.log -> .1 -> .2 when over the size cap."""
+        base = LOGS_DIR / "bot_stdout.log"
+        try:
+            if not base.exists() or base.stat().st_size <= self._STDOUT_LOG_MAX_BYTES:
+                return
+            oldest = LOGS_DIR / f"bot_stdout.log.{self._STDOUT_LOG_BACKUPS}"
+            if oldest.exists():
+                oldest.unlink()
+            for i in range(self._STDOUT_LOG_BACKUPS - 1, 0, -1):
+                src = LOGS_DIR / f"bot_stdout.log.{i}"
+                if src.exists():
+                    src.rename(LOGS_DIR / f"bot_stdout.log.{i + 1}")
+            base.rename(LOGS_DIR / "bot_stdout.log.1")
+            _log("info", "stdout_log_rotated")
+        except Exception as e:  # rotation must never block a bot start
+            _log("warning", "stdout_log_rotate_failed", error=str(e))
 
     def stop(self):
         if not self.is_running:
@@ -512,19 +541,34 @@ print(json.dumps(metrics, indent=2, default=str))
 
 
 def cleanup_old_logs():
-    """Remove logs and reports older than 30 days."""
+    """Remove logs and reports older than 30 days; cap rotated backups.
+
+    mtime-based deletion can never touch a continuously-appended file (its
+    mtime is always "now"), so rotation is handled at bot start
+    (BotManager._rotate_stdout_log); here we only prune rotated backups and
+    genuinely stale files.
+    """
     cutoff = datetime.now() - timedelta(days=30)
     removed = 0
     for d in [LOGS_DIR, REPORTS_DIR]:
         for f in d.iterdir():
-            if f.is_file() and f.name != "orchestrator.log":
-                try:
-                    mtime = datetime.fromtimestamp(f.stat().st_mtime)
-                    if mtime < cutoff:
+            if not f.is_file() or f.name == "orchestrator.log":
+                continue
+            try:
+                # Rotated stdout backups: keep only the configured count
+                # regardless of age (they can be 50 MB each).
+                if f.name.startswith("bot_stdout.log."):
+                    suffix = f.name.rsplit(".", 1)[-1]
+                    if suffix.isdigit() and int(suffix) > BotManager._STDOUT_LOG_BACKUPS:
                         f.unlink()
                         removed += 1
-                except Exception:
-                    pass
+                        continue
+                mtime = datetime.fromtimestamp(f.stat().st_mtime)
+                if mtime < cutoff:
+                    f.unlink()
+                    removed += 1
+            except Exception:
+                pass
     _log("info", "cleanup_complete", removed=removed)
 
 

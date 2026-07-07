@@ -48,7 +48,27 @@ class AccountManager:
 
         values = await self._client.get_account_values()
         if not values:
-            # Fallback: estimate NLV from portfolio positions
+            # If a prior good snapshot exists, keep it rather than falling
+            # through to the position-sum estimate: that estimate is
+            # currency-blind (mixes CAD stock and USD options), and
+            # get_account_values now intentionally returns {} when FX is
+            # unavailable (audit 2026-07-07 item 1.6) — a mis-currencied
+            # guess here would defeat that hard-stop. Stale-but-correct
+            # beats fresh-but-wrong for risk math.
+            if self._last_fetch > 0:
+                stale_seconds = now - self._last_fetch
+                if stale_seconds > 300:
+                    log.error(
+                        "account_data_stale",
+                        stale_seconds=int(stale_seconds),
+                        msg="Account data over 5 minutes old — risk calculations unreliable",
+                    )
+                else:
+                    log.warning("account_fetch_empty", using="cached_values")
+                return self._snapshot
+            # Never had a snapshot at all: last-resort estimate from
+            # positions (crude, currency-blind — better than zero only at
+            # first boot).
             try:
                 positions = self._client.ib.positions()
                 if positions:

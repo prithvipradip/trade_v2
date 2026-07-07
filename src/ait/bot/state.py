@@ -189,6 +189,16 @@ class StateManager:
                 CREATE INDEX IF NOT EXISTS idx_trades_symbol
                 ON trades(symbol);
             """)
+            # Lightweight migrations for pre-existing DBs (SQLite has no
+            # ADD COLUMN IF NOT EXISTS; duplicate-add raises OperationalError).
+            for ddl in (
+                "ALTER TABLE open_positions ADD COLUMN pnl_pct REAL DEFAULT 0",
+                "ALTER TABLE open_positions ADD COLUMN mark_time TEXT DEFAULT ''",
+            ):
+                try:
+                    conn.execute(ddl)
+                except sqlite3.OperationalError:
+                    pass  # column already exists
 
     @staticmethod
     def _init_duckdb():
@@ -426,6 +436,23 @@ class StateManager:
             conn.execute(
                 "UPDATE open_positions SET high_water_mark = MAX(high_water_mark, ?) WHERE trade_id = ?",
                 (hwm, trade_id),
+            )
+
+    def update_position_mark(
+        self, trade_id: str, unrealized_pnl: float, pnl_pct: float
+    ) -> None:
+        """Persist the live mark for an open position.
+
+        Called from PortfolioManager._evaluate_position on every tick where
+        real IBKR leg marks are present. Before this existed, unrealized_pnl
+        sat at its insert-time 0.0 forever and the dashboard had no live
+        per-position P&L (audit 2026-07-07 item 1.4).
+        """
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                "UPDATE open_positions SET unrealized_pnl = ?, pnl_pct = ?, "
+                "mark_time = ? WHERE trade_id = ?",
+                (unrealized_pnl, pnl_pct, datetime.now().isoformat(), trade_id),
             )
 
     def get_high_water_mark(self, trade_id: str) -> float:
