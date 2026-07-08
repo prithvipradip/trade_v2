@@ -44,7 +44,7 @@ class TestWalkForwardConfig:
         cfg = WalkForwardConfig()
         assert cfg.train_days == 365
         assert cfg.test_days == 63
-        assert cfg.step_days == 21
+        assert cfg.step_days == 63  # non-overlapping by default (deep-audit BT-M5)
         assert cfg.gap_days == 5
 
     def test_custom_config(self) -> None:
