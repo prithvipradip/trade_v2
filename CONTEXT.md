@@ -1,7 +1,16 @@
 # AIT v2 — Autonomous Intelligent Trading Bot
 
 ## What This Is
-A fully autonomous options trading bot that sells theta (iron condors + credit spreads) using ML predictions, sentiment analysis, and self-learning. Starts with $700 CAD and auto-scales strategies as capital grows.
+A fully autonomous options trading bot that sells theta (iron condors + strangles) using ML predictions, sentiment analysis, and self-learning, on an IBKR paper account. Goal: build a trustworthy real track record that answers "does this have edge?" before any real money.
+
+## Current State (2026-07-07) — READ THIS FIRST, THEN PLAN.md
+**PLAN.md is the living document**: three audit rounds (Round 1 layers → Round 2 forensics/adversarial → Round 3 full line-by-line of all ~40k lines) with every finding, fix, and deferred item. This file is background/architecture.
+
+- **Operational end-to-end for the first time (since 2026-07-06):** IBC auto-login → live market data (Network B/C + OPRA, ~$3/mo) → read-write API → marketable entries that actually FILL → managed exits → honest P&L.
+- **Real track record: $248.80 realized (2 real wins, both IWM strangle take-profits), 8 open 1-contract positions.** Everything earlier was accounting fiction (migrated estimates) — excluded from all "real" numbers.
+- Paper account DUN603821 (CAD-base, FX-converted ≈ $196k USD). Universe: SPY QQQ IWM DIA NVDA AMZN AMD + GLD TLT XLE. DTE 7–30. Max 1 contract/trade, 8 positions, 20% aggregate risk cap, credit-position cap 6, VIX≥28 credit halt.
+- **Trust levels:** live accounting = honest (post-audits). Backtest numbers = DIRECTIONAL ONLY (known ~N× capital inflation + √252 Sharpe overstatement — PLAN Round 3 deferred #1). ML edge = UNPROVEN on real fills. Learning layer = dormant until ~30 real closes.
+- Ops: Gateway auto-starts via IBC + Startup shortcut; keeper_ait.bat guards the orchestrator; logs rotated; dashboards localhost-only (8503 = live status). Gotchas: single live-data slot (keep the live login logged out elsewhere); "Read-Only API" checkbox may need a manual check→uncheck→Apply toggle after some Gateway restarts (Telegram alert fires if so). FinBERT is DISABLED (torch segfault) — sentiment runs on Finnhub keywords + fear/greed + IB news.
 
 ---
 
@@ -135,7 +144,7 @@ run_orchestrator.py          ← Master process (start here)
 
 ---
 
-## What's Been Done
+## What's Been Done  ⚠️ as of June 5 — see PLAN.md for everything since (3 audit rounds, ~50 fixes)
 
 ### Core Engine
 - [x] Walk-forward backtester with train/test/step windows
@@ -263,7 +272,7 @@ run_orchestrator.py          ← Master process (start here)
 
 ---
 
-## Backtest Results
+## Backtest Results  ⚠️ STALE (June) — and Round-3 audit found the engine inflates multi-symbol returns ~N× and Sharpe ~4.6×; treat as directional only (PLAN.md Round 3)
 
 ### Full capital ($50k, 5 symbols, 2022-2026)
 - **+311% total return** ($50k → $206k)
@@ -318,7 +327,7 @@ MLflow experiment: `walkforward_QQQ` (browse via `mlflow ui --backend-store-uri 
 
 ---
 
-## What's Next (Priority Order)
+## What's Next (Priority Order)  ⚠️ SUPERSEDED by PLAN.md Round 3 deferred list
 
 ### High Priority
 1. **[ ] Fund IBKR live account** — Even $1 CAD unlocks market data subscriptions and full paper trading. Currently the main blocker for real-time data.
