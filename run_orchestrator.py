@@ -46,6 +46,12 @@ os.environ.setdefault("AIT_MARKET_DATA_TYPE", "1")
 # only contractual (institutional audit INST-5).
 os.environ.setdefault("AIT_ALLOW_UNDEFINED_RISK", "1")
 
+# Macro-event protection ON (user decision 2026-07-08): flattens short-premium
+# positions when <=1 day to FOMC/CPI/NFP and blocks new entries around events.
+# This code existed since Round 1 but the switch defaulted OFF — the book
+# would have held short vol straight through the Jul 28-29 FOMC.
+os.environ.setdefault("AIT_SKIP_MACRO_EVENTS", "1")
+
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 # Load .env early so AIT_LIQ_* and any other env-var overrides reach the bot

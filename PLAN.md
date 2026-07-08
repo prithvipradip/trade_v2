@@ -124,6 +124,24 @@ DEFERRED (Round 3 todo — larger design work, ranked):
 5. GARCH members frozen at train time (stale up to reload interval); trainer rollback keyed on last symbol only; adaptor same-param compounding within a cycle; counterfactual eval min-elapsed guard; economic_calendar hardcoded 2026-only (year-end time bomb); DuckDB readers read_only; sortino/profit-factor display consistency; analyzer NULL-column guards.
 6. MP-F3 verify: sign of a real closing-BAG avgFillPrice (debit-spread exit negation depends on it) — check on first live debit close.
 
+## Dormant / degraded subsystem inventory (2026-07-08 — so nothing resurfaces as a "surprise")
+| Subsystem | State | Wakes when |
+|---|---|---|
+| Self-learning (analyzer/adaptor/meta/drift/Thompson) | DORMANT — needs 5/20/30 real closes; overrides also bypassed in paper_trading_mode by design | ~30 real closes; revisit paper bypass then |
+| Sentiment | DEGRADED — FinBERT off (torch segfault); live = Finnhub keywords + fear/greed; IB news CLI-only. Barely affects neutral book (range model overrides confidence) | Phase 2 if directional trading ever matters; safe path = subprocess/ONNX |
+| Hedging module + portfolio-delta gate | DEAD — greeks feed ~0 (no subscription) | greeks subscription or model-greeks fallback |
+| GARCH/MS-GARCH/OU range members | OFF LIVE (constructor defaults False; XGB/LGBM only) — deliberate post-OU-bug | after backtest re-run validates them |
+| IV / IV-rank features | STALE — implied_vol was wiped daily until R3 fix; models trained with NULL IV; "iv_rank" is realized-vol proxy | IV backfill re-run + next retrain |
+| VLMC/intraday features (range model) | just wired (A-F5); GLD/TLT/XLE have no intraday history yet | retrain + data accumulation |
+| CC/CSP strategies | DEAD on this account (assignment notional vs 3% cap) | larger account only |
+| Directional strategies | ~never trade (neutral-heavy model ~40% dir. accuracy, 0.85 first-hour bar, IC outranks) — direction model is a veto, not a trader; coherent | better direction signal first |
+| Partial-exit ladder | DEAD at 1 contract (33% of 1 = 0) | contract sizing > 2 |
+| Capital tiers | only name-filter + position-count live; wing/strategy logic advisory-dead | not planned |
+| Macro-event flatten + entry block | **ENABLED 2026-07-08** (was off since inception) | active — first test: CPI mid-July, FOMC Jul 28-29 |
+| Adaptor stop/TP overrides | written but unread ("wire or delete" — did neither); moot in paper bypass | decide at learning wake-up |
+| Event-vol engine (event_straddle) | built, mostly idle | candidate 2nd engine after paper verdict |
+| Calendar engine | built, rarely trades; needs real IV surface | after IV backfill |
+
 ## Deferred / watchlist
 - ~~Live data~~ done 2026-07-02 (Network B/C + OPRA, ~$3/mo).
 - IBC read-only automation: vmoptions `--add-opens` fixed the crash; box may still need manual
