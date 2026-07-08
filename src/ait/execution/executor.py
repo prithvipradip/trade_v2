@@ -132,6 +132,18 @@ class TradeExecutor:
             return None
         _bucket.append(_now)
 
+        # GOV (governance audit): market-hours enforcement at the EXECUTOR —
+        # the scheduler gates the loop, but nothing stopped any other caller
+        # from submitting outside RTH. Last line of defense.
+        try:
+            from ait.utils.time import is_market_open as _imo
+            if not _imo() and _os.environ.get("AIT_ALLOW_AFTER_HOURS") != "1":
+                log.error("order_refused_market_closed",
+                          strategy=signal.strategy_name, symbol=signal.symbol)
+                return None
+        except Exception:  # noqa: BLE001 — never let the guard itself block
+            pass
+
         if not await self._ibkr.ensure_connected():
             log.error("execution_failed", reason="IBKR not connected")
             self._circuit_breaker.record_api_failure()
@@ -332,6 +344,42 @@ class TradeExecutor:
         # Determine credit/debit from strategy cash-flow sign.
         # Leg counts are ambiguous (e.g. iron condor has 2 BUY + 2 SELL but is CREDIT).
         is_credit = signal.strategy_name in self.CREDIT_STRATEGIES
+
+        # GOV-1 (governance audit): the primary strategy (iron condor) had
+        # NO live-quote validation — the marketable limit derived purely from
+        # the signal-time mid. Fetch the live combo NBBO once and refuse when
+        # (a) the combo spread is disorderly, or (b) the signal price has
+        # drifted far from the live mid (stale signal / fat finger).
+        try:
+            self._ibkr.ib.reqMktData(combo, "", False, False)
+            try:
+                import asyncio as _aio
+                await _aio.sleep(1.5)
+                _t = self._ibkr.ib.ticker(combo)
+                _bid = _t.bid if (_t and _t.bid == _t.bid) else None
+                _ask = _t.ask if (_t and _t.ask == _t.ask) else None
+            finally:
+                try:
+                    self._ibkr.ib.cancelMktData(combo)
+                except Exception:
+                    pass
+            if _bid is not None and _ask is not None and _ask > _bid:
+                _mid = (_bid + _ask) / 2
+                _spread = abs(_ask - _bid)
+                if abs(_mid) > 0.05 and _spread / abs(_mid) > 1.0:
+                    log.warning("combo_spread_disorderly_rejected",
+                                trade_id=trade_id, bid=_bid, ask=_ask)
+                    self._state.update_trade_status(trade_id, TradeStatus.CANCELLED)
+                    return None
+                # combo quotes are signed; compare magnitudes
+                if abs(_mid) > 0.05 and abs(abs(signal.entry_price) - abs(_mid)) / abs(_mid) > 0.35:
+                    log.warning("combo_signal_price_stale_rejected",
+                                trade_id=trade_id,
+                                signal_px=signal.entry_price, live_mid=_mid)
+                    self._state.update_trade_status(trade_id, TradeStatus.CANCELLED)
+                    return None
+        except Exception as _e:  # noqa: BLE001 — validation must not block on quote hiccups
+            log.debug("combo_quote_validation_skipped", error=str(_e))
 
         limit_price, aggressive_offset = combo_entry_limit(
             signal.entry_price, is_credit

@@ -152,6 +152,26 @@ Deferred (documented, right-sized OUT at this account size): broker-side OCA bra
 event-sourcing ledger rewrite, HA. Immutable-ledger need is partially met by daily snapshots.
 Governance-auditor findings (second agent) recorded separately when delivered.
 
+## Round 4b (2026-07-08) — governance auditor: controls + lineage SHIPPED
+Landmark finding: computed the CURRENT paper book's -10% gap stress = **-$5,937**
+(-$7,387 from the 3 short strangles alone) — on the planned $2.1k live account that is
+-280%. Empirical proof of go-live gate 2 (defined-risk only), using our own positions.
+Shipped (all 5 refuse-items):
+- GOV-1 combo fat-finger: live NBBO fetched pre-submit; disorderly spread or >35%
+  signal-vs-mid drift = refused. Plus market-hours guard AT the executor.
+- GOV-2 model lineage: trade_context.model_version column + written on every trade —
+  losses are now attributable to the model version that produced them.
+- GOV-3 defined-risk-only keyed to TRADING MODE (env allowance force-stripped when
+  mode != paper), not just an env default.
+- GOV-4 EOD BREAK REPORT: one Telegram/day — recon CLEAN/N-breaks, NLV, and the book's
+  -10% gap-stress number (previously visible nowhere). Plus data/RESTRICTED.txt
+  hard-ban list (post-incident control, no restart needed).
+- GOV-5 docs/RUNBOOK.md (alert -> operator action, kill switches, go-live checklist) +
+  live-profile startup ASSERTION (refuses to run live with paper-relaxed liquidity gates).
+Deferred as accepted-at-this-size: vault for secrets, challenger/shadow model period
+(rollback + lineage is the right-sized substitute), cash-ledger reconciliation (NLV
+day-over-day in the EOD report is the proxy).
+
 ## Go-live gates (decided 2026-07-07 — do NOT relitigate on a winning streak)
 Paper phase: ALL strategies stay enabled (incl. short_strangle) — the sample must answer
 "which strategies have edge", and paper blowups are data, not losses.

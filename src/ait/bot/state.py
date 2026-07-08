@@ -194,6 +194,10 @@ class StateManager:
             for ddl in (
                 "ALTER TABLE open_positions ADD COLUMN pnl_pct REAL DEFAULT 0",
                 "ALTER TABLE open_positions ADD COLUMN mark_time TEXT DEFAULT ''",
+                # GOV-2 (governance audit): model lineage — without this you
+                # cannot attribute a live trade to the model version that
+                # produced its prediction.
+                "ALTER TABLE trade_context ADD COLUMN model_version TEXT DEFAULT ''",
             ):
                 try:
                     conn.execute(ddl)
@@ -547,15 +551,18 @@ class StateManager:
         iv_rank: float,
         sentiment_score: float,
         signals: str = "{}",
+        model_version: str = "",
     ) -> None:
         """Save the market context at time of trade entry (SQLite + DuckDB)."""
         with sqlite3.connect(self._db_path) as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO trade_context
                    (trade_id, entry_direction, entry_confidence, entry_regime,
-                    entry_vix, entry_iv_rank, entry_sentiment_score, entry_signals)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (trade_id, direction, confidence, regime, vix, iv_rank, sentiment_score, signals),
+                    entry_vix, entry_iv_rank, entry_sentiment_score, entry_signals,
+                    model_version)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (trade_id, direction, confidence, regime, vix, iv_rank,
+                 sentiment_score, signals, model_version),
             )
 
         # Dual-write to DuckDB

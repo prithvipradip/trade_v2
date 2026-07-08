@@ -156,6 +156,32 @@ class TradingOrchestrator:
             earnings_calendar=self._earnings,
             economic_calendar=self._economic_cal,
         )
+        # GOV-5 (governance audit): live-profile assertion — the liquidity
+        # gates were deliberately relaxed for paper/delayed data
+        # (spread 40%, min volume 0). Shipping those to live guts the
+        # illiquid-chain protection exactly when a bad fill costs money.
+        # Refuse to start in live mode with paper-relaxed gates.
+        import os as _os_g5
+        if str(getattr(settings.trading, "mode", "paper")).lower() != "paper":
+            _spread_env = float(_os_g5.environ.get("AIT_LIQ_MAX_SPREAD", "0.15"))
+            _vol_env = int(_os_g5.environ.get("AIT_LIQ_MIN_VOLUME", "10"))
+            if _spread_env > 0.15 or _vol_env < 1:
+                raise RuntimeError(
+                    "LIVE-PROFILE ASSERTION FAILED: liquidity gates are still "
+                    f"paper-relaxed (AIT_LIQ_MAX_SPREAD={_spread_env}, "
+                    f"AIT_LIQ_MIN_VOLUME={_vol_env}). Tighten them before live "
+                    "(see docs/RUNBOOK.md go-live checklist)."
+                )
+
+        # GOV-3 (governance audit): defined-risk-only keyed to TRADING MODE,
+        # not just an env default. In any non-paper mode the undefined-risk
+        # allowance is force-stripped — the executor then refuses strangles
+        # regardless of what the environment claims.
+        import os as _os_g3
+        if str(getattr(settings.trading, "mode", "paper")).lower() != "paper":
+            _os_g3.environ.pop("AIT_ALLOW_UNDEFINED_RISK", None)
+            log.info("undefined_risk_disabled_live_mode")
+
         # Wire alerts for silently-unprotected states (marks outage, PDT-
         # blocked stop) into the same Telegram channel as everything else.
         self._portfolio._notify_cb = self._send_notification
@@ -1264,6 +1290,17 @@ class TradingOrchestrator:
             if _flag.exists():
                 log.warning("entries_halted", reason=_why, flag=str(_flag))
                 return True  # symbol handled: no new entries while halted
+        # GOV (governance audit): restricted list — hard-ban a symbol without
+        # a config edit + restart (post-incident control). One symbol per line.
+        _rl = _P("data/RESTRICTED.txt")
+        if _rl.exists():
+            try:
+                _banned = {ln.strip().upper() for ln in _rl.read_text().splitlines() if ln.strip()}
+                if signal.symbol.upper() in _banned:
+                    log.warning("symbol_restricted", symbol=signal.symbol)
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
 
         # Check trade budget (time-based pacing)
         remaining = self._get_trade_budget()
@@ -1451,6 +1488,7 @@ class TradingOrchestrator:
                 vix=await self._market_data.get_vix() or 0,
                 iv_rank=signal.iv_rank if hasattr(signal, "iv_rank") else 0,
                 sentiment_score=sentiment.composite_score if sentiment and hasattr(sentiment, "composite_score") else 0,
+                model_version=getattr(self._predictor, "model_version", "") or "",
             )
 
             msg = (
@@ -1796,6 +1834,38 @@ class TradingOrchestrator:
         # 1. Reconcile with IBKR
         recon = await self._reconciler.reconcile()
         await self._alert_reconcile_anomalies(recon)
+
+        # GOV-4 (governance audit): EOD BREAK REPORT — reconcile used to run
+        # startup/pre-market only and breaks were log lines nobody read. One
+        # Telegram line per day: books-vs-broker status + NLV + the book's
+        # -10% gap stress (a number that previously existed NOWHERE).
+        try:
+            _nlv = await self._account.get_net_liquidation()
+            _stress = 0.0
+            for _t in self._state.get_open_trades():
+                if _t.status.value not in ("filled", "partial"):
+                    continue
+                _spot = await self._market_data.get_current_price(_t.symbol)
+                if not _spot:
+                    continue
+                _settle = _spot * 0.90
+                _iv = self._reconciler._structure_intrinsic(_t, _settle)
+                if _iv is None:
+                    continue
+                from ait.strategies.base import CREDIT_STRATEGIES as _CS
+                if _t.strategy in _CS:
+                    _stress += (_t.entry_price - _iv) * 100 * _t.quantity
+                else:
+                    _stress += (_iv - _t.entry_price) * 100 * _t.quantity
+            _breaks = len(recon.discrepancies or [])
+            await self._send_notification(
+                f"EOD RECON: {'CLEAN' if _breaks == 0 else f'{_breaks} BREAK(S)'} | "
+                f"matched {recon.matched} | NLV ${_nlv:,.0f} | "
+                f"book -10% gap stress: ${_stress:,.0f}"
+                + ("" if _breaks == 0 else "\n" + "\n".join((recon.discrepancies or [])[:3]))
+            )
+        except Exception as _e:  # noqa: BLE001
+            log.warning("eod_break_report_failed", error=str(_e))
 
         # 2. Run self-learning cycle
         if self._settings.learning.enabled:
