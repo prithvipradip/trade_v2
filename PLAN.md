@@ -116,15 +116,20 @@ Going LIVE requires ALL of:
 2. **Defined-risk only**: iron condors (and debit structures) ONLY. NO short strangles live —
    their max_loss is a model estimate, not a contract. Strangles earn live status only after
    a real margin model + 3 months of live consistency at base size.
-3. **Tuition sizing — user decision 2026-07-07: $2,000 CAD (~$1.4k USD) initial funding.**
-   That lands in the MICRO capital tier (SPY-only, $1-2-wide credit spreads, 2 positions) —
-   a DIFFERENT regime than the big-account paper run. Therefore: before go-live, run a
-   paper phase with AIT_SIMULATED_CAPITAL=1400 so the validated configuration IS the
-   launch configuration. (MICRO-tier affordability bug SR-L11 fixed 2026-07-07 —
-   the tier was bricked below ~$1,667.) 1 contract, daily-loss halt on, VIX halt on,
-   weekly human review mandatory. NOTE: at this size, commissions+slippage are ~$8-15
-   per round trip vs ~$20-40 profit targets — expect thin nets; the goal at $2k is
-   PROCESS validation with real money, not income.
+3. **Tuition sizing — user decision 2026-07-07 (rev 2): $3,000 CAD (~$2.1k USD) initial
+   funding → SMALL capital tier** (SPY/QQQ/IWM/AMD/AAPL + GLD/TLT/XLE, iron condors
+   preferred — matches the defined-risk-only rule, 3 positions).
+   **Phase-switch recipe (target-size paper validation, run BEFORE funding):**
+   - .env: AIT_SIMULATED_CAPITAL=2100  (scales the whole risk stack to launch size)
+   - config.yaml: risk.max_position_risk_pct: 0.03 -> 0.07  (3% = $63 at $2.1k, below ANY
+     real spread's max loss — 7% matches the SMALL tier design; REVERT both when
+     switching back to big-account paper)
+   - restart bot; verify SMALL-tier universe + 1-2-wide condors + fills; run >= 4 weeks.
+   Notes: MICRO/SMALL affordability bug SR-L11 fixed; tier max_underlying_price/wing
+   logic confirmed DEAD live (only the name filter runs). Costs at this size: ~$5-13
+   per IC round trip vs ~$20-45 targets — thin nets; the $3k stage validates PROCESS
+   with real money, not income. 1 contract, daily-loss halt on, VIX halt on, weekly
+   human review mandatory.
 4. **Backtest credibility fixed first** (Round 3 deferred #1) — no sizing decision may cite
    backtest numbers until the engine's inflation bugs are fixed.
 5. Expect live < paper (real fills). Scale only on 3+ months of live evidence.

@@ -97,7 +97,8 @@ TIERS = {
         stop_loss_pct=0.35,
         profit_target_pct=0.50,
         max_underlying_price=300.0,
-        preferred_underlyings=["SPY", "QQQ", "IWM", "AMD", "AAPL"],
+        preferred_underlyings=["SPY", "QQQ", "IWM", "AMD", "AAPL",
+                               "GLD", "TLT", "XLE"],  # cheap underlyings suit small accounts (2026-07-07, $3k CAD launch plan)
     ),
     CapitalTier.MEDIUM: TierConfig(
         tier=CapitalTier.MEDIUM,
