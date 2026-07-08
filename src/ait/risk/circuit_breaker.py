@@ -12,6 +12,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from datetime import date
+from ait.utils.time import now_et
 
 from ait.config.settings import RiskConfig
 from ait.utils.logging import get_logger
@@ -44,7 +45,7 @@ class CircuitBreaker:
         self._daily_pnl = 0.0
         self._consecutive_losses = 0
         self._api_failures: list[float] = []  # Timestamps of recent failures
-        self._last_reset_date = date.today()
+        self._last_reset_date = now_et().date()
 
     @property
     def is_tripped(self) -> bool:
@@ -58,6 +59,10 @@ class CircuitBreaker:
             self._tripped = False
             self._trip_reason = ""
             self._resume_time = 0.0
+            # Deep-audit SR-L10: without this, the counter stayed at the
+            # threshold and a single loss after auto-resume instantly
+            # re-tripped — inconsistent with manual/daily resets.
+            self._consecutive_losses = 0
             return False
 
         return True
@@ -74,7 +79,7 @@ class CircuitBreaker:
 
     def check_daily_reset(self) -> None:
         """Reset daily counters if it's a new day."""
-        today = date.today()
+        today = now_et().date()  # ET-pinned (deep-audit SR-M5)
         if today != self._last_reset_date:
             self._daily_pnl = 0.0
             self._consecutive_losses = 0
@@ -86,6 +91,13 @@ class CircuitBreaker:
                 self._tripped = False
                 self._trip_reason = ""
                 log.info("circuit_breaker_daily_reset")
+
+    def record_partial_pnl(self, pnl: float) -> None:
+        """Fold partial-exit P&L into the daily total WITHOUT touching the
+        consecutive-loss counter (a scale-out is not a completed trade).
+        Deep-audit BC-H3: partial P&L previously never reached the breaker,
+        so the daily-loss halt undercounted realized losses."""
+        self._daily_pnl += pnl
 
     def record_trade_result(self, pnl: float) -> None:
         """Record a trade's P&L and check for circuit breaker triggers."""

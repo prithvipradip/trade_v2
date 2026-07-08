@@ -149,7 +149,7 @@ class DirectionalModel:
         log.info("directional_class_balance", up=n_up, down=n_down, total=len(y))
 
         # Train XGBoost with precision-focused hyperparams
-        tscv = TimeSeriesSplit(n_splits=5)
+        tscv = TimeSeriesSplit(n_splits=5, gap=5)  # purge >= 5d label horizon (deep-audit ML-F4)
         accuracies = {}
 
         try:

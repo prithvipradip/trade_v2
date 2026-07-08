@@ -392,8 +392,11 @@ class TestExitFillPriceSigned:
             f.execution.shares = shares
             return f
         ex = self._executor()
+        # ib_insync execution.shares for options = CONTRACT count (deep-audit
+        # MP-F1): the old fixture used shares=100 for 1 contract, enshrining a
+        # convention that made real reconstructions 100x too small.
         t = self._bag_trade(avg=float("nan"), qty=1,
-                            fills=[fill("SLD", 2.00, 100), fill("SLD", 0.80, 100)])
+                            fills=[fill("SLD", 2.00, 1), fill("SLD", 0.80, 1)])
         assert ex._get_exit_fill_price(1, [t]) == pytest.approx(-2.80)
 
     def test_bag_mixed_side_fills(self):
@@ -407,7 +410,7 @@ class TestExitFillPriceSigned:
             return f
         ex = self._executor()
         t = self._bag_trade(avg=float("nan"), qty=1,
-                            fills=[fill("SLD", 2.00, 100), fill("BOT", 0.80, 100)])
+                            fills=[fill("SLD", 2.00, 1), fill("BOT", 0.80, 1)])
         assert ex._get_exit_fill_price(1, [t]) == pytest.approx(-1.20)
 
 

@@ -223,9 +223,10 @@ class TestDailyReset:
 
         from datetime import date, timedelta
 
+        from unittest.mock import MagicMock
         tomorrow = date.today() + timedelta(days=1)
-        with patch("ait.risk.circuit_breaker.date") as mock_date:
-            mock_date.today.return_value = tomorrow
+        with patch("ait.risk.circuit_breaker.now_et") as mock_now:
+            mock_now.return_value = MagicMock(date=lambda: tomorrow)
             cb.check_daily_reset()
 
         status = cb.get_status()
@@ -242,9 +243,10 @@ class TestDailyReset:
 
         from datetime import date, timedelta
 
+        from unittest.mock import MagicMock
         tomorrow = date.today() + timedelta(days=1)
-        with patch("ait.risk.circuit_breaker.date") as mock_date:
-            mock_date.today.return_value = tomorrow
+        with patch("ait.risk.circuit_breaker.now_et") as mock_now:
+            mock_now.return_value = MagicMock(date=lambda: tomorrow)
             cb.check_daily_reset()
 
         assert cb.is_tripped is False

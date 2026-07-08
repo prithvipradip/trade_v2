@@ -622,10 +622,11 @@ class Backtester:
             else:
                 pos["legs"] = []
 
-            # Deduct commission
+            # Deep-audit BT-M6: entry commission is included in _calc_pnl
+            # (subtracted from the trade P&L added back at exit) — debiting
+            # capital here as well double-counted it in final_capital.
             n_legs = pos.get("n_legs", 1)
             entry_commission = self._commission * pos["contracts"] * n_legs
-            capital -= entry_commission
             pos["entry_commission"] = entry_commission
 
             open_positions.append(pos)

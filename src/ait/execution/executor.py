@@ -330,6 +330,14 @@ class TradeExecutor:
         filled = []
         cancelled = []
 
+        # CONNECTION GUARD (deep-audit MP-F2b): get_open_orders() and
+        # get_all_trades() both return [] when disconnected, which used to
+        # make every working order look vanished -> mass mis-cancel. Skip
+        # the whole pass on a dead connection; nothing is lost by waiting.
+        if not self._ibkr.connected:
+            log.warning("check_fills_skipped_disconnected")
+            return filled, []
+
         # 1. Cancel stale orders that have exceeded timeout
         await self._cancel_stale_orders()
 
@@ -364,6 +372,19 @@ class TradeExecutor:
                 filled_qty = self._get_filled_quantity(order_id, all_trades, pending)
                 partial_price = self._get_fill_price(order_id, all_trades, pending)
                 self._update_trade_partial(pending, filled_qty, partial_price)
+
+                # Terminal partial (order cancelled/inactive at IBKR with
+                # fills): booking is done — stop tracking so this doesn't
+                # re-book every cycle (deep-audit MP-F2a follow-through).
+                _terminal = any(
+                    t.order.orderId == order_id
+                    and t.orderStatus.status.lower() in ("cancelled", "inactive", "apicancelled")
+                    for t in all_trades
+                )
+                if _terminal:
+                    del self._pending_orders[order_id]
+                    filled.append(pending.trade_id)  # partial contracts are live
+                    continue
 
                 # If partial fill has been sitting > 30s, cancel the remainder
                 # to avoid orphaned legs and stale prices
@@ -549,14 +570,20 @@ class TradeExecutor:
         for trade in all_trades:
             if trade.order.orderId == order_id:
                 status = trade.orderStatus.status.lower()
+                filled_qty = trade.orderStatus.filled or 0
                 if status in ("filled",):
                     return "filled"
                 elif status in ("cancelled", "inactive", "apicancelled"):
-                    return "cancelled"
+                    # FILLED-QTY FIRST (deep-audit MP-F2a): a cancelled order
+                    # with fills (partial-then-cancel-remainder) previously
+                    # returned "cancelled", flipping the trade to CANCELLED —
+                    # a status neither the portfolio monitor nor the
+                    # reconciler ever re-adopts — while the filled contracts
+                    # were LIVE at IBKR with no stop/TP/expiry management.
+                    return "partial" if filled_qty > 0 else "cancelled"
                 elif status in ("submitted", "presubmitted"):
                     return "pending"  # Still working
 
-                filled_qty = trade.orderStatus.filled or 0
                 remaining = trade.orderStatus.remaining or 0
                 if filled_qty > 0 and remaining > 0:
                     return "partial"
@@ -565,7 +592,13 @@ class TradeExecutor:
                 else:
                     return "cancelled"
 
-        # If not found in trades list, assume cancelled (order was rejected or expired)
+        # NOT-FOUND HARDENING (deep-audit MP-F2b): the entry path used to
+        # assume "cancelled" whenever the order wasn't in get_all_trades() —
+        # but that list is empty on any connection blip, so a mid-cycle
+        # disconnect flipped EVERY working entry to CANCELLED while live at
+        # IBKR. Mirror the exit path: treat young/unknown as still pending.
+        if pending.age_seconds < 30:
+            return "pending"
         return "cancelled"
 
     @staticmethod
@@ -584,7 +617,12 @@ class TradeExecutor:
         for f in trade.fills:
             sign = 1.0 if f.execution.side == "SLD" else -1.0
             net += sign * f.execution.price * f.execution.shares
-        return -net / (100.0 * qty)
+        # UNIT FIX (deep-audit MP-F1): ib_insync `execution.shares` for
+        # options is the CONTRACT count, not shares — dividing by 100·qty
+        # made every reconstructed combo price 100x too small (a fresh
+        # strangle would mark at -9900% and instantly stop out on fiction).
+        # price-per-combo-unit = premium net / combo quantity.
+        return -net / qty
 
     def _get_fill_price(
         self, order_id: int, all_trades: list, pending: PendingOrder

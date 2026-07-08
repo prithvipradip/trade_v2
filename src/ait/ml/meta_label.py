@@ -171,9 +171,11 @@ class MetaLabeler:
             return {}
 
         # Scale features
-        self._scaler.fit(X)
-        X_scaled = self._scaler.transform(X)
-
+        # Deep-audit ML-F2: fitting the scaler on ALL rows before CV leaks
+        # each fold's mean/variance into training — the reported accuracy/
+        # precision of this live trade-veto gate were optimistically biased.
+        # CV below scales per fold; the production scaler fits on the full
+        # data only AFTER CV (matching ensemble/range/vol_mag).
         # Time-series cross-validation
         n_splits = min(5, max(2, len(y) // 10))
         tscv = TimeSeriesSplit(n_splits=n_splits)
@@ -194,12 +196,16 @@ class MetaLabeler:
                 n_jobs=-1,
             )
 
-            # Cross-validate
+            # Cross-validate — scaler fit PER FOLD on the train slice only.
+            from sklearn.preprocessing import StandardScaler as _SS
             accuracies = []
             precisions = []
-            for train_idx, val_idx in tscv.split(X_scaled):
-                model.fit(X_scaled[train_idx], y[train_idx])
-                preds = model.predict(X_scaled[val_idx])
+            for train_idx, val_idx in tscv.split(X):
+                _fold_scaler = _SS()
+                X_tr = _fold_scaler.fit_transform(X[train_idx])
+                X_va = _fold_scaler.transform(X[val_idx])
+                model.fit(X_tr, y[train_idx])
+                preds = model.predict(X_va)
                 acc = float(np.mean(preds == y[val_idx]))
                 accuracies.append(acc)
 
@@ -209,7 +215,9 @@ class MetaLabeler:
                     precision = float(np.mean(y[val_idx][take_mask] == 1))
                     precisions.append(precision)
 
-            # Final model on all data
+            # Production scaler + final model fit on ALL data (after CV)
+            self._scaler.fit(X)
+            X_scaled = self._scaler.transform(X)
             model.fit(X_scaled, y)
             self._model = model
             self._trained = True

@@ -376,10 +376,16 @@ class OUKouGARCH:
 
         # OU variance at horizon h
         two_kappa_h_dt = 2.0 * p.kappa * horizon * _DT
+        # Deep-audit VL-H: sigma2_last is a DAILY variance; the previous
+        # expressions divided the h-day accumulation by an extra 1/_DT
+        # (=252), making sigma_h ~16x too small and P(in range) ~= 1.0 —
+        # while the CV scoring used the CORRECT path, so a member that
+        # scored well contributed a constant ~1.0 live. h-day OU variance
+        # = sigma2_daily * (1 - e^{-2 kappa t}) / (2 kappa dt).
         if two_kappa_h_dt < 1e-6:
-            sigma2_ou_h = sigma2_last * horizon * _DT
+            sigma2_ou_h = sigma2_last * horizon
         else:
-            sigma2_ou_h = sigma2_last * (1.0 - np.exp(-two_kappa_h_dt)) / (2.0 * p.kappa)
+            sigma2_ou_h = sigma2_last * (1.0 - np.exp(-two_kappa_h_dt)) / (2.0 * p.kappa * _DT)
         sigma2_ou_h = max(sigma2_ou_h, _MIN_VAR)
 
         # OU conditional mean at horizon h

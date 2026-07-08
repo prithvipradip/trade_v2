@@ -269,7 +269,7 @@ class OptionsChainService:
             strike_range = price * 0.20
             target_strikes = [
                 s for s in chain_def.strikes
-                if abs(s - price) <= strike_range and s == int(s)
+                if abs(s - price) <= strike_range and (s * 2) == int(s * 2)  # allow $0.50 strikes; whole-dollar-only deleted ATM strikes on sub-$25 names (deep-audit DATA-M7)
             ]
 
             # Fetch option contracts for each expiry
@@ -338,7 +338,7 @@ class OptionsChainService:
                         bid=ticker.bid if ticker.bid and ticker.bid > 0 else 0.0,
                         ask=ticker.ask if ticker.ask and ticker.ask > 0 else 0.0,
                         last=ticker.last if ticker.last and ticker.last > 0 else 0.0,
-                        volume=int(ticker.volume) if ticker.volume else 0,
+                        volume=(int(ticker.volume) if (ticker.volume and ticker.volume == ticker.volume and ticker.volume > 0) else 0),  # NaN is truthy; int(NaN) killed the whole 50-contract batch (deep-audit DATA-M6)
                         open_interest=0,  # IBKR doesn't provide OI in real-time
                         implied_vol=(
                             ticker.modelGreeks.impliedVol

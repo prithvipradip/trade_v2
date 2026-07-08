@@ -72,7 +72,7 @@ class CorrelationGuard:
         correlated = [
             existing for existing in open_symbols
             if (c := self._get_correlation(new_symbol, existing)) is not None
-            and abs(c) > self._max_corr
+            and c > self._max_corr  # signed (deep-audit SR-L13): negative corr = hedge, must not count toward the cluster cap
         ]
         if len(correlated) >= self._max_correlated:
             reason = (

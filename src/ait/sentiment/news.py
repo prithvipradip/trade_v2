@@ -208,8 +208,14 @@ class NewsSentiment:
             "warning", "risk", "fear", "sell", "layoff",
         ]
 
-        bull_count = sum(1 for w in bullish_words if w in text_lower)
-        bear_count = sum(1 for w in bearish_words if w in text_lower)
+        # Word-boundary matching (deep-audit VL-M): bare substring checks
+        # fired "gain" inside "against", "rise" inside "crisis", "cut"
+        # inside "execute" — sign-flipping headlines. \b anchors fix it.
+        import re as _re
+        bull_count = sum(1 for w in bullish_words
+                         if _re.search(rf"\b{_re.escape(w)}\w*", text_lower))
+        bear_count = sum(1 for w in bearish_words
+                         if _re.search(rf"\b{_re.escape(w)}\w*", text_lower))
 
         total = bull_count + bear_count
         if total == 0:

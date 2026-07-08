@@ -407,12 +407,27 @@ class PositionReconciler:
             realized_pnl = 0.0
             exit_reason = "reconciler_ibkr_realized"
             found_ibkr_pnl = False
+            # LEG-AWARE attribution (deep-audit MP-F4): matching by symbol
+            # alone grabbed the FIRST leg's realizedPNL as the whole
+            # structure's P&L (~1/4 of an iron condor), and could book one
+            # trade's P&L onto another trade on the same underlying. Sum the
+            # realizedPNL of exactly THIS trade's legs.
+            trade_keys = self._trade_leg_keys(trade)
+            leg_pnls = []
             for item in ibkr_portfolio:
-                sym = item.contract.symbol
-                if sym == trade.symbol and item.position == 0 and item.realizedPNL != 0:
-                    realized_pnl = item.realizedPNL
-                    found_ibkr_pnl = True
-                    break
+                if item.contract.secType != "OPT" or item.position != 0:
+                    continue
+                key = self._make_position_key(
+                    symbol=item.contract.symbol,
+                    strike=item.contract.strike,
+                    right=item.contract.right,
+                    expiry=item.contract.lastTradeDateOrContractMonth,
+                )
+                if key in trade_keys and item.realizedPNL:
+                    leg_pnls.append(item.realizedPNL)
+            if leg_pnls:
+                realized_pnl = float(sum(leg_pnls))
+                found_ibkr_pnl = True
 
             if not found_ibkr_pnl and trade.entry_price > 0:
                 # No IBKR data. Only assume "expired worthless" when the

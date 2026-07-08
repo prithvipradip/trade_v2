@@ -68,6 +68,34 @@ blocking is pre-existing (3% cap vs assignment notional), not a regression.
 | R2.13 | Retrain-effectiveness + fill-quality watch: verify tomorrow's session — thesis-check runs clean, marks persist, slippage on new entries, GLD/TLT/XLE signals generate. | live verification | todo |
 | R2.14 | Deferred: Telegram off hot path w/ retry+2nd channel; covered_call share-ownership precondition (currently unreachable — blocked by 3% cap); ET-pinning for time gates; wmic→tasklist in keeper. | various | todo |
 
+## Round 3 (2026-07-07 night) — LINE-BY-LINE audit of the FULL system (~40k lines, 8 auditors, 100% coverage attested per file)
+
+FIXED (commit refs this batch):
+| Area | Fix |
+|---|---|
+| executor | BAG fill reconstruction was 100x too small (execution.shares = CONTRACTS for options); eager "cancelled" no longer orphans partial fills or mass-cancels on disconnect (filled-qty-first + not-found grace + connection guard); terminal partials stop tracking cleanly |
+| reconciler | realized P&L attribution now LEG-aware (was: first same-symbol item ≈ 1/4 of an IC, cross-trade bleed) |
+| orchestrator | fast-monitor errors now WARN + feed watchdog (were DEBUG-swallowed for hours); partial exits no longer double-count trades_won; breaker now sees partial P&L; first-hour 0.85 gate exempts range-gated neutral strategies (it structurally banned ICs 9:30-10:30) + ET-pinned; drift not fed fake directions for neutral wins; PDT round-trips now RECORDED (guard was fully inert — zero callers) |
+| watchdog | heartbeat no longer zeroes error_count (counter could never trip) |
+| circuit_breaker | record_partial_pnl(); ET-pinned daily reset (local-midnight reset could un-trip the daily halt MID-SESSION); consecutive-loss counter reset on auto-resume |
+| risk | sizer: credit strategies sized on capital-at-risk not premium (4-5x understatement); min-1 floor no longer forces an unaffordable contract; correlation cap now signed (negative-corr hedges no longer blocked); capital_tiers preferred lists include GLD/TLT/XLE (tier filter was silently deleting the R2.10 diversifiers!) |
+| thompson | atomic state save (kill mid-write silently reset the whole bandit) |
+| ML | vol_mag CV purge gap >= horizon (same leak-class as fixed range 2.4 — gated straddles on illusory edge); meta-label scaler now per-fold (was fit on ALL data pre-CV); ensemble labels NaN-init (last 5 rows were stamped fake-NEUTRAL every retrain); predict() reindex-safe + honest features_used; range model actually consumes VLMC features; directional CV gap=5 |
+| vol models | OU jump P(in-range) horizon variance was 252x too small (returned ~1.0 constant into the IC gate ensemble); GARCH student-t/skew-t thresholds now unit-variance rescaled |
+| sentiment | news keyword matching word-boundary anchored ("gain" in "against" flipped signs) |
+| learning | analyzer window keys on exit_time (7-30d holds closed in-window were excluded) |
+| data | daily save() no longer wipes implied_vol (INSERT OR REPLACE deleted it every retrain — IV features silently dead); int(NaN) volume guards in save paths + chain builder (one NaN killed a whole 50-contract batch); $0.50 strikes allowed (whole-dollar filter deleted ATM strikes on cheap names); earnings fetch never blocks the event loop (background-fills cache) |
+| ops | web_logs + streamlit dashboards bound to 127.0.0.1 (were LAN-exposed, no auth); daily report called a NONEXISTENT method since day one (empty file + false success) — fixed + returncode-gated; APScheduler misfire grace 1s→1h (jobs were silently dropped on restarts); orchestrator.log size-capped; Telegram token redacted from error logs; status.py None-guard |
+| backtest/offline | fix_pnl_history refuses re-run (2nd run zeroed migrated wins); run_optimizer --apply requires AIT_ALLOW_APPLY=1 (was a direct overfit→live-config pipe); engine entry commission no longer double-debited |
+
+DEFERRED (Round 3 todo — larger design work, ranked):
+1. **Backtest credibility overhaul**: multi-symbol capital inflation (~N x returns), Sharpe √252 on per-trade P&L (~4.6x overstated, also inside the Optuna objective), overlapping-window double-counting, per-symbol return display, hard-forced iron_condor silencing other strategies, drawdown on mis-ordered trades. Treat ALL backtest numbers as directional-only until this lands.
+2. **Adjusted-vs-unadjusted price mixing** across IBKR/Polygon/Yahoo and between the two daily pipelines (corrupts features/labels for dividend payers incl. GLD/TLT/XLE). Needs a single price-basis policy.
+3. Quote timestamps = exchange time (staleness detection currently blind); intraday bar-semantics tag (TRADES vs MIDPOINT vs adjusted); partial-day bar exclusion in live features.
+4. get_portfolio_summary must stop mutating protection state (EOD false MARKS-MISSING alert risk); watchdog ibkr/market_data components never heartbeated; daily-loss breaker still entry-gated + realized-only.
+5. GARCH members frozen at train time (stale up to reload interval); trainer rollback keyed on last symbol only; adaptor same-param compounding within a cycle; counterfactual eval min-elapsed guard; economic_calendar hardcoded 2026-only (year-end time bomb); DuckDB readers read_only; sortino/profit-factor display consistency; analyzer NULL-column guards.
+6. MP-F3 verify: sign of a real closing-BAG avgFillPrice (debit-spread exit negation depends on it) — check on first live debit close.
+
 ## Deferred / watchlist
 - ~~Live data~~ done 2026-07-02 (Network B/C + OPRA, ~$3/mo).
 - IBC read-only automation: vmoptions `--add-opens` fixed the crash; box may still need manual

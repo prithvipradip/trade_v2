@@ -82,7 +82,9 @@ class Watchdog:
             self.register_component(component)
         self._components[component].last_heartbeat = time.time()
         self._components[component].status = ComponentStatus.HEALTHY
-        self._components[component].error_count = 0
+        # Deep-audit BC-H2a: heartbeat used to zero error_count — with a 30s
+        # heartbeat and a 10-error threshold the counter oscillated 0<->1 and
+        # could NEVER trip. Errors now persist until explicit recovery.
 
     def record_error(self, component: str, error: str) -> None:
         """Record an error for a component."""

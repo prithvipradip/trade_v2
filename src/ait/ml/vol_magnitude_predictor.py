@@ -214,7 +214,14 @@ class VolMagnitudePredictor:
     def fitted_weights(self) -> "dict[str, float] | None":
         return getattr(self, "_fitted_weights", None)
 
-    def _walk_forward_split(self, n: int, n_splits: int = 4, gap: int = 5):
+    def _walk_forward_split(self, n: int, n_splits: int = 4, gap: int | None = None):
+        # Deep-audit ML-F1: labels look self._horizon (30) days forward and
+        # OVERLAP; gap=5 leaked ~25 days of label window into every
+        # validation fold, inflating the CV accuracy that gates whether
+        # long_straddle trades at all. Purge gap must cover the horizon
+        # (same bug-class as the fixed range-model item 2.4).
+        if gap is None:
+            gap = max(5, int(self._horizon))
         splits = []
         fold = n // (n_splits + 1)
         for i in range(n_splits):

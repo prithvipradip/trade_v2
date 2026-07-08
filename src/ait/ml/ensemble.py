@@ -124,7 +124,11 @@ class DirectionPredictor:
             return None
 
         # Use only the last row (current prediction)
-        X = features[feature_names].iloc[[-1]]
+        # Deep-audit ML-F7: direct column indexing raised KeyError when a
+        # VLMC-trained model met a symbol whose intraday store was empty at
+        # predict time. Reindex + neutral-fill instead (predict_from_features
+        # already did this).
+        X = features.reindex(columns=feature_names).fillna(0.0).iloc[[-1]]
 
         try:
             # Keep as DataFrame with feature names so LightGBM/sklearn agree
@@ -181,7 +185,7 @@ class DirectionPredictor:
             direction=direction,
             confidence=confidence,
             probabilities=probabilities,
-            features_used=len(self._feature_names),
+            features_used=len(feature_names),  # per-symbol list, not the global one (deep-audit ML-F7)
             model_version=self._model_version,
         )
 
@@ -520,9 +524,14 @@ class DirectionPredictor:
         and gives the model more directional training signal.
         """
         fwd_return = close.pct_change(5).shift(-5)  # 5-day forward return
-        labels = pd.Series(1, index=close.index, dtype=float)  # Default neutral
+        # Deep-audit ML-F3: initialising to 1 stamped the last 5 rows (whose
+        # forward return is unknowable NaN) as NEUTRAL on every retrain —
+        # systematically wrong labels at the most regime-relevant rows.
+        # NaN-init means dropna(subset=["target"]) removes them instead.
+        labels = pd.Series(float("nan"), index=close.index, dtype=float)
         labels[fwd_return > 0.01] = 2    # Bullish: >+1.0% in 5 days
         labels[fwd_return < -0.01] = 0   # Bearish: <-1.0% in 5 days
+        labels[(fwd_return <= 0.01) & (fwd_return >= -0.01)] = 1  # Neutral
         return labels
 
     @staticmethod

@@ -310,7 +310,15 @@ class RiskManager:
         # 9. Position sizing
         size = self._sizer.calculate(
             account_value=account_value,
-            option_price=request.entry_price,
+            # Deep-audit SR-H3: for credit strategies entry_price is the
+            # CREDIT — sizing on it treats a $400-risk condor as a $100
+            # position (~4-5x risk understatement). Size on per-contract
+            # capital-at-risk when known.
+            option_price=(
+                request.max_loss / (max(1, request.contracts) * 100)
+                if (is_credit and getattr(request, "max_loss", None))
+                else request.entry_price
+            ),
             confidence=request.confidence,
             implied_vol=request.implied_vol,
             strategy=request.strategy,

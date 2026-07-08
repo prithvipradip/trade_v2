@@ -715,7 +715,12 @@ class GARCHRangeModel:
 
             elif dist == "t":
                 nu = float(arch_result.params.get("nu", 8.0))
-                return float(stats.t.cdf(t, df=nu) - stats.t.cdf(-t, df=nu))
+                # Deep-audit VL-M: arch standardises innovations to UNIT
+                # variance while scipy's t has variance nu/(nu-2) — the
+                # unscaled threshold understated P(in range) (nu=5 -> ~1.29x
+                # too strict). Rescale to the unit-variance t.
+                t_std = t * np.sqrt(nu / (nu - 2.0)) if nu > 2.0 else t
+                return float(stats.t.cdf(t_std, df=nu) - stats.t.cdf(-t_std, df=nu))
 
             elif dist == "skewt":
                 # Hansen's skewed-t: use scipy skewed-t approximation
@@ -725,8 +730,10 @@ class GARCHRangeModel:
                 # Use scipy's nct (non-central t) as approximation for skewed-t
                 # nc parameter encodes skewness; scale back to unit variance
                 nc = lam * np.sqrt(eta / (eta - 2.0)) if eta > 2 else 0.0
-                p_hi = float(stats.nct.cdf(t, df=eta, nc=nc))
-                p_lo = float(stats.nct.cdf(-t, df=eta, nc=nc))
+                # Same unit-variance rescale as the "t" branch (deep-audit VL-M)
+                t_std = t * np.sqrt(eta / (eta - 2.0)) if eta > 2.0 else t
+                p_hi = float(stats.nct.cdf(t_std, df=eta, nc=nc))
+                p_lo = float(stats.nct.cdf(-t_std, df=eta, nc=nc))
                 return float(np.clip(p_hi - p_lo, 0.0, 1.0))
 
             elif dist == "ged":

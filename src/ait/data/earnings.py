@@ -38,14 +38,45 @@ class EarningsCalendar:
         self._cache = TTLCache(default_ttl=21600, max_size=200)
 
     def get_next_earnings(self, symbol: str) -> EarningsInfo:
-        """Get the next earnings date for a symbol."""
+        """Get the next earnings date for a symbol.
+
+        Deep-audit DATA-M5: the synchronous yfinance fetch used to run
+        directly on the asyncio event loop — a cache miss froze position
+        monitoring, stops, and exit fills for the whole fetch. When called
+        from inside a running loop we now NEVER block: kick a background
+        thread to populate the cache and return "unknown" for this tick
+        (same trade-through behavior as a failed fetch); the next tick gets
+        the cached answer. Sync callers (tests/CLI) fetch inline as before.
+        """
         cached = self._cache.get(f"earnings_{symbol}")
         if cached is not None:
             return cached
 
-        info = self._fetch_earnings(symbol)
-        self._cache.set(f"earnings_{symbol}", info)
-        return info
+        import asyncio as _aio
+        import threading as _th
+        try:
+            _aio.get_running_loop()
+            inflight = getattr(self, "_inflight", None)
+            if inflight is None:
+                inflight = self._inflight = set()
+            if symbol not in inflight:
+                inflight.add(symbol)
+
+                def _bg():
+                    try:
+                        info = self._fetch_earnings(symbol)
+                        self._cache.set(f"earnings_{symbol}", info)
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("earnings_bg_fetch_failed", symbol=symbol, error=str(e))
+                    finally:
+                        inflight.discard(symbol)
+
+                _th.Thread(target=_bg, daemon=True).start()
+            return EarningsInfo(symbol=symbol, next_earnings_date=None)
+        except RuntimeError:
+            info = self._fetch_earnings(symbol)
+            self._cache.set(f"earnings_{symbol}", info)
+            return info
 
     def is_near_earnings(self, symbol: str, check_date: date | None = None) -> bool:
         """Check if a date is within the earnings danger zone.

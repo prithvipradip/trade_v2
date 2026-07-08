@@ -585,7 +585,7 @@ class TradeAnalyzer:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 """SELECT * FROM trades
-                   WHERE status = 'closed' AND entry_time >= ?
+                   WHERE status = 'closed' AND COALESCE(exit_time, entry_time) >= ?  -- exit-time window (deep-audit): 7-30d holds opened before the window but closed inside it were excluded
                      AND COALESCE(exit_reason_detailed, '') NOT LIKE '%migrated%'
                      AND COALESCE(exit_reason_detailed, '') NOT LIKE '%pending%'
                      AND COALESCE(exit_reason_detailed, '') NOT LIKE '%never_filled%'

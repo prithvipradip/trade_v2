@@ -147,7 +147,14 @@ class PositionSizer:
         # Hard per-trade contract cap (config) — keep cost-per-trade small so
         # the book can hold many more concurrent positions (learning volume).
         hard_cap = self._pos_config.max_contracts_per_trade
-        contracts = max(1, min(max_contracts, account_scale_cap, hard_cap))
+        # Deep-audit SR-M4: max(1, ...) forced 1 contract even when
+        # max_contracts computed to 0 because a single contract exceeds
+        # max_position_pct — silently blowing the cap. 0 is a legitimate
+        # answer ("cannot afford one contract within the cap").
+        if max_contracts < 1:
+            return PositionSize(0, 0.0, conf_adj, vol_adj,
+                                "single contract exceeds max_position_pct cap")
+        contracts = min(max_contracts, account_scale_cap, hard_cap)
 
         # Max risk: for spreads, risk is the net debit (option_price already is net debit).
         # For naked options, risk is the full premium paid.

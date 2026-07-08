@@ -107,6 +107,16 @@ def corrected_pnl(row: dict) -> tuple[float, str]:
     return 0.0, "migrated_unknown_exit"
 
 
+def _already_migrated(conn) -> bool:
+    """Deep-audit BT-H1: this script is NOT idempotent — a second run pushes
+    already-migrated expired-worthless wins through Rule B and zeroes them,
+    then propagates the zeros to DuckDB. Refuse to run twice."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM trades WHERE exit_reason_detailed LIKE '%migrated%'"
+    ).fetchone()
+    return bool(row and row[0] > 0)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
@@ -120,6 +130,10 @@ def main() -> None:
         print(f"Backups written with suffix .bak_{stamp}")
 
     con = sqlite3.connect(SQLITE_DB)
+    if _already_migrated(conn):
+        print("REFUSING TO RUN: migration flags already present in trades "
+              "(re-running would zero migrated wins — deep-audit BT-H1).")
+        return
     con.row_factory = sqlite3.Row
     rows = [dict(r) for r in con.execute(
         "SELECT * FROM trades WHERE status='closed' ORDER BY entry_time"

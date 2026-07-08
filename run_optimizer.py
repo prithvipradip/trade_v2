@@ -35,6 +35,7 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -134,7 +135,14 @@ def main() -> None:
 
     # Optionally apply to config.yaml
     if args.apply:
-        result.apply_to_config(args.config)
+        # Deep-audit BT-H2: --apply wrote single-window, no-holdout params
+        # straight into the LIVE config.yaml. Require an explicit env opt-in
+        # so overfit params can't be promoted by muscle memory.
+        if os.environ.get("AIT_ALLOW_APPLY") != "1":
+            print("REFUSING --apply: set AIT_ALLOW_APPLY=1 to write optimizer "
+                  "params into the live config (they are in-sample only).")
+        else:
+            result.apply_to_config(args.config)
         print(f"Best params written to: {args.config}")
 
 

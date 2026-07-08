@@ -178,7 +178,12 @@ class RangePredictor:
                 hint=f"Threshold {self._threshold:.0%} may be too tight/loose",
             )
 
-        self._feature_names = self._feature_engine.get_feature_names()
+        # Deep-audit ML-F5: omitting include_vlmc dropped all 26 intraday
+        # VLMC columns that compute() had just built — wasted O(n^2) compute
+        # and unrealised feature intent (ensemble does this correctly).
+        self._feature_names = self._feature_engine.get_feature_names(
+            include_vlmc=intraday_store is not None
+        )
         self._feature_names = [f for f in self._feature_names if f in features.columns]
 
         X = features[self._feature_names].values

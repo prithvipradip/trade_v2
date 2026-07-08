@@ -117,7 +117,8 @@ TIERS = {
         stop_loss_pct=0.35,
         profit_target_pct=0.50,
         max_underlying_price=700.0,
-        preferred_underlyings=["SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "NVDA", "AMD"],
+        preferred_underlyings=["SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "NVDA", "AMD",
+                               "GLD", "TLT", "XLE"],  # deep-audit SR-H2: tier filter was silently deleting the R2.10 diversifiers
     ),
     CapitalTier.LARGE: TierConfig(
         tier=CapitalTier.LARGE,
@@ -140,6 +141,7 @@ TIERS = {
         preferred_underlyings=[
             "SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT",
             "NVDA", "TSLA", "AMD", "AMZN", "META", "GOOGL",
+            "GLD", "TLT", "XLE",  # deep-audit SR-H2
         ],
     ),
 }

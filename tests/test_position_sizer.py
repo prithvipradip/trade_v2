@@ -274,8 +274,10 @@ class TestStrategyRiskMultipliers:
 class TestFloorAndCap:
     """Test floor of 1 contract, cap scales with account size."""
 
-    def test_floor_of_1(self, sizer: PositionSizer) -> None:
-        """Even with tiny account, should get at least 1 contract."""
+    def test_unaffordable_contract_returns_zero(self, sizer: PositionSizer) -> None:
+        """Deep-audit SR-M4: a $5,000 contract on a $1,000 account must NOT
+        be forced to 1 contract (500% of account) — the old floor silently
+        blew max_position_pct. Zero is the correct answer."""
         result = sizer.calculate(
             account_value=1_000,
             option_price=50.0,  # $5000/contract > account
@@ -284,7 +286,8 @@ class TestFloorAndCap:
             strategy="iron_condor",
             underlying_price=450.0,
         )
-        assert result.contracts == 1
+        assert result.contracts == 0
+        assert "exceeds" in result.reason
 
     def test_cap_scales_with_account(self, sizer: PositionSizer) -> None:
         """Cap should scale with account size (1 per $10k)."""

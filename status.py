@@ -136,7 +136,7 @@ def get_status() -> dict:
                 "WHERE t.status NOT IN ('closed') ORDER BY t.entry_time DESC").fetchall()
         out["open_positions"] = [
             {"symbol": r["symbol"], "strategy": r["strategy"], "status": r["status"],
-             "entry": r["entry_price"], "since": r["entry_time"][:16],
+             "entry": r["entry_price"], "since": (r["entry_time"] or "")[:16],
              "unrealized": round(r["unrealized_pnl"] or 0.0, 2),
              "pnl_pct": round((r["pnl_pct"] or 0.0) * 100, 1),
              "marked": (r["mark_time"] or "")[:16]}

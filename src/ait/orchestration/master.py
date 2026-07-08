@@ -84,7 +84,9 @@ def _alert(message: str) -> None:
             f"https://api.telegram.org/bot{token}/sendMessage", data=data)
         urllib.request.urlopen(req, timeout=10)
     except Exception as e:  # noqa: BLE001
-        _log("warn", "alert_send_failed", error=str(e))
+        import re as _re
+        _log("warn", "alert_send_failed",
+             error=_re.sub(r"/bot[^/\s]+", "/bot***", str(e))[:300])  # never leak the token via exception URLs
 
 
 def _gateway_listening(port: int, host: str = "127.0.0.1") -> bool:
@@ -341,7 +343,11 @@ class WebServiceManager:
         self._dashboard_proc = subprocess.Popen(
             [sys.executable, "-m", "streamlit", "run",
              str(ROOT / "src" / "ait" / "dashboard" / "app.py"),
-             "--server.port=8501", "--server.headless=true"],
+             "--server.port=8501", "--server.headless=true",
+             # localhost ONLY (deep-audit S2): streamlit's default binds all
+             # interfaces, LAN-exposing the P&L dashboard with no auth.
+             "--server.address=127.0.0.1",
+             "--browser.gatherUsageStats=false"],
             cwd=str(ROOT),
             stdout=self._dashboard_log,
             stderr=subprocess.STDOUT,
@@ -579,14 +585,24 @@ sys.path.insert(0, 'src')
 from ait.monitoring.analytics import TradeAnalytics
 
 analytics = TradeAnalytics()
-metrics = analytics.get_performance_metrics()
-print(json.dumps(metrics, indent=2, default=str))
+metrics = analytics.get_performance(days=1)
+print(json.dumps(metrics.__dict__ if hasattr(metrics, '__dict__') else metrics, indent=2, default=str))
 """],
             cwd=str(ROOT),
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=120,
         )
+
+        # Deep-audit C1: this called a method that never existed
+        # (get_performance_metrics), wrote the empty stdout, and logged
+        # success — the 4:30 report has been an empty file since day one.
+        # Gate on the child actually succeeding.
+        if result.returncode != 0 or not result.stdout.strip():
+            _log("error", "daily_report_child_failed",
+                 returncode=result.returncode,
+                 stderr=(result.stderr or "")[:400])
+            return
 
         ts = datetime.now().strftime("%Y%m%d")
         report_path = REPORTS_DIR / f"daily_{ts}.json"
@@ -610,7 +626,17 @@ def cleanup_old_logs():
     removed = 0
     for d in [LOGS_DIR, REPORTS_DIR]:
         for f in d.iterdir():
-            if not f.is_file() or f.name == "orchestrator.log":
+            if not f.is_file():
+                continue
+            if f.name == "orchestrator.log":
+                # Deep-audit OPS-R1: exempt from deletion but NOT from a size
+                # cap — it grew unbounded (heartbeat line every 2 min).
+                try:
+                    if f.stat().st_size > 20 * 1024 * 1024:
+                        f.rename(f.with_suffix(".log.1"))
+                        removed += 1
+                except Exception:
+                    pass
                 continue
             try:
                 # Rotated stdout backups: keep only the configured count
@@ -674,7 +700,14 @@ def main():
 
     bot = BotManager()
     web = WebServiceManager()
-    scheduler = BlockingScheduler(timezone="US/Eastern")
+    # Deep-audit OPS-C2: default misfire_grace_time is 1 SECOND — on this
+    # frequently-restarted box the 7:30 retrain / 16:30 report / Sunday
+    # backtest were silently dropped whenever the process was down or busy
+    # across the cron second. Give jobs an hour of grace and coalesce.
+    scheduler = BlockingScheduler(
+        timezone="US/Eastern",
+        job_defaults={"misfire_grace_time": 3600, "coalesce": True},
+    )
     shutdown = Event()
 
     def graceful_shutdown(signum, frame):

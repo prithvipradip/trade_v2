@@ -14,6 +14,17 @@ import pandas as pd
 
 from ait.utils.logging import get_logger
 
+def _safe_vol(v) -> int:
+    """int() that treats NaN/None/negative sentinel volume as 0."""
+    try:
+        f = float(v)
+        if f != f or f < 0:  # NaN or IB's -1 sentinel
+            return 0
+        return int(f)
+    except (TypeError, ValueError):
+        return 0
+
+
 log = get_logger("data.historical")
 
 DB_PATH = Path("data/historical.db")
@@ -130,14 +141,23 @@ class HistoricalDataStore:
                 float(row.get("High", 0)),
                 float(row.get("Low", 0)),
                 float(row.get("Close", 0)),
-                int(row.get("Volume", 0)),
+                _safe_vol(row.get("Volume", 0)),  # int(NaN) aborted the whole batch (deep-audit DATA-L10)
             ))
 
         with sqlite3.connect(self._db_path) as conn:
+            # Deep-audit DATA-H2: INSERT OR REPLACE deletes the whole
+            # conflicting row — including implied_vol, which this statement
+            # doesn't carry — so the daily retrain's save() nulled every IV
+            # the backfill had written, silently killing the IV/IV-rank
+            # features. Upsert only the OHLCV columns instead.
             conn.executemany(
-                f"""INSERT OR REPLACE INTO {self._daily_table}
+                f"""INSERT INTO {self._daily_table}
                    (symbol, date, open, high, low, close, volume)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(symbol, date) DO UPDATE SET
+                     open=excluded.open, high=excluded.high,
+                     low=excluded.low, close=excluded.close,
+                     volume=excluded.volume""",
                 rows,
             )
 
@@ -292,7 +312,7 @@ class HistoricalDataStore:
                 float(row.get("High",   0.0)),
                 float(row.get("Low",    0.0)),
                 float(row.get("Close",  0.0)),
-                int(row.get("Volume", 0)),
+                _safe_vol(row.get("Volume", 0)),  # int(NaN) aborted the whole batch (deep-audit DATA-L10)
             ))
 
         with sqlite3.connect(self._db_path) as conn:

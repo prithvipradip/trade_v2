@@ -392,6 +392,19 @@ class TradingOrchestrator:
             except Exception:  # noqa: BLE001
                 pass
 
+            # Deep-audit SR-H1: the PDT guard was fully built but NOTHING
+            # ever called record_day_trade — it always reported 0/3 used.
+            # A same-ET-day open+close is a day trade; record it.
+            try:
+                _t = self._find_trade_by_id(trade_id)
+                if _t and _t.entry_time:
+                    from ait.utils.time import now_et as _now_et
+                    _entry_d = datetime.fromisoformat(_t.entry_time).date()
+                    if _entry_d == _now_et().date():
+                        self._pdt_guard.record_day_trade(_t.symbol)
+            except Exception as _e:  # noqa: BLE001
+                log.debug("pdt_record_failed", error=str(_e))
+
             trade = self._find_trade_by_id(trade_id)
             if trade:
                 self._thompson.record_outcome(
@@ -399,11 +412,15 @@ class TradingOrchestrator:
                     won=realized_pnl > 0,
                     pnl=realized_pnl,
                 )
-                actual_dir = "bullish" if realized_pnl > 0 else "bearish"
-                self._trainer.drift_detector.record_outcome(
-                    trade_id=trade_id,
-                    actual_direction=actual_dir,
-                )
+                # Deep-audit BC-L2: deriving direction from P&L sign is
+                # meaningless for market-neutral strategies (a strangle win
+                # is NOT "bullish") and poisons drift accuracy tracking.
+                if trade.strategy not in ("iron_condor", "short_strangle"):
+                    actual_dir = "bullish" if realized_pnl > 0 else "bearish"
+                    self._trainer.drift_detector.record_outcome(
+                        trade_id=trade_id,
+                        actual_direction=actual_dir,
+                    )
 
             msg = (
                 f"EXIT FILLED: {trade.symbol if trade else trade_id}\n"
@@ -461,7 +478,14 @@ class TradingOrchestrator:
                 self._edgar_check_count = 0
                 await self._check_material_events()
         except Exception as e:
-            log.debug("fast_monitor_error", error=str(e))
+            # Deep-audit BC-H1: this was log.debug — the 30s stop/TP engine
+            # could silently no-op for HOURS with a green heartbeat. Surface
+            # loudly and feed the watchdog error counter.
+            log.warning("fast_monitor_error", error=str(e))
+            try:
+                self._watchdog.record_error("trading_loop", f"fast_monitor: {e}")
+            except Exception:
+                pass
 
     async def _check_material_events(self) -> None:
         """Check for new SEC 8-K filings; flatten any held positions on the symbol."""
@@ -1213,8 +1237,15 @@ class TradingOrchestrator:
             return True  # whole-bot pause — not a per-signal reject
 
         # First hour requires higher confidence (only take the best setups)
-        hour_min = dt.now().hour + dt.now().minute / 60.0
-        if hour_min < 10.5 and confidence < 0.85:
+        from ait.utils.time import now_et
+        _et = now_et()
+        hour_min = _et.hour + _et.minute / 60.0
+        # Deep-audit BC-M2: neutral strategies carry RANGE probability as
+        # confidence (~0.65-0.75 scale) — requiring 0.85 structurally banned
+        # iron condors for the whole first hour. Gate directional signals
+        # only. (Also ET-pinned per BC-M3.)
+        _neutral = signal.strategy_name in ("iron_condor", "short_strangle")
+        if hour_min < 10.5 and not _neutral and confidence < 0.85:
             log.info("first_hour_confidence_gate",
                      symbol=signal.symbol, confidence=f"{confidence:.2f}",
                      required=0.85)
@@ -1576,12 +1607,18 @@ class TradingOrchestrator:
             new_qty = trade.quantity - qty_to_close
             self._state.update_trade_quantity(pos.trade_id, new_qty)
 
-            # Update daily stats with realized portion
+            # Update daily stats with realized portion. Deep-audit BC-H3:
+            # do NOT bump trades_won here — the final close books the win/
+            # loss; counting the partial too made trades_won exceed
+            # trades_taken. DO feed the circuit breaker's daily P&L, which
+            # previously never saw partial-exit money.
             stats = self._state.get_daily_stats()
             stats.total_pnl += partial_pnl
-            if partial_pnl > 0:
-                stats.trades_won += 1
             self._state.update_daily_stats(stats)
+            try:
+                self._circuit_breaker.record_partial_pnl(partial_pnl)
+            except Exception:
+                pass
 
             msg = (
                 f"PARTIAL EXIT: {trade.symbol} {trade.strategy}\n"

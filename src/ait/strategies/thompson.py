@@ -191,7 +191,13 @@ class ThompsonSampler:
                 "total_pnl": arm.total_pnl,
             }
         try:
-            STATE_FILE.write_text(json.dumps(data, indent=2))
+            # Atomic write (deep-audit SR-M7): in-place write_text truncates
+            # first — a kill mid-write corrupts the JSON and _load_state then
+            # silently resets the whole bandit to uniform priors.
+            _tmp = STATE_FILE.with_suffix(".json.tmp")
+            _tmp.write_text(json.dumps(data, indent=2))
+            import os as _os
+            _os.replace(_tmp, STATE_FILE)
         except Exception as e:
             log.warning("thompson_save_failed", error=str(e))
 
