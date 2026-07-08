@@ -31,11 +31,14 @@ def _tail_lines(path: Path, n: int = 4000) -> list[str]:
 
 def _proc_running() -> tuple[bool, int]:
     try:
+        # A11 (deep-audit): wmic is deprecated/removed on newer Windows.
         out = subprocess.run(
-            ["wmic", "process", "where", "name='python.exe'", "get", "commandline"],
-            capture_output=True, text=True, timeout=10).stdout
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" "
+             "| Select-Object -ExpandProperty CommandLine"],
+            capture_output=True, text=True, timeout=15).stdout
         orch = len(re.findall(r"run_orchestrator\.py", out))
-        bot = len(re.findall(r"ait\.main", out))
+        bot = len(re.findall(r"-m ait\.main", out))
         return (orch >= 1 and bot >= 1), orch + bot
     except Exception:
         return False, 0

@@ -114,6 +114,19 @@ class CounterfactualTracker:
             current_price = price_lookup.get(trade.symbol)
             if current_price is None or current_price <= 0:
                 continue
+            if not trade.entry_price or trade.entry_price <= 0:
+                trade.outcome_checked = True  # unevaluable -- do not retry forever
+                continue
+            # Min-age guard (deep-audit VL): skips evaluated minutes after
+            # the skip always scored ~0% move = "correct skip", inflating
+            # filter_accuracy. Wait at least 1 full day before judging.
+            try:
+                from datetime import datetime as _dt
+                _age_h = (_dt.now() - _dt.fromisoformat(trade.timestamp)).total_seconds() / 3600
+                if _age_h < 24:
+                    continue
+            except (ValueError, TypeError):
+                pass
 
             # Simple model: would the direction have been correct?
             price_change_pct = (current_price - trade.entry_price) / trade.entry_price

@@ -25,8 +25,16 @@ class TTLCache:
             return None
         expiry, value = entry
         if time.time() > expiry:
-            del self._store[key]
+            self._store.pop(key, None)  # pop: expiry race must not KeyError
             return None
+        # A11/L9: hand back a COPY of pandas objects — cached DataFrames were
+        # returned by reference, so any consumer mutating one (adding a
+        # column, sorting) silently poisoned every other consumer's view.
+        if type(value).__module__.startswith("pandas"):
+            try:
+                return value.copy()
+            except Exception:  # noqa: BLE001
+                return value
         return value
 
     def set(self, key: str, value: Any, ttl: int | None = None) -> None:

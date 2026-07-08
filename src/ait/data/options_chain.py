@@ -503,13 +503,20 @@ class OptionsChainService:
         r = 0.05  # Risk-free rate approximation
         t = max(chain.dte / 365.0, 0.001)  # Time to expiry in years
 
+        # A6 (deep-audit DATA-M6 residual): when a contract lacks IV, use the
+        # chain's MEDIAN observed IV instead of a flat 30% — a wrong sigma
+        # shifts the computed delta, and strategies pick strikes BY delta.
+        _ivs = sorted(c.implied_vol for grp in (chain.calls, chain.puts)
+                      for c in grp if c.implied_vol and c.implied_vol > 0)
+        _chain_iv = _ivs[len(_ivs) // 2] if _ivs else 0.30
+
         for contracts in (chain.calls, chain.puts):
             for c in contracts:
                 if c.delta != 0:
                     continue  # Already has Greeks (from IBKR)
 
                 flag = "c" if c.right == "C" else "p"
-                sigma = c.implied_vol if c.implied_vol > 0 else 0.30  # Default 30% vol
+                sigma = c.implied_vol if c.implied_vol > 0 else _chain_iv
 
                 try:
                     c.delta = delta(flag, S, c.strike, t, r, sigma)

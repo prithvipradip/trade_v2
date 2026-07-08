@@ -7,7 +7,7 @@ cd /d C:\Users\prith\Documents\Git\agent_trade\trade_v2
 set PYTHONIOENCODING=utf-8
 
 REM Guard: bail if a run_orchestrator.py is already running.
-wmic process where "name='python.exe' and commandline like '%%run_orchestrator.py%%'" get processid 2>nul | findstr /r "[0-9]" >nul
+powershell -NoProfile -Command "if (Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -match 'run_orchestrator' }) { exit 0 } else { exit 1 }"
 if %errorlevel%==0 (
     echo [autostart] orchestrator already running, skipping. >> logs\autostart.log
     exit /b 0

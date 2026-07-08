@@ -183,7 +183,7 @@ class PortfolioManager:
 
     async def _evaluate_position(
         self, trade: TradeRecord, option_marks: dict[tuple, float] | None = None
-    ) -> PositionStatus | None:
+    , persist: bool = True) -> PositionStatus | None:
         """Evaluate a single position for exit conditions."""
         current_price = await self._market_data.get_current_price(trade.symbol)
         if current_price is None:
@@ -233,7 +233,7 @@ class PortfolioManager:
             # whole stretch (data slot stolen, farm outage) — a short-vol
             # book riding a selloff unmanaged. Alert ONCE per outage.
             # (getattr-guarded: some tests construct via __new__.)
-            streaks = getattr(self, "_marks_missing_streak", None)
+            streaks = getattr(self, "_marks_missing_streak", None) if persist else None
             notify = getattr(self, "_notify_cb", None)
             if streaks is not None:
                 streak = streaks.get(trade.trade_id, 0) + 1
@@ -268,7 +268,7 @@ class PortfolioManager:
         # accurate (but never let a marks-missing 0.0 touch it)
         prev_hwm = self._state.get_high_water_mark(trade.trade_id)
         hwm = max(prev_hwm, pnl_pct)
-        if not marks_missing:
+        if not marks_missing and persist:
             self._state.update_high_water_mark(trade.trade_id, hwm)
             # Persist the live mark so status/dashboard show real per-position
             # unrealized P&L (guarded: a marks-missing tick must never
@@ -418,7 +418,7 @@ class PortfolioManager:
                     # (audit R2/H3). Alert once per trade so the human can
                     # decide to close manually. (getattr-guarded for tests
                     # constructing via __new__.)
-                    _pdt_seen = getattr(self, "_pdt_alerted", None)
+                    _pdt_seen = getattr(self, "_pdt_alerted", None) if persist else None
                     _notify = getattr(self, "_notify_cb", None)
                     if _pdt_seen is not None and trade.trade_id not in _pdt_seen and _notify:
                         _pdt_seen.add(trade.trade_id)
@@ -588,7 +588,10 @@ class PortfolioManager:
         for trade in open_trades:
             if trade.status not in (TradeStatus.FILLED, TradeStatus.PARTIAL):
                 continue
-            status = await self._evaluate_position(trade)
+            # A4 (deep-audit MP-F5): the SUMMARY is a report — it must not
+            # advance HWM, marks, missing-streaks, or fire alerts (the EOD
+            # call was mutating protection state on stale after-hours marks).
+            status = await self._evaluate_position(trade, persist=False)
             if status:
                 total_unrealized += status.unrealized_pnl
                 positions.append({

@@ -92,6 +92,10 @@ class StrategyAdaptor:
         """
         adaptations: list[Adaptation] = []
         applied = 0
+        # Deep-audit VL: three insights mapping to the SAME parameter used to
+        # compound within one cycle (stop 0.50->0.43->0.36->0.31 in a single
+        # pass). One adaptation per parameter per cycle.
+        _touched_params: set[str] = set()
 
         for insight in insights:
             if applied >= self._limits.max_adaptations_per_cycle:
@@ -100,7 +104,12 @@ class StrategyAdaptor:
                 continue
 
             adaptation = self._process_insight(insight)
+            if adaptation and adaptation.parameter in _touched_params:
+                log.info("adaptation_skipped_same_param_this_cycle",
+                         parameter=adaptation.parameter)
+                continue
             if adaptation:
+                _touched_params.add(adaptation.parameter)
                 adaptations.append(adaptation)
                 applied += 1
                 log.info(

@@ -2145,9 +2145,32 @@ class TradingOrchestrator:
         return max(0, min(100, iv_rank))
 
     async def _send_notification(self, message: str) -> None:
-        """Send notification via configured channel."""
-        if self._notify:
+        """Send notification via configured channel.
+
+        A11 (deep-audit OPS-M3): the send used to be awaited INLINE in the
+        trading loop -- a slow/hung Telegram POST delayed fill-checks and
+        exits by up to its 10s timeout, and a failed send was dropped with
+        one log line. Now fire-and-forget with 3 attempts + backoff; the
+        loop never waits on the network.
+        """
+        if not self._notify:
+            return
+
+        async def _send_with_retry(msg: str) -> None:
+            for attempt in range(3):
+                try:
+                    await self._notify(msg)
+                    return
+                except Exception as e:  # noqa: BLE001
+                    log.warning("notification_attempt_failed",
+                                attempt=attempt + 1, error=str(e)[:200])
+                    await asyncio.sleep(2 * (attempt + 1))
+            log.error("notification_dropped_after_retries", preview=msg[:80])
+
+        try:
+            asyncio.get_running_loop().create_task(_send_with_retry(message))
+        except RuntimeError:  # no loop (sync/test context) -- best-effort inline
             try:
                 await self._notify(message)
-            except Exception as e:
-                log.warning("notification_failed", error=str(e))
+            except Exception as e:  # noqa: BLE001
+                log.warning("notification_failed", error=str(e)[:200])

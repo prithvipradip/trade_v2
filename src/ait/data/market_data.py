@@ -451,7 +451,11 @@ class MarketDataService:
                         ask=ask if ask > 0 else 0.0,
                         last=last if last > 0 else 0.0,
                         volume=volume,
-                        timestamp=datetime.now(),
+                        # A2 (deep-audit DATA-M4): exchange tick time when
+                        # available — wall-clock stamps made staleness
+                        # detection blind (frozen quotes always looked fresh).
+                        timestamp=(ticker.time.replace(tzinfo=None)
+                                   if getattr(ticker, "time", None) else datetime.now()),
                     )
         except Exception as e:
             log.debug("ibkr_quote_failed", symbol=symbol, error=str(e))

@@ -15,7 +15,9 @@ set PY="C:\Users\prith\AppData\Local\Programs\Python\Python313\python.exe"
 
 :loop
 REM Is an orchestrator process alive?
-wmic process where "name='python.exe' and commandline like '%%run_orchestrator.py%%'" get processid 2>nul | findstr /r "[0-9]" >nul
+REM A11 (deep-audit): wmic is deprecated/removed on newer Windows -- its
+REM disappearance would have silently broken the keeper AND the dup-guard.
+powershell -NoProfile -Command "if (Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -match 'run_orchestrator' }) { exit 0 } else { exit 1 }"
 if errorlevel 1 (
     echo [keeper] %date% %time% orchestrator DOWN - relaunching >> logs\keeper.log
     start "" /min %PY% run_orchestrator.py

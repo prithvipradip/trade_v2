@@ -151,8 +151,17 @@ class ModelTrainer:
         self._last_train_date = date.today()
         self._drift_detector.acknowledge_retrain()
 
-        # Auto-rollback: if new model is significantly worse, revert
+        # Auto-rollback: if new model is significantly worse, revert.
+        # A8 (deep-audit ML-F9): predictor.cv_scores held only the LAST
+        # symbol trained -- the decision now uses the MEAN accuracy across
+        # every symbol trained this run (results maps symbol -> accuracy).
         if prev_scores and results:
+            try:
+                _vals = [v for v in results.values() if isinstance(v, (int, float))]
+                if _vals:
+                    self._predictor.cv_scores = {"all_symbol_mean": sum(_vals) / len(_vals)}
+            except Exception:  # noqa: BLE001
+                pass
             new_scores = self._predictor.cv_scores
             if self._should_rollback(prev_scores, new_scores):
                 log.warning(

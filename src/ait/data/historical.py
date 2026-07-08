@@ -85,6 +85,7 @@ class HistoricalDataStore:
                     low      REAL,
                     close    REAL,
                     volume   INTEGER,
+                    source   TEXT DEFAULT '',
                     PRIMARY KEY (symbol, datetime, interval)
                 )
             """)
@@ -293,6 +294,7 @@ class HistoricalDataStore:
         symbol: str,
         df: pd.DataFrame,
         interval: str = "5m",
+        source: str = "TRADES",
     ) -> int:
         """Upsert 5-min bars into intraday table. Returns rows inserted/replaced."""
         if df is None or df.empty:
@@ -313,13 +315,19 @@ class HistoricalDataStore:
                 float(row.get("Low",    0.0)),
                 float(row.get("Close",  0.0)),
                 _safe_vol(row.get("Volume", 0)),  # int(NaN) aborted the whole batch (deep-audit DATA-L10)
+                source,  # A9: bar semantics tag (TRADES vs MIDPOINT vs YAHOO_ADJ)
             ))
 
         with sqlite3.connect(self._db_path) as conn:
+            # Guarded migration for pre-existing DBs (duplicate-add raises)
+            try:
+                conn.execute(f"ALTER TABLE {self._intraday_table} ADD COLUMN source TEXT DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
             conn.executemany(
                 f"""INSERT OR REPLACE INTO {self._intraday_table}
-                   (symbol, datetime, interval, open, high, low, close, volume)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (symbol, datetime, interval, open, high, low, close, volume, source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 rows,
             )
 
@@ -431,6 +439,16 @@ class HistoricalDataStore:
         )
         daily.index = pd.to_datetime(daily.index)
         daily.index.name = "Date"
+        # A9 (deep-audit DATA-M8): drop TODAY's partial session — a half-day
+        # bar (partial High/Low/Volume, mid-session Close) fed live features
+        # a bar shape the models never saw in training (train/serve skew).
+        try:
+            from ait.utils.time import now_et
+            _today = pd.Timestamp(now_et().date())
+            if len(daily) and daily.index[-1] >= _today:
+                daily = daily[daily.index < _today]
+        except Exception:  # noqa: BLE001
+            pass
         log.debug("resampled_to_daily", symbol=symbol, rows=len(daily))
         return daily
 

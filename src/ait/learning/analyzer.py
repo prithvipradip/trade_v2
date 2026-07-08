@@ -593,4 +593,15 @@ class TradeAnalyzer:
                 (since,),
             ).fetchall()
 
-        return [dict(r) for r in rows]
+        # NULL choke point (deep-audit VL): one NULL realized_pnl or
+        # ml_confidence used to TypeError deep inside an analysis and abort
+        # the whole learning cycle. Coerce numeric fields once, here.
+        out = []
+        for r in rows:
+            d = dict(r)
+            for k in ("realized_pnl", "ml_confidence", "entry_price",
+                      "exit_price", "quantity"):
+                if d.get(k) is None:
+                    d[k] = 0.0 if k != "quantity" else 0
+            out.append(d)
+        return out

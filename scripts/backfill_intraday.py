@@ -159,7 +159,7 @@ async def _backfill_symbol(
         df.set_index("Datetime", inplace=True)
         df = df[["Open", "High", "Low", "Close", "Volume"]]
 
-        stored = store.save_intraday(symbol, df, interval="5m")
+        stored = store.save_intraday(symbol, df, interval="5m", source="TRADES")  # A9: tag bar semantics
         total_stored += stored
         print(f" → {len(df)} bars fetched, {stored} rows upserted")
 

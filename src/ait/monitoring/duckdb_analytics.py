@@ -64,8 +64,11 @@ class DuckDBAnalytics:
         self._db_path = db_path
         self._init_schema()
 
-    def _get_conn(self) -> duckdb.DuckDBPyConnection:
-        return duckdb.connect(str(self._db_path))
+    def _get_conn(self, read_only: bool = False) -> duckdb.DuckDBPyConnection:
+        # A11 (deep-audit OPS-R3): DuckDB is single-writer -- read paths
+        # (dashboard/report/learning) opening read-write collided with the
+        # bot's close-time ingest. Readers pass read_only=True.
+        return duckdb.connect(str(self._db_path), read_only=read_only)
 
     def _init_schema(self) -> None:
         with self._get_conn() as conn:
@@ -231,7 +234,7 @@ class DuckDBAnalytics:
         """Compute comprehensive performance metrics using DuckDB."""
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
 
-        with self._get_conn() as conn:
+        with self._get_conn(read_only=True) as conn:
             rows = conn.execute("""
                 SELECT realized_pnl, entry_time, exit_time
                 FROM trades
@@ -324,7 +327,7 @@ class DuckDBAnalytics:
         """Get daily P&L with cumulative running total — uses DuckDB window function."""
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
 
-        with self._get_conn() as conn:
+        with self._get_conn(read_only=True) as conn:
             rows = conn.execute("""
                 SELECT
                     date,
@@ -354,7 +357,7 @@ class DuckDBAnalytics:
         """Strategy performance breakdown — single DuckDB query."""
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
 
-        with self._get_conn() as conn:
+        with self._get_conn(read_only=True) as conn:
             rows = conn.execute("""
                 SELECT
                     strategy,
@@ -384,7 +387,7 @@ class DuckDBAnalytics:
         """Symbol performance breakdown."""
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
 
-        with self._get_conn() as conn:
+        with self._get_conn(read_only=True) as conn:
             rows = conn.execute("""
                 SELECT
                     symbol,
@@ -407,7 +410,7 @@ class DuckDBAnalytics:
         """Performance breakdown by market regime — new analytics not in SQLite."""
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
 
-        with self._get_conn() as conn:
+        with self._get_conn(read_only=True) as conn:
             rows = conn.execute("""
                 SELECT
                     t.market_regime AS regime,
@@ -435,7 +438,7 @@ class DuckDBAnalytics:
         """Strategy x Regime performance matrix — which strategies work in which regimes."""
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
 
-        with self._get_conn() as conn:
+        with self._get_conn(read_only=True) as conn:
             rows = conn.execute("""
                 SELECT
                     strategy,
@@ -459,7 +462,7 @@ class DuckDBAnalytics:
         """Win rate by hour of day — find bad trading hours."""
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
 
-        with self._get_conn() as conn:
+        with self._get_conn(read_only=True) as conn:
             rows = conn.execute("""
                 SELECT
                     EXTRACT(HOUR FROM entry_time) AS hour,
@@ -481,7 +484,7 @@ class DuckDBAnalytics:
         """Rolling Sharpe ratio over time — uses DuckDB window functions."""
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
 
-        with self._get_conn() as conn:
+        with self._get_conn(read_only=True) as conn:
             rows = conn.execute("""
                 WITH daily_returns AS (
                     SELECT date, total_pnl
@@ -517,7 +520,7 @@ class DuckDBAnalytics:
         """Analyze profit capture efficiency per strategy."""
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
 
-        with self._get_conn() as conn:
+        with self._get_conn(read_only=True) as conn:
             rows = conn.execute("""
                 SELECT
                     strategy,
@@ -540,7 +543,7 @@ class DuckDBAnalytics:
         """Analyze win rate by ML confidence bands."""
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
 
-        with self._get_conn() as conn:
+        with self._get_conn(read_only=True) as conn:
             rows = conn.execute("""
                 SELECT
                     CASE
@@ -569,7 +572,7 @@ class DuckDBAnalytics:
         """Analyze strategy performance across IV rank quintiles."""
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
 
-        with self._get_conn() as conn:
+        with self._get_conn(read_only=True) as conn:
             rows = conn.execute("""
                 SELECT
                     t.strategy,
@@ -598,7 +601,7 @@ class DuckDBAnalytics:
 
     def get_trade_count(self) -> int:
         """Get total number of trades in DuckDB."""
-        with self._get_conn() as conn:
+        with self._get_conn(read_only=True) as conn:
             result = conn.execute("SELECT COUNT(*) FROM trades").fetchone()
         return result[0] if result else 0
 
@@ -722,7 +725,7 @@ class DuckDBAnalytics:
 
     def get_equity_stats(self, symbol: str, table: str = "equity_stats") -> dict | None:
         """Return latest fundamental snapshot for one symbol, or None."""
-        with self._get_conn() as conn:
+        with self._get_conn(read_only=True) as conn:
             row = conn.execute(
                 f"SELECT * FROM {table} WHERE symbol = ?", [symbol]
             ).fetchone()
@@ -732,7 +735,7 @@ class DuckDBAnalytics:
 
     def get_all_equity_stats(self, table: str = "equity_stats") -> list[dict]:
         """Return all equity stats rows (for dashboard display)."""
-        with self._get_conn() as conn:
+        with self._get_conn(read_only=True) as conn:
             rows = conn.execute(
                 f"SELECT * FROM {table} ORDER BY symbol"
             ).fetchall()

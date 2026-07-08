@@ -261,6 +261,7 @@ class RangePredictor:
                 _ms_garch_state = getattr(self, "_ms_garch_state", None)
                 _ou_jump_state = getattr(self, "_ou_jump_state", None)
                 self._symbol_models[symbol] = {
+                    "fitted_at": __import__("datetime").date.today().isoformat(),  # A7
                     "models": copy.deepcopy(self._models),
                     "scaler": copy.deepcopy(self._scaler),
                     "feature_names": list(self._feature_names),
@@ -649,8 +650,25 @@ class RangePredictor:
             except Exception:
                 continue
 
+        # A7 (deep-audit ML-F6): the parametric members (GARCH/MS-GARCH/OU)
+        # are FROZEN at fit time -- they never see the prediction-day close.
+        # Daily-retrained states are fine; served past the retrain interval
+        # their contribution is a stale constant diluting the live XGB/LGBM
+        # signal, so skip them.
+        _stale_parametric = False
+        try:
+            from datetime import date as _date
+            _fit = (sym_data or {}).get("fitted_at")
+            if _fit:
+                _age = (_date.today() - _date.fromisoformat(_fit)).days
+                _stale_parametric = _age > 7
+        except Exception:  # noqa: BLE001
+            pass
+
         # GARCH ensemble contribution
         garch_state = (sym_data or {}).get("garch_state") or getattr(self, "_garch_state", None)
+        if garch_state and _stale_parametric:
+            garch_state = None
         if garch_state:
             w_garch = _weight("garch", 0.5)
             if w_garch > 0:
@@ -664,6 +682,8 @@ class RangePredictor:
 
         # MS-GARCH ensemble contribution
         ms_garch_state = (sym_data or {}).get("ms_garch_state") or getattr(self, "_ms_garch_state", None)
+        if ms_garch_state and _stale_parametric:
+            ms_garch_state = None
         if ms_garch_state:
             w_ms = _weight("msgarch", 0.5)
             if w_ms > 0:
@@ -677,6 +697,8 @@ class RangePredictor:
 
         # OU-Kou-GARCH ensemble contribution
         ou_jump_state = (sym_data or {}).get("ou_jump_state") or getattr(self, "_ou_jump_state", None)
+        if ou_jump_state and _stale_parametric:
+            ou_jump_state = None
         if ou_jump_state:
             w_ou = _weight("oujump", 0.5)
             if w_ou > 0:

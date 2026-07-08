@@ -163,9 +163,23 @@ class EconomicCalendar:
         self._events = _ALL_EVENTS
         self._event_dates = _EVENT_DATES
 
+    _exhausted_warned = False
+
     def is_event_day(self, check_date: date | None = None) -> bool:
         """Return True if the given date has a major economic release."""
         check_date = check_date or date.today()
+        # A10 (deep-audit DATA-L13): the calendar is HARDCODED for 2026.
+        # Past its horizon every macro guard silently returns False -- the
+        # bot would hold short premium through the first 2027 FOMC with no
+        # protection and no warning. Scream (once) when exhausted.
+        if check_date.year > 2026 and not EconomicCalendar._exhausted_warned:
+            EconomicCalendar._exhausted_warned = True
+            log.critical(
+                "economic_calendar_exhausted",
+                year=check_date.year,
+                msg="hardcoded 2026 calendar has no data for this year -- "
+                    "macro-event guards are BLIND. Update _FOMC/_CPI/_NFP tables.",
+            )
         return check_date in self._event_dates
 
     def is_pre_event_day(self, check_date: date | None = None) -> bool:

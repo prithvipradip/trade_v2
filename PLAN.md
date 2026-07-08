@@ -88,6 +88,21 @@ FIXED (commit refs this batch):
 | ops | web_logs + streamlit dashboards bound to 127.0.0.1 (were LAN-exposed, no auth); daily report called a NONEXISTENT method since day one (empty file + false success) — fixed + returncode-gated; APScheduler misfire grace 1s→1h (jobs were silently dropped on restarts); orchestrator.log size-capped; Telegram token redacted from error logs; status.py None-guard |
 | backtest/offline | fix_pnl_history refuses re-run (2nd run zeroed migrated wins); run_optimizer --apply requires AIT_ALLOW_APPLY=1 (was a direct overfit→live-config pipe); engine entry commission no longer double-debited |
 
+## Round 3-A (2026-07-08 pre-dawn) — "finish everything under A": all remaining code items DONE
+A1 MTM daily-loss brake (30s tick, realized + unrealized-vs-SOD, same breaker, alert once);
+A2 exchange-time quote timestamps (staleness detection un-blinded); A3 remaining ET-pinning
+(budget tiers, daily-stats bucketing incl. StateManager default); A4 get_portfolio_summary
+read-only (persist=False — no HWM/marks/streak/alert mutation from reports); A5 watchdog
+ibkr+market_data heartbeats wired; A6 chain-median IV fallback (not flat 30%) for greeks;
+A7 stale parametric GARCH/MS/OU members skipped past retrain interval; A8 trainer rollback
+on all-symbol MEAN + adaptor one-adaptation-per-parameter + counterfactual min-age/zero-
+entry guards + analyzer NULL choke point; A9 partial-day bar excluded from live resample +
+bar-source tag column (TRADES/MIDPOINT); A10 economic-calendar exhaustion alarm (2027 bomb
+defused with a CRITICAL log); A11 Telegram off hot path w/ 3 retries + DuckDB read-only
+readers + TTLCache copy-on-get + wmic->PowerShell in keeper/autostart/status.
+A12 (open, live-only): observe the sign of a real closing-BAG avgFillPrice on the first
+debit-spread close (exit negation depends on it) — grep exit_order_filled that day.
+
 DEFERRED (Round 3 todo — larger design work, ranked):
 1. **Backtest credibility overhaul — CORE FIXED 2026-07-07 night**: sleeve-capital aggregation
    (window capital = capital x N symbols; was ~N x inflated), trade-frequency-aware
