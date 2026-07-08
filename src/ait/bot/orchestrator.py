@@ -453,6 +453,39 @@ class TradingOrchestrator:
                 await self._check_trading_enabled()
 
             positions = await self._portfolio.check_positions()
+            # A5: a successful portfolio read == IBKR is genuinely alive.
+            try:
+                self._watchdog.heartbeat("ibkr")
+            except Exception:
+                pass
+
+            # A1: mark-to-market daily-loss brake (the realized-only breaker
+            # is entry-gated and blind to unrealized gap-day bleeding).
+            # mtm_day = realized_today + (unrealized_now - unrealized_at_SOD).
+            try:
+                from ait.utils.time import now_et as _net
+                _unreal_now = sum((p.unrealized_pnl or 0.0) for p in positions)
+                _sod_key = f"mtm_sod_{_net().date().isoformat()}"
+                _sod_raw = self._state.get_state(_sod_key, "")
+                if _sod_raw == "":
+                    self._state.set_state(_sod_key, str(_unreal_now))
+                    _sod = _unreal_now
+                else:
+                    _sod = float(_sod_raw)
+                _realized_today = self._state.get_daily_stats().total_pnl
+                _mtm_day = _realized_today + (_unreal_now - _sod)
+                _nlv = await self._account.get_net_liquidation()
+                if _nlv > 0 and self._circuit_breaker.check_daily_loss_mtm(_mtm_day, _nlv):
+                    if not getattr(self, "_mtm_halt_alerted", False):
+                        self._mtm_halt_alerted = True
+                        await self._send_notification(
+                            f"DAILY MTM LOSS HALT: day P&L ${_mtm_day:,.0f} "
+                            f"(realized ${_realized_today:,.0f} + unrealized move) "
+                            f"breached the daily-loss cap. New entries blocked; "
+                            f"exits still active."
+                        )
+            except Exception as _e:  # noqa: BLE001
+                log.debug("mtm_check_failed", error=str(_e))
 
             # Skip positions already in CLOSING state (exit order already placed)
             closing_ids = {
@@ -808,6 +841,12 @@ class TradingOrchestrator:
                 reject_reason="low_confidence_directional",
             )
 
+        # A5: a successful history fetch == the market-data path is alive.
+        try:
+            self._watchdog.heartbeat("market_data")
+        except Exception:
+            pass
+
         # Market regime
         regime = self._regime_detector.analyze(hist, vix)
 
@@ -1154,12 +1193,12 @@ class TradingOrchestrator:
           - Power hour (14:00-16:00): remaining budget
         This way the bot can act on opportunities throughout the day.
         """
-        from datetime import datetime as dt
+        from ait.utils.time import now_et
         max_trades = self._settings.trading.max_daily_trades
-        daily_stats = self._state.get_daily_stats(date.today())
+        daily_stats = self._state.get_daily_stats(now_et().date())
         taken = daily_stats.trades_taken
 
-        now = dt.now()
+        now = now_et()  # ET-pinned (A3): budget tiers were wall-clock local
         hour_min = now.hour + now.minute / 60.0
 
         if hour_min < 10.5:      # 9:30-10:30 — first hour
@@ -1216,7 +1255,7 @@ class TradingOrchestrator:
         # Check trade budget (time-based pacing)
         remaining = self._get_trade_budget()
         if remaining <= 0:
-            daily_stats = self._state.get_daily_stats(date.today())
+            daily_stats = self._state.get_daily_stats(__import__('ait.utils.time', fromlist=['now_et']).now_et().date())
             log.info("trade_budget_exhausted",
                      trades_taken=daily_stats.trades_taken,
                      max=self._settings.trading.max_daily_trades,

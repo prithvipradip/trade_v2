@@ -416,7 +416,8 @@ class StateManager:
 
     def get_daily_stats(self, d: date | None = None) -> DailyStats:
         """Get daily stats for a specific date (default: today)."""
-        d = d or date.today()
+        from ait.utils.time import now_et
+        d = d or now_et().date()  # ET-pinned (A3)
         with sqlite3.connect(self._db_path) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(

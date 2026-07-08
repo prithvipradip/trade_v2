@@ -116,6 +116,27 @@ class CircuitBreaker:
                 pause_seconds=pause_seconds,
             )
 
+    def check_daily_loss_mtm(self, mtm_day_pnl: float, account_value: float) -> bool:
+        """Mark-to-market daily-loss halt (A1, deep-audit BC-M4/R2.8).
+
+        The realized-only check below is also ENTRY-GATED (evaluated only
+        inside validate_trade), so on a gap day with no new entries the 2%
+        halt was never even looked at while open positions bled unrealized.
+        This variant is called from the 30s monitor with
+        mtm_day_pnl = realized_today + (unrealized_now - unrealized_at_SOD)
+        and trips the same breaker (blocks NEW entries; exits keep working).
+        """
+        if account_value <= 0 or self._tripped:
+            return self._tripped
+        if mtm_day_pnl < 0 and abs(mtm_day_pnl) / account_value >= self._config.max_daily_loss_pct:
+            self._trip(
+                f"daily MTM loss {abs(mtm_day_pnl):.0f} >= "
+                f"{self._config.max_daily_loss_pct:.0%} of {account_value:.0f}",
+                pause_seconds=0,  # clears on daily reset, like the realized halt
+            )
+            return True
+        return False
+
     def check_daily_loss(self, account_value: float) -> bool:
         """Check if daily loss limit has been exceeded.
 
