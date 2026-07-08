@@ -120,17 +120,27 @@ def get_status() -> dict:
     if DB.exists():
         con = sqlite3.connect(DB)
         con.row_factory = sqlite3.Row
+        try:
+            rows = con.execute(
+                "SELECT t.symbol, t.strategy, t.status, t.entry_price, t.entry_time, "
+                "       op.unrealized_pnl, op.pnl_pct, op.mark_time "
+                "FROM trades t LEFT JOIN open_positions op ON op.trade_id = t.trade_id "
+                "WHERE t.status NOT IN ('closed') ORDER BY t.entry_time DESC").fetchall()
+        except sqlite3.OperationalError:
+            # Pre-migration DB (pnl_pct/mark_time added by the bot's
+            # StateManager on first start of new code) — degrade gracefully.
+            rows = con.execute(
+                "SELECT t.symbol, t.strategy, t.status, t.entry_price, t.entry_time, "
+                "       op.unrealized_pnl, 0 AS pnl_pct, '' AS mark_time "
+                "FROM trades t LEFT JOIN open_positions op ON op.trade_id = t.trade_id "
+                "WHERE t.status NOT IN ('closed') ORDER BY t.entry_time DESC").fetchall()
         out["open_positions"] = [
             {"symbol": r["symbol"], "strategy": r["strategy"], "status": r["status"],
              "entry": r["entry_price"], "since": r["entry_time"][:16],
              "unrealized": round(r["unrealized_pnl"] or 0.0, 2),
              "pnl_pct": round((r["pnl_pct"] or 0.0) * 100, 1),
              "marked": (r["mark_time"] or "")[:16]}
-            for r in con.execute(
-                "SELECT t.symbol, t.strategy, t.status, t.entry_price, t.entry_time, "
-                "       op.unrealized_pnl, op.pnl_pct, op.mark_time "
-                "FROM trades t LEFT JOIN open_positions op ON op.trade_id = t.trade_id "
-                "WHERE t.status NOT IN ('closed') ORDER BY t.entry_time DESC")
+            for r in rows
         ]
         out["unrealized_total"] = round(
             sum(p["unrealized"] for p in out["open_positions"]), 2)

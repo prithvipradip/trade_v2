@@ -76,17 +76,134 @@ class PositionReconciler:
     # all new trades on the symbol + correlated symbols.
     STALE_PENDING_MINUTES = 30
 
+    async def _underlying_last(self, symbol: str) -> float | None:
+        """Best-effort current/last price of the underlying via IBKR."""
+        try:
+            if not self._ibkr.connected:
+                return None
+            from ib_insync import Stock
+            contract = Stock(symbol, "SMART", "USD")
+            q = await self._ibkr.ib.qualifyContractsAsync(contract)
+            if not q:
+                return None
+            ticker = self._ibkr.ib.reqMktData(q[0], "", False, False)
+            try:
+                import asyncio as _aio
+                await _aio.sleep(2.0)
+                for cand in (ticker.last, ticker.close,
+                             (ticker.bid + ticker.ask) / 2 if ticker.bid and ticker.ask else None):
+                    if cand and cand == cand and cand > 0:
+                        return float(cand)
+            finally:
+                try:
+                    self._ibkr.ib.cancelMktData(q[0])
+                except Exception:
+                    pass
+        except Exception as e:  # noqa: BLE001
+            log.warning("underlying_last_failed", symbol=symbol, error=str(e))
+        return None
+
+    @staticmethod
+    def _structure_intrinsic(trade, settle_px: float) -> float | None:
+        """Per-unit intrinsic value of the trade's option structure at expiry.
+
+        Convention matches executor P&L: the returned number is the COST TO
+        SETTLE for credit structures / VALUE RECEIVED for debit structures —
+        i.e. (short intrinsics - long intrinsics) from the counterparty view
+        equals (long intrinsics - short intrinsics) from ours; we return the
+        absolute structure value with legs signed by action so both P&L
+        formulas in the caller work with the same number.
+        """
+        try:
+            legs = json.loads(trade.legs) if trade.legs else []
+        except (ValueError, TypeError):
+            legs = []
+        if not legs and getattr(trade, "strike", None):
+            right = "C" if "call" in trade.strategy else "P"
+            legs = [{"strike": trade.strike, "right": right, "action": "SELL"}]
+        if not legs:
+            return None
+        value = 0.0
+        for leg in legs:
+            try:
+                k = float(leg["strike"])
+                right = str(leg["right"]).upper()
+                action = str(leg.get("action", "SELL")).upper()
+            except (KeyError, TypeError, ValueError):
+                return None
+            intrinsic = max(0.0, settle_px - k) if right == "C" else max(0.0, k - settle_px)
+            # Long legs add value to us; short legs are what we owe.
+            value += intrinsic if action == "BUY" else -intrinsic
+        # For CREDIT structures the caller computes (credit - cost_to_close):
+        # cost_to_close = shorts owed - longs held = -value. For DEBIT:
+        # value received = value. Return the caller-appropriate magnitude.
+        from ait.strategies.base import CREDIT_STRATEGIES as _CS
+        return -value if trade.strategy in _CS else value
+
+    def _trade_leg_keys(self, trade) -> set[str]:
+        """Normalized position keys for every leg of a local trade."""
+        keys: set[str] = set()
+        try:
+            legs = json.loads(trade.legs) if trade.legs else []
+        except (ValueError, TypeError):
+            legs = []
+        for leg in legs:
+            try:
+                keys.add(self._make_position_key(
+                    symbol=trade.symbol,
+                    strike=float(leg["strike"]),
+                    right=str(leg["right"]),
+                    expiry=str(leg.get("expiry", "")),
+                ))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not keys and getattr(trade, "strike", None):
+            right = "C" if "call" in trade.strategy else "P"
+            keys.add(self._make_position_key(
+                symbol=trade.symbol, strike=trade.strike,
+                right=right, expiry=trade.expiry or "",
+            ))
+        if not keys:
+            keys.add(f"{trade.symbol}:STK")
+        return keys
+
+    def _live_ibkr_leg_keys(self) -> set[str] | None:
+        """Position keys currently live at IBKR, or None if unavailable."""
+        try:
+            if not self._ibkr.connected:
+                return None
+            live: set[str] = set()
+            for pos in self._ibkr.get_positions():
+                if pos.contract.secType == "OPT":
+                    live.add(self._make_position_key(
+                        symbol=pos.contract.symbol,
+                        strike=pos.contract.strike,
+                        right=pos.contract.right,
+                        expiry=pos.contract.lastTradeDateOrContractMonth,
+                    ))
+                else:
+                    live.add(f"{pos.contract.symbol}:STK")
+            return live
+        except Exception as e:  # noqa: BLE001
+            log.warning("live_leg_keys_failed", error=str(e))
+            return None
+
     def _sweep_stale_pending(self) -> int:
         """Close PENDING trades too old to still be live working orders.
 
-        Age-based, so RECENT pendings (awaiting a legitimate fill) are left
-        alone and still dedup correctly; only long-dead orphans are cleared.
-        Runs before the IBKR-empty mass-close guard because an unfilled order
-        opened no position — closing it as never-filled risks nothing.
+        LIVENESS-GATED (audit R2/C3): the old sweep closed any 30-min-old
+        PENDING as "never filled, $0" WITHOUT checking IBKR — front-running
+        the promotion rescue in reconcile(). A genuinely-filled order whose
+        in-memory tracker died in a restart was booked as fiction while the
+        real position lived on unmanaged. Now: if any of the trade's legs are
+        live at IBKR, PROMOTE to FILLED instead of closing; if IBKR positions
+        can't be read this cycle, don't sweep at all (pending dedup still
+        protects — no fiction gets written).
         """
         closed = 0
         try:
             now = datetime.now()
+            stale = []
             for t in self._state.get_open_trades():
                 if t.status != TradeStatus.PENDING:
                     continue
@@ -95,14 +212,29 @@ class PositionReconciler:
                 except (ValueError, TypeError):
                     continue
                 if age_min >= self.STALE_PENDING_MINUTES:
-                    self._state.close_trade(
-                        trade_id=t.trade_id, exit_price=0.0, realized_pnl=0.0,
-                        exit_reason_detailed="stale_pending_never_filled",
-                    )
-                    closed += 1
-                    log.warning("reconcile_stale_pending_closed",
+                    stale.append((t, age_min))
+            if not stale:
+                return 0
+            live_keys = self._live_ibkr_leg_keys()
+            if live_keys is None:
+                log.warning("sweep_skipped_no_ibkr_positions")
+                return 0
+            for t, age_min in stale:
+                if not self._trade_leg_keys(t).isdisjoint(live_keys):
+                    # Legs live at the broker — the order FILLED. Rescue it.
+                    self._state.update_trade_status(t.trade_id, TradeStatus.FILLED)
+                    log.warning("sweep_promoted_filled_pending",
                                 trade_id=t.trade_id, symbol=t.symbol,
                                 strategy=t.strategy, age_min=int(age_min))
+                    continue
+                self._state.close_trade(
+                    trade_id=t.trade_id, exit_price=0.0, realized_pnl=0.0,
+                    exit_reason_detailed="stale_pending_never_filled",
+                )
+                closed += 1
+                log.warning("reconcile_stale_pending_closed",
+                            trade_id=t.trade_id, symbol=t.symbol,
+                            strategy=t.strategy, age_min=int(age_min))
         except Exception as e:  # noqa: BLE001
             log.warning("sweep_stale_pending_failed", error=str(e))
         return closed
@@ -114,8 +246,11 @@ class PositionReconciler:
         """
         log.info("reconciliation_starting")
 
-        # Clear long-dead PENDING orphans first (see _sweep_stale_pending).
-        self._sweep_stale_pending()
+        # NOTE (audit R2/C3): the stale-pending sweep used to run HERE —
+        # before the IBKR promotion loop — so a filled-but-tracker-lost
+        # PENDING was closed as "$0 never filled" before promotion could
+        # rescue it. The sweep is now liveness-gated AND runs after the
+        # promotion pass (end of this method).
 
         # Get IBKR positions
         ibkr_positions = self._ibkr.get_positions()
@@ -151,33 +286,7 @@ class PositionReconciler:
         local_entries: list[tuple] = []  # (trade, set_of_leg_keys)
         local_map: dict[str, list] = {}  # any leg key -> [trade, ...]
         for trade in local_trades:
-            keys: set[str] = set()
-            try:
-                legs = json.loads(trade.legs) if trade.legs else []
-            except (ValueError, TypeError):
-                legs = []
-            if legs:
-                for leg in legs:
-                    try:
-                        keys.add(self._make_position_key(
-                            symbol=trade.symbol,
-                            strike=float(leg["strike"]),
-                            right=str(leg["right"]),
-                            expiry=str(leg.get("expiry", "")),
-                        ))
-                    except (KeyError, TypeError, ValueError):
-                        continue
-            if not keys and trade.strike:
-                right = "C" if "call" in trade.strategy else "P"
-                keys.add(self._make_position_key(
-                    symbol=trade.symbol,
-                    strike=trade.strike,
-                    right=right,
-                    expiry=trade.expiry or "",
-                ))
-            if not keys:
-                # Stock positions
-                keys.add(f"{trade.symbol}:STK")
+            keys = self._trade_leg_keys(trade)
             local_entries.append((trade, keys))
             for key in keys:
                 local_map.setdefault(key, []).append(trade)
@@ -222,12 +331,27 @@ class PositionReconciler:
                                 ibkr_qty=ibkr_pos["quantity"], local_qty=local_qty)
             else:
                 result.new_from_ibkr += 1
-                msg = (
-                    f"New position from IBKR: {key}, "
-                    f"qty={ibkr_pos['quantity']}, avg_cost={ibkr_pos['avg_cost']}"
-                )
+                # ASSIGNMENT DETECTION (audit R2): an untracked STOCK position
+                # is the signature of a short option being assigned — 100
+                # shares/contract appear, consume buying power, and previously
+                # only produced this log line. Flag it unmistakably so the
+                # orchestrator can alert; without handling it corrupts both
+                # the position count and every margin-based check.
+                if ibkr_pos.get("sec_type") == "STK":
+                    msg = (
+                        f"UNTRACKED STOCK POSITION (possible ASSIGNMENT): {key}, "
+                        f"qty={ibkr_pos['quantity']}, avg_cost={ibkr_pos['avg_cost']} "
+                        f"— needs manual liquidation/review"
+                    )
+                    log.critical("reconcile_untracked_stock_assignment",
+                                 position=key, qty=ibkr_pos["quantity"])
+                else:
+                    msg = (
+                        f"New position from IBKR: {key}, "
+                        f"qty={ibkr_pos['quantity']}, avg_cost={ibkr_pos['avg_cost']}"
+                    )
+                    log.warning("reconcile_new_ibkr_position", position=key)
                 result.discrepancies.append(msg)
-                log.warning("reconcile_new_ibkr_position", position=key)
 
         # Check local positions not in IBKR (may have been closed while bot was down).
         # SAFETY: if IBKR reports ZERO OPTION positions while we hold open
@@ -304,13 +428,37 @@ class PositionReconciler:
 
                 multiplier = 100 if trade.contract_type != "stock" else 1
                 if expired:
-                    if trade.strategy in CREDIT_STRATEGIES:
-                        # Credit expired worthless = full premium kept
-                        realized_pnl = trade.entry_price * multiplier * trade.quantity
+                    # ITM-AWARE expiry booking (audit R2, goal-align #1): the
+                    # old branch booked ANY expired credit as a full-premium
+                    # win — an option that expired IN the money (e.g. short
+                    # put after a selloff over a down weekend) was recorded as
+                    # a max win instead of a loss. Value the structure at
+                    # expiry from intrinsic using the underlying's price; if
+                    # the underlying price can't be fetched, refuse to invent
+                    # a number and fall through to the review path.
+                    settle_px = await self._underlying_last(trade.symbol)
+                    intrinsic = self._structure_intrinsic(trade, settle_px) if settle_px else None
+                    if intrinsic is not None:
+                        if trade.strategy in CREDIT_STRATEGIES:
+                            # cost to settle = what the shorts owe minus longs
+                            realized_pnl = (trade.entry_price - intrinsic) * multiplier * trade.quantity
+                        else:
+                            realized_pnl = (intrinsic - trade.entry_price) * multiplier * trade.quantity
+                        exit_price = intrinsic
+                        exit_reason = "reconciler_expired_intrinsic"
+                        log.info("reconcile_expired_intrinsic",
+                                 trade_id=trade.trade_id, settle_px=settle_px,
+                                 intrinsic=round(intrinsic, 2),
+                                 realized_pnl=round(realized_pnl, 2))
                     else:
-                        # Debit expired worthless = full loss
-                        realized_pnl = -trade.entry_price * multiplier * trade.quantity
-                    exit_reason = "reconciler_estimate_expired_worthless"
+                        realized_pnl = 0.0
+                        exit_reason = "reconciler_unknown_exit_expired_needs_review"
+                        log.critical(
+                            "reconcile_expired_unbookable",
+                            trade_id=trade.trade_id, symbol=trade.symbol,
+                            note="expired but underlying price unavailable — "
+                                 "P&L NOT booked, needs manual review",
+                        )
                 else:
                     # Unknown exit — record neutral P&L and flag for review
                     # rather than inventing a number.
@@ -334,6 +482,10 @@ class PositionReconciler:
                 realized_pnl=realized_pnl,
                 exit_reason_detailed=exit_reason,
             )
+
+        # Sweep long-dead PENDING orphans LAST — after promotion had its
+        # chance to rescue filled-but-tracker-lost orders (audit R2/C3).
+        self._sweep_stale_pending()
 
         # Update portfolio value in IBKR for reconciliation
         for item in ibkr_portfolio:

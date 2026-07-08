@@ -8,7 +8,11 @@ trading:
   # KEPT: SPY/QQQ/IWM/DIA (indices), NVDA/AMZN/AMD (range-bound mature)
   # DROPPED 4yr: MSFT, SOFI, AAPL, META, TSLA (catastrophic losses)
   # DROPPED 1yr: GOOGL (-66%), PLTR (-33%) - became momentum stocks, hostile to iron condors
-  universe: [SPY, QQQ, IWM, DIA, NVDA, AMZN, AMD]
+  # GLD/TLT/XLE added 2026-07-07 (audit R2): the index cluster (SPY/QQQ/IWM/DIA,
+  # corr ~0.95) caps at 2 concurrent positions, saturating the book at ~5 of 8
+  # slots. Gold/bonds/energy are liquid, optionable, and weakly correlated to
+  # equities — they fill the idle slots AND diversify the short-vol tail.
+  universe: [SPY, QQQ, IWM, DIA, NVDA, AMZN, AMD, GLD, TLT, XLE]
   scan_interval_seconds: 300           # 5 minutes between scans
   max_daily_trades: 12                  # Raised for higher trade volume / faster learning
   trading_hours_only: true             # Only trade during RTH (9:30-16:00 ET)
@@ -35,10 +39,14 @@ risk:
   max_position_risk_pct: 0.03          # Per-trade max_loss cap vs NLV (was hardcoded in manager.py)
   max_correlation: 0.75                # Correlation above which symbols count as the same bet
   max_correlated_positions: 2          # Positions per correlated cluster (was code default)
+  max_credit_positions: 6              # Cap on simultaneous short-premium positions (audit R2)
+  credit_vix_halt: 28                  # No NEW credit entries at/above this VIX (audit R2)
 
 options:
   delta_range: [0.20, 0.50]            # Target delta for long options
-  dte_range: [14, 45]                  # Days to expiry range
+  dte_range: [7, 30]                   # Was [14,45]: shorter DTE = faster theta resolution,
+                                       # roughly doubles closes/slot for the clean-sample sprint
+                                       # (audit R2 goal-align). Revert to [14,45] to slow down.
   min_open_interest: 10                # Loosened: paper account on delayed data
   min_volume: 0                        # Delayed feeds report volume=0; relaxed pydantic floor too
   max_bid_ask_spread_pct: 0.40         # Loosened: stale-quote spreads run wider
@@ -140,5 +148,5 @@ dashboard:
 logging:
   level: INFO
   file: logs/ait.log
-  max_bytes: 10485760                  # 10 MB
-  backup_count: 5
+  max_bytes: 20971520                  # 20 MB (10MB x5 held ~20 min under IBKR error spam —
+  backup_count: 10                     #  destroyed forensic evidence; now ~200MB / hours of history)

@@ -174,3 +174,70 @@ class TestStrangleStressLoss:
         # Strikes so wide even a 15% move stays OTM -> falls back to 3x floor
         loss = self._stress_loss(100, 60, 140, 1.00)
         assert loss == pytest.approx(300.0)
+
+
+# ---------------------------------------------------------------------------
+# Round-2 audit fixes (2026-07-07 evening)
+# ---------------------------------------------------------------------------
+
+class TestStructureIntrinsic:
+    """ITM-aware expiry booking (reconciler) — no more fabricated wins."""
+
+    @staticmethod
+    def _trade(legs, strategy):
+        import json as _json
+        return SimpleNamespace(legs=_json.dumps(legs), strategy=strategy, strike=None)
+
+    def test_ic_put_side_itm_costs_wing_width(self):
+        from ait.execution.reconciler import PositionReconciler
+        legs = [
+            {"strike": 713, "right": "P", "action": "BUY"},
+            {"strike": 715, "right": "P", "action": "SELL"},
+            {"strike": 752, "right": "C", "action": "SELL"},
+            {"strike": 754, "right": "C", "action": "BUY"},
+        ]
+        # settle 700: short 715P owes 15, long 713P worth 13 -> cost 2.0
+        cost = PositionReconciler._structure_intrinsic(self._trade(legs, "iron_condor"), 700.0)
+        assert cost == pytest.approx(2.0)
+        # credit P&L would be (credit - 2.0)*100 => max loss, NOT a full win
+
+    def test_strangle_otm_costs_zero(self):
+        from ait.execution.reconciler import PositionReconciler
+        legs = [
+            {"strike": 225, "right": "P", "action": "SELL"},
+            {"strike": 265, "right": "C", "action": "SELL"},
+        ]
+        cost = PositionReconciler._structure_intrinsic(self._trade(legs, "short_strangle"), 245.0)
+        assert cost == pytest.approx(0.0)  # genuinely expired worthless
+
+    def test_short_put_itm_costs_intrinsic(self):
+        from ait.execution.reconciler import PositionReconciler
+        legs = [{"strike": 225, "right": "P", "action": "SELL"}]
+        cost = PositionReconciler._structure_intrinsic(self._trade(legs, "cash_secured_put"), 210.0)
+        assert cost == pytest.approx(15.0)  # the old code booked this as a WIN
+
+
+class TestOIUnknownPassthrough:
+    """IBKR realtime reports OI=0 (unknown) — must not reject on unknown."""
+
+    def test_oi_zero_passes_when_otherwise_liquid(self, monkeypatch):
+        monkeypatch.setenv("AIT_LIQ_MIN_VOL", "0")
+        monkeypatch.setenv("AIT_LIQ_MIN_OI", "10")
+        monkeypatch.setenv("AIT_LIQ_MAX_SPREAD", "0.50")
+        from ait.data.options_chain import OptionContract
+        c = OptionContract(symbol="SPY", expiry="2026-07-24", strike=650, right="C",
+                           bid=1.00, ask=1.05, last=1.02, volume=100,
+                           open_interest=0, implied_vol=0.2, delta=0.2,
+                           gamma=0, theta=0, vega=0)
+        assert c.is_liquid  # unknown OI does not disqualify
+
+    def test_low_known_oi_still_rejected(self, monkeypatch):
+        monkeypatch.setenv("AIT_LIQ_MIN_VOL", "0")
+        monkeypatch.setenv("AIT_LIQ_MIN_OI", "10")
+        monkeypatch.setenv("AIT_LIQ_MAX_SPREAD", "0.50")
+        from ait.data.options_chain import OptionContract
+        c = OptionContract(symbol="SPY", expiry="2026-07-24", strike=650, right="C",
+                           bid=1.00, ask=1.05, last=1.02, volume=100,
+                           open_interest=3, implied_vol=0.2, delta=0.2,
+                           gamma=0, theta=0, vega=0)
+        assert not c.is_liquid  # KNOWN thin OI is still rejected

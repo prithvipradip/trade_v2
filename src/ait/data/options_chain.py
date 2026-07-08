@@ -85,7 +85,11 @@ class OptionContract:
         # Env-tunable so we can loosen on paper / delayed-data accounts where
         # `volume` is often 0 because it's a live tick stream we don't get.
         min_vol, min_oi, max_spread = _liquidity_thresholds()
-        return self.volume >= min_vol and self.open_interest >= min_oi and self.spread_pct < max_spread
+        # open_interest==0 means UNKNOWN on the IBKR realtime path (no OI
+        # tick) — treating unknown as illiquid rejected every IBKR contract
+        # (audit R2/C2). Enforce the OI floor only when OI is reported.
+        oi_ok = self.open_interest <= 0 or self.open_interest >= min_oi
+        return self.volume >= min_vol and oi_ok and self.spread_pct < max_spread
 
 
 @dataclass
@@ -133,14 +137,14 @@ class OptionsChain:
                 c
                 for c in self.calls
                 if c.volume >= config.min_volume
-                and c.open_interest >= config.min_open_interest
+                and (c.open_interest <= 0 or c.open_interest >= config.min_open_interest)
                 and c.spread_pct <= config.max_bid_ask_spread_pct
             ],
             puts=[
                 p
                 for p in self.puts
                 if p.volume >= config.min_volume
-                and p.open_interest >= config.min_open_interest
+                and (p.open_interest <= 0 or p.open_interest >= config.min_open_interest)
                 and p.spread_pct <= config.max_bid_ask_spread_pct
             ],
         )

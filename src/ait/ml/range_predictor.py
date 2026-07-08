@@ -323,7 +323,7 @@ class RangePredictor:
             return None
 
         garch = GARCHRangeModel()
-        splits = self._walk_forward_split(len(close))
+        splits = self._walk_forward_split(len(close), gap=5)  # GARCH CV labels use _CV_HORIZON=5; horizon-default gap would over-purge
 
         # CV scored at a SHORT horizon (5d) so P(in range) varies widely across
         # validation days (±5% over 5d: quiet ~0.95, shock day ~0.30 → 3× spread
@@ -386,7 +386,7 @@ class RangePredictor:
             return None
 
         garch = GARCHRangeModel()
-        splits = self._walk_forward_split(len(close))
+        splits = self._walk_forward_split(len(close), gap=5)  # GARCH CV labels use _CV_HORIZON=5; horizon-default gap would over-purge
 
         _CV_HORIZON = 5
         _cv_threshold = self._threshold * np.sqrt(_CV_HORIZON / max(self._horizon, 1))
@@ -437,7 +437,7 @@ class RangePredictor:
             return None
 
         garch = GARCHRangeModel()
-        splits = self._walk_forward_split(len(close))
+        splits = self._walk_forward_split(len(close), gap=5)  # GARCH CV labels use _CV_HORIZON=5; horizon-default gap would over-purge
 
         _CV_HORIZON = 5
         _cv_threshold = self._threshold * np.sqrt(_CV_HORIZON / max(self._horizon, 1))

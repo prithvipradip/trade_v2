@@ -58,6 +58,14 @@ class RiskConfig(BaseModel):
         description="Max simultaneous positions within one correlated cluster "
                     "(SPY/QQQ/IWM/DIA correlate ~0.95). Was a CorrelationGuard "
                     "code default — audit item 3.3.")
+    max_credit_positions: int = Field(default=6, ge=1, le=20,
+        description="Max simultaneous short-premium (credit) positions. The "
+                    "delta gate is dead and the daily breaker only sees "
+                    "realized P&L, so without this the whole book can be "
+                    "short vol into a gap (audit R2).")
+    credit_vix_halt: float = Field(default=28.0, ge=15.0, le=60.0,
+        description="No NEW credit entries when VIX is at/above this level — "
+                    "cheap vol-regime brake for short-premium strategies.")
 
 
 class OptionsConfig(BaseModel):

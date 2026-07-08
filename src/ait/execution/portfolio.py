@@ -72,6 +72,14 @@ class PortfolioManager:
         self._exit_config = exit_config or ExitConfig()
         self._earnings = earnings_calendar
         self._economic_cal = economic_calendar
+        # Optional async notifier (orchestrator wires _send_notification):
+        # used for prolonged marks-missing and PDT-blocked-stop alerts, both
+        # states where positions are silently unprotected (audit R2).
+        self._notify_cb = None
+        self._marks_missing_streak: dict[str, int] = {}
+        self._pdt_alerted: set[str] = set()
+
+    MARKS_MISSING_ALERT_TICKS = 10  # ~5 min at the 30s fast-monitor cadence
 
     async def check_positions(self) -> list[PositionStatus]:
         """Check all open positions and determine which need action."""
@@ -220,6 +228,29 @@ class PortfolioManager:
                 reason="no IBKR marks for one or more legs; P&L exit rules "
                        "skipped this tick, DTE safety exits still active",
             )
+            # PROLONGED-outage alert (audit R2): one missing tick is routine;
+            # N consecutive means stop/TP protection has been OFF for the
+            # whole stretch (data slot stolen, farm outage) — a short-vol
+            # book riding a selloff unmanaged. Alert ONCE per outage.
+            # (getattr-guarded: some tests construct via __new__.)
+            streaks = getattr(self, "_marks_missing_streak", None)
+            notify = getattr(self, "_notify_cb", None)
+            if streaks is not None:
+                streak = streaks.get(trade.trade_id, 0) + 1
+                streaks[trade.trade_id] = streak
+                if streak == self.MARKS_MISSING_ALERT_TICKS and notify:
+                    try:
+                        await notify(
+                            f"MARKS MISSING x{streak} ticks: {trade.symbol} "
+                            f"{trade.strategy} — stop/take-profit protection is "
+                            f"NOT running (data outage?). DTE safety exits only."
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+        else:
+            streaks = getattr(self, "_marks_missing_streak", None)
+            if streaks is not None:
+                streaks.pop(trade.trade_id, None)
 
         cost_basis = abs(trade.entry_price) * trade.quantity * multiplier
         pnl_pct = unrealized_pnl / cost_basis if cost_basis > 0 else 0.0
@@ -382,6 +413,24 @@ class PortfolioManager:
                         trade_id=trade.trade_id,
                         symbol=trade.symbol,
                     )
+                    # A PDT-vetoed exit means a STOP or take-profit wanted to
+                    # fire and couldn't — the position rides unprotected
+                    # (audit R2/H3). Alert once per trade so the human can
+                    # decide to close manually. (getattr-guarded for tests
+                    # constructing via __new__.)
+                    _pdt_seen = getattr(self, "_pdt_alerted", None)
+                    _notify = getattr(self, "_notify_cb", None)
+                    if _pdt_seen is not None and trade.trade_id not in _pdt_seen and _notify:
+                        _pdt_seen.add(trade.trade_id)
+                        try:
+                            await _notify(
+                                f"PDT BLOCKED EXIT: {trade.symbol} {trade.strategy} "
+                                f"wanted to exit (P&L {pnl_pct:+.1%}) but closing "
+                                f"today would trip PDT. Position is riding "
+                                f"unprotected until tomorrow — review manually."
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
 
         return PositionStatus(
             trade_id=trade.trade_id,

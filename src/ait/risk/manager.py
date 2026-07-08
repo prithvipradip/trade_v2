@@ -172,6 +172,32 @@ class RiskManager:
         # on TradingConfig, so it could never fire. The real daily budget is
         # enforced in orchestrator._get_trade_budget.)
 
+        # 2c. Short-vol guardrails (audit R2 goal-align): the portfolio-delta
+        # gate is dead (no greeks) and the daily breaker only sees REALIZED
+        # P&L, so nothing else stops the whole book being short premium into
+        # a gap. Two cheap brakes for credit strategies:
+        from ait.strategies.base import CREDIT_STRATEGIES
+        is_credit = request.strategy in CREDIT_STRATEGIES
+        if is_credit:
+            #  - vol-regime halt: no NEW short premium in a high-VIX regime
+            if request.vix and request.vix >= self._risk_config.credit_vix_halt:
+                return TradeValidation(
+                    False,
+                    f"credit entry halted: VIX {request.vix:.1f} >= "
+                    f"{self._risk_config.credit_vix_halt:.0f}",
+                )
+            #  - concentration brake: cap simultaneous credit positions
+            n_credit = sum(
+                1 for p in self._open_positions
+                if p.get("strategy") in CREDIT_STRATEGIES
+            )
+            if n_credit >= self._risk_config.max_credit_positions:
+                return TradeValidation(
+                    False,
+                    f"short-premium cap: {n_credit}/"
+                    f"{self._risk_config.max_credit_positions} credit positions open",
+                )
+
         # 3b. Position count limit
         if len(self._open_positions) >= self._pos_config.max_open_positions:
             return TradeValidation(
@@ -203,8 +229,7 @@ class RiskManager:
         # approximated by the max_loss/tail estimate (now stress-based for
         # strangles); debit trades still pay the premium up front.
         account_value = await self._account.get_net_liquidation()
-        from ait.strategies.base import CREDIT_STRATEGIES
-        is_credit = request.strategy in CREDIT_STRATEGIES
+        # (is_credit computed at gate 2c above)
         if is_credit and getattr(request, "max_loss", None):
             estimated_cost = float(request.max_loss)
         else:

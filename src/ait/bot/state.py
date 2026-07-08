@@ -508,6 +508,20 @@ class StateManager:
                 return []
         return []
 
+    def update_trade_entry_price(self, trade_id: str, entry_price: float) -> None:
+        """Overwrite trades.entry_price with the REAL fill price.
+
+        The signal's target price is recorded at order placement; once IBKR
+        reports the actual fill, this replaces it so every downstream P&L
+        computation (exits, analytics, learning) uses reality, not the
+        optimistic target (audit R2/C1 — entry slippage was invisible).
+        """
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                "UPDATE trades SET entry_price = ? WHERE trade_id = ?",
+                (entry_price, trade_id),
+            )
+
     def update_trade_quantity(self, trade_id: str, new_quantity: int) -> None:
         """Update remaining quantity after a partial exit."""
         with sqlite3.connect(self._db_path) as conn:
@@ -586,6 +600,11 @@ class StateManager:
                 "SELECT value FROM bot_state WHERE key = ?", (key,)
             ).fetchone()
         return row[0] if row else default
+
+    def delete_state(self, key: str) -> None:
+        """Delete a key from bot state (e.g. per-trade risk keys on close)."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute("DELETE FROM bot_state WHERE key = ?", (key,))
 
     # --- Helpers ---
 

@@ -203,17 +203,33 @@ class BotManager:
             _log("debug", "bot_healthy", pid=self._proc.pid)
             # Fresh-models marker (audit item 3.1): the daily retrain wrote new
             # models the running bot won't load until its 7-day timer. One
-            # controlled restart (retrain finishes pre-market) picks them up.
+            # controlled restart picks them up. GUARDS (audit R2): (a) never
+            # restart during market hours — a slow retrain can outlive the
+            # 7:30 slot and finish mid-session (only an IDLE timeout bounds
+            # it); the marker simply waits until the market is closed.
+            # (b) only restart if the marker was actually deleted, else a
+            # locked file would restart the bot every 2 minutes forever.
             marker = ROOT / "models" / ".retrained"
             if marker.exists():
                 try:
-                    marker.unlink()
+                    from ait.utils.time import is_market_open
+                    market_open = is_market_open()
                 except Exception:
-                    pass
-                _log("info", "bot_restart_for_fresh_models")
-                self.stop()
-                self.start()
-                return
+                    market_open = False
+                if market_open:
+                    _log("info", "fresh_models_restart_deferred_market_open")
+                else:
+                    unlinked = False
+                    try:
+                        marker.unlink()
+                        unlinked = True
+                    except Exception as e:
+                        _log("warning", "retrain_marker_unlink_failed", error=str(e))
+                    if unlinked:
+                        _log("info", "bot_restart_for_fresh_models")
+                        self.stop()
+                        self.start()
+                        return
             # Reset the restart budget once the bot has been continuously
             # healthy for a sustained stretch. Without this, restart attempts
             # spent during a transient overnight Gateway outage are never

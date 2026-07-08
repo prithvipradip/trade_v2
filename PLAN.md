@@ -45,6 +45,29 @@ Full audit reports: four-agent audit (pipeline core, risk/broker, ML/learning, o
 | 3.3 | **Config consolidation**: hoist behavioral literals (EXIT_CROSS, entry offset, RANGE_MIN_CONFIDENCE, budget tiers, risk cap %s, correlation cap) into settings; delete dead gates (daily-limit on wrong object, concentration reading never-populated field); wire or remove phantom `max_portfolio_risk_pct`. | manager.py, orchestrator.py, executor.py, settings.py | done |
 | 3.4 | **Backtest fill realism** (larger project, separate pass): historical option quotes where available, model combo non-fills. Until then treat +311% IC backtest as directional only. | engine.py | deferred |
 
+## Round 2 (2026-07-07 evening) — verification audit: fixes verified + new findings fixed
+
+Adversarial review of Round-1 commits: all major fixes verified clean (neutral-only, FX stop,
+reconnect, Thompson floats, config wiring); stress-risk does NOT kill strangles; CC/CSP
+blocking is pre-existing (3% cap vs assignment notional), not a regression.
+
+| # | Item | Where | Status |
+|---|------|-------|--------|
+| R2.1 | **P&L booked on signal price, not real fill** (forensics: all 8 fills adverse, −$89, up to 14.8% of credit — slippage invisible, P&L overstated). Real fill now written to trades.entry_price; BAG-aware entry fill reconstruction. | executor.py, state.py | done |
+| R2.2 | **ITM-aware expiry booking** — expired credit was booked full-premium WIN regardless of moneyness (top sample-corruption risk). Now valued at intrinsic via underlying price; refuses to invent numbers (review flag) if price unavailable. | reconciler.py | done |
+| R2.3 | **Sweep front-ran fill-promotion** — 30-min PENDING closed as "$0 never filled" before IBKR liveness check could rescue it. Sweep now liveness-gated (promotes if legs live; skips if IBKR unreadable) and runs AFTER promotion. | reconciler.py | done |
+| R2.4 | **Partial/cancel status writes were no-ops** (INSERT OR IGNORE on existing row) — partial entry fills were live UNMANAGED positions. Real writes + open_positions registration. | executor.py | done |
+| R2.5 | **Exit-cancel double-close race** — stale exit reverted CLOSING→FILLED while the cancel could race a fill → second close = fresh naked position. Now keeps tracking until terminal state (900s zombie cap). | executor.py | done |
+| R2.6 | **Assignment detection** — untracked STK position at IBKR now flagged CRITICAL + Telegram (was: one log line, then silent buying-power rot). | reconciler.py, orchestrator.py | done |
+| R2.7 | **Stale strangle max_loss restated** — 3 pre-fix positions under-counted aggregate risk 2.7x ($6.6k vs $18.1k true); restated in bot_state + 28 dead keys purged + keys now deleted on close. | one-time data fix, orchestrator.py | done |
+| R2.8 | **Short-vol guardrails** — credit-position cap (6) + VIX entry halt (28) for credit strategies; delta gate is dead and daily breaker sees only realized P&L, so these are the gap-day brakes. | manager.py, settings, config | done |
+| R2.9 | **Unprotected-state alerts** — prolonged marks-missing (10 ticks ≈5 min → stop/TP silently OFF) and PDT-blocked stop now Telegram once. | portfolio.py, orchestrator.py | done |
+| R2.10 | **Sample velocity** — universe +GLD/TLT/XLE (index cluster saturated book at ~5/8 slots), dte_range 14-45 → 7-30 (~2x closes/slot). 100 closes/month was NOT achievable as configured (~15-20). | config.yaml | done |
+| R2.11 | **Mid-session restart guard** — fresh-models marker restart now deferred while market open + gated on successful unlink (was: slow retrain → unguarded restart at 10am; locked marker → restart every 2 min). | master.py | done |
+| R2.12 | Smalls: partial-exit await 10s→4s (stalled other stops), OI=0 treated as unknown not illiquid (IBKR realtime), GARCH CV gap pinned 5 (over-purge), status.py pre-migration fallback, ait.log 10MB×5→20MB×10 (error spam destroyed forensic evidence), Thompson float fmt. | various | done |
+| R2.13 | Retrain-effectiveness + fill-quality watch: verify tomorrow's session — thesis-check runs clean, marks persist, slippage on new entries, GLD/TLT/XLE signals generate. | live verification | todo |
+| R2.14 | Deferred: Telegram off hot path w/ retry+2nd channel; covered_call share-ownership precondition (currently unreachable — blocked by 3% cap); ET-pinning for time gates; wmic→tasklist in keeper. | various | todo |
+
 ## Deferred / watchlist
 - ~~Live data~~ done 2026-07-02 (Network B/C + OPRA, ~$3/mo).
 - IBC read-only automation: vmoptions `--add-opens` fixed the crash; box may still need manual

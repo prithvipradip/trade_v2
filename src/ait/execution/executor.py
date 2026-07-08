@@ -362,7 +362,8 @@ class TradeExecutor:
 
             elif status == "partial":
                 filled_qty = self._get_filled_quantity(order_id, all_trades, pending)
-                self._update_trade_partial(pending, filled_qty)
+                partial_price = self._get_fill_price(order_id, all_trades, pending)
+                self._update_trade_partial(pending, filled_qty, partial_price)
 
                 # If partial fill has been sitting > 30s, cancel the remainder
                 # to avoid orphaned legs and stale prices
@@ -489,9 +490,18 @@ class TradeExecutor:
                 del self._pending_exit_orders[order_id]
 
             elif exit_status == "pending" and pending_exit.age_seconds > 300:
-                # Exit stuck pending for 5+ min — cancel and let portfolio re-trigger
+                # Exit stuck pending 5+ min — request cancel but KEEP TRACKING
+                # (audit R2/H1): the old code cancelled, reverted to FILLED and
+                # dropped the tracker in one shot. If the cancel raced a fill
+                # (order fills as the cancel arrives), the portfolio re-triggered
+                # a SECOND exit on an already-closed position — flipping it into
+                # a fresh naked position. Now: send cancel, keep the tracker;
+                # the next check sees a terminal state (filled -> book properly,
+                # cancelled -> revert to FILLED for a clean re-trigger). Hard
+                # cap at 900s so a zombie order can't wedge the position in
+                # CLOSING forever.
                 log.warning(
-                    "exit_order_stale_pending",
+                    "exit_order_stale_pending_cancel_requested",
                     trade_id=pending_exit.trade_id,
                     age_seconds=int(pending_exit.age_seconds),
                 )
@@ -502,10 +512,16 @@ class TradeExecutor:
                             break
                 except Exception:
                     pass
-                self._state.update_trade_status(
-                    pending_exit.trade_id, TradeStatus.FILLED,
-                )
-                del self._pending_exit_orders[order_id]
+                if pending_exit.age_seconds > 900:
+                    log.error(
+                        "exit_order_zombie_reverting",
+                        trade_id=pending_exit.trade_id,
+                        age_seconds=int(pending_exit.age_seconds),
+                    )
+                    self._state.update_trade_status(
+                        pending_exit.trade_id, TradeStatus.FILLED,
+                    )
+                    del self._pending_exit_orders[order_id]
 
         return filled, completed_exits
 
@@ -552,19 +568,51 @@ class TradeExecutor:
         # If not found in trades list, assume cancelled (order was rejected or expired)
         return "cancelled"
 
+    @staticmethod
+    def _reconstruct_bag_price(trade) -> float | None:
+        """Side-aware net price for a BAG from per-leg executions.
+
+        (sold proceeds - bought costs) per contract, negated to IBKR's
+        as-defined convention (negative = combo nets a credit). Shared by
+        entry and exit fill reconstruction (audit R2 — the entry path
+        previously lacked this and silently fell back to the signal price).
+        """
+        qty = trade.order.totalQuantity or 0
+        if not trade.fills or qty <= 0:
+            return None
+        net = 0.0
+        for f in trade.fills:
+            sign = 1.0 if f.execution.side == "SLD" else -1.0
+            net += sign * f.execution.price * f.execution.shares
+        return -net / (100.0 * qty)
+
     def _get_fill_price(
         self, order_id: int, all_trades: list, pending: PendingOrder
     ) -> float:
-        """Get the actual fill price for an order."""
+        """Get the actual fill price for an entry order."""
         for trade in all_trades:
             if trade.order.orderId == order_id:
                 avg_price = trade.orderStatus.avgFillPrice
                 if avg_price is not None and not math.isnan(avg_price) and avg_price != 0:
                     return avg_price
+                # BAG fallback: reconstruct from per-leg executions (mirrors
+                # the exit path) instead of masking slippage with the signal
+                # price.
+                if getattr(trade.contract, "secType", "") == "BAG":
+                    bag = self._reconstruct_bag_price(trade)
+                    if bag is not None:
+                        return bag
+                elif trade.fills:
+                    total_cost = sum(f.execution.price * f.execution.shares for f in trade.fills)
+                    total_shares = sum(f.execution.shares for f in trade.fills)
+                    if total_shares > 0:
+                        return total_cost / total_shares
                 if (trade.orderStatus.filled or 0) > 0:
                     return 0.0
 
-        return pending.signal.entry_price  # Fallback to expected price
+        log.warning("entry_fill_price_missing_using_signal",
+                    trade_id=pending.trade_id, order_id=order_id)
+        return pending.signal.entry_price  # last resort — flagged above
 
     def _get_filled_quantity(
         self, order_id: int, all_trades: list, pending: PendingOrder
@@ -614,17 +662,9 @@ class TradeExecutor:
             # Fallback: reconstruct from per-leg executions
             if trade.fills:
                 if getattr(trade.contract, "secType", "") == "BAG":
-                    # Side-aware net: (sold proceeds - bought costs) per
-                    # contract, then negate to match IBKR's as-defined
-                    # convention (negative = combo nets a credit). A naive
-                    # side-blind VWAP of leg premiums is meaningless here.
-                    qty = trade.order.totalQuantity or 0
-                    if qty > 0:
-                        net = 0.0
-                        for f in trade.fills:
-                            sign = 1.0 if f.execution.side == "SLD" else -1.0
-                            net += sign * f.execution.price * f.execution.shares
-                        return -net / (100.0 * qty)
+                    bag = self._reconstruct_bag_price(trade)
+                    if bag is not None:
+                        return bag
                 else:
                     total_cost = sum(f.execution.price * f.execution.shares for f in trade.fills)
                     total_shares = sum(f.execution.shares for f in trade.fills)
@@ -686,6 +726,15 @@ class TradeExecutor:
         # so use update_trade_status for existing rows)
         self._state.update_trade_status(pending.trade_id, TradeStatus.FILLED)
 
+        # Book the REAL fill into trades.entry_price (audit R2/C1): it was
+        # only stored in open_positions while every P&L computation read the
+        # optimistic signal price from trades — systematically overstating
+        # realized P&L by the entry slippage (measured -$89 across the first
+        # 8 marketable fills, up to 14.8% of credit). trades.entry_price is
+        # the unsigned premium convention; BAG credit fills come signed.
+        if actual_price is not None and actual_price != 0:
+            self._state.update_trade_entry_price(pending.trade_id, abs(actual_price))
+
         # Build legs JSON for open_positions (handles both contract-shaped and
         # plain-dict legs via _leg_fields so dict-shaped legs don't crash here)
         legs_json = json.dumps([
@@ -709,49 +758,49 @@ class TradeExecutor:
             legs=legs_json,
         )
 
-    def _update_trade_partial(self, pending: PendingOrder, filled_qty: int) -> None:
-        """Update a trade record for partial fill."""
+    def _update_trade_partial(
+        self, pending: PendingOrder, filled_qty: int, actual_price: float | None = None
+    ) -> None:
+        """Update a trade record for a partial ENTRY fill.
+
+        AUDIT R2/C4-C5: this (and _update_trade_cancelled) previously went
+        through record_trade, which is INSERT OR IGNORE — a silent NO-OP on
+        the already-existing PENDING row. The PARTIAL status never persisted,
+        quantity stayed wrong, and no open_positions row existed, so the
+        already-filled contracts were a LIVE, UNMANAGED position. Write the
+        transitions for real and register the partial position.
+        """
         signal = pending.signal
-        self._state.record_trade(
-            TradeRecord(
-                trade_id=pending.trade_id,
-                symbol=signal.symbol,
-                strategy=signal.strategy_name,
-                direction=(
-                    TradeDirection.LONG
-                    if signal.direction != SignalDirection.BEARISH
-                    else TradeDirection.SHORT
-                ),
-                status=TradeStatus.PARTIAL,
-                entry_time=datetime.now().isoformat(),
-                entry_price=signal.entry_price,
-                quantity=filled_qty,
-                contract_type=self._get_contract_type(signal),
-                notes=f"partial fill: {filled_qty}/{pending.contracts}",
-            )
+        self._state.update_trade_status(pending.trade_id, TradeStatus.PARTIAL)
+        self._state.update_trade_quantity(pending.trade_id, filled_qty)
+        if actual_price is not None and actual_price != 0:
+            self._state.update_trade_entry_price(pending.trade_id, abs(actual_price))
+        # Register the filled portion so PortfolioManager manages it
+        # (check_positions iterates FILLED/PARTIAL).
+        legs_json = json.dumps([
+            {"strike": s, "right": r, "action": leg["action"], "expiry": e}
+            for leg in signal.legs
+            for s, r, e in [self._leg_fields(leg)]
+        ]) if signal.legs else "[]"
+        self._state.insert_open_position(
+            trade_id=pending.trade_id,
+            symbol=signal.symbol,
+            contract_type=self._get_contract_type(signal),
+            quantity=filled_qty,
+            entry_price=actual_price if actual_price is not None else signal.entry_price,
+            legs=legs_json,
+        )
+        log.warning(
+            "trade_partial_persisted",
+            trade_id=pending.trade_id,
+            filled=filled_qty,
+            requested=pending.contracts,
         )
 
     def _update_trade_cancelled(self, pending: PendingOrder) -> None:
-        """Update a trade record to CANCELLED status."""
-        signal = pending.signal
-        self._state.record_trade(
-            TradeRecord(
-                trade_id=pending.trade_id,
-                symbol=signal.symbol,
-                strategy=signal.strategy_name,
-                direction=(
-                    TradeDirection.LONG
-                    if signal.direction != SignalDirection.BEARISH
-                    else TradeDirection.SHORT
-                ),
-                status=TradeStatus.CANCELLED,
-                entry_time=datetime.now().isoformat(),
-                entry_price=signal.entry_price,
-                quantity=0,
-                contract_type=self._get_contract_type(signal),
-                notes=f"cancelled after {pending.age_seconds:.0f}s (timeout={self._order_timeout}s)",
-            )
-        )
+        """Update a trade record to CANCELLED status (real write — see
+        _update_trade_partial docstring for the INSERT OR IGNORE no-op bug)."""
+        self._state.update_trade_status(pending.trade_id, TradeStatus.CANCELLED)
 
     def register_exit_order(
         self,

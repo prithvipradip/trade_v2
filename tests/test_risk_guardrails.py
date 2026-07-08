@@ -18,7 +18,8 @@ from ait.risk.manager import RiskManager, TradeRequest
 def _manager(net_liq=200_000.0, open_positions=None):
     pos_config = MagicMock(max_open_positions=5, max_position_pct=0.05,
                            max_portfolio_delta=1.0, max_portfolio_risk_pct=0.20)
-    risk_config = MagicMock(min_confidence=0.50, max_position_risk_pct=0.10)
+    risk_config = MagicMock(min_confidence=0.50, max_position_risk_pct=0.10,
+                            max_credit_positions=6, credit_vix_halt=28.0)
     account = MagicMock()
     account.get_net_liquidation = AsyncMock(return_value=net_liq)
     account.can_afford = AsyncMock(return_value=True)

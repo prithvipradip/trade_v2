@@ -156,6 +156,9 @@ class TradingOrchestrator:
             earnings_calendar=self._earnings,
             economic_calendar=self._economic_cal,
         )
+        # Wire alerts for silently-unprotected states (marks outage, PDT-
+        # blocked stop) into the same Telegram channel as everything else.
+        self._portfolio._notify_cb = self._send_notification
 
         # Scheduling
         self._scheduler = MarketScheduler()
@@ -223,6 +226,7 @@ class TradingOrchestrator:
             log.info("startup_reconcile_done",
                      matched=recon.matched, promoted=recon.promoted,
                      stale_closed=recon.stale_local, new_from_ibkr=recon.new_from_ibkr)
+            await self._alert_reconcile_anomalies(recon)
         except Exception as e:
             log.error("startup_reconcile_failed", error=str(e))
 
@@ -345,6 +349,18 @@ class TradingOrchestrator:
             model_version=self._predictor.model_version,
         )
 
+    async def _alert_reconcile_anomalies(self, recon) -> None:
+        """Telegram-alert reconcile findings that need a human (assignment)."""
+        try:
+            urgent = [d for d in (recon.discrepancies or [])
+                      if "ASSIGNMENT" in d or "PARTIAL legs missing" in d]
+            if urgent:
+                await self._send_notification(
+                    "RECONCILE NEEDS ATTENTION:\n" + "\n".join(urgent[:5])
+                )
+        except Exception as e:  # noqa: BLE001
+            log.warning("reconcile_alert_failed", error=str(e))
+
     async def _process_completed_exits(self, completed_exits: list[dict]) -> None:
         """Book completed exits: daily stats, circuit breaker, Thompson, drift.
 
@@ -367,6 +383,14 @@ class TradingOrchestrator:
             # streak within an otherwise green day.
             self._circuit_breaker.record_trade_result(realized_pnl)
             self._state.update_daily_stats(stats)
+
+            # Drop the per-trade risk key so the aggregate cap's namespace
+            # doesn't accumulate dead entries (28 stale keys found in the
+            # 2026-07-07 forensic audit).
+            try:
+                self._state.delete_state(f"trade_maxloss_{trade_id}")
+            except Exception:  # noqa: BLE001
+                pass
 
             trade = self._find_trade_by_id(trade_id)
             if trade:
@@ -1486,7 +1510,13 @@ class TradingOrchestrator:
                 # before the order even filled. Book on the real fill only.
                 fill_price = None
                 if exit_trade is not None:
-                    for _ in range(20):  # up to ~10s — market orders on liquid options fill in seconds
+                    # Bounded at ~4s (audit R2): this await runs inside the
+                    # trading cycle, and while it sleeps NO fast-monitor pass
+                    # runs — every other position's stop/TP check is delayed.
+                    # Market orders on liquid options fill sub-second; 4s is
+                    # plenty, and an unfilled order is cancelled + retried
+                    # next cycle rather than waited on.
+                    for _ in range(8):
                         await asyncio.sleep(0.5)
                         st = exit_trade.orderStatus
                         if st.status == "Filled" and st.avgFillPrice:
@@ -1675,7 +1705,8 @@ class TradingOrchestrator:
         log.info("post_market_starting")
 
         # 1. Reconcile with IBKR
-        await self._reconciler.reconcile()
+        recon = await self._reconciler.reconcile()
+        await self._alert_reconcile_anomalies(recon)
 
         # 2. Run self-learning cycle
         if self._settings.learning.enabled:
@@ -1743,7 +1774,7 @@ class TradingOrchestrator:
         thompson_stats = self._thompson.get_stats()
         if thompson_stats:
             top = thompson_stats[0]
-            report += f"\n  Top strategy (Thompson): {top['strategy']} ({top['win_rate']:.0%} over {top['observations']} trades)"
+            report += f"\n  Top strategy (Thompson): {top['strategy']} ({top['win_rate']:.0%} over {top['observations']:.0f} trades)"
 
         # Counterfactual summary
         cf = self._counterfactual.get_analysis()

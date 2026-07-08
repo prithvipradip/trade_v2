@@ -341,12 +341,19 @@ class TestReconcilerMatching:
             [self._ibkr_pos("QQQ", "20260821", 500.0, "C")],
             [trade],
         )
+        # ITM-aware expiry booking (audit R2): the reconciler now values the
+        # structure at expiry from intrinsic using the underlying price
+        # instead of assuming "expired worthless". Settle exactly ATM (635):
+        # both straddle legs are worthless -> full debit loss, same -2400 as
+        # before, but computed honestly.
+        async def _settle(_symbol):
+            return 635.0
+        rec._underlying_last = _settle
         result = await rec.reconcile()
         assert result.stale_local == 1
         kwargs = rec._state.close_trade.call_args.kwargs
-        # debit expired worthless -> full loss, correctly signed + flagged
         assert kwargs["realized_pnl"] == pytest.approx(-2400.0)
-        assert kwargs["exit_reason_detailed"] == "reconciler_estimate_expired_worthless"
+        assert kwargs["exit_reason_detailed"] == "reconciler_expired_intrinsic"
 
 
 # ---------------------------------------------------------------------------
