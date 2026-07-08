@@ -105,6 +105,23 @@ DEFERRED (Round 3 todo — larger design work, ranked):
   ET-vs-local time in Friday gate + budget tiers; wmic deprecation in keeper.
 - Learning layer wakes at ~30 real closes; expect ~1 month at current fill rate.
 
+## Go-live gates (decided 2026-07-07 — do NOT relitigate on a winning streak)
+Paper phase: ALL strategies stay enabled (incl. short_strangle) — the sample must answer
+"which strategies have edge", and paper blowups are data, not losses.
+
+Going LIVE requires ALL of:
+1. **Paper verdict**: >= 50-100 real closes with profit factor > 1.3, max drawdown < 8% of
+   deployed risk, stable slippage, zero unmanaged-position incidents. Criteria fixed BEFORE
+   looking at results.
+2. **Defined-risk only**: iron condors (and debit structures) ONLY. NO short strangles live —
+   their max_loss is a model estimate, not a contract. Strangles earn live status only after
+   a real margin model + 3 months of live consistency at base size.
+3. **Tuition sizing**: fund with an amount whose TOTAL loss is acceptable ($5-10k). 1 contract,
+   1-2% max loss per trade, daily-loss halt on, VIX halt on, weekly human review mandatory.
+4. **Backtest credibility fixed first** (Round 3 deferred #1) — no sizing decision may cite
+   backtest numbers until the engine's inflation bugs are fixed.
+5. Expect live < paper (real fills). Scale only on 3+ months of live evidence.
+
 ## Operating rules (learned the hard way)
 - Restarting the BOT ≠ restarting the GATEWAY. Entitlements/read-only load at Gateway login.
 - ONE live-data slot: live account must stay logged out of mobile/web while bot runs.
