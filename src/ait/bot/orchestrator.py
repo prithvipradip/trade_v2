@@ -1252,6 +1252,19 @@ class TradingOrchestrator:
         """
         adaptor = self._learning.adaptor
 
+        # INST-2/3 (institutional audit): manual + automatic ENTRY freeze.
+        #  - data/HALT: the operator's kill switch that isn't `kill` — blocks
+        #    all NEW entries while exits keep being managed. Delete to resume.
+        #  - data/HALT_UNTRACKED: set automatically when reconcile finds a
+        #    live option position with no local record (mid-placement crash);
+        #    trading blind next to an unmanaged position is not acceptable.
+        from pathlib import Path as _P
+        for _flag, _why in ((_P("data/HALT"), "manual halt file present"),
+                            (_P("data/HALT_UNTRACKED"), "untracked live position needs review")):
+            if _flag.exists():
+                log.warning("entries_halted", reason=_why, flag=str(_flag))
+                return True  # symbol handled: no new entries while halted
+
         # Check trade budget (time-based pacing)
         remaining = self._get_trade_budget()
         if remaining <= 0:

@@ -104,6 +104,34 @@ class TradeExecutor:
 
     async def execute_signal(self, signal: Signal, contracts: int) -> str | None:
         """Execute a trade signal. Returns trade_id on success, None on failure."""
+        # INST-5 (institutional audit): defined-risk-only as an EXECUTION
+        # gate, not a config policy. Undefined-risk (naked short premium)
+        # orders are refused unless explicitly allowed — in paper we allow
+        # them via run_orchestrator's default so the edge comparison runs;
+        # at go-live the env is unset and the wings become a contractual,
+        # not configured, loss floor.
+        import os as _os
+        if (not signal.is_defined_risk or signal.strategy_name == "short_strangle") \
+                and _os.environ.get("AIT_ALLOW_UNDEFINED_RISK") != "1":
+            log.error("undefined_risk_refused_at_executor",
+                      strategy=signal.strategy_name, symbol=signal.symbol)
+            return None
+
+        # INST-4: hard order-rate backstop. The daily budget bounds INTENTS
+        # via the orchestrator; nothing used to bound a logic bug that spams
+        # placements. Token bucket: >8 orders in a rolling 60s window is not
+        # a strategy, it's a malfunction — refuse and scream.
+        import time as _time
+        _bucket = getattr(self, "_order_times", None)
+        if _bucket is None:
+            _bucket = self._order_times = []
+        _now = _time.time()
+        _bucket[:] = [t for t in _bucket if _now - t < 60]
+        if len(_bucket) >= 8:
+            log.critical("order_rate_limit_tripped", orders_last_60s=len(_bucket))
+            return None
+        _bucket.append(_now)
+
         if not await self._ibkr.ensure_connected():
             log.error("execution_failed", reason="IBKR not connected")
             self._circuit_breaker.record_api_failure()

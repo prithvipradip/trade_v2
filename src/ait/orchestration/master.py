@@ -614,6 +614,38 @@ print(json.dumps(metrics.__dict__ if hasattr(metrics, '__dict__') else metrics, 
         _log("error", "daily_report_failed", error=str(e))
 
 
+def backup_state_db():
+    """INST-1 (institutional audit): the entire real track record — the whole
+    basis of the go/no-go decision — lives in ONE unreplicated SQLite file on
+    the box with the known process-killer. Online-safe daily backup via
+    sqlite3's .backup API; keeps 14 dailies locally + mirrors the latest to a
+    second directory outside the repo (sync that folder to cloud for off-box)."""
+    import sqlite3 as _sq
+    try:
+        src = DATA_DIR / "ait_state.db"
+        if not src.exists():
+            return
+        bdir = DATA_DIR / "backups"
+        bdir.mkdir(exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d")
+        dest = bdir / f"ait_state.{ts}.db"
+        with _sq.connect(str(src)) as con, _sq.connect(str(dest)) as out:
+            con.backup(out)
+        # prune to 14 most recent
+        snaps = sorted(bdir.glob("ait_state.*.db"))
+        for old_f in snaps[:-14]:
+            old_f.unlink(missing_ok=True)
+        # mirror latest outside the repo tree (second failure domain)
+        mirror_dir = Path.home() / "Documents" / "ait_backups"
+        mirror_dir.mkdir(parents=True, exist_ok=True)
+        import shutil
+        shutil.copy2(dest, mirror_dir / "ait_state.latest.db")
+        _log("info", "state_db_backed_up", dest=str(dest))
+    except Exception as e:  # noqa: BLE001
+        _log("error", "state_db_backup_failed", error=str(e))
+        _alert(f"STATE DB BACKUP FAILED: {e} — the track record is unprotected.")
+
+
 def cleanup_old_logs():
     """Remove logs and reports older than 30 days; cap rotated backups.
 
@@ -739,6 +771,8 @@ def main():
                       id="daily_retrain")
 
     # Daily performance report: 4:30 PM ET
+    scheduler.add_job(backup_state_db, CronTrigger(day_of_week="mon-fri", hour=17, minute=0),
+                      id="db_backup", name="State DB backup")
     scheduler.add_job(daily_report,
                       CronTrigger(day_of_week="mon-fri", hour=16, minute=30),
                       id="daily_report")

@@ -40,6 +40,12 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 # Revert to "4" here if the subscription ever lapses.
 os.environ.setdefault("AIT_MARKET_DATA_TYPE", "1")
 
+# Paper phase keeps short strangles enabled for the edge comparison
+# (PLAN.md go-live gates); the executor refuses undefined-risk orders unless
+# this is "1". REMOVE/SET TO 0 AT GO-LIVE — that's what makes defined-risk-
+# only contractual (institutional audit INST-5).
+os.environ.setdefault("AIT_ALLOW_UNDEFINED_RISK", "1")
+
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 # Load .env early so AIT_LIQ_* and any other env-var overrides reach the bot

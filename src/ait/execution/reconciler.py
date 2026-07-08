@@ -337,7 +337,26 @@ class PositionReconciler:
                 # only produced this log line. Flag it unmistakably so the
                 # orchestrator can alert; without handling it corrupts both
                 # the position count and every margin-based check.
-                if ibkr_pos.get("sec_type") == "STK":
+                if ibkr_pos.get("sec_type") == "OPT":
+                    # INST-3: a live OPTION at the broker with no local record
+                    # = the mid-placement crash window. It has no stop, no TP,
+                    # no expiry handling. Freeze new entries until a human
+                    # resolves it (delete data/HALT_UNTRACKED to resume).
+                    try:
+                        from pathlib import Path as _P
+                        _P("data/HALT_UNTRACKED").write_text(
+                            f"untracked {key} qty={ibkr_pos['quantity']} — "
+                            f"resolve at IBKR then delete this file")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    msg = (
+                        f"UNTRACKED OPTION POSITION (no local record): {key}, "
+                        f"qty={ibkr_pos['quantity']} — NEW ENTRIES FROZEN "
+                        f"(data/HALT_UNTRACKED). Resolve manually, then delete the file."
+                    )
+                    log.critical("reconcile_untracked_option_freeze",
+                                 position=key, qty=ibkr_pos["quantity"])
+                elif ibkr_pos.get("sec_type") == "STK":
                     msg = (
                         f"UNTRACKED STOCK POSITION (possible ASSIGNMENT): {key}, "
                         f"qty={ibkr_pos['quantity']}, avg_cost={ibkr_pos['avg_cost']} "

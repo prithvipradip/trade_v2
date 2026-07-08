@@ -133,6 +133,25 @@ DEFERRED (Round 3 todo — larger design work, ranked):
   ET-vs-local time in Friday gate + budget tiers; wmic deprecation in keeper.
 - Learning layer wakes at ~30 real closes; expect ~1 month at current fill rate.
 
+## Round 4 (2026-07-08 pre-open) — institutional architect audit: lifecycle guarantees
+Verdicts: order-lifecycle REFUSE (mid-placement crash window -> live unmanaged position);
+unprotected-book REFUSE for strangles / CONDITIONAL PASS for the IC-only funded config (the
+LONG WINGS are the broker-side protection — no OCA gold-plating needed at this size); state
+architecture REFUSE (no backup, mutable ledger); kill-switch REFUSE; clock CONDITIONAL PASS.
+ALL five right-sized remediations SHIPPED (~70 lines):
+- INST-1 daily `sqlite3 .backup` of ait_state.db (17:00 ET cron; 14 local snapshots + mirror
+  to ~/Documents/ait_backups — SYNC THAT FOLDER TO CLOUD for true off-box). Verified live.
+- INST-2 data/HALT file = operator kill switch (blocks new entries, exits keep managing).
+- INST-3 untracked live OPTION at broker (mid-placement crash) -> data/HALT_UNTRACKED auto-
+  freeze + CRITICAL alert until a human resolves and deletes the file.
+- INST-4 executor token-bucket rate limiter (>8 orders/60s = malfunction -> refuse + CRITICAL).
+- INST-5 defined-risk-only ENFORCED AT THE EXECUTOR: undefined-risk orders refused unless
+  AIT_ALLOW_UNDEFINED_RISK=1 (set by run_orchestrator for the paper phase; REMOVE AT GO-LIVE
+  — this is what makes the wings a contractual loss floor, gate 2 structural).
+Deferred (documented, right-sized OUT at this account size): broker-side OCA brackets,
+event-sourcing ledger rewrite, HA. Immutable-ledger need is partially met by daily snapshots.
+Governance-auditor findings (second agent) recorded separately when delivered.
+
 ## Go-live gates (decided 2026-07-07 — do NOT relitigate on a winning streak)
 Paper phase: ALL strategies stay enabled (incl. short_strangle) — the sample must answer
 "which strategies have edge", and paper blowups are data, not losses.
