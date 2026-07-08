@@ -1,5 +1,10 @@
 """Unified market data service with fallback chain.
 
+PRICE BASIS (deep-audit DATA-H1): all Yahoo calls pass auto_adjust=False
+so Close is split-adjusted but NOT dividend-adjusted — matching IBKR
+TRADES and Polygon. Mixed bases created fake step-returns at ex-div
+dates that corrupted features/labels for dividend payers (SPY/GLD/TLT..).
+
 Data source priority: IBKR → Yahoo Finance
 Each source has proper error handling — if one fails, the next is tried.
 NO mock/fake data is ever returned.
@@ -84,7 +89,7 @@ def load_daily_ohlcv(
         log.info("daily_ohlcv_yahoo_fallback", symbol=symbol, ib_rows=len(df))
         try:
             start = (date.today() - timedelta(days=days + 30)).isoformat()
-            ydf = yf.Ticker(symbol).history(start=start, interval="1d")
+            ydf = yf.Ticker(symbol).history(start=start, interval="1d", auto_adjust=False)
             if not ydf.empty:
                 df = ydf[["Open", "High", "Low", "Close", "Volume"]].copy()
         except Exception as exc:
@@ -295,7 +300,7 @@ class MarketDataService:
         try:
             loop = asyncio.get_running_loop()
             ticker = await loop.run_in_executor(None, lambda: yf.Ticker("^VIX"))
-            data = await loop.run_in_executor(None, lambda: ticker.history(period="1d"))
+            data = await loop.run_in_executor(None, lambda: ticker.history(period="1d", auto_adjust=False))
             if not data.empty:
                 return float(data["Close"].iloc[-1])
         except Exception as e:
@@ -388,7 +393,7 @@ class MarketDataService:
             loop = asyncio.get_running_loop()
             ticker = await loop.run_in_executor(None, lambda: yf.Ticker(symbol))
             df = await loop.run_in_executor(
-                None, lambda: ticker.history(period=period, interval=interval)
+                None, lambda: ticker.history(period=period, interval=interval, auto_adjust=False)
             )
 
             if df is None or df.empty:
@@ -523,7 +528,7 @@ class MarketDataService:
             loop = asyncio.get_running_loop()
             ticker = await loop.run_in_executor(None, lambda: yf.Ticker(symbol))
             df = await loop.run_in_executor(
-                None, lambda: ticker.history(period=period, interval=interval)
+                None, lambda: ticker.history(period=period, interval=interval, auto_adjust=False)
             )
 
             if df is None or df.empty:
@@ -547,7 +552,7 @@ class MarketDataService:
 
             last = float(info.last_price) if hasattr(info, "last_price") else 0.0
             if last <= 0:
-                data = await loop.run_in_executor(None, lambda: ticker.history(period="1d"))
+                data = await loop.run_in_executor(None, lambda: ticker.history(period="1d", auto_adjust=False))
                 if data.empty:
                     return None
                 last = float(data["Close"].iloc[-1])

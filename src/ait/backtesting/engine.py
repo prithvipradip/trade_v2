@@ -952,13 +952,11 @@ class Backtester:
         rv_long = realized_vol(close_arr, window=60) if len(close_arr) > 61 else rv_short
         iv_regime_high = rv_short > rv_long * 1.1  # Short-term vol elevated
 
-        # Always prefer iron condor — proven +311% in backtesting.
-        # Direction doesn't matter — iron condors profit from theta decay.
-        has_condor = bool(available & {"iron_condor"})
-
-        if has_condor:
-            candidates = available & {"iron_condor"}
-        elif direction == SignalDirection.NEUTRAL:
+        # BT-M8: iron_condor used to be FORCED whenever present, silently
+        # never trading the other requested strategies (and misleading every
+        # multi-strategy breakdown). Prefer it on NEUTRAL, but respect the
+        # requested strategy set for directional signals.
+        if direction == SignalDirection.NEUTRAL:
             candidates = available & CREDIT_STRATEGIES
         elif direction == SignalDirection.BULLISH:
             candidates = available & {"bull_call_spread", "long_call"}
@@ -967,6 +965,8 @@ class Backtester:
 
         if not candidates:
             return None
+        if "iron_condor" in candidates:
+            return "iron_condor"  # preferred among the eligible set
         return sorted(candidates)[0]
 
     # ------------------------------------------------------------------

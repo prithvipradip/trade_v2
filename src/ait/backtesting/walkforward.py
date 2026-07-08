@@ -99,7 +99,10 @@ class WalkForwardConfig:
 
     train_days: int = 365        # ~1 year training window (calendar days)
     test_days: int = 63          # ~3 months test window
-    step_days: int = 21          # ~1 month step between windows
+    step_days: int = 63          # == test_days: NON-overlapping by default (BT-M5:
+                                 # 21d step x 63d test simulated every date ~3x,
+                                 # triple-counting trades in pooled metrics and
+                                 # compounding overlapping windows in total_return)
     gap_days: int = 5            # Purge gap between train and test
     initial_capital: float = 100_000.0
     commission_per_contract: float = 0.65
@@ -212,7 +215,9 @@ class WalkForwardResult:
         std = np.std(all_pnls, ddof=1)
         if std == 0:
             return 0.0
-        return float((mean / std) * np.sqrt(252))
+        from ait.backtesting.result import annualization_factor
+        _all_t = [t for w in self.windows for t in w.backtest_result.trades]
+        return float((mean / std) * annualization_factor(_all_t))
 
     @property
     def max_drawdown(self) -> float:
@@ -272,7 +277,9 @@ class WalkForwardResult:
         ds_std = float(downside.std(ddof=1))
         if ds_std == 0:
             return 0.0
-        return (mean_pnl / ds_std) * float(np.sqrt(252))
+        from ait.backtesting.result import annualization_factor
+        _all_t = [t for w in self.windows for t in w.backtest_result.trades]
+        return (mean_pnl / ds_std) * annualization_factor(_all_t)
 
     @property
     def avg_win(self) -> float:
@@ -1221,6 +1228,8 @@ class WalkForwardBacktester:
             for t in result.trades:
                 t["symbol"] = symbol
             all_symbol_trades.extend(result.trades)
+            # (sorted chronologically after the loop — BT-M9: drawdown was
+            # computed on symbol-grouped, non-chronological order)
 
             # Save per-bar timeseries for dashboard (Layer 2c)
             if self._progress_dir is not None:
@@ -1236,9 +1245,16 @@ class WalkForwardBacktester:
                     precomputed_features=_oos_feat_cache,
                 )
 
+        all_symbol_trades.sort(
+            key=lambda t: str(t.get("entry_date") or t.get("entry_time") or ""))
         if all_symbol_trades:
             total_pnl = sum(t.get("pnl", 0) for t in all_symbol_trades)
-            window_capital = self._config.initial_capital
+            # Deep-audit BT-H3: each symbol is deliberately seeded with FULL
+            # capital (per-symbol sleeve — splitting made condors unaffordable),
+            # so the window's deployed capital is capital x N sleeves. Summing
+            # sleeve P&L onto a single full-capital account inflated returns
+            # ~N x (the mechanism behind the untrustworthy +311%).
+            window_capital = self._config.initial_capital * max(1, len(data))
             window_result = WindowResult(
                 window_id=window_id,
                 train_start=train_start,
@@ -2683,7 +2699,10 @@ class WalkForwardBacktester:
                 symbol_trades.setdefault(sym, []).append(t)
 
         results = {}
-        per_symbol_capital = self._config.initial_capital / max(len(data), 1)
+        # BT-M7: each symbol trades a FULL-capital sleeve (see BT-H3), so its
+        # return denominator is full capital — dividing by capital/N showed
+        # a +8% symbol as +40% on a 5-symbol run.
+        per_symbol_capital = self._config.initial_capital
         for sym, trades in symbol_trades.items():
             total_pnl = sum(t.get("pnl", 0) for t in trades)
             results[sym] = BacktestResult(

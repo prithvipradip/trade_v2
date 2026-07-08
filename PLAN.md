@@ -89,8 +89,21 @@ FIXED (commit refs this batch):
 | backtest/offline | fix_pnl_history refuses re-run (2nd run zeroed migrated wins); run_optimizer --apply requires AIT_ALLOW_APPLY=1 (was a direct overfit→live-config pipe); engine entry commission no longer double-debited |
 
 DEFERRED (Round 3 todo — larger design work, ranked):
-1. **Backtest credibility overhaul**: multi-symbol capital inflation (~N x returns), Sharpe √252 on per-trade P&L (~4.6x overstated, also inside the Optuna objective), overlapping-window double-counting, per-symbol return display, hard-forced iron_condor silencing other strategies, drawdown on mis-ordered trades. Treat ALL backtest numbers as directional-only until this lands.
-2. **Adjusted-vs-unadjusted price mixing** across IBKR/Polygon/Yahoo and between the two daily pipelines (corrupts features/labels for dividend payers incl. GLD/TLT/XLE). Needs a single price-basis policy.
+1. **Backtest credibility overhaul — CORE FIXED 2026-07-07 night**: sleeve-capital aggregation
+   (window capital = capital x N symbols; was ~N x inflated), trade-frequency-aware
+   Sharpe/Sortino annualization via `annualization_factor()` (was sqrt(252) per trade,
+   ~4.6x overstated; Sortino unified to target-0 downside deviation), non-overlapping
+   windows by default (step 21->63), chronological trade ordering for drawdown,
+   per-symbol returns vs full sleeve, forced-iron_condor removed (preferred on NEUTRAL
+   only). STILL OPEN from this cluster: export.py/app.py/analytics/duckdb display-side
+   sqrt(252) call sites (5), M10 param-collision in export/apply, M11 learner overlap
+   leak (sequential runs), and 3.4 fill realism. Historical run artifacts in reports/
+   were produced by the OLD math — re-run before citing any number.
+2. **Adjusted-vs-unadjusted price mixing — FIXED at the Yahoo boundary 2026-07-07 night**
+   (all 5 yfinance history() sites now auto_adjust=False = split-adjusted, div-unadjusted,
+   matching IBKR TRADES / Polygon). NOTE: previously-saved Yahoo-sourced rows in the SQLite
+   store and any trained models still carry the old mixed basis — next retrain refreshes
+   models; consider a one-time store re-backfill for dividend payers.
 3. Quote timestamps = exchange time (staleness detection currently blind); intraday bar-semantics tag (TRADES vs MIDPOINT vs adjusted); partial-day bar exclusion in live features.
 4. get_portfolio_summary must stop mutating protection state (EOD false MARKS-MISSING alert risk); watchdog ibkr/market_data components never heartbeated; daily-loss breaker still entry-gated + realized-only.
 5. GARCH members frozen at train time (stale up to reload interval); trainer rollback keyed on last symbol only; adaptor same-param compounding within a cycle; counterfactual eval min-elapsed guard; economic_calendar hardcoded 2026-only (year-end time bomb); DuckDB readers read_only; sortino/profit-factor display consistency; analyzer NULL-column guards.

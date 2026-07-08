@@ -167,4 +167,6 @@ class TestInvalidValues:
 
     def test_negative_min_open_interest(self) -> None:
         with pytest.raises(ValidationError):
-            OptionsConfig(min_open_interest=5)  # Below min of 10
+            OptionsConfig(min_open_interest=-1)  # Negative invalid (floor was
+            # intentionally loosened to 0 for paper/delayed accounts, and 0 now
+            # means "unknown OI passes" per deep-audit DATA-C2/M6)
