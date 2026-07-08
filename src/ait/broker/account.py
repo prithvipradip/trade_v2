@@ -97,6 +97,27 @@ class AccountManager:
                 log.warning("account_fetch_empty", using="cached_values")
             return self._snapshot
 
+        # AIT_SIMULATED_CAPITAL: cap every balance at a target size so the
+        # ENTIRE risk stack (capital tiers, position sizing, aggregate caps)
+        # behaves as if the account were that small. Purpose: validate the
+        # actual go-live configuration (e.g. $2k CAD ~= $1.4k USD -> MICRO
+        # tier, SPY credit spreads) on the big paper account. Opt-in via env.
+        import os as _os
+        _sim = _os.environ.get("AIT_SIMULATED_CAPITAL")
+        if _sim:
+            try:
+                _cap = float(_sim)
+                _real_nlv = float(values.get("NetLiquidation", 0)) or _cap
+                _scale = min(1.0, _cap / _real_nlv)
+                for _k in ("NetLiquidation", "BuyingPower", "AvailableFunds",
+                           "ExcessLiquidity", "CashBalance"):
+                    if values.get(_k):
+                        values[_k] = str(float(values[_k]) * _scale)
+                log.info("simulated_capital_active", target=_cap,
+                         real_nlv=round(_real_nlv, 0))
+            except (TypeError, ValueError):
+                pass
+
         self._snapshot = AccountSnapshot(
             timestamp=now,
             net_liquidation=float(values.get("NetLiquidation", 0)),

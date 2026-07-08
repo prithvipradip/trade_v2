@@ -219,8 +219,13 @@ class CapitalTierManager:
         config = self.get_config(capital)
         if underlying_price > config.max_underlying_price:
             return False
-        # Check if minimum spread ($1 wide) is affordable
-        min_risk = config.min_wing_width * 100  # $100 per $1 width
+        # Check if minimum spread ($1 wide) is affordable.
+        # Deep-audit SR-L11 fix (launch-blocking for a ~$1.4k USD start): a
+        # credit spread's actual max loss is width - credit (~65-75% of
+        # width), not the full width. Requiring the full $100/point bricked
+        # the MICRO tier below ~$1,667 — the tier documented as serving
+        # $0-2k could not trade at all. Use a 0.70 typical-max-loss factor.
+        min_risk = config.min_wing_width * 100 * 0.70
         max_risk = self.get_max_risk(capital)
         return max_risk >= min_risk
 

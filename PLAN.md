@@ -116,8 +116,15 @@ Going LIVE requires ALL of:
 2. **Defined-risk only**: iron condors (and debit structures) ONLY. NO short strangles live —
    their max_loss is a model estimate, not a contract. Strangles earn live status only after
    a real margin model + 3 months of live consistency at base size.
-3. **Tuition sizing**: fund with an amount whose TOTAL loss is acceptable ($5-10k). 1 contract,
-   1-2% max loss per trade, daily-loss halt on, VIX halt on, weekly human review mandatory.
+3. **Tuition sizing — user decision 2026-07-07: $2,000 CAD (~$1.4k USD) initial funding.**
+   That lands in the MICRO capital tier (SPY-only, $1-2-wide credit spreads, 2 positions) —
+   a DIFFERENT regime than the big-account paper run. Therefore: before go-live, run a
+   paper phase with AIT_SIMULATED_CAPITAL=1400 so the validated configuration IS the
+   launch configuration. (MICRO-tier affordability bug SR-L11 fixed 2026-07-07 —
+   the tier was bricked below ~$1,667.) 1 contract, daily-loss halt on, VIX halt on,
+   weekly human review mandatory. NOTE: at this size, commissions+slippage are ~$8-15
+   per round trip vs ~$20-40 profit targets — expect thin nets; the goal at $2k is
+   PROCESS validation with real money, not income.
 4. **Backtest credibility fixed first** (Round 3 deferred #1) — no sizing decision may cite
    backtest numbers until the engine's inflation bugs are fixed.
 5. Expect live < paper (real fills). Scale only on 3+ months of live evidence.
