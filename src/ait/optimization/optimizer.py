@@ -237,7 +237,11 @@ class StrategyOptimizer:
         if result.total_trades < _HARD_MIN_TRADES:
             return -100.0
         if self._min_trades > 0 and result.total_trades < self._min_trades:
-            value *= (result.total_trades / self._min_trades) ** 2
+            _f = (result.total_trades / self._min_trades) ** 2
+            # R5 audit: multiplying a NEGATIVE score by a <1 factor shrinks
+            # the loss toward zero — degenerate 3-9 trade configs outranked
+            # honest 12-trade losers. Penalize magnitude symmetrically.
+            value = value * _f if value > 0 else value / _f
 
         # Store per-trial metrics for dashboard Optuna tab (Layer 2b).
         trial.set_user_attr("sharpe",        round(float(result.sharpe_ratio), 4))

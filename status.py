@@ -181,7 +181,9 @@ def main() -> None:
               f"unreal=${p['unrealized']:+8.2f} ({p['pnl_pct']:+.1f}%)  since {p['since']}")
     print("\nREALIZED P&L  (real exits only)")
     print(f"  today   : ${s['pnl_today']:>10,.2f}  ({s['pnl_today_n']} closed)")
-    print(f"  lifetime: ${s['pnl_life']:>10,.2f}  ({s['pnl_life_n']} closed)")
+    # R5: "lifetime" hid the 2026-07-06 reset (95 broken-P&L trades archived
+    # to trades_legacy). Label honestly so nobody reads this as full history.
+    print(f"  since 07-06 reset: ${s['pnl_life']:>10,.2f}  ({s['pnl_life_n']} closed; pre-reset archive in trades_legacy)")
     print("\n" + "=" * 56)
 
 

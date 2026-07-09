@@ -115,13 +115,18 @@ def _build_chunks(years: float, chunk_months: int) -> list[tuple[datetime, str]]
     total_months = int(years * 12)
     chunks: list[tuple[datetime, str]] = []
 
+    # R5 audit C2: stepping back a flat 31 days per month while requesting
+    # IBKR calendar-month durations left 1-5 day holes at every chunk
+    # boundary (months are shorter than 31 days). Step by real calendar
+    # months so consecutive chunks abut exactly.
+    from dateutil.relativedelta import relativedelta
     end = now
     remaining = total_months
     while remaining > 0:
         this_chunk = min(chunk_months, remaining)
         duration = f"{this_chunk} M"
         chunks.append((end, duration))
-        end = end - timedelta(days=this_chunk * 31)
+        end = end - relativedelta(months=this_chunk)
         remaining -= this_chunk
 
     return chunks
@@ -196,7 +201,11 @@ async def _backfill_intraday_symbol(
         df.set_index("Datetime", inplace=True)
         df = df[["Open", "High", "Low", "Close", "Volume"]]
 
-        stored = store.save_intraday(symbol, df, interval="5m")
+        # R5 audit C1: source tag was omitted, so MIDPOINT bars (the default
+        # --what-to-show) were stamped 'TRADES' and silently overwrote real
+        # trade bars from backfill_intraday.py via INSERT OR REPLACE.
+        stored = store.save_intraday(symbol, df, interval="5m",
+                                     source=what_to_show)
         total_stored += stored
         print(f" → {len(df)} bars fetched, {stored} rows upserted")
 

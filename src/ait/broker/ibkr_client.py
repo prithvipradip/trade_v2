@@ -80,6 +80,23 @@ class IBKRClient:
                 account = self._config.ibkr_account or (
                     self._ib.managedAccounts()[0] if self._ib.managedAccounts() else "unknown"
                 )
+                # R5 audit CRITICAL: nothing anywhere verified paper-vs-live.
+                # ensure_gateway() trusts any process on the port and the IBC
+                # config decides the mode at login — assert the account type
+                # matches expectations here, the one place every session
+                # passes through. IBKR paper accounts start with "D".
+                _expect_paper = os.environ.get("AIT_EXPECT_LIVE_ACCOUNT") != "1"
+                _is_paper_acct = str(account).upper().startswith("D")
+                if account != "unknown" and _expect_paper and not _is_paper_acct:
+                    log.critical("LIVE_ACCOUNT_ON_PAPER_SESSION",
+                                 account=account,
+                                 hint="set AIT_EXPECT_LIVE_ACCOUNT=1 only at go-live")
+                    self._ib.disconnect()
+                    return False
+                if account != "unknown" and not _expect_paper and _is_paper_acct:
+                    log.critical("PAPER_ACCOUNT_ON_LIVE_SESSION", account=account)
+                    self._ib.disconnect()
+                    return False
                 log.info(
                     "ibkr_connected",
                     host=self._config.ibkr_host,

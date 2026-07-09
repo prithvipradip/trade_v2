@@ -62,8 +62,8 @@ async function tick(){
   E('pnl').innerHTML=
     `<div class="big ${s.pnl_today>=0?'ok':'bad'}">$${s.pnl_today.toFixed(2)}</div>`+
     row('today closed', s.pnl_today_n)+
-    row('lifetime', '$'+s.pnl_life.toFixed(2), s.pnl_life>=0?'ok':'bad')+
-    row('lifetime closed', s.pnl_life_n)+
+    row('since 07-06 reset', '$'+s.pnl_life.toFixed(2), s.pnl_life>=0?'ok':'bad')+
+    row('closed since reset', s.pnl_life_n)+
     row('open unrealized', (s.unrealized_total>=0?'+$':'-$')+Math.abs(s.unrealized_total||0).toFixed(2),
         (s.unrealized_total||0)>=0?'ok':'bad');
   if(s.open_positions.length){

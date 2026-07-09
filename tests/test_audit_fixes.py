@@ -98,6 +98,10 @@ class TestBotManagerSupervision:
 
     def test_fresh_models_marker_triggers_one_restart(self, bot_manager, monkeypatch):
         master, mgr = bot_manager
+        # R5 audit: R2.11 defers marker restarts during market hours, so this
+        # test failed 9:30-16:00 ET and passed off-hours — a wall-clock-
+        # dependent CI verdict. Pin the market closed.
+        monkeypatch.setattr(master, "is_market_open", lambda: False, raising=False)
         mgr._proc = SimpleNamespace(pid=123, poll=lambda: None, returncode=None)
         marker = master.ROOT / "models" / ".retrained"
         marker.write_text("2026-07-07")

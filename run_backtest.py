@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--train-days", type=int, default=365, help="Training window days (calendar)")
     p.add_argument("--test-days", type=int, default=63, help="Test window days")
-    p.add_argument("--step-days", type=int, default=21, help="Step between windows")
+    p.add_argument("--step-days", type=int, default=63, help="Step between windows")
     p.add_argument("--gap-days", type=int, default=5, help="Purge gap days")
     p.add_argument("--capital", type=float, default=50_000.0, help="Initial capital")
     p.add_argument("--min-confidence", type=float, default=0.65, help="Min ML confidence")

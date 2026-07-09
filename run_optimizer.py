@@ -143,7 +143,9 @@ def main() -> None:
                   "params into the live config (they are in-sample only).")
         else:
             result.apply_to_config(args.config)
-        print(f"Best params written to: {args.config}")
+            # R5 audit: this print sat OUTSIDE the else — the tool claimed
+            # "Best params written" even when the apply was refused.
+            print(f"Best params written to: {args.config}")
 
 
 if __name__ == "__main__":

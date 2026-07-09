@@ -53,15 +53,22 @@ options:
   strategies:
     - long_call
     - long_put
-    - covered_call
-    - cash_secured_put
     - bull_call_spread
     - bear_put_spread
     - iron_condor
     - long_straddle
     - short_strangle
-    - calendar_spread     # Low-IV complement to iron condor (active when IV rank < 50)
-    - event_straddle      # Long straddle 0-1d before FOMC/CPI/NFP — long-vol complement
+    # Disabled 2026-07-08 (Round 5 audit) — all four were dead weight or latent hazards:
+    # - covered_call      R5: NO stock-ownership check exists -> a fill would be a NAKED
+    #                     call booked as defined-risk; only blocked today by the 3% cap
+    #                     arithmetic. Also permanently risk-rejected at this account size.
+    # - cash_secured_put  R5: max_loss ~$8.5k+ always exceeds the 3% per-trade cap; pure
+    #                     wasted scan cycles that burned execution fall-through slots.
+    # - calendar_spread   R5: structurally dead — far leg needs 45-80 DTE but chains are
+    #                     only fetched 7-30 DTE / 3 closest expiries. Never emitted a signal.
+    # - event_straddle    R5: mutually exclusive with AIT_SKIP_MACRO_EVENTS=1 (enabled
+    #                     2026-07-08 — scans skip event days entirely). Also days_to_event=0
+    #                     accepts entry AFTER 8:30am releases, buying straight into IV crush.
 
 backtest:
   initial_capital: 100000              # Starting capital for walk-forward / integration tests
@@ -116,6 +123,12 @@ exit:
 
 learning:
   enabled: true                          # Self-learning: adapt strategies from past trades
+  paper_trading_mode: true               # R5 audit: this was NEVER set (code default False),
+                                         # so Thompson re-ranking / adaptor overrides / flow
+                                         # hard-gate bypasses were all INACTIVE, contradicting
+                                         # PLAN.md's design. True = paper measures the fixed
+                                         # ruleset so results stay comparable to the backtest.
+                                         # MUST be set false (or removed) at go-live.
   lookback_days: 30                      # Analyze last 30 days of trades
   max_adaptations_per_cycle: 3           # Max config changes per learning cycle
   min_insight_confidence: 0.60           # Only act on insights above 60% confidence

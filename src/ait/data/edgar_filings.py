@@ -42,7 +42,9 @@ TICKER_TO_CIK = {
 }
 
 # Friendly user-agent required by EDGAR
-USER_AGENT = "AIT v2 Trading Bot research@example.com"
+# R5 audit: was a placeholder example.com address — SEC blocks non-compliant
+# UAs with persistent 403s, silently disabling the 8-K safety flatten.
+USER_AGENT = "AIT v2 Trading Bot prithvi.pradip@cluedigital.com"
 
 
 @dataclass

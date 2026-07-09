@@ -223,7 +223,14 @@ class RegimeDetector:
 
         # High volatility override (VIX > 30 or realized vol > 40%)
         if (vix and vix > 30) or vol > 0.40:
-            return MarketRegime.HIGH_VOLATILITY, min(0.9, vol)
+            # R5 audit HIGH: confidence used to be the raw vol fraction
+            # (VIX-35 crash with 25% realized vol -> 0.25), but the live
+            # consumers gate defensive action at >0.70/0.80 — the crash
+            # override only woke at ~2008-level realized vol. Scale so any
+            # classification at the trigger threshold clears the gates:
+            # vol 0.40 -> 0.80; VIX-triggered entries floor at 0.80.
+            conf = max(0.80, min(0.9, vol / 0.50))
+            return MarketRegime.HIGH_VOLATILITY, conf
 
         # IV Crush: vol was recently high but is rapidly compressing
         # (iv_rank dropping from high, vol trend negative)

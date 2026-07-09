@@ -68,7 +68,7 @@ def _safe_fetchone(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> di
 
 def _get_state_value(conn: sqlite3.Connection, key: str) -> str | None:
     """Read a value from the state table."""
-    row = _safe_fetchone(conn, "SELECT value FROM state WHERE key = ?", (key,))
+    row = _safe_fetchone(conn, "SELECT value FROM bot_state WHERE key = ?", (key,))
     return row["value"] if row else None
 
 
@@ -786,7 +786,7 @@ def _tab_self_learning(conn: sqlite3.Connection) -> None:
     st.subheader("All Learning State Keys")
     learning_keys = _safe_query(
         conn,
-        "SELECT key, value FROM state WHERE key LIKE 'learning_%' ORDER BY key",
+        "SELECT key, value FROM bot_state WHERE key LIKE 'learning_%' ORDER BY key",
     )
     if not learning_keys.empty:
         st.dataframe(learning_keys, use_container_width=True, hide_index=True)
@@ -956,7 +956,7 @@ def _tab_system_health(conn: sqlite3.Connection) -> None:
     st.subheader("Component Status")
     watchdog_keys = _safe_query(
         conn,
-        "SELECT key, value FROM state WHERE key LIKE 'watchdog_%' ORDER BY key",
+        "SELECT key, value FROM bot_state WHERE key LIKE 'watchdog_%' ORDER BY key",
     )
     if not watchdog_keys.empty:
         for _, row in watchdog_keys.iterrows():

@@ -152,6 +152,17 @@ class BotManager:
         # so rotate here at start time — the only moment the handle is closed
         # (Windows cannot rename an open file). Bot restarts are frequent
         # enough that this bounds growth in practice.
+        # R5 audit F10: the crash-restart path (health_check -> start())
+        # opened a new handle without closing the previous one — the leaked
+        # handle kept the file open, every rotation rename failed (WinError
+        # 32), and rotation had NEVER succeeded (98MB log, destroyed crash
+        # dumps, the 2GB incident). Close before rotating.
+        if getattr(self, "_log_handle", None):
+            try:
+                self._log_handle.close()
+            except Exception:
+                pass
+            self._log_handle = None
         self._rotate_stdout_log()
         self._log_handle = open(LOGS_DIR / "bot_stdout.log", "a")
         self._proc = subprocess.Popen(

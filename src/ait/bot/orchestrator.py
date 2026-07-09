@@ -165,12 +165,14 @@ class TradingOrchestrator:
         if str(getattr(settings.trading, "mode", "paper")).lower() != "paper":
             _spread_env = float(_os_g5.environ.get("AIT_LIQ_MAX_SPREAD", "0.15"))
             _vol_env = int(_os_g5.environ.get("AIT_LIQ_MIN_VOLUME", "10"))
-            if _spread_env > 0.15 or _vol_env < 1:
+            _spread_cfg = float(getattr(settings.options, "max_bid_ask_spread_pct", 0.15) or 0.15)
+            if _spread_env > 0.15 or _vol_env < 1 or _spread_cfg > 0.15:
                 raise RuntimeError(
                     "LIVE-PROFILE ASSERTION FAILED: liquidity gates are still "
                     f"paper-relaxed (AIT_LIQ_MAX_SPREAD={_spread_env}, "
-                    f"AIT_LIQ_MIN_VOLUME={_vol_env}). Tighten them before live "
-                    "(see docs/RUNBOOK.md go-live checklist)."
+                    f"AIT_LIQ_MIN_VOLUME={_vol_env}, "
+                    f"config max_bid_ask_spread_pct={_spread_cfg}). Tighten "
+                    "them before live (see docs/RUNBOOK.md go-live checklist)."
                 )
 
         # GOV-3 (governance audit): defined-risk-only keyed to TRADING MODE,
@@ -443,8 +445,18 @@ class TradingOrchestrator:
                 # is NOT "bullish") and poisons drift accuracy tracking.
                 if trade.strategy not in ("iron_condor", "short_strangle"):
                     actual_dir = "bullish" if realized_pnl > 0 else "bearish"
+                    # R5 audit CRITICAL: predictions are recorded under
+                    # "{symbol}-{direction}" (see _scan_symbol) but outcomes
+                    # were recorded under the real trade id — keys never
+                    # matched, record_outcome silently no-opped, and drift
+                    # detection had NEVER completed a single sample. Use the
+                    # same key the prediction was recorded under (predictions
+                    # key on bullish/bearish; TradeDirection is long/short).
+                    _tdir = str(getattr(getattr(trade, "direction", ""), "value",
+                                        getattr(trade, "direction", "")) or "")
+                    _dir = {"long": "bullish", "short": "bearish"}.get(_tdir, _tdir)
                     self._trainer.drift_detector.record_outcome(
-                        trade_id=trade_id,
+                        trade_id=f"{trade.symbol}-{_dir}",
                         actual_direction=actual_dir,
                     )
 
@@ -571,7 +583,9 @@ class TradingOrchestrator:
                     if pos.symbol == filing.symbol:
                         await self._execute_exit(pos)
         except Exception as e:
-            log.debug("material_event_check_failed", error=str(e))
+            # R5 audit: was log.debug — a permanently-failing 8-K check (e.g.
+            # SEC blocking the UA) looked identical to "no filings" for months.
+            log.warning("material_event_check_failed", error=str(e))
 
     async def _trading_loop(self) -> None:
         """Main trading loop during market hours.
@@ -1024,8 +1038,11 @@ class TradingOrchestrator:
                                  bias_strength=flow.bias_strength)
                         return  # Skip this symbol entirely
 
-                # Boost confidence if flow agrees with prediction direction
-                if flow.bias_strength > 0.5:
+                # Boost confidence if flow agrees with prediction direction.
+                # R5 audit: the hard gate above was paper-bypassed but this boost
+                # was not — paper results absorbed flow noise the backtest never
+                # sees, breaking Gap Z7's comparability rationale. Same bypass.
+                if not paper_mode and flow.bias_strength > 0.5:
                     if (flow.overall_bias == "bullish" and direction == SignalDirection.BULLISH) or \
                        (flow.overall_bias == "bearish" and direction == SignalDirection.BEARISH):
                         final_confidence = min(1.0, final_confidence + flow.bias_strength * 0.1)
@@ -1413,12 +1430,22 @@ class TradingOrchestrator:
                 reason=validation.reason,
             )
             # Record counterfactual for risk-rejected trades
+            # R5 audit CRITICAL: this site stored the OPTION premium as
+            # entry_price while evaluate_outcomes() compares against the
+            # UNDERLYING spot — a skipped $3.50 call on $620 SPY scored as a
+            # +17,600% missed win. Record the underlying reference price,
+            # same units as the other two record sites.
+            _under_px = 0.0
+            try:
+                _under_px = float(signal.underlying_price or 0)
+            except Exception:
+                pass
             self._counterfactual.record_skip(
                 symbol=signal.symbol,
                 strategy=signal.strategy_name,
                 direction=signal.direction.value,
                 confidence=confidence,
-                entry_price=signal.entry_price,
+                entry_price=_under_px,
                 reject_reason=f"risk_{validation.reason}",
             )
             return False  # rejected — let the caller try the next-ranked strategy

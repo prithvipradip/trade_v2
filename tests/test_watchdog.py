@@ -55,15 +55,18 @@ class TestErrorTracking:
         health = watchdog.get_health()
         assert health.components["test"].status == ComponentStatus.DOWN
 
-    def test_heartbeat_resets_errors(self, watchdog):
+    def test_heartbeat_does_not_reset_errors(self, watchdog):
+        # R5 audit: this test used to assert error_count == 0 after a
+        # heartbeat — enshrining the exact bug Round 3 fixed (a hot error
+        # loop that also heartbeats could never trip the watchdog). The
+        # fixed behavior: heartbeat refreshes liveness, error count persists.
         watchdog.register_component("test")
         watchdog.record_error("test", "error")
         watchdog.record_error("test", "error")
         watchdog.heartbeat("test")
 
         health = watchdog.get_health()
-        assert health.components["test"].status == ComponentStatus.HEALTHY
-        assert health.components["test"].error_count == 0
+        assert health.components["test"].error_count == 2
 
 
 class TestOverallHealth:

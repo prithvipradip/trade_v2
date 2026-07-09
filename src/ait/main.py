@@ -26,7 +26,17 @@ from pathlib import Path
 # stderr -> bot_stdout.log. The bot was dying every 30-60 min to a c0000005
 # access violation in a C-extension (2026-06-24); this names the exact call
 # site on the next crash so we can pin the culprit library.
-faulthandler.enable()
+# R5 audit F4: dumps used to go to stderr -> bot_stdout.log, where the
+# rotation/truncation cycle destroyed every one of them — the c0000005 call
+# site is still unproven after ~30 WER crash reports. Dedicated always-open
+# file; falls back to stderr if the logs dir is unwritable.
+try:
+    from pathlib import Path as _P
+    _P("logs").mkdir(exist_ok=True)
+    _fatal_log = open("logs/fatal.log", "a")
+    faulthandler.enable(file=_fatal_log)
+except Exception:
+    faulthandler.enable()
 
 from ait.bot.orchestrator import TradingOrchestrator
 from ait.broker.ibkr_client import IBKRClient

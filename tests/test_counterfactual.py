@@ -27,6 +27,19 @@ class TestSkippedTrade:
         assert t.would_have_won is None
 
 
+def _age_records(tracker, hours: float = 25.0) -> None:
+    """Backdate pending records past the 24h min-age guard (deep-audit VL).
+
+    The guard makes fresh records unevaluable by design; tests that expect
+    evaluation must age their records first, like real records age overnight.
+    """
+    from datetime import datetime, timedelta
+    ts = (datetime.now() - timedelta(hours=hours)).isoformat()
+    for t in tracker._skipped:
+        if not t.outcome_checked:
+            t.timestamp = ts
+
+
 class TestCounterfactualTracker:
     """Test the counterfactual tracking system."""
 
@@ -56,6 +69,7 @@ class TestCounterfactualTracker:
             confidence=0.70, entry_price=450.0, reject_reason="risk_limit",
         )
         # Price went up significantly
+        _age_records(tracker)
         evaluated = tracker.evaluate_outcomes({"SPY": 470.0})
         assert evaluated == 1
         assert tracker.pending_count == 0
@@ -70,6 +84,7 @@ class TestCounterfactualTracker:
             confidence=0.60, entry_price=380.0, reject_reason="meta_label_reject",
         )
         # Price went down — our filter was correct
+        _age_records(tracker)
         evaluated = tracker.evaluate_outcomes({"QQQ": 370.0})
         assert evaluated == 1
 
@@ -83,6 +98,7 @@ class TestCounterfactualTracker:
             confidence=0.75, entry_price=450.0, reject_reason="low_confidence",
         )
         # Price went down — bearish was correct, we missed it
+        _age_records(tracker)
         evaluated = tracker.evaluate_outcomes({"SPY": 430.0})
         assert evaluated == 1
 
@@ -95,6 +111,7 @@ class TestCounterfactualTracker:
             confidence=0.80, entry_price=170.0, reject_reason="risk_limit",
         )
         # No price available for AAPL
+        _age_records(tracker)
         evaluated = tracker.evaluate_outcomes({"SPY": 450.0})
         assert evaluated == 0
         assert tracker.pending_count == 1
@@ -105,6 +122,7 @@ class TestCounterfactualTracker:
         tracker.record_skip("QQQ", "long_call", "bullish", 0.70, 380.0, "meta_label_reject")
         tracker.record_skip("AAPL", "iron_condor", "neutral", 0.80, 170.0, "low_confidence")
 
+        _age_records(tracker)
         tracker.evaluate_outcomes({"SPY": 470.0, "QQQ": 370.0, "AAPL": 170.5})
 
         analysis = tracker.get_analysis()
@@ -115,6 +133,7 @@ class TestCounterfactualTracker:
         tracker.record_skip("SPY", "long_call", "bullish", 0.65, 450.0, "risk_limit")
         tracker.record_skip("QQQ", "iron_condor", "neutral", 0.80, 380.0, "risk_limit")
 
+        _age_records(tracker)
         tracker.evaluate_outcomes({"SPY": 470.0, "QQQ": 380.5})
 
         analysis = tracker.get_analysis()
@@ -144,6 +163,7 @@ class TestCounterfactualTracker:
 
         # Evaluate: all prices went up (all would have won)
         prices = {f"S{i}": 110.0 for i in range(10)}
+        _age_records(tracker)
         tracker.evaluate_outcomes(prices)
 
         worst = tracker.get_worst_filters(min_observations=5)

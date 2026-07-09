@@ -260,7 +260,15 @@ class MultiTimeframeAnalyzer:
         )
 
     def _analyze_intraday(self, df: pd.DataFrame) -> TimeframeSignal:
-        """Analyze intraday trend from 5-min bars."""
+        """Analyze intraday trend from 5-min bars (latest session only)."""
+        # R5 audit HIGH: callers pass up to 730 days of 5-min bars, so the
+        # "intraday" VWAP/volume-average were computed over ~2 years — in any
+        # sustained trend the signal saturated permanently bullish/bearish
+        # and skewed the confidence boost on every entry. Slice to the most
+        # recent session before computing anything.
+        if len(df) and hasattr(df.index, "date"):
+            _last_day = df.index.date[-1]
+            df = df[df.index.date == _last_day]
         close = df["Close"]
         volume = df["Volume"]
 

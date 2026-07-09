@@ -1,3 +1,14 @@
+> [!WARNING]
+> **STALE — DO NOT TRUST (banner added 2026-07-08, Round 5 audit).**
+> This document predates the July 2026 audit rounds. Specifically:
+> all quoted performance numbers (Sharpe 8-24, +183% OOS, etc.) came from
+> backtest math since proven wrong (sleeve-capital inflation, sqrt(252)
+> annualization, window overlap); the credit-sizing formula described here
+> was a 4-5x risk understatement bug; the delta gate / hedging described as
+> active are DEAD (no greeks feed); config numbers (universe, DTE, caps,
+> confidence) no longer match config.yaml. **PLAN.md is the only current
+> source of truth.** Structural lessons remain useful; numbers do not.
+
 # AIT v2 — Walk-Forward Experiment Insights
 
 > **Purpose:** A living record of what each experiment taught us. Covers what we configured, what we assumed, what the results showed, and what we changed as a consequence. Update this file after every experiment.

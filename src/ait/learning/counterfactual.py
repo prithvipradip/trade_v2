@@ -7,7 +7,11 @@ This helps identify:
 - Correctly avoided losses (filter working well)
 - Strategy-specific filter accuracy
 
-The bot uses this data to tune its filters over time.
+ADVISORY ONLY (R5 audit): nothing consumes this data automatically — it
+surfaces in the post-market log/Telegram report for a human to read. The
+"win" model is crude (underlying moved >2% in the skip direction, scored
+once after >=24h); it is NOT option-structure P&L and must not be treated
+as a P&L estimate.
 """
 
 from __future__ import annotations
@@ -76,6 +80,16 @@ class CounterfactualTracker:
             entry_price=entry_price,
             reject_reason=reject_reason,
         )
+        # R5 audit: _scan_symbol fires every ~5 min — persistently-rejected
+        # symbols generated hundreds of duplicate records/day, evicting older
+        # records before the 24h min-age let them be scored (evaluation
+        # starved on every active day). One unevaluated record per
+        # (symbol, strategy, reason) at a time.
+        for _t in self._skipped:
+            if (not _t.outcome_checked and _t.symbol == symbol
+                    and _t.strategy == strategy
+                    and _t.reject_reason == reject_reason):
+                return
         self._skipped.append(record)
 
         # Trim history
@@ -126,7 +140,11 @@ class CounterfactualTracker:
                 if _age_h < 24:
                     continue
             except (ValueError, TypeError):
-                pass
+                # R5 audit: falling through evaluated the record immediately —
+                # the exact ~0%-move "correct skip" inflation the min-age
+                # guard exists to prevent. Malformed timestamp = unevaluable.
+                trade.outcome_checked = True
+                continue
 
             # Simple model: would the direction have been correct?
             price_change_pct = (current_price - trade.entry_price) / trade.entry_price
@@ -157,7 +175,12 @@ class CounterfactualTracker:
 
         Returns a summary of how well our filters are working.
         """
-        checked = [t for t in self._skipped if t.outcome_checked]
+        # R5 audit: outcome_checked includes unevaluable records
+        # (would_have_won None — credit strategies, bad prices, bad
+        # timestamps). Counting None as falsy made every unevaluable skip a
+        # "correct skip", inflating filter_accuracy toward 100%.
+        checked = [t for t in self._skipped
+                   if t.outcome_checked and t.would_have_won is not None]
         if not checked:
             return {
                 "total_skipped": len(self._skipped),

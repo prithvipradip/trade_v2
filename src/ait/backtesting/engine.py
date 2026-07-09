@@ -516,7 +516,7 @@ class Backtester:
                     # Find first bar in the entry window
                     window_bars = session_bars[
                         session_bars.index.to_series().apply(
-                            lambda ts: self._is_in_entry_window(ts.time())
+                            lambda ts: self._is_in_entry_window(ts)
                         )
                     ]
                     if window_bars.empty:
@@ -771,11 +771,27 @@ class Backtester:
         return dt_time(int(h), int(m))
 
     def _is_in_entry_window(self, bar_time) -> bool:
-        """Return True if bar_time (datetime.time) is within the entry window."""
+        """Return True if bar_time is within the ET entry window.
+
+        Accepts a datetime.time (assumed already ET) or a timestamp. R5 audit
+        C4: intraday bars are stored tz-aware UTC, but this compared the RAW
+        clock time against ET strings — only 13:30-15:30 *UTC* bars passed,
+        so every backtest entered solely in the first ~2h of the session
+        (DST-shifting), regardless of the configured window. Convert
+        tz-aware timestamps to America/New_York first.
+        """
         from datetime import time as dt_time
         start = self._parse_et_time(self._entry_window_start_et)
         end = self._parse_et_time(self._entry_window_end_et)
-        t = bar_time if isinstance(bar_time, dt_time) else bar_time.time()
+        if isinstance(bar_time, dt_time):
+            t = bar_time
+        else:
+            ts = bar_time
+            if getattr(ts, "tzinfo", None) is not None:
+                from zoneinfo import ZoneInfo
+                ts = ts.tz_convert("America/New_York") if hasattr(ts, "tz_convert") \
+                    else ts.astimezone(ZoneInfo("America/New_York"))
+            t = ts.time()
         return start <= t < end
 
     def _check_intraday_exit(

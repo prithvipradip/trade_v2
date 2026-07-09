@@ -304,10 +304,17 @@ def load_settings(config_path: str | Path = "config.yaml") -> Settings:
     """Load settings from YAML file, with env var overrides for secrets."""
     config_path = Path(config_path)
 
-    yaml_data = {}
-    if config_path.exists():
-        with open(config_path) as f:
-            yaml_data = yaml.safe_load(f) or {}
+    # R5 audit: silently falling back to all-defaults gave a materially
+    # different bot (default universe, meta-label ON, FinBERT ON -> crash
+    # loop, 10 contracts/trade) whenever launched from the wrong cwd.
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"Config file not found: {config_path.resolve()} — refusing to "
+            "run on pydantic defaults. Launch from the repo root or pass an "
+            "explicit --config path."
+        )
+    with open(config_path) as f:
+        yaml_data = yaml.safe_load(f) or {}
 
     # IBKR and API keys come from environment only
     yaml_data["ibkr"] = IBKREnvConfig().model_dump()

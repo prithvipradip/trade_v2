@@ -33,6 +33,43 @@ log = get_logger("execution.executor")
 DEFAULT_ORDER_TIMEOUT = 90  # 90 seconds
 
 
+# R5 audit: expected (n_sell, n_buy) leg shape per multi-leg strategy. A combo
+# whose SELL/BUY counts disagree with its strategy name is refused — this is
+# the only layer between strategy signal dicts and the wire.
+_EXPECTED_LEG_SHAPE = {
+    "iron_condor": (2, 2),
+    "short_strangle": (2, 0),
+    "long_straddle": (0, 2),
+    "event_straddle": (0, 2),
+    "bull_call_spread": (1, 1),
+    "bear_put_spread": (1, 1),
+    "calendar_spread": (1, 1),
+}
+
+
+def _validate_combo_legs(strategy_name: str, legs: list[dict]) -> str | None:
+    """Return an error string if the combo legs are malformed, else None."""
+    sells = buys = 0
+    for leg in legs:
+        action = str(leg.get("action", "")).upper()
+        if action not in ("BUY", "SELL"):
+            return f"invalid leg action {leg.get('action')!r}"
+        if int(leg.get("conId", 0) or 0) <= 0:
+            return "leg missing qualified conId"
+        ratio = int(leg.get("ratio", 1) or 0)
+        if ratio < 1 or ratio > 4:
+            return f"suspicious leg ratio {ratio}"
+        if action == "SELL":
+            sells += 1
+        else:
+            buys += 1
+    expected = _EXPECTED_LEG_SHAPE.get(strategy_name)
+    if expected and (sells, buys) != expected:
+        return (f"leg shape ({sells} SELL, {buys} BUY) does not match "
+                f"{strategy_name} (expects {expected[0]} SELL, {expected[1]} BUY)")
+    return None
+
+
 def combo_entry_limit(entry_price: float, is_credit: bool) -> tuple[float, float]:
     """Marketable limit for a multi-leg combo entry.
 
@@ -111,7 +148,10 @@ class TradeExecutor:
         # at go-live the env is unset and the wings become a contractual,
         # not configured, loss floor.
         import os as _os
-        if (not signal.is_defined_risk or signal.strategy_name == "short_strangle") \
+        # R5 audit: covered_call included — no stock-ownership check exists
+        # anywhere, so a CC fill would be a NAKED call mislabeled defined-risk.
+        if (not signal.is_defined_risk
+                or signal.strategy_name in ("short_strangle", "covered_call")) \
                 and _os.environ.get("AIT_ALLOW_UNDEFINED_RISK") != "1":
             log.error("undefined_risk_refused_at_executor",
                       strategy=signal.strategy_name, symbol=signal.symbol)
@@ -336,6 +376,18 @@ class TradeExecutor:
                 "ratio": signal.legs[i].get("ratio", 1),
             })
 
+        # R5 audit CRITICAL: strategy leg dicts flowed verbatim to the wire —
+        # nothing asserted leg-side integrity, and a single reversed leg turns
+        # defined-risk into undefined-risk (and can be instantly marketable
+        # under the always-BUY/signed-price convention). Validate structure
+        # before building the BAG.
+        _err = _validate_combo_legs(signal.strategy_name, qualified_legs)
+        if _err:
+            log.error("combo_legs_rejected", trade_id=trade_id,
+                      strategy=signal.strategy_name, reason=_err)
+            self._state.update_trade_status(trade_id, TradeStatus.CANCELLED)
+            return None
+
         combo = ContractBuilder.combo(
             symbol=signal.symbol,
             legs=qualified_legs,
@@ -384,6 +436,14 @@ class TradeExecutor:
         limit_price, aggressive_offset = combo_entry_limit(
             signal.entry_price, is_credit
         )
+        # R5 audit: for debit combos the marketable cross (up to +15%) pushed
+        # the worst-case cost past the max_loss the risk manager validated —
+        # a systematic ~15% understatement. Cap the limit at the validated
+        # per-contract loss so the risk check stays truthful.
+        if not is_credit and signal.max_loss and contracts > 0:
+            _validated = signal.max_loss / (100 * contracts)
+            if limit_price > _validated > 0:
+                limit_price = round(_validated, 2)
         log.info("combo_entry_priced", strategy=signal.strategy_name,
                  target=signal.entry_price, offset=aggressive_offset,
                  limit=limit_price, is_credit=is_credit)
@@ -391,7 +451,9 @@ class TradeExecutor:
         order = OrderBuilder.combo_limit(
             action="BUY",
             quantity=contracts,
-            limit_price=limit_price,
+            # R5 audit: float artifacts (2.07-0.31=1.7599999...) produce
+            # off-tick prices IBKR rejects with error 110. Round to cents.
+            limit_price=round(limit_price, 2),
         )
 
         return await self._ibkr.place_order(combo, order)
