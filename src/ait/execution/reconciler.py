@@ -342,6 +342,29 @@ class PositionReconciler:
                     # = the mid-placement crash window. It has no stop, no TP,
                     # no expiry handling. Freeze new entries until a human
                     # resolves it (delete data/HALT_UNTRACKED to resume).
+                    #
+                    # R5 follow-up (2026-07-09): DEBOUNCE — the Gateway's
+                    # morning position stream produced a phantom row twice
+                    # (QQQ 500C Aug-21, 07-08 09:17 and 07-09 09:43) that a
+                    # direct broker query minutes later disproved both times.
+                    # Halting on a single sighting froze entries for hours on
+                    # a position that never existed. Require the same key to
+                    # be sighted on TWO DISTINCT reconcile runs (>=2 min and
+                    # <=8 h apart) before freezing; a real crash-window
+                    # position persists at the broker and halts on the next
+                    # periodic reconcile.
+                    from datetime import datetime as _dtd
+                    if not hasattr(self, "_untracked_sightings"):
+                        self._untracked_sightings: dict[str, _dtd] = {}
+                    _now = _dtd.now()
+                    _prev = self._untracked_sightings.get(key)
+                    self._untracked_sightings[key] = _now
+                    _gap_min = (_now - _prev).total_seconds() / 60 if _prev else None
+                    if _gap_min is None or _gap_min < 2 or _gap_min > 480:
+                        log.warning("untracked_option_first_sighting_debounced",
+                                    position=key, qty=ibkr_pos["quantity"],
+                                    note="will freeze if still present next reconcile")
+                        continue
                     try:
                         from pathlib import Path as _P
                         _P("data/HALT_UNTRACKED").write_text(
