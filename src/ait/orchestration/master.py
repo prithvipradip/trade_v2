@@ -214,6 +214,29 @@ class BotManager:
         """Check if bot is alive, restart if crashed."""
         if self.is_running:
             _log("debug", "bot_healthy", pid=self._proc.pid)
+            # R6 (user-approved): HANG detection — process-exists is not
+            # process-alive. The bot touches data/bot_heartbeat every ~30s
+            # while its trading loop runs; stale >15 min DURING MARKET HOURS
+            # means a hung event loop (stops/TPs silently off on the whole
+            # book) — the exact failure class all three supervision layers
+            # were blind to (R5-D1). Restart + alert.
+            try:
+                _hb = DATA_DIR / "bot_heartbeat"
+                from ait.utils.time import is_market_open as _imo_hb
+                if _imo_hb() and _hb.exists():
+                    _age_min = (datetime.now() - datetime.fromtimestamp(
+                        _hb.stat().st_mtime)).total_seconds() / 60
+                    if _age_min > 15:
+                        _log("error", "bot_hung_heartbeat_stale",
+                             age_min=round(_age_min))
+                        _alert(f"BOT HUNG: trading-loop heartbeat {_age_min:.0f} "
+                               f"min stale during market hours — restarting the bot. "
+                               f"Positions were unmanaged for that window.")
+                        self.stop()
+                        self.start()
+                        return
+            except Exception as _e:  # noqa: BLE001
+                _log("warning", "heartbeat_check_failed", error=str(_e))
             # Fresh-models marker (audit item 3.1): the daily retrain wrote new
             # models the running bot won't load until its 7-day timer. One
             # controlled restart picks them up. GUARDS (audit R2): (a) never
@@ -642,6 +665,16 @@ def backup_state_db():
         dest = bdir / f"ait_state.{ts}.db"
         with _sq.connect(str(src)) as con, _sq.connect(str(dest)) as out:
             con.backup(out)
+            # R6: verify the snapshot — a corrupt backup discovered at
+            # restore time is unrecoverable. integrity_check + row parity on
+            # the table that IS the track record.
+            _ok = out.execute("PRAGMA integrity_check").fetchone()[0]
+            _n_src = con.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+            _n_dst = out.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+            if _ok != "ok" or _n_src != _n_dst:
+                raise RuntimeError(
+                    f"backup verification failed: integrity={_ok}, "
+                    f"trades {_n_src} -> {_n_dst}")
         # prune to 14 most recent
         snaps = sorted(bdir.glob("ait_state.*.db"))
         for old_f in snaps[:-14]:
@@ -655,6 +688,49 @@ def backup_state_db():
     except Exception as e:  # noqa: BLE001
         _log("error", "state_db_backup_failed", error=str(e))
         _alert(f"STATE DB BACKUP FAILED: {e} — the track record is unprotected.")
+
+
+def daily_digest():
+    """R6 (user-approved): one-line liveness digest to Telegram (09:35 and
+    16:05 ET). The ABSENCE of this message is itself an alarm — the Jul 8->9
+    18-hour outage was silent because every alert path died with the machine.
+    Pairs with the keeper's external dead-man ping (data/deadman_url.txt)."""
+    import sqlite3 as _sq
+    try:
+        parts = []
+        src = DATA_DIR / "ait_state.db"
+        if src.exists():
+            con = _sq.connect(str(src))
+            today = datetime.now().strftime("%Y-%m-%d")
+            real = ("AND exit_reason_detailed NOT LIKE '%migrated%' "
+                    "AND exit_reason_detailed NOT LIKE '%pending%' "
+                    "AND exit_reason_detailed NOT LIKE '%never_filled%'")
+            t = con.execute(
+                f"SELECT COUNT(*), COALESCE(SUM(realized_pnl),0) FROM trades "
+                f"WHERE status='closed' AND exit_time LIKE ?||'%' {real}",
+                (today,)).fetchone()
+            e = con.execute(
+                "SELECT COUNT(*) FROM trades WHERE entry_time LIKE ?||'%'",
+                (today,)).fetchone()
+            o = con.execute(
+                "SELECT COUNT(*), COALESCE(SUM(unrealized_pnl),0) "
+                "FROM open_positions").fetchone()
+            con.close()
+            parts.append(f"open {o[0]} (unreal ${o[1]:+,.0f})")
+            parts.append(f"today {e[0]} entries / {t[0]} closes ${t[1]:+,.0f}")
+        hb = DATA_DIR / "bot_heartbeat"
+        if hb.exists():
+            age = (datetime.now() - datetime.fromtimestamp(
+                hb.stat().st_mtime)).total_seconds() / 60
+            parts.append(f"heartbeat {age:.0f}m")
+        snaps = sorted((DATA_DIR / "backups").glob("ait_state.*.db"))
+        if snaps:
+            bage = (datetime.now() - datetime.fromtimestamp(
+                snaps[-1].stat().st_mtime)).total_seconds() / 3600
+            parts.append(f"backup {bage:.0f}h ago")
+        _alert("DIGEST: " + " | ".join(parts))
+    except Exception as e:  # noqa: BLE001
+        _log("warning", "daily_digest_failed", error=str(e))
 
 
 def cleanup_old_logs():
@@ -784,6 +860,23 @@ def main():
     # Daily performance report: 4:30 PM ET
     scheduler.add_job(backup_state_db, CronTrigger(day_of_week="mon-fri", hour=17, minute=0),
                       id="db_backup", name="State DB backup")
+    scheduler.add_job(daily_digest,
+                      CronTrigger(day_of_week="mon-fri", hour=9, minute=35),
+                      id="digest_am")
+    scheduler.add_job(daily_digest,
+                      CronTrigger(day_of_week="mon-fri", hour=16, minute=5),
+                      id="digest_pm")
+    # R6: catch-up backup at supervisor start when the newest snapshot is
+    # >24h old — a machine-down day silently skips the 17:00 slot (observed
+    # Jul 8: the 18h outage covered it and nothing noticed).
+    try:
+        _snaps = sorted((DATA_DIR / "backups").glob("ait_state.*.db"))
+        if not _snaps or (datetime.now() - datetime.fromtimestamp(
+                _snaps[-1].stat().st_mtime)) > timedelta(hours=24):
+            _log("info", "startup_catchup_backup")
+            backup_state_db()
+    except Exception as _e:  # noqa: BLE001
+        _log("warning", "startup_backup_check_failed", error=str(_e))
     scheduler.add_job(daily_report,
                       CronTrigger(day_of_week="mon-fri", hour=16, minute=30),
                       id="daily_report")

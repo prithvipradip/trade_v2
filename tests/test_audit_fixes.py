@@ -100,8 +100,11 @@ class TestBotManagerSupervision:
         master, mgr = bot_manager
         # R5 audit: R2.11 defers marker restarts during market hours, so this
         # test failed 9:30-16:00 ET and passed off-hours — a wall-clock-
-        # dependent CI verdict. Pin the market closed.
-        monkeypatch.setattr(master, "is_market_open", lambda: False, raising=False)
+        # dependent CI verdict. Pin the market closed AT THE SOURCE module:
+        # master.py does `from ait.utils.time import is_market_open` inside
+        # the function, so patching a master attribute is a no-op.
+        import ait.utils.time as _time_mod
+        monkeypatch.setattr(_time_mod, "is_market_open", lambda: False)
         mgr._proc = SimpleNamespace(pid=123, poll=lambda: None, returncode=None)
         marker = master.ROOT / "models" / ".retrained"
         marker.write_text("2026-07-07")

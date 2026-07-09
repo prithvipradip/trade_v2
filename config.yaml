@@ -22,7 +22,10 @@ account:
   pdt_account_under_25k: true          # Set false if account >= $25k
 
 positions:
-  max_open_positions: 8                # Raised for higher trade volume / faster learning
+  max_open_positions: 10               # R6 (user-approved): 423 of 500 logged entry
+                                       # rejections were THIS cap, not the credit cap —
+                                       # +2 slots absorb defined-risk structures without
+                                       # adding short-premium exposure (credit cap stays 6)
   max_position_pct: 0.05               # 5% of portfolio per position
   max_contracts_per_trade: 1           # Learning mode: 1 contract/trade = min cost = max # of trades
   max_portfolio_delta: 0.30            # Net delta limit (absolute)
@@ -57,7 +60,13 @@ options:
     - bear_put_spread
     - iron_condor
     - long_straddle
-    - short_strangle
+    # - short_strangle   R6 (user-approved 2026-07-09): entries disabled — go-live
+    #                     is defined-risk only, so strangle closes pad the 50-close
+    #                     count while answering nothing (and carry 10-60x the live
+    #                     risk budget: bot_state max-loss $1.5k-$8.2k vs $128-719 for
+    #                     ICs). Open strangles are managed OUT by the widened macro
+    #                     flatten (5d window). Re-enable only for a deliberate
+    #                     edge-comparison experiment.
     # Disabled 2026-07-08 (Round 5 audit) — all four were dead weight or latent hazards:
     # - covered_call      R5: NO stock-ownership check exists -> a fill would be a NAKED
     #                     call booked as defined-risk; only blocked today by the 3% cap

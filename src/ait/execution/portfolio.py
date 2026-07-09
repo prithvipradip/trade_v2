@@ -280,16 +280,31 @@ class PortfolioManager:
         trailing_stop_pct = self._exit_config.trailing_stop_pct
         breakeven_trigger = self._exit_config.breakeven_trigger_pct
 
-        # Volatility-adjusted stops: widen stops for high-volatility underlyings
-        if self._exit_config.volatility_adjusted_stops:
-            vol_multiplier = await self._get_volatility_stop_multiplier(trade.symbol)
-            stop_loss_pct = min(0.50, stop_loss_pct * vol_multiplier)   # Cap at 50% max loss
-            trailing_stop_pct = min(0.35, trailing_stop_pct * vol_multiplier)
+        if is_credit:
+            # R6 (2026-07-09, user-approved): credit-structure P&L oscillates
+            # by design, and the equity-style breakeven(+30%)/trailing(25%)
+            # tiers — with the vol multiplier TIGHTENING stops on calm
+            # underlyings — scratched statistical winners before the 40% TP
+            # (SPY IC peaked +32.3% of credit, trail-stopped out at +$5.80
+            # the same day). Practitioner-standard for defined-risk short
+            # premium: one flat loss limit as a multiple of credit received;
+            # the wings already cap the true tail. No breakeven tier, no
+            # trailing, no vol adjustment. Take-profit tiers unchanged.
+            import os as _os_x
+            _loss_mult = float(_os_x.environ.get("AIT_CREDIT_LOSS_LIMIT", "1.25"))
+            effective_stop = -_loss_mult
+        else:
+            # Volatility-adjusted stops (debit structures only): widen stops
+            # for high-volatility underlyings
+            if self._exit_config.volatility_adjusted_stops:
+                vol_multiplier = await self._get_volatility_stop_multiplier(trade.symbol)
+                stop_loss_pct = min(0.50, stop_loss_pct * vol_multiplier)   # Cap at 50% max loss
+                trailing_stop_pct = min(0.35, trailing_stop_pct * vol_multiplier)
 
-        # Determine dynamic stop level
-        effective_stop = self._calculate_dynamic_stop(
-            pnl_pct, hwm, stop_loss_pct, trailing_stop_pct, breakeven_trigger,
-        )
+            # Determine dynamic stop level
+            effective_stop = self._calculate_dynamic_stop(
+                pnl_pct, hwm, stop_loss_pct, trailing_stop_pct, breakeven_trigger,
+            )
 
         # Determine take profit target (time-decay adjusted)
         take_profit_long, take_profit_short = self._get_take_profit_targets(dte)
@@ -367,7 +382,11 @@ class PortfolioManager:
                 if info and info.next_earnings_date:
                     from datetime import date as _d
                     days_to_earnings = (info.next_earnings_date - _d.today()).days
-                    if 0 <= days_to_earnings <= 2 and pnl_pct > 0:
+                    # R6: the pnl_pct > 0 gate meant a LOSING short-premium
+                    # position — maximum gamma/vega into the event — rode
+                    # through earnings hoping for breakeven. Close regardless
+                    # of P&L; the event risk is the same either way.
+                    if 0 <= days_to_earnings <= 2:
                         should_exit = True
                         exit_reason = f"pre_earnings_iv_crush (days={days_to_earnings}, pnl={pnl_pct:.1%})"
             except Exception:
@@ -385,7 +404,12 @@ class PortfolioManager:
                 )):
             try:
                 days_to_event = self._economic_cal.days_until_next_event()
-                if days_to_event is not None and days_to_event <= 1:
+                # R6 (user-approved): undefined-risk (strangles) exits EARLY
+                # — a Thu/Fri close ahead of a Mon/Tue event avoids carrying
+                # naked weekend gap risk for ~2 sessions of residual theta.
+                # Defined-risk keeps the tight window (wings cap the gap).
+                _evt_window = 5 if trade.strategy == "short_strangle" else 1
+                if days_to_event is not None and days_to_event <= _evt_window:
                     should_exit = True
                     exit_reason = f"macro_event_flatten (days_to_event={days_to_event})"
             except Exception:

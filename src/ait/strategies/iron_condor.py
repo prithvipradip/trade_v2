@@ -26,6 +26,33 @@ class IronCondor(Strategy):
     def direction_bias(self) -> SignalDirection | None:
         return None  # Direction neutral
 
+    def _vol_scaled_width(self, price, short_put, short_call_hint, chain) -> float:
+        """R6: wing width target = wing_k x price x IV x sqrt(DTE/365), min $2.
+
+        Mirrors the backtest's wing sizing (config backtest.wing_k) so live
+        condors are the structure the walk-forward evidence describes. IV
+        from the short strikes (fallback 0.20), DTE from the chain expiry.
+        """
+        import math
+        iv_vals = []
+        for c in (short_put, short_call_hint):
+            v = float(getattr(c, "implied_vol", 0) or 0) if c is not None else 0.0
+            if v > 0:
+                iv_vals.append(v)
+        iv = sum(iv_vals) / len(iv_vals) if iv_vals else 0.20
+        dte = 21
+        try:
+            from datetime import date as _date, datetime as _dt
+            exp = getattr(chain, "expiry", None)
+            if exp:
+                exp_d = _dt.fromisoformat(str(exp)[:10]).date()
+                dte = max(1, (exp_d - _date.today()).days)
+        except Exception:  # noqa: BLE001
+            pass
+        import os as _os_w
+        k = float(_os_w.environ.get("AIT_IC_WING_K", "1.0"))
+        return max(2.0, k * price * iv * math.sqrt(dte / 365))
+
     def generate_signals(
         self,
         symbol: str,
@@ -62,14 +89,22 @@ class IronCondor(Strategy):
         if not short_put:
             return []
 
-        # Buy protection at least 2 strikes below short put for meaningful width
+        # R6 (user-approved): wing width was a strike-grid artifact ("2nd
+        # strike beyond" = $2 on QQQ/IWM, $10 on NVDA) while the backtest
+        # sizes wings as wing_k x price x IV x sqrt(DTE/365) — live traded a
+        # structurally different condor than the one the evidence describes.
+        # Target the vol-scaled width, snapped to the nearest listed strike.
         long_put_candidates = sorted(
             [p for p in liquid_puts if p.strike < short_put.strike],
             key=lambda p: p.strike, reverse=True,
         )
-        if len(long_put_candidates) < 2:
+        if not long_put_candidates:
             return []
-        long_put = long_put_candidates[1]  # Skip adjacent, take 2nd strike down
+        _wing_target = self._vol_scaled_width(price, short_put, short_call_hint=None, chain=chain)
+        long_put = min(
+            long_put_candidates,
+            key=lambda pc: abs((short_put.strike - pc.strike) - _wing_target),
+        )
 
         # Call side (above price):
         # Sell call at delta ~0.20, buy call 1-2 strikes higher
@@ -77,14 +112,18 @@ class IronCondor(Strategy):
         if not short_call:
             return []
 
-        # Buy protection at least 2 strikes above short call for meaningful width
+        # Vol-scaled call wing (see put side, R6)
         long_call_candidates = sorted(
             [c for c in liquid_calls if c.strike > short_call.strike],
             key=lambda c: c.strike,
         )
-        if len(long_call_candidates) < 2:
+        if not long_call_candidates:
             return []
-        long_call = long_call_candidates[1]  # Skip adjacent, take 2nd strike up
+        _wing_target = self._vol_scaled_width(price, short_put, short_call_hint=short_call, chain=chain)
+        long_call = min(
+            long_call_candidates,
+            key=lambda cc: abs((cc.strike - short_call.strike) - _wing_target),
+        )
 
         # Verify structure: long_put < short_put < price < short_call < long_call
         if not (long_put.strike < short_put.strike < price < short_call.strike < long_call.strike):
@@ -96,6 +135,14 @@ class IronCondor(Strategy):
         total_credit = put_credit + call_credit
 
         if total_credit <= 0:
+            return []
+
+        # R6 (user-approved): cost floor — at a 50% take-profit the gross
+        # must clear ~3x the round-trip cost (8 legs x ~$0.65 + entry/exit
+        # crossing = $10-13); QQQ condors collecting $0.72 were structurally
+        # cost-dominated regardless of hit rate.
+        min_credit = float(os.environ.get("AIT_IC_MIN_CREDIT", "0.70"))
+        if total_credit < min_credit:
             return []
 
         # Max loss = wider spread width - total credit

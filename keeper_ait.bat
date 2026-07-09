@@ -23,6 +23,13 @@ if errorlevel 1 (
     start "" /min %PY% run_orchestrator.py
 ) else (
     echo [keeper] %date% %time% orchestrator alive >> logs\keeper.log
+    REM R6: external dead-man ping. Create a check at healthchecks.io and put
+    REM its ping URL (one line) in data\deadman_url.txt -- the service alerts
+    REM when pings STOP: machine off, hard reboot at logon screen, keeper
+    REM dead, or bot down. Pinged ONLY while the orchestrator is alive.
+    if exist data\deadman_url.txt (
+        for /f "usebackq delims=" %%u in ("data\deadman_url.txt") do curl.exe -fsS -m 10 "%%u" >nul 2>&1
+    )
 )
 timeout /t 90 /nobreak >nul
 goto loop

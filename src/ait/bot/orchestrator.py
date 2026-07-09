@@ -600,6 +600,14 @@ class TradingOrchestrator:
         while self._running and self._scheduler.get_current_phase() == TradingPhase.MARKET_OPEN:
             try:
                 self._watchdog.heartbeat("trading_loop")
+                # R6: file heartbeat for the SUPERVISOR's hang detection —
+                # the in-process watchdog dies with a hung event loop, and
+                # all process checks only prove existence, not liveness.
+                try:
+                    from pathlib import Path as _PHB
+                    _PHB("data/bot_heartbeat").write_text(datetime.now().isoformat())
+                except Exception:  # noqa: BLE001
+                    pass
 
                 if time_since_scan >= scan_interval:
                     # Full cycle: scan for new trades + check positions
@@ -1319,6 +1327,24 @@ class TradingOrchestrator:
             except Exception:  # noqa: BLE001
                 pass
 
+        # R6 (user-approved): don't OPEN credit structures the macro flatten
+        # will force-close within days — paying full round-trip costs for
+        # 1-2 days of theta is systematically negative EV, and it recurs at
+        # every CPI/NFP/FOMC. Entry-side mirror of the exit-engine flatten.
+        # Returns False so the caller can still try a debit strategy.
+        try:
+            from ait.strategies.base import CREDIT_STRATEGIES as _CS6
+            if signal.strategy_name in _CS6 and self._economic_cal:
+                _d2e = self._economic_cal.days_until_next_event()
+                if _d2e is not None and _d2e <= 3:
+                    log.info("credit_entry_skipped_pre_event",
+                             symbol=signal.symbol,
+                             strategy=signal.strategy_name,
+                             days_to_event=_d2e)
+                    return False
+        except Exception:  # noqa: BLE001
+            pass
+
         # Check trade budget (time-based pacing)
         remaining = self._get_trade_budget()
         if remaining <= 0:
@@ -1498,6 +1524,15 @@ class TradingOrchestrator:
         trade_id = await self._executor.execute_signal(signal, adjusted_size)
 
         if trade_id:
+            # R6 (user-approved): re-sync the risk manager IMMEDIATELY so a
+            # position placed earlier in THIS scan cycle counts toward the
+            # cluster/count/aggregate guards for the rest of the cycle
+            # (QQQ IC and IWM IC entered 5 seconds apart on 07-06 proved
+            # positions were invisible until the next cycle's sync).
+            try:
+                await self._sync_risk_manager_positions()
+            except Exception as _e:  # noqa: BLE001
+                log.warning("post_execute_risk_sync_failed", error=str(_e))
             # Store full entry context for thesis re-evaluation and learning
             regime_str = regime.regime.value if regime else ""
             self._state.set_state(f"trade_regime_{trade_id}", regime_str)

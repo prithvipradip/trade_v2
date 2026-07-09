@@ -62,17 +62,19 @@ class CorrelationGuard:
         if not open_symbols:
             return True, "no open positions"
 
-        if new_symbol in open_symbols:
-            # Same symbol — allow (duplicate check is in risk manager)
-            return True, "same symbol handled by duplicate check"
-
         # Count how many existing positions are correlated above the threshold.
         # Block only once that count reaches the cap, so a few correlated
         # positions are allowed (diversified premium) but not unlimited stacking.
+        # R6 (user-approved): the old same-symbol early-return let a second
+        # strategy on an already-open symbol bypass the cluster count entirely
+        # — the book reached 5 SPY/QQQ/IWM short-vol positions against cap 2
+        # (QQQ IC + QQQ strangle stacked unseen). Same symbol IS correlation
+        # 1.0; count it like any other cluster member.
         correlated = [
             existing for existing in open_symbols
-            if (c := self._get_correlation(new_symbol, existing)) is not None
-            and c > self._max_corr  # signed (deep-audit SR-L13): negative corr = hedge, must not count toward the cluster cap
+            if existing == new_symbol
+            or ((c := self._get_correlation(new_symbol, existing)) is not None
+                and c > self._max_corr)  # signed (deep-audit SR-L13): negative corr = hedge, must not count toward the cluster cap
         ]
         if len(correlated) >= self._max_correlated:
             reason = (

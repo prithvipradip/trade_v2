@@ -62,6 +62,14 @@ def setup_logging(
     file_handler.setFormatter(logging.Formatter("%(message)s"))
     root_logger.addHandler(file_handler)
 
+    # R6: ibapi's wire-protocol DEBUG (every >>>/<<< frame) was ~66% of
+    # ait.log — 20MB per ~15min of scanning, so the 10x20MB rotation held
+    # ~3h of history (destroyed crash forensics) and status.py's 2MB tail
+    # undercounted "today" events on the dashboard. Wire frames are noise;
+    # real errors from these libraries still pass at WARNING/INFO.
+    logging.getLogger("ibapi").setLevel(logging.WARNING)
+    logging.getLogger("ib_insync").setLevel(logging.INFO)
+
     # Configure structlog
     structlog.configure(
         processors=[
