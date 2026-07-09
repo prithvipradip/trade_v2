@@ -1336,7 +1336,10 @@ class TradingOrchestrator:
             from ait.strategies.base import CREDIT_STRATEGIES as _CS6
             if signal.strategy_name in _CS6 and self._economic_cal:
                 _d2e = self._economic_cal.days_until_next_event()
-                if _d2e is not None and _d2e <= 3:
+                # 4 not 3: calendar-day counting means a Friday entry
+                # before a Tuesday event reads d2e=4 yet still gets
+                # flattened Monday after one session of theta.
+                if _d2e is not None and _d2e <= 4:
                     log.info("credit_entry_skipped_pre_event",
                              symbol=signal.symbol,
                              strategy=signal.strategy_name,
