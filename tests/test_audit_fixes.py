@@ -248,3 +248,38 @@ class TestOIUnknownPassthrough:
                            open_interest=3, implied_vol=0.2, delta=0.2,
                            gamma=0, theta=0, vega=0)
         assert not c.is_liquid  # KNOWN thin OI is still rejected
+
+
+class TestSchemaDataclassParity:
+    """R7 incident (2026-07-10): a migration added trades.capital_at_risk but
+    TradeRecord had no such field — TradeRecord(**row) raised on EVERY read,
+    killing the fast monitor and trading cycle for a full session (stops off
+    all day). These tests pin both the fix and the failure class."""
+
+    def test_round_trip_through_migrated_schema(self, tmp_path):
+        from ait.bot.state import StateManager, TradeRecord, TradeDirection, TradeStatus
+        sm = StateManager(db_path=tmp_path / "t.db")
+        sm.record_trade(TradeRecord(
+            trade_id="T-test-1", symbol="SPY", strategy="iron_condor",
+            direction=TradeDirection.LONG, status=TradeStatus.FILLED,
+            entry_time="2026-07-10T10:00:00", entry_price=1.0, quantity=1,
+            contract_type="combo", strike=0.0, expiry="2026-07-24",
+        ))
+        trades = sm.get_open_trades()
+        assert len(trades) == 1
+        assert trades[0].capital_at_risk == 0.0
+
+    def test_unknown_column_cannot_kill_row_mapping(self, tmp_path):
+        import sqlite3
+        from ait.bot.state import StateManager, TradeRecord, TradeDirection, TradeStatus
+        sm = StateManager(db_path=tmp_path / "t.db")
+        sm.record_trade(TradeRecord(
+            trade_id="T-test-2", symbol="QQQ", strategy="iron_condor",
+            direction=TradeDirection.LONG, status=TradeStatus.FILLED,
+            entry_time="2026-07-10T10:00:00", entry_price=1.0, quantity=1,
+            contract_type="combo", strike=0.0, expiry="2026-07-24",
+        ))
+        with sqlite3.connect(tmp_path / "t.db") as con:
+            con.execute("ALTER TABLE trades ADD COLUMN future_col TEXT DEFAULT 'x'")
+        trades = sm.get_open_trades()  # must not raise
+        assert len(trades) == 1

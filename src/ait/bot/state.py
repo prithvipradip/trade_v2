@@ -76,6 +76,7 @@ class TradeRecord:
     peak_pnl_pct: float = 0.0
     time_to_peak_hours: float = 0.0
     direction_correct: int = -1  # -1 = unknown, 0 = wrong, 1 = correct
+    capital_at_risk: float = 0.0  # R7: retained max_loss at entry (verdict math)
 
 
 @dataclass
@@ -691,4 +692,18 @@ class StateManager:
         d = dict(row)
         d["direction"] = TradeDirection(d["direction"])
         d["status"] = TradeStatus(d["status"])
+        # R7 incident (2026-07-10): a migration added a column the dataclass
+        # didn't have — TradeRecord(**d) raised on EVERY row read, which
+        # silently killed the fast monitor and trading cycle for a full
+        # session (stops/TPs off all day). Filter to known fields so a
+        # schema-ahead-of-dataclass mismatch can never take the loop down;
+        # log once if we drop anything so the drift is visible.
+        import dataclasses as _dc
+        known = {f.name for f in _dc.fields(TradeRecord)}
+        extra = set(d) - known
+        if extra:
+            import structlog as _sl
+            _sl.get_logger("bot.state").warning(
+                "trade_row_extra_columns_dropped", columns=sorted(extra))
+            d = {k: v for k, v in d.items() if k in known}
         return TradeRecord(**d)
