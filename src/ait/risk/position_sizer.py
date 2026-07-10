@@ -147,13 +147,20 @@ class PositionSizer:
         # Hard per-trade contract cap (config) — keep cost-per-trade small so
         # the book can hold many more concurrent positions (learning volume).
         hard_cap = self._pos_config.max_contracts_per_trade
-        # Deep-audit SR-M4: max(1, ...) forced 1 contract even when
-        # max_contracts computed to 0 because a single contract exceeds
-        # max_position_pct — silently blowing the cap. 0 is a legitimate
-        # answer ("cannot afford one contract within the cap").
-        if max_contracts < 1:
+        # Deep-audit SR-M4 + R7-SOON (launch coherence): viability is decided
+        # by the HARD cap alone (account x max_position_pct). The SOFT
+        # multipliers (confidence, vol, strategy, IV-rank, drawdown, VIX)
+        # used to gate viability too — at small NLV they shrank the budget
+        # below ONE contract and bricked every defined-risk entry (0.07 x
+        # $2.1k = $147 budget x 0.4 IC strategy_adj x ... = $17-42 vs $130
+        # min condor -> 0 contracts, account unusable). SR-M4's intent is
+        # honored by the hard check: a structure the raw cap can't afford is
+        # still 0. Soft multipliers throttle COUNT above the 1-contract floor.
+        if cost_per_contract > max_position_value:
             return PositionSize(0, 0.0, conf_adj, vol_adj,
                                 "single contract exceeds max_position_pct cap")
+        if max_contracts < 1:
+            max_contracts = 1
         contracts = min(max_contracts, account_scale_cap, hard_cap)
 
         # Max risk: for spreads, risk is the net debit (option_price already is net debit).

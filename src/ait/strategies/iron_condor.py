@@ -51,7 +51,22 @@ class IronCondor(Strategy):
             pass
         import os as _os_w
         k = float(_os_w.environ.get("AIT_IC_WING_K", "1.0"))
-        return max(2.0, k * price * iv * math.sqrt(dte / 365))
+        width = max(2.0, k * price * iv * math.sqrt(dte / 365))
+        # R7-SOON (user-approved): budget-aware cap — the $2.1k launch
+        # account cannot hold the $10-22 wings the vol formula produces on
+        # index underlyings (max_loss $400-2,100 vs a ~$147 per-trade
+        # budget). Worst-case max_loss = (width - credit)*100 with credit >=
+        # min_ratio*width, so affordable width <= budget / (100*(1-ratio)).
+        # Width floor relaxes to $1 when budget-capped (GLD/TLT strike grid
+        # supports it); the credit floor + credit/width gates still decide
+        # whether the narrow structure is economically WORTH trading — at
+        # launch scale the bot should trade less, only when premium is rich.
+        if self.risk_budget and self.risk_budget > 0:
+            min_ratio = float(_os_w.environ.get("AIT_IC_MIN_CREDIT_WIDTH", "0.20"))
+            affordable = self.risk_budget / (100.0 * max(0.5, 1.0 - min_ratio))
+            if affordable < width:
+                width = max(1.0, affordable)
+        return width
 
     def generate_signals(
         self,

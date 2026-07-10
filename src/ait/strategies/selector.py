@@ -125,6 +125,7 @@ class StrategySelector:
         confidence: float,
         iv_rank: float,
         historical_data: pd.DataFrame | None = None,
+        risk_budget: float | None = None,
     ) -> list[Signal]:
         """Run all enabled strategies and return ranked signals.
 
@@ -135,6 +136,10 @@ class StrategySelector:
 
         for strategy in self._strategies:
             try:
+                # R7: hand every strategy the account's per-trade budget so
+                # defined-risk construction can fit the funded account, not
+                # just the paper one.
+                strategy.risk_budget = risk_budget
                 signals = strategy.generate_signals(
                     symbol=symbol,
                     chain=chain,

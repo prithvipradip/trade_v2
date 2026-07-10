@@ -728,6 +728,21 @@ class TradingOrchestrator:
         await self._process_signal_queue()
 
         # 9. Scan universe for new opportunities
+        # R7-SOON: refresh the per-trade dollar budget once per cycle so
+        # strategy construction fits the CURRENT account (paper $197k today,
+        # $2.1k at Phase 2 via AIT_SIMULATED_CAPITAL) — and run the launch-
+        # size coherence self-test whenever NLV moves >20%.
+        try:
+            _nlv = await self._account.get_net_liquidation()
+            if _nlv and _nlv > 0:
+                self._risk_budget = _nlv * self._settings.risk.max_position_risk_pct
+                _last = getattr(self, "_coherence_checked_nlv", 0.0)
+                if not _last or abs(_nlv - _last) / _last > 0.20:
+                    self._coherence_checked_nlv = _nlv
+                    await self._launch_size_coherence_check(_nlv)
+        except Exception as _e:  # noqa: BLE001
+            log.debug("risk_budget_refresh_failed", error=str(_e))
+
         vix = await self._market_data.get_vix()
 
         # Fetch cross-asset context once per scan cycle (VIX + SPY history for ML)
@@ -1123,6 +1138,7 @@ class TradingOrchestrator:
                 continue
 
             signals = self._strategy_selector.generate_all_signals(
+                risk_budget=getattr(self, "_risk_budget", None),
                 symbol=symbol,
                 chain=chain,
                 market_direction=direction,
@@ -1312,6 +1328,56 @@ class TradingOrchestrator:
             budget = max_trades
 
         return min(budget, max_trades) - taken
+
+    async def _launch_size_coherence_check(self, nlv: float) -> None:
+        """R7-SOON: assert the cap grid is mutually satisfiable at this NLV.
+
+        The Phase-2 launch account bricked silently before: sizer budget <
+        one minimum-viable condor, and the daily-loss breaker smaller than a
+        single trade's stop. Runs at startup and whenever NLV moves >20%;
+        alerts LOUDLY instead of letting the account sit structurally unable
+        to trade (or unable to survive one normal stop-out).
+        """
+        try:
+            budget = nlv * self._settings.risk.max_position_risk_pct
+            import os as _os_c
+            min_credit = float(_os_c.environ.get("AIT_IC_MIN_CREDIT", "0.70"))
+            min_ratio = float(_os_c.environ.get("AIT_IC_MIN_CREDIT_WIDTH", "0.20"))
+            # Minimum viable condor given the economics floors: the narrowest
+            # width whose floor credit is even possible (credit <= ~0.45x
+            # width in practice at 0.20 delta), then its max loss.
+            min_width = max(1.0, min_credit / 0.45)
+            min_viable_cost = (min_width - min_credit) * 100
+            # Typical stopped-trade loss under the 1.25x credit limit
+            loss_mult = float(_os_c.environ.get("AIT_CREDIT_LOSS_LIMIT", "1.25"))
+            typical_stop_loss = loss_mult * max(min_credit, min_ratio * min_width) * 100
+            breaker_pct = float(getattr(self._settings.risk, "daily_loss_limit_pct", 0.02) or 0.02)
+            breaker_usd = nlv * breaker_pct
+            problems = []
+            if budget < min_viable_cost:
+                problems.append(
+                    f"per-trade budget ${budget:.0f} < minimum viable condor "
+                    f"~${min_viable_cost:.0f} (width ${min_width:.1f}, credit "
+                    f"floor ${min_credit:.2f}) — NO condor can pass sizing")
+            if breaker_usd < 1.5 * typical_stop_loss:
+                problems.append(
+                    f"daily-loss breaker ${breaker_usd:.0f} < 1.5x one normal "
+                    f"stop-out ~${typical_stop_loss:.0f} — a single stopped "
+                    f"trade halts the whole day")
+            log.info("launch_size_coherence",
+                     nlv=round(nlv), budget=round(budget),
+                     min_viable_ic=round(min_viable_cost),
+                     breaker=round(breaker_usd),
+                     problems=len(problems))
+            if problems:
+                await self._send_notification(
+                    "CAP-GRID INCOHERENT at NLV ${:,.0f}:\n- ".format(nlv)
+                    + "\n- ".join(problems)
+                    + "\nFix knobs (risk.max_position_risk_pct / breaker / "
+                      "credit floors) before expecting trades."
+                )
+        except Exception as _e:  # noqa: BLE001
+            log.warning("coherence_check_failed", error=str(_e))
 
     async def _get_vix_lkg(self) -> float | None:
         """VIX with a 45-minute last-known-good cache (R7 fail-closed)."""

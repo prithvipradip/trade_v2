@@ -85,6 +85,13 @@ class Signal:
 class Strategy(ABC):
     """Abstract base class for all trading strategies."""
 
+    # R7-SOON (budget-aware construction): per-trade dollar risk budget for
+    # the CURRENT account, refreshed by the orchestrator each scan cycle via
+    # StrategySelector.generate_all_signals(risk_budget=...). None = no
+    # constraint (paper big-account behavior). Strategies that build
+    # defined-risk structures should cap width so max_loss fits this budget.
+    risk_budget: float | None = None
+
     @property
     @abstractmethod
     def name(self) -> str:
