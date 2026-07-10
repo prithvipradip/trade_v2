@@ -133,25 +133,37 @@ class EarningsCalendar:
                 or (hasattr(cal, "empty") and cal.empty)
             )
             if not cal_empty:
-                # Dict format (newer yfinance)
-                if isinstance(cal, dict):
-                    for val in cal.values():
-                        if isinstance(val, list) and val:
-                            val = val[0]
-                        if isinstance(val, (datetime, date)):
-                            earnings_date = val if isinstance(val, date) else val.date()
-                            return EarningsInfo(symbol=symbol, next_earnings_date=earnings_date)
+                # R7 CRITICAL FIX: the old code returned the FIRST datetime in
+                # the dict — usually 'Dividend Date'/'Ex-Dividend Date', NOT
+                # earnings. In production AAPL's "next earnings" was a past
+                # dividend date and AMD's was 1995 — all three earnings guards
+                # were dead for single names. Parse 'Earnings Date' by KEY,
+                # reject past dates, and fall through to earnings_dates.
+                def _to_date(v):
+                    if isinstance(v, list) and v:
+                        v = v[0]
+                    if isinstance(v, datetime):
+                        return v.date()
+                    if isinstance(v, date):
+                        return v
+                    return None
 
-                elif hasattr(cal, "iloc"):
-                    # DataFrame format
-                    earnings_date = None
+                if isinstance(cal, dict):
+                    for key in ("Earnings Date", "earnings date", "EarningsDate"):
+                        if key in cal:
+                            d = _to_date(cal[key])
+                            if d is not None and d >= date.today():
+                                return EarningsInfo(symbol=symbol, next_earnings_date=d)
+                            break  # key present but past/unparseable -> earnings_dates fallback
+
+                elif hasattr(cal, "iloc") and len(cal) > 0:
+                    # DataFrame format: same rule — earnings columns only
                     for col in cal.columns:
-                        val = cal.iloc[0][col] if len(cal) > 0 else None
-                        if isinstance(val, (datetime, date)):
-                            earnings_date = val if isinstance(val, date) else val.date()
-                            break
-                    if earnings_date:
-                        return EarningsInfo(symbol=symbol, next_earnings_date=earnings_date)
+                        if "earnings" not in str(col).lower():
+                            continue
+                        d = _to_date(cal.iloc[0][col])
+                        if d is not None and d >= date.today():
+                            return EarningsInfo(symbol=symbol, next_earnings_date=d)
 
                 # Try the earnings_dates attribute instead
                 if hasattr(ticker, "earnings_dates") and ticker.earnings_dates is not None:

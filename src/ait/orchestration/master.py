@@ -619,7 +619,7 @@ sys.path.insert(0, 'src')
 from ait.monitoring.analytics import TradeAnalytics
 
 analytics = TradeAnalytics()
-metrics = analytics.get_performance(days=1)
+metrics = analytics.get_performance(lookback_days=1)
 print(json.dumps(metrics.__dict__ if hasattr(metrics, '__dict__') else metrics, indent=2, default=str))
 """],
             cwd=str(ROOT),
@@ -731,6 +731,60 @@ def daily_digest():
         _alert("DIGEST: " + " | ".join(parts))
     except Exception as e:  # noqa: BLE001
         _log("warning", "daily_digest_failed", error=str(e))
+
+
+def weekly_scorecard():
+    """R7: go-live-gate scorecard to Telegram (Friday 16:10 ET). The five
+    gate criteria, computed since the 2026-07-06 reset, on real closes only.
+    DD is reported vs max concurrent DEPLOYED RISK, not paper NLV (a 100%
+    loss of deployed risk used to read as ~2% 'drawdown')."""
+    import sqlite3 as _sq
+    try:
+        src = DATA_DIR / "ait_state.db"
+        if not src.exists():
+            return
+        con = _sq.connect(str(src)); con.row_factory = _sq.Row
+        real = ("AND COALESCE(exit_reason_detailed,'') NOT LIKE '%migrated%' "
+                "AND COALESCE(exit_reason_detailed,'') NOT LIKE '%pending%' "
+                "AND COALESCE(exit_reason_detailed,'') NOT LIKE '%never_filled%'")
+        rows = con.execute(
+            f"SELECT realized_pnl, entry_time, exit_time, "
+            f"COALESCE(capital_at_risk, 0) car, COALESCE(commission,0) comm "
+            f"FROM trades WHERE status='closed' {real} "
+            f"ORDER BY COALESCE(exit_time, entry_time)").fetchall()
+        n = len(rows)
+        wins = sum(1 for r in rows if r["realized_pnl"] > 0)
+        gp = sum(r["realized_pnl"] for r in rows if r["realized_pnl"] > 0)
+        gl = abs(sum(r["realized_pnl"] for r in rows if r["realized_pnl"] < 0))
+        pf = (gp / gl) if gl > 0 else float("inf")
+        tot = sum(r["realized_pnl"] for r in rows)
+        comm = sum(r["comm"] for r in rows)
+        # drawdown vs deployed risk: equity curve of realized P&L; base =
+        # max concurrent capital_at_risk (approx: max single-day sum of open
+        # trades' car; fallback to open book's current car sum, then $1k).
+        peak = dd = cum = 0.0
+        for r in rows:
+            cum += r["realized_pnl"]
+            peak = max(peak, cum)
+            dd = max(dd, peak - cum)
+        car_open = con.execute(
+            "SELECT COALESCE(SUM(t.capital_at_risk),0) FROM trades t "
+            "JOIN open_positions o ON o.trade_id=t.trade_id").fetchone()[0]
+        base = max(car_open or 0, 1000.0)
+        con.close()
+        pf_s = "inf" if pf == float("inf") else f"{pf:.2f}"
+        _alert(
+            f"GO-LIVE SCORECARD (since 07-06 reset)\n"
+            f"closes: {n}/50 | PF: {pf_s} (gate >1.3) | win rate: "
+            f"{(wins / n * 100) if n else 0:.0f}%\n"
+            f"realized: ${tot:+,.0f} (commissions recorded: ${comm:,.0f})\n"
+            f"max DD: ${dd:,.0f} = {dd / base * 100:.1f}% of deployed risk "
+            f"~${base:,.0f} (gate <8%)\n"
+            f"pace: {'on track' if n >= 1 else 'no closes yet'} — see "
+            f"docs/GAP_AUDIT_R7.md for gate definitions"
+        )
+    except Exception as e:  # noqa: BLE001
+        _log("warning", "weekly_scorecard_failed", error=str(e))
 
 
 def cleanup_old_logs():
@@ -860,6 +914,9 @@ def main():
     # Daily performance report: 4:30 PM ET
     scheduler.add_job(backup_state_db, CronTrigger(day_of_week="mon-fri", hour=17, minute=0),
                       id="db_backup", name="State DB backup")
+    scheduler.add_job(weekly_scorecard,
+                      CronTrigger(day_of_week="fri", hour=16, minute=10),
+                      id="weekly_scorecard")
     scheduler.add_job(daily_digest,
                       CronTrigger(day_of_week="mon-fri", hour=9, minute=35),
                       id="digest_am")

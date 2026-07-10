@@ -11,6 +11,7 @@ Supports:
 
 from __future__ import annotations
 
+import os
 from datetime import date, timedelta
 from typing import Any
 
@@ -60,7 +61,8 @@ class Backtester:
         delta_short: float = 0.20,
         delta_long: float = 0.30,
         iv_floor: float = 0.12,
-        wing_floor_dollars: float = 5.0,
+        # R6 parity: live iron_condor._vol_scaled_width enforces min $2, not $5.
+        wing_floor_dollars: float = 2.0,
         wing_k: float = 1.0,
         delta_iv_scale: float = 0.0,
         skew_factor: float = 1.0,
@@ -95,6 +97,23 @@ class Backtester:
         meta_labeler: Any = None,
         # H2 val-split: skip new entries before this date (full df still used for feature warmup)
         eval_start_date: "date | None" = None,
+        # --- R6 exit/construction parity with the live bot ---
+        # Flat loss limit for CREDIT structures as a multiple of credit
+        # received (live portfolio.py reads env AIT_CREDIT_LOSS_LIMIT, 1.25).
+        # None -> resolve from env with the same default as live.
+        credit_loss_limit_mult: float | None = None,
+        # Iron condor construction gates (live iron_condor.py R6):
+        # minimum mid-price total credit (env AIT_IC_MIN_CREDIT, $0.70) and
+        # minimum credit/max-width ratio (env AIT_IC_MIN_CREDIT_WIDTH, 0.20).
+        ic_min_credit: float | None = None,
+        ic_min_credit_width: float | None = None,
+        # Macro-event gate: live orchestrator blocks CREDIT entries <=4 days
+        # before FOMC/CPI/NFP/GDP/PCE; live portfolio flattens defined-risk
+        # credit <=1 day before (strangles <=5) when AIT_SKIP_MACRO_EVENTS=1.
+        # Uses the hardcoded-2026 calendar in ait.data.economic_calendar —
+        # for pre-2026 backtest windows the gate is effectively inactive
+        # (days-to-event is always > 4), which is a documented limitation.
+        macro_event_gate: bool = True,
     ) -> None:
         self._data = self._prepare_data(data)
         self._strategies = strategies
@@ -144,6 +163,29 @@ class Backtester:
         self._limit_order_timeout_bars = limit_order_timeout_bars
         self._meta_labeler = meta_labeler
         self._eval_start_date = eval_start_date
+
+        # R6 parity knobs — None resolves to the SAME env var + default the
+        # live bot reads, so an un-configured backtest matches live behavior.
+        self._credit_loss_limit_mult = (
+            float(credit_loss_limit_mult) if credit_loss_limit_mult is not None
+            else float(os.environ.get("AIT_CREDIT_LOSS_LIMIT", "1.25"))
+        )
+        self._ic_min_credit = (
+            float(ic_min_credit) if ic_min_credit is not None
+            else float(os.environ.get("AIT_IC_MIN_CREDIT", "0.70"))
+        )
+        self._ic_min_credit_width = (
+            float(ic_min_credit_width) if ic_min_credit_width is not None
+            else float(os.environ.get("AIT_IC_MIN_CREDIT_WIDTH", "0.20"))
+        )
+        self._macro_event_gate = macro_event_gate
+        self._economic_cal = None
+        if macro_event_gate:
+            try:
+                from ait.data.economic_calendar import EconomicCalendar
+                self._economic_cal = EconomicCalendar()
+            except Exception:  # noqa: BLE001 — gate is best-effort, never fatal
+                self._economic_cal = None
 
         self._predictor = predictor if predictor is not None else self._load_predictor()
 
@@ -252,6 +294,7 @@ class Backtester:
                 "fractal_gate": {"hurst_spread": 0.0, "threshold": self._hurst_regime_threshold, "pass": True},
                 "regime": "range_bound",
                 "earnings_skip": False,
+                "macro_gate": {"days_to_event": None, "blocked": False},
             }
 
             # Apply fractal regime gate to confidence for credit strategies.
@@ -354,6 +397,31 @@ class Backtester:
             if today_date in self._earnings_dates:
                 log.debug("earnings_skip", date=str(today_date), strategy=strategy)
                 continue
+
+            # Macro-event entry gate (R6 parity, live orchestrator._should_skip
+            # credit block): don't OPEN credit structures <=4 days before a
+            # FOMC/CPI/NFP/GDP/PCE release — the live macro flatten would
+            # force-close them within days, paying full round-trip costs for
+            # 1-2 days of theta. LIMITATION: the calendar is hardcoded for
+            # 2026 only, so for pre-2026 windows days-to-event is always > 4
+            # and the gate never fires (documented in the parity manifest).
+            if self._economic_cal is not None and strategy in CREDIT_STRATEGIES:
+                try:
+                    _d2e = self._economic_cal.days_until_next_event(today_date)
+                except Exception:  # noqa: BLE001
+                    _d2e = None
+                _entry_decision["macro_gate"] = {
+                    "days_to_event": _d2e,
+                    "blocked": _d2e is not None and _d2e <= 4,
+                }
+                if _d2e is not None and _d2e <= 4:
+                    log.debug(
+                        "macro_event_entry_skip",
+                        date=str(today_date),
+                        strategy=strategy,
+                        days_to_event=_d2e,
+                    )
+                    continue
 
             # Regime gate: iron condors / short strangles fail in trending-down regimes.
             # Exp 21 post-mortem: 4 trending_down trades, 25% win rate, avg PnL -$195.
@@ -662,7 +730,12 @@ class Backtester:
     def compare_exit_modes(
         cls, data: pd.DataFrame, strategies: list[str], **kwargs: Any
     ) -> dict:
-        """Run backtest with both fixed and trailing stops, return comparison."""
+        """Run backtest with both fixed and trailing stops, return comparison.
+
+        R6 parity note: credit structures always use the flat-loss-limit +
+        DTE-laddered TP path, so fixed-vs-trailing deltas reflect DEBIT
+        trades only.
+        """
         shared = {k: v for k, v in kwargs.items() if k != "trailing_stop_enabled"}
 
         fixed_bt = cls(data, strategies, trailing_stop_enabled=False, **shared)
@@ -825,11 +898,8 @@ class Backtester:
                 current_val *= (1 - exit_half_spread)
                 pnl_pct = (current_val - entry_price) / entry_price if entry_price > 0 else 0.0
 
-            # Check stop / profit
-            if self._trailing_stop_enabled:
-                result = self._check_exit_trailing(pos, pnl_pct, current_date)
-            else:
-                result = self._check_exit_fixed(pos, pnl_pct, current_date)
+            # Check stop / profit — routed per trade type (R6 exit parity)
+            result = self._dispatch_exit_check(pos, trade_type, pnl_pct, current_date)
 
             if result is not None:
                 bar_ts = row.Index
@@ -1240,6 +1310,19 @@ class Backtester:
             if net_credit <= 0:
                 return None
 
+            # R6 live-parity construction gates (src/ait/strategies/iron_condor.py
+            # applies both to the MID-price total credit, before friction):
+            # 1. Cost floor — live rejects total_credit < AIT_IC_MIN_CREDIT
+            #    ($0.70 default): at a 50% TP the gross must clear ~3x the
+            #    round-trip commission/crossing cost.
+            if net_credit < self._ic_min_credit:
+                return None
+            # 2. Credit-to-width gate — live rejects total_credit/max_width <
+            #    AIT_IC_MIN_CREDIT_WIDTH (0.20 default). Engine wings are
+            #    symmetric, so max_width == wing_width.
+            if wing_width > 0 and (net_credit / wing_width) < self._ic_min_credit_width:
+                return None
+
             # Per-leg spread cost: 4 legs × half-spread (sell at bid, buy at ask)
             half_spread = self._options_half_spread(iv, dte)
             avg_leg_mid = (short_call_price + short_put_price + long_call_price + long_put_price) / 4
@@ -1602,10 +1685,7 @@ class Backtester:
         else:
             current_value *= (1 - exit_half_spread)  # Sell at bid
 
-        if self._trailing_stop_enabled:
-            result = self._check_exit_trailing(pos, pnl_pct, current_date)
-        else:
-            result = self._check_exit_fixed(pos, pnl_pct, current_date)
+        result = self._dispatch_exit_check(pos, trade_type, pnl_pct, current_date)
 
         if result is not None:
             # Calculate actual P&L
@@ -1619,8 +1699,92 @@ class Backtester:
 
         return None
 
+    def _dispatch_exit_check(
+        self, pos: dict, trade_type: str, pnl_pct: float, current_date: date
+    ) -> dict | None:
+        """Route exit logic by trade type (R6 exit parity with live).
+
+        CREDIT structures mirror live portfolio.py check_position(): ONE flat
+        loss limit at credit_loss_limit_mult x credit received plus the
+        DTE-laddered take-profit — NO trailing stop, NO breakeven tier, NO
+        vol-adjusted stops. DEBIT structures keep the existing behaviour
+        (trailing/breakeven when enabled, else fixed stop + profit target).
+        """
+        if trade_type == "credit":
+            return self._check_exit_credit(pos, pnl_pct, current_date)
+        if self._trailing_stop_enabled:
+            return self._check_exit_trailing(pos, pnl_pct, current_date)
+        return self._check_exit_fixed(pos, pnl_pct, current_date)
+
+    @staticmethod
+    def _credit_take_profit_pct(dte: int | None) -> float:
+        """DTE-laddered take-profit target as a fraction of credit received.
+
+        Mirrors the SHORT side of src/ait/execution/portfolio.py
+        _get_take_profit_targets() exactly (time_decay_scaling=True is the
+        live default; dte=None falls back to the live 0.50 default):
+            DTE > 20  -> 0.50
+            DTE 11-20 -> 0.40
+            DTE 6-10  -> 0.30
+            DTE <= 5  -> 0.20
+        """
+        if dte is None or dte > 20:
+            return 0.50
+        elif dte > 10:
+            return 0.40
+        elif dte > 5:
+            return 0.30
+        return 0.20
+
+    def _check_exit_credit(self, pos: dict, pnl_pct: float, current_date: date) -> dict | None:
+        """Credit-structure exits — R6 parity with live portfolio.py.
+
+        pnl_pct is fraction of credit received (positive = value decayed).
+        Order mirrors live check_position(): (1) flat loss limit,
+        (2) DTE-laddered take-profit, (3) expiry-approaching close at
+        DTE<=5, (4) macro-event flatten (env-gated, same as live).
+        """
+        # HWM still tracked for journaling/analysis parity (live persists it
+        # even though credit exits no longer trail off it).
+        pos["high_water_mark"] = max(pos.get("high_water_mark", 0.0), pnl_pct)
+
+        expiry = date.fromisoformat(pos["expiry_date"])
+        remaining_dte = (expiry - current_date).days
+
+        # 1. Flat loss limit: one stop at -mult x credit (live default 1.25,
+        # env AIT_CREDIT_LOSS_LIMIT). The wings already cap the true tail.
+        if pnl_pct <= -self._credit_loss_limit_mult:
+            return {"exit_date": str(current_date), "exit_reason": "credit_loss_limit"}
+
+        # 2. DTE-laddered take-profit (portfolio._get_take_profit_targets)
+        if pnl_pct >= self._credit_take_profit_pct(remaining_dte):
+            return {"exit_date": str(current_date), "exit_reason": "take_profit_short"}
+
+        # 3. Expiry-approaching close — live closes any position at DTE<=5
+        # (portfolio.py rule 3a; rule 3 assignment risk at DTE<=1 is subsumed).
+        if remaining_dte <= 5:
+            reason = "expiry" if current_date >= expiry else "expiry_approaching"
+            return {"exit_date": str(current_date), "exit_reason": reason}
+
+        # 4. Macro-event flatten (portfolio.py rule 3d): defined-risk credit
+        # <=1 day before FOMC/CPI/NFP/GDP/PCE, strangles <=5 days. Live keeps
+        # this behind AIT_SKIP_MACRO_EVENTS=1 (disabled by default for the
+        # data-collection window) — mirrored here for exact parity. 2026-only
+        # calendar: inactive for pre-2026 windows.
+        if (self._economic_cal is not None
+                and os.environ.get("AIT_SKIP_MACRO_EVENTS", "0") == "1"):
+            try:
+                _d2e = self._economic_cal.days_until_next_event(current_date)
+            except Exception:  # noqa: BLE001
+                _d2e = None
+            _evt_window = 5 if pos.get("strategy") == "short_strangle" else 1
+            if _d2e is not None and _d2e <= _evt_window:
+                return {"exit_date": str(current_date), "exit_reason": "macro_event_flatten"}
+
+        return None
+
     def _check_exit_fixed(self, pos: dict, pnl_pct: float, current_date: date) -> dict | None:
-        """Fixed stop-loss / take-profit."""
+        """Fixed stop-loss / take-profit (DEBIT trades only since R6 parity)."""
         stop = self._stop_loss_pct
 
         # Stop loss

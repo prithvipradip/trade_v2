@@ -145,6 +145,16 @@ class IronCondor(Strategy):
         if total_credit < min_credit:
             return []
 
+        # R7: credit-to-width ratio gate — the absolute floor alone lets a
+        # $0.75 credit on a $10-wide condor through (7.5% of width = terrible
+        # risk/reward, ~$925 risked for a $37 TP). Practitioner floor ~20%.
+        put_w = short_put.strike - long_put.strike
+        call_w = long_call.strike - short_call.strike
+        _mw = max(put_w, call_w)
+        min_ratio = float(os.environ.get("AIT_IC_MIN_CREDIT_WIDTH", "0.20"))
+        if _mw > 0 and (total_credit / _mw) < min_ratio:
+            return []
+
         # Max loss = wider spread width - total credit
         put_width = short_put.strike - long_put.strike
         call_width = long_call.strike - short_call.strike

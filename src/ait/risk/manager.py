@@ -180,7 +180,15 @@ class RiskManager:
         is_credit = request.strategy in CREDIT_STRATEGIES
         if is_credit:
             #  - vol-regime halt: no NEW short premium in a high-VIX regime
-            if request.vix and request.vix >= self._risk_config.credit_vix_halt:
+            # R7: FAIL CLOSED — a missing/zero VIX used to skip this gate
+            # entirely (`request.vix` falsy), i.e. the vol-regime brake was
+            # off exactly when the data layer was struggling.
+            if not request.vix or request.vix <= 0:
+                return TradeValidation(
+                    False,
+                    "credit entry halted: VIX unavailable (fail-closed)",
+                )
+            if request.vix >= self._risk_config.credit_vix_halt:
                 return TradeValidation(
                     False,
                     f"credit entry halted: VIX {request.vix:.1f} >= "

@@ -42,6 +42,9 @@ def _req(symbol="SPY", strategy="iron_condor", max_loss=2000.0):
     return TradeRequest(
         symbol=symbol, strategy=strategy, direction="neutral",
         contracts=1, entry_price=1.0, confidence=0.95, max_loss=max_loss,
+        # R7: credit entries FAIL CLOSED without a VIX print — tests must
+        # supply a calm-regime VIX like the live pipeline does.
+        vix=18.0,
     )
 
 

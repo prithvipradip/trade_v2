@@ -396,9 +396,14 @@ class TestWingKDynamicSizing:
         import datetime
         from ait.backtesting.engine import Backtester
 
+        # R6 parity: the engine now applies the live credit-to-width gate
+        # (AIT_IC_MIN_CREDIT_WIDTH, 0.20) at construction; this synthetic
+        # condor sits at ratio 0.1996 and would be rejected live too. Disable
+        # the gate here — this test verifies wing GEOMETRY, not credit economics.
         bt = Backtester(
             data=self._make_df(500.0), strategies=["iron_condor"],
             initial_capital=100_000, iv_floor=0.25, wing_floor_dollars=5.0, wing_k=1.0,
+            ic_min_credit_width=0.0,
         )
         pos = bt._build_credit_position(
             "iron_condor", S=500.0, iv=0.25, t=30 / 365, r=0.05, dte=30,
@@ -415,9 +420,12 @@ class TestWingKDynamicSizing:
         import datetime
         from ait.backtesting.engine import Backtester
 
+        # ic_min_credit_width=0.0: geometry test — bypass the live R6
+        # credit-to-width construction gate (see test above).
         bt = Backtester(
             data=self._make_df(500.0), strategies=["iron_condor"],
             initial_capital=100_000, iv_floor=0.20, wing_floor_dollars=5.0, wing_k=0.001,
+            ic_min_credit_width=0.0,
         )
         pos = bt._build_credit_position(
             "iron_condor", S=500.0, iv=0.20, t=30 / 365, r=0.05, dte=30,
@@ -436,12 +444,17 @@ class TestWingKDynamicSizing:
         kwargs = dict(S=500.0, iv=0.25, t=30 / 365, r=0.05, dte=30,
                       today_date=today, capital=100_000)
 
+        # ic_min_credit_width=0.0: geometry test — wing_k=2.0 condors sit at
+        # credit/width ~0.11 and the live R6 gate would (correctly) reject
+        # them, silently skipping this comparison. Bypass it here.
         bt_narrow = Backtester(data=self._make_df(500.0), strategies=["iron_condor"],
                                initial_capital=100_000, iv_floor=0.20,
-                               wing_floor_dollars=1.0, wing_k=0.5)
+                               wing_floor_dollars=1.0, wing_k=0.5,
+                               ic_min_credit_width=0.0)
         bt_wide = Backtester(data=self._make_df(500.0), strategies=["iron_condor"],
                              initial_capital=100_000, iv_floor=0.20,
-                             wing_floor_dollars=1.0, wing_k=2.0)
+                             wing_floor_dollars=1.0, wing_k=2.0,
+                             ic_min_credit_width=0.0)
 
         pos_narrow = bt_narrow._build_credit_position("iron_condor", **kwargs)
         pos_wide = bt_wide._build_credit_position("iron_condor", **kwargs)

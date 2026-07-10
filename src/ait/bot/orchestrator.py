@@ -193,7 +193,11 @@ class TradingOrchestrator:
         self._reconciler = PositionReconciler(ibkr_client, self._state)
 
         # Self-learning
-        self._learning = LearningEngine(self._state)
+        self._learning = LearningEngine(
+            self._state,
+            # R7: in paper mode the learning layer observes but never steers
+            apply_adaptations=not self._settings.learning.paper_trading_mode,
+        )
 
         # Data quality & market intelligence
         self._data_quality = DataQualityValidator()
@@ -434,6 +438,14 @@ class TradingOrchestrator:
                 log.debug("pdt_record_failed", error=str(_e))
 
             trade = self._find_trade_by_id(trade_id)
+            # R7: stamp the REAL round-trip commission (from the executions
+            # ledger) onto the closed trade row for the PF verdict.
+            try:
+                _real_comm = self._state.total_commission(trade_id)
+                if _real_comm > 0:
+                    self._state.update_trade_commission(trade_id, _real_comm)
+            except Exception:  # noqa: BLE001
+                pass
             if trade:
                 self._thompson.record_outcome(
                     strategy=trade.strategy,
@@ -721,11 +733,36 @@ class TradingOrchestrator:
         # Fetch cross-asset context once per scan cycle (VIX + SPY history for ML)
         market_context = await self._build_market_context()
 
+        # R7 (gap audit): two-phase scan — collect candidates across the
+        # WHOLE universe, then execute best-first. Slots were previously
+        # allocated by config-file order (first acceptable condor won), so
+        # the track record measured second-best trades whenever slots were
+        # scarce. Score = eff_conf + 0.3 x credit/width (credit structures).
+        candidates: list = []
         for symbol in universe:
             try:
-                await self._scan_symbol(symbol, vix, market_context)
+                await self._scan_symbol(symbol, vix, market_context,
+                                        collect=candidates)
             except Exception as e:
                 log.warning("symbol_scan_failed", symbol=symbol, error=str(e))
+
+        if candidates:
+            candidates.sort(key=lambda c: c[0], reverse=True)
+            log.info("candidate_ranking",
+                     ranked=[(f"{c[1].symbol}:{c[1].strategy_name}",
+                              round(c[0], 3)) for c in candidates[:8]])
+            handled_symbols: set[str] = set()
+            for score, sig, conf, sent, reg in candidates:
+                if sig.symbol in handled_symbols:
+                    continue
+                try:
+                    handled = await self._try_execute(sig, conf, sent, reg)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("candidate_execute_failed",
+                                symbol=sig.symbol, error=str(e))
+                    handled = True
+                if handled:
+                    handled_symbols.add(sig.symbol)
 
     async def _build_market_context(self) -> dict:
         """Fetch VIX, SPY, and macro data for ML cross-asset features."""
@@ -754,7 +791,7 @@ class TradingOrchestrator:
             pass
         return context
 
-    async def _scan_symbol(self, symbol: str, vix: float | None, market_context: dict | None = None) -> None:
+    async def _scan_symbol(self, symbol: str, vix: float | None, market_context: dict | None = None, collect: list | None = None) -> None:
         """Analyze a single symbol for trading opportunities.
 
         Parallelizes data fetches: historical, sentiment, and IV rank
@@ -1219,6 +1256,21 @@ class TradingOrchestrator:
                     if signal.strategy_name in model_overridden
                     else final_confidence
                 )
+                # R7 two-phase scan: in collect mode, defer execution to the
+                # cross-symbol ranking pass instead of executing in-place.
+                if collect is not None:
+                    _cw = 0.0
+                    try:
+                        from ait.strategies.base import CREDIT_STRATEGIES as _CS7
+                        if (signal.strategy_name in _CS7 and signal.max_loss
+                                and signal.entry_price):
+                            _gross = abs(signal.entry_price) * 100
+                            _cw = _gross / (signal.max_loss + _gross)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    collect.append((eff_conf + 0.3 * _cw, signal, eff_conf,
+                                    sentiment, regime))
+                    continue
                 if self._should_queue_signal(signal, hist):
                     self._signal_queue[signal.symbol] = {
                         "signal": signal,
@@ -1260,6 +1312,24 @@ class TradingOrchestrator:
             budget = max_trades
 
         return min(budget, max_trades) - taken
+
+    async def _get_vix_lkg(self) -> float | None:
+        """VIX with a 45-minute last-known-good cache (R7 fail-closed)."""
+        import time as _t
+        try:
+            v = await self._market_data.get_vix()
+        except Exception:  # noqa: BLE001
+            v = None
+        if v and v > 0:
+            self._vix_lkg = (float(v), _t.time())
+            return float(v)
+        lkg = getattr(self, "_vix_lkg", None)
+        if lkg and (_t.time() - lkg[1]) <= 2700:
+            log.warning("vix_using_last_known_good", vix=lkg[0],
+                        age_s=int(_t.time() - lkg[1]))
+            return lkg[0]
+        log.error("vix_unavailable_fail_closed")
+        return None
 
     async def _check_trading_enabled(self) -> bool:
         """Probe whether orders can actually be placed; alert loudly if not.
@@ -1435,7 +1505,12 @@ class TradingOrchestrator:
                 return True  # symbol blocked through earnings
 
         # Build trade request for risk validation
-        current_vix = await self._market_data.get_vix() or 0.0
+        # R7: VIX with last-known-good fallback. `or 0.0` made the VIX-28
+        # credit halt FAIL OPEN on any fetch hiccup (0 is falsy, gate skipped).
+        # A fresh failure now reuses the last good print (<=45 min old);
+        # otherwise vix stays None and the risk manager fails CLOSED for
+        # credit entries.
+        current_vix = await self._get_vix_lkg()
         request = TradeRequest(
             symbol=signal.symbol,
             strategy=signal.strategy_name,
@@ -1545,6 +1620,14 @@ class TradingOrchestrator:
                 f"trade_maxloss_{trade_id}",
                 str(signal.max_loss if signal.is_defined_risk else 0.0),
             )
+            # R7: capital-at-risk RETAINED on the trade row (the KV above is
+            # deleted on close) so PF-per-unit-risk and DD-vs-deployed-risk
+            # stay reconstructable for the go-live verdict.
+            try:
+                self._state.set_trade_capital_at_risk(
+                    trade_id, float(signal.max_loss or 0.0))
+            except Exception:  # noqa: BLE001
+                pass
             self._state.save_trade_context(
                 trade_id=trade_id,
                 direction=signal.direction.value,
@@ -2266,7 +2349,31 @@ class TradingOrchestrator:
         return self._state.get_trade_by_id(trade_id)
 
     async def _estimate_iv_rank(self, symbol: str) -> float:
-        """Estimate IV rank (0-100) from recent volatility data."""
+        """IV rank (0-100). R7: TRUE percentile of today's implied vol in the
+        stored daily IV series when >=60 IV observations exist; otherwise the
+        old realized-vol min-max proxy, tagged in the logs. Sell-when-IV-is-
+        rich is THE premium-seller signal — the proxy measured realized, not
+        implied, and the two diverge exactly when the edge is largest.
+        """
+        try:
+            import sqlite3 as _sq
+            con = _sq.connect("file:data/historical.db?mode=ro", uri=True)
+            rows = [r[0] for r in con.execute(
+                "SELECT implied_vol FROM daily_prices WHERE symbol=? "
+                "AND implied_vol IS NOT NULL AND implied_vol > 0 "
+                "ORDER BY date DESC LIMIT 252", (symbol,))]
+            con.close()
+            if len(rows) >= 60:
+                cur = rows[0]
+                below = sum(1 for v in rows if v < cur)
+                rank = below / len(rows) * 100
+                log.debug("iv_rank_true_percentile", symbol=symbol,
+                          rank=round(rank, 1), n=len(rows))
+                return max(0.0, min(100.0, rank))
+        except Exception as _e:  # noqa: BLE001
+            log.debug("iv_rank_store_read_failed", symbol=symbol, error=str(_e))
+        log.debug("iv_rank_realized_proxy", symbol=symbol,
+                  note="stored IV series <60 obs — run IV backfill")
         hist = await self._market_data.get_historical(symbol, days=252)
         if hist is None or len(hist) < 60:
             return 50.0

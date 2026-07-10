@@ -108,7 +108,7 @@ class WalkForwardConfig:
     commission_per_contract: float = 0.65
     slippage_pct: float = 0.03  # 3% realistic for multi-leg options
     position_size_pct: float = 0.05
-    wing_floor_dollars: float = 5.0
+    wing_floor_dollars: float = 2.0   # R6 parity: live iron_condor min wing is $2, not $5
     wing_k: float = 1.0
     iv_floor: float = 0.12
     delta_iv_scale: float = 0.0
@@ -146,6 +146,13 @@ class WalkForwardConfig:
     spread_iv_sensitivity: float = 0.10   # additional spread per unit IV above 0.20
     spread_dte_sensitivity: float = 0.005 # additional spread per DTE below 21
     spread_cap: float = 0.15              # maximum half-spread per leg ($)
+    # R6 exit/construction parity knobs (None -> engine resolves the SAME env
+    # var + default the live bot reads; see Backtester.__init__):
+    credit_loss_limit_mult: float | None = None   # env AIT_CREDIT_LOSS_LIMIT (live 1.25)
+    ic_min_credit: float | None = None            # env AIT_IC_MIN_CREDIT (live $0.70)
+    ic_min_credit_width: float | None = None      # env AIT_IC_MIN_CREDIT_WIDTH (live 0.20)
+    macro_event_gate: bool = True                 # block credit entries <=4d pre macro event
+                                                  # (2026-only calendar; inactive earlier)
     optimize_n_jobs: int = 1              # Number of walk-forward WINDOWS to run in parallel via
                                           # ProcessPoolExecutor. Despite the "optimize_" prefix this
                                           # controls WINDOW-LEVEL parallelism, NOT Optuna trial-level
@@ -1188,6 +1195,11 @@ class WalkForwardBacktester:
                 iv_floor=window_cfg.iv_floor,
                 wing_floor_dollars=window_cfg.wing_floor_dollars,
                 wing_k=window_cfg.wing_k,
+                # R6 parity knobs — flow through so run_backtest CLI overrides reach the engine
+                credit_loss_limit_mult=getattr(window_cfg, "credit_loss_limit_mult", None),
+                ic_min_credit=getattr(window_cfg, "ic_min_credit", None),
+                ic_min_credit_width=getattr(window_cfg, "ic_min_credit_width", None),
+                macro_event_gate=getattr(window_cfg, "macro_event_gate", True),
                 delta_iv_scale=window_cfg.delta_iv_scale,
                 max_concurrent_positions=window_cfg.max_concurrent_positions,
                 max_entry_vol_annual=window_cfg.max_entry_vol_annual,
@@ -2570,6 +2582,12 @@ class WalkForwardBacktester:
                 iv_floor=window_cfg.iv_floor,
                 wing_floor_dollars=window_cfg.wing_floor_dollars,
                 wing_k=window_cfg.wing_k,
+                # R6 parity knobs — shadow backtest must label trades under the
+                # same exit/construction rules as the OOS run
+                credit_loss_limit_mult=getattr(window_cfg, "credit_loss_limit_mult", None),
+                ic_min_credit=getattr(window_cfg, "ic_min_credit", None),
+                ic_min_credit_width=getattr(window_cfg, "ic_min_credit_width", None),
+                macro_event_gate=getattr(window_cfg, "macro_event_gate", True),
                 max_concurrent_positions=window_cfg.max_concurrent_positions,
                 max_entry_vol_annual=window_cfg.max_entry_vol_annual,
                 spread_base=window_cfg.spread_base,

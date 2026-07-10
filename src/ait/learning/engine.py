@@ -31,10 +31,15 @@ class LearningEngine:
         state: StateManager,
         analyzer: TradeAnalyzer | None = None,
         adaptor: StrategyAdaptor | None = None,
+        apply_adaptations: bool = True,
     ) -> None:
+        # R7: apply_adaptations=False (paper_trading_mode) = analyze and log
+        # insights, but never mutate live behavior — the 50-close verdict
+        # must measure ONE fixed ruleset.
         self._state = state
         self._analyzer = analyzer or TradeAnalyzer()
-        self._adaptor = adaptor or StrategyAdaptor(state)
+        self._adaptor = adaptor or StrategyAdaptor(state, active=apply_adaptations)
+        self._apply_adaptations = apply_adaptations
 
     @property
     def adaptor(self) -> StrategyAdaptor:

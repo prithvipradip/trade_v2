@@ -30,7 +30,10 @@ log = get_logger("execution.executor")
 
 # Order timeout: cancel unfilled orders after this many seconds
 # Options markets move fast — stale orders get bad fills or block capital
-DEFAULT_ORDER_TIMEOUT = 90  # 90 seconds
+import os as _os_t
+# R7: 240s default — the mid-first reprice ladder needs 3 steps x 45s before
+# the cancel; 90s cancelled orders before the marketable step could fire.
+DEFAULT_ORDER_TIMEOUT = int(_os_t.environ.get("AIT_ENTRY_ORDER_TIMEOUT", "240"))
 
 
 # R5 audit: expected (n_sell, n_buy) leg shape per multi-leg strategy. A combo
@@ -70,6 +73,20 @@ def _validate_combo_legs(strategy_name: str, legs: list[dict]) -> str | None:
     return None
 
 
+def _ladder_limit(base_mag: float, full_offset: float, frac: float,
+                  is_credit: bool) -> float:
+    """R7: limit price at `frac` of the marketable offset from |mid|.
+
+    Signed for the always-BUY combo convention: credit combos are negative
+    (we accept `frac*offset` less credit than mid as we escalate), debit
+    combos positive (we pay `frac*offset` more than mid).
+    """
+    off = full_offset * max(0.0, min(1.0, frac))
+    if is_credit:
+        return -max(0.01, round(base_mag - off, 2))
+    return round(base_mag + off, 2)
+
+
 def combo_entry_limit(entry_price: float, is_credit: bool) -> tuple[float, float]:
     """Marketable limit for a multi-leg combo entry.
 
@@ -91,15 +108,31 @@ def combo_entry_limit(entry_price: float, is_credit: bool) -> tuple[float, float
 
 
 class PendingOrder:
-    """Tracks a pending order with its submission time."""
+    """Tracks a pending order with its submission time.
 
-    __slots__ = ("trade_id", "signal", "submitted_at", "contracts")
+    R7: also carries the reprice-ladder state (base price, full marketable
+    offset, current step) and the fill-quality context captured at placement
+    (signal price, live combo mid, NBBO spread) for the executions ledger.
+    """
 
-    def __init__(self, trade_id: str, signal: Signal, contracts: int) -> None:
+    __slots__ = ("trade_id", "signal", "submitted_at", "contracts",
+                 "base_price", "full_offset", "is_credit", "step",
+                 "live_mid", "nbbo_spread")
+
+    def __init__(self, trade_id: str, signal: Signal, contracts: int,
+                 base_price: float = 0.0, full_offset: float = 0.0,
+                 is_credit: bool = False, live_mid: float = 0.0,
+                 nbbo_spread: float = 0.0) -> None:
         self.trade_id = trade_id
         self.signal = signal
         self.submitted_at = time.time()
         self.contracts = contracts
+        self.base_price = base_price
+        self.full_offset = full_offset
+        self.is_credit = is_credit
+        self.step = 0
+        self.live_mid = live_mid
+        self.nbbo_spread = nbbo_spread
 
     @property
     def age_seconds(self) -> float:
@@ -241,7 +274,17 @@ class TradeExecutor:
                     trade_id=trade_id,
                     signal=signal,
                     contracts=contracts,
+                    base_price=getattr(self, "_last_base_mag", 0.0),
+                    full_offset=getattr(self, "_last_full_offset", 0.0),
+                    is_credit=signal.strategy_name in self.CREDIT_STRATEGIES,
+                    live_mid=getattr(self, "_last_live_mid", 0.0) or 0.0,
+                    nbbo_spread=getattr(self, "_last_nbbo_spread", 0.0) or 0.0,
                 )
+                # R7: orderId -> trade_id survives pending-dict cleanup so the
+                # executions sweep can attribute late commission reports.
+                if not hasattr(self, "_order_trade_map"):
+                    self._order_trade_map = {}
+                self._order_trade_map[trade.order.orderId] = trade_id
 
             log.info(
                 "trade_executed",
@@ -402,6 +445,8 @@ class TradeExecutor:
         # the signal-time mid. Fetch the live combo NBBO once and refuse when
         # (a) the combo spread is disorderly, or (b) the signal price has
         # drifted far from the live mid (stale signal / fat finger).
+        _live_mid_mag = None
+        _live_spread = None
         try:
             self._ibkr.ib.reqMktData(combo, "", False, False)
             try:
@@ -430,12 +475,26 @@ class TradeExecutor:
                                 signal_px=signal.entry_price, live_mid=_mid)
                     self._state.update_trade_status(trade_id, TradeStatus.CANCELLED)
                     return None
+                # R7: keep the live quote — it becomes the PRICING anchor
+                # (was fetched for validation then thrown away) and the
+                # fill-quality baseline in the executions ledger.
+                _live_mid_mag = abs(_mid)
+                _live_spread = _spread
         except Exception as _e:  # noqa: BLE001 — validation must not block on quote hiccups
             log.debug("combo_quote_validation_skipped", error=str(_e))
 
-        limit_price, aggressive_offset = combo_entry_limit(
-            signal.entry_price, is_credit
-        )
+        # R7: anchor pricing to the LIVE combo mid when we have one — the
+        # signal-time price can be minutes old. And start the reprice ladder
+        # NEAR MID instead of fully marketable: step 0 concedes only 25% of
+        # the marketable offset; check_fills escalates 60% -> 100% if
+        # unfilled. Measured entry slippage was ~15% of credit; most of it
+        # is recoverable patience.
+        import os as _os_l
+        _base_mag = _live_mid_mag if _live_mid_mag else abs(signal.entry_price)
+        _, aggressive_offset = combo_entry_limit(_base_mag, is_credit)
+        _start_frac = float(_os_l.environ.get("AIT_ENTRY_LADDER_START", "0.25"))
+        limit_price = _ladder_limit(_base_mag, aggressive_offset,
+                                    _start_frac, is_credit)
         # R5 audit: for debit combos the marketable cross (up to +15%) pushed
         # the worst-case cost past the max_loss the risk manager validated —
         # a systematic ~15% understatement. Cap the limit at the validated
@@ -455,6 +514,12 @@ class TradeExecutor:
             # off-tick prices IBKR rejects with error 110. Round to cents.
             limit_price=round(limit_price, 2),
         )
+
+        # R7: stash pricing context for the PendingOrder created by the caller
+        self._last_base_mag = _base_mag
+        self._last_full_offset = aggressive_offset
+        self._last_live_mid = _live_mid_mag
+        self._last_nbbo_spread = _live_spread
 
         return await self._ibkr.place_order(combo, order)
 
@@ -684,8 +749,86 @@ class TradeExecutor:
 
         return filled, completed_exits
 
+    _LADDER_STEPS = (0.25, 0.60, 1.00)   # fractions of the marketable offset
+    _LADDER_STEP_SECS = 45               # escalate an unfilled entry every 45s
+
+    async def _reprice_pending_entries(self) -> None:
+        """R7: step unfilled entry combos toward marketable (mid-first ladder).
+
+        Step 0 was placed at 25% of the offset; at 45s escalate to 60%, at
+        90s to 100% (the old immediate-marketable price). Modification uses
+        the same orderId, so queue priority is only lost on the price change.
+        """
+        for order_id, pending in list(self._pending_orders.items()):
+            if not pending.base_price or not pending.full_offset:
+                continue
+            target_step = min(int(pending.age_seconds // self._LADDER_STEP_SECS),
+                              len(self._LADDER_STEPS) - 1)
+            if target_step <= pending.step:
+                continue
+            pending.step = target_step
+            new_limit = _ladder_limit(pending.base_price, pending.full_offset,
+                                      self._LADDER_STEPS[target_step],
+                                      pending.is_credit)
+            try:
+                for t in self._ibkr.ib.openTrades():
+                    if t.order.orderId == order_id:
+                        t.order.lmtPrice = round(new_limit, 2)
+                        self._ibkr.ib.placeOrder(t.contract, t.order)
+                        log.info("entry_ladder_reprice",
+                                 trade_id=pending.trade_id, step=target_step,
+                                 limit=round(new_limit, 2))
+                        break
+            except Exception as e:  # noqa: BLE001
+                log.warning("entry_ladder_reprice_failed",
+                            trade_id=pending.trade_id, error=str(e))
+
+    def _sweep_executions(self) -> None:
+        """R7: persist every broker fill + commission to the executions
+        ledger. Runs each check_fills pass; upserts refresh commissions that
+        arrive after the fill. This is the ground truth the PF verdict needs
+        (trades.commission was guessed at $0.65/leg before)."""
+        try:
+            omap = getattr(self, "_order_trade_map", {})
+            for t in self._ibkr.ib.trades():
+                oid = t.order.orderId
+                trade_id = omap.get(oid, "")
+                pend = self._pending_orders.get(oid) or self._pending_exit_orders.get(oid)
+                for f in t.fills:
+                    if not f.execution or not f.execution.execId:
+                        continue
+                    comm = 0.0
+                    rpnl = 0.0
+                    if f.commissionReport:
+                        comm = float(f.commissionReport.commission or 0.0)
+                        rp = f.commissionReport.realizedPNL
+                        rpnl = float(rp) if rp and rp == rp and abs(rp) < 1e12 else 0.0
+                    self._state.record_execution(
+                        exec_id=f.execution.execId,
+                        order_id=oid,
+                        perm_id=getattr(t.order, "permId", 0) or 0,
+                        trade_id=trade_id,
+                        symbol=t.contract.symbol,
+                        con_id=getattr(f.contract, "conId", 0) or 0,
+                        side=f.execution.side,
+                        shares=float(f.execution.shares or 0),
+                        price=float(f.execution.price or 0),
+                        exec_time=str(f.execution.time or ""),
+                        commission=comm,
+                        realized_pnl=rpnl,
+                        signal_price=abs(getattr(getattr(pend, "signal", None),
+                                                 "entry_price", 0) or 0)
+                                     if pend is not None and hasattr(pend, "signal") else 0.0,
+                        live_mid=getattr(pend, "live_mid", 0.0) or 0.0,
+                        nbbo_spread=getattr(pend, "nbbo_spread", 0.0) or 0.0,
+                    )
+        except Exception as e:  # noqa: BLE001
+            log.debug("executions_sweep_failed", error=str(e))
+
     async def _cancel_stale_orders(self) -> None:
         """Cancel orders that have been pending longer than the timeout."""
+        await self._reprice_pending_entries()
+        self._sweep_executions()
         for order_id, pending in list(self._pending_orders.items()):
             if pending.age_seconds > self._order_timeout:
                 log.info(

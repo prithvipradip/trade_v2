@@ -184,6 +184,26 @@ def main() -> None:
     # R5: "lifetime" hid the 2026-07-06 reset (95 broken-P&L trades archived
     # to trades_legacy). Label honestly so nobody reads this as full history.
     print(f"  since 07-06 reset: ${s['pnl_life']:>10,.2f}  ({s['pnl_life_n']} closed; pre-reset archive in trades_legacy)")
+    # R7 go-live scorecard: the five gate criteria at a glance
+    try:
+        import sqlite3 as _sq
+        con = _sq.connect("data/ait_state.db"); con.row_factory = _sq.Row
+        real = ("AND COALESCE(exit_reason_detailed,'') NOT LIKE '%migrated%' "
+                "AND COALESCE(exit_reason_detailed,'') NOT LIKE '%pending%' "
+                "AND COALESCE(exit_reason_detailed,'') NOT LIKE '%never_filled%'")
+        rows = con.execute(f"SELECT realized_pnl FROM trades WHERE status='closed' {real} "
+                           f"ORDER BY COALESCE(exit_time, entry_time)").fetchall()
+        con.close()
+        n = len(rows)
+        gp = sum(r[0] for r in rows if r[0] > 0)
+        gl = abs(sum(r[0] for r in rows if r[0] < 0))
+        pf = "inf" if gl == 0 else f"{gp / gl:.2f}"
+        peak = dd = cum = 0.0
+        for r in rows:
+            cum += r[0]; peak = max(peak, cum); dd = max(dd, peak - cum)
+        print(f"  GO-LIVE GATES: closes {n}/50 | PF {pf} (>1.3) | maxDD ${dd:,.0f}")
+    except Exception:
+        pass
     print("\n" + "=" * 56)
 
 

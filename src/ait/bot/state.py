@@ -198,6 +198,31 @@ class StateManager:
                 # cannot attribute a live trade to the model version that
                 # produced its prediction.
                 "ALTER TABLE trade_context ADD COLUMN model_version TEXT DEFAULT ''",
+                # R7 (gap audit): capital-at-risk retained on the trade row —
+                # it used to live only in bot_state KV and was deleted on
+                # close, making PF-per-unit-risk and DD-vs-deployed-risk
+                # unreconstructable for the go-live verdict.
+                "ALTER TABLE trades ADD COLUMN capital_at_risk REAL DEFAULT 0",
+                # R7: per-fill execution ledger (real commissions + fill
+                # quality). trades.commission was written by ZERO callers —
+                # the PF verdict was being computed on guessed costs.
+                """CREATE TABLE IF NOT EXISTS executions (
+                    exec_id TEXT PRIMARY KEY,
+                    order_id INTEGER,
+                    perm_id INTEGER,
+                    trade_id TEXT,
+                    symbol TEXT,
+                    con_id INTEGER,
+                    side TEXT,
+                    shares REAL,
+                    price REAL,
+                    exec_time TEXT,
+                    commission REAL DEFAULT 0,
+                    realized_pnl REAL DEFAULT 0,
+                    signal_price REAL DEFAULT 0,
+                    live_mid REAL DEFAULT 0,
+                    nbbo_spread REAL DEFAULT 0
+                )""",
             ):
                 try:
                     conn.execute(ddl)
@@ -608,6 +633,51 @@ class StateManager:
                 "SELECT value FROM bot_state WHERE key = ?", (key,)
             ).fetchone()
         return row[0] if row else default
+
+    def record_execution(self, exec_id: str, order_id: int, perm_id: int,
+                         trade_id: str, symbol: str, con_id: int, side: str,
+                         shares: float, price: float, exec_time: str,
+                         commission: float = 0.0, realized_pnl: float = 0.0,
+                         signal_price: float = 0.0, live_mid: float = 0.0,
+                         nbbo_spread: float = 0.0) -> None:
+        """R7: upsert one broker execution (commission may arrive later —
+        re-upserting the same exec_id refreshes it)."""
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO executions
+                   (exec_id, order_id, perm_id, trade_id, symbol, con_id,
+                    side, shares, price, exec_time, commission, realized_pnl,
+                    signal_price, live_mid, nbbo_spread)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(exec_id) DO UPDATE SET
+                     commission=excluded.commission,
+                     realized_pnl=excluded.realized_pnl,
+                     trade_id=CASE WHEN excluded.trade_id != ''
+                                   THEN excluded.trade_id ELSE trade_id END""",
+                (exec_id, order_id, perm_id, trade_id, symbol, con_id, side,
+                 shares, price, exec_time, commission, realized_pnl,
+                 signal_price, live_mid, nbbo_spread),
+            )
+
+    def total_commission(self, trade_id: str) -> float:
+        """R7: sum of real broker commissions recorded for a trade."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(commission),0) FROM executions "
+                "WHERE trade_id = ?", (trade_id,)).fetchone()
+            return float(row[0] or 0.0)
+
+    def update_trade_commission(self, trade_id: str, commission: float) -> None:
+        """R7: record the REAL round-trip commission on the trade row."""
+        with self._connect() as conn:
+            conn.execute("UPDATE trades SET commission = ? WHERE trade_id = ?",
+                         (commission, trade_id))
+
+    def set_trade_capital_at_risk(self, trade_id: str, car: float) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE trades SET capital_at_risk = ? WHERE trade_id = ?",
+                (car, trade_id))
 
     def delete_state(self, key: str) -> None:
         """Delete a key from bot state (e.g. per-trade risk keys on close)."""
