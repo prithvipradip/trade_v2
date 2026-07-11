@@ -208,6 +208,15 @@ class TradingOrchestrator:
         self._watchdog = Watchdog()
         self._watchdog.register_component("trading_loop")
         self._watchdog.register_component("ibkr")
+        # R8 (incident 2026-07-10): the watchdog's alert path existed but was
+        # NEVER wired — 661 component-down states paged nobody while stops
+        # were dead for a full session. Route to Telegram, 1/hour cooldown.
+        async def _wd_alert(msg: str) -> None:
+            import time as _t
+            if _t.time() - getattr(self, "_wd_alert_last", 0.0) > 3600:
+                self._wd_alert_last = _t.time()
+                await self._send_notification(f"WATCHDOG {msg}")
+        self._watchdog.set_alert_callback(_wd_alert)
         self._watchdog.register_component("market_data")
         self._watchdog.on_recovery("ibkr", self._ibkr.ensure_connected)
 
@@ -560,6 +569,7 @@ class TradingOrchestrator:
             if self._edgar_check_count >= 10:
                 self._edgar_check_count = 0
                 await self._check_material_events()
+            self._clear_loop_error("fast_monitor_error")  # R8: success resets streak
         except Exception as e:
             # Deep-audit BC-H1: this was log.debug — the 30s stop/TP engine
             # could silently no-op for HOURS with a green heartbeat. Surface
@@ -569,6 +579,7 @@ class TradingOrchestrator:
                 self._watchdog.record_error("trading_loop", f"fast_monitor: {e}")
             except Exception:
                 pass
+            await self._note_loop_error("fast_monitor_error", str(e))
 
     async def _check_material_events(self) -> None:
         """Check for new SEC 8-K filings; flatten any held positions on the symbol."""
@@ -621,15 +632,18 @@ class TradingOrchestrator:
                 except Exception:  # noqa: BLE001
                     pass
 
+
                 if time_since_scan >= scan_interval:
                     # Full cycle: scan for new trades + check positions
                     await self._trading_cycle()
+                    self._clear_loop_error("trading_cycle_error")  # R8: success resets streak
                     time_since_scan = 0
                 else:
                     # Fast check: only monitor existing positions and fills
                     await self._monitor_positions_fast()
             except Exception as e:
                 log.error("trading_cycle_error", error=str(e))
+                await self._note_loop_error("trading_cycle_error", str(e))
                 self._circuit_breaker.record_api_failure()
                 self._watchdog.record_error("trading_loop", str(e))
 
@@ -1378,6 +1392,36 @@ class TradingOrchestrator:
                 )
         except Exception as _e:  # noqa: BLE001
             log.warning("coherence_check_failed", error=str(_e))
+
+    async def _note_loop_error(self, kind: str, error: str) -> None:
+        """R8 (incident 2026-07-10): 516 fast-monitor + 145 trading-cycle
+        errors produced ZERO alerts — per-iteration try/excepts logged a
+        WARNING and kept looping while stops/TPs were dead all session. Any
+        streak of >=5 consecutive failures at one site pages Telegram once,
+        re-pages hourly while it persists; the streak resets on the first
+        clean iteration (_clear_loop_errors)."""
+        import time as _t
+        st = getattr(self, "_err_streaks", None)
+        if st is None:
+            st = self._err_streaks = {}
+        n, last_alert = st.get(kind, (0, 0.0))
+        n += 1
+        if n >= 5 and (_t.time() - last_alert) > 3600:
+            last_alert = _t.time()
+            try:
+                await self._send_notification(
+                    f"LOOP IMPAIRED — {kind}: {n} consecutive failures. "
+                    f"Position protection may be OFF. Latest: {error[:200]}"
+                )
+            except Exception:  # noqa: BLE001 — alerting must never crash the loop
+                pass
+        st[kind] = (n, last_alert)
+
+    def _clear_loop_error(self, kind: str) -> None:
+        """Reset one streak — call ONLY from that path's success point."""
+        st = getattr(self, "_err_streaks", None)
+        if st and kind in st:
+            st[kind] = (0, st[kind][1])
 
     async def _get_vix_lkg(self) -> float | None:
         """VIX with a 45-minute last-known-good cache (R7 fail-closed)."""
