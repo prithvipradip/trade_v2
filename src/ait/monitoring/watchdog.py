@@ -81,10 +81,24 @@ class Watchdog:
         if component not in self._components:
             self.register_component(component)
         self._components[component].last_heartbeat = time.time()
-        self._components[component].status = ComponentStatus.HEALTHY
+        # R8: a heartbeat proves LIVENESS, not health — during the 07-10
+        # incident the looping (alive) bot heartbeat every 30s, wiping the
+        # DOWN status its own errors had just set. Status only recovers
+        # when errors stop crossing the threshold (note_success below).
+        if self._components[component].error_count < self._error_threshold:
+            self._components[component].status = ComponentStatus.HEALTHY
         # Deep-audit BC-H2a: heartbeat used to zero error_count — with a 30s
         # heartbeat and a 10-error threshold the counter oscillated 0<->1 and
         # could NEVER trip. Errors now persist until explicit recovery.
+
+    def note_success(self, component: str) -> None:
+        """R8: consecutive-error semantics — a clean pass resets the counter
+        (the lifetime counter meant 10 sporadic errors across a session put a
+        component permanently DOWN, flooding component_down logs)."""
+        comp = self._components.get(component)
+        if comp is not None:
+            comp.error_count = 0
+            comp.status = ComponentStatus.HEALTHY
 
     def record_error(self, component: str, error: str) -> None:
         """Record an error for a component."""

@@ -226,8 +226,27 @@ class DuckDBAnalytics:
     # Ingest (write path — called by StateManager on trade close)
     # ------------------------------------------------------------------
 
+    _TRADE_INGEST_COLS = (
+        "trade_id", "symbol", "strategy", "direction", "status",
+        "entry_time", "entry_price", "quantity", "contract_type",
+        "strike", "expiry", "exit_time", "exit_price",
+        "realized_pnl", "commission", "ml_confidence",
+        "sentiment_score", "market_regime", "notes", "legs",
+        "exit_reason_detailed", "peak_pnl_pct",
+        "time_to_peak_hours", "direction_correct",
+    )
+
     def ingest_trade(self, trade: dict) -> None:
-        """Upsert a trade record into DuckDB analytics store."""
+        """Upsert a trade record into DuckDB analytics store.
+
+        R8 CRITICAL fix: callers feed dict(SELECT * FROM trades) — after the
+        capital_at_risk migration that dict has MORE keys than the INSERT's
+        named params and DuckDB raises on the excess, silently (warning-
+        swallowed) stopping every future close from reaching analytics.
+        Filter to the ingest columns so sqlite-side migrations can never
+        break the mirror again.
+        """
+        trade = {k: trade.get(k) for k in self._TRADE_INGEST_COLS}
         with self._get_conn() as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO trades VALUES (
@@ -254,6 +273,12 @@ class DuckDBAnalytics:
 
     def ingest_trade_context(self, context: dict) -> None:
         """Upsert trade entry context."""
+        # R8: same excess-parameter armor as ingest_trade (model_version
+        # column was already breaking this — 17/17 sync_context_failed).
+        _cols = ("trade_id", "entry_direction", "entry_confidence",
+                 "entry_regime", "entry_vix", "entry_iv_rank",
+                 "entry_sentiment_score", "entry_signals")
+        context = {k: context.get(k) for k in _cols}
         with self._get_conn() as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO trade_context VALUES (
@@ -567,9 +592,13 @@ class DuckDBAnalytics:
         daily_stats, not per-trade P&L, so daily annualization applies.
         """
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        # R8: the window size is INLINED — a bound '?' inside a named WINDOW
+        # gets duplicated by DuckDB's OVER-w expansion (6 params wanted, 2
+        # supplied), so this method raised on every call since it was written.
+        window_rows = max(0, int(window_days) - 1)
 
         with self._get_conn(read_only=True) as conn:
-            rows = conn.execute("""
+            rows = conn.execute(f"""
                 WITH daily_returns AS (
                     SELECT date, total_pnl
                     FROM daily_stats
@@ -585,9 +614,9 @@ class DuckDBAnalytics:
                          THEN (AVG(total_pnl) OVER w / STDDEV(total_pnl) OVER w) * SQRT(252)
                          ELSE 0 END AS rolling_sharpe
                 FROM daily_returns
-                WINDOW w AS (ORDER BY date ROWS BETWEEN ? PRECEDING AND CURRENT ROW)
+                WINDOW w AS (ORDER BY date ROWS BETWEEN {window_rows} PRECEDING AND CURRENT ROW)
                 ORDER BY date
-            """, [cutoff, window_days - 1]).fetchall()
+            """, [cutoff]).fetchall()
 
         return [
             {

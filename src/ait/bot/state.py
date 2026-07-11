@@ -456,7 +456,13 @@ class StateManager:
             ).fetchone()
 
         if row:
-            return DailyStats(**dict(row))
+            return DailyStats(**{
+            # R8: same schema-ahead-of-dataclass armor as _row_to_trade —
+            # this sits in the fast monitor + exit booking; an unguarded
+            # daily_stats migration would repeat the 07-10 incident.
+            k: v for k, v in dict(row).items()
+            if k in {f.name for f in __import__("dataclasses").fields(DailyStats)}
+        })
         return DailyStats(date=d.isoformat())
 
     # --- High Water Mark & Partial Exits ---
@@ -634,6 +640,16 @@ class StateManager:
                 "SELECT value FROM bot_state WHERE key = ?", (key,)
             ).fetchone()
         return row[0] if row else default
+
+    def _connect(self):
+        """R8 CRITICAL fix: the four R7 ledger methods were written against a
+        _connect() helper that never existed — every call raised
+        AttributeError (swallowed at their call sites), leaving the entire
+        real-cost ledger dead-on-arrival: executions empty, commissions $0,
+        capital_at_risk 0 on every row. sqlite3.Connection is a context
+        manager, matching the `with self._connect() as conn:` usage."""
+        import sqlite3 as _sq
+        return _sq.connect(self._db_path)
 
     def record_execution(self, exec_id: str, order_id: int, perm_id: int,
                          trade_id: str, symbol: str, con_id: int, side: str,

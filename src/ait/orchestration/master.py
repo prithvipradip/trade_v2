@@ -68,7 +68,11 @@ def _alert(message: str) -> None:
             _TG_CREDS = (s.api_keys.telegram_bot_token, s.api_keys.telegram_chat_id)
         except Exception as e:  # noqa: BLE001
             _log("warn", "alert_creds_unavailable", error=str(e))
-            _TG_CREDS = ()
+            # R8: caching () permanently silenced ALL supervisor alerts after
+            # one transient settings failure. Leave None so the next alert
+            # retries the load.
+            _TG_CREDS = None
+            return
     if not _TG_CREDS or not _TG_CREDS[0] or not _TG_CREDS[1]:
         return
     token, chat_id = _TG_CREDS
@@ -702,9 +706,9 @@ def daily_digest():
         if src.exists():
             con = _sq.connect(str(src))
             today = datetime.now().strftime("%Y-%m-%d")
-            real = ("AND exit_reason_detailed NOT LIKE '%migrated%' "
-                    "AND exit_reason_detailed NOT LIKE '%pending%' "
-                    "AND exit_reason_detailed NOT LIKE '%never_filled%'")
+            real = ("AND COALESCE(exit_reason_detailed,'') NOT LIKE '%migrated%' "
+                    "AND COALESCE(exit_reason_detailed,'') NOT LIKE '%pending%' "
+                    "AND COALESCE(exit_reason_detailed,'') NOT LIKE '%never_filled%'")  # R8: NULL-safe like sibling sites
             t = con.execute(
                 f"SELECT COUNT(*), COALESCE(SUM(realized_pnl),0) FROM trades "
                 f"WHERE status='closed' AND exit_time LIKE ?||'%' {real}",

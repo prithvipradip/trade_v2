@@ -283,3 +283,53 @@ class TestSchemaDataclassParity:
             con.execute("ALTER TABLE trades ADD COLUMN future_col TEXT DEFAULT 'x'")
         trades = sm.get_open_trades()  # must not raise
         assert len(trades) == 1
+
+
+class TestR8LedgerRuntime:
+    """R8: the four R7 ledger methods called a _connect() that didn't exist —
+    AttributeError on every call, swallowed at call sites, entire real-cost
+    ledger dead-on-arrival. These tests EXECUTE every method (the incident
+    class survives compile + read-only review)."""
+
+    def test_all_four_ledger_methods_execute(self, tmp_path):
+        from ait.bot.state import StateManager, TradeRecord, TradeDirection, TradeStatus
+        sm = StateManager(db_path=tmp_path / "t.db")
+        sm.record_execution(exec_id="E1", order_id=1, perm_id=2, trade_id="T1",
+                            symbol="SPY", con_id=3, side="BOT", shares=1,
+                            price=1.5, exec_time="2026-07-11T10:00:00",
+                            commission=1.31)
+        sm.record_execution(exec_id="E1", order_id=1, perm_id=2, trade_id="T1",
+                            symbol="SPY", con_id=3, side="BOT", shares=1,
+                            price=1.5, exec_time="2026-07-11T10:00:00",
+                            commission=1.31)  # upsert must not raise
+        assert sm.total_commission("T1") == 1.31
+        sm.record_trade(TradeRecord(
+            trade_id="T1", symbol="SPY", strategy="iron_condor",
+            direction=TradeDirection.LONG, status=TradeStatus.FILLED,
+            entry_time="2026-07-11T10:00:00", entry_price=1.0, quantity=1,
+            contract_type="combo", strike=0.0, expiry="2026-07-24"))
+        sm.update_trade_commission("T1", 2.62)
+        sm.set_trade_capital_at_risk("T1", 130.0)
+        assert sm.get_trade_by_id("T1").capital_at_risk == 130.0
+
+    def test_duckdb_ingest_survives_schema_ahead_rows(self, tmp_path):
+        import sqlite3
+        from ait.bot.state import StateManager, TradeRecord, TradeDirection, TradeStatus
+        from ait.monitoring.duckdb_analytics import DuckDBAnalytics
+        sm = StateManager(db_path=tmp_path / "t.db")
+        sm.record_trade(TradeRecord(
+            trade_id="T1", symbol="SPY", strategy="iron_condor",
+            direction=TradeDirection.LONG, status=TradeStatus.FILLED,
+            entry_time="2026-07-11T10:00:00", entry_price=1.0, quantity=1,
+            contract_type="combo", strike=0.0, expiry="2026-07-24"))
+        con = sqlite3.connect(tmp_path / "t.db"); con.row_factory = sqlite3.Row
+        row = dict(con.execute("SELECT * FROM trades").fetchone())
+        row["some_future_column"] = 42  # schema-ahead simulation
+        duck = DuckDBAnalytics(db_path=tmp_path / "a.duckdb")
+        duck.ingest_trade(row)  # must not raise
+        duck.ingest_trade_context({
+            "trade_id": "T1", "entry_direction": "long",
+            "entry_confidence": 0.7, "entry_regime": "r", "entry_vix": 18.0,
+            "entry_iv_rank": 40.0, "entry_sentiment_score": 0.0,
+            "entry_signals": "{}", "model_version": "v9"})  # extra key OK
+        assert len(duck.get_rolling_sharpe(30)) == 0  # executes, no raise

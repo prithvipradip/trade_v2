@@ -244,7 +244,10 @@ class TradingOrchestrator:
     def set_notification_callback(self, callback) -> None:
         """Set async callback for sending notifications."""
         self._notify = callback
-        self._watchdog.set_alert_callback(callback)
+        # R8: do NOT overwrite the cooldown-wrapped watchdog callback wired
+        # in __init__ — it routes through _send_notification (which uses
+        # self._notify) with a 1/hour cooldown; the raw callback would page
+        # on every check pass of a flapping component.
 
     async def run(self) -> None:
         """Main loop — runs continuously, trading during market hours."""
@@ -570,6 +573,7 @@ class TradingOrchestrator:
                 self._edgar_check_count = 0
                 await self._check_material_events()
             self._clear_loop_error("fast_monitor_error")  # R8: success resets streak
+            self._watchdog.note_success("trading_loop")
         except Exception as e:
             # Deep-audit BC-H1: this was log.debug — the 30s stop/TP engine
             # could silently no-op for HOURS with a green heartbeat. Surface
@@ -627,8 +631,15 @@ class TradingOrchestrator:
                 # the in-process watchdog dies with a hung event loop, and
                 # all process checks only prove existence, not liveness.
                 try:
-                    from pathlib import Path as _PHB
-                    _PHB("data/bot_heartbeat").write_text(datetime.now().isoformat())
+                    # R8: only refresh the heartbeat when the loop is actually
+                    # HEALTHY — during the 07-10 error loop the top-of-loop
+                    # touch kept the supervisor's hang detection blind while
+                    # stops were dead. Any active error streak lets it go
+                    # stale, so the 15-min supervisor restart+alert fires.
+                    _streaks = getattr(self, "_err_streaks", {})
+                    if not any(n for n, _ in _streaks.values()):
+                        from pathlib import Path as _PHB
+                        _PHB("data/bot_heartbeat").write_text(datetime.now().isoformat())
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -637,10 +648,20 @@ class TradingOrchestrator:
                     # Full cycle: scan for new trades + check positions
                     await self._trading_cycle()
                     self._clear_loop_error("trading_cycle_error")  # R8: success resets streak
+                    self._watchdog.note_success("trading_loop")
                     time_since_scan = 0
                 else:
                     # Fast check: only monitor existing positions and fills
                     await self._monitor_positions_fast()
+                    # R8: check_and_recover was only reachable from the outer
+                    # exception handler (i.e. never) — run it periodically so
+                    # component-down states can actually page.
+                    self._wd_tick = getattr(self, "_wd_tick", 0) + 1
+                    if self._wd_tick % 10 == 0:
+                        try:
+                            await self._watchdog.check_and_recover()
+                        except Exception:  # noqa: BLE001
+                            pass
             except Exception as e:
                 log.error("trading_cycle_error", error=str(e))
                 await self._note_loop_error("trading_cycle_error", str(e))
@@ -1365,7 +1386,7 @@ class TradingOrchestrator:
             # Typical stopped-trade loss under the 1.25x credit limit
             loss_mult = float(_os_c.environ.get("AIT_CREDIT_LOSS_LIMIT", "1.25"))
             typical_stop_loss = loss_mult * max(min_credit, min_ratio * min_width) * 100
-            breaker_pct = float(getattr(self._settings.risk, "daily_loss_limit_pct", 0.02) or 0.02)
+            breaker_pct = float(getattr(self._settings.risk, "max_daily_loss_pct", 0.02) or 0.02)  # R8: real field name
             breaker_usd = nlv * breaker_pct
             problems = []
             if budget < min_viable_cost:
@@ -2522,15 +2543,34 @@ class TradingOrchestrator:
             return
 
         async def _send_with_retry(msg: str) -> None:
+            # R8: TelegramNotifier.send returns False on failure without
+            # raising — the retry loop treated that as success, so the A11
+            # 3-attempt logic was unreachable and a dead Telegram channel was
+            # invisible. False now retries; 5 consecutive definitive failures
+            # write data/TELEGRAM_DEAD (surfaced by the supervisor digest).
             for attempt in range(3):
                 try:
-                    await self._notify(msg)
-                    return
+                    ok = await self._notify(msg)
+                    if ok is not False:
+                        self._tg_fail_streak = 0
+                        return
+                    log.warning("notification_attempt_returned_false",
+                                attempt=attempt + 1)
                 except Exception as e:  # noqa: BLE001
                     log.warning("notification_attempt_failed",
                                 attempt=attempt + 1, error=str(e)[:200])
-                    await asyncio.sleep(2 * (attempt + 1))
+                await asyncio.sleep(2 * (attempt + 1))
             log.error("notification_dropped_after_retries", preview=msg[:80])
+            self._tg_fail_streak = getattr(self, "_tg_fail_streak", 0) + 1
+            if self._tg_fail_streak >= 5:
+                try:
+                    from pathlib import Path as _PTD
+                    _PTD("data/TELEGRAM_DEAD").write_text(
+                        f"{self._tg_fail_streak} consecutive dropped alerts")
+                    log.critical("telegram_channel_dead",
+                                 streak=self._tg_fail_streak)
+                except Exception:  # noqa: BLE001
+                    pass
 
         try:
             asyncio.get_running_loop().create_task(_send_with_retry(message))

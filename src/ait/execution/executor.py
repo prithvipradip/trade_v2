@@ -117,7 +117,7 @@ class PendingOrder:
 
     __slots__ = ("trade_id", "signal", "submitted_at", "contracts",
                  "base_price", "full_offset", "is_credit", "step",
-                 "live_mid", "nbbo_spread")
+                 "live_mid", "nbbo_spread", "debit_cap")
 
     def __init__(self, trade_id: str, signal: Signal, contracts: int,
                  base_price: float = 0.0, full_offset: float = 0.0,
@@ -133,6 +133,9 @@ class PendingOrder:
         self.step = 0
         self.live_mid = live_mid
         self.nbbo_spread = nbbo_spread
+        # R8: risk-validated per-contract debit ceiling — the reprice ladder
+        # must never step a debit limit above what the risk manager approved.
+        self.debit_cap = 0.0
 
     @property
     def age_seconds(self) -> float:
@@ -180,6 +183,15 @@ class TradeExecutor:
         # them via run_orchestrator's default so the edge comparison runs;
         # at go-live the env is unset and the wings become a contractual,
         # not configured, loss floor.
+        # R8: zero the combo pricing stash — it leaked the PREVIOUS combo's
+        # base/offset into single-leg PendingOrders (single-leg path never
+        # writes it), arming the reprice ladder with wrong prices.
+        self._last_base_mag = 0.0
+        self._last_full_offset = 0.0
+        self._last_live_mid = 0.0
+        self._last_nbbo_spread = 0.0
+        self._last_debit_cap = 0.0
+
         import os as _os
         # R5 audit: covered_call included — no stock-ownership check exists
         # anywhere, so a CC fill would be a NAKED call mislabeled defined-risk.
@@ -280,6 +292,8 @@ class TradeExecutor:
                     live_mid=getattr(self, "_last_live_mid", 0.0) or 0.0,
                     nbbo_spread=getattr(self, "_last_nbbo_spread", 0.0) or 0.0,
                 )
+                self._pending_orders[trade.order.orderId].debit_cap = \
+                    getattr(self, "_last_debit_cap", 0.0) or 0.0
                 # R7: orderId -> trade_id survives pending-dict cleanup so the
                 # executions sweep can attribute late commission reports.
                 if not hasattr(self, "_order_trade_map"):
@@ -499,10 +513,13 @@ class TradeExecutor:
         # the worst-case cost past the max_loss the risk manager validated —
         # a systematic ~15% understatement. Cap the limit at the validated
         # per-contract loss so the risk check stays truthful.
+        _debit_cap = 0.0
         if not is_credit and signal.max_loss and contracts > 0:
             _validated = signal.max_loss / (100 * contracts)
+            _debit_cap = round(_validated, 2)
             if limit_price > _validated > 0:
                 limit_price = round(_validated, 2)
+        self._last_debit_cap = _debit_cap
         log.info("combo_entry_priced", strategy=signal.strategy_name,
                  target=signal.entry_price, offset=aggressive_offset,
                  limit=limit_price, is_credit=is_credit)
@@ -770,6 +787,8 @@ class TradeExecutor:
             new_limit = _ladder_limit(pending.base_price, pending.full_offset,
                                       self._LADDER_STEPS[target_step],
                                       pending.is_credit)
+            if not pending.is_credit and pending.debit_cap > 0:
+                new_limit = min(new_limit, pending.debit_cap)  # R8: honor risk cap
             try:
                 for t in self._ibkr.ib.openTrades():
                     if t.order.orderId == order_id:
@@ -793,6 +812,9 @@ class TradeExecutor:
             for t in self._ibkr.ib.trades():
                 oid = t.order.orderId
                 trade_id = omap.get(oid, "")
+                if not trade_id:
+                    _p = self._pending_exit_orders.get(oid)
+                    trade_id = getattr(_p, "trade_id", "") if _p else ""
                 pend = self._pending_orders.get(oid) or self._pending_exit_orders.get(oid)
                 for f in t.fills:
                     if not f.execution or not f.execution.execId:
@@ -1128,6 +1150,12 @@ class TradeExecutor:
         exit_reason: str,
         estimated_pnl: float,
     ) -> None:
+        # R8: exit orders were never added to the orderId->trade_id map, so
+        # exit-leg fills landed in the executions ledger with trade_id='' and
+        # total_commission() summed HALF the round trip.
+        if not hasattr(self, "_order_trade_map"):
+            self._order_trade_map = {}
+        self._order_trade_map[order_id] = trade_id
         """Register an exit order for fill tracking.
 
         Called by the orchestrator after placing a close order so that
