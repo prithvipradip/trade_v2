@@ -42,3 +42,19 @@ def account_config() -> AccountConfig:
 @pytest.fixture
 def account_config_over_25k() -> AccountConfig:
     return AccountConfig(pdt_protection=True, pdt_account_under_25k=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_model_artifacts(tmp_path, monkeypatch):
+    """R12 (vol-craft audit): tests constructed predictors with the DEFAULT
+    model dir — the LIVE models/ — and pytest runs overwrote models/range.pkl
+    with a synthetic-noise QQQ model (caught 2026-07-13, file mtime 13:12,
+    while the live gate depends on that artifact). Redirect every model save
+    in every test to tmp_path. The live spec-mismatch guard remains the
+    second net; this fixture is the fence."""
+    import ait.ml.range_predictor as _rp
+    import ait.ml.vol_magnitude_predictor as _vp
+    import ait.ml.ensemble as _en
+    for _mod in (_rp, _vp, _en):
+        if hasattr(_mod, "MODEL_DIR"):
+            monkeypatch.setattr(_mod, "MODEL_DIR", tmp_path, raising=False)
