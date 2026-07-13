@@ -18,7 +18,7 @@ Usage:
     python scripts/calibrate_option_spreads.py \\
         --symbols QQQ \\
         --db-path data/historical.db \\
-        --update-config config_QQQ_test.yaml
+        --update-config deprecated/configs/config_QQQ_test.yaml
 
     # Dry-run (shows request plan only):
     python scripts/calibrate_option_spreads.py --symbols QQQ --dry-run
@@ -28,7 +28,7 @@ Usage:
         --symbols QQQ --source ibkr \\
         --db-path data/historical.db \\
         --port 4002 --client-id 91 \\
-        --update-config config_QQQ_test.yaml
+        --update-config deprecated/configs/config_QQQ_test.yaml
 """
 
 from __future__ import annotations

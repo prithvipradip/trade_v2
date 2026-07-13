@@ -343,7 +343,7 @@ python run_backtest.py --symbols SPY QQQ --optimize-per-window --optimize-n-tria
 python run_optimizer.py --strategies iron_condor --symbols SPY QQQ --n-trials 100 --objective sharpe_ratio
 
 # View live logs (color-coded)
-python tail_logs.py
+python web_logs.py   # log dashboard at 127.0.0.1:8502 (tail_logs retired to deprecated/ops/)
 
 # Just the dashboard (if already running)
 streamlit run src/ait/dashboard/app.py
@@ -511,9 +511,8 @@ Auto-refreshing colored log stream. Filters: all / trades / predictions / signal
 
 ### Terminal Log Viewer
 ```bash
-python tail_logs.py              # Color-coded live tail
-python tail_logs.py --trades     # Only trade events
-python tail_logs.py --last 100   # Last 100 lines
+python web_logs.py               # Log dashboard at http://127.0.0.1:8502
+# (the old terminal viewer lives in deprecated/ops/tail_logs.py)
 ```
 
 ### Telegram Alerts
@@ -613,7 +612,7 @@ pip install "transformers>=4.38,<4.45"
 ```
 trade_v2/
 ├── README.md                   ← You are here
-├── CONTEXT.md                  ← Architecture/history notes
+├── deprecated/                 ← Retired docs/configs/tools (see its README)
 ├── config.yaml                 ← Main configuration
 ├── .env                        ← Secrets (not committed)
 ├── .env.example                ← Template for .env
@@ -621,7 +620,6 @@ trade_v2/
 ├── run_orchestrator.py         ← Master entry point
 ├── run_backtest.py             ← CLI backtester
 ├── run_optimizer.py            ← Optuna strategy/ML parameter optimizer
-├── tail_logs.py                ← Terminal log viewer
 ├── web_logs.py                 ← Flask log viewer (port 8502)
 ├── start_bot.bat               ← Windows launcher
 ├── src/ait/
