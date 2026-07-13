@@ -141,6 +141,10 @@ class MarketDataService:
         self._polygon_key = polygon_api_key
         self._cache = TTLCache(default_ttl=cache_ttl)
         self._polygon_client = None
+        # R9 single-flight: per-cache-key asyncio.Lock so N concurrent cache
+        # misses for the same key result in ONE network fetch (the rest wait,
+        # then hit the freshly-set cache). Created lazily per key.
+        self._fetch_locks: dict[str, asyncio.Lock] = {}
 
         if polygon_api_key:
             try:
@@ -151,23 +155,43 @@ class MarketDataService:
             except ImportError:
                 log.warning("polygon_package_not_installed")
 
+    def _lock_for(self, key: str) -> asyncio.Lock:
+        """Return the single-flight lock for a cache key (creating if needed).
+
+        Bounded: when the dict grows past 512 entries, locks nobody currently
+        holds are pruned (a pruned-then-recreated lock only risks one
+        duplicate fetch, never corruption).
+        """
+        if len(self._fetch_locks) > 512:
+            for k in [k for k, lk in self._fetch_locks.items() if not lk.locked()]:
+                self._fetch_locks.pop(k, None)
+        return self._fetch_locks.setdefault(key, asyncio.Lock())
+
     async def get_quote(self, symbol: str) -> Quote | None:
         """Get real-time quote. Tries IBKR first, then Yahoo."""
-        cached = self._cache.get(f"quote:{symbol}")
+        cache_key = f"quote:{symbol}"
+        cached = self._cache.get(cache_key)
         if cached:
             return cached
 
-        # Try IBKR
-        quote = await self._get_ibkr_quote(symbol)
+        async with self._lock_for(cache_key):
+            # Double-check: another task may have populated the cache while
+            # we waited on the single-flight lock.
+            cached = self._cache.get(cache_key)
+            if cached:
+                return cached
 
-        # Fallback to Yahoo
-        if quote is None:
-            quote = await self._get_yahoo_quote(symbol)
+            # Try IBKR
+            quote = await self._get_ibkr_quote(symbol)
 
-        if quote:
-            self._cache.set(f"quote:{symbol}", quote, ttl=15)  # 15s cache for quotes
+            # Fallback to Yahoo
+            if quote is None:
+                quote = await self._get_yahoo_quote(symbol)
 
-        return quote
+            if quote:
+                self._cache.set(cache_key, quote, ttl=15)  # 15s cache for quotes
+
+            return quote
 
     async def get_historical(
         self,
@@ -185,20 +209,25 @@ class MarketDataService:
         if cached is not None:
             return cached
 
-        df = None
+        async with self._lock_for(cache_key):
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                return cached
 
-        # Try Polygon (free tier: 2 years of daily data)
-        if self._polygon_client and interval == "1d":
-            df = await self._get_polygon_historical(symbol, days)
+            df = None
 
-        # Fallback to Yahoo
-        if df is None:
-            df = await self._get_yahoo_historical(symbol, days, interval)
+            # Try Polygon (free tier: 2 years of daily data)
+            if self._polygon_client and interval == "1d":
+                df = await self._get_polygon_historical(symbol, days)
 
-        if df is not None and not df.empty:
-            self._cache.set(cache_key, df, ttl=3600)  # 1hr cache for daily data
+            # Fallback to Yahoo
+            if df is None:
+                df = await self._get_yahoo_historical(symbol, days, interval)
 
-        return df
+            if df is not None and not df.empty:
+                self._cache.set(cache_key, df, ttl=3600)  # 1hr cache for daily data
+
+            return df
 
     async def get_intraday(
         self,
@@ -216,21 +245,26 @@ class MarketDataService:
         if cached is not None:
             return cached
 
-        df = None
+        async with self._lock_for(cache_key):
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                return cached
 
-        # Try IBKR first (consistent with live trading data)
-        if interval == "5m":
-            duration = self._days_to_ibkr_duration(days)
-            df = await self._get_ibkr_intraday(symbol, duration=duration)
+            df = None
 
-        # Fallback to Yahoo (max 60 days of 5-min data)
-        if df is None:
-            df = await self._get_yahoo_intraday(symbol, interval=interval, days=days)
+            # Try IBKR first (consistent with live trading data)
+            if interval == "5m":
+                duration = self._days_to_ibkr_duration(days)
+                df = await self._get_ibkr_intraday(symbol, duration=duration)
 
-        if df is not None and not df.empty:
-            self._cache.set(cache_key, df, ttl=300)
+            # Fallback to Yahoo (max 60 days of 5-min data)
+            if df is None:
+                df = await self._get_yahoo_intraday(symbol, interval=interval, days=days)
 
-        return df
+            if df is not None and not df.empty:
+                self._cache.set(cache_key, df, ttl=300)
+
+            return df
 
     async def get_intraday_since(
         self,
@@ -296,13 +330,20 @@ class MarketDataService:
             except Exception as e:
                 log.debug("vix_ibkr_failed", error=str(e))
 
-        # Yahoo fallback for VIX
+        # Yahoo fallback for VIX — entire fetch (Ticker construction included)
+        # runs in a worker thread so the event loop keeps servicing the risk
+        # monitor and ib_insync callbacks. yf.Ticker is created INSIDE the
+        # thread: yfinance sessions are not safely shareable across threads.
+        def _fetch_vix_sync() -> float | None:
+            data = yf.Ticker("^VIX").history(period="1d", auto_adjust=False)
+            if data.empty:
+                return None
+            return float(data["Close"].iloc[-1])
+
         try:
-            loop = asyncio.get_running_loop()
-            ticker = await loop.run_in_executor(None, lambda: yf.Ticker("^VIX"))
-            data = await loop.run_in_executor(None, lambda: ticker.history(period="1d", auto_adjust=False))
-            if not data.empty:
-                return float(data["Close"].iloc[-1])
+            vix = await asyncio.wait_for(asyncio.to_thread(_fetch_vix_sync), timeout=30.0)
+            if vix is not None:
+                return vix
         except Exception as e:
             log.warning("vix_fetch_failed", error=str(e))
 
@@ -356,19 +397,12 @@ class MarketDataService:
             if not bars:
                 return None
 
-            df = util.df(bars)
-            df = df.rename(columns={
-                "date": "Datetime",
-                "open": "Open",
-                "high": "High",
-                "low": "Low",
-                "close": "Close",
-                "volume": "Volume",
-            })
-            df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True)
-            df.set_index("Datetime", inplace=True)
-            df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-            df.index.name = "Datetime"
+            # R9: the pandas transform (util.df on up to ~20k 5-min bars for
+            # "1 Y" duration) blocked the event loop — offload it. This is NOT
+            # an ib_insync API call: reqHistoricalDataAsync has already
+            # completed and `bars` is a plain snapshot (keepUpToDate=False),
+            # so no ib socket/loop state is touched from the worker thread.
+            df = await asyncio.to_thread(self._ibkr_bars_to_df, list(bars))
             log.debug(
                 "ibkr_intraday_fetched",
                 symbol=symbol,
@@ -381,6 +415,28 @@ class MarketDataService:
             log.debug("ibkr_intraday_failed", symbol=symbol, duration=duration, error=str(e))
             return None
 
+    @staticmethod
+    def _ibkr_bars_to_df(bars: list) -> pd.DataFrame:
+        """Pure-pandas conversion of IBKR BarData list → OHLCV DataFrame.
+
+        Runs in a worker thread (see _get_ibkr_intraday) — must not touch
+        any ib_insync connection state, only the already-fetched bar list.
+        """
+        df = util.df(bars)
+        df = df.rename(columns={
+            "date": "Datetime",
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume",
+        })
+        df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True)
+        df.set_index("Datetime", inplace=True)
+        df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+        df.index.name = "Datetime"
+        return df
+
     async def _get_yahoo_intraday(
         self,
         symbol: str,
@@ -390,21 +446,26 @@ class MarketDataService:
         """Get intraday data from Yahoo Finance (fallback; max 60 days of 5-min data)."""
         try:
             period = f"{min(days, 59)}d" if days <= 59 else "1mo"
-            loop = asyncio.get_running_loop()
-            ticker = await loop.run_in_executor(None, lambda: yf.Ticker(symbol))
-            df = await loop.run_in_executor(
-                None, lambda: ticker.history(period=period, interval=interval, auto_adjust=False)
-            )
 
-            if df is None or df.empty:
+            # Self-contained sync fetch + transform, offloaded to a worker
+            # thread. yf.Ticker created INSIDE the thread (session safety).
+            def _fetch_sync() -> pd.DataFrame | None:
+                df = yf.Ticker(symbol).history(
+                    period=period, interval=interval, auto_adjust=False
+                )
+                if df is None or df.empty:
+                    return None
+                df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+                df.index.name = "Datetime"
+                if getattr(df.index, "tz", None) is None:
+                    df.index = df.index.tz_localize("UTC")
+                else:
+                    df.index = df.index.tz_convert("UTC")
+                return df
+
+            df = await asyncio.wait_for(asyncio.to_thread(_fetch_sync), timeout=30.0)
+            if df is None:
                 return None
-
-            df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-            df.index.name = "Datetime"
-            if getattr(df.index, "tz", None) is None:
-                df.index = df.index.tz_localize("UTC")
-            else:
-                df.index = df.index.tz_convert("UTC")
             log.debug("yahoo_intraday_fetched", symbol=symbol, bars=len(df))
             return df
 
@@ -471,10 +532,10 @@ class MarketDataService:
             end = date.today()
             start = end - timedelta(days=int(days * 1.5))  # Extra days for non-trading days
 
-            loop = asyncio.get_running_loop()
-            aggs = await loop.run_in_executor(
-                None,
-                lambda: list(
+            # Network iteration + DataFrame build both offloaded — the agg
+            # list can be thousands of rows and the build blocked the loop.
+            def _fetch_sync() -> pd.DataFrame | None:
+                aggs = list(
                     self._polygon_client.list_aggs(
                         ticker=symbol,
                         multiplier=1,
@@ -483,28 +544,27 @@ class MarketDataService:
                         to=end.strftime("%Y-%m-%d"),
                         limit=50000,
                     )
-                ),
-            )
+                )
+                if not aggs:
+                    return None
+                df = pd.DataFrame(
+                    [
+                        {
+                            "Date": pd.Timestamp(a.timestamp, unit="ms"),
+                            "Open": a.open,
+                            "High": a.high,
+                            "Low": a.low,
+                            "Close": a.close,
+                            "Volume": a.volume,
+                        }
+                        for a in aggs
+                    ]
+                )
+                df.set_index("Date", inplace=True)
+                df.sort_index(inplace=True)
+                return df.tail(days)
 
-            if not aggs:
-                return None
-
-            df = pd.DataFrame(
-                [
-                    {
-                        "Date": pd.Timestamp(a.timestamp, unit="ms"),
-                        "Open": a.open,
-                        "High": a.high,
-                        "Low": a.low,
-                        "Close": a.close,
-                        "Volume": a.volume,
-                    }
-                    for a in aggs
-                ]
-            )
-            df.set_index("Date", inplace=True)
-            df.sort_index(inplace=True)
-            return df.tail(days)
+            return await asyncio.wait_for(asyncio.to_thread(_fetch_sync), timeout=30.0)
 
         except Exception as e:
             log.debug("polygon_historical_failed", symbol=symbol, error=str(e))
@@ -529,19 +589,20 @@ class MarketDataService:
             else:
                 period = "2y"
 
-            loop = asyncio.get_running_loop()
-            ticker = await loop.run_in_executor(None, lambda: yf.Ticker(symbol))
-            df = await loop.run_in_executor(
-                None, lambda: ticker.history(period=period, interval=interval, auto_adjust=False)
-            )
+            # Self-contained sync fetch + transform in a worker thread.
+            # yf.Ticker created INSIDE the thread (session safety).
+            def _fetch_sync() -> pd.DataFrame | None:
+                df = yf.Ticker(symbol).history(
+                    period=period, interval=interval, auto_adjust=False
+                )
+                if df is None or df.empty:
+                    return None
+                # Standardize columns
+                df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+                df.index.name = "Date"
+                return df.tail(days)
 
-            if df is None or df.empty:
-                return None
-
-            # Standardize columns
-            df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-            df.index.name = "Date"
-            return df.tail(days)
+            return await asyncio.wait_for(asyncio.to_thread(_fetch_sync), timeout=30.0)
 
         except Exception as e:
             log.debug("yahoo_historical_failed", symbol=symbol, error=str(e))
@@ -550,25 +611,30 @@ class MarketDataService:
     async def _get_yahoo_quote(self, symbol: str) -> Quote | None:
         """Get quote from Yahoo Finance (slower, but always available)."""
         try:
-            loop = asyncio.get_running_loop()
-            ticker = await loop.run_in_executor(None, lambda: yf.Ticker(symbol))
-            info = await loop.run_in_executor(None, lambda: ticker.fast_info)
+            # Entire quote fetch is self-contained in one worker thread —
+            # fast_info and the history() fallback are both blocking HTTP.
+            # yf.Ticker created INSIDE the thread (session safety).
+            def _fetch_sync() -> Quote | None:
+                ticker = yf.Ticker(symbol)
+                info = ticker.fast_info
 
-            last = float(info.last_price) if hasattr(info, "last_price") else 0.0
-            if last <= 0:
-                data = await loop.run_in_executor(None, lambda: ticker.history(period="1d", auto_adjust=False))
-                if data.empty:
-                    return None
-                last = float(data["Close"].iloc[-1])
+                last = float(info.last_price) if hasattr(info, "last_price") else 0.0
+                if last <= 0:
+                    data = ticker.history(period="1d", auto_adjust=False)
+                    if data.empty:
+                        return None
+                    last = float(data["Close"].iloc[-1])
 
-            return Quote(
-                symbol=symbol,
-                bid=0.0,  # Yahoo doesn't provide reliable bid/ask
-                ask=0.0,
-                last=last,
-                volume=int(info.last_volume) if hasattr(info, "last_volume") else 0,
-                timestamp=datetime.now(),
-            )
+                return Quote(
+                    symbol=symbol,
+                    bid=0.0,  # Yahoo doesn't provide reliable bid/ask
+                    ask=0.0,
+                    last=last,
+                    volume=int(info.last_volume) if hasattr(info, "last_volume") else 0,
+                    timestamp=datetime.now(),
+                )
+
+            return await asyncio.wait_for(asyncio.to_thread(_fetch_sync), timeout=30.0)
         except Exception as e:
             log.debug("yahoo_quote_failed", symbol=symbol, error=str(e))
             return None

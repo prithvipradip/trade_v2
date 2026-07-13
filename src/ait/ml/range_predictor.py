@@ -37,6 +37,13 @@ warnings.filterwarnings(
 MODEL_DIR = Path(__file__).resolve().parents[3] / "models"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
+# Research sandbox for backtest/walkforward artifacts. R7/R10: a walkforward
+# run saved its adaptive-threshold model over models/range.pkl and the live
+# bot's range gate silently ran at the research spec (8.67%/21d instead of
+# the designed 5%/30d). Research callers MUST pass this as model_dir so they
+# can never clobber the live artifact.
+RESEARCH_MODEL_DIR = MODEL_DIR / "research"
+
 
 @dataclass
 class RangePrediction:
@@ -65,9 +72,24 @@ class RangePredictor:
         enable_msgarch: bool = False,
         enable_oujump: bool = False,
         min_edge_over_baseline: float = 0.05,
+        model_dir: "Path | str | None" = None,
     ) -> None:
         self._threshold = threshold_pct
         self._horizon = horizon_days
+        # Artifact directory — live default is models/. Research callers
+        # (walkforward/backtest/optimizer) MUST pass RESEARCH_MODEL_DIR so a
+        # research run can never overwrite the live artifact (R7/R10).
+        self._model_dir = Path(model_dir) if model_dir is not None else MODEL_DIR
+        # Designed spec, immutable — the reference for the load-time spec
+        # guard. self._threshold/_horizon may be overwritten by a loaded
+        # pickle (kept honest and flagged); training always rebuilds at the
+        # designed spec.
+        self._spec_threshold = float(threshold_pct)
+        self._spec_horizon = int(horizon_days)
+        self._spec_mismatch = False
+        self._trained_at: "str | None" = None
+        self._global_model_symbol: str = ""
+        self._fallback_warned: set[str] = set()
         self._enable_garch = enable_garch
         self._enable_msgarch = enable_msgarch
         self._enable_oujump = enable_oujump
@@ -98,6 +120,19 @@ class RangePredictor:
     @property
     def model_version(self) -> str:
         return self._model_version
+
+    @property
+    def spec_mismatch(self) -> bool:
+        """True when the loaded artifact's threshold/horizon differ from the
+        constructor's designed spec (see load_models). ModelTrainer.needs_training
+        treats this as a forced-retrain signal."""
+        return self._spec_mismatch
+
+    @property
+    def trained_at(self) -> "str | None":
+        """ISO timestamp of the last training run, persisted in the artifact
+        (R9: lets needs_training recover freshness across restarts)."""
+        return self._trained_at
 
     # --- Label creation ---
 
@@ -139,6 +174,13 @@ class RangePredictor:
         intraday_store=None,
     ) -> dict[str, float]:
         """Train range model on historical data."""
+        # Always train at the DESIGNED constructor spec. A previously loaded
+        # pickle may have overwritten self._threshold/_horizon with a foreign
+        # spec (load_models spec guard keeps the pickle's values so served
+        # probabilities stay honest); retraining must restore the design so
+        # the rebuilt model answers the question this instance was built for.
+        self._threshold = self._spec_threshold
+        self._horizon = self._spec_horizon
         features = self._feature_engine.compute(
             df, market_context=market_context,
             intraday_store=intraday_store, symbol=symbol,
@@ -233,6 +275,12 @@ class RangePredictor:
         if self._trained:
             from datetime import datetime
             self._model_version = f"range-v-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            self._trained_at = datetime.now().isoformat()
+            if symbol:
+                # The instance-level (global fallback) models now belong to the
+                # LAST symbol trained — recorded for fallback honesty (R7: TLT
+                # was silently served by a model trained on XLE).
+                self._global_model_symbol = symbol
 
             # Fit ensemble weights from per-model CV edge over 0.50 baseline.
             # Models with no skill get zero weight; proportional to edge otherwise.
@@ -262,6 +310,10 @@ class RangePredictor:
                 _ou_jump_state = getattr(self, "_ou_jump_state", None)
                 self._symbol_models[symbol] = {
                     "fitted_at": __import__("datetime").date.today().isoformat(),  # A7
+                    # Real label spec of THIS symbol's model — predictions must
+                    # report these, not the instance defaults (R9 log fix).
+                    "threshold": self._threshold,
+                    "horizon": self._horizon,
                     "models": copy.deepcopy(self._models),
                     "scaler": copy.deepcopy(self._scaler),
                     "feature_names": list(self._feature_names),
@@ -298,6 +350,9 @@ class RangePredictor:
                 }
 
             self._save_models()
+            # A fresh train at the designed spec supersedes any previously
+            # flagged artifact mismatch.
+            self._spec_mismatch = False
             log.info(
                 "range_trained",
                 symbol=symbol,
@@ -592,6 +647,7 @@ class RangePredictor:
             models = self._models
             scaler = self._scaler
             feature_names = self._feature_names
+            self._warn_symbol_fallback(symbol)
         else:
             return None
 
@@ -714,13 +770,43 @@ class RangePredictor:
             return None
         p_in_range = weighted_p / total_weight
 
+        _thr, _hor = self._model_spec(sym_data)
         return RangePrediction(
             probability_in_range=p_in_range,
-            threshold_pct=self._threshold,
-            horizon_days=self._horizon,
+            threshold_pct=_thr,
+            horizon_days=_hor,
             confidence=max(p_in_range, 1 - p_in_range),
             features_used=len(feature_names),
             model_version=self._model_version,
+        )
+
+    def _model_spec(self, sym_data: "dict | None") -> "tuple[float, int]":
+        """Real label spec of the model that produced a prediction.
+
+        R9 log fix: per-symbol models may have been trained at a different
+        threshold/horizon than the instance defaults (e.g. walkforward's
+        adaptive thresholds). Predictions must report the spec they were
+        actually trained on, never the constructor's aspiration.
+        """
+        if sym_data is not None:
+            return (
+                float(sym_data.get("threshold", self._threshold)),
+                int(sym_data.get("horizon", self._horizon)),
+            )
+        return float(self._threshold), int(self._horizon)
+
+    def _warn_symbol_fallback(self, symbol: str) -> None:
+        """R7 honesty: a symbol without its own model is served by the global
+        fallback (trained on whatever symbol trained last, e.g. TLT->XLE).
+        Warn once per symbol per process."""
+        if not symbol or symbol in self._symbol_models or symbol in self._fallback_warned:
+            return
+        self._fallback_warned.add(symbol)
+        log.warning(
+            "range_model_symbol_fallback",
+            symbol=symbol,
+            fallback_trained_on=self._global_model_symbol or "unknown",
+            available_symbol_models=sorted(self._symbol_models),
         )
 
     def predict_from_features(
@@ -744,6 +830,7 @@ class RangePredictor:
             models = self._models
             scaler = self._scaler
             feature_names = self._feature_names
+            self._warn_symbol_fallback(symbol)
         else:
             return None
 
@@ -827,10 +914,11 @@ class RangePredictor:
             return None
         p_in_range = weighted_p / total_weight
 
+        _thr, _hor = self._model_spec(sym_data)
         return RangePrediction(
             probability_in_range=p_in_range,
-            threshold_pct=self._threshold,
-            horizon_days=self._horizon,
+            threshold_pct=_thr,
+            horizon_days=_hor,
             confidence=max(p_in_range, 1 - p_in_range),
             features_used=len(feature_names),
             model_version=self._model_version,
@@ -838,36 +926,92 @@ class RangePredictor:
 
     # --- Persistence ---
 
-    def _save_models(self) -> None:
-        path = MODEL_DIR / "range.pkl"
-        with open(path, "wb") as f:
-            pickle.dump({
-                "models": self._models,
-                "scaler": self._scaler,
-                "feature_names": self._feature_names,
-                "version": self._model_version,
-                "threshold": self._threshold,
-                "horizon": self._horizon,
-                "symbol_models": self._symbol_models,
-            }, f)
-        log.info("range_models_saved", path=str(path), version=self._model_version)
+    def _save_models(self, model_dir: "Path | str | None" = None) -> None:
+        """Save artifact to model_dir (default: the directory this instance was
+        constructed with — live models/ unless a research dir was passed)."""
+        from datetime import datetime
+        target_dir = Path(model_dir) if model_dir is not None else self._model_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / "range.pkl"
+        tmp = target_dir / "range.pkl.tmp"
+        payload = {
+            "models": self._models,
+            "scaler": self._scaler,
+            "feature_names": self._feature_names,
+            "version": self._model_version,
+            "threshold": self._threshold,
+            "horizon": self._horizon,
+            "symbol_models": self._symbol_models,
+            # R9: persisted so ModelTrainer.needs_training can recover model
+            # freshness across restarts instead of retraining on every boot.
+            "trained_at": self._trained_at or datetime.now().isoformat(),
+            # R7: which symbol the instance-level fallback models were fit on.
+            "trained_symbol": self._global_model_symbol,
+        }
+        # Atomic write — a concurrent reader (live bot) can never observe a
+        # half-written pickle.
+        import os as _os
+        with open(tmp, "wb") as f:
+            pickle.dump(payload, f)
+        _os.replace(tmp, path)
+        log.info("range_models_saved", path=str(path), version=self._model_version,
+                 threshold=self._threshold, horizon=self._horizon)
 
-    def load_models(self) -> bool:
-        path = MODEL_DIR / "range.pkl"
+    def load_models(self, model_dir: "Path | str | None" = None) -> bool:
+        """Load artifact from model_dir (default: this instance's model dir).
+
+        Spec guard (R7/R10): if the pickle's threshold/horizon differ from the
+        constructor's designed spec, the artifact was written by something else
+        (e.g. a walkforward's adaptive-threshold model hijacking the live
+        pickle). We do NOT silently flip the threshold — the model's
+        probabilities only answer the question it was trained on — and we do
+        NOT silently serve the designed spec either. The pickle's REAL spec is
+        kept (predictions report it honestly), a CRITICAL is logged with both
+        specs, and self.spec_mismatch is raised so ModelTrainer.needs_training
+        forces a proper retrain at the designed spec.
+        """
+        source_dir = Path(model_dir) if model_dir is not None else self._model_dir
+        path = source_dir / "range.pkl"
         if not path.exists():
             return False
         try:
             with open(path, "rb") as f:
                 data = pickle.load(f)
+
+            loaded_threshold = float(data.get("threshold", 0.05))
+            loaded_horizon = int(data.get("horizon", 30))
+            if (abs(loaded_threshold - self._spec_threshold) > 1e-9
+                    or loaded_horizon != self._spec_horizon):
+                self._spec_mismatch = True
+                log.critical(
+                    "range_model_spec_mismatch",
+                    designed_threshold=self._spec_threshold,
+                    designed_horizon_days=self._spec_horizon,
+                    loaded_threshold=loaded_threshold,
+                    loaded_horizon_days=loaded_horizon,
+                    loaded_version=data.get("version", ""),
+                    loaded_symbols=sorted(data.get("symbol_models", {})),
+                    path=str(path),
+                    action="serving artifact at its REAL spec; needs-retrain "
+                           "flagged so the next training pass rebuilds at the "
+                           "designed spec",
+                )
+            else:
+                self._spec_mismatch = False
+
             self._models = data["models"]
             self._scaler = data["scaler"]
             self._feature_names = data["feature_names"]
             self._model_version = data["version"]
-            self._threshold = data.get("threshold", 0.05)
-            self._horizon = data.get("horizon", 30)
+            self._threshold = loaded_threshold
+            self._horizon = loaded_horizon
             self._symbol_models = data.get("symbol_models", {})
+            self._trained_at = data.get("trained_at")
+            self._global_model_symbol = data.get("trained_symbol", "")
             self._trained = bool(self._models)
-            log.info("range_models_loaded", version=self._model_version)
+            log.info("range_models_loaded", version=self._model_version,
+                     threshold=self._threshold, horizon=self._horizon,
+                     trained_at=self._trained_at, path=str(path))
             return True
         except Exception as e:
             log.warning("range_load_failed", error=str(e))

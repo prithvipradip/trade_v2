@@ -42,6 +42,10 @@ warnings.filterwarnings(
 MODEL_DIR = Path(__file__).resolve().parents[3] / "models"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
+# Research sandbox for backtest/walkforward artifacts — never the live bot's
+# models/ (R7/R10, same hygiene rule as range_predictor.RESEARCH_MODEL_DIR).
+RESEARCH_MODEL_DIR = MODEL_DIR / "research"
+
 
 @dataclass
 class VolMagnitudePrediction:
@@ -67,9 +71,20 @@ class VolMagnitudePredictor:
         threshold_pct: float = 0.07,
         horizon_days: int = 30,
         ensemble_weights: dict[str, float] | None = None,
+        model_dir: "Path | str | None" = None,
     ) -> None:
         self._threshold = threshold_pct
         self._horizon = horizon_days
+        # Artifact directory — live default is models/. Research callers MUST
+        # pass RESEARCH_MODEL_DIR so they never clobber the live artifact.
+        self._model_dir = Path(model_dir) if model_dir is not None else MODEL_DIR
+        # Designed spec (immutable) for the load-time spec guard.
+        self._spec_threshold = float(threshold_pct)
+        self._spec_horizon = int(horizon_days)
+        self._spec_mismatch = False
+        self._trained_at: "str | None" = None
+        self._global_model_symbol: str = ""
+        self._fallback_warned: set[str] = set()
         self._weights = ensemble_weights or {"xgboost": 0.5, "lightgbm": 0.5}
         self._models: dict = {}
         self._symbol_models: dict[str, dict] = {}
@@ -86,6 +101,17 @@ class VolMagnitudePredictor:
     @property
     def model_version(self) -> str:
         return self._model_version
+
+    @property
+    def spec_mismatch(self) -> bool:
+        """True when the loaded artifact's threshold/horizon differ from the
+        constructor's designed spec (see load_models)."""
+        return self._spec_mismatch
+
+    @property
+    def trained_at(self) -> "str | None":
+        """ISO timestamp of the last training run, persisted in the artifact."""
+        return self._trained_at
 
     def _create_labels(self, close: pd.Series) -> pd.Series:
         """Label = 1 if max abs return over next N days > threshold."""
@@ -104,6 +130,10 @@ class VolMagnitudePredictor:
         market_context: dict | None = None,
     ) -> dict[str, float]:
         """Train vol-magnitude model on historical data."""
+        # Always train at the DESIGNED constructor spec — a loaded pickle may
+        # have overwritten these with a foreign spec (see load_models guard).
+        self._threshold = self._spec_threshold
+        self._horizon = self._spec_horizon
         features = self._feature_engine.compute(df, market_context=market_context)
         if len(features) < 100:
             log.warning("vol_mag_insufficient_data", rows=len(features), required=100)
@@ -164,6 +194,9 @@ class VolMagnitudePredictor:
         if self._trained:
             from datetime import datetime
             self._model_version = f"volmag-v-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            self._trained_at = datetime.now().isoformat()
+            if symbol:
+                self._global_model_symbol = symbol
 
             # Fit ensemble weights from per-model CV edge over 0.50 baseline.
             _baseline = 0.50
@@ -187,6 +220,9 @@ class VolMagnitudePredictor:
                         except Exception:
                             pass
                 self._symbol_models[symbol] = {
+                    # Real label spec of THIS symbol's model (R9 log fix)
+                    "threshold": self._threshold,
+                    "horizon": self._horizon,
                     "models": copy.deepcopy(self._models),
                     "scaler": copy.deepcopy(self._scaler),
                     "feature_names": list(self._feature_names),
@@ -198,6 +234,7 @@ class VolMagnitudePredictor:
                 }
 
             self._save_models()
+            self._spec_mismatch = False
             log.info(
                 "vol_mag_trained",
                 symbol=symbol,
@@ -319,6 +356,7 @@ class VolMagnitudePredictor:
             models = self._models
             scaler = self._scaler
             feature_names = self._feature_names
+            self._warn_symbol_fallback(symbol)
         else:
             return None
 
@@ -365,45 +403,112 @@ class VolMagnitudePredictor:
             return None
         p_big_move = weighted_p / total_weight
 
+        # Report the REAL spec of the model that produced this probability —
+        # per-symbol models may carry their own threshold/horizon (R9 log fix).
+        if sym_data is not None:
+            _thr = float(sym_data.get("threshold", self._threshold))
+            _hor = int(sym_data.get("horizon", self._horizon))
+        else:
+            _thr, _hor = float(self._threshold), int(self._horizon)
         return VolMagnitudePrediction(
             probability_big_move=p_big_move,
-            threshold_pct=self._threshold,
-            horizon_days=self._horizon,
+            threshold_pct=_thr,
+            horizon_days=_hor,
             confidence=max(p_big_move, 1 - p_big_move),
             features_used=len(feature_names),
             model_version=self._model_version,
         )
 
-    def _save_models(self) -> None:
-        path = MODEL_DIR / "vol_magnitude.pkl"
-        with open(path, "wb") as f:
-            pickle.dump({
-                "models": self._models,
-                "scaler": self._scaler,
-                "feature_names": self._feature_names,
-                "version": self._model_version,
-                "threshold": self._threshold,
-                "horizon": self._horizon,
-                "symbol_models": self._symbol_models,
-            }, f)
-        log.info("vol_mag_models_saved", path=str(path), version=self._model_version)
+    def _warn_symbol_fallback(self, symbol: str) -> None:
+        """R7 honesty: symbol without its own model served by the global
+        fallback (trained on the last symbol trained). Warn once per symbol."""
+        if not symbol or symbol in self._symbol_models or symbol in self._fallback_warned:
+            return
+        self._fallback_warned.add(symbol)
+        log.warning(
+            "vol_mag_model_symbol_fallback",
+            symbol=symbol,
+            fallback_trained_on=self._global_model_symbol or "unknown",
+            available_symbol_models=sorted(self._symbol_models),
+        )
 
-    def load_models(self) -> bool:
-        path = MODEL_DIR / "vol_magnitude.pkl"
+    def _save_models(self, model_dir: "Path | str | None" = None) -> None:
+        """Save artifact to model_dir (default: the directory this instance was
+        constructed with — live models/ unless a research dir was passed)."""
+        from datetime import datetime
+        target_dir = Path(model_dir) if model_dir is not None else self._model_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / "vol_magnitude.pkl"
+        tmp = target_dir / "vol_magnitude.pkl.tmp"
+        payload = {
+            "models": self._models,
+            "scaler": self._scaler,
+            "feature_names": self._feature_names,
+            "version": self._model_version,
+            "threshold": self._threshold,
+            "horizon": self._horizon,
+            "symbol_models": self._symbol_models,
+            # R9: persisted freshness so needs_training survives restarts
+            "trained_at": self._trained_at or datetime.now().isoformat(),
+            "trained_symbol": self._global_model_symbol,
+        }
+        import os as _os
+        with open(tmp, "wb") as f:
+            pickle.dump(payload, f)
+        _os.replace(tmp, path)
+        log.info("vol_mag_models_saved", path=str(path), version=self._model_version,
+                 threshold=self._threshold, horizon=self._horizon)
+
+    def load_models(self, model_dir: "Path | str | None" = None) -> bool:
+        """Load artifact from model_dir (default: this instance's model dir).
+
+        Spec guard (R7/R10): same contract as RangePredictor.load_models —
+        on threshold/horizon mismatch vs the constructor spec, keep the
+        pickle's REAL spec, log CRITICAL, and flag needs-retrain. Never
+        silently flip the threshold on a model trained with a different one.
+        """
+        source_dir = Path(model_dir) if model_dir is not None else self._model_dir
+        path = source_dir / "vol_magnitude.pkl"
         if not path.exists():
             return False
         try:
             with open(path, "rb") as f:
                 data = pickle.load(f)
+
+            loaded_threshold = float(data.get("threshold", 0.07))
+            loaded_horizon = int(data.get("horizon", 30))
+            if (abs(loaded_threshold - self._spec_threshold) > 1e-9
+                    or loaded_horizon != self._spec_horizon):
+                self._spec_mismatch = True
+                log.critical(
+                    "vol_mag_model_spec_mismatch",
+                    designed_threshold=self._spec_threshold,
+                    designed_horizon_days=self._spec_horizon,
+                    loaded_threshold=loaded_threshold,
+                    loaded_horizon_days=loaded_horizon,
+                    loaded_version=data.get("version", ""),
+                    loaded_symbols=sorted(data.get("symbol_models", {})),
+                    path=str(path),
+                    action="serving artifact at its REAL spec; needs-retrain "
+                           "flagged so the next training pass rebuilds at the "
+                           "designed spec",
+                )
+            else:
+                self._spec_mismatch = False
+
             self._models = data["models"]
             self._scaler = data["scaler"]
             self._feature_names = data["feature_names"]
             self._model_version = data["version"]
-            self._threshold = data.get("threshold", 0.07)
-            self._horizon = data.get("horizon", 30)
+            self._threshold = loaded_threshold
+            self._horizon = loaded_horizon
             self._symbol_models = data.get("symbol_models", {})
+            self._trained_at = data.get("trained_at")
+            self._global_model_symbol = data.get("trained_symbol", "")
             self._trained = bool(self._models)
-            log.info("vol_mag_models_loaded", version=self._model_version)
+            log.info("vol_mag_models_loaded", version=self._model_version,
+                     threshold=self._threshold, horizon=self._horizon,
+                     trained_at=self._trained_at, path=str(path))
             return True
         except Exception as e:
             log.warning("vol_mag_load_failed", error=str(e))

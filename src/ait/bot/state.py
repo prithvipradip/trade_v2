@@ -230,12 +230,21 @@ class StateManager:
                 except sqlite3.OperationalError:
                     pass  # column already exists
 
-    @staticmethod
-    def _init_duckdb():
-        """Initialize DuckDB analytics store (lazy — returns None if unavailable)."""
+    def _init_duckdb(self):
+        """Initialize DuckDB analytics store (lazy — returns None if unavailable).
+
+        R11 (smoke-script find): the duck path was cwd-relative regardless of
+        this manager's db_path — every pytest run with a tmp_path SQLite
+        fixture dual-wrote its FIXTURE trades into the PRODUCTION analytics
+        store (105 synthetic trades found; dashboard 7d P&L read +$1,613 vs
+        true +$383). The mirror now lives next to whatever SQLite file this
+        manager was given, so test isolation is automatic.
+        """
         try:
+            from pathlib import Path as _P
             from ait.monitoring.duckdb_analytics import DuckDBAnalytics
-            duck = DuckDBAnalytics()
+            duck = DuckDBAnalytics(
+                db_path=_P(self._db_path).parent / "ait_analytics.duckdb")
             log.info("duckdb_analytics_enabled")
             return duck
         except Exception as e:

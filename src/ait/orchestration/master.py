@@ -776,6 +776,39 @@ def weekly_scorecard():
             "JOIN open_positions o ON o.trade_id=t.trade_id").fetchone()[0]
         base = max(car_open or 0, 1000.0)
         con.close()
+        # R11 (R10 adoption): TCA + attribution read-outs — the capture layer
+        # existed with zero aggregation; the go-live "stable slippage" gate
+        # now has a NUMBER: median entry slippage <= 8% of credit over the
+        # trailing 20 fills, no worsening trend (PLAN.md gate 1).
+        con2 = _sq.connect(str(src)); con2.row_factory = _sq.Row
+        try:
+            xr = con2.execute(
+                "SELECT COUNT(*) n, SUM(CASE WHEN live_mid > 0 THEN 1 ELSE 0 END) m, "
+                "COALESCE(SUM(commission),0) c FROM executions").fetchone()
+            exec_line = f"executions: {xr['n']} fills, ${xr['c']:.2f} commissions"
+            slip = con2.execute(
+                "SELECT AVG(ABS(price - live_mid)) FROM executions "
+                "WHERE live_mid > 0").fetchone()[0]
+            if slip is not None:
+                exec_line += f", avg |fill-mid| ${slip:.2f} (gate: median <=8% of credit)"
+            att = con2.execute(
+                f"SELECT COALESCE(exit_reason_detailed,'?') r, COUNT(*) n, "
+                f"SUM(realized_pnl) p FROM trades WHERE status='closed' {real} "
+                f"GROUP BY 1 ORDER BY 3").fetchall()
+            attrib = " | ".join(
+                f"{(a['r'].split(' ')[0])[:22]}: {a['n']}x ${a['p']:+,.0f}"
+                for a in att[:6])
+            fr = con2.execute(
+                "SELECT SUM(CASE WHEN status='closed' AND COALESCE(exit_reason_detailed,'') "
+                "LIKE '%never_filled%' THEN 1 ELSE 0 END) dead, COUNT(*) total "
+                "FROM trades WHERE entry_time >= '2026-07-06'").fetchone()
+            fill_line = (f"entry fill rate: {fr['total'] - fr['dead']}/{fr['total']}"
+                         if fr and fr["total"] else "")
+        except Exception as _e:  # noqa: BLE001
+            exec_line, attrib, fill_line = f"(exec stats unavailable: {_e})", "", ""
+        finally:
+            con2.close()
+
         pf_s = "inf" if pf == float("inf") else f"{pf:.2f}"
         _alert(
             f"GO-LIVE SCORECARD (since 07-06 reset)\n"
@@ -784,6 +817,9 @@ def weekly_scorecard():
             f"realized: ${tot:+,.0f} (commissions recorded: ${comm:,.0f})\n"
             f"max DD: ${dd:,.0f} = {dd / base * 100:.1f}% of deployed risk "
             f"~${base:,.0f} (gate <8%)\n"
+            f"{exec_line}\n"
+            f"by exit reason: {attrib}\n"
+            f"{fill_line}\n"
             f"pace: {'on track' if n >= 1 else 'no closes yet'} — see "
             f"docs/GAP_AUDIT_R7.md for gate definitions"
         )

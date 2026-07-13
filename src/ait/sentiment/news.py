@@ -9,6 +9,7 @@ No mock data — if APIs are unavailable, returns None.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -94,25 +95,36 @@ class NewsSentiment:
         return score
 
     async def _fetch_news(self, symbol: str) -> list[NewsItem]:
-        """Fetch news from available sources."""
-        import asyncio
-        loop = asyncio.get_running_loop()
-        articles = []
+        """Fetch news from available sources.
+
+        Both sources are blocking (finnhub SDK uses requests; feedparser
+        fetches via urllib) — each runs in a worker thread via
+        asyncio.to_thread with its own timeout so the event loop (risk
+        monitor, ib_insync callbacks) never stalls, and a slow/hung source
+        cannot starve the other.
+        """
+        articles: list[NewsItem] = []
 
         # Finnhub company news (blocking SDK — run in thread)
         if self._finnhub_client:
-            finnhub_articles = await asyncio.wait_for(
-                loop.run_in_executor(None, self._fetch_finnhub, symbol),
-                timeout=10.0,
-            )
-            articles.extend(finnhub_articles)
+            try:
+                finnhub_articles = await asyncio.wait_for(
+                    asyncio.to_thread(self._fetch_finnhub, symbol),
+                    timeout=10.0,
+                )
+                articles.extend(finnhub_articles)
+            except Exception as e:
+                log.debug("finnhub_news_unavailable", symbol=symbol, error=str(e))
 
         # RSS feeds (blocking — run in thread)
-        rss_articles = await asyncio.wait_for(
-            loop.run_in_executor(None, self._fetch_rss, symbol),
-            timeout=10.0,
-        )
-        articles.extend(rss_articles)
+        try:
+            rss_articles = await asyncio.wait_for(
+                asyncio.to_thread(self._fetch_rss, symbol),
+                timeout=10.0,
+            )
+            articles.extend(rss_articles)
+        except Exception as e:
+            log.debug("rss_news_unavailable", symbol=symbol, error=str(e))
 
         return articles
 
@@ -161,7 +173,16 @@ class NewsSentiment:
         articles = []
         for feed_url in self.RSS_FEEDS:
             try:
-                feed = feedparser.parse(feed_url)
+                # Fetch with an explicit socket timeout, then parse bytes —
+                # feedparser.parse(url) uses urllib with NO timeout and would
+                # leak a permanently-hung worker thread on a stalled server.
+                import urllib.request
+                req = urllib.request.Request(
+                    feed_url, headers={"User-Agent": "ait-bot/1.0"}
+                )
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    raw = resp.read()
+                feed = feedparser.parse(raw)
                 for entry in feed.entries[:10]:
                     title = entry.get("title", "")
                     # Only include if symbol or company is mentioned

@@ -1,0 +1,51 @@
+# Minimal CI — born from the 2026-07-10 incident (green local tests, deploy
+# shipped a runtime fault that killed the trading loop for a session).
+# Scope on purpose:
+#   - unit tests (integration suites excluded: they want IB Gateway / long runs)
+#   - byte-compile ALL of src (catches syntax errors in never-imported modules)
+# NOT here (future work):
+#   - ruff lint: [tool.ruff] exists in pyproject but the codebase isn't clean
+#     against it yet — adding it now would be permanently red. Clean up, then add.
+#   - scripts/smoke_deploy.py: it needs the REAL config/DBs, so it runs on the
+#     trading box after each deploy (see docs/RUNBOOK.md "Deploy checklist").
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # torch is a mandatory dep (transformers/FinBERT). Pre-install the
+      # CPU-only wheel so `pip install -e .` sees torch>=2.6 already
+      # satisfied and skips the multi-GB CUDA build — same effect as an env
+      # marker without editing pyproject.toml.
+      - name: Install torch (CPU wheel)
+        run: pip install "torch>=2.6" --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install package + dev deps
+        run: pip install -e ".[dev]"
+
+      - name: Byte-compile src (syntax errors anywhere fail the build)
+        run: python -m compileall -q src
+
+      - name: Unit tests
+        run: >
+          python -m pytest tests/ -q -x
+          --ignore=tests/test_integration.py
+          --ignore=tests/test_full_integration.py

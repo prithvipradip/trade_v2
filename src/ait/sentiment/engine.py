@@ -11,6 +11,7 @@ If sentiment sources fail, trading continues without them (graceful degradation)
 
 from __future__ import annotations
 
+import asyncio
 import statistics
 from dataclasses import dataclass, field
 
@@ -117,14 +118,12 @@ class SentimentEngine:
         if self._finbert and self._news:
             total_sources += 1
             try:
-                import asyncio
                 # Get headlines and run FinBERT (blocking torch inference — run in thread)
                 articles = await self._news._fetch_news(symbol)
                 if articles:
                     headlines = [a.headline for a in articles[:10]]
-                    loop = asyncio.get_running_loop()
                     finbert_scores = await asyncio.wait_for(
-                        loop.run_in_executor(None, self._finbert.analyze_batch, headlines),
+                        asyncio.to_thread(self._finbert.analyze_batch, headlines),
                         timeout=30.0,
                     )
                     valid_scores = [s for s in finbert_scores if s is not None]
@@ -139,7 +138,14 @@ class SentimentEngine:
         if self._fundamentals_store and self._config.ib_news_weight > 0:
             total_sources += 1
             try:
-                news_rows = self._fundamentals_store.get_recent_news(symbol, hours=24)
+                # Sync sqlite read — offload so a slow/locked DB can't stall
+                # the event loop (risk monitor, ib_insync callbacks).
+                news_rows = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._fundamentals_store.get_recent_news, symbol, hours=24
+                    ),
+                    timeout=10.0,
+                )
                 if news_rows:
                     ib_news_score = statistics.mean(n["sentiment"] for n in news_rows)
                     scores.append((ib_news_score, self._config.ib_news_weight))

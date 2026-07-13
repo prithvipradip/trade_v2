@@ -124,6 +124,19 @@ DEFERRED (Round 3 todo — larger design work, ranked):
 5. GARCH members frozen at train time (stale up to reload interval); trainer rollback keyed on last symbol only; adaptor same-param compounding within a cycle; counterfactual eval min-elapsed guard; economic_calendar hardcoded 2026-only (year-end time bomb); DuckDB readers read_only; sortino/profit-factor display consistency; analyzer NULL-column guards.
 6. MP-F3 verify: sign of a real closing-BAG avgFillPrice (debit-spread exit negation depends on it) — check on first live debit close.
 
+## Round 11 (2026-07-11) — R9/R10 adoption batch (user: "lets fix r9 and r10")
+Benchmarks + maturity reports: docs/BENCHMARKS_R9.md, docs/MATURITY_R10.md. Shipping:
+- **Event loop unblocked** (R9 #1: risk monitor was BLIND 48% of RTH — sync yfinance/pandas I/O inside async scans blocked stops/TPs ~5min of every 10): blocking fetches offloaded to threads (agent, market_data/sentiment/multi_timeframe).
+- **Event-driven fill detection** (was ~33s poll-bound): ib_insync orderStatusEvent → debounced check_fills within ~1s; reentrancy-guarded (check_fills_safe); event-detected exits book through the same completed-exit path.
+- **Scan stage timing** (95% of per-symbol time was dark): scan_symbol_timing event with per-stage ms — DIA/GLD ~48s mystery becomes attributable.
+- **No-retrain-on-boot** (~110s unprotected on every restart) + **range-model artifact separation** (backtest hijacked live gate: prod ran 8.67%/21d vs designed ±5%/30d) + spec-mismatch CRITICAL on load (agent).
+- **Post-deploy smoke script** (scripts/smoke_deploy.py — executes every runtime path that died on 07-10/would have died from R8's _connect bug) + **deploy checklist** in RUNBOOK + **minimal CI** (.github/workflows/ci.yml — first CI this repo has ever had) (agent).
+- **Scorecard TCA**: executions/commissions/|fill-mid| + exit-reason P&L attribution + entry fill-rate in the Friday scorecard.
+- **GATE 1 SLIPPAGE NUMBER DEFINED (before data can bias it): median entry slippage ≤ 8% of credit over trailing 20 fills, with no worsening trend.**
+- **DRILLS: backup-restore REHEARSED 2026-07-11 — PASS** (integrity ok, 16/16 trades, snapshot+off-repo mirror both present). Kill-switch drill scheduled Monday RTH (create data/HALT, verify entries_halted, remove).
+- R9 statistical honesty adopted into expectations: 50 closes confirms PF>1.0 only at ~42/50 wins; PF>1.3 verdict realistically needs 100+ closes — the gate stays 50 for a PRELIMINARY verdict, 100 for funding (gate text updated).
+- STILL USER: healthchecks.io URL → data/deadman_url.txt (dead-man UNARMED since 07-09); cloud-sync ~/Documents/ait_backups; auto-logon.
+
 ## Round 7 (2026-07-09) — component gap audit ("what's missing to make money") + NOW batch
 Full report: docs/GAP_AUDIT_R7.md (13 agents, line coverage, 43 NOW items). NOW batch SHIPPED same day:
 - **Bugs defused**: earnings parser returned DIVIDEND dates as earnings (AAPL="past", AMD=1995 — all earnings guards dead for single names; parse 'Earnings Date' by key, reject past, fallback earnings_dates); VIX-28 credit halt failed OPEN on fetch failure (now last-known-good ≤45min + FAIL CLOSED in manager); daily report crashed daily (days= vs lookback_days); learning structural adaptations had NO paper gate (adaptor now fully inert when paper_trading_mode — 8 consult guards).

@@ -11,6 +11,7 @@ of a successful trade is significantly higher.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 
 import numpy as np
@@ -171,6 +172,24 @@ class MultiTimeframeAnalyzer:
             daily=daily,
             intraday=intraday,
         )
+
+    async def analyze_async(
+        self,
+        daily_df: pd.DataFrame,
+        intraday_df: pd.DataFrame | None = None,
+    ) -> MultiTimeframeAnalysis:
+        """Event-loop-safe wrapper around analyze().
+
+        R9: analyze() is pure pandas but can chew on ~2 years of 5-min bars
+        (rolling windows, date-slicing on ~57k rows) — called synchronously
+        from an async orchestrator path it stalls the event loop and the
+        30s risk monitor. This wrapper offloads the whole computation to a
+        worker thread. Async call sites (e.g. orchestrator._analyze_symbol)
+        should use:  mtf = await self._mtf_analyzer.analyze_async(hist, intraday_full)
+
+        Same arguments and return type as analyze().
+        """
+        return await asyncio.to_thread(self.analyze, daily_df, intraday_df)
 
     def _analyze_weekly(self, df: pd.DataFrame) -> TimeframeSignal:
         """Analyze weekly trend from daily data (5-day resampling)."""

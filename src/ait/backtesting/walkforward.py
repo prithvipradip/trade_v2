@@ -64,7 +64,7 @@ def _range_model_worker(
     the queue after joining the process.
     """
     try:
-        from ait.ml.range_predictor import RangePredictor
+        from ait.ml.range_predictor import RESEARCH_MODEL_DIR, RangePredictor
 
         intraday_store = None
         if db_path is not None:
@@ -79,6 +79,9 @@ def _range_model_worker(
             enable_garch=False,       # plain GARCH: rank-inversion problem not yet fixed
             enable_msgarch=enable_msgarch,
             enable_oujump=enable_oujump,
+            # R7/R10 artifact hygiene: research runs save under models/research/
+            # — NEVER models/range.pkl, which is the live bot's artifact.
+            model_dir=RESEARCH_MODEL_DIR,
         )
         accs = rp.train(train_df, symbol=symbol, intraday_store=intraday_store)
 
@@ -2430,7 +2433,7 @@ class WalkForwardBacktester:
         Never contaminates parent RNG when statistical models are disabled.
         """
         try:
-            from ait.ml.range_predictor import RangePredictor
+            from ait.ml.range_predictor import RESEARCH_MODEL_DIR, RangePredictor
             intraday_store = None
             if self._db_path is not None:
                 from ait.data.historical import HistoricalDataStore
@@ -2443,6 +2446,9 @@ class WalkForwardBacktester:
                 enable_garch=False,
                 enable_msgarch=enable_msgarch,
                 enable_oujump=enable_oujump,
+                # R7/R10 artifact hygiene: research runs save under
+                # models/research/ — NEVER the live models/range.pkl.
+                model_dir=RESEARCH_MODEL_DIR,
             )
             accs = rp.train(train_df, symbol=symbol, intraday_store=intraday_store)
             if accs and rp.is_trained:

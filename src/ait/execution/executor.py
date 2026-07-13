@@ -540,6 +540,62 @@ class TradeExecutor:
 
         return await self._ibkr.place_order(combo, order)
 
+    def attach_fill_events(self) -> None:
+        """R11 (R9 latency finding): fill DETECTION measured at ~33s because
+        it rode the 30s polling loop. Subscribe to ib_insync's orderStatus
+        events so a fill triggers check_fills within ~1s (debounced so a
+        4-leg burst coalesces into one pass). Safe: ib_insync fires events on
+        the loop thread; we only create a task."""
+        import asyncio as _aio
+
+        def _on_order_status(trade) -> None:
+            try:
+                if trade.orderStatus.status != "Filled":
+                    return
+                if getattr(self, "_fill_task_pending", False):
+                    return
+                self._fill_task_pending = True
+
+                async def _run() -> None:
+                    try:
+                        await _aio.sleep(1.0)  # coalesce leg-fill bursts
+                        self._fill_task_pending = False
+                        filled, exits = await self.check_fills_safe()
+                        if filled or exits:
+                            log.info("event_driven_fill_processed",
+                                     entries=len(filled), exits=len(exits))
+                        # exits booked here still reach daily stats/Thompson
+                        # via the orchestrator's completed-exit callback if
+                        # one is registered
+                        cb = getattr(self, "_completed_exits_cb", None)
+                        if cb and exits:
+                            await cb(exits)
+                    except Exception as _e:  # noqa: BLE001
+                        self._fill_task_pending = False
+                        log.warning("event_fill_check_failed", error=str(_e))
+
+                _aio.get_event_loop().create_task(_run())
+            except Exception:  # noqa: BLE001 — event handler must never raise
+                pass
+
+        try:
+            self._ibkr.ib.orderStatusEvent += _on_order_status
+            log.info("fill_events_attached")
+        except Exception as _e:  # noqa: BLE001
+            log.warning("fill_events_attach_failed", error=str(_e))
+
+    async def check_fills_safe(self) -> tuple[list[str], list[dict]]:
+        """R11: reentrancy guard — the event-driven path and the 30s monitor
+        can both want check_fills; concurrent runs would double-process
+        completed exits."""
+        if getattr(self, "_cf_running", False):
+            return [], []
+        self._cf_running = True
+        try:
+            return await self.check_fills()
+        finally:
+            self._cf_running = False
+
     async def check_fills(self) -> tuple[list[str], list[dict]]:
         """Check for filled/cancelled/timed-out orders and update state.
 

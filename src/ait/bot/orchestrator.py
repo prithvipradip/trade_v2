@@ -217,6 +217,15 @@ class TradingOrchestrator:
                 self._wd_alert_last = _t.time()
                 await self._send_notification(f"WATCHDOG {msg}")
         self._watchdog.set_alert_callback(_wd_alert)
+
+        # R11: event-driven fill detection (fills were detected ~33s late on
+        # the polling loop). The executor calls back so event-detected exits
+        # get booked identically to polled ones.
+        try:
+            self._executor._completed_exits_cb = self._process_completed_exits
+            self._executor.attach_fill_events()
+        except Exception as _e:  # noqa: BLE001
+            log.warning("fill_events_wiring_failed", error=str(_e))
         self._watchdog.register_component("market_data")
         self._watchdog.on_recovery("ibkr", self._ibkr.ensure_connected)
 
@@ -564,7 +573,7 @@ class TradingOrchestrator:
 
             # Also check pending order fills — and BOOK the completed exits
             # (stats/breaker/Thompson); they used to be silently discarded.
-            _entries, completed_exits = await self._executor.check_fills()
+            _entries, completed_exits = await self._executor.check_fills_safe()
             await self._process_completed_exits(completed_exits)
 
             # SEC 8-K material-event check every ~5 min (every 10th fast cycle)
@@ -717,7 +726,7 @@ class TradingOrchestrator:
             return
 
         # 6. Check fill status of pending orders (entry + exit)
-        _filled_entries, completed_exits = await self._executor.check_fills()
+        _filled_entries, completed_exits = await self._executor.check_fills_safe()
         await self._process_completed_exits(completed_exits)
 
         # 7. Get effective universe (learning + capital tier filtering)
@@ -848,6 +857,11 @@ class TradingOrchestrator:
         are fetched concurrently with asyncio.gather.
         """
         adaptor = self._learning.adaptor
+        # R11 (R9 instrumentation): ~95% of per-symbol scan time was dark,
+        # untimed I/O (DIA/GLD ~48s each, cause unknown). Coarse stage clocks.
+        import time as _tt
+        _scan_t0 = _tt.monotonic()
+        _stage_ms: dict = {}
 
         # Parallel fetch: historical data, sentiment, IV rank
         # 2 years of history for robust features (iv_rank, vol percentiles, trend)
@@ -994,7 +1008,7 @@ class TradingOrchestrator:
         # Multi-timeframe analysis: boost/penalize confidence based on alignment
         # Use intraday_full (full SQLite history) not the incremental fetch — the
         # MTF analyser needs ≥20 bars and the incremental fetch is often just a few.
-        mtf = self._mtf_analyzer.analyze(hist, intraday_full)
+        mtf = await self._mtf_analyzer.analyze_async(hist, intraday_full)  # R11: off-loop
         final_confidence = max(0, min(1, final_confidence + mtf.confidence_boost))
 
         # Pre-compute daily features once — used for fractal penalty and meta-labeler below.
@@ -1094,7 +1108,9 @@ class TradingOrchestrator:
         # IV rank already fetched in parallel above
 
         # Get options chains
+        _stage_ms["pre_chain"] = round((_tt.monotonic() - _scan_t0) * 1000)
         chains = await self._options_chain.get_chain(symbol)
+        _stage_ms["chain"] = round((_tt.monotonic() - _scan_t0) * 1000) - _stage_ms["pre_chain"]
         if not chains:
             return
 
@@ -1285,6 +1301,9 @@ class TradingOrchestrator:
             if signals:
                 signals = ([s for s in signals if s.is_defined_risk]
                            + [s for s in signals if not s.is_defined_risk])
+
+            _stage_ms["total"] = round((_tt.monotonic() - _scan_t0) * 1000)
+            log.info("scan_symbol_timing", symbol=symbol, **_stage_ms)
 
             # Try the best signal; if it's risk-REJECTED, fall through to the
             # next-ranked strategy rather than abandoning the symbol. The old
