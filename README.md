@@ -9,6 +9,17 @@
 > confidence) no longer match config.yaml. **PLAN.md is the only current
 > source of truth.** Structural lessons remain useful; numbers do not.
 
+## Dashboards (all localhost-only, auto-started by the supervisor)
+
+| URL | What it shows | Source |
+|---|---|---|
+| http://localhost:8503 | **Live status** — positions green/red, unrealized P&L, go-live gate scorecard | status_server.py |
+| http://localhost:8501 | **Analytics** (Streamlit) — trade history, strategy/regime breakdowns, backtest tab | src/ait/dashboard/app.py |
+| http://127.0.0.1:8502 | **Logs** — color-coded live log viewer | web_logs.py |
+
+Daily 2-minute routine and alert→action table: [docs/RUNBOOK.md](docs/RUNBOOK.md).
+
+
 # AIT v2 — Autonomous Intelligent Trading Bot
 
 An autonomous options trading bot that trades iron condors, credit spreads, and straddles using ML predictions, sentiment analysis, and self-learning. Connects to Interactive Brokers via IB Gateway for live/paper execution.
