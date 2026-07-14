@@ -17,6 +17,10 @@ from ait.optimization.results import OptimizationResult
 from ait.backtesting.result import BacktestResult
 from ait.backtesting.walkforward import WalkForwardConfig
 
+# R12: long-running suite (Optuna trials) — excluded from the default/CI fast
+# selection (-m "not ibkr and not slow"); the nightly CI job runs -m slow.
+pytestmark = pytest.mark.slow
+
 
 # ---------------------------------------------------------------------------
 # Helpers

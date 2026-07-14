@@ -63,14 +63,16 @@ class RangePredictor:
     Default: ±5% over 30 days. Matches typical iron-condor wing width and DTE.
     """
 
+    # R12-C: the GARCH/MS-GARCH/OU-Kou-GARCH ensemble members were retired to
+    # deprecated/research/ (2026-07-13). The enable_garch/enable_msgarch/
+    # enable_oujump constructor flags are gone — they were hard-False in
+    # production and the parametric members never earned CV weight.
+
     def __init__(
         self,
         threshold_pct: float = 0.05,
         horizon_days: int = 30,
         ensemble_weights: dict[str, float] | None = None,
-        enable_garch: bool = False,
-        enable_msgarch: bool = False,
-        enable_oujump: bool = False,
         min_edge_over_baseline: float = 0.05,
         model_dir: "Path | str | None" = None,
     ) -> None:
@@ -90,20 +92,12 @@ class RangePredictor:
         self._trained_at: "str | None" = None
         self._global_model_symbol: str = ""
         self._fallback_warned: set[str] = set()
-        self._enable_garch = enable_garch
-        self._enable_msgarch = enable_msgarch
-        self._enable_oujump = enable_oujump
         # Equal prior weights updated by CV edge after training.
         # Caller-supplied ensemble_weights respected as-is for backward compat.
         if ensemble_weights is not None:
             self._weights = ensemble_weights
         else:
-            _active = ["xgboost", "lightgbm"]
-            if enable_garch:   _active.append("garch")
-            if enable_msgarch: _active.append("msgarch")
-            if enable_oujump:  _active.append("oujump")
-            _w = 1.0 / len(_active)
-            self._weights = {m: _w for m in _active}
+            self._weights = {"xgboost": 0.5, "lightgbm": 0.5}
         self._models: dict = {}
         self._symbol_models: dict[str, dict] = {}
         self._scaler = StandardScaler()
@@ -245,23 +239,8 @@ class RangePredictor:
             acc = self._train_lgb(X, y)
             accuracies["lightgbm"] = acc
 
-        if self._enable_garch and "garch" in self._weights:
-            garch_acc = self._train_garch(features["Close"])
-            # None = no valid CV folds (insufficient data) → omit from accuracies
-            # 0.0–1.0 = valid AUROC score → include, even if 0.5 (no edge still
-            # participates in equal-weight tie-breaking with XGB/LGB)
-            if garch_acc is not None:
-                accuracies["garch"] = garch_acc
-
-        if self._enable_msgarch and "msgarch" in self._weights:
-            msgarch_acc = self._train_msgarch(features["Close"])
-            if msgarch_acc is not None:
-                accuracies["msgarch"] = msgarch_acc
-
-        if self._enable_oujump and "oujump" in self._weights:
-            oujump_acc = self._train_oujump(features["Close"])
-            if oujump_acc is not None:
-                accuracies["oujump"] = oujump_acc
+        # R12-C: GARCH/MS-GARCH/OU-Jump training arms removed — the parametric
+        # members live in deprecated/research/garch_range_predictor.py et al.
 
         # Final fit on all data
         self._scaler.fit(X)
@@ -305,9 +284,6 @@ class RangePredictor:
                             importances[name] = dict(zip(self._feature_names, arr.tolist()))
                         except Exception:
                             pass
-                _garch_state = getattr(self, "_garch_state", None)
-                _ms_garch_state = getattr(self, "_ms_garch_state", None)
-                _ou_jump_state = getattr(self, "_ou_jump_state", None)
                 self._symbol_models[symbol] = {
                     "fitted_at": __import__("datetime").date.today().isoformat(),  # A7
                     # Real label spec of THIS symbol's model — predictions must
@@ -322,31 +298,9 @@ class RangePredictor:
                     "feature_importances": importances,
                     "in_range_rate": float(positive_rate),
                     "version": self._model_version,
-                    # GARCH ensemble member metadata
-                    "garch_state":   _garch_state,
-                    "garch_variant": (_garch_state or {}).get("selected_variant"),
-                    "garch_dist":    (_garch_state or {}).get("selected_dist"),
-                    "garch_dist_bic": (_garch_state or {}).get("selected_bic"),
-                    "garch_jb_pvalue": (_garch_state or {}).get("jb_pvalue"),
-                    "garch_resid_skewness": (_garch_state or {}).get("resid_skewness"),
-                    "garch_fallback": (_garch_state or {}).get("fallback_used"),
-                    "garch_stable_attempted": (_garch_state or {}).get("garch_stable_attempted"),
-                    "garch_stable_converged": (_garch_state or {}).get("garch_stable_converged"),
-                    "garch_all_variants": (_garch_state or {}).get("garch_all_variants", {}),
-                    # MS-GARCH ensemble member metadata
-                    "ms_garch_state":     _ms_garch_state,
-                    "ms_garch_converged": (_ms_garch_state or {}).get("converged"),
-                    "ms_garch_bic":       (_ms_garch_state or {}).get("bic"),
-                    "ms_garch_regime0":   (_ms_garch_state or {}).get("msgarch_state", {}).get("regime0"),
-                    "ms_garch_regime1":   (_ms_garch_state or {}).get("msgarch_state", {}).get("regime1"),
-                    "ms_garch_transitions": (_ms_garch_state or {}).get("msgarch_state", {}).get("transition"),
-                    # OU-Kou-GARCH ensemble member metadata
-                    "ou_jump_state":      _ou_jump_state,
-                    "ou_jump_converged":  (_ou_jump_state or {}).get("converged"),
-                    "ou_jump_bic":        (_ou_jump_state or {}).get("bic"),
-                    "ou_jump_direction":  (_ou_jump_state or {}).get("ou_jump_direction"),
-                    "ou_jump_confidence": (_ou_jump_state or {}).get("ou_jump_confidence"),
-                    "ou_jump_params":     (_ou_jump_state or {}).get("oujump_state", {}).get("params"),
+                    # R12-C: garch_state / ms_garch_state / ou_jump_state
+                    # metadata keys no longer emitted (GARCH family retired
+                    # to deprecated/research/).
                 }
 
             self._save_models()
@@ -364,174 +318,6 @@ class RangePredictor:
             )
 
         return accuracies
-
-    def _train_garch(self, close: pd.Series) -> "float | None":
-        """CV-evaluate GARCH range model. Returns mean AUROC, or None if no valid folds.
-
-        Returns None (not 0.0) when all CV folds fail — caller omits GARCH from
-        accuracies dict entirely, producing nan in window JSON (honest: unevaluable).
-        Returns 0.0–1.0 for valid AUROC; 0.5 = no edge but still participates in
-        equal-weight tie-breaking.
-
-        Mirrors _train_xgb/_train_lgb pattern but operates on the Close price
-        series directly (GARCH uses returns, not the feature matrix).
-        Stores the full-training-data GARCH state in self._garch_state.
-        """
-        try:
-            from ait.ml.garch_range_predictor import GARCHRangeModel
-        except ImportError:
-            log.warning("garch_not_available", hint="pip install arch>=7.2")
-            return None
-
-        garch = GARCHRangeModel()
-        splits = self._walk_forward_split(len(close), gap=5)  # GARCH CV labels use _CV_HORIZON=5; horizon-default gap would over-purge
-
-        # CV scored at a SHORT horizon (5d) so P(in range) varies widely across
-        # validation days (±5% over 5d: quiet ~0.95, shock day ~0.30 → 3× spread
-        # vs 21d: quiet ~0.85, shock ~0.50 → too narrow for AUROC to discriminate).
-        # The full-horizon fit below still uses self._horizon (21d) for OOS prediction.
-        #
-        # Threshold scaled to the CV horizon via sqrt-of-time: a 5% threshold over
-        # 21 days corresponds to ~2.4% over 5 days. Using the full 21d threshold
-        # with a 5d horizon makes almost every day "in range" → all-positive folds
-        # → AUROC undefined (P36). Scale by sqrt(cv_h / full_h) to match.
-        _CV_HORIZON = 5
-        _cv_threshold = self._threshold * np.sqrt(_CV_HORIZON / max(self._horizon, 1))
-        _cv_labels_fn = lambda c: self._create_labels_horizon(c, _CV_HORIZON, _cv_threshold)
-        acc = garch.cv_score(
-            close=close,
-            horizon_days=_CV_HORIZON,
-            threshold_pct=_cv_threshold,
-            splits=splits,
-            create_labels_fn=_cv_labels_fn,
-        )
-
-        # Fit on full training data — stored for predict().
-        # Strip non-serialisable objects (arch result, vol kwargs) before storing —
-        # the state dict ends up in _symbol_models which gets serialised to window JSON.
-        try:
-            raw_state = garch.fit(close, self._horizon, self._threshold)
-            self._garch_state: dict = {
-                k: v for k, v in raw_state.items()
-                if k not in ("arch_result", "cts_params")
-                # _vol_kwargs is a plain serialisable dict — kept so CV rolling
-                # refit uses the same variant spec as the BIC-winning fit.
-            }
-            if raw_state.get("cts_params") is not None:
-                self._garch_state["cts_params"] = raw_state["cts_params"].tolist()
-        except Exception as e:
-            log.warning("garch_full_fit_failed", error=str(e))
-            self._garch_state = {}
-
-        log.info(
-            "range_garch_trained",
-            cv_auroc="None" if acc is None else f"{acc:.3f}",
-            cv_edge="None" if acc is None else f"{acc - 0.5:+.3f}",
-            variant=self._garch_state.get("selected_variant"),
-            dist=self._garch_state.get("selected_dist"),
-            fallback=self._garch_state.get("fallback_used"),
-        )
-        return acc
-
-    def _train_msgarch(self, close: pd.Series) -> "float | None":
-        """CV-evaluate MS-GARCH range model. Returns mean AUROC, or None if no valid folds.
-
-        Same contract as _train_garch(): None means unevaluable (omit from accuracies),
-        0.0–1.0 means valid AUROC.  Stores full-training-data MS-GARCH state in
-        self._ms_garch_state for use in predict() and window JSON serialisation.
-        """
-        try:
-            from ait.ml.garch_range_predictor import GARCHRangeModel
-        except ImportError:
-            log.warning("msgarch_not_available")
-            return None
-
-        garch = GARCHRangeModel()
-        splits = self._walk_forward_split(len(close), gap=5)  # GARCH CV labels use _CV_HORIZON=5; horizon-default gap would over-purge
-
-        _CV_HORIZON = 5
-        _cv_threshold = self._threshold * np.sqrt(_CV_HORIZON / max(self._horizon, 1))
-        _cv_labels_fn = lambda c: self._create_labels_horizon(c, _CV_HORIZON, _cv_threshold)
-        acc = garch.cv_score_msgarch(
-            close=close,
-            horizon_days=_CV_HORIZON,
-            threshold_pct=_cv_threshold,
-            splits=splits,
-            create_labels_fn=_cv_labels_fn,
-        )
-
-        # Fit on full training data via _fit_msgarch (BIC-comparable result dict).
-        try:
-            import numpy as _np
-            returns = _np.diff(_np.log(close.dropna().values))
-            ms_result = garch._fit_msgarch(returns, self._horizon, self._threshold)
-            # Strip the live object — store only the serialisable state dict.
-            ms_result.pop("_msgarch_obj", None)
-            ms_result.pop("arch_result", None)
-            self._ms_garch_state: dict = ms_result
-        except Exception as e:
-            log.warning("msgarch_full_fit_failed", error=str(e))
-            self._ms_garch_state = {}
-
-        log.info(
-            "range_msgarch_trained",
-            cv_auroc="None" if acc is None else f"{acc:.3f}",
-            cv_edge="None" if acc is None else f"{acc - 0.5:+.3f}",
-            converged=self._ms_garch_state.get("converged"),
-            bic=self._ms_garch_state.get("bic"),
-        )
-        return acc
-
-    def _train_oujump(self, close: pd.Series) -> "float | None":
-        """CV-evaluate OU-Kou-GARCH model. Returns mean AUROC, or None if no valid folds.
-
-        Same contract as _train_garch() / _train_msgarch():
-          None   → unevaluable (omit from accuracies; nan in window JSON)
-          float  → valid AUROC in [0, 1]; even 0.5 participates in weighting
-
-        Stores full-training-data state in self._ou_jump_state.
-        """
-        try:
-            from ait.ml.garch_range_predictor import GARCHRangeModel
-        except ImportError:
-            log.warning("oujump_not_available")
-            return None
-
-        garch = GARCHRangeModel()
-        splits = self._walk_forward_split(len(close), gap=5)  # GARCH CV labels use _CV_HORIZON=5; horizon-default gap would over-purge
-
-        _CV_HORIZON = 5
-        _cv_threshold = self._threshold * np.sqrt(_CV_HORIZON / max(self._horizon, 1))
-        _cv_labels_fn = lambda c: self._create_labels_horizon(c, _CV_HORIZON, _cv_threshold)
-        acc = garch.cv_score_oujump(
-            close=close,
-            horizon_days=_CV_HORIZON,
-            threshold_pct=_cv_threshold,
-            splits=splits,
-            create_labels_fn=_cv_labels_fn,
-        )
-
-        # Fit on full training data via _fit_oujump (returns BIC-comparable dict)
-        try:
-            import numpy as _np
-            returns = _np.diff(_np.log(close.dropna().values))
-            ou_result = garch._fit_oujump(returns, self._horizon, self._threshold)
-            ou_result.pop("_oujump_obj", None)
-            ou_result.pop("arch_result", None)
-            self._ou_jump_state: dict = ou_result
-        except Exception as e:
-            log.warning("oujump_full_fit_failed", error=str(e))
-            self._ou_jump_state = {}
-
-        log.info(
-            "range_oujump_trained",
-            cv_auroc="None" if acc is None else f"{acc:.3f}",
-            cv_edge="None" if acc is None else f"{acc - 0.5:+.3f}",
-            converged=self._ou_jump_state.get("converged"),
-            bic=self._ou_jump_state.get("bic"),
-            direction=self._ou_jump_state.get("ou_jump_direction"),
-        )
-        return acc
 
     @property
     def fitted_weights(self) -> "dict[str, float] | None":
@@ -679,7 +465,12 @@ class RangePredictor:
         if features.empty:
             return None
 
-        X = features[feature_names].iloc[[-1]]
+        # reindex+fill (not direct indexing): an artifact trained before the
+        # R12-C feature retirement lists columns FeatureEngine no longer
+        # produces (sentiment/flow). Those were constant in training, so tree
+        # models never split on them — 0.0 fill is exact. Same pattern as
+        # ensemble.predict and predict_from_features below.
+        X = features.reindex(columns=feature_names).fillna(0.0).iloc[[-1]]
         try:
             X_scaled = pd.DataFrame(
                 scaler.transform(X.values), columns=feature_names,
@@ -706,65 +497,11 @@ class RangePredictor:
             except Exception:
                 continue
 
-        # A7 (deep-audit ML-F6): the parametric members (GARCH/MS-GARCH/OU)
-        # are FROZEN at fit time -- they never see the prediction-day close.
-        # Daily-retrained states are fine; served past the retrain interval
-        # their contribution is a stale constant diluting the live XGB/LGBM
-        # signal, so skip them.
-        _stale_parametric = False
-        try:
-            from datetime import date as _date
-            _fit = (sym_data or {}).get("fitted_at")
-            if _fit:
-                _age = (_date.today() - _date.fromisoformat(_fit)).days
-                _stale_parametric = _age > 7
-        except Exception:  # noqa: BLE001
-            pass
-
-        # GARCH ensemble contribution
-        garch_state = (sym_data or {}).get("garch_state") or getattr(self, "_garch_state", None)
-        if garch_state and _stale_parametric:
-            garch_state = None
-        if garch_state:
-            w_garch = _weight("garch", 0.5)
-            if w_garch > 0:
-                try:
-                    from ait.ml.garch_range_predictor import GARCHRangeModel
-                    p_garch = GARCHRangeModel().predict_p_in_range(garch_state)
-                    weighted_p += w_garch * p_garch
-                    total_weight += w_garch
-                except Exception:
-                    pass
-
-        # MS-GARCH ensemble contribution
-        ms_garch_state = (sym_data or {}).get("ms_garch_state") or getattr(self, "_ms_garch_state", None)
-        if ms_garch_state and _stale_parametric:
-            ms_garch_state = None
-        if ms_garch_state:
-            w_ms = _weight("msgarch", 0.5)
-            if w_ms > 0:
-                try:
-                    from ait.ml.garch_range_predictor import GARCHRangeModel
-                    p_ms = GARCHRangeModel().predict_p_in_range(ms_garch_state)
-                    weighted_p += w_ms * p_ms
-                    total_weight += w_ms
-                except Exception:
-                    pass
-
-        # OU-Kou-GARCH ensemble contribution
-        ou_jump_state = (sym_data or {}).get("ou_jump_state") or getattr(self, "_ou_jump_state", None)
-        if ou_jump_state and _stale_parametric:
-            ou_jump_state = None
-        if ou_jump_state:
-            w_ou = _weight("oujump", 0.5)
-            if w_ou > 0:
-                try:
-                    from ait.ml.garch_range_predictor import GARCHRangeModel
-                    p_ou = GARCHRangeModel().predict_p_in_range(ou_jump_state)
-                    weighted_p += w_ou * p_ou
-                    total_weight += w_ou
-                except Exception:
-                    pass
+        # R12-C: parametric ensemble contributions (GARCH/MS-GARCH/OU-Jump
+        # states) removed — the family is retired to deprecated/research/.
+        # Artifacts trained before the retirement may still carry *_state
+        # keys in sym_data; they are simply ignored (their weights were
+        # CV-fitted to ~0 in production anyway).
 
         if total_weight == 0:
             return None
@@ -817,8 +554,7 @@ class RangePredictor:
         """Make a prediction from a pre-computed feature row, bypassing FeatureEngine.
 
         Used by _save_window_timeseries for O(1) per-bar predictions instead of
-        re-running FeatureEngine on 252+ rows for each bar. GARCH/MS-GARCH/OU-Jump
-        state contributions are preserved — they are state-based, not feature-based.
+        re-running FeatureEngine on 252+ rows for each bar.
         """
         sym_data = None
         if symbol and symbol in self._symbol_models:
@@ -874,41 +610,7 @@ class RangePredictor:
             except Exception:
                 continue
 
-        garch_state = (sym_data or {}).get("garch_state") or getattr(self, "_garch_state", None)
-        if garch_state:
-            w_garch = _weight("garch", 0.5)
-            if w_garch > 0:
-                try:
-                    from ait.ml.garch_range_predictor import GARCHRangeModel
-                    p_garch = GARCHRangeModel().predict_p_in_range(garch_state)
-                    weighted_p += w_garch * p_garch
-                    total_weight += w_garch
-                except Exception:
-                    pass
-
-        ms_garch_state = (sym_data or {}).get("ms_garch_state") or getattr(self, "_ms_garch_state", None)
-        if ms_garch_state:
-            w_ms = _weight("msgarch", 0.5)
-            if w_ms > 0:
-                try:
-                    from ait.ml.garch_range_predictor import GARCHRangeModel
-                    p_ms = GARCHRangeModel().predict_p_in_range(ms_garch_state)
-                    weighted_p += w_ms * p_ms
-                    total_weight += w_ms
-                except Exception:
-                    pass
-
-        ou_jump_state = (sym_data or {}).get("ou_jump_state") or getattr(self, "_ou_jump_state", None)
-        if ou_jump_state:
-            w_ou = _weight("oujump", 0.5)
-            if w_ou > 0:
-                try:
-                    from ait.ml.garch_range_predictor import GARCHRangeModel
-                    p_ou = GARCHRangeModel().predict_p_in_range(ou_jump_state)
-                    weighted_p += w_ou * p_ou
-                    total_weight += w_ou
-                except Exception:
-                    pass
+        # R12-C: parametric ensemble contributions removed (see predict()).
 
         if total_weight == 0:
             return None

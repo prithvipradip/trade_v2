@@ -125,7 +125,7 @@ class TestIVEffect:
         t = 21 / 365
         r = 0.05
 
-        from ait.backtesting.options_sim import black_scholes_price, find_strike_by_delta, OptionType
+        from ait.backtesting.pricing import black_scholes_price, find_strike_by_delta, OptionType
 
         call_strike_lo = find_strike_by_delta(underlying, t, iv_lo, 0.20, OptionType.CALL, r)
         call_strike_hi = find_strike_by_delta(underlying, t, iv_hi, 0.20, OptionType.CALL, r)

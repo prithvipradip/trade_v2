@@ -133,11 +133,24 @@ class Strategy(ABC):
         self,
         contracts: list[OptionContract],
         target_delta: float,
+        tolerance: float | None = 0.07,
     ) -> OptionContract | None:
-        """Find the contract closest to a target delta."""
+        """Find the contract closest to a target delta.
+
+        R12-B (vol agent, 07-07 SPY condor): unbounded closest-match is how a
+        "0.20-delta" short call filled at 0.49 DELTA — on a thin/degraded
+        chain the nearest liquid contract can be ANY delta, and every
+        downstream gate rewarded the closer-to-ATM error. Reject when the
+        best candidate is outside target +/- tolerance (default 0.07) so no
+        strategy silently trades a structure it didn't design. Pass
+        tolerance=None to restore the old unbounded behavior.
+        """
         if not contracts:
             return None
-        return min(contracts, key=lambda c: abs(abs(c.delta) - target_delta))
+        best = min(contracts, key=lambda c: abs(abs(c.delta) - target_delta))
+        if tolerance is not None and abs(abs(best.delta) - target_delta) > tolerance:
+            return None
+        return best
 
     def _find_strike_near(
         self,

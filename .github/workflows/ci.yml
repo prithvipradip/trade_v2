@@ -1,18 +1,30 @@
 # Minimal CI — born from the 2026-07-10 incident (green local tests, deploy
 # shipped a runtime fault that killed the trading loop for a session).
-# Scope on purpose:
-#   - unit tests (integration suites excluded: they want IB Gateway / long runs)
+#
+# R12 (test-maturity audit): the previous selection could NEVER go green — it
+# pulled ~1h of GARCH/walkforward suites under a 30-min timeout with -x, so a
+# single early failure (or the clock) killed every run. Now:
+#   - fast lane (every push/PR): -m "not ibkr and not slow", no -x — the full
+#     failure list surfaces in one run
+#   - slow lane (nightly cron):  -m "slow and not ibkr", 120-min budget
 #   - byte-compile ALL of src (catches syntax errors in never-imported modules)
+# The old --ignore flags for test_integration.py / test_full_integration.py
+# are gone: both modules self-skip unless RUN_INTEGRATION_TESTS=1.
 # NOT here (future work):
 #   - ruff lint: [tool.ruff] exists in pyproject but the codebase isn't clean
 #     against it yet — adding it now would be permanently red. Clean up, then add.
-#   - scripts/smoke_deploy.py: it needs the REAL config/DBs, so it runs on the
-#     trading box after each deploy (see docs/RUNBOOK.md "Deploy checklist").
+#   - scripts/smoke_deploy.py: verified R12 — it hard-requires the REAL
+#     config.yaml and data/ait_state.db (check_state_manager REFUSES to create
+#     a missing state DB, and the digest/analytics checks read both live DBs),
+#     so it cannot run in CI. It runs on the trading box after each deploy
+#     (see docs/RUNBOOK.md "Deploy checklist").
 name: CI
 
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "0 6 * * *"   # nightly slow lane (06:00 UTC = pre-market ET)
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -20,6 +32,7 @@ concurrency:
 
 jobs:
   test:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -44,8 +57,30 @@ jobs:
       - name: Byte-compile src (syntax errors anywhere fail the build)
         run: python -m compileall -q src
 
-      - name: Unit tests
-        run: >
-          python -m pytest tests/ -q -x
-          --ignore=tests/test_integration.py
-          --ignore=tests/test_full_integration.py
+      - name: Unit tests (fast lane)
+        run: python -m pytest tests/ -q -m "not ibkr and not slow"
+
+  slow-nightly:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install torch (CPU wheel)
+        run: pip install "torch>=2.6" --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install package + dev deps
+        run: pip install -e ".[dev]"
+
+      - name: Byte-compile src
+        run: python -m compileall -q src
+
+      - name: Slow suites (nightly)
+        run: python -m pytest tests/ -q -m "slow and not ibkr"

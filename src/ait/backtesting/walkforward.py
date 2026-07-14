@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import multiprocessing as _mp
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -35,63 +34,10 @@ from ait.strategies.base import SignalDirection
 from ait.utils.logging import get_logger
 
 
-# ---------------------------------------------------------------------------
-# Module-level worker for RNG-isolated statistical model training
-# ---------------------------------------------------------------------------
-# Must be at module level (not a nested function) so the `spawn` start method
-# can import and pickle it in the child interpreter.
-
-def _range_model_worker(
-    queue: "_mp.Queue",
-    train_df: "pd.DataFrame",
-    symbol: str,
-    window_id: int,
-    max_hold_days: int,
-    threshold_pct: float,
-    db_path: "Path | None",
-    table_prefix: str,
-    enable_msgarch: bool,
-    enable_oujump: bool,
-) -> None:
-    """Train RangePredictor with statistical models in an isolated subprocess.
-
-    Runs inside a `spawn`-started child process so that scipy/numpy RNG state
-    consumed by MS-GARCH EM and OU-Kou-GARCH MLE never propagates back to the
-    parent process where Optuna's TPE sampler is running.
-
-    Places (range_predictor, status, threshold_pct) into `queue` on success,
-    or (None, error_reason, threshold_pct) on failure.  The parent reads from
-    the queue after joining the process.
-    """
-    try:
-        from ait.ml.range_predictor import RESEARCH_MODEL_DIR, RangePredictor
-
-        intraday_store = None
-        if db_path is not None:
-            from ait.data.historical import HistoricalDataStore
-            intraday_store = HistoricalDataStore(
-                db_path=db_path, table_prefix=table_prefix
-            )
-
-        rp = RangePredictor(
-            threshold_pct=threshold_pct,
-            horizon_days=max_hold_days,
-            enable_garch=False,       # plain GARCH: rank-inversion problem not yet fixed
-            enable_msgarch=enable_msgarch,
-            enable_oujump=enable_oujump,
-            # R7/R10 artifact hygiene: research runs save under models/research/
-            # — NEVER models/range.pkl, which is the live bot's artifact.
-            model_dir=RESEARCH_MODEL_DIR,
-        )
-        accs = rp.train(train_df, symbol=symbol, intraday_store=intraday_store)
-
-        if accs and rp.is_trained:
-            queue.put((rp, "ok", threshold_pct))
-        else:
-            queue.put((None, "training_returned_no_accuracy", threshold_pct))
-
-    except Exception as exc:
-        queue.put((None, f"exception: {exc}", threshold_pct))
+# R12-C: _range_model_worker (spawn-isolated GARCH/MS-GARCH/OU training) was
+# removed with the GARCH family retirement to deprecated/research/. Range
+# models are ML-only (XGB/LGBM) and train in-process — the RNG-contamination
+# isolation existed solely for the parametric members' scipy/numpy RNG use.
 
 log = get_logger("backtesting.walkforward")
 
@@ -135,7 +81,6 @@ class WalkForwardConfig:
     hurst_regime_penalty: float = 0.10
     hurst_hard_veto_multiplier: float = 0.0   # 0=disabled; Exp 20 post-mortem: QQQ spread never < 0.43, any multiplier blocks all entries
     multifractal_max_width: float = 0.50
-    aekf_veto_threshold: float = 0.60         # Exp 20: suppress IC entry when AEKF drift confidence >= this
     iv_rank_rise_threshold: float = 0.30      # Exp 20: suppress IC entry when IV rank rose > this over last 10 days
     pct_from_60d_high_threshold: float = -1.0 # Exp 27: suppress IC entry when price is this far below 60d rolling high (-1.0 = disabled)
     min_edge_over_baseline: float = 0.05      # Exp 28: min weighted CV edge for range predictor to activate (0.0 = always use, higher = stricter quality gate)
@@ -538,7 +483,9 @@ _TIMESERIES_FEAT_KEYS = [
     "rsi_14", "macd", "macd_signal", "macd_hist",
     "sma_20", "sma_50", "bb_upper", "bb_lower", "bb_position",
     "atr_pct", "realized_vol_20", "iv_rank", "vix_level",
-    "hurst_wavelet", "sentiment_composite", "put_call_ratio",
+    "hurst_wavelet",
+    # R12-C: sentiment_composite / put_call_ratio removed with the
+    # sentiment/flow feature retirement (constant columns).
 ]
 
 
@@ -725,8 +672,6 @@ class WalkForwardBacktester:
         db_path: "Path | None" = None,
         progress_dir: "Path | None" = None,
         table_prefix: str = "",
-        enable_msgarch: bool = True,
-        enable_oujump: bool = True,
     ) -> None:
         self._symbols = symbols
         self._strategies = strategies
@@ -736,10 +681,8 @@ class WalkForwardBacktester:
         self._progress_dir = Path(progress_dir) if progress_dir else None
         self._global_best_params: dict | None = None
         self._global_best_score: float = -1.0
-        # Statistical ensemble members — trained in spawn-isolated subprocess
-        # (Exp 17+) to prevent Optuna RNG contamination (P31/P32).
-        self._enable_msgarch = enable_msgarch
-        self._enable_oujump  = enable_oujump
+        # R12-C: enable_msgarch/enable_oujump flags removed — the GARCH family
+        # is retired to deprecated/research/; range models are ML-only.
 
     async def run(self, data: dict[str, pd.DataFrame] | None = None) -> WalkForwardResult:
         """Run walk-forward backtest.
@@ -791,12 +734,10 @@ class WalkForwardBacktester:
             # disabled.  Progress JSON files are written independently per window with
             # no conflicts (each window has a unique file name).
             #
-            # Statistical model pre-training (Exp 17+ fix for subprocess timeout):
-            # MS-GARCH and OU-Kou-GARCH are trained sequentially here in the parent
-            # process BEFORE the ProcessPoolExecutor launches.  This eliminates CPU
-            # contention between statistical model subprocesses and Optuna workers.
-            # It also removes the need for spawn-subprocess isolation at this stage
-            # because Optuna has not started yet — no RNG contamination is possible.
+            # Range models are pre-trained sequentially here in the parent
+            # process BEFORE the ProcessPoolExecutor launches, eliminating CPU
+            # contention with Optuna workers. (R12-C: this used to also train
+            # the MS-GARCH/OU statistical members — now ML-only.)
             pretrained_range_by_window: list[dict] = self._pretrain_range_models(
                 windows, data, _vix_full
             )
@@ -1014,53 +955,15 @@ class WalkForwardBacktester:
             _model_weights: dict = {}
             if range_predictor is not None and range_predictor.fitted_weights:
                 rp_sym = getattr(range_predictor, "_symbol_models", {}).get(symbol, {})
-                _garch_state = rp_sym.get("garch_state") or {}
-                _ms_garch_state = rp_sym.get("ms_garch_state") or {}
+                # R12-C: GARCH/MS-GARCH/OU-Jump metadata keys removed — the
+                # family is retired to deprecated/research/ and RangePredictor
+                # no longer emits their states.
                 _model_weights["range_predictor"] = {
                     "status":          _range_model_status,
                     "threshold_pct":   round(_range_threshold, 4),
                     "fitted_weights":  dict(range_predictor.fitted_weights),
                     "cv_scores":       dict(rp_sym.get("cv_scores", {})),
                     "in_range_rate":   rp_sym.get("in_range_rate"),
-                    # GARCH metadata
-                    "garch_selected_variant":   rp_sym.get("garch_variant"),
-                    "garch_selected_dist":      rp_sym.get("garch_dist"),
-                    "garch_selected_bic":       rp_sym.get("garch_dist_bic"),
-                    "garch_fallback":           rp_sym.get("garch_fallback"),
-                    "garch_jb_pvalue":          rp_sym.get("garch_jb_pvalue"),
-                    "garch_resid_skewness":     rp_sym.get("garch_resid_skewness"),
-                    "garch_stable_attempted":   rp_sym.get("garch_stable_attempted"),
-                    "garch_stable_converged":   rp_sym.get("garch_stable_converged"),
-                    "p_in_range_compounding":   _garch_state.get("p_in_range_compounding"),
-                    "p_in_range_sqrt_scale":    _garch_state.get("p_in_range_sqrt_scale"),
-                    "garch_all_variants":       rp_sym.get("garch_all_variants", {}),
-                    # MS-GARCH metadata
-                    "ms_garch_converged":   rp_sym.get("ms_garch_converged"),
-                    "ms_garch_bic":         rp_sym.get("ms_garch_bic"),
-                    "ms_garch_regime0":     rp_sym.get("ms_garch_regime0"),
-                    "ms_garch_regime1":     rp_sym.get("ms_garch_regime1"),
-                    "ms_garch_transitions": rp_sym.get("ms_garch_transitions"),
-                    "ms_garch_p_in_range":  _ms_garch_state.get("p_in_range_compounding"),
-                    # OU-Kou-GARCH + AEKF metadata
-                    **({} if not (_ou_jump_state := rp_sym.get("ou_jump_state") or {})
-                       else {
-                        "ou_jump_converged":         rp_sym.get("ou_jump_converged"),
-                        "ou_jump_bic":               rp_sym.get("ou_jump_bic"),
-                        "ou_jump_direction":         rp_sym.get("ou_jump_direction"),
-                        "ou_jump_confidence":        rp_sym.get("ou_jump_confidence"),
-                        "ou_jump_params":            rp_sym.get("ou_jump_params"),
-                        "ou_jump_p_in_range":        _ou_jump_state.get("p_in_range_compounding"),
-                        "ou_jump_loglik":            _ou_jump_state.get("loglik"),
-                        "ou_jump_aic":               (_ou_jump_state.get("diagnostics") or {}).get("aic"),
-                        "ou_jump_jb_pvalue":         (_ou_jump_state.get("diagnostics") or {}).get("jb_pvalue"),
-                        "ou_jump_resid_skewness":    (_ou_jump_state.get("diagnostics") or {}).get("resid_skewness"),
-                        "ou_jump_resid_kurtosis":    (_ou_jump_state.get("diagnostics") or {}).get("resid_kurtosis"),
-                        "ou_jump_ljung_box_pvalue":  (_ou_jump_state.get("diagnostics") or {}).get("ljung_box_pvalue"),
-                        "ou_jump_half_life_days":    (_ou_jump_state.get("diagnostics") or {}).get("ou_half_life_days"),
-                        "ou_jump_intensity_annual":  (_ou_jump_state.get("diagnostics") or {}).get("jump_intensity_annual"),
-                        "ou_jump_persistence":       (_ou_jump_state.get("diagnostics") or {}).get("diffusion_persistence"),
-                        "ou_jump_aekf_kappa_cv":     (_ou_jump_state.get("diagnostics") or {}).get("aekf_kappa_cv"),
-                    }),
                 }
             else:
                 _model_weights["range_predictor"] = {
@@ -1191,7 +1094,6 @@ class WalkForwardBacktester:
                 hurst_regime_penalty=getattr(window_cfg, "hurst_regime_penalty", 0.10),
                 hurst_hard_veto_multiplier=getattr(window_cfg, "hurst_hard_veto_multiplier", 1.5),
                 multifractal_max_width=getattr(window_cfg, "multifractal_max_width", 0.50),
-                aekf_veto_threshold=getattr(window_cfg, "aekf_veto_threshold", 0.60),
                 iv_rank_rise_threshold=getattr(window_cfg, "iv_rank_rise_threshold", 0.30),
                 pct_from_60d_high_threshold=getattr(window_cfg, "pct_from_60d_high_threshold", -1.0),
                 min_edge_over_baseline=getattr(window_cfg, "min_edge_over_baseline", 0.05),
@@ -1541,15 +1443,15 @@ class WalkForwardBacktester:
         """Evaluate range predictor accuracy on OOS test data.
 
         Computes per-model probability scoring metrics (Brier score, log loss,
-        Brier skill score, realized-vol MAE) and balanced accuracy, plus AEKF
-        direction diagnostics for the OU-Kou-GARCH member.  All metrics are
-        stored under ``oos_scores`` in the window JSON so train/test
-        generalisation gaps are visible per model.
+        Brier skill score, realized-vol MAE) and balanced accuracy for the ML
+        members.  All metrics are stored under ``oos_scores`` in the window
+        JSON so train/test generalisation gaps are visible per model.
+        (R12-C: GARCH/MS-GARCH/OU rolling scoring and AEKF diagnostics removed
+        with the family's retirement to deprecated/research/.)
 
         Returns empty dict if evaluation is not possible.
         """
         import numpy as _np
-        from sklearn.metrics import balanced_accuracy_score, roc_auc_score
 
         try:
             # ----------------------------------------------------------------
@@ -1638,77 +1540,18 @@ class WalkForwardBacktester:
                         except Exception:
                             pass
 
-            # Ensemble score over ML members only (statistical members added below)
+            # Ensemble score over ML members
             if ml_scores:
                 ml_scores["ensemble_ml"] = self._prob_score_metrics(
                     y_true, ensemble_proba, base_rate
                 )
 
             # ----------------------------------------------------------------
-            # 3. Statistical model rolling OOS scoring
+            # 3. Statistical model rolling OOS scoring — REMOVED (R12-C).
+            # GARCH/MS-GARCH/OU forecasts + AEKF diagnostics retired to
+            # deprecated/research/; RangePredictor emits no *_state keys.
             # ----------------------------------------------------------------
             stat_scores: dict[str, dict] = {}
-
-            try:
-                from ait.ml.garch_range_predictor import GARCHRangeModel
-                grm = GARCHRangeModel()
-
-                # GARCH/GJR/EGARCH/ARCH rolling forecasts
-                garch_state = rp_sym.get("garch_state") or {}
-                if garch_state and garch_state.get("_vol_kwargs") is not None:
-                    p_garch = grm.roll_garch_forecasts(
-                        garch_state, oos_returns, horizon_days, threshold_pct
-                    )
-                    if len(p_garch) == len(y_true):
-                        rvol_pred_garch = self._garch_rvol_forecast(
-                            garch_state, oos_returns, horizon_days
-                        )
-                        stat_scores["garch"] = self._prob_score_metrics(
-                            y_true, p_garch, base_rate,
-                            rvol_pred=rvol_pred_garch, rvol_true=rvol_true,
-                        )
-
-                # MS-GARCH rolling forecasts
-                ms_garch_state = rp_sym.get("ms_garch_state") or {}
-                if ms_garch_state:
-                    p_ms = grm.roll_msgarch_forecasts(
-                        ms_garch_state, oos_returns, horizon_days, threshold_pct
-                    )
-                    if len(p_ms) == len(y_true):
-                        stat_scores["msgarch"] = self._prob_score_metrics(
-                            y_true, p_ms, base_rate
-                        )
-
-                # OU-Kou-GARCH rolling forecasts + AEKF diagnostics
-                ou_jump_state = rp_sym.get("ou_jump_state") or {}
-                aekf_metrics:  dict = {}
-                if ou_jump_state:
-                    p_ou, drifts, sigma_ou = grm.roll_oujump_forecasts(
-                        ou_jump_state, oos_returns, horizon_days, threshold_pct
-                    )
-                    if len(p_ou) == len(y_true):
-                        stat_scores["oujump"] = self._prob_score_metrics(
-                            y_true, p_ou, base_rate,
-                            rvol_pred=sigma_ou[:len(y_true)] if len(sigma_ou) >= len(y_true) else None,
-                            rvol_true=rvol_true,
-                        )
-
-                    # AEKF direction diagnostics from oos_aekf_diagnostics()
-                    try:
-                        from ait.ml.ou_jump import OUKouGARCH
-                        _ou_tmp = OUKouGARCH()
-                        # Reconstruct just enough state for oos_aekf_diagnostics
-                        _ou_tmp._params   = None  # will be rebuilt inside method
-                        aekf_raw = self._aekf_oos_eval(
-                            ou_jump_state, oos_returns, horizon_days, threshold_pct, y_true, rvol_true
-                        )
-                        if aekf_raw:
-                            aekf_metrics = aekf_raw
-                    except Exception:
-                        pass
-
-            except Exception:
-                pass
 
             # ----------------------------------------------------------------
             # 4. Full ensemble combined score
@@ -1741,8 +1584,6 @@ class WalkForwardBacktester:
             }
             if "ensemble" in all_scores:
                 result["ensemble"] = _strip_arrays(all_scores["ensemble"])
-            if aekf_metrics:
-                result["aekf"] = aekf_metrics
 
             log.debug(
                 "range_oos_evaluated",
@@ -2004,182 +1845,6 @@ class WalkForwardBacktester:
             return {}
 
     @staticmethod
-    def _garch_rvol_forecast(
-        state: dict,
-        oos_returns: "np.ndarray",
-        horizon_days: int,
-    ) -> "np.ndarray | None":
-        """Per-day h-step annualised vol forecast from frozen GARCH params.
-
-        Uses the analytic GARCH variance recursion (no refit) to produce a
-        rolling forecast of realized vol for the rvol_mae metric.
-        """
-        import numpy as _np
-        try:
-            vol_kwargs  = state.get("_vol_kwargs")
-            if vol_kwargs is None:
-                return None
-            import warnings
-            from arch import arch_model
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                am  = arch_model(oos_returns * 100, mean="Constant", **vol_kwargs)
-                res = am.fit(disp="off", show_warning=False, options={"maxiter": 200})
-            n = len(oos_returns)
-            n_labelable = n - horizon_days
-            sigma_h = _np.empty(n_labelable)
-            for t in range(n_labelable):
-                try:
-                    fc = res.forecast(horizon=horizon_days, start=t, method="analytic", reindex=False)
-                    var_h = float(fc.variance.iloc[0].sum())
-                    sigma_h[t] = float(_np.sqrt(max(var_h, 1e-10))) / 100.0 * _np.sqrt(252)
-                except Exception:
-                    sigma_h[t] = float("nan")
-            return sigma_h
-        except Exception:
-            return None
-
-    def _aekf_oos_eval(
-        self,
-        ou_jump_state: dict,
-        oos_returns: "np.ndarray",
-        horizon_days: int,
-        threshold_pct: float,
-        y_true: "np.ndarray",
-        rvol_true: "np.ndarray",
-    ) -> dict:
-        """Compute AEKF OOS diagnostics from a stored OU-Kou-GARCH state dict.
-
-        Rebuilds an OUKouGARCH object from the state dict and calls
-        oos_aekf_diagnostics() to get the full AEKF step-forward metrics.
-
-        Returns a dict of scalar AEKF diagnostics for the window JSON.
-        """
-        import numpy as _np
-        from sklearn.metrics import roc_auc_score
-        try:
-            from ait.ml.ou_jump import OUKouGARCH, OUKouGARCHParams, AdaptiveEKF, _MIN_VAR, _DT
-
-            inner = ou_jump_state.get("oujump_state") or {}
-            params_raw  = inner.get("params") or {}
-            aekf_final  = inner.get("aekf_final_state") or {}
-            if not params_raw or not aekf_final:
-                return {}
-
-            from scipy import stats as _stats
-
-            # Reconstruct a minimal OUKouGARCH for oos_aekf_diagnostics
-            p = OUKouGARCHParams(
-                kappa=float(params_raw.get("kappa",  0.1)),
-                mu=   float(params_raw.get("mu",     0.0)),
-                omega=float(params_raw.get("omega",  1e-6)),
-                alpha=float(params_raw.get("alpha",  0.05)),
-                beta= float(params_raw.get("beta",   0.90)),
-                lam=  float(params_raw.get("lambda", 0.05)),
-                p_up= float(params_raw.get("p_up",   0.5)),
-                eta1= float(params_raw.get("eta1",   50.0)),
-                eta2= float(params_raw.get("eta2",   50.0)),
-            )
-            X_T   = float(aekf_final.get("X_T",     p.mu))
-            k_T   = float(aekf_final.get("kappa_T", p.kappa))
-            m_T   = float(aekf_final.get("mu_T",    p.mu))
-            uncond = p.omega / max(1.0 - p.alpha - p.beta, 1e-6)
-
-            ou = OUKouGARCH()
-            ou._params      = p
-            ou._loglik      = float(inner.get("loglik", 0.0))
-            ou._n_obs       = int(inner.get("n_obs", 0))
-            ou._converged   = bool(inner.get("converged", False))
-            ou._n_iter      = int(inner.get("n_iter", 0))
-            log_prices_stub = _np.array([X_T])
-            ou._log_prices  = log_prices_stub
-            sigma2_stub     = _np.array([uncond])
-            ou._sigma2_path = sigma2_stub
-
-            # Rebuild AEKF at training end-state
-            aekf = AdaptiveEKF(x0=X_T, kappa_init=k_T, mu_init=m_T,
-                               sigma2_init=uncond)
-            aekf._z = _np.array([X_T, k_T, m_T])
-            ou._aekf = aekf
-
-            raw = ou.oos_aekf_diagnostics(oos_returns, horizon_days, threshold_pct)
-            if not raw:
-                return {}
-
-            innovations  = raw["innovations"]
-            kappa_path   = raw["kappa_path"]
-            drift_path   = raw["drift_path"]
-            p_ou         = raw["p_scores"]
-            y_oos        = raw["y_realized"]
-            lb_pvalue    = raw["lb_pvalue"]
-            lb_acf       = raw["lb_acf_pvalue"]
-
-            # Direction accuracy: fraction where sign(drift) == sign(realized return)
-            n_lab  = min(len(drift_path), len(y_true))
-            if n_lab > 0:
-                drift_sign    = (_np.asarray(drift_path[:n_lab]) > 0).astype(int)
-                # y_true=1 means price stayed in range; for direction we compare to
-                # realized return direction over horizon (positive return = bullish)
-                # Compute realized h-day log return sign from oos_returns
-                n_r = len(oos_returns)
-                realized_dir = _np.array([
-                    1 if _np.sum(oos_returns[t + 1: t + 1 + horizon_days]) > 0 else 0
-                    for t in range(min(n_lab, n_r - horizon_days))
-                ])
-                nd = min(len(drift_sign), len(realized_dir))
-                dir_accuracy = float(_np.mean(drift_sign[:nd] == realized_dir[:nd])) if nd > 0 else float("nan")
-
-                # Direction AUROC: |drift| as score, realized_dir as label
-                try:
-                    dir_auroc = float(roc_auc_score(
-                        realized_dir[:nd],
-                        _np.abs(drift_path[:nd]),
-                    ))
-                except Exception:
-                    dir_auroc = float("nan")
-
-                # Direction Brier
-                if len(p_ou) >= nd and len(y_oos) >= nd:
-                    dir_brier_base = float(_np.mean(realized_dir[:nd])) * (1.0 - float(_np.mean(realized_dir[:nd])))
-                    # Use normalised |drift| mapped to [0,1] as confidence
-                    drift_conf = _np.clip(_np.abs(drift_path[:nd]) / (3.0 * float(_np.std(drift_path[:nd])) + 1e-8), 0.0, 1.0)
-                    dir_brier  = float(_np.mean((drift_conf - realized_dir[:nd]) ** 2))
-                    dir_brier_skill = float(1.0 - dir_brier / dir_brier_base) if dir_brier_base > 0 else float("nan")
-                else:
-                    dir_brier = dir_brier_skill = float("nan")
-            else:
-                dir_accuracy = dir_auroc = dir_brier = dir_brier_skill = float("nan")
-
-            # AEKF stability metrics
-            kappa_mean = float(_np.mean(kappa_path))
-            kappa_std  = float(_np.std(kappa_path))
-            kappa_cv   = kappa_std / max(kappa_mean, 1e-8)
-            kappa_min  = float(_np.min(kappa_path))
-            kappa_max  = float(_np.max(kappa_path))
-
-            # Innovation whiteness: fraction of |ν_t| > 2σ_ν (outlier rate)
-            sigma_nu  = float(_np.std(innovations))
-            outlier_rate = float(_np.mean(_np.abs(innovations) > 2.0 * sigma_nu))
-
-            return {
-                "lb_innovations_sq_pvalue":  round(lb_pvalue,    5) if _np.isfinite(lb_pvalue)    else None,
-                "lb_innovations_acf_pvalue": round(lb_acf,       5) if _np.isfinite(lb_acf)       else None,
-                "innovation_outlier_rate":   round(outlier_rate, 4),
-                "kappa_oos_mean":            round(kappa_mean,   5),
-                "kappa_oos_cv":              round(kappa_cv,     4),
-                "kappa_oos_min":             round(kappa_min,    5),
-                "kappa_oos_max":             round(kappa_max,    5),
-                "direction_accuracy":        round(dir_accuracy, 4) if _np.isfinite(dir_accuracy)    else None,
-                "direction_auroc":           round(dir_auroc,    4) if _np.isfinite(dir_auroc)       else None,
-                "direction_brier":           round(dir_brier,    5) if _np.isfinite(dir_brier)       else None,
-                "direction_brier_skill":     round(dir_brier_skill, 4) if _np.isfinite(dir_brier_skill) else None,
-            }
-
-        except Exception as e:
-            log.debug("aekf_oos_eval_failed", error=str(e))
-            return {}
-
-    @staticmethod
     def _adaptive_range_threshold(
         train_df: pd.DataFrame,
         horizon_days: int,
@@ -2254,8 +1919,6 @@ class WalkForwardBacktester:
                     threshold_pct=self._adaptive_range_threshold(
                         train_df, horizon_days=self._config.max_hold_days
                     ),
-                    enable_msgarch=getattr(self, "_enable_msgarch", True),
-                    enable_oujump=getattr(self, "_enable_oujump", True),
                 )
             results.append(per_symbol)
         return results
@@ -2278,144 +1941,7 @@ class WalkForwardBacktester:
         threshold_pct = self._adaptive_range_threshold(train_df, horizon_days=max_hold_days)
         return self._train_window_range_model_inprocess(
             train_df, symbol, window_id, max_hold_days, threshold_pct,
-            enable_msgarch=getattr(self, "_enable_msgarch", True),
-            enable_oujump=getattr(self, "_enable_oujump", True),
         )
-
-    def _train_window_range_model_isolated(
-        self,
-        train_df: pd.DataFrame,
-        symbol: str,
-        window_id: int,
-        max_hold_days: int,
-        threshold_pct: float,
-        _timeout: int = 480,
-    ) -> "tuple[Any | None, str, float]":
-        """Train RangePredictor with statistical models in a spawn-isolated subprocess.
-
-        Statistical model fitting (MS-GARCH EM, OU-Kou-GARCH MLE) consumes
-        numpy/scipy global RNG state.  Running this in a `spawn` subprocess
-        guarantees the parent process RNG — used by Optuna's TPE sampler — is
-        completely unaffected by statistical model training (Exp 17 fix for
-        Problem 1: RNG contamination documented in P31/P32).
-
-        Fallback chain on subprocess failure:
-          1. Timeout (> _timeout seconds) → fall back to ML-only in-process training
-          2. OOM kill (exit code -9) → same fallback
-          3. Any other exception → same fallback, log reason
-
-        The fallback never raises; it always returns a valid (predictor, status,
-        threshold) tuple so the window continues without a statistical ensemble.
-        """
-        enable_msgarch = getattr(self, "_enable_msgarch", True)
-        enable_oujump  = getattr(self, "_enable_oujump",  True)
-
-        # If no statistical models are requested, skip subprocess overhead.
-        if not enable_msgarch and not enable_oujump:
-            return self._train_window_range_model_inprocess(
-                train_df, symbol, window_id, max_hold_days, threshold_pct,
-                enable_msgarch=False, enable_oujump=False,
-            )
-
-        ctx = _mp.get_context("spawn")
-        queue: "_mp.Queue" = ctx.Queue()
-
-        proc = ctx.Process(
-            target=_range_model_worker,
-            args=(
-                queue,
-                train_df,
-                symbol,
-                window_id,
-                max_hold_days,
-                threshold_pct,
-                self._db_path,
-                self._table_prefix,
-                enable_msgarch,
-                enable_oujump,
-            ),
-            daemon=True,
-        )
-
-        proc.start()
-        proc.join(timeout=_timeout)
-
-        if proc.is_alive():
-            proc.terminate()
-            proc.join(timeout=5)
-            queue.close()
-            queue.join_thread()
-            log.warning(
-                "range_model_subprocess_timeout",
-                window=window_id, symbol=symbol,
-                timeout_s=_timeout,
-                action="falling back to ML-only in-process training",
-            )
-            return self._train_window_range_model_inprocess(
-                train_df, symbol, window_id, max_hold_days, threshold_pct,
-                enable_msgarch=False, enable_oujump=False,
-            )
-
-        exit_code = proc.exitcode
-        if exit_code != 0:
-            queue.close()
-            queue.join_thread()
-            log.warning(
-                "range_model_subprocess_failed",
-                window=window_id, symbol=symbol,
-                exit_code=exit_code,
-                action="falling back to ML-only in-process training",
-            )
-            return self._train_window_range_model_inprocess(
-                train_df, symbol, window_id, max_hold_days, threshold_pct,
-                enable_msgarch=False, enable_oujump=False,
-            )
-
-        try:
-            result = queue.get_nowait()
-        except Exception:
-            log.warning(
-                "range_model_subprocess_empty_queue",
-                window=window_id, symbol=symbol,
-                action="falling back to ML-only in-process training",
-            )
-            queue.close()
-            queue.join_thread()
-            return self._train_window_range_model_inprocess(
-                train_df, symbol, window_id, max_hold_days, threshold_pct,
-                enable_msgarch=False, enable_oujump=False,
-            )
-
-        # Explicit queue cleanup prevents semaphore leaks on macOS (resource_tracker
-        # warning: "leaked semaphore objects"). Queue uses a background thread +
-        # OS semaphore that must be released before the Queue goes out of scope.
-        queue.close()
-        queue.join_thread()
-
-        rp, status, thr = result
-        if status == "ok" and rp is not None:
-            avg_acc = (
-                sum(rp.fitted_weights.values()) / len(rp.fitted_weights)
-                if rp.fitted_weights else 0.0
-            )
-            log.info(
-                "window_range_model_trained",
-                window=window_id, symbol=symbol,
-                mode="isolated_subprocess",
-                accuracy=f"{avg_acc:.3f}",
-                threshold_pct=f"{threshold_pct:.3f}",
-                fitted_weights=rp.fitted_weights,
-            )
-        else:
-            log.warning(
-                "range_model_train_failed",
-                window=window_id, symbol=symbol,
-                error=status,
-                threshold_pct=f"{threshold_pct:.3f}",
-                action="OOS IC entries will be blocked — no range gate available",
-            )
-
-        return rp, status, thr
 
     def _train_window_range_model_inprocess(
         self,
@@ -2424,13 +1950,12 @@ class WalkForwardBacktester:
         window_id: int,
         max_hold_days: int,
         threshold_pct: float,
-        enable_msgarch: bool = False,
-        enable_oujump: bool = False,
     ) -> "tuple[Any | None, str, float]":
-        """In-process fallback: trains ML models only (no statistical members).
+        """Train the ML-only (XGB/LGBM) range model in-process.
 
-        Used when subprocess isolation fails or statistical models are disabled.
-        Never contaminates parent RNG when statistical models are disabled.
+        R12-C: the spawn-isolated variant and the MS-GARCH/OU statistical
+        members are retired (deprecated/research/); ML-only training does not
+        touch the numpy/scipy global RNG that Optuna's sampler depends on.
         """
         try:
             from ait.ml.range_predictor import RESEARCH_MODEL_DIR, RangePredictor
@@ -2443,9 +1968,6 @@ class WalkForwardBacktester:
             rp = RangePredictor(
                 threshold_pct=threshold_pct,
                 horizon_days=max_hold_days,
-                enable_garch=False,
-                enable_msgarch=enable_msgarch,
-                enable_oujump=enable_oujump,
                 # R7/R10 artifact hygiene: research runs save under
                 # models/research/ — NEVER the live models/range.pkl.
                 model_dir=RESEARCH_MODEL_DIR,

@@ -284,13 +284,64 @@ class StateManager:
                 ),
             )
 
-    def update_trade_status(self, trade_id: str, status: TradeStatus) -> None:
-        """Update the status of an existing trade without touching journaling columns."""
+    def update_trade_status(
+        self,
+        trade_id: str,
+        status: TradeStatus,
+        from_statuses=None,
+    ) -> bool:
+        """Update the status of an existing trade without touching journaling columns.
+
+        R12 Tier-A #1: when ``from_statuses`` is given this delegates to the
+        compare-and-swap :meth:`transition` (the write only lands if the row
+        is currently in one of those statuses). The unconditional form remains
+        ONLY for legacy callers outside the executor/reconciler; every status
+        writer in the execution layer must pass a from-set or call
+        transition() directly.
+        """
+        if from_statuses is not None:
+            return self.transition(trade_id, from_statuses, status)
         with sqlite3.connect(self._db_path) as conn:
             conn.execute(
                 "UPDATE trades SET status = ? WHERE trade_id = ?",
                 (status.value, trade_id),
             )
+        return True
+
+    def transition(self, trade_id: str, from_statuses, to_status: TradeStatus) -> bool:
+        """R12 Tier-A #1 (concurrency audit, NAIVE state-machine verdict):
+        compare-and-swap status writer. Six call sites used to do blind
+        UPDATEs, making illegal edges reachable: CLOSING->FILLED after a
+        restart (duplicate close -> position REVERSAL), CLOSED resurrection,
+        PARTIAL->FILLED quantity loss. The UPDATE only lands when the row is
+        currently in one of ``from_statuses``; a blocked write is logged and
+        reported so the caller can react instead of silently corrupting state.
+
+        Returns True iff exactly one row transitioned.
+        """
+        froms = [
+            s.value if isinstance(s, TradeStatus) else str(s)
+            for s in (from_statuses if not isinstance(from_statuses, (str, TradeStatus))
+                      else [from_statuses])
+        ]
+        to_val = to_status.value if isinstance(to_status, TradeStatus) else str(to_status)
+        placeholders = ", ".join("?" for _ in froms)
+        with sqlite3.connect(self._db_path) as conn:
+            cur = conn.execute(
+                f"UPDATE trades SET status = ? "
+                f"WHERE trade_id = ? AND status IN ({placeholders})",
+                (to_val, trade_id, *froms),
+            )
+            rowcount = cur.rowcount
+        if rowcount == 1:
+            return True
+        log.warning(
+            "illegal_transition_blocked",
+            trade_id=trade_id,
+            from_statuses=froms,
+            to_status=to_val,
+        )
+        return False
 
     def close_trade(
         self,
@@ -299,8 +350,16 @@ class StateManager:
         realized_pnl: float,
         commission: float = 0.0,
         exit_reason_detailed: str = "",
-    ) -> None:
-        """Mark a trade as closed with exit details and journaling data."""
+    ) -> bool:
+        """Mark a trade as closed with exit details and journaling data.
+
+        R12 Tier-A #1: the close is a compare-and-swap from an OPEN status
+        (PENDING/FILLED/PARTIAL/CLOSING) only. A trade that is already CLOSED
+        (or CANCELLED/REJECTED) is refused — a second close used to overwrite
+        the real exit data AND dual-write a duplicate row into the DuckDB
+        analytics store (double-counted P&L). Returns True iff the close
+        landed.
+        """
         now = datetime.now().isoformat()
 
         # Compute journaling fields
@@ -309,18 +368,30 @@ class StateManager:
         # Calculate time to peak (from entry to when HWM was set)
         time_to_peak_hours = 0.0
 
+        _open = (TradeStatus.PENDING.value, TradeStatus.FILLED.value,
+                 TradeStatus.PARTIAL.value, TradeStatus.CLOSING.value)
         with sqlite3.connect(self._db_path) as conn:
-            conn.execute(
+            cur = conn.execute(
                 """UPDATE trades
                    SET status = ?, exit_time = ?, exit_price = ?,
                        realized_pnl = ?, commission = ?,
                        exit_reason_detailed = ?, peak_pnl_pct = ?,
                        time_to_peak_hours = ?
-                   WHERE trade_id = ?""",
+                   WHERE trade_id = ? AND status IN (?, ?, ?, ?)""",
                 (TradeStatus.CLOSED.value, now, exit_price, realized_pnl,
                  commission, exit_reason_detailed, peak_pnl_pct,
-                 time_to_peak_hours, trade_id),
+                 time_to_peak_hours, trade_id, *_open),
             )
+            if cur.rowcount != 1:
+                # R12 Tier-A #1: double-close / close-of-terminal blocked.
+                log.warning(
+                    "illegal_transition_blocked",
+                    trade_id=trade_id,
+                    from_statuses=list(_open),
+                    to_status=TradeStatus.CLOSED.value,
+                    context="close_trade",
+                )
+                return False
 
             # Clean up open_positions row now that trade is closed
             conn.execute(
@@ -339,6 +410,7 @@ class StateManager:
                         self._duck.ingest_trade(dict(row))
                 except Exception as e:
                     log.warning("duckdb_trade_sync_failed", trade_id=trade_id, error=str(e))
+        return True  # R12 Tier-A #1: close landed (CAS matched an open status)
 
     def insert_open_position(
         self,

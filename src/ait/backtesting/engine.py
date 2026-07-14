@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from ait.backtesting.options_sim import (
+from ait.backtesting.pricing import (
     OptionType,
     black_scholes_price,
     find_strike_by_delta,
@@ -70,7 +70,6 @@ class Backtester:
         hurst_regime_penalty: float = 0.10,
         hurst_hard_veto_multiplier: float = 1.5,
         multifractal_max_width: float = 0.50,
-        aekf_veto_threshold: float = 0.60,
         iv_rank_rise_threshold: float = 0.30,
         pct_from_60d_high_threshold: float = -1.0,
         min_edge_over_baseline: float = 0.05,
@@ -146,7 +145,6 @@ class Backtester:
         self._hurst_regime_penalty = hurst_regime_penalty
         self._hurst_hard_veto_multiplier = hurst_hard_veto_multiplier
         self._multifractal_max_width = multifractal_max_width
-        self._aekf_veto_threshold = aekf_veto_threshold
         self._iv_rank_rise_threshold = iv_rank_rise_threshold
         self._pct_from_60d_high_threshold = pct_from_60d_high_threshold
         self._min_edge_over_baseline = min_edge_over_baseline
@@ -495,31 +493,9 @@ class Backtester:
                         )
                         continue
 
-            # AEKF direction veto: if the OU-Kou-GARCH AEKF produces a high-confidence
-            # directional drift signal, the market is trending — skip iron condor entry.
-            # Signal values are always logged (not just on veto) for threshold tuning.
-            if strategy in ("iron_condor", "short_strangle") and self._range_predictor is not None:
-                try:
-                    sym_data = (getattr(self._range_predictor, "_symbol_models", {}) or {}).get(self._symbol, {})
-                    _ou_dir  = (sym_data.get("ou_jump_state") or {}).get("ou_jump_direction")
-                    _ou_conf = (sym_data.get("ou_jump_state") or {}).get("ou_jump_confidence") or 0.0
-                    _entry_decision["aekf_signal"] = {
-                        "direction": _ou_dir,
-                        "confidence": round(float(_ou_conf), 4) if _ou_dir is not None else None,
-                    }
-                    if _ou_dir is not None and float(_ou_conf) >= self._aekf_veto_threshold:
-                        _entry_decision["aekf_veto"] = {"direction": _ou_dir, "confidence": round(float(_ou_conf), 4)}
-                        log.debug(
-                            "aekf_veto_fired",
-                            component="backtesting.engine",
-                            strategy=strategy,
-                            ou_direction=_ou_dir,
-                            ou_confidence=round(float(_ou_conf), 4),
-                            threshold=self._aekf_veto_threshold,
-                        )
-                        continue
-                except Exception:
-                    pass
+            # R12-C: AEKF (OU-Kou-GARCH) direction veto removed — the GARCH
+            # family moved to deprecated/research/ and RangePredictor no longer
+            # produces ou_jump_state, so the veto could never fire again.
 
             # Rising IV rank filter: if IV rank has risen by more than iv_rank_rise_threshold
             # over the last 10 days, market is in directional stress — skip iron condor entry.
@@ -651,8 +627,8 @@ class Backtester:
                     "iv_rank":             round(float(last_f.get("iv_rank", 0.0)), 3),
                     "vix_level":           round(float(last_f.get("vix_level", 0.0)), 2),
                     "hurst_wavelet":       round(float(last_f.get("hurst_wavelet", 0.0)), 3),
-                    "sentiment_composite": round(float(last_f.get("sentiment_composite", 0.0)), 3),
-                    "put_call_ratio":      round(float(last_f.get("put_call_ratio", 1.0)), 3),
+                    # R12-C: sentiment_composite / put_call_ratio dropped with
+                    # the sentiment/flow feature retirement (constant columns).
                 }
             else:
                 pos["entry_regime"] = "range_bound"  # default when history too short
@@ -930,16 +906,8 @@ class Backtester:
             return True, first + 1, fill_ts
         return False, min(len(session_bars), timeout_bars), None
 
-    def _load_directional_model(self):
-        """Try to load the directional model for small account trading."""
-        try:
-            from ait.ml.directional import DirectionalModel
-            model = DirectionalModel()
-            if model.load():
-                return model
-        except Exception:
-            pass
-        return None
+    # R12-C: _load_directional_model removed — no callers; DirectionalModel
+    # retired to deprecated/src/directional.py.
 
     def _get_direction(
         self,

@@ -4,6 +4,22 @@ from __future__ import annotations
 
 import pytest
 
+
+def pytest_configure(config: pytest.Config) -> None:
+    """R12: marker registration. CANONICAL registration lives in pyproject
+    [tool.pytest.ini_options] markers; this mirror only keeps local runs
+    warning-clean if pyproject and tests land out of order (duplicate
+    registration is harmless)."""
+    config.addinivalue_line(
+        "markers",
+        "ibkr: live tests requiring IB Gateway on 127.0.0.1:4002 (run with -m ibkr)",
+    )
+    config.addinivalue_line(
+        "markers",
+        "slow: long-running suites (walkforward, optimizer, training); "
+        "excluded from the default selection, run nightly with -m slow",
+    )
+
 from ait.config.settings import (
     AccountConfig,
     MLConfig,

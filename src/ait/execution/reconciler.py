@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from ait.broker.ibkr_client import IBKRClient
@@ -31,6 +31,11 @@ class ReconciliationResult:
     stale_local: int  # Local positions not found in IBKR
     discrepancies: list[str]  # Human-readable descriptions
     promoted: int = 0  # PENDING/CLOSING trades found live in IBKR -> FILLED
+    # R12 F4.1: CLOSING trades KEPT closing because a working close order
+    # still exists at the broker: trade_id -> broker orderId. The
+    # orchestrator must call executor.adopt_exit_order(order_id, trade_id,
+    # reason) for each so the exit tracker survives the restart.
+    closing_exit_orders: dict[str, int] = field(default_factory=dict)
 
 
 class PositionReconciler:
@@ -188,6 +193,68 @@ class PositionReconciler:
             log.warning("live_leg_keys_failed", error=str(e))
             return None
 
+    # R12 F4.1: orderStatus values that mean "still working at the broker".
+    # Unknown/empty statuses are treated as working — the safe direction is
+    # keeping a CLOSING trade CLOSING (self-heals via the adopted tracker's
+    # stale/zombie handling) rather than promoting past a live close order.
+    _WORKING_ORDER_STATUSES = {
+        "pendingsubmit", "apipending", "presubmitted", "submitted", "",
+    }
+
+    async def _fetch_working_orders(self) -> list[tuple[int, set[str], str]] | None:
+        """R12 F4.1: working orders at the broker as (orderId, keys, symbol).
+
+        Keys are leg position-keys for plain option orders; combo (BAG)
+        orders only expose leg conIds, so they match at symbol level via the
+        "SYMBOL:BAG" marker. Uses reqAllOpenOrders (all clientIds) so exit
+        orders placed by a previous session/clientId are seen. Returns None
+        when the broker view is unavailable (callers must then NOT promote
+        CLOSING trades — unknown is not "no working order").
+        """
+        try:
+            if hasattr(self._ibkr, "get_all_open_trades"):
+                trades = await self._ibkr.get_all_open_trades()
+            else:  # pragma: no cover — legacy client without the helper
+                trades = self._ibkr.get_open_orders()
+            if trades is None:
+                return None
+            entries: list[tuple[int, set[str], str]] = []
+            for t in trades:
+                status = str(getattr(t.orderStatus, "status", "") or "").lower()
+                if status not in self._WORKING_ORDER_STATUSES:
+                    continue
+                c = t.contract
+                keys: set[str] = set()
+                sec_type = str(getattr(c, "secType", "") or "")
+                if sec_type == "OPT":
+                    keys.add(self._make_position_key(
+                        symbol=c.symbol, strike=c.strike, right=c.right,
+                        expiry=c.lastTradeDateOrContractMonth))
+                elif sec_type == "BAG":
+                    keys.add(f"{c.symbol}:BAG")
+                else:
+                    keys.add(f"{c.symbol}:STK")
+                entries.append((int(t.order.orderId or 0), keys, str(c.symbol)))
+            return entries
+        except Exception as e:  # noqa: BLE001
+            log.warning("working_orders_fetch_failed", error=str(e))
+            return None
+
+    def _working_exit_order_for(
+        self, trade, working: list[tuple[int, set[str], str]]
+    ) -> int | None:
+        """R12 F4.1: orderId of a working order touching this trade's legs
+        (leg-key match for plain options; symbol match for BAG combos —
+        combo legs are opaque conIds at this layer, and keeping CLOSING on a
+        same-symbol combo is the safe direction)."""
+        trade_keys = self._trade_leg_keys(trade)
+        for order_id, keys, symbol in working:
+            if not keys.isdisjoint(trade_keys):
+                return order_id
+            if f"{symbol}:BAG" in keys and symbol == trade.symbol:
+                return order_id
+        return None
+
     def _sweep_stale_pending(self) -> int:
         """Close PENDING trades too old to still be live working orders.
 
@@ -222,7 +289,10 @@ class PositionReconciler:
             for t, age_min in stale:
                 if not self._trade_leg_keys(t).isdisjoint(live_keys):
                     # Legs live at the broker — the order FILLED. Rescue it.
-                    self._state.update_trade_status(t.trade_id, TradeStatus.FILLED)
+                    # R12 Tier-A #1: CAS PENDING->FILLED (a concurrent writer
+                    # may have moved the trade since get_open_trades()).
+                    self._state.transition(
+                        t.trade_id, (TradeStatus.PENDING,), TradeStatus.FILLED)
                     log.warning("sweep_promoted_filled_pending",
                                 trade_id=t.trade_id, symbol=t.symbol,
                                 strategy=t.strategy, age_min=int(age_min))
@@ -298,6 +368,15 @@ class PositionReconciler:
             discrepancies=[],
         )
 
+        # R12 F4.1: broker working orders are needed BEFORE promoting any
+        # CLOSING trade — a live close order means the exit is in flight, and
+        # promoting past it re-triggers a second close (fills of both =
+        # position REVERSAL). Fetched once, and only when a CLOSING trade
+        # exists locally.
+        working_orders: list[tuple[int, set[str], str]] | None = None
+        if any(t.status == TradeStatus.CLOSING for t in local_trades):
+            working_orders = await self._fetch_working_orders()
+
         # Check IBKR positions against local state
         promoted_ids: set[str] = set()
         for key, ibkr_pos in ibkr_map.items():
@@ -310,15 +389,58 @@ class PositionReconciler:
                 # FILLED so the portfolio monitor manages it (check_positions
                 # only evaluates FILLED/PARTIAL).
                 for local_trade in matching_trades:
-                    if (local_trade.status in (TradeStatus.PENDING, TradeStatus.CLOSING)
-                            and local_trade.trade_id not in promoted_ids):
-                        self._state.update_trade_status(local_trade.trade_id, TradeStatus.FILLED)
-                        promoted_ids.add(local_trade.trade_id)
-                        result.promoted += 1
-                        log.warning("reconcile_promoted_to_filled",
-                                    trade_id=local_trade.trade_id, symbol=local_trade.symbol,
-                                    strategy=local_trade.strategy,
-                                    prior_status=local_trade.status.value)
+                    if local_trade.trade_id in promoted_ids:
+                        continue
+                    if local_trade.trade_id in result.closing_exit_orders:
+                        continue  # already resolved as kept-CLOSING
+                    if local_trade.status == TradeStatus.PENDING:
+                        # R12 Tier-A #1: CAS PENDING->FILLED.
+                        if self._state.update_trade_status(
+                                local_trade.trade_id, TradeStatus.FILLED,
+                                from_statuses=(TradeStatus.PENDING,)):
+                            promoted_ids.add(local_trade.trade_id)
+                            result.promoted += 1
+                            log.warning("reconcile_promoted_to_filled",
+                                        trade_id=local_trade.trade_id,
+                                        symbol=local_trade.symbol,
+                                        strategy=local_trade.strategy,
+                                        prior_status=local_trade.status.value)
+                    elif local_trade.status == TradeStatus.CLOSING:
+                        # R12 F4.1: only promote CLOSING->FILLED when NO
+                        # working order exists on the trade's legs. If one
+                        # does (or the broker view is unavailable), keep
+                        # CLOSING and report the orderId so the orchestrator
+                        # re-registers the exit tracker via
+                        # executor.adopt_exit_order().
+                        _oid = (self._working_exit_order_for(local_trade, working_orders)
+                                if working_orders else None)
+                        if _oid is not None:
+                            result.closing_exit_orders[local_trade.trade_id] = _oid
+                            log.warning("reconcile_closing_kept_working_order",
+                                        trade_id=local_trade.trade_id,
+                                        symbol=local_trade.symbol,
+                                        order_id=_oid)
+                        elif working_orders is None:
+                            # Unknown broker order state — promoting could
+                            # duplicate a live close. Keep CLOSING; the next
+                            # reconcile retries with a working broker view.
+                            result.discrepancies.append(
+                                f"CLOSING trade {local_trade.trade_id} kept: "
+                                f"broker open-order view unavailable")
+                            log.warning("reconcile_closing_kept_orders_unknown",
+                                        trade_id=local_trade.trade_id,
+                                        symbol=local_trade.symbol)
+                        else:
+                            if self._state.transition(
+                                    local_trade.trade_id,
+                                    (TradeStatus.CLOSING,), TradeStatus.FILLED):
+                                promoted_ids.add(local_trade.trade_id)
+                                result.promoted += 1
+                                log.warning("reconcile_promoted_to_filled",
+                                            trade_id=local_trade.trade_id,
+                                            symbol=local_trade.symbol,
+                                            strategy=local_trade.strategy,
+                                            prior_status=local_trade.status.value)
                 # Check quantity matches
                 local_qty = sum(abs(t.quantity) for t in matching_trades)
                 if abs(ibkr_pos["quantity"]) != local_qty:
@@ -361,6 +483,16 @@ class PositionReconciler:
                     self._untracked_sightings[key] = _now
                     _gap_min = (_now - _prev).total_seconds() / 60 if _prev else None
                     if _gap_min is None or _gap_min < 2 or _gap_min > 480:
+                        # R12 F3.1/chaos#4B follow-through: the debounce was
+                        # meant to delay the FREEZE, but it also swallowed the
+                        # discrepancy — the EOD recon Telegram reported 0
+                        # BREAKS on the day an untracked option first showed.
+                        # Report the break same-day; only the HALT file still
+                        # waits for the second sighting.
+                        result.discrepancies.append(
+                            f"UNTRACKED OPTION POSITION (1st sighting, freeze "
+                            f"deferred): {key}, qty={ibkr_pos['quantity']} — "
+                            f"freezes if still present next reconcile")
                         log.warning("untracked_option_first_sighting_debounced",
                                     position=key, qty=ibkr_pos["quantity"],
                                     note="will freeze if still present next reconcile")

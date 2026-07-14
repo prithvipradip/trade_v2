@@ -378,7 +378,11 @@ class VolMagnitudePredictor:
         if features.empty:
             return None
 
-        X = features[feature_names].iloc[[-1]]
+        # reindex+fill (not direct indexing): an artifact trained before the
+        # R12-C feature retirement lists sentiment/flow columns FeatureEngine
+        # no longer produces. Constant in training -> 0.0 fill is exact for
+        # the tree ensemble (same pattern as ensemble.predict).
+        X = features.reindex(columns=feature_names).fillna(0.0).iloc[[-1]]
         try:
             X_scaled = pd.DataFrame(
                 scaler.transform(X.values), columns=feature_names,

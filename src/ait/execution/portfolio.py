@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
@@ -291,8 +292,15 @@ class PortfolioManager:
             # the wings already cap the true tail. No breakeven tier, no
             # trailing, no vol adjustment. Take-profit tiers unchanged.
             import os as _os_x
-            _loss_mult = float(_os_x.environ.get("AIT_CREDIT_LOSS_LIMIT", "1.25"))
-            effective_stop = -_loss_mult
+            # R12-B1 (evidence backtest, 17mo walk-forward, 26 matched
+            # trades): flat credit stops fired THROUGH their trigger on gaps
+            # (-1.25x trigger realized -2.01x in the worked example) and every
+            # flat level underperformed both no-stop and touch-close
+            # (touch +$756/PF 1.38 > none -$24 > 1.25x -$134 > 2.0x -$1,067).
+            # Default 0 = flat stop DISABLED; short-strike-touch close (rule
+            # 1b below) is the early loss exit; the wings cap the tail.
+            _loss_mult = float(_os_x.environ.get("AIT_CREDIT_LOSS_LIMIT", "0"))
+            effective_stop = -_loss_mult if _loss_mult > 0 else -999.0
         else:
             # Volatility-adjusted stops (debit structures only): widen stops
             # for high-volatility underlyings
@@ -316,6 +324,27 @@ class PortfolioManager:
 
         # 1. Dynamic stop loss (trailing/breakeven) — needs real marks: a
         # marks-missing pnl_pct of 0.0 would spuriously trip a breakeven stop
+        #
+        # R12-B POST-STOP COOLDOWN — NEEDS THE ORCHESTRATOR (flagged for main
+        # thread; this file only evaluates exits, it cannot see entries).
+        # Evidence: the existing re-entry cooldown (orchestrator GUARD #2,
+        # ~line 1609) keys on ENTRY time — a symbol stopped out this scan can
+        # re-enter NEXT scan into the same trend that just stopped it.
+        # Spec: in orchestrator._should_skip_signal (GUARD #2 block), ALSO
+        # skip when a recent stop-out exists keyed on EXIT time, duration
+        # 1 TRADING day (exit_time's next trading session must have STARTED
+        # before re-entry). Exact query against bot_state.db:
+        #   SELECT COUNT(*) FROM trades
+        #    WHERE symbol = :symbol
+        #      AND status = 'CLOSED'
+        #      AND (exit_reason_detailed LIKE '%stop_loss%'
+        #           OR notes LIKE '%stop_loss%')
+        #      AND exit_time >= :cutoff_iso
+        # where :cutoff_iso = start (09:30 ET) of the PREVIOUS trading day if
+        # now is during RTH, i.e. block while exit_time falls within the
+        # current or immediately preceding trading session; weekends/holidays
+        # via the existing market-calendar helper. Non-zero count -> skip
+        # with log tag "post_stop_cooldown_skip".
         if not marks_missing and pnl_pct <= effective_stop:
             should_exit = True
             if hwm >= breakeven_trigger and effective_stop >= 0:
@@ -324,6 +353,38 @@ class PortfolioManager:
                 exit_reason = f"breakeven_stop (P&L: {pnl_pct:.1%}, peak: {hwm:.1%})"
             else:
                 exit_reason = f"stop_loss (P&L: {pnl_pct:.1%})"
+
+        # 1b. R12-B1: short-strike TOUCH close for credit structures — the
+        # evidence-backed early loss exit (avg loss at touch 0.475x credit,
+        # matching the audit's 0.49x; only 1 of 7 touched trades recovered).
+        # Uses the UNDERLYING price, so it protects even when option marks
+        # are missing. Env AIT_CREDIT_TOUCH_STOP=0 disables.
+        if (not should_exit and is_credit
+                and os.environ.get("AIT_CREDIT_TOUCH_STOP", "1") == "1"):
+            try:
+                import json as _json
+                _legs = _json.loads(trade.legs) if trade.legs else []
+                _short_put = max((float(l["strike"]) for l in _legs
+                                  if str(l.get("action", "")).upper() == "SELL"
+                                  and str(l.get("right", l.get("type", ""))).upper().startswith("P")),
+                                 default=None)
+                _short_call = min((float(l["strike"]) for l in _legs
+                                   if str(l.get("action", "")).upper() == "SELL"
+                                   and str(l.get("right", l.get("type", ""))).upper().startswith("C")),
+                                  default=None)
+                if _short_put or _short_call:
+                    _spot = await self._market_data.get_current_price(trade.symbol)
+                    if _spot:
+                        if _short_put and _spot <= _short_put:
+                            should_exit = True
+                            exit_reason = (f"short_strike_touch (spot {_spot:.2f} "
+                                           f"<= put {_short_put:.2f})")
+                        elif _short_call and _spot >= _short_call:
+                            should_exit = True
+                            exit_reason = (f"short_strike_touch (spot {_spot:.2f} "
+                                           f">= call {_short_call:.2f})")
+            except Exception as _e:  # noqa: BLE001 — protection, never a crash source
+                log.debug("touch_check_failed", trade_id=trade.trade_id, error=str(_e))
 
         # 2. Take profit (time-decay adjusted) — needs real marks
         elif not marks_missing and not is_credit and pnl_pct >= take_profit_long:
@@ -358,6 +419,12 @@ class PortfolioManager:
                 exit_reason = f"expiry_approaching (DTE: {dte})"
 
         # 3a. Time decay — close other positions with 5 or fewer DTE
+        # R12-B GUARD (cadence): the entry-DTE floor is CONFIG-side
+        # (options.dte_range min raised 7 -> 14; 7-DTE entries were 2-day
+        # churn, best case ~60% cost-dominated). This DTE<=5 forced exit plus
+        # the 14-DTE entry floor implies every position gets >=9 calendar
+        # days of theta runway — do NOT lower dte_range[0] below ~10 without
+        # revisiting this exit, or entries become forced-exit churn again.
         elif dte is not None and dte <= 5:
             should_exit = True
             exit_reason = f"expiry_approaching (DTE: {dte})"
@@ -501,6 +568,37 @@ class PortfolioManager:
 
         As DTE decreases, we lower the target to capture profit
         before theta accelerates.
+
+        R12-B RESTING GTC TAKE-PROFIT — NEEDS EXECUTOR/ORCHESTRATOR (flagged
+        for main thread; deliberately NOT implemented here — this module is
+        the synthetic monitor, order placement lives in executor.py).
+        Evidence: synthetic TP exits currently cross ask+$0.10, surrendering
+        6-17% of each win; a resting broker-side order also survives bot
+        death and monitor blindness (marks-missing outages).
+        Spec:
+          1. On entry fill (executor confirms the BAG entry), place a GTC
+             BAG LIMIT order to CLOSE the combo at price
+             credit * (1 - tp_tier(dte)), tp_tier from the table below
+             (0.50/0.40/0.30/0.20). Record its orderId on the trade row.
+          2. At tier transitions (DTE crossing 20, 10, 5), cancel-and-replace
+             the GTC at the new tier price (orchestrator daily tick).
+          3. Cancel the resting GTC whenever ANY other exit path fires
+             (stop, DTE close, assignment risk, delta breach, earnings/macro
+             flatten, manual) BEFORE placing that exit order.
+        SAFETY ANALYSIS (double-fill): both the resting GTC and a synthetic
+        exit can be in flight simultaneously — if the GTC fills while a
+        synthetic exit order is working (or vice versa) the second fill
+        REVERSES the position (short condor -> long condor), the exact class
+        of bug as the CLOSING->FILLED duplicate-close in Tier A1. Therefore
+        the synthetic exit path MUST, before placing any exit order:
+          (a) check the trade row for a resting TP orderId;
+          (b) request its status — if Filled/PendingSubmit-with-fills, do NOT
+              place the synthetic exit (the TP already closed the position);
+          (c) otherwise cancel the GTC, CONFIRM the cancel ack, then place
+              the synthetic exit;
+          (d) startup reconcile must rebuild the resting-TP map from broker
+              open orders (survives restarts; ties into Tier A1's tracker
+              rebuild).
         """
         if not self._exit_config.time_decay_scaling or dte is None:
             return 1.0, 0.50  # Default: +100% long, +50% short

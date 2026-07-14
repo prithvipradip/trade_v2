@@ -92,6 +92,66 @@ class OptionContract:
         return self.volume >= min_vol and oi_ok and self.spread_pct < max_spread
 
 
+def atm_iv(chain: "OptionsChain") -> float:
+    """ATM implied vol interpolated at the two strikes bracketing spot.
+
+    R12-B (vol agent): the flat-0.20 IV fallback in wing sizing produced
+    +/-50% wing-width errors vs the chain's real ATM vol — every live chain
+    already carries the data to price the expected move, so extract it here
+    once and let strategies read it. Falls back to the median observed IV
+    (with a logged tag) when spot isn't bracketed by quoted-IV strikes.
+    Returns 0.0 only when the chain has no usable IV at all.
+    """
+    spot = chain.underlying_price
+    # Per-strike IV: average call+put IV when both quote at a strike.
+    by_strike: dict[float, list[float]] = {}
+    for grp in (chain.calls, chain.puts):
+        for c in grp:
+            if c.implied_vol and c.implied_vol > 0:
+                by_strike.setdefault(float(c.strike), []).append(float(c.implied_vol))
+    if not by_strike:
+        log.warning("atm_iv_unavailable", symbol=chain.symbol, tag="no_iv_data")
+        return 0.0
+
+    ivs = {k: sum(v) / len(v) for k, v in by_strike.items()}
+    lower = max((s for s in ivs if s <= spot), default=None)
+    upper = min((s for s in ivs if s >= spot), default=None)
+
+    if lower is not None and upper is not None:
+        if upper == lower:
+            return ivs[lower]
+        w = (spot - lower) / (upper - lower)
+        return ivs[lower] * (1.0 - w) + ivs[upper] * w
+
+    # Spot outside the quoted-IV strike ladder — median fallback, tagged so
+    # entry-quality telemetry can distinguish interpolated from degraded IV.
+    med_vals = sorted(ivs.values())
+    med = med_vals[len(med_vals) // 2]
+    log.warning(
+        "atm_iv_fallback", symbol=chain.symbol, tag="median_iv_no_bracket",
+        value=round(med, 4), spot=spot,
+    )
+    return med
+
+
+def expected_move(chain: "OptionsChain", spot: float | None = None) -> float:
+    """1-sigma expected move to the chain expiry: spot * atm_iv * sqrt(dte/365).
+
+    R12-B: the sanity yardstick for short-strike placement (the 07-07 SPY
+    condor filled its short call at 0.49 delta — ~0 expected moves from spot
+    — and no gate noticed). Uses the chain's own expiry for DTE.
+    """
+    import math
+
+    if spot is None:
+        spot = chain.underlying_price
+    iv = chain.atm_iv if getattr(chain, "atm_iv", 0.0) > 0 else atm_iv(chain)
+    if iv <= 0 or spot <= 0:
+        return 0.0
+    dte = max((chain.expiry - date.today()).days, 0)
+    return spot * iv * math.sqrt(dte / 365.0)
+
+
 @dataclass
 class OptionsChain:
     """Full options chain for a symbol at a specific expiry."""
@@ -101,6 +161,19 @@ class OptionsChain:
     expiry: date
     calls: list[OptionContract]
     puts: list[OptionContract]
+    # R12-B: computed once on build (see __post_init__) so strategies read
+    # them off the chain without refetching or re-deriving vol.
+    atm_iv: float = 0.0
+    expected_move: float = 0.0
+
+    def __post_init__(self) -> None:
+        # R12-B: attach ATM IV + expected move to every chain at build time.
+        # Guarded so explicitly-passed values (e.g. filter_* copies carrying
+        # the FULL chain's values) are preserved.
+        if not self.atm_iv:
+            self.atm_iv = atm_iv(self)
+        if not self.expected_move:
+            self.expected_move = expected_move(self, self.underlying_price)
 
     @property
     def dte(self) -> int:
@@ -125,6 +198,10 @@ class OptionsChain:
             expiry=self.expiry,
             calls=[c for c in self.calls if min_delta <= abs(c.delta) <= max_delta],
             puts=[p for p in self.puts if min_delta <= abs(p.delta) <= max_delta],
+            # R12-B: carry the FULL chain's vol stats — recomputing from a
+            # delta-filtered (OTM-only) subset would bias ATM IV.
+            atm_iv=self.atm_iv,
+            expected_move=self.expected_move,
         )
 
     def filter_liquid(self, config: OptionsConfig) -> OptionsChain:
@@ -147,6 +224,9 @@ class OptionsChain:
                 and (p.open_interest <= 0 or p.open_interest >= config.min_open_interest)
                 and p.spread_pct <= config.max_bid_ask_spread_pct
             ],
+            # R12-B: carry the full chain's vol stats (see filter_by_delta).
+            atm_iv=self.atm_iv,
+            expected_move=self.expected_move,
         )
 
 

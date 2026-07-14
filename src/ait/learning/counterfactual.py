@@ -1,24 +1,19 @@
-"""Counterfactual analysis — tracks what would have happened with skipped trades.
+"""Counterfactual skip log — records signals the bot generated but rejected.
 
-When the bot rejects a signal (risk limits, meta-label, low confidence, etc.),
-we record it here. Later, we check what the actual outcome would have been.
-This helps identify:
-- Systematic missed opportunities (filter too aggressive)
-- Correctly avoided losses (filter working well)
-- Strategy-specific filter accuracy
-
-ADVISORY ONLY (R5 audit): nothing consumes this data automatically — it
-surfaces in the post-market log/Telegram report for a human to read. The
-"win" model is crude (underlying moved >2% in the skip direction, scored
-once after >=24h); it is NOT option-structure P&L and must not be treated
-as a P&L estimate.
+R12-C simplification (2026-07-13): the evaluation/analysis half
+(evaluate_outcomes / get_analysis / get_worst_filters) was deleted. Its
+outputs were twice ruled garbage — R7 found a units bug, R9 found the
+"filter accuracy" indistinguishable from base rate — and the crude
+underlying-moved-2% "win" model was never option-structure P&L. What
+remains is the durable record of taken-vs-vetoed signals (record_skip +
+JSON storage), which the post-market report and future analyses can read.
+The deleted logic is in git history (this file pre-R12) if ever wanted.
 """
 
 from __future__ import annotations
 
 import json
-from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -31,7 +26,13 @@ STATE_FILE = Path("data/counterfactual_log.json")
 
 @dataclass
 class SkippedTrade:
-    """A trade signal that was generated but not executed."""
+    """A trade signal that was generated but not executed.
+
+    The outcome fields (exit_price / hypothetical_pnl / would_have_won /
+    outcome_checked) are retained for on-disk compatibility with existing
+    data/counterfactual_log.json rows written before R12-C; nothing fills
+    them in anymore.
+    """
 
     timestamp: str
     symbol: str
@@ -40,7 +41,6 @@ class SkippedTrade:
     confidence: float
     entry_price: float
     reject_reason: str
-    # Filled in later when we check the outcome
     exit_price: float | None = None
     hypothetical_pnl: float | None = None
     would_have_won: bool | None = None
@@ -48,13 +48,7 @@ class SkippedTrade:
 
 
 class CounterfactualTracker:
-    """Tracks skipped trades and evaluates what would have happened.
-
-    Usage:
-    1. Call record_skip() when a signal is rejected
-    2. Call evaluate_outcomes() periodically to check actual prices
-    3. Call get_analysis() to see filter effectiveness
-    """
+    """Records skipped trades: call record_skip() when a signal is rejected."""
 
     def __init__(self, max_history: int = 500) -> None:
         self._skipped: list[SkippedTrade] = []
@@ -105,166 +99,9 @@ class CounterfactualTracker:
         )
         self._save_state()
 
-    def evaluate_outcomes(
-        self,
-        price_lookup: dict[str, float],
-        hold_return_threshold: float = 0.02,
-    ) -> int:
-        """Evaluate hypothetical outcomes for unchecked skipped trades.
-
-        Args:
-            price_lookup: {symbol: current_price} for each symbol
-            hold_return_threshold: Assume exit after this % move (default 2%)
-
-        Returns:
-            Number of outcomes evaluated.
-        """
-        evaluated = 0
-
-        for trade in self._skipped:
-            if trade.outcome_checked:
-                continue
-
-            current_price = price_lookup.get(trade.symbol)
-            if current_price is None or current_price <= 0:
-                continue
-            if not trade.entry_price or trade.entry_price <= 0:
-                trade.outcome_checked = True  # unevaluable -- do not retry forever
-                continue
-            # Min-age guard (deep-audit VL): skips evaluated minutes after
-            # the skip always scored ~0% move = "correct skip", inflating
-            # filter_accuracy. Wait at least 1 full day before judging.
-            try:
-                from datetime import datetime as _dt
-                _age_h = (_dt.now() - _dt.fromisoformat(trade.timestamp)).total_seconds() / 3600
-                if _age_h < 24:
-                    continue
-            except (ValueError, TypeError):
-                # R5 audit: falling through evaluated the record immediately —
-                # the exact ~0%-move "correct skip" inflation the min-age
-                # guard exists to prevent. Malformed timestamp = unevaluable.
-                trade.outcome_checked = True
-                continue
-
-            # Simple model: would the direction have been correct?
-            price_change_pct = (current_price - trade.entry_price) / trade.entry_price
-
-            if trade.direction in ("bullish", "long"):
-                trade.would_have_won = price_change_pct > hold_return_threshold
-                trade.hypothetical_pnl = price_change_pct * trade.entry_price * 100  # per contract
-            elif trade.direction in ("bearish", "short"):
-                trade.would_have_won = price_change_pct < -hold_return_threshold
-                trade.hypothetical_pnl = -price_change_pct * trade.entry_price * 100
-            else:
-                # Neutral strategies — harder to evaluate
-                trade.would_have_won = abs(price_change_pct) < hold_return_threshold
-                trade.hypothetical_pnl = 0.0
-
-            trade.exit_price = current_price
-            trade.outcome_checked = True
-            evaluated += 1
-
-        if evaluated > 0:
-            self._save_state()
-            log.info("counterfactual_evaluated", count=evaluated)
-
-        return evaluated
-
-    def get_analysis(self) -> dict:
-        """Analyze counterfactual outcomes to measure filter effectiveness.
-
-        Returns a summary of how well our filters are working.
-        """
-        # R5 audit: outcome_checked includes unevaluable records
-        # (would_have_won None — credit strategies, bad prices, bad
-        # timestamps). Counting None as falsy made every unevaluable skip a
-        # "correct skip", inflating filter_accuracy toward 100%.
-        checked = [t for t in self._skipped
-                   if t.outcome_checked and t.would_have_won is not None]
-        if not checked:
-            return {
-                "total_skipped": len(self._skipped),
-                "evaluated": 0,
-                "filter_accuracy": 0.0,
-                "by_reason": {},
-                "by_strategy": {},
-            }
-
-        # Overall: how many skipped trades would have lost?
-        correct_skips = sum(1 for t in checked if not t.would_have_won)
-        filter_accuracy = correct_skips / len(checked) if checked else 0.0
-
-        # Break down by reject reason
-        by_reason: dict[str, dict] = defaultdict(lambda: {"total": 0, "would_won": 0, "would_lost": 0, "pnl": 0.0})
-        for t in checked:
-            r = by_reason[t.reject_reason]
-            r["total"] += 1
-            if t.would_have_won:
-                r["would_won"] += 1
-            else:
-                r["would_lost"] += 1
-            r["pnl"] += t.hypothetical_pnl or 0.0
-
-        # Break down by strategy
-        by_strategy: dict[str, dict] = defaultdict(lambda: {"total": 0, "would_won": 0, "would_lost": 0, "pnl": 0.0})
-        for t in checked:
-            s = by_strategy[t.strategy]
-            s["total"] += 1
-            if t.would_have_won:
-                s["would_won"] += 1
-            else:
-                s["would_lost"] += 1
-            s["pnl"] += t.hypothetical_pnl or 0.0
-
-        # Compute accuracy per reason
-        reason_stats = {}
-        for reason, data in by_reason.items():
-            reason_stats[reason] = {
-                **data,
-                "accuracy": data["would_lost"] / data["total"] if data["total"] > 0 else 0.0,
-            }
-
-        strategy_stats = {}
-        for strategy, data in by_strategy.items():
-            strategy_stats[strategy] = {
-                **data,
-                "accuracy": data["would_lost"] / data["total"] if data["total"] > 0 else 0.0,
-            }
-
-        total_missed_pnl = sum(t.hypothetical_pnl or 0 for t in checked if t.would_have_won)
-
-        return {
-            "total_skipped": len(self._skipped),
-            "evaluated": len(checked),
-            "filter_accuracy": filter_accuracy,
-            "correct_skips": correct_skips,
-            "missed_opportunities": len(checked) - correct_skips,
-            "total_missed_pnl": total_missed_pnl,
-            "by_reason": reason_stats,
-            "by_strategy": strategy_stats,
-        }
-
-    def get_worst_filters(self, min_observations: int = 5) -> list[dict]:
-        """Identify filters that are rejecting too many winning trades.
-
-        Returns reject reasons sorted by missed opportunity rate.
-        """
-        analysis = self.get_analysis()
-        worst = []
-
-        for reason, data in analysis.get("by_reason", {}).items():
-            if data["total"] >= min_observations:
-                miss_rate = data["would_won"] / data["total"] if data["total"] > 0 else 0
-                if miss_rate > 0.5:  # More than half the skipped trades would have won
-                    worst.append({
-                        "reason": reason,
-                        "miss_rate": miss_rate,
-                        "missed_trades": data["would_won"],
-                        "total": data["total"],
-                        "missed_pnl": data["pnl"],
-                    })
-
-        return sorted(worst, key=lambda x: x["miss_rate"], reverse=True)
+    # R12-C: evaluate_outcomes / get_analysis / get_worst_filters deleted —
+    # outputs twice ruled misleading (units bug R7; base-rate-
+    # indistinguishable R9). record_skip rows above are the kept record.
 
     @property
     def pending_count(self) -> int:

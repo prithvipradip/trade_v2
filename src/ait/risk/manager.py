@@ -6,6 +6,7 @@ and validates every trade before execution.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 from ait.broker.account import AccountManager
@@ -55,6 +56,10 @@ class TradeRequest:
     # For multi-leg strategies
     max_loss: float | None = None  # Defined risk strategies
     vix: float = 0.0  # Current VIX level for regime-aware sizing
+    # R12-B: IV percentile (0-100) for the VRP regime cap. 0.0 = unknown —
+    # the cap only fires on a real value (orchestrator must pass
+    # signal.iv_rank; see gate 2c-iv below).
+    iv_rank: float = 0.0
 
 
 class RiskManager:
@@ -194,16 +199,38 @@ class RiskManager:
                     f"credit entry halted: VIX {request.vix:.1f} >= "
                     f"{self._risk_config.credit_vix_halt:.0f}",
                 )
-            #  - concentration brake: cap simultaneous credit positions
+            #  - concentration brake: cap simultaneous credit positions.
+            # R12-B (cadence): the cap is now VIX-TIERED — a flat 6 let the
+            # book stay fully short premium into a rising-vol regime. Tiers:
+            # VIX<20 -> 6, VIX<25 -> 4, else 2 (config remains the ceiling).
+            # request.vix is guaranteed > 0 here (fail-closed gate above).
+            _vix_tier_cap = 6 if request.vix < 20 else (4 if request.vix < 25 else 2)
+            _credit_cap = min(self._risk_config.max_credit_positions, _vix_tier_cap)
             n_credit = sum(
                 1 for p in self._open_positions
                 if p.get("strategy") in CREDIT_STRATEGIES
             )
-            if n_credit >= self._risk_config.max_credit_positions:
+            if n_credit >= _credit_cap:
                 return TradeValidation(
                     False,
-                    f"short-premium cap: {n_credit}/"
-                    f"{self._risk_config.max_credit_positions} credit positions open",
+                    f"short-premium cap: {n_credit}/{_credit_cap} credit "
+                    f"positions open (VIX {request.vix:.1f} tier)",
+                )
+
+            #  - R12-B IV-percentile cap (IV regime): the R12 VRP-by-IV-bucket
+            # measurement showed the TOP IV bucket realizes NEGATIVE variance
+            # risk premium (~-2.3 vol pts) — selling "rich" vol above the
+            # ~85th percentile is selling vol that is rich for a reason (AMD
+            # sat at the 98.8th percentile PRE-EARNINGS and the IV-rank floor
+            # said TRADE). Fires only on a real iv_rank; 0/unknown skips
+            # (orchestrator must pass signal.iv_rank — flagged for main).
+            _iv_cap = float(os.environ.get("AIT_IV_RANK_CAP", "85"))
+            if request.iv_rank and request.iv_rank > _iv_cap:
+                return TradeValidation(
+                    False,
+                    f"iv_rank {request.iv_rank:.0f} > {_iv_cap:.0f} cap: "
+                    f"top-bucket IV carries negative VRP (R12: -2.3 vol pts "
+                    f"realized) — no new short premium this rich",
                 )
 
         # 3b. Position count limit
@@ -219,6 +246,32 @@ class RiskManager:
                 return TradeValidation(
                     False,
                     f"duplicate position: {request.symbol} {request.strategy} already open",
+                )
+
+        # 4b. R12-B PER-EXPIRY CAP (cadence): concentrating the book in one
+        # expiry stacks pin/gamma risk into a single settlement date — cap at
+        # 3 positions sharing an expiry (env AIT_MAX_PER_EXPIRY). Tolerant by
+        # design: positions whose dict lacks "expiry" are skipped (the
+        # orchestrator sync at orchestrator.py:_sync_risk_positions must add
+        # "expiry": trade.expiry — flagged for main thread), and the gate is
+        # skipped entirely when the request's own expiry is unknown.
+        _req_expiry = None
+        if request.option is not None and getattr(request.option, "expiry", None):
+            _req_expiry = str(request.option.expiry).replace("-", "")[:8]
+        if _req_expiry:
+            _max_per_expiry = int(os.environ.get("AIT_MAX_PER_EXPIRY", "3"))
+            _same_expiry = 0
+            for p in self._open_positions:
+                _pe = p.get("expiry")
+                if not _pe:
+                    continue  # expiry unknown — skip tolerantly
+                if str(_pe).replace("-", "")[:8] == _req_expiry:
+                    _same_expiry += 1
+            if _same_expiry >= _max_per_expiry:
+                return TradeValidation(
+                    False,
+                    f"per-expiry cap: {_same_expiry}/{_max_per_expiry} open "
+                    f"positions already share expiry {_req_expiry}",
                 )
 
         # 5. Correlation check (prevent stacking correlated positions)

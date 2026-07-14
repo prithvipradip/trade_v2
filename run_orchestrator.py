@@ -15,8 +15,10 @@ Usage:
     python run_orchestrator.py --backtest         # Run backtest now
     python run_orchestrator.py --retrain          # Retrain models now
     python run_orchestrator.py --refresh-fundamentals  # Refresh equity stats (yfinance)
-    python run_orchestrator.py --fetch-news       # Fetch IB news + analyst actions
 """
+# R12-C: --fetch-news retired with the sentiment stack (deprecated/src/).
+# --refresh-fundamentals KEPT: it only touches ait.data.equity_stats +
+# DuckDB (yfinance fundamentals), none of which were retired.
 
 import argparse
 import os
@@ -109,45 +111,17 @@ def _refresh_fundamentals() -> None:
 
 
 def _fetch_news() -> None:
-    """Fetch IB news + analyst actions for all configured symbols.
+    """R12-C tombstone: the IB news / FinBERT sentiment pipeline is retired.
 
-    Requires an active IB Gateway / TWS connection.
+    The whole stack (ait.sentiment, ait.data.ib_news, ait.data.fundamentals_db)
+    lives in deprecated/src/ — R7/R12 verified it had zero influence on iron
+    condor decisions, and FinBERT's torch dependency was implicated in the
+    c0000005 crash cluster. Nothing consumes the news/analyst tables anymore.
     """
-    from ait.config.settings import load_settings, IBKREnvConfig
-    from ait.broker.ibkr_client import IBKRClient
-    from ait.data.fundamentals_db import FundamentalsStore
-    from ait.data.ib_news import IBNewsService
-
-    settings = load_settings()
-    symbols = settings.trading.universe
-    print(f"Fetching IB news for {len(symbols)} symbols: {', '.join(symbols)}")
-
-    ibkr_cfg = IBKREnvConfig()
-    client = IBKRClient(ibkr_cfg)
-
-    ib = client.ib
-    ib.connect(ibkr_cfg.ibkr_host, ibkr_cfg.ibkr_port, clientId=ibkr_cfg.ibkr_client_id + 10)
-    try:
-        from ait.sentiment.finbert import FinBERTAnalyzer
-        finbert = FinBERTAnalyzer()
-        store = FundamentalsStore()
-        svc = IBNewsService(
-            ib_client=client,
-            store=store,
-            sentiment_fn=lambda h: finbert.analyze(h) or 0.0,
-        )
-        for symbol in symbols:
-            news_fetched, news_inserted = svc.fetch_and_store_news(symbol, hours_back=24)
-            analyst_fetched, analyst_inserted = svc.fetch_and_store_analyst_actions(
-                symbol, hours_back=168
-            )
-            print(
-                f"  {symbol:8s}  news={news_inserted:3d} inserted ({news_fetched:3d} fetched)  "
-                f"analyst={analyst_inserted:3d} inserted ({analyst_fetched:3d} fetched)"
-            )
-    finally:
-        ib.disconnect()
-    print("Done.")
+    print("--fetch-news is retired (R12 Tier-C, 2026-07-13): the sentiment/IB-news")
+    print("pipeline moved to deprecated/src/ and no live component reads its output.")
+    print("See docs/AUDIT_R12.md Tier C item 3.")
+    raise SystemExit(1)
 
 
 if __name__ == "__main__":
@@ -164,7 +138,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--fetch-news",
         action="store_true",
-        help="Fetch IB news + analyst actions for all symbols (requires IB connection)",
+        help="RETIRED (R12-C): sentiment/IB-news stack moved to deprecated/src/",
     )
     args = parser.parse_args()
 

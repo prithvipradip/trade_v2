@@ -17,6 +17,10 @@ from ait.backtesting.walkforward import (
 )
 from ait.backtesting.result import BacktestResult
 
+# R12: long-running suite — excluded from the default/CI fast selection
+# (-m "not ibkr and not slow"); the nightly slow-nightly CI job runs -m slow.
+pytestmark = pytest.mark.slow
+
 
 def _make_ohlcv(days: int = 500, start_price: float = 100.0) -> pd.DataFrame:
     """Generate synthetic OHLCV data for testing."""
@@ -974,8 +978,7 @@ class TestPretrainRangeModels:
         )
         data = {"QQQ": _make_ohlcv(300, start_price=450)}
         cfg = WalkForwardConfig(train_days=100, test_days=30, step_days=30, gap_days=5)
-        bt = WalkForwardBacktester(["QQQ"], ["iron_condor"], config=cfg,
-                                   enable_msgarch=False, enable_oujump=False)
+        bt = WalkForwardBacktester(["QQQ"], ["iron_condor"], config=cfg)
         windows = bt._generate_windows(data)
         result = bt._pretrain_range_models(windows, data, pd.DataFrame())
         assert len(result) == len(windows), \
@@ -1001,8 +1004,7 @@ class TestPretrainRangeModels:
 
         data = {"QQQ": _make_ohlcv(300, start_price=450)}
         cfg = WalkForwardConfig(train_days=100, test_days=40, step_days=40, gap_days=5)
-        bt = WalkForwardBacktester(["QQQ"], ["iron_condor"], config=cfg,
-                                   enable_msgarch=False, enable_oujump=False)
+        bt = WalkForwardBacktester(["QQQ"], ["iron_condor"], config=cfg)
         windows = bt._generate_windows(data)
         if not windows:
             pytest.skip("no windows generated for this dataset size")
@@ -1035,8 +1037,7 @@ class TestPretrainRangeModels:
 
         data = {"QQQ": _make_ohlcv(300, start_price=450)}
         cfg = WalkForwardConfig(train_days=100, test_days=40, step_days=40, gap_days=5)
-        bt = WalkForwardBacktester(["QQQ"], ["iron_condor"], config=cfg,
-                                   enable_msgarch=False, enable_oujump=False)
+        bt = WalkForwardBacktester(["QQQ"], ["iron_condor"], config=cfg)
         windows = bt._generate_windows(data)
         if not windows:
             pytest.skip("no windows generated for this dataset size")

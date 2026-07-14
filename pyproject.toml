@@ -24,8 +24,6 @@ dependencies = [
     "py-vollib>=1.0.1",
     "scipy>=1.12",
     # Sentiment
-    "transformers>=5.0",  # R5: venv runs 5.3; old 4.x pin uninstallable on py3.13
-    "torch>=2.6",         # R5: venv runs 2.10 CPU; torch<2.3 has no cp313 wheels at all
     "feedparser>=6.0",
     "finnhub-python>=2.4",
     # Notifications
@@ -40,7 +38,6 @@ dependencies = [
     # Fractal analysis
     "pywavelets>=1.4",
     # Volatility models (GARCH/ARCH ensemble member for range predictor)
-    "arch>=7.2",
     # Optimization
     "optuna>=3.6",
     # Scheduling
@@ -55,18 +52,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# R12-C: torch+transformers (580MB) served only the hard-disabled FinBERT and
+# torch is forensically implicated in the c0000005 crash cluster; arch served
+# the GARCH research stack now in deprecated/research/. None are imported by
+# the live tree (grep-verified).
+sentiment = ["torch>=2.6", "transformers>=5.0"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "pytest-cov>=4.1",
     "ruff>=0.2",
     "mypy>=1.8",
-    "packaging>=23.0",
-]
+    "packaging>=23.0", "hypothesis>=6.100"]
 research = [
     "mlflow>=2.0",
-    "shap>=0.42",
-]
+    "shap>=0.42", "arch>=6.0"]
 
 [project.scripts]
 ait = "ait.main:main"
@@ -87,9 +87,13 @@ testpaths = ["tests"]
 pythonpath = ["."]
 # R5: without addopts the live-gateway tests ran (and ERRORED with Gateway
 # down) on every plain `pytest` invocation.
-addopts = "-m 'not ibkr'"
+# R12: default selection excludes broker-live AND slow suites so a plain
+# `pytest` (and the CI fast lane) finishes in minutes and can actually go
+# green; nightly CI runs `-m slow`.
+addopts = "-m 'not ibkr and not slow'"
 markers = [
     "ibkr: live tests requiring IB Gateway on 127.0.0.1:4002 (run with -m ibkr)",
+    "slow: long-running ML/backtest suites (nightly CI lane, run with -m slow)",
 ]
 
 [tool.mypy]

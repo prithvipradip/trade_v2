@@ -33,10 +33,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 from ait.data.equity_stats import EquityStatsService
-from ait.data.fundamentals_db import FundamentalsStore
-from ait.data.ib_news import IBNewsService
 from ait.monitoring.duckdb_analytics import DuckDBAnalytics
-from ait.sentiment.finbert import FinBERTAnalyzer
 
 # ---------------------------------------------------------------------------
 # Shared paths (production databases)
@@ -200,104 +197,9 @@ def _require_news(fetched: int, hours_back: int) -> None:
         )
 
 
-class TestIBNewsIntegration:
-    def test_fetch_spy_news_writes_to_test_table(
-        self, news_service: IBNewsService, fundamentals_store: FundamentalsStore
-    ):
-        fetched, _inserted = news_service.fetch_and_store_news("SPY", hours_back=_FETCH_HOURS)
-        _require_news(fetched, _FETCH_HOURS)
-
-        rows = fundamentals_store.get_recent_news("SPY", hours=_READ_HOURS)
-        assert rows, "IB returned articles but get_recent_news returned empty"
-        first = rows[0]
-        assert first["symbol"] == "SPY"
-        assert first["headline"] != ""
-        assert "published_at" in first
-        assert isinstance(first["sentiment"], float)
-        assert -1.0 <= first["sentiment"] <= 1.0, (
-            f"sentiment out of range: {first['sentiment']}"
-        )
-
-    def test_fetch_aapl_news_writes_to_test_table(
-        self, news_service: IBNewsService, fundamentals_store: FundamentalsStore
-    ):
-        fetched, _inserted = news_service.fetch_and_store_news("AAPL", hours_back=_FETCH_HOURS)
-        _require_news(fetched, _FETCH_HOURS)
-
-        rows = fundamentals_store.get_recent_news("AAPL", hours=_READ_HOURS)
-        assert rows, "IB returned articles but get_recent_news returned empty"
-        assert all(isinstance(r["sentiment"], float) for r in rows)
-        assert all(-1.0 <= r["sentiment"] <= 1.0 for r in rows)
-
-    def test_newly_inserted_news_has_finbert_score(
-        self, news_service: IBNewsService, fundamentals_store: FundamentalsStore
-    ):
-        """Freshly inserted articles must carry real FinBERT scores (not all 0.0).
-
-        Wipes stale test_news rows for SPY so this run inserts fresh articles
-        scored by the live FinBERT pipeline — rows from earlier broken runs had
-        0.0 scores and would make the assertion vacuously fail.
-        """
-        with fundamentals_store._connect() as conn:
-            conn.execute(f"DELETE FROM {fundamentals_store._news_table} WHERE symbol = 'SPY'")
-
-        fetched, inserted = news_service.fetch_and_store_news("SPY", hours_back=_FETCH_HOURS)
-        _require_news(fetched, _FETCH_HOURS)
-        assert inserted > 0, f"Expected fresh inserts after clearing table, got {inserted}"
-
-        rows = fundamentals_store.get_recent_news("SPY", hours=_READ_HOURS)
-        assert rows, "IB returned articles but get_recent_news returned empty after re-insert"
-        scores = [r["sentiment"] for r in rows]
-        assert any(s != 0.0 for s in scores), (
-            "All sentiment scores are 0.0 — FinBERT may not be running correctly."
-        )
-
-    def test_news_insert_is_idempotent(
-        self, news_service: IBNewsService, fundamentals_store: FundamentalsStore
-    ):
-        """Fetching the same window twice should not create duplicate rows."""
-        fetched_first, _inserted_first = news_service.fetch_and_store_news("SPY", hours_back=_FETCH_HOURS)
-        _require_news(fetched_first, _FETCH_HOURS)
-        _fetched_second, inserted_second = news_service.fetch_and_store_news("SPY", hours_back=_FETCH_HOURS)
-        assert inserted_second == 0, (
-            f"Expected 0 new rows on second fetch, got {inserted_second}"
-        )
+# R12-C: TestIBNewsIntegration removed with the retired sentiment/news stack.
 
 
-# ---------------------------------------------------------------------------
-# Feature 2 — IB Analyst Recommendations (live IB → test_analyst_recommendations)
-# ---------------------------------------------------------------------------
+# R12-C: TestIBAnalystIntegration removed with the retired sentiment/news stack.
 
 
-class TestIBAnalystIntegration:
-    def test_fetch_aapl_analyst_actions(
-        self, news_service: IBNewsService, fundamentals_store: FundamentalsStore
-    ):
-        fetched, _inserted = news_service.fetch_and_store_analyst_actions("AAPL", hours_back=168)
-        _require_news(fetched, 168)
-
-        rows = fundamentals_store.get_analyst_recs("AAPL", days=30)
-        assert rows, "IB returned analyst records but get_analyst_recs returned empty"
-        first = rows[0]
-        assert first["symbol"] == "AAPL"
-        assert first["firm"] != "", "firm should be non-empty"
-        assert first["action"] != "", "action should be non-empty"
-        assert len(first["id"]) == 16
-
-    def test_fetch_aapl_analyst_actions_second_fetch(
-        self, news_service: IBNewsService, fundamentals_store: FundamentalsStore
-    ):
-        """Second fetch for AAPL — verifies the service works across multiple calls."""
-        fetched, _inserted = news_service.fetch_and_store_analyst_actions("AAPL", hours_back=168)
-        _require_news(fetched, 168)
-
-    def test_analyst_insert_is_idempotent(
-        self, news_service: IBNewsService, fundamentals_store: FundamentalsStore
-    ):
-        """UNIQUE(symbol, issued_at, firm) ensures re-fetching is idempotent."""
-        fetched_first, _inserted_first = news_service.fetch_and_store_analyst_actions("AAPL", hours_back=48)
-        _require_news(fetched_first, 48)
-        _fetched_second, inserted_second = news_service.fetch_and_store_analyst_actions("AAPL", hours_back=48)
-        assert inserted_second == 0, (
-            f"Expected 0 new rows on second analyst fetch, got {inserted_second}"
-        )

@@ -178,23 +178,29 @@ class MLConfig(BaseModel):
 
 
 class MetaLabelConfig(BaseModel):
-    enabled: bool = True
+    # R12-C: default flipped to False (was True). The meta-labeler was trained
+    # on corrupted data and rejects everything; config.yaml has carried
+    # `enabled: false` since that finding, so this only changes what happens
+    # if the key is ever omitted — default-off is the safe direction.
+    enabled: bool = False
     min_probability: float = Field(default=0.50, ge=0.30, le=0.80)
     retrain_with_primary: bool = True  # Retrain when primary model retrains
 
 
-class SentimentSourcesConfig(BaseModel):
-    news: bool = True
-    fear_greed: bool = True
-    finbert: bool = True
-
-
 class SentimentConfig(BaseModel):
-    enabled: bool = True
-    weight: float = Field(default=0.20, ge=0.0, le=0.50)
-    cache_ttl_seconds: int = Field(default=300, ge=60, le=3600)
-    sources: SentimentSourcesConfig = SentimentSourcesConfig()
-    ib_news_weight: float = Field(default=0.20, ge=0.0, le=0.50)
+    """R12-C tombstone: the sentiment stack (ait.sentiment, ib_news,
+    fundamentals_db) is retired to deprecated/src/ — verified zero influence
+    on iron-condor decisions. Nothing reads this config anymore.
+
+    Kept as a permissive stub (extra="allow") so an existing config.yaml
+    `sentiment:` block — including its nested `sources:` mapping — still
+    validates instead of crashing load_settings() at bot startup. That is the
+    least-breaking path: no config edit required, no consumer left to care
+    what the values are.
+    """
+
+    enabled: bool = False
+    model_config = {"extra": "allow"}
 
 
 class ExitConfig(BaseModel):

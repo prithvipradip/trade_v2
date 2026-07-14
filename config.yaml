@@ -47,9 +47,13 @@ risk:
 
 options:
   delta_range: [0.20, 0.50]            # Target delta for long options
-  dte_range: [7, 30]                   # Was [14,45]: shorter DTE = faster theta resolution,
-                                       # roughly doubles closes/slot for the clean-sample sprint
-                                       # (audit R2 goal-align). Revert to [14,45] to slow down.
+  dte_range: [14, 30]                  # R12-B (cadence): min DTE 7 -> 14. 7-DTE entries were
+                                       # 2-day churn (forced out by the DTE<=5 exit almost
+                                       # immediately), best case ~60% cost-dominated — commissions
+                                       # and crossing ate the theta. 14 gives >=9 days of runway
+                                       # ahead of the DTE<=5 forced exit (guard comment in
+                                       # execution/portfolio.py). History: [14,45] -> [7,30] (R2
+                                       # clean-sample sprint) -> [14,30] (R12-B).
   min_open_interest: 10                # Loosened: paper account on delayed data
   min_volume: 0                        # Delayed feeds report volume=0; relaxed pydantic floor too
   max_bid_ask_spread_pct: 0.40         # Loosened: stale-quote spreads run wider

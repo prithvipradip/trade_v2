@@ -29,7 +29,6 @@ from ait.data.historical import HistoricalDataStore
 from ait.data.market_data import MarketDataService
 from ait.data.options_chain import OptionsChainService
 from ait.data.multi_timeframe import MultiTimeframeAnalyzer
-from ait.data.options_flow import OptionsFlowDetector
 from ait.data.quality import DataQualityValidator
 from ait.execution.executor import TradeExecutor
 from ait.execution.portfolio import PortfolioManager, PositionStatus
@@ -43,12 +42,10 @@ from ait.monitoring.analytics import TradeAnalytics
 from ait.monitoring.watchdog import Watchdog
 from ait.risk.circuit_breaker import CircuitBreaker
 from ait.risk.correlation import CorrelationGuard
-from ait.risk.hedging import DeltaHedger
 from ait.risk.manager import RiskManager, TradeRequest
 from ait.risk.pdt_guard import PDTGuard
 from ait.risk.position_sizer import PositionSizer
 from ait.risk.capital_tiers import CapitalTierManager
-from ait.sentiment.engine import SentimentEngine
 from ait.learning.counterfactual import CounterfactualTracker
 from ait.strategies.base import CREDIT_STRATEGIES, SignalDirection
 from ait.strategies.selector import StrategySelector
@@ -101,7 +98,6 @@ class TradingOrchestrator:
             correlation_guard=self._correlation_guard,
             state=self._state,
         )
-        self._delta_hedger = DeltaHedger()
 
         # ML
         self._predictor = DirectionPredictor(settings.ml)
@@ -133,10 +129,6 @@ class TradingOrchestrator:
         ) if settings.meta_label.enabled else None
 
         # Sentiment
-        self._sentiment = SentimentEngine(
-            settings.sentiment, self._market_data,
-            finnhub_api_key=settings.api_keys.finnhub_api_key,
-        )
 
         # Calendars — needed by portfolio for event-driven exits
         self._earnings = EarningsCalendar()
@@ -201,7 +193,6 @@ class TradingOrchestrator:
 
         # Data quality & market intelligence
         self._data_quality = DataQualityValidator()
-        self._flow_detector = OptionsFlowDetector()
         self._mtf_analyzer = MultiTimeframeAnalyzer()
 
         # Health monitoring
@@ -248,7 +239,6 @@ class TradingOrchestrator:
 
         # Signal queue for entry timing optimization
         # Signals wait here until timing conditions are met (max 3 cycles)
-        self._signal_queue: dict[str, dict] = {}  # symbol → {signal, confidence, sentiment, regime, age}
 
     def set_notification_callback(self, callback) -> None:
         """Set async callback for sending notifications."""
@@ -276,6 +266,18 @@ class TradingOrchestrator:
         # them against IBKR's actual positions.
         try:
             recon = await self._reconciler.reconcile()
+
+            # R12-A (F4.1): re-adopt working exit orders the reconciler found
+            # for kept-CLOSING trades — without a tracker, a restart-surviving
+            # exit order is invisible and a duplicate close (position
+            # REVERSAL) follows.
+            for _tid, _oid in getattr(recon, "closing_exit_orders", {}).items():
+                try:
+                    self._executor.adopt_exit_order(
+                        _oid, _tid, reason="reconcile_readopt")
+                except Exception as _e:  # noqa: BLE001
+                    log.warning("exit_order_adopt_failed",
+                                trade_id=_tid, error=str(_e))
             log.info("startup_reconcile_done",
                      matched=recon.matched, promoted=recon.promoted,
                      stale_closed=recon.stale_local, new_from_ibkr=recon.new_from_ibkr)
@@ -717,8 +719,11 @@ class TradingOrchestrator:
                 pos.exit_reason = f"thesis_invalidated: {reason}"
                 await self._execute_exit(pos)
 
-        # 4. Check portfolio delta hedging
-        await self._check_hedging()
+        # R12-C: delta-hedging check REMOVED — dead since inception (greeks
+        # feed ~0) and dangerous: its auto-execute path placed SPY stock
+        # MARKET orders directly via the broker client, bypassing every
+        # executor guardrail (rate limit, INST-5 defined-risk, GOV-1 NBBO,
+        # market-hours). Module retired to deprecated/src/.
 
         # 5. Check if we should avoid new trades (last 15 min)
         if self._scheduler.should_avoid_new_trades():
@@ -768,8 +773,6 @@ class TradingOrchestrator:
                          events=str(self._economic_cal.get_upcoming_events(days=2)))
                 return
 
-        # 8. Process queued signals first (entry timing optimization)
-        await self._process_signal_queue()
 
         # 9. Scan universe for new opportunities
         # R7-SOON: refresh the per-trade dollar budget once per cycle so
@@ -866,11 +869,15 @@ class TradingOrchestrator:
         # Parallel fetch: historical data, sentiment, IV rank
         # 2 years of history for robust features (iv_rank, vol percentiles, trend)
         hist_task = self._market_data.get_historical(symbol, days=504)
-        sentiment_task = self._sentiment.get_sentiment(symbol)
         iv_rank_task = self._estimate_iv_rank(symbol)
 
-        hist, sentiment, iv_rank = await asyncio.gather(
-            hist_task, sentiment_task, iv_rank_task,
+        # R12-C: sentiment retired — R7 traced its contribution to IC
+        # decisions to exactly zero (range override replaces confidence
+        # before sentiment could reach any decision; its ML features were
+        # constant at train time). Downstream sites are None-tolerant.
+        sentiment = None
+        hist, iv_rank = await asyncio.gather(
+            hist_task, iv_rank_task,
             return_exceptions=True,
         )
 
@@ -882,8 +889,6 @@ class TradingOrchestrator:
             log.warning("hist_data_empty", symbol=symbol,
                         hint="No historical data — check market data subscription or data source")
             return
-        if isinstance(sentiment, Exception):
-            sentiment = None
         if isinstance(iv_rank, Exception):
             iv_rank = 50.0
 
@@ -934,7 +939,7 @@ class TradingOrchestrator:
         prediction = self._predictor.predict(
             hist, symbol=symbol,
             market_context=market_context,
-            live_signals=live_signals,
+            live_signals=None,  # R12-C: retired features; kwarg ignored
             intraday_store=self._historical,
         )
         if prediction is None:
@@ -999,11 +1004,10 @@ class TradingOrchestrator:
         # Market regime
         regime = self._regime_detector.analyze(hist, vix)
 
-        # Adjust confidence with sentiment (already fetched in parallel)
+        # R12-C: sentiment confidence adjustment removed with the sentiment
+        # stack — it never reached an IC decision (range override wins) and
+        # carried a wrong-signed adjustment on the directional path.
         final_confidence = prediction.confidence
-        if sentiment and hasattr(sentiment, "sources_available") and sentiment.sources_available > 0:
-            sentiment_adj = sentiment.composite_score * self._sentiment.weight
-            final_confidence = max(0, min(1, final_confidence + sentiment_adj))
 
         # Multi-timeframe analysis: boost/penalize confidence based on alignment
         # Use intraday_full (full SQLite history) not the incremental fetch — the
@@ -1119,47 +1123,11 @@ class TradingOrchestrator:
             c.filter_liquid(self._settings.options) for c in chains
         ]
 
-        # Options flow analysis — detect unusual activity
+        # R12-C: options-flow analysis removed — gate/boost were
+        # paper-bypassed, its ML features were constant at train time, and
+        # bias_strength was a proportion (one small sweep read as 1.0).
+        # Module retired to deprecated/src/.
         underlying_price = hist["Close"].iloc[-1] if "Close" in hist.columns else 0
-        for chain in filtered_chains:
-            if chain.calls or chain.puts:
-                call_data = [
-                    {"strike": c.strike, "volume": c.volume, "open_interest": c.open_interest,
-                     "last_price": c.last, "delta": c.delta}
-                    for c in (chain.calls or [])
-                ]
-                put_data = [
-                    {"strike": p.strike, "volume": p.volume, "open_interest": p.open_interest,
-                     "last_price": p.last, "delta": p.delta}
-                    for p in (chain.puts or [])
-                ]
-                flow = self._flow_detector.analyze_chain(
-                    symbol, call_data, put_data, underlying_price
-                )
-                # Hard gate: if strong flow disagrees with ML direction, reject entirely.
-                # Bypassed in paper_trading_mode — backtest has no flow data (Gap Z7).
-                if not paper_mode and flow.bias_strength > 0.7:
-                    flow_disagrees = (
-                        (flow.overall_bias == "bearish" and direction == SignalDirection.BULLISH) or
-                        (flow.overall_bias == "bullish" and direction == SignalDirection.BEARISH)
-                    )
-                    if flow_disagrees:
-                        log.info("flow_hard_gate_reject", symbol=symbol,
-                                 flow_bias=flow.overall_bias, ml_direction=direction.value,
-                                 bias_strength=flow.bias_strength)
-                        return  # Skip this symbol entirely
-
-                # Boost confidence if flow agrees with prediction direction.
-                # R5 audit: the hard gate above was paper-bypassed but this boost
-                # was not — paper results absorbed flow noise the backtest never
-                # sees, breaking Gap Z7's comparability rationale. Same bypass.
-                if not paper_mode and flow.bias_strength > 0.5:
-                    if (flow.overall_bias == "bullish" and direction == SignalDirection.BULLISH) or \
-                       (flow.overall_bias == "bearish" and direction == SignalDirection.BEARISH):
-                        final_confidence = min(1.0, final_confidence + flow.bias_strength * 0.1)
-                        log.info("flow_confidence_boost", symbol=symbol, bias=flow.overall_bias,
-                                 boost=flow.bias_strength * 0.1)
-                break  # Only analyze first chain for flow
 
         # Calendar spreads need multiple expiry chains — generate once per symbol.
         # Best in LOW IV (cheap premium to buy that may rise).
@@ -1224,7 +1192,7 @@ class TradingOrchestrator:
                 range_pred = self._range_predictor.predict(
                     hist, symbol=symbol,
                     market_context=market_context,
-                    live_signals=live_signals,
+                    live_signals=None,  # R12-C: retired features; kwarg ignored
                     intraday_store=self._historical,
                 )
                 if range_pred:
@@ -1245,7 +1213,7 @@ class TradingOrchestrator:
                 vm_pred = self._vol_mag_predictor.predict(
                     hist, symbol=symbol,
                     market_context=market_context,
-                    live_signals=live_signals,
+                    live_signals=None,  # R12-C: retired features; kwarg ignored
                 )
                 if vm_pred:
                     log.info("vol_mag_prediction", symbol=symbol,
@@ -1341,17 +1309,6 @@ class TradingOrchestrator:
                     collect.append((eff_conf + 0.3 * _cw, signal, eff_conf,
                                     sentiment, regime))
                     continue
-                if self._should_queue_signal(signal, hist):
-                    self._signal_queue[signal.symbol] = {
-                        "signal": signal,
-                        "confidence": eff_conf,
-                        "sentiment": sentiment,
-                        "regime": regime,
-                        "age": 0,
-                    }
-                    log.info("signal_queued", symbol=signal.symbol,
-                             strategy=signal.strategy_name, reason="entry_timing")
-                    break
                 handled = await self._try_execute(signal, eff_conf, sentiment, regime)
                 if handled:
                     break  # executed or symbol-level block — done with this symbol
@@ -1568,6 +1525,29 @@ class TradingOrchestrator:
         except Exception:  # noqa: BLE001
             pass
 
+        # R12-B4 (user-approved): post-stop re-entry discipline. The old
+        # cooldown keyed on ENTRY time, so a symbol stopped out on day 3 of a
+        # trend could re-enter on the very next scan into the same move —
+        # the most autocorrelated loss sequence condors produce. A stop-loss
+        # close now blocks NEW entries on that symbol for 1 trading day.
+        try:
+            import sqlite3 as _sq12
+            _con = _sq12.connect("file:data/ait_state.db?mode=ro", uri=True)
+            _row = _con.execute(
+                "SELECT exit_time FROM trades WHERE symbol=? AND status='closed' "
+                "AND COALESCE(exit_reason_detailed,'') LIKE '%stop_loss%' "
+                "ORDER BY exit_time DESC LIMIT 1", (signal.symbol,)).fetchone()
+            _con.close()
+            if _row and _row[0]:
+                from datetime import datetime as _dt12, timedelta as _td12
+                _exit_t = _dt12.fromisoformat(_row[0])
+                if _dt12.now() - _exit_t < _td12(hours=30):
+                    log.info("entry_blocked_post_stop_cooldown",
+                             symbol=signal.symbol, stopped_at=_row[0])
+                    return False
+        except Exception:  # noqa: BLE001 — cooldown must never block the loop
+            pass
+
         # Check trade budget (time-based pacing)
         remaining = self._get_trade_budget()
         if remaining <= 0:
@@ -1672,6 +1652,8 @@ class TradingOrchestrator:
             implied_vol=signal.contract.implied_vol if signal.contract else 0.30,
             max_loss=signal.max_loss if signal.is_defined_risk else None,
             vix=current_vix,
+            # R12-B5c: IV-percentile cap (VRP top bucket = -2.3 vol pts)
+            iv_rank=signal.iv_rank if hasattr(signal, "iv_rank") else 0.0,
         )
 
         validation = await self._risk_manager.validate_trade(request)
@@ -1726,6 +1708,7 @@ class TradingOrchestrator:
                 implied_vol=request.implied_vol,
                 max_loss=(request.max_loss * scale) if request.max_loss else None,
                 vix=request.vix,
+                iv_rank=request.iv_rank,  # R12-B5c: carry through revalidation
             ))
             if not revalidation.approved:
                 log.info("multiplier_size_rejected_using_base",
@@ -1826,6 +1809,14 @@ class TradingOrchestrator:
             log.error("exit_trade_not_found", trade_id=pos.trade_id)
             return
 
+        # R12-A: refuse to build an exit for anything not FILLED/PARTIAL —
+        # a CLOSED/CANCELLED row must never be resurrected into the exit
+        # path (F4.5). Checked BEFORE any order is placed.
+        if trade.status not in (TradeStatus.FILLED, TradeStatus.PARTIAL):
+            log.warning("exit_refused_bad_status",
+                        trade_id=pos.trade_id, status=str(trade.status))
+            return
+
         if not await self._ibkr.ensure_connected():
             log.error("exit_failed_no_connection", trade_id=pos.trade_id)
             self._watchdog.record_error("ibkr", "disconnected during exit")
@@ -1870,7 +1861,24 @@ class TradingOrchestrator:
 
             # Mark trade as CLOSING — actual close happens when the exit
             # order fills (detected in executor.check_fills).
-            self._state.update_trade_status(pos.trade_id, TradeStatus.CLOSING)
+            # R12-A: CAS — the last blind status write; only FILLED/PARTIAL
+            # positions may move to CLOSING (a CLOSED/CANCELLED row must not
+            # be resurrected into the exit path).
+            if not self._state.update_trade_status(
+                    pos.trade_id, TradeStatus.CLOSING,
+                    from_statuses=(TradeStatus.FILLED, TradeStatus.PARTIAL)):
+                # Race window only (pre-check passed above): another path
+                # closed the trade between order placement and here. A live
+                # close order now exists on a closed position — cancel it.
+                log.critical("closing_transition_refused_cancelling_order",
+                             trade_id=pos.trade_id)
+                try:
+                    if exit_trade is not None and getattr(exit_trade, "order", None):
+                        self._ibkr.ib.cancelOrder(exit_trade.order)
+                except Exception as _e:  # noqa: BLE001
+                    log.error("race_exit_cancel_failed",
+                              trade_id=pos.trade_id, error=str(_e))
+                return
 
             # Register the exit order with the executor for fill tracking
             if exit_trade.order.orderId:
@@ -2131,6 +2139,18 @@ class TradingOrchestrator:
 
         # 1. Reconcile with IBKR
         recon = await self._reconciler.reconcile()
+
+        # R12-A (F4.1): re-adopt working exit orders the reconciler found
+        # for kept-CLOSING trades — without a tracker, a restart-surviving
+        # exit order is invisible and a duplicate close (position
+        # REVERSAL) follows.
+        for _tid, _oid in getattr(recon, "closing_exit_orders", {}).items():
+            try:
+                self._executor.adopt_exit_order(
+                    _oid, _tid, reason="reconcile_readopt")
+            except Exception as _e:  # noqa: BLE001
+                log.warning("exit_order_adopt_failed",
+                            trade_id=_tid, error=str(_e))
         await self._alert_reconcile_anomalies(recon)
 
         # GOV-4 (governance audit): EOD BREAK REPORT — reconcile used to run
@@ -2173,23 +2193,8 @@ class TradingOrchestrator:
             log.info("post_market_learning", result=learning_result)
 
         # 3. Evaluate counterfactual outcomes (what would skipped trades have done?)
-        if self._counterfactual.pending_count > 0:
-            prices = {}
-            for sym in self._settings.trading.universe:
-                price = await self._market_data.get_current_price(sym)
-                if price:
-                    prices[sym] = price
-            evaluated = self._counterfactual.evaluate_outcomes(prices)
-            if evaluated > 0:
-                cf_analysis = self._counterfactual.get_analysis()
-                log.info(
-                    "counterfactual_analysis",
-                    evaluated=evaluated,
-                    filter_accuracy=f"{cf_analysis['filter_accuracy']:.0%}",
-                    missed=cf_analysis.get("missed_opportunities", 0),
-                )
-
-        # 4. Check drift status
+        # R12-C: counterfactual evaluation loop removed (analysis retired;
+        # record_skip rows remain the taken-vs-vetoed record).
         drift_report = self._trainer.drift_detector.check_drift()
         if drift_report.is_drifting:
             log.warning("post_market_drift", accuracy=f"{drift_report.accuracy:.2%}", reason=drift_report.reason)
@@ -2234,9 +2239,7 @@ class TradingOrchestrator:
             report += f"\n  Top strategy (Thompson): {top['strategy']} ({top['win_rate']:.0%} over {top['observations']:.0f} trades)"
 
         # Counterfactual summary
-        cf = self._counterfactual.get_analysis()
-        if cf["evaluated"] > 0:
-            report += f"\n  Filters: {cf['filter_accuracy']:.0%} accurate, {cf.get('missed_opportunities', 0)} missed"
+        # R12-C: counterfactual analysis section removed from the report
 
         await self._send_notification(report)
         log.info("post_market_complete", summary=summary, metrics=vars(metrics))
@@ -2247,129 +2250,8 @@ class TradingOrchestrator:
         health = self._watchdog.get_summary()
         await self._send_notification(f"Bot shutting down\n\n{health}")
 
-    async def _check_hedging(self) -> None:
-        """Check if portfolio delta needs hedging with SPY."""
-        try:
-            portfolio_greeks = self._risk_manager._portfolio_greeks
-            account_value = await self._account.get_net_liquidation()
-            spy_price = await self._market_data.get_current_price("SPY")
 
-            if not spy_price or account_value <= 0:
-                return
 
-            recommendation = self._delta_hedger.check_hedge_needed(
-                portfolio_greeks, account_value, spy_price
-            )
-
-            if recommendation:
-                cost = self._delta_hedger.calculate_hedge_cost(recommendation, spy_price)
-                msg = (
-                    f"HEDGE: {recommendation.action} {recommendation.quantity}x SPY\n"
-                    f"Reason: {recommendation.reason}\n"
-                    f"Estimated cost: ${cost:,.0f}"
-                )
-
-                # Auto-execute hedge if enabled
-                if self._settings.exit.auto_hedge:
-                    try:
-                        contract = ContractBuilder.stock("SPY")
-                        qualified = await self._ibkr.qualify_contract(contract)
-                        if qualified:
-                            order = OrderBuilder.market(
-                                action=recommendation.action,
-                                quantity=recommendation.quantity,
-                            )
-                            await self._ibkr.place_order(qualified, order)
-                            msg += "\nStatus: AUTO-EXECUTED"
-                            log.info(
-                                "hedge_auto_executed",
-                                action=recommendation.action,
-                                shares=recommendation.quantity,
-                            )
-                        else:
-                            msg += "\nStatus: FAILED (contract qualification)"
-                    except Exception as he:
-                        msg += f"\nStatus: FAILED ({he})"
-                        log.error("hedge_execution_failed", error=str(he))
-                else:
-                    msg += "\nStatus: MANUAL (auto_hedge disabled)"
-
-                await self._send_notification(msg)
-                log.info(
-                    "hedge_recommendation",
-                    action=recommendation.action,
-                    shares=recommendation.quantity,
-                    delta=recommendation.current_delta,
-                    auto_executed=self._settings.exit.auto_hedge,
-                )
-        except Exception as e:
-            log.warning("hedging_check_failed", error=str(e))
-
-    # --- Helpers ---
-
-    def _should_queue_signal(self, signal, hist) -> bool:
-        """Check if a signal should be queued for better entry timing.
-
-        Queue bullish signals when RSI is high (overbought) — wait for pullback.
-        Queue bearish signals when RSI is low (oversold) — wait for bounce.
-        """
-        if signal.symbol in self._signal_queue:
-            return False  # Already queued
-
-        if hist is None or hist.empty or "Close" not in hist.columns:
-            return False
-
-        try:
-            close = hist["Close"]
-            # Calculate RSI-14
-            delta = close.diff()
-            gain = delta.where(delta > 0, 0.0).rolling(14).mean()
-            loss = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
-            rs = gain / loss
-            rsi = 100 - (100 / (1 + rs))
-            current_rsi = float(rsi.iloc[-1])
-
-            # For bullish trades, prefer entry on pullback (RSI < 60)
-            if signal.direction == SignalDirection.BULLISH and current_rsi > 65:
-                return True
-
-            # For bearish trades, prefer entry on bounce (RSI > 40)
-            if signal.direction == SignalDirection.BEARISH and current_rsi < 35:
-                return True
-
-        except Exception:
-            pass
-
-        return False
-
-    async def _process_signal_queue(self) -> None:
-        """Process queued signals — execute if timing improved or expire."""
-        expired = []
-
-        for symbol, entry in list(self._signal_queue.items()):
-            entry["age"] += 1
-
-            # Expire after 3 cycles (15 min at 5-min intervals)
-            if entry["age"] > 3:
-                expired.append(symbol)
-                log.info("signal_expired", symbol=symbol, strategy=entry["signal"].strategy_name)
-                continue
-
-            # Check if timing has improved
-            hist = await self._market_data.get_historical(symbol, days=60)
-            if not self._should_queue_signal(entry["signal"], hist):
-                # Timing improved — execute now
-                log.info("queued_signal_executing", symbol=symbol, age=entry["age"])
-                await self._try_execute(
-                    entry["signal"],
-                    entry["confidence"],
-                    entry["sentiment"],
-                    entry["regime"],
-                )
-                expired.append(symbol)
-
-        for symbol in expired:
-            self._signal_queue.pop(symbol, None)
 
     async def _check_thesis_valid(self, pos: PositionStatus) -> tuple[bool, str]:
         """Re-evaluate whether the original trade thesis still holds.
@@ -2468,6 +2350,7 @@ class TradingOrchestrator:
                 positions_for_risk.append({
                     "symbol": trade.symbol,
                     "strategy": trade.strategy,
+                    "expiry": trade.expiry,  # R12-B5a: per-expiry cap
                     "quantity": trade.quantity,
                     "delta": greeks.get("delta", 0),
                     "gamma": greeks.get("gamma", 0),

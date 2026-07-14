@@ -11,9 +11,6 @@ import pandas as pd
 from ait.config.settings import OptionsConfig
 from ait.data.options_chain import OptionsChain
 from ait.strategies.base import Signal, SignalDirection, Strategy
-from ait.strategies.calendar import CalendarSpread
-from ait.strategies.covered import CashSecuredPut, CoveredCall
-from ait.strategies.event_straddle import EventStraddle
 from ait.strategies.iron_condor import IronCondor
 from ait.strategies.long_options import LongCall, LongPut
 from ait.strategies.spreads import BearPutSpread, BullCallSpread
@@ -22,12 +19,14 @@ from ait.utils.logging import get_logger
 
 log = get_logger("strategies.selector")
 
-# Map strategy names to classes
+# Map strategy names to classes.
+# R12-C: covered_call / cash_secured_put (covered.py), calendar_spread
+# (calendar.py) and event_straddle (event_straddle.py) retired to
+# deprecated/src/ — never traded live; covered.py could emit naked calls
+# when the share-ownership premise wasn't checked.
 STRATEGY_MAP: dict[str, type[Strategy]] = {
     "long_call": LongCall,
     "long_put": LongPut,
-    "covered_call": CoveredCall,
-    "cash_secured_put": CashSecuredPut,
     "bull_call_spread": BullCallSpread,
     "bear_put_spread": BearPutSpread,
     "iron_condor": IronCondor,
@@ -42,16 +41,8 @@ class StrategySelector:
     def __init__(self, config: OptionsConfig) -> None:
         self._config = config
         self._strategies: list[Strategy] = []
-        self._calendar = None  # multi-expiry strategy, separate path
-        self._event_straddle = None  # needs economic_cal + multi-expiry, separate path
 
         for name in config.strategies:
-            if name == "calendar_spread":
-                self._calendar = CalendarSpread()
-                continue
-            if name == "event_straddle":
-                self._event_straddle = EventStraddle()
-                continue
             cls = STRATEGY_MAP.get(name)
             if cls:
                 self._strategies.append(cls())
@@ -59,15 +50,7 @@ class StrategySelector:
                 log.warning("unknown_strategy", name=name)
 
         names = [s.name for s in self._strategies]
-        if self._calendar:
-            names.append(self._calendar.name)
-        if self._event_straddle:
-            names.append(self._event_straddle.name)
-        log.info("strategies_loaded",
-                 count=len(self._strategies)
-                       + (1 if self._calendar else 0)
-                       + (1 if self._event_straddle else 0),
-                 names=names)
+        log.info("strategies_loaded", count=len(self._strategies), names=names)
 
     def generate_calendar_signals(
         self,
@@ -77,20 +60,13 @@ class StrategySelector:
         confidence: float,
         iv_rank: float,
     ) -> list[Signal]:
-        """Calendar spreads need 2+ expiry chains, separate code path."""
-        if self._calendar is None:
-            return []
-        try:
-            return self._calendar.generate_signals(
-                symbol=symbol,
-                chains=chains,
-                market_direction=market_direction,
-                confidence=confidence,
-                iv_rank=iv_rank,
-            )
-        except Exception as e:
-            log.warning("calendar_signal_error", symbol=symbol, error=str(e))
-            return []
+        """R12-C stub: CalendarSpread retired to deprecated/src/calendar.py.
+
+        Kept because the orchestrator still calls this unconditionally; it
+        already returned [] whenever calendar_spread wasn't configured (it
+        never was in config.yaml), so this is behavior-identical.
+        """
+        return []
 
     def generate_event_straddle_signals(
         self,
@@ -101,21 +77,13 @@ class StrategySelector:
         iv_rank: float,
         economic_cal=None,
     ) -> list[Signal]:
-        """Event-driven straddle: needs economic_cal + multi-expiry, separate path."""
-        if self._event_straddle is None:
-            return []
-        try:
-            return self._event_straddle.generate_signals(
-                symbol=symbol,
-                chains=chains,
-                market_direction=market_direction,
-                confidence=confidence,
-                iv_rank=iv_rank,
-                economic_cal=economic_cal,
-            )
-        except Exception as e:
-            log.warning("event_straddle_signal_error", symbol=symbol, error=str(e))
-            return []
+        """R12-C stub: EventStraddle retired to deprecated/src/event_straddle.py.
+
+        Kept because the orchestrator still calls this unconditionally; it
+        already returned [] whenever event_straddle wasn't configured (it
+        never was in config.yaml), so this is behavior-identical.
+        """
+        return []
 
     def generate_all_signals(
         self,
@@ -173,11 +141,11 @@ class StrategySelector:
 
     # Strategies that profit from selling premium (short vega)
     SELLING_STRATEGIES = frozenset({
-        "covered_call", "cash_secured_put", "iron_condor", "short_strangle",
+        "iron_condor", "short_strangle",
     })
     # Strategies that profit from buying premium (long vega)
     BUYING_STRATEGIES = frozenset({
-        "long_call", "long_put", "long_straddle", "event_straddle",
+        "long_call", "long_put", "long_straddle",
     })
 
     def _rank_signals(self, signals: list[Signal]) -> list[Signal]:
@@ -251,10 +219,8 @@ class StrategySelector:
         if market_direction == SignalDirection.BULLISH:
             if iv_rank < 30:
                 recommendations.extend(["long_call", "bull_call_spread"])
-            elif iv_rank > 50:
-                recommendations.extend(["cash_secured_put", "bull_call_spread", "covered_call"])
             else:
-                recommendations.extend(["bull_call_spread", "covered_call"])
+                recommendations.extend(["bull_call_spread"])
 
         elif market_direction == SignalDirection.BEARISH:
             if iv_rank < 30:

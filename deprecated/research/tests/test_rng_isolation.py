@@ -13,6 +13,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
+# R12: long-running suite (subprocess model training) — excluded from the
+# default/CI fast selection; the nightly CI job runs -m slow.
+pytestmark = pytest.mark.slow
+
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -9,11 +9,11 @@ share a single run across all tests that need the same configuration:
   - wf_plain:  no per-window Optuna (fast ablation path)
   - wf_optuna: optimize_per_window=True, n_trials=3
 
-INTENTIONAL DESIGN DECISION — do not add a pytestmark skip gate here:
-These tests run in ~6 minutes (down from ~32 min) thanks to module-scoped
-fixtures that share two WalkForwardBacktester runs across all 31 tests.
-They must stay in the default suite to catch regressions in the dashboard
-enrichment path. An env-var gate was proposed and explicitly rejected.
+R12 supersedes the earlier "no skip gate" decision: even at ~6 minutes this
+module cannot fit the CI fast lane (30-min budget across the whole suite), so
+it carries the `slow` marker and runs in the scheduled slow-nightly CI job
+(-m slow) instead of being silently env-gated off. Run locally any time with
+`pytest tests/test_walkforward_dashboard.py -m slow`.
 """
 
 from __future__ import annotations
@@ -32,6 +32,9 @@ from ait.backtesting.walkforward import (
     _build_optuna_window_data,
     _isnan,
 )
+
+# R12: slow suite — runs in the scheduled slow-nightly CI job (see docstring).
+pytestmark = pytest.mark.slow
 
 
 # ---------------------------------------------------------------------------

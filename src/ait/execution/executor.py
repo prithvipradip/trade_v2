@@ -174,6 +174,14 @@ class TradeExecutor:
         self._order_timeout = order_timeout
         self._pending_orders: dict[int, PendingOrder] = {}  # order_id → PendingOrder
         self._pending_exit_orders: dict[int, PendingExitOrder] = {}  # order_id → PendingExitOrder
+        self._order_trade_map: dict[int, str] = {}  # orderId → trade_id (survives cleanup)
+        # R12 F2.2: strong references to event-spawned tasks. An unreferenced
+        # asyncio task is garbage-collectable mid-flight — the event-driven
+        # fill check could silently die between scheduling and execution.
+        self._bg_tasks: set = set()
+        self._fill_task_pending = False
+        self._cf_running = False
+        self._cf_rerun = False  # R12 F2.3: rerun-requested flag (no dropped passes)
 
     async def execute_signal(self, signal: Signal, contracts: int) -> str | None:
         """Execute a trade signal. Returns trade_id on success, None on failure."""
@@ -237,15 +245,12 @@ class TradeExecutor:
         trade_id = f"T-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
 
         try:
-            if signal.legs:
-                trade = await self._execute_multi_leg(signal, contracts, trade_id)
-            else:
-                trade = await self._execute_single_leg(signal, contracts, trade_id)
-
-            if trade is None:
-                return None
-
-            # Record trade in state
+            # R12 chaos#1 (order-before-row): the PENDING trade row is written
+            # BEFORE placeOrder. The old order (placeOrder first, row second)
+            # left a crash window where a live broker order had NO local
+            # record — the exact untracked-option scenario the reconciler
+            # HALTs on. A PENDING row with no broker order is the benign
+            # direction: it is swept/cancelled by the reconciler.
             legs_json = json.dumps([
                 {
                     "strike": self._leg_fields(leg)[0],
@@ -279,6 +284,23 @@ class TradeExecutor:
                 legs=legs_json,
             )
             self._state.record_trade(record)
+
+            if signal.legs:
+                trade = await self._execute_multi_leg(signal, contracts, trade_id)
+            else:
+                trade = await self._execute_single_leg(signal, contracts, trade_id)
+
+            if trade is None:
+                # R12 chaos#1 + Tier-A #1: placement failed/refused — retire
+                # the pre-written PENDING row via CAS. CANCELLED is included
+                # in the from-set so inner reject paths that already flipped
+                # the row don't produce a spurious illegal-transition warning.
+                self._state.transition(
+                    trade_id,
+                    (TradeStatus.PENDING, TradeStatus.CANCELLED),
+                    TradeStatus.CANCELLED,
+                )
+                return None
 
             # Track pending order for fill monitoring
             if trade.order.orderId:
@@ -320,6 +342,17 @@ class TradeExecutor:
                 symbol=signal.symbol,
                 error=str(e),
             )
+            # R12 chaos#1: retire the pre-written PENDING row (CAS; no-op with
+            # a warning if the row was never written because record_trade
+            # itself failed). CANCELLED in the from-set keeps this idempotent.
+            try:
+                self._state.transition(
+                    trade_id,
+                    (TradeStatus.PENDING, TradeStatus.CANCELLED),
+                    TradeStatus.CANCELLED,
+                )
+            except Exception:  # noqa: BLE001 — cleanup must not mask the original error
+                pass
             self._circuit_breaker.record_api_failure()
             return None
 
@@ -358,7 +391,11 @@ class TradeExecutor:
             if spread_pct > 0.15:
                 log.warning("wide_spread_rejected", trade_id=trade_id,
                             bid=bid, ask=ask, spread_pct=f"{spread_pct:.1%}")
-                self._state.update_trade_status(trade_id, TradeStatus.CANCELLED)
+                # R12 Tier-A #1: CAS PENDING->CANCELLED (row now exists —
+                # chaos#1 writes it before placement, so this reject is a
+                # real state write, not the historical no-op).
+                self._state.transition(
+                    trade_id, (TradeStatus.PENDING,), TradeStatus.CANCELLED)
                 return None
 
         if bid > 0 and ask > 0 and ask > bid:
@@ -442,7 +479,9 @@ class TradeExecutor:
         if _err:
             log.error("combo_legs_rejected", trade_id=trade_id,
                       strategy=signal.strategy_name, reason=_err)
-            self._state.update_trade_status(trade_id, TradeStatus.CANCELLED)
+            # R12 Tier-A #1: CAS PENDING->CANCELLED
+            self._state.transition(
+                trade_id, (TradeStatus.PENDING,), TradeStatus.CANCELLED)
             return None
 
         combo = ContractBuilder.combo(
@@ -480,14 +519,18 @@ class TradeExecutor:
                 if abs(_mid) > 0.05 and _spread / abs(_mid) > 1.0:
                     log.warning("combo_spread_disorderly_rejected",
                                 trade_id=trade_id, bid=_bid, ask=_ask)
-                    self._state.update_trade_status(trade_id, TradeStatus.CANCELLED)
+                    # R12 Tier-A #1: CAS PENDING->CANCELLED
+                    self._state.transition(
+                        trade_id, (TradeStatus.PENDING,), TradeStatus.CANCELLED)
                     return None
                 # combo quotes are signed; compare magnitudes
                 if abs(_mid) > 0.05 and abs(abs(signal.entry_price) - abs(_mid)) / abs(_mid) > 0.35:
                     log.warning("combo_signal_price_stale_rejected",
                                 trade_id=trade_id,
                                 signal_px=signal.entry_price, live_mid=_mid)
-                    self._state.update_trade_status(trade_id, TradeStatus.CANCELLED)
+                    # R12 Tier-A #1: CAS PENDING->CANCELLED
+                    self._state.transition(
+                        trade_id, (TradeStatus.PENDING,), TradeStatus.CANCELLED)
                     return None
                 # R7: keep the live quote — it becomes the PRICING anchor
                 # (was fetched for validation then thrown away) and the
@@ -574,7 +617,26 @@ class TradeExecutor:
                         self._fill_task_pending = False
                         log.warning("event_fill_check_failed", error=str(_e))
 
-                _aio.get_event_loop().create_task(_run())
+                # R12 F2.1: create_task failure used to leave
+                # _fill_task_pending wedged True FOREVER — every later fill
+                # event returned early and event-driven detection silently
+                # died for the session. Reset the flag in the except.
+                # R12 F2.2: keep a strong reference to the task (unreferenced
+                # tasks are GC-cancellable mid-flight); discard on done.
+                # get_running_loop (not get_event_loop): ib_insync fires this
+                # on the loop thread, and get_event_loop is deprecated /
+                # wrong-loop-prone outside it.
+                try:
+                    _task = _aio.get_running_loop().create_task(_run())
+                    _bg = getattr(self, "_bg_tasks", None)
+                    if _bg is None:
+                        _bg = self._bg_tasks = set()
+                    _bg.add(_task)
+                    _task.add_done_callback(_bg.discard)
+                except Exception as _sched_err:  # noqa: BLE001
+                    self._fill_task_pending = False
+                    log.warning("event_fill_task_schedule_failed",
+                                error=str(_sched_err))
             except Exception:  # noqa: BLE001 — event handler must never raise
                 pass
 
@@ -587,12 +649,30 @@ class TradeExecutor:
     async def check_fills_safe(self) -> tuple[list[str], list[dict]]:
         """R11: reentrancy guard — the event-driven path and the 30s monitor
         can both want check_fills; concurrent runs would double-process
-        completed exits."""
+        completed exits.
+
+        R12 F2.3: the busy-guard used to DROP the concurrent request — a fill
+        event arriving during a monitor pass was simply never processed until
+        the next 30s poll (exactly the latency the event path exists to
+        remove). Now the loser sets a rerun flag and the running pass loops
+        until no rerun is requested (bounded, so an event storm can't spin
+        this forever — the 30s monitor is still behind us).
+        """
         if getattr(self, "_cf_running", False):
+            self._cf_rerun = True  # R12 F2.3: queue a rerun instead of dropping
             return [], []
         self._cf_running = True
         try:
-            return await self.check_fills()
+            filled_all: list[str] = []
+            exits_all: list[dict] = []
+            for _pass in range(4):  # initial pass + up to 3 queued reruns
+                self._cf_rerun = False
+                filled, exits = await self.check_fills()
+                filled_all.extend(filled)
+                exits_all.extend(exits)
+                if not getattr(self, "_cf_rerun", False):
+                    break
+            return filled_all, exits_all
         finally:
             self._cf_running = False
 
@@ -633,7 +713,14 @@ class TradeExecutor:
             if status == "filled":
                 # Get actual fill price if available
                 actual_price = self._get_fill_price(order_id, all_trades, pending)
-                self._update_trade_filled(pending, actual_price)
+                # R12 F4.4: pass the TRUE filled quantity from orderStatus —
+                # a PARTIAL pass may have shrunk trades/open_positions to the
+                # partial quantity, and the old FILLED write never restored it.
+                true_qty = self._get_filled_quantity(order_id, all_trades, pending)
+                self._update_trade_filled(
+                    pending, actual_price,
+                    filled_qty=true_qty if true_qty > 0 else pending.contracts,
+                )
                 filled.append(pending.trade_id)
                 log.info(
                     "trade_filled",
@@ -753,31 +840,61 @@ class TradeExecutor:
                         estimated_pnl=realized_pnl,
                     )
 
-                self._state.close_trade(
+                # R12 Tier-A #1: close_trade is now a CAS from an open status.
+                # A refused close (trade already CLOSED by another path) must
+                # NOT emit a completed-exit event — the orchestrator callback
+                # would double-book daily stats/Thompson on it.
+                closed_ok = self._state.close_trade(
                     trade_id=pending_exit.trade_id,
                     exit_price=actual_exit_price if actual_exit_price is not None else 0.0,
                     realized_pnl=realized_pnl,
                     exit_reason_detailed=exit_reason,
                 )
-                completed_exits.append({
-                    "trade_id": pending_exit.trade_id,
-                    "exit_price": actual_exit_price if actual_exit_price is not None else 0.0,
-                    "realized_pnl": realized_pnl,
-                    "exit_reason": exit_reason,
-                })
-                log.info(
-                    "exit_order_filled",
-                    trade_id=pending_exit.trade_id,
-                    actual_exit_price=actual_exit_price,
-                    realized_pnl=realized_pnl,
-                )
+                if closed_ok is not False:  # True or legacy None both count
+                    completed_exits.append({
+                        "trade_id": pending_exit.trade_id,
+                        "exit_price": actual_exit_price if actual_exit_price is not None else 0.0,
+                        "realized_pnl": realized_pnl,
+                        "exit_reason": exit_reason,
+                    })
+                    log.info(
+                        "exit_order_filled",
+                        trade_id=pending_exit.trade_id,
+                        actual_exit_price=actual_exit_price,
+                        realized_pnl=realized_pnl,
+                    )
+                else:
+                    log.warning(
+                        "exit_close_refused_already_terminal",
+                        trade_id=pending_exit.trade_id,
+                        order_id=order_id,
+                    )
+                del self._pending_exit_orders[order_id]
+
+            elif exit_status == "partial":
+                # R12 F4.3 (exit partial-fill-then-cancel): the exit order
+                # died with SOME contracts closed. The old code fell into the
+                # "cancelled" branch and reverted the trade to FILLED at its
+                # ORIGINAL quantity — the next exit then re-sold the already-
+                # closed contracts, flipping the book into a naked short.
+                # Book the closed portion (partial exit + quantity reduction,
+                # mirroring the entry-partial path) and hand the REMAINDER
+                # back to the portfolio monitor via CLOSING->FILLED.
+                self._book_partial_exit(order_id, pending_exit, all_trades,
+                                        completed_exits)
                 del self._pending_exit_orders[order_id]
 
             elif exit_status == "cancelled":
                 # Exit order was cancelled/rejected — revert to FILLED so
                 # portfolio manager will re-trigger an exit next cycle.
-                self._state.update_trade_status(
-                    pending_exit.trade_id, TradeStatus.FILLED,
+                # R12 Tier-A #1 (F4.5): CAS CLOSING->FILLED ONLY. The blind
+                # UPDATE could resurrect a trade another path had already
+                # CLOSED (restart race) — a re-managed ghost position whose
+                # "exit" would open a fresh naked position.
+                self._state.transition(
+                    pending_exit.trade_id,
+                    (TradeStatus.CLOSING,),
+                    TradeStatus.FILLED,
                 )
                 log.warning(
                     "exit_order_cancelled",
@@ -815,8 +932,12 @@ class TradeExecutor:
                         trade_id=pending_exit.trade_id,
                         age_seconds=int(pending_exit.age_seconds),
                     )
-                    self._state.update_trade_status(
-                        pending_exit.trade_id, TradeStatus.FILLED,
+                    # R12 Tier-A #1 (F4.5): CAS CLOSING->FILLED only — never
+                    # resurrect a trade that reached CLOSED via another path.
+                    self._state.transition(
+                        pending_exit.trade_id,
+                        (TradeStatus.CLOSING,),
+                        TradeStatus.FILLED,
                     )
                     del self._pending_exit_orders[order_id]
 
@@ -921,6 +1042,22 @@ class TradeExecutor:
                 except Exception as e:
                     log.warning("cancel_failed", order_id=order_id, error=str(e))
 
+    def _is_foreign_open_order(self, order_id: int) -> bool:
+        """R12 F3.1 / chaos#4B: True when this orderId was seen working at the
+        broker under ANOTHER clientId (stashed at fallback-reconnect time).
+        Such orders are invisible to this session's trade list — their
+        absence is NOT evidence of a cancel."""
+        foreign = getattr(self._ibkr, "foreign_open_order_ids", None) or set()
+        if order_id in foreign:
+            log.warning(
+                "cancel_verdict_refused_foreign_order",
+                order_id=order_id,
+                note="order is working under a previous clientId session; "
+                     "treating as pending, not cancelled",
+            )
+            return True
+        return False
+
     def _determine_fill_status(
         self, order_id: int, all_trades: list, pending: PendingOrder
     ) -> str:
@@ -939,7 +1076,12 @@ class TradeExecutor:
                     # a status neither the portfolio monitor nor the
                     # reconciler ever re-adopts — while the filled contracts
                     # were LIVE at IBKR with no stop/TP/expiry management.
-                    return "partial" if filled_qty > 0 else "cancelled"
+                    if filled_qty > 0:
+                        return "partial"
+                    # R12 F3.1: never issue a cancel verdict for an order the
+                    # broker showed WORKING under another clientId.
+                    return "pending" if self._is_foreign_open_order(order_id) \
+                        else "cancelled"
                 elif status in ("submitted", "presubmitted"):
                     return "pending"  # Still working
 
@@ -948,6 +1090,8 @@ class TradeExecutor:
                     return "partial"
                 elif filled_qty > 0:
                     return "filled"
+                elif self._is_foreign_open_order(order_id):  # R12 F3.1
+                    return "pending"
                 else:
                     return "cancelled"
 
@@ -957,6 +1101,11 @@ class TradeExecutor:
         # disconnect flipped EVERY working entry to CANCELLED while live at
         # IBKR. Mirror the exit path: treat young/unknown as still pending.
         if pending.age_seconds < 30:
+            return "pending"
+        # R12 F3.1: an order placed before a fallback-clientId reconnect is
+        # ABSENT from this session's trade list by construction — that is the
+        # mass-false-CANCELLED path, not a cancel.
+        if self._is_foreign_open_order(order_id):
             return "pending"
         return "cancelled"
 
@@ -1021,20 +1170,38 @@ class TradeExecutor:
         return 0
 
     def _determine_exit_fill_status(self, order_id: int, all_trades: list) -> str:
-        """Determine whether an exit order filled or was cancelled."""
+        """Determine whether an exit order filled, partially filled, or was cancelled.
+
+        R12 F4.3: mirrors the entry path's FILLED-QTY-FIRST logic. An exit
+        cancelled WITH fills used to return a clean "cancelled" — the caller
+        reverted the trade to FILLED at its original quantity and the next
+        exit OVERSOLD the already-closed contracts (naked short). Now it
+        returns "partial" so the closed slice is booked.
+        """
         for trade in all_trades:
             if trade.order.orderId == order_id:
                 status = trade.orderStatus.status.lower()
+                filled_qty = trade.orderStatus.filled or 0
                 if status in ("filled",):
                     return "filled"
                 elif status in ("cancelled", "inactive", "apicancelled"):
-                    return "cancelled"
+                    # R12 F4.3: filled-qty first — dead order with fills is a
+                    # partial exit, not a clean cancel.
+                    if filled_qty > 0:
+                        return "partial"
+                    # R12 F3.1: refuse cancel verdicts for foreign-session orders.
+                    return "pending" if self._is_foreign_open_order(order_id) \
+                        else "cancelled"
                 elif status in ("submitted", "presubmitted"):
                     return "pending"
 
-                filled_qty = trade.orderStatus.filled or 0
-                if filled_qty > 0:
+                remaining = trade.orderStatus.remaining or 0
+                if filled_qty > 0 and remaining > 0:
+                    return "partial"
+                elif filled_qty > 0:
                     return "filled"
+                elif self._is_foreign_open_order(order_id):  # R12 F3.1
+                    return "pending"
                 return "cancelled"
 
         # Order not found in IBKR trade list yet — assume still pending
@@ -1073,6 +1240,102 @@ class TradeExecutor:
                 return 0.0
             return None
         return None
+
+    def _book_partial_exit(
+        self,
+        order_id: int,
+        pending_exit: PendingExitOrder,
+        all_trades: list,
+        completed_exits: list[dict],
+    ) -> None:
+        """R12 F4.3: book an exit order that terminated with a PARTIAL fill.
+
+        The closed portion gets a real partial-exit record (quantity, price,
+        fill-derived P&L — mirroring the orchestrator's single-leg partial
+        path: record_partial_exit + update_trade_quantity), and the REMAINING
+        contracts revert CLOSING->FILLED so the portfolio monitor re-triggers
+        an exit for them. The old behavior reverted the WHOLE trade to FILLED
+        at its original quantity — the re-triggered exit then oversold the
+        already-closed contracts into a naked short.
+        """
+        trade_id = pending_exit.trade_id
+        trade_record = self._state.get_trade_by_id(trade_id)
+        filled_units = 0
+        for t in all_trades:
+            if t.order.orderId == order_id:
+                filled_units = int(t.orderStatus.filled or 0)
+                break
+        if trade_record is None or filled_units <= 0:
+            # No basis to book — safest is a clean re-trigger of the whole
+            # exit (CAS so a CLOSED trade can never be resurrected).
+            self._state.transition(
+                trade_id, (TradeStatus.CLOSING,), TradeStatus.FILLED)
+            log.warning("exit_partial_unbookable_reverted",
+                        trade_id=trade_id, order_id=order_id,
+                        filled_units=filled_units)
+            return
+
+        exit_price = self._get_exit_fill_price(order_id, all_trades)
+        # Same sign convention as the full-fill path: multi-leg DEBIT exits
+        # fill via a reversed-legs combo whose as-defined price is negative.
+        if (exit_price is not None
+                and trade_record.contract_type in ("spread", "iron_condor")
+                and trade_record.strategy not in CREDIT_STRATEGIES):
+            exit_price = -exit_price
+
+        if filled_units >= trade_record.quantity:
+            # The "partial" verdict covered the whole remaining position
+            # (e.g. cancel raced the last fill) — book a normal full close.
+            exit_reason = pending_exit.exit_reason
+            if exit_price is not None:
+                realized_pnl = self._calculate_realized_pnl(trade_record, exit_price)
+            else:
+                realized_pnl = pending_exit.estimated_pnl
+                exit_reason = f"{exit_reason}|pnl_estimate_no_fill_price"
+            closed_ok = self._state.close_trade(
+                trade_id=trade_id,
+                exit_price=exit_price if exit_price is not None else 0.0,
+                realized_pnl=realized_pnl,
+                exit_reason_detailed=exit_reason,
+            )
+            if closed_ok is not False:  # R12 Tier-A #1: no event on refused close
+                completed_exits.append({
+                    "trade_id": trade_id,
+                    "exit_price": exit_price if exit_price is not None else 0.0,
+                    "realized_pnl": realized_pnl,
+                    "exit_reason": exit_reason,
+                })
+                log.info("exit_order_filled", trade_id=trade_id,
+                         actual_exit_price=exit_price, realized_pnl=realized_pnl,
+                         via="partial_verdict_full_quantity")
+            return
+
+        # True partial: book the closed slice at its real fill price.
+        import dataclasses as _dc
+        closed_slice = _dc.replace(trade_record, quantity=filled_units)
+        partial_pnl = (self._calculate_realized_pnl(closed_slice, exit_price)
+                       if exit_price is not None else 0.0)
+        self._state.record_partial_exit(
+            trade_id=trade_id,
+            quantity=filled_units,
+            price=exit_price if exit_price is not None else 0.0,
+            pnl=partial_pnl,
+        )
+        remaining = int(trade_record.quantity) - filled_units
+        self._state.update_trade_quantity(trade_id, remaining)
+        # Remainder goes back to the monitor for a fresh exit at the REDUCED
+        # quantity. CAS: CLOSING->FILLED only (F4.5).
+        self._state.transition(
+            trade_id, (TradeStatus.CLOSING,), TradeStatus.FILLED)
+        log.warning(
+            "exit_partial_fill_booked",
+            trade_id=trade_id,
+            closed=filled_units,
+            remaining=remaining,
+            exit_price=exit_price,
+            partial_pnl=partial_pnl,
+            exit_reason=pending_exit.exit_reason,
+        )
 
     # Entry cash-flow direction lives in CREDIT_STRATEGIES (strategies/base.py).
     # Everything not listed there is DEBIT — long options, straddles,
@@ -1114,14 +1377,29 @@ class TradeExecutor:
 
         return round(pnl, 2)
 
-    def _update_trade_filled(self, pending: PendingOrder, actual_price: float) -> None:
-        """Update a trade record to FILLED status with actual fill info."""
+    def _update_trade_filled(
+        self, pending: PendingOrder, actual_price: float,
+        filled_qty: int | None = None,
+    ) -> None:
+        """Update a trade record to FILLED status with actual fill info.
+
+        R12 F4.4: takes the TRUE filled quantity from orderStatus. On the
+        PARTIAL->FILLED edge the partial pass had already written the partial
+        quantity into trades/open_positions; the old FILLED write only
+        flipped status, so the position was managed (stops, exits, P&L) at
+        the PARTIAL quantity while the full size was live at the broker.
+        """
         signal = pending.signal
         contract_type = self._get_contract_type(signal)
+        true_qty = int(filled_qty) if filled_qty else pending.contracts
 
-        # Update trade status to FILLED (record_trade uses INSERT OR IGNORE,
-        # so use update_trade_status for existing rows)
-        self._state.update_trade_status(pending.trade_id, TradeStatus.FILLED)
+        # R12 Tier-A #1: CAS — a fill can only land on a PENDING or PARTIAL
+        # entry (blind UPDATE could resurrect CANCELLED/CLOSED rows).
+        self._state.transition(
+            pending.trade_id,
+            (TradeStatus.PENDING, TradeStatus.PARTIAL),
+            TradeStatus.FILLED,
+        )
 
         # Book the REAL fill into trades.entry_price (audit R2/C1): it was
         # only stored in open_positions while every P&L computation read the
@@ -1150,10 +1428,15 @@ class TradeExecutor:
             trade_id=pending.trade_id,
             symbol=signal.symbol,
             contract_type=contract_type,
-            quantity=pending.contracts,
+            quantity=true_qty,
             entry_price=actual_price,
             legs=legs_json,
         )
+        # R12 F4.4: insert_open_position is INSERT OR IGNORE — after a
+        # PARTIAL pass the existing row keeps its partial quantity, and
+        # trades.quantity was shrunk by the partial write too. Explicitly
+        # settle BOTH tables at the broker-reported filled quantity.
+        self._state.update_trade_quantity(pending.trade_id, true_qty)
 
     def _update_trade_partial(
         self, pending: PendingOrder, filled_qty: int, actual_price: float | None = None
@@ -1168,7 +1451,13 @@ class TradeExecutor:
         transitions for real and register the partial position.
         """
         signal = pending.signal
-        self._state.update_trade_status(pending.trade_id, TradeStatus.PARTIAL)
+        # R12 Tier-A #1: CAS — PARTIAL can only follow PENDING (or refresh an
+        # earlier PARTIAL as more contracts fill).
+        self._state.transition(
+            pending.trade_id,
+            (TradeStatus.PENDING, TradeStatus.PARTIAL),
+            TradeStatus.PARTIAL,
+        )
         self._state.update_trade_quantity(pending.trade_id, filled_qty)
         if actual_price is not None and actual_price != 0:
             self._state.update_trade_entry_price(pending.trade_id, abs(actual_price))
@@ -1196,8 +1485,15 @@ class TradeExecutor:
 
     def _update_trade_cancelled(self, pending: PendingOrder) -> None:
         """Update a trade record to CANCELLED status (real write — see
-        _update_trade_partial docstring for the INSERT OR IGNORE no-op bug)."""
-        self._state.update_trade_status(pending.trade_id, TradeStatus.CANCELLED)
+        _update_trade_partial docstring for the INSERT OR IGNORE no-op bug).
+
+        R12 Tier-A #1: CAS from PENDING/PARTIAL only — a cancel verdict must
+        never claw back a trade that has since FILLED or CLOSED."""
+        self._state.transition(
+            pending.trade_id,
+            (TradeStatus.PENDING, TradeStatus.PARTIAL),
+            TradeStatus.CANCELLED,
+        )
 
     def register_exit_order(
         self,
@@ -1227,6 +1523,35 @@ class TradeExecutor:
             "exit_order_registered",
             order_id=order_id,
             trade_id=trade_id,
+        )
+
+    def adopt_exit_order(self, order_id: int, trade_id: str, reason: str) -> None:
+        """R12 F4.1 (CLOSING restart): re-register an exit tracker for a
+        working close order discovered at startup reconcile.
+
+        The in-memory exit tracker dies with the process; before this, a
+        restart mid-close promoted the CLOSING trade back to FILLED and the
+        portfolio placed a SECOND close — when the original order also
+        filled, the position REVERSED. The reconciler now keeps such trades
+        CLOSING and reports the working orderId; the orchestrator calls this
+        to resume tracking (estimated_pnl 0.0 — the real P&L is computed from
+        the actual fill when check_fills books the close).
+        """
+        if order_id in self._pending_exit_orders:
+            log.info("exit_order_already_tracked", order_id=order_id,
+                     trade_id=trade_id)
+            return
+        self.register_exit_order(
+            order_id=order_id,
+            trade_id=trade_id,
+            exit_reason=reason,
+            estimated_pnl=0.0,
+        )
+        log.warning(
+            "exit_order_adopted",
+            order_id=order_id,
+            trade_id=trade_id,
+            reason=reason,
         )
 
     @property

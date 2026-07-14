@@ -43,7 +43,10 @@ _DASHBOARD_FEATURE_KEYS = [
     "rsi_14", "macd", "macd_signal", "macd_hist",
     "sma_20", "sma_50", "bb_upper", "bb_lower", "bb_position",
     "atr_pct", "realized_vol_20", "iv_rank", "vix_level",
-    "hurst_wavelet", "sentiment_composite", "put_call_ratio", "volume_ratio",
+    "hurst_wavelet", "volume_ratio",
+    # R12-C: sentiment_composite / put_call_ratio removed with the
+    # sentiment/flow feature retirement (FeatureEngine no longer emits them;
+    # archived timeseries JSONs that still carry them are simply not rendered).
 ]
 
 # Map from FeatureEngine column name → dashboard key (only where they differ)
@@ -973,8 +976,7 @@ def _feature_library() -> list[dict]:
         {"key": "vix_level", "label": "VIX", "group": "Cross-Asset", "pane": "iv"},
         {"key": "bb_position", "label": "Bollinger %B", "group": "Volatility", "pane": "bb"},
         {"key": "hurst_wavelet", "label": "Hurst (wavelet)", "group": "Fractal", "pane": "fractal"},
-        {"key": "sentiment_composite", "label": "Sentiment", "group": "Sentiment", "pane": "sent"},
-        {"key": "put_call_ratio", "label": "Put/Call Ratio", "group": "Sentiment", "pane": "sent"},
+        # R12-C: Sentiment pane entries removed with the sentiment feature retirement.
     ]
 
 

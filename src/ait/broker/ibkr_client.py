@@ -29,6 +29,13 @@ class IBKRClient:
         self._max_reconnect_attempts = 5
         self._reconnect_delay = 5  # seconds
         self._fx_cache: dict[str, float] = {}  # ccy -> units per 1 USD, cached per session
+        # R12 F3.1 (clientId-fallback blindness): orderIds of working orders
+        # that belong to ANOTHER clientId session (typically our own previous
+        # session after a mid-run reconnect landed on a fallback id). These
+        # orders are invisible to ib.trades()/openTrades() on this session,
+        # so the executor must never read their absence as "cancelled".
+        self.foreign_open_order_ids: set[int] = set()
+        self._ever_connected = False  # distinguishes first connect from mid-session reconnect
 
         # Wire up disconnect handler
         self._ib.disconnectedEvent += self._on_disconnect
@@ -97,6 +104,30 @@ class IBKRClient:
                     log.critical("PAPER_ACCOUNT_ON_LIVE_SESSION", account=account)
                     self._ib.disconnect()
                     return False
+                # R12 F3.1 / chaos#4B: a mid-session reconnect that lands on a
+                # FALLBACK clientId cannot see the previous session's working
+                # orders via ib.trades()/openTrades() — check_fills would read
+                # every one of them as vanished and mass-flip live trades to
+                # CANCELLED. Snapshot all-clients open orders once and stash
+                # their orderIds so the executor refuses those false verdicts.
+                if client_id != base_id and self._ever_connected:
+                    try:
+                        _all_open = await self._ib.reqAllOpenOrdersAsync()
+                        _ids = {
+                            t.order.orderId for t in _all_open
+                            if getattr(t.order, "orderId", 0)
+                        }
+                        self.foreign_open_order_ids |= _ids
+                        log.warning(
+                            "fallback_clientid_foreign_orders_stashed",
+                            client_id=client_id,
+                            base_id=base_id,
+                            foreign_order_ids=sorted(self.foreign_open_order_ids),
+                        )
+                    except Exception as _fo_err:  # noqa: BLE001
+                        log.warning("foreign_open_orders_fetch_failed",
+                                    error=str(_fo_err))
+                self._ever_connected = True
                 log.info(
                     "ibkr_connected",
                     host=self._config.ibkr_host,
@@ -325,6 +356,31 @@ class IBKRClient:
         if not self.connected:
             return []
         return self._ib.openTrades()
+
+    async def get_all_open_trades(self) -> list[Trade] | None:
+        """R12 F4.1: working orders across ALL client ids (reqAllOpenOrders).
+
+        Used by the startup reconciler to decide whether a CLOSING trade
+        still has a live exit order at the broker (possibly placed by a
+        previous session/clientId) before promoting it back to FILLED —
+        promoting past a working close order re-triggers the exit and
+        REVERSES the position when both fill. Returns None when the broker
+        can't be asked (disconnected / request failed) so callers can
+        distinguish "no working orders" from "unknown".
+        """
+        if not self.connected:
+            return None
+        try:
+            trades = await self._ib.reqAllOpenOrdersAsync()
+            return list(trades) if trades is not None else []
+        except Exception as e:  # noqa: BLE001
+            log.warning("req_all_open_orders_failed", error=str(e))
+            # Fall back to this session's view — better than nothing, but
+            # signal degraded coverage by still returning a list.
+            try:
+                return list(self._ib.openTrades())
+            except Exception:  # noqa: BLE001
+                return None
 
     def get_portfolio(self) -> list:
         """Get portfolio items with market value and P&L."""

@@ -13,6 +13,9 @@ import pandas as pd
 
 from ait.data.options_chain import OptionsChain, OptionContract
 from ait.strategies.base import Signal, SignalDirection, Strategy
+from ait.utils.logging import get_logger
+
+log = get_logger("strategies.iron_condor")
 
 
 class IronCondor(Strategy):
@@ -25,6 +28,49 @@ class IronCondor(Strategy):
     @property
     def direction_bias(self) -> SignalDirection | None:
         return None  # Direction neutral
+
+    def _log_entry_quality(
+        self,
+        symbol: str,
+        status: str,
+        reason: str,
+        chain: OptionsChain,
+        short_put: OptionContract | None = None,
+        short_call: OptionContract | None = None,
+        credit: float | None = None,
+        width: float | None = None,
+    ) -> None:
+        """R12-B entry-quality telemetry: one structured line per generated/
+        rejected condor (short deltas, EM multiples, credit/width, atm_iv).
+
+        Evidence: the 07-07 SPY condor filled its short call at 0.49 DELTA
+        (designed 0.20) and left NO trace of the gap between the designed and
+        the filled structure — this line is that audit trail.
+        """
+        em = float(getattr(chain, "expected_move", 0.0) or 0.0)
+        spot = chain.underlying_price
+
+        def _em_mult(dist: float) -> float | None:
+            return round(dist / em, 3) if em > 0 else None
+
+        log.info(
+            "condor_entry_quality",
+            symbol=symbol,
+            status=status,
+            reason=reason,
+            atm_iv=round(float(getattr(chain, "atm_iv", 0.0) or 0.0), 4),
+            expected_move=round(em, 3),
+            short_put_delta=(round(short_put.delta, 3) if short_put else None),
+            short_call_delta=(round(short_call.delta, 3) if short_call else None),
+            put_em_mult=(_em_mult(spot - short_put.strike) if short_put else None),
+            call_em_mult=(_em_mult(short_call.strike - spot) if short_call else None),
+            credit=(round(credit, 2) if credit is not None else None),
+            width=(round(width, 2) if width is not None else None),
+            credit_width_ratio=(
+                round(credit / width, 3)
+                if (credit is not None and width) else None
+            ),
+        )
 
     def _vol_scaled_width(self, price, short_put, short_call_hint, chain) -> float:
         """R6: wing width target = wing_k x price x IV x sqrt(DTE/365), min $2.
@@ -39,7 +85,15 @@ class IronCondor(Strategy):
             v = float(getattr(c, "implied_vol", 0) or 0) if c is not None else 0.0
             if v > 0:
                 iv_vals.append(v)
-        iv = sum(iv_vals) / len(iv_vals) if iv_vals else 0.20
+        if iv_vals:
+            iv = sum(iv_vals) / len(iv_vals)
+        else:
+            # R12-B (vol agent): the flat 0.20 fallback mis-sized wings by
+            # +/-50% vs the chain's real ATM vol. Contract IV stays primary;
+            # the chain's interpolated ATM IV is the fallback; 0.20 survives
+            # only as the last resort when the chain carries no IV at all.
+            _chain_atm_iv = float(getattr(chain, "atm_iv", 0.0) or 0.0)
+            iv = _chain_atm_iv if _chain_atm_iv > 0 else 0.20
         dte = 21
         try:
             from datetime import date as _date, datetime as _dt
@@ -98,10 +152,72 @@ class IronCondor(Strategy):
 
         price = chain.underlying_price
 
+        # R12-B degraded-greeks gate (vol agent): when the feed returns NO
+        # deltas at all (modelGreeks missing chain-wide), closest-match strike
+        # selection is meaningless — this is the exact failure mode that let
+        # the 07-07 SPY condor fill its short call at 0.49 DELTA (designed
+        # 0.20). Reject before selecting anything.
+        if (not any(abs(p.delta) > 0 for p in liquid_puts)
+                and not any(abs(c.delta) > 0 for c in liquid_calls)):
+            self._log_entry_quality(symbol, "rejected", "degraded_greeks", chain)
+            return []
+
         # Put side (below price):
         # Sell put at delta ~0.20, buy put 1-2 strikes lower
+        # (R12-B: _find_strike_by_delta now enforces target +/- 0.07)
         short_put = self._find_strike_by_delta(liquid_puts, 0.20)
         if not short_put:
+            self._log_entry_quality(
+                symbol, "rejected", "short_put_outside_delta_tolerance", chain)
+            return []
+
+        # Call side (above price):
+        # Sell call at delta ~0.20, buy call 1-2 strikes higher
+        short_call = self._find_strike_by_delta(liquid_calls, 0.20)
+        if not short_call:
+            self._log_entry_quality(
+                symbol, "rejected", "short_call_outside_delta_tolerance",
+                chain, short_put)
+            return []
+
+        # R12-B DELTA BAND (vol agent): enforce the DESIGNED trade. Credit
+        # floors monotonically reward closer-to-ATM shorts, so without an
+        # upper delta bound a mis-selected 0.49-delta short PASSES every gate
+        # more easily than the intended 0.20 ("the gate stack's equilibrium,
+        # not an accident"). Both shorts must sit in |delta| [0.15, 0.30].
+        _band_lo = float(os.environ.get("AIT_IC_DELTA_MIN", "0.15"))
+        _band_hi = float(os.environ.get("AIT_IC_DELTA_MAX", "0.30"))
+        _spd, _scd = abs(short_put.delta), abs(short_call.delta)
+        if _spd == 0 and _scd == 0:
+            # Deltas 0/missing on BOTH shorts — the degraded-greeks failure
+            # mode that produced the 0.49-delta fill.
+            self._log_entry_quality(
+                symbol, "rejected", "degraded_greeks", chain, short_put, short_call)
+            return []
+        if not (_band_lo <= _spd <= _band_hi and _band_lo <= _scd <= _band_hi):
+            self._log_entry_quality(
+                symbol, "rejected", "delta_band", chain, short_put, short_call)
+            return []
+
+        # R12-B EM SANITY GATE (vol agent): each short strike must sit within
+        # [0.6, 1.3] x expected move of spot — a delta-independent second
+        # opinion on strike placement (a 0.49-delta short sits ~0 EMs from
+        # spot; a 0.05-delta short sits far outside; both are NOT the designed
+        # ~0.20-delta / ~1-EM condor). Reject when EM is unavailable: we
+        # cannot verify the structure we'd be selling.
+        _em = float(getattr(chain, "expected_move", 0.0) or 0.0)
+        _em_lo = float(os.environ.get("AIT_IC_EM_MIN", "0.6"))
+        _em_hi = float(os.environ.get("AIT_IC_EM_MAX", "1.3"))
+        if _em <= 0:
+            self._log_entry_quality(
+                symbol, "rejected", "em_unavailable", chain, short_put, short_call)
+            return []
+        _put_dist = price - short_put.strike
+        _call_dist = short_call.strike - price
+        if not (_em_lo * _em <= _put_dist <= _em_hi * _em
+                and _em_lo * _em <= _call_dist <= _em_hi * _em):
+            self._log_entry_quality(
+                symbol, "rejected", "em_gate", chain, short_put, short_call)
             return []
 
         # R6 (user-approved): wing width was a strike-grid artifact ("2nd
@@ -114,6 +230,8 @@ class IronCondor(Strategy):
             key=lambda p: p.strike, reverse=True,
         )
         if not long_put_candidates:
+            self._log_entry_quality(
+                symbol, "rejected", "no_put_wing", chain, short_put, short_call)
             return []
         _wing_target = self._vol_scaled_width(price, short_put, short_call_hint=None, chain=chain)
         long_put = min(
@@ -121,18 +239,14 @@ class IronCondor(Strategy):
             key=lambda pc: abs((short_put.strike - pc.strike) - _wing_target),
         )
 
-        # Call side (above price):
-        # Sell call at delta ~0.20, buy call 1-2 strikes higher
-        short_call = self._find_strike_by_delta(liquid_calls, 0.20)
-        if not short_call:
-            return []
-
         # Vol-scaled call wing (see put side, R6)
         long_call_candidates = sorted(
             [c for c in liquid_calls if c.strike > short_call.strike],
             key=lambda c: c.strike,
         )
         if not long_call_candidates:
+            self._log_entry_quality(
+                symbol, "rejected", "no_call_wing", chain, short_put, short_call)
             return []
         _wing_target = self._vol_scaled_width(price, short_put, short_call_hint=short_call, chain=chain)
         long_call = min(
@@ -142,6 +256,8 @@ class IronCondor(Strategy):
 
         # Verify structure: long_put < short_put < price < short_call < long_call
         if not (long_put.strike < short_put.strike < price < short_call.strike < long_call.strike):
+            self._log_entry_quality(
+                symbol, "rejected", "structure_invalid", chain, short_put, short_call)
             return []
 
         # Calculate pricing
@@ -150,6 +266,8 @@ class IronCondor(Strategy):
         total_credit = put_credit + call_credit
 
         if total_credit <= 0:
+            self._log_entry_quality(
+                symbol, "rejected", "non_positive_credit", chain, short_put, short_call)
             return []
 
         # R6 (user-approved): cost floor — at a 50% take-profit the gross
@@ -158,6 +276,11 @@ class IronCondor(Strategy):
         # cost-dominated regardless of hit rate.
         min_credit = float(os.environ.get("AIT_IC_MIN_CREDIT", "0.70"))
         if total_credit < min_credit:
+            self._log_entry_quality(
+                symbol, "rejected", "credit_floor", chain, short_put, short_call,
+                credit=total_credit,
+                width=max(short_put.strike - long_put.strike,
+                          long_call.strike - short_call.strike))
             return []
 
         # R7: credit-to-width ratio gate — the absolute floor alone lets a
@@ -168,6 +291,9 @@ class IronCondor(Strategy):
         _mw = max(put_w, call_w)
         min_ratio = float(os.environ.get("AIT_IC_MIN_CREDIT_WIDTH", "0.20"))
         if _mw > 0 and (total_credit / _mw) < min_ratio:
+            self._log_entry_quality(
+                symbol, "rejected", "credit_width_ratio", chain,
+                short_put, short_call, credit=total_credit, width=_mw)
             return []
 
         # Max loss = wider spread width - total credit
@@ -177,6 +303,9 @@ class IronCondor(Strategy):
         max_loss = (max_width - total_credit) * 100
 
         if max_loss <= 0:
+            self._log_entry_quality(
+                symbol, "rejected", "non_positive_max_loss", chain,
+                short_put, short_call, credit=total_credit, width=max_width)
             return []
 
         max_profit = total_credit * 100
@@ -185,6 +314,11 @@ class IronCondor(Strategy):
         take_profit = round(total_credit * 0.50, 2)
         # Stop loss at 2x credit received
         stop_loss = round(total_credit * 2.0, 2)
+
+        # R12-B: entry-quality telemetry for the ACCEPTED condor.
+        self._log_entry_quality(
+            symbol, "generated", "all_gates_passed", chain,
+            short_put, short_call, credit=total_credit, width=max_width)
 
         return [
             Signal(
