@@ -9,9 +9,29 @@ $3,000 CAD.
 - Real track record since the 2026-07-06 reset: **9 closes, +$280.20**, with real broker
   commissions booked. Open book: 1 IWM long straddle, held into CPI deliberately (it is
   long vol). Zero short premium through the print.
+- **R12 DEPLOYED 2026-07-14 09:09 ET** (commit b154459, tag `deploy-20260714`): fast lane
+  626 pass / 0 fail, SMOKE PASS (12 checks), first-RTH liveness clean (fresh heartbeat,
+  cycles, trading_verified ×2, marks updating). `scan_symbol_timing` unobservable on
+  deploy day — the CPI-day `economic_event_skip` gate short-circuits before it; confirm 07-15.
 - The machine works — real fills, real costs, honest scoreboard, layered protection.
   **Edge is still unproven**, and R9's statistics say 50 closes is only a preliminary read.
-- 12 audit rounds complete (~250 defects fixed). Newest rounds at the top.
+- 12 audit rounds complete (~250 defects fixed). Newest rounds at the top. R13 in flight.
+
+## INCIDENT 2026-07-13 — the R12 reversal bug fired in the wild, pre-R12-load
+Monday's macro-flatten exits **triple-filled**. Ledger proof (executions table): NVDA condor
+T-20260706-140054 closed by order 261874 (17:30:44Z, P&L booked −$127.7 net), then the SAME
+exit combo re-placed and re-filled as 261926 (17:31:44Z) and 261902 (17:32:26Z, both P&L
+$0 in books). First fill closed the condor; the extra fills built an inverse position —
+**duplicate close → position REVERSAL, the exact class R12's CAS state machine kills** —
+~25 min before the 13:57 retrain reload could load any R12 code. QQQ (261908) and IWM
+(261914) each double-filled once. Result: **12 untracked legs at the broker** = 4 accidental
+reverse iron condors (long-vol debit, defined risk): IWM 290/288P+310/312C ×1,
+QQQ 690/688P+753/755C ×1, NVDA 185/175P+210/220C ×2 — ~$955 premium, expiry 07-24, theta
+bleed now that CPI has printed. The untracked-option tripwire worked: HALT_UNTRACKED at
+09:00 07-14, entries frozen, exits unaffected. Books are NOT contaminated (each close booked
+once, off the first real fill); account NLV vs track-record P&L will diverge by these
+positions' outcome until resolved. The duplicate executions DO sit in the executions ledger
+under their old trade_ids — the shadow referee (R13) must flag exactly this class.
 
 **Doc map:** `docs/AUDIT_R12.md` (sophistication/maturity decision sheet) ·
 `docs/GAP_AUDIT_R7.md` (component gaps) · `docs/BENCHMARKS_R9.md` (measured latency /
@@ -29,6 +49,8 @@ is retired-not-deleted and loaded by nothing.
 | U2 | **Enable Windows auto-logon** (Sysinternals Autologon + lock on logon) | Every recovery layer starts from Startup shortcuts that need a human logon. A forced reboot at 2pm = book unprotected until someone logs in; first signal is a *missing* digest at 16:05. |
 | U3 | **Start the Windows Time service** (`net start w32time & w32tm /resync`) | w32time is NOT RUNNING on a box that already had a 2-hour clock error. A clock jump silently kills all stop/TP protection AND disarms the hang detector — both read the same wrong clock. |
 | U4 | Cloud-sync `~/Documents/ait_backups` | The mirror exists but shares a failure domain with the box. |
+| U5 | **Resolve the 4 untracked reverse iron condors at IBKR, then delete `data/HALT_UNTRACKED`** (see INCIDENT 2026-07-13). Recommendation: close them — CPI (the catalyst they accidentally straddle) has printed; they are pure theta bleed to 07-24. They are NOT in the bot's books and must not be adopted (they'd contaminate the sample). Entries stay frozen until the file is deleted. | ~$955 of unbooked defined-risk premium decaying; entry freeze blocks sample-building. |
+| U6 | **Live market data entitlement degraded**: Error 10089/354 ("requires additional subscription for API") on live quote requests since ≥07-09, low-rate but constant. Broker-side marks still flow (account stream), so exits function. Likely fix: log the live account out of mobile/web (one-data-slot rule) and/or restart the Gateway so entitlements reload at login. | Entry pricing quality + option marks during scans; known class from the 06-30/07-02 saga. |
 
 ---
 
