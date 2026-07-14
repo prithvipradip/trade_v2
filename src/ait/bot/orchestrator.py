@@ -1850,6 +1850,73 @@ class TradingOrchestrator:
             self._watchdog.record_error("ibkr", "disconnected during exit")
             return
 
+        # R13 (human-factors #2) / R14: the position must still exist at the
+        # broker, WHOLE, before we reverse it. Nothing here used to check:
+        # after a manual TWS flatten (or any close the bot missed) the monitor
+        # still demanded the exit, and the reverse combo REBUILT the position
+        # inverted — the 07-13 incident's end-state, reachable by an operator
+        # with no bug at all.
+        #
+        # "unknown" (wedged feed, unkeyable shape) must always PROCEED: a data
+        # problem must never silently disable a stop.
+        try:
+            liveness = await self._reconciler.position_liveness(trade)
+        except Exception as _e:  # noqa: BLE001 — never let the check kill an exit
+            log.warning("exit_liveness_check_failed",
+                        trade_id=pos.trade_id, error=str(_e))
+            liveness = "unknown"
+
+        if liveness == "gone":
+            # Confirmed absent against a FRESH broker query. Refuse the
+            # reverse combo — and BOOK the trade here. reconcile()'s
+            # stale-local loop cannot: its zero-options guard fires on exactly
+            # this state (the last open position manually flattened), so
+            # without this the row would sit FILLED forever, re-demanding an
+            # exit that is refused every pass.
+            log.critical(
+                "exit_refused_position_not_at_broker",
+                trade_id=pos.trade_id, symbol=pos.symbol,
+                reason=pos.exit_reason,
+                note="legs confirmed absent at IBKR (manual close? missed "
+                     "fill?) — reversing would OPEN an inverse position",
+            )
+            booked = await self._reconciler.book_vanished_trade(trade)
+            if self._alert_gate(f"exit_refused:{pos.trade_id}"):
+                _tail = ("Booked closed from broker records."
+                         if booked else
+                         "NOTE: booking it failed — the row needs manual review.")
+                await self._send_notification(
+                    f"EXIT REFUSED (position not at broker): {pos.symbol} "
+                    f"{trade.strategy} — the bot wanted to exit but its legs "
+                    f"are gone at IBKR (confirmed by a fresh query). No order "
+                    f"placed. {_tail}"
+                )
+            return
+
+        if liveness == "partial":
+            # SOME legs gone (manual half-flatten, assignment). The reverse
+            # combo reverses ALL stored legs, so the already-flat ones would be
+            # OPENED as new, inverted, unmanaged positions — a naked short in
+            # the worst case. That is the very incident class this gate exists
+            # to prevent, so refuse and escalate: we never auto-close half a
+            # structure (reconcile() takes the same line).
+            log.critical(
+                "exit_refused_partial_structure",
+                trade_id=pos.trade_id, symbol=pos.symbol,
+                reason=pos.exit_reason,
+                note="only SOME legs live at IBKR — a full reverse combo would "
+                     "OPEN inverted positions on the missing legs; needs a human",
+            )
+            if self._alert_gate(f"exit_partial:{pos.trade_id}"):
+                await self._send_notification(
+                    f"EXIT REFUSED (partial structure): {pos.symbol} "
+                    f"{trade.strategy} — only SOME legs are still at IBKR "
+                    f"(manual close? assignment?). Reversing all legs would "
+                    f"open new inverted positions, so no order was placed. "
+                    f"This needs you: close the remainder at IBKR."
+                )
+            return
+
         try:
             exit_trade = None
 
@@ -2064,6 +2131,29 @@ class TradingOrchestrator:
         except Exception as e:
             log.error("partial_exit_failed", trade_id=pos.trade_id, error=str(e))
 
+    @staticmethod
+    def _defined_risk_width(legs: list[dict]) -> float | None:
+        """R13: max vertical width (per share) of a defined-risk structure —
+        the wider wing of an iron condor, or a vertical's strike distance.
+        This is the STRUCTURAL bound on what closing a credit position can
+        ever be worth: the wings cap the loss, so paying more than the width
+        to buy it back is, by construction, a bad quote rather than a real
+        price. None when the shape isn't a clean vertical set (straddles,
+        strangles) — then there is no structural bound to enforce."""
+        by_right: dict[str, list[float]] = {}
+        for leg in legs:
+            try:
+                right = str(leg["right"]).upper()[:1]
+                by_right.setdefault(right, []).append(float(leg["strike"]))
+            except (KeyError, TypeError, ValueError):
+                return None
+        widths = []
+        for strikes in by_right.values():
+            if len(strikes) != 2:
+                return None  # not a vertical pair on this side
+            widths.append(abs(strikes[0] - strikes[1]))
+        return max(widths) if widths else None
+
     async def _close_multi_leg(self, trade: TradeRecord, legs: list[dict]):
         """Close a multi-leg position by reversing the combo."""
         qualified_legs = []
@@ -2100,6 +2190,7 @@ class TradingOrchestrator:
 
         # Try to get mid-price from IBKR for a limit order
         limit_price = None
+        EXIT_CROSS = self._settings.exit.exit_cross_amount
         try:
             qualified_combo = await self._ibkr.qualify_contract(combo)
             if qualified_combo:
@@ -2133,7 +2224,6 @@ class TradingOrchestrator:
                     # and re-placed every 30s forever — the IWM strangle sat
                     # on a +54% gain it couldn't take). BUY pays up to the ask,
                     # SELL accepts down to the bid.
-                    EXIT_CROSS = self._settings.exit.exit_cross_amount
                     if combo_action == "BUY":
                         if ask is not None:
                             limit_price = round(ask + EXIT_CROSS, 2)
@@ -2147,17 +2237,109 @@ class TradingOrchestrator:
         except Exception as e:
             log.warning("combo_mid_price_failed", error=str(e))
 
-        # Use market order as fallback if we couldn't get a limit price.
-        # Negative limits are valid (closing a debit position nets a credit).
-        if limit_price is not None and limit_price != 0:
+        # R13 (market-catastrophe lens): the exit had NO price sanity bound —
+        # `ask + cross` with no ceiling, and a MARKET order on a 4-leg BAG
+        # exactly when quotes evaporate (executed proof: a $2-wide condor with
+        # a garbage 9.90 ask placed BUY LMT 10.00 — 5x the wing width, i.e.
+        # 5x the structural max loss). The entry's GOV-1 fat-finger guard
+        # never covered this path.
+        is_credit = trade.strategy in CREDIT_STRATEGIES
+        width = self._defined_risk_width(legs)
+
+        # A credit buyback (positive as-defined price = cost to close) can
+        # never rationally exceed the wing width — that IS the max loss the
+        # structure was sold to cap. Cap AT the width, not below it: a
+        # deep-ITM condor is legitimately worth ~width, and a cap of
+        # width-0.01 would be non-marketable exactly then, leaving the order
+        # to re-place forever while the ITM short carries assignment risk.
+        if is_credit and width and limit_price is not None and limit_price > width:
+            cap = round(width, 2)
+            log.warning(
+                "combo_exit_limit_capped_at_wing_width",
+                symbol=trade.symbol, trade_id=trade.trade_id,
+                quoted_limit=limit_price, wing_width=width, capped_to=cap,
+                note="quote implies paying more than the structural max "
+                     "loss to close — capping at the wings",
+            )
+            limit_price = cap
+
+        # The mirror bound, which the credit-only cap above missed entirely:
+        # closing a DEBIT structure SELLS what we own, so the as-defined quote
+        # is NEGATIVE (we receive credit) and the limit can only be positive by
+        # the spread-crossing buffer on a near-worthless structure. A positive
+        # limit beyond that means the feed handed us a sign-corrupted quote —
+        # the same garbage-quote class as the condor incident — and placing it
+        # would PAY, uncapped, to dispose of a long position. You never pay
+        # more than the cross to get out of something you own.
+        if not is_credit and limit_price is not None and limit_price > EXIT_CROSS:
+            cap = round(EXIT_CROSS, 2)
+            log.warning(
+                "combo_exit_limit_capped_debit_close",
+                symbol=trade.symbol, trade_id=trade.trade_id,
+                quoted_limit=limit_price, capped_to=cap,
+                note="closing a long structure should RECEIVE credit; a "
+                     "positive limit beyond the cross implies a bad quote",
+            )
+            limit_price = cap
+
+        # NOTE: `is not None`, NOT truthiness. A computed limit of exactly
+        # 0.00 is a legitimate, marketable price for a debit close (a dying
+        # straddle bid at the cross amount quotes ask=-0.10, +0.10 cross = 0.00
+        # — BUY LMT 0.00 still fills against any negative offer). Treating it
+        # as "no quote" deferred a perfectly closeable position indefinitely.
+        if limit_price is not None:
             log.info("combo_exit_limit", symbol=trade.symbol, action=combo_action,
                      limit_price=limit_price)
             order = OrderBuilder.combo_limit(
                 action=combo_action, quantity=trade.quantity, limit_price=limit_price
             )
+        elif is_credit and width:
+            # No usable quote on a credit structure. A MARKET order here is
+            # the worst possible choice (unbounded fill on 4 illiquid legs in
+            # exactly the tape where marks vanished). Price AT the wing width:
+            # worst case is the max loss the wings already guarantee, and it
+            # will fill against anything sane.
+            fallback = round(width, 2)
+            log.critical(
+                "combo_exit_no_quote_pricing_at_wing_width",
+                symbol=trade.symbol, trade_id=trade.trade_id,
+                wing_width=width, limit_price=fallback,
+            )
+            if self._alert_gate(f"exit_noquote:{trade.trade_id}"):
+                await self._send_notification(
+                    f"EXIT WITHOUT QUOTES: {trade.symbol} {trade.strategy} — "
+                    f"no combo NBBO, closing at the wing width "
+                    f"(${fallback:.2f}, the structural max loss). Check data "
+                    f"feed."
+                )
+            order = OrderBuilder.combo_limit(
+                action=combo_action, quantity=trade.quantity, limit_price=fallback
+            )
         else:
-            log.info("combo_exit_market_fallback", symbol=trade.symbol, action=combo_action)
-            order = OrderBuilder.market(action=combo_action, quantity=trade.quantity)
+            # No quote and no structural bound (debit shapes, or credit
+            # strangles whose loss ISN'T capped): do NOT dump a multi-leg BAG
+            # at market. For debit shapes deferral is strictly safer (loss
+            # already capped at premium paid). For an unbounded credit shape
+            # both options are bad — a blind market BAG in a no-quote tape is
+            # the known catastrophe (unbounded FILL price), deferral keeps
+            # unbounded MARKET exposure for one more cycle. We defer: the
+            # monitor re-demands the exit every pass, and the operator is
+            # paged below. Retry next cycle.
+            log.critical(
+                "combo_exit_deferred_no_quote",
+                symbol=trade.symbol, trade_id=trade.trade_id,
+                strategy=trade.strategy,
+                note="no combo quote and no structural bound — refusing a "
+                     "market order on a multi-leg BAG; will retry next cycle",
+            )
+            if self._alert_gate(f"exit_deferred:{trade.trade_id}"):
+                await self._send_notification(
+                    f"EXIT DEFERRED (no quotes): {trade.symbol} "
+                    f"{trade.strategy} — refusing to market-order a multi-leg "
+                    f"combo blind. Retrying every cycle. If this repeats, "
+                    f"check the market-data feed."
+                )
+            return None
 
         return await self._ibkr.place_order(combo, order)
 
@@ -2459,6 +2641,22 @@ class TradingOrchestrator:
 
         iv_rank = ((current_vol - vol_min) / vol_range) * 100
         return max(0, min(100, iv_rank))
+
+    def _alert_gate(self, key: str, interval_s: float = 900.0) -> bool:
+        """R14: rate-limit a repeating page. True = send now, False = still
+        inside the window. The exit paths re-demand a refused/deferred exit
+        EVERY monitor pass (nothing enters closing_ids), so an unthrottled
+        page repeats ~every 30s until post-market reconcile books the trade —
+        an alert storm the operator learns to ignore (the R13 human-factors
+        failure). Logs still fire every pass; only the page is gated."""
+        now = time.monotonic()
+        gates: dict[str, float] = getattr(self, "_alert_gate_last", None) or {}
+        self._alert_gate_last = gates
+        last = gates.get(key)
+        if last is not None and (now - last) < interval_s:
+            return False
+        gates[key] = now
+        return True
 
     async def _send_notification(self, message: str) -> None:
         """Send notification via configured channel.

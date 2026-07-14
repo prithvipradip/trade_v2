@@ -355,6 +355,34 @@ class IBKRClient:
             return []
         return self._ib.positions()
 
+    async def get_positions_fresh(self, timeout: float = 8.0) -> list | None:
+        """R14: AUTHORITATIVE position list — re-requested from the broker,
+        not read from the local cache.
+
+        `get_positions()` returns ib_insync's cached `positions()`. That cache
+        is EMPTY, with no error and `connected` still True, whenever the
+        startup reqPositions timed out (connectAsync waits 4s and only logs)
+        or the Gateway reset its position stream. An empty cache is therefore
+        ambiguous: it means either "genuinely flat" or "we never got the
+        data". The reconciler already refuses to mass-close on that ambiguity
+        (reconcile()'s zero-options guard).
+
+        Any code that would take an IRREVERSIBLE action on "the position is
+        gone" must resolve the ambiguity here instead of guessing. Returns
+        None when the broker won't answer — which the caller must treat as
+        "unknown", never as "gone".
+        """
+        if not self.connected:
+            return None
+        try:
+            return await asyncio.wait_for(
+                self._ib.reqPositionsAsync(), timeout=timeout
+            )
+        except Exception as e:  # noqa: BLE001 — incl. TimeoutError; any
+            # failure to answer is "unknown", never "flat".
+            log.warning("fresh_positions_unavailable", error=str(e)[:200])
+            return None
+
     def get_open_orders(self) -> list[Trade]:
         """Get all open/pending orders."""
         if not self.connected:

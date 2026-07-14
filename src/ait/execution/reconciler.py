@@ -172,6 +172,206 @@ class PositionReconciler:
             keys.add(f"{trade.symbol}:STK")
         return keys
 
+    async def position_liveness(self, trade) -> str:
+        """R14: does this trade's structure still exist at the broker, and is
+        it WHOLE? Returns one of:
+
+          "live"    — every leg is present; a reverse combo closes exactly it.
+          "partial" — SOME legs present, some gone (manual half-flatten,
+                      assignment). Reversing all legs would SELL the already-
+                      flat ones and OPEN new inverted positions. Needs a human.
+          "gone"    — authoritatively absent. Reversing would REBUILD the
+                      position inverted (the 07-13 end-state, reachable by an
+                      operator with no bug at all).
+          "unknown" — we cannot tell. NEVER block an exit on this: a wedged
+                      data feed must not silently disable stops.
+
+        The exit path must ask BEFORE placing a reverse combo.
+
+        Why this is async: a cached-empty position list is ambiguous between
+        "flat" and "stream wedged" (ib_insync's startup reqPositions timeout
+        only logs; `connected` stays True). Believing an empty cache would
+        refuse every exit — a stop-loss disabled exactly when the broker link
+        is flaky. So before ever returning "gone" we re-request positions from
+        the broker authoritatively; only a FRESH answer can retire a position.
+        """
+        keys = self._trade_leg_keys(trade)
+        if not keys or keys == {f"{trade.symbol}:STK"}:
+            return "unknown"  # shape we can't key — don't block the exit on it
+
+        live = self._live_ibkr_leg_keys()
+        if live is None:
+            return "unknown"
+
+        present = keys & live
+        if present == keys:
+            return "live"
+        if present:
+            return "partial"
+
+        # The cached view says GONE — the one answer we refuse to take on
+        # trust, because it is also what a wedged position stream looks like.
+        # Re-request from the broker before acting on it.
+        fresh = await self._ibkr.get_positions_fresh()
+        if fresh is None:
+            log.warning("liveness_unconfirmed_broker_silent",
+                        trade_id=trade.trade_id, symbol=trade.symbol,
+                        note="cache says gone, broker won't confirm — treating "
+                             "as unknown so the exit still goes out")
+            return "unknown"
+
+        fresh_keys: set[str] = set()
+        for pos in fresh:
+            try:
+                if pos.contract.secType == "OPT":
+                    fresh_keys.add(self._make_position_key(
+                        symbol=pos.contract.symbol,
+                        strike=pos.contract.strike,
+                        right=pos.contract.right,
+                        expiry=pos.contract.lastTradeDateOrContractMonth,
+                    ))
+            except (AttributeError, TypeError, ValueError):
+                continue
+
+        present = keys & fresh_keys
+        if present == keys:
+            return "live"
+        if present:
+            return "partial"
+        return "gone"
+
+    async def _book_stale_trade(self, trade, ibkr_portfolio) -> None:
+        """Close a trade whose position is gone at the broker, attributing the
+        best P&L we can defend. Shared by reconcile()'s stale-local loop and
+        the exit path's confirmed-vanished booking, so both book identically.
+        """
+        # Try to get realized P&L from IBKR portfolio items
+        exit_price = 0.0
+        realized_pnl = 0.0
+        exit_reason = "reconciler_ibkr_realized"
+        found_ibkr_pnl = False
+        # LEG-AWARE attribution (deep-audit MP-F4): matching by symbol
+        # alone grabbed the FIRST leg's realizedPNL as the whole
+        # structure's P&L (~1/4 of an iron condor), and could book one
+        # trade's P&L onto another trade on the same underlying. Sum the
+        # realizedPNL of exactly THIS trade's legs.
+        trade_keys = self._trade_leg_keys(trade)
+        leg_pnls = []
+        for item in ibkr_portfolio:
+            if item.contract.secType != "OPT" or item.position != 0:
+                continue
+            key = self._make_position_key(
+                symbol=item.contract.symbol,
+                strike=item.contract.strike,
+                right=item.contract.right,
+                expiry=item.contract.lastTradeDateOrContractMonth,
+            )
+            if key in trade_keys and item.realizedPNL:
+                leg_pnls.append(item.realizedPNL)
+        if leg_pnls:
+            realized_pnl = float(sum(leg_pnls))
+            found_ibkr_pnl = True
+
+        if not found_ibkr_pnl and trade.entry_price > 0:
+            # No IBKR data. Only assume "expired worthless" when the
+            # position has actually reached expiry; a position that
+            # vanished mid-life was closed at an unknown price and
+            # recording a full win/loss would be fiction.
+            expired = False
+            if trade.expiry:
+                try:
+                    expired = datetime.fromisoformat(trade.expiry).date() <= datetime.now().date()
+                except ValueError:
+                    pass
+
+            multiplier = 100 if trade.contract_type != "stock" else 1
+            if expired:
+                # ITM-AWARE expiry booking (audit R2, goal-align #1): the
+                # old branch booked ANY expired credit as a full-premium
+                # win — an option that expired IN the money (e.g. short
+                # put after a selloff over a down weekend) was recorded as
+                # a max win instead of a loss. Value the structure at
+                # expiry from intrinsic using the underlying's price; if
+                # the underlying price can't be fetched, refuse to invent
+                # a number and fall through to the review path.
+                settle_px = await self._underlying_last(trade.symbol)
+                intrinsic = self._structure_intrinsic(trade, settle_px) if settle_px else None
+                if intrinsic is not None:
+                    if trade.strategy in CREDIT_STRATEGIES:
+                        # cost to settle = what the shorts owe minus longs
+                        realized_pnl = (trade.entry_price - intrinsic) * multiplier * trade.quantity
+                    else:
+                        realized_pnl = (intrinsic - trade.entry_price) * multiplier * trade.quantity
+                    exit_price = intrinsic
+                    exit_reason = "reconciler_expired_intrinsic"
+                    log.info("reconcile_expired_intrinsic",
+                             trade_id=trade.trade_id, settle_px=settle_px,
+                             intrinsic=round(intrinsic, 2),
+                             realized_pnl=round(realized_pnl, 2))
+                else:
+                    realized_pnl = 0.0
+                    exit_reason = "reconciler_unknown_exit_expired_needs_review"
+                    log.critical(
+                        "reconcile_expired_unbookable",
+                        trade_id=trade.trade_id, symbol=trade.symbol,
+                        note="expired but underlying price unavailable — "
+                             "P&L NOT booked, needs manual review",
+                    )
+            else:
+                # Unknown exit — record neutral P&L and flag for review
+                # rather than inventing a number.
+                realized_pnl = 0.0
+                exit_reason = "reconciler_unknown_exit"
+                log.warning(
+                    "reconcile_unknown_exit",
+                    trade_id=trade.trade_id,
+                    symbol=trade.symbol,
+                    strategy=trade.strategy,
+                    note="position gone from IBKR before expiry; true exit price unrecoverable",
+                )
+
+        log.info("reconcile_closing_stale", trade_id=trade.trade_id,
+                 exit_price=exit_price, realized_pnl=realized_pnl,
+                 exit_reason=exit_reason)
+
+        self._state.close_trade(
+            trade_id=trade.trade_id,
+            exit_price=exit_price,
+            realized_pnl=realized_pnl,
+            exit_reason_detailed=exit_reason,
+        )
+
+    async def book_vanished_trade(self, trade) -> bool:
+        """R14 (the strand hole): CLOSE a trade whose position is confirmed
+        gone at the broker.
+
+        reconcile()'s stale-local loop cannot do this for the case that
+        matters most. Its zero-options guard — "IBKR shows no option positions
+        while local option trades are open; refusing to mass-close" — fires on
+        exactly the state left by manually flattening the LAST open position,
+        so the booking loop never runs and the trade stays FILLED forever:
+        the monitor re-demands the exit every pass, the exit is refused every
+        pass, and no code path ever closes the row.
+
+        That guard is right to distrust an empty snapshot in bulk. This path
+        is safe where it isn't, because the caller has already resolved the
+        ambiguity against a FRESH broker query for THIS trade specifically
+        (position_liveness -> "gone"), and books one trade rather than the book.
+        """
+        try:
+            portfolio = self._ibkr.get_portfolio()
+        except Exception as e:  # noqa: BLE001
+            log.error("book_vanished_portfolio_failed",
+                      trade_id=trade.trade_id, error=str(e))
+            portfolio = []
+        try:
+            await self._book_stale_trade(trade, portfolio)
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.error("book_vanished_failed",
+                      trade_id=trade.trade_id, error=str(e))
+            return False
+
     def _live_ibkr_leg_keys(self) -> set[str] | None:
         """Position keys currently live at IBKR, or None if unavailable."""
         try:
@@ -576,101 +776,7 @@ class PositionReconciler:
             log.warning("reconcile_stale_local", trade_id=trade.trade_id,
                         symbol=trade.symbol, strategy=trade.strategy)
 
-            # Try to get realized P&L from IBKR portfolio items
-            exit_price = 0.0
-            realized_pnl = 0.0
-            exit_reason = "reconciler_ibkr_realized"
-            found_ibkr_pnl = False
-            # LEG-AWARE attribution (deep-audit MP-F4): matching by symbol
-            # alone grabbed the FIRST leg's realizedPNL as the whole
-            # structure's P&L (~1/4 of an iron condor), and could book one
-            # trade's P&L onto another trade on the same underlying. Sum the
-            # realizedPNL of exactly THIS trade's legs.
-            trade_keys = self._trade_leg_keys(trade)
-            leg_pnls = []
-            for item in ibkr_portfolio:
-                if item.contract.secType != "OPT" or item.position != 0:
-                    continue
-                key = self._make_position_key(
-                    symbol=item.contract.symbol,
-                    strike=item.contract.strike,
-                    right=item.contract.right,
-                    expiry=item.contract.lastTradeDateOrContractMonth,
-                )
-                if key in trade_keys and item.realizedPNL:
-                    leg_pnls.append(item.realizedPNL)
-            if leg_pnls:
-                realized_pnl = float(sum(leg_pnls))
-                found_ibkr_pnl = True
-
-            if not found_ibkr_pnl and trade.entry_price > 0:
-                # No IBKR data. Only assume "expired worthless" when the
-                # position has actually reached expiry; a position that
-                # vanished mid-life was closed at an unknown price and
-                # recording a full win/loss would be fiction.
-                expired = False
-                if trade.expiry:
-                    try:
-                        expired = datetime.fromisoformat(trade.expiry).date() <= datetime.now().date()
-                    except ValueError:
-                        pass
-
-                multiplier = 100 if trade.contract_type != "stock" else 1
-                if expired:
-                    # ITM-AWARE expiry booking (audit R2, goal-align #1): the
-                    # old branch booked ANY expired credit as a full-premium
-                    # win — an option that expired IN the money (e.g. short
-                    # put after a selloff over a down weekend) was recorded as
-                    # a max win instead of a loss. Value the structure at
-                    # expiry from intrinsic using the underlying's price; if
-                    # the underlying price can't be fetched, refuse to invent
-                    # a number and fall through to the review path.
-                    settle_px = await self._underlying_last(trade.symbol)
-                    intrinsic = self._structure_intrinsic(trade, settle_px) if settle_px else None
-                    if intrinsic is not None:
-                        if trade.strategy in CREDIT_STRATEGIES:
-                            # cost to settle = what the shorts owe minus longs
-                            realized_pnl = (trade.entry_price - intrinsic) * multiplier * trade.quantity
-                        else:
-                            realized_pnl = (intrinsic - trade.entry_price) * multiplier * trade.quantity
-                        exit_price = intrinsic
-                        exit_reason = "reconciler_expired_intrinsic"
-                        log.info("reconcile_expired_intrinsic",
-                                 trade_id=trade.trade_id, settle_px=settle_px,
-                                 intrinsic=round(intrinsic, 2),
-                                 realized_pnl=round(realized_pnl, 2))
-                    else:
-                        realized_pnl = 0.0
-                        exit_reason = "reconciler_unknown_exit_expired_needs_review"
-                        log.critical(
-                            "reconcile_expired_unbookable",
-                            trade_id=trade.trade_id, symbol=trade.symbol,
-                            note="expired but underlying price unavailable — "
-                                 "P&L NOT booked, needs manual review",
-                        )
-                else:
-                    # Unknown exit — record neutral P&L and flag for review
-                    # rather than inventing a number.
-                    realized_pnl = 0.0
-                    exit_reason = "reconciler_unknown_exit"
-                    log.warning(
-                        "reconcile_unknown_exit",
-                        trade_id=trade.trade_id,
-                        symbol=trade.symbol,
-                        strategy=trade.strategy,
-                        note="position gone from IBKR before expiry; true exit price unrecoverable",
-                    )
-
-            log.info("reconcile_closing_stale", trade_id=trade.trade_id,
-                     exit_price=exit_price, realized_pnl=realized_pnl,
-                     exit_reason=exit_reason)
-
-            self._state.close_trade(
-                trade_id=trade.trade_id,
-                exit_price=exit_price,
-                realized_pnl=realized_pnl,
-                exit_reason_detailed=exit_reason,
-            )
+            await self._book_stale_trade(trade, ibkr_portfolio)
 
         # Sweep long-dead PENDING orphans LAST — after promotion had its
         # chance to rescue filled-but-tracker-lost orders (audit R2/C3).
