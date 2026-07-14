@@ -62,6 +62,9 @@ an evening.
 **4. Arm the silent-failure layers (U1, U2, U3, U4).** Long-standing, ~5 min each, and R13
 re-confirmed all three are still unarmed — every recovery layer is downstream of them.
 **5. Ship the R14 code queue** (below) in out-of-RTH windows while the sample accumulates.
+*R14 Tier-1 items 1–2 (exit-price bound, broker-liveness gate) are DONE and committed —
+`dae9c64`, 687 tests green. They take effect on the next bot start; no live position is
+affected while entries are frozen. Next up in the queue is item 3 (staleness gate).*
 **6. Then, and only then**: ML ablation → 50-close preliminary read → 100-close verdict →
 Phase-2 sizing → go-live gates.
 
@@ -188,29 +191,55 @@ redeploy). **Scoreboard restatement decision pending**: book exits from first-cl
 
 ---
 
-## Round 14 (queued) — the R13 SOON list, ordered by exposure
+## Round 14 (in progress) — the R13 SOON list, ordered by exposure
 All evidence is already gathered (R13 lens reports). Ship in out-of-RTH windows while the
-sample accumulates. **Status 2026-07-14 EOD: items 1-2 are WRITTEN but UNCOMMITTED in the
-working tree** (`orchestrator.py`, `reconciler.py`) — finish, test, deploy as one batch.
+sample accumulates.
 
 **Tier 1 — live exposure in a bad tape**
-1. **Exit-price sanity bound.** The exit path has no ceiling: `ask + $0.10` with no cap, plus a
-   MARKET fallback on a 4-leg BAG exactly when quotes evaporate. Executed proof: a $2-wide
-   condor with a garbage 9.90 ask placed `BUY LMT 10.00` — 5× the wing width, i.e. 5× the
-   structural max loss. Fix: cap a credit buyback at the wing width (the max loss the wings
-   already guarantee); never MARKET a multi-leg BAG — no quote ⇒ credit prices AT the wing
-   width + alert, debit defers a cycle + alert. *(written)*
-2. **Broker-position check before reverse exit combos** (human-factors #2). After a manual TWS
-   flatten the monitor still demands the exit and `_execute_exit` reverses the legs with no
-   broker check → REBUILDS the position inverted. Same end-state as the 07-13 incident, but
-   operator-triggered and needing no bug at all. Fix: `reconciler.position_is_live(trade)`
-   before any reverse order; `None` (broker view unavailable) must never read as "gone".
-   *(written)*
+1. ✅ **Exit-price sanity bound.** *(shipped `dae9c64`)* The exit path had no ceiling:
+   `ask + $0.10` with no cap, plus a MARKET fallback on a 4-leg BAG exactly when quotes
+   evaporate. Executed proof: a $2-wide condor with a garbage 9.90 ask placed `BUY LMT 10.00` —
+   5× the wing width, i.e. 5× the structural max loss. Shipped: credit buyback capped **at** the
+   wing width (capping *below* it would be non-marketable on a deep-ITM condor, which is
+   legitimately worth ~width, so the order would re-place forever while the ITM short carried
+   assignment risk); **debit close capped at the crossing buffer** — the mirror hole the
+   credit-only cap missed entirely, and the open IWM straddle's exact path: a sign-corrupted
+   +9.90 ask made the bot place `BUY LMT 9.95`, *paying* to dispose of a position it owned;
+   never MARKET a multi-leg BAG; and a computed limit of exactly `0.00` is a real marketable
+   price for a debit close, not "no quote" (the `!= 0` truthiness test deferred a perfectly
+   closeable position indefinitely).
+2. ✅ **Broker-position check before reverse exit combos** (human-factors #2). *(shipped
+   `dae9c64`)* After a manual TWS flatten the monitor still demanded the exit and `_execute_exit`
+   reversed the legs with no broker check → REBUILT the position inverted. Same end-state as the
+   07-13 incident, operator-triggered, needing no bug at all. Shipped as **three-state**
+   `reconciler.position_liveness(trade)`, because each answer has its own catastrophe:
+   - `gone` → refuse **and book the trade**. Refusing alone *strands* it: `reconcile()`'s
+     zero-options guard ("refusing to mass-close") fires on exactly the state a flatten of the
+     **last** position leaves, so its stale-local loop never books the row — the trade would sit
+     FILLED forever, re-demanding an exit that is refused every pass. Booking logic is now shared
+     with `reconcile()`, not duplicated.
+   - `partial` → refuse and page. Reversing all legs of a half-flattened structure SELLS the
+     already-flat ones, *opening* new inverted positions (a naked short in the worst case).
+   - `unknown` → **proceed**. An empty position cache is indistinguishable from a wedged feed
+     (ib_insync's startup `reqPositions` can time out with `connected` still True), so `gone` is
+     only returned after an authoritative broker re-query (`get_positions_fresh`). Trusting the
+     cache would disable stops exactly when the broker link is flaky.
+
+   *48 tests; every guard is mutation-checked (reverting it fails its test). Findings 1's debit
+   bound, the strand hole, and the partial/wedged states were all found by an adversarial review
+   of the first draft of these two fixes — i.e. the fixes shipped with bugs of their own until
+   that pass ran.*
 3. **Staleness gate on exit inputs.** `Quote.timestamp` is write-only; the touch stop and DTE
    exits act on possibly-frozen marks. The gate ALREADY EXISTS (`quality.validate_quote`, 30s)
    and is instantiated — with **zero call sites**. Wire it into the touch/DTE path; reject or
    alert on quotes older than ~3 min in RTH; require two agreeing ticks before firing a touch
    on a degraded/fallback quote.
+3b. **Single-leg exits still MARKET-order** (`_execute_exit`, `contract_type in (call, put)`).
+   The R14 price bound covers only the multi-leg path. `long_call`/`long_put` exits are a market
+   SELL of something we own, so the loss is bounded by the option's value — not the condor-class
+   catastrophe, which is why it didn't block this batch. But it's the same no-quote tape and the
+   same missing bound; the two retired unbounded shapes (`covered_call`, `cash_secured_put` — a
+   MARKET buyback of a short call *is* unbounded) must not come back off the bench without it.
 
 **Tier 2 — correctness of the verdict itself**
 4. **Book realized P&L from executions** (the D1 fix in code): first-closing-group price + real
@@ -227,8 +256,12 @@ working tree** (`orchestrator.py`, `reconciler.py`) — finish, test, deploy as 
    −8% gap-open registers `mtm_day = 0`. Persist the prior close's unrealized as the baseline.
 9. **Exit-reject backoff + alert counter**: retries are fixed-cadence and unbounded, no
    halted-contract awareness, and exit rejects page nobody.
-10. **Zero-options mass-close guard escape hatch** — a full manual flatten of the last position
-    is never booked (the guard refuses, correctly, but there is no confirmed-empty path).
+10. ~~**Zero-options mass-close guard escape hatch**~~ — *mostly closed by `dae9c64`*. A full
+    manual flatten of the last position is now booked via `book_vanished_trade`, whose
+    confirmed-empty path is an authoritative broker re-query rather than the untrusted cache.
+    Residual: `reconcile()` itself still has no such hatch, so a position that vanishes while
+    **no exit is pending** (e.g. flattened after hours, bot restarted) still isn't booked until
+    something demands an exit. Give `reconcile()` the same fresh-query confirmation.
 11. **Keeper relaunch verification + alert** (it never checks that a relaunch worked); digest
     reports the mirror's CONTENT age, not the local snapshot's mtime.
 
