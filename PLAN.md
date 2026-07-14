@@ -5,21 +5,24 @@ ML-gated entries, automated exits, hands-off ops. Paper account DUN603821.
 **Goal:** a trustworthy real track record answering "does this have edge?" before funding
 $3,000 CAD.
 
-**Current state (2026-07-14):**
-- Real track record since the 2026-07-06 reset: **9 closes, +$280.20**, with real broker
-  commissions booked. Open book: 1 IWM long straddle, held into CPI deliberately (it is
-  long vol). Zero short premium through the print.
-- **R12 DEPLOYED 2026-07-14 09:09 ET** (commit b154459, tag `deploy-20260714`): fast lane
-  626 pass / 0 fail, SMOKE PASS (12 checks), first-RTH liveness clean (fresh heartbeat,
-  cycles, trading_verified ×2, marks updating). `scan_symbol_timing` unobservable on
-  deploy day — the CPI-day `economic_event_skip` gate short-circuits before it; confirm 07-15.
-- The machine works — real fills, real costs, honest scoreboard, layered protection.
-  **Edge is still unproven**, and R9's statistics say 50 closes is only a preliminary read.
-  R13's referee corrects the booked scoreboard to **+$254.90 / 6W-3L / PF 2.64** (restatement
-  pending at redeploy).
-- 13 audit rounds complete (~275 defects found). **R13 fixes are committed but NOT yet
-  running** — redeploy at 16:00 ET 07-14 (both `_evaluate_position` criticals live until
-  then; safe today only because the book is one debit straddle and entries are frozen).
+**Current state (2026-07-14, end of day):**
+- Booked track record since the 2026-07-06 reset: 9 closes, +$280.20. **R13's shadow referee
+  says the true number is +$254.90 / 6W-3L / PF 2.64** (the booked scoreboard recorded phantom
+  re-close prices + estimated commissions). **Restatement is a pending DECISION — see D1.**
+- Open book: 1 IWM long straddle (−$233, CPI came in quiet — the long-vol bet didn't pay).
+  Plus 4 UNTRACKED reverse condors from the 07-13 incident, not in the books (**U5**).
+- **ENTRIES ARE FROZEN** (HALT_UNTRACKED since 09:00 07-14) and stay frozen until U5 is
+  resolved. Zero sample-building while frozen — this is the top-priority blocker.
+- **R12 + R13 both DEPLOYED and verified** — R12 at 09:09 (tag `deploy-20260714`), R13 at
+  12:10 (tag `deploy-20260714b`, commits b154459 → 3901fab): 639 tests green, SMOKE PASS with
+  the new config sentinels, `entries_frozen` observable, `trading_verified`, marks updating.
+- Deferred verification: `scan_symbol_timing` couldn't be observed on 07-14 (the CPI-day
+  `economic_event_skip` gate short-circuits before it). Scheduled task
+  **`AIT-Deploy-Liveness-20260715` runs `scripts/check_first_rth_liveness.py` at 09:40 ET
+  07-15** and Telegrams the verdict. That closes the deploy checklist.
+- The machine works — real fills, real costs, an honest scoreboard, layered protection.
+  **Edge is still unproven**; R9's statistics say even 50 closes is only a preliminary read.
+- 13 audit rounds complete (~275 defects found).
 
 ## INCIDENT 2026-07-13 — the R12 reversal bug fired in the wild, pre-R12-load
 Monday's macro-flatten exits **triple-filled**. Ledger proof (executions table): NVDA condor
@@ -45,21 +48,55 @@ is retired-not-deleted and loaded by nothing.
 
 ---
 
-## OPEN — user actions (each verified missing on the box; each closes real exposure)
+## WHAT'S NEXT (after R13) — the sequence
 
-| # | Action | Why it matters (R12 chaos walk) |
+The mission is a trustworthy verdict on edge. Everything below is ordered by what actually
+moves that forward. **The bot cannot build a sample while entries are frozen, so U5 is the
+single highest-value action on this page.**
+
+**1. Unfreeze the machine (U5 → U6).** Nothing else matters until the bot is trading again.
+**2. Take the two open decisions (D1, D2)** — both must be settled BEFORE the sample grows,
+because both change how results are scored, and "criteria fixed before looking" is the rule.
+**3. Close the security exposure (U7 → U8/U9 → U10/U11/U12).** Independent of trading; do in
+an evening.
+**4. Arm the silent-failure layers (U1, U2, U3, U4).** Long-standing, ~5 min each, and R13
+re-confirmed all three are still unarmed — every recovery layer is downstream of them.
+**5. Ship the R14 code queue** (below) in out-of-RTH windows while the sample accumulates.
+**6. Then, and only then**: ML ablation → 50-close preliminary read → 100-close verdict →
+Phase-2 sizing → go-live gates.
+
+### OPEN — user actions (only YOU can do these; each verified on the box)
+
+**Blocking the mission**
+| # | Action | Why it matters |
 |---|---|---|
-| U1 | **Create a healthchecks.io check → put its ping URL in `data/deadman_url.txt`** | Shipped-but-UNARMED since 07-09. The ONLY alert that fires when the whole machine dies. Closes detection for three separate disasters (machine down, keeper dead, Telegram dead). ~3 min. |
-| U2 | **Enable Windows auto-logon** (Sysinternals Autologon + lock on logon) | Every recovery layer starts from Startup shortcuts that need a human logon. A forced reboot at 2pm = book unprotected until someone logs in; first signal is a *missing* digest at 16:05. |
-| U3 | **Start the Windows Time service** (`net start w32time & w32tm /resync`) | w32time is NOT RUNNING on a box that already had a 2-hour clock error. A clock jump silently kills all stop/TP protection AND disarms the hang detector — both read the same wrong clock. |
-| U4 | Cloud-sync `~/Documents/ait_backups` | The mirror exists but shares a failure domain with the box. |
-| U5 | **Resolve the 4 untracked reverse iron condors at IBKR, then delete `data/HALT_UNTRACKED`** (see INCIDENT 2026-07-13). Recommendation: close them — CPI (the catalyst they accidentally straddle) has printed; they are pure theta bleed to 07-24. They are NOT in the bot's books and must not be adopted (they'd contaminate the sample). Entries stay frozen until the file is deleted. | ~$955 of unbooked defined-risk premium decaying; entry freeze blocks sample-building. |
-| U6 | **Live market data entitlement degraded**: Error 10089/354 ("requires additional subscription for API") on live quote requests since ≥07-09, low-rate but constant. Broker-side marks still flow (account stream), so exits function. Likely fix: log the live account out of mobile/web (one-data-slot rule) and/or restart the Gateway so entitlements reload at login. | Entry pricing quality + option marks during scans; known class from the 06-30/07-02 saga. |
-| U7 | **Make the GitHub repo PRIVATE**: `gh repo edit prithvipradip/trade_v2 --visibility private` | The repo is public TODAY: PLAN.md (incl. the unarmed-protections list and the IB-password file location), account ID, 38 daily P&L reports, 1.46 GB archive branch — all world-readable. No secret is in history (verified), so no rotation forced. R13 #9. |
-| U8 | **Close the Gateway LAN hole** (out-of-RTH): `C:\IBC\config.ini` line 699 `AcceptIncomingConnectionAction=accept → reject`, then disable the java.exe Private-profile firewall Allow rules (+ the ibgateway 1048 Allow rule). Bot is unaffected — it connects via 127.0.0.1 which is in TrustedIPs (verified live). | Gateway API listens on 0.0.0.0:4002 with ReadOnlyApi=no and IBC auto-accepting any non-trusted client; the ONLY current protection is the Wi-Fi being categorized "Public" — one profile flip (or a Private-categorized vEthernet/VPN adapter) exposes an order-placing API to the LAN. R13 #4. |
-| U9 | **MySQL is reachable from the Wi-Fi RIGHT NOW**: elevated `Disable-NetFirewallRule -DisplayName 'Port 3306','Port 33060'` (or bind 127.0.0.1 in my.ini) | Its port rules Allow ALL profiles incl. Public (`Test-NetConnection 192.168.2.16 -Port 3306` succeeds). Not part of the bot — pure attack surface on the trading box. R13 #14. |
-| U10 | **Rotate the Finnhub API key** at finnhub.io, then scrub logs (`logs/*` grep for `?token=`) | The live key sits in 11 log files (200 hits) via urllib3 DEBUG URL logging; key confirmed still ACTIVE (HTTP 200 on 07-14). The class fix (urllib3→INFO) is committed; rotation is yours. R13 #12. |
-| U11 | **Tighten C:\IBC ACL** (out-of-RTH): `icacls C:\IBC /inheritance:r /grant:r "prith:(F)" "SYSTEM:(F)" "Administrators:(F)"`, restart Gateway once | The IB login+password file is readable by BUILTIN\Users and MODIFIABLE by Authenticated Users (inherited from C:\); a second enabled local account exists. Becomes HIGH the day live creds land there. R13 #13. |
+| U5 | **Close the 4 untracked reverse iron condors at IBKR → verify flat in TWS → THEN delete `data/HALT_UNTRACKED`** (see INCIDENT 2026-07-13). They are NOT in the bot's books and must not be adopted (that would contaminate the sample). R13 verified this flow is SAFE — the bot has no exit path referencing them, so it will not fight your closes. Deleting the file BEFORE the broker is flat just re-freezes at the next reconcile. | **THE blocker.** Entries frozen = zero sample-building (R2: ~15-20 closes/month is the ceiling even when healthy). Plus ~$955 of unbooked premium bleeding theta to 07-24, with the CPI catalyst already passed. |
+| U6 | **Restore the live market-data entitlement**: log the live account out of mobile/web (the ONE-data-slot rule), then restart the Gateway so entitlements reload at login. | Error 10089/354 on live quote requests since ≥07-09, low-rate but constant. Broker-stream marks still flow so exits work — but entry pricing quality depends on it the moment entries resume. Known class from the 06-30/07-02 saga. |
+
+**Security (R13 — do in one evening, outside RTH)**
+| # | Action | Why it matters |
+|---|---|---|
+| U7 | **Make the GitHub repo PRIVATE.** No `gh` on this box → do it in the browser: repo → Settings → General → Danger Zone → Change visibility → Private. | The repo is PUBLIC today: PLAN.md (incl. this unarmed-protections list and the IB-password file location), the account ID, 38 daily P&L reports, a 1.46 GB archive branch — all world-readable. No secret ever entered git history (verified), so nothing needs rotating for this. R13 #9. |
+| U8 | **Close the Gateway LAN hole**: `C:\IBC\config.ini` line 699 `AcceptIncomingConnectionAction=accept → reject`, then disable the java.exe Private-profile firewall Allow rules (+ the ibgateway 1048 Allow rule). The bot is unaffected — it connects via 127.0.0.1, which is in TrustedIPs (verified on the live session). | The Gateway API listens on 0.0.0.0:4002 with `ReadOnlyApi=no` and IBC auto-accepting any non-trusted client. The ONLY thing standing between the LAN and an order-placing API is the Wi-Fi being categorized "Public" — one profile flip (or a Private-categorized VPN/vEthernet adapter, and WSL's is already Up) exposes it. R13 #4. |
+| U9 | **MySQL is reachable from the Wi-Fi RIGHT NOW**: elevated `Disable-NetFirewallRule -DisplayName 'Port 3306','Port 33060'` (or bind 127.0.0.1 in my.ini). | Its port rules Allow ALL profiles including Public, so the "Public" categorization does NOT protect it (`Test-NetConnection 192.168.2.16 -Port 3306` succeeds). Not part of the bot — pure attack surface on the machine holding the trading credentials. R13 #14. |
+| U10 | **Rotate the Finnhub API key** at finnhub.io, then scrub the logs (`logs/*`, grep `?token=`). | The live key sits in 11 log files (200 hits) via urllib3 DEBUG URL logging; confirmed still ACTIVE on 07-14. The class fix (urllib3→INFO) is deployed, so no NEW leaks — but the existing key is burned. R13 #12. |
+| U11 | **Tighten the `C:\IBC` ACL**: `icacls C:\IBC /inheritance:r /grant:r "prith:(F)" "SYSTEM:(F)" "Administrators:(F)"`, then restart the Gateway once to confirm it still reads. | The IB login+password file is readable by `BUILTIN\Users` and MODIFIABLE by `Authenticated Users` (inherited from C:\); a second enabled local account exists. Becomes HIGH the day live credentials land there. R13 #13. |
+| U12 | Docker Desktop → Settings → General → untick "Expose daemon on tcp://localhost:2375 without TLS". | Unauthenticated Docker Engine API on localhost = a local-privilege-escalation amplifier on the trading box. Localhost-only, so lowest priority. R13 #24. |
+
+**Silent-failure layers (long-standing; R13 re-confirmed all still unarmed)**
+| # | Action | Why it matters |
+|---|---|---|
+| U1 | **Create a healthchecks.io check → put its ping URL in `data/deadman_url.txt`** (~3 min). | Shipped-but-UNARMED since 07-09. The ONLY alert that fires when the whole machine dies. Closes detection for three separate disasters at once (machine down, keeper dead, Telegram dead). The 07-08→07-09 outage was 18 hours of silence. |
+| U2 | **Enable Windows auto-logon** (Sysinternals Autologon + lock on logon). | Every recovery layer — keeper, Gateway, bot — starts from Startup shortcuts that need a human logon. A forced reboot at 2pm leaves the book unprotected until someone logs in; the first signal would be a *missing* 16:05 digest. Also required for the scheduled liveness check to run. |
+| U3 | **Start the Windows Time service** (`net start w32time & w32tm /resync`). Do it outside RTH — a resync can jump the clock. | w32time is NOT RUNNING on a box that already had a 2-hour clock error. A clock jump silently kills all stop/TP protection AND disarms the hang detector — both read the same wrong clock. |
+| U4 | Cloud-sync `~/Documents/ait_backups`. | The mirror exists (and is now hash-verified after the R13 fix) but shares a failure domain with the box. |
+
+### OPEN — decisions (mine to recommend, yours to make; settle BEFORE the sample grows)
+
+| # | Decision | Recommendation |
+|---|---|---|
+| D1 | **Scoreboard restatement.** The referee books exits from the FIRST closing fill group + real commissions; the system booked phantom re-close prices + a flat $0.65/leg estimate. Restating moves the record from +$280.20 / 7W / PF 3.03 to **+$254.90 / 6W-3L / PF 2.64** (QQQ's booked "win" is really a −$15.71 loss). | **Yes — do it once, with a DB backup, while the bot is stopped.** Honest numbers must precede the sample, not follow it. The go-live gates are meaningless if the inputs are wrong. |
+| D2 | **Drawdown-gate method.** The scorecard's base is "sum of capital_at_risk of CURRENTLY OPEN trades, floored at $1,000" → after a flatten the base collapses to $1,000 and DD reads **13.8% (FAIL)**. The referee uses max CONCURRENT deployed risk over the window ($2,114) → **7.4% (PASS)**. The two methods disagree ACROSS the 8% gate line. | **Pin the concurrent-risk method now**, before more data accrues. It is the economically meaningful denominator (what was actually at risk), and picking it later — with results visible — would violate criteria-fixed-before-looking. Also backfill `capital_at_risk` where derivable (5 of 9 closes have 0). |
 | U12 | Docker Desktop → Settings → General → untick "Expose daemon on tcp://localhost:2375 without TLS" | Unauthenticated Docker Engine API on localhost = local-privilege-escalation amplifier on the trading box. Localhost-only, so lowest priority. R13 #24. |
 
 ---
@@ -149,14 +186,59 @@ redeploy). **Scoreboard restatement decision pending**: book exits from first-cl
   advice corrected (the file re-creates at the next reconcile — not an option the code
   supports).
 
-### SOON queue (next code windows, evidence in the R13 result file)
-Exit-price sanity bound (credit buyback capped at wing width; never MARKET a credit BAG);
-staleness gate wired into touch/DTE exits (`validate_quote` exists, zero call sites); exit
-reject backoff + alert counter; MTM brake gap-blindness (SOD baseline from prior close);
-commission attribution EOD re-stamp; booked-P&L-from-executions booking path; DD method pin;
-exec_time +4h double-conversion; broker-position check before reverse exit combos +
-zero-options guard escape hatch (human-factors #2); keeper relaunch verification + alert;
-digest reports mirror content age; ib_async migration (post-verdict).
+---
+
+## Round 14 (queued) — the R13 SOON list, ordered by exposure
+All evidence is already gathered (R13 lens reports). Ship in out-of-RTH windows while the
+sample accumulates. **Status 2026-07-14 EOD: items 1-2 are WRITTEN but UNCOMMITTED in the
+working tree** (`orchestrator.py`, `reconciler.py`) — finish, test, deploy as one batch.
+
+**Tier 1 — live exposure in a bad tape**
+1. **Exit-price sanity bound.** The exit path has no ceiling: `ask + $0.10` with no cap, plus a
+   MARKET fallback on a 4-leg BAG exactly when quotes evaporate. Executed proof: a $2-wide
+   condor with a garbage 9.90 ask placed `BUY LMT 10.00` — 5× the wing width, i.e. 5× the
+   structural max loss. Fix: cap a credit buyback at the wing width (the max loss the wings
+   already guarantee); never MARKET a multi-leg BAG — no quote ⇒ credit prices AT the wing
+   width + alert, debit defers a cycle + alert. *(written)*
+2. **Broker-position check before reverse exit combos** (human-factors #2). After a manual TWS
+   flatten the monitor still demands the exit and `_execute_exit` reverses the legs with no
+   broker check → REBUILDS the position inverted. Same end-state as the 07-13 incident, but
+   operator-triggered and needing no bug at all. Fix: `reconciler.position_is_live(trade)`
+   before any reverse order; `None` (broker view unavailable) must never read as "gone".
+   *(written)*
+3. **Staleness gate on exit inputs.** `Quote.timestamp` is write-only; the touch stop and DTE
+   exits act on possibly-frozen marks. The gate ALREADY EXISTS (`quality.validate_quote`, 30s)
+   and is instantiated — with **zero call sites**. Wire it into the touch/DTE path; reject or
+   alert on quotes older than ~3 min in RTH; require two agreeing ticks before firing a touch
+   on a degraded/fallback quote.
+
+**Tier 2 — correctness of the verdict itself**
+4. **Book realized P&L from executions** (the D1 fix in code): first-closing-group price + real
+   commissions, not the phantom-fill price + a flat estimate. Without this, D1's restatement
+   just re-accrues the same error on the next close.
+5. **DD-method pin** (D2 in code): max concurrent deployed risk as the denominator; backfill
+   `capital_at_risk` where derivable.
+6. **Commission attribution**: key on exec_id/orderId with an EOD sweep that re-stamps
+   already-closed trades; keep phantom/unattributed costs in a separate incident bucket.
+7. **`executions.exec_time` is +4h off** (already-UTC broker time double-converted as if ET).
+
+**Tier 3 — resilience / ops**
+8. **MTM brake gap-blindness**: the SOD unrealized baseline is captured AFTER the gap, so a
+   −8% gap-open registers `mtm_day = 0`. Persist the prior close's unrealized as the baseline.
+9. **Exit-reject backoff + alert counter**: retries are fixed-cadence and unbounded, no
+   halted-contract awareness, and exit rejects page nobody.
+10. **Zero-options mass-close guard escape hatch** — a full manual flatten of the last position
+    is never booked (the guard refuses, correctly, but there is no confirmed-empty path).
+11. **Keeper relaunch verification + alert** (it never checks that a relaunch worked); digest
+    reports the mirror's CONTENT age, not the local snapshot's mtime.
+
+**Parked deliberately**
+- **ib_async migration** (ib_insync is archived; author deceased). Pinned pair `ib_insync==0.9.86`
+  + Gateway 1044 holds for now via `constraints.txt`. Migrate AFTER the paper verdict — a
+  broker-library swap mid-sample would contaminate the very evidence it exists to protect.
+- **Resting GTC take-profits** (R12 Tier B): worth 6-17% of each win and they survive bot
+  death, but it is a new order path with double-fill risk — the same class as the bug that
+  fired on 07-13. It gets its own change with its own verification, post-verdict.
 
 ### USER ACTIONS (new — see table at top: U7-U12)
 Repo is PUBLIC; Gateway API binds 0.0.0.0 + IBC auto-accepts (one Wi-Fi-profile flip from a
