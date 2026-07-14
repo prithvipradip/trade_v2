@@ -62,9 +62,11 @@ an evening.
 **4. Arm the silent-failure layers (U1, U2, U3, U4).** Long-standing, ~5 min each, and R13
 re-confirmed all three are still unarmed — every recovery layer is downstream of them.
 **5. Ship the R14 code queue** (below) in out-of-RTH windows while the sample accumulates.
-*R14 Tier-1 items 1–2 (exit-price bound, broker-liveness gate) are DONE and committed —
-`dae9c64`, 687 tests green. They take effect on the next bot start; no live position is
-affected while entries are frozen. Next up in the queue is item 3 (staleness gate).*
+*R14 Tier-1 is DONE — items 1–2 (exit-price bound, broker-liveness gate) in `dae9c64`, item 3
+(exit-input staleness gate) in `935e897`. 698 tests green, every guard mutation-checked. All
+three take effect on the next bot start; no live position is affected while entries are frozen.
+Tier-1 (live exposure in a bad tape) is fully closed; the queue now moves to Tier 2 (verdict
+correctness — the D1/D2 code) once the decisions are settled.*
 **6. Then, and only then**: ML ablation → 50-close preliminary read → 100-close verdict →
 Phase-2 sizing → go-live gates.
 
@@ -229,11 +231,18 @@ sample accumulates.
    bound, the strand hole, and the partial/wedged states were all found by an adversarial review
    of the first draft of these two fixes — i.e. the fixes shipped with bugs of their own until
    that pass ran.*
-3. **Staleness gate on exit inputs.** `Quote.timestamp` is write-only; the touch stop and DTE
-   exits act on possibly-frozen marks. The gate ALREADY EXISTS (`quality.validate_quote`, 30s)
-   and is instantiated — with **zero call sites**. Wire it into the touch/DTE path; reject or
-   alert on quotes older than ~3 min in RTH; require two agreeing ticks before firing a touch
-   on a degraded/fallback quote.
+3. ✅ **Staleness gate on exit inputs.** *(shipped `935e897`)* `Quote.timestamp` was write-only
+   and `quality.validate_quote` had zero call sites; the touch stop fired on a single unvalidated
+   spot read. Shipped: exits read the quote through `_spot_quote`, which returns a health verdict
+   (`fresh`/`degraded`/`frozen`/`missing`). Fresh fires immediately (a touch rarely recovers);
+   degraded/frozen require `touch_confirm_ticks` (default 2) agreeing looks, and frozen pages once
+   per outage. The load-bearing call is **frozen vs. old**: the bot runs delayed data (type 4),
+   which ticks *behind* but still *moves*, so an absolute-age rule would disable the touch stop
+   outright — a feed that stops *advancing* is the real failure. A confirmed touch off a bad feed
+   still FIRES (missed breach = wing width, unbounded on a strangle; false = the spread).
+   `touch_confirm_ticks=1` restores pre-R14 behaviour. Also fixed a latent bug: a missing
+   underlying quote used to `return None` and abandon the whole evaluation, killing the DTE safety
+   exit; it now degrades only the two spot-dependent checks. *11 tests, all guards mutation-checked.*
 3b. **Single-leg exits still MARKET-order** (`_execute_exit`, `contract_type in (call, put)`).
    The R14 price bound covers only the multi-leg path. `long_call`/`long_put` exits are a market
    SELL of something we own, so the loss is bounded by the option's value — not the condor-class
