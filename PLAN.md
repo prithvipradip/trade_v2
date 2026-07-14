@@ -15,7 +15,11 @@ $3,000 CAD.
   deploy day — the CPI-day `economic_event_skip` gate short-circuits before it; confirm 07-15.
 - The machine works — real fills, real costs, honest scoreboard, layered protection.
   **Edge is still unproven**, and R9's statistics say 50 closes is only a preliminary read.
-- 12 audit rounds complete (~250 defects fixed). Newest rounds at the top. R13 in flight.
+  R13's referee corrects the booked scoreboard to **+$254.90 / 6W-3L / PF 2.64** (restatement
+  pending at redeploy).
+- 13 audit rounds complete (~275 defects found). **R13 fixes are committed but NOT yet
+  running** — redeploy at 16:00 ET 07-14 (both `_evaluate_position` criticals live until
+  then; safe today only because the book is one debit straddle and entries are frozen).
 
 ## INCIDENT 2026-07-13 — the R12 reversal bug fired in the wild, pre-R12-load
 Monday's macro-flatten exits **triple-filled**. Ledger proof (executions table): NVDA condor
@@ -51,29 +55,80 @@ is retired-not-deleted and loaded by nothing.
 | U4 | Cloud-sync `~/Documents/ait_backups` | The mirror exists but shares a failure domain with the box. |
 | U5 | **Resolve the 4 untracked reverse iron condors at IBKR, then delete `data/HALT_UNTRACKED`** (see INCIDENT 2026-07-13). Recommendation: close them — CPI (the catalyst they accidentally straddle) has printed; they are pure theta bleed to 07-24. They are NOT in the bot's books and must not be adopted (they'd contaminate the sample). Entries stay frozen until the file is deleted. | ~$955 of unbooked defined-risk premium decaying; entry freeze blocks sample-building. |
 | U6 | **Live market data entitlement degraded**: Error 10089/354 ("requires additional subscription for API") on live quote requests since ≥07-09, low-rate but constant. Broker-side marks still flow (account stream), so exits function. Likely fix: log the live account out of mobile/web (one-data-slot rule) and/or restart the Gateway so entitlements reload at login. | Entry pricing quality + option marks during scans; known class from the 06-30/07-02 saga. |
+| U7 | **Make the GitHub repo PRIVATE**: `gh repo edit prithvipradip/trade_v2 --visibility private` | The repo is public TODAY: PLAN.md (incl. the unarmed-protections list and the IB-password file location), account ID, 38 daily P&L reports, 1.46 GB archive branch — all world-readable. No secret is in history (verified), so no rotation forced. R13 #9. |
+| U8 | **Close the Gateway LAN hole** (out-of-RTH): `C:\IBC\config.ini` line 699 `AcceptIncomingConnectionAction=accept → reject`, then disable the java.exe Private-profile firewall Allow rules (+ the ibgateway 1048 Allow rule). Bot is unaffected — it connects via 127.0.0.1 which is in TrustedIPs (verified live). | Gateway API listens on 0.0.0.0:4002 with ReadOnlyApi=no and IBC auto-accepting any non-trusted client; the ONLY current protection is the Wi-Fi being categorized "Public" — one profile flip (or a Private-categorized vEthernet/VPN adapter) exposes an order-placing API to the LAN. R13 #4. |
+| U9 | **MySQL is reachable from the Wi-Fi RIGHT NOW**: elevated `Disable-NetFirewallRule -DisplayName 'Port 3306','Port 33060'` (or bind 127.0.0.1 in my.ini) | Its port rules Allow ALL profiles incl. Public (`Test-NetConnection 192.168.2.16 -Port 3306` succeeds). Not part of the bot — pure attack surface on the trading box. R13 #14. |
+| U10 | **Rotate the Finnhub API key** at finnhub.io, then scrub logs (`logs/*` grep for `?token=`) | The live key sits in 11 log files (200 hits) via urllib3 DEBUG URL logging; key confirmed still ACTIVE (HTTP 200 on 07-14). The class fix (urllib3→INFO) is committed; rotation is yours. R13 #12. |
+| U11 | **Tighten C:\IBC ACL** (out-of-RTH): `icacls C:\IBC /inheritance:r /grant:r "prith:(F)" "SYSTEM:(F)" "Administrators:(F)"`, restart Gateway once | The IB login+password file is readable by BUILTIN\Users and MODIFIABLE by Authenticated Users (inherited from C:\); a second enabled local account exists. Becomes HIGH the day live creds land there. R13 #13. |
+| U12 | Docker Desktop → Settings → General → untick "Expose daemon on tcp://localhost:2375 without TLS" | Unauthenticated Docker Engine API on localhost = local-privilege-escalation amplifier on the trading box. Localhost-only, so lowest priority. R13 #24. |
 
 ---
 
-## Round 13 (planned) — lenses never used
+## Round 13 (2026-07-14) — security/supply-chain, market-catastrophe, shadow referee
+32-agent workflow (5 lenses × adversarial verify), 26 verified findings. Human-factors lens
+died on an API error mid-run; rerun in flight. Same-day fixes below are COMMITTED but await
+the 16:00 out-of-RTH redeploy — the running bot still has both criticals.
 
-1. **Security & supply chain**: credentials at rest (IBC config.ini, Telegram token, `.env` —
-   ever in git history?); unauthenticated localhost dashboards; unpinned deps, no lockfile;
-   **dependency health/EOL — verify whether `ib_insync` is unmaintained/archived** (successor
-   `ib_async`): our single most critical dependency may be a frozen artifact.
-2. **Regime dependence + market-catastrophe playbook**: all evidence spans 2024-2026 ≈ one
-   regime. How does this behave in a 2020-March or 2022 tape? Flash crash through the wings,
-   trading halts, broker outage mid-crash. (R12's chaos walk covered *infrastructure*
-   disasters, not *market* ones.)
-3. **Human factors**: what can the operator break — manual TWS intervention mid-session,
-   config typos silently defaulted by pydantic, alert fatigue, instruction ambiguity.
-4. **Shadow referee**: an independent ~200-line script that recomputes P&L and gate decisions
-   from raw broker data daily and diffs against the system. Catches classes of error nothing
-   else can.
-5. **Right-sized OUT** (decisions, not oversights): market-impact analysis — 1 lot in SPY/QQQ
-   options is a rounding error of displayed size; the costs we actually pay (spread-crossing,
-   adverse selection) are instrumented instead. Revisit at ~5-10% of displayed size (≈20+ lots
-   index, 5-10 lots GLD/TLT/XLE). Also out: formal model governance (SR 11-7), HA/DR beyond
-   current, privacy.
+### The two criticals (both in `_evaluate_position`, both shipped by R12, both latent-live)
+1. **A function-local `import os` (macro block) killed exit evaluation for EVERY credit
+   position** — `os.environ` at the touch-stop guard runs before the local import →
+   UnboundLocalError on every credit tick, propagating out of `check_positions`: exits, MTM
+   brake, and entry scans all die while any condor is open. Latent only because today's book
+   is one debit straddle. FIXED (module import only).
+2. **The R12 touch-stop `if` orphaned the exit elif-chain** — take-profit / assignment /
+   DTE / delta / earnings exits were structurally unreachable for credit positions. A condor
+   could only ever exit via stop or touch. FIXED (explicit `not should_exit` guards).
+   Both criticals shipped through the same test hole: **no test had ever driven a credit
+   position through the real `_evaluate_position`** — pytest was green while pre-fix all 8
+   cells of the new `tests/test_credit_exits.py` matrix ERROR or no-exit. That suite +
+   `tests/test_qualify_batch.py` + the 07-13 incident replay in `test_order_lifecycle.py`
+   now pin the contracts (18 tests, fail-verified against pre-fix code).
+
+### Shadow referee (`scripts/shadow_referee.py`) — first run: 8 BREAKs
+Independent (imports nothing from src/ait), read-only, recomputes the track record from raw
+broker executions. Day-one catches: the 07-13 triple-fill (independently); **booked P&L wrong
+on all 3 verifiable condors** — track record booked +$280.20 / 7W / PF 3.03 vs
+broker-corrected **+$254.90 / 6W / PF 2.64** (QQQ's booked +$6.80 WIN is a real −$15.71 LOSS
+— books recorded the phantom re-close price + a flat $0.65/leg commission estimate);
+**slippage gate had literally NO data** (every execution row live_mid/signal_price = 0 —
+R11's event-driven fills deleted the pending entry before the sweep captured context; FIXED
+via placement-time context map + self-healing upsert, measuring starts with the next fill);
+**DD-on-deployed-risk methods disagree across the 8% gate line** (system 13.8% FAIL vs
+concurrent-risk 7.4% PASS — method must be pinned before more data accrues); DuckDB mirror
+commission column stuck at $0 (FIXED: re-ingest on commission update + one-time backfill at
+redeploy). **Scoreboard restatement decision pending**: book exits from first-closing-group
++ real commissions (referee method) — do it once, at the redeploy, with a DB backup.
+
+### Also fixed same-day
+- Stale WORKING exit orders had no timeout path (found writing the incident regression):
+  the >300s cancel + 900s zombie cap were unreachable while an order rested at the broker —
+  a runaway market could wedge a position in CLOSING with a stale-priced exit. Now: one
+  cancel request at >300s, tracking kept, terminal verdict books or CAS-reverts.
+- `qualify_contracts_batch` returned a SHORTER list on partial failure (ib_insync 0.9.86
+  DROPS failures; the wrapper comment claimed conId==0-in-place) → positional consumers
+  could misalign conId-to-leg on a condor. Now N-for-N/None from the input objects.
+- urllib3/requests silenced to INFO (a live FINNHUB_API_KEY sat in 11 log files via DEBUG
+  URL logging — same class as the R6 ibapi flood; key rotation = user action).
+- `constraints.txt` checked in (136 pins from the RUNTIME interpreter; R10 ordered this,
+  never done). ib_insync==0.9.86 + Gateway 1044 documented as a load-bearing pinned PAIR
+  (lib archived Mar 2024, author deceased; successor `ib_async` 2.1.0; IB is removing legacy
+  wire methods on a forced-upgrade schedule — migration is a dedicated post-verdict change).
+
+### SOON queue (next code windows, evidence in the R13 result file)
+Exit-price sanity bound (credit buyback capped at wing width; never MARKET a credit BAG);
+staleness gate wired into touch/DTE exits (`validate_quote` exists, zero call sites); exit
+reject backoff + alert counter; MTM brake gap-blindness (SOD baseline from prior close);
+commission attribution EOD re-stamp; booked-P&L-from-executions booking path; DD method pin;
+exec_time +4h double-conversion; ib_async migration (post-verdict).
+
+### USER ACTIONS (new — see table at top: U7-U12)
+Repo is PUBLIC; Gateway API binds 0.0.0.0 + IBC auto-accepts (one Wi-Fi-profile flip from a
+LAN-exposed order API); MySQL reachable on Public Wi-Fi NOW; C:\IBC ACL world-readable;
+Finnhub key rotation; Docker 2375.
+
+### Right-sized OUT (decisions, not oversights — unchanged from planning)
+Market-impact analysis at 1-lot; formal model governance (SR 11-7); HA/DR beyond current;
+privacy.
 
 ---
 

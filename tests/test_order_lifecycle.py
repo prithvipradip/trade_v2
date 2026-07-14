@@ -351,3 +351,73 @@ async def test_reconcile_promotes_live_pending_and_sweeps_dead(tmp_path):
     assert dead.exit_reason_detailed == "stale_pending_never_filled"
     assert dead.realized_pnl == 0.0
     assert dead.exit_price == 0.0
+
+
+# ---------------------------------------------------------------------------
+# 6. INCIDENT 2026-07-13 replay: blind-window exit re-trigger cannot duplicate
+# ---------------------------------------------------------------------------
+
+async def test_incident_20260713_exit_retrigger_books_exactly_one_close(env):
+    """Replay of the 07-13 macro-flatten triple-fill (PLAN.md INCIDENT):
+    exit #1 filled at the broker while fill detection was blind; the next
+    fast-monitor cycles re-placed the same exit twice, and the duplicate
+    fills built untracked inverse positions (4 accidental reverse condors).
+    Post-R12 contract under the same timeline:
+      a) the FILLED->CLOSING CAS refuses a re-trigger while an exit is in
+         flight (the orchestrator only places an exit after CAS success);
+      b) the stale-pending path cancels but KEEPS TRACKING (no premature
+         CLOSING->FILLED revert);
+      c) when the cancel loses the race, the late-detected fill books
+         exactly ONE close and the trade is terminal."""
+    trade_id, order_id = await _place(env, _ic_signal(credit=1.00))
+    env.ib.resolve(order_id, "Filled", avg_price=-0.95, filled=1)
+    await env.executor.check_fills()
+    assert _trade_row(env, trade_id).status == TradeStatus.FILLED
+
+    # 13:30:44 — exit #1: CAS FILLED->CLOSING, place, register.
+    assert env.state.update_trade_status(
+        trade_id, TradeStatus.CLOSING,
+        from_statuses=[TradeStatus.FILLED, TradeStatus.PARTIAL],
+    )
+    exit_order = SimpleNamespace(orderId=0, totalQuantity=1, lmtPrice=0.55,
+                                 action="BUY", orderType="LMT")
+    exit_trade = env.ib.placeOrder(
+        SimpleNamespace(secType="BAG", symbol="SPY"), exit_order)
+    exit_oid = exit_trade.order.orderId
+    env.executor.register_exit_order(exit_oid, trade_id, "macro_event_flatten",
+                                     estimated_pnl=40.0)
+
+    # 13:31:44 — the fast monitor comes around again while the bot is blind
+    # to the fill. Pre-R12 this re-placed the same exit (order 261926).
+    # The re-trigger gate is the CAS: it must refuse while CLOSING.
+    assert env.state.update_trade_status(
+        trade_id, TradeStatus.CLOSING,
+        from_statuses=[TradeStatus.FILLED, TradeStatus.PARTIAL],
+    ) is False, "second exit must be refused while one is in flight"
+    assert len(env.ib.placed) == 2  # entry + ONE exit; Monday saw three exits
+
+    # Exit looks stuck (>300s): the executor requests a cancel but keeps
+    # tracking — no premature revert that would re-arm the portfolio monitor.
+    env.executor._pending_exit_orders[exit_oid].submitted_at -= 301
+    await env.executor.check_fills()
+    assert exit_oid in env.ib.cancelled_order_ids
+    assert exit_oid in env.executor._pending_exit_orders
+    assert _trade_row(env, trade_id).status == TradeStatus.CLOSING
+
+    # The cancel LOSES: IB reports the order actually filled at 13:30:44.
+    env.ib.resolve(exit_oid, "Filled", avg_price=0.40, filled=1)
+    filled, exits = await env.executor.check_fills()
+    assert len(exits) == 1, "the late-detected fill books exactly one close"
+    assert exits[0]["trade_id"] == trade_id
+    assert exits[0]["exit_price"] == pytest.approx(0.40)
+    assert _trade_row(env, trade_id).status == TradeStatus.CLOSED
+    assert _open_position_row(env, trade_id) is None
+    assert exit_oid not in env.executor._pending_exit_orders
+
+    # Terminal is terminal: nothing can double-book or resurrect it.
+    assert env.state.close_trade(trade_id, 0.0, 0.0) is False
+    assert env.state.update_trade_status(
+        trade_id, TradeStatus.FILLED, from_statuses=[TradeStatus.CLOSING]) is False
+    _, exits_again = await env.executor.check_fills()
+    assert exits_again == []
+    assert len(env.ib.placed) == 2  # still: one entry, one exit, ever

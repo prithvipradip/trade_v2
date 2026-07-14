@@ -69,6 +69,12 @@ def setup_logging(
     # real errors from these libraries still pass at WARNING/INFO.
     logging.getLogger("ibapi").setLevel(logging.WARNING)
     logging.getLogger("ib_insync").setLevel(logging.INFO)
+    # R13 (secrets lens): urllib3's DEBUG logs full request URLs — a real
+    # FINNHUB_API_KEY landed in 11 log files as `?token=<key>` querystrings
+    # (200 occurrences) because the file handler captures DEBUG. Same class
+    # as the ibapi flood: third-party wire noise never belongs at DEBUG here.
+    logging.getLogger("urllib3").setLevel(logging.INFO)
+    logging.getLogger("requests").setLevel(logging.INFO)
 
     # Configure structlog
     structlog.configure(

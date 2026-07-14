@@ -174,6 +174,12 @@ class TradeExecutor:
         self._order_timeout = order_timeout
         self._pending_orders: dict[int, PendingOrder] = {}  # order_id → PendingOrder
         self._pending_exit_orders: dict[int, PendingExitOrder] = {}  # order_id → PendingExitOrder
+        # R13: exit orderIds we already asked the broker to cancel while they
+        # were still WORKING (stale >300s) — one cancel per order, not per pass.
+        self._exit_cancels_requested: set[int] = set()
+        # R13: orderId -> (signal_price, live_mid, nbbo_spread) captured at
+        # placement; survives pending-dict cleanup (see _sweep_executions).
+        self._order_ctx_map: dict[int, tuple[float, float, float]] = {}
         self._order_trade_map: dict[int, str] = {}  # orderId → trade_id (survives cleanup)
         # R12 F2.2: strong references to event-spawned tasks. An unreferenced
         # asyncio task is garbage-collectable mid-flight — the event-driven
@@ -321,6 +327,17 @@ class TradeExecutor:
                 if not hasattr(self, "_order_trade_map"):
                     self._order_trade_map = {}
                 self._order_trade_map[trade.order.orderId] = trade_id
+                # R13 (shadow-referee break #7): fill-quality context must
+                # ALSO survive cleanup. Since R11's event-driven fills, the
+                # pending entry is booked and deleted by the fill event BEFORE
+                # the next sweep pass — the sweep then inserted every
+                # execution with signal_price/live_mid/nbbo_spread = 0 and
+                # the slippage gate had literally no data.
+                self._order_ctx_map[trade.order.orderId] = (
+                    abs(signal.entry_price or 0),
+                    getattr(self, "_last_live_mid", 0.0) or 0.0,
+                    getattr(self, "_last_nbbo_spread", 0.0) or 0.0,
+                )
 
             log.info(
                 "trade_executed",
@@ -797,7 +814,37 @@ class TradeExecutor:
         for order_id, pending_exit in list(self._pending_exit_orders.items()):
             still_open = any(t.order.orderId == order_id for t in open_trades)
             if still_open:
+                # R13 (07-13 incident regression work): a WORKING exit was
+                # skipped unconditionally here, which made the >300s stale
+                # branch and the 900s zombie cap below UNREACHABLE for the
+                # common case — a resting limit the market ran away from.
+                # The position wedged in CLOSING (CAS then blocks every new
+                # exit) with a stale-priced order at the broker. Now: request
+                # ONE cancel at >300s and keep tracking. The next pass gets
+                # the terminal verdict: filled -> booked (cancel lost the
+                # race, exactly one close), cancelled -> CAS revert to FILLED
+                # for a clean marketable re-trigger. Never revert while the
+                # broker shows the order working (a halt can reject cancels;
+                # reverting would re-arm the duplicate-exit incident).
+                if (pending_exit.age_seconds > 300
+                        and order_id not in self._exit_cancels_requested):
+                    log.warning(
+                        "exit_order_stale_working_cancel_requested",
+                        trade_id=pending_exit.trade_id,
+                        order_id=order_id,
+                        age_seconds=int(pending_exit.age_seconds),
+                    )
+                    try:
+                        for t in open_trades:
+                            if t.order.orderId == order_id:
+                                self._ibkr.ib.cancelOrder(t.order)
+                                self._exit_cancels_requested.add(order_id)
+                                break
+                    except Exception as e:
+                        log.warning("exit_stale_cancel_failed",
+                                    order_id=order_id, error=str(e))
                 continue
+            self._exit_cancels_requested.discard(order_id)
 
             # Give exit orders time to appear in IBKR's trade list before checking
             # Without this, fresh orders get falsely marked as "cancelled"
@@ -993,6 +1040,16 @@ class TradeExecutor:
                     _p = self._pending_exit_orders.get(oid)
                     trade_id = getattr(_p, "trade_id", "") if _p else ""
                 pend = self._pending_orders.get(oid) or self._pending_exit_orders.get(oid)
+                # R13 (shadow-referee break #7): the pending entry is gone by
+                # the first sweep after an event-driven fill (R11) — fall back
+                # to the placement-time context map, which survives cleanup.
+                ctx = self._order_ctx_map.get(oid, (0.0, 0.0, 0.0))
+                if pend is not None and hasattr(pend, "signal"):
+                    sig_price = abs(getattr(pend.signal, "entry_price", 0) or 0)
+                else:
+                    sig_price = ctx[0]
+                live_mid = (getattr(pend, "live_mid", 0.0) or 0.0) or ctx[1]
+                nbbo = (getattr(pend, "nbbo_spread", 0.0) or 0.0) or ctx[2]
                 for f in t.fills:
                     if not f.execution or not f.execution.execId:
                         continue
@@ -1015,11 +1072,9 @@ class TradeExecutor:
                         exec_time=str(f.execution.time or ""),
                         commission=comm,
                         realized_pnl=rpnl,
-                        signal_price=abs(getattr(getattr(pend, "signal", None),
-                                                 "entry_price", 0) or 0)
-                                     if pend is not None and hasattr(pend, "signal") else 0.0,
-                        live_mid=getattr(pend, "live_mid", 0.0) or 0.0,
-                        nbbo_spread=getattr(pend, "nbbo_spread", 0.0) or 0.0,
+                        signal_price=sig_price,
+                        live_mid=live_mid,
+                        nbbo_spread=nbbo,
                     )
         except Exception as e:  # noqa: BLE001
             log.debug("executions_sweep_failed", error=str(e))

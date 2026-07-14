@@ -387,17 +387,26 @@ class PortfolioManager:
                 log.debug("touch_check_failed", trade_id=trade.trade_id, error=str(_e))
 
         # 2. Take profit (time-decay adjusted) — needs real marks
-        elif not marks_missing and not is_credit and pnl_pct >= take_profit_long:
+        # R13-CRIT-2: this was `elif`, chained to the R12 touch-stop `if`
+        # above. For every credit position with the touch stop enabled (the
+        # default), the touch `if` was taken, so take-profit / assignment /
+        # DTE / delta / earnings below were STRUCTURALLY UNREACHABLE — a
+        # condor could only ever exit via stop or touch. Each branch now
+        # guards on `not should_exit` explicitly.
+        if (not should_exit
+                and not marks_missing and not is_credit and pnl_pct >= take_profit_long):
             should_exit = True
             exit_reason = f"take_profit (P&L: {pnl_pct:.1%}, target: {take_profit_long:.1%})"
-        elif not marks_missing and is_credit and pnl_pct >= take_profit_short:
+        elif (not should_exit
+                and not marks_missing and is_credit and pnl_pct >= take_profit_short):
             should_exit = True
             exit_reason = f"take_profit_short (P&L: {pnl_pct:.1%}, target: {take_profit_short:.1%})"
 
         # 3. Assignment risk — ITM shorts on expiry day (DTE 0-1) MUST close
         # Short puts ITM → stock gets put to you (cash drain)
         # Short calls ITM → shares called away (may cause forced cover)
-        elif dte is not None and dte <= 1 and is_credit and trade.strike:
+        elif (not should_exit
+                and dte is not None and dte <= 1 and is_credit and trade.strike):
             try:
                 current_underlying = await self._market_data.get_current_price(trade.symbol)
                 if current_underlying:
@@ -425,15 +434,16 @@ class PortfolioManager:
         # the 14-DTE entry floor implies every position gets >=9 calendar
         # days of theta runway — do NOT lower dte_range[0] below ~10 without
         # revisiting this exit, or entries become forced-exit churn again.
-        elif dte is not None and dte <= 5:
+        elif not should_exit and dte is not None and dte <= 5:
             should_exit = True
             exit_reason = f"expiry_approaching (DTE: {dte})"
 
         # 3b. Delta breach — close if directional risk ballooned
         # For neutral strategies (iron condor, straddle), delta should stay small
         # If abs(delta) > 0.50, position has taken on large directional exposure
-        elif trade.strategy in ("iron_condor", "short_strangle", "long_straddle",
-                                 "cash_secured_put", "covered_call"):
+        elif (not should_exit
+                and trade.strategy in ("iron_condor", "short_strangle", "long_straddle",
+                                       "cash_secured_put", "covered_call")):
             pos_delta = self._get_position_delta(trade)
             if pos_delta is not None and abs(pos_delta) > 0.50:
                 should_exit = True
@@ -441,7 +451,7 @@ class PortfolioManager:
 
         # 3c. IV crush pre-close — for SHORT premium strategies, close 2 days
         # before earnings to capture theta without eating the earnings IV crush
-        elif self._earnings and trade.strategy in (
+        elif not should_exit and self._earnings and trade.strategy in (
             "iron_condor", "short_strangle", "cash_secured_put", "covered_call",
         ):
             try:
@@ -462,7 +472,10 @@ class PortfolioManager:
         # 3d. Macro event flatten — close short-premium positions 1 day before
         # FOMC/CPI/NFP to avoid vol expansion. DISABLED for data-collection
         # window — set AIT_SKIP_MACRO_EVENTS=1 to re-enable.
-        import os
+        # R13-CRIT-1: a local `import os` here made `os` function-local, so
+        # line ~363 (touch-stop env read) raised UnboundLocalError on EVERY
+        # credit-position tick — killing the whole exit monitor. Module-level
+        # import (line 16) is the only one allowed in this function.
         if (os.environ.get("AIT_SKIP_MACRO_EVENTS", "0") == "1"
                 and not should_exit and self._economic_cal
                 and trade.strategy in (

@@ -272,16 +272,20 @@ class IBKRClient:
         if not await self.ensure_connected():
             return [None] * len(contracts)
         try:
-            qualified = await self._ib.qualifyContractsAsync(*contracts)
-            # qualifyContractsAsync returns the same contracts with details filled in.
-            # Contracts that failed qualification will have conId == 0.
-            result = []
-            for q in qualified:
-                if q.conId and q.conId > 0:
-                    result.append(q)
-                else:
-                    result.append(None)
-            return result
+            await self._ib.qualifyContractsAsync(*contracts)
+            # R13 (supply-chain verify): the old code mapped over the RETURN
+            # value assuming failures come back in place with conId==0.
+            # Installed ib_insync 0.9.86 OMITS failed contracts from the
+            # returned list entirely, so on a partial failure the result was
+            # SHORTER than the input and every positional consumer (executor
+            # combo legs, reconciler, options_chain) silently misaligned
+            # conId-to-leg — a condor could reach the broker with conIds
+            # mapped to the wrong actions. qualifyContractsAsync mutates the
+            # INPUT objects in place, so build the N-for-N result from the
+            # inputs themselves; also forward-compatible with ib_async's
+            # N-for-N/None return contract.
+            return [c if (getattr(c, "conId", 0) or 0) > 0 else None
+                    for c in contracts]
         except Exception as e:
             log.error("batch_qualification_failed", count=len(contracts), error=str(e))
             return [None] * len(contracts)

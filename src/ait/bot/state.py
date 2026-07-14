@@ -751,7 +751,16 @@ class StateManager:
                      commission=excluded.commission,
                      realized_pnl=excluded.realized_pnl,
                      trade_id=CASE WHEN excluded.trade_id != ''
-                                   THEN excluded.trade_id ELSE trade_id END""",
+                                   THEN excluded.trade_id ELSE trade_id END,
+                     -- R13: fill-quality context is only known at placement;
+                     -- a later sweep may carry it when the first insert did
+                     -- not (event-fill races). Never zero a known value.
+                     signal_price=CASE WHEN excluded.signal_price > 0
+                                       THEN excluded.signal_price ELSE signal_price END,
+                     live_mid=CASE WHEN excluded.live_mid > 0
+                                   THEN excluded.live_mid ELSE live_mid END,
+                     nbbo_spread=CASE WHEN excluded.nbbo_spread > 0
+                                      THEN excluded.nbbo_spread ELSE nbbo_spread END""",
                 (exec_id, order_id, perm_id, trade_id, symbol, con_id, side,
                  shares, price, exec_time, commission, realized_pnl,
                  signal_price, live_mid, nbbo_spread),
@@ -770,6 +779,22 @@ class StateManager:
         with self._connect() as conn:
             conn.execute("UPDATE trades SET commission = ? WHERE trade_id = ?",
                          (commission, trade_id))
+            # R13 (shadow-referee break #9): commissions arrive AFTER
+            # close_trade's dual-write, so the DuckDB mirror kept
+            # commission=0 forever (sqlite $22.72 vs duckdb $0.00 measured
+            # 2026-07-14). Re-ingest the row — ingest_trade is an
+            # INSERT OR REPLACE upsert, so this is idempotent.
+            if self._duck:
+                try:
+                    conn.row_factory = sqlite3.Row
+                    row = conn.execute(
+                        "SELECT * FROM trades WHERE trade_id = ?", (trade_id,)
+                    ).fetchone()
+                    if row:
+                        self._duck.ingest_trade(dict(row))
+                except Exception as e:
+                    log.warning("duckdb_commission_sync_failed",
+                                trade_id=trade_id, error=str(e))
 
     def set_trade_capital_at_risk(self, trade_id: str, car: float) -> None:
         with self._connect() as conn:
