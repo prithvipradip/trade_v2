@@ -684,11 +684,39 @@ class TradingOrchestrator:
 
     async def _trading_cycle(self) -> None:
         """Single trading cycle: scan all symbols, check positions, execute signals."""
+        # R13 (human-factors): make the entry-freeze state OBSERVABLE. The
+        # halt check lives deep in _try_execute, so on a gated day (e.g. CPI
+        # economic_event_skip) `entries_halted` never logged — 90 min of
+        # frozen RTH on 07-14 produced ZERO greppable evidence and the
+        # RUNBOOK kill-switch drill greps for exactly that. One line per
+        # scan cycle, only while a halt file exists.
+        try:
+            from pathlib import Path as _P13
+            _halts = [p.name for p in _P13("data").glob("HALT*") if p.is_file()]
+            if _halts:
+                log.warning("entries_frozen", halt_files=_halts)
+        except Exception:  # noqa: BLE001
+            pass
+
         # 1. Check circuit breaker
         if self._circuit_breaker.is_tripped:
             log.warning("trading_halted", reason=self._circuit_breaker.get_status().reason)
-            await self._send_notification(f"CIRCUIT BREAKER: Trading halted - {self._circuit_breaker.get_status().reason}")
+            # R13 (human-factors): this notification was UNTHROTTLED — on
+            # 07-10 it sent the same message 62 times in one day (every
+            # 5-min cycle while tripped), burying the signal. Notify once
+            # per trip, then at most hourly while it stays tripped. The
+            # per-cycle log line above is unchanged.
+            _now = time.time()
+            _last = getattr(self, "_cb_last_notify", 0.0)
+            _was_tripped = getattr(self, "_cb_was_tripped", False)
+            if not _was_tripped or (_now - _last) >= 3600:
+                await self._send_notification(
+                    f"CIRCUIT BREAKER: Trading halted - "
+                    f"{self._circuit_breaker.get_status().reason}")
+                self._cb_last_notify = _now
+            self._cb_was_tripped = True
             return
+        self._cb_was_tripped = False
 
         # 2. Sync risk manager with live positions (fixes stale position tracking)
         await self._sync_risk_manager_positions()

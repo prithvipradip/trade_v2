@@ -114,12 +114,49 @@ redeploy). **Scoreboard restatement decision pending**: book exits from first-cl
   (lib archived Mar 2024, author deceased; successor `ib_async` 2.1.0; IB is removing legacy
   wire methods on a forced-upgrade schedule — migration is a dedicated post-verdict change).
 
+### Human-factors lens (rerun, completed later 07-14 — all executed evidence)
+- **Config typos were silently swallowed** (pydantic `extra="ignore"` everywhere): executed
+  proof — `max_contracts_per_trad` (one letter) silently traded **10× size**;
+  `paper_trading_mod` silently re-enabled live-only learning overlays (the exact R5 class);
+  zero warnings, and the deploy smoke only proved the yaml parsed. FIXED: `extra="forbid"`
+  on every config model (SentimentConfig stays `allow` as the tombstone exception) + smoke
+  sentinels (1-lot, paper_trading_mode, mode=paper). Real config.yaml verified loading clean.
+- **The bot fights manual intervention**: after a manual TWS flatten, the monitor still
+  demanded the exit and `_execute_exit` places the reverse combo with NO broker-position
+  check → rebuilds the position inverted (07-13 incident class, operator-triggered). Also:
+  flattening the LAST option position is never booked (zero-options mass-close guard), and
+  a one-leg manual close would be re-opened reversed. SOON: broker-position check before
+  reverse combos + guard escape hatch. NOW: RUNBOOK "manual intervention procedure" box.
+  **U5 flow verified SAFE** (untracked positions have no exit path; close at broker →
+  verify flat → delete HALT_UNTRACKED; deleting early just re-freezes).
+- **Backup mirror was silently stale**: unclosed sqlite connections + no content verify —
+  the off-box mirror was missing ALL of Monday's closes while the success log, digest, and
+  the RUNBOOK's timestamp check all read green (copy2 back-dates mtimes). FIXED: explicit
+  closes before the mirror copy + sha256 verify raising into the existing BACKUP FAILED
+  alert. SOON: digest reports mirror CONTENT age.
+- **Alert fatigue**: 07-10 produced 136 Telegram sends, 62 of them the identical unthrottled
+  CIRCUIT BREAKER message (every 5-min cycle while tripped). FIXED: once per trip + hourly.
+  RUNBOOK rows added for CIRCUIT BREAKER / LOOP IMPAIRED / component-down.
+- **The entry freeze was unobservable**: `entries_halted` never logged in any file back to
+  07-09 — including 90 min of frozen RTH today — because the check sits below the scan
+  gates; the RUNBOOK drill grepped for exactly that event. FIXED: `entries_frozen` logs
+  once per scan cycle whenever a HALT* file exists; drill updated.
+- **Startup chain coherent but its failure is silent**: keeper never verifies a relaunch
+  succeeded and never alerts (SOON) — and the three compensating layers are all STILL
+  unarmed: U1 dead-man, U2 auto-logon, U3 w32time (the fundamental blockers here).
+- RUNBOOK staleness fixed same-day: retired duckdb-pollution warning (fixed since R12),
+  drill table filled (backup restore 07-11 PASS), "leave it and note it" untracked-option
+  advice corrected (the file re-creates at the next reconcile — not an option the code
+  supports).
+
 ### SOON queue (next code windows, evidence in the R13 result file)
 Exit-price sanity bound (credit buyback capped at wing width; never MARKET a credit BAG);
 staleness gate wired into touch/DTE exits (`validate_quote` exists, zero call sites); exit
 reject backoff + alert counter; MTM brake gap-blindness (SOD baseline from prior close);
 commission attribution EOD re-stamp; booked-P&L-from-executions booking path; DD method pin;
-exec_time +4h double-conversion; ib_async migration (post-verdict).
+exec_time +4h double-conversion; broker-position check before reverse exit combos +
+zero-options guard escape hatch (human-factors #2); keeper relaunch verification + alert;
+digest reports mirror content age; ib_async migration (post-verdict).
 
 ### USER ACTIONS (new — see table at top: U7-U12)
 Repo is PUBLIC; Gateway API binds 0.0.0.0 + IBC auto-accepts (one Wi-Fi-profile flip from a

@@ -667,7 +667,9 @@ def backup_state_db():
         bdir.mkdir(exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d")
         dest = bdir / f"ait_state.{ts}.db"
-        with _sq.connect(str(src)) as con, _sq.connect(str(dest)) as out:
+        con = _sq.connect(str(src))
+        out = _sq.connect(str(dest))
+        try:
             con.backup(out)
             # R6: verify the snapshot — a corrupt backup discovered at
             # restore time is unrecoverable. integrity_check + row parity on
@@ -679,6 +681,14 @@ def backup_state_db():
                 raise RuntimeError(
                     f"backup verification failed: integrity={_ok}, "
                     f"trades {_n_src} -> {_n_dst}")
+        finally:
+            # R13 (human-factors): `with sqlite3.connect(...)` manages the
+            # TRANSACTION, not the connection — the destination file could be
+            # un-finalized when copy2 read it, and on 07-14 the mirror was
+            # found a full run stale (missing all of Monday's closes) while
+            # every check read green. Close BEFORE the mirror copy.
+            con.close()
+            out.close()
         # prune to 14 most recent
         snaps = sorted(bdir.glob("ait_state.*.db"))
         for old_f in snaps[:-14]:
@@ -687,7 +697,21 @@ def backup_state_db():
         mirror_dir = Path.home() / "Documents" / "ait_backups"
         mirror_dir.mkdir(parents=True, exist_ok=True)
         import shutil
-        shutil.copy2(dest, mirror_dir / "ait_state.latest.db")
+        import hashlib
+        mirror = mirror_dir / "ait_state.latest.db"
+        shutil.copy2(dest, mirror)
+        # R13: verify the mirror BY CONTENT — copy2 back-dates the mtime, so
+        # the RUNBOOK's timestamp check could not catch a stale/partial copy.
+        # A mismatch raises into the existing BACKUP FAILED alert path.
+        def _sha(p):
+            h = hashlib.sha256()
+            with open(p, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        if _sha(dest) != _sha(mirror):
+            raise RuntimeError("mirror hash mismatch after copy — "
+                               f"{mirror} does not match {dest}")
         _log("info", "state_db_backed_up", dest=str(dest))
     except Exception as e:  # noqa: BLE001
         _log("error", "state_db_backup_failed", error=str(e))

@@ -259,8 +259,21 @@ def check_load_settings() -> str:
     s = load_settings("config.yaml")
     for attr in ("api_keys", "ibkr", "notifications", "learning", "logging"):
         getattr(s, attr)
+    # R13 (human-factors): this check used to prove only that the yaml
+    # PARSED — it asserted no values, so a typo'd key running a silent code
+    # default sailed through the deploy smoke. Strict extra="forbid" now
+    # rejects unknown keys at load; these sentinels additionally pin the
+    # values a silent default would poison worst.
+    assert s.positions.max_contracts_per_trade == 1, (
+        f"max_contracts_per_trade={s.positions.max_contracts_per_trade} — "
+        "expected 1 (sample-building sizing); a default leak here trades 10x")
+    assert s.learning.paper_trading_mode is True, (
+        "learning.paper_trading_mode is not True — live-only learning "
+        "overlays would contaminate the paper sample (R5 class)")
+    assert s.trading.mode == "paper", (
+        f"trading.mode={s.trading.mode!r} — this box is the PAPER stage")
     _SETTINGS = s
-    return "config.yaml parsed + validated"
+    return "config.yaml parsed + validated + sentinels (1-lot, paper-mode)"
 
 
 def check_state_manager() -> str:
