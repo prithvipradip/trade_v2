@@ -1,284 +1,288 @@
-# AIT v2 — Improvement Plan (from full repo audit, 2026-07-07)
+# AIT v2 — Plan & Audit Ledger
 
-Mission: autonomous options-income bot (sell premium via iron condors / strangles on
-liquid US ETFs/megacaps), ML-gated entries, automated exits, self-learning, hands-off ops.
-Paper account DUN603821. Real track record as of audit: **$248.80 banked (5 real closes),
-8 open filled positions** — machine works, edge unproven.
+**Mission:** autonomous options-income bot (iron condors on liquid US ETFs/megacaps),
+ML-gated entries, automated exits, hands-off ops. Paper account DUN603821.
+**Goal:** a trustworthy real track record answering "does this have edge?" before funding
+$3,000 CAD.
 
-Strategic frame: with the learning layer dormant below ~30 real trades, the fastest path
-to "is the edge real?" is **maximizing clean trade count while protecting track-record
-integrity**. Priorities below rank by that, not code aesthetics.
+**Current state (2026-07-14):**
+- Real track record since the 2026-07-06 reset: **9 closes, +$280.20**, with real broker
+  commissions booked. Open book: 1 IWM long straddle, held into CPI deliberately (it is
+  long vol). Zero short premium through the print.
+- The machine works — real fills, real costs, honest scoreboard, layered protection.
+  **Edge is still unproven**, and R9's statistics say 50 closes is only a preliminary read.
+- 12 audit rounds complete (~250 defects fixed). Newest rounds at the top.
 
-Full audit reports: four-agent audit (pipeline core, risk/broker, ML/learning, ops/infra),
-2026-07-07. Key file:line references inline.
+**Doc map:** `docs/AUDIT_R12.md` (sophistication/maturity decision sheet) ·
+`docs/GAP_AUDIT_R7.md` (component gaps) · `docs/BENCHMARKS_R9.md` (measured latency /
+accuracy / performance) · `docs/MATURITY_R10.md` (external best-practice matrix) ·
+`docs/RUNBOOK.md` (alert→action, deploy checklist, drills). Everything under `deprecated/`
+is retired-not-deleted and loaded by nothing.
 
 ---
 
-## Batch 1 — safety/correctness bugs live right now
+## OPEN — user actions (each verified missing on the box; each closes real exposure)
 
-| # | Item | Where | Status |
-|---|------|-------|--------|
-| 1.1 | **Dead thesis-invalidation exit**: `_check_thesis_valid` raises NameError (`symbol` undefined) every call, swallowed by broad except → ML direction-flip exit never runs. Fix var + narrow except. | orchestrator.py:1797,1822 | done |
-| 1.2 | **IC gated backwards**: iron condors require ≥0.65 *directional* confidence pre-check — blocks calm markets (ideal for ICs), admits trending ones. Backtest skips this gate for neutral strategies (engine.py:300); live must too. Gate ICs on range-model probability. | orchestrator.py:~730 | done |
-| 1.3 | **bot_stdout.log unbounded (2.0 GB)**: raw append sink never rotated; mtime-based cleanup can never delete it. Size-capped rotation + size-based cleanup. | master.py:146,514 | done |
-| 1.4 | **Per-position marks never persisted**: `open_positions.unrealized_pnl` stays 0 forever. Add `update_position_mark()` in state.py, call in `_evaluate_position` (marks-present guard), surface per-position P&L in status.py + 8503 dashboard (green/red table). | portfolio.py:240, state.py, status.py:122, status_server.py | done |
-| 1.5 | **Reconnect wedge**: after 5 failed reconnects, `_reconnect` returns False forever (counter never resets). Reset counter on exhaustion + alert. | ibkr_client.py:166-189 | done |
-| 1.6 | **FX silent overstatement**: failed USDCAD fetch → usd_to_base=1.0 → all CAD-base limits inflated ~39%. Cache last good rate; if none, mark account data unreliable (risk layer treats as no-data). | account.py / ibkr_client.py:401 area | done |
-| 1.7 | **keeper_ait.bat untracked** — the crash-recovery script exists only on this machine. git add. | repo root | done |
-
-## Batch 2 — track-record integrity + edge validation
-
-| # | Item | Where | Status |
-|---|------|-------|--------|
-| 2.1 | **Strangle risk mis-modeled**: `max_loss = 3× credit` understates tail 10-30×; buying-power check inverted for credits (checks affordability of money received); IBKR margin never consulted. Use strike-distance-based tail estimate; check margin/available funds for credit trades. | straddles.py:155, manager.py:204 | done |
-| 2.2 | **Partial exits book phantom P&L**: records estimated P&L + underlying price as fill before order fills → DB/IBKR drift. Register order, book on real fill. | orchestrator.py:1407-1447 | done |
-| 2.3 | **Size multiplier bypasses risk gates**: learning multiplier applied AFTER validate_trade → gates check 1×, book can execute N×. Apply before validation. | orchestrator.py:1235 | done |
-| 2.4 | **Range-model CV leakage**: 30-day overlapping labels with gap=5 → inflated AUROC feeding the trade/no-trade edge gate. gap ≥ horizon. | range_predictor.py:479-491 | done |
-| 2.5 | **Thompson decay truncation**: `int(wins*0.995)` zeroes 1-win arms daily → bandit can never accumulate signal at low volume. Decay in float, round on read. | thompson.py:132-133 | done |
-
-## Batch 3 — before trusting results / going live
-
-| # | Item | Where | Status |
-|---|------|-------|--------|
-| 3.1 | **Retrain pipeline**: 7:30 daily retrain writes models the live bot doesn't load (7-day reload timer) — unify; pin OMP threads in subprocess; atomic pickle writes (tmp+rename). | master.py:396-436, trainer.py:67, ensemble.py:419 | done |
-| 3.2 | **Tests for burned paths**: marketable-combo entry pricing + spread-reject gate (executor), BotManager restart budget / gateway-defer. Zero coverage today despite production failures. | tests/ | done |
-| 3.3 | **Config consolidation**: hoist behavioral literals (EXIT_CROSS, entry offset, RANGE_MIN_CONFIDENCE, budget tiers, risk cap %s, correlation cap) into settings; delete dead gates (daily-limit on wrong object, concentration reading never-populated field); wire or remove phantom `max_portfolio_risk_pct`. | manager.py, orchestrator.py, executor.py, settings.py | done |
-| 3.4 | **Backtest fill realism** (larger project, separate pass): historical option quotes where available, model combo non-fills. Until then treat +311% IC backtest as directional only. | engine.py | deferred |
-
-## Round 2 (2026-07-07 evening) — verification audit: fixes verified + new findings fixed
-
-Adversarial review of Round-1 commits: all major fixes verified clean (neutral-only, FX stop,
-reconnect, Thompson floats, config wiring); stress-risk does NOT kill strangles; CC/CSP
-blocking is pre-existing (3% cap vs assignment notional), not a regression.
-
-| # | Item | Where | Status |
-|---|------|-------|--------|
-| R2.1 | **P&L booked on signal price, not real fill** (forensics: all 8 fills adverse, −$89, up to 14.8% of credit — slippage invisible, P&L overstated). Real fill now written to trades.entry_price; BAG-aware entry fill reconstruction. | executor.py, state.py | done |
-| R2.2 | **ITM-aware expiry booking** — expired credit was booked full-premium WIN regardless of moneyness (top sample-corruption risk). Now valued at intrinsic via underlying price; refuses to invent numbers (review flag) if price unavailable. | reconciler.py | done |
-| R2.3 | **Sweep front-ran fill-promotion** — 30-min PENDING closed as "$0 never filled" before IBKR liveness check could rescue it. Sweep now liveness-gated (promotes if legs live; skips if IBKR unreadable) and runs AFTER promotion. | reconciler.py | done |
-| R2.4 | **Partial/cancel status writes were no-ops** (INSERT OR IGNORE on existing row) — partial entry fills were live UNMANAGED positions. Real writes + open_positions registration. | executor.py | done |
-| R2.5 | **Exit-cancel double-close race** — stale exit reverted CLOSING→FILLED while the cancel could race a fill → second close = fresh naked position. Now keeps tracking until terminal state (900s zombie cap). | executor.py | done |
-| R2.6 | **Assignment detection** — untracked STK position at IBKR now flagged CRITICAL + Telegram (was: one log line, then silent buying-power rot). | reconciler.py, orchestrator.py | done |
-| R2.7 | **Stale strangle max_loss restated** — 3 pre-fix positions under-counted aggregate risk 2.7x ($6.6k vs $18.1k true); restated in bot_state + 28 dead keys purged + keys now deleted on close. | one-time data fix, orchestrator.py | done |
-| R2.8 | **Short-vol guardrails** — credit-position cap (6) + VIX entry halt (28) for credit strategies; delta gate is dead and daily breaker sees only realized P&L, so these are the gap-day brakes. | manager.py, settings, config | done |
-| R2.9 | **Unprotected-state alerts** — prolonged marks-missing (10 ticks ≈5 min → stop/TP silently OFF) and PDT-blocked stop now Telegram once. | portfolio.py, orchestrator.py | done |
-| R2.10 | **Sample velocity** — universe +GLD/TLT/XLE (index cluster saturated book at ~5/8 slots), dte_range 14-45 → 7-30 (~2x closes/slot). 100 closes/month was NOT achievable as configured (~15-20). | config.yaml | done |
-| R2.11 | **Mid-session restart guard** — fresh-models marker restart now deferred while market open + gated on successful unlink (was: slow retrain → unguarded restart at 10am; locked marker → restart every 2 min). | master.py | done |
-| R2.12 | Smalls: partial-exit await 10s→4s (stalled other stops), OI=0 treated as unknown not illiquid (IBKR realtime), GARCH CV gap pinned 5 (over-purge), status.py pre-migration fallback, ait.log 10MB×5→20MB×10 (error spam destroyed forensic evidence), Thompson float fmt. | various | done |
-| R2.13 | Retrain-effectiveness + fill-quality watch: verify tomorrow's session — thesis-check runs clean, marks persist, slippage on new entries, GLD/TLT/XLE signals generate. | live verification | todo |
-| R2.14 | Deferred: Telegram off hot path w/ retry+2nd channel; covered_call share-ownership precondition (currently unreachable — blocked by 3% cap); ET-pinning for time gates; wmic→tasklist in keeper. | various | todo |
-
-## Round 3 (2026-07-07 night) — LINE-BY-LINE audit of the FULL system (~40k lines, 8 auditors, 100% coverage attested per file)
-
-FIXED (commit refs this batch):
-| Area | Fix |
-|---|---|
-| executor | BAG fill reconstruction was 100x too small (execution.shares = CONTRACTS for options); eager "cancelled" no longer orphans partial fills or mass-cancels on disconnect (filled-qty-first + not-found grace + connection guard); terminal partials stop tracking cleanly |
-| reconciler | realized P&L attribution now LEG-aware (was: first same-symbol item ≈ 1/4 of an IC, cross-trade bleed) |
-| orchestrator | fast-monitor errors now WARN + feed watchdog (were DEBUG-swallowed for hours); partial exits no longer double-count trades_won; breaker now sees partial P&L; first-hour 0.85 gate exempts range-gated neutral strategies (it structurally banned ICs 9:30-10:30) + ET-pinned; drift not fed fake directions for neutral wins; PDT round-trips now RECORDED (guard was fully inert — zero callers) |
-| watchdog | heartbeat no longer zeroes error_count (counter could never trip) |
-| circuit_breaker | record_partial_pnl(); ET-pinned daily reset (local-midnight reset could un-trip the daily halt MID-SESSION); consecutive-loss counter reset on auto-resume |
-| risk | sizer: credit strategies sized on capital-at-risk not premium (4-5x understatement); min-1 floor no longer forces an unaffordable contract; correlation cap now signed (negative-corr hedges no longer blocked); capital_tiers preferred lists include GLD/TLT/XLE (tier filter was silently deleting the R2.10 diversifiers!) |
-| thompson | atomic state save (kill mid-write silently reset the whole bandit) |
-| ML | vol_mag CV purge gap >= horizon (same leak-class as fixed range 2.4 — gated straddles on illusory edge); meta-label scaler now per-fold (was fit on ALL data pre-CV); ensemble labels NaN-init (last 5 rows were stamped fake-NEUTRAL every retrain); predict() reindex-safe + honest features_used; range model actually consumes VLMC features; directional CV gap=5 |
-| vol models | OU jump P(in-range) horizon variance was 252x too small (returned ~1.0 constant into the IC gate ensemble); GARCH student-t/skew-t thresholds now unit-variance rescaled |
-| sentiment | news keyword matching word-boundary anchored ("gain" in "against" flipped signs) |
-| learning | analyzer window keys on exit_time (7-30d holds closed in-window were excluded) |
-| data | daily save() no longer wipes implied_vol (INSERT OR REPLACE deleted it every retrain — IV features silently dead); int(NaN) volume guards in save paths + chain builder (one NaN killed a whole 50-contract batch); $0.50 strikes allowed (whole-dollar filter deleted ATM strikes on cheap names); earnings fetch never blocks the event loop (background-fills cache) |
-| ops | web_logs + streamlit dashboards bound to 127.0.0.1 (were LAN-exposed, no auth); daily report called a NONEXISTENT method since day one (empty file + false success) — fixed + returncode-gated; APScheduler misfire grace 1s→1h (jobs were silently dropped on restarts); orchestrator.log size-capped; Telegram token redacted from error logs; status.py None-guard |
-| backtest/offline | fix_pnl_history refuses re-run (2nd run zeroed migrated wins); run_optimizer --apply requires AIT_ALLOW_APPLY=1 (was a direct overfit→live-config pipe); engine entry commission no longer double-debited |
-
-## Round 3-A (2026-07-08 pre-dawn) — "finish everything under A": all remaining code items DONE
-A1 MTM daily-loss brake (30s tick, realized + unrealized-vs-SOD, same breaker, alert once);
-A2 exchange-time quote timestamps (staleness detection un-blinded); A3 remaining ET-pinning
-(budget tiers, daily-stats bucketing incl. StateManager default); A4 get_portfolio_summary
-read-only (persist=False — no HWM/marks/streak/alert mutation from reports); A5 watchdog
-ibkr+market_data heartbeats wired; A6 chain-median IV fallback (not flat 30%) for greeks;
-A7 stale parametric GARCH/MS/OU members skipped past retrain interval; A8 trainer rollback
-on all-symbol MEAN + adaptor one-adaptation-per-parameter + counterfactual min-age/zero-
-entry guards + analyzer NULL choke point; A9 partial-day bar excluded from live resample +
-bar-source tag column (TRADES/MIDPOINT); A10 economic-calendar exhaustion alarm (2027 bomb
-defused with a CRITICAL log); A11 Telegram off hot path w/ 3 retries + DuckDB read-only
-readers + TTLCache copy-on-get + wmic->PowerShell in keeper/autostart/status.
-A12 (open, live-only): observe the sign of a real closing-BAG avgFillPrice on the first
-debit-spread close (exit negation depends on it) — grep exit_order_filled that day.
-
-DEFERRED (Round 3 todo — larger design work, ranked):
-1. **Backtest credibility overhaul — CORE FIXED 2026-07-07 night**: sleeve-capital aggregation
-   (window capital = capital x N symbols; was ~N x inflated), trade-frequency-aware
-   Sharpe/Sortino annualization via `annualization_factor()` (was sqrt(252) per trade,
-   ~4.6x overstated; Sortino unified to target-0 downside deviation), non-overlapping
-   windows by default (step 21->63), chronological trade ordering for drawdown,
-   per-symbol returns vs full sleeve, forced-iron_condor removed (preferred on NEUTRAL
-   only). STILL OPEN from this cluster: export.py/app.py/analytics/duckdb display-side
-   sqrt(252) call sites (5), M10 param-collision in export/apply, M11 learner overlap
-   leak (sequential runs), and 3.4 fill realism. Historical run artifacts in reports/
-   were produced by the OLD math — re-run before citing any number.
-2. **Adjusted-vs-unadjusted price mixing — FIXED at the Yahoo boundary 2026-07-07 night**
-   (all 5 yfinance history() sites now auto_adjust=False = split-adjusted, div-unadjusted,
-   matching IBKR TRADES / Polygon). NOTE: previously-saved Yahoo-sourced rows in the SQLite
-   store and any trained models still carry the old mixed basis — next retrain refreshes
-   models; consider a one-time store re-backfill for dividend payers.
-3. Quote timestamps = exchange time (staleness detection currently blind); intraday bar-semantics tag (TRADES vs MIDPOINT vs adjusted); partial-day bar exclusion in live features.
-4. get_portfolio_summary must stop mutating protection state (EOD false MARKS-MISSING alert risk); watchdog ibkr/market_data components never heartbeated; daily-loss breaker still entry-gated + realized-only.
-5. GARCH members frozen at train time (stale up to reload interval); trainer rollback keyed on last symbol only; adaptor same-param compounding within a cycle; counterfactual eval min-elapsed guard; economic_calendar hardcoded 2026-only (year-end time bomb); DuckDB readers read_only; sortino/profit-factor display consistency; analyzer NULL-column guards.
-6. MP-F3 verify: sign of a real closing-BAG avgFillPrice (debit-spread exit negation depends on it) — check on first live debit close.
-
-## Round 11 (2026-07-11) — R9/R10 adoption batch (user: "lets fix r9 and r10")
-Benchmarks + maturity reports: docs/BENCHMARKS_R9.md, docs/MATURITY_R10.md. Shipping:
-- **Event loop unblocked** (R9 #1: risk monitor was BLIND 48% of RTH — sync yfinance/pandas I/O inside async scans blocked stops/TPs ~5min of every 10): blocking fetches offloaded to threads (agent, market_data/sentiment/multi_timeframe).
-- **Event-driven fill detection** (was ~33s poll-bound): ib_insync orderStatusEvent → debounced check_fills within ~1s; reentrancy-guarded (check_fills_safe); event-detected exits book through the same completed-exit path.
-- **Scan stage timing** (95% of per-symbol time was dark): scan_symbol_timing event with per-stage ms — DIA/GLD ~48s mystery becomes attributable.
-- **No-retrain-on-boot** (~110s unprotected on every restart) + **range-model artifact separation** (backtest hijacked live gate: prod ran 8.67%/21d vs designed ±5%/30d) + spec-mismatch CRITICAL on load (agent).
-- **Post-deploy smoke script** (scripts/smoke_deploy.py — executes every runtime path that died on 07-10/would have died from R8's _connect bug) + **deploy checklist** in RUNBOOK + **minimal CI** (.github/workflows/ci.yml — first CI this repo has ever had) (agent).
-- **Scorecard TCA**: executions/commissions/|fill-mid| + exit-reason P&L attribution + entry fill-rate in the Friday scorecard.
-- **GATE 1 SLIPPAGE NUMBER DEFINED (before data can bias it): median entry slippage ≤ 8% of credit over trailing 20 fills, with no worsening trend.**
-- **DRILLS: backup-restore REHEARSED 2026-07-11 — PASS** (integrity ok, 16/16 trades, snapshot+off-repo mirror both present). Kill-switch drill scheduled Monday RTH (create data/HALT, verify entries_halted, remove).
-- R9 statistical honesty adopted into expectations: 50 closes confirms PF>1.0 only at ~42/50 wins; PF>1.3 verdict realistically needs 100+ closes — the gate stays 50 for a PRELIMINARY verdict, 100 for funding (gate text updated).
-- STILL USER: healthchecks.io URL → data/deadman_url.txt (dead-man UNARMED since 07-09); cloud-sync ~/Documents/ait_backups; auto-logon.
-
-## Round 7 (2026-07-09) — component gap audit ("what's missing to make money") + NOW batch
-Full report: docs/GAP_AUDIT_R7.md (13 agents, line coverage, 43 NOW items). NOW batch SHIPPED same day:
-- **Bugs defused**: earnings parser returned DIVIDEND dates as earnings (AAPL="past", AMD=1995 — all earnings guards dead for single names; parse 'Earnings Date' by key, reject past, fallback earnings_dates); VIX-28 credit halt failed OPEN on fetch failure (now last-known-good ≤45min + FAIL CLOSED in manager); daily report crashed daily (days= vs lookback_days); learning structural adaptations had NO paper gate (adaptor now fully inert when paper_trading_mode — 8 consult guards).
-- **Measurement**: `executions` table (per-fill exec_id/side/price/time + REAL commissionReport commissions + signal-vs-mid fill quality) swept every check_fills; trades.commission stamped with real round-trip at close; trades.capital_at_risk retained (was KV deleted on close).
-- **Money**: entry limits anchored to LIVE combo NBBO mid (was fetched then thrown away); mid-first reprice ladder 25%→60%→100% of offset at 45s steps (AIT_ENTRY_LADDER_START; entry timeout 240s env AIT_ENTRY_ORDER_TIMEOUT); credit-to-width gate ≥0.20 (AIT_IC_MIN_CREDIT_WIDTH).
-- **Selection**: TRUE IV rank (percentile of stored daily implied_vol, ≥60 obs; tagged realized-proxy fallback until backfill lands — backfill kicked); cross-symbol two-phase scan: candidates collected universe-wide, ranked by eff_conf + 0.3×credit/width, executed best-first (was config-file order = second-best trades measured).
-- **Verdict**: weekly Friday 16:10 Telegram GO-LIVE SCORECARD (closes N/50, PF vs 1.3, maxDD vs deployed risk — NOT paper NLV) + same block in status.py; backtest R6-exit-parity mode + parameter-parity manifest (via subagent).
-**R7-SOON SHIPPED (2026-07-10, user-approved): budget-aware construction + launch coherence.** Strategies now receive the account's per-trade dollar budget each scan (Strategy.risk_budget via selector); iron-condor wings cap at affordable width = budget/(100×(1−credit_ratio)), floor relaxing $2→$1 when budget-capped — the $2.1k account trades narrow condors ONLY when premium is rich enough to clear the unchanged cost floors (trade less, only when paid). Position sizer: viability decided by the HARD cap alone (NLV×max_position_pct); soft multipliers (conf/vol/strategy/IV/drawdown/VIX) throttle count above the 1-contract floor instead of bricking the account (was $17-42 effective budget vs $130 min condor at launch size). Launch-size coherence self-test runs at startup + NLV moves >20%: asserts budget ≥ min-viable-IC and daily breaker ≥ 1.5× one normal stop-out, Telegram-alerts "CAP-GRID INCOHERENT" with the failing knobs. Verified: viable at both $197k/3% (budget $5,910) and $2,100/7% (budget $147 vs $86 min viable). Phase-2 recipe UPDATED: AIT_SIMULATED_CAPITAL=2100 + risk.max_position_risk_pct 0.07 now actually produces trades; watch the coherence line in logs on switch day.
-
-R7 remaining (SOON/POST-VERDICT) triaged in docs/GAP_AUDIT_R7.md — biggest SOONs: budget-aware condor construction + launch-size cap-coherence self-test (the $2.1k account cannot trade the current wide-wing structure — MUST land before Phase 2), range-model artifact separation (backtest overwrites models/range.pkl → live gate ran at 8.67%/21d not the designed ±5%/30d!), chain-snapshot quality telemetry, ex-div awareness, sentiment retirement decision.
-
-## Round 6 (2026-07-09) — user-approved strategy + ops batch ("lets do all of it")
-Driven by the 4-lens improvement review (backlog/empirics/design/ops). USER DECISIONS, all approved 2026-07-09:
-1. **Credit-aware exits** — flat loss limit 1.25x credit (env AIT_CREDIT_LOSS_LIMIT); NO breakeven tier, NO trailing, NO vol-tightening for CREDIT_STRATEGIES (SPY IC had peaked +32.3% of credit and was trail-stopped at +$5.80 — winners were being scratched before the 40% TP; PF gate was biased false-negative). Debit exits unchanged.
-2. **short_strangle entries DISABLED** (go-live is defined-risk-only; strangle closes pad the 50-count answering nothing, at 10-60x live risk). Open strangles wound down by the widened macro flatten: undefined-risk flattens at days_to_event<=5 (weekend-gap aware), defined-risk stays <=1.
-3. **Vol-scaled IC wings** (wing_k x price x IV x sqrt(DTE/365), min $2, env AIT_IC_WING_K) replacing the "2nd strike" grid artifact — live now trades the structure the backtest describes. Plus **credit cost floor** AIT_IC_MIN_CREDIT=0.70 (QQQ $0.72-credit condors were cost-dominated).
-4. **max_open_positions 8→10** (423/500 logged rejections were the total cap; credit cap stays 6, cluster cap stays 2).
-Bugfixes: correlation same-symbol early-return removed (book had reached 5 index-cluster positions vs cap 2) + post-execute risk-manager re-sync (intra-cycle blindness); credit entries skipped when days_to_event<=3 (flatten-doomed round-trips); pre-earnings crush exit no longer requires pnl>0 for credit; untracked-option freeze debounced (2 consecutive sightings — phantom QQQ 500C recurred 2 mornings).
-Ops: ibapi wire DEBUG silenced (was 66% of ait.log; broke status tail-counts + forensics); trading-loop heartbeat file + supervisor hang-detection (>15min stale during RTH → alert+restart) — first real closure of R5-D1's hung-bot hole; daily Telegram digest 09:35/16:05 (absence = alarm); backup integrity-check + catch-up backup on stale start (Jul 8 18h outage silently skipped the 17:00 slot); keeper dead-man ping (healthchecks.io URL in data/deadman_url.txt — USER: create check + paste URL; also USER: cloud-sync ~/Documents/ait_backups, set up Windows auto-logon per ops lens).
-Scoreboard layer (R5-D4 + residual sqrt(252)): exit_time windows, trade-frequency annualization, unified target-0 Sortino, capital-base drawdown pct (AIT_CAPITAL_BASE), PF div-zero, app step_days 63, real-close filters — via subagent, same batch.
-Learning-wake decision recorded: adaptor stop/TP overrides stay UNWIRED and are bypassed by paper_trading_mode=true; delete-vs-wire re-decided at go-live cutover, not before.
-NOTE for velocity math: with strangles out and slots 10, expect defined-risk closes ~3-4/wk → 50-close gate ~mid-October. TP stays 40% (rejected accelerant — changing it changes the measured strategy).
-
-## Round 5 (2026-07-08) — coverage-gap audit: 8 agents over everything prior rounds touched lightly
-~120 findings. Shipped same day (see commit): paper_trading_mode ON (was never set — Thompson/adaptor/flow bypasses were all inactive, contradicting design); CC/CSP/calendar/event_straddle disabled (naked-call latent bug / permanently-rejected / structurally dead / macro-guard-incompatible); combo leg-shape validation at executor; paper-vs-live account assertion at connect (DU-prefix check, AIT_EXPECT_LIVE_ACCOUNT=1 for go-live); debit-combo limit capped at risk-validated max_loss + tick rounding; regime HIGH_VOL confidence floor 0.80 (defensive gates were unreachable); drift-detector key mismatch (never completed one sample since birth); intraday VWAP session-scoped (was 2-year "intraday"); EDGAR UA fixed (SEC was 403ing the 8-K safety net); flow confidence boost paper-bypassed; config fail-loud on missing file; GOV-5 also asserts config spread gate; start_bot.bat duplicate guard (07:30 task was launching duplicate bots); master stdout-handle leak fixed (rotation had NEVER succeeded); faulthandler → logs/fatal.log; backtest entry-window UTC→ET (backtests only ever entered 13:30-15:30 UTC!); backfill source-tag + calendar-month chunking; run_backtest step_days 63; optimizer penalty inversion + honest --apply print; dashboard bot_state table (Self-Learning/System Health tabs were permanently green); DuckDB analytics mirror purged to match SQLite (was blending −$10.2k pre-purge history); status labels "since 07-06 reset"; counterfactual honesty (units, dedup, unevaluable-skip accuracy); two red tests fixed; pyproject pins match the real venv + `-m "not ibkr"` default; fix_pnl_history.py deleted; stale-doc warning banners (10 files).
-
-**Kill-mystery verdict (watchdog agent):** historical 30-60-min deaths were native c0000005 crashes in python313.dll at one identical offset, ~30 WER reports Jun 9–Jul 2, always in ML-stack processes (3 coexisting OpenMP runtimes); quiet since Jul 2. Faulthandler evidence was destroyed by the (never-working) log rotation — both now fixed. Jul 7 16:43 death = hard machine reboot. If it recurs: read logs/fatal.log, and enable WER LocalDumps for python.exe.
-
-### Round 5 deferred (visible, prioritized)
-| # | Item | Why deferred |
+| # | Action | Why it matters (R12 chaos walk) |
 |---|---|---|
-| R5-D1 | Hung-bot detection (all 3 supervision layers only check process existence) + Job Object so orchestrator death can't orphan children (orphans caused today's 60-crash dashboard loop; double-trade risk via clientId fallback) | design work; keeper+task guard shipped reduces exposure |
-| R5-D2 | GARCH validation math (BIC race across 3 likelihood unit scales; roll_garch refits on OOS; cv_score refits train+val; msgarch step_filter off-by-one) | training-only; MUST fix before any GARCH-member enable decision — current CV/OOS evidence untrustworthy in both directions |
-| R5-D3 | Backtest pricing realism: dividend yield q=0 (SPY/QQQ condor credits biased bullish), no early-assignment model, expiry buyback spread | affects go-live backtest gate; batch with deferred 3.4 fill realism |
-| R5-D4 | Analytics P&L windows filter on entry_time not exit_time (recent exits vanish from 30-day reports); drawdown-pct definition; 3 different Sortinos | display layer; batch with deferred sqrt(252) sites |
-| R5-D5 | Optimizer holdout unreachable from CLI (every run in-sample); composite objective rewards tail-risk; strangle param space re-opens frozen overfit channels | don't trust optimizer output until fixed; not used for live decisions today |
-| R5-D6 | options_flow bias_strength is a proportion (1 small sweep = 1.0); quality.py quote validation is dead code; macro FRED train/serve one-day leak; matrix flow features permanently constant | feature-quality cluster; fold into IV-backfill/retrain work |
-| R5-D7 | Regime detector: no hysteresis (knife-edge flapping), partial-bar contamination, corrupt-data→confident RANGE_BOUND | needs design (hysteresis + unknown sentinel); HIGH_VOL gate fix shipped |
-| R5-D8 | Executor bracket() builder raises TypeError on first use (loaded trap in future stop-loss path); orderRef absent on all orders; passive_limit docstring inverted + NaN guard; market-order fallback on illiquid combo exits | dormant paths; fix before any feature uses them |
-| R5-D9 | ensure_gateway races nightly IBC restart (duelling sessions under primaryoverride); setup_ibc writes port 4002 unconditionally incl. live mode | account assertion shipped is the backstop; gateway.py rework when touching IBC next |
-| R5-D10 | Learner confidence ratchet (walkforward) freezes at 0.85 off one bad stretch; export_production_params D1 collision + calibrate threshold mismatch | offline; blocks trusting walk-forward "learning" results |
-| R5-D11 | Tests: formula-copy tests → call real code; regression tests for sleeve-capital/annualization/commission/IV-wipe; remove skip hatches. Known pre-existing reds (verified against pre-R5 tree, NOT caused by R5): test_learning StrategyAdaptor ×2 (Windows temp-db handle-lock teardown flake), test_vlmc_training_integration empty-store fallback ×1, test_ibkr_intraday fallback ×4 | hygiene sprint |
-| R5-D12 | Mid-session restart skips that day's pre-market prep (reconcile runs at startup anyway; signal prep degraded) | low frequency; document in RUNBOOK |
-| R5-D13 | 8-K flatten date logic (midnight-parse drops yesterday-afternoon filings; restart re-flattens on <24h-old filings) | protection now at least alive (UA+warning fix); refine window next |
+| U1 | **Create a healthchecks.io check → put its ping URL in `data/deadman_url.txt`** | Shipped-but-UNARMED since 07-09. The ONLY alert that fires when the whole machine dies. Closes detection for three separate disasters (machine down, keeper dead, Telegram dead). ~3 min. |
+| U2 | **Enable Windows auto-logon** (Sysinternals Autologon + lock on logon) | Every recovery layer starts from Startup shortcuts that need a human logon. A forced reboot at 2pm = book unprotected until someone logs in; first signal is a *missing* digest at 16:05. |
+| U3 | **Start the Windows Time service** (`net start w32time & w32tm /resync`) | w32time is NOT RUNNING on a box that already had a 2-hour clock error. A clock jump silently kills all stop/TP protection AND disarms the hang detector — both read the same wrong clock. |
+| U4 | Cloud-sync `~/Documents/ait_backups` | The mirror exists but shares a failure domain with the box. |
 
-## Dormant / degraded subsystem inventory (2026-07-08 — so nothing resurfaces as a "surprise")
+---
+
+## Round 13 (planned) — lenses never used
+
+1. **Security & supply chain**: credentials at rest (IBC config.ini, Telegram token, `.env` —
+   ever in git history?); unauthenticated localhost dashboards; unpinned deps, no lockfile;
+   **dependency health/EOL — verify whether `ib_insync` is unmaintained/archived** (successor
+   `ib_async`): our single most critical dependency may be a frozen artifact.
+2. **Regime dependence + market-catastrophe playbook**: all evidence spans 2024-2026 ≈ one
+   regime. How does this behave in a 2020-March or 2022 tape? Flash crash through the wings,
+   trading halts, broker outage mid-crash. (R12's chaos walk covered *infrastructure*
+   disasters, not *market* ones.)
+3. **Human factors**: what can the operator break — manual TWS intervention mid-session,
+   config typos silently defaulted by pydantic, alert fatigue, instruction ambiguity.
+4. **Shadow referee**: an independent ~200-line script that recomputes P&L and gate decisions
+   from raw broker data daily and diffs against the system. Catches classes of error nothing
+   else can.
+5. **Right-sized OUT** (decisions, not oversights): market-impact analysis — 1 lot in SPY/QQQ
+   options is a rounding error of displayed size; the costs we actually pay (spread-crossing,
+   adverse selection) are instrumented instead. Revisit at ~5-10% of displayed size (≈20+ lots
+   index, 5-10 lots GLD/TLT/XLE). Also out: formal model governance (SR 11-7), HA/DR beyond
+   current, privacy.
+
+---
+
+## Round 12 (2026-07-13/14) — sophistication & maturity audit + full execution ("all of it")
+
+Six lenses no prior round used: concurrency/state-machine, trade-lifecycle craft, chaos walks,
+vol/pricing craft, over-engineering, test maturity. Decision sheet: `docs/AUDIT_R12.md`.
+**All three tiers executed.**
+
+### Tier A — hardening (shipped)
+- **Trade status is a real state machine now.** Six writers did blind UPDATEs, and illegal
+  edges were reachable: CLOSING→FILLED after a restart (duplicate close → **position
+  REVERSAL**), an exit partial-fill-then-cancel treated as a clean cancel (**oversell → naked
+  short**), PARTIAL→FILLED losing quantity, CLOSED resurrection. Fixed with a compare-and-swap
+  `transition(from_statuses → to)` that every writer must use (illegal transitions are now
+  logged no-ops), filled-qty-first exit logic with partial-exit booking, and startup
+  re-adoption of broker-side working exit orders. 34/34 execution proofs.
+- **clientId-fallback blindness**: a mid-session reconnect on a fallback id made all working
+  orders invisible → mass false-CANCELLED while real orders worked at the broker. The fallback
+  path now snapshots `reqAllOpenOrders` and refuses "cancelled" verdicts for foreign orderIds.
+  An untracked option's FIRST sighting now reports an EOD break same-day.
+- **Event-fill robustness**: the debounce flag could wedge permanently (silently reverting to
+  30s polling), tasks were GC-cancellable, the busy-guard dropped events. All fixed.
+- **The PENDING row now precedes placeOrder** (a DB failure used to leave a live untracked
+  order at the broker).
+- **Test/CI repair**: CI as shipped could never go green (it ran the ~1h GARCH suite inside a
+  30-minute timeout, with `-x`). Now `slow`/`ibkr` markers, a fast lane by default, a nightly
+  slow lane. The 8 event-loop flakes were root-caused (sync tests calling `get_event_loop`
+  after pytest-asyncio closes it) and fixed; stale reds rewritten. New: `tests/fakes.py`
+  (shape-faithful broker fakes — MagicMock is what hid the `shares=contracts` bug class),
+  `tests/test_order_lifecycle.py` (drives the REAL executor through place→fill→exit→close,
+  including partial-then-cancel and disconnect-blip), `tests/test_properties.py` (hypothesis:
+  ladder monotonicity, P&L sign invariants by CREDIT_STRATEGIES membership, wing-width bounds).
+- **Found and fixed mid-audit: pytest was clobbering LIVE model artifacts** — `range.pkl` and
+  `ensemble.pkl` overwritten with synthetic-noise models (the R7/R11 fence covered walkforward
+  saves, not test saves). A conftest fixture now isolates every test model write; artifacts
+  were rebuilt from real data.
+
+### Tier B — strategy (user-approved, evidence-backed)
+- **Stop recalibrated on evidence.** 17-month walk-forward, 26 matched trades, identical
+  entries across arms: **touch-close +$756 (PF 1.38) > no stop −$24 (0.99) > 1.25× flat −$134
+  (0.96) > 2.0× flat −$1,067 (0.73)**. The flat stop fires THROUGH its trigger on gaps (worked
+  example: a −1.25× trigger realized −2.01×). The backtest's average loss at short-strike touch
+  was **0.475× credit** — independently confirming the audit's 0.49× derivation.
+  **SHIPPED: the flat credit stop is DISABLED by default** (`AIT_CREDIT_LOSS_LIMIT=0`) and the
+  **short-strike-touch close is the early loss exit** (`AIT_CREDIT_TOUCH_STOP=1`). It reads the
+  UNDERLYING price, so it protects even during an option-marks outage. The wings cap the tail.
+- **The designed trade is now enforced.** The 07-07 SPY condor filled with its short call at
+  **0.49 delta** (intended 0.20) and passed every gate *because* of the error — credit floors
+  monotonically reward closer-to-ATM strikes and no upper delta bound existed ("the gate stack's
+  equilibrium, not an accident"). SHIPPED: delta band |Δ| ∈ [0.15, 0.30]; expected-move sanity
+  gate (shorts within [0.6, 1.3]×EM); ATM IV + expected move extracted from every live chain
+  (killing the ±50% flat-0.20-IV wing error); degraded-greeks rejection; one
+  `condor_entry_quality` telemetry line per generated/rejected condor. *A replay of the 07-07
+  incident chain is now rejected at strike selection.*
+- **Cadence**: minimum entry DTE 14 (7-DTE entries were 2-day churn, best case ~60%
+  cost-dominated); per-expiry cap of 3; **post-stop re-entry cooldown keyed on EXIT time** (the
+  old cooldown keyed on entry time, so a stopped symbol could re-enter on the next scan into the
+  same trend); VIX-tiered credit cap (6/4/2 by VIX band); IV-percentile cap at 85 (the variance
+  risk premium in the top bucket measured −2.3 vol points, yet the floor said "trade").
+- **Deferred deliberately**: resting GTC take-profits at the broker — worth 6-17% of each win
+  and they survive bot death, but it is a NEW order path with double-fill risk, the same class
+  as the CLOSING→FILLED bug just fixed. It gets its own change with its own verification.
+- **Confirmed keep**: mechanical no-adjustment discipline (no rolls) — correct at 1-lot defined
+  risk. The reviewing agent argued both sides and committed.
+
+### Tier C — deletion slate (user-approved, zero live-behavior change)
+**~6,650 source LOC + ~1,800 test LOC out of the live tree**, all retired-not-deleted with
+history into `deprecated/src/` and `deprecated/research/`:
+- **`hedging.py` — the dangerous one.** Dead since inception (greeks feed ~0) AND its
+  auto-execute path placed SPY **stock market orders** straight through the broker client,
+  bypassing every executor guardrail (rate limit, defined-risk gate, NBBO fat-finger check,
+  market-hours guard). One `auto_hedge: true` flip from live.
+- **Sentiment stack** (engine/news/finbert/fear_greed + ib_news + fundamentals_db, ~1,250 LOC):
+  R7 traced its contribution to iron-condor decisions to exactly zero. Salvage, if ever wanted:
+  a ~30-LOC VIX-backwardation gate in `risk/`.
+- **torch + transformers → optional `sentiment` extra** (580MB serving a hard-disabled FinBERT;
+  torch is forensically implicated in the historical c0000005 crash cluster). `arch` → `research`
+  extra. Zero live importers, grep-verified. Install and CI time roughly halve.
+- **Dead code**: the signal queue (unreachable post-R7, inside the most safety-critical file),
+  `options_sim.py` (carried a 5×-premium tail-cap trap; its live pricing functions were extracted
+  to `backtesting/pricing.py`), `directional.py`, `covered.py` (a naked-call generator),
+  `options_flow.py`, `calendar.py`, `event_straddle.py`.
+- **GARCH / MS-GARCH / OU → `deprecated/research/`** (~2,900 src + ~1,200 test LOC). It was
+  already OFF live by deliberate decision, and R5-D2 showed its validation evidence untrustworthy
+  in both directions — so the enable decision was blocked anyway — yet it consumed more repeated
+  audit attention than any live module. Wake path unchanged: fix the validation math, produce a
+  credible backtest, re-enable. **The live range gate (XGB+LGBM) was NOT touched** — its fate
+  belongs to the pending ML ablation.
+- **Simplified**: `capital_tiers` 250→144 LOC; `counterfactual` keeps `record_skip` but its
+  "analysis" outputs (twice ruled misleading) are gone; `meta_label` default-off.
+
+---
+
+## Round 11 (2026-07-11) — R9/R10 adoption
+Event loop UNBLOCKED (the risk monitor had been blind **48% of market hours** — synchronous I/O
+inside async scans; proof: max ticker gap 1171ms → 116ms). Event-driven fill detection (33s →
+~1s). Scan stage timing. Model-artifact separation + spec-mismatch guard (backtests had been
+hijacking the live range gate: production ran 8.67%/21d instead of the designed ±5%/30d). The
+first CI this repo ever had, plus `scripts/smoke_deploy.py` (12 runtime checks — it immediately
+caught pytest polluting the production DuckDB). Scorecard TCA. **The slippage gate got a NUMBER
+before data could bias it: median entry slippage ≤ 8% of credit over the trailing 20 fills, no
+worsening trend.** Backup-restore drill REHEARSED (PASS).
+
+## Round 10 (2026-07-11) — maturity vs external checklists (`docs/MATURITY_R10.md`)
+The first audit to measure the project against *external* standards (trading-ops, SRE, MLOps,
+SDLC) rather than its own intent. Verdict: engineering maturity far above $3k scale, but
+**measurement existed with zero read-out**, and **last-resort layers had never been exercised**.
+Drove the R11/R12 adoptions.
+
+## Round 9 (2026-07-11) — first benchmarks ever (`docs/BENCHMARKS_R9.md`)
+Latency: exit decision→order 170ms (good); fill detection 33s (poll-bound — since fixed); **the
+risk monitor blind 48% of RTH**; scans at ~10.4 min against a 5-min design; a full retrain on
+every boot (~110s unprotected). Accuracy: effectively never settled — the one settleable day
+scored **0/12 direction hits at 0.92-0.98 confidence**; **risk caps, not ML, decided 164 of 165
+entry decisions**. Statistics: **50 closes needs 42/50 wins just to confirm PF>1.0 at 90%
+confidence** — a decisive PF>1.3 verdict realistically needs 100+.
+
+## Round 8 (2026-07-11) — execution-based runtime audit
+The lesson that stuck: **agents must EXECUTE code, not read it.** `StateManager._connect()` never
+existed — all four R7 ledger methods raised AttributeError, swallowed at their call sites, so the
+entire real-cost ledger was dead on arrival (executions empty, commissions $0). The DuckDB mirror
+would also have silently stopped syncing at the next close. Both fixed, execute-verified,
+regression-tested. Also: the watchdog→Telegram path was wired (dead since birth — 661
+component-down events had paged nobody), error-streak escalation added, heartbeat gated on error
+streaks.
+
+## Round 7 (2026-07-09) — component gap audit (`docs/GAP_AUDIT_R7.md`)
+13 agents, one question: "what's MISSING to make money" per component. Shipped: the earnings
+parser (it had been returning DIVIDEND dates — AAPL read as a past date, AMD as 1995, so all
+earnings guards were dead for the single names), VIX halt fail-CLOSED, the learning layer made
+inert in paper mode, the real-cost ledger, NBBO-anchored mid-first entry ladder, cross-symbol
+best-first selection, TRUE IV rank (2 years of implied vol backfilled), the go-live scorecard.
+Plus budget-aware condor construction and a launch-size cap-coherence self-test — the $2.1k
+account previously could not trade at all (the sizer's multiplier chain returned 0 contracts).
+
+## Round 6 (2026-07-09) — strategy + ops batch
+Credit-aware exits (killing the equity-style trailing-stop scratch machine: a condor peaked at
++32.3% of credit and was stopped out at +$5.80). Short strangles retired from entries (go-live is
+defined-risk only). Vol-scaled condor wings and credit floors. The correlation cap actually
+enforced (the book had reached 5 index-cluster positions against a cap of 2). The ibapi log flood
+silenced, hang detection, the daily digest, dead-man ping plumbing (still unarmed — see U1).
+
+## Round 5 (2026-07-08) — coverage-gap audit
+8 agents over everything prior rounds had touched lightly. The biggest: `paper_trading_mode` was
+NEVER actually set, so every "bypassed in paper" claim in the codebase was false. Also: combo
+leg-shape validation, a paper-vs-live account assertion, the backtest entry-window UTC→ET fix
+(**every past backtest had only ever entered between 13:30-15:30 UTC**), dashboards querying a
+nonexistent table (and therefore rendering permanently green), and stale-doc warning banners.
+
+## Rounds 1-4b (2026-07-07/08) — foundation
+Rounds 1-3: the P&L was fiction (+$148k reported → −$12k real); marketable entries fixed (nothing
+had been filling); BAG fill reconstruction was 100× too small; the PDT guard was inert; the
+watchdog could never trip; credit sizing was 4-5× understated; expired-ITM credit was booked as a
+full WIN. Round 3 was line-by-line across ~40k lines (8 agents, 100% coverage attested).
+Rounds 4/4b (institutional lenses): daily DB backup + off-box mirror, the `data/HALT` kill switch,
+untracked-position auto-freeze, an executor rate limiter, **defined-risk-only enforced AT the
+executor**, the combo fat-finger check, model lineage on every trade, the EOD break report with
+the book's −10% gap-stress number, the RUNBOOK, and a live-profile startup assertion.
+Landmark finding: the paper book's −10% gap stress was **−$5,937** — −280% of the planned live
+account. Empirical proof of the defined-risk-only gate, using our own positions.
+
+---
+
+## Go-live gates
+*(decided 2026-07-07; amended by R9 statistics and R12 evidence — do NOT relitigate on a winning
+streak)*
+
+1. **Paper verdict**: ≥ 50 real closes for a PRELIMINARY read; **≥ 100 closes before funding**
+   (R9: at n=50 you need 42/50 wins just to confirm PF>1.0 at 90% confidence — 50 cannot settle
+   PF>1.3). Required: PF > 1.3; max drawdown < 8% **of deployed risk** (not of paper NLV);
+   **median entry slippage ≤ 8% of credit over the trailing 20 fills, with no worsening trend**;
+   zero unmanaged-position incidents. Criteria fixed BEFORE looking at results.
+2. **Defined-risk only**: iron condors (and debit structures) ONLY. NO short strangles live —
+   their max_loss is a model estimate, not a contract. Enforced at the executor.
+3. **Tuition sizing**: $3,000 CAD (~$2.1k USD) → SMALL tier. Phase-switch recipe (run BEFORE
+   funding): `.env AIT_SIMULATED_CAPITAL=2100` + `risk.max_position_risk_pct: 0.03 → 0.07`,
+   restart, confirm the coherence self-test passes, run ≥ 4 weeks.
+   **R12 caveat — the two-animals problem**: paper is currently earning the verdict on ~$22-wide
+   condors while the funded account will trade ~$2-wide ones. **Phase 2 must therefore be the
+   PRIMARY evidence, not a smoke test.**
+   Economics honesty: ~$5-13 per iron-condor round trip against $20-45 targets. The $3k stage
+   validates PROCESS with real money, not income.
+4. **Backtest credibility**: core math fixed (sleeve capital, annualization, window overlap,
+   price basis, R6-exit parity + a parameter-parity manifest). Old `reports/` artifacts are
+   invalid — re-run before citing any number.
+5. **The ML ablation is still open**: R9 showed risk caps (not models) decided 164/165 entries,
+   and the range gate has never vetoed anything. Run ML-on vs ML-off through the parity engine
+   before claiming the ML earns its place.
+6. Expect live < paper (real fills). Scale only on 3+ months of live evidence.
+   At go-live: remove `AIT_ALLOW_UNDEFINED_RISK`, tighten the liquidity gates (startup asserts
+   this), set `AIT_EXPECT_LIVE_ACCOUNT=1`, and settle the adaptor-override wire-or-delete
+   question.
+
+## Dormant / degraded inventory (post-R12 — so nothing resurfaces as a surprise)
 | Subsystem | State | Wakes when |
 |---|---|---|
-| Self-learning (analyzer/adaptor/meta/drift/Thompson) | DORMANT — needs 5/20/30 real closes; overrides also bypassed in paper_trading_mode by design | ~30 real closes; revisit paper bypass then |
-| Sentiment | DEGRADED — FinBERT off (torch segfault); live = Finnhub keywords + fear/greed; IB news CLI-only. Barely affects neutral book (range model overrides confidence) | Phase 2 if directional trading ever matters; safe path = subprocess/ONNX |
-| Hedging module + portfolio-delta gate | DEAD — greeks feed ~0 (no subscription) | greeks subscription or model-greeks fallback |
-| GARCH/MS-GARCH/OU range members | OFF LIVE (constructor defaults False; XGB/LGBM only) — deliberate post-OU-bug | after backtest re-run validates them |
-| IV / IV-rank features | STALE — implied_vol was wiped daily until R3 fix; models trained with NULL IV; "iv_rank" is realized-vol proxy | IV backfill re-run + next retrain |
-| VLMC/intraday features (range model) | just wired (A-F5); GLD/TLT/XLE have no intraday history yet | retrain + data accumulation |
-| CC/CSP strategies | DEAD on this account (assignment notional vs 3% cap) | larger account only |
-| Directional strategies | ~never trade (neutral-heavy model ~40% dir. accuracy, 0.85 first-hour bar, IC outranks) — direction model is a veto, not a trader; coherent | better direction signal first |
-| Partial-exit ladder | DEAD at 1 contract (33% of 1 = 0) | contract sizing > 2 |
-| Capital tiers | only name-filter + position-count live; wing/strategy logic advisory-dead | not planned |
-| Macro-event flatten + entry block | **ENABLED 2026-07-08** (was off since inception) | active — first test: CPI mid-July, FOMC Jul 28-29 |
-| Adaptor stop/TP overrides | written but unread ("wire or delete" — did neither); moot in paper bypass | decide at learning wake-up |
-| Event-vol engine (event_straddle) | built, mostly idle | candidate 2nd engine after paper verdict |
-| Calendar engine | built, rarely trades; needs real IV surface | after IV backfill |
+| Self-learning (analyzer / adaptor / Thompson) | DORMANT, and provably inert in paper mode (R7 made the adaptor a no-op) | ~30 real closes; decide wire-or-delete at the go-live cutover |
+| Range gate + direction ensemble (XGB/LGBM) | LIVE — the range gate gates every condor | its value is unproven: **the ablation decides** |
+| GARCH / MS-GARCH / OU | RETIRED to `deprecated/research/` (was already off live) | fix the R5-D2 validation math → credible backtest → re-enable |
+| Sentiment, hedging, options_flow, directional, covered, calendar, event_straddle | RETIRED to `deprecated/src/` (all zero-influence; hedging was dangerous) | sentiment only as a ~30-LOC VIX-backwardation gate, if ever |
+| Greeks feed / portfolio-delta gate | DEAD (no subscription). Substitutes in place: credit-position cap, VIX-tiered cap, correlation cap | a greeks subscription, or model-greeks fallback |
+| Partial-exit ladder | DEAD at 1 contract | contract sizing > 2 |
+| Drift detector | keys fixed (R7) but needs 20 samples it cannot reach at 3-4 closes/week; in-memory only | persist it post-verdict, or delete it |
+| Meta-labeler | untrained, default-off | 100+ closes |
+| IV / IV-rank | TRUE percentile live (2y of IBKR ATM IV backfilled). The feature matrix still lacks `implied_vol` | next feature-engine pass |
 
 ## Deferred / watchlist
-- ~~Live data~~ done 2026-07-02 (Network B/C + OPRA, ~$3/mo).
-- IBC read-only automation: vmoptions `--add-opens` fixed the crash; box may still need manual
-  check→uncheck→Apply toggle after some Gateway restarts. Guardrail alerts via Telegram.
-- Options-chain OI=0 vs `min_open_interest` filter interplay; correlation guard gets no price
-  data (sector-table fallback only); portfolio delta gate ~0 (no greeks subscription);
-  ET-vs-local time in Friday gate + budget tiers; wmic deprecation in keeper.
-- Learning layer wakes at ~30 real closes; expect ~1 month at current fill rate.
-
-## Round 4 (2026-07-08 pre-open) — institutional architect audit: lifecycle guarantees
-Verdicts: order-lifecycle REFUSE (mid-placement crash window -> live unmanaged position);
-unprotected-book REFUSE for strangles / CONDITIONAL PASS for the IC-only funded config (the
-LONG WINGS are the broker-side protection — no OCA gold-plating needed at this size); state
-architecture REFUSE (no backup, mutable ledger); kill-switch REFUSE; clock CONDITIONAL PASS.
-ALL five right-sized remediations SHIPPED (~70 lines):
-- INST-1 daily `sqlite3 .backup` of ait_state.db (17:00 ET cron; 14 local snapshots + mirror
-  to ~/Documents/ait_backups — SYNC THAT FOLDER TO CLOUD for true off-box). Verified live.
-- INST-2 data/HALT file = operator kill switch (blocks new entries, exits keep managing).
-- INST-3 untracked live OPTION at broker (mid-placement crash) -> data/HALT_UNTRACKED auto-
-  freeze + CRITICAL alert until a human resolves and deletes the file.
-- INST-4 executor token-bucket rate limiter (>8 orders/60s = malfunction -> refuse + CRITICAL).
-- INST-5 defined-risk-only ENFORCED AT THE EXECUTOR: undefined-risk orders refused unless
-  AIT_ALLOW_UNDEFINED_RISK=1 (set by run_orchestrator for the paper phase; REMOVE AT GO-LIVE
-  — this is what makes the wings a contractual loss floor, gate 2 structural).
-Deferred (documented, right-sized OUT at this account size): broker-side OCA brackets,
-event-sourcing ledger rewrite, HA. Immutable-ledger need is partially met by daily snapshots.
-Governance-auditor findings (second agent) recorded separately when delivered.
-
-## Round 4b (2026-07-08) — governance auditor: controls + lineage SHIPPED
-Landmark finding: computed the CURRENT paper book's -10% gap stress = **-$5,937**
-(-$7,387 from the 3 short strangles alone) — on the planned $2.1k live account that is
--280%. Empirical proof of go-live gate 2 (defined-risk only), using our own positions.
-Shipped (all 5 refuse-items):
-- GOV-1 combo fat-finger: live NBBO fetched pre-submit; disorderly spread or >35%
-  signal-vs-mid drift = refused. Plus market-hours guard AT the executor.
-- GOV-2 model lineage: trade_context.model_version column + written on every trade —
-  losses are now attributable to the model version that produced them.
-- GOV-3 defined-risk-only keyed to TRADING MODE (env allowance force-stripped when
-  mode != paper), not just an env default.
-- GOV-4 EOD BREAK REPORT: one Telegram/day — recon CLEAN/N-breaks, NLV, and the book's
-  -10% gap-stress number (previously visible nowhere). Plus data/RESTRICTED.txt
-  hard-ban list (post-incident control, no restart needed).
-- GOV-5 docs/RUNBOOK.md (alert -> operator action, kill switches, go-live checklist) +
-  live-profile startup ASSERTION (refuses to run live with paper-relaxed liquidity gates).
-Deferred as accepted-at-this-size: vault for secrets, challenger/shadow model period
-(rollback + lineage is the right-sized substitute), cash-ledger reconciliation (NLV
-day-over-day in the EOD report is the proxy).
-
-## Go-live gates (decided 2026-07-07 — do NOT relitigate on a winning streak)
-Paper phase: ALL strategies stay enabled (incl. short_strangle) — the sample must answer
-"which strategies have edge", and paper blowups are data, not losses.
-
-Going LIVE requires ALL of:
-1. **Paper verdict**: >= 50-100 real closes with profit factor > 1.3, max drawdown < 8% of
-   deployed risk, stable slippage, zero unmanaged-position incidents. Criteria fixed BEFORE
-   looking at results.
-2. **Defined-risk only**: iron condors (and debit structures) ONLY. NO short strangles live —
-   their max_loss is a model estimate, not a contract. Strangles earn live status only after
-   a real margin model + 3 months of live consistency at base size.
-3. **Tuition sizing — user decision 2026-07-07 (rev 2): $3,000 CAD (~$2.1k USD) initial
-   funding → SMALL capital tier** (SPY/QQQ/IWM/AMD/AAPL + GLD/TLT/XLE, iron condors
-   preferred — matches the defined-risk-only rule, 3 positions).
-   **Phase-switch recipe (target-size paper validation, run BEFORE funding):**
-   - .env: AIT_SIMULATED_CAPITAL=2100  (scales the whole risk stack to launch size)
-   - config.yaml: risk.max_position_risk_pct: 0.03 -> 0.07  (3% = $63 at $2.1k, below ANY
-     real spread's max loss — 7% matches the SMALL tier design; REVERT both when
-     switching back to big-account paper)
-   - restart bot; verify SMALL-tier universe + 1-2-wide condors + fills; run >= 4 weeks.
-   Notes: MICRO/SMALL affordability bug SR-L11 fixed; tier max_underlying_price/wing
-   logic confirmed DEAD live (only the name filter runs). Costs at this size: ~$5-13
-   per IC round trip vs ~$20-45 targets — thin nets; the $3k stage validates PROCESS
-   with real money, not income. 1 contract, daily-loss halt on, VIX halt on, weekly
-   human review mandatory.
-4. **Backtest credibility fixed first** (Round 3 deferred #1) — no sizing decision may cite
-   backtest numbers until the engine's inflation bugs are fixed.
-5. Expect live < paper (real fills). Scale only on 3+ months of live evidence.
+- **Resting GTC take-profits** (R12 Tier B, deliberately deferred): worth 6-17% of each win and
+  they survive bot death — but they need careful double-fill handling.
+- Adverse-selection analysis (a real cost at any size, unlike market impact).
+- The range gate models a fixed-% band, not the trade's actual profitable zone (measured
+  gate-vs-P&L correlation: +0.18). The upgrade is a trade-matched P(no-touch of the actual short
+  strikes).
+- Skew-aware per-side delta targeting — post-verdict only; do not contaminate the sample.
+- IBC read-only quirk: some Gateway restarts may still need a manual check→uncheck→Apply toggle
+  (Telegram-alerted).
+- Display-side `sqrt(252)` sites in research/export code; backtest fill realism (item 3.4).
 
 ## Operating rules (learned the hard way)
-- Restarting the BOT ≠ restarting the GATEWAY. Entitlements/read-only load at Gateway login.
-- ONE live-data slot: live account must stay logged out of mobile/web while bot runs.
-- Paper ≠ live fills: paper is optimistic; marketable pricing narrows the gap.
-- Secrets: IBC password lives ONLY in C:\IBC\config.ini (outside repo). Never in git/chat/docs.
+- Restarting the BOT ≠ restarting the GATEWAY. Entitlements and read-only state load at Gateway
+  login.
+- ONE live-data slot: the live account must stay logged out of mobile/web while the bot runs.
+- Paper ≠ live fills. Paper is optimistic; marketable pricing narrows the gap.
+- Secrets: the IBC password lives ONLY in `C:\IBC\config.ini`, outside the repo. Never in git,
+  chat, or docs.
+- **Deploy discipline** (bought with a lost trading session on 07-10): targeted tests → deploy
+  outside RTH → `python scripts/smoke_deploy.py` must print SMOKE PASS → after the next open,
+  confirm a clean cycle (fresh heartbeat, `scan_symbol_timing` events, no LOOP IMPAIRED alert).
+  Green tests are NOT a deploy signal on their own.
+- **Fix velocity mints new audit surface.** Half of R8's and R12's findings were in code written
+  days earlier by these very audits. Audit the fixes, not just the original.
+- **Fix CLASSES, not instances.** The artifact fence covered walkforward but not tests; the CAS
+  transition guard covers every writer, present and future.
