@@ -22,6 +22,7 @@ from ait.broker.ibkr_client import IBKRClient
 from ait.strategies.base import CREDIT_STRATEGIES
 from ait.config.settings import ExitConfig
 from ait.data.market_data import MarketDataService
+from ait.data.quality import DataQualityValidator
 from ait.risk.circuit_breaker import CircuitBreaker
 from ait.risk.pdt_guard import PDTGuard
 from ait.utils.logging import get_logger
@@ -79,8 +80,101 @@ class PortfolioManager:
         self._notify_cb = None
         self._marks_missing_streak: dict[str, int] = {}
         self._pdt_alerted: set[str] = set()
+        # R14: exit-input staleness gate. `DataQualityValidator` has existed
+        # (and been instantiated in the orchestrator) since the beginning with
+        # ZERO call sites — the exit path never checked a single quote.
+        self._quality = DataQualityValidator(
+            max_staleness_seconds=self._exit_config.max_quote_staleness_seconds,
+        )
+        self._last_quote_ts: dict[str, datetime] = {}   # symbol -> last tick time
+        self._frozen_alerted: set[str] = set()
+        self._touch_confirm: dict[str, int] = {}        # trade_id -> agreeing ticks
 
     MARKS_MISSING_ALERT_TICKS = 10  # ~5 min at the 30s fast-monitor cadence
+
+    async def _spot_quote(self, symbol: str) -> tuple[float | None, str]:
+        """R14: the underlying's price for exit decisions, WITH a health verdict.
+
+        Returns (mid, health) where health is one of:
+          "fresh"    — validator passed and the tick time advanced.
+          "degraded" — the validator flagged it (stale / crossed / wide spread /
+                       outlier jump), or it came from a fallback with no real
+                       bid/ask. Usable, but not on its own.
+          "frozen"   — the exchange tick time has NOT advanced since the last
+                       look. The feed is dead: the number is a fossil, and it
+                       will keep being returned, unchanged, forever.
+          "missing"  — no quote at all.
+
+        The distinction that matters is frozen-vs-old. A DELAYED feed (the bot
+        defaults to market-data type 4) still ticks; its numbers are behind but
+        they move, and staleness alone would condemn every quote and disable the
+        touch stop outright. A FROZEN feed stops advancing — that is the state
+        worth acting on, and it is invisible to an absolute-age check.
+        """
+        try:
+            quote = await self._market_data.get_quote(symbol)
+        except Exception as e:  # noqa: BLE001 — never let a quote fetch kill exits
+            log.warning("spot_quote_failed", symbol=symbol, error=str(e))
+            return None, "missing"
+        if quote is None or quote.mid <= 0:
+            return None, "missing"
+
+        # getattr-guarded like the rest of this class: some tests build the
+        # manager via __new__ and never run __init__.
+        seen_ts = getattr(self, "_last_quote_ts", None)
+        if seen_ts is None:
+            seen_ts = self._last_quote_ts = {}
+        prev_ts = seen_ts.get(symbol)
+        seen_ts[symbol] = quote.timestamp
+        if prev_ts is not None and quote.timestamp <= prev_ts:
+            return quote.mid, "frozen"
+
+        quality = self._quality_validator().validate_quote(
+            symbol=symbol,
+            bid=quote.bid,
+            ask=quote.ask,
+            last=quote.last or quote.mid,
+            volume=quote.volume,
+            timestamp=quote.timestamp.timestamp(),
+        )
+        if not quality.is_valid:
+            log.warning("exit_quote_degraded", symbol=symbol,
+                        issues=quality.issues,
+                        staleness_s=round(quality.staleness_seconds, 1))
+            return quote.mid, "degraded"
+
+        getattr(self, "_frozen_alerted", set()).discard(symbol)
+        return quote.mid, "fresh"
+
+    def _quality_validator(self) -> DataQualityValidator:
+        q = getattr(self, "_quality", None)
+        if q is None:
+            q = self._quality = DataQualityValidator(
+                max_staleness_seconds=self._exit_config.max_quote_staleness_seconds,
+            )
+        return q
+
+    async def _alert_frozen_feed(self, symbol: str, trade_id: str) -> None:
+        """Page ONCE per outage: the touch stop is a credit position's primary
+        loss cap, and it is now running on a feed that has stopped moving."""
+        alerted = getattr(self, "_frozen_alerted", None)
+        if alerted is None:
+            alerted = self._frozen_alerted = set()
+        if symbol in alerted:
+            return
+        alerted.add(symbol)
+        notify = getattr(self, "_notify_cb", None)
+        if not notify:
+            return
+        try:
+            await notify(
+                f"STALE EXIT FEED: {symbol} — the underlying quote has stopped "
+                f"advancing, and the short-strike touch stop reads it directly. "
+                f"Exits still fire, but now need {self._exit_config.touch_confirm_ticks} "
+                f"agreeing ticks. Check the market-data feed ({trade_id})."
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     async def check_positions(self) -> list[PositionStatus]:
         """Check all open positions and determine which need action."""
@@ -186,10 +280,27 @@ class PortfolioManager:
         self, trade: TradeRecord, option_marks: dict[tuple, float] | None = None
     , persist: bool = True) -> PositionStatus | None:
         """Evaluate a single position for exit conditions."""
-        current_price = await self._market_data.get_current_price(trade.symbol)
+        current_price, spot_health = await self._spot_quote(trade.symbol)
+
         if current_price is None:
-            log.warning("cannot_evaluate_position", symbol=trade.symbol, reason="no price")
-            return None
+            # R14: a missing UNDERLYING quote used to abandon the whole
+            # evaluation — no PositionStatus, so no stop, no take-profit and,
+            # worst of all, no DTE/expiry safety exit. An option's P&L comes
+            # from its own leg marks, not from spot, so only the touch and the
+            # assignment-ITM refinement actually need this price. Losing it must
+            # degrade those two, not switch the position off. (Same principle as
+            # marks_missing below; that path already got this right.)
+            if trade.contract_type == "stock":
+                log.warning("cannot_evaluate_position", symbol=trade.symbol,
+                            reason="no price for a STOCK position (P&L needs it)")
+                return None
+            log.warning(
+                "underlying_quote_missing",
+                trade_id=trade.trade_id, symbol=trade.symbol,
+                note="touch/assignment checks skipped this tick; P&L and DTE "
+                     "safety exits still active",
+            )
+            current_price = 0.0
 
         # Calculate unrealized P&L.
         # For options this must be priced from the OPTION position's market
@@ -372,17 +483,62 @@ class PortfolioManager:
                                    if str(l.get("action", "")).upper() == "SELL"
                                    and str(l.get("right", l.get("type", ""))).upper().startswith("C")),
                                   default=None)
-                if _short_put or _short_call:
-                    _spot = await self._market_data.get_current_price(trade.symbol)
-                    if _spot:
-                        if _short_put and _spot <= _short_put:
+                # R14: reuse the quote already fetched (and health-checked) for
+                # this tick instead of a second unvalidated read. A missing
+                # quote leaves _spot at 0.0, which touches nothing.
+                _spot = current_price
+                if (_short_put or _short_call) and _spot:
+                    _touched = ""
+                    if _short_put and _spot <= _short_put:
+                        _touched = (f"short_strike_touch (spot {_spot:.2f} "
+                                    f"<= put {_short_put:.2f})")
+                    elif _short_call and _spot >= _short_call:
+                        _touched = (f"short_strike_touch (spot {_spot:.2f} "
+                                    f">= call {_short_call:.2f})")
+
+                    # The touch stop is the only exit rule that acts DIRECTLY on
+                    # the underlying's price, and it used to fire on a single
+                    # unvalidated print. On a healthy quote that is still right:
+                    # the evidence says a touch rarely recovers (1 of 7), so
+                    # speed matters. On a degraded or frozen one, demand
+                    # corroboration first — a lone bad tick must not liquidate a
+                    # healthy condor, and a fossil price must not do it twice.
+                    #
+                    # We still FIRE on a confirmed touch off a bad feed rather
+                    # than going quiet. The asymmetry is the whole argument: a
+                    # missed real breach costs the wing width (or, on a strangle,
+                    # is unbounded); a false one costs the spread. Never trade a
+                    # bounded loss for an unbounded silence.
+                    confirms = getattr(self, "_touch_confirm", None)
+                    if confirms is None:
+                        confirms = self._touch_confirm = {}
+
+                    if _touched and spot_health == "fresh":
+                        should_exit = True
+                        exit_reason = _touched
+                        confirms.pop(trade.trade_id, None)
+                    elif _touched:
+                        need = max(1, int(getattr(
+                            self._exit_config, "touch_confirm_ticks", 2)))
+                        seen = confirms.get(trade.trade_id, 0) + 1
+                        if persist:
+                            confirms[trade.trade_id] = seen
+                        if spot_health == "frozen":
+                            await self._alert_frozen_feed(trade.symbol, trade.trade_id)
+                        if seen >= need:
                             should_exit = True
-                            exit_reason = (f"short_strike_touch (spot {_spot:.2f} "
-                                           f"<= put {_short_put:.2f})")
-                        elif _short_call and _spot >= _short_call:
-                            should_exit = True
-                            exit_reason = (f"short_strike_touch (spot {_spot:.2f} "
-                                           f">= call {_short_call:.2f})")
+                            exit_reason = f"{_touched} [{spot_health} quote, {seen} agreeing ticks]"
+                        else:
+                            log.warning(
+                                "touch_pending_confirmation",
+                                trade_id=trade.trade_id, symbol=trade.symbol,
+                                spot_health=spot_health, seen=seen, need=need,
+                                note="touch seen on a bad quote — holding for "
+                                     "corroboration rather than acting on one print",
+                            )
+                    else:
+                        # Spot pulled back inside the strikes: the streak dies.
+                        confirms.pop(trade.trade_id, None)
             except Exception as _e:  # noqa: BLE001 — protection, never a crash source
                 log.debug("touch_check_failed", trade_id=trade.trade_id, error=str(_e))
 
@@ -408,7 +564,10 @@ class PortfolioManager:
         elif (not should_exit
                 and dte is not None and dte <= 1 and is_credit and trade.strike):
             try:
-                current_underlying = await self._market_data.get_current_price(trade.symbol)
+                # R14: reuse the health-checked quote. This branch only refines
+                # the exit REASON — both paths exit — so a missing/stale spot
+                # costs us the ITM label, never the exit itself.
+                current_underlying = current_price
                 if current_underlying:
                     itm = False
                     if trade.contract_type == "put" and current_underlying < trade.strike:

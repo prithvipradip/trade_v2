@@ -230,6 +230,19 @@ class ExitConfig(_StrictModel):
     volatility_adjusted_stops: bool = True
     initial_stop_loss_pct: float = Field(default=0.50, ge=0.15, le=0.75)
     auto_hedge: bool = False
+    # R14: staleness gate on exit inputs. The touch stop is the only exit rule
+    # that acts DIRECTLY on the underlying's price, and it read that price with
+    # no quality check at all — a frozen feed could fire it on a breach that had
+    # long since passed, or hide a real one. Budget is generous because the
+    # fast monitor runs on a 30s cadence and quotes are cached for 15s.
+    max_quote_staleness_seconds: float = Field(default=180.0, ge=30.0, le=900.0,
+        description="Underlying quote older than this (by exchange tick time) "
+                    "marks the touch stop's input DEGRADED — it then needs two "
+                    "agreeing ticks to fire instead of one.")
+    touch_confirm_ticks: int = Field(default=2, ge=1, le=5,
+        description="Consecutive agreeing evaluations required before a touch "
+                    "stop fires on a degraded/frozen quote. 1 = fire on a "
+                    "single stale print (the pre-R14 behaviour).")
 
 
 class LearningConfig(_StrictModel):

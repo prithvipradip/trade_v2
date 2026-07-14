@@ -22,13 +22,14 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from ait.config.settings import ExitConfig
+from ait.data.market_data import Quote
 from ait.execution.portfolio import PortfolioManager
 
 CONDOR_LEGS = json.dumps([
@@ -63,6 +64,24 @@ def _manager(spot: float, unrealized: float | None) -> PortfolioManager:
     mgr._state = MagicMock()
     mgr._state.get_high_water_mark.return_value = 0.0
     mgr._market_data = MagicMock()
+
+    # R14: the exit path now reads the QUOTE (for its tick time and bid/ask),
+    # not a bare price, so it can tell a live feed from a frozen one. A healthy
+    # tight two-sided quote whose timestamp advances every call = "fresh", which
+    # is the regime every test below assumes.
+    tick = {"n": 0}
+
+    async def _quote(symbol):
+        tick["n"] += 1
+        return Quote(
+            symbol=symbol,
+            bid=round(spot - 0.01, 2),
+            ask=round(spot + 0.01, 2),
+            last=spot,
+            volume=1_000_000,
+            timestamp=datetime.now() + timedelta(seconds=tick["n"]),
+        )
+    mgr._market_data.get_quote = _quote
 
     async def _price(symbol):
         return spot
