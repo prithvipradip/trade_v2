@@ -178,6 +178,35 @@ class BotManager:
         )
         self._last_restart = datetime.now()
         _log("info", "bot_started", pid=self._proc.pid)
+        self._verify_launch()
+
+    _LAUNCH_GRACE_S = 8.0  # a Popen that dies within this window never came up
+
+    def _verify_launch(self) -> bool:
+        """R14 #11: confirm the child actually STAYED up after Popen.
+
+        `start()` used to Popen and return, assuming success. A process that
+        launches and dies a second later (bad import, port bind, Gateway drop
+        mid-init) then read as 'started' until the NEXT 2-minute health cycle —
+        the keeper's whole reason to exist, blind for 2 minutes each time. Poll
+        briefly: if the child exits inside the grace window, it never came up,
+        so alert immediately (with the stdout tail hint) instead of reporting a
+        healthy PID. Returns True if it survived the window."""
+        deadline = time.time() + self._LAUNCH_GRACE_S
+        while time.time() < deadline:
+            if self._proc is None or self._proc.poll() is not None:
+                code = self._proc.returncode if self._proc else "no_proc"
+                _log("error", "bot_launch_failed_immediately", exit_code=code)
+                _alert(
+                    f"BOT RELAUNCH FAILED: the process exited within "
+                    f"{self._LAUNCH_GRACE_S:.0f}s of launch (exit_code={code}). "
+                    f"It is NOT running — check logs/bot_stdout.log. The keeper "
+                    f"will keep retrying."
+                )
+                return False
+            time.sleep(0.5)
+        _log("info", "bot_launch_verified", pid=self._proc.pid)
+        return True
 
     _STDOUT_LOG_MAX_BYTES = 50 * 1024 * 1024  # rotate above 50 MB
     _STDOUT_LOG_BACKUPS = 2                    # keep .1 and .2
@@ -718,6 +747,39 @@ def backup_state_db():
         _alert(f"STATE DB BACKUP FAILED: {e} — the track record is unprotected.")
 
 
+def _mirror_content_age_hours() -> float | None:
+    """R14 #11: how stale is the off-box mirror's CONTENT (not its file mtime)?
+
+    copy2 back-dates the mirror's mtime, so an mtime check reads green even
+    when the mirror is a full run behind (the 07-14 incident). Derive freshness
+    from the newest trade timestamp inside the mirror DB, compared to now.
+    Returns hours, or None if the mirror is absent/unreadable/empty — the
+    caller surfaces that as a MISSING alarm rather than a false all-clear.
+    """
+    import sqlite3 as _sq
+    mirror = Path.home() / "Documents" / "ait_backups" / "ait_state.latest.db"
+    if not mirror.exists():
+        return None
+    try:
+        con = _sq.connect(f"file:{mirror}?mode=ro", uri=True)
+        try:
+            row = con.execute(
+                "SELECT MAX(ts) FROM ("
+                "  SELECT MAX(entry_time) ts FROM trades"
+                "  UNION ALL SELECT MAX(exit_time) FROM trades"
+                ")"
+            ).fetchone()
+        finally:
+            con.close()
+        if not row or not row[0]:
+            return None
+        newest = datetime.fromisoformat(str(row[0]))
+        return max(0.0, (datetime.now() - newest).total_seconds() / 3600)
+    except Exception as e:  # noqa: BLE001
+        _log("warning", "mirror_content_age_failed", error=str(e))
+        return None
+
+
 def daily_digest():
     """R6 (user-approved): one-line liveness digest to Telegram (09:35 and
     16:05 ET). The ABSENCE of this message is itself an alarm — the Jul 8->9
@@ -751,11 +813,18 @@ def daily_digest():
             age = (datetime.now() - datetime.fromtimestamp(
                 hb.stat().st_mtime)).total_seconds() / 60
             parts.append(f"heartbeat {age:.0f}m")
-        snaps = sorted((DATA_DIR / "backups").glob("ait_state.*.db"))
-        if snaps:
-            bage = (datetime.now() - datetime.fromtimestamp(
-                snaps[-1].stat().st_mtime)).total_seconds() / 3600
-            parts.append(f"backup {bage:.0f}h ago")
+        # R14 #11: report the MIRROR's CONTENT age, not a local snapshot's
+        # mtime. The mirror (off-box, the real recovery copy) is what silently
+        # went a full run stale on 07-14 while every mtime check read green —
+        # and copy2 back-dates its mtime, so mtime can't detect it. Derive age
+        # from the newest trade timestamp INSIDE the mirror DB instead.
+        m_age = _mirror_content_age_hours()
+        if m_age is not None:
+            parts.append(f"mirror {m_age:.0f}h stale")
+        else:
+            # Mirror unreadable/absent — say so loudly rather than silently
+            # falling back to a green-looking local mtime.
+            parts.append("mirror MISSING")
         _alert("DIGEST: " + " | ".join(parts))
     except Exception as e:  # noqa: BLE001
         _log("warning", "daily_digest_failed", error=str(e))

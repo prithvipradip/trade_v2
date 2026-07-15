@@ -447,6 +447,10 @@ class TradingOrchestrator:
             except Exception:  # noqa: BLE001
                 pass
 
+            # R14 #9: the exit completed — clear its reject-backoff record so a
+            # future, unrelated exit on this trade_id starts with a clean slate.
+            getattr(self, "_exit_attempts", {}).pop(trade_id, None)
+
             # Deep-audit SR-H1: the PDT guard was fully built but NOTHING
             # ever called record_day_trade — it always reported 0/3 used.
             # A same-ET-day open+close is a day trade; record it.
@@ -1342,6 +1346,53 @@ class TradingOrchestrator:
                     break  # executed or symbol-level block — done with this symbol
                 # else: risk-rejected — try the next-ranked strategy
 
+    def _prestamp_mtm_baseline(self, unrealized_at_close: float) -> None:
+        """R14 #8: stamp the NEXT trading day's MTM baseline with the PRIOR
+        CLOSE's unrealized P&L, so a gap-open shows up as the full move from it.
+
+        The mark-to-market brake computes mtm_day = realized + (unrealized_now
+        - unrealized_at_SOD). Its SOD baseline used to be captured lazily on the
+        first fast-monitor tick — AFTER the open — so on a -8% gap the already-
+        collapsed unrealized became the baseline and mtm_day registered ~0: the
+        brake was blind to exactly the overnight gap it exists to catch. The
+        monitor's lazy write only fires when the key is empty, so a value
+        pre-stamped here under the upcoming date wins.
+        """
+        try:
+            key = f"mtm_sod_{next_market_open().date().isoformat()}"
+            self._state.set_state(key, str(float(unrealized_at_close)))
+            log.info("mtm_baseline_prestamped", key=key,
+                     unrealized_at_close=round(float(unrealized_at_close), 2))
+        except Exception as _e:  # noqa: BLE001
+            log.warning("mtm_baseline_prestamp_failed", error=str(_e))
+
+    @staticmethod
+    def _position_capital_at_risk(signal, quantity: int) -> float:
+        """TOTAL dollars at risk for an executed position = per-contract
+        max_loss x contract count.
+
+        SR-M6 (2026-07-15): every strategy builds its signal with quantity=1
+        (iron_condor.py, spreads.py, long_options.py, straddles.py all set
+        max_loss for ONE contract), but the trade executes `quantity`
+        contracts. Both consumers of this number want the position TOTAL:
+          - the aggregate capital-at-risk guard sums trade_maxloss_* across the
+            book (risk/manager.py) — per-contract values let an N-lot book pass
+            a portfolio cap it actually blows through by Nx;
+          - capital_at_risk is the retained denominator for the go-live verdict
+            (PF-per-unit-risk, DD-vs-deployed-risk) — D2's whole question is
+            what that denominator is, so it must be real dollars at risk, not a
+            per-lot slice.
+        Previously both were stored per-contract (the quantity=1 value).
+        Dormant while small-account sizing pins every trade to 1 lot; wrong the
+        moment sizing scales past 1 (NLV>$10k, or a learning multiplier >1) —
+        i.e. exactly at Phase-2, on the go-live path. `is_defined_risk` holds
+        for every live strategy (all set max_loss>0); 0.0 is a defensive floor
+        for any future undefined-risk shape that leaves it unset.
+        """
+        if not signal.is_defined_risk:
+            return 0.0
+        return float(signal.max_loss or 0.0) * max(1, int(quantity))
+
     def _get_trade_budget(self) -> int:
         """Return how many trades are allowed this scan based on time of day.
 
@@ -1775,18 +1826,18 @@ class TradingOrchestrator:
             # Store full entry context for thesis re-evaluation and learning
             regime_str = regime.regime.value if regime else ""
             self._state.set_state(f"trade_regime_{trade_id}", regime_str)
-            # Persist max_loss so the aggregate capital-at-risk guard can sum
-            # it across open positions (survives restarts via the state DB).
+            # Persist TOTAL capital-at-risk for this position = per-contract
+            # max_loss x the executed contract count. (See _position_capital_at_risk.)
+            _total_risk = self._position_capital_at_risk(signal, adjusted_size)
             self._state.set_state(
                 f"trade_maxloss_{trade_id}",
-                str(signal.max_loss if signal.is_defined_risk else 0.0),
+                str(_total_risk),
             )
             # R7: capital-at-risk RETAINED on the trade row (the KV above is
             # deleted on close) so PF-per-unit-risk and DD-vs-deployed-risk
             # stay reconstructable for the go-live verdict.
             try:
-                self._state.set_trade_capital_at_risk(
-                    trade_id, float(signal.max_loss or 0.0))
+                self._state.set_trade_capital_at_risk(trade_id, _total_risk)
             except Exception:  # noqa: BLE001
                 pass
             self._state.save_trade_context(
@@ -1917,6 +1968,16 @@ class TradingOrchestrator:
                 )
             return
 
+        # R14 #9: reject backoff. A trade only re-reaches this method after its
+        # PRIOR exit order died — while an exit is live the trade sits in
+        # closing_ids and the monitor skips it. So a re-request IS the reject
+        # signal: the last close was rejected/cancelled (illiquid, halted, a
+        # crossed/again-stale quote) and reverted CLOSING->FILLED. Left alone
+        # the monitor re-fires it every 30s forever, unbounded, paging nobody.
+        # Throttle with an escalating backoff and escalate to a page.
+        if not self._exit_retry_ready(pos.trade_id):
+            return
+
         try:
             exit_trade = None
 
@@ -1937,8 +1998,12 @@ class TradingOrchestrator:
                 # stores the signal's view (CSP is "long"/bullish but we SOLD
                 # the put). Credit strategies buy back; debit strategies sell.
                 close_action = "BUY" if trade.strategy in CREDIT_STRATEGIES else "SELL"
-                order = OrderBuilder.market(action=close_action, quantity=trade.quantity)
-                exit_trade = await self._ibkr.place_order(qualified, order)
+                exit_trade = await self._close_single_leg(
+                    trade, qualified, close_action)
+                if exit_trade is None:
+                    # Deferred (short buyback with no quote — see helper). Leave
+                    # the trade FILLED so the monitor retries next cycle.
+                    return
 
             elif trade.contract_type in ("spread", "iron_condor"):
                 # Multi-leg close: submit reverse combo order
@@ -2153,6 +2218,108 @@ class TradingOrchestrator:
                 return None  # not a vertical pair on this side
             widths.append(abs(strikes[0] - strikes[1]))
         return max(widths) if widths else None
+
+    async def _option_nbbo(self, qualified) -> tuple[float | None, float | None]:
+        """(bid, ask) for a single qualified option, or (None, None). Mirrors
+        the req/cancel pairing discipline of the combo path: a leaked
+        snapshot=False subscription streams (and, if unentitled, errors 10091)
+        forever and eventually crashes the ib_insync thread."""
+        try:
+            self._ibkr.ib.reqMktData(qualified, "", False, False)
+            ticker = None
+            try:
+                await asyncio.sleep(0.5)
+                ticker = self._ibkr.ib.ticker(qualified)
+            finally:
+                try:
+                    self._ibkr.ib.cancelMktData(qualified)
+                except Exception:
+                    pass
+            if ticker:
+                import math
+                bid = ticker.bid if not math.isnan(ticker.bid) and ticker.bid > 0 else None
+                ask = ticker.ask if not math.isnan(ticker.ask) and ticker.ask > 0 else None
+                return bid, ask
+        except Exception as e:  # noqa: BLE001
+            log.warning("single_leg_nbbo_failed", error=str(e))
+        return None, None
+
+    async def _close_single_leg(self, trade: TradeRecord, qualified, close_action: str):
+        """Close a single-leg option with a PRICE-BOUNDED order.
+
+        R14 item 3b: the single-leg exit path placed a raw MARKET order. For a
+        SELL-to-close (a LONG option) that is bounded — the worst fill is $0
+        and the premium is already sunk — so a market fallback is acceptable.
+        For a BUY-to-close (a SHORT buyback) it is the same unbounded-fill
+        catastrophe the multi-leg path was hardened against: a short CALL bought
+        back at market in a no-quote tape has NO ceiling. So a buyback is a
+        LIMIT, never a market order, and:
+          - short PUT: capped at the strike — the most it can ever be worth is
+            full intrinsic (underlying -> 0), so paying more is a bad quote;
+          - short CALL: no structural cap exists, so price at the marketable ask
+            plus the cross; a genuinely high ask is a genuinely expensive
+            buyback, but the LIMIT means a lone garbage print can't fill beyond
+            it. No quote at all -> defer + page rather than market a short.
+        """
+        EXIT_CROSS = self._settings.exit.exit_cross_amount
+        bid, ask = await self._option_nbbo(qualified)
+
+        if close_action == "SELL":
+            # Closing a long option: receive credit. Marketable limit at the
+            # bid; market fallback is bounded (>= 0), so it is acceptable.
+            if bid is not None:
+                limit_price = max(0.01, round(bid - EXIT_CROSS, 2))
+                order = OrderBuilder.limit(action="SELL", quantity=trade.quantity,
+                                           limit_price=limit_price)
+            elif ask is not None:
+                limit_price = max(0.01, round(ask - EXIT_CROSS, 2))
+                order = OrderBuilder.limit(action="SELL", quantity=trade.quantity,
+                                           limit_price=limit_price)
+            else:
+                log.warning("single_leg_sell_no_quote_market_fallback",
+                            trade_id=trade.trade_id, symbol=trade.symbol,
+                            note="long-option close; market fill is bounded at $0")
+                order = OrderBuilder.market(action="SELL", quantity=trade.quantity)
+            return await self._ibkr.place_order(qualified, order)
+
+        # BUY-to-close a short: unbounded risk if done at market. LIMIT only.
+        is_put = trade.contract_type == "put"
+        if ask is not None:
+            limit_price = round(ask + EXIT_CROSS, 2)
+        elif bid is not None:
+            limit_price = round(bid + EXIT_CROSS, 2)
+        else:
+            # No quote on a SHORT buyback: never market it. Defer + page.
+            log.critical(
+                "single_leg_buyback_deferred_no_quote",
+                trade_id=trade.trade_id, symbol=trade.symbol,
+                strategy=trade.strategy,
+                note="short-option buyback with no NBBO — refusing a market "
+                     "order (unbounded fill on a short); will retry next cycle",
+            )
+            if self._alert_gate(f"exit_single_noquote:{trade.trade_id}"):
+                await self._send_notification(
+                    f"EXIT DEFERRED (no quotes): {trade.symbol} {trade.strategy} "
+                    f"— short-option buyback with no NBBO. Refusing to market "
+                    f"order a short (unbounded). Retrying; check the data feed."
+                )
+            return None
+
+        # Cap a short PUT at its strike — full intrinsic is the ceiling on what
+        # closing it can ever cost. A short CALL has no such structural cap.
+        if is_put and trade.strike:
+            cap = round(float(trade.strike), 2)
+            if limit_price > cap:
+                log.warning("single_leg_buyback_capped_at_strike",
+                            trade_id=trade.trade_id, symbol=trade.symbol,
+                            quoted_limit=limit_price, strike=cap)
+                limit_price = cap
+
+        log.info("single_leg_buyback_limit", trade_id=trade.trade_id,
+                 symbol=trade.symbol, limit_price=limit_price)
+        order = OrderBuilder.limit(action="BUY", quantity=trade.quantity,
+                                   limit_price=limit_price)
+        return await self._ibkr.place_order(qualified, order)
 
     async def _close_multi_leg(self, trade: TradeRecord, legs: list[dict]):
         """Close a multi-leg position by reversing the combo."""
@@ -2417,6 +2584,19 @@ class TradingOrchestrator:
         stats = self._state.get_daily_stats()
         health = self._watchdog.get_health()
 
+        # A1-followup (R14 #8): PRE-STAMP tomorrow's MTM baseline with the PRIOR
+        # CLOSE's unrealized P&L. The mark-to-market daily-loss brake computes
+        # mtm_day = realized + (unrealized_now - unrealized_at_SOD); its SOD
+        # baseline used to be captured lazily on the first fast-monitor tick of
+        # the day — which runs AFTER the open, so on a -8% gap the already-
+        # collapsed unrealized became the baseline and mtm_day registered ~0.
+        # The brake was blind to exactly the overnight gap risk it exists to
+        # catch. Stamp the close's figure under the NEXT trading day's key; the
+        # monitor's lazy capture only writes when the key is empty, so a
+        # pre-stamped value wins and the baseline becomes the prior close (a
+        # genuine gap then shows up as the full unrealized move from it).
+        self._prestamp_mtm_baseline(float(summary["total_unrealized_pnl"]))
+
         report = (
             f"DAILY SUMMARY ({date.today().isoformat()})\n"
             f"Trades: {stats.trades_taken} | "
@@ -2641,6 +2821,70 @@ class TradingOrchestrator:
 
         iv_rank = ((current_vol - vol_min) / vol_range) * 100
         return max(0, min(100, iv_rank))
+
+    # R14 #9 exit-reject backoff tuning. A fast broker reject reverts the exit
+    # order CLOSING->FILLED within seconds, so the monitor re-requests it on the
+    # next 30s pass; the NORMAL working-order re-price reverts only at the ~300s
+    # stale-order timeout. RAPID_WINDOW sits between those so consecutive fast
+    # rejects escalate while the slow re-price cadence resets.
+    _EXIT_REJECT_BASE_S = 30.0
+    _EXIT_REJECT_CAP_S = 180.0
+    _EXIT_REJECT_RAPID_WINDOW_S = 240.0
+    _EXIT_REJECT_PAGE_STRIKES = 3
+
+    def _exit_retry_ready(self, trade_id: str) -> bool:
+        """R14 #9: escalating backoff for a repeatedly-rejected exit.
+
+        Returns True if an exit attempt may proceed now, False to skip this
+        pass. The FIRST exit for a trade always proceeds. A re-request that
+        arrives within RAPID_WINDOW of the last attempt is treated as a reject
+        (the previous close died fast); each such strike widens the backoff
+        (30/60/120/180s) and, at PAGE_STRIKES, pages once per window. A
+        re-request that arrives only after the slow working-order re-price
+        cadence resets the strike count — normal price-chasing must not look
+        like a reject storm.
+        """
+        now = time.monotonic()
+        attempts: dict = getattr(self, "_exit_attempts", None)
+        if attempts is None:
+            attempts = self._exit_attempts = {}
+        rec = attempts.get(trade_id)
+
+        if rec is not None and now < rec["next_allowed_at"]:
+            return False  # inside the backoff window — skip silently
+
+        if rec is not None and (now - rec["last_attempt_at"]) < self._EXIT_REJECT_RAPID_WINDOW_S:
+            strikes = rec["strikes"] + 1  # fast re-request => prior exit rejected
+        else:
+            strikes = 1  # first attempt, or the slow re-price cadence — reset
+
+        backoff = (min(self._EXIT_REJECT_CAP_S,
+                       self._EXIT_REJECT_BASE_S * (2 ** (strikes - 2)))
+                   if strikes > 1 else 0.0)
+        attempts[trade_id] = {
+            "strikes": strikes,
+            "last_attempt_at": now,
+            "next_allowed_at": now + backoff,
+        }
+        if strikes > 1:
+            log.warning("exit_retry_backoff", trade_id=trade_id, strikes=strikes,
+                        backoff_s=round(backoff, 0),
+                        note="prior exit rejected/cancelled; escalating backoff")
+        if strikes >= self._EXIT_REJECT_PAGE_STRIKES and self._alert_gate(
+                f"exit_reject:{trade_id}", interval_s=1800.0):
+            # Fire-and-forget page (this method is sync). The repeated fast
+            # reject is the signature of an illiquid or HALTED contract or a
+            # persistently un-marketable quote — a human needs to look.
+            try:
+                asyncio.get_running_loop().create_task(self._send_notification(
+                    f"EXIT REPEATEDLY REJECTED: {trade_id} — {strikes} fast "
+                    f"rejects in a row. The contract may be halted or too "
+                    f"illiquid to close at the quoted price. Backing off to "
+                    f"{round(backoff)}s between tries; check it manually."
+                ))
+            except RuntimeError:
+                pass
+        return True
 
     def _alert_gate(self, key: str, interval_s: float = 900.0) -> bool:
         """R14: rate-limit a repeating page. True = send now, False = still

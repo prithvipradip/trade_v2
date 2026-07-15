@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -261,6 +261,11 @@ class TestReconcilerMatching:
         rec._ibkr = MagicMock()
         rec._ibkr.get_positions.return_value = ibkr_positions
         rec._ibkr.get_portfolio.return_value = []
+        # R14 #10: the zero-options guard now does an authoritative re-query
+        # before it will book a flat book. Default it to "can't confirm" (None)
+        # so these guard tests exercise the refusal path; a case that wants the
+        # confirmed-flat behaviour overrides this explicitly.
+        rec._ibkr.get_positions_fresh = AsyncMock(return_value=None)
         rec._state = MagicMock()
         rec._state.get_open_trades.return_value = open_trades
         return rec

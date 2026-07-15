@@ -741,12 +741,57 @@ class PositionReconciler:
             t.contract_type != "stock" for t, _ in local_entries
         )
         if local_has_options and not ibkr_has_options:
-            log.warning(
-                "reconcile_skipping_stale_close",
-                open_local_trades=len(local_entries),
-                reason="IBKR shows no option positions while local option "
-                       "trades are open; refusing to mass-close",
+            # R14 #10: the cached snapshot shows zero options while we hold open
+            # option trades — almost always a stale/unsynced list, so the bulk
+            # stale-local loop below must NOT run on it (that is the mass-close
+            # this guard has always prevented). But the blunt refusal also
+            # STRANDS a book that is GENUINELY flat — every position closed
+            # while the bot was down / after hours, no exit ever pending so the
+            # _execute_exit gone-path never fired — leaving those rows FILLED
+            # forever. Resolve the ambiguity the way position_liveness does: an
+            # AUTHORITATIVE re-query. Only when a FRESH result confirms zero
+            # options do we book, and then only the FILLED/PARTIAL option trades
+            # (targeted, via the same booker) — PENDING orphans still belong to
+            # the stale-pending sweep, and stocks are never auto-closed here.
+            # None (broker won't answer) or any live option keeps the refusal.
+            # getattr-guarded so an older IBKR fake without the method simply
+            # reads as "can't confirm" = refuse, i.e. the prior behaviour.
+            fresh_fn = getattr(self._ibkr, "get_positions_fresh", None)
+            fresh = await fresh_fn() if callable(fresh_fn) else None
+            fresh_has_options = (
+                any(getattr(p.contract, "secType", "") == "OPT" for p in fresh)
+                if fresh is not None else None
             )
+            if fresh is not None and not fresh_has_options:
+                booked = 0
+                for _t, _keys in local_entries:
+                    if getattr(_t, "contract_type", "") == "stock":
+                        continue
+                    if _t.status in (TradeStatus.FILLED, TradeStatus.PARTIAL):
+                        result.stale_local += 1
+                        result.discrepancies.append(
+                            f"Local position not in IBKR (fresh-confirmed flat): "
+                            f"{_t.trade_id}")
+                        await self._book_stale_trade(_t, ibkr_portfolio)
+                        booked += 1
+                log.critical(
+                    "reconcile_zero_options_confirmed_fresh",
+                    open_local_trades=len(local_entries), booked=booked,
+                    note="fresh broker re-query CONFIRMS zero option positions "
+                         "— booked the genuinely-flat FILLED/PARTIAL trades",
+                )
+            else:
+                log.warning(
+                    "reconcile_skipping_stale_close",
+                    open_local_trades=len(local_entries),
+                    fresh_available=fresh is not None,
+                    reason="IBKR shows no option positions while local option "
+                           "trades are open, and a fresh re-query did not "
+                           "confirm the book is flat; refusing to mass-close",
+                )
+            # In every branch the bulk stale-local loop stays disabled on a
+            # zero-options snapshot: booking (if any) happened above; PENDING
+            # orphans are handled by the stale-pending sweep at the end.
             local_entries = []
 
         # A multi-leg trade is stale only when NONE of its legs exist in IBKR;
