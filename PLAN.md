@@ -62,11 +62,14 @@ an evening.
 **4. Arm the silent-failure layers (U1, U2, U3, U4).** Long-standing, ~5 min each, and R13
 re-confirmed all three are still unarmed — every recovery layer is downstream of them.
 **5. Ship the R14 code queue** (below) in out-of-RTH windows while the sample accumulates.
-*R14 Tier-1 is DONE — items 1–2 (exit-price bound, broker-liveness gate) in `dae9c64`, item 3
-(exit-input staleness gate) in `935e897`. 698 tests green, every guard mutation-checked. All
-three take effect on the next bot start; no live position is affected while entries are frozen.
-Tier-1 (live exposure in a bad tape) is fully closed; the queue now moves to Tier 2 (verdict
-correctness — the D1/D2 code) once the decisions are settled.*
+*R14 Tier-1 DONE — exit-price bound + broker-liveness gate (`dae9c64`), exit-input staleness gate
+(`935e897`). R14 Tier-3 + item 3b + the capital-at-risk base fix DONE (`081be1b`). 724 tests green,
+every guard mutation-checked. All effective on the next bot start; no live position touched while
+entries are frozen. **Everything in the R14 code queue that is NOT blocked on a decision is now
+shipped.** What remains: Tier 2 (verdict-correctness code — D1/D2) is blocked until you settle D1
+and D2; the historical `capital_at_risk` backfill; and two deferred, deliberately-scoped items
+(broker `errorEvent`/halt hook, `ib_async` migration). The mission-blocker is still **U5 —
+unfreeze entries**; none of this builds the sample.*
 **6. Then, and only then**: ML ablation → 50-close preliminary read → 100-close verdict →
 Phase-2 sizing → go-live gates.
 
@@ -243,36 +246,56 @@ sample accumulates.
    `touch_confirm_ticks=1` restores pre-R14 behaviour. Also fixed a latent bug: a missing
    underlying quote used to `return None` and abandon the whole evaluation, killing the DTE safety
    exit; it now degrades only the two spot-dependent checks. *11 tests, all guards mutation-checked.*
-3b. **Single-leg exits still MARKET-order** (`_execute_exit`, `contract_type in (call, put)`).
-   The R14 price bound covers only the multi-leg path. `long_call`/`long_put` exits are a market
-   SELL of something we own, so the loss is bounded by the option's value — not the condor-class
-   catastrophe, which is why it didn't block this batch. But it's the same no-quote tape and the
-   same missing bound; the two retired unbounded shapes (`covered_call`, `cash_secured_put` — a
-   MARKET buyback of a short call *is* unbounded) must not come back off the bench without it.
+3b. ✅ **Single-leg exit price bound** *(shipped `081be1b`)*. `_close_single_leg`: a SELL-to-close
+   (long option) is bounded — worst fill is $0, premium already sunk — so it keeps a marketable-
+   limit-then-market fallback. A BUY-to-close (short buyback) is the unbounded-fill catastrophe, so
+   it is a LIMIT, never a market order — short puts capped at the strike (full intrinsic is the
+   ceiling), short calls at the marketable ask (no structural cap), no-quote defers + pages. The
+   retired `covered_call`/`cash_secured_put` short shapes are now safe to bring back.
+
+**Sizing base (the "base = capital-at-risk" question)** ✅ *(shipped `081be1b`)*. The live sizer's
+   contract COUNT was already correct (risk/manager SR-H3 sizes credit off `max_loss`, not the
+   premium — the "~4× off" read was wrong). The real bug: the RETAINED per-trade risk
+   (`capital_at_risk` and the `trade_maxloss_*` KV the aggregate guard sums) was stored
+   **per-contract**, since every signal is built at quantity=1 but executes `adjusted_size`
+   contracts. Dormant at 1-lot small-account sizing; understates the verdict denominator and the
+   aggregate cap by the lot count the moment sizing scales past 1 — i.e. exactly at Phase-2. Now
+   `per-contract max_loss × executed quantity` via `_position_capital_at_risk`. **This resolves the
+   `capital_at_risk` backfill dependency in D2/Tier-2 item 5 for all trades entered from here on.**
 
 **Tier 2 — correctness of the verdict itself**
 4. **Book realized P&L from executions** (the D1 fix in code): first-closing-group price + real
    commissions, not the phantom-fill price + a flat estimate. Without this, D1's restatement
    just re-accrues the same error on the next close.
 5. **DD-method pin** (D2 in code): max concurrent deployed risk as the denominator; backfill
-   `capital_at_risk` where derivable.
+   `capital_at_risk` where derivable. *Note: new trades now store `capital_at_risk` correctly
+   (per-contract × quantity, `081be1b`) — this item is now just the HISTORICAL backfill for trades
+   entered before that fix.*
 6. **Commission attribution**: key on exec_id/orderId with an EOD sweep that re-stamps
    already-closed trades; keep phantom/unattributed costs in a separate incident bucket.
 7. **`executions.exec_time` is +4h off** (already-UTC broker time double-converted as if ET).
 
-**Tier 3 — resilience / ops**
-8. **MTM brake gap-blindness**: the SOD unrealized baseline is captured AFTER the gap, so a
-   −8% gap-open registers `mtm_day = 0`. Persist the prior close's unrealized as the baseline.
-9. **Exit-reject backoff + alert counter**: retries are fixed-cadence and unbounded, no
-   halted-contract awareness, and exit rejects page nobody.
-10. ~~**Zero-options mass-close guard escape hatch**~~ — *mostly closed by `dae9c64`*. A full
-    manual flatten of the last position is now booked via `book_vanished_trade`, whose
-    confirmed-empty path is an authoritative broker re-query rather than the untrusted cache.
-    Residual: `reconcile()` itself still has no such hatch, so a position that vanishes while
-    **no exit is pending** (e.g. flattened after hours, bot restarted) still isn't booked until
-    something demands an exit. Give `reconcile()` the same fresh-query confirmation.
-11. **Keeper relaunch verification + alert** (it never checks that a relaunch worked); digest
-    reports the mirror's CONTENT age, not the local snapshot's mtime.
+**Tier 3 — resilience / ops** — *all shipped `081be1b`; 26 tests, mutation-checked.*
+8. ✅ **MTM brake gap-blindness**. The SOD unrealized baseline was captured AFTER the open, so a
+   −8% gap registered `mtm_day ≈ 0` and the brake never tripped. `_post_market` now pre-stamps the
+   next trading day's baseline with the prior close's unrealized (`_prestamp_mtm_baseline`); the
+   monitor's lazy write only fires on an empty key, so the pre-stamp wins.
+9. ✅ **Exit-reject backoff + alert counter**. A rejected exit re-fired every 30s forever, paging
+   nobody. A re-request IS the reject signal (a live exit sits in `closing_ids`), so each rapid
+   strike widens an escalating backoff (30/60/120/180s) and pages at 3; the slow ~300s
+   working-order re-price cadence resets the count so price-chasing isn't mistaken for a storm.
+   *(Halted-contract awareness via a broker `errorEvent` hook is still net-new — deferred; the
+   backoff + page covers the fixed-cadence/unbounded/silent parts.)*
+10. ✅ **Zero-options mass-close escape hatch**. `reconcile()` now does the same authoritative
+    re-query as `book_vanished_trade`: a position that vanishes with no exit pending (flattened
+    after hours, bot restarted) is booked only when a FRESH query confirms zero options, and only
+    the FILLED/PARTIAL trades — PENDING orphans still route to the stale-pending sweep, stocks are
+    never auto-closed, and None/unconfirmed keeps the refusal.
+11. ✅ **Keeper relaunch verification + digest content-age**. `start()` now verifies the child
+    survives a grace window and pages on an instant death (was: Popen-and-assume, blind for 2 min).
+    The digest reports the off-box mirror's CONTENT age (newest trade timestamp inside the mirror
+    DB) instead of a local snapshot's `copy2`-back-dated mtime — the signal that read green while
+    the mirror went a full run stale on 07-14 — and says MISSING loudly if the mirror is gone.
 
 **Parked deliberately**
 - **ib_async migration** (ib_insync is archived; author deceased). Pinned pair `ib_insync==0.9.86`
