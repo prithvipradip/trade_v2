@@ -87,6 +87,31 @@ def _ladder_limit(base_mag: float, full_offset: float, frac: float,
     return round(base_mag + off, 2)
 
 
+def single_leg_entry_ladder(bid: float, ask: float) -> tuple[float, float, float]:
+    """R14: reprice-ladder state for a single-leg DEBIT (long-option) entry.
+
+    Single-leg entries used a PASSIVE sub-mid limit with NO escalation ladder,
+    while combos escalate 0.25 -> 0.60 -> 1.00 of the marketable offset. So a
+    single-leg order sat below the ask and was reconciled
+    stale_pending_never_filled even on a tight, healthy quote (observed: a long
+    put resting at 3.28 against a 3.32 ask, cancelled unfilled after 4 min).
+
+    Arm the SAME ladder machinery combos use: base = mid, full_offset crosses
+    from mid to the ask plus a small buffer, so at frac=1.0 the limit is
+    marketable (fills against the ask) while step 0 (0.25x) still starts near
+    mid for price improvement. Returns (base_mag, full_offset, debit_cap); the
+    debit cap is the marketable ceiling so the ladder can reach the ask but
+    never overshoot it.
+    """
+    mid = (bid + ask) / 2.0
+    half_spread = max(0.0, (ask - bid) / 2.0)
+    buffer = 0.02  # a couple ticks past the ask guarantees marketability at 1.0x
+    offset = round(half_spread + buffer, 2)
+    base_mag = round(mid, 2)
+    debit_cap = round(base_mag + offset, 2)  # ~ ask + buffer
+    return base_mag, offset, debit_cap
+
+
 def combo_entry_limit(entry_price: float, is_credit: bool) -> tuple[float, float]:
     """Marketable limit for a multi-leg combo entry.
 
@@ -415,19 +440,28 @@ class TradeExecutor:
                     trade_id, (TradeStatus.PENDING,), TradeStatus.CANCELLED)
                 return None
 
-        if bid > 0 and ask > 0 and ask > bid:
-            order = OrderBuilder.passive_limit(
-                action=signal.action,
-                quantity=contracts,
-                bid=bid,
-                ask=ask,
-            )
+        is_credit = signal.strategy_name in self.CREDIT_STRATEGIES
+        if bid > 0 and ask > 0 and ask > bid and not is_credit:
+            # R14: arm the marketable reprice ladder (was a passive sub-mid
+            # limit that never escalated -> stale_pending_never_filled). Start
+            # near mid for price improvement; _reprice_pending_entries steps it
+            # to the ask by 90s if unfilled, honoring debit_cap. These stash
+            # fields are read by execute_signal when it registers the
+            # PendingOrder (same path combos use).
+            base_mag, offset, debit_cap = single_leg_entry_ladder(bid, ask)
+            self._last_base_mag = base_mag
+            self._last_full_offset = offset
+            self._last_debit_cap = debit_cap
+            self._last_live_mid = round((bid + ask) / 2.0, 2)
+            self._last_nbbo_spread = round(ask - bid, 4)
+            init_limit = _ladder_limit(base_mag, offset,
+                                       self._LADDER_STEPS[0], is_credit=False)
+            order = OrderBuilder.limit(
+                action=signal.action, quantity=contracts, limit_price=init_limit)
             log.info(
-                "passive_order",
-                trade_id=trade_id,
-                bid=bid,
-                ask=ask,
-                limit=order.lmtPrice,
+                "single_leg_entry_laddered",
+                trade_id=trade_id, bid=bid, ask=ask,
+                base=base_mag, offset=offset, init_limit=init_limit, cap=debit_cap,
             )
         else:
             order = OrderBuilder.limit(
