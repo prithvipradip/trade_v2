@@ -112,21 +112,37 @@ def main():
           f"{len(covered)}/{len(closed)} real closes have raw executions "
           f"(pre-ledger closes unverifiable against broker)")
 
-    # [2] duplicate / phantom close fills + implied residual legs
-    dups, residual_legs = [], 0
+    # [2] duplicate / phantom close fills + implied residual legs.
+    # Incidents can be ACKNOWLEDGED by a human once resolved at the broker:
+    # bot_state['incident_ack_before'] = ISO timestamp. Dup groups whose
+    # fills all predate it are reported but don't BREAK (the 07-13 triple
+    # fill is history — its 11 residual legs were flattened and broker-
+    # verified flat on 07-15). NEW duplicates always BREAK.
+    ack_row = cur.execute(
+        "SELECT value FROM bot_state WHERE key='incident_ack_before'").fetchone()
+    ack_before = ack_row[0] if ack_row else ""
+    dups, acked, residual_legs = [], [], 0
     for t in covered:
         gs = fill_groups(cur, t["trade_id"])
         full = [g for g in gs if g["n_legs"] >= 2]
         if len(full) > 1:
             phantom = len(full) - 1
-            residual_legs += phantom * full[0]["n_legs"]
-            dups.append(f"{t['symbol']} {t['trade_id'][-6:]}: {len(full)} fills "
-                        f"(prices {[g['combo_price'] for g in full]}) -> "
-                        f"{phantom} phantom re-close(s)")
+            msg = (f"{t['symbol']} {t['trade_id'][-6:]}: {len(full)} fills "
+                   f"(prices {[g['combo_price'] for g in full]}) -> "
+                   f"{phantom} phantom re-close(s)")
+            if ack_before and all(g["time"] <= ack_before for g in full):
+                acked.append(msg)
+            else:
+                residual_legs += phantom * full[0]["n_legs"]
+                dups.append(msg)
     check("duplicate_closes", not dups,
-          "; ".join(dups) + f" | implied ~{residual_legs} residual untracked legs"
-          if dups else "one fill group per close")
+          ("; ".join(dups) + f" | implied ~{residual_legs} residual untracked legs")
+          if dups else
+          (f"one fill group per close"
+           + (f" | {len(acked)} acknowledged historical incident(s) "
+              f"(pre-{ack_before[:10]})" if acked else "")))
     detail["duplicate_closes"] = dups
+    detail["acknowledged_dups"] = acked
 
     # [3] per-trade realized P&L: books vs broker's own realizedPNL
     pnl_rows, pnl_bad = [], []
@@ -184,18 +200,19 @@ def main():
           f"wins={ref_a['wins']} total={ref_a['total']:+.2f} PF={ref_a['pf']}")
     detail["aggregates"] = {"system": sys_a, "referee": ref_a}
 
-    # [6] max drawdown on deployed risk — system's base vs concurrent-risk base
-    car_open = sum(t.get("capital_at_risk") or 0 for t in open_rows)
-    base_sys = max(car_open, 1000.0)                      # system's approximation
+    # [6] max drawdown on deployed risk — D2 (DECIDED 2026-07-16) pins the
+    # CONCURRENT-risk base for both system and referee. This check now
+    # verifies (a) car COVERAGE — every real close carries capital_at_risk,
+    # since a coverage hole silently understates the base and inflates DD% —
+    # and (b) reports DD under the pinned method vs the gate.
+    no_car = [t["trade_id"][-6:] for t in closed if (t.get("capital_at_risk") or 0) <= 0]
     base_ref = max(max_concurrent_risk(closed + open_rows), 1.0)
-    dd_sys_pct = sys_a["dd"] / base_sys * 100
     dd_ref_pct = ref_a["dd"] / base_ref * 100
-    same_side = (dd_sys_pct < GATE_DD_PCT) == (dd_ref_pct < GATE_DD_PCT)
-    check("dd_deployed_risk", same_side,
-          f"system method: DD ${sys_a['dd']:.2f} / base ${base_sys:,.0f} = "
-          f"{dd_sys_pct:.1f}% | referee: DD ${ref_a['dd']:.2f} / concurrent "
+    check("dd_deployed_risk", not no_car,
+          f"pinned concurrent-risk method: DD ${ref_a['dd']:.2f} / "
           f"${base_ref:,.0f} = {dd_ref_pct:.1f}% (gate <{GATE_DD_PCT}%)"
-          + ("" if same_side else " -> methods DISAGREE across the gate line"))
+          + (f" | COVERAGE HOLE: {len(no_car)} close(s) missing "
+             f"capital_at_risk {no_car}" if no_car else " | car coverage complete"))
 
     # [7] slippage gate: median entry slip as % of credit, trailing N fills
     slips = [dict(r) for r in cur.execute(

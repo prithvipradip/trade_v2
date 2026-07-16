@@ -5,10 +5,13 @@ ML-gated entries, automated exits, hands-off ops. Paper account DUN603821.
 **Goal:** a trustworthy real track record answering "does this have edge?" before funding
 $3,000 CAD.
 
-**Current state (2026-07-16, morning):**
-- Booked track record since the 2026-07-06 reset: 9 closes, +$280.20. **R13's shadow referee
-  says the true number is +$254.90 / 6W-3L / PF 2.64** (the booked scoreboard recorded phantom
-  re-close prices + estimated commissions). **Restatement is a pending DECISION — see D1.**
+**Current state (2026-07-16, midday):**
+- **Track record since the 2026-07-06 reset (RESTATED, broker-true): 10 closes, 6W-4L,
+  +$231.99, PF 2.30, DD 2.7% of $6,710 concurrent deployed risk.** D1 + D2 both DECIDED and
+  EXECUTED (see decisions table); shadow referee reads **0 BREAKS** — books ≡ broker ledger ≡
+  mirror, scoring method pinned. The 10th close was TODAY: an IWM long_call that entered at
+  12:40, **filled** (first filled entry since 07-09 — the R14 single-leg fill ladder works),
+  and exited on a thesis flip 10 min later (−$22.91).
 - **U5 DONE (07-15):** the 07-13 incident's orphan book — 11 untracked legs, each the inverse
   of a booked-closed trade — was flattened at the broker (all fills verified), the broker book
   reconciled to exactly the tracked positions, and `HALT_UNTRACKED` cleared. **Entries are
@@ -117,8 +120,8 @@ Phase-2 sizing → go-live gates.
 
 | # | Decision | Recommendation |
 |---|---|---|
-| D1 | **Scoreboard restatement.** The referee books exits from the FIRST closing fill group + real commissions; the system booked phantom re-close prices + a flat $0.65/leg estimate. Restating moves the record from +$280.20 / 7W / PF 3.03 to **+$254.90 / 6W-3L / PF 2.64** (QQQ's booked "win" is really a −$15.71 loss). | **Yes — do it once, with a DB backup, while the bot is stopped.** Honest numbers must precede the sample, not follow it. The go-live gates are meaningless if the inputs are wrong. |
-| D2 | **Drawdown-gate method.** The scorecard's base is "sum of capital_at_risk of CURRENTLY OPEN trades, floored at $1,000" → after a flatten the base collapses to $1,000 and DD reads **13.8% (FAIL)**. The referee uses max CONCURRENT deployed risk over the window ($2,114) → **7.4% (PASS)**. The two methods disagree ACROSS the 8% gate line. | **Pin the concurrent-risk method now**, before more data accrues. It is the economically meaningful denominator (what was actually at risk), and picking it later — with results visible — would violate criteria-fixed-before-looking. Also backfill `capital_at_risk` where derivable (5 of 9 closes have 0). |
+| ~~D1~~ | ✅ **DECIDED + EXECUTED 2026-07-16** (`scripts/restate_d1.py`, backup `ait_state.pre_d1_restatement.db`, bot stopped). All verifiable closes restated to the broker's own numbers (referee math: closing-fill-group realizedPNL + all-group commissions). A 10th close (IWM long_call, −$22.91, thesis-flip same-day) landed between decision and apply, so the final restated record is **n=10, 6W-4L, +$231.99, PF 2.30** (QQQ +6.80 → −15.71 as predicted). daily_stats recomputed for affected dates; provenance in `bot_state['d1_restatement']`; DuckDB mirror matched. **Referee post-apply: 0 BREAKS — books ≡ broker to the cent.** Ongoing path already books real commissions (R7) and duplicates are dead (R12/R14), so the error class does not re-accrue. | Done. |
+| ~~D2~~ | ✅ **DECIDED + EXECUTED 2026-07-16**: the DD denominator is PINNED to **max concurrent deployed risk** (`_max_concurrent_car` in master.py, event-sweep over [entry, exit) windows; 6 tests). `capital_at_risk` backfilled on all 5 missing closes (defined-risk exact from legs; strangles 3×-credit convention, labeled estimates). Referee check [6] now verifies car COVERAGE + reports the pinned method: **DD $178.59 / $6,710 = 2.7% (gate <8% → PASS)**. The old open-book/$1k-floor base is gone. Criteria fixed before the sample grows — do not revisit with results visible. | Done. |
 | U12 | Docker Desktop → Settings → General → untick "Expose daemon on tcp://localhost:2375 without TLS" | Unauthenticated Docker Engine API on localhost = local-privilege-escalation amplifier on the trading box. Localhost-only, so lowest priority. R13 #24. |
 
 ---

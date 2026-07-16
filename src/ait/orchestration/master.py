@@ -830,6 +830,29 @@ def daily_digest():
         _log("warning", "daily_digest_failed", error=str(e))
 
 
+def _max_concurrent_car(rows) -> float:
+    """D2 (pinned 2026-07-16): max CONCURRENT sum of capital_at_risk over the
+    trades' [entry_time, exit_time) windows — the economically meaningful
+    drawdown denominator (what was actually at risk when the loss happened).
+
+    Event-sweep: +car at entry, -car at exit (open trades never subtract).
+    Rows without a positive car contribute nothing — the D1 backfill filled
+    all derivable ones, and the referee flags coverage holes.
+    """
+    ev = []
+    for r in rows:
+        car = r["car"] if "car" in r.keys() else 0
+        if not car or car <= 0:
+            continue
+        ev.append((r["entry_time"] or "", +car))
+        ev.append((r["exit_time"] or "9999", -car))
+    peak = cur = 0.0
+    for _, d in sorted(ev):
+        cur += d
+        peak = max(peak, cur)
+    return peak
+
+
 def weekly_scorecard():
     """R7: go-live-gate scorecard to Telegram (Friday 16:10 ET). The five
     gate criteria, computed since the 2026-07-06 reset, on real closes only.
@@ -864,10 +887,17 @@ def weekly_scorecard():
             cum += r["realized_pnl"]
             peak = max(peak, cum)
             dd = max(dd, peak - cum)
-        car_open = con.execute(
-            "SELECT COALESCE(SUM(t.capital_at_risk),0) FROM trades t "
-            "JOIN open_positions o ON o.trade_id=t.trade_id").fetchone()[0]
-        base = max(car_open or 0, 1000.0)
+        # D2 (DECIDED 2026-07-16, PLAN.md): the DD base is the MAX CONCURRENT
+        # deployed risk over the whole window — not the current open book.
+        # The old base (open-book car floored at $1,000) collapsed to the
+        # floor after any flatten, inflating DD% (13.8% FAIL vs the true
+        # 7.4% PASS across the 8% gate — the exact ambiguity D2 settles).
+        # Criteria pinned BEFORE the sample grows; do not revisit with
+        # results visible.
+        open_rows = con.execute(
+            "SELECT t.entry_time, t.exit_time, COALESCE(t.capital_at_risk,0) car "
+            "FROM trades t JOIN open_positions o ON o.trade_id=t.trade_id").fetchall()
+        base = max(_max_concurrent_car(list(rows) + list(open_rows)), 1000.0)
         con.close()
         # R11 (R10 adoption): TCA + attribution read-outs — the capture layer
         # existed with zero aggregation; the go-live "stable slippage" gate
