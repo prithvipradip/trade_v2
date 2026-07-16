@@ -5,24 +5,36 @@ ML-gated entries, automated exits, hands-off ops. Paper account DUN603821.
 **Goal:** a trustworthy real track record answering "does this have edge?" before funding
 $3,000 CAD.
 
-**Current state (2026-07-14, end of day):**
+**Current state (2026-07-16, morning):**
 - Booked track record since the 2026-07-06 reset: 9 closes, +$280.20. **R13's shadow referee
   says the true number is +$254.90 / 6W-3L / PF 2.64** (the booked scoreboard recorded phantom
   re-close prices + estimated commissions). **Restatement is a pending DECISION — see D1.**
-- Open book: 1 IWM long straddle (−$233, CPI came in quiet — the long-vol bet didn't pay).
-  Plus 4 UNTRACKED reverse condors from the 07-13 incident, not in the books (**U5**).
-- **ENTRIES ARE FROZEN** (HALT_UNTRACKED since 09:00 07-14) and stay frozen until U5 is
-  resolved. Zero sample-building while frozen — this is the top-priority blocker.
-- **R12 + R13 both DEPLOYED and verified** — R12 at 09:09 (tag `deploy-20260714`), R13 at
-  12:10 (tag `deploy-20260714b`, commits b154459 → 3901fab): 639 tests green, SMOKE PASS with
-  the new config sentinels, `entries_frozen` observable, `trading_verified`, marks updating.
-- Deferred verification: `scan_symbol_timing` couldn't be observed on 07-14 (the CPI-day
-  `economic_event_skip` gate short-circuits before it). Scheduled task
-  **`AIT-Deploy-Liveness-20260715` runs `scripts/check_first_rth_liveness.py` at 09:40 ET
-  07-15** and Telegrams the verdict. That closes the deploy checklist.
+- **U5 DONE (07-15):** the 07-13 incident's orphan book — 11 untracked legs, each the inverse
+  of a booked-closed trade — was flattened at the broker (all fills verified), the broker book
+  reconciled to exactly the tracked positions, and `HALT_UNTRACKED` cleared. **Entries are
+  UNFROZEN.** Orphan-close P&L does NOT enter the track record (correct — they were phantom
+  inversions, not strategy trades). Lesson recorded: on a post-reversal book, pull the FULL
+  authoritative position set before touching any leg (a lone "orphan" 290P was covering a
+  short 288P; closing it first briefly created a naked short, cleaned up in the flatten).
+- Open book: 1 IWM long straddle (−38%, DTE 8 — walking toward the −50% stop / DTE≤5 exit).
+- **NEW BLOCKER — U6 root cause found (07-16): the live market-data subscriptions are GONE.**
+  Network B + C + OPRA no longer active on prithvipradip; re-subscribing was REJECTED for
+  "insufficient equity" — the live account U21959335 is unfunded and IBKR requires **USD 500
+  minimum equity + the USD 4.50/mo fees** to activate data (their published minimum). The free
+  "US Real-Time Non Consolidated" feed is NOT API-eligible and carries no options. Confirmed
+  during RTH 07-16: Error 354 persists, quotes NaN, 10197 (competing session) is CLEARED.
+  Delayed fallback breaks delta-based strike selection (18 `short_put_outside_delta_tolerance`
+  condor rejects on 07-16) and starves fills. **No free alternative exists** (web-verified:
+  OPRA's own NP floor is $1.25/user/mo; every real-time options feed is paid). ACTION: fund
+  U21959335 with ~USD 505 (≈CAD 700 — it SITS there, not spent), re-subscribe the 3 Level-I
+  feeds, confirm share-with-paper, then restart the Gateway.
+- **R14 fully shipped** (dae9c64/935e897/081be1b/2d58418): exit-price bounds (multi- and
+  single-leg), 3-state broker-liveness gate, exit-input staleness gate, Tier-3 resilience,
+  capital-at-risk base fix, single-leg entry fill ladder. 724 tests green, guards mutation-
+  checked. Deployed via the 07-15 restart.
 - The machine works — real fills, real costs, an honest scoreboard, layered protection.
   **Edge is still unproven**; R9's statistics say even 50 closes is only a preliminary read.
-- 13 audit rounds complete (~275 defects found).
+- 14 audit rounds complete (~285 defects found).
 
 ## INCIDENT 2026-07-13 — the R12 reversal bug fired in the wild, pre-R12-load
 Monday's macro-flatten exits **triple-filled**. Ledger proof (executions table): NVDA condor
@@ -54,7 +66,9 @@ The mission is a trustworthy verdict on edge. Everything below is ordered by wha
 moves that forward. **The bot cannot build a sample while entries are frozen, so U5 is the
 single highest-value action on this page.**
 
-**1. Unfreeze the machine (U5 → U6).** Nothing else matters until the bot is trading again.
+**1. Unfreeze the machine (~~U5~~ ✅ → U6).** U5 done 07-15 (book flattened, entries unfrozen).
+U6 re-scoped 07-16: fund the live account ~USD 505 so the data subs can activate. Nothing else
+matters until the bot has real option quotes again.
 **2. Take the two open decisions (D1, D2)** — both must be settled BEFORE the sample grows,
 because both change how results are scored, and "criteria fixed before looking" is the rule.
 **3. Close the security exposure (U7 → U8/U9 → U10/U11/U12).** Independent of trading; do in
@@ -78,8 +92,8 @@ Phase-2 sizing → go-live gates.
 **Blocking the mission**
 | # | Action | Why it matters |
 |---|---|---|
-| U5 | **Close the 4 untracked reverse iron condors at IBKR → verify flat in TWS → THEN delete `data/HALT_UNTRACKED`** (see INCIDENT 2026-07-13). They are NOT in the bot's books and must not be adopted (that would contaminate the sample). R13 verified this flow is SAFE — the bot has no exit path referencing them, so it will not fight your closes. Deleting the file BEFORE the broker is flat just re-freezes at the next reconcile. | **THE blocker.** Entries frozen = zero sample-building (R2: ~15-20 closes/month is the ceiling even when healthy). Plus ~$955 of unbooked premium bleeding theta to 07-24, with the CPI catalyst already passed. |
-| U6 | **Restore the live market-data entitlement**: log the live account out of mobile/web (the ONE-data-slot rule), then restart the Gateway so entitlements reload at login. | Error 10089/354 on live quote requests since ≥07-09, low-rate but constant. Broker-stream marks still flow so exits work — but entry pricing quality depends on it the moment entries resume. Known class from the 06-30/07-02 saga. |
+| ~~U5~~ | ✅ **DONE 07-15.** All 11 orphan legs flattened at the broker (scripted, dedicated clientId, fills verified against a fresh `reqPositions`), book reconciled, `HALT_UNTRACKED` cleared, entries unfrozen, bot did not re-freeze. | Was THE blocker; closed. |
+| U6 | **Fund U21959335 with ~USD 505 (≈CAD 700) → re-subscribe Network B ($1.50) + Network C ($1.50) + OPRA ($1.50) → confirm share-with-paper → tell the bot-keeper to restart the Gateway.** Root cause (07-16): the subs LAPSED because the live account is unfunded — IBKR requires USD 500 minimum equity + fees to activate data; re-subscribe was REJECTED "insufficient equity". The competing-session half (10197) is already fixed. The deposit SITS as balance; only $4.50/mo is spent. No free alternative exists (web-verified; OPRA NP floor is $1.25). | **NOW the blocker.** Without OPRA there are no option quotes at all: delayed fallback breaks delta strike selection (18 condor rejects 07-16) and starves fills — zero sample-building even with entries unfrozen. Funding ≠ going live: the bot stays `--paper`; go-live gates unchanged. |
 
 **Security (R13 — do in one evening, outside RTH)**
 | # | Action | Why it matters |
