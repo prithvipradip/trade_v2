@@ -84,6 +84,13 @@ class PositionSizer:
         if account_value <= 0 or option_price <= 0:
             return PositionSize(0, 0, 0, 0, "invalid inputs")
 
+        # R15 minor: a VIX outage passes vix=None (credit strategies fail
+        # closed upstream by design, but DEBIT strategies reach this compare
+        # and died with TypeError — silently blocking ALL debit entries).
+        # None = regime unknown: treat as calm (no VIX shrink) rather than
+        # crash; the upstream credit fail-closed gate is unaffected.
+        vix = vix or 0.0
+
         # Base: max position as percentage of account
         max_position_value = account_value * self._pos_config.max_position_pct
         cost_per_contract = option_price * 100  # Options are 100 shares

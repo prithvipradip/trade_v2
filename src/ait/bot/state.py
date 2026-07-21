@@ -774,6 +774,13 @@ class StateManager:
                 "WHERE trade_id = ?", (trade_id,)).fetchone()
             return float(row[0] or 0.0)
 
+    def update_trade_realized_pnl(self, trade_id: str, realized_pnl: float) -> None:
+        """R15 #8: commission true-up rewrite of a just-closed trade's P&L
+        (estimate swapped for the executions-ledger truth at booking time)."""
+        with self._connect() as conn:
+            conn.execute("UPDATE trades SET realized_pnl = ? WHERE trade_id = ?",
+                         (realized_pnl, trade_id))
+
     def update_trade_commission(self, trade_id: str, commission: float) -> None:
         """R7: record the REAL round-trip commission on the trade row."""
         with self._connect() as conn:

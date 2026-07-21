@@ -71,6 +71,12 @@ def _isolate_model_artifacts(tmp_path, monkeypatch):
     import ait.ml.range_predictor as _rp
     import ait.ml.vol_magnitude_predictor as _vp
     import ait.ml.ensemble as _en
-    for _mod in (_rp, _vp, _en):
+    # R15 #7: meta_label was MISSING from this fence — its own CWD-relative
+    # MODEL_DIR meant every pytest run on the trading box overwrote the LIVE
+    # models/meta_label.pkl with a test-fixture model. Enumerate by package
+    # scan would be better still; at minimum every module with a MODEL_DIR
+    # must appear here.
+    import ait.ml.meta_label as _ml
+    for _mod in (_rp, _vp, _en, _ml):
         if hasattr(_mod, "MODEL_DIR"):
             monkeypatch.setattr(_mod, "MODEL_DIR", tmp_path, raising=False)

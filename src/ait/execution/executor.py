@@ -1452,8 +1452,23 @@ class TradeExecutor:
             # Debit: paid `entry` to open, receive `exit_price` on close
             pnl = (exit_price - entry) * multiplier * qty
 
-        # Subtract commissions: ~$0.65/contract/side (IBKR tiered pricing)
-        # Multi-leg strategies pay per leg both entering and exiting
+        # Subtract commissions: ~$0.65/contract/side (IBKR tiered pricing).
+        # R15 #8: this is an ESTIMATE at fill time; _process_completed_exits
+        # trues it up against the executions ledger (same formula via
+        # commission_estimate) before any stats/breaker/learning booking.
+        # Class-qualified (not self.): tests drive this method through a
+        # minimal host shim that only carries CREDIT_STRATEGIES.
+        pnl -= TradeExecutor.commission_estimate(trade)
+
+        return round(pnl, 2)
+
+    @staticmethod
+    def commission_estimate(trade) -> float:
+        """Flat round-trip commission estimate: $0.65/contract/side per leg.
+        Single source of truth — the fill-time booking subtracts this, and
+        the completed-exit true-up adds it back before subtracting the REAL
+        ledger commission. The two must stay the same formula."""
+        qty = max(1, int(getattr(trade, "quantity", 1) or 1))
         legs_per_side = 1
         if trade.contract_type == "iron_condor":
             legs_per_side = 4
@@ -1461,10 +1476,7 @@ class TradeExecutor:
             "long_straddle", "event_straddle", "short_strangle", "calendar_spread",
         ):
             legs_per_side = 2
-        commission = 0.65 * legs_per_side * qty * 2  # entry + exit
-        pnl -= commission
-
-        return round(pnl, 2)
+        return 0.65 * legs_per_side * qty * 2  # entry + exit
 
     def _update_trade_filled(
         self, pending: PendingOrder, actual_price: float,

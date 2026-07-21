@@ -125,7 +125,13 @@ class PositionReconciler:
             legs = []
         if not legs and getattr(trade, "strike", None):
             right = "C" if "call" in trade.strategy else "P"
-            legs = [{"strike": trade.strike, "right": right, "action": "SELL"}]
+            # R15 #1: the synthesized action must follow the strategy's cash
+            # flow. Hardcoded "SELL" sign-flipped every single-leg DEBIT trade
+            # (long_call/long_put store legs="[]" + strike): a long put bought
+            # at 3.00 expiring ITM worth 5.00 booked as an amplified LOSS.
+            from ait.strategies.base import CREDIT_STRATEGIES as _CS_IL
+            action = "SELL" if trade.strategy in _CS_IL else "BUY"
+            legs = [{"strike": trade.strike, "right": right, "action": action}]
         if not legs:
             return None
         value = 0.0
@@ -797,6 +803,14 @@ class PositionReconciler:
         # A multi-leg trade is stale only when NONE of its legs exist in IBKR;
         # any surviving leg means the position (or part of it) is still live.
         for trade, keys in local_entries:
+            # R15 #2: PENDING rows belong to the liveness-gated, 30-min-aged
+            # stale-pending sweep — NEVER to this booking loop. A crash-restart
+            # one minute after placing an entry used to book the fresh PENDING
+            # as reconciler_unknown_exit while the entry order still WORKED at
+            # the broker: the fill then landed untracked (the exact class the
+            # untracked-option freeze exists to catch).
+            if trade.status == TradeStatus.PENDING:
+                continue
             if not keys.isdisjoint(ibkr_map):
                 # Some legs alive. If OTHERS are missing, this is a partial
                 # assignment/exercise — flag it loudly; the position needs

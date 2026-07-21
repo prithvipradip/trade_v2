@@ -130,7 +130,11 @@ class CircuitBreaker:
             return self._tripped
         if mtm_day_pnl < 0 and abs(mtm_day_pnl) / account_value >= self._config.max_daily_loss_pct:
             self._trip(
-                f"daily MTM loss {abs(mtm_day_pnl):.0f} >= "
+                # R15 #3: MUST contain 'daily_loss' — check_daily_reset's
+                # matcher untrips only reasons containing that token, and
+                # "daily MTM loss" didn't match: one MTM trip blocked entries
+                # FOREVER (pause_seconds=0 means no time-based resume either).
+                f"daily_loss (MTM) {abs(mtm_day_pnl):.0f} >= "
                 f"{self._config.max_daily_loss_pct:.0%} of {account_value:.0f}",
                 pause_seconds=0,  # clears on daily reset, like the realized halt
             )

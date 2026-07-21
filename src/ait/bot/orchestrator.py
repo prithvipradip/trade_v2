@@ -424,8 +424,32 @@ class TradingOrchestrator:
         the breaker/learning never saw them.
         """
         for ex in completed_exits:
-            realized_pnl = ex["realized_pnl"]
             trade_id = ex["trade_id"]
+
+            # R15 #8 (Tier-2 #4 for real): the fill-time booking embedded a
+            # FLAT $0.65/leg/side commission estimate inside realized_pnl —
+            # real commissions only ever reached the commission COLUMN, so
+            # every new close drifted from the broker again (the exact class
+            # D1 just restated away). True up BEFORE stats/breaker/Thompson
+            # see the number: swap the estimate out, the ledger truth in.
+            try:
+                _real_comm0 = self._state.total_commission(trade_id)
+                _t0 = self._find_trade_by_id(trade_id)
+                if _real_comm0 > 0 and _t0:
+                    from ait.execution.executor import TradeExecutor as _TE
+                    _delta = round(_TE.commission_estimate(_t0) - _real_comm0, 2)
+                    if abs(_delta) >= 0.01:
+                        ex["realized_pnl"] = round(ex["realized_pnl"] + _delta, 2)
+                        self._state.update_trade_realized_pnl(
+                            trade_id, ex["realized_pnl"])
+                        log.info("realized_pnl_commission_trueup",
+                                 trade_id=trade_id, delta=_delta,
+                                 real_comm=round(_real_comm0, 2))
+            except Exception as _e:  # noqa: BLE001 — booking must never die here
+                log.warning("commission_trueup_failed",
+                            trade_id=trade_id, error=str(_e))
+
+            realized_pnl = ex["realized_pnl"]
 
             stats = self._state.get_daily_stats()
             stats.total_pnl += realized_pnl
@@ -1663,7 +1687,12 @@ class TradingOrchestrator:
             log.info("first_hour_confidence_gate",
                      symbol=signal.symbol, confidence=f"{confidence:.2f}",
                      required=0.85)
-            return True  # same confidence for all signals — trying another won't help
+            # R15 minor: per-signal reject, NOT symbol-handled. Neutral
+            # candidates (IC/strangle) are EXEMPT from this gate and carry
+            # their own model-overridden confidence — returning True here
+            # suppressed every first-hour condor whenever a directional
+            # signal outranked it, throttling exactly the sample we need.
+            return False
 
         # GUARD #2 — per-symbol+strategy cooldown. Refuse re-entry on the same
         # symbol+strategy within the window regardless of fill status; a simple

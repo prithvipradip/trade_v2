@@ -515,7 +515,15 @@ class MarketDataService:
                         # A2 (deep-audit DATA-M4): exchange tick time when
                         # available — wall-clock stamps made staleness
                         # detection blind (frozen quotes always looked fresh).
-                        timestamp=(ticker.time.replace(tzinfo=None)
+                        # R15 #6: normalize to naive LOCAL time. ticker.time is
+                        # aware-UTC; the old .replace(tzinfo=None) kept the UTC
+                        # wall-clock, while the Yahoo fallback stamps local
+                        # now(). Consumers call .timestamp() (interprets naive
+                        # as LOCAL), so IBKR quotes read 4h in the future —
+                        # never stale to the R14 gate — and an IBKR->Yahoo
+                        # source flip looked like time running backwards
+                        # ("frozen"). astimezone() first = true local wall.
+                        timestamp=(ticker.time.astimezone().replace(tzinfo=None)
                                    if getattr(ticker, "time", None) else datetime.now()),
                     )
         except Exception as e:

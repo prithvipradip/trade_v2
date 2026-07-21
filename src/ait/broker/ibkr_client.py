@@ -84,9 +84,23 @@ class IBKRClient:
                 self._ib.reqMarketDataType(_mdt)
                 log.info("market_data_type_set", type=_mdt)
 
-                account = self._config.ibkr_account or (
-                    self._ib.managedAccounts()[0] if self._ib.managedAccounts() else "unknown"
-                )
+                # R15 #4: the SESSION's managedAccounts() is the truth — the
+                # config string is only a fallback. The old precedence made
+                # the paper/live assertion validate the .env constant (always
+                # "DUN..." = always paper) while a Gateway logged into the
+                # LIVE account sailed straight through the gate.
+                _session_accts = self._ib.managedAccounts() or []
+                account = self._resolve_session_account(
+                    _session_accts, self._config.ibkr_account)
+                if (_session_accts and self._config.ibkr_account
+                        and self._config.ibkr_account not in _session_accts):
+                    log.critical(
+                        "CONFIGURED_ACCOUNT_NOT_IN_SESSION",
+                        configured=self._config.ibkr_account,
+                        session_accounts=_session_accts,
+                        note="the Gateway is logged into a different account "
+                             "than the config expects",
+                    )
                 # R5 audit CRITICAL: nothing anywhere verified paper-vs-live.
                 # ensure_gateway() trusts any process on the port and the IBC
                 # config decides the mode at login — assert the account type
@@ -110,7 +124,12 @@ class IBKRClient:
                 # every one of them as vanished and mass-flip live trades to
                 # CANCELLED. Snapshot all-clients open orders once and stash
                 # their orderIds so the executor refuses those false verdicts.
-                if client_id != base_id and self._ever_connected:
+                # R15 #5: stash on any reconnect whose clientId DIFFERS from
+                # the PREVIOUS session's — not just base->fallback. The old
+                # `!= base_id` test missed the return leg (fallback 105 ->
+                # base): orders placed under 105 were invisible to the fresh
+                # base session and mass-flipped to false CANCELLED.
+                if self._should_stash_foreign(client_id, base_id):
                     try:
                         _all_open = await self._ib.reqAllOpenOrdersAsync()
                         _ids = {
@@ -128,6 +147,7 @@ class IBKRClient:
                         log.warning("foreign_open_orders_fetch_failed",
                                     error=str(_fo_err))
                 self._ever_connected = True
+                self._last_client_id = client_id
                 log.info(
                     "ibkr_connected",
                     host=self._config.ibkr_host,
@@ -159,6 +179,29 @@ class IBKRClient:
             self._ib.disconnect()
             self._connected = False
             log.info("ibkr_disconnected")
+
+    @staticmethod
+    def _resolve_session_account(session_accts: list, config_account: str | None) -> str:
+        """R15 #4: the SESSION's managedAccounts() is the truth for the
+        paper/live assertion; the config string is only a last-resort
+        fallback. The old precedence (config first) made the gate validate a
+        .env constant — a Gateway logged into the LIVE account passed as
+        'paper'."""
+        if session_accts:
+            return str(session_accts[0])
+        return config_account or "unknown"
+
+    def _should_stash_foreign(self, client_id: int, base_id: int) -> bool:
+        """R15 #5: stash the previous session's open orders on any reconnect
+        whose clientId differs from the PREVIOUS session's id — not merely
+        when landing off-base. The old `client_id != base_id` missed the
+        return leg (fallback -> base): orders placed under the fallback id
+        were invisible to the fresh base session and mass-flipped to false
+        CANCELLED."""
+        if not self._ever_connected:
+            return False
+        prev = getattr(self, "_last_client_id", None)
+        return client_id != (prev if prev is not None else base_id)
 
     async def ensure_connected(self) -> bool:
         """Ensure we're connected, reconnecting if necessary."""
