@@ -564,3 +564,7 @@ streak)*
   days earlier by these very audits. Audit the fixes, not just the original.
 - **Fix CLASSES, not instances.** The artifact fence covered walkforward but not tests; the CAS
   transition guard covers every writer, present and future.
+
+## Round 15 (2026-07-21) - main-vs-branch adversarial review + fixes
+29-agent review of origin/main...HEAD: all 7 areas mission-ALIGNED, nothing of value lost from main, 8 defects confirmed (2 skeptics each) and ALL FIXED same day (cad16d5, 17 tests, suite 755 green): intrinsic sign-flip on single-leg debit expiry booking; PENDING rows booked stale while entry orders worked; MTM halt never un-tripping (reason-token mismatch); paper/live assertion validating config not session; foreign-order stash missing the fallback-to-base leg; naive-UTC vs naive-local quote stamps blinding the staleness gate; pytest clobbering live meta_label.pkl; realized_pnl embedding the flat commission estimate (now trued up from the ledger at booking - Tier-2 #4 closed). Plus: first-hour gate no longer suppresses exempt condors; vix=None no longer crashes debit sizing.
+KNOWN RESIDUE: models/meta_label.pkl was clobbered by a test run Sat 07-18 11:04 and the daily retrain has NOT run since 07-17 (investigate scheduler); inert while paper_trading_mode disables the meta-label gate, but restore before it re-arms.
