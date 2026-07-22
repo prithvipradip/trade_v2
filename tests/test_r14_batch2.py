@@ -277,9 +277,9 @@ def _recon_for_hatch(fresh):
 
 
 def _opt_pos(symbol, strike, right, expiry):
-    return SimpleNamespace(contract=SimpleNamespace(
+    return SimpleNamespace(position=1.0, contract=SimpleNamespace(
         secType="OPT", symbol=symbol, strike=strike, right=right,
-        lastTradeDateOrContractMonth=expiry, position=0))
+        lastTradeDateOrContractMonth=expiry))
 
 
 class TestReconcileFreshHatch:

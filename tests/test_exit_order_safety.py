@@ -416,7 +416,7 @@ def _reconciler(
 
 def _ibkr_pos(symbol: str, strike: float, right: str, expiry: str):
     """An IBKR position row: OPT contract, expiry in IBKR's YYYYMMDD form."""
-    return SimpleNamespace(contract=SimpleNamespace(
+    return SimpleNamespace(position=1.0, contract=SimpleNamespace(
         secType="OPT", symbol=symbol, strike=strike, right=right,
         lastTradeDateOrContractMonth=expiry,
     ))

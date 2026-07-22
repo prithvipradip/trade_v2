@@ -12,7 +12,11 @@ trading:
   # corr ~0.95) caps at 2 concurrent positions, saturating the book at ~5 of 8
   # slots. Gold/bonds/energy are liquid, optionable, and weakly correlated to
   # equities — they fill the idle slots AND diversify the short-vol tail.
-  universe: [SPY, QQQ, IWM, DIA, NVDA, AMZN, AMD, GLD, TLT, XLE]
+  # USER DECISION 2026-07-22: index ETFs only ("like QQQ and SPY") — tightest
+  # spreads, best fills, no single-name earnings gaps (the NVDA/AMZN condors
+  # were in the 07-13 mess and cost-dominated). IWM kept: same category,
+  # cheaper strikes. Was: [SPY, QQQ, IWM, DIA, NVDA, AMZN, AMD, GLD, TLT, XLE]
+  universe: [SPY, QQQ, IWM]
   scan_interval_seconds: 300           # 5 minutes between scans
   max_daily_trades: 12                  # Raised for higher trade volume / faster learning
   trading_hours_only: true             # Only trade during RTH (9:30-16:00 ET)
@@ -58,12 +62,19 @@ options:
   min_volume: 0                        # Delayed feeds report volume=0; relaxed pydantic floor too
   max_bid_ask_spread_pct: 0.40         # Loosened: stale-quote spreads run wider
   strategies:
-    - long_call
-    - long_put
-    - bull_call_spread
-    - bear_put_spread
+    # USER DECISION 2026-07-22 (at close #12): IRON CONDOR ONLY — the stated
+    # mission (PLAN line 3). The fillers were churn: long_straddle bled -55%
+    # over 2 weeks then needed a manual flatten (no combo quotes to exit);
+    # the directional long options were delayed-quote coin flips (-22.91,
+    # -102.30, -22.91). The verdict sample from here forward is IC closes on
+    # index ETFs — one strategy, one clean question. Re-enable others only
+    # by deliberate decision recorded in PLAN.
     - iron_condor
-    - long_straddle
+    # - long_call
+    # - long_put
+    # - bull_call_spread
+    # - bear_put_spread
+    # - long_straddle
     # - short_strangle   R6 (user-approved 2026-07-09): entries disabled — go-live
     #                     is defined-risk only, so strangle closes pad the 50-close
     #                     count while answering nothing (and carry 10-60x the live

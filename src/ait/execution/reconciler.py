@@ -228,6 +228,8 @@ class PositionReconciler:
 
         fresh_keys: set[str] = set()
         for pos in fresh:
+            if not getattr(pos, "position", 0):
+                continue  # R15b: zeroed row = closed, not live
             try:
                 if pos.contract.secType == "OPT":
                     fresh_keys.add(self._make_position_key(
@@ -385,6 +387,8 @@ class PositionReconciler:
                 return None
             live: set[str] = set()
             for pos in self._ibkr.get_positions():
+                if not getattr(pos, "position", 0):
+                    continue  # R15b: zeroed row = closed, not live
                 if pos.contract.secType == "OPT":
                     live.add(self._make_position_key(
                         symbol=pos.contract.symbol,
@@ -535,6 +539,8 @@ class PositionReconciler:
         # Build IBKR position map using normalized keys
         ibkr_map: dict[str, dict] = {}
         for pos in ibkr_positions:
+            if not getattr(pos, "position", 0):
+                continue  # R15b: a zeroed row must not "match" local legs
             if pos.contract.secType == "OPT":
                 key = self._make_position_key(
                     symbol=pos.contract.symbol,
@@ -765,7 +771,8 @@ class PositionReconciler:
             fresh_fn = getattr(self._ibkr, "get_positions_fresh", None)
             fresh = await fresh_fn() if callable(fresh_fn) else None
             fresh_has_options = (
-                any(getattr(p.contract, "secType", "") == "OPT" for p in fresh)
+                any(getattr(p.contract, "secType", "") == "OPT"
+                    and getattr(p, "position", 0) for p in fresh)
                 if fresh is not None else None
             )
             if fresh is not None and not fresh_has_options:
