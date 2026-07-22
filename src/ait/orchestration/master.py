@@ -1097,6 +1097,24 @@ def main():
             backup_state_db()
     except Exception as _e:  # noqa: BLE001
         _log("warning", "startup_backup_check_failed", error=str(_e))
+    # R15 follow-up: the 07:30 retrain cron only fires if this PROCESS is
+    # alive at 07:30 — and the box routinely comes up ~08:45-09:00 (no
+    # auto-logon, U2), so the retrain silently missed EVERY late start
+    # (last ran 07-17; models went stale for days, and the meta_label.pkl
+    # test-clobber persisted because nothing rewrote it). Same catch-up
+    # pattern as the backup above: a weekday start after 07:35 with no
+    # retrain log for today runs one immediately. Safe intraday: the
+    # .retrained model-reload restart already defers until market close.
+    try:
+        from ait.utils.time import now_et as _cnet
+        _now_c = _cnet()
+        if (_now_c.weekday() < 5 and (_now_c.hour, _now_c.minute) >= (7, 35)
+                and not list(LOGS_DIR.glob(
+                    f"retrain_{_now_c.strftime('%Y%m%d')}_*.log"))):
+            _log("info", "startup_catchup_retrain")
+            retrain_models()
+    except Exception as _e:  # noqa: BLE001
+        _log("warning", "startup_retrain_check_failed", error=str(_e))
     scheduler.add_job(daily_report,
                       CronTrigger(day_of_week="mon-fri", hour=16, minute=30),
                       id="daily_report")
