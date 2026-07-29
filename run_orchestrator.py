@@ -40,7 +40,13 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 # account holds Network B/C (US equity consolidated) + OPRA subscriptions
 # (added 2026-07-02). Propagates to bot + keeper-relaunched subprocesses.
 # Revert to "4" here if the subscription ever lapses.
-os.environ.setdefault("AIT_MARKET_DATA_TYPE", "1")
+# 2026-07-28 (user decision: trade IC on delayed until U6 funds live data).
+# Type 1 with no subscription = 8,446x Error 354 spam and sporadic greeks;
+# explicit delayed-frozen (4) serves clean 15-min data. The economics gates
+# (credit/width, delta band, EM) remain the protection; delayed-era closes
+# are separable by timestamp once live data starts. Flip back to "1" after
+# funding + resubscribe.
+os.environ.setdefault("AIT_MARKET_DATA_TYPE", "4")
 
 # Paper phase keeps short strangles enabled for the edge comparison
 # (PLAN.md go-live gates); the executor refuses undefined-risk orders unless
