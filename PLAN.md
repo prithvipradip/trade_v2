@@ -571,3 +571,6 @@ KNOWN RESIDUE: models/meta_label.pkl was clobbered by a test run Sat 07-18 11:04
 
 ## 2026-07-22 - IC-ONLY pivot (user decision) + straddle resolved + R15b
 Strategies pinned to [iron_condor], universe [SPY,QQQ,IWM]. Straddle manually flattened (299C@0.49/299P@3.63) after days stuck in the no-quote defer loop. R15b: zero-position IBKR rows now filtered in all liveness/matching paths (found by the hatch's first live use). Catch-up retrain shipped+fired (first since 07-17). Machine-side U-items done: U4 OneDrive mirror, U8 IBC reject, U10 logs clean, U11 ACL, U12 Docker. User-side: U1, U2, U3+U9 (elevated), U7 (browser), U6 (fund ~USD505 - THE blocker).
+
+## 2026-07-28 - wing_k study (PRE-REGISTERED decision rule, written BEFORE results)
+Sweep k in {0.6, 0.8, 1.0, 1.2}, iron_condor only, SPY/QQQ/IWM, all other params at live values (ratio floor 0.20, credit floor 0.70, delta band). RULE: require OOS trades >= 30 AND PF > 1.0; among qualifiers pick highest PF; ties within 0.1 PF -> higher trade count; if NONE qualifies, KEEP k=1.0 and wait for vol (no gate loosening). Chosen k gets locked in config + backtest before the first counted sample close.
