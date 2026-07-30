@@ -1,0 +1,38 @@
+[
+ {
+  "k": 0.6,
+  "n": 39,
+  "win_rate": 53.85,
+  "pf": 1.06,
+  "max_dd_pct": 5.95,
+  "total_ret_pct": 0.17,
+  "windows": 21
+ },
+ {
+  "k": 0.8,
+  "n": 39,
+  "win_rate": 56.41,
+  "pf": 1.07,
+  "max_dd_pct": 5.13,
+  "total_ret_pct": 0.16,
+  "windows": 21
+ },
+ {
+  "k": 1.0,
+  "n": 25,
+  "win_rate": 60.0,
+  "pf": 0.84,
+  "max_dd_pct": 3.72,
+  "total_ret_pct": -0.25,
+  "windows": 16
+ },
+ {
+  "k": 1.2,
+  "n": 0,
+  "win_rate": 0.0,
+  "pf": 0.0,
+  "max_dd_pct": 0.0,
+  "total_ret_pct": 0.0,
+  "windows": 0
+ }
+]

@@ -47,6 +47,10 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 # are separable by timestamp once live data starts. Flip back to "1" after
 # funding + resubscribe.
 os.environ.setdefault("AIT_MARKET_DATA_TYPE", "4")
+# 2026-07-29 wing_k study (pre-registered rule): live wings mirror the
+# backtest winner. Narrower wings also raise credit/width, so condors can
+# clear the 0.20 floor at lower IV.
+os.environ.setdefault("AIT_IC_WING_K", "0.8")
 
 # Paper phase keeps short strangles enabled for the edge comparison
 # (PLAN.md go-live gates); the executor refuses undefined-risk orders unless

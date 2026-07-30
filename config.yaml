@@ -101,7 +101,12 @@ backtest:
   wing_floor_dollars: 5.0             # Hard minimum spread width in dollars (safety floor only)
                                        # Wing sizing is now primarily driven by wing_k × expected_move
                                        # Lower to 0.5 for sub-$10 stocks (e.g. SOFI)
-  wing_k: 1.0                         # Vol-scaled wing multiplier: wing = wing_k × price × IV × √(DTE/365)
+  # 2026-07-29 wing_k STUDY DECISION (rule pre-registered in PLAN before
+  # results): k=0.8 — 21 windows / 39 OOS trades / PF 1.07 / win 56.4% /
+  # DD 5.13% vs k=1.0's PF 0.84 (25 trades, negative return). Locked for
+  # live + backtest together. Caveats recorded in PLAN (window overlap
+  # ~1.5x -> effective n ~26; OOS PF barely >1 - edge evidence is THIN).
+  wing_k: 0.8
                                        # Optuna optimizes per walk-forward window [0.3 – 2.0]
                                        # 0.5 = half-sigma (tight), 1.0 = 1-sigma, 2.0 = 2-sigma (wide)
   iv_floor: 0.20                      # Min synthetic IV for option pricing
