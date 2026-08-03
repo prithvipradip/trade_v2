@@ -577,3 +577,13 @@ Sweep k in {0.6, 0.8, 1.0, 1.2}, iron_condor only, SPY/QQQ/IWM, all other params
 
 ## 2026-07-29 - wing_k study RESULT + DECISION: k=0.8 LOCKED
 Dense sweep (train126/test63/step42/gap5, 1049 rows ~4.2y, SPY/QQQ/IWM, IC-only, ratio floor 0.20): k=0.6 -> 21w/39t PF1.06 win53.9 DD5.95; k=0.8 -> 21w/39t PF1.07 win56.4 DD5.13; k=1.0 -> 16w/25t PF0.84 ret NEGATIVE; k=1.2 -> zero trades (wings too wide to ever pass ratio). RULE APPLIED: qualifiers 0.6+0.8; PF tie within 0.1 -> trade count ALSO tied at 39 -> rule exhausted; resolved to k=0.8 by reverting to primary metric (higher PF) which also dominates win rate + DD. RESIDUAL JUDGMENT DISCLOSED. Caveats: window overlap ~1.5x (effective n ~26, below the raw-30 bar the registered rule counted); OOS PF barely above 1 - THE EDGE EVIDENCE IS THIN, which is why the live 50-close sample remains the verdict. k=0.8 locked in config.yaml (backtest) + AIT_IC_WING_K (live); narrower wings raise credit/width so condors can clear 0.20 at lower IV. Study: scripts/wingk_study.py, artifacts reports/wingk_study/.
+
+## 2026-08-03 - ML ABLATION (PRE-REGISTERED rule, written BEFORE results)
+Study: walk-forward SPY/QQQ/IWM iron_condor k=0.8, GATE-STACK-ONLY vs FULL-STACK (ML
+confidence/range/meta gates active). RULE: ML "earns its place" ONLY if full-stack shows
+BOTH higher PF AND lower max DD than gate-only on >=30 OOS trades each; anything less ->
+REMOVE the ML gates from the entry path (simplicity wins ties). Harness note: engine ML
+toggle to be wired next session; rule locked now. Also 2026-08-03: straddle FINAL
+restatement to broker ledger truth -575.33 (record: 13 closes 6W-7L -$451.94); referee
+0 BREAKS after fill attribution; corrupt meta_label.pkl quarantined (retrain does not
+cover it - regenerate before meta gate ever re-arms).
