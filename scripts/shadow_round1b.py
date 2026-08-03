@@ -104,12 +104,12 @@ async def main():
             print(f"[shadow1b] {strat} FAILED: {e}", flush=True)
             rows.append({"arm": strat, "error": str(e)[:200]})
     print("\n[wingk] ===== RESULTS =====")
-    print(f"{'k':>4} {'win':>7} {'trades':>7} {'winrate':>8} {'PF':>7} {'DD%':>6} {'ret%':>7}")
+    print(f"{'arm':>18} {'win':>7} {'trades':>7} {'winrate':>8} {'PF':>7} {'DD%':>6} {'ret%':>7}")
     for r in rows:
         if "error" in r:
-            print(f"{r['k']:>4} ERROR {r['error'][:60]}")
+            print(f"{r['arm']:>18} ERROR {r['error'][:60]}")
         else:
-            print(f"{r['k']:>4} {r['windows']:>7} {r['n']:>7} {r['win_rate']:>8} "
+            print(f"{r['arm']:>18} {r['windows']:>7} {r['n']:>7} {r['win_rate']:>8} "
                   f"{r['pf']:>7} {r['max_dd_pct']:>6} {r['total_ret_pct']:>7}")
     (OUT / "results.json").write_text(json.dumps(rows, indent=1))
     print("[shadow1b] PLAN rule: promote only if PF > 1.2 AND max_dd_pct <= IC arm, n >= 30; strangle = benchmark only")

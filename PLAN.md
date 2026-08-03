@@ -622,3 +622,22 @@ n>=30); (b) jade_lizard - BENCHMARK ONLY, permanently non-promotable at current 
 (c) UNCORRELATED UNIVERSE arms - all strategies re-run on XLE/GLD/TLT; a universe earns
 live inclusion ONLY if its IC arm passes the same promotion bar on its own windows.
 Runs chained AFTER shadow round 1 completes (CPU contention). Same harness, k=0.8.
+
+## 2026-08-03 - SHADOW TOURNAMENT VERDICT (rules pre-registered above; raw logs = source)
+R1 SPY/QQQ/IWM (~4y, 28 wf windows): IC n=89 PF 0.97 DD 18.4% | iron_butterfly n=73
+PF 0.31 DD 29.2% | put_credit_spread n=7 (gate rarely clears) | short_strangle BENCH
+n=53 PF 1.30 DD 1.2%. R1b: call_credit_spread n=7 PF inf (100% win - small-sample,
+no verdict) | jade_lizard n=5 PF 0.79 (no verdict). R2 XLE/GLD/TLT: IC n=37 PF 0.58 |
+IB n=58 PF 0.35 | strangle n=65 PF 0.77 | all spread/lizard arms n=0 (never traded -
+premia too thin for gates).
+RULES APPLIED: (1) NO candidate promotes - zero arms met PF>1.2 AND DD<=IC AND n>=30.
+(2) iron_butterfly ELIMINATED (0.31/0.35 both universes - ATM shorts die by touch-stop).
+(3) Vertical spreads + jade lizard: NO VERDICT as parameterized - they barely trade
+(n<=7 R1, n=0 R2); re-parameterize (full-width wing / lower credit floor) before any
+future round, else drop. (4) UNCORRELATED UNIVERSE REJECTED: XLE/GLD/TLT IC arm PF 0.58
+fails its bar; even the wings-free strangle loses there (0.77). SPY/QQQ/IWM stays the
+universe. (5) Wings-cost thesis: supported in R1 (strangle 1.30 vs IC 0.97 - wings cost
+the whole edge) but does NOT transfer universes and lizard n too small to confirm.
+Next test of the thesis: BROKEN-WING condor round (defined-risk, cheaper wings).
+LIVE CONFIG UNCHANGED: iron_condor on SPY/QQQ/IWM remains the sole live arm; the
+50-close live sample remains the decider (sim IC estimates now 1.07/0.86/0.97 ~ 1.0).
