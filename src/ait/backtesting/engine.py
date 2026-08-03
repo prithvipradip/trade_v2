@@ -31,7 +31,7 @@ from ait.utils.logging import get_logger
 log = get_logger("backtesting.engine")
 
 # Strategies that collect premium (short theta)
-CREDIT_STRATEGIES = {"iron_condor", "short_strangle", "short_straddle", "covered_call", "cash_secured_put", "put_credit_spread"}
+CREDIT_STRATEGIES = {"iron_condor", "iron_butterfly", "call_credit_spread", "jade_lizard", "short_strangle", "short_straddle", "covered_call", "cash_secured_put", "put_credit_spread"}
 # Strategies that pay premium (long theta)
 DEBIT_STRATEGIES = {"long_call", "long_put", "bull_call_spread", "bear_put_spread", "long_straddle"}
 
@@ -311,7 +311,7 @@ class Backtester:
                     # Hard veto is optional: it only applies when multiplier > 0.
                     # Exp 20 post-mortem showed QQQ hurst_spread rarely drops below
                     # ~0.43 in normal conditions; overly tight thresholds can block all entries.
-                    _neutral_strat = bool(set(self._strategies) & {"iron_condor", "short_strangle"})
+                    _neutral_strat = bool(set(self._strategies) & {"iron_condor", "iron_butterfly", "short_strangle"})
                     _veto_base = max(self._hurst_regime_threshold, 0.20)
                     _hard_veto_threshold = _veto_base * self._hurst_hard_veto_multiplier
                     if _neutral_strat and self._hurst_hard_veto_multiplier > 0 and spread > _hard_veto_threshold:
@@ -338,7 +338,7 @@ class Backtester:
             # confidence signals a trending regime — exactly when they fail. Skip the
             # direction gate for these strategies; the range model below is the sole
             # entry filter. Directional strategies still require confidence ≥ min_conf.
-            _neutral_only = bool(set(self._strategies) & {"iron_condor", "short_strangle"})
+            _neutral_only = bool(set(self._strategies) & {"iron_condor", "iron_butterfly", "short_strangle"})
             if not _neutral_only:
                 if confidence < effective_min_conf:
                     continue
@@ -429,7 +429,7 @@ class Backtester:
             # Exp 22: threshold -0.02 was too loose — blocked profitable 2-4% corrections
             # in W02, causing Optuna to adapt badly. Both structural failures cleared -0.05
             # (Yen carry -6-8%, tariff shock -8-10%); raised to -0.05 for Exp 23.
-            if strategy in ("iron_condor", "short_strangle") and not features_df.empty:
+            if strategy in ("iron_condor", "iron_butterfly", "short_strangle") and not features_df.empty:
                 _last_f        = features_df.iloc[-1]
                 _vol_exp_flag  = float(_last_f.get("vol_regime_expanding", 0.0)) > 0.5
                 _px_sma_val    = float(_last_f.get("price_vs_sma_20", 0.0))
@@ -454,7 +454,7 @@ class Backtester:
 
             # Range model gate: for iron condors / strangles, replace confidence
             # with P(stays in range). Skip if below range threshold.
-            if strategy in ("iron_condor", "short_strangle") and self._range_predictor is not None:
+            if strategy in ("iron_condor", "iron_butterfly", "short_strangle") and self._range_predictor is not None:
                 try:
                     rp = self._range_predictor.predict(
                         hist,
@@ -475,7 +475,7 @@ class Backtester:
 
             # Realized-vol entry gate: iron condors / short strangles cannot profit
             # during high-volatility regimes (e.g. tariff shocks, VIX > 40).
-            if strategy in ("iron_condor", "short_strangle"):
+            if strategy in ("iron_condor", "iron_butterfly", "short_strangle"):
                 recent_close = hist["Close"].iloc[-11:]
                 if len(recent_close) >= 11:
                     vol_10d = recent_close.pct_change().std() * (252 ** 0.5)
@@ -500,7 +500,7 @@ class Backtester:
             # Rising IV rank filter: if IV rank has risen by more than iv_rank_rise_threshold
             # over the last 10 days, market is in directional stress — skip iron condor entry.
             # Rise value is always logged (not just on veto) for threshold tuning.
-            if strategy in ("iron_condor", "short_strangle") and not features_df.empty:
+            if strategy in ("iron_condor", "iron_butterfly", "short_strangle") and not features_df.empty:
                 if "iv_rank" in features_df.columns and len(features_df) >= 11:
                     iv_rank_series = features_df["iv_rank"].iloc[-11:]
                     iv_rank_rise = float(iv_rank_series.iloc[-1]) - float(iv_rank_series.iloc[0])
@@ -640,7 +640,7 @@ class Backtester:
             pos["decision"] = _entry_decision
 
             # Iron condor leg structure for the dashboard drawer
-            if pos.get("strategy") == "iron_condor":
+            if pos.get("strategy") in ("iron_condor", "iron_butterfly"):
                 ep = pos.get("entry_price", 0.0)  # net credit per share
                 # Each spread contributes ep/2 to the net credit.
                 # Short leg = ep/2 + wing_cost; long leg = -wing_cost (debit).
@@ -1334,6 +1334,62 @@ class Backtester:
                 "high_water_mark": 0.0,
             }
 
+        elif strategy == "iron_butterfly":
+            # SHADOW TOURNAMENT candidate (PLAN 2026-08-03): condor variant
+            # with BOTH shorts at-the-money — much larger credit, so the
+            # credit/width ratio clears in low IV where condors starve.
+            # Same wing logic (wing_k x expected move, floor applies).
+            atm = round(S)
+            expected_move = S * iv * (dte / 365.0) ** 0.5
+            wing_width = max(self._wing_k * expected_move, self._wing_floor_dollars)
+            short_call_strike = short_put_strike = float(atm)
+            long_call_strike = atm + wing_width
+            long_put_strike = atm - wing_width
+            short_call_price = black_scholes_price(S, short_call_strike, t, r,
+                self._get_leg_iv(iv, short_call_strike, S, OptionType.CALL), OptionType.CALL)
+            short_put_price = black_scholes_price(S, short_put_strike, t, r,
+                self._get_leg_iv(iv, short_put_strike, S, OptionType.PUT), OptionType.PUT)
+            long_call_price = black_scholes_price(S, long_call_strike, t, r,
+                self._get_leg_iv(iv, long_call_strike, S, OptionType.CALL), OptionType.CALL)
+            long_put_price = black_scholes_price(S, long_put_strike, t, r,
+                self._get_leg_iv(iv, long_put_strike, S, OptionType.PUT), OptionType.PUT)
+            net_credit = (short_call_price + short_put_price) - (long_call_price + long_put_price)
+            if net_credit <= 0:
+                return None
+            if net_credit < self._ic_min_credit:
+                return None
+            if wing_width > 0 and (net_credit / wing_width) < self._ic_min_credit_width:
+                return None
+            half_spread = self._options_half_spread(iv, dte)
+            avg_leg_mid = (short_call_price + short_put_price + long_call_price + long_put_price) / 4
+            net_credit = max(0.0, net_credit - 4 * half_spread * avg_leg_mid)
+            if net_credit <= 0:
+                return None
+            max_loss_per_share = wing_width - net_credit
+            max_loss_per_contract = max_loss_per_share * 100
+            import math
+            if (max_loss_per_contract <= 0 or math.isnan(max_loss_per_contract)
+                    or capital < max_loss_per_contract):
+                return None
+            contracts = int(capital * self._position_size_pct / max_loss_per_contract)
+            if contracts < 1:
+                return None
+            return {
+                "symbol": "SIM", "strategy": "iron_butterfly",
+                "direction": SignalDirection.NEUTRAL.value, "trade_type": "credit",
+                "entry_date": str(today_date), "entry_price": round(net_credit, 4),
+                "contracts": contracts, "n_legs": 4,
+                "short_call_strike": round(short_call_strike, 0),
+                "short_put_strike": round(short_put_strike, 0),
+                "long_call_strike": round(long_call_strike, 0),
+                "long_put_strike": round(long_put_strike, 0),
+                "strike": round(S, 0), "option_type": "iron_butterfly",
+                "entry_iv": round(iv, 4), "underlying_at_entry": round(S, 2),
+                "max_loss_per_share": round(max_loss_per_share, 4),
+                "expiry_date": str(today_date + timedelta(days=dte)),
+                "high_water_mark": 0.0,
+            }
+
         elif strategy == "put_credit_spread":
             # Sell higher strike put, buy lower strike put = bullish credit spread
             short_put_strike = find_strike_by_delta(S, t, iv, -self._delta_short, OptionType.PUT, r)
@@ -1390,6 +1446,93 @@ class Backtester:
                 "entry_iv": round(iv, 4),
                 "underlying_at_entry": round(S, 2),
                 "max_loss_per_share": round(max_loss_per_share, 4),
+                "expiry_date": str(today_date + timedelta(days=dte)),
+                "high_water_mark": 0.0,
+            }
+
+        elif strategy == "call_credit_spread":
+            # SHADOW R2: bearish twin of put_credit_spread.
+            short_call_strike = find_strike_by_delta(S, t, iv, self._delta_short, OptionType.CALL, r)
+            expected_move = S * iv * (dte / 365.0) ** 0.5
+            wing = max(self._wing_k * expected_move * 0.5, self._wing_floor_dollars)
+            long_call_strike = short_call_strike + wing
+            short_call_price = black_scholes_price(S, short_call_strike, t, r,
+                self._get_leg_iv(iv, short_call_strike, S, OptionType.CALL), OptionType.CALL)
+            long_call_price = black_scholes_price(S, long_call_strike, t, r,
+                self._get_leg_iv(iv, long_call_strike, S, OptionType.CALL), OptionType.CALL)
+            net_credit = short_call_price - long_call_price
+            if net_credit <= 0:
+                return None
+            half_spread = self._options_half_spread(iv, dte)
+            net_credit = max(0.0, net_credit - 2 * half_spread *
+                             (short_call_price + long_call_price) / 2)
+            if net_credit <= 0:
+                return None
+            max_loss_per_share = wing - net_credit
+            max_loss_per_contract = max_loss_per_share * 100
+            if max_loss_per_contract <= 0 or capital < max_loss_per_contract:
+                return None
+            contracts = int(capital * self._position_size_pct / max_loss_per_contract)
+            if contracts < 1:
+                if max_loss_per_contract <= capital * 0.25:
+                    contracts = 1
+                else:
+                    return None
+            return {
+                "symbol": "SIM", "strategy": "call_credit_spread",
+                "direction": SignalDirection.BEARISH.value, "trade_type": "credit",
+                "entry_date": str(today_date), "entry_price": round(net_credit, 4),
+                "contracts": contracts, "n_legs": 2,
+                "short_call_strike": round(short_call_strike, 0),
+                "long_call_strike": round(long_call_strike, 0),
+                "strike": round(short_call_strike, 0), "option_type": "call",
+                "entry_iv": round(iv, 4), "underlying_at_entry": round(S, 2),
+                "max_loss_per_share": round(max_loss_per_share, 4),
+                "expiry_date": str(today_date + timedelta(days=dte)),
+                "high_water_mark": 0.0,
+            }
+
+        elif strategy == "jade_lizard":
+            # SHADOW R2 BENCHMARK ONLY (PLAN 2026-08-03): short put + short
+            # call spread. Naked put side => NEVER live-promotable at current
+            # capital. Sized by the strangle margin convention (S*0.20*100).
+            short_put_strike = find_strike_by_delta(S, t, iv, -self._delta_short, OptionType.PUT, r)
+            short_call_strike = find_strike_by_delta(S, t, iv, self._delta_short, OptionType.CALL, r)
+            expected_move = S * iv * (dte / 365.0) ** 0.5
+            wing = max(self._wing_k * expected_move * 0.5, self._wing_floor_dollars)
+            long_call_strike = short_call_strike + wing
+            short_put_price = black_scholes_price(S, short_put_strike, t, r,
+                self._get_leg_iv(iv, short_put_strike, S, OptionType.PUT), OptionType.PUT)
+            short_call_price = black_scholes_price(S, short_call_strike, t, r,
+                self._get_leg_iv(iv, short_call_strike, S, OptionType.CALL), OptionType.CALL)
+            long_call_price = black_scholes_price(S, long_call_strike, t, r,
+                self._get_leg_iv(iv, long_call_strike, S, OptionType.CALL), OptionType.CALL)
+            net_credit = short_put_price + short_call_price - long_call_price
+            if net_credit <= 0:
+                return None
+            half_spread = self._options_half_spread(iv, dte)
+            avg_mid = (short_put_price + short_call_price + long_call_price) / 3
+            net_credit = max(0.0, net_credit - 3 * half_spread * avg_mid)
+            if net_credit <= 0:
+                return None
+            margin_per_contract = S * 0.20 * 100
+            if capital < margin_per_contract:
+                return None
+            contracts = int(capital * self._position_size_pct / margin_per_contract)
+            if contracts < 1:
+                return None
+            return {
+                "symbol": "SIM", "strategy": "jade_lizard",
+                "direction": SignalDirection.NEUTRAL.value, "trade_type": "credit",
+                "entry_date": str(today_date), "entry_price": round(net_credit, 4),
+                "contracts": contracts, "n_legs": 3,
+                "short_put_strike": round(short_put_strike, 0),
+                "short_call_strike": round(short_call_strike, 0),
+                "long_call_strike": round(long_call_strike, 0),
+                "strike": round(S, 0), "option_type": "jade_lizard",
+                "entry_iv": round(iv, 4), "underlying_at_entry": round(S, 2),
+                "max_loss_per_share": round(max(short_put_strike - net_credit,
+                                                wing - net_credit), 4),
                 "expiry_date": str(today_date + timedelta(days=dte)),
                 "high_water_mark": 0.0,
             }
@@ -1513,7 +1656,7 @@ class Backtester:
 
         strategy = pos["strategy"]
 
-        if strategy == "iron_condor":
+        if strategy in ("iron_condor", "iron_butterfly"):
             sc = black_scholes_price(underlying, pos["short_call_strike"], t, r,
                 self._get_leg_iv(iv, pos["short_call_strike"], underlying, OptionType.CALL), OptionType.CALL)
             sp = black_scholes_price(underlying, pos["short_put_strike"], t, r,
@@ -1530,6 +1673,22 @@ class Backtester:
             lp = black_scholes_price(underlying, pos["long_put_strike"], t, r,
                 self._get_leg_iv(iv, pos["long_put_strike"], underlying, OptionType.PUT), OptionType.PUT)
             return sp - lp
+
+        elif strategy == "call_credit_spread":
+            sc = black_scholes_price(underlying, pos["short_call_strike"], t, r,
+                self._get_leg_iv(iv, pos["short_call_strike"], underlying, OptionType.CALL), OptionType.CALL)
+            lc = black_scholes_price(underlying, pos["long_call_strike"], t, r,
+                self._get_leg_iv(iv, pos["long_call_strike"], underlying, OptionType.CALL), OptionType.CALL)
+            return sc - lc
+
+        elif strategy == "jade_lizard":
+            sp = black_scholes_price(underlying, pos["short_put_strike"], t, r,
+                self._get_leg_iv(iv, pos["short_put_strike"], underlying, OptionType.PUT), OptionType.PUT)
+            sc = black_scholes_price(underlying, pos["short_call_strike"], t, r,
+                self._get_leg_iv(iv, pos["short_call_strike"], underlying, OptionType.CALL), OptionType.CALL)
+            lc = black_scholes_price(underlying, pos["long_call_strike"], t, r,
+                self._get_leg_iv(iv, pos["long_call_strike"], underlying, OptionType.CALL), OptionType.CALL)
+            return sp + sc - lc
 
         elif strategy in ("bull_call_spread", "bear_put_spread"):
             long_strike = pos["long_strike"]
