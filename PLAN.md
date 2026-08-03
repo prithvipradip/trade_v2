@@ -614,3 +614,11 @@ alone. Models keep training for future studies (meta-labeler at 50 closes still 
 Then: shadow tournament builders (IB + put credit spread, rules already registered).
 Also note: PF 0.86 on n=58 dense windows vs 1.07 on n=39 - simulated IC edge flickers
 around breakeven; the LIVE sample remains the only verdict that counts.
+
+## 2026-08-03 - SHADOW ROUND 2 (PRE-REGISTERED before results)
+Adds: (a) call_credit_spread - promotable under the same rule (PF > 1.2 AND DD <= IC arm,
+n>=30); (b) jade_lizard - BENCHMARK ONLY, permanently non-promotable at current capital
+(naked put side ~ strike-to-zero risk; sized in-engine by strangle margin convention);
+(c) UNCORRELATED UNIVERSE arms - all strategies re-run on XLE/GLD/TLT; a universe earns
+live inclusion ONLY if its IC arm passes the same promotion bar on its own windows.
+Runs chained AFTER shadow round 1 completes (CPU contention). Same harness, k=0.8.
