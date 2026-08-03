@@ -587,3 +587,8 @@ toggle to be wired next session; rule locked now. Also 2026-08-03: straddle FINA
 restatement to broker ledger truth -575.33 (record: 13 closes 6W-7L -$451.94); referee
 0 BREAKS after fill attribution; corrupt meta_label.pkl quarantined (retrain does not
 cover it - regenerate before meta gate ever re-arms).
+ABLATION HARNESS (next session, ~30 min): engine already treats predictor=None/untrained as
+the UNGATED path (walkforward.py:564,575 - gates apply only if is_trained). Wire: add
+WalkForwardConfig.train_window_models: bool = True; skip the per-window train call when
+False; clone wingk_study.py -> ablation_study.py running k=0.8 with flag False (arm A,
+gate-stack-only) vs True (arm B, full-stack); apply the pre-registered rule above.
