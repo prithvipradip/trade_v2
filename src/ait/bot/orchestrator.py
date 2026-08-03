@@ -1286,11 +1286,14 @@ class TradingOrchestrator:
             # trained. (Was nested inside the vol-mag block, so an untrained
             # vol-mag model silently skipped the iron-condor floor — audit
             # 2026-07-07, quick-win under item 1.2.)
-            signals = [
-                s for s in signals
-                if s.strategy_name not in model_overridden
-                or s.confidence >= RANGE_MIN_CONFIDENCE
-            ]
+            if self._settings.ml.entry_gates_enabled:
+                signals = [
+                    s for s in signals
+                    if s.strategy_name not in model_overridden
+                    or s.confidence >= RANGE_MIN_CONFIDENCE
+                ]
+            # else: ABLATION VERDICT 2026-08-03 — the floor vetoed nothing in
+            # 3 identical walk-forward runs; gate stack alone decides entries.
 
             # Neutral-only mode (directional confidence below threshold):
             #  - drop directional strategies — no directional basis to trade;
@@ -1300,7 +1303,8 @@ class TradingOrchestrator:
                 signals = [
                     s for s in signals
                     if s.strategy_name in ("iron_condor", "short_strangle")
-                    and s.strategy_name in model_overridden
+                    and (s.strategy_name in model_overridden
+                         or not self._settings.ml.entry_gates_enabled)
                 ]
                 if signals:
                     log.info("neutral_only_candidates", symbol=symbol,

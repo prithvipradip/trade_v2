@@ -209,3 +209,14 @@ class TestMinors:
             implied_vol=0.3, strategy="long_straddle", underlying_price=300,
             vix=None)  # pre-fix: TypeError on `vix >= 30`
         assert size.contracts >= 1
+
+
+# ABLATION VERDICT 2026-08-03: ML entry gates removed (default OFF)
+class TestMlGatesRemoved:
+    def test_entry_gates_disabled_by_default(self):
+        from ait.config.settings import MLConfig
+        assert MLConfig().entry_gates_enabled is False  # 3 identical runs: gates veto nothing
+
+    def test_flag_can_reenable_for_studies(self):
+        from ait.config.settings import MLConfig
+        assert MLConfig(entry_gates_enabled=True).entry_gates_enabled is True

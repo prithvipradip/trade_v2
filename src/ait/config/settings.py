@@ -175,6 +175,10 @@ class MLConfig(_StrictModel):
     retrain_interval_days: int = Field(default=7, ge=1, le=30)
     lookback_days: int = Field(default=504, ge=60, le=2520)
     min_training_samples: int = Field(default=100, ge=30)
+    # ABLATION VERDICT 2026-08-03 (3 identical runs, rule pre-registered):
+    # ML entry gates veto nothing. Default OFF; the entry path runs on the
+    # strategy gate stack alone. Models still train for future studies.
+    entry_gates_enabled: bool = False
     range_min_confidence: float = Field(default=0.65, ge=0.50, le=0.90,
         description="Floor for model-overridden signal confidence (range/"
                     "vol-mag). 0.65 beat 0.55 across every backtest metric. "
