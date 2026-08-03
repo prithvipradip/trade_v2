@@ -59,6 +59,10 @@ class WalkForwardConfig:
     position_size_pct: float = 0.05
     wing_floor_dollars: float = 2.0   # R6 parity: live iron_condor min wing is $2, not $5
     wing_k: float = 1.0
+    # ML ABLATION (pre-registered PLAN 2026-08-03): False = gate-stack-only
+    # arm — no window models trained, so every predictor gate reads
+    # None/untrained and the engine runs ungated (its designed fallback).
+    train_window_models: bool = True
     iv_floor: float = 0.12
     delta_iv_scale: float = 0.0
     stop_loss_pct: float = 0.35            # Cut losses at 35% (options decay fast)
@@ -897,7 +901,7 @@ class WalkForwardBacktester:
             # Previously models were trained after optimization, so Optuna evaluated
             # params against _simple_direction fallback with no range gate — a
             # different signal than what ran in OOS.
-            predictor = self._train_window_model(
+            predictor = None if not self._config.train_window_models                 else self._train_window_model(
                 train_df, symbol, window_id,
                 vix_full=vix_full, spy_full=spy_full,
             )

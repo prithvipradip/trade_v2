@@ -601,3 +601,16 @@ OOS trades, earns a live slot ONLY if PF > 1.2 AND max DD% <= IC's on the same w
 else stays shadow. Implementation notes: backtest engine needs an iron_butterfly builder
 (clone condor path, ATM shorts, same wing logic) and a 2-leg put-spread builder; run after
 the ML ablation completes. No live config change without a passing pre-registered result.
+
+## 2026-08-03 - ML ABLATION VERDICT (rule pre-registered above; CONFIRMED x2)
+gate_only vs full_stack vs full_stack_v2 (raw-logged, ensemble predictions verified
+flowing at 0.8+ conf): ALL IDENTICAL - n=58, win 58.62%, PF 0.86, DD 9.78%, ret -0.73%
+over 25 windows. The ML gates veto NOTHING (confirms R9: caps decided 164/165 live).
+RULE APPLIED: ML fails both criteria -> REMOVE from the entry path. Note: removal is
+behaviorally a NO-OP (proven identical trades) - its value is simplification. EXECUTION
+(next task, fresh session): config-level disable of ensemble-confidence/range/meta entry
+gates, test-pinned, BEFORE the first counted IC close so the sample tests the gate stack
+alone. Models keep training for future studies (meta-labeler at 50 closes still planned).
+Then: shadow tournament builders (IB + put credit spread, rules already registered).
+Also note: PF 0.86 on n=58 dense windows vs 1.07 on n=39 - simulated IC edge flickers
+around breakeven; the LIVE sample remains the only verdict that counts.
