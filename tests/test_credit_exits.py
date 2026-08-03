@@ -182,6 +182,21 @@ async def test_take_profit_fires_with_touch_disabled(monkeypatch):
     assert "take_profit_short" in status.exit_reason
 
 
+async def test_no_trailing_stop_on_credit_structures(monkeypatch):
+    """R6 (2026-07-09, user-approved) + R12-B1 evidence: credit structures
+    get NO breakeven/trailing tiers. Pre-R6, a condor that peaked +32% and
+    pulled back to +5% was trail-stopped (hwm .32 >= trigger .30 -> stop
+    .07 > pnl .05); the SPY IC scratched at +$5.80 that way. Post-R6 it
+    must HOLD for the 50% TP. Pins the decision against regression."""
+    monkeypatch.setenv("AIT_CREDIT_TOUCH_STOP", "1")
+    monkeypatch.delenv("AIT_CREDIT_LOSS_LIMIT", raising=False)
+    mgr = _manager(spot=100.0, unrealized=5.0)   # +5% of credit, inside strikes
+    mgr._state.get_high_water_mark.return_value = 0.32  # peaked above trigger
+    status = await mgr._evaluate_position(_condor(dte=20))
+    assert status is not None
+    assert not status.should_exit  # pre-R6 behavior: trailing_stop fired here
+
+
 async def test_touch_disabled_does_not_touch_close(monkeypatch):
     monkeypatch.setenv("AIT_CREDIT_TOUCH_STOP", "0")
     mgr = _manager(spot=97.5, unrealized=-20.0)
