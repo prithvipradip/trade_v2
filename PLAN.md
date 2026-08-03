@@ -592,3 +592,12 @@ the UNGATED path (walkforward.py:564,575 - gates apply only if is_trained). Wire
 WalkForwardConfig.train_window_models: bool = True; skip the per-window train call when
 False; clone wingk_study.py -> ablation_study.py running k=0.8 with flag False (arm A,
 gate-stack-only) vs True (arm B, full-stack); apply the pre-registered rule above.
+
+## 2026-08-03 - SHADOW STRATEGY PIPELINE (user-approved; PRE-REGISTERED before any results)
+Live stays IC-ONLY until its verdict. Candidates compete in SHADOW (walk-forward + optional
+live signal logging, zero orders): (1) iron_butterfly (low-IV complement), (2) vertical put
+credit spread (2-leg cost profile). RULE per candidate: same harness as wing_k study, >=30
+OOS trades, earns a live slot ONLY if PF > 1.2 AND max DD% <= IC's on the same windows;
+else stays shadow. Implementation notes: backtest engine needs an iron_butterfly builder
+(clone condor path, ATM shorts, same wing logic) and a 2-leg put-spread builder; run after
+the ML ablation completes. No live config change without a passing pre-registered result.
