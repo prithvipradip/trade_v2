@@ -484,7 +484,14 @@ def run_backtest():
         result = subprocess.run(
             [
                 sys.executable, str(ROOT / "run_backtest.py"),
-                "--symbols", "SPY", "QQQ", "AAPL", "MSFT", "NVDA",
+                # 2026-08-03: align the weekly HEALTH backtest with what
+                # live actually trades (IC-only, index ETFs, k=0.8) — it was
+                # still testing the retired AAPL/MSFT/NVDA mixed-strategy
+                # universe, so its Sunday signal tracked a phantom strategy.
+                # This is drift TRACKING, not decision-making: params stay
+                # locked by the pre-registered rules regardless of results.
+                "--symbols", "SPY", "QQQ", "IWM",
+                "--strategies", "iron_condor",
                 "--capital", "50000",
             ],
             cwd=str(ROOT),
