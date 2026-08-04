@@ -211,6 +211,29 @@ class TestMinors:
         assert size.contracts >= 1
 
 
+# PLAN 2026-08-03 (user-approved): pre-event credit blackout 4 -> 1 day.
+# The <=4 window blacked out ~half of trading days (NFP+CPI+PCE lead-outs)
+# and refused the richest pre-event premium; holds span events regardless.
+class TestPreEventBlackoutRelaxed:
+    def test_default_is_one_day(self):
+        from ait.config.settings import RiskConfig
+        assert RiskConfig().pre_event_blackout_days == 1
+
+    def test_engine_parity_uses_config_default(self):
+        # the backtest gate must read the SAME default (no drifting constant)
+        import inspect
+        from ait.backtesting import engine
+        src = inspect.getsource(engine)
+        assert "pre_event_blackout_days" in src
+        assert "_d2e <= 4" not in src
+
+    def test_two_days_out_no_longer_blocked(self):
+        from ait.config.settings import RiskConfig
+        blackout = RiskConfig().pre_event_blackout_days
+        for d2e, expect_block in [(0, True), (1, True), (2, False), (4, False)]:
+            assert (d2e <= blackout) is expect_block
+
+
 # ABLATION VERDICT 2026-08-03: ML entry gates removed (default OFF)
 class TestMlGatesRemoved:
     def test_entry_gates_disabled_by_default(self):

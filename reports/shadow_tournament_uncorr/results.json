@@ -1,0 +1,56 @@
+[
+ {
+  "arm": "iron_condor",
+  "n": 37,
+  "win_rate": 59.46,
+  "pf": 0.58,
+  "max_dd_pct": 15.08,
+  "total_ret_pct": -3.49,
+  "windows": 17
+ },
+ {
+  "arm": "iron_butterfly",
+  "n": 58,
+  "win_rate": 32.76,
+  "pf": 0.35,
+  "max_dd_pct": 34.31,
+  "total_ret_pct": -10.57,
+  "windows": 25
+ },
+ {
+  "arm": "put_credit_spread",
+  "n": 0,
+  "win_rate": 0.0,
+  "pf": 0.0,
+  "max_dd_pct": 0.0,
+  "total_ret_pct": 0.0,
+  "windows": 0
+ },
+ {
+  "arm": "call_credit_spread",
+  "n": 0,
+  "win_rate": 0.0,
+  "pf": 0.0,
+  "max_dd_pct": 0.0,
+  "total_ret_pct": 0.0,
+  "windows": 0
+ },
+ {
+  "arm": "jade_lizard",
+  "n": 0,
+  "win_rate": 0.0,
+  "pf": 0.0,
+  "max_dd_pct": 0.0,
+  "total_ret_pct": 0.0,
+  "windows": 0
+ },
+ {
+  "arm": "short_strangle",
+  "n": 65,
+  "win_rate": 70.77,
+  "pf": 0.77,
+  "max_dd_pct": 6.47,
+  "total_ret_pct": -0.76,
+  "windows": 25
+ }
+]

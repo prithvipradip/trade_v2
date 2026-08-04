@@ -396,23 +396,24 @@ class Backtester:
                 log.debug("earnings_skip", date=str(today_date), strategy=strategy)
                 continue
 
-            # Macro-event entry gate (R6 parity, live orchestrator._should_skip
-            # credit block): don't OPEN credit structures <=4 days before a
-            # FOMC/CPI/NFP/GDP/PCE release — the live macro flatten would
-            # force-close them within days, paying full round-trip costs for
-            # 1-2 days of theta. LIMITATION: the calendar is hardcoded for
-            # 2026 only, so for pre-2026 windows days-to-event is always > 4
-            # and the gate never fires (documented in the parity manifest).
+            # Macro-event entry gate (live orchestrator credit-block parity).
+            # PLAN 2026-08-03 (user-approved): window 4 -> RiskConfig default
+            # (1). Parity is with the CONFIG DEFAULT, not a yaml override.
+            # LIMITATION: the calendar is hardcoded for 2026 only, so for
+            # pre-2026 windows days-to-event is always > window and the gate
+            # never fires (documented in the parity manifest).
             if self._economic_cal is not None and strategy in CREDIT_STRATEGIES:
+                from ait.config.settings import RiskConfig as _RC
+                _blackout = _RC().pre_event_blackout_days
                 try:
                     _d2e = self._economic_cal.days_until_next_event(today_date)
                 except Exception:  # noqa: BLE001
                     _d2e = None
                 _entry_decision["macro_gate"] = {
                     "days_to_event": _d2e,
-                    "blocked": _d2e is not None and _d2e <= 4,
+                    "blocked": _d2e is not None and _d2e <= _blackout,
                 }
-                if _d2e is not None and _d2e <= 4:
+                if _d2e is not None and _d2e <= _blackout:
                     log.debug(
                         "macro_event_entry_skip",
                         date=str(today_date),

@@ -1,0 +1,199 @@
+{
+  "window": 10,
+  "test_start": "2023-10-17",
+  "test_end": "2023-12-19",
+  "pnl": -6249.73,
+  "return_pct": -2.0832,
+  "trades": 2,
+  "win_rate": 0.0,
+  "sharpe": -7.1289,
+  "max_drawdown": 2.0832,
+  "strategies": {
+    "iron_butterfly": 2
+  },
+  "best_params": {},
+  "trades_detail": [
+    {
+      "symbol": "TLT",
+      "strategy": "iron_butterfly",
+      "entry_date": "2023-10-27",
+      "entry_time": "2023-10-27",
+      "exit_date": "2023-11-13",
+      "exit_time": "2023-11-13",
+      "exit_reason": "expiry_approaching",
+      "pnl": -1688.66,
+      "entry_confidence": 0.3026,
+      "entry_regime": "high_volatility",
+      "contracts": 20,
+      "n_legs": 4,
+      "hold_days": 17,
+      "entry_price": 3.0672,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 3.8595,
+      "entry_iv_rank": 0.9989,
+      "entry_vix_level": 0.5,
+      "credit": 6134.4,
+      "max_loss": 3865.6,
+      "return_pct": -0.4368,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 84.0,
+          "premium": 1.687
+        },
+        {
+          "type": "long_put",
+          "strike": 79.0,
+          "premium": -0.1534
+        },
+        {
+          "type": "short_call",
+          "strike": 84.0,
+          "premium": 1.687
+        },
+        {
+          "type": "long_call",
+          "strike": 89.0,
+          "premium": -0.1534
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.3026,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.2487,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.3072,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "high_volatility",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 805,
+          "blocked": false
+        },
+        "regime_class": "high_volatility",
+        "iv_rank_rise_10d": -0.0011
+      },
+      "features_at_entry": {
+        "rsi_14": 45.65,
+        "macd_hist": 0.00215,
+        "bb_position": 0.321,
+        "atr_pct": 0.0203,
+        "realized_vol_20": 0.2462,
+        "iv_rank": 0.999,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.578
+      }
+    },
+    {
+      "symbol": "TLT",
+      "strategy": "iron_butterfly",
+      "entry_date": "2023-11-30",
+      "entry_time": "2023-11-30",
+      "exit_date": "2023-12-18",
+      "exit_time": "2023-12-18",
+      "exit_reason": "expiry_approaching",
+      "pnl": -4561.07,
+      "entry_confidence": 0.3611,
+      "entry_regime": "trending_up",
+      "contracts": 19,
+      "n_legs": 4,
+      "hold_days": 18,
+      "entry_price": 2.9609,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 5.3095,
+      "entry_iv_rank": 0.5566,
+      "entry_vix_level": 0.5,
+      "credit": 5625.71,
+      "max_loss": 3874.29,
+      "return_pct": -1.1773,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 92.0,
+          "premium": 1.6285
+        },
+        {
+          "type": "long_put",
+          "strike": 87.0,
+          "premium": -0.148
+        },
+        {
+          "type": "short_call",
+          "strike": 92.0,
+          "premium": 1.6285
+        },
+        {
+          "type": "long_call",
+          "strike": 97.0,
+          "premium": -0.148
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.3611,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.1517,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.2522,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "trending_up",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 771,
+          "blocked": false
+        },
+        "regime_class": "trending_up",
+        "iv_rank_rise_10d": -0.2826
+      },
+      "features_at_entry": {
+        "rsi_14": 67.9,
+        "macd_hist": 0.00359,
+        "bb_position": 0.809,
+        "atr_pct": 0.0133,
+        "realized_vol_20": 0.2026,
+        "iv_rank": 0.557,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.666
+      }
+    }
+  ],
+  "model_weights": {
+    "range_predictor": {
+      "status": "training_returned_no_accuracy",
+      "threshold_pct": 0.0678
+    }
+  }
+}

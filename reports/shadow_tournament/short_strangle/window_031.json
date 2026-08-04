@@ -1,0 +1,157 @@
+{
+  "window": 31,
+  "test_start": "2026-03-17",
+  "test_end": "2026-05-19",
+  "pnl": 21.99,
+  "return_pct": 0.0073,
+  "trades": 2,
+  "win_rate": 0.5,
+  "sharpe": 0.3687,
+  "max_drawdown": 0.0359,
+  "strategies": {
+    "short_strangle": 2
+  },
+  "best_params": {},
+  "trades_detail": [
+    {
+      "symbol": "IWM",
+      "strategy": "short_strangle",
+      "entry_date": "2026-04-20",
+      "entry_time": "2026-04-20",
+      "exit_date": "2026-04-27",
+      "exit_time": "2026-04-27",
+      "exit_reason": "take_profit_short",
+      "pnl": 129.8,
+      "entry_confidence": 0.1463,
+      "entry_regime": "range_bound",
+      "contracts": 1,
+      "n_legs": 2,
+      "hold_days": 7,
+      "entry_price": 3.2624,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 1.9384,
+      "entry_iv_rank": 0.6795,
+      "entry_vix_level": 0.4718,
+      "credit": null,
+      "max_loss": null,
+      "return_pct": null,
+      "legs": [],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.1463,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.1619,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.609,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 9,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": -0.2851
+      },
+      "features_at_entry": {
+        "rsi_14": 98.31,
+        "macd_hist": 0.01041,
+        "bb_position": 0.957,
+        "atr_pct": 0.0177,
+        "realized_vol_20": 0.2197,
+        "iv_rank": 0.679,
+        "vix_level": 0.47,
+        "hurst_wavelet": 0.562
+      }
+    },
+    {
+      "symbol": "IWM",
+      "strategy": "short_strangle",
+      "entry_date": "2026-05-13",
+      "entry_time": "2026-05-13",
+      "exit_date": "2026-05-19",
+      "exit_time": "2026-05-19",
+      "exit_reason": "backtest_end",
+      "pnl": -107.81,
+      "entry_confidence": 0.2484,
+      "entry_regime": "range_bound",
+      "contracts": 1,
+      "n_legs": 2,
+      "hold_days": 6,
+      "entry_price": 3.3284,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 4.3805,
+      "entry_iv_rank": 0.3445,
+      "entry_vix_level": 0.4468,
+      "credit": null,
+      "max_loss": null,
+      "return_pct": null,
+      "legs": [],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.2484,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.1893,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.4368,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 16,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": 0.0861
+      },
+      "features_at_entry": {
+        "rsi_14": 60.31,
+        "macd_hist": -0.00068,
+        "bb_position": 0.727,
+        "atr_pct": 0.0153,
+        "realized_vol_20": 0.1695,
+        "iv_rank": 0.344,
+        "vix_level": 0.45,
+        "hurst_wavelet": 0.726
+      }
+    }
+  ],
+  "model_weights": {
+    "range_predictor": {
+      "status": "training_returned_no_accuracy",
+      "threshold_pct": 0.0661
+    }
+  }
+}

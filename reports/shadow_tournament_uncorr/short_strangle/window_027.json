@@ -1,0 +1,90 @@
+{
+  "window": 27,
+  "test_start": "2025-09-30",
+  "test_end": "2025-12-02",
+  "pnl": 81.37,
+  "return_pct": 0.0271,
+  "trades": 1,
+  "win_rate": 1.0,
+  "sharpe": 0.0,
+  "max_drawdown": 0.0,
+  "strategies": {
+    "short_strangle": 1
+  },
+  "best_params": {},
+  "trades_detail": [
+    {
+      "symbol": "GLD",
+      "strategy": "short_strangle",
+      "entry_date": "2025-11-28",
+      "entry_time": "2025-11-28",
+      "exit_date": "2025-12-02",
+      "exit_time": "2025-12-02",
+      "exit_reason": "backtest_end",
+      "pnl": 81.37,
+      "entry_confidence": 0.1663,
+      "entry_regime": "range_bound",
+      "contracts": 1,
+      "n_legs": 2,
+      "hold_days": 4,
+      "entry_price": 4.3208,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 3.4811,
+      "entry_iv_rank": 0.2921,
+      "entry_vix_level": 0.4088,
+      "credit": null,
+      "max_loss": null,
+      "return_pct": null,
+      "legs": [],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.1663,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.1645,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.6203,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 42,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": -0.6094
+      },
+      "features_at_entry": {
+        "rsi_14": 69.62,
+        "macd_hist": 0.00122,
+        "bb_position": 0.945,
+        "atr_pct": 0.0163,
+        "realized_vol_20": 0.1805,
+        "iv_rank": 0.292,
+        "vix_level": 0.41,
+        "hurst_wavelet": 0.782
+      }
+    }
+  ],
+  "model_weights": {
+    "range_predictor": {
+      "status": "training_returned_no_accuracy",
+      "threshold_pct": 0.039
+    }
+  }
+}

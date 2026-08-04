@@ -1,0 +1,38 @@
+============================================================
+  WALK-FORWARD BACKTEST RESULTS
+============================================================
+  Windows:           5
+  Total Trades:      7
+  Total Return:      0.55%
+  Cash-Drag Adj Ret: 14.61%  (idle cash @ 5%)
+------------------------------------------------------------
+  RISK-ADJUSTED
+  Sharpe Ratio:      3.62
+  Sortino Ratio:     inf  (downside-only vol)
+  Max Drawdown:      0.00%
+------------------------------------------------------------
+  TRADE QUALITY
+  Win Rate:          100.00%
+  Avg Win:           $236.89
+  Avg Loss:          $0.00
+  Win/Loss Ratio:    inf  (>1 = winners bigger)
+  Expectancy/Trade:  $236.89
+  Best Trade:        $323.69
+  Worst Trade:       $1.50
+  Profit Factor:     inf
+------------------------------------------------------------
+  CAPITAL EFFICIENCY
+  Utilization:       0.2%  (avg % deployed)
+  RAROC:             264.9%  (return on deployed)
+------------------------------------------------------------
+  CONSISTENCY
+  Profitable Windows:100%
+  Avg Window Return: 0.11%
+------------------------------------------------------------
+  STRATEGY BREAKDOWN:
+    call_credit_spread        | trades=  7 | win=100% | pnl=$1,658
+  SYMBOL BREAKDOWN:
+    IWM      | return=1.05% | trades=  5 | sharpe=9.13
+    SPY      | return=0.32% | trades=  1 | sharpe=0.00
+    QQQ      | return=0.29% | trades=  1 | sharpe=0.00
+============================================================

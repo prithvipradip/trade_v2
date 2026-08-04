@@ -61,6 +61,12 @@ class RiskConfig(_StrictModel):
     pause_minutes_after_losses: int = Field(default=30, ge=5, le=120)
     max_api_failures: int = Field(default=5, ge=2, le=20)
     min_confidence: float = Field(default=0.65, ge=0.50, le=0.95)
+    pre_event_blackout_days: int = Field(default=1, ge=0, le=7,
+        description="Block NEW credit entries within N calendar days of a "
+                    "macro event (NFP/CPI/PCE). PLAN 2026-08-03: relaxed 4->1 "
+                    "(user-approved) - the <=4 window blacked out ~half of all "
+                    "trading days and refused the richest premium; every 14-30 "
+                    "DTE hold spans events regardless, wings cap the surprise.")
     max_position_risk_pct: float = Field(default=0.03, ge=0.005, le=0.10,
         description="Per-trade max_loss cap as a fraction of NLV (was "
                     "hardcoded 0.03 in manager.py â€” audit item 3.3).")

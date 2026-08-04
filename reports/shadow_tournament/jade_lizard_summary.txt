@@ -1,0 +1,36 @@
+============================================================
+  WALK-FORWARD BACKTEST RESULTS
+============================================================
+  Windows:           3
+  Total Trades:      5
+  Total Return:      -0.01%
+  Cash-Drag Adj Ret: 2.00%  (idle cash @ 5%)
+------------------------------------------------------------
+  RISK-ADJUSTED
+  Sharpe Ratio:      -0.53
+  Sortino Ratio:     -1.39  (downside-only vol)
+  Max Drawdown:      0.18%
+------------------------------------------------------------
+  TRADE QUALITY
+  Win Rate:          40.00%
+  Avg Win:           $72.48
+  Avg Loss:          $61.52
+  Win/Loss Ratio:    1.18  (>1 = winners bigger)
+  Expectancy/Trade:  $-7.92
+  Best Trade:        $76.11
+  Worst Trade:       $-94.02
+  Profit Factor:     0.79
+------------------------------------------------------------
+  CAPITAL EFFICIENCY
+  Utilization:       0.0%  (avg % deployed)
+  RAROC:             -62.0%  (return on deployed)
+------------------------------------------------------------
+  CONSISTENCY
+  Profitable Windows:67%
+  Avg Window Return: -0.00%
+------------------------------------------------------------
+  STRATEGY BREAKDOWN:
+    jade_lizard               | trades=  5 | win=40% | pnl=$-40
+  SYMBOL BREAKDOWN:
+    IWM      | return=-0.04% | trades=  5 | sharpe=-0.53
+============================================================

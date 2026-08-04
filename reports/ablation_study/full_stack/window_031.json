@@ -1,0 +1,111 @@
+{
+  "window": 31,
+  "test_start": "2026-03-17",
+  "test_end": "2026-05-19",
+  "pnl": 658.07,
+  "return_pct": 0.2194,
+  "trades": 1,
+  "win_rate": 1.0,
+  "sharpe": 0.0,
+  "max_drawdown": 0.0,
+  "strategies": {
+    "iron_condor": 1
+  },
+  "best_params": {},
+  "trades_detail": [
+    {
+      "symbol": "IWM",
+      "strategy": "iron_condor",
+      "entry_date": "2026-03-19",
+      "entry_time": "2026-03-19",
+      "exit_date": "2026-03-31",
+      "exit_time": "2026-03-31",
+      "exit_reason": "take_profit_short",
+      "pnl": 658.07,
+      "entry_confidence": 0.5184,
+      "entry_regime": "high_volatility",
+      "contracts": 4,
+      "n_legs": 4,
+      "hold_days": 12,
+      "entry_price": 2.9217,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 1.2245,
+      "entry_iv_rank": 0.7079,
+      "entry_vix_level": 0.6015,
+      "credit": 1168.68,
+      "max_loss": 4189.4,
+      "return_pct": 0.1571,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 235.0,
+          "premium": 1.6069
+        },
+        {
+          "type": "long_put",
+          "strike": 222.0,
+          "premium": -0.1461
+        },
+        {
+          "type": "short_call",
+          "strike": 263.0,
+          "premium": 1.6069
+        },
+        {
+          "type": "long_call",
+          "strike": 276.0,
+          "premium": -0.1461
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.5184,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.2235,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.5832,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "high_volatility",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 8,
+          "blocked": false
+        },
+        "regime_class": "high_volatility",
+        "iv_rank_rise_10d": -0.1421
+      },
+      "features_at_entry": {
+        "rsi_14": 30.55,
+        "macd_hist": -0.00586,
+        "bb_position": 0.131,
+        "atr_pct": 0.0252,
+        "realized_vol_20": 0.198,
+        "iv_rank": 0.708,
+        "vix_level": 0.6,
+        "hurst_wavelet": 0.771
+      }
+    }
+  ],
+  "model_weights": {
+    "range_predictor": {
+      "status": "training_returned_no_accuracy",
+      "threshold_pct": 0.0661
+    }
+  }
+}

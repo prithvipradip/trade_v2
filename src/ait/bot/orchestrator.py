@@ -1620,10 +1620,13 @@ class TradingOrchestrator:
             from ait.strategies.base import CREDIT_STRATEGIES as _CS6
             if signal.strategy_name in _CS6 and self._economic_cal:
                 _d2e = self._economic_cal.days_until_next_event()
-                # 4 not 3: calendar-day counting means a Friday entry
-                # before a Tuesday event reads d2e=4 yet still gets
-                # flattened Monday after one session of theta.
-                if _d2e is not None and _d2e <= 4:
+                # PLAN 2026-08-03 (user-approved): 4 -> config, default 1.
+                # The <=4 window blocked ~half of all trading days (NFP+CPI+
+                # PCE lead-outs) and refused exactly the elevated pre-event
+                # premium a seller is paid to take; every 14-30 DTE hold
+                # spans events regardless, and wings cap the surprise.
+                _blackout = self._settings.risk.pre_event_blackout_days
+                if _d2e is not None and _d2e <= _blackout:
                     log.info("credit_entry_skipped_pre_event",
                              symbol=signal.symbol,
                              strategy=signal.strategy_name,

@@ -641,3 +641,16 @@ the whole edge) but does NOT transfer universes and lizard n too small to confir
 Next test of the thesis: BROKEN-WING condor round (defined-risk, cheaper wings).
 LIVE CONFIG UNCHANGED: iron_condor on SPY/QQQ/IWM remains the sole live arm; the
 50-close live sample remains the decider (sim IC estimates now 1.07/0.86/0.97 ~ 1.0).
+
+## 2026-08-03 - PRE-EVENT BLACKOUT 4 -> 1 DAY (user-approved; registered before effect)
+Finding: the <=4-day credit blackout (orchestrator) + monthly NFP/CPI/PCE cadence blacked
+out ~half of all trading days; 2026-08-03 QQQ passed every quality gate (IV rank 83,
+credit/width ok) and was refused solely by d2e=4 (NFP 08-07). Inconsistency: every 14-30
+DTE hold spans >=1 NFP and >=1 CPI anyway - the gate only refused ENTRY at peak pre-event
+premium (the vol-crush trade a seller is paid for). Wings cap any event surprise; the
+1-day window still skips event-eve gamma. CHANGE: RiskConfig.pre_event_blackout_days=1
+(was hardcoded 4), live gate + backtest engine parity, test-pinned
+(TestPreEventBlackoutRelaxed). Effect: first eligible entry day moves 08-13 -> 08-04.
+RISK ACCEPTED: entries now sell into pre-event IV; an event-gap through a short strike
+costs at most the fenced max loss (~$80-170/contract). Sample-attribution unchanged -
+same strategy, same sizing, one gate parameter.

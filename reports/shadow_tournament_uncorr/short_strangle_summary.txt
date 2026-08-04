@@ -1,0 +1,38 @@
+============================================================
+  WALK-FORWARD BACKTEST RESULTS
+============================================================
+  Windows:           25
+  Total Trades:      65
+  Total Return:      -0.76%
+  Cash-Drag Adj Ret: 17.31%  (idle cash @ 5%)
+------------------------------------------------------------
+  RISK-ADJUSTED
+  Sharpe Ratio:      -0.38
+  Sortino Ratio:     -0.34  (downside-only vol)
+  Max Drawdown:      6.47%
+------------------------------------------------------------
+  TRADE QUALITY
+  Win Rate:          70.77%
+  Avg Win:           $159.29
+  Avg Loss:          $504.09
+  Win/Loss Ratio:    0.32  (>1 = winners bigger)
+  Expectancy/Trade:  $-34.62
+  Best Trade:        $329.45
+  Worst Trade:       $-1,567.32
+  Profit Factor:     0.77
+------------------------------------------------------------
+  CAPITAL EFFICIENCY
+  Utilization:       0.2%  (avg % deployed)
+  RAROC:             -396.1%  (return on deployed)
+------------------------------------------------------------
+  CONSISTENCY
+  Profitable Windows:68%
+  Avg Window Return: -0.03%
+------------------------------------------------------------
+  STRATEGY BREAKDOWN:
+    short_strangle            | trades= 65 | win=71% | pnl=$-2,250
+  SYMBOL BREAKDOWN:
+    TLT      | return=1.79% | trades= 14 | sharpe=3.11
+    XLE      | return=-1.10% | trades= 25 | sharpe=-0.28
+    GLD      | return=-2.94% | trades= 26 | sharpe=-0.73
+============================================================

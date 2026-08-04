@@ -1,0 +1,9 @@
+{
+ "arm": "put_credit_spread",
+ "n": 7,
+ "win_rate": 57.14,
+ "pf": 0.57,
+ "max_dd_pct": 1.04,
+ "total_ret_pct": -0.24,
+ "windows": 5
+}

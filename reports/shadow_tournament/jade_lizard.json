@@ -1,0 +1,9 @@
+{
+ "arm": "jade_lizard",
+ "n": 5,
+ "win_rate": 40.0,
+ "pf": 0.79,
+ "max_dd_pct": 0.18,
+ "total_ret_pct": -0.01,
+ "windows": 3
+}
