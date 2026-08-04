@@ -660,3 +660,15 @@ d2e<=1 - with entry now allowed at d2e=2 that meant enter Wed, force-flatten Thu
 theta, full round-trip costs, no crush harvest). iron_condor REMOVED from the flatten
 list (portfolio.py + engine parity, test-pinned): condors hold THROUGH events; wings cap
 the surprise. Undefined-risk unchanged (strangle 5d, CSP/CC 1d).
+
+## 2026-08-04 - SHADOW ROUND 3: WINGS-COST INTERPOLANTS (PRE-REGISTERED before results)
+Thesis under test (from R1: strangle PF 1.30 vs condor 0.97 same windows): the wings we
+buy cost the whole edge; cheaper/farther insurance should recover part of it. Arms, both
+PROMOTABLE under the standard bar (PF > 1.2 AND max DD <= the IC arm's on the SAME run,
+n >= 30): (a) wide_wing_condor - both wings at 2x standard k*EM distance; (b)
+broken_wing_condor - call wing standard, put wing 2x (skew-priced put insurance moved
+out). IC baseline RERUN in the same launch so windows/data are identical. REGISTERED
+DEVIATION: credit floor held ABSOLUTE at the standard-width equivalent (ratio floor
+scaled by std/max width) - otherwise doubled width mechanically halves the ratio and the
+arms never trade (the R1b spread lesson). PREDICTION registered: if the thesis is real,
+PF ordering should be condor < broken_wing <= wide_wing < strangle(1.30).
