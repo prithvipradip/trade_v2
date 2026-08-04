@@ -672,3 +672,25 @@ DEVIATION: credit floor held ABSOLUTE at the standard-width equivalent (ratio fl
 scaled by std/max width) - otherwise doubled width mechanically halves the ratio and the
 arms never trade (the R1b spread lesson). PREDICTION registered: if the thesis is real,
 PF ordering should be condor < broken_wing <= wide_wing < strangle(1.30).
+
+## 2026-08-04 - SHADOW ROUND 3 VERDICT + PROMOTION (rule pre-registered above)
+Same run, same 28 windows, SPY/QQQ/IWM: IC baseline n=90 PF 1.31 DD 8.5% | wide_wing
+n=93 PF 1.51 DD 6.57% | broken_wing n=92 PF 1.48 DD 5.48%. Registered prediction
+CONFIRMED exactly: condor 1.31 < broken 1.48 <= wide 1.51 (< strangle 1.30 no longer
+holds - see baseline note). BASELINE NOTE: IC jumped 0.97 -> 1.31 (DD 18.4 -> 8.5) vs
+round 1 with ONE change between runs - the entry blackout 4 -> 1 day (engine parity of
+the live decision; flatten was already env-off in studies). The 4-day blackout alone
+was costing ~0.34 PF and doubling DD in sim: it removed exactly the rich pre-event
+entries. Sim IC estimates are now 1.07/0.86/0.97/1.31 - the last is the only one under
+the CURRENT live ruleset.
+RULE APPLIED: BOTH candidates pass (PF > 1.2, DD <= 8.5%, n >= 30). PROMOTED:
+wide_wing_condor - higher PF and a config-only live change (AIT_IC_WING_K 0.8 -> 1.6,
+AIT_IC_MIN_CREDIT_WIDTH 0.20 -> 0.10; absolute credit demand per structure unchanged).
+broken_wing stays shadow (needs an asymmetric live builder; revisit if wide-wing live
+closes diverge from sim). WING_K STUDY RECONCILIATION: the 07-29 k=0.8 lock compared k
+under an UNSCALED 0.20 floor, so higher k silently shrank the entry population; round
+3's absolute-credit design separates wing economics from population - the lock is
+SUPERSEDED for the scaled-floor parameterization. EPOCH MARKER: live closes from
+2026-08-04 are the wide-wing epoch (k=1.6, floor 0.10, gates-only, no ML veto, 1-day
+blackout, hold-through-events). The open QQQ condor T-20260804-095630 (entered 09:56,
+$6.44 credit, k=0.8 strikes) is the LAST k=0.8-epoch position.

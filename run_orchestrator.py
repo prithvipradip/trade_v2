@@ -47,10 +47,17 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 # are separable by timestamp once live data starts. Flip back to "1" after
 # funding + resubscribe.
 os.environ.setdefault("AIT_MARKET_DATA_TYPE", "4")
-# 2026-07-29 wing_k study (pre-registered rule): live wings mirror the
-# backtest winner. Narrower wings also raise credit/width, so condors can
-# clear the 0.20 floor at lower IV.
-os.environ.setdefault("AIT_IC_WING_K", "0.8")
+# 2026-08-04 SHADOW ROUND 3 PROMOTION (pre-registered rule, PLAN): the
+# wide_wing_condor arm (wings at 2x the k=0.8 distance) beat the same-run IC
+# baseline PF 1.51 vs 1.31, DD 6.57% vs 8.5%, n=93 — and the broken-wing arm
+# agreed (1.48/5.48%). Both cleared the bar; wide-wing promoted (higher PF,
+# config-only change). k 0.8 -> 1.6 with the ratio floor scaled 0.20 -> 0.10
+# so the ABSOLUTE credit demand per structure is unchanged (the registered
+# deviation — floor scales with width, else doubled width can never pass).
+# The 07-29 wing_k study (k=0.8 winner) conflated wing economics with the
+# entry-population shrink of an UNSCALED floor; round 3 separated them.
+os.environ.setdefault("AIT_IC_WING_K", "1.6")
+os.environ.setdefault("AIT_IC_MIN_CREDIT_WIDTH", "0.10")
 
 # Paper phase keeps short strangles enabled for the edge comparison
 # (PLAN.md go-live gates); the executor refuses undefined-risk orders unless

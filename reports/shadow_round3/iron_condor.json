@@ -1,0 +1,9 @@
+{
+ "arm": "iron_condor",
+ "n": 90,
+ "win_rate": 70.0,
+ "pf": 1.31,
+ "max_dd_pct": 8.5,
+ "total_ret_pct": 3.33,
+ "windows": 28
+}
