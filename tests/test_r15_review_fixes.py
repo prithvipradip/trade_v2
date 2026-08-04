@@ -233,6 +233,22 @@ class TestPreEventBlackoutRelaxed:
         for d2e, expect_block in [(0, True), (1, True), (2, False), (4, False)]:
             assert (d2e <= blackout) is expect_block
 
+    def test_defined_risk_exempt_from_macro_flatten(self):
+        # the paired exit rule: condors HOLD through events (wings cap the
+        # surprise) — else entries at d2e=2 get force-closed at d2e=1 for one
+        # day of theta and full round-trip costs. Undefined-risk keeps it.
+        import inspect
+        from ait.execution import portfolio
+        from ait.backtesting import engine
+        for mod in (portfolio, engine):
+            src = inspect.getsource(mod)
+            i = src.find("AIT_SKIP_MACRO_EVENTS")
+            while i != -1:
+                clause = src[i:i + 400]
+                if "short_strangle" in clause:
+                    assert '"iron_condor"' not in clause
+                i = src.find("AIT_SKIP_MACRO_EVENTS", i + 1)
+
 
 # ABLATION VERDICT 2026-08-03: ML entry gates removed (default OFF)
 class TestMlGatesRemoved:

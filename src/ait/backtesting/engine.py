@@ -1894,13 +1894,16 @@ class Backtester:
             reason = "expiry" if current_date >= expiry else "expiry_approaching"
             return {"exit_date": str(current_date), "exit_reason": reason}
 
-        # 4. Macro-event flatten (portfolio.py rule 3d): defined-risk credit
-        # <=1 day before FOMC/CPI/NFP/GDP/PCE, strangles <=5 days. Live keeps
-        # this behind AIT_SKIP_MACRO_EVENTS=1 (disabled by default for the
-        # data-collection window) — mirrored here for exact parity. 2026-only
-        # calendar: inactive for pre-2026 windows.
+        # 4. Macro-event flatten (portfolio.py rule 3d parity). PLAN
+        # 2026-08-04: defined-risk EXEMPT — condors hold through events
+        # (wings cap the surprise; the vol crush is the payoff). Only
+        # undefined/assignment-risk strategies keep the early exit
+        # (strangles <=5 days, CSP/CC <=1). 2026-only calendar: inactive
+        # for pre-2026 windows.
         if (self._economic_cal is not None
-                and os.environ.get("AIT_SKIP_MACRO_EVENTS", "0") == "1"):
+                and os.environ.get("AIT_SKIP_MACRO_EVENTS", "0") == "1"
+                and pos.get("strategy") in (
+                    "short_strangle", "cash_secured_put", "covered_call")):
             try:
                 _d2e = self._economic_cal.days_until_next_event(current_date)
             except Exception:  # noqa: BLE001

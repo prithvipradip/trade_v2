@@ -654,3 +654,9 @@ premium (the vol-crush trade a seller is paid for). Wings cap any event surprise
 RISK ACCEPTED: entries now sell into pre-event IV; an event-gap through a short strike
 costs at most the fenced max loss (~$80-170/contract). Sample-attribution unchanged -
 same strategy, same sizing, one gate parameter.
+ADDENDUM 2026-08-04 (same decision, exit side): run_orchestrator.py sets
+AIT_SKIP_MACRO_EVENTS=1, so the rule-3d flatten force-closed defined-risk credit at
+d2e<=1 - with entry now allowed at d2e=2 that meant enter Wed, force-flatten Thu (1 day
+theta, full round-trip costs, no crush harvest). iron_condor REMOVED from the flatten
+list (portfolio.py + engine parity, test-pinned): condors hold THROUGH events; wings cap
+the surprise. Undefined-risk unchanged (strangle 5d, CSP/CC 1d).

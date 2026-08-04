@@ -635,10 +635,15 @@ class PortfolioManager:
         # line ~363 (touch-stop env read) raised UnboundLocalError on EVERY
         # credit-position tick — killing the whole exit monitor. Module-level
         # import (line 16) is the only one allowed in this function.
+        # PLAN 2026-08-04: iron_condor REMOVED from the flatten list (paired
+        # with pre_event_blackout_days 4->1). Defined-risk holds THROUGH the
+        # event — the wings cap a surprise, and the post-event vol crush is
+        # the trade's payoff; flattening at d2e<=1 sold the insurance and
+        # refused the premium. Undefined-risk keeps the early exit.
         if (os.environ.get("AIT_SKIP_MACRO_EVENTS", "0") == "1"
                 and not should_exit and self._economic_cal
                 and trade.strategy in (
-                    "iron_condor", "short_strangle",
+                    "short_strangle",
                     "cash_secured_put", "covered_call",
                 )):
             try:
