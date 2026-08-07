@@ -185,8 +185,19 @@ def main():
             "FROM trades WHERE status='closed' AND exit_time LIKE ?||'%' "
             + " ".join(f"AND COALESCE(exit_reason_detailed,'') NOT LIKE '{p}'"
                        for p in NOT_REAL), (d,)).fetchone()
-        cur.execute("UPDATE daily_stats SET total_pnl=?, trades_won=?, trades_lost=? "
-                    "WHERE date=?", (row["p"], row["w"], row["l"], d))
+        # R16: bare UPDATE silently no-ops when the date row doesn't exist —
+        # that's how the 07-22 straddle loss vanished from cumulative daily
+        # P&L. INSERT OR REPLACE like state.update_daily_stats does.
+        cur.execute(
+            "INSERT OR REPLACE INTO daily_stats (date, trades_taken, "
+            "trades_won, trades_lost, total_pnl, max_drawdown, "
+            "day_trades_count, circuit_breaker_triggered) VALUES (?, "
+            "COALESCE((SELECT trades_taken FROM daily_stats WHERE date=?),0), "
+            "?, ?, ?, "
+            "COALESCE((SELECT max_drawdown FROM daily_stats WHERE date=?),0), "
+            "COALESCE((SELECT day_trades_count FROM daily_stats WHERE date=?),0), "
+            "COALESCE((SELECT circuit_breaker_triggered FROM daily_stats WHERE date=?),0))",
+            (d, d, row["w"], row["l"], row["p"], d, d, d))
         print(f"daily_stats[{d}] recomputed: pnl={row['p']:+.2f} W{row['w']}/L{row['l']}")
     cur.execute(
         "INSERT OR REPLACE INTO bot_state (key, value, updated_at) VALUES (?,?,?)",

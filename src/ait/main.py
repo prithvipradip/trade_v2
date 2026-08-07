@@ -22,6 +22,15 @@ import signal
 import sys
 from pathlib import Path
 
+# R16: apply the shared runtime env contract BEFORE any trading subsystem
+# import. A bare `python -m ait.main` used to run with macro protections
+# OFF, k=1.0 wings, the 0.20 floor, and the undefined-risk gate open —
+# silently different economics from the supervised launch path.
+# runtime_env is import-light; the KMP/OMP crash guards land before numpy.
+from ait.config.runtime_env import apply_runtime_env_defaults
+
+apply_runtime_env_defaults()
+
 # Dump the Python stack on a native crash (segfault / access violation) to
 # stderr -> bot_stdout.log. The bot was dying every 30-60 min to a c0000005
 # access violation in a C-extension (2026-06-24); this names the exact call

@@ -17,7 +17,13 @@ set PY="C:\Users\prith\AppData\Local\Programs\Python\Python313\python.exe"
 REM Is an orchestrator process alive?
 REM A11 (deep-audit): wmic is deprecated/removed on newer Windows -- its
 REM disappearance would have silently broken the keeper AND the dup-guard.
-powershell -NoProfile -Command "if (Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -match 'run_orchestrator' }) { exit 0 } else { exit 1 }"
+REM R16 #10: also match 'ait.main' -- a bot child orphaned by a master-only
+REM death did NOT match 'run_orchestrator', so the keeper relaunched a full
+REM second stack on top of it = TWO trading bots on the same account. If
+REM either process exists, do not launch; BotManager refuses alongside an
+REM orphan bot and alerts, so the operator resolves it instead of a blind
+REM double-spawn.
+powershell -NoProfile -Command "if (Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -match 'run_orchestrator|ait\.main' }) { exit 0 } else { exit 1 }"
 if errorlevel 1 (
     echo [keeper] %date% %time% orchestrator DOWN - relaunching >> logs\keeper.log
     start "" /min %PY% run_orchestrator.py

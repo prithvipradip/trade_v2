@@ -23,7 +23,11 @@ trading:
 
 account:
   pdt_protection: true                 # Enable Pattern Day Trader guard
-  pdt_account_under_25k: true          # Set false if account >= $25k
+  pdt_account_under_25k: false         # R16: this paper account is $198k — PDT
+                                       # is legally inapplicable >= $25k, and the
+                                       # guard was able to VETO same-day stop-loss
+                                       # exits ("riding unprotected"). RE-FLIP TO
+                                       # true at go-live if the real account < $25k.
 
 positions:
   max_open_positions: 10               # R6 (user-approved): 423 of 500 logged entry
@@ -101,12 +105,13 @@ backtest:
   wing_floor_dollars: 5.0             # Hard minimum spread width in dollars (safety floor only)
                                        # Wing sizing is now primarily driven by wing_k × expected_move
                                        # Lower to 0.5 for sub-$10 stocks (e.g. SOFI)
-  # 2026-07-29 wing_k STUDY DECISION (rule pre-registered in PLAN before
-  # results): k=0.8 — 21 windows / 39 OOS trades / PF 1.07 / win 56.4% /
-  # DD 5.13% vs k=1.0's PF 0.84 (25 trades, negative return). Locked for
-  # live + backtest together. Caveats recorded in PLAN (window overlap
-  # ~1.5x -> effective n ~26; OOS PF barely >1 - edge evidence is THIN).
-  wing_k: 0.8
+  # 2026-08-04 SHADOW R3 PROMOTION supersedes the 07-29 k=0.8 lock (that
+  # study compared k under an UNSCALED ratio floor — population artifact,
+  # see PLAN). LIVE runs k=1.6 with ratio floor 0.10 via env in
+  # run_orchestrator.py (AIT_IC_WING_K / AIT_IC_MIN_CREDIT_WIDTH — the
+  # authority for live). This yaml value feeds backtest/integration paths;
+  # R16: aligned to the promoted live value.
+  wing_k: 1.6
                                        # Optuna optimizes per walk-forward window [0.3 – 2.0]
                                        # 0.5 = half-sigma (tight), 1.0 = 1-sigma, 2.0 = 2-sigma (wide)
   iv_floor: 0.20                      # Min synthetic IV for option pricing

@@ -73,6 +73,7 @@ class CorrelationGuard:
         correlated = [
             existing for existing in open_symbols
             if existing == new_symbol
+            or self._same_sector_cluster(new_symbol, existing)
             or ((c := self._get_correlation(new_symbol, existing)) is not None
                 and c > self._max_corr)  # signed (deep-audit SR-L13): negative corr = hedge, must not count toward the cluster cap
         ]
@@ -101,6 +102,18 @@ class CorrelationGuard:
                     corr = self._get_correlation(s1, s2)
                     matrix[s1][s2] = corr if corr is not None else 0.0
         return matrix
+
+    @staticmethod
+    def _same_sector_cluster(sym1: str, sym2: str) -> bool:
+        """R16: cluster membership is SET-based for known sector groups.
+
+        The measured 60-day correlation for SPY/QQQ vs IWM sits at 0.76-0.78 —
+        a routine 0.01-0.03 small-cap divergence drops it under the 0.75
+        strict threshold and admits a THIRD index short-vol condor while at
+        the 2-position cluster cap. Two index ETFs are the same macro bet
+        regardless of a marginal correlation print; membership in the same
+        SECTOR_GROUPS set always counts toward the cluster."""
+        return any(sym1 in g and sym2 in g for g in SECTOR_GROUPS.values())
 
     def _get_correlation(self, sym1: str, sym2: str) -> float | None:
         """Get correlation between two symbols."""

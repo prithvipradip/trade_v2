@@ -465,6 +465,48 @@ class PositionReconciler:
                 return order_id
         return None
 
+    def _cancel_working_entry_order(self, trade) -> bool:
+        """R16: cancel a still-WORKING broker order for a stale PENDING trade.
+
+        Returns True when a matching open order was found (cancel requested —
+        the caller must NOT book "never filled" this cycle; the next sweep
+        sees either the cancel or a late fill). Uses the in-session
+        openTrades cache: same-clientId orders only, which is exactly the
+        population the sweep can own.
+        """
+        try:
+            ib = getattr(self._ibkr, "ib", None)
+            try:
+                open_trades = list(ib.openTrades()) if ib is not None else []
+            except TypeError:
+                # Not a real ib_insync view (older fake/mock): no readable
+                # order book = no visible working order — pre-R16 behavior.
+                # The live_keys gate upstream still guards genuinely-filled
+                # orders from fiction.
+                return False
+            keys = self._trade_leg_keys(trade)
+            _TERMINAL = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
+            for bt in open_trades:
+                # Belt-and-braces: only genuinely ACTIVE orders count as
+                # working (some fakes/caches keep terminal trades in the view).
+                _st = getattr(getattr(bt, "orderStatus", None), "status", "")
+                if _st in _TERMINAL:
+                    continue
+                c = bt.contract
+                sym = getattr(c, "symbol", "")
+                if sym != trade.symbol:
+                    continue
+                sec = getattr(c, "secType", "")
+                if sec == "BAG" or (sec == "OPT" and keys and any(
+                        str(getattr(c, "strike", "")) in k for k in keys)):
+                    ib.cancelOrder(bt.order)
+                    return True
+        except Exception as e:  # noqa: BLE001 — sweep must survive broker hiccups
+            log.warning("sweep_cancel_check_failed",
+                        trade_id=trade.trade_id, error=str(e))
+            return True  # unknown broker state: defer booking, never fiction
+        return False
+
     def _sweep_stale_pending(self) -> int:
         """Close PENDING trades too old to still be live working orders.
 
@@ -507,9 +549,24 @@ class PositionReconciler:
                                 trade_id=t.trade_id, symbol=t.symbol,
                                 strategy=t.strategy, age_min=int(age_min))
                     continue
+                # R16: a WORKING entry order at the broker means "not filled
+                # YET", not "never filled" — booking $0 while the order rests
+                # lets it fill later as an untracked position. Cancel the
+                # order first; book only once no working order remains.
+                if self._cancel_working_entry_order(t):
+                    log.warning("sweep_cancelled_working_entry_order",
+                                trade_id=t.trade_id, symbol=t.symbol,
+                                note="entry order was still WORKING at the "
+                                     "broker; cancelled — booking deferred "
+                                     "to the next sweep cycle")
+                    continue
+                # R16: CAS narrowed to PENDING — a concurrent promotion to
+                # FILLED (second process / broker-lag race) must always win
+                # over a $0 "never filled" booking.
                 self._state.close_trade(
                     trade_id=t.trade_id, exit_price=0.0, realized_pnl=0.0,
                     exit_reason_detailed="stale_pending_never_filled",
+                    from_statuses=(TradeStatus.PENDING,),
                 )
                 closed += 1
                 log.warning("reconcile_stale_pending_closed",
@@ -780,7 +837,23 @@ class PositionReconciler:
                 for _t, _keys in local_entries:
                     if getattr(_t, "contract_type", "") == "stock":
                         continue
-                    if _t.status in (TradeStatus.FILLED, TradeStatus.PARTIAL):
+                    _bookable = _t.status in (TradeStatus.FILLED, TradeStatus.PARTIAL)
+                    if not _bookable and _t.status == TradeStatus.CLOSING:
+                        # R16: a CLOSING trade whose exit filled while the bot
+                        # was down (or was manually flattened) used to fall
+                        # through this filter and wedge in CLOSING forever —
+                        # counted against dedup/max-position/risk caps on every
+                        # cycle. Book it ONLY when the broker view is available
+                        # AND shows no working exit order (a working order
+                        # means the exit is still in flight: keep + adopt).
+                        _woid = (self._working_exit_order_for(_t, working_orders)
+                                 if working_orders else None)
+                        _bookable = working_orders is not None and _woid is None
+                        if _bookable:
+                            log.warning("reconcile_booking_wedged_closing",
+                                        trade_id=_t.trade_id,
+                                        symbol=_t.symbol)
+                    if _bookable:
                         result.stale_local += 1
                         result.discrepancies.append(
                             f"Local position not in IBKR (fresh-confirmed flat): "

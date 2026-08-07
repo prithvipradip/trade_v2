@@ -23,6 +23,12 @@ from ait.utils.logging import get_logger
 
 log = get_logger("data.options")
 
+# R16: Yahoo serves placeholder impliedVolatility values (~1e-5) off-hours /
+# pre-open, and they passed the old `> 0` filters — atm_iv=1e-5 produced a
+# ~50x error in expected_move and garbage-sigma deltas. Any IV below this
+# floor is non-physical for the traded universe and is treated as MISSING.
+MIN_PHYSICAL_IV = 0.005
+
 
 def _parse_env_override(raw: str | None, cast, default):
     if raw is None:
@@ -104,11 +110,26 @@ def atm_iv(chain: "OptionsChain") -> float:
     """
     spot = chain.underlying_price
     # Per-strike IV: average call+put IV when both quote at a strike.
+    # R16: `c.implied_vol and ...` is also the None guard (ib_insync maps
+    # IB's "not yet computed" sentinels to None); the MIN_PHYSICAL_IV floor
+    # rejects Yahoo's ~1e-5 placeholders so they read as missing, not real.
     by_strike: dict[float, list[float]] = {}
+    dropped_placeholder = 0
     for grp in (chain.calls, chain.puts):
         for c in grp:
-            if c.implied_vol and c.implied_vol > 0:
-                by_strike.setdefault(float(c.strike), []).append(float(c.implied_vol))
+            if not c.implied_vol:
+                continue
+            if c.implied_vol < MIN_PHYSICAL_IV:
+                dropped_placeholder += 1
+                continue
+            by_strike.setdefault(float(c.strike), []).append(float(c.implied_vol))
+    if dropped_placeholder:
+        log.debug(
+            "atm_iv_placeholder_iv_dropped",
+            symbol=chain.symbol,
+            contracts=dropped_placeholder,
+            floor=MIN_PHYSICAL_IV,
+        )
     if not by_strike:
         log.warning("atm_iv_unavailable", symbol=chain.symbol, tag="no_iv_data")
         return 0.0
@@ -192,12 +213,30 @@ class OptionsChain:
 
     def filter_by_delta(self, min_delta: float, max_delta: float) -> OptionsChain:
         """Filter contracts by absolute delta range."""
+        # R16: ib_insync maps IB's "not yet computed" greek sentinels to
+        # None; abs(None) raised TypeError here and aborted the whole
+        # symbol's scan. Skip None-delta contracts instead (debug-logged).
+        dropped_none = sum(
+            1 for grp in (self.calls, self.puts) for c in grp if c.delta is None
+        )
+        if dropped_none:
+            log.debug(
+                "filter_by_delta_none_greeks_dropped",
+                symbol=self.symbol,
+                contracts=dropped_none,
+            )
         return OptionsChain(
             symbol=self.symbol,
             underlying_price=self.underlying_price,
             expiry=self.expiry,
-            calls=[c for c in self.calls if min_delta <= abs(c.delta) <= max_delta],
-            puts=[p for p in self.puts if min_delta <= abs(p.delta) <= max_delta],
+            calls=[
+                c for c in self.calls
+                if c.delta is not None and min_delta <= abs(c.delta) <= max_delta
+            ],
+            puts=[
+                p for p in self.puts
+                if p.delta is not None and min_delta <= abs(p.delta) <= max_delta
+            ],
             # R12-B: carry the FULL chain's vol stats — recomputing from a
             # delta-filtered (OTM-only) subset would bias ATM IV.
             atm_iv=self.atm_iv,
@@ -323,14 +362,32 @@ class OptionsChainService:
             if not chains_data:
                 return []
 
-            # Find SMART exchange chain
+            # Find SMART exchange chain for the STANDARD trading class.
+            # R16: reqSecDefOptParams lists the post-split adjusted class
+            # ('2IWM'/'2SPY'/'2QQQ') FIRST on SMART; taking the first SMART
+            # def served a 1-3 strike garbage mini-chain (IWM had no usable
+            # chain for ~3 weeks, SPY scans requested non-existent strikes).
+            # Prefer exchange=='SMART' AND tradingClass==symbol; fall back to
+            # any SMART def only when no exact class match exists.
             chain_def = None
             for cd in chains_data:
-                if cd.exchange == "SMART":
+                if cd.exchange == "SMART" and getattr(cd, "tradingClass", "") == symbol:
                     chain_def = cd
                     break
             if chain_def is None:
+                for cd in chains_data:
+                    if cd.exchange == "SMART":
+                        chain_def = cd
+                        break
+            if chain_def is None:
                 chain_def = chains_data[0]
+            if getattr(chain_def, "tradingClass", symbol) != symbol:
+                log.warning(
+                    "chain_def_nonstandard_class",
+                    symbol=symbol,
+                    trading_class=getattr(chain_def, "tradingClass", ""),
+                    reason="no SMART def with tradingClass==symbol",
+                )
 
             # Filter expiries by DTE range
             today = date.today()
@@ -382,71 +439,107 @@ class OptionsChainService:
         puts = []
         exp_str = expiry.strftime("%Y%m%d")
 
-        # Build option contracts for qualification
+        # Build option contracts for qualification.
+        # R16: pin tradingClass=symbol — strikes that exist in BOTH the
+        # standard and the adjusted class ('2IWM' etc.) came back 'Ambiguous
+        # contract' from qualifyContractsAsync and were silently dropped.
         option_contracts = []
         for strike in strikes:
             for right in ("C", "P"):
-                opt = Option(symbol, exp_str, strike, right, "SMART")
+                opt = Option(symbol, exp_str, strike, right, "SMART", tradingClass=symbol)
                 option_contracts.append(opt)
+
+        def _num(val) -> float:
+            # R16: ib_insync maps IB's -1/-2 "not yet computed" sentinels to
+            # None in modelGreeks — storing raw None crashed downstream math
+            # (TypeError in _calculate_greeks / filter_by_delta), aborting
+            # the whole symbol's scan. Coerce None to 0.0 = "missing".
+            return float(val) if val is not None else 0.0
+
+        none_greek_contracts = 0
 
         # Qualify in batches to avoid timeout
         batch_size = 50
+        # R16: the old snapshot pattern (50 concurrent reqMktData, 0.5s wait,
+        # no cancel) meant delayed-snapshot modelGreeks essentially never
+        # arrived (chain-wide IV/delta = 0) and un-cancelled subs stacked
+        # toward the market-data line cap while their ~11s snapshotEnd
+        # windows overlapped (10091/10197 error floods). Request fewer
+        # concurrently, wait longer, and always cancel in a finally.
+        md_batch_size = 25
+        md_wait_s = 2.0
         for i in range(0, len(option_contracts), batch_size):
             batch = option_contracts[i : i + batch_size]
             try:
                 qualified = await self._ibkr.ib.qualifyContractsAsync(*batch)
-                for q in qualified:
-                    if q.conId == 0:
-                        continue
-                    # Request market data
-                    self._ibkr.ib.reqMktData(q, "", True, False)
+                valid = [q for q in qualified if q.conId != 0]
 
-                await asyncio.sleep(0.5)
+                for j in range(0, len(valid), md_batch_size):
+                    md_batch = valid[j : j + md_batch_size]
+                    requested: list = []
+                    try:
+                        for q in md_batch:
+                            # Request market data (snapshot)
+                            self._ibkr.ib.reqMktData(q, "", True, False)
+                            requested.append(q)
 
-                for q in qualified:
-                    if q.conId == 0:
-                        continue
-                    ticker = self._ibkr.ib.ticker(q)
-                    if not ticker:
-                        continue
+                        await asyncio.sleep(md_wait_s)
 
-                    contract = OptionContract(
-                        symbol=symbol,
-                        expiry=expiry,
-                        strike=q.strike,
-                        right=q.right,
-                        bid=ticker.bid if ticker.bid and ticker.bid > 0 else 0.0,
-                        ask=ticker.ask if ticker.ask and ticker.ask > 0 else 0.0,
-                        last=ticker.last if ticker.last and ticker.last > 0 else 0.0,
-                        volume=(int(ticker.volume) if (ticker.volume and ticker.volume == ticker.volume and ticker.volume > 0) else 0),  # NaN is truthy; int(NaN) killed the whole 50-contract batch (deep-audit DATA-M6)
-                        open_interest=0,  # IBKR doesn't provide OI in real-time
-                        implied_vol=(
-                            ticker.modelGreeks.impliedVol
-                            if ticker.modelGreeks
-                            else 0.0
-                        ),
-                        delta=(
-                            ticker.modelGreeks.delta if ticker.modelGreeks else 0.0
-                        ),
-                        gamma=(
-                            ticker.modelGreeks.gamma if ticker.modelGreeks else 0.0
-                        ),
-                        theta=(
-                            ticker.modelGreeks.theta if ticker.modelGreeks else 0.0
-                        ),
-                        vega=(
-                            ticker.modelGreeks.vega if ticker.modelGreeks else 0.0
-                        ),
-                        con_id=q.conId,
-                    )
+                        for q in md_batch:
+                            ticker = self._ibkr.ib.ticker(q)
+                            if not ticker:
+                                continue
 
-                    if q.right == "C":
-                        calls.append(contract)
-                    else:
-                        puts.append(contract)
+                            mg = ticker.modelGreeks
+                            if mg and any(
+                                v is None
+                                for v in (mg.impliedVol, mg.delta, mg.gamma, mg.theta, mg.vega)
+                            ):
+                                none_greek_contracts += 1
+
+                            contract = OptionContract(
+                                symbol=symbol,
+                                expiry=expiry,
+                                strike=q.strike,
+                                right=q.right,
+                                bid=ticker.bid if ticker.bid and ticker.bid > 0 else 0.0,
+                                ask=ticker.ask if ticker.ask and ticker.ask > 0 else 0.0,
+                                last=ticker.last if ticker.last and ticker.last > 0 else 0.0,
+                                volume=(int(ticker.volume) if (ticker.volume and ticker.volume == ticker.volume and ticker.volume > 0) else 0),  # NaN is truthy; int(NaN) killed the whole 50-contract batch (deep-audit DATA-M6)
+                                open_interest=0,  # IBKR doesn't provide OI in real-time
+                                implied_vol=_num(mg.impliedVol) if mg else 0.0,
+                                delta=_num(mg.delta) if mg else 0.0,
+                                gamma=_num(mg.gamma) if mg else 0.0,
+                                theta=_num(mg.theta) if mg else 0.0,
+                                vega=_num(mg.vega) if mg else 0.0,
+                                con_id=q.conId,
+                            )
+
+                            if q.right == "C":
+                                calls.append(contract)
+                            else:
+                                puts.append(contract)
+                    finally:
+                        # R16: explicit cancel for EVERY request. Snapshot
+                        # subs auto-cancel only at snapshotEnd (~11s); until
+                        # then each holds a market-data line and error-floods
+                        # on unsubscribable contracts.
+                        for q in requested:
+                            try:
+                                self._ibkr.ib.cancelMktData(q)
+                            except Exception:
+                                pass
 
             except Exception as e:
                 log.debug("ibkr_batch_failed", symbol=symbol, batch=i, error=str(e))
+
+        if none_greek_contracts:
+            log.debug(
+                "ibkr_none_greeks_coerced",
+                symbol=symbol,
+                expiry=exp_str,
+                contracts=none_greek_contracts,
+            )
 
         if not calls and not puts:
             return None
@@ -490,6 +583,20 @@ class OptionsChainService:
             except (TypeError, ValueError):
                 return default
 
+        # R16: Yahoo stamps placeholder impliedVolatility (~1e-5) on rows
+        # without a computed IV (routine off-hours/pre-open). They passed the
+        # old `> 0` filters and polluted ATM-IV / median-IV calcs (50x-small
+        # expected_move). Treat sub-floor IVs as missing and count the drops.
+        placeholder_ivs = 0
+
+        def _physical_iv(val) -> float:
+            nonlocal placeholder_ivs
+            iv = _safe_float(val)
+            if 0 < iv < MIN_PHYSICAL_IV:
+                placeholder_ivs += 1
+                return 0.0
+            return iv
+
         for exp_str in expiry_strings:
             exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
             dte = (exp_date - today).days
@@ -517,7 +624,7 @@ class OptionsChainService:
                         last=_safe_float(row.get("lastPrice")),
                         volume=_safe_int(row.get("volume")),
                         open_interest=_safe_int(row.get("openInterest")),
-                        implied_vol=_safe_float(row.get("impliedVolatility")),
+                        implied_vol=_physical_iv(row.get("impliedVolatility")),
                     )
                 )
 
@@ -537,7 +644,7 @@ class OptionsChainService:
                         last=_safe_float(row.get("lastPrice")),
                         volume=_safe_int(row.get("volume")),
                         open_interest=_safe_int(row.get("openInterest")),
-                        implied_vol=_safe_float(row.get("impliedVolatility")),
+                        implied_vol=_physical_iv(row.get("impliedVolatility")),
                     )
                 )
 
@@ -554,6 +661,14 @@ class OptionsChainService:
 
             if len(chains) >= 3:
                 break
+
+        if placeholder_ivs:
+            log.debug(
+                "yahoo_placeholder_iv_dropped",
+                symbol=symbol,
+                contracts=placeholder_ivs,
+                floor=MIN_PHYSICAL_IV,
+            )
 
         return chains
 
@@ -586,17 +701,38 @@ class OptionsChainService:
         # A6 (deep-audit DATA-M6 residual): when a contract lacks IV, use the
         # chain's MEDIAN observed IV instead of a flat 30% — a wrong sigma
         # shifts the computed delta, and strategies pick strikes BY delta.
+        # R16: `c.implied_vol and ...` is None-safe, and the MIN_PHYSICAL_IV
+        # floor keeps Yahoo's ~1e-5 placeholders out of the median.
         _ivs = sorted(c.implied_vol for grp in (chain.calls, chain.puts)
-                      for c in grp if c.implied_vol and c.implied_vol > 0)
+                      for c in grp
+                      if c.implied_vol and c.implied_vol >= MIN_PHYSICAL_IV)
         _chain_iv = _ivs[len(_ivs) // 2] if _ivs else 0.30
 
+        none_greeks = 0
         for contracts in (chain.calls, chain.puts):
             for c in contracts:
+                # R16: ib_insync maps IB's "not yet computed" sentinels to
+                # None — a raw None here raised TypeError (the sigma compare
+                # sat OUTSIDE the try below) and aborted the whole symbol's
+                # scan. Coerce to 0.0 = missing so the BS backfill runs.
+                if any(v is None for v in (c.implied_vol, c.delta, c.gamma, c.theta, c.vega)):
+                    none_greeks += 1
+                    c.implied_vol = c.implied_vol or 0.0
+                    c.delta = c.delta or 0.0
+                    c.gamma = c.gamma or 0.0
+                    c.theta = c.theta or 0.0
+                    c.vega = c.vega or 0.0
                 if c.delta != 0:
                     continue  # Already has Greeks (from IBKR)
 
                 flag = "c" if c.right == "C" else "p"
-                sigma = c.implied_vol if c.implied_vol > 0 else _chain_iv
+                # R16: placeholder floor — a degenerate ~1e-5 sigma must never
+                # feed the BS backfill (it pins deltas to 0/±1).
+                sigma = (
+                    c.implied_vol
+                    if c.implied_vol and c.implied_vol >= MIN_PHYSICAL_IV
+                    else _chain_iv
+                )
 
                 try:
                     c.delta = delta(flag, S, c.strike, t, r, sigma)
@@ -605,3 +741,8 @@ class OptionsChainService:
                     c.vega = vega(flag, S, c.strike, t, r, sigma) / 100.0  # Per 1% vol move
                 except Exception:
                     pass  # Leave as 0 if calculation fails
+
+        if none_greeks:
+            log.debug(
+                "greeks_none_coerced", symbol=chain.symbol, contracts=none_greeks
+            )

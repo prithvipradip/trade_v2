@@ -365,6 +365,9 @@ class StrategyOptimizer:
             range_predictor=self._range_predictor,
             intraday_store=self._intraday_store,
             eval_start_date=eval_start_date,
+            # R16: Optuna trials must never score with the live future-trained
+            # artifact (same look-ahead class as the walkforward OOS fence).
+            allow_live_model_fallback=False,
             **bt_kwargs,
         )
         return bt.run()

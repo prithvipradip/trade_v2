@@ -26,7 +26,7 @@ from ait.backtesting.walkforward import WalkForwardBacktester, WalkForwardConfig
 # - AIT_IC_WING_K / wing floor $2:   src/ait/strategies/iron_condor.py _vol_scaled_width
 # - AIT_IC_MIN_CREDIT ($0.70):       src/ait/strategies/iron_condor.py generate_signals
 # - AIT_IC_MIN_CREDIT_WIDTH (0.20):  credit-to-width gate being added live
-# - AIT_CREDIT_LOSS_LIMIT (1.25):    src/ait/execution/portfolio.py check_position
+# - AIT_CREDIT_LOSS_LIMIT (0=off):   R16 parity - live default DISABLED (R6: touch-close beats flat stops)
 # - delta target 0.20:               hardcoded in iron_condor.generate_signals
 # - DTE band [14, 45]:               src/ait/config/settings.py OptionsConfig.dte_range
 # - TP ladder:                       src/ait/execution/portfolio.py _get_take_profit_targets
@@ -47,7 +47,8 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
         "wing_k":            float(os.environ.get("AIT_IC_WING_K", "1.0")),
         "ic_min_credit":     float(os.environ.get("AIT_IC_MIN_CREDIT", "0.70")),
         "ic_min_credit_width": float(os.environ.get("AIT_IC_MIN_CREDIT_WIDTH", "0.20")),
-        "credit_loss_limit": float(os.environ.get("AIT_CREDIT_LOSS_LIMIT", "1.25")),
+        "credit_loss_limit": float(os.environ.get("AIT_CREDIT_LOSS_LIMIT", "0")),
+        "pre_event_blackout_days": None,  # R16: resolved from loaded settings in engine
         "delta_target":      0.20,
         "dte_band":          [14, 45],
         "tp_ladder":         dict(_LIVE_TP_LADDER),
@@ -155,9 +156,9 @@ def parse_args() -> argparse.Namespace:
     # --- R6 live-parity knobs (defaults resolve from the SAME env vars the
     # live bot reads, falling back to the live defaults) ---
     p.add_argument("--credit-loss-limit", type=float,
-                   default=float(os.environ.get("AIT_CREDIT_LOSS_LIMIT", "1.25")),
+                   default=float(os.environ.get("AIT_CREDIT_LOSS_LIMIT", "0")),
                    help="Flat loss limit for credit trades, as multiple of credit "
-                        "received (live env AIT_CREDIT_LOSS_LIMIT, default 1.25)")
+                        "received (live env AIT_CREDIT_LOSS_LIMIT, default 0=off per R6/R16)")
     p.add_argument("--ic-min-credit", type=float,
                    default=float(os.environ.get("AIT_IC_MIN_CREDIT", "0.70")),
                    help="Min mid-price total credit for iron condors "

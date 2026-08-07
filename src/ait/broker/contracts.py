@@ -31,6 +31,7 @@ class ContractBuilder:
         right: str,  # "C" or "P"
         exchange: str = "SMART",
         currency: str = "USD",
+        trading_class: str = "",
     ) -> Option:
         """Create an option contract.
 
@@ -41,6 +42,11 @@ class ContractBuilder:
             right: "C" for call, "P" for put
             exchange: Exchange (default SMART for best routing)
             currency: Currency (default USD)
+            trading_class: IBKR trading class; defaults to `symbol`. R16: an
+                unpinned tradingClass made strikes that exist in both the
+                standard and the post-split adjusted class ('2SPY'/'2QQQ'/
+                '2IWM') fail qualification as 'Ambiguous contract'. Pass
+                explicitly only for non-standard classes (e.g. index weeklies).
         """
         if isinstance(expiry, date):
             expiry_str = expiry.strftime("%Y%m%d")
@@ -53,7 +59,10 @@ class ContractBuilder:
         if right not in ("C", "P"):
             raise ValueError(f"Option right must be 'C' or 'P', got '{right}'")
 
-        return Option(symbol, expiry_str, strike, right, exchange, currency=currency)
+        return Option(
+            symbol, expiry_str, strike, right, exchange,
+            currency=currency, tradingClass=trading_class or symbol,
+        )
 
     @staticmethod
     def combo(

@@ -167,10 +167,12 @@ class TestCommissionTrueUp:
                                 trades_taken=0)
         state.get_daily_stats.return_value = stats
         state.total_commission.return_value = 8.89       # ledger truth
+        state.count_executions.return_value = 8          # R16: complete ledger (2x4 legs)
         orch._state = state
         trade = SimpleNamespace(trade_id="T-X", symbol="NVDA",
                                 strategy="iron_condor", contract_type="iron_condor",
-                                quantity=1, entry_time=None)
+                                quantity=1, entry_time=None,
+                                legs='[{},{},{},{}]')
         orch._find_trade_by_id = lambda tid: trade
         orch._circuit_breaker = MagicMock()
         orch._thompson = MagicMock()
@@ -186,6 +188,37 @@ class TestCommissionTrueUp:
         # est (IC, qty1) = 0.65*4*2 = 5.20; delta = 5.20 - 8.89 = -3.69
         state.update_trade_realized_pnl.assert_called_once_with("T-X", -13.69)
         assert stats.total_pnl == pytest.approx(-13.69)
+
+    async def test_partial_ledger_defers_trueup(self):
+        # R16: commissionReports arrive async — a partial ledger (entry legs
+        # only) must DEFER, not true up against half the commissions.
+        orch = TradingOrchestrator.__new__(TradingOrchestrator)
+        state = MagicMock()
+        stats = SimpleNamespace(total_pnl=0.0, trades_won=0, trades_lost=0,
+                                trades_taken=0)
+        state.get_daily_stats.return_value = stats
+        state.total_commission.return_value = 2.60       # entry side only
+        state.count_executions.return_value = 4          # < 2x4 legs
+        orch._state = state
+        trade = SimpleNamespace(trade_id="T-Y", symbol="SPY",
+                                strategy="iron_condor", contract_type="iron_condor",
+                                quantity=1, entry_time=None,
+                                legs='[{},{},{},{}]')
+        orch._find_trade_by_id = lambda tid: trade
+        orch._circuit_breaker = MagicMock()
+        orch._thompson = MagicMock()
+        orch._pdt_guard = MagicMock()
+        orch._trainer = MagicMock()
+        orch._exit_attempts = {}
+        async def _notify(m):
+            pass
+        orch._send_notification = _notify
+        ex = {"trade_id": "T-Y", "realized_pnl": -10.00, "exit_reason": "stop",
+              "exit_price": 0.74}
+        await orch._process_completed_exits([ex])
+        state.update_trade_realized_pnl.assert_not_called()
+        state.set_state.assert_any_call("trueup_pending_T-Y",
+                                        date.today().isoformat())
 
     def test_estimate_formula_unchanged(self):
         t = SimpleNamespace(contract_type="iron_condor", strategy="iron_condor",

@@ -32,6 +32,14 @@ CREDIT_STRATEGIES = frozenset({
     "iron_condor", "short_strangle", "covered_call", "cash_secured_put",
 })
 
+# R16: strategies whose max loss is NOT structurally capped. Signal.max_loss
+# for these is a stress ESTIMATE (always > 0), so "max_loss > 0" could never
+# identify them — strangle signals reported is_defined_risk=True, silently
+# defeating the defined-risk-first ordering and the +10 ranking bonus.
+UNDEFINED_RISK_STRATEGIES = frozenset({
+    "short_strangle", "short_straddle", "covered_call", "cash_secured_put",
+})
+
 
 @dataclass
 class Signal:
@@ -72,8 +80,15 @@ class Signal:
 
     @property
     def is_defined_risk(self) -> bool:
-        """Whether this trade has defined (capped) maximum loss."""
-        return self.max_loss > 0
+        """Whether this trade has a structurally capped maximum loss.
+
+        R16: identity-based, NOT max_loss>0 — undefined-risk strategies set
+        max_loss to a positive stress ESTIMATE for sizing, which made every
+        strangle read as defined-risk (ordering + ranking bonus no-ops).
+        max_loss remains the sizing estimate only.
+        """
+        return (self.strategy_name not in UNDEFINED_RISK_STRATEGIES
+                and self.max_loss > 0)
 
     def __repr__(self) -> str:
         return (

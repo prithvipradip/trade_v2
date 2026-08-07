@@ -2,7 +2,8 @@
 
 Major economic releases (FOMC, CPI, NFP, GDP, PCE) cause massive IV crush
 and gap risk that can blow through iron condor wings in minutes. This module
-provides a hardcoded 2026 calendar of known release dates so the bot can:
+provides a hardcoded calendar (2026 confirmed; 2027-H1 APPROXIMATE — see the
+R16 #10 block below) of release dates so the bot can:
   - Skip opening new positions on event days and the day before
   - Close or avoid iron condors that would span these events
 
@@ -121,20 +122,78 @@ _PCE_2026 = [
     date(2026, 12, 23),  # Nov 2026 data
 ]
 
+# ---------------------------------------------------------------------------
+# 2027 H1 calendar (R16 #10)
+# ---------------------------------------------------------------------------
+# The 2026 tables end 2026-12-23 (PCE), so from 12-24 every macro guard went
+# silently blind while standard 14-45 DTE entries span the first 2027 NFP/CPI.
+#
+# !!! APPROXIMATE DATES — VERIFY BEFORE TRADING INTO THEM !!!
+# These follow the agencies' TYPICAL scheduling patterns, not confirmed
+# announcements:
+#   - NFP: first Friday of the month (2027-01-01 is a market-holiday Friday,
+#     so the Dec-2026 report shifts to the second Friday, Jan 8 — BLS-typical)
+#   - CPI: ~10th-13th of the month (BLS-typical)
+#   - PCE: ~last business Friday of the month (BEA-typical)
+#   - FOMC: Fed's tentative two-day meeting calendar (decision-day listed)
+#   - GDP: advance estimates ~end of Jan/Apr (BEA-typical)
+# Confirm against the primary sources before these dates matter:
+#   federalreserve.gov/monetarypolicy/fomccalendars.htm
+#   bls.gov/schedule/news_release/    bea.gov/news/schedule
+_FOMC_2027 = [
+    date(2027, 1, 27),   # Jan 26-27 (tentative)
+    date(2027, 3, 17),   # Mar 16-17 (tentative)
+    date(2027, 4, 28),   # Apr 27-28 (tentative)
+    date(2027, 6, 16),   # Jun 15-16 (tentative)
+]
+
+_CPI_2027 = [
+    date(2027, 1, 13),   # Dec 2026 data (approximate)
+    date(2027, 2, 10),   # Jan 2027 data (approximate)
+    date(2027, 3, 10),   # Feb 2027 data (approximate)
+    date(2027, 4, 13),   # Mar 2027 data (approximate)
+    date(2027, 5, 12),   # Apr 2027 data (approximate)
+    date(2027, 6, 10),   # May 2027 data (approximate)
+]
+
+_NFP_2027 = [
+    date(2027, 1, 8),    # Dec 2026 data (Jan 1 = holiday Friday -> 2nd Friday)
+    date(2027, 2, 5),    # Jan 2027 data (first Friday)
+    date(2027, 3, 5),    # Feb 2027 data (first Friday)
+    date(2027, 4, 2),    # Mar 2027 data (first Friday)
+    date(2027, 5, 7),    # Apr 2027 data (first Friday)
+    date(2027, 6, 4),    # May 2027 data (first Friday)
+]
+
+_GDP_2027 = [
+    date(2027, 1, 28),   # Q4 2026 advance (approximate)
+    date(2027, 4, 29),   # Q1 2027 advance (approximate)
+]
+
+_PCE_2027 = [
+    date(2027, 1, 29),   # Dec 2026 data (last Friday)
+    date(2027, 2, 26),   # Jan 2027 data (last Friday)
+    date(2027, 3, 26),   # Feb 2027 data (last Friday; Good Friday — markets
+                         # closed, BEA typically still releases; VERIFY)
+    date(2027, 4, 30),   # Mar 2027 data (last Friday)
+    date(2027, 5, 28),   # Apr 2027 data (last Friday)
+    date(2027, 6, 25),   # May 2027 data (last Friday)
+]
+
 
 def _build_event_list() -> list[EconomicEvent]:
     """Construct the full event list from hardcoded dates."""
     events: list[EconomicEvent] = []
 
-    for d in _FOMC_2026:
+    for d in _FOMC_2026 + _FOMC_2027:
         events.append(EconomicEvent(d, EventType.FOMC, f"FOMC rate decision {d}"))
-    for d in _CPI_2026:
+    for d in _CPI_2026 + _CPI_2027:
         events.append(EconomicEvent(d, EventType.CPI, f"CPI release {d}"))
-    for d in _NFP_2026:
+    for d in _NFP_2026 + _NFP_2027:
         events.append(EconomicEvent(d, EventType.NFP, f"NFP jobs report {d}"))
-    for d in _GDP_2026:
+    for d in _GDP_2026 + _GDP_2027:
         events.append(EconomicEvent(d, EventType.GDP, f"GDP advance estimate {d}"))
-    for d in _PCE_2026:
+    for d in _PCE_2026 + _PCE_2027:
         events.append(EconomicEvent(d, EventType.PCE, f"PCE release {d}"))
 
     events.sort(key=lambda e: e.date)
@@ -159,27 +218,48 @@ class EconomicCalendar:
             return
     """
 
+    # R16 #10: fire the staleness alarm while there is still runway. The old
+    # A10 alarm only triggered when a check was made with a year-2027 date —
+    # i.e. AFTER the guards had already gone blind (last 2026 event was
+    # 12-23; entries from 12-24 sailed unprotected into Jan-2027 NFP/CPI).
+    # Now it fires as soon as fewer than STALENESS_ALARM_DAYS of known future
+    # events remain, which is before a fresh 14-45 DTE entry can outlive the
+    # calendar.
+    STALENESS_ALARM_DAYS = 30
+
     def __init__(self) -> None:
         self._events = _ALL_EVENTS
         self._event_dates = _EVENT_DATES
+        self._last_event_date: date = (
+            max(e.date for e in self._events) if self._events else date.min
+        )
 
     _exhausted_warned = False
+
+    def _warn_if_nearly_exhausted(self, check_date: date) -> None:
+        """log.critical (once per process) when the hardcoded calendar has
+        fewer than STALENESS_ALARM_DAYS of future events left."""
+        if EconomicCalendar._exhausted_warned:
+            return
+        remaining = (self._last_event_date - check_date).days
+        if remaining < self.STALENESS_ALARM_DAYS:
+            EconomicCalendar._exhausted_warned = True
+            log.critical(
+                "economic_calendar_nearly_exhausted",
+                last_known_event=str(self._last_event_date),
+                days_of_coverage_left=remaining,
+                msg="hardcoded calendar has <"
+                    f"{self.STALENESS_ALARM_DAYS} days of future events -- "
+                    "macro-event guards are about to go BLIND. Extend the "
+                    "_FOMC/_CPI/_NFP/_GDP/_PCE tables (2027-H1 dates are "
+                    "APPROXIMATE and must be verified against BLS/BEA/Fed "
+                    "schedules).",
+            )
 
     def is_event_day(self, check_date: date | None = None) -> bool:
         """Return True if the given date has a major economic release."""
         check_date = check_date or date.today()
-        # A10 (deep-audit DATA-L13): the calendar is HARDCODED for 2026.
-        # Past its horizon every macro guard silently returns False -- the
-        # bot would hold short premium through the first 2027 FOMC with no
-        # protection and no warning. Scream (once) when exhausted.
-        if check_date.year > 2026 and not EconomicCalendar._exhausted_warned:
-            EconomicCalendar._exhausted_warned = True
-            log.critical(
-                "economic_calendar_exhausted",
-                year=check_date.year,
-                msg="hardcoded 2026 calendar has no data for this year -- "
-                    "macro-event guards are BLIND. Update _FOMC/_CPI/_NFP tables.",
-            )
+        self._warn_if_nearly_exhausted(check_date)
         return check_date in self._event_dates
 
     def is_pre_event_day(self, check_date: date | None = None) -> bool:
@@ -233,8 +313,15 @@ class EconomicCalendar:
         return [e for e in self._events if today <= e.date <= cutoff]
 
     def days_until_next_event(self, check_date: date | None = None) -> int | None:
-        """Return days until the next macro event, or None if no future events."""
+        """Return days until the next macro event, or None if no future events.
+
+        NOTE (R16 #10): a None return means the calendar is EXHAUSTED, not
+        that no event is coming — consumers (orchestrator blackout, engine
+        macro gate) treat None as "no event", so the staleness alarm below is
+        the guard rail against silently trading blind.
+        """
         check_date = check_date or date.today()
+        self._warn_if_nearly_exhausted(check_date)
         for event in self._events:
             if event.date >= check_date:
                 return (event.date - check_date).days
@@ -248,6 +335,7 @@ class EconomicCalendar:
         Use this to decide whether an iron condor can safely be held
         to expiration without macro event risk.
         """
+        self._warn_if_nearly_exhausted(entry_date)
         for event in self._events:
             if entry_date < event.date <= expiry_date:
                 return False

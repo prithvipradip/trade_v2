@@ -129,7 +129,17 @@ def load_daily_ohlcv(
 
 
 class MarketDataService:
-    """Fetches market data with IBKR → Polygon → Yahoo fallback chain."""
+    """Fetches market data with per-method fallback chains.
+
+    R16 (docstring was wrong twice): get_quote / get_intraday use
+    IBKR → Yahoo (Polygon is never consulted); get_historical (daily)
+    uses Polygon → Yahoo (IBKR is never consulted).
+    """
+
+    # R16: consecutive Polygon AUTH failures before the client is disabled
+    # for the rest of the process — a dead key burned an HTTPS roundtrip on
+    # every get_historical cache miss (~8-16/day) forever.
+    _POLYGON_AUTH_FAILURE_LIMIT = 3
 
     def __init__(
         self,
@@ -141,6 +151,7 @@ class MarketDataService:
         self._polygon_key = polygon_api_key
         self._cache = TTLCache(default_ttl=cache_ttl)
         self._polygon_client = None
+        self._polygon_auth_failures = 0
         # R9 single-flight: per-cache-key asyncio.Lock so N concurrent cache
         # misses for the same key result in ONE network fetch (the rest wait,
         # then hit the freshly-set cache). Created lazily per key.
@@ -572,10 +583,29 @@ class MarketDataService:
                 df.sort_index(inplace=True)
                 return df.tail(days)
 
-            return await asyncio.wait_for(asyncio.to_thread(_fetch_sync), timeout=30.0)
+            df = await asyncio.wait_for(asyncio.to_thread(_fetch_sync), timeout=30.0)
+            self._polygon_auth_failures = 0  # R16: healthy response resets the breaker
+            return df
 
         except Exception as e:
-            log.debug("polygon_historical_failed", symbol=symbol, error=str(e))
+            msg = str(e)
+            log.debug("polygon_historical_failed", symbol=symbol, error=msg)
+            # R16: nothing ever disabled the client after repeated auth
+            # failures ('Unknown API Key'), so a dead key was retried on
+            # every cache miss indefinitely. Trip a breaker after
+            # _POLYGON_AUTH_FAILURE_LIMIT consecutive auth failures.
+            if any(t in msg.lower() for t in ("unknown api key", "unauthorized", "401", "403")):
+                self._polygon_auth_failures += 1
+                if (
+                    self._polygon_auth_failures >= self._POLYGON_AUTH_FAILURE_LIMIT
+                    and self._polygon_client is not None
+                ):
+                    self._polygon_client = None
+                    log.warning(
+                        "polygon_disabled_auth_failures",
+                        failures=self._polygon_auth_failures,
+                        action="daily history now served by Yahoo only",
+                    )
             return None
 
     async def _get_yahoo_historical(

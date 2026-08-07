@@ -60,8 +60,15 @@ class WalkForwardConfig:
     wing_floor_dollars: float = 2.0   # R6 parity: live iron_condor min wing is $2, not $5
     wing_k: float = 1.0
     # ML ABLATION (pre-registered PLAN 2026-08-03): False = gate-stack-only
-    # arm — no window models trained, so every predictor gate reads
-    # None/untrained and the engine runs ungated (its designed fallback).
+    # arm — NO window models trained (direction AND range predictors both
+    # read None) and the engine runs ungated (its designed fallback).
+    # R16 #4: this flag previously gated only the DIRECTION predictor; the
+    # range predictor still trained (and would have gated entries whenever
+    # its training succeeded), making "gate_only" arms mislabeled. Range
+    # training now honors the flag in _run_single_window AND
+    # _pretrain_range_models (status "disabled_by_config", predictor None,
+    # entries deliberately NOT blocked — unlike a FAILED training, which
+    # blocks OOS IC entries via range_min_confidence=1.0 + engine R16 #3).
     train_window_models: bool = True
     iv_floor: float = 0.12
     delta_iv_scale: float = 0.0
@@ -100,11 +107,15 @@ class WalkForwardConfig:
     spread_cap: float = 0.15              # maximum half-spread per leg ($)
     # R6 exit/construction parity knobs (None -> engine resolves the SAME env
     # var + default the live bot reads; see Backtester.__init__):
-    credit_loss_limit_mult: float | None = None   # env AIT_CREDIT_LOSS_LIMIT (live 1.25)
+    credit_loss_limit_mult: float | None = None   # env AIT_CREDIT_LOSS_LIMIT (live default 0
+                                                  # = flat stop DISABLED; R12-B1 + R16 #6)
     ic_min_credit: float | None = None            # env AIT_IC_MIN_CREDIT (live $0.70)
     ic_min_credit_width: float | None = None      # env AIT_IC_MIN_CREDIT_WIDTH (live 0.20)
-    macro_event_gate: bool = True                 # block credit entries <=4d pre macro event
-                                                  # (2026-only calendar; inactive earlier)
+    macro_event_gate: bool = True                 # block credit entries pre macro event
+                                                  # (2026+2027-H1 calendar; inactive earlier)
+    pre_event_blackout_days: int | None = None    # R16 #7: None -> engine resolves from
+                                                  # load_settings().risk (live parity),
+                                                  # falling back to the RiskConfig default
     optimize_n_jobs: int = 1              # Number of walk-forward WINDOWS to run in parallel via
                                           # ProcessPoolExecutor. Despite the "optimize_" prefix this
                                           # controls WINDOW-LEVEL parallelism, NOT Optuna trial-level
@@ -128,6 +139,10 @@ class WindowResult:
     test_end: date
     backtest_result: BacktestResult
     model_accuracy: float = 0.0
+    # R16 #3: per-symbol range-model training status for this window
+    # ("ok" | "disabled_by_config" | failure reasons — anything not
+    # ok/disabled means OOS IC entries were BLOCKED for that symbol).
+    range_model_status: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -139,6 +154,12 @@ class WalkForwardResult:
     strategy_results: dict[str, dict] = field(default_factory=dict)
     initial_capital: float = 10_000.0
     config: WalkForwardConfig | None = None
+    # R16 #3: {window_id: {symbol: status}} for EVERY generated window
+    # (including zero-trade ones) so the summary can surface how many
+    # windows actually had a trained range model — the shipped ablation /
+    # shadow studies ran with range training failing in 32/32 windows and
+    # nothing in the summary said so.
+    range_training_status: dict = field(default_factory=dict)
 
     @property
     def total_trades(self) -> int:
@@ -352,6 +373,36 @@ class WalkForwardResult:
             f"  Avg Window Return: {self.avg_window_return:.2%}",
             "-" * 60,
         ]
+
+        # R16 #3: surface per-window range-model training status. A study
+        # whose range model never trained is NOT evidence about the range
+        # gate — say so in the result text, loudly.
+        if self.range_training_status:
+            _status_counts: dict[str, int] = {}
+            for _per_sym in self.range_training_status.values():
+                for _s in _per_sym.values():
+                    _status_counts[_s] = _status_counts.get(_s, 0) + 1
+            _total = sum(_status_counts.values())
+            _ok = _status_counts.get("ok", 0)
+            lines.append("  RANGE MODEL TRAINING (per window-symbol)")
+            lines.append(f"  Trained ok:        {_ok}/{_total}")
+            for _s in sorted(_status_counts):
+                if _s == "ok":
+                    continue
+                _note = (
+                    "entries ungated (ablation arm)"
+                    if _s == "disabled_by_config"
+                    else "OOS IC entries BLOCKED"
+                )
+                lines.append(
+                    f"    {_s}: {_status_counts[_s]}/{_total}  [{_note}]"
+                )
+            if _ok == 0 and _total > 0 and "disabled_by_config" not in _status_counts:
+                lines.append(
+                    "  WARNING: range model trained in ZERO windows — this "
+                    "run says NOTHING about the range gate."
+                )
+            lines.append("-" * 60)
 
         if self.strategy_results:
             lines.append("  STRATEGY BREAKDOWN:")
@@ -702,6 +753,23 @@ class WalkForwardBacktester:
             log.error("no_data_for_backtest")
             return WalkForwardResult(initial_capital=self._config.initial_capital)
 
+        # R16 #5 (defensive): normalize any tz-aware symbol frame to tz-naive.
+        # VIX/SPY context frames are normalized below, and reindexing a
+        # tz-aware frame against a naive index raises ("Cannot compare dtypes
+        # datetime64[ns] and datetime64[ns, America/New_York]") on the FIRST
+        # window. Shallow-copy so callers' frames are untouched.
+        _normalized: dict[str, pd.DataFrame] = {}
+        for _sym, _df in data.items():
+            if isinstance(_df.index, pd.DatetimeIndex) and _df.index.tz is not None:
+                _df = _df.copy(deep=False)
+                _df.index = _df.index.tz_localize(None)
+            _normalized[_sym] = _df
+        data = _normalized
+
+        # R16 #3: per-window range-model training status, recorded for EVERY
+        # window (zero-trade windows included) and surfaced in the summary.
+        self._range_status_by_window: dict[int, dict[str, str]] = {}
+
         # Load VIX and SPY data for the full backtest period (yfinance fallback when not in DB).
         # VIX: Priority-2 IV proxy and live feature for the MetaLabeler.
         # SPY: cross-asset features (relative strength, momentum, correlation) for the ML model.
@@ -745,6 +813,12 @@ class WalkForwardBacktester:
             pretrained_range_by_window: list[dict] = self._pretrain_range_models(
                 windows, data, _vix_full
             )
+            # R16 #3: statuses are known here in the parent process (workers
+            # cannot report back through instance state).
+            for _i, _per_symbol in enumerate(pretrained_range_by_window):
+                self._range_status_by_window[_i + 1] = {
+                    _sym: _tup[1] for _sym, _tup in _per_symbol.items()
+                }
 
             from concurrent.futures import ProcessPoolExecutor
 
@@ -815,6 +889,7 @@ class WalkForwardBacktester:
             windows=window_results,
             initial_capital=self._config.initial_capital,
             config=self._config,
+            range_training_status=dict(self._range_status_by_window),
         )
 
         # Compute per-symbol results
@@ -832,6 +907,26 @@ class WalkForwardBacktester:
         )
 
         return result
+
+    @staticmethod
+    def _resolve_oos_range_min_conf(
+        range_predictor, status: str, configured: float
+    ) -> float:
+        """R16 #3/#4: decide the OOS range-gate threshold for a window.
+
+        - Training ATTEMPTED but failed (any status other than "ok" /
+          "disabled_by_config" with no predictor): return 1.0 — combined with
+          the engine-side block (predictor None + threshold >= 1.0 skips the
+          entry) this HONORS the "range model absent -> block entries"
+          contract that engine.py previously broke by skipping the gate.
+        - Training disabled by config (gate-stack-only ablation arm): run
+          UNGATED at the configured threshold — that is the arm's documented
+          semantics.
+        - Trained ok: configured threshold.
+        """
+        if range_predictor is None and status not in ("ok", "disabled_by_config"):
+            return 1.0
+        return configured
 
     def _run_single_window(
         self,
@@ -879,6 +974,7 @@ class WalkForwardBacktester:
         curr_best_params: dict | None = None
         _optuna_meta: dict | None = None
         _model_weights: dict = {}  # initialised here so it's always bound even if loop is empty
+        _range_status_local: dict[str, str] = {}  # R16 #3: symbol -> range training status
         # Use full capital per symbol — splitting by symbol count makes iron condors
         # impossible on stocks priced >$50 (max_loss_per_contract too large).
         per_symbol_capital = self._config.initial_capital
@@ -909,7 +1005,12 @@ class WalkForwardBacktester:
             # Use pre-trained range predictor when provided (parallel mode with
             # _pretrain_range_models()).  Fall back to training in-process when
             # running sequentially or when pre-training was skipped.
-            if pretrained_range is not None and symbol in pretrained_range:
+            # R16 #4: train_window_models=False disables the range predictor
+            # too (previously only the direction predictor honored the flag,
+            # so a "gate_only" ablation arm could run WITH a range gate).
+            if not self._config.train_window_models:
+                _range_result = (None, "disabled_by_config", 0.05)
+            elif pretrained_range is not None and symbol in pretrained_range:
                 _range_result = pretrained_range[symbol]
             else:
                 _range_result = self._train_window_range_model(
@@ -921,6 +1022,13 @@ class WalkForwardBacktester:
                 range_predictor, _range_model_status, _range_threshold = None, "skipped", 0.05
             else:
                 range_predictor, _range_model_status, _range_threshold = _range_result
+
+            # R16 #3: record status for the WindowResult and run summary
+            # (instance dict is guarded — tests may call _run_single_window
+            # directly, bypassing run()).
+            _range_status_local[symbol] = _range_model_status
+            if hasattr(self, "_range_status_by_window"):
+                self._range_status_by_window.setdefault(window_id, {})[symbol] = _range_model_status
 
             # Build market context for the training slice (VIX + SPY) so features_cache
             # has real cross-asset values instead of neutral defaults.
@@ -1041,18 +1149,24 @@ class WalkForwardBacktester:
             if _ctx_oos:
                 _vix_ctx = _ctx_oos
 
-            # When the range model failed to train, block all OOS IC entries by
+            # When the range model FAILED to train, block all OOS IC entries by
             # raising range_min_confidence to an unreachable value. Without a range
             # gate, iron condors have no entry signal and should not trade.
-            _oos_range_min_conf = getattr(window_cfg, "range_min_confidence", 0.55)
-            if range_predictor is None and _range_model_status != "ok":
+            # (The engine now enforces this contract too — R16 #3: predictor
+            # None + threshold >= 1.0 blocks the entry instead of silently
+            # skipping the gate.) "disabled_by_config" (R16 #4 ablation arm)
+            # deliberately runs UNGATED at the configured threshold.
+            _oos_range_min_conf = self._resolve_oos_range_min_conf(
+                range_predictor, _range_model_status,
+                getattr(window_cfg, "range_min_confidence", 0.55),
+            )
+            if _oos_range_min_conf >= 1.0:
                 log.warning(
                     "range_model_absent_blocking_oos",
                     window=window_id, symbol=symbol,
                     status=_range_model_status,
                     action="setting range_min_confidence=1.0 to block OOS IC entries",
                 )
-                _oos_range_min_conf = 1.0
 
             # Pre-compute OOS feature matrix once — shared by the OOS Backtester,
             # timeseries export, and both model evaluators.  Eliminates ~120
@@ -1109,6 +1223,12 @@ class WalkForwardBacktester:
                 ic_min_credit=getattr(window_cfg, "ic_min_credit", None),
                 ic_min_credit_width=getattr(window_cfg, "ic_min_credit_width", None),
                 macro_event_gate=getattr(window_cfg, "macro_event_gate", True),
+                # R16 #7: None -> engine resolves from loaded settings (live parity)
+                pre_event_blackout_days=getattr(window_cfg, "pre_event_blackout_days", None),
+                # R16 #1: NEVER score an OOS window with the live (future-
+                # trained) models/ensemble.pkl. If the window model failed to
+                # train, the window trades ungated — the documented fallback.
+                allow_live_model_fallback=False,
                 delta_iv_scale=window_cfg.delta_iv_scale,
                 max_concurrent_positions=window_cfg.max_concurrent_positions,
                 max_entry_vol_annual=window_cfg.max_entry_vol_annual,
@@ -1190,6 +1310,7 @@ class WalkForwardBacktester:
                     end_date=test_end,
                 ),
                 model_accuracy=model_accuracy,
+                range_model_status=dict(_range_status_local),
             )
             self._write_window_progress(window_id, window_result, curr_best_params,
                                          optuna_meta=_optuna_meta, model_weights=_model_weights)
@@ -1898,6 +2019,20 @@ class WalkForwardBacktester:
           - Optuna's RNG state is untouched (statistical fitting runs before Optuna)
           - The spawn-subprocess isolation is no longer needed for this phase
         """
+        if not self._config.train_window_models:
+            # R16 #4: gate-stack-only arm — the flag disables ALL window
+            # models, so skip range pre-training entirely (it previously ran
+            # regardless, leaking a trained range gate into "ML-free" arms).
+            log.info(
+                "range_pretraining_disabled_by_config",
+                windows=len(windows),
+                reason="train_window_models=False",
+            )
+            return [
+                {symbol: (None, "disabled_by_config", 0.05) for symbol in data}
+                for _ in windows
+            ]
+
         results: list[dict] = []
         n_windows = len(windows)
         for i, (train_start, train_end, _test_start, _test_end) in enumerate(windows):
@@ -2030,7 +2165,12 @@ class WalkForwardBacktester:
             _market_ctx = _train_ctx if _train_ctx else None
 
             ml_config = MLConfig()
-            predictor = DirectionPredictor(ml_config)
+            # R16 #2: window models are throwaway research artifacts — NEVER
+            # persist them. DirectionPredictor.train() used to save
+            # unconditionally to the CWD-relative models/ dir, clobbering the
+            # LIVE ensemble.pkl (the bot served an IWM-only window model for
+            # 2.5 market hours on 2026-08-03).
+            predictor = DirectionPredictor(ml_config, persist_artifacts=False)
             accuracies = predictor.train(
                 train_df, symbol=symbol, intraday_store=intraday_store,
                 market_context=_market_ctx,
@@ -2120,6 +2260,10 @@ class WalkForwardBacktester:
                 ic_min_credit=getattr(window_cfg, "ic_min_credit", None),
                 ic_min_credit_width=getattr(window_cfg, "ic_min_credit_width", None),
                 macro_event_gate=getattr(window_cfg, "macro_event_gate", True),
+                pre_event_blackout_days=getattr(window_cfg, "pre_event_blackout_days", None),
+                # R16 #1: shadow labelling runs with the window predictor
+                # (possibly None) — never with the live artifact.
+                allow_live_model_fallback=False,
                 max_concurrent_positions=window_cfg.max_concurrent_positions,
                 max_entry_vol_annual=window_cfg.max_entry_vol_annual,
                 spread_base=window_cfg.spread_base,
@@ -2230,6 +2374,14 @@ class WalkForwardBacktester:
                     ),
                 )
                 if df is not None and len(df) > 100:
+                    # R16 #5: load_daily_ohlcv can return a tz-aware
+                    # (America/New_York) index while run() normalizes VIX/SPY
+                    # context to tz-naive — the mix crashed
+                    # vix_full.reindex(train_df.index) on the first window,
+                    # so run(data=None) (the dashboard runner) never worked.
+                    if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
+                        df = df.copy(deep=False)
+                        df.index = df.index.tz_localize(None)
                     data[symbol] = df
                     log.info("data_fetched", symbol=symbol, rows=len(df))
             except Exception as e:

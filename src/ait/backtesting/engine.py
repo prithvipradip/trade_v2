@@ -35,6 +35,20 @@ CREDIT_STRATEGIES = {"iron_condor", "iron_butterfly", "wide_wing_condor", "broke
 # Strategies that pay premium (long theta)
 DEBIT_STRATEGIES = {"long_call", "long_put", "bull_call_spread", "bear_put_spread", "long_straddle"}
 
+# R16 #9: direction-neutral credit structures sharing the direction-gate
+# bypass and the five neutral entry risk gates (hurst hard veto,
+# trending-down regime veto, range-model gate, 10d realized-vol gate,
+# IV-rank-rise veto). jade_lizard and call_credit_spread are backtest-only
+# shadow arms selectable ONLY on NEUTRAL signals (_select_strategy), so they
+# belong to the same entry population as the condor/strangle arms — they were
+# previously missing from every tuple, which made those arms either
+# zero-trade (blocked by the directional-confidence gate that NEUTRAL@0.4
+# can never pass) or, when ML emitted NEUTRAL>=0.55, completely ungated.
+NEUTRAL_CREDIT_GATED = (
+    "iron_condor", "iron_butterfly", "wide_wing_condor", "broken_wing_condor",
+    "short_strangle", "jade_lizard", "call_credit_spread",
+)
+
 
 class Backtester:
     """Simulates trading strategies against historical OHLCV data."""
@@ -63,7 +77,9 @@ class Backtester:
         iv_floor: float = 0.12,
         # R6 parity: live iron_condor._vol_scaled_width enforces min $2, not $5.
         wing_floor_dollars: float = 2.0,
-        wing_k: float = 1.0,
+        # R16 #8: None -> resolve env AIT_IC_WING_K (default 1.0), mirroring
+        # live iron_condor.py:107 — same pattern as ic_min_credit_width below.
+        wing_k: float | None = None,
         delta_iv_scale: float = 0.0,
         skew_factor: float = 1.0,
         hurst_regime_threshold: float = 0.20,
@@ -98,8 +114,11 @@ class Backtester:
         eval_start_date: "date | None" = None,
         # --- R6 exit/construction parity with the live bot ---
         # Flat loss limit for CREDIT structures as a multiple of credit
-        # received (live portfolio.py reads env AIT_CREDIT_LOSS_LIMIT, 1.25).
-        # None -> resolve from env with the same default as live.
+        # received (live portfolio.py reads env AIT_CREDIT_LOSS_LIMIT with
+        # default "0" = flat stop DISABLED — R12-B1 evidence: touch-close beat
+        # every flat level). None -> resolve from env with the SAME default as
+        # live (R16 #6 parity: this used to default to 1.25, so every backtest
+        # simulated an active stop the live book does not run).
         credit_loss_limit_mult: float | None = None,
         # Iron condor construction gates (live iron_condor.py R6):
         # minimum mid-price total credit (env AIT_IC_MIN_CREDIT, $0.70) and
@@ -113,6 +132,20 @@ class Backtester:
         # for pre-2026 backtest windows the gate is effectively inactive
         # (days-to-event is always > 4), which is a documented limitation.
         macro_event_gate: bool = True,
+        # R16 #7: live reads pre_event_blackout_days from LOADED settings
+        # (orchestrator.py: self._settings.risk.pre_event_blackout_days), so a
+        # yaml override must reach the engine too. None -> resolve from
+        # load_settings(), falling back to the RiskConfig default when no
+        # config.yaml is reachable from the CWD.
+        pre_event_blackout_days: int | None = None,
+        # R16 #1 (look-ahead fence): when no predictor is supplied, standalone
+        # runs may fall back to loading the LIVE models/ensemble.pkl. Walk-
+        # forward OOS windows must NEVER do that (the live artifact is trained
+        # on the very future periods being scored) — walkforward passes False,
+        # and the window then trades UNGATED (predictor=None), which is the
+        # engine's designed fallback and what the ablation studies claimed to
+        # measure.
+        allow_live_model_fallback: bool = True,
     ) -> None:
         self._data = self._prepare_data(data)
         self._strategies = strategies
@@ -138,7 +171,12 @@ class Backtester:
         self._delta_long = delta_long
         self._iv_floor = iv_floor
         self._wing_floor_dollars = wing_floor_dollars
-        self._wing_k = wing_k
+        # R16 #8: mirror the live env resolution (iron_condor.py reads
+        # AIT_IC_WING_K, default 1.0) when wing_k is not explicitly configured.
+        self._wing_k = (
+            float(wing_k) if wing_k is not None
+            else float(os.environ.get("AIT_IC_WING_K", "1.0"))
+        )
         self._delta_iv_scale = delta_iv_scale
         self._skew_factor = skew_factor
         self._hurst_regime_threshold = hurst_regime_threshold
@@ -164,9 +202,14 @@ class Backtester:
 
         # R6 parity knobs — None resolves to the SAME env var + default the
         # live bot reads, so an un-configured backtest matches live behavior.
+        # R16 #6: default "0" = flat credit stop DISABLED, matching live
+        # portfolio.py:413 exactly (R12-B1: flat stops fired through their
+        # trigger on gaps and every level underperformed touch-close; live
+        # runs touch-close-only, which the engine does NOT yet mirror — a
+        # documented structural divergence, not a parity value mismatch).
         self._credit_loss_limit_mult = (
             float(credit_loss_limit_mult) if credit_loss_limit_mult is not None
-            else float(os.environ.get("AIT_CREDIT_LOSS_LIMIT", "1.25"))
+            else float(os.environ.get("AIT_CREDIT_LOSS_LIMIT", "0"))
         )
         self._ic_min_credit = (
             float(ic_min_credit) if ic_min_credit is not None
@@ -185,7 +228,48 @@ class Backtester:
             except Exception:  # noqa: BLE001 — gate is best-effort, never fatal
                 self._economic_cal = None
 
-        self._predictor = predictor if predictor is not None else self._load_predictor()
+        # R16 #7: resolve the macro blackout window ONCE, from the same source
+        # live reads (loaded settings), instead of pinning to RiskConfig()
+        # defaults on every entry day.
+        if pre_event_blackout_days is not None:
+            self._pre_event_blackout_days = int(pre_event_blackout_days)
+        else:
+            try:
+                from ait.config.settings import load_settings as _ls
+                self._pre_event_blackout_days = int(
+                    _ls().risk.pre_event_blackout_days
+                )
+            except Exception:  # noqa: BLE001 — no config.yaml -> config default
+                from ait.config.settings import RiskConfig as _RC
+                self._pre_event_blackout_days = int(_RC().pre_event_blackout_days)
+
+        # R16 #1: explicit, loudly-logged predictor mode. Never silently score
+        # research windows with the live (future-trained) artifact.
+        self._allow_live_model_fallback = bool(allow_live_model_fallback)
+        if predictor is not None:
+            self._predictor = predictor
+            log.info("ml_predictor_mode", mode="explicit_window_model")
+        elif self._allow_live_model_fallback:
+            self._predictor = self._load_predictor()
+            if self._predictor is not None:
+                log.warning(
+                    "ml_predictor_mode",
+                    mode="LIVE_ARTIFACT_FALLBACK",
+                    version=getattr(self._predictor, "model_version", "?"),
+                    note="scoring with live models/ensemble.pkl — INVALID for "
+                         "walk-forward OOS windows (look-ahead leak); pass "
+                         "allow_live_model_fallback=False for research runs",
+                )
+            else:
+                log.info("ml_predictor_mode", mode="ungated_no_model_found")
+        else:
+            self._predictor = None
+            log.info(
+                "ml_predictor_mode",
+                mode="ungated_fallback_disabled",
+                note="no window model and live-artifact fallback disabled — "
+                     "direction comes from _simple_direction only",
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -311,7 +395,7 @@ class Backtester:
                     # Hard veto is optional: it only applies when multiplier > 0.
                     # Exp 20 post-mortem showed QQQ hurst_spread rarely drops below
                     # ~0.43 in normal conditions; overly tight thresholds can block all entries.
-                    _neutral_strat = bool(set(self._strategies) & {"iron_condor", "iron_butterfly", "wide_wing_condor", "broken_wing_condor", "short_strangle"})
+                    _neutral_strat = bool(set(self._strategies) & set(NEUTRAL_CREDIT_GATED))
                     _veto_base = max(self._hurst_regime_threshold, 0.20)
                     _hard_veto_threshold = _veto_base * self._hurst_hard_veto_multiplier
                     if _neutral_strat and self._hurst_hard_veto_multiplier > 0 and spread > _hard_veto_threshold:
@@ -338,7 +422,7 @@ class Backtester:
             # confidence signals a trending regime — exactly when they fail. Skip the
             # direction gate for these strategies; the range model below is the sole
             # entry filter. Directional strategies still require confidence ≥ min_conf.
-            _neutral_only = bool(set(self._strategies) & {"iron_condor", "iron_butterfly", "wide_wing_condor", "broken_wing_condor", "short_strangle"})
+            _neutral_only = bool(set(self._strategies) & set(NEUTRAL_CREDIT_GATED))
             if not _neutral_only:
                 if confidence < effective_min_conf:
                     continue
@@ -397,14 +481,15 @@ class Backtester:
                 continue
 
             # Macro-event entry gate (live orchestrator credit-block parity).
-            # PLAN 2026-08-03 (user-approved): window 4 -> RiskConfig default
-            # (1). Parity is with the CONFIG DEFAULT, not a yaml override.
-            # LIMITATION: the calendar is hardcoded for 2026 only, so for
+            # R16 #7: the blackout window is resolved once in __init__ from
+            # the LOADED settings (constructor override > load_settings() >
+            # RiskConfig default) — the same source live reads — so a yaml
+            # override no longer changes live only.
+            # LIMITATION: the calendar is hardcoded 2026 + 2027-H1, so for
             # pre-2026 windows days-to-event is always > window and the gate
             # never fires (documented in the parity manifest).
             if self._economic_cal is not None and strategy in CREDIT_STRATEGIES:
-                from ait.config.settings import RiskConfig as _RC
-                _blackout = _RC().pre_event_blackout_days
+                _blackout = self._pre_event_blackout_days
                 try:
                     _d2e = self._economic_cal.days_until_next_event(today_date)
                 except Exception:  # noqa: BLE001
@@ -430,7 +515,7 @@ class Backtester:
             # Exp 22: threshold -0.02 was too loose — blocked profitable 2-4% corrections
             # in W02, causing Optuna to adapt badly. Both structural failures cleared -0.05
             # (Yen carry -6-8%, tariff shock -8-10%); raised to -0.05 for Exp 23.
-            if strategy in ("iron_condor", "iron_butterfly", "wide_wing_condor", "broken_wing_condor", "short_strangle") and not features_df.empty:
+            if strategy in NEUTRAL_CREDIT_GATED and not features_df.empty:
                 _last_f        = features_df.iloc[-1]
                 _vol_exp_flag  = float(_last_f.get("vol_regime_expanding", 0.0)) > 0.5
                 _px_sma_val    = float(_last_f.get("price_vs_sma_20", 0.0))
@@ -453,30 +538,53 @@ class Backtester:
                     )
                     continue
 
-            # Range model gate: for iron condors / strangles, replace confidence
-            # with P(stays in range). Skip if below range threshold.
-            if strategy in ("iron_condor", "iron_butterfly", "wide_wing_condor", "broken_wing_condor", "short_strangle") and self._range_predictor is not None:
-                try:
-                    rp = self._range_predictor.predict(
-                        hist,
-                        symbol=self._symbol,
-                        market_context=self._market_context,
-                        min_edge_override=self._min_edge_over_baseline,
-                    )
-                    if rp is None or rp.probability_in_range < self._range_min_confidence:
-                        continue  # bad range setup → skip
-                    _entry_decision["range_gate"] = {
-                        "prob": round(float(rp.probability_in_range), 4),
-                        "threshold": self._range_min_confidence,
-                        "pass": True,
-                    }
-                    confidence = rp.probability_in_range
-                except Exception:
-                    pass
+            # Range model gate: for neutral credit structures, replace
+            # confidence with P(stays in range). Skip if below range threshold.
+            if strategy in NEUTRAL_CREDIT_GATED:
+                if self._range_predictor is None:
+                    # R16 #3: honor the walkforward "range model absent ->
+                    # block entries" contract. walkforward raises
+                    # range_min_confidence to 1.0 when window range training
+                    # FAILED; with no predictor no probability can ever reach
+                    # it, so the entry must be blocked HERE. Previously the
+                    # whole gate was skipped when the predictor was None and
+                    # entries flowed ungated — every recent study (ablation,
+                    # wingk, shadow rounds) ran with no range gate at all.
+                    if self._range_min_confidence >= 1.0:
+                        _entry_decision["range_gate"] = {
+                            "prob": None,
+                            "threshold": self._range_min_confidence,
+                            "pass": False,
+                        }
+                        log.debug(
+                            "range_gate_blocked_no_predictor",
+                            date=str(today_date),
+                            strategy=strategy,
+                            threshold=self._range_min_confidence,
+                        )
+                        continue
+                else:
+                    try:
+                        rp = self._range_predictor.predict(
+                            hist,
+                            symbol=self._symbol,
+                            market_context=self._market_context,
+                            min_edge_override=self._min_edge_over_baseline,
+                        )
+                        if rp is None or rp.probability_in_range < self._range_min_confidence:
+                            continue  # bad range setup → skip
+                        _entry_decision["range_gate"] = {
+                            "prob": round(float(rp.probability_in_range), 4),
+                            "threshold": self._range_min_confidence,
+                            "pass": True,
+                        }
+                        confidence = rp.probability_in_range
+                    except Exception:
+                        pass
 
-            # Realized-vol entry gate: iron condors / short strangles cannot profit
+            # Realized-vol entry gate: neutral credit structures cannot profit
             # during high-volatility regimes (e.g. tariff shocks, VIX > 40).
-            if strategy in ("iron_condor", "iron_butterfly", "wide_wing_condor", "broken_wing_condor", "short_strangle"):
+            if strategy in NEUTRAL_CREDIT_GATED:
                 recent_close = hist["Close"].iloc[-11:]
                 if len(recent_close) >= 11:
                     vol_10d = recent_close.pct_change().std() * (252 ** 0.5)
@@ -501,7 +609,7 @@ class Backtester:
             # Rising IV rank filter: if IV rank has risen by more than iv_rank_rise_threshold
             # over the last 10 days, market is in directional stress — skip iron condor entry.
             # Rise value is always logged (not just on veto) for threshold tuning.
-            if strategy in ("iron_condor", "iron_butterfly", "wide_wing_condor", "broken_wing_condor", "short_strangle") and not features_df.empty:
+            if strategy in NEUTRAL_CREDIT_GATED and not features_df.empty:
                 if "iv_rank" in features_df.columns and len(features_df) >= 11:
                     iv_rank_series = features_df["iv_rank"].iloc[-11:]
                     iv_rank_rise = float(iv_rank_series.iloc[-1]) - float(iv_rank_series.iloc[0])
@@ -1948,9 +2056,12 @@ class Backtester:
         expiry = date.fromisoformat(pos["expiry_date"])
         remaining_dte = (expiry - current_date).days
 
-        # 1. Flat loss limit: one stop at -mult x credit (live default 1.25,
-        # env AIT_CREDIT_LOSS_LIMIT). The wings already cap the true tail.
-        if pnl_pct <= -self._credit_loss_limit_mult:
+        # 1. Flat loss limit: one stop at -mult x credit (env
+        # AIT_CREDIT_LOSS_LIMIT). R16 #6 parity with live portfolio.py:413-414:
+        # default 0 = flat stop DISABLED (mult <= 0 mirrors live's -999
+        # sentinel); the wings cap the true tail, and R12-B1 showed touch-close
+        # beats every flat level. Env override still re-arms the stop.
+        if self._credit_loss_limit_mult > 0 and pnl_pct <= -self._credit_loss_limit_mult:
             return {"exit_date": str(current_date), "exit_reason": "credit_loss_limit"}
 
         # 2. DTE-laddered take-profit (portfolio._get_take_profit_targets)

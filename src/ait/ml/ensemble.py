@@ -34,7 +34,14 @@ from ait.utils.logging import get_logger
 
 log = get_logger("ml.ensemble")
 
-MODEL_DIR = Path("models")
+# R16 #2: absolute, repo-anchored models dir (trade_v2/models). The old
+# CWD-relative Path("models") meant any process's CWD decided which
+# ensemble.pkl got read/WRITTEN — a walkforward run from repo root clobbered
+# the LIVE artifact (the bot served an IWM-only window model for 2.5 market
+# hours on 2026-08-03). The pytest conftest fence monkeypatches this module
+# attribute to tmp_path; resolve it lazily (self.model_dir) so the fence
+# keeps working.
+MODEL_DIR = Path(__file__).resolve().parents[3] / "models"
 
 
 @dataclass
@@ -54,9 +61,27 @@ class DirectionPredictor:
     LABELS = {0: SignalDirection.BEARISH, 1: SignalDirection.NEUTRAL, 2: SignalDirection.BULLISH}
     LABEL_MAP = {v: k for k, v in LABELS.items()}
 
-    def __init__(self, config: MLConfig) -> None:
+    def __init__(
+        self,
+        config: MLConfig,
+        model_dir: "Path | str | None" = None,
+        persist_artifacts: bool = True,
+    ) -> None:
+        """Args:
+            config: ML configuration.
+            model_dir: R16 #2 artifact fence — where models are saved/loaded.
+                None -> the module-level MODEL_DIR (absolute repo-anchored
+                live models dir; monkeypatched to tmp_path under pytest).
+                Research/window training must pass its own directory OR set
+                persist_artifacts=False.
+            persist_artifacts: False -> train() never writes to disk (used by
+                walkforward window training — window models are throwaway and
+                previously clobbered the LIVE models/ensemble.pkl).
+        """
         self._config = config
         self._feature_engine = FeatureEngine()
+        self._model_dir: Path | None = Path(model_dir) if model_dir is not None else None
+        self._persist_artifacts = bool(persist_artifacts)
 
         # Per-symbol model storage: {symbol: {models, scaler, feature_names, scores}}
         self._symbol_models: dict[str, dict] = {}
@@ -74,7 +99,14 @@ class DirectionPredictor:
         self._xgb_kwargs: dict = {}
         self._lgbm_kwargs: dict = {}
 
-        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        if self._persist_artifacts:
+            self.model_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def model_dir(self) -> Path:
+        """Artifact directory: explicit constructor fence when given, else the
+        module default (which the pytest conftest fence monkeypatches)."""
+        return self._model_dir if self._model_dir is not None else MODEL_DIR
 
     @property
     def is_trained(self) -> bool:
@@ -373,7 +405,17 @@ class DirectionPredictor:
                          accuracies=accuracies, fitted_weights=fitted_weights,
                          features=len(self._feature_names))
 
-            self._save_models()
+            # R16 #2: window/research training passes persist_artifacts=False
+            # so a train() can NEVER touch the live ensemble.pkl (or churn its
+            # versioned rollback copies).
+            if self._persist_artifacts:
+                self._save_models()
+            else:
+                log.info(
+                    "ensemble_not_persisted",
+                    version=self._model_version,
+                    reason="persist_artifacts=False (research/window model)",
+                )
             log.info(
                 "ensemble_trained",
                 version=self._model_version,
@@ -395,9 +437,9 @@ class DirectionPredictor:
             version: Specific version to load. None = latest (ensemble.pkl).
         """
         if version:
-            model_file = MODEL_DIR / f"ensemble_{version}.pkl"
+            model_file = self.model_dir / f"ensemble_{version}.pkl"
         else:
-            model_file = MODEL_DIR / "ensemble.pkl"
+            model_file = self.model_dir / "ensemble.pkl"
 
         if not model_file.exists():
             return False
@@ -437,8 +479,9 @@ class DirectionPredictor:
         # half-written pickle. A corrupted-model event was already referenced
         # in adaptor.py (2026-06-23). Audit 2026-07-07 item 3.1.
         import os as _os
-        model_file = MODEL_DIR / "ensemble.pkl"
-        tmp_file = MODEL_DIR / "ensemble.pkl.tmp"
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+        model_file = self.model_dir / "ensemble.pkl"
+        tmp_file = self.model_dir / "ensemble.pkl.tmp"
         try:
             with open(tmp_file, "wb") as f:
                 pickle.dump(data, f)
@@ -454,7 +497,7 @@ class DirectionPredictor:
 
         # Save versioned copy for rollback
         if self._model_version:
-            versioned_file = MODEL_DIR / f"ensemble_{self._model_version}.pkl"
+            versioned_file = self.model_dir / f"ensemble_{self._model_version}.pkl"
             try:
                 with open(versioned_file, "wb") as f:
                     pickle.dump(data, f)
@@ -467,7 +510,7 @@ class DirectionPredictor:
 
     def _prune_old_versions(self, keep: int = 5) -> None:
         """Remove old model versions, keeping only the N most recent."""
-        versions = sorted(MODEL_DIR.glob("ensemble_v-*.pkl"))
+        versions = sorted(self.model_dir.glob("ensemble_v-*.pkl"))
         if len(versions) > keep:
             for old in versions[:-keep]:
                 old.unlink()
@@ -486,7 +529,7 @@ class DirectionPredictor:
     def list_versions(self) -> list[dict]:
         """List available model versions."""
         versions = []
-        for f in sorted(MODEL_DIR.glob("ensemble_v-*.pkl")):
+        for f in sorted(self.model_dir.glob("ensemble_v-*.pkl")):
             try:
                 with open(f, "rb") as fh:
                     data = pickle.load(fh)

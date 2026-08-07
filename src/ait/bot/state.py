@@ -350,6 +350,7 @@ class StateManager:
         realized_pnl: float,
         commission: float = 0.0,
         exit_reason_detailed: str = "",
+        from_statuses: tuple[TradeStatus, ...] | None = None,
     ) -> bool:
         """Mark a trade as closed with exit details and journaling data.
 
@@ -359,6 +360,12 @@ class StateManager:
         the real exit data AND dual-write a duplicate row into the DuckDB
         analytics store (double-counted P&L). Returns True iff the close
         landed.
+
+        R16: `from_statuses` narrows the CAS at the DB layer — the stale-
+        pending sweep must pass (PENDING,) so a row promoted to FILLED by a
+        concurrent process (second bot, operator script, broker-lag race)
+        can never be booked as "never filled"/$0. Default keeps all four
+        open statuses.
         """
         now = datetime.now().isoformat()
 
@@ -368,8 +375,12 @@ class StateManager:
         # Calculate time to peak (from entry to when HWM was set)
         time_to_peak_hours = 0.0
 
-        _open = (TradeStatus.PENDING.value, TradeStatus.FILLED.value,
-                 TradeStatus.PARTIAL.value, TradeStatus.CLOSING.value)
+        if from_statuses:
+            _open = tuple(s.value for s in from_statuses)
+            _open = (_open * 4)[:4]  # pad (by repetition) to the 4 IN placeholders
+        else:
+            _open = (TradeStatus.PENDING.value, TradeStatus.FILLED.value,
+                     TradeStatus.PARTIAL.value, TradeStatus.CLOSING.value)
         with sqlite3.connect(self._db_path) as conn:
             cur = conn.execute(
                 """UPDATE trades
@@ -573,6 +584,24 @@ class StateManager:
                 (unrealized_pnl, pnl_pct, datetime.now().isoformat(), trade_id),
             )
 
+    def get_position_mark(self, trade_id: str) -> dict | None:
+        """Return the last persisted live mark for an open position.
+
+        R16: added for the exit-pricing mark anchor — the wing-width sanity
+        cap alone stopped binding once wings widened to $30-35 (a garbage
+        quote of 10.00 on a structure whose fair close is ~$1 passes a
+        35.00 cap). Consumers must check mark_time freshness themselves.
+        """
+        with sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(
+                "SELECT unrealized_pnl, pnl_pct, mark_time FROM open_positions "
+                "WHERE trade_id = ?",
+                (trade_id,),
+            ).fetchone()
+        if row is None or row[0] is None or row[2] is None:
+            return None
+        return {"unrealized_pnl": row[0], "pnl_pct": row[1], "mark_time": row[2]}
+
     def get_high_water_mark(self, trade_id: str) -> float:
         """Get the high water mark P&L pct for a trade."""
         with sqlite3.connect(self._db_path) as conn:
@@ -773,6 +802,24 @@ class StateManager:
                 "SELECT COALESCE(SUM(commission),0) FROM executions "
                 "WHERE trade_id = ?", (trade_id,)).fetchone()
             return float(row[0] or 0.0)
+
+    def count_executions(self, trade_id: str) -> int:
+        """R16: execution rows recorded for a trade — completeness check for
+        the commission true-up (a partial ledger must defer, not true up)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM executions WHERE trade_id = ?",
+                (trade_id,)).fetchone()
+            return int(row[0] or 0)
+
+    def pending_trueup_trade_ids(self) -> list[str]:
+        """R16: trades whose commission true-up was deferred on a partial
+        executions ledger (bot_state keys trueup_pending_<trade_id>)."""
+        with sqlite3.connect(self._db_path) as conn:
+            rows = conn.execute(
+                "SELECT key FROM bot_state WHERE key LIKE 'trueup_pending_%'"
+            ).fetchall()
+        return [r[0][len("trueup_pending_"):] for r in rows]
 
     def update_trade_realized_pnl(self, trade_id: str, realized_pnl: float) -> None:
         """R15 #8: commission true-up rewrite of a just-closed trade's P&L

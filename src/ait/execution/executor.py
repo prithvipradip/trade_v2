@@ -1103,7 +1103,7 @@ class TradeExecutor:
                         side=f.execution.side,
                         shares=float(f.execution.shares or 0),
                         price=float(f.execution.price or 0),
-                        exec_time=str(f.execution.time or ""),
+                        exec_time=self._normalize_exec_time(f.execution.time),
                         commission=comm,
                         realized_pnl=rpnl,
                         signal_price=sig_price,
@@ -1112,6 +1112,28 @@ class TradeExecutor:
                     )
         except Exception as e:  # noqa: BLE001
             log.debug("executions_sweep_failed", error=str(e))
+
+    @staticmethod
+    def _normalize_exec_time(t) -> str:
+        """R16: store exec_time as TRUE UTC ISO.
+
+        ib_insync hands back either an aware datetime or a naive gateway
+        wall-clock stamp that str() then mislabels '+00:00' — the ledger held
+        mixed semantics (+4h on swept rows vs true UTC on restated rows),
+        silently skewing every time-based join by 4 hours. Aware -> convert
+        to UTC; naive -> localize as LOCAL gateway wall time, then convert.
+        """
+        if not t:
+            return ""
+        try:
+            from datetime import datetime, timezone
+            if isinstance(t, str):
+                return t
+            if t.tzinfo is not None:
+                return t.astimezone(timezone.utc).isoformat()
+            return t.astimezone().astimezone(timezone.utc).isoformat()
+        except Exception:  # noqa: BLE001
+            return str(t)
 
     async def _cancel_stale_orders(self) -> None:
         """Cancel orders that have been pending longer than the timeout."""

@@ -25,76 +25,16 @@ import os
 import sys
 from pathlib import Path
 
-# OpenMP conflict guard. XGBoost and LightGBM each bundle their own OpenMP
-# runtime; loading both on Windows causes an access-violation crash inside
-# xgboost's native training (observed 2026-06-26: segfault in xgboost
-# core.update during vol_magnitude fit, killing the whole process — a crash
-# try/except cannot catch). KMP_DUPLICATE_LIB_OK lets the duplicate runtimes
-# coexist; single-threaded OpenMP avoids the conflicting parallel path.
-# Must be set BEFORE numpy/xgboost/lightgbm import anywhere, and propagates
-# to the bot + retrain subprocesses via inherited env.
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-
-# Market data type: 1=live real-time, 4=delayed-frozen. Live now that the
-# account holds Network B/C (US equity consolidated) + OPRA subscriptions
-# (added 2026-07-02). Propagates to bot + keeper-relaunched subprocesses.
-# Revert to "4" here if the subscription ever lapses.
-# 2026-07-28 (user decision: trade IC on delayed until U6 funds live data).
-# Type 1 with no subscription = 8,446x Error 354 spam and sporadic greeks;
-# explicit delayed-frozen (4) serves clean 15-min data. The economics gates
-# (credit/width, delta band, EM) remain the protection; delayed-era closes
-# are separable by timestamp once live data starts. Flip back to "1" after
-# funding + resubscribe.
-os.environ.setdefault("AIT_MARKET_DATA_TYPE", "4")
-# 2026-08-04 SHADOW ROUND 3 PROMOTION (pre-registered rule, PLAN): the
-# wide_wing_condor arm (wings at 2x the k=0.8 distance) beat the same-run IC
-# baseline PF 1.51 vs 1.31, DD 6.57% vs 8.5%, n=93 — and the broken-wing arm
-# agreed (1.48/5.48%). Both cleared the bar; wide-wing promoted (higher PF,
-# config-only change). k 0.8 -> 1.6 with the ratio floor scaled 0.20 -> 0.10
-# so the ABSOLUTE credit demand per structure is unchanged (the registered
-# deviation — floor scales with width, else doubled width can never pass).
-# The 07-29 wing_k study (k=0.8 winner) conflated wing economics with the
-# entry-population shrink of an UNSCALED floor; round 3 separated them.
-os.environ.setdefault("AIT_IC_WING_K", "1.6")
-os.environ.setdefault("AIT_IC_MIN_CREDIT_WIDTH", "0.10")
-
-# Paper phase keeps short strangles enabled for the edge comparison
-# (PLAN.md go-live gates); the executor refuses undefined-risk orders unless
-# this is "1". REMOVE/SET TO 0 AT GO-LIVE — that's what makes defined-risk-
-# only contractual (institutional audit INST-5).
-os.environ.setdefault("AIT_ALLOW_UNDEFINED_RISK", "1")
-
-# Macro-event protection ON (user decision 2026-07-08): flattens short-premium
-# positions when <=1 day to FOMC/CPI/NFP and blocks new entries around events.
-# This code existed since Round 1 but the switch defaulted OFF — the book
-# would have held short vol straight through the Jul 28-29 FOMC.
-os.environ.setdefault("AIT_SKIP_MACRO_EVENTS", "1")
-
+# R16: the protective/economic env contract (OMP crash guards, delayed-data
+# mode, wide-wing promotion values, undefined-risk gate, macro protection)
+# moved to ait.config.runtime_env so EVERY entry point — this launcher AND a
+# bare `python -m ait.main` — resolves identical values. runtime_env is
+# import-light by contract, so the KMP/OMP guards land before any
+# OpenMP-bundling library loads. .env still loads last, filling unset keys.
 sys.path.insert(0, str(Path(__file__).parent / "src"))
+from ait.config.runtime_env import apply_runtime_env_defaults  # noqa: E402
 
-# Load .env early so AIT_LIQ_* and any other env-var overrides reach the bot
-# subprocesses spawned by BotManager.
-_env_file = Path(__file__).parent / ".env"
-if _env_file.exists():
-    for raw in _env_file.read_text().splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        val = val.strip()
-        if val and val[0] in {'"', "'"}:
-            quote = val[0]
-            end = val.find(quote, 1)
-            if end != -1:
-                val = val[1:end]
-            else:
-                val = val[1:]
-        else:
-            val = val.split("#", 1)[0].rstrip()
-        key = key.strip()
-        if key and key not in os.environ:
-            os.environ[key] = val
+apply_runtime_env_defaults()
 
 from ait.orchestration.master import (
     BotManager,

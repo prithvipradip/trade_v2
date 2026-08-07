@@ -203,9 +203,11 @@ class TradingOrchestrator:
         # NEVER wired — 661 component-down states paged nobody while stops
         # were dead for a full session. Route to Telegram, 1/hour cooldown.
         async def _wd_alert(msg: str) -> None:
-            import time as _t
-            if _t.time() - getattr(self, "_wd_alert_last", 0.0) > 3600:
-                self._wd_alert_last = _t.time()
+            # R16: cooldown keyed PER COMPONENT — one global timestamp meant a
+            # NEW, different critical arriving inside another component's hour
+            # was silently swallowed. Key = first token of the message.
+            _component = (msg.split() or ["unknown"])[0]
+            if self._alert_gate(f"watchdog:{_component}", interval_s=3600):
                 await self._send_notification(f"WATCHDOG {msg}")
         self._watchdog.set_alert_callback(_wd_alert)
 
@@ -435,7 +437,19 @@ class TradingOrchestrator:
             try:
                 _real_comm0 = self._state.total_commission(trade_id)
                 _t0 = self._find_trade_by_id(trade_id)
-                if _real_comm0 > 0 and _t0:
+                # R16: commissionReports for the 4 exit legs arrive ASYNC —
+                # truing up against a partial ledger (e.g. entry legs only)
+                # overstates realized_pnl permanently. Require a complete
+                # ledger (>= 2x leg count: entry side + exit side) before
+                # swapping; else defer to the post-market re-true-up.
+                _legs_n = 4
+                try:
+                    import json as _json
+                    _legs_n = max(1, len(_json.loads(_t0.legs))) if _t0 and _t0.legs else 4
+                except Exception:  # noqa: BLE001
+                    pass
+                _exec_n = self._state.count_executions(trade_id)
+                if _real_comm0 > 0 and _t0 and _exec_n >= 2 * _legs_n:
                     from ait.execution.executor import TradeExecutor as _TE
                     _delta = round(_TE.commission_estimate(_t0) - _real_comm0, 2)
                     if abs(_delta) >= 0.01:
@@ -445,6 +459,12 @@ class TradingOrchestrator:
                         log.info("realized_pnl_commission_trueup",
                                  trade_id=trade_id, delta=_delta,
                                  real_comm=round(_real_comm0, 2))
+                elif _t0:
+                    self._state.set_state(f"trueup_pending_{trade_id}",
+                                          datetime.now().date().isoformat())
+                    log.info("commission_trueup_deferred_partial_ledger",
+                             trade_id=trade_id, executions=_exec_n,
+                             expected=2 * _legs_n)
             except Exception as _e:  # noqa: BLE001 — booking must never die here
                 log.warning("commission_trueup_failed",
                             trade_id=trade_id, error=str(_e))
@@ -1174,6 +1194,13 @@ class TradingOrchestrator:
         if not chains:
             return
 
+        # R16: SELF-HEALING IV STORE. The daily IV series' only writer was a
+        # manual backfill script nobody scheduled — frozen since 07-09, so
+        # every iv_rank ran on a month-old snapshot. Persist today's chain
+        # ATM IV once per symbol per day; the store stays fresh as a side
+        # effect of scanning.
+        self._persist_daily_iv(symbol, chains)
+
         # Filter liquid options
         filtered_chains = [
             c.filter_liquid(self._settings.options) for c in chains
@@ -1256,11 +1283,17 @@ class TradingOrchestrator:
                              p_in_range=f"{range_pred.probability_in_range:.3f}",
                              threshold=range_pred.threshold_pct,
                              horizon_days=range_pred.horizon_days)
-                    # Override confidence for iron condors with range probability
-                    for s in signals:
-                        if s.strategy_name in ("iron_condor", "short_strangle"):
-                            s.confidence = range_pred.probability_in_range
-                            model_overridden.add(s.strategy_name)
+                    # Override confidence for iron condors with range probability.
+                    # R16: the override itself is now gated on entry_gates_enabled —
+                    # with gates OFF the prediction is LOGGED (line above, for future
+                    # studies) but must not flow into eff_conf, where the risk
+                    # manager's min_confidence=0.50 and the Friday >=0.90 gate were
+                    # still vetoing entries. With gates off, ML observes; never vetoes.
+                    if self._settings.ml.entry_gates_enabled:
+                        for s in signals:
+                            if s.strategy_name in ("iron_condor", "short_strangle"):
+                                s.confidence = range_pred.probability_in_range
+                                model_overridden.add(s.strategy_name)
 
             # Vol-magnitude model (Tier 1) for long straddles — predicts P(big move)
             # Direct signal for "buy volatility" strategies, more accurate than
@@ -2357,6 +2390,28 @@ class TradingOrchestrator:
                                    limit_price=limit_price)
         return await self._ibkr.place_order(qualified, order)
 
+    def _marked_cost_to_close(self, trade: TradeRecord) -> float | None:
+        """Per-share cost to close a CREDIT structure per the monitor's marks.
+
+        unrealized = (entry_credit - current_cost) * 100 * qty, so
+        current_cost = entry_credit - unrealized/(100*qty). Returns None when
+        the mark is absent or stale (>15 min) — callers fall back to the
+        structural wing-width bound (R16 exit-pricing mark anchor).
+        """
+        try:
+            mark = self._state.get_position_mark(trade.trade_id)
+            if not mark or not trade.entry_price or not trade.quantity:
+                return None
+            age = (datetime.now()
+                   - datetime.fromisoformat(mark["mark_time"])).total_seconds()
+            if age > 900:
+                return None
+            cost = float(trade.entry_price) - (
+                float(mark["unrealized_pnl"]) / (100.0 * trade.quantity))
+            return max(0.0, cost)
+        except Exception:  # noqa: BLE001 — a broken mark must never block an exit
+            return None
+
     async def _close_multi_leg(self, trade: TradeRecord, legs: list[dict]):
         """Close a multi-leg position by reversing the combo."""
         qualified_legs = []
@@ -2466,6 +2521,26 @@ class TradingOrchestrator:
             )
             limit_price = cap
 
+        # R16: MARK-ANCHORED bound alongside the structural one. The width cap
+        # was calibrated for $2-5 wings; at the promoted $30-35 wings R13's own
+        # worked incident (garbage 9.90 ask -> BUY LMT 10.00 on a structure
+        # fairly worth ~$1) passes UNCAPPED. Anchor to the monitor's persisted
+        # leg-mark cost-to-close: never pay more than max(2x the marked cost,
+        # entry credit + 25% of the wings) unless the mark is stale/absent —
+        # then the structural cap is all we have (unchanged behavior).
+        mark_cost = self._marked_cost_to_close(trade)
+        if is_credit and width and limit_price is not None and mark_cost is not None:
+            anchor = round(min(width, max(2.0 * mark_cost,
+                                          float(trade.entry_price or 0) + 0.25 * width)), 2)
+            if limit_price > anchor:
+                log.warning(
+                    "combo_exit_limit_capped_at_mark_anchor",
+                    symbol=trade.symbol, trade_id=trade.trade_id,
+                    quoted_limit=limit_price, mark_cost=round(mark_cost, 2),
+                    wing_width=width, capped_to=anchor,
+                )
+                limit_price = anchor
+
         # The mirror bound, which the credit-only cap above missed entirely:
         # closing a DEBIT structure SELLS what we own, so the as-defined quote
         # is NEGATIVE (we receive credit) and the limit can only be positive by
@@ -2499,14 +2574,20 @@ class TradingOrchestrator:
         elif is_credit and width:
             # No usable quote on a credit structure. A MARKET order here is
             # the worst possible choice (unbounded fill on 4 illiquid legs in
-            # exactly the tape where marks vanished). Price AT the wing width:
-            # worst case is the max loss the wings already guarantee, and it
-            # will fill against anything sane.
-            fallback = round(width, 2)
+            # exactly the tape where marks vanished). R16: with $30-35 wings,
+            # pricing AT the width means offering ~$3,000-3,500/lot for a
+            # structure whose marked cost may be ~$300 — so anchor to the
+            # persisted leg marks when fresh; the raw width is the LAST
+            # resort (marks gone too), unchanged from R13.
+            if mark_cost is not None:
+                fallback = round(min(width, max(2.0 * mark_cost,
+                                                float(trade.entry_price or 0) + 0.25 * width)), 2)
+            else:
+                fallback = round(width, 2)
             log.critical(
                 "combo_exit_no_quote_pricing_at_wing_width",
                 symbol=trade.symbol, trade_id=trade.trade_id,
-                wing_width=width, limit_price=fallback,
+                wing_width=width, mark_cost=mark_cost, limit_price=fallback,
             )
             if self._alert_gate(f"exit_noquote:{trade.trade_id}"):
                 await self._send_notification(
@@ -2549,6 +2630,28 @@ class TradingOrchestrator:
     async def _post_market(self) -> None:
         """Post-market reconciliation, learning, and reporting."""
         log.info("post_market_starting")
+
+        # R16: settle deferred commission true-ups now that the day's
+        # commissionReports have all landed (booking-time ledger was partial).
+        for _tid in self._state.pending_trueup_trade_ids():
+            try:
+                _t = self._find_trade_by_id(_tid)
+                _real = self._state.total_commission(_tid)
+                if _t is not None and _real > 0 and _t.realized_pnl is not None:
+                    from ait.execution.executor import TradeExecutor as _TE
+                    _delta = round(_TE.commission_estimate(_t) - _real, 2)
+                    if abs(_delta) >= 0.01:
+                        _new_pnl = round(float(_t.realized_pnl) + _delta, 2)
+                        self._state.update_trade_realized_pnl(_tid, _new_pnl)
+                        _st = self._state.get_daily_stats()
+                        _st.total_pnl = round(_st.total_pnl + _delta, 2)
+                        self._state.update_daily_stats(_st)
+                        log.info("commission_trueup_settled_post_market",
+                                 trade_id=_tid, delta=_delta)
+                self._state.delete_state(f"trueup_pending_{_tid}")
+            except Exception as _e:  # noqa: BLE001
+                log.warning("post_market_trueup_failed", trade_id=_tid,
+                            error=str(_e))
 
         # 1. Reconcile with IBKR
         recon = await self._reconciler.reconcile()
@@ -2686,6 +2789,17 @@ class TradingOrchestrator:
         Checks: direction flip, regime shift, VIX spike.
         """
         try:
+            # R16 (2026-08-07): defined-risk NEUTRAL credit structures are
+            # EXEMPT from the whole thesis check. A condor profits in either
+            # direction inside its range, so a direction "flip" is meaningless;
+            # and the vix_spike branch here was the last remaining path that
+            # force-flattened condors into events — undoing the user-approved
+            # hold-through decision (rule-3d exemption) at maximum IV expansion.
+            # Condor exits are TP/touch-stop/DTE only (R6 evidence: measured
+            # best policy). Directional strategies keep the full check.
+            if getattr(pos, "strategy", "") in ("iron_condor", "iron_butterfly"):
+                return False, ""
+
             context = self._state.get_trade_context(pos.trade_id)
             if not context:
                 return False, ""
@@ -2695,7 +2809,10 @@ class TradingOrchestrator:
             entry_vix = context.get("entry_vix", 0)
 
             # 1. Re-run ML prediction on fresh data (no market_context here — lightweight check)
-            hist = await self._market_data.get_historical(pos.symbol, days=60)
+            # R16: 60 days left vol_ratio/vol_mean_reversion/momentum_divergence
+            # all-NaN (they need a 60-bar rolling window + warmup) — the zero-fill
+            # fed the model systematically distorted inputs. 180 covers warmup.
+            hist = await self._market_data.get_historical(pos.symbol, days=180)
             if hist is not None and not hist.empty:
                 # NOTE: was `symbol=symbol` (undefined) — a swallowed NameError
                 # that killed this entire thesis check (incl. regime/VIX branches
@@ -2807,6 +2924,29 @@ class TradingOrchestrator:
         """Find any trade record by ID (including closed)."""
         return self._state.get_trade_by_id(trade_id)
 
+    def _persist_daily_iv(self, symbol: str, chains) -> None:
+        """R16: write today's chain ATM IV into the daily IV store (once per
+        symbol per day) so iv_rank never runs on a frozen series again."""
+        try:
+            today = datetime.now().date().isoformat()
+            marker = f"iv_saved_{symbol}"
+            if self._state.get_state(marker, "") == today:
+                return
+            ivs = [c.atm_iv() for c in chains if hasattr(c, "atm_iv")]
+            ivs = [v for v in ivs if v and v > 0.005]
+            if not ivs:
+                return
+            import pandas as pd
+            atm = sorted(ivs)[len(ivs) // 2]  # median across expiries
+            n = self._historical.save_daily_iv(
+                symbol, pd.Series([atm], index=[pd.Timestamp(today)]))
+            if n:
+                self._state.set_state(marker, today)
+                log.info("daily_iv_persisted", symbol=symbol,
+                         atm_iv=round(atm, 4))
+        except Exception as e:  # noqa: BLE001 — never let bookkeeping kill a scan
+            log.debug("daily_iv_persist_failed", symbol=symbol, error=str(e))
+
     async def _estimate_iv_rank(self, symbol: str) -> float:
         """IV rank (0-100). R7: TRUE percentile of today's implied vol in the
         stored daily IV series when >=60 IV observations exist; otherwise the
@@ -2817,11 +2957,25 @@ class TradingOrchestrator:
         try:
             import sqlite3 as _sq
             con = _sq.connect("file:data/historical.db?mode=ro", uri=True)
-            rows = [r[0] for r in con.execute(
-                "SELECT implied_vol FROM daily_prices WHERE symbol=? "
+            pairs = con.execute(
+                "SELECT date, implied_vol FROM daily_prices WHERE symbol=? "
                 "AND implied_vol IS NOT NULL AND implied_vol > 0 "
-                "ORDER BY date DESC LIMIT 252", (symbol,))]
+                "ORDER BY date DESC LIMIT 252", (symbol,)).fetchall()
             con.close()
+            rows = [p[1] for p in pairs]
+            # R16: FRESHNESS GATE — the series froze on 07-09 and every gate
+            # ran a month on the stale snapshot, unnoticed. A stale head means
+            # "cur" is not today's IV: fall through to the realized proxy
+            # (tagged in logs) rather than serve a fictitious percentile.
+            if pairs:
+                _age_days = (datetime.now().date()
+                             - datetime.fromisoformat(pairs[0][0][:10]).date()).days
+                if _age_days > 5:
+                    log.warning("iv_rank_store_stale", symbol=symbol,
+                                latest=pairs[0][0], age_days=_age_days,
+                                note="using realized-vol proxy; store should "
+                                     "self-heal via daily_iv_persisted")
+                    rows = []
             if len(rows) >= 60:
                 cur = rows[0]
                 below = sum(1 for v in rows if v < cur)

@@ -46,6 +46,13 @@ def _log(level: str, event: str, **kw):
     if extras:
         line += f" | {extras}"
     print(line, flush=True)
+    # R16 #56: pytest drives BotManager/_verify_launch with mock procs
+    # (pid=123) and every run planted fake ERROR launch-failure lines in the
+    # production forensic log — indistinguishable from real 22:xx launch
+    # failures during incident forensics. Under pytest, drop the file sink
+    # (the print above still reaches captured stdout for assertions).
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
     with open(LOGS_DIR / "orchestrator.log", "a") as f:
         f.write(line + "\n")
 
@@ -54,11 +61,14 @@ def _log(level: str, event: str, **kw):
 _TG_CREDS: tuple | None = None
 
 
-def _alert(message: str) -> None:
+def _alert(message: str) -> bool:
     """Send a supervisor-level Telegram alert (best-effort, synchronous).
 
     The supervisor is the only thing that survives a bot crash, so dead-bot
     and restart-exhaustion notifications must originate here, not in the bot.
+    R16: returns True only when Telegram accepted the send — the digest
+    sent-marker (#29) and the TELEGRAM_DEAD recovery probe (#15) both need
+    to know whether the message actually left the box.
     """
     global _TG_CREDS
     if _TG_CREDS is None:
@@ -72,9 +82,9 @@ def _alert(message: str) -> None:
             # one transient settings failure. Leave None so the next alert
             # retries the load.
             _TG_CREDS = None
-            return
+            return False
     if not _TG_CREDS or not _TG_CREDS[0] or not _TG_CREDS[1]:
-        return
+        return False
     token, chat_id = _TG_CREDS
     try:
         import urllib.request
@@ -87,10 +97,33 @@ def _alert(message: str) -> None:
         req = urllib.request.Request(
             f"https://api.telegram.org/bot{token}/sendMessage", data=data)
         urllib.request.urlopen(req, timeout=10)
+        return True
     except Exception as e:  # noqa: BLE001
         import re as _re
         _log("warn", "alert_send_failed",
              error=_re.sub(r"/bot[^/\s]+", "/bot***", str(e))[:300])  # never leak the token via exception URLs
+        return False
+
+
+# R16 #54: per-key alert cooldowns. A single shared timestamp for a class of
+# alerts lets one noisy failure starve a NEW, DIFFERENT critical for the whole
+# window (the exact defect in the bot watchdog's global 1h cooldown). Every
+# throttled supervisor alert site keys its own cooldown through this gate.
+_ALERT_GATE_LAST: dict[str, float] = {}
+
+
+def _alert_gate(key: str, interval_s: float, _now: float | None = None) -> bool:
+    """True if an alert keyed `key` may fire now; records the attempt.
+
+    Records the attempt time whether or not the caller's send then succeeds,
+    so a dead channel is probed once per interval, not every cycle.
+    """
+    now = time.time() if _now is None else _now
+    last = _ALERT_GATE_LAST.get(key)
+    if last is not None and now - last < interval_s:
+        return False
+    _ALERT_GATE_LAST[key] = now
+    return True
 
 
 def _gateway_listening(port: int, host: str = "127.0.0.1") -> bool:
@@ -105,6 +138,143 @@ def _gateway_listening(port: int, host: str = "127.0.0.1") -> bool:
             return True
     except OSError:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Single-instance mutex (R16 #66)
+# ---------------------------------------------------------------------------
+# The keeper's 90s loop and the 07:30 AIT-Bot-Start task both guard with a
+# check-then-launch process-table query — no lock — so two masters can pass
+# the guard inside the same ~1-2s window (TOCTOU). An OS-level exclusive byte
+# lock is atomic and self-releasing: msvcrt region locks die with the process,
+# so there is no stale-pidfile problem to detect.
+
+_singleton_lock_handle = None  # module-held: lock lives exactly as long as this process
+
+
+def _acquire_singleton_lock(lock_path: Path | None = None) -> bool:
+    """Atomically claim the single-orchestrator lock. False = already held."""
+    global _singleton_lock_handle
+    import msvcrt
+    path = lock_path or (DATA_DIR / "orchestrator.lock")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(path, "a+")
+        fh.seek(0)  # locking() operates from the fd's current position
+        try:
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            fh.close()
+            return False
+        try:  # informational only — who holds it (the LOCK is the guard)
+            fh.truncate(0)
+            fh.write(f"{os.getpid()}\n")
+            fh.flush()
+        except OSError:
+            pass
+        _singleton_lock_handle = fh
+        return True
+    except Exception as e:  # noqa: BLE001 — lock plumbing must never keep the bot down
+        _log("warning", "singleton_lock_error", error=str(e))
+        return True
+
+
+def _release_singleton_lock() -> None:
+    """Explicit release (tests / graceful paths); process death also releases."""
+    global _singleton_lock_handle
+    if _singleton_lock_handle is None:
+        return
+    import msvcrt
+    try:
+        _singleton_lock_handle.seek(0)
+        msvcrt.locking(_singleton_lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+    try:
+        _singleton_lock_handle.close()
+    except OSError:
+        pass
+    _singleton_lock_handle = None
+
+
+# ---------------------------------------------------------------------------
+# Process-table scans (R16 #10 / #57)
+# ---------------------------------------------------------------------------
+
+def _scan_foreign_bot_pids() -> list[int]:
+    """R16 #10: PIDs of any pre-existing 'ait.main' trading-bot process.
+
+    An ait.main child orphaned by a master-only death survives (no Job
+    object), the keeper's guard used to match only 'run_orchestrator', and a
+    relaunched master would spawn a SECOND bot trading the same account/DB
+    (the clientId fallback defeats IBKR's duplicate-id rejection). Same
+    Get-CimInstance approach as the keeper (wmic is deprecated, A11)."""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+             "Where-Object { $_.CommandLine -match 'ait\\.main' } | "
+             "Select-Object -ExpandProperty ProcessId"],
+            capture_output=True, text=True, timeout=30)
+        return [int(tok) for tok in result.stdout.split() if tok.strip().isdigit()]
+    except Exception as e:  # noqa: BLE001 — a failed scan must not block a start
+        _log("warning", "foreign_bot_scan_failed", error=str(e))
+        return []
+
+
+def _clear_dashboard_port(port: int = 8501) -> bool:
+    """R16 #57: free the dashboard port before (re)launching Streamlit.
+
+    An orphaned Streamlit from an ungracefully-dead supervisor holds 8501, so
+    every relaunch died within ~1s ('Port 8501 is not available') and the
+    health loop blind-respawned a doomed child every 2 minutes (663 restarts
+    on 08-04 alone). Kill the orphan first. This is the ONE sanctioned
+    process-kill in the supervisor and it is scoped hard: only a process that
+    is LISTENING on the dashboard port AND whose command line is a streamlit
+    launch — never ait.main, never run_orchestrator, never any other python.
+    Returns True when the port is free to bind."""
+    if not _gateway_listening(port):
+        return True  # nothing listening — free
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"Get-NetTCPConnection -State Listen -LocalPort {port} "
+             "-ErrorAction SilentlyContinue | "
+             "Select-Object -ExpandProperty OwningProcess -Unique"],
+            capture_output=True, text=True, timeout=30)
+        pids = [int(tok) for tok in result.stdout.split() if tok.strip().isdigit()]
+    except Exception as e:  # noqa: BLE001
+        _log("warning", "dashboard_port_scan_failed", port=port, error=str(e))
+        return False
+    for pid in pids:
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine"],
+                capture_output=True, text=True, timeout=30)
+            cmdline = (r.stdout or "").strip()
+        except Exception as e:  # noqa: BLE001
+            _log("warning", "dashboard_port_owner_query_failed", pid=pid, error=str(e))
+            continue
+        low = cmdline.lower()
+        if "streamlit" not in low or "ait.main" in low or "run_orchestrator" in low:
+            # NOT ours to kill — leave it and report; the caller skips the
+            # doomed spawn instead of crash-looping against the holder.
+            _log("error", "dashboard_port_held_foreign", pid=pid,
+                 cmdline=cmdline[:160])
+            continue
+        _log("warn", "orphan_dashboard_killing", pid=pid, port=port)
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                           capture_output=True, text=True, timeout=15)
+        except Exception as e:  # noqa: BLE001
+            _log("warning", "orphan_dashboard_kill_failed", pid=pid, error=str(e))
+    # give the OS a moment to release the listener
+    for _ in range(10):
+        if not _gateway_listening(port):
+            return True
+        time.sleep(0.5)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +301,27 @@ class BotManager:
     def start(self):
         if self.is_running:
             _log("info", "bot_already_running", pid=self._proc.pid)
+            return
+
+        # R16 #10: REFUSE to spawn a second trading bot. is_running only knows
+        # about OUR OWN Popen — an ait.main orphaned by a previous master's
+        # death is invisible to it, and spawning alongside it means two bots
+        # trading the same account/DB (the clientId fallback lets the second
+        # one connect). Refuse loudly instead; the operator must resolve the
+        # orphan (it is a live trading process — never auto-kill a bot).
+        foreign = _scan_foreign_bot_pids()
+        if foreign:
+            _log("critical", "bot_start_refused_foreign_bot_running",
+                 pids=foreign)
+            if _alert_gate("foreign_bot_refusal", 1800):
+                _alert(
+                    f"REFUSING to start the trading bot: a pre-existing "
+                    f"ait.main process (PID {foreign}) is already running — "
+                    f"starting another would mean TWO bots trading the same "
+                    f"account. Kill the orphan manually (verify the PID) and "
+                    f"the supervisor will start a fresh bot on the next "
+                    f"health cycle."
+                )
             return
 
         # Ensure IB Gateway is running before starting bot
@@ -404,8 +595,28 @@ class WebServiceManager:
     def _start_dashboard(self):
         if self._dashboard_proc and self._dashboard_proc.poll() is None:
             return
+        # R16 #57: an orphaned Streamlit (from an ungracefully-dead previous
+        # supervisor) holding 8501 made every relaunch die in ~1s and the
+        # health loop respawned a doomed child every 2 min, forever, silently.
+        # Clear the port first; if a NON-streamlit process holds it, skip the
+        # spawn entirely (alert, gated) instead of crash-looping against it.
+        if not _clear_dashboard_port(8501):
+            _log("error", "dashboard_start_skipped_port_held", port=8501)
+            if _alert_gate("dashboard_port_held", 3600):
+                _alert("dashboard NOT started: port 8501 is held by a process "
+                       "the supervisor won't kill — see orchestrator.log "
+                       "(dashboard_port_held_foreign) for the holder.")
+            return
         _log("info", "dashboard_starting", port=8501)
         log_path = LOGS_DIR / "dashboard.log"
+        # R5 F10 pattern: close the previous handle before reopening — the
+        # crash-restart path leaked one open handle per restart (663/day
+        # during the 08-04 loop).
+        if self._dashboard_log:
+            try:
+                self._dashboard_log.close()
+            except Exception:
+                pass
         self._dashboard_log = open(log_path, "a")
         self._dashboard_proc = subprocess.Popen(
             [sys.executable, "-m", "streamlit", "run",
@@ -652,6 +863,14 @@ def daily_report():
     """Generate daily P&L and performance summary."""
     _log("info", "daily_report_starting")
     try:
+        ts = datetime.now().strftime("%Y%m%d")
+        report_path = REPORTS_DIR / f"daily_{ts}.json"
+        # R16 #58: the child used to PRINT the JSON and the parent saved raw
+        # stdout — but TradeAnalytics() emits a structlog line to stdout
+        # first ('duckdb_initialized ...'), so every daily_*.json since
+        # 07-02 began with a log line and json.load failed on all of them.
+        # json.dump straight to the report file instead; stdout stays
+        # log-only and never touches the artifact.
         result = subprocess.run(
             [sys.executable, "-c", """
 import sys, json
@@ -660,8 +879,10 @@ from ait.monitoring.analytics import TradeAnalytics
 
 analytics = TradeAnalytics()
 metrics = analytics.get_performance(lookback_days=1)
-print(json.dumps(metrics.__dict__ if hasattr(metrics, '__dict__') else metrics, indent=2, default=str))
-"""],
+payload = metrics.__dict__ if hasattr(metrics, '__dict__') else metrics
+with open(sys.argv[1], 'w') as f:
+    json.dump(payload, f, indent=2, default=str)
+""", str(report_path)],
             cwd=str(ROOT),
             capture_output=True,
             text=True,
@@ -672,16 +893,21 @@ print(json.dumps(metrics.__dict__ if hasattr(metrics, '__dict__') else metrics, 
         # (get_performance_metrics), wrote the empty stdout, and logged
         # success — the 4:30 report has been an empty file since day one.
         # Gate on the child actually succeeding.
-        if result.returncode != 0 or not result.stdout.strip():
+        if result.returncode != 0:
             _log("error", "daily_report_child_failed",
                  returncode=result.returncode,
                  stderr=(result.stderr or "")[:400])
             return
 
-        ts = datetime.now().strftime("%Y%m%d")
-        report_path = REPORTS_DIR / f"daily_{ts}.json"
-        with open(report_path, "w") as f:
-            f.write(result.stdout)
+        # R16 #58: and gate on the artifact PARSING — 'complete' was logged
+        # for 22 straight invalid files; never again without a json.load.
+        try:
+            with open(report_path) as f:
+                json.load(f)
+        except (OSError, ValueError) as e:
+            _log("error", "daily_report_invalid_json", report=str(report_path),
+                 error=str(e)[:200])
+            return
 
         _log("info", "daily_report_complete", report=str(report_path))
     except Exception as e:
@@ -832,9 +1058,34 @@ def daily_digest():
             # Mirror unreadable/absent — say so loudly rather than silently
             # falling back to a green-looking local mtime.
             parts.append("mirror MISSING")
-        _alert("DIGEST: " + " | ".join(parts))
+        # R16 #29: record a sent-marker so the startup catch-up knows whether
+        # today's digest actually went out. Only on a CONFIRMED send — a
+        # failed/credless send leaves no marker, so the next boot retries.
+        if _alert("DIGEST: " + " | ".join(parts)):
+            try:
+                marker = DATA_DIR / f"digest_sent_{datetime.now().strftime('%Y%m%d')}"
+                for _old in DATA_DIR.glob("digest_sent_*"):
+                    if _old != marker:
+                        _old.unlink()
+                marker.write_text(datetime.now().isoformat())
+            except Exception as _me:  # noqa: BLE001
+                _log("warning", "digest_marker_failed", error=str(_me))
     except Exception as e:  # noqa: BLE001
         _log("warning", "daily_digest_failed", error=str(e))
+
+
+def _digest_catchup_due(now: datetime, data_dir: Path | None = None) -> bool:
+    """R16 #29: should a supervisor boot send the missed 09:35 digest now?
+
+    True on a weekday boot inside 09:35-16:00 ET with no digest_sent marker
+    for today. Before 09:35 the cron will fire normally; at/after 16:00 the
+    16:05 PM digest is imminent and carries the same content."""
+    if now.weekday() >= 5:
+        return False
+    if not ((9, 35) <= (now.hour, now.minute) < (16, 0)):
+        return False
+    d = data_dir if data_dir is not None else DATA_DIR
+    return not (d / f"digest_sent_{now.strftime('%Y%m%d')}").exists()
 
 
 def _max_concurrent_car(rows) -> float:
@@ -1033,11 +1284,95 @@ def _append_health_metric(metrics: dict):
         f.write(json.dumps(metrics) + "\n")
 
 
+def _daily_report_catchup_due(now: datetime, reports_dir: Path | None = None) -> bool:
+    """R16 #59: should a supervisor boot run the missed 16:30 daily report?
+
+    True on a weekday boot at/after 16:35 with no daily_YYYYMMDD.json for
+    today. The 16:35 threshold leaves the cron slot 5 min of margin so a boot
+    at 16:3x cannot double-run alongside the scheduled job."""
+    if now.weekday() >= 5:
+        return False
+    if (now.hour, now.minute) < (16, 35):
+        return False
+    d = reports_dir if reports_dir is not None else REPORTS_DIR
+    return not (d / f"daily_{now.strftime('%Y%m%d')}.json").exists()
+
+
+def _backtest_catchup_due(now: datetime, reports_dir: Path | None = None) -> bool:
+    """R16 #59: was the weekly Sunday 20:00 backtest slot missed?
+
+    True when the newest backtest_*.json predates the most recent Sunday
+    20:00 slot (or none exists at all — the observed state: exactly one run
+    since March). `now` is naive local time (box runs ET), matching the
+    artifact mtimes it is compared against."""
+    d = reports_dir if reports_dir is not None else REPORTS_DIR
+    # Most recent Sunday-20:00 slot at or before `now` (Mon=0..Sun=6).
+    due = (now - timedelta(days=(now.weekday() + 1) % 7)).replace(
+        hour=20, minute=0, second=0, microsecond=0)
+    if due > now:  # it IS Sunday, before 20:00 — last due slot was last week's
+        due -= timedelta(days=7)
+    snaps = list(d.glob("backtest_*.json"))
+    if not snaps:
+        return True
+    newest = max(datetime.fromtimestamp(f.stat().st_mtime) for f in snaps)
+    return newest < due
+
+
+def _backtest_catchup_run_at(now: datetime) -> datetime:
+    """R16 #59: when to run the backtest catch-up.
+
+    Deferred 10 min after start (never synchronously in main() — a stuck
+    subprocess there would block the whole supervisor, finding #69), and
+    never inside market hours: the 10-min full-core backtest has no business
+    running beside the live bot. If the deferred slot would land in (or
+    within 15 min of) the 9:30-16:00 session, push it to 16:40 ET — after
+    the 16:30 report slot."""
+    run_at = now + timedelta(minutes=10)
+    if run_at.weekday() < 5 and (9, 15) <= (run_at.hour, run_at.minute) < (16, 30):
+        run_at = run_at.replace(hour=16, minute=40, second=0, microsecond=0)
+    return run_at
+
+
+def _check_telegram_dead():
+    """R16 #15: the bot writes data/TELEGRAM_DEAD after 5 consecutive dropped
+    sends — and until now NOTHING read it (the writer's own comment claimed
+    the digest surfaced it; it never did), so a dead alert channel stayed
+    invisible until the operator noticed prolonged silence. Every health
+    cycle: log critical while the marker exists, probe the channel at most
+    once per hour, and clear the marker the moment a send goes through."""
+    marker = DATA_DIR / "TELEGRAM_DEAD"
+    try:
+        if not marker.exists():
+            return
+        detail = ""
+        try:
+            detail = marker.read_text()[:120]
+        except OSError:
+            pass
+        _log("critical", "telegram_dead_marker_present", detail=detail)
+        if not _alert_gate("telegram_dead_probe", 3600):
+            return
+        if _alert("Telegram channel RECOVERED — the bot had marked it dead "
+                  f"({detail or 'no detail'}). Alerts dropped during the "
+                  "outage were NOT re-delivered; check logs for "
+                  "notification_dropped_after_retries."):
+            marker.unlink()
+            _log("info", "telegram_dead_marker_cleared")
+    except Exception as e:  # noqa: BLE001 — health loop must never die on this
+        _log("warning", "telegram_dead_check_failed", error=str(e))
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
+    # R16 #66: atomic single-instance gate BEFORE any side effects — the
+    # keeper's 90s loop and the 07:30 scheduled task can both pass their
+    # check-then-launch guards in the same window; the OS lock cannot race.
+    if not _acquire_singleton_lock():
+        _log("info", "orchestrator_already_running", action="exiting")
+        return
     _log("info", "orchestrator_starting", pid=os.getpid())
     _alert("supervisor started — bot + web services coming up.")
 
@@ -1073,6 +1408,9 @@ def main():
     def combined_health_check():
         bot.health_check()
         web.health_check()
+        # R16 #15: surface a dead Telegram channel (bot-written marker that
+        # nothing read); probes hourly, clears itself on a successful send.
+        _check_telegram_dead()
 
     scheduler.add_job(combined_health_check, "interval", minutes=2, id="health_check")
 
@@ -1122,14 +1460,51 @@ def main():
             retrain_models()
     except Exception as _e:  # noqa: BLE001
         _log("warning", "startup_retrain_check_failed", error=str(_e))
+    # R16 #29: digest catch-up — the 09:35 digest ('absence IS the alarm')
+    # was silently skipped on exactly the outage mornings it was built to
+    # expose (boots at 13:43 on 08-05, 11:44 on 08-06: no digest either day).
+    # Same catch-up pattern as backup/retrain above: trading-day boot inside
+    # 09:35-16:00 with no digest_sent marker for today -> send one now.
+    try:
+        from ait.utils.time import now_et as _dnet
+        if _digest_catchup_due(_dnet()):
+            _log("info", "startup_catchup_digest")
+            daily_digest()
+    except Exception as _e:  # noqa: BLE001
+        _log("warning", "startup_digest_check_failed", error=str(_e))
     scheduler.add_job(daily_report,
                       CronTrigger(day_of_week="mon-fri", hour=16, minute=30),
                       id="daily_report")
+    # R16 #59: same missed-slot catch-up for the 16:30 report (a boot after
+    # 16:30 skips the cron entirely — in-memory jobstore, grace only applies
+    # while the process is alive).
+    try:
+        from ait.utils.time import now_et as _rpnet
+        if _daily_report_catchup_due(_rpnet()):
+            _log("info", "startup_catchup_daily_report")
+            daily_report()
+    except Exception as _e:  # noqa: BLE001
+        _log("warning", "startup_daily_report_check_failed", error=str(_e))
 
     # Weekly deep backtest: Sunday 8 PM ET
     scheduler.add_job(run_backtest,
                       CronTrigger(day_of_week="sun", hour=20, minute=0),
                       id="weekly_backtest")
+    # R16 #59: weekly-backtest catch-up — fired ONCE since March (Apr 26);
+    # the box is routinely off Sunday 20:00. Unlike the report, this one is
+    # DEFERRED 10 min (never synchronously in main(), #69) and never runs
+    # during market hours: pushed past 16:30 ET if it would land in-session.
+    try:
+        _now_bt = datetime.now()  # naive local (=ET box), matches file mtimes
+        if _backtest_catchup_due(_now_bt):
+            _bt_at = _backtest_catchup_run_at(_now_bt)
+            scheduler.add_job(run_backtest, "date", run_date=_bt_at,
+                              id="backtest_catchup",
+                              name="Weekly backtest catch-up")
+            _log("info", "startup_catchup_backtest_scheduled",
+                 run_at=_bt_at.strftime("%Y-%m-%d %H:%M"))
+    except Exception as _e:  # noqa: BLE001
+        _log("warning", "startup_backtest_check_failed", error=str(_e))
 
     # Monthly log cleanup: 1st of month at midnight
     scheduler.add_job(cleanup_old_logs,
