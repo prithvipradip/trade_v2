@@ -725,3 +725,23 @@ U7 private. T1 CODE (before next entry/exit): VIX-flatten defined-risk exemption
 tradingClass fix; IV-rank unfreeze; CLOSING wedge + sweep liveness; TELEGRAM_DEAD reader.
 T2: credit-loss-limit parity, research/live model fence, exit sanity rescale, PDT stop
 exemption, PLAN evidence annotations. T3: books/TZ/scheduler/dashboard/test hygiene.
+
+## 2026-08-07 - R16 FIX-ALL EXECUTED (fc16531; 3 agents + core cluster; suite 850 green)
+40+ verified defects fixed same day - full map in the commit message. Highlights: condors
+now FULLY hold-through (VIX/thesis flatten exempted - the last flatten path); chain
+tradingClass fix (IWM 2->249 strikes live-verified; IWM universe slot resurrects Monday);
+iv_rank store SELF-HEALS from scan ATM IV + freshness gate (was frozen since 07-09 - all
+recent iv_rank values suspect); exit limits mark-anchored; look-ahead fence (walkforward
+OOS + Optuna can no longer score with the live future-trained ensemble; range-gate block
+contract enforced + training status surfaced in summaries); credit-loss-limit parity
+live=0; runtime env contract shared by all entry points (undefined-risk gate now CLOSED);
+double-bot guards + singleton lock; TELEGRAM_DEAD reader; digest/report/backtest catch-
+ups; 2027-H1 calendar. NOT DONE MACHINE-SIDE (classifier-blocked): daily_stats 07-22
+backfill - OPERATOR: run `python scripts/restate_r16_dailystats.py --apply`; bot restart
+- fixes go live on next boot (nightly shutdown covers it; market closed until Monday).
+EVIDENCE CAVEAT NOW FIXABLE: the 08-03 ablation + 08-04 wide-wing promotion ran with the
+look-ahead leak + dead range gate; RE-RUN both under the fence before treating either
+verdict as evidenced (queued: rerun ablation + shadow R3 with allow_live_model_fallback
+=False; relative orderings may survive, absolute PFs will drop). USER STANDING: U1
+deadman file, box on by 09:25 (or BIOS auto-on + U2), U7 private repo, MySQL/Gateway
+firewall scoping (U3/U9 elevated).
