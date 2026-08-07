@@ -694,3 +694,34 @@ SUPERSEDED for the scaled-floor parameterization. EPOCH MARKER: live closes from
 2026-08-04 are the wide-wing epoch (k=1.6, floor 0.10, gates-only, no ML veto, 1-day
 blackout, hold-through-events). The open QQQ condor T-20260804-095630 (entered 09:56,
 $6.44 credit, k=0.8 strikes) is the LAST k=0.8-epoch position.
+
+## 2026-08-07 - R16 FULL AUDIT (16 dimensions, 118 agents, all findings 2-skeptic verified)
+111 raw -> 70 survived verification (+40 unvetted lows). Full detail: session task output
+wbkvg8gc1 + workflow journal wf_ebdc88ff-20d. CRITICAL: dead-man (U1) STILL unarmed while
+the HOST was shut down (Start-menu, Event 1074) 5 of last 10 nights, returning 10:22-13:43
+- market-hours blind with live positions unmanaged 08-05 (4.2h) and 08-06 (2.2h); zero
+pages possible (all alert paths die with the box). TOP VERIFIED DEFECT CLUSTERS:
+(1) DATA: options_chain picks first SMART chain-def -> adjusted class 2IWM/2SPY/2QQQ
+garbage mini-chains; IWM dead since 07-17, SPY eval dead 08-05 pm (4 phantom strikes);
+IV RANK FROZEN since 07-09 (all gates on stale snapshot); Yahoo degradation silent with
+placeholder 1e-5 IVs. (2) EXITS (2 live positions!): VIX-spike thesis check STILL
+flattens condors (contradicts hold-through decision - unowned branch orchestrator.py
+~2722); BAG exit live-quote path dead code (qualification always fails); exit sanity
+bounds rescaled 8-14x by wide wings; PDT guard can veto same-day stop exits; commission
+true-up races partial commissionReports. (3) STATE: CLOSING-never-booked wedge when
+broker flat; stale-pending sweep books never-filled while order works; orphaned-child
+double-bot (guards match only run_orchestrator); CAS from-set includes FILLED.
+(4) EVIDENCE INTEGRITY: all recent studies (ablation, wing_k, shadow R1-R3) evaluated
+OOS windows with the LIVE fully-trained ensemble (look-ahead; relative arm-vs-arm
+ordering likely survives - same contamination all arms - absolute PFs inflated);
+AIT_CREDIT_LOSS_LIMIT live=0/disabled vs backtest=1.25/active parity break; referee
+49.9% slippage BREAK is a ledger-semantics artifact. (5) OPS: repo PUBLIC (U7), Gateway
+API 0.0.0.0:4002, MySQL LAN-reachable, no auto-logon (U2). daily_stats missing 07-22 row
+(+$575.33 cumulative overstatement in daily view). COVERAGE GAPS (critic): broker-vs-DB
+ground truth not compared; live exit path unexercised since 07-22; VIX-thesis branch
+never executed by any auditor; end-to-end Telegram delivery unproven.
+FIX TIERS: T0 USER = U1 dead-man file + power box on by 09:25 (or BIOS auto-on + U2) +
+U7 private. T1 CODE (before next entry/exit): VIX-flatten defined-risk exemption; chain
+tradingClass fix; IV-rank unfreeze; CLOSING wedge + sweep liveness; TELEGRAM_DEAD reader.
+T2: credit-loss-limit parity, research/live model fence, exit sanity rescale, PDT stop
+exemption, PLAN evidence annotations. T3: books/TZ/scheduler/dashboard/test hygiene.
