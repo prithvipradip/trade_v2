@@ -283,12 +283,16 @@ class TestPreEventBlackoutRelaxed:
                 i = src.find("AIT_SKIP_MACRO_EVENTS", i + 1)
 
 
-# ABLATION VERDICT 2026-08-03: ML entry gates removed (default OFF)
-class TestMlGatesRemoved:
-    def test_entry_gates_disabled_by_default(self):
+# ABLATION VERDICT REVERSED 2026-08-08 (rule B1): the 08-03 removal rested on
+# a run where 96/96 window trainings FAILED (all arms identical by construction,
+# live artifact leaking in as a look-ahead predictor). The honest re-run —
+# train_days=365, R16 fence, 11y, 242 models actually trained — shows the gates
+# cut max drawdown 34.6% -> 10.0% and lift PF 1.05 -> 1.27 at n=92.
+class TestMlGatesRestored:
+    def test_entry_gates_enabled_by_default(self):
         from ait.config.settings import MLConfig
-        assert MLConfig().entry_gates_enabled is False  # 3 identical runs: gates veto nothing
+        assert MLConfig().entry_gates_enabled is True
 
-    def test_flag_can_reenable_for_studies(self):
+    def test_flag_can_disable_for_studies(self):
         from ait.config.settings import MLConfig
-        assert MLConfig(entry_gates_enabled=True).entry_gates_enabled is True
+        assert MLConfig(entry_gates_enabled=False).entry_gates_enabled is False

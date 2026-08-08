@@ -1,0 +1,111 @@
+{
+  "window": 31,
+  "test_start": "2020-01-12",
+  "test_end": "2020-03-15",
+  "pnl": -10404.7,
+  "return_pct": -3.4682,
+  "trades": 1,
+  "win_rate": 0.0,
+  "sharpe": 0.0,
+  "max_drawdown": 3.4682,
+  "strategies": {
+    "iron_condor": 1
+  },
+  "best_params": {},
+  "trades_detail": [
+    {
+      "symbol": "QQQ",
+      "strategy": "iron_condor",
+      "entry_date": "2020-02-21",
+      "entry_time": "2020-02-21",
+      "exit_date": "2020-03-09",
+      "exit_time": "2020-03-09",
+      "exit_reason": "expiry_approaching",
+      "pnl": -10404.7,
+      "entry_confidence": 0.4,
+      "entry_regime": "range_bound",
+      "contracts": 13,
+      "n_legs": 4,
+      "hold_days": 17,
+      "entry_price": 2.0834,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 10.035,
+      "entry_iv_rank": 0.5582,
+      "entry_vix_level": 0.5,
+      "credit": 2708.42,
+      "max_loss": 9298.25,
+      "return_pct": -1.119,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 222.0,
+          "premium": 1.1459
+        },
+        {
+          "type": "long_put",
+          "strike": 213.0,
+          "premium": -0.1042
+        },
+        {
+          "type": "short_call",
+          "strike": 241.0,
+          "premium": 1.1459
+        },
+        {
+          "type": "long_call",
+          "strike": 250.0,
+          "premium": -0.1042
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.4,
+        "range_gate": {
+          "prob": null,
+          "threshold": 0.55,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.1512,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.0571,
+          "threshold": 0.2,
+          "pass": true
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 2149,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": 0.0413
+      },
+      "features_at_entry": {
+        "rsi_14": 70.59,
+        "macd_hist": -0.00047,
+        "bb_position": 0.581,
+        "atr_pct": 0.0138,
+        "realized_vol_20": 0.1865,
+        "iv_rank": 0.558,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.896
+      }
+    }
+  ],
+  "model_weights": {
+    "range_predictor": {
+      "status": "disabled_by_config",
+      "threshold_pct": 0.05
+    }
+  }
+}

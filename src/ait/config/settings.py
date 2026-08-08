@@ -181,10 +181,18 @@ class MLConfig(_StrictModel):
     retrain_interval_days: int = Field(default=7, ge=1, le=30)
     lookback_days: int = Field(default=504, ge=60, le=2520)
     min_training_samples: int = Field(default=100, ge=30)
-    # ABLATION VERDICT 2026-08-03 (3 identical runs, rule pre-registered):
-    # ML entry gates veto nothing. Default OFF; the entry path runs on the
-    # strategy gate stack alone. Models still train for future studies.
-    entry_gates_enabled: bool = False
+    # ABLATION VERDICT REVERSED 2026-08-08 (rule B1 pre-registered in PLAN).
+    # The 08-03 "gates veto nothing" run was VACUOUS: per-window training
+    # failed 96/96 times (train_days=126 left ~27 samples vs the 100 floor),
+    # so all three arms were the same ungated engine and the live artifact
+    # leaked in as a look-ahead predictor. Re-run with train_days=365 + the
+    # R16 fence, 11y / 68 windows / 242 models genuinely trained:
+    #   gates OFF n=274 PF 1.05 DD 34.57%   gates ON n=92 PF 1.27 DD 9.97%
+    # The gates are a DRAWDOWN control above all — 34.6% -> 10.0% across
+    # 2018/2020/2022 vol events — and they clear B1 (PF +0.22 > 0.10, DD
+    # better, n>=30, 40 trading windows). Default back ON.
+    # COST, measured and accepted: ~66% of candidate entries rejected.
+    entry_gates_enabled: bool = True
     range_min_confidence: float = Field(default=0.65, ge=0.50, le=0.90,
         description="Floor for model-overridden signal confidence (range/"
                     "vol-mag). 0.65 beat 0.55 across every backtest metric. "

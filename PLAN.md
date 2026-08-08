@@ -822,3 +822,32 @@ and the 08-03 outcome stands for the right reason at last.
 LESSON (process): a pre-registered rule with a missing floor is still a rule I must
 report against honestly rather than quietly reinterpret - recorded here as a defect in
 MY rule, not in the result.
+
+## 2026-08-08 - RULE B1 APPLIED: ML ENTRY GATES BACK ON (08-03 removal REVERSED on evidence)
+CONFIRM RUN (scripts/ablation_confirm.py, ~11y, 68 windows, 242 window models genuinely
+trained - 14 insufficient + 9 no-accuracy only):
+  gate_only  (ML OFF) n=274 win 77.4% PF 1.05 DD 34.57% ret +2.47%  68 windows
+  full_stack (ML ON)  n= 92 win 64.1% PF 1.27 DD  9.97% ret +3.05%  40 windows
+B1 SATISFIED on a proper sample (PF +0.22 > 0.10; DD 9.97 vs 34.57; n=92 >= 30; 40
+trading windows >= 20). The 08-08 short-run PF gap (1.95 vs 1.04) narrowed to 1.27 vs
+1.05 with 3.7x the trades - the small sample WAS inflated, exactly as the missing-n-floor
+disclosure warned - but the direction and the DD result both held. APPLIED:
+MLConfig.entry_gates_enabled True (settings.py), test pin flipped
+(TestMlGatesRestored). Live effect at next boot.
+THE REAL HEADLINE IS THE DRAWDOWN, NOT THE PF. Over 11 years spanning 2018/2020/2022 the
+UNGATED condor - our live config until this commit - draws down 34.57%. On the planned
+$3,000 live account that is a ~$1,040 hole; the gated arm's 9.97% is ~$300. Every prior
+DD number we ever quoted (5-18%) came from 2-4 year windows that CONTAINED NO REAL VOL
+EVENT. This is the first honest look at the strategy through a full cycle and it is the
+most important number produced so far.
+COST ACCEPTED + NEW PROBLEM: gates reject ~66% of candidates (274 -> 92 over 11y ~ 8
+trades/yr across 3 symbols). The 50-close sample at that rate takes years. VELOCITY IS
+NOW THE BINDING CONSTRAINT ON THE WHOLE PROGRAM - and note the ungated alternative is not
+a fix, it is PF 1.05 (breakeven) with a 34.6% hole. Next studies must attack velocity
+WITHOUT reopening that drawdown: (a) ml.range_min_confidence=0.65 is the binding live
+floor and has NEVER been studied (current live QQQ p_in_range 0.587 sits just under it) -
+sweep it; (b) universe breadth (the R2 uncorrelated-universe rejection was measured
+UNGATED - retest gated); (c) DTE/entry-cadence.
+COUPLING HANDLED: the 08-08 wing verdict (rerun A) was measured GATES-OFF and therefore
+no longer matches live. scripts/shadow_round3_gated.py launched (same 3 arms, gates ON,
+365-day train, 11y) - the wide-vs-broken wing decision is DEFERRED until it lands.
