@@ -774,3 +774,26 @@ DECISION RULES (registered now):
      removal is CONFIRMED on valid evidence.
 Absolute PFs from these reruns are expected LOWER than 08-03/08-04 (the leak inflated
 them); the arm ORDERING is the load-bearing output.
+
+## 2026-08-08 - RERUN A VERDICT: shadow R3 under the fence (rules pre-registered above)
+Clean run (train_window_models=False => NO models, look-ahead impossible), same windows/
+data/k as 08-04, 29 windows SPY/QQQ/IWM:
+  iron_condor        n=97  win 82.5%  PF 1.85  DD 12.31%  ret +9.91%
+  wide_wing_condor   n=100 win 84.0%  PF 1.91  DD  8.68%  ret +5.47%
+  broken_wing_condor n=97  win 83.5%  PF 2.13  DD  5.52%  ret +5.18%
+PREDICTION FALSIFIED: I registered "absolute PFs will drop"; every arm rose sharply
+(IC 1.31->1.85). Mechanism: the leaked artifact was the DIRECTION ensemble, and its
+future-trained calls were FILTERING OUT profitable neutral entries. The look-ahead model
+made selection WORSE than no model — a result that only the fence could expose, and
+independent corroboration of the ML-is-not-helping thesis (pending rerun B).
+RULE A1 APPLIED: wide_wing beats the baseline on PF (1.91 > 1.85) with lower DD (8.68 <
+12.31) at n=100 -> KEEPS its live slot. NO revert. Live config unchanged.
+NEW, ON CLEAN EVIDENCE: the 08-04 wide-vs-broken ORDERING FLIPS. broken_wing now
+DOMINATES wide_wing on both criteria (PF 2.13 vs 1.91; DD 5.52% vs 8.68%) and clears the
+standard promotion bar (PF>1.2, DD<=IC arm, n>=30) by the widest margin of any arm ever
+tested. It stays shadow ONLY because live has no asymmetric-wing builder
+(strategies/iron_condor.py builds symmetric wings). PROMOTION BLOCKED ON CODE, NOT
+EVIDENCE - user decision: build the asymmetric builder (put wing 2x call wing) or keep
+wide-wing. Note the trade-off the numbers make explicit: IC has the highest total RETURN
+(+9.91%) with the worst DD - narrower wings size more contracts per risk unit; PF/DD is
+the pre-registered decision metric, not raw return.

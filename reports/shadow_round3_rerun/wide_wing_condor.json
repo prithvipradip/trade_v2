@@ -1,0 +1,9 @@
+{
+ "arm": "wide_wing_condor",
+ "n": 100,
+ "win_rate": 84.0,
+ "pf": 1.91,
+ "max_dd_pct": 8.68,
+ "total_ret_pct": 5.47,
+ "windows": 29
+}
