@@ -797,3 +797,28 @@ EVIDENCE - user decision: build the asymmetric builder (put wing 2x call wing) o
 wide-wing. Note the trade-off the numbers make explicit: IC has the highest total RETURN
 (+9.91%) with the worst DD - narrower wings size more contracts per risk unit; PF/DD is
 the pre-registered decision metric, not raw return.
+
+## 2026-08-08 - RERUN B VERDICT: honest ML ablation REVERSES the 08-03 removal
+First ablation where models ACTUALLY trained (72 window models + 79 range models trained;
+only 9 insufficient_training_data + 2 no-accuracy, vs 96/96 FAILURES in the 08-03 run
+that made that verdict vacuous). train_days=365, fence on, 25 windows:
+  gate_only  (ML OFF) n=75 win 77.3% PF 1.04 DD 13.94% ret +0.43%  25 windows
+  full_stack (ML ON)  n=20 win 70.0% PF 1.95 DD  1.72% ret +1.03%  13 windows
+The gates VETO HARD: 75 -> 20 trades (73% rejected), and 12 of 25 windows produce no
+trade at all. On PF and DD the gated arm wins by a mile (1.95 vs 1.04; 1.72% vs 13.94%).
+This is the OPPOSITE of the 08-03 verdict ("gates veto nothing") - which we now know
+tested nothing at all.
+RULE B1 IS TECHNICALLY SATISFIED (PF +0.91 > 0.10, DD better, >=20 trained windows) =>
+the rule says turn ML entry gates back ON. WITHHELD PENDING CONFIRMATION, disclosed:
+B1 as I registered it OMITTED an n floor, and n=20 is below the n>=30 bar this project
+applies to every other promotion. PF on 20 trades (14W/6L) cannot be separated from
+noise, and flipping gates ON live would cut entries ~73%, gutting the 50-close sample
+velocity that is the whole point of the live phase. Running ablation_confirm.py
+(scripts/, ~11y history via days=4000) so the gated arm can clear n>=30 on
+non-overlapping windows before any live change. If the confirm run holds (gated PF still
+> ungated by >0.10, DD no worse, n>=30) -> set ml.entry_gates_enabled=True and record the
+08-03 removal as REVERSED-ON-EVIDENCE; if it collapses toward parity -> gates stay OFF
+and the 08-03 outcome stands for the right reason at last.
+LESSON (process): a pre-registered rule with a missing floor is still a rule I must
+report against honestly rather than quietly reinterpret - recorded here as a defect in
+MY rule, not in the result.
