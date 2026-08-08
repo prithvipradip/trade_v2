@@ -745,3 +745,32 @@ verdict as evidenced (queued: rerun ablation + shadow R3 with allow_live_model_f
 =False; relative orderings may survive, absolute PFs will drop). USER STANDING: U1
 deadman file, box on by 09:25 (or BIOS auto-on + U2), U7 private repo, MySQL/Gateway
 firewall scoping (U3/U9 elevated).
+
+## 2026-08-07 - R16 STUDY RE-RUNS (PRE-REGISTERED before results; supersede 08-03/08-04)
+WHY: R16 proved both prior verdicts rested on broken evidence — (a) per-window training
+failed in 96/96 windows (only ~27 feature rows survived the warmup at train_days=126 vs
+min_training_samples=100), and the engine then fell back to the LIVE future-trained
+ensemble => look-ahead leak on every OOS window; (b) the "range model absent -> block
+entries" contract never fired (engine skipped the gate when predictor was None), so the
+ablation's "gates veto nothing" tested nothing.
+RERUN A - shadow R3 (scripts/shadow_round3_rerun.py): iron_condor vs wide_wing_condor vs
+broken_wing_condor, train_window_models=False => NO models at all, matching LIVE
+(entry_gates_enabled=False). Look-ahead structurally impossible. Same windows/data/k as
+the original so the numbers are directly comparable.
+RERUN B - ablation (scripts/ablation_rerun.py): gate_only(False) vs full_stack(True) at
+train_days=365 (~190 samples clear warmup) so window models ACTUALLY train — the first
+honest test of whether ML gates veto anything.
+DECISION RULES (registered now):
+ A1. wide_wing keeps its live slot ONLY if it still beats the IC baseline on PF with DD
+     <= baseline on the SAME rerun windows, n>=30. If it loses -> revert live to k=0.8/
+     floor 0.20 (AIT_IC_WING_K/AIT_IC_MIN_CREDIT_WIDTH in ait/config/runtime_env.py).
+ A2. If NO arm reaches n>=30 the rerun is INCONCLUSIVE — live config stays as-is and the
+     wide-wing promotion is downgraded to "unevidenced, retained by default" in PLAN.
+ B1. ML entry gates stay OFF unless full_stack beats gate_only on PF by >0.10 AND does
+     not worsen DD, with >=20 windows where the model actually trained (status reported
+     in the summary's RANGE MODEL TRAINING section). Any window count of trained models
+     ==0 => rerun is void, report as such rather than re-deriving the old verdict.
+ B2. Both arms identical again (same n, PF, DD) => gates provably inert -> the 08-03
+     removal is CONFIRMED on valid evidence.
+Absolute PFs from these reruns are expected LOWER than 08-03/08-04 (the leak inflated
+them); the arm ORDERING is the load-bearing output.
