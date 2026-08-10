@@ -851,3 +851,24 @@ UNGATED - retest gated); (c) DTE/entry-cadence.
 COUPLING HANDLED: the 08-08 wing verdict (rerun A) was measured GATES-OFF and therefore
 no longer matches live. scripts/shadow_round3_gated.py launched (same 3 arms, gates ON,
 365-day train, 11y) - the wide-vs-broken wing decision is DEFERRED until it lands.
+
+## 2026-08-10 - WING VERDICT UNDER GATES-ON: wide_wing CONFIRMED, broken_wing REJECTED
+scripts/shadow_round3_gated.py (same 3 arms, gates ON = the regime live actually runs,
+365-day train, fence on, 11y, 40 windows):
+  iron_condor        n=92 win 64.1% PF 1.27 DD 9.97% ret +3.05%
+  wide_wing_condor   n=95 win 71.6% PF 1.62 DD 4.91% ret +3.36%   <-- LIVE, CONFIRMED
+  broken_wing_condor n=94 win 64.9% PF 1.27 DD 4.41% ret +1.44%
+DEFERRED DECISION RESOLVED - NO LIVE CHANGE, NO ASYMMETRIC BUILDER NEEDED. wide_wing
+wins PF (1.62 vs 1.27/1.27) and return, at a DD statistically tied with broken_wing
+(4.91 vs 4.41) and half the baseline's. Broken_wing's apparent 08-08 dominance (PF 2.13)
+was an ARTIFACT OF THE UNGATED REGIME: with gates on it collapses to 1.27, identical to
+the plain condor. Deferring the builder was the correct call - building it on Saturday's
+numbers would have shipped a DOWNGRADE.
+METHOD NOTE (third reversal in a week, all from the same root): arm rankings are NOT
+portable across regimes. wing_k, ML gates and wing SHAPE interact; every future arm study
+must run under the live gate regime or its ranking means nothing. Registered as standing
+process for all future shadow rounds.
+LIVE (2026-08-10, box booted onto R16 + gates-ON): bot entered QQQ IC T-20260810-095326
+@5.44 at 09:53 and SPY signals are generating at ratio 0.11 with p_in_range 0.959 - the
+0.65 range floor is NOT freezing entries at current model outputs (the 08-08 velocity
+worry was over-stated for the current regime; keep monitoring).

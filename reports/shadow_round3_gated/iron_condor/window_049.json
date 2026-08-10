@@ -1,0 +1,488 @@
+{
+  "window": 49,
+  "test_start": "2022-02-06",
+  "test_end": "2022-04-10",
+  "pnl": 3004.97,
+  "return_pct": 1.0017,
+  "trades": 5,
+  "win_rate": 0.8,
+  "sharpe": 5.1438,
+  "max_drawdown": 0.1377,
+  "strategies": {
+    "iron_condor": 5
+  },
+  "best_params": {},
+  "trades_detail": [
+    {
+      "symbol": "IWM",
+      "strategy": "iron_condor",
+      "entry_date": "2022-02-08",
+      "entry_time": "2022-02-08",
+      "exit_date": "2022-02-22",
+      "exit_time": "2022-02-22",
+      "exit_reason": "take_profit_short",
+      "pnl": 904.14,
+      "entry_confidence": 0.8337,
+      "entry_regime": "high_volatility",
+      "contracts": 10,
+      "n_legs": 4,
+      "hold_days": 14,
+      "entry_price": 2.5842,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 1.6281,
+      "entry_iv_rank": 0.6671,
+      "entry_vix_level": 0.5,
+      "credit": 2584.2,
+      "max_loss": 9311.3,
+      "return_pct": 0.0971,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 192.0,
+          "premium": 1.4213
+        },
+        {
+          "type": "long_put",
+          "strike": 180.0,
+          "premium": -0.1292
+        },
+        {
+          "type": "short_call",
+          "strike": 217.0,
+          "premium": 1.4213
+        },
+        {
+          "type": "long_call",
+          "strike": 229.0,
+          "premium": -0.1292
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.8337,
+        "range_gate": {
+          "prob": 0.8337,
+          "threshold": 0.55,
+          "pass": true
+        },
+        "vol_gate": {
+          "vol_10d": 0.3296,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.0253,
+          "threshold": 0.2,
+          "pass": true
+        },
+        "regime": "high_volatility",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1431,
+          "blocked": false
+        },
+        "regime_class": "high_volatility",
+        "iv_rank_rise_10d": 0.2984
+      },
+      "features_at_entry": {
+        "rsi_14": 39.06,
+        "macd_hist": 0.00213,
+        "bb_position": 0.418,
+        "atr_pct": 0.0341,
+        "realized_vol_20": 0.2728,
+        "iv_rank": 0.667,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.9
+      }
+    },
+    {
+      "symbol": "IWM",
+      "strategy": "iron_condor",
+      "entry_date": "2022-02-28",
+      "entry_time": "2022-02-28",
+      "exit_date": "2022-03-10",
+      "exit_time": "2022-03-10",
+      "exit_reason": "take_profit_short",
+      "pnl": 902.76,
+      "entry_confidence": 0.9621,
+      "entry_regime": "high_volatility",
+      "contracts": 9,
+      "n_legs": 4,
+      "hold_days": 10,
+      "entry_price": 2.7276,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 1.6725,
+      "entry_iv_rank": 0.7835,
+      "entry_vix_level": 0.5,
+      "credit": 2454.84,
+      "max_loss": 9270.0,
+      "return_pct": 0.0974,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 191.0,
+          "premium": 1.5002
+        },
+        {
+          "type": "long_put",
+          "strike": 178.0,
+          "premium": -0.1364
+        },
+        {
+          "type": "short_call",
+          "strike": 219.0,
+          "premium": 1.5002
+        },
+        {
+          "type": "long_call",
+          "strike": 232.0,
+          "premium": -0.1364
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.9621,
+        "range_gate": {
+          "prob": 0.9621,
+          "threshold": 0.55,
+          "pass": true
+        },
+        "vol_gate": {
+          "vol_10d": 0.2999,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.4092,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "high_volatility",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1411,
+          "blocked": false
+        },
+        "regime_class": "high_volatility",
+        "iv_rank_rise_10d": 0.0576
+      },
+      "features_at_entry": {
+        "rsi_14": 54.62,
+        "macd_hist": 0.00353,
+        "bb_position": 0.67,
+        "atr_pct": 0.0265,
+        "realized_vol_20": 0.2979,
+        "iv_rank": 0.784,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.897
+      }
+    },
+    {
+      "symbol": "IWM",
+      "strategy": "iron_condor",
+      "entry_date": "2022-03-10",
+      "entry_time": "2022-03-10",
+      "exit_date": "2022-03-14",
+      "exit_time": "2022-03-14",
+      "exit_reason": "thesis_invalidated:bullish@0.82",
+      "pnl": -415.57,
+      "entry_confidence": 0.9686,
+      "entry_regime": "high_volatility",
+      "contracts": 10,
+      "n_legs": 4,
+      "hold_days": 4,
+      "entry_price": 2.5389,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 2.9025,
+      "entry_iv_rank": 0.7362,
+      "entry_vix_level": 0.5,
+      "credit": 2538.9,
+      "max_loss": 9831.5,
+      "return_pct": -0.0423,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 188.0,
+          "premium": 1.3964
+        },
+        {
+          "type": "long_put",
+          "strike": 176.0,
+          "premium": -0.1269
+        },
+        {
+          "type": "short_call",
+          "strike": 215.0,
+          "premium": 1.3964
+        },
+        {
+          "type": "long_call",
+          "strike": 227.0,
+          "premium": -0.1269
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.9686,
+        "range_gate": {
+          "prob": 0.9686,
+          "threshold": 0.55,
+          "pass": true
+        },
+        "vol_gate": {
+          "vol_10d": 0.3024,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.1067,
+          "threshold": 0.2,
+          "pass": true
+        },
+        "regime": "high_volatility",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1401,
+          "blocked": false
+        },
+        "regime_class": "high_volatility",
+        "iv_rank_rise_10d": -0.0689
+      },
+      "features_at_entry": {
+        "rsi_14": 48.56,
+        "macd_hist": 0.00158,
+        "bb_position": 0.477,
+        "atr_pct": 0.0283,
+        "realized_vol_20": 0.2877,
+        "iv_rank": 0.736,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.841
+      }
+    },
+    {
+      "symbol": "IWM",
+      "strategy": "iron_condor",
+      "entry_date": "2022-03-15",
+      "entry_time": "2022-03-15",
+      "exit_date": "2022-03-31",
+      "exit_time": "2022-03-31",
+      "exit_reason": "take_profit_short",
+      "pnl": 1378.17,
+      "entry_confidence": 0.9679,
+      "entry_regime": "high_volatility",
+      "contracts": 10,
+      "n_legs": 4,
+      "hold_days": 16,
+      "entry_price": 2.6937,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 1.2635,
+      "entry_iv_rank": 0.7992,
+      "entry_vix_level": 0.5,
+      "credit": 2693.7,
+      "max_loss": 9993.0,
+      "return_pct": 0.1379,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 184.0,
+          "premium": 1.4815
+        },
+        {
+          "type": "long_put",
+          "strike": 171.0,
+          "premium": -0.1347
+        },
+        {
+          "type": "short_call",
+          "strike": 211.0,
+          "premium": 1.4815
+        },
+        {
+          "type": "long_call",
+          "strike": 224.0,
+          "premium": -0.1347
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.9679,
+        "range_gate": {
+          "prob": 0.9679,
+          "threshold": 0.55,
+          "pass": true
+        },
+        "vol_gate": {
+          "vol_10d": 0.3038,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.7117,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "high_volatility",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1396,
+          "blocked": false
+        },
+        "regime_class": "high_volatility",
+        "iv_rank_rise_10d": -0.0007
+      },
+      "features_at_entry": {
+        "rsi_14": 53.0,
+        "macd_hist": -0.00057,
+        "bb_position": 0.29,
+        "atr_pct": 0.0283,
+        "realized_vol_20": 0.3013,
+        "iv_rank": 0.799,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.84
+      }
+    },
+    {
+      "symbol": "IWM",
+      "strategy": "iron_condor",
+      "entry_date": "2022-03-31",
+      "entry_time": "2022-03-31",
+      "exit_date": "2022-04-06",
+      "exit_time": "2022-04-06",
+      "exit_reason": "thesis_invalidated:bearish@0.90",
+      "pnl": 235.47,
+      "entry_confidence": 0.9495,
+      "entry_regime": "high_volatility",
+      "contracts": 10,
+      "n_legs": 4,
+      "hold_days": 6,
+      "entry_price": 2.5788,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 2.2913,
+      "entry_iv_rank": 0.7521,
+      "entry_vix_level": 0.5,
+      "credit": 2578.8,
+      "max_loss": 9581.6,
+      "return_pct": 0.0246,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 194.0,
+          "premium": 1.4183
+        },
+        {
+          "type": "long_put",
+          "strike": 182.0,
+          "premium": -0.1289
+        },
+        {
+          "type": "short_call",
+          "strike": 220.0,
+          "premium": 1.4183
+        },
+        {
+          "type": "long_call",
+          "strike": 232.0,
+          "premium": -0.1289
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.9495,
+        "range_gate": {
+          "prob": 0.9495,
+          "threshold": 0.55,
+          "pass": true
+        },
+        "vol_gate": {
+          "vol_10d": 0.2315,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.1238,
+          "threshold": 0.2,
+          "pass": true
+        },
+        "regime": "high_volatility",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1380,
+          "blocked": false
+        },
+        "regime_class": "high_volatility",
+        "iv_rank_rise_10d": -0.0998
+      },
+      "features_at_entry": {
+        "rsi_14": 60.59,
+        "macd_hist": 0.0035,
+        "bb_position": 0.636,
+        "atr_pct": 0.0202,
+        "realized_vol_20": 0.2754,
+        "iv_rank": 0.752,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.815
+      }
+    }
+  ],
+  "model_weights": {
+    "range_predictor": {
+      "status": "ok",
+      "threshold_pct": 0.0896,
+      "fitted_weights": {
+        "xgboost": 1.0,
+        "lightgbm": 0.0
+      },
+      "cv_scores": {
+        "xgboost": 0.5625,
+        "lightgbm": 0.5
+      },
+      "in_range_rate": 0.8134328358208955,
+      "oos_scores": {
+        "n_samples": 23,
+        "base_rate": 0.9565,
+        "ml": {},
+        "statistical": {}
+      }
+    },
+    "direction_predictor": {
+      "fitted_weights": {
+        "xgboost": 0.5700738235642208,
+        "lightgbm": 0.42992617643577924
+      },
+      "cv_scores": {
+        "xgboost": 0.6366765240120503,
+        "lightgbm": 0.6030757999194716
+      }
+    }
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "window": 31,
+  "test_start": "2020-01-12",
+  "test_end": "2020-03-15",
+  "pnl": 0.0,
+  "return_pct": 0.0,
+  "trades": 0,
+  "win_rate": 0.0,
+  "sharpe": 0.0,
+  "max_drawdown": 0.0,
+  "strategies": {},
+  "best_params": {},
+  "note": "no_trades",
+  "model_weights": {
+    "range_predictor": {
+      "status": "ok",
+      "threshold_pct": 0.0349,
+      "fitted_weights": {
+        "xgboost": 0.5,
+        "lightgbm": 0.5
+      },
+      "cv_scores": {
+        "xgboost": 0.3747412008281573,
+        "lightgbm": 0.4288302277432712
+      },
+      "in_range_rate": 0.19834710743801653,
+      "oos_scores": {
+        "n_samples": 22,
+        "base_rate": 0.0455,
+        "ml": {},
+        "statistical": {}
+      }
+    },
+    "direction_predictor": {
+      "fitted_weights": {
+        "xgboost": 1.0,
+        "lightgbm": 0.0
+      },
+      "cv_scores": {
+        "xgboost": 0.5018105426493584,
+        "lightgbm": 0.493340237065566
+      }
+    }
+  }
+}
