@@ -999,3 +999,80 @@ date and QQQ/IWM are ABSENT - unusable as a backtest source. Alpha Vantage histo
 options needs a (free) user key; CBOE/ORATS/OptionMetrics are paid. Conclusion: keep
 building OUR OWN dataset via the now-working calibration capture.
 NEXT: re-parameterized range-floor sweep is the FIRST study with all three corrections.
+
+## 2026-08-12 - R17: independent external code review, 20 findings FIXED (branch r17-review-fixes)
+WHY: a fresh Claude session (no access to this file or prior audit context) reviewed the
+whole feature/event-straddle diff against main cold, as a code review rather than an
+audit round. Findings recorded in docs/PR6_CODE_REVIEW.md. All 20 re-verified against
+the tip TWICE as this branch kept moving mid-review/mid-fix (ee6abc8 -> b593583 via R16
+ROUND 2, then b593583 -> a90e8d7 via SIM FIDELITY above, rebased onto cleanly - neither
+touched the same lines except this file) - none were already fixed, none conflict with
+that work. 7 commits, one per theme, each independently revertable. Tests +50 across 5
+new files (r17_live/risk_data/ops/dormant_strategy/minor_fixes), suite green.
+HEADLINES (live-affecting now - only iron_condor is enabled in config.yaml):
+ * EARNINGS PRE-CLOSE EXIT WAS UNREACHABLE: rule 3b (delta breach) claimed the exit
+   elif-chain slot on strategy-membership alone (no delta check gated ENTRY to the
+   branch, only whether it acted once inside) - so once R16 ROUND 2 confirmed 3b is
+   structurally inert (no greeks subscription), it still permanently blocked rule 3c
+   (the 2-day pre-earnings close) for every iron_condor/short_strangle/etc position
+   past DTE 5. Same bug class R13-CRIT-2 fixed for rule 2 vs the touch stop, missed
+   here. Now 3b only claims the slot on a real breach (walrus-guarded condition).
+ * ML AUTO-ROLLBACK WAS DEAD CODE: the "mean accuracy across all symbols trained"
+   flattening always produced an empty list (results[symbol] is a dict of per-model
+   scores, never a scalar), so cv_scores was never updated post-training and a
+   materially worse retrain could never trigger rollback. Zero prior test coverage.
+ * DASHBOARD P&L SILENTLY DROPPED NULL-LABELED TRADES: get_status() (CLI + web
+   dashboard) was missing the COALESCE its own main() sibling query already had.
+ * CALENDAR-EXHAUSTION ALARM NEVER REACHED A HUMAN: log.critical with no notify
+   route - the exact "macro guards went blind, nobody noticed" failure R16 #10 above
+   was built to catch, reproduced by its own follow-up alarm.
+ * .ENV COULD NOT OVERRIDE PROTECTIVE DEFAULTS: apply_runtime_env_defaults() loaded
+   .env AFTER the 7 setdefault() calls, so .env - the only documented user config
+   path - could never touch them, including AIT_MARKET_DATA_TYPE (the delayed-vs-live
+   switch the code comments say is meant to flip "after funding"). Reordered.
+ * ORDERREF ADDED FOR EXIT DISAMBIGUATION: reconciler's combo-order matching fell
+   back to symbol-only when leg-keys didn't disambiguate - a real misassignment risk
+   between two same-symbol multi-leg positions both mid-close after a restart.
+   orderRef (unused anywhere in this repo before now) is stamped with trade_id at
+   every order-placement site; reconciler tries an exact match first.
+ * Also (live but lower-severity): capital_base() go-live enforcement (was silent if
+   it fell back to the hardcoded default in live mode); earnings.py used
+   date.today() instead of the ET convention; a backfill script's MIDPOINT-vs-TRADES
+   "fix" only relabeled, didn't prevent the overwrite; gate 6c (symbol concentration)
+   summed credit collected instead of real max-loss; account-data staleness never
+   escalated past a log line; winter EDT-hardcode false-failed the post-deploy
+   liveness check every EST season; smoke_deploy's no-write guard had zero tolerance
+   for the live bot's own concurrent writes; walk-forward window capital divided by
+   configured symbol count instead of the count that actually survived the learner's
+   gates; a NaN-fill safety net contradicted vix_level's own documented neutral
+   value; Yahoo-fallback options data got IBKR's "OI=0 means unknown" leniency where
+   a Yahoo zero is real.
+DORMANT (only matters if short_strangle/long_straddle are re-enabled - fixed now per
+this repo's own convention of not leaving known bugs dormant): capital-at-risk
+accounting returned $0 for undefined-risk strategies with a real max_loss; the
+long_straddle vol-magnitude ML override had no entry_gates_enabled check (unlike the
+adjacent range-model override); long_straddle was missing from the direction-
+inference-avoidance exclusion list.
+HYGIENE: settings.py had a stray UTF-8 BOM + 23 mojibake sequences (cp1252/UTF-8
+round-trip corruption) from a prior edit, repaired byte-exact, encoding-only commit.
+counterfactual.py's skip-dedup silently froze after the first occurrence per combo
+forever (the reset flag's setter was deleted in R12-C) - now resets daily. main.py
+hard-cancelled orchestrator.run() on shutdown, bypassing R16 ROUND 2's own
+notify-drain fix entirely - now stops gracefully with a bounded grace window first.
+Two items documented rather than changed (no live bug, confirmed by grep): the
+risk_budget shared-instance mutation (inert while scanning is sequential) and the
+Sortino inf-vs-None inconsistency (PerformanceMetrics.sortino_ratio has no current
+JSON consumer).
+NOT IN SCOPE: a multi-contract debit-combo pricing bug found in passing
+(executor.py's debit-cap divides by contracts twice) - only affects debit strategies
+(bull_call_spread/bear_put_spread/calendar_spread/long_straddle), all currently
+disabled; wasn't in the original 20 findings, left untouched to avoid scope creep.
+PRE-EXISTING, UNRELATED FAILURES noted before rebase (not touched by this branch):
+tests/test_iv_model.py::TestGetIV::test_vix_proxy_scalar_produces_plausible_iv (fails
+identically on b593583; fixed incidentally by SIM FIDELITY's VIX-path unification
+above, confirmed post-rebase) and tests/test_r16_ops_fixes.py::TestSingletonMutex (3
+tests; the singleton-lock mechanism imports msvcrt, Windows-only - fails on macOS dev
+boxes, unrelated to platform the bot actually runs on).
+Rebased onto a90e8d7 and pushed directly to feature/event-straddle (user-approved) -
+matches this branch's own convention (R12-R16 above all landed as direct commits to
+an already-open PR #6, not stacked sub-PRs).
