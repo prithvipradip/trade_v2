@@ -308,6 +308,25 @@ class IronCondor(Strategy):
                 short_put, short_call, credit=total_credit, width=max_width)
             return []
 
+        # R16: snap-to-strike can land WIDER than the budget-affordable target
+        # _vol_scaled_width capped above (one strike up on a $1 grid, several
+        # dollars on a $5 grid), so the emitted structure's max_loss could
+        # exceed the very risk_budget the width cap was derived from — e.g. a
+        # $3k budget (affordable width 1.0) on a $5 grid emitted max_loss $329
+        # vs the $90 budget. Nothing inside the strategy re-checked it; the
+        # only backstop was RiskManager gate 6b (manager.py:304, max_loss vs
+        # max_position_risk_pct x NLV), which agrees with risk_budget ONLY
+        # because both currently read 3% — divergence there would let an
+        # over-budget structure execute. Re-check the built structure against
+        # the budget the width target came from, with its own telemetry reason
+        # so these show up as budget rejections, not as silent fall-through
+        # candidates rejected downstream every scan.
+        if self.risk_budget and self.risk_budget > 0 and max_loss > self.risk_budget:
+            self._log_entry_quality(
+                symbol, "rejected", "max_loss_over_budget", chain,
+                short_put, short_call, credit=total_credit, width=max_width)
+            return []
+
         max_profit = total_credit * 100
 
         # Exit at 50% of max profit (take profit early)

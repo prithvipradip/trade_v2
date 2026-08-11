@@ -812,6 +812,19 @@ class StateManager:
                 (trade_id,)).fetchone()
             return int(row[0] or 0)
 
+    def state_keys_like(self, pattern: str) -> list[str]:
+        """R16: bot_state keys matching a SQL LIKE pattern.
+
+        Needed to sweep orphaned trade_maxloss_* keys (they leak whenever a
+        trade leaves the book by any path other than a completed exit, and
+        each orphan permanently inflates the aggregate risk denominator).
+        """
+        with sqlite3.connect(self._db_path) as conn:
+            rows = conn.execute(
+                "SELECT key FROM bot_state WHERE key LIKE ?", (pattern,)
+            ).fetchall()
+        return [r[0] for r in rows]
+
     def pending_trueup_trade_ids(self) -> list[str]:
         """R16: trades whose commission true-up was deferred on a partial
         executions ledger (bot_state keys trueup_pending_<trade_id>)."""

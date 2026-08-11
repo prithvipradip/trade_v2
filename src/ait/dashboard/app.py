@@ -39,9 +39,13 @@ def _capital_base() -> float:
     return/drawdown percentages are computed off the wrong base.
     """
     try:
-        return float(os.environ.get("AIT_CAPITAL_BASE", "196000"))
-    except (TypeError, ValueError):
-        return 196000.0
+        from ait.config.runtime_env import capital_base as _cb
+        return _cb()
+    except Exception:  # noqa: BLE001 - R16: single authority, safe fallback
+        try:
+            return float(os.environ.get("AIT_CAPITAL_BASE", "196000"))
+        except (TypeError, ValueError):
+            return 196000.0
 
 
 def _annualization_factor(trades: list[dict]) -> float:

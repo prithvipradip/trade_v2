@@ -277,6 +277,38 @@ def _clear_dashboard_port(port: int = 8501) -> bool:
     return False
 
 
+def _in_post_market_window(now: datetime | None = None,
+                           grace_minutes: int = 20) -> bool:
+    """R16: is NOW inside the bot's own POST_MARKET phase (+grace)?
+
+    The bot's scheduler treats close -> close+15min as POST_MARKET and runs the
+    whole EOD pipeline on entry, with no already-ran-today guard. A supervisor
+    restart landing in that window therefore re-runs it. Mirrors
+    bot/scheduler.py:52-63 (honouring early-close days via get_market_close)
+    and adds 5 minutes of slack so a restart cannot land on the boundary.
+
+    If the market calendar is unavailable it falls back to the regular-session
+    clock (16:00 ET, the box's local time) rather than a blanket True — fail
+    closed INSIDE the window, but never wedge the model-reload restart forever
+    on a calendar outage.
+    """
+    try:
+        from datetime import timedelta as _td
+        from ait.utils.time import ET, get_market_close, is_trading_day, now_et
+        n = now or now_et()
+        if n.tzinfo is None:
+            n = n.replace(tzinfo=ET)
+        if not is_trading_day(n.date()):
+            return False
+        close_dt = datetime.combine(n.date(), get_market_close(n.date()), tzinfo=ET)
+        return close_dt <= n < close_dt + _td(minutes=15 + grace_minutes)
+    except Exception as e:  # noqa: BLE001
+        _log("warning", "post_market_window_check_failed", error=str(e))
+        n2 = now or datetime.now()
+        mins = n2.hour * 60 + n2.minute
+        return (16 * 60) <= mins < (16 * 60 + 15 + grace_minutes)
+
+
 # ---------------------------------------------------------------------------
 # Bot process management
 # ---------------------------------------------------------------------------
@@ -478,6 +510,19 @@ class BotManager:
                     market_open = False
                 if market_open:
                     _log("info", "fresh_models_restart_deferred_market_open")
+                elif _in_post_market_window():
+                    # R16: "market closed" is true the SECOND the bell rings,
+                    # so the first post-16:00 health check consumed the marker
+                    # and the replacement bot started inside the bot's own
+                    # POST_MARKET phase (close -> close+15min, scheduler.py:
+                    # 52-63). Its run() then re-ran _post_market: a second EOD
+                    # RECON + daily summary to Telegram, a second reconcile and
+                    # a second learning cycle, ~80s after the first — observed
+                    # on 5 of the last 8 sessions (07-28, 07-29, 07-31, 08-03,
+                    # 08-05) and a straight re-run of the R13 duplicate-page
+                    # class. Wait until the post-market window has closed; the
+                    # marker survives to the next 2-minute check.
+                    _log("info", "fresh_models_restart_deferred_post_market")
                 else:
                     unlinked = False
                     try:
@@ -609,6 +654,9 @@ class WebServiceManager:
             return
         _log("info", "dashboard_starting", port=8501)
         log_path = LOGS_DIR / "dashboard.log"
+        # R16: rotate BEFORE reopening — this is the one moment no child holds
+        # the handle, mirroring BotManager._rotate_stdout_log at bot start.
+        _rotate_if_oversized(log_path, _ROTATE_TARGETS["dashboard.log"])
         # R5 F10 pattern: close the previous handle before reopening — the
         # crash-restart path leaked one open handle per restart (663/day
         # during the 08-04 loop).
@@ -637,6 +685,7 @@ class WebServiceManager:
             return
         _log("info", "weblog_starting", port=8502)
         log_path = LOGS_DIR / "weblog.log"
+        _rotate_if_oversized(log_path, _ROTATE_TARGETS["weblog.log"])  # R16
         self._weblog_log = open(log_path, "a")
         self._weblog_proc = subprocess.Popen(
             [sys.executable, str(ROOT / "web_logs.py")],
@@ -980,6 +1029,67 @@ def backup_state_db():
         _alert(f"STATE DB BACKUP FAILED: {e} — the track record is unprotected.")
 
 
+def _newest_trade_ts(db_path: Path) -> str | None:
+    """Newest entry_time/exit_time in a state DB, read-only. None if unusable."""
+    import sqlite3 as _sq
+    if not db_path.exists():
+        return None
+    try:
+        con = _sq.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            row = con.execute(
+                "SELECT MAX(ts) FROM ("
+                "  SELECT MAX(entry_time) ts FROM trades"
+                "  UNION ALL SELECT MAX(exit_time) FROM trades"
+                ")"
+            ).fetchone()
+        finally:
+            con.close()
+        return str(row[0]) if row and row[0] else None
+    except Exception as e:  # noqa: BLE001
+        _log("warning", "newest_trade_ts_failed", db=str(db_path), error=str(e))
+        return None
+
+
+def _mirror_lag() -> tuple[str, float | None]:
+    """R16: is the off-box mirror BEHIND the live DB? (label, lag_hours).
+
+    _mirror_content_age_hours below measures now - newest trade IN the mirror,
+    which is last-TRADE recency, not mirror freshness: during any no-trade
+    stretch (entries blacked out pre-NFP, positions holding) the digest reported
+    an ever-growing "mirror 69h stale" while the nightly hash-verified copy was
+    <16h old — training the operator to ignore the line — and a genuinely stale
+    mirror during a quiet week read identically to a healthy one.
+
+    The real question is whether the mirror's content MATCHES the source, which
+    is exactly the 07-14 failure signature. Labels:
+      "current"  — mirror newest trade == live newest trade
+      "behind"   — mirror is older than live, lag_hours = the gap
+      "missing"  — mirror absent/unreadable
+      "unknown"  — live DB unreadable, so no comparison is possible
+    """
+    mirror = Path.home() / "Documents" / "ait_backups" / "ait_state.latest.db"
+    if not mirror.exists():
+        return ("missing", None)
+    m_ts = _newest_trade_ts(mirror)
+    s_ts = _newest_trade_ts(DATA_DIR / "ait_state.db")
+    if m_ts is None:
+        return ("missing", None)
+    if s_ts is None:
+        return ("unknown", None)
+    if m_ts == s_ts:
+        return ("current", 0.0)
+    try:
+        lag = (datetime.fromisoformat(s_ts)
+               - datetime.fromisoformat(m_ts)).total_seconds() / 3600
+    except Exception:  # noqa: BLE001
+        return ("behind", None)
+    if lag <= 0:
+        # Mirror newer than source (post-restore) — not a staleness problem.
+        return ("current", 0.0)
+    return ("behind", lag)
+
+
 def _mirror_content_age_hours() -> float | None:
     """R14 #11: how stale is the off-box mirror's CONTENT (not its file mtime)?
 
@@ -1046,18 +1156,31 @@ def daily_digest():
             age = (datetime.now() - datetime.fromtimestamp(
                 hb.stat().st_mtime)).total_seconds() / 60
             parts.append(f"heartbeat {age:.0f}m")
-        # R14 #11: report the MIRROR's CONTENT age, not a local snapshot's
-        # mtime. The mirror (off-box, the real recovery copy) is what silently
-        # went a full run stale on 07-14 while every mtime check read green —
-        # and copy2 back-dates its mtime, so mtime can't detect it. Derive age
-        # from the newest trade timestamp INSIDE the mirror DB instead.
-        m_age = _mirror_content_age_hours()
-        if m_age is not None:
-            parts.append(f"mirror {m_age:.0f}h stale")
+        # R14 #11: report the MIRROR's CONTENT, not a local snapshot's mtime.
+        # The mirror (off-box, the real recovery copy) is what silently went a
+        # full run stale on 07-14 while every mtime check read green — and
+        # copy2 back-dates its mtime, so mtime can't detect it.
+        # R16: the PRIMARY number is now the mirror-vs-SOURCE lag, which is
+        # what "stale" actually means. now - newest-trade measured last-TRADE
+        # recency, so a quiet market read as an ever-worsening staleness alarm
+        # (69h "stale" on 08-07 against a mirror copied 08-06 17:00) while a
+        # genuinely stale mirror in a quiet week looked identical. Wall-clock
+        # content age is kept as the secondary token.
+        m_state, m_lag = _mirror_lag()
+        if m_state == "current":
+            parts.append("mirror current")
+        elif m_state == "behind":
+            parts.append(f"mirror BEHIND live by {m_lag:.0f}h"
+                         if m_lag is not None else "mirror BEHIND live")
+        elif m_state == "unknown":
+            parts.append("mirror ?(live db unreadable)")
         else:
             # Mirror unreadable/absent — say so loudly rather than silently
             # falling back to a green-looking local mtime.
             parts.append("mirror MISSING")
+        m_age = _mirror_content_age_hours()
+        if m_age is not None:
+            parts.append(f"last trade {m_age:.0f}h ago")
         # R16 #29: record a sent-marker so the startup catch-up knows whether
         # today's digest actually went out. Only on a CONFIRMED send — a
         # failed/credless send leaves no marker, so the next boot retries.
@@ -1208,6 +1331,58 @@ def weekly_scorecard():
         _log("warning", "weekly_scorecard_failed", error=str(e))
 
 
+# R16: keeper.log (22.7 MB), dashboard.log (22 MB) and weblog.log are all
+# append-only with NO rotation anywhere — the keeper .bat only ever `>>`s, and
+# mtime-based cleanup can never touch a continuously-appended file. The logs
+# directory was at 438 MB and growing unbounded on a machine that has to stay
+# up for the bot. Same shift-and-cap pattern as _rotate_stdout_log, run daily
+# (not monthly) because the keeper's tight-loop bug can add 144k lines in a
+# single day.
+_ROTATE_TARGETS = {
+    "keeper.log": 20 * 1024 * 1024,
+    "dashboard.log": 20 * 1024 * 1024,
+    "weblog.log": 20 * 1024 * 1024,
+    "orchestrator.log": 20 * 1024 * 1024,
+}
+_ROTATE_BACKUPS = 2
+
+
+def _rotate_if_oversized(path: Path, max_bytes: int,
+                         backups: int = _ROTATE_BACKUPS) -> bool:
+    """Shift path -> .1 -> .2 when over the cap. Never raises.
+
+    A rename can legitimately fail on Windows while a child process holds the
+    file open (dashboard/weblog stdout); that is logged and retried next run —
+    those two are also rotated at their own (re)start, where the handle is
+    closed.
+    """
+    try:
+        if not path.exists() or path.stat().st_size <= max_bytes:
+            return False
+        oldest = path.with_name(f"{path.name}.{backups}")
+        if oldest.exists():
+            oldest.unlink()
+        for i in range(backups - 1, 0, -1):
+            src = path.with_name(f"{path.name}.{i}")
+            if src.exists():
+                src.rename(path.with_name(f"{path.name}.{i + 1}"))
+        path.rename(path.with_name(f"{path.name}.1"))
+        _log("info", "log_rotated", file=path.name)
+        return True
+    except Exception as e:  # noqa: BLE001 — rotation must never break the loop
+        _log("warning", "log_rotate_failed", file=path.name, error=str(e))
+        return False
+
+
+def rotate_oversized_logs():
+    """Daily size cap for the append-only logs nothing else rotates."""
+    rotated = 0
+    for name, cap in _ROTATE_TARGETS.items():
+        if _rotate_if_oversized(LOGS_DIR / name, cap):
+            rotated += 1
+    _log("info", "log_rotation_sweep", rotated=rotated)
+
+
 def cleanup_old_logs():
     """Remove logs and reports older than 30 days; cap rotated backups.
 
@@ -1216,21 +1391,18 @@ def cleanup_old_logs():
     (BotManager._rotate_stdout_log); here we only prune rotated backups and
     genuinely stale files.
     """
+    # R16: size-cap the append-only logs first (keeper/dashboard/weblog/
+    # orchestrator) — mtime deletion below can never reach them.
+    rotate_oversized_logs()
     cutoff = datetime.now() - timedelta(days=30)
     removed = 0
     for d in [LOGS_DIR, REPORTS_DIR]:
         for f in d.iterdir():
             if not f.is_file():
                 continue
-            if f.name == "orchestrator.log":
-                # Deep-audit OPS-R1: exempt from deletion but NOT from a size
-                # cap — it grew unbounded (heartbeat line every 2 min).
-                try:
-                    if f.stat().st_size > 20 * 1024 * 1024:
-                        f.rename(f.with_suffix(".log.1"))
-                        removed += 1
-                except Exception:
-                    pass
+            if f.name in _ROTATE_TARGETS:
+                # Active append-only logs: rotated above by size, exempt from
+                # mtime deletion (their mtime is always "now" anyway).
                 continue
             try:
                 # Rotated stdout backups: keep only the configured count
@@ -1448,16 +1620,26 @@ def main():
     # (last ran 07-17; models went stale for days, and the meta_label.pkl
     # test-clobber persisted because nothing rewrote it). Same catch-up
     # pattern as the backup above: a weekday start after 07:35 with no
-    # retrain log for today runs one immediately. Safe intraday: the
-    # .retrained model-reload restart already defers until market close.
+    # retrain log for today runs one. Safe intraday: the .retrained
+    # model-reload restart already defers until market close.
+    # R16: DEFERRED, not synchronous. retrain_models() is a multi-minute
+    # blocking child (bounded only by its own idle killer) and it ran inside
+    # main() BEFORE scheduler.start() — so on every late boot the supervisor
+    # had no health checks, no bot-down detection and no dead-man ping for the
+    # whole retrain, exactly when the box has just come up. Same one-shot
+    # date-job pattern as the weekly-backtest catch-up (#69).
     try:
         from ait.utils.time import now_et as _cnet
         _now_c = _cnet()
         if (_now_c.weekday() < 5 and (_now_c.hour, _now_c.minute) >= (7, 35)
                 and not list(LOGS_DIR.glob(
                     f"retrain_{_now_c.strftime('%Y%m%d')}_*.log"))):
-            _log("info", "startup_catchup_retrain")
-            retrain_models()
+            _rt_at = datetime.now() + timedelta(minutes=2)
+            scheduler.add_job(retrain_models, "date", run_date=_rt_at,
+                              id="retrain_catchup",
+                              name="Daily retrain catch-up")
+            _log("info", "startup_catchup_retrain_scheduled",
+                 run_at=_rt_at.strftime("%Y-%m-%d %H:%M"))
     except Exception as _e:  # noqa: BLE001
         _log("warning", "startup_retrain_check_failed", error=str(_e))
     # R16 #29: digest catch-up — the 09:35 digest ('absence IS the alarm')
@@ -1510,6 +1692,12 @@ def main():
     scheduler.add_job(cleanup_old_logs,
                       CronTrigger(day=1, hour=0, minute=0),
                       id="monthly_cleanup")
+    # R16: DAILY size cap for the append-only logs (keeper/dashboard/weblog/
+    # orchestrator). Monthly was far too slow for a keeper.log that can gain
+    # 144k lines in one day when the .bat pacing collapses.
+    scheduler.add_job(rotate_oversized_logs,
+                      CronTrigger(hour=0, minute=5),
+                      id="daily_log_rotation")
 
     _log("info", "scheduler_ready", jobs=len(scheduler.get_jobs()))
     for job in scheduler.get_jobs():

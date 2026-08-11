@@ -54,6 +54,37 @@ def apply_runtime_env_defaults() -> None:
     _load_dotenv(REPO_ROOT / ".env")
 
 
+def capital_base(default: float = 196_000.0) -> float:
+    """R16: single authority for the equity base used in return/DD percentages.
+
+    The value was hardcoded '196000' in three files (dashboard, analytics,
+    referee) and had ALREADY drifted from the live NLV (~198.1k), so every
+    percentage the operator reads was computed off a stale denominator — and
+    at go-live, off a base ~65x too large. Reads AIT_CAPITAL_BASE, else the
+    live account snapshot cached by the bot, else the documented default.
+    """
+    import os as _os
+    raw = _os.environ.get("AIT_CAPITAL_BASE")
+    if raw:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            pass
+    try:  # live NLV cached by the account manager (bot writes it each cycle)
+        import sqlite3
+        con = sqlite3.connect(
+            f"file:{REPO_ROOT / 'data' / 'ait_state.db'}?mode=ro", uri=True)
+        row = con.execute(
+            "SELECT value FROM bot_state WHERE key='last_net_liquidation'"
+        ).fetchone()
+        con.close()
+        if row and float(row[0]) > 0:
+            return float(row[0])
+    except Exception:  # noqa: BLE001
+        pass
+    return default
+
+
 def _load_dotenv(env_file: Path) -> None:
     """Minimal .env loader (no dependency): fills only UNSET keys."""
     if not env_file.exists():

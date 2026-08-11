@@ -872,3 +872,45 @@ LIVE (2026-08-10, box booted onto R16 + gates-ON): bot entered QQQ IC T-20260810
 @5.44 at 09:53 and SPY signals are generating at ratio 0.11 with p_in_range 0.959 - the
 0.65 range floor is NOT freezing entries at current model outputs (the 08-08 velocity
 worry was over-stated for the current regime; keep monitoring).
+
+## 2026-08-10 - R16 ROUND 2: remaining 44 findings FIXED (suite 1014 green, referee 0 BREAKS)
+Closed the medium/low tail across executor/broker, risk/books/state, engine/config/ops and
+the orchestrator. Headlines:
+ * EXIT QUOTE PATH WAS DEAD CODE: _close_multi_leg gated its NBBO fetch on
+   qualify_contract(combo), which ALWAYS returns None for a BAG - so every multi-leg exit
+   ever placed skipped live pricing and fell to the wing-width emergency branch (+ a
+   CRITICAL page) on routine take-profits. Now quotes the raw Bag, polls up to 2.5s.
+ * PRE-EVENT BLACKOUT FAILED OPEN behind a blanket except-pass, and counted CALENDAR days
+   (a Friday entry with a Monday event saw "3 days" with ZERO sessions between). Now
+   fails CLOSED and counts trading sessions.
+ * CIRCUIT BREAKER now persists across restarts - the keeper's 90s relaunch used to reset
+   the consecutive-loss count, erasing the protection during the crash-loop most likely
+   to accompany a losing streak.
+ * AGGREGATE RISK CAP could approve a new 3k-risk condor with "all checks passed" while
+   two live condors reported max_loss 0 (missing KV). Structural fallback added; orphan
+   KVs now swept post-market.
+ * SLIPPAGE GATE was reading 65.1% because combo pricing context was written onto every
+   LEG row and the BAG price kept the broker's sign. Writer fixed +
+   scripts/restate_r16_executions.py applied (15 leg rows cleared, 4 BAG prices
+   normalized) -> gate now reads 5.5%.
+ * REFEREE FALSE POSITIVE FIXED: duplicate_closes counted any >=2-leg fill group, so an
+   ENTRY group + its EXIT group read as a phantom re-close. It only surfaced now because
+   the 08-04 QQQ condor is the FIRST trade whose entry legs were also swept into the
+   ledger. Now requires the `closing` flag it already computed. Referee: 0 BREAKS.
+ * META-LABELER BLOCKED, NOW EXPLICIT: trade_context.entry_signals is "{}" in the fixture
+   AND in production, so 11 of the 20 META_FEATURES have NEVER been captured - the
+   meta-labeler could only ever have trained on 9, which is exactly the degraded input
+   that got meta_label.pkl quarantined 07-18. Coverage guard refuses to arm; the old test
+   asserted the broken behavior and has been inverted (+ a positive control).
+   PREREQUISITE for the "meta-labeler at 50 closes" plan: populate entry_signals first.
+ * Also: single CREDIT_STRATEGIES authority (engine imported base's, was a 4-vs-11 fork);
+   capital base single authority reading live NLV (was 196000 hardcoded in 3 files, ~65x
+   wrong at the planned $3k scale); MTM brake failure now pages instead of DEBUG;
+   notification tasks strongly referenced (an unreferenced create_task can be GC'd
+   mid-flight - the shutdown page was the likeliest casualty); yfinance raw output no
+   longer corrupts the JSON log stream; jade_lizard classified undefined-risk + flattened
+   strangle-class; log rotation for keeper/dashboard; liquidity + parity manifests
+   single-sourced. DELTA-BREACH RULE 3b confirmed STRUCTURALLY INERT (ib_insync
+   PortfolioItem carries no greeks at all) - left inert but now LOUD once per session
+   rather than silently dead; making it real needs a market-data decision after U6.
+Tests +191 across 5 new files (r16_broker/risk/tail/round2 + core). Suite 1014 green.

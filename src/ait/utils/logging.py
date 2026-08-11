@@ -75,6 +75,20 @@ def setup_logging(
     # as the ibapi flood: third-party wire noise never belongs at DEBUG here.
     logging.getLogger("urllib3").setLevel(logging.INFO)
     logging.getLogger("requests").setLevel(logging.INFO)
+    # R16: yfinance/peewee print RAW, non-JSON lines ("Entering get()",
+    # "url=...", "response code=200") straight into ait.log, breaking every
+    # JSON parser that reads the stream — including the audit tooling and
+    # status.py. yfinance ships its own debug-mode logger; silence the whole
+    # family to WARNING so ait.log stays machine-readable.
+    for _noisy in ("yfinance", "peewee", "urllib3.connectionpool",
+                   "matplotlib", "asyncio"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
+    try:  # yfinance>=0.2 exposes an explicit debug toggle
+        import yfinance as _yf
+        if hasattr(_yf, "set_tz_cache_location"):  # cheap version probe
+            _yf.utils.get_yf_logger().setLevel(logging.WARNING)
+    except Exception:  # noqa: BLE001 — never let logging setup break boot
+        pass
 
     # Configure structlog
     structlog.configure(

@@ -92,7 +92,7 @@ class PortfolioManager:
 
     MARKS_MISSING_ALERT_TICKS = 10  # ~5 min at the 30s fast-monitor cadence
 
-    async def _spot_quote(self, symbol: str) -> tuple[float | None, str]:
+    async def _spot_quote(self, symbol: str, persist: bool = True) -> tuple[float | None, str]:
         """R14: the underlying's price for exit decisions, WITH a health verdict.
 
         Returns (mid, health) where health is one of:
@@ -110,6 +110,15 @@ class PortfolioManager:
         they move, and staleness alone would condemn every quote and disable the
         touch stop outright. A FROZEN feed stops advancing — that is the state
         worth acting on, and it is invisible to an absolute-age check.
+
+        `persist=False` makes this a pure READ (A4 report invariant): the
+        last-seen tick time is not advanced and the frozen-feed alert latch is
+        not cleared. R16: the write was unconditional, so a report call
+        CONSUMED the timestamp advance — within market_data's 15s quote cache
+        the very next monitor pass saw an unchanged timestamp, classified the
+        feed "frozen", and downgraded a real short-strike touch from
+        fire-immediately to a 2-tick confirmation (+30-60s on the one exit
+        rule that caps a credit structure's loss).
         """
         try:
             quote = await self._market_data.get_quote(symbol)
@@ -125,7 +134,8 @@ class PortfolioManager:
         if seen_ts is None:
             seen_ts = self._last_quote_ts = {}
         prev_ts = seen_ts.get(symbol)
-        seen_ts[symbol] = quote.timestamp
+        if persist:
+            seen_ts[symbol] = quote.timestamp
         if prev_ts is not None and quote.timestamp <= prev_ts:
             return quote.mid, "frozen"
 
@@ -143,7 +153,10 @@ class PortfolioManager:
                         staleness_s=round(quality.staleness_seconds, 1))
             return quote.mid, "degraded"
 
-        getattr(self, "_frozen_alerted", set()).discard(symbol)
+        if persist:
+            # R16: clearing the once-per-outage page latch is alert STATE —
+            # a report must not re-arm it (nor, below, fire the page itself).
+            getattr(self, "_frozen_alerted", set()).discard(symbol)
         return quote.mid, "fresh"
 
     def _quality_validator(self) -> DataQualityValidator:
@@ -280,7 +293,7 @@ class PortfolioManager:
         self, trade: TradeRecord, option_marks: dict[tuple, float] | None = None
     , persist: bool = True) -> PositionStatus | None:
         """Evaluate a single position for exit conditions."""
-        current_price, spot_health = await self._spot_quote(trade.symbol)
+        current_price, spot_health = await self._spot_quote(trade.symbol, persist=persist)
 
         if current_price is None:
             # R14: a missing UNDERLYING quote used to abandon the whole
@@ -516,14 +529,21 @@ class PortfolioManager:
                     if _touched and spot_health == "fresh":
                         should_exit = True
                         exit_reason = _touched
-                        confirms.pop(trade.trade_id, None)
+                        # R16: persist-guarded like the increment below — the
+                        # streak is protection state, and A4 says a report
+                        # must not advance OR clear it.
+                        if persist:
+                            confirms.pop(trade.trade_id, None)
                     elif _touched:
                         need = max(1, int(getattr(
                             self._exit_config, "touch_confirm_ticks", 2)))
                         seen = confirms.get(trade.trade_id, 0) + 1
                         if persist:
                             confirms[trade.trade_id] = seen
-                        if spot_health == "frozen":
+                        if spot_health == "frozen" and persist:
+                            # R16: A4 — "must not ... fire alerts". The page
+                            # is once-per-outage; spending it on a report both
+                            # notifies off a report and silences the monitor.
                             await self._alert_frozen_feed(trade.symbol, trade.trade_id)
                         if seen >= need:
                             should_exit = True
@@ -536,8 +556,13 @@ class PortfolioManager:
                                 note="touch seen on a bad quote — holding for "
                                      "corroboration rather than acting on one print",
                             )
-                    else:
+                    elif persist:
                         # Spot pulled back inside the strikes: the streak dies.
+                        # R16: this pop ran regardless of `persist`, so the
+                        # post-market summary (the sole get_portfolio_summary
+                        # caller today) could WIPE a pending degraded/frozen
+                        # touch-confirmation streak that the 30s monitor had
+                        # been accumulating — the report deciding an exit.
                         confirms.pop(trade.trade_id, None)
             except Exception as _e:  # noqa: BLE001 — protection, never a crash source
                 log.debug("touch_check_failed", trade_id=trade.trade_id, error=str(_e))
@@ -600,6 +625,13 @@ class PortfolioManager:
         # 3b. Delta breach — close if directional risk ballooned
         # For neutral strategies (iron condor, straddle), delta should stay small
         # If abs(delta) > 0.50, position has taken on large directional exposure
+        #
+        # R16 WARNING: this rule is INERT in the current deployment — there is
+        # no market-data subscription behind ib.ticker() in the exit path, so
+        # _get_position_delta always returns None (it now logs
+        # delta_breach_rule_inert once per session). Do not count 3b as live
+        # protection; the touch stop at rule 1b covers the same blowout. Full
+        # explanation and what a real fix costs: _get_position_delta docstring.
         elif (not should_exit
                 and trade.strategy in ("iron_condor", "short_strangle", "long_straddle",
                                        "cash_secured_put", "covered_call")):
@@ -834,6 +866,30 @@ class PortfolioManager:
 
         Returns None if delta can't be determined (single strike, missing data).
         For multi-leg strategies, sums delta across all legs.
+
+        R16 — READ THIS BEFORE RELYING ON EXIT RULE 3b (delta_breach).
+        This is INERT in the current deployment and cannot be fixed from this
+        module. `ib.ticker(contract)` only returns a live Ticker while a
+        market-data subscription for that contract is open, and the exit stack
+        opens none: every reqMktData in the codebase is snapshot-style and
+        cancelled in a finally block (options_chain.py:483 at entry,
+        orchestrator._option_nbbo, market_data). So ticker() is None (or a
+        days-stale entry-time fossil), found_any stays False, and rule 3b at
+        _evaluate_position can never fire on live greeks.
+
+        The obvious alternative source is NOT one: ib_insync 0.9.86's
+        PortfolioItem carries no greeks at all (fields: contract, position,
+        marketPrice, marketValue, averageCost, unrealizedPNL, realizedPNL,
+        account — verified), which is also why the risk manager's
+        portfolio-delta gate is documented dead. Making 3b real needs a
+        genuine per-leg subscription (reqMktData + ~2s settle + cancel, the
+        options_chain pattern) issued from the 30s exit loop — a broker-side
+        change this module should not own unilaterally, on a feed where
+        run_orchestrator.py:43-49 already documents greeks as "sporadic".
+
+        Until then the rule is left in place but ANNOUNCED: the touch stop
+        covers the same directional blowout, and a safety rule that is quietly
+        dead is worse than one that says so.
         """
         try:
             if not self._ibkr or not self._ibkr.connected:
@@ -849,9 +905,35 @@ class PortfolioManager:
                 if ticker and ticker.modelGreeks and ticker.modelGreeks.delta is not None:
                     total_delta += ticker.modelGreeks.delta * item.position
                     found_any = True
-            return total_delta if found_any else None
+            if not found_any:
+                self._warn_delta_rule_inert(trade)
+                return None
+            return total_delta
         except Exception:
             return None
+
+    def _warn_delta_rule_inert(self, trade) -> None:
+        """R16: say it out loud, once per session, that exit rule 3b is dead.
+
+        Once per PROCESS (not per position, not per tick): the condition is
+        structural, so per-tick logging would be pure noise at the 30s
+        cadence, and total silence is what let a rule advertised in the exit
+        chain sit inert since inception.
+        """
+        seen = getattr(self, "_delta_rule_inert_logged", None)
+        if seen:
+            return
+        self._delta_rule_inert_logged = True
+        log.warning(
+            "delta_breach_rule_inert",
+            trade_id=getattr(trade, "trade_id", "?"),
+            symbol=getattr(trade, "symbol", "?"),
+            note="exit rule 3b (delta_breach) has NO greeks to read: the exit "
+                 "path holds no market-data subscription for the leg "
+                 "contracts and PortfolioItem carries no greeks. Treat rule 3b "
+                 "as OFF — the short-strike touch stop is the live guard "
+                 "against the same directional blowout.",
+        )
 
     async def _get_volatility_stop_multiplier(self, symbol: str) -> float:
         """Calculate a stop width multiplier based on the underlying's volatility.

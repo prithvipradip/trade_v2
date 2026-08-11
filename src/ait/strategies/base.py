@@ -28,16 +28,44 @@ class SignalDirection(str, Enum):
 # Everything else is a DEBIT strategy (entry paid, exit received).
 # Single source of truth — executor, portfolio manager, and reconciler
 # all branch on this set.
-CREDIT_STRATEGIES = frozenset({
+#
+# R16: this file and backtesting/engine.py both declared a set NAMED
+# CREDIT_STRATEGIES with DIFFERENT membership (4 here vs 11 there). Nothing
+# forced them to agree, so promoting any engine-only arm live would have had
+# every consumer of THIS set (credit P&L sign convention, credit position
+# caps, macro gates) silently misclassify it as a debit structure. The
+# membership is now declared once, here, and engine.py imports it — a
+# backtest-only name can never fork classification again.
+#
+# LIVE_CREDIT_STRATEGIES = names the live selector can actually instantiate
+# (STRATEGY_MAP in strategies/selector.py); BACKTEST_CREDIT_STRATEGIES =
+# shadow-tournament arms that exist only inside the engine. Both are credit
+# structures, so both belong in CREDIT_STRATEGIES: classification follows the
+# cash-flow direction, not whether the name happens to be tradeable today.
+LIVE_CREDIT_STRATEGIES = frozenset({
     "iron_condor", "short_strangle", "covered_call", "cash_secured_put",
 })
+
+BACKTEST_CREDIT_STRATEGIES = frozenset({
+    "iron_butterfly", "wide_wing_condor", "broken_wing_condor",
+    "call_credit_spread", "put_credit_spread", "jade_lizard",
+    "short_straddle",
+})
+
+CREDIT_STRATEGIES = LIVE_CREDIT_STRATEGIES | BACKTEST_CREDIT_STRATEGIES
 
 # R16: strategies whose max loss is NOT structurally capped. Signal.max_loss
 # for these is a stress ESTIMATE (always > 0), so "max_loss > 0" could never
 # identify them — strangle signals reported is_defined_risk=True, silently
 # defeating the defined-risk-first ordering and the +10 ranking bonus.
+# R16: jade_lizard added — its short put is NAKED (backtest max_loss_per_share
+# = short_put_strike - credit, ~7x a same-underlying condor's). It is a
+# backtest-only arm today, so this is pre-emptive: if it is ever promoted it
+# must not read as defined-risk here while the engine flattens it as
+# strangle-class risk before macro events.
 UNDEFINED_RISK_STRATEGIES = frozenset({
     "short_strangle", "short_straddle", "covered_call", "cash_secured_put",
+    "jade_lizard",
 })
 
 

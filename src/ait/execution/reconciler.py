@@ -81,6 +81,32 @@ class PositionReconciler:
     # all new trades on the symbol + correlated symbols.
     STALE_PENDING_MINUTES = 30
 
+    def _ensure_open_position_row(self, trade) -> None:
+        """R16: give a rescued trade the open_positions row its monitors need.
+
+        Every promotion path here flips trades.status via CAS but nothing ever
+        created the open_positions row that only the executor's fill paths
+        write (executor.py:1550, 1594). Without that row
+        update_high_water_mark / update_position_mark are UPDATEs that match
+        zero rows and no-op SILENTLY, and get_high_water_mark returns 0.0 — so
+        a promoted trade is monitored for stops and take-profit but its
+        trailing profit-lock, peak-P&L journaling and partial-exit ledger are
+        dead for its entire life. insert_open_position is INSERT OR IGNORE,
+        so this is idempotent and safe to call on every promotion.
+        """
+        try:
+            self._state.insert_open_position(
+                trade_id=trade.trade_id,
+                symbol=trade.symbol,
+                contract_type=getattr(trade, "contract_type", "") or "",
+                quantity=abs(int(getattr(trade, "quantity", 0) or 0)),
+                entry_price=abs(float(getattr(trade, "entry_price", 0.0) or 0.0)),
+                legs=getattr(trade, "legs", "[]") or "[]",
+            )
+        except Exception as e:  # noqa: BLE001 — a promotion must not be undone
+            log.warning("promoted_open_position_insert_failed",
+                        trade_id=getattr(trade, "trade_id", "?"), error=str(e))
+
     async def _underlying_last(self, symbol: str) -> float | None:
         """Best-effort current/last price of the underlying via IBKR."""
         try:
@@ -543,8 +569,11 @@ class PositionReconciler:
                     # Legs live at the broker — the order FILLED. Rescue it.
                     # R12 Tier-A #1: CAS PENDING->FILLED (a concurrent writer
                     # may have moved the trade since get_open_trades()).
-                    self._state.transition(
-                        t.trade_id, (TradeStatus.PENDING,), TradeStatus.FILLED)
+                    if self._state.transition(
+                            t.trade_id, (TradeStatus.PENDING,), TradeStatus.FILLED):
+                        # R16: rescued trades had no open_positions row, so
+                        # HWM/trailing-lock/partial-exit tracking was dead.
+                        self._ensure_open_position_row(t)
                     log.warning("sweep_promoted_filled_pending",
                                 trade_id=t.trade_id, symbol=t.symbol,
                                 strategy=t.strategy, age_min=int(age_min))
@@ -648,6 +677,13 @@ class PositionReconciler:
 
         # Check IBKR positions against local state
         promoted_ids: set[str] = set()
+        # R16: a CLOSING trade kept because the broker order view is
+        # unavailable is ONE fact about ONE trade, but the branch below sits
+        # inside the per-IBKR-key match loop and — unlike the adopted branch,
+        # which records the trade in result.closing_exit_orders — recorded
+        # nothing, so all 4 legs of a condor re-entered it and the EOD recon
+        # Telegram counted 4 identical BREAKs. Dedup like promoted_ids.
+        kept_unknown_ids: set[str] = set()
         for key, ibkr_pos in ibkr_map.items():
             if key in local_map:
                 result.matched += 1
@@ -662,6 +698,8 @@ class PositionReconciler:
                         continue
                     if local_trade.trade_id in result.closing_exit_orders:
                         continue  # already resolved as kept-CLOSING
+                    if local_trade.trade_id in kept_unknown_ids:
+                        continue  # R16: already reported once for this trade
                     if local_trade.status == TradeStatus.PENDING:
                         # R12 Tier-A #1: CAS PENDING->FILLED.
                         if self._state.update_trade_status(
@@ -669,6 +707,10 @@ class PositionReconciler:
                                 from_statuses=(TradeStatus.PENDING,)):
                             promoted_ids.add(local_trade.trade_id)
                             result.promoted += 1
+                            # R16: promotions never inserted the
+                            # open_positions row the HWM/partial-exit
+                            # ledger lives in.
+                            self._ensure_open_position_row(local_trade)
                             log.warning("reconcile_promoted_to_filled",
                                         trade_id=local_trade.trade_id,
                                         symbol=local_trade.symbol,
@@ -693,6 +735,9 @@ class PositionReconciler:
                             # Unknown broker order state — promoting could
                             # duplicate a live close. Keep CLOSING; the next
                             # reconcile retries with a working broker view.
+                            # R16: report ONCE per trade, not once per leg key
+                            # (a condor matched here 4x = 4 identical BREAKs).
+                            kept_unknown_ids.add(local_trade.trade_id)
                             result.discrepancies.append(
                                 f"CLOSING trade {local_trade.trade_id} kept: "
                                 f"broker open-order view unavailable")
@@ -705,6 +750,10 @@ class PositionReconciler:
                                     (TradeStatus.CLOSING,), TradeStatus.FILLED):
                                 promoted_ids.add(local_trade.trade_id)
                                 result.promoted += 1
+                                # R16: see _ensure_open_position_row — a
+                                # CLOSING->FILLED rescue is exactly the case
+                                # where the row went missing at restart.
+                                self._ensure_open_position_row(local_trade)
                                 log.warning("reconcile_promoted_to_filled",
                                             trade_id=local_trade.trade_id,
                                             symbol=local_trade.symbol,

@@ -35,6 +35,13 @@ import os as _os_t
 # the cancel; 90s cancelled orders before the marketable step could fire.
 DEFAULT_ORDER_TIMEOUT = int(_os_t.environ.get("AIT_ENTRY_ORDER_TIMEOUT", "240"))
 
+# R16: IBKR's generic combo contract id. Every BAG order reports, alongside its
+# per-leg executions, ONE combo-level summary execution carrying this conId and
+# the net combo price (negative when the combo nets a credit). Leg rows and the
+# combo row are different units and must never be compared to each other — see
+# _sweep_executions.
+BAG_CON_ID = 28812380
+
 
 # R5 audit: expected (n_sell, n_buy) leg shape per multi-leg strategy. A combo
 # whose SELL/BUY counts disagree with its strategy name is refused — this is
@@ -213,6 +220,19 @@ class TradeExecutor:
         self._fill_task_pending = False
         self._cf_running = False
         self._cf_rerun = False  # R12 F2.3: rerun-requested flag (no dropped passes)
+        # R16: (fetched_at, orderIds | None) of the last AUTHORITATIVE
+        # all-clients open-order snapshot. None means the broker could not be
+        # asked — every consumer must DEFER on it, never conclude "gone".
+        self._broker_open_ids_cache: tuple[float, set[int] | None] | None = None
+        # R16: one operator page per (order_id, event); these conditions
+        # persist across passes and must not re-page every 30s.
+        self._stuck_order_pages: set[tuple[int, str]] = set()
+        # R16: exit orderIds ever classified as belonging to ANOTHER clientId.
+        # Sticky: the foreign stash gets pruned once the broker stops
+        # reporting the order, and a wiped cache erases the clientId evidence
+        # — but an exit order whose fill was never observable here must stay
+        # on the broker-truth path, never fall back into the 900s revert.
+        self._foreign_exit_orders: set[int] = set()
 
     async def execute_signal(self, signal: Signal, contracts: int) -> str | None:
         """Execute a trade signal. Returns trade_id on success, None on failure."""
@@ -745,6 +765,15 @@ class TradeExecutor:
             log.warning("check_fills_skipped_disconnected")
             return filled, []
 
+        # R16: classify tracked EXIT orders against the stash / cached clientId
+        # BEFORE the stash is pruned — pruning is what erases the evidence,
+        # and an exit order whose fill was never observable in this session
+        # must stay on the broker-truth path instead of falling back into the
+        # 900s revert. Then release stashed ids the broker no longer reports
+        # working, so a genuinely dead order stops forcing "pending" forever.
+        self._classify_foreign_exit_orders(self._ibkr.get_open_orders())
+        await self._prune_foreign_stash()
+
         # 1. Cancel stale orders that have exceeded timeout
         await self._cancel_stale_orders()
 
@@ -760,6 +789,19 @@ class TradeExecutor:
 
             # Order is no longer open — determine what happened
             status = self._determine_fill_status(order_id, all_trades, pending)
+
+            # R16 (post-reconnect amnesia): a "cancelled" verdict that rests
+            # ONLY on the order being absent from this session's caches is not
+            # evidence of anything — a reconnect whose open-orders sync timed
+            # out silently leaves those caches empty while the order is still
+            # working (and its later fill creates no Trade object at all).
+            # Confirm against the broker before writing CANCELLED; defer when
+            # the broker cannot confirm. A verdict read off an explicit
+            # terminal status in all_trades is trustworthy and skips this.
+            if status == "cancelled" and not any(
+                    t.order.orderId == order_id for t in all_trades):
+                if not await self._confirm_order_not_working(order_id, all_trades):
+                    continue
 
             if status == "filled":
                 # Get actual fill price if available
@@ -846,6 +888,78 @@ class TradeExecutor:
         # 3. Check pending EXIT orders — finalize CLOSING → CLOSED with real fill price
         completed_exits = []
         for order_id, pending_exit in list(self._pending_exit_orders.items()):
+            # R16 (foreign / frozen exit orders): when the exit order belongs
+            # to another clientId — a fallback-clientId reconnect, or an order
+            # adopted from the previous process at startup reconcile — the
+            # local cache is meaningless in BOTH directions, and each
+            # direction had its own money bug:
+            #   present-forever (ib_insync inserts the foreign order frozen at
+            #     'Submitted' and never updates it) pinned the trade in CLOSING
+            #     with an order nobody in this session can cancel or reprice,
+            #     and made the 900s zombie cap unreachable;
+            #   absent (stash fetch failed, or a reconnect wiped the cache)
+            #     let that 900s cap revert CLOSING->FILLED while the original
+            #     close was still working at the broker — the monitor then
+            #     places a SECOND close and both fill (R12 F4.1's incident).
+            # Resolve such orders against a fresh all-clients broker snapshot,
+            # and DEFER (keep CLOSING, page once) whenever the broker cannot
+            # be asked or cannot tell us whether it filled.
+            _foreign_exits = getattr(self, "_foreign_exit_orders", None)
+            if _foreign_exits is None:
+                _foreign_exits = self._foreign_exit_orders = set()
+            if (order_id in _foreign_exits
+                    or self._is_foreign_session_order(order_id, open_trades)):
+                _foreign_exits.add(order_id)
+                _ids = await self._broker_open_order_ids()
+                if _ids is None:
+                    self._page_stuck_order(
+                        order_id, "exit_order_foreign_state_unknown",
+                        trade_id=pending_exit.trade_id,
+                        age_seconds=int(pending_exit.age_seconds),
+                        detail="exit order belongs to another clientId and the "
+                               "broker cannot be asked; holding CLOSING")
+                    continue
+                if order_id in _ids:
+                    # Still working under the other session. Cross-client
+                    # cancels are rejected, so escalate instead of looping on
+                    # a cancel that can never land.
+                    if pending_exit.age_seconds > 300:
+                        self._page_stuck_order(
+                            order_id, "exit_order_foreign_uncancellable",
+                            trade_id=pending_exit.trade_id,
+                            age_seconds=int(pending_exit.age_seconds),
+                            detail="a previous clientId's close order is still "
+                                   "working; cancel/reprice needs the operator")
+                    continue
+                # Broker says it is no longer working. The frozen local
+                # snapshot cannot say whether it FILLED or died, and guessing
+                # is a money bug either way (a phantom close, or a re-armed
+                # duplicate close). Hold CLOSING and let reconcile settle it
+                # from positions + the broker's own leg P&L.
+                self._forget_foreign_order(order_id)
+                # Once reconcile HAS settled the trade, stop tracking it so
+                # the tracker (and its page) do not live forever.
+                try:
+                    _tr = self._state.get_trade_by_id(pending_exit.trade_id)
+                except Exception:  # noqa: BLE001
+                    _tr = None
+                if _tr is not None and getattr(_tr, "status", None) != TradeStatus.CLOSING:
+                    log.warning("exit_order_foreign_tracker_released",
+                                order_id=order_id,
+                                trade_id=pending_exit.trade_id,
+                                status=str(getattr(_tr, "status", "")))
+                    _foreign_exits.discard(order_id)
+                    del self._pending_exit_orders[order_id]
+                    continue
+                self._page_stuck_order(
+                    order_id, "exit_order_foreign_gone_unbookable",
+                    trade_id=pending_exit.trade_id,
+                    age_seconds=int(pending_exit.age_seconds),
+                    detail="foreign exit order left the broker's open-order "
+                           "book; filled-vs-cancelled is unobservable in this "
+                           "session — held CLOSING for reconcile")
+                continue
+
             still_open = any(t.order.orderId == order_id for t in open_trades)
             if still_open:
                 # R13 (07-13 incident regression work): a WORKING exit was
@@ -1008,10 +1122,31 @@ class TradeExecutor:
                 except Exception:
                     pass
                 if pending_exit.age_seconds > 900:
+                    # R16: the zombie cap consulted NOTHING before reverting —
+                    # not the foreign stash, not the broker. If the close
+                    # order is in fact still working (under a previous
+                    # clientId, or simply invisible after a cache wipe),
+                    # reverting to FILLED re-arms the monitor and a second
+                    # close goes out alongside the first: both fill and the
+                    # condor flips into an inverse structure. Revert ONLY on a
+                    # broker snapshot that answered and does not list it.
+                    _ids = await self._broker_open_order_ids()
+                    if _ids is None or order_id in _ids:
+                        self._page_stuck_order(
+                            order_id, "exit_zombie_revert_deferred",
+                            trade_id=pending_exit.trade_id,
+                            age_seconds=int(pending_exit.age_seconds),
+                            reason=("broker_unreachable" if _ids is None
+                                    else "order_still_working_at_broker"),
+                            detail="held CLOSING rather than re-arming a "
+                                   "duplicate close",
+                        )
+                        continue
                     log.error(
                         "exit_order_zombie_reverting",
                         trade_id=pending_exit.trade_id,
                         age_seconds=int(pending_exit.age_seconds),
+                        broker_confirmed_not_working=True,
                     )
                     # R12 Tier-A #1 (F4.5): CAS CLOSING->FILLED only — never
                     # resurrect a trade that reached CLOSED via another path.
@@ -1060,11 +1195,39 @@ class TradeExecutor:
                 log.warning("entry_ladder_reprice_failed",
                             trade_id=pending.trade_id, error=str(e))
 
+    @staticmethod
+    def _is_bag_row(fill) -> bool:
+        """R16: True for the combo-level summary execution of a BAG order
+        (IBKR's generic combo conId), as opposed to a per-leg execution."""
+        c = getattr(fill, "contract", None)
+        if c is None:
+            return False
+        return ((getattr(c, "conId", 0) or 0) == BAG_CON_ID
+                or getattr(c, "secType", "") == "BAG")
+
     def _sweep_executions(self) -> None:
         """R7: persist every broker fill + commission to the executions
         ledger. Runs each check_fills pass; upserts refresh commissions that
         arrive after the fill. This is the ground truth the PF verdict needs
-        (trades.commission was guessed at $0.65/leg before)."""
+        (trades.commission was guessed at $0.65/leg before).
+
+        R16 (fill-quality semantics): signal_price/live_mid describe the
+        COMBO — one net price for the whole structure — and were stamped onto
+        every per-leg row as well. Every slippage consumer then computed
+        |per-leg price - combo mid|, e.g. a 2.09 short put against a 4.24
+        condor mid = "49.9% slippage", and the go-live gate (median <= 8% of
+        credit) was permanently, unfixably red while a genuinely bad fill
+        would have been invisible in the same noise. Fill-quality context is
+        now written ONLY where the comparison is defined:
+          * combo orders: the BAG summary row alone, whose price is the net
+            combo price. It is stored as a MAGNITUDE so it shares
+            trades.entry_price's unsigned convention — the raw as-defined
+            value is negative for a credit, which made ABS(price - live_mid)
+            read 198% instead of the true 1.6%. The per-leg rows keep their
+            raw signed broker prices (all P&L reconstruction uses those and
+            already excludes the BAG conId) but carry no combo context.
+          * single-leg orders: unchanged — price and mid are the same unit.
+        """
         try:
             omap = getattr(self, "_order_trade_map", {})
             for t in self._ibkr.ib.trades():
@@ -1084,9 +1247,21 @@ class TradeExecutor:
                     sig_price = ctx[0]
                 live_mid = (getattr(pend, "live_mid", 0.0) or 0.0) or ctx[1]
                 nbbo = (getattr(pend, "nbbo_spread", 0.0) or 0.0) or ctx[2]
+                is_combo = getattr(t.contract, "secType", "") == "BAG"
                 for f in t.fills:
                     if not f.execution or not f.execution.execId:
                         continue
+                    px = float(f.execution.price or 0)
+                    # R16: see the docstring — combo context belongs on the
+                    # combo row only, in the combo row's own unit.
+                    if is_combo:
+                        if self._is_bag_row(f):
+                            px = abs(px)
+                            row_sig, row_mid, row_nbbo = sig_price, live_mid, nbbo
+                        else:
+                            row_sig = row_mid = row_nbbo = 0.0
+                    else:
+                        row_sig, row_mid, row_nbbo = sig_price, live_mid, nbbo
                     comm = 0.0
                     rpnl = 0.0
                     if f.commissionReport:
@@ -1102,13 +1277,13 @@ class TradeExecutor:
                         con_id=getattr(f.contract, "conId", 0) or 0,
                         side=f.execution.side,
                         shares=float(f.execution.shares or 0),
-                        price=float(f.execution.price or 0),
+                        price=px,
                         exec_time=self._normalize_exec_time(f.execution.time),
                         commission=comm,
                         realized_pnl=rpnl,
-                        signal_price=sig_price,
-                        live_mid=live_mid,
-                        nbbo_spread=nbbo,
+                        signal_price=row_sig,
+                        live_mid=row_mid,
+                        nbbo_spread=row_nbbo,
                     )
         except Exception as e:  # noqa: BLE001
             log.debug("executions_sweep_failed", error=str(e))
@@ -1141,6 +1316,19 @@ class TradeExecutor:
         self._sweep_executions()
         for order_id, pending in list(self._pending_orders.items()):
             if pending.age_seconds > self._order_timeout:
+                # R16: a foreign-session order has no Trade object here, so
+                # cancel_order() can only fail ("no matching trade found") —
+                # it logged an error on every 30s pass for the life of the
+                # process. The order is unreachable from this session: say so
+                # once and let the stash prune / reconcile resolve it.
+                if self._in_foreign_stash(order_id):
+                    self._page_stuck_order(
+                        order_id, "stale_entry_order_foreign_uncancellable",
+                        trade_id=pending.trade_id,
+                        age_seconds=int(pending.age_seconds),
+                        detail="entry order is working under another clientId; "
+                               "this session cannot cancel it")
+                    continue
                 log.info(
                     "cancelling_stale_order",
                     trade_id=pending.trade_id,
@@ -1152,6 +1340,197 @@ class TradeExecutor:
                     await self._ibkr.cancel_order(order_id)
                 except Exception as e:
                     log.warning("cancel_failed", order_id=order_id, error=str(e))
+
+    # R16: an authoritative all-clients snapshot is a broker round trip; a
+    # single check_fills pass can consult it from several places (stash prune,
+    # entry cancel verdicts, exit resolution, the 900s zombie cap), so cache
+    # it for a few seconds. Passes are 30s apart, so this never hides a change.
+    _BROKER_SNAPSHOT_TTL = 5.0
+
+    async def _broker_open_order_ids(self) -> set[int] | None:
+        """R16: orderIds working at the BROKER across ALL clientIds, or None
+        when the broker could not be asked.
+
+        This is the only trustworthy answer to "is this order still working?".
+        ib_insync's caches are not: they are wiped by any disconnect, and
+        orders owned by another clientId sit in them frozen at 'Submitted'
+        forever (no master clientId is configured, so no updates arrive).
+        Both failure modes are indistinguishable from a real disappearance,
+        which is how working entries were mass-flipped to CANCELLED and how a
+        CLOSING trade could be reverted while its close order was still live.
+
+        None means UNKNOWN. Callers must defer, never act.
+        """
+        now = time.time()
+        cached = getattr(self, "_broker_open_ids_cache", None)
+        if cached is not None and (now - cached[0]) < self._BROKER_SNAPSHOT_TTL:
+            return cached[1]
+        ids: set[int] | None = None
+        try:
+            getter = getattr(self._ibkr, "get_all_open_order_ids", None)
+            if getter is not None:
+                ids = await getter()
+            else:
+                # Legacy/shim client without the strict probe: get_all_open_trades
+                # returns None only when it truly cannot answer.
+                trades_getter = getattr(self._ibkr, "get_all_open_trades", None)
+                if trades_getter is not None:
+                    trades = await trades_getter()
+                    ids = (None if trades is None else
+                           {int(t.order.orderId) for t in trades
+                            if getattr(t.order, "orderId", 0)})
+        except Exception as e:  # noqa: BLE001 — an unanswered probe is UNKNOWN
+            log.warning("broker_open_orders_probe_failed", error=str(e)[:200])
+            ids = None
+        self._broker_open_ids_cache = (now, ids)
+        return ids
+
+    def _in_foreign_stash(self, order_id: int) -> bool:
+        """R16: quiet membership test (``_is_foreign_open_order`` logs)."""
+        return order_id in (getattr(self._ibkr, "foreign_open_order_ids", None) or set())
+
+    def _note_foreign_order(self, order_id: int, reason: str) -> None:
+        """R16: record that this orderId is working at the broker but is NOT
+        observable in this session, so every later pass refuses cancel
+        verdicts for it instead of re-deriving the discovery."""
+        try:
+            stash = getattr(self._ibkr, "foreign_open_order_ids", None)
+            if stash is None or order_id in stash:
+                return
+            stash.add(order_id)
+            log.warning("foreign_open_order_noted", order_id=order_id, reason=reason)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _forget_foreign_order(self, order_id: int) -> None:
+        """R16: the broker no longer reports this order working — release it
+        so the normal fill/cancel resolution can finish the trade."""
+        try:
+            stash = getattr(self._ibkr, "foreign_open_order_ids", None)
+            if stash is not None and order_id in stash:
+                stash.discard(order_id)
+                log.warning("foreign_open_order_released", order_id=order_id)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _is_foreign_session_order(self, order_id: int, trades) -> bool:
+        """R16: True when this order cannot be observed from this session.
+
+        Two independent signals:
+          * it is in the foreign stash (a clientId-change reconnect saw it
+            working under the previous session), or
+          * the cached Trade object carries a DIFFERENT clientId — ib_insync
+            builds those from reqAllOpenOrders as snapshots and never updates
+            them again, so their 'Submitted' status is meaningless. The stash
+            alone missed this case: _should_stash_foreign is skipped on a
+            same-id reconnect, and a startup reconcile poisons the cache
+            before any stash exists.
+        """
+        if self._in_foreign_stash(order_id):
+            return True
+        my_id = getattr(self._ibkr, "client_id", None)
+        try:
+            my_id = int(my_id) if my_id else 0
+        except (TypeError, ValueError):
+            my_id = 0
+        if my_id <= 0:
+            return False
+        for t in trades:
+            if getattr(t.order, "orderId", None) != order_id:
+                continue
+            other = getattr(t.order, "clientId", None)
+            try:
+                other = int(other) if other else 0
+            except (TypeError, ValueError):
+                other = 0
+            if other > 0 and other != my_id:
+                self._note_foreign_order(
+                    order_id, f"cached trade is a frozen snapshot owned by "
+                              f"clientId {other} (this session is {my_id})")
+                return True
+            return False
+        return False
+
+    def _page_stuck_order(self, order_id: int, event: str, **fields) -> None:
+        """R16: page the operator ONCE per (order, event). These states
+        persist across passes; re-paging every 30s is how alarm fatigue
+        buries the page that matters."""
+        key = (order_id, event)
+        pages = getattr(self, "_stuck_order_pages", None)
+        if pages is None:
+            pages = self._stuck_order_pages = set()
+        if key in pages:
+            return
+        pages.add(key)
+        log.critical(event, order_id=order_id, **fields)
+
+    def _classify_foreign_exit_orders(self, trades) -> None:
+        """R16: record which tracked exit orders belong to another clientId.
+
+        Sticky by design and evaluated BEFORE the stash is pruned: once an
+        exit order's fill is unobservable from this session, no later cache
+        state may quietly return it to the guess-from-cache path."""
+        pending_exits = getattr(self, "_pending_exit_orders", None) or {}
+        if not pending_exits:
+            return
+        foreign = getattr(self, "_foreign_exit_orders", None)
+        if foreign is None:
+            foreign = self._foreign_exit_orders = set()
+        for oid in list(pending_exits):
+            if oid not in foreign and self._is_foreign_session_order(oid, trades):
+                foreign.add(oid)
+
+    async def _prune_foreign_stash(self) -> None:
+        """R16: the stash was add-only, so an order that genuinely died kept
+        forcing 'pending' for the life of the process. Re-validate it against
+        an authoritative snapshot; prune ONLY on a successful answer."""
+        if not (getattr(self._ibkr, "foreign_open_order_ids", None) or set()):
+            return
+        ids = await self._broker_open_order_ids()
+        if ids is None:
+            return  # unknown -> keep the protective stash intact
+        pruner = getattr(self._ibkr, "prune_foreign_open_orders", None)
+        if pruner is not None:
+            pruner(ids)
+            return
+        stash = self._ibkr.foreign_open_order_ids
+        for oid in sorted(stash - ids):
+            self._forget_foreign_order(oid)
+
+    async def _confirm_order_not_working(self, order_id: int, all_trades: list) -> bool:
+        """R16: may a "vanished" order be declared CANCELLED?
+
+        Only when an authoritative all-clients snapshot answered AND does not
+        list it AND this session can see orders at all. A same-clientId
+        reconnect whose open-orders sync silently timed out (ib_insync only
+        LOGS that timeout and still reports a successful connect) leaves
+        trades()/openTrades() EMPTY, which the old code read as "every working
+        entry was cancelled" — flipping live broker orders to CANCELLED
+        locally and untracking their later fills.
+        """
+        ids = await self._broker_open_order_ids()
+        if ids is None:
+            log.warning(
+                "cancel_verdict_deferred_broker_unreachable",
+                order_id=order_id,
+                note="cannot confirm the order is gone; treating as pending",
+            )
+            return False
+        if order_id in ids:
+            self._note_foreign_order(
+                order_id, "working at the broker but absent from this "
+                          "session's trade cache")
+            return False
+        if not all_trades:
+            log.warning(
+                "cancel_verdict_deferred_empty_session_snapshot",
+                order_id=order_id,
+                note="this session's trade cache is empty (post-reconnect "
+                     "amnesia); a fill would be invisible here",
+            )
+            return False
+        self._forget_foreign_order(order_id)
+        return True
 
     def _is_foreign_open_order(self, order_id: int) -> bool:
         """R12 F3.1 / chaos#4B: True when this orderId was seen working at the
@@ -1664,6 +2043,24 @@ class TradeExecutor:
             log.info("exit_order_already_tracked", order_id=order_id,
                      trade_id=trade_id)
             return
+        # R16: an order adopted from a PREVIOUS clientId is a frozen snapshot
+        # in ib_insync's cache — its status never updates again, so check_fills
+        # would see it "working" forever (or "vanished" after a cache wipe).
+        # Classify it at adoption so the exit loop resolves it against the
+        # broker instead of the cache. The R12 stash cannot cover this: it is
+        # skipped on the first connect of a restarted process, which is
+        # exactly when adoption happens.
+        try:
+            if self._is_foreign_session_order(order_id, self._ibkr.ib.trades()):
+                if getattr(self, "_foreign_exit_orders", None) is None:
+                    self._foreign_exit_orders = set()
+                self._foreign_exit_orders.add(order_id)
+                log.warning("exit_order_adopted_foreign_session",
+                            order_id=order_id, trade_id=trade_id,
+                            note="status is unobservable in this session; "
+                                 "tracked against reqAllOpenOrders instead")
+        except Exception as _e:  # noqa: BLE001 — classification must not block adoption
+            log.debug("adopted_exit_foreign_check_failed", error=str(_e))
         self.register_exit_order(
             order_id=order_id,
             trade_id=trade_id,

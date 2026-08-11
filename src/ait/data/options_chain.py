@@ -39,13 +39,75 @@ def _parse_env_override(raw: str | None, cast, default):
         return default
 
 
+# R16: contract liquidity used to be filtered from TWO independent sources
+# with different defaults — OptionContract.is_liquid read env AIT_LIQ_*
+# (defaults 50/100/0.15) while OptionsChain.filter_liquid(config) read
+# config.yaml options.min_volume/min_open_interest/max_bid_ask_spread_pct
+# (0/10/0.40). They agreed only by coincidence, so editing one knob changed
+# only half the filtering, and the env-side defaults (volume >= 50) are
+# entry-killing on this delayed feed if .env is ever not loaded.
+#
+# ONE authority: config.yaml options.* is the base; AIT_LIQ_* are EXPLICIT
+# per-key overrides on top of it; the hardcoded triple below survives only as
+# the last resort when settings cannot be loaded at all. The resolved values
+# and which source won each key are logged once per process.
+_LIQ_LAST_RESORT = (50, 100, 0.15)
+_LIQ_ENV_KEYS = ("AIT_LIQ_MIN_VOLUME", "AIT_LIQ_MIN_OI", "AIT_LIQ_MAX_SPREAD")
+_liq_logged: tuple | None = None
+
+
+def _resolve_liquidity(config: "OptionsConfig | None") -> tuple[int, int, float]:
+    """Resolve (min_volume, min_open_interest, max_spread_pct) + log sources."""
+    sources = ["code_default"] * 3
+    base = list(_LIQ_LAST_RESORT)
+    cfg = config
+    if cfg is None:
+        try:
+            from ait.config.settings import load_settings
+            cfg = load_settings().options
+        except Exception:  # noqa: BLE001 — never let config break chain filtering
+            cfg = None
+    if cfg is not None:
+        try:
+            base = [int(cfg.min_volume), int(cfg.min_open_interest),
+                    float(cfg.max_bid_ask_spread_pct)]
+            sources = ["config.yaml"] * 3
+        except Exception:  # noqa: BLE001
+            pass
+
+    casts = (int, int, float)
+    for i, (key, cast) in enumerate(zip(_LIQ_ENV_KEYS, casts)):
+        raw = os.environ.get(key)
+        if raw is None:
+            continue  # unset -> config.yaml (or last resort) stands
+        base[i] = _parse_env_override(raw, cast, base[i])
+        sources[i] = f"env:{key}"
+
+    resolved = (int(base[0]), int(base[1]), float(base[2]))
+    # Log the winning source per key, but only when it CHANGES — filter_liquid
+    # runs per chain per scan and this is a config fact, not an event.
+    global _liq_logged
+    fingerprint = (resolved, tuple(sources))
+    if fingerprint != _liq_logged:
+        _liq_logged = fingerprint
+        log.info(
+            "liquidity_thresholds_resolved",
+            min_volume=resolved[0], min_volume_source=sources[0],
+            min_open_interest=resolved[1], min_open_interest_source=sources[1],
+            max_spread_pct=resolved[2], max_spread_source=sources[2],
+        )
+    return resolved
+
+
 @lru_cache(maxsize=1)
 def _liquidity_thresholds() -> tuple[int, int, float]:
-    return (
-        _parse_env_override(os.environ.get("AIT_LIQ_MIN_VOLUME"), int, 50),
-        _parse_env_override(os.environ.get("AIT_LIQ_MIN_OI"), int, 100),
-        _parse_env_override(os.environ.get("AIT_LIQ_MAX_SPREAD"), float, 0.15),
-    )
+    """Process-wide resolved thresholds (see _resolve_liquidity).
+
+    Cached because is_liquid runs per contract per scan. Consequence, kept
+    deliberately: editing .env or config.yaml requires a process restart —
+    call _liquidity_thresholds.cache_clear() to re-resolve (tests do).
+    """
+    return _resolve_liquidity(None)
 
 
 @dataclass
@@ -186,6 +248,10 @@ class OptionsChain:
     # them off the chain without refetching or re-deriving vol.
     atm_iv: float = 0.0
     expected_move: float = 0.0
+    # R16: which feed actually produced this chain ("ibkr" | "yahoo_delayed").
+    # The IBKR->Yahoo degradation was completely silent, so entry telemetry
+    # attributed delayed-snapshot deltas/IVs to the realtime feed.
+    source: str = ""
 
     def __post_init__(self) -> None:
         # R12-B: attach ATM IV + expected move to every chain at build time.
@@ -241,10 +307,20 @@ class OptionsChain:
             # delta-filtered (OTM-only) subset would bias ATM IV.
             atm_iv=self.atm_iv,
             expected_move=self.expected_move,
+            source=self.source,
         )
 
-    def filter_liquid(self, config: OptionsConfig) -> OptionsChain:
-        """Filter to only liquid contracts based on config thresholds."""
+    def filter_liquid(self, config: OptionsConfig | None = None) -> OptionsChain:
+        """Filter to only liquid contracts.
+
+        R16: this used to read the passed OptionsConfig directly while
+        OptionContract.is_liquid read env AIT_LIQ_* with different defaults —
+        two filters, two sources. Both now resolve through
+        _resolve_liquidity(): config.yaml is the base, AIT_LIQ_* override it.
+        Passing config keeps the caller's base explicit (the orchestrator
+        passes settings.options); None resolves the loaded settings.
+        """
+        min_vol, min_oi, max_spread = _resolve_liquidity(config)
         return OptionsChain(
             symbol=self.symbol,
             underlying_price=self.underlying_price,
@@ -252,20 +328,21 @@ class OptionsChain:
             calls=[
                 c
                 for c in self.calls
-                if c.volume >= config.min_volume
-                and (c.open_interest <= 0 or c.open_interest >= config.min_open_interest)
-                and c.spread_pct <= config.max_bid_ask_spread_pct
+                if c.volume >= min_vol
+                and (c.open_interest <= 0 or c.open_interest >= min_oi)
+                and c.spread_pct <= max_spread
             ],
             puts=[
                 p
                 for p in self.puts
-                if p.volume >= config.min_volume
-                and (p.open_interest <= 0 or p.open_interest >= config.min_open_interest)
-                and p.spread_pct <= config.max_bid_ask_spread_pct
+                if p.volume >= min_vol
+                and (p.open_interest <= 0 or p.open_interest >= min_oi)
+                and p.spread_pct <= max_spread
             ],
             # R12-B: carry the full chain's vol stats (see filter_by_delta).
             atm_iv=self.atm_iv,
             expected_move=self.expected_move,
+            source=self.source,
         )
 
 
@@ -309,19 +386,55 @@ class OptionsChainService:
 
         # Try IBKR first
         chains = await self._get_ibkr_chain(symbol, price, min_dte, max_dte)
+        source = "ibkr"
 
         # Fallback to Yahoo
         if not chains:
             chains = await self._get_yahoo_chain(symbol, price, min_dte, max_dte)
+            source = "yahoo_delayed"
+
+        # R16: the degradation to Yahoo was COMPLETELY SILENT — no log line
+        # anywhere recorded which feed a scan's strikes, deltas and IVs came
+        # from, so a Gateway/market-data outage looked identical to a healthy
+        # scan in every downstream telemetry (condor_entry_quality, atm_iv,
+        # expected_move). Emit the source actually used on every resolution
+        # (cache miss, i.e. at most once per symbol/DTE-band per 120s cache
+        # window ~ once per scan), WARNING when degraded.
+        self._log_chain_source(symbol, source, chains)
 
         if chains:
             # Calculate Greeks for all contracts
             for chain in chains:
+                chain.source = source
                 self._calculate_greeks(chain)
 
             self._cache.set(cache_key, chains, ttl=120)
 
         return chains
+
+    def _log_chain_source(self, symbol: str, source: str,
+                          chains: list[OptionsChain]) -> None:
+        """R16: one line per symbol per scan naming the feed that served it."""
+        if not chains:
+            log.warning(
+                "chain_source_unavailable",
+                symbol=symbol,
+                source="none",
+                reason="IBKR returned nothing and the Yahoo fallback was empty",
+            )
+            return
+        if source == "ibkr":
+            log.info("chain_source", symbol=symbol, source=source,
+                     expiries=len(chains))
+        else:
+            log.warning(
+                "chain_source_degraded",
+                symbol=symbol,
+                source=source,
+                expiries=len(chains),
+                note="IBKR chain empty/unavailable — strikes, IV and greeks "
+                     "for this scan come from DELAYED Yahoo snapshots",
+            )
 
     async def get_chain_for_expiry(
         self, symbol: str, expiry: date

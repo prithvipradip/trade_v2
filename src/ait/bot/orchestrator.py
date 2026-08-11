@@ -82,7 +82,12 @@ class TradingOrchestrator:
         self._state = StateManager()
 
         # Risk
-        self._circuit_breaker = CircuitBreaker(settings.risk)
+        # R16: hand the breaker the state handle directly so its consecutive-
+        # loss count and any active trip SURVIVE a restart. Pre-fix, the
+        # keeper's 90s relaunch reset the loss streak to zero — the protection
+        # against a losing streak was erased by the very crash-loop most
+        # likely to accompany one.
+        self._circuit_breaker = CircuitBreaker(settings.risk, state=self._state)
         self._pdt_guard = PDTGuard(settings.account, self._state)
         self._position_sizer = PositionSizer(settings.positions, settings.risk)
         # Config-wired (audit item 3.3) — was CorrelationGuard() with code
@@ -348,6 +353,10 @@ class TradingOrchestrator:
         # 2. Reset daily counters
         self._circuit_breaker.check_daily_reset()
         self._data_quality.reset_tracking()
+        # R16: the MTM-halt page latch is set-once-per-PROCESS, so after the
+        # first halt (or, pre-fix, after a false one) a genuine second-day
+        # halt paged nobody. Clear it with the other daily counters.
+        self._mtm_halt_alerted = False
 
         # 3. Run self-learning cycle (analyze yesterday's trades)
         if self._settings.learning.enabled:
@@ -606,7 +615,20 @@ class TradingOrchestrator:
                             f"exits still active."
                         )
             except Exception as _e:  # noqa: BLE001
-                log.debug("mtm_check_failed", error=str(_e))
+                # R16: was DEBUG — the gap-day daily-loss brake could fail on
+                # every tick and be invisible at the configured log level, so
+                # the one control that stops a bleeding day would look healthy
+                # while doing nothing. WARNING + a page (gated) instead.
+                log.warning("mtm_check_failed", error=str(_e),
+                            note="daily MTM loss brake did not evaluate this "
+                                 "tick — the gap-day halt is not protecting "
+                                 "the book until this clears")
+                if self._alert_gate("mtm_brake_broken", interval_s=3600):
+                    await self._send_notification(
+                        f"MTM BRAKE NOT EVALUATING: {type(_e).__name__}: {_e}. "
+                        f"The daily-loss halt is inactive until fixed; entries "
+                        f"are NOT being blocked by it."
+                    )
 
             # Skip positions already in CLOSING state (exit order already placed)
             closing_ids = {
@@ -816,6 +838,14 @@ class TradingOrchestrator:
         # Get current account value for capital tier decisions
         account_snapshot = await self._account.get_snapshot()
         current_capital = account_snapshot.net_liquidation if account_snapshot else 10_000.0
+        # R16: publish NLV so return/drawdown percentages stop being computed
+        # off a hardcoded 196000 that had already drifted from the real book
+        # (and would be ~65x wrong at the planned $3k go-live scale).
+        if account_snapshot and current_capital > 0:
+            try:
+                self._state.set_state("last_net_liquidation", str(current_capital))
+            except Exception:  # noqa: BLE001
+                pass
         tier_config = self._capital_tiers.get_config(current_capital)
 
         # Filter universe: learning restrictions + capital tier affordability
@@ -825,10 +855,19 @@ class TradingOrchestrator:
         ]
         universe = self._capital_tiers.filter_universe(universe, current_capital)
 
+        # R16: log what is ACTUALLY tradeable, not the tier's menu. The tier
+        # advertised 7 strategies (incl. short_strangle/long_straddle) while
+        # config.strategies has been [iron_condor] since 07-22 — the log read
+        # as if undefined-risk shapes were live and cost real diagnostic time
+        # during the audit. Intersection is the truth; both are shown.
+        _tradeable = [s for s in tier_config.allowed_strategies
+                      if s in set(self._settings.trading.strategies)]
         log.debug("capital_tier_active",
                   tier=tier_config.tier.value,
                   capital=f"${current_capital:,.0f}",
-                  strategies=tier_config.allowed_strategies,
+                  strategies=_tradeable,
+                  tier_menu=tier_config.allowed_strategies,
+                  config_enabled=list(self._settings.trading.strategies),
                   max_positions=tier_config.max_positions,
                   universe=universe)
 
@@ -1659,14 +1698,30 @@ class TradingOrchestrator:
                 # premium a seller is paid to take; every 14-30 DTE hold
                 # spans events regardless, and wings cap the surprise.
                 _blackout = self._settings.risk.pre_event_blackout_days
-                if _d2e is not None and _d2e <= _blackout:
+                # R16: days_until_next_event counts CALENDAR days, so a Friday
+                # entry ahead of a Monday event reads d2e=3 and sails past a
+                # 1-day window with ZERO intervening sessions. Convert to
+                # TRADING days so "1 day before the event" means one session.
+                _sessions = self._sessions_until(_d2e)
+                if _sessions is not None and _sessions <= _blackout:
                     log.info("credit_entry_skipped_pre_event",
                              symbol=signal.symbol,
                              strategy=signal.strategy_name,
-                             days_to_event=_d2e)
+                             days_to_event=_d2e, sessions_to_event=_sessions)
                     return False
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as _e:  # noqa: BLE001
+            # R16: this was a blanket except-pass — a calendar failure made the
+            # gate FAIL OPEN silently, entering exactly into the event it
+            # exists to avoid. Fail CLOSED for credit structures and say so.
+            log.error("pre_event_blackout_check_failed_failing_closed",
+                      symbol=signal.symbol, strategy=signal.strategy_name,
+                      error=str(_e))
+            try:
+                from ait.strategies.base import CREDIT_STRATEGIES as _CS6b
+                if signal.strategy_name in _CS6b:
+                    return True
+            except Exception:  # noqa: BLE001
+                return True
 
         # R12-B4 (user-approved): post-stop re-entry discipline. The old
         # cooldown keyed on ENTRY time, so a symbol stopped out on day 3 of a
@@ -2450,13 +2505,32 @@ class TradingOrchestrator:
         limit_price = None
         EXIT_CROSS = self._settings.exit.exit_cross_amount
         try:
-            qualified_combo = await self._ibkr.qualify_contract(combo)
-            if qualified_combo:
-                self._ibkr.ib.reqMktData(qualified_combo, "", False, False)
+            # R16: the live-quote path was DEAD CODE. It gated the NBBO fetch
+            # behind qualify_contract(combo), but a BAG cannot be qualified
+            # (reqContractDetails always returns None for a synthetic combo),
+            # so limit_price stayed None on EVERY multi-leg exit and each one
+            # fell through to the no-quote branch — pricing at the full wing
+            # width plus a CRITICAL page, on routine take-profits. A raw Bag
+            # IS valid for reqMktData and for order placement (the ENTRY path
+            # already relies on exactly that), so request on `combo` directly.
+            quote_contract = combo
+            if True:
+                self._ibkr.ib.reqMktData(quote_contract, "", False, False)
                 ticker = None
                 try:
-                    await asyncio.sleep(0.5)
-                    ticker = self._ibkr.ib.ticker(qualified_combo)
+                    # 0.5s was also too short for a 4-leg BAG to tick; the
+                    # entry path waits longer. Poll up to ~2.5s, breaking as
+                    # soon as a usable quote lands.
+                    import math as _m
+                    for _ in range(5):
+                        await asyncio.sleep(0.5)
+                        ticker = self._ibkr.ib.ticker(quote_contract)
+                        if ticker and (
+                                (ticker.bid is not None and not _m.isnan(ticker.bid)
+                                 and ticker.bid != 0)
+                                or (ticker.ask is not None and not _m.isnan(ticker.ask)
+                                    and ticker.ask != 0)):
+                            break
                 finally:
                     # ALWAYS cancel the streaming subscription. A leaked
                     # snapshot=False sub streams (and, if unentitled, errors
@@ -2465,7 +2539,7 @@ class TradingOrchestrator:
                     # message thread (native access violation). Cancelling here
                     # keeps req/cancel paired 1:1.
                     try:
-                        self._ibkr.ib.cancelMktData(qualified_combo)
+                        self._ibkr.ib.cancelMktData(quote_contract)
                     except Exception:
                         pass
                 if ticker:
@@ -2631,6 +2705,24 @@ class TradingOrchestrator:
         """Post-market reconciliation, learning, and reporting."""
         log.info("post_market_starting")
 
+        # R16: sweep orphaned per-trade risk keys. delete_state only runs on
+        # the _process_completed_exits path, so trades that CANCELLED, were
+        # manually flattened, or were restated leave trade_maxloss_* behind —
+        # 28 such keys were found in the 07-07 forensics, and each one
+        # permanently inflates the aggregate capital-at-risk denominator,
+        # silently shrinking how much the bot is allowed to deploy.
+        try:
+            _open_ids = {t.trade_id for t in self._state.get_open_trades()}
+            _swept = 0
+            for _k in self._state.state_keys_like("trade_maxloss_%"):
+                if _k[len("trade_maxloss_"):] not in _open_ids:
+                    self._state.delete_state(_k)
+                    _swept += 1
+            if _swept:
+                log.info("orphan_maxloss_keys_swept", count=_swept)
+        except Exception as _e:  # noqa: BLE001
+            log.warning("maxloss_key_sweep_failed", error=str(_e))
+
         # R16: settle deferred commission true-ups now that the day's
         # commissionReports have all landed (booking-time ledger was partial).
         for _tid in self._state.pending_trueup_trade_ids():
@@ -2778,6 +2870,16 @@ class TradingOrchestrator:
         log.info("orchestrator_shutting_down")
         health = self._watchdog.get_summary()
         await self._send_notification(f"Bot shutting down\n\n{health}")
+        # R16: drain in-flight notification tasks. The shutdown page is
+        # fire-and-forget like every other alert, so the loop used to close
+        # out from under it — the one message that says "the bot is gone" was
+        # the message most likely to be lost.
+        _tasks = getattr(self, "_notify_tasks", None)
+        if _tasks:
+            try:
+                await asyncio.wait(set(_tasks), timeout=15)
+            except Exception as _e:  # noqa: BLE001
+                log.warning("notify_drain_failed", error=str(_e))
 
 
 
@@ -2899,7 +3001,12 @@ class TradingOrchestrator:
                     "gamma": greeks.get("gamma", 0),
                     "theta": greeks.get("theta", 0),
                     "vega": greeks.get("vega", 0),
-                    "max_loss": float(ml) if ml else 0.0,
+                    # R16: fall back to the trade row's capital_at_risk when the
+                    # per-trade KV is missing (it leaks on any non-exit close
+                    # path). Reporting 0.0 made every reader — aggregate cap,
+                    # concentration, digests — treat the position as risk-free.
+                    "max_loss": (float(ml) if ml else
+                                 abs(float(getattr(trade, "capital_at_risk", 0) or 0))),
                     # Concentration-gate repair (audit item 3.3): the 20%
                     # symbol-concentration gate reads market_value, which was
                     # never populated → exposure always 0 → gate dead. Entry
@@ -2923,6 +3030,26 @@ class TradingOrchestrator:
     def _find_trade_by_id(self, trade_id: str) -> TradeRecord | None:
         """Find any trade record by ID (including closed)."""
         return self._state.get_trade_by_id(trade_id)
+
+    @staticmethod
+    def _sessions_until(calendar_days: int | None) -> int | None:
+        """R16: convert calendar days-to-event into TRADING sessions.
+
+        days_until_next_event() counts calendar days, so a Friday entry with a
+        Monday event reads 3 and clears a 1-day blackout despite there being
+        NO session in between — the gate could never see the weekend. Counts
+        weekdays strictly between today and the event (holidays ignored:
+        erring toward MORE sessions is the fail-safe direction for a gate that
+        blocks entries).
+        """
+        if calendar_days is None:
+            return None
+        today = datetime.now().date()
+        sessions = 0
+        for i in range(1, max(1, calendar_days) + 1):
+            if (today + timedelta(days=i)).weekday() < 5:
+                sessions += 1
+        return max(0, sessions - 1)  # exclude the event day itself
 
     def _persist_daily_iv(self, symbol: str, chains) -> None:
         """R16: write today's chain ATM IV into the daily IV store (once per
@@ -3135,7 +3262,17 @@ class TradingOrchestrator:
                     pass
 
         try:
-            asyncio.get_running_loop().create_task(_send_with_retry(message))
+            # R16: hold a strong reference. An unreferenced create_task can be
+            # garbage-collected mid-flight (CPython gives the loop only a weak
+            # ref), so an alert could vanish before its first await — and the
+            # shutdown page in particular raced the loop closing. Tracked in a
+            # set with a done-callback discard; _shutdown drains it.
+            _tasks = getattr(self, "_notify_tasks", None)
+            if _tasks is None:
+                _tasks = self._notify_tasks = set()
+            _t = asyncio.get_running_loop().create_task(_send_with_retry(message))
+            _tasks.add(_t)
+            _t.add_done_callback(_tasks.discard)
         except RuntimeError:  # no loop (sync/test context) -- best-effort inline
             try:
                 await self._notify(message)

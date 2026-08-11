@@ -124,7 +124,15 @@ def main():
     dups, acked, residual_legs = [], [], 0
     for t in covered:
         gs = fill_groups(cur, t["trade_id"])
-        full = [g for g in gs if g["n_legs"] >= 2]
+        # R16: `closing` is REQUIRED here. This counted every >=2-leg fill
+        # group, so an ENTRY group and its EXIT group read as two closes.
+        # It never fired historically only because the ledger used to capture
+        # exit fills alone; the 08-04 QQQ condor is the first trade whose
+        # ENTRY legs were also swept, and it immediately produced a phantom
+        # "1 re-close + 4 residual legs" against a book that is provably
+        # flat (entry legs carry realized_pnl 0.0, exit legs carry the real
+        # P&L — the discriminator the group builder already computes).
+        full = [g for g in gs if g["n_legs"] >= 2 and g["closing"]]
         if len(full) > 1:
             phantom = len(full) - 1
             msg = (f"{t['symbol']} {t['trade_id'][-6:]}: {len(full)} fills "

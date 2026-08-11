@@ -36,6 +36,20 @@ class IBKRClient:
         # so the executor must never read their absence as "cancelled".
         self.foreign_open_order_ids: set[int] = set()
         self._ever_connected = False  # distinguishes first connect from mid-session reconnect
+        self._last_client_id: int | None = None
+        # R16 (multi-account session): the account the SESSION resolved to,
+        # set only when it came from managedAccounts() — never from the config
+        # fallback. Used to filter accountValues() and to pin order.account so
+        # a linked/FA login can neither blend balances across accounts nor
+        # route an order to whatever account the Gateway defaults to.
+        self._session_account: str | None = None
+        # R16 (_reconnect concurrency): ensure_connected/_reconnect held no
+        # lock and every retry starts with an unconditional disconnect, so a
+        # second waiter waking from backoff tore down the session the first
+        # had just re-established. Serialize reconnects. Created lazily inside
+        # the loop that first uses it (an asyncio.Lock binds to the running
+        # loop on first acquire; the client can be built before one exists).
+        self._reconnect_lock: asyncio.Lock | None = None
 
         # Wire up disconnect handler
         self._ib.disconnectedEvent += self._on_disconnect
@@ -48,6 +62,28 @@ class IBKRClient:
     @property
     def connected(self) -> bool:
         return self._connected and self._ib.isConnected()
+
+    @property
+    def client_id(self) -> int | None:
+        """R16: the clientId THIS session is connected under.
+
+        Orders owned by any other clientId are frozen snapshots in ib_insync's
+        trades cache (no master clientId is configured, so no status updates
+        for them ever arrive) — callers compare against this to know when the
+        local cache cannot answer a question about an order.
+        """
+        try:
+            cid = int(getattr(self._ib.client, "clientId", -1) or -1)
+            if cid > 0:
+                return cid
+        except Exception:  # noqa: BLE001
+            pass
+        return getattr(self, "_last_client_id", None)
+
+    @property
+    def session_account(self) -> str | None:
+        """R16: the managedAccounts()-resolved account, or None if unknown."""
+        return getattr(self, "_session_account", None)
 
     async def connect(self) -> bool:
         """Connect to IBKR TWS/Gateway.
@@ -90,8 +126,35 @@ class IBKRClient:
                 # "DUN..." = always paper) while a Gateway logged into the
                 # LIVE account sailed straight through the gate.
                 _session_accts = self._ib.managedAccounts() or []
+                # R16 (multi-account session): AIT_ACCOUNT is the operator's
+                # explicit selector when a login exposes more than one account
+                # (linked margin/TFSA/RRSP, or an FA master); it falls back to
+                # the configured account.
+                _configured = (os.environ.get("AIT_ACCOUNT")
+                               or self._config.ibkr_account)
                 account = self._resolve_session_account(
-                    _session_accts, self._config.ibkr_account)
+                    _session_accts, _configured)
+                # R16: the old code took managedAccounts()[0] blindly, so the
+                # paper/live gate validated ONE of several tradeable accounts,
+                # get_account_values blended tags across all of them, and no
+                # order ever pinned order.account. Ambiguity is refused, not
+                # guessed — a wrong account is a wrong-money path.
+                if account == self.AMBIGUOUS_ACCOUNT:
+                    log.critical(
+                        "MULTI_ACCOUNT_SESSION_REFUSED",
+                        session_accounts=_session_accts,
+                        configured=_configured or "",
+                        hint="set AIT_ACCOUNT to the single account this bot "
+                             "may trade; it must be one of session_accounts",
+                    )
+                    self._ib.disconnect()
+                    self._connected = False
+                    return False
+                # Only a SESSION-derived account may be used to filter account
+                # values / pin orders; the config fallback is just a label.
+                self._session_account = (
+                    account if account in [str(a) for a in _session_accts]
+                    else None)
                 if (_session_accts and self._config.ibkr_account
                         and self._config.ibkr_account not in _session_accts):
                     log.critical(
@@ -180,16 +243,34 @@ class IBKRClient:
             self._connected = False
             log.info("ibkr_disconnected")
 
+    # R16: sentinel for "this session exposes several tradeable accounts and
+    # nothing selects between them". connect() refuses the session outright.
+    AMBIGUOUS_ACCOUNT = "__ambiguous_multi_account__"
+
     @staticmethod
     def _resolve_session_account(session_accts: list, config_account: str | None) -> str:
         """R15 #4: the SESSION's managedAccounts() is the truth for the
         paper/live assertion; the config string is only a last-resort
         fallback. The old precedence (config first) made the gate validate a
         .env constant — a Gateway logged into the LIVE account passed as
-        'paper'."""
-        if session_accts:
+        'paper'.
+
+        R16: managedAccounts()[0] was equally blind in the other direction —
+        with ['DUN603821', 'U1234567'] the gate validated only the paper id
+        and PASSED while a LIVE account was tradeable in the same session
+        (reversing the list blocked instead: pure ordering luck). A
+        multi-account session is resolved ONLY by an explicit selector that
+        names one of the session's own accounts; otherwise it is ambiguous
+        and the caller must refuse to trade.
+        """
+        if not session_accts:
+            return config_account or "unknown"
+        if len(session_accts) == 1:
             return str(session_accts[0])
-        return config_account or "unknown"
+        selected = str(config_account) if config_account else ""
+        if selected and selected in [str(a) for a in session_accts]:
+            return selected
+        return IBKRClient.AMBIGUOUS_ACCOUNT
 
     def _should_stash_foreign(self, client_id: int, base_id: int) -> bool:
         """R15 #5: stash the previous session's open orders on any reconnect
@@ -197,11 +278,45 @@ class IBKRClient:
         when landing off-base. The old `client_id != base_id` missed the
         return leg (fallback -> base): orders placed under the fallback id
         were invisible to the fresh base session and mass-flipped to false
-        CANCELLED."""
+        CANCELLED.
+
+        R16: the FIRST connect of a freshly restarted process was exempt, yet
+        that is exactly the crash-restart case — the keeper relaunches within
+        90s, the Gateway still holds the old clientId, connect() falls through
+        to a fallback id, and every order the dead process left working is
+        foreign to this session. A first connect that did NOT land on the
+        configured base id stashes too."""
         if not self._ever_connected:
-            return False
+            return client_id != base_id
         prev = getattr(self, "_last_client_id", None)
         return client_id != (prev if prev is not None else base_id)
+
+    def prune_foreign_open_orders(self, broker_open_ids: set[int] | None) -> set[int]:
+        """R16: drop stashed ids the BROKER no longer reports as working.
+
+        The stash was add-only (``|=`` at connect, no discard anywhere), so a
+        foreign order that later filled, was cancelled, or simply expired as a
+        DAY order kept forcing a "pending" verdict for the life of the
+        process: its trade row never resolved intraday and every stale-order
+        pass re-attempted a cancel that could not possibly land.
+
+        ``broker_open_ids`` is an AUTHORITATIVE all-clients snapshot; None
+        means the broker could not be asked, and then nothing is pruned —
+        never read an unanswered request as "the order is gone".
+        """
+        if broker_open_ids is None or not self.foreign_open_order_ids:
+            return set(self.foreign_open_order_ids)
+        dropped = self.foreign_open_order_ids - broker_open_ids
+        if dropped:
+            self.foreign_open_order_ids -= dropped
+            log.warning(
+                "foreign_open_orders_pruned",
+                dropped=sorted(dropped),
+                remaining=sorted(self.foreign_open_order_ids),
+                note="broker no longer reports these as working under any "
+                     "clientId; normal fill/cancel resolution resumes",
+            )
+        return set(self.foreign_open_order_ids)
 
     async def ensure_connected(self) -> bool:
         """Ensure we're connected, reconnecting if necessary."""
@@ -254,8 +369,37 @@ class IBKRClient:
             log.warning("verify_can_trade_error", error=str(e))
             return True  # probe failed for another reason; don't block
 
+    def _get_reconnect_lock(self) -> asyncio.Lock:
+        """R16: lazily-created reconnect mutex (instances built via __new__ in
+        tests never ran __init__)."""
+        lock = getattr(self, "_reconnect_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._reconnect_lock = lock
+        return lock
+
     async def _reconnect(self) -> bool:
-        """Attempt to reconnect with exponential backoff."""
+        """Attempt to reconnect with exponential backoff.
+
+        R16 (concurrency): reconnects are SERIALIZED and every waiter re-checks
+        liveness before touching the socket. Concurrent callers exist by
+        design — an event-driven fill task can reach cancel_order ->
+        ensure_connected while the main loop is already reconnecting — and the
+        old lock-free loop began each retry with an unconditional
+        `if isConnected(): disconnect()`, so the second waiter woke from its
+        backoff and tore down the healthy session the first had just restored.
+        Interleaved retries could flap for minutes and both exhaust their five
+        attempts.
+        """
+        async with self._get_reconnect_lock():
+            return await self._reconnect_locked()
+
+    async def _reconnect_locked(self) -> bool:
+        # Another waiter may have restored the session while we queued on the
+        # lock — never disconnect a live session to "reconnect" it.
+        if self.connected:
+            log.info("ibkr_reconnect_unnecessary", reason="already reconnected")
+            return True
         while self._reconnect_attempts < self._max_reconnect_attempts:
             self._reconnect_attempts += 1
             delay = self._reconnect_delay * (2 ** (self._reconnect_attempts - 1))
@@ -266,6 +410,13 @@ class IBKRClient:
                 delay_seconds=delay,
             )
             await asyncio.sleep(delay)
+            # R16: the session can come back on its own during the backoff
+            # (ib_insync auto-reconnect, Gateway restart finishing). Re-check
+            # AFTER the sleep so the retry does not disconnect a live socket.
+            if self.connected:
+                log.info("ibkr_reconnect_unnecessary", reason="live after backoff")
+                self._reconnect_attempts = 0
+                return True
 
             try:
                 if self._ib.isConnected():
@@ -338,6 +489,17 @@ class IBKRClient:
         if not await self.ensure_connected():
             log.error("cannot_place_order", reason="not connected")
             return None
+
+        # R16 (multi-account session): no code path ever set order.account, so
+        # every order routed to whatever account the Gateway picks by default.
+        # Pin the SESSION-resolved account (never the config fallback — an id
+        # the Gateway does not manage is rejected outright).
+        _acct = getattr(self, "_session_account", None)
+        if _acct and not getattr(order, "account", ""):
+            try:
+                order.account = _acct
+            except Exception:  # noqa: BLE001 — pinning must never block a trade
+                log.warning("order_account_pin_failed", account=_acct)
 
         try:
             trade = self._ib.placeOrder(contract, order)
@@ -457,6 +619,40 @@ class IBKRClient:
             except Exception:  # noqa: BLE001
                 return None
 
+    async def get_all_open_order_ids(self, timeout: float = 8.0) -> set[int] | None:
+        """R16: AUTHORITATIVE set of orderIds working at the broker under ANY
+        clientId — or None, meaning UNKNOWN.
+
+        ib_insync's trades()/openTrades() caches cannot answer "is this order
+        still working?" in two situations that look identical to "it vanished":
+        the cache is WIPED by any disconnect (wrapper.connectionClosed ->
+        reset), and orders owned by another clientId are frozen snapshots that
+        never update (no master clientId is configured). Acting on either
+        produced real incidents — working entries mass-flipped to CANCELLED,
+        and a CLOSING trade reverted to FILLED while its close order was still
+        live (duplicate close = position reversal).
+
+        Unlike get_all_open_trades this NEVER falls back to this session's
+        degraded view: a failure returns None so callers defer instead of
+        concluding "not working".
+        """
+        if not self.connected:
+            return None
+        try:
+            trades = await asyncio.wait_for(
+                self._ib.reqAllOpenOrdersAsync(), timeout=timeout)
+        except Exception as e:  # noqa: BLE001 — incl. TimeoutError
+            log.warning("all_open_order_ids_unavailable", error=str(e)[:200])
+            return None
+        if trades is None:
+            return None
+        try:
+            return {int(t.order.orderId) for t in trades
+                    if getattr(t.order, "orderId", 0)}
+        except Exception as e:  # noqa: BLE001
+            log.warning("all_open_order_ids_unparsable", error=str(e)[:200])
+            return None
+
     def get_portfolio(self) -> list:
         """Get portfolio items with market value and P&L."""
         if not self.connected:
@@ -513,8 +709,29 @@ class IBKRClient:
             return {}
         raw = self._ib.accountValues()
 
+        # R16 (multi-account session): accountValues() returns one row per
+        # (tag, currency) PER ACCOUNT. With no account filter, which account's
+        # NetLiquidation won was dict-insertion-order dependent (BASE rows
+        # assign -> last wins; base-ccy rows setdefault -> first wins), so the
+        # risk layer could size from an account the paper/live gate never
+        # validated. Keep only the session-resolved account's rows — and only
+        # when the session actually reports several, so single-account
+        # sessions and __new__-built test shims are untouched.
+        _acct = getattr(self, "_session_account", None)
+        if _acct:
+            _accts_present = {getattr(av, "account", "") for av in raw}
+            _accts_present.discard("")
+            if len(_accts_present) > 1 and _acct in _accts_present:
+                _filtered = [av for av in raw
+                             if getattr(av, "account", "") in (_acct, "")]
+                log.warning("account_values_filtered_multi_account",
+                            selected=_acct, present=sorted(_accts_present),
+                            kept=len(_filtered), raw=len(raw))
+                raw = _filtered
+
         # FX + base-currency detection from the ExchangeRate rows.
         usd_to_base = 1.0
+        usd_rate_from_broker = False  # R16: did IBKR actually give us a USD rate?
         base_ccy: str | None = None
         for av in raw:
             if av.tag != "ExchangeRate":
@@ -525,6 +742,7 @@ class IBKRClient:
                 continue
             if av.currency == "USD":
                 usd_to_base = rate
+                usd_rate_from_broker = rate > 0
             elif av.currency not in ("BASE", "USD", "") and abs(rate - 1.0) < 1e-9:
                 base_ccy = av.currency  # base currency has rate 1.0
 
@@ -554,6 +772,19 @@ class IBKRClient:
                     usd_to_base = fx
                     log.info("account_base_ccy_inferred_fx", base_ccy=base_ccy,
                              usd_to_base=round(fx, 4))
+                elif usd_rate_from_broker and usd_to_base > 0:
+                    # R16: the loop above ALREADY parsed a real ExchangeRate
+                    # USD row (base per 1 USD) — the base currency was simply
+                    # not identifiable from a rate-1.0 row. The old code threw
+                    # that rate away and returned {} on an FX-fetch failure,
+                    # so AccountManager fell back to a stale snapshot (or, at
+                    # first boot, a currency-blind estimate) while a correct
+                    # rate was in hand.
+                    log.warning("account_fx_using_exchange_rate_row",
+                                base_ccy=base_ccy,
+                                usd_to_base=round(usd_to_base, 4),
+                                note="FX fetch failed; using IBKR's own "
+                                     "ExchangeRate USD row")
                 else:
                     # HARD STOP (audit 2026-07-07 item 1.6): previously fell
                     # back to usd_to_base=1.0, silently treating CAD as USD —

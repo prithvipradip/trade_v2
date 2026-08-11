@@ -6,6 +6,7 @@ and validates every trade before execution.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 
@@ -88,6 +89,23 @@ class RiskManager:
         # Track current positions for limit checks
         self._open_positions: list[dict] = []
         self._portfolio_greeks = PortfolioGreeks()
+        # R16: warn-once-per-position keys for the aggregate-cap backfill
+        # (see _aggregate_open_risk) — the condition persists for a
+        # position's whole life, so an unguarded warning would log per scan.
+        self._risk_backfill_warned: set[tuple] = set()
+
+        # R16: the CircuitBreaker's consecutive-loss streak and active trip
+        # were process-memory only, so a keeper relaunch silently cleared a
+        # 3-loss pause. This is the one place holding BOTH the breaker and the
+        # StateManager (orchestrator.py:85 constructs the breaker with
+        # settings.risk alone), so the persistence seam is wired here.
+        if state is not None:
+            try:
+                attach = getattr(circuit_breaker, "attach_state", None)
+                if callable(attach):
+                    attach(state)
+            except Exception as e:  # noqa: BLE001 — never block construction
+                log.warning("circuit_breaker_state_attach_failed", error=str(e))
 
     def _count_correlated_positions(self, new_symbol: str, open_symbols: list[str]) -> int:
         """Count open positions that are highly correlated with a new symbol.
@@ -125,6 +143,158 @@ class RiskManager:
             return losing_streak
         except Exception:
             return 0
+
+    # --- Aggregate capital-at-risk (R16) ---
+
+    @staticmethod
+    def _structural_max_loss(legs_json, quantity: int) -> float:
+        """Conservative capital-at-risk read off a structure's OWN legs.
+
+        Defined-risk (every short leg is covered by a long on the same right):
+        widest wing x 100 x qty — the structure's max loss BEFORE the credit
+        is netted out, i.e. deliberately over- rather than under-stated, which
+        is the only safe direction for a cap.
+
+        Naked shorts (no long on that right — short_strangle/cash_secured_put)
+        have no width to measure and an unbounded tail, so fall back to the
+        Reg-T-style 20%-of-short-strike-notional margin proxy: the smallest
+        number that is still honest about the exposure.
+
+        Returns 0.0 when the legs JSON is absent/unparseable — the caller then
+        drops to the entry-notional floor.
+        """
+        try:
+            legs = json.loads(legs_json) if isinstance(legs_json, str) else legs_json
+        except (TypeError, ValueError):
+            return 0.0
+        if not legs:
+            return 0.0
+        qty = max(1, abs(int(quantity or 1)))
+        by_right: dict[str, dict[str, list[float]]] = {}
+        for leg in legs:
+            if not isinstance(leg, dict):
+                continue
+            try:
+                strike = float(leg.get("strike"))
+            except (TypeError, ValueError):
+                continue
+            right = str(leg.get("right", leg.get("type", "")) or "?").upper()[:1]
+            side = "SELL" if str(leg.get("action", "")).upper().startswith("S") else "BUY"
+            by_right.setdefault(right, {"SELL": [], "BUY": []})[side].append(strike)
+
+        widest = 0.0
+        naked_strike = 0.0
+        for sides in by_right.values():
+            shorts, longs = sides["SELL"], sides["BUY"]
+            if not shorts:
+                continue
+            if not longs:
+                naked_strike = max(naked_strike, max(shorts))
+                continue
+            for s in shorts:
+                widest = max(widest, min(abs(s - lng) for lng in longs))
+        if naked_strike > 0:
+            return round(naked_strike * 0.20 * 100 * qty, 2)
+        return round(widest * 100 * qty, 2)
+
+    def _open_trade_index(self) -> dict[tuple[str, str], list]:
+        """(symbol, strategy) -> open TradeRecords, for the risk backfill."""
+        idx: dict[tuple[str, str], list] = {}
+        state = getattr(self, "_state", None)
+        if state is None:
+            return idx
+        try:
+            for t in state.get_open_trades():
+                key = (str(getattr(t, "symbol", "") or ""),
+                       str(getattr(t, "strategy", "") or ""))
+                idx.setdefault(key, []).append(t)
+        except Exception as e:  # noqa: BLE001 — a cap must survive a DB hiccup
+            log.warning("risk_open_trade_index_failed", error=str(e))
+        return idx
+
+    def _backfilled_position_risk(self, pos: dict, idx: dict) -> tuple[float, str]:
+        """Best conservative capital-at-risk for a position whose max_loss is 0."""
+        qty = 1
+        try:
+            qty = max(1, abs(int(pos.get("quantity", 1) or 1)))
+        except (TypeError, ValueError):
+            qty = 1
+        key = (str(pos.get("symbol", "") or ""), str(pos.get("strategy", "") or ""))
+        candidates = idx.get(key, [])
+        # Narrow by expiry when BOTH sides know it (two condors on one symbol).
+        pos_exp = str(pos.get("expiry", "") or "").replace("-", "")[:8]
+        if pos_exp and len(candidates) > 1:
+            narrowed = [t for t in candidates
+                        if str(getattr(t, "expiry", "") or "").replace("-", "")[:8] == pos_exp]
+            candidates = narrowed or candidates
+
+        # 1. capital_at_risk stamped on the trade row at entry (R7 ledger). It
+        #    is written in the SAME orchestrator block as the KV, but on the
+        #    trade row, so it survives the KV's deletion-on-close and is the
+        #    closest thing to the authoritative number.
+        for t in candidates:
+            try:
+                car = float(getattr(t, "capital_at_risk", 0) or 0)
+            except (TypeError, ValueError):
+                car = 0.0
+            if car > 0:
+                return car, "trade_row_capital_at_risk"
+        # 2. the structure itself.
+        for t in candidates:
+            est = self._structural_max_loss(getattr(t, "legs", "") or "", qty)
+            if est > 0:
+                return est, "structure_width"
+        # 3. entry notional — a floor, never zero for a real position.
+        try:
+            mv = abs(float(pos.get("market_value", 0) or 0))
+        except (TypeError, ValueError):
+            mv = 0.0
+        if mv > 0:
+            return mv, "entry_notional"
+        return 0.0, "unknown"
+
+    def _aggregate_open_risk(self) -> float:
+        """Sum defined risk across open positions for the portfolio cap.
+
+        R16: this was `sum(p.get("max_loss", 0))`, and the orchestrator sync
+        (orchestrator.py:_sync_risk_manager_positions) writes max_loss=0.0
+        whenever the trade_maxloss_<trade_id> KV is absent. That KV is written
+        only AFTER execute_signal returns, so a crash / keeper-kill inside
+        that window leaves a live position contributing $0 to the 20%
+        aggregate cap for its ENTIRE life — nothing ever backfills it, and the
+        cap silently under-counts the book by a whole condor. Under-counting
+        is the one direction a risk cap must never fail in, so a position with
+        no KV now falls back to its own structure instead of to zero.
+        """
+        total = 0.0
+        idx: dict | None = None
+        for p in self._open_positions:
+            try:
+                ml = float(p.get("max_loss", 0) or 0)
+            except (TypeError, ValueError):
+                ml = 0.0
+            if ml > 0:
+                total += ml
+                continue
+            if idx is None:
+                idx = self._open_trade_index()  # one DB read per validate call
+            est, source = self._backfilled_position_risk(p, idx)
+            total += est
+            warned = getattr(self, "_risk_backfill_warned", None)
+            if warned is None:
+                warned = self._risk_backfill_warned = set()
+            wkey = (str(p.get("symbol", "")), str(p.get("strategy", "")),
+                    str(p.get("expiry", "")), source)
+            if wkey not in warned:
+                warned.add(wkey)
+                log.warning(
+                    "position_risk_backfilled" if est > 0 else "position_risk_unknown",
+                    symbol=p.get("symbol"), strategy=p.get("strategy"),
+                    expiry=p.get("expiry"), source=source, max_loss=est,
+                    note="trade_maxloss_ KV missing for an open position — the "
+                         "aggregate cap would otherwise have counted $0 for it",
+                )
+        return total
 
     def update_positions(self, positions: list[dict]) -> None:
         """Update current position list from IBKR or state."""
@@ -316,7 +486,9 @@ class RiskManager:
         # a phantom knob while this literal ruled. Default 0.20 (2026-06-30).
         PORTFOLIO_RISK_CAP_PCT = self._pos_config.max_portfolio_risk_pct
         portfolio_cap = account_value * PORTFOLIO_RISK_CAP_PCT
-        open_risk = sum(float(p.get("max_loss", 0) or 0) for p in self._open_positions)
+        # R16: was sum(p["max_loss"]) — blind to any position whose
+        # trade_maxloss_ KV never got written. See _aggregate_open_risk.
+        open_risk = self._aggregate_open_risk()
         new_risk = request.max_loss if (getattr(request, "max_loss", None) and request.max_loss) else estimated_cost
         if open_risk + new_risk > portfolio_cap:
             return TradeValidation(

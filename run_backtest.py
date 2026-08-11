@@ -25,13 +25,59 @@ from ait.backtesting.walkforward import WalkForwardBacktester, WalkForwardConfig
 # ---------------------------------------------------------------------------
 # - AIT_IC_WING_K / wing floor $2:   src/ait/strategies/iron_condor.py _vol_scaled_width
 # - AIT_IC_MIN_CREDIT ($0.70):       src/ait/strategies/iron_condor.py generate_signals
-# - AIT_IC_MIN_CREDIT_WIDTH (0.20):  credit-to-width gate being added live
+# - AIT_IC_MIN_CREDIT_WIDTH:         credit-to-width gate in iron_condor.py
 # - AIT_CREDIT_LOSS_LIMIT (0=off):   R16 parity - live default DISABLED (R6: touch-close beats flat stops)
 # - delta target 0.20:               hardcoded in iron_condor.generate_signals
-# - DTE band [14, 45]:               src/ait/config/settings.py OptionsConfig.dte_range
+# - DTE band:                        config.yaml options.dte_range (loaded, NOT the code default)
 # - TP ladder:                       src/ait/execution/portfolio.py _get_take_profit_targets
 # - IV rank floor 15:                AIT_IRON_CONDOR_IV_FLOOR default in iron_condor.py
+# - pre-event blackout:              config.yaml risk.pre_event_blackout_days
+#
+# R16: the "live" column used to be HARDCODED here (dte_band [14,45] while
+# config.yaml says [14,30]; a comment claiming a <=4d macro gate that is now 1
+# day) and its env-backed entries read THIS process's environment rather than
+# the contract the bot itself applies — so a bare `python run_backtest.py`
+# compared the run against wing_k=1.0/ratio 0.20 while live runs 1.6/0.10, and
+# the manifest systematically UNDERSTATED live-vs-backtest divergence. Every
+# live value below is now resolved from the authorities: ait.config.runtime_env
+# (the env contract every bot entry point applies) and load_settings().
 _LIVE_TP_LADDER = {"dte>20": 0.50, "dte_11_20": 0.40, "dte_6_10": 0.30, "dte<=5": 0.20}
+
+
+def _live_env() -> dict:
+    """The env contract as the BOT resolves it, without mutating this process.
+
+    run_orchestrator.py / ait.main call apply_runtime_env_defaults() at
+    startup; a backtest process does not, so reading os.environ here reported
+    code defaults as if they were live values. Apply the contract into a
+    snapshot, then restore — the engine reads several of these vars, and this
+    function must not change what the backtest itself runs.
+    """
+    saved = dict(os.environ)
+    try:
+        from ait.config.runtime_env import apply_runtime_env_defaults
+        apply_runtime_env_defaults()
+        return dict(os.environ)
+    except Exception as e:  # noqa: BLE001 — manifest must never break a run
+        print(f"  ! parity manifest: live env contract unavailable ({e})")
+        return dict(os.environ)
+    finally:
+        for k in list(os.environ):
+            if k not in saved:
+                del os.environ[k]
+        for k, v in saved.items():
+            if os.environ.get(k) != v:
+                os.environ[k] = v
+
+
+def _live_settings():
+    """Loaded config.yaml, or None if it cannot be read."""
+    try:
+        from ait.config.settings import load_settings
+        return load_settings()
+    except Exception as e:  # noqa: BLE001
+        print(f"  ! parity manifest: settings unavailable ({e})")
+        return None
 
 
 def build_parity_manifest(args: argparse.Namespace) -> dict:
@@ -43,19 +89,26 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
     """
     from ait.backtesting.engine import Backtester
 
+    env = _live_env()
+    settings = _live_settings()
+    live_dte = list(settings.options.dte_range) if settings else [14, 45]
+    live_blackout = (settings.risk.pre_event_blackout_days
+                     if settings else None)
+
     live = {
-        "wing_k":            float(os.environ.get("AIT_IC_WING_K", "1.0")),
-        "ic_min_credit":     float(os.environ.get("AIT_IC_MIN_CREDIT", "0.70")),
-        "ic_min_credit_width": float(os.environ.get("AIT_IC_MIN_CREDIT_WIDTH", "0.20")),
-        "credit_loss_limit": float(os.environ.get("AIT_CREDIT_LOSS_LIMIT", "0")),
-        "pre_event_blackout_days": None,  # R16: resolved from loaded settings in engine
+        "wing_k":            float(env.get("AIT_IC_WING_K", "1.0")),
+        "ic_min_credit":     float(env.get("AIT_IC_MIN_CREDIT", "0.70")),
+        "ic_min_credit_width": float(env.get("AIT_IC_MIN_CREDIT_WIDTH", "0.20")),
+        "credit_loss_limit": float(env.get("AIT_CREDIT_LOSS_LIMIT", "0")),
+        "pre_event_blackout_days": live_blackout,
         "delta_target":      0.20,
-        "dte_band":          [14, 45],
+        "dte_band":          live_dte,
         "tp_ladder":         dict(_LIVE_TP_LADDER),
         "wing_floor":        2.0,
-        "macro_gate_entry":  True,   # orchestrator blocks credit entries <=4d pre-event
-        "macro_flatten_enabled": os.environ.get("AIT_SKIP_MACRO_EVENTS", "0") == "1",
-        "iv_rank_floor":     float(os.environ.get("AIT_IRON_CONDOR_IV_FLOOR", "15")),
+        "macro_gate_entry":  True,   # orchestrator blocks credit entries within
+                                     # risk.pre_event_blackout_days of an event
+        "macro_flatten_enabled": env.get("AIT_SKIP_MACRO_EVENTS", "0") == "1",
+        "iv_rank_floor":     float(env.get("AIT_IRON_CONDOR_IV_FLOOR", "15")),
     }
 
     # Backtest TP ladder read from the engine mirror itself, so this manifest
@@ -71,6 +124,9 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
         "ic_min_credit":     args.ic_min_credit,
         "ic_min_credit_width": args.ic_min_credit_width,
         "credit_loss_limit": args.credit_loss_limit,
+        # R16 #7: the walk-forward passes None, so the engine resolves the same
+        # loaded settings value live uses — report the resolved number, not None.
+        "pre_event_blackout_days": live_blackout,
         "delta_target":      0.20,   # Backtester delta_short default (walk-forward does not override)
         "dte_band":          [21, 21],  # engine uses fixed DTE = max_hold_days
         "tp_ladder":         bt_ladder,
@@ -96,17 +152,26 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
             warnings.append(f"{key}: live={live_val} backtest={bt_val}")
 
     notes = [
-        "macro gate uses the hardcoded-2026 economic calendar "
+        # R16: this note used to hardcode a 4-day pre-event window; the
+        # blackout has been risk.pre_event_blackout_days (currently 1) since
+        # settings.py:64, so it is interpolated from the loaded settings now.
+        f"macro gate blocks credit entries within {live_blackout} day(s) of an "
+        "event, using the hardcoded-2026 economic calendar "
         "(src/ait/data/economic_calendar.py); for pre-2026 backtest windows "
-        "days-to-event is always > 4, so the gate is effectively INACTIVE — "
+        "days-to-event is always larger, so the gate is effectively INACTIVE — "
         "acceptable, but macro-event losses are NOT simulated there.",
         "live macro FLATTEN (portfolio.py rule 3d) is env-gated behind "
-        "AIT_SKIP_MACRO_EVENTS=1 (currently disabled by default for data "
-        "collection); the backtest mirrors that env var exactly.",
+        "AIT_SKIP_MACRO_EVENTS=1; defined-risk condors are EXEMPT in code, so "
+        "it governs undefined/assignment-risk arms (strangle, jade_lizard, "
+        "CSP/CC); the backtest mirrors that env var exactly.",
         "engine trades a fixed synthetic DTE (max_hold_days=21) inside the "
-        "live dte_range [14, 45].",
+        f"live dte_range {live_dte}.",
         "credit exits: flat loss limit + DTE-laddered TP + DTE<=5 close "
         "(mirrors portfolio.py); trailing/breakeven applies to DEBIT only.",
+        "the 'live' column is resolved from ait.config.runtime_env (the env "
+        "contract every bot entry point applies) + load_settings(), NOT from "
+        "this process's environment — a bare backtest run therefore shows the "
+        "REAL divergence instead of comparing the run against itself.",
     ]
 
     return {
@@ -196,11 +261,15 @@ async def run_backtest(args: argparse.Namespace) -> None:
     print(f"  Trailing:   {'ON (debit trades only)' if args.trailing_stop else 'OFF'}")
     print("=" * 60)
 
+    # --- Parameter-parity manifest: live config/env vs this backtest run ---
+    # R16: built BEFORE the env override below. Setting AIT_IRON_CONDOR_IV_FLOOR
+    # first made the manifest's "live" iv_rank_floor read back this run's own
+    # --iv-floor, so that row could never disagree — the manifest was partly
+    # comparing the run against itself.
+    manifest = build_parity_manifest(args)
+
     # Set IV floor for iron condor strategy (read by iron_condor.py via env)
     os.environ["AIT_IRON_CONDOR_IV_FLOOR"] = str(args.iv_floor)
-
-    # --- Parameter-parity manifest: live config/env vs this backtest run ---
-    manifest = build_parity_manifest(args)
     print("\n  PARAMETER-PARITY MANIFEST (live vs backtest):")
     print("  " + json.dumps(manifest, indent=2).replace("\n", "\n  "))
     if manifest["parity_warnings"]:

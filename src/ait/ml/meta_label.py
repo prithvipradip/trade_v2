@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import pickle
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -27,7 +28,49 @@ from ait.utils.logging import get_logger
 
 log = get_logger("ml.meta_label")
 
-MODEL_DIR = Path("models")
+# R16: MODEL_DIR was the CWD-relative Path("models") — the same clobber class
+# range_predictor.py:37 already fixed by anchoring to the repo. Any script run
+# from a different CWD created/read a DIFFERENT models/ tree (and the
+# constructor's mkdir silently manufactured it).
+MODEL_DIR = Path(__file__).resolve().parents[3] / "models"
+
+
+def _model_path() -> Path:
+    """Resolved at CALL time, never cached at import: tests/conftest.py's
+    autouse fence monkeypatches MODEL_DIR, and a module-level constant would
+    silently escape it (that fence exists because a pytest run clobbered the
+    live artifact once already — R15 #7)."""
+    return MODEL_DIR / "meta_label.pkl"
+
+
+# R16 QUARANTINE, 2026-07-18. models/meta_label.pkl was clobbered by a test run
+# and moved aside to meta_label.pkl.clobbered_20260718; nothing has rewritten
+# it since, because the daily retrain child (orchestration/master.py
+# retrain_models) trains ensemble/range/vol_magnitude ONLY. The gate is inert
+# today (config.yaml meta_label.enabled=false -> orchestrator._meta_labeler is
+# None, and the gate additionally requires live mode), so this is NOT
+# silently re-armed here. What changes: the missing/stale artifact is now LOUD
+# and the arming path refuses to trust a degraded rebuild.
+#
+# REGENERATION PATH (do all three before flipping meta_label.enabled=true):
+#   1. Confirm >= MIN_TRADES_FOR_TRAINING closed trades with trade_context
+#      rows carrying the FULL META_FEATURES set. build_training_data() below
+#      currently supplies only 9 of the 20 (sentiment_score is permanently 0
+#      after R12-C retired the sentiment feed) — training on that is exactly
+#      the corrupted-input condition the artifact was quarantined for.
+#   2. Train explicitly and inspect the stats:
+#        python -c "import sys; sys.path.insert(0,'src'); \
+#          from ait.ml.meta_label import MetaLabeler; \
+#          from ait.execution.state import StateManager; \
+#          m=MetaLabeler(); print(m.train(m.build_training_data(StateManager())))"
+#      An empty dict means the guards below refused to arm — read the logged
+#      reason (meta_label_arm_refused) rather than forcing it.
+#   3. Add the trainer to retrain_models() so the artifact cannot silently
+#      go stale again, then delete meta_label.pkl.clobbered_20260718.
+# Alternative, equally acceptable: DELETE the meta-labeler. It is dead config
+# in an iron-condor-only book.
+MIN_FEATURE_COVERAGE = 15   # of the 20 META_FEATURES, else refuse to arm
+MAX_ARTIFACT_AGE_DAYS = 45  # loaded artifact older than this = stale, refuse
 
 # Minimum trades needed before the meta-labeler has enough signal
 MIN_TRADES_FOR_TRAINING = 30
@@ -153,6 +196,35 @@ class MetaLabeler:
         available = [f for f in META_FEATURES if f in trades_df.columns]
         if not available:
             log.warning("no_meta_features_available")
+            return {}
+
+        # R16 ARM GUARD: the quarantined 07-18 artifact was trained on a
+        # degraded feature set and rejected everything. build_training_data()
+        # supplies only 9 of the 20 META_FEATURES today (sentiment_score is
+        # permanently 0 after R12-C), so an unattended retrain would recreate
+        # exactly that condition — silently, since the caller only checks that
+        # load_model() failed. Refuse to arm below the coverage floor, and
+        # count a column that is CONSTANT across every row as absent (a
+        # retired feed reads as "present" but carries no information).
+        live_cols = [
+            f for f in available
+            if trades_df[f].notna().any() and trades_df[f].nunique(dropna=True) > 1
+        ]
+        if len(live_cols) < MIN_FEATURE_COVERAGE:
+            log.error(
+                "meta_label_arm_refused",
+                reason="insufficient_feature_coverage",
+                informative_features=len(live_cols),
+                present_features=len(available),
+                required=MIN_FEATURE_COVERAGE,
+                expected=len(META_FEATURES),
+                dead_or_constant=[f for f in available if f not in live_cols],
+                impact="NOT arming the meta-label gate — this is the "
+                       "corrupted-training condition meta_label.pkl was "
+                       "quarantined for on 2026-07-18. See the REGENERATION "
+                       "PATH comment in src/ait/ml/meta_label.py.",
+            )
+            self._trained = False
             return {}
 
         self._feature_names = available
@@ -426,9 +498,44 @@ class MetaLabeler:
         return pd.DataFrame(rows)
 
     def load_model(self) -> bool:
-        """Load previously trained meta-label model from disk."""
-        model_file = MODEL_DIR / "meta_label.pkl"
+        """Load previously trained meta-label model from disk.
+
+        R16: a missing artifact used to return False in complete silence, so
+        the 07-18 quarantine has been invisible for weeks and the caller
+        (orchestrator.py:383) fell straight through to an unsupervised
+        retrain. Missing and STALE are both loud now, and stale refuses to
+        arm rather than gating live entries on a months-old model.
+        """
+        model_file = _model_path()
         if not model_file.exists():
+            quarantined = sorted(MODEL_DIR.glob("meta_label.pkl.clobbered_*"))
+            log.error(
+                "meta_label_artifact_missing",
+                path=str(model_file),
+                quarantined=[p.name for p in quarantined] or None,
+                impact="meta-label gate CANNOT arm; caller must not retrain "
+                       "it blind — see the REGENERATION PATH comment at the "
+                       "top of src/ait/ml/meta_label.py",
+            )
+            return False
+
+        try:
+            age_days = (
+                datetime.now() - datetime.fromtimestamp(model_file.stat().st_mtime)
+            ).days
+            if age_days > MAX_ARTIFACT_AGE_DAYS:
+                log.error(
+                    "meta_label_artifact_stale",
+                    path=str(model_file),
+                    age_days=age_days,
+                    max_age_days=MAX_ARTIFACT_AGE_DAYS,
+                    impact="refusing to arm the meta-label gate on a stale "
+                           "artifact — retrain it deliberately",
+                )
+                return False
+        except OSError as e:  # noqa: BLE001 — stat failure must not arm blind
+            log.error("meta_label_artifact_stat_failed",
+                      path=str(model_file), error=str(e))
             return False
 
         try:
@@ -474,7 +581,7 @@ class MetaLabeler:
             "training_stats": self._training_stats,
         }
 
-        model_file = MODEL_DIR / "meta_label.pkl"
+        model_file = _model_path()
         try:
             with open(model_file, "wb") as f:
                 pickle.dump(data, f)

@@ -14,6 +14,23 @@ set PYTHONIOENCODING=utf-8
 set PY="C:\Users\prith\AppData\Local\Programs\Python\Python313\python.exe"
 
 :loop
+REM R16: size-cap keeper.log. The keeper only ever appended (>>) and nothing
+REM else rotated this file -- 22.7 MB / ~448k lines and growing, inside a
+REM 438 MB logs directory on a machine that must stay up for the bot. Pure
+REM batch, no PowerShell and no cmd chaining operators: %%~zA is the size in
+REM bytes.
+REM Shift keeper.log -> .1 -> .2 above 20 MB; master.py's daily sweep caps the
+REM backups. Runs before the ping so a rotation can never delay the check.
+set KLSIZE=0
+for %%A in ("logs\keeper.log") do set KLSIZE=%%~zA
+if "%KLSIZE%"=="" set KLSIZE=0
+if %KLSIZE% GTR 20971520 (
+    if exist "logs\keeper.log.2" del "logs\keeper.log.2"
+    if exist "logs\keeper.log.1" move /y "logs\keeper.log.1" "logs\keeper.log.2" >nul
+    move /y "logs\keeper.log" "logs\keeper.log.1" >nul
+    echo [keeper] %date% %time% rotated keeper.log at %KLSIZE% bytes >> logs\keeper.log
+)
+
 REM Is an orchestrator process alive?
 REM A11 (deep-audit): wmic is deprecated/removed on newer Windows -- its
 REM disappearance would have silently broken the keeper AND the dup-guard.
@@ -37,5 +54,18 @@ if errorlevel 1 (
         for /f "usebackq delims=" %%u in ("data\deadman_url.txt") do curl.exe -fsS -m 10 "%%u" >nul 2>&1
     )
 )
-timeout /t 90 /nobreak >nul
+REM R16: `timeout /t` needs an interactive console input handle. In some
+REM console states (stdin redirected / detached) it fails INSTANTLY with
+REM "ERROR: Input redirection is not supported", and this loop then spun at
+REM ~1-2 iterations/sec: keeper.log gained ~144k lines on 08-04 and 6,254 in
+REM the single hour 20:00-21:00 on 08-05 (normal is 40/hour). Once
+REM data\deadman_url.txt is armed that same tight loop would curl
+REM healthchecks.io ~once per second -- rate-limited into false "down" alerts
+REM from the one channel that has to stay reliable.
+REM Three independent delays, cheapest first, none needing console input.
+REM `ping -n 91` waits ~1s between echoes = ~90s. No cmd chaining operators
+REM anywhere (parser-safe): each fallback is guarded by `if errorlevel 1`.
+ping -n 91 127.0.0.1 >nul 2>&1
+if errorlevel 1 timeout /t 90 /nobreak >nul 2>&1
+if errorlevel 1 powershell -NoProfile -Command "Start-Sleep -Seconds 90"
 goto loop

@@ -25,13 +25,18 @@ from ait.backtesting.pricing import (
     realized_vol,
 )
 from ait.backtesting.result import BacktestResult
-from ait.strategies.base import SignalDirection
+from ait.strategies.base import CREDIT_STRATEGIES, SignalDirection
 from ait.utils.logging import get_logger
 
 log = get_logger("backtesting.engine")
 
-# Strategies that collect premium (short theta)
-CREDIT_STRATEGIES = {"iron_condor", "iron_butterfly", "wide_wing_condor", "broken_wing_condor", "call_credit_spread", "jade_lizard", "short_strangle", "short_straddle", "covered_call", "cash_secured_put", "put_credit_spread"}
+# Strategies that collect premium (short theta).
+# R16: this module used to declare its OWN set under the same name with
+# different membership from strategies/base.py — see the comment there. The
+# membership now lives in base.py (live + backtest-only arms) and is imported,
+# so the two can never drift apart again. The imported name stays module-level
+# here, so existing `from ait.backtesting.engine import CREDIT_STRATEGIES`
+# callers keep working unchanged.
 # Strategies that pay premium (long theta)
 DEBIT_STRATEGIES = {"long_call", "long_put", "bull_call_spread", "bear_put_spread", "long_straddle"}
 
@@ -632,7 +637,12 @@ class Backtester:
             # in a sustained decline relative to its 60-day rolling high.  Catches slow-grind
             # bear phases that iv_rank_rise misses (W12 tariff shock: rise=0.021 but -16% from high).
             # Default threshold -1.0 disables the gate; Optuna tunes per window in [-0.15, -0.05].
-            if strategy == "iron_condor" and self._pct_from_60d_high_threshold > -0.99:
+            # R16: this was the ONE neutral-credit gate the string-patched
+            # builder rollout missed — every sibling gate above already reads
+            # NEUTRAL_CREDIT_GATED, so an activated threshold gave the
+            # iron_condor baseline a drawdown veto the butterfly/wide/broken/
+            # jade/ccs arms silently skipped, biasing any promotion study.
+            if strategy in NEUTRAL_CREDIT_GATED and self._pct_from_60d_high_threshold > -0.99:
                 _close_series = hist["Close"]
                 _rolling_high = _close_series.rolling(min(60, len(_close_series))).max().iloc[-1]
                 if _rolling_high and _rolling_high > 0:
@@ -771,6 +781,25 @@ class Backtester:
                 ]
                 contracts = pos.get("contracts", 1)
                 pos["credit"]   = round(ep * 100 * contracts, 2)
+                pos["max_loss"] = round(pos.get("max_loss_per_share", 0.0) * 100 * contracts, 2)
+            elif pos.get("strategy") == "jade_lizard":
+                # R16: jade_lizard fell to the else below, so it got legs=[]
+                # and NO credit/max_loss keys — result.py:194 then fell back to
+                # `abs(pnl)*2` as the risk proxy, computing the arm's
+                # capital_utilization / cash_drag_adjusted_return off a P&L
+                # multiple instead of margin, and rendering an empty leg drawer.
+                # 3 legs: short put + short call + long call wing. Premium split
+                # follows the sibling branches' credit-share convention.
+                ep = pos.get("entry_price", 0.0)
+                pos["legs"] = [
+                    {"type": "short_put",  "strike": pos.get("short_put_strike"),  "premium": round(ep * 0.55, 4)},
+                    {"type": "short_call", "strike": pos.get("short_call_strike"), "premium": round(ep * 0.50, 4)},
+                    {"type": "long_call",  "strike": pos.get("long_call_strike"),  "premium": round(-ep * 0.05, 4)},
+                ]
+                contracts = pos.get("contracts", 1)
+                pos["credit"]   = round(ep * 100 * contracts, 2)
+                # Undefined-risk put side: max_loss_per_share is the builder's
+                # (short_put_strike - credit) stress figure, NOT a structural cap.
                 pos["max_loss"] = round(pos.get("max_loss_per_share", 0.0) * 100 * contracts, 2)
             else:
                 pos["legs"] = []
@@ -1351,6 +1380,26 @@ class Backtester:
             "high_water_mark": 0.0,
         }
 
+    def _log_unaffordable(self, strategy: str, risk_per_contract: float,
+                          capital: float) -> None:
+        """R16: attribute a zero-trade credit arm to SIZING, not to 'no edge'.
+
+        The `contracts < 1` budget gate is intentional policy (refusing a
+        structure whose single-contract risk exceeds position_size_pct of
+        capital), and it is shared by every condor-family builder. But it was
+        completely silent, so a shadow-tournament arm whose per-contract risk
+        never fits the budget at index-ETF prices (jade_lizard's S*0.20*100
+        margin is the extreme case) reported n=0 with no error and no reason.
+        """
+        log.debug(
+            "credit_position_unaffordable",
+            component="backtesting.engine",
+            strategy=strategy,
+            risk_per_contract=round(float(risk_per_contract), 2),
+            budget=round(float(capital) * self._position_size_pct, 2),
+            capital=round(float(capital), 2),
+        )
+
     def _build_credit_position(
         self, strategy: str,
         S: float, iv: float, t: float, r: float, dte: int,
@@ -1419,6 +1468,7 @@ class Backtester:
                 return None
             contracts = int(capital * self._position_size_pct / max_loss_per_contract)
             if contracts < 1:
+                self._log_unaffordable(strategy, max_loss_per_contract, capital)
                 return None
 
             return {
@@ -1489,6 +1539,7 @@ class Backtester:
                 return None
             contracts = int(capital * self._position_size_pct / max_loss_per_contract)
             if contracts < 1:
+                self._log_unaffordable(strategy, max_loss_per_contract, capital)
                 return None
             return {
                 "symbol": "SIM",
@@ -1551,6 +1602,7 @@ class Backtester:
                 return None
             contracts = int(capital * self._position_size_pct / max_loss_per_contract)
             if contracts < 1:
+                self._log_unaffordable(strategy, max_loss_per_contract, capital)
                 return None
             return {
                 "symbol": "SIM", "strategy": "iron_butterfly",
@@ -1698,6 +1750,7 @@ class Backtester:
                 return None
             contracts = int(capital * self._position_size_pct / margin_per_contract)
             if contracts < 1:
+                self._log_unaffordable(strategy, margin_per_contract, capital)
                 return None
             return {
                 "symbol": "SIM", "strategy": "jade_lizard",
@@ -2078,17 +2131,25 @@ class Backtester:
         # 2026-08-04: defined-risk EXEMPT — condors hold through events
         # (wings cap the surprise; the vol crush is the payoff). Only
         # undefined/assignment-risk strategies keep the early exit
-        # (strangles <=5 days, CSP/CC <=1). 2026-only calendar: inactive
-        # for pre-2026 windows.
+        # (strangles/jade_lizard <=5 days, CSP/CC <=1). 2026-only calendar:
+        # inactive for pre-2026 windows.
+        # R16: jade_lizard was missing here. The "wings cap the surprise"
+        # rationale is untrue for its NAKED short put — built max_loss_per_share
+        # is ~93.7 on a $100 underlying vs ~12.8 for the condors — so it was
+        # holding through FOMC/CPI/NFP while short_strangle (same put-side
+        # assignment/tail risk) flattened 5 days out, inflating the jade arm's
+        # relative PF on exactly the highest-variance days.
         if (self._economic_cal is not None
                 and os.environ.get("AIT_SKIP_MACRO_EVENTS", "0") == "1"
                 and pos.get("strategy") in (
-                    "short_strangle", "cash_secured_put", "covered_call")):
+                    "short_strangle", "jade_lizard",
+                    "cash_secured_put", "covered_call")):
             try:
                 _d2e = self._economic_cal.days_until_next_event(current_date)
             except Exception:  # noqa: BLE001
                 _d2e = None
-            _evt_window = 5 if pos.get("strategy") == "short_strangle" else 1
+            _evt_window = 5 if pos.get("strategy") in (
+                "short_strangle", "jade_lizard") else 1
             if _d2e is not None and _d2e <= _evt_window:
                 return {"exit_date": str(current_date), "exit_reason": "macro_event_flatten"}
 
