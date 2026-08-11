@@ -253,6 +253,33 @@ class RiskManager:
             return mv, "entry_notional"
         return 0.0, "unknown"
 
+    def _symbol_capital_at_risk(self, symbol: str) -> float:
+        """R17: real capital-at-risk for one symbol's open positions, for
+        gate 6c (same-symbol concentration cap). This gate summed
+        `market_value` directly instead of reusing the max_loss/backfill
+        sourcing _aggregate_open_risk already established (R16, adjacent
+        gate 6b-2) -- for credit strategies market_value is the CREDIT
+        COLLECTED, not the real dollar risk, so 6c could pass on a small
+        fraction of what a symbol's positions could actually lose.
+        """
+        total = 0.0
+        idx: dict | None = None
+        for p in self._open_positions:
+            if p.get("symbol") != symbol:
+                continue
+            try:
+                ml = float(p.get("max_loss", 0) or 0)
+            except (TypeError, ValueError):
+                ml = 0.0
+            if ml > 0:
+                total += ml
+                continue
+            if idx is None:
+                idx = self._open_trade_index()
+            est, _source = self._backfilled_position_risk(p, idx)
+            total += est
+        return total
+
     def _aggregate_open_risk(self) -> float:
         """Sum defined risk across open positions for the portfolio cap.
 
@@ -499,11 +526,10 @@ class RiskManager:
             )
 
         # 6c. Concentration limit — no more than 20% of account in one symbol
-        symbol_exposure = sum(
-            abs(p.get("market_value", 0))
-            for p in self._open_positions
-            if p.get("symbol") == request.symbol
-        )
+        # R17: was summing market_value (credit collected for credit
+        # strategies, not real risk) -- now the same max_loss/backfill
+        # sourcing gate 6b-2's aggregate cap uses.
+        symbol_exposure = self._symbol_capital_at_risk(request.symbol)
         if (symbol_exposure + estimated_cost) > account_value * 0.20:
             return TradeValidation(
                 False,

@@ -185,6 +185,10 @@ class TradingOrchestrator:
         # Wire alerts for silently-unprotected states (marks outage, PDT-
         # blocked stop) into the same Telegram channel as everything else.
         self._portfolio._notify_cb = self._send_notification
+        # R17: stale account data used to only ever log — wire it to the same
+        # notify channel and the existing circuit-breaker halt lever.
+        self._account._notify_cb = self._send_notification
+        self._account._circuit_breaker = self._circuit_breaker
 
         # Scheduling
         self._scheduler = MarketScheduler()

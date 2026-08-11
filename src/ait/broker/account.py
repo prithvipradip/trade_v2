@@ -34,11 +34,50 @@ class AccountSnapshot:
 class AccountManager:
     """Manages account data with caching to minimize IBKR API calls."""
 
+    # R17: past this age, a stale account snapshot escalates beyond a log
+    # line -- every dollar-based risk gate runs on this number.
+    ESCALATE_STALE_SECONDS = 900
+
     def __init__(self, client: IBKRClient, cache_ttl: int = 30) -> None:
         self._client = client
         self._cache_ttl = cache_ttl
         self._snapshot = AccountSnapshot()
         self._last_fetch = 0.0
+        self._notify_cb = None  # optional async callable(str), wired by orchestrator
+        self._circuit_breaker = None  # optional CircuitBreaker, wired by orchestrator
+        self._stale_escalated = False
+
+    async def _handle_stale(self, stale_seconds: float) -> None:
+        """R17: log.error alone never escalated -- risk math kept running
+        on a fossil snapshot for as long as an outage lasted. Past
+        ESCALATE_STALE_SECONDS, trip the existing circuit-breaker halt lever
+        and notify, once per outage.
+        """
+        if stale_seconds > 300:
+            log.error(
+                "account_data_stale",
+                stale_seconds=int(stale_seconds),
+                msg="Account data over 5 minutes old — risk calculations unreliable",
+            )
+        else:
+            log.warning("account_fetch_empty", using="cached_values")
+            return
+        if stale_seconds <= self.ESCALATE_STALE_SECONDS or self._stale_escalated:
+            return
+        self._stale_escalated = True
+        if self._circuit_breaker is not None:
+            try:
+                self._circuit_breaker.record_api_failure()
+            except Exception as e:  # noqa: BLE001 — escalation must not crash the read
+                log.warning("account_stale_breaker_failed", error=str(e))
+        if self._notify_cb is not None:
+            try:
+                await self._notify_cb(
+                    f"ACCOUNT DATA STALE {int(stale_seconds / 60)} min — risk "
+                    f"calculations are running on a fossil snapshot."
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("account_stale_notify_failed", error=str(e))
 
     async def get_snapshot(self, force_refresh: bool = False) -> AccountSnapshot:
         """Get current account snapshot, using cache if fresh enough."""
@@ -56,15 +95,7 @@ class AccountManager:
             # guess here would defeat that hard-stop. Stale-but-correct
             # beats fresh-but-wrong for risk math.
             if self._last_fetch > 0:
-                stale_seconds = now - self._last_fetch
-                if stale_seconds > 300:
-                    log.error(
-                        "account_data_stale",
-                        stale_seconds=int(stale_seconds),
-                        msg="Account data over 5 minutes old — risk calculations unreliable",
-                    )
-                else:
-                    log.warning("account_fetch_empty", using="cached_values")
+                await self._handle_stale(now - self._last_fetch)
                 return self._snapshot
             # Never had a snapshot at all: last-resort estimate from
             # positions (crude, currency-blind — better than zero only at
@@ -86,13 +117,8 @@ class AccountManager:
             except Exception as e:
                 log.debug("position_fallback_failed", error=str(e))
 
-            stale_seconds = now - self._last_fetch
-            if self._last_fetch > 0 and stale_seconds > 300:
-                log.error(
-                    "account_data_stale",
-                    stale_seconds=int(stale_seconds),
-                    msg="Account data over 5 minutes old — risk calculations unreliable",
-                )
+            if self._last_fetch > 0:
+                await self._handle_stale(now - self._last_fetch)
             else:
                 log.warning("account_fetch_empty", using="cached_values")
             return self._snapshot
@@ -131,6 +157,7 @@ class AccountManager:
             cash_balance=float(values.get("CashBalance", 0)),
         )
         self._last_fetch = now
+        self._stale_escalated = False  # R17: outage over — re-arm the escalation latch
 
         log.debug(
             "account_snapshot",

@@ -324,10 +324,20 @@ class HistoricalDataStore:
                 conn.execute(f"ALTER TABLE {self._intraday_table} ADD COLUMN source TEXT DEFAULT ''")
             except sqlite3.OperationalError:
                 pass
+            # R17: INSERT OR REPLACE let MIDPOINT bars (backfill_historical_data.py's
+            # default --what-to-show) silently overwrite real TRADES bars, since
+            # `source` isn't part of the primary key. Upsert instead, refusing to
+            # downgrade an existing TRADES row unless the incoming row is ALSO
+            # TRADES (which always wins, e.g. a genuine re-backfill).
             conn.executemany(
-                f"""INSERT OR REPLACE INTO {self._intraday_table}
+                f"""INSERT INTO {self._intraday_table}
                    (symbol, datetime, interval, open, high, low, close, volume, source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(symbol, datetime, interval) DO UPDATE SET
+                       open=excluded.open, high=excluded.high, low=excluded.low,
+                       close=excluded.close, volume=excluded.volume, source=excluded.source
+                   WHERE {self._intraday_table}.source != 'TRADES'
+                      OR excluded.source = 'TRADES'""",
                 rows,
             )
 
