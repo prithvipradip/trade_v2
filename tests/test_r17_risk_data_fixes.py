@@ -167,3 +167,40 @@ class TestAccountStaleDataEscalates:
         })
         await acct.get_snapshot(force_refresh=True)
         assert acct._stale_escalated is False
+
+
+class TestReconcilerOrderRefDisambiguation:
+    def _reconciler(self):
+        from ait.execution.reconciler import PositionReconciler
+        return PositionReconciler.__new__(PositionReconciler)
+
+    def _trade(self, trade_id, symbol="SPY"):
+        return SimpleNamespace(
+            trade_id=trade_id, symbol=symbol, strategy="iron_condor",
+            legs="[]", strike=None, expiry=None,
+        )
+
+    def test_exact_order_ref_match_disambiguates_same_symbol_combos(self):
+        recon = self._reconciler()
+        trade_a = self._trade("T-A")
+        trade_b = self._trade("T-B")
+        working = [
+            (111, {"SPY:BAG"}, "SPY", "T-A"),
+            (222, {"SPY:BAG"}, "SPY", "T-B"),
+        ]
+        assert recon._working_exit_order_for(trade_a, working) == 111
+        assert recon._working_exit_order_for(trade_b, working) == 222
+
+    def test_tagged_order_never_claimed_by_a_different_trade(self):
+        recon = self._reconciler()
+        trade_c = self._trade("T-C")  # no working order of its own
+        working = [(111, {"SPY:BAG"}, "SPY", "T-A")]
+        # Pre-fix: symbol-only match would have claimed order 111 for T-C too.
+        assert recon._working_exit_order_for(trade_c, working) is None
+
+    def test_falls_back_to_symbol_heuristic_when_order_ref_absent(self):
+        """Orders placed before this change carry no order_ref."""
+        recon = self._reconciler()
+        trade = self._trade("T-LEGACY")
+        working = [(111, {"SPY:BAG"}, "SPY", "")]
+        assert recon._working_exit_order_for(trade, working) == 111

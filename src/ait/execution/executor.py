@@ -490,6 +490,9 @@ class TradeExecutor:
                 limit_price=signal.entry_price,
             )
 
+        # R17: tag the order with its trade_id so the reconciler can match a
+        # working order to its trade exactly, instead of by symbol alone.
+        order.orderRef = trade_id
         return await self._ibkr.place_order(qualified, order)
 
     async def _execute_multi_leg(
@@ -652,6 +655,9 @@ class TradeExecutor:
         self._last_live_mid = _live_mid_mag
         self._last_nbbo_spread = _live_spread
 
+        # R17: tag the order with its trade_id so the reconciler can match a
+        # working order to its trade exactly, instead of by symbol alone.
+        order.orderRef = trade_id
         return await self._ibkr.place_order(combo, order)
 
     def attach_fill_events(self) -> None:

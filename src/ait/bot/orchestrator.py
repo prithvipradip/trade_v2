@@ -2441,6 +2441,8 @@ class TradingOrchestrator:
                             trade_id=trade.trade_id, symbol=trade.symbol,
                             note="long-option close; market fill is bounded at $0")
                 order = OrderBuilder.market(action="SELL", quantity=trade.quantity)
+            # R17: tag with trade_id for exact reconciler matching.
+            order.orderRef = trade.trade_id
             return await self._ibkr.place_order(qualified, order)
 
         # BUY-to-close a short: unbounded risk if done at market. LIMIT only.
@@ -2480,6 +2482,8 @@ class TradingOrchestrator:
                  symbol=trade.symbol, limit_price=limit_price)
         order = OrderBuilder.limit(action="BUY", quantity=trade.quantity,
                                    limit_price=limit_price)
+        # R17: tag with trade_id for exact reconciler matching.
+        order.orderRef = trade.trade_id
         return await self._ibkr.place_order(qualified, order)
 
     def _marked_cost_to_close(self, trade: TradeRecord) -> float | None:
@@ -2736,6 +2740,8 @@ class TradingOrchestrator:
                 )
             return None
 
+        # R17: tag with trade_id for exact reconciler matching.
+        order.orderRef = trade.trade_id
         return await self._ibkr.place_order(combo, order)
 
     async def _post_market(self) -> None:

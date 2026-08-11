@@ -437,8 +437,8 @@ class PositionReconciler:
         "pendingsubmit", "apipending", "presubmitted", "submitted", "",
     }
 
-    async def _fetch_working_orders(self) -> list[tuple[int, set[str], str]] | None:
-        """R12 F4.1: working orders at the broker as (orderId, keys, symbol).
+    async def _fetch_working_orders(self) -> list[tuple[int, set[str], str, str]] | None:
+        """R12 F4.1: working orders at the broker as (orderId, keys, symbol, order_ref).
 
         Keys are leg position-keys for plain option orders; combo (BAG)
         orders only expose leg conIds, so they match at symbol level via the
@@ -446,6 +446,11 @@ class PositionReconciler:
         orders placed by a previous session/clientId are seen. Returns None
         when the broker view is unavailable (callers must then NOT promote
         CLOSING trades — unknown is not "no working order").
+
+        R17: order_ref is the trade_id stamped on the order at placement
+        (executor.py / orchestrator.py _close_*). Orders placed before this
+        change carry no order_ref — _working_exit_order_for falls back to
+        the symbol heuristic for those, same as before.
         """
         try:
             if hasattr(self._ibkr, "get_all_open_trades"):
@@ -454,7 +459,7 @@ class PositionReconciler:
                 trades = self._ibkr.get_open_orders()
             if trades is None:
                 return None
-            entries: list[tuple[int, set[str], str]] = []
+            entries: list[tuple[int, set[str], str, str]] = []
             for t in trades:
                 status = str(getattr(t.orderStatus, "status", "") or "").lower()
                 if status not in self._WORKING_ORDER_STATUSES:
@@ -470,21 +475,36 @@ class PositionReconciler:
                     keys.add(f"{c.symbol}:BAG")
                 else:
                     keys.add(f"{c.symbol}:STK")
-                entries.append((int(t.order.orderId or 0), keys, str(c.symbol)))
+                order_ref = str(getattr(t.order, "orderRef", "") or "")
+                entries.append((int(t.order.orderId or 0), keys, str(c.symbol), order_ref))
             return entries
         except Exception as e:  # noqa: BLE001
             log.warning("working_orders_fetch_failed", error=str(e))
             return None
 
     def _working_exit_order_for(
-        self, trade, working: list[tuple[int, set[str], str]]
+        self, trade, working: list[tuple[int, set[str], str, str]]
     ) -> int | None:
         """R12 F4.1: orderId of a working order touching this trade's legs
         (leg-key match for plain options; symbol match for BAG combos —
         combo legs are opaque conIds at this layer, and keeping CLOSING on a
-        same-symbol combo is the safe direction)."""
+        same-symbol combo is the safe direction).
+
+        R17: the symbol-only BAG match could misassign between two
+        same-symbol multi-leg positions both mid-close after a restart. Try
+        an exact order_ref==trade_id match first (stamped at placement);
+        only fall back to the symbol heuristic for orders with no order_ref
+        (pre-deploy orders still in flight) — and never claim an order
+        that's tagged for a DIFFERENT trade.
+        """
+        for order_id, _keys, _symbol, order_ref in working:
+            if order_ref and order_ref == trade.trade_id:
+                return order_id
+
         trade_keys = self._trade_leg_keys(trade)
-        for order_id, keys, symbol in working:
+        for order_id, keys, symbol, order_ref in working:
+            if order_ref:
+                continue  # tagged for a different trade — never claim it
             if not keys.isdisjoint(trade_keys):
                 return order_id
             if f"{symbol}:BAG" in keys and symbol == trade.symbol:
@@ -671,7 +691,7 @@ class PositionReconciler:
         # promoting past it re-triggers a second close (fills of both =
         # position REVERSAL). Fetched once, and only when a CLOSING trade
         # exists locally.
-        working_orders: list[tuple[int, set[str], str]] | None = None
+        working_orders: list[tuple[int, set[str], str, str]] | None = None
         if any(t.status == TradeStatus.CLOSING for t in local_trades):
             working_orders = await self._fetch_working_orders()
 
