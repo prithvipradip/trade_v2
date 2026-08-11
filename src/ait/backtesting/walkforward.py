@@ -1295,7 +1295,13 @@ class WalkForwardBacktester:
             # so the window's deployed capital is capital x N sleeves. Summing
             # sleeve P&L onto a single full-capital account inflated returns
             # ~N x (the mechanism behind the untrustworthy +311%).
-            window_capital = self._config.initial_capital * max(1, len(data))
+            # R17: N was len(data) (every symbol passed INTO the window),
+            # not active_symbols (the ones that actually passed the
+            # learner-allowed + min-row-count gates and deployed a sleeve of
+            # capital) -- once the self-learning feature drops a symbol
+            # mid-run, this understated the window's real capital base and
+            # hence its reported return.
+            window_capital = self._config.initial_capital * max(1, active_symbols)
             window_result = WindowResult(
                 window_id=window_id,
                 train_start=train_start,

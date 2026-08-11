@@ -131,6 +131,10 @@ class OptionContract:
     vega: float = 0.0
     # Metadata
     con_id: int = 0  # IBKR contract ID (needed for combo orders)
+    # R17: which feed this contract came from. "ibkr" reports open_interest=0
+    # to mean UNKNOWN (no real-time OI tick) rather than a real zero; Yahoo
+    # ("yahoo_delayed") reports a genuine value, including a genuine zero.
+    source: str = "ibkr"
 
     @property
     def mid(self) -> float:
@@ -156,7 +160,9 @@ class OptionContract:
         # open_interest==0 means UNKNOWN on the IBKR realtime path (no OI
         # tick) — treating unknown as illiquid rejected every IBKR contract
         # (audit R2/C2). Enforce the OI floor only when OI is reported.
-        oi_ok = self.open_interest <= 0 or self.open_interest >= min_oi
+        # R17: that leniency is only valid for IBKR — the Yahoo fallback
+        # reports a genuine open_interest, including a genuine zero.
+        oi_ok = (self.open_interest <= 0 and self.source == "ibkr") or self.open_interest >= min_oi
         return self.volume >= min_vol and oi_ok and self.spread_pct < max_spread
 
 
@@ -325,18 +331,20 @@ class OptionsChain:
             symbol=self.symbol,
             underlying_price=self.underlying_price,
             expiry=self.expiry,
+            # R17: the OI<=0-means-unknown leniency only holds for IBKR;
+            # each contract's own `source` decides, not the chain-level one.
             calls=[
                 c
                 for c in self.calls
                 if c.volume >= min_vol
-                and (c.open_interest <= 0 or c.open_interest >= min_oi)
+                and ((c.open_interest <= 0 and c.source == "ibkr") or c.open_interest >= min_oi)
                 and c.spread_pct <= max_spread
             ],
             puts=[
                 p
                 for p in self.puts
                 if p.volume >= min_vol
-                and (p.open_interest <= 0 or p.open_interest >= min_oi)
+                and ((p.open_interest <= 0 and p.source == "ibkr") or p.open_interest >= min_oi)
                 and p.spread_pct <= max_spread
             ],
             # R12-B: carry the full chain's vol stats (see filter_by_delta).
@@ -626,6 +634,7 @@ class OptionsChainService:
                                 theta=_num(mg.theta) if mg else 0.0,
                                 vega=_num(mg.vega) if mg else 0.0,
                                 con_id=q.conId,
+                                source="ibkr",  # open_interest=0 here means UNKNOWN, not zero
                             )
 
                             if q.right == "C":
@@ -738,6 +747,7 @@ class OptionsChainService:
                         volume=_safe_int(row.get("volume")),
                         open_interest=_safe_int(row.get("openInterest")),
                         implied_vol=_physical_iv(row.get("impliedVolatility")),
+                        source="yahoo_delayed",
                     )
                 )
 
@@ -758,6 +768,7 @@ class OptionsChainService:
                         volume=_safe_int(row.get("volume")),
                         open_interest=_safe_int(row.get("openInterest")),
                         implied_vol=_physical_iv(row.get("impliedVolatility")),
+                        source="yahoo_delayed",
                     )
                 )
 

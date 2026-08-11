@@ -22,14 +22,12 @@ import re
 import sqlite3
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TAIL_BYTES = 4 << 20  # last 4MB of ait.log
 FRESH_SECS = 600
-
-ET = timezone(timedelta(hours=-4))  # EDT; fine for RTH checks in summer
 
 
 def _log_tail() -> str:
@@ -39,6 +37,20 @@ def _log_tail() -> str:
     with open(p, "rb") as f:
         f.seek(max(0, p.stat().st_size - TAIL_BYTES))
         return f.read().decode("utf-8", errors="ignore")
+
+
+def _mark_age_seconds(newest_iso: str, now: datetime | None = None) -> float:
+    """Age of the newest position mark, in the codebase's ET convention.
+
+    R17: was a hardcoded EDT (UTC-4) offset -- wrong for ~4-5 months a year
+    (EST is UTC-5), guaranteeing a false LIVENESS FAIL every winter.
+    `now` is injectable for tests; defaults to the real current time.
+    """
+    sys.path.insert(0, str(ROOT / "src"))
+    from ait.utils.time import ET
+
+    mark_dt = datetime.fromisoformat(newest_iso).replace(tzinfo=ET)
+    return ((now or datetime.now(ET)) - mark_dt).total_seconds()
 
 
 def main() -> int:
@@ -75,8 +87,7 @@ def main() -> int:
         con.close()
         if rows:
             newest = max(r[1] or "" for r in rows)
-            mark_dt = datetime.fromisoformat(newest).replace(tzinfo=ET)
-            mage = (datetime.now(ET) - mark_dt).total_seconds()
+            mage = _mark_age_seconds(newest)
             results.append(("marks_fresh", mage < FRESH_SECS,
                             f"{len(rows)} position(s), newest mark {int(mage)}s old"))
         else:

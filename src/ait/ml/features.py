@@ -22,6 +22,12 @@ from ait.utils.logging import get_logger
 
 log = get_logger("ml.features")
 
+# R17: neutral fallback values for the all-NaN-column safety net in
+# FeatureEngine.compute(). A blanket 0.0 is wrong for a column whose
+# documented "no data" value is something else — vix_level's is 0.5
+# ("VIX~20, normal") elsewhere in this file.
+NEUTRAL_COLUMN_DEFAULTS: dict[str, float] = {"vix_level": 0.5}
+
 
 class FeatureEngine:
     """Computes features from OHLCV data for ML models."""
@@ -107,11 +113,18 @@ class FeatureEngine:
         # wipe every row, silently killing all predictions. Neutral-fill any
         # all-NaN column with 0 instead, and log which ones so the underlying
         # data problem stays visible.
+        # R17: a blanket 0.0 fill is wrong for columns with a documented
+        # non-zero neutral value (NEUTRAL_COLUMN_DEFAULTS) -- a
+        # present-but-corrupted VIX feed (as opposed to a simply-absent
+        # one) would otherwise get coded as "extremely calm" (0.0) instead
+        # of neutral, right when the data pipeline is unreliable.
         all_nan = [c for c in features.columns if features[c].isna().all()]
         if all_nan:
             log.warning("features_all_nan_columns_filled",
                         count=len(all_nan), columns=all_nan[:20])
-            features[all_nan] = features[all_nan].fillna(0.0)
+            for _col in all_nan:
+                features[_col] = features[_col].fillna(
+                    NEUTRAL_COLUMN_DEFAULTS.get(_col, 0.0))
 
         # Drop rows with NaN from lookback calculations
         features = features.dropna()

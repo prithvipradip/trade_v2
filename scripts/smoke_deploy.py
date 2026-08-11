@@ -46,6 +46,7 @@ import os
 import pkgutil
 import sqlite3
 import sys
+import time
 import traceback
 from datetime import date
 from pathlib import Path
@@ -53,6 +54,25 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SQLITE_PATH = ROOT / "data" / "ait_state.db"
 DUCK_PATH = ROOT / "data" / "ait_analytics.duckdb"
+
+# R17: tables the LIVE BOT itself legitimately writes during normal
+# operation (trade open/close, daily stats, feature snapshots). A row-count
+# delta confined to these, while the bot's own heartbeat is fresh, is
+# positive evidence of a concurrent legitimate writer -- not the smoke
+# script writing to a database, the actual failure mode this guard exists
+# to catch (which most plausibly happens with the bot mid-restart/stopped).
+LIVE_WRITE_TABLES = {
+    "trades", "daily_stats", "open_positions", "trade_context",
+    "bot_state", "executions", "feature_snapshots", "equity_stats",
+}
+HEARTBEAT_FRESH_SECS = 600
+
+
+def _bot_heartbeat_fresh() -> bool:
+    hb = ROOT / "data" / "bot_heartbeat"
+    if not hb.exists():
+        return False
+    return (time.time() - hb.stat().st_mtime) < HEARTBEAT_FRESH_SECS
 
 RESULTS: list[tuple[str, str | None]] = []  # (check name, None | error text)
 WARNINGS: list[str] = []
@@ -192,7 +212,14 @@ class NoWriteGuard:
             sv_b = b.pop("__schema_version__", None)
             sv_a = a.pop("__schema_version__", None)
             if b != a:
-                problems.append(f"sqlite rows changed [{self._diff(b, a)}]")
+                changed = {k for k in set(b) | set(a) if b.get(k) != a.get(k)}
+                if changed <= LIVE_WRITE_TABLES and _bot_heartbeat_fresh():
+                    notes.append(
+                        f"sqlite rows changed in live-write tables while the "
+                        f"bot's heartbeat is fresh (concurrent live activity, "
+                        f"not the smoke) [{self._diff(b, a)}]")
+                else:
+                    problems.append(f"sqlite rows changed [{self._diff(b, a)}]")
             elif sv_b != sv_a:
                 notes.append(
                     f"sqlite schema_version {sv_b} -> {sv_a}: StateManager "
@@ -204,8 +231,18 @@ class NoWriteGuard:
         after_duck = self._duck_snapshot()
         if self.duck_before is not None and after_duck is not None:
             if self.duck_before != after_duck:
-                problems.append(
-                    f"duckdb rows changed [{self._diff(self.duck_before, after_duck)}]")
+                changed = {k for k in set(self.duck_before) | set(after_duck)
+                           if self.duck_before.get(k) != after_duck.get(k)}
+                if changed <= LIVE_WRITE_TABLES and _bot_heartbeat_fresh():
+                    notes.append(
+                        f"duckdb rows changed in live-write tables while the "
+                        f"bot's heartbeat is fresh (concurrent live activity, "
+                        f"not the smoke) "
+                        f"[{self._diff(self.duck_before, after_duck)}]")
+                else:
+                    problems.append(
+                        f"duckdb rows changed "
+                        f"[{self._diff(self.duck_before, after_duck)}]")
 
         if self._dv_con is not None:
             try:
