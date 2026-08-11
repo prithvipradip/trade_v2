@@ -914,3 +914,22 @@ the orchestrator. Headlines:
    PortfolioItem carries no greeks at all) - left inert but now LOUD once per session
    rather than silently dead; making it real needs a market-data decision after U6.
 Tests +191 across 5 new files (r16_broker/risk/tail/round2 + core). Suite 1014 green.
+
+## 2026-08-11 - RANGE-FLOOR STUDY (PRE-REGISTERED before results)
+WHY: with ML gates back ON (rule B1), ml.range_min_confidence is now THE binding entry
+constraint on every condor, and it has NEVER been studied - it was set to 0.65 once and
+inherited. Velocity is the program's limiting factor (~8 trades/yr gated), and this is
+the one knob that can buy trades back WITHOUT reopening the 34.6% ungated drawdown.
+PARITY GAP THIS ALSO CLOSES: WalkForwardConfig.range_min_confidence defaults to 0.55
+while live runs 0.65 - so the 08-08 confirm run measured a LOOSER gate than production
+applies, and its n=92 OVERSTATES live velocity. Every arm here runs gates ON so the only
+variable is the floor.
+ARMS: 0.50 / 0.55 / 0.60 / 0.65(live) / 0.70, ~11y, 365-day train, fence on.
+DECISION RULE (registered now): pick the LOWEST floor whose PF >= 0.95x the 0.65 arm's
+PF AND whose max DD <= the 0.65 arm's DD, requiring n >= 30. That maximizes sample
+velocity subject to not degrading quality. If NO arm beats 0.65 on trade count without
+breaching those bounds, the floor STAYS 0.65 and velocity must be attacked elsewhere
+(universe breadth, DTE cadence) - recorded as such rather than loosened by preference.
+If the 0.50/0.55 arms show materially MORE trades at equal quality, that also means the
+08-08 confirm run's absolute numbers were measured at a floor we do not run - annotate
+that verdict accordingly.
