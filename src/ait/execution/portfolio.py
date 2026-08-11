@@ -632,13 +632,22 @@ class PortfolioManager:
         # delta_breach_rule_inert once per session). Do not count 3b as live
         # protection; the touch stop at rule 1b covers the same blowout. Full
         # explanation and what a real fix costs: _get_position_delta docstring.
+        #
+        # R17: the delta check used to gate only the BODY of this branch, not
+        # entry into it — trade.strategy membership alone claimed the elif
+        # slot, so a None/no-breach delta still silently blocked rule 3c
+        # (earnings pre-close) from ever running for every position of these
+        # strategies once DTE>5. Delta is now part of the condition itself:
+        # this branch only claims the slot when there's a real breach to act
+        # on, so 3c gets its turn whenever 3b doesn't fire (i.e. always,
+        # today, since delta is inert).
         elif (not should_exit
                 and trade.strategy in ("iron_condor", "short_strangle", "long_straddle",
-                                       "cash_secured_put", "covered_call")):
-            pos_delta = self._get_position_delta(trade)
-            if pos_delta is not None and abs(pos_delta) > 0.50:
-                should_exit = True
-                exit_reason = f"delta_breach (|Δ|={abs(pos_delta):.2f} > 0.50)"
+                                       "cash_secured_put", "covered_call")
+                and (pos_delta := self._get_position_delta(trade)) is not None
+                and abs(pos_delta) > 0.50):
+            should_exit = True
+            exit_reason = f"delta_breach (|Δ|={abs(pos_delta):.2f} > 0.50)"
 
         # 3c. IV crush pre-close — for SHORT premium strategies, close 2 days
         # before earnings to capture theta without eating the earnings IV crush

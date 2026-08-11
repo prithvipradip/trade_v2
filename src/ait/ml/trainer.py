@@ -232,9 +232,17 @@ class ModelTrainer:
         # A8 (deep-audit ML-F9): predictor.cv_scores held only the LAST
         # symbol trained -- the decision now uses the MEAN accuracy across
         # every symbol trained this run (results maps symbol -> accuracy).
+        #
+        # R17: `results` maps symbol -> dict[model_name, float], never a bare
+        # scalar, so the old `isinstance(v, (int, float))` filter over
+        # results.values() always saw dicts and always produced an empty
+        # list -- the "mean across every symbol" never actually replaced
+        # cv_scores, silently defeating this rollback check. Flatten one
+        # level deeper to reach the actual per-model accuracy floats.
         if prev_scores and results:
             try:
-                _vals = [v for v in results.values() if isinstance(v, (int, float))]
+                _vals = [acc for sym_scores in results.values() if isinstance(sym_scores, dict)
+                          for acc in sym_scores.values() if isinstance(acc, (int, float))]
                 if _vals:
                     self._predictor.cv_scores = {"all_symbol_mean": sum(_vals) / len(_vals)}
             except Exception:  # noqa: BLE001

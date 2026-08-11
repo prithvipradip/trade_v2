@@ -21,6 +21,7 @@ from ait.broker.account import AccountManager
 from ait.broker.contracts import ContractBuilder
 from ait.broker.ibkr_client import IBKRClient
 from ait.broker.orders import OrderBuilder
+from ait.config.runtime_env import capital_base, capital_base_source
 from ait.config.settings import Settings
 from ait.data.earnings import EarningsCalendar
 from ait.data.economic_calendar import EconomicCalendar
@@ -293,6 +294,20 @@ class TradingOrchestrator:
             log.error("startup_reconcile_failed", error=str(e))
 
         await self._send_notification(f"BOT STARTED | Mode: {self._settings.trading.mode} | {len(self._settings.trading.universe)} symbols")
+
+        # R17: capital_base() (drawdown%/return% denominator across the
+        # dashboard/analytics) silently falls back to a hardcoded default if
+        # AIT_CAPITAL_BASE is unset and no live NLV has been cached yet — a
+        # silently-wrong-denominator risk if that happens at real go-live.
+        # One-time startup check, not per-render; paper mode never pages.
+        if (self._settings.trading.mode == "live"
+                and capital_base_source() == "default"):
+            log.critical("capital_base_unset_in_live_mode", value=capital_base())
+            await self._send_notification(
+                f"WARNING: live-mode capital base is the HARDCODED DEFAULT "
+                f"(${capital_base():,.0f}) — set AIT_CAPITAL_BASE or every "
+                f"risk %/drawdown reading is wrong."
+            )
 
         # Read-only guardrail: verify the Gateway session can actually place
         # orders. Read-only sessions silently reject every order (Error 321)
@@ -581,6 +596,8 @@ class TradingOrchestrator:
             if last is None or (now - last).total_seconds() >= 1200:
                 self._last_readonly_check = now
                 await self._check_trading_enabled()
+
+            await self._check_economic_calendar_exhaustion()
 
             positions = await self._portfolio.check_positions()
             # A5: a successful portfolio read == IBKR is genuinely alive.
@@ -1645,6 +1662,22 @@ class TradingOrchestrator:
                 await self._send_notification("Trading ENABLED again — Gateway accepts orders. Resuming.")
                 log.info("trading_reenabled")
         return can_trade
+
+    async def _check_economic_calendar_exhaustion(self) -> None:
+        """R17: page once when the hardcoded macro-event calendar is nearly
+        exhausted. EconomicCalendar._warn_if_nearly_exhausted only ever
+        logged (log.critical, no notification route) -- the exact "macro
+        guards went blind and nobody noticed" failure it exists to catch.
+        """
+        if self._economic_cal.exhausted_warned and not getattr(
+            self, "_econ_cal_exhausted_notified", False
+        ):
+            self._econ_cal_exhausted_notified = True
+            await self._send_notification(
+                "ECONOMIC CALENDAR NEARLY EXHAUSTED: macro-event guards "
+                "are about to go blind. Extend the FOMC/CPI/NFP/GDP/PCE "
+                "tables in economic_calendar.py — see logs for details."
+            )
 
     async def _try_execute(self, signal, confidence: float, sentiment, regime) -> bool:
         """Validate and execute a signal.

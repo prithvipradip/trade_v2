@@ -147,9 +147,14 @@ def get_status() -> dict:
         ]
         out["unrealized_total"] = round(
             sum(p["unrealized"] for p in out["open_positions"]), 2)
-        real = ("AND exit_reason_detailed NOT LIKE '%migrated%' "
-                "AND exit_reason_detailed NOT LIKE '%pending%' "
-                "AND exit_reason_detailed NOT LIKE '%never_filled%'")
+        # R17: was missing COALESCE, so any row with a NULL exit_reason_detailed
+        # (SQL NULL NOT LIKE x -> NULL -> dropped by WHERE) silently fell out
+        # of pnl_today/pnl_life -- unlike the go-live scorecard query below,
+        # which already had it. Both the CLI and status_server.py's web
+        # dashboard read this via get_status().
+        real = ("AND COALESCE(exit_reason_detailed,'') NOT LIKE '%migrated%' "
+                "AND COALESCE(exit_reason_detailed,'') NOT LIKE '%pending%' "
+                "AND COALESCE(exit_reason_detailed,'') NOT LIKE '%never_filled%'")
         t = con.execute(f"SELECT COALESCE(SUM(realized_pnl),0),COUNT(*) FROM trades "
                         f"WHERE status='closed' AND exit_time>=? {real}", (today,)).fetchone()
         l = con.execute(f"SELECT COALESCE(SUM(realized_pnl),0),COUNT(*) FROM trades "

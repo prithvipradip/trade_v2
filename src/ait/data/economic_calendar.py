@@ -236,6 +236,14 @@ class EconomicCalendar:
 
     _exhausted_warned = False
 
+    @property
+    def exhausted_warned(self) -> bool:
+        """R17: True once `_warn_if_nearly_exhausted` has logged the
+        once-per-process staleness alarm. Polled by the orchestrator (whose
+        callers are async, unlike this class's) to actually page a human —
+        the log.critical() below alone never reached Telegram."""
+        return EconomicCalendar._exhausted_warned
+
     def _warn_if_nearly_exhausted(self, check_date: date) -> None:
         """log.critical (once per process) when the hardcoded calendar has
         fewer than STALENESS_ALARM_DAYS of future events left."""

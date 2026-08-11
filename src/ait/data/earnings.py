@@ -15,6 +15,7 @@ from datetime import date, datetime, timedelta
 
 from ait.data.cache import TTLCache
 from ait.utils.logging import get_logger
+from ait.utils.time import now_et
 
 log = get_logger("data.earnings")
 
@@ -84,7 +85,10 @@ class EarningsCalendar:
         Danger zone = [earnings - buffer_before, earnings + buffer_after]
         Default: 2 days before through 1 day after earnings.
         """
-        check_date = check_date or date.today()
+        # R17: was date.today() (server-local clock) instead of this
+        # codebase's ET convention -- a multi-hour window around midnight
+        # UTC could misclassify a same-day earnings date as "already past".
+        check_date = check_date or now_et().date()
         info = self.get_next_earnings(symbol)
 
         if info.next_earnings_date is None:
@@ -152,7 +156,7 @@ class EarningsCalendar:
                     for key in ("Earnings Date", "earnings date", "EarningsDate"):
                         if key in cal:
                             d = _to_date(cal[key])
-                            if d is not None and d >= date.today():
+                            if d is not None and d >= now_et().date():
                                 return EarningsInfo(symbol=symbol, next_earnings_date=d)
                             break  # key present but past/unparseable -> earnings_dates fallback
 
@@ -162,7 +166,7 @@ class EarningsCalendar:
                         if "earnings" not in str(col).lower():
                             continue
                         d = _to_date(cal.iloc[0][col])
-                        if d is not None and d >= date.today():
+                        if d is not None and d >= now_et().date():
                             return EarningsInfo(symbol=symbol, next_earnings_date=d)
 
                 # Try the earnings_dates attribute instead
@@ -172,7 +176,7 @@ class EarningsCalendar:
                         future_dates = [
                             d.date() if hasattr(d, "date") else d
                             for d in eds.index
-                            if (d.date() if hasattr(d, "date") else d) >= date.today()
+                            if (d.date() if hasattr(d, "date") else d) >= now_et().date()
                         ]
                         if future_dates:
                             return EarningsInfo(

@@ -19,12 +19,27 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def apply_runtime_env_defaults() -> None:
-    """setdefault the protective/economic env contract, then load .env.
+    """Load .env, then setdefault the protective/economic env contract.
 
-    setdefault semantics: an explicitly exported env var (or a scheduled
-    task's environment) always wins; these are the safety net for bare
-    launches. .env loads LAST and fills only still-unset keys.
+    Precedence (highest wins): an explicitly exported env var (or a
+    scheduled task's environment) always wins, since it's already set
+    before this function runs either step. Then .env. Then these hardcoded
+    defaults, which exist purely as the safety net for a fully bare launch
+    with no .env and no exported vars at all.
+
+    R17: .env used to load LAST (after the setdefault calls below), so it
+    could never override any of these 7 vars — including
+    AIT_MARKET_DATA_TYPE, the delayed-vs-live data switch the code comment
+    two lines down says is meant to be flipped via config. .env is the only
+    documented user-facing config mechanism in this repo; it must actually
+    take effect. Loading it first is safe: _load_dotenv only touches
+    os/pathlib (no numpy/xgboost/pandas import), so it doesn't disturb the
+    KMP/OMP-guards-before-heavy-import constraint below — those still land
+    (via setdefault) before apply_runtime_env_defaults() returns, which is
+    what both entry points require.
     """
+    _load_dotenv(REPO_ROOT / ".env")
+
     # OpenMP conflict guard — MUST precede numpy/xgboost/lightgbm import
     # (c0000005 crash cluster, 2026-06-26).
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -51,8 +66,6 @@ def apply_runtime_env_defaults() -> None:
     # engine parity mirror.
     os.environ.setdefault("AIT_SKIP_MACRO_EVENTS", "1")
 
-    _load_dotenv(REPO_ROOT / ".env")
-
 
 def capital_base(default: float = 196_000.0) -> float:
     """R16: single authority for the equity base used in return/DD percentages.
@@ -63,11 +76,27 @@ def capital_base(default: float = 196_000.0) -> float:
     at go-live, off a base ~65x too large. Reads AIT_CAPITAL_BASE, else the
     live account snapshot cached by the bot, else the documented default.
     """
+    return _capital_base_with_source(default)[0]
+
+
+def capital_base_source(default: float = 196_000.0) -> str:
+    """R17: which tier `capital_base()` actually resolved from.
+
+    De-duplicating the three call sites (R16) didn't add any enforcement —
+    if AIT_CAPITAL_BASE is unset AND the bot has never cached a live NLV
+    (e.g. fresh go-live), capital_base() still silently returns the
+    hardcoded default with no warning. Callers that care whether that
+    happened in a LIVE (non-paper) context should check this.
+    """
+    return _capital_base_with_source(default)[1]
+
+
+def _capital_base_with_source(default: float) -> tuple[float, str]:
     import os as _os
     raw = _os.environ.get("AIT_CAPITAL_BASE")
     if raw:
         try:
-            return float(raw)
+            return float(raw), "env"
         except (TypeError, ValueError):
             pass
     try:  # live NLV cached by the account manager (bot writes it each cycle)
@@ -79,10 +108,10 @@ def capital_base(default: float = 196_000.0) -> float:
         ).fetchone()
         con.close()
         if row and float(row[0]) > 0:
-            return float(row[0])
+            return float(row[0]), "live_nlv"
     except Exception:  # noqa: BLE001
         pass
-    return default
+    return default, "default"
 
 
 def _load_dotenv(env_file: Path) -> None:
