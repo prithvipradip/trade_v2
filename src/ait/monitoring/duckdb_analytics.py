@@ -366,6 +366,9 @@ class DuckDBAnalytics:
             if downside_dev > 0:
                 snap.sortino_ratio = (mean_pnl / downside_dev) * ann
             elif mean_pnl > 0:
+                # R17: see the matching comment in monitoring/analytics.py --
+                # inconsistent with export.py's None convention, not unified
+                # (no current JSON consumer of this field).
                 snap.sortino_ratio = float("inf")
 
         # Drawdown — dd% measured against the EQUITY high-water mark where

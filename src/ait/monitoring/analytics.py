@@ -197,6 +197,14 @@ class TradeAnalytics:
             if downside_dev > 0:
                 metrics.sortino_ratio = (mean_pnl / downside_dev) * ann
             elif mean_pnl > 0:
+                # R17: inconsistent with dashboard/walkforward/export.py's
+                # _sortino_from_trades, which returns None for the identical
+                # "no losing trades" case (float("inf") isn't valid JSON).
+                # Not unified here: PerformanceMetrics.sortino_ratio is typed
+                # float (not float | None) with no current JSON consumer —
+                # widening the type has a ripple this fix doesn't need to
+                # take on. Sanitize at whatever boundary first serializes
+                # this to JSON, if one is ever added.
                 metrics.sortino_ratio = float("inf")
 
         # Maximum drawdown

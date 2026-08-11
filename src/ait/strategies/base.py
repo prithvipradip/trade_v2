@@ -133,6 +133,11 @@ class Strategy(ABC):
     # StrategySelector.generate_all_signals(risk_budget=...). None = no
     # constraint (paper big-account behavior). Strategies that build
     # defined-risk structures should cap width so max_loss fits this budget.
+    # R17: set by mutating this shared, long-lived instance (see
+    # selector.py), NOT thread/coroutine-safe. Safe today only because
+    # per-symbol scanning is strictly sequential — do not parallelize it
+    # without first threading risk_budget as an explicit
+    # generate_signals(...) parameter instead.
     risk_budget: float | None = None
 
     @property

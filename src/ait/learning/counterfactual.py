@@ -77,10 +77,18 @@ class CounterfactualTracker:
         # R5 audit: _scan_symbol fires every ~5 min — persistently-rejected
         # symbols generated hundreds of duplicate records/day, evicting older
         # records before the 24h min-age let them be scored (evaluation
-        # starved on every active day). One unevaluated record per
-        # (symbol, strategy, reason) at a time.
+        # starved on every active day). One record per (symbol, strategy,
+        # reason) per day.
+        #
+        # R17: originally gated on `not outcome_checked`, so once
+        # evaluate_outcomes() (the only code that ever flipped that flag)
+        # was deleted in R12-C, this became "one record per combo, ever" —
+        # a persistently-rejected symbol was recorded once and then silently
+        # dropped forever. Gate on same-day instead: still floods nothing,
+        # but the log keeps recording across days.
+        today = record.timestamp[:10]
         for _t in self._skipped:
-            if (not _t.outcome_checked and _t.symbol == symbol
+            if (_t.timestamp[:10] == today and _t.symbol == symbol
                     and _t.strategy == strategy
                     and _t.reject_reason == reject_reason):
                 return

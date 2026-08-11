@@ -55,6 +55,10 @@ from ait.utils.logging import get_logger, setup_logging
 
 log = get_logger("main")
 
+# R17: exceeds orchestrator._shutdown()'s own 15s notify-task drain, so a
+# graceful stop has room to actually send the "bot shutting down" message.
+GRACEFUL_SHUTDOWN_TIMEOUT = 30
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="AIT v2 - Autonomous Intelligent Trading")
@@ -62,6 +66,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--paper", action="store_true", help="Force paper trading mode")
     parser.add_argument("--dashboard-only", action="store_true", help="Run dashboard only")
     return parser.parse_args()
+
+
+async def _graceful_shutdown_bot_task(orchestrator, bot_task: asyncio.Task) -> None:
+    """R17: stop the orchestrator's run() loop gracefully before cancelling.
+
+    run()'s while-loop only reaches its post-loop await self._shutdown()
+    (notify-drain, etc.) after self._running goes False AND the current
+    phase-processing chunk returns -- hard-cancelling immediately injects
+    CancelledError wherever run() happens to be awaiting, unwinding it
+    before _shutdown() is ever called. Ask nicely first, with a bounded
+    grace window; cancel only if it doesn't exit in time -- same behavior
+    as before for a shutdown mid-long-wait, strictly better for the common
+    case (mid trading-loop, cadence tens of seconds).
+    """
+    await orchestrator.stop()
+    try:
+        await asyncio.wait_for(bot_task, timeout=GRACEFUL_SHUTDOWN_TIMEOUT)
+    except asyncio.TimeoutError:
+        log.warning("graceful_shutdown_timed_out_cancelling")
+        bot_task.cancel()
+        try:
+            await bot_task
+        except asyncio.CancelledError:
+            pass
 
 
 async def run_bot(args: argparse.Namespace) -> None:
@@ -142,6 +170,10 @@ async def run_bot(args: argparse.Namespace) -> None:
             [bot_task, shutdown_task],
             return_when=asyncio.FIRST_COMPLETED,
         )
+
+        if bot_task in pending:
+            await _graceful_shutdown_bot_task(orchestrator, bot_task)
+            pending.discard(bot_task)
 
         # Cancel remaining tasks
         for task in pending:

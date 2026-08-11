@@ -107,6 +107,10 @@ class StrategySelector:
                 # R7: hand every strategy the account's per-trade budget so
                 # defined-risk construction can fit the funded account, not
                 # just the paper one.
+                # R17: NOT coroutine-safe -- mutates the shared, long-lived
+                # strategy instance. Safe only because this loop is strictly
+                # sequential; do not parallelize per-symbol scanning without
+                # first threading risk_budget as an explicit parameter.
                 strategy.risk_budget = risk_budget
                 signals = strategy.generate_signals(
                     symbol=symbol,
