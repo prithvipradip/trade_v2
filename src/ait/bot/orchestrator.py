@@ -554,7 +554,9 @@ class TradingOrchestrator:
                 # Deep-audit BC-L2: deriving direction from P&L sign is
                 # meaningless for market-neutral strategies (a strangle win
                 # is NOT "bullish") and poisons drift accuracy tracking.
-                if trade.strategy not in ("iron_condor", "short_strangle"):
+                # R17: long_straddle is equally direction-agnostic (buys
+                # both a call and a put) and was missing from this list.
+                if trade.strategy not in ("iron_condor", "short_strangle", "long_straddle"):
                     actual_dir = "bullish" if realized_pnl > 0 else "bearish"
                     # R5 audit CRITICAL: predictions are recorded under
                     # "{symbol}-{direction}" (see _scan_symbol) but outcomes
@@ -1369,10 +1371,15 @@ class TradingOrchestrator:
                              p_big_move=f"{vm_pred.probability_big_move:.3f}",
                              threshold=vm_pred.threshold_pct,
                              horizon_days=vm_pred.horizon_days)
-                    for s in signals:
-                        if s.strategy_name == "long_straddle":
-                            s.confidence = vm_pred.probability_big_move
-                            model_overridden.add(s.strategy_name)
+                    # R17: unlike the range-model override above, this had no
+                    # entry_gates_enabled check at all — it applied
+                    # unconditionally whenever the model was trained,
+                    # regardless of the master ML-gate switch.
+                    if self._settings.ml.entry_gates_enabled:
+                        for s in signals:
+                            if s.strategy_name == "long_straddle":
+                                s.confidence = vm_pred.probability_big_move
+                                model_overridden.add(s.strategy_name)
 
             # Model-confidence floor — applies whenever a payoff-matched model
             # overrode a signal's confidence, REGARDLESS of which models are
@@ -1506,13 +1513,21 @@ class TradingOrchestrator:
         Previously both were stored per-contract (the quantity=1 value).
         Dormant while small-account sizing pins every trade to 1 lot; wrong the
         moment sizing scales past 1 (NLV>$10k, or a learning multiplier >1) —
-        i.e. exactly at Phase-2, on the go-live path. `is_defined_risk` holds
-        for every live strategy (all set max_loss>0); 0.0 is a defensive floor
-        for any future undefined-risk shape that leaves it unset.
+        i.e. exactly at Phase-2, on the go-live path.
+
+        R17: this used to return 0.0 whenever `is_defined_risk` was False —
+        but that flag governs trade-RANKING eligibility (base.py), not
+        whether a dollar-risk number exists. short_strangle (undefined-risk)
+        still carries a real, positive, stress-estimated max_loss
+        (straddles.py's `estimated_max_loss`), so it was being recorded as
+        $0 exposure — invisible to the aggregate capital-at-risk cap. Any
+        positive max_loss is real risk regardless of defined/undefined
+        status; only a genuinely unset max_loss floors to 0.0.
         """
-        if not signal.is_defined_risk:
-            return 0.0
-        return float(signal.max_loss or 0.0) * max(1, int(quantity))
+        max_loss = float(signal.max_loss or 0.0)
+        if max_loss > 0:
+            return max_loss * max(1, int(quantity))
+        return 0.0
 
     def _get_trade_budget(self) -> int:
         """Return how many trades are allowed this scan based on time of day.

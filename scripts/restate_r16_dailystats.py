@@ -39,15 +39,19 @@ def main() -> int:
         if row is not None:
             print("row already present — nothing to do")
             return 0
+        # R17: was hardcoded won=0/lost=1 regardless of the fetched pnl's
+        # sign. Harmless for this specific trade (a confirmed loss), but
+        # the label should be derived, not assumed.
+        won, lost = (1, 0) if pnl >= 0 else (0, 1)
         if not apply:
             print(f"DRY RUN: would INSERT daily_stats({DATE}, "
-                  f"lost=1, total_pnl={pnl})")
+                  f"won={won}, lost={lost}, total_pnl={pnl})")
             return 0
         db.execute(
             "INSERT OR REPLACE INTO daily_stats (date, trades_taken, "
             "trades_won, trades_lost, total_pnl, max_drawdown, "
             "day_trades_count, circuit_breaker_triggered) "
-            "VALUES (?, 0, 0, 1, ?, 0.0, 0, 0)", (DATE, pnl))
+            "VALUES (?, 0, ?, ?, ?, 0.0, 0, 0)", (DATE, won, lost, pnl))
         db.execute(
             "INSERT OR REPLACE INTO bot_state (key, value, updated_at) "
             "VALUES ('r16_dailystats_0722_backfill', ?, ?)",
