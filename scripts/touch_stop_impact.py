@@ -119,14 +119,14 @@ async def main():
             rows.append(await run_k(arm, bc, data))
         except Exception as e:  # noqa: BLE001
             print(f"[abl] {arm[0]} FAILED: {e}", flush=True)
-            rows.append({"arm": name, "error": str(e)[:200]})
+            rows.append({"arm": arm[0], "error": str(e)[:200]})
     print("\n[wingk] ===== RESULTS =====")
-    print(f"{'k':>4} {'win':>7} {'trades':>7} {'winrate':>8} {'PF':>7} {'DD%':>6} {'ret%':>7}")
+    print(f"{'arm':>20} {'win':>7} {'trades':>7} {'winrate':>8} {'PF':>7} {'DD%':>6} {'ret%':>7}")
     for r in rows:
         if "error" in r:
-            print(f"{r['k']:>4} ERROR {r['error'][:60]}")
+            print(f"{r.get('arm','?'):>20} ERROR {r['error'][:60]}")
         else:
-            print(f"{r['k']:>4} {r['windows']:>7} {r['n']:>7} {r['win_rate']:>8} "
+            print(f"{r['arm']:>20} {r['windows']:>7} {r['n']:>7} {r['win_rate']:>8} "
                   f"{r['pf']:>7} {r['max_dd_pct']:>6} {r['total_ret_pct']:>7}")
     (OUT / "results.json").write_text(json.dumps(rows, indent=1))
     print("[abl] apply PLAN rule: ML survives only if full_stack beats gate_only on BOTH pf AND max_dd_pct, n>=30 each")
