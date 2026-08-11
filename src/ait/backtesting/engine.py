@@ -1220,26 +1220,59 @@ class Backtester:
                 if stored > 0:
                     return stored
 
-        # Priority 2: VIX proxy from market context (scalar or DataFrame)
+        # Priority 2: VIX proxy from market context (scalar or DataFrame),
+        # scaled PER SYMBOL. R16: a flat 1.10 multiplier was applied to every
+        # underlying, but VIX measures SPX vol — QQQ and IWM are structurally
+        # more volatile. Measured against the real implied indices and 10y
+        # realized vol:
+        #   VXN/VIX  (NDX vs SPX, implied)  median 1.228   <- QQQ's true anchor
+        #   QQQ/SPY  (realized, 10y)        median 1.354
+        #   IWM/SPY  (realized, 10y)        median 1.465
+        # So 1.10 understated QQQ implied vol by ~12% at the median (and by
+        # ~34% on days like 2026-08-11: VIX 15.6 vs VXN 22.9) — biasing every
+        # simulated QQQ credit low and every expected-move wing narrow.
+        # SPY takes 1.00 (SPY IV ~ VIX by construction). QQQ takes the
+        # measured VXN/VIX median. IWM has no free implied index (RVX is not
+        # served by yfinance), so it takes its realized ratio shrunk by the
+        # same implied-vs-realized factor VXN/QQQ exhibits (1.228/1.354):
+        # 1.465 * 0.907 ~ 1.33. Override per symbol via AIT_BT_VOL_MULT_<SYM>.
         if market_context:
             vix = market_context.get("vix_close") or market_context.get("vix")
             if vix is not None:
+                mult = self._symbol_vol_multiplier()
                 if hasattr(vix, "reindex"):
                     # Full VIX DataFrame — align to current hist and take last value
                     vix_aligned = vix["Close"].reindex(hist.index, method="ffill")
                     if not vix_aligned.empty:
                         vix_val = float(vix_aligned.iloc[-1])
                         if vix_val > 0:
-                            return vix_val / 100.0 * 1.10
+                            return vix_val / 100.0 * mult
                 else:
                     vix_val = float(vix)
                     if vix_val > 0:
-                        return vix_val / 100.0 * 1.05
+                        return vix_val / 100.0 * mult
 
         # Priority 3: synthetic fallback
         close_arr = hist["Close"].values
         rv = realized_vol(close_arr, window=20)
         return rv * 1.15
+
+    # R16: VIX -> per-symbol implied-vol multipliers (see _get_iv). Unknown
+    # symbols keep the historical 1.10 so nothing silently changes for
+    # underlyings this calibration was never measured on.
+    _VOL_MULT_VS_VIX = {"SPY": 1.00, "QQQ": 1.228, "IWM": 1.33, "DIA": 0.98}
+    _VOL_MULT_DEFAULT = 1.10
+
+    def _symbol_vol_multiplier(self) -> float:
+        """Per-symbol VIX scaling, env-overridable for sensitivity runs."""
+        sym = (self._symbol or "").upper()
+        env = os.environ.get(f"AIT_BT_VOL_MULT_{sym}")
+        if env:
+            try:
+                return float(env)
+            except ValueError:
+                pass
+        return self._VOL_MULT_VS_VIX.get(sym, self._VOL_MULT_DEFAULT)
 
     def _build_position(
         self,
