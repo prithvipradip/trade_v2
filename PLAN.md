@@ -933,3 +933,33 @@ breaching those bounds, the floor STAYS 0.65 and velocity must be attacked elsew
 If the 0.50/0.55 arms show materially MORE trades at equal quality, that also means the
 08-08 confirm run's absolute numbers were measured at a floor we do not run - annotate
 that verdict accordingly.
+
+## 2026-08-11 - TOUCH-STOP MIRROR ADDED TO THE ENGINE (methodology fix; PRE-REGISTERED study)
+FINDING (user question, verified in code): every backtest this project has ever run steps
+ONE BAR PER DAY and evaluated exits against the daily CLOSE. Live's PRIMARY loss exit is
+the short-strike TOUCH, checked every 30s against spot. The engine never modelled it -
+its own comment called this "a documented structural divergence". So an intraday pierce
+that recovered by the bell was scored as an untouched winner, and EVERY verdict to date
+(wing_k, shadow R1-R3, both ablations, the range-floor sweep now running) measured a
+DIFFERENT EXIT POLICY than production runs - biased optimistic on exactly the days that
+hurt. This is the most likely single explanation for sim win rates of 77-84% against a
+live record of 7W/14.
+FIX (engine.py _check_exit_credit rule 0): daily High/Low BRACKET the true intraday path,
+so the touch is detected EXACTLY (no intraday bars needed) - if price reached 750 at any
+point, Low <= 750. The exit is repriced AT the touched strike (where live transacts), not
+at the close. Ordered BEFORE take-profit: live's 30s monitor sees the pierce first.
+AIT_BT_TOUCH_STOP=1 default (live parity); =0 restores legacy close-only for A/B only.
+Test-pinned (tests/test_r16_touch_stop.py, 10 tests incl. the recovered-pierce case).
+INTRADAY DATA (asked): Yahoo caps 5m at 60 days (4,606 bars) and 1h at 730 days; only
+daily reaches 11y. Local 5m store covers 2026-06-01+ only. So deep-history intraday is
+NOT available from the current sources - but it is also NOT needed for touch DETECTION,
+which High/Low gives exactly. Intraday would add fill-level realism and same-day
+put-vs-call touch SEQUENCING (rare); IBKR reqHistoricalData could backfill 1-2y of 5m
+with pacing if we later want that validation slice.
+STUDY PRE-REGISTERED (scripts/touch_stop_impact.py): identical arm (k=1.6, floor 0.10,
+gates ON, 11y), touch OFF vs ON. RULE: report the delta honestly whatever it shows; if
+PF/DD degrade materially under the touch stop, EVERY prior verdict is restated as
+measured-under-the-wrong-policy and the wing/gate decisions are RE-DERIVED from
+touch-on numbers before any further live change. Queued behind the range-floor sweep
+(CPU); NOTE the floor sweep is running the OLD close-only engine and its absolutes will
+need the same treatment - its arm-vs-arm ORDERING is still valid (consistent policy).

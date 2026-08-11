@@ -216,6 +216,12 @@ class Backtester:
             float(credit_loss_limit_mult) if credit_loss_limit_mult is not None
             else float(os.environ.get("AIT_CREDIT_LOSS_LIMIT", "0"))
         )
+        # R16: short-strike touch stop — live's PRIMARY loss exit, mirrored
+        # here at last via daily High/Low (they bracket the true intraday
+        # path). ON by default = live parity. AIT_BT_TOUCH_STOP=0 restores
+        # the old close-only behaviour for before/after comparisons ONLY.
+        self._touch_stop_enabled = (
+            os.environ.get("AIT_BT_TOUCH_STOP", "1") != "0")
         self._ic_min_credit = (
             float(ic_min_credit) if ic_min_credit is not None
             else float(os.environ.get("AIT_IC_MIN_CREDIT", "0.70"))
@@ -2043,9 +2049,19 @@ class Backtester:
         else:
             current_value *= (1 - exit_half_spread)  # Sell at bid
 
-        result = self._dispatch_exit_check(pos, trade_type, pnl_pct, current_date)
+        result = self._dispatch_exit_check(pos, trade_type, pnl_pct, current_date, row)
 
         if result is not None:
+            # R16 touch-stop: live transacts AT the touched strike intraday, not
+            # at the close. Reprice the structure at that level so a pierce that
+            # recovered by the bell is booked at what live would actually have
+            # paid — the whole point of modelling the touch.
+            if result.get("exit_reason") == "touch_stop":
+                _tu = float(result.pop("touch_underlying"))
+                current_value = self._reprice_position(pos, _tu, days_held, hist)
+                current_value *= (1 + exit_half_spread)
+                underlying = _tu
+
             # Calculate actual P&L
             pnl = self._calc_pnl(pos, current_value)
             result["pnl"] = round(pnl, 2)
@@ -2058,7 +2074,8 @@ class Backtester:
         return None
 
     def _dispatch_exit_check(
-        self, pos: dict, trade_type: str, pnl_pct: float, current_date: date
+        self, pos: dict, trade_type: str, pnl_pct: float, current_date: date,
+        row: pd.Series | None = None
     ) -> dict | None:
         """Route exit logic by trade type (R6 exit parity with live).
 
@@ -2069,7 +2086,7 @@ class Backtester:
         (trailing/breakeven when enabled, else fixed stop + profit target).
         """
         if trade_type == "credit":
-            return self._check_exit_credit(pos, pnl_pct, current_date)
+            return self._check_exit_credit(pos, pnl_pct, current_date, row)
         if self._trailing_stop_enabled:
             return self._check_exit_trailing(pos, pnl_pct, current_date)
         return self._check_exit_fixed(pos, pnl_pct, current_date)
@@ -2094,14 +2111,43 @@ class Backtester:
             return 0.30
         return 0.20
 
-    def _check_exit_credit(self, pos: dict, pnl_pct: float, current_date: date) -> dict | None:
+    def _check_exit_credit(self, pos: dict, pnl_pct: float, current_date: date,
+                           row: pd.Series | None = None) -> dict | None:
         """Credit-structure exits — R6 parity with live portfolio.py.
 
         pnl_pct is fraction of credit received (positive = value decayed).
-        Order mirrors live check_position(): (1) flat loss limit,
-        (2) DTE-laddered take-profit, (3) expiry-approaching close at
-        DTE<=5, (4) macro-event flatten (env-gated, same as live).
+        Order mirrors live check_position(): (0) SHORT-STRIKE TOUCH,
+        (1) flat loss limit, (2) DTE-laddered take-profit, (3)
+        expiry-approaching close at DTE<=5, (4) macro-event flatten.
         """
+        # 0. R16: SHORT-STRIKE TOUCH — live's PRIMARY loss exit, and until now
+        # the engine's single largest structural divergence. Live watches spot
+        # every 30s and closes the moment price reaches a short strike; the
+        # engine only ever saw the daily CLOSE, so an intraday pierce that
+        # recovered by the bell was scored as an untouched winner. Every study
+        # to date (wing_k, shadow R1-R3, ablations) therefore measured a
+        # DIFFERENT exit policy than the one running live — biased toward
+        # optimism precisely on the days that hurt.
+        # Daily High/Low bracket the true intraday path, so they detect the
+        # touch without intraday bars. The exit is priced AT the touched
+        # strike (the level live would have transacted at), not at the close.
+        if row is not None and self._touch_stop_enabled:
+            _sp = pos.get("short_put_strike")
+            _sc = pos.get("short_call_strike")
+            try:
+                _low = float(row["Low"]) if "Low" in row else None
+                _high = float(row["High"]) if "High" in row else None
+            except (TypeError, ValueError):
+                _low = _high = None
+            _touched = None
+            if _sp and _low is not None and _low <= float(_sp):
+                _touched = float(_sp)
+            elif _sc and _high is not None and _high >= float(_sc):
+                _touched = float(_sc)
+            if _touched is not None:
+                return {"exit_date": str(current_date),
+                        "exit_reason": "touch_stop",
+                        "touch_underlying": _touched}
         # HWM still tracked for journaling/analysis parity (live persists it
         # even though credit exits no longer trail off it).
         pos["high_water_mark"] = max(pos.get("high_water_mark", 0.0), pnl_pct)
