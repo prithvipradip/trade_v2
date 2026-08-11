@@ -1,0 +1,488 @@
+{
+  "window": 37,
+  "test_start": "2020-09-23",
+  "test_end": "2020-11-25",
+  "pnl": -3901.65,
+  "return_pct": -1.3006,
+  "trades": 5,
+  "win_rate": 0.6,
+  "sharpe": -1.572,
+  "max_drawdown": 2.0715,
+  "strategies": {
+    "iron_condor": 5
+  },
+  "best_params": {},
+  "trades_detail": [
+    {
+      "symbol": "IWM",
+      "strategy": "iron_condor",
+      "entry_date": "2020-10-08",
+      "entry_time": "2020-10-08",
+      "exit_date": "2020-10-19",
+      "exit_time": "2020-10-19",
+      "exit_reason": "take_profit_short",
+      "pnl": 1222.58,
+      "entry_confidence": 0.942,
+      "entry_regime": "range_bound",
+      "contracts": 11,
+      "n_legs": 4,
+      "hold_days": 11,
+      "entry_price": 2.3179,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 1.1545,
+      "entry_iv_rank": 0.2689,
+      "entry_vix_level": 0.5,
+      "credit": 2549.69,
+      "max_loss": 9382.23,
+      "return_pct": 0.1303,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 152.0,
+          "premium": 1.2748
+        },
+        {
+          "type": "long_put",
+          "strike": 141.0,
+          "premium": -0.1159
+        },
+        {
+          "type": "short_call",
+          "strike": 175.0,
+          "premium": 1.2748
+        },
+        {
+          "type": "long_call",
+          "strike": 186.0,
+          "premium": -0.1159
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.942,
+        "range_gate": {
+          "prob": 0.942,
+          "threshold": 0.5,
+          "pass": true
+        },
+        "vol_gate": {
+          "vol_10d": 0.1808,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.3423,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1919,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": 0.0177
+      },
+      "features_at_entry": {
+        "rsi_14": 61.43,
+        "macd_hist": 0.00857,
+        "bb_position": 1.021,
+        "atr_pct": 0.0251,
+        "realized_vol_20": 0.3116,
+        "iv_rank": 0.269,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.9
+      }
+    },
+    {
+      "symbol": "QQQ",
+      "strategy": "iron_condor",
+      "entry_date": "2020-10-13",
+      "entry_time": "2020-10-13",
+      "exit_date": "2020-10-15",
+      "exit_time": "2020-10-15",
+      "exit_reason": "thesis_invalidated:bullish@0.88",
+      "pnl": -103.94,
+      "entry_confidence": 0.8617,
+      "entry_regime": "range_bound",
+      "contracts": 7,
+      "n_legs": 4,
+      "hold_days": 2,
+      "entry_price": 3.643,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 3.7395,
+      "entry_iv_rank": 0.2281,
+      "entry_vix_level": 0.5,
+      "credit": 2550.1,
+      "max_loss": 9157.75,
+      "return_pct": -0.0113,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 279.0,
+          "premium": 2.0036
+        },
+        {
+          "type": "long_put",
+          "strike": 262.0,
+          "premium": -0.1822
+        },
+        {
+          "type": "short_call",
+          "strike": 314.0,
+          "premium": 2.0036
+        },
+        {
+          "type": "long_call",
+          "strike": 331.0,
+          "premium": -0.1822
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.8617,
+        "range_gate": {
+          "prob": 0.8617,
+          "threshold": 0.5,
+          "pass": true
+        },
+        "vol_gate": {
+          "vol_10d": 0.2865,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.1109,
+          "threshold": 0.2,
+          "pass": true
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1914,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": -0.0984
+      },
+      "features_at_entry": {
+        "rsi_14": 75.83,
+        "macd_hist": 0.00731,
+        "bb_position": 1.029,
+        "atr_pct": 0.0204,
+        "realized_vol_20": 0.264,
+        "iv_rank": 0.228,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.884
+      }
+    },
+    {
+      "symbol": "IWM",
+      "strategy": "iron_condor",
+      "entry_date": "2020-10-19",
+      "entry_time": "2020-10-19",
+      "exit_date": "2020-10-26",
+      "exit_time": "2020-10-26",
+      "exit_reason": "thesis_invalidated:bullish@0.85",
+      "pnl": 1193.27,
+      "entry_confidence": 0.9665,
+      "entry_regime": "range_bound",
+      "contracts": 12,
+      "n_legs": 4,
+      "hold_days": 7,
+      "entry_price": 2.189,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 1.1426,
+      "entry_iv_rank": 0.2558,
+      "entry_vix_level": 0.5,
+      "credit": 2626.8,
+      "max_loss": 9743.4,
+      "return_pct": 0.1225,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 151.0,
+          "premium": 1.204
+        },
+        {
+          "type": "long_put",
+          "strike": 141.0,
+          "premium": -0.1094
+        },
+        {
+          "type": "short_call",
+          "strike": 173.0,
+          "premium": 1.204
+        },
+        {
+          "type": "long_call",
+          "strike": 183.0,
+          "premium": -0.1094
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.9665,
+        "range_gate": {
+          "prob": 0.9665,
+          "threshold": 0.5,
+          "pass": true
+        },
+        "vol_gate": {
+          "vol_10d": 0.1704,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.0994,
+          "threshold": 0.2,
+          "pass": true
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1908,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": -0.0346
+      },
+      "features_at_entry": {
+        "rsi_14": 75.1,
+        "macd_hist": 0.00381,
+        "bb_position": 0.676,
+        "atr_pct": 0.0199,
+        "realized_vol_20": 0.2988,
+        "iv_rank": 0.256,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.9
+      }
+    },
+    {
+      "symbol": "IWM",
+      "strategy": "iron_condor",
+      "entry_date": "2020-11-05",
+      "entry_time": "2020-11-05",
+      "exit_date": "2020-11-23",
+      "exit_time": "2020-11-23",
+      "exit_reason": "expiry_approaching",
+      "pnl": -6262.32,
+      "entry_confidence": 0.7899,
+      "entry_regime": "trending_up",
+      "contracts": 15,
+      "n_legs": 4,
+      "hold_days": 18,
+      "entry_price": 1.9433,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 6.0662,
+      "entry_iv_rank": 0.2014,
+      "entry_vix_level": 0.5,
+      "credit": 2914.95,
+      "max_loss": 10173.3,
+      "return_pct": -0.6156,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 157.0,
+          "premium": 1.0688
+        },
+        {
+          "type": "long_put",
+          "strike": 148.0,
+          "premium": -0.0972
+        },
+        {
+          "type": "short_call",
+          "strike": 175.0,
+          "premium": 1.0688
+        },
+        {
+          "type": "long_call",
+          "strike": 184.0,
+          "premium": -0.0972
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.7899,
+        "range_gate": {
+          "prob": 0.7899,
+          "threshold": 0.5,
+          "pass": true
+        },
+        "vol_gate": {
+          "vol_10d": 0.3223,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.2171,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "trending_up",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1891,
+          "blocked": false
+        },
+        "regime_class": "trending_up",
+        "iv_rank_rise_10d": 0.0606
+      },
+      "features_at_entry": {
+        "rsi_14": 53.9,
+        "macd_hist": 0.00033,
+        "bb_position": 0.854,
+        "atr_pct": 0.0226,
+        "realized_vol_20": 0.246,
+        "iv_rank": 0.201,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.9
+      }
+    },
+    {
+      "symbol": "IWM",
+      "strategy": "iron_condor",
+      "entry_date": "2020-11-23",
+      "entry_time": "2020-11-23",
+      "exit_date": "2020-11-25",
+      "exit_time": "2020-11-25",
+      "exit_reason": "backtest_end",
+      "pnl": 48.76,
+      "entry_confidence": 0.9987,
+      "entry_regime": "range_bound",
+      "contracts": 11,
+      "n_legs": 4,
+      "hold_days": 2,
+      "entry_price": 2.3686,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 2.2723,
+      "entry_iv_rank": 0.2504,
+      "entry_vix_level": 0.5,
+      "credit": 2605.46,
+      "max_loss": 9412.37,
+      "return_pct": 0.0052,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 171.0,
+          "premium": 1.3027
+        },
+        {
+          "type": "long_put",
+          "strike": 160.0,
+          "premium": -0.1184
+        },
+        {
+          "type": "short_call",
+          "strike": 194.0,
+          "premium": 1.3027
+        },
+        {
+          "type": "long_call",
+          "strike": 205.0,
+          "premium": -0.1184
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.9987,
+        "range_gate": {
+          "prob": 0.9987,
+          "threshold": 0.5,
+          "pass": true
+        },
+        "vol_gate": {
+          "vol_10d": 0.223,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.1267,
+          "threshold": 0.2,
+          "pass": true
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1873,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": 0.049
+      },
+      "features_at_entry": {
+        "rsi_14": 82.52,
+        "macd_hist": 0.00668,
+        "bb_position": 0.834,
+        "atr_pct": 0.0262,
+        "realized_vol_20": 0.2936,
+        "iv_rank": 0.25,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.9
+      }
+    }
+  ],
+  "model_weights": {
+    "range_predictor": {
+      "status": "ok",
+      "threshold_pct": 0.0772,
+      "fitted_weights": {
+        "xgboost": 0.48387096774193555,
+        "lightgbm": 0.5161290322580645
+      },
+      "cv_scores": {
+        "xgboost": 0.75,
+        "lightgbm": 0.7666666666666666
+      },
+      "in_range_rate": 0.359375,
+      "oos_scores": {
+        "n_samples": 25,
+        "base_rate": 0.44,
+        "ml": {},
+        "statistical": {}
+      }
+    },
+    "direction_predictor": {
+      "fitted_weights": {
+        "xgboost": 0.5,
+        "lightgbm": 0.5
+      },
+      "cv_scores": {
+        "xgboost": 0.47086402670042377,
+        "lightgbm": 0.48874685363655956
+      }
+    }
+  }
+}

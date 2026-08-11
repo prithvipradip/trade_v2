@@ -46,7 +46,8 @@ async def run_k(arm, bc, data):
     name, train_ml = arm
     k = 0.8
     cfg = WalkForwardConfig(
-        wing_k=0.8,
+        wing_k=1.6,  # R16: live-promoted value (was 0.8 - a clone defect that
+        # measured the floor sweep at pre-promotion wings)
         train_window_models=True,
         range_min_confidence=train_ml,
         # R16 RERUN: 365 calendar days (~252 trading rows) so ~190
@@ -63,7 +64,7 @@ async def run_k(arm, bc, data):
         spread_iv_sensitivity=bc.spread_iv_sensitivity,
         spread_dte_sensitivity=bc.spread_dte_sensitivity,
         spread_cap=bc.spread_cap,
-        ic_min_credit_width=0.20,
+        ic_min_credit_width=0.10,  # live-promoted scaled floor
     )
     bt = WalkForwardBacktester(SYMBOLS, ["iron_condor"], config=cfg,
                                db_path=ROOT / "data" / "historical.db",
