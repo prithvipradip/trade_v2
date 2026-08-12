@@ -288,6 +288,27 @@ async def test_ladder_escalates_honors_debit_cap_and_times_out(env):
     assert order_id not in env.executor._pending_orders
 
 
+async def test_multi_contract_debit_cap_stays_per_contract(env):
+    """R17 (found in passing, not one of the original 20): signal.max_loss is
+    ALWAYS a per-contract figure (every strategy builds its signal at
+    quantity=1) and so is the limit price the cap bounds — contracts sized
+    >1 must not shrink the cap. Pre-fix, `max_loss / (100 * contracts)`
+    clamped a 2-contract $210/contract spread's cap to $1.05 instead of
+    $2.10, pricing every escalation step below any real market and letting
+    the order time out unfilled — silently killing every multi-contract
+    debit entry once sizing scales past 1 lot."""
+    trade_id, order_id = await _place(env, _debit_spread_signal(2.00, 210.0), contracts=3)
+    pending = env.executor._pending_orders[order_id]
+
+    # Cap must stay per-contract ($2.10), not shrink to 210/(100*3)=$0.70.
+    assert pending.debit_cap == pytest.approx(2.10)
+
+    order = env.ib.openTrades()[0].order
+    pending.submitted_at -= 92  # step 2: 100% of the marketable offset
+    await env.executor._cancel_stale_orders()
+    assert order.lmtPrice == pytest.approx(2.10)
+
+
 # ---------------------------------------------------------------------------
 # 5. reconcile: promotes live PENDING, sweeps dead PENDING
 # ---------------------------------------------------------------------------

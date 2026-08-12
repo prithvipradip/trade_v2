@@ -630,9 +630,19 @@ class TradeExecutor:
         # the worst-case cost past the max_loss the risk manager validated —
         # a systematic ~15% understatement. Cap the limit at the validated
         # per-contract loss so the risk check stays truthful.
+        #
+        # R17: signal.max_loss is ALWAYS a per-contract figure (every
+        # strategy builds its signal at quantity=1 -- spreads.py/
+        # straddles.py compute `max_loss = net_debit * 100`; SR-M6). limit_price
+        # is likewise a per-share, per-contract price, unaffected by how
+        # many contracts this order actually sizes to. Dividing by
+        # `contracts` a second time shrank the cap by that factor for any
+        # multi-contract order, clamping limit_price to an unfillable price
+        # and silently killing the entry (reprice ladder re-clamps to the
+        # same wrong cap every escalation, times out ~4 min later).
         _debit_cap = 0.0
         if not is_credit and signal.max_loss and contracts > 0:
-            _validated = signal.max_loss / (100 * contracts)
+            _validated = signal.max_loss / 100
             _debit_cap = round(_validated, 2)
             if limit_price > _validated > 0:
                 limit_price = round(_validated, 2)
