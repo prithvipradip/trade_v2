@@ -69,12 +69,28 @@ class TestGetIV:
         assert np.isfinite(result)
 
     def test_vix_proxy_scalar_produces_plausible_iv(self) -> None:
+        # R16: the scalar path used x1.05 while the DataFrame path used x1.10
+        # for the SAME VIX reading — an inconsistency, not a design. Both now
+        # use the per-symbol multiplier (_symbol_vol_multiplier). An
+        # unspecified symbol keeps the historical 1.10 default.
         bt = _make_backtester(iv_floor=0.20)
         hist = _make_ohlcv(60)
         market_ctx = {"vix_close": 22.0}
         result = bt._get_iv(hist, market_context=market_ctx)
-        assert pytest.approx(result, abs=0.01) == 22.0 / 100.0 * 1.05
-        assert result < 2.0
+        assert pytest.approx(result, abs=0.01) == 22.0 / 100.0 * 1.10
+
+    def test_vix_proxy_is_per_symbol(self):
+        """SPY ~ VIX; QQQ carries the measured VXN/VIX premium (1.228)."""
+        hist = _make_ohlcv(60)
+        ctx = {"vix_close": 20.0}
+        spy = _make_backtester(iv_floor=0.20, symbol="SPY")
+        qqq = _make_backtester(iv_floor=0.20, symbol="QQQ")
+        iwm = _make_backtester(iv_floor=0.20, symbol="IWM")
+        assert pytest.approx(spy._get_iv(hist, market_context=ctx), abs=0.001) == 0.200
+        assert pytest.approx(qqq._get_iv(hist, market_context=ctx), abs=0.001) == 0.2456
+        assert pytest.approx(iwm._get_iv(hist, market_context=ctx), abs=0.001) == 0.266
+        # and the ordering that matters: QQQ/IWM are never priced BELOW SPY
+        assert qqq._get_iv(hist, market_context=ctx) > spy._get_iv(hist, market_context=ctx)
 
     def test_vix_proxy_dataframe_produces_plausible_iv(self) -> None:
         bt = _make_backtester(iv_floor=0.20)

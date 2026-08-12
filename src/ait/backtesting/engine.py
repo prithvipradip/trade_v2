@@ -161,6 +161,16 @@ class Backtester:
         self._spread_iv_sensitivity = spread_iv_sensitivity
         self._spread_dte_sensitivity = spread_dte_sensitivity
         self._spread_cap = spread_cap
+        # R16: prefer EMPIRICALLY CALIBRATED per-symbol spreads over the
+        # config formula. scripts/calibrate_option_spreads.py fits the model
+        # to real observed bid/ask quotes and stores it in
+        # option_spread_params — a table that existed, was never populated,
+        # and (once populated) was still read by nothing. Measured 2026-08-11
+        # on 3,159 quotes, config's base=0.04 overstates the real base by
+        # 2-13x (SPY 0.012 / QQQ 0.003 / IWM 0.020), so every simulated
+        # credit has been charged too much friction. AIT_BT_CALIBRATED_SPREADS=0
+        # restores the config formula for A/B runs.
+        self._calibrated_spreads = None
         self._position_size_pct = position_size_pct
         self._stop_loss_pct = stop_loss_pct
         self._profit_target_pct = profit_target_pct
@@ -196,6 +206,9 @@ class Backtester:
         self._max_entry_vol_annual = max_entry_vol_annual
         self._market_context = market_context
         self._symbol = symbol or ""
+        # R16: must run AFTER _symbol is set — the calibration is per-symbol.
+        if os.environ.get("AIT_BT_CALIBRATED_SPREADS", "1") != "0":
+            self._load_calibrated_spreads()
         self._earnings_dates: set[date] = self._load_earnings_dates(symbol, earnings_skip_days)
         self._intraday_store = intraday_store
         self._scan_interval_minutes = scan_interval_minutes
@@ -1262,6 +1275,33 @@ class Backtester:
     # underlyings this calibration was never measured on.
     _VOL_MULT_VS_VIX = {"SPY": 1.00, "QQQ": 1.228, "IWM": 1.33, "DIA": 0.98}
     _VOL_MULT_DEFAULT = 1.10
+
+    def _load_calibrated_spreads(self) -> None:
+        """R16: adopt fitted per-symbol spread params when they exist.
+
+        Silent no-op when the symbol has no calibration (keeps the config
+        formula), so an uncalibrated underlying behaves exactly as before.
+        """
+        sym = (self._symbol or "").upper()
+        if not sym:
+            return
+        try:
+            from ait.data.historical import HistoricalDataStore
+            p = HistoricalDataStore().load_spread_params(sym)
+            if not p:
+                return
+            self._spread_base = float(p.get("spread_base", self._spread_base))
+            self._spread_iv_sensitivity = float(
+                p.get("spread_iv_sensitivity", self._spread_iv_sensitivity))
+            self._spread_dte_sensitivity = float(
+                p.get("spread_dte_sensitivity", self._spread_dte_sensitivity))
+            self._calibrated_spreads = p
+            log.info("calibrated_spreads_loaded", symbol=sym,
+                     base=round(self._spread_base, 5),
+                     iv_sens=round(self._spread_iv_sensitivity, 5),
+                     dte_sens=round(self._spread_dte_sensitivity, 6))
+        except Exception as e:  # noqa: BLE001 — never block a run on this
+            log.debug("calibrated_spreads_unavailable", symbol=sym, error=str(e))
 
     def _symbol_vol_multiplier(self) -> float:
         """Per-symbol VIX scaling, env-overridable for sensitivity runs."""

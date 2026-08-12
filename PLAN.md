@@ -963,3 +963,39 @@ measured-under-the-wrong-policy and the wing/gate decisions are RE-DERIVED from
 touch-on numbers before any further live change. Queued behind the range-floor sweep
 (CPU); NOTE the floor sweep is running the OLD close-only engine and its absolutes will
 need the same treatment - its arm-vs-arm ORDERING is still valid (consistent policy).
+
+## 2026-08-11 - SIM FIDELITY: three measurement corrections landed (suite 1025 green)
+Prompted by the user's question "are we only testing against closing values?". All three
+were REAL biases in every study this project has ever run, and they do NOT point the same
+way - which is why no verdict should be re-derived until a study runs with all three.
+ 1. TOUCH STOP (methodology, biggest): engine now mirrors live's short-strike exit via
+    daily High/Low (they bracket the intraday path, so detection is exact without
+    intraday bars); exit repriced AT the touched strike. MEASURED IMPACT (identical arm,
+    k=1.6/0.10, gates on, 11y, 34 windows):
+        touch OFF  n=82 win 68.3% PF 1.38 DD 5.38% ret 1.86%
+        touch ON   n=87 win 60.9% PF 1.30 DD 3.88% ret 1.45%
+    -> sim was OPTIMISTIC by 7.4pp of win rate and 0.08 PF, but PESSIMISTIC on drawdown
+    (-28%). Explains a large part of the 77-84% sim win rate vs 8W/15 live. Prior
+    arm-vs-arm verdicts stand (the policy applies uniformly to all arms); the ABSOLUTE
+    win rates we have quoted are restated ~7pp lower.
+ 2. PER-SYMBOL IMPLIED VOL: the engine applied VIX x1.10 to every underlying. Measured
+    VXN/VIX (NDX vs SPX, implied) median 1.228 over 2,918 days; realized ratios 10y are
+    QQQ/SPY 1.354, IWM/SPY 1.465. Now SPY x1.00, QQQ x1.228, IWM x1.33 (RVX is not
+    served by yfinance, so IWM uses its realized ratio shrunk by QQQ's implied/realized
+    factor). QQQ - our most-traded symbol - had its IV understated ~12% at the median and
+    ~34% on 2026-08-11 (VIX 15.6 vs VXN 22.9), biasing credits low and wings narrow.
+    Also unified the scalar-vs-DataFrame VIX paths (they used 1.05 vs 1.10 for the same
+    reading - an inconsistency the old test had pinned).
+ 3. EMPIRICAL SPREADS: option_spread_samples/params existed, had NEVER been populated,
+    and (once populated) were read by NOTHING. calibrate_option_spreads.py crashed on a
+    cp1252 arrow char AFTER writing SPY but BEFORE QQQ/IWM - which is why it looked like
+    it had never worked. Fixed + stdout hardened; captured 3,159 real quotes (7-45 DTE).
+    Fitted base spread SPY 0.0123 / QQQ 0.0027 / IWM 0.0197 vs config 0.04 - we were
+    charging 2-13x the real friction (a PESSIMISTIC bias). Engine now loads calibrated
+    per-symbol params (AIT_BT_CALIBRATED_SPREADS=0 to A/B).
+FREE OPTIONS DATA (asked): DoltHub post-no-preference/options is genuinely free with real
+bid/ask/IV/greeks and is updated daily, BUT SPY has only ~4 expirations / 33 strikes per
+date and QQQ/IWM are ABSENT - unusable as a backtest source. Alpha Vantage historical
+options needs a (free) user key; CBOE/ORATS/OptionMetrics are paid. Conclusion: keep
+building OUR OWN dataset via the now-working calibration capture.
+NEXT: re-parameterized range-floor sweep is the FIRST study with all three corrections.
