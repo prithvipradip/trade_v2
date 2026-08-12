@@ -146,8 +146,14 @@ def _gateway_listening(port: int, host: str = "127.0.0.1") -> bool:
 # The keeper's 90s loop and the 07:30 AIT-Bot-Start task both guard with a
 # check-then-launch process-table query — no lock — so two masters can pass
 # the guard inside the same ~1-2s window (TOCTOU). An OS-level exclusive byte
-# lock is atomic and self-releasing: msvcrt region locks die with the process,
-# so there is no stale-pidfile problem to detect.
+# lock is atomic and self-releasing: the lock dies with the process, so there
+# is no stale-pidfile problem to detect. msvcrt.locking() on Windows (the
+# production platform); fcntl.flock() on POSIX (CI runs ubuntu-latest, and
+# this also lets the mechanism be exercised on a macOS dev box) — both are
+# per-open-handle exclusive locks that release when the holding process
+# dies, so a second handle in the SAME process still conflicts with the
+# first (the atomicity guard the check-then-launch .bat lacked) and cross-
+# process exclusion behaves identically either way.
 
 _singleton_lock_handle = None  # module-held: lock lives exactly as long as this process
 
@@ -155,14 +161,18 @@ _singleton_lock_handle = None  # module-held: lock lives exactly as long as this
 def _acquire_singleton_lock(lock_path: Path | None = None) -> bool:
     """Atomically claim the single-orchestrator lock. False = already held."""
     global _singleton_lock_handle
-    import msvcrt
     path = lock_path or (DATA_DIR / "orchestrator.lock")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fh = open(path, "a+")
         fh.seek(0)  # locking() operates from the fd's current position
         try:
-            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            if sys.platform == "win32":
+                import msvcrt
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             fh.close()
             return False
@@ -184,10 +194,14 @@ def _release_singleton_lock() -> None:
     global _singleton_lock_handle
     if _singleton_lock_handle is None:
         return
-    import msvcrt
     try:
         _singleton_lock_handle.seek(0)
-        msvcrt.locking(_singleton_lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(_singleton_lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(_singleton_lock_handle.fileno(), fcntl.LOCK_UN)
     except OSError:
         pass
     try:
