@@ -491,6 +491,8 @@ class TestReportPathIsReadOnly:
     def _condor(self):
         return SimpleNamespace(
             trade_id="T-LIVE", symbol="SPY", strategy="iron_condor",
+            # status is what get_portfolio_summary filters on
+            status=TradeStatus.FILLED,
             contract_type="iron_condor", quantity=1, entry_price=4.24,
             direction=SimpleNamespace(value="neutral"),
             expiry=None, strike=None, entry_time="2026-08-04T10:51:37",
@@ -523,10 +525,32 @@ class TestReportPathIsReadOnly:
         assert pm._touch_confirm.get("T-LIVE") is None
         assert st.should_exit is False  # 1 tick on a degraded quote != exit
 
-    def test_summary_calls_evaluate_with_persist_false(self):
-        import inspect
-        src = inspect.getsource(PortfolioManager.get_portfolio_summary)
-        assert "persist=False" in src
+    async def test_summary_call_does_not_consume_a_touch_streak(self):
+        """The EOD/report caller, end to end.
+
+        R17-bis: this was `assert "persist=False" in
+        inspect.getsource(get_portfolio_summary)` — satisfied by the string
+        appearing anywhere (a dead branch, a comment, a different call), and
+        by nothing at all if the loop is reshaped. get_portfolio_summary was
+        otherwise never CALLED by any test in the suite, so the report path
+        that mutates live protection state had zero executable coverage.
+        Drive it for real: same rule-1b scenario as the test above, reached
+        through the public method instead of _evaluate_position directly.
+        """
+        trade = self._condor()
+        pm = self._evaluable(spot=700.0)    # spot back INSIDE the short strikes
+        pm._state.get_open_trades.return_value = [trade]
+        pm._state.get_daily_stats.return_value = SimpleNamespace(
+            total_pnl=12.5, trades_taken=1)
+        pm._touch_confirm["T-LIVE"] = 1
+
+        summary = await pm.get_portfolio_summary()
+
+        # the position was actually priced (not skipped by the status filter),
+        # so the touch-streak assertion below is about a real evaluation
+        assert summary["open_positions"] == 1
+        assert summary["today_realized_pnl"] == 12.5
+        assert pm._touch_confirm.get("T-LIVE") == 1  # persist=True: wiped
 
 
 # --- [7] the inert delta rule must announce itself --------------------------

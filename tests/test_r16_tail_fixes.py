@@ -30,6 +30,7 @@ import os
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
 import pandas as pd
@@ -488,16 +489,24 @@ class TestLiquidityThresholdAuthority:
         assert (min_vol, min_oi, max_spread) != (50, 100, 0.15)
 
 
-def _chain_service_get_chain():
-    from ait.data.options_chain import OptionsChainService
-    return OptionsChainService.get_chain
-
-
 class TestChainSourceTelemetry:
 
     def _svc(self):
         from ait.data.options_chain import OptionsChainService
         return OptionsChainService.__new__(OptionsChainService)
+
+    def _wired_svc(self, *, ibkr_chains, yahoo_chains):
+        """A real OptionsChainService with only the two FEEDS stubbed, so
+        get_chain's own resolution/stamping/caching logic runs unmodified."""
+        from ait.config.settings import OptionsConfig
+        from ait.data.options_chain import OptionsChainService
+        svc = OptionsChainService(ibkr_client=MagicMock(connected=False),
+                                  market_data=MagicMock(),
+                                  config=OptionsConfig())
+        svc._market_data.get_current_price = AsyncMock(return_value=100.0)
+        svc._get_ibkr_chain = AsyncMock(return_value=ibkr_chains)
+        svc._get_yahoo_chain = AsyncMock(return_value=yahoo_chains)
+        return svc
 
     def _chain(self):
         return OptionsChain(symbol="SPY", underlying_price=100.0,
@@ -528,9 +537,36 @@ class TestChainSourceTelemetry:
             svc._log_chain_source("SPY", "yahoo_delayed", [])
         assert _has_event(events, "chain_source_unavailable")
 
-    def test_get_chain_stamps_the_source_it_used(self):
-        assert "chain.source = source" in inspect.getsource(
-            _chain_service_get_chain())
+    async def test_get_chain_stamps_the_yahoo_fallback_it_used(self):
+        """R17-bis: was `assert "chain.source = source" in getsource(get_chain)`
+        — true of a line in a dead branch, of a line that assigns the wrong
+        variable's value, and of a line whose loop no longer runs. get_chain
+        was never executed by any test, so the stamp that every downstream
+        feed-attribution check depends on had no executable coverage."""
+        chain = self._chain()
+        assert chain.source == ""          # unstamped until get_chain says so
+        svc = self._wired_svc(ibkr_chains=[], yahoo_chains=[chain])
+
+        with structlog_events() as events:
+            out = await svc.get_chain("SPY")
+
+        assert [c.source for c in out] == ["yahoo_delayed"]
+        rec = [e for e in events if e.get("event") == "chain_source_degraded"]
+        assert rec and rec[0]["log_level"] == "warning"
+
+    async def test_get_chain_stamps_ibkr_when_ibkr_served_it(self):
+        # Negative control: a hardcoded "yahoo_delayed" (or a stamp taken from
+        # the wrong branch) must not pass the test above.
+        chain = self._chain()
+        svc = self._wired_svc(ibkr_chains=[chain], yahoo_chains=[])
+
+        with structlog_events() as events:
+            out = await svc.get_chain("SPY")
+
+        assert [c.source for c in out] == ["ibkr"]
+        svc._get_yahoo_chain.assert_not_awaited()   # no needless fallback
+        assert not _has_event(events, "chain_source_degraded")
+        assert _has_event(events, "chain_source")
 
     def test_source_survives_filtering(self):
         from ait.config.settings import OptionsConfig

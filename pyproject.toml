@@ -97,6 +97,15 @@ markers = [
 ]
 
 [tool.mypy]
-python_version = "3.11"
+# Must match requires-python / the CI matrix / the live venv (all 3.13) —
+# this said 3.11, so mypy was reasoning about a runtime nobody uses.
+python_version = "3.13"
+# Resolve `ait.*` from the source tree rather than relying on an editable
+# install being present (scripts/typecheck.py runs before/without one).
+mypy_path = "src"
 warn_return_any = true
 warn_unused_configs = true
+# The blocking gate lives in scripts/typecheck.py, NOT here: `mypy src` is at
+# ~221 errors (mostly missing third-party stubs), so a whole-tree gate would
+# be permanently red. typecheck.py fails only on the crash-class codes
+# (attr-defined / name-defined / call-arg) in config/bot/execution/risk.

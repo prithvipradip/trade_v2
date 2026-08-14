@@ -8,6 +8,12 @@
 #     failure list surfaces in one run
 #   - slow lane (nightly cron):  -m "slow and not ibkr", 120-min budget
 #   - byte-compile ALL of src (catches syntax errors in never-imported modules)
+#   - type gate (2026-08 incident): `self._settings.trading.strategies` — the
+#     field lives on OptionsConfig, not TradingConfig — raised AttributeError
+#     inside the trading cycle 595 times over 3 days. mypy flags it as
+#     [attr-defined] statically. `mypy src` is at ~221 errors so it can only be
+#     informational; the BLOCKING check is scripts/typecheck.py, which fails on
+#     attr-defined/name-defined/call-arg in config/bot/execution/risk only.
 # The old --ignore flags for test_integration.py / test_full_integration.py
 # are gone: both modules self-skip unless RUN_INTEGRATION_TESTS=1.
 # NOT here (future work):
@@ -56,6 +62,25 @@ jobs:
 
       - name: Byte-compile src (syntax errors anywhere fail the build)
         run: python -m compileall -q src
+
+      # Full-tree mypy: ~221 errors today (mostly missing third-party stubs +
+      # no-any-return), so it CANNOT block — it is here for visibility and to
+      # track the debt down. Never let this one turn red-and-ignored; the
+      # blocking signal is the next step.
+      - name: mypy (whole src — informational, non-blocking)
+        continue-on-error: true
+        run: python -m mypy src --no-error-summary
+
+      # BLOCKING type gate. `self._settings.trading.strategies` (the field is
+      # on OptionsConfig, not TradingConfig) crashed the trading cycle 595x
+      # over 3 days; the config models are typed pydantic, so mypy calls that
+      # [attr-defined] at commit time. This step fails ONLY on the "name /
+      # attribute / argument does not exist" codes, only in config, bot,
+      # execution and risk — see scripts/typecheck.py for the full rationale
+      # and for how to ratchet more codes in. Runs before the tests because it
+      # takes ~40s and, unlike a test failure, every hit is a real defect.
+      - name: Type gate (blocking — attr-defined/name-defined/call-arg)
+        run: python scripts/typecheck.py
 
       - name: Unit tests (fast lane)
         run: python -m pytest tests/ -q -m "not ibkr and not slow"

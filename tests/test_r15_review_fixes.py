@@ -4,12 +4,14 @@ code by construction (asserts the corrected behavior the review proved wrong).
 """
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from ait.backtesting.engine import Backtester
 from ait.bot.orchestrator import TradingOrchestrator
 from ait.bot.state import TradeStatus
 from ait.broker.ibkr_client import IBKRClient
@@ -266,21 +268,107 @@ class TestPreEventBlackoutRelaxed:
         for d2e, expect_block in [(0, True), (1, True), (2, False), (4, False)]:
             assert (d2e <= blackout) is expect_block
 
-    def test_defined_risk_exempt_from_macro_flatten(self):
-        # the paired exit rule: condors HOLD through events (wings cap the
-        # surprise) — else entries at d2e=2 get force-closed at d2e=1 for one
-        # day of theta and full round-trip costs. Undefined-risk keeps it.
-        import inspect
-        from ait.execution import portfolio
-        from ait.backtesting import engine
-        for mod in (portfolio, engine):
-            src = inspect.getsource(mod)
-            i = src.find("AIT_SKIP_MACRO_EVENTS")
-            while i != -1:
-                clause = src[i:i + 400]
-                if "short_strangle" in clause:
-                    assert '"iron_condor"' not in clause
-                i = src.find("AIT_SKIP_MACRO_EVENTS", i + 1)
+    # --- the paired EXIT rule, driven through both engines -------------------
+    # Condors HOLD through events (the wings cap the surprise and the post-
+    # event vol crush is the trade's payoff) — else entries at d2e=2 get
+    # force-closed at d2e=1 for one day of theta and a full round trip.
+    # Undefined risk (strangle/CSP/CC, and jade_lizard in the engine) keeps
+    # the early exit.
+    #
+    # R17-bis: this pair replaces a `while i != -1` source scan whose body was
+    # guarded by `if "short_strangle" in clause` — reshaping the condition,
+    # renaming the strategy, or widening the 400-char window made the loop
+    # assert NOTHING while staying green. Both flatten rules now execute.
+
+    def _live_pm(self, *, d2e):
+        """PortfolioManager wired far enough to run _evaluate_position."""
+        from ait.config.settings import ExitConfig
+        from ait.execution.portfolio import PortfolioManager
+        pm = PortfolioManager.__new__(PortfolioManager)
+        pm._last_quote_ts = {}
+        pm._frozen_alerted = set()
+        pm._touch_confirm = {}
+        pm._marks_missing_streak = {}
+        pm._pdt_alerted = set()
+        pm._notify_cb = None
+        pm._earnings = None
+        pm._exit_config = ExitConfig()
+        pm._quality = MagicMock()
+        pm._quality.validate_quote.return_value = SimpleNamespace(
+            is_valid=True, issues=[], staleness_seconds=1.0)
+        pm._ibkr = MagicMock()
+        pm._ibkr.connected = False
+        pm._market_data = MagicMock()
+        pm._market_data.get_quote = AsyncMock(return_value=SimpleNamespace(
+            mid=700.0, bid=699.99, ask=700.01, last=700.0, volume=1000,
+            timestamp=datetime(2026, 8, 10, 14, 0, 0)))
+        pm._option_position_unrealized = lambda *a, **k: 12.0  # small winner
+        pm._state = MagicMock()
+        pm._state.get_high_water_mark.return_value = 0.05
+        pm._pdt_guard = MagicMock()
+        pm._pdt_guard.would_be_day_trade.return_value = False
+        cal = MagicMock()
+        cal.days_until_next_event.return_value = d2e
+        pm._economic_cal = cal
+        return pm
+
+    def _live_trade(self, strategy):
+        legs = [{"strike": 690.0, "right": "P", "action": "SELL"},
+                {"strike": 720.0, "right": "C", "action": "SELL"}]
+        if strategy == "iron_condor":
+            legs += [{"strike": 660.0, "right": "P", "action": "BUY"},
+                     {"strike": 750.0, "right": "C", "action": "BUY"}]
+        return SimpleNamespace(
+            trade_id=f"T-{strategy}", symbol="SPY", strategy=strategy,
+            contract_type=strategy, quantity=1, entry_price=4.24,
+            direction=SimpleNamespace(value="neutral"),
+            expiry=None, strike=None, entry_time="2026-08-04T10:51:37",
+            legs=json.dumps(legs))
+
+    async def test_live_exit_engine_holds_a_condor_through_the_event(
+            self, monkeypatch):
+        monkeypatch.setenv("AIT_SKIP_MACRO_EVENTS", "1")   # gate ARMED
+        st = await self._live_pm(d2e=1)._evaluate_position(
+            self._live_trade("iron_condor"))
+        assert st is not None
+        assert st.should_exit is False
+        assert "macro_event_flatten" not in (st.exit_reason or "")
+
+    async def test_live_exit_engine_still_flattens_undefined_risk(
+            self, monkeypatch):
+        # Negative control: without it, a flatten rule deleted outright would
+        # look identical to the exemption.
+        monkeypatch.setenv("AIT_SKIP_MACRO_EVENTS", "1")
+        st = await self._live_pm(d2e=1)._evaluate_position(
+            self._live_trade("short_strangle"))
+        assert st.should_exit is True
+        assert "macro_event_flatten" in st.exit_reason
+
+    def _bt(self, *, d2e):
+        bt = Backtester.__new__(Backtester)
+        bt._touch_stop_enabled = False        # rule 0 out of the way
+        bt._credit_loss_limit_mult = 0.0      # rule 1 disabled (live parity)
+        cal = MagicMock()
+        cal.days_until_next_event.return_value = d2e
+        bt._economic_cal = cal
+        return bt
+
+    def _bt_pos(self, strategy):
+        # 30 DTE, +5% of credit: clears the take-profit ladder and the DTE<=5
+        # close, so the macro rule is the only one that can fire.
+        return {"strategy": strategy, "high_water_mark": 0.0,
+                "expiry_date": str(date.today() + timedelta(days=30))}
+
+    def test_engine_holds_a_condor_through_the_event(self, monkeypatch):
+        monkeypatch.setenv("AIT_SKIP_MACRO_EVENTS", "1")
+        assert self._bt(d2e=1)._check_exit_credit(
+            self._bt_pos("iron_condor"), 0.05, date.today()) is None
+
+    def test_engine_still_flattens_undefined_risk(self, monkeypatch):
+        monkeypatch.setenv("AIT_SKIP_MACRO_EVENTS", "1")
+        out = self._bt(d2e=1)._check_exit_credit(
+            self._bt_pos("short_strangle"), 0.05, date.today())
+        assert out["exit_reason"] == "macro_event_flatten"
 
 
 # ABLATION VERDICT REVERSED 2026-08-08 (rule B1): the 08-03 removal rested on

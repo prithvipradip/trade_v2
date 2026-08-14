@@ -225,7 +225,15 @@ class TradingOrchestrator:
         # the polling loop). The executor calls back so event-detected exits
         # get booked identically to polled ones.
         try:
-            self._executor._completed_exits_cb = self._process_completed_exits
+            # type-ignore justified: deliberate duck-typed slot. TradeExecutor
+            # never declares _completed_exits_cb — it reads it back with
+            # getattr(self, "_completed_exits_cb", None) (executor.py:700), so
+            # mypy is correct that the attribute is undeclared and wrong that
+            # this is a bug. Declaring it on TradeExecutor would be the real
+            # fix; that is a src change outside this CI-hardening scope.
+            self._executor._completed_exits_cb = (  # type: ignore[attr-defined]
+                self._process_completed_exits
+            )
             self._executor.attach_fill_events()
         except Exception as _e:  # noqa: BLE001
             log.warning("fill_events_wiring_failed", error=str(_e))
@@ -749,11 +757,22 @@ class TradingOrchestrator:
 
 
                 if time_since_scan >= scan_interval:
-                    # Full cycle: scan for new trades + check positions
-                    await self._trading_cycle()
-                    self._clear_loop_error("trading_cycle_error")  # R8: success resets streak
-                    self._watchdog.note_success("trading_loop")
-                    time_since_scan = 0
+                    # Full cycle: scan for new trades + check positions.
+                    # R18 AMPLIFIER FIX: time_since_scan used to reset ONLY on
+                    # success. When _trading_cycle raised, the counter kept
+                    # growing, so EVERY subsequent 30s iteration re-took this
+                    # branch and _monitor_positions_fast never ran again — the
+                    # 2026-08-11 outage killed the MTM daily-loss brake, the
+                    # 8-K material-event check and the read-only re-probe as
+                    # collateral, not just entries. The scan cadence must
+                    # advance whether or not the cycle succeeded, so a broken
+                    # scan can never starve the fast monitor.
+                    try:
+                        await self._trading_cycle()
+                        self._clear_loop_error("trading_cycle_error")  # R8: success resets streak
+                        self._watchdog.note_success("trading_loop")
+                    finally:
+                        time_since_scan = 0
                 else:
                     # Fast check: only monitor existing positions and fills
                     await self._monitor_positions_fast()
@@ -1754,6 +1773,7 @@ class TradingOrchestrator:
                 # entry ahead of a Monday event reads d2e=3 and sails past a
                 # 1-day window with ZERO intervening sessions. Convert to
                 # TRADING days so "1 day before the event" means one session.
+                self._blackout_fail_streak = 0  # R18: healthy pass resets
                 _sessions = self._sessions_until(_d2e)
                 if _sessions is not None and _sessions <= _blackout:
                     log.info("credit_entry_skipped_pre_event",
@@ -1768,6 +1788,22 @@ class TradingOrchestrator:
             log.error("pre_event_blackout_check_failed_failing_closed",
                       symbol=signal.symbol, strategy=signal.strategy_name,
                       error=str(_e))
+            # R18: fail-closed is correct, but SILENT fail-closed is the 08-11
+            # outage signature again. iron_condor is the only enabled strategy
+            # and it IS a credit structure, so a persistent fault here blocks
+            # 100% of entries indefinitely with nothing but a log line. Count
+            # consecutive failures and PAGE — a gate that stops all trading
+            # must announce itself.
+            _n = getattr(self, "_blackout_fail_streak", 0) + 1
+            self._blackout_fail_streak = _n
+            if _n >= 3 and self._alert_gate("blackout_check_broken", interval_s=3600):
+                await self._send_notification(
+                    f"ENTRY GATE BROKEN — the pre-event blackout check has "
+                    f"failed {_n} times in a row ({type(_e).__name__}: "
+                    f"{str(_e)[:120]}). Credit entries are being refused "
+                    f"fail-closed, so the bot is NOT opening trades until this "
+                    f"clears. Exits are unaffected."
+                )
             try:
                 from ait.strategies.base import CREDIT_STRATEGIES as _CS6b
                 if signal.strategy_name in _CS6b:
@@ -2413,8 +2449,12 @@ class TradingOrchestrator:
                     pass
             if ticker:
                 import math
-                bid = ticker.bid if not math.isnan(ticker.bid) and ticker.bid > 0 else None
-                ask = ticker.ask if not math.isnan(ticker.ask) and ticker.ask > 0 else None
+                # R18: same None-safety as the combo path — a single-leg
+                # buyback with a one-sided quote must not raise here.
+                bid = (ticker.bid if ticker.bid is not None
+                       and not math.isnan(ticker.bid) and ticker.bid > 0 else None)
+                ask = (ticker.ask if ticker.ask is not None
+                       and not math.isnan(ticker.ask) and ticker.ask > 0 else None)
                 return bid, ask
         except Exception as e:  # noqa: BLE001
             log.warning("single_leg_nbbo_failed", error=str(e))
@@ -2603,8 +2643,14 @@ class TradingOrchestrator:
                     # Combo quotes are SIGNED: closing a debit position
                     # (reversed legs = net sell) quotes NEGATIVE — we receive
                     # credit. Only 0/NaN means "no quote".
-                    bid = ticker.bid if not math.isnan(ticker.bid) and ticker.bid != 0 else None
-                    ask = ticker.ask if not math.isnan(ticker.ask) and ticker.ask != 0 else None
+                    # R18: `is not None` FIRST — the poll loop above breaks on a
+                    # one-sided quote, and math.isnan(None) raises TypeError,
+                    # which silently reverted the R16 fix (exit priced at the
+                    # full wing width + a CRITICAL page on a routine close).
+                    bid = (ticker.bid if ticker.bid is not None
+                           and not math.isnan(ticker.bid) and ticker.bid != 0 else None)
+                    ask = (ticker.ask if ticker.ask is not None
+                           and not math.isnan(ticker.ask) and ticker.ask != 0 else None)
                     # An EXIT must FILL — a take-profit/stop that sits unfilled
                     # lets a winner reverse or a loss deepen. Price at the
                     # MARKETABLE side and cross the spread by a buffer, instead
@@ -3063,8 +3109,11 @@ class TradingOrchestrator:
                     # per-trade KV is missing (it leaks on any non-exit close
                     # path). Reporting 0.0 made every reader — aggregate cap,
                     # concentration, digests — treat the position as risk-free.
-                    "max_loss": (float(ml) if ml else
-                                 abs(float(getattr(trade, "capital_at_risk", 0) or 0))),
+                    # R18: converted defensively. A non-numeric KV used to raise
+                    # ValueError out of the whole loop, so update_positions() was
+                    # never called and EVERY risk cap then validated against a
+                    # STALE position set — a silent, unbounded failure.
+                    "max_loss": self._position_max_loss(trade, ml),
                     # Concentration-gate repair (audit item 3.3): the 20%
                     # symbol-concentration gate reads market_value, which was
                     # never populated → exposure always 0 → gate dead. Entry
@@ -3076,6 +3125,26 @@ class TradingOrchestrator:
             log.debug("risk_manager_synced", position_count=len(positions_for_risk))
         except Exception as e:
             log.warning("risk_manager_sync_failed", error=str(e))
+
+    @staticmethod
+    def _position_max_loss(trade, ml_kv: str) -> float:
+        """R18: per-position max-loss resolution that CANNOT raise.
+
+        Order: the trade_maxloss_* KV, else the trade row's capital_at_risk,
+        else 0.0. A malformed KV degrades this ONE position to its row value
+        instead of aborting the entire risk sync (which left the risk manager
+        holding a stale book while every cap kept 'passing').
+        """
+        for candidate in (ml_kv, getattr(trade, "capital_at_risk", None)):
+            if candidate in (None, ""):
+                continue
+            try:
+                return abs(float(candidate))
+            except (TypeError, ValueError):
+                log.warning("position_max_loss_unparseable",
+                            trade_id=getattr(trade, "trade_id", "?"),
+                            value=str(candidate)[:40])
+        return 0.0
 
     def _find_trade_record(self, trade_id: str) -> TradeRecord | None:
         """Find a trade record by ID (open trades only)."""

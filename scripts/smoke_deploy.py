@@ -13,6 +13,9 @@ executes at runtime, against the REAL config and the REAL databases:
 
   1.  import every module under src/ait           (import-time faults)
   2.  load_settings('config.yaml')                (config parse + validation)
+  2b. ONE REAL TRADING CYCLE, dry-run             (the entry pipeline is
+      EXECUTED against fakes in a throwaway sandbox — see
+      check_trading_cycle_dryrun; added after the 2026-08 outage below)
   3.  StateManager on the real data/ait_state.db  (row->dataclass mapping of
       every open + recent trade, daily stats, trade context, commissions)
   4.  TradeAnalytics.get_performance(7)           (DuckDB path AND the forced
@@ -22,6 +25,12 @@ executes at runtime, against the REAL config and the REAL databases:
   6.  CounterfactualTracker / ThompsonSampler     (learning-state loads)
   7.  IronCondor._vol_scaled_width               (wing sizing with and
       without a risk budget)
+
+2026-08 (why check 2b exists): a one-line AttributeError in
+TradingOrchestrator._trading_cycle ran live for THREE DAYS. Checks 1 and 2
+were green the entire time — importing a module and parsing a config prove
+nothing about whether the loop can complete a pass. The gate now runs one
+real cycle and one real fast-monitor tick.
 
 Safety: read-only by design. It never inserts/updates/deletes rows; a
 no-write guard snapshots per-table row counts + schema versions of BOTH DBs
@@ -95,6 +104,11 @@ def _bootstrap() -> None:
     src = str(ROOT / "src")
     if src not in sys.path:
         sys.path.insert(0, src)
+    # The repo root itself, so check_trading_cycle_dryrun can import the
+    # shared hot-path rig from tests/ (running as `python scripts/...` puts
+    # scripts/ on sys.path, not the root).
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
 
 
 def _fmt_exc(e: BaseException) -> str:
@@ -313,6 +327,132 @@ def check_load_settings() -> str:
     return "config.yaml parsed + validated + sentinels (1-lot, paper-mode)"
 
 
+def check_trading_cycle_dryrun() -> str:
+    """(b2) EXECUTE the entry pipeline: one _trading_cycle + one fast monitor.
+
+    THE gate. On 2026-08 a one-line AttributeError in _trading_cycle ran live
+    for three days while check_import_walk and check_load_settings stayed
+    green — because importing a module and parsing a config never execute the
+    loop. This check does: it builds a REAL TradingOrchestrator through the
+    REAL __init__ (real settings, real risk manager, real circuit breaker,
+    real state layer, real executor, real portfolio) with fakes only at the
+    I/O boundary, and awaits one full scan cycle, one 30-second monitor tick,
+    and one entry decision (_try_execute on a canonical iron condor — the
+    live models legitimately veto the synthetic candidate inside the cycle,
+    so the entry path needs driving explicitly to be covered here).
+
+    Two things are asserted, and both are needed:
+
+      - NOTHING RAISED. Any AttributeError/KeyError/TypeError anywhere in the
+        cycle fails the deploy.
+      - NOTHING WAS SWALLOWED, and real work happened. Every hot-path
+        function catches its own exceptions by design, so "it returned" is
+        not evidence: a cycle that dies in its first try/except returns
+        normally. The rig's log spy fails on any *_failed / *_error event,
+        and the stage markers below prove the cycle reached the scan.
+
+    Safety: runs entirely inside a throwaway temp directory (cwd is switched
+    for the duration and restored in a finally), so every cwd-relative
+    artefact the orchestrator creates — state DB, historical DB, duckdb
+    store, learning JSON — lands there and NEVER next to the live bot's
+    data/. No IBKR connection, no network, no notifications, no order.
+    """
+    import asyncio
+    import shutil
+    import tempfile
+
+    try:
+        # Shared with tests/test_hot_path_smoke.py on purpose: a gate built on
+        # its own private fakes proves something different from what the suite
+        # proves, and the two would drift.
+        from tests.test_hot_path_smoke import (
+            build_smoke_orchestrator,
+            iron_condor_signal,
+        )
+    except ImportError as e:
+        raise RuntimeError(
+            f"cannot import the hot-path rig from tests/ ({e}) — the deploy "
+            "gate needs the tests tree and pytest installed "
+            "(pip install -e .[dev])"
+        ) from e
+
+    async def _drive(rig) -> bool:
+        await rig.orch._trading_cycle()
+        await rig.orch._monitor_positions_fast()
+        # Entry decision path: every risk gate, sizing, and the post-execute
+        # bookkeeping block. execute_signal is stubbed by the rig, so an
+        # approval builds an order object and places NOTHING.
+        handled = await rig.orch._try_execute(iron_condor_signal(), 0.72, None, None)
+        await rig.drain_notifications()
+        return handled
+
+    cwd = os.getcwd()
+    # mkdtemp + best-effort rmtree, NOT TemporaryDirectory: the orchestrator's
+    # SQLite/DuckDB handles stay open, and on Windows that makes the context
+    # manager's cleanup raise PermissionError — failing the deploy on a
+    # janitorial detail after the cycle itself passed.
+    sandbox = tempfile.mkdtemp(prefix="ait_smoke_cycle_")
+    rig = None
+    try:
+        os.chdir(sandbox)
+        try:
+            rig = build_smoke_orchestrator(config_path=ROOT / "config.yaml")
+            handled = asyncio.run(_drive(rig))
+            if not isinstance(handled, bool):
+                raise RuntimeError(
+                    f"_try_execute returned {handled!r}, not a bool — its "
+                    "handled/rejected contract drives the fall-through to the "
+                    "next-ranked strategy")
+
+            swallowed = rig.log.failures()
+            if swallowed:
+                raise RuntimeError(
+                    "the trading cycle degraded SILENTLY (caught its own "
+                    "exception and kept going): "
+                    + "; ".join(f"{ev} {kw}" for _lvl, ev, kw in swallowed))
+
+            events = rig.log.names()
+            # Stage markers — a cycle that returned early at the circuit
+            # breaker, the close-to-close guard, or the learning hour block
+            # would otherwise pass this gate looking healthy.
+            for marker, meaning in (
+                ("capital_tier_active", "reached the account/universe stage"),
+                ("ml_prediction", "reached ML scoring inside _scan_symbol"),
+                ("scan_symbol_timing", "completed a full chain/strategy pass"),
+            ):
+                if marker not in events:
+                    raise RuntimeError(
+                        f"cycle never {meaning} (no {marker!r} event) — it "
+                        f"returned early; saw: {sorted(set(events))}")
+            if not rig.chains.requested:
+                raise RuntimeError("no options chain was ever requested — the "
+                                   "scan stopped before strategy generation")
+            # _try_execute must have reached RISK VALIDATION: it either
+            # approved (order built) or the risk manager rejected it. Anything
+            # else means a pre-gate short-circuited the entry path.
+            if not rig.executed and "trade_rejected" not in events:
+                raise RuntimeError(
+                    "_try_execute never reached risk validation — an entry "
+                    f"gate short-circuited it; orchestrator saw: "
+                    f"{sorted(set(events))}")
+            from ait.utils.time import now_et
+            sod_key = f"mtm_sod_{now_et().date().isoformat()}"
+            if not rig.orch._state.get_state(sod_key, ""):
+                raise RuntimeError(
+                    "the fast monitor's mark-to-market daily-loss brake never "
+                    "evaluated — it failed inside its own exception handler")
+
+            return (f"cycle+monitor executed clean: {len(events)} orchestrator "
+                    f"events, {len(rig.chains.requested)} chain fetch(es), "
+                    f"{len(rig.executed)} order(s) built (none placed)")
+        finally:
+            if rig is not None:
+                rig.restore()
+    finally:
+        os.chdir(cwd)
+        shutil.rmtree(sandbox, ignore_errors=True)
+
+
 def check_state_manager() -> str:
     """(c) StateManager against the REAL DB — the 07-10 failure class."""
     if not SQLITE_PATH.exists():
@@ -517,6 +657,7 @@ def main(argv: list[str] | None = None) -> int:
 
     _run("import_walk(src/ait)", check_import_walk)
     _run("load_settings(config.yaml)", check_load_settings)
+    _run("orchestrator.trading_cycle(dryrun)", check_trading_cycle_dryrun)
     _run("state_manager(data/ait_state.db)", check_state_manager)
     _run("analytics.get_performance(duckdb)", check_analytics_duckdb)
     _run("analytics.get_performance(sqlite_fallback)", check_analytics_sqlite_fallback)
