@@ -3186,7 +3186,14 @@ class TradingOrchestrator:
             marker = f"iv_saved_{symbol}"
             if self._state.get_state(marker, "") == today:
                 return
-            ivs = [c.atm_iv() for c in chains if hasattr(c, "atm_iv")]
+            # R18: `atm_iv` is a dataclass FIELD (float), not a method. Calling
+            # it raised TypeError into this function's own `except`, so the R16
+            # "self-healing IV store" never wrote a single row — proven by the
+            # store still ending 2026-07-09 for every symbol. Consequence: the
+            # freshness gate in _estimate_iv_rank kept finding a stale series,
+            # so EVERY iv_rank silently fell back to the realized-vol proxy —
+            # the exact failure R16 added this function to fix.
+            ivs = [c.atm_iv for c in chains if getattr(c, "atm_iv", None)]
             ivs = [v for v in ivs if v and v > 0.005]
             if not ivs:
                 return

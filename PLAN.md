@@ -1076,3 +1076,55 @@ boxes, unrelated to platform the bot actually runs on).
 Rebased onto a90e8d7 and pushed directly to feature/event-straddle (user-approved) -
 matches this branch's own convention (R12-R16 above all landed as direct commits to
 an already-open PR #6, not stacked sub-PRs).
+
+## 2026-08-14 - R18: the 08-11 outage was one bug hiding a CLASS. Class closed.
+INCIDENT: `self._settings.trading.strategies` (strategies lives on OptionsConfig)
+raised AttributeError on EVERY trading cycle from the 08-11 restart. 595 errors, 3
+trading days with ZERO entry scans. Hotfix 7594e7f.
+CORRECTION TO MY OWN FIRST REPORT: I said it "paged nobody". WRONG - the message text is
+never logged (only a char count), so grepping for the alert text could never find it. The
+LOOP IMPAIRED alert for this bug is EXACTLY 153 chars and the logs show 24 sends of 153
+chars during the window. `_note_loop_error` worked as designed and paged Telegram 24
+times. DETECTION WAS NOT THE GAP - the alerts were delivered and not acted on. Open
+question for the operator: are Telegram pages being seen at all? Building more alerting
+would be pointless if 24 went unnoticed; alert ROUTING/wording is the real lever (this
+one says "Position protection may be OFF", not "the bot has stopped trading").
+WHY IT SHIPPED: its test asserted `inspect.getsource(...)` contained strings - it passed
+while the code raised on every execution. 34 such assertions exist; NOTHING in tests/ ever
+called _trading_cycle / _scan_symbol / _try_execute / _monitor_positions_fast / __init__.
+Exits have 15+ real invocations - which is exactly why "exits were unaffected, so it
+looked healthy".
+AMPLIFIER (worse than first reported): _trading_loop reset time_since_scan ONLY on
+success, so a raising cycle re-took that branch forever and _monitor_positions_fast NEVER
+RAN AGAIN. The outage therefore also silently killed the MTM daily-loss brake, the 8-K
+material-event check and the read-only re-probe. Reset now happens in a `finally`.
+THREE MORE LATENT BUGS OF THE SAME CLASS (all R16-introduced, all on paths no test ran):
+ * _try_execute fail-closed returned "handled" on ANY blackout-check exception. Since
+   iron_condor is the ONLY enabled strategy and IS a credit structure, a persistent fault
+   blocked 100% of entries INDEFINITELY behind one log line. Now escalates + pages.
+ * _sync_risk_manager_positions: float() on a raw KV raised out of the whole loop, so
+   update_positions() never ran and every risk cap validated against a STALE book.
+ * _close_multi_leg/_option_nbbo: the R16 poll loop tolerates a None bid, the consumers
+   called math.isnan(None) -> TypeError -> exit fell back to pricing at the FULL WING
+   WIDTH + a CRITICAL page, reverting the R16 fix.
+FOURTH BUG, found by the new smoke harness on its FIRST RUN: _persist_daily_iv called
+`c.atm_iv()` but atm_iv is a dataclass FIELD (float). TypeError into its own except every
+time -> the R16 "self-healing IV store" NEVER WROTE A ROW (store still ends 2026-07-09 for
+all 11 symbols) -> the freshness gate kept finding it stale -> EVERY iv_rank since has
+silently used the realized-vol proxy, not implied. So the R16 IV fix never worked, and we
+only know because a test finally EXECUTED the path.
+FIXES SHIPPED: all four bugs + amplifier; three tests that COULD NOT FAIL repaired (two
+inspected method names that have never existed -> empty source; one contained
+`True if x or True else False`); highest-risk source-string tests converted to behavioral
+(17/17 mutation checks caught); NEW tests/test_hot_path_smoke.py builds a REAL orchestrator
+through the REAL __init__ with REAL settings and awaits the whole hot path, with a log spy
+that fails on any SWALLOWED exception (a returning function proves nothing when every hot
+path catches its own errors); smoke_deploy gains check_trading_cycle_dryrun (import-walk +
+load-settings both passed green all through the outage); mypy type gate
+(scripts/typecheck.py) blocking on attr-defined/name-defined/call-arg, PROVEN to fail on
+the shipped bug and pass on HEAD. Suite 1100 green.
+NOTE: the CI type gate does NOT protect main until PR #6 merges (GitHub runs workflows
+from the default branch).
+STANDING LESSON: a source-string assertion proves code was WRITTEN, never that it RUNS -
+and it decays into a silent no-op on rename (two already had). Same "execute, don't read"
+rule the audits kept proving; I broke it in my own fixes.

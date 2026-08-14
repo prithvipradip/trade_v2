@@ -443,3 +443,50 @@ class TestMtmBrakeLoud:
         assert not _events(events, "mtm_check_failed")
         page = orch._send_notification.await_args.args[0]
         assert "DAILY MTM LOSS HALT" in page
+
+
+class TestDailyIvStoreActuallyWrites:
+    """R18: `_persist_daily_iv` called `c.atm_iv()` but `atm_iv` is a dataclass
+    FIELD (float). Every call raised TypeError into the function's own
+    `except`, so the R16 'self-healing IV store' never wrote a single row —
+    the store still ended 2026-07-09 for every symbol, the freshness gate kept
+    finding it stale, and EVERY iv_rank silently used the realized-vol proxy.
+
+    A source-string test would have passed. This one executes.
+    """
+
+    def _orch(self):
+        from unittest.mock import MagicMock
+        orch = TradingOrchestrator.__new__(TradingOrchestrator)
+        st = MagicMock()
+        st.get_state.return_value = ""      # not yet saved today
+        orch._state = st
+        orch._historical = MagicMock()
+        orch._historical.save_daily_iv.return_value = 1
+        return orch
+
+    def test_writes_median_atm_iv_from_field_not_call(self):
+        orch = self._orch()
+        chains = [SimpleNamespace(atm_iv=0.1832), SimpleNamespace(atm_iv=0.2011),
+                  SimpleNamespace(atm_iv=0.0)]          # 0.0 must be dropped
+        orch._persist_daily_iv("SPY", chains)
+        assert orch._historical.save_daily_iv.called, (
+            "the IV store must actually write — this is the bug that made "
+            "every iv_rank fall back to the realized-vol proxy")
+        sym, series = orch._historical.save_daily_iv.call_args[0]
+        assert sym == "SPY"
+        assert float(series.iloc[0]) == pytest.approx(0.2011)
+        orch._state.set_state.assert_called()            # once-per-day marker
+
+    def test_placeholder_ivs_are_not_written(self):
+        orch = self._orch()
+        orch._persist_daily_iv("QQQ", [SimpleNamespace(atm_iv=1e-5),
+                                       SimpleNamespace(atm_iv=0.0)])
+        orch._historical.save_daily_iv.assert_not_called()
+
+    def test_already_saved_today_is_a_noop(self):
+        orch = self._orch()
+        from datetime import datetime as _dt
+        orch._state.get_state.return_value = _dt.now().date().isoformat()
+        orch._persist_daily_iv("SPY", [SimpleNamespace(atm_iv=0.20)])
+        orch._historical.save_daily_iv.assert_not_called()
