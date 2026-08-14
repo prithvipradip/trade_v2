@@ -1,0 +1,45 @@
+{
+  "window": 69,
+  "test_start": "2024-05-30",
+  "test_end": "2024-08-01",
+  "pnl": 0.0,
+  "return_pct": 0.0,
+  "trades": 0,
+  "win_rate": 0.0,
+  "sharpe": 0.0,
+  "max_drawdown": 0.0,
+  "strategies": {},
+  "best_params": {},
+  "note": "no_trades",
+  "model_weights": {
+    "range_predictor": {
+      "status": "ok",
+      "threshold_pct": 0.0606,
+      "fitted_weights": {
+        "xgboost": 0.0,
+        "lightgbm": 1.0
+      },
+      "cv_scores": {
+        "xgboost": 0.3908514492753623,
+        "lightgbm": 0.5104166666666667
+      },
+      "in_range_rate": 0.5041322314049587,
+      "oos_scores": {
+        "n_samples": 23,
+        "base_rate": 0.3478,
+        "ml": {},
+        "statistical": {}
+      }
+    },
+    "direction_predictor": {
+      "fitted_weights": {
+        "xgboost": 0.4610032398116084,
+        "lightgbm": 0.5389967601883916
+      },
+      "cv_scores": {
+        "xgboost": 0.5927386226926669,
+        "lightgbm": 0.6084283424908425
+      }
+    }
+  }
+}

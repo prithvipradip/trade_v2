@@ -884,13 +884,13 @@ class TradingOrchestrator:
         # as if undefined-risk shapes were live and cost real diagnostic time
         # during the audit. Intersection is the truth; both are shown.
         _tradeable = [s for s in tier_config.allowed_strategies
-                      if s in set(self._settings.trading.strategies)]
+                      if s in set(self._settings.options.strategies)]
         log.debug("capital_tier_active",
                   tier=tier_config.tier.value,
                   capital=f"${current_capital:,.0f}",
                   strategies=_tradeable,
                   tier_menu=tier_config.allowed_strategies,
-                  config_enabled=list(self._settings.trading.strategies),
+                  config_enabled=list(self._settings.options.strategies),
                   max_positions=tier_config.max_positions,
                   universe=universe)
 

@@ -123,6 +123,27 @@ class TestHonestTierLogging:
         src = inspect.getsource(TradingOrchestrator._trading_cycle)
         assert "tier_menu=" in src and "config_enabled=" in src
 
+    def test_strategies_attribute_actually_exists(self):
+        """R17-bis REGRESSION: the source-string test above passed while the
+        code raised AttributeError on EVERY cycle.
+
+        The tier-logging fix read self._settings.trading.strategies, but
+        `strategies` lives on OptionsConfig, not TradingConfig. Result:
+        'TradingConfig' object has no attribute 'strategies' 300 times, the
+        entry scan never ran for 3 days (exits were unaffected, which is why
+        it looked healthy), and the repeated failures tripped the circuit
+        breaker on api_failures. A source-string assertion can never catch a
+        runtime attribute error — resolve the real config object instead.
+        """
+        from ait.config.settings import load_settings, TradingConfig
+        st = load_settings("config.yaml")
+        assert "strategies" not in TradingConfig.model_fields
+        enabled = set(st.options.strategies)          # must not raise
+        assert enabled and "iron_condor" in enabled
+        # and the exact expression the cycle evaluates
+        tier_menu = ["iron_condor", "short_strangle", "long_straddle"]
+        assert [s for s in tier_menu if s in enabled] == ["iron_condor"]
+
 
 class TestNotificationTaskRetention:
     def test_task_is_strongly_referenced(self):
