@@ -5,39 +5,33 @@ ML-gated entries, automated exits, hands-off ops. Paper account DUN603821.
 **Goal:** a trustworthy real track record answering "does this have edge?" before funding
 $3,000 CAD.
 
-**Current state (2026-07-16, midday):**
-- **Track record since the 2026-07-06 reset (RESTATED, broker-true): 10 closes, 6W-4L,
-  +$231.99, PF 2.30, DD 2.7% of $6,710 concurrent deployed risk.** D1 + D2 both DECIDED and
-  EXECUTED (see decisions table); shadow referee reads **0 BREAKS** — books ≡ broker ledger ≡
-  mirror, scoring method pinned. The 10th close was TODAY: an IWM long_call that entered at
-  12:40, **filled** (first filled entry since 07-09 — the R14 single-leg fill ladder works),
-  and exited on a thesis flip 10 min later (−$22.91).
-- **U5 DONE (07-15):** the 07-13 incident's orphan book — 11 untracked legs, each the inverse
-  of a booked-closed trade — was flattened at the broker (all fills verified), the broker book
-  reconciled to exactly the tracked positions, and `HALT_UNTRACKED` cleared. **Entries are
-  UNFROZEN.** Orphan-close P&L does NOT enter the track record (correct — they were phantom
-  inversions, not strategy trades). Lesson recorded: on a post-reversal book, pull the FULL
-  authoritative position set before touching any leg (a lone "orphan" 290P was covering a
-  short 288P; closing it first briefly created a naked short, cleaned up in the flatten).
-- Open book: 1 IWM long straddle (−38%, DTE 8 — walking toward the −50% stop / DTE≤5 exit).
-- **NEW BLOCKER — U6 root cause found (07-16): the live market-data subscriptions are GONE.**
-  Network B + C + OPRA no longer active on prithvipradip; re-subscribing was REJECTED for
-  "insufficient equity" — the live account U21959335 is unfunded and IBKR requires **USD 500
-  minimum equity + the USD 4.50/mo fees** to activate data (their published minimum). The free
-  "US Real-Time Non Consolidated" feed is NOT API-eligible and carries no options. Confirmed
-  during RTH 07-16: Error 354 persists, quotes NaN, 10197 (competing session) is CLEARED.
-  Delayed fallback breaks delta-based strike selection (18 `short_put_outside_delta_tolerance`
-  condor rejects on 07-16) and starves fills. **No free alternative exists** (web-verified:
-  OPRA's own NP floor is $1.25/user/mo; every real-time options feed is paid). ACTION: fund
-  U21959335 with ~USD 505 (≈CAD 700 — it SITS there, not spent), re-subscribe the 3 Level-I
-  feeds, confirm share-with-paper, then restart the Gateway.
-- **R14 fully shipped** (dae9c64/935e897/081be1b/2d58418): exit-price bounds (multi- and
-  single-leg), 3-state broker-liveness gate, exit-input staleness gate, Tier-3 resilience,
-  capital-at-risk base fix, single-leg entry fill ladder. 724 tests green, guards mutation-
-  checked. Deployed via the 07-15 restart.
-- The machine works — real fills, real costs, an honest scoreboard, layered protection.
-  **Edge is still unproven**; R9's statistics say even 50 closes is only a preliminary read.
-- 14 audit rounds complete (~285 defects found).
+**Current state (2026-08-15):**
+- **Track record: 16 closes, 9W-7L, +$150.83 (broker-true, referee 0 BREAKS).** POSITIVE for
+  the first time — three consecutive auto take-profits (+$243 QQQ 08-07 through NFP, +$154 SPY
+  08-11, +$206 QQQ 08-12) since the blackout relaxation + wide-wing promotion. Book FLAT.
+  Sample: 16/50 closes. Sim caveat stands: the live sample is the only verdict that counts.
+- **Live config (wide-wing epoch):** iron_condor ONLY, SPY/QQQ/IWM (IWM alive again since the
+  08-10 tradingClass fix), k=1.6 wings / 0.10 scaled ratio floor, ML entry gates ON (B1
+  confirm: DD 34.6%->10.0% over 11y), pre-event blackout 1 TRADING day, condors hold through
+  macro events, PDT off at $198k paper, delayed data (mdType 4) until U6.
+- **Reliability state after R16-R18 (~180 defects fixed since 07-16):** dead-man ARMED
+  (healthchecks.io, market-hours cron); circuit breaker persists across restarts; exit quotes
+  price the raw BAG (the qualify gate was dead code); exits mark-anchored; hot-path smoke
+  harness + smoke_deploy dry-run gate + mypy type gate (blocking on attr-defined class);
+  suite 1,100 green. R18 fixes are committed but LIVE ONLY AFTER NEXT BOOT.
+- **08-11 outage lesson (R18):** a one-line settings typo killed all entry scans for 3 trading
+  days behind a green source-string test; Telegram paged 24x unnoticed. Root causes closed
+  (execute-don't-read tests, loop amplifier, escalation). OPEN QUESTION for operator: do
+  Telegram pages reach a place you actually look?
+- **Measurement fidelity (all engine studies now):** touch-stop mirrored via High/Low (sim win
+  rates restated ~7pp lower), per-symbol implied vol (VXN-calibrated; flat VIXx1.10 understated
+  QQQ ~12%), empirically calibrated spreads (config overstated friction 2-13x). iv_rank now
+  self-heals from scan ATM IV (the R16 version never wrote — fixed R18).
+- **USER-SIDE OPEN:** U6 fund U21959335 ~USD 505 -> resubscribe Network B+C+OPRA -> I flip to
+  live data; merge PR #6 (arms the mypy gate + nightly CI — advisory until merged); U7 repo
+  private (username + live account number visible in a public repo); U10 rotate Finnhub key;
+  box on by 09:25 ET on trading days (Start-menu shutdowns at ~22:00 are fine).
+- 18 audit/fix rounds complete (~465 defects found; R17 was an independent external review).
 
 ## INCIDENT 2026-07-13 — the R12 reversal bug fired in the wild, pre-R12-load
 Monday's macro-flatten exits **triple-filled**. Ledger proof (executions table): NVDA condor
