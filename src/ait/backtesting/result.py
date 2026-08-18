@@ -71,7 +71,7 @@ class BacktestResult:
         std_pnl = np.std(pnls, ddof=1)
         if std_pnl == 0:
             return 0.0
-        return float((mean_pnl / std_pnl) * math.sqrt(252))
+        return float((mean_pnl / std_pnl) * annualization_factor(self.trades))
 
     @property
     def max_drawdown(self) -> float:
@@ -102,14 +102,13 @@ class BacktestResult:
             return 0.0
         pnls = np.array([t.get("pnl", 0) for t in self.trades])
         mean_pnl = float(pnls.mean())
-        downside = pnls[pnls < 0]
-        if len(downside) < 2:
-            # Not enough losses to estimate downside vol — fall back to Sharpe-like
+        # Standard downside deviation: sqrt(mean(min(0, r)^2)) over ALL
+        # trades (target 0) — the old sample-std-of-losers-around-their-own-
+        # mean was one of THREE inconsistent Sortino definitions (BT-H4).
+        downside_dev = float(np.sqrt(np.mean(np.minimum(pnls, 0.0) ** 2)))
+        if downside_dev == 0:
             return float("inf") if mean_pnl > 0 else 0.0
-        downside_std = float(downside.std(ddof=1))
-        if downside_std == 0:
-            return 0.0
-        return (mean_pnl / downside_std) * math.sqrt(252)
+        return (mean_pnl / downside_dev) * annualization_factor(self.trades)
 
     @staticmethod
     def _to_date(d):
@@ -299,3 +298,29 @@ class BacktestResult:
             "=" * 60,
         ]
         return "\n".join(line for line in lines if line is not None)
+
+
+def annualization_factor(trades) -> float:
+    """sqrt(trades per year) from the sample's actual time span.
+
+    Deep-audit BT-H4: sqrt(252) treated every TRADE as one trading DAY —
+    at ~12-17 trades/yr for 7-30 DTE premium selling that overstated
+    Sharpe/Sortino ~4-4.6x, including inside the Optuna objective. Derive
+    the factor from the real trade frequency; cap at daily (sqrt 252).
+    """
+    try:
+        from datetime import datetime, date as _d
+        def _dt(x):
+            if isinstance(x, _d):
+                return x
+            return datetime.fromisoformat(str(x)[:19]).date()
+        ds = sorted(_dt(t.get("entry_date") or t.get("entry_time"))
+                    for t in trades
+                    if (t.get("entry_date") or t.get("entry_time")))
+        if len(ds) < 2:
+            return 1.0
+        span_days = max((ds[-1] - ds[0]).days, 1)
+        tpy = len(ds) * 365.0 / span_days
+        return math.sqrt(min(252.0, max(tpy, 1.0)))
+    except Exception:
+        return 1.0

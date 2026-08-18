@@ -1,0 +1,11 @@
+{
+  "total_trades": "2",
+  "total_return": "0.16%",
+  "sharpe": "14.99",
+  "max_drawdown": "0.00%",
+  "win_rate": "100.00%",
+  "profit_factor": "inf",
+  "equity_summary": "Start: $50,000  ->  End: $50,234",
+  "timestamp": "20260808_143551",
+  "exit_code": 0
+}

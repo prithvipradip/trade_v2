@@ -1,0 +1,224 @@
+{
+  "window": 2,
+  "test_start": "2022-11-15",
+  "test_end": "2023-01-17",
+  "pnl": 325.17,
+  "return_pct": 0.1084,
+  "trades": 3,
+  "win_rate": 1.0,
+  "sharpe": 23.04,
+  "max_drawdown": 0.0,
+  "strategies": {
+    "short_strangle": 3
+  },
+  "best_params": {},
+  "trades_detail": [
+    {
+      "symbol": "IWM",
+      "strategy": "short_strangle",
+      "entry_date": "2022-11-15",
+      "entry_time": "2022-11-15",
+      "exit_date": "2022-11-22",
+      "exit_time": "2022-11-22",
+      "exit_reason": "thesis_invalidated:bullish@0.84",
+      "pnl": 134.98,
+      "entry_confidence": 0.0417,
+      "entry_regime": "trending_up",
+      "contracts": 1,
+      "n_legs": 2,
+      "hold_days": 7,
+      "entry_price": 3.6589,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 2.2831,
+      "entry_iv_rank": 0.8919,
+      "entry_vix_level": 0.5,
+      "credit": null,
+      "max_loss": null,
+      "return_pct": null,
+      "legs": [],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.0417,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.4085,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.9,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "trending_up",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1151,
+          "blocked": false
+        },
+        "regime_class": "trending_up",
+        "iv_rank_rise_10d": 0.032
+      },
+      "features_at_entry": {
+        "rsi_14": 68.31,
+        "macd_hist": 0.00425,
+        "bb_position": 0.981,
+        "atr_pct": 0.0253,
+        "realized_vol_20": 0.3357,
+        "iv_rank": 0.892,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.9
+      }
+    },
+    {
+      "symbol": "IWM",
+      "strategy": "short_strangle",
+      "entry_date": "2022-12-21",
+      "entry_time": "2022-12-21",
+      "exit_date": "2022-12-29",
+      "exit_time": "2022-12-29",
+      "exit_reason": "take_profit_short",
+      "pnl": 92.22,
+      "entry_confidence": 0.2046,
+      "entry_regime": "high_volatility",
+      "contracts": 1,
+      "n_legs": 2,
+      "hold_days": 8,
+      "entry_price": 2.2837,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 1.3355,
+      "entry_iv_rank": 0.2398,
+      "entry_vix_level": 0.5,
+      "credit": null,
+      "max_loss": null,
+      "return_pct": null,
+      "legs": [],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.2046,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.2083,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.7432,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "high_volatility",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1115,
+          "blocked": false
+        },
+        "regime_class": "high_volatility",
+        "iv_rank_rise_10d": -0.5133
+      },
+      "features_at_entry": {
+        "rsi_14": 31.02,
+        "macd_hist": -0.00619,
+        "bb_position": 0.249,
+        "atr_pct": 0.022,
+        "realized_vol_20": 0.2219,
+        "iv_rank": 0.24,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.61
+      }
+    },
+    {
+      "symbol": "IWM",
+      "strategy": "short_strangle",
+      "entry_date": "2022-12-30",
+      "entry_time": "2022-12-30",
+      "exit_date": "2023-01-09",
+      "exit_time": "2023-01-09",
+      "exit_reason": "take_profit_short",
+      "pnl": 97.97,
+      "entry_confidence": 0.0996,
+      "entry_regime": "high_volatility",
+      "contracts": 1,
+      "n_legs": 2,
+      "hold_days": 10,
+      "entry_price": 2.2917,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 1.286,
+      "entry_iv_rank": 0.2092,
+      "entry_vix_level": 0.5,
+      "credit": null,
+      "max_loss": null,
+      "return_pct": null,
+      "legs": [],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.0996,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.2173,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.6321,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "high_volatility",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1106,
+          "blocked": false
+        },
+        "regime_class": "high_volatility",
+        "iv_rank_rise_10d": 0.0195
+      },
+      "features_at_entry": {
+        "rsi_14": 42.33,
+        "macd_hist": -0.00201,
+        "bb_position": 0.339,
+        "atr_pct": 0.0214,
+        "realized_vol_20": 0.2166,
+        "iv_rank": 0.209,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.618
+      }
+    }
+  ],
+  "model_weights": {
+    "range_predictor": {
+      "status": "training_returned_no_accuracy",
+      "threshold_pct": 0.1134
+    }
+  }
+}

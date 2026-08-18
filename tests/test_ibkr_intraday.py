@@ -94,7 +94,7 @@ class TestGetIntradayFallback:
             with patch.object(svc, "_get_yahoo_intraday", new=AsyncMock(return_value=None)):
                 return await svc.get_intraday("SPY", interval="5m", days=7)
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         assert result is None
 
     def test_falls_back_to_yahoo_when_ibkr_disconnected(self) -> None:
@@ -105,7 +105,7 @@ class TestGetIntradayFallback:
             with patch.object(svc, "_get_yahoo_intraday", new=AsyncMock(return_value=yahoo_df)):
                 return await svc.get_intraday("SPY", interval="5m", days=7)
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         assert result is not None
         assert len(result) == len(yahoo_df)
 
@@ -119,7 +119,7 @@ class TestGetIntradayFallback:
                 with patch.object(svc, "_get_yahoo_intraday", new=AsyncMock(return_value=yahoo_df)):
                     return await svc.get_intraday("SPY", interval="5m", days=7)
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         assert len(result) == len(ibkr_df), "IBKR result should take precedence over Yahoo"
 
     def test_output_has_ohlcv_columns(self) -> None:
@@ -130,7 +130,7 @@ class TestGetIntradayFallback:
             with patch.object(svc, "_get_ibkr_intraday", new=AsyncMock(return_value=ibkr_df)):
                 return await svc.get_intraday("SPY", interval="5m", days=7)
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         assert result is not None
         assert set(result.columns) >= {"Open", "High", "Low", "Close", "Volume"}
 
@@ -142,7 +142,7 @@ class TestGetIntradayFallback:
             with patch.object(svc, "_get_ibkr_intraday", new=AsyncMock(return_value=ibkr_df)):
                 return await svc.get_intraday("SPY", interval="5m", days=7)
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         assert result is not None
         assert result.index.tzinfo is not None, "Index must be timezone-aware (UTC)"
 
@@ -158,7 +158,7 @@ class TestGetIntradaySince:
             with patch.object(svc, "_get_ibkr_intraday", new=AsyncMock(return_value=full_df)):
                 return await svc.get_intraday_since("SPY", since=cutoff)
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         assert result is not None and not result.empty
         assert result.index.min() > cutoff, "All returned bars must be strictly after cutoff"
 
@@ -171,7 +171,7 @@ class TestGetIntradaySince:
             with patch.object(svc, "_get_ibkr_intraday", new=AsyncMock(return_value=full_df)):
                 return await svc.get_intraday_since("SPY", since=cutoff)
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         assert result is None or (result is not None and result.empty), (
             "No bars should be returned when cutoff >= last bar"
         )
@@ -186,7 +186,7 @@ class TestGetIntradaySince:
                 with patch.object(svc, "_get_yahoo_intraday", new=AsyncMock(return_value=yahoo_df)):
                     return await svc.get_intraday_since("SPY", since=cutoff)
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         if result is not None and not result.empty:
             assert result.index.min() > cutoff
 
@@ -264,7 +264,7 @@ class TestIBKRIntradayLive:
         async def _connect():
             await ib.connectAsync("127.0.0.1", 4002, clientId=96, timeout=10)
 
-        asyncio.get_event_loop().run_until_complete(_connect())
+        asyncio.run(_connect())
 
         mock_client = MagicMock()
         mock_client.connected = True
@@ -283,7 +283,7 @@ class TestIBKRIntradayLive:
     def test_get_intraday_returns_dataframe(self, ibkr_svc) -> None:
         async def run():
             return await ibkr_svc.get_intraday("SPY", interval="5m", days=7)
-        df = asyncio.get_event_loop().run_until_complete(run())
+        df = asyncio.run(run())
         assert df is not None and not df.empty
         assert set(df.columns) >= {"Open", "High", "Low", "Close", "Volume"}
         assert df.index.tzinfo is not None
@@ -293,7 +293,7 @@ class TestIBKRIntradayLive:
     def test_get_intraday_prices_are_positive(self, ibkr_svc) -> None:
         async def run():
             return await ibkr_svc.get_intraday("SPY", interval="5m", days=5)
-        df = asyncio.get_event_loop().run_until_complete(run())
+        df = asyncio.run(run())
         assert df is not None
         assert (df["Close"] > 0).all(), "All close prices must be positive"
         assert (df["High"] >= df["Low"]).all(), "High must be >= Low for all bars"
@@ -305,7 +305,7 @@ class TestIBKRIntradayLive:
             incremental = await ibkr_svc.get_intraday_since("SPY", since=cutoff)
             return full, cutoff, incremental
 
-        full, cutoff, incremental = asyncio.get_event_loop().run_until_complete(run())
+        full, cutoff, incremental = asyncio.run(run())
         assert incremental is not None and not incremental.empty
         assert incremental.index.min() > cutoff
 

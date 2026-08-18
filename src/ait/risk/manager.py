@@ -6,6 +6,8 @@ and validates every trade before execution.
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
 
 from ait.broker.account import AccountManager
@@ -55,6 +57,10 @@ class TradeRequest:
     # For multi-leg strategies
     max_loss: float | None = None  # Defined risk strategies
     vix: float = 0.0  # Current VIX level for regime-aware sizing
+    # R12-B: IV percentile (0-100) for the VRP regime cap. 0.0 = unknown —
+    # the cap only fires on a real value (orchestrator must pass
+    # signal.iv_rank; see gate 2c-iv below).
+    iv_rank: float = 0.0
 
 
 class RiskManager:
@@ -83,6 +89,23 @@ class RiskManager:
         # Track current positions for limit checks
         self._open_positions: list[dict] = []
         self._portfolio_greeks = PortfolioGreeks()
+        # R16: warn-once-per-position keys for the aggregate-cap backfill
+        # (see _aggregate_open_risk) — the condition persists for a
+        # position's whole life, so an unguarded warning would log per scan.
+        self._risk_backfill_warned: set[tuple] = set()
+
+        # R16: the CircuitBreaker's consecutive-loss streak and active trip
+        # were process-memory only, so a keeper relaunch silently cleared a
+        # 3-loss pause. This is the one place holding BOTH the breaker and the
+        # StateManager (orchestrator.py:85 constructs the breaker with
+        # settings.risk alone), so the persistence seam is wired here.
+        if state is not None:
+            try:
+                attach = getattr(circuit_breaker, "attach_state", None)
+                if callable(attach):
+                    attach(state)
+            except Exception as e:  # noqa: BLE001 — never block construction
+                log.warning("circuit_breaker_state_attach_failed", error=str(e))
 
     def _count_correlated_positions(self, new_symbol: str, open_symbols: list[str]) -> int:
         """Count open positions that are highly correlated with a new symbol.
@@ -120,6 +143,185 @@ class RiskManager:
             return losing_streak
         except Exception:
             return 0
+
+    # --- Aggregate capital-at-risk (R16) ---
+
+    @staticmethod
+    def _structural_max_loss(legs_json, quantity: int) -> float:
+        """Conservative capital-at-risk read off a structure's OWN legs.
+
+        Defined-risk (every short leg is covered by a long on the same right):
+        widest wing x 100 x qty — the structure's max loss BEFORE the credit
+        is netted out, i.e. deliberately over- rather than under-stated, which
+        is the only safe direction for a cap.
+
+        Naked shorts (no long on that right — short_strangle/cash_secured_put)
+        have no width to measure and an unbounded tail, so fall back to the
+        Reg-T-style 20%-of-short-strike-notional margin proxy: the smallest
+        number that is still honest about the exposure.
+
+        Returns 0.0 when the legs JSON is absent/unparseable — the caller then
+        drops to the entry-notional floor.
+        """
+        try:
+            legs = json.loads(legs_json) if isinstance(legs_json, str) else legs_json
+        except (TypeError, ValueError):
+            return 0.0
+        if not legs:
+            return 0.0
+        qty = max(1, abs(int(quantity or 1)))
+        by_right: dict[str, dict[str, list[float]]] = {}
+        for leg in legs:
+            if not isinstance(leg, dict):
+                continue
+            try:
+                strike = float(leg.get("strike"))
+            except (TypeError, ValueError):
+                continue
+            right = str(leg.get("right", leg.get("type", "")) or "?").upper()[:1]
+            side = "SELL" if str(leg.get("action", "")).upper().startswith("S") else "BUY"
+            by_right.setdefault(right, {"SELL": [], "BUY": []})[side].append(strike)
+
+        widest = 0.0
+        naked_strike = 0.0
+        for sides in by_right.values():
+            shorts, longs = sides["SELL"], sides["BUY"]
+            if not shorts:
+                continue
+            if not longs:
+                naked_strike = max(naked_strike, max(shorts))
+                continue
+            for s in shorts:
+                widest = max(widest, min(abs(s - lng) for lng in longs))
+        if naked_strike > 0:
+            return round(naked_strike * 0.20 * 100 * qty, 2)
+        return round(widest * 100 * qty, 2)
+
+    def _open_trade_index(self) -> dict[tuple[str, str], list]:
+        """(symbol, strategy) -> open TradeRecords, for the risk backfill."""
+        idx: dict[tuple[str, str], list] = {}
+        state = getattr(self, "_state", None)
+        if state is None:
+            return idx
+        try:
+            for t in state.get_open_trades():
+                key = (str(getattr(t, "symbol", "") or ""),
+                       str(getattr(t, "strategy", "") or ""))
+                idx.setdefault(key, []).append(t)
+        except Exception as e:  # noqa: BLE001 — a cap must survive a DB hiccup
+            log.warning("risk_open_trade_index_failed", error=str(e))
+        return idx
+
+    def _backfilled_position_risk(self, pos: dict, idx: dict) -> tuple[float, str]:
+        """Best conservative capital-at-risk for a position whose max_loss is 0."""
+        qty = 1
+        try:
+            qty = max(1, abs(int(pos.get("quantity", 1) or 1)))
+        except (TypeError, ValueError):
+            qty = 1
+        key = (str(pos.get("symbol", "") or ""), str(pos.get("strategy", "") or ""))
+        candidates = idx.get(key, [])
+        # Narrow by expiry when BOTH sides know it (two condors on one symbol).
+        pos_exp = str(pos.get("expiry", "") or "").replace("-", "")[:8]
+        if pos_exp and len(candidates) > 1:
+            narrowed = [t for t in candidates
+                        if str(getattr(t, "expiry", "") or "").replace("-", "")[:8] == pos_exp]
+            candidates = narrowed or candidates
+
+        # 1. capital_at_risk stamped on the trade row at entry (R7 ledger). It
+        #    is written in the SAME orchestrator block as the KV, but on the
+        #    trade row, so it survives the KV's deletion-on-close and is the
+        #    closest thing to the authoritative number.
+        for t in candidates:
+            try:
+                car = float(getattr(t, "capital_at_risk", 0) or 0)
+            except (TypeError, ValueError):
+                car = 0.0
+            if car > 0:
+                return car, "trade_row_capital_at_risk"
+        # 2. the structure itself.
+        for t in candidates:
+            est = self._structural_max_loss(getattr(t, "legs", "") or "", qty)
+            if est > 0:
+                return est, "structure_width"
+        # 3. entry notional — a floor, never zero for a real position.
+        try:
+            mv = abs(float(pos.get("market_value", 0) or 0))
+        except (TypeError, ValueError):
+            mv = 0.0
+        if mv > 0:
+            return mv, "entry_notional"
+        return 0.0, "unknown"
+
+    def _symbol_capital_at_risk(self, symbol: str) -> float:
+        """R17: real capital-at-risk for one symbol's open positions, for
+        gate 6c (same-symbol concentration cap). This gate summed
+        `market_value` directly instead of reusing the max_loss/backfill
+        sourcing _aggregate_open_risk already established (R16, adjacent
+        gate 6b-2) -- for credit strategies market_value is the CREDIT
+        COLLECTED, not the real dollar risk, so 6c could pass on a small
+        fraction of what a symbol's positions could actually lose.
+        """
+        total = 0.0
+        idx: dict | None = None
+        for p in self._open_positions:
+            if p.get("symbol") != symbol:
+                continue
+            try:
+                ml = float(p.get("max_loss", 0) or 0)
+            except (TypeError, ValueError):
+                ml = 0.0
+            if ml > 0:
+                total += ml
+                continue
+            if idx is None:
+                idx = self._open_trade_index()
+            est, _source = self._backfilled_position_risk(p, idx)
+            total += est
+        return total
+
+    def _aggregate_open_risk(self) -> float:
+        """Sum defined risk across open positions for the portfolio cap.
+
+        R16: this was `sum(p.get("max_loss", 0))`, and the orchestrator sync
+        (orchestrator.py:_sync_risk_manager_positions) writes max_loss=0.0
+        whenever the trade_maxloss_<trade_id> KV is absent. That KV is written
+        only AFTER execute_signal returns, so a crash / keeper-kill inside
+        that window leaves a live position contributing $0 to the 20%
+        aggregate cap for its ENTIRE life — nothing ever backfills it, and the
+        cap silently under-counts the book by a whole condor. Under-counting
+        is the one direction a risk cap must never fail in, so a position with
+        no KV now falls back to its own structure instead of to zero.
+        """
+        total = 0.0
+        idx: dict | None = None
+        for p in self._open_positions:
+            try:
+                ml = float(p.get("max_loss", 0) or 0)
+            except (TypeError, ValueError):
+                ml = 0.0
+            if ml > 0:
+                total += ml
+                continue
+            if idx is None:
+                idx = self._open_trade_index()  # one DB read per validate call
+            est, source = self._backfilled_position_risk(p, idx)
+            total += est
+            warned = getattr(self, "_risk_backfill_warned", None)
+            if warned is None:
+                warned = self._risk_backfill_warned = set()
+            wkey = (str(p.get("symbol", "")), str(p.get("strategy", "")),
+                    str(p.get("expiry", "")), source)
+            if wkey not in warned:
+                warned.add(wkey)
+                log.warning(
+                    "position_risk_backfilled" if est > 0 else "position_risk_unknown",
+                    symbol=p.get("symbol"), strategy=p.get("strategy"),
+                    expiry=p.get("expiry"), source=source, max_loss=est,
+                    note="trade_maxloss_ KV missing for an open position — the "
+                         "aggregate cap would otherwise have counted $0 for it",
+                )
+        return total
 
     def update_positions(self, positions: list[dict]) -> None:
         """Update current position list from IBKR or state."""
@@ -167,13 +369,65 @@ class RiskManager:
                     f"(got {request.confidence:.2f})",
                 )
 
-        # 3a. Daily trade limit
-        if hasattr(request, 'daily_trades_taken') and hasattr(self._risk_config, 'max_daily_trades'):
-            max_daily = getattr(self._risk_config, 'max_daily_trades', 5)
-            if request.daily_trades_taken >= max_daily:
+        # (Dead daily-trade gate removed — audit 2026-07-07 item 3.3: it
+        # checked a field TradeRequest never had AND a config key that lives
+        # on TradingConfig, so it could never fire. The real daily budget is
+        # enforced in orchestrator._get_trade_budget.)
+
+        # 2c. Short-vol guardrails (audit R2 goal-align): the portfolio-delta
+        # gate is dead (no greeks) and the daily breaker only sees REALIZED
+        # P&L, so nothing else stops the whole book being short premium into
+        # a gap. Two cheap brakes for credit strategies:
+        from ait.strategies.base import CREDIT_STRATEGIES
+        is_credit = request.strategy in CREDIT_STRATEGIES
+        if is_credit:
+            #  - vol-regime halt: no NEW short premium in a high-VIX regime
+            # R7: FAIL CLOSED — a missing/zero VIX used to skip this gate
+            # entirely (`request.vix` falsy), i.e. the vol-regime brake was
+            # off exactly when the data layer was struggling.
+            if not request.vix or request.vix <= 0:
                 return TradeValidation(
                     False,
-                    f"max daily trades reached ({request.daily_trades_taken}/{max_daily})",
+                    "credit entry halted: VIX unavailable (fail-closed)",
+                )
+            if request.vix >= self._risk_config.credit_vix_halt:
+                return TradeValidation(
+                    False,
+                    f"credit entry halted: VIX {request.vix:.1f} >= "
+                    f"{self._risk_config.credit_vix_halt:.0f}",
+                )
+            #  - concentration brake: cap simultaneous credit positions.
+            # R12-B (cadence): the cap is now VIX-TIERED — a flat 6 let the
+            # book stay fully short premium into a rising-vol regime. Tiers:
+            # VIX<20 -> 6, VIX<25 -> 4, else 2 (config remains the ceiling).
+            # request.vix is guaranteed > 0 here (fail-closed gate above).
+            _vix_tier_cap = 6 if request.vix < 20 else (4 if request.vix < 25 else 2)
+            _credit_cap = min(self._risk_config.max_credit_positions, _vix_tier_cap)
+            n_credit = sum(
+                1 for p in self._open_positions
+                if p.get("strategy") in CREDIT_STRATEGIES
+            )
+            if n_credit >= _credit_cap:
+                return TradeValidation(
+                    False,
+                    f"short-premium cap: {n_credit}/{_credit_cap} credit "
+                    f"positions open (VIX {request.vix:.1f} tier)",
+                )
+
+            #  - R12-B IV-percentile cap (IV regime): the R12 VRP-by-IV-bucket
+            # measurement showed the TOP IV bucket realizes NEGATIVE variance
+            # risk premium (~-2.3 vol pts) — selling "rich" vol above the
+            # ~85th percentile is selling vol that is rich for a reason (AMD
+            # sat at the 98.8th percentile PRE-EARNINGS and the IV-rank floor
+            # said TRADE). Fires only on a real iv_rank; 0/unknown skips
+            # (orchestrator must pass signal.iv_rank — flagged for main).
+            _iv_cap = float(os.environ.get("AIT_IV_RANK_CAP", "85"))
+            if request.iv_rank and request.iv_rank > _iv_cap:
+                return TradeValidation(
+                    False,
+                    f"iv_rank {request.iv_rank:.0f} > {_iv_cap:.0f} cap: "
+                    f"top-bucket IV carries negative VRP (R12: -2.3 vol pts "
+                    f"realized) — no new short premium this rich",
                 )
 
         # 3b. Position count limit
@@ -191,6 +445,32 @@ class RiskManager:
                     f"duplicate position: {request.symbol} {request.strategy} already open",
                 )
 
+        # 4b. R12-B PER-EXPIRY CAP (cadence): concentrating the book in one
+        # expiry stacks pin/gamma risk into a single settlement date — cap at
+        # 3 positions sharing an expiry (env AIT_MAX_PER_EXPIRY). Tolerant by
+        # design: positions whose dict lacks "expiry" are skipped (the
+        # orchestrator sync at orchestrator.py:_sync_risk_positions must add
+        # "expiry": trade.expiry — flagged for main thread), and the gate is
+        # skipped entirely when the request's own expiry is unknown.
+        _req_expiry = None
+        if request.option is not None and getattr(request.option, "expiry", None):
+            _req_expiry = str(request.option.expiry).replace("-", "")[:8]
+        if _req_expiry:
+            _max_per_expiry = int(os.environ.get("AIT_MAX_PER_EXPIRY", "3"))
+            _same_expiry = 0
+            for p in self._open_positions:
+                _pe = p.get("expiry")
+                if not _pe:
+                    continue  # expiry unknown — skip tolerantly
+                if str(_pe).replace("-", "")[:8] == _req_expiry:
+                    _same_expiry += 1
+            if _same_expiry >= _max_per_expiry:
+                return TradeValidation(
+                    False,
+                    f"per-expiry cap: {_same_expiry}/{_max_per_expiry} open "
+                    f"positions already share expiry {_req_expiry}",
+                )
+
         # 5. Correlation check (prevent stacking correlated positions)
         open_symbols = [p.get("symbol") for p in self._open_positions if p.get("symbol")]
         corr_allowed, corr_reason = self._correlation.check_correlation(
@@ -199,26 +479,57 @@ class RiskManager:
         if not corr_allowed:
             return TradeValidation(False, f"correlation block: {corr_reason}")
 
-        # 6. Buying power check
+        # 6. Buying power check.
+        # For CREDIT strategies entry_price is money RECEIVED — the old
+        # `entry_price*contracts*100` check asked "can we afford income?"
+        # (always yes) and never measured the capital the position consumes
+        # (audit 2026-07-07 item 2.1). Capital consumed for credit trades is
+        # approximated by the max_loss/tail estimate (now stress-based for
+        # strangles); debit trades still pay the premium up front.
         account_value = await self._account.get_net_liquidation()
-        estimated_cost = request.entry_price * request.contracts * 100
+        # (is_credit computed at gate 2c above)
+        if is_credit and getattr(request, "max_loss", None):
+            estimated_cost = float(request.max_loss)
+        else:
+            estimated_cost = request.entry_price * request.contracts * 100
         if not await self._account.can_afford(estimated_cost):
             return TradeValidation(False, "insufficient buying power")
 
-        # 6b. Per-position max risk — no single trade should risk more than 3% of account
-        max_risk_per_trade = account_value * 0.03
+        # 6b. Per-position max risk (config: risk.max_position_risk_pct)
+        _per_trade_pct = self._risk_config.max_position_risk_pct
+        max_risk_per_trade = account_value * _per_trade_pct
         if hasattr(request, 'max_loss') and request.max_loss and request.max_loss > max_risk_per_trade:
             return TradeValidation(
                 False,
-                f"position risk ${request.max_loss:.0f} exceeds 3% account limit ${max_risk_per_trade:.0f}",
+                f"position risk ${request.max_loss:.0f} exceeds "
+                f"{_per_trade_pct:.0%} account limit ${max_risk_per_trade:.0f}",
+            )
+
+        # 6b-2. AGGREGATE capital-at-risk — the sum of defined-risk across ALL
+        # open positions plus this one must stay under a portfolio cap. The
+        # per-trade 3% check alone lets the account stack many trades into a
+        # large concentrated bet; this bounds the whole book.
+        # Config-wired (audit item 3.3): positions.max_portfolio_risk_pct was
+        # a phantom knob while this literal ruled. Default 0.20 (2026-06-30).
+        PORTFOLIO_RISK_CAP_PCT = self._pos_config.max_portfolio_risk_pct
+        portfolio_cap = account_value * PORTFOLIO_RISK_CAP_PCT
+        # R16: was sum(p["max_loss"]) — blind to any position whose
+        # trade_maxloss_ KV never got written. See _aggregate_open_risk.
+        open_risk = self._aggregate_open_risk()
+        new_risk = request.max_loss if (getattr(request, "max_loss", None) and request.max_loss) else estimated_cost
+        if open_risk + new_risk > portfolio_cap:
+            return TradeValidation(
+                False,
+                f"aggregate risk ${open_risk + new_risk:.0f} (open ${open_risk:.0f} "
+                f"+ new ${new_risk:.0f}) exceeds {PORTFOLIO_RISK_CAP_PCT:.0%} "
+                f"portfolio cap ${portfolio_cap:.0f}",
             )
 
         # 6c. Concentration limit — no more than 20% of account in one symbol
-        symbol_exposure = sum(
-            abs(p.get("market_value", 0))
-            for p in self._open_positions
-            if p.get("symbol") == request.symbol
-        )
+        # R17: was summing market_value (credit collected for credit
+        # strategies, not real risk) -- now the same max_loss/backfill
+        # sourcing gate 6b-2's aggregate cap uses.
+        symbol_exposure = self._symbol_capital_at_risk(request.symbol)
         if (symbol_exposure + estimated_cost) > account_value * 0.20:
             return TradeValidation(
                 False,
@@ -258,7 +569,15 @@ class RiskManager:
         # 9. Position sizing
         size = self._sizer.calculate(
             account_value=account_value,
-            option_price=request.entry_price,
+            # Deep-audit SR-H3: for credit strategies entry_price is the
+            # CREDIT — sizing on it treats a $400-risk condor as a $100
+            # position (~4-5x risk understatement). Size on per-contract
+            # capital-at-risk when known.
+            option_price=(
+                request.max_loss / (max(1, request.contracts) * 100)
+                if (is_credit and getattr(request, "max_loss", None))
+                else request.entry_price
+            ),
             confidence=request.confidence,
             implied_vol=request.implied_vol,
             strategy=request.strategy,

@@ -533,11 +533,46 @@ class TestMetaLabeler:
         except ImportError:
             pytest.skip("xgboost not installed")
 
-        assert result != {}
-        assert "accuracy" in result
-        assert "precision" in result
-        assert "trades_used" in result
-        assert result["trades_used"] >= 40
+        # R16: this used to assert training SUCCEEDS on this fixture. It does
+        # not, and must not. trade_context stores the 11 technical
+        # META_FEATURES inside entry_signals, and that column is "{}" in the
+        # fixture AND in production (verified on the live DB) — so only 9 of
+        # 20 features have ever existed. Training on that is precisely the
+        # degraded-input condition meta_label.pkl was quarantined for on
+        # 2026-07-18; the coverage guard now refuses instead of silently
+        # fitting a crippled model. Arming the meta-labeler therefore needs
+        # entry_signals populated FIRST (see PLAN 2026-08-10).
+        from ait.ml.meta_label import MIN_FEATURE_COVERAGE
+        assert result == {}, (
+            "training must REFUSE below the feature-coverage floor "
+            f"({MIN_FEATURE_COVERAGE}/20); got {result}")
+
+    def test_train_arms_once_feature_coverage_is_restored(self, tmp_path,
+                                                          monkeypatch):
+        """The positive control: with coverage satisfied, training proceeds.
+
+        Guards against the refusal becoming permanent-by-accident (the exact
+        failure mode of the 07-18 quarantine itself)."""
+        import ait.ml.meta_label as mlmod
+        monkeypatch.setattr(mlmod, "MIN_FEATURE_COVERAGE", 5)
+        ml = mlmod.MetaLabeler()
+        import pandas as pd
+        import numpy as np
+        rng = np.random.default_rng(7)
+        n = 60
+        df = pd.DataFrame({
+            "primary_confidence": rng.uniform(0.5, 0.95, n),
+            "vix": rng.uniform(12, 30, n),
+            "iv_rank": rng.uniform(0, 1, n),
+            "sentiment_score": rng.uniform(-1, 1, n),
+            "rsi_14": rng.uniform(20, 80, n),
+            "profitable": rng.integers(0, 2, n),
+        })
+        try:
+            result = ml.train(df)
+        except ImportError:
+            pytest.skip("xgboost not installed")
+        assert result != {} and "accuracy" in result
 
     def test_predict_returns_meta_signal_after_training(self, state: StateManager) -> None:
         """After successful training, predict() should return a MetaSignal."""

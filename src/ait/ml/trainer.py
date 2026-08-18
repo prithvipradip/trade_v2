@@ -52,14 +52,39 @@ class ModelTrainer:
 
         Triggers on:
         1. First run (no model loaded)
-        2. Scheduled interval elapsed
-        3. Drift detector signals retraining needed
+        2. Live artifact spec mismatch (a research model hijacked the pickle
+           — R7/R10 spec guard in RangePredictor/VolMagnitudePredictor.load_models)
+        3. Scheduled interval elapsed
+        4. Drift detector signals retraining needed
+
+        R9 fix: _last_train_date was process-local (always None after a
+        restart), so EVERY boot retrained all models (~110s with no risk
+        management, ~7.5min to first scan). It is now recovered from the
+        persisted artifacts, so a restart with fresh (<interval) artifacts
+        skips the boot retrain entirely.
         """
         # First run — always train
         if not self._predictor.is_trained:
             return True
 
-        # Check interval
+        # Range gate untrained (artifact missing/corrupt) — Tier 1 model for
+        # iron condors; without it ICs would trade ungated all day.
+        if self._range_predictor is not None and not self._range_predictor.is_trained:
+            log.info("needs_training_range_untrained")
+            return True
+
+        # Spec guard (R7/R10): a loaded live artifact whose threshold/horizon
+        # differ from the designed constructor spec must be rebuilt — its
+        # probabilities answer a different question than the strategy asks.
+        for _p, _name in ((self._range_predictor, "range"),
+                          (self._vol_mag_predictor, "vol_magnitude")):
+            if _p is not None and getattr(_p, "spec_mismatch", False):
+                log.warning("needs_training_spec_mismatch", predictor=_name)
+                return True
+
+        # Check interval — recover last-train date from artifacts after restart
+        if self._last_train_date is None:
+            self._last_train_date = self._artifact_train_date()
         if self._last_train_date is None:
             return True
 
@@ -79,6 +104,58 @@ class ModelTrainer:
             return True
 
         return False
+
+    def _artifact_train_date(self) -> "date | None":
+        """Recover the last training date from persisted model artifacts (R9).
+
+        Sources, most exact first:
+        1. trained_at ISO timestamp persisted inside range/vol-mag pickles
+        2. the direction ensemble's version string (v-YYYYMMDD-HHMMSS)
+        3. artifact file mtimes (models/*.pkl)
+
+        Uses the OLDEST recovered timestamp so one stale artifact still
+        triggers a full retrain at the scheduled interval.
+        """
+        candidates: list[datetime] = []
+
+        for _p in (self._range_predictor, self._vol_mag_predictor):
+            iso = getattr(_p, "trained_at", None) if _p is not None else None
+            if iso:
+                try:
+                    candidates.append(datetime.fromisoformat(iso))
+                except ValueError:
+                    pass
+
+        version = getattr(self._predictor, "model_version", "") or ""
+        if version.startswith("v-"):
+            try:
+                candidates.append(datetime.strptime(version[2:], "%Y%m%d-%H%M%S"))
+            except ValueError:
+                pass
+
+        if not candidates:
+            # Fall back to artifact file mtimes — retrains rewrite the pickles,
+            # so mtime is an honest lower bound on training recency.
+            try:
+                from ait.ml.range_predictor import MODEL_DIR as _model_dir
+                for name in ("ensemble.pkl", "range.pkl", "vol_magnitude.pkl"):
+                    f = _model_dir / name
+                    if f.exists():
+                        candidates.append(datetime.fromtimestamp(f.stat().st_mtime))
+            except Exception:  # noqa: BLE001
+                pass
+
+        if not candidates:
+            return None
+        recovered = min(candidates).date()
+        log.info(
+            "last_train_date_recovered",
+            trained=recovered.isoformat(),
+            age_days=(date.today() - recovered).days,
+            sources=len(candidates),
+            hint="fresh artifacts -> boot retrain skipped (R9 fix)",
+        )
+        return recovered
 
     async def train_all_symbols(
         self,
@@ -151,8 +228,25 @@ class ModelTrainer:
         self._last_train_date = date.today()
         self._drift_detector.acknowledge_retrain()
 
-        # Auto-rollback: if new model is significantly worse, revert
+        # Auto-rollback: if new model is significantly worse, revert.
+        # A8 (deep-audit ML-F9): predictor.cv_scores held only the LAST
+        # symbol trained -- the decision now uses the MEAN accuracy across
+        # every symbol trained this run (results maps symbol -> accuracy).
+        #
+        # R17: `results` maps symbol -> dict[model_name, float], never a bare
+        # scalar, so the old `isinstance(v, (int, float))` filter over
+        # results.values() always saw dicts and always produced an empty
+        # list -- the "mean across every symbol" never actually replaced
+        # cv_scores, silently defeating this rollback check. Flatten one
+        # level deeper to reach the actual per-model accuracy floats.
         if prev_scores and results:
+            try:
+                _vals = [acc for sym_scores in results.values() if isinstance(sym_scores, dict)
+                          for acc in sym_scores.values() if isinstance(acc, (int, float))]
+                if _vals:
+                    self._predictor.cv_scores = {"all_symbol_mean": sum(_vals) / len(_vals)}
+            except Exception:  # noqa: BLE001
+                pass
             new_scores = self._predictor.cv_scores
             if self._should_rollback(prev_scores, new_scores):
                 log.warning(

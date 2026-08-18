@@ -1,4 +1,10 @@
-"""Tests for counterfactual analysis tracker."""
+"""Tests for the counterfactual skip log.
+
+R12-C: the evaluation/analysis half (evaluate_outcomes / get_analysis /
+get_worst_filters) was deleted — outputs twice ruled misleading (units bug
+R7; base-rate-indistinguishable R9). These tests cover what remains:
+record_skip, dedup, history trim, counters, and JSON persistence.
+"""
 
 from __future__ import annotations
 
@@ -28,7 +34,7 @@ class TestSkippedTrade:
 
 
 class TestCounterfactualTracker:
-    """Test the counterfactual tracking system."""
+    """Test the skip-recording system."""
 
     @pytest.fixture
     def tracker(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> CounterfactualTracker:
@@ -50,76 +56,17 @@ class TestCounterfactualTracker:
         assert tracker.total_count == 1
         assert tracker.pending_count == 1
 
-    def test_evaluate_bullish_win(self, tracker: CounterfactualTracker) -> None:
-        tracker.record_skip(
-            symbol="SPY", strategy="long_call", direction="bullish",
-            confidence=0.70, entry_price=450.0, reject_reason="risk_limit",
-        )
-        # Price went up significantly
-        evaluated = tracker.evaluate_outcomes({"SPY": 470.0})
-        assert evaluated == 1
-        assert tracker.pending_count == 0
+    def test_duplicate_pending_skip_not_recorded(self, tracker: CounterfactualTracker) -> None:
+        """R5 audit: one unevaluated record per (symbol, strategy, reason) —
+        a persistently-rejected symbol scanning every ~5 min must not flood
+        the log with duplicates."""
+        for _ in range(5):
+            tracker.record_skip("SPY", "iron_condor", "neutral", 0.7, 450.0, "risk_limit")
+        assert tracker.total_count == 1
 
-        analysis = tracker.get_analysis()
-        assert analysis["evaluated"] == 1
-        assert analysis["missed_opportunities"] == 1  # We missed a winner
-
-    def test_evaluate_bullish_loss(self, tracker: CounterfactualTracker) -> None:
-        tracker.record_skip(
-            symbol="QQQ", strategy="long_call", direction="bullish",
-            confidence=0.60, entry_price=380.0, reject_reason="meta_label_reject",
-        )
-        # Price went down — our filter was correct
-        evaluated = tracker.evaluate_outcomes({"QQQ": 370.0})
-        assert evaluated == 1
-
-        analysis = tracker.get_analysis()
-        assert analysis["correct_skips"] == 1
-        assert analysis["filter_accuracy"] == 1.0
-
-    def test_evaluate_bearish(self, tracker: CounterfactualTracker) -> None:
-        tracker.record_skip(
-            symbol="SPY", strategy="long_put", direction="bearish",
-            confidence=0.75, entry_price=450.0, reject_reason="low_confidence",
-        )
-        # Price went down — bearish was correct, we missed it
-        evaluated = tracker.evaluate_outcomes({"SPY": 430.0})
-        assert evaluated == 1
-
-        analysis = tracker.get_analysis()
-        assert analysis["missed_opportunities"] == 1
-
-    def test_evaluate_skips_unknown_symbols(self, tracker: CounterfactualTracker) -> None:
-        tracker.record_skip(
-            symbol="AAPL", strategy="long_call", direction="bullish",
-            confidence=0.80, entry_price=170.0, reject_reason="risk_limit",
-        )
-        # No price available for AAPL
-        evaluated = tracker.evaluate_outcomes({"SPY": 450.0})
-        assert evaluated == 0
-        assert tracker.pending_count == 1
-
-    def test_analysis_by_reason(self, tracker: CounterfactualTracker) -> None:
-        # Record skips with different reasons
-        tracker.record_skip("SPY", "long_call", "bullish", 0.65, 450.0, "low_confidence")
-        tracker.record_skip("QQQ", "long_call", "bullish", 0.70, 380.0, "meta_label_reject")
-        tracker.record_skip("AAPL", "iron_condor", "neutral", 0.80, 170.0, "low_confidence")
-
-        tracker.evaluate_outcomes({"SPY": 470.0, "QQQ": 370.0, "AAPL": 170.5})
-
-        analysis = tracker.get_analysis()
-        assert "low_confidence" in analysis["by_reason"]
-        assert "meta_label_reject" in analysis["by_reason"]
-
-    def test_analysis_by_strategy(self, tracker: CounterfactualTracker) -> None:
-        tracker.record_skip("SPY", "long_call", "bullish", 0.65, 450.0, "risk_limit")
-        tracker.record_skip("QQQ", "iron_condor", "neutral", 0.80, 380.0, "risk_limit")
-
-        tracker.evaluate_outcomes({"SPY": 470.0, "QQQ": 380.5})
-
-        analysis = tracker.get_analysis()
-        assert "long_call" in analysis["by_strategy"]
-        assert "iron_condor" in analysis["by_strategy"]
+        # A different reject_reason for the same symbol/strategy IS a new record.
+        tracker.record_skip("SPY", "iron_condor", "neutral", 0.7, 450.0, "meta_label_reject")
+        assert tracker.total_count == 2
 
     def test_max_history(self, tracker: CounterfactualTracker) -> None:
         tracker._max_history = 5
@@ -137,22 +84,38 @@ class TestCounterfactualTracker:
         t2 = CounterfactualTracker()
         assert t2.total_count == 1
 
-    def test_get_worst_filters(self, tracker: CounterfactualTracker) -> None:
-        # Record many skips with a bad filter (most would have won)
-        for i in range(10):
-            tracker.record_skip(f"S{i}", "long_call", "bullish", 0.7, 100.0, "bad_filter")
+    def test_loads_pre_r12_rows_with_outcome_fields(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Rows written before R12-C carry evaluated-outcome fields; loading
+        them must not crash and pending_count must respect outcome_checked."""
+        import json
 
-        # Evaluate: all prices went up (all would have won)
-        prices = {f"S{i}": 110.0 for i in range(10)}
-        tracker.evaluate_outcomes(prices)
+        state_file = tmp_path / "counterfactual.json"
+        monkeypatch.setattr("ait.learning.counterfactual.STATE_FILE", state_file)
+        state_file.write_text(json.dumps([
+            {
+                "timestamp": "2026-07-01T10:00:00", "symbol": "SPY",
+                "strategy": "iron_condor", "direction": "neutral",
+                "confidence": 0.7, "entry_price": 450.0,
+                "reject_reason": "risk_limit",
+                "exit_price": 452.0, "hypothetical_pnl": 0.0,
+                "would_have_won": True, "outcome_checked": True,
+            },
+            {
+                "timestamp": "2026-07-12T10:00:00", "symbol": "QQQ",
+                "strategy": "iron_condor", "direction": "neutral",
+                "confidence": 0.8, "entry_price": 380.0,
+                "reject_reason": "low_confidence",
+            },
+        ]))
 
-        worst = tracker.get_worst_filters(min_observations=5)
-        assert len(worst) >= 1
-        assert worst[0]["reason"] == "bad_filter"
-        assert worst[0]["miss_rate"] > 0.5
+        t = CounterfactualTracker()
+        assert t.total_count == 2
+        assert t.pending_count == 1  # only the unevaluated legacy row
 
-    def test_empty_analysis(self, tracker: CounterfactualTracker) -> None:
-        analysis = tracker.get_analysis()
-        assert analysis["total_skipped"] == 0
-        assert analysis["evaluated"] == 0
-        assert analysis["filter_accuracy"] == 0.0
+    def test_analysis_methods_removed(self, tracker: CounterfactualTracker) -> None:
+        """The R12-C deletion is intentional; resurrection needs re-review."""
+        assert not hasattr(tracker, "evaluate_outcomes")
+        assert not hasattr(tracker, "get_analysis")
+        assert not hasattr(tracker, "get_worst_filters")

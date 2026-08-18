@@ -1,0 +1,727 @@
+{
+  "window": 1,
+  "test_start": "2022-10-09",
+  "test_end": "2022-12-11",
+  "pnl": 1546.1,
+  "return_pct": 0.5154,
+  "trades": 8,
+  "win_rate": 1.0,
+  "sharpe": 27.743,
+  "max_drawdown": 0.0,
+  "strategies": {
+    "broken_wing_condor": 8
+  },
+  "best_params": {},
+  "trades_detail": [
+    {
+      "symbol": "QQQ",
+      "strategy": "broken_wing_condor",
+      "entry_date": "2022-10-21",
+      "entry_time": "2022-10-21",
+      "exit_date": "2022-10-31",
+      "exit_time": "2022-10-31",
+      "exit_reason": "take_profit_short",
+      "pnl": 232.35,
+      "entry_confidence": 0.1048,
+      "entry_regime": "range_bound",
+      "contracts": 1,
+      "n_legs": 4,
+      "hold_days": 10,
+      "entry_price": 5.0969,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 2.7214,
+      "entry_iv_rank": 0.9269,
+      "entry_vix_level": 0.5,
+      "credit": 509.69,
+      "max_loss": 3875.48,
+      "return_pct": 0.06,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 255.0,
+          "premium": 2.8033
+        },
+        {
+          "type": "long_put",
+          "strike": 211.0,
+          "premium": -0.2548
+        },
+        {
+          "type": "short_call",
+          "strike": 302.0,
+          "premium": 2.8033
+        },
+        {
+          "type": "long_call",
+          "strike": 324.0,
+          "premium": -0.2548
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.1048,
+        "range_gate": {
+          "prob": null,
+          "threshold": 0.55,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.4248,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.5903,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1176,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": 0.2296
+      },
+      "features_at_entry": {
+        "rsi_14": 47.2,
+        "macd_hist": 0.00652,
+        "bb_position": 0.633,
+        "atr_pct": 0.0343,
+        "realized_vol_20": 0.3701,
+        "iv_rank": 0.927,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.657
+      }
+    },
+    {
+      "symbol": "IWM",
+      "strategy": "broken_wing_condor",
+      "entry_date": "2022-10-21",
+      "entry_time": "2022-10-21",
+      "exit_date": "2022-11-01",
+      "exit_time": "2022-11-01",
+      "exit_reason": "take_profit_short",
+      "pnl": 76.29,
+      "entry_confidence": 0.1143,
+      "entry_regime": "range_bound",
+      "contracts": 1,
+      "n_legs": 4,
+      "hold_days": 11,
+      "entry_price": 3.4313,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 2.6164,
+      "entry_iv_rank": 1.0,
+      "entry_vix_level": 0.5,
+      "credit": 343.13,
+      "max_loss": 2511.16,
+      "return_pct": 0.0304,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 160.0,
+          "premium": 1.8872
+        },
+        {
+          "type": "long_put",
+          "strike": 131.0,
+          "premium": -0.1716
+        },
+        {
+          "type": "short_call",
+          "strike": 190.0,
+          "premium": 1.8872
+        },
+        {
+          "type": "long_call",
+          "strike": 204.0,
+          "premium": -0.1716
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.1143,
+        "range_gate": {
+          "prob": null,
+          "threshold": 0.55,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.3971,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.5714,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1176,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": 0.0341
+      },
+      "features_at_entry": {
+        "rsi_14": 52.77,
+        "macd_hist": 0.00589,
+        "bb_position": 0.731,
+        "atr_pct": 0.0345,
+        "realized_vol_20": 0.3842,
+        "iv_rank": 1.0,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.746
+      }
+    },
+    {
+      "symbol": "QQQ",
+      "strategy": "broken_wing_condor",
+      "entry_date": "2022-10-31",
+      "entry_time": "2022-10-31",
+      "exit_date": "2022-11-10",
+      "exit_time": "2022-11-10",
+      "exit_reason": "take_profit_short",
+      "pnl": 243.76,
+      "entry_confidence": 0.4,
+      "entry_regime": "range_bound",
+      "contracts": 1,
+      "n_legs": 4,
+      "hold_days": 10,
+      "entry_price": 5.499,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 3.0094,
+      "entry_iv_rank": 0.9782,
+      "entry_vix_level": 0.5,
+      "credit": 549.9,
+      "max_loss": 4160.98,
+      "return_pct": 0.0586,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 256.0,
+          "premium": 3.0244
+        },
+        {
+          "type": "long_put",
+          "strike": 209.0,
+          "premium": -0.2749
+        },
+        {
+          "type": "short_call",
+          "strike": 306.0,
+          "premium": 3.0244
+        },
+        {
+          "type": "long_call",
+          "strike": 330.0,
+          "premium": -0.2749
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.4,
+        "range_gate": {
+          "prob": null,
+          "threshold": 0.55,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.289,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.1,
+          "threshold": 0.2,
+          "pass": true
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1166,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": 0.1157
+      },
+      "features_at_entry": {
+        "rsi_14": 61.6,
+        "macd_hist": 0.00822,
+        "bb_position": 0.714,
+        "atr_pct": 0.0289,
+        "realized_vol_20": 0.394,
+        "iv_rank": 0.978,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.637
+      }
+    },
+    {
+      "symbol": "SPY",
+      "strategy": "broken_wing_condor",
+      "entry_date": "2022-11-02",
+      "entry_time": "2022-11-02",
+      "exit_date": "2022-11-08",
+      "exit_time": "2022-11-08",
+      "exit_reason": "take_profit_short",
+      "pnl": 220.83,
+      "entry_confidence": 0.137,
+      "entry_regime": "range_bound",
+      "contracts": 1,
+      "n_legs": 4,
+      "hold_days": 6,
+      "entry_price": 6.361,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 4.1007,
+      "entry_iv_rank": 0.9732,
+      "entry_vix_level": 0.5,
+      "credit": 636.1,
+      "max_loss": 4732.2,
+      "return_pct": 0.0467,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 350.0,
+          "premium": 3.4986
+        },
+        {
+          "type": "long_put",
+          "strike": 296.0,
+          "premium": -0.318
+        },
+        {
+          "type": "short_call",
+          "strike": 407.0,
+          "premium": 3.4986
+        },
+        {
+          "type": "long_call",
+          "strike": 434.0,
+          "premium": -0.318
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.137,
+        "range_gate": {
+          "prob": null,
+          "threshold": 0.55,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.2584,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.526,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1164,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": 0.0124
+      },
+      "features_at_entry": {
+        "rsi_14": 55.92,
+        "macd_hist": 0.00604,
+        "bb_position": 0.559,
+        "atr_pct": 0.0225,
+        "realized_vol_20": 0.3329,
+        "iv_rank": 0.973,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.65
+      }
+    },
+    {
+      "symbol": "IWM",
+      "strategy": "broken_wing_condor",
+      "entry_date": "2022-11-09",
+      "entry_time": "2022-11-09",
+      "exit_date": "2022-11-21",
+      "exit_time": "2022-11-21",
+      "exit_reason": "take_profit_short",
+      "pnl": 122.79,
+      "entry_confidence": 0.1887,
+      "entry_regime": "range_bound",
+      "contracts": 2,
+      "n_legs": 4,
+      "hold_days": 12,
+      "entry_price": 2.6326,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 1.9667,
+      "entry_iv_rank": 0.5801,
+      "entry_vix_level": 0.5,
+      "credit": 526.52,
+      "max_loss": 3958.4,
+      "return_pct": 0.031,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 164.0,
+          "premium": 1.4479
+        },
+        {
+          "type": "long_put",
+          "strike": 142.0,
+          "premium": -0.1316
+        },
+        {
+          "type": "short_call",
+          "strike": 188.0,
+          "premium": 1.4479
+        },
+        {
+          "type": "long_call",
+          "strike": 199.0,
+          "premium": -0.1316
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.1887,
+        "range_gate": {
+          "prob": null,
+          "threshold": 0.55,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.268,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.4226,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1157,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": -0.4048
+      },
+      "features_at_entry": {
+        "rsi_14": 59.33,
+        "macd_hist": 0.00084,
+        "bb_position": 0.419,
+        "atr_pct": 0.0243,
+        "realized_vol_20": 0.2985,
+        "iv_rank": 0.58,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.783
+      }
+    },
+    {
+      "symbol": "SPY",
+      "strategy": "broken_wing_condor",
+      "entry_date": "2022-11-21",
+      "entry_time": "2022-11-21",
+      "exit_date": "2022-11-29",
+      "exit_time": "2022-11-29",
+      "exit_reason": "take_profit_short",
+      "pnl": 210.75,
+      "entry_confidence": 0.1489,
+      "entry_regime": "range_bound",
+      "contracts": 1,
+      "n_legs": 4,
+      "hold_days": 8,
+      "entry_price": 5.5351,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 3.3756,
+      "entry_iv_rank": 0.624,
+      "entry_vix_level": 0.5,
+      "credit": 553.51,
+      "max_loss": 4068.68,
+      "return_pct": 0.0518,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 373.0,
+          "premium": 3.0443
+        },
+        {
+          "type": "long_put",
+          "strike": 327.0,
+          "premium": -0.2768
+        },
+        {
+          "type": "short_call",
+          "strike": 422.0,
+          "premium": 3.0443
+        },
+        {
+          "type": "long_call",
+          "strike": 445.0,
+          "premium": -0.2768
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.1489,
+        "range_gate": {
+          "prob": null,
+          "threshold": 0.55,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.32,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.5023,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1145,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": 0.1226
+      },
+      "features_at_entry": {
+        "rsi_14": 57.09,
+        "macd_hist": 0.00338,
+        "bb_position": 0.725,
+        "atr_pct": 0.0193,
+        "realized_vol_20": 0.2723,
+        "iv_rank": 0.624,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.828
+      }
+    },
+    {
+      "symbol": "SPY",
+      "strategy": "broken_wing_condor",
+      "entry_date": "2022-11-29",
+      "entry_time": "2022-11-29",
+      "exit_date": "2022-12-08",
+      "exit_time": "2022-12-08",
+      "exit_reason": "take_profit_short",
+      "pnl": 230.77,
+      "entry_confidence": 0.1147,
+      "entry_regime": "range_bound",
+      "contracts": 1,
+      "n_legs": 4,
+      "hold_days": 9,
+      "entry_price": 5.2284,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 2.8687,
+      "entry_iv_rank": 0.5659,
+      "entry_vix_level": 0.5,
+      "credit": 522.84,
+      "max_loss": 3935.44,
+      "return_pct": 0.0586,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 374.0,
+          "premium": 2.8756
+        },
+        {
+          "type": "long_put",
+          "strike": 329.0,
+          "premium": -0.2614
+        },
+        {
+          "type": "short_call",
+          "strike": 422.0,
+          "premium": 2.8756
+        },
+        {
+          "type": "long_call",
+          "strike": 444.0,
+          "premium": -0.2614
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.1147,
+        "range_gate": {
+          "prob": null,
+          "threshold": 0.55,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.1352,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.5706,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1137,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": -0.1422
+      },
+      "features_at_entry": {
+        "rsi_14": 60.75,
+        "macd_hist": 0.00069,
+        "bb_position": 0.621,
+        "atr_pct": 0.0157,
+        "realized_vol_20": 0.2622,
+        "iv_rank": 0.566,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.782
+      }
+    },
+    {
+      "symbol": "QQQ",
+      "strategy": "broken_wing_condor",
+      "entry_date": "2022-11-29",
+      "entry_time": "2022-11-29",
+      "exit_date": "2022-12-08",
+      "exit_time": "2022-12-08",
+      "exit_reason": "take_profit_short",
+      "pnl": 208.56,
+      "entry_confidence": 0.1879,
+      "entry_regime": "range_bound",
+      "contracts": 1,
+      "n_legs": 4,
+      "hold_days": 9,
+      "entry_price": 4.9931,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 2.8555,
+      "entry_iv_rank": 0.6791,
+      "entry_vix_level": 0.5,
+      "credit": 499.31,
+      "max_loss": 3733.04,
+      "return_pct": 0.0559,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 261.0,
+          "premium": 2.7462
+        },
+        {
+          "type": "long_put",
+          "strike": 219.0,
+          "premium": -0.2497
+        },
+        {
+          "type": "short_call",
+          "strike": 306.0,
+          "premium": 2.7462
+        },
+        {
+          "type": "long_call",
+          "strike": 327.0,
+          "premium": -0.2497
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.1879,
+        "range_gate": {
+          "prob": null,
+          "threshold": 0.55,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.1743,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.4242,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1137,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": -0.1745
+      },
+      "features_at_entry": {
+        "rsi_14": 59.19,
+        "macd_hist": 0.00138,
+        "bb_position": 0.548,
+        "atr_pct": 0.0222,
+        "realized_vol_20": 0.3507,
+        "iv_rank": 0.679,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.727
+      }
+    }
+  ],
+  "model_weights": {
+    "range_predictor": {
+      "status": "disabled_by_config",
+      "threshold_pct": 0.05
+    }
+  }
+}

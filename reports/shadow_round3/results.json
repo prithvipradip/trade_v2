@@ -1,0 +1,29 @@
+[
+ {
+  "arm": "iron_condor",
+  "n": 90,
+  "win_rate": 70.0,
+  "pf": 1.31,
+  "max_dd_pct": 8.5,
+  "total_ret_pct": 3.33,
+  "windows": 28
+ },
+ {
+  "arm": "wide_wing_condor",
+  "n": 93,
+  "win_rate": 76.34,
+  "pf": 1.51,
+  "max_dd_pct": 6.57,
+  "total_ret_pct": 3.19,
+  "windows": 28
+ },
+ {
+  "arm": "broken_wing_condor",
+  "n": 92,
+  "win_rate": 75.0,
+  "pf": 1.48,
+  "max_dd_pct": 5.48,
+  "total_ret_pct": 2.56,
+  "windows": 28
+ }
+]

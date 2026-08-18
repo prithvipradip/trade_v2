@@ -34,11 +34,134 @@ class AccountSnapshot:
 class AccountManager:
     """Manages account data with caching to minimize IBKR API calls."""
 
+    # R17: past this age, a stale account snapshot escalates beyond a log
+    # line -- every dollar-based risk gate runs on this number.
+    ESCALATE_STALE_SECONDS = 900
+
+    # R19: how many API failures we are willing to record in one escalation
+    # before concluding the breaker will not trip from them. CircuitBreaker
+    # trips at config.max_api_failures (5) within a 10-min window; the cap is
+    # a hard stop so a mis-wired/duck-typed breaker can never spin here.
+    ESCALATE_MAX_FAILURES = 12
+
     def __init__(self, client: IBKRClient, cache_ttl: int = 30) -> None:
         self._client = client
         self._cache_ttl = cache_ttl
         self._snapshot = AccountSnapshot()
         self._last_fetch = 0.0
+        self._notify_cb = None  # optional async callable(str), wired by orchestrator
+        self._circuit_breaker = None  # optional CircuitBreaker, wired by orchestrator
+        self._stale_escalated = False
+        self._stale_halt_unavailable_logged = False
+
+    def _escalate_to_breaker(self, stale_seconds: float) -> bool:
+        """R19: actually HALT on a fossil account snapshot. Returns whether the
+        breaker is tripped when we are done.
+
+        R17 called record_api_failure() exactly ONCE per outage, but the
+        breaker only trips at config.max_api_failures (5) failures inside a
+        10-minute window (circuit_breaker.py record_api_failure) -- one call is
+        1/5 of a trip, so the documented "trip the existing circuit-breaker
+        halt lever" could never happen and the safety rule was structurally
+        dead. Record failures until the breaker itself reports tripped (its
+        own threshold and window stay authoritative), and if it still will not
+        engage, pull the trip lever directly rather than leave a silent
+        no-op. A halt we cannot achieve is paged as a CRITICAL, never
+        swallowed.
+
+        Deliberately NOT latched by _stale_escalated: the api_failures trip
+        auto-resumes after 10 minutes, and an outage that outlives the pause
+        must re-halt. Re-escalation only ever runs while the breaker is NOT
+        tripped, so it cannot accumulate failures behind an active halt.
+        """
+        cb = getattr(self, "_circuit_breaker", None)
+        if cb is None:
+            if not getattr(self, "_stale_halt_unavailable_logged", False):
+                self._stale_halt_unavailable_logged = True
+                log.critical(
+                    "account_stale_halt_unavailable",
+                    stale_seconds=int(stale_seconds),
+                    note="account snapshot is a fossil and NO circuit breaker "
+                         "is wired to this AccountManager — every dollar-based "
+                         "risk gate keeps sizing off it. Halt manually.",
+                )
+            return False
+        try:
+            if bool(getattr(cb, "is_tripped", False)):
+                return True  # already halted — nothing to add
+            for _ in range(self.ESCALATE_MAX_FAILURES):
+                cb.record_api_failure()
+                if bool(getattr(cb, "is_tripped", False)):
+                    break
+            halted = bool(getattr(cb, "is_tripped", False))
+            if not halted:
+                # The failure-count route did not reach the threshold (custom
+                # config / duck-typed breaker). Trip directly: staleness past
+                # ESCALATE_STALE_SECONDS is itself a halt condition.
+                trip = getattr(cb, "_trip", None)
+                if callable(trip):
+                    trip(
+                        f"account_data_stale ({int(stale_seconds / 60)} min "
+                        f"— risk math on a fossil NLV)",
+                        pause_seconds=600,
+                    )
+                    halted = bool(getattr(cb, "is_tripped", False))
+        except Exception as e:  # noqa: BLE001 — escalation must not crash the read
+            log.warning("account_stale_breaker_failed", error=str(e))
+            halted = False
+        if not halted:
+            log.critical(
+                "account_stale_halt_failed",
+                stale_seconds=int(stale_seconds),
+                note="stale-account escalation could not halt trading — "
+                     "risk gates are running on a fossil snapshot. Halt manually.",
+            )
+        else:
+            log.critical(
+                "account_stale_trading_halted",
+                stale_seconds=int(stale_seconds),
+                reason=str(getattr(cb, "_trip_reason", "")),
+            )
+        return halted
+
+    async def _handle_stale(self, stale_seconds: float) -> None:
+        """R17: log.error alone never escalated -- risk math kept running
+        on a fossil snapshot for as long as an outage lasted. Past
+        ESCALATE_STALE_SECONDS, trip the existing circuit-breaker halt lever
+        and notify, once per outage.
+
+        R19: the trip is now real (see _escalate_to_breaker) and is re-applied
+        on every stale read while the breaker is clear; only the Telegram page
+        stays once-per-outage.
+        """
+        if stale_seconds > 300:
+            log.error(
+                "account_data_stale",
+                stale_seconds=int(stale_seconds),
+                msg="Account data over 5 minutes old — risk calculations unreliable",
+            )
+        else:
+            log.warning("account_fetch_empty", using="cached_values")
+            return
+        if stale_seconds <= self.ESCALATE_STALE_SECONDS:
+            return
+        # R19: halting is re-attempted every stale read (the api-failure trip
+        # auto-resumes after 10 min); only the page below is latched.
+        halted = self._escalate_to_breaker(stale_seconds)
+        if self._stale_escalated:
+            return
+        self._stale_escalated = True
+        if self._notify_cb is not None:
+            try:
+                await self._notify_cb(
+                    f"ACCOUNT DATA STALE {int(stale_seconds / 60)} min — risk "
+                    f"calculations are running on a fossil snapshot. "
+                    + ("Trading HALTED by the circuit breaker."
+                       if halted else
+                       "COULD NOT HALT — halt manually.")
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("account_stale_notify_failed", error=str(e))
 
     async def get_snapshot(self, force_refresh: bool = False) -> AccountSnapshot:
         """Get current account snapshot, using cache if fresh enough."""
@@ -48,7 +171,19 @@ class AccountManager:
 
         values = await self._client.get_account_values()
         if not values:
-            # Fallback: estimate NLV from portfolio positions
+            # If a prior good snapshot exists, keep it rather than falling
+            # through to the position-sum estimate: that estimate is
+            # currency-blind (mixes CAD stock and USD options), and
+            # get_account_values now intentionally returns {} when FX is
+            # unavailable (audit 2026-07-07 item 1.6) — a mis-currencied
+            # guess here would defeat that hard-stop. Stale-but-correct
+            # beats fresh-but-wrong for risk math.
+            if self._last_fetch > 0:
+                await self._handle_stale(now - self._last_fetch)
+                return self._snapshot
+            # Never had a snapshot at all: last-resort estimate from
+            # positions (crude, currency-blind — better than zero only at
+            # first boot).
             try:
                 positions = self._client.ib.positions()
                 if positions:
@@ -66,16 +201,32 @@ class AccountManager:
             except Exception as e:
                 log.debug("position_fallback_failed", error=str(e))
 
-            stale_seconds = now - self._last_fetch
-            if self._last_fetch > 0 and stale_seconds > 300:
-                log.error(
-                    "account_data_stale",
-                    stale_seconds=int(stale_seconds),
-                    msg="Account data over 5 minutes old — risk calculations unreliable",
-                )
+            if self._last_fetch > 0:
+                await self._handle_stale(now - self._last_fetch)
             else:
                 log.warning("account_fetch_empty", using="cached_values")
             return self._snapshot
+
+        # AIT_SIMULATED_CAPITAL: cap every balance at a target size so the
+        # ENTIRE risk stack (capital tiers, position sizing, aggregate caps)
+        # behaves as if the account were that small. Purpose: validate the
+        # actual go-live configuration (e.g. $2k CAD ~= $1.4k USD -> MICRO
+        # tier, SPY credit spreads) on the big paper account. Opt-in via env.
+        import os as _os
+        _sim = _os.environ.get("AIT_SIMULATED_CAPITAL")
+        if _sim:
+            try:
+                _cap = float(_sim)
+                _real_nlv = float(values.get("NetLiquidation", 0)) or _cap
+                _scale = min(1.0, _cap / _real_nlv)
+                for _k in ("NetLiquidation", "BuyingPower", "AvailableFunds",
+                           "ExcessLiquidity", "CashBalance"):
+                    if values.get(_k):
+                        values[_k] = str(float(values[_k]) * _scale)
+                log.info("simulated_capital_active", target=_cap,
+                         real_nlv=round(_real_nlv, 0))
+            except (TypeError, ValueError):
+                pass
 
         self._snapshot = AccountSnapshot(
             timestamp=now,
@@ -90,6 +241,7 @@ class AccountManager:
             cash_balance=float(values.get("CashBalance", 0)),
         )
         self._last_fetch = now
+        self._stale_escalated = False  # R17: outage over — re-arm the escalation latch
 
         log.debug(
             "account_snapshot",

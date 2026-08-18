@@ -18,7 +18,7 @@ Usage:
     python scripts/calibrate_option_spreads.py \\
         --symbols QQQ \\
         --db-path data/historical.db \\
-        --update-config config_QQQ_test.yaml
+        --update-config deprecated/configs/config_QQQ_test.yaml
 
     # Dry-run (shows request plan only):
     python scripts/calibrate_option_spreads.py --symbols QQQ --dry-run
@@ -28,13 +28,18 @@ Usage:
         --symbols QQQ --source ibkr \\
         --db-path data/historical.db \\
         --port 4002 --client-id 91 \\
-        --update-config config_QQQ_test.yaml
+        --update-config deprecated/configs/config_QQQ_test.yaml
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import sys as _sys
+try:  # R16: never let a console codepage kill a calibration run
+    _sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 import math
 import sys
 import time
@@ -187,8 +192,8 @@ def _calibrate_symbol_yfinance(
             nearest = min(expiry_dates, key=lambda d: abs((d - today).days - dte_target))
             actual_dte = (nearest - today).days
             print(
-                f"  [{symbol}] DTE target {dte_target:3d} → expiry {nearest} "
-                f"(actual DTE={actual_dte}) → would download full chain"
+                f"  [{symbol}] DTE target {dte_target:3d} -> expiry {nearest} "
+                f"(actual DTE={actual_dte}) -> would download full chain"
             )
         return 0
 
@@ -364,8 +369,8 @@ async def _calibrate_symbol_ibkr(
             nearest = min(expiry_dates, key=lambda d: abs((d - today).days - dte_target))
             actual_dte = (nearest - today).days
             print(
-                f"  [{symbol}] DTE target {dte_target:3d} → expiry {nearest} "
-                f"(DTE={actual_dte}) → {len(z_offsets) * 2} contracts to snapshot"
+                f"  [{symbol}] DTE target {dte_target:3d} -> expiry {nearest} "
+                f"(DTE={actual_dte}) -> {len(z_offsets) * 2} contracts to snapshot"
             )
         return 0
 
@@ -561,7 +566,7 @@ def _update_yaml_config(config_path: Path, params: dict) -> None:
     with open(config_path, "w") as f:
         yaml.dump(data, f)
 
-    print(f"  → Updated {config_path} with calibrated spread values")
+    print(f"  -> Updated {config_path} with calibrated spread values")
 
 
 # ---------------------------------------------------------------------------
@@ -655,7 +660,7 @@ def _print_results(sym: str, params: dict) -> None:
     print(f"    spread_dte_sensitivity: {params['spread_dte_sensitivity']}")
     print(f"    spread_cap: {params['spread_cap']}")
     print()
-    print("  → Saved to option_spread_params (DB)")
+    print("  -> Saved to option_spread_params (DB)")
 
 
 def main(argv: list[str] | None = None) -> int:

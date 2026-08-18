@@ -1,0 +1,35 @@
+{
+  "window": 60,
+  "test_start": "2023-05-17",
+  "test_end": "2023-07-19",
+  "pnl": 0.0,
+  "return_pct": 0.0,
+  "trades": 0,
+  "win_rate": 0.0,
+  "sharpe": 0.0,
+  "max_drawdown": 0.0,
+  "strategies": {},
+  "best_params": {},
+  "note": "no_trades",
+  "model_weights": {
+    "range_predictor": {
+      "status": "ok",
+      "threshold_pct": 0.0754,
+      "fitted_weights": {
+        "xgboost": 0.5,
+        "lightgbm": 0.5
+      },
+      "cv_scores": {
+        "xgboost": 0.3150735294117647,
+        "lightgbm": 0.275
+      },
+      "in_range_rate": 0.5923076923076923,
+      "oos_scores": {
+        "n_samples": 22,
+        "base_rate": 0.9091,
+        "ml": {},
+        "statistical": {}
+      }
+    }
+  }
+}

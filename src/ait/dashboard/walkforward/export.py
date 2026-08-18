@@ -43,7 +43,10 @@ _DASHBOARD_FEATURE_KEYS = [
     "rsi_14", "macd", "macd_signal", "macd_hist",
     "sma_20", "sma_50", "bb_upper", "bb_lower", "bb_position",
     "atr_pct", "realized_vol_20", "iv_rank", "vix_level",
-    "hurst_wavelet", "sentiment_composite", "put_call_ratio", "volume_ratio",
+    "hurst_wavelet", "volume_ratio",
+    # R12-C: sentiment_composite / put_call_ratio removed with the
+    # sentiment/flow feature retirement (FeatureEngine no longer emits them;
+    # archived timeseries JSONs that still carry them are simply not rendered).
 ]
 
 # Map from FeatureEngine column name → dashboard key (only where they differ)
@@ -74,25 +77,50 @@ def _safe(x, default=None):
     return x
 
 
-def _sortino_from_pnls(pnls: list) -> float | None:
-    """Trade-based Sortino ratio (annualised, sqrt(252) factor).
+def _annualization_factor(trades: list) -> float:
+    """sqrt(trades-per-year) — replicates ait.backtesting.result.annualization_factor
+    (not imported: that module pulls in numpy/pandas, which this exporter
+    deliberately avoids).
 
-    Uses mean PnL as the target return and downside deviation computed from
-    trades that fell *below* the mean.  Returns None when undefined (fewer
-    than 2 downside observations or zero downside std).
+    sqrt(252) treated every TRADE as one trading DAY, overstating
+    Sharpe/Sortino ~4x at typical trade frequency (see result.py BT-H4 note).
+    Span runs first→last exit date; capped at daily sqrt(252).
     """
-    pnls = [p for p in pnls if p is not None]
+    try:
+        ds = sorted(
+            date.fromisoformat(str(t.get("exit_date") or t.get("exit_time")
+                                   or t.get("entry_date"))[:10])
+            for t in trades
+            if (t.get("exit_date") or t.get("exit_time") or t.get("entry_date"))
+        )
+        if len(ds) < 2:
+            return 1.0
+        span_days = max((ds[-1] - ds[0]).days, 1)
+        trades_per_year = len(ds) / (span_days / 365.25)
+        return math.sqrt(min(252.0, max(trades_per_year, 1.0)))
+    except Exception:
+        return 1.0
+
+
+def _sortino_from_trades(trades: list) -> float | None:
+    """Trade-based Sortino ratio, target-0 downside deviation.
+
+    downside_dev = sqrt(mean(min(p, 0)^2)) over ALL trades — matching
+    ait.backtesting.result.BacktestResult.sortino_ratio. The old
+    deviation-below-mean definition let a strategy losing a consistent
+    -$500 score downside-dev≈0. Annualised by sqrt(trades/yr) from the
+    exit-date span instead of sqrt(252) (which treated each trade as one
+    trading day). Returns None when undefined (fewer than 2 trades or no
+    downside observations).
+    """
+    pnls = [t.get("pnl") for t in trades if t.get("pnl") is not None]
     if len(pnls) < 2:
         return None
     mean = sum(pnls) / len(pnls)
-    downside = [p for p in pnls if p < mean]
-    if len(downside) < 2:
-        return None
-    ds_var = sum((p - mean) ** 2 for p in downside) / (len(downside) - 1)
-    ds_std = ds_var ** 0.5
-    if ds_std == 0:
-        return None
-    return _round((mean / ds_std) * (252 ** 0.5), 2)
+    ds_dev = math.sqrt(sum(min(p, 0.0) ** 2 for p in pnls) / len(pnls))
+    if ds_dev == 0:
+        return None  # no losing trades — Sortino is undefined/infinite
+    return _round((mean / ds_dev) * _annualization_factor(trades), 2)
 
 
 def _iso(d) -> str | None:
@@ -275,7 +303,9 @@ def build_ait(report_dir: Path) -> dict:
             "cash_drag_adjusted_return": None,
             "win_rate": _round(summary.get("win_rate", 0), 4),
             "sharpe_ratio": _round(summary.get("sharpe_ratio", 0), 2),
-            "sortino_ratio": _sortino_from_pnls([t["pnl"] for t in all_trades if _HAS_PANDAS]),
+            # target-0 Sortino from trade detail (no longer gated on pandas —
+            # the computation is pure stdlib)
+            "sortino_ratio": _sortino_from_trades(all_trades),
             "max_drawdown": _round(summary.get("max_drawdown_pct", 0), 4),
             "profit_factor": _round(summary.get("profit_factor", 0), 2),
             "consistency": _round(profitable_windows / n_windows, 4) if n_windows else 0,
@@ -946,8 +976,7 @@ def _feature_library() -> list[dict]:
         {"key": "vix_level", "label": "VIX", "group": "Cross-Asset", "pane": "iv"},
         {"key": "bb_position", "label": "Bollinger %B", "group": "Volatility", "pane": "bb"},
         {"key": "hurst_wavelet", "label": "Hurst (wavelet)", "group": "Fractal", "pane": "fractal"},
-        {"key": "sentiment_composite", "label": "Sentiment", "group": "Sentiment", "pane": "sent"},
-        {"key": "put_call_ratio", "label": "Put/Call Ratio", "group": "Sentiment", "pane": "sent"},
+        # R12-C: Sentiment pane entries removed with the sentiment feature retirement.
     ]
 
 

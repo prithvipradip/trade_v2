@@ -4,6 +4,22 @@ from __future__ import annotations
 
 import pytest
 
+
+def pytest_configure(config: pytest.Config) -> None:
+    """R12: marker registration. CANONICAL registration lives in pyproject
+    [tool.pytest.ini_options] markers; this mirror only keeps local runs
+    warning-clean if pyproject and tests land out of order (duplicate
+    registration is harmless)."""
+    config.addinivalue_line(
+        "markers",
+        "ibkr: live tests requiring IB Gateway on 127.0.0.1:4002 (run with -m ibkr)",
+    )
+    config.addinivalue_line(
+        "markers",
+        "slow: long-running suites (walkforward, optimizer, training); "
+        "excluded from the default selection, run nightly with -m slow",
+    )
+
 from ait.config.settings import (
     AccountConfig,
     MLConfig,
@@ -42,3 +58,25 @@ def account_config() -> AccountConfig:
 @pytest.fixture
 def account_config_over_25k() -> AccountConfig:
     return AccountConfig(pdt_protection=True, pdt_account_under_25k=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_model_artifacts(tmp_path, monkeypatch):
+    """R12 (vol-craft audit): tests constructed predictors with the DEFAULT
+    model dir — the LIVE models/ — and pytest runs overwrote models/range.pkl
+    with a synthetic-noise QQQ model (caught 2026-07-13, file mtime 13:12,
+    while the live gate depends on that artifact). Redirect every model save
+    in every test to tmp_path. The live spec-mismatch guard remains the
+    second net; this fixture is the fence."""
+    import ait.ml.range_predictor as _rp
+    import ait.ml.vol_magnitude_predictor as _vp
+    import ait.ml.ensemble as _en
+    # R15 #7: meta_label was MISSING from this fence — its own CWD-relative
+    # MODEL_DIR meant every pytest run on the trading box overwrote the LIVE
+    # models/meta_label.pkl with a test-fixture model. Enumerate by package
+    # scan would be better still; at minimum every module with a MODEL_DIR
+    # must appear here.
+    import ait.ml.meta_label as _ml
+    for _mod in (_rp, _vp, _en, _ml):
+        if hasattr(_mod, "MODEL_DIR"):
+            monkeypatch.setattr(_mod, "MODEL_DIR", tmp_path, raising=False)

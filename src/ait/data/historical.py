@@ -14,6 +14,17 @@ import pandas as pd
 
 from ait.utils.logging import get_logger
 
+def _safe_vol(v) -> int:
+    """int() that treats NaN/None/negative sentinel volume as 0."""
+    try:
+        f = float(v)
+        if f != f or f < 0:  # NaN or IB's -1 sentinel
+            return 0
+        return int(f)
+    except (TypeError, ValueError):
+        return 0
+
+
 log = get_logger("data.historical")
 
 DB_PATH = Path("data/historical.db")
@@ -74,6 +85,7 @@ class HistoricalDataStore:
                     low      REAL,
                     close    REAL,
                     volume   INTEGER,
+                    source   TEXT DEFAULT '',
                     PRIMARY KEY (symbol, datetime, interval)
                 )
             """)
@@ -130,14 +142,23 @@ class HistoricalDataStore:
                 float(row.get("High", 0)),
                 float(row.get("Low", 0)),
                 float(row.get("Close", 0)),
-                int(row.get("Volume", 0)),
+                _safe_vol(row.get("Volume", 0)),  # int(NaN) aborted the whole batch (deep-audit DATA-L10)
             ))
 
         with sqlite3.connect(self._db_path) as conn:
+            # Deep-audit DATA-H2: INSERT OR REPLACE deletes the whole
+            # conflicting row — including implied_vol, which this statement
+            # doesn't carry — so the daily retrain's save() nulled every IV
+            # the backfill had written, silently killing the IV/IV-rank
+            # features. Upsert only the OHLCV columns instead.
             conn.executemany(
-                f"""INSERT OR REPLACE INTO {self._daily_table}
+                f"""INSERT INTO {self._daily_table}
                    (symbol, date, open, high, low, close, volume)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(symbol, date) DO UPDATE SET
+                     open=excluded.open, high=excluded.high,
+                     low=excluded.low, close=excluded.close,
+                     volume=excluded.volume""",
                 rows,
             )
 
@@ -273,6 +294,7 @@ class HistoricalDataStore:
         symbol: str,
         df: pd.DataFrame,
         interval: str = "5m",
+        source: str = "TRADES",
     ) -> int:
         """Upsert 5-min bars into intraday table. Returns rows inserted/replaced."""
         if df is None or df.empty:
@@ -292,14 +314,30 @@ class HistoricalDataStore:
                 float(row.get("High",   0.0)),
                 float(row.get("Low",    0.0)),
                 float(row.get("Close",  0.0)),
-                int(row.get("Volume", 0)),
+                _safe_vol(row.get("Volume", 0)),  # int(NaN) aborted the whole batch (deep-audit DATA-L10)
+                source,  # A9: bar semantics tag (TRADES vs MIDPOINT vs YAHOO_ADJ)
             ))
 
         with sqlite3.connect(self._db_path) as conn:
+            # Guarded migration for pre-existing DBs (duplicate-add raises)
+            try:
+                conn.execute(f"ALTER TABLE {self._intraday_table} ADD COLUMN source TEXT DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
+            # R17: INSERT OR REPLACE let MIDPOINT bars (backfill_historical_data.py's
+            # default --what-to-show) silently overwrite real TRADES bars, since
+            # `source` isn't part of the primary key. Upsert instead, refusing to
+            # downgrade an existing TRADES row unless the incoming row is ALSO
+            # TRADES (which always wins, e.g. a genuine re-backfill).
             conn.executemany(
-                f"""INSERT OR REPLACE INTO {self._intraday_table}
-                   (symbol, datetime, interval, open, high, low, close, volume)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                f"""INSERT INTO {self._intraday_table}
+                   (symbol, datetime, interval, open, high, low, close, volume, source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(symbol, datetime, interval) DO UPDATE SET
+                       open=excluded.open, high=excluded.high, low=excluded.low,
+                       close=excluded.close, volume=excluded.volume, source=excluded.source
+                   WHERE {self._intraday_table}.source != 'TRADES'
+                      OR excluded.source = 'TRADES'""",
                 rows,
             )
 
@@ -411,6 +449,16 @@ class HistoricalDataStore:
         )
         daily.index = pd.to_datetime(daily.index)
         daily.index.name = "Date"
+        # A9 (deep-audit DATA-M8): drop TODAY's partial session — a half-day
+        # bar (partial High/Low/Volume, mid-session Close) fed live features
+        # a bar shape the models never saw in training (train/serve skew).
+        try:
+            from ait.utils.time import now_et
+            _today = pd.Timestamp(now_et().date())
+            if len(daily) and daily.index[-1] >= _today:
+                daily = daily[daily.index < _today]
+        except Exception:  # noqa: BLE001
+            pass
         log.debug("resampled_to_daily", symbol=symbol, rows=len(daily))
         return daily
 

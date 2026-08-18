@@ -1,0 +1,306 @@
+{
+  "window": 83,
+  "test_start": "2026-01-04",
+  "test_end": "2026-03-08",
+  "pnl": 1531.52,
+  "return_pct": 0.5105,
+  "trades": 3,
+  "win_rate": 1.0,
+  "sharpe": 196.6448,
+  "max_drawdown": 0.0,
+  "strategies": {
+    "wide_wing_condor": 3
+  },
+  "best_params": {},
+  "trades_detail": [
+    {
+      "symbol": "IWM",
+      "strategy": "wide_wing_condor",
+      "entry_date": "2026-01-20",
+      "entry_time": "2026-01-20",
+      "exit_date": "2026-01-26",
+      "exit_time": "2026-01-26",
+      "exit_reason": "take_profit_short",
+      "pnl": 515.48,
+      "entry_confidence": 0.9821,
+      "entry_regime": "range_bound",
+      "contracts": 5,
+      "n_legs": 4,
+      "hold_days": 6,
+      "entry_price": 2.9025,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 1.8195,
+      "entry_iv_rank": 0.0191,
+      "entry_vix_level": 0.5023,
+      "credit": 1451.25,
+      "max_loss": 9391.65,
+      "return_pct": 0.0549,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 252.0,
+          "premium": 1.5964
+        },
+        {
+          "type": "long_put",
+          "strike": 230.0,
+          "premium": -0.1451
+        },
+        {
+          "type": "short_call",
+          "strike": 275.0,
+          "premium": 1.5964
+        },
+        {
+          "type": "long_call",
+          "strike": 297.0,
+          "premium": -0.1451
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.9821,
+        "range_gate": {
+          "prob": 0.9821,
+          "threshold": 0.55,
+          "pass": true
+        },
+        "vol_gate": {
+          "vol_10d": 0.1189,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.0618,
+          "threshold": 0.2,
+          "pass": true
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 8,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": -0.065
+      },
+      "features_at_entry": {
+        "rsi_14": 68.22,
+        "macd_hist": 0.00285,
+        "bb_position": 0.78,
+        "atr_pct": 0.0131,
+        "realized_vol_20": 0.1354,
+        "iv_rank": 0.019,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.825
+      }
+    },
+    {
+      "symbol": "IWM",
+      "strategy": "wide_wing_condor",
+      "entry_date": "2026-02-02",
+      "entry_time": "2026-02-02",
+      "exit_date": "2026-02-11",
+      "exit_time": "2026-02-11",
+      "exit_reason": "take_profit_short",
+      "pnl": 492.66,
+      "entry_confidence": 0.9618,
+      "entry_regime": "range_bound",
+      "contracts": 5,
+      "n_legs": 4,
+      "hold_days": 9,
+      "entry_price": 2.8413,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 1.804,
+      "entry_iv_rank": 0.0918,
+      "entry_vix_level": 0.4085,
+      "credit": 1420.65,
+      "max_loss": 8750.85,
+      "return_pct": 0.0563,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 253.0,
+          "premium": 1.5627
+        },
+        {
+          "type": "long_put",
+          "strike": 233.0,
+          "premium": -0.1421
+        },
+        {
+          "type": "short_call",
+          "strike": 274.0,
+          "premium": 1.5627
+        },
+        {
+          "type": "long_call",
+          "strike": 294.0,
+          "premium": -0.1421
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.9618,
+        "range_gate": {
+          "prob": 0.9618,
+          "threshold": 0.55,
+          "pass": true
+        },
+        "vol_gate": {
+          "vol_10d": 0.1877,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.1237,
+          "threshold": 0.2,
+          "pass": true
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 4,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": 0.0863
+      },
+      "features_at_entry": {
+        "rsi_14": 51.16,
+        "macd_hist": -0.00311,
+        "bb_position": 0.504,
+        "atr_pct": 0.0158,
+        "realized_vol_20": 0.1621,
+        "iv_rank": 0.092,
+        "vix_level": 0.41,
+        "hurst_wavelet": 0.854
+      }
+    },
+    {
+      "symbol": "IWM",
+      "strategy": "wide_wing_condor",
+      "entry_date": "2026-02-18",
+      "entry_time": "2026-02-18",
+      "exit_date": "2026-02-25",
+      "exit_time": "2026-02-25",
+      "exit_reason": "take_profit_short",
+      "pnl": 523.38,
+      "entry_confidence": 0.6334,
+      "entry_regime": "range_bound",
+      "contracts": 5,
+      "n_legs": 4,
+      "hold_days": 7,
+      "entry_price": 3.0467,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 1.9479,
+      "entry_iv_rank": 0.235,
+      "entry_vix_level": 0.4905,
+      "credit": 1523.35,
+      "max_loss": 10084.65,
+      "return_pct": 0.0519,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 253.0,
+          "premium": 1.6757
+        },
+        {
+          "type": "long_put",
+          "strike": 230.0,
+          "premium": -0.1523
+        },
+        {
+          "type": "short_call",
+          "strike": 278.0,
+          "premium": 1.6757
+        },
+        {
+          "type": "long_call",
+          "strike": 301.0,
+          "premium": -0.1523
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.6334,
+        "range_gate": {
+          "prob": 0.6334,
+          "threshold": 0.55,
+          "pass": true
+        },
+        "vol_gate": {
+          "vol_10d": 0.2574,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.0242,
+          "threshold": 0.2,
+          "pass": true
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 9,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": 0.1742
+      },
+      "features_at_entry": {
+        "rsi_14": 50.94,
+        "macd_hist": -0.00165,
+        "bb_position": 0.534,
+        "atr_pct": 0.0235,
+        "realized_vol_20": 0.2146,
+        "iv_rank": 0.235,
+        "vix_level": 0.49,
+        "hurst_wavelet": 0.794
+      }
+    }
+  ],
+  "model_weights": {
+    "range_predictor": {
+      "status": "ok",
+      "threshold_pct": 0.0742,
+      "fitted_weights": {
+        "xgboost": 0.5043392015869078,
+        "lightgbm": 0.4956607984130922
+      },
+      "cv_scores": {
+        "xgboost": 0.6614285714285714,
+        "lightgbm": 0.6586507936507937
+      },
+      "in_range_rate": 0.8015873015873016
+    },
+    "direction_predictor": {
+      "fitted_weights": {
+        "xgboost": 0.4735247100936554,
+        "lightgbm": 0.5264752899063446
+      },
+      "cv_scores": {
+        "xgboost": 0.600494001308146,
+        "lightgbm": 0.6117314626771864
+      }
+    }
+  }
+}

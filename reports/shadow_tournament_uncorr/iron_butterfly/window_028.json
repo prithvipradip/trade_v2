@@ -1,0 +1,287 @@
+{
+  "window": 28,
+  "test_start": "2025-11-11",
+  "test_end": "2026-01-13",
+  "pnl": -331.6,
+  "return_pct": -0.1105,
+  "trades": 3,
+  "win_rate": 0.3333,
+  "sharpe": -0.4829,
+  "max_drawdown": 0.5029,
+  "strategies": {
+    "iron_butterfly": 3
+  },
+  "best_params": {},
+  "trades_detail": [
+    {
+      "symbol": "GLD",
+      "strategy": "iron_butterfly",
+      "entry_date": "2025-11-11",
+      "entry_time": "2025-11-11",
+      "exit_date": "2025-11-14",
+      "exit_time": "2025-11-14",
+      "exit_reason": "thesis_invalidated:bullish@0.84",
+      "pnl": -1149.12,
+      "entry_confidence": 0.3085,
+      "entry_regime": "range_bound",
+      "contracts": 7,
+      "n_legs": 4,
+      "hold_days": 3,
+      "entry_price": 10.0733,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 11.6629,
+      "entry_iv_rank": 1.0,
+      "entry_vix_level": 0.432,
+      "credit": 7051.31,
+      "max_loss": 3865.12,
+      "return_pct": -0.2973,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 380.0,
+          "premium": 5.5403
+        },
+        {
+          "type": "long_put",
+          "strike": 364.0,
+          "premium": -0.5037
+        },
+        {
+          "type": "short_call",
+          "strike": 380.0,
+          "premium": 5.5403
+        },
+        {
+          "type": "long_call",
+          "strike": 396.0,
+          "premium": -0.5037
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.3085,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.2954,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.3662,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 59,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": 0.0086
+      },
+      "features_at_entry": {
+        "rsi_14": 35.07,
+        "macd_hist": -0.00493,
+        "bb_position": 0.584,
+        "atr_pct": 0.0225,
+        "realized_vol_20": 0.3747,
+        "iv_rank": 1.0,
+        "vix_level": 0.43,
+        "hurst_wavelet": 0.564
+      }
+    },
+    {
+      "symbol": "GLD",
+      "strategy": "iron_butterfly",
+      "entry_date": "2025-11-24",
+      "entry_time": "2025-11-24",
+      "exit_date": "2025-12-10",
+      "exit_time": "2025-12-10",
+      "exit_reason": "expiry_approaching",
+      "pnl": -359.69,
+      "entry_confidence": 0.2366,
+      "entry_regime": "range_bound",
+      "contracts": 7,
+      "n_legs": 4,
+      "hold_days": 16,
+      "entry_price": 9.7822,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 10.244,
+      "entry_iv_rank": 0.4889,
+      "entry_vix_level": 0.513,
+      "credit": 6847.54,
+      "max_loss": 3738.7,
+      "return_pct": -0.0962,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 380.0,
+          "premium": 5.3802
+        },
+        {
+          "type": "long_put",
+          "strike": 365.0,
+          "premium": -0.4891
+        },
+        {
+          "type": "short_call",
+          "strike": 380.0,
+          "premium": 5.3802
+        },
+        {
+          "type": "long_call",
+          "strike": 395.0,
+          "premium": -0.4891
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.2366,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.257,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.4837,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 46,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": -0.4752
+      },
+      "features_at_entry": {
+        "rsi_14": 60.8,
+        "macd_hist": -0.00115,
+        "bb_position": 0.788,
+        "atr_pct": 0.0178,
+        "realized_vol_20": 0.2358,
+        "iv_rank": 0.489,
+        "vix_level": 0.51,
+        "hurst_wavelet": 0.639
+      }
+    },
+    {
+      "symbol": "GLD",
+      "strategy": "iron_butterfly",
+      "entry_date": "2025-12-22",
+      "entry_time": "2025-12-22",
+      "exit_date": "2026-01-07",
+      "exit_time": "2026-01-07",
+      "exit_reason": "take_profit_short",
+      "pnl": 1177.21,
+      "entry_confidence": 0.1117,
+      "entry_regime": "trending_up",
+      "contracts": 6,
+      "n_legs": 4,
+      "hold_days": 16,
+      "entry_price": 11.182,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 9.168,
+      "entry_iv_rank": 0.0838,
+      "entry_vix_level": 0.352,
+      "credit": 6709.2,
+      "max_loss": 3694.02,
+      "return_pct": 0.3187,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 408.0,
+          "premium": 6.1501
+        },
+        {
+          "type": "long_put",
+          "strike": 391.0,
+          "premium": -0.5591
+        },
+        {
+          "type": "short_call",
+          "strike": 408.0,
+          "premium": 6.1501
+        },
+        {
+          "type": "long_call",
+          "strike": 425.0,
+          "premium": -0.5591
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.1117,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.1145,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.8317,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "trending_up",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 18,
+          "blocked": false
+        },
+        "regime_class": "trending_up",
+        "iv_rank_rise_10d": -0.2302
+      },
+      "features_at_entry": {
+        "rsi_14": 89.5,
+        "macd_hist": 0.00227,
+        "bb_position": 1.106,
+        "atr_pct": 0.0123,
+        "realized_vol_20": 0.1124,
+        "iv_rank": 0.084,
+        "vix_level": 0.35,
+        "hurst_wavelet": 0.704
+      }
+    }
+  ],
+  "model_weights": {
+    "range_predictor": {
+      "status": "training_returned_no_accuracy",
+      "threshold_pct": 0.0364
+    }
+  }
+}

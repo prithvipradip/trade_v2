@@ -7,7 +7,7 @@ Usage:
     # Explicit run directory:
     python scripts/export_production_params.py \\
         --run-dir reports/runs/QQQ_2Y_iron_condor_per_strategy_20260512 \\
-        --base-config config_QQQ_test.yaml \\
+        --base-config deprecated/configs/config_QQQ_test.yaml \\
         --output config_QQQ_production.yaml
 
     # Preview only (no file written):

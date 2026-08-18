@@ -28,8 +28,44 @@ class SignalDirection(str, Enum):
 # Everything else is a DEBIT strategy (entry paid, exit received).
 # Single source of truth — executor, portfolio manager, and reconciler
 # all branch on this set.
-CREDIT_STRATEGIES = frozenset({
+#
+# R16: this file and backtesting/engine.py both declared a set NAMED
+# CREDIT_STRATEGIES with DIFFERENT membership (4 here vs 11 there). Nothing
+# forced them to agree, so promoting any engine-only arm live would have had
+# every consumer of THIS set (credit P&L sign convention, credit position
+# caps, macro gates) silently misclassify it as a debit structure. The
+# membership is now declared once, here, and engine.py imports it — a
+# backtest-only name can never fork classification again.
+#
+# LIVE_CREDIT_STRATEGIES = names the live selector can actually instantiate
+# (STRATEGY_MAP in strategies/selector.py); BACKTEST_CREDIT_STRATEGIES =
+# shadow-tournament arms that exist only inside the engine. Both are credit
+# structures, so both belong in CREDIT_STRATEGIES: classification follows the
+# cash-flow direction, not whether the name happens to be tradeable today.
+LIVE_CREDIT_STRATEGIES = frozenset({
     "iron_condor", "short_strangle", "covered_call", "cash_secured_put",
+})
+
+BACKTEST_CREDIT_STRATEGIES = frozenset({
+    "iron_butterfly", "wide_wing_condor", "broken_wing_condor",
+    "call_credit_spread", "put_credit_spread", "jade_lizard",
+    "short_straddle",
+})
+
+CREDIT_STRATEGIES = LIVE_CREDIT_STRATEGIES | BACKTEST_CREDIT_STRATEGIES
+
+# R16: strategies whose max loss is NOT structurally capped. Signal.max_loss
+# for these is a stress ESTIMATE (always > 0), so "max_loss > 0" could never
+# identify them — strangle signals reported is_defined_risk=True, silently
+# defeating the defined-risk-first ordering and the +10 ranking bonus.
+# R16: jade_lizard added — its short put is NAKED (backtest max_loss_per_share
+# = short_put_strike - credit, ~7x a same-underlying condor's). It is a
+# backtest-only arm today, so this is pre-emptive: if it is ever promoted it
+# must not read as defined-risk here while the engine flattens it as
+# strangle-class risk before macro events.
+UNDEFINED_RISK_STRATEGIES = frozenset({
+    "short_strangle", "short_straddle", "covered_call", "cash_secured_put",
+    "jade_lizard",
 })
 
 
@@ -72,8 +108,15 @@ class Signal:
 
     @property
     def is_defined_risk(self) -> bool:
-        """Whether this trade has defined (capped) maximum loss."""
-        return self.max_loss > 0
+        """Whether this trade has a structurally capped maximum loss.
+
+        R16: identity-based, NOT max_loss>0 — undefined-risk strategies set
+        max_loss to a positive stress ESTIMATE for sizing, which made every
+        strangle read as defined-risk (ordering + ranking bonus no-ops).
+        max_loss remains the sizing estimate only.
+        """
+        return (self.strategy_name not in UNDEFINED_RISK_STRATEGIES
+                and self.max_loss > 0)
 
     def __repr__(self) -> str:
         return (
@@ -84,6 +127,18 @@ class Signal:
 
 class Strategy(ABC):
     """Abstract base class for all trading strategies."""
+
+    # R7-SOON (budget-aware construction): per-trade dollar risk budget for
+    # the CURRENT account, refreshed by the orchestrator each scan cycle via
+    # StrategySelector.generate_all_signals(risk_budget=...). None = no
+    # constraint (paper big-account behavior). Strategies that build
+    # defined-risk structures should cap width so max_loss fits this budget.
+    # R17: set by mutating this shared, long-lived instance (see
+    # selector.py), NOT thread/coroutine-safe. Safe today only because
+    # per-symbol scanning is strictly sequential — do not parallelize it
+    # without first threading risk_budget as an explicit
+    # generate_signals(...) parameter instead.
+    risk_budget: float | None = None
 
     @property
     @abstractmethod
@@ -126,11 +181,24 @@ class Strategy(ABC):
         self,
         contracts: list[OptionContract],
         target_delta: float,
+        tolerance: float | None = 0.07,
     ) -> OptionContract | None:
-        """Find the contract closest to a target delta."""
+        """Find the contract closest to a target delta.
+
+        R12-B (vol agent, 07-07 SPY condor): unbounded closest-match is how a
+        "0.20-delta" short call filled at 0.49 DELTA — on a thin/degraded
+        chain the nearest liquid contract can be ANY delta, and every
+        downstream gate rewarded the closer-to-ATM error. Reject when the
+        best candidate is outside target +/- tolerance (default 0.07) so no
+        strategy silently trades a structure it didn't design. Pass
+        tolerance=None to restore the old unbounded behavior.
+        """
         if not contracts:
             return None
-        return min(contracts, key=lambda c: abs(abs(c.delta) - target_delta))
+        best = min(contracts, key=lambda c: abs(abs(c.delta) - target_delta))
+        if tolerance is not None and abs(abs(best.delta) - target_delta) > tolerance:
+            return None
+        return best
 
     def _find_strike_near(
         self,

@@ -1,0 +1,375 @@
+{
+  "window": 17,
+  "test_start": "2024-08-07",
+  "test_end": "2024-10-09",
+  "pnl": -699.43,
+  "return_pct": -0.2331,
+  "trades": 4,
+  "win_rate": 0.5,
+  "sharpe": -0.8966,
+  "max_drawdown": 0.6233,
+  "strategies": {
+    "wide_wing_condor": 4
+  },
+  "best_params": {},
+  "trades_detail": [
+    {
+      "symbol": "QQQ",
+      "strategy": "wide_wing_condor",
+      "entry_date": "2024-08-12",
+      "entry_time": "2024-08-12",
+      "exit_date": "2024-08-19",
+      "exit_time": "2024-08-19",
+      "exit_reason": "credit_loss_limit",
+      "pnl": -1599.18,
+      "entry_confidence": 0.205,
+      "entry_regime": "high_volatility",
+      "contracts": 2,
+      "n_legs": 4,
+      "hold_days": 7,
+      "entry_price": 5.49,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 13.4339,
+      "entry_iv_rank": 0.9602,
+      "entry_vix_level": 0.5177,
+      "credit": 1098.0,
+      "max_loss": 7156.28,
+      "return_pct": -0.2235,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 432.0,
+          "premium": 3.0195
+        },
+        {
+          "type": "long_put",
+          "strike": 391.0,
+          "premium": -0.2745
+        },
+        {
+          "type": "short_call",
+          "strike": 476.0,
+          "premium": 3.0195
+        },
+        {
+          "type": "long_call",
+          "strike": 517.0,
+          "premium": -0.2745
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.205,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.3448,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.6365,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "high_volatility",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 515,
+          "blocked": false
+        },
+        "regime_class": "high_volatility",
+        "iv_rank_rise_10d": -0.0398
+      },
+      "features_at_entry": {
+        "rsi_14": 39.11,
+        "macd_hist": -0.00555,
+        "bb_position": 0.266,
+        "atr_pct": 0.0254,
+        "realized_vol_20": 0.2963,
+        "iv_rank": 0.96,
+        "vix_level": 0.52,
+        "hurst_wavelet": 0.767
+      }
+    },
+    {
+      "symbol": "IWM",
+      "strategy": "wide_wing_condor",
+      "entry_date": "2024-08-13",
+      "entry_time": "2024-08-13",
+      "exit_date": "2024-08-29",
+      "exit_time": "2024-08-29",
+      "exit_reason": "expiry_approaching",
+      "pnl": -270.75,
+      "entry_confidence": 0.1116,
+      "entry_regime": "high_volatility",
+      "contracts": 6,
+      "n_legs": 4,
+      "hold_days": 16,
+      "entry_price": 2.6462,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 3.0455,
+      "entry_iv_rank": 0.9025,
+      "entry_vix_level": 0.453,
+      "credit": 1587.72,
+      "max_loss": 9954.6,
+      "return_pct": -0.0272,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 199.0,
+          "premium": 1.4554
+        },
+        {
+          "type": "long_put",
+          "strike": 180.0,
+          "premium": -0.1323
+        },
+        {
+          "type": "short_call",
+          "strike": 219.0,
+          "premium": 1.4554
+        },
+        {
+          "type": "long_call",
+          "strike": 238.0,
+          "premium": -0.1323
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.1116,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.3346,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.768,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "high_volatility",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 514,
+          "blocked": false
+        },
+        "regime_class": "high_volatility",
+        "iv_rank_rise_10d": -0.0975
+      },
+      "features_at_entry": {
+        "rsi_14": 37.82,
+        "macd_hist": -0.00999,
+        "bb_position": 0.217,
+        "atr_pct": 0.0266,
+        "realized_vol_20": 0.3228,
+        "iv_rank": 0.902,
+        "vix_level": 0.45,
+        "hurst_wavelet": 0.714
+      }
+    },
+    {
+      "symbol": "IWM",
+      "strategy": "wide_wing_condor",
+      "entry_date": "2024-09-13",
+      "entry_time": "2024-09-13",
+      "exit_date": "2024-09-23",
+      "exit_time": "2024-09-23",
+      "exit_reason": "take_profit_short",
+      "pnl": 656.5,
+      "entry_confidence": 0.1241,
+      "entry_regime": "range_bound",
+      "contracts": 6,
+      "n_legs": 4,
+      "hold_days": 10,
+      "entry_price": 2.6089,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 1.4627,
+      "entry_iv_rank": 0.4739,
+      "entry_vix_level": 0.414,
+      "credit": 1565.34,
+      "max_loss": 9897.24,
+      "return_pct": 0.0663,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 208.0,
+          "premium": 1.4349
+        },
+        {
+          "type": "long_put",
+          "strike": 189.0,
+          "premium": -0.1304
+        },
+        {
+          "type": "short_call",
+          "strike": 228.0,
+          "premium": 1.4349
+        },
+        {
+          "type": "long_call",
+          "strike": 247.0,
+          "premium": -0.1304
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.1241,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.245,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.6529,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 483,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": -0.3353
+      },
+      "features_at_entry": {
+        "rsi_14": 43.55,
+        "macd_hist": -0.00132,
+        "bb_position": 0.654,
+        "atr_pct": 0.0184,
+        "realized_vol_20": 0.2253,
+        "iv_rank": 0.474,
+        "vix_level": 0.41,
+        "hurst_wavelet": 0.9
+      }
+    },
+    {
+      "symbol": "IWM",
+      "strategy": "wide_wing_condor",
+      "entry_date": "2024-10-03",
+      "entry_time": "2024-10-03",
+      "exit_date": "2024-10-09",
+      "exit_time": "2024-10-09",
+      "exit_reason": "backtest_end",
+      "pnl": 514.0,
+      "entry_confidence": 0.0,
+      "entry_regime": "range_bound",
+      "contracts": 6,
+      "n_legs": 4,
+      "hold_days": 6,
+      "entry_price": 2.5827,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 1.674,
+      "entry_iv_rank": 0.2534,
+      "entry_vix_level": 0.5122,
+      "credit": 1549.62,
+      "max_loss": 9877.56,
+      "return_pct": 0.052,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 207.0,
+          "premium": 1.4205
+        },
+        {
+          "type": "long_put",
+          "strike": 188.0,
+          "premium": -0.1291
+        },
+        {
+          "type": "short_call",
+          "strike": 227.0,
+          "premium": 1.4205
+        },
+        {
+          "type": "long_call",
+          "strike": 246.0,
+          "premium": -0.1291
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.0,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.1253,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.9,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 463,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": -0.1896
+      },
+      "features_at_entry": {
+        "rsi_14": 48.42,
+        "macd_hist": -0.00154,
+        "bb_position": 0.468,
+        "atr_pct": 0.0165,
+        "realized_vol_20": 0.1751,
+        "iv_rank": 0.253,
+        "vix_level": 0.51,
+        "hurst_wavelet": 0.9
+      }
+    }
+  ],
+  "model_weights": {
+    "range_predictor": {
+      "status": "training_returned_no_accuracy",
+      "threshold_pct": 0.0757
+    }
+  }
+}

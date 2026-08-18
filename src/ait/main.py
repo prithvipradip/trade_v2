@@ -17,9 +17,35 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import faulthandler
 import signal
 import sys
 from pathlib import Path
+
+# R16: apply the shared runtime env contract BEFORE any trading subsystem
+# import. A bare `python -m ait.main` used to run with macro protections
+# OFF, k=1.0 wings, the 0.20 floor, and the undefined-risk gate open —
+# silently different economics from the supervised launch path.
+# runtime_env is import-light; the KMP/OMP crash guards land before numpy.
+from ait.config.runtime_env import apply_runtime_env_defaults
+
+apply_runtime_env_defaults()
+
+# Dump the Python stack on a native crash (segfault / access violation) to
+# stderr -> bot_stdout.log. The bot was dying every 30-60 min to a c0000005
+# access violation in a C-extension (2026-06-24); this names the exact call
+# site on the next crash so we can pin the culprit library.
+# R5 audit F4: dumps used to go to stderr -> bot_stdout.log, where the
+# rotation/truncation cycle destroyed every one of them — the c0000005 call
+# site is still unproven after ~30 WER crash reports. Dedicated always-open
+# file; falls back to stderr if the logs dir is unwritable.
+try:
+    from pathlib import Path as _P
+    _P("logs").mkdir(exist_ok=True)
+    _fatal_log = open("logs/fatal.log", "a")
+    faulthandler.enable(file=_fatal_log)
+except Exception:
+    faulthandler.enable()
 
 from ait.bot.orchestrator import TradingOrchestrator
 from ait.broker.ibkr_client import IBKRClient
@@ -29,6 +55,10 @@ from ait.utils.logging import get_logger, setup_logging
 
 log = get_logger("main")
 
+# R17: exceeds orchestrator._shutdown()'s own 15s notify-task drain, so a
+# graceful stop has room to actually send the "bot shutting down" message.
+GRACEFUL_SHUTDOWN_TIMEOUT = 30
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="AIT v2 - Autonomous Intelligent Trading")
@@ -36,6 +66,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--paper", action="store_true", help="Force paper trading mode")
     parser.add_argument("--dashboard-only", action="store_true", help="Run dashboard only")
     return parser.parse_args()
+
+
+async def _graceful_shutdown_bot_task(orchestrator, bot_task: asyncio.Task) -> None:
+    """R17: stop the orchestrator's run() loop gracefully before cancelling.
+
+    run()'s while-loop only reaches its post-loop await self._shutdown()
+    (notify-drain, etc.) after self._running goes False AND the current
+    phase-processing chunk returns -- hard-cancelling immediately injects
+    CancelledError wherever run() happens to be awaiting, unwinding it
+    before _shutdown() is ever called. Ask nicely first, with a bounded
+    grace window; cancel only if it doesn't exit in time -- same behavior
+    as before for a shutdown mid-long-wait, strictly better for the common
+    case (mid trading-loop, cadence tens of seconds).
+    """
+    await orchestrator.stop()
+    try:
+        await asyncio.wait_for(bot_task, timeout=GRACEFUL_SHUTDOWN_TIMEOUT)
+    except asyncio.TimeoutError:
+        log.warning("graceful_shutdown_timed_out_cancelling")
+        bot_task.cancel()
+        try:
+            await bot_task
+        except asyncio.CancelledError:
+            pass
 
 
 async def run_bot(args: argparse.Namespace) -> None:
@@ -116,6 +170,10 @@ async def run_bot(args: argparse.Namespace) -> None:
             [bot_task, shutdown_task],
             return_when=asyncio.FIRST_COMPLETED,
         )
+
+        if bot_task in pending:
+            await _graceful_shutdown_bot_task(orchestrator, bot_task)
+            pending.discard(bot_task)
 
         # Cancel remaining tasks
         for task in pending:

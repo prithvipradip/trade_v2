@@ -232,4 +232,6 @@ if __name__ == '__main__':
     print("  AIT v2 Web Log Viewer")
     print("  Open http://localhost:8502")
     print("=" * 50)
-    app.run(host='0.0.0.0', port=8502, debug=False)
+    # localhost ONLY (deep-audit S1): 0.0.0.0 exposed the raw live trade
+    # stream (positions, orders, P&L) to the whole LAN with no auth.
+    app.run(host='127.0.0.1', port=8502, debug=False)

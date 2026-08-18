@@ -34,7 +34,14 @@ from ait.utils.logging import get_logger
 
 log = get_logger("ml.ensemble")
 
-MODEL_DIR = Path("models")
+# R16 #2: absolute, repo-anchored models dir (trade_v2/models). The old
+# CWD-relative Path("models") meant any process's CWD decided which
+# ensemble.pkl got read/WRITTEN — a walkforward run from repo root clobbered
+# the LIVE artifact (the bot served an IWM-only window model for 2.5 market
+# hours on 2026-08-03). The pytest conftest fence monkeypatches this module
+# attribute to tmp_path; resolve it lazily (self.model_dir) so the fence
+# keeps working.
+MODEL_DIR = Path(__file__).resolve().parents[3] / "models"
 
 
 @dataclass
@@ -54,9 +61,27 @@ class DirectionPredictor:
     LABELS = {0: SignalDirection.BEARISH, 1: SignalDirection.NEUTRAL, 2: SignalDirection.BULLISH}
     LABEL_MAP = {v: k for k, v in LABELS.items()}
 
-    def __init__(self, config: MLConfig) -> None:
+    def __init__(
+        self,
+        config: MLConfig,
+        model_dir: "Path | str | None" = None,
+        persist_artifacts: bool = True,
+    ) -> None:
+        """Args:
+            config: ML configuration.
+            model_dir: R16 #2 artifact fence — where models are saved/loaded.
+                None -> the module-level MODEL_DIR (absolute repo-anchored
+                live models dir; monkeypatched to tmp_path under pytest).
+                Research/window training must pass its own directory OR set
+                persist_artifacts=False.
+            persist_artifacts: False -> train() never writes to disk (used by
+                walkforward window training — window models are throwaway and
+                previously clobbered the LIVE models/ensemble.pkl).
+        """
         self._config = config
         self._feature_engine = FeatureEngine()
+        self._model_dir: Path | None = Path(model_dir) if model_dir is not None else None
+        self._persist_artifacts = bool(persist_artifacts)
 
         # Per-symbol model storage: {symbol: {models, scaler, feature_names, scores}}
         self._symbol_models: dict[str, dict] = {}
@@ -74,7 +99,14 @@ class DirectionPredictor:
         self._xgb_kwargs: dict = {}
         self._lgbm_kwargs: dict = {}
 
-        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        if self._persist_artifacts:
+            self.model_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def model_dir(self) -> Path:
+        """Artifact directory: explicit constructor fence when given, else the
+        module default (which the pytest conftest fence monkeypatches)."""
+        return self._model_dir if self._model_dir is not None else MODEL_DIR
 
     @property
     def is_trained(self) -> bool:
@@ -124,7 +156,11 @@ class DirectionPredictor:
             return None
 
         # Use only the last row (current prediction)
-        X = features[feature_names].iloc[[-1]]
+        # Deep-audit ML-F7: direct column indexing raised KeyError when a
+        # VLMC-trained model met a symbol whose intraday store was empty at
+        # predict time. Reindex + neutral-fill instead (predict_from_features
+        # already did this).
+        X = features.reindex(columns=feature_names).fillna(0.0).iloc[[-1]]
 
         try:
             # Keep as DataFrame with feature names so LightGBM/sklearn agree
@@ -181,7 +217,7 @@ class DirectionPredictor:
             direction=direction,
             confidence=confidence,
             probabilities=probabilities,
-            features_used=len(self._feature_names),
+            features_used=len(feature_names),  # per-symbol list, not the global one (deep-audit ML-F7)
             model_version=self._model_version,
         )
 
@@ -369,7 +405,17 @@ class DirectionPredictor:
                          accuracies=accuracies, fitted_weights=fitted_weights,
                          features=len(self._feature_names))
 
-            self._save_models()
+            # R16 #2: window/research training passes persist_artifacts=False
+            # so a train() can NEVER touch the live ensemble.pkl (or churn its
+            # versioned rollback copies).
+            if self._persist_artifacts:
+                self._save_models()
+            else:
+                log.info(
+                    "ensemble_not_persisted",
+                    version=self._model_version,
+                    reason="persist_artifacts=False (research/window model)",
+                )
             log.info(
                 "ensemble_trained",
                 version=self._model_version,
@@ -391,9 +437,9 @@ class DirectionPredictor:
             version: Specific version to load. None = latest (ensemble.pkl).
         """
         if version:
-            model_file = MODEL_DIR / f"ensemble_{version}.pkl"
+            model_file = self.model_dir / f"ensemble_{version}.pkl"
         else:
-            model_file = MODEL_DIR / "ensemble.pkl"
+            model_file = self.model_dir / "ensemble.pkl"
 
         if not model_file.exists():
             return False
@@ -416,8 +462,14 @@ class DirectionPredictor:
             log.error("model_load_failed", error=str(e))
             return False
 
-    def _save_models(self) -> None:
-        """Save trained models to disk with versioning."""
+    def _save_models(self) -> bool:
+        """Save trained models to disk with versioning.
+
+        R19: returns whether models/ensemble.pkl now holds THIS in-memory
+        model. rollback() must know — a rollback whose write failed leaves the
+        degraded artifact on disk for the live bot to load, which has to be
+        loud, not silent.
+        """
         data = {
             "models": self._models,
             "scaler": self._scaler,
@@ -427,18 +479,31 @@ class DirectionPredictor:
             "symbol_models": self._symbol_models,
         }
 
-        # Save as current (ensemble.pkl)
-        model_file = MODEL_DIR / "ensemble.pkl"
+        # Save as current (ensemble.pkl) — ATOMIC: write tmp then os.replace,
+        # so a concurrent reader (live bot) or a second writer (7:30 retrain
+        # subprocess vs mid-day bot train) can never observe/produce a
+        # half-written pickle. A corrupted-model event was already referenced
+        # in adaptor.py (2026-06-23). Audit 2026-07-07 item 3.1.
+        import os as _os
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+        model_file = self.model_dir / "ensemble.pkl"
+        tmp_file = self.model_dir / "ensemble.pkl.tmp"
         try:
-            with open(model_file, "wb") as f:
+            with open(tmp_file, "wb") as f:
                 pickle.dump(data, f)
+            _os.replace(tmp_file, model_file)
         except Exception as e:
             log.error("model_save_failed", error=str(e))
-            return
+            try:
+                if tmp_file.exists():
+                    tmp_file.unlink()
+            except Exception:
+                pass
+            return False
 
         # Save versioned copy for rollback
         if self._model_version:
-            versioned_file = MODEL_DIR / f"ensemble_{self._model_version}.pkl"
+            versioned_file = self.model_dir / f"ensemble_{self._model_version}.pkl"
             try:
                 with open(versioned_file, "wb") as f:
                     pickle.dump(data, f)
@@ -449,28 +514,70 @@ class DirectionPredictor:
             # Prune old versions (keep last 5)
             self._prune_old_versions(keep=5)
 
+        return True
+
     def _prune_old_versions(self, keep: int = 5) -> None:
         """Remove old model versions, keeping only the N most recent."""
-        versions = sorted(MODEL_DIR.glob("ensemble_v-*.pkl"))
+        versions = sorted(self.model_dir.glob("ensemble_v-*.pkl"))
         if len(versions) > keep:
             for old in versions[:-keep]:
                 old.unlink()
                 log.debug("pruned_old_model", path=str(old))
 
     def rollback(self, version: str) -> bool:
-        """Roll back to a specific model version. Falls back to latest if target missing."""
+        """Roll back to a specific model version, IN MEMORY AND ON DISK.
+
+        Returns True only when models/ensemble.pkl now holds `version`.
+
+        R19: this used to load_models() and stop there. The retrain that
+        decides to roll back runs in the 7:30 subprocess (master.py) which
+        exits seconds later, so the in-memory revert died with it while the
+        just-written models/ensemble.pkl still held the DEGRADED model — the
+        live bot's next load_models() (orchestrator ensure_models_ready)
+        served exactly the model the rollback had rejected. A rollback that
+        does not rewrite the artifact is not a rollback.
+
+        The "target missing" fallback also had to change: loading the latest
+        ensemble.pkl loads the degraded model itself, so it can never be
+        reported as a successful rollback (and must never be re-persisted).
+        Keep the load for in-memory continuity, return False, and say so
+        loudly — an unprotected retrain is an operator-visible event.
+        """
         log.info("model_rollback_requested", target_version=version)
-        success = self.load_models(version=version)
-        if not success:
-            log.warning("rollback_target_missing", version=version,
-                        hint="Loading latest available model instead")
-            success = self.load_models()  # Load latest ensemble.pkl
-        return success
+        if not self.load_models(version=version):
+            log.critical(
+                "model_rollback_target_missing",
+                version=version,
+                note="rollback artifact absent — the DEGRADED model stays on "
+                     "disk and will be loaded by the live bot; needs review",
+            )
+            self.load_models()  # in-memory continuity only — NOT a rollback
+            return False
+
+        # R16 #2 artifact fence still applies: a research/window predictor
+        # must never write the live ensemble.pkl, rollback or not.
+        if not self._persist_artifacts:
+            log.info("model_rollback_not_persisted", version=version,
+                     reason="persist_artifacts=False (research/window model)")
+            return True
+
+        if not self._save_models():
+            log.critical(
+                "model_rollback_persist_failed",
+                version=version,
+                note="rolled back in memory but ensemble.pkl still holds the "
+                     "degraded model — the live bot will load it on restart",
+            )
+            return False
+
+        log.warning("model_rollback_persisted", version=self._model_version,
+                    path=str(self.model_dir / "ensemble.pkl"))
+        return True
 
     def list_versions(self) -> list[dict]:
         """List available model versions."""
         versions = []
-        for f in sorted(MODEL_DIR.glob("ensemble_v-*.pkl")):
+        for f in sorted(self.model_dir.glob("ensemble_v-*.pkl")):
             try:
                 with open(f, "rb") as fh:
                     data = pickle.load(fh)
@@ -493,6 +600,23 @@ class DirectionPredictor:
     def cv_scores(self) -> dict[str, float]:
         return self._cv_scores
 
+    @cv_scores.setter
+    def cv_scores(self, scores: "dict[str, float]") -> None:
+        """R19: cv_scores was getter-only, so the R17 auto-rollback fix
+        (`self._predictor.cv_scores = {"all_symbol_mean": ...}` in
+        trainer.train_all_symbols) raised AttributeError on EVERY retrain and
+        its own `except Exception: pass` swallowed it. The rollback decision
+        therefore kept comparing the LAST symbol's per-model scores — the
+        ML-F9/A8 defect that two rounds of fixes each believed they had
+        closed. A setter makes the assignment real; the trainer's `if _vals`
+        guard already keeps it from ever being set to an empty dict.
+        """
+        if not isinstance(scores, dict):
+            raise TypeError(
+                f"cv_scores must be a dict, got {type(scores).__name__}"
+            )
+        self._cv_scores = dict(scores)
+
     def _create_labels(self, close: pd.Series) -> pd.Series:
         """Create 3-class labels from 5-day forward returns.
 
@@ -508,9 +632,14 @@ class DirectionPredictor:
         and gives the model more directional training signal.
         """
         fwd_return = close.pct_change(5).shift(-5)  # 5-day forward return
-        labels = pd.Series(1, index=close.index, dtype=float)  # Default neutral
+        # Deep-audit ML-F3: initialising to 1 stamped the last 5 rows (whose
+        # forward return is unknowable NaN) as NEUTRAL on every retrain —
+        # systematically wrong labels at the most regime-relevant rows.
+        # NaN-init means dropna(subset=["target"]) removes them instead.
+        labels = pd.Series(float("nan"), index=close.index, dtype=float)
         labels[fwd_return > 0.01] = 2    # Bullish: >+1.0% in 5 days
         labels[fwd_return < -0.01] = 0   # Bearish: <-1.0% in 5 days
+        labels[(fwd_return <= 0.01) & (fwd_return >= -0.01)] = 1  # Neutral
         return labels
 
     @staticmethod

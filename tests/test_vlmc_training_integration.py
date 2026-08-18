@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from ait.ml.features import FeatureEngine
+
+# R12: long-running suite (walk-forward training) — excluded from the
+# default/CI fast selection; the nightly CI job runs -m slow.
+pytestmark = pytest.mark.slow
 
 
 def _make_ohlcv(days: int = 150, seed: int = 42) -> pd.DataFrame:

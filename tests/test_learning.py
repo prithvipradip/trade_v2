@@ -126,20 +126,48 @@ class TestStrategyAdaptor:
     """Test strategy adaptation from insights."""
 
     def test_disable_losing_strategy(self, tmp_db):
+        """Disabling works for NON-protected strategies.
+
+        R12: the old version disabled iron_condor, which production now
+        blocks via PROTECTED_STRATEGIES (auto-disable on corrupted P&L data
+        silently halted all trading on 2026-06-23). The disable path itself
+        is still live for every other strategy.
+        """
         _, state = tmp_db
         adaptor = StrategyAdaptor(state)
 
         insights = [TradeInsight(
             category="strategy",
-            insight="iron_condor losing",
-            action="disable_iron_condor",
+            insight="long_put losing",
+            action="disable_long_put",
             confidence=0.8,
         )]
 
         adaptations = adaptor.apply_insights(insights)
         assert len(adaptations) == 1
-        assert not adaptor.is_strategy_enabled("iron_condor")
-        assert adaptor.get_strategy_multiplier("iron_condor") == 0.0
+        assert not adaptor.is_strategy_enabled("long_put")
+        assert adaptor.get_strategy_multiplier("long_put") == 0.0
+
+    def test_protected_strategy_cannot_be_disabled(self, tmp_db):
+        """iron_condor is in PROTECTED_STRATEGIES — the learning engine must
+        NEVER auto-disable it, no matter how confident the insight."""
+        _, state = tmp_db
+        adaptor = StrategyAdaptor(state)
+
+        insights = [TradeInsight(
+            category="strategy",
+            insight="iron_condor losing (possibly corrupted P&L data)",
+            action="disable_iron_condor",
+            confidence=0.99,
+        )]
+
+        adaptations = adaptor.apply_insights(insights)
+        assert adaptations == []
+        assert adaptor.is_strategy_enabled("iron_condor")
+        assert adaptor.get_strategy_multiplier("iron_condor") == 1.0
+        # And nothing was persisted that a reload would resurrect
+        adaptor2 = StrategyAdaptor(state)
+        assert adaptor2.is_strategy_enabled("iron_condor")
 
     def test_boost_winning_strategy(self, tmp_db):
         _, state = tmp_db
@@ -192,8 +220,10 @@ class TestStrategyAdaptor:
         limits = AdaptationLimits(max_adaptations_per_cycle=2)
         adaptor = StrategyAdaptor(state, limits)
 
+        # All three actions are individually applicable (non-protected
+        # strategy) so the cap is what stops the third one.
         insights = [
-            TradeInsight(category="strategy", insight="a", action="disable_iron_condor", confidence=0.9),
+            TradeInsight(category="strategy", insight="a", action="disable_long_put", confidence=0.9),
             TradeInsight(category="strategy", insight="b", action="boost_long_call", confidence=0.8),
             TradeInsight(category="symbol", insight="c", action="remove_symbol_TSLA", confidence=0.7),
         ]
@@ -233,26 +263,27 @@ class TestStrategyAdaptor:
     def test_state_persists_and_loads(self, tmp_db):
         _, state = tmp_db
 
-        # Apply an adaptation
+        # Apply an adaptation (non-protected strategy — see PROTECTED_STRATEGIES)
         adaptor1 = StrategyAdaptor(state)
         adaptor1.apply_insights([TradeInsight(
-            category="strategy", insight="x", action="disable_iron_condor", confidence=0.8,
+            category="strategy", insight="x", action="disable_long_put", confidence=0.8,
         )])
 
         # New instance should load persisted state
         adaptor2 = StrategyAdaptor(state)
-        assert not adaptor2.is_strategy_enabled("iron_condor")
+        assert not adaptor2.is_strategy_enabled("long_put")
 
     def test_reset_clears_all(self, tmp_db):
         _, state = tmp_db
         adaptor = StrategyAdaptor(state)
 
         adaptor.apply_insights([TradeInsight(
-            category="strategy", insight="x", action="disable_iron_condor", confidence=0.8,
+            category="strategy", insight="x", action="disable_long_put", confidence=0.8,
         )])
+        assert not adaptor.is_strategy_enabled("long_put")
         adaptor.reset()
 
-        assert adaptor.is_strategy_enabled("iron_condor")
+        assert adaptor.is_strategy_enabled("long_put")
         assert adaptor.get_confidence_override() is None
 
 

@@ -1,0 +1,111 @@
+{
+  "window": 24,
+  "test_start": "2019-03-24",
+  "test_end": "2019-05-26",
+  "pnl": 350.59,
+  "return_pct": 0.1169,
+  "trades": 1,
+  "win_rate": 1.0,
+  "sharpe": 0.0,
+  "max_drawdown": 0.0,
+  "strategies": {
+    "iron_condor": 1
+  },
+  "best_params": {},
+  "trades_detail": [
+    {
+      "symbol": "IWM",
+      "strategy": "iron_condor",
+      "entry_date": "2019-05-17",
+      "entry_time": "2019-05-17",
+      "exit_date": "2019-05-24",
+      "exit_time": "2019-05-24",
+      "exit_reason": "backtest_end",
+      "pnl": 350.59,
+      "entry_confidence": 0.211,
+      "entry_regime": "high_volatility",
+      "contracts": 20,
+      "n_legs": 4,
+      "hold_days": 7,
+      "entry_price": 1.4277,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 1.2004,
+      "entry_iv_rank": 0.5059,
+      "entry_vix_level": 0.5,
+      "credit": 2855.4,
+      "max_loss": 9811.0,
+      "return_pct": 0.0357,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 147.0,
+          "premium": 0.7852
+        },
+        {
+          "type": "long_put",
+          "strike": 141.0,
+          "premium": -0.0714
+        },
+        {
+          "type": "short_call",
+          "strike": 160.0,
+          "premium": 0.7852
+        },
+        {
+          "type": "long_call",
+          "strike": 166.0,
+          "premium": -0.0714
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.211,
+        "range_gate": {
+          "prob": null,
+          "threshold": 0.55,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.2132,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.3779,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "high_volatility",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 2429,
+          "blocked": false
+        },
+        "regime_class": "high_volatility",
+        "iv_rank_rise_10d": 0.2167
+      },
+      "features_at_entry": {
+        "rsi_14": 35.69,
+        "macd_hist": -0.00402,
+        "bb_position": 0.101,
+        "atr_pct": 0.0187,
+        "realized_vol_20": 0.1927,
+        "iv_rank": 0.506,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.9
+      }
+    }
+  ],
+  "model_weights": {
+    "range_predictor": {
+      "status": "disabled_by_config",
+      "threshold_pct": 0.05
+    }
+  }
+}

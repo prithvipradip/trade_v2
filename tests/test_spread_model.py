@@ -75,7 +75,7 @@ class TestSpreadReducesNetCredit:
         t = 21 / 365
         r = 0.05
 
-        from ait.backtesting.options_sim import black_scholes_price, find_strike_by_delta, OptionType
+        from ait.backtesting.pricing import black_scholes_price, find_strike_by_delta, OptionType
 
         # Short call (OTM)
         sc_strike = find_strike_by_delta(underlying, t, iv, 0.20, OptionType.CALL, r)

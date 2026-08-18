@@ -1,3 +1,25 @@
+> [!WARNING]
+> **STALE — DO NOT TRUST (banner added 2026-07-08, Round 5 audit).**
+> This document predates the July 2026 audit rounds. Specifically:
+> all quoted performance numbers (Sharpe 8-24, +183% OOS, etc.) came from
+> backtest math since proven wrong (sleeve-capital inflation, sqrt(252)
+> annualization, window overlap); the credit-sizing formula described here
+> was a 4-5x risk understatement bug; the delta gate / hedging described as
+> active are DEAD (no greeks feed); config numbers (universe, DTE, caps,
+> confidence) no longer match config.yaml. **PLAN.md is the only current
+> source of truth.** Structural lessons remain useful; numbers do not.
+
+## Dashboards (all localhost-only, auto-started by the supervisor)
+
+| URL | What it shows | Source |
+|---|---|---|
+| http://localhost:8503 | **Live status** — positions green/red, unrealized P&L, go-live gate scorecard | status_server.py |
+| http://localhost:8501 | **Analytics** (Streamlit) — trade history, strategy/regime breakdowns, backtest tab | src/ait/dashboard/app.py |
+| http://127.0.0.1:8502 | **Logs** — color-coded live log viewer | web_logs.py |
+
+Daily 2-minute routine and alert→action table: [docs/RUNBOOK.md](docs/RUNBOOK.md).
+
+
 # AIT v2 — Autonomous Intelligent Trading Bot
 
 An autonomous options trading bot that trades iron condors, credit spreads, and straddles using ML predictions, sentiment analysis, and self-learning. Connects to Interactive Brokers via IB Gateway for live/paper execution.
@@ -332,7 +354,7 @@ python run_backtest.py --symbols SPY QQQ --optimize-per-window --optimize-n-tria
 python run_optimizer.py --strategies iron_condor --symbols SPY QQQ --n-trials 100 --objective sharpe_ratio
 
 # View live logs (color-coded)
-python tail_logs.py
+python web_logs.py   # log dashboard at 127.0.0.1:8502 (tail_logs retired to deprecated/ops/)
 
 # Just the dashboard (if already running)
 streamlit run src/ait/dashboard/app.py
@@ -500,9 +522,8 @@ Auto-refreshing colored log stream. Filters: all / trades / predictions / signal
 
 ### Terminal Log Viewer
 ```bash
-python tail_logs.py              # Color-coded live tail
-python tail_logs.py --trades     # Only trade events
-python tail_logs.py --last 100   # Last 100 lines
+python web_logs.py               # Log dashboard at http://127.0.0.1:8502
+# (the old terminal viewer lives in deprecated/ops/tail_logs.py)
 ```
 
 ### Telegram Alerts
@@ -602,7 +623,7 @@ pip install "transformers>=4.38,<4.45"
 ```
 trade_v2/
 ├── README.md                   ← You are here
-├── CONTEXT.md                  ← Architecture/history notes
+├── deprecated/                 ← Retired docs/configs/tools (see its README)
 ├── config.yaml                 ← Main configuration
 ├── .env                        ← Secrets (not committed)
 ├── .env.example                ← Template for .env
@@ -610,7 +631,6 @@ trade_v2/
 ├── run_orchestrator.py         ← Master entry point
 ├── run_backtest.py             ← CLI backtester
 ├── run_optimizer.py            ← Optuna strategy/ML parameter optimizer
-├── tail_logs.py                ← Terminal log viewer
 ├── web_logs.py                 ← Flask log viewer (port 8502)
 ├── start_bot.bat               ← Windows launcher
 ├── src/ait/

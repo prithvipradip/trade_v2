@@ -11,7 +11,8 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date
+from ait.utils.time import now_et, datetime
 
 from ait.bot.state import StateManager
 from ait.config.settings import AccountConfig
@@ -86,7 +87,7 @@ class PDTGuard:
         if not self._enabled:
             return
 
-        today = date.today().isoformat()
+        today = now_et().date().isoformat()  # ET-pinned (deep-audit SR-M6)
         self._day_trades.append((today, symbol))
         self._save_state()
 
@@ -138,7 +139,7 @@ class PDTGuard:
         Call this BEFORE entering a trade to warn the user that closing
         it today would consume a day trade.
         """
-        return entry_date == date.today()
+        return entry_date == now_et().date()  # ET-pinned (deep-audit SR-M6)
 
     def _count_in_window(self) -> int:
         """Count day trades in the rolling 5-day window."""

@@ -14,6 +14,7 @@ Architecture:
 from __future__ import annotations
 
 import math
+import os
 import statistics
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -26,6 +27,57 @@ from ait.utils.logging import get_logger
 log = get_logger("monitoring.duckdb")
 
 DUCK_DB_PATH = Path("data/ait_analytics.duckdb")
+
+
+def _real_close_sql(prefix: str = "") -> str:
+    """SQL predicate excluding non-real closes from closed-trade aggregates.
+
+    Reconciler bookkeeping rows (never_filled / pending / migrated) must not
+    count as closes in PF / win-rate / drawdown — mirrors status.py's filter.
+    """
+    col = f"COALESCE({prefix}exit_reason_detailed, '')"
+    return (f"{col} NOT LIKE '%never_filled%' AND {col} NOT LIKE '%pending%' "
+            f"AND {col} NOT LIKE '%migrated%'")
+
+
+def _capital_base() -> float:
+    """Equity base for drawdown %. Defaults to 196000 (paper NLV).
+
+    Go-live MUST set AIT_CAPITAL_BASE to the funded amount, otherwise
+    drawdown % is computed off the wrong base.
+    """
+    try:
+        from ait.config.runtime_env import capital_base as _cb
+        return _cb()
+    except Exception:  # noqa: BLE001 - R16: single authority, safe fallback
+        try:
+            return float(os.environ.get("AIT_CAPITAL_BASE", "196000"))
+        except (TypeError, ValueError):
+            return 196000.0
+
+
+def _annualization_factor(close_times: list) -> float:
+    """sqrt(trades-per-year) — replicates ait.backtesting.result.annualization_factor.
+
+    sqrt(252) treated every TRADE as one trading DAY, overstating
+    Sharpe/Sortino ~4x at typical trade frequency (see result.py BT-H4 note).
+    Span runs first→last close time to match exit-time windowing; capped at
+    daily sqrt(252).
+    """
+    try:
+        dates = sorted(
+            t.date() if isinstance(t, datetime)
+            else datetime.fromisoformat(str(t)[:19]).date()
+            for t in close_times
+            if t is not None
+        )
+        if len(dates) < 2:
+            return 1.0
+        span_days = max((dates[-1] - dates[0]).days, 1)
+        trades_per_year = len(dates) / (span_days / 365.25)
+        return math.sqrt(min(252.0, max(trades_per_year, 1.0)))
+    except Exception:
+        return 1.0
 
 
 @dataclass
@@ -64,8 +116,11 @@ class DuckDBAnalytics:
         self._db_path = db_path
         self._init_schema()
 
-    def _get_conn(self) -> duckdb.DuckDBPyConnection:
-        return duckdb.connect(str(self._db_path))
+    def _get_conn(self, read_only: bool = False) -> duckdb.DuckDBPyConnection:
+        # A11 (deep-audit OPS-R3): DuckDB is single-writer -- read paths
+        # (dashboard/report/learning) opening read-write collided with the
+        # bot's close-time ingest. Readers pass read_only=True.
+        return duckdb.connect(str(self._db_path), read_only=read_only)
 
     def _init_schema(self) -> None:
         with self._get_conn() as conn:
@@ -175,8 +230,27 @@ class DuckDBAnalytics:
     # Ingest (write path — called by StateManager on trade close)
     # ------------------------------------------------------------------
 
+    _TRADE_INGEST_COLS = (
+        "trade_id", "symbol", "strategy", "direction", "status",
+        "entry_time", "entry_price", "quantity", "contract_type",
+        "strike", "expiry", "exit_time", "exit_price",
+        "realized_pnl", "commission", "ml_confidence",
+        "sentiment_score", "market_regime", "notes", "legs",
+        "exit_reason_detailed", "peak_pnl_pct",
+        "time_to_peak_hours", "direction_correct",
+    )
+
     def ingest_trade(self, trade: dict) -> None:
-        """Upsert a trade record into DuckDB analytics store."""
+        """Upsert a trade record into DuckDB analytics store.
+
+        R8 CRITICAL fix: callers feed dict(SELECT * FROM trades) — after the
+        capital_at_risk migration that dict has MORE keys than the INSERT's
+        named params and DuckDB raises on the excess, silently (warning-
+        swallowed) stopping every future close from reaching analytics.
+        Filter to the ingest columns so sqlite-side migrations can never
+        break the mirror again.
+        """
+        trade = {k: trade.get(k) for k in self._TRADE_INGEST_COLS}
         with self._get_conn() as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO trades VALUES (
@@ -203,6 +277,12 @@ class DuckDBAnalytics:
 
     def ingest_trade_context(self, context: dict) -> None:
         """Upsert trade entry context."""
+        # R8: same excess-parameter armor as ingest_trade (model_version
+        # column was already breaking this — 17/17 sync_context_failed).
+        _cols = ("trade_id", "entry_direction", "entry_confidence",
+                 "entry_regime", "entry_vix", "entry_iv_rank",
+                 "entry_sentiment_score", "entry_signals")
+        context = {k: context.get(k) for k in _cols}
         with self._get_conn() as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO trade_context VALUES (
@@ -231,12 +311,18 @@ class DuckDBAnalytics:
         """Compute comprehensive performance metrics using DuckDB."""
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
 
-        with self._get_conn() as conn:
-            rows = conn.execute("""
+        with self._get_conn(read_only=True) as conn:
+            # Exit-time window: a trade opened before the lookback window but
+            # CLOSED inside it must count (entry-time filtering hid late
+            # losers). Order by close time so drawdown/streaks follow
+            # realization order; exclude bookkeeping closes.
+            rows = conn.execute(f"""
                 SELECT realized_pnl, entry_time, exit_time
                 FROM trades
-                WHERE status = 'closed' AND entry_time >= ?
-                ORDER BY entry_time
+                WHERE status = 'closed'
+                  AND COALESCE(exit_time, entry_time) >= ?
+                  AND {_real_close_sql()}
+                ORDER BY COALESCE(exit_time, entry_time)
             """, [cutoff]).fetchall()
 
         if not rows:
@@ -263,31 +349,48 @@ class DuckDBAnalytics:
         gross_losses = abs(sum(losses))
         snap.profit_factor = gross_wins / gross_losses if gross_losses > 0 else float("inf")
 
-        # Sharpe & Sortino
+        # Sharpe & Sortino — annualized by ACTUAL trade frequency, not
+        # sqrt(252) (sqrt(252) treated each trade as one trading day; see
+        # ait.backtesting.result.annualization_factor)
         if len(pnls) > 1:
+            ann = _annualization_factor([r[2] or r[1] for r in rows])
             mean_pnl = statistics.mean(pnls)
             std_pnl = statistics.stdev(pnls)
             if std_pnl > 0:
-                snap.sharpe_ratio = (mean_pnl / std_pnl) * math.sqrt(252)
-            downside = [p for p in pnls if p < 0]
-            if downside:
-                ds_std = statistics.stdev(downside) if len(downside) > 1 else abs(downside[0])
-                if ds_std > 0:
-                    snap.sortino_ratio = (mean_pnl / ds_std) * math.sqrt(252)
+                snap.sharpe_ratio = (mean_pnl / std_pnl) * ann
+            # Sortino — target-0 downside deviation over ALL returns:
+            # sqrt(mean(min(r,0)^2)), matching result.py. The old
+            # stdev-of-losses-about-their-own-mean gave a consistent
+            # -$500 loser downside-dev≈0.
+            downside_dev = math.sqrt(sum(min(p, 0.0) ** 2 for p in pnls) / len(pnls))
+            if downside_dev > 0:
+                snap.sortino_ratio = (mean_pnl / downside_dev) * ann
+            elif mean_pnl > 0:
+                # R17: see the matching comment in monitoring/analytics.py --
+                # inconsistent with export.py's None convention, not unified
+                # (no current JSON consumer of this field).
+                snap.sortino_ratio = float("inf")
 
-        # Drawdown
-        cumulative = 0.0
-        peak = 0.0
+        # Drawdown — dd% measured against the EQUITY high-water mark where
+        # equity = CAPITAL_BASE + cumulative P&L. The old cumulative-P&L peak
+        # (starting at 0) returned 0% after pure losses and absurd % on small
+        # samples. dd$ is still reported alongside.
+        base = _capital_base()
+        equity = base
+        peak = base
         max_dd = 0.0
+        max_dd_pct = 0.0
         for p in pnls:
-            cumulative += p
-            if cumulative > peak:
-                peak = cumulative
-            dd = peak - cumulative
+            equity += p
+            if equity > peak:
+                peak = equity
+            dd = peak - equity
             if dd > max_dd:
                 max_dd = dd
+            if peak > 0 and dd / peak > max_dd_pct:
+                max_dd_pct = dd / peak
         snap.max_drawdown_dollars = max_dd
-        snap.max_drawdown_pct = max_dd / peak if peak > 0 else 0.0
+        snap.max_drawdown_pct = max_dd_pct
 
         if max_dd > 0:
             snap.recovery_factor = total_pnl / max_dd
@@ -324,7 +427,7 @@ class DuckDBAnalytics:
         """Get daily P&L with cumulative running total — uses DuckDB window function."""
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
 
-        with self._get_conn() as conn:
+        with self._get_conn(read_only=True) as conn:
             rows = conn.execute("""
                 SELECT
                     date,
@@ -354,8 +457,9 @@ class DuckDBAnalytics:
         """Strategy performance breakdown — single DuckDB query."""
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
 
-        with self._get_conn() as conn:
-            rows = conn.execute("""
+        with self._get_conn(read_only=True) as conn:
+            # exit-time window + real-close filter (see get_performance)
+            rows = conn.execute(f"""
                 SELECT
                     strategy,
                     COUNT(*) AS trades,
@@ -371,7 +475,8 @@ class DuckDBAnalytics:
                         ELSE 999.0 END, 2) AS profit_factor,
                     ROUND(AVG(ml_confidence), 3) AS avg_confidence
                 FROM trades
-                WHERE status = 'closed' AND entry_time >= ?
+                WHERE status = 'closed' AND COALESCE(exit_time, entry_time) >= ?
+                    AND {_real_close_sql()}
                 GROUP BY strategy
                 ORDER BY total_pnl DESC
             """, [cutoff]).fetchall()
@@ -384,8 +489,9 @@ class DuckDBAnalytics:
         """Symbol performance breakdown."""
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
 
-        with self._get_conn() as conn:
-            rows = conn.execute("""
+        with self._get_conn(read_only=True) as conn:
+            # exit-time window + real-close filter (see get_performance)
+            rows = conn.execute(f"""
                 SELECT
                     symbol,
                     COUNT(*) AS trades,
@@ -395,7 +501,8 @@ class DuckDBAnalytics:
                     ROUND(SUM(realized_pnl), 2) AS total_pnl,
                     ROUND(AVG(realized_pnl), 2) AS avg_pnl
                 FROM trades
-                WHERE status = 'closed' AND entry_time >= ?
+                WHERE status = 'closed' AND COALESCE(exit_time, entry_time) >= ?
+                    AND {_real_close_sql()}
                 GROUP BY symbol
                 ORDER BY total_pnl DESC
             """, [cutoff]).fetchall()
@@ -407,8 +514,9 @@ class DuckDBAnalytics:
         """Performance breakdown by market regime — new analytics not in SQLite."""
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
 
-        with self._get_conn() as conn:
-            rows = conn.execute("""
+        with self._get_conn(read_only=True) as conn:
+            # exit-time window + real-close filter (see get_performance)
+            rows = conn.execute(f"""
                 SELECT
                     t.market_regime AS regime,
                     COUNT(*) AS trades,
@@ -421,7 +529,9 @@ class DuckDBAnalytics:
                     ROUND(AVG(tc.entry_vix), 1) AS avg_vix
                 FROM trades t
                 LEFT JOIN trade_context tc ON t.trade_id = tc.trade_id
-                WHERE t.status = 'closed' AND t.entry_time >= ?
+                WHERE t.status = 'closed'
+                    AND COALESCE(t.exit_time, t.entry_time) >= ?
+                    AND {_real_close_sql('t.')}
                     AND t.market_regime != ''
                 GROUP BY t.market_regime
                 ORDER BY total_pnl DESC
@@ -435,8 +545,9 @@ class DuckDBAnalytics:
         """Strategy x Regime performance matrix — which strategies work in which regimes."""
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
 
-        with self._get_conn() as conn:
-            rows = conn.execute("""
+        with self._get_conn(read_only=True) as conn:
+            # exit-time window + real-close filter (see get_performance)
+            rows = conn.execute(f"""
                 SELECT
                     strategy,
                     market_regime AS regime,
@@ -445,7 +556,8 @@ class DuckDBAnalytics:
                           / COUNT(*) * 100, 1) AS win_rate_pct,
                     ROUND(SUM(realized_pnl), 2) AS total_pnl
                 FROM trades
-                WHERE status = 'closed' AND entry_time >= ?
+                WHERE status = 'closed' AND COALESCE(exit_time, entry_time) >= ?
+                    AND {_real_close_sql()}
                     AND market_regime != ''
                 GROUP BY strategy, market_regime
                 HAVING COUNT(*) >= 2
@@ -459,8 +571,10 @@ class DuckDBAnalytics:
         """Win rate by hour of day — find bad trading hours."""
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
 
-        with self._get_conn() as conn:
-            rows = conn.execute("""
+        with self._get_conn(read_only=True) as conn:
+            # exit-time window + real-close filter (see get_performance);
+            # grouping stays on ENTRY hour — the question is entry timing.
+            rows = conn.execute(f"""
                 SELECT
                     EXTRACT(HOUR FROM entry_time) AS hour,
                     COUNT(*) AS trades,
@@ -469,7 +583,8 @@ class DuckDBAnalytics:
                           / COUNT(*) * 100, 1) AS win_rate_pct,
                     ROUND(SUM(realized_pnl), 2) AS total_pnl
                 FROM trades
-                WHERE status = 'closed' AND entry_time >= ?
+                WHERE status = 'closed' AND COALESCE(exit_time, entry_time) >= ?
+                    AND {_real_close_sql()}
                 GROUP BY EXTRACT(HOUR FROM entry_time)
                 ORDER BY hour
             """, [cutoff]).fetchall()
@@ -478,11 +593,19 @@ class DuckDBAnalytics:
         return [dict(zip(cols, r)) for r in rows]
 
     def get_rolling_sharpe(self, window_days: int = 20, lookback_days: int = 90) -> list[dict]:
-        """Rolling Sharpe ratio over time — uses DuckDB window functions."""
-        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        """Rolling Sharpe ratio over time — uses DuckDB window functions.
 
-        with self._get_conn() as conn:
-            rows = conn.execute("""
+        NOTE: SQRT(252) is CORRECT here — this operates on DAILY P&L from
+        daily_stats, not per-trade P&L, so daily annualization applies.
+        """
+        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        # R8: the window size is INLINED — a bound '?' inside a named WINDOW
+        # gets duplicated by DuckDB's OVER-w expansion (6 params wanted, 2
+        # supplied), so this method raised on every call since it was written.
+        window_rows = max(0, int(window_days) - 1)
+
+        with self._get_conn(read_only=True) as conn:
+            rows = conn.execute(f"""
                 WITH daily_returns AS (
                     SELECT date, total_pnl
                     FROM daily_stats
@@ -498,9 +621,9 @@ class DuckDBAnalytics:
                          THEN (AVG(total_pnl) OVER w / STDDEV(total_pnl) OVER w) * SQRT(252)
                          ELSE 0 END AS rolling_sharpe
                 FROM daily_returns
-                WINDOW w AS (ORDER BY date ROWS BETWEEN ? PRECEDING AND CURRENT ROW)
+                WINDOW w AS (ORDER BY date ROWS BETWEEN {window_rows} PRECEDING AND CURRENT ROW)
                 ORDER BY date
-            """, [cutoff, window_days - 1]).fetchall()
+            """, [cutoff]).fetchall()
 
         return [
             {
@@ -517,8 +640,9 @@ class DuckDBAnalytics:
         """Analyze profit capture efficiency per strategy."""
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
 
-        with self._get_conn() as conn:
-            rows = conn.execute("""
+        with self._get_conn(read_only=True) as conn:
+            # exit-time window + real-close filter (see get_performance)
+            rows = conn.execute(f"""
                 SELECT
                     strategy,
                     COUNT(*) AS trades,
@@ -526,7 +650,8 @@ class DuckDBAnalytics:
                     ROUND(AVG(CASE WHEN realized_pnl > 0 THEN realized_pnl ELSE 0 END), 2) AS avg_realized_win,
                     ROUND(AVG(CAST(exit_reason_detailed != '' AS INTEGER)), 2) AS pct_with_exit_reason
                 FROM trades
-                WHERE status = 'closed' AND entry_time >= ?
+                WHERE status = 'closed' AND COALESCE(exit_time, entry_time) >= ?
+                    AND {_real_close_sql()}
                     AND peak_pnl_pct > 0
                 GROUP BY strategy
                 HAVING COUNT(*) >= 2
@@ -540,8 +665,9 @@ class DuckDBAnalytics:
         """Analyze win rate by ML confidence bands."""
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
 
-        with self._get_conn() as conn:
-            rows = conn.execute("""
+        with self._get_conn(read_only=True) as conn:
+            # exit-time window + real-close filter (see get_performance)
+            rows = conn.execute(f"""
                 SELECT
                     CASE
                         WHEN ml_confidence < 0.60 THEN '0.50-0.60'
@@ -557,7 +683,8 @@ class DuckDBAnalytics:
                     ROUND(SUM(realized_pnl), 2) AS total_pnl,
                     ROUND(AVG(realized_pnl), 2) AS avg_pnl
                 FROM trades
-                WHERE status = 'closed' AND entry_time >= ?
+                WHERE status = 'closed' AND COALESCE(exit_time, entry_time) >= ?
+                    AND {_real_close_sql()}
                 GROUP BY confidence_band
                 ORDER BY confidence_band
             """, [cutoff]).fetchall()
@@ -569,8 +696,9 @@ class DuckDBAnalytics:
         """Analyze strategy performance across IV rank quintiles."""
         cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
 
-        with self._get_conn() as conn:
-            rows = conn.execute("""
+        with self._get_conn(read_only=True) as conn:
+            # exit-time window + real-close filter (see get_performance)
+            rows = conn.execute(f"""
                 SELECT
                     t.strategy,
                     CASE
@@ -587,7 +715,9 @@ class DuckDBAnalytics:
                     ROUND(AVG(t.realized_pnl), 2) AS avg_pnl
                 FROM trades t
                 JOIN trade_context tc ON t.trade_id = tc.trade_id
-                WHERE t.status = 'closed' AND t.entry_time >= ?
+                WHERE t.status = 'closed'
+                    AND COALESCE(t.exit_time, t.entry_time) >= ?
+                    AND {_real_close_sql('t.')}
                 GROUP BY t.strategy, iv_quintile
                 HAVING COUNT(*) >= 2
                 ORDER BY t.strategy, iv_quintile
@@ -598,7 +728,7 @@ class DuckDBAnalytics:
 
     def get_trade_count(self) -> int:
         """Get total number of trades in DuckDB."""
-        with self._get_conn() as conn:
+        with self._get_conn(read_only=True) as conn:
             result = conn.execute("SELECT COUNT(*) FROM trades").fetchone()
         return result[0] if result else 0
 
@@ -722,7 +852,7 @@ class DuckDBAnalytics:
 
     def get_equity_stats(self, symbol: str, table: str = "equity_stats") -> dict | None:
         """Return latest fundamental snapshot for one symbol, or None."""
-        with self._get_conn() as conn:
+        with self._get_conn(read_only=True) as conn:
             row = conn.execute(
                 f"SELECT * FROM {table} WHERE symbol = ?", [symbol]
             ).fetchone()
@@ -732,7 +862,7 @@ class DuckDBAnalytics:
 
     def get_all_equity_stats(self, table: str = "equity_stats") -> list[dict]:
         """Return all equity stats rows (for dashboard display)."""
-        with self._get_conn() as conn:
+        with self._get_conn(read_only=True) as conn:
             rows = conn.execute(
                 f"SELECT * FROM {table} ORDER BY symbol"
             ).fetchall()

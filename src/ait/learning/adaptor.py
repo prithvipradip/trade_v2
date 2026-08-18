@@ -69,7 +69,14 @@ class StrategyAdaptor:
         self,
         state: StateManager,
         limits: AdaptationLimits | None = None,
+        active: bool = True,
     ) -> None:
+        # R7 (gap audit): structural adaptations (remove symbol, block hour,
+        # disable strategy, sizing multiplier) had NO paper_trading_mode
+        # guard — a 9-trade cold streak could silently shrink the measured
+        # universe mid-verdict. active=False makes every consult a no-op
+        # (allow everything, override nothing) while analysis still runs.
+        self._active = active
         self._state = state
         self._limits = limits or AdaptationLimits()
 
@@ -92,6 +99,10 @@ class StrategyAdaptor:
         """
         adaptations: list[Adaptation] = []
         applied = 0
+        # Deep-audit VL: three insights mapping to the SAME parameter used to
+        # compound within one cycle (stop 0.50->0.43->0.36->0.31 in a single
+        # pass). One adaptation per parameter per cycle.
+        _touched_params: set[str] = set()
 
         for insight in insights:
             if applied >= self._limits.max_adaptations_per_cycle:
@@ -100,7 +111,12 @@ class StrategyAdaptor:
                 continue
 
             adaptation = self._process_insight(insight)
+            if adaptation and adaptation.parameter in _touched_params:
+                log.info("adaptation_skipped_same_param_this_cycle",
+                         parameter=adaptation.parameter)
+                continue
             if adaptation:
+                _touched_params.add(adaptation.parameter)
                 adaptations.append(adaptation)
                 applied += 1
                 log.info(
@@ -117,6 +133,8 @@ class StrategyAdaptor:
         return adaptations
 
     def get_strategy_multiplier(self, strategy: str) -> float:
+        if not self._active:
+            return 1.0
         """Get the current sizing multiplier for a strategy.
 
         Returns 1.0 for default, >1 for boosted, <1 for reduced, 0 for disabled.
@@ -126,30 +144,44 @@ class StrategyAdaptor:
         return self._strategy_multipliers.get(strategy, 1.0)
 
     def is_strategy_enabled(self, strategy: str) -> bool:
+        if not self._active:
+            return True
         """Check if a strategy is currently enabled."""
         return strategy not in self._disabled_strategies
 
     def is_symbol_allowed(self, symbol: str) -> bool:
+        if not self._active:
+            return True
         """Check if a symbol is allowed (not removed by learning)."""
         return symbol not in self._removed_symbols
 
     def get_confidence_override(self) -> float | None:
+        if not self._active:
+            return None
         """Get the learned minimum confidence threshold, or None for default."""
         return self._confidence_override
 
     def get_stop_loss_override(self) -> float | None:
+        if not self._active:
+            return None
         """Get the learned stop loss percentage, or None for default."""
         return self._stop_loss_override
 
     def get_trailing_stop_override(self, strategy: str) -> float | None:
+        if not self._active:
+            return None
         """Get learned trailing stop pct for a strategy, or None for default."""
         return self._trailing_stop_overrides.get(strategy)
 
     def get_take_profit_override(self, strategy: str) -> float | None:
+        if not self._active:
+            return None
         """Get learned take profit pct for a strategy, or None for default."""
         return self._take_profit_overrides.get(strategy)
 
     def is_hour_allowed(self, hour: int) -> bool:
+        if not self._active:
+            return True
         """Check if trading is allowed at this hour."""
         return hour not in self._blocked_hours
 
@@ -214,9 +246,20 @@ class StrategyAdaptor:
 
         return None
 
+    # Core strategies the learning engine may never auto-disable. iron_condor
+    # is the primary income strategy and the only defined-risk neutral play
+    # that fits the per-trade risk cap; auto-disabling it (which happened on
+    # corrupted P&L data, 2026-06-23) silently halts all trading. A human can
+    # still disable it via config.
+    PROTECTED_STRATEGIES = frozenset({"iron_condor"})
+
     def _disable_strategy(self, strategy: str, insight: TradeInsight) -> Adaptation | None:
         """Disable a consistently losing strategy."""
         if strategy in self._disabled_strategies:
+            return None
+        if strategy in self.PROTECTED_STRATEGIES:
+            log.info("strategy_disable_blocked_protected",
+                     strategy=strategy, reason=insight.insight)
             return None
 
         self._disabled_strategies.add(strategy)

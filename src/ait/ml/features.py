@@ -22,6 +22,12 @@ from ait.utils.logging import get_logger
 
 log = get_logger("ml.features")
 
+# R17: neutral fallback values for the all-NaN-column safety net in
+# FeatureEngine.compute(). A blanket 0.0 is wrong for a column whose
+# documented "no data" value is something else — vix_level's is 0.5
+# ("VIX~20, normal") elsewhere in this file.
+NEUTRAL_COLUMN_DEFAULTS: dict[str, float] = {"vix_level": 0.5}
+
 
 class FeatureEngine:
     """Computes features from OHLCV data for ML models."""
@@ -93,13 +99,32 @@ class FeatureEngine:
         # --- Fractal / Multi-Scale Features ---
         features = self._add_fractal_features(features)
 
-        # --- Live Signal Features (sentiment, options flow) ---
-        # During training, live_signals=None → neutral defaults so feature
-        # count stays consistent. At prediction time, real values are passed.
-        features = self._add_live_signals(features, live_signals)
+        # R12-C: live-signal features (sentiment + options flow) retired with
+        # the sentiment stack — 8 columns that were constant neutral defaults
+        # in training and near-constant live; verified zero IC influence.
+        # live_signals is still accepted (and ignored) so existing callers
+        # (orchestrator, predictors) keep working until their kwarg is removed.
 
         # --- Seasonality Features ---
         features = self._add_seasonality(features)
+
+        # Safety net: a single ENTIRELY-NaN column (e.g. a degraded live feed
+        # with no volume or no IV) would otherwise make the dropna() below
+        # wipe every row, silently killing all predictions. Neutral-fill any
+        # all-NaN column with 0 instead, and log which ones so the underlying
+        # data problem stays visible.
+        # R17: a blanket 0.0 fill is wrong for columns with a documented
+        # non-zero neutral value (NEUTRAL_COLUMN_DEFAULTS) -- a
+        # present-but-corrupted VIX feed (as opposed to a simply-absent
+        # one) would otherwise get coded as "extremely calm" (0.0) instead
+        # of neutral, right when the data pipeline is unreliable.
+        all_nan = [c for c in features.columns if features[c].isna().all()]
+        if all_nan:
+            log.warning("features_all_nan_columns_filled",
+                        count=len(all_nan), columns=all_nan[:20])
+            for _col in all_nan:
+                features[_col] = features[_col].fillna(
+                    NEUTRAL_COLUMN_DEFAULTS.get(_col, 0.0))
 
         # Drop rows with NaN from lookback calculations
         features = features.dropna()
@@ -445,10 +470,6 @@ class FeatureEngine:
             "yield_curve_spread", "yield_curve_inverted", "yield_curve_change_20d",
             "dxy_level_norm", "dxy_change_5d", "dxy_change_20d",
             "us_10y_change_20d",
-            # Live signals (sentiment + options flow)
-            "sentiment_composite", "sentiment_news", "sentiment_finbert",
-            "fear_greed", "put_call_ratio",
-            "flow_bias_strength", "flow_bullish", "flow_bearish",
             # Seasonality
             "day_of_week", "month_of_year",
             # Fractal / multi-scale
@@ -523,16 +544,32 @@ class FeatureEngine:
         volume = df["Volume"]
         close = df["Close"]
 
-        # Volume relative to 20-day average
+        # Volume features must degrade gracefully when volume is zero/missing.
+        # Delayed and free-tier feeds (Polygon/Yahoo/IBKR delayed) frequently
+        # report volume=0, which makes every one of these features NaN for ALL
+        # rows; the downstream dropna() then empties the whole feature matrix
+        # and the bot silently stops predicting (observed live 2026-06-22).
+        # Neutral fills keep the rows: ratio 1.0 = "normal" volume, change 0.0.
         vol_sma20 = volume.rolling(20).mean()
-        df["volume_sma_20_ratio"] = volume / vol_sma20.replace(0, np.nan)
+        df["volume_sma_20_ratio"] = (
+            (volume / vol_sma20.replace(0, np.nan))
+            .replace([np.inf, -np.inf], np.nan)
+        )
 
-        # OBV (On-Balance Volume) change
         obv = (np.sign(close.diff()) * volume).cumsum()
-        df["obv_change"] = obv.pct_change(5)
+        df["obv_change"] = obv.pct_change(5).replace([np.inf, -np.inf], np.nan)
 
-        # Volume trend (5-day slope)
-        df["volume_trend"] = volume.rolling(5).mean() / volume.rolling(20).mean()
+        df["volume_trend"] = (
+            (volume.rolling(5).mean() / volume.rolling(20).mean())
+            .replace([np.inf, -np.inf], np.nan)
+        )
+
+        # Fill ONLY the volume columns with neutral values. Leading lookback
+        # warmup rows stay NaN via the price features and are still dropped as
+        # intended; this only rescues rows lost purely to a zero-volume feed.
+        df["volume_sma_20_ratio"] = df["volume_sma_20_ratio"].fillna(1.0)
+        df["obv_change"] = df["obv_change"].fillna(0.0)
+        df["volume_trend"] = df["volume_trend"].fillna(1.0)
 
         return df
 
@@ -915,39 +952,6 @@ class FeatureEngine:
             df["dxy_level_norm"] = 0.0
             df["dxy_change_5d"] = 0.0
             df["dxy_change_20d"] = 0.0
-
-        return df
-
-    def _add_live_signals(
-        self, df: pd.DataFrame, live_signals: dict | None
-    ) -> pd.DataFrame:
-        """Add sentiment and options-flow features.
-
-        Defaults to neutral (0.0) values during training. Real values
-        passed at prediction time via live_signals dict.
-
-        Expected live_signals keys (all optional):
-          sentiment_composite, sentiment_news, sentiment_finbert,
-          fear_greed, put_call_ratio, flow_bias_strength, flow_bullish,
-          flow_bearish
-        """
-        defaults = {
-            "sentiment_composite": 0.0,
-            "sentiment_news": 0.0,
-            "sentiment_finbert": 0.0,
-            "fear_greed": 0.0,
-            "put_call_ratio": 1.0,
-            "flow_bias_strength": 0.0,
-            "flow_bullish": 0.0,
-            "flow_bearish": 0.0,
-        }
-
-        if live_signals:
-            for key, default in defaults.items():
-                df[key] = float(live_signals.get(key, default))
-        else:
-            for key, default in defaults.items():
-                df[key] = default
 
         return df
 

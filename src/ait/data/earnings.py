@@ -15,6 +15,7 @@ from datetime import date, datetime, timedelta
 
 from ait.data.cache import TTLCache
 from ait.utils.logging import get_logger
+from ait.utils.time import now_et
 
 log = get_logger("data.earnings")
 
@@ -38,14 +39,45 @@ class EarningsCalendar:
         self._cache = TTLCache(default_ttl=21600, max_size=200)
 
     def get_next_earnings(self, symbol: str) -> EarningsInfo:
-        """Get the next earnings date for a symbol."""
+        """Get the next earnings date for a symbol.
+
+        Deep-audit DATA-M5: the synchronous yfinance fetch used to run
+        directly on the asyncio event loop — a cache miss froze position
+        monitoring, stops, and exit fills for the whole fetch. When called
+        from inside a running loop we now NEVER block: kick a background
+        thread to populate the cache and return "unknown" for this tick
+        (same trade-through behavior as a failed fetch); the next tick gets
+        the cached answer. Sync callers (tests/CLI) fetch inline as before.
+        """
         cached = self._cache.get(f"earnings_{symbol}")
         if cached is not None:
             return cached
 
-        info = self._fetch_earnings(symbol)
-        self._cache.set(f"earnings_{symbol}", info)
-        return info
+        import asyncio as _aio
+        import threading as _th
+        try:
+            _aio.get_running_loop()
+            inflight = getattr(self, "_inflight", None)
+            if inflight is None:
+                inflight = self._inflight = set()
+            if symbol not in inflight:
+                inflight.add(symbol)
+
+                def _bg():
+                    try:
+                        info = self._fetch_earnings(symbol)
+                        self._cache.set(f"earnings_{symbol}", info)
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("earnings_bg_fetch_failed", symbol=symbol, error=str(e))
+                    finally:
+                        inflight.discard(symbol)
+
+                _th.Thread(target=_bg, daemon=True).start()
+            return EarningsInfo(symbol=symbol, next_earnings_date=None)
+        except RuntimeError:
+            info = self._fetch_earnings(symbol)
+            self._cache.set(f"earnings_{symbol}", info)
+            return info
 
     def is_near_earnings(self, symbol: str, check_date: date | None = None) -> bool:
         """Check if a date is within the earnings danger zone.
@@ -53,7 +85,10 @@ class EarningsCalendar:
         Danger zone = [earnings - buffer_before, earnings + buffer_after]
         Default: 2 days before through 1 day after earnings.
         """
-        check_date = check_date or date.today()
+        # R17: was date.today() (server-local clock) instead of this
+        # codebase's ET convention -- a multi-hour window around midnight
+        # UTC could misclassify a same-day earnings date as "already past".
+        check_date = check_date or now_et().date()
         info = self.get_next_earnings(symbol)
 
         if info.next_earnings_date is None:
@@ -102,25 +137,37 @@ class EarningsCalendar:
                 or (hasattr(cal, "empty") and cal.empty)
             )
             if not cal_empty:
-                # Dict format (newer yfinance)
-                if isinstance(cal, dict):
-                    for val in cal.values():
-                        if isinstance(val, list) and val:
-                            val = val[0]
-                        if isinstance(val, (datetime, date)):
-                            earnings_date = val if isinstance(val, date) else val.date()
-                            return EarningsInfo(symbol=symbol, next_earnings_date=earnings_date)
+                # R7 CRITICAL FIX: the old code returned the FIRST datetime in
+                # the dict — usually 'Dividend Date'/'Ex-Dividend Date', NOT
+                # earnings. In production AAPL's "next earnings" was a past
+                # dividend date and AMD's was 1995 — all three earnings guards
+                # were dead for single names. Parse 'Earnings Date' by KEY,
+                # reject past dates, and fall through to earnings_dates.
+                def _to_date(v):
+                    if isinstance(v, list) and v:
+                        v = v[0]
+                    if isinstance(v, datetime):
+                        return v.date()
+                    if isinstance(v, date):
+                        return v
+                    return None
 
-                elif hasattr(cal, "iloc"):
-                    # DataFrame format
-                    earnings_date = None
+                if isinstance(cal, dict):
+                    for key in ("Earnings Date", "earnings date", "EarningsDate"):
+                        if key in cal:
+                            d = _to_date(cal[key])
+                            if d is not None and d >= now_et().date():
+                                return EarningsInfo(symbol=symbol, next_earnings_date=d)
+                            break  # key present but past/unparseable -> earnings_dates fallback
+
+                elif hasattr(cal, "iloc") and len(cal) > 0:
+                    # DataFrame format: same rule — earnings columns only
                     for col in cal.columns:
-                        val = cal.iloc[0][col] if len(cal) > 0 else None
-                        if isinstance(val, (datetime, date)):
-                            earnings_date = val if isinstance(val, date) else val.date()
-                            break
-                    if earnings_date:
-                        return EarningsInfo(symbol=symbol, next_earnings_date=earnings_date)
+                        if "earnings" not in str(col).lower():
+                            continue
+                        d = _to_date(cal.iloc[0][col])
+                        if d is not None and d >= now_et().date():
+                            return EarningsInfo(symbol=symbol, next_earnings_date=d)
 
                 # Try the earnings_dates attribute instead
                 if hasattr(ticker, "earnings_dates") and ticker.earnings_dates is not None:
@@ -129,7 +176,7 @@ class EarningsCalendar:
                         future_dates = [
                             d.date() if hasattr(d, "date") else d
                             for d in eds.index
-                            if (d.date() if hasattr(d, "date") else d) >= date.today()
+                            if (d.date() if hasattr(d, "date") else d) >= now_et().date()
                         ]
                         if future_dates:
                             return EarningsInfo(

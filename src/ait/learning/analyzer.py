@@ -585,9 +585,23 @@ class TradeAnalyzer:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 """SELECT * FROM trades
-                   WHERE status = 'closed' AND entry_time >= ?
+                   WHERE status = 'closed' AND COALESCE(exit_time, entry_time) >= ?  -- exit-time window (deep-audit): 7-30d holds opened before the window but closed inside it were excluded
+                     AND COALESCE(exit_reason_detailed, '') NOT LIKE '%migrated%'
+                     AND COALESCE(exit_reason_detailed, '') NOT LIKE '%pending%'
+                     AND COALESCE(exit_reason_detailed, '') NOT LIKE '%never_filled%'
                    ORDER BY entry_time""",
                 (since,),
             ).fetchall()
 
-        return [dict(r) for r in rows]
+        # NULL choke point (deep-audit VL): one NULL realized_pnl or
+        # ml_confidence used to TypeError deep inside an analysis and abort
+        # the whole learning cycle. Coerce numeric fields once, here.
+        out = []
+        for r in rows:
+            d = dict(r)
+            for k in ("realized_pnl", "ml_confidence", "entry_price",
+                      "exit_price", "quantity"):
+                if d.get(k) is None:
+                    d[k] = 0.0 if k != "quantity" else 0
+            out.append(d)
+        return out

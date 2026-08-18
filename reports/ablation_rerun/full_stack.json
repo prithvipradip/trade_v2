@@ -1,0 +1,9 @@
+{
+ "arm": "full_stack",
+ "n": 20,
+ "win_rate": 70.0,
+ "pf": 1.95,
+ "max_dd_pct": 1.72,
+ "total_ret_pct": 1.03,
+ "windows": 13
+}

@@ -1,0 +1,21 @@
+2026-08-07 16:30:00 [info     ] duckdb_initialized             component=monitoring.duckdb path=data\ait_analytics.duckdb
+{
+  "total_trades": 1,
+  "total_pnl": 242.76,
+  "win_rate": 1.0,
+  "profit_factor": Infinity,
+  "sharpe_ratio": 0.0,
+  "sortino_ratio": 0.0,
+  "max_drawdown_pct": 0.0,
+  "max_drawdown_dollars": 0.0,
+  "avg_trade_pnl": 242.76,
+  "avg_win": 242.76,
+  "avg_loss": 0,
+  "largest_win": 242.76,
+  "largest_loss": 0,
+  "avg_hold_hours": 77.03928300444444,
+  "consecutive_wins": 1,
+  "consecutive_losses": 0,
+  "current_streak": 1,
+  "recovery_factor": 0.0
+}

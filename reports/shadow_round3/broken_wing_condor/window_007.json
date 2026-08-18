@@ -1,0 +1,111 @@
+{
+  "window": 7,
+  "test_start": "2023-06-14",
+  "test_end": "2023-08-16",
+  "pnl": 253.39,
+  "return_pct": 0.0845,
+  "trades": 1,
+  "win_rate": 1.0,
+  "sharpe": 0.0,
+  "max_drawdown": 0.0,
+  "strategies": {
+    "broken_wing_condor": 1
+  },
+  "best_params": {},
+  "trades_detail": [
+    {
+      "symbol": "IWM",
+      "strategy": "broken_wing_condor",
+      "entry_date": "2023-06-15",
+      "entry_time": "2023-06-15",
+      "exit_date": "2023-06-27",
+      "exit_time": "2023-06-27",
+      "exit_reason": "take_profit_short",
+      "pnl": 253.39,
+      "entry_confidence": 0.2368,
+      "entry_regime": "range_bound",
+      "contracts": 3,
+      "n_legs": 4,
+      "hold_days": 12,
+      "entry_price": 2.1954,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 1.2988,
+      "entry_iv_rank": 0.6006,
+      "entry_vix_level": 0.5,
+      "credit": 658.62,
+      "max_loss": 4756.74,
+      "return_pct": 0.0533,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 179.0,
+          "premium": 1.2075
+        },
+        {
+          "type": "long_put",
+          "strike": 161.0,
+          "premium": -0.1098
+        },
+        {
+          "type": "short_call",
+          "strike": 198.0,
+          "premium": 1.2075
+        },
+        {
+          "type": "long_call",
+          "strike": 207.0,
+          "premium": -0.1098
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.2368,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.2578,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.4174,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 939,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": 0.2917
+      },
+      "features_at_entry": {
+        "rsi_14": 66.38,
+        "macd_hist": 0.00569,
+        "bb_position": 0.905,
+        "atr_pct": 0.0187,
+        "realized_vol_20": 0.2239,
+        "iv_rank": 0.601,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.556
+      }
+    }
+  ],
+  "model_weights": {
+    "range_predictor": {
+      "status": "training_returned_no_accuracy",
+      "threshold_pct": 0.0759
+    }
+  }
+}

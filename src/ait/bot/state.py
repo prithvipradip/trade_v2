@@ -76,6 +76,7 @@ class TradeRecord:
     peak_pnl_pct: float = 0.0
     time_to_peak_hours: float = 0.0
     direction_correct: int = -1  # -1 = unknown, 0 = wrong, 1 = correct
+    capital_at_risk: float = 0.0  # R7: retained max_loss at entry (verdict math)
 
 
 @dataclass
@@ -189,13 +190,61 @@ class StateManager:
                 CREATE INDEX IF NOT EXISTS idx_trades_symbol
                 ON trades(symbol);
             """)
+            # Lightweight migrations for pre-existing DBs (SQLite has no
+            # ADD COLUMN IF NOT EXISTS; duplicate-add raises OperationalError).
+            for ddl in (
+                "ALTER TABLE open_positions ADD COLUMN pnl_pct REAL DEFAULT 0",
+                "ALTER TABLE open_positions ADD COLUMN mark_time TEXT DEFAULT ''",
+                # GOV-2 (governance audit): model lineage — without this you
+                # cannot attribute a live trade to the model version that
+                # produced its prediction.
+                "ALTER TABLE trade_context ADD COLUMN model_version TEXT DEFAULT ''",
+                # R7 (gap audit): capital-at-risk retained on the trade row —
+                # it used to live only in bot_state KV and was deleted on
+                # close, making PF-per-unit-risk and DD-vs-deployed-risk
+                # unreconstructable for the go-live verdict.
+                "ALTER TABLE trades ADD COLUMN capital_at_risk REAL DEFAULT 0",
+                # R7: per-fill execution ledger (real commissions + fill
+                # quality). trades.commission was written by ZERO callers —
+                # the PF verdict was being computed on guessed costs.
+                """CREATE TABLE IF NOT EXISTS executions (
+                    exec_id TEXT PRIMARY KEY,
+                    order_id INTEGER,
+                    perm_id INTEGER,
+                    trade_id TEXT,
+                    symbol TEXT,
+                    con_id INTEGER,
+                    side TEXT,
+                    shares REAL,
+                    price REAL,
+                    exec_time TEXT,
+                    commission REAL DEFAULT 0,
+                    realized_pnl REAL DEFAULT 0,
+                    signal_price REAL DEFAULT 0,
+                    live_mid REAL DEFAULT 0,
+                    nbbo_spread REAL DEFAULT 0
+                )""",
+            ):
+                try:
+                    conn.execute(ddl)
+                except sqlite3.OperationalError:
+                    pass  # column already exists
 
-    @staticmethod
-    def _init_duckdb():
-        """Initialize DuckDB analytics store (lazy — returns None if unavailable)."""
+    def _init_duckdb(self):
+        """Initialize DuckDB analytics store (lazy — returns None if unavailable).
+
+        R11 (smoke-script find): the duck path was cwd-relative regardless of
+        this manager's db_path — every pytest run with a tmp_path SQLite
+        fixture dual-wrote its FIXTURE trades into the PRODUCTION analytics
+        store (105 synthetic trades found; dashboard 7d P&L read +$1,613 vs
+        true +$383). The mirror now lives next to whatever SQLite file this
+        manager was given, so test isolation is automatic.
+        """
         try:
+            from pathlib import Path as _P
             from ait.monitoring.duckdb_analytics import DuckDBAnalytics
-            duck = DuckDBAnalytics()
+            duck = DuckDBAnalytics(
+                db_path=_P(self._db_path).parent / "ait_analytics.duckdb")
             log.info("duckdb_analytics_enabled")
             return duck
         except Exception as e:
@@ -235,13 +284,64 @@ class StateManager:
                 ),
             )
 
-    def update_trade_status(self, trade_id: str, status: TradeStatus) -> None:
-        """Update the status of an existing trade without touching journaling columns."""
+    def update_trade_status(
+        self,
+        trade_id: str,
+        status: TradeStatus,
+        from_statuses=None,
+    ) -> bool:
+        """Update the status of an existing trade without touching journaling columns.
+
+        R12 Tier-A #1: when ``from_statuses`` is given this delegates to the
+        compare-and-swap :meth:`transition` (the write only lands if the row
+        is currently in one of those statuses). The unconditional form remains
+        ONLY for legacy callers outside the executor/reconciler; every status
+        writer in the execution layer must pass a from-set or call
+        transition() directly.
+        """
+        if from_statuses is not None:
+            return self.transition(trade_id, from_statuses, status)
         with sqlite3.connect(self._db_path) as conn:
             conn.execute(
                 "UPDATE trades SET status = ? WHERE trade_id = ?",
                 (status.value, trade_id),
             )
+        return True
+
+    def transition(self, trade_id: str, from_statuses, to_status: TradeStatus) -> bool:
+        """R12 Tier-A #1 (concurrency audit, NAIVE state-machine verdict):
+        compare-and-swap status writer. Six call sites used to do blind
+        UPDATEs, making illegal edges reachable: CLOSING->FILLED after a
+        restart (duplicate close -> position REVERSAL), CLOSED resurrection,
+        PARTIAL->FILLED quantity loss. The UPDATE only lands when the row is
+        currently in one of ``from_statuses``; a blocked write is logged and
+        reported so the caller can react instead of silently corrupting state.
+
+        Returns True iff exactly one row transitioned.
+        """
+        froms = [
+            s.value if isinstance(s, TradeStatus) else str(s)
+            for s in (from_statuses if not isinstance(from_statuses, (str, TradeStatus))
+                      else [from_statuses])
+        ]
+        to_val = to_status.value if isinstance(to_status, TradeStatus) else str(to_status)
+        placeholders = ", ".join("?" for _ in froms)
+        with sqlite3.connect(self._db_path) as conn:
+            cur = conn.execute(
+                f"UPDATE trades SET status = ? "
+                f"WHERE trade_id = ? AND status IN ({placeholders})",
+                (to_val, trade_id, *froms),
+            )
+            rowcount = cur.rowcount
+        if rowcount == 1:
+            return True
+        log.warning(
+            "illegal_transition_blocked",
+            trade_id=trade_id,
+            from_statuses=froms,
+            to_status=to_val,
+        )
+        return False
 
     def close_trade(
         self,
@@ -250,8 +350,23 @@ class StateManager:
         realized_pnl: float,
         commission: float = 0.0,
         exit_reason_detailed: str = "",
-    ) -> None:
-        """Mark a trade as closed with exit details and journaling data."""
+        from_statuses: tuple[TradeStatus, ...] | None = None,
+    ) -> bool:
+        """Mark a trade as closed with exit details and journaling data.
+
+        R12 Tier-A #1: the close is a compare-and-swap from an OPEN status
+        (PENDING/FILLED/PARTIAL/CLOSING) only. A trade that is already CLOSED
+        (or CANCELLED/REJECTED) is refused — a second close used to overwrite
+        the real exit data AND dual-write a duplicate row into the DuckDB
+        analytics store (double-counted P&L). Returns True iff the close
+        landed.
+
+        R16: `from_statuses` narrows the CAS at the DB layer — the stale-
+        pending sweep must pass (PENDING,) so a row promoted to FILLED by a
+        concurrent process (second bot, operator script, broker-lag race)
+        can never be booked as "never filled"/$0. Default keeps all four
+        open statuses.
+        """
         now = datetime.now().isoformat()
 
         # Compute journaling fields
@@ -260,18 +375,34 @@ class StateManager:
         # Calculate time to peak (from entry to when HWM was set)
         time_to_peak_hours = 0.0
 
+        if from_statuses:
+            _open = tuple(s.value for s in from_statuses)
+            _open = (_open * 4)[:4]  # pad (by repetition) to the 4 IN placeholders
+        else:
+            _open = (TradeStatus.PENDING.value, TradeStatus.FILLED.value,
+                     TradeStatus.PARTIAL.value, TradeStatus.CLOSING.value)
         with sqlite3.connect(self._db_path) as conn:
-            conn.execute(
+            cur = conn.execute(
                 """UPDATE trades
                    SET status = ?, exit_time = ?, exit_price = ?,
                        realized_pnl = ?, commission = ?,
                        exit_reason_detailed = ?, peak_pnl_pct = ?,
                        time_to_peak_hours = ?
-                   WHERE trade_id = ?""",
+                   WHERE trade_id = ? AND status IN (?, ?, ?, ?)""",
                 (TradeStatus.CLOSED.value, now, exit_price, realized_pnl,
                  commission, exit_reason_detailed, peak_pnl_pct,
-                 time_to_peak_hours, trade_id),
+                 time_to_peak_hours, trade_id, *_open),
             )
+            if cur.rowcount != 1:
+                # R12 Tier-A #1: double-close / close-of-terminal blocked.
+                log.warning(
+                    "illegal_transition_blocked",
+                    trade_id=trade_id,
+                    from_statuses=list(_open),
+                    to_status=TradeStatus.CLOSED.value,
+                    context="close_trade",
+                )
+                return False
 
             # Clean up open_positions row now that trade is closed
             conn.execute(
@@ -290,6 +421,7 @@ class StateManager:
                         self._duck.ingest_trade(dict(row))
                 except Exception as e:
                     log.warning("duckdb_trade_sync_failed", trade_id=trade_id, error=str(e))
+        return True  # R12 Tier-A #1: close landed (CAS matched an open status)
 
     def insert_open_position(
         self,
@@ -406,7 +538,8 @@ class StateManager:
 
     def get_daily_stats(self, d: date | None = None) -> DailyStats:
         """Get daily stats for a specific date (default: today)."""
-        d = d or date.today()
+        from ait.utils.time import now_et
+        d = d or now_et().date()  # ET-pinned (A3)
         with sqlite3.connect(self._db_path) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
@@ -415,7 +548,13 @@ class StateManager:
             ).fetchone()
 
         if row:
-            return DailyStats(**dict(row))
+            return DailyStats(**{
+            # R8: same schema-ahead-of-dataclass armor as _row_to_trade —
+            # this sits in the fast monitor + exit booking; an unguarded
+            # daily_stats migration would repeat the 07-10 incident.
+            k: v for k, v in dict(row).items()
+            if k in {f.name for f in __import__("dataclasses").fields(DailyStats)}
+        })
         return DailyStats(date=d.isoformat())
 
     # --- High Water Mark & Partial Exits ---
@@ -427,6 +566,41 @@ class StateManager:
                 "UPDATE open_positions SET high_water_mark = MAX(high_water_mark, ?) WHERE trade_id = ?",
                 (hwm, trade_id),
             )
+
+    def update_position_mark(
+        self, trade_id: str, unrealized_pnl: float, pnl_pct: float
+    ) -> None:
+        """Persist the live mark for an open position.
+
+        Called from PortfolioManager._evaluate_position on every tick where
+        real IBKR leg marks are present. Before this existed, unrealized_pnl
+        sat at its insert-time 0.0 forever and the dashboard had no live
+        per-position P&L (audit 2026-07-07 item 1.4).
+        """
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                "UPDATE open_positions SET unrealized_pnl = ?, pnl_pct = ?, "
+                "mark_time = ? WHERE trade_id = ?",
+                (unrealized_pnl, pnl_pct, datetime.now().isoformat(), trade_id),
+            )
+
+    def get_position_mark(self, trade_id: str) -> dict | None:
+        """Return the last persisted live mark for an open position.
+
+        R16: added for the exit-pricing mark anchor — the wing-width sanity
+        cap alone stopped binding once wings widened to $30-35 (a garbage
+        quote of 10.00 on a structure whose fair close is ~$1 passes a
+        35.00 cap). Consumers must check mark_time freshness themselves.
+        """
+        with sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(
+                "SELECT unrealized_pnl, pnl_pct, mark_time FROM open_positions "
+                "WHERE trade_id = ?",
+                (trade_id,),
+            ).fetchone()
+        if row is None or row[0] is None or row[2] is None:
+            return None
+        return {"unrealized_pnl": row[0], "pnl_pct": row[1], "mark_time": row[2]}
 
     def get_high_water_mark(self, trade_id: str) -> float:
         """Get the high water mark P&L pct for a trade."""
@@ -481,6 +655,20 @@ class StateManager:
                 return []
         return []
 
+    def update_trade_entry_price(self, trade_id: str, entry_price: float) -> None:
+        """Overwrite trades.entry_price with the REAL fill price.
+
+        The signal's target price is recorded at order placement; once IBKR
+        reports the actual fill, this replaces it so every downstream P&L
+        computation (exits, analytics, learning) uses reality, not the
+        optimistic target (audit R2/C1 — entry slippage was invisible).
+        """
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                "UPDATE trades SET entry_price = ? WHERE trade_id = ?",
+                (entry_price, trade_id),
+            )
+
     def update_trade_quantity(self, trade_id: str, new_quantity: int) -> None:
         """Update remaining quantity after a partial exit."""
         with sqlite3.connect(self._db_path) as conn:
@@ -505,15 +693,18 @@ class StateManager:
         iv_rank: float,
         sentiment_score: float,
         signals: str = "{}",
+        model_version: str = "",
     ) -> None:
         """Save the market context at time of trade entry (SQLite + DuckDB)."""
         with sqlite3.connect(self._db_path) as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO trade_context
                    (trade_id, entry_direction, entry_confidence, entry_regime,
-                    entry_vix, entry_iv_rank, entry_sentiment_score, entry_signals)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (trade_id, direction, confidence, regime, vix, iv_rank, sentiment_score, signals),
+                    entry_vix, entry_iv_rank, entry_sentiment_score, entry_signals,
+                    model_version)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (trade_id, direction, confidence, regime, vix, iv_rank,
+                 sentiment_score, signals, model_version),
             )
 
         # Dual-write to DuckDB
@@ -560,6 +751,129 @@ class StateManager:
             ).fetchone()
         return row[0] if row else default
 
+    def _connect(self):
+        """R8 CRITICAL fix: the four R7 ledger methods were written against a
+        _connect() helper that never existed — every call raised
+        AttributeError (swallowed at their call sites), leaving the entire
+        real-cost ledger dead-on-arrival: executions empty, commissions $0,
+        capital_at_risk 0 on every row. sqlite3.Connection is a context
+        manager, matching the `with self._connect() as conn:` usage."""
+        import sqlite3 as _sq
+        return _sq.connect(self._db_path)
+
+    def record_execution(self, exec_id: str, order_id: int, perm_id: int,
+                         trade_id: str, symbol: str, con_id: int, side: str,
+                         shares: float, price: float, exec_time: str,
+                         commission: float = 0.0, realized_pnl: float = 0.0,
+                         signal_price: float = 0.0, live_mid: float = 0.0,
+                         nbbo_spread: float = 0.0) -> None:
+        """R7: upsert one broker execution (commission may arrive later —
+        re-upserting the same exec_id refreshes it)."""
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO executions
+                   (exec_id, order_id, perm_id, trade_id, symbol, con_id,
+                    side, shares, price, exec_time, commission, realized_pnl,
+                    signal_price, live_mid, nbbo_spread)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(exec_id) DO UPDATE SET
+                     commission=excluded.commission,
+                     realized_pnl=excluded.realized_pnl,
+                     trade_id=CASE WHEN excluded.trade_id != ''
+                                   THEN excluded.trade_id ELSE trade_id END,
+                     -- R13: fill-quality context is only known at placement;
+                     -- a later sweep may carry it when the first insert did
+                     -- not (event-fill races). Never zero a known value.
+                     signal_price=CASE WHEN excluded.signal_price > 0
+                                       THEN excluded.signal_price ELSE signal_price END,
+                     live_mid=CASE WHEN excluded.live_mid > 0
+                                   THEN excluded.live_mid ELSE live_mid END,
+                     nbbo_spread=CASE WHEN excluded.nbbo_spread > 0
+                                      THEN excluded.nbbo_spread ELSE nbbo_spread END""",
+                (exec_id, order_id, perm_id, trade_id, symbol, con_id, side,
+                 shares, price, exec_time, commission, realized_pnl,
+                 signal_price, live_mid, nbbo_spread),
+            )
+
+    def total_commission(self, trade_id: str) -> float:
+        """R7: sum of real broker commissions recorded for a trade."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(commission),0) FROM executions "
+                "WHERE trade_id = ?", (trade_id,)).fetchone()
+            return float(row[0] or 0.0)
+
+    def count_executions(self, trade_id: str) -> int:
+        """R16: execution rows recorded for a trade — completeness check for
+        the commission true-up (a partial ledger must defer, not true up)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM executions WHERE trade_id = ?",
+                (trade_id,)).fetchone()
+            return int(row[0] or 0)
+
+    def state_keys_like(self, pattern: str) -> list[str]:
+        """R16: bot_state keys matching a SQL LIKE pattern.
+
+        Needed to sweep orphaned trade_maxloss_* keys (they leak whenever a
+        trade leaves the book by any path other than a completed exit, and
+        each orphan permanently inflates the aggregate risk denominator).
+        """
+        with sqlite3.connect(self._db_path) as conn:
+            rows = conn.execute(
+                "SELECT key FROM bot_state WHERE key LIKE ?", (pattern,)
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def pending_trueup_trade_ids(self) -> list[str]:
+        """R16: trades whose commission true-up was deferred on a partial
+        executions ledger (bot_state keys trueup_pending_<trade_id>)."""
+        with sqlite3.connect(self._db_path) as conn:
+            rows = conn.execute(
+                "SELECT key FROM bot_state WHERE key LIKE 'trueup_pending_%'"
+            ).fetchall()
+        return [r[0][len("trueup_pending_"):] for r in rows]
+
+    def update_trade_realized_pnl(self, trade_id: str, realized_pnl: float) -> None:
+        """R15 #8: commission true-up rewrite of a just-closed trade's P&L
+        (estimate swapped for the executions-ledger truth at booking time)."""
+        with self._connect() as conn:
+            conn.execute("UPDATE trades SET realized_pnl = ? WHERE trade_id = ?",
+                         (realized_pnl, trade_id))
+
+    def update_trade_commission(self, trade_id: str, commission: float) -> None:
+        """R7: record the REAL round-trip commission on the trade row."""
+        with self._connect() as conn:
+            conn.execute("UPDATE trades SET commission = ? WHERE trade_id = ?",
+                         (commission, trade_id))
+            # R13 (shadow-referee break #9): commissions arrive AFTER
+            # close_trade's dual-write, so the DuckDB mirror kept
+            # commission=0 forever (sqlite $22.72 vs duckdb $0.00 measured
+            # 2026-07-14). Re-ingest the row — ingest_trade is an
+            # INSERT OR REPLACE upsert, so this is idempotent.
+            if self._duck:
+                try:
+                    conn.row_factory = sqlite3.Row
+                    row = conn.execute(
+                        "SELECT * FROM trades WHERE trade_id = ?", (trade_id,)
+                    ).fetchone()
+                    if row:
+                        self._duck.ingest_trade(dict(row))
+                except Exception as e:
+                    log.warning("duckdb_commission_sync_failed",
+                                trade_id=trade_id, error=str(e))
+
+    def set_trade_capital_at_risk(self, trade_id: str, car: float) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE trades SET capital_at_risk = ? WHERE trade_id = ?",
+                (car, trade_id))
+
+    def delete_state(self, key: str) -> None:
+        """Delete a key from bot state (e.g. per-trade risk keys on close)."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute("DELETE FROM bot_state WHERE key = ?", (key,))
+
     # --- Helpers ---
 
     @staticmethod
@@ -567,4 +881,18 @@ class StateManager:
         d = dict(row)
         d["direction"] = TradeDirection(d["direction"])
         d["status"] = TradeStatus(d["status"])
+        # R7 incident (2026-07-10): a migration added a column the dataclass
+        # didn't have — TradeRecord(**d) raised on EVERY row read, which
+        # silently killed the fast monitor and trading cycle for a full
+        # session (stops/TPs off all day). Filter to known fields so a
+        # schema-ahead-of-dataclass mismatch can never take the loop down;
+        # log once if we drop anything so the drift is visible.
+        import dataclasses as _dc
+        known = {f.name for f in _dc.fields(TradeRecord)}
+        extra = set(d) - known
+        if extra:
+            import structlog as _sl
+            _sl.get_logger("bot.state").warning(
+                "trade_row_extra_columns_dropped", columns=sorted(extra))
+            d = {k: v for k, v in d.items() if k in known}
         return TradeRecord(**d)

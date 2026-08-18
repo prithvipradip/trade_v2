@@ -237,7 +237,11 @@ class StrategyOptimizer:
         if result.total_trades < _HARD_MIN_TRADES:
             return -100.0
         if self._min_trades > 0 and result.total_trades < self._min_trades:
-            value *= (result.total_trades / self._min_trades) ** 2
+            _f = (result.total_trades / self._min_trades) ** 2
+            # R5 audit: multiplying a NEGATIVE score by a <1 factor shrinks
+            # the loss toward zero — degenerate 3-9 trade configs outranked
+            # honest 12-trade losers. Penalize magnitude symmetrically.
+            value = value * _f if value > 0 else value / _f
 
         # Store per-trial metrics for dashboard Optuna tab (Layer 2b).
         trial.set_user_attr("sharpe",        round(float(result.sharpe_ratio), 4))
@@ -361,6 +365,9 @@ class StrategyOptimizer:
             range_predictor=self._range_predictor,
             intraday_store=self._intraday_store,
             eval_start_date=eval_start_date,
+            # R16: Optuna trials must never score with the live future-trained
+            # artifact (same look-ahead class as the walkforward OOS fence).
+            allow_live_model_fallback=False,
             **bt_kwargs,
         )
         return bt.run()

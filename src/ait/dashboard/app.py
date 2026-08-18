@@ -10,6 +10,8 @@ regime analysis) and SQLite for live operational state (open positions, KV store
 from __future__ import annotations
 
 import json
+import math
+import os
 import sqlite3
 import time
 from datetime import date, datetime, timedelta
@@ -19,6 +21,54 @@ import pandas as pd
 import plotly.graph_objects as go
 
 DB_PATH = Path("data/ait_state.db")
+
+# Non-real closes (reconciler bookkeeping rows: never_filled / pending /
+# migrated) must not count as closes in PF / win-rate / drawdown — mirrors
+# the filter in status.py.
+_REAL_CLOSE_SQL = (
+    "COALESCE(exit_reason_detailed, '') NOT LIKE '%never_filled%' "
+    "AND COALESCE(exit_reason_detailed, '') NOT LIKE '%pending%' "
+    "AND COALESCE(exit_reason_detailed, '') NOT LIKE '%migrated%'"
+)
+
+
+def _capital_base() -> float:
+    """Account equity base. Defaults to 196000 (paper NLV).
+
+    Go-live MUST set AIT_CAPITAL_BASE to the funded amount, otherwise
+    return/drawdown percentages are computed off the wrong base.
+    """
+    try:
+        from ait.config.runtime_env import capital_base as _cb
+        return _cb()
+    except Exception:  # noqa: BLE001 - R16: single authority, safe fallback
+        try:
+            return float(os.environ.get("AIT_CAPITAL_BASE", "196000"))
+        except (TypeError, ValueError):
+            return 196000.0
+
+
+def _annualization_factor(trades: list[dict]) -> float:
+    """sqrt(trades-per-year) — replicates ait.backtesting.result.annualization_factor.
+
+    sqrt(252) treated every TRADE as one trading DAY, overstating
+    Sharpe/Sortino ~4x at typical trade frequency (see result.py BT-H4 note).
+    Span runs first→last exit (COALESCE to entry when exit missing); capped
+    at daily sqrt(252).
+    """
+    try:
+        dates = sorted(
+            datetime.fromisoformat(str(t.get("exit_time") or t.get("entry_time"))[:19]).date()
+            for t in trades
+            if (t.get("exit_time") or t.get("entry_time"))
+        )
+        if len(dates) < 2:
+            return 1.0
+        span_days = max((dates[-1] - dates[0]).days, 1)
+        trades_per_year = len(dates) / (span_days / 365.25)
+        return math.sqrt(min(252.0, max(trades_per_year, 1.0)))
+    except Exception:
+        return 1.0
 
 
 def _get_duck():
@@ -68,7 +118,7 @@ def _safe_fetchone(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> di
 
 def _get_state_value(conn: sqlite3.Connection, key: str) -> str | None:
     """Read a value from the state table."""
-    row = _safe_fetchone(conn, "SELECT value FROM state WHERE key = ?", (key,))
+    row = _safe_fetchone(conn, "SELECT value FROM bot_state WHERE key = ?", (key,))
     return row["value"] if row else None
 
 
@@ -185,9 +235,11 @@ def _tab_trade_history(
     st.subheader("Recent Trades")
     recent = _safe_query(
         conn,
+        # exit-time window (COALESCE→entry for open trades): a trade opened
+        # before the window but closed inside it must appear in the range
         "SELECT trade_id, symbol, strategy, direction, status, "
         "entry_price, exit_price, realized_pnl, entry_time, exit_time "
-        "FROM trades WHERE date(entry_time) BETWEEN ? AND ? "
+        "FROM trades WHERE date(COALESCE(exit_time, entry_time)) BETWEEN ? AND ? "
         "ORDER BY entry_time DESC LIMIT 100",
         (start_iso, end_iso),
     )
@@ -214,13 +266,17 @@ def _tab_trade_history(
     else:
         strategy_perf = _safe_query(
             conn,
-            "SELECT strategy, COUNT(*) as trades, "
-            "SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins, "
-            "ROUND(SUM(CASE WHEN realized_pnl > 0 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1) as win_rate_pct, "
-            "ROUND(SUM(realized_pnl), 2) as total_pnl, "
-            "ROUND(AVG(realized_pnl), 2) as avg_pnl "
-            "FROM trades WHERE status = 'closed' AND date(entry_time) BETWEEN ? AND ? "
-            "GROUP BY strategy ORDER BY total_pnl DESC",
+            # exit-time window + real-close filter (bookkeeping closes must
+            # not count in win-rate/P&L aggregates)
+            f"SELECT strategy, COUNT(*) as trades, "
+            f"SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins, "
+            f"ROUND(SUM(CASE WHEN realized_pnl > 0 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1) as win_rate_pct, "
+            f"ROUND(SUM(realized_pnl), 2) as total_pnl, "
+            f"ROUND(AVG(realized_pnl), 2) as avg_pnl "
+            f"FROM trades WHERE status = 'closed' "
+            f"AND date(COALESCE(exit_time, entry_time)) BETWEEN ? AND ? "
+            f"AND {_REAL_CLOSE_SQL} "
+            f"GROUP BY strategy ORDER BY total_pnl DESC",
             (start_iso, end_iso),
         )
         if not strategy_perf.empty:
@@ -246,13 +302,16 @@ def _tab_trade_history(
     else:
         symbol_perf = _safe_query(
             conn,
-            "SELECT symbol, COUNT(*) as trades, "
-            "SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins, "
-            "ROUND(SUM(CASE WHEN realized_pnl > 0 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1) as win_rate_pct, "
-            "ROUND(SUM(realized_pnl), 2) as total_pnl, "
-            "ROUND(AVG(realized_pnl), 2) as avg_pnl "
-            "FROM trades WHERE status = 'closed' AND date(entry_time) BETWEEN ? AND ? "
-            "GROUP BY symbol ORDER BY total_pnl DESC",
+            # exit-time window + real-close filter (see strategy query above)
+            f"SELECT symbol, COUNT(*) as trades, "
+            f"SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins, "
+            f"ROUND(SUM(CASE WHEN realized_pnl > 0 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1) as win_rate_pct, "
+            f"ROUND(SUM(realized_pnl), 2) as total_pnl, "
+            f"ROUND(AVG(realized_pnl), 2) as avg_pnl "
+            f"FROM trades WHERE status = 'closed' "
+            f"AND date(COALESCE(exit_time, entry_time)) BETWEEN ? AND ? "
+            f"AND {_REAL_CLOSE_SQL} "
+            f"GROUP BY symbol ORDER BY total_pnl DESC",
             (start_iso, end_iso),
         )
         if not symbol_perf.empty:
@@ -286,7 +345,8 @@ def _tab_trade_history(
     )
     conf_perf = _safe_query(
         conn,
-        """
+        # exit-time window + real-close filter (see strategy query above)
+        f"""
         SELECT
             CASE
                 WHEN ml_confidence < 0.55 THEN '1. low (<0.55)'
@@ -301,7 +361,8 @@ def _tab_trade_history(
             ROUND(AVG(realized_pnl), 2) as avg_pnl
         FROM trades
         WHERE status = 'closed'
-          AND date(entry_time) BETWEEN ? AND ?
+          AND date(COALESCE(exit_time, entry_time)) BETWEEN ? AND ?
+          AND {_REAL_CLOSE_SQL}
           AND ml_confidence > 0
         GROUP BY confidence_bucket
         ORDER BY confidence_bucket
@@ -319,7 +380,9 @@ def _tab_trade_history(
     st.subheader("Day-of-Week Performance")
     dow_perf = _safe_query(
         conn,
-        """
+        # exit-time window + real-close filter; grouping stays on ENTRY
+        # weekday — the question is entry timing
+        f"""
         SELECT
             CASE strftime('%w', entry_time)
                 WHEN '1' THEN '1. Monday'
@@ -334,7 +397,8 @@ def _tab_trade_history(
             ROUND(AVG(realized_pnl), 2) as avg_pnl
         FROM trades
         WHERE status = 'closed'
-          AND date(entry_time) BETWEEN ? AND ?
+          AND date(COALESCE(exit_time, entry_time)) BETWEEN ? AND ?
+          AND {_REAL_CLOSE_SQL}
         GROUP BY day_of_week
         ORDER BY day_of_week
         """,
@@ -344,6 +408,31 @@ def _tab_trade_history(
         st.dataframe(dow_perf, use_container_width=True)
     else:
         st.info("No day-of-week data yet")
+
+
+def _bt_period_years(bt: dict) -> tuple[float, bool]:
+    """Backtest span in years derived from the report JSON's date range.
+
+    Returns (years, assumed). assumed=True means no date range was found and
+    the 4y fallback is a fabrication — the UI must label it so the reader
+    knows the annualized figure rests on an assumption.
+    """
+    def _parse_date(s):
+        try:
+            return date.fromisoformat(str(s)[:10])
+        except (ValueError, TypeError):
+            return None
+
+    start = _parse_date(bt.get("start_date") or bt.get("period_start"))
+    end = _parse_date(bt.get("end_date") or bt.get("period_end"))
+    if not (start and end):
+        period = bt.get("backtest_period") or bt.get("period") or ""
+        if " to " in str(period):
+            a, b = str(period).split(" to ", 1)
+            start, end = _parse_date(a.strip()), _parse_date(b.strip())
+    if start and end and end > start:
+        return max((end - start).days / 365.25, 1 / 365.25), False
+    return 4.0, True
 
 
 def _live_vs_backtest_panel(conn: sqlite3.Connection) -> None:
@@ -392,37 +481,47 @@ def _live_vs_backtest_panel(conn: sqlite3.Connection) -> None:
     bt_win_rate = _parse_pct(bt.get("win_rate"))
     bt_max_dd = _parse_pct(bt.get("max_drawdown"))
 
-    # Get live stats — last 30 days of closed trades
+    # Get live stats — last 30 days of closed trades.
+    # Window on EXIT time: a trade opened 35 days ago but closed yesterday at
+    # a big loss must count. Exclude bookkeeping closes (never_filled etc.).
     end = date.today()
     start = end - timedelta(days=30)
     live_trades = _safe_fetchall(
         conn,
-        "SELECT realized_pnl, entry_time FROM trades "
-        "WHERE status = 'closed' AND date(entry_time) BETWEEN ? AND ?",
+        f"SELECT realized_pnl, entry_time, exit_time FROM trades "
+        f"WHERE status = 'closed' "
+        f"AND date(COALESCE(exit_time, entry_time)) BETWEEN ? AND ? "
+        f"AND {_REAL_CLOSE_SQL}",
         (start.isoformat(), end.isoformat()),
     )
-    live_pnls = [t["realized_pnl"] for t in live_trades if t.get("realized_pnl")]
+    # Same population in numerator and denominator: the old truthiness check
+    # dropped $0 scratch trades from wins/P&L while the denominator counted
+    # all rows. A $0 trade is a non-win, not a dropped row.
+    live_pnls = [t["realized_pnl"] for t in live_trades if t.get("realized_pnl") is not None]
     live_total_pnl = sum(live_pnls)
-    live_trade_count = len(live_trades)
+    live_trade_count = len(live_pnls)
     live_wins = sum(1 for p in live_pnls if p > 0)
     live_win_rate = live_wins / live_trade_count if live_trade_count > 0 else None
 
-    # Get account value for return calc
+    # Get account value for return calc — fallback is AIT_CAPITAL_BASE
+    # (paper NLV default), not a hardcoded 250k that misstates returns
     nlv_row = _safe_fetchall(
         conn,
         "SELECT value FROM bot_state WHERE key = 'account_value' LIMIT 1",
     )
-    nlv = float(nlv_row[0]["value"]) if nlv_row else 250000.0
+    nlv = float(nlv_row[0]["value"]) if nlv_row else _capital_base()
     live_return_30d = (live_total_pnl / nlv) if nlv > 0 else 0
 
-    # Annualize: backtest is multi-year, live is 30 days
-    bt_period_years = 4.0  # rough — backtest covers ~4 years of test data
-    bt_annualized = (1 + bt_return) ** (1 / bt_period_years) - 1 if bt_return is not None else None
+    # Annualize: derive the backtest span from the report's date range —
+    # only fall back to the 4y guess when absent, and say so in the UI
+    bt_years, bt_years_assumed = _bt_period_years(bt)
+    bt_annualized = (1 + bt_return) ** (1 / bt_years) - 1 if bt_return is not None else None
     live_annualized = ((1 + live_return_30d) ** 12) - 1 if live_return_30d else 0
 
     col1, col2, col3 = st.columns(3)
     col1.metric(
-        "Backtest Return (annualized)",
+        "Backtest Return (annualized)"
+        + (" (assumed 4y)" if bt_years_assumed else f" ({bt_years:.1f}y)"),
         f"{bt_annualized:.1%}" if bt_annualized is not None else "n/a",
     )
     col2.metric(
@@ -477,11 +576,14 @@ def _tab_analytics(conn: sqlite3.Connection) -> None:
     _live_vs_backtest_panel(conn)
     st.divider()
 
-    # Gather closed trades for analytics
+    # Gather closed trades for analytics — exclude bookkeeping closes
+    # (never_filled/pending/migrated) and order by CLOSE time so the equity
+    # curve, drawdown and streaks follow realization order
     trades = _safe_fetchall(
         conn,
-        "SELECT realized_pnl, entry_time, exit_time FROM trades "
-        "WHERE status = 'closed' ORDER BY entry_time",
+        f"SELECT realized_pnl, entry_time, exit_time FROM trades "
+        f"WHERE status = 'closed' AND {_REAL_CLOSE_SQL} "
+        f"ORDER BY COALESCE(exit_time, entry_time)",
     )
 
     pnls = [t["realized_pnl"] for t in trades if t.get("realized_pnl") is not None]
@@ -493,23 +595,24 @@ def _tab_analytics(conn: sqlite3.Connection) -> None:
     if len(pnls) > 1:
         import statistics
 
-        import math
-
+        # Annualize by ACTUAL trade frequency, not sqrt(252) — sqrt(252)
+        # treated each trade as one trading day (see
+        # ait.backtesting.result.annualization_factor)
+        ann = _annualization_factor(trades)
         mean_pnl = statistics.mean(pnls)
         std_pnl = statistics.stdev(pnls)
 
         if std_pnl > 0:
-            sharpe = (mean_pnl / std_pnl) * math.sqrt(252)
+            sharpe = (mean_pnl / std_pnl) * ann
 
-        downside = [p for p in pnls if p < 0]
-        if len(downside) > 1:
-            ds_std = statistics.stdev(downside)
-            if ds_std > 0:
-                sortino = (mean_pnl / ds_std) * math.sqrt(252)
-        elif len(downside) == 1:
-            ds_std = abs(downside[0])
-            if ds_std > 0:
-                sortino = (mean_pnl / ds_std) * math.sqrt(252)
+        # Sortino — target-0 downside deviation over ALL returns:
+        # sqrt(mean(min(r,0)^2)), matching result.py. The old stdev-of-losses
+        # definition gave a consistent loser downside-dev≈0.
+        downside_dev = math.sqrt(sum(min(p, 0.0) ** 2 for p in pnls) / len(pnls))
+        if downside_dev > 0:
+            sortino = (mean_pnl / downside_dev) * ann
+        elif mean_pnl > 0:
+            sortino = float("inf")
 
     # Max drawdown
     if pnls:
@@ -786,7 +889,7 @@ def _tab_self_learning(conn: sqlite3.Connection) -> None:
     st.subheader("All Learning State Keys")
     learning_keys = _safe_query(
         conn,
-        "SELECT key, value FROM state WHERE key LIKE 'learning_%' ORDER BY key",
+        "SELECT key, value FROM bot_state WHERE key LIKE 'learning_%' ORDER BY key",
     )
     if not learning_keys.empty:
         st.dataframe(learning_keys, use_container_width=True, hide_index=True)
@@ -801,13 +904,16 @@ def _tab_trade_intelligence(conn: sqlite3.Connection) -> None:
     # --- Exit Management Overview ---
     st.subheader("Dynamic Exit Management")
 
-    # Trades with journaling data
+    # Trades with journaling data — exclude bookkeeping closes so
+    # stale_pending_never_filled etc. don't pollute the exit-reason and
+    # direction-accuracy aggregates
     exit_data = _safe_query(
         conn,
-        "SELECT symbol, strategy, exit_reason_detailed, peak_pnl_pct, "
-        "realized_pnl, direction_correct "
-        "FROM trades WHERE status = 'closed' AND exit_reason_detailed != '' "
-        "ORDER BY exit_time DESC LIMIT 50",
+        f"SELECT symbol, strategy, exit_reason_detailed, peak_pnl_pct, "
+        f"realized_pnl, direction_correct "
+        f"FROM trades WHERE status = 'closed' AND exit_reason_detailed != '' "
+        f"AND {_REAL_CLOSE_SQL} "
+        f"ORDER BY exit_time DESC LIMIT 50",
     )
 
     if not exit_data.empty:
@@ -956,7 +1062,7 @@ def _tab_system_health(conn: sqlite3.Connection) -> None:
     st.subheader("Component Status")
     watchdog_keys = _safe_query(
         conn,
-        "SELECT key, value FROM state WHERE key LIKE 'watchdog_%' ORDER BY key",
+        "SELECT key, value FROM bot_state WHERE key LIKE 'watchdog_%' ORDER BY key",
     )
     if not watchdog_keys.empty:
         for _, row in watchdog_keys.iterrows():
@@ -1078,7 +1184,9 @@ def _run_walkforward(symbols, strategies, capital, min_conf) -> dict:
     cfg = WalkForwardConfig(
         train_days=365,
         test_days=63,
-        step_days=21,
+        # step == test window: step_days=21 with 63-day tests re-counted each
+        # period ~3x (window-overlap triple-counting fixed in the engine)
+        step_days=63,
         gap_days=5,
         initial_capital=capital,
         min_confidence=min_conf,

@@ -1,0 +1,9 @@
+{
+ "arm": "gate_only",
+ "n": 58,
+ "win_rate": 58.62,
+ "pf": 0.86,
+ "max_dd_pct": 9.78,
+ "total_ret_pct": -0.73,
+ "windows": 25
+}

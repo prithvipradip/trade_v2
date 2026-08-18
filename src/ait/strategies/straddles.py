@@ -151,8 +151,22 @@ class ShortStrangle(Strategy):
         if total_credit <= 0:
             return []
 
-        # Undefined risk — estimate max loss as 3x credit for risk management
-        estimated_max_loss = total_credit * 3 * 100
+        # Undefined risk — estimate the tail loss from an actual stress move,
+        # not a flat multiple of credit. The old `3x credit` proxy understated
+        # true tail risk 10-30x, which made the 3% per-trade and 20% aggregate
+        # risk caps meaningless for strangles (audit 2026-07-07 item 2.1).
+        # Stress: +/-15% underlying move over the hold; loss = worse side's
+        # intrinsic minus the credit collected. Floored at the old 3x credit
+        # so this can only be MORE conservative than before.
+        STRESS_MOVE_PCT = 0.15
+        spot = chain.underlying_price or 0.0
+        if spot > 0:
+            put_side_loss = max(0.0, short_put.strike - spot * (1 - STRESS_MOVE_PCT))
+            call_side_loss = max(0.0, spot * (1 + STRESS_MOVE_PCT) - short_call.strike)
+            stress_loss = (max(put_side_loss, call_side_loss) - total_credit) * 100
+        else:
+            stress_loss = 0.0
+        estimated_max_loss = max(stress_loss, total_credit * 3 * 100)
         max_profit = total_credit * 100
 
         return [

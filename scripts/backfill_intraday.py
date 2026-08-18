@@ -87,13 +87,17 @@ def _build_chunks(years: float, chunk_months: int) -> list[tuple[datetime, str]]
     total_months = int(years * 12)
     chunks: list[tuple[datetime, str]] = []
 
+    # R5 audit C2: 31-day stride vs calendar-month durations left multi-day
+    # holes at every boundary (worst at 6-month chunks: 2-5 days). Use real
+    # calendar months.
+    from dateutil.relativedelta import relativedelta
     end = now
     remaining = total_months
     while remaining > 0:
         this_chunk = min(chunk_months, remaining)
         duration = f"{this_chunk} M"
         chunks.append((end, duration))
-        end = end - timedelta(days=this_chunk * 31)  # approximate
+        end = end - relativedelta(months=this_chunk)
         remaining -= this_chunk
 
     return chunks
@@ -159,7 +163,7 @@ async def _backfill_symbol(
         df.set_index("Datetime", inplace=True)
         df = df[["Open", "High", "Low", "Close", "Volume"]]
 
-        stored = store.save_intraday(symbol, df, interval="5m")
+        stored = store.save_intraday(symbol, df, interval="5m", source="TRADES")  # A9: tag bar semantics
         total_stored += stored
         print(f" → {len(df)} bars fetched, {stored} rows upserted")
 

@@ -14,7 +14,19 @@ from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings
 
 
-class TradingConfig(BaseModel):
+class _StrictModel(BaseModel):
+    """R13 (human-factors lens): every config model silently IGNORED unknown
+    keys (pydantic default), so a one-letter typo in config.yaml silently ran
+    the code default — executed proof: `max_contracts_per_trad` traded 10x
+    size, `paper_trading_mod` re-enabled live-only overlays, all with zero
+    warnings. Unknown keys are now a fail-loud config error at load time.
+    SentimentConfig keeps `extra="allow"` deliberately (retired-subsystem
+    tombstone keys may linger in old configs)."""
+
+    model_config = {"extra": "forbid"}
+
+
+class TradingConfig(_StrictModel):
     mode: Literal["paper", "live"] = "paper"
     universe: list[str] = ["SPY", "QQQ", "AAPL"]
     scan_interval_seconds: int = Field(default=300, ge=30, le=3600)
@@ -22,27 +34,59 @@ class TradingConfig(BaseModel):
     trading_hours_only: bool = True
 
 
-class AccountConfig(BaseModel):
+class AccountConfig(_StrictModel):
     pdt_protection: bool = True
     pdt_account_under_25k: bool = True
 
 
-class PositionConfig(BaseModel):
+class PositionConfig(_StrictModel):
     max_open_positions: int = Field(default=5, ge=1, le=20)
     max_position_pct: float = Field(default=0.05, ge=0.01, le=0.25)
     max_portfolio_delta: float = Field(default=0.30, ge=0.05, le=1.0)
-    max_portfolio_risk_pct: float = Field(default=0.02, ge=0.005, le=0.10)
+    max_portfolio_risk_pct: float = Field(default=0.20, ge=0.005, le=0.50,
+        description="Aggregate capital-at-risk across ALL open positions as a "
+                    "fraction of NLV. Was a phantom knob (never read) while the "
+                    "real cap was hardcoded 0.20 in manager.py — now wired "
+                    "(audit 2026-07-07 item 3.3). Default matches the "
+                    "2026-06-30 operating value.")
+    max_contracts_per_trade: int = Field(default=10, ge=1, le=100,
+        description="Hard cap on contracts per trade. Low values (e.g. 1) keep "
+                    "cost-per-trade minimal so the account can hold many more "
+                    "concurrent positions — maximizes trade COUNT for learning.")
 
 
-class RiskConfig(BaseModel):
+class RiskConfig(_StrictModel):
     max_daily_loss_pct: float = Field(default=0.02, ge=0.005, le=0.10)
     max_consecutive_losses: int = Field(default=3, ge=1, le=10)
     pause_minutes_after_losses: int = Field(default=30, ge=5, le=120)
     max_api_failures: int = Field(default=5, ge=2, le=20)
     min_confidence: float = Field(default=0.65, ge=0.50, le=0.95)
+    pre_event_blackout_days: int = Field(default=1, ge=0, le=7,
+        description="Block NEW credit entries within N calendar days of a "
+                    "macro event (NFP/CPI/PCE). PLAN 2026-08-03: relaxed 4->1 "
+                    "(user-approved) - the <=4 window blacked out ~half of all "
+                    "trading days and refused the richest premium; every 14-30 "
+                    "DTE hold spans events regardless, wings cap the surprise.")
+    max_position_risk_pct: float = Field(default=0.03, ge=0.005, le=0.10,
+        description="Per-trade max_loss cap as a fraction of NLV (was "
+                    "hardcoded 0.03 in manager.py — audit item 3.3).")
+    max_correlation: float = Field(default=0.75, ge=0.30, le=0.99,
+        description="Correlation above which two symbols count as the same bet.")
+    max_correlated_positions: int = Field(default=2, ge=1, le=8,
+        description="Max simultaneous positions within one correlated cluster "
+                    "(SPY/QQQ/IWM/DIA correlate ~0.95). Was a CorrelationGuard "
+                    "code default — audit item 3.3.")
+    max_credit_positions: int = Field(default=6, ge=1, le=20,
+        description="Max simultaneous short-premium (credit) positions. The "
+                    "delta gate is dead and the daily breaker only sees "
+                    "realized P&L, so without this the whole book can be "
+                    "short vol into a gap (audit R2).")
+    credit_vix_halt: float = Field(default=28.0, ge=15.0, le=60.0,
+        description="No NEW credit entries when VIX is at/above this level — "
+                    "cheap vol-regime brake for short-premium strategies.")
 
 
-class OptionsConfig(BaseModel):
+class OptionsConfig(_StrictModel):
     delta_range: list[float] = [0.20, 0.50]
     dte_range: list[int] = [14, 45]
     min_open_interest: int = Field(default=100, ge=0)
@@ -71,17 +115,24 @@ class OptionsConfig(BaseModel):
         return v
 
 
-class BacktestConfig(BaseModel):
+class BacktestConfig(_StrictModel):
     initial_capital: float = Field(default=100_000.0, ge=1_000.0, le=10_000_000.0)
     position_size_pct: float = Field(default=0.05, ge=0.01, le=0.50,
         description="Fraction of capital risked per trade (max-loss basis).")
     wing_floor_dollars: float = Field(default=5.0, ge=0.50, le=50.0,
         description="Hard minimum spread width in dollars (safety floor only). "
                     "Wing sizing is now primarily driven by wing_k × expected_move.")
-    wing_k: float = Field(default=1.0, ge=0.1, le=3.0,
+    wing_k: float = Field(default=1.6, ge=0.1, le=3.0,
         description="Vol-scaled wing multiplier: wing_width = wing_k × price × IV × sqrt(DTE/365). "
                     "Optuna optimizes this per walk-forward window. "
-                    "1.0 = 1-sigma expected move. wing_floor_dollars is the hard minimum.")
+                    "1.0 = 1-sigma expected move. wing_floor_dollars is the hard minimum. "
+                    "R19: default raised 1.0 -> 1.6 to match the LIVE promoted value "
+                    "(runtime_env.CONTRACT_DEFAULTS, 2026-08-04 SHADOW R3). This was the "
+                    "third fork of wing_k: any module constructing BacktestConfig() bare "
+                    "researched 1.0-wing structures while live traded 1.6, so backtests "
+                    "did not describe the live book. Unlike the risk knobs below, a "
+                    "divergent wing_k is not 'safer' in either direction — it is simply a "
+                    "different strategy, so it must track the live value.")
     iv_floor: float = Field(default=0.20, ge=0.05, le=1.0,
         description="Minimum synthetic IV used for option pricing. "
                     "Prevents near-zero credits in calm markets.")
@@ -132,11 +183,27 @@ class BacktestConfig(BaseModel):
         description="Multifractal width above which fractal confidence penalty is applied.")
 
 
-class MLConfig(BaseModel):
+class MLConfig(_StrictModel):
     ensemble_weights: dict[str, float] = {"xgboost": 0.5, "lightgbm": 0.5}
     retrain_interval_days: int = Field(default=7, ge=1, le=30)
     lookback_days: int = Field(default=504, ge=60, le=2520)
     min_training_samples: int = Field(default=100, ge=30)
+    # ABLATION VERDICT REVERSED 2026-08-08 (rule B1 pre-registered in PLAN).
+    # The 08-03 "gates veto nothing" run was VACUOUS: per-window training
+    # failed 96/96 times (train_days=126 left ~27 samples vs the 100 floor),
+    # so all three arms were the same ungated engine and the live artifact
+    # leaked in as a look-ahead predictor. Re-run with train_days=365 + the
+    # R16 fence, 11y / 68 windows / 242 models genuinely trained:
+    #   gates OFF n=274 PF 1.05 DD 34.57%   gates ON n=92 PF 1.27 DD 9.97%
+    # The gates are a DRAWDOWN control above all — 34.6% -> 10.0% across
+    # 2018/2020/2022 vol events — and they clear B1 (PF +0.22 > 0.10, DD
+    # better, n>=30, 40 trading windows). Default back ON.
+    # COST, measured and accepted: ~66% of candidate entries rejected.
+    entry_gates_enabled: bool = True
+    range_min_confidence: float = Field(default=0.65, ge=0.50, le=0.90,
+        description="Floor for model-overridden signal confidence (range/"
+                    "vol-mag). 0.65 beat 0.55 across every backtest metric. "
+                    "Was hardcoded in orchestrator — audit item 3.3.")
 
     @field_validator("ensemble_weights")
     @classmethod
@@ -147,27 +214,37 @@ class MLConfig(BaseModel):
         return v
 
 
-class MetaLabelConfig(BaseModel):
-    enabled: bool = True
+class MetaLabelConfig(_StrictModel):
+    # R12-C: default flipped to False (was True). The meta-labeler was trained
+    # on corrupted data and rejects everything; config.yaml has carried
+    # `enabled: false` since that finding, so this only changes what happens
+    # if the key is ever omitted — default-off is the safe direction.
+    enabled: bool = False
     min_probability: float = Field(default=0.50, ge=0.30, le=0.80)
     retrain_with_primary: bool = True  # Retrain when primary model retrains
 
 
-class SentimentSourcesConfig(BaseModel):
-    news: bool = True
-    fear_greed: bool = True
-    finbert: bool = True
+class SentimentConfig(_StrictModel):
+    """R12-C tombstone: the sentiment stack (ait.sentiment, ib_news,
+    fundamentals_db) is retired to deprecated/src/ — verified zero influence
+    on iron-condor decisions. Nothing reads this config anymore.
+
+    Kept as a permissive stub (extra="allow") so an existing config.yaml
+    `sentiment:` block — including its nested `sources:` mapping — still
+    validates instead of crashing load_settings() at bot startup. That is the
+    least-breaking path: no config edit required, no consumer left to care
+    what the values are.
+    """
+
+    enabled: bool = False
+    model_config = {"extra": "allow"}
 
 
-class SentimentConfig(BaseModel):
-    enabled: bool = True
-    weight: float = Field(default=0.20, ge=0.0, le=0.50)
-    cache_ttl_seconds: int = Field(default=300, ge=60, le=3600)
-    sources: SentimentSourcesConfig = SentimentSourcesConfig()
-    ib_news_weight: float = Field(default=0.20, ge=0.0, le=0.50)
-
-
-class ExitConfig(BaseModel):
+class ExitConfig(_StrictModel):
+    exit_cross_amount: float = Field(default=0.10, ge=0.01, le=0.50,
+        description="How far a combo EXIT limit crosses the spread so the "
+                    "close actually fills (was hardcoded EXIT_CROSS in "
+                    "orchestrator — audit item 3.3).")
     trailing_stop_pct: float = Field(default=0.25, ge=0.10, le=0.50)
     breakeven_trigger_pct: float = Field(default=0.30, ge=0.10, le=0.80)
     partial_exit_levels: list[dict] = [
@@ -178,9 +255,22 @@ class ExitConfig(BaseModel):
     volatility_adjusted_stops: bool = True
     initial_stop_loss_pct: float = Field(default=0.50, ge=0.15, le=0.75)
     auto_hedge: bool = False
+    # R14: staleness gate on exit inputs. The touch stop is the only exit rule
+    # that acts DIRECTLY on the underlying's price, and it read that price with
+    # no quality check at all — a frozen feed could fire it on a breach that had
+    # long since passed, or hide a real one. Budget is generous because the
+    # fast monitor runs on a 30s cadence and quotes are cached for 15s.
+    max_quote_staleness_seconds: float = Field(default=180.0, ge=30.0, le=900.0,
+        description="Underlying quote older than this (by exchange tick time) "
+                    "marks the touch stop's input DEGRADED — it then needs two "
+                    "agreeing ticks to fire instead of one.")
+    touch_confirm_ticks: int = Field(default=2, ge=1, le=5,
+        description="Consecutive agreeing evaluations required before a touch "
+                    "stop fires on a degraded/frozen quote. 1 = fire on a "
+                    "single stale print (the pre-R14 behaviour).")
 
 
-class LearningConfig(BaseModel):
+class LearningConfig(_StrictModel):
     enabled: bool = True
     lookback_days: int = Field(default=30, ge=7, le=180)
     max_adaptations_per_cycle: int = Field(default=3, ge=1, le=10)
@@ -197,7 +287,7 @@ class LearningConfig(BaseModel):
     )
 
 
-class TelegramConfig(BaseModel):
+class TelegramConfig(_StrictModel):
     enabled: bool = True
     send_trades: bool = True
     send_errors: bool = True
@@ -205,16 +295,16 @@ class TelegramConfig(BaseModel):
     send_circuit_breaker: bool = True
 
 
-class NotificationsConfig(BaseModel):
+class NotificationsConfig(_StrictModel):
     telegram: TelegramConfig = TelegramConfig()
 
 
-class DashboardConfig(BaseModel):
+class DashboardConfig(_StrictModel):
     enabled: bool = True
     port: int = Field(default=8501, ge=1024, le=65535)
 
 
-class LoggingConfig(BaseModel):
+class LoggingConfig(_StrictModel):
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     file: str = "logs/ait.log"
     max_bytes: int = Field(default=10_485_760, ge=1_048_576)
@@ -243,7 +333,7 @@ class APIKeysConfig(BaseSettings):
     model_config = {"env_file": ".env", "env_prefix": "", "case_sensitive": False, "extra": "ignore"}
 
 
-class Settings(BaseModel):
+class Settings(_StrictModel):
     """Root configuration — validated on startup."""
 
     trading: TradingConfig = TradingConfig()
@@ -270,13 +360,99 @@ def load_settings(config_path: str | Path = "config.yaml") -> Settings:
     """Load settings from YAML file, with env var overrides for secrets."""
     config_path = Path(config_path)
 
-    yaml_data = {}
-    if config_path.exists():
-        with open(config_path) as f:
-            yaml_data = yaml.safe_load(f) or {}
+    # R5 audit: silently falling back to all-defaults gave a materially
+    # different bot (default universe, meta-label ON, FinBERT ON -> crash
+    # loop, 10 contracts/trade) whenever launched from the wrong cwd.
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"Config file not found: {config_path.resolve()} — refusing to "
+            "run on pydantic defaults. Launch from the repo root or pass an "
+            "explicit --config path."
+        )
+    with open(config_path) as f:
+        yaml_data = yaml.safe_load(f) or {}
 
     # IBKR and API keys come from environment only
     yaml_data["ibkr"] = IBKREnvConfig().model_dump()
     yaml_data["api_keys"] = APIKeysConfig().model_dump()
 
-    return Settings.model_validate(yaml_data)
+    settings = Settings.model_validate(yaml_data)
+    _report_default_divergence(settings)
+    return settings
+
+
+# R19 (user audit): the SECOND shadowing layer, after the env contract.
+# Every module that builds a config model BARE — Backtester(), WalkForwardConfig(),
+# the optimizer, the trainer — gets the pydantic Field default, NOT the
+# config.yaml operating value. Those disagreed on 5 fields, so research
+# validated a different bot than the one that trades.
+#
+# wing_k was ALIGNED (a divergent wing size is not "safer", it is a different
+# strategy). The rest are deliberately left STRICTER in code than in yaml —
+# a bare construction should fail safe, not inherit a loosened operating
+# value — but the divergence must never again be SILENT. This reports it
+# once at load, so `grep config_default_divergence` answers "is research
+# running the same knobs as live?" in one line.
+# R19 SECURITY: sections whose VALUES must never enter a log line. api_keys /
+# ibkr carry the Finnhub + Polygon keys, the Telegram bot token and the account
+# number — the exact class that put a live Finnhub key into 11 log files (R13
+# #12, still pending rotation as U10). The divergence report exists to compare
+# NUMERIC knobs; secrets are reported as names only, never values.
+_SECRET_SECTIONS: frozenset[str] = frozenset({"api_keys", "ibkr"})
+_SECRET_FIELD_HINTS: tuple[str, ...] = (
+    "key", "token", "secret", "password", "account", "chat_id",
+)
+_DIVERGENCE_EXEMPT: frozenset[str] = frozenset()
+
+
+def _is_secret(section_name: str, field_name: str) -> bool:
+    if section_name in _SECRET_SECTIONS:
+        return True
+    lowered = field_name.lower()
+    return any(hint in lowered for hint in _SECRET_FIELD_HINTS)
+
+
+def default_divergences(settings: "Settings") -> list[tuple[str, object, object]]:
+    """Fields whose config.yaml value differs from the pydantic default.
+
+    Returns (dotted_field, code_default, active_value). Used by the startup
+    report and by tests/test_r19_config_authority.py to pin that no NEW
+    divergence appears unnoticed.
+    """
+    out: list[tuple[str, object, object]] = []
+    for section_name, section in settings:
+        model_fields = getattr(type(section), "model_fields", None)
+        if not model_fields:
+            continue
+        for field_name, field in model_fields.items():
+            dotted = f"{section_name}.{field_name}"
+            if dotted in _DIVERGENCE_EXEMPT:
+                continue
+            if _is_secret(section_name, field_name):
+                continue  # R19: names only for secrets — never values
+            default = field.default
+            if default is None or repr(default).startswith("PydanticUndefined"):
+                continue
+            active = getattr(section, field_name, None)
+            if isinstance(default, (int, float, str, bool)) and active != default:
+                out.append((dotted, default, active))
+    return out
+
+
+def _report_default_divergence(settings: "Settings") -> None:
+    try:
+        diverged = default_divergences(settings)
+        if diverged:
+            from ait.utils.logging import get_logger  # lazy: keep settings import-light
+            log = get_logger("config.settings")
+            log.info(
+                "config_default_divergence",
+                count=len(diverged),
+                fields={d: {"code_default": c, "active": a} for d, c, a in diverged},
+                note="config.yaml overrides these; any module constructing a "
+                     "config model BARE (engine/walkforward/optimizer/trainer) "
+                     "runs the code_default instead — research vs live skew.",
+            )
+    except Exception:  # noqa: BLE001 — diagnostics must never block startup
+        pass
+

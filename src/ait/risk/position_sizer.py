@@ -84,6 +84,13 @@ class PositionSizer:
         if account_value <= 0 or option_price <= 0:
             return PositionSize(0, 0, 0, 0, "invalid inputs")
 
+        # R15 minor: a VIX outage passes vix=None (credit strategies fail
+        # closed upstream by design, but DEBIT strategies reach this compare
+        # and died with TypeError — silently blocking ALL debit entries).
+        # None = regime unknown: treat as calm (no VIX shrink) rather than
+        # crash; the upstream credit fail-closed gate is unaffected.
+        vix = vix or 0.0
+
         # Base: max position as percentage of account
         max_position_value = account_value * self._pos_config.max_position_pct
         cost_per_contract = option_price * 100  # Options are 100 shares
@@ -144,7 +151,24 @@ class PositionSizer:
 
         # Scale cap with account size: 10 contracts per $100k, minimum 1
         account_scale_cap = max(1, int(account_value / 10_000))
-        contracts = max(1, min(max_contracts, account_scale_cap))
+        # Hard per-trade contract cap (config) — keep cost-per-trade small so
+        # the book can hold many more concurrent positions (learning volume).
+        hard_cap = self._pos_config.max_contracts_per_trade
+        # Deep-audit SR-M4 + R7-SOON (launch coherence): viability is decided
+        # by the HARD cap alone (account x max_position_pct). The SOFT
+        # multipliers (confidence, vol, strategy, IV-rank, drawdown, VIX)
+        # used to gate viability too — at small NLV they shrank the budget
+        # below ONE contract and bricked every defined-risk entry (0.07 x
+        # $2.1k = $147 budget x 0.4 IC strategy_adj x ... = $17-42 vs $130
+        # min condor -> 0 contracts, account unusable). SR-M4's intent is
+        # honored by the hard check: a structure the raw cap can't afford is
+        # still 0. Soft multipliers throttle COUNT above the 1-contract floor.
+        if cost_per_contract > max_position_value:
+            return PositionSize(0, 0.0, conf_adj, vol_adj,
+                                "single contract exceeds max_position_pct cap")
+        if max_contracts < 1:
+            max_contracts = 1
+        contracts = min(max_contracts, account_scale_cap, hard_cap)
 
         # Max risk: for spreads, risk is the net debit (option_price already is net debit).
         # For naked options, risk is the full premium paid.

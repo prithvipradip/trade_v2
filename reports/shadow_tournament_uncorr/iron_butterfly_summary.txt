@@ -1,0 +1,38 @@
+============================================================
+  WALK-FORWARD BACKTEST RESULTS
+============================================================
+  Windows:           25
+  Total Trades:      58
+  Total Return:      -10.57%
+  Cash-Drag Adj Ret: 7.17%  (idle cash @ 5%)
+------------------------------------------------------------
+  RISK-ADJUSTED
+  Sharpe Ratio:      -1.52
+  Sortino Ratio:     -1.88  (downside-only vol)
+  Max Drawdown:      34.31%
+------------------------------------------------------------
+  TRADE QUALITY
+  Win Rate:          32.76%
+  Avg Win:           $953.16
+  Avg Loss:          $1,316.95
+  Win/Loss Ratio:    0.72  (>1 = winners bigger)
+  Expectancy/Trade:  $-573.29
+  Best Trade:        $2,639.72
+  Worst Trade:       $-4,903.34
+  Profit Factor:     0.35
+------------------------------------------------------------
+  CAPITAL EFFICIENCY
+  Utilization:       2.0%  (avg % deployed)
+  RAROC:             -518.8%  (return on deployed)
+------------------------------------------------------------
+  CONSISTENCY
+  Profitable Windows:32%
+  Avg Window Return: -0.44%
+------------------------------------------------------------
+  STRATEGY BREAKDOWN:
+    iron_butterfly            | trades= 58 | win=33% | pnl=$-33,251
+  SYMBOL BREAKDOWN:
+    GLD      | return=-4.33% | trades= 23 | sharpe=-0.36
+    XLE      | return=-4.60% | trades= 22 | sharpe=-0.76
+    TLT      | return=-24.33% | trades= 13 | sharpe=-2.40
+============================================================

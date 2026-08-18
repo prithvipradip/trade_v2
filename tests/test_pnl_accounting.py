@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -261,6 +261,11 @@ class TestReconcilerMatching:
         rec._ibkr = MagicMock()
         rec._ibkr.get_positions.return_value = ibkr_positions
         rec._ibkr.get_portfolio.return_value = []
+        # R14 #10: the zero-options guard now does an authoritative re-query
+        # before it will book a flat book. Default it to "can't confirm" (None)
+        # so these guard tests exercise the refusal path; a case that wants the
+        # confirmed-flat behaviour overrides this explicitly.
+        rec._ibkr.get_positions_fresh = AsyncMock(return_value=None)
         rec._state = MagicMock()
         rec._state.get_open_trades.return_value = open_trades
         return rec
@@ -306,6 +311,28 @@ class TestReconcilerMatching:
         rec._state.close_trade.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_pending_trade_with_live_legs_promoted_to_filled(self):
+        # Orphan recovery: a trade stuck PENDING after a restart whose legs
+        # are live in IBKR must be promoted to FILLED so the monitor manages it.
+        from ait.bot.state import TradeStatus
+        legs = json.dumps([
+            {"strike": 635.0, "right": "C", "action": "BUY", "expiry": "2026-07-17"},
+            {"strike": 635.0, "right": "P", "action": "BUY", "expiry": "2026-07-17"},
+        ])
+        trade = FakeTrade(24.0, 1, "spread", "long_straddle", legs=legs)
+        trade.status = TradeStatus.PENDING
+        rec = self._reconciler(
+            [self._ibkr_pos("SPY", "20260717", 635.0, "C"),
+             self._ibkr_pos("SPY", "20260717", 635.0, "P")],
+            [trade],
+        )
+        result = await rec.reconcile()
+        assert result.promoted == 1
+        rec._state.update_trade_status.assert_called_once()
+        args = rec._state.update_trade_status.call_args[0]
+        assert args[1] == TradeStatus.FILLED
+
+    @pytest.mark.asyncio
     async def test_truly_gone_position_closed_with_flag(self):
         legs = json.dumps([
             {"strike": 635.0, "right": "C", "action": "BUY", "expiry": "2020-01-17"},
@@ -319,12 +346,19 @@ class TestReconcilerMatching:
             [self._ibkr_pos("QQQ", "20260821", 500.0, "C")],
             [trade],
         )
+        # ITM-aware expiry booking (audit R2): the reconciler now values the
+        # structure at expiry from intrinsic using the underlying price
+        # instead of assuming "expired worthless". Settle exactly ATM (635):
+        # both straddle legs are worthless -> full debit loss, same -2400 as
+        # before, but computed honestly.
+        async def _settle(_symbol):
+            return 635.0
+        rec._underlying_last = _settle
         result = await rec.reconcile()
         assert result.stale_local == 1
         kwargs = rec._state.close_trade.call_args.kwargs
-        # debit expired worthless -> full loss, correctly signed + flagged
         assert kwargs["realized_pnl"] == pytest.approx(-2400.0)
-        assert kwargs["exit_reason_detailed"] == "reconciler_estimate_expired_worthless"
+        assert kwargs["exit_reason_detailed"] == "reconciler_expired_intrinsic"
 
 
 # ---------------------------------------------------------------------------
@@ -363,8 +397,11 @@ class TestExitFillPriceSigned:
             f.execution.shares = shares
             return f
         ex = self._executor()
+        # ib_insync execution.shares for options = CONTRACT count (deep-audit
+        # MP-F1): the old fixture used shares=100 for 1 contract, enshrining a
+        # convention that made real reconstructions 100x too small.
         t = self._bag_trade(avg=float("nan"), qty=1,
-                            fills=[fill("SLD", 2.00, 100), fill("SLD", 0.80, 100)])
+                            fills=[fill("SLD", 2.00, 1), fill("SLD", 0.80, 1)])
         assert ex._get_exit_fill_price(1, [t]) == pytest.approx(-2.80)
 
     def test_bag_mixed_side_fills(self):
@@ -378,7 +415,7 @@ class TestExitFillPriceSigned:
             return f
         ex = self._executor()
         t = self._bag_trade(avg=float("nan"), qty=1,
-                            fills=[fill("SLD", 2.00, 100), fill("BOT", 0.80, 100)])
+                            fills=[fill("SLD", 2.00, 1), fill("BOT", 0.80, 1)])
         assert ex._get_exit_fill_price(1, [t]) == pytest.approx(-1.20)
 
 

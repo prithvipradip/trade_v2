@@ -1,0 +1,90 @@
+{
+  "window": 22,
+  "test_start": "2025-03-04",
+  "test_end": "2025-05-06",
+  "pnl": -144.79,
+  "return_pct": -0.0483,
+  "trades": 1,
+  "win_rate": 0.0,
+  "sharpe": 0.0,
+  "max_drawdown": 0.0483,
+  "strategies": {
+    "short_strangle": 1
+  },
+  "best_params": {},
+  "trades_detail": [
+    {
+      "symbol": "IWM",
+      "strategy": "short_strangle",
+      "entry_date": "2025-04-14",
+      "entry_time": "2025-04-14",
+      "exit_date": "2025-04-16",
+      "exit_time": "2025-04-16",
+      "exit_reason": "thesis_invalidated:bullish@0.88",
+      "pnl": -144.79,
+      "entry_confidence": 0.5236,
+      "entry_regime": "high_volatility",
+      "contracts": 1,
+      "n_legs": 2,
+      "hold_days": 2,
+      "entry_price": 3.024,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 4.4459,
+      "entry_iv_rank": 0.982,
+      "entry_vix_level": 0.7722,
+      "credit": null,
+      "max_loss": null,
+      "return_pct": null,
+      "legs": [],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.5236,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.6721,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.6612,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "high_volatility",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 270,
+          "blocked": false
+        },
+        "regime_class": "high_volatility",
+        "iv_rank_rise_10d": 0.2251
+      },
+      "features_at_entry": {
+        "rsi_14": 34.17,
+        "macd_hist": -0.00309,
+        "bb_position": 0.291,
+        "atr_pct": 0.0503,
+        "realized_vol_20": 0.4824,
+        "iv_rank": 0.982,
+        "vix_level": 0.77,
+        "hurst_wavelet": 0.871
+      }
+    }
+  ],
+  "model_weights": {
+    "range_predictor": {
+      "status": "training_returned_no_accuracy",
+      "threshold_pct": 0.0633
+    }
+  }
+}

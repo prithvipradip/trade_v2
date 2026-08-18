@@ -1,0 +1,9 @@
+{
+ "arm": "call_credit_spread",
+ "n": 7,
+ "win_rate": 100.0,
+ "pf": Infinity,
+ "max_dd_pct": 0.0,
+ "total_ret_pct": 0.55,
+ "windows": 5
+}

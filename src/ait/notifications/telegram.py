@@ -65,7 +65,7 @@ class TelegramNotifier:
                         return False
 
         except Exception as e:
-            log.warning("telegram_error", error=str(e))
+            log.warning("telegram_error", error=__import__("re").sub(r"/bot[^/\s]+", "/bot***", str(e))[:300])
             return False
 
     async def send_trade_alert(

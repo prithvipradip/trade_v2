@@ -1,0 +1,199 @@
+{
+  "window": 5,
+  "test_start": "2023-03-21",
+  "test_end": "2023-05-23",
+  "pnl": 1451.3,
+  "return_pct": 0.4838,
+  "trades": 2,
+  "win_rate": 0.5,
+  "sharpe": 5.5439,
+  "max_drawdown": 0.0732,
+  "strategies": {
+    "iron_butterfly": 2
+  },
+  "best_params": {},
+  "trades_detail": [
+    {
+      "symbol": "QQQ",
+      "strategy": "iron_butterfly",
+      "entry_date": "2023-03-23",
+      "entry_time": "2023-03-23",
+      "exit_date": "2023-03-30",
+      "exit_time": "2023-03-30",
+      "exit_reason": "thesis_invalidated:bearish@0.83",
+      "pnl": -219.52,
+      "entry_confidence": 0.4854,
+      "entry_regime": "trending_up",
+      "contracts": 6,
+      "n_legs": 4,
+      "hold_days": 7,
+      "entry_price": 8.897,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 9.2109,
+      "entry_iv_rank": 0.1649,
+      "entry_vix_level": 0.5,
+      "credit": 5338.2,
+      "max_loss": 2956.56,
+      "return_pct": -0.0742,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 310.0,
+          "premium": 4.8934
+        },
+        {
+          "type": "long_put",
+          "strike": 296.0,
+          "premium": -0.4448
+        },
+        {
+          "type": "short_call",
+          "strike": 310.0,
+          "premium": 4.8934
+        },
+        {
+          "type": "long_call",
+          "strike": 324.0,
+          "premium": -0.4448
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.4854,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.2413,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.5243,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "trending_up",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1023,
+          "blocked": false
+        },
+        "regime_class": "trending_up",
+        "iv_rank_rise_10d": 0.1314
+      },
+      "features_at_entry": {
+        "rsi_14": 67.54,
+        "macd_hist": 0.0045,
+        "bb_position": 0.982,
+        "atr_pct": 0.0221,
+        "realized_vol_20": 0.2075,
+        "iv_rank": 0.165,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.428
+      }
+    },
+    {
+      "symbol": "QQQ",
+      "strategy": "iron_butterfly",
+      "entry_date": "2023-03-30",
+      "entry_time": "2023-03-30",
+      "exit_date": "2023-04-17",
+      "exit_time": "2023-04-17",
+      "exit_reason": "take_profit_short",
+      "pnl": 1670.82,
+      "entry_confidence": 0.0,
+      "entry_regime": "range_bound",
+      "contracts": 6,
+      "n_legs": 4,
+      "hold_days": 18,
+      "entry_price": 9.0177,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 6.181,
+      "entry_iv_rank": 0.15,
+      "entry_vix_level": 0.5,
+      "credit": 5410.62,
+      "max_loss": 2993.58,
+      "return_pct": 0.5581,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 316.0,
+          "premium": 4.9597
+        },
+        {
+          "type": "long_put",
+          "strike": 302.0,
+          "premium": -0.4509
+        },
+        {
+          "type": "short_call",
+          "strike": 316.0,
+          "premium": 4.9597
+        },
+        {
+          "type": "long_call",
+          "strike": 330.0,
+          "premium": -0.4509
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.0,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.1925,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.7876,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 1016,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": -0.0313
+      },
+      "features_at_entry": {
+        "rsi_14": 67.05,
+        "macd_hist": 0.00405,
+        "bb_position": 0.922,
+        "atr_pct": 0.0211,
+        "realized_vol_20": 0.2063,
+        "iv_rank": 0.15,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.483
+      }
+    }
+  ],
+  "model_weights": {
+    "range_predictor": {
+      "status": "training_returned_no_accuracy",
+      "threshold_pct": 0.0773
+    }
+  }
+}

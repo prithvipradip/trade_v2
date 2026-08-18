@@ -1,0 +1,153 @@
+{
+  "window": 27,
+  "test_start": "2025-09-30",
+  "test_end": "2025-12-02",
+  "pnl": -146.64,
+  "return_pct": -0.0489,
+  "trades": 2,
+  "win_rate": 0.0,
+  "sharpe": -16.9176,
+  "max_drawdown": 0.0489,
+  "strategies": {
+    "jade_lizard": 2
+  },
+  "best_params": {},
+  "trades_detail": [
+    {
+      "symbol": "IWM",
+      "strategy": "jade_lizard",
+      "entry_date": "2025-10-20",
+      "entry_time": "2025-10-20",
+      "exit_date": "2025-10-22",
+      "exit_time": "2025-10-22",
+      "exit_reason": "thesis_invalidated:bullish@0.93",
+      "pnl": -94.02,
+      "entry_confidence": 0.5831,
+      "entry_regime": "high_volatility",
+      "contracts": 1,
+      "n_legs": 3,
+      "hold_days": 2,
+      "entry_price": 2.0842,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 2.9854,
+      "entry_iv_rank": 0.8349,
+      "entry_vix_level": 0.4557,
+      "credit": null,
+      "max_loss": null,
+      "return_pct": null,
+      "legs": [],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.5831,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": null,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.1548,
+          "threshold": 0.2,
+          "pass": true
+        },
+        "regime": "high_volatility",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 81,
+          "blocked": false
+        }
+      },
+      "features_at_entry": {
+        "rsi_14": 57.18,
+        "macd_hist": -0.00107,
+        "bb_position": 0.825,
+        "atr_pct": 0.0201,
+        "realized_vol_20": 0.219,
+        "iv_rank": 0.835,
+        "vix_level": 0.46,
+        "hurst_wavelet": 0.386
+      }
+    },
+    {
+      "symbol": "IWM",
+      "strategy": "jade_lizard",
+      "entry_date": "2025-11-05",
+      "entry_time": "2025-11-05",
+      "exit_date": "2025-11-07",
+      "exit_time": "2025-11-07",
+      "exit_reason": "thesis_invalidated:bearish@0.91",
+      "pnl": -52.62,
+      "entry_confidence": 0.7227,
+      "entry_regime": "range_bound",
+      "contracts": 1,
+      "n_legs": 3,
+      "hold_days": 2,
+      "entry_price": 2.1295,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 2.6167,
+      "entry_iv_rank": 1.0,
+      "entry_vix_level": 0.4503,
+      "credit": null,
+      "max_loss": null,
+      "return_pct": null,
+      "legs": [],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.7227,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": null,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.1,
+          "threshold": 0.2,
+          "pass": true
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 65,
+          "blocked": false
+        }
+      },
+      "features_at_entry": {
+        "rsi_14": 49.43,
+        "macd_hist": -0.00324,
+        "bb_position": 0.405,
+        "atr_pct": 0.0168,
+        "realized_vol_20": 0.235,
+        "iv_rank": 1.0,
+        "vix_level": 0.45,
+        "hurst_wavelet": 0.551
+      }
+    }
+  ],
+  "model_weights": {
+    "range_predictor": {
+      "status": "training_returned_no_accuracy",
+      "threshold_pct": 0.0671
+    }
+  }
+}

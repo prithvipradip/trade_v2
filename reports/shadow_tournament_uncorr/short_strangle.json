@@ -1,0 +1,9 @@
+{
+ "arm": "short_strangle",
+ "n": 65,
+ "win_rate": 70.77,
+ "pf": 0.77,
+ "max_dd_pct": 6.47,
+ "total_ret_pct": -0.76,
+ "windows": 25
+}

@@ -13,6 +13,10 @@ import pytest
 from ait.backtesting.engine import Backtester
 from ait.strategies.base import SignalDirection
 
+# R12: long-running suite — excluded from the default/CI fast selection
+# (-m "not ibkr and not slow"); the nightly slow-nightly CI job runs -m slow.
+pytestmark = pytest.mark.slow
+
 
 # ---------------------------------------------------------------------------
 # Helpers

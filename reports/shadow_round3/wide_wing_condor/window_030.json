@@ -1,0 +1,727 @@
+{
+  "window": 30,
+  "test_start": "2026-02-04",
+  "test_end": "2026-04-08",
+  "pnl": 338.96,
+  "return_pct": 0.113,
+  "trades": 8,
+  "win_rate": 0.625,
+  "sharpe": 0.8944,
+  "max_drawdown": 0.3493,
+  "strategies": {
+    "wide_wing_condor": 8
+  },
+  "best_params": {},
+  "trades_detail": [
+    {
+      "symbol": "QQQ",
+      "strategy": "wide_wing_condor",
+      "entry_date": "2026-02-20",
+      "entry_time": "2026-02-20",
+      "exit_date": "2026-02-23",
+      "exit_time": "2026-02-23",
+      "exit_reason": "thesis_invalidated:bearish@0.84",
+      "pnl": 99.35,
+      "entry_confidence": 0.0,
+      "entry_regime": "range_bound",
+      "contracts": 2,
+      "n_legs": 4,
+      "hold_days": 3,
+      "entry_price": 6.6288,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 6.0801,
+      "entry_iv_rank": 0.6564,
+      "entry_vix_level": 0.4773,
+      "credit": 1325.76,
+      "max_loss": 8505.5,
+      "return_pct": 0.0117,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 586.0,
+          "premium": 3.6458
+        },
+        {
+          "type": "long_put",
+          "strike": 537.0,
+          "premium": -0.3314
+        },
+        {
+          "type": "short_call",
+          "strike": 638.0,
+          "premium": 3.6458
+        },
+        {
+          "type": "long_call",
+          "strike": 687.0,
+          "premium": -0.3314
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.0,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.1724,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.9,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 7,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": 0.1155
+      },
+      "features_at_entry": {
+        "rsi_14": 35.55,
+        "macd_hist": -0.00129,
+        "bb_position": 0.389,
+        "atr_pct": 0.019,
+        "realized_vol_20": 0.1834,
+        "iv_rank": 0.656,
+        "vix_level": 0.48,
+        "hurst_wavelet": 0.9
+      }
+    },
+    {
+      "symbol": "QQQ",
+      "strategy": "wide_wing_condor",
+      "entry_date": "2026-03-02",
+      "entry_time": "2026-03-02",
+      "exit_date": "2026-03-04",
+      "exit_time": "2026-03-04",
+      "exit_reason": "thesis_invalidated:bearish@0.95",
+      "pnl": 60.03,
+      "entry_confidence": 0.1907,
+      "entry_regime": "range_bound",
+      "contracts": 2,
+      "n_legs": 4,
+      "hold_days": 2,
+      "entry_price": 6.7171,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 6.3649,
+      "entry_iv_rank": 0.7155,
+      "entry_vix_level": 0.536,
+      "credit": 1343.42,
+      "max_loss": 8651.08,
+      "return_pct": 0.0069,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 585.0,
+          "premium": 3.6944
+        },
+        {
+          "type": "long_put",
+          "strike": 535.0,
+          "premium": -0.3359
+        },
+        {
+          "type": "short_call",
+          "strike": 638.0,
+          "premium": 3.6944
+        },
+        {
+          "type": "long_call",
+          "strike": 688.0,
+          "premium": -0.3359
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.1907,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.1468,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.9,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 4,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": -0.0499
+      },
+      "features_at_entry": {
+        "rsi_14": 45.12,
+        "macd_hist": 0.00093,
+        "bb_position": 0.478,
+        "atr_pct": 0.0162,
+        "realized_vol_20": 0.1903,
+        "iv_rank": 0.716,
+        "vix_level": 0.54,
+        "hurst_wavelet": 0.893
+      }
+    },
+    {
+      "symbol": "QQQ",
+      "strategy": "wide_wing_condor",
+      "entry_date": "2026-03-04",
+      "entry_time": "2026-03-04",
+      "exit_date": "2026-03-06",
+      "exit_time": "2026-03-06",
+      "exit_reason": "thesis_invalidated:bearish@0.92",
+      "pnl": -80.81,
+      "entry_confidence": 0.3638,
+      "entry_regime": "range_bound",
+      "contracts": 2,
+      "n_legs": 4,
+      "hold_days": 2,
+      "entry_price": 6.4733,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 6.8253,
+      "entry_iv_rank": 0.7825,
+      "entry_vix_level": 0.5287,
+      "credit": 1294.66,
+      "max_loss": 8439.18,
+      "return_pct": -0.0096,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 588.0,
+          "premium": 3.5603
+        },
+        {
+          "type": "long_put",
+          "strike": 539.0,
+          "premium": -0.3237
+        },
+        {
+          "type": "short_call",
+          "strike": 640.0,
+          "premium": 3.5603
+        },
+        {
+          "type": "long_call",
+          "strike": 689.0,
+          "premium": -0.3237
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.3638,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.1725,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.8818,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 2,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": 0.0251
+      },
+      "features_at_entry": {
+        "rsi_14": 48.43,
+        "macd_hist": 0.00084,
+        "bb_position": 0.69,
+        "atr_pct": 0.0175,
+        "realized_vol_20": 0.1981,
+        "iv_rank": 0.783,
+        "vix_level": 0.53,
+        "hurst_wavelet": 0.886
+      }
+    },
+    {
+      "symbol": "SPY",
+      "strategy": "wide_wing_condor",
+      "entry_date": "2026-03-12",
+      "entry_time": "2026-03-12",
+      "exit_date": "2026-03-17",
+      "exit_time": "2026-03-17",
+      "exit_reason": "take_profit_short",
+      "pnl": 564.41,
+      "entry_confidence": 0.5349,
+      "entry_regime": "high_volatility",
+      "contracts": 2,
+      "n_legs": 4,
+      "hold_days": 5,
+      "entry_price": 7.5887,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 4.7147,
+      "entry_iv_rank": 0.6358,
+      "entry_vix_level": 0.6823,
+      "credit": 1517.74,
+      "max_loss": 9684.38,
+      "return_pct": 0.0583,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 640.0,
+          "premium": 4.1738
+        },
+        {
+          "type": "long_put",
+          "strike": 584.0,
+          "premium": -0.3794
+        },
+        {
+          "type": "short_call",
+          "strike": 699.0,
+          "premium": 4.1738
+        },
+        {
+          "type": "long_call",
+          "strike": 755.0,
+          "premium": -0.3794
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.5349,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.1241,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.3807,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "high_volatility",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 6,
+          "blocked": false
+        },
+        "regime_class": "high_volatility",
+        "iv_rank_rise_10d": -0.0291
+      },
+      "features_at_entry": {
+        "rsi_14": 32.57,
+        "macd_hist": -0.00255,
+        "bb_position": -0.15,
+        "atr_pct": 0.0151,
+        "realized_vol_20": 0.1255,
+        "iv_rank": 0.636,
+        "vix_level": 0.68,
+        "hurst_wavelet": 0.619
+      }
+    },
+    {
+      "symbol": "QQQ",
+      "strategy": "wide_wing_condor",
+      "entry_date": "2026-03-12",
+      "entry_time": "2026-03-12",
+      "exit_date": "2026-03-16",
+      "exit_time": "2026-03-16",
+      "exit_reason": "thesis_invalidated:bearish@0.90",
+      "pnl": 545.57,
+      "entry_confidence": 0.1344,
+      "entry_regime": "high_volatility",
+      "contracts": 2,
+      "n_legs": 4,
+      "hold_days": 4,
+      "entry_price": 7.7622,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 4.9823,
+      "entry_iv_rank": 0.5584,
+      "entry_vix_level": 0.6823,
+      "credit": 1552.44,
+      "max_loss": 9996.82,
+      "return_pct": 0.0546,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 570.0,
+          "premium": 4.2692
+        },
+        {
+          "type": "long_put",
+          "strike": 512.0,
+          "premium": -0.3881
+        },
+        {
+          "type": "short_call",
+          "strike": 631.0,
+          "premium": 4.2692
+        },
+        {
+          "type": "long_call",
+          "strike": 689.0,
+          "premium": -0.3881
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.1344,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.1698,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.6657,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "high_volatility",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 6,
+          "blocked": false
+        },
+        "regime_class": "high_volatility",
+        "iv_rank_rise_10d": -0.195
+      },
+      "features_at_entry": {
+        "rsi_14": 42.6,
+        "macd_hist": -0.00027,
+        "bb_position": 0.046,
+        "atr_pct": 0.0182,
+        "realized_vol_20": 0.172,
+        "iv_rank": 0.558,
+        "vix_level": 0.68,
+        "hurst_wavelet": 0.699
+      }
+    },
+    {
+      "symbol": "QQQ",
+      "strategy": "wide_wing_condor",
+      "entry_date": "2026-03-16",
+      "entry_time": "2026-03-16",
+      "exit_date": "2026-03-18",
+      "exit_time": "2026-03-18",
+      "exit_reason": "thesis_invalidated:bearish@0.91",
+      "pnl": 203.3,
+      "entry_confidence": 0.1742,
+      "entry_regime": "high_volatility",
+      "contracts": 2,
+      "n_legs": 4,
+      "hold_days": 2,
+      "entry_price": 7.0512,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 5.9827,
+      "entry_iv_rank": 0.4791,
+      "entry_vix_level": 0.5878,
+      "credit": 1410.24,
+      "max_loss": 9022.3,
+      "return_pct": 0.0225,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 576.0,
+          "premium": 3.8782
+        },
+        {
+          "type": "long_put",
+          "strike": 524.0,
+          "premium": -0.3526
+        },
+        {
+          "type": "short_call",
+          "strike": 631.0,
+          "premium": 3.8782
+        },
+        {
+          "type": "long_call",
+          "strike": 683.0,
+          "premium": -0.3526
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.1742,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.1834,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.7396,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "high_volatility",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 2,
+          "blocked": false
+        },
+        "regime_class": "high_volatility",
+        "iv_rank_rise_10d": -0.2364
+      },
+      "features_at_entry": {
+        "rsi_14": 44.97,
+        "macd_hist": -0.001,
+        "bb_position": 0.27,
+        "atr_pct": 0.0184,
+        "realized_vol_20": 0.1628,
+        "iv_rank": 0.479,
+        "vix_level": 0.59,
+        "hurst_wavelet": 0.69
+      }
+    },
+    {
+      "symbol": "SPY",
+      "strategy": "wide_wing_condor",
+      "entry_date": "2026-03-24",
+      "entry_time": "2026-03-24",
+      "exit_date": "2026-03-27",
+      "exit_time": "2026-03-27",
+      "exit_reason": "thesis_invalidated:bearish@0.82",
+      "pnl": -232.61,
+      "entry_confidence": 0.4323,
+      "entry_regime": "high_volatility",
+      "contracts": 2,
+      "n_legs": 4,
+      "hold_days": 3,
+      "entry_price": 7.3613,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 8.4724,
+      "entry_iv_rank": 0.7601,
+      "entry_vix_level": 0.6738,
+      "credit": 1472.26,
+      "max_loss": 9471.06,
+      "return_pct": -0.0246,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 628.0,
+          "premium": 4.0487
+        },
+        {
+          "type": "long_put",
+          "strike": 573.0,
+          "premium": -0.3681
+        },
+        {
+          "type": "short_call",
+          "strike": 686.0,
+          "premium": 4.0487
+        },
+        {
+          "type": "long_call",
+          "strike": 741.0,
+          "premium": -0.3681
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.4323,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.1552,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.6161,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "high_volatility",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 3,
+          "blocked": false
+        },
+        "regime_class": "high_volatility",
+        "iv_rank_rise_10d": 0.2409
+      },
+      "features_at_entry": {
+        "rsi_14": 28.51,
+        "macd_hist": -0.00335,
+        "bb_position": 0.122,
+        "atr_pct": 0.0158,
+        "realized_vol_20": 0.1364,
+        "iv_rank": 0.76,
+        "vix_level": 0.67,
+        "hurst_wavelet": 0.682
+      }
+    },
+    {
+      "symbol": "QQQ",
+      "strategy": "wide_wing_condor",
+      "entry_date": "2026-03-25",
+      "entry_time": "2026-03-25",
+      "exit_date": "2026-03-27",
+      "exit_time": "2026-03-27",
+      "exit_reason": "thesis_invalidated:bearish@0.93",
+      "pnl": -820.28,
+      "entry_confidence": 0.3635,
+      "entry_regime": "high_volatility",
+      "contracts": 2,
+      "n_legs": 4,
+      "hold_days": 2,
+      "entry_price": 7.321,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 11.3704,
+      "entry_iv_rank": 0.4923,
+      "entry_vix_level": 0.6332,
+      "credit": 1464.2,
+      "max_loss": 9248.58,
+      "return_pct": -0.0887,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 563.0,
+          "premium": 4.0266
+        },
+        {
+          "type": "long_put",
+          "strike": 509.0,
+          "premium": -0.366
+        },
+        {
+          "type": "short_call",
+          "strike": 619.0,
+          "premium": 4.0266
+        },
+        {
+          "type": "long_call",
+          "strike": 673.0,
+          "premium": -0.366
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.3635,
+        "range_gate": {
+          "prob": null,
+          "threshold": 1.0,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.1765,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.5904,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "high_volatility",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 2,
+          "blocked": false
+        },
+        "regime_class": "high_volatility",
+        "iv_rank_rise_10d": 0.0227
+      },
+      "features_at_entry": {
+        "rsi_14": 36.1,
+        "macd_hist": -0.00248,
+        "bb_position": 0.176,
+        "atr_pct": 0.017,
+        "realized_vol_20": 0.1643,
+        "iv_rank": 0.492,
+        "vix_level": 0.63,
+        "hurst_wavelet": 0.748
+      }
+    }
+  ],
+  "model_weights": {
+    "range_predictor": {
+      "status": "training_returned_no_accuracy",
+      "threshold_pct": 0.0669
+    }
+  }
+}

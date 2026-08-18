@@ -33,9 +33,18 @@ class CorrelationGuard:
         self,
         max_correlation: float = 0.75,
         lookback_days: int = 60,
+        max_correlated_positions: int = 2,
     ) -> None:
         self._max_corr = max_correlation
         self._lookback = lookback_days
+        # Max positions correlated above the threshold allowed at once. Set to
+        # 2 (user 2026-06-30: "place more trades and learn"): up to TWO positions
+        # per correlated cluster — e.g. two index bets (SPY/QQQ/IWM/DIA correlate
+        # ~0.95) at once. Was 1 (single-position-per-cluster) but that kept the
+        # bot near-flat in an index-heavy universe. Safe now that combo exits
+        # fill (marketable-exit fix) and per-trade/aggregate risk caps bound the
+        # book. Raise further to allow more diversified premium across names.
+        self._max_correlated = max_correlated_positions
         self._corr_cache = TTLCache(default_ttl=3600, max_size=500)  # 1hr cache
         self._price_data: dict[str, pd.Series] = {}
 
@@ -53,19 +62,29 @@ class CorrelationGuard:
         if not open_symbols:
             return True, "no open positions"
 
-        if new_symbol in open_symbols:
-            # Same symbol — allow (duplicate check is in risk manager)
-            return True, "same symbol handled by duplicate check"
-
-        for existing in open_symbols:
-            corr = self._get_correlation(new_symbol, existing)
-            if corr is not None and abs(corr) > self._max_corr:
-                reason = (
-                    f"{new_symbol} correlation with open position {existing}: "
-                    f"{corr:.2f} > max {self._max_corr:.2f}"
-                )
-                log.info("correlation_block", new=new_symbol, existing=existing, correlation=corr)
-                return False, reason
+        # Count how many existing positions are correlated above the threshold.
+        # Block only once that count reaches the cap, so a few correlated
+        # positions are allowed (diversified premium) but not unlimited stacking.
+        # R6 (user-approved): the old same-symbol early-return let a second
+        # strategy on an already-open symbol bypass the cluster count entirely
+        # — the book reached 5 SPY/QQQ/IWM short-vol positions against cap 2
+        # (QQQ IC + QQQ strangle stacked unseen). Same symbol IS correlation
+        # 1.0; count it like any other cluster member.
+        correlated = [
+            existing for existing in open_symbols
+            if existing == new_symbol
+            or self._same_sector_cluster(new_symbol, existing)
+            or ((c := self._get_correlation(new_symbol, existing)) is not None
+                and c > self._max_corr)  # signed (deep-audit SR-L13): negative corr = hedge, must not count toward the cluster cap
+        ]
+        if len(correlated) >= self._max_correlated:
+            reason = (
+                f"{new_symbol} correlated with {len(correlated)} open positions "
+                f"{correlated} (cap {self._max_correlated})"
+            )
+            log.info("correlation_block", new=new_symbol,
+                     correlated_count=len(correlated), cap=self._max_correlated)
+            return False, reason
 
         return True, "correlation check passed"
 
@@ -83,6 +102,18 @@ class CorrelationGuard:
                     corr = self._get_correlation(s1, s2)
                     matrix[s1][s2] = corr if corr is not None else 0.0
         return matrix
+
+    @staticmethod
+    def _same_sector_cluster(sym1: str, sym2: str) -> bool:
+        """R16: cluster membership is SET-based for known sector groups.
+
+        The measured 60-day correlation for SPY/QQQ vs IWM sits at 0.76-0.78 —
+        a routine 0.01-0.03 small-cap divergence drops it under the 0.75
+        strict threshold and admits a THIRD index short-vol condor while at
+        the 2-position cluster cap. Two index ETFs are the same macro bet
+        regardless of a marginal correlation print; membership in the same
+        SECTOR_GROUPS set always counts toward the cluster."""
+        return any(sym1 in g and sym2 in g for g in SECTOR_GROUPS.values())
 
     def _get_correlation(self, sym1: str, sym2: str) -> float | None:
         """Get correlation between two symbols."""

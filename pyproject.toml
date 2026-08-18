@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "ait"
 version = "2.0.0"
 description = "Autonomous Intelligent Trading - Options trading bot with ML and sentiment analysis"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.13,<3.14"  # R5: the running venv is 3.13; older pins were uninstallable on it
 dependencies = [
     # IBKR
     "ib_insync>=0.9.86",
@@ -14,7 +14,7 @@ dependencies = [
     "yfinance>=0.2.36",
     "polygon-api-client>=1.14",
     "pandas>=2.2",
-    "numpy>=1.26,<2.0",  # PyTorch 2.2.2 compiled against NumPy 1.x; 2.x breaks inference
+    "numpy>=2.0",  # R5: venv runs numpy 2.4 / torch 2.10 — the old <2.0 pin was a dead letter
     "pandas-market-calendars>=4.4",
     # ML (lightweight - no TensorFlow/PyTorch)
     "xgboost>=2.0",
@@ -24,8 +24,6 @@ dependencies = [
     "py-vollib>=1.0.1",
     "scipy>=1.12",
     # Sentiment
-    "transformers>=4.38,<4.45",  # FinBERT; >=4.45 blocks torch.load when torch<2.6 (CVE-2025-32434)
-    "torch>=2.2,<2.3",          # CPU-only for FinBERT inference; Intel Mac ceiling
     "feedparser>=6.0",
     "finnhub-python>=2.4",
     # Notifications
@@ -40,7 +38,6 @@ dependencies = [
     # Fractal analysis
     "pywavelets>=1.4",
     # Volatility models (GARCH/ARCH ensemble member for range predictor)
-    "arch>=7.2",
     # Optimization
     "optuna>=3.6",
     # Scheduling
@@ -55,18 +52,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# R12-C: torch+transformers (580MB) served only the hard-disabled FinBERT and
+# torch is forensically implicated in the c0000005 crash cluster; arch served
+# the GARCH research stack now in deprecated/research/. None are imported by
+# the live tree (grep-verified).
+sentiment = ["torch>=2.6", "transformers>=5.0"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "pytest-cov>=4.1",
     "ruff>=0.2",
     "mypy>=1.8",
-    "packaging>=23.0",
-]
+    "packaging>=23.0", "hypothesis>=6.100"]
 research = [
     "mlflow>=2.0",
-    "shap>=0.42",
-]
+    "shap>=0.42", "arch>=6.0"]
 
 [project.scripts]
 ait = "ait.main:main"
@@ -85,11 +85,27 @@ select = ["E", "F", "I", "N", "W", "UP"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["."]
+# R5: without addopts the live-gateway tests ran (and ERRORED with Gateway
+# down) on every plain `pytest` invocation.
+# R12: default selection excludes broker-live AND slow suites so a plain
+# `pytest` (and the CI fast lane) finishes in minutes and can actually go
+# green; nightly CI runs `-m slow`.
+addopts = "-m 'not ibkr and not slow'"
 markers = [
     "ibkr: live tests requiring IB Gateway on 127.0.0.1:4002 (run with -m ibkr)",
+    "slow: long-running ML/backtest suites (nightly CI lane, run with -m slow)",
 ]
 
 [tool.mypy]
-python_version = "3.11"
+# Must match requires-python / the CI matrix / the live venv (all 3.13) —
+# this said 3.11, so mypy was reasoning about a runtime nobody uses.
+python_version = "3.13"
+# Resolve `ait.*` from the source tree rather than relying on an editable
+# install being present (scripts/typecheck.py runs before/without one).
+mypy_path = "src"
 warn_return_any = true
 warn_unused_configs = true
+# The blocking gate lives in scripts/typecheck.py, NOT here: `mypy src` is at
+# ~221 errors (mostly missing third-party stubs), so a whole-tree gate would
+# be permanently red. typecheck.py fails only on the crash-class codes
+# (attr-defined / name-defined / call-arg) in config/bot/execution/risk.

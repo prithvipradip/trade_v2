@@ -8,46 +8,95 @@ trading:
   # KEPT: SPY/QQQ/IWM/DIA (indices), NVDA/AMZN/AMD (range-bound mature)
   # DROPPED 4yr: MSFT, SOFI, AAPL, META, TSLA (catastrophic losses)
   # DROPPED 1yr: GOOGL (-66%), PLTR (-33%) - became momentum stocks, hostile to iron condors
-  universe: [SPY, QQQ, IWM, DIA, NVDA, AMZN, AMD]
+  # GLD/TLT/XLE added 2026-07-07 (audit R2): the index cluster (SPY/QQQ/IWM/DIA,
+  # corr ~0.95) caps at 2 concurrent positions, saturating the book at ~5 of 8
+  # slots. Gold/bonds/energy are liquid, optionable, and weakly correlated to
+  # equities — they fill the idle slots AND diversify the short-vol tail.
+  # USER DECISION 2026-07-22: index ETFs only ("like QQQ and SPY") — tightest
+  # spreads, best fills, no single-name earnings gaps (the NVDA/AMZN condors
+  # were in the 07-13 mess and cost-dominated). IWM kept: same category,
+  # cheaper strikes. Was: [SPY, QQQ, IWM, DIA, NVDA, AMZN, AMD, GLD, TLT, XLE]
+  universe: [SPY, QQQ, IWM]
   scan_interval_seconds: 300           # 5 minutes between scans
-  max_daily_trades: 5
+  max_daily_trades: 12                  # Raised for higher trade volume / faster learning
   trading_hours_only: true             # Only trade during RTH (9:30-16:00 ET)
 
 account:
   pdt_protection: true                 # Enable Pattern Day Trader guard
-  pdt_account_under_25k: true          # Set false if account >= $25k
+  pdt_account_under_25k: false         # R16: this paper account is $198k — PDT
+                                       # is legally inapplicable >= $25k, and the
+                                       # guard was able to VETO same-day stop-loss
+                                       # exits ("riding unprotected"). RE-FLIP TO
+                                       # true at go-live if the real account < $25k.
 
 positions:
-  max_open_positions: 5
+  max_open_positions: 10               # R6 (user-approved): 423 of 500 logged entry
+                                       # rejections were THIS cap, not the credit cap —
+                                       # +2 slots absorb defined-risk structures without
+                                       # adding short-premium exposure (credit cap stays 6)
   max_position_pct: 0.05               # 5% of portfolio per position
+  max_contracts_per_trade: 1           # Learning mode: 1 contract/trade = min cost = max # of trades
   max_portfolio_delta: 0.30            # Net delta limit (absolute)
-  max_portfolio_risk_pct: 0.02         # 2% max portfolio risk
+  max_portfolio_risk_pct: 0.20         # Aggregate open capital-at-risk cap (now WIRED — was a
+                                       # phantom 0.02 never read while manager hardcoded 0.20;
+                                       # audit 2026-07-07 item 3.3. 0.20 = operating value since 06-30)
 
 risk:
   max_daily_loss_pct: 0.02             # 2% daily loss limit → circuit breaker
   max_consecutive_losses: 3            # Pause after 3 consecutive losses
   pause_minutes_after_losses: 30       # Cool-down period
   max_api_failures: 5                  # Halt after 5 API failures in 10 min
-  min_confidence: 0.55                 # Lowered for GARCH ensemble (range predictor outputs 0.58-0.62 in calm markets)
+  min_confidence: 0.50                 # At learning floor — capture more marginal signals to learn from (was 0.55)
+  max_position_risk_pct: 0.03          # Per-trade max_loss cap vs NLV (was hardcoded in manager.py)
+  max_correlation: 0.75                # Correlation above which symbols count as the same bet
+  max_correlated_positions: 2          # Positions per correlated cluster (was code default)
+  max_credit_positions: 6              # Cap on simultaneous short-premium positions (audit R2)
+  credit_vix_halt: 28                  # No NEW credit entries at/above this VIX (audit R2)
 
 options:
   delta_range: [0.20, 0.50]            # Target delta for long options
-  dte_range: [14, 45]                  # Days to expiry range
+  dte_range: [14, 30]                  # R12-B (cadence): min DTE 7 -> 14. 7-DTE entries were
+                                       # 2-day churn (forced out by the DTE<=5 exit almost
+                                       # immediately), best case ~60% cost-dominated — commissions
+                                       # and crossing ate the theta. 14 gives >=9 days of runway
+                                       # ahead of the DTE<=5 forced exit (guard comment in
+                                       # execution/portfolio.py). History: [14,45] -> [7,30] (R2
+                                       # clean-sample sprint) -> [14,30] (R12-B).
   min_open_interest: 10                # Loosened: paper account on delayed data
   min_volume: 0                        # Delayed feeds report volume=0; relaxed pydantic floor too
   max_bid_ask_spread_pct: 0.40         # Loosened: stale-quote spreads run wider
   strategies:
-    - long_call
-    - long_put
-    - covered_call
-    - cash_secured_put
-    - bull_call_spread
-    - bear_put_spread
+    # USER DECISION 2026-07-22 (at close #12): IRON CONDOR ONLY — the stated
+    # mission (PLAN line 3). The fillers were churn: long_straddle bled -55%
+    # over 2 weeks then needed a manual flatten (no combo quotes to exit);
+    # the directional long options were delayed-quote coin flips (-22.91,
+    # -102.30, -22.91). The verdict sample from here forward is IC closes on
+    # index ETFs — one strategy, one clean question. Re-enable others only
+    # by deliberate decision recorded in PLAN.
     - iron_condor
-    - long_straddle
-    - short_strangle
-    - calendar_spread     # Low-IV complement to iron condor (active when IV rank < 50)
-    - event_straddle      # Long straddle 0-1d before FOMC/CPI/NFP — long-vol complement
+    # - long_call
+    # - long_put
+    # - bull_call_spread
+    # - bear_put_spread
+    # - long_straddle
+    # - short_strangle   R6 (user-approved 2026-07-09): entries disabled — go-live
+    #                     is defined-risk only, so strangle closes pad the 50-close
+    #                     count while answering nothing (and carry 10-60x the live
+    #                     risk budget: bot_state max-loss $1.5k-$8.2k vs $128-719 for
+    #                     ICs). Open strangles are managed OUT by the widened macro
+    #                     flatten (5d window). Re-enable only for a deliberate
+    #                     edge-comparison experiment.
+    # Disabled 2026-07-08 (Round 5 audit) — all four were dead weight or latent hazards:
+    # - covered_call      R5: NO stock-ownership check exists -> a fill would be a NAKED
+    #                     call booked as defined-risk; only blocked today by the 3% cap
+    #                     arithmetic. Also permanently risk-rejected at this account size.
+    # - cash_secured_put  R5: max_loss ~$8.5k+ always exceeds the 3% per-trade cap; pure
+    #                     wasted scan cycles that burned execution fall-through slots.
+    # - calendar_spread   R5: structurally dead — far leg needs 45-80 DTE but chains are
+    #                     only fetched 7-30 DTE / 3 closest expiries. Never emitted a signal.
+    # - event_straddle    R5: mutually exclusive with AIT_SKIP_MACRO_EVENTS=1 (enabled
+    #                     2026-07-08 — scans skip event days entirely). Also days_to_event=0
+    #                     accepts entry AFTER 8:30am releases, buying straight into IV crush.
 
 backtest:
   initial_capital: 100000              # Starting capital for walk-forward / integration tests
@@ -56,7 +105,13 @@ backtest:
   wing_floor_dollars: 5.0             # Hard minimum spread width in dollars (safety floor only)
                                        # Wing sizing is now primarily driven by wing_k × expected_move
                                        # Lower to 0.5 for sub-$10 stocks (e.g. SOFI)
-  wing_k: 1.0                         # Vol-scaled wing multiplier: wing = wing_k × price × IV × √(DTE/365)
+  # 2026-08-04 SHADOW R3 PROMOTION supersedes the 07-29 k=0.8 lock (that
+  # study compared k under an UNSCALED ratio floor — population artifact,
+  # see PLAN). LIVE runs k=1.6 with ratio floor 0.10 via env in
+  # run_orchestrator.py (AIT_IC_WING_K / AIT_IC_MIN_CREDIT_WIDTH — the
+  # authority for live). This yaml value feeds backtest/integration paths;
+  # R16: aligned to the promoted live value.
+  wing_k: 1.6
                                        # Optuna optimizes per walk-forward window [0.3 – 2.0]
                                        # 0.5 = half-sigma (tight), 1.0 = 1-sigma, 2.0 = 2-sigma (wide)
   iv_floor: 0.20                      # Min synthetic IV for option pricing
@@ -79,6 +134,7 @@ ml:
   retrain_interval_days: 7
   lookback_days: 504                   # 2 years of trading days
   min_training_samples: 100
+  range_min_confidence: 0.65           # Floor for range/vol-mag model-overridden confidence (was hardcoded)
 
 meta_label:
   enabled: false                       # Disabled: trained on corrupted data, rejects everything. Re-enable after 50+ clean trades.
@@ -86,6 +142,7 @@ meta_label:
   retrain_with_primary: true           # Retrain when primary model retrains
 
 exit:
+  exit_cross_amount: 0.10             # How far combo exits cross the spread to guarantee fills (was hardcoded)
   trailing_stop_pct: 0.25             # Trail 25% below high water mark
   breakeven_trigger_pct: 0.30         # Move stop to breakeven at +30% P&L
   initial_stop_loss_pct: 0.50         # Fixed stop before breakeven activates
@@ -100,6 +157,12 @@ exit:
 
 learning:
   enabled: true                          # Self-learning: adapt strategies from past trades
+  paper_trading_mode: true               # R5 audit: this was NEVER set (code default False),
+                                         # so Thompson re-ranking / adaptor overrides / flow
+                                         # hard-gate bypasses were all INACTIVE, contradicting
+                                         # PLAN.md's design. True = paper measures the fixed
+                                         # ruleset so results stay comparable to the backtest.
+                                         # MUST be set false (or removed) at go-live.
   lookback_days: 30                      # Analyze last 30 days of trades
   max_adaptations_per_cycle: 3           # Max config changes per learning cycle
   min_insight_confidence: 0.60           # Only act on insights above 60% confidence
@@ -113,7 +176,9 @@ sentiment:
   sources:
     news: true
     fear_greed: true
-    finbert: true
+    finbert: false   # DISABLED: torch DLL load segfaults the whole process on
+                     # this machine (c0000005 in torch _load_dll_libraries,
+                     # crashed the bot every 30-60 min). news + fear_greed remain.
 
 notifications:
   telegram:
@@ -130,5 +195,5 @@ dashboard:
 logging:
   level: INFO
   file: logs/ait.log
-  max_bytes: 10485760                  # 10 MB
-  backup_count: 5
+  max_bytes: 20971520                  # 20 MB (10MB x5 held ~20 min under IBKR error spam —
+  backup_count: 10                     #  destroyed forensic evidence; now ~200MB / hours of history)

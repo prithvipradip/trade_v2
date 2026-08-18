@@ -11,28 +11,49 @@ Supports:
 
 from __future__ import annotations
 
+import os
 from datetime import date, timedelta
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from ait.backtesting.options_sim import (
+from ait.backtesting.pricing import (
     OptionType,
     black_scholes_price,
     find_strike_by_delta,
     realized_vol,
 )
 from ait.backtesting.result import BacktestResult
-from ait.strategies.base import SignalDirection
+from ait.strategies.base import CREDIT_STRATEGIES, SignalDirection
 from ait.utils.logging import get_logger
+from ait.config.runtime_env import contract_flag, contract_float  # R19: ONE authority for env-contract defaults
 
 log = get_logger("backtesting.engine")
 
-# Strategies that collect premium (short theta)
-CREDIT_STRATEGIES = {"iron_condor", "short_strangle", "short_straddle", "covered_call", "cash_secured_put", "put_credit_spread"}
+# Strategies that collect premium (short theta).
+# R16: this module used to declare its OWN set under the same name with
+# different membership from strategies/base.py — see the comment there. The
+# membership now lives in base.py (live + backtest-only arms) and is imported,
+# so the two can never drift apart again. The imported name stays module-level
+# here, so existing `from ait.backtesting.engine import CREDIT_STRATEGIES`
+# callers keep working unchanged.
 # Strategies that pay premium (long theta)
 DEBIT_STRATEGIES = {"long_call", "long_put", "bull_call_spread", "bear_put_spread", "long_straddle"}
+
+# R16 #9: direction-neutral credit structures sharing the direction-gate
+# bypass and the five neutral entry risk gates (hurst hard veto,
+# trending-down regime veto, range-model gate, 10d realized-vol gate,
+# IV-rank-rise veto). jade_lizard and call_credit_spread are backtest-only
+# shadow arms selectable ONLY on NEUTRAL signals (_select_strategy), so they
+# belong to the same entry population as the condor/strangle arms — they were
+# previously missing from every tuple, which made those arms either
+# zero-trade (blocked by the directional-confidence gate that NEUTRAL@0.4
+# can never pass) or, when ML emitted NEUTRAL>=0.55, completely ungated.
+NEUTRAL_CREDIT_GATED = (
+    "iron_condor", "iron_butterfly", "wide_wing_condor", "broken_wing_condor",
+    "short_strangle", "jade_lizard", "call_credit_spread",
+)
 
 
 class Backtester:
@@ -60,15 +81,17 @@ class Backtester:
         delta_short: float = 0.20,
         delta_long: float = 0.30,
         iv_floor: float = 0.12,
-        wing_floor_dollars: float = 5.0,
-        wing_k: float = 1.0,
+        # R6 parity: live iron_condor._vol_scaled_width enforces min $2, not $5.
+        wing_floor_dollars: float = 2.0,
+        # R16 #8: None -> resolve env AIT_IC_WING_K (default 1.0), mirroring
+        # live iron_condor.py:107 — same pattern as ic_min_credit_width below.
+        wing_k: float | None = None,
         delta_iv_scale: float = 0.0,
         skew_factor: float = 1.0,
         hurst_regime_threshold: float = 0.20,
         hurst_regime_penalty: float = 0.10,
         hurst_hard_veto_multiplier: float = 1.5,
         multifractal_max_width: float = 0.50,
-        aekf_veto_threshold: float = 0.60,
         iv_rank_rise_threshold: float = 0.30,
         pct_from_60d_high_threshold: float = -1.0,
         min_edge_over_baseline: float = 0.05,
@@ -95,6 +118,40 @@ class Backtester:
         meta_labeler: Any = None,
         # H2 val-split: skip new entries before this date (full df still used for feature warmup)
         eval_start_date: "date | None" = None,
+        # --- R6 exit/construction parity with the live bot ---
+        # Flat loss limit for CREDIT structures as a multiple of credit
+        # received (live portfolio.py reads env AIT_CREDIT_LOSS_LIMIT with
+        # default "0" = flat stop DISABLED — R12-B1 evidence: touch-close beat
+        # every flat level). None -> resolve from env with the SAME default as
+        # live (R16 #6 parity: this used to default to 1.25, so every backtest
+        # simulated an active stop the live book does not run).
+        credit_loss_limit_mult: float | None = None,
+        # Iron condor construction gates (live iron_condor.py R6):
+        # minimum mid-price total credit (env AIT_IC_MIN_CREDIT, $0.70) and
+        # minimum credit/max-width ratio (env AIT_IC_MIN_CREDIT_WIDTH, 0.20).
+        ic_min_credit: float | None = None,
+        ic_min_credit_width: float | None = None,
+        # Macro-event gate: live orchestrator blocks CREDIT entries <=4 days
+        # before FOMC/CPI/NFP/GDP/PCE; live portfolio flattens defined-risk
+        # credit <=1 day before (strangles <=5) when AIT_SKIP_MACRO_EVENTS=1.
+        # Uses the hardcoded-2026 calendar in ait.data.economic_calendar —
+        # for pre-2026 backtest windows the gate is effectively inactive
+        # (days-to-event is always > 4), which is a documented limitation.
+        macro_event_gate: bool = True,
+        # R16 #7: live reads pre_event_blackout_days from LOADED settings
+        # (orchestrator.py: self._settings.risk.pre_event_blackout_days), so a
+        # yaml override must reach the engine too. None -> resolve from
+        # load_settings(), falling back to the RiskConfig default when no
+        # config.yaml is reachable from the CWD.
+        pre_event_blackout_days: int | None = None,
+        # R16 #1 (look-ahead fence): when no predictor is supplied, standalone
+        # runs may fall back to loading the LIVE models/ensemble.pkl. Walk-
+        # forward OOS windows must NEVER do that (the live artifact is trained
+        # on the very future periods being scored) — walkforward passes False,
+        # and the window then trades UNGATED (predictor=None), which is the
+        # engine's designed fallback and what the ablation studies claimed to
+        # measure.
+        allow_live_model_fallback: bool = True,
     ) -> None:
         self._data = self._prepare_data(data)
         self._strategies = strategies
@@ -105,6 +162,16 @@ class Backtester:
         self._spread_iv_sensitivity = spread_iv_sensitivity
         self._spread_dte_sensitivity = spread_dte_sensitivity
         self._spread_cap = spread_cap
+        # R16: prefer EMPIRICALLY CALIBRATED per-symbol spreads over the
+        # config formula. scripts/calibrate_option_spreads.py fits the model
+        # to real observed bid/ask quotes and stores it in
+        # option_spread_params — a table that existed, was never populated,
+        # and (once populated) was still read by nothing. Measured 2026-08-11
+        # on 3,159 quotes, config's base=0.04 overstates the real base by
+        # 2-13x (SPY 0.012 / QQQ 0.003 / IWM 0.020), so every simulated
+        # credit has been charged too much friction. AIT_BT_CALIBRATED_SPREADS=0
+        # restores the config formula for A/B runs.
+        self._calibrated_spreads = None
         self._position_size_pct = position_size_pct
         self._stop_loss_pct = stop_loss_pct
         self._profit_target_pct = profit_target_pct
@@ -120,14 +187,18 @@ class Backtester:
         self._delta_long = delta_long
         self._iv_floor = iv_floor
         self._wing_floor_dollars = wing_floor_dollars
-        self._wing_k = wing_k
+        # R16 #8: mirror the live env resolution (iron_condor.py reads
+        # AIT_IC_WING_K, default 1.0) when wing_k is not explicitly configured.
+        self._wing_k = (
+            float(wing_k) if wing_k is not None
+            else contract_float("AIT_IC_WING_K")
+        )
         self._delta_iv_scale = delta_iv_scale
         self._skew_factor = skew_factor
         self._hurst_regime_threshold = hurst_regime_threshold
         self._hurst_regime_penalty = hurst_regime_penalty
         self._hurst_hard_veto_multiplier = hurst_hard_veto_multiplier
         self._multifractal_max_width = multifractal_max_width
-        self._aekf_veto_threshold = aekf_veto_threshold
         self._iv_rank_rise_threshold = iv_rank_rise_threshold
         self._pct_from_60d_high_threshold = pct_from_60d_high_threshold
         self._min_edge_over_baseline = min_edge_over_baseline
@@ -136,6 +207,9 @@ class Backtester:
         self._max_entry_vol_annual = max_entry_vol_annual
         self._market_context = market_context
         self._symbol = symbol or ""
+        # R16: must run AFTER _symbol is set — the calibration is per-symbol.
+        if os.environ.get("AIT_BT_CALIBRATED_SPREADS", "1") != "0":
+            self._load_calibrated_spreads()
         self._earnings_dates: set[date] = self._load_earnings_dates(symbol, earnings_skip_days)
         self._intraday_store = intraday_store
         self._scan_interval_minutes = scan_interval_minutes
@@ -145,7 +219,82 @@ class Backtester:
         self._meta_labeler = meta_labeler
         self._eval_start_date = eval_start_date
 
-        self._predictor = predictor if predictor is not None else self._load_predictor()
+        # R6 parity knobs — None resolves to the SAME env var + default the
+        # live bot reads, so an un-configured backtest matches live behavior.
+        # R16 #6: default "0" = flat credit stop DISABLED, matching live
+        # portfolio.py:413 exactly (R12-B1: flat stops fired through their
+        # trigger on gaps and every level underperformed touch-close; live
+        # runs touch-close-only, which the engine does NOT yet mirror — a
+        # documented structural divergence, not a parity value mismatch).
+        self._credit_loss_limit_mult = (
+            float(credit_loss_limit_mult) if credit_loss_limit_mult is not None
+            else contract_float("AIT_CREDIT_LOSS_LIMIT")
+        )
+        # R16: short-strike touch stop — live's PRIMARY loss exit, mirrored
+        # here at last via daily High/Low (they bracket the true intraday
+        # path). ON by default = live parity. AIT_BT_TOUCH_STOP=0 restores
+        # the old close-only behaviour for before/after comparisons ONLY.
+        self._touch_stop_enabled = (
+            os.environ.get("AIT_BT_TOUCH_STOP", "1") != "0")
+        self._ic_min_credit = (
+            float(ic_min_credit) if ic_min_credit is not None
+            else contract_float("AIT_IC_MIN_CREDIT")
+        )
+        self._ic_min_credit_width = (
+            float(ic_min_credit_width) if ic_min_credit_width is not None
+            else contract_float("AIT_IC_MIN_CREDIT_WIDTH")
+        )
+        self._macro_event_gate = macro_event_gate
+        self._economic_cal = None
+        if macro_event_gate:
+            try:
+                from ait.data.economic_calendar import EconomicCalendar
+                self._economic_cal = EconomicCalendar()
+            except Exception:  # noqa: BLE001 — gate is best-effort, never fatal
+                self._economic_cal = None
+
+        # R16 #7: resolve the macro blackout window ONCE, from the same source
+        # live reads (loaded settings), instead of pinning to RiskConfig()
+        # defaults on every entry day.
+        if pre_event_blackout_days is not None:
+            self._pre_event_blackout_days = int(pre_event_blackout_days)
+        else:
+            try:
+                from ait.config.settings import load_settings as _ls
+                self._pre_event_blackout_days = int(
+                    _ls().risk.pre_event_blackout_days
+                )
+            except Exception:  # noqa: BLE001 — no config.yaml -> config default
+                from ait.config.settings import RiskConfig as _RC
+                self._pre_event_blackout_days = int(_RC().pre_event_blackout_days)
+
+        # R16 #1: explicit, loudly-logged predictor mode. Never silently score
+        # research windows with the live (future-trained) artifact.
+        self._allow_live_model_fallback = bool(allow_live_model_fallback)
+        if predictor is not None:
+            self._predictor = predictor
+            log.info("ml_predictor_mode", mode="explicit_window_model")
+        elif self._allow_live_model_fallback:
+            self._predictor = self._load_predictor()
+            if self._predictor is not None:
+                log.warning(
+                    "ml_predictor_mode",
+                    mode="LIVE_ARTIFACT_FALLBACK",
+                    version=getattr(self._predictor, "model_version", "?"),
+                    note="scoring with live models/ensemble.pkl — INVALID for "
+                         "walk-forward OOS windows (look-ahead leak); pass "
+                         "allow_live_model_fallback=False for research runs",
+                )
+            else:
+                log.info("ml_predictor_mode", mode="ungated_no_model_found")
+        else:
+            self._predictor = None
+            log.info(
+                "ml_predictor_mode",
+                mode="ungated_fallback_disabled",
+                note="no window model and live-artifact fallback disabled — "
+                     "direction comes from _simple_direction only",
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -252,6 +401,7 @@ class Backtester:
                 "fractal_gate": {"hurst_spread": 0.0, "threshold": self._hurst_regime_threshold, "pass": True},
                 "regime": "range_bound",
                 "earnings_skip": False,
+                "macro_gate": {"days_to_event": None, "blocked": False},
             }
 
             # Apply fractal regime gate to confidence for credit strategies.
@@ -270,7 +420,7 @@ class Backtester:
                     # Hard veto is optional: it only applies when multiplier > 0.
                     # Exp 20 post-mortem showed QQQ hurst_spread rarely drops below
                     # ~0.43 in normal conditions; overly tight thresholds can block all entries.
-                    _neutral_strat = bool(set(self._strategies) & {"iron_condor", "short_strangle"})
+                    _neutral_strat = bool(set(self._strategies) & set(NEUTRAL_CREDIT_GATED))
                     _veto_base = max(self._hurst_regime_threshold, 0.20)
                     _hard_veto_threshold = _veto_base * self._hurst_hard_veto_multiplier
                     if _neutral_strat and self._hurst_hard_veto_multiplier > 0 and spread > _hard_veto_threshold:
@@ -297,7 +447,7 @@ class Backtester:
             # confidence signals a trending regime — exactly when they fail. Skip the
             # direction gate for these strategies; the range model below is the sole
             # entry filter. Directional strategies still require confidence ≥ min_conf.
-            _neutral_only = bool(set(self._strategies) & {"iron_condor", "short_strangle"})
+            _neutral_only = bool(set(self._strategies) & set(NEUTRAL_CREDIT_GATED))
             if not _neutral_only:
                 if confidence < effective_min_conf:
                     continue
@@ -355,6 +505,33 @@ class Backtester:
                 log.debug("earnings_skip", date=str(today_date), strategy=strategy)
                 continue
 
+            # Macro-event entry gate (live orchestrator credit-block parity).
+            # R16 #7: the blackout window is resolved once in __init__ from
+            # the LOADED settings (constructor override > load_settings() >
+            # RiskConfig default) — the same source live reads — so a yaml
+            # override no longer changes live only.
+            # LIMITATION: the calendar is hardcoded 2026 + 2027-H1, so for
+            # pre-2026 windows days-to-event is always > window and the gate
+            # never fires (documented in the parity manifest).
+            if self._economic_cal is not None and strategy in CREDIT_STRATEGIES:
+                _blackout = self._pre_event_blackout_days
+                try:
+                    _d2e = self._economic_cal.days_until_next_event(today_date)
+                except Exception:  # noqa: BLE001
+                    _d2e = None
+                _entry_decision["macro_gate"] = {
+                    "days_to_event": _d2e,
+                    "blocked": _d2e is not None and _d2e <= _blackout,
+                }
+                if _d2e is not None and _d2e <= _blackout:
+                    log.debug(
+                        "macro_event_entry_skip",
+                        date=str(today_date),
+                        strategy=strategy,
+                        days_to_event=_d2e,
+                    )
+                    continue
+
             # Regime gate: iron condors / short strangles fail in trending-down regimes.
             # Exp 21 post-mortem: 4 trending_down trades, 25% win rate, avg PnL -$195.
             # Both macro dislocations in the dataset (Yen carry unwind Aug-2024,
@@ -363,7 +540,7 @@ class Backtester:
             # Exp 22: threshold -0.02 was too loose — blocked profitable 2-4% corrections
             # in W02, causing Optuna to adapt badly. Both structural failures cleared -0.05
             # (Yen carry -6-8%, tariff shock -8-10%); raised to -0.05 for Exp 23.
-            if strategy in ("iron_condor", "short_strangle") and not features_df.empty:
+            if strategy in NEUTRAL_CREDIT_GATED and not features_df.empty:
                 _last_f        = features_df.iloc[-1]
                 _vol_exp_flag  = float(_last_f.get("vol_regime_expanding", 0.0)) > 0.5
                 _px_sma_val    = float(_last_f.get("price_vs_sma_20", 0.0))
@@ -386,30 +563,53 @@ class Backtester:
                     )
                     continue
 
-            # Range model gate: for iron condors / strangles, replace confidence
-            # with P(stays in range). Skip if below range threshold.
-            if strategy in ("iron_condor", "short_strangle") and self._range_predictor is not None:
-                try:
-                    rp = self._range_predictor.predict(
-                        hist,
-                        symbol=self._symbol,
-                        market_context=self._market_context,
-                        min_edge_override=self._min_edge_over_baseline,
-                    )
-                    if rp is None or rp.probability_in_range < self._range_min_confidence:
-                        continue  # bad range setup → skip
-                    _entry_decision["range_gate"] = {
-                        "prob": round(float(rp.probability_in_range), 4),
-                        "threshold": self._range_min_confidence,
-                        "pass": True,
-                    }
-                    confidence = rp.probability_in_range
-                except Exception:
-                    pass
+            # Range model gate: for neutral credit structures, replace
+            # confidence with P(stays in range). Skip if below range threshold.
+            if strategy in NEUTRAL_CREDIT_GATED:
+                if self._range_predictor is None:
+                    # R16 #3: honor the walkforward "range model absent ->
+                    # block entries" contract. walkforward raises
+                    # range_min_confidence to 1.0 when window range training
+                    # FAILED; with no predictor no probability can ever reach
+                    # it, so the entry must be blocked HERE. Previously the
+                    # whole gate was skipped when the predictor was None and
+                    # entries flowed ungated — every recent study (ablation,
+                    # wingk, shadow rounds) ran with no range gate at all.
+                    if self._range_min_confidence >= 1.0:
+                        _entry_decision["range_gate"] = {
+                            "prob": None,
+                            "threshold": self._range_min_confidence,
+                            "pass": False,
+                        }
+                        log.debug(
+                            "range_gate_blocked_no_predictor",
+                            date=str(today_date),
+                            strategy=strategy,
+                            threshold=self._range_min_confidence,
+                        )
+                        continue
+                else:
+                    try:
+                        rp = self._range_predictor.predict(
+                            hist,
+                            symbol=self._symbol,
+                            market_context=self._market_context,
+                            min_edge_override=self._min_edge_over_baseline,
+                        )
+                        if rp is None or rp.probability_in_range < self._range_min_confidence:
+                            continue  # bad range setup → skip
+                        _entry_decision["range_gate"] = {
+                            "prob": round(float(rp.probability_in_range), 4),
+                            "threshold": self._range_min_confidence,
+                            "pass": True,
+                        }
+                        confidence = rp.probability_in_range
+                    except Exception:
+                        pass
 
-            # Realized-vol entry gate: iron condors / short strangles cannot profit
+            # Realized-vol entry gate: neutral credit structures cannot profit
             # during high-volatility regimes (e.g. tariff shocks, VIX > 40).
-            if strategy in ("iron_condor", "short_strangle"):
+            if strategy in NEUTRAL_CREDIT_GATED:
                 recent_close = hist["Close"].iloc[-11:]
                 if len(recent_close) >= 11:
                     vol_10d = recent_close.pct_change().std() * (252 ** 0.5)
@@ -427,36 +627,14 @@ class Backtester:
                         )
                         continue
 
-            # AEKF direction veto: if the OU-Kou-GARCH AEKF produces a high-confidence
-            # directional drift signal, the market is trending — skip iron condor entry.
-            # Signal values are always logged (not just on veto) for threshold tuning.
-            if strategy in ("iron_condor", "short_strangle") and self._range_predictor is not None:
-                try:
-                    sym_data = (getattr(self._range_predictor, "_symbol_models", {}) or {}).get(self._symbol, {})
-                    _ou_dir  = (sym_data.get("ou_jump_state") or {}).get("ou_jump_direction")
-                    _ou_conf = (sym_data.get("ou_jump_state") or {}).get("ou_jump_confidence") or 0.0
-                    _entry_decision["aekf_signal"] = {
-                        "direction": _ou_dir,
-                        "confidence": round(float(_ou_conf), 4) if _ou_dir is not None else None,
-                    }
-                    if _ou_dir is not None and float(_ou_conf) >= self._aekf_veto_threshold:
-                        _entry_decision["aekf_veto"] = {"direction": _ou_dir, "confidence": round(float(_ou_conf), 4)}
-                        log.debug(
-                            "aekf_veto_fired",
-                            component="backtesting.engine",
-                            strategy=strategy,
-                            ou_direction=_ou_dir,
-                            ou_confidence=round(float(_ou_conf), 4),
-                            threshold=self._aekf_veto_threshold,
-                        )
-                        continue
-                except Exception:
-                    pass
+            # R12-C: AEKF (OU-Kou-GARCH) direction veto removed — the GARCH
+            # family moved to deprecated/research/ and RangePredictor no longer
+            # produces ou_jump_state, so the veto could never fire again.
 
             # Rising IV rank filter: if IV rank has risen by more than iv_rank_rise_threshold
             # over the last 10 days, market is in directional stress — skip iron condor entry.
             # Rise value is always logged (not just on veto) for threshold tuning.
-            if strategy in ("iron_condor", "short_strangle") and not features_df.empty:
+            if strategy in NEUTRAL_CREDIT_GATED and not features_df.empty:
                 if "iv_rank" in features_df.columns and len(features_df) >= 11:
                     iv_rank_series = features_df["iv_rank"].iloc[-11:]
                     iv_rank_rise = float(iv_rank_series.iloc[-1]) - float(iv_rank_series.iloc[0])
@@ -479,7 +657,12 @@ class Backtester:
             # in a sustained decline relative to its 60-day rolling high.  Catches slow-grind
             # bear phases that iv_rank_rise misses (W12 tariff shock: rise=0.021 but -16% from high).
             # Default threshold -1.0 disables the gate; Optuna tunes per window in [-0.15, -0.05].
-            if strategy == "iron_condor" and self._pct_from_60d_high_threshold > -0.99:
+            # R16: this was the ONE neutral-credit gate the string-patched
+            # builder rollout missed — every sibling gate above already reads
+            # NEUTRAL_CREDIT_GATED, so an activated threshold gave the
+            # iron_condor baseline a drawdown veto the butterfly/wide/broken/
+            # jade/ccs arms silently skipped, biasing any promotion study.
+            if strategy in NEUTRAL_CREDIT_GATED and self._pct_from_60d_high_threshold > -0.99:
                 _close_series = hist["Close"]
                 _rolling_high = _close_series.rolling(min(60, len(_close_series))).max().iloc[-1]
                 if _rolling_high and _rolling_high > 0:
@@ -516,7 +699,7 @@ class Backtester:
                     # Find first bar in the entry window
                     window_bars = session_bars[
                         session_bars.index.to_series().apply(
-                            lambda ts: self._is_in_entry_window(ts.time())
+                            lambda ts: self._is_in_entry_window(ts)
                         )
                     ]
                     if window_bars.empty:
@@ -583,8 +766,8 @@ class Backtester:
                     "iv_rank":             round(float(last_f.get("iv_rank", 0.0)), 3),
                     "vix_level":           round(float(last_f.get("vix_level", 0.0)), 2),
                     "hurst_wavelet":       round(float(last_f.get("hurst_wavelet", 0.0)), 3),
-                    "sentiment_composite": round(float(last_f.get("sentiment_composite", 0.0)), 3),
-                    "put_call_ratio":      round(float(last_f.get("put_call_ratio", 1.0)), 3),
+                    # R12-C: sentiment_composite / put_call_ratio dropped with
+                    # the sentiment/flow feature retirement (constant columns).
                 }
             else:
                 pos["entry_regime"] = "range_bound"  # default when history too short
@@ -596,7 +779,7 @@ class Backtester:
             pos["decision"] = _entry_decision
 
             # Iron condor leg structure for the dashboard drawer
-            if pos.get("strategy") == "iron_condor":
+            if pos.get("strategy") in ("iron_condor", "iron_butterfly", "wide_wing_condor", "broken_wing_condor"):
                 ep = pos.get("entry_price", 0.0)  # net credit per share
                 # Each spread contributes ep/2 to the net credit.
                 # Short leg = ep/2 + wing_cost; long leg = -wing_cost (debit).
@@ -619,13 +802,33 @@ class Backtester:
                 contracts = pos.get("contracts", 1)
                 pos["credit"]   = round(ep * 100 * contracts, 2)
                 pos["max_loss"] = round(pos.get("max_loss_per_share", 0.0) * 100 * contracts, 2)
+            elif pos.get("strategy") == "jade_lizard":
+                # R16: jade_lizard fell to the else below, so it got legs=[]
+                # and NO credit/max_loss keys — result.py:194 then fell back to
+                # `abs(pnl)*2` as the risk proxy, computing the arm's
+                # capital_utilization / cash_drag_adjusted_return off a P&L
+                # multiple instead of margin, and rendering an empty leg drawer.
+                # 3 legs: short put + short call + long call wing. Premium split
+                # follows the sibling branches' credit-share convention.
+                ep = pos.get("entry_price", 0.0)
+                pos["legs"] = [
+                    {"type": "short_put",  "strike": pos.get("short_put_strike"),  "premium": round(ep * 0.55, 4)},
+                    {"type": "short_call", "strike": pos.get("short_call_strike"), "premium": round(ep * 0.50, 4)},
+                    {"type": "long_call",  "strike": pos.get("long_call_strike"),  "premium": round(-ep * 0.05, 4)},
+                ]
+                contracts = pos.get("contracts", 1)
+                pos["credit"]   = round(ep * 100 * contracts, 2)
+                # Undefined-risk put side: max_loss_per_share is the builder's
+                # (short_put_strike - credit) stress figure, NOT a structural cap.
+                pos["max_loss"] = round(pos.get("max_loss_per_share", 0.0) * 100 * contracts, 2)
             else:
                 pos["legs"] = []
 
-            # Deduct commission
+            # Deep-audit BT-M6: entry commission is included in _calc_pnl
+            # (subtracted from the trade P&L added back at exit) — debiting
+            # capital here as well double-counted it in final_capital.
             n_legs = pos.get("n_legs", 1)
             entry_commission = self._commission * pos["contracts"] * n_legs
-            capital -= entry_commission
             pos["entry_commission"] = entry_commission
 
             open_positions.append(pos)
@@ -661,7 +864,12 @@ class Backtester:
     def compare_exit_modes(
         cls, data: pd.DataFrame, strategies: list[str], **kwargs: Any
     ) -> dict:
-        """Run backtest with both fixed and trailing stops, return comparison."""
+        """Run backtest with both fixed and trailing stops, return comparison.
+
+        R6 parity note: credit structures always use the flat-loss-limit +
+        DTE-laddered TP path, so fixed-vs-trailing deltas reflect DEBIT
+        trades only.
+        """
         shared = {k: v for k, v in kwargs.items() if k != "trailing_stop_enabled"}
 
         fixed_bt = cls(data, strategies, trailing_stop_enabled=False, **shared)
@@ -770,11 +978,27 @@ class Backtester:
         return dt_time(int(h), int(m))
 
     def _is_in_entry_window(self, bar_time) -> bool:
-        """Return True if bar_time (datetime.time) is within the entry window."""
+        """Return True if bar_time is within the ET entry window.
+
+        Accepts a datetime.time (assumed already ET) or a timestamp. R5 audit
+        C4: intraday bars are stored tz-aware UTC, but this compared the RAW
+        clock time against ET strings — only 13:30-15:30 *UTC* bars passed,
+        so every backtest entered solely in the first ~2h of the session
+        (DST-shifting), regardless of the configured window. Convert
+        tz-aware timestamps to America/New_York first.
+        """
         from datetime import time as dt_time
         start = self._parse_et_time(self._entry_window_start_et)
         end = self._parse_et_time(self._entry_window_end_et)
-        t = bar_time if isinstance(bar_time, dt_time) else bar_time.time()
+        if isinstance(bar_time, dt_time):
+            t = bar_time
+        else:
+            ts = bar_time
+            if getattr(ts, "tzinfo", None) is not None:
+                from zoneinfo import ZoneInfo
+                ts = ts.tz_convert("America/New_York") if hasattr(ts, "tz_convert") \
+                    else ts.astimezone(ZoneInfo("America/New_York"))
+            t = ts.time()
         return start <= t < end
 
     def _check_intraday_exit(
@@ -808,11 +1032,8 @@ class Backtester:
                 current_val *= (1 - exit_half_spread)
                 pnl_pct = (current_val - entry_price) / entry_price if entry_price > 0 else 0.0
 
-            # Check stop / profit
-            if self._trailing_stop_enabled:
-                result = self._check_exit_trailing(pos, pnl_pct, current_date)
-            else:
-                result = self._check_exit_fixed(pos, pnl_pct, current_date)
+            # Check stop / profit — routed per trade type (R6 exit parity)
+            result = self._dispatch_exit_check(pos, trade_type, pnl_pct, current_date)
 
             if result is not None:
                 bar_ts = row.Index
@@ -843,16 +1064,8 @@ class Backtester:
             return True, first + 1, fill_ts
         return False, min(len(session_bars), timeout_bars), None
 
-    def _load_directional_model(self):
-        """Try to load the directional model for small account trading."""
-        try:
-            from ait.ml.directional import DirectionalModel
-            model = DirectionalModel()
-            if model.load():
-                return model
-        except Exception:
-            pass
-        return None
+    # R12-C: _load_directional_model removed — no callers; DirectionalModel
+    # retired to deprecated/src/directional.py.
 
     def _get_direction(
         self,
@@ -951,13 +1164,11 @@ class Backtester:
         rv_long = realized_vol(close_arr, window=60) if len(close_arr) > 61 else rv_short
         iv_regime_high = rv_short > rv_long * 1.1  # Short-term vol elevated
 
-        # Always prefer iron condor — proven +311% in backtesting.
-        # Direction doesn't matter — iron condors profit from theta decay.
-        has_condor = bool(available & {"iron_condor"})
-
-        if has_condor:
-            candidates = available & {"iron_condor"}
-        elif direction == SignalDirection.NEUTRAL:
+        # BT-M8: iron_condor used to be FORCED whenever present, silently
+        # never trading the other requested strategies (and misleading every
+        # multi-strategy breakdown). Prefer it on NEUTRAL, but respect the
+        # requested strategy set for directional signals.
+        if direction == SignalDirection.NEUTRAL:
             candidates = available & CREDIT_STRATEGIES
         elif direction == SignalDirection.BULLISH:
             candidates = available & {"bull_call_spread", "long_call"}
@@ -966,6 +1177,8 @@ class Backtester:
 
         if not candidates:
             return None
+        if "iron_condor" in candidates:
+            return "iron_condor"  # preferred among the eligible set
         return sorted(candidates)[0]
 
     # ------------------------------------------------------------------
@@ -1021,26 +1234,86 @@ class Backtester:
                 if stored > 0:
                     return stored
 
-        # Priority 2: VIX proxy from market context (scalar or DataFrame)
+        # Priority 2: VIX proxy from market context (scalar or DataFrame),
+        # scaled PER SYMBOL. R16: a flat 1.10 multiplier was applied to every
+        # underlying, but VIX measures SPX vol — QQQ and IWM are structurally
+        # more volatile. Measured against the real implied indices and 10y
+        # realized vol:
+        #   VXN/VIX  (NDX vs SPX, implied)  median 1.228   <- QQQ's true anchor
+        #   QQQ/SPY  (realized, 10y)        median 1.354
+        #   IWM/SPY  (realized, 10y)        median 1.465
+        # So 1.10 understated QQQ implied vol by ~12% at the median (and by
+        # ~34% on days like 2026-08-11: VIX 15.6 vs VXN 22.9) — biasing every
+        # simulated QQQ credit low and every expected-move wing narrow.
+        # SPY takes 1.00 (SPY IV ~ VIX by construction). QQQ takes the
+        # measured VXN/VIX median. IWM has no free implied index (RVX is not
+        # served by yfinance), so it takes its realized ratio shrunk by the
+        # same implied-vs-realized factor VXN/QQQ exhibits (1.228/1.354):
+        # 1.465 * 0.907 ~ 1.33. Override per symbol via AIT_BT_VOL_MULT_<SYM>.
         if market_context:
             vix = market_context.get("vix_close") or market_context.get("vix")
             if vix is not None:
+                mult = self._symbol_vol_multiplier()
                 if hasattr(vix, "reindex"):
                     # Full VIX DataFrame — align to current hist and take last value
                     vix_aligned = vix["Close"].reindex(hist.index, method="ffill")
                     if not vix_aligned.empty:
                         vix_val = float(vix_aligned.iloc[-1])
                         if vix_val > 0:
-                            return vix_val / 100.0 * 1.10
+                            return vix_val / 100.0 * mult
                 else:
                     vix_val = float(vix)
                     if vix_val > 0:
-                        return vix_val / 100.0 * 1.05
+                        return vix_val / 100.0 * mult
 
         # Priority 3: synthetic fallback
         close_arr = hist["Close"].values
         rv = realized_vol(close_arr, window=20)
         return rv * 1.15
+
+    # R16: VIX -> per-symbol implied-vol multipliers (see _get_iv). Unknown
+    # symbols keep the historical 1.10 so nothing silently changes for
+    # underlyings this calibration was never measured on.
+    _VOL_MULT_VS_VIX = {"SPY": 1.00, "QQQ": 1.228, "IWM": 1.33, "DIA": 0.98}
+    _VOL_MULT_DEFAULT = 1.10
+
+    def _load_calibrated_spreads(self) -> None:
+        """R16: adopt fitted per-symbol spread params when they exist.
+
+        Silent no-op when the symbol has no calibration (keeps the config
+        formula), so an uncalibrated underlying behaves exactly as before.
+        """
+        sym = (self._symbol or "").upper()
+        if not sym:
+            return
+        try:
+            from ait.data.historical import HistoricalDataStore
+            p = HistoricalDataStore().load_spread_params(sym)
+            if not p:
+                return
+            self._spread_base = float(p.get("spread_base", self._spread_base))
+            self._spread_iv_sensitivity = float(
+                p.get("spread_iv_sensitivity", self._spread_iv_sensitivity))
+            self._spread_dte_sensitivity = float(
+                p.get("spread_dte_sensitivity", self._spread_dte_sensitivity))
+            self._calibrated_spreads = p
+            log.info("calibrated_spreads_loaded", symbol=sym,
+                     base=round(self._spread_base, 5),
+                     iv_sens=round(self._spread_iv_sensitivity, 5),
+                     dte_sens=round(self._spread_dte_sensitivity, 6))
+        except Exception as e:  # noqa: BLE001 — never block a run on this
+            log.debug("calibrated_spreads_unavailable", symbol=sym, error=str(e))
+
+    def _symbol_vol_multiplier(self) -> float:
+        """Per-symbol VIX scaling, env-overridable for sensitivity runs."""
+        sym = (self._symbol or "").upper()
+        env = os.environ.get(f"AIT_BT_VOL_MULT_{sym}")
+        if env:
+            try:
+                return float(env)
+            except ValueError:
+                pass
+        return self._VOL_MULT_VS_VIX.get(sym, self._VOL_MULT_DEFAULT)
 
     def _build_position(
         self,
@@ -1187,6 +1460,26 @@ class Backtester:
             "high_water_mark": 0.0,
         }
 
+    def _log_unaffordable(self, strategy: str, risk_per_contract: float,
+                          capital: float) -> None:
+        """R16: attribute a zero-trade credit arm to SIZING, not to 'no edge'.
+
+        The `contracts < 1` budget gate is intentional policy (refusing a
+        structure whose single-contract risk exceeds position_size_pct of
+        capital), and it is shared by every condor-family builder. But it was
+        completely silent, so a shadow-tournament arm whose per-contract risk
+        never fits the budget at index-ETF prices (jade_lizard's S*0.20*100
+        margin is the extreme case) reported n=0 with no error and no reason.
+        """
+        log.debug(
+            "credit_position_unaffordable",
+            component="backtesting.engine",
+            strategy=strategy,
+            risk_per_contract=round(float(risk_per_contract), 2),
+            budget=round(float(capital) * self._position_size_pct, 2),
+            capital=round(float(capital), 2),
+        )
+
     def _build_credit_position(
         self, strategy: str,
         S: float, iv: float, t: float, r: float, dte: int,
@@ -1223,6 +1516,19 @@ class Backtester:
             if net_credit <= 0:
                 return None
 
+            # R6 live-parity construction gates (src/ait/strategies/iron_condor.py
+            # applies both to the MID-price total credit, before friction):
+            # 1. Cost floor — live rejects total_credit < AIT_IC_MIN_CREDIT
+            #    ($0.70 default): at a 50% TP the gross must clear ~3x the
+            #    round-trip commission/crossing cost.
+            if net_credit < self._ic_min_credit:
+                return None
+            # 2. Credit-to-width gate — live rejects total_credit/max_width <
+            #    AIT_IC_MIN_CREDIT_WIDTH (0.20 default). Engine wings are
+            #    symmetric, so max_width == wing_width.
+            if wing_width > 0 and (net_credit / wing_width) < self._ic_min_credit_width:
+                return None
+
             # Per-leg spread cost: 4 legs × half-spread (sell at bid, buy at ask)
             half_spread = self._options_half_spread(iv, dte)
             avg_leg_mid = (short_call_price + short_put_price + long_call_price + long_put_price) / 4
@@ -1242,6 +1548,7 @@ class Backtester:
                 return None
             contracts = int(capital * self._position_size_pct / max_loss_per_contract)
             if contracts < 1:
+                self._log_unaffordable(strategy, max_loss_per_contract, capital)
                 return None
 
             return {
@@ -1261,6 +1568,133 @@ class Backtester:
                 "option_type": "iron_condor",
                 "entry_iv": round(iv, 4),
                 "underlying_at_entry": round(S, 2),
+                "max_loss_per_share": round(max_loss_per_share, 4),
+                "expiry_date": str(today_date + timedelta(days=dte)),
+                "high_water_mark": 0.0,
+            }
+
+        elif strategy in ("wide_wing_condor", "broken_wing_condor"):
+            # SHADOW ROUND 3 (PLAN 2026-08-04, pre-registered): wings-cost
+            # interpolants between the condor (PF 0.97) and the wings-free
+            # strangle benchmark (PF 1.30). wide_wing: BOTH wings at 2x the
+            # standard k*EM distance; broken_wing: call wing standard, put
+            # wing 2x (skew makes the put wing the expensive insurance).
+            # REGISTERED DEVIATION from the live ratio gate: the credit floor
+            # is held ABSOLUTE at the standard-width equivalent
+            # (0.20 * std_width) so the entry population matches the live
+            # condor; the ratio floor scales by std/max width.
+            short_call_strike = find_strike_by_delta(S, t, iv, self._delta_short, OptionType.CALL, r)
+            short_put_strike = find_strike_by_delta(S, t, iv, -self._delta_short, OptionType.PUT, r)
+            expected_move = S * iv * (dte / 365.0) ** 0.5
+            std_width = max(self._wing_k * expected_move, self._wing_floor_dollars)
+            call_width = std_width * (2.0 if strategy == "wide_wing_condor" else 1.0)
+            put_width = std_width * 2.0
+            long_call_strike = short_call_strike + call_width
+            long_put_strike = short_put_strike - put_width
+            short_call_price = black_scholes_price(S, short_call_strike, t, r,
+                self._get_leg_iv(iv, short_call_strike, S, OptionType.CALL), OptionType.CALL)
+            short_put_price = black_scholes_price(S, short_put_strike, t, r,
+                self._get_leg_iv(iv, short_put_strike, S, OptionType.PUT), OptionType.PUT)
+            long_call_price = black_scholes_price(S, long_call_strike, t, r,
+                self._get_leg_iv(iv, long_call_strike, S, OptionType.CALL), OptionType.CALL)
+            long_put_price = black_scholes_price(S, long_put_strike, t, r,
+                self._get_leg_iv(iv, long_put_strike, S, OptionType.PUT), OptionType.PUT)
+            net_credit = (short_call_price + short_put_price) - (long_call_price + long_put_price)
+            if net_credit <= 0 or net_credit < self._ic_min_credit:
+                return None
+            max_width = max(call_width, put_width)
+            scaled_floor = self._ic_min_credit_width * (std_width / max_width)
+            if max_width > 0 and (net_credit / max_width) < scaled_floor:
+                return None
+            half_spread = self._options_half_spread(iv, dte)
+            avg_leg_mid = (short_call_price + short_put_price + long_call_price + long_put_price) / 4
+            net_credit = max(0.0, net_credit - 4 * half_spread * avg_leg_mid)
+            if net_credit <= 0:
+                return None
+            max_loss_per_share = max_width - net_credit
+            max_loss_per_contract = max_loss_per_share * 100
+            import math
+            if (max_loss_per_contract <= 0 or math.isnan(max_loss_per_contract)
+                    or capital < max_loss_per_contract):
+                return None
+            contracts = int(capital * self._position_size_pct / max_loss_per_contract)
+            if contracts < 1:
+                self._log_unaffordable(strategy, max_loss_per_contract, capital)
+                return None
+            return {
+                "symbol": "SIM",
+                "strategy": strategy,
+                "direction": SignalDirection.NEUTRAL.value,
+                "trade_type": "credit",
+                "entry_date": str(today_date),
+                "entry_price": round(net_credit, 4),
+                "contracts": contracts,
+                "n_legs": 4,
+                "short_call_strike": round(short_call_strike, 0),
+                "short_put_strike": round(short_put_strike, 0),
+                "long_call_strike": round(long_call_strike, 0),
+                "long_put_strike": round(long_put_strike, 0),
+                "strike": round(S, 0),
+                "option_type": strategy,
+                "entry_iv": round(iv, 4),
+                "underlying_at_entry": round(S, 2),
+                "max_loss_per_share": round(max_loss_per_share, 4),
+                "expiry_date": str(today_date + timedelta(days=dte)),
+                "high_water_mark": 0.0,
+            }
+
+        elif strategy == "iron_butterfly":
+            # SHADOW TOURNAMENT candidate (PLAN 2026-08-03): condor variant
+            # with BOTH shorts at-the-money — much larger credit, so the
+            # credit/width ratio clears in low IV where condors starve.
+            # Same wing logic (wing_k x expected move, floor applies).
+            atm = round(S)
+            expected_move = S * iv * (dte / 365.0) ** 0.5
+            wing_width = max(self._wing_k * expected_move, self._wing_floor_dollars)
+            short_call_strike = short_put_strike = float(atm)
+            long_call_strike = atm + wing_width
+            long_put_strike = atm - wing_width
+            short_call_price = black_scholes_price(S, short_call_strike, t, r,
+                self._get_leg_iv(iv, short_call_strike, S, OptionType.CALL), OptionType.CALL)
+            short_put_price = black_scholes_price(S, short_put_strike, t, r,
+                self._get_leg_iv(iv, short_put_strike, S, OptionType.PUT), OptionType.PUT)
+            long_call_price = black_scholes_price(S, long_call_strike, t, r,
+                self._get_leg_iv(iv, long_call_strike, S, OptionType.CALL), OptionType.CALL)
+            long_put_price = black_scholes_price(S, long_put_strike, t, r,
+                self._get_leg_iv(iv, long_put_strike, S, OptionType.PUT), OptionType.PUT)
+            net_credit = (short_call_price + short_put_price) - (long_call_price + long_put_price)
+            if net_credit <= 0:
+                return None
+            if net_credit < self._ic_min_credit:
+                return None
+            if wing_width > 0 and (net_credit / wing_width) < self._ic_min_credit_width:
+                return None
+            half_spread = self._options_half_spread(iv, dte)
+            avg_leg_mid = (short_call_price + short_put_price + long_call_price + long_put_price) / 4
+            net_credit = max(0.0, net_credit - 4 * half_spread * avg_leg_mid)
+            if net_credit <= 0:
+                return None
+            max_loss_per_share = wing_width - net_credit
+            max_loss_per_contract = max_loss_per_share * 100
+            import math
+            if (max_loss_per_contract <= 0 or math.isnan(max_loss_per_contract)
+                    or capital < max_loss_per_contract):
+                return None
+            contracts = int(capital * self._position_size_pct / max_loss_per_contract)
+            if contracts < 1:
+                self._log_unaffordable(strategy, max_loss_per_contract, capital)
+                return None
+            return {
+                "symbol": "SIM", "strategy": "iron_butterfly",
+                "direction": SignalDirection.NEUTRAL.value, "trade_type": "credit",
+                "entry_date": str(today_date), "entry_price": round(net_credit, 4),
+                "contracts": contracts, "n_legs": 4,
+                "short_call_strike": round(short_call_strike, 0),
+                "short_put_strike": round(short_put_strike, 0),
+                "long_call_strike": round(long_call_strike, 0),
+                "long_put_strike": round(long_put_strike, 0),
+                "strike": round(S, 0), "option_type": "iron_butterfly",
+                "entry_iv": round(iv, 4), "underlying_at_entry": round(S, 2),
                 "max_loss_per_share": round(max_loss_per_share, 4),
                 "expiry_date": str(today_date + timedelta(days=dte)),
                 "high_water_mark": 0.0,
@@ -1322,6 +1756,94 @@ class Backtester:
                 "entry_iv": round(iv, 4),
                 "underlying_at_entry": round(S, 2),
                 "max_loss_per_share": round(max_loss_per_share, 4),
+                "expiry_date": str(today_date + timedelta(days=dte)),
+                "high_water_mark": 0.0,
+            }
+
+        elif strategy == "call_credit_spread":
+            # SHADOW R2: bearish twin of put_credit_spread.
+            short_call_strike = find_strike_by_delta(S, t, iv, self._delta_short, OptionType.CALL, r)
+            expected_move = S * iv * (dte / 365.0) ** 0.5
+            wing = max(self._wing_k * expected_move * 0.5, self._wing_floor_dollars)
+            long_call_strike = short_call_strike + wing
+            short_call_price = black_scholes_price(S, short_call_strike, t, r,
+                self._get_leg_iv(iv, short_call_strike, S, OptionType.CALL), OptionType.CALL)
+            long_call_price = black_scholes_price(S, long_call_strike, t, r,
+                self._get_leg_iv(iv, long_call_strike, S, OptionType.CALL), OptionType.CALL)
+            net_credit = short_call_price - long_call_price
+            if net_credit <= 0:
+                return None
+            half_spread = self._options_half_spread(iv, dte)
+            net_credit = max(0.0, net_credit - 2 * half_spread *
+                             (short_call_price + long_call_price) / 2)
+            if net_credit <= 0:
+                return None
+            max_loss_per_share = wing - net_credit
+            max_loss_per_contract = max_loss_per_share * 100
+            if max_loss_per_contract <= 0 or capital < max_loss_per_contract:
+                return None
+            contracts = int(capital * self._position_size_pct / max_loss_per_contract)
+            if contracts < 1:
+                if max_loss_per_contract <= capital * 0.25:
+                    contracts = 1
+                else:
+                    return None
+            return {
+                "symbol": "SIM", "strategy": "call_credit_spread",
+                "direction": SignalDirection.BEARISH.value, "trade_type": "credit",
+                "entry_date": str(today_date), "entry_price": round(net_credit, 4),
+                "contracts": contracts, "n_legs": 2,
+                "short_call_strike": round(short_call_strike, 0),
+                "long_call_strike": round(long_call_strike, 0),
+                "strike": round(short_call_strike, 0), "option_type": "call",
+                "entry_iv": round(iv, 4), "underlying_at_entry": round(S, 2),
+                "max_loss_per_share": round(max_loss_per_share, 4),
+                "expiry_date": str(today_date + timedelta(days=dte)),
+                "high_water_mark": 0.0,
+            }
+
+        elif strategy == "jade_lizard":
+            # SHADOW R2 BENCHMARK ONLY (PLAN 2026-08-03): short put + short
+            # call spread. Naked put side => NEVER live-promotable at current
+            # capital. Sized by the strangle margin convention (S*0.20*100).
+            short_put_strike = find_strike_by_delta(S, t, iv, -self._delta_short, OptionType.PUT, r)
+            short_call_strike = find_strike_by_delta(S, t, iv, self._delta_short, OptionType.CALL, r)
+            expected_move = S * iv * (dte / 365.0) ** 0.5
+            wing = max(self._wing_k * expected_move * 0.5, self._wing_floor_dollars)
+            long_call_strike = short_call_strike + wing
+            short_put_price = black_scholes_price(S, short_put_strike, t, r,
+                self._get_leg_iv(iv, short_put_strike, S, OptionType.PUT), OptionType.PUT)
+            short_call_price = black_scholes_price(S, short_call_strike, t, r,
+                self._get_leg_iv(iv, short_call_strike, S, OptionType.CALL), OptionType.CALL)
+            long_call_price = black_scholes_price(S, long_call_strike, t, r,
+                self._get_leg_iv(iv, long_call_strike, S, OptionType.CALL), OptionType.CALL)
+            net_credit = short_put_price + short_call_price - long_call_price
+            if net_credit <= 0:
+                return None
+            half_spread = self._options_half_spread(iv, dte)
+            avg_mid = (short_put_price + short_call_price + long_call_price) / 3
+            net_credit = max(0.0, net_credit - 3 * half_spread * avg_mid)
+            if net_credit <= 0:
+                return None
+            margin_per_contract = S * 0.20 * 100
+            if capital < margin_per_contract:
+                return None
+            contracts = int(capital * self._position_size_pct / margin_per_contract)
+            if contracts < 1:
+                self._log_unaffordable(strategy, margin_per_contract, capital)
+                return None
+            return {
+                "symbol": "SIM", "strategy": "jade_lizard",
+                "direction": SignalDirection.NEUTRAL.value, "trade_type": "credit",
+                "entry_date": str(today_date), "entry_price": round(net_credit, 4),
+                "contracts": contracts, "n_legs": 3,
+                "short_put_strike": round(short_put_strike, 0),
+                "short_call_strike": round(short_call_strike, 0),
+                "long_call_strike": round(long_call_strike, 0),
+                "strike": round(S, 0), "option_type": "jade_lizard",
+                "entry_iv": round(iv, 4), "underlying_at_entry": round(S, 2),
+                "max_loss_per_share": round(max(short_put_strike - net_credit,
+                                                wing - net_credit), 4),
                 "expiry_date": str(today_date + timedelta(days=dte)),
                 "high_water_mark": 0.0,
             }
@@ -1445,7 +1967,7 @@ class Backtester:
 
         strategy = pos["strategy"]
 
-        if strategy == "iron_condor":
+        if strategy in ("iron_condor", "iron_butterfly", "wide_wing_condor", "broken_wing_condor"):
             sc = black_scholes_price(underlying, pos["short_call_strike"], t, r,
                 self._get_leg_iv(iv, pos["short_call_strike"], underlying, OptionType.CALL), OptionType.CALL)
             sp = black_scholes_price(underlying, pos["short_put_strike"], t, r,
@@ -1462,6 +1984,22 @@ class Backtester:
             lp = black_scholes_price(underlying, pos["long_put_strike"], t, r,
                 self._get_leg_iv(iv, pos["long_put_strike"], underlying, OptionType.PUT), OptionType.PUT)
             return sp - lp
+
+        elif strategy == "call_credit_spread":
+            sc = black_scholes_price(underlying, pos["short_call_strike"], t, r,
+                self._get_leg_iv(iv, pos["short_call_strike"], underlying, OptionType.CALL), OptionType.CALL)
+            lc = black_scholes_price(underlying, pos["long_call_strike"], t, r,
+                self._get_leg_iv(iv, pos["long_call_strike"], underlying, OptionType.CALL), OptionType.CALL)
+            return sc - lc
+
+        elif strategy == "jade_lizard":
+            sp = black_scholes_price(underlying, pos["short_put_strike"], t, r,
+                self._get_leg_iv(iv, pos["short_put_strike"], underlying, OptionType.PUT), OptionType.PUT)
+            sc = black_scholes_price(underlying, pos["short_call_strike"], t, r,
+                self._get_leg_iv(iv, pos["short_call_strike"], underlying, OptionType.CALL), OptionType.CALL)
+            lc = black_scholes_price(underlying, pos["long_call_strike"], t, r,
+                self._get_leg_iv(iv, pos["long_call_strike"], underlying, OptionType.CALL), OptionType.CALL)
+            return sp + sc - lc
 
         elif strategy in ("bull_call_spread", "bear_put_spread"):
             long_strike = pos["long_strike"]
@@ -1585,12 +2123,19 @@ class Backtester:
         else:
             current_value *= (1 - exit_half_spread)  # Sell at bid
 
-        if self._trailing_stop_enabled:
-            result = self._check_exit_trailing(pos, pnl_pct, current_date)
-        else:
-            result = self._check_exit_fixed(pos, pnl_pct, current_date)
+        result = self._dispatch_exit_check(pos, trade_type, pnl_pct, current_date, row)
 
         if result is not None:
+            # R16 touch-stop: live transacts AT the touched strike intraday, not
+            # at the close. Reprice the structure at that level so a pierce that
+            # recovered by the bell is booked at what live would actually have
+            # paid — the whole point of modelling the touch.
+            if result.get("exit_reason") == "touch_stop":
+                _tu = float(result.pop("touch_underlying"))
+                current_value = self._reprice_position(pos, _tu, days_held, hist)
+                current_value *= (1 + exit_half_spread)
+                underlying = _tu
+
             # Calculate actual P&L
             pnl = self._calc_pnl(pos, current_value)
             result["pnl"] = round(pnl, 2)
@@ -1602,8 +2147,136 @@ class Backtester:
 
         return None
 
+    def _dispatch_exit_check(
+        self, pos: dict, trade_type: str, pnl_pct: float, current_date: date,
+        row: pd.Series | None = None
+    ) -> dict | None:
+        """Route exit logic by trade type (R6 exit parity with live).
+
+        CREDIT structures mirror live portfolio.py check_position(): ONE flat
+        loss limit at credit_loss_limit_mult x credit received plus the
+        DTE-laddered take-profit — NO trailing stop, NO breakeven tier, NO
+        vol-adjusted stops. DEBIT structures keep the existing behaviour
+        (trailing/breakeven when enabled, else fixed stop + profit target).
+        """
+        if trade_type == "credit":
+            return self._check_exit_credit(pos, pnl_pct, current_date, row)
+        if self._trailing_stop_enabled:
+            return self._check_exit_trailing(pos, pnl_pct, current_date)
+        return self._check_exit_fixed(pos, pnl_pct, current_date)
+
+    @staticmethod
+    def _credit_take_profit_pct(dte: int | None) -> float:
+        """DTE-laddered take-profit target as a fraction of credit received.
+
+        Mirrors the SHORT side of src/ait/execution/portfolio.py
+        _get_take_profit_targets() exactly (time_decay_scaling=True is the
+        live default; dte=None falls back to the live 0.50 default):
+            DTE > 20  -> 0.50
+            DTE 11-20 -> 0.40
+            DTE 6-10  -> 0.30
+            DTE <= 5  -> 0.20
+        """
+        if dte is None or dte > 20:
+            return 0.50
+        elif dte > 10:
+            return 0.40
+        elif dte > 5:
+            return 0.30
+        return 0.20
+
+    def _check_exit_credit(self, pos: dict, pnl_pct: float, current_date: date,
+                           row: pd.Series | None = None) -> dict | None:
+        """Credit-structure exits — R6 parity with live portfolio.py.
+
+        pnl_pct is fraction of credit received (positive = value decayed).
+        Order mirrors live check_position(): (0) SHORT-STRIKE TOUCH,
+        (1) flat loss limit, (2) DTE-laddered take-profit, (3)
+        expiry-approaching close at DTE<=5, (4) macro-event flatten.
+        """
+        # 0. R16: SHORT-STRIKE TOUCH — live's PRIMARY loss exit, and until now
+        # the engine's single largest structural divergence. Live watches spot
+        # every 30s and closes the moment price reaches a short strike; the
+        # engine only ever saw the daily CLOSE, so an intraday pierce that
+        # recovered by the bell was scored as an untouched winner. Every study
+        # to date (wing_k, shadow R1-R3, ablations) therefore measured a
+        # DIFFERENT exit policy than the one running live — biased toward
+        # optimism precisely on the days that hurt.
+        # Daily High/Low bracket the true intraday path, so they detect the
+        # touch without intraday bars. The exit is priced AT the touched
+        # strike (the level live would have transacted at), not at the close.
+        if row is not None and self._touch_stop_enabled:
+            _sp = pos.get("short_put_strike")
+            _sc = pos.get("short_call_strike")
+            try:
+                _low = float(row["Low"]) if "Low" in row else None
+                _high = float(row["High"]) if "High" in row else None
+            except (TypeError, ValueError):
+                _low = _high = None
+            _touched = None
+            if _sp and _low is not None and _low <= float(_sp):
+                _touched = float(_sp)
+            elif _sc and _high is not None and _high >= float(_sc):
+                _touched = float(_sc)
+            if _touched is not None:
+                return {"exit_date": str(current_date),
+                        "exit_reason": "touch_stop",
+                        "touch_underlying": _touched}
+        # HWM still tracked for journaling/analysis parity (live persists it
+        # even though credit exits no longer trail off it).
+        pos["high_water_mark"] = max(pos.get("high_water_mark", 0.0), pnl_pct)
+
+        expiry = date.fromisoformat(pos["expiry_date"])
+        remaining_dte = (expiry - current_date).days
+
+        # 1. Flat loss limit: one stop at -mult x credit (env
+        # AIT_CREDIT_LOSS_LIMIT). R16 #6 parity with live portfolio.py:413-414:
+        # default 0 = flat stop DISABLED (mult <= 0 mirrors live's -999
+        # sentinel); the wings cap the true tail, and R12-B1 showed touch-close
+        # beats every flat level. Env override still re-arms the stop.
+        if self._credit_loss_limit_mult > 0 and pnl_pct <= -self._credit_loss_limit_mult:
+            return {"exit_date": str(current_date), "exit_reason": "credit_loss_limit"}
+
+        # 2. DTE-laddered take-profit (portfolio._get_take_profit_targets)
+        if pnl_pct >= self._credit_take_profit_pct(remaining_dte):
+            return {"exit_date": str(current_date), "exit_reason": "take_profit_short"}
+
+        # 3. Expiry-approaching close — live closes any position at DTE<=5
+        # (portfolio.py rule 3a; rule 3 assignment risk at DTE<=1 is subsumed).
+        if remaining_dte <= 5:
+            reason = "expiry" if current_date >= expiry else "expiry_approaching"
+            return {"exit_date": str(current_date), "exit_reason": reason}
+
+        # 4. Macro-event flatten (portfolio.py rule 3d parity). PLAN
+        # 2026-08-04: defined-risk EXEMPT — condors hold through events
+        # (wings cap the surprise; the vol crush is the payoff). Only
+        # undefined/assignment-risk strategies keep the early exit
+        # (strangles/jade_lizard <=5 days, CSP/CC <=1). 2026-only calendar:
+        # inactive for pre-2026 windows.
+        # R16: jade_lizard was missing here. The "wings cap the surprise"
+        # rationale is untrue for its NAKED short put — built max_loss_per_share
+        # is ~93.7 on a $100 underlying vs ~12.8 for the condors — so it was
+        # holding through FOMC/CPI/NFP while short_strangle (same put-side
+        # assignment/tail risk) flattened 5 days out, inflating the jade arm's
+        # relative PF on exactly the highest-variance days.
+        if (self._economic_cal is not None
+                and contract_flag("AIT_SKIP_MACRO_EVENTS")
+                and pos.get("strategy") in (
+                    "short_strangle", "jade_lizard",
+                    "cash_secured_put", "covered_call")):
+            try:
+                _d2e = self._economic_cal.days_until_next_event(current_date)
+            except Exception:  # noqa: BLE001
+                _d2e = None
+            _evt_window = 5 if pos.get("strategy") in (
+                "short_strangle", "jade_lizard") else 1
+            if _d2e is not None and _d2e <= _evt_window:
+                return {"exit_date": str(current_date), "exit_reason": "macro_event_flatten"}
+
+        return None
+
     def _check_exit_fixed(self, pos: dict, pnl_pct: float, current_date: date) -> dict | None:
-        """Fixed stop-loss / take-profit."""
+        """Fixed stop-loss / take-profit (DEBIT trades only since R6 parity)."""
         stop = self._stop_loss_pct
 
         # Stop loss

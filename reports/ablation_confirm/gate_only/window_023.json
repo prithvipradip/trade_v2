@@ -1,0 +1,199 @@
+{
+  "window": 23,
+  "test_start": "2019-02-10",
+  "test_end": "2019-04-14",
+  "pnl": 330.32,
+  "return_pct": 0.1101,
+  "trades": 2,
+  "win_rate": 0.5,
+  "sharpe": 2.0347,
+  "max_drawdown": 0.094,
+  "strategies": {
+    "iron_condor": 2
+  },
+  "best_params": {},
+  "trades_detail": [
+    {
+      "symbol": "IWM",
+      "strategy": "iron_condor",
+      "entry_date": "2019-03-28",
+      "entry_time": "2019-03-28",
+      "exit_date": "2019-04-08",
+      "exit_time": "2019-04-08",
+      "exit_reason": "take_profit_short",
+      "pnl": 612.84,
+      "entry_confidence": 0.4,
+      "entry_regime": "high_volatility",
+      "contracts": 20,
+      "n_legs": 4,
+      "hold_days": 11,
+      "entry_price": 1.4959,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 1.1375,
+      "entry_iv_rank": 0.5218,
+      "entry_vix_level": 0.5,
+      "credit": 2991.8,
+      "max_loss": 9923.6,
+      "return_pct": 0.0618,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 147.0,
+          "premium": 0.8227
+        },
+        {
+          "type": "long_put",
+          "strike": 141.0,
+          "premium": -0.0748
+        },
+        {
+          "type": "short_call",
+          "strike": 160.0,
+          "premium": 0.8227
+        },
+        {
+          "type": "long_call",
+          "strike": 166.0,
+          "premium": -0.0748
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.4,
+        "range_gate": {
+          "prob": null,
+          "threshold": 0.55,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.2309,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.0353,
+          "threshold": 0.2,
+          "pass": true
+        },
+        "regime": "high_volatility",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 2479,
+          "blocked": false
+        },
+        "regime_class": "high_volatility",
+        "iv_rank_rise_10d": 0.232
+      },
+      "features_at_entry": {
+        "rsi_14": 52.49,
+        "macd_hist": -0.00365,
+        "bb_position": 0.374,
+        "atr_pct": 0.0158,
+        "realized_vol_20": 0.1967,
+        "iv_rank": 0.522,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.9
+      }
+    },
+    {
+      "symbol": "IWM",
+      "strategy": "iron_condor",
+      "entry_date": "2019-04-09",
+      "entry_time": "2019-04-09",
+      "exit_date": "2019-04-12",
+      "exit_time": "2019-04-12",
+      "exit_reason": "backtest_end",
+      "pnl": -282.52,
+      "entry_confidence": 0.2466,
+      "entry_regime": "range_bound",
+      "contracts": 21,
+      "n_legs": 4,
+      "hold_days": 3,
+      "entry_price": 1.3923,
+      "limit_price": null,
+      "fill_time": null,
+      "exit_price": 1.4748,
+      "entry_iv_rank": 0.4527,
+      "entry_vix_level": 0.5,
+      "credit": 2923.83,
+      "max_loss": 9629.34,
+      "return_pct": -0.0293,
+      "legs": [
+        {
+          "type": "short_put",
+          "strike": 150.0,
+          "premium": 0.7658
+        },
+        {
+          "type": "long_put",
+          "strike": 144.0,
+          "premium": -0.0696
+        },
+        {
+          "type": "short_call",
+          "strike": 162.0,
+          "premium": 0.7658
+        },
+        {
+          "type": "long_call",
+          "strike": 168.0,
+          "premium": -0.0696
+        }
+      ],
+      "decision": {
+        "direction_class": "neutral",
+        "direction_conf": 0.2466,
+        "range_gate": {
+          "prob": null,
+          "threshold": 0.55,
+          "pass": null
+        },
+        "vol_gate": {
+          "vol_10d": 0.115,
+          "max": 0.8,
+          "pass": true
+        },
+        "meta_label": {
+          "take": true,
+          "prob": null,
+          "threshold": 0.5
+        },
+        "fractal_gate": {
+          "hurst_spread": 0.3068,
+          "threshold": 0.2,
+          "pass": false
+        },
+        "regime": "range_bound",
+        "earnings_skip": false,
+        "macro_gate": {
+          "days_to_event": 2467,
+          "blocked": false
+        },
+        "regime_class": "range_bound",
+        "iv_rank_rise_10d": -0.0556
+      },
+      "features_at_entry": {
+        "rsi_14": 54.95,
+        "macd_hist": 0.00188,
+        "bb_position": 0.631,
+        "atr_pct": 0.0149,
+        "realized_vol_20": 0.1791,
+        "iv_rank": 0.453,
+        "vix_level": 0.5,
+        "hurst_wavelet": 0.9
+      }
+    }
+  ],
+  "model_weights": {
+    "range_predictor": {
+      "status": "disabled_by_config",
+      "threshold_pct": 0.05
+    }
+  }
+}

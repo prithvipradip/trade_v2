@@ -11,6 +11,7 @@ of a successful trade is significantly higher.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 
 import numpy as np
@@ -172,6 +173,24 @@ class MultiTimeframeAnalyzer:
             intraday=intraday,
         )
 
+    async def analyze_async(
+        self,
+        daily_df: pd.DataFrame,
+        intraday_df: pd.DataFrame | None = None,
+    ) -> MultiTimeframeAnalysis:
+        """Event-loop-safe wrapper around analyze().
+
+        R9: analyze() is pure pandas but can chew on ~2 years of 5-min bars
+        (rolling windows, date-slicing on ~57k rows) — called synchronously
+        from an async orchestrator path it stalls the event loop and the
+        30s risk monitor. This wrapper offloads the whole computation to a
+        worker thread. Async call sites (e.g. orchestrator._analyze_symbol)
+        should use:  mtf = await self._mtf_analyzer.analyze_async(hist, intraday_full)
+
+        Same arguments and return type as analyze().
+        """
+        return await asyncio.to_thread(self.analyze, daily_df, intraday_df)
+
     def _analyze_weekly(self, df: pd.DataFrame) -> TimeframeSignal:
         """Analyze weekly trend from daily data (5-day resampling)."""
         close = df["Close"]
@@ -260,7 +279,15 @@ class MultiTimeframeAnalyzer:
         )
 
     def _analyze_intraday(self, df: pd.DataFrame) -> TimeframeSignal:
-        """Analyze intraday trend from 5-min bars."""
+        """Analyze intraday trend from 5-min bars (latest session only)."""
+        # R5 audit HIGH: callers pass up to 730 days of 5-min bars, so the
+        # "intraday" VWAP/volume-average were computed over ~2 years — in any
+        # sustained trend the signal saturated permanently bullish/bearish
+        # and skewed the confidence boost on every entry. Slice to the most
+        # recent session before computing anything.
+        if len(df) and hasattr(df.index, "date"):
+            _last_day = df.index.date[-1]
+            df = df[df.index.date == _last_day]
         close = df["Close"]
         volume = df["Volume"]
 

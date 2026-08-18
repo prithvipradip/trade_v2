@@ -1,0 +1,20 @@
+{
+  "total_trades": 1,
+  "total_pnl": 154.36,
+  "win_rate": 1.0,
+  "profit_factor": Infinity,
+  "sharpe_ratio": 0.0,
+  "sortino_ratio": 0.0,
+  "max_drawdown_pct": 0.0,
+  "max_drawdown_dollars": 0.0,
+  "avg_trade_pnl": 154.36,
+  "avg_win": 154.36,
+  "avg_loss": 0,
+  "largest_win": 154.36,
+  "largest_loss": 0,
+  "avg_hold_hours": 166.94821434777776,
+  "consecutive_wins": 1,
+  "consecutive_losses": 0,
+  "current_streak": 1,
+  "recovery_factor": 0.0
+}
