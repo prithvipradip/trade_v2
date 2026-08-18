@@ -35,6 +35,17 @@ import os as _os_t
 # the cancel; 90s cancelled orders before the marketable step could fire.
 DEFAULT_ORDER_TIMEOUT = int(_os_t.environ.get("AIT_ENTRY_ORDER_TIMEOUT", "240"))
 
+# R19 (audit finding executor.py:453): terminal fallback for the single-leg
+# wide-spread reject. The 0.15 literal used to live inline in
+# _execute_single_leg, silently shadowing the EXISTING config field
+# options.max_bid_ask_spread_pct (config.yaml = 0.40, deliberately loosened
+# because stale-quote spreads run wider on this delayed-data paper account).
+# The scanner accepted 40% while the executor vetoed anything over 15% with
+# only a WARNING — the wing_k silent-divergence pattern. The value now comes
+# from settings when the caller threads it in; this constant only covers call
+# sites constructed without settings so nothing breaks.
+DEFAULT_MAX_SPREAD_PCT = 0.15
+
 # R16: IBKR's generic combo contract id. Every BAG order reports, alongside its
 # per-leg executions, ONE combo-level summary execution carrying this conId and
 # the net combo price (negative when the combo nets a credit). Leg rows and the
@@ -199,11 +210,24 @@ class TradeExecutor:
         state: StateManager,
         circuit_breaker: CircuitBreaker,
         order_timeout: int = DEFAULT_ORDER_TIMEOUT,
+        settings=None,
     ) -> None:
         self._ibkr = ibkr_client
         self._state = state
         self._circuit_breaker = circuit_breaker
         self._order_timeout = order_timeout
+        # R19: the executor received NO config, so every threshold it enforced
+        # had to be a literal — which is how the single-leg spread gate ended
+        # up shadowing options.max_bid_ask_spread_pct. Optional so existing
+        # call sites keep working; when settings ARE passed, config wins.
+        self._settings = settings
+        _opts = getattr(settings, "options", None)
+        _cfg_spread = getattr(_opts, "max_bid_ask_spread_pct", None)
+        try:
+            self._max_spread_pct = (float(_cfg_spread) if _cfg_spread
+                                    else DEFAULT_MAX_SPREAD_PCT)
+        except (TypeError, ValueError):
+            self._max_spread_pct = DEFAULT_MAX_SPREAD_PCT
         self._pending_orders: dict[int, PendingOrder] = {}  # order_id → PendingOrder
         self._pending_exit_orders: dict[int, PendingExitOrder] = {}  # order_id → PendingExitOrder
         # R13: exit orderIds we already asked the broker to cancel while they
@@ -213,6 +237,15 @@ class TradeExecutor:
         # placement; survives pending-dict cleanup (see _sweep_executions).
         self._order_ctx_map: dict[int, tuple[float, float, float]] = {}
         self._order_trade_map: dict[int, str] = {}  # orderId → trade_id (survives cleanup)
+        # R19: orderId -> permId, learned at placement and refreshed on every
+        # pass while the order is still visible. permId is IBKR's PERMANENT,
+        # cross-session order key: ib_insync's wrapper.connectionClosed() calls
+        # reset() (0.9.86 wrapper.py), wiping self.trades, and orders recovered
+        # afterwards via reqCompletedOrders routinely carry order.orderId=0
+        # (they are keyed by permId). Without this map an entry that FILLED
+        # during a disconnect matches nothing and reads as "not working".
+        self._order_perm_map: dict[int, int] = {}
+        self._perm_trade_map: dict[int, str] = {}  # permId → trade_id
         # R12 F2.2: strong references to event-spawned tasks. An unreferenced
         # asyncio task is garbage-collectable mid-flight — the event-driven
         # fill check could silently die between scheduling and execution.
@@ -372,6 +405,12 @@ class TradeExecutor:
                 if not hasattr(self, "_order_trade_map"):
                     self._order_trade_map = {}
                 self._order_trade_map[trade.order.orderId] = trade_id
+                # R19: capture the permId as soon as IBKR assigns one. It is
+                # usually still 0 at placeOrder time (it arrives with the
+                # openOrder callback), so _refresh_perm_ids re-reads it on
+                # every pass — but capture here too for the fast path.
+                self._remember_perm_id(trade.order.orderId,
+                                       getattr(trade.order, "permId", 0))
                 # R13 (shadow-referee break #7): fill-quality context must
                 # ALSO survive cleanup. Since R11's event-driven fills, the
                 # pending entry is booked and deleted by the fill event BEFORE
@@ -446,13 +485,20 @@ class TradeExecutor:
         bid = getattr(signal.contract, "bid", 0) or 0
         ask = getattr(signal.contract, "ask", 0) or 0
 
-        # Reject if bid-ask spread is too wide (>15% of mid) — indicates stale/illiquid quote
+        # Reject if the bid-ask spread is too wide — a stale/illiquid quote.
+        # R19: the ceiling is options.max_bid_ask_spread_pct (config), NOT a
+        # literal. The old inline 0.15 shadowed the config field: config.yaml
+        # sets 0.40, so the scanner/chain filter admitted quotes the executor
+        # then vetoed with only a WARNING, and tightening the config below
+        # 0.15 did not tighten the executor either. See DEFAULT_MAX_SPREAD_PCT.
+        max_spread_pct = getattr(self, "_max_spread_pct", DEFAULT_MAX_SPREAD_PCT)
         if bid > 0 and ask > 0:
             mid = (bid + ask) / 2
             spread_pct = (ask - bid) / mid if mid > 0 else 1.0
-            if spread_pct > 0.15:
+            if spread_pct > max_spread_pct:
                 log.warning("wide_spread_rejected", trade_id=trade_id,
-                            bid=bid, ask=ask, spread_pct=f"{spread_pct:.1%}")
+                            bid=bid, ask=ask, spread_pct=f"{spread_pct:.1%}",
+                            max_spread_pct=max_spread_pct)
                 # R12 Tier-A #1: CAS PENDING->CANCELLED (row now exists —
                 # chaos#1 writes it before placement, so this reject is a
                 # real state write, not the historical no-op).
@@ -797,6 +843,12 @@ class TradeExecutor:
         open_trades = self._ibkr.get_open_orders()
         all_trades = self._ibkr.get_all_trades() if hasattr(self._ibkr, 'get_all_trades') else []
 
+        # R19: refresh permIds while the session can still see these orders.
+        # permId is 0 at placeOrder time and the Trade cache is wiped by the
+        # next disconnect — this is the only window in which the permanent
+        # key of a working order can be learned.
+        self._refresh_perm_ids(all_trades)
+
         for order_id, pending in list(self._pending_orders.items()):
             still_open = any(t.order.orderId == order_id for t in open_trades)
 
@@ -859,7 +911,13 @@ class TradeExecutor:
                     continue
 
                 # If partial fill has been sitting > 30s, cancel the remainder
-                # to avoid orphaned legs and stale prices
+                # to avoid orphaned legs and stale prices.
+                # R19: this searched open_trades — but the branch is only
+                # reachable when the order is ABSENT from open_trades (the
+                # `if still_open: continue` above), so the loop never matched
+                # and the cancel was never transmitted: a dead safety path
+                # that logged a cancellation which never happened, leaving the
+                # remainder riding at stale prices until the 240s timeout.
                 if pending.age_seconds > 30:
                     log.warning(
                         "partial_fill_cancelling_remainder",
@@ -869,13 +927,16 @@ class TradeExecutor:
                         requested=pending.contracts,
                         age_seconds=pending.age_seconds,
                     )
-                    try:
-                        for t in open_trades:
-                            if t.order.orderId == order_id:
-                                self._ibkr.ib.cancelOrder(t.order)
-                                break
-                    except Exception as e:
-                        log.warning("partial_cancel_failed", error=str(e))
+                    self._blind_cancel_once(
+                        order_id, "partial_remainder_cancel_unsent",
+                        open_trades, all_trades,
+                        trade_id=pending.trade_id,
+                        filled=filled_qty,
+                        requested=pending.contracts,
+                        detail="could not transmit the remainder cancel; the "
+                               "unfilled balance is still working at the "
+                               "broker at a stale price",
+                    )
                 else:
                     log.warning(
                         "trade_partial_fill",
@@ -886,14 +947,20 @@ class TradeExecutor:
                     )
 
             elif status == "cancelled":
-                self._update_trade_cancelled(pending)
-                cancelled.append(pending.trade_id)
-                log.info(
-                    "trade_cancelled",
-                    trade_id=pending.trade_id,
-                    symbol=pending.signal.symbol,
-                    age_seconds=pending.age_seconds,
-                )
+                # R19: a cancel verdict on a row that is already PARTIAL is
+                # refused (contracts are live) — the trade is handed back as
+                # a live position instead, exactly like the terminal-partial
+                # branch above.
+                if self._update_trade_cancelled(pending):
+                    cancelled.append(pending.trade_id)
+                    log.info(
+                        "trade_cancelled",
+                        trade_id=pending.trade_id,
+                        symbol=pending.signal.symbol,
+                        age_seconds=pending.age_seconds,
+                    )
+                else:
+                    filled.append(pending.trade_id)  # partial contracts are live
 
             if status in ("filled", "cancelled"):
                 del self._pending_orders[order_id]
@@ -1125,18 +1192,27 @@ class TradeExecutor:
                 # cancelled -> revert to FILLED for a clean re-trigger). Hard
                 # cap at 900s so a zombie order can't wedge the position in
                 # CLOSING forever.
+                # R19: same dead path as the partial remainder above — this
+                # branch is reachable only when the order is INVISIBLE to this
+                # session (the working case returns at `still_open`), so
+                # iterating open_trades could never find it and no cancel was
+                # ever sent; IBKRClient.cancel_order(int) fails the same way
+                # ("no matching trade found"). Cancel by orderId on the wire,
+                # and page if even that cannot be transmitted.
                 log.warning(
                     "exit_order_stale_pending_cancel_requested",
                     trade_id=pending_exit.trade_id,
                     age_seconds=int(pending_exit.age_seconds),
                 )
-                try:
-                    for t in open_trades:
-                        if t.order.orderId == order_id:
-                            self._ibkr.ib.cancelOrder(t.order)
-                            break
-                except Exception:
-                    pass
+                self._blind_cancel_once(
+                    order_id, "exit_stale_pending_cancel_unsent",
+                    open_trades, all_trades,
+                    trade_id=pending_exit.trade_id,
+                    age_seconds=int(pending_exit.age_seconds),
+                    detail="a close order invisible to this session could not "
+                           "be cancelled; the position stays CLOSING until "
+                           "the broker or the operator resolves it",
+                )
                 if pending_exit.age_seconds > 900:
                     # R16: the zombie cap consulted NOTHING before reverting —
                     # not the foreign stash, not the broker. If the close
@@ -1245,28 +1321,30 @@ class TradeExecutor:
           * single-leg orders: unchanged — price and mid are the same unit.
         """
         try:
-            omap = getattr(self, "_order_trade_map", {})
             for t in self._ibkr.ib.trades():
                 oid = t.order.orderId
-                trade_id = omap.get(oid, "")
-                if not trade_id:
-                    _p = self._pending_exit_orders.get(oid)
-                    trade_id = getattr(_p, "trade_id", "") if _p else ""
-                pend = self._pending_orders.get(oid) or self._pending_exit_orders.get(oid)
-                # R13 (shadow-referee break #7): the pending entry is gone by
-                # the first sweep after an event-driven fill (R11) — fall back
-                # to the placement-time context map, which survives cleanup.
-                ctx = self._order_ctx_map.get(oid, (0.0, 0.0, 0.0))
-                if pend is not None and hasattr(pend, "signal"):
-                    sig_price = abs(getattr(pend.signal, "entry_price", 0) or 0)
-                else:
-                    sig_price = ctx[0]
-                live_mid = (getattr(pend, "live_mid", 0.0) or 0.0) or ctx[1]
-                nbbo = (getattr(pend, "nbbo_spread", 0.0) or 0.0) or ctx[2]
+                t_perm = getattr(t.order, "permId", 0) or 0
+                self._remember_perm_id(oid, t_perm)
                 is_combo = getattr(t.contract, "secType", "") == "BAG"
                 for f in t.fills:
                     if not f.execution or not f.execution.execId:
                         continue
+                    # R19: attribute per FILL, not per Trade. A trade
+                    # recovered via reqCompletedOrders after a reconnect can
+                    # carry order.orderId = 0 (IBKR keys completed orders by
+                    # permId), which used to write every one of its fills with
+                    # order_id 0 and trade_id '' — the ledger declared "the
+                    # ground truth the PF verdict needs" losing commission and
+                    # P&L attribution for exactly the fills around a
+                    # connection loss. Execution objects carry the true
+                    # orderId and permId; prefer whichever key resolves.
+                    f_oid = int(getattr(f.execution, "orderId", 0) or 0)
+                    f_perm = int(getattr(f.execution, "permId", 0) or 0)
+                    row_oid = int(oid or 0) or f_oid
+                    row_perm = int(t_perm or 0) or f_perm
+                    self._remember_perm_id(row_oid, row_perm)
+                    trade_id, sig_price, live_mid, nbbo = self._ledger_context(
+                        row_oid, row_perm)
                     px = float(f.execution.price or 0)
                     # R16: see the docstring — combo context belongs on the
                     # combo row only, in the combo row's own unit.
@@ -1286,8 +1364,8 @@ class TradeExecutor:
                         rpnl = float(rp) if rp and rp == rp and abs(rp) < 1e12 else 0.0
                     self._state.record_execution(
                         exec_id=f.execution.execId,
-                        order_id=oid,
-                        perm_id=getattr(t.order, "permId", 0) or 0,
+                        order_id=row_oid,
+                        perm_id=row_perm,
                         trade_id=trade_id,
                         symbol=t.contract.symbol,
                         con_id=getattr(f.contract, "conId", 0) or 0,
@@ -1303,6 +1381,37 @@ class TradeExecutor:
                     )
         except Exception as e:  # noqa: BLE001
             log.debug("executions_sweep_failed", error=str(e))
+
+    def _ledger_context(self, order_id: int,
+                        perm_id: int = 0) -> tuple[str, float, float, float]:
+        """R19: (trade_id, signal_price, live_mid, nbbo_spread) for a ledger
+        row, resolved by orderId and — when that fails — by permId.
+
+        Split out of _sweep_executions so attribution can be done per FILL:
+        the orderId on a reconnect-recovered completed order is 0, and the
+        permId map (learned while the order was still visible) is then the
+        only route back to our trade_id.
+        """
+        omap = getattr(self, "_order_trade_map", {})
+        trade_id = omap.get(order_id, "")
+        if not trade_id:
+            _p = getattr(self, "_pending_exit_orders", {}).get(order_id)
+            trade_id = getattr(_p, "trade_id", "") if _p else ""
+        if not trade_id and perm_id:
+            trade_id = self._perm_maps()[1].get(int(perm_id), "")
+        pend = (getattr(self, "_pending_orders", {}).get(order_id)
+                or getattr(self, "_pending_exit_orders", {}).get(order_id))
+        # R13 (shadow-referee break #7): the pending entry is gone by the
+        # first sweep after an event-driven fill (R11) — fall back to the
+        # placement-time context map, which survives cleanup.
+        ctx = getattr(self, "_order_ctx_map", {}).get(order_id, (0.0, 0.0, 0.0))
+        if pend is not None and hasattr(pend, "signal"):
+            sig_price = abs(getattr(pend.signal, "entry_price", 0) or 0)
+        else:
+            sig_price = ctx[0]
+        live_mid = (getattr(pend, "live_mid", 0.0) or 0.0) or ctx[1]
+        nbbo = (getattr(pend, "nbbo_spread", 0.0) or 0.0) or ctx[2]
+        return trade_id, sig_price, live_mid, nbbo
 
     @staticmethod
     def _normalize_exec_time(t) -> str:
@@ -1513,6 +1622,263 @@ class TradeExecutor:
         for oid in sorted(stash - ids):
             self._forget_foreign_order(oid)
 
+    # ------------------------------------------------------------------
+    # R19: permId bookkeeping + execution-level fill evidence.
+    #
+    # Every "did this order die?" question in this file used to be answered
+    # with `t.order.orderId == order_id` against THIS SESSION's Trade cache.
+    # ib_insync 0.9.86 wipes that cache on any disconnect
+    # (wrapper.connectionClosed -> reset()), and orders it recovers afterwards
+    # via reqCompletedOrders routinely carry order.orderId = 0 because IBKR
+    # keys completed orders by permId. So an entry that FILLED during an
+    # outage matched nothing, read as "not working", and was booked CANCELLED
+    # — a status neither the portfolio monitor nor the reconciler re-adopts —
+    # while four condor legs were LIVE at the broker.
+    # ------------------------------------------------------------------
+
+    def _perm_maps(self) -> tuple[dict, dict]:
+        """R19: (orderId->permId, permId->trade_id), created on demand.
+
+        Lazily built so instances constructed via ``__new__`` in tests (and
+        any legacy pickled/partial executor) never AttributeError inside the
+        sweep's blanket except, which would silently drop the whole ledger.
+        """
+        pm = getattr(self, "_order_perm_map", None)
+        if pm is None:
+            pm = self._order_perm_map = {}
+        tm = getattr(self, "_perm_trade_map", None)
+        if tm is None:
+            tm = self._perm_trade_map = {}
+        return pm, tm
+
+    def _remember_perm_id(self, order_id, perm_id) -> None:
+        """R19: record IBKR's PERMANENT order key for a tracked orderId."""
+        try:
+            oid = int(order_id or 0)
+            pid = int(perm_id or 0)
+        except (TypeError, ValueError):
+            return
+        if oid <= 0 or pid <= 0:
+            return
+        pm, tm = self._perm_maps()
+        pm[oid] = pid
+        trade_id = getattr(self, "_order_trade_map", {}).get(oid, "")
+        if not trade_id:
+            _pe = getattr(self, "_pending_exit_orders", {}).get(oid)
+            trade_id = getattr(_pe, "trade_id", "") if _pe else ""
+        if trade_id:
+            tm[pid] = trade_id
+
+    def _refresh_perm_ids(self, trades) -> None:
+        """R19: re-read permIds for tracked orders while this session can
+        still see them. permId is 0 at placeOrder time (it arrives with the
+        openOrder callback), so placement alone never captures it — and after
+        the cache wipe it is the only link from a recovered execution back to
+        our trade."""
+        tracked = set(getattr(self, "_pending_orders", {}))
+        tracked |= set(getattr(self, "_pending_exit_orders", {}))
+        if not tracked:
+            return
+        for t in trades or []:
+            try:
+                oid = int(getattr(t.order, "orderId", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if oid in tracked:
+                self._remember_perm_id(oid, getattr(t.order, "permId", 0))
+
+    def _broker_fill_evidence(self, order_id: int, pending=None) -> dict | None:
+        """R19: did this order actually EXECUTE at the broker?
+
+        "Is the order still working?" is NOT the question a cancel verdict
+        needs — a FILLED order is also not working. Executions are the durable
+        evidence: ``Fill.execution`` carries the TRUE orderId and permId even
+        when the parent (completed-order) Trade reports orderId 0, and
+        ib.fills() survives what the Trade cache does not.
+
+        Returns None when there is no evidence of a fill, else a dict with
+        ``units`` (COMBO units — a 4-leg condor filling once is 1, not 4),
+        ``price`` (as-defined signed net for a combo, unsigned average for a
+        single leg; None when unknown), ``source`` and ``n_fills``.
+        """
+        try:
+            oid = int(order_id or 0)
+        except (TypeError, ValueError):
+            return None
+        perm_id = self._perm_maps()[0].get(oid, 0)
+
+        matches: list = []
+        try:
+            getter = getattr(getattr(self._ibkr, "ib", None), "fills", None)
+            for f in (getter() or []) if getter is not None else []:
+                ex = getattr(f, "execution", None)
+                if ex is None or not getattr(ex, "execId", ""):
+                    continue
+                try:
+                    f_oid = int(getattr(ex, "orderId", 0) or 0)
+                    f_pid = int(getattr(ex, "permId", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if f_oid == oid or (perm_id > 0 and f_pid == perm_id):
+                    matches.append(f)
+        except Exception as e:  # noqa: BLE001 — an unreadable ledger is "unknown"
+            log.warning("broker_fill_evidence_probe_failed",
+                        order_id=oid, error=str(e)[:200])
+            matches = []
+
+        if matches:
+            n_legs = 1
+            legs = getattr(getattr(pending, "signal", None), "legs", None)
+            if legs:
+                n_legs = max(1, len(legs))
+            bag_units = 0.0
+            bag_price: float | None = None
+            leg_shares = 0.0
+            leg_cost = 0.0
+            net = 0.0
+            for f in matches:
+                ex = f.execution
+                shares = float(getattr(ex, "shares", 0) or 0)
+                price = float(getattr(ex, "price", 0) or 0)
+                if self._is_bag_row(f):
+                    bag_units += shares
+                    if bag_price is None:
+                        bag_price = price
+                    continue
+                leg_shares += shares
+                leg_cost += price * shares
+                net += (1.0 if getattr(ex, "side", "") == "SLD" else -1.0) * price * shares
+            units = bag_units if bag_units > 0 else (
+                leg_shares / n_legs if leg_shares > 0 else 0.0)
+            price = bag_price
+            if price is None and units > 0 and leg_shares > 0:
+                # Same unit convention as _reconstruct_bag_price / _get_fill_price:
+                # combos are the as-defined signed net per combo unit, single
+                # legs the unsigned share-weighted average.
+                price = (-net / units) if n_legs > 1 else (leg_cost / leg_shares)
+            return {"units": units, "price": price,
+                    "source": "ib_fills", "n_fills": len(matches)}
+
+        # Second source: the on-disk executions ledger. ib_insync's
+        # wrapper.reset() clears fills too, and while connectAsync does
+        # re-request them (reqExecutionsAsync), that request can time out like
+        # any other — the ledger already persisted every fill swept on earlier
+        # passes, so it still answers for fills that predate the outage.
+        trade_id = getattr(pending, "trade_id", "") or \
+            getattr(self, "_order_trade_map", {}).get(oid, "")
+        if trade_id:
+            n = 0
+            try:
+                raw = self._state.count_executions(trade_id)
+                # Strict: a non-numeric answer (stub/mock state) is NOT
+                # evidence — inventing a fill would be as bad as missing one.
+                if isinstance(raw, int) and not isinstance(raw, bool):
+                    n = raw
+                elif isinstance(raw, float):
+                    n = int(raw)
+            except Exception:  # noqa: BLE001 — no ledger answer is not evidence
+                n = 0
+            if n > 0:
+                return {"units": 0.0, "price": None,
+                        "source": "executions_ledger", "n_fills": n}
+        return None
+
+    def _cancel_verdict(self, order_id: int, pending=None) -> str:
+        """R19: the ONLY place an entry 'cancelled' verdict is minted.
+
+        FAIL-SAFE direction: broker executions outrank cache absence. A hit
+        means the contracts are LIVE and the trade must be booked FILLED so
+        the portfolio monitor manages it — never CANCELLED, which nothing
+        re-adopts.
+        """
+        evidence = self._broker_fill_evidence(order_id, pending)
+        if evidence is not None:
+            log.critical(
+                "cancel_verdict_overridden_by_broker_fills",
+                order_id=order_id,
+                trade_id=getattr(pending, "trade_id", ""),
+                source=evidence["source"],
+                n_fills=evidence["n_fills"],
+                units=evidence["units"],
+                note="order executed at the broker but is absent from this "
+                     "session's trade cache (reconnect amnesia / completed "
+                     "order with orderId 0) — booking FILLED, not CANCELLED",
+            )
+            return "filled"
+        # R12 F3.1: never issue a cancel verdict for an order the broker
+        # showed WORKING under another clientId.
+        if self._is_foreign_open_order(order_id):
+            return "pending"
+        return "cancelled"
+
+    def _cancel_order_anywhere(self, order_id: int, *trade_lists) -> bool:
+        """R19: transmit a cancel for ``order_id`` even when this session
+        holds no Trade object for it.
+
+        Two safety paths in check_fills searched ONLY ``open_trades`` for the
+        order — yet both branches are reachable exclusively when the order is
+        ABSENT from open_trades (they sit after ``if still_open: continue``),
+        so the loop could never match and the cancel was never transmitted:
+        the 30s partial-remainder cancel logged
+        'partial_fill_cancelling_remainder' for a cancellation that never
+        happened, and the >300s stale-pending exit cancel was a no-op for
+        exactly the cache-invisible orders it exists to clear.
+        IBKRClient.cancel_order(int) cannot help either — it resolves the id
+        against ib.trades() and fails 'no matching trade found'. The wire
+        message needs only the orderId (ib_insync IB.cancelOrder calls
+        client.cancelOrder(order.orderId)), so fall back to a bare Order.
+        """
+        ib = getattr(self._ibkr, "ib", None)
+        if ib is None:
+            return False
+        for lst in trade_lists:
+            for t in (lst or []):
+                try:
+                    if int(getattr(t.order, "orderId", 0) or 0) != int(order_id):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                try:
+                    ib.cancelOrder(t.order)
+                    return True
+                except Exception as e:  # noqa: BLE001 — try the bare-order path
+                    log.warning("cancel_via_cached_trade_failed",
+                                order_id=order_id, error=str(e)[:200])
+                    break
+        try:
+            from ib_insync import Order as _Order
+            bare = _Order()
+            bare.orderId = int(order_id)
+            perm = self._perm_maps()[0].get(int(order_id), 0)
+            if perm:
+                bare.permId = perm
+            ib.cancelOrder(bare)
+            log.warning("cancel_sent_for_cache_invisible_order",
+                        order_id=order_id, perm_id=perm,
+                        note="no Trade object in this session; cancelled by "
+                             "orderId on the wire")
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.error("cancel_transmit_failed", order_id=order_id,
+                      error=str(e)[:200])
+            return False
+
+    def _blind_cancel_once(self, order_id: int, event: str, *trade_lists,
+                           **fields) -> bool:
+        """R19: send at most ONE cancel per order for the cache-invisible
+        paths, and page LOUDLY when the transmit fails — a dead safety path
+        must never sit silently in the code."""
+        sent_set = getattr(self, "_blind_cancels_sent", None)
+        if sent_set is None:
+            sent_set = self._blind_cancels_sent = set()
+        if order_id in sent_set:
+            return True
+        if self._cancel_order_anywhere(order_id, *trade_lists):
+            sent_set.add(order_id)
+            return True
+        self._page_stuck_order(order_id, event, **fields)
+        return False
+
     async def _confirm_order_not_working(self, order_id: int, all_trades: list) -> bool:
         """R16: may a "vanished" order be declared CANCELLED?
 
@@ -1523,7 +1889,21 @@ class TradeExecutor:
         trades()/openTrades() EMPTY, which the old code read as "every working
         entry was cancelled" — flipping live broker orders to CANCELLED
         locally and untracking their later fills.
+
+        R19: "not working" is not the same question as "did not fill". Ask
+        the executions first — a filled order is also not working, and after a
+        cache wipe that is exactly how a live 4-leg condor got booked
+        CANCELLED. Evidence of a fill is an unconditional refusal.
         """
+        _ev = self._broker_fill_evidence(order_id)
+        if _ev is not None:
+            log.critical(
+                "cancel_verdict_refused_order_has_fills",
+                order_id=order_id, source=_ev["source"], n_fills=_ev["n_fills"],
+                note="broker executions exist for this orderId/permId; it "
+                     "filled, it was not cancelled",
+            )
+            return False
         ids = await self._broker_open_order_ids()
         if ids is None:
             log.warning(
@@ -1584,10 +1964,10 @@ class TradeExecutor:
                     # were LIVE at IBKR with no stop/TP/expiry management.
                     if filled_qty > 0:
                         return "partial"
-                    # R12 F3.1: never issue a cancel verdict for an order the
-                    # broker showed WORKING under another clientId.
-                    return "pending" if self._is_foreign_open_order(order_id) \
-                        else "cancelled"
+                    # R12 F3.1 / R19: _cancel_verdict is the single gate —
+                    # it refuses to cancel an order with broker executions
+                    # and refuses for orders working under another clientId.
+                    return self._cancel_verdict(order_id, pending)
                 elif status in ("submitted", "presubmitted"):
                     return "pending"  # Still working
 
@@ -1596,10 +1976,8 @@ class TradeExecutor:
                     return "partial"
                 elif filled_qty > 0:
                     return "filled"
-                elif self._is_foreign_open_order(order_id):  # R12 F3.1
-                    return "pending"
                 else:
-                    return "cancelled"
+                    return self._cancel_verdict(order_id, pending)
 
         # NOT-FOUND HARDENING (deep-audit MP-F2b): the entry path used to
         # assume "cancelled" whenever the order wasn't in get_all_trades() —
@@ -1611,9 +1989,11 @@ class TradeExecutor:
         # R12 F3.1: an order placed before a fallback-clientId reconnect is
         # ABSENT from this session's trade list by construction — that is the
         # mass-false-CANCELLED path, not a cancel.
-        if self._is_foreign_open_order(order_id):
-            return "pending"
-        return "cancelled"
+        # R19: and an order that FILLED during a disconnect is absent for the
+        # same reason (wrapper.reset() wiped the cache; the recovered
+        # completed order carries orderId 0) — _cancel_verdict checks the
+        # executions before it will say "cancelled".
+        return self._cancel_verdict(order_id, pending)
 
     @staticmethod
     def _reconstruct_bag_price(trade) -> float | None:
@@ -1624,7 +2004,18 @@ class TradeExecutor:
         entry and exit fill reconstruction (audit R2 — the entry path
         previously lacked this and silently fell back to the signal price).
         """
-        qty = trade.order.totalQuantity or 0
+        # R19: divide by what actually FILLED, not what was ORDERED. `net` is
+        # summed over real executions, so pairing it with totalQuantity
+        # reconstructs filled/ordered of the true price — a 1-of-2 condor fill
+        # came back at -3.06 instead of -6.12 per combo. That value is booked
+        # as entry_price (and as the exit price / partial-exit price), so the
+        # error propagates into every downstream P&L, stop and target.
+        ordered = trade.order.totalQuantity or 0
+        try:
+            filled_units = float(getattr(trade.orderStatus, "filled", 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            filled_units = 0.0
+        qty = filled_units if filled_units > 0 else ordered
         if not trade.fills or qty <= 0:
             return None
         net = 0.0
@@ -1662,6 +2053,17 @@ class TradeExecutor:
                 if (trade.orderStatus.filled or 0) > 0:
                     return 0.0
 
+        # R19: an entry recovered from the executions (the order is not in
+        # all_trades after a reconnect) still has a REAL price — reconstruct
+        # it from the fills instead of booking the optimistic signal price,
+        # which would flow into entry_price and every downstream P&L.
+        evidence = self._broker_fill_evidence(order_id, pending)
+        if evidence is not None and evidence.get("price") is not None:
+            log.warning("entry_fill_price_from_broker_executions",
+                        trade_id=pending.trade_id, order_id=order_id,
+                        price=evidence["price"], source=evidence["source"])
+            return float(evidence["price"])
+
         log.warning("entry_fill_price_missing_using_signal",
                     trade_id=pending.trade_id, order_id=order_id)
         return pending.signal.entry_price  # last resort — flagged above
@@ -1673,6 +2075,12 @@ class TradeExecutor:
         for trade in all_trades:
             if trade.order.orderId == order_id:
                 return int(trade.orderStatus.filled or 0)
+        # R19: not in this session's cache — fall back to the executions
+        # (COMBO units), so a fill recovered after a reconnect is booked at
+        # the quantity that actually filled, never 0.
+        evidence = self._broker_fill_evidence(order_id, pending)
+        if evidence is not None and evidence.get("units", 0) > 0:
+            return int(round(float(evidence["units"])))
         return 0
 
     def _determine_exit_fill_status(self, order_id: int, all_trades: list) -> str:
@@ -2001,17 +2409,49 @@ class TradeExecutor:
             requested=pending.contracts,
         )
 
-    def _update_trade_cancelled(self, pending: PendingOrder) -> None:
+    def _update_trade_cancelled(self, pending: PendingOrder) -> bool:
         """Update a trade record to CANCELLED status (real write — see
         _update_trade_partial docstring for the INSERT OR IGNORE no-op bug).
 
-        R12 Tier-A #1: CAS from PENDING/PARTIAL only — a cancel verdict must
-        never claw back a trade that has since FILLED or CLOSED."""
+        R12 Tier-A #1: CAS from PENDING only — a cancel verdict must never
+        claw back a trade that has since FILLED or CLOSED.
+
+        R19: PARTIAL was removed from the from-set. A partially filled entry
+        has CONTRACTS LIVE at the broker and an open_positions row; flipping
+        it to CANCELLED orphaned them in a status neither the portfolio
+        monitor nor the reconciler re-adopts (the same one-way door the
+        filled-qty-first rule exists to avoid) — and the filled-qty-first
+        protection cannot fire post-reconnect, when the order row is not in
+        all_trades at all. A PARTIAL row therefore resolves to FILLED at the
+        already-booked partial quantity: the order is dead, the contracts are
+        not. Returns True when the trade was really cancelled.
+        """
+        try:
+            row = self._state.get_trade_by_id(pending.trade_id)
+        except Exception:  # noqa: BLE001 — a lookup failure must not book a cancel
+            row = None
+        if row is not None and getattr(row, "status", None) == TradeStatus.PARTIAL:
+            promoted = self._state.transition(
+                pending.trade_id,
+                (TradeStatus.PARTIAL,),
+                TradeStatus.FILLED,
+            )
+            log.critical(
+                "cancel_refused_partial_contracts_live",
+                trade_id=pending.trade_id,
+                quantity=getattr(row, "quantity", None),
+                promoted=promoted,
+                note="entry order died after a partial fill — the filled "
+                     "contracts stay MANAGED (FILLED at the partial "
+                     "quantity) instead of being orphaned as CANCELLED",
+            )
+            return False
         self._state.transition(
             pending.trade_id,
-            (TradeStatus.PENDING, TradeStatus.PARTIAL),
+            (TradeStatus.PENDING,),
             TradeStatus.CANCELLED,
         )
+        return True
 
     def register_exit_order(
         self,

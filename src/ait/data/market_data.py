@@ -30,6 +30,7 @@ from ib_insync import Stock, util
 from ait.broker.ibkr_client import IBKRClient
 from ait.data.cache import TTLCache
 from ait.utils.logging import get_logger
+from ait.config.runtime_env import contract_str  # R19: ONE authority for env-contract defaults
 
 log = get_logger("data.market")
 
@@ -497,7 +498,7 @@ class MarketDataService:
 
             # Market data type from env (same knob as ibkr_client): 1=live,
             # 4=delayed-frozen. Live now that Network B/C + OPRA are subscribed.
-            self._ibkr.ib.reqMarketDataType(int(os.environ.get("AIT_MARKET_DATA_TYPE", "4")))
+            self._ibkr.ib.reqMarketDataType(int(contract_str("AIT_MARKET_DATA_TYPE")))
             self._ibkr.ib.reqMktData(qualified, "", False, False)
             ticker = None
             try:

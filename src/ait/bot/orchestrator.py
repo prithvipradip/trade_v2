@@ -21,7 +21,7 @@ from ait.broker.account import AccountManager
 from ait.broker.contracts import ContractBuilder
 from ait.broker.ibkr_client import IBKRClient
 from ait.broker.orders import OrderBuilder
-from ait.config.runtime_env import capital_base, capital_base_source
+from ait.config.runtime_env import capital_base, capital_base_source, contract_flag, contract_float
 from ait.config.settings import Settings
 from ait.data.earnings import EarningsCalendar
 from ait.data.economic_calendar import EconomicCalendar
@@ -924,7 +924,7 @@ class TradingOrchestrator:
         # TEMPORARILY DISABLED — env var AIT_SKIP_MACRO_EVENTS=0 bypasses this
         # to gather more paper trade data. Re-enable once we have 30+ trades.
         import os
-        if os.environ.get("AIT_SKIP_MACRO_EVENTS", "0") == "1":
+        if contract_flag("AIT_SKIP_MACRO_EVENTS"):
             if self._economic_cal.should_skip_trading():
                 log.info("economic_event_skip",
                          events=str(self._economic_cal.get_upcoming_events(days=2)))
@@ -1586,15 +1586,15 @@ class TradingOrchestrator:
         try:
             budget = nlv * self._settings.risk.max_position_risk_pct
             import os as _os_c
-            min_credit = float(_os_c.environ.get("AIT_IC_MIN_CREDIT", "0.70"))
-            min_ratio = float(_os_c.environ.get("AIT_IC_MIN_CREDIT_WIDTH", "0.20"))
+            min_credit = contract_float("AIT_IC_MIN_CREDIT")
+            min_ratio = contract_float("AIT_IC_MIN_CREDIT_WIDTH")
             # Minimum viable condor given the economics floors: the narrowest
             # width whose floor credit is even possible (credit <= ~0.45x
             # width in practice at 0.20 delta), then its max loss.
             min_width = max(1.0, min_credit / 0.45)
             min_viable_cost = (min_width - min_credit) * 100
             # Typical stopped-trade loss under the 1.25x credit limit
-            loss_mult = float(_os_c.environ.get("AIT_CREDIT_LOSS_LIMIT", "1.25"))
+            loss_mult = contract_float("AIT_CREDIT_LOSS_LIMIT")
             typical_stop_loss = loss_mult * max(min_credit, min_ratio * min_width) * 100
             breaker_pct = float(getattr(self._settings.risk, "max_daily_loss_pct", 0.02) or 0.02)  # R8: real field name
             breaker_usd = nlv * breaker_pct

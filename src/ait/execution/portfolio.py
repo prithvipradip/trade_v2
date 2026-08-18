@@ -26,6 +26,7 @@ from ait.data.quality import DataQualityValidator
 from ait.risk.circuit_breaker import CircuitBreaker
 from ait.risk.pdt_guard import PDTGuard
 from ait.utils.logging import get_logger
+from ait.config.runtime_env import contract_flag, contract_float  # R19: ONE authority for env-contract defaults
 
 log = get_logger("execution.portfolio")
 
@@ -119,14 +120,36 @@ class PortfolioManager:
         feed "frozen", and downgraded a real short-strike touch from
         fire-immediately to a 2-tick confirmation (+30-60s on the one exit
         rule that caps a credit structure's loss).
+
+        R19: the same self-collision one level down. _last_quote_ts is keyed
+        by SYMBOL but a check_positions pass can evaluate the symbol more than
+        once (two positions on one underlying). The first evaluation advanced
+        the timestamp, so the second read the SAME 15s-cached quote, saw
+        `timestamp <= prev_ts` and called a healthy feed "frozen" — every
+        pass, forever, for that position: touch stops downgraded to 2-tick
+        confirmation and the once-per-outage STALE EXIT FEED page spent on
+        nothing. Classify each symbol ONCE per pass and reuse the verdict
+        (`<` alone cannot replace `<=`: a genuinely frozen feed repeats its
+        timestamp, it never rewinds).
         """
+        # Per-pass memo — reads only, never a mutation of the tick-time state.
+        # persist=False (report path) neither fills nor consumes it.
+        pass_seen = getattr(self, "_pass_quote_verdicts", None)
+        if persist and pass_seen is not None and symbol in pass_seen:
+            return pass_seen[symbol]
+
+        def _verdict(result: "tuple[float | None, str]") -> "tuple[float | None, str]":
+            if persist and pass_seen is not None:
+                pass_seen[symbol] = result
+            return result
+
         try:
             quote = await self._market_data.get_quote(symbol)
         except Exception as e:  # noqa: BLE001 — never let a quote fetch kill exits
             log.warning("spot_quote_failed", symbol=symbol, error=str(e))
-            return None, "missing"
+            return _verdict((None, "missing"))
         if quote is None or quote.mid <= 0:
-            return None, "missing"
+            return _verdict((None, "missing"))
 
         # getattr-guarded like the rest of this class: some tests build the
         # manager via __new__ and never run __init__.
@@ -137,7 +160,7 @@ class PortfolioManager:
         if persist:
             seen_ts[symbol] = quote.timestamp
         if prev_ts is not None and quote.timestamp <= prev_ts:
-            return quote.mid, "frozen"
+            return _verdict((quote.mid, "frozen"))
 
         quality = self._quality_validator().validate_quote(
             symbol=symbol,
@@ -151,13 +174,13 @@ class PortfolioManager:
             log.warning("exit_quote_degraded", symbol=symbol,
                         issues=quality.issues,
                         staleness_s=round(quality.staleness_seconds, 1))
-            return quote.mid, "degraded"
+            return _verdict((quote.mid, "degraded"))
 
         if persist:
             # R16: clearing the once-per-outage page latch is alert STATE —
             # a report must not re-arm it (nor, below, fire the page itself).
             getattr(self, "_frozen_alerted", set()).discard(symbol)
-        return quote.mid, "fresh"
+        return _verdict((quote.mid, "fresh"))
 
     def _quality_validator(self) -> DataQualityValidator:
         q = getattr(self, "_quality", None)
@@ -195,15 +218,24 @@ class PortfolioManager:
         if not open_trades:
             return []
 
+        # R19: one spot classification per symbol per pass (see _spot_quote).
+        # Fresh dict every pass — a verdict must never outlive the pass that
+        # produced it, or a feed that froze between passes would go unseen.
+        self._pass_quote_verdicts: dict[str, tuple[float | None, str]] = {}
+
         option_marks = self._get_option_marks()
         statuses = []
-        for trade in open_trades:
-            if trade.status not in (TradeStatus.FILLED, TradeStatus.PARTIAL):
-                continue
+        try:
+            for trade in open_trades:
+                if trade.status not in (TradeStatus.FILLED, TradeStatus.PARTIAL):
+                    continue
 
-            status = await self._evaluate_position(trade, option_marks)
-            if status:
-                statuses.append(status)
+                status = await self._evaluate_position(trade, option_marks)
+                if status:
+                    statuses.append(status)
+        finally:
+            # The memo is pass-scoped: nothing outside this loop may reuse it.
+            self._pass_quote_verdicts = None
 
         # Log summary
         exits_needed = [s for s in statuses if s.should_exit or s.partial_exit_quantity > 0]
@@ -423,7 +455,7 @@ class PortfolioManager:
             # (touch +$756/PF 1.38 > none -$24 > 1.25x -$134 > 2.0x -$1,067).
             # Default 0 = flat stop DISABLED; short-strike-touch close (rule
             # 1b below) is the early loss exit; the wings cap the tail.
-            _loss_mult = float(_os_x.environ.get("AIT_CREDIT_LOSS_LIMIT", "0"))
+            _loss_mult = contract_float("AIT_CREDIT_LOSS_LIMIT")
             effective_stop = -_loss_mult if _loss_mult > 0 else -999.0
         else:
             # Volatility-adjusted stops (debit structures only): widen stops
@@ -681,7 +713,7 @@ class PortfolioManager:
         # event — the wings cap a surprise, and the post-event vol crush is
         # the trade's payoff; flattening at d2e<=1 sold the insurance and
         # refused the premium. Undefined-risk keeps the early exit.
-        if (os.environ.get("AIT_SKIP_MACRO_EVENTS", "0") == "1"
+        if (contract_flag("AIT_SKIP_MACRO_EVENTS")
                 and not should_exit and self._economic_cal
                 and trade.strategy in (
                     "short_strangle",

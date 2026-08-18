@@ -126,6 +126,29 @@ class TestSymbolConcentrationUsesRealRisk:
         assert mgr._symbol_capital_at_risk("SPY") == pytest.approx(750.0)
 
 
+class _FakeBreaker:
+    """R19: minimal stand-in with the REAL CircuitBreaker's semantics —
+    is_tripped is a bool that starts False and flips once the failure
+    threshold is reached. Verified against the real class: 5 api failures
+    inside the window produce trip reason 'api_failures (5 in 10 min)'."""
+
+    def __init__(self, trip_after: int = 5) -> None:
+        self.calls = 0
+        self._trip_after = trip_after
+        self.is_tripped = False
+        self.reason = ""
+
+    def record_api_failure(self) -> None:
+        self.calls += 1
+        if self.calls >= self._trip_after:
+            self.is_tripped = True
+            self.reason = f"api_failures ({self.calls} in 10 min)"
+
+    def _trip(self, reason: str, pause_seconds: int = 600) -> None:
+        self.is_tripped = True
+        self.reason = reason
+
+
 class TestAccountStaleDataEscalates:
     def _account(self):
         from ait.broker.account import AccountManager
@@ -134,7 +157,13 @@ class TestAccountStaleDataEscalates:
         acct._client = MagicMock()
         acct._cache_ttl = 30
         acct._notify_cb = AsyncMock()
-        acct._circuit_breaker = MagicMock()
+        # R19: a bare MagicMock breaker reports is_tripped as a TRUTHY Mock,
+        # so the escalation's "already halted, nothing to add" short-circuit
+        # fired immediately and record_api_failure was never called — the mock
+        # was asserting against a state the real breaker can never be in at
+        # the start of an outage. Model the real semantics: starts clear, and
+        # trips once the configured failure threshold is reached.
+        acct._circuit_breaker = _FakeBreaker(trip_after=5)
         acct._stale_escalated = False
         return acct
 
@@ -142,18 +171,29 @@ class TestAccountStaleDataEscalates:
         acct = self._account()
         await acct._handle_stale(1000.0)  # past ESCALATE_STALE_SECONDS=900
         acct._notify_cb.assert_awaited_once()
-        acct._circuit_breaker.record_api_failure.assert_called_once()
+        # R19: the R17 rule recorded ONE api failure, but the breaker needs
+        # max_api_failures (5) inside its window to trip — so the documented
+        # "halt on fossil account data" could never actually happen. It must
+        # now escalate until the breaker REPORTS tripped.
+        assert acct._circuit_breaker.is_tripped, (
+            "a 16-minute-stale NLV must actually HALT trading, not just log")
+        assert acct._circuit_breaker.calls >= 5
 
-        # A second call while still stale must not double-fire.
+        # A second call while still stale must not re-page or stack failures
+        # behind an already-active halt.
+        calls_after_first = acct._circuit_breaker.calls
         await acct._handle_stale(1100.0)
         acct._notify_cb.assert_awaited_once()
-        acct._circuit_breaker.record_api_failure.assert_called_once()
+        assert acct._circuit_breaker.calls == calls_after_first
 
     async def test_below_threshold_does_not_escalate(self):
         acct = self._account()
         await acct._handle_stale(400.0)  # >300s (logs) but <900s (no escalation)
         acct._notify_cb.assert_not_awaited()
-        acct._circuit_breaker.record_api_failure.assert_not_called()
+        # R19: _FakeBreaker is a real object, not a MagicMock — assert on its
+        # recorded state instead of mock-call plumbing.
+        assert acct._circuit_breaker.calls == 0
+        assert acct._circuit_breaker.is_tripped is False
 
     async def test_fresh_fetch_rearms_the_latch(self):
         acct = self._account()

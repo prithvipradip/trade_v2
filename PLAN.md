@@ -1122,3 +1122,56 @@ from the default branch).
 STANDING LESSON: a source-string assertion proves code was WRITTEN, never that it RUNS -
 and it decays into a silent no-op on rename (two already had). Same "execute, don't read"
 rule the audits kept proving; I broke it in my own fixes.
+
+## 2026-08-18 - R19 EXTREME AUDIT (user-directed: line-by-line + "any hardcoded config?")
+SCOPE: all 38,358 production lines / 66 files, 15 auditors each attesting per-file line
+coverage, 95 agents, adversarial 2-skeptic verification. 48 findings survived; 248
+lower-tier logged. THE HARDCODED-CONFIG LENS WAS THE HIGHEST-YIELD QUESTION ASKED SO FAR.
+FINDING OF THE ROUND — the env contract was shadowed by 17 private reader fallbacks, FOUR
+disagreeing with the contract they mirrored:
+  AIT_IC_WING_K           contract 1.6  -> readers 1.0  (x2)
+  AIT_IC_MIN_CREDIT_WIDTH contract 0.10 -> readers 0.20 (x4)
+  AIT_SKIP_MACRO_EVENTS   contract "1"  -> readers "0"  (x3, FAIL-OPEN)
+  AIT_CREDIT_LOSS_LIMIT   absent        -> split 0 vs 1.25
+Live was safe ONLY because both entry points call apply_runtime_env_defaults() first; any
+path skipping it ran pre-promotion economics with macro protection OFF. This is the wing_k
+four-sources incident recurring one layer down. FIX: runtime_env.CONTRACT_DEFAULTS (one
+table, 9 keys) + contract_float/flag/str accessors; 17 reader sites migrated; the applier
+now drives off the same table; AIT_CREDIT_LOSS_LIMIT joined the contract at 0 (R6 evidence).
+Verified: a bare process with NO applier now resolves 1.6 / 0.10 / protection-ON.
+tests/test_r19_config_authority.py ENFORCES it — scans src/ and fails if any module
+reintroduces a private fallback (executor's INST-5 read is the one documented exemption).
+LIVE-MONEY BUGS FIXED: (1) an entry that FILLED during a disconnect could be booked
+CANCELLED — ib_insync wipes the trade cache on disconnect and recovered orders carry
+orderId 0, so orderId-only matching missed it, orphaning 4 live legs in a status nothing
+re-adopts; now permId + ib.fills() + ledger evidence, and a cancel verdict is refused when
+executions exist. (2) cancel CAS included PARTIAL (could orphan filled legs). (3) BAG price
+reconstructed on ORDERED not FILLED quantity. (4) ledger fill attribution had the same
+reconnect blind spot. (5) two dead cancel paths (30s partial remainder, >300s stale exit)
+that could never transmit. (6) NaN realized P&L could reach the trades DB. (7) the R16
+sweep could cancel ANOTHER trade's order (ignored R17's orderRef tagging). (8) _spot_quote
+false-'frozen' on the 2nd same-symbol read per pass, suppressing real exits.
+BOTH OF THE EXTERNAL R17 HEADLINE FIXES WERE DEAD CODE (found independently by 2 auditors):
+ML auto-rollback assigned to a READ-ONLY property (AttributeError swallowed every time, so
+a degraded retrain could never roll back) AND never persisted (bad ensemble.pkl survived to
+the next boot); the stale-account escalation recorded ONE api failure where the breaker
+needs 5, so the documented halt could never fire. Both now real + tested. LESSON: the
+reviewer who caught MY unexecuted fixes shipped unexecuted fixes. The disease is universal;
+only execution-based tests catch it.
+MY OWN MIGRATION INTRODUCED ONE: the import-insertion guard checked whether the MODULE was
+imported, not the NAMES — orchestrator.py already imported capital_base from runtime_env,
+so contract_flag was never added -> NameError on every trading cycle. Caught by
+tests/test_hot_path_smoke.py (R18) before it ever reached the bot. That harness has now
+paid for itself twice.
+TESTS PINNING THE OLD DIVERGENCE, corrected: engine wing_k default asserted 1.0 (the bug);
+the R17 account-stale test used a bare MagicMock whose is_tripped is TRUTHY, so the
+escalation short-circuited and the assertion passed against a state the real breaker can
+never be in at outage start — replaced with a _FakeBreaker modelling real semantics.
+STATE: suite 1,166 green; type gate, referee (0 BREAKS) and deploy smoke all pass.
+DEFERRED (recorded, not fixed): the research-validity cluster — engine never forwards
+market_context to _build_position (so VIX-proxy IV, incl. the R18 per-symbol VXN
+calibration, may never have engaged), Optuna-searched params never reach trial Backtesters,
+train_window_models=False still trains the meta-labeler, entry-window 09:30-vs-10:30 fork.
+Arm ORDERINGS likely survive (shared defects); absolutes suspect. Re-run studies only after
+this cluster is fixed. Also deferred: ~125 lower-tier hardcoded-config items (the register
+is the spec), executor settings= wiring at orchestrator.py:149 (dormant: IC-only).

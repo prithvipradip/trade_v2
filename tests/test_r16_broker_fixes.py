@@ -494,9 +494,13 @@ class TestEntryCancelVerdictConfirmation:
 
         await ex.check_fills()
 
+        # R19: the CAS from-set narrowed to PENDING only — a PARTIAL row has
+        # contracts LIVE at the broker and must never be flipped to CANCELLED
+        # (see tests/test_r19_executor_fixes.py). The R16 contract this test
+        # guards is unchanged: a confirmed-dead PENDING order still books
+        # CANCELLED, exactly once.
         state.transition.assert_called_once_with(
-            "T-ENTRY", (TradeStatus.PENDING, TradeStatus.PARTIAL),
-            TradeStatus.CANCELLED)
+            "T-ENTRY", (TradeStatus.PENDING,), TradeStatus.CANCELLED)
         assert 3001 not in ex._pending_orders
 
 

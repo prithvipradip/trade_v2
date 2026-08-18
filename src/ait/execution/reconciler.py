@@ -10,6 +10,7 @@ When the bot restarts (crash, manual stop, etc.), this module:
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -291,6 +292,7 @@ class PositionReconciler:
         # realizedPNL of exactly THIS trade's legs.
         trade_keys = self._trade_leg_keys(trade)
         leg_pnls = []
+        leg_pnl_unusable = False
         for item in ibkr_portfolio:
             if item.contract.secType != "OPT" or item.position != 0:
                 continue
@@ -300,11 +302,41 @@ class PositionReconciler:
                 right=item.contract.right,
                 expiry=item.contract.lastTradeDateOrContractMonth,
             )
-            if key in trade_keys and item.realizedPNL:
-                leg_pnls.append(item.realizedPNL)
-        if leg_pnls:
+            if key not in trade_keys:
+                continue
+            # R19: NaN is TRUTHY, so `if item.realizedPNL:` admitted IBKR's
+            # NaN sentinel; one NaN leg makes sum(leg_pnls) NaN and
+            # close_trade() then writes realized_pnl=NaN into trades (and the
+            # DuckDB dual-write) labelled as broker-derived — poisoning every
+            # SUM / profit-factor / win-rate over the column, permanently and
+            # silently. portfolio.py:227 already isnan-guards marketPrice on
+            # these same PortfolioItem objects; realizedPNL had no guard.
+            _leg_pnl = item.realizedPNL
+            try:
+                _usable = _leg_pnl is not None and math.isfinite(float(_leg_pnl))
+            except (TypeError, ValueError):
+                _usable = False
+            if not _usable:
+                if _leg_pnl is not None:
+                    # One unknown leg makes the STRUCTURE's P&L unknown —
+                    # summing the rest would label a knowingly-incomplete
+                    # number "broker-derived". Refuse the whole attribution.
+                    leg_pnl_unusable = True
+                    log.warning("reconcile_leg_pnl_unusable", trade_id=trade.trade_id,
+                                leg=key, value=str(_leg_pnl),
+                                note="non-finite realizedPNL from IBKR")
+                continue
+            if _leg_pnl:
+                leg_pnls.append(float(_leg_pnl))
+        if leg_pnls and not leg_pnl_unusable:
             realized_pnl = float(sum(leg_pnls))
             found_ibkr_pnl = True
+        elif leg_pnl_unusable:
+            # Fall through to the intrinsic / needs-review path below.
+            log.critical("reconcile_ibkr_pnl_non_finite", trade_id=trade.trade_id,
+                         symbol=trade.symbol, usable_legs=str(leg_pnls),
+                         note="a leg's broker P&L is not finite — NOT booked as "
+                              "broker-derived; using the review path instead")
 
         if not found_ibkr_pnl and trade.entry_price > 0:
             # No IBKR data. Only assume "expired worthless" when the
@@ -363,6 +395,20 @@ class PositionReconciler:
                     strategy=trade.strategy,
                     note="position gone from IBKR before expiry; true exit price unrecoverable",
                 )
+
+        # R19: last gate before the write — a non-finite number (NaN/inf from
+        # any branch above, incl. a NaN settle price feeding the intrinsic
+        # calc) must never enter the trades table. Book the neutral
+        # needs-review row instead: a $0 flagged for a human is recoverable,
+        # a NaN aggregate is not.
+        if not math.isfinite(realized_pnl) or not math.isfinite(exit_price):
+            log.critical("reconcile_non_finite_booking_blocked",
+                         trade_id=trade.trade_id, symbol=trade.symbol,
+                         realized_pnl=str(realized_pnl), exit_price=str(exit_price),
+                         prior_reason=exit_reason)
+            realized_pnl = 0.0
+            exit_price = 0.0
+            exit_reason = "reconciler_unknown_exit_needs_review"
 
         log.info("reconcile_closing_stale", trade_id=trade.trade_id,
                  exit_price=exit_price, realized_pnl=realized_pnl,
@@ -519,6 +565,17 @@ class PositionReconciler:
         sees either the cancel or a late fill). Uses the in-session
         openTrades cache: same-clientId orders only, which is exactly the
         population the sweep can own.
+
+        R19: the matcher used to accept ANY active same-symbol BAG order, and
+        for plain options a strike SUBSTRING test ("45.0" matches
+        "SPY:745.0:P:...", expiry ignored) — so a sweep for one stale PENDING
+        could cancel a DIFFERENT trade's working order, including a live EXIT
+        combo (a stop/TP in flight, silently killed, and re-killed every ~30s
+        cycle). Every entry/exit order has carried its trade_id in orderRef
+        since R17, so: match orderRef == trade_id exactly; fall back to the
+        symbol/leg heuristic ONLY for orders with no orderRef (pre-R17 orders
+        still in flight), logging when it does; and NEVER touch an order
+        tagged for another trade. Same contract as _working_exit_order_for.
         """
         try:
             ib = getattr(self._ibkr, "ib", None)
@@ -532,26 +589,135 @@ class PositionReconciler:
                 return False
             keys = self._trade_leg_keys(trade)
             _TERMINAL = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
+            active = []
             for bt in open_trades:
                 # Belt-and-braces: only genuinely ACTIVE orders count as
                 # working (some fakes/caches keep terminal trades in the view).
                 _st = getattr(getattr(bt, "orderStatus", None), "status", "")
                 if _st in _TERMINAL:
                     continue
+                active.append(bt)
+
+            # Pass 1 — the exact answer: this trade's own tagged order.
+            for bt in active:
+                ref = str(getattr(getattr(bt, "order", None), "orderRef", "") or "")
+                if ref and ref == trade.trade_id:
+                    ib.cancelOrder(bt.order)
+                    log.info("sweep_cancelled_by_order_ref",
+                             trade_id=trade.trade_id, order_ref=ref)
+                    return True
+
+            # Pass 2 — legacy untagged orders only.
+            for bt in active:
+                ref = str(getattr(getattr(bt, "order", None), "orderRef", "") or "")
+                if ref:
+                    continue  # tagged for a DIFFERENT trade — never cancel it
                 c = bt.contract
                 sym = getattr(c, "symbol", "")
                 if sym != trade.symbol:
                     continue
                 sec = getattr(c, "secType", "")
-                if sec == "BAG" or (sec == "OPT" and keys and any(
-                        str(getattr(c, "strike", "")) in k for k in keys)):
+                matched = sec == "BAG"
+                if not matched and sec == "OPT" and keys:
+                    # Full position-key equality (strike + right + expiry),
+                    # never a substring of the key.
+                    try:
+                        matched = self._make_position_key(
+                            symbol=sym,
+                            strike=float(getattr(c, "strike", 0.0) or 0.0),
+                            right=str(getattr(c, "right", "")),
+                            expiry=str(getattr(c, "lastTradeDateOrContractMonth", "")),
+                        ) in keys
+                    except (TypeError, ValueError):
+                        continue
+                if matched:
                     ib.cancelOrder(bt.order)
+                    log.warning("sweep_cancelled_untagged_order",
+                                trade_id=trade.trade_id, symbol=sym,
+                                sec_type=sec,
+                                note="order carries no orderRef (pre-R17) — "
+                                     "matched by symbol/leg heuristic")
                     return True
         except Exception as e:  # noqa: BLE001 — sweep must survive broker hiccups
             log.warning("sweep_cancel_check_failed",
                         trade_id=trade.trade_id, error=str(e))
             return True  # unknown broker state: defer booking, never fiction
         return False
+
+    def _request_fresh_positions(self) -> None:
+        """R19: best-effort authoritative re-query kicked off from the SYNC
+        sweep (the 30s orchestrator path cannot await).
+
+        reqPositionsAsync also repopulates ib_insync's position cache, so the
+        deferred booking decision has real data to work with on the next
+        cycle instead of re-reading the same wedged-empty list forever. Purely
+        a read; nothing is booked off it here.
+        """
+        try:
+            import asyncio
+            fresh_fn = getattr(self._ibkr, "get_positions_fresh", None)
+            if not callable(fresh_fn):
+                return
+            loop = asyncio.get_running_loop()
+        except (RuntimeError, ImportError):
+            return  # no running loop (sync test/tool) — nothing to schedule
+        except Exception:  # noqa: BLE001
+            return
+        try:
+            task = loop.create_task(fresh_fn())
+            # Keep a reference so the task is not garbage-collected mid-flight.
+            self._fresh_refresh_task = task
+            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+        except Exception as e:  # noqa: BLE001 — a refresh must never break the sweep
+            log.warning("sweep_fresh_refresh_failed", error=str(e))
+
+    def _fresh_leg_keys(self, fresh) -> set[str]:
+        """R19: position keys from an AUTHORITATIVE get_positions_fresh() list."""
+        keys: set[str] = set()
+        for pos in fresh or []:
+            if not getattr(pos, "position", 0):
+                continue  # zeroed row = closed, not live
+            try:
+                c = pos.contract
+                if getattr(c, "secType", "") == "OPT":
+                    keys.add(self._make_position_key(
+                        symbol=c.symbol, strike=c.strike, right=c.right,
+                        expiry=c.lastTradeDateOrContractMonth))
+                else:
+                    keys.add(f"{c.symbol}:STK")
+            except (AttributeError, TypeError, ValueError):
+                continue
+        return keys
+
+    async def sweep_stale_pending(self) -> int:
+        """R19: async entry point for the stale-PENDING sweep that can resolve
+        an empty position cache authoritatively before anything is booked.
+
+        The sync _sweep_stale_pending() defers (books nothing) when the cached
+        list is empty; this wrapper answers the ambiguity the way
+        position_liveness and the zero-options guard do — one fresh broker
+        query — and hands the answer down through _fresh_keys_for_sweep.
+
+        The answer travels on the instance rather than as an argument so
+        _sweep_stale_pending keeps the zero-arg signature the orchestrator's
+        30s cycle calls it with; it is consumed exactly once, so a
+        confirmation can never be re-used on a later cycle.
+        """
+        fresh_keys = None
+        try:
+            fresh_fn = getattr(self._ibkr, "get_positions_fresh", None)
+            if callable(fresh_fn):
+                fresh = await fresh_fn()
+                if fresh is not None:
+                    fresh_keys = self._fresh_leg_keys(fresh)
+        except Exception as e:  # noqa: BLE001 — unknown stays unknown
+            log.warning("sweep_fresh_positions_failed", error=str(e))
+            fresh_keys = None
+        self._fresh_keys_for_sweep = fresh_keys
+        try:
+            return self._sweep_stale_pending()
+        finally:
+            self._fresh_keys_for_sweep = None
 
     def _sweep_stale_pending(self) -> int:
         """Close PENDING trades too old to still be live working orders.
@@ -564,7 +730,22 @@ class PositionReconciler:
         live at IBKR, PROMOTE to FILLED instead of closing; if IBKR positions
         can't be read this cycle, don't sweep at all (pending dedup still
         protects — no fiction gets written).
+
+        R19: only DISCONNECTED/exception used to stop the sweep, so an
+        EMPTY-but-connected ib.positions() cache (Gateway stream reset,
+        reqPositions timeout that ib_insync only logs) read as "no legs live"
+        — the exact ambiguity every other 'gone' decision in this file refuses
+        to take on trust (position_liveness, the zero-options guard,
+        ibkr_client.get_positions_fresh's own docstring). A filled-but-
+        tracker-lost PENDING was then booked $0 "never filled" while the real
+        position lived unmanaged. An empty cache now requires an authoritative
+        answer — the one the async sweep_stale_pending() wrapper leaves in
+        _fresh_keys_for_sweep — or nothing is booked this cycle.
         """
+        # Consume the authoritative answer exactly once (None = we don't have
+        # one; a confirmation must never be re-used on a later cycle).
+        fresh_keys = getattr(self, "_fresh_keys_for_sweep", None)
+        self._fresh_keys_for_sweep = None
         closed = 0
         try:
             now = datetime.now()
@@ -584,6 +765,34 @@ class PositionReconciler:
             if live_keys is None:
                 log.warning("sweep_skipped_no_ibkr_positions")
                 return 0
+            if not live_keys:
+                # R19: empty-but-connected == ambiguous. Only a FRESH broker
+                # answer may retire a position here.
+                if fresh_keys is not None:
+                    live_keys = fresh_keys
+                    log.info("sweep_using_fresh_positions", legs=len(live_keys))
+                elif callable(getattr(self._ibkr, "get_positions_fresh", None)):
+                    log.warning(
+                        "sweep_deferred_empty_position_cache",
+                        stale_pendings=len(stale),
+                        note="cached position list is EMPTY while stale PENDING "
+                             "trades exist — ambiguous between flat and a wedged "
+                             "stream; booking deferred until a fresh query "
+                             "confirms. Requesting one now.",
+                    )
+                    self._request_fresh_positions()
+                    return 0
+                else:
+                    # No authoritative-query surface on this client at all
+                    # (legacy client / test fake): there is nothing to wait
+                    # for, so keep the pre-R19 behaviour rather than wedging
+                    # every orphan open forever — but never silently.
+                    log.warning(
+                        "sweep_unconfirmed_empty_position_cache",
+                        stale_pendings=len(stale),
+                        note="client exposes no get_positions_fresh — booking "
+                             "off an UNCONFIRMED empty position cache",
+                    )
             for t, age_min in stale:
                 if not self._trade_leg_keys(t).isdisjoint(live_keys):
                     # Legs live at the broker — the order FILLED. Rescue it.
@@ -988,7 +1197,9 @@ class PositionReconciler:
 
         # Sweep long-dead PENDING orphans LAST — after promotion had its
         # chance to rescue filled-but-tracker-lost orders (audit R2/C3).
-        self._sweep_stale_pending()
+        # R19: via the async wrapper so an empty position cache is resolved
+        # against a FRESH broker query instead of being believed.
+        await self.sweep_stale_pending()
 
         # Update portfolio value in IBKR for reconciliation
         for item in ibkr_portfolio:

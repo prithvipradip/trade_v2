@@ -14,6 +14,7 @@ from ib_insync import IB, Contract, Order, Trade, util
 
 from ait.config.settings import IBKREnvConfig
 from ait.utils.logging import get_logger
+from ait.config.runtime_env import contract_str  # R19: ONE authority for env-contract defaults
 
 log = get_logger("broker.ibkr")
 
@@ -116,7 +117,7 @@ class IBKRClient:
                 # a real live subscription is active for the API, set
                 # AIT_MARKET_DATA_TYPE=1 to switch to real-time.
                 import os
-                _mdt = int(os.environ.get("AIT_MARKET_DATA_TYPE", "4"))
+                _mdt = int(contract_str("AIT_MARKET_DATA_TYPE"))
                 self._ib.reqMarketDataType(_mdt)
                 log.info("market_data_type_set", type=_mdt)
 

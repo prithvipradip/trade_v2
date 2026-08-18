@@ -40,31 +40,66 @@ def apply_runtime_env_defaults() -> None:
     """
     _load_dotenv(REPO_ROOT / ".env")
 
-    # OpenMP conflict guard — MUST precede numpy/xgboost/lightgbm import
-    # (c0000005 crash cluster, 2026-06-26).
-    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    # R19: driven by CONTRACT_DEFAULTS so the applier and every reader share
+    # ONE table. The OpenMP guards must still land before numpy/xgboost import
+    # anywhere — they are first in the dict and this runs before any heavy
+    # import in both entry points.
+    for _key, _val in CONTRACT_DEFAULTS.items():
+        os.environ.setdefault(_key, _val)
 
-    # Market data: delayed-frozen until U6 funds live entitlements
-    # (2026-07-28 user decision; flip to "1" after funding + resubscribe).
-    os.environ.setdefault("AIT_MARKET_DATA_TYPE", "4")
 
-    # 2026-08-04 SHADOW R3 PROMOTION (pre-registered rule, PLAN): wide-wing
-    # condor — k=1.6 wings with the ratio floor scaled 0.20 -> 0.10 so the
-    # ABSOLUTE credit demand per structure is unchanged.
-    os.environ.setdefault("AIT_IC_WING_K", "1.6")
-    os.environ.setdefault("AIT_IC_MIN_CREDIT_WIDTH", "0.10")
+# R19 (user audit: "have we hardcoded any config in code?"). ONE authority for
+# every value in the env contract. Before this, 17 reader sites carried their
+# OWN fallback literals and FOUR disagreed with the contract:
+#   AIT_IC_WING_K            contract 1.6  -> readers defaulted 1.0  (x2)
+#   AIT_IC_MIN_CREDIT_WIDTH  contract 0.10 -> readers defaulted 0.20 (x4)
+#   AIT_SKIP_MACRO_EVENTS    contract "1"  -> readers defaulted "0"  (x3, FAIL-OPEN)
+#   AIT_CREDIT_LOSS_LIMIT    absent        -> readers split 0 vs 1.25
+# Live was protected only because both entry points call
+# apply_runtime_env_defaults() first; ANY path that skips it (a test, a script,
+# a notebook, a future entry point) silently ran pre-promotion economics with
+# macro protection OFF. That is the wing_k four-disagreeing-sources incident
+# recurring one layer down, so the fallback now lives in exactly one place:
+# a promotion edits CONTRACT_DEFAULTS and nothing else.
+CONTRACT_DEFAULTS: dict[str, str] = {
+    # OpenMP guards MUST stay first — they have to land before numpy/xgboost
+    # import anywhere in the process (c0000005 crash cluster, 2026-06-26).
+    "KMP_DUPLICATE_LIB_OK": "TRUE",
+    "OMP_NUM_THREADS": "1",
+    "AIT_MARKET_DATA_TYPE": "4",
+    "AIT_IC_WING_K": "1.6",
+    "AIT_IC_MIN_CREDIT_WIDTH": "0.10",
+    "AIT_IC_MIN_CREDIT": "0.70",
+    # R6/R16 evidence: flat credit stops underperform touch-close, so live
+    # runs DISABLED. Absent from the contract until R19, which is how
+    # portfolio.py (0) and the orchestrator coherence check (1.25) came to
+    # reason about two different stops.
+    "AIT_CREDIT_LOSS_LIMIT": "0",
+    "AIT_ALLOW_UNDEFINED_RISK": "0",
+    "AIT_SKIP_MACRO_EVENTS": "1",
+}
 
-    # R16: undefined-risk executor gate CLOSED. The =1 justification (paper
-    # strangle edge-comparison) has been stale since the 07-22 IC-only
-    # pivot; nothing live may emit an undefined-risk order. (INST-5.)
-    os.environ.setdefault("AIT_ALLOW_UNDEFINED_RISK", "0")
 
-    # Macro-event protection ON (2026-07-08 user decision). NOTE 2026-08-04:
-    # defined-risk condors are EXEMPT from the rule-3d flatten in code;
-    # this flag now governs undefined/assignment-risk strategies + the
-    # engine parity mirror.
-    os.environ.setdefault("AIT_SKIP_MACRO_EVENTS", "1")
+def contract_str(key: str) -> str:
+    """Env value for a contract key, falling back to the ONE declared default."""
+    if key not in CONTRACT_DEFAULTS:
+        raise KeyError(f"{key} is not part of the runtime env contract")
+    return os.environ.get(key, CONTRACT_DEFAULTS[key])
+
+
+def contract_float(key: str) -> float:
+    """Numeric contract value. A malformed override falls back to the declared
+    default rather than crashing a trading cycle."""
+    try:
+        return float(contract_str(key))
+    except (TypeError, ValueError):
+        return float(CONTRACT_DEFAULTS[key])
+
+
+def contract_flag(key: str) -> bool:
+    """Boolean contract value ('1' = on). Protective flags therefore default to
+    their PROTECTIVE state at every reader, never to off."""
+    return contract_str(key) == "1"
 
 
 def capital_base(default: float = 196_000.0) -> float:

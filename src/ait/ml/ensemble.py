@@ -462,8 +462,14 @@ class DirectionPredictor:
             log.error("model_load_failed", error=str(e))
             return False
 
-    def _save_models(self) -> None:
-        """Save trained models to disk with versioning."""
+    def _save_models(self) -> bool:
+        """Save trained models to disk with versioning.
+
+        R19: returns whether models/ensemble.pkl now holds THIS in-memory
+        model. rollback() must know — a rollback whose write failed leaves the
+        degraded artifact on disk for the live bot to load, which has to be
+        loud, not silent.
+        """
         data = {
             "models": self._models,
             "scaler": self._scaler,
@@ -493,7 +499,7 @@ class DirectionPredictor:
                     tmp_file.unlink()
             except Exception:
                 pass
-            return
+            return False
 
         # Save versioned copy for rollback
         if self._model_version:
@@ -508,6 +514,8 @@ class DirectionPredictor:
             # Prune old versions (keep last 5)
             self._prune_old_versions(keep=5)
 
+        return True
+
     def _prune_old_versions(self, keep: int = 5) -> None:
         """Remove old model versions, keeping only the N most recent."""
         versions = sorted(self.model_dir.glob("ensemble_v-*.pkl"))
@@ -517,14 +525,54 @@ class DirectionPredictor:
                 log.debug("pruned_old_model", path=str(old))
 
     def rollback(self, version: str) -> bool:
-        """Roll back to a specific model version. Falls back to latest if target missing."""
+        """Roll back to a specific model version, IN MEMORY AND ON DISK.
+
+        Returns True only when models/ensemble.pkl now holds `version`.
+
+        R19: this used to load_models() and stop there. The retrain that
+        decides to roll back runs in the 7:30 subprocess (master.py) which
+        exits seconds later, so the in-memory revert died with it while the
+        just-written models/ensemble.pkl still held the DEGRADED model — the
+        live bot's next load_models() (orchestrator ensure_models_ready)
+        served exactly the model the rollback had rejected. A rollback that
+        does not rewrite the artifact is not a rollback.
+
+        The "target missing" fallback also had to change: loading the latest
+        ensemble.pkl loads the degraded model itself, so it can never be
+        reported as a successful rollback (and must never be re-persisted).
+        Keep the load for in-memory continuity, return False, and say so
+        loudly — an unprotected retrain is an operator-visible event.
+        """
         log.info("model_rollback_requested", target_version=version)
-        success = self.load_models(version=version)
-        if not success:
-            log.warning("rollback_target_missing", version=version,
-                        hint="Loading latest available model instead")
-            success = self.load_models()  # Load latest ensemble.pkl
-        return success
+        if not self.load_models(version=version):
+            log.critical(
+                "model_rollback_target_missing",
+                version=version,
+                note="rollback artifact absent — the DEGRADED model stays on "
+                     "disk and will be loaded by the live bot; needs review",
+            )
+            self.load_models()  # in-memory continuity only — NOT a rollback
+            return False
+
+        # R16 #2 artifact fence still applies: a research/window predictor
+        # must never write the live ensemble.pkl, rollback or not.
+        if not self._persist_artifacts:
+            log.info("model_rollback_not_persisted", version=version,
+                     reason="persist_artifacts=False (research/window model)")
+            return True
+
+        if not self._save_models():
+            log.critical(
+                "model_rollback_persist_failed",
+                version=version,
+                note="rolled back in memory but ensemble.pkl still holds the "
+                     "degraded model — the live bot will load it on restart",
+            )
+            return False
+
+        log.warning("model_rollback_persisted", version=self._model_version,
+                    path=str(self.model_dir / "ensemble.pkl"))
+        return True
 
     def list_versions(self) -> list[dict]:
         """List available model versions."""
@@ -551,6 +599,23 @@ class DirectionPredictor:
     @property
     def cv_scores(self) -> dict[str, float]:
         return self._cv_scores
+
+    @cv_scores.setter
+    def cv_scores(self, scores: "dict[str, float]") -> None:
+        """R19: cv_scores was getter-only, so the R17 auto-rollback fix
+        (`self._predictor.cv_scores = {"all_symbol_mean": ...}` in
+        trainer.train_all_symbols) raised AttributeError on EVERY retrain and
+        its own `except Exception: pass` swallowed it. The rollback decision
+        therefore kept comparing the LAST symbol's per-model scores — the
+        ML-F9/A8 defect that two rounds of fixes each believed they had
+        closed. A setter makes the assignment real; the trainer's `if _vals`
+        guard already keeps it from ever being set to an empty dict.
+        """
+        if not isinstance(scores, dict):
+            raise TypeError(
+                f"cv_scores must be a dict, got {type(scores).__name__}"
+            )
+        self._cv_scores = dict(scores)
 
     def _create_labels(self, close: pd.Series) -> pd.Series:
         """Create 3-class labels from 5-day forward returns.

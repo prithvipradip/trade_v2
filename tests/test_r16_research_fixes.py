@@ -460,9 +460,16 @@ class TestWingKEnv:
         assert bt._wing_k == 1.6, "engine must mirror live AIT_IC_WING_K resolution"
 
     def test_default_without_env(self, synth_df, synth_features, monkeypatch):
+        # R19: this asserted 1.0 — the DIVERGENT reader default that was the
+        # bug. The env contract (runtime_env.CONTRACT_DEFAULTS) has declared
+        # 1.6 since the 2026-08-04 wide-wing promotion, so an engine built in
+        # a process that never applied the contract used to research 1.0-wing
+        # structures while live traded 1.6. The whole point of the single
+        # authority is that the unset case now resolves the PROMOTED value.
         monkeypatch.delenv("AIT_IC_WING_K", raising=False)
         bt = Backtester(**_engine_kwargs(synth_df, synth_features))
-        assert bt._wing_k == 1.0
+        from ait.config.runtime_env import CONTRACT_DEFAULTS
+        assert bt._wing_k == float(CONTRACT_DEFAULTS["AIT_IC_WING_K"]) == 1.6
 
     def test_explicit_param_beats_env(self, synth_df, synth_features, monkeypatch):
         monkeypatch.setenv("AIT_IC_WING_K", "1.6")

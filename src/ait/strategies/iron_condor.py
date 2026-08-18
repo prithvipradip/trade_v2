@@ -14,6 +14,7 @@ import pandas as pd
 from ait.data.options_chain import OptionsChain, OptionContract
 from ait.strategies.base import Signal, SignalDirection, Strategy
 from ait.utils.logging import get_logger
+from ait.config.runtime_env import contract_float  # R19: ONE authority for env-contract defaults
 
 log = get_logger("strategies.iron_condor")
 
@@ -104,7 +105,7 @@ class IronCondor(Strategy):
         except Exception:  # noqa: BLE001
             pass
         import os as _os_w
-        k = float(_os_w.environ.get("AIT_IC_WING_K", "1.0"))
+        k = contract_float("AIT_IC_WING_K")
         width = max(2.0, k * price * iv * math.sqrt(dte / 365))
         # R7-SOON (user-approved): budget-aware cap — the $2.1k launch
         # account cannot hold the $10-22 wings the vol formula produces on
@@ -116,7 +117,7 @@ class IronCondor(Strategy):
         # whether the narrow structure is economically WORTH trading — at
         # launch scale the bot should trade less, only when premium is rich.
         if self.risk_budget and self.risk_budget > 0:
-            min_ratio = float(_os_w.environ.get("AIT_IC_MIN_CREDIT_WIDTH", "0.20"))
+            min_ratio = contract_float("AIT_IC_MIN_CREDIT_WIDTH")
             affordable = self.risk_budget / (100.0 * max(0.5, 1.0 - min_ratio))
             if affordable < width:
                 width = max(1.0, affordable)
@@ -274,7 +275,7 @@ class IronCondor(Strategy):
         # must clear ~3x the round-trip cost (8 legs x ~$0.65 + entry/exit
         # crossing = $10-13); QQQ condors collecting $0.72 were structurally
         # cost-dominated regardless of hit rate.
-        min_credit = float(os.environ.get("AIT_IC_MIN_CREDIT", "0.70"))
+        min_credit = contract_float("AIT_IC_MIN_CREDIT")
         if total_credit < min_credit:
             self._log_entry_quality(
                 symbol, "rejected", "credit_floor", chain, short_put, short_call,
@@ -289,7 +290,7 @@ class IronCondor(Strategy):
         put_w = short_put.strike - long_put.strike
         call_w = long_call.strike - short_call.strike
         _mw = max(put_w, call_w)
-        min_ratio = float(os.environ.get("AIT_IC_MIN_CREDIT_WIDTH", "0.20"))
+        min_ratio = contract_float("AIT_IC_MIN_CREDIT_WIDTH")
         if _mw > 0 and (total_credit / _mw) < min_ratio:
             self._log_entry_quality(
                 symbol, "rejected", "credit_width_ratio", chain,

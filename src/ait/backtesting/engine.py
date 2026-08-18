@@ -27,6 +27,7 @@ from ait.backtesting.pricing import (
 from ait.backtesting.result import BacktestResult
 from ait.strategies.base import CREDIT_STRATEGIES, SignalDirection
 from ait.utils.logging import get_logger
+from ait.config.runtime_env import contract_flag, contract_float  # R19: ONE authority for env-contract defaults
 
 log = get_logger("backtesting.engine")
 
@@ -190,7 +191,7 @@ class Backtester:
         # AIT_IC_WING_K, default 1.0) when wing_k is not explicitly configured.
         self._wing_k = (
             float(wing_k) if wing_k is not None
-            else float(os.environ.get("AIT_IC_WING_K", "1.0"))
+            else contract_float("AIT_IC_WING_K")
         )
         self._delta_iv_scale = delta_iv_scale
         self._skew_factor = skew_factor
@@ -227,7 +228,7 @@ class Backtester:
         # documented structural divergence, not a parity value mismatch).
         self._credit_loss_limit_mult = (
             float(credit_loss_limit_mult) if credit_loss_limit_mult is not None
-            else float(os.environ.get("AIT_CREDIT_LOSS_LIMIT", "0"))
+            else contract_float("AIT_CREDIT_LOSS_LIMIT")
         )
         # R16: short-strike touch stop — live's PRIMARY loss exit, mirrored
         # here at last via daily High/Low (they bracket the true intraday
@@ -237,11 +238,11 @@ class Backtester:
             os.environ.get("AIT_BT_TOUCH_STOP", "1") != "0")
         self._ic_min_credit = (
             float(ic_min_credit) if ic_min_credit is not None
-            else float(os.environ.get("AIT_IC_MIN_CREDIT", "0.70"))
+            else contract_float("AIT_IC_MIN_CREDIT")
         )
         self._ic_min_credit_width = (
             float(ic_min_credit_width) if ic_min_credit_width is not None
-            else float(os.environ.get("AIT_IC_MIN_CREDIT_WIDTH", "0.20"))
+            else contract_float("AIT_IC_MIN_CREDIT_WIDTH")
         )
         self._macro_event_gate = macro_event_gate
         self._economic_cal = None
@@ -2259,7 +2260,7 @@ class Backtester:
         # assignment/tail risk) flattened 5 days out, inflating the jade arm's
         # relative PF on exactly the highest-variance days.
         if (self._economic_cal is not None
-                and os.environ.get("AIT_SKIP_MACRO_EVENTS", "0") == "1"
+                and contract_flag("AIT_SKIP_MACRO_EVENTS")
                 and pos.get("strategy") in (
                     "short_strangle", "jade_lizard",
                     "cash_secured_put", "covered_call")):
