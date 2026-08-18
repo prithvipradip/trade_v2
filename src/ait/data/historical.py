@@ -86,9 +86,17 @@ class HistoricalDataStore:
                     close    REAL,
                     volume   INTEGER,
                     source   TEXT DEFAULT '',
+                    implied_vol REAL,
                     PRIMARY KEY (symbol, datetime, interval)
                 )
             """)
+            # Migrate existing tables that pre-date the implied_vol column
+            try:
+                conn.execute(
+                    f"ALTER TABLE {self._intraday_table} ADD COLUMN implied_vol REAL"
+                )
+            except sqlite3.OperationalError:
+                pass  # column already exists
             conn.execute(f"""
                 CREATE INDEX IF NOT EXISTS idx_{self._intraday_table}_symbol_dt
                 ON {self._intraday_table}(symbol, interval, datetime)
@@ -461,6 +469,79 @@ class HistoricalDataStore:
             pass
         log.debug("resampled_to_daily", symbol=symbol, rows=len(daily))
         return daily
+
+    def save_intraday_iv(
+        self,
+        symbol: str,
+        iv_series: "pd.Series",
+        interval: str = "5m",
+    ) -> int:
+        """Upsert implied_vol into intraday_prices for a symbol.
+
+        iv_series must be a pandas Series with a DatetimeIndex and float values
+        (e.g. 0.25 = 25% IV). Rows that already exist (from the OHLCV path) get
+        their implied_vol updated; rows that don't exist are inserted with NULL
+        OHLCV so the IV is available even before bar data arrives.
+        Returns the number of rows upserted.
+        """
+        if iv_series is None or iv_series.empty:
+            return 0
+
+        rows = []
+        for idx, val in iv_series.items():
+            if pd.isna(val):
+                continue
+            dt_str = idx.isoformat() if isinstance(idx, (pd.Timestamp, datetime)) else str(idx)
+            rows.append((symbol, dt_str, float(val)))
+
+        with sqlite3.connect(self._db_path) as conn:
+            # Same two-step upsert as save_daily_iv: insert a skeleton row if
+            # absent (leaves existing OHLCV/source untouched), then set IV.
+            conn.executemany(
+                f"INSERT OR IGNORE INTO {self._intraday_table} "
+                "(symbol, datetime, interval) VALUES (?, ?, ?)",
+                [(sym, dt_str, interval) for sym, dt_str, _ in rows],
+            )
+            conn.executemany(
+                f"UPDATE {self._intraday_table} SET implied_vol = ? "
+                "WHERE symbol = ? AND datetime = ? AND interval = ?",
+                [(iv, sym, dt_str, interval) for sym, dt_str, iv in rows],
+            )
+
+        log.debug("intraday_iv_saved", symbol=symbol, interval=interval, rows=len(rows))
+        return len(rows)
+
+    def load_intraday_iv(
+        self,
+        symbol: str,
+        start_date: date,
+        end_date: date,
+        interval: str = "5m",
+    ) -> "pd.Series":
+        """Load stored intraday implied_vol values for a symbol over a date range.
+
+        Returns a Series with UTC DatetimeIndex; only rows with non-NULL
+        implied_vol are returned.
+        """
+        start_str = str(start_date)
+        end_str = str(end_date) + "T23:59:59"
+
+        with sqlite3.connect(self._db_path) as conn:
+            df = pd.read_sql_query(
+                f"""SELECT datetime, implied_vol FROM {self._intraday_table}
+                   WHERE symbol = ? AND interval = ?
+                     AND datetime >= ? AND datetime <= ?
+                     AND implied_vol IS NOT NULL
+                   ORDER BY datetime""",
+                conn,
+                params=(symbol, interval, start_str, end_str),
+            )
+
+        if df.empty:
+            return pd.Series(dtype=float, name="implied_vol")
+
+        df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+        return df.set_index("datetime")["implied_vol"].rename("implied_vol")
 
     def get_latest_intraday_timestamp(
         self,

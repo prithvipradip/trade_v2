@@ -50,8 +50,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Tickers to backfill (e.g., QQQ SPY AAPL).",
     )
     parser.add_argument(
-        "--mode", default="intraday", choices=["intraday", "iv", "both"],
-        help="What to backfill: 5-min bars, daily IV, or both (default: intraday).",
+        "--mode", default="intraday",
+        choices=["intraday", "iv", "iv-intraday", "both"],
+        help="What to backfill: 5-min bars, daily IV, 5-min IV, or both "
+             "(default: intraday).",
     )
     parser.add_argument(
         "--years", type=float, default=2.0, metavar="N",
@@ -318,6 +320,85 @@ async def _backfill_iv_symbol(
 
 
 # ---------------------------------------------------------------------------
+# Intraday (5-min) IV backfill
+# ---------------------------------------------------------------------------
+
+async def _backfill_intraday_iv_symbol(
+    ib,
+    symbol: str,
+    chunks: list[tuple[datetime, str]],
+    store,
+    pause_secs: float,
+    dry_run: bool,
+) -> int:
+    """Fetch 5-min OPTION_IMPLIED_VOLATILITY bars for one symbol.
+
+    Same chunking as the OHLCV intraday path (reuses _build_chunks), but
+    whatToShow=OPTION_IMPLIED_VOLATILITY and stored via save_intraday_iv.
+    Returns total rows upserted.
+    """
+    import pandas as pd
+    from ib_insync import Stock, util
+
+    contract = Stock(symbol, "SMART", "USD")
+    try:
+        qualified_list = await ib.qualifyContractsAsync(contract)
+        if not qualified_list:
+            print(f"  [{symbol}] ERROR: could not qualify contract")
+            return 0
+        qualified = qualified_list[0]
+    except Exception as e:
+        print(f"  [{symbol}] ERROR qualifying: {e}")
+        return 0
+
+    total_stored = 0
+    for i, (end_dt, duration) in enumerate(chunks, start=1):
+        end_str = end_dt.strftime("%Y%m%d %H:%M:%S") + " UTC"
+        print(
+            f"  [{symbol}] iv-intraday chunk {i}/{len(chunks)}: {duration} "
+            f"ending {end_str}",
+            end="", flush=True,
+        )
+
+        if dry_run:
+            print(" [DRY RUN]")
+            continue
+
+        try:
+            bars = await ib.reqHistoricalDataAsync(
+                qualified,
+                endDateTime=end_str,
+                durationStr=duration,
+                barSizeSetting="5 mins",
+                whatToShow="OPTION_IMPLIED_VOLATILITY",
+                useRTH=True,
+                formatDate=1,
+            )
+        except Exception as e:
+            print(f" ERROR: {e}")
+            continue
+
+        if not bars:
+            print(" 0 bars")
+            continue
+
+        df = util.df(bars)
+        # "close" is the IV value for OPTION_IMPLIED_VOLATILITY bars.
+        df["date"] = pd.to_datetime(df["date"], utc=True)
+        iv_series = df.set_index("date")["close"].rename("implied_vol")
+        iv_series = iv_series[iv_series > 0]
+
+        stored = store.save_intraday_iv(symbol, iv_series, interval="5m")
+        total_stored += stored
+        print(f" → {len(bars)} bars fetched, {stored} rows upserted")
+
+        if i < len(chunks):
+            time.sleep(pause_secs)
+
+    return total_stored
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -327,10 +408,14 @@ async def _main(args: argparse.Namespace) -> int:
 
     do_intraday = args.mode in ("intraday", "both")
     do_iv = args.mode in ("iv", "both")
+    do_iv_intraday = args.mode == "iv-intraday"
 
-    intraday_chunks = _build_chunks(args.years, args.chunk_months) if do_intraday else []
+    intraday_chunks = (
+        _build_chunks(args.years, args.chunk_months)
+        if (do_intraday or do_iv_intraday) else []
+    )
     total_requests = (
-        len(args.symbols) * len(intraday_chunks) * int(do_intraday)
+        len(args.symbols) * len(intraday_chunks) * int(do_intraday or do_iv_intraday)
         + len(args.symbols) * int(max(1, args.years)) * int(do_iv)
     )
 
@@ -339,6 +424,10 @@ async def _main(args: argparse.Namespace) -> int:
         print(f"  intraday: {len(intraday_chunks)} chunk(s) × {len(args.symbols)} = "
               f"{len(intraday_chunks) * len(args.symbols)} IBKR requests "
               f"[whatToShow={args.what_to_show}]")
+    if do_iv_intraday:
+        print(f"  iv-intraday: {len(intraday_chunks)} chunk(s) × {len(args.symbols)} = "
+              f"{len(intraday_chunks) * len(args.symbols)} IBKR requests "
+              f"[whatToShow=OPTION_IMPLIED_VOLATILITY, bar=5 mins]")
     if do_iv:
         print(f"  daily iv: {int(max(1, args.years))} chunk(s) × {len(args.symbols)} = "
               f"{int(max(1, args.years)) * len(args.symbols)} IBKR requests")
@@ -347,9 +436,10 @@ async def _main(args: argparse.Namespace) -> int:
     if args.dry_run:
         print("[DRY RUN — no IBKR calls will be made]")
         for sym in args.symbols:
-            if do_intraday:
+            if do_intraday or do_iv_intraday:
                 for i, (end_dt, dur) in enumerate(intraday_chunks, 1):
-                    print(f"  [{sym}] intraday chunk {i}/{len(intraday_chunks)}: {dur} "
+                    print(f"  [{sym}] {'iv-intraday' if do_iv_intraday else 'intraday'} "
+                          f"chunk {i}/{len(intraday_chunks)}: {dur} "
                           f"ending {end_dt.strftime('%Y%m%d %H:%M:%S')} UTC")
             if do_iv:
                 total_years = int(max(1, args.years))
@@ -386,6 +476,15 @@ async def _main(args: argparse.Namespace) -> int:
                 store, pause_secs=args.pause_secs, dry_run=args.dry_run,
             )
             print(f"  [{sym}] intraday total rows upserted: {n}")
+            grand_total += n
+
+        if do_iv_intraday:
+            print(f"  Backfilling 5-min IV for {sym}...")
+            n = await _backfill_intraday_iv_symbol(
+                ib, sym, intraday_chunks,
+                store, pause_secs=args.pause_secs, dry_run=args.dry_run,
+            )
+            print(f"  [{sym}] iv-intraday total rows upserted: {n}")
             grand_total += n
 
         if do_iv:
