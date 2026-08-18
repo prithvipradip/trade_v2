@@ -44,8 +44,14 @@ def apply_runtime_env_defaults() -> None:
     # ONE table. The OpenMP guards must still land before numpy/xgboost import
     # anywhere — they are first in the dict and this runs before any heavy
     # import in both entry points.
+    # R19b (user: "config must have priority over the default"): for keys with
+    # a config.yaml home, the applier seeds the CONFIG value, not the table
+    # default — otherwise a live process (env always populated by this very
+    # loop) could never see a config.yaml edit. Full precedence: explicit env/
+    # .env > config.yaml > CONTRACT_DEFAULTS.
     for _key, _val in CONTRACT_DEFAULTS.items():
-        os.environ.setdefault(_key, _val)
+        _cfg = _config_value(_key)
+        os.environ.setdefault(_key, str(_cfg) if _cfg is not None else _val)
 
 
 # R19 (user audit: "have we hardcoded any config in code?"). ONE authority for
@@ -80,11 +86,58 @@ CONTRACT_DEFAULTS: dict[str, str] = {
 }
 
 
+# R19 (user question: "the config must have priority over the default, right?").
+# Yes — and it did NOT. Some contract keys mirror a field that already lives in
+# config.yaml, but resolution went env -> hardcoded default, so config.yaml was
+# SKIPPED: an operator editing backtest.wing_k changed nothing on the live or
+# engine default path (only explicit callers like run_backtest.py read it).
+# Precedence is now, highest first:
+#   1. explicit argument at the call site (a caller deliberately overriding)
+#   2. environment variable          (deployment/study override)
+#   3. config.yaml                   (the operator's declared configuration)
+#   4. CONTRACT_DEFAULTS             (last-resort safety net only)
+CONFIG_BACKED: dict[str, tuple[str, str]] = {
+    "AIT_IC_WING_K": ("backtest", "wing_k"),
+}
+
+_yaml_cache: dict | None = None
+
+
+def _config_yaml() -> dict:
+    """Cached raw read of config.yaml. Deliberately uses yaml directly rather
+    than load_settings() — this module must stay import-light and must not
+    import the settings model (which would also make the import circular)."""
+    global _yaml_cache
+    if _yaml_cache is None:
+        try:
+            import yaml
+            path = REPO_ROOT / "config.yaml"
+            _yaml_cache = yaml.safe_load(path.read_text()) or {} if path.exists() else {}
+        except Exception:  # noqa: BLE001 — never block startup on config parsing
+            _yaml_cache = {}
+    return _yaml_cache
+
+
+def _config_value(key: str):
+    """config.yaml value mirroring a contract key, or None when it has no home."""
+    home = CONFIG_BACKED.get(key)
+    if not home:
+        return None
+    section, field = home
+    return (_config_yaml().get(section) or {}).get(field)
+
+
 def contract_str(key: str) -> str:
-    """Env value for a contract key, falling back to the ONE declared default."""
+    """Contract value: env override > config.yaml > declared default."""
     if key not in CONTRACT_DEFAULTS:
         raise KeyError(f"{key} is not part of the runtime env contract")
-    return os.environ.get(key, CONTRACT_DEFAULTS[key])
+    raw = os.environ.get(key)
+    if raw is not None:
+        return raw
+    cfg = _config_value(key)
+    if cfg is not None:
+        return str(cfg)
+    return CONTRACT_DEFAULTS[key]
 
 
 def contract_float(key: str) -> float:

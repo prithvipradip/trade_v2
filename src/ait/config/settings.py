@@ -122,10 +122,17 @@ class BacktestConfig(_StrictModel):
     wing_floor_dollars: float = Field(default=5.0, ge=0.50, le=50.0,
         description="Hard minimum spread width in dollars (safety floor only). "
                     "Wing sizing is now primarily driven by wing_k × expected_move.")
-    wing_k: float = Field(default=1.0, ge=0.1, le=3.0,
+    wing_k: float = Field(default=1.6, ge=0.1, le=3.0,
         description="Vol-scaled wing multiplier: wing_width = wing_k × price × IV × sqrt(DTE/365). "
                     "Optuna optimizes this per walk-forward window. "
-                    "1.0 = 1-sigma expected move. wing_floor_dollars is the hard minimum.")
+                    "1.0 = 1-sigma expected move. wing_floor_dollars is the hard minimum. "
+                    "R19: default raised 1.0 -> 1.6 to match the LIVE promoted value "
+                    "(runtime_env.CONTRACT_DEFAULTS, 2026-08-04 SHADOW R3). This was the "
+                    "third fork of wing_k: any module constructing BacktestConfig() bare "
+                    "researched 1.0-wing structures while live traded 1.6, so backtests "
+                    "did not describe the live book. Unlike the risk knobs below, a "
+                    "divergent wing_k is not 'safer' in either direction — it is simply a "
+                    "different strategy, so it must track the live value.")
     iv_floor: float = Field(default=0.20, ge=0.05, le=1.0,
         description="Minimum synthetic IV used for option pricing. "
                     "Prevents near-zero credits in calm markets.")
@@ -369,5 +376,83 @@ def load_settings(config_path: str | Path = "config.yaml") -> Settings:
     yaml_data["ibkr"] = IBKREnvConfig().model_dump()
     yaml_data["api_keys"] = APIKeysConfig().model_dump()
 
-    return Settings.model_validate(yaml_data)
+    settings = Settings.model_validate(yaml_data)
+    _report_default_divergence(settings)
+    return settings
+
+
+# R19 (user audit): the SECOND shadowing layer, after the env contract.
+# Every module that builds a config model BARE — Backtester(), WalkForwardConfig(),
+# the optimizer, the trainer — gets the pydantic Field default, NOT the
+# config.yaml operating value. Those disagreed on 5 fields, so research
+# validated a different bot than the one that trades.
+#
+# wing_k was ALIGNED (a divergent wing size is not "safer", it is a different
+# strategy). The rest are deliberately left STRICTER in code than in yaml —
+# a bare construction should fail safe, not inherit a loosened operating
+# value — but the divergence must never again be SILENT. This reports it
+# once at load, so `grep config_default_divergence` answers "is research
+# running the same knobs as live?" in one line.
+# R19 SECURITY: sections whose VALUES must never enter a log line. api_keys /
+# ibkr carry the Finnhub + Polygon keys, the Telegram bot token and the account
+# number — the exact class that put a live Finnhub key into 11 log files (R13
+# #12, still pending rotation as U10). The divergence report exists to compare
+# NUMERIC knobs; secrets are reported as names only, never values.
+_SECRET_SECTIONS: frozenset[str] = frozenset({"api_keys", "ibkr"})
+_SECRET_FIELD_HINTS: tuple[str, ...] = (
+    "key", "token", "secret", "password", "account", "chat_id",
+)
+_DIVERGENCE_EXEMPT: frozenset[str] = frozenset()
+
+
+def _is_secret(section_name: str, field_name: str) -> bool:
+    if section_name in _SECRET_SECTIONS:
+        return True
+    lowered = field_name.lower()
+    return any(hint in lowered for hint in _SECRET_FIELD_HINTS)
+
+
+def default_divergences(settings: "Settings") -> list[tuple[str, object, object]]:
+    """Fields whose config.yaml value differs from the pydantic default.
+
+    Returns (dotted_field, code_default, active_value). Used by the startup
+    report and by tests/test_r19_config_authority.py to pin that no NEW
+    divergence appears unnoticed.
+    """
+    out: list[tuple[str, object, object]] = []
+    for section_name, section in settings:
+        model_fields = getattr(type(section), "model_fields", None)
+        if not model_fields:
+            continue
+        for field_name, field in model_fields.items():
+            dotted = f"{section_name}.{field_name}"
+            if dotted in _DIVERGENCE_EXEMPT:
+                continue
+            if _is_secret(section_name, field_name):
+                continue  # R19: names only for secrets — never values
+            default = field.default
+            if default is None or repr(default).startswith("PydanticUndefined"):
+                continue
+            active = getattr(section, field_name, None)
+            if isinstance(default, (int, float, str, bool)) and active != default:
+                out.append((dotted, default, active))
+    return out
+
+
+def _report_default_divergence(settings: "Settings") -> None:
+    try:
+        diverged = default_divergences(settings)
+        if diverged:
+            from ait.utils.logging import get_logger  # lazy: keep settings import-light
+            log = get_logger("config.settings")
+            log.info(
+                "config_default_divergence",
+                count=len(diverged),
+                fields={d: {"code_default": c, "active": a} for d, c, a in diverged},
+                note="config.yaml overrides these; any module constructing a "
+                     "config model BARE (engine/walkforward/optimizer/trainer) "
+                     "runs the code_default instead — research vs live skew.",
+            )
+    except Exception:  # noqa: BLE001 — diagnostics must never block startup
+        pass
 

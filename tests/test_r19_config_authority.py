@@ -85,3 +85,82 @@ class TestNoReaderReintroducesItsOwnFallback:
         assert not offenders, (
             "contract keys must be read via contract_float/flag/str so one "
             "table governs every reader:\n  " + "\n  ".join(offenders))
+
+
+class TestDefaultDivergenceReport:
+    """R19 second shadowing layer: pydantic Field defaults vs config.yaml.
+
+    Every module that builds a config model BARE (Backtester(),
+    WalkForwardConfig(), the optimizer, the trainer) gets the Field default,
+    NOT the yaml operating value — so research can validate a different bot
+    than the one that trades. wing_k was ALIGNED (a different wing size is a
+    different strategy, not a safer fallback); the rest stay deliberately
+    STRICTER in code, but must never diverge SILENTLY again.
+    """
+
+    def test_wing_k_default_tracks_the_live_contract(self):
+        from ait.config.settings import BacktestConfig
+        from ait.config.runtime_env import CONTRACT_DEFAULTS
+        assert BacktestConfig().wing_k == float(CONTRACT_DEFAULTS["AIT_IC_WING_K"])
+
+    def test_report_lists_yaml_overrides(self):
+        from ait.config.settings import load_settings, default_divergences
+        d = dict((n, (c, a)) for n, c, a in
+                 default_divergences(load_settings("config.yaml")))
+        # known, deliberate overrides — the report must SEE them
+        assert "options.max_bid_ask_spread_pct" in d
+        assert "risk.min_confidence" in d
+        # and wing_k must NOT appear (it is now aligned)
+        assert "backtest.wing_k" not in d
+
+    def test_report_never_contains_secrets(self):
+        """The report writes to the structured log. A live Finnhub key already
+        reached 11 log files once (R13 #12); this report must not be the
+        second route."""
+        from ait.config.settings import load_settings, default_divergences
+        secret_markers = ("key", "token", "secret", "password", "chat_id")
+        for name, code, active in default_divergences(load_settings("config.yaml")):
+            low = name.lower()
+            assert not any(m in low for m in secret_markers), (
+                f"{name} would log a secret VALUE")
+            assert not low.startswith(("api_keys.", "ibkr."))
+
+
+class TestConfigBeatsDefault:
+    """R19b (user question: "the config must have priority over the default,
+    right?"). It did NOT: resolution went env -> hardcoded default and skipped
+    config.yaml entirely, so editing backtest.wing_k changed nothing on the
+    live/default path. Precedence is now: explicit env > config.yaml >
+    CONTRACT_DEFAULTS — at the reader AND in the applier (which seeds env for
+    live processes and would otherwise mask config forever).
+    """
+
+    def _fresh(self, monkeypatch, yaml_value):
+        import ait.config.runtime_env as m
+        monkeypatch.delenv("AIT_IC_WING_K", raising=False)
+        monkeypatch.setattr(m, "_yaml_cache",
+                            {"backtest": {"wing_k": yaml_value}} if yaml_value
+                            is not None else {})
+        return m
+
+    def test_config_yaml_beats_table_default(self, monkeypatch):
+        m = self._fresh(monkeypatch, 2.2)
+        assert m.contract_float("AIT_IC_WING_K") == pytest.approx(2.2)
+
+    def test_env_beats_config_yaml(self, monkeypatch):
+        m = self._fresh(monkeypatch, 2.2)
+        monkeypatch.setenv("AIT_IC_WING_K", "0.8")
+        assert m.contract_float("AIT_IC_WING_K") == pytest.approx(0.8)
+
+    def test_applier_seeds_config_value_not_table_default(self, monkeypatch):
+        # In a LIVE process the applier populates env; if it seeded the table
+        # default, config.yaml could never take effect anywhere. It must seed
+        # the config value.
+        import os
+        m = self._fresh(monkeypatch, 2.2)
+        m.apply_runtime_env_defaults()
+        assert os.environ["AIT_IC_WING_K"] == "2.2"
+
+    def test_missing_config_home_falls_to_table_default(self, monkeypatch):
+        m = self._fresh(monkeypatch, None)
+        assert m.contract_float("AIT_IC_WING_K") == pytest.approx(1.6)

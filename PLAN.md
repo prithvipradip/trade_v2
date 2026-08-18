@@ -1175,3 +1175,26 @@ train_window_models=False still trains the meta-labeler, entry-window 09:30-vs-1
 Arm ORDERINGS likely survive (shared defects); absolutes suspect. Re-run studies only after
 this cluster is fixed. Also deferred: ~125 lower-tier hardcoded-config items (the register
 is the spec), executor settings= wiring at orchestrator.py:149 (dormant: IC-only).
+
+## 2026-08-18 - R19b: CONFIG NOW OUTRANKS CODE DEFAULTS (user question, answered in code)
+User asked: "the config must have priority over the default, right?" It did NOT, twice over:
+ (1) SECOND SHADOWING LAYER: pydantic Field defaults in settings.py diverged from
+     config.yaml on 5+ knobs (wing_k 1.0-vs-1.6 the worst). Every module constructing a
+     config model BARE (engine, walkforward, optimizer, trainer) ran code defaults, not the
+     operator's yaml. FIX: wing_k default aligned to the live 1.6 (a divergent wing size is
+     a DIFFERENT STRATEGY, not a safer fallback); the risk-side knobs stay deliberately
+     stricter in code but load_settings() now emits config_default_divergence listing every
+     yaml override (12 today) so the skew is never silent; default_divergences() is
+     test-pinned.
+ (2) PRECEDENCE HOLE: contract resolution went env -> hardcoded default, SKIPPING
+     config.yaml - editing backtest.wing_k changed nothing on the live/default path. FIX:
+     CONFIG_BACKED maps contract keys to their yaml homes; precedence is now explicit env >
+     config.yaml > CONTRACT_DEFAULTS, enforced at the reader AND in the applier (which
+     seeds env for live processes and would otherwise mask config forever). Proven with a
+     5-scenario execution matrix + 4 pinned tests.
+SECURITY CATCH DURING THE WORK: my first divergence report printed api_keys/ibkr VALUES
+(Finnhub, Polygon, Telegram token, account number) - the exact R13 #12 leak class, caught
+before it ever ran in the bot. Secrets are now excluded by section + field-name heuristic,
+with a test asserting no secret can enter the report. NOTE: those keys passed through this
+chat session - U10 (rotate Finnhub) now applies to ALL of them; rotate at the providers.
+Suite 1,173 green; smoke + type gates pass.
