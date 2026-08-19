@@ -81,6 +81,11 @@ class RiskConfig(_StrictModel):
                     "delta gate is dead and the daily breaker only sees "
                     "realized P&L, so without this the whole book can be "
                     "short vol into a gap (audit R2).")
+    skip_macro_events: bool = Field(default=True,
+        description="R19c: macro-event protection (entry gates + rule-3d "
+                    "flatten for undefined-risk shapes). Config home for "
+                    "AIT_SKIP_MACRO_EVENTS ('1'=on). Protective default ON; "
+                    "2026-07-08 user decision.")
     credit_vix_halt: float = Field(default=28.0, ge=15.0, le=60.0,
         description="No NEW credit entries when VIX is at/above this level — "
                     "cheap vol-regime brake for short-premium strategies.")
@@ -133,6 +138,20 @@ class BacktestConfig(_StrictModel):
                     "did not describe the live book. Unlike the risk knobs below, a "
                     "divergent wing_k is not 'safer' in either direction — it is simply a "
                     "different strategy, so it must track the live value.")
+    ic_min_credit_width: float = Field(default=0.10, ge=0.01, le=0.50,
+        description="R19c: credit/width ratio floor for condor entries — the "
+                    "config.yaml home for AIT_IC_MIN_CREDIT_WIDTH (contract "
+                    "default 0.10 since the 2026-08-04 wide-wing promotion). "
+                    "Precedence: env > this > CONTRACT_DEFAULTS.")
+    ic_min_credit: float = Field(default=0.70, ge=0.10, le=5.0,
+        description="R19c: absolute minimum total credit ($/share) for a "
+                    "condor — config.yaml home for AIT_IC_MIN_CREDIT. At a 50% "
+                    "TP the gross must clear ~3x round-trip costs.")
+    credit_loss_limit: float = Field(default=0.0, ge=0.0, le=5.0,
+        description="R19c: flat credit-structure stop as a multiple of credit "
+                    "received; 0 = DISABLED (R6/R12-B1 evidence: every flat "
+                    "level underperformed touch-close). Config home for "
+                    "AIT_CREDIT_LOSS_LIMIT.")
     iv_floor: float = Field(default=0.20, ge=0.05, le=1.0,
         description="Minimum synthetic IV used for option pricing. "
                     "Prevents near-zero credits in calm markets.")

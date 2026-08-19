@@ -41,13 +41,19 @@ class TestContractIsTheSingleAuthority:
         assert contract_float("AIT_CREDIT_LOSS_LIMIT") == pytest.approx(0.0)
 
     def test_applier_and_readers_share_one_table(self, monkeypatch):
+        # R19c: config-backed keys seed the CONFIG value (which today equals
+        # the contract semantically but may differ in string form, e.g. yaml
+        # 0.10 -> "0.1"). Compare resolved SEMANTICS, not string formatting.
         for k in CONTRACT_DEFAULTS:
             monkeypatch.delenv(k, raising=False)
         apply_runtime_env_defaults()
         import os
         for key, declared in CONTRACT_DEFAULTS.items():
-            assert os.environ[key] == declared
-            assert contract_str(key) == declared
+            assert os.environ[key] == contract_str(key)
+            try:
+                assert float(os.environ[key]) == pytest.approx(float(declared))
+            except ValueError:  # non-numeric (TRUE etc.)
+                assert os.environ[key] == declared
 
     def test_explicit_override_still_wins(self, monkeypatch):
         monkeypatch.setenv("AIT_IC_WING_K", "0.8")
@@ -164,3 +170,57 @@ class TestConfigBeatsDefault:
     def test_missing_config_home_falls_to_table_default(self, monkeypatch):
         m = self._fresh(monkeypatch, None)
         assert m.contract_float("AIT_IC_WING_K") == pytest.approx(1.6)
+
+
+class TestConfigIsTheOperatingSource:
+    """R19c (user policy: "config must be the ONLY place with values that
+    manage trading"). Every trading-economics contract key must have a
+    config.yaml home; env is an override, CONTRACT_DEFAULTS a safety net.
+    Named exceptions (each documented in runtime_env.py): the OpenMP crash
+    guards, AIT_MARKET_DATA_TYPE (broker entitlement, flips at U6), and
+    AIT_ALLOW_UNDEFINED_RISK (INST-5 interlock, env-only on purpose).
+    """
+
+    _EXEMPT = {"KMP_DUPLICATE_LIB_OK", "OMP_NUM_THREADS",
+               "AIT_MARKET_DATA_TYPE", "AIT_ALLOW_UNDEFINED_RISK"}
+
+    def test_every_trading_key_has_a_config_home(self):
+        from ait.config.runtime_env import CONTRACT_DEFAULTS, CONFIG_BACKED
+        missing = [k for k in CONTRACT_DEFAULTS
+                   if k not in self._EXEMPT and k not in CONFIG_BACKED]
+        assert not missing, (
+            f"trading keys without a config.yaml home: {missing} — add the "
+            "field to settings.py + config.yaml + CONFIG_BACKED, or document "
+            "an exemption")
+
+    def test_config_homes_exist_in_yaml_and_settings(self):
+        import yaml as _yaml
+        from ait.config.runtime_env import CONFIG_BACKED, REPO_ROOT
+        from ait.config.settings import load_settings
+        y = _yaml.safe_load((REPO_ROOT / "config.yaml").read_text())
+        st = load_settings(str(REPO_ROOT / "config.yaml"))
+        for key, (section, field) in CONFIG_BACKED.items():
+            assert field in (y.get(section) or {}), (
+                f"{key}: config.yaml [{section}] lacks '{field}'")
+            assert hasattr(getattr(st, section), field), (
+                f"{key}: settings.{section} lacks '{field}' (extra=forbid "
+                "would reject the yaml key)")
+
+    def test_yaml_bool_normalizes_to_contract_flag(self, monkeypatch):
+        import ait.config.runtime_env as m
+        monkeypatch.delenv("AIT_SKIP_MACRO_EVENTS", raising=False)
+        monkeypatch.setattr(m, "_yaml_cache", {"risk": {"skip_macro_events": False}})
+        assert m.contract_flag("AIT_SKIP_MACRO_EVENTS") is False
+        monkeypatch.setattr(m, "_yaml_cache", {"risk": {"skip_macro_events": True}})
+        assert m.contract_flag("AIT_SKIP_MACRO_EVENTS") is True
+
+    def test_config_values_match_live_operating_state(self):
+        """The yaml declarations added in R19c must equal what live actually
+        runs today — this change is about WHERE values live, not WHAT they are."""
+        from ait.config.settings import load_settings
+        st = load_settings("config.yaml")
+        assert st.backtest.wing_k == pytest.approx(1.6)
+        assert st.backtest.ic_min_credit_width == pytest.approx(0.10)
+        assert st.backtest.ic_min_credit == pytest.approx(0.70)
+        assert st.backtest.credit_loss_limit == pytest.approx(0.0)
+        assert st.risk.skip_macro_events is True

@@ -1198,3 +1198,22 @@ before it ever ran in the bot. Secrets are now excluded by section + field-name 
 with a test asserting no secret can enter the report. NOTE: those keys passed through this
 chat session - U10 (rotate Finnhub) now applies to ALL of them; rotate at the providers.
 Suite 1,173 green; smoke + type gates pass.
+
+## 2026-08-18 - R19c: CONFIG.YAML IS NOW THE OPERATING SOURCE FOR TRADING VALUES (user policy)
+User decision: "config must be the ONLY place with values that manage trading." Executed:
+every trading-economics contract key now has a config.yaml home visible to the operator -
+backtest.ic_min_credit_width (0.10), backtest.ic_min_credit (0.70),
+backtest.credit_loss_limit (0 = disabled per R6), risk.skip_macro_events (true) - joining
+backtest.wing_k (1.6). Resolution everywhere: explicit env override > config.yaml >
+CONTRACT_DEFAULTS (safety net only). Yaml booleans normalize to the contract's '1'/'0'.
+Values unchanged - this is about WHERE they live, not WHAT they are (test-pinned).
+DOCUMENTED EXCEPTIONS (each with a stated reason, enforced by test): KMP/OMP crash guards
+(process-level, must precede imports); AIT_MARKET_DATA_TYPE (broker data entitlement -
+deployment concern, flips at U6); AIT_ALLOW_UNDEFINED_RISK (INST-5 interlock, env-only ON
+PURPOSE so re-enabling naked risk is a deliberate act, not a config edit).
+ENFORCEMENT: test_every_trading_key_has_a_config_home fails if a future contract key lacks
+a config home; test_config_homes_exist_in_yaml_and_settings fails if yaml and settings
+drift; the R19 no-private-fallback scan still guards the reader side. Suite 1,177 green.
+REMAINING CONFIG DEBT: ~125 lower-tier literals from the R19 register (VIX credit-cap
+tiers, TP ladder copies in the engine, entry-window forks, param_spaces) - migrate
+opportunistically using these same homes; the register is the spec.
