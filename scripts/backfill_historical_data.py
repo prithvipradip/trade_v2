@@ -1,9 +1,12 @@
-"""Backfill historical 5-min bars AND daily implied-vol snapshots from IBKR.
+"""Backfill historical 5-min bars AND implied-vol OHLC bars from IBKR.
 
-Two modes:
-  --mode intraday  (default) — paginated 5-min bar backfill into intraday_prices
-  --mode iv        — daily OPTION_IMPLIED_VOLATILITY into daily_prices.implied_vol
-  --mode both      — run intraday then iv
+Modes:
+  --mode intraday     (default) — paginated 5-min bar backfill into intraday_prices
+  --mode iv           — daily OPTION_IMPLIED_VOLATILITY: close into
+                        daily_prices.implied_vol (feeds the live IV-rank path),
+                        full OHLC into daily_iv
+  --mode iv-intraday  — 5-min OPTION_IMPLIED_VOLATILITY OHLC into intraday_iv
+  --mode both         — run intraday then iv
 
 Usage:
     # Seed QQQ 5-min bars for the last 2 years:
@@ -229,13 +232,17 @@ async def _backfill_iv_symbol(
     pause_secs: float,
     dry_run: bool,
 ) -> int:
-    """Fetch daily OPTION_IMPLIED_VOLATILITY bars and store in daily_prices.implied_vol.
+    """Fetch daily OPTION_IMPLIED_VOLATILITY bars.
 
-    IBKR returns daily IV bars that correspond to the ATM 30-day IV estimate.
-    These are stored as update-only operations — only rows already present in
-    daily_prices (from the OHLCV path) get an implied_vol value.
+    IBKR returns these as real OHLC bars (start/high/low/last IV over the
+    day), not a single value. The last/close reading is upserted into
+    daily_prices.implied_vol (update-only — only rows already present from
+    the OHLCV path get a value; this feeds the live IV-rank pipeline, which
+    wants one reading per day same as it does for price Close). The full
+    OHLC is additionally stored in the dedicated daily_iv table for anyone
+    who needs the intraday-of-day IV range.
 
-    Returns the number of rows updated.
+    Returns the number of daily_prices rows updated.
     """
     import pandas as pd
     from ib_insync import Stock, util
@@ -254,6 +261,7 @@ async def _backfill_iv_symbol(
     # IBKR allows up to 1 Y per request for daily IV; chunk by year
     total_years = int(max(1, years))
     all_iv: dict[str, float] = {}
+    all_ohlc: dict[str, tuple[float, float, float, float]] = {}
 
     for year_idx in range(total_years):
         end_dt = datetime.now(tz=timezone.utc) - timedelta(days=year_idx * 365)
@@ -289,15 +297,17 @@ async def _backfill_iv_symbol(
             continue
 
         df = util.df(bars)
-        # The "close" field for OPTION_IMPLIED_VOLATILITY bars is the IV value
-        # (expressed as a decimal, e.g. 0.25 = 25%). The "date" field is the bar date.
-        if "date" in df.columns and "close" in df.columns:
+        # OPTION_IMPLIED_VOLATILITY bars are OHLC (start/high/low/last IV,
+        # decimals e.g. 0.25 = 25%), same as a price bar — not a scalar.
+        if {"date", "open", "high", "low", "close"}.issubset(df.columns):
             for _, row in df.iterrows():
                 try:
                     date_str = str(row["date"])[:10]
-                    iv_val = float(row["close"])
-                    if iv_val > 0:
-                        all_iv[date_str] = iv_val
+                    o, h, l, c = (float(row["open"]), float(row["high"]),
+                                  float(row["low"]), float(row["close"]))
+                    if c > 0:
+                        all_iv[date_str] = c
+                        all_ohlc[date_str] = (o, h, l, c)
                 except (ValueError, TypeError):
                     continue
 
@@ -306,13 +316,22 @@ async def _backfill_iv_symbol(
         if year_idx < total_years - 1:
             time.sleep(pause_secs)
 
-    if not all_iv or dry_run:
+    if (not all_iv) or dry_run:
         return 0
 
-    # Build Series and save
+    # Close-only series feeds the live daily_prices.implied_vol / IV-rank path.
     iv_series = pd.Series(all_iv, name="implied_vol")
     iv_series.index = pd.to_datetime(iv_series.index)
     iv_series = iv_series.sort_index()
+
+    # Full OHLC feeds the dedicated daily_iv table.
+    ohlc_df = pd.DataFrame.from_dict(
+        all_ohlc, orient="index", columns=["Open", "High", "Low", "Close"],
+    )
+    ohlc_df.index = pd.to_datetime(ohlc_df.index)
+    ohlc_df.sort_index(inplace=True)
+    bars_stored = store.save_daily_iv_bars(symbol, ohlc_df)
+    print(f"  [{symbol}] iv: {bars_stored} daily_iv OHLC rows stored")
 
     updated = store.save_daily_iv(symbol, iv_series)
     print(f"  [{symbol}] iv: {len(all_iv)} values fetched, {updated} daily_prices rows updated")
@@ -333,8 +352,9 @@ async def _backfill_intraday_iv_symbol(
 ) -> int:
     """Fetch 5-min OPTION_IMPLIED_VOLATILITY bars for one symbol.
 
-    Same chunking as the OHLCV intraday path (reuses _build_chunks), but
-    whatToShow=OPTION_IMPLIED_VOLATILITY and stored via save_intraday_iv.
+    Same chunking as the OHLCV intraday path (reuses _build_chunks). These
+    are real OHLC bars (start/high/low/last IV per 5-min window), stored in
+    full via save_intraday_iv_bars into the dedicated intraday_iv table.
     Returns total rows upserted.
     """
     import pandas as pd
@@ -383,12 +403,13 @@ async def _backfill_intraday_iv_symbol(
             continue
 
         df = util.df(bars)
-        # "close" is the IV value for OPTION_IMPLIED_VOLATILITY bars.
+        # OPTION_IMPLIED_VOLATILITY bars are OHLC, not a scalar close.
         df["date"] = pd.to_datetime(df["date"], utc=True)
-        iv_series = df.set_index("date")["close"].rename("implied_vol")
-        iv_series = iv_series[iv_series > 0]
+        df = df.set_index("date")[["open", "high", "low", "close"]]
+        df.columns = ["Open", "High", "Low", "Close"]
+        df = df[df["Close"] > 0]
 
-        stored = store.save_intraday_iv(symbol, iv_series, interval="5m")
+        stored = store.save_intraday_iv_bars(symbol, df, interval="5m")
         total_stored += stored
         print(f" → {len(bars)} bars fetched, {stored} rows upserted")
 
