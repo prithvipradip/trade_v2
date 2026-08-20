@@ -1217,3 +1217,14 @@ drift; the R19 no-private-fallback scan still guards the reader side. Suite 1,17
 REMAINING CONFIG DEBT: ~125 lower-tier literals from the R19 register (VIX credit-cap
 tiers, TP ladder copies in the engine, entry-window forks, param_spaces) - migrate
 opportunistically using these same homes; the register is the spec.
+
+## 2026-08-20 - R19d: VERDICT METRIC IS IRON-CONDOR-ONLY (user decision)
+The go-live gates now score IC closes exclusively (status.py; all-strategy line kept
+underneath for book honesty). Rationale: the mission is the IC edge question; the retired
+experiments were drowning the signal - the mixed record read -$451 at its worst and
+9W-7L/+$150.83 today, while the CONDOR record is 7 closes, 4W-3L, +$452.89, PF 3.91.
+Sharper still: ALL 3 condor losses came from the since-abolished 07-13 macro-event flatten
+and the lone early scratch-win from the since-removed trailing stop - under the CURRENT
+ruleset (hold-through, wide wings, touch-stop) the condor is 3-for-3, +$602.77. Those 3
+closes are the first entries of the verdict sample that actually test today's policy.
+Gate math unchanged (50 closes, PF>1.3); the clock now counts what the mission asks.

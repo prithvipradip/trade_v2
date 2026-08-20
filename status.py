@@ -196,17 +196,34 @@ def main() -> None:
         real = ("AND COALESCE(exit_reason_detailed,'') NOT LIKE '%migrated%' "
                 "AND COALESCE(exit_reason_detailed,'') NOT LIKE '%pending%' "
                 "AND COALESCE(exit_reason_detailed,'') NOT LIKE '%never_filled%'")
-        rows = con.execute(f"SELECT realized_pnl FROM trades WHERE status='closed' {real} "
+        # R19d (user decision 2026-08-20): the VERDICT METRIC is IRON CONDOR
+        # closes only. The mission (PLAN line 3) is the IC edge question; the
+        # retired experiments (straddle -575, long calls -132, strangles +378)
+        # answer nothing about it and were drowning the signal — the mixed
+        # record read -$451 at its worst while the condor itself was positive.
+        # The all-strategy line is kept underneath for book-level honesty.
+        rows = con.execute(f"SELECT realized_pnl, strategy FROM trades WHERE status='closed' {real} "
                            f"ORDER BY COALESCE(exit_time, entry_time)").fetchall()
         con.close()
-        n = len(rows)
-        gp = sum(r[0] for r in rows if r[0] > 0)
-        gl = abs(sum(r[0] for r in rows if r[0] < 0))
-        pf = "inf" if gl == 0 else f"{gp / gl:.2f}"
-        peak = dd = cum = 0.0
-        for r in rows:
-            cum += r[0]; peak = max(peak, cum); dd = max(dd, peak - cum)
-        print(f"  GO-LIVE GATES: closes {n}/50 | PF {pf} (>1.3) | maxDD ${dd:,.0f}")
+
+        def _stats(rs):
+            n = len(rs)
+            gp = sum(r[0] for r in rs if r[0] > 0)
+            gl = abs(sum(r[0] for r in rs if r[0] < 0))
+            pf = "inf" if gl == 0 else f"{gp / gl:.2f}"
+            w = sum(1 for r in rs if r[0] > 0)
+            peak = dd = cum = 0.0
+            for r in rs:
+                cum += r[0]; peak = max(peak, cum); dd = max(dd, peak - cum)
+            return n, w, sum(r[0] for r in rs), pf, dd
+
+        ic = [r for r in rows if r["strategy"] == "iron_condor"]
+        n, w, net, pf, dd = _stats(ic)
+        print(f"  GO-LIVE GATES (IRON CONDOR — the verdict metric): "
+              f"closes {n}/50 | {w}W-{n - w}L | net ${net:+,.2f} | PF {pf} (>1.3) | maxDD ${dd:,.0f}")
+        an, aw, anet, apf, add_ = _stats(rows)
+        print(f"  all strategies (book-level, incl. retired experiments): "
+              f"{an} closes | {aw}W-{an - aw}L | net ${anet:+,.2f} | PF {apf}")
     except Exception:
         pass
     print("\n" + "=" * 56)
