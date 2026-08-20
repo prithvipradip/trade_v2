@@ -31,7 +31,11 @@ IRON_CONDOR_SPACE: dict[str, tuple] = {
     # Exp 18 (H1 test): stop_loss_pct, profit_target_pct, trailing_stop_fraction frozen at
     #   ablation defaults (0.35, 0.50, 0.70). These are risk-management constants that
     #   don't vary by market regime — optimising them per window overfit train-path noise.
-    #   Only the 3 regime-specific params + fractal gate + iv_rank gate remain in the search space (7 total).
+    #   Only the regime-specific params + fractal gate + iv_rank/edge gates remain in the
+    #   search space (8 total — R20: the old "7 total" note miscounted; also note that
+    #   until R20 the iv_rank_rise_threshold and min_edge_over_baseline dimensions never
+    #   reached the trial Backtester at all, so the Exp 26/28 training-side searches over
+    #   them were vacuous — see optimizer._run_backtest bt_kwargs invariant).
     "delta_short":            ("float", 0.15, 0.30),
     # [14, 40]: 60-day OOS windows give a 20-day end buffer (60-40=20), keeping
     # backtest_end exits rare while still allowing meaningful theta harvesting.

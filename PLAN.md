@@ -1228,3 +1228,36 @@ and the lone early scratch-win from the since-removed trailing stop - under the 
 ruleset (hold-through, wide wings, touch-stop) the condor is 3-for-3, +$602.77. Those 3
 closes are the first entries of the verdict sample that actually test today's policy.
 Gate math unchanged (50 closes, PF>1.3); the clock now counts what the mission asks.
+
+## 2026-08-20 - R20: RESEARCH APPARATUS FIXED + ENTRY_SIGNALS CAPTURE + REGISTER TIER-2
+THE HEADLINE, PROVEN BY A/B EXECUTION: the engine NEVER forwarded market_context into
+position building - a run with VIX 30 supplied and a run without were IDENTICAL (10
+trades each, entry IV = realized-vol x 1.15 synthetic). EVERY study this project ever ran
+- wing_k, shadow R1-R3, both ablations, floor sweep, touch-stop impact - priced its
+options WITHOUT VIX and WITHOUT the R18 per-symbol calibration. Post-fix: VIX 30 ->
+QQQ prices at 0.3684 = 0.30 x 1.228 (per-symbol multiplier finally engaged); SPY control
+at 0.30 (x1.00). Arm ORDERINGS remain the only trustworthy prior outputs (shared defect);
+every ABSOLUTE number is restated as measured-on-synthetic-vol. Next study is the first
+with an honest apparatus end to end.
+ALSO FIXED (agent, all proven fail-pre-fix, 30 new tests): Optuna searched 2 params that
+NEVER reached the trial engine (pure noise dimensions - the "best" values were arbitrary
+and walkforward applied them OOS anyway); train_window_models=False still trained AND
+applied the window meta-labeler (ablation contamination); phantom intraday knobs now
+actually forwarded; NEW shared authority ait/execution/exit_policy.py - the engine
+consumed a HAND-COPY of live's TP ladder/DTE-5/macro windows, now imports the shared
+module + a test executes live portfolio._get_take_profit_targets vs the policy so any
+future de-sync fails a test; entry-window fork resolved to config's 10:30 (engine/
+walkforward drift said 09:30); range/vol-mag training floor literal 100 ->
+ml.min_training_samples (mine - constructors take min_training_samples=None -> config).
+ENTRY_SIGNALS CAPTURE (mine, live path, gated x3): _scan_symbol stashes the entry-time
+feature row; _try_execute persists the 11 technical META_FEATURES + hour_of_day into
+trade_context.entry_signals - the column that was "{}" on EVERY trade ever taken, which
+is why the meta-labeler could never train (9/20 features). From the next entry, every
+close builds the training set. Degrades to "{}" safely; never blocks an entry.
+REGISTER TIER-2 (mine, pure relocations, semantics test-pinned identical): VIX-tiered
+credit caps -> risk.credit_cap_vix_tiers ([[20,6],[25,4],[999,2]]); symbol concentration
+0.20 -> risk.max_symbol_concentration_pct. Three test fixtures completed (mocked configs
+missing the new fields - the _FakeBreaker lesson again).
+Suite 1,210 green; type gate, smoke (13 checks), referee (0 BREAKS) all pass. Agent
+flagged for a follow-up: walkforward wing_k=1.0 dataclass default (pre-registered-
+comparison sensitive), optimizer baseline literals (stop 0.35, hurst, mf, max_hold 30).

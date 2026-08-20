@@ -401,7 +401,11 @@ class RiskManager:
             # book stay fully short premium into a rising-vol regime. Tiers:
             # VIX<20 -> 6, VIX<25 -> 4, else 2 (config remains the ceiling).
             # request.vix is guaranteed > 0 here (fail-closed gate above).
-            _vix_tier_cap = 6 if request.vix < 20 else (4 if request.vix < 25 else 2)
+            # R20 (register): tiers now live in config (risk.credit_cap_vix_tiers)
+            # with the historical values as the default — behavior unchanged.
+            _vix_tier_cap = next(
+                (int(cap) for ceiling, cap in self._risk_config.credit_cap_vix_tiers
+                 if request.vix < float(ceiling)), 2)
             _credit_cap = min(self._risk_config.max_credit_positions, _vix_tier_cap)
             n_credit = sum(
                 1 for p in self._open_positions
@@ -530,7 +534,7 @@ class RiskManager:
         # strategies, not real risk) -- now the same max_loss/backfill
         # sourcing gate 6b-2's aggregate cap uses.
         symbol_exposure = self._symbol_capital_at_risk(request.symbol)
-        if (symbol_exposure + estimated_cost) > account_value * 0.20:
+        if (symbol_exposure + estimated_cost) > account_value * self._risk_config.max_symbol_concentration_pct:
             return TradeValidation(
                 False,
                 f"symbol concentration: {request.symbol} exposure "

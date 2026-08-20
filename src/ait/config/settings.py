@@ -81,6 +81,18 @@ class RiskConfig(_StrictModel):
                     "delta gate is dead and the daily breaker only sees "
                     "realized P&L, so without this the whole book can be "
                     "short vol into a gap (audit R2).")
+    credit_cap_vix_tiers: list[list[float]] = Field(
+        default=[[20.0, 6], [25.0, 4], [999.0, 2]],
+        description="R20: VIX-tiered credit-position caps as [vix_below, cap] "
+                    "pairs, first match wins — config home for the hardcoded "
+                    "'6 if vix<20 else 4 if vix<25 else 2' in manager.py "
+                    "(register CD item). max_credit_positions stays the "
+                    "absolute ceiling.")
+    max_symbol_concentration_pct: float = Field(default=0.20, ge=0.05, le=0.50,
+        description="R20: max fraction of account in ONE symbol (gate 6c) — "
+                    "was a hardcoded 0.20 that numerically shadowed "
+                    "positions.max_portfolio_risk_pct while meaning something "
+                    "different.")
     skip_macro_events: bool = Field(default=True,
         description="R19c: macro-event protection (entry gates + rule-3d "
                     "flatten for undefined-risk shapes). Config home for "

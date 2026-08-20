@@ -224,3 +224,46 @@ class TestConfigIsTheOperatingSource:
         assert st.backtest.ic_min_credit == pytest.approx(0.70)
         assert st.backtest.credit_loss_limit == pytest.approx(0.0)
         assert st.risk.skip_macro_events is True
+
+
+class TestR20LiveRegisterMigrations:
+    """R20: two live-side register items moved into config as PURE
+    relocations — semantics identical, ownership changed."""
+
+    def test_vix_tier_semantics_unchanged(self):
+        from ait.config.settings import RiskConfig
+        tiers = RiskConfig().credit_cap_vix_tiers
+        def cap(v):
+            return next((int(c) for ceil, c in tiers if v < float(ceil)), 2)
+        # the exact historical mapping the literal implemented
+        assert (cap(15.0), cap(19.9), cap(20.0), cap(24.9), cap(25.0), cap(40.0)) \
+            == (6, 6, 4, 4, 2, 2)
+
+    def test_manager_reads_config_not_literals(self):
+        import inspect
+        from ait.risk import manager
+        src = inspect.getsource(manager)
+        assert "credit_cap_vix_tiers" in src
+        assert "max_symbol_concentration_pct" in src
+        # the old literals must be gone from the validation path
+        assert "6 if request.vix < 20" not in src
+        assert "account_value * 0.20" not in src
+
+    def test_entry_signals_capture_shape(self):
+        """R20: trade_context.entry_signals must carry the 11 technical
+        META_FEATURES + hour_of_day (was '{}' on every trade ever taken)."""
+        import json
+        import pandas as pd
+        from ait.bot.orchestrator import TradingOrchestrator as T
+        from ait.ml.meta_label import META_FEATURES
+        o = T.__new__(T)
+        tech = [f for f in META_FEATURES if f not in (
+            "primary_confidence", "regime_trending_up", "regime_trending_down",
+            "regime_high_vol", "regime_range_bound", "vix", "iv_rank",
+            "sentiment_score", "hour_of_day")]
+        o._entry_feature_snap = {"QQQ": pd.Series({t: 1.0 for t in tech})}
+        d = json.loads(o._entry_signals_json("QQQ"))
+        assert set(d) == set(tech) | {"hour_of_day"}
+        # degradation paths never block an entry
+        assert o._entry_signals_json("SPY") == "{}"
+        assert T.__new__(T)._entry_signals_json("QQQ") == "{}"

@@ -348,6 +348,7 @@ class TestPreEventBlackoutRelaxed:
         bt = Backtester.__new__(Backtester)
         bt._touch_stop_enabled = False        # rule 0 out of the way
         bt._credit_loss_limit_mult = 0.0      # rule 1 disabled (live parity)
+        bt._exit_time_decay_scaling = True    # R20: shared exit_policy ladder flag
         cal = MagicMock()
         cal.days_until_next_event.return_value = d2e
         bt._economic_cal = cal

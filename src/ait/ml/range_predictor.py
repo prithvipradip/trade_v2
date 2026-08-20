@@ -70,12 +70,22 @@ class RangePredictor:
 
     def __init__(
         self,
+        # R20: config-backed training floor (was a hardcoded 100 that
+        # shadowed ml.min_training_samples). None -> the config value.
+        min_training_samples: int | None = None,
         threshold_pct: float = 0.05,
         horizon_days: int = 30,
         ensemble_weights: dict[str, float] | None = None,
         min_edge_over_baseline: float = 0.05,
         model_dir: "Path | str | None" = None,
     ) -> None:
+        if min_training_samples is None:
+            try:
+                from ait.config.settings import MLConfig
+                min_training_samples = MLConfig().min_training_samples
+            except Exception:  # noqa: BLE001 — never block construction
+                min_training_samples = 100
+        self._min_training_samples = int(min_training_samples)
         self._threshold = threshold_pct
         self._horizon = horizon_days
         # Artifact directory — live default is models/. Research callers
@@ -179,8 +189,8 @@ class RangePredictor:
             df, market_context=market_context,
             intraday_store=intraday_store, symbol=symbol,
         )
-        if len(features) < 100:  # Need at least 100 rows for binary classification
-            log.warning("range_insufficient_data", rows=len(features), required=100)
+        if len(features) < self._min_training_samples:  # Need at least 100 rows for binary classification
+            log.warning("range_insufficient_data", rows=len(features), required=self._min_training_samples)
             return {}
 
         # Create binary labels

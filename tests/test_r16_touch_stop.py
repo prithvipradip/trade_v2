@@ -36,6 +36,9 @@ def _bt(**kw):
     bt._credit_loss_limit_mult = 0.0
     bt._touch_stop_enabled = kw.get("touch", True)
     bt._economic_cal = None
+    # R20: the exit path now reads the shared exit_policy ladder with live's
+    # time_decay_scaling flag — bare fixtures must model it like live (True).
+    bt._exit_time_decay_scaling = True
     return bt
 
 

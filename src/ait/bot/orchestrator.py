@@ -1176,6 +1176,22 @@ class TradingOrchestrator:
         from ait.ml.features import FeatureEngine
         features_df = FeatureEngine().compute(hist)
 
+        # R20: stash the entry-time feature row per symbol so _try_execute can
+        # persist it into trade_context.entry_signals. That column has been
+        # "{}" for EVERY trade ever taken, which means 11 of the meta-labeler's
+        # 20 features were never captured — the "meta-labeler at 50 closes"
+        # milestone was unreachable and nobody knew until the R19 coverage
+        # guard refused to train on 9/20 features. Every close without this
+        # is training data lost forever.
+        try:
+            if not features_df.empty:
+                _snap = getattr(self, "_entry_feature_snap", None)
+                if _snap is None:
+                    _snap = self._entry_feature_snap = {}
+                _snap[symbol] = features_df.iloc[-1]
+        except Exception:  # noqa: BLE001 — telemetry must never break a scan
+            pass
+
         # Fractal regime confidence penalty (Gap Z5): mirrors backtest engine logic.
         # If hurst_scale_spread or multifractal_width indicate chaotic fractal regime,
         # penalise confidence by hurst_regime_penalty so the live bot is as conservative
@@ -2060,6 +2076,12 @@ class TradingOrchestrator:
                 vix=await self._market_data.get_vix() or 0,
                 iv_rank=signal.iv_rank if hasattr(signal, "iv_rank") else 0,
                 sentiment_score=sentiment.composite_score if sentiment and hasattr(sentiment, "composite_score") else 0,
+                # R20: the 11 technical META_FEATURES, captured at entry. This
+                # column was "{}" on every trade ever taken — the meta-labeler
+                # could never train (9/20 features) and every close without it
+                # is training data lost. Snapshot comes from this scan cycle's
+                # feature frame (stashed in _scan_symbol minutes earlier).
+                signals=self._entry_signals_json(signal.symbol),
                 model_version=getattr(self._predictor, "model_version", "") or "",
             )
 
@@ -2540,6 +2562,37 @@ class TradingOrchestrator:
         # R17: tag with trade_id for exact reconciler matching.
         order.orderRef = trade.trade_id
         return await self._ibkr.place_order(qualified, order)
+
+    def _entry_signals_json(self, symbol: str) -> str:
+        """R20: serialize the 11 technical META_FEATURES for trade_context.
+
+        Values come from the feature row stashed by _scan_symbol this cycle
+        (same frame the ML gates read), plus hour_of_day stamped here. Only
+        finite numerics are written; a missing/stale snapshot degrades to
+        "{}" exactly as before — never blocks an entry.
+        """
+        import json as _json
+        import math as _math
+        try:
+            row = (getattr(self, "_entry_feature_snap", None) or {}).get(symbol)
+            if row is None:
+                return "{}"
+            from ait.ml.meta_label import META_FEATURES
+            out: dict[str, float] = {}
+            for name in META_FEATURES:
+                if name == "hour_of_day":
+                    out[name] = float(datetime.now().hour)
+                    continue
+                if name in getattr(row, "index", ()):
+                    try:
+                        v = float(row[name])
+                        if _math.isfinite(v):
+                            out[name] = round(v, 6)
+                    except (TypeError, ValueError):
+                        pass
+            return _json.dumps(out) if out else "{}"
+        except Exception:  # noqa: BLE001 — telemetry must never block an entry
+            return "{}"
 
     def _marked_cost_to_close(self, trade: TradeRecord) -> float | None:
         """Per-share cost to close a CREDIT structure per the monitor's marks.

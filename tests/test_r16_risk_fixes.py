@@ -276,7 +276,10 @@ class TestAggregateRiskBackfill:
                                          max_portfolio_risk_pct=0.03,
                                          max_portfolio_delta=0.30)
         rm._risk_config = _risk_cfg(max_position_risk_pct=0.03,
-                                    credit_vix_halt=28.0, max_credit_positions=6)
+                                    credit_vix_halt=28.0, max_credit_positions=6,
+                                    # R20: config-backed since the register migration
+                                    credit_cap_vix_tiers=[[20.0, 6], [25.0, 4], [999.0, 2]],
+                                    max_symbol_concentration_pct=0.20)
         cb = MagicMock()
         cb.is_tripped = False
         cb.check_daily_loss.return_value = True

@@ -93,6 +93,16 @@ class StrategyOptimizer:
         min_trades: int = 10,
         max_concurrent_positions: int = 1,
         max_entry_vol_annual: float = 0.80,
+        # R20 #2: baseline values for the two iron_condor gate params Optuna
+        # searches (param_spaces Exp 26/28). They were absent from bt_kwargs,
+        # and the trial-override loop only applies params already present
+        # there — so both suggestions were silently DROPPED every trial: the
+        # objective was flat noise along those dimensions while walkforward
+        # still applied the arbitrary "best" values OOS. Threaded from the
+        # caller (walkforward passes its config) like wing_k/iv_floor;
+        # defaults match the engine's.
+        iv_rank_rise_threshold: float = 0.30,
+        min_edge_over_baseline: float = 0.05,
         seed: int = 42,
         intraday_store: "Any | None" = None,
         symbol: str | None = None,
@@ -122,6 +132,8 @@ class StrategyOptimizer:
         self._min_trades = min_trades
         self._max_concurrent_positions = max_concurrent_positions
         self._max_entry_vol_annual = max_entry_vol_annual
+        self._iv_rank_rise_threshold = iv_rank_rise_threshold
+        self._min_edge_over_baseline = min_edge_over_baseline
         self._seed = seed
         self._intraday_store = intraday_store
         self._symbol = symbol
@@ -321,6 +333,13 @@ class StrategyOptimizer:
         # Extract Backtester-compatible params (drop strategy__ prefix).
         # Only parameters that Backtester.__init__ actually accepts are included
         # so Optuna optimises values that genuinely influence the objective.
+        # R20 #2 INVARIANT: every param a STRATEGY_SPACES entry searches MUST
+        # have a baseline key here (or a derived-param handler below) — the
+        # override loop applies a trial suggestion only when its bare name is
+        # already present, so a missing key silently turns that search
+        # dimension into noise (iv_rank_rise_threshold /
+        # min_edge_over_baseline were dropped this way for every Exp 26/28
+        # trial). test_r20_research_validity pins the full-space coverage.
         bt_kwargs: dict[str, Any] = {
             "initial_capital":       self._initial_capital,
             "stop_loss_pct":         0.35,
@@ -341,6 +360,8 @@ class StrategyOptimizer:
             "hurst_regime_threshold":    0.20,
             "hurst_regime_penalty":      0.10,
             "multifractal_max_width":    0.50,
+            "iv_rank_rise_threshold":    self._iv_rank_rise_threshold,
+            "min_edge_over_baseline":    self._min_edge_over_baseline,
         }
         # Override with trial params that match Backtester signatures
         for key, val in params.items():

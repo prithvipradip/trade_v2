@@ -25,6 +25,10 @@ from ait.backtesting.pricing import (
     realized_vol,
 )
 from ait.backtesting.result import BacktestResult
+# R20 #5a: credit TP ladder / DTE close / macro-flatten windows come from the
+# shared exit-policy module (pure, import-light) instead of a hand copy of
+# live portfolio.py — a live tuning can no longer silently de-sync research.
+from ait.execution import exit_policy
 from ait.strategies.base import CREDIT_STRATEGIES, SignalDirection
 from ait.utils.logging import get_logger
 from ait.config.runtime_env import contract_flag, contract_float  # R19: ONE authority for env-contract defaults
@@ -108,12 +112,21 @@ class Backtester:
         # Earnings-aware skip (Gap Z4): if symbol is given, skip entries near earnings dates
         symbol: str | None = None,
         earnings_skip_days: int = 2,
-        # Intraday engine (Fix 1): 5-min execution loop
+        # Intraday engine (Fix 1): 5-min execution loop.
+        # R20 #4/#5b: None -> resolve from load_settings().backtest (config.yaml
+        # authority; BacktestConfig defaults when no config is reachable). The
+        # engine used to hardcode '09:30' while BacktestConfig declares '10:30'
+        # — the documented Fix 1/Gap H parity value that
+        # scripts/export_production_params.py reports as production parity —
+        # so every intraday-gated study traded a window the config contract
+        # says is forbidden, and the exported params lied about it. '10:30'
+        # (skip open volatility) is the historically correct value; '09:30'
+        # was constructor drift.
         intraday_store: Any = None,
-        scan_interval_minutes: int = 60,
-        entry_window_start_et: str = "09:30",
-        entry_window_end_et: str = "15:30",
-        limit_order_timeout_bars: int = 3,
+        scan_interval_minutes: int | None = None,
+        entry_window_start_et: str | None = None,
+        entry_window_end_et: str | None = None,
+        limit_order_timeout_bars: int | None = None,
         # Per-window MetaLabeler for OOS signal filtering (Gap Z1)
         meta_labeler: Any = None,
         # H2 val-split: skip new entries before this date (full df still used for feature warmup)
@@ -212,10 +225,49 @@ class Backtester:
             self._load_calibrated_spreads()
         self._earnings_dates: set[date] = self._load_earnings_dates(symbol, earnings_skip_days)
         self._intraday_store = intraday_store
-        self._scan_interval_minutes = scan_interval_minutes
-        self._entry_window_start_et = entry_window_start_et
-        self._entry_window_end_et = entry_window_end_et
-        self._limit_order_timeout_bars = limit_order_timeout_bars
+        # R20: resolve LOADED settings once for every config-backed knob below
+        # (extends the R16 #7 pre_event_blackout_days pattern). Each consumer
+        # guards its own attribute access so a partial stub or a missing
+        # config.yaml degrades to that field's config-model default.
+        try:
+            from ait.config.settings import load_settings as _ls
+            _settings = _ls()
+        except Exception:  # noqa: BLE001 — no config.yaml -> per-field defaults
+            _settings = None
+        # R20 #4/#5b: intraday execution knobs — ONE source (settings.backtest,
+        # config.yaml-backed). Explicit constructor args still win.
+        try:
+            _bt_cfg = _settings.backtest
+        except Exception:  # noqa: BLE001
+            _bt_cfg = None
+        if _bt_cfg is None:
+            from ait.config.settings import BacktestConfig as _BTC
+            _bt_cfg = _BTC()
+        self._scan_interval_minutes = (
+            int(scan_interval_minutes) if scan_interval_minutes is not None
+            else int(_bt_cfg.scan_interval_minutes)
+        )
+        self._entry_window_start_et = (
+            str(entry_window_start_et) if entry_window_start_et is not None
+            else str(_bt_cfg.entry_window_start_et)
+        )
+        self._entry_window_end_et = (
+            str(entry_window_end_et) if entry_window_end_et is not None
+            else str(_bt_cfg.entry_window_end_et)
+        )
+        self._limit_order_timeout_bars = (
+            int(limit_order_timeout_bars) if limit_order_timeout_bars is not None
+            else int(_bt_cfg.limit_order_timeout_bars)
+        )
+        # R20 #5a: live's TP ladder is gated by exit.time_decay_scaling
+        # (portfolio.py _get_take_profit_targets); the engine ran the ladder
+        # unconditionally, so flipping the flag moved live to flat 0.50
+        # targets while research kept the ladder.
+        try:
+            self._exit_time_decay_scaling = bool(_settings.exit.time_decay_scaling)
+        except Exception:  # noqa: BLE001 — no config -> ExitConfig default
+            from ait.config.settings import ExitConfig as _EC
+            self._exit_time_decay_scaling = bool(_EC().time_decay_scaling)
         self._meta_labeler = meta_labeler
         self._eval_start_date = eval_start_date
 
@@ -260,9 +312,10 @@ class Backtester:
             self._pre_event_blackout_days = int(pre_event_blackout_days)
         else:
             try:
-                from ait.config.settings import load_settings as _ls
+                # R20: _settings resolved once above (same load_settings()
+                # source live reads; same fallback semantics as before).
                 self._pre_event_blackout_days = int(
-                    _ls().risk.pre_event_blackout_days
+                    _settings.risk.pre_event_blackout_days
                 )
             except Exception:  # noqa: BLE001 — no config.yaml -> config default
                 from ait.config.settings import RiskConfig as _RC
@@ -727,7 +780,16 @@ class Backtester:
                     if not filled:
                         continue  # Limit order expired without fill — skip entry
 
-            pos = self._build_position(strategy, direction, row, hist, today_date, capital)
+            # R20 #1: run() has had self._market_context all along (walkforward
+            # passes the window-aligned VIX/SPY frames) but never forwarded it
+            # here, so _get_iv's priority-2 VIX branch and the R16 per-symbol
+            # vol calibration (VXN/VIX 1.228 QQQ, 1.33 IWM) were DEAD at
+            # entry-pricing time — every study priced entries off the
+            # priority-3 synthetic fallback realized_vol*1.15.
+            pos = self._build_position(
+                strategy, direction, row, hist, today_date, capital,
+                market_context=self._market_context,
+            )
             if pos is None:
                 continue
 
@@ -1156,7 +1218,10 @@ class Backtester:
         Low IV → prefer debit strategies (buy cheap premium)
         """
         available = set(self._strategies)
-        iv = self._get_iv(hist)
+        # R20 #1: a bare, context-free IV-estimation call sat here with its
+        # result UNUSED — dead code that invited a future reader to assume
+        # selection was VIX-aware. Removed rather than context-threaded: the
+        # regime proxy below is realized-vol based.
 
         # IV rank proxy: compare current IV to its range
         close_arr = hist["Close"].values
@@ -2166,24 +2231,18 @@ class Backtester:
         return self._check_exit_fixed(pos, pnl_pct, current_date)
 
     @staticmethod
-    def _credit_take_profit_pct(dte: int | None) -> float:
+    def _credit_take_profit_pct(dte: int | None, time_decay_scaling: bool = True) -> float:
         """DTE-laddered take-profit target as a fraction of credit received.
 
-        Mirrors the SHORT side of src/ait/execution/portfolio.py
-        _get_take_profit_targets() exactly (time_decay_scaling=True is the
-        live default; dte=None falls back to the live 0.50 default):
-            DTE > 20  -> 0.50
-            DTE 11-20 -> 0.40
-            DTE 6-10  -> 0.30
-            DTE <= 5  -> 0.20
+        R20 #5a: the ladder (0.50/0.40/0.30/0.20 + breakpoints) used to be a
+        hand copy of portfolio.py _get_take_profit_targets — now imported from
+        the shared ait.execution.exit_policy authority. Stays a staticmethod
+        with a defaulted flag because run_backtest.py calls it UNBOUND for its
+        drift-check table; the exit path passes self._exit_time_decay_scaling.
         """
-        if dte is None or dte > 20:
-            return 0.50
-        elif dte > 10:
-            return 0.40
-        elif dte > 5:
-            return 0.30
-        return 0.20
+        return exit_policy.credit_take_profit_pct(
+            dte, time_decay_scaling=time_decay_scaling
+        )
 
     def _check_exit_credit(self, pos: dict, pnl_pct: float, current_date: date,
                            row: pd.Series | None = None) -> dict | None:
@@ -2237,40 +2296,37 @@ class Backtester:
         if self._credit_loss_limit_mult > 0 and pnl_pct <= -self._credit_loss_limit_mult:
             return {"exit_date": str(current_date), "exit_reason": "credit_loss_limit"}
 
-        # 2. DTE-laddered take-profit (portfolio._get_take_profit_targets)
-        if pnl_pct >= self._credit_take_profit_pct(remaining_dte):
+        # 2. DTE-laddered take-profit (shared exit_policy ladder — R20 #5a
+        # also honors exit.time_decay_scaling exactly as live does; the flag
+        # off collapses to live's flat 0.50 short target).
+        if pnl_pct >= self._credit_take_profit_pct(
+                remaining_dte, self._exit_time_decay_scaling):
             return {"exit_date": str(current_date), "exit_reason": "take_profit_short"}
 
-        # 3. Expiry-approaching close — live closes any position at DTE<=5
-        # (portfolio.py rule 3a; rule 3 assignment risk at DTE<=1 is subsumed).
-        if remaining_dte <= 5:
+        # 3. Expiry-approaching close — live closes any position at
+        # DTE <= exit_policy.EXPIRY_APPROACHING_DTE (portfolio.py rule 3a;
+        # rule 3 assignment risk at DTE<=1 is subsumed).
+        if remaining_dte <= exit_policy.EXPIRY_APPROACHING_DTE:
             reason = "expiry" if current_date >= expiry else "expiry_approaching"
             return {"exit_date": str(current_date), "exit_reason": reason}
 
         # 4. Macro-event flatten (portfolio.py rule 3d parity). PLAN
         # 2026-08-04: defined-risk EXEMPT — condors hold through events
         # (wings cap the surprise; the vol crush is the payoff). Only
-        # undefined/assignment-risk strategies keep the early exit
-        # (strangles/jade_lizard <=5 days, CSP/CC <=1). 2026-only calendar:
-        # inactive for pre-2026 windows.
-        # R16: jade_lizard was missing here. The "wings cap the surprise"
-        # rationale is untrue for its NAKED short put — built max_loss_per_share
-        # is ~93.7 on a $100 underlying vs ~12.8 for the condors — so it was
-        # holding through FOMC/CPI/NFP while short_strangle (same put-side
-        # assignment/tail risk) flattened 5 days out, inflating the jade arm's
-        # relative PF on exactly the highest-variance days.
+        # undefined/assignment-risk strategies keep the early exit.
+        # R20 #5a: the strategy list AND per-strategy windows (strangle-class
+        # 5 days, CSP/CC 1) come from the shared exit_policy table — the R16
+        # jade_lizard omission was exactly the hand-copy drift this kills.
+        # 2026+2027-H1 calendar: inactive for pre-2026 windows.
+        _flat_window = exit_policy.macro_flatten_window_days(pos.get("strategy"))
         if (self._economic_cal is not None
                 and contract_flag("AIT_SKIP_MACRO_EVENTS")
-                and pos.get("strategy") in (
-                    "short_strangle", "jade_lizard",
-                    "cash_secured_put", "covered_call")):
+                and _flat_window is not None):
             try:
                 _d2e = self._economic_cal.days_until_next_event(current_date)
             except Exception:  # noqa: BLE001
                 _d2e = None
-            _evt_window = 5 if pos.get("strategy") in (
-                "short_strangle", "jade_lizard") else 1
-            if _d2e is not None and _d2e <= _evt_window:
+            if _d2e is not None and _d2e <= _flat_window:
                 return {"exit_date": str(current_date), "exit_reason": "macro_event_flatten"}
 
         return None
