@@ -146,7 +146,13 @@ class TradingOrchestrator:
 
         # Trading
         self._strategy_selector = StrategySelector(settings.options)
-        self._executor = TradeExecutor(ibkr_client, self._state, self._circuit_breaker)
+        # R20 (register): hand the executor the loaded settings so its
+        # spread-reject gate reads options.max_bid_ask_spread_pct instead of
+        # its 0.15 fallback — the last dormant piece of the R19 config
+        # binding. Dormant today (IC-only), armed the day a single-leg
+        # strategy is re-enabled.
+        self._executor = TradeExecutor(ibkr_client, self._state,
+                                       self._circuit_breaker, settings=settings)
         self._portfolio = PortfolioManager(
             ibkr_client, self._market_data, self._state,
             self._circuit_breaker, self._pdt_guard,
