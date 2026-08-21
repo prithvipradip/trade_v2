@@ -67,6 +67,12 @@ class Backtester:
         self,
         data: pd.DataFrame,
         strategies: list[str],
+        # R20b: initial_capital (and max_concurrent_positions below) stay
+        # EXPLICIT constructor defaults per the pre-registration — they are
+        # test-harness sizing knobs, not strategy economics: every research
+        # entry point (walkforward, optimizer, run_backtest) passes its own
+        # capital, and a $10k bare-engine default cannot bias a comparison
+        # the way a divergent gate threshold can.
         initial_capital: float = 10_000.0,
         commission_per_contract: float = 0.65,
         slippage_pct: float = 0.01,
@@ -74,17 +80,27 @@ class Backtester:
         stop_loss_pct: float = 0.50,
         profit_target_pct: float = 1.00,
         max_hold_days: int = 30,
-        min_confidence: float = 0.55,
+        # R20b (pre-registered PLAN 2026-08-21): was 0.55, silently shadowing
+        # the config with a DIFFERENT value. None -> resolve from
+        # load_settings().risk.min_confidence (yaml 0.50). See the resolution
+        # block below for why risk.min_confidence is the documented home.
+        min_confidence: float | None = None,
         trailing_stop_enabled: bool = False,
         trailing_stop_pct: float = 0.25,
         breakeven_trigger_pct: float = 0.30,
         predictor: Any = None,
         range_predictor: Any = None,
-        range_min_confidence: float = 0.55,
+        # R20b: was 0.55 vs live's ml.range_min_confidence = 0.65 (config.yaml;
+        # 0.65 beat 0.55 across every backtest metric) — the parity gap the
+        # floor sweep exposed. None -> resolve from load_settings().ml.
+        range_min_confidence: float | None = None,
         context_bars: int = 0,
         delta_short: float = 0.20,
         delta_long: float = 0.30,
-        iv_floor: float = 0.12,
+        # R20b: was 0.12 vs config.yaml backtest.iv_floor = 0.20 — a bare
+        # engine priced systematically thinner credits than every configured
+        # path. None -> resolve from load_settings().backtest.iv_floor.
+        iv_floor: float | None = None,
         # R6 parity: live iron_condor._vol_scaled_width enforces min $2, not $5.
         wing_floor_dollars: float = 2.0,
         # R16 #8: None -> resolve env AIT_IC_WING_K (default 1.0), mirroring
@@ -100,6 +116,9 @@ class Backtester:
         pct_from_60d_high_threshold: float = -1.0,
         min_edge_over_baseline: float = 0.05,
         features_cache: pd.DataFrame | None = None,
+        # R20b: stays EXPLICIT (with initial_capital above) per the
+        # pre-registration — harness sizing knob; 1 = the original
+        # single-position semantics unit tests depend on.
         max_concurrent_positions: int = 1,
         max_entry_vol_annual: float = 0.80,
         # Options bid-ask spread model (per-leg, IV/DTE-aware)
@@ -189,19 +208,20 @@ class Backtester:
         self._stop_loss_pct = stop_loss_pct
         self._profit_target_pct = profit_target_pct
         self._max_hold_days = max_hold_days
-        self._min_confidence = min_confidence
+        # R20b: _min_confidence / _range_min_confidence / _iv_floor are
+        # resolved in the loaded-settings block below (they need _settings).
         self._trailing_stop_enabled = trailing_stop_enabled
         self._trailing_stop_pct = trailing_stop_pct
         self._breakeven_trigger_pct = breakeven_trigger_pct
         self._context_bars = context_bars
         self._range_predictor = range_predictor
-        self._range_min_confidence = range_min_confidence
         self._delta_short = delta_short
         self._delta_long = delta_long
-        self._iv_floor = iv_floor
         self._wing_floor_dollars = wing_floor_dollars
-        # R16 #8: mirror the live env resolution (iron_condor.py reads
-        # AIT_IC_WING_K, default 1.0) when wing_k is not explicitly configured.
+        # R16 #8: mirror the live resolution when wing_k is not explicitly
+        # configured (R19 contract: env AIT_IC_WING_K > config.yaml
+        # backtest.wing_k > CONTRACT_DEFAULTS 1.6 — the comment here used to
+        # say "default 1.0", stale since the 2026-08-04 promotion).
         self._wing_k = (
             float(wing_k) if wing_k is not None
             else contract_float("AIT_IC_WING_K")
@@ -259,6 +279,44 @@ class Backtester:
             int(limit_order_timeout_bars) if limit_order_timeout_bars is not None
             else int(_bt_cfg.limit_order_timeout_bars)
         )
+        # R20b (pre-registered PLAN 2026-08-21): the three constructor
+        # defaults that SHADOWED config with different values now resolve
+        # from the loaded settings (same pattern as the intraday knobs above;
+        # explicit constructor args always win; per-field guards degrade a
+        # partial stub / missing config.yaml to that field's config-model
+        # default):
+        #   iv_floor             0.12 -> settings.backtest.iv_floor      (yaml 0.20)
+        #   range_min_confidence 0.55 -> settings.ml.range_min_confidence (yaml 0.65)
+        #   min_confidence       0.55 -> settings.risk.min_confidence     (yaml 0.50)
+        # min_confidence's home is risk.min_confidence because the engine
+        # consumes it as the DIRECTIONAL-confidence entry gate (run():
+        # `confidence < effective_min_conf` skips the entry, with the
+        # neutral-credit bypass) — exactly the gate live reads from
+        # settings.risk.min_confidence (orchestrator.py `neutral_only =
+        # prediction.confidence < min_confidence`), and the production-params
+        # exporter already maps "min_confidence" -> ("risk", "min_confidence")
+        # (optimization/results.py). It is NOT ml.range_min_confidence (the
+        # range-gate floor, a separate knob resolved above).
+        self._iv_floor = (
+            float(iv_floor) if iv_floor is not None
+            else float(_bt_cfg.iv_floor)
+        )
+        if range_min_confidence is not None:
+            self._range_min_confidence = float(range_min_confidence)
+        else:
+            try:
+                self._range_min_confidence = float(_settings.ml.range_min_confidence)
+            except Exception:  # noqa: BLE001 — partial stub / no config -> model default
+                from ait.config.settings import MLConfig as _MLC
+                self._range_min_confidence = float(_MLC().range_min_confidence)
+        if min_confidence is not None:
+            self._min_confidence = float(min_confidence)
+        else:
+            try:
+                self._min_confidence = float(_settings.risk.min_confidence)
+            except Exception:  # noqa: BLE001 — partial stub / no config -> model default
+                from ait.config.settings import RiskConfig as _RC2
+                self._min_confidence = float(_RC2().min_confidence)
         # R20 #5a: live's TP ladder is gated by exit.time_decay_scaling
         # (portfolio.py _get_take_profit_targets); the engine ran the ladder
         # unconditionally, so flipping the flag moved live to flat 0.50

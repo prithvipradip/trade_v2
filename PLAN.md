@@ -1284,3 +1284,22 @@ reproduction protects disavowed numbers. REGISTERED CHANGE, before implementatio
 CONSEQUENCE ACCEPTED: re-running an OLD study script without explicit params now measures
 CURRENT config, not 2026-07 defaults. That is the point. Any historical reproduction must
 pass explicit values (the scripts we care about already do).
+
+## 2026-08-21 - R20b EXECUTED: research defaults now resolve from config (registration above)
+All four registered items landed (agent, 14 new tests, 9/14 proven fail-pre-fix):
+WalkForwardConfig wing_k/ic_min_credit_width/range_min_confidence -> None => contract/
+config resolution (bare config now resolves 1.6/0.10/0.65 — the 0.55 floor-sweep parity
+gap is closed at the source); engine iv_floor/range_min_confidence/min_confidence -> None
+=> load_settings() (min_confidence homed to risk.min_confidence — it IS live's directional
+gate, documented); optimizer trial baselines read config (5 NEW BacktestConfig fields:
+stop_loss_pct 0.35, profit_target_pct 0.50, max_hold_days 30, iv_rank_rise_threshold
+0.30, min_edge_over_baseline 0.05 + existing fractal fields wired; multifractal deviation:
+reused existing multifractal_max_width rather than forking a duplicate). Two stale test
+pins retired (they asserted the 1.0 literal this migration removes). Divergence report
+unchanged (12 pre-existing entries; new fields drop out naturally, test-pinned).
+Also closed this session: live TradeExecutor now receives settings (spread gate config-
+bound). Suite 1,224 green; type gate, smoke, referee all pass.
+RESIDUALS (named, bounded): run_backtest.py CLI argparse defaults re-freeze old values
+(stale env fallbacks 1.0/0.20/0.55) — ops-round item; bare StrategyOptimizer() without
+walkforward threading still defaults wing_k 1.0 (walk-forward path correct); dashboard
+export display literals (cosmetic). Tier-4 log/report strings RECLASSIFIED as not-config.

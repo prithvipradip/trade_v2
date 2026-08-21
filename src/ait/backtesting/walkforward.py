@@ -58,7 +58,12 @@ class WalkForwardConfig:
     slippage_pct: float = 0.03  # 3% realistic for multi-leg options
     position_size_pct: float = 0.05
     wing_floor_dollars: float = 2.0   # R6 parity: live iron_condor min wing is $2, not $5
-    wing_k: float = 1.0
+    # R20b (pre-registered PLAN 2026-08-21): was a hardcoded 1.0 — the frozen
+    # 2026-07 default that shadowed the PROMOTED live value (contract 1.6 since
+    # the 2026-08-04 wide-wing promotion). None -> __post_init__ resolves via
+    # contract_float("AIT_IC_WING_K"): env > config.yaml backtest.wing_k > 1.6.
+    # Explicit values always win.
+    wing_k: float | None = None
     # ML ABLATION (pre-registered PLAN 2026-08-03): False = gate-stack-only
     # arm — NO window models trained (direction AND range predictors both
     # read None) and the engine runs ungated (its designed fallback).
@@ -76,7 +81,13 @@ class WalkForwardConfig:
     profit_target_pct: float = 0.50         # Take profits at 50% (don't be greedy)
     max_hold_days: int = 21                 # 3 weeks max (avoid deep theta decay)
     min_confidence: float = 0.55
-    range_min_confidence: float = 0.55     # threshold for range model on iron condors
+    # R20b (pre-registered PLAN 2026-08-21): was a hardcoded 0.55 while live
+    # gates on ml.range_min_confidence = 0.65 (config.yaml; 0.65 beat 0.55
+    # across every backtest metric) — the parity gap the range-floor sweep
+    # exposed. None -> __post_init__ resolves load_settings().ml
+    # .range_min_confidence (MLConfig default 0.65 when no config.yaml is
+    # reachable). Explicit values always win.
+    range_min_confidence: float | None = None  # threshold for range model on iron condors
     trailing_stop_enabled: bool = True
     trailing_stop_pct: float = 0.25
     breakeven_trigger_pct: float = 0.30
@@ -117,7 +128,11 @@ class WalkForwardConfig:
     credit_loss_limit_mult: float | None = None   # env AIT_CREDIT_LOSS_LIMIT (live default 0
                                                   # = flat stop DISABLED; R12-B1 + R16 #6)
     ic_min_credit: float | None = None            # env AIT_IC_MIN_CREDIT (live $0.70)
-    ic_min_credit_width: float | None = None      # env AIT_IC_MIN_CREDIT_WIDTH (live 0.20)
+    # R20b: comment said "live 0.20" — stale since the 2026-08-04 promotion
+    # (contract 0.10). None -> __post_init__ resolves
+    # contract_float("AIT_IC_MIN_CREDIT_WIDTH"): env > config.yaml
+    # backtest.ic_min_credit_width > 0.10. Explicit values always win.
+    ic_min_credit_width: float | None = None      # env AIT_IC_MIN_CREDIT_WIDTH (live 0.10)
     macro_event_gate: bool = True                 # block credit entries pre macro event
                                                   # (2026+2027-H1 calendar; inactive earlier)
     pre_event_blackout_days: int | None = None    # R16 #7: None -> engine resolves from
@@ -133,6 +148,31 @@ class WalkForwardConfig:
                                           # process parallelism is the effective speedup path).
                                           # Set via --wf-n-jobs CLI flag (default: 1 = sequential).
     optimize_val_split: bool = False      # H2: score Optuna objective on held-out 20% val slice
+
+    def __post_init__(self) -> None:
+        """R20b (pre-registered PLAN 2026-08-21): research defaults migrate to
+        config resolution. R20 proved every prior absolute was priced without
+        volatility data, so protecting old-study reproduction protects
+        disavowed numbers — a bare WalkForwardConfig() now measures the
+        CURRENT operating contract, not frozen 2026-07 literals.
+
+        None is the sentinel meaning "resolve from the contract/config";
+        explicit values always win (a historical reproduction must pass them).
+        """
+        if self.wing_k is None:
+            from ait.config.runtime_env import contract_float
+            self.wing_k = contract_float("AIT_IC_WING_K")
+        if self.ic_min_credit_width is None:
+            from ait.config.runtime_env import contract_float
+            self.ic_min_credit_width = contract_float("AIT_IC_MIN_CREDIT_WIDTH")
+        if self.range_min_confidence is None:
+            try:
+                from ait.config.settings import load_settings
+                self.range_min_confidence = float(
+                    load_settings().ml.range_min_confidence
+                )
+            except Exception:  # noqa: BLE001 — no config.yaml -> model default
+                self.range_min_confidence = float(MLConfig().range_min_confidence)
 
 
 @dataclass
@@ -1237,9 +1277,15 @@ class WalkForwardBacktester:
             # None + threshold >= 1.0 blocks the entry instead of silently
             # skipping the gate.) "disabled_by_config" (R16 #4 ablation arm)
             # deliberately runs UNGATED at the configured threshold.
+            # R20b: stub-config fallback is the CONFIG contract
+            # (ml.range_min_confidence, default 0.65), no longer the retired
+            # 0.55 literal. Real WalkForwardConfigs resolve in __post_init__
+            # and never hit this fallback.
+            _cfg_range_min = getattr(window_cfg, "range_min_confidence", None)
+            if _cfg_range_min is None:
+                _cfg_range_min = float(MLConfig().range_min_confidence)
             _oos_range_min_conf = self._resolve_oos_range_min_conf(
-                range_predictor, _range_model_status,
-                getattr(window_cfg, "range_min_confidence", 0.55),
+                range_predictor, _range_model_status, _cfg_range_min,
             )
             if _oos_range_min_conf >= 1.0:
                 log.warning(

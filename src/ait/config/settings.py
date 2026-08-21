@@ -207,11 +207,40 @@ class BacktestConfig(_StrictModel):
         description="Maximum per-leg half-spread ($). Prevents unrealistic spread in stress regimes.")
     # Fractal regime params (Gap Z5) — also used by live orchestrator for parity with backtest
     hurst_regime_threshold: float = Field(default=0.20, ge=0.05, le=0.50,
-        description="Hurst scale-spread above which fractal confidence penalty is applied.")
+        description="Hurst scale-spread above which fractal confidence penalty is applied. "
+                    "R20b: also the optimizer's trial-baseline (was a 0.20 literal in bt_kwargs).")
     hurst_regime_penalty: float = Field(default=0.10, ge=0.0, le=0.30,
-        description="Confidence deducted when fractal regime is chaotic.")
+        description="Confidence deducted when fractal regime is chaotic. "
+                    "R20b: also the optimizer's trial-baseline (was a 0.10 literal in bt_kwargs).")
     multifractal_max_width: float = Field(default=0.50, ge=0.20, le=0.80,
-        description="Multifractal width above which fractal confidence penalty is applied.")
+        description="Multifractal width above which fractal confidence penalty is applied. "
+                    "R20b: also the optimizer's trial-baseline (was a 0.50 literal in "
+                    "bt_kwargs; the pre-registration named it multifractal_width_threshold "
+                    "— this EXISTING field is that knob, no duplicate was added).")
+    # R20b (pre-registered PLAN 2026-08-21): config homes for the optimizer's
+    # remaining non-searched engine baselines — they were frozen literals in
+    # StrategyOptimizer._run_backtest's bt_kwargs, so a config change could
+    # never reach a trial backtest. Defaults = the 2026-08-21 operating
+    # literals, and config.yaml declares the same values (no divergence).
+    stop_loss_pct: float = Field(default=0.35, ge=0.05, le=1.0,
+        description="R20b: baseline stop-loss as a fraction of position value for "
+                    "trial/engine backtests (options decay fast — cut at 35%). "
+                    "Optuna may search per window; this is the non-searched baseline.")
+    profit_target_pct: float = Field(default=0.50, ge=0.05, le=3.0,
+        description="R20b: baseline take-profit as a fraction of position value for "
+                    "trial/engine backtests (take profits at 50%). Optuna may search "
+                    "per window; this is the non-searched baseline.")
+    max_hold_days: int = Field(default=30, ge=1, le=120,
+        description="R20b: baseline maximum holding period (calendar days) before a "
+                    "trial/engine backtest force-closes a position.")
+    iv_rank_rise_threshold: float = Field(default=0.30, ge=0.0, le=10.0,
+        description="R20b: suppress iron-condor entry when IV rank rose more than "
+                    "this over the last 10 days (Exp 20 veto). Values > 1 disable "
+                    "the veto (IV rank is 0-1).")
+    min_edge_over_baseline: float = Field(default=0.05, ge=0.0, le=1.0,
+        description="R20b: minimum weighted CV edge over the base rate for the "
+                    "range predictor to activate as an entry gate (Exp 28 quality "
+                    "floor; 0.0 = always use the model).")
 
 
 class MLConfig(_StrictModel):

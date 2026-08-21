@@ -136,6 +136,18 @@ backtest:
   optimize_n_trials: 50               # Optuna trials per walk-forward window
   optimize_patience: 20               # Early stopping: halt after N consecutive non-improving trials (0=disabled)
   optimize_min_trades: 10             # Min trades for full score; < 3 → always −100; 3–9 → quadratic penalty
+  # R20b (pre-registered 2026-08-21): optimizer trial baselines moved from code
+  # literals into config — values below = the operating literals they replace.
+  stop_loss_pct: 0.35                 # Baseline stop-loss (fraction of position value)
+  profit_target_pct: 0.50            # Baseline take-profit (fraction of position value)
+  max_hold_days: 30                   # Baseline max holding period (calendar days)
+  iv_rank_rise_threshold: 0.30        # Veto IC entry when IV rank rose > this over 10d (Exp 20)
+  min_edge_over_baseline: 0.05        # Min range-model CV edge to activate the gate (Exp 28)
+  # R20b: yaml homes for the existing fractal-regime fields the optimizer now
+  # reads from loaded settings (previously 0.20/0.10/0.50 literals in bt_kwargs)
+  hurst_regime_threshold: 0.20        # Hurst scale-spread above which confidence penalty applies
+  hurst_regime_penalty: 0.10          # Confidence deducted in chaotic fractal regime
+  multifractal_max_width: 0.50        # Multifractal width above which confidence penalty applies
 
 ml:
   ensemble_weights:

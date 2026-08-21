@@ -263,9 +263,14 @@ class TestWalkForwardConfigOptimizer:
             cfg = WalkForwardConfig(optimize_n_trials=n)
             assert cfg.optimize_n_trials == n
 
-    def test_default_wing_k_is_1(self):
+    def test_default_wing_k_resolves_live_contract(self, monkeypatch):
+        # R20b (pre-registered PLAN 2026-08-21): was `== 1.0` — the frozen
+        # research literal. Bare configs now resolve the promoted contract
+        # value (env AIT_IC_WING_K > config.yaml backtest.wing_k > 1.6).
+        monkeypatch.delenv("AIT_IC_WING_K", raising=False)
         cfg = WalkForwardConfig()
-        assert cfg.wing_k == pytest.approx(1.0)
+        from ait.config.runtime_env import contract_float
+        assert cfg.wing_k == pytest.approx(contract_float("AIT_IC_WING_K")) == 1.6
 
     def test_wing_k_propagated_to_config(self):
         cfg = WalkForwardConfig(wing_k=0.5)

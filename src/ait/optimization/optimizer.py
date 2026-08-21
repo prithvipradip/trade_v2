@@ -99,10 +99,13 @@ class StrategyOptimizer:
         # there — so both suggestions were silently DROPPED every trial: the
         # objective was flat noise along those dimensions while walkforward
         # still applied the arbitrary "best" values OOS. Threaded from the
-        # caller (walkforward passes its config) like wing_k/iv_floor;
-        # defaults match the engine's.
-        iv_rank_rise_threshold: float = 0.30,
-        min_edge_over_baseline: float = 0.05,
+        # caller (walkforward passes its config) like wing_k/iv_floor.
+        # R20b (pre-registered PLAN 2026-08-21): defaults were literals
+        # (0.30 / 0.05); None now resolves from load_settings().backtest
+        # (iv_rank_rise_threshold / min_edge_over_baseline). Explicit caller
+        # values always win.
+        iv_rank_rise_threshold: float | None = None,
+        min_edge_over_baseline: float | None = None,
         seed: int = 42,
         intraday_store: "Any | None" = None,
         symbol: str | None = None,
@@ -132,8 +135,30 @@ class StrategyOptimizer:
         self._min_trades = min_trades
         self._max_concurrent_positions = max_concurrent_positions
         self._max_entry_vol_annual = max_entry_vol_annual
-        self._iv_rank_rise_threshold = iv_rank_rise_threshold
-        self._min_edge_over_baseline = min_edge_over_baseline
+        # R20b (pre-registered PLAN 2026-08-21): resolve the config-backed
+        # trial BASELINES once, from the same loaded settings live reads
+        # (mirrors Backtester's R20 None->load_settings pattern). These feed
+        # the non-searched engine params in _run_backtest's bt_kwargs, which
+        # were frozen literals — an operator/config change could never reach
+        # a trial backtest. Guarded so a missing config.yaml (or a partial
+        # stub in tests) degrades to the BacktestConfig field defaults.
+        try:
+            from ait.config.settings import load_settings as _ls
+            _bt_cfg = _ls().backtest
+        except Exception:  # noqa: BLE001 — no config.yaml -> field defaults
+            _bt_cfg = None
+        if _bt_cfg is None:
+            from ait.config.settings import BacktestConfig as _BTC
+            _bt_cfg = _BTC()
+        self._bt_baselines = _bt_cfg
+        self._iv_rank_rise_threshold = (
+            float(iv_rank_rise_threshold) if iv_rank_rise_threshold is not None
+            else float(_bt_cfg.iv_rank_rise_threshold)
+        )
+        self._min_edge_over_baseline = (
+            float(min_edge_over_baseline) if min_edge_over_baseline is not None
+            else float(_bt_cfg.min_edge_over_baseline)
+        )
         self._seed = seed
         self._intraday_store = intraday_store
         self._symbol = symbol
@@ -340,15 +365,21 @@ class StrategyOptimizer:
         # dimension into noise (iv_rank_rise_threshold /
         # min_edge_over_baseline were dropped this way for every Exp 26/28
         # trial). test_r20_research_validity pins the full-space coverage.
+        # R20b (pre-registered PLAN 2026-08-21): the frozen literals
+        # (stop_loss_pct 0.35 / profit_target_pct 0.50 / max_hold_days 30 /
+        # hurst 0.20+0.10 / multifractal 0.50) now come from
+        # load_settings().backtest (resolved once in __init__), so trial
+        # baselines track the operating config instead of 2026-07 snapshots.
+        _bl = self._bt_baselines
         bt_kwargs: dict[str, Any] = {
             "initial_capital":       self._initial_capital,
-            "stop_loss_pct":         0.35,
-            "profit_target_pct":     0.50,
+            "stop_loss_pct":         float(_bl.stop_loss_pct),
+            "profit_target_pct":     float(_bl.profit_target_pct),
             "min_confidence":        0.55,
             "position_size_pct":     self._position_size_pct,
             "trailing_stop_pct":     0.25,
             "breakeven_trigger_pct": 0.30,
-            "max_hold_days":         30,
+            "max_hold_days":         int(_bl.max_hold_days),
             "delta_short":           0.20,
             "delta_long":            0.30,
             "iv_floor":              self._iv_floor,
@@ -357,9 +388,9 @@ class StrategyOptimizer:
             "delta_iv_scale":            self._delta_iv_scale,
             "max_concurrent_positions":  self._max_concurrent_positions,
             "max_entry_vol_annual":      self._max_entry_vol_annual,
-            "hurst_regime_threshold":    0.20,
-            "hurst_regime_penalty":      0.10,
-            "multifractal_max_width":    0.50,
+            "hurst_regime_threshold":    float(_bl.hurst_regime_threshold),
+            "hurst_regime_penalty":      float(_bl.hurst_regime_penalty),
+            "multifractal_max_width":    float(_bl.multifractal_max_width),
             "iv_rank_rise_threshold":    self._iv_rank_rise_threshold,
             "min_edge_over_baseline":    self._min_edge_over_baseline,
         }
