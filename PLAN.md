@@ -1261,3 +1261,26 @@ missing the new fields - the _FakeBreaker lesson again).
 Suite 1,210 green; type gate, smoke (13 checks), referee (0 BREAKS) all pass. Agent
 flagged for a follow-up: walkforward wing_k=1.0 dataclass default (pre-registered-
 comparison sensitive), optimizer baseline literals (stop 0.35, hurst, mf, max_hold 30).
+
+## 2026-08-21 - R20b PRE-REGISTRATION: research defaults migrate to config resolution
+User: "can't we fix them?" — yes. The deferral reason (old-study comparability) is void:
+R20 proved every prior absolute was priced without volatility data, so protecting their
+reproduction protects disavowed numbers. REGISTERED CHANGE, before implementation:
+ 1. WalkForwardConfig.wing_k 1.0 -> None => resolve from the contract (env>config>1.6);
+    same for ic_min_credit_width and range_min_confidence (-> ml.range_min_confidence,
+    closing the 0.55-vs-0.65 parity gap the floor sweep exposed).
+ 2. Engine constructor defaults that shadow config with DIFFERENT values (iv_floor 0.12
+    vs 0.20, range_min_confidence 0.55 vs 0.65, min_confidence 0.55) -> None => resolve
+    from load_settings(); initial_capital/max_concurrent stay explicit (test-harness
+    knobs, documented).
+ 3. Optimizer baselines: hurst_regime_threshold/penalty read the EXISTING BacktestConfig
+    fields; stop_loss_pct (0.35), profit_target_pct, max_hold_days (30),
+    multifractal_width_threshold (0.50), iv_rank_rise_threshold (0.30),
+    min_edge_over_baseline (0.05) get NEW BacktestConfig fields with today's operating
+    values as defaults + config.yaml entries.
+ 4. Tier-4 reclassification: log strings/report formats are NOT config and will not be
+    migrated; genuinely config-ish tier-4 items (dashboard ports, DB paths) stay on the
+    register for an ops round.
+CONSEQUENCE ACCEPTED: re-running an OLD study script without explicit params now measures
+CURRENT config, not 2026-07 defaults. That is the point. Any historical reproduction must
+pass explicit values (the scripts we care about already do).
