@@ -86,7 +86,12 @@ class StrategyOptimizer:
         features_cache: "pd.DataFrame | None" = None,
         position_size_pct: float = 0.05,
         wing_floor_dollars: float = 5.0,
-        wing_k: float = 1.0,
+        # R20b review follow-up: was a hardcoded 1.0 that shadowed the
+        # promoted live/config value (1.6) for any direct optimizer caller
+        # (run_optimizer.py never overrides it) -- same defect class as the
+        # other frozen literals below. None resolves from _bt_cfg.wing_k
+        # (set below from load_settings().backtest) once _bt_cfg exists.
+        wing_k: float | None = None,
         iv_floor: float = 0.20,
         delta_iv_scale: float = 0.0,
         patience: int = 0,
@@ -114,6 +119,13 @@ class StrategyOptimizer:
         symbol: str | None = None,
         range_predictor: "Any | None" = None,
         val_split: bool = False,
+        # R20b review follow-up: walkforward builds vix_ctx for the training
+        # window and threads it into features_cache above, but every trial's
+        # Backtester was still constructed without it — trials priced entries
+        # with the synthetic realized-vol fallback while the selected params
+        # are evaluated OOS with real VIX pricing (same defect class as the
+        # engine.py entry-pricing fix). Threaded through to _run_backtest.
+        market_context: "dict | None" = None,
     ) -> None:
         if objective not in OBJECTIVES:
             raise ValueError(f"Unknown objective '{objective}'. Choose from: {list(OBJECTIVES)}")
@@ -131,7 +143,6 @@ class StrategyOptimizer:
         self._features_cache = features_cache
         self._position_size_pct = position_size_pct
         self._wing_floor_dollars = wing_floor_dollars
-        self._wing_k = wing_k
         self._iv_floor = iv_floor
         self._delta_iv_scale = delta_iv_scale
         self._patience = patience
@@ -156,6 +167,11 @@ class StrategyOptimizer:
             from ait.config.settings import BacktestConfig as _BTC
             _bt_cfg = _BTC()
         self._bt_baselines = _bt_cfg
+        # R20b review follow-up: same None -> config-resolution pattern as
+        # iv_rank_rise_threshold/min_edge_over_baseline below — a direct
+        # caller that omits wing_k now gets the config/live value (1.6)
+        # instead of the frozen 1.0 literal.
+        self._wing_k = float(wing_k) if wing_k is not None else float(_bt_cfg.wing_k)
         self._iv_rank_rise_threshold = (
             float(iv_rank_rise_threshold) if iv_rank_rise_threshold is not None
             else float(_bt_cfg.iv_rank_rise_threshold)
@@ -180,6 +196,7 @@ class StrategyOptimizer:
         self._symbol = symbol
         self._range_predictor = range_predictor
         self._val_split = val_split
+        self._market_context = market_context
         self._data: dict[str, pd.DataFrame] = {}
 
     # ------------------------------------------------------------------
@@ -440,6 +457,10 @@ class StrategyOptimizer:
             # every trial otherwise re-read + re-validated config.yaml from
             # disk (BT-E1: N windows x M trials redundant reloads/run).
             settings=self._settings,
+            # R20b review follow-up: forward the training-window VIX/SPY
+            # context so trial entries price with the same VIX branch as the
+            # OOS evaluation, instead of the synthetic realized-vol fallback.
+            market_context=self._market_context,
             **bt_kwargs,
         )
         return bt.run()

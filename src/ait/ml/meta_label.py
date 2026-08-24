@@ -453,6 +453,7 @@ class MetaLabeler:
         Returns:
             DataFrame ready for training.
         """
+        import json as _json
         import sqlite3
 
         rows = []
@@ -462,7 +463,8 @@ class MetaLabeler:
             results = conn.execute("""
                 SELECT t.trade_id, t.realized_pnl, t.entry_time,
                        c.entry_direction, c.entry_confidence, c.entry_regime,
-                       c.entry_vix, c.entry_iv_rank, c.entry_sentiment_score
+                       c.entry_vix, c.entry_iv_rank, c.entry_sentiment_score,
+                       c.entry_signals
                 FROM trades t
                 JOIN trade_context c ON t.trade_id = c.trade_id
                 WHERE t.status = 'closed'
@@ -478,6 +480,18 @@ class MetaLabeler:
             except (ValueError, TypeError):
                 pass
 
+            # R20b review follow-up: entry_signals stores the 11 technical
+            # META_FEATURES snapshotted at entry (_entry_signals_json). Parse
+            # it so training uses the full 20-feature space instead of only
+            # the 9 scalar context columns selected above — the coverage
+            # guard (test_r20_research_validity) requires all META_FEATURES.
+            try:
+                sig = _json.loads(r.get("entry_signals") or "{}")
+            except (TypeError, ValueError):
+                sig = {}
+            if not isinstance(sig, dict):
+                sig = {}
+
             regime = r.get("entry_regime", "")
             rows.append({
                 "primary_confidence": r.get("entry_confidence", 0),
@@ -488,7 +502,18 @@ class MetaLabeler:
                 "vix": r.get("entry_vix", 0),
                 "iv_rank": r.get("entry_iv_rank", 0),
                 "sentiment_score": r.get("entry_sentiment_score", 0),
+                "rsi_14":               sig.get("rsi_14", 50.0),
+                "rsi_7":                sig.get("rsi_7", 50.0),
+                "bb_position":          sig.get("bb_position", 0.5),
+                "volume_sma_20_ratio":  sig.get("volume_sma_20_ratio", 1.0),
+                "realized_vol_20":      sig.get("realized_vol_20", 0.20),
+                "atr_pct":              sig.get("atr_pct", 0.01),
+                "weekly_trend_aligned": sig.get("weekly_trend_aligned", 0.5),
+                "volume_confirmation":  sig.get("volume_confirmation", 0.0),
                 "hour_of_day": entry_hour,
+                "macd_hist":            sig.get("macd_hist", 0.0),
+                "price_vs_sma_20":      sig.get("price_vs_sma_20", 0.0),
+                "sma_10_20_cross":      sig.get("sma_10_20_cross", 0.5),
                 "profitable": 1 if r["realized_pnl"] > 0 else 0,
             })
 

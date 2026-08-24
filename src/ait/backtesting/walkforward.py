@@ -794,7 +794,7 @@ def _window_task_mp(args: tuple) -> tuple:
         db_path=db_path,
         progress_dir=progress_dir,
     )
-    wr, best_params = bt._run_single_window(
+    wr, best_params, meta_status = bt._run_single_window(
         window_id=window_id,
         train_start=train_start,
         train_end=train_end,
@@ -808,7 +808,7 @@ def _window_task_mp(args: tuple) -> tuple:
         prev_oos=None,
         pretrained_range=pretrained_range,
     )
-    return window_id, wr, best_params
+    return window_id, wr, best_params, meta_status
 
 
 class WalkForwardBacktester:
@@ -947,7 +947,14 @@ class WalkForwardBacktester:
             with ProcessPoolExecutor(max_workers=self._config.optimize_n_jobs) as executor:
                 mp_results = list(executor.map(_window_task_mp, args_list))
 
-            for _wid, wr, curr_best_params in sorted(mp_results, key=lambda x: x[0]):
+            for _wid, wr, curr_best_params, _meta_status in sorted(mp_results, key=lambda x: x[0]):
+                # R20b review follow-up: merge the per-symbol meta-labeler
+                # status independently of whether the window produced trades
+                # — a zero-trade parallel window (wr is None) is precisely
+                # where a failed/disabled gate needs to stay visible in the
+                # summary instead of silently vanishing with the WindowResult.
+                if _meta_status:
+                    self._meta_status_by_window.setdefault(_wid, {}).update(_meta_status)
                 if wr is not None:
                     window_results.append(wr)
                     if curr_best_params is not None:
@@ -963,7 +970,7 @@ class WalkForwardBacktester:
             prev_best_params: dict | None = None
             for i, (train_start, train_end, test_start, test_end) in enumerate(windows):
                 prev_oos = window_results[-1].backtest_result if window_results else None
-                wr, curr_best_params = self._run_single_window(
+                wr, curr_best_params, _meta_status = self._run_single_window(
                     window_id=i + 1,
                     train_start=train_start,
                     train_end=train_end,
@@ -1069,12 +1076,17 @@ class WalkForwardBacktester:
         prev_best_params: "dict | None" = None,
         prev_oos: "BacktestResult | None" = None,
         pretrained_range: "dict | None" = None,
-    ) -> "tuple[WindowResult | None, dict | None]":
+    ) -> "tuple[WindowResult | None, dict | None, dict]":
         """Run optimization, ML training, and backtest for one window.
 
-        Returns (window_result, best_params).  window_result is None when no
-        trades are generated.  Pass learner=None in parallel mode — the method
-        then uses static config defaults (no cross-window adaptation).
+        Returns (window_result, best_params, meta_labeler_status). window_result
+        is None when no trades are generated, but meta_labeler_status is always
+        populated (per-symbol) — parallel workers build a fresh instance per
+        window and only communicate back through this return value, so a
+        zero-trade window (precisely where a failed/disabled gate needs
+        visibility) must not be silently dropped along with the WindowResult.
+        Pass learner=None in parallel mode — the method then uses static
+        config defaults (no cross-window adaptation).
         """
         log.info(
             "running_window",
@@ -1481,7 +1493,7 @@ class WalkForwardBacktester:
             )
             self._write_window_progress(window_id, window_result, curr_best_params,
                                          optuna_meta=_optuna_meta, model_weights=_model_weights)
-            return window_result, curr_best_params
+            return window_result, curr_best_params, dict(_meta_status_local)
         else:
             self._write_window_progress(
                 window_id, None, curr_best_params,
@@ -1489,7 +1501,7 @@ class WalkForwardBacktester:
                 test_start=test_start, test_end=test_end,
                 optuna_meta=_optuna_meta, model_weights=_model_weights,
             )
-            return None, curr_best_params
+            return None, curr_best_params, dict(_meta_status_local)
 
     def _write_window_progress(
         self,
@@ -1692,6 +1704,10 @@ class WalkForwardBacktester:
                     symbol=symbol,
                     range_predictor=range_predictor,
                     val_split=self._config.optimize_val_split,
+                    # R20b review follow-up: trial objectives priced with the
+                    # same training-window VIX/SPY context as features_cache
+                    # above, instead of the synthetic realized-vol fallback.
+                    market_context=vix_ctx,
                 )
                 res = opt.run(data={symbol: train_df}, prior_params=warm)
                 all_best_params.update(res.best_params)

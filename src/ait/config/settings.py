@@ -102,6 +102,38 @@ class RiskConfig(_StrictModel):
         description="No NEW credit entries when VIX is at/above this level — "
                     "cheap vol-regime brake for short-premium strategies.")
 
+    @field_validator("credit_cap_vix_tiers")
+    @classmethod
+    def validate_credit_cap_vix_tiers(cls, v: list[list[float]]) -> list[list[float]]:
+        """R20b review follow-up: manager.py consumes each row via two-value
+        unpacking (`for ceiling, cap in ...`) and takes the FIRST match in
+        list order — a malformed row (wrong arity), a non-integer/non-positive
+        cap, or unsorted ceilings all passed startup validation before this
+        fix and could crash trade validation or silently apply the wrong cap.
+        """
+        if not v:
+            raise ValueError("credit_cap_vix_tiers must not be empty")
+        prev_ceiling = float("-inf")
+        for row in v:
+            if len(row) != 2:
+                raise ValueError(
+                    f"credit_cap_vix_tiers row {row!r} must be exactly "
+                    "[vix_ceiling, cap]"
+                )
+            ceiling, cap = row
+            if cap <= 0 or int(cap) != cap:
+                raise ValueError(
+                    f"credit_cap_vix_tiers cap {cap!r} must be a positive integer"
+                )
+            if ceiling <= prev_ceiling:
+                raise ValueError(
+                    "credit_cap_vix_tiers ceilings must be strictly increasing "
+                    f"(row {row!r} does not exceed the prior ceiling "
+                    f"{prev_ceiling!r})"
+                )
+            prev_ceiling = ceiling
+        return v
+
 
 class OptionsConfig(_StrictModel):
     delta_range: list[float] = [0.20, 0.50]
