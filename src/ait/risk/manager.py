@@ -403,9 +403,16 @@ class RiskManager:
             # request.vix is guaranteed > 0 here (fail-closed gate above).
             # R20 (register): tiers now live in config (risk.credit_cap_vix_tiers)
             # with the historical values as the default — behavior unchanged.
+            # R20b review follow-up: the no-match fallback used to be a
+            # hardcoded literal 2. Validation permits a tier table whose
+            # final ceiling is below credit_vix_halt, so requests above that
+            # ceiling would silently use 2 regardless of the configured last
+            # tier's cap. Fall back to the last configured tier's cap instead
+            # so config remains authoritative.
+            _tiers = self._risk_config.credit_cap_vix_tiers
             _vix_tier_cap = next(
-                (int(cap) for ceiling, cap in self._risk_config.credit_cap_vix_tiers
-                 if request.vix < float(ceiling)), 2)
+                (int(cap) for ceiling, cap in _tiers
+                 if request.vix < float(ceiling)), int(_tiers[-1][1]))
             _credit_cap = min(self._risk_config.max_credit_positions, _vix_tier_cap)
             n_credit = sum(
                 1 for p in self._open_positions

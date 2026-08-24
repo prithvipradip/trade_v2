@@ -457,6 +457,17 @@ class MetaLabeler:
         import sqlite3
 
         rows = []
+        # Legacy rows with no captured snapshot (entry_signals == '{}') must
+        # NOT be back-filled with the same fixed defaults for every row —
+        # that fabricates artificial variance once even a single real
+        # snapshot differs, letting the coverage guard in train() arm on
+        # mostly-imputed data. Preserve these as NaN instead so
+        # nunique(dropna=True) only reflects genuinely captured values.
+        _nan = float("nan")
+
+        def _sig(sig: dict, key: str, default):
+            return sig.get(key, default) if sig else _nan
+
         with sqlite3.connect(state_manager._db_path) as conn:
             conn.row_factory = sqlite3.Row
             # Join trades with their entry context
@@ -502,18 +513,18 @@ class MetaLabeler:
                 "vix": r.get("entry_vix", 0),
                 "iv_rank": r.get("entry_iv_rank", 0),
                 "sentiment_score": r.get("entry_sentiment_score", 0),
-                "rsi_14":               sig.get("rsi_14", 50.0),
-                "rsi_7":                sig.get("rsi_7", 50.0),
-                "bb_position":          sig.get("bb_position", 0.5),
-                "volume_sma_20_ratio":  sig.get("volume_sma_20_ratio", 1.0),
-                "realized_vol_20":      sig.get("realized_vol_20", 0.20),
-                "atr_pct":              sig.get("atr_pct", 0.01),
-                "weekly_trend_aligned": sig.get("weekly_trend_aligned", 0.5),
-                "volume_confirmation":  sig.get("volume_confirmation", 0.0),
+                "rsi_14":               _sig(sig, "rsi_14", 50.0),
+                "rsi_7":                _sig(sig, "rsi_7", 50.0),
+                "bb_position":          _sig(sig, "bb_position", 0.5),
+                "volume_sma_20_ratio":  _sig(sig, "volume_sma_20_ratio", 1.0),
+                "realized_vol_20":      _sig(sig, "realized_vol_20", 0.20),
+                "atr_pct":              _sig(sig, "atr_pct", 0.01),
+                "weekly_trend_aligned": _sig(sig, "weekly_trend_aligned", 0.5),
+                "volume_confirmation":  _sig(sig, "volume_confirmation", 0.0),
                 "hour_of_day": entry_hour,
-                "macd_hist":            sig.get("macd_hist", 0.0),
-                "price_vs_sma_20":      sig.get("price_vs_sma_20", 0.0),
-                "sma_10_20_cross":      sig.get("sma_10_20_cross", 0.5),
+                "macd_hist":            _sig(sig, "macd_hist", 0.0),
+                "price_vs_sma_20":      _sig(sig, "price_vs_sma_20", 0.0),
+                "sma_10_20_cross":      _sig(sig, "sma_10_20_cross", 0.5),
                 "profitable": 1 if r["realized_pnl"] > 0 else 0,
             })
 
