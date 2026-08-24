@@ -92,7 +92,11 @@ class StrategyOptimizer:
         # other frozen literals below. None resolves from _bt_cfg.wing_k
         # (set below from load_settings().backtest) once _bt_cfg exists.
         wing_k: float | None = None,
-        iv_floor: float = 0.20,
+        # R20b review follow-up: was a hardcoded 0.20 literal, shadowing the
+        # config/live value for any direct caller (run_optimizer.py never
+        # overrides it) -- same defect class as wing_k above. None resolves
+        # from _bt_cfg.iv_floor once _bt_cfg exists.
+        iv_floor: float | None = None,
         delta_iv_scale: float = 0.0,
         patience: int = 0,
         min_trades: int = 10,
@@ -143,7 +147,6 @@ class StrategyOptimizer:
         self._features_cache = features_cache
         self._position_size_pct = position_size_pct
         self._wing_floor_dollars = wing_floor_dollars
-        self._iv_floor = iv_floor
         self._delta_iv_scale = delta_iv_scale
         self._patience = patience
         self._min_trades = min_trades
@@ -172,6 +175,10 @@ class StrategyOptimizer:
         # caller that omits wing_k now gets the config/live value (1.6)
         # instead of the frozen 1.0 literal.
         self._wing_k = float(wing_k) if wing_k is not None else float(_bt_cfg.wing_k)
+        # R20b review follow-up: same None -> config-resolution pattern as
+        # wing_k above -- a direct caller that omits iv_floor now gets the
+        # config/live value instead of the frozen 0.20 literal.
+        self._iv_floor = float(iv_floor) if iv_floor is not None else float(_bt_cfg.iv_floor)
         self._iv_rank_rise_threshold = (
             float(iv_rank_rise_threshold) if iv_rank_rise_threshold is not None
             else float(_bt_cfg.iv_rank_rise_threshold)
