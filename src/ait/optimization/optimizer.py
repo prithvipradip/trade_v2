@@ -104,6 +104,9 @@ class StrategyOptimizer:
         # (0.30 / 0.05); None now resolves from load_settings().backtest
         # (iv_rank_rise_threshold / min_edge_over_baseline). Explicit caller
         # values always win.
+        # Keyword-only from here: inserted mid-signature, a positional
+        # caller would otherwise silently misbind into these two params.
+        *,
         iv_rank_rise_threshold: float | None = None,
         min_edge_over_baseline: float | None = None,
         seed: int = 42,
@@ -144,8 +147,10 @@ class StrategyOptimizer:
         # stub in tests) degrades to the BacktestConfig field defaults.
         try:
             from ait.config.settings import load_settings as _ls
-            _bt_cfg = _ls().backtest
+            self._settings = _ls()
+            _bt_cfg = self._settings.backtest
         except Exception:  # noqa: BLE001 — no config.yaml -> field defaults
+            self._settings = None
             _bt_cfg = None
         if _bt_cfg is None:
             from ait.config.settings import BacktestConfig as _BTC
@@ -159,6 +164,17 @@ class StrategyOptimizer:
             float(min_edge_over_baseline) if min_edge_over_baseline is not None
             else float(_bt_cfg.min_edge_over_baseline)
         )
+        # R20b follow-up: min_confidence in _run_backtest's bt_kwargs was a
+        # hardcoded 0.55 even though the sibling literals above were migrated
+        # to config resolution in this same PR -- same defect class, lives on
+        # RiskConfig (not BacktestConfig) since that's min_confidence's
+        # documented home (see engine.py's resolution comment). Reuses
+        # self._settings (loaded once above), not a second independent read.
+        try:
+            self._min_confidence = float(self._settings.risk.min_confidence)
+        except Exception:  # noqa: BLE001 — no config.yaml -> field default
+            from ait.config.settings import RiskConfig as _RC
+            self._min_confidence = float(_RC().min_confidence)
         self._seed = seed
         self._intraday_store = intraday_store
         self._symbol = symbol
@@ -375,7 +391,7 @@ class StrategyOptimizer:
             "initial_capital":       self._initial_capital,
             "stop_loss_pct":         float(_bl.stop_loss_pct),
             "profit_target_pct":     float(_bl.profit_target_pct),
-            "min_confidence":        0.55,
+            "min_confidence":        self._min_confidence,
             "position_size_pct":     self._position_size_pct,
             "trailing_stop_pct":     0.25,
             "breakeven_trigger_pct": 0.30,
@@ -420,6 +436,10 @@ class StrategyOptimizer:
             # R16: Optuna trials must never score with the live future-trained
             # artifact (same look-ahead class as the walkforward OOS fence).
             allow_live_model_fallback=False,
+            # R20b follow-up: reuse the settings loaded once in __init__ —
+            # every trial otherwise re-read + re-validated config.yaml from
+            # disk (BT-E1: N windows x M trials redundant reloads/run).
+            settings=self._settings,
             **bt_kwargs,
         )
         return bt.run()

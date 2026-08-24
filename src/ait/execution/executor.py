@@ -224,7 +224,11 @@ class TradeExecutor:
         _opts = getattr(settings, "options", None)
         _cfg_spread = getattr(_opts, "max_bid_ask_spread_pct", None)
         try:
-            self._max_spread_pct = (float(_cfg_spread) if _cfg_spread
+            # R20b follow-up: `if _cfg_spread` treated a configured 0.0 (a
+            # maximally strict spread gate) as "not configured" and silently
+            # fell back to the default -- check for None explicitly instead
+            # of relying on truthiness.
+            self._max_spread_pct = (float(_cfg_spread) if _cfg_spread is not None
                                     else DEFAULT_MAX_SPREAD_PCT)
         except (TypeError, ValueError):
             self._max_spread_pct = DEFAULT_MAX_SPREAD_PCT

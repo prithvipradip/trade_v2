@@ -75,12 +75,23 @@ class WalkForwardConfig:
     # entries deliberately NOT blocked — unlike a FAILED training, which
     # blocks OOS IC entries via range_min_confidence=1.0 + engine R16 #3).
     train_window_models: bool = True
-    iv_floor: float = 0.12
+    # R20b follow-up: was a hardcoded 0.12 while live/engine resolve
+    # settings.backtest.iv_floor (config.yaml 0.20) — the same "constructor
+    # default silently shadows config" defect range_min_confidence was fixed
+    # for below, just missed for this field. None -> __post_init__ resolves
+    # load_settings().backtest.iv_floor (BacktestConfig default when no
+    # config.yaml is reachable). Explicit values always win.
+    iv_floor: float | None = None
     delta_iv_scale: float = 0.0
     stop_loss_pct: float = 0.35            # Cut losses at 35% (options decay fast)
     profit_target_pct: float = 0.50         # Take profits at 50% (don't be greedy)
     max_hold_days: int = 21                 # 3 weeks max (avoid deep theta decay)
-    min_confidence: float = 0.55
+    # R20b follow-up: was a hardcoded 0.55 while live/engine resolve
+    # settings.risk.min_confidence (config.yaml 0.50) — same defect class as
+    # iv_floor above. None -> __post_init__ resolves load_settings()
+    # .risk.min_confidence (RiskConfig default when no config.yaml is
+    # reachable). Explicit values always win.
+    min_confidence: float | None = None
     # R20b (pre-registered PLAN 2026-08-21): was a hardcoded 0.55 while live
     # gates on ml.range_min_confidence = 0.65 (config.yaml; 0.65 beat 0.55
     # across every backtest metric) — the parity gap the range-floor sweep
@@ -173,6 +184,18 @@ class WalkForwardConfig:
                 )
             except Exception:  # noqa: BLE001 — no config.yaml -> model default
                 self.range_min_confidence = float(MLConfig().range_min_confidence)
+        if self.iv_floor is None:
+            try:
+                from ait.config.settings import BacktestConfig, load_settings
+                self.iv_floor = float(load_settings().backtest.iv_floor)
+            except Exception:  # noqa: BLE001 — no config.yaml -> model default
+                self.iv_floor = float(BacktestConfig().iv_floor)
+        if self.min_confidence is None:
+            try:
+                from ait.config.settings import RiskConfig, load_settings
+                self.min_confidence = float(load_settings().risk.min_confidence)
+            except Exception:  # noqa: BLE001 — no config.yaml -> model default
+                self.min_confidence = float(RiskConfig().min_confidence)
 
 
 @dataclass

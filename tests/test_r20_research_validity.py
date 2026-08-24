@@ -487,14 +487,15 @@ class TestSharedExitPolicy:
 
     def test_macro_flatten_windows_match_live_source(self):
         from ait.execution import exit_policy
-        import ait.execution.portfolio as portfolio_mod
+        from ait.execution.portfolio import PortfolioManager
 
-        src = inspect.getsource(portfolio_mod)
-        # Live rule 3d: strangle-class 5 days, CSP/CC 1 day
-        assert re.search(
-            r"_evt_window\s*=\s*5\s+if\s+trade\.strategy\s*==\s*.short_strangle.\s+else\s+1",
-            src,
-        ), "live macro-flatten window structure changed — update exit_policy"
+        # R20 #5a follow-up: live portfolio.py now DELEGATES to the shared
+        # table instead of hand-copying the strategy/window mapping (was a
+        # source-regex tripwire for the inline copy; now checks delegation).
+        src = inspect.getsource(PortfolioManager._evaluate_position)
+        assert "macro_flatten_window_days" in src, (
+            "live portfolio.py should delegate macro-flatten windows to exit_policy"
+        )
         assert exit_policy.macro_flatten_window_days("short_strangle") == 5
         assert exit_policy.macro_flatten_window_days("jade_lizard") == 5
         assert exit_policy.macro_flatten_window_days("cash_secured_put") == 1
@@ -507,12 +508,14 @@ class TestSharedExitPolicy:
 
     def test_expiry_close_dte_matches_live_source(self):
         from ait.execution import exit_policy
-        import ait.execution.portfolio as portfolio_mod
+        from ait.execution.portfolio import PortfolioManager
 
         assert exit_policy.EXPIRY_APPROACHING_DTE == 5
-        src = inspect.getsource(portfolio_mod)
-        assert re.search(r"dte\s+is\s+not\s+None\s+and\s+dte\s*<=\s*5", src), (
-            "live DTE-close rule changed — update exit_policy"
+        # R20 #5a follow-up: live portfolio.py now DELEGATES (dte <=
+        # EXPIRY_APPROACHING_DTE) instead of hand-copying the literal 5.
+        src = inspect.getsource(PortfolioManager._evaluate_position)
+        assert "EXPIRY_APPROACHING_DTE" in src, (
+            "live portfolio.py should delegate the DTE-close rule to exit_policy"
         )
         eng_src = inspect.getsource(Backtester._check_exit_credit)
         assert "EXPIRY_APPROACHING_DTE" in eng_src

@@ -70,6 +70,10 @@ class VolMagnitudePredictor:
         self,
         # R20: config-backed training floor (was a hardcoded 100 that
         # shadowed ml.min_training_samples). None -> the config value.
+        # Keyword-only: inserted ahead of the original params, a positional
+        # caller would otherwise silently misbind (e.g. int(threshold_pct)
+        # landing here, truncated to 0, disabling the training floor).
+        *,
         min_training_samples: int | None = None,
         threshold_pct: float = 0.07,
         horizon_days: int = 30,
@@ -77,11 +81,17 @@ class VolMagnitudePredictor:
         model_dir: "Path | str | None" = None,
     ) -> None:
         if min_training_samples is None:
+            # R20b follow-up: was a bare MLConfig() (pydantic field default,
+            # never reads config.yaml) despite the comment above claiming
+            # this resolves "the config value" — load_settings() is the
+            # actual config-reading call, same as every sibling resolution
+            # block (engine.py/walkforward.py/optimizer.py).
             try:
+                from ait.config.settings import load_settings
+                min_training_samples = load_settings().ml.min_training_samples
+            except Exception:  # noqa: BLE001 — never block construction
                 from ait.config.settings import MLConfig
                 min_training_samples = MLConfig().min_training_samples
-            except Exception:  # noqa: BLE001 — never block construction
-                min_training_samples = 100
         self._min_training_samples = int(min_training_samples)
         self._threshold = threshold_pct
         self._horizon = horizon_days

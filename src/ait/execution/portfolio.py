@@ -21,6 +21,11 @@ from ait.bot.state import StateManager, TradeRecord, TradeStatus
 from ait.broker.ibkr_client import IBKRClient
 from ait.strategies.base import CREDIT_STRATEGIES
 from ait.config.settings import ExitConfig
+from ait.execution.exit_policy import (
+    EXPIRY_APPROACHING_DTE,
+    macro_flatten_window_days,
+    take_profit_targets,
+)
 from ait.data.market_data import MarketDataService
 from ait.data.quality import DataQualityValidator
 from ait.risk.circuit_breaker import CircuitBreaker
@@ -650,7 +655,7 @@ class PortfolioManager:
         # the 14-DTE entry floor implies every position gets >=9 calendar
         # days of theta runway — do NOT lower dte_range[0] below ~10 without
         # revisiting this exit, or entries become forced-exit churn again.
-        elif not should_exit and dte is not None and dte <= 5:
+        elif not should_exit and dte is not None and dte <= EXPIRY_APPROACHING_DTE:
             should_exit = True
             exit_reason = f"expiry_approaching (DTE: {dte})"
 
@@ -713,19 +718,20 @@ class PortfolioManager:
         # event — the wings cap a surprise, and the post-event vol crush is
         # the trade's payoff; flattening at d2e<=1 sold the insurance and
         # refused the premium. Undefined-risk keeps the early exit.
+        # R20 #5a follow-up: strategy list + per-strategy window (5 for
+        # strangle-class, 1 for CSP/CC) now come from exit_policy.py's
+        # MACRO_FLATTEN_WINDOW_DAYS — the single source the research engine
+        # already reads, instead of a hand-copied tuple+conditional here.
+        _evt_window = macro_flatten_window_days(trade.strategy)
         if (contract_flag("AIT_SKIP_MACRO_EVENTS")
                 and not should_exit and self._economic_cal
-                and trade.strategy in (
-                    "short_strangle",
-                    "cash_secured_put", "covered_call",
-                )):
+                and _evt_window is not None):
             try:
                 days_to_event = self._economic_cal.days_until_next_event()
                 # R6 (user-approved): undefined-risk (strangles) exits EARLY
                 # — a Thu/Fri close ahead of a Mon/Tue event avoids carrying
                 # naked weekend gap risk for ~2 sessions of residual theta.
                 # Defined-risk keeps the tight window (wings cap the gap).
-                _evt_window = 5 if trade.strategy == "short_strangle" else 1
                 if days_to_event is not None and days_to_event <= _evt_window:
                     should_exit = True
                     exit_reason = f"macro_event_flatten (days_to_event={days_to_event})"
@@ -850,17 +856,11 @@ class PortfolioManager:
               open orders (survives restarts; ties into Tier A1's tracker
               rebuild).
         """
-        if not self._exit_config.time_decay_scaling or dte is None:
-            return 1.0, 0.50  # Default: +100% long, +50% short
-
-        if dte > 20:
-            return 1.0, 0.50
-        elif dte > 10:
-            return 0.75, 0.40
-        elif dte > 5:
-            return 0.50, 0.30
-        else:
-            return 0.25, 0.20  # Very aggressive — grab what you can
+        # R20 #5a follow-up: was an inline copy of the ladder now owned by
+        # exit_policy.py (the research engine already reads it from there) —
+        # kept in sync only by test_r20_research_validity.py's parity check.
+        # Wired directly so there is one implementation, not two verified-equal.
+        return take_profit_targets(dte, self._exit_config.time_decay_scaling)
 
     def _check_partial_exit(
         self,
