@@ -529,7 +529,8 @@ class RiskManager:
                 f"portfolio cap ${portfolio_cap:.0f}",
             )
 
-        # 6c. Concentration limit — no more than 20% of account in one symbol
+        # 6c. Concentration limit — no more than risk.max_symbol_concentration_pct
+        # of account in one symbol (config-backed, default 20%)
         # R17: was summing market_value (credit collected for credit
         # strategies, not real risk) -- now the same max_loss/backfill
         # sourcing gate 6b-2's aggregate cap uses.
@@ -538,7 +539,14 @@ class RiskManager:
             return TradeValidation(
                 False,
                 f"symbol concentration: {request.symbol} exposure "
-                f"${symbol_exposure + estimated_cost:.0f} exceeds 20% of ${account_value:.0f}",
+                f"${symbol_exposure + estimated_cost:.0f} exceeds "
+                # R20b review follow-up: was a hardcoded "20%" literal even
+                # though the threshold itself already reads the configured
+                # max_symbol_concentration_pct above -- the rejection reason
+                # (logged + persisted into counterfactual/skip records) would
+                # misreport the actual gate an operator configured.
+                f"{self._risk_config.max_symbol_concentration_pct:.0%} of "
+                f"${account_value:.0f}",
             )
 
         # 7. Portfolio delta limit

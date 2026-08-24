@@ -60,23 +60,13 @@ NEUTRAL_CREDIT_GATED = (
 )
 
 
-def _resolve_setting(explicit, section: str, field: str, fallback_cls, settings) -> Any:
-    """explicit > loaded settings.<section>.<field> > fallback_cls().<field>.
-
-    R20b follow-up: consolidates ~7 hand-duplicated "explicit arg > config >
-    fallback-class-default" blocks in this file (one per config-backed
-    constructor knob) into one helper. `settings` is the Settings object
-    already loaded once by __init__ (or None) — a missing section/attribute
-    (partial stub, or settings is None) degrades to the fallback config
-    model's own pydantic default, same behavior as before, just not
-    re-implemented per field.
-    """
-    if explicit is not None:
-        return explicit
-    try:
-        return getattr(getattr(settings, section), field)
-    except Exception:  # noqa: BLE001 — partial stub / no config -> model default
-        return getattr(fallback_cls(), field)
+# R20b review follow-up: this used to be a private copy of the "explicit >
+# config > fallback-class-default" precedence, duplicated independently in
+# walkforward.py/optimizer.py/the ML predictors/run_backtest.py. Moved to
+# ait.config.settings as the ONE shared implementation (also reused by those
+# other call sites); re-imported under the original name so every existing
+# `_resolve_setting(...)` call in this file needs no change.
+from ait.config.settings import resolve_config_value as _resolve_setting
 
 
 class Backtester:

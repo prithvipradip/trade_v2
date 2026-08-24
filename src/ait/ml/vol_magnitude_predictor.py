@@ -80,18 +80,20 @@ class VolMagnitudePredictor:
         ensemble_weights: dict[str, float] | None = None,
         model_dir: "Path | str | None" = None,
     ) -> None:
+        # R20b follow-up: was a bare MLConfig() (pydantic field default,
+        # never reads config.yaml) despite the comment above claiming this
+        # resolves "the config value". Now the shared resolve_config_value
+        # helper (also used by engine.py/walkforward.py/optimizer.py) —
+        # this file and range_predictor.py used to hand-roll an identical
+        # copy of this block independently.
         if min_training_samples is None:
-            # R20b follow-up: was a bare MLConfig() (pydantic field default,
-            # never reads config.yaml) despite the comment above claiming
-            # this resolves "the config value" — load_settings() is the
-            # actual config-reading call, same as every sibling resolution
-            # block (engine.py/walkforward.py/optimizer.py).
+            from ait.config.settings import MLConfig, load_settings, resolve_config_value
             try:
-                from ait.config.settings import load_settings
-                min_training_samples = load_settings().ml.min_training_samples
+                _settings = load_settings()
             except Exception:  # noqa: BLE001 — never block construction
-                from ait.config.settings import MLConfig
-                min_training_samples = MLConfig().min_training_samples
+                _settings = None
+            min_training_samples = resolve_config_value(
+                None, "ml", "min_training_samples", MLConfig, _settings)
         self._min_training_samples = int(min_training_samples)
         self._threshold = threshold_pct
         self._horizon = horizon_days

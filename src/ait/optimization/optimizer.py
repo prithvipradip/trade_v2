@@ -92,7 +92,12 @@ class StrategyOptimizer:
         # other frozen literals below. None resolves from _bt_cfg.wing_k
         # (set below from load_settings().backtest) once _bt_cfg exists.
         wing_k: float | None = None,
-        iv_floor: float = 0.20,
+        # R20b review follow-up: same defect class as wing_k above -- was a
+        # hardcoded 0.20 even though its sibling wing_k (same constructor,
+        # same PR) got migrated. run_optimizer.py never overrides this either.
+        # None resolves from _bt_cfg.iv_floor (set below from
+        # load_settings().backtest) once _bt_cfg exists.
+        iv_floor: float | None = None,
         delta_iv_scale: float = 0.0,
         patience: int = 0,
         min_trades: int = 10,
@@ -126,6 +131,13 @@ class StrategyOptimizer:
         # are evaluated OOS with real VIX pricing (same defect class as the
         # engine.py entry-pricing fix). Threaded through to _run_backtest.
         market_context: "dict | None" = None,
+        # R20b review follow-up: optional pre-loaded Settings, mirroring
+        # Backtester's own `settings=` param -- lets a caller building many
+        # StrategyOptimizer instances (WalkForwardBacktester: one per window
+        # per strategy) load config.yaml ONCE and thread it through instead
+        # of every construction re-reading + re-validating the file from
+        # disk. None (default) preserves the original behavior — load it here.
+        settings: "Any | None" = None,
     ) -> None:
         if objective not in OBJECTIVES:
             raise ValueError(f"Unknown objective '{objective}'. Choose from: {list(OBJECTIVES)}")
@@ -143,7 +155,7 @@ class StrategyOptimizer:
         self._features_cache = features_cache
         self._position_size_pct = position_size_pct
         self._wing_floor_dollars = wing_floor_dollars
-        self._iv_floor = iv_floor
+        # self._iv_floor resolved below once _bt_cfg exists (R20b review follow-up)
         self._delta_iv_scale = delta_iv_scale
         self._patience = patience
         self._min_trades = min_trades
@@ -156,13 +168,20 @@ class StrategyOptimizer:
         # were frozen literals — an operator/config change could never reach
         # a trial backtest. Guarded so a missing config.yaml (or a partial
         # stub in tests) degrades to the BacktestConfig field defaults.
-        try:
-            from ait.config.settings import load_settings as _ls
-            self._settings = _ls()
+        # R20b review follow-up: reuse a caller-supplied `settings` (e.g.
+        # WalkForwardBacktester loads it once and threads it through per
+        # window/strategy) instead of unconditionally re-reading it here.
+        if settings is not None:
+            self._settings = settings
             _bt_cfg = self._settings.backtest
-        except Exception:  # noqa: BLE001 — no config.yaml -> field defaults
-            self._settings = None
-            _bt_cfg = None
+        else:
+            try:
+                from ait.config.settings import load_settings as _ls
+                self._settings = _ls()
+                _bt_cfg = self._settings.backtest
+            except Exception:  # noqa: BLE001 — no config.yaml -> field defaults
+                self._settings = None
+                _bt_cfg = None
         if _bt_cfg is None:
             from ait.config.settings import BacktestConfig as _BTC
             _bt_cfg = _BTC()
@@ -172,6 +191,7 @@ class StrategyOptimizer:
         # caller that omits wing_k now gets the config/live value (1.6)
         # instead of the frozen 1.0 literal.
         self._wing_k = float(wing_k) if wing_k is not None else float(_bt_cfg.wing_k)
+        self._iv_floor = float(iv_floor) if iv_floor is not None else float(_bt_cfg.iv_floor)
         self._iv_rank_rise_threshold = (
             float(iv_rank_rise_threshold) if iv_rank_rise_threshold is not None
             else float(_bt_cfg.iv_rank_rise_threshold)

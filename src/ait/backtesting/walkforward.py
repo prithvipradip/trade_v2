@@ -114,9 +114,17 @@ class WalkForwardConfig:
     hurst_regime_penalty: float = 0.10
     hurst_hard_veto_multiplier: float = 0.0   # 0=disabled; Exp 20 post-mortem: QQQ spread never < 0.43, any multiplier blocks all entries
     multifractal_max_width: float = 0.50
-    iv_rank_rise_threshold: float = 0.30      # Exp 20: suppress IC entry when IV rank rose > this over last 10 days
+    # R20b review follow-up: was a hardcoded 0.30 while StrategyOptimizer's
+    # OWN copy of this field was already migrated to the None-sentinel +
+    # config-resolution pattern this PR gave every sibling field -- config.yaml
+    # edits to backtest.iv_rank_rise_threshold were inert on the default
+    # (non-optimized) walk-forward path, which forwards window_cfg's own
+    # frozen value straight into the OOS Backtester. None -> __post_init__
+    # resolves load_settings().backtest.iv_rank_rise_threshold.
+    iv_rank_rise_threshold: float | None = None  # Exp 20: suppress IC entry when IV rank rose > this over last 10 days
     pct_from_60d_high_threshold: float = -1.0 # Exp 27: suppress IC entry when price is this far below 60d rolling high (-1.0 = disabled)
-    min_edge_over_baseline: float = 0.05      # Exp 28: min weighted CV edge for range predictor to activate (0.0 = always use, higher = stricter quality gate)
+    # R20b review follow-up: same defect class as iv_rank_rise_threshold above.
+    min_edge_over_baseline: float | None = None  # Exp 28: min weighted CV edge for range predictor to activate (0.0 = always use, higher = stricter quality gate)
     # Intraday execution params (Fix 1 / Gap H).
     # R20 #4/#5b: these four were PHANTOM — declared here (with their own
     # '09:30' fork of the entry window) but never forwarded to Backtester, so
@@ -176,26 +184,33 @@ class WalkForwardConfig:
         if self.ic_min_credit_width is None:
             from ait.config.runtime_env import contract_float
             self.ic_min_credit_width = contract_float("AIT_IC_MIN_CREDIT_WIDTH")
-        if self.range_min_confidence is None:
-            try:
-                from ait.config.settings import load_settings
-                self.range_min_confidence = float(
-                    load_settings().ml.range_min_confidence
-                )
-            except Exception:  # noqa: BLE001 — no config.yaml -> model default
-                self.range_min_confidence = float(MLConfig().range_min_confidence)
-        if self.iv_floor is None:
-            try:
-                from ait.config.settings import BacktestConfig, load_settings
-                self.iv_floor = float(load_settings().backtest.iv_floor)
-            except Exception:  # noqa: BLE001 — no config.yaml -> model default
-                self.iv_floor = float(BacktestConfig().iv_floor)
-        if self.min_confidence is None:
-            try:
-                from ait.config.settings import RiskConfig, load_settings
-                self.min_confidence = float(load_settings().risk.min_confidence)
-            except Exception:  # noqa: BLE001 — no config.yaml -> model default
-                self.min_confidence = float(RiskConfig().min_confidence)
+        # R20b review follow-up: load settings ONCE for every config-backed
+        # field below via the shared resolve_config_value helper (also used
+        # by engine.py/optimizer.py/the ML predictors) instead of each field
+        # independently calling load_settings() (was up to 3 redundant reads
+        # per WalkForwardConfig construction, now 1).
+        from ait.config.settings import (
+            BacktestConfig, MLConfig, RiskConfig, load_settings, resolve_config_value,
+        )
+        try:
+            _settings = load_settings()
+        except Exception:  # noqa: BLE001 — no config.yaml -> per-field model defaults
+            _settings = None
+        self.range_min_confidence = float(resolve_config_value(
+            self.range_min_confidence, "ml", "range_min_confidence", MLConfig, _settings))
+        self.iv_floor = float(resolve_config_value(
+            self.iv_floor, "backtest", "iv_floor", BacktestConfig, _settings))
+        self.min_confidence = float(resolve_config_value(
+            self.min_confidence, "risk", "min_confidence", RiskConfig, _settings))
+        # R20b review follow-up: same defect class as the three above -- was
+        # a frozen literal even though StrategyOptimizer's own copy of these
+        # two fields was already migrated (optimizer.py __init__).
+        self.iv_rank_rise_threshold = float(resolve_config_value(
+            self.iv_rank_rise_threshold, "backtest", "iv_rank_rise_threshold",
+            BacktestConfig, _settings))
+        self.min_edge_over_baseline = float(resolve_config_value(
+            self.min_edge_over_baseline, "backtest", "min_edge_over_baseline",
+            BacktestConfig, _settings))
 
 
 @dataclass
@@ -844,6 +859,19 @@ class WalkForwardBacktester:
         self._progress_dir = Path(progress_dir) if progress_dir else None
         self._global_best_params: dict | None = None
         self._global_best_score: float = -1.0
+        # R20b review follow-up: load settings ONCE for the whole run instead
+        # of every per-window Backtester()/StrategyOptimizer() construction
+        # independently re-reading + re-validating config.yaml (same
+        # redundant-reload class the settings= param on Backtester/
+        # StrategyOptimizer was built to eliminate for Optuna trials —
+        # WalkForwardConfig.__post_init__ already loads its own copy above
+        # for its config-backed fields, this is the SEPARATE copy every
+        # window's Backtester/StrategyOptimizer construction used to trigger).
+        try:
+            from ait.config.settings import load_settings as _ls3
+            self._settings = _ls3()
+        except Exception:  # noqa: BLE001 — no config.yaml -> per-field defaults downstream
+            self._settings = None
         # R12-C: enable_msgarch/enable_oujump flags removed — the GARCH family
         # is retired to deprecated/research/; range models are ML-only.
 
@@ -1412,6 +1440,10 @@ class WalkForwardBacktester:
                 entry_window_end_et=getattr(window_cfg, "entry_window_end_et", None),
                 limit_order_timeout_bars=getattr(window_cfg, "limit_order_timeout_bars", None),
                 symbol=symbol,
+                # R20b review follow-up: reuse settings loaded once in
+                # __init__ instead of every window's OOS Backtester
+                # independently re-reading + re-validating config.yaml.
+                settings=self._settings,
             )
             result = bt.run()
 
@@ -1708,6 +1740,11 @@ class WalkForwardBacktester:
                     # same training-window VIX/SPY context as features_cache
                     # above, instead of the synthetic realized-vol fallback.
                     market_context=vix_ctx,
+                    # R20b review follow-up: reuse settings loaded once in
+                    # WalkForwardBacktester.__init__ instead of every
+                    # per-window, per-strategy StrategyOptimizer independently
+                    # re-reading + re-validating config.yaml.
+                    settings=self._settings,
                 )
                 res = opt.run(data={symbol: train_df}, prior_params=warm)
                 all_best_params.update(res.best_params)
@@ -2465,6 +2502,10 @@ class WalkForwardBacktester:
                 entry_window_end_et=getattr(window_cfg, "entry_window_end_et", None),
                 limit_order_timeout_bars=getattr(window_cfg, "limit_order_timeout_bars", None),
                 market_context=vix_ctx,
+                # R20b review follow-up: reuse settings loaded once in
+                # __init__ instead of every shadow-labeling Backtester
+                # independently re-reading + re-validating config.yaml.
+                settings=self._settings,
             )
             shadow_result = shadow_bt.run()
 

@@ -448,6 +448,40 @@ class Settings(_StrictModel):
     api_keys: APIKeysConfig = APIKeysConfig()
 
 
+def resolve_config_value(explicit, section: str, field: str, fallback_cls, settings):
+    """explicit > loaded settings.<section>.<field> > fallback_cls().<field>.
+
+    R20b review follow-up: the "explicit arg > config > fallback-class-default"
+    precedence was hand-duplicated at 4+ call sites (engine.py, walkforward.py,
+    optimizer.py, the ML predictors, run_backtest.py's parity manifest) —
+    moved here as the ONE shared implementation so a future change to the
+    resolution semantics only needs to happen once.
+
+    `settings` is an already-loaded Settings object, or None (load_settings()
+    failed or was never attempted). `settings is None` is logged at WARNING —
+    every config-backed knob silently reverting to its (sometimes stricter,
+    sometimes looser) pydantic default because config.yaml went missing
+    mid-run is exactly the class of silent divergence this whole PR exists to
+    prevent, and load_settings()'s own divergence report never runs on this
+    path (it's the last line inside a SUCCESSFUL load). A partial settings
+    stub (missing this one section/field, e.g. a test fixture) stays silent —
+    that's an intentional, narrower degradation tests rely on.
+    """
+    if explicit is not None:
+        return explicit
+    if settings is None:
+        from ait.utils.logging import get_logger
+        get_logger("config.settings").warning(
+            "config_unavailable_using_fallback_default",
+            section=section, field=field,
+        )
+        return getattr(fallback_cls(), field)
+    try:
+        return getattr(getattr(settings, section), field)
+    except Exception:  # noqa: BLE001 — partial stub -> model default, silent
+        return getattr(fallback_cls(), field)
+
+
 def load_settings(config_path: str | Path = "config.yaml") -> Settings:
     """Load settings from YAML file, with env var overrides for secrets."""
     config_path = Path(config_path)
