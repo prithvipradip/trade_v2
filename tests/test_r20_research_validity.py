@@ -536,6 +536,7 @@ class TestSharedExitPolicy:
         # flat 0.50 (scaling off) must NOT.
         pos = {
             "expiry_date": str(date(2024, 6, 11)),
+            "entry_date": str(date(2024, 6, 1)),
             "strategy": "iron_condor",
         }
         out = bt._check_exit_credit(dict(pos), 0.35, date(2024, 6, 3))

@@ -358,6 +358,8 @@ class TestPreEventBlackoutRelaxed:
         bt._touch_stop_enabled = False        # rule 0 out of the way
         bt._credit_loss_limit_mult = 0.0      # rule 1 disabled (live parity)
         bt._exit_time_decay_scaling = True    # R20: shared exit_policy ladder flag
+        bt._max_hold_days = 60                # DTE/hold-cap fix: keep the new
+                                               # hold-cap check from firing here
         cal = MagicMock()
         cal.days_until_next_event.return_value = d2e
         bt._economic_cal = cal
@@ -367,6 +369,7 @@ class TestPreEventBlackoutRelaxed:
         # 30 DTE, +5% of credit: clears the take-profit ladder and the DTE<=5
         # close, so the macro rule is the only one that can fire.
         return {"strategy": strategy, "high_water_mark": 0.0,
+                "entry_date": str(date.today()),
                 "expiry_date": str(date.today() + timedelta(days=30))}
 
     def test_engine_holds_a_condor_through_the_event(self, monkeypatch):
