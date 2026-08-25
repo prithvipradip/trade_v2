@@ -1198,7 +1198,10 @@ class WalkForwardBacktester:
             else:
                 _range_result = self._train_window_range_model(
                     train_df, symbol, window_id,
-                    max_hold_days=self._config.max_hold_days,
+                    # PR#7 review 2026-08-25: was self._config.max_hold_days
+                    # (30) — trained 30-day containment labels for ~9-day
+                    # reachable trades. See _range_label_horizon.
+                    max_hold_days=self._range_label_horizon(),
                 )
             # Guard: tests may monkeypatch _train_window_range_model to return None
             if _range_result is None or not isinstance(_range_result, tuple):
@@ -1468,7 +1471,10 @@ class WalkForwardBacktester:
                 _oos_scores = self._evaluate_range_model_oos(
                     range_predictor, test_df, symbol,
                     threshold_pct=_range_threshold,
-                    horizon_days=self._config.max_hold_days,
+                    # PR#7 review 2026-08-25: OOS eval must score the same
+                    # horizon the model was trained on (see
+                    # _range_label_horizon) — was max_hold_days (30).
+                    horizon_days=self._range_label_horizon(),
                     precomputed_features=_oos_feat_cache,
                 )
                 if _oos_scores and "range_predictor" in _model_weights:
@@ -1746,6 +1752,14 @@ class WalkForwardBacktester:
                     # gate params — trials now score the values they suggest.
                     iv_rank_rise_threshold=self._config.iv_rank_rise_threshold,
                     min_edge_over_baseline=self._config.min_edge_over_baseline,
+                    # PR#7 review 2026-08-25: without these three, trials
+                    # trained at loaded-YAML baselines while the OOS
+                    # Backtester ran the caller's (possibly explicit) config
+                    # values — train/OOS parity break for any run that
+                    # overrides them.
+                    stop_loss_pct=self._config.stop_loss_pct,
+                    profit_target_pct=self._config.profit_target_pct,
+                    min_confidence=self._config.min_confidence,
                     seed=self._config.optimize_seed,
                     intraday_store=_intraday_store,
                     symbol=symbol,
@@ -2289,17 +2303,44 @@ class WalkForwardBacktester:
                     n_windows=n_windows,
                 )
                 # Train directly in-process — Optuna hasn't started, no RNG risk.
+                # PR#7 review 2026-08-25: was self._config.max_hold_days (30)
+                # for both label and threshold horizons — see
+                # _range_label_horizon.
                 per_symbol[symbol] = self._train_window_range_model_inprocess(
                     train_df=train_df,
                     symbol=symbol,
                     window_id=window_id,
-                    max_hold_days=self._config.max_hold_days,
+                    max_hold_days=self._range_label_horizon(),
                     threshold_pct=self._adaptive_range_threshold(
-                        train_df, horizon_days=self._config.max_hold_days
+                        train_df, horizon_days=self._range_label_horizon()
                     ),
                 )
             results.append(per_symbol)
         return results
+
+    def _range_label_horizon(self) -> int:
+        """Label/eval horizon for the range model: the REACHABLE trade horizon.
+
+        PR#7 review 2026-08-25: both range-training paths passed
+        self._config.max_hold_days (resolves to 30) as RangePredictor's
+        horizon_days, but since the engine's entry_dte decoupling positions
+        expire at options.dte_range[0] (14) and credit structures close at
+        EXPIRY_APPROACHING_DTE (5) — real holds cap at ~9 calendar days, and
+        optimized IC holds search 1-9. The model was trained to predict
+        30-day containment (a strictly harder question) and reused to gate
+        much shorter trades. Derive the horizon from what a trade can
+        actually reach; max_hold_days remains a cap, never an extender.
+        """
+        from ait.config.settings import OptionsConfig
+        from ait.execution.exit_policy import EXPIRY_APPROACHING_DTE
+        try:
+            _opts = (self._settings.options if self._settings is not None
+                     else OptionsConfig())
+        except Exception:  # noqa: BLE001 — partial test stubs -> field defaults
+            _opts = OptionsConfig()
+        entry_dte = int(_opts.dte_range[0])
+        reachable = max(1, entry_dte - int(EXPIRY_APPROACHING_DTE))
+        return min(int(self._config.max_hold_days), reachable)
 
     def _train_window_range_model(
         self,

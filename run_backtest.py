@@ -163,7 +163,12 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
         # loaded settings value live uses — report the resolved number, not None.
         "pre_event_blackout_days": live_blackout,
         "delta_target":      0.20,   # Backtester delta_short default (walk-forward does not override)
-        "dte_band":          [21, 21],  # engine uses fixed DTE = max_hold_days
+        # PR#7 review 2026-08-25: was a stale hardcoded [21, 21] with the note
+        # "engine uses fixed DTE = max_hold_days" — the engine's 2026-08-24
+        # decoupling resolves entry_dte from options.dte_range[0] instead, so
+        # the manifest reported a DTE no run actually priced. Report the same
+        # resolution the engine performs.
+        "dte_band":          [live_dte[0], live_dte[0]],
         "tp_ladder":         bt_ladder,
         "wing_floor":        args.wing_floor,
         "macro_gate_entry":  args.macro_gate,

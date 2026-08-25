@@ -118,6 +118,16 @@ class StrategyOptimizer:
         *,
         iv_rank_rise_threshold: float | None = None,
         min_edge_over_baseline: float | None = None,
+        # PR#7 review 2026-08-25: walkforward threads wing/IV/gate overrides
+        # into every per-window optimizer, but NOT these three non-searched
+        # trial baselines — an explicitly configured historical run trained
+        # IC trials at the loaded-YAML values and then evaluated OOS with the
+        # caller's explicit values (train/OOS parity break, same class as the
+        # R20 #2 dropped-dimension bug). None resolves from config exactly as
+        # before; explicit caller values now win, matching wing_k/iv_floor.
+        stop_loss_pct: float | None = None,
+        profit_target_pct: float | None = None,
+        min_confidence: float | None = None,
         seed: int = 42,
         intraday_store: "Any | None" = None,
         symbol: str | None = None,
@@ -202,17 +212,31 @@ class StrategyOptimizer:
             float(min_edge_over_baseline) if min_edge_over_baseline is not None
             else float(_bt_cfg.min_edge_over_baseline)
         )
+        # PR#7 review 2026-08-25: explicit caller values (walkforward threads
+        # its config-resolved copies) win over the config baselines so trial
+        # training and OOS evaluation see the SAME numbers.
+        self._stop_loss_pct = (
+            float(stop_loss_pct) if stop_loss_pct is not None
+            else float(_bt_cfg.stop_loss_pct)
+        )
+        self._profit_target_pct = (
+            float(profit_target_pct) if profit_target_pct is not None
+            else float(_bt_cfg.profit_target_pct)
+        )
         # R20b follow-up: min_confidence in _run_backtest's bt_kwargs was a
         # hardcoded 0.55 even though the sibling literals above were migrated
         # to config resolution in this same PR -- same defect class, lives on
         # RiskConfig (not BacktestConfig) since that's min_confidence's
         # documented home (see engine.py's resolution comment). Reuses
         # self._settings (loaded once above), not a second independent read.
-        try:
-            self._min_confidence = float(self._settings.risk.min_confidence)
-        except Exception:  # noqa: BLE001 — no config.yaml -> field default
-            from ait.config.settings import RiskConfig as _RC
-            self._min_confidence = float(_RC().min_confidence)
+        if min_confidence is not None:
+            self._min_confidence = float(min_confidence)
+        else:
+            try:
+                self._min_confidence = float(self._settings.risk.min_confidence)
+            except Exception:  # noqa: BLE001 — no config.yaml -> field default
+                from ait.config.settings import RiskConfig as _RC
+                self._min_confidence = float(_RC().min_confidence)
         self._seed = seed
         self._intraday_store = intraday_store
         self._symbol = symbol
@@ -428,8 +452,11 @@ class StrategyOptimizer:
         _bl = self._bt_baselines
         bt_kwargs: dict[str, Any] = {
             "initial_capital":       self._initial_capital,
-            "stop_loss_pct":         float(_bl.stop_loss_pct),
-            "profit_target_pct":     float(_bl.profit_target_pct),
+            # PR#7 review 2026-08-25: were float(_bl.stop_loss_pct)/(_bl.
+            # profit_target_pct) — always the loaded YAML, ignoring explicit
+            # caller overrides that the OOS Backtester WOULD honor.
+            "stop_loss_pct":         self._stop_loss_pct,
+            "profit_target_pct":     self._profit_target_pct,
             "min_confidence":        self._min_confidence,
             "position_size_pct":     self._position_size_pct,
             "trailing_stop_pct":     0.25,

@@ -1327,3 +1327,25 @@ store — our daily_prices.implied_vol path unchanged; reconcile pending) and
 pulled curious-talleb's review round (engine entry_dte decoupled from Optuna's
 max_hold_days cap, UTC-midnight flaky-test fixes, vix-tier fallback, iv_floor
 dup, GO_LIVE_VERDICT_STRATEGIES frozenset in base.py).
+
+## 2026-08-25 - R21b: PR#7 REVIEW ROUND (Copilot, 4 findings) — ALL VERIFIED REAL, FIXED
+All four are fallout from the 08-24 entry_dte/max_hold_days decoupling:
+[1] param_spaces: 7 non-IC spaces searched max_hold_days from 14 up — debit
+    expires at entry_dte (14), credit closes at DTE<=5 (~day 9), so the
+    dimension was flat Optuna noise. Bounded: debit (5,14), credit (1,9).
+[2] optimizer: stop_loss_pct/profit_target_pct/min_confidence had no ctor
+    overrides — walkforward's explicit values reached the OOS Backtester but
+    NOT trial baselines (train/OOS parity break). Threaded through, explicit
+    wins, None still resolves from config.
+[3] walkforward: range model trained + OOS-evaluated at horizon
+    max_hold_days (30) while reachable IC holds cap at ~9 days — 30-day
+    containment labels gating 9-day trades. New _range_label_horizon() =
+    min(max_hold_days, dte_range[0] - EXPIRY_APPROACHING_DTE); all 3 range
+    call sites switched (direction-model eval untouched — separate question).
+[4] run_backtest parity manifest hardcoded dte_band [21,21] ("engine uses
+    fixed DTE = max_hold_days" — retired convention) — now reports
+    [dte_range[0]]x2, matched against the actual engine in a test.
+PROOF: tests/test_r21b_pr7_review_round.py — 8 tests execute the real
+resolution paths (space reachability vs CREDIT_STRATEGIES, ctor override
+precedence + config defaults, horizon derivation + cap + degraded-settings
+fallback, manifest == live Backtester._entry_dte).
