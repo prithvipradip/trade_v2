@@ -51,6 +51,17 @@ risk:
   max_correlation: 0.75                # Correlation above which symbols count as the same bet
   max_correlated_positions: 2          # Positions per correlated cluster (was code default)
   max_credit_positions: 6              # Cap on simultaneous short-premium positions (audit R2)
+  # R20b follow-up: these three RiskConfig fields were claimed "relocated to
+  # config.yaml" (PLAN.md R20 entry / settings.py descriptions) but were
+  # never actually declared here -- silently falling back to the pydantic
+  # Field defaults below (values unchanged; this closes the documentation/
+  # consistency gap so config.yaml really is the operating source).
+  pre_event_blackout_days: 1           # Block new credit entries within N days of a macro event
+  credit_cap_vix_tiers:                # VIX-tiered credit-position caps as [vix_below, cap], first match wins
+    - [20.0, 6]
+    - [25.0, 4]
+    - [999.0, 2]
+  max_symbol_concentration_pct: 0.20   # Max fraction of account in one symbol (gate 6c)
   skip_macro_events: true              # R19c: macro-event protection (2026-07-08 decision).
                                        # Condors are code-exempt from the flatten; this governs
                                        # entry gates + undefined-risk flattens.

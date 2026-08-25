@@ -249,7 +249,8 @@ class TestJadeLizardDispatch:
         bt = _bt()
         monkeypatch.setenv("AIT_SKIP_MACRO_EVENTS", "1")
         # DTE 20 (past the DTE<=5 close), pnl below every TP rung.
-        pos_common = {"expiry_date": "2026-06-23", "high_water_mark": 0.0}
+        pos_common = {"expiry_date": "2026-06-23", "entry_date": "2026-06-03",
+                      "high_water_mark": 0.0}
         today = date(2026, 6, 3)
 
         bt._economic_cal = _Cal(2)  # inside the 5-day strangle-class window
@@ -277,7 +278,7 @@ class TestJadeLizardDispatch:
         bt._economic_cal = _Cal()
         monkeypatch.setenv("AIT_SKIP_MACRO_EVENTS", "0")
         jade = {"strategy": "jade_lizard", "expiry_date": "2026-06-23",
-                "high_water_mark": 0.0}
+                "entry_date": "2026-06-03", "high_water_mark": 0.0}
         assert bt._check_exit_credit(
             jade, pnl_pct=0.0, current_date=date(2026, 6, 3)) is None
 

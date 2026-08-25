@@ -276,6 +276,38 @@ class TestOptunaParamsReachEngine:
         assert "iv_rank_rise_threshold=self._config.iv_rank_rise_threshold" in src
         assert "min_edge_over_baseline=self._config.min_edge_over_baseline" in src
 
+    def test_max_hold_days_changes_iron_condor_trial(self, synth_df, synth_features):
+        # End-to-end guard: changing max_hold_days must change IC exits.
+        short_hold = Backtester(
+            **_engine_kwargs(
+                synth_df,
+                synth_features,
+                max_hold_days=1,
+                symbol="SPY",
+            )
+        )
+        long_hold = Backtester(
+            **_engine_kwargs(
+                synth_df,
+                synth_features,
+                max_hold_days=30,
+                symbol="SPY",
+            )
+        )
+        short_hold._touch_stop_enabled = False
+        long_hold._touch_stop_enabled = False
+        short_hold._credit_take_profit_pct = lambda *_a, **_k: 9_999.0
+        long_hold._credit_take_profit_pct = lambda *_a, **_k: 9_999.0
+
+        res_short = short_hold.run()
+        res_long = long_hold.run()
+        assert res_short.total_trades > 0 and res_long.total_trades > 0
+
+        short_reasons = {t.get("exit_reason") for t in res_short.trades}
+        long_reasons = {t.get("exit_reason") for t in res_long.trades}
+        assert "max_hold_reached" in short_reasons
+        assert "max_hold_reached" not in long_reasons
+
 
 # ---------------------------------------------------------------------------
 # #3 — train_window_models=False disables the MetaLabeler too
@@ -487,14 +519,15 @@ class TestSharedExitPolicy:
 
     def test_macro_flatten_windows_match_live_source(self):
         from ait.execution import exit_policy
-        import ait.execution.portfolio as portfolio_mod
+        from ait.execution.portfolio import PortfolioManager
 
-        src = inspect.getsource(portfolio_mod)
-        # Live rule 3d: strangle-class 5 days, CSP/CC 1 day
-        assert re.search(
-            r"_evt_window\s*=\s*5\s+if\s+trade\.strategy\s*==\s*.short_strangle.\s+else\s+1",
-            src,
-        ), "live macro-flatten window structure changed — update exit_policy"
+        # R20 #5a follow-up: live portfolio.py now DELEGATES to the shared
+        # table instead of hand-copying the strategy/window mapping (was a
+        # source-regex tripwire for the inline copy; now checks delegation).
+        src = inspect.getsource(PortfolioManager._evaluate_position)
+        assert "macro_flatten_window_days" in src, (
+            "live portfolio.py should delegate macro-flatten windows to exit_policy"
+        )
         assert exit_policy.macro_flatten_window_days("short_strangle") == 5
         assert exit_policy.macro_flatten_window_days("jade_lizard") == 5
         assert exit_policy.macro_flatten_window_days("cash_secured_put") == 1
@@ -507,12 +540,14 @@ class TestSharedExitPolicy:
 
     def test_expiry_close_dte_matches_live_source(self):
         from ait.execution import exit_policy
-        import ait.execution.portfolio as portfolio_mod
+        from ait.execution.portfolio import PortfolioManager
 
         assert exit_policy.EXPIRY_APPROACHING_DTE == 5
-        src = inspect.getsource(portfolio_mod)
-        assert re.search(r"dte\s+is\s+not\s+None\s+and\s+dte\s*<=\s*5", src), (
-            "live DTE-close rule changed — update exit_policy"
+        # R20 #5a follow-up: live portfolio.py now DELEGATES (dte <=
+        # EXPIRY_APPROACHING_DTE) instead of hand-copying the literal 5.
+        src = inspect.getsource(PortfolioManager._evaluate_position)
+        assert "EXPIRY_APPROACHING_DTE" in src, (
+            "live portfolio.py should delegate the DTE-close rule to exit_policy"
         )
         eng_src = inspect.getsource(Backtester._check_exit_credit)
         assert "EXPIRY_APPROACHING_DTE" in eng_src
@@ -533,6 +568,7 @@ class TestSharedExitPolicy:
         # flat 0.50 (scaling off) must NOT.
         pos = {
             "expiry_date": str(date(2024, 6, 11)),
+            "entry_date": str(date(2024, 6, 1)),
             "strategy": "iron_condor",
         }
         out = bt._check_exit_credit(dict(pos), 0.35, date(2024, 6, 3))

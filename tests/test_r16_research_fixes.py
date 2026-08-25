@@ -388,7 +388,7 @@ class TestCreditLossParity:
     def test_zero_mult_never_fires_flat_stop(self, synth_df, synth_features, monkeypatch):
         monkeypatch.delenv("AIT_CREDIT_LOSS_LIMIT", raising=False)
         bt = Backtester(**_engine_kwargs(synth_df, synth_features))
-        pos = {"expiry_date": "2099-01-01", "strategy": "iron_condor"}
+        pos = {"expiry_date": "2099-01-01", "entry_date": "2024-06-01", "strategy": "iron_condor"}
         # deep loss, far expiry: with the stop disabled nothing may fire
         assert bt._check_exit_credit(dict(pos), -2.0, date(2024, 6, 3)) is None
 
@@ -396,7 +396,7 @@ class TestCreditLossParity:
         bt = Backtester(
             **_engine_kwargs(synth_df, synth_features, credit_loss_limit_mult=1.25)
         )
-        pos = {"expiry_date": "2099-01-01", "strategy": "iron_condor"}
+        pos = {"expiry_date": "2099-01-01", "entry_date": "2024-06-01", "strategy": "iron_condor"}
         out = bt._check_exit_credit(dict(pos), -1.3, date(2024, 6, 3))
         assert out is not None and out["exit_reason"] == "credit_loss_limit"
 

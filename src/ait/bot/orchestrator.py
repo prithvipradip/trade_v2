@@ -1190,10 +1190,11 @@ class TradingOrchestrator:
         # guard refused to train on 9/20 features. Every close without this
         # is training data lost forever.
         try:
+            _snap = getattr(self, "_entry_feature_snap", None)
+            if _snap is None:
+                _snap = self._entry_feature_snap = {}
+            _snap.pop(symbol, None)
             if not features_df.empty:
-                _snap = getattr(self, "_entry_feature_snap", None)
-                if _snap is None:
-                    _snap = self._entry_feature_snap = {}
                 _snap[symbol] = features_df.iloc[-1]
         except Exception:  # noqa: BLE001 — telemetry must never break a scan
             pass

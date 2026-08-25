@@ -819,7 +819,7 @@ class TestWindowLevelParallelism:
         cfg = WalkForwardConfig(train_days=100, test_days=30, gap_days=5)
         bt = WalkForwardBacktester(["SPY"], ["iron_condor"], config=cfg)
 
-        wr, params = bt._run_single_window(
+        wr, params, _ = bt._run_single_window(
             window_id=1,
             train_start=date(2023, 1, 1),
             train_end=date(2023, 4, 11),

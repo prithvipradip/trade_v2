@@ -140,7 +140,7 @@ class TestWalkforwardWindowCapitalUsesActiveSymbols:
                                 initial_capital=100_000.0)
         bt = WalkForwardBacktester(["SPY", "QQQ"], ["iron_condor"], config=cfg)
 
-        wr, _ = bt._run_single_window(
+        wr, _, _ = bt._run_single_window(
             window_id=1,
             train_start=date(2023, 1, 1), train_end=date(2023, 10, 28),
             test_start=date(2023, 11, 2), test_end=date(2023, 12, 22),

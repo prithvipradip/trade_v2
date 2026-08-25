@@ -11,8 +11,12 @@ from __future__ import annotations
 import re
 import sqlite3
 import subprocess
+import sys
 from datetime import datetime, date
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+from ait.strategies.base import GO_LIVE_VERDICT_STRATEGIES
 
 ROOT = Path(__file__).resolve().parent
 DB = ROOT / "data" / "ait_state.db"
@@ -217,7 +221,7 @@ def main() -> None:
                 cum += r[0]; peak = max(peak, cum); dd = max(dd, peak - cum)
             return n, w, sum(r[0] for r in rs), pf, dd
 
-        ic = [r for r in rows if r["strategy"] == "iron_condor"]
+        ic = [r for r in rows if r["strategy"] in GO_LIVE_VERDICT_STRATEGIES]
         n, w, net, pf, dd = _stats(ic)
         print(f"  GO-LIVE GATES (IRON CONDOR — the verdict metric): "
               f"closes {n}/50 | {w}W-{n - w}L | net ${net:+,.2f} | PF {pf} (>1.3) | maxDD ${dd:,.0f}")

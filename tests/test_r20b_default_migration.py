@@ -131,6 +131,13 @@ class TestWalkForwardConfigResolution:
         assert cfg.range_min_confidence == pytest.approx(
             load_settings("config.yaml").ml.range_min_confidence
         )
+        st = load_settings("config.yaml").backtest
+        assert cfg.stop_loss_pct == pytest.approx(st.stop_loss_pct)
+        assert cfg.profit_target_pct == pytest.approx(st.profit_target_pct)
+        assert cfg.max_hold_days == st.max_hold_days
+        assert cfg.hurst_regime_threshold == pytest.approx(st.hurst_regime_threshold)
+        assert cfg.hurst_regime_penalty == pytest.approx(st.hurst_regime_penalty)
+        assert cfg.multifractal_max_width == pytest.approx(st.multifractal_max_width)
 
     def test_env_override_reaches_bare_config(self, monkeypatch):
         # The sentinel resolves THROUGH the contract (env > config > default),
@@ -140,11 +147,20 @@ class TestWalkForwardConfigResolution:
 
     def test_explicit_values_always_win(self, _clean_contract_env):
         cfg = WalkForwardConfig(
-            wing_k=1.0, ic_min_credit_width=0.20, range_min_confidence=0.55
+            wing_k=1.0, ic_min_credit_width=0.20, range_min_confidence=0.55,
+            stop_loss_pct=0.41, profit_target_pct=0.77, max_hold_days=17,
+            hurst_regime_threshold=0.33, hurst_regime_penalty=0.22,
+            multifractal_max_width=0.61,
         )
         assert cfg.wing_k == pytest.approx(1.0)
         assert cfg.ic_min_credit_width == pytest.approx(0.20)
         assert cfg.range_min_confidence == pytest.approx(0.55)
+        assert cfg.stop_loss_pct == pytest.approx(0.41)
+        assert cfg.profit_target_pct == pytest.approx(0.77)
+        assert cfg.max_hold_days == 17
+        assert cfg.hurst_regime_threshold == pytest.approx(0.33)
+        assert cfg.hurst_regime_penalty == pytest.approx(0.22)
+        assert cfg.multifractal_max_width == pytest.approx(0.61)
 
     def test_no_config_yaml_falls_back_to_ml_model_default(self, monkeypatch):
         import ait.config.settings as settings_mod
@@ -153,11 +169,20 @@ class TestWalkForwardConfigResolution:
             raise FileNotFoundError("no config.yaml")
 
         monkeypatch.setattr(settings_mod, "load_settings", _boom)
-        from ait.config.settings import MLConfig
+        from ait.config.settings import BacktestConfig, MLConfig
         cfg = WalkForwardConfig()
         assert cfg.range_min_confidence == pytest.approx(
             MLConfig().range_min_confidence
         )
+        bt_defaults = BacktestConfig()
+        assert cfg.stop_loss_pct == pytest.approx(bt_defaults.stop_loss_pct)
+        assert cfg.profit_target_pct == pytest.approx(bt_defaults.profit_target_pct)
+        assert cfg.max_hold_days == bt_defaults.max_hold_days
+        assert cfg.hurst_regime_threshold == pytest.approx(
+            bt_defaults.hurst_regime_threshold
+        )
+        assert cfg.hurst_regime_penalty == pytest.approx(bt_defaults.hurst_regime_penalty)
+        assert cfg.multifractal_max_width == pytest.approx(bt_defaults.multifractal_max_width)
 
     def test_oos_backtester_receives_resolved_values(
         self, synth_df, monkeypatch, _clean_contract_env

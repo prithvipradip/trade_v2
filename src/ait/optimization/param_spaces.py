@@ -37,9 +37,11 @@ IRON_CONDOR_SPACE: dict[str, tuple] = {
     #   reached the trial Backtester at all, so the Exp 26/28 training-side searches over
     #   them were vacuous — see optimizer._run_backtest bt_kwargs invariant).
     "delta_short":            ("float", 0.15, 0.30),
-    # [14, 40]: 60-day OOS windows give a 20-day end buffer (60-40=20), keeping
-    # backtest_end exits rare while still allowing meaningful theta harvesting.
-    "max_hold_days":          ("int",   14,   40),
+    # IC credit trades close at DTE<=5, and entry_dte defaults to 14, so holds
+    # can last ~9 calendar days before expiry_approaching takes over. Keep the
+    # searched range inside that reachable window so this dimension can move
+    # trial outcomes instead of becoming flat noise.
+    "max_hold_days":          ("int",   1,    9),
     "wing_k":                 ("float", 0.30, 2.00),
     # Exp 26: iv_rank_rise gate threshold tunable per window. Fixed 0.30 was blocking
     # profitable W01/W02 entries (gradual IV drift pre-crash) once context_bars=252

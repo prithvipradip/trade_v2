@@ -88,6 +88,8 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
     one that loudly diverges on purpose.
     """
     from ait.backtesting.engine import Backtester
+    from ait.config.settings import MLConfig
+    from ait.config.runtime_env import contract_float
 
     env = _live_env()
     settings = _live_settings()
@@ -95,8 +97,40 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
     live_blackout = (settings.risk.pre_event_blackout_days
                      if settings else None)
 
+    # R20b follow-up: wing_k/range_confidence now default to None on the CLI
+    # (resolved by WalkForwardConfig.__post_init__), so report the RESOLVED
+    # value here too -- same reasoning as pre_event_blackout_days above.
+    if args.wing_k is not None:
+        resolved_wing_k = args.wing_k
+    else:
+        resolved_wing_k = contract_float("AIT_IC_WING_K")
+    if args.range_confidence is not None:
+        resolved_range_confidence = args.range_confidence
+    elif settings is not None:
+        resolved_range_confidence = settings.ml.range_min_confidence
+    else:
+        resolved_range_confidence = MLConfig().range_min_confidence
+    # R20b follow-up: same None -> contract_float resolution as wing_k above
+    # -- was raw os.environ.get(..., HARDCODED_FALLBACK), which could never
+    # pick up a config.yaml override (and ic-min-credit-width's fallback,
+    # 0.20, was flatly wrong vs the contract's 0.10).
+    resolved_credit_loss_limit = (
+        args.credit_loss_limit if args.credit_loss_limit is not None
+        else contract_float("AIT_CREDIT_LOSS_LIMIT")
+    )
+    resolved_ic_min_credit = (
+        args.ic_min_credit if args.ic_min_credit is not None
+        else contract_float("AIT_IC_MIN_CREDIT")
+    )
+    resolved_ic_min_credit_width = (
+        args.ic_min_credit_width if args.ic_min_credit_width is not None
+        else contract_float("AIT_IC_MIN_CREDIT_WIDTH")
+    )
+
     live = {
         "wing_k":            float(env.get("AIT_IC_WING_K", "1.0")),
+        "range_min_confidence": (settings.ml.range_min_confidence
+                                  if settings else MLConfig().range_min_confidence),
         "ic_min_credit":     float(env.get("AIT_IC_MIN_CREDIT", "0.70")),
         "ic_min_credit_width": float(env.get("AIT_IC_MIN_CREDIT_WIDTH", "0.20")),
         "credit_loss_limit": float(env.get("AIT_CREDIT_LOSS_LIMIT", "0")),
@@ -120,10 +154,11 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
         "dte<=5":    Backtester._credit_take_profit_pct(3),
     }
     backtest = {
-        "wing_k":            args.wing_k,
-        "ic_min_credit":     args.ic_min_credit,
-        "ic_min_credit_width": args.ic_min_credit_width,
-        "credit_loss_limit": args.credit_loss_limit,
+        "wing_k":            resolved_wing_k,
+        "range_min_confidence": resolved_range_confidence,
+        "ic_min_credit":     resolved_ic_min_credit,
+        "ic_min_credit_width": resolved_ic_min_credit_width,
+        "credit_loss_limit": resolved_credit_loss_limit,
         # R16 #7: the walk-forward passes None, so the engine resolves the same
         # loaded settings value live uses — report the resolved number, not None.
         "pre_event_blackout_days": live_blackout,
@@ -206,9 +241,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--step-days", type=int, default=63, help="Step between windows")
     p.add_argument("--gap-days", type=int, default=5, help="Purge gap days")
     p.add_argument("--capital", type=float, default=50_000.0, help="Initial capital")
-    p.add_argument("--min-confidence", type=float, default=0.65, help="Min ML confidence")
-    p.add_argument("--range-confidence", type=float, default=0.55,
-                   help="Min P(in_range) for iron condors (range model)")
+    p.add_argument("--min-confidence", type=float, default=None,
+                   help="Min ML confidence. Default resolves from config.yaml "
+                        "risk.min_confidence (currently 0.50 via WalkForwardConfig "
+                        "-- was a stale hardcoded 0.65 that overrode the config-"
+                        "resolved value (R20b follow-up).")
+    p.add_argument("--range-confidence", type=float, default=None,
+                   help="Min P(in_range) for iron condors (range model). "
+                        "Default resolves from config.yaml ml.range_min_confidence "
+                        "(currently 0.65) -- was a stale hardcoded 0.55 (R20b follow-up).")
     p.add_argument("--iv-floor", type=float, default=15.0,
                    help="Min IV rank for iron condors (aligned with live "
                         "AIT_IRON_CONDOR_IV_FLOOR default of 15; was 30)")
@@ -218,24 +259,31 @@ def parse_args() -> argparse.Namespace:
     # live-parity flat loss limit + DTE-laddered take-profit.
     p.add_argument("--trailing-stop", action=argparse.BooleanOptionalAction, default=True,
                    help="Enable trailing stops (debit trades only)")
-    # --- R6 live-parity knobs (defaults resolve from the SAME env vars the
-    # live bot reads, falling back to the live defaults) ---
-    p.add_argument("--credit-loss-limit", type=float,
-                   default=float(os.environ.get("AIT_CREDIT_LOSS_LIMIT", "0")),
+    # --- R6 live-parity knobs (default resolves env > config.yaml > contract
+    # default via contract_float, same as --wing-k below -- was raw
+    # os.environ.get(..., HARDCODED_FALLBACK), which could never pick up a
+    # config.yaml override and, for --ic-min-credit-width, hardcoded the
+    # WRONG fallback: 0.20 vs the contract's 0.10 (CONTRACT_DEFAULTS in
+    # runtime_env.py), so a bare run silently traded a 2x looser credit/width
+    # gate than live. R20b follow-up.) ---
+    p.add_argument("--credit-loss-limit", type=float, default=None,
                    help="Flat loss limit for credit trades, as multiple of credit "
-                        "received (live env AIT_CREDIT_LOSS_LIMIT, default 0=off per R6/R16)")
-    p.add_argument("--ic-min-credit", type=float,
-                   default=float(os.environ.get("AIT_IC_MIN_CREDIT", "0.70")),
-                   help="Min mid-price total credit for iron condors "
-                        "(live env AIT_IC_MIN_CREDIT, default 0.70)")
-    p.add_argument("--ic-min-credit-width", type=float,
-                   default=float(os.environ.get("AIT_IC_MIN_CREDIT_WIDTH", "0.20")),
-                   help="Min credit/max-width ratio for iron condors "
-                        "(live env AIT_IC_MIN_CREDIT_WIDTH, default 0.20)")
-    p.add_argument("--wing-k", type=float,
-                   default=float(os.environ.get("AIT_IC_WING_K", "1.0")),
-                   help="Wing width = wing_k*price*IV*sqrt(DTE/365) "
-                        "(live env AIT_IC_WING_K, default 1.0)")
+                        "received. Default resolves env AIT_CREDIT_LOSS_LIMIT > "
+                        "config.yaml backtest.credit_loss_limit > 0 (off per R6/R16).")
+    p.add_argument("--ic-min-credit", type=float, default=None,
+                   help="Min mid-price total credit for iron condors. Default "
+                        "resolves env AIT_IC_MIN_CREDIT > config.yaml "
+                        "backtest.ic_min_credit > 0.70.")
+    p.add_argument("--ic-min-credit-width", type=float, default=None,
+                   help="Min credit/max-width ratio for iron condors. Default "
+                        "resolves env AIT_IC_MIN_CREDIT_WIDTH > config.yaml "
+                        "backtest.ic_min_credit_width > 0.10 -- was a hardcoded "
+                        "0.20, 2x the contract default (R20b follow-up).")
+    p.add_argument("--wing-k", type=float, default=None,
+                   help="Wing width = wing_k*price*IV*sqrt(DTE/365). Default "
+                        "resolves env AIT_IC_WING_K > config.yaml backtest.wing_k "
+                        "> 1.6 (contract_float) -- was a stale hardcoded 1.0 "
+                        "that shadowed the promoted live value (R20b follow-up).")
     p.add_argument("--wing-floor", type=float, default=2.0,
                    help="Hard minimum wing width in $ (live enforces $2; "
                         "old backtest default was $5)")

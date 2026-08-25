@@ -60,6 +60,15 @@ NEUTRAL_CREDIT_GATED = (
 )
 
 
+# R20b review follow-up: this used to be a private copy of the "explicit >
+# config > fallback-class-default" precedence, duplicated independently in
+# walkforward.py/optimizer.py/the ML predictors/run_backtest.py. Moved to
+# ait.config.settings as the ONE shared implementation (also reused by those
+# other call sites); re-imported under the original name so every existing
+# `_resolve_setting(...)` call in this file needs no change.
+from ait.config.settings import resolve_config_value as _resolve_setting
+
+
 class Backtester:
     """Simulates trading strategies against historical OHLCV data."""
 
@@ -184,6 +193,26 @@ class Backtester:
         # engine's designed fallback and what the ablation studies claimed to
         # measure.
         allow_live_model_fallback: bool = True,
+        # DTE/hold-cap decoupling fix (2026-08-24): entry_dte is the REAL
+        # time-to-expiration used for BS pricing and decay, fixed near what
+        # live actually gets (options_chain.py picks the nearest expiry >=
+        # dte_range[0]) — it is NOT Optuna-searched. max_hold_days remains a
+        # separate, deliberately-synthetic Optuna-searched hold-period cap
+        # (live has no "close after N days held" rule; only DTE/touch/TP
+        # exits) for exploring shorter/longer forced-hold horizons. Before
+        # this fix both concepts were the SAME variable (self._max_hold_days
+        # doubled as the option's simulated expiration), so every prior
+        # walk-forward study's "optimal max_hold_days" was silently also
+        # picking the simulated DTE. None -> resolve options.dte_range[0]
+        # from load_settings() (config.yaml authority; falls back to
+        # OptionsConfig's pydantic default when no config.yaml is reachable).
+        entry_dte: int | None = None,
+        # R20b follow-up: optional pre-loaded Settings, so a caller building
+        # many Backtester instances (StrategyOptimizer: one per Optuna trial)
+        # can load config.yaml ONCE and thread it through instead of every
+        # construction re-reading and re-validating the file from disk.
+        # None (default) preserves the original behavior — load it here.
+        settings: Any = None,
     ) -> None:
         self._data = self._prepare_data(data)
         self._strategies = strategies
@@ -246,45 +275,24 @@ class Backtester:
         self._earnings_dates: set[date] = self._load_earnings_dates(symbol, earnings_skip_days)
         self._intraday_store = intraday_store
         # R20: resolve LOADED settings once for every config-backed knob below
-        # (extends the R16 #7 pre_event_blackout_days pattern). Each consumer
-        # guards its own attribute access so a partial stub or a missing
-        # config.yaml degrades to that field's config-model default.
-        try:
-            from ait.config.settings import load_settings as _ls
-            _settings = _ls()
-        except Exception:  # noqa: BLE001 — no config.yaml -> per-field defaults
-            _settings = None
-        # R20 #4/#5b: intraday execution knobs — ONE source (settings.backtest,
-        # config.yaml-backed). Explicit constructor args still win.
-        try:
-            _bt_cfg = _settings.backtest
-        except Exception:  # noqa: BLE001
-            _bt_cfg = None
-        if _bt_cfg is None:
-            from ait.config.settings import BacktestConfig as _BTC
-            _bt_cfg = _BTC()
-        self._scan_interval_minutes = (
-            int(scan_interval_minutes) if scan_interval_minutes is not None
-            else int(_bt_cfg.scan_interval_minutes)
-        )
-        self._entry_window_start_et = (
-            str(entry_window_start_et) if entry_window_start_et is not None
-            else str(_bt_cfg.entry_window_start_et)
-        )
-        self._entry_window_end_et = (
-            str(entry_window_end_et) if entry_window_end_et is not None
-            else str(_bt_cfg.entry_window_end_et)
-        )
-        self._limit_order_timeout_bars = (
-            int(limit_order_timeout_bars) if limit_order_timeout_bars is not None
-            else int(_bt_cfg.limit_order_timeout_bars)
-        )
-        # R20b (pre-registered PLAN 2026-08-21): the three constructor
-        # defaults that SHADOWED config with different values now resolve
-        # from the loaded settings (same pattern as the intraday knobs above;
-        # explicit constructor args always win; per-field guards degrade a
-        # partial stub / missing config.yaml to that field's config-model
-        # default):
+        # (extends the R16 #7 pre_event_blackout_days pattern).
+        # R20b follow-up: reuse a caller-supplied `settings` (e.g.
+        # StrategyOptimizer loads it once and threads it through per Optuna
+        # trial) instead of unconditionally re-reading + re-validating
+        # config.yaml on every Backtester construction.
+        if settings is not None:
+            _settings = settings
+        else:
+            try:
+                from ait.config.settings import load_settings as _ls
+                _settings = _ls()
+            except Exception:  # noqa: BLE001 — no config.yaml -> per-field defaults
+                _settings = None
+        # R20 #4/#5b + R20b (pre-registered PLAN 2026-08-21): every knob below
+        # follows the same explicit > settings.<section>.<field> > config-model
+        # default precedence (_resolve_setting); explicit constructor args
+        # always win, a partial stub or missing config.yaml degrades to that
+        # field's pydantic default.
         #   iv_floor             0.12 -> settings.backtest.iv_floor      (yaml 0.20)
         #   range_min_confidence 0.55 -> settings.ml.range_min_confidence (yaml 0.65)
         #   min_confidence       0.55 -> settings.risk.min_confidence     (yaml 0.50)
@@ -296,36 +304,37 @@ class Backtester:
         # prediction.confidence < min_confidence`), and the production-params
         # exporter already maps "min_confidence" -> ("risk", "min_confidence")
         # (optimization/results.py). It is NOT ml.range_min_confidence (the
-        # range-gate floor, a separate knob resolved above).
-        self._iv_floor = (
-            float(iv_floor) if iv_floor is not None
-            else float(_bt_cfg.iv_floor)
+        # range-gate floor, a separate knob resolved below).
+        from ait.config.settings import (
+            BacktestConfig, ExitConfig, MLConfig, OptionsConfig, RiskConfig,
         )
-        if range_min_confidence is not None:
-            self._range_min_confidence = float(range_min_confidence)
-        else:
-            try:
-                self._range_min_confidence = float(_settings.ml.range_min_confidence)
-            except Exception:  # noqa: BLE001 — partial stub / no config -> model default
-                from ait.config.settings import MLConfig as _MLC
-                self._range_min_confidence = float(_MLC().range_min_confidence)
-        if min_confidence is not None:
-            self._min_confidence = float(min_confidence)
-        else:
-            try:
-                self._min_confidence = float(_settings.risk.min_confidence)
-            except Exception:  # noqa: BLE001 — partial stub / no config -> model default
-                from ait.config.settings import RiskConfig as _RC2
-                self._min_confidence = float(_RC2().min_confidence)
+        # entry_dte: real time-to-expiration for BS pricing/decay, fixed near
+        # live's actual chain selection (dte_range[0]) — see constructor
+        # comment. Not itself Optuna-searched; max_hold_days (below) stays
+        # the searched hold-cap knob.
+        self._entry_dte = int(entry_dte) if entry_dte is not None else int(
+            _resolve_setting(None, "options", "dte_range", OptionsConfig, _settings)[0])
+        self._scan_interval_minutes = int(_resolve_setting(
+            scan_interval_minutes, "backtest", "scan_interval_minutes", BacktestConfig, _settings))
+        self._entry_window_start_et = str(_resolve_setting(
+            entry_window_start_et, "backtest", "entry_window_start_et", BacktestConfig, _settings))
+        self._entry_window_end_et = str(_resolve_setting(
+            entry_window_end_et, "backtest", "entry_window_end_et", BacktestConfig, _settings))
+        self._limit_order_timeout_bars = int(_resolve_setting(
+            limit_order_timeout_bars, "backtest", "limit_order_timeout_bars", BacktestConfig, _settings))
+        self._iv_floor = float(_resolve_setting(
+            iv_floor, "backtest", "iv_floor", BacktestConfig, _settings))
+        self._range_min_confidence = float(_resolve_setting(
+            range_min_confidence, "ml", "range_min_confidence", MLConfig, _settings))
+        self._min_confidence = float(_resolve_setting(
+            min_confidence, "risk", "min_confidence", RiskConfig, _settings))
         # R20 #5a: live's TP ladder is gated by exit.time_decay_scaling
         # (portfolio.py _get_take_profit_targets); the engine ran the ladder
         # unconditionally, so flipping the flag moved live to flat 0.50
-        # targets while research kept the ladder.
-        try:
-            self._exit_time_decay_scaling = bool(_settings.exit.time_decay_scaling)
-        except Exception:  # noqa: BLE001 — no config -> ExitConfig default
-            from ait.config.settings import ExitConfig as _EC
-            self._exit_time_decay_scaling = bool(_EC().time_decay_scaling)
+        # targets while research kept the ladder. No constructor override —
+        # always follows the loaded/default config, same as before.
+        self._exit_time_decay_scaling = bool(_resolve_setting(
+            None, "exit", "time_decay_scaling", ExitConfig, _settings))
         self._meta_labeler = meta_labeler
         self._eval_start_date = eval_start_date
 
@@ -366,18 +375,8 @@ class Backtester:
         # R16 #7: resolve the macro blackout window ONCE, from the same source
         # live reads (loaded settings), instead of pinning to RiskConfig()
         # defaults on every entry day.
-        if pre_event_blackout_days is not None:
-            self._pre_event_blackout_days = int(pre_event_blackout_days)
-        else:
-            try:
-                # R20: _settings resolved once above (same load_settings()
-                # source live reads; same fallback semantics as before).
-                self._pre_event_blackout_days = int(
-                    _settings.risk.pre_event_blackout_days
-                )
-            except Exception:  # noqa: BLE001 — no config.yaml -> config default
-                from ait.config.settings import RiskConfig as _RC
-                self._pre_event_blackout_days = int(_RC().pre_event_blackout_days)
+        self._pre_event_blackout_days = int(_resolve_setting(
+            pre_event_blackout_days, "risk", "pre_event_blackout_days", RiskConfig, _settings))
 
         # R16 #1: explicit, loudly-logged predictor mode. Never silently score
         # research windows with the live (future-trained) artifact.
@@ -1451,7 +1450,7 @@ class Backtester:
         """Build a position dict with proper BS pricing for the strategy type."""
         underlying = row["Close"]
         iv = self._get_iv(hist, market_context=market_context)
-        dte = self._max_hold_days
+        dte = self._entry_dte
         t = dte / 365.0
         r = 0.05
 
@@ -2084,7 +2083,10 @@ class Backtester:
         - For credit positions: current cost to buy back (want it to go DOWN)
         """
         iv = self._get_current_iv(pos, hist)
-        dte_remaining = max(self._max_hold_days - days_held, 0)
+        # Decay to the REAL expiration (entry_dte), not the hold-cap —
+        # max_hold_days now closes the position early via its own exit
+        # check (_check_exit_*) rather than by fabricating a shorter option.
+        dte_remaining = max(self._entry_dte - days_held, 0)
         t = max(dte_remaining / 365.0, 0.0001)
         r = 0.05
 
@@ -2361,6 +2363,18 @@ class Backtester:
                 remaining_dte, self._exit_time_decay_scaling):
             return {"exit_date": str(current_date), "exit_reason": "take_profit_short"}
 
+        # 2b. Max-hold-days cap — RESEARCH-ONLY knob (Optuna-searched): live
+        # has no "close after N days held" rule, only the DTE/touch/TP exits
+        # in this function. 2026-08-24 fix: before this, max_hold_days WAS
+        # entry_dte (the same variable), so this trigger never existed — the
+        # position simply couldn't outlive its own fabricated expiration.
+        # Now entry_dte is fixed near live's real chain selection and
+        # max_hold_days independently forces an earlier close, letting
+        # Optuna explore shorter/longer synthetic hold horizons.
+        held = (current_date - date.fromisoformat(pos["entry_date"])).days
+        if held >= self._max_hold_days:
+            return {"exit_date": str(current_date), "exit_reason": "max_hold_reached"}
+
         # 3. Expiry-approaching close — live closes any position at
         # DTE <= exit_policy.EXPIRY_APPROACHING_DTE (portfolio.py rule 3a;
         # rule 3 assignment risk at DTE<=1 is subsumed).
@@ -2402,6 +2416,11 @@ class Backtester:
         if pnl_pct >= target:
             return {"exit_date": str(current_date), "exit_reason": "profit_target"}
 
+        # Max-hold-days cap (research-only knob; see _check_exit_credit)
+        held = (current_date - date.fromisoformat(pos["entry_date"])).days
+        if held >= self._max_hold_days:
+            return {"exit_date": str(current_date), "exit_reason": "max_hold_reached"}
+
         # Expiry
         expiry = date.fromisoformat(pos["expiry_date"])
         if current_date >= expiry:
@@ -2423,6 +2442,11 @@ class Backtester:
 
         if pnl_pct <= effective_stop:
             return {"exit_date": str(current_date), "exit_reason": stop_label}
+
+        # Max-hold-days cap (research-only knob; see _check_exit_credit)
+        held = (current_date - date.fromisoformat(pos["entry_date"])).days
+        if held >= self._max_hold_days:
+            return {"exit_date": str(current_date), "exit_reason": "max_hold_reached"}
 
         expiry = date.fromisoformat(pos["expiry_date"])
         if current_date >= expiry:

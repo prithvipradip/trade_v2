@@ -8,12 +8,13 @@ de-synced every parity backtest (the same divergence class that motivated
 importing CREDIT_STRATEGIES from strategies/base.py). The values now live
 here, in a pure import-light module consumed by the engine.
 
-TODO(R20): src/ait/execution/portfolio.py should ALSO import these instead of
-carrying its own inline copies. It is under concurrent edit and not owned by
-the R20 research change, so it was deliberately not touched; until it is
-wired, tests/test_r20_research_validity.py::TestSharedExitPolicy EXECUTES the
-live _get_take_profit_targets and compares it against this module, so any
-future de-sync fails a test instead of silently diverging.
+R20 follow-up: src/ait/execution/portfolio.py now imports these directly
+(take_profit_targets, EXPIRY_APPROACHING_DTE, macro_flatten_window_days)
+instead of carrying its own inline copies — this module is the only
+implementation, live and research both read it.
+tests/test_r20_research_validity.py::TestSharedExitPolicy still EXECUTES the
+live _get_take_profit_targets and compares it against this module as a
+regression guard against a future hand-copy creeping back in.
 
 This module must stay pure and import-light (no pandas/numpy/broker imports):
 it is imported by both the live exit path and the research engine.

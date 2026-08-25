@@ -102,6 +102,38 @@ class RiskConfig(_StrictModel):
         description="No NEW credit entries when VIX is at/above this level — "
                     "cheap vol-regime brake for short-premium strategies.")
 
+    @field_validator("credit_cap_vix_tiers")
+    @classmethod
+    def validate_credit_cap_vix_tiers(cls, v: list[list[float]]) -> list[list[float]]:
+        """R20b review follow-up: manager.py consumes each row via two-value
+        unpacking (`for ceiling, cap in ...`) and takes the FIRST match in
+        list order — a malformed row (wrong arity), a non-integer/non-positive
+        cap, or unsorted ceilings all passed startup validation before this
+        fix and could crash trade validation or silently apply the wrong cap.
+        """
+        if not v:
+            raise ValueError("credit_cap_vix_tiers must not be empty")
+        prev_ceiling = float("-inf")
+        for row in v:
+            if len(row) != 2:
+                raise ValueError(
+                    f"credit_cap_vix_tiers row {row!r} must be exactly "
+                    "[vix_ceiling, cap]"
+                )
+            ceiling, cap = row
+            if cap <= 0 or int(cap) != cap:
+                raise ValueError(
+                    f"credit_cap_vix_tiers cap {cap!r} must be a positive integer"
+                )
+            if ceiling <= prev_ceiling:
+                raise ValueError(
+                    "credit_cap_vix_tiers ceilings must be strictly increasing "
+                    f"(row {row!r} does not exceed the prior ceiling "
+                    f"{prev_ceiling!r})"
+                )
+            prev_ceiling = ceiling
+        return v
+
 
 class OptionsConfig(_StrictModel):
     delta_range: list[float] = [0.20, 0.50]
@@ -414,6 +446,40 @@ class Settings(_StrictModel):
     # Loaded from environment
     ibkr: IBKREnvConfig = IBKREnvConfig()
     api_keys: APIKeysConfig = APIKeysConfig()
+
+
+def resolve_config_value(explicit, section: str, field: str, fallback_cls, settings):
+    """explicit > loaded settings.<section>.<field> > fallback_cls().<field>.
+
+    R20b review follow-up: the "explicit arg > config > fallback-class-default"
+    precedence was hand-duplicated at 4+ call sites (engine.py, walkforward.py,
+    optimizer.py, the ML predictors, run_backtest.py's parity manifest) —
+    moved here as the ONE shared implementation so a future change to the
+    resolution semantics only needs to happen once.
+
+    `settings` is an already-loaded Settings object, or None (load_settings()
+    failed or was never attempted). `settings is None` is logged at WARNING —
+    every config-backed knob silently reverting to its (sometimes stricter,
+    sometimes looser) pydantic default because config.yaml went missing
+    mid-run is exactly the class of silent divergence this whole PR exists to
+    prevent, and load_settings()'s own divergence report never runs on this
+    path (it's the last line inside a SUCCESSFUL load). A partial settings
+    stub (missing this one section/field, e.g. a test fixture) stays silent —
+    that's an intentional, narrower degradation tests rely on.
+    """
+    if explicit is not None:
+        return explicit
+    if settings is None:
+        from ait.utils.logging import get_logger
+        get_logger("config.settings").warning(
+            "config_unavailable_using_fallback_default",
+            section=section, field=field,
+        )
+        return getattr(fallback_cls(), field)
+    try:
+        return getattr(getattr(settings, section), field)
+    except Exception:  # noqa: BLE001 — partial stub -> model default, silent
+        return getattr(fallback_cls(), field)
 
 
 def load_settings(config_path: str | Path = "config.yaml") -> Settings:
