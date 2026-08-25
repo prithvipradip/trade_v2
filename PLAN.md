@@ -1303,3 +1303,27 @@ RESIDUALS (named, bounded): run_backtest.py CLI argparse defaults re-freeze old 
 (stale env fallbacks 1.0/0.20/0.55) — ops-round item; bare StrategyOptimizer() without
 walkforward threading still defaults wing_k 1.0 (walk-forward path correct); dashboard
 export display literals (cosmetic). Tier-4 log/report strings RECLASSIFIED as not-config.
+
+## 2026-08-25 - R21: POST-STOP COOLDOWN NEVER MATCHED THE TOUCH STOP (found via live book)
+DEFECT (live, executed proof): R12-B4's re-entry cooldown greps
+exit_reason_detailed LIKE '%stop_loss%', but the short-strike touch stop —
+live's PRIMARY loss exit since R12-B1 — writes 'short_strike_touch (spot ...)'.
+08-24: QQQ touch-stopped 09:47:33 (−$272.29), bot re-entered QQQ 10:00:40 —
+13 minutes later, straight back into the move the rule exists to avoid. The
+rule silently never applied to the exit type it most needed to cover.
+FIX: query extracted to TradingOrchestrator._post_stop_cooldown_until (now
+testable), pattern broadened to stop_loss OR short_strike_touch. trailing_stop
+/breakeven_stop stay excluded on purpose (fire at/above breakeven — not the
+autocorrelated-loss sequence). Stale mirror comment in portfolio.py updated.
+PROOF: old query 0 matches vs new 1 on the live reason string (executed);
+tests/test_r21_post_stop_cooldown.py — 7 tests EXECUTE the real query against
+a real sqlite file (touch blocks, confirmed-tick variant blocks, stop_loss
+blocks, profit exits don't, 30h expiry, per-symbol scope, open rows ignored).
+NOTE: the 08-24 re-entry itself stands (T-20260824-100040, $6.35 credit) — we
+do not undo live positions retroactively; it is a normal position now.
+Same day: merged origin/main (Ahmed's PR #6 merge = CI type gate + nightly
+lane armed on main; his 2 IV commits add a PARALLEL daily_iv/intraday_iv OHLC
+store — our daily_prices.implied_vol path unchanged; reconcile pending) and
+pulled curious-talleb's review round (engine entry_dte decoupled from Optuna's
+max_hold_days cap, UTC-midnight flaky-test fixes, vix-tier fallback, iv_floor
+dup, GO_LIVE_VERDICT_STRATEGIES frozenset in base.py).

@@ -1,0 +1,20 @@
+{
+  "total_trades": 1,
+  "total_pnl": -272.29,
+  "win_rate": 0.0,
+  "profit_factor": 0.0,
+  "sharpe_ratio": 0.0,
+  "sortino_ratio": 0.0,
+  "max_drawdown_pct": 0.0013503223982130861,
+  "max_drawdown_dollars": 272.29000000000815,
+  "avg_trade_pnl": -272.29,
+  "avg_win": 0,
+  "avg_loss": -272.29,
+  "largest_win": 0,
+  "largest_loss": -272.29,
+  "avg_hold_hours": 163.46205587416668,
+  "consecutive_wins": 0,
+  "consecutive_losses": 1,
+  "current_streak": -1,
+  "recovery_factor": -0.9999999999999701
+}

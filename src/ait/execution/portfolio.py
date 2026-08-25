@@ -499,8 +499,12 @@ class PortfolioManager:
         #    WHERE symbol = :symbol
         #      AND status = 'CLOSED'
         #      AND (exit_reason_detailed LIKE '%stop_loss%'
-        #           OR notes LIKE '%stop_loss%')
+        #           OR exit_reason_detailed LIKE '%short_strike_touch%')
         #      AND exit_time >= :cutoff_iso
+        # (2026-08-25: short_strike_touch added — the touch stop below is the
+        #  primary loss exit and its reason string does NOT contain
+        #  'stop_loss'; the 08-24 QQQ re-entry 13 min after a touch stop was
+        #  this mismatch. Authority: TradingOrchestrator._post_stop_cooldown_until.)
         # where :cutoff_iso = start (09:30 ET) of the PREVIOUS trading day if
         # now is during RTH, i.e. block while exit_time falls within the
         # current or immediately preceding trading session; weekends/holidays

@@ -1740,6 +1740,39 @@ class TradingOrchestrator:
                 "tables in economic_calendar.py — see logs for details."
             )
 
+    def _post_stop_cooldown_until(self, symbol: str) -> str | None:
+        """R12-B4 query, extracted so tests can execute it against a real DB.
+
+        Returns the exit_time of the most recent qualifying stop close inside
+        the cooldown window, else None.
+
+        2026-08-25 defect: the query matched only '%stop_loss%', but the
+        short-strike touch stop — live's PRIMARY loss exit since R12-B1 —
+        writes 'short_strike_touch (spot ...)'. Executed proof from the live
+        book: QQQ touch-stopped 08-24 09:47:33 (−$272.29) and re-entered at
+        10:00:40, 13 minutes later, straight back into the same move the rule
+        exists to avoid. Both spellings of a forced adverse-move exit now
+        match. trailing_stop/breakeven_stop stay excluded on purpose: those
+        fire at/above breakeven, so re-entry after them is not the
+        autocorrelated-loss sequence R12-B4 targets.
+        """
+        import sqlite3 as _sq12
+        _con = _sq12.connect("file:data/ait_state.db?mode=ro", uri=True)
+        try:
+            _row = _con.execute(
+                "SELECT exit_time FROM trades WHERE symbol=? AND status='closed' "
+                "AND (COALESCE(exit_reason_detailed,'') LIKE '%stop_loss%' "
+                "OR COALESCE(exit_reason_detailed,'') LIKE '%short_strike_touch%') "
+                "ORDER BY exit_time DESC LIMIT 1", (symbol,)).fetchone()
+        finally:
+            _con.close()
+        if _row and _row[0]:
+            from datetime import datetime as _dt12, timedelta as _td12
+            _exit_t = _dt12.fromisoformat(_row[0])
+            if _dt12.now() - _exit_t < _td12(hours=30):
+                return _row[0]
+        return None
+
     async def _try_execute(self, signal, confidence: float, sentiment, regime) -> bool:
         """Validate and execute a signal.
 
@@ -1840,20 +1873,11 @@ class TradingOrchestrator:
         # the most autocorrelated loss sequence condors produce. A stop-loss
         # close now blocks NEW entries on that symbol for 1 trading day.
         try:
-            import sqlite3 as _sq12
-            _con = _sq12.connect("file:data/ait_state.db?mode=ro", uri=True)
-            _row = _con.execute(
-                "SELECT exit_time FROM trades WHERE symbol=? AND status='closed' "
-                "AND COALESCE(exit_reason_detailed,'') LIKE '%stop_loss%' "
-                "ORDER BY exit_time DESC LIMIT 1", (signal.symbol,)).fetchone()
-            _con.close()
-            if _row and _row[0]:
-                from datetime import datetime as _dt12, timedelta as _td12
-                _exit_t = _dt12.fromisoformat(_row[0])
-                if _dt12.now() - _exit_t < _td12(hours=30):
-                    log.info("entry_blocked_post_stop_cooldown",
-                             symbol=signal.symbol, stopped_at=_row[0])
-                    return False
+            _stopped_at = self._post_stop_cooldown_until(signal.symbol)
+            if _stopped_at:
+                log.info("entry_blocked_post_stop_cooldown",
+                         symbol=signal.symbol, stopped_at=_stopped_at)
+                return False
         except Exception:  # noqa: BLE001 — cooldown must never block the loop
             pass
 
