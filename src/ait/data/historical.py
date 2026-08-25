@@ -45,6 +45,8 @@ class HistoricalDataStore:
         self._db_path = db_path
         self._daily_table = f"{table_prefix}daily_prices"
         self._intraday_table = f"{table_prefix}intraday_prices"
+        self._daily_iv_table = f"{table_prefix}daily_iv"
+        self._intraday_iv_table = f"{table_prefix}intraday_iv"
         self._spread_samples_table = f"{table_prefix}option_spread_samples"
         self._spread_params_table = f"{table_prefix}option_spread_params"
         self._init_db()
@@ -92,6 +94,38 @@ class HistoricalDataStore:
             conn.execute(f"""
                 CREATE INDEX IF NOT EXISTS idx_{self._intraday_table}_symbol_dt
                 ON {self._intraday_table}(symbol, interval, datetime)
+            """)
+            # Dedicated IV-bar tables (separate from price OHLCV — IBKR's
+            # OPTION_IMPLIED_VOLATILITY historical bars are themselves OHLC:
+            # start/high/low/last IV over the bar period, not a single
+            # scalar). Kept apart from daily_prices/intraday_prices so this
+            # doesn't require NULL-OHLCV skeleton rows in the price tables.
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._daily_iv_table} (
+                    symbol   TEXT NOT NULL,
+                    date     TEXT NOT NULL,
+                    iv_open  REAL,
+                    iv_high  REAL,
+                    iv_low   REAL,
+                    iv_close REAL,
+                    PRIMARY KEY (symbol, date)
+                )
+            """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._intraday_iv_table} (
+                    symbol   TEXT NOT NULL,
+                    datetime TEXT NOT NULL,
+                    interval TEXT NOT NULL,
+                    iv_open  REAL,
+                    iv_high  REAL,
+                    iv_low   REAL,
+                    iv_close REAL,
+                    PRIMARY KEY (symbol, datetime, interval)
+                )
+            """)
+            conn.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_{self._intraday_iv_table}_symbol_dt
+                ON {self._intraday_iv_table}(symbol, interval, datetime)
             """)
             conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS {self._spread_samples_table} (
@@ -461,6 +495,143 @@ class HistoricalDataStore:
             pass
         log.debug("resampled_to_daily", symbol=symbol, rows=len(daily))
         return daily
+
+    # ------------------------------------------------------------------
+    # IV bar history (dedicated tables — IBKR's OPTION_IMPLIED_VOLATILITY
+    # historical data is itself OHLC per bar, distinct from the live
+    # single-value self-healing store in daily_prices.implied_vol above).
+    # ------------------------------------------------------------------
+
+    def save_daily_iv_bars(self, symbol: str, df: "pd.DataFrame") -> int:
+        """Upsert daily IV OHLC bars into the daily_iv table.
+
+        df must have a date/DatetimeIndex and columns Open/High/Low/Close
+        (IV values as decimals, e.g. 0.25 = 25%). Returns rows upserted.
+        """
+        if df is None or df.empty:
+            return 0
+
+        rows = []
+        for idx, row in df.iterrows():
+            dt = idx.date() if isinstance(idx, (pd.Timestamp, datetime)) else idx
+            rows.append((
+                symbol, str(dt),
+                float(row["Open"]), float(row["High"]),
+                float(row["Low"]), float(row["Close"]),
+            ))
+
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                f"""INSERT INTO {self._daily_iv_table}
+                   (symbol, date, iv_open, iv_high, iv_low, iv_close)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(symbol, date) DO UPDATE SET
+                       iv_open=excluded.iv_open, iv_high=excluded.iv_high,
+                       iv_low=excluded.iv_low, iv_close=excluded.iv_close""",
+                rows,
+            )
+
+        log.debug("daily_iv_bars_saved", symbol=symbol, rows=len(rows))
+        return len(rows)
+
+    def load_daily_iv_bars(
+        self,
+        symbol: str,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> "pd.DataFrame":
+        """Load daily IV OHLC bars for a symbol."""
+        query = (
+            f"SELECT date, iv_open, iv_high, iv_low, iv_close "
+            f"FROM {self._daily_iv_table} WHERE symbol = ?"
+        )
+        params: list = [symbol]
+        if start_date:
+            query += " AND date >= ?"
+            params.append(str(start_date))
+        if end_date:
+            query += " AND date <= ?"
+            params.append(str(end_date))
+        query += " ORDER BY date"
+
+        with sqlite3.connect(self._db_path) as conn:
+            df = pd.read_sql_query(query, conn, params=params)
+
+        if df.empty:
+            return pd.DataFrame(columns=["Open", "High", "Low", "Close"])
+
+        df["date"] = pd.to_datetime(df["date"])
+        df.set_index("date", inplace=True)
+        df.columns = ["Open", "High", "Low", "Close"]
+        return df
+
+    def save_intraday_iv_bars(
+        self,
+        symbol: str,
+        df: "pd.DataFrame",
+        interval: str = "5m",
+    ) -> int:
+        """Upsert intraday IV OHLC bars into the intraday_iv table.
+
+        df must have a DatetimeIndex and columns Open/High/Low/Close
+        (IV values as decimals). Returns rows upserted.
+        """
+        if df is None or df.empty:
+            return 0
+
+        rows = []
+        for idx, row in df.iterrows():
+            dt_str = idx.isoformat() if isinstance(idx, (pd.Timestamp, datetime)) else str(idx)
+            rows.append((
+                symbol, dt_str, interval,
+                float(row["Open"]), float(row["High"]),
+                float(row["Low"]), float(row["Close"]),
+            ))
+
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                f"""INSERT INTO {self._intraday_iv_table}
+                   (symbol, datetime, interval, iv_open, iv_high, iv_low, iv_close)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(symbol, datetime, interval) DO UPDATE SET
+                       iv_open=excluded.iv_open, iv_high=excluded.iv_high,
+                       iv_low=excluded.iv_low, iv_close=excluded.iv_close""",
+                rows,
+            )
+
+        log.debug("intraday_iv_bars_saved", symbol=symbol, interval=interval, rows=len(rows))
+        return len(rows)
+
+    def load_intraday_iv_bars(
+        self,
+        symbol: str,
+        start_date: date,
+        end_date: date,
+        interval: str = "5m",
+    ) -> "pd.DataFrame":
+        """Load intraday IV OHLC bars for a symbol over a date range."""
+        start_str = str(start_date)
+        end_str = str(end_date) + "T23:59:59"
+
+        with sqlite3.connect(self._db_path) as conn:
+            df = pd.read_sql_query(
+                f"""SELECT datetime, iv_open, iv_high, iv_low, iv_close
+                   FROM {self._intraday_iv_table}
+                   WHERE symbol = ? AND interval = ?
+                     AND datetime >= ? AND datetime <= ?
+                   ORDER BY datetime""",
+                conn,
+                params=(symbol, interval, start_str, end_str),
+            )
+
+        if df.empty:
+            return pd.DataFrame(columns=["Open", "High", "Low", "Close"])
+
+        df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+        df.set_index("datetime", inplace=True)
+        df.columns = ["Open", "High", "Low", "Close"]
+        df.index.name = "Datetime"
+        return df
 
     def get_latest_intraday_timestamp(
         self,

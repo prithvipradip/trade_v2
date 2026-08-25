@@ -1,9 +1,12 @@
-"""Backfill historical 5-min bars AND daily implied-vol snapshots from IBKR.
+"""Backfill historical 5-min bars AND implied-vol OHLC bars from IBKR.
 
-Two modes:
-  --mode intraday  (default) — paginated 5-min bar backfill into intraday_prices
-  --mode iv        — daily OPTION_IMPLIED_VOLATILITY into daily_prices.implied_vol
-  --mode both      — run intraday then iv
+Modes:
+  --mode intraday     (default) — paginated 5-min bar backfill into intraday_prices
+  --mode iv           — daily OPTION_IMPLIED_VOLATILITY: close into
+                        daily_prices.implied_vol (feeds the live IV-rank path),
+                        full OHLC into daily_iv
+  --mode iv-intraday  — 5-min OPTION_IMPLIED_VOLATILITY OHLC into intraday_iv
+  --mode both         — run intraday then iv
 
 Usage:
     # Seed QQQ 5-min bars for the last 2 years:
@@ -50,8 +53,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Tickers to backfill (e.g., QQQ SPY AAPL).",
     )
     parser.add_argument(
-        "--mode", default="intraday", choices=["intraday", "iv", "both"],
-        help="What to backfill: 5-min bars, daily IV, or both (default: intraday).",
+        "--mode", default="intraday",
+        choices=["intraday", "iv", "iv-intraday", "both"],
+        help="What to backfill: 5-min bars, daily IV, 5-min IV, or both "
+             "(default: intraday).",
     )
     parser.add_argument(
         "--years", type=float, default=2.0, metavar="N",
@@ -227,13 +232,17 @@ async def _backfill_iv_symbol(
     pause_secs: float,
     dry_run: bool,
 ) -> int:
-    """Fetch daily OPTION_IMPLIED_VOLATILITY bars and store in daily_prices.implied_vol.
+    """Fetch daily OPTION_IMPLIED_VOLATILITY bars.
 
-    IBKR returns daily IV bars that correspond to the ATM 30-day IV estimate.
-    These are stored as update-only operations — only rows already present in
-    daily_prices (from the OHLCV path) get an implied_vol value.
+    IBKR returns these as real OHLC bars (start/high/low/last IV over the
+    day), not a single value. The last/close reading is upserted into
+    daily_prices.implied_vol (update-only — only rows already present from
+    the OHLCV path get a value; this feeds the live IV-rank pipeline, which
+    wants one reading per day same as it does for price Close). The full
+    OHLC is additionally stored in the dedicated daily_iv table for anyone
+    who needs the intraday-of-day IV range.
 
-    Returns the number of rows updated.
+    Returns the number of daily_prices rows updated.
     """
     import pandas as pd
     from ib_insync import Stock, util
@@ -252,6 +261,7 @@ async def _backfill_iv_symbol(
     # IBKR allows up to 1 Y per request for daily IV; chunk by year
     total_years = int(max(1, years))
     all_iv: dict[str, float] = {}
+    all_ohlc: dict[str, tuple[float, float, float, float]] = {}
 
     for year_idx in range(total_years):
         end_dt = datetime.now(tz=timezone.utc) - timedelta(days=year_idx * 365)
@@ -287,15 +297,17 @@ async def _backfill_iv_symbol(
             continue
 
         df = util.df(bars)
-        # The "close" field for OPTION_IMPLIED_VOLATILITY bars is the IV value
-        # (expressed as a decimal, e.g. 0.25 = 25%). The "date" field is the bar date.
-        if "date" in df.columns and "close" in df.columns:
+        # OPTION_IMPLIED_VOLATILITY bars are OHLC (start/high/low/last IV,
+        # decimals e.g. 0.25 = 25%), same as a price bar — not a scalar.
+        if {"date", "open", "high", "low", "close"}.issubset(df.columns):
             for _, row in df.iterrows():
                 try:
                     date_str = str(row["date"])[:10]
-                    iv_val = float(row["close"])
-                    if iv_val > 0:
-                        all_iv[date_str] = iv_val
+                    o, h, l, c = (float(row["open"]), float(row["high"]),
+                                  float(row["low"]), float(row["close"]))
+                    if c > 0:
+                        all_iv[date_str] = c
+                        all_ohlc[date_str] = (o, h, l, c)
                 except (ValueError, TypeError):
                     continue
 
@@ -304,17 +316,107 @@ async def _backfill_iv_symbol(
         if year_idx < total_years - 1:
             time.sleep(pause_secs)
 
-    if not all_iv or dry_run:
+    if (not all_iv) or dry_run:
         return 0
 
-    # Build Series and save
+    # Close-only series feeds the live daily_prices.implied_vol / IV-rank path.
     iv_series = pd.Series(all_iv, name="implied_vol")
     iv_series.index = pd.to_datetime(iv_series.index)
     iv_series = iv_series.sort_index()
 
+    # Full OHLC feeds the dedicated daily_iv table.
+    ohlc_df = pd.DataFrame.from_dict(
+        all_ohlc, orient="index", columns=["Open", "High", "Low", "Close"],
+    )
+    ohlc_df.index = pd.to_datetime(ohlc_df.index)
+    ohlc_df.sort_index(inplace=True)
+    bars_stored = store.save_daily_iv_bars(symbol, ohlc_df)
+    print(f"  [{symbol}] iv: {bars_stored} daily_iv OHLC rows stored")
+
     updated = store.save_daily_iv(symbol, iv_series)
     print(f"  [{symbol}] iv: {len(all_iv)} values fetched, {updated} daily_prices rows updated")
     return updated
+
+
+# ---------------------------------------------------------------------------
+# Intraday (5-min) IV backfill
+# ---------------------------------------------------------------------------
+
+async def _backfill_intraday_iv_symbol(
+    ib,
+    symbol: str,
+    chunks: list[tuple[datetime, str]],
+    store,
+    pause_secs: float,
+    dry_run: bool,
+) -> int:
+    """Fetch 5-min OPTION_IMPLIED_VOLATILITY bars for one symbol.
+
+    Same chunking as the OHLCV intraday path (reuses _build_chunks). These
+    are real OHLC bars (start/high/low/last IV per 5-min window), stored in
+    full via save_intraday_iv_bars into the dedicated intraday_iv table.
+    Returns total rows upserted.
+    """
+    import pandas as pd
+    from ib_insync import Stock, util
+
+    contract = Stock(symbol, "SMART", "USD")
+    try:
+        qualified_list = await ib.qualifyContractsAsync(contract)
+        if not qualified_list:
+            print(f"  [{symbol}] ERROR: could not qualify contract")
+            return 0
+        qualified = qualified_list[0]
+    except Exception as e:
+        print(f"  [{symbol}] ERROR qualifying: {e}")
+        return 0
+
+    total_stored = 0
+    for i, (end_dt, duration) in enumerate(chunks, start=1):
+        end_str = end_dt.strftime("%Y%m%d %H:%M:%S") + " UTC"
+        print(
+            f"  [{symbol}] iv-intraday chunk {i}/{len(chunks)}: {duration} "
+            f"ending {end_str}",
+            end="", flush=True,
+        )
+
+        if dry_run:
+            print(" [DRY RUN]")
+            continue
+
+        try:
+            bars = await ib.reqHistoricalDataAsync(
+                qualified,
+                endDateTime=end_str,
+                durationStr=duration,
+                barSizeSetting="5 mins",
+                whatToShow="OPTION_IMPLIED_VOLATILITY",
+                useRTH=True,
+                formatDate=1,
+            )
+        except Exception as e:
+            print(f" ERROR: {e}")
+            continue
+
+        if not bars:
+            print(" 0 bars")
+            continue
+
+        df = util.df(bars)
+        # OPTION_IMPLIED_VOLATILITY bars are OHLC, not a scalar close.
+        df["date"] = pd.to_datetime(df["date"], utc=True)
+        df = df.set_index("date")[["open", "high", "low", "close"]]
+        df.columns = ["Open", "High", "Low", "Close"]
+        df = df[df["Close"] > 0]
+
+        stored = store.save_intraday_iv_bars(symbol, df, interval="5m")
+        total_stored += stored
+        print(f" → {len(bars)} bars fetched, {stored} rows upserted")
+
+        if i < len(chunks):
+            time.sleep(pause_secs)
+
+    return total_stored
 
 
 # ---------------------------------------------------------------------------
@@ -327,10 +429,14 @@ async def _main(args: argparse.Namespace) -> int:
 
     do_intraday = args.mode in ("intraday", "both")
     do_iv = args.mode in ("iv", "both")
+    do_iv_intraday = args.mode == "iv-intraday"
 
-    intraday_chunks = _build_chunks(args.years, args.chunk_months) if do_intraday else []
+    intraday_chunks = (
+        _build_chunks(args.years, args.chunk_months)
+        if (do_intraday or do_iv_intraday) else []
+    )
     total_requests = (
-        len(args.symbols) * len(intraday_chunks) * int(do_intraday)
+        len(args.symbols) * len(intraday_chunks) * int(do_intraday or do_iv_intraday)
         + len(args.symbols) * int(max(1, args.years)) * int(do_iv)
     )
 
@@ -339,6 +445,10 @@ async def _main(args: argparse.Namespace) -> int:
         print(f"  intraday: {len(intraday_chunks)} chunk(s) × {len(args.symbols)} = "
               f"{len(intraday_chunks) * len(args.symbols)} IBKR requests "
               f"[whatToShow={args.what_to_show}]")
+    if do_iv_intraday:
+        print(f"  iv-intraday: {len(intraday_chunks)} chunk(s) × {len(args.symbols)} = "
+              f"{len(intraday_chunks) * len(args.symbols)} IBKR requests "
+              f"[whatToShow=OPTION_IMPLIED_VOLATILITY, bar=5 mins]")
     if do_iv:
         print(f"  daily iv: {int(max(1, args.years))} chunk(s) × {len(args.symbols)} = "
               f"{int(max(1, args.years)) * len(args.symbols)} IBKR requests")
@@ -347,9 +457,10 @@ async def _main(args: argparse.Namespace) -> int:
     if args.dry_run:
         print("[DRY RUN — no IBKR calls will be made]")
         for sym in args.symbols:
-            if do_intraday:
+            if do_intraday or do_iv_intraday:
                 for i, (end_dt, dur) in enumerate(intraday_chunks, 1):
-                    print(f"  [{sym}] intraday chunk {i}/{len(intraday_chunks)}: {dur} "
+                    print(f"  [{sym}] {'iv-intraday' if do_iv_intraday else 'intraday'} "
+                          f"chunk {i}/{len(intraday_chunks)}: {dur} "
                           f"ending {end_dt.strftime('%Y%m%d %H:%M:%S')} UTC")
             if do_iv:
                 total_years = int(max(1, args.years))
@@ -386,6 +497,15 @@ async def _main(args: argparse.Namespace) -> int:
                 store, pause_secs=args.pause_secs, dry_run=args.dry_run,
             )
             print(f"  [{sym}] intraday total rows upserted: {n}")
+            grand_total += n
+
+        if do_iv_intraday:
+            print(f"  Backfilling 5-min IV for {sym}...")
+            n = await _backfill_intraday_iv_symbol(
+                ib, sym, intraday_chunks,
+                store, pause_secs=args.pause_secs, dry_run=args.dry_run,
+            )
+            print(f"  [{sym}] iv-intraday total rows upserted: {n}")
             grand_total += n
 
         if do_iv:
