@@ -84,14 +84,23 @@ class TestMtmHaltClears:
             b._tripped, b._trip_reason = False, ""
             b._daily_pnl, b._consecutive_losses = 0.0, 0
             b._api_failures, b._resume_time = {}, None
-            b._last_reset_date = date.today()
+            # R20b follow-up: date.today() is naive/UTC-local (the CI runner's
+            # system tz); CircuitBreaker.check_daily_reset() is deliberately
+            # ET-pinned (now_et().date(), "deep-audit SR-M5"). They disagree
+            # for ~4-5h/day (UTC midnight -> ET midnight, ET is UTC-4/-5), so
+            # a CI run landing in that window flipped which calendar day
+            # "yesterday" resolved to and made this fixture flaky. Match the
+            # code under test's own time reference instead of the wall clock.
+            from ait.utils.time import now_et
+            b._last_reset_date = now_et().date()
             return b
 
     def test_mtm_trip_untrips_next_day(self):
+        from ait.utils.time import now_et
         b = self._breaker()
         assert b.check_daily_loss_mtm(-2000.0, 60000.0) is True
         assert b._tripped
-        b._last_reset_date = date.today() - timedelta(days=1)
+        b._last_reset_date = now_et().date() - timedelta(days=1)
         b.check_daily_reset()
         assert not b._tripped  # pre-fix: reason lacked 'daily_loss' -> stuck forever
 

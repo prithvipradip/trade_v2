@@ -218,9 +218,17 @@ class TestWouldBeDayTrade:
     """Test would_be_day_trade helper."""
 
     def test_same_day_is_day_trade(self, pdt_guard) -> None:
-        today = date.today()
+        # R20b follow-up: date.today() is naive/UTC-local (the CI runner's
+        # system tz); would_be_day_trade() is deliberately ET-pinned
+        # (now_et().date(), "deep-audit SR-M6"). They disagree for ~4-5h/day
+        # (UTC midnight -> ET midnight, ET is UTC-4/-5), so a CI run landing
+        # in that window flipped which day "today" resolved to here. Match
+        # the code under test's own time reference instead of the wall clock.
+        from ait.utils.time import now_et
+        today = now_et().date()
         assert pdt_guard.would_be_day_trade("SPY", today) is True
 
     def test_different_day_is_not(self, pdt_guard) -> None:
-        yesterday = date.today() - timedelta(days=1)
+        from ait.utils.time import now_et
+        yesterday = now_et().date() - timedelta(days=1)
         assert pdt_guard.would_be_day_trade("SPY", yesterday) is False
