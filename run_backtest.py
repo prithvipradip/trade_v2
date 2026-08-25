@@ -204,8 +204,14 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
         "AIT_SKIP_MACRO_EVENTS=1; defined-risk condors are EXEMPT in code, so "
         "it governs undefined/assignment-risk arms (strangle, jade_lizard, "
         "CSP/CC); the backtest mirrors that env var exactly.",
-        "engine trades a fixed synthetic DTE (max_hold_days=21) inside the "
-        f"live dte_range {live_dte}.",
+        # PR#7 validation 2026-08-25 (F33 second half): this note still
+        # described the retired fixed-DTE=max_hold_days convention, directly
+        # contradicting the corrected dte_band lines above in the same
+        # manifest.
+        f"engine prices a fixed synthetic entry DTE = dte_range[0] "
+        f"({live_dte[0]}) inside the live dte_range {live_dte}; the hold is "
+        "capped separately by max_hold_days (entry_dte/hold-cap decoupled "
+        "2026-08-24).",
         "credit exits: flat loss limit + DTE-laddered TP + DTE<=5 close "
         "(mirrors portfolio.py); trailing/breakeven applies to DEBIT only.",
         "the 'live' column is resolved from ait.config.runtime_env (the env "

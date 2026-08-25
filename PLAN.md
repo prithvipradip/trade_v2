@@ -1349,3 +1349,25 @@ PROOF: tests/test_r21b_pr7_review_round.py — 8 tests execute the real
 resolution paths (space reachability vs CREDIT_STRATEGIES, ctor override
 precedence + config defaults, horizon derivation + cap + degraded-settings
 fallback, manifest == live Backtester._entry_dte).
+
+## 2026-08-25 - R21c: PRE-MERGE ULTRA-VALIDATION OF PR#7 (12-agent adversarial pass)
+Validated the three no-blocker merge claims. RESULTS: claim 2 (no Ahmed
+conflict) CONFIRMED (merge-base = origin/main tip; his commits purely
+additive; zero overlap, no schema collisions). Claims 1 and 3 FALSIFIED as
+stated, both fixed same day:
+[1] F33 half-fixed: manifest dte_band corrected earlier but the prose NOTE at
+    run_backtest.py:207 still described the retired fixed-DTE=max_hold_days
+    convention. Note rewritten; executed check: no 'max_hold_days=21' in notes.
+[3] The ONE risk-loosening live change (orchestrator passing settings= into
+    TradeExecutor, arming the executor's config spread ceiling 0.15->0.40 —
+    deliberate R19 register change aligning executor with the scanner) had NO
+    test on the WIRING hunk: reverting it kept the suite green. Pinned by
+    test_hot_path_smoke.py::TestConstruction::test_executor_receives_settings_spread_ceiling.
+Findings ledger: 33 distinct review findings across all rounds; 32 verified
+fixed in-code (10 by named executing tests, 22 by ad-hoc real-code probes),
+1 (F33) completed above. REGISTERED RESIDUALS from the critic: (a) 22 fixes
+lack a permanent pinning pytest (regression-visible only via behavior);
+(b) typecheck gate scope excludes backtesting/optimization/ml; (c) 5 config
+homes are zero-delta today but create config-edit levers on live economics
+(documented, intended — that IS the R19c policy); (d) meta_label.py changes
+live-dormant behind meta_label.enabled=false.

@@ -463,6 +463,24 @@ class TestConstruction:
         assert orch._account._notify_cb is not None
         assert orch._account._circuit_breaker is not None
 
+    def test_executor_receives_settings_spread_ceiling(self, rig):
+        """PR#7 merge validation (2026-08-25): the ``settings=`` argument in
+        orchestrator __init__'s TradeExecutor construction is the hunk that
+        arms the executor's config-bound single-leg spread ceiling (0.40)
+        over the 0.15 code default — the one risk-LOOSENING live change in
+        the R19c-R21b arc, and the validation proved reverting just that
+        wiring kept the entire suite green. This pins it: construct
+        TradeExecutor without settings again and the ceiling silently falls
+        back to DEFAULT_MAX_SPREAD_PCT, failing here."""
+        from ait.execution.executor import DEFAULT_MAX_SPREAD_PCT
+        expected = float(rig.orch._settings.options.max_bid_ask_spread_pct)
+        assert rig.orch._executor._max_spread_pct == expected
+        # Teeth check: config must differ from the code default, or this test
+        # cannot tell wired from unwired. If you deliberately set
+        # options.max_bid_ask_spread_pct to exactly 0.15, pick a nearby value
+        # (e.g. 0.16) or rework this test — do not delete it.
+        assert expected != DEFAULT_MAX_SPREAD_PCT
+
     def test_construction_is_sandboxed_away_from_the_live_databases(self, rig):
         """A LIVE BOT MAY BE RUNNING. Nothing here may touch the repo's data/."""
         state_db = Path(rig.orch._state._db_path).resolve()
