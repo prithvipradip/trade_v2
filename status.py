@@ -11,9 +11,11 @@ from __future__ import annotations
 import re
 import sqlite3
 import subprocess
+import sys
 from datetime import datetime, date
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 from ait.strategies.base import GO_LIVE_VERDICT_STRATEGIES
 
 ROOT = Path(__file__).resolve().parent

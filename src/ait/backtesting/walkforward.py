@@ -83,9 +83,9 @@ class WalkForwardConfig:
     # config.yaml is reachable). Explicit values always win.
     iv_floor: float | None = None
     delta_iv_scale: float = 0.0
-    stop_loss_pct: float = 0.35            # Cut losses at 35% (options decay fast)
-    profit_target_pct: float = 0.50         # Take profits at 50% (don't be greedy)
-    max_hold_days: int = 21                 # 3 weeks max (avoid deep theta decay)
+    stop_loss_pct: float | None = None      # None -> __post_init__ resolves
+    profit_target_pct: float | None = None  # settings.backtest baselines
+    max_hold_days: int | None = None
     # R20b follow-up: was a hardcoded 0.55 while live/engine resolve
     # settings.risk.min_confidence (config.yaml 0.50) — same defect class as
     # iv_floor above. None -> __post_init__ resolves load_settings()
@@ -110,10 +110,10 @@ class WalkForwardConfig:
     optimize_min_trades: int = 10    # Penalise trials with fewer trades than this floor
     optimize_seed: int = 42          # TPESampler seed — fix for reproducibility
     range_threshold_pct: float = 0.05  # Target move % for range model; links to strategy profitability
-    hurst_regime_threshold: float = 0.20
-    hurst_regime_penalty: float = 0.10
+    hurst_regime_threshold: float | None = None
+    hurst_regime_penalty: float | None = None
     hurst_hard_veto_multiplier: float = 0.0   # 0=disabled; Exp 20 post-mortem: QQQ spread never < 0.43, any multiplier blocks all entries
-    multifractal_max_width: float = 0.50
+    multifractal_max_width: float | None = None
     # R20b review follow-up: was a hardcoded 0.30 while StrategyOptimizer's
     # OWN copy of this field was already migrated to the None-sentinel +
     # config-resolution pattern this PR gave every sibling field -- config.yaml
@@ -202,6 +202,21 @@ class WalkForwardConfig:
             self.iv_floor, "backtest", "iv_floor", BacktestConfig, _settings))
         self.min_confidence = float(resolve_config_value(
             self.min_confidence, "risk", "min_confidence", RiskConfig, _settings))
+        self.stop_loss_pct = float(resolve_config_value(
+            self.stop_loss_pct, "backtest", "stop_loss_pct", BacktestConfig, _settings))
+        self.profit_target_pct = float(resolve_config_value(
+            self.profit_target_pct, "backtest", "profit_target_pct", BacktestConfig, _settings))
+        self.max_hold_days = int(resolve_config_value(
+            self.max_hold_days, "backtest", "max_hold_days", BacktestConfig, _settings))
+        self.hurst_regime_threshold = float(resolve_config_value(
+            self.hurst_regime_threshold, "backtest", "hurst_regime_threshold",
+            BacktestConfig, _settings))
+        self.hurst_regime_penalty = float(resolve_config_value(
+            self.hurst_regime_penalty, "backtest", "hurst_regime_penalty",
+            BacktestConfig, _settings))
+        self.multifractal_max_width = float(resolve_config_value(
+            self.multifractal_max_width, "backtest", "multifractal_max_width",
+            BacktestConfig, _settings))
         # R20b review follow-up: same defect class as the three above -- was
         # a frozen literal even though StrategyOptimizer's own copy of these
         # two fields was already migrated (optimizer.py __init__).

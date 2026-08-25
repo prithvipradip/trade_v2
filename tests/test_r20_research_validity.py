@@ -276,6 +276,38 @@ class TestOptunaParamsReachEngine:
         assert "iv_rank_rise_threshold=self._config.iv_rank_rise_threshold" in src
         assert "min_edge_over_baseline=self._config.min_edge_over_baseline" in src
 
+    def test_max_hold_days_changes_iron_condor_trial(self, synth_df, synth_features):
+        # End-to-end guard: changing max_hold_days must change IC exits.
+        short_hold = Backtester(
+            **_engine_kwargs(
+                synth_df,
+                synth_features,
+                max_hold_days=1,
+                symbol="SPY",
+            )
+        )
+        long_hold = Backtester(
+            **_engine_kwargs(
+                synth_df,
+                synth_features,
+                max_hold_days=30,
+                symbol="SPY",
+            )
+        )
+        short_hold._touch_stop_enabled = False
+        long_hold._touch_stop_enabled = False
+        short_hold._credit_take_profit_pct = lambda *_a, **_k: 9_999.0
+        long_hold._credit_take_profit_pct = lambda *_a, **_k: 9_999.0
+
+        res_short = short_hold.run()
+        res_long = long_hold.run()
+        assert res_short.total_trades > 0 and res_long.total_trades > 0
+
+        short_reasons = {t.get("exit_reason") for t in res_short.trades}
+        long_reasons = {t.get("exit_reason") for t in res_long.trades}
+        assert "max_hold_reached" in short_reasons
+        assert "max_hold_reached" not in long_reasons
+
 
 # ---------------------------------------------------------------------------
 # #3 — train_window_models=False disables the MetaLabeler too
