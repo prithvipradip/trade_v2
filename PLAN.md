@@ -1403,3 +1403,65 @@ macro day-counting, intraday path skipping touch stop); wave 3 = ops
 breaker-coherence alarm, naive-clock timestamp sites). Critic blind spots
 recorded in the register: concurrency contracts, multi-process sqlite,
 consistent-but-wrong, deprecated/ + scripts/ under-swept.
+
+## 2026-08-26 - R23: BLIND-SPOT + COMPOSITION HUNTS — 77 MORE STANDING; GRAND REGISTER 123
+User directive: audit with COLLECTIVE repo context before fixing anything.
+Round 2 (8 blind-spot classes, 17 agents): 50 standing (22 live_money).
+Round 3 (4 vertical whole-flow audits with full flow maps, 8 agents): 27
+standing (17 live_money). Register: reports/blindspot_composition_hunt_20260825.md.
+Combined with R22's 46: 123 standing findings, none fixed yet.
+HEADLINE CLUSTERS (critic-concurred):
+[A] BREAKER BYPASS FAMILY: reconciler-booked closes (bot-down fills, manual
+    flattens, expiries) hit trades.realized_pnl but NEVER the circuit
+    breaker/daily stats/PDT/Thompson (trade-life-close-booking-two-owners,
+    money-flow-01); fill-booking callback loss on crash loses the booking
+    entirely (concurrency-2); breaker state silently resets on unreadable DB
+    at relaunch (fail-direction-10). The 3-loss pause + daily-loss halt are
+    defeatable from BOTH ends.
+[B] FILL-VS-SWEEP RACE (concurrency-1): a stale entry that fills as the $0
+    sweep books it leaves a REAL condor at the broker managed by NOTHING,
+    with entry_price rewritten on a closed $0 row.
+[C] FAIL-OPEN GATE CHAIN (common-cause): IV outage fabricates iv_rank=50
+    passing both IV gates + quoteless strikes rank most-liquid + combo NBBO
+    sanity fails open + duplicate-order guards fail open at debug — one
+    degraded-feed morning can chain these.
+[D] SCORECARD CONTRADICTION: Friday's automated GO-LIVE SCORECARD computes
+    the RETIRED all-strategy metric (PF 0.89 FAIL) while status.py computes
+    the pinned R19d IC metric (PF 1.42 PASS); master also authorizes at 25
+    closes vs the pinned 50; maxDD criterion structurally unanswerable.
+[E] RESEARCH COST-MODEL SIGN RISK: commissions ~$2.13/contract understated +
+    gap-through-strike losses booked at touch price + IV skew ~10x flatter
+    than measured — together the scale of the whole per-condor expectancy;
+    can flip the researched edge's sign. Plus dead-surface-2: the 08-10
+    --apply run permanently zeroed the only live fill-quality ground truth.
+[F] PROTECTION-ARMING WINDOWS (bot-day): hang-detector kills slow startups
+    in a loop (no reconcile/no touch stop all session); startup training
+    blocks protection arming; exit-order-then-CLOSING crash window
+    duplicates closes; scan duration stretches the 30s exit cadence.
+NEVER-AUDITED (registered for a future round): IBC/TWS lifecycle (C:\IBC),
+paper-vs-real fill realism of the verdict evidence, broker-statement P&L
+parity, ML feature/label lookahead, backfill/calibration scripts,
+deprecated/ subtree, fixture DDL drift, early-close sessions, config.yaml
+multi-writer races, host substrate (backups, disk, Windows Update).
+SEVERITY ELEVATIONS accepted: multiprocess-db-1, dead-surface-2,
+log-contracts-5, policy-vs-impl-5 -> treat as live_money-adjacent;
+R22's string-contracts-1/-4 + db-contracts-1 likewise.
+FIX WAVES REVISED (supersedes R22 waves; still pre-registered, not executed):
+W1 BOOKING INTEGRITY: one shared close-booking authority (outbox pattern) so
+   EVERY close — executor, reconciler, sweep, vanished — reaches breaker/
+   stats/PDT/Thompson exactly once, transactionally; CAS-gate the fill
+   writes (concurrency-1); persist breaker state fail-closed.
+W2 GATE FAIL-DIRECTION: protective gates fail CLOSED (or loud): iv_rank
+   sentinel None not 50, liquidity refuses quoteless, NBBO sanity blocks,
+   dup guards escalate, VIX outage pages (it already fails closed but
+   silently), touch-stop except pages at CRITICAL.
+W3 SCORECARD TRUTH: master scorecard computes the R19d IC metric with the
+   50-close denominator + not-real-close authority (merges R22 trio);
+   retire the contradicting Friday page.
+W4 LIVE ECONOMICS COHERENCE: cooldown trading-day semantics, live range-gate
+   horizon/threshold from shared authority, credit floors re-checked at
+   fill, entry_vix LKG.
+W5 RESEARCH HONESTY: commissions/skew/gap pricing in engine; then re-run
+   studies (supersedes the earlier plan to re-run immediately post-merge).
+W6 OPS: protection-arming windows, dead-man attests bot not supervisor,
+   dashboard dead panels, log contracts.
