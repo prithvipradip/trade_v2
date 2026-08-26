@@ -1371,3 +1371,35 @@ lack a permanent pinning pytest (regression-visible only via behavior);
 homes are zero-delta today but create config-edit levers on live economics
 (documented, intended — that IS the R19c policy); (d) meta_label.py changes
 live-dormant behind meta_label.enabled=false.
+
+## 2026-08-25 - R22: RELATIONSHIP-DEFECT HUNT (15-agent, 7 classes) — 46 STANDING, REGISTERED
+Question: "any other defects like entry_dte-vs-horizon?" (facts in different
+files that must agree, nothing enforcing it). 7 class-specialized finders +
+adversarial verification (default-refute): 48 candidates -> 46 standing
+(30 DIVERGENT TODAY, 16 enforcement gaps), 2 refuted. Full register with
+proof/consequence/fix per finding: reports/relationship_defect_hunt_20260825.md.
+Severity: live_money 8 | research_validity 23 | ops_reporting 11 | cosmetic 4.
+TOP THREE (critic-concurred):
+[1] units-scale-05: LIVE range gate asks P(+-5% over 30d)>=0.65 while
+    post-R21b research validates a 9-day/adaptive-threshold question — live
+    vetoes entries the validated evidence would take AND slows the 50-close
+    verdict sample. (The mirror image of R21b: fixed research, didn't sweep
+    the live consumer.)
+[2] numeric-pairs-02: R21's cooldown kept the flat 30h window vs the R12-B4
+    spec's 1 TRADING day — a Friday stop-out gets ZERO effective cooldown
+    (window dies Saturday). The R21 fix itself carried a member of the class
+    it fixed.
+[3] Scorecard-integrity trio: meta_label trains on 6 phantom $0 never-filled
+    rows (26% of its set, missing the shared not-real-close filter);
+    reconciler $0 needs_review sentinels would count as real closes in
+    PF/win-rate with ZERO consumers surfacing the review; status shows 5
+    open positions when the book holds 2 (cancelled rows leak the filter).
+FIX WAVES (pre-registered, NOT yet executed): wave 1 = live_money divergent
+(units-scale-05, numeric-pairs-02) + scorecard trio; wave 2 = live-vs-backtest
+mirror cluster BEFORE the next research run (else the apparatus still is not
+honest: debit stop 0.35 vs 0.50, sizing, iv floors, delta_short triplication,
+macro day-counting, intraday path skipping touch stop); wave 3 = ops
+(dead dashboard keys incl. unconditional 'No errors logged', unreachable
+breaker-coherence alarm, naive-clock timestamp sites). Critic blind spots
+recorded in the register: concurrency contracts, multi-process sqlite,
+consistent-but-wrong, deprecated/ + scripts/ under-swept.
