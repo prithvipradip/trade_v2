@@ -1465,3 +1465,29 @@ W5 RESEARCH HONESTY: commissions/skew/gap pricing in engine; then re-run
    studies (supersedes the earlier plan to re-run immediately post-merge).
 W6 OPS: protection-arming windows, dead-man attests bot not supervisor,
    dashboard dead panels, log contracts.
+
+## 2026-08-26 - W1 EXECUTED: BOOKING INTEGRITY (R23 breaker-bypass family closed)
+[1] EXIT OUTBOX (concurrency-2, trade-life-close-booking-two-owners,
+    money-flow-01): close_trade now enqueues a booking obligation in the
+    SAME sqlite transaction as the close; every booking path CLAIMS the row
+    first (single DELETE, sqlite-serialized => exactly-once). The executor
+    callback claims before booking; a new orchestrator cycle drain
+    (_drain_exit_outbox, 120s grace) books the orphans — reconciler/sweep/
+    vanished closes and bookings lost to a crash — into daily stats, the
+    circuit breaker, PDT, and Thompson, with an ORPHAN CLOSE BOOKED page.
+    Prior-day orphans are claimed but NOT booked into today's daily
+    quantities (logged stale_exit_booking_skipped).
+[2] CAS-GATED FILLS (concurrency-1): _update_trade_filled/_update_trade_partial
+    no longer write entry_price/quantity/open_positions when the status CAS
+    is refused — the closed $0 row stays intact, and a CRITICAL page fires
+    via the alert_fill_after_close flag (drained each cycle).
+[3] BREAKER FAILS CLOSED (fail-direction-10): an unreadable/corrupt breaker
+    store now trips conservatively for one pause window (auto-resume) instead
+    of starting fresh and silently clearing an active 3-loss pause. R16's
+    test_corrupt_blob_is_survivable updated to the new contract.
+Smoke guard taught that a new EMPTY table is startup DDL, not a write.
+PROOF: tests/test_w1_booking_integrity.py — 13 executing tests (real
+StateManager/CircuitBreaker/TradeExecutor on a real sqlite file); stash
+proof: 3 key tests FAIL against pre-W1 src. Suite 1254 green, type gate OK,
+SMOKE PASS 13. NOTE: fixes take effect on next bot restart (restart already
+pending for R21).

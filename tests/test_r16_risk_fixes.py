@@ -177,9 +177,18 @@ class TestCircuitBreakerRestartPersistence:
         assert b._consecutive_losses == 1
 
     def test_corrupt_blob_is_survivable(self):
+        # W1 (R23 fail-direction-10): contract CHANGED from fail-open to
+        # fail-closed. An unreadable/corrupt store could be hiding an ACTIVE
+        # 3-loss pause, so the breaker now trips conservatively for one
+        # configured pause window (resume timer auto-lifts it) instead of
+        # starting fresh and silently clearing that pause. Survivable still
+        # means "the bot runs" — it just pauses entries first.
         st = _FakeState({CircuitBreaker.STATE_KEY: "{not json"})
         b = CircuitBreaker(_risk_cfg(), state=st)
-        assert b._consecutive_losses == 0 and b.is_tripped is False
+        assert b._consecutive_losses == 0
+        assert b.is_tripped is True
+        assert b._trip_reason == "state_unreadable_fail_closed"
+        assert b._resume_time > 0  # bounded: auto-resumes, never stuck
 
     def test_risk_manager_wires_persistence(self):
         # The orchestrator builds the breaker without a state handle

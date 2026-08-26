@@ -2325,11 +2325,33 @@ class TradeExecutor:
 
         # R12 Tier-A #1: CAS — a fill can only land on a PENDING or PARTIAL
         # entry (blind UPDATE could resurrect CANCELLED/CLOSED rows).
-        self._state.transition(
+        # W1 (R23 concurrency-1): the CAS verdict was DISCARDED — a fill that
+        # raced the stale-pending sweep still rewrote entry_price/quantity on
+        # the closed $0 row and re-inserted open_positions, while a REAL
+        # position sat at the broker managed by nothing. Now: no CAS, no
+        # writes — flag it for the operator instead (the untracked-option
+        # freeze is the backstop for the live position itself).
+        _cas_ok = self._state.transition(
             pending.trade_id,
             (TradeStatus.PENDING, TradeStatus.PARTIAL),
             TradeStatus.FILLED,
         )
+        if not _cas_ok:
+            log.error(
+                "fill_landed_on_terminal_row",
+                trade_id=pending.trade_id,
+                symbol=signal.symbol,
+                fill_price=actual_price,
+                note="row already closed/cancelled — a REAL position may be "
+                     "live at the broker with no managing trade row",
+            )
+            try:
+                self._state.set_state(
+                    "alert_fill_after_close",
+                    f"{pending.trade_id}|{signal.symbol}|{actual_price}")
+            except Exception:  # noqa: BLE001
+                pass
+            return
 
         # Book the REAL fill into trades.entry_price (audit R2/C1): it was
         # only stored in open_positions while every P&L computation read the
@@ -2383,11 +2405,26 @@ class TradeExecutor:
         signal = pending.signal
         # R12 Tier-A #1: CAS — PARTIAL can only follow PENDING (or refresh an
         # earlier PARTIAL as more contracts fill).
-        self._state.transition(
+        # W1 (R23 concurrency-1): same gate as _update_trade_filled — a CAS
+        # refusal means the row is terminal; writing quantity/entry_price/
+        # open_positions would corrupt a closed row.
+        if not self._state.transition(
             pending.trade_id,
             (TradeStatus.PENDING, TradeStatus.PARTIAL),
             TradeStatus.PARTIAL,
-        )
+        ):
+            log.error(
+                "partial_fill_landed_on_terminal_row",
+                trade_id=pending.trade_id, symbol=signal.symbol,
+                filled_qty=filled_qty,
+            )
+            try:
+                self._state.set_state(
+                    "alert_fill_after_close",
+                    f"{pending.trade_id}|{signal.symbol}|partial:{filled_qty}")
+            except Exception:  # noqa: BLE001
+                pass
+            return
         self._state.update_trade_quantity(pending.trade_id, filled_qty)
         if actual_price is not None and actual_price != 0:
             self._state.update_trade_entry_price(pending.trade_id, abs(actual_price))

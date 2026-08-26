@@ -460,6 +460,90 @@ class TradingOrchestrator:
         except Exception as e:  # noqa: BLE001
             log.warning("reconcile_alert_failed", error=str(e))
 
+    async def _drain_exit_outbox(self) -> None:
+        """W1 (R23 breaker-bypass family): book closes nobody booked.
+
+        Pre-W1, every close the RECONCILER discovered (a stop that filled
+        while the bot was down, a manual TWS flatten, an ITM expiry) landed
+        in trades.realized_pnl but NEVER reached the circuit breaker, daily
+        stats, PDT counter, or Thompson — the daily-loss halt and 3-loss
+        pause undercounted exactly the chaotic-day losses they exist for.
+        Same for a booking lost to a crash between close_trade's commit and
+        the fill callback. close_trade now enqueues transactionally; this
+        drain claims and books the orphans. The 120s grace keeps it from
+        racing an in-flight executor callback (which claims within seconds).
+        """
+        # W1 (concurrency-1): page the fill-after-close flag the executor sets
+        # when a fill's CAS is refused — a real position may be unmanaged.
+        try:
+            _fac = self._state.get_state("alert_fill_after_close", "")
+            if _fac:
+                self._state.delete_state("alert_fill_after_close")
+                await self._send_notification(
+                    f"CRITICAL: fill landed on a TERMINAL trade row ({_fac}). "
+                    "A REAL position may be live at the broker with no "
+                    "managing row — check TWS and the untracked-option freeze.")
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            pending = self._state.pending_exit_bookings(older_than_seconds=120.0)
+        except Exception as e:  # noqa: BLE001
+            log.warning("exit_outbox_read_failed", error=str(e))
+            return
+        if not pending:
+            return
+        from ait.utils.time import now_et as _now_et
+        today = _now_et().date()
+        for row in pending:
+            trade_id = row["trade_id"]
+            try:
+                if not self._state.claim_exit_booking(trade_id):
+                    continue  # lost the race to a concurrent booker — correct
+                pnl = float(row["realized_pnl"] or 0.0)
+                try:
+                    exit_d = datetime.fromisoformat(row["exit_time"]).date()
+                except Exception:  # noqa: BLE001
+                    exit_d = None
+                if exit_d != today:
+                    # Stats/breaker are DAILY quantities — booking a prior-day
+                    # close into today's halt math errs the other direction.
+                    # Claimed (never resurfaces), logged for the human ledger.
+                    log.warning("stale_exit_booking_skipped", trade_id=trade_id,
+                                exit_time=row["exit_time"], pnl=pnl)
+                    continue
+                stats = self._state.get_daily_stats()
+                stats.total_pnl += pnl
+                if pnl > 0:
+                    stats.trades_won += 1
+                else:
+                    stats.trades_lost += 1
+                self._circuit_breaker.record_trade_result(pnl)
+                self._state.update_daily_stats(stats)
+                try:
+                    self._state.delete_state(f"trade_maxloss_{trade_id}")
+                except Exception:  # noqa: BLE001
+                    pass
+                _t = self._find_trade_by_id(trade_id)
+                if _t and _t.entry_time:
+                    try:
+                        if datetime.fromisoformat(_t.entry_time).date() == today:
+                            self._pdt_guard.record_day_trade(_t.symbol)
+                    except Exception as _e:  # noqa: BLE001
+                        log.debug("pdt_record_failed", error=str(_e))
+                if _t:
+                    self._thompson.record_outcome(
+                        strategy=_t.strategy, won=pnl > 0, pnl=pnl)
+                log.warning("orphan_close_booked", trade_id=trade_id, pnl=pnl,
+                            reason=row.get("exit_reason", ""))
+                await self._send_notification(
+                    f"ORPHAN CLOSE BOOKED: {(_t.symbol if _t else trade_id)} "
+                    f"P&L ${pnl:.2f} ({row.get('exit_reason') or 'unknown'}) — "
+                    "found by reconcile; breaker/stats now counted it.")
+            except Exception as e:  # noqa: BLE001 — one bad row must not stop the drain
+                log.error("exit_outbox_booking_failed", trade_id=trade_id,
+                          error=str(e))
+
     async def _process_completed_exits(self, completed_exits: list[dict]) -> None:
         """Book completed exits: daily stats, circuit breaker, Thompson, drift.
 
@@ -469,6 +553,18 @@ class TradingOrchestrator:
         """
         for ex in completed_exits:
             trade_id = ex["trade_id"]
+
+            # W1 (R23 concurrency-2): claim the outbox row before booking.
+            # Exactly one booker wins the DELETE — if the cycle drain (or a
+            # concurrent pass) already booked this close, do NOT double-count
+            # it into stats/breaker/Thompson.
+            try:
+                _claimed = self._state.claim_exit_booking(trade_id)
+            except Exception:  # noqa: BLE001 — outbox unavailable: book as before
+                _claimed = True
+            if not _claimed:
+                log.warning("exit_booking_already_claimed", trade_id=trade_id)
+                continue
 
             # R15 #8 (Tier-2 #4 for real): the fill-time booking embedded a
             # FLAT $0.65/leg/side commission estimate inside realized_pnl —
@@ -879,6 +975,10 @@ class TradingOrchestrator:
         # 6. Check fill status of pending orders (entry + exit)
         _filled_entries, completed_exits = await self._executor.check_fills_safe()
         await self._process_completed_exits(completed_exits)
+
+        # 6b. W1: book closes nobody booked — reconciler/sweep closes and
+        # bookings lost to a crash between the sqlite close and the callback.
+        await self._drain_exit_outbox()
 
         # 7. Get effective universe (learning + capital tier filtering)
         adaptor = self._learning.adaptor

@@ -225,6 +225,17 @@ class NoWriteGuard:
             a = dict(after_sql)
             sv_b = b.pop("__schema_version__", None)
             sv_a = a.pop("__schema_version__", None)
+            # W1: a table that did not exist before and holds ZERO rows after
+            # is idempotent startup DDL (schema migration), not data written —
+            # the same class the __schema_version__ note below covers. Flagging
+            # it as a write would fail every deploy that adds a table.
+            _new_empty = {k for k in set(a) - set(b) if a.get(k) == 0}
+            for _k in _new_empty:
+                a.pop(_k)
+            if _new_empty:
+                notes.append(
+                    "new empty table(s) from idempotent startup DDL "
+                    f"[{', '.join(sorted(_new_empty))}] — no rows written")
             if b != a:
                 changed = {k for k in set(b) | set(a) if b.get(k) != a.get(k)}
                 if changed <= LIVE_WRITE_TABLES and _bot_heartbeat_fresh():

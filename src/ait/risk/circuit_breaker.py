@@ -96,10 +96,23 @@ class CircuitBreaker:
             raw = state.get_state(self.STATE_KEY, "")
             blob = json.loads(raw) if raw else None
         except Exception as e:  # noqa: BLE001
-            log.warning("circuit_breaker_state_load_failed", error=str(e))
+            # W1 (R23 fail-direction-10): an UNREADABLE store used to fall
+            # through to a fresh zero state — a relaunch during a brief DB
+            # lock silently cleared an active 3-loss pause and the loss
+            # streak, re-entering immediately into the same losing
+            # conditions. Fail CLOSED: pause for one configured window so a
+            # possibly-active halt is honored; a healthy read next restart
+            # (or the resume timer) lifts it.
+            log.error("circuit_breaker_state_unreadable_fail_closed",
+                      error=str(e))
+            self._tripped = True
+            self._trip_reason = "state_unreadable_fail_closed"
+            self._resume_time = time.time() + max(
+                60.0, float(getattr(self._config,
+                                    "pause_minutes_after_losses", 30)) * 60.0)
             return
         if not isinstance(blob, dict):
-            return
+            return  # empty/first-run store: genuinely fresh, no fail-close
         try:
             self._consecutive_losses = int(blob.get("consecutive_losses", 0) or 0)
             self._daily_pnl = float(blob.get("daily_pnl", 0.0) or 0.0)
