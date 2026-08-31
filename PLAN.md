@@ -1570,3 +1570,78 @@ authority every retrain cycle (visible via range_train_spec_mismatch);
 walkforward.py:57 still pins commission_per_contract 0.65 (fees DO resolve, so
 windows get corrected friction); skew/commission are static measured constants,
 not a live calibration path. W3 (scorecard truth) and W6 (ops) remain.
+
+## 2026-08-31 - W3 + W6 EXECUTED — ALL SIX WAVES NOW COMPLETE
+W3 SCORECARD TRUTH — one authority for the go-live verdict:
+NEW src/ait/reporting/go_live.py: compute_go_live_verdict() + the not-real-close
+  patterns + OPEN_TRADE_STATUSES (derived from TradeStatus) + gate constants.
+  status.py AND master.py's Friday page now call the SAME functions; a test
+  runs both against one DB and asserts every gate line is BYTE-IDENTICAL.
+[policy-vs-impl-1/-3, money-flow-04] The Friday page graded the RETIRED
+  all-strategy population; now IC-only via GO_LIVE_VERDICT_STRATEGIES, with
+  both thresholds shown (50 prelim / 100 funding). CORRECTION to the R23
+  register: master did NOT authorize at 25 closes — it already read /50. The
+  real defects were the population and the missing funding threshold. No
+  25-close constant exists in the repo.
+[policy-vs-impl-2] A lifetime DOLLAR MEAN was rendered under a label promising
+  a percent-of-credit MEDIAN -> now the pinned statistic (median |fill-mid| as
+  % of credit, trailing 20 fills) plus the never-computed no-worsening clause.
+[policy-vs-impl-5] The 2 unanswerable criteria printed as nothing; now
+  UNAVAILABLE WITH THE REASON, and a failure prints GATE READOUT FAILED
+  instead of silently deleting the whole readout.
+[string-contracts-1] meta_label.build_training_data: 24 -> 18 rows on the live
+  DB (the 6 never-filled $0 phantoms, 26% of the training set, are gone).
+[string-contracts-4] Reconciler $0 sentinels named as constants and counted
+  correctly (written strings deliberately UNCHANGED — other consumers read
+  them); the scorecard now SURFACES excluded rows instead of hiding them.
+[db-contracts-4] Open-position queries derive from TradeStatus (cancelled rows
+  no longer read as open).
+W6 OPS SURFACES — no surface may report green on an unwired channel:
+NEW src/ait/monitoring/ops_health.py: ANSI-robust log parsing, bounded tail
+  reads + incremental day counters, native-crash counting, bot-liveness
+  evidence, and the bot_state health channel (plain sqlite, never the DuckDB
+  RW lock, throttled 1/min, disabled under pytest).
+[string-contracts-5, db-contracts-6] The 5 dead dashboard keys: watchdog now
+  PUBLISHES component health + memory + an error ring; model_version re-wired
+  to trade_context (a real source); meta_label_stats left honestly blank. The
+  unconditional green st.success('No errors logged') is GONE — green now
+  requires wired AND fresh AND empty; absent/stale say "NOT WIRED ... this is
+  NOT an all-clear".
+[log-contracts-1/-4/-6] web_logs: 76MB full re-read every 5s per tab -> bounded
+  seek (0.01s); counters no longer derive from the display window and walk
+  today's rotated backups; UTC->LOCAL date bucketing; ANSI-robust parsing;
+  HTML-escaped output. Live: 63 orders / 39 ML predictions today where the old
+  code reported 0.
+[log-contracts-3] Crashes counted from logs/fatal.log (the real sink), with
+  "nothing records crashes" distinguished from "no crashes".
+[dead-surface-4] Capture efficiency was DOLLARS / PERCENT: -1653% -> median
+  +70.7% (winners 85-96%), a usable exit-tuning number.
+[dead-surface-3] Direction accuracy states plainly that state.close_trade never
+  writes the column — "NOT RECORDED", not "no data yet".
+[bot-day-02] Dead-man ping GATED on liveness evidence (heartbeat < 900s = 30
+  missed beats, RTH-only, post-open warmup — the SAME threshold master.py uses
+  for bot_hung_heartbeat_stale, so no new alert surface); not-alive sends
+  /fail. keeper_ait.bat rewired; verify_deadman confirms "ping gated: True".
+INTEGRATION (owner, cross-boundary items the agents flagged):
+- All 6 remaining consumers rewired to the ONE not-real-close authority
+  (dashboard, analytics, duckdb_analytics, learning/analyzer, shadow_referee,
+  restate_d1) — each had omitted the reconciler sentinels.
+- status.py: crash counting -> fatal.log; today-counts -> ops_health (was a
+  fixed tail window + UTC-vs-local substring match).
+- orchestrator: log.error("loop_impaired") now EMITTED as a structured event
+  (it existed only inside the Telegram f-string, so every log consumer
+  reported a healthy loop through an R8-class outage).
+- keeper_ait.bat gated (above). tests/test_w6_ops_surfaces.py's
+  test_the_real_keeper_is_detected_as_ungated INVERTED to
+  test_the_real_keeper_is_gated — it pinned a defect that is now fixed.
+PROOF: W3 32 tests (13 fail pre-fix), W6 63 tests (43 fail pre-fix). Suite
+1478 green, type gate OK, SMOKE PASS 13.
+STILL OPEN (registered, not done): master.py:830 builds RangePredictor at
+horizon 30 inside the retrain subprocess (will flap against the horizon-9
+authority every cycle — visible via range_train_spec_mismatch);
+walkforward.py:57 pins commission_per_contract; state.close_trade never writes
+direction_correct; scripts/check_first_rth_liveness.py has the old tail/regex
+defects; docs/RUNBOOK.md:131 still says ">=50 closes" only; status_server's
+8503 page still exposes no gate data. THE BIG ONE: every pre-W5 study absolute
+is stale — the walk-forward re-run on the corrected cost model is the next
+milestone and the real test of whether the IC edge survives.

@@ -456,6 +456,17 @@ class MetaLabeler:
         import json as _json
         import sqlite3
 
+        # W3 string-contracts-1/-4: this query used to be a bare
+        # "WHERE t.status = 'closed'" while all 8 sibling consumers filtered
+        # out non-real closes — so the trainer learned from $0 rows for
+        # signals that NEVER FILLED (6 of 23 rows = 26% of the set, 43% of
+        # the negative class on the 2026-08-25 book), teaching the entry gate
+        # that those entry-feature contexts lose, and inflating the
+        # MIN_TRADES_FOR_TRAINING arming count with fabricated labels. The
+        # reconciler's $0 "needs manual review" sentinels are excluded by the
+        # same authority.
+        from ait.reporting.go_live import not_real_close_sql
+
         rows = []
         # Legacy rows with no captured snapshot (entry_signals == '{}') must
         # NOT be back-filled with the same fixed defaults for every row —
@@ -471,7 +482,7 @@ class MetaLabeler:
         with sqlite3.connect(state_manager._db_path) as conn:
             conn.row_factory = sqlite3.Row
             # Join trades with their entry context
-            results = conn.execute("""
+            results = conn.execute(f"""
                 SELECT t.trade_id, t.realized_pnl, t.entry_time,
                        c.entry_direction, c.entry_confidence, c.entry_regime,
                        c.entry_vix, c.entry_iv_rank, c.entry_sentiment_score,
@@ -479,6 +490,7 @@ class MetaLabeler:
                 FROM trades t
                 JOIN trade_context c ON t.trade_id = c.trade_id
                 WHERE t.status = 'closed'
+                      {not_real_close_sql("t.exit_reason_detailed")}
                 ORDER BY t.entry_time
             """).fetchall()
 

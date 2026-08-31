@@ -2001,6 +2001,11 @@ class TradingOrchestrator:
         n += 1
         if n >= 5 and (_t.time() - last_alert) > 3600:
             last_alert = _t.time()
+            # W6/log-contracts-2: "LOOP IMPAIRED" existed ONLY inside the
+            # Telegram f-string, so every log consumer (deploy gate, status,
+            # first-RTH liveness check) reported a healthy loop through an
+            # R8-class outage. Emit it as a structured event too.
+            log.error("loop_impaired", kind=kind, consecutive_failures=n)
             try:
                 await self._send_notification(
                     f"LOOP IMPAIRED — {kind}: {n} consecutive failures. "

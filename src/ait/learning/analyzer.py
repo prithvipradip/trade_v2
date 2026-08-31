@@ -17,6 +17,9 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from ait.utils.logging import get_logger
+from ait.reporting.go_live import (
+    not_real_close_sql as _not_real_close_sql,  # W3/string-contracts-4
+)
 
 log = get_logger("learning.analyzer")
 
@@ -586,9 +589,7 @@ class TradeAnalyzer:
             rows = conn.execute(
                 """SELECT * FROM trades
                    WHERE status = 'closed' AND COALESCE(exit_time, entry_time) >= ?  -- exit-time window (deep-audit): 7-30d holds opened before the window but closed inside it were excluded
-                     AND COALESCE(exit_reason_detailed, '') NOT LIKE '%migrated%'
-                     AND COALESCE(exit_reason_detailed, '') NOT LIKE '%pending%'
-                     AND COALESCE(exit_reason_detailed, '') NOT LIKE '%never_filled%'
+                     """ + _not_real_close_sql() + """
                    ORDER BY entry_time""",
                 (since,),
             ).fetchall()

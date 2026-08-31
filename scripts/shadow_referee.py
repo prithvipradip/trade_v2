@@ -33,7 +33,8 @@ PNL_TOL = 2.00                # per-trade booked-vs-broker tolerance ($)
 COMM_TOL = 0.75               # per-trade commission tolerance ($)
 TOTAL_TOL = 5.00              # aggregate realized tolerance ($)
 PF_TOL = 0.10                 # aggregate PF tolerance
-NOT_REAL = ("%migrated%", "%pending%", "%never_filled%")  # scorecard's filter
+# W3/string-contracts-4: the scorecard's filter now lives in ONE place.
+from ait.reporting.go_live import NOT_REAL_CLOSE_PATTERNS as NOT_REAL
 
 
 def real_closed_trades(cur):

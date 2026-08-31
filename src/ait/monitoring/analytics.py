@@ -31,11 +31,18 @@ DB_PATH = Path("data/ait_state.db")
 # Non-real closes (reconciler bookkeeping rows: never_filled / pending /
 # migrated) must not count as closes in PF / win-rate / drawdown — mirrors
 # the filter in status.py.
-_REAL_CLOSE_SQL = (
-    "COALESCE(exit_reason_detailed, '') NOT LIKE '%never_filled%' "
-    "AND COALESCE(exit_reason_detailed, '') NOT LIKE '%pending%' "
-    "AND COALESCE(exit_reason_detailed, '') NOT LIKE '%migrated%'"
+from ait.reporting.go_live import (
+    NOT_REAL_CLOSE_PATTERNS as _NOT_REAL_PATTERNS,
 )
+
+# W3/string-contracts-4: membership now comes from the ONE authority
+# (src/ait/reporting/go_live.py) — this local copy omitted the
+# reconciler $0 sentinels (reconciler_unknown / needs_review), which
+# therefore counted as REAL closes in PF / win-rate / drawdown.
+_REAL_CLOSE_SQL = " ".join(
+    f"COALESCE(exit_reason_detailed, '') NOT LIKE '{_p}'"
+    for _p in _NOT_REAL_PATTERNS
+).replace("' COALESCE", "' AND COALESCE")
 
 
 def _capital_base() -> float:

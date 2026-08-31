@@ -33,7 +33,8 @@ DB = ROOT / "data" / "ait_state.db"
 MIRROR = ROOT / "data" / "ait_analytics.duckdb"
 
 BAG_CONID = 28812380
-NOT_REAL = ("%migrated%", "%pending%", "%never_filled%")
+# W3/string-contracts-4: membership from the ONE authority.
+from ait.reporting.go_live import NOT_REAL_CLOSE_PATTERNS as NOT_REAL
 PNL_EPS = 0.005  # below this, booked == broker; skip
 
 
