@@ -83,7 +83,17 @@ class Backtester:
         # capital, and a $10k bare-engine default cannot bias a comparison
         # the way a divergent gate threshold can.
         initial_capital: float = 10_000.0,
-        commission_per_contract: float = 0.65,
+        # W5 finding model-vs-reality-commission-constant: was a bare 0.65
+        # literal that stood for the WHOLE per-leg cost. IBKR charges ~$0.65
+        # commission PLUS regulatory/exchange/clearing fees on every option
+        # leg, entry AND exit; the repo's own executions ledger measures the
+        # all-in at 0.9168/contract-leg (mean; median 1.0284), so the flat
+        # 0.65 understated a condor round trip by $2.13/contract (~41%).
+        # None -> resolve from load_settings().backtest.* (see the resolution
+        # block below); an explicit value still wins, so walkforward.py's
+        # pinned 0.65 keeps its commission line and only gains the fees.
+        commission_per_contract: float | None = None,
+        regulatory_fees_per_contract: float | None = None,
         slippage_pct: float = 0.01,
         position_size_pct: float = 0.05,
         stop_loss_pct: float = 0.50,
@@ -117,6 +127,12 @@ class Backtester:
         wing_k: float | None = None,
         delta_iv_scale: float = 0.0,
         skew_factor: float = 1.0,
+        # W5 finding model-vs-reality-skew-10x-flat: measured put-side skew is
+        # 9-11x steeper than the hardcoded 0.10 slope in _get_leg_iv, so model
+        # wings were near-free ($0.08 vs $0.71-0.92 real). None -> resolve
+        # from load_settings().backtest.skew_slope_per_pct_otm; 0.0 restores
+        # pre-W5 pricing exactly.
+        skew_slope_per_pct_otm: float | None = None,
         hurst_regime_threshold: float = 0.20,
         hurst_regime_penalty: float = 0.10,
         hurst_hard_veto_multiplier: float = 1.5,
@@ -217,7 +233,9 @@ class Backtester:
         self._data = self._prepare_data(data)
         self._strategies = strategies
         self._initial_capital = initial_capital
-        self._commission = commission_per_contract
+        # W5: _commission / _regulatory_fees / _cost_per_contract_leg are
+        # resolved in the loaded-settings block below (they need _settings),
+        # same as _iv_floor.
         self._slippage_pct = slippage_pct
         self._spread_base = spread_base
         self._spread_iv_sensitivity = spread_iv_sensitivity
@@ -257,6 +275,7 @@ class Backtester:
         )
         self._delta_iv_scale = delta_iv_scale
         self._skew_factor = skew_factor
+        # W5: _skew_slope_per_pct_otm resolved in the settings block below.
         self._hurst_regime_threshold = hurst_regime_threshold
         self._hurst_regime_penalty = hurst_regime_penalty
         self._hurst_hard_veto_multiplier = hurst_hard_veto_multiplier
@@ -324,6 +343,26 @@ class Backtester:
             limit_order_timeout_bars, "backtest", "limit_order_timeout_bars", BacktestConfig, _settings))
         self._iv_floor = float(_resolve_setting(
             iv_floor, "backtest", "iv_floor", BacktestConfig, _settings))
+        # W5 model-vs-reality-commission-constant: per-leg, per-side broker
+        # cost = commission + regulatory/exchange/clearing fees. Both charged
+        # on entry AND exit (see run() and _calc_pnl). _commission stays the
+        # commission LINE (walkforward/optimizer pass it explicitly); the
+        # all-in figure the engine actually debits is
+        # _cost_per_contract_leg = 0.65 + 0.2668 = 0.9168 by default, the
+        # measured ledger mean.
+        self._commission = float(_resolve_setting(
+            commission_per_contract, "backtest", "commission_per_contract",
+            BacktestConfig, _settings))
+        self._regulatory_fees = float(_resolve_setting(
+            regulatory_fees_per_contract, "backtest",
+            "regulatory_fees_per_contract", BacktestConfig, _settings))
+        self._cost_per_contract_leg = self._commission + self._regulatory_fees
+        # W5 model-vs-reality-skew-10x-flat: relative put-side IV uplift per
+        # percentage point OTM, consumed in _get_leg_iv (the single per-leg IV
+        # input point every builder and reprice path goes through).
+        self._skew_slope_per_pct_otm = float(_resolve_setting(
+            skew_slope_per_pct_otm, "backtest", "skew_slope_per_pct_otm",
+            BacktestConfig, _settings))
         self._range_min_confidence = float(_resolve_setting(
             range_min_confidence, "ml", "range_min_confidence", MLConfig, _settings))
         self._min_confidence = float(_resolve_setting(
@@ -946,8 +985,11 @@ class Backtester:
             # Deep-audit BT-M6: entry commission is included in _calc_pnl
             # (subtracted from the trade P&L added back at exit) — debiting
             # capital here as well double-counted it in final_capital.
+            # W5 model-vs-reality-commission-constant: the debit is now the
+            # ALL-IN per-leg cost (commission + regulatory/exchange/clearing
+            # fees), charged per leg on entry and again on exit in _calc_pnl.
             n_legs = pos.get("n_legs", 1)
-            entry_commission = self._commission * pos["contracts"] * n_legs
+            entry_commission = self._cost_per_contract_leg * pos["contracts"] * n_legs
             pos["entry_commission"] = entry_commission
 
             open_positions.append(pos)
@@ -1311,14 +1353,35 @@ class Backtester:
                     option_type: OptionType) -> float:
         """Apply vol skew: OTM puts carry extra IV, OTM calls carry mild extra IV.
 
-        Linear model in log-moneyness space:
+        Legacy (pre-W5) linear model in log-moneyness space:
         - Put: +1% IV per 10% below ATM (e.g. 20% OTM put → +2% IV)
         - Call: +0.2% IV per 10% above ATM
         skew_factor=0.0 restores flat IV; default 1.0 approximates market skew.
+
+        W5 finding model-vs-reality-skew-10x-flat: that put slope (0.10
+        absolute IV per unit |log-moneyness|) is 9-11x FLATTER than the
+        surface measured on the repo's own 3,159 IBKR quotes (1.141 SPY /
+        0.983 QQQ / 0.916 IWM), which is why model wings were near-free —
+        long put $0.08 against a $0.71-0.92 real chain mid — and every
+        wing_k / wide-wing study preferred wider wings than the market
+        actually prices. The correction is the config-backed MULTIPLICATIVE
+        term below: leg IV picks up base_iv x skew_slope_per_pct_otm x
+        (percentage points OTM), so the surface steepens with the vol level
+        the way the measured one does.
+
+        skew_slope_per_pct_otm = 0.0 reproduces the pre-W5 output EXACTLY
+        (backward-compat escape hatch for reproducing an old study). The call
+        side keeps its legacy 0.02 term on purpose: the same regression put
+        the call-side slope at 0.064 / 0.112 / -0.089 — sign-unstable across
+        symbols, so there is no measured slope to ship there.
         """
         log_m = np.log(strike / underlying)
         if option_type == OptionType.PUT:
-            skew_adj = self._skew_factor * max(0.0, -log_m) * 0.10
+            otm = max(0.0, -log_m)
+            skew_adj = self._skew_factor * otm * 0.10
+            # W5: measured put-side steepening, relative to the vol level.
+            # otm * 100 = distance in PERCENTAGE POINTS OTM.
+            skew_adj += base_iv * self._skew_slope_per_pct_otm * (otm * 100.0)
         else:
             skew_adj = self._skew_factor * max(0.0, log_m) * 0.02
         return max(base_iv + skew_adj, self._iv_floor)
@@ -2258,8 +2321,21 @@ class Backtester:
             if result.get("exit_reason") == "touch_stop":
                 _tu = float(result.pop("touch_underlying"))
                 current_value = self._reprice_position(pos, _tu, days_held, hist)
-                current_value *= (1 + exit_half_spread)
                 underlying = _tu
+                # W5 model-vs-reality-touch-gap-pricing: a day that OPENED
+                # beyond the short strike could never have been closed AT the
+                # strike. Reprice at the gapped open and book the worse of the
+                # two — conservative by construction, so a gap can only ever
+                # cost more than the strike-touch booking, never less.
+                _gap = result.pop("touch_gap_underlying", None)
+                if _gap is not None:
+                    _gv = self._reprice_position(pos, float(_gap), days_held, hist)
+                    _worse = (_gv > current_value if trade_type == "credit"
+                              else _gv < current_value)
+                    if _worse:
+                        current_value = _gv
+                        underlying = float(_gap)
+                current_value *= (1 + exit_half_spread)
 
             # Calculate actual P&L
             pnl = self._calc_pnl(pos, current_value)
@@ -2324,6 +2400,16 @@ class Backtester:
         # Daily High/Low bracket the true intraday path, so they detect the
         # touch without intraday bars. The exit is priced AT the touched
         # strike (the level live would have transacted at), not at the close.
+        # W5 model-vs-reality-touch-gap-pricing: the strike is the right exit
+        # level only for an INTRADAY pierce. When the session OPENS already
+        # beyond a short strike there was never a chance to transact at the
+        # strike — options do not trade overnight and a resting stop would
+        # trigger at the open too — so booking the strike prices the standard
+        # condor loss path as a near-scratch. Measured: 1%+ overnight gaps on
+        # 9.6% of SPY / 18.1% QQQ / 17.8% IWM days in the very 604-day sample
+        # every study runs on, understating the loss by $324-$1,405/contract
+        # at 1%-3.5% gaps. The gapped open is reported alongside the strike
+        # and _check_exit prices the exit at the WORSE of the two.
         if row is not None and self._touch_stop_enabled:
             _sp = pos.get("short_put_strike")
             _sc = pos.get("short_call_strike")
@@ -2332,15 +2418,27 @@ class Backtester:
                 _high = float(row["High"]) if "High" in row else None
             except (TypeError, ValueError):
                 _low = _high = None
+            try:
+                _open = float(row["Open"]) if "Open" in row else None
+            except (TypeError, ValueError):
+                _open = None
             _touched = None
+            _gapped = None
             if _sp and _low is not None and _low <= float(_sp):
                 _touched = float(_sp)
+                if _open is not None and _open <= float(_sp):
+                    _gapped = _open
             elif _sc and _high is not None and _high >= float(_sc):
                 _touched = float(_sc)
+                if _open is not None and _open >= float(_sc):
+                    _gapped = _open
             if _touched is not None:
-                return {"exit_date": str(current_date),
+                _out = {"exit_date": str(current_date),
                         "exit_reason": "touch_stop",
                         "touch_underlying": _touched}
+                if _gapped is not None:
+                    _out["touch_gap_underlying"] = _gapped
+                return _out
         # HWM still tracked for journaling/analysis parity (live persists it
         # even though credit exits no longer trail off it).
         pos["high_water_mark"] = max(pos.get("high_water_mark", 0.0), pnl_pct)
@@ -2470,7 +2568,11 @@ class Backtester:
         else:
             raw_pnl = (current_value - entry_price) * 100 * contracts
 
-        exit_commission = self._commission * contracts * n_legs
+        # W5 model-vs-reality-commission-constant: all-in per-leg cost
+        # (commission + regulatory/exchange/clearing fees), same figure the
+        # entry side debits — a 4-leg condor round trip therefore costs
+        # _cost_per_contract_leg x 4 x 2 per contract.
+        exit_commission = self._cost_per_contract_leg * contracts * n_legs
         total_commission = pos.get("entry_commission", 0) + exit_commission
 
         return raw_pnl - total_commission

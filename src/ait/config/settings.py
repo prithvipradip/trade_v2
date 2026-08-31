@@ -237,6 +237,59 @@ class BacktestConfig(_StrictModel):
         description="Additional half-spread per DTE below 21. Near-expiry options are wider.")
     spread_cap: float = Field(default=0.15, ge=0.01, le=0.50,
         description="Maximum per-leg half-spread ($). Prevents unrealistic spread in stress regimes.")
+    # W5 research-honesty block (blindspot_composition_hunt_20260825.md).
+    # Three CONFIRMED research_validity findings whose combined size is the
+    # whole per-condor expectancy — the researched edge may be sign-flipped,
+    # so these values are the measured ones, not the convenient ones.
+    commission_per_contract: float = Field(default=0.65, ge=0.0, le=10.0,
+        description="Finding model-vs-reality-commission-constant: IBKR base "
+                    "options commission ($/contract, per leg, charged on entry "
+                    "AND exit). This is ONLY the commission line — the "
+                    "regulatory/exchange/clearing fees that ride with every "
+                    "fill live in regulatory_fees_per_contract below. The "
+                    "engine used to charge this 0.65 as the ENTIRE per-leg "
+                    "cost, which is what the finding measured as a ~41% "
+                    "understatement of real friction.")
+    regulatory_fees_per_contract: float = Field(default=0.2668, ge=0.0, le=5.0,
+        description="Finding model-vs-reality-commission-constant: the "
+                    "regulatory/exchange/clearing fees IBKR adds to every "
+                    "option fill, on top of commission_per_contract, per leg, "
+                    "entry AND exit. Default is the finding's OWN measurement "
+                    "on data/ait_state.db executions (78 leg fills, BAG "
+                    "summary rows excluded): all-in per contract-leg mean "
+                    "0.9168 (median 1.0284, min 0.6195, max 1.0586); "
+                    "0.9168 - 0.65 = 0.2668. It reproduces the finding's "
+                    "headline gap exactly: a 4-leg condor round trip costs "
+                    "(0.65 + 0.2668) x 4 x 2 = $7.33/contract against the old "
+                    "flat-0.65 model's $5.20 = the measured $2.13/contract "
+                    "understatement. Set to 0.0 ONLY to reproduce a pre-W5 "
+                    "study; live P&L is trued up to the real ledger "
+                    "(orchestrator total_commission), so 0.0 means research "
+                    "and live disagree by this amount on every leg.")
+    skew_slope_per_pct_otm: float = Field(default=0.0736, ge=0.0, le=1.0,
+        description="Finding model-vs-reality-skew-10x-flat: RELATIVE IV "
+                    "uplift per 1 percentage point of OTM distance for the "
+                    "put side, i.e. leg_iv gains base_iv x this x "
+                    "(100 x |ln(K/S)|) on top of the legacy hardcoded skew. "
+                    "The engine's hardcoded put slope was 0.10 absolute IV "
+                    "per unit |log-moneyness|; the finding's regression on "
+                    "the repo's own 3,159 IBKR quotes "
+                    "(data/historical.db option_spread_samples, 2026-08-11) "
+                    "measured 1.141 SPY dte20 (n=140), 0.983 QQQ dte20 "
+                    "(n=81), 0.916 IWM dte24 (n=57) — 9-11x steeper — with a "
+                    "sample-weighted mean of 1.049. Default 0.0736 makes the "
+                    "TOTAL put slope hit that 1.049 at the finding's own "
+                    "probe anchor (SPY atm_iv 0.1289, skew_factor 1.0): "
+                    "0.10 + 0.1289 x 100 x 0.0736 = 1.049. Consequence of "
+                    "the old value: wings were near-free in research (long "
+                    "put $0.08 model vs $0.71-0.92 real chain mid), so every "
+                    "wing_k/wide-wing study preferred wider wings than "
+                    "reality prices. The CALL side deliberately keeps its "
+                    "legacy 0.02 term: the same regression measured "
+                    "0.064/0.112/-0.089 there — sign-unstable across symbols "
+                    "and therefore not a calibrated slope. 0.0 restores "
+                    "pre-W5 pricing exactly (backward-compat escape hatch "
+                    "for reproducing an old study, NOT an honest surface).")
     # Fractal regime params (Gap Z5) — also used by live orchestrator for parity with backtest
     hurst_regime_threshold: float = Field(default=0.20, ge=0.05, le=0.50,
         description="Hurst scale-spread above which fractal confidence penalty is applied. "

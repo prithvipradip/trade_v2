@@ -316,14 +316,26 @@ class TradeExecutor:
         # GOV (governance audit): market-hours enforcement at the EXECUTOR —
         # the scheduler gates the loop, but nothing stopped any other caller
         # from submitting outside RTH. Last line of defense.
-        try:
-            from ait.utils.time import is_market_open as _imo
-            if not _imo() and _os.environ.get("AIT_ALLOW_AFTER_HOURS") != "1":
+        # fail-direction-12 (blindspot_composition_hunt_20260825): the guard
+        # swallowed ANY calendar exception at a bare `pass`. "Never let the
+        # guard itself block" inverts the fail direction of a self-described
+        # last line of defense: a calendar that raises silently authorised an
+        # off-hours submission. The explicit operator override is checked
+        # FIRST (the guard is then deliberately disabled); otherwise a
+        # calendar that cannot answer REFUSES the order and says so at ERROR.
+        if _os.environ.get("AIT_ALLOW_AFTER_HOURS") != "1":
+            try:
+                from ait.utils.time import is_market_open as _imo
+                _mkt_open = _imo()
+            except Exception as _mh_err:  # noqa: BLE001 — fail CLOSED, loudly
+                log.error("market_hours_guard_failed",
+                          strategy=signal.strategy_name, symbol=signal.symbol,
+                          error=str(_mh_err))
+                return None
+            if not _mkt_open:
                 log.error("order_refused_market_closed",
                           strategy=signal.strategy_name, symbol=signal.symbol)
                 return None
-        except Exception:  # noqa: BLE001 — never let the guard itself block
-            pass
 
         if not await self._ibkr.ensure_connected():
             log.error("execution_failed", reason="IBKR not connected")
@@ -545,13 +557,38 @@ class TradeExecutor:
         order.orderRef = trade_id
         return await self._ibkr.place_order(qualified, order)
 
+    def _nbbo_gate_refuses(self, trade_id: str, *, is_exit: bool,
+                           reason: str) -> bool:
+        """fail-direction-07: verdict when the combo NBBO sanity input is
+        missing (quote outage, nan/empty NBBO, crossed book).
+
+        ENTRY: refuse (fail CLOSED) — without a live NBBO the marketable
+        limit is anchored to a scan-time mid that "can be minutes old", in
+        exactly the disorderly-book conditions where that limit becomes the
+        fill. EXIT: never blocked — fail OPEN but LOUD. The asymmetry is
+        deliberate: a missed exit is worse than a missed entry.
+
+        Returns True when the caller must refuse the placement.
+        """
+        if is_exit:
+            log.error("combo_nbbo_unavailable_exit_proceeding",
+                      trade_id=trade_id, reason=reason)
+            return False
+        log.warning("combo_nbbo_unavailable_entry_refused",
+                    trade_id=trade_id, reason=reason)
+        return True
+
     async def _execute_multi_leg(
-        self, signal: Signal, contracts: int, trade_id: str
+        self, signal: Signal, contracts: int, trade_id: str,
+        is_exit: bool = False,
     ) -> Trade | None:
         """Execute a multi-leg combo order (spreads, condors).
 
         Uses batch contract qualification for speed — qualifies all legs
         in a single IBKR call instead of one-at-a-time.
+
+        ``is_exit`` selects the combo-NBBO fail direction (fail-direction-07):
+        entries refuse without a live NBBO, exits proceed loudly.
         """
         if not signal.legs:
             log.error("no_legs_in_signal", trade_id=trade_id)
@@ -622,22 +659,42 @@ class TradeExecutor:
         # the signal-time mid. Fetch the live combo NBBO once and refuse when
         # (a) the combo spread is disorderly, or (b) the signal price has
         # drifted far from the live mid (stale signal / fat finger).
+        #
+        # fail-direction-07 (blindspot_composition_hunt_20260825): both
+        # unavailable-quote modes used to fail OPEN at debug/silence — an
+        # exception landed on log.debug("combo_quote_validation_skipped") and
+        # a nan/empty NBBO simply failed the `if` with no else. Either way
+        # the ladder anchored to the (possibly minutes-old) signal mid with
+        # NO live sanity check. Now: the outcome is tracked explicitly and an
+        # ENTRY without a usable NBBO is REFUSED.
         _live_mid_mag = None
         _live_spread = None
+        _nbbo_unavailable = "quote_never_arrived"
         try:
             self._ibkr.ib.reqMktData(combo, "", False, False)
             try:
                 import asyncio as _aio
-                await _aio.sleep(1.5)
-                _t = self._ibkr.ib.ticker(combo)
-                _bid = _t.bid if (_t and _t.bid == _t.bid) else None
-                _ask = _t.ask if (_t and _t.ask == _t.ask) else None
+                # Same 1.5s cap as before, but polled: a book that answers in
+                # 200ms no longer costs 1.5s of extra staleness before the
+                # sanity check that exists to catch stale prices.
+                _bid = _ask = None
+                for _ in range(15):
+                    await _aio.sleep(0.1)
+                    _t = self._ibkr.ib.ticker(combo)
+                    _bid = _t.bid if (_t and _t.bid == _t.bid) else None
+                    _ask = _t.ask if (_t and _t.ask == _t.ask) else None
+                    if _bid is not None and _ask is not None:
+                        break
             finally:
                 try:
                     self._ibkr.ib.cancelMktData(combo)
                 except Exception:
                     pass
-            if _bid is not None and _ask is not None and _ask > _bid:
+            if _bid is None or _ask is None:
+                _nbbo_unavailable = "nan_or_empty_nbbo"
+            elif _ask <= _bid:
+                _nbbo_unavailable = "crossed_or_locked_nbbo"
+            else:
                 _mid = (_bid + _ask) / 2
                 _spread = abs(_ask - _bid)
                 if abs(_mid) > 0.05 and _spread / abs(_mid) > 1.0:
@@ -661,8 +718,16 @@ class TradeExecutor:
                 # fill-quality baseline in the executions ledger.
                 _live_mid_mag = abs(_mid)
                 _live_spread = _spread
-        except Exception as _e:  # noqa: BLE001 — validation must not block on quote hiccups
-            log.debug("combo_quote_validation_skipped", error=str(_e))
+                _nbbo_unavailable = ""
+        except Exception as _e:  # noqa: BLE001 — classified below, never swallowed
+            _nbbo_unavailable = f"{type(_e).__name__}: {str(_e)[:120]}"
+
+        if _nbbo_unavailable and self._nbbo_gate_refuses(
+                trade_id, is_exit=is_exit, reason=_nbbo_unavailable):
+            # R12 Tier-A #1: CAS PENDING->CANCELLED
+            self._state.transition(
+                trade_id, (TradeStatus.PENDING,), TradeStatus.CANCELLED)
+            return None
 
         # R7: anchor pricing to the LIVE combo mid when we have one — the
         # signal-time price can be minutes old. And start the reprice ladder
@@ -1278,6 +1343,20 @@ class TradeExecutor:
                                       pending.is_credit)
             if not pending.is_credit and pending.debit_cap > 0:
                 new_limit = min(new_limit, pending.debit_cap)  # R8: honor risk cap
+            # trade-life-credit-econ-floors-signal-time-only: the credit
+            # economics floors (min credit + credit/width ratio) were applied
+            # to the SIGNAL's mid only, while this ladder is free to concede
+            # the full marketable offset — a fill could land below both
+            # floors that justified the entry. Re-check the CURRENT candidate
+            # credit; the debit side has had its mirror cap since R8 above.
+            if pending.is_credit and not self._credit_floors_hold(
+                    pending, new_limit):
+                # Refuse the REMAINDER of the ladder: park at the last step so
+                # no further escalation is attempted. The resting order keeps
+                # its current (floor-compliant) price; the entry times out and
+                # is cancelled normally if the market never comes to it.
+                pending.step = len(self._LADDER_STEPS) - 1
+                continue
             try:
                 for t in self._ibkr.ib.openTrades():
                     if t.order.orderId == order_id:
@@ -1290,6 +1369,65 @@ class TradeExecutor:
             except Exception as e:  # noqa: BLE001
                 log.warning("entry_ladder_reprice_failed",
                             trade_id=pending.trade_id, error=str(e))
+
+    def _credit_floors_hold(self, pending, limit_price: float) -> bool:
+        """trade-life-credit-econ-floors-signal-time-only: do the signal-time
+        credit-economics floors still hold for this re-priced ENTRY credit?
+
+        Mirrors the signal-time check (strategies/iron_condor.py: absolute
+        AIT_IC_MIN_CREDIT floor, then AIT_IC_MIN_CREDIT_WIDTH as a fraction of
+        the WIDER wing) against the candidate credit rather than the mid that
+        was quoted minutes earlier. ENTRY credit orders only — exits never
+        reach this path.
+        """
+        from ait.config.runtime_env import contract_float
+
+        credit = abs(round(limit_price, 2))
+        min_credit = contract_float("AIT_IC_MIN_CREDIT")
+        min_ratio = contract_float("AIT_IC_MIN_CREDIT_WIDTH")
+        width = self._pending_wing_width(pending)
+        ratio = (credit / width) if width > 0 else None
+        if credit < min_credit or (ratio is not None and ratio < min_ratio):
+            log.warning("credit_floor_breached_at_reprice",
+                        trade_id=getattr(pending, "trade_id", ""),
+                        credit=credit, min_credit=min_credit,
+                        width=width,
+                        ratio=(round(ratio, 4) if ratio is not None else None),
+                        min_ratio=min_ratio)
+            return False
+        return True
+
+    def _pending_wing_width(self, pending) -> float:
+        """Wider wing width of a pending credit structure, derived the way the
+        signal-time floor derives it: max(put_width, call_width) over the
+        order's own legs. Falls back to the PENDING trade row's legs JSON when
+        the in-memory signal carries no legs. 0.0 = width unknown (the ratio
+        floor is then skipped; the absolute credit floor still applies)."""
+        legs = list(getattr(getattr(pending, "signal", None), "legs", None) or [])
+        strikes: dict[str, list[float]] = {"P": [], "C": []}
+        for leg in legs:
+            try:
+                strike, right, _ = self._leg_fields(leg)
+            except Exception:  # noqa: BLE001 — an odd leg shape is not fatal
+                continue
+            side = str(right or "").upper()[:1]
+            if side in strikes and strike:
+                strikes[side].append(float(strike))
+        if not any(len(v) >= 2 for v in strikes.values()):
+            strikes = {"P": [], "C": []}
+            try:
+                row = self._state.get_trade_by_id(
+                    getattr(pending, "trade_id", "")) if self._state else None
+                for leg in json.loads(getattr(row, "legs", "[]") or "[]"):
+                    side = str(leg.get("right") or "").upper()[:1]
+                    if side in strikes and leg.get("strike"):
+                        strikes[side].append(float(leg["strike"]))
+            except Exception as _e:  # noqa: BLE001
+                log.debug("pending_wing_width_legs_unavailable",
+                          trade_id=getattr(pending, "trade_id", ""),
+                          error=str(_e))
+        widths = [max(v) - min(v) for v in strikes.values() if len(v) >= 2]
+        return round(max(widths), 4) if widths else 0.0
 
     @staticmethod
     def _is_bag_row(fill) -> bool:

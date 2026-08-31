@@ -105,6 +105,48 @@ class ModelTrainer:
 
         return False
 
+    def check_range_spec(self) -> bool:
+        """units-scale-05: is the range predictor about to be REBUILT at the
+        live authority's spec?
+
+        ``RangePredictor.train`` always restores its DESIGNED constructor spec
+        (``_spec_threshold``/``_spec_horizon``) before fitting, so whatever the
+        trainer is handed decides what every subsequent live gate decision
+        actually measures. ``ait.ml.range_spec.live_range_spec`` is the single
+        authority for that pair (and must equal walkforward's
+        ``_range_label_horizon``); a predictor built from anywhere else means
+        the next retrain silently re-establishes the divergence the register
+        entry was opened for. Logged, not corrected: rebinding another
+        object's designed spec here would hide which caller is wrong.
+
+        Returns True when the designed spec matches (or there is no range
+        predictor to check).
+        """
+        rp = self._range_predictor
+        if rp is None:
+            return True
+        designed_threshold = getattr(rp, "_spec_threshold", None)
+        designed_horizon = getattr(rp, "_spec_horizon", None)
+        if designed_threshold is None or designed_horizon is None:
+            return True
+        from ait.ml.range_spec import live_range_spec
+        live_threshold, live_horizon = live_range_spec()
+        if (abs(float(designed_threshold) - live_threshold) <= 1e-9
+                and int(designed_horizon) == int(live_horizon)):
+            return True
+        log.warning(
+            "range_train_spec_mismatch",
+            designed_threshold=designed_threshold,
+            designed_horizon_days=designed_horizon,
+            live_threshold=live_threshold,
+            live_horizon_days=live_horizon,
+            note="this retrain will rebuild the range model at the DESIGNED "
+                 "spec, which is not the live authority (ait.ml.range_spec) — "
+                 "the gate would measure a different question than the "
+                 "research that calibrated its confidence floor",
+        )
+        return False
+
     def _artifact_train_date(self) -> "date | None":
         """Recover the last training date from persisted model artifacts (R9).
 
@@ -177,6 +219,11 @@ class ModelTrainer:
         # Save previous scores for comparison
         prev_version = self._predictor.model_version
         prev_scores = dict(self._predictor.cv_scores)
+
+        # units-scale-05: one check per training run, before anything is
+        # fitted, so a range model about to be rebuilt at a non-authoritative
+        # (threshold, horizon) is visible in the log that produced it.
+        self.check_range_spec()
 
         # Fetch cross-asset data once (shared across all symbols)
         market_context = await self._fetch_market_context()

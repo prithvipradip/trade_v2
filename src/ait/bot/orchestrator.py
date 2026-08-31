@@ -56,6 +56,135 @@ from ait.utils.time import next_market_open
 
 log = get_logger("bot.orchestrator")
 
+# Strategies whose ENTRY confidence must come from the payoff-matched range
+# model rather than the directional one — P(price stays inside the wings) is
+# what a short-premium neutral structure actually gets paid for.
+# fail-direction-02 (R22): declared once here so the fail-closed drop below
+# cannot drift from the membership it protects. (The two pre-existing literal
+# copies at the override and the neutral-only filter are set-membership-6, a
+# separate register entry, and are left untouched by this wave.)
+RANGE_GATED_STRATEGIES: frozenset[str] = frozenset({"iron_condor", "short_strangle"})
+
+def _cooldown_now() -> datetime:
+    """Reference instant for the post-stop cooldown, naive-LOCAL.
+
+    numeric-pairs-02 (R22): kept naive-local on purpose — trades.exit_time is
+    written with datetime.now() (state.py) and the host runs ET, so the DB
+    rows and this clock share one convention. Extracted as a module function
+    so tests can pin it and stay deterministic on any weekday.
+    """
+    return datetime.now()
+
+
+# Cutoff depends only on the reference DATE, and each lookup costs an NYSE
+# calendar query; memoise so a scan over the universe pays it once a day.
+_COOLDOWN_CUTOFF_CACHE: dict[date, datetime] = {}
+
+
+def _post_stop_cooldown_cutoff(now: datetime | None = None) -> datetime:
+    """09:30 (naive-local == ET on this host) start of the PREVIOUS session.
+
+    numeric-pairs-02 (R22): the R12-B4 spec (portfolio.py ~line 495) is a
+    duration of ONE TRADING DAY — "exit_time's next trading session must have
+    STARTED before re-entry" — with weekends/holidays resolved by the market
+    calendar. The implementation was a flat `now - exit_time < 30h` wall-clock
+    window, which agrees mid-week and collapses across a weekend: a Friday
+    10:00 touch stop expired Saturday 16:00, so the bot re-entered that symbol
+    from Monday's open into the same move R12-B4 exists to sit out (the 08-24
+    QQQ re-entry is the live instance of the family).
+
+    The rule is uniform: block while exit_time >= 09:30 on the latest trading
+    day STRICTLY BEFORE the reference date. On a Monday that cutoff is
+    Friday 09:30 (a Friday stop blocks all of Monday; a Thursday stop does
+    not), mid-week it is yesterday 09:30, and after a market holiday the
+    calendar walks back to the last real session on its own.
+    """
+    from ait.utils.time import MARKET_OPEN, is_trading_day
+
+    now = now or _cooldown_now()
+    ref = now.date()
+    cached = _COOLDOWN_CUTOFF_CACHE.get(ref)
+    if cached is not None:
+        return cached
+
+    prev = ref - timedelta(days=1)
+    for _ in range(14):  # 14 calendar days covers any NYSE holiday cluster
+        if is_trading_day(prev):
+            break
+        prev -= timedelta(days=1)
+    cutoff = datetime.combine(prev, MARKET_OPEN)
+
+    if len(_COOLDOWN_CUTOFF_CACHE) > 8:
+        _COOLDOWN_CUTOFF_CACHE.clear()
+    _COOLDOWN_CUTOFF_CACHE[ref] = cutoff
+    return cutoff
+
+
+RESTRICTED_LIST_PATH = "data/RESTRICTED.txt"
+# fail-direction-11: sentinel returned when the ban file EXISTS but cannot be
+# parsed. It is deliberately NOT a set — a caller that forgets to check it
+# raises instead of silently reading "no bans".
+RESTRICTED_UNREADABLE = None
+
+
+def read_restricted_symbols(path: str | None = None) -> set[str] | None:
+    """Read the operator's hard-ban list (data/RESTRICTED.txt, one symbol/line).
+
+    fail-direction-11 (blindspot_composition_hunt_20260825): this was an
+    inline `read_text()` inside a bare `except: pass`. A UTF-8 BOM (Notepad,
+    `Set-Content`) parsed to {'\ufeffSPY'} and a UTF-16 file (PowerShell's
+    default `>` / Out-File) to NUL-riddled garbage — no exception raised, no
+    log written, and the banned symbol traded on regardless.
+
+    Returns:
+        set[str]  — the banned symbols (upper-cased); empty set when the file
+                    is ABSENT, which means "no restrictions" exactly as before;
+        None      — RESTRICTED_UNREADABLE: the file exists but could not be
+                    parsed. The caller MUST refuse new entries until it reads
+                    cleanly: an operator who dropped a ban file gets
+                    protection, not silence.
+    """
+    from pathlib import Path as _Path
+
+    p = _Path(path or RESTRICTED_LIST_PATH)
+    try:
+        if not p.exists():
+            return set()
+    except OSError as e:
+        log.error("restricted_list_unreadable_fail_closed",
+                  path=str(p), error=str(e), stage="exists")
+        return RESTRICTED_UNREADABLE
+
+    text = None
+    try:
+        # utf-8-sig strips the BOM that made 'SPY' read as '\ufeffSPY'.
+        text = p.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        # PowerShell 5.1's `echo SPY > data\RESTRICTED.txt` writes UTF-16LE;
+        # a real ban file in the operator's default encoding is readable, not
+        # a failure. Anything else still fails closed below.
+        try:
+            text = p.read_text(encoding="utf-16")
+            log.warning("restricted_list_decoded_utf16", path=str(p))
+        except Exception as e:  # noqa: BLE001
+            log.error("restricted_list_unreadable_fail_closed",
+                      path=str(p), error=str(e), stage="decode")
+            return RESTRICTED_UNREADABLE
+    except Exception as e:  # noqa: BLE001 — OSError, AV/permission lock, ...
+        log.error("restricted_list_unreadable_fail_closed",
+                  path=str(p), error=str(e), stage="read")
+        return RESTRICTED_UNREADABLE
+
+    if "\x00" in text:
+        log.error("restricted_list_unreadable_fail_closed",
+                  path=str(p), error="NUL bytes in decoded text",
+                  stage="decode")
+        return RESTRICTED_UNREADABLE
+
+    banned = {ln.strip().upper() for ln in text.splitlines() if ln.strip()}
+    log.info("restricted_list_loaded", path=str(p), symbols=sorted(banned))
+    return banned
+
 
 class TradingOrchestrator:
     """Orchestrates the complete autonomous trading lifecycle."""
@@ -109,13 +238,24 @@ class TradingOrchestrator:
         self._predictor = DirectionPredictor(settings.ml)
         self._regime_detector = RegimeDetector()
 
-        # Range predictor (Tier 1) — used for iron condor confidence
+        # Range predictor (Tier 1) — used for iron condor confidence.
+        # units-scale-05 (R22): these were bare literals (0.05, 30) — the LIVE
+        # half of a must-agree pair whose RESEARCH half (walkforward's
+        # _range_label_horizon) had already moved to the reachable trade
+        # horizon (dte_range[0] - EXPIRY_APPROACHING_DTE = 9d). The live 0.65
+        # floor is justified by a sweep of the research pipeline, so a 30-day
+        # containment probability was being judged against a floor calibrated
+        # on the strictly easier 9-day question — vetoing IC entries the
+        # validated gate would take. Both sides now read one authority.
         from ait.ml.range_predictor import RangePredictor
+        from ait.ml.range_spec import live_range_spec
+        _range_threshold, _range_horizon = live_range_spec(settings)
         self._range_predictor = RangePredictor(
-            threshold_pct=0.05,  # ±5%
-            horizon_days=30,
+            threshold_pct=_range_threshold,
+            horizon_days=_range_horizon,
         )
         self._range_predictor.load_models()  # silent if no model yet
+        self._check_range_model_spec(_range_threshold, _range_horizon)
 
         # Vol-magnitude predictor (Tier 1) — used for long straddle confidence
         from ait.ml.vol_magnitude_predictor import VolMagnitudePredictor
@@ -265,6 +405,44 @@ class TradingOrchestrator:
 
         # Signal queue for entry timing optimization
         # Signals wait here until timing conditions are met (max 3 cycles)
+
+    def _check_range_model_spec(self, threshold: float, horizon: int) -> bool:
+        """units-scale-05: MODEL-ARTIFACT HONESTY at startup.
+
+        A loaded range model keeps the spec it was TRAINED at — its
+        probabilities only answer that question, and silently re-labelling
+        them with the live spec would be a lie (RangePredictor.load_models is
+        deliberately built that way). But a stale artifact must not be
+        invisible either: a model trained at 30d/±5% gating ~9-day trades is
+        the exact divergence units-scale-05 registers, and the operator has to
+        be able to see it in the startup log.
+
+        Returns True when a mismatch was found and logged. Nothing is deleted
+        or retrained here — ModelTrainer.needs_training already forces a
+        rebuild at the designed spec via RangePredictor.spec_mismatch.
+        """
+        rp = getattr(self, "_range_predictor", None)
+        if rp is None or not getattr(rp, "is_trained", False):
+            return False
+        trained_threshold = getattr(rp, "_threshold", None)
+        trained_horizon = getattr(rp, "_horizon", None)
+        if (trained_threshold is None or trained_horizon is None
+                or (abs(float(trained_threshold) - float(threshold)) <= 1e-9
+                    and int(trained_horizon) == int(horizon))):
+            return False
+        log.warning(
+            "range_model_spec_mismatch",
+            live_threshold=threshold,
+            live_horizon_days=horizon,
+            model_threshold=trained_threshold,
+            model_horizon_days=trained_horizon,
+            model_version=getattr(rp, "model_version", ""),
+            trained_at=getattr(rp, "trained_at", None),
+            note="loaded range model answers a DIFFERENT question than the "
+                 "live spec; it keeps serving its trained spec until the "
+                 "next retrain rebuilds it (see ait.ml.range_spec)",
+        )
+        return True
 
     def set_notification_callback(self, callback) -> None:
         """Set async callback for sending notifications."""
@@ -1152,8 +1330,33 @@ class TradingOrchestrator:
             log.warning("hist_data_empty", symbol=symbol,
                         hint="No historical data — check market data subscription or data source")
             return
+        # fail-direction-05 (R22): this used to be `iv_rank = 50.0` with NO
+        # log — and 50 is the one value that passes BOTH IV gates
+        # (iron_condor's >=15 floor and the risk manager's <=85 VRP cap), so
+        # a broken IV layer made every symbol scan as "perfectly average IV"
+        # and journalled that fabrication into entry_iv_rank as a real
+        # measurement. Unknown now propagates as None.
         if isinstance(iv_rank, Exception):
-            iv_rank = 50.0
+            log.warning("iv_rank_unavailable", symbol=symbol,
+                        reason=f"scan_gather_raised:{type(iv_rank).__name__}",
+                        detail=str(iv_rank)[:160])
+            iv_rank = None
+        if iv_rank is None:
+            # FAIL CLOSED for NEW entries only. Every downstream consumer
+            # (iron_condor's IV floor, the VRP cap, the journalled
+            # entry_iv_rank, meta-label training features) treats iv_rank as
+            # a measurement; with none there is no basis to sell premium on
+            # this symbol this scan. Exits/monitoring never run through
+            # _scan_symbol, so open positions keep being managed and exited
+            # normally — this only refuses to OPEN.
+            log.warning("iv_rank_unavailable_entry_skipped", symbol=symbol)
+            if self._alert_gate(f"iv_rank_unavailable:{symbol}", interval_s=3600):
+                await self._send_notification(
+                    f"IV DATA OUTAGE — {symbol}: IV rank could not be measured, "
+                    f"so NEW entries on {symbol} are being skipped (fail-closed). "
+                    f"Open positions are still monitored and exited normally."
+                )
+            return
 
         # Incremental intraday fetch: only request bars not yet stored in SQLite.
         # On first run (no stored data) fetches a full 7-day seed window.
@@ -1475,6 +1678,7 @@ class TradingOrchestrator:
             # Sharpe 1.36 vs 0.64, Sortino 2.20 vs 0.97, RAROC 604% vs 276%.
             RANGE_MIN_CONFIDENCE = self._settings.ml.range_min_confidence
             model_overridden: set[str] = set()  # strategies whose confidence came from a payoff-matched model
+            range_pred = None  # fail-direction-02: stays None when the gate has no evidence
             if self._range_predictor and self._range_predictor.is_trained:
                 range_pred = self._range_predictor.predict(
                     hist, symbol=symbol,
@@ -1498,6 +1702,41 @@ class TradingOrchestrator:
                             if s.strategy_name in ("iron_condor", "short_strangle"):
                                 s.confidence = range_pred.probability_in_range
                                 model_overridden.add(s.strategy_name)
+
+            # fail-direction-02 (R22): ONE fail direction when the payoff-
+            # matched gate has no evidence. Pre-fix, an unavailable range
+            # model (missing/corrupt range.pkl — a documented incident class,
+            # untrained after a caught training failure, or a routine
+            # predict()->None) left iron_condor/short_strangle carrying the
+            # DIRECTIONAL model's confidence, so the armed gate INVERTED by
+            # regime: on neutral days the neutral-only filter below dropped
+            # every IC silently (a sample stop), on directional days ICs were
+            # admitted on directional evidence — precisely the wrong-payoff
+            # basis this override exists to replace. Live mirror of
+            # walkforward.py:1376 (range_min_confidence=1.0 on a training
+            # failure). With gates OFF the model stays observe-only by design
+            # (R16), so nothing is dropped there.
+            if self._settings.ml.entry_gates_enabled and range_pred is None:
+                _ungated = [s for s in signals
+                            if s.strategy_name in RANGE_GATED_STRATEGIES]
+                if _ungated:
+                    signals = [s for s in signals
+                               if s.strategy_name not in RANGE_GATED_STRATEGIES]
+                    log.warning(
+                        "range_gate_unavailable_entries_blocked",
+                        symbol=symbol,
+                        blocked=sorted({s.strategy_name for s in _ungated}),
+                        model_trained=bool(self._range_predictor
+                                           and self._range_predictor.is_trained),
+                    )
+                    if self._alert_gate("range_gate_unavailable", interval_s=3600):
+                        await self._send_notification(
+                            "RANGE GATE UNAVAILABLE — the range model produced no "
+                            "prediction (missing/untrained artifact or predict() "
+                            "returned nothing), so iron condor / short strangle "
+                            "entries are being refused FAIL-CLOSED on every symbol "
+                            "until it recovers. Exits are unaffected."
+                        )
 
             # Vol-magnitude model (Tier 1) for long straddles — predicts P(big move)
             # Direct signal for "buy volatility" strategies, more accurate than
@@ -1786,13 +2025,36 @@ class TradingOrchestrator:
             v = None
         if v and v > 0:
             self._vix_lkg = (float(v), _t.time())
+            self._vix_fail_streak = 0
             return float(v)
         lkg = getattr(self, "_vix_lkg", None)
         if lkg and (_t.time() - lkg[1]) <= 2700:
             log.warning("vix_using_last_known_good", vix=lkg[0],
                         age_s=int(_t.time() - lkg[1]))
+            self._vix_fail_streak = 0
             return lkg[0]
         log.error("vix_unavailable_fail_closed")
+        # fail-direction-01 (R22): the fail-closed stop itself is correct —
+        # but it was SILENT (log.error only; grep found no notification on
+        # any VIX path). With config strategies = [iron_condor] this refuses
+        # 100% of entries for the whole outage and the operator's only clue
+        # is a day with zero trades: the same silent-full-stop signature the
+        # blackout gate was hardened against in R18. Reaching here already
+        # means BOTH sources failed AND the last known good is >45 min old,
+        # so no failure streak is needed to establish this is an outage.
+        # This never fires on a genuinely high VIX — that returns a real
+        # number above and is refused downstream by the risk manager, which
+        # is a decision, not a data failure.
+        _n = int(getattr(self, "_vix_fail_streak", 0)) + 1
+        self._vix_fail_streak = _n
+        if self._alert_gate("vix_gate_unavailable", interval_s=3600):
+            await self._send_notification(
+                f"VIX DATA OUTAGE — no VIX print from either source and the "
+                f"last known good is older than 45 min ({_n} consecutive "
+                f"checks). Credit entries are being refused FAIL-CLOSED, so "
+                f"the bot is NOT opening trades until this clears. Exits are "
+                f"unaffected."
+            )
         return None
 
     async def _check_trading_enabled(self) -> bool:
@@ -1855,6 +2117,9 @@ class TradingOrchestrator:
         match. trailing_stop/breakeven_stop stay excluded on purpose: those
         fire at/above breakeven, so re-entry after them is not the
         autocorrelated-loss sequence R12-B4 targets.
+
+        numeric-pairs-02 (R22): the window is ONE TRADING DAY (the spec), not
+        a flat 30 wall-clock hours — see _post_stop_cooldown_cutoff.
         """
         import sqlite3 as _sq12
         _con = _sq12.connect("file:data/ait_state.db?mode=ro", uri=True)
@@ -1867,11 +2132,89 @@ class TradingOrchestrator:
         finally:
             _con.close()
         if _row and _row[0]:
-            from datetime import datetime as _dt12, timedelta as _td12
+            from datetime import datetime as _dt12
             _exit_t = _dt12.fromisoformat(_row[0])
-            if _dt12.now() - _exit_t < _td12(hours=30):
+            # numeric-pairs-02 (R22): was `_dt12.now() - _exit_t < 30h` — a
+            # flat wall-clock window with no calendar, so every Friday and
+            # pre-holiday stop bought ZERO post-stop sessions of cooldown.
+            # The spec is ONE TRADING day; see _post_stop_cooldown_cutoff.
+            if _exit_t >= _post_stop_cooldown_cutoff():
                 return _row[0]
         return None
+
+    def _duplicate_guard_verdict(self, signal) -> str:
+        """fail-direction-08: verdict of the three duplicate-order layers.
+
+        Returns:
+            "clear"      — every layer answered and none found a duplicate;
+            "duplicate"  — a layer found one (it logged which);
+            "unverified" — a layer could not answer (locked DB, disconnected
+                            broker). The old code logged that at DEBUG and
+                            carried on to placement, so a locked-DB window
+                            plus a reconnect blip could put a SECOND live
+                            order on the same symbol with two DEBUG lines as
+                            the only evidence.
+        """
+        from datetime import datetime as dt
+
+        # GUARD #2 — per-symbol+strategy cooldown. Refuse re-entry on the same
+        # symbol+strategy within the window regardless of fill status; a simple
+        # DB-backed backstop that survives restarts and doesn't depend on the
+        # (fragile) in-memory pending tracker.
+        COOLDOWN_MINUTES = 120
+        try:
+            cutoff = dt.now() - timedelta(minutes=COOLDOWN_MINUTES)
+            for rt in self._state.get_recent_trades(n=30):
+                if rt.symbol == signal.symbol and rt.strategy == signal.strategy_name:
+                    try:
+                        entered = datetime.fromisoformat(rt.entry_time)
+                    except (ValueError, TypeError):
+                        continue
+                    if entered >= cutoff:
+                        log.info("cooldown_skip", symbol=signal.symbol,
+                                 strategy=signal.strategy_name,
+                                 minutes_ago=int((dt.now() - entered).total_seconds() / 60))
+                        return "duplicate"  # symbol+strategy recently traded
+        except Exception as e:  # noqa: BLE001 — fail CLOSED (was log.debug + place)
+            log.warning("cooldown_check_failed_entry_refused",
+                        symbol=signal.symbol, error=str(e))
+            return "unverified"
+
+        # GUARD #3 — working IBKR orders. Catch in-flight orders the local DB
+        # hasn't caught up on (e.g. placed but not yet recorded/filled).
+        # get_open_orders() returns [] when DISCONNECTED, which is
+        # indistinguishable from a verified-empty book — so check the
+        # connection explicitly and treat a blind read as unverified.
+        try:
+            if not getattr(self._ibkr, "connected", True):
+                log.warning("working_order_check_disconnected_entry_refused",
+                            symbol=signal.symbol)
+                return "unverified"
+            for t in (self._ibkr.get_open_orders() or []):
+                if getattr(t.contract, "symbol", None) == signal.symbol:
+                    log.info("working_order_skip", symbol=signal.symbol)
+                    return "duplicate"
+        except Exception as e:  # noqa: BLE001 — fail CLOSED (was log.debug + place)
+            log.warning("working_order_check_failed_entry_refused",
+                        symbol=signal.symbol, error=str(e))
+            return "unverified"
+
+        # GUARD #4 — in-memory pending tracker (empty after every restart,
+        # which is why the two DB/broker layers above must stay honest).
+        try:
+            pending_symbols = set()
+            for _oid, pending in self._executor._pending_orders.items():
+                if hasattr(pending, 'signal') and hasattr(pending.signal, 'symbol'):
+                    pending_symbols.add(pending.signal.symbol)
+        except Exception as e:  # noqa: BLE001
+            log.warning("pending_tracker_check_failed_entry_refused",
+                        symbol=signal.symbol, error=str(e))
+            return "unverified"
+        if signal.symbol in pending_symbols:
+            log.info("symbol_has_pending_order", symbol=signal.symbol)
+            return "duplicate"
+
+        return "clear"
 
     async def _try_execute(self, signal, confidence: float, sentiment, regime) -> bool:
         """Validate and execute a signal.
@@ -1900,15 +2243,17 @@ class TradingOrchestrator:
                 return True  # symbol handled: no new entries while halted
         # GOV (governance audit): restricted list — hard-ban a symbol without
         # a config edit + restart (post-incident control). One symbol per line.
-        _rl = _P("data/RESTRICTED.txt")
-        if _rl.exists():
-            try:
-                _banned = {ln.strip().upper() for ln in _rl.read_text().splitlines() if ln.strip()}
-                if signal.symbol.upper() in _banned:
-                    log.warning("symbol_restricted", symbol=signal.symbol)
-                    return True
-            except Exception:  # noqa: BLE001
-                pass
+        # fail-direction-11: a present-but-unreadable ban file must never mean
+        # "no bans" — it blocks NEW entries entirely until it reads cleanly.
+        _banned = read_restricted_symbols()
+        if _banned is RESTRICTED_UNREADABLE:
+            log.warning("entries_halted_restricted_list_unreadable",
+                        symbol=signal.symbol, path=RESTRICTED_LIST_PATH)
+            return True  # symbol handled: no new entries while the ban file
+            #              cannot be read (exits are untouched)
+        if signal.symbol.upper() in _banned:
+            log.warning("symbol_restricted", symbol=signal.symbol)
+            return True
 
         # R6 (user-approved): don't OPEN credit structures the macro flatten
         # will force-close within days — paying full round-trip costs for
@@ -2024,45 +2369,21 @@ class TradingOrchestrator:
             # signal outranked it, throttling exactly the sample we need.
             return False
 
-        # GUARD #2 — per-symbol+strategy cooldown. Refuse re-entry on the same
-        # symbol+strategy within the window regardless of fill status; a simple
-        # DB-backed backstop that survives restarts and doesn't depend on the
-        # (fragile) in-memory pending tracker.
-        COOLDOWN_MINUTES = 120
-        try:
-            cutoff = dt.now() - timedelta(minutes=COOLDOWN_MINUTES)
-            for rt in self._state.get_recent_trades(n=30):
-                if rt.symbol == signal.symbol and rt.strategy == signal.strategy_name:
-                    try:
-                        entered = datetime.fromisoformat(rt.entry_time)
-                    except (ValueError, TypeError):
-                        continue
-                    if entered >= cutoff:
-                        log.info("cooldown_skip", symbol=signal.symbol,
-                                 strategy=signal.strategy_name,
-                                 minutes_ago=int((dt.now() - entered).total_seconds() / 60))
-                        return True  # symbol+strategy recently traded
-        except Exception as e:  # noqa: BLE001
-            log.debug("cooldown_check_failed", error=str(e))
-
-        # GUARD #3 — working IBKR orders. Catch in-flight orders the local DB
-        # hasn't caught up on (e.g. placed but not yet recorded/filled).
-        try:
-            for t in (self._ibkr.get_open_orders() or []):
-                if getattr(t.contract, "symbol", None) == signal.symbol:
-                    log.info("working_order_skip", symbol=signal.symbol)
-                    return True
-        except Exception as e:  # noqa: BLE001
-            log.debug("working_order_check_failed", error=str(e))
-
-        # Check if this symbol already has a pending order (in-memory tracker)
-        pending_symbols = set()
-        for oid, pending in self._executor._pending_orders.items():
-            if hasattr(pending, 'signal') and hasattr(pending.signal, 'symbol'):
-                pending_symbols.add(pending.signal.symbol)
-        if signal.symbol in pending_symbols:
-            log.debug("symbol_has_pending_order", symbol=signal.symbol)
-            return True  # symbol already busy
+        # GUARDS #2-#4 — duplicate-order layers. fail-direction-08: each layer
+        # used to swallow its own errors at DEBUG and fall through to PLACE.
+        _dup = self._duplicate_guard_verdict(signal)
+        if _dup == "duplicate":
+            return True  # symbol already busy — the layer logged which one
+        if _dup == "unverified":
+            # A layer could not answer (locked DB, disconnected broker read).
+            # "No duplicate found" and "could not check" are different facts:
+            # place on the first, refuse this pass on the second.
+            log.warning("duplicate_guard_unverified_entry_refused",
+                        symbol=signal.symbol, strategy=signal.strategy_name,
+                        detail=("a duplicate-order check failed; refusing the "
+                                "entry this pass rather than risking a second "
+                                "live order for the same symbol"))
+            return True
 
         # Check if position would hold through earnings (IV crush risk)
         if signal.expiry:
@@ -2199,12 +2520,31 @@ class TradingOrchestrator:
                 self._state.set_trade_capital_at_risk(trade_id, _total_risk)
             except Exception:  # noqa: BLE001
                 pass
+            # trade-life-entry-vix-refetch-defeats-lkg (R22): this line was
+            # `vix=await self._market_data.get_vix() or 0` — a SECOND,
+            # independent network fetch (get_vix is uncached) seconds after
+            # the validated one, with `current_vix` sitting unused in scope,
+            # and the exact `or 0` pattern R7 removed from the risk path. One
+            # transient hiccup wrote entry_vix=0 PERMANENTLY: the row poisons
+            # trade_context/meta-label training as a false zero for a real
+            # feature, and _check_thesis_valid's `entry_vix > 0` guard
+            # disarms the vix_spike exit for that position's whole life.
+            # Reuse the value the risk gates already validated; fall back to
+            # the same last-known-good cache _get_vix_lkg maintains; write
+            # NULL (None) if genuinely nothing is known — never a fake 0.
+            _entry_vix = current_vix
+            if _entry_vix is None:
+                _lkg_ctx = getattr(self, "_vix_lkg", None)
+                if _lkg_ctx and (time.time() - _lkg_ctx[1]) <= 2700:
+                    _entry_vix = float(_lkg_ctx[0])
+            if _entry_vix is None:
+                log.warning("entry_vix_unknown_stored_null", trade_id=trade_id)
             self._state.save_trade_context(
                 trade_id=trade_id,
                 direction=signal.direction.value,
                 confidence=confidence,
                 regime=regime_str,
-                vix=await self._market_data.get_vix() or 0,
+                vix=_entry_vix,
                 iv_rank=signal.iv_rank if hasattr(signal, "iv_rank") else 0,
                 sentiment_score=sentiment.composite_score if sentiment and hasattr(sentiment, "composite_score") else 0,
                 # R20: the 11 technical META_FEATURES, captured at entry. This
@@ -3392,12 +3732,24 @@ class TradingOrchestrator:
         except Exception as e:  # noqa: BLE001 — never let bookkeeping kill a scan
             log.debug("daily_iv_persist_failed", symbol=symbol, error=str(e))
 
-    async def _estimate_iv_rank(self, symbol: str) -> float:
-        """IV rank (0-100). R7: TRUE percentile of today's implied vol in the
+    async def _estimate_iv_rank(self, symbol: str) -> float | None:
+        """IV rank (0-100), or None when it cannot be measured.
+
+        R7: TRUE percentile of today's implied vol in the
         stored daily IV series when >=60 IV observations exist; otherwise the
         old realized-vol min-max proxy, tagged in the logs. Sell-when-IV-is-
         rich is THE premium-seller signal — the proxy measured realized, not
         implied, and the two diverge exactly when the edge is largest.
+
+        fail-direction-05 (R22): every failure path here used to return a
+        fabricated 50.0 — the one value that passes BOTH IV gates — and the
+        proxy's own get_historical call sat outside any try, so its exception
+        was laundered into 50.0 by _scan_symbol's gather. The triggers are
+        normal-op (historical.db locked/stale/corrupt, a yfinance outage),
+        i.e. the bot sold premium as if IV were average during exactly the
+        outages when IV was unknown, and stored 50 as a measurement. Unknown
+        is now None; the caller fails closed for new entries and the journal
+        records NULL instead of a fabricated rank.
         """
         try:
             import sqlite3 as _sq
@@ -3432,30 +3784,57 @@ class TradingOrchestrator:
             log.debug("iv_rank_store_read_failed", symbol=symbol, error=str(_e))
         log.debug("iv_rank_realized_proxy", symbol=symbol,
                   note="stored IV series <60 obs — run IV backfill")
-        hist = await self._market_data.get_historical(symbol, days=252)
+        # fail-direction-05: this fetch used to sit OUTSIDE any try, so its
+        # exception reached the caller's asyncio.gather and became 50.0 there.
+        # Own the failure at the source and report it honestly as "unknown".
+        try:
+            hist = await self._market_data.get_historical(symbol, days=252)
+        except Exception as _e:  # noqa: BLE001
+            log.warning("iv_rank_unavailable", symbol=symbol,
+                        reason=f"proxy_history_raised:{type(_e).__name__}",
+                        detail=str(_e)[:160])
+            return None
         if hist is None or len(hist) < 60:
-            return 50.0
+            log.warning("iv_rank_unavailable", symbol=symbol,
+                        reason="proxy_history_too_short",
+                        rows=0 if hist is None else len(hist))
+            return None
 
-        import numpy as np
-        close = hist["Close"]
-        log_returns = np.log(close / close.shift(1)).dropna()
+        try:
+            import numpy as np
+            close = hist["Close"]
+            log_returns = np.log(close / close.shift(1)).dropna()
 
-        current_vol = float(log_returns.tail(20).std() * np.sqrt(252))
-        rolling_vol = log_returns.rolling(20).std() * np.sqrt(252)
-        rolling_vol = rolling_vol.dropna()
+            current_vol = float(log_returns.tail(20).std() * np.sqrt(252))
+            rolling_vol = log_returns.rolling(20).std() * np.sqrt(252)
+            rolling_vol = rolling_vol.dropna()
+        except Exception as _e:  # noqa: BLE001
+            log.warning("iv_rank_unavailable", symbol=symbol,
+                        reason=f"proxy_compute_raised:{type(_e).__name__}",
+                        detail=str(_e)[:160])
+            return None
 
         if len(rolling_vol) < 2:
-            return 50.0
+            log.warning("iv_rank_unavailable", symbol=symbol,
+                        reason="proxy_vol_history_too_short",
+                        rows=len(rolling_vol))
+            return None
 
         vol_min = float(rolling_vol.min())
         vol_max = float(rolling_vol.max())
         vol_range = vol_max - vol_min
 
         if vol_range <= 0:
-            return 50.0
+            # A flat vol series is a FROZEN/degenerate feed, not "average IV".
+            # Returning 50 here was the same fabrication as the exception
+            # path — it passed both IV gates on data that says nothing.
+            log.warning("iv_rank_unavailable", symbol=symbol,
+                        reason="proxy_degenerate_vol_range",
+                        vol_min=round(vol_min, 6), vol_max=round(vol_max, 6))
+            return None
 
         iv_rank = ((current_vol - vol_min) / vol_range) * 100
-        return max(0, min(100, iv_rank))
+        return max(0.0, min(100.0, float(iv_rank)))
 
     # R14 #9 exit-reject backoff tuning. A fast broker reject reverts the exit
     # order CLOSING->FILLED within seconds, so the monitor re-requests it on the

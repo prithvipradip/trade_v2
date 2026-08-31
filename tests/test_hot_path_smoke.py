@@ -258,6 +258,37 @@ class FakePredictor:
         return FakePrediction(SignalDirection.NEUTRAL, 0.72)
 
 
+class FakeRangePredictor:
+    """Stands in for the trained RangePredictor (models aren't in the sandbox).
+
+    W2/fail-direction-02: an unavailable range model now fails CLOSED — with
+    gates on, iron_condor/short_strangle signals are DROPPED rather than
+    silently falling through on directional confidence. The rig's MODEL_DIR is
+    cwd-relative, so under the sandbox chdir no range.pkl exists and the real
+    predictor is untrained; before the fix that gap was invisible because the
+    gate failed open. Stand one in, exactly as the rig already does for
+    DirectionPredictor, so the smoke exercises the ARMED path.
+    """
+
+    is_trained = True
+    model_version = "smoke-range-1"
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def predict(self, hist, symbol: str = "", **kw):
+        from ait.ml.range_predictor import RangePrediction
+        from ait.ml.range_spec import live_range_spec
+        self.calls.append(symbol)
+        threshold, horizon = live_range_spec()
+        # Above ml.range_min_confidence so the condor survives the floor.
+        return RangePrediction(
+            probability_in_range=0.80, threshold_pct=threshold,
+            horizon_days=horizon, confidence=0.80, features_used=42,
+            model_version=self.model_version,
+        )
+
+
 class SmokeIBKRClient(FakeIBKRClient):
     """tests/fakes.FakeIBKRClient + the account/reconcile surface the hot path uses.
 
@@ -386,6 +417,9 @@ def build_smoke_orchestrator(config_path: Path | str = CONFIG_PATH) -> SmokeRig:
     orch._market_data = market
     orch._options_chain = chains
     orch._predictor = predictor
+    # W2/fail-direction-02: the range gate is armed now — a missing
+    # model fails closed, so the rig must supply one (see class docstring).
+    orch._range_predictor = FakeRangePredictor()
     orch._portfolio._market_data = market
     orch._trainer._market_data = market
     # _build_market_context lazily builds this one; pre-seed it so no FRED

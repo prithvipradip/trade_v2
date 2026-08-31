@@ -159,6 +159,25 @@ backtest:
   hurst_regime_threshold: 0.20        # Hurst scale-spread above which confidence penalty applies
   hurst_regime_penalty: 0.10          # Confidence deducted in chaotic fractal regime
   multifractal_max_width: 0.50        # Multifractal width above which confidence penalty applies
+  # W5 research-honesty block — three CONFIRMED research_validity findings in
+  # reports/blindspot_composition_hunt_20260825.md. Together they are the size
+  # of the whole per-condor expectancy, so every backtest absolute produced
+  # BEFORE these landed is stale and must be re-run.
+  # model-vs-reality-commission-constant: real IBKR cost is commission PLUS
+  # regulatory/exchange/clearing fees, per leg, entry AND exit. Measured on the
+  # repo's own executions ledger: all-in 0.9168/contract-leg (mean; median
+  # 1.0284) vs the old flat 0.65 = $2.13/contract understated per condor
+  # round trip.
+  commission_per_contract: 0.65        # IBKR base options commission ($/contract/leg)
+  regulatory_fees_per_contract: 0.2668 # Reg/exchange/clearing fees on top (0.9168 - 0.65)
+                                       # 0.0 reproduces pre-W5 studies only
+  # model-vs-reality-skew-10x-flat: the engine priced every strike off a
+  # surface ~10x flatter than the measured one (hardcoded put slope 0.10 vs
+  # 0.916-1.141 regressed on 3,159 IBKR quotes), so wings were near-free
+  # (long put $0.08 model vs $0.71-0.92 real).
+  skew_slope_per_pct_otm: 0.0736       # Relative put-side IV uplift per 1% OTM
+                                       # (total slope 1.049 at atm_iv 0.1289 = the
+                                       # sample-weighted measured value); 0 = pre-W5
 
 ml:
   ensemble_weights:

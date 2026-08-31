@@ -33,7 +33,7 @@ from ait.bot.state import StateManager, TradeStatus
 from ait.execution.executor import TradeExecutor
 from ait.execution.reconciler import PositionReconciler
 from ait.risk.circuit_breaker import CircuitBreaker
-from ait.strategies.base import Signal, SignalDirection
+from ait.strategies.base import CREDIT_STRATEGIES, Signal, SignalDirection
 
 from tests.fakes import FakeIB, FakeIBKRClient, _option_position
 
@@ -122,6 +122,19 @@ def _open_position_row(env, trade_id: str):
 
 
 async def _place(env, signal: Signal, contracts: int = 1) -> tuple[str, int]:
+    # fail-direction-07 (blindspot_composition_hunt_20260825): a combo ENTRY
+    # now REFUSES placement when the live combo NBBO is unavailable (it used
+    # to fail OPEN at log.debug and anchor the ladder to the scan-time mid).
+    # FakeIB.reqMktData raises until `.quote` is set, so these lifecycle tests
+    # were riding in on exactly that fail-open path. Supply an NBBO centred on
+    # the signal price (always-BUY convention: credit combos quote NEGATIVE),
+    # which makes the live mid equal to the old signal-mid anchor and leaves
+    # every price/ladder assertion below unchanged.
+    if getattr(env.ib, "quote", None) is None and signal.legs:
+        _px = abs(signal.entry_price)
+        env.ib.quote = ((-(_px + 0.02), -(_px - 0.02))
+                        if signal.strategy_name in CREDIT_STRATEGIES
+                        else (_px - 0.02, _px + 0.02))
     trade_id = await env.executor.execute_signal(signal, contracts)
     assert trade_id is not None, "execute_signal refused the order"
     order_id = next(iter(env.executor._pending_orders))

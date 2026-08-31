@@ -1491,3 +1491,82 @@ StateManager/CircuitBreaker/TradeExecutor on a real sqlite file); stash
 proof: 3 key tests FAIL against pre-W1 src. Suite 1254 green, type gate OK,
 SMOKE PASS 13. NOTE: fixes take effect on next bot restart (restart already
 pending for R21).
+
+## 2026-08-31 - W2 + W4 + W5 EXECUTED (4 parallel agents, strict file ownership)
+W2 GATE FAIL-DIRECTION — protective gates now fail CLOSED or LOUD:
+[fail-direction-05] _estimate_iv_rank returned a FABRICATED 50.0 on any
+  exception (passing BOTH IV gates during exactly the outages that break IV
+  data). Now returns None; _scan_symbol skips NEW entries for that symbol and
+  pages 1/hour. Exits unaffected (they never traverse _scan_symbol).
+[fail-direction-02] With entry gates ON and the range model missing/untrained,
+  IC/strangle signals silently kept DIRECTIONAL confidence (gate inverted by
+  regime). Now dropped + paged. Gates-off keeps R16 observe-only behavior.
+[fail-direction-01] VIX-outage full stop was fail-closed but SILENT -> pages.
+[fail-direction-06 + external-contracts-02] Quote-less contracts scored spread
+  0.0 = TIGHTEST in the chain and their stale last prints fed credit math.
+  Spread is now ILLIQUID_SPREAD_PCT=inf (no threshold can admit it), is_liquid
+  rejects no-two-sided-quote up front, crossed books (which scored NEGATIVE)
+  rejected, filter_liquid logs the drop count.
+[fail-direction-04] Touch-stop except swallowed at debug (silently disabling
+  the ONLY credit loss exit) -> log.error every tick + one page per outage,
+  latch cleared on recovery; bare except retained so one bad row cannot kill
+  the loop over other positions.
+[fail-direction-07] Combo-NBBO gate failed open quietly -> ENTRIES refused on
+  missing/nan/crossed NBBO; EXITS still proceed but log.error (deliberate
+  asymmetry: a missed exit costs more than a missed entry). 1.5s flat settle
+  -> 15x0.1s poll (a book answering in 200ms no longer adds 1.3s of staleness
+  to the staleness check itself).
+[fail-direction-08] Duplicate-order guards swallowed their own errors at debug
+  and placed anyway; a DISCONNECTED client returns [] indistinguishable from
+  "verified empty". Three-way verdict clear/duplicate/unverified; unverified
+  refuses the entry this pass.
+[fail-direction-09] PDT guard fail-open on corrupt state/empty calendar ->
+  blocks; window counting no longer returns 0 on degradation.
+[fail-direction-11] Restricted list: utf-8-sig + UTF-16 retry (PowerShell
+  writes), unreadable-but-present -> sentinel -> ENTRIES HALTED (an operator
+  who dropped a ban file gets protection, not silence).
+[fail-direction-12] Executor market-hours guard refuses on calendar exception.
+W4 LIVE ECONOMICS COHERENCE:
+[numeric-pairs-02] Cooldown is now ONE TRADING DAY (09:30 ET of the previous
+  session) not a flat 30h — a Friday stop gave ZERO effective cooldown.
+[trade-life-entry-vix-refetch] entry_vix reuses the validated value / LKG;
+  writes NULL, never a false 0.
+[trade-life-credit-econ-floors] Credit floors re-checked at REPRICE; ladder
+  remainder refused on breach (the resting compliant order stays).
+[units-scale-05] NEW src/ait/ml/range_spec.py = the ONE authority:
+  live_range_spec() -> (0.05, dte_range[0] - EXPIRY_APPROACHING_DTE) = (0.05, 9)
+  today. Orchestrator + trainer read it; a LOADED model keeping a different
+  trained spec logs range_model_spec_mismatch (artifacts not deleted).
+W5 RESEARCH HONESTY (engine cost model — measured from our OWN data):
+[commission] Ledger probe, 78 leg fills: all-in 0.9168/contract-leg. Condor
+  round trip $7.33 vs modeled $5.20 = $2.13/contract understated. Config homes
+  commission_per_contract 0.65 + regulatory_fees_per_contract 0.2668.
+[touch-gap] A day OPENING beyond a short strike was booked at the strike-touch
+  price. Now reprices at the gapped open, books the WORSE of the two:
+  $305/$681/$1,344 per contract previously hidden at 1%/2%/3.5% gaps.
+[skew] Every strike priced at the SAME IV. Calibrated on 3,159 of our own IBKR
+  quotes (put dIV/d|ln(K/S)| 1.141 SPY / 0.983 QQQ / 0.916 IWM, weighted 1.049)
+  -> skew_slope_per_pct_otm 0.0736. An 8%-OTM 20-DTE put wing: $0.037 -> $0.740,
+  inside the measured $0.71-0.92 real band. DELIBERATE: slope 0 reproduces
+  PRE-W5 pricing (the engine was never literally flat); the CALL side is left
+  alone because the same regression gave a sign-unstable slope (+0.064/+0.112/
+  -0.089) and the model already OVER-prices short calls.
+CONSEQUENCE (must not be soft-pedaled): every backtest/walk-forward/Optuna/
+ablation/shadow-tournament ABSOLUTE produced before W5 is STALE — all three
+corrections push the same pessimistic direction. Nothing in reports/ may be
+quoted until a re-run. This is the wave that can flip the sign of the
+researched edge; which way is not yet known.
+PROOF: 4 new test files, 129 executing tests (38 orchestrator + 22 chain/
+portfolio + 41 executor/risk + 28 engine). Each agent independently verified
+its tests FAIL against pre-fix source (revert-and-restore probes). Suite 1383
+green, type gate OK, SMOKE PASS 13.
+INTEGRATION FIX (owner): tests/test_hot_path_smoke.py gained FakeRangePredictor
+— the rig's MODEL_DIR is cwd-relative so no range.pkl exists in the sandbox;
+that test passed ONLY because the range gate failed open (fail-direction-02
+itself). Same boundary-swap pattern the rig already uses for DirectionPredictor.
+REGISTERED FOLLOW-UPS (not done): master.py:830 builds RangePredictor at
+horizon 30 inside the retrain subprocess -> will flap against the horizon-9
+authority every retrain cycle (visible via range_train_spec_mismatch);
+walkforward.py:57 still pins commission_per_contract 0.65 (fees DO resolve, so
+windows get corrected friction); skew/commission are static measured constants,
+not a live calibration path. W3 (scorecard truth) and W6 (ops) remain.

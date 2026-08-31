@@ -95,6 +95,10 @@ class PortfolioManager:
         self._last_quote_ts: dict[str, datetime] = {}   # symbol -> last tick time
         self._frozen_alerted: set[str] = set()
         self._touch_confirm: dict[str, int] = {}        # trade_id -> agreeing ticks
+        # fail-direction-04: once-per-outage latch for a touch stop that is
+        # RAISING instead of evaluating (same shape as _frozen_alerted, keyed
+        # by trade because the failure is per position, not per feed).
+        self._touch_fail_alerted: set[str] = set()
 
     MARKS_MISSING_ALERT_TICKS = 10  # ~5 min at the 30s fast-monitor cadence
 
@@ -215,6 +219,43 @@ class PortfolioManager:
                 f"agreeing ticks. Check the market-data feed ({trade_id})."
             )
         except Exception:  # noqa: BLE001
+            pass
+
+    async def _alert_touch_stop_failed(self, trade, error: Exception) -> None:
+        """Page ONCE per outage: the touch stop is not evaluating at all.
+
+        fail-direction-04 (blind-spot hunt 2026-08-25): the touch-stop block's
+        except swallowed every exception at log.debug. The flat credit stop
+        defaults to DISABLED (AIT_CREDIT_LOSS_LIMIT contract default "0", see
+        the is_credit branch below), so on a credit structure the short-strike
+        touch is the ONLY loss exit — a swallowed exception silently switches
+        loss protection off for the life of the trade, re-failing every 30s
+        tick with nothing but a DEBUG line in a rotating file.
+
+        Throttled like _alert_frozen_feed: a 30s monitor must not page every
+        tick. The latch clears when the block next evaluates cleanly, so a
+        LATER outage pages again. Never raises — it runs inside an except
+        handler, and an exception here would abort check_positions' loop and
+        take every OTHER position's exit evaluation down with it.
+        """
+        try:
+            alerted = getattr(self, "_touch_fail_alerted", None)
+            if alerted is None:
+                alerted = self._touch_fail_alerted = set()
+            if trade.trade_id in alerted:
+                return
+            alerted.add(trade.trade_id)
+            notify = getattr(self, "_notify_cb", None)
+            if not notify:
+                return
+            await notify(
+                f"TOUCH STOP NOT EVALUATING: {trade.symbol} {trade.strategy} "
+                f"({trade.trade_id}) — the short-strike touch check raised "
+                f"{type(error).__name__}: {error}. This is the only loss exit "
+                f"on a credit structure; the position now has DTE/expiry exits "
+                f"only. Check the trade's legs data."
+            )
+        except Exception:  # noqa: BLE001 — an alert must never break exits
             pass
 
     async def check_positions(self) -> list[PositionStatus]:
@@ -605,8 +646,36 @@ class PortfolioManager:
                         # touch-confirmation streak that the 30s monitor had
                         # been accumulating — the report deciding an exit.
                         confirms.pop(trade.trade_id, None)
+                # fail-direction-04: the block evaluated. Clear the page latch
+                # so a LATER failure counts as a new outage (alert STATE, so
+                # persist-guarded exactly like the streak above).
+                if persist:
+                    _tf_ok = getattr(self, "_touch_fail_alerted", None)
+                    if _tf_ok:
+                        _tf_ok.discard(trade.trade_id)
             except Exception as _e:  # noqa: BLE001 — protection, never a crash source
-                log.debug("touch_check_failed", trade_id=trade.trade_id, error=str(_e))
+                # fail-direction-04: this was log.debug, and nothing else. The
+                # touch stop is the ONLY loss exit on credit structures (the
+                # flat credit stop is disabled by contract default), so any
+                # exception here disables loss protection for the life of the
+                # trade — invisibly, on every 30s tick. Surface it as an ERROR
+                # and page once per outage; the except still stands so ONE bad
+                # trade row cannot kill check_positions' loop over the others.
+                log.error(
+                    "touch_stop_evaluation_failed",
+                    trade_id=trade.trade_id,
+                    symbol=trade.symbol,
+                    strategy=trade.strategy,
+                    error=str(_e),
+                    error_type=type(_e).__name__,
+                    note="short-strike touch stop did not evaluate — this is "
+                         "the only loss exit on a credit structure; DTE and "
+                         "expiry exits are all that remain for this position",
+                )
+                if persist:
+                    # A4 report invariant: a read-only summary pass must not
+                    # fire alerts (nor consume the once-per-outage page).
+                    await self._alert_touch_stop_failed(trade, _e)
 
         # 2. Take profit (time-decay adjusted) — needs real marks
         # R13-CRIT-2: this was `elif`, chained to the R12 touch-stop `if`
