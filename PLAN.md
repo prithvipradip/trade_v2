@@ -1645,3 +1645,36 @@ defects; docs/RUNBOOK.md:131 still says ">=50 closes" only; status_server's
 8503 page still exposes no gate data. THE BIG ONE: every pre-W5 study absolute
 is stale — the walk-forward re-run on the corrected cost model is the next
 milestone and the real test of whether the IC edge survives.
+
+## 2026-08-31 - RESTART + research-to-live-01 MATERIALIZED AND FIXED
+BOT RESTARTED 15:50 ET (deliberately before the 15:58-16:13 duplicate-EOD
+window, a registered unfixed finding). Clean boot: IBKR connected client_id 1
+no fallback, startup_reconcile matched/promoted/stale 0, ZERO cycle or monitor
+errors. R21 through W6 are now LIVE. range_model_spec_mismatch logged exactly
+as designed (artifact trained at horizon 30 vs the horizon-9 authority; it
+serves at its REAL spec and flags needs-retrain rather than pretending).
+Dead-man verified: "ping gated on bot: True", liveness ALIVE, STATUS ARMED.
+TRADING: two closes today, the book's best day — SPY +$280.36 (66.9%) and
+QQQ +$329.36 (53.6%), both take_profit_short. IC verdict now 10 closes,
+6W-4L, net +$790.32, PF 2.85 PASS, maxDD 3.3% of deployed risk PASS. Sample
+10/50 is the only failing criterion. Book FLAT.
+DEFECT FOUND VIA THE NIGHTLY REPORT (not a W5 regression): the 16:40 backtest
+wrote exit_code 1 / "ERROR: No data fetched. Check internet connection." Root
+cause is research-to-live-01 from the R23 register, materializing on almost
+exactly the predicted date: load_daily_ohlcv judged the IB store sufficient
+with a FIXED `len(df) < 60`, independent of the requested window. The intraday
+store crossed 60 trading days ~2026-08-26, so every research entry point
+asking for 730 days silently got 63 — and the failure was misattributed to the
+network. FIX: sufficiency is measured against the REQUEST
+(expected = days*252/365; need >= max(60, 80% of expected)), and a frame that
+is still short AFTER the fallback logs daily_ohlcv_coverage_short instead of
+looking healthy. Verified live: SPY 730d now returns 522 rows spanning
+2024-08-01..2026-08-31 (was 63).
+PROOF: tests/test_research_data_coverage.py, 5 executing tests against a real
+sqlite store with the Yahoo boundary stubbed (offline/deterministic): the
+2026-08-31 failure itself, store-preferred-when-sufficient, short-request via
+the absolute floor, short-after-fallback logged, dead-Yahoo degradation.
+Suite 1483 green, type gate OK, SMOKE PASS 13.
+NOTE: this was BLOCKING the W5 re-run — the corrected-cost-model walk-forward
+could not have run at all. That re-run is now unblocked and remains the next
+milestone.
