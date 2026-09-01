@@ -187,6 +187,14 @@ ml:
   lookback_days: 504                   # 2 years of trading days
   min_training_samples: 100
   range_min_confidence: 0.65           # Floor for range/vol-mag model-overridden confidence (was hardcoded)
+  # 2026-09-01 OBSERVE MODE (PLAN pre-registration). The retrained range model
+  # is near coin-flip on SPY/QQQ (CV AUC 0.545/0.545, edge +0.045 vs the 0.05
+  # min_edge threshold), so predict() returns None and W2's fail-CLOSED gate
+  # blocked EVERY iron-condor entry: 16 candidates, 0 orders on 09-01. The ML
+  # models keep predicting and logging; they no longer veto. Re-arm only if
+  # the observe-mode record shows the gate would have improved PF.
+  entry_gates_enabled: false
+  observe_mode_neutral_confidence: 0.60  # direction-neutral structures skip the DIRECTIONAL min_confidence gate
 
 meta_label:
   enabled: false                       # Disabled: trained on corrupted data, rejects everything. Re-enable after 50+ clean trades.

@@ -1678,3 +1678,72 @@ Suite 1483 green, type gate OK, SMOKE PASS 13.
 NOTE: this was BLOCKING the W5 re-run — the corrected-cost-model walk-forward
 could not have run at all. That re-run is now unblocked and remains the next
 milestone.
+
+## 2026-09-01 - OBSERVE MODE PRE-REGISTRATION (user decision, written BEFORE results)
+SITUATION (evidence, 2026-09-01): the overnight retrain rebuilt the range
+model at the corrected horizon 9 (W2's spec-mismatch flag worked). Its per-
+symbol skill is near coin-flip: mean CV AUC SPY 0.5453, QQQ 0.5446, IWM
+0.5808 -> edge over baseline +0.045 / +0.045 / +0.081 against a
+min_edge_over_baseline of 0.05. So predict() returns None for SPY and QQQ,
+and W2's fail-CLOSED range gate blocks every IC entry on them. Today: 16
+condor candidates logged all_gates_passed, ZERO orders placed, book flat.
+Before W2 this gate failed OPEN, so those same condors traded on DIRECTIONAL
+confidence — the inverted-gate defect. We have gone from "trades on an
+inverted gate" to "cannot trade at all". The model is telling the truth: it
+has no demonstrated skill on SPY/QQQ.
+THE CONFLICT: the project exists to answer "does the iron condor have edge?"
+and needs 50 IC closes; we have 10. A near-coin-flip FILTER must not be what
+prevents the underlying question from ever being answered.
+DECISION (user, option 1 of 3 offered): run the entry gates in OBSERVE MODE —
+ml.entry_gates_enabled false. The ML models keep predicting and logging
+(evidence accumulates) but never veto. Rejected: lowering
+min_edge_over_baseline 0.05->0.04 (moving the goalposts to get the answer we
+want) and leaving entries blocked indefinitely (the verdict stalls and we
+learn nothing).
+MANDATORY COMPANION FIX — without it this decision BACKFIRES. Registered
+finding trade-life-gatesoff-reintroduces-neutral-autoreject: with gates off,
+model_overridden is empty, so eff_conf falls back to the DIRECTIONAL
+final_confidence (orchestrator.py:1833) and manager.py:351 rejects
+confidence < risk.min_confidence (0.50). In the neutral regime a condor
+WANTS, directional confidence is below 0.50 -> rejected; only trending-
+aligned days clear it. Flipping the flag alone would swap "blocked
+everywhere" for ADVERSE SELECTION (condors entering only in their worst
+regime). Fix: in observe mode, direction-neutral structures are validated on
+a config-homed neutral baseline instead of the directional number, because
+the risk manager's min_confidence gate is a DIRECTIONAL gate and direction is
+not what a market-neutral structure is paid for. All other gates (VIX,
+liquidity, credit floors, concentration, correlation, PDT, cooldown, macro)
+remain fully armed and unchanged.
+WHAT WE EXPECT / HOW WE WILL JUDGE IT (pre-registered so it cannot be
+rationalized later): entries resume on SPY/QQQ/IWM in neutral regimes; the
+IC sample grows toward 50. The ML gate's value becomes MEASURABLE rather
+than assumed — every logged range_prediction is scored against the realized
+outcome, so at 50 closes we can ask whether the gate WOULD have helped
+(compare closes where p_in_range was above vs below 0.65). If the observe-
+mode record shows the gate would have improved PF, we re-arm it; if it shows
+no discrimination, the gate is retired rather than carried as unexamined
+faith. RISK ACCEPTED: entries that the (unskilled) gate would have blocked
+may lose money; that is the price of measuring the filter instead of
+believing it.
+
+## 2026-09-01 - OBSERVE MODE EXECUTED (registration above)
+config.yaml ml.entry_gates_enabled: false (declared EXPLICITLY — R19c: config
+is the operating source; the flag was previously absent and ran the code
+default). New config home ml.observe_mode_neutral_confidence 0.60.
+COMPANION FIX SHIPPED (orchestrator eff_conf block): in observe mode a
+direction-neutral structure (RANGE_GATED_STRATEGIES) is validated on the
+neutral baseline instead of the DIRECTIONAL confidence. Without it the flag
+flip alone would have produced ADVERSE SELECTION — condors entering only on
+trending-aligned days, their worst regime. Gates-ON behaviour is untouched:
+the payoff-matched model still owns the number.
+PROOF: tests/test_observe_mode_neutral_confidence.py, 7 executing tests (real
+risk-config contract, real orchestrator scan via the hot-path smoke rig in
+collect mode). Executed pre-fix proof: reverting ONLY the eff_conf hunk makes
+test_condor_carries_the_neutral_baseline_not_the_directional_number FAIL,
+restored -> 7 pass. The premise is pinned too: a neutral-regime directional
+confidence (0.42) is BELOW risk.min_confidence (0.50), so the fix is
+load-bearing rather than decorative.
+tests/test_w2_orchestrator_gates.py::TestRangeGateFailsClosed now ARMS the
+gate explicitly (autouse fixture) instead of inheriting the shipped config —
+the fail-closed behaviour stays proven and ready to re-arm.
+Suite 1490 green, type gate OK, SMOKE PASS 13.

@@ -349,6 +349,24 @@ class MLConfig(_StrictModel):
         description="Floor for model-overridden signal confidence (range/"
                     "vol-mag). 0.65 beat 0.55 across every backtest metric. "
                     "Was hardcoded in orchestrator — audit item 3.3.")
+    observe_mode_neutral_confidence: float = Field(default=0.60, ge=0.50, le=0.90,
+        description="OBSERVE MODE ONLY (entry_gates_enabled=false): the "
+                    "confidence a DIRECTION-NEUTRAL structure (iron_condor, "
+                    "short_strangle) carries into risk validation. "
+                    "trade-life-gatesoff-reintroduces-neutral-autoreject "
+                    "(2026-09-01): with gates off nothing writes "
+                    "model_overridden, so eff_conf fell back to the "
+                    "DIRECTIONAL confidence and manager.py rejected anything "
+                    "below risk.min_confidence — in exactly the neutral "
+                    "regime a condor wants. Only trending-aligned days "
+                    "survived, i.e. condors entered ONLY in their worst "
+                    "regime (adverse selection). The risk manager's "
+                    "min_confidence is a DIRECTIONAL gate; a market-neutral "
+                    "structure is not paid for direction, so it is validated "
+                    "on this neutral baseline instead. Must stay >= "
+                    "risk.min_confidence or observe mode blocks itself; the "
+                    "0.60 default sits above the shipped 0.50 with headroom. "
+                    "Ignored entirely when gates are ON.")
 
     @field_validator("ensemble_weights")
     @classmethod

@@ -1830,11 +1830,31 @@ class TradingOrchestrator:
                 # range probability never reached risk sizing, and in
                 # neutral-only mode the low directional confidence would have
                 # auto-failed the risk manager's own confidence gate.
-                eff_conf = (
-                    signal.confidence
-                    if signal.strategy_name in model_overridden
-                    else final_confidence
-                )
+                # trade-life-gatesoff-reintroduces-neutral-autoreject
+                # (2026-09-01, PLAN pre-registration): in OBSERVE MODE nothing
+                # writes model_overridden, so this used to fall back to the
+                # DIRECTIONAL confidence for a market-neutral structure — and
+                # manager.py:351 rejects < risk.min_confidence. In the neutral
+                # regime a condor is built FOR, that number is below the gate,
+                # so only trending-aligned days survived: condors entering
+                # exclusively in their worst regime. The min_confidence gate is
+                # a DIRECTIONAL gate; direction is not what a condor is paid
+                # for, so validate direction-neutral structures on the
+                # config-homed neutral baseline instead. Gates ON is unchanged:
+                # the payoff-matched model still owns the number.
+                if signal.strategy_name in model_overridden:
+                    eff_conf = signal.confidence
+                elif (not self._settings.ml.entry_gates_enabled
+                        and signal.strategy_name in RANGE_GATED_STRATEGIES):
+                    eff_conf = float(
+                        self._settings.ml.observe_mode_neutral_confidence)
+                    log.debug("observe_mode_neutral_confidence_applied",
+                              symbol=signal.symbol,
+                              strategy=signal.strategy_name,
+                              directional=round(final_confidence, 3),
+                              used=eff_conf)
+                else:
+                    eff_conf = final_confidence
                 # R7 two-phase scan: in collect mode, defer execution to the
                 # cross-symbol ranking pass instead of executing in-place.
                 if collect is not None:

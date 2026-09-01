@@ -535,11 +535,24 @@ class TestRangeGateFailsClosed:
     """fail-direction-02: with the gates armed, a neutral-premium entry needs
     range evidence in BOTH regimes. Pre-fix, no prediction meant the signal
     kept the DIRECTIONAL model's confidence and was admitted on trending days
-    (and silently dropped on neutral ones) — the gate inverted by regime."""
+    (and silently dropped on neutral ones) — the gate inverted by regime.
+
+    2026-09-01: config.yaml now ships OBSERVE MODE (entry_gates_enabled false,
+    PLAN pre-registration — the retrained range model is near coin-flip on
+    SPY/QQQ and was blocking every entry). These tests are ABOUT the armed
+    gate, so they arm it explicitly instead of inheriting whatever the shipped
+    config happens to say. That decoupling is the point: the fail-closed
+    behaviour must stay proven and ready to re-arm.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _arm_the_gates(self, rig):
+        rig.orch._settings.ml.entry_gates_enabled = True
+        yield
 
     async def test_untrained_model_blocks_the_condor_and_pages(self, rig, monkeypatch):
         from tests.test_hot_path_smoke import iron_condor_signal
-        assert rig.orch._settings.ml.entry_gates_enabled, "gates must be ON here"
+        assert rig.orch._settings.ml.entry_gates_enabled, "gates must be ON here"  # armed by the autouse fixture
         rig.orch._range_predictor = _RangeStub(trained=False)
 
         collected = await _scan_one(rig, monkeypatch, iron_condor_signal())
