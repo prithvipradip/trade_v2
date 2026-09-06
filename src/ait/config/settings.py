@@ -408,6 +408,19 @@ class ExitConfig(_StrictModel):
         description="How far a combo EXIT limit crosses the spread so the "
                     "close actually fills (was hardcoded EXIT_CROSS in "
                     "orchestrator — audit item 3.3).")
+    exit_mark_multiple: float = Field(default=1.5, ge=1.05, le=3.0,
+        description="W7 (R24 logic-exit-risk-01): ceiling on a credit "
+                    "buyback as a multiple of the CURRENT marked cost to "
+                    "close. The R16 bound was "
+                    "max(2*mark, entry_credit + 0.25*wing_width) — at the "
+                    "promoted $39-60 wings the width term dominated and "
+                    "priced routine take-profits at 6-10x the mark (SPY sent "
+                    "BUY LMT 14.04 against a 1.40 mark). IBKR's price band "
+                    "rejected 61 of 63 exits; the broker's guard was the ONLY "
+                    "thing bounding the price. The bound is now anchored to "
+                    "the mark alone; the wing width remains the structural "
+                    "cap above it, and mark+exit_cross_amount is the floor so "
+                    "the order stays marketable.")
     trailing_stop_pct: float = Field(default=0.25, ge=0.10, le=0.50)
     breakeven_trigger_pct: float = Field(default=0.30, ge=0.10, le=0.80)
     partial_exit_levels: list[dict] = [

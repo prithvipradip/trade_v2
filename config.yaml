@@ -203,6 +203,11 @@ meta_label:
 
 exit:
   exit_cross_amount: 0.10             # How far combo exits cross the spread to guarantee fills (was hardcoded)
+  # W7/R24 logic-exit-risk-01: credit buyback ceiling as a multiple of the
+  # CURRENT marked cost. The old bound included entry_credit + 25% of the
+  # wing width, which dominated at $39-60 wings and priced take-profits at
+  # 6-10x the mark (61 of 63 exits rejected by IBKR's price band).
+  exit_mark_multiple: 1.5
   trailing_stop_pct: 0.25             # Trail 25% below high water mark
   breakeven_trigger_pct: 0.30         # Move stop to breakeven at +30% P&L
   initial_stop_loss_pct: 0.50         # Fixed stop before breakeven activates

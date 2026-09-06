@@ -11,6 +11,7 @@ Responsible for:
 from __future__ import annotations
 
 import json
+import re
 import math
 import time
 import uuid
@@ -1243,10 +1244,34 @@ class TradeExecutor:
                     (TradeStatus.CLOSING,),
                     TradeStatus.FILLED,
                 )
+                # W7 (logic-exit-risk-02): mine the broker's stated
+                # acceptable price out of the order log and persist it, so
+                # the next exit attempt is priced UNDER the band instead of
+                # re-placing the identical rejected limit forever.
+                _band, _mkt = (None, None)
+                try:
+                    for _t in all_trades:
+                        if _t.order.orderId == order_id:
+                            _band, _mkt = self.parse_price_band_reject(
+                                getattr(_t, "log", None))
+                            break
+                    if _band is not None or _mkt is not None:
+                        self._state.set_state(
+                            f"exit_band_{pending_exit.trade_id}",
+                            json.dumps({"band": _band, "market": _mkt,
+                                        "at": datetime.now().isoformat()}),
+                        )
+                except Exception:  # noqa: BLE001 — never let this block the revert
+                    pass
                 log.warning(
                     "exit_order_cancelled",
                     trade_id=pending_exit.trade_id,
                     age_seconds=pending_exit.age_seconds,
+                    band_price=_band,
+                    market_price=_mkt,
+                    note=("broker price-band reject — next attempt will be "
+                          "re-priced under the band" if _band or _mkt else
+                          "no band price in the order log"),
                 )
                 del self._pending_exit_orders[order_id]
 
@@ -2224,6 +2249,35 @@ class TradeExecutor:
         if evidence is not None and evidence.get("units", 0) > 0:
             return int(round(float(evidence["units"])))
         return 0
+
+    # W7 (R24 logic-exit-risk-02): IBKR rejects an over-aggressive limit with
+    # "Warning 202 ... We cannot accept an order at a limit price at or more
+    # aggressive than 1.745. Please submit your order using a limit price that
+    # is closer to the current market price of 1.42." The bot discarded that
+    # text and re-placed the IDENTICAL limit every backoff, so a take-profit
+    # looped 32 min (SPY) and 2h55m (QQQ) on 08-31 and a touch stop would loop
+    # while the loss grew. Capture the acceptable price so the next attempt is
+    # priced under it.
+    _BAND_RE = re.compile(
+        r"more aggressive than\s+([0-9]*\.?[0-9]+)", re.IGNORECASE)
+    _MKT_RE = re.compile(
+        r"current market price of\s+([0-9]*\.?[0-9]+)", re.IGNORECASE)
+
+    @classmethod
+    def parse_price_band_reject(cls, messages) -> "tuple[float | None, float | None]":
+        """Return (acceptable_limit, market_price) from an order's log text.
+
+        Either may be None. Scans newest-first so a re-used order object
+        reports its most recent rejection.
+        """
+        for msg in reversed(list(messages or [])):
+            text = getattr(msg, "message", None) or str(msg)
+            band = cls._BAND_RE.search(text)
+            mkt = cls._MKT_RE.search(text)
+            if band or mkt:
+                return (float(band.group(1)) if band else None,
+                        float(mkt.group(1)) if mkt else None)
+        return (None, None)
 
     def _determine_exit_fill_status(self, order_id: int, all_trades: list) -> str:
         """Determine whether an exit order filled, partially filled, or was cancelled.

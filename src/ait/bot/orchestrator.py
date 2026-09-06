@@ -3090,6 +3090,115 @@ class TradingOrchestrator:
         except Exception:  # noqa: BLE001 — telemetry must never block an entry
             return "{}"
 
+    async def _synthesize_combo_cost(self, qualified_legs: list[dict],
+                                     poll_rounds: int = 4) -> float | None:
+        """W7 (R24 logic-exit-risk-01): build the combo's marketable cost from
+        the FOUR LEG quotes when the BAG contract never ticks.
+
+        Root cause of the 08-31 incident: every one of 63 exits took the
+        no-quote branch (``combo_exit_limit`` appears zero times in any
+        retained log) and was priced off a formula instead of the market,
+        while the ENTRY path's Bag quotes arrive normally. Legs quote
+        reliably, so synthesize: a leg we BUY back costs its ask, a leg we
+        SELL returns its bid. Returns the as-defined cost for the reversed
+        combo (positive = we pay), or None if any leg is unquotable — a
+        partial sum would understate the cost and place an unfillable order.
+        """
+        import math as _m
+        total = 0.0
+        for leg in qualified_legs:
+            contract = leg.get("_contract")
+            if contract is None:
+                return None
+            bid = ask = None
+            try:
+                self._ibkr.ib.reqMktData(contract, "", False, False)
+                for _ in range(poll_rounds):
+                    await asyncio.sleep(0.5)
+                    t = self._ibkr.ib.ticker(contract)
+                    if not t:
+                        continue
+                    b, a = t.bid, t.ask
+                    bid = b if (b is not None and not _m.isnan(b) and b > 0) else None
+                    ask = a if (a is not None and not _m.isnan(a) and a > 0) else None
+                    if bid is not None and ask is not None:
+                        break
+            except Exception as e:  # noqa: BLE001
+                log.debug("leg_quote_failed", error=str(e))
+                return None
+            finally:
+                try:
+                    self._ibkr.ib.cancelMktData(contract)
+                except Exception:  # noqa: BLE001
+                    pass
+            ratio = float(leg.get("ratio", 1) or 1)
+            if str(leg.get("action", "")).upper() == "BUY":
+                # buying this leg back — we pay the offer
+                price = ask if ask is not None else bid
+            else:
+                # selling this leg — we receive the bid
+                price = bid if bid is not None else ask
+            if price is None:
+                log.warning("leg_quote_unavailable",
+                            con_id=leg.get("conId"), action=leg.get("action"))
+                return None
+            total += ratio * (price if str(leg.get("action", "")).upper() == "BUY"
+                              else -price)
+        return round(total, 2)
+
+    def _exit_band_cap(self, trade: TradeRecord) -> float | None:
+        """W7: the acceptable limit IBKR stated when it rejected the previous
+        exit attempt (executor.parse_price_band_reject persists it).
+
+        Pre-W7 the reject reason was discarded and the identical unexecutable
+        limit was re-placed every backoff — 61 of 63 exits on 08-31, a
+        take-profit looping 32 min and 2h55m. Stale entries (>1h) are ignored
+        so an old band cannot pin a later exit in a moved market.
+        """
+        try:
+            import json as _json
+            raw = self._state.get_state(f"exit_band_{trade.trade_id}", "")
+            if not raw:
+                return None
+            blob = _json.loads(raw)
+            at = blob.get("at")
+            if at and (datetime.now()
+                       - datetime.fromisoformat(at)).total_seconds() > 3600:
+                return None
+            band = blob.get("band")
+            if band is None:
+                mkt = blob.get("market")
+                # No explicit band, but the broker named the market price:
+                # a buyback just above it is the marketable, acceptable side.
+                return round(float(mkt) * 1.05, 2) if mkt else None
+            return float(band)
+        except Exception:  # noqa: BLE001 — a bad band must never block an exit
+            return None
+
+    def _exit_price_ceiling(self, mark_cost: float, width: float,
+                            exit_cross: float) -> float:
+        """W7 (R24 logic-exit-risk-01): the most we may pay to buy back a
+        credit structure, anchored to what it is CURRENTLY worth.
+
+        The R16 bound was ``max(2*mark, entry_credit + 0.25*wing_width)``.
+        That second term was meant as a floor for an unreliable mark, but it
+        sits inside a max(), so at the promoted $39-60 wings it DOMINATED:
+        a SPY condor marked at 1.40 priced its take-profit at
+        4.29 + 0.25*39 = 14.04 — ten times the mark. IBKR's price band
+        rejected 61 of 63 exits (the broker's guard was the only thing
+        bounding the price) and the two that filled did so at NBBO by
+        exchange price improvement, not because anything here was correct.
+
+        The wing width stays the structural cap (a deep-ITM condor really is
+        worth ~width). ``mark + exit_cross`` is the floor, so the order
+        remains marketable at a near-worthless buyback.
+        """
+        mult = float(self._settings.exit.exit_mark_multiple)
+        ceiling = max(mark_cost + exit_cross, mult * mark_cost)
+        if width:
+            ceiling = min(width, ceiling)
+        return round(ceiling, 2)
+
     def _marked_cost_to_close(self, trade: TradeRecord) -> float | None:
         """Per-share cost to close a CREDIT structure per the monitor's marks.
 
@@ -3134,9 +3243,16 @@ class TradingOrchestrator:
                 "conId": qualified.conId,
                 "action": close_action,
                 "ratio": leg.get("ratio", 1),
+                # W7: retained so the exit can synthesize a combo quote from
+                # the individual legs when the BAG itself never ticks.
+                "_contract": qualified,
             })
 
-        combo = ContractBuilder.combo(symbol=trade.symbol, legs=qualified_legs)
+        combo = ContractBuilder.combo(
+            symbol=trade.symbol,
+            legs=[{k: v for k, v in l.items() if not k.startswith("_")}
+                  for l in qualified_legs],
+        )
 
         # The legs above are ALREADY reversed, so the combo order must be
         # BUY — IBKR executes a BUY combo's legs exactly as defined, while a
@@ -3220,6 +3336,21 @@ class TradingOrchestrator:
         except Exception as e:
             log.warning("combo_mid_price_failed", error=str(e))
 
+        # W7 (R24 logic-exit-risk-01): the BAG stayed silent on 63 of 63 exits
+        # while the same account quotes legs fine. Synthesize the combo's
+        # marketable cost from the legs rather than falling through to a
+        # formula-priced order.
+        if limit_price is None:
+            synth = await self._synthesize_combo_cost(qualified_legs)
+            if synth is not None:
+                limit_price = round(
+                    synth + EXIT_CROSS if combo_action == "BUY"
+                    else synth - EXIT_CROSS, 2)
+                log.info("combo_exit_limit_from_legs", symbol=trade.symbol,
+                         trade_id=trade.trade_id, synthesized_cost=synth,
+                         action=combo_action, limit_price=limit_price,
+                         note="BAG never ticked; priced from the four legs")
+
         # R13 (market-catastrophe lens): the exit had NO price sanity bound —
         # `ask + cross` with no ceiling, and a MARKET order on a 4-leg BAG
         # exactly when quotes evaporate (executed proof: a $2-wide condor with
@@ -3255,8 +3386,7 @@ class TradingOrchestrator:
         # then the structural cap is all we have (unchanged behavior).
         mark_cost = self._marked_cost_to_close(trade)
         if is_credit and width and limit_price is not None and mark_cost is not None:
-            anchor = round(min(width, max(2.0 * mark_cost,
-                                          float(trade.entry_price or 0) + 0.25 * width)), 2)
+            anchor = self._exit_price_ceiling(mark_cost, width, EXIT_CROSS)
             if limit_price > anchor:
                 log.warning(
                     "combo_exit_limit_capped_at_mark_anchor",
@@ -3285,6 +3415,22 @@ class TradingOrchestrator:
             )
             limit_price = cap
 
+        # W7 (R24 logic-exit-risk-02): the broker told us, on the previous
+        # attempt, the most aggressive price it will accept. Honour it — this
+        # is what turns an endless re-place loop into a converging exit. The
+        # band is a CAP for a BUY-to-close; the exit still has to be at least
+        # marketable, so never drop below the marked cost plus the cross.
+        _band = self._exit_band_cap(trade)
+        if _band is not None and limit_price is not None and limit_price > _band:
+            floor = round((mark_cost or 0.0) + EXIT_CROSS, 2)
+            capped = round(max(min(limit_price, _band), min(floor, _band)), 2)
+            log.warning(
+                "combo_exit_limit_capped_at_broker_band",
+                symbol=trade.symbol, trade_id=trade.trade_id,
+                requested=limit_price, band=_band, capped_to=capped,
+            )
+            limit_price = capped
+
         # NOTE: `is not None`, NOT truthiness. A computed limit of exactly
         # 0.00 is a legitimate, marketable price for a debit close (a dying
         # straddle bid at the cross amount quotes ask=-0.10, +0.10 cross = 0.00
@@ -3305,10 +3451,13 @@ class TradingOrchestrator:
             # persisted leg marks when fresh; the raw width is the LAST
             # resort (marks gone too), unchanged from R13.
             if mark_cost is not None:
-                fallback = round(min(width, max(2.0 * mark_cost,
-                                                float(trade.entry_price or 0) + 0.25 * width)), 2)
+                fallback = self._exit_price_ceiling(mark_cost, width, EXIT_CROSS)
             else:
                 fallback = round(width, 2)
+            _band_fb = self._exit_band_cap(trade)
+            if _band_fb is not None and fallback > _band_fb:
+                fallback = round(max(_band_fb, min(
+                    (mark_cost or 0.0) + EXIT_CROSS, _band_fb)), 2)
             log.critical(
                 "combo_exit_no_quote_pricing_at_wing_width",
                 symbol=trade.symbol, trade_id=trade.trade_id,

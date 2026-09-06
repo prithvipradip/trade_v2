@@ -1808,3 +1808,46 @@ with no config home, i.e. the threshold authorizing real capital is outside the 
 NO FIXES APPLIED. Fix order proposed: (W7) exit pricing + reject handling; (W8) funding-size
 viability; (W9) booking exactly-once + breaker integrity; (W10) observe-mode measurability;
 (W11) fail-open gates + calendar; (W12) ops substrate.
+
+## 2026-09-06 - W7 EXECUTED: THE STOP-LOSS NOW EXISTS AS A MECHANISM
+Fixes R24's two dominant findings (logic-exit-risk-01/-02). Three linked
+changes, because the exit was broken in three ways at once:
+[1] PRICE CEILING ANCHORED TO THE MARK. The R16 bound was
+    max(2*mark, entry_credit + 0.25*wing_width). The second term was meant as
+    a floor for an unreliable mark but sits inside a max(), so at the promoted
+    $39-60 wings it DOMINATED: SPY marked 1.40 priced its take-profit at
+    4.29 + 0.25*39 = 14.04 (10x), QQQ 2.94 -> 18.60 (6.3x). New helper
+    _exit_price_ceiling = min(width, max(mark + exit_cross, mult * mark)) with
+    mult config-homed (exit.exit_mark_multiple 1.5). SPY 14.04 -> 2.10;
+    QQQ 18.60 -> 4.41; the 08-24 touch stop 19.87 -> 13.14. The wing width
+    stays the structural cap; mark+cross is the floor so the order remains
+    marketable. Applied to BOTH the quoted anchor and the no-quote fallback.
+[2] THE BROKER'S STATED PRICE IS NOW HONOURED. IBKR rejects with "Warning 202
+    ... more aggressive than 1.745 ... current market price of 1.42" and the
+    bot DISCARDED that text, re-placing the identical unexecutable limit every
+    backoff (SPY looped 32 min, QQQ 2h55m on 08-31; a touch stop would loop
+    while the loss grew). TradeExecutor.parse_price_band_reject mines the
+    order log, the cancel path persists {band, market, at} to bot_state, and
+    _exit_band_cap feeds it back as a hard cap on the next attempt (stale >1h
+    ignored so an old band cannot pin a moved market).
+[3] ROOT CAUSE — THE BAG NEVER TICKED. combo_exit_limit appears ZERO times in
+    any retained log: all 63 exits took the no-quote branch and were priced by
+    formula, while the ENTRY path's Bag quotes arrive fine. New
+    _synthesize_combo_cost quotes the FOUR LEGS individually (buy-back legs at
+    the ask, sold legs at the bid) and prices the exit from the real market.
+    Returns None if ANY leg is unquotable — a partial sum would understate the
+    cost and place an unfillable order. Subscriptions are cancelled 1:1 even
+    on exception (the leaked-sub -> market-data-flood -> native-crash class).
+PROOF: tests/test_w7_exit_pricing.py, 20 executing tests driving the real
+functions with the real incident numbers. Pre-fix proof: restoring ONLY the
+old bound makes 5 of them fail; restored -> 20 pass. A test caught a genuine
+defect during development: _exit_band_cap used json.loads but orchestrator.py
+has no module-level json import, so it raised NameError into its own except
+and silently returned None — the exact silent-failure class this project keeps
+finding. Fixed with a local import.
+Suite 1510 green, type gate OK, SMOKE PASS 13.
+NOT YET DEPLOYED — takes effect on the next bot restart.
+REMAINING FROM R24 (unchanged): W8 funding-size viability (at $3k the sizer
+refuses every viable condor while the self-test reports problems=0), W9
+booking exactly-once, W10 observe-mode measurability, W11 fail-open gates +
+holiday blackout, W12 ops substrate (Gateway absorbing state).
