@@ -1747,3 +1747,64 @@ tests/test_w2_orchestrator_gates.py::TestRangeGateFailsClosed now ARMS the
 gate explicitly (autouse fixture) instead of inheriting the shipped config —
 the fail-closed behaviour stays proven and ready to re-arm.
 Suite 1490 green, type gate OK, SMOKE PASS 13.
+
+## 2026-09-06 - R24 FULL AUDIT: 109 STANDING (21 live_money) + TRIAGE SAYS 78 OF 123 STILL OPEN
+User: "full audit again, every angle, every bug, every hardcoded, every parameter, every
+logic and reason". 16 angles, 137 raw candidates, STRICT two-lens adversarial verification
+(code-reading + execution probe; both must concede) -> 109 standing, 28 refuted. 80 agents,
+0 errors. Register: reports/full_audit_r24_20260906.md.
+CORRECTION TO THE RECORD: I described W1-W6 as "all six waves complete". The wave SCOPES
+were complete; the REGISTER was not. Triage of the 123 prior findings: 28 FIXED, 19
+PARTIAL, 78 OPEN. The waves closed the headline clusters, not the list.
+THE TWO THAT DOMINATE EVERYTHING ELSE:
+[1] logic-exit-risk-01/-02 — THE STOP-LOSS DOES NOT EXIST AS A MECHANISM. Every multi-leg
+    exit since the R16 "quote the raw Bag" fix takes the NO-QUOTE fallback, which prices a
+    credit close at max(2*mark, entry_credit + 0.25*width) = 6-10x the marked cost at the
+    promoted $39-60 wings (SPY sent as BUY LMT 14.04 against a ~1.4 mark). 61 of 63 exit
+    attempts were REJECTED by IBKR's price band — the broker's own guard is the only thing
+    that prevented paying it. And a price-band reject is handled exactly like a cancel:
+    revert CLOSING->FILLED, back off, re-place the SAME unexecutable limit forever; nothing
+    reads Warning 202's acceptable price. On 08-31 the SPY take-profit looped 32 min and QQQ
+    2h55m. On paper this corrupts the sample; at $3k it converts a defined-risk condor into
+    a full-width loss. FIX THIS FIRST — it outranks every accounting finding.
+[2] logic-entry-01 + params-trading-01 — THE FUNDING PLAN CANNOT TRADE. At the documented
+    $3,000 CAD (~$2.1k USD), even after the PLAN gate-3 recipe (max_position_risk_pct
+    0.03->0.07), the sizer's viability check (max_position_pct 0.05 x NLV = $105) refuses
+    every $2-wide condor collecting the historical $0.67-0.72 credit (max_loss $130 > $105).
+    Deterministically ZERO entries while the launch self-test reports problems=0. Phase 2 —
+    the designated PRIMARY go-live evidence — opens no trades. Day-1 certainty, not a tail.
+OTHER live_money CLUSTERS: W1 outbox is at-most-once not exactly-once (concurrency-01: a
+kill between the claim DELETE and the booking write loses the obligation entirely);
+claim-raises-then-drain double-books one loss into the breaker (regress-live-02,
+concurrency-02); the drain books $0 not-real-close sentinels as LOSSES and RESETS the
+consecutive-loss streak (regress-live-01, pnl-money-01); the fail-closed breaker overwrites
+an intact persisted streak on auto-resume (regress-live-04); PDT history rewritten to a
+single entry on a transient lock (regress-live-05, live at funding); credit floor enforced
+at neither placement nor reprice (regress-live-06); the cooldown caller still swallows every
+exception so a calendar/lock fault silently disables it (regress-live-07, time-calendar-02);
+the pre-event blackout counts WEEKDAYS so holidays make it fail OPEN, opposite to its own
+docstring (time-calendar-01); the cooldown is per-SYMBOL over three ETFs the bot's own
+correlation module calls one 0.95 cluster (logic-exit-risk-03); trades_taken counts orders
+PLACED and is never decremented, so phantom orders spend the intraday entry budget
+(data-integrity-07); Gateway logoff + dead bot is an ABSORBING state the supervisor never
+escapes — already materialized 2026-07-01 for 5h10m, 3h15m inside RTH (ops-substrate-01);
+RUNBOOK "Full stop" never stops the keeper, which relaunches within 90s mid-procedure
+(docs-policy-04).
+THE PRE-REGISTERED OBSERVE-MODE VERDICT IS UNEXECUTABLE (8 findings, critic says merge as
+ONE): the entry-time range probability is never persisted — it exists only in log lines that
+rotate in ~9 trading days, was never produced for SPY/QQQ at all (predict() exits at the
+min-edge gate), trades.ml_confidence silently changed meaning on 09-01, and
+cleanup_old_logs will unlink the durable reports/ half on 2026-10-01. The only decision rule
+we pre-registered cannot be scored. Fix before more observe-mode closes accumulate.
+CRITIC — NEVER AUDITED BY ANY ROUND: src/ait/broker/* (844-line ibkr_client, combo leg
+ratios/signs, orderRef/permId reuse), dashboard/app.py (2102 lines, 12+ raw trades queries),
+the CAD->USD chain account.py -> capital_tiers -> position_sizer (a mismatch is ~35% sizing
+error on day 1), Reg-T margin vs the %-of-NLV budget, correlation.py/selector.py/thompson.py,
+ops_health's own protection logic, notifications/telegram.py (every alert rides it),
+who writes executions.live_mid (go-live criterion [4] may be structurally unmeasurable),
+schema-migration and sqlite->duckdb copy as data-loss surfaces. ALSO: go_live.py:163-167 —
+the go-live bar itself (50/100 closes, PF 1.3, DD 8%, slip 8%) is an unexamined code literal
+with no config home, i.e. the threshold authorizing real capital is outside the R19c policy.
+NO FIXES APPLIED. Fix order proposed: (W7) exit pricing + reject handling; (W8) funding-size
+viability; (W9) booking exactly-once + breaker integrity; (W10) observe-mode measurability;
+(W11) fail-open gates + calendar; (W12) ops substrate.
