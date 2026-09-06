@@ -35,9 +35,11 @@ def _real_close_sql(prefix: str = "") -> str:
     Reconciler bookkeeping rows (never_filled / pending / migrated) must not
     count as closes in PF / win-rate / drawdown — mirrors status.py's filter.
     """
+    # W3/string-contracts-4: membership from the ONE authority — this copy
+    # omitted the reconciler $0 sentinels, which counted as real closes.
+    from ait.reporting.go_live import NOT_REAL_CLOSE_PATTERNS
     col = f"COALESCE({prefix}exit_reason_detailed, '')"
-    return (f"{col} NOT LIKE '%never_filled%' AND {col} NOT LIKE '%pending%' "
-            f"AND {col} NOT LIKE '%migrated%'")
+    return " AND ".join(f"{col} NOT LIKE '{p}'" for p in NOT_REAL_CLOSE_PATTERNS)
 
 
 def _capital_base() -> float:

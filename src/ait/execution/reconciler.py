@@ -22,6 +22,37 @@ from ait.utils.logging import get_logger
 
 log = get_logger("execution.reconciler")
 
+# ---------------------------------------------------------------------------
+# W3 (string-contracts-4): the exit_reason_detailed sentinels this module
+# books with realized_pnl = 0.0 for outcomes it could NOT determine.
+#
+# These rows are status='closed' but they are NOT trading results: a $0
+# placeholder for an UNKNOWN outcome is not a scratch trade. Before W3 all
+# three PASSED the not-a-real-close filter every consumer applied (which knew
+# only about never_filled / pending / migrated), so the first unbookable exit
+# would have counted as a real LOSING close in PF, win-rate, drawdown,
+# status.py's P&L and the go-live scorecard that authorizes real money.
+# ait.reporting.go_live now excludes them everywhere.
+#
+# The STRING VALUES are a written contract other consumers match on and are
+# deliberately unchanged — this module still WRITES exactly what it always
+# wrote; only who COUNTS the rows changed. Never edit a value here without
+# editing ait.reporting.go_live.NOT_REAL_CLOSE_PATTERNS with it:
+# tests/test_w3_scorecard_truth.py asserts every constant below is excluded
+# by is_real_close().
+UNKNOWN_EXIT_REASON = "reconciler_unknown_exit"
+UNKNOWN_EXPIRED_EXIT_REASON = "reconciler_unknown_exit_expired_needs_review"
+NON_FINITE_EXIT_REASON = "reconciler_unknown_exit_needs_review"
+NEVER_FILLED_EXIT_REASON = "stale_pending_never_filled"
+
+#: Every $0 sentinel this module can book. Not a real close, by construction.
+NOT_REAL_CLOSE_EXIT_REASONS = (
+    UNKNOWN_EXIT_REASON,
+    UNKNOWN_EXPIRED_EXIT_REASON,
+    NON_FINITE_EXIT_REASON,
+    NEVER_FILLED_EXIT_REASON,
+)
+
 
 @dataclass
 class ReconciliationResult:
@@ -376,7 +407,7 @@ class PositionReconciler:
                              realized_pnl=round(realized_pnl, 2))
                 else:
                     realized_pnl = 0.0
-                    exit_reason = "reconciler_unknown_exit_expired_needs_review"
+                    exit_reason = UNKNOWN_EXPIRED_EXIT_REASON
                     log.critical(
                         "reconcile_expired_unbookable",
                         trade_id=trade.trade_id, symbol=trade.symbol,
@@ -387,7 +418,7 @@ class PositionReconciler:
                 # Unknown exit — record neutral P&L and flag for review
                 # rather than inventing a number.
                 realized_pnl = 0.0
-                exit_reason = "reconciler_unknown_exit"
+                exit_reason = UNKNOWN_EXIT_REASON
                 log.warning(
                     "reconcile_unknown_exit",
                     trade_id=trade.trade_id,
@@ -408,7 +439,7 @@ class PositionReconciler:
                          prior_reason=exit_reason)
             realized_pnl = 0.0
             exit_price = 0.0
-            exit_reason = "reconciler_unknown_exit_needs_review"
+            exit_reason = NON_FINITE_EXIT_REASON
 
         log.info("reconcile_closing_stale", trade_id=trade.trade_id,
                  exit_price=exit_price, realized_pnl=realized_pnl,
@@ -823,7 +854,7 @@ class PositionReconciler:
                 # over a $0 "never filled" booking.
                 self._state.close_trade(
                     trade_id=t.trade_id, exit_price=0.0, realized_pnl=0.0,
-                    exit_reason_detailed="stale_pending_never_filled",
+                    exit_reason_detailed=NEVER_FILLED_EXIT_REASON,
                     from_statuses=(TradeStatus.PENDING,),
                 )
                 closed += 1

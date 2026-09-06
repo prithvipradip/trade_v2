@@ -51,6 +51,8 @@ def apply_runtime_env_defaults() -> None:
     # .env > config.yaml > CONTRACT_DEFAULTS.
     for _key, _val in CONTRACT_DEFAULTS.items():
         _cfg = _config_value(_key)
+        if isinstance(_cfg, bool):
+            _cfg = "1" if _cfg else "0"
         os.environ.setdefault(_key, str(_cfg) if _cfg is not None else _val)
 
 
@@ -96,8 +98,23 @@ CONTRACT_DEFAULTS: dict[str, str] = {
 #   2. environment variable          (deployment/study override)
 #   3. config.yaml                   (the operator's declared configuration)
 #   4. CONTRACT_DEFAULTS             (last-resort safety net only)
+# R19c (user policy decision: "config must be the ONLY place with values that
+# manage trading"). Every trading-economics contract key now has a config.yaml
+# home; env remains an OVERRIDE for deployments/studies, and CONTRACT_DEFAULTS
+# is a last-resort safety net, never the operating source. Deliberate
+# exceptions, each for a stated reason:
+#   KMP/OMP guards        - process-level crash guards, must precede imports
+#   AIT_MARKET_DATA_TYPE  - broker DATA entitlement (deployment concern, flips
+#                           at U6 funding), not a strategy value
+#   AIT_ALLOW_UNDEFINED_RISK - INST-5 safety interlock; env-only ON PURPOSE so
+#                           re-enabling naked risk is an explicit deliberate
+#                           act, never a config edit that slips through review
 CONFIG_BACKED: dict[str, tuple[str, str]] = {
     "AIT_IC_WING_K": ("backtest", "wing_k"),
+    "AIT_IC_MIN_CREDIT_WIDTH": ("backtest", "ic_min_credit_width"),
+    "AIT_IC_MIN_CREDIT": ("backtest", "ic_min_credit"),
+    "AIT_CREDIT_LOSS_LIMIT": ("backtest", "credit_loss_limit"),
+    "AIT_SKIP_MACRO_EVENTS": ("risk", "skip_macro_events"),
 }
 
 _yaml_cache: dict | None = None
@@ -136,6 +153,8 @@ def contract_str(key: str) -> str:
         return raw
     cfg = _config_value(key)
     if cfg is not None:
+        if isinstance(cfg, bool):  # yaml true/false -> the contract's '1'/'0'
+            return "1" if cfg else "0"
         return str(cfg)
     return CONTRACT_DEFAULTS[key]
 

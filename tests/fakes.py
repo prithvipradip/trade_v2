@@ -153,9 +153,10 @@ class FakeIB:
     - ``all_trades``:  what ``trades()`` returns (session superset)
     - ``positions_list`` / ``portfolio_list``: broker positions/portfolio
 
-    ``reqMktData`` RAISES by default so the executor's live-quote validation
-    block (GOV-1, with its 1.5 s settle sleep) is skipped instantly; set
-    ``quote = (bid, ask)`` to exercise it.
+    ``reqMktData`` RAISES by default = "no live quote available". Since
+    fail-direction-07 that is a REFUSED combo ENTRY (the gate fails closed),
+    so a test that needs a placement must set ``quote = (bid, ask)``; combo
+    quotes are SIGNED (negative = credit). Exits are never blocked by it.
     """
 
     def __init__(self) -> None:
@@ -208,7 +209,7 @@ class FakeIB:
     def openTrades(self) -> list:  # noqa: N802
         return list(self.open_trades)
 
-    # -- market data (default: unavailable, so GOV-1 validation no-ops) -----
+    # -- market data (default: unavailable -> GOV-1 refuses combo ENTRIES) --
     def reqMktData(self, *a, **k):  # noqa: N802
         if self.quote is None:
             raise RuntimeError("FakeIB: no market data (set .quote to enable)")

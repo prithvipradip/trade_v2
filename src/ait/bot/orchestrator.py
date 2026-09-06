@@ -56,6 +56,135 @@ from ait.utils.time import next_market_open
 
 log = get_logger("bot.orchestrator")
 
+# Strategies whose ENTRY confidence must come from the payoff-matched range
+# model rather than the directional one — P(price stays inside the wings) is
+# what a short-premium neutral structure actually gets paid for.
+# fail-direction-02 (R22): declared once here so the fail-closed drop below
+# cannot drift from the membership it protects. (The two pre-existing literal
+# copies at the override and the neutral-only filter are set-membership-6, a
+# separate register entry, and are left untouched by this wave.)
+RANGE_GATED_STRATEGIES: frozenset[str] = frozenset({"iron_condor", "short_strangle"})
+
+def _cooldown_now() -> datetime:
+    """Reference instant for the post-stop cooldown, naive-LOCAL.
+
+    numeric-pairs-02 (R22): kept naive-local on purpose — trades.exit_time is
+    written with datetime.now() (state.py) and the host runs ET, so the DB
+    rows and this clock share one convention. Extracted as a module function
+    so tests can pin it and stay deterministic on any weekday.
+    """
+    return datetime.now()
+
+
+# Cutoff depends only on the reference DATE, and each lookup costs an NYSE
+# calendar query; memoise so a scan over the universe pays it once a day.
+_COOLDOWN_CUTOFF_CACHE: dict[date, datetime] = {}
+
+
+def _post_stop_cooldown_cutoff(now: datetime | None = None) -> datetime:
+    """09:30 (naive-local == ET on this host) start of the PREVIOUS session.
+
+    numeric-pairs-02 (R22): the R12-B4 spec (portfolio.py ~line 495) is a
+    duration of ONE TRADING DAY — "exit_time's next trading session must have
+    STARTED before re-entry" — with weekends/holidays resolved by the market
+    calendar. The implementation was a flat `now - exit_time < 30h` wall-clock
+    window, which agrees mid-week and collapses across a weekend: a Friday
+    10:00 touch stop expired Saturday 16:00, so the bot re-entered that symbol
+    from Monday's open into the same move R12-B4 exists to sit out (the 08-24
+    QQQ re-entry is the live instance of the family).
+
+    The rule is uniform: block while exit_time >= 09:30 on the latest trading
+    day STRICTLY BEFORE the reference date. On a Monday that cutoff is
+    Friday 09:30 (a Friday stop blocks all of Monday; a Thursday stop does
+    not), mid-week it is yesterday 09:30, and after a market holiday the
+    calendar walks back to the last real session on its own.
+    """
+    from ait.utils.time import MARKET_OPEN, is_trading_day
+
+    now = now or _cooldown_now()
+    ref = now.date()
+    cached = _COOLDOWN_CUTOFF_CACHE.get(ref)
+    if cached is not None:
+        return cached
+
+    prev = ref - timedelta(days=1)
+    for _ in range(14):  # 14 calendar days covers any NYSE holiday cluster
+        if is_trading_day(prev):
+            break
+        prev -= timedelta(days=1)
+    cutoff = datetime.combine(prev, MARKET_OPEN)
+
+    if len(_COOLDOWN_CUTOFF_CACHE) > 8:
+        _COOLDOWN_CUTOFF_CACHE.clear()
+    _COOLDOWN_CUTOFF_CACHE[ref] = cutoff
+    return cutoff
+
+
+RESTRICTED_LIST_PATH = "data/RESTRICTED.txt"
+# fail-direction-11: sentinel returned when the ban file EXISTS but cannot be
+# parsed. It is deliberately NOT a set — a caller that forgets to check it
+# raises instead of silently reading "no bans".
+RESTRICTED_UNREADABLE = None
+
+
+def read_restricted_symbols(path: str | None = None) -> set[str] | None:
+    """Read the operator's hard-ban list (data/RESTRICTED.txt, one symbol/line).
+
+    fail-direction-11 (blindspot_composition_hunt_20260825): this was an
+    inline `read_text()` inside a bare `except: pass`. A UTF-8 BOM (Notepad,
+    `Set-Content`) parsed to {'\ufeffSPY'} and a UTF-16 file (PowerShell's
+    default `>` / Out-File) to NUL-riddled garbage — no exception raised, no
+    log written, and the banned symbol traded on regardless.
+
+    Returns:
+        set[str]  — the banned symbols (upper-cased); empty set when the file
+                    is ABSENT, which means "no restrictions" exactly as before;
+        None      — RESTRICTED_UNREADABLE: the file exists but could not be
+                    parsed. The caller MUST refuse new entries until it reads
+                    cleanly: an operator who dropped a ban file gets
+                    protection, not silence.
+    """
+    from pathlib import Path as _Path
+
+    p = _Path(path or RESTRICTED_LIST_PATH)
+    try:
+        if not p.exists():
+            return set()
+    except OSError as e:
+        log.error("restricted_list_unreadable_fail_closed",
+                  path=str(p), error=str(e), stage="exists")
+        return RESTRICTED_UNREADABLE
+
+    text = None
+    try:
+        # utf-8-sig strips the BOM that made 'SPY' read as '\ufeffSPY'.
+        text = p.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        # PowerShell 5.1's `echo SPY > data\RESTRICTED.txt` writes UTF-16LE;
+        # a real ban file in the operator's default encoding is readable, not
+        # a failure. Anything else still fails closed below.
+        try:
+            text = p.read_text(encoding="utf-16")
+            log.warning("restricted_list_decoded_utf16", path=str(p))
+        except Exception as e:  # noqa: BLE001
+            log.error("restricted_list_unreadable_fail_closed",
+                      path=str(p), error=str(e), stage="decode")
+            return RESTRICTED_UNREADABLE
+    except Exception as e:  # noqa: BLE001 — OSError, AV/permission lock, ...
+        log.error("restricted_list_unreadable_fail_closed",
+                  path=str(p), error=str(e), stage="read")
+        return RESTRICTED_UNREADABLE
+
+    if "\x00" in text:
+        log.error("restricted_list_unreadable_fail_closed",
+                  path=str(p), error="NUL bytes in decoded text",
+                  stage="decode")
+        return RESTRICTED_UNREADABLE
+
+    banned = {ln.strip().upper() for ln in text.splitlines() if ln.strip()}
+    log.info("restricted_list_loaded", path=str(p), symbols=sorted(banned))
+    return banned
+
 
 class TradingOrchestrator:
     """Orchestrates the complete autonomous trading lifecycle."""
@@ -109,13 +238,24 @@ class TradingOrchestrator:
         self._predictor = DirectionPredictor(settings.ml)
         self._regime_detector = RegimeDetector()
 
-        # Range predictor (Tier 1) — used for iron condor confidence
+        # Range predictor (Tier 1) — used for iron condor confidence.
+        # units-scale-05 (R22): these were bare literals (0.05, 30) — the LIVE
+        # half of a must-agree pair whose RESEARCH half (walkforward's
+        # _range_label_horizon) had already moved to the reachable trade
+        # horizon (dte_range[0] - EXPIRY_APPROACHING_DTE = 9d). The live 0.65
+        # floor is justified by a sweep of the research pipeline, so a 30-day
+        # containment probability was being judged against a floor calibrated
+        # on the strictly easier 9-day question — vetoing IC entries the
+        # validated gate would take. Both sides now read one authority.
         from ait.ml.range_predictor import RangePredictor
+        from ait.ml.range_spec import live_range_spec
+        _range_threshold, _range_horizon = live_range_spec(settings)
         self._range_predictor = RangePredictor(
-            threshold_pct=0.05,  # ±5%
-            horizon_days=30,
+            threshold_pct=_range_threshold,
+            horizon_days=_range_horizon,
         )
         self._range_predictor.load_models()  # silent if no model yet
+        self._check_range_model_spec(_range_threshold, _range_horizon)
 
         # Vol-magnitude predictor (Tier 1) — used for long straddle confidence
         from ait.ml.vol_magnitude_predictor import VolMagnitudePredictor
@@ -146,7 +286,13 @@ class TradingOrchestrator:
 
         # Trading
         self._strategy_selector = StrategySelector(settings.options)
-        self._executor = TradeExecutor(ibkr_client, self._state, self._circuit_breaker)
+        # R20 (register): hand the executor the loaded settings so its
+        # spread-reject gate reads options.max_bid_ask_spread_pct instead of
+        # its 0.15 fallback — the last dormant piece of the R19 config
+        # binding. Dormant today (IC-only), armed the day a single-leg
+        # strategy is re-enabled.
+        self._executor = TradeExecutor(ibkr_client, self._state,
+                                       self._circuit_breaker, settings=settings)
         self._portfolio = PortfolioManager(
             ibkr_client, self._market_data, self._state,
             self._circuit_breaker, self._pdt_guard,
@@ -259,6 +405,44 @@ class TradingOrchestrator:
 
         # Signal queue for entry timing optimization
         # Signals wait here until timing conditions are met (max 3 cycles)
+
+    def _check_range_model_spec(self, threshold: float, horizon: int) -> bool:
+        """units-scale-05: MODEL-ARTIFACT HONESTY at startup.
+
+        A loaded range model keeps the spec it was TRAINED at — its
+        probabilities only answer that question, and silently re-labelling
+        them with the live spec would be a lie (RangePredictor.load_models is
+        deliberately built that way). But a stale artifact must not be
+        invisible either: a model trained at 30d/±5% gating ~9-day trades is
+        the exact divergence units-scale-05 registers, and the operator has to
+        be able to see it in the startup log.
+
+        Returns True when a mismatch was found and logged. Nothing is deleted
+        or retrained here — ModelTrainer.needs_training already forces a
+        rebuild at the designed spec via RangePredictor.spec_mismatch.
+        """
+        rp = getattr(self, "_range_predictor", None)
+        if rp is None or not getattr(rp, "is_trained", False):
+            return False
+        trained_threshold = getattr(rp, "_threshold", None)
+        trained_horizon = getattr(rp, "_horizon", None)
+        if (trained_threshold is None or trained_horizon is None
+                or (abs(float(trained_threshold) - float(threshold)) <= 1e-9
+                    and int(trained_horizon) == int(horizon))):
+            return False
+        log.warning(
+            "range_model_spec_mismatch",
+            live_threshold=threshold,
+            live_horizon_days=horizon,
+            model_threshold=trained_threshold,
+            model_horizon_days=trained_horizon,
+            model_version=getattr(rp, "model_version", ""),
+            trained_at=getattr(rp, "trained_at", None),
+            note="loaded range model answers a DIFFERENT question than the "
+                 "live spec; it keeps serving its trained spec until the "
+                 "next retrain rebuilds it (see ait.ml.range_spec)",
+        )
+        return True
 
     def set_notification_callback(self, callback) -> None:
         """Set async callback for sending notifications."""
@@ -454,6 +638,90 @@ class TradingOrchestrator:
         except Exception as e:  # noqa: BLE001
             log.warning("reconcile_alert_failed", error=str(e))
 
+    async def _drain_exit_outbox(self) -> None:
+        """W1 (R23 breaker-bypass family): book closes nobody booked.
+
+        Pre-W1, every close the RECONCILER discovered (a stop that filled
+        while the bot was down, a manual TWS flatten, an ITM expiry) landed
+        in trades.realized_pnl but NEVER reached the circuit breaker, daily
+        stats, PDT counter, or Thompson — the daily-loss halt and 3-loss
+        pause undercounted exactly the chaotic-day losses they exist for.
+        Same for a booking lost to a crash between close_trade's commit and
+        the fill callback. close_trade now enqueues transactionally; this
+        drain claims and books the orphans. The 120s grace keeps it from
+        racing an in-flight executor callback (which claims within seconds).
+        """
+        # W1 (concurrency-1): page the fill-after-close flag the executor sets
+        # when a fill's CAS is refused — a real position may be unmanaged.
+        try:
+            _fac = self._state.get_state("alert_fill_after_close", "")
+            if _fac:
+                self._state.delete_state("alert_fill_after_close")
+                await self._send_notification(
+                    f"CRITICAL: fill landed on a TERMINAL trade row ({_fac}). "
+                    "A REAL position may be live at the broker with no "
+                    "managing row — check TWS and the untracked-option freeze.")
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            pending = self._state.pending_exit_bookings(older_than_seconds=120.0)
+        except Exception as e:  # noqa: BLE001
+            log.warning("exit_outbox_read_failed", error=str(e))
+            return
+        if not pending:
+            return
+        from ait.utils.time import now_et as _now_et
+        today = _now_et().date()
+        for row in pending:
+            trade_id = row["trade_id"]
+            try:
+                if not self._state.claim_exit_booking(trade_id):
+                    continue  # lost the race to a concurrent booker — correct
+                pnl = float(row["realized_pnl"] or 0.0)
+                try:
+                    exit_d = datetime.fromisoformat(row["exit_time"]).date()
+                except Exception:  # noqa: BLE001
+                    exit_d = None
+                if exit_d != today:
+                    # Stats/breaker are DAILY quantities — booking a prior-day
+                    # close into today's halt math errs the other direction.
+                    # Claimed (never resurfaces), logged for the human ledger.
+                    log.warning("stale_exit_booking_skipped", trade_id=trade_id,
+                                exit_time=row["exit_time"], pnl=pnl)
+                    continue
+                stats = self._state.get_daily_stats()
+                stats.total_pnl += pnl
+                if pnl > 0:
+                    stats.trades_won += 1
+                else:
+                    stats.trades_lost += 1
+                self._circuit_breaker.record_trade_result(pnl)
+                self._state.update_daily_stats(stats)
+                try:
+                    self._state.delete_state(f"trade_maxloss_{trade_id}")
+                except Exception:  # noqa: BLE001
+                    pass
+                _t = self._find_trade_by_id(trade_id)
+                if _t and _t.entry_time:
+                    try:
+                        if datetime.fromisoformat(_t.entry_time).date() == today:
+                            self._pdt_guard.record_day_trade(_t.symbol)
+                    except Exception as _e:  # noqa: BLE001
+                        log.debug("pdt_record_failed", error=str(_e))
+                if _t:
+                    self._thompson.record_outcome(
+                        strategy=_t.strategy, won=pnl > 0, pnl=pnl)
+                log.warning("orphan_close_booked", trade_id=trade_id, pnl=pnl,
+                            reason=row.get("exit_reason", ""))
+                await self._send_notification(
+                    f"ORPHAN CLOSE BOOKED: {(_t.symbol if _t else trade_id)} "
+                    f"P&L ${pnl:.2f} ({row.get('exit_reason') or 'unknown'}) — "
+                    "found by reconcile; breaker/stats now counted it.")
+            except Exception as e:  # noqa: BLE001 — one bad row must not stop the drain
+                log.error("exit_outbox_booking_failed", trade_id=trade_id,
+                          error=str(e))
+
     async def _process_completed_exits(self, completed_exits: list[dict]) -> None:
         """Book completed exits: daily stats, circuit breaker, Thompson, drift.
 
@@ -463,6 +731,18 @@ class TradingOrchestrator:
         """
         for ex in completed_exits:
             trade_id = ex["trade_id"]
+
+            # W1 (R23 concurrency-2): claim the outbox row before booking.
+            # Exactly one booker wins the DELETE — if the cycle drain (or a
+            # concurrent pass) already booked this close, do NOT double-count
+            # it into stats/breaker/Thompson.
+            try:
+                _claimed = self._state.claim_exit_booking(trade_id)
+            except Exception:  # noqa: BLE001 — outbox unavailable: book as before
+                _claimed = True
+            if not _claimed:
+                log.warning("exit_booking_already_claimed", trade_id=trade_id)
+                continue
 
             # R15 #8 (Tier-2 #4 for real): the fill-time booking embedded a
             # FLAT $0.65/leg/side commission estimate inside realized_pnl —
@@ -874,6 +1154,10 @@ class TradingOrchestrator:
         _filled_entries, completed_exits = await self._executor.check_fills_safe()
         await self._process_completed_exits(completed_exits)
 
+        # 6b. W1: book closes nobody booked — reconciler/sweep closes and
+        # bookings lost to a crash between the sqlite close and the callback.
+        await self._drain_exit_outbox()
+
         # 7. Get effective universe (learning + capital tier filtering)
         adaptor = self._learning.adaptor
 
@@ -1046,8 +1330,33 @@ class TradingOrchestrator:
             log.warning("hist_data_empty", symbol=symbol,
                         hint="No historical data — check market data subscription or data source")
             return
+        # fail-direction-05 (R22): this used to be `iv_rank = 50.0` with NO
+        # log — and 50 is the one value that passes BOTH IV gates
+        # (iron_condor's >=15 floor and the risk manager's <=85 VRP cap), so
+        # a broken IV layer made every symbol scan as "perfectly average IV"
+        # and journalled that fabrication into entry_iv_rank as a real
+        # measurement. Unknown now propagates as None.
         if isinstance(iv_rank, Exception):
-            iv_rank = 50.0
+            log.warning("iv_rank_unavailable", symbol=symbol,
+                        reason=f"scan_gather_raised:{type(iv_rank).__name__}",
+                        detail=str(iv_rank)[:160])
+            iv_rank = None
+        if iv_rank is None:
+            # FAIL CLOSED for NEW entries only. Every downstream consumer
+            # (iron_condor's IV floor, the VRP cap, the journalled
+            # entry_iv_rank, meta-label training features) treats iv_rank as
+            # a measurement; with none there is no basis to sell premium on
+            # this symbol this scan. Exits/monitoring never run through
+            # _scan_symbol, so open positions keep being managed and exited
+            # normally — this only refuses to OPEN.
+            log.warning("iv_rank_unavailable_entry_skipped", symbol=symbol)
+            if self._alert_gate(f"iv_rank_unavailable:{symbol}", interval_s=3600):
+                await self._send_notification(
+                    f"IV DATA OUTAGE — {symbol}: IV rank could not be measured, "
+                    f"so NEW entries on {symbol} are being skipped (fail-closed). "
+                    f"Open positions are still monitored and exited normally."
+                )
+            return
 
         # Incremental intraday fetch: only request bars not yet stored in SQLite.
         # On first run (no stored data) fetches a full 7-day seed window.
@@ -1175,6 +1484,23 @@ class TradingOrchestrator:
         # Pre-compute daily features once — used for fractal penalty and meta-labeler below.
         from ait.ml.features import FeatureEngine
         features_df = FeatureEngine().compute(hist)
+
+        # R20: stash the entry-time feature row per symbol so _try_execute can
+        # persist it into trade_context.entry_signals. That column has been
+        # "{}" for EVERY trade ever taken, which means 11 of the meta-labeler's
+        # 20 features were never captured — the "meta-labeler at 50 closes"
+        # milestone was unreachable and nobody knew until the R19 coverage
+        # guard refused to train on 9/20 features. Every close without this
+        # is training data lost forever.
+        try:
+            _snap = getattr(self, "_entry_feature_snap", None)
+            if _snap is None:
+                _snap = self._entry_feature_snap = {}
+            _snap.pop(symbol, None)
+            if not features_df.empty:
+                _snap[symbol] = features_df.iloc[-1]
+        except Exception:  # noqa: BLE001 — telemetry must never break a scan
+            pass
 
         # Fractal regime confidence penalty (Gap Z5): mirrors backtest engine logic.
         # If hurst_scale_spread or multifractal_width indicate chaotic fractal regime,
@@ -1352,6 +1678,7 @@ class TradingOrchestrator:
             # Sharpe 1.36 vs 0.64, Sortino 2.20 vs 0.97, RAROC 604% vs 276%.
             RANGE_MIN_CONFIDENCE = self._settings.ml.range_min_confidence
             model_overridden: set[str] = set()  # strategies whose confidence came from a payoff-matched model
+            range_pred = None  # fail-direction-02: stays None when the gate has no evidence
             if self._range_predictor and self._range_predictor.is_trained:
                 range_pred = self._range_predictor.predict(
                     hist, symbol=symbol,
@@ -1375,6 +1702,41 @@ class TradingOrchestrator:
                             if s.strategy_name in ("iron_condor", "short_strangle"):
                                 s.confidence = range_pred.probability_in_range
                                 model_overridden.add(s.strategy_name)
+
+            # fail-direction-02 (R22): ONE fail direction when the payoff-
+            # matched gate has no evidence. Pre-fix, an unavailable range
+            # model (missing/corrupt range.pkl — a documented incident class,
+            # untrained after a caught training failure, or a routine
+            # predict()->None) left iron_condor/short_strangle carrying the
+            # DIRECTIONAL model's confidence, so the armed gate INVERTED by
+            # regime: on neutral days the neutral-only filter below dropped
+            # every IC silently (a sample stop), on directional days ICs were
+            # admitted on directional evidence — precisely the wrong-payoff
+            # basis this override exists to replace. Live mirror of
+            # walkforward.py:1376 (range_min_confidence=1.0 on a training
+            # failure). With gates OFF the model stays observe-only by design
+            # (R16), so nothing is dropped there.
+            if self._settings.ml.entry_gates_enabled and range_pred is None:
+                _ungated = [s for s in signals
+                            if s.strategy_name in RANGE_GATED_STRATEGIES]
+                if _ungated:
+                    signals = [s for s in signals
+                               if s.strategy_name not in RANGE_GATED_STRATEGIES]
+                    log.warning(
+                        "range_gate_unavailable_entries_blocked",
+                        symbol=symbol,
+                        blocked=sorted({s.strategy_name for s in _ungated}),
+                        model_trained=bool(self._range_predictor
+                                           and self._range_predictor.is_trained),
+                    )
+                    if self._alert_gate("range_gate_unavailable", interval_s=3600):
+                        await self._send_notification(
+                            "RANGE GATE UNAVAILABLE — the range model produced no "
+                            "prediction (missing/untrained artifact or predict() "
+                            "returned nothing), so iron condor / short strangle "
+                            "entries are being refused FAIL-CLOSED on every symbol "
+                            "until it recovers. Exits are unaffected."
+                        )
 
             # Vol-magnitude model (Tier 1) for long straddles — predicts P(big move)
             # Direct signal for "buy volatility" strategies, more accurate than
@@ -1468,11 +1830,31 @@ class TradingOrchestrator:
                 # range probability never reached risk sizing, and in
                 # neutral-only mode the low directional confidence would have
                 # auto-failed the risk manager's own confidence gate.
-                eff_conf = (
-                    signal.confidence
-                    if signal.strategy_name in model_overridden
-                    else final_confidence
-                )
+                # trade-life-gatesoff-reintroduces-neutral-autoreject
+                # (2026-09-01, PLAN pre-registration): in OBSERVE MODE nothing
+                # writes model_overridden, so this used to fall back to the
+                # DIRECTIONAL confidence for a market-neutral structure — and
+                # manager.py:351 rejects < risk.min_confidence. In the neutral
+                # regime a condor is built FOR, that number is below the gate,
+                # so only trending-aligned days survived: condors entering
+                # exclusively in their worst regime. The min_confidence gate is
+                # a DIRECTIONAL gate; direction is not what a condor is paid
+                # for, so validate direction-neutral structures on the
+                # config-homed neutral baseline instead. Gates ON is unchanged:
+                # the payoff-matched model still owns the number.
+                if signal.strategy_name in model_overridden:
+                    eff_conf = signal.confidence
+                elif (not self._settings.ml.entry_gates_enabled
+                        and signal.strategy_name in RANGE_GATED_STRATEGIES):
+                    eff_conf = float(
+                        self._settings.ml.observe_mode_neutral_confidence)
+                    log.debug("observe_mode_neutral_confidence_applied",
+                              symbol=signal.symbol,
+                              strategy=signal.strategy_name,
+                              directional=round(final_confidence, 3),
+                              used=eff_conf)
+                else:
+                    eff_conf = final_confidence
                 # R7 two-phase scan: in collect mode, defer execution to the
                 # cross-symbol ranking pass instead of executing in-place.
                 if collect is not None:
@@ -1639,6 +2021,11 @@ class TradingOrchestrator:
         n += 1
         if n >= 5 and (_t.time() - last_alert) > 3600:
             last_alert = _t.time()
+            # W6/log-contracts-2: "LOOP IMPAIRED" existed ONLY inside the
+            # Telegram f-string, so every log consumer (deploy gate, status,
+            # first-RTH liveness check) reported a healthy loop through an
+            # R8-class outage. Emit it as a structured event too.
+            log.error("loop_impaired", kind=kind, consecutive_failures=n)
             try:
                 await self._send_notification(
                     f"LOOP IMPAIRED — {kind}: {n} consecutive failures. "
@@ -1663,13 +2050,36 @@ class TradingOrchestrator:
             v = None
         if v and v > 0:
             self._vix_lkg = (float(v), _t.time())
+            self._vix_fail_streak = 0
             return float(v)
         lkg = getattr(self, "_vix_lkg", None)
         if lkg and (_t.time() - lkg[1]) <= 2700:
             log.warning("vix_using_last_known_good", vix=lkg[0],
                         age_s=int(_t.time() - lkg[1]))
+            self._vix_fail_streak = 0
             return lkg[0]
         log.error("vix_unavailable_fail_closed")
+        # fail-direction-01 (R22): the fail-closed stop itself is correct —
+        # but it was SILENT (log.error only; grep found no notification on
+        # any VIX path). With config strategies = [iron_condor] this refuses
+        # 100% of entries for the whole outage and the operator's only clue
+        # is a day with zero trades: the same silent-full-stop signature the
+        # blackout gate was hardened against in R18. Reaching here already
+        # means BOTH sources failed AND the last known good is >45 min old,
+        # so no failure streak is needed to establish this is an outage.
+        # This never fires on a genuinely high VIX — that returns a real
+        # number above and is refused downstream by the risk manager, which
+        # is a decision, not a data failure.
+        _n = int(getattr(self, "_vix_fail_streak", 0)) + 1
+        self._vix_fail_streak = _n
+        if self._alert_gate("vix_gate_unavailable", interval_s=3600):
+            await self._send_notification(
+                f"VIX DATA OUTAGE — no VIX print from either source and the "
+                f"last known good is older than 45 min ({_n} consecutive "
+                f"checks). Credit entries are being refused FAIL-CLOSED, so "
+                f"the bot is NOT opening trades until this clears. Exits are "
+                f"unaffected."
+            )
         return None
 
     async def _check_trading_enabled(self) -> bool:
@@ -1717,6 +2127,120 @@ class TradingOrchestrator:
                 "tables in economic_calendar.py — see logs for details."
             )
 
+    def _post_stop_cooldown_until(self, symbol: str) -> str | None:
+        """R12-B4 query, extracted so tests can execute it against a real DB.
+
+        Returns the exit_time of the most recent qualifying stop close inside
+        the cooldown window, else None.
+
+        2026-08-25 defect: the query matched only '%stop_loss%', but the
+        short-strike touch stop — live's PRIMARY loss exit since R12-B1 —
+        writes 'short_strike_touch (spot ...)'. Executed proof from the live
+        book: QQQ touch-stopped 08-24 09:47:33 (−$272.29) and re-entered at
+        10:00:40, 13 minutes later, straight back into the same move the rule
+        exists to avoid. Both spellings of a forced adverse-move exit now
+        match. trailing_stop/breakeven_stop stay excluded on purpose: those
+        fire at/above breakeven, so re-entry after them is not the
+        autocorrelated-loss sequence R12-B4 targets.
+
+        numeric-pairs-02 (R22): the window is ONE TRADING DAY (the spec), not
+        a flat 30 wall-clock hours — see _post_stop_cooldown_cutoff.
+        """
+        import sqlite3 as _sq12
+        _con = _sq12.connect("file:data/ait_state.db?mode=ro", uri=True)
+        try:
+            _row = _con.execute(
+                "SELECT exit_time FROM trades WHERE symbol=? AND status='closed' "
+                "AND (COALESCE(exit_reason_detailed,'') LIKE '%stop_loss%' "
+                "OR COALESCE(exit_reason_detailed,'') LIKE '%short_strike_touch%') "
+                "ORDER BY exit_time DESC LIMIT 1", (symbol,)).fetchone()
+        finally:
+            _con.close()
+        if _row and _row[0]:
+            from datetime import datetime as _dt12
+            _exit_t = _dt12.fromisoformat(_row[0])
+            # numeric-pairs-02 (R22): was `_dt12.now() - _exit_t < 30h` — a
+            # flat wall-clock window with no calendar, so every Friday and
+            # pre-holiday stop bought ZERO post-stop sessions of cooldown.
+            # The spec is ONE TRADING day; see _post_stop_cooldown_cutoff.
+            if _exit_t >= _post_stop_cooldown_cutoff():
+                return _row[0]
+        return None
+
+    def _duplicate_guard_verdict(self, signal) -> str:
+        """fail-direction-08: verdict of the three duplicate-order layers.
+
+        Returns:
+            "clear"      — every layer answered and none found a duplicate;
+            "duplicate"  — a layer found one (it logged which);
+            "unverified" — a layer could not answer (locked DB, disconnected
+                            broker). The old code logged that at DEBUG and
+                            carried on to placement, so a locked-DB window
+                            plus a reconnect blip could put a SECOND live
+                            order on the same symbol with two DEBUG lines as
+                            the only evidence.
+        """
+        from datetime import datetime as dt
+
+        # GUARD #2 — per-symbol+strategy cooldown. Refuse re-entry on the same
+        # symbol+strategy within the window regardless of fill status; a simple
+        # DB-backed backstop that survives restarts and doesn't depend on the
+        # (fragile) in-memory pending tracker.
+        COOLDOWN_MINUTES = 120
+        try:
+            cutoff = dt.now() - timedelta(minutes=COOLDOWN_MINUTES)
+            for rt in self._state.get_recent_trades(n=30):
+                if rt.symbol == signal.symbol and rt.strategy == signal.strategy_name:
+                    try:
+                        entered = datetime.fromisoformat(rt.entry_time)
+                    except (ValueError, TypeError):
+                        continue
+                    if entered >= cutoff:
+                        log.info("cooldown_skip", symbol=signal.symbol,
+                                 strategy=signal.strategy_name,
+                                 minutes_ago=int((dt.now() - entered).total_seconds() / 60))
+                        return "duplicate"  # symbol+strategy recently traded
+        except Exception as e:  # noqa: BLE001 — fail CLOSED (was log.debug + place)
+            log.warning("cooldown_check_failed_entry_refused",
+                        symbol=signal.symbol, error=str(e))
+            return "unverified"
+
+        # GUARD #3 — working IBKR orders. Catch in-flight orders the local DB
+        # hasn't caught up on (e.g. placed but not yet recorded/filled).
+        # get_open_orders() returns [] when DISCONNECTED, which is
+        # indistinguishable from a verified-empty book — so check the
+        # connection explicitly and treat a blind read as unverified.
+        try:
+            if not getattr(self._ibkr, "connected", True):
+                log.warning("working_order_check_disconnected_entry_refused",
+                            symbol=signal.symbol)
+                return "unverified"
+            for t in (self._ibkr.get_open_orders() or []):
+                if getattr(t.contract, "symbol", None) == signal.symbol:
+                    log.info("working_order_skip", symbol=signal.symbol)
+                    return "duplicate"
+        except Exception as e:  # noqa: BLE001 — fail CLOSED (was log.debug + place)
+            log.warning("working_order_check_failed_entry_refused",
+                        symbol=signal.symbol, error=str(e))
+            return "unverified"
+
+        # GUARD #4 — in-memory pending tracker (empty after every restart,
+        # which is why the two DB/broker layers above must stay honest).
+        try:
+            pending_symbols = set()
+            for _oid, pending in self._executor._pending_orders.items():
+                if hasattr(pending, 'signal') and hasattr(pending.signal, 'symbol'):
+                    pending_symbols.add(pending.signal.symbol)
+        except Exception as e:  # noqa: BLE001
+            log.warning("pending_tracker_check_failed_entry_refused",
+                        symbol=signal.symbol, error=str(e))
+            return "unverified"
+        if signal.symbol in pending_symbols:
+            log.info("symbol_has_pending_order", symbol=signal.symbol)
+            return "duplicate"
+
+        return "clear"
+
     async def _try_execute(self, signal, confidence: float, sentiment, regime) -> bool:
         """Validate and execute a signal.
 
@@ -1744,15 +2268,17 @@ class TradingOrchestrator:
                 return True  # symbol handled: no new entries while halted
         # GOV (governance audit): restricted list — hard-ban a symbol without
         # a config edit + restart (post-incident control). One symbol per line.
-        _rl = _P("data/RESTRICTED.txt")
-        if _rl.exists():
-            try:
-                _banned = {ln.strip().upper() for ln in _rl.read_text().splitlines() if ln.strip()}
-                if signal.symbol.upper() in _banned:
-                    log.warning("symbol_restricted", symbol=signal.symbol)
-                    return True
-            except Exception:  # noqa: BLE001
-                pass
+        # fail-direction-11: a present-but-unreadable ban file must never mean
+        # "no bans" — it blocks NEW entries entirely until it reads cleanly.
+        _banned = read_restricted_symbols()
+        if _banned is RESTRICTED_UNREADABLE:
+            log.warning("entries_halted_restricted_list_unreadable",
+                        symbol=signal.symbol, path=RESTRICTED_LIST_PATH)
+            return True  # symbol handled: no new entries while the ban file
+            #              cannot be read (exits are untouched)
+        if signal.symbol.upper() in _banned:
+            log.warning("symbol_restricted", symbol=signal.symbol)
+            return True
 
         # R6 (user-approved): don't OPEN credit structures the macro flatten
         # will force-close within days — paying full round-trip costs for
@@ -1817,20 +2343,11 @@ class TradingOrchestrator:
         # the most autocorrelated loss sequence condors produce. A stop-loss
         # close now blocks NEW entries on that symbol for 1 trading day.
         try:
-            import sqlite3 as _sq12
-            _con = _sq12.connect("file:data/ait_state.db?mode=ro", uri=True)
-            _row = _con.execute(
-                "SELECT exit_time FROM trades WHERE symbol=? AND status='closed' "
-                "AND COALESCE(exit_reason_detailed,'') LIKE '%stop_loss%' "
-                "ORDER BY exit_time DESC LIMIT 1", (signal.symbol,)).fetchone()
-            _con.close()
-            if _row and _row[0]:
-                from datetime import datetime as _dt12, timedelta as _td12
-                _exit_t = _dt12.fromisoformat(_row[0])
-                if _dt12.now() - _exit_t < _td12(hours=30):
-                    log.info("entry_blocked_post_stop_cooldown",
-                             symbol=signal.symbol, stopped_at=_row[0])
-                    return False
+            _stopped_at = self._post_stop_cooldown_until(signal.symbol)
+            if _stopped_at:
+                log.info("entry_blocked_post_stop_cooldown",
+                         symbol=signal.symbol, stopped_at=_stopped_at)
+                return False
         except Exception:  # noqa: BLE001 — cooldown must never block the loop
             pass
 
@@ -1877,45 +2394,21 @@ class TradingOrchestrator:
             # signal outranked it, throttling exactly the sample we need.
             return False
 
-        # GUARD #2 — per-symbol+strategy cooldown. Refuse re-entry on the same
-        # symbol+strategy within the window regardless of fill status; a simple
-        # DB-backed backstop that survives restarts and doesn't depend on the
-        # (fragile) in-memory pending tracker.
-        COOLDOWN_MINUTES = 120
-        try:
-            cutoff = dt.now() - timedelta(minutes=COOLDOWN_MINUTES)
-            for rt in self._state.get_recent_trades(n=30):
-                if rt.symbol == signal.symbol and rt.strategy == signal.strategy_name:
-                    try:
-                        entered = datetime.fromisoformat(rt.entry_time)
-                    except (ValueError, TypeError):
-                        continue
-                    if entered >= cutoff:
-                        log.info("cooldown_skip", symbol=signal.symbol,
-                                 strategy=signal.strategy_name,
-                                 minutes_ago=int((dt.now() - entered).total_seconds() / 60))
-                        return True  # symbol+strategy recently traded
-        except Exception as e:  # noqa: BLE001
-            log.debug("cooldown_check_failed", error=str(e))
-
-        # GUARD #3 — working IBKR orders. Catch in-flight orders the local DB
-        # hasn't caught up on (e.g. placed but not yet recorded/filled).
-        try:
-            for t in (self._ibkr.get_open_orders() or []):
-                if getattr(t.contract, "symbol", None) == signal.symbol:
-                    log.info("working_order_skip", symbol=signal.symbol)
-                    return True
-        except Exception as e:  # noqa: BLE001
-            log.debug("working_order_check_failed", error=str(e))
-
-        # Check if this symbol already has a pending order (in-memory tracker)
-        pending_symbols = set()
-        for oid, pending in self._executor._pending_orders.items():
-            if hasattr(pending, 'signal') and hasattr(pending.signal, 'symbol'):
-                pending_symbols.add(pending.signal.symbol)
-        if signal.symbol in pending_symbols:
-            log.debug("symbol_has_pending_order", symbol=signal.symbol)
-            return True  # symbol already busy
+        # GUARDS #2-#4 — duplicate-order layers. fail-direction-08: each layer
+        # used to swallow its own errors at DEBUG and fall through to PLACE.
+        _dup = self._duplicate_guard_verdict(signal)
+        if _dup == "duplicate":
+            return True  # symbol already busy — the layer logged which one
+        if _dup == "unverified":
+            # A layer could not answer (locked DB, disconnected broker read).
+            # "No duplicate found" and "could not check" are different facts:
+            # place on the first, refuse this pass on the second.
+            log.warning("duplicate_guard_unverified_entry_refused",
+                        symbol=signal.symbol, strategy=signal.strategy_name,
+                        detail=("a duplicate-order check failed; refusing the "
+                                "entry this pass rather than risking a second "
+                                "live order for the same symbol"))
+            return True
 
         # Check if position would hold through earnings (IV crush risk)
         if signal.expiry:
@@ -2052,14 +2545,39 @@ class TradingOrchestrator:
                 self._state.set_trade_capital_at_risk(trade_id, _total_risk)
             except Exception:  # noqa: BLE001
                 pass
+            # trade-life-entry-vix-refetch-defeats-lkg (R22): this line was
+            # `vix=await self._market_data.get_vix() or 0` — a SECOND,
+            # independent network fetch (get_vix is uncached) seconds after
+            # the validated one, with `current_vix` sitting unused in scope,
+            # and the exact `or 0` pattern R7 removed from the risk path. One
+            # transient hiccup wrote entry_vix=0 PERMANENTLY: the row poisons
+            # trade_context/meta-label training as a false zero for a real
+            # feature, and _check_thesis_valid's `entry_vix > 0` guard
+            # disarms the vix_spike exit for that position's whole life.
+            # Reuse the value the risk gates already validated; fall back to
+            # the same last-known-good cache _get_vix_lkg maintains; write
+            # NULL (None) if genuinely nothing is known — never a fake 0.
+            _entry_vix = current_vix
+            if _entry_vix is None:
+                _lkg_ctx = getattr(self, "_vix_lkg", None)
+                if _lkg_ctx and (time.time() - _lkg_ctx[1]) <= 2700:
+                    _entry_vix = float(_lkg_ctx[0])
+            if _entry_vix is None:
+                log.warning("entry_vix_unknown_stored_null", trade_id=trade_id)
             self._state.save_trade_context(
                 trade_id=trade_id,
                 direction=signal.direction.value,
                 confidence=confidence,
                 regime=regime_str,
-                vix=await self._market_data.get_vix() or 0,
+                vix=_entry_vix,
                 iv_rank=signal.iv_rank if hasattr(signal, "iv_rank") else 0,
                 sentiment_score=sentiment.composite_score if sentiment and hasattr(sentiment, "composite_score") else 0,
+                # R20: the 11 technical META_FEATURES, captured at entry. This
+                # column was "{}" on every trade ever taken — the meta-labeler
+                # could never train (9/20 features) and every close without it
+                # is training data lost. Snapshot comes from this scan cycle's
+                # feature frame (stashed in _scan_symbol minutes earlier).
+                signals=self._entry_signals_json(signal.symbol),
                 model_version=getattr(self._predictor, "model_version", "") or "",
             )
 
@@ -2541,6 +3059,146 @@ class TradingOrchestrator:
         order.orderRef = trade.trade_id
         return await self._ibkr.place_order(qualified, order)
 
+    def _entry_signals_json(self, symbol: str) -> str:
+        """R20: serialize the 11 technical META_FEATURES for trade_context.
+
+        Values come from the feature row stashed by _scan_symbol this cycle
+        (same frame the ML gates read), plus hour_of_day stamped here. Only
+        finite numerics are written; a missing/stale snapshot degrades to
+        "{}" exactly as before — never blocks an entry.
+        """
+        import json as _json
+        import math as _math
+        try:
+            row = (getattr(self, "_entry_feature_snap", None) or {}).get(symbol)
+            if row is None:
+                return "{}"
+            from ait.ml.meta_label import META_FEATURES
+            out: dict[str, float] = {}
+            for name in META_FEATURES:
+                if name == "hour_of_day":
+                    out[name] = float(datetime.now().hour)
+                    continue
+                if name in getattr(row, "index", ()):
+                    try:
+                        v = float(row[name])
+                        if _math.isfinite(v):
+                            out[name] = round(v, 6)
+                    except (TypeError, ValueError):
+                        pass
+            return _json.dumps(out) if out else "{}"
+        except Exception:  # noqa: BLE001 — telemetry must never block an entry
+            return "{}"
+
+    async def _synthesize_combo_cost(self, qualified_legs: list[dict],
+                                     poll_rounds: int = 4) -> float | None:
+        """W7 (R24 logic-exit-risk-01): build the combo's marketable cost from
+        the FOUR LEG quotes when the BAG contract never ticks.
+
+        Root cause of the 08-31 incident: every one of 63 exits took the
+        no-quote branch (``combo_exit_limit`` appears zero times in any
+        retained log) and was priced off a formula instead of the market,
+        while the ENTRY path's Bag quotes arrive normally. Legs quote
+        reliably, so synthesize: a leg we BUY back costs its ask, a leg we
+        SELL returns its bid. Returns the as-defined cost for the reversed
+        combo (positive = we pay), or None if any leg is unquotable — a
+        partial sum would understate the cost and place an unfillable order.
+        """
+        import math as _m
+        total = 0.0
+        for leg in qualified_legs:
+            contract = leg.get("_contract")
+            if contract is None:
+                return None
+            bid = ask = None
+            try:
+                self._ibkr.ib.reqMktData(contract, "", False, False)
+                for _ in range(poll_rounds):
+                    await asyncio.sleep(0.5)
+                    t = self._ibkr.ib.ticker(contract)
+                    if not t:
+                        continue
+                    b, a = t.bid, t.ask
+                    bid = b if (b is not None and not _m.isnan(b) and b > 0) else None
+                    ask = a if (a is not None and not _m.isnan(a) and a > 0) else None
+                    if bid is not None and ask is not None:
+                        break
+            except Exception as e:  # noqa: BLE001
+                log.debug("leg_quote_failed", error=str(e))
+                return None
+            finally:
+                try:
+                    self._ibkr.ib.cancelMktData(contract)
+                except Exception:  # noqa: BLE001
+                    pass
+            ratio = float(leg.get("ratio", 1) or 1)
+            if str(leg.get("action", "")).upper() == "BUY":
+                # buying this leg back — we pay the offer
+                price = ask if ask is not None else bid
+            else:
+                # selling this leg — we receive the bid
+                price = bid if bid is not None else ask
+            if price is None:
+                log.warning("leg_quote_unavailable",
+                            con_id=leg.get("conId"), action=leg.get("action"))
+                return None
+            total += ratio * (price if str(leg.get("action", "")).upper() == "BUY"
+                              else -price)
+        return round(total, 2)
+
+    def _exit_band_cap(self, trade: TradeRecord) -> float | None:
+        """W7: the acceptable limit IBKR stated when it rejected the previous
+        exit attempt (executor.parse_price_band_reject persists it).
+
+        Pre-W7 the reject reason was discarded and the identical unexecutable
+        limit was re-placed every backoff — 61 of 63 exits on 08-31, a
+        take-profit looping 32 min and 2h55m. Stale entries (>1h) are ignored
+        so an old band cannot pin a later exit in a moved market.
+        """
+        try:
+            import json as _json
+            raw = self._state.get_state(f"exit_band_{trade.trade_id}", "")
+            if not raw:
+                return None
+            blob = _json.loads(raw)
+            at = blob.get("at")
+            if at and (datetime.now()
+                       - datetime.fromisoformat(at)).total_seconds() > 3600:
+                return None
+            band = blob.get("band")
+            if band is None:
+                mkt = blob.get("market")
+                # No explicit band, but the broker named the market price:
+                # a buyback just above it is the marketable, acceptable side.
+                return round(float(mkt) * 1.05, 2) if mkt else None
+            return float(band)
+        except Exception:  # noqa: BLE001 — a bad band must never block an exit
+            return None
+
+    def _exit_price_ceiling(self, mark_cost: float, width: float,
+                            exit_cross: float) -> float:
+        """W7 (R24 logic-exit-risk-01): the most we may pay to buy back a
+        credit structure, anchored to what it is CURRENTLY worth.
+
+        The R16 bound was ``max(2*mark, entry_credit + 0.25*wing_width)``.
+        That second term was meant as a floor for an unreliable mark, but it
+        sits inside a max(), so at the promoted $39-60 wings it DOMINATED:
+        a SPY condor marked at 1.40 priced its take-profit at
+        4.29 + 0.25*39 = 14.04 — ten times the mark. IBKR's price band
+        rejected 61 of 63 exits (the broker's guard was the only thing
+        bounding the price) and the two that filled did so at NBBO by
+        exchange price improvement, not because anything here was correct.
+
+        The wing width stays the structural cap (a deep-ITM condor really is
+        worth ~width). ``mark + exit_cross`` is the floor, so the order
+        remains marketable at a near-worthless buyback.
+        """
+        mult = float(self._settings.exit.exit_mark_multiple)
+        ceiling = max(mark_cost + exit_cross, mult * mark_cost)
+        if width:
+            ceiling = min(width, ceiling)
+        return round(ceiling, 2)
+
     def _marked_cost_to_close(self, trade: TradeRecord) -> float | None:
         """Per-share cost to close a CREDIT structure per the monitor's marks.
 
@@ -2585,9 +3243,16 @@ class TradingOrchestrator:
                 "conId": qualified.conId,
                 "action": close_action,
                 "ratio": leg.get("ratio", 1),
+                # W7: retained so the exit can synthesize a combo quote from
+                # the individual legs when the BAG itself never ticks.
+                "_contract": qualified,
             })
 
-        combo = ContractBuilder.combo(symbol=trade.symbol, legs=qualified_legs)
+        combo = ContractBuilder.combo(
+            symbol=trade.symbol,
+            legs=[{k: v for k, v in l.items() if not k.startswith("_")}
+                  for l in qualified_legs],
+        )
 
         # The legs above are ALREADY reversed, so the combo order must be
         # BUY — IBKR executes a BUY combo's legs exactly as defined, while a
@@ -2671,6 +3336,21 @@ class TradingOrchestrator:
         except Exception as e:
             log.warning("combo_mid_price_failed", error=str(e))
 
+        # W7 (R24 logic-exit-risk-01): the BAG stayed silent on 63 of 63 exits
+        # while the same account quotes legs fine. Synthesize the combo's
+        # marketable cost from the legs rather than falling through to a
+        # formula-priced order.
+        if limit_price is None:
+            synth = await self._synthesize_combo_cost(qualified_legs)
+            if synth is not None:
+                limit_price = round(
+                    synth + EXIT_CROSS if combo_action == "BUY"
+                    else synth - EXIT_CROSS, 2)
+                log.info("combo_exit_limit_from_legs", symbol=trade.symbol,
+                         trade_id=trade.trade_id, synthesized_cost=synth,
+                         action=combo_action, limit_price=limit_price,
+                         note="BAG never ticked; priced from the four legs")
+
         # R13 (market-catastrophe lens): the exit had NO price sanity bound —
         # `ask + cross` with no ceiling, and a MARKET order on a 4-leg BAG
         # exactly when quotes evaporate (executed proof: a $2-wide condor with
@@ -2706,8 +3386,7 @@ class TradingOrchestrator:
         # then the structural cap is all we have (unchanged behavior).
         mark_cost = self._marked_cost_to_close(trade)
         if is_credit and width and limit_price is not None and mark_cost is not None:
-            anchor = round(min(width, max(2.0 * mark_cost,
-                                          float(trade.entry_price or 0) + 0.25 * width)), 2)
+            anchor = self._exit_price_ceiling(mark_cost, width, EXIT_CROSS)
             if limit_price > anchor:
                 log.warning(
                     "combo_exit_limit_capped_at_mark_anchor",
@@ -2736,6 +3415,22 @@ class TradingOrchestrator:
             )
             limit_price = cap
 
+        # W7 (R24 logic-exit-risk-02): the broker told us, on the previous
+        # attempt, the most aggressive price it will accept. Honour it — this
+        # is what turns an endless re-place loop into a converging exit. The
+        # band is a CAP for a BUY-to-close; the exit still has to be at least
+        # marketable, so never drop below the marked cost plus the cross.
+        _band = self._exit_band_cap(trade)
+        if _band is not None and limit_price is not None and limit_price > _band:
+            floor = round((mark_cost or 0.0) + EXIT_CROSS, 2)
+            capped = round(max(min(limit_price, _band), min(floor, _band)), 2)
+            log.warning(
+                "combo_exit_limit_capped_at_broker_band",
+                symbol=trade.symbol, trade_id=trade.trade_id,
+                requested=limit_price, band=_band, capped_to=capped,
+            )
+            limit_price = capped
+
         # NOTE: `is not None`, NOT truthiness. A computed limit of exactly
         # 0.00 is a legitimate, marketable price for a debit close (a dying
         # straddle bid at the cross amount quotes ask=-0.10, +0.10 cross = 0.00
@@ -2756,10 +3451,13 @@ class TradingOrchestrator:
             # persisted leg marks when fresh; the raw width is the LAST
             # resort (marks gone too), unchanged from R13.
             if mark_cost is not None:
-                fallback = round(min(width, max(2.0 * mark_cost,
-                                                float(trade.entry_price or 0) + 0.25 * width)), 2)
+                fallback = self._exit_price_ceiling(mark_cost, width, EXIT_CROSS)
             else:
                 fallback = round(width, 2)
+            _band_fb = self._exit_band_cap(trade)
+            if _band_fb is not None and fallback > _band_fb:
+                fallback = round(max(_band_fb, min(
+                    (mark_cost or 0.0) + EXIT_CROSS, _band_fb)), 2)
             log.critical(
                 "combo_exit_no_quote_pricing_at_wing_width",
                 symbol=trade.symbol, trade_id=trade.trade_id,
@@ -3208,12 +3906,24 @@ class TradingOrchestrator:
         except Exception as e:  # noqa: BLE001 — never let bookkeeping kill a scan
             log.debug("daily_iv_persist_failed", symbol=symbol, error=str(e))
 
-    async def _estimate_iv_rank(self, symbol: str) -> float:
-        """IV rank (0-100). R7: TRUE percentile of today's implied vol in the
+    async def _estimate_iv_rank(self, symbol: str) -> float | None:
+        """IV rank (0-100), or None when it cannot be measured.
+
+        R7: TRUE percentile of today's implied vol in the
         stored daily IV series when >=60 IV observations exist; otherwise the
         old realized-vol min-max proxy, tagged in the logs. Sell-when-IV-is-
         rich is THE premium-seller signal — the proxy measured realized, not
         implied, and the two diverge exactly when the edge is largest.
+
+        fail-direction-05 (R22): every failure path here used to return a
+        fabricated 50.0 — the one value that passes BOTH IV gates — and the
+        proxy's own get_historical call sat outside any try, so its exception
+        was laundered into 50.0 by _scan_symbol's gather. The triggers are
+        normal-op (historical.db locked/stale/corrupt, a yfinance outage),
+        i.e. the bot sold premium as if IV were average during exactly the
+        outages when IV was unknown, and stored 50 as a measurement. Unknown
+        is now None; the caller fails closed for new entries and the journal
+        records NULL instead of a fabricated rank.
         """
         try:
             import sqlite3 as _sq
@@ -3248,30 +3958,57 @@ class TradingOrchestrator:
             log.debug("iv_rank_store_read_failed", symbol=symbol, error=str(_e))
         log.debug("iv_rank_realized_proxy", symbol=symbol,
                   note="stored IV series <60 obs — run IV backfill")
-        hist = await self._market_data.get_historical(symbol, days=252)
+        # fail-direction-05: this fetch used to sit OUTSIDE any try, so its
+        # exception reached the caller's asyncio.gather and became 50.0 there.
+        # Own the failure at the source and report it honestly as "unknown".
+        try:
+            hist = await self._market_data.get_historical(symbol, days=252)
+        except Exception as _e:  # noqa: BLE001
+            log.warning("iv_rank_unavailable", symbol=symbol,
+                        reason=f"proxy_history_raised:{type(_e).__name__}",
+                        detail=str(_e)[:160])
+            return None
         if hist is None or len(hist) < 60:
-            return 50.0
+            log.warning("iv_rank_unavailable", symbol=symbol,
+                        reason="proxy_history_too_short",
+                        rows=0 if hist is None else len(hist))
+            return None
 
-        import numpy as np
-        close = hist["Close"]
-        log_returns = np.log(close / close.shift(1)).dropna()
+        try:
+            import numpy as np
+            close = hist["Close"]
+            log_returns = np.log(close / close.shift(1)).dropna()
 
-        current_vol = float(log_returns.tail(20).std() * np.sqrt(252))
-        rolling_vol = log_returns.rolling(20).std() * np.sqrt(252)
-        rolling_vol = rolling_vol.dropna()
+            current_vol = float(log_returns.tail(20).std() * np.sqrt(252))
+            rolling_vol = log_returns.rolling(20).std() * np.sqrt(252)
+            rolling_vol = rolling_vol.dropna()
+        except Exception as _e:  # noqa: BLE001
+            log.warning("iv_rank_unavailable", symbol=symbol,
+                        reason=f"proxy_compute_raised:{type(_e).__name__}",
+                        detail=str(_e)[:160])
+            return None
 
         if len(rolling_vol) < 2:
-            return 50.0
+            log.warning("iv_rank_unavailable", symbol=symbol,
+                        reason="proxy_vol_history_too_short",
+                        rows=len(rolling_vol))
+            return None
 
         vol_min = float(rolling_vol.min())
         vol_max = float(rolling_vol.max())
         vol_range = vol_max - vol_min
 
         if vol_range <= 0:
-            return 50.0
+            # A flat vol series is a FROZEN/degenerate feed, not "average IV".
+            # Returning 50 here was the same fabrication as the exception
+            # path — it passed both IV gates on data that says nothing.
+            log.warning("iv_rank_unavailable", symbol=symbol,
+                        reason="proxy_degenerate_vol_range",
+                        vol_min=round(vol_min, 6), vol_max=round(vol_max, 6))
+            return None
 
         iv_rank = ((current_vol - vol_min) / vol_range) * 100
-        return max(0, min(100, iv_rank))
+        return max(0.0, min(100.0, float(iv_rank)))
 
     # R14 #9 exit-reject backoff tuning. A fast broker reject reverts the exit
     # order CLOSING->FILLED within seconds, so the monitor re-requests it on the

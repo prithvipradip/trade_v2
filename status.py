@@ -11,8 +11,22 @@ from __future__ import annotations
 import re
 import sqlite3
 import subprocess
+import sys
 from datetime import datetime, date
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+# W3: every "is this a real close?" / "is this position open?" / go-live
+# verdict question is answered by ONE module, shared with the scheduled
+# Telegram scorecard in ait.orchestration.master.  Before W3 the two
+# surfaces computed different numbers from the same database.
+from ait.reporting.go_live import (  # noqa: E402
+    compute_go_live_verdict,
+    format_pace_line,
+    format_verdict_lines,
+    not_real_close_sql,
+    open_trade_status_sql,
+)
 
 ROOT = Path(__file__).resolve().parent
 DB = ROOT / "data" / "ait_state.db"
@@ -61,8 +75,11 @@ def _last_connect() -> str:
 
 
 def _crash_count() -> int:
-    return sum(1 for ln in _tail_lines(LOGS / "bot_stdout.log", 50000)
-               if "Windows fatal exception" in ln)
+    """W6/log-contracts-3: crashes land in logs/fatal.log (the faulthandler
+    sink), NOT bot_stdout.log — this reported 0 while tracebacks piled up.
+    ops_health also distinguishes "no crashes" from "nothing records crashes"."""
+    from ait.monitoring.ops_health import count_native_crashes
+    return count_native_crashes(LOGS / "fatal.log", (LOGS / "bot_stdout.log",))
 
 
 def _keeper_relaunches() -> int:
@@ -78,10 +95,13 @@ def _readonly_recent() -> bool:
 
 
 def _count_event_today(event: str) -> int:
-    today = date.today().isoformat()
-    pat = f'"event": "{event}"'
-    return sum(1 for ln in _tail_lines(LOGS / "ait.log", 60000)
-               if pat in ln and today in ln)
+    """W6/log-contracts-1 + time-authority-1: a fixed tail window missed
+    events rotated away (reporting 0 activity for a bot that predicted 112
+    times), and substring-matching a LOCAL date against UTC stamps bucketed
+    the wrong day. ops_health walks today's rotated backups and buckets by
+    local date."""
+    from ait.monitoring.ops_health import count_events_today
+    return count_events_today(LOGS / "ait.log", (event,)).counts.get(event, 0)
 
 
 def _last_activity() -> str:
@@ -124,11 +144,18 @@ def get_status() -> dict:
         con = sqlite3.connect(DB)
         con.row_factory = sqlite3.Row
         try:
+            # W3 db-contracts-4: "NOT IN ('closed')" also admitted the
+            # TERMINAL statuses cancelled/rejected — three IWM trades
+            # cancelled in July showed here (and on the web dashboard) as
+            # open at $0 for over a month, reporting 5 open positions on a
+            # 2-position book.  Derive from the authority instead:
+            # ait.bot.state.TradeStatus's genuinely-open values.
+            open_sql = open_trade_status_sql("t.status")
             rows = con.execute(
                 "SELECT t.symbol, t.strategy, t.status, t.entry_price, t.entry_time, "
                 "       op.unrealized_pnl, op.pnl_pct, op.mark_time "
                 "FROM trades t LEFT JOIN open_positions op ON op.trade_id = t.trade_id "
-                "WHERE t.status NOT IN ('closed') ORDER BY t.entry_time DESC").fetchall()
+                f"WHERE {open_sql} ORDER BY t.entry_time DESC").fetchall()
         except sqlite3.OperationalError:
             # Pre-migration DB (pnl_pct/mark_time added by the bot's
             # StateManager on first start of new code) — degrade gracefully.
@@ -136,7 +163,8 @@ def get_status() -> dict:
                 "SELECT t.symbol, t.strategy, t.status, t.entry_price, t.entry_time, "
                 "       op.unrealized_pnl, 0 AS pnl_pct, '' AS mark_time "
                 "FROM trades t LEFT JOIN open_positions op ON op.trade_id = t.trade_id "
-                "WHERE t.status NOT IN ('closed') ORDER BY t.entry_time DESC").fetchall()
+                f"WHERE {open_trade_status_sql('t.status')} "
+                "ORDER BY t.entry_time DESC").fetchall()
         out["open_positions"] = [
             {"symbol": r["symbol"], "strategy": r["strategy"], "status": r["status"],
              "entry": r["entry_price"], "since": (r["entry_time"] or "")[:16],
@@ -152,9 +180,10 @@ def get_status() -> dict:
         # of pnl_today/pnl_life -- unlike the go-live scorecard query below,
         # which already had it. Both the CLI and status_server.py's web
         # dashboard read this via get_status().
-        real = ("AND COALESCE(exit_reason_detailed,'') NOT LIKE '%migrated%' "
-                "AND COALESCE(exit_reason_detailed,'') NOT LIKE '%pending%' "
-                "AND COALESCE(exit_reason_detailed,'') NOT LIKE '%never_filled%'")
+        # W3 string-contracts-1/-4: the hand-rolled trio is gone; the shared
+        # authority also excludes the reconciler's $0 "needs manual review"
+        # sentinels, which passed the old filter and booked as real losses.
+        real = not_real_close_sql()
         t = con.execute(f"SELECT COALESCE(SUM(realized_pnl),0),COUNT(*) FROM trades "
                         f"WHERE status='closed' AND exit_time>=? {real}", (today,)).fetchone()
         l = con.execute(f"SELECT COALESCE(SUM(realized_pnl),0),COUNT(*) FROM trades "
@@ -189,26 +218,31 @@ def main() -> None:
     # R5: "lifetime" hid the 2026-07-06 reset (95 broken-P&L trades archived
     # to trades_legacy). Label honestly so nobody reads this as full history.
     print(f"  since 07-06 reset: ${s['pnl_life']:>10,.2f}  ({s['pnl_life_n']} closed; pre-reset archive in trades_legacy)")
-    # R7 go-live scorecard: the five gate criteria at a glance
+    # R7/W3 go-live scorecard: all FIVE of gate 1's criteria, every one
+    # either computed AS PINNED or printed UNAVAILABLE with a reason.
+    # R19d (user decision 2026-08-20): the VERDICT METRIC is IRON CONDOR
+    # closes only. The mission (PLAN line 3) is the IC edge question; the
+    # retired experiments (straddle -575, long calls -132, strangles +378)
+    # answer nothing about it and were drowning the signal - the mixed
+    # record read -$451 at its worst while the condor itself was positive.
+    # The all-strategy line is kept underneath for book-level honesty.
+    # W3: the numbers come from ait.reporting.go_live, the SAME function the
+    # scheduled Friday Telegram scorecard calls - the two surfaces can no
+    # longer disagree about the go/no-go number.
+    print()
     try:
-        import sqlite3 as _sq
-        con = _sq.connect("data/ait_state.db"); con.row_factory = _sq.Row
-        real = ("AND COALESCE(exit_reason_detailed,'') NOT LIKE '%migrated%' "
-                "AND COALESCE(exit_reason_detailed,'') NOT LIKE '%pending%' "
-                "AND COALESCE(exit_reason_detailed,'') NOT LIKE '%never_filled%'")
-        rows = con.execute(f"SELECT realized_pnl FROM trades WHERE status='closed' {real} "
-                           f"ORDER BY COALESCE(exit_time, entry_time)").fetchall()
-        con.close()
-        n = len(rows)
-        gp = sum(r[0] for r in rows if r[0] > 0)
-        gl = abs(sum(r[0] for r in rows if r[0] < 0))
-        pf = "inf" if gl == 0 else f"{gp / gl:.2f}"
-        peak = dd = cum = 0.0
-        for r in rows:
-            cum += r[0]; peak = max(peak, cum); dd = max(dd, peak - cum)
-        print(f"  GO-LIVE GATES: closes {n}/50 | PF {pf} (>1.3) | maxDD ${dd:,.0f}")
-    except Exception:
-        pass
+        v = compute_go_live_verdict(DB)
+        for line in format_verdict_lines(v, indent="  "):
+            print(line)
+        print(format_pace_line(v, indent="  "))
+    except Exception as e:  # noqa: BLE001
+        # W3 policy-vs-impl-5: this block used to be `except Exception: pass`,
+        # so a schema change (or a stale import) silently DELETED the entire
+        # gate readout and the operator saw a status page with no gates on
+        # it at all. Fail LOUD instead.
+        print(f"  !! GATE READOUT FAILED: {type(e).__name__}: {e}")
+        print("  !! the go-live verdict is MISSING, not passing - do not "
+              "read its absence as green.")
     print("\n" + "=" * 56)
 
 

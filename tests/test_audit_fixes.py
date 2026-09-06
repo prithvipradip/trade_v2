@@ -105,6 +105,15 @@ class TestBotManagerSupervision:
         # the function, so patching a master attribute is a no-op.
         import ait.utils.time as _time_mod
         monkeypatch.setattr(_time_mod, "is_market_open", lambda: False)
+        # R20b follow-up: is_market_open() being False isn't sufficient --
+        # health_check()'s marker branch ALSO defers inside R16's post-market
+        # window (close -> close+35min, master._in_post_market_window), a
+        # SECOND independent wall-clock check the fix above doesn't touch.
+        # This test was still flaky in that ~35-minute daily window (observed
+        # failing at 16:16 ET, well after the 9:30-16:00 range the original
+        # comment covers). Pin it too, at its own module (master.py calls
+        # it unqualified, i.e. module-global, not via an attribute import).
+        monkeypatch.setattr(master, "_in_post_market_window", lambda: False)
         mgr._proc = SimpleNamespace(pid=123, poll=lambda: None, returncode=None)
         marker = master.ROOT / "models" / ".retrained"
         marker.write_text("2026-07-07")

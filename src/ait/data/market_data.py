@@ -67,7 +67,16 @@ def load_daily_ohlcv(
     """Load daily OHLCV — IB SQLite store first, Yahoo Finance fallback.
 
     Tries to resample stored 5-min bars to daily OHLCV. Falls back to
-    Yahoo Finance when fewer than 60 trading days are available in the store.
+    Yahoo Finance when the store cannot cover the REQUESTED window.
+
+    research-to-live-01 (R23 register; materialized 2026-08-31): the
+    sufficiency test used to be a fixed ``len(df) < 60``, independent of how
+    much history the caller asked for. The intraday store crossed 60 trading
+    days around 2026-08-26, so from then on every research entry point asking
+    for 730 days silently received ~63 — and the nightly backtest died with a
+    misattributed "No data fetched. Check internet connection." (reports/
+    backtest_20260831_164000.json, exit_code 1). Sufficiency is now measured
+    against the request.
 
     Also left-joins stored IBKR implied_vol snapshots (from daily IV backfill)
     onto the returned DataFrame as an `implied_vol` column. Rows without stored
@@ -86,8 +95,16 @@ def load_daily_ohlcv(
     store = HistoricalDataStore(db_path=db_path or _DEFAULT_DB)
     df = store.resample_to_daily(symbol, days=days)
 
-    if len(df) < 60:
-        log.info("daily_ohlcv_yahoo_fallback", symbol=symbol, ib_rows=len(df))
+    # research-to-live-01: coverage is judged against what was ASKED FOR.
+    # ~252 trading days per calendar year; require 80% of the expected span
+    # (weekends/holidays//partial backfills make an exact match unrealistic)
+    # and keep the original absolute floor for short requests.
+    _expected = max(1, int(days * 252 / 365))
+    _needed = max(60, int(_expected * 0.8))
+    if len(df) < _needed:
+        log.info("daily_ohlcv_yahoo_fallback", symbol=symbol, ib_rows=len(df),
+                 requested_days=days, expected_trading_days=_expected,
+                 needed=_needed)
         try:
             start = (date.today() - timedelta(days=days + 30)).isoformat()
             ydf = yf.Ticker(symbol).history(start=start, interval="1d", auto_adjust=False)
@@ -97,8 +114,18 @@ def load_daily_ohlcv(
             log.warning("yahoo_fallback_failed", symbol=symbol, error=str(exc))
             if df.empty:
                 return pd.DataFrame()
+        # research-to-live-01: a SHORT result must never look like a healthy
+        # one — a study silently run on 63 days of history is worse than a
+        # study that refuses to run.
+        if len(df) < _needed:
+            log.warning("daily_ohlcv_coverage_short", symbol=symbol,
+                        rows=len(df), requested_days=days, needed=_needed,
+                        note="both the IB store and Yahoo came up short; "
+                             "research results on this frame are not "
+                             "representative of the requested window")
     else:
-        log.info("daily_ohlcv_from_ib_store", symbol=symbol, rows=len(df))
+        log.info("daily_ohlcv_from_ib_store", symbol=symbol, rows=len(df),
+                 requested_days=days)
 
     if df.empty:
         return df

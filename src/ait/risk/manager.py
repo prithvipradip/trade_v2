@@ -401,7 +401,18 @@ class RiskManager:
             # book stay fully short premium into a rising-vol regime. Tiers:
             # VIX<20 -> 6, VIX<25 -> 4, else 2 (config remains the ceiling).
             # request.vix is guaranteed > 0 here (fail-closed gate above).
-            _vix_tier_cap = 6 if request.vix < 20 else (4 if request.vix < 25 else 2)
+            # R20 (register): tiers now live in config (risk.credit_cap_vix_tiers)
+            # with the historical values as the default — behavior unchanged.
+            # R20b review follow-up: the no-match fallback used to be a
+            # hardcoded literal 2. Validation permits a tier table whose
+            # final ceiling is below credit_vix_halt, so requests above that
+            # ceiling would silently use 2 regardless of the configured last
+            # tier's cap. Fall back to the last configured tier's cap instead
+            # so config remains authoritative.
+            _tiers = self._risk_config.credit_cap_vix_tiers
+            _vix_tier_cap = next(
+                (int(cap) for ceiling, cap in _tiers
+                 if request.vix < float(ceiling)), int(_tiers[-1][1]))
             _credit_cap = min(self._risk_config.max_credit_positions, _vix_tier_cap)
             n_credit = sum(
                 1 for p in self._open_positions
@@ -525,16 +536,24 @@ class RiskManager:
                 f"portfolio cap ${portfolio_cap:.0f}",
             )
 
-        # 6c. Concentration limit — no more than 20% of account in one symbol
+        # 6c. Concentration limit — no more than risk.max_symbol_concentration_pct
+        # of account in one symbol (config-backed, default 20%)
         # R17: was summing market_value (credit collected for credit
         # strategies, not real risk) -- now the same max_loss/backfill
         # sourcing gate 6b-2's aggregate cap uses.
         symbol_exposure = self._symbol_capital_at_risk(request.symbol)
-        if (symbol_exposure + estimated_cost) > account_value * 0.20:
+        if (symbol_exposure + estimated_cost) > account_value * self._risk_config.max_symbol_concentration_pct:
             return TradeValidation(
                 False,
                 f"symbol concentration: {request.symbol} exposure "
-                f"${symbol_exposure + estimated_cost:.0f} exceeds 20% of ${account_value:.0f}",
+                f"${symbol_exposure + estimated_cost:.0f} exceeds "
+                # R20b review follow-up: was a hardcoded "20%" literal even
+                # though the threshold itself already reads the configured
+                # max_symbol_concentration_pct above -- the rejection reason
+                # (logged + persisted into counterfactual/skip records) would
+                # misreport the actual gate an operator configured.
+                f"{self._risk_config.max_symbol_concentration_pct:.0%} of "
+                f"${account_value:.0f}",
             )
 
         # 7. Portfolio delta limit

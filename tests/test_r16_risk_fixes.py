@@ -85,9 +85,15 @@ class TestMtmVerdictScopedToItsOwnTrip:
     def test_mtm_reason_still_clears_on_daily_reset(self):
         # R15 #3 regression guard: the token must keep matching
         # check_daily_reset's 'daily_loss' untrip matcher.
+        # R20b follow-up: date.today() is naive/UTC-local; check_daily_reset()
+        # is deliberately ET-pinned (now_et().date(), "deep-audit SR-M5") --
+        # they disagree for ~4-5h/day (UTC midnight -> ET midnight), which
+        # made this "yesterday" simulation land on today-in-ET during that
+        # window. Match the code under test's own time reference.
+        from ait.utils.time import now_et
         b = self._breaker()
         assert b.check_daily_loss_mtm(-9900.0, 198_000.0) is True
-        b._last_reset_date = date.today() - timedelta(days=1)
+        b._last_reset_date = now_et().date() - timedelta(days=1)
         b.check_daily_reset()
         assert b._tripped is False
 
@@ -138,13 +144,17 @@ class TestCircuitBreakerRestartPersistence:
         assert b2._consecutive_losses == 0
 
     def test_stale_day_rolls_over_on_load(self):
+        # R20b follow-up: date.today() (naive/UTC-local) vs the breaker's own
+        # ET-pinned "today" (now_et().date()) disagree for ~4-5h/day (UTC
+        # midnight -> ET midnight) -- see test_mtm_reason_still_clears_on_daily_reset.
+        from ait.utils.time import now_et
         st = _FakeState()
         b1 = CircuitBreaker(_risk_cfg(), state=st)
         for _ in range(3):
             b1.record_trade_result(-100.0)
         # rewrite the blob as if it were written yesterday
         blob = json.loads(st.kv[CircuitBreaker.STATE_KEY])
-        blob["date"] = (date.today() - timedelta(days=1)).isoformat()
+        blob["date"] = (now_et().date() - timedelta(days=1)).isoformat()
         st.kv[CircuitBreaker.STATE_KEY] = json.dumps(blob)
 
         b2 = CircuitBreaker(_risk_cfg(), state=st)
@@ -167,9 +177,18 @@ class TestCircuitBreakerRestartPersistence:
         assert b._consecutive_losses == 1
 
     def test_corrupt_blob_is_survivable(self):
+        # W1 (R23 fail-direction-10): contract CHANGED from fail-open to
+        # fail-closed. An unreadable/corrupt store could be hiding an ACTIVE
+        # 3-loss pause, so the breaker now trips conservatively for one
+        # configured pause window (resume timer auto-lifts it) instead of
+        # starting fresh and silently clearing that pause. Survivable still
+        # means "the bot runs" — it just pauses entries first.
         st = _FakeState({CircuitBreaker.STATE_KEY: "{not json"})
         b = CircuitBreaker(_risk_cfg(), state=st)
-        assert b._consecutive_losses == 0 and b.is_tripped is False
+        assert b._consecutive_losses == 0
+        assert b.is_tripped is True
+        assert b._trip_reason == "state_unreadable_fail_closed"
+        assert b._resume_time > 0  # bounded: auto-resumes, never stuck
 
     def test_risk_manager_wires_persistence(self):
         # The orchestrator builds the breaker without a state handle
@@ -276,7 +295,10 @@ class TestAggregateRiskBackfill:
                                          max_portfolio_risk_pct=0.03,
                                          max_portfolio_delta=0.30)
         rm._risk_config = _risk_cfg(max_position_risk_pct=0.03,
-                                    credit_vix_halt=28.0, max_credit_positions=6)
+                                    credit_vix_halt=28.0, max_credit_positions=6,
+                                    # R20: config-backed since the register migration
+                                    credit_cap_vix_tiers=[[20.0, 6], [25.0, 4], [999.0, 2]],
+                                    max_symbol_concentration_pct=0.20)
         cb = MagicMock()
         cb.is_tripped = False
         cb.check_daily_loss.return_value = True

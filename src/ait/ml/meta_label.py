@@ -453,19 +453,44 @@ class MetaLabeler:
         Returns:
             DataFrame ready for training.
         """
+        import json as _json
         import sqlite3
 
+        # W3 string-contracts-1/-4: this query used to be a bare
+        # "WHERE t.status = 'closed'" while all 8 sibling consumers filtered
+        # out non-real closes — so the trainer learned from $0 rows for
+        # signals that NEVER FILLED (6 of 23 rows = 26% of the set, 43% of
+        # the negative class on the 2026-08-25 book), teaching the entry gate
+        # that those entry-feature contexts lose, and inflating the
+        # MIN_TRADES_FOR_TRAINING arming count with fabricated labels. The
+        # reconciler's $0 "needs manual review" sentinels are excluded by the
+        # same authority.
+        from ait.reporting.go_live import not_real_close_sql
+
         rows = []
+        # Legacy rows with no captured snapshot (entry_signals == '{}') must
+        # NOT be back-filled with the same fixed defaults for every row —
+        # that fabricates artificial variance once even a single real
+        # snapshot differs, letting the coverage guard in train() arm on
+        # mostly-imputed data. Preserve these as NaN instead so
+        # nunique(dropna=True) only reflects genuinely captured values.
+        _nan = float("nan")
+
+        def _sig(sig: dict, key: str, default):
+            return sig.get(key, default) if sig else _nan
+
         with sqlite3.connect(state_manager._db_path) as conn:
             conn.row_factory = sqlite3.Row
             # Join trades with their entry context
-            results = conn.execute("""
+            results = conn.execute(f"""
                 SELECT t.trade_id, t.realized_pnl, t.entry_time,
                        c.entry_direction, c.entry_confidence, c.entry_regime,
-                       c.entry_vix, c.entry_iv_rank, c.entry_sentiment_score
+                       c.entry_vix, c.entry_iv_rank, c.entry_sentiment_score,
+                       c.entry_signals
                 FROM trades t
                 JOIN trade_context c ON t.trade_id = c.trade_id
                 WHERE t.status = 'closed'
+                      {not_real_close_sql("t.exit_reason_detailed")}
                 ORDER BY t.entry_time
             """).fetchall()
 
@@ -478,6 +503,18 @@ class MetaLabeler:
             except (ValueError, TypeError):
                 pass
 
+            # R20b review follow-up: entry_signals stores the 11 technical
+            # META_FEATURES snapshotted at entry (_entry_signals_json). Parse
+            # it so training uses the full 20-feature space instead of only
+            # the 9 scalar context columns selected above — the coverage
+            # guard (test_r20_research_validity) requires all META_FEATURES.
+            try:
+                sig = _json.loads(r.get("entry_signals") or "{}")
+            except (TypeError, ValueError):
+                sig = {}
+            if not isinstance(sig, dict):
+                sig = {}
+
             regime = r.get("entry_regime", "")
             rows.append({
                 "primary_confidence": r.get("entry_confidence", 0),
@@ -488,7 +525,18 @@ class MetaLabeler:
                 "vix": r.get("entry_vix", 0),
                 "iv_rank": r.get("entry_iv_rank", 0),
                 "sentiment_score": r.get("entry_sentiment_score", 0),
+                "rsi_14":               _sig(sig, "rsi_14", 50.0),
+                "rsi_7":                _sig(sig, "rsi_7", 50.0),
+                "bb_position":          _sig(sig, "bb_position", 0.5),
+                "volume_sma_20_ratio":  _sig(sig, "volume_sma_20_ratio", 1.0),
+                "realized_vol_20":      _sig(sig, "realized_vol_20", 0.20),
+                "atr_pct":              _sig(sig, "atr_pct", 0.01),
+                "weekly_trend_aligned": _sig(sig, "weekly_trend_aligned", 0.5),
+                "volume_confirmation":  _sig(sig, "volume_confirmation", 0.0),
                 "hour_of_day": entry_hour,
+                "macd_hist":            _sig(sig, "macd_hist", 0.0),
+                "price_vs_sma_20":      _sig(sig, "price_vs_sma_20", 0.0),
+                "sma_10_20_cross":      _sig(sig, "sma_10_20_cross", 0.5),
                 "profitable": 1 if r["realized_pnl"] > 0 else 0,
             })
 

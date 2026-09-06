@@ -7,6 +7,7 @@ Calculates Greeks using py_vollib for proper Black-Scholes pricing.
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 from functools import lru_cache
 from dataclasses import dataclass
@@ -28,6 +29,35 @@ log = get_logger("data.options")
 # ~50x error in expected_move and garbage-sigma deltas. Any IV below this
 # floor is non-physical for the traded universe and is treated as MISSING.
 MIN_PHYSICAL_IV = 0.005
+
+# fail-direction-06-liquidity-gate-passes-quoteless-contracts /
+# external-contracts-02-zero-quote-reads-as-max-liquidity (blind-spot hunt
+# 2026-08-25): a contract with NO live two-sided market used to score the
+# TIGHTEST spread in the chain. bid/ask arrive as 0.0 whenever the NBBO ticks
+# miss the snapshot window (the coercion in _fetch_ibkr_chain below) or as NaN
+# straight off ib_insync, and (ask - bid) / mid then collapsed to
+# (0 - 0) / last = 0.0 — so on this profile (min_volume=0, min_oi=10 with the
+# IBKR unknown-OI carve-out, i.e. the spread is the ONLY active criterion) a
+# phantom quote outranked every real market and its stale `last` print flowed
+# into condor credit math. No quote means spread-UNKNOWN, and unknown fails
+# CLOSED: +inf loses to any threshold a config or env override can set,
+# including one >= 1.0.
+ILLIQUID_SPREAD_PCT = float("inf")
+
+
+def _real_quote(value) -> bool:
+    """True only for a finite, strictly-positive quote side.
+
+    NaN is what ib_insync hands back for "no tick yet", and every NaN
+    comparison is False — so `bid > 0` reads a missing quote as "not positive"
+    in one place while arithmetic silently propagates it in another. One
+    predicate, shared by mid / spread_pct / is_liquid / filter_liquid.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(v) and v > 0.0
 
 
 def _parse_env_override(raw: str | None, cast, default):
@@ -137,16 +167,42 @@ class OptionContract:
     source: str = "ibkr"
 
     @property
+    def has_two_sided_quote(self) -> bool:
+        """A real market on BOTH sides — the precondition for any spread math.
+
+        fail-direction-06: without it a quote-less contract (bid/ask 0.0 or
+        NaN) carrying a stale `last` print reads as the most liquid contract
+        in the chain, and that fossil price becomes the condor's credit.
+        """
+        return _real_quote(self.bid) and _real_quote(self.ask)
+
+    @property
     def mid(self) -> float:
-        if self.bid > 0 and self.ask > 0:
+        if self.has_two_sided_quote:
             return (self.bid + self.ask) / 2
-        return self.last
+        # Quote-less: `last` is a stale print, not a market. It stays the
+        # pricing fallback it has always been (callers that need a number get
+        # one), but such a contract is now rejected by is_liquid /
+        # filter_liquid before it can ever be selected as a leg. NaN `last`
+        # reads as no price rather than propagating into arithmetic.
+        return float(self.last) if _real_quote(self.last) else 0.0
 
     @property
     def spread_pct(self) -> float:
-        if self.mid <= 0:
-            return 1.0  # Treat as illiquid
-        return (self.ask - self.bid) / self.mid
+        # fail-direction-06 / external-contracts-02: no quote is spread-
+        # UNKNOWN, never spread-zero. Pre-fix, bid=ask=0 with last=2.50
+        # returned 0.000 — tighter than every genuinely quoted contract.
+        if not self.has_two_sided_quote:
+            return ILLIQUID_SPREAD_PCT
+        mid = self.mid
+        if not math.isfinite(mid) or mid <= 0:
+            return ILLIQUID_SPREAD_PCT
+        spread = (self.ask - self.bid) / mid
+        if not math.isfinite(spread) or spread < 0:
+            # A crossed book (ask < bid) is degenerate, not "tighter than
+            # zero" — same fail direction as the quote-less case.
+            return ILLIQUID_SPREAD_PCT
+        return spread
 
     @property
     def dte(self) -> int:
@@ -157,6 +213,11 @@ class OptionContract:
         # Env-tunable so we can loosen on paper / delayed-data accounts where
         # `volume` is often 0 because it's a live tick stream we don't get.
         min_vol, min_oi, max_spread = _liquidity_thresholds()
+        # fail-direction-06: fail CLOSED on a missing/degenerate quote. This
+        # is an explicit gate rather than a side effect of spread_pct alone so
+        # the intent survives any later edit to the spread math.
+        if not self.has_two_sided_quote:
+            return False
         # open_interest==0 means UNKNOWN on the IBKR realtime path (no OI
         # tick) — treating unknown as illiquid rejected every IBKR contract
         # (audit R2/C2). Enforce the OI floor only when OI is reported.
@@ -327,6 +388,26 @@ class OptionsChain:
         passes settings.options); None resolves the loaded settings.
         """
         min_vol, min_oi, max_spread = _resolve_liquidity(config)
+        # fail-direction-06 / external-contracts-02: quote-less contracts are
+        # dropped here, and the drop is VISIBLE. Pre-fix they were not merely
+        # kept — with spread_pct 0.0 they were the best-ranked contracts in
+        # the chain, silently, during exactly the farm-reconnect / no-NBBO
+        # stretches that produce them.
+        quoteless = sum(
+            1 for c in list(self.calls) + list(self.puts)
+            if not c.has_two_sided_quote
+        )
+        if quoteless:
+            log.warning(
+                "chain_quoteless_contracts_dropped",
+                symbol=self.symbol,
+                expiry=str(self.expiry),
+                contracts=quoteless,
+                total=len(self.calls) + len(self.puts),
+                note="no two-sided market (bid/ask missing, zero or NaN); "
+                     "these used to pass the liquidity filter as the tightest "
+                     "spread in the chain and price legs off a stale last",
+            )
         return OptionsChain(
             symbol=self.symbol,
             underlying_price=self.underlying_price,
@@ -336,14 +417,16 @@ class OptionsChain:
             calls=[
                 c
                 for c in self.calls
-                if c.volume >= min_vol
+                if c.has_two_sided_quote
+                and c.volume >= min_vol
                 and ((c.open_interest <= 0 and c.source == "ibkr") or c.open_interest >= min_oi)
                 and c.spread_pct <= max_spread
             ],
             puts=[
                 p
                 for p in self.puts
-                if p.volume >= min_vol
+                if p.has_two_sided_quote
+                and p.volume >= min_vol
                 and ((p.open_interest <= 0 and p.source == "ibkr") or p.open_interest >= min_oi)
                 and p.spread_pct <= max_spread
             ],

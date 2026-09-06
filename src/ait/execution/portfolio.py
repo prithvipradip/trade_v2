@@ -21,6 +21,11 @@ from ait.bot.state import StateManager, TradeRecord, TradeStatus
 from ait.broker.ibkr_client import IBKRClient
 from ait.strategies.base import CREDIT_STRATEGIES
 from ait.config.settings import ExitConfig
+from ait.execution.exit_policy import (
+    EXPIRY_APPROACHING_DTE,
+    macro_flatten_window_days,
+    take_profit_targets,
+)
 from ait.data.market_data import MarketDataService
 from ait.data.quality import DataQualityValidator
 from ait.risk.circuit_breaker import CircuitBreaker
@@ -90,6 +95,10 @@ class PortfolioManager:
         self._last_quote_ts: dict[str, datetime] = {}   # symbol -> last tick time
         self._frozen_alerted: set[str] = set()
         self._touch_confirm: dict[str, int] = {}        # trade_id -> agreeing ticks
+        # fail-direction-04: once-per-outage latch for a touch stop that is
+        # RAISING instead of evaluating (same shape as _frozen_alerted, keyed
+        # by trade because the failure is per position, not per feed).
+        self._touch_fail_alerted: set[str] = set()
 
     MARKS_MISSING_ALERT_TICKS = 10  # ~5 min at the 30s fast-monitor cadence
 
@@ -210,6 +219,43 @@ class PortfolioManager:
                 f"agreeing ticks. Check the market-data feed ({trade_id})."
             )
         except Exception:  # noqa: BLE001
+            pass
+
+    async def _alert_touch_stop_failed(self, trade, error: Exception) -> None:
+        """Page ONCE per outage: the touch stop is not evaluating at all.
+
+        fail-direction-04 (blind-spot hunt 2026-08-25): the touch-stop block's
+        except swallowed every exception at log.debug. The flat credit stop
+        defaults to DISABLED (AIT_CREDIT_LOSS_LIMIT contract default "0", see
+        the is_credit branch below), so on a credit structure the short-strike
+        touch is the ONLY loss exit — a swallowed exception silently switches
+        loss protection off for the life of the trade, re-failing every 30s
+        tick with nothing but a DEBUG line in a rotating file.
+
+        Throttled like _alert_frozen_feed: a 30s monitor must not page every
+        tick. The latch clears when the block next evaluates cleanly, so a
+        LATER outage pages again. Never raises — it runs inside an except
+        handler, and an exception here would abort check_positions' loop and
+        take every OTHER position's exit evaluation down with it.
+        """
+        try:
+            alerted = getattr(self, "_touch_fail_alerted", None)
+            if alerted is None:
+                alerted = self._touch_fail_alerted = set()
+            if trade.trade_id in alerted:
+                return
+            alerted.add(trade.trade_id)
+            notify = getattr(self, "_notify_cb", None)
+            if not notify:
+                return
+            await notify(
+                f"TOUCH STOP NOT EVALUATING: {trade.symbol} {trade.strategy} "
+                f"({trade.trade_id}) — the short-strike touch check raised "
+                f"{type(error).__name__}: {error}. This is the only loss exit "
+                f"on a credit structure; the position now has DTE/expiry exits "
+                f"only. Check the trade's legs data."
+            )
+        except Exception:  # noqa: BLE001 — an alert must never break exits
             pass
 
     async def check_positions(self) -> list[PositionStatus]:
@@ -494,8 +540,12 @@ class PortfolioManager:
         #    WHERE symbol = :symbol
         #      AND status = 'CLOSED'
         #      AND (exit_reason_detailed LIKE '%stop_loss%'
-        #           OR notes LIKE '%stop_loss%')
+        #           OR exit_reason_detailed LIKE '%short_strike_touch%')
         #      AND exit_time >= :cutoff_iso
+        # (2026-08-25: short_strike_touch added — the touch stop below is the
+        #  primary loss exit and its reason string does NOT contain
+        #  'stop_loss'; the 08-24 QQQ re-entry 13 min after a touch stop was
+        #  this mismatch. Authority: TradingOrchestrator._post_stop_cooldown_until.)
         # where :cutoff_iso = start (09:30 ET) of the PREVIOUS trading day if
         # now is during RTH, i.e. block while exit_time falls within the
         # current or immediately preceding trading session; weekends/holidays
@@ -596,8 +646,36 @@ class PortfolioManager:
                         # touch-confirmation streak that the 30s monitor had
                         # been accumulating — the report deciding an exit.
                         confirms.pop(trade.trade_id, None)
+                # fail-direction-04: the block evaluated. Clear the page latch
+                # so a LATER failure counts as a new outage (alert STATE, so
+                # persist-guarded exactly like the streak above).
+                if persist:
+                    _tf_ok = getattr(self, "_touch_fail_alerted", None)
+                    if _tf_ok:
+                        _tf_ok.discard(trade.trade_id)
             except Exception as _e:  # noqa: BLE001 — protection, never a crash source
-                log.debug("touch_check_failed", trade_id=trade.trade_id, error=str(_e))
+                # fail-direction-04: this was log.debug, and nothing else. The
+                # touch stop is the ONLY loss exit on credit structures (the
+                # flat credit stop is disabled by contract default), so any
+                # exception here disables loss protection for the life of the
+                # trade — invisibly, on every 30s tick. Surface it as an ERROR
+                # and page once per outage; the except still stands so ONE bad
+                # trade row cannot kill check_positions' loop over the others.
+                log.error(
+                    "touch_stop_evaluation_failed",
+                    trade_id=trade.trade_id,
+                    symbol=trade.symbol,
+                    strategy=trade.strategy,
+                    error=str(_e),
+                    error_type=type(_e).__name__,
+                    note="short-strike touch stop did not evaluate — this is "
+                         "the only loss exit on a credit structure; DTE and "
+                         "expiry exits are all that remain for this position",
+                )
+                if persist:
+                    # A4 report invariant: a read-only summary pass must not
+                    # fire alerts (nor consume the once-per-outage page).
+                    await self._alert_touch_stop_failed(trade, _e)
 
         # 2. Take profit (time-decay adjusted) — needs real marks
         # R13-CRIT-2: this was `elif`, chained to the R12 touch-stop `if`
@@ -650,7 +728,7 @@ class PortfolioManager:
         # the 14-DTE entry floor implies every position gets >=9 calendar
         # days of theta runway — do NOT lower dte_range[0] below ~10 without
         # revisiting this exit, or entries become forced-exit churn again.
-        elif not should_exit and dte is not None and dte <= 5:
+        elif not should_exit and dte is not None and dte <= EXPIRY_APPROACHING_DTE:
             should_exit = True
             exit_reason = f"expiry_approaching (DTE: {dte})"
 
@@ -713,19 +791,20 @@ class PortfolioManager:
         # event — the wings cap a surprise, and the post-event vol crush is
         # the trade's payoff; flattening at d2e<=1 sold the insurance and
         # refused the premium. Undefined-risk keeps the early exit.
+        # R20 #5a follow-up: strategy list + per-strategy window (5 for
+        # strangle-class, 1 for CSP/CC) now come from exit_policy.py's
+        # MACRO_FLATTEN_WINDOW_DAYS — the single source the research engine
+        # already reads, instead of a hand-copied tuple+conditional here.
+        _evt_window = macro_flatten_window_days(trade.strategy)
         if (contract_flag("AIT_SKIP_MACRO_EVENTS")
                 and not should_exit and self._economic_cal
-                and trade.strategy in (
-                    "short_strangle",
-                    "cash_secured_put", "covered_call",
-                )):
+                and _evt_window is not None):
             try:
                 days_to_event = self._economic_cal.days_until_next_event()
                 # R6 (user-approved): undefined-risk (strangles) exits EARLY
                 # — a Thu/Fri close ahead of a Mon/Tue event avoids carrying
                 # naked weekend gap risk for ~2 sessions of residual theta.
                 # Defined-risk keeps the tight window (wings cap the gap).
-                _evt_window = 5 if trade.strategy == "short_strangle" else 1
                 if days_to_event is not None and days_to_event <= _evt_window:
                     should_exit = True
                     exit_reason = f"macro_event_flatten (days_to_event={days_to_event})"
@@ -850,17 +929,11 @@ class PortfolioManager:
               open orders (survives restarts; ties into Tier A1's tracker
               rebuild).
         """
-        if not self._exit_config.time_decay_scaling or dte is None:
-            return 1.0, 0.50  # Default: +100% long, +50% short
-
-        if dte > 20:
-            return 1.0, 0.50
-        elif dte > 10:
-            return 0.75, 0.40
-        elif dte > 5:
-            return 0.50, 0.30
-        else:
-            return 0.25, 0.20  # Very aggressive — grab what you can
+        # R20 #5a follow-up: was an inline copy of the ladder now owned by
+        # exit_policy.py (the research engine already reads it from there) —
+        # kept in sync only by test_r20_research_validity.py's parity check.
+        # Wired directly so there is one implementation, not two verified-equal.
+        return take_profit_targets(dte, self._exit_config.time_decay_scaling)
 
     def _check_partial_exit(
         self,

@@ -49,9 +49,24 @@ if errorlevel 1 (
     REM R6: external dead-man ping. Create a check at healthchecks.io and put
     REM its ping URL (one line) in data\deadman_url.txt -- the service alerts
     REM when pings STOP: machine off, hard reboot at logon screen, keeper
-    REM dead, or bot down. Pinged ONLY while the orchestrator is alive.
+    REM dead, or bot down.
+    REM W6/bot-day-02: the ping used to fire whenever the PROCESS existed, so
+    REM it attested the SUPERVISOR was alive -- not that the bot was working.
+    REM A Telegram-dead + gateway-down outage produced a green external
+    REM monitor for hours while positions sat unmanaged. Now gated on real
+    REM liveness evidence (heartbeat within 900s = 30 missed beats, RTH only,
+    REM post-open warmup) -- the SAME threshold master.py already uses for
+    REM bot_hung_heartbeat_stale, so this adds no new alert surface.
+    REM Not-alive sends /fail so the check alerts now instead of waiting out
+    REM its grace period.
     if exist data\deadman_url.txt (
-        for /f "usebackq delims=" %%u in ("data\deadman_url.txt") do curl.exe -fsS -m 10 "%%u" >nul 2>&1
+        %PY% -m ait.monitoring.ops_health liveness >nul 2>&1
+        if errorlevel 1 (
+            for /f "usebackq delims=" %%u in ("data\deadman_url.txt") do curl.exe -fsS -m 10 "%%u/fail" >nul 2>&1
+            echo [keeper] %date% %time% deadman: bot NOT demonstrably alive - sent /fail >> logs\keeper.log
+        ) else (
+            for /f "usebackq delims=" %%u in ("data\deadman_url.txt") do curl.exe -fsS -m 10 "%%u" >nul 2>&1
+        )
     )
 )
 REM R16: `timeout /t` needs an interactive console input handle. In some

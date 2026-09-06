@@ -19,7 +19,13 @@ def _manager(net_liq=200_000.0, open_positions=None):
     pos_config = MagicMock(max_open_positions=5, max_position_pct=0.05,
                            max_portfolio_delta=1.0, max_portfolio_risk_pct=0.20)
     risk_config = MagicMock(min_confidence=0.50, max_position_risk_pct=0.10,
-                            max_credit_positions=6, credit_vix_halt=28.0)
+                            max_credit_positions=6, credit_vix_halt=28.0,
+                            # R20: fields the manager now reads from config —
+                            # a bare MagicMock here made `account_value * mock`
+                            # raise and the tier-iteration fall to its default,
+                            # failing 5 tests for FIXTURE reasons, not code.
+                            credit_cap_vix_tiers=[[20.0, 6], [25.0, 4], [999.0, 2]],
+                            max_symbol_concentration_pct=0.20)
     account = MagicMock()
     account.get_net_liquidation = AsyncMock(return_value=net_liq)
     account.can_afford = AsyncMock(return_value=True)

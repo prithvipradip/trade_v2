@@ -1149,9 +1149,11 @@ def daily_digest():
         if src.exists():
             con = _sq.connect(str(src))
             today = datetime.now().strftime("%Y-%m-%d")
-            real = ("AND COALESCE(exit_reason_detailed,'') NOT LIKE '%migrated%' "
-                    "AND COALESCE(exit_reason_detailed,'') NOT LIKE '%pending%' "
-                    "AND COALESCE(exit_reason_detailed,'') NOT LIKE '%never_filled%'")  # R8: NULL-safe like sibling sites
+            # R8: NULL-safe. W3 string-contracts-1/-4: the hand-rolled
+            # trio is replaced by the ONE shared authority, which also
+            # excludes the reconciler's $0 needs-manual-review sentinels.
+            from ait.reporting.go_live import not_real_close_sql
+            real = not_real_close_sql()
             t = con.execute(
                 f"SELECT COUNT(*), COALESCE(SUM(realized_pnl),0) FROM trades "
                 f"WHERE status='closed' AND exit_time LIKE ?||'%' {real}",
@@ -1230,85 +1232,86 @@ def _max_concurrent_car(rows) -> float:
     trades' [entry_time, exit_time) windows — the economically meaningful
     drawdown denominator (what was actually at risk when the loss happened).
 
-    Event-sweep: +car at entry, -car at exit (open trades never subtract).
-    Rows without a positive car contribute nothing — the D1 backfill filled
-    all derivable ones, and the referee flags coverage holes.
+    W3: the implementation now lives in ait.reporting.go_live so status.py's
+    verdict and this scorecard share one definition; this stays as the
+    row-shaped adapter (sqlite3.Row / dict) the scorecard and
+    tests/test_d2_concurrent_risk.py call.
     """
-    ev = []
-    for r in rows:
-        car = r["car"] if "car" in r.keys() else 0
-        if not car or car <= 0:
-            continue
-        ev.append((r["entry_time"] or "", +car))
-        ev.append((r["exit_time"] or "9999", -car))
-    peak = cur = 0.0
-    for _, d in sorted(ev):
-        cur += d
-        peak = max(peak, cur)
-    return peak
+    from ait.reporting.go_live import max_concurrent_car
+
+    def _car(r):
+        try:
+            return r["car"] if "car" in r.keys() else 0
+        except AttributeError:      # plain dict
+            return r.get("car", 0)
+
+    return max_concurrent_car(
+        [(r["entry_time"], r["exit_time"], _car(r)) for r in rows])
 
 
 def weekly_scorecard():
-    """R7: go-live-gate scorecard to Telegram (Friday 16:10 ET). The five
-    gate criteria, computed since the 2026-07-06 reset, on real closes only.
-    DD is reported vs max concurrent DEPLOYED RISK, not paper NLV (a 100%
-    loss of deployed risk used to read as ~2% 'drawdown')."""
+    """R7/W3: go-live-gate scorecard to Telegram (Friday 16:10 ET).
+
+    W3 (money-flow-04 / policy-vs-impl-1/-2/-3/-5): this SCHEDULED surface is
+    the one the operator actually receives, and it used to grade the RETIRED
+    all-strategy metric while the pinned R19d verdict metric (IRON CONDOR
+    closes only) lived solely in status.py — on the live book the two sat on
+    opposite sides of the PF>1.3 gate. It now calls the SAME
+    ait.reporting.go_live.compute_go_live_verdict() status.py calls and
+    renders the SAME format_verdict_lines(), so a divergence between the two
+    operator surfaces is no longer expressible. The all-strategy book-level
+    line is kept underneath, clearly labelled as book honesty, exactly as
+    status.py presents it.
+
+    Every one of gate 1's five criteria is either computed AS PINNED or
+    printed UNAVAILABLE with a reason — never a differently-defined number
+    wearing the gate's label (the old message rendered a LIFETIME DOLLAR MEAN
+    of |fill - mid| under the label "gate: median <=8% of credit").
+    """
     import sqlite3 as _sq
+    from ait.reporting.go_live import (
+        compute_go_live_verdict,
+        format_pace_line,
+        format_verdict_lines,
+        not_real_close_sql,
+    )
     try:
         src = DATA_DIR / "ait_state.db"
         if not src.exists():
             return
-        con = _sq.connect(str(src)); con.row_factory = _sq.Row
-        real = ("AND COALESCE(exit_reason_detailed,'') NOT LIKE '%migrated%' "
-                "AND COALESCE(exit_reason_detailed,'') NOT LIKE '%pending%' "
-                "AND COALESCE(exit_reason_detailed,'') NOT LIKE '%never_filled%'")
-        rows = con.execute(
-            f"SELECT realized_pnl, entry_time, exit_time, "
-            f"COALESCE(capital_at_risk, 0) car, COALESCE(commission,0) comm "
-            f"FROM trades WHERE status='closed' {real} "
-            f"ORDER BY COALESCE(exit_time, entry_time)").fetchall()
-        n = len(rows)
-        wins = sum(1 for r in rows if r["realized_pnl"] > 0)
-        gp = sum(r["realized_pnl"] for r in rows if r["realized_pnl"] > 0)
-        gl = abs(sum(r["realized_pnl"] for r in rows if r["realized_pnl"] < 0))
-        pf = (gp / gl) if gl > 0 else float("inf")
-        tot = sum(r["realized_pnl"] for r in rows)
-        comm = sum(r["comm"] for r in rows)
-        # drawdown vs deployed risk: equity curve of realized P&L; base =
-        # max concurrent capital_at_risk (approx: max single-day sum of open
-        # trades' car; fallback to open book's current car sum, then $1k).
-        peak = dd = cum = 0.0
-        for r in rows:
-            cum += r["realized_pnl"]
-            peak = max(peak, cum)
-            dd = max(dd, peak - cum)
-        # D2 (DECIDED 2026-07-16, PLAN.md): the DD base is the MAX CONCURRENT
-        # deployed risk over the whole window — not the current open book.
-        # The old base (open-book car floored at $1,000) collapsed to the
-        # floor after any flatten, inflating DD% (13.8% FAIL vs the true
-        # 7.4% PASS across the 8% gate — the exact ambiguity D2 settles).
-        # Criteria pinned BEFORE the sample grows; do not revisit with
-        # results visible.
-        open_rows = con.execute(
-            "SELECT t.entry_time, t.exit_time, COALESCE(t.capital_at_risk,0) car "
-            "FROM trades t JOIN open_positions o ON o.trade_id=t.trade_id").fetchall()
-        base = max(_max_concurrent_car(list(rows) + list(open_rows)), 1000.0)
-        con.close()
-        # R11 (R10 adoption): TCA + attribution read-outs — the capture layer
-        # existed with zero aggregation; the go-live "stable slippage" gate
-        # now has a NUMBER: median entry slippage <= 8% of credit over the
-        # trailing 20 fills, no worsening trend (PLAN.md gate 1).
+        # W3 string-contracts-1/-4: one authority for "not a real close" —
+        # also excludes the reconciler's $0 needs-manual-review sentinels,
+        # which passed the old trio filter and counted as real losing closes.
+        real = not_real_close_sql()
+
+        # ---- the gate block (SHARED with status.py) ------------------------
+        # policy-vs-impl-5: an exception here used to delete the ENTIRE gate
+        # readout silently. It now prints a loud failure line instead.
+        try:
+            v = compute_go_live_verdict(src)
+            gate_lines = format_verdict_lines(v) + [format_pace_line(v)]
+        except Exception as _ge:  # noqa: BLE001
+            _log("error", "weekly_scorecard_gate_readout_failed",
+                 error=f"{type(_ge).__name__}: {_ge}")
+            gate_lines = [
+                f"!! GATE READOUT FAILED: {type(_ge).__name__}: {_ge}",
+                "!! the go-live verdict is MISSING, not passing — do not read "
+                "its absence as green.",
+            ]
+
+        # ---- TCA / attribution context (NOT gate criteria) ----------------
+        # R11 (R10 adoption): the capture layer existed with zero aggregation.
+        # W3: the slippage GATE is criterion [4] above, computed as the pinned
+        # statistic; what remains here is plain fill/commission bookkeeping
+        # with no gate label attached to it.
         con2 = _sq.connect(str(src)); con2.row_factory = _sq.Row
         try:
             xr = con2.execute(
                 "SELECT COUNT(*) n, SUM(CASE WHEN live_mid > 0 THEN 1 ELSE 0 END) m, "
                 "COALESCE(SUM(commission),0) c FROM executions").fetchone()
-            exec_line = f"executions: {xr['n']} fills, ${xr['c']:.2f} commissions"
-            slip = con2.execute(
-                "SELECT AVG(ABS(price - live_mid)) FROM executions "
-                "WHERE live_mid > 0").fetchone()[0]
-            if slip is not None:
-                exec_line += f", avg |fill-mid| ${slip:.2f} (gate: median <=8% of credit)"
+            exec_line = (f"executions: {xr['n']} fills "
+                         f"({xr['m'] or 0} with a live mid), "
+                         f"${xr['c']:.2f} commissions")
             att = con2.execute(
                 f"SELECT COALESCE(exit_reason_detailed,'?') r, COUNT(*) n, "
                 f"SUM(realized_pnl) p FROM trades WHERE status='closed' {real} "
@@ -1327,22 +1330,24 @@ def weekly_scorecard():
         finally:
             con2.close()
 
-        pf_s = "inf" if pf == float("inf") else f"{pf:.2f}"
-        _alert(
-            f"GO-LIVE SCORECARD (since 07-06 reset)\n"
-            f"closes: {n}/50 | PF: {pf_s} (gate >1.3) | win rate: "
-            f"{(wins / n * 100) if n else 0:.0f}%\n"
-            f"realized: ${tot:+,.0f} (commissions recorded: ${comm:,.0f})\n"
-            f"max DD: ${dd:,.0f} = {dd / base * 100:.1f}% of deployed risk "
-            f"~${base:,.0f} (gate <8%)\n"
-            f"{exec_line}\n"
-            f"by exit reason: {attrib}\n"
-            f"{fill_line}\n"
-            f"pace: {'on track' if n >= 1 else 'no closes yet'} — see "
-            f"docs/GAP_AUDIT_R7.md for gate definitions"
-        )
+        body = ["GO-LIVE SCORECARD (since 07-06 reset)"]
+        body += gate_lines
+        body += [exec_line, f"by exit reason: {attrib}"]
+        if fill_line:
+            body.append(fill_line)
+        body.append("see docs/GAP_AUDIT_R7.md for gate definitions")
+        _alert(chr(10).join(body))
     except Exception as e:  # noqa: BLE001
         _log("warning", "weekly_scorecard_failed", error=str(e))
+        # W3: a failed scorecard used to be a SILENT Friday — the operator saw
+        # no message and had no way to tell "nothing to report" from "the gate
+        # readout crashed". Say so loudly.
+        try:
+            _alert(f"GO-LIVE SCORECARD: GATE READOUT FAILED — "
+                   f"{type(e).__name__}: {e} (no verdict was computed; "
+                   f"run `python status.py` for the gates)")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # R16: keeper.log (22.7 MB), dashboard.log (22 MB) and weblog.log are all

@@ -1198,3 +1198,656 @@ before it ever ran in the bot. Secrets are now excluded by section + field-name 
 with a test asserting no secret can enter the report. NOTE: those keys passed through this
 chat session - U10 (rotate Finnhub) now applies to ALL of them; rotate at the providers.
 Suite 1,173 green; smoke + type gates pass.
+
+## 2026-08-18 - R19c: CONFIG.YAML IS NOW THE OPERATING SOURCE FOR TRADING VALUES (user policy)
+User decision: "config must be the ONLY place with values that manage trading." Executed:
+every trading-economics contract key now has a config.yaml home visible to the operator -
+backtest.ic_min_credit_width (0.10), backtest.ic_min_credit (0.70),
+backtest.credit_loss_limit (0 = disabled per R6), risk.skip_macro_events (true) - joining
+backtest.wing_k (1.6). Resolution everywhere: explicit env override > config.yaml >
+CONTRACT_DEFAULTS (safety net only). Yaml booleans normalize to the contract's '1'/'0'.
+Values unchanged - this is about WHERE they live, not WHAT they are (test-pinned).
+DOCUMENTED EXCEPTIONS (each with a stated reason, enforced by test): KMP/OMP crash guards
+(process-level, must precede imports); AIT_MARKET_DATA_TYPE (broker data entitlement -
+deployment concern, flips at U6); AIT_ALLOW_UNDEFINED_RISK (INST-5 interlock, env-only ON
+PURPOSE so re-enabling naked risk is a deliberate act, not a config edit).
+ENFORCEMENT: test_every_trading_key_has_a_config_home fails if a future contract key lacks
+a config home; test_config_homes_exist_in_yaml_and_settings fails if yaml and settings
+drift; the R19 no-private-fallback scan still guards the reader side. Suite 1,177 green.
+REMAINING CONFIG DEBT: ~125 lower-tier literals from the R19 register (VIX credit-cap
+tiers, TP ladder copies in the engine, entry-window forks, param_spaces) - migrate
+opportunistically using these same homes; the register is the spec.
+
+## 2026-08-20 - R19d: VERDICT METRIC IS IRON-CONDOR-ONLY (user decision)
+The go-live gates now score IC closes exclusively (status.py; all-strategy line kept
+underneath for book honesty). Rationale: the mission is the IC edge question; the retired
+experiments were drowning the signal - the mixed record read -$451 at its worst and
+9W-7L/+$150.83 today, while the CONDOR record is 7 closes, 4W-3L, +$452.89, PF 3.91.
+Sharper still: ALL 3 condor losses came from the since-abolished 07-13 macro-event flatten
+and the lone early scratch-win from the since-removed trailing stop - under the CURRENT
+ruleset (hold-through, wide wings, touch-stop) the condor is 3-for-3, +$602.77. Those 3
+closes are the first entries of the verdict sample that actually test today's policy.
+Gate math unchanged (50 closes, PF>1.3); the clock now counts what the mission asks.
+
+## 2026-08-20 - R20: RESEARCH APPARATUS FIXED + ENTRY_SIGNALS CAPTURE + REGISTER TIER-2
+THE HEADLINE, PROVEN BY A/B EXECUTION: the engine NEVER forwarded market_context into
+position building - a run with VIX 30 supplied and a run without were IDENTICAL (10
+trades each, entry IV = realized-vol x 1.15 synthetic). EVERY study this project ever ran
+- wing_k, shadow R1-R3, both ablations, floor sweep, touch-stop impact - priced its
+options WITHOUT VIX and WITHOUT the R18 per-symbol calibration. Post-fix: VIX 30 ->
+QQQ prices at 0.3684 = 0.30 x 1.228 (per-symbol multiplier finally engaged); SPY control
+at 0.30 (x1.00). Arm ORDERINGS remain the only trustworthy prior outputs (shared defect);
+every ABSOLUTE number is restated as measured-on-synthetic-vol. Next study is the first
+with an honest apparatus end to end.
+ALSO FIXED (agent, all proven fail-pre-fix, 30 new tests): Optuna searched 2 params that
+NEVER reached the trial engine (pure noise dimensions - the "best" values were arbitrary
+and walkforward applied them OOS anyway); train_window_models=False still trained AND
+applied the window meta-labeler (ablation contamination); phantom intraday knobs now
+actually forwarded; NEW shared authority ait/execution/exit_policy.py - the engine
+consumed a HAND-COPY of live's TP ladder/DTE-5/macro windows, now imports the shared
+module + a test executes live portfolio._get_take_profit_targets vs the policy so any
+future de-sync fails a test; entry-window fork resolved to config's 10:30 (engine/
+walkforward drift said 09:30); range/vol-mag training floor literal 100 ->
+ml.min_training_samples (mine - constructors take min_training_samples=None -> config).
+ENTRY_SIGNALS CAPTURE (mine, live path, gated x3): _scan_symbol stashes the entry-time
+feature row; _try_execute persists the 11 technical META_FEATURES + hour_of_day into
+trade_context.entry_signals - the column that was "{}" on EVERY trade ever taken, which
+is why the meta-labeler could never train (9/20 features). From the next entry, every
+close builds the training set. Degrades to "{}" safely; never blocks an entry.
+REGISTER TIER-2 (mine, pure relocations, semantics test-pinned identical): VIX-tiered
+credit caps -> risk.credit_cap_vix_tiers ([[20,6],[25,4],[999,2]]); symbol concentration
+0.20 -> risk.max_symbol_concentration_pct. Three test fixtures completed (mocked configs
+missing the new fields - the _FakeBreaker lesson again).
+Suite 1,210 green; type gate, smoke (13 checks), referee (0 BREAKS) all pass. Agent
+flagged for a follow-up: walkforward wing_k=1.0 dataclass default (pre-registered-
+comparison sensitive), optimizer baseline literals (stop 0.35, hurst, mf, max_hold 30).
+
+## 2026-08-21 - R20b PRE-REGISTRATION: research defaults migrate to config resolution
+User: "can't we fix them?" — yes. The deferral reason (old-study comparability) is void:
+R20 proved every prior absolute was priced without volatility data, so protecting their
+reproduction protects disavowed numbers. REGISTERED CHANGE, before implementation:
+ 1. WalkForwardConfig.wing_k 1.0 -> None => resolve from the contract (env>config>1.6);
+    same for ic_min_credit_width and range_min_confidence (-> ml.range_min_confidence,
+    closing the 0.55-vs-0.65 parity gap the floor sweep exposed).
+ 2. Engine constructor defaults that shadow config with DIFFERENT values (iv_floor 0.12
+    vs 0.20, range_min_confidence 0.55 vs 0.65, min_confidence 0.55) -> None => resolve
+    from load_settings(); initial_capital/max_concurrent stay explicit (test-harness
+    knobs, documented).
+ 3. Optimizer baselines: hurst_regime_threshold/penalty read the EXISTING BacktestConfig
+    fields; stop_loss_pct (0.35), profit_target_pct, max_hold_days (30),
+    multifractal_width_threshold (0.50), iv_rank_rise_threshold (0.30),
+    min_edge_over_baseline (0.05) get NEW BacktestConfig fields with today's operating
+    values as defaults + config.yaml entries.
+ 4. Tier-4 reclassification: log strings/report formats are NOT config and will not be
+    migrated; genuinely config-ish tier-4 items (dashboard ports, DB paths) stay on the
+    register for an ops round.
+CONSEQUENCE ACCEPTED: re-running an OLD study script without explicit params now measures
+CURRENT config, not 2026-07 defaults. That is the point. Any historical reproduction must
+pass explicit values (the scripts we care about already do).
+
+## 2026-08-21 - R20b EXECUTED: research defaults now resolve from config (registration above)
+All four registered items landed (agent, 14 new tests, 9/14 proven fail-pre-fix):
+WalkForwardConfig wing_k/ic_min_credit_width/range_min_confidence -> None => contract/
+config resolution (bare config now resolves 1.6/0.10/0.65 — the 0.55 floor-sweep parity
+gap is closed at the source); engine iv_floor/range_min_confidence/min_confidence -> None
+=> load_settings() (min_confidence homed to risk.min_confidence — it IS live's directional
+gate, documented); optimizer trial baselines read config (5 NEW BacktestConfig fields:
+stop_loss_pct 0.35, profit_target_pct 0.50, max_hold_days 30, iv_rank_rise_threshold
+0.30, min_edge_over_baseline 0.05 + existing fractal fields wired; multifractal deviation:
+reused existing multifractal_max_width rather than forking a duplicate). Two stale test
+pins retired (they asserted the 1.0 literal this migration removes). Divergence report
+unchanged (12 pre-existing entries; new fields drop out naturally, test-pinned).
+Also closed this session: live TradeExecutor now receives settings (spread gate config-
+bound). Suite 1,224 green; type gate, smoke, referee all pass.
+RESIDUALS (named, bounded): run_backtest.py CLI argparse defaults re-freeze old values
+(stale env fallbacks 1.0/0.20/0.55) — ops-round item; bare StrategyOptimizer() without
+walkforward threading still defaults wing_k 1.0 (walk-forward path correct); dashboard
+export display literals (cosmetic). Tier-4 log/report strings RECLASSIFIED as not-config.
+
+## 2026-08-25 - R21: POST-STOP COOLDOWN NEVER MATCHED THE TOUCH STOP (found via live book)
+DEFECT (live, executed proof): R12-B4's re-entry cooldown greps
+exit_reason_detailed LIKE '%stop_loss%', but the short-strike touch stop —
+live's PRIMARY loss exit since R12-B1 — writes 'short_strike_touch (spot ...)'.
+08-24: QQQ touch-stopped 09:47:33 (−$272.29), bot re-entered QQQ 10:00:40 —
+13 minutes later, straight back into the move the rule exists to avoid. The
+rule silently never applied to the exit type it most needed to cover.
+FIX: query extracted to TradingOrchestrator._post_stop_cooldown_until (now
+testable), pattern broadened to stop_loss OR short_strike_touch. trailing_stop
+/breakeven_stop stay excluded on purpose (fire at/above breakeven — not the
+autocorrelated-loss sequence). Stale mirror comment in portfolio.py updated.
+PROOF: old query 0 matches vs new 1 on the live reason string (executed);
+tests/test_r21_post_stop_cooldown.py — 7 tests EXECUTE the real query against
+a real sqlite file (touch blocks, confirmed-tick variant blocks, stop_loss
+blocks, profit exits don't, 30h expiry, per-symbol scope, open rows ignored).
+NOTE: the 08-24 re-entry itself stands (T-20260824-100040, $6.35 credit) — we
+do not undo live positions retroactively; it is a normal position now.
+Same day: merged origin/main (Ahmed's PR #6 merge = CI type gate + nightly
+lane armed on main; his 2 IV commits add a PARALLEL daily_iv/intraday_iv OHLC
+store — our daily_prices.implied_vol path unchanged; reconcile pending) and
+pulled curious-talleb's review round (engine entry_dte decoupled from Optuna's
+max_hold_days cap, UTC-midnight flaky-test fixes, vix-tier fallback, iv_floor
+dup, GO_LIVE_VERDICT_STRATEGIES frozenset in base.py).
+
+## 2026-08-25 - R21b: PR#7 REVIEW ROUND (Copilot, 4 findings) — ALL VERIFIED REAL, FIXED
+All four are fallout from the 08-24 entry_dte/max_hold_days decoupling:
+[1] param_spaces: 7 non-IC spaces searched max_hold_days from 14 up — debit
+    expires at entry_dte (14), credit closes at DTE<=5 (~day 9), so the
+    dimension was flat Optuna noise. Bounded: debit (5,14), credit (1,9).
+[2] optimizer: stop_loss_pct/profit_target_pct/min_confidence had no ctor
+    overrides — walkforward's explicit values reached the OOS Backtester but
+    NOT trial baselines (train/OOS parity break). Threaded through, explicit
+    wins, None still resolves from config.
+[3] walkforward: range model trained + OOS-evaluated at horizon
+    max_hold_days (30) while reachable IC holds cap at ~9 days — 30-day
+    containment labels gating 9-day trades. New _range_label_horizon() =
+    min(max_hold_days, dte_range[0] - EXPIRY_APPROACHING_DTE); all 3 range
+    call sites switched (direction-model eval untouched — separate question).
+[4] run_backtest parity manifest hardcoded dte_band [21,21] ("engine uses
+    fixed DTE = max_hold_days" — retired convention) — now reports
+    [dte_range[0]]x2, matched against the actual engine in a test.
+PROOF: tests/test_r21b_pr7_review_round.py — 8 tests execute the real
+resolution paths (space reachability vs CREDIT_STRATEGIES, ctor override
+precedence + config defaults, horizon derivation + cap + degraded-settings
+fallback, manifest == live Backtester._entry_dte).
+
+## 2026-08-25 - R21c: PRE-MERGE ULTRA-VALIDATION OF PR#7 (12-agent adversarial pass)
+Validated the three no-blocker merge claims. RESULTS: claim 2 (no Ahmed
+conflict) CONFIRMED (merge-base = origin/main tip; his commits purely
+additive; zero overlap, no schema collisions). Claims 1 and 3 FALSIFIED as
+stated, both fixed same day:
+[1] F33 half-fixed: manifest dte_band corrected earlier but the prose NOTE at
+    run_backtest.py:207 still described the retired fixed-DTE=max_hold_days
+    convention. Note rewritten; executed check: no 'max_hold_days=21' in notes.
+[3] The ONE risk-loosening live change (orchestrator passing settings= into
+    TradeExecutor, arming the executor's config spread ceiling 0.15->0.40 —
+    deliberate R19 register change aligning executor with the scanner) had NO
+    test on the WIRING hunk: reverting it kept the suite green. Pinned by
+    test_hot_path_smoke.py::TestConstruction::test_executor_receives_settings_spread_ceiling.
+Findings ledger: 33 distinct review findings across all rounds; 32 verified
+fixed in-code (10 by named executing tests, 22 by ad-hoc real-code probes),
+1 (F33) completed above. REGISTERED RESIDUALS from the critic: (a) 22 fixes
+lack a permanent pinning pytest (regression-visible only via behavior);
+(b) typecheck gate scope excludes backtesting/optimization/ml; (c) 5 config
+homes are zero-delta today but create config-edit levers on live economics
+(documented, intended — that IS the R19c policy); (d) meta_label.py changes
+live-dormant behind meta_label.enabled=false.
+
+## 2026-08-25 - R22: RELATIONSHIP-DEFECT HUNT (15-agent, 7 classes) — 46 STANDING, REGISTERED
+Question: "any other defects like entry_dte-vs-horizon?" (facts in different
+files that must agree, nothing enforcing it). 7 class-specialized finders +
+adversarial verification (default-refute): 48 candidates -> 46 standing
+(30 DIVERGENT TODAY, 16 enforcement gaps), 2 refuted. Full register with
+proof/consequence/fix per finding: reports/relationship_defect_hunt_20260825.md.
+Severity: live_money 8 | research_validity 23 | ops_reporting 11 | cosmetic 4.
+TOP THREE (critic-concurred):
+[1] units-scale-05: LIVE range gate asks P(+-5% over 30d)>=0.65 while
+    post-R21b research validates a 9-day/adaptive-threshold question — live
+    vetoes entries the validated evidence would take AND slows the 50-close
+    verdict sample. (The mirror image of R21b: fixed research, didn't sweep
+    the live consumer.)
+[2] numeric-pairs-02: R21's cooldown kept the flat 30h window vs the R12-B4
+    spec's 1 TRADING day — a Friday stop-out gets ZERO effective cooldown
+    (window dies Saturday). The R21 fix itself carried a member of the class
+    it fixed.
+[3] Scorecard-integrity trio: meta_label trains on 6 phantom $0 never-filled
+    rows (26% of its set, missing the shared not-real-close filter);
+    reconciler $0 needs_review sentinels would count as real closes in
+    PF/win-rate with ZERO consumers surfacing the review; status shows 5
+    open positions when the book holds 2 (cancelled rows leak the filter).
+FIX WAVES (pre-registered, NOT yet executed): wave 1 = live_money divergent
+(units-scale-05, numeric-pairs-02) + scorecard trio; wave 2 = live-vs-backtest
+mirror cluster BEFORE the next research run (else the apparatus still is not
+honest: debit stop 0.35 vs 0.50, sizing, iv floors, delta_short triplication,
+macro day-counting, intraday path skipping touch stop); wave 3 = ops
+(dead dashboard keys incl. unconditional 'No errors logged', unreachable
+breaker-coherence alarm, naive-clock timestamp sites). Critic blind spots
+recorded in the register: concurrency contracts, multi-process sqlite,
+consistent-but-wrong, deprecated/ + scripts/ under-swept.
+
+## 2026-08-26 - R23: BLIND-SPOT + COMPOSITION HUNTS — 77 MORE STANDING; GRAND REGISTER 123
+User directive: audit with COLLECTIVE repo context before fixing anything.
+Round 2 (8 blind-spot classes, 17 agents): 50 standing (22 live_money).
+Round 3 (4 vertical whole-flow audits with full flow maps, 8 agents): 27
+standing (17 live_money). Register: reports/blindspot_composition_hunt_20260825.md.
+Combined with R22's 46: 123 standing findings, none fixed yet.
+HEADLINE CLUSTERS (critic-concurred):
+[A] BREAKER BYPASS FAMILY: reconciler-booked closes (bot-down fills, manual
+    flattens, expiries) hit trades.realized_pnl but NEVER the circuit
+    breaker/daily stats/PDT/Thompson (trade-life-close-booking-two-owners,
+    money-flow-01); fill-booking callback loss on crash loses the booking
+    entirely (concurrency-2); breaker state silently resets on unreadable DB
+    at relaunch (fail-direction-10). The 3-loss pause + daily-loss halt are
+    defeatable from BOTH ends.
+[B] FILL-VS-SWEEP RACE (concurrency-1): a stale entry that fills as the $0
+    sweep books it leaves a REAL condor at the broker managed by NOTHING,
+    with entry_price rewritten on a closed $0 row.
+[C] FAIL-OPEN GATE CHAIN (common-cause): IV outage fabricates iv_rank=50
+    passing both IV gates + quoteless strikes rank most-liquid + combo NBBO
+    sanity fails open + duplicate-order guards fail open at debug — one
+    degraded-feed morning can chain these.
+[D] SCORECARD CONTRADICTION: Friday's automated GO-LIVE SCORECARD computes
+    the RETIRED all-strategy metric (PF 0.89 FAIL) while status.py computes
+    the pinned R19d IC metric (PF 1.42 PASS); master also authorizes at 25
+    closes vs the pinned 50; maxDD criterion structurally unanswerable.
+[E] RESEARCH COST-MODEL SIGN RISK: commissions ~$2.13/contract understated +
+    gap-through-strike losses booked at touch price + IV skew ~10x flatter
+    than measured — together the scale of the whole per-condor expectancy;
+    can flip the researched edge's sign. Plus dead-surface-2: the 08-10
+    --apply run permanently zeroed the only live fill-quality ground truth.
+[F] PROTECTION-ARMING WINDOWS (bot-day): hang-detector kills slow startups
+    in a loop (no reconcile/no touch stop all session); startup training
+    blocks protection arming; exit-order-then-CLOSING crash window
+    duplicates closes; scan duration stretches the 30s exit cadence.
+NEVER-AUDITED (registered for a future round): IBC/TWS lifecycle (C:\IBC),
+paper-vs-real fill realism of the verdict evidence, broker-statement P&L
+parity, ML feature/label lookahead, backfill/calibration scripts,
+deprecated/ subtree, fixture DDL drift, early-close sessions, config.yaml
+multi-writer races, host substrate (backups, disk, Windows Update).
+SEVERITY ELEVATIONS accepted: multiprocess-db-1, dead-surface-2,
+log-contracts-5, policy-vs-impl-5 -> treat as live_money-adjacent;
+R22's string-contracts-1/-4 + db-contracts-1 likewise.
+FIX WAVES REVISED (supersedes R22 waves; still pre-registered, not executed):
+W1 BOOKING INTEGRITY: one shared close-booking authority (outbox pattern) so
+   EVERY close — executor, reconciler, sweep, vanished — reaches breaker/
+   stats/PDT/Thompson exactly once, transactionally; CAS-gate the fill
+   writes (concurrency-1); persist breaker state fail-closed.
+W2 GATE FAIL-DIRECTION: protective gates fail CLOSED (or loud): iv_rank
+   sentinel None not 50, liquidity refuses quoteless, NBBO sanity blocks,
+   dup guards escalate, VIX outage pages (it already fails closed but
+   silently), touch-stop except pages at CRITICAL.
+W3 SCORECARD TRUTH: master scorecard computes the R19d IC metric with the
+   50-close denominator + not-real-close authority (merges R22 trio);
+   retire the contradicting Friday page.
+W4 LIVE ECONOMICS COHERENCE: cooldown trading-day semantics, live range-gate
+   horizon/threshold from shared authority, credit floors re-checked at
+   fill, entry_vix LKG.
+W5 RESEARCH HONESTY: commissions/skew/gap pricing in engine; then re-run
+   studies (supersedes the earlier plan to re-run immediately post-merge).
+W6 OPS: protection-arming windows, dead-man attests bot not supervisor,
+   dashboard dead panels, log contracts.
+
+## 2026-08-26 - W1 EXECUTED: BOOKING INTEGRITY (R23 breaker-bypass family closed)
+[1] EXIT OUTBOX (concurrency-2, trade-life-close-booking-two-owners,
+    money-flow-01): close_trade now enqueues a booking obligation in the
+    SAME sqlite transaction as the close; every booking path CLAIMS the row
+    first (single DELETE, sqlite-serialized => exactly-once). The executor
+    callback claims before booking; a new orchestrator cycle drain
+    (_drain_exit_outbox, 120s grace) books the orphans — reconciler/sweep/
+    vanished closes and bookings lost to a crash — into daily stats, the
+    circuit breaker, PDT, and Thompson, with an ORPHAN CLOSE BOOKED page.
+    Prior-day orphans are claimed but NOT booked into today's daily
+    quantities (logged stale_exit_booking_skipped).
+[2] CAS-GATED FILLS (concurrency-1): _update_trade_filled/_update_trade_partial
+    no longer write entry_price/quantity/open_positions when the status CAS
+    is refused — the closed $0 row stays intact, and a CRITICAL page fires
+    via the alert_fill_after_close flag (drained each cycle).
+[3] BREAKER FAILS CLOSED (fail-direction-10): an unreadable/corrupt breaker
+    store now trips conservatively for one pause window (auto-resume) instead
+    of starting fresh and silently clearing an active 3-loss pause. R16's
+    test_corrupt_blob_is_survivable updated to the new contract.
+Smoke guard taught that a new EMPTY table is startup DDL, not a write.
+PROOF: tests/test_w1_booking_integrity.py — 13 executing tests (real
+StateManager/CircuitBreaker/TradeExecutor on a real sqlite file); stash
+proof: 3 key tests FAIL against pre-W1 src. Suite 1254 green, type gate OK,
+SMOKE PASS 13. NOTE: fixes take effect on next bot restart (restart already
+pending for R21).
+
+## 2026-08-31 - W2 + W4 + W5 EXECUTED (4 parallel agents, strict file ownership)
+W2 GATE FAIL-DIRECTION — protective gates now fail CLOSED or LOUD:
+[fail-direction-05] _estimate_iv_rank returned a FABRICATED 50.0 on any
+  exception (passing BOTH IV gates during exactly the outages that break IV
+  data). Now returns None; _scan_symbol skips NEW entries for that symbol and
+  pages 1/hour. Exits unaffected (they never traverse _scan_symbol).
+[fail-direction-02] With entry gates ON and the range model missing/untrained,
+  IC/strangle signals silently kept DIRECTIONAL confidence (gate inverted by
+  regime). Now dropped + paged. Gates-off keeps R16 observe-only behavior.
+[fail-direction-01] VIX-outage full stop was fail-closed but SILENT -> pages.
+[fail-direction-06 + external-contracts-02] Quote-less contracts scored spread
+  0.0 = TIGHTEST in the chain and their stale last prints fed credit math.
+  Spread is now ILLIQUID_SPREAD_PCT=inf (no threshold can admit it), is_liquid
+  rejects no-two-sided-quote up front, crossed books (which scored NEGATIVE)
+  rejected, filter_liquid logs the drop count.
+[fail-direction-04] Touch-stop except swallowed at debug (silently disabling
+  the ONLY credit loss exit) -> log.error every tick + one page per outage,
+  latch cleared on recovery; bare except retained so one bad row cannot kill
+  the loop over other positions.
+[fail-direction-07] Combo-NBBO gate failed open quietly -> ENTRIES refused on
+  missing/nan/crossed NBBO; EXITS still proceed but log.error (deliberate
+  asymmetry: a missed exit costs more than a missed entry). 1.5s flat settle
+  -> 15x0.1s poll (a book answering in 200ms no longer adds 1.3s of staleness
+  to the staleness check itself).
+[fail-direction-08] Duplicate-order guards swallowed their own errors at debug
+  and placed anyway; a DISCONNECTED client returns [] indistinguishable from
+  "verified empty". Three-way verdict clear/duplicate/unverified; unverified
+  refuses the entry this pass.
+[fail-direction-09] PDT guard fail-open on corrupt state/empty calendar ->
+  blocks; window counting no longer returns 0 on degradation.
+[fail-direction-11] Restricted list: utf-8-sig + UTF-16 retry (PowerShell
+  writes), unreadable-but-present -> sentinel -> ENTRIES HALTED (an operator
+  who dropped a ban file gets protection, not silence).
+[fail-direction-12] Executor market-hours guard refuses on calendar exception.
+W4 LIVE ECONOMICS COHERENCE:
+[numeric-pairs-02] Cooldown is now ONE TRADING DAY (09:30 ET of the previous
+  session) not a flat 30h — a Friday stop gave ZERO effective cooldown.
+[trade-life-entry-vix-refetch] entry_vix reuses the validated value / LKG;
+  writes NULL, never a false 0.
+[trade-life-credit-econ-floors] Credit floors re-checked at REPRICE; ladder
+  remainder refused on breach (the resting compliant order stays).
+[units-scale-05] NEW src/ait/ml/range_spec.py = the ONE authority:
+  live_range_spec() -> (0.05, dte_range[0] - EXPIRY_APPROACHING_DTE) = (0.05, 9)
+  today. Orchestrator + trainer read it; a LOADED model keeping a different
+  trained spec logs range_model_spec_mismatch (artifacts not deleted).
+W5 RESEARCH HONESTY (engine cost model — measured from our OWN data):
+[commission] Ledger probe, 78 leg fills: all-in 0.9168/contract-leg. Condor
+  round trip $7.33 vs modeled $5.20 = $2.13/contract understated. Config homes
+  commission_per_contract 0.65 + regulatory_fees_per_contract 0.2668.
+[touch-gap] A day OPENING beyond a short strike was booked at the strike-touch
+  price. Now reprices at the gapped open, books the WORSE of the two:
+  $305/$681/$1,344 per contract previously hidden at 1%/2%/3.5% gaps.
+[skew] Every strike priced at the SAME IV. Calibrated on 3,159 of our own IBKR
+  quotes (put dIV/d|ln(K/S)| 1.141 SPY / 0.983 QQQ / 0.916 IWM, weighted 1.049)
+  -> skew_slope_per_pct_otm 0.0736. An 8%-OTM 20-DTE put wing: $0.037 -> $0.740,
+  inside the measured $0.71-0.92 real band. DELIBERATE: slope 0 reproduces
+  PRE-W5 pricing (the engine was never literally flat); the CALL side is left
+  alone because the same regression gave a sign-unstable slope (+0.064/+0.112/
+  -0.089) and the model already OVER-prices short calls.
+CONSEQUENCE (must not be soft-pedaled): every backtest/walk-forward/Optuna/
+ablation/shadow-tournament ABSOLUTE produced before W5 is STALE — all three
+corrections push the same pessimistic direction. Nothing in reports/ may be
+quoted until a re-run. This is the wave that can flip the sign of the
+researched edge; which way is not yet known.
+PROOF: 4 new test files, 129 executing tests (38 orchestrator + 22 chain/
+portfolio + 41 executor/risk + 28 engine). Each agent independently verified
+its tests FAIL against pre-fix source (revert-and-restore probes). Suite 1383
+green, type gate OK, SMOKE PASS 13.
+INTEGRATION FIX (owner): tests/test_hot_path_smoke.py gained FakeRangePredictor
+— the rig's MODEL_DIR is cwd-relative so no range.pkl exists in the sandbox;
+that test passed ONLY because the range gate failed open (fail-direction-02
+itself). Same boundary-swap pattern the rig already uses for DirectionPredictor.
+REGISTERED FOLLOW-UPS (not done): master.py:830 builds RangePredictor at
+horizon 30 inside the retrain subprocess -> will flap against the horizon-9
+authority every retrain cycle (visible via range_train_spec_mismatch);
+walkforward.py:57 still pins commission_per_contract 0.65 (fees DO resolve, so
+windows get corrected friction); skew/commission are static measured constants,
+not a live calibration path. W3 (scorecard truth) and W6 (ops) remain.
+
+## 2026-08-31 - W3 + W6 EXECUTED — ALL SIX WAVES NOW COMPLETE
+W3 SCORECARD TRUTH — one authority for the go-live verdict:
+NEW src/ait/reporting/go_live.py: compute_go_live_verdict() + the not-real-close
+  patterns + OPEN_TRADE_STATUSES (derived from TradeStatus) + gate constants.
+  status.py AND master.py's Friday page now call the SAME functions; a test
+  runs both against one DB and asserts every gate line is BYTE-IDENTICAL.
+[policy-vs-impl-1/-3, money-flow-04] The Friday page graded the RETIRED
+  all-strategy population; now IC-only via GO_LIVE_VERDICT_STRATEGIES, with
+  both thresholds shown (50 prelim / 100 funding). CORRECTION to the R23
+  register: master did NOT authorize at 25 closes — it already read /50. The
+  real defects were the population and the missing funding threshold. No
+  25-close constant exists in the repo.
+[policy-vs-impl-2] A lifetime DOLLAR MEAN was rendered under a label promising
+  a percent-of-credit MEDIAN -> now the pinned statistic (median |fill-mid| as
+  % of credit, trailing 20 fills) plus the never-computed no-worsening clause.
+[policy-vs-impl-5] The 2 unanswerable criteria printed as nothing; now
+  UNAVAILABLE WITH THE REASON, and a failure prints GATE READOUT FAILED
+  instead of silently deleting the whole readout.
+[string-contracts-1] meta_label.build_training_data: 24 -> 18 rows on the live
+  DB (the 6 never-filled $0 phantoms, 26% of the training set, are gone).
+[string-contracts-4] Reconciler $0 sentinels named as constants and counted
+  correctly (written strings deliberately UNCHANGED — other consumers read
+  them); the scorecard now SURFACES excluded rows instead of hiding them.
+[db-contracts-4] Open-position queries derive from TradeStatus (cancelled rows
+  no longer read as open).
+W6 OPS SURFACES — no surface may report green on an unwired channel:
+NEW src/ait/monitoring/ops_health.py: ANSI-robust log parsing, bounded tail
+  reads + incremental day counters, native-crash counting, bot-liveness
+  evidence, and the bot_state health channel (plain sqlite, never the DuckDB
+  RW lock, throttled 1/min, disabled under pytest).
+[string-contracts-5, db-contracts-6] The 5 dead dashboard keys: watchdog now
+  PUBLISHES component health + memory + an error ring; model_version re-wired
+  to trade_context (a real source); meta_label_stats left honestly blank. The
+  unconditional green st.success('No errors logged') is GONE — green now
+  requires wired AND fresh AND empty; absent/stale say "NOT WIRED ... this is
+  NOT an all-clear".
+[log-contracts-1/-4/-6] web_logs: 76MB full re-read every 5s per tab -> bounded
+  seek (0.01s); counters no longer derive from the display window and walk
+  today's rotated backups; UTC->LOCAL date bucketing; ANSI-robust parsing;
+  HTML-escaped output. Live: 63 orders / 39 ML predictions today where the old
+  code reported 0.
+[log-contracts-3] Crashes counted from logs/fatal.log (the real sink), with
+  "nothing records crashes" distinguished from "no crashes".
+[dead-surface-4] Capture efficiency was DOLLARS / PERCENT: -1653% -> median
+  +70.7% (winners 85-96%), a usable exit-tuning number.
+[dead-surface-3] Direction accuracy states plainly that state.close_trade never
+  writes the column — "NOT RECORDED", not "no data yet".
+[bot-day-02] Dead-man ping GATED on liveness evidence (heartbeat < 900s = 30
+  missed beats, RTH-only, post-open warmup — the SAME threshold master.py uses
+  for bot_hung_heartbeat_stale, so no new alert surface); not-alive sends
+  /fail. keeper_ait.bat rewired; verify_deadman confirms "ping gated: True".
+INTEGRATION (owner, cross-boundary items the agents flagged):
+- All 6 remaining consumers rewired to the ONE not-real-close authority
+  (dashboard, analytics, duckdb_analytics, learning/analyzer, shadow_referee,
+  restate_d1) — each had omitted the reconciler sentinels.
+- status.py: crash counting -> fatal.log; today-counts -> ops_health (was a
+  fixed tail window + UTC-vs-local substring match).
+- orchestrator: log.error("loop_impaired") now EMITTED as a structured event
+  (it existed only inside the Telegram f-string, so every log consumer
+  reported a healthy loop through an R8-class outage).
+- keeper_ait.bat gated (above). tests/test_w6_ops_surfaces.py's
+  test_the_real_keeper_is_detected_as_ungated INVERTED to
+  test_the_real_keeper_is_gated — it pinned a defect that is now fixed.
+PROOF: W3 32 tests (13 fail pre-fix), W6 63 tests (43 fail pre-fix). Suite
+1478 green, type gate OK, SMOKE PASS 13.
+STILL OPEN (registered, not done): master.py:830 builds RangePredictor at
+horizon 30 inside the retrain subprocess (will flap against the horizon-9
+authority every cycle — visible via range_train_spec_mismatch);
+walkforward.py:57 pins commission_per_contract; state.close_trade never writes
+direction_correct; scripts/check_first_rth_liveness.py has the old tail/regex
+defects; docs/RUNBOOK.md:131 still says ">=50 closes" only; status_server's
+8503 page still exposes no gate data. THE BIG ONE: every pre-W5 study absolute
+is stale — the walk-forward re-run on the corrected cost model is the next
+milestone and the real test of whether the IC edge survives.
+
+## 2026-08-31 - RESTART + research-to-live-01 MATERIALIZED AND FIXED
+BOT RESTARTED 15:50 ET (deliberately before the 15:58-16:13 duplicate-EOD
+window, a registered unfixed finding). Clean boot: IBKR connected client_id 1
+no fallback, startup_reconcile matched/promoted/stale 0, ZERO cycle or monitor
+errors. R21 through W6 are now LIVE. range_model_spec_mismatch logged exactly
+as designed (artifact trained at horizon 30 vs the horizon-9 authority; it
+serves at its REAL spec and flags needs-retrain rather than pretending).
+Dead-man verified: "ping gated on bot: True", liveness ALIVE, STATUS ARMED.
+TRADING: two closes today, the book's best day — SPY +$280.36 (66.9%) and
+QQQ +$329.36 (53.6%), both take_profit_short. IC verdict now 10 closes,
+6W-4L, net +$790.32, PF 2.85 PASS, maxDD 3.3% of deployed risk PASS. Sample
+10/50 is the only failing criterion. Book FLAT.
+DEFECT FOUND VIA THE NIGHTLY REPORT (not a W5 regression): the 16:40 backtest
+wrote exit_code 1 / "ERROR: No data fetched. Check internet connection." Root
+cause is research-to-live-01 from the R23 register, materializing on almost
+exactly the predicted date: load_daily_ohlcv judged the IB store sufficient
+with a FIXED `len(df) < 60`, independent of the requested window. The intraday
+store crossed 60 trading days ~2026-08-26, so every research entry point
+asking for 730 days silently got 63 — and the failure was misattributed to the
+network. FIX: sufficiency is measured against the REQUEST
+(expected = days*252/365; need >= max(60, 80% of expected)), and a frame that
+is still short AFTER the fallback logs daily_ohlcv_coverage_short instead of
+looking healthy. Verified live: SPY 730d now returns 522 rows spanning
+2024-08-01..2026-08-31 (was 63).
+PROOF: tests/test_research_data_coverage.py, 5 executing tests against a real
+sqlite store with the Yahoo boundary stubbed (offline/deterministic): the
+2026-08-31 failure itself, store-preferred-when-sufficient, short-request via
+the absolute floor, short-after-fallback logged, dead-Yahoo degradation.
+Suite 1483 green, type gate OK, SMOKE PASS 13.
+NOTE: this was BLOCKING the W5 re-run — the corrected-cost-model walk-forward
+could not have run at all. That re-run is now unblocked and remains the next
+milestone.
+
+## 2026-09-01 - OBSERVE MODE PRE-REGISTRATION (user decision, written BEFORE results)
+SITUATION (evidence, 2026-09-01): the overnight retrain rebuilt the range
+model at the corrected horizon 9 (W2's spec-mismatch flag worked). Its per-
+symbol skill is near coin-flip: mean CV AUC SPY 0.5453, QQQ 0.5446, IWM
+0.5808 -> edge over baseline +0.045 / +0.045 / +0.081 against a
+min_edge_over_baseline of 0.05. So predict() returns None for SPY and QQQ,
+and W2's fail-CLOSED range gate blocks every IC entry on them. Today: 16
+condor candidates logged all_gates_passed, ZERO orders placed, book flat.
+Before W2 this gate failed OPEN, so those same condors traded on DIRECTIONAL
+confidence — the inverted-gate defect. We have gone from "trades on an
+inverted gate" to "cannot trade at all". The model is telling the truth: it
+has no demonstrated skill on SPY/QQQ.
+THE CONFLICT: the project exists to answer "does the iron condor have edge?"
+and needs 50 IC closes; we have 10. A near-coin-flip FILTER must not be what
+prevents the underlying question from ever being answered.
+DECISION (user, option 1 of 3 offered): run the entry gates in OBSERVE MODE —
+ml.entry_gates_enabled false. The ML models keep predicting and logging
+(evidence accumulates) but never veto. Rejected: lowering
+min_edge_over_baseline 0.05->0.04 (moving the goalposts to get the answer we
+want) and leaving entries blocked indefinitely (the verdict stalls and we
+learn nothing).
+MANDATORY COMPANION FIX — without it this decision BACKFIRES. Registered
+finding trade-life-gatesoff-reintroduces-neutral-autoreject: with gates off,
+model_overridden is empty, so eff_conf falls back to the DIRECTIONAL
+final_confidence (orchestrator.py:1833) and manager.py:351 rejects
+confidence < risk.min_confidence (0.50). In the neutral regime a condor
+WANTS, directional confidence is below 0.50 -> rejected; only trending-
+aligned days clear it. Flipping the flag alone would swap "blocked
+everywhere" for ADVERSE SELECTION (condors entering only in their worst
+regime). Fix: in observe mode, direction-neutral structures are validated on
+a config-homed neutral baseline instead of the directional number, because
+the risk manager's min_confidence gate is a DIRECTIONAL gate and direction is
+not what a market-neutral structure is paid for. All other gates (VIX,
+liquidity, credit floors, concentration, correlation, PDT, cooldown, macro)
+remain fully armed and unchanged.
+WHAT WE EXPECT / HOW WE WILL JUDGE IT (pre-registered so it cannot be
+rationalized later): entries resume on SPY/QQQ/IWM in neutral regimes; the
+IC sample grows toward 50. The ML gate's value becomes MEASURABLE rather
+than assumed — every logged range_prediction is scored against the realized
+outcome, so at 50 closes we can ask whether the gate WOULD have helped
+(compare closes where p_in_range was above vs below 0.65). If the observe-
+mode record shows the gate would have improved PF, we re-arm it; if it shows
+no discrimination, the gate is retired rather than carried as unexamined
+faith. RISK ACCEPTED: entries that the (unskilled) gate would have blocked
+may lose money; that is the price of measuring the filter instead of
+believing it.
+
+## 2026-09-01 - OBSERVE MODE EXECUTED (registration above)
+config.yaml ml.entry_gates_enabled: false (declared EXPLICITLY — R19c: config
+is the operating source; the flag was previously absent and ran the code
+default). New config home ml.observe_mode_neutral_confidence 0.60.
+COMPANION FIX SHIPPED (orchestrator eff_conf block): in observe mode a
+direction-neutral structure (RANGE_GATED_STRATEGIES) is validated on the
+neutral baseline instead of the DIRECTIONAL confidence. Without it the flag
+flip alone would have produced ADVERSE SELECTION — condors entering only on
+trending-aligned days, their worst regime. Gates-ON behaviour is untouched:
+the payoff-matched model still owns the number.
+PROOF: tests/test_observe_mode_neutral_confidence.py, 7 executing tests (real
+risk-config contract, real orchestrator scan via the hot-path smoke rig in
+collect mode). Executed pre-fix proof: reverting ONLY the eff_conf hunk makes
+test_condor_carries_the_neutral_baseline_not_the_directional_number FAIL,
+restored -> 7 pass. The premise is pinned too: a neutral-regime directional
+confidence (0.42) is BELOW risk.min_confidence (0.50), so the fix is
+load-bearing rather than decorative.
+tests/test_w2_orchestrator_gates.py::TestRangeGateFailsClosed now ARMS the
+gate explicitly (autouse fixture) instead of inheriting the shipped config —
+the fail-closed behaviour stays proven and ready to re-arm.
+Suite 1490 green, type gate OK, SMOKE PASS 13.
+
+## 2026-09-06 - R24 FULL AUDIT: 109 STANDING (21 live_money) + TRIAGE SAYS 78 OF 123 STILL OPEN
+User: "full audit again, every angle, every bug, every hardcoded, every parameter, every
+logic and reason". 16 angles, 137 raw candidates, STRICT two-lens adversarial verification
+(code-reading + execution probe; both must concede) -> 109 standing, 28 refuted. 80 agents,
+0 errors. Register: reports/full_audit_r24_20260906.md.
+CORRECTION TO THE RECORD: I described W1-W6 as "all six waves complete". The wave SCOPES
+were complete; the REGISTER was not. Triage of the 123 prior findings: 28 FIXED, 19
+PARTIAL, 78 OPEN. The waves closed the headline clusters, not the list.
+THE TWO THAT DOMINATE EVERYTHING ELSE:
+[1] logic-exit-risk-01/-02 — THE STOP-LOSS DOES NOT EXIST AS A MECHANISM. Every multi-leg
+    exit since the R16 "quote the raw Bag" fix takes the NO-QUOTE fallback, which prices a
+    credit close at max(2*mark, entry_credit + 0.25*width) = 6-10x the marked cost at the
+    promoted $39-60 wings (SPY sent as BUY LMT 14.04 against a ~1.4 mark). 61 of 63 exit
+    attempts were REJECTED by IBKR's price band — the broker's own guard is the only thing
+    that prevented paying it. And a price-band reject is handled exactly like a cancel:
+    revert CLOSING->FILLED, back off, re-place the SAME unexecutable limit forever; nothing
+    reads Warning 202's acceptable price. On 08-31 the SPY take-profit looped 32 min and QQQ
+    2h55m. On paper this corrupts the sample; at $3k it converts a defined-risk condor into
+    a full-width loss. FIX THIS FIRST — it outranks every accounting finding.
+[2] logic-entry-01 + params-trading-01 — THE FUNDING PLAN CANNOT TRADE. At the documented
+    $3,000 CAD (~$2.1k USD), even after the PLAN gate-3 recipe (max_position_risk_pct
+    0.03->0.07), the sizer's viability check (max_position_pct 0.05 x NLV = $105) refuses
+    every $2-wide condor collecting the historical $0.67-0.72 credit (max_loss $130 > $105).
+    Deterministically ZERO entries while the launch self-test reports problems=0. Phase 2 —
+    the designated PRIMARY go-live evidence — opens no trades. Day-1 certainty, not a tail.
+OTHER live_money CLUSTERS: W1 outbox is at-most-once not exactly-once (concurrency-01: a
+kill between the claim DELETE and the booking write loses the obligation entirely);
+claim-raises-then-drain double-books one loss into the breaker (regress-live-02,
+concurrency-02); the drain books $0 not-real-close sentinels as LOSSES and RESETS the
+consecutive-loss streak (regress-live-01, pnl-money-01); the fail-closed breaker overwrites
+an intact persisted streak on auto-resume (regress-live-04); PDT history rewritten to a
+single entry on a transient lock (regress-live-05, live at funding); credit floor enforced
+at neither placement nor reprice (regress-live-06); the cooldown caller still swallows every
+exception so a calendar/lock fault silently disables it (regress-live-07, time-calendar-02);
+the pre-event blackout counts WEEKDAYS so holidays make it fail OPEN, opposite to its own
+docstring (time-calendar-01); the cooldown is per-SYMBOL over three ETFs the bot's own
+correlation module calls one 0.95 cluster (logic-exit-risk-03); trades_taken counts orders
+PLACED and is never decremented, so phantom orders spend the intraday entry budget
+(data-integrity-07); Gateway logoff + dead bot is an ABSORBING state the supervisor never
+escapes — already materialized 2026-07-01 for 5h10m, 3h15m inside RTH (ops-substrate-01);
+RUNBOOK "Full stop" never stops the keeper, which relaunches within 90s mid-procedure
+(docs-policy-04).
+THE PRE-REGISTERED OBSERVE-MODE VERDICT IS UNEXECUTABLE (8 findings, critic says merge as
+ONE): the entry-time range probability is never persisted — it exists only in log lines that
+rotate in ~9 trading days, was never produced for SPY/QQQ at all (predict() exits at the
+min-edge gate), trades.ml_confidence silently changed meaning on 09-01, and
+cleanup_old_logs will unlink the durable reports/ half on 2026-10-01. The only decision rule
+we pre-registered cannot be scored. Fix before more observe-mode closes accumulate.
+CRITIC — NEVER AUDITED BY ANY ROUND: src/ait/broker/* (844-line ibkr_client, combo leg
+ratios/signs, orderRef/permId reuse), dashboard/app.py (2102 lines, 12+ raw trades queries),
+the CAD->USD chain account.py -> capital_tiers -> position_sizer (a mismatch is ~35% sizing
+error on day 1), Reg-T margin vs the %-of-NLV budget, correlation.py/selector.py/thompson.py,
+ops_health's own protection logic, notifications/telegram.py (every alert rides it),
+who writes executions.live_mid (go-live criterion [4] may be structurally unmeasurable),
+schema-migration and sqlite->duckdb copy as data-loss surfaces. ALSO: go_live.py:163-167 —
+the go-live bar itself (50/100 closes, PF 1.3, DD 8%, slip 8%) is an unexamined code literal
+with no config home, i.e. the threshold authorizing real capital is outside the R19c policy.
+NO FIXES APPLIED. Fix order proposed: (W7) exit pricing + reject handling; (W8) funding-size
+viability; (W9) booking exactly-once + breaker integrity; (W10) observe-mode measurability;
+(W11) fail-open gates + calendar; (W12) ops substrate.
+
+## 2026-09-06 - W7 EXECUTED: THE STOP-LOSS NOW EXISTS AS A MECHANISM
+Fixes R24's two dominant findings (logic-exit-risk-01/-02). Three linked
+changes, because the exit was broken in three ways at once:
+[1] PRICE CEILING ANCHORED TO THE MARK. The R16 bound was
+    max(2*mark, entry_credit + 0.25*wing_width). The second term was meant as
+    a floor for an unreliable mark but sits inside a max(), so at the promoted
+    $39-60 wings it DOMINATED: SPY marked 1.40 priced its take-profit at
+    4.29 + 0.25*39 = 14.04 (10x), QQQ 2.94 -> 18.60 (6.3x). New helper
+    _exit_price_ceiling = min(width, max(mark + exit_cross, mult * mark)) with
+    mult config-homed (exit.exit_mark_multiple 1.5). SPY 14.04 -> 2.10;
+    QQQ 18.60 -> 4.41; the 08-24 touch stop 19.87 -> 13.14. The wing width
+    stays the structural cap; mark+cross is the floor so the order remains
+    marketable. Applied to BOTH the quoted anchor and the no-quote fallback.
+[2] THE BROKER'S STATED PRICE IS NOW HONOURED. IBKR rejects with "Warning 202
+    ... more aggressive than 1.745 ... current market price of 1.42" and the
+    bot DISCARDED that text, re-placing the identical unexecutable limit every
+    backoff (SPY looped 32 min, QQQ 2h55m on 08-31; a touch stop would loop
+    while the loss grew). TradeExecutor.parse_price_band_reject mines the
+    order log, the cancel path persists {band, market, at} to bot_state, and
+    _exit_band_cap feeds it back as a hard cap on the next attempt (stale >1h
+    ignored so an old band cannot pin a moved market).
+[3] ROOT CAUSE — THE BAG NEVER TICKED. combo_exit_limit appears ZERO times in
+    any retained log: all 63 exits took the no-quote branch and were priced by
+    formula, while the ENTRY path's Bag quotes arrive fine. New
+    _synthesize_combo_cost quotes the FOUR LEGS individually (buy-back legs at
+    the ask, sold legs at the bid) and prices the exit from the real market.
+    Returns None if ANY leg is unquotable — a partial sum would understate the
+    cost and place an unfillable order. Subscriptions are cancelled 1:1 even
+    on exception (the leaked-sub -> market-data-flood -> native-crash class).
+PROOF: tests/test_w7_exit_pricing.py, 20 executing tests driving the real
+functions with the real incident numbers. Pre-fix proof: restoring ONLY the
+old bound makes 5 of them fail; restored -> 20 pass. A test caught a genuine
+defect during development: _exit_band_cap used json.loads but orchestrator.py
+has no module-level json import, so it raised NameError into its own except
+and silently returned None — the exact silent-failure class this project keeps
+finding. Fixed with a local import.
+Suite 1510 green, type gate OK, SMOKE PASS 13.
+NOT YET DEPLOYED — takes effect on the next bot restart.
+REMAINING FROM R24 (unchanged): W8 funding-size viability (at $3k the sizer
+refuses every viable condor while the self-test reports problems=0), W9
+booking exactly-once, W10 observe-mode measurability, W11 fail-open gates +
+holiday blackout, W12 ops substrate (Gateway absorbing state).

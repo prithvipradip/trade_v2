@@ -25,11 +25,18 @@ DB_PATH = Path("data/ait_state.db")
 # Non-real closes (reconciler bookkeeping rows: never_filled / pending /
 # migrated) must not count as closes in PF / win-rate / drawdown — mirrors
 # the filter in status.py.
-_REAL_CLOSE_SQL = (
-    "COALESCE(exit_reason_detailed, '') NOT LIKE '%never_filled%' "
-    "AND COALESCE(exit_reason_detailed, '') NOT LIKE '%pending%' "
-    "AND COALESCE(exit_reason_detailed, '') NOT LIKE '%migrated%'"
+from ait.reporting.go_live import (
+    NOT_REAL_CLOSE_PATTERNS as _NOT_REAL_PATTERNS,
 )
+
+# W3/string-contracts-4: membership now comes from the ONE authority
+# (src/ait/reporting/go_live.py) — this local copy omitted the
+# reconciler $0 sentinels (reconciler_unknown / needs_review), which
+# therefore counted as REAL closes in PF / win-rate / drawdown.
+_REAL_CLOSE_SQL = " ".join(
+    f"COALESCE(exit_reason_detailed, '') NOT LIKE '{_p}'"
+    for _p in _NOT_REAL_PATTERNS
+).replace("' COALESCE", "' AND COALESCE")
 
 
 def _capital_base() -> float:
@@ -131,6 +138,484 @@ def _get_state_json(conn: sqlite3.Connection, key: str) -> dict | list | None:
         return json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# Panel models (W6: string-contracts-5, db-contracts-6, dead-surface-3/-4)
+#
+# The System Health tab read FIVE bot_state keys that nothing in the codebase
+# ever wrote, so every panel deterministically took its fallback branch — and
+# the error panel's fallback was an affirmative green st.success('No errors
+# logged'), which would have shown all-clear through the documented full-day
+# outage.
+#
+# The DECISION for each panel now lives in a pure function here (testable
+# without Streamlit, and one place per decision); the _tab_* renderers only
+# turn the result into widgets.  The invariant every one of them obeys:
+#
+#     an absent channel renders as NOT WIRED, naming the missing producer.
+#     It never renders as green, and never as a bare zero.
+# ---------------------------------------------------------------------------
+
+#: Real data — render it.
+PANEL_OK = "ok"
+#: Channel is wired and current, and genuinely has nothing to show.
+PANEL_EMPTY = "empty"
+#: Channel is wired but its last publish is old: values are historical.
+PANEL_STALE = "stale"
+#: No producer exists for this channel. NEVER green.
+PANEL_NOT_WIRED = "not_wired"
+
+#: Options contract multiplier — mirrors execution/portfolio.py:401, which is
+#: what produced the peak_pnl_pct fractions we divide into.
+_OPTION_MULTIPLIER = 100
+
+_STATUS_ICONS = {
+    "healthy": "🟢", "ok": "🟢", "running": "🟢",
+    "degraded": "🟡",
+    "down": "🔴",
+    "unknown": "⚪",
+}
+
+
+def _ops_health():
+    """ait.monitoring.ops_health, or None when src/ isn't importable."""
+    try:
+        from ait.monitoring import ops_health
+        return ops_health
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def health_channel(conn: sqlite3.Connection, *, now: datetime | None = None):
+    """Wiring/freshness beacon for the watchdog's bot_state health channel."""
+    oh = _ops_health()
+    if oh is None:
+        return None
+    return oh.read_channel_state(conn, now=now)
+
+
+def component_status_panel(conn: sqlite3.Connection, *,
+                           now: datetime | None = None) -> dict:
+    """Component Status panel model (db-contracts-6).
+
+    Reads the same ``bot_state LIKE 'watchdog_%'`` contract the panel always
+    read — which ait.monitoring.watchdog now actually writes — but excludes the
+    two sibling keys that are not component rows, and refuses to show a green
+    dot from a channel that stopped publishing.
+    """
+    oh = _ops_health()
+    skip = set(oh.NON_COMPONENT_KEYS) if oh else {"watchdog_channel", "watchdog_errors"}
+    rows = _safe_fetchall(
+        conn,
+        "SELECT key, value, updated_at FROM bot_state "
+        "WHERE key LIKE 'watchdog_%' ORDER BY key",
+    )
+    rows = [r for r in rows if r.get("key") not in skip]
+    channel = health_channel(conn, now=now)
+    stale = bool(channel is not None and channel.wired and not channel.fresh)
+
+    components = []
+    for row in rows:
+        raw = row.get("value")
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, TypeError):
+            parsed = raw
+        name = str(row.get("key", "")).replace("watchdog_", "").replace("_", " ").title()
+        if isinstance(parsed, dict):
+            status = str(parsed.get("status", "unknown")).lower()
+            components.append({
+                "name": name,
+                "status": status,
+                # A stale channel can only report history, so no dot may read
+                # as "currently green".
+                "icon": "⚪" if stale else _STATUS_ICONS.get(status, "🔴"),
+                "last_seen": parsed.get("last_heartbeat", parsed.get("last_seen", "")),
+                "error_count": parsed.get("error_count", 0),
+                "last_error": parsed.get("last_error", ""),
+                "raw": parsed,
+            })
+        else:
+            components.append({"name": name, "status": "unknown", "icon": "⚪",
+                               "last_seen": "", "error_count": 0,
+                               "last_error": "", "raw": parsed})
+
+    if not components:
+        return {
+            "state": PANEL_NOT_WIRED,
+            "components": [],
+            "channel": channel,
+            "message": (
+                "Component Status NOT WIRED — no bot_state 'watchdog_*' key has "
+                "ever been written. The writer is ait.monitoring.watchdog's "
+                "HealthStatePublisher; if this persists while the bot is up, the "
+                "publisher is disabled or cannot reach data/ait_state.db. "
+                "This is NOT an all-clear."
+            ),
+        }
+    if stale:
+        return {"state": PANEL_STALE, "components": components, "channel": channel,
+                "message": channel.detail}
+    return {"state": PANEL_OK, "components": components, "channel": channel,
+            "message": channel.detail if channel else ""}
+
+
+def memory_panel(conn: sqlite3.Connection, *, now: datetime | None = None) -> dict:
+    """Memory Usage panel model (db-contracts-6)."""
+    raw = _get_state_value(conn, "system_memory_usage")
+    channel = health_channel(conn, now=now)
+    if raw is None:
+        return {
+            "state": PANEL_NOT_WIRED,
+            "memory": None,
+            "channel": channel,
+            "message": ("Memory Usage NOT WIRED — nothing has written "
+                        "bot_state['system_memory_usage']. Writer: "
+                        "ait.monitoring.watchdog."),
+        }
+    try:
+        mem = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        mem = raw
+    stale = bool(channel is not None and channel.wired and not channel.fresh)
+    return {
+        "state": PANEL_STALE if stale else PANEL_OK,
+        "memory": mem,
+        "channel": channel,
+        "message": channel.detail if channel else "",
+    }
+
+
+def error_panel(conn: sqlite3.Connection, *, now: datetime | None = None) -> dict:
+    """Recent Errors panel model (string-contracts-5) — the worst offender.
+
+    The old fallback was ``st.success('No errors logged')``: a GREEN all-clear
+    whose real meaning was "no error channel exists".  Four outcomes now, and
+    only one of them is green:
+
+      ok        — errors recorded, show them
+      empty     — the channel is wired AND current and holds no errors
+      stale     — the channel is wired but stopped publishing (NOT an all-clear)
+      not_wired — nothing writes here at all       (NOT an all-clear)
+    """
+    channel = health_channel(conn, now=now)
+    errors = None
+    source = None
+    # bot_state['error_log'] has no producer in src/ (the orchestrator's
+    # _note_loop_error path goes to logs + Telegram + in-memory streaks only),
+    # but it stays as the primary read so a future writer needs no dashboard
+    # change.  watchdog_errors is the channel that is actually wired today.
+    for key in ("error_log", "watchdog_errors"):
+        raw = _get_state_value(conn, key)
+        if raw is None:
+            continue
+        source = key
+        try:
+            errors = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            errors = raw
+        break
+
+    if source is None:
+        return {
+            "state": PANEL_NOT_WIRED,
+            "errors": [],
+            "source": None,
+            "channel": channel,
+            "message": (
+                "Error channel NOT WIRED — neither bot_state['error_log'] nor "
+                "bot_state['watchdog_errors'] has ever been written, so this "
+                "panel cannot show an error even during a total outage. "
+                "This is NOT an all-clear: read logs/ait.log."
+            ),
+        }
+    if isinstance(errors, list) and errors:
+        return {"state": PANEL_OK, "errors": errors, "source": source,
+                "channel": channel,
+                "message": f"{len(errors)} recorded via bot_state['{source}']"}
+    if not isinstance(errors, list):
+        return {"state": PANEL_OK, "errors": errors, "source": source,
+                "channel": channel,
+                "message": f"raw value from bot_state['{source}']"}
+
+    stale = bool(channel is not None and channel.wired and not channel.fresh)
+    if stale or channel is None or not channel.wired:
+        detail = channel.detail if channel is not None else "health channel unreadable"
+        return {
+            "state": PANEL_STALE,
+            "errors": [],
+            "source": source,
+            "channel": channel,
+            "message": (f"No errors in bot_state['{source}'], but the {detail} "
+                        "An empty list from a channel that stopped publishing "
+                        "is NOT an all-clear."),
+        }
+    return {
+        "state": PANEL_EMPTY,
+        "errors": [],
+        "source": source,
+        "channel": channel,
+        "message": (f"No errors recorded — the watchdog error channel is live "
+                    f"(last publish {channel.updated_at})."),
+    }
+
+
+def model_info_panel(conn: sqlite3.Connection) -> dict:
+    """Model Info panel model (string-contracts-5).
+
+    bot_state['model_version'] has no writer anywhere in src/, so the panel was
+    permanently blank.  ``trade_context.model_version`` IS written on every
+    entry (state.py:721-732), so the honest reading is "the model version
+    recorded on the most recent trade" — real data, correctly labelled, instead
+    of a dead key.
+    """
+    raw = _get_state_value(conn, "model_version")
+    if raw is not None:
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            parsed = raw
+        return {"state": PANEL_OK, "source": "bot_state['model_version']",
+                "model": parsed, "message": ""}
+
+    row = _safe_fetchone(
+        conn,
+        "SELECT tc.model_version AS model_version, t.entry_time AS entry_time, "
+        "       tc.trade_id AS trade_id "
+        "FROM trade_context tc JOIN trades t ON t.trade_id = tc.trade_id "
+        "WHERE COALESCE(tc.model_version, '') != '' "
+        "ORDER BY t.entry_time DESC LIMIT 1",
+    )
+    if row:
+        return {
+            "state": PANEL_OK,
+            "source": "trade_context.model_version",
+            "model": {
+                "model_version": row["model_version"],
+                "recorded_on_trade": row["trade_id"],
+                "entry_time": (row["entry_time"] or "")[:19],
+            },
+            "message": ("bot_state['model_version'] has no writer in src/; this "
+                        "is the version stamped on the most recent trade's "
+                        "context row."),
+        }
+    return {
+        "state": PANEL_NOT_WIRED,
+        "source": None,
+        "model": None,
+        "message": ("Model version NOT WIRED — nothing writes "
+                    "bot_state['model_version'], and no trade_context row "
+                    "carries a version either."),
+    }
+
+
+def meta_label_panel(conn: sqlite3.Connection) -> dict:
+    """Meta-Label Filter panel model (string-contracts-5).
+
+    The old fallback asserted a FACT the dashboard cannot know — "Meta-labeler
+    not yet trained (needs 30+ closed trades with context)" — when the truth is
+    that nothing writes the key, trained or not.
+    """
+    stats = _get_state_json(conn, "meta_label_stats")
+    if isinstance(stats, dict) and stats:
+        return {"state": PANEL_OK, "stats": stats, "message": ""}
+    if stats is not None:
+        return {
+            "state": PANEL_NOT_WIRED,
+            "stats": None,
+            "message": ("bot_state['meta_label_stats'] holds a value this panel "
+                        "cannot read (expected a JSON object)."),
+        }
+    return {
+        "state": PANEL_NOT_WIRED,
+        "stats": None,
+        "message": ("Meta-label stats NOT WIRED — nothing in src/ writes "
+                    "bot_state['meta_label_stats'], so this panel stays blank "
+                    "whether or not the meta-labeler has been trained. It is "
+                    "not evidence about training state."),
+    }
+
+
+def crash_panel(fatal_log=None, legacy_logs=None) -> dict:
+    """Native-crash panel model (log-contracts-3).
+
+    status.py still counts 'Windows fatal exception' in bot_stdout.log, where
+    faulthandler stopped writing when src/ait/main.py:43-48 moved the sink to
+    logs/fatal.log — so it prints "native crashes: 0" forever.  This panel
+    counts the real sink, and reports NOT WIRED when the sink is absent rather
+    than a reassuring zero.
+    """
+    oh = _ops_health()
+    if oh is None:
+        return {"state": PANEL_NOT_WIRED, "report": None,
+                "message": "ait.monitoring.ops_health unavailable."}
+    kw = {}
+    if fatal_log is not None:
+        kw["fatal_log"] = fatal_log
+    if legacy_logs is not None:
+        kw["legacy_logs"] = legacy_logs
+    report = oh.native_crash_report(**kw)
+    if not report["channel_wired"]:
+        return {"state": PANEL_NOT_WIRED, "report": report,
+                "message": report["detail"]}
+    return {
+        "state": PANEL_OK if report["count"] else PANEL_EMPTY,
+        "report": report,
+        "message": report["detail"],
+    }
+
+
+def liveness_panel() -> dict:
+    """Bot-liveness panel model (bot-day-02) — evidence, not process existence."""
+    oh = _ops_health()
+    if oh is None:
+        return {"state": PANEL_NOT_WIRED, "verdict": None,
+                "message": "ait.monitoring.ops_health unavailable."}
+    verdict = oh.bot_liveness()
+    return {
+        "state": PANEL_OK if verdict.ok else PANEL_STALE,
+        "verdict": verdict,
+        "message": verdict.detail,
+    }
+
+
+def add_capture_efficiency(exit_data: pd.DataFrame) -> pd.DataFrame:
+    """Add realized_pnl_pct / capture_pct in a CONSISTENT basis (dead-surface-4).
+
+    The panel showed "Avg Capture Efficiency -1653%", computed as
+    ``realized_pnl / (peak_pnl_pct * 100) * 100`` — absolute DOLLARS divided by
+    a FRACTION.  It is dimensionally meaningless (doubling position size
+    doubles "efficiency"), and a $127 loss on a tiny-peak condor dominated the
+    average at -16376%.
+
+    peak_pnl_pct is a fraction of cost basis (portfolio.py:458-459
+    ``pnl_pct = unrealized_pnl / cost_basis``), so realized P&L must be put in
+    the same basis before the ratio means anything:
+
+        cost_basis   = abs(entry_price) * quantity * multiplier
+        realized_pct = realized_pnl / cost_basis
+        capture_pct  = realized_pct / peak_pnl_pct * 100
+
+    Rows without a usable cost basis get NaN rather than a fabricated number.
+    """
+    df = exit_data.copy()
+    multiplier = _OPTION_MULTIPLIER
+    if "contract_type" in df.columns:
+        mult = df["contract_type"].apply(
+            lambda c: 1 if str(c).lower() == "stock" else _OPTION_MULTIPLIER)
+    else:
+        mult = pd.Series([multiplier] * len(df), index=df.index)
+
+    entry = pd.to_numeric(df.get("entry_price"), errors="coerce").abs()
+    qty = pd.to_numeric(df.get("quantity"), errors="coerce")
+    realized = pd.to_numeric(df.get("realized_pnl"), errors="coerce")
+    peak = pd.to_numeric(df.get("peak_pnl_pct"), errors="coerce")
+
+    cost_basis = entry * qty * mult
+    cost_basis = cost_basis.where(cost_basis > 0)
+    df["cost_basis"] = cost_basis
+    df["realized_pnl_pct"] = realized / cost_basis
+    df["capture_pct"] = (df["realized_pnl_pct"] / peak.where(peak > 0)) * 100
+    return df
+
+
+def capture_efficiency_panel(exit_data: pd.DataFrame) -> dict:
+    """Profit-capture panel model (dead-surface-4)."""
+    if exit_data is None or exit_data.empty:
+        return {"state": PANEL_EMPTY, "rows": None, "avg_capture": None,
+                "avg_peak": None, "dropped": 0,
+                "message": "No closed trades with exit journalling yet."}
+    peak = pd.to_numeric(exit_data.get("peak_pnl_pct"), errors="coerce")
+    has_peak = exit_data[peak > 0]
+    if has_peak.empty:
+        return {"state": PANEL_EMPTY, "rows": None, "avg_capture": None,
+                "avg_peak": None, "dropped": 0,
+                "message": "No trades with peak P&L data yet."}
+    enriched = add_capture_efficiency(has_peak)
+    usable = enriched[enriched["capture_pct"].notna()]
+    dropped = int(len(enriched) - len(usable))
+    if usable.empty:
+        return {
+            "state": PANEL_NOT_WIRED, "rows": enriched, "avg_capture": None,
+            "avg_peak": float(pd.to_numeric(enriched["peak_pnl_pct"],
+                                            errors="coerce").mean()),
+            "dropped": dropped,
+            "message": (f"Capture efficiency not computable for any of "
+                        f"{len(enriched)} trades — entry_price/quantity give no "
+                        "cost basis, so realized P&L cannot be put in the same "
+                        "unit as peak_pnl_pct."),
+        }
+    # The MEDIAN is the headline: capture is a ratio with peak_pnl_pct in the
+    # denominator, so a trade that barely went positive before reversing
+    # (NVDA: peak +0.78%, closed -45%) legitimately scores -5828% and drags any
+    # mean far outside the range of every other trade. The mean is still
+    # reported, labelled, next to it.
+    notes = []
+    if dropped:
+        notes.append(f"{dropped} trade(s) excluded: no usable cost basis.")
+    outliers = int((usable["capture_pct"].abs() > 500).sum())
+    if outliers:
+        notes.append(f"{outliers} trade(s) beyond +/-500% (near-zero peak in the "
+                     "denominator) skew the mean; the median is the headline.")
+    return {
+        "state": PANEL_OK,
+        "rows": enriched,
+        "avg_capture": float(usable["capture_pct"].mean()),
+        "median_capture": float(usable["capture_pct"].median()),
+        "outliers": outliers,
+        "avg_peak": float(pd.to_numeric(enriched["peak_pnl_pct"],
+                                        errors="coerce").mean()),
+        "dropped": dropped,
+        "message": " ".join(notes),
+    }
+
+
+def direction_accuracy_panel(exit_data: pd.DataFrame) -> dict:
+    """ML Direction Accuracy panel model (dead-surface-3).
+
+    ``trades.direction_correct`` sits at its DDL default -1 on every row:
+    close_trade's UPDATE (state.py:386-394) never writes it, despite
+    record_trade's docstring promising it is "populated on close".  The old
+    fallback, ``st.info('No direction accuracy data yet (needs trade context)')``,
+    reads as "keep trading and it will fill in" — it never will.  State it.
+    """
+    if exit_data is None or exit_data.empty or "direction_correct" not in exit_data:
+        return {"state": PANEL_NOT_WIRED, "correct": 0, "total": 0,
+                "right_but_lost": 0, "unset": 0,
+                "message": ("Direction accuracy NOT RECORDED — no closed trades "
+                            "carry a direction_correct value.")}
+    col = pd.to_numeric(exit_data["direction_correct"], errors="coerce")
+    known = exit_data[col.isin([0, 1])]
+    unset = int((col == -1).sum())
+    if known.empty:
+        return {
+            "state": PANEL_NOT_WIRED,
+            "correct": 0, "total": 0, "right_but_lost": 0, "unset": unset,
+            "message": (
+                f"Direction accuracy NOT RECORDED — all {unset} closed trade(s) "
+                "sit at the DDL default direction_correct = -1. "
+                "StateManager.close_trade (state.py:386-394) does not write the "
+                "column, so this panel can never populate no matter how many "
+                "trades close. It is not 'no data yet'."
+            ),
+        }
+    correct = int(pd.to_numeric(known["direction_correct"], errors="coerce").sum())
+    total = int(len(known))
+    right_but_lost = int(len(known[
+        (pd.to_numeric(known["direction_correct"], errors="coerce") == 1)
+        & (pd.to_numeric(known["realized_pnl"], errors="coerce") <= 0)
+    ]))
+    return {
+        "state": PANEL_OK,
+        "correct": correct,
+        "total": total,
+        "accuracy": correct / total * 100 if total else 0.0,
+        "right_but_lost": right_but_lost,
+        "unset": unset,
+        "message": (f"{unset} further closed trade(s) still unwritten "
+                    "(direction_correct = -1)." if unset else ""),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -907,10 +1392,14 @@ def _tab_trade_intelligence(conn: sqlite3.Connection) -> None:
     # Trades with journaling data — exclude bookkeeping closes so
     # stale_pending_never_filled etc. don't pollute the exit-reason and
     # direction-accuracy aggregates
+    # dead-surface-4: entry_price/quantity/contract_type are selected so
+    # realized P&L can be expressed in the SAME basis as peak_pnl_pct (a
+    # fraction of cost basis). Without them the panel divided dollars by a
+    # percentage.
     exit_data = _safe_query(
         conn,
         f"SELECT symbol, strategy, exit_reason_detailed, peak_pnl_pct, "
-        f"realized_pnl, direction_correct "
+        f"realized_pnl, direction_correct, entry_price, quantity, contract_type "
         f"FROM trades WHERE status = 'closed' AND exit_reason_detailed != '' "
         f"AND {_REAL_CLOSE_SQL} "
         f"ORDER BY exit_time DESC LIMIT 50",
@@ -932,58 +1421,70 @@ def _tab_trade_intelligence(conn: sqlite3.Connection) -> None:
 
         # Peak vs Realized P&L (profit giveback analysis)
         st.write("**Peak vs Realized P&L (Profit Capture Efficiency)**")
-        has_peak = exit_data[exit_data["peak_pnl_pct"] > 0].copy()
-        if not has_peak.empty:
-            has_peak["capture_pct"] = has_peak.apply(
-                lambda r: (r["realized_pnl"] / (r["peak_pnl_pct"] * 100)) * 100
-                if r["peak_pnl_pct"] > 0 else 0, axis=1
-            )
-            avg_capture = has_peak["capture_pct"].mean()
-            avg_peak = has_peak["peak_pnl_pct"].mean()
+        cap = capture_efficiency_panel(exit_data)
+        if cap["state"] == PANEL_OK:
+            rows = cap["rows"]
             c1, c2 = st.columns(2)
-            c1.metric("Avg Peak P&L %", f"{avg_peak:.1%}")
-            c2.metric("Avg Capture Efficiency", f"{avg_capture:.0f}%")
+            c1.metric("Avg Peak P&L %", f"{cap['avg_peak']:.1%}")
+            c2.metric("Median Capture Efficiency",
+                      f"{cap['median_capture']:.0f}%")
+            st.caption(
+                "capture = realized P&L / peak P&L, both as a fraction of the "
+                "same cost basis (abs(entry_price) x quantity x multiplier). "
+                "Before W6 this divided dollars by a percentage and read -1653%. "
+                f"Mean across {len(cap['rows'])} trades: "
+                f"{cap['avg_capture']:.0f}%."
+            )
+            if cap["message"]:
+                st.caption(cap["message"])
 
+            # dead-surface-4: both series are now PERCENTAGES, so one y-axis is
+            # meaningful. It previously mixed peak-% with realized-dollars.
             fig = go.Figure()
             fig.add_trace(go.Bar(
-                x=has_peak["symbol"],
-                y=has_peak["peak_pnl_pct"] * 100,
+                x=rows["symbol"],
+                y=rows["peak_pnl_pct"] * 100,
                 name="Peak P&L %",
                 marker_color="lightblue",
             ))
             fig.add_trace(go.Bar(
-                x=has_peak["symbol"],
-                y=has_peak["realized_pnl"],
-                name="Realized P&L $",
-                marker_color=["green" if p > 0 else "red" for p in has_peak["realized_pnl"]],
+                x=rows["symbol"],
+                y=rows["realized_pnl_pct"] * 100,
+                name="Realized P&L %",
+                marker_color=["green" if p > 0 else "red"
+                              for p in rows["realized_pnl_pct"].fillna(0)],
             ))
-            fig.update_layout(barmode="group", height=350)
+            fig.update_layout(barmode="group", height=350,
+                              yaxis_title="% of cost basis")
             st.plotly_chart(fig, use_container_width=True)
+        elif cap["state"] == PANEL_NOT_WIRED:
+            st.warning(cap["message"])
         else:
-            st.info("No trades with peak P&L data yet")
+            st.info(cap["message"])
 
         st.divider()
 
         # Direction accuracy
         st.write("**ML Direction Accuracy**")
-        known = exit_data[exit_data["direction_correct"].isin([0, 1])]
-        if not known.empty:
-            correct = known["direction_correct"].sum()
-            total = len(known)
+        dir_panel = direction_accuracy_panel(exit_data)
+        if dir_panel["state"] == PANEL_OK:
             dc1, dc2, dc3 = st.columns(3)
-            dc1.metric("Direction Correct", f"{correct}/{total}")
-            dc2.metric("Direction Accuracy", f"{correct / total * 100:.1f}%")
-
-            # Direction right but lost money = exit problem
-            right_but_lost = known[(known["direction_correct"] == 1) & (known["realized_pnl"] <= 0)]
-            dc3.metric("Right Direction, Lost $", f"{len(right_but_lost)}/{correct}")
-            if len(right_but_lost) > 0:
+            dc1.metric("Direction Correct",
+                       f"{dir_panel['correct']}/{dir_panel['total']}")
+            dc2.metric("Direction Accuracy", f"{dir_panel['accuracy']:.1f}%")
+            dc3.metric("Right Direction, Lost $",
+                       f"{dir_panel['right_but_lost']}/{dir_panel['correct']}")
+            if dir_panel["right_but_lost"] > 0:
                 st.warning(
-                    f"{len(right_but_lost)} trades had correct direction but lost money — "
-                    "exit management is the bottleneck, not ML predictions."
+                    f"{dir_panel['right_but_lost']} trades had correct direction "
+                    "but lost money — exit management is the bottleneck, not ML "
+                    "predictions."
                 )
+            if dir_panel["message"]:
+                st.caption(dir_panel["message"])
         else:
-            st.info("No direction accuracy data yet (needs trade context)")
+            # dead-surface-3: NOT "no data yet" — the column is never written.
+            st.warning(dir_panel["message"])
     else:
         st.info("No exit intelligence data yet — trades need exit_reason_detailed")
 
@@ -1036,8 +1537,9 @@ def _tab_trade_intelligence(conn: sqlite3.Connection) -> None:
 
     # --- Meta-Label Stats ---
     st.subheader("Meta-Label Filter")
-    meta_stats = _get_state_json(conn, "meta_label_stats")
-    if meta_stats and isinstance(meta_stats, dict):
+    meta_panel = meta_label_panel(conn)
+    meta_stats = meta_panel["stats"]
+    if meta_panel["state"] == PANEL_OK and isinstance(meta_stats, dict):
         m1, m2, m3 = st.columns(3)
         m1.metric("Accuracy", f"{meta_stats.get('accuracy', 0):.1%}")
         m2.metric("Precision", f"{meta_stats.get('precision', 0):.1%}")
@@ -1052,110 +1554,132 @@ def _tab_trade_intelligence(conn: sqlite3.Connection) -> None:
             ])
             st.dataframe(feat_df, use_container_width=True, hide_index=True)
     else:
-        st.info("Meta-labeler not yet trained (needs 30+ closed trades with context)")
+        # string-contracts-5: the old copy asserted "not yet trained (needs 30+
+        # closed trades)" — a claim about training state the dashboard has no
+        # way to know, when the truth is that nothing writes the key at all.
+        st.warning(meta_panel["message"])
 
 
 def _tab_system_health(conn: sqlite3.Connection) -> None:
+    """System Health tab.
+
+    W6 string-contracts-5 / db-contracts-6: every panel here used to read a
+    bot_state key with no writer, and the error panel's fallback was a green
+    st.success('No errors logged').  All panel decisions now come from the pure
+    models above, whose invariant is that an absent channel says NOT WIRED and
+    never renders green.
+    """
     import streamlit as st
 
-    # Watchdog / component status
+    # --- Bot liveness (bot-day-02: evidence, not process existence) ---
+    st.subheader("Bot Liveness")
+    live = liveness_panel()
+    verdict = live.get("verdict")
+    if verdict is None:
+        st.warning(live["message"])
+    elif verdict.ok:
+        st.success(f"{verdict.state}: {verdict.detail}")
+    else:
+        st.error(f"{verdict.state}: {verdict.detail}")
+    if verdict is not None and verdict.heartbeat_age_s is not None:
+        st.caption(f"data/bot_heartbeat age: {verdict.heartbeat_age_s / 60:.1f} min")
+
+    st.divider()
+
+    # --- Watchdog / component status ---
     st.subheader("Component Status")
-    watchdog_keys = _safe_query(
-        conn,
-        "SELECT key, value FROM bot_state WHERE key LIKE 'watchdog_%' ORDER BY key",
-    )
-    if not watchdog_keys.empty:
-        for _, row in watchdog_keys.iterrows():
-            key_name = row["key"].replace("watchdog_", "").replace("_", " ").title()
-            val = row["value"]
-            try:
-                parsed = json.loads(val) if isinstance(val, str) else val
-            except (json.JSONDecodeError, TypeError):
-                parsed = val
-
-            if isinstance(parsed, dict):
-                status = parsed.get("status", "unknown")
-                icon = "🟢" if status in ("ok", "running", "healthy") else "🔴"
-                last_seen = parsed.get("last_heartbeat", parsed.get("last_seen", ""))
-                st.write(f"{icon} **{key_name}** — {status}")
-                if last_seen:
-                    st.caption(f"Last seen: {last_seen}")
-            else:
-                st.write(f"**{key_name}**: {parsed}")
+    panel = component_status_panel(conn)
+    if panel["state"] == PANEL_NOT_WIRED:
+        st.warning(panel["message"])
     else:
-        st.info("No watchdog data available")
+        if panel["state"] == PANEL_STALE:
+            st.warning(panel["message"])
+        elif panel["message"]:
+            st.caption(panel["message"])
+        for comp in panel["components"]:
+            st.write(f"{comp['icon']} **{comp['name']}** — {comp['status']}")
+            bits = []
+            if comp["last_seen"]:
+                bits.append(f"Last seen: {comp['last_seen']}")
+            if comp["error_count"]:
+                bits.append(f"errors: {comp['error_count']}")
+            if comp["last_error"]:
+                bits.append(f"last error: {comp['last_error']}")
+            if bits:
+                st.caption(" | ".join(str(b) for b in bits))
 
     st.divider()
 
-    # Memory usage
+    # --- Memory usage ---
     st.subheader("Memory Usage")
-    mem_val = _get_state_value(conn, "system_memory_usage")
-    if mem_val:
-        try:
-            mem = json.loads(mem_val)
-            if isinstance(mem, dict):
-                mc1, mc2 = st.columns(2)
-                mc1.metric("RSS (MB)", f"{mem.get('rss_mb', 'N/A')}")
-                mc2.metric("VMS (MB)", f"{mem.get('vms_mb', 'N/A')}")
-            else:
-                st.write(f"Memory: {mem}")
-        except (json.JSONDecodeError, TypeError):
-            st.write(f"Memory: {mem_val}")
+    mem_panel = memory_panel(conn)
+    if mem_panel["state"] == PANEL_NOT_WIRED:
+        st.warning(mem_panel["message"])
     else:
-        st.info("No memory usage data available")
-
-    st.divider()
-
-    # Error log
-    st.subheader("Recent Errors")
-    errors_raw = _get_state_value(conn, "error_log")
-    if errors_raw:
-        try:
-            errors = json.loads(errors_raw)
-            if isinstance(errors, list):
-                last_20 = errors[-20:]
-                last_20.reverse()
-                err_df = pd.DataFrame(last_20)
-                st.dataframe(err_df, use_container_width=True, hide_index=True)
-            else:
-                st.code(str(errors))
-        except (json.JSONDecodeError, TypeError):
-            st.code(errors_raw)
-    else:
-        # Try watchdog_errors key as fallback
-        errors_raw2 = _get_state_value(conn, "watchdog_errors")
-        if errors_raw2:
-            try:
-                errors = json.loads(errors_raw2)
-                if isinstance(errors, list):
-                    last_20 = errors[-20:]
-                    last_20.reverse()
-                    err_df = pd.DataFrame(last_20)
-                    st.dataframe(err_df, use_container_width=True, hide_index=True)
-                else:
-                    st.code(str(errors))
-            except (json.JSONDecodeError, TypeError):
-                st.code(errors_raw2)
+        mem = mem_panel["memory"]
+        if isinstance(mem, dict):
+            mc1, mc2 = st.columns(2)
+            mc1.metric("RSS (MB)", f"{mem.get('rss_mb', 'N/A')}")
+            mc2.metric("VMS (MB)", f"{mem.get('vms_mb', 'N/A')}")
         else:
-            st.success("No errors logged")
+            st.write(f"Memory: {mem}")
+        if mem_panel["state"] == PANEL_STALE:
+            st.warning(mem_panel["message"])
 
     st.divider()
 
-    # Model version info
-    st.subheader("Model Info")
-    model_val = _get_state_value(conn, "model_version")
-    if model_val:
-        try:
-            model = json.loads(model_val)
-            if isinstance(model, dict):
-                for k, v in model.items():
-                    st.write(f"**{k}**: {v}")
-            else:
-                st.write(f"Model version: {model}")
-        except (json.JSONDecodeError, TypeError):
-            st.write(f"Model version: {model_val}")
+    # --- Error log ---
+    st.subheader("Recent Errors")
+    errs = error_panel(conn)
+    if errs["state"] == PANEL_OK:
+        payload = errs["errors"]
+        if isinstance(payload, list):
+            last_20 = list(payload)[-20:]
+            last_20.reverse()
+            st.dataframe(pd.DataFrame(last_20), use_container_width=True,
+                         hide_index=True)
+        else:
+            st.code(str(payload))
+        st.caption(errs["message"])
+    elif errs["state"] == PANEL_EMPTY:
+        # The ONLY green branch: the channel is wired AND currently publishing.
+        st.success(errs["message"])
     else:
-        st.info("No model version info available")
+        st.warning(errs["message"])
+
+    st.divider()
+
+    # --- Native crashes (log-contracts-3) ---
+    st.subheader("Native Crashes")
+    crashes = crash_panel()
+    if crashes["state"] == PANEL_NOT_WIRED:
+        st.warning(crashes["message"])
+    else:
+        report = crashes["report"]
+        cc1, cc2 = st.columns(2)
+        cc1.metric("faulthandler dumps", report["count"])
+        cc2.metric("in logs/fatal.log", report["fatal_count"])
+        st.caption(crashes["message"])
+        if report.get("last_write"):
+            st.caption(f"fatal.log last written: {report['last_write']}")
+
+    st.divider()
+
+    # --- Model version info ---
+    st.subheader("Model Info")
+    model = model_info_panel(conn)
+    if model["state"] == PANEL_NOT_WIRED:
+        st.warning(model["message"])
+    else:
+        payload = model["model"]
+        if isinstance(payload, dict):
+            for k, v in payload.items():
+                st.write(f"**{k}**: {v}")
+        else:
+            st.write(f"Model version: {payload}")
+        st.caption(f"source: {model['source']}")
+        if model["message"]:
+            st.caption(model["message"])
 
 
 # ---------------------------------------------------------------------------

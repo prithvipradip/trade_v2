@@ -36,6 +36,13 @@ def _bt(**kw):
     bt._credit_loss_limit_mult = 0.0
     bt._touch_stop_enabled = kw.get("touch", True)
     bt._economic_cal = None
+    # R20: the exit path now reads the shared exit_policy ladder with live's
+    # time_decay_scaling flag — bare fixtures must model it like live (True).
+    bt._exit_time_decay_scaling = True
+    # DTE/hold-cap decoupling fix: max_hold_days is now a genuine exit
+    # trigger checked separately from expiry_date — bare fixtures need it
+    # set to something that won't fire within the ~8-day test windows here.
+    bt._max_hold_days = kw.get("max_hold_days", 30)
     return bt
 
 

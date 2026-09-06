@@ -31,11 +31,17 @@ IRON_CONDOR_SPACE: dict[str, tuple] = {
     # Exp 18 (H1 test): stop_loss_pct, profit_target_pct, trailing_stop_fraction frozen at
     #   ablation defaults (0.35, 0.50, 0.70). These are risk-management constants that
     #   don't vary by market regime — optimising them per window overfit train-path noise.
-    #   Only the 3 regime-specific params + fractal gate + iv_rank gate remain in the search space (7 total).
+    #   Only the regime-specific params + fractal gate + iv_rank/edge gates remain in the
+    #   search space (8 total — R20: the old "7 total" note miscounted; also note that
+    #   until R20 the iv_rank_rise_threshold and min_edge_over_baseline dimensions never
+    #   reached the trial Backtester at all, so the Exp 26/28 training-side searches over
+    #   them were vacuous — see optimizer._run_backtest bt_kwargs invariant).
     "delta_short":            ("float", 0.15, 0.30),
-    # [14, 40]: 60-day OOS windows give a 20-day end buffer (60-40=20), keeping
-    # backtest_end exits rare while still allowing meaningful theta harvesting.
-    "max_hold_days":          ("int",   14,   40),
+    # IC credit trades close at DTE<=5, and entry_dte defaults to 14, so holds
+    # can last ~9 calendar days before expiry_approaching takes over. Keep the
+    # searched range inside that reachable window so this dimension can move
+    # trial outcomes instead of becoming flat noise.
+    "max_hold_days":          ("int",   1,    9),
     "wing_k":                 ("float", 0.30, 2.00),
     # Exp 26: iv_rank_rise gate threshold tunable per window. Fixed 0.30 was blocking
     # profitable W01/W02 entries (gradual IV drift pre-crash) once context_bars=252
@@ -57,7 +63,11 @@ LONG_CALL_SPACE: dict[str, tuple] = {
     "stop_loss_pct":     ("float", 0.30, 0.60),
     "profit_target_pct": ("float", 0.60, 1.50),
     "delta_long":        ("float", 0.25, 0.55),
-    "max_hold_days":     ("int",   14,   60),
+    # PR#7 review 2026-08-25: entry_dte is 14 (options.dte_range[0]), so a
+    # debit position EXPIRES at day ~14 — every searched value above 14 was
+    # identical to hold-to-expiry (a flat/noise Optuna dimension). Bound the
+    # range to the reachable horizon so the dimension can move outcomes.
+    "max_hold_days":     ("int",   5,    14),
     "iv_floor":          ("float", 0.08, 0.25),
 }
 
@@ -66,7 +76,11 @@ LONG_PUT_SPACE: dict[str, tuple] = {
     "stop_loss_pct":     ("float", 0.30, 0.60),
     "profit_target_pct": ("float", 0.60, 1.50),
     "delta_long":        ("float", 0.25, 0.55),
-    "max_hold_days":     ("int",   14,   60),
+    # PR#7 review 2026-08-25: entry_dte is 14 (options.dte_range[0]), so a
+    # debit position EXPIRES at day ~14 — every searched value above 14 was
+    # identical to hold-to-expiry (a flat/noise Optuna dimension). Bound the
+    # range to the reachable horizon so the dimension can move outcomes.
+    "max_hold_days":     ("int",   5,    14),
     "iv_floor":          ("float", 0.08, 0.25),
 }
 
@@ -75,7 +89,11 @@ BULL_CALL_SPREAD_SPACE: dict[str, tuple] = {
     "stop_loss_pct":     ("float", 0.30, 0.65),
     "profit_target_pct": ("float", 0.50, 0.90),
     "delta_long":        ("float", 0.30, 0.55),
-    "max_hold_days":     ("int",   14,   60),
+    # PR#7 review 2026-08-25: entry_dte is 14 (options.dte_range[0]), so a
+    # debit position EXPIRES at day ~14 — every searched value above 14 was
+    # identical to hold-to-expiry (a flat/noise Optuna dimension). Bound the
+    # range to the reachable horizon so the dimension can move outcomes.
+    "max_hold_days":     ("int",   5,    14),
 }
 
 BEAR_PUT_SPREAD_SPACE: dict[str, tuple] = {
@@ -83,7 +101,11 @@ BEAR_PUT_SPREAD_SPACE: dict[str, tuple] = {
     "stop_loss_pct":     ("float", 0.30, 0.65),
     "profit_target_pct": ("float", 0.50, 0.90),
     "delta_long":        ("float", 0.30, 0.55),
-    "max_hold_days":     ("int",   14,   60),
+    # PR#7 review 2026-08-25: entry_dte is 14 (options.dte_range[0]), so a
+    # debit position EXPIRES at day ~14 — every searched value above 14 was
+    # identical to hold-to-expiry (a flat/noise Optuna dimension). Bound the
+    # range to the reachable horizon so the dimension can move outcomes.
+    "max_hold_days":     ("int",   5,    14),
 }
 
 SHORT_STRANGLE_SPACE: dict[str, tuple] = {
@@ -92,7 +114,11 @@ SHORT_STRANGLE_SPACE: dict[str, tuple] = {
     "profit_target_pct":    ("float", 0.30, 0.70),
     "trailing_stop_fraction": ("float", 0.30, 0.90),
     "delta_short":            ("float", 0.10, 0.25),
-    "max_hold_days":          ("int",   14,   40),
+    # PR#7 review 2026-08-25: same reachability bound as IRON_CONDOR_SPACE
+    # above — entry_dte is 14 (options.dte_range[0]) and credit structures
+    # close at DTE<=5, so holds cap at ~9 calendar days; the old 14+ range
+    # was entirely unreachable (a flat/noise Optuna dimension every trial).
+    "max_hold_days":          ("int",   1,    9),
     "iv_floor":             ("float", 0.15, 0.40),
     "delta_iv_scale":       ("float", 0.0,  1.0),
     "max_entry_vol_annual": ("float", 0.25, 0.90),
@@ -104,7 +130,11 @@ LONG_STRANGLE_SPACE: dict[str, tuple] = {
     "stop_loss_pct":     ("float", 0.30, 0.60),
     "profit_target_pct": ("float", 0.50, 2.00),
     "delta_long":        ("float", 0.10, 0.35),
-    "max_hold_days":     ("int",   14,   45),
+    # PR#7 review 2026-08-25: entry_dte is 14 (options.dte_range[0]), so a
+    # debit position EXPIRES at day ~14 — every searched value above 14 was
+    # identical to hold-to-expiry (a flat/noise Optuna dimension). Bound the
+    # range to the reachable horizon so the dimension can move outcomes.
+    "max_hold_days":     ("int",   5,    14),
     "iv_floor":          ("float", 0.15, 0.40),
     "delta_iv_scale":    ("float", 0.0,  1.0),
 }
@@ -114,7 +144,11 @@ PUT_CREDIT_SPREAD_SPACE: dict[str, tuple] = {
     "stop_loss_pct":     ("float", 0.30, 0.70),
     "profit_target_pct": ("float", 0.30, 0.70),
     "delta_short":       ("float", 0.15, 0.30),
-    "max_hold_days":     ("int",   14,   45),
+    # PR#7 review 2026-08-25: same reachability bound as IRON_CONDOR_SPACE
+    # above — entry_dte is 14 (options.dte_range[0]) and credit structures
+    # close at DTE<=5, so holds cap at ~9 calendar days; the old 14+ range
+    # was entirely unreachable (a flat/noise Optuna dimension every trial).
+    "max_hold_days":     ("int",   1,    9),
     "iv_floor":          ("float", 0.08, 0.25),
     "wing_k":            ("float", 0.30, 2.00),
 }

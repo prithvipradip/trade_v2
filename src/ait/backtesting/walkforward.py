@@ -58,7 +58,12 @@ class WalkForwardConfig:
     slippage_pct: float = 0.03  # 3% realistic for multi-leg options
     position_size_pct: float = 0.05
     wing_floor_dollars: float = 2.0   # R6 parity: live iron_condor min wing is $2, not $5
-    wing_k: float = 1.0
+    # R20b (pre-registered PLAN 2026-08-21): was a hardcoded 1.0 — the frozen
+    # 2026-07 default that shadowed the PROMOTED live value (contract 1.6 since
+    # the 2026-08-04 wide-wing promotion). None -> __post_init__ resolves via
+    # contract_float("AIT_IC_WING_K"): env > config.yaml backtest.wing_k > 1.6.
+    # Explicit values always win.
+    wing_k: float | None = None
     # ML ABLATION (pre-registered PLAN 2026-08-03): False = gate-stack-only
     # arm — NO window models trained (direction AND range predictors both
     # read None) and the engine runs ungated (its designed fallback).
@@ -70,13 +75,30 @@ class WalkForwardConfig:
     # entries deliberately NOT blocked — unlike a FAILED training, which
     # blocks OOS IC entries via range_min_confidence=1.0 + engine R16 #3).
     train_window_models: bool = True
-    iv_floor: float = 0.12
+    # R20b follow-up: was a hardcoded 0.12 while live/engine resolve
+    # settings.backtest.iv_floor (config.yaml 0.20) — the same "constructor
+    # default silently shadows config" defect range_min_confidence was fixed
+    # for below, just missed for this field. None -> __post_init__ resolves
+    # load_settings().backtest.iv_floor (BacktestConfig default when no
+    # config.yaml is reachable). Explicit values always win.
+    iv_floor: float | None = None
     delta_iv_scale: float = 0.0
-    stop_loss_pct: float = 0.35            # Cut losses at 35% (options decay fast)
-    profit_target_pct: float = 0.50         # Take profits at 50% (don't be greedy)
-    max_hold_days: int = 21                 # 3 weeks max (avoid deep theta decay)
-    min_confidence: float = 0.55
-    range_min_confidence: float = 0.55     # threshold for range model on iron condors
+    stop_loss_pct: float | None = None      # None -> __post_init__ resolves
+    profit_target_pct: float | None = None  # settings.backtest baselines
+    max_hold_days: int | None = None
+    # R20b follow-up: was a hardcoded 0.55 while live/engine resolve
+    # settings.risk.min_confidence (config.yaml 0.50) — same defect class as
+    # iv_floor above. None -> __post_init__ resolves load_settings()
+    # .risk.min_confidence (RiskConfig default when no config.yaml is
+    # reachable). Explicit values always win.
+    min_confidence: float | None = None
+    # R20b (pre-registered PLAN 2026-08-21): was a hardcoded 0.55 while live
+    # gates on ml.range_min_confidence = 0.65 (config.yaml; 0.65 beat 0.55
+    # across every backtest metric) — the parity gap the range-floor sweep
+    # exposed. None -> __post_init__ resolves load_settings().ml
+    # .range_min_confidence (MLConfig default 0.65 when no config.yaml is
+    # reachable). Explicit values always win.
+    range_min_confidence: float | None = None  # threshold for range model on iron condors
     trailing_stop_enabled: bool = True
     trailing_stop_pct: float = 0.25
     breakeven_trigger_pct: float = 0.30
@@ -88,18 +110,33 @@ class WalkForwardConfig:
     optimize_min_trades: int = 10    # Penalise trials with fewer trades than this floor
     optimize_seed: int = 42          # TPESampler seed — fix for reproducibility
     range_threshold_pct: float = 0.05  # Target move % for range model; links to strategy profitability
-    hurst_regime_threshold: float = 0.20
-    hurst_regime_penalty: float = 0.10
+    hurst_regime_threshold: float | None = None
+    hurst_regime_penalty: float | None = None
     hurst_hard_veto_multiplier: float = 0.0   # 0=disabled; Exp 20 post-mortem: QQQ spread never < 0.43, any multiplier blocks all entries
-    multifractal_max_width: float = 0.50
-    iv_rank_rise_threshold: float = 0.30      # Exp 20: suppress IC entry when IV rank rose > this over last 10 days
+    multifractal_max_width: float | None = None
+    # R20b review follow-up: was a hardcoded 0.30 while StrategyOptimizer's
+    # OWN copy of this field was already migrated to the None-sentinel +
+    # config-resolution pattern this PR gave every sibling field -- config.yaml
+    # edits to backtest.iv_rank_rise_threshold were inert on the default
+    # (non-optimized) walk-forward path, which forwards window_cfg's own
+    # frozen value straight into the OOS Backtester. None -> __post_init__
+    # resolves load_settings().backtest.iv_rank_rise_threshold.
+    iv_rank_rise_threshold: float | None = None  # Exp 20: suppress IC entry when IV rank rose > this over last 10 days
     pct_from_60d_high_threshold: float = -1.0 # Exp 27: suppress IC entry when price is this far below 60d rolling high (-1.0 = disabled)
-    min_edge_over_baseline: float = 0.05      # Exp 28: min weighted CV edge for range predictor to activate (0.0 = always use, higher = stricter quality gate)
-    # Intraday execution params (Fix 1 / Gap H)
-    scan_interval_minutes: int = 60        # how often to scan for signals during a session
-    entry_window_start_et: str = "09:30"   # earliest allowed entry time (ET)
-    entry_window_end_et: str = "15:30"     # latest allowed entry time (ET)
-    limit_order_timeout_bars: int = 3      # cancel limit order after N 5-min bars without fill
+    # R20b review follow-up: same defect class as iv_rank_rise_threshold above.
+    min_edge_over_baseline: float | None = None  # Exp 28: min weighted CV edge for range predictor to activate (0.0 = always use, higher = stricter quality gate)
+    # Intraday execution params (Fix 1 / Gap H).
+    # R20 #4/#5b: these four were PHANTOM — declared here (with their own
+    # '09:30' fork of the entry window) but never forwarded to Backtester, so
+    # setting them did nothing and every OOS run traded the engine's old
+    # hardcoded 09:30-15:30 window while config declared 10:30. They are now
+    # forwarded at BOTH Backtester construction sites; None = defer to the ONE
+    # config-backed source (settings.backtest / config.yaml, default 10:30),
+    # which the engine resolves itself.
+    scan_interval_minutes: int | None = None    # how often to scan for signals during a session
+    entry_window_start_et: str | None = None    # earliest allowed entry time (ET)
+    entry_window_end_et: str | None = None      # latest allowed entry time (ET)
+    limit_order_timeout_bars: int | None = None # cancel limit order after N 5-min bars without fill
     # Options spread model params (Fix 5 / Gap E)
     spread_base: float = 0.03             # base half-spread per leg ($)
     spread_iv_sensitivity: float = 0.10   # additional spread per unit IV above 0.20
@@ -110,7 +147,11 @@ class WalkForwardConfig:
     credit_loss_limit_mult: float | None = None   # env AIT_CREDIT_LOSS_LIMIT (live default 0
                                                   # = flat stop DISABLED; R12-B1 + R16 #6)
     ic_min_credit: float | None = None            # env AIT_IC_MIN_CREDIT (live $0.70)
-    ic_min_credit_width: float | None = None      # env AIT_IC_MIN_CREDIT_WIDTH (live 0.20)
+    # R20b: comment said "live 0.20" — stale since the 2026-08-04 promotion
+    # (contract 0.10). None -> __post_init__ resolves
+    # contract_float("AIT_IC_MIN_CREDIT_WIDTH"): env > config.yaml
+    # backtest.ic_min_credit_width > 0.10. Explicit values always win.
+    ic_min_credit_width: float | None = None      # env AIT_IC_MIN_CREDIT_WIDTH (live 0.10)
     macro_event_gate: bool = True                 # block credit entries pre macro event
                                                   # (2026+2027-H1 calendar; inactive earlier)
     pre_event_blackout_days: int | None = None    # R16 #7: None -> engine resolves from
@@ -126,6 +167,65 @@ class WalkForwardConfig:
                                           # process parallelism is the effective speedup path).
                                           # Set via --wf-n-jobs CLI flag (default: 1 = sequential).
     optimize_val_split: bool = False      # H2: score Optuna objective on held-out 20% val slice
+
+    def __post_init__(self) -> None:
+        """R20b (pre-registered PLAN 2026-08-21): research defaults migrate to
+        config resolution. R20 proved every prior absolute was priced without
+        volatility data, so protecting old-study reproduction protects
+        disavowed numbers — a bare WalkForwardConfig() now measures the
+        CURRENT operating contract, not frozen 2026-07 literals.
+
+        None is the sentinel meaning "resolve from the contract/config";
+        explicit values always win (a historical reproduction must pass them).
+        """
+        if self.wing_k is None:
+            from ait.config.runtime_env import contract_float
+            self.wing_k = contract_float("AIT_IC_WING_K")
+        if self.ic_min_credit_width is None:
+            from ait.config.runtime_env import contract_float
+            self.ic_min_credit_width = contract_float("AIT_IC_MIN_CREDIT_WIDTH")
+        # R20b review follow-up: load settings ONCE for every config-backed
+        # field below via the shared resolve_config_value helper (also used
+        # by engine.py/optimizer.py/the ML predictors) instead of each field
+        # independently calling load_settings() (was up to 3 redundant reads
+        # per WalkForwardConfig construction, now 1).
+        from ait.config.settings import (
+            BacktestConfig, MLConfig, RiskConfig, load_settings, resolve_config_value,
+        )
+        try:
+            _settings = load_settings()
+        except Exception:  # noqa: BLE001 — no config.yaml -> per-field model defaults
+            _settings = None
+        self.range_min_confidence = float(resolve_config_value(
+            self.range_min_confidence, "ml", "range_min_confidence", MLConfig, _settings))
+        self.iv_floor = float(resolve_config_value(
+            self.iv_floor, "backtest", "iv_floor", BacktestConfig, _settings))
+        self.min_confidence = float(resolve_config_value(
+            self.min_confidence, "risk", "min_confidence", RiskConfig, _settings))
+        self.stop_loss_pct = float(resolve_config_value(
+            self.stop_loss_pct, "backtest", "stop_loss_pct", BacktestConfig, _settings))
+        self.profit_target_pct = float(resolve_config_value(
+            self.profit_target_pct, "backtest", "profit_target_pct", BacktestConfig, _settings))
+        self.max_hold_days = int(resolve_config_value(
+            self.max_hold_days, "backtest", "max_hold_days", BacktestConfig, _settings))
+        self.hurst_regime_threshold = float(resolve_config_value(
+            self.hurst_regime_threshold, "backtest", "hurst_regime_threshold",
+            BacktestConfig, _settings))
+        self.hurst_regime_penalty = float(resolve_config_value(
+            self.hurst_regime_penalty, "backtest", "hurst_regime_penalty",
+            BacktestConfig, _settings))
+        self.multifractal_max_width = float(resolve_config_value(
+            self.multifractal_max_width, "backtest", "multifractal_max_width",
+            BacktestConfig, _settings))
+        # R20b review follow-up: same defect class as the three above -- was
+        # a frozen literal even though StrategyOptimizer's own copy of these
+        # two fields was already migrated (optimizer.py __init__).
+        self.iv_rank_rise_threshold = float(resolve_config_value(
+            self.iv_rank_rise_threshold, "backtest", "iv_rank_rise_threshold",
+            BacktestConfig, _settings))
+        self.min_edge_over_baseline = float(resolve_config_value(
+            self.min_edge_over_baseline, "backtest", "min_edge_over_baseline",
+            BacktestConfig, _settings))
 
 
 @dataclass
@@ -143,6 +243,13 @@ class WindowResult:
     # ("ok" | "disabled_by_config" | failure reasons — anything not
     # ok/disabled means OOS IC entries were BLOCKED for that symbol).
     range_model_status: dict = field(default_factory=dict)
+    # R20 #3: per-symbol MetaLabeler status for this window ("ok" = trained
+    # and GATING OOS entries | "disabled_by_config" = ablation arm, no meta
+    # gate | "not_trained" = enabled but training failed/short — no gate).
+    # R16 #4 gated direction+range on train_window_models but missed this
+    # third window model, so "ML-free" arms could silently carry a trained
+    # XGB entry gate.
+    meta_labeler_status: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -160,6 +267,11 @@ class WalkForwardResult:
     # shadow studies ran with range training failing in 32/32 windows and
     # nothing in the summary said so.
     range_training_status: dict = field(default_factory=dict)
+    # R20 #3: {window_id: {symbol: status}} for the window MetaLabeler,
+    # surfaced in summary() exactly like range_training_status — an arm
+    # labelled "gates only / ML-free" that ran WITH a trained meta gate is a
+    # mislabeled study (the R16 #4 failure mode through the third model).
+    meta_training_status: dict = field(default_factory=dict)
 
     @property
     def total_trades(self) -> int:
@@ -401,6 +513,32 @@ class WalkForwardResult:
                 lines.append(
                     "  WARNING: range model trained in ZERO windows — this "
                     "run says NOTHING about the range gate."
+                )
+            lines.append("-" * 60)
+
+        # R20 #3: surface the meta-labeler gate per window-symbol, mirroring
+        # the range block above. "ok" means OOS entries WERE meta-gated in
+        # that window; anything else means they were not — either is fine,
+        # but a study must SAY which apparatus actually ran.
+        if self.meta_training_status:
+            _m_counts: dict[str, int] = {}
+            for _per_sym in self.meta_training_status.values():
+                for _s in _per_sym.values():
+                    _m_counts[_s] = _m_counts.get(_s, 0) + 1
+            _m_total = sum(_m_counts.values())
+            _m_ok = _m_counts.get("ok", 0)
+            lines.append("  META-LABEL GATE (per window-symbol)")
+            lines.append(f"  Trained ok:        {_m_ok}/{_m_total}  [OOS entries meta-gated]")
+            for _s in sorted(_m_counts):
+                if _s == "ok":
+                    continue
+                _note = (
+                    "no meta gate (ablation arm)"
+                    if _s == "disabled_by_config"
+                    else "no meta gate (training failed/insufficient trades)"
+                )
+                lines.append(
+                    f"    {_s}: {_m_counts[_s]}/{_m_total}  [{_note}]"
                 )
             lines.append("-" * 60)
 
@@ -686,7 +824,7 @@ def _window_task_mp(args: tuple) -> tuple:
         db_path=db_path,
         progress_dir=progress_dir,
     )
-    wr, best_params = bt._run_single_window(
+    wr, best_params, meta_status = bt._run_single_window(
         window_id=window_id,
         train_start=train_start,
         train_end=train_end,
@@ -700,7 +838,7 @@ def _window_task_mp(args: tuple) -> tuple:
         prev_oos=None,
         pretrained_range=pretrained_range,
     )
-    return window_id, wr, best_params
+    return window_id, wr, best_params, meta_status
 
 
 class WalkForwardBacktester:
@@ -736,6 +874,19 @@ class WalkForwardBacktester:
         self._progress_dir = Path(progress_dir) if progress_dir else None
         self._global_best_params: dict | None = None
         self._global_best_score: float = -1.0
+        # R20b review follow-up: load settings ONCE for the whole run instead
+        # of every per-window Backtester()/StrategyOptimizer() construction
+        # independently re-reading + re-validating config.yaml (same
+        # redundant-reload class the settings= param on Backtester/
+        # StrategyOptimizer was built to eliminate for Optuna trials —
+        # WalkForwardConfig.__post_init__ already loads its own copy above
+        # for its config-backed fields, this is the SEPARATE copy every
+        # window's Backtester/StrategyOptimizer construction used to trigger).
+        try:
+            from ait.config.settings import load_settings as _ls3
+            self._settings = _ls3()
+        except Exception:  # noqa: BLE001 — no config.yaml -> per-field defaults downstream
+            self._settings = None
         # R12-C: enable_msgarch/enable_oujump flags removed — the GARCH family
         # is retired to deprecated/research/; range models are ML-only.
 
@@ -769,6 +920,10 @@ class WalkForwardBacktester:
         # R16 #3: per-window range-model training status, recorded for EVERY
         # window (zero-trade windows included) and surfaced in the summary.
         self._range_status_by_window: dict[int, dict[str, str]] = {}
+        # R20 #3: same for the window MetaLabeler (sequential mode records
+        # here; parallel workers report through WindowResult.meta_labeler_status
+        # and are merged below).
+        self._meta_status_by_window: dict[int, dict[str, str]] = {}
 
         # Load VIX and SPY data for the full backtest period (yfinance fallback when not in DB).
         # VIX: Priority-2 IV proxy and live feature for the MetaLabeler.
@@ -835,7 +990,14 @@ class WalkForwardBacktester:
             with ProcessPoolExecutor(max_workers=self._config.optimize_n_jobs) as executor:
                 mp_results = list(executor.map(_window_task_mp, args_list))
 
-            for _wid, wr, curr_best_params in sorted(mp_results, key=lambda x: x[0]):
+            for _wid, wr, curr_best_params, _meta_status in sorted(mp_results, key=lambda x: x[0]):
+                # R20b review follow-up: merge the per-symbol meta-labeler
+                # status independently of whether the window produced trades
+                # — a zero-trade parallel window (wr is None) is precisely
+                # where a failed/disabled gate needs to stay visible in the
+                # summary instead of silently vanishing with the WindowResult.
+                if _meta_status:
+                    self._meta_status_by_window.setdefault(_wid, {}).update(_meta_status)
                 if wr is not None:
                     window_results.append(wr)
                     if curr_best_params is not None:
@@ -851,7 +1013,7 @@ class WalkForwardBacktester:
             prev_best_params: dict | None = None
             for i, (train_start, train_end, test_start, test_end) in enumerate(windows):
                 prev_oos = window_results[-1].backtest_result if window_results else None
-                wr, curr_best_params = self._run_single_window(
+                wr, curr_best_params, _meta_status = self._run_single_window(
                     window_id=i + 1,
                     train_start=train_start,
                     train_end=train_end,
@@ -884,12 +1046,27 @@ class WalkForwardBacktester:
 
             log.info("self_learning_final_state", summary=learner.summary())
 
+        # R20 #3: merge meta-labeler statuses — sequential windows recorded
+        # into the instance dict; parallel workers can only report through the
+        # WindowResult they return (zero-trade parallel windows are therefore
+        # absent, a documented limitation matching how their other per-symbol
+        # metadata is lost too).
+        _meta_status_all: dict[int, dict[str, str]] = {
+            k: dict(v) for k, v in self._meta_status_by_window.items()
+        }
+        for _wr in window_results:
+            if _wr.meta_labeler_status:
+                _meta_status_all.setdefault(_wr.window_id, {}).update(
+                    _wr.meta_labeler_status
+                )
+
         # Build aggregated results
         result = WalkForwardResult(
             windows=window_results,
             initial_capital=self._config.initial_capital,
             config=self._config,
             range_training_status=dict(self._range_status_by_window),
+            meta_training_status=_meta_status_all,
         )
 
         # Compute per-symbol results
@@ -942,12 +1119,17 @@ class WalkForwardBacktester:
         prev_best_params: "dict | None" = None,
         prev_oos: "BacktestResult | None" = None,
         pretrained_range: "dict | None" = None,
-    ) -> "tuple[WindowResult | None, dict | None]":
+    ) -> "tuple[WindowResult | None, dict | None, dict]":
         """Run optimization, ML training, and backtest for one window.
 
-        Returns (window_result, best_params).  window_result is None when no
-        trades are generated.  Pass learner=None in parallel mode — the method
-        then uses static config defaults (no cross-window adaptation).
+        Returns (window_result, best_params, meta_labeler_status). window_result
+        is None when no trades are generated, but meta_labeler_status is always
+        populated (per-symbol) — parallel workers build a fresh instance per
+        window and only communicate back through this return value, so a
+        zero-trade window (precisely where a failed/disabled gate needs
+        visibility) must not be silently dropped along with the WindowResult.
+        Pass learner=None in parallel mode — the method then uses static
+        config defaults (no cross-window adaptation).
         """
         log.info(
             "running_window",
@@ -975,6 +1157,7 @@ class WalkForwardBacktester:
         _optuna_meta: dict | None = None
         _model_weights: dict = {}  # initialised here so it's always bound even if loop is empty
         _range_status_local: dict[str, str] = {}  # R16 #3: symbol -> range training status
+        _meta_status_local: dict[str, str] = {}   # R20 #3: symbol -> meta-labeler status
         # Use full capital per symbol — splitting by symbol count makes iron condors
         # impossible on stocks priced >$50 (max_loss_per_contract too large).
         per_symbol_capital = self._config.initial_capital
@@ -1015,7 +1198,10 @@ class WalkForwardBacktester:
             else:
                 _range_result = self._train_window_range_model(
                     train_df, symbol, window_id,
-                    max_hold_days=self._config.max_hold_days,
+                    # PR#7 review 2026-08-25: was self._config.max_hold_days
+                    # (30) — trained 30-day containment labels for ~9-day
+                    # reachable trades. See _range_label_horizon.
+                    max_hold_days=self._range_label_horizon(),
                 )
             # Guard: tests may monkeypatch _train_window_range_model to return None
             if _range_result is None or not isinstance(_range_result, tuple):
@@ -1105,15 +1291,31 @@ class WalkForwardBacktester:
             if _ctx_train:
                 _vix_train_ctx = _ctx_train
 
-            meta_labeler = self._train_window_meta_labeler(
-                train_df=train_df,
-                symbol=symbol,
-                window_id=window_id,
-                predictor=predictor,
-                window_cfg=window_cfg,
-                artifact_dir=_meta_artifact,
-                vix_ctx=_vix_train_ctx,
-            )
+            # R20 #3: honor train_window_models for the THIRD window model.
+            # R16 #4 gated direction + range on this flag but the MetaLabeler
+            # was still trained (shadow backtest) and passed to the OOS
+            # Backtester, which gates entries whenever it is_trained — so a
+            # "gate-stack-only / ML-free" ablation arm could silently run
+            # WITH a trained XGB entry gate (the mislabeled-arm failure mode
+            # of the vacuous 08-03 ablation, recurring). False => no meta
+            # training AND no meta gating; status recorded like range's.
+            if not self._config.train_window_models:
+                meta_labeler = None
+                _meta_status = "disabled_by_config"
+            else:
+                meta_labeler = self._train_window_meta_labeler(
+                    train_df=train_df,
+                    symbol=symbol,
+                    window_id=window_id,
+                    predictor=predictor,
+                    window_cfg=window_cfg,
+                    artifact_dir=_meta_artifact,
+                    vix_ctx=_vix_train_ctx,
+                )
+                _meta_status = "ok" if meta_labeler is not None else "not_trained"
+            _meta_status_local[symbol] = _meta_status
+            if hasattr(self, "_meta_status_by_window"):
+                self._meta_status_by_window.setdefault(window_id, {})[symbol] = _meta_status
 
             # Prepend training data context so ML features can be computed.
             # iv_rank uses vol_20.rolling(252) — needs 252 bars to be meaningful.
@@ -1156,9 +1358,15 @@ class WalkForwardBacktester:
             # None + threshold >= 1.0 blocks the entry instead of silently
             # skipping the gate.) "disabled_by_config" (R16 #4 ablation arm)
             # deliberately runs UNGATED at the configured threshold.
+            # R20b: stub-config fallback is the CONFIG contract
+            # (ml.range_min_confidence, default 0.65), no longer the retired
+            # 0.55 literal. Real WalkForwardConfigs resolve in __post_init__
+            # and never hit this fallback.
+            _cfg_range_min = getattr(window_cfg, "range_min_confidence", None)
+            if _cfg_range_min is None:
+                _cfg_range_min = float(MLConfig().range_min_confidence)
             _oos_range_min_conf = self._resolve_oos_range_min_conf(
-                range_predictor, _range_model_status,
-                getattr(window_cfg, "range_min_confidence", 0.55),
+                range_predictor, _range_model_status, _cfg_range_min,
             )
             if _oos_range_min_conf >= 1.0:
                 log.warning(
@@ -1181,9 +1389,11 @@ class WalkForwardBacktester:
                 pass
 
             # Change D: pass intraday_store to OOS Backtester so entries are
-            # gated by the 09:30–15:30 ET entry window and limit-fill simulation,
-            # matching the live-trading execution model. Also enables capture of
-            # limit_price and fill_time on every OOS trade.
+            # gated by the config-backed ET entry window (settings.backtest,
+            # default 10:30–15:30 — R20 #5b: the old comment's "09:30–15:30"
+            # described engine-default drift, not configuration) and limit-fill
+            # simulation, matching the live-trading execution model. Also
+            # enables capture of limit_price and fill_time on every OOS trade.
             _oos_intraday_store = None
             if self._db_path is not None:
                 from ait.data.historical import HistoricalDataStore
@@ -1239,7 +1449,19 @@ class WalkForwardBacktester:
                 meta_labeler=meta_labeler,
                 market_context=_vix_ctx,
                 intraday_store=_oos_intraday_store,
+                # R20 #4: forward the intraday execution knobs — they were
+                # declared on WalkForwardConfig but never passed, so the
+                # engine always ran its own defaults regardless of config.
+                # None defers to the engine's settings.backtest resolution.
+                scan_interval_minutes=getattr(window_cfg, "scan_interval_minutes", None),
+                entry_window_start_et=getattr(window_cfg, "entry_window_start_et", None),
+                entry_window_end_et=getattr(window_cfg, "entry_window_end_et", None),
+                limit_order_timeout_bars=getattr(window_cfg, "limit_order_timeout_bars", None),
                 symbol=symbol,
+                # R20b review follow-up: reuse settings loaded once in
+                # __init__ instead of every window's OOS Backtester
+                # independently re-reading + re-validating config.yaml.
+                settings=self._settings,
             )
             result = bt.run()
 
@@ -1249,7 +1471,10 @@ class WalkForwardBacktester:
                 _oos_scores = self._evaluate_range_model_oos(
                     range_predictor, test_df, symbol,
                     threshold_pct=_range_threshold,
-                    horizon_days=self._config.max_hold_days,
+                    # PR#7 review 2026-08-25: OOS eval must score the same
+                    # horizon the model was trained on (see
+                    # _range_label_horizon) — was max_hold_days (30).
+                    horizon_days=self._range_label_horizon(),
                     precomputed_features=_oos_feat_cache,
                 )
                 if _oos_scores and "range_predictor" in _model_weights:
@@ -1317,10 +1542,11 @@ class WalkForwardBacktester:
                 ),
                 model_accuracy=model_accuracy,
                 range_model_status=dict(_range_status_local),
+                meta_labeler_status=dict(_meta_status_local),  # R20 #3
             )
             self._write_window_progress(window_id, window_result, curr_best_params,
                                          optuna_meta=_optuna_meta, model_weights=_model_weights)
-            return window_result, curr_best_params
+            return window_result, curr_best_params, dict(_meta_status_local)
         else:
             self._write_window_progress(
                 window_id, None, curr_best_params,
@@ -1328,7 +1554,7 @@ class WalkForwardBacktester:
                 test_start=test_start, test_end=test_end,
                 optuna_meta=_optuna_meta, model_weights=_model_weights,
             )
-            return None, curr_best_params
+            return None, curr_best_params, dict(_meta_status_local)
 
     def _write_window_progress(
         self,
@@ -1522,11 +1748,32 @@ class WalkForwardBacktester:
                     min_trades=self._config.optimize_min_trades,
                     max_concurrent_positions=self._config.max_concurrent_positions,
                     max_entry_vol_annual=self._config.max_entry_vol_annual,
+                    # R20 #2: baselines for the searched-but-previously-dropped
+                    # gate params — trials now score the values they suggest.
+                    iv_rank_rise_threshold=self._config.iv_rank_rise_threshold,
+                    min_edge_over_baseline=self._config.min_edge_over_baseline,
+                    # PR#7 review 2026-08-25: without these three, trials
+                    # trained at loaded-YAML baselines while the OOS
+                    # Backtester ran the caller's (possibly explicit) config
+                    # values — train/OOS parity break for any run that
+                    # overrides them.
+                    stop_loss_pct=self._config.stop_loss_pct,
+                    profit_target_pct=self._config.profit_target_pct,
+                    min_confidence=self._config.min_confidence,
                     seed=self._config.optimize_seed,
                     intraday_store=_intraday_store,
                     symbol=symbol,
                     range_predictor=range_predictor,
                     val_split=self._config.optimize_val_split,
+                    # R20b review follow-up: trial objectives priced with the
+                    # same training-window VIX/SPY context as features_cache
+                    # above, instead of the synthetic realized-vol fallback.
+                    market_context=vix_ctx,
+                    # R20b review follow-up: reuse settings loaded once in
+                    # WalkForwardBacktester.__init__ instead of every
+                    # per-window, per-strategy StrategyOptimizer independently
+                    # re-reading + re-validating config.yaml.
+                    settings=self._settings,
                 )
                 res = opt.run(data={symbol: train_df}, prior_params=warm)
                 all_best_params.update(res.best_params)
@@ -2056,17 +2303,44 @@ class WalkForwardBacktester:
                     n_windows=n_windows,
                 )
                 # Train directly in-process — Optuna hasn't started, no RNG risk.
+                # PR#7 review 2026-08-25: was self._config.max_hold_days (30)
+                # for both label and threshold horizons — see
+                # _range_label_horizon.
                 per_symbol[symbol] = self._train_window_range_model_inprocess(
                     train_df=train_df,
                     symbol=symbol,
                     window_id=window_id,
-                    max_hold_days=self._config.max_hold_days,
+                    max_hold_days=self._range_label_horizon(),
                     threshold_pct=self._adaptive_range_threshold(
-                        train_df, horizon_days=self._config.max_hold_days
+                        train_df, horizon_days=self._range_label_horizon()
                     ),
                 )
             results.append(per_symbol)
         return results
+
+    def _range_label_horizon(self) -> int:
+        """Label/eval horizon for the range model: the REACHABLE trade horizon.
+
+        PR#7 review 2026-08-25: both range-training paths passed
+        self._config.max_hold_days (resolves to 30) as RangePredictor's
+        horizon_days, but since the engine's entry_dte decoupling positions
+        expire at options.dte_range[0] (14) and credit structures close at
+        EXPIRY_APPROACHING_DTE (5) — real holds cap at ~9 calendar days, and
+        optimized IC holds search 1-9. The model was trained to predict
+        30-day containment (a strictly harder question) and reused to gate
+        much shorter trades. Derive the horizon from what a trade can
+        actually reach; max_hold_days remains a cap, never an extender.
+        """
+        from ait.config.settings import OptionsConfig
+        from ait.execution.exit_policy import EXPIRY_APPROACHING_DTE
+        try:
+            _opts = (self._settings.options if self._settings is not None
+                     else OptionsConfig())
+        except Exception:  # noqa: BLE001 — partial test stubs -> field defaults
+            _opts = OptionsConfig()
+        entry_dte = int(_opts.dte_range[0])
+        reachable = max(1, entry_dte - int(EXPIRY_APPROACHING_DTE))
+        return min(int(self._config.max_hold_days), reachable)
 
     def _train_window_range_model(
         self,
@@ -2276,7 +2550,18 @@ class WalkForwardBacktester:
                 spread_iv_sensitivity=window_cfg.spread_iv_sensitivity,
                 spread_dte_sensitivity=window_cfg.spread_dte_sensitivity,
                 spread_cap=window_cfg.spread_cap,
+                # R20 #4: same intraday knobs as the OOS Backtester (inert
+                # here — no intraday_store — but the shadow must never fork
+                # its own execution model if a store is ever wired in).
+                scan_interval_minutes=getattr(window_cfg, "scan_interval_minutes", None),
+                entry_window_start_et=getattr(window_cfg, "entry_window_start_et", None),
+                entry_window_end_et=getattr(window_cfg, "entry_window_end_et", None),
+                limit_order_timeout_bars=getattr(window_cfg, "limit_order_timeout_bars", None),
                 market_context=vix_ctx,
+                # R20b review follow-up: reuse settings loaded once in
+                # __init__ instead of every shadow-labeling Backtester
+                # independently re-reading + re-validating config.yaml.
+                settings=self._settings,
             )
             shadow_result = shadow_bt.run()
 

@@ -85,7 +85,9 @@ class TestRuntimeEnvContract:
         import os
         assert os.environ["AIT_ALLOW_UNDEFINED_RISK"] == "0"
         assert os.environ["AIT_IC_WING_K"] == "1.6"
-        assert os.environ["AIT_IC_MIN_CREDIT_WIDTH"] == "0.10"
+        # R19c: config.yaml now seeds this (yaml 0.10 -> "0.1"); compare
+        # numerically — the SEMANTIC contract is what matters.
+        assert float(os.environ["AIT_IC_MIN_CREDIT_WIDTH"]) == 0.10
         assert os.environ["AIT_SKIP_MACRO_EVENTS"] == "1"
 
     def test_bare_main_applies_contract(self):

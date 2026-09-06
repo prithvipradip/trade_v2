@@ -81,9 +81,58 @@ class RiskConfig(_StrictModel):
                     "delta gate is dead and the daily breaker only sees "
                     "realized P&L, so without this the whole book can be "
                     "short vol into a gap (audit R2).")
+    credit_cap_vix_tiers: list[list[float]] = Field(
+        default=[[20.0, 6], [25.0, 4], [999.0, 2]],
+        description="R20: VIX-tiered credit-position caps as [vix_below, cap] "
+                    "pairs, first match wins — config home for the hardcoded "
+                    "'6 if vix<20 else 4 if vix<25 else 2' in manager.py "
+                    "(register CD item). max_credit_positions stays the "
+                    "absolute ceiling.")
+    max_symbol_concentration_pct: float = Field(default=0.20, ge=0.05, le=0.50,
+        description="R20: max fraction of account in ONE symbol (gate 6c) — "
+                    "was a hardcoded 0.20 that numerically shadowed "
+                    "positions.max_portfolio_risk_pct while meaning something "
+                    "different.")
+    skip_macro_events: bool = Field(default=True,
+        description="R19c: macro-event protection (entry gates + rule-3d "
+                    "flatten for undefined-risk shapes). Config home for "
+                    "AIT_SKIP_MACRO_EVENTS ('1'=on). Protective default ON; "
+                    "2026-07-08 user decision.")
     credit_vix_halt: float = Field(default=28.0, ge=15.0, le=60.0,
         description="No NEW credit entries when VIX is at/above this level — "
                     "cheap vol-regime brake for short-premium strategies.")
+
+    @field_validator("credit_cap_vix_tiers")
+    @classmethod
+    def validate_credit_cap_vix_tiers(cls, v: list[list[float]]) -> list[list[float]]:
+        """R20b review follow-up: manager.py consumes each row via two-value
+        unpacking (`for ceiling, cap in ...`) and takes the FIRST match in
+        list order — a malformed row (wrong arity), a non-integer/non-positive
+        cap, or unsorted ceilings all passed startup validation before this
+        fix and could crash trade validation or silently apply the wrong cap.
+        """
+        if not v:
+            raise ValueError("credit_cap_vix_tiers must not be empty")
+        prev_ceiling = float("-inf")
+        for row in v:
+            if len(row) != 2:
+                raise ValueError(
+                    f"credit_cap_vix_tiers row {row!r} must be exactly "
+                    "[vix_ceiling, cap]"
+                )
+            ceiling, cap = row
+            if cap <= 0 or int(cap) != cap:
+                raise ValueError(
+                    f"credit_cap_vix_tiers cap {cap!r} must be a positive integer"
+                )
+            if ceiling <= prev_ceiling:
+                raise ValueError(
+                    "credit_cap_vix_tiers ceilings must be strictly increasing "
+                    f"(row {row!r} does not exceed the prior ceiling "
+                    f"{prev_ceiling!r})"
+                )
+            prev_ceiling = ceiling
+        return v
 
 
 class OptionsConfig(_StrictModel):
@@ -133,6 +182,20 @@ class BacktestConfig(_StrictModel):
                     "did not describe the live book. Unlike the risk knobs below, a "
                     "divergent wing_k is not 'safer' in either direction — it is simply a "
                     "different strategy, so it must track the live value.")
+    ic_min_credit_width: float = Field(default=0.10, ge=0.01, le=0.50,
+        description="R19c: credit/width ratio floor for condor entries — the "
+                    "config.yaml home for AIT_IC_MIN_CREDIT_WIDTH (contract "
+                    "default 0.10 since the 2026-08-04 wide-wing promotion). "
+                    "Precedence: env > this > CONTRACT_DEFAULTS.")
+    ic_min_credit: float = Field(default=0.70, ge=0.10, le=5.0,
+        description="R19c: absolute minimum total credit ($/share) for a "
+                    "condor — config.yaml home for AIT_IC_MIN_CREDIT. At a 50% "
+                    "TP the gross must clear ~3x round-trip costs.")
+    credit_loss_limit: float = Field(default=0.0, ge=0.0, le=5.0,
+        description="R19c: flat credit-structure stop as a multiple of credit "
+                    "received; 0 = DISABLED (R6/R12-B1 evidence: every flat "
+                    "level underperformed touch-close). Config home for "
+                    "AIT_CREDIT_LOSS_LIMIT.")
     iv_floor: float = Field(default=0.20, ge=0.05, le=1.0,
         description="Minimum synthetic IV used for option pricing. "
                     "Prevents near-zero credits in calm markets.")
@@ -174,13 +237,95 @@ class BacktestConfig(_StrictModel):
         description="Additional half-spread per DTE below 21. Near-expiry options are wider.")
     spread_cap: float = Field(default=0.15, ge=0.01, le=0.50,
         description="Maximum per-leg half-spread ($). Prevents unrealistic spread in stress regimes.")
+    # W5 research-honesty block (blindspot_composition_hunt_20260825.md).
+    # Three CONFIRMED research_validity findings whose combined size is the
+    # whole per-condor expectancy — the researched edge may be sign-flipped,
+    # so these values are the measured ones, not the convenient ones.
+    commission_per_contract: float = Field(default=0.65, ge=0.0, le=10.0,
+        description="Finding model-vs-reality-commission-constant: IBKR base "
+                    "options commission ($/contract, per leg, charged on entry "
+                    "AND exit). This is ONLY the commission line — the "
+                    "regulatory/exchange/clearing fees that ride with every "
+                    "fill live in regulatory_fees_per_contract below. The "
+                    "engine used to charge this 0.65 as the ENTIRE per-leg "
+                    "cost, which is what the finding measured as a ~41% "
+                    "understatement of real friction.")
+    regulatory_fees_per_contract: float = Field(default=0.2668, ge=0.0, le=5.0,
+        description="Finding model-vs-reality-commission-constant: the "
+                    "regulatory/exchange/clearing fees IBKR adds to every "
+                    "option fill, on top of commission_per_contract, per leg, "
+                    "entry AND exit. Default is the finding's OWN measurement "
+                    "on data/ait_state.db executions (78 leg fills, BAG "
+                    "summary rows excluded): all-in per contract-leg mean "
+                    "0.9168 (median 1.0284, min 0.6195, max 1.0586); "
+                    "0.9168 - 0.65 = 0.2668. It reproduces the finding's "
+                    "headline gap exactly: a 4-leg condor round trip costs "
+                    "(0.65 + 0.2668) x 4 x 2 = $7.33/contract against the old "
+                    "flat-0.65 model's $5.20 = the measured $2.13/contract "
+                    "understatement. Set to 0.0 ONLY to reproduce a pre-W5 "
+                    "study; live P&L is trued up to the real ledger "
+                    "(orchestrator total_commission), so 0.0 means research "
+                    "and live disagree by this amount on every leg.")
+    skew_slope_per_pct_otm: float = Field(default=0.0736, ge=0.0, le=1.0,
+        description="Finding model-vs-reality-skew-10x-flat: RELATIVE IV "
+                    "uplift per 1 percentage point of OTM distance for the "
+                    "put side, i.e. leg_iv gains base_iv x this x "
+                    "(100 x |ln(K/S)|) on top of the legacy hardcoded skew. "
+                    "The engine's hardcoded put slope was 0.10 absolute IV "
+                    "per unit |log-moneyness|; the finding's regression on "
+                    "the repo's own 3,159 IBKR quotes "
+                    "(data/historical.db option_spread_samples, 2026-08-11) "
+                    "measured 1.141 SPY dte20 (n=140), 0.983 QQQ dte20 "
+                    "(n=81), 0.916 IWM dte24 (n=57) — 9-11x steeper — with a "
+                    "sample-weighted mean of 1.049. Default 0.0736 makes the "
+                    "TOTAL put slope hit that 1.049 at the finding's own "
+                    "probe anchor (SPY atm_iv 0.1289, skew_factor 1.0): "
+                    "0.10 + 0.1289 x 100 x 0.0736 = 1.049. Consequence of "
+                    "the old value: wings were near-free in research (long "
+                    "put $0.08 model vs $0.71-0.92 real chain mid), so every "
+                    "wing_k/wide-wing study preferred wider wings than "
+                    "reality prices. The CALL side deliberately keeps its "
+                    "legacy 0.02 term: the same regression measured "
+                    "0.064/0.112/-0.089 there — sign-unstable across symbols "
+                    "and therefore not a calibrated slope. 0.0 restores "
+                    "pre-W5 pricing exactly (backward-compat escape hatch "
+                    "for reproducing an old study, NOT an honest surface).")
     # Fractal regime params (Gap Z5) — also used by live orchestrator for parity with backtest
     hurst_regime_threshold: float = Field(default=0.20, ge=0.05, le=0.50,
-        description="Hurst scale-spread above which fractal confidence penalty is applied.")
+        description="Hurst scale-spread above which fractal confidence penalty is applied. "
+                    "R20b: also the optimizer's trial-baseline (was a 0.20 literal in bt_kwargs).")
     hurst_regime_penalty: float = Field(default=0.10, ge=0.0, le=0.30,
-        description="Confidence deducted when fractal regime is chaotic.")
+        description="Confidence deducted when fractal regime is chaotic. "
+                    "R20b: also the optimizer's trial-baseline (was a 0.10 literal in bt_kwargs).")
     multifractal_max_width: float = Field(default=0.50, ge=0.20, le=0.80,
-        description="Multifractal width above which fractal confidence penalty is applied.")
+        description="Multifractal width above which fractal confidence penalty is applied. "
+                    "R20b: also the optimizer's trial-baseline (was a 0.50 literal in "
+                    "bt_kwargs; the pre-registration named it multifractal_width_threshold "
+                    "— this EXISTING field is that knob, no duplicate was added).")
+    # R20b (pre-registered PLAN 2026-08-21): config homes for the optimizer's
+    # remaining non-searched engine baselines — they were frozen literals in
+    # StrategyOptimizer._run_backtest's bt_kwargs, so a config change could
+    # never reach a trial backtest. Defaults = the 2026-08-21 operating
+    # literals, and config.yaml declares the same values (no divergence).
+    stop_loss_pct: float = Field(default=0.35, ge=0.05, le=1.0,
+        description="R20b: baseline stop-loss as a fraction of position value for "
+                    "trial/engine backtests (options decay fast — cut at 35%). "
+                    "Optuna may search per window; this is the non-searched baseline.")
+    profit_target_pct: float = Field(default=0.50, ge=0.05, le=3.0,
+        description="R20b: baseline take-profit as a fraction of position value for "
+                    "trial/engine backtests (take profits at 50%). Optuna may search "
+                    "per window; this is the non-searched baseline.")
+    max_hold_days: int = Field(default=30, ge=1, le=120,
+        description="R20b: baseline maximum holding period (calendar days) before a "
+                    "trial/engine backtest force-closes a position.")
+    iv_rank_rise_threshold: float = Field(default=0.30, ge=0.0, le=10.0,
+        description="R20b: suppress iron-condor entry when IV rank rose more than "
+                    "this over the last 10 days (Exp 20 veto). Values > 1 disable "
+                    "the veto (IV rank is 0-1).")
+    min_edge_over_baseline: float = Field(default=0.05, ge=0.0, le=1.0,
+        description="R20b: minimum weighted CV edge over the base rate for the "
+                    "range predictor to activate as an entry gate (Exp 28 quality "
+                    "floor; 0.0 = always use the model).")
 
 
 class MLConfig(_StrictModel):
@@ -204,6 +349,24 @@ class MLConfig(_StrictModel):
         description="Floor for model-overridden signal confidence (range/"
                     "vol-mag). 0.65 beat 0.55 across every backtest metric. "
                     "Was hardcoded in orchestrator — audit item 3.3.")
+    observe_mode_neutral_confidence: float = Field(default=0.60, ge=0.50, le=0.90,
+        description="OBSERVE MODE ONLY (entry_gates_enabled=false): the "
+                    "confidence a DIRECTION-NEUTRAL structure (iron_condor, "
+                    "short_strangle) carries into risk validation. "
+                    "trade-life-gatesoff-reintroduces-neutral-autoreject "
+                    "(2026-09-01): with gates off nothing writes "
+                    "model_overridden, so eff_conf fell back to the "
+                    "DIRECTIONAL confidence and manager.py rejected anything "
+                    "below risk.min_confidence — in exactly the neutral "
+                    "regime a condor wants. Only trending-aligned days "
+                    "survived, i.e. condors entered ONLY in their worst "
+                    "regime (adverse selection). The risk manager's "
+                    "min_confidence is a DIRECTIONAL gate; a market-neutral "
+                    "structure is not paid for direction, so it is validated "
+                    "on this neutral baseline instead. Must stay >= "
+                    "risk.min_confidence or observe mode blocks itself; the "
+                    "0.60 default sits above the shipped 0.50 with headroom. "
+                    "Ignored entirely when gates are ON.")
 
     @field_validator("ensemble_weights")
     @classmethod
@@ -245,6 +408,19 @@ class ExitConfig(_StrictModel):
         description="How far a combo EXIT limit crosses the spread so the "
                     "close actually fills (was hardcoded EXIT_CROSS in "
                     "orchestrator — audit item 3.3).")
+    exit_mark_multiple: float = Field(default=1.5, ge=1.05, le=3.0,
+        description="W7 (R24 logic-exit-risk-01): ceiling on a credit "
+                    "buyback as a multiple of the CURRENT marked cost to "
+                    "close. The R16 bound was "
+                    "max(2*mark, entry_credit + 0.25*wing_width) — at the "
+                    "promoted $39-60 wings the width term dominated and "
+                    "priced routine take-profits at 6-10x the mark (SPY sent "
+                    "BUY LMT 14.04 against a 1.40 mark). IBKR's price band "
+                    "rejected 61 of 63 exits; the broker's guard was the ONLY "
+                    "thing bounding the price. The bound is now anchored to "
+                    "the mark alone; the wing width remains the structural "
+                    "cap above it, and mark+exit_cross_amount is the floor so "
+                    "the order stays marketable.")
     trailing_stop_pct: float = Field(default=0.25, ge=0.10, le=0.50)
     breakeven_trigger_pct: float = Field(default=0.30, ge=0.10, le=0.80)
     partial_exit_levels: list[dict] = [
@@ -354,6 +530,40 @@ class Settings(_StrictModel):
     # Loaded from environment
     ibkr: IBKREnvConfig = IBKREnvConfig()
     api_keys: APIKeysConfig = APIKeysConfig()
+
+
+def resolve_config_value(explicit, section: str, field: str, fallback_cls, settings):
+    """explicit > loaded settings.<section>.<field> > fallback_cls().<field>.
+
+    R20b review follow-up: the "explicit arg > config > fallback-class-default"
+    precedence was hand-duplicated at 4+ call sites (engine.py, walkforward.py,
+    optimizer.py, the ML predictors, run_backtest.py's parity manifest) —
+    moved here as the ONE shared implementation so a future change to the
+    resolution semantics only needs to happen once.
+
+    `settings` is an already-loaded Settings object, or None (load_settings()
+    failed or was never attempted). `settings is None` is logged at WARNING —
+    every config-backed knob silently reverting to its (sometimes stricter,
+    sometimes looser) pydantic default because config.yaml went missing
+    mid-run is exactly the class of silent divergence this whole PR exists to
+    prevent, and load_settings()'s own divergence report never runs on this
+    path (it's the last line inside a SUCCESSFUL load). A partial settings
+    stub (missing this one section/field, e.g. a test fixture) stays silent —
+    that's an intentional, narrower degradation tests rely on.
+    """
+    if explicit is not None:
+        return explicit
+    if settings is None:
+        from ait.utils.logging import get_logger
+        get_logger("config.settings").warning(
+            "config_unavailable_using_fallback_default",
+            section=section, field=field,
+        )
+        return getattr(fallback_cls(), field)
+    try:
+        return getattr(getattr(settings, section), field)
+    except Exception:  # noqa: BLE001 — partial stub -> model default, silent
+        return getattr(fallback_cls(), field)
 
 
 def load_settings(config_path: str | Path = "config.yaml") -> Settings:

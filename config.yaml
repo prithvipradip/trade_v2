@@ -51,6 +51,20 @@ risk:
   max_correlation: 0.75                # Correlation above which symbols count as the same bet
   max_correlated_positions: 2          # Positions per correlated cluster (was code default)
   max_credit_positions: 6              # Cap on simultaneous short-premium positions (audit R2)
+  # R20b follow-up: these three RiskConfig fields were claimed "relocated to
+  # config.yaml" (PLAN.md R20 entry / settings.py descriptions) but were
+  # never actually declared here -- silently falling back to the pydantic
+  # Field defaults below (values unchanged; this closes the documentation/
+  # consistency gap so config.yaml really is the operating source).
+  pre_event_blackout_days: 1           # Block new credit entries within N days of a macro event
+  credit_cap_vix_tiers:                # VIX-tiered credit-position caps as [vix_below, cap], first match wins
+    - [20.0, 6]
+    - [25.0, 4]
+    - [999.0, 2]
+  max_symbol_concentration_pct: 0.20   # Max fraction of account in one symbol (gate 6c)
+  skip_macro_events: true              # R19c: macro-event protection (2026-07-08 decision).
+                                       # Condors are code-exempt from the flatten; this governs
+                                       # entry gates + undefined-risk flattens.
   credit_vix_halt: 28                  # No NEW credit entries at/above this VIX (audit R2)
 
 options:
@@ -112,6 +126,13 @@ backtest:
   # authority for live). This yaml value feeds backtest/integration paths;
   # R16: aligned to the promoted live value.
   wing_k: 1.6
+  # R19c (policy: config.yaml is THE home for trading values; env only
+  # overrides; code defaults are a last-resort safety net):
+  ic_min_credit_width: 0.10            # Credit/width floor — 0.10 pairs with k=1.6 wings
+                                       # (2026-08-04 promotion: absolute credit demand unchanged)
+  ic_min_credit: 0.70                  # Min total credit $/share (50% TP must clear ~3x costs)
+  credit_loss_limit: 0                 # Flat credit stop x credit; 0 = DISABLED
+                                       # (R6/R12-B1: every flat level underperformed touch-close)
                                        # Optuna optimizes per walk-forward window [0.3 – 2.0]
                                        # 0.5 = half-sigma (tight), 1.0 = 1-sigma, 2.0 = 2-sigma (wide)
   iv_floor: 0.20                      # Min synthetic IV for option pricing
@@ -126,6 +147,37 @@ backtest:
   optimize_n_trials: 50               # Optuna trials per walk-forward window
   optimize_patience: 20               # Early stopping: halt after N consecutive non-improving trials (0=disabled)
   optimize_min_trades: 10             # Min trades for full score; < 3 → always −100; 3–9 → quadratic penalty
+  # R20b (pre-registered 2026-08-21): optimizer trial baselines moved from code
+  # literals into config — values below = the operating literals they replace.
+  stop_loss_pct: 0.35                 # Baseline stop-loss (fraction of position value)
+  profit_target_pct: 0.50            # Baseline take-profit (fraction of position value)
+  max_hold_days: 30                   # Baseline max holding period (calendar days)
+  iv_rank_rise_threshold: 0.30        # Veto IC entry when IV rank rose > this over 10d (Exp 20)
+  min_edge_over_baseline: 0.05        # Min range-model CV edge to activate the gate (Exp 28)
+  # R20b: yaml homes for the existing fractal-regime fields the optimizer now
+  # reads from loaded settings (previously 0.20/0.10/0.50 literals in bt_kwargs)
+  hurst_regime_threshold: 0.20        # Hurst scale-spread above which confidence penalty applies
+  hurst_regime_penalty: 0.10          # Confidence deducted in chaotic fractal regime
+  multifractal_max_width: 0.50        # Multifractal width above which confidence penalty applies
+  # W5 research-honesty block — three CONFIRMED research_validity findings in
+  # reports/blindspot_composition_hunt_20260825.md. Together they are the size
+  # of the whole per-condor expectancy, so every backtest absolute produced
+  # BEFORE these landed is stale and must be re-run.
+  # model-vs-reality-commission-constant: real IBKR cost is commission PLUS
+  # regulatory/exchange/clearing fees, per leg, entry AND exit. Measured on the
+  # repo's own executions ledger: all-in 0.9168/contract-leg (mean; median
+  # 1.0284) vs the old flat 0.65 = $2.13/contract understated per condor
+  # round trip.
+  commission_per_contract: 0.65        # IBKR base options commission ($/contract/leg)
+  regulatory_fees_per_contract: 0.2668 # Reg/exchange/clearing fees on top (0.9168 - 0.65)
+                                       # 0.0 reproduces pre-W5 studies only
+  # model-vs-reality-skew-10x-flat: the engine priced every strike off a
+  # surface ~10x flatter than the measured one (hardcoded put slope 0.10 vs
+  # 0.916-1.141 regressed on 3,159 IBKR quotes), so wings were near-free
+  # (long put $0.08 model vs $0.71-0.92 real).
+  skew_slope_per_pct_otm: 0.0736       # Relative put-side IV uplift per 1% OTM
+                                       # (total slope 1.049 at atm_iv 0.1289 = the
+                                       # sample-weighted measured value); 0 = pre-W5
 
 ml:
   ensemble_weights:
@@ -135,6 +187,14 @@ ml:
   lookback_days: 504                   # 2 years of trading days
   min_training_samples: 100
   range_min_confidence: 0.65           # Floor for range/vol-mag model-overridden confidence (was hardcoded)
+  # 2026-09-01 OBSERVE MODE (PLAN pre-registration). The retrained range model
+  # is near coin-flip on SPY/QQQ (CV AUC 0.545/0.545, edge +0.045 vs the 0.05
+  # min_edge threshold), so predict() returns None and W2's fail-CLOSED gate
+  # blocked EVERY iron-condor entry: 16 candidates, 0 orders on 09-01. The ML
+  # models keep predicting and logging; they no longer veto. Re-arm only if
+  # the observe-mode record shows the gate would have improved PF.
+  entry_gates_enabled: false
+  observe_mode_neutral_confidence: 0.60  # direction-neutral structures skip the DIRECTIONAL min_confidence gate
 
 meta_label:
   enabled: false                       # Disabled: trained on corrupted data, rejects everything. Re-enable after 50+ clean trades.
@@ -143,6 +203,11 @@ meta_label:
 
 exit:
   exit_cross_amount: 0.10             # How far combo exits cross the spread to guarantee fills (was hardcoded)
+  # W7/R24 logic-exit-risk-01: credit buyback ceiling as a multiple of the
+  # CURRENT marked cost. The old bound included entry_credit + 25% of the
+  # wing width, which dominated at $39-60 wings and priced take-profits at
+  # 6-10x the mark (61 of 63 exits rejected by IBKR's price band).
+  exit_mark_multiple: 1.5
   trailing_stop_pct: 0.25             # Trail 25% below high water mark
   breakeven_trigger_pct: 0.30         # Move stop to breakeven at +30% P&L
   initial_stop_loss_pct: 0.50         # Fixed stop before breakeven activates

@@ -55,9 +55,15 @@ class TestWalkForwardConfig:
         cfg = WalkForwardConfig(train_days=120, test_days=30, step_days=10)
         assert cfg.train_days == 120
 
-    def test_wing_k_default_is_1(self) -> None:
+    def test_wing_k_default_resolves_live_contract(self, monkeypatch) -> None:
+        # R20b (pre-registered PLAN 2026-08-21): this asserted 1.0 — the
+        # frozen 2026-07 research literal that shadowed the PROMOTED live
+        # value. A bare WalkForwardConfig now resolves the contract
+        # (env AIT_IC_WING_K > config.yaml backtest.wing_k > 1.6).
+        monkeypatch.delenv("AIT_IC_WING_K", raising=False)
         cfg = WalkForwardConfig()
-        assert cfg.wing_k == pytest.approx(1.0)
+        from ait.config.runtime_env import contract_float
+        assert cfg.wing_k == pytest.approx(contract_float("AIT_IC_WING_K")) == 1.6
 
     def test_delta_iv_scale_default_is_0(self) -> None:
         cfg = WalkForwardConfig()
@@ -813,7 +819,7 @@ class TestWindowLevelParallelism:
         cfg = WalkForwardConfig(train_days=100, test_days=30, gap_days=5)
         bt = WalkForwardBacktester(["SPY"], ["iron_condor"], config=cfg)
 
-        wr, params = bt._run_single_window(
+        wr, params, _ = bt._run_single_window(
             window_id=1,
             train_start=date(2023, 1, 1),
             train_end=date(2023, 4, 11),

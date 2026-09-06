@@ -25,6 +25,10 @@ from ait.backtesting.pricing import (
     realized_vol,
 )
 from ait.backtesting.result import BacktestResult
+# R20 #5a: credit TP ladder / DTE close / macro-flatten windows come from the
+# shared exit-policy module (pure, import-light) instead of a hand copy of
+# live portfolio.py — a live tuning can no longer silently de-sync research.
+from ait.execution import exit_policy
 from ait.strategies.base import CREDIT_STRATEGIES, SignalDirection
 from ait.utils.logging import get_logger
 from ait.config.runtime_env import contract_flag, contract_float  # R19: ONE authority for env-contract defaults
@@ -56,6 +60,15 @@ NEUTRAL_CREDIT_GATED = (
 )
 
 
+# R20b review follow-up: this used to be a private copy of the "explicit >
+# config > fallback-class-default" precedence, duplicated independently in
+# walkforward.py/optimizer.py/the ML predictors/run_backtest.py. Moved to
+# ait.config.settings as the ONE shared implementation (also reused by those
+# other call sites); re-imported under the original name so every existing
+# `_resolve_setting(...)` call in this file needs no change.
+from ait.config.settings import resolve_config_value as _resolve_setting
+
+
 class Backtester:
     """Simulates trading strategies against historical OHLCV data."""
 
@@ -63,24 +76,50 @@ class Backtester:
         self,
         data: pd.DataFrame,
         strategies: list[str],
+        # R20b: initial_capital (and max_concurrent_positions below) stay
+        # EXPLICIT constructor defaults per the pre-registration — they are
+        # test-harness sizing knobs, not strategy economics: every research
+        # entry point (walkforward, optimizer, run_backtest) passes its own
+        # capital, and a $10k bare-engine default cannot bias a comparison
+        # the way a divergent gate threshold can.
         initial_capital: float = 10_000.0,
-        commission_per_contract: float = 0.65,
+        # W5 finding model-vs-reality-commission-constant: was a bare 0.65
+        # literal that stood for the WHOLE per-leg cost. IBKR charges ~$0.65
+        # commission PLUS regulatory/exchange/clearing fees on every option
+        # leg, entry AND exit; the repo's own executions ledger measures the
+        # all-in at 0.9168/contract-leg (mean; median 1.0284), so the flat
+        # 0.65 understated a condor round trip by $2.13/contract (~41%).
+        # None -> resolve from load_settings().backtest.* (see the resolution
+        # block below); an explicit value still wins, so walkforward.py's
+        # pinned 0.65 keeps its commission line and only gains the fees.
+        commission_per_contract: float | None = None,
+        regulatory_fees_per_contract: float | None = None,
         slippage_pct: float = 0.01,
         position_size_pct: float = 0.05,
         stop_loss_pct: float = 0.50,
         profit_target_pct: float = 1.00,
         max_hold_days: int = 30,
-        min_confidence: float = 0.55,
+        # R20b (pre-registered PLAN 2026-08-21): was 0.55, silently shadowing
+        # the config with a DIFFERENT value. None -> resolve from
+        # load_settings().risk.min_confidence (yaml 0.50). See the resolution
+        # block below for why risk.min_confidence is the documented home.
+        min_confidence: float | None = None,
         trailing_stop_enabled: bool = False,
         trailing_stop_pct: float = 0.25,
         breakeven_trigger_pct: float = 0.30,
         predictor: Any = None,
         range_predictor: Any = None,
-        range_min_confidence: float = 0.55,
+        # R20b: was 0.55 vs live's ml.range_min_confidence = 0.65 (config.yaml;
+        # 0.65 beat 0.55 across every backtest metric) — the parity gap the
+        # floor sweep exposed. None -> resolve from load_settings().ml.
+        range_min_confidence: float | None = None,
         context_bars: int = 0,
         delta_short: float = 0.20,
         delta_long: float = 0.30,
-        iv_floor: float = 0.12,
+        # R20b: was 0.12 vs config.yaml backtest.iv_floor = 0.20 — a bare
+        # engine priced systematically thinner credits than every configured
+        # path. None -> resolve from load_settings().backtest.iv_floor.
+        iv_floor: float | None = None,
         # R6 parity: live iron_condor._vol_scaled_width enforces min $2, not $5.
         wing_floor_dollars: float = 2.0,
         # R16 #8: None -> resolve env AIT_IC_WING_K (default 1.0), mirroring
@@ -88,6 +127,12 @@ class Backtester:
         wing_k: float | None = None,
         delta_iv_scale: float = 0.0,
         skew_factor: float = 1.0,
+        # W5 finding model-vs-reality-skew-10x-flat: measured put-side skew is
+        # 9-11x steeper than the hardcoded 0.10 slope in _get_leg_iv, so model
+        # wings were near-free ($0.08 vs $0.71-0.92 real). None -> resolve
+        # from load_settings().backtest.skew_slope_per_pct_otm; 0.0 restores
+        # pre-W5 pricing exactly.
+        skew_slope_per_pct_otm: float | None = None,
         hurst_regime_threshold: float = 0.20,
         hurst_regime_penalty: float = 0.10,
         hurst_hard_veto_multiplier: float = 1.5,
@@ -96,6 +141,9 @@ class Backtester:
         pct_from_60d_high_threshold: float = -1.0,
         min_edge_over_baseline: float = 0.05,
         features_cache: pd.DataFrame | None = None,
+        # R20b: stays EXPLICIT (with initial_capital above) per the
+        # pre-registration — harness sizing knob; 1 = the original
+        # single-position semantics unit tests depend on.
         max_concurrent_positions: int = 1,
         max_entry_vol_annual: float = 0.80,
         # Options bid-ask spread model (per-leg, IV/DTE-aware)
@@ -108,12 +156,21 @@ class Backtester:
         # Earnings-aware skip (Gap Z4): if symbol is given, skip entries near earnings dates
         symbol: str | None = None,
         earnings_skip_days: int = 2,
-        # Intraday engine (Fix 1): 5-min execution loop
+        # Intraday engine (Fix 1): 5-min execution loop.
+        # R20 #4/#5b: None -> resolve from load_settings().backtest (config.yaml
+        # authority; BacktestConfig defaults when no config is reachable). The
+        # engine used to hardcode '09:30' while BacktestConfig declares '10:30'
+        # — the documented Fix 1/Gap H parity value that
+        # scripts/export_production_params.py reports as production parity —
+        # so every intraday-gated study traded a window the config contract
+        # says is forbidden, and the exported params lied about it. '10:30'
+        # (skip open volatility) is the historically correct value; '09:30'
+        # was constructor drift.
         intraday_store: Any = None,
-        scan_interval_minutes: int = 60,
-        entry_window_start_et: str = "09:30",
-        entry_window_end_et: str = "15:30",
-        limit_order_timeout_bars: int = 3,
+        scan_interval_minutes: int | None = None,
+        entry_window_start_et: str | None = None,
+        entry_window_end_et: str | None = None,
+        limit_order_timeout_bars: int | None = None,
         # Per-window MetaLabeler for OOS signal filtering (Gap Z1)
         meta_labeler: Any = None,
         # H2 val-split: skip new entries before this date (full df still used for feature warmup)
@@ -152,11 +209,33 @@ class Backtester:
         # engine's designed fallback and what the ablation studies claimed to
         # measure.
         allow_live_model_fallback: bool = True,
+        # DTE/hold-cap decoupling fix (2026-08-24): entry_dte is the REAL
+        # time-to-expiration used for BS pricing and decay, fixed near what
+        # live actually gets (options_chain.py picks the nearest expiry >=
+        # dte_range[0]) — it is NOT Optuna-searched. max_hold_days remains a
+        # separate, deliberately-synthetic Optuna-searched hold-period cap
+        # (live has no "close after N days held" rule; only DTE/touch/TP
+        # exits) for exploring shorter/longer forced-hold horizons. Before
+        # this fix both concepts were the SAME variable (self._max_hold_days
+        # doubled as the option's simulated expiration), so every prior
+        # walk-forward study's "optimal max_hold_days" was silently also
+        # picking the simulated DTE. None -> resolve options.dte_range[0]
+        # from load_settings() (config.yaml authority; falls back to
+        # OptionsConfig's pydantic default when no config.yaml is reachable).
+        entry_dte: int | None = None,
+        # R20b follow-up: optional pre-loaded Settings, so a caller building
+        # many Backtester instances (StrategyOptimizer: one per Optuna trial)
+        # can load config.yaml ONCE and thread it through instead of every
+        # construction re-reading and re-validating the file from disk.
+        # None (default) preserves the original behavior — load it here.
+        settings: Any = None,
     ) -> None:
         self._data = self._prepare_data(data)
         self._strategies = strategies
         self._initial_capital = initial_capital
-        self._commission = commission_per_contract
+        # W5: _commission / _regulatory_fees / _cost_per_contract_leg are
+        # resolved in the loaded-settings block below (they need _settings),
+        # same as _iv_floor.
         self._slippage_pct = slippage_pct
         self._spread_base = spread_base
         self._spread_iv_sensitivity = spread_iv_sensitivity
@@ -176,25 +255,27 @@ class Backtester:
         self._stop_loss_pct = stop_loss_pct
         self._profit_target_pct = profit_target_pct
         self._max_hold_days = max_hold_days
-        self._min_confidence = min_confidence
+        # R20b: _min_confidence / _range_min_confidence / _iv_floor are
+        # resolved in the loaded-settings block below (they need _settings).
         self._trailing_stop_enabled = trailing_stop_enabled
         self._trailing_stop_pct = trailing_stop_pct
         self._breakeven_trigger_pct = breakeven_trigger_pct
         self._context_bars = context_bars
         self._range_predictor = range_predictor
-        self._range_min_confidence = range_min_confidence
         self._delta_short = delta_short
         self._delta_long = delta_long
-        self._iv_floor = iv_floor
         self._wing_floor_dollars = wing_floor_dollars
-        # R16 #8: mirror the live env resolution (iron_condor.py reads
-        # AIT_IC_WING_K, default 1.0) when wing_k is not explicitly configured.
+        # R16 #8: mirror the live resolution when wing_k is not explicitly
+        # configured (R19 contract: env AIT_IC_WING_K > config.yaml
+        # backtest.wing_k > CONTRACT_DEFAULTS 1.6 — the comment here used to
+        # say "default 1.0", stale since the 2026-08-04 promotion).
         self._wing_k = (
             float(wing_k) if wing_k is not None
             else contract_float("AIT_IC_WING_K")
         )
         self._delta_iv_scale = delta_iv_scale
         self._skew_factor = skew_factor
+        # W5: _skew_slope_per_pct_otm resolved in the settings block below.
         self._hurst_regime_threshold = hurst_regime_threshold
         self._hurst_regime_penalty = hurst_regime_penalty
         self._hurst_hard_veto_multiplier = hurst_hard_veto_multiplier
@@ -212,10 +293,87 @@ class Backtester:
             self._load_calibrated_spreads()
         self._earnings_dates: set[date] = self._load_earnings_dates(symbol, earnings_skip_days)
         self._intraday_store = intraday_store
-        self._scan_interval_minutes = scan_interval_minutes
-        self._entry_window_start_et = entry_window_start_et
-        self._entry_window_end_et = entry_window_end_et
-        self._limit_order_timeout_bars = limit_order_timeout_bars
+        # R20: resolve LOADED settings once for every config-backed knob below
+        # (extends the R16 #7 pre_event_blackout_days pattern).
+        # R20b follow-up: reuse a caller-supplied `settings` (e.g.
+        # StrategyOptimizer loads it once and threads it through per Optuna
+        # trial) instead of unconditionally re-reading + re-validating
+        # config.yaml on every Backtester construction.
+        if settings is not None:
+            _settings = settings
+        else:
+            try:
+                from ait.config.settings import load_settings as _ls
+                _settings = _ls()
+            except Exception:  # noqa: BLE001 — no config.yaml -> per-field defaults
+                _settings = None
+        # R20 #4/#5b + R20b (pre-registered PLAN 2026-08-21): every knob below
+        # follows the same explicit > settings.<section>.<field> > config-model
+        # default precedence (_resolve_setting); explicit constructor args
+        # always win, a partial stub or missing config.yaml degrades to that
+        # field's pydantic default.
+        #   iv_floor             0.12 -> settings.backtest.iv_floor      (yaml 0.20)
+        #   range_min_confidence 0.55 -> settings.ml.range_min_confidence (yaml 0.65)
+        #   min_confidence       0.55 -> settings.risk.min_confidence     (yaml 0.50)
+        # min_confidence's home is risk.min_confidence because the engine
+        # consumes it as the DIRECTIONAL-confidence entry gate (run():
+        # `confidence < effective_min_conf` skips the entry, with the
+        # neutral-credit bypass) — exactly the gate live reads from
+        # settings.risk.min_confidence (orchestrator.py `neutral_only =
+        # prediction.confidence < min_confidence`), and the production-params
+        # exporter already maps "min_confidence" -> ("risk", "min_confidence")
+        # (optimization/results.py). It is NOT ml.range_min_confidence (the
+        # range-gate floor, a separate knob resolved below).
+        from ait.config.settings import (
+            BacktestConfig, ExitConfig, MLConfig, OptionsConfig, RiskConfig,
+        )
+        # entry_dte: real time-to-expiration for BS pricing/decay, fixed near
+        # live's actual chain selection (dte_range[0]) — see constructor
+        # comment. Not itself Optuna-searched; max_hold_days (below) stays
+        # the searched hold-cap knob.
+        self._entry_dte = int(entry_dte) if entry_dte is not None else int(
+            _resolve_setting(None, "options", "dte_range", OptionsConfig, _settings)[0])
+        self._scan_interval_minutes = int(_resolve_setting(
+            scan_interval_minutes, "backtest", "scan_interval_minutes", BacktestConfig, _settings))
+        self._entry_window_start_et = str(_resolve_setting(
+            entry_window_start_et, "backtest", "entry_window_start_et", BacktestConfig, _settings))
+        self._entry_window_end_et = str(_resolve_setting(
+            entry_window_end_et, "backtest", "entry_window_end_et", BacktestConfig, _settings))
+        self._limit_order_timeout_bars = int(_resolve_setting(
+            limit_order_timeout_bars, "backtest", "limit_order_timeout_bars", BacktestConfig, _settings))
+        self._iv_floor = float(_resolve_setting(
+            iv_floor, "backtest", "iv_floor", BacktestConfig, _settings))
+        # W5 model-vs-reality-commission-constant: per-leg, per-side broker
+        # cost = commission + regulatory/exchange/clearing fees. Both charged
+        # on entry AND exit (see run() and _calc_pnl). _commission stays the
+        # commission LINE (walkforward/optimizer pass it explicitly); the
+        # all-in figure the engine actually debits is
+        # _cost_per_contract_leg = 0.65 + 0.2668 = 0.9168 by default, the
+        # measured ledger mean.
+        self._commission = float(_resolve_setting(
+            commission_per_contract, "backtest", "commission_per_contract",
+            BacktestConfig, _settings))
+        self._regulatory_fees = float(_resolve_setting(
+            regulatory_fees_per_contract, "backtest",
+            "regulatory_fees_per_contract", BacktestConfig, _settings))
+        self._cost_per_contract_leg = self._commission + self._regulatory_fees
+        # W5 model-vs-reality-skew-10x-flat: relative put-side IV uplift per
+        # percentage point OTM, consumed in _get_leg_iv (the single per-leg IV
+        # input point every builder and reprice path goes through).
+        self._skew_slope_per_pct_otm = float(_resolve_setting(
+            skew_slope_per_pct_otm, "backtest", "skew_slope_per_pct_otm",
+            BacktestConfig, _settings))
+        self._range_min_confidence = float(_resolve_setting(
+            range_min_confidence, "ml", "range_min_confidence", MLConfig, _settings))
+        self._min_confidence = float(_resolve_setting(
+            min_confidence, "risk", "min_confidence", RiskConfig, _settings))
+        # R20 #5a: live's TP ladder is gated by exit.time_decay_scaling
+        # (portfolio.py _get_take_profit_targets); the engine ran the ladder
+        # unconditionally, so flipping the flag moved live to flat 0.50
+        # targets while research kept the ladder. No constructor override —
+        # always follows the loaded/default config, same as before.
+        self._exit_time_decay_scaling = bool(_resolve_setting(
+            None, "exit", "time_decay_scaling", ExitConfig, _settings))
         self._meta_labeler = meta_labeler
         self._eval_start_date = eval_start_date
 
@@ -256,17 +414,8 @@ class Backtester:
         # R16 #7: resolve the macro blackout window ONCE, from the same source
         # live reads (loaded settings), instead of pinning to RiskConfig()
         # defaults on every entry day.
-        if pre_event_blackout_days is not None:
-            self._pre_event_blackout_days = int(pre_event_blackout_days)
-        else:
-            try:
-                from ait.config.settings import load_settings as _ls
-                self._pre_event_blackout_days = int(
-                    _ls().risk.pre_event_blackout_days
-                )
-            except Exception:  # noqa: BLE001 — no config.yaml -> config default
-                from ait.config.settings import RiskConfig as _RC
-                self._pre_event_blackout_days = int(_RC().pre_event_blackout_days)
+        self._pre_event_blackout_days = int(_resolve_setting(
+            pre_event_blackout_days, "risk", "pre_event_blackout_days", RiskConfig, _settings))
 
         # R16 #1: explicit, loudly-logged predictor mode. Never silently score
         # research windows with the live (future-trained) artifact.
@@ -727,7 +876,16 @@ class Backtester:
                     if not filled:
                         continue  # Limit order expired without fill — skip entry
 
-            pos = self._build_position(strategy, direction, row, hist, today_date, capital)
+            # R20 #1: run() has had self._market_context all along (walkforward
+            # passes the window-aligned VIX/SPY frames) but never forwarded it
+            # here, so _get_iv's priority-2 VIX branch and the R16 per-symbol
+            # vol calibration (VXN/VIX 1.228 QQQ, 1.33 IWM) were DEAD at
+            # entry-pricing time — every study priced entries off the
+            # priority-3 synthetic fallback realized_vol*1.15.
+            pos = self._build_position(
+                strategy, direction, row, hist, today_date, capital,
+                market_context=self._market_context,
+            )
             if pos is None:
                 continue
 
@@ -827,8 +985,11 @@ class Backtester:
             # Deep-audit BT-M6: entry commission is included in _calc_pnl
             # (subtracted from the trade P&L added back at exit) — debiting
             # capital here as well double-counted it in final_capital.
+            # W5 model-vs-reality-commission-constant: the debit is now the
+            # ALL-IN per-leg cost (commission + regulatory/exchange/clearing
+            # fees), charged per leg on entry and again on exit in _calc_pnl.
             n_legs = pos.get("n_legs", 1)
-            entry_commission = self._commission * pos["contracts"] * n_legs
+            entry_commission = self._cost_per_contract_leg * pos["contracts"] * n_legs
             pos["entry_commission"] = entry_commission
 
             open_positions.append(pos)
@@ -1156,7 +1317,10 @@ class Backtester:
         Low IV → prefer debit strategies (buy cheap premium)
         """
         available = set(self._strategies)
-        iv = self._get_iv(hist)
+        # R20 #1: a bare, context-free IV-estimation call sat here with its
+        # result UNUSED — dead code that invited a future reader to assume
+        # selection was VIX-aware. Removed rather than context-threaded: the
+        # regime proxy below is realized-vol based.
 
         # IV rank proxy: compare current IV to its range
         close_arr = hist["Close"].values
@@ -1189,14 +1353,35 @@ class Backtester:
                     option_type: OptionType) -> float:
         """Apply vol skew: OTM puts carry extra IV, OTM calls carry mild extra IV.
 
-        Linear model in log-moneyness space:
+        Legacy (pre-W5) linear model in log-moneyness space:
         - Put: +1% IV per 10% below ATM (e.g. 20% OTM put → +2% IV)
         - Call: +0.2% IV per 10% above ATM
         skew_factor=0.0 restores flat IV; default 1.0 approximates market skew.
+
+        W5 finding model-vs-reality-skew-10x-flat: that put slope (0.10
+        absolute IV per unit |log-moneyness|) is 9-11x FLATTER than the
+        surface measured on the repo's own 3,159 IBKR quotes (1.141 SPY /
+        0.983 QQQ / 0.916 IWM), which is why model wings were near-free —
+        long put $0.08 against a $0.71-0.92 real chain mid — and every
+        wing_k / wide-wing study preferred wider wings than the market
+        actually prices. The correction is the config-backed MULTIPLICATIVE
+        term below: leg IV picks up base_iv x skew_slope_per_pct_otm x
+        (percentage points OTM), so the surface steepens with the vol level
+        the way the measured one does.
+
+        skew_slope_per_pct_otm = 0.0 reproduces the pre-W5 output EXACTLY
+        (backward-compat escape hatch for reproducing an old study). The call
+        side keeps its legacy 0.02 term on purpose: the same regression put
+        the call-side slope at 0.064 / 0.112 / -0.089 — sign-unstable across
+        symbols, so there is no measured slope to ship there.
         """
         log_m = np.log(strike / underlying)
         if option_type == OptionType.PUT:
-            skew_adj = self._skew_factor * max(0.0, -log_m) * 0.10
+            otm = max(0.0, -log_m)
+            skew_adj = self._skew_factor * otm * 0.10
+            # W5: measured put-side steepening, relative to the vol level.
+            # otm * 100 = distance in PERCENTAGE POINTS OTM.
+            skew_adj += base_iv * self._skew_slope_per_pct_otm * (otm * 100.0)
         else:
             skew_adj = self._skew_factor * max(0.0, log_m) * 0.02
         return max(base_iv + skew_adj, self._iv_floor)
@@ -1328,7 +1513,7 @@ class Backtester:
         """Build a position dict with proper BS pricing for the strategy type."""
         underlying = row["Close"]
         iv = self._get_iv(hist, market_context=market_context)
-        dte = self._max_hold_days
+        dte = self._entry_dte
         t = dte / 365.0
         r = 0.05
 
@@ -1961,7 +2146,10 @@ class Backtester:
         - For credit positions: current cost to buy back (want it to go DOWN)
         """
         iv = self._get_current_iv(pos, hist)
-        dte_remaining = max(self._max_hold_days - days_held, 0)
+        # Decay to the REAL expiration (entry_dte), not the hold-cap —
+        # max_hold_days now closes the position early via its own exit
+        # check (_check_exit_*) rather than by fabricating a shorter option.
+        dte_remaining = max(self._entry_dte - days_held, 0)
         t = max(dte_remaining / 365.0, 0.0001)
         r = 0.05
 
@@ -2133,8 +2321,21 @@ class Backtester:
             if result.get("exit_reason") == "touch_stop":
                 _tu = float(result.pop("touch_underlying"))
                 current_value = self._reprice_position(pos, _tu, days_held, hist)
-                current_value *= (1 + exit_half_spread)
                 underlying = _tu
+                # W5 model-vs-reality-touch-gap-pricing: a day that OPENED
+                # beyond the short strike could never have been closed AT the
+                # strike. Reprice at the gapped open and book the worse of the
+                # two — conservative by construction, so a gap can only ever
+                # cost more than the strike-touch booking, never less.
+                _gap = result.pop("touch_gap_underlying", None)
+                if _gap is not None:
+                    _gv = self._reprice_position(pos, float(_gap), days_held, hist)
+                    _worse = (_gv > current_value if trade_type == "credit"
+                              else _gv < current_value)
+                    if _worse:
+                        current_value = _gv
+                        underlying = float(_gap)
+                current_value *= (1 + exit_half_spread)
 
             # Calculate actual P&L
             pnl = self._calc_pnl(pos, current_value)
@@ -2166,24 +2367,18 @@ class Backtester:
         return self._check_exit_fixed(pos, pnl_pct, current_date)
 
     @staticmethod
-    def _credit_take_profit_pct(dte: int | None) -> float:
+    def _credit_take_profit_pct(dte: int | None, time_decay_scaling: bool = True) -> float:
         """DTE-laddered take-profit target as a fraction of credit received.
 
-        Mirrors the SHORT side of src/ait/execution/portfolio.py
-        _get_take_profit_targets() exactly (time_decay_scaling=True is the
-        live default; dte=None falls back to the live 0.50 default):
-            DTE > 20  -> 0.50
-            DTE 11-20 -> 0.40
-            DTE 6-10  -> 0.30
-            DTE <= 5  -> 0.20
+        R20 #5a: the ladder (0.50/0.40/0.30/0.20 + breakpoints) used to be a
+        hand copy of portfolio.py _get_take_profit_targets — now imported from
+        the shared ait.execution.exit_policy authority. Stays a staticmethod
+        with a defaulted flag because run_backtest.py calls it UNBOUND for its
+        drift-check table; the exit path passes self._exit_time_decay_scaling.
         """
-        if dte is None or dte > 20:
-            return 0.50
-        elif dte > 10:
-            return 0.40
-        elif dte > 5:
-            return 0.30
-        return 0.20
+        return exit_policy.credit_take_profit_pct(
+            dte, time_decay_scaling=time_decay_scaling
+        )
 
     def _check_exit_credit(self, pos: dict, pnl_pct: float, current_date: date,
                            row: pd.Series | None = None) -> dict | None:
@@ -2205,6 +2400,16 @@ class Backtester:
         # Daily High/Low bracket the true intraday path, so they detect the
         # touch without intraday bars. The exit is priced AT the touched
         # strike (the level live would have transacted at), not at the close.
+        # W5 model-vs-reality-touch-gap-pricing: the strike is the right exit
+        # level only for an INTRADAY pierce. When the session OPENS already
+        # beyond a short strike there was never a chance to transact at the
+        # strike — options do not trade overnight and a resting stop would
+        # trigger at the open too — so booking the strike prices the standard
+        # condor loss path as a near-scratch. Measured: 1%+ overnight gaps on
+        # 9.6% of SPY / 18.1% QQQ / 17.8% IWM days in the very 604-day sample
+        # every study runs on, understating the loss by $324-$1,405/contract
+        # at 1%-3.5% gaps. The gapped open is reported alongside the strike
+        # and _check_exit prices the exit at the WORSE of the two.
         if row is not None and self._touch_stop_enabled:
             _sp = pos.get("short_put_strike")
             _sc = pos.get("short_call_strike")
@@ -2213,15 +2418,27 @@ class Backtester:
                 _high = float(row["High"]) if "High" in row else None
             except (TypeError, ValueError):
                 _low = _high = None
+            try:
+                _open = float(row["Open"]) if "Open" in row else None
+            except (TypeError, ValueError):
+                _open = None
             _touched = None
+            _gapped = None
             if _sp and _low is not None and _low <= float(_sp):
                 _touched = float(_sp)
+                if _open is not None and _open <= float(_sp):
+                    _gapped = _open
             elif _sc and _high is not None and _high >= float(_sc):
                 _touched = float(_sc)
+                if _open is not None and _open >= float(_sc):
+                    _gapped = _open
             if _touched is not None:
-                return {"exit_date": str(current_date),
+                _out = {"exit_date": str(current_date),
                         "exit_reason": "touch_stop",
                         "touch_underlying": _touched}
+                if _gapped is not None:
+                    _out["touch_gap_underlying"] = _gapped
+                return _out
         # HWM still tracked for journaling/analysis parity (live persists it
         # even though credit exits no longer trail off it).
         pos["high_water_mark"] = max(pos.get("high_water_mark", 0.0), pnl_pct)
@@ -2237,40 +2454,49 @@ class Backtester:
         if self._credit_loss_limit_mult > 0 and pnl_pct <= -self._credit_loss_limit_mult:
             return {"exit_date": str(current_date), "exit_reason": "credit_loss_limit"}
 
-        # 2. DTE-laddered take-profit (portfolio._get_take_profit_targets)
-        if pnl_pct >= self._credit_take_profit_pct(remaining_dte):
+        # 2. DTE-laddered take-profit (shared exit_policy ladder — R20 #5a
+        # also honors exit.time_decay_scaling exactly as live does; the flag
+        # off collapses to live's flat 0.50 short target).
+        if pnl_pct >= self._credit_take_profit_pct(
+                remaining_dte, self._exit_time_decay_scaling):
             return {"exit_date": str(current_date), "exit_reason": "take_profit_short"}
 
-        # 3. Expiry-approaching close — live closes any position at DTE<=5
-        # (portfolio.py rule 3a; rule 3 assignment risk at DTE<=1 is subsumed).
-        if remaining_dte <= 5:
+        # 2b. Max-hold-days cap — RESEARCH-ONLY knob (Optuna-searched): live
+        # has no "close after N days held" rule, only the DTE/touch/TP exits
+        # in this function. 2026-08-24 fix: before this, max_hold_days WAS
+        # entry_dte (the same variable), so this trigger never existed — the
+        # position simply couldn't outlive its own fabricated expiration.
+        # Now entry_dte is fixed near live's real chain selection and
+        # max_hold_days independently forces an earlier close, letting
+        # Optuna explore shorter/longer synthetic hold horizons.
+        held = (current_date - date.fromisoformat(pos["entry_date"])).days
+        if held >= self._max_hold_days:
+            return {"exit_date": str(current_date), "exit_reason": "max_hold_reached"}
+
+        # 3. Expiry-approaching close — live closes any position at
+        # DTE <= exit_policy.EXPIRY_APPROACHING_DTE (portfolio.py rule 3a;
+        # rule 3 assignment risk at DTE<=1 is subsumed).
+        if remaining_dte <= exit_policy.EXPIRY_APPROACHING_DTE:
             reason = "expiry" if current_date >= expiry else "expiry_approaching"
             return {"exit_date": str(current_date), "exit_reason": reason}
 
         # 4. Macro-event flatten (portfolio.py rule 3d parity). PLAN
         # 2026-08-04: defined-risk EXEMPT — condors hold through events
         # (wings cap the surprise; the vol crush is the payoff). Only
-        # undefined/assignment-risk strategies keep the early exit
-        # (strangles/jade_lizard <=5 days, CSP/CC <=1). 2026-only calendar:
-        # inactive for pre-2026 windows.
-        # R16: jade_lizard was missing here. The "wings cap the surprise"
-        # rationale is untrue for its NAKED short put — built max_loss_per_share
-        # is ~93.7 on a $100 underlying vs ~12.8 for the condors — so it was
-        # holding through FOMC/CPI/NFP while short_strangle (same put-side
-        # assignment/tail risk) flattened 5 days out, inflating the jade arm's
-        # relative PF on exactly the highest-variance days.
+        # undefined/assignment-risk strategies keep the early exit.
+        # R20 #5a: the strategy list AND per-strategy windows (strangle-class
+        # 5 days, CSP/CC 1) come from the shared exit_policy table — the R16
+        # jade_lizard omission was exactly the hand-copy drift this kills.
+        # 2026+2027-H1 calendar: inactive for pre-2026 windows.
+        _flat_window = exit_policy.macro_flatten_window_days(pos.get("strategy"))
         if (self._economic_cal is not None
                 and contract_flag("AIT_SKIP_MACRO_EVENTS")
-                and pos.get("strategy") in (
-                    "short_strangle", "jade_lizard",
-                    "cash_secured_put", "covered_call")):
+                and _flat_window is not None):
             try:
                 _d2e = self._economic_cal.days_until_next_event(current_date)
             except Exception:  # noqa: BLE001
                 _d2e = None
-            _evt_window = 5 if pos.get("strategy") in (
-                "short_strangle", "jade_lizard") else 1
-            if _d2e is not None and _d2e <= _evt_window:
+            if _d2e is not None and _d2e <= _flat_window:
                 return {"exit_date": str(current_date), "exit_reason": "macro_event_flatten"}
 
         return None
@@ -2287,6 +2513,11 @@ class Backtester:
         target = self._profit_target_pct
         if pnl_pct >= target:
             return {"exit_date": str(current_date), "exit_reason": "profit_target"}
+
+        # Max-hold-days cap (research-only knob; see _check_exit_credit)
+        held = (current_date - date.fromisoformat(pos["entry_date"])).days
+        if held >= self._max_hold_days:
+            return {"exit_date": str(current_date), "exit_reason": "max_hold_reached"}
 
         # Expiry
         expiry = date.fromisoformat(pos["expiry_date"])
@@ -2310,6 +2541,11 @@ class Backtester:
         if pnl_pct <= effective_stop:
             return {"exit_date": str(current_date), "exit_reason": stop_label}
 
+        # Max-hold-days cap (research-only knob; see _check_exit_credit)
+        held = (current_date - date.fromisoformat(pos["entry_date"])).days
+        if held >= self._max_hold_days:
+            return {"exit_date": str(current_date), "exit_reason": "max_hold_reached"}
+
         expiry = date.fromisoformat(pos["expiry_date"])
         if current_date >= expiry:
             return {"exit_date": str(current_date), "exit_reason": "expiry"}
@@ -2332,7 +2568,11 @@ class Backtester:
         else:
             raw_pnl = (current_value - entry_price) * 100 * contracts
 
-        exit_commission = self._commission * contracts * n_legs
+        # W5 model-vs-reality-commission-constant: all-in per-leg cost
+        # (commission + regulatory/exchange/clearing fees), same figure the
+        # entry side debits — a 4-leg condor round trip therefore costs
+        # _cost_per_contract_leg x 4 x 2 per contract.
+        exit_commission = self._cost_per_contract_leg * contracts * n_legs
         total_commission = pos.get("entry_commission", 0) + exit_commission
 
         return raw_pnl - total_commission

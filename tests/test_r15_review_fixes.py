@@ -84,14 +84,23 @@ class TestMtmHaltClears:
             b._tripped, b._trip_reason = False, ""
             b._daily_pnl, b._consecutive_losses = 0.0, 0
             b._api_failures, b._resume_time = {}, None
-            b._last_reset_date = date.today()
+            # R20b follow-up: date.today() is naive/UTC-local (the CI runner's
+            # system tz); CircuitBreaker.check_daily_reset() is deliberately
+            # ET-pinned (now_et().date(), "deep-audit SR-M5"). They disagree
+            # for ~4-5h/day (UTC midnight -> ET midnight, ET is UTC-4/-5), so
+            # a CI run landing in that window flipped which calendar day
+            # "yesterday" resolved to and made this fixture flaky. Match the
+            # code under test's own time reference instead of the wall clock.
+            from ait.utils.time import now_et
+            b._last_reset_date = now_et().date()
             return b
 
     def test_mtm_trip_untrips_next_day(self):
+        from ait.utils.time import now_et
         b = self._breaker()
         assert b.check_daily_loss_mtm(-2000.0, 60000.0) is True
         assert b._tripped
-        b._last_reset_date = date.today() - timedelta(days=1)
+        b._last_reset_date = now_et().date() - timedelta(days=1)
         b.check_daily_reset()
         assert not b._tripped  # pre-fix: reason lacked 'daily_loss' -> stuck forever
 
@@ -348,6 +357,9 @@ class TestPreEventBlackoutRelaxed:
         bt = Backtester.__new__(Backtester)
         bt._touch_stop_enabled = False        # rule 0 out of the way
         bt._credit_loss_limit_mult = 0.0      # rule 1 disabled (live parity)
+        bt._exit_time_decay_scaling = True    # R20: shared exit_policy ladder flag
+        bt._max_hold_days = 60                # DTE/hold-cap fix: keep the new
+                                               # hold-cap check from firing here
         cal = MagicMock()
         cal.days_until_next_event.return_value = d2e
         bt._economic_cal = cal
@@ -357,6 +369,7 @@ class TestPreEventBlackoutRelaxed:
         # 30 DTE, +5% of credit: clears the take-profit ladder and the DTE<=5
         # close, so the macro rule is the only one that can fire.
         return {"strategy": strategy, "high_water_mark": 0.0,
+                "entry_date": str(date.today()),
                 "expiry_date": str(date.today() + timedelta(days=30))}
 
     def test_engine_holds_a_condor_through_the_event(self, monkeypatch):

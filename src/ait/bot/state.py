@@ -224,6 +224,19 @@ class StateManager:
                     live_mid REAL DEFAULT 0,
                     nbbo_spread REAL DEFAULT 0
                 )""",
+                # W1 (R23 concurrency-2 / trade-life-close-booking-two-owners):
+                # transactional exit outbox. close_trade enqueues a row in the
+                # SAME transaction as the close; every booking path CLAIMS the
+                # row (single DELETE, sqlite-serialized => exactly-once) before
+                # touching daily stats / breaker / PDT / Thompson. Closes booked
+                # by the reconciler while the bot was down are drained by the
+                # orchestrator's cycle instead of silently bypassing the breaker.
+                """CREATE TABLE IF NOT EXISTS exit_outbox (
+                    trade_id TEXT PRIMARY KEY,
+                    realized_pnl REAL NOT NULL,
+                    exit_reason TEXT DEFAULT '',
+                    exit_time TEXT NOT NULL
+                )""",
             ):
                 try:
                     conn.execute(ddl)
@@ -408,6 +421,18 @@ class StateManager:
             conn.execute(
                 "DELETE FROM open_positions WHERE trade_id = ?",
                 (trade_id,),
+            )
+
+            # W1: enqueue the booking obligation in the SAME transaction as
+            # the close — whoever books stats/breaker must claim this row
+            # first (claim_exit_booking), so a close can be booked exactly
+            # once no matter which path (executor callback, reconciler,
+            # sweep, crash-recovery drain) discovers it.
+            conn.execute(
+                "INSERT OR REPLACE INTO exit_outbox "
+                "(trade_id, realized_pnl, exit_reason, exit_time) "
+                "VALUES (?, ?, ?, ?)",
+                (trade_id, realized_pnl, exit_reason_detailed, now),
             )
 
             # Dual-write: sync closed trade to DuckDB analytics
@@ -734,6 +759,31 @@ class StateManager:
         return dict(row) if row else None
 
     # --- Bot State (Key-Value) ---
+
+    def claim_exit_booking(self, trade_id: str) -> bool:
+        """W1: atomically claim the right to book a close's stats/breaker
+        effects. DELETE is serialized by sqlite, so of N concurrent bookers
+        exactly one gets True. Returns False when the row was already claimed
+        (or never enqueued — pre-outbox legacy closes)."""
+        with sqlite3.connect(self._db_path) as conn:
+            cur = conn.execute(
+                "DELETE FROM exit_outbox WHERE trade_id = ?", (trade_id,))
+            return cur.rowcount > 0
+
+    def pending_exit_bookings(self, older_than_seconds: float = 120.0) -> list[dict]:
+        """W1: closes whose booking nobody has claimed yet. The grace period
+        keeps the drain from racing an in-flight executor booking callback —
+        the callback claims within seconds; anything older is an orphan
+        (reconciler/sweep close, or a booking lost to a crash)."""
+        from datetime import datetime as _dt, timedelta as _td
+        cutoff = (_dt.now() - _td(seconds=older_than_seconds)).isoformat()
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT trade_id, realized_pnl, exit_reason, exit_time "
+                "FROM exit_outbox WHERE exit_time < ? ORDER BY exit_time",
+                (cutoff,)).fetchall()
+            return [dict(r) for r in rows]
 
     def set_state(self, key: str, value: str) -> None:
         """Set a key-value pair in bot state."""

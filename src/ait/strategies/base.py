@@ -54,6 +54,14 @@ BACKTEST_CREDIT_STRATEGIES = frozenset({
 
 CREDIT_STRATEGIES = LIVE_CREDIT_STRATEGIES | BACKTEST_CREDIT_STRATEGIES
 
+# R19d/R20b follow-up: the go-live verdict metric (status.py) counts ONLY
+# strategies actually promoted to production, which is a STRICT SUBSET of
+# CREDIT_STRATEGIES (most of which are backtest-only experiments) — a
+# different concept, not a narrowing of the same one. iron_condor is the
+# sole promotion today; extend this set (not a bare string literal at each
+# report call site) when a second strategy is promoted.
+GO_LIVE_VERDICT_STRATEGIES = frozenset({"iron_condor"})
+
 # R16: strategies whose max loss is NOT structurally capped. Signal.max_loss
 # for these is a stress ESTIMATE (always > 0), so "max_loss > 0" could never
 # identify them — strangle signals reported is_defined_risk=True, silently

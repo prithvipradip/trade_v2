@@ -68,11 +68,33 @@ class VolMagnitudePredictor:
 
     def __init__(
         self,
+        # R20: config-backed training floor (was a hardcoded 100 that
+        # shadowed ml.min_training_samples). None -> the config value.
+        # Keyword-only: inserted ahead of the original params, a positional
+        # caller would otherwise silently misbind (e.g. int(threshold_pct)
+        # landing here, truncated to 0, disabling the training floor).
+        *,
+        min_training_samples: int | None = None,
         threshold_pct: float = 0.07,
         horizon_days: int = 30,
         ensemble_weights: dict[str, float] | None = None,
         model_dir: "Path | str | None" = None,
     ) -> None:
+        # R20b follow-up: was a bare MLConfig() (pydantic field default,
+        # never reads config.yaml) despite the comment above claiming this
+        # resolves "the config value". Now the shared resolve_config_value
+        # helper (also used by engine.py/walkforward.py/optimizer.py) —
+        # this file and range_predictor.py used to hand-roll an identical
+        # copy of this block independently.
+        if min_training_samples is None:
+            from ait.config.settings import MLConfig, load_settings, resolve_config_value
+            try:
+                _settings = load_settings()
+            except Exception:  # noqa: BLE001 — never block construction
+                _settings = None
+            min_training_samples = resolve_config_value(
+                None, "ml", "min_training_samples", MLConfig, _settings)
+        self._min_training_samples = int(min_training_samples)
         self._threshold = threshold_pct
         self._horizon = horizon_days
         # Artifact directory — live default is models/. Research callers MUST
@@ -135,8 +157,8 @@ class VolMagnitudePredictor:
         self._threshold = self._spec_threshold
         self._horizon = self._spec_horizon
         features = self._feature_engine.compute(df, market_context=market_context)
-        if len(features) < 100:
-            log.warning("vol_mag_insufficient_data", rows=len(features), required=100)
+        if len(features) < self._min_training_samples:
+            log.warning("vol_mag_insufficient_data", rows=len(features), required=self._min_training_samples)
             return {}
 
         features["target"] = self._create_labels(features["Close"])
