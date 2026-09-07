@@ -204,6 +204,22 @@ class StateManager:
                 # close, making PF-per-unit-risk and DD-vs-deployed-risk
                 # unreconstructable for the go-live verdict.
                 "ALTER TABLE trades ADD COLUMN capital_at_risk REAL DEFAULT 0",
+                # W10 (R24: the pre-registered observe-mode verdict is
+                # unscoreable). The entry-time RANGE PROBABILITY had no home:
+                # it was written into entry_confidence when the gates were
+                # armed and silently replaced by the observe-mode neutral
+                # baseline (0.60) on 2026-09-01, so the column means different
+                # things in different epochs and the rule "compare closes
+                # where p_in_range was above vs below 0.65" cannot be run.
+                # These give it a durable home of its own, plus the spec it
+                # was produced under (a probability is meaningless without its
+                # horizon/threshold) and which gate mode was in force.
+                "ALTER TABLE trade_context ADD COLUMN range_probability REAL",
+                "ALTER TABLE trade_context ADD COLUMN range_threshold_pct REAL",
+                "ALTER TABLE trade_context ADD COLUMN range_horizon_days INTEGER",
+                "ALTER TABLE trade_context ADD COLUMN range_model_version TEXT",
+                "ALTER TABLE trade_context ADD COLUMN entry_gates_mode TEXT",
+                "ALTER TABLE trade_context ADD COLUMN directional_confidence REAL",
                 # R7: per-fill execution ledger (real commissions + fill
                 # quality). trades.commission was written by ZERO callers —
                 # the PF verdict was being computed on guessed costs.
@@ -719,17 +735,35 @@ class StateManager:
         sentiment_score: float,
         signals: str = "{}",
         model_version: str = "",
+        range_probability: float | None = None,
+        range_threshold_pct: float | None = None,
+        range_horizon_days: int | None = None,
+        range_model_version: str | None = None,
+        entry_gates_mode: str | None = None,
+        directional_confidence: float | None = None,
     ) -> None:
-        """Save the market context at time of trade entry (SQLite + DuckDB)."""
+        """Save the market context at time of trade entry (SQLite + DuckDB).
+
+        W10: the range-model fields are separate from `confidence` on purpose.
+        `confidence` is whatever number actually drove risk validation for
+        this trade, which changes with gate mode; the range fields record what
+        the model SAID, under which spec, so the observe-mode verdict stays
+        scoreable across a mode change. None means "not produced" — which is
+        itself the answer for a symbol whose model failed its edge gate — and
+        must never be written as 0.0."""
         with sqlite3.connect(self._db_path) as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO trade_context
                    (trade_id, entry_direction, entry_confidence, entry_regime,
                     entry_vix, entry_iv_rank, entry_sentiment_score, entry_signals,
-                    model_version)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    model_version, range_probability, range_threshold_pct,
+                    range_horizon_days, range_model_version, entry_gates_mode,
+                    directional_confidence)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (trade_id, direction, confidence, regime, vix, iv_rank,
-                 sentiment_score, signals, model_version),
+                 sentiment_score, signals, model_version, range_probability,
+                 range_threshold_pct, range_horizon_days, range_model_version,
+                 entry_gates_mode, directional_confidence),
             )
 
         # Dual-write to DuckDB

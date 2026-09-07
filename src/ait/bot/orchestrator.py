@@ -1703,6 +1703,21 @@ class TradingOrchestrator:
                                 s.confidence = range_pred.probability_in_range
                                 model_overridden.add(s.strategy_name)
 
+            # W10 (R24): stash the prediction — INCLUDING its absence — so
+            # _try_execute can persist it on the trade row. Logging it was not
+            # enough: the pre-registered observe-mode rule ("compare closes
+            # where p_in_range was above vs below 0.65") is scored months
+            # later, and log lines rotate out in ~9 trading days. A symbol
+            # whose model failed its edge gate produces None, and None is the
+            # honest answer for that trade — never 0.0.
+            try:
+                _rp = getattr(self, "_entry_range_pred", None)
+                if _rp is None:
+                    _rp = self._entry_range_pred = {}
+                _rp[symbol] = range_pred
+            except Exception:  # noqa: BLE001 — telemetry must never block a scan
+                pass
+
             # fail-direction-02 (R22): ONE fail direction when the payoff-
             # matched gate has no evidence. Pre-fix, an unavailable range
             # model (missing/corrupt range.pkl — a documented incident class,
@@ -2579,6 +2594,14 @@ class TradingOrchestrator:
                 # feature frame (stashed in _scan_symbol minutes earlier).
                 signals=self._entry_signals_json(signal.symbol),
                 model_version=getattr(self._predictor, "model_version", "") or "",
+                # W10: the range model's own verdict, in its own columns, with
+                # the spec it was produced under. `confidence` above is
+                # whatever number actually drove risk validation and CHANGES
+                # MEANING with gate mode (it was the range probability while
+                # the gates were armed, and is the observe-mode neutral
+                # baseline since 2026-09-01) — which is precisely why the
+                # verdict could not be scored across the mode change.
+                **self._entry_range_context(signal.symbol),
             )
 
             msg = (
@@ -3145,6 +3168,29 @@ class TradingOrchestrator:
             total += ratio * (price if str(leg.get("action", "")).upper() == "BUY"
                               else -price)
         return round(total, 2)
+
+    def _entry_range_context(self, symbol: str) -> dict:
+        """W10: range-model fields for save_trade_context, from this scan's
+        stashed prediction. All None when the model produced nothing — that
+        is the real answer for a symbol whose model failed its edge gate, and
+        it must be distinguishable from a genuine low probability."""
+        pred = None
+        try:
+            pred = (getattr(self, "_entry_range_pred", None) or {}).get(symbol)
+        except Exception:  # noqa: BLE001
+            pred = None
+        mode = ("armed" if self._settings.ml.entry_gates_enabled else "observe")
+        if pred is None:
+            return {"range_probability": None, "range_threshold_pct": None,
+                    "range_horizon_days": None, "range_model_version": None,
+                    "entry_gates_mode": mode}
+        return {
+            "range_probability": float(pred.probability_in_range),
+            "range_threshold_pct": float(pred.threshold_pct),
+            "range_horizon_days": int(pred.horizon_days),
+            "range_model_version": getattr(pred, "model_version", "") or "",
+            "entry_gates_mode": mode,
+        }
 
     def _exit_band_cap(self, trade: TradeRecord) -> float | None:
         """W7: the acceptable limit IBKR stated when it rejected the previous

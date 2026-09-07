@@ -1851,3 +1851,36 @@ REMAINING FROM R24 (unchanged): W8 funding-size viability (at $3k the sizer
 refuses every viable condor while the self-test reports problems=0), W9
 booking exactly-once, W10 observe-mode measurability, W11 fail-open gates +
 holiday blackout, W12 ops substrate (Gateway absorbing state).
+
+## 2026-09-07 - W10 EXECUTED: THE OBSERVE-MODE VERDICT IS NOW SCOREABLE
+R24 found the 2026-09-01 pre-registration unexecutable: the rule "compare
+closes where p_in_range was above vs below 0.65" had no data behind it.
+PROOF FROM THE LIVE DB (why it was broken): trade_context.entry_confidence
+holds 0.8977 for the 08-24 trade (a range-model probability, written because
+the gates were armed) and exactly 0.60 for both 09-01 trades (the observe-mode
+neutral baseline). The column silently changed MEANING at the mode switch, the
+probability had no column of its own, and the only surviving copy was a log
+line — logs rotate in ~9 trading days while the verdict is scored at 50-100
+closes. For SPY/QQQ no probability was ever produced at all (predict() exits
+at the min-edge gate), and "no prediction" is not a low probability.
+FIX: six migrated columns on trade_context — range_probability,
+range_threshold_pct, range_horizon_days, range_model_version,
+entry_gates_mode, directional_confidence. _scan_symbol stashes the prediction
+(INCLUDING its absence) per symbol; _entry_range_context feeds it into
+save_trade_context at entry. NULL means "the model produced nothing", which is
+the honest record for an edge-gate failure and must never be written as 0.0
+(0.0 would read as "certain to leave the range" and land on the wrong side of
+the 0.65 split). The spec is stored WITH the number because the live model was
+retrained from horizon 30 to 9 — a probability without its horizon is not
+comparable across that change.
+PROOF: tests/test_w10_observe_mode_measurability.py, 11 executing tests
+(real StateManager migrations, real orchestrator helper, and an end-to-end
+test that runs the pre-registered above/below-0.65 split as SQL against
+stored rows, asserting the three-way above/below/unscored partition).
+Suite 1521 green, type gate OK, SMOKE PASS 13.
+HONEST LIMIT: this fixes measurement from NOW ON. The 10 closes already in the
+verdict sample, and the two open positions entered 09-01, have no stored
+probability and never will — they are permanently unscoreable against the
+pre-registered rule. The observe-mode evaluation therefore starts from the
+next entry, not from the existing sample.
+NOT YET DEPLOYED — takes effect on the next bot restart (as does W7).
