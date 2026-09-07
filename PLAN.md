@@ -1884,3 +1884,40 @@ probability and never will — they are permanently unscoreable against the
 pre-registered rule. The observe-mode evaluation therefore starts from the
 next entry, not from the existing sample.
 NOT YET DEPLOYED — takes effect on the next bot restart (as does W7).
+
+## 2026-09-07 - W11: COMMISSIONS IN P&L (measured against our own IBKR ledger) + CI FIX
+MEASURED FROM 94 REAL IBKR LEG FILLS (data/ait_state.db executions):
+  per-leg  min $0.6195  median $1.0230  mean $0.9089  max $1.0586
+  9 closed condor round trips: mean $7.62, median $8.23, range $6.64-$8.89
+The spread is bimodal (a ~$0.62 cluster and a ~$1.02-1.06 cluster) and is NOT
+explained by side (BOT $0.9081 vs SLD $0.9098), by entry-vs-exit ($0.9188 vs
+$0.8724), by premium tier (the same $0.01 option drew both $0.6228 and
+$1.0506), by symbol, or by month — it is exchange routing, which we do not
+control. What we CAN do is stop pretending the estimate is the truth.
+[1] hardcoded-live-03: TradeExecutor.commission_estimate was a flat $0.65/leg
+    = $5.20 per 1-lot condor round trip — IBKR's COMMISSION LINE ONLY, with no
+    exchange/regulatory/clearing pass-throughs. Against the measured $7.62 that
+    understated EVERY close by ~$2.42. Now reads the W5-calibrated config home
+    (commission_per_contract 0.65 + regulatory_fees_per_contract 0.2668 =
+    $0.9168/leg -> $7.33/condor), which matches the measured $0.9089 mean to
+    within a cent. Research and live now share one cost model.
+[2] regress-live-09 / pnl-money-02: the ledger true-up ran ONLY on the executor
+    callback path, so any close booked by the W1 outbox drain (crash between
+    the close and the callback, or a callback slower than the 120s grace) kept
+    the estimate forever and left trades.commission at 0.0 — a ONE-DIRECTIONAL
+    overstatement of the go-live P&L. Extracted to _true_up_commission, now
+    called on BOTH paths, and it also stamps the real figure so PF reads broker
+    truth. The partial-ledger defer (R16) is preserved on both.
+TEST DEBT REPAID: five test files re-implemented or pinned the $0.65 formula
+(test_pnl_accounting, test_properties, test_r15_review_fixes,
+test_order_lifecycle) — a second source of truth that broke the moment the
+authority moved. All now DERIVE from commission_estimate;
+test_properties._commission delegates instead of re-implementing.
+CI FIX (the failure on 7d971ed): web_logs.api_logs called
+orchestrator_status() bare, whose `path=ORCH_LOG` default binds at DEF time,
+so the test's monkeypatch was ignored and the assertion was satisfied by the
+DEVELOPER'S real logs/orchestrator.log. Green locally, "No supervisor log" in
+CI. Now reads the module global at CALL time. Proven hermetic by moving the
+real log aside and re-running (5 passed). This is the same late-binding class
+the W6 work fixed in verify_deadman.py and missed here.
+Suite 1524 green, type gate OK, SMOKE PASS 13.

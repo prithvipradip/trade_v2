@@ -122,14 +122,19 @@ def _pnl(strategy: str, contract_type: str, entry: float,
 
 
 def _commission(contract_type: str, strategy: str, qty: int) -> float:
-    legs = 1
-    if contract_type == "iron_condor":
-        legs = 4
-    elif contract_type == "spread" or strategy in (
-        "long_straddle", "event_straddle", "short_strangle", "calendar_spread",
-    ):
-        legs = 2
-    return 0.65 * legs * qty * 2
+    """Delegate to the ONE authority.
+
+    R24 hardcoded-live-03: this used to re-implement the formula with a
+    hardcoded $0.65/leg. That is the drift pattern this project keeps
+    finding — when commission_estimate moved to the all-in config-homed
+    figure ($0.9168/leg, matching our measured $0.9089 mean over 94 real
+    leg fills), this copy silently disagreed and the property tests failed
+    against correct code. A test that re-derives a production formula is a
+    second source of truth; call the real one.
+    """
+    from types import SimpleNamespace as _NS
+    return TradeExecutor.commission_estimate(
+        _NS(contract_type=contract_type, strategy=strategy, quantity=qty))
 
 
 class TestPnlCreditMembership:

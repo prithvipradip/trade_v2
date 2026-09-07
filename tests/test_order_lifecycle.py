@@ -187,13 +187,21 @@ async def test_credit_ic_place_fill_exit_close(env):
     booked = exits[0]
     assert booked["trade_id"] == trade_id
     assert booked["exit_price"] == pytest.approx(0.40)
-    # Credit membership: (entry_credit - exit_debit)*100*qty - 8-leg commission
-    expected_pnl = (0.95 - 0.40) * 100 - 0.65 * 4 * 1 * 2
-    assert booked["realized_pnl"] == pytest.approx(expected_pnl)
+    # Credit membership: (entry_credit - exit_debit)*100*qty - 8-leg
+    # commission. R24 hardcoded-live-03: derive it from the authority — it
+    # was $0.65/leg (IBKR's commission LINE only) and is now the all-in
+    # config-homed figure, matching the $0.9089/leg mean measured over our
+    # own 94 real fills.
+    _comm = TradeExecutor.commission_estimate(
+        SimpleNamespace(contract_type="iron_condor", strategy="iron_condor",
+                        quantity=1))
+    expected_pnl = (0.95 - 0.40) * 100 - _comm
+    # booked P&L is rounded to cents; the estimate is not
+    assert booked["realized_pnl"] == pytest.approx(expected_pnl, abs=0.01)
 
     row = _trade_row(env, trade_id)
     assert row.status == TradeStatus.CLOSED
-    assert row.realized_pnl == pytest.approx(expected_pnl)
+    assert row.realized_pnl == pytest.approx(expected_pnl, abs=0.01)
     assert _open_position_row(env, trade_id) is None
     assert env.executor.pending_count == 0
 
@@ -203,7 +211,8 @@ async def test_credit_ic_place_fill_exit_close(env):
     assert env.state.update_trade_status(
         trade_id, TradeStatus.FILLED, from_statuses=[TradeStatus.CLOSING]) is False
     assert _trade_row(env, trade_id).status == TradeStatus.CLOSED
-    assert _trade_row(env, trade_id).realized_pnl == pytest.approx(expected_pnl)
+    assert _trade_row(env, trade_id).realized_pnl == pytest.approx(
+        expected_pnl, abs=0.01)
 
 
 # ---------------------------------------------------------------------------

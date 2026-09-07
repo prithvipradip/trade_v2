@@ -679,6 +679,9 @@ class TradingOrchestrator:
                 if not self._state.claim_exit_booking(trade_id):
                     continue  # lost the race to a concurrent booker — correct
                 pnl = float(row["realized_pnl"] or 0.0)
+                # R24 regress-live-09: the drain used to book the fill-time
+                # ESTIMATE forever. Same correction the callback path applies.
+                pnl = self._true_up_commission(trade_id, pnl)
                 try:
                     exit_d = datetime.fromisoformat(row["exit_time"]).date()
                 except Exception:  # noqa: BLE001
@@ -744,46 +747,11 @@ class TradingOrchestrator:
                 log.warning("exit_booking_already_claimed", trade_id=trade_id)
                 continue
 
-            # R15 #8 (Tier-2 #4 for real): the fill-time booking embedded a
-            # FLAT $0.65/leg/side commission estimate inside realized_pnl —
-            # real commissions only ever reached the commission COLUMN, so
-            # every new close drifted from the broker again (the exact class
-            # D1 just restated away). True up BEFORE stats/breaker/Thompson
-            # see the number: swap the estimate out, the ledger truth in.
-            try:
-                _real_comm0 = self._state.total_commission(trade_id)
-                _t0 = self._find_trade_by_id(trade_id)
-                # R16: commissionReports for the 4 exit legs arrive ASYNC —
-                # truing up against a partial ledger (e.g. entry legs only)
-                # overstates realized_pnl permanently. Require a complete
-                # ledger (>= 2x leg count: entry side + exit side) before
-                # swapping; else defer to the post-market re-true-up.
-                _legs_n = 4
-                try:
-                    import json as _json
-                    _legs_n = max(1, len(_json.loads(_t0.legs))) if _t0 and _t0.legs else 4
-                except Exception:  # noqa: BLE001
-                    pass
-                _exec_n = self._state.count_executions(trade_id)
-                if _real_comm0 > 0 and _t0 and _exec_n >= 2 * _legs_n:
-                    from ait.execution.executor import TradeExecutor as _TE
-                    _delta = round(_TE.commission_estimate(_t0) - _real_comm0, 2)
-                    if abs(_delta) >= 0.01:
-                        ex["realized_pnl"] = round(ex["realized_pnl"] + _delta, 2)
-                        self._state.update_trade_realized_pnl(
-                            trade_id, ex["realized_pnl"])
-                        log.info("realized_pnl_commission_trueup",
-                                 trade_id=trade_id, delta=_delta,
-                                 real_comm=round(_real_comm0, 2))
-                elif _t0:
-                    self._state.set_state(f"trueup_pending_{trade_id}",
-                                          datetime.now().date().isoformat())
-                    log.info("commission_trueup_deferred_partial_ledger",
-                             trade_id=trade_id, executions=_exec_n,
-                             expected=2 * _legs_n)
-            except Exception as _e:  # noqa: BLE001 — booking must never die here
-                log.warning("commission_trueup_failed",
-                            trade_id=trade_id, error=str(_e))
+            # R15 #8: swap the fill-time ESTIMATE out and the ledger truth
+            # in BEFORE stats/breaker/Thompson see the number. W11: extracted
+            # so the outbox drain applies the identical correction.
+            ex["realized_pnl"] = self._true_up_commission(
+                trade_id, ex["realized_pnl"])
 
             realized_pnl = ex["realized_pnl"]
 
@@ -3168,6 +3136,63 @@ class TradingOrchestrator:
             total += ratio * (price if str(leg.get("action", "")).upper() == "BUY"
                               else -price)
         return round(total, 2)
+
+    def _true_up_commission(self, trade_id: str, pnl: float) -> float:
+        """Replace the fill-time commission ESTIMATE inside a realized P&L
+        with the broker's actual ledger figure. Returns the corrected P&L.
+
+        The fill-time booking subtracts commission_estimate(); the executions
+        ledger carries what IBKR really charged. Measured on our own 94 leg
+        fills, per-leg cost varies $0.62-$1.06 with exchange routing, so the
+        estimate is never exactly right and the ledger must win.
+
+        R16: commissionReports for the exit legs arrive ASYNC — truing up
+        against a partial ledger (entry legs only) overstates realized_pnl
+        permanently, so require a COMPLETE ledger (>= 2x leg count) and
+        otherwise defer to the post-market re-true-up.
+
+        R24 regress-live-09 / pnl-money-02: this used to live inline in
+        _process_completed_exits only, so any close booked by the outbox
+        drain (crash between the close and the callback, or a callback later
+        than the drain's grace period) kept the estimate forever and left
+        trades.commission at 0.0 — a one-directional overstatement of the
+        go-live P&L. One authority, both paths.
+        """
+        try:
+            real = self._state.total_commission(trade_id)
+            trade = self._find_trade_by_id(trade_id)
+            legs_n = 4
+            try:
+                import json as _json
+                legs_n = (max(1, len(_json.loads(trade.legs)))
+                          if trade and trade.legs else 4)
+            except Exception:  # noqa: BLE001
+                pass
+            exec_n = self._state.count_executions(trade_id)
+            if real > 0 and trade and exec_n >= 2 * legs_n:
+                from ait.execution.executor import TradeExecutor as _TE
+                delta = round(_TE.commission_estimate(trade) - real, 2)
+                if abs(delta) >= 0.01:
+                    pnl = round(pnl + delta, 2)
+                    self._state.update_trade_realized_pnl(trade_id, pnl)
+                    log.info("realized_pnl_commission_trueup",
+                             trade_id=trade_id, delta=delta,
+                             real_comm=round(real, 2))
+                # Stamp the real figure so the PF verdict reads broker truth.
+                try:
+                    self._state.update_trade_commission(trade_id, real)
+                except Exception:  # noqa: BLE001
+                    pass
+            elif trade:
+                self._state.set_state(f"trueup_pending_{trade_id}",
+                                      datetime.now().date().isoformat())
+                log.info("commission_trueup_deferred_partial_ledger",
+                         trade_id=trade_id, executions=exec_n,
+                         expected=2 * legs_n)
+        except Exception as e:  # noqa: BLE001 — booking must never die here
+            log.warning("commission_trueup_failed",
+                        trade_id=trade_id, error=str(e))
+        return pnl
 
     def _entry_range_context(self, symbol: str) -> dict:
         """W10: range-model fields for save_trade_context, from this scan's

@@ -307,7 +307,15 @@ def api_logs():
             html_lines.append(html)
 
     snap, last_signal, counter_note = day_counts()
-    status, _age = orchestrator_status()
+    # Read the module global at CALL time. `orchestrator_status(path=ORCH_LOG)`
+    # binds its default at def time, so calling it bare ignored any later
+    # reassignment of ORCH_LOG — which made this endpoint untestable and, worse,
+    # silently read the DEVELOPER'S real logs/orchestrator.log during tests.
+    # That is why the W6 suite passed locally and failed in CI ("No supervisor
+    # log"): the assertion was being satisfied by ambient machine state, not by
+    # the fixture. Same late-binding class the W6 work already fixed in
+    # scripts/verify_deadman.py (URL_FILE); this instance was missed.
+    status, _age = orchestrator_status(ORCH_LOG)
 
     return {
         'html': '\n'.join(html_lines[-400:]),

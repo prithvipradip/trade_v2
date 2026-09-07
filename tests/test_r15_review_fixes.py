@@ -196,9 +196,14 @@ class TestCommissionTrueUp:
         ex = {"trade_id": "T-X", "realized_pnl": -10.00, "exit_reason": "stop",
               "exit_price": 0.74}
         await orch._process_completed_exits([ex])
-        # est (IC, qty1) = 0.65*4*2 = 5.20; delta = 5.20 - 8.89 = -3.69
-        state.update_trade_realized_pnl.assert_called_once_with("T-X", -13.69)
-        assert stats.total_pnl == pytest.approx(-13.69)
+        # R24 hardcoded-live-03: the estimate is now the all-in config-homed
+        # figure (was the $0.65 commission LINE only = $5.20/condor, which
+        # understated our measured $7.46-$7.62 round trips). Derive it rather
+        # than re-pinning a literal that will drift again.
+        _est = TradeExecutor.commission_estimate(trade)
+        _expected = round(-10.00 + round(_est - 8.89, 2), 2)
+        state.update_trade_realized_pnl.assert_called_once_with("T-X", _expected)
+        assert stats.total_pnl == pytest.approx(_expected)
 
     async def test_partial_ledger_defers_trueup(self):
         # R16: commissionReports arrive async — a partial ledger (entry legs
@@ -231,13 +236,27 @@ class TestCommissionTrueUp:
         state.set_state.assert_any_call("trueup_pending_T-Y",
                                         date.today().isoformat())
 
-    def test_estimate_formula_unchanged(self):
+    def test_estimate_is_all_in_and_leg_proportional(self):
+        """RENAMED from test_estimate_formula_unchanged (R24
+        hardcoded-live-03). The formula DID change, deliberately: it was
+        $0.65/leg — IBKR's commission line only, omitting exchange/
+        regulatory/clearing pass-throughs — which made a 1-lot condor
+        round trip $5.20 against a measured $7.46 (9 real round trips,
+        range $6.64-$8.89; 94 leg fills averaging $0.9089). It now reads the
+        W5-calibrated config home. What must stay TRUE is the shape: all-in,
+        proportional to legs x sides x quantity, and identical for a 4-leg
+        condor and a 2-lot 2-leg spread (both are 8 contract-legs)."""
+        from ait.config.settings import load_settings
+        _bt = load_settings().backtest
+        per_leg = _bt.commission_per_contract + _bt.regulatory_fees_per_contract
         t = SimpleNamespace(contract_type="iron_condor", strategy="iron_condor",
                             quantity=1)
-        assert TradeExecutor.commission_estimate(t) == pytest.approx(5.20)
+        assert TradeExecutor.commission_estimate(t) == pytest.approx(per_leg * 8)
         t2 = SimpleNamespace(contract_type="spread", strategy="long_straddle",
                              quantity=2)
-        assert TradeExecutor.commission_estimate(t2) == pytest.approx(5.20)
+        assert TradeExecutor.commission_estimate(t2) == pytest.approx(per_leg * 8)
+        # and it must exceed the retired commission-line-only figure
+        assert TradeExecutor.commission_estimate(t) > 5.20
 
 
 # [minors] first-hour gate + VIX-None sizer

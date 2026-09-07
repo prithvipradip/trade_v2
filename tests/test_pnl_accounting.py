@@ -47,6 +47,18 @@ class _CalcHost:
 
 calc = _CalcHost()._calculate_realized_pnl
 
+# R24 hardcoded-live-03 (2026-09-07): these expectations used to hardcode the
+# $0.65/leg COMMISSION LINE ($2.60 for a 2-leg, $5.20 for a 4-leg round trip).
+# That omitted the exchange/regulatory/clearing pass-throughs: measured over
+# our own 94 real IBKR leg fills the all-in mean is $0.9089/leg, and 9 closed
+# condor round trips averaged $7.62. commission_estimate now reads the
+# W5-calibrated config home, so derive the figure from the authority rather
+# than re-pinning a literal that will drift again.
+def _comm(entry: float, qty: int, ctype: str, strategy: str) -> float:
+    return TradeExecutor.commission_estimate(
+        FakeTrade(entry, qty, ctype, strategy))
+
+
 
 # ---------------------------------------------------------------------------
 # 1. credit/debit P&L branching
@@ -56,22 +68,22 @@ class TestRealizedPnlFormula:
     def test_long_straddle_expiring_worthless_is_a_loss(self):
         t = FakeTrade(24.03, 1, "spread", "long_straddle")
         pnl = calc(t, 0.0)
-        assert pnl == pytest.approx(-2403 - 2.6, abs=0.01)
+        assert pnl == pytest.approx(-2403 - _comm(24.03, 1, "spread", "long_straddle"), abs=0.01)
 
     def test_long_straddle_doubling_is_a_gain(self):
         t = FakeTrade(19.925, 1, "spread", "long_straddle")
         pnl = calc(t, 39.85)
-        assert pnl == pytest.approx(+1992.5 - 2.6, abs=0.01)
+        assert pnl == pytest.approx(+1992.5 - _comm(19.925, 1, "spread", "long_straddle"), abs=0.01)
 
     def test_event_straddle_treated_as_debit(self):
         t = FakeTrade(10.0, 2, "spread", "event_straddle")
         pnl = calc(t, 15.0)
-        assert pnl == pytest.approx((15 - 10) * 100 * 2 - 0.65 * 2 * 2 * 2, abs=0.01)
+        assert pnl == pytest.approx((15 - 10) * 100 * 2 - _comm(10.0, 2, "spread", "event_straddle"), abs=0.01)
 
     def test_iron_condor_expiring_worthless_keeps_credit(self):
         t = FakeTrade(0.80, 1, "iron_condor", "iron_condor")
         pnl = calc(t, 0.0)
-        assert pnl == pytest.approx(+80 - 5.2, abs=0.01)
+        assert pnl == pytest.approx(+80 - _comm(0.80, 1, "iron_condor", "iron_condor"), abs=0.01)
 
     def test_iron_condor_bought_back_above_credit_is_a_loss(self):
         t = FakeTrade(0.80, 1, "iron_condor", "iron_condor")
@@ -80,7 +92,7 @@ class TestRealizedPnlFormula:
     def test_short_strangle_expiring_worthless_is_a_win(self):
         t = FakeTrade(2.50, 1, "spread", "short_strangle")
         pnl = calc(t, 0.0)
-        assert pnl == pytest.approx(+250 - 2.6, abs=0.01)
+        assert pnl == pytest.approx(+250 - _comm(2.50, 1, "spread", "short_strangle"), abs=0.01)
 
     def test_bull_call_spread_is_debit_despite_two_legs(self):
         t = FakeTrade(1.20, 1, "spread", "bull_call_spread")
@@ -89,11 +101,11 @@ class TestRealizedPnlFormula:
 
     def test_cash_secured_put_cheap_buyback_is_a_win(self):
         t = FakeTrade(5.00, 1, "put", "cash_secured_put")
-        assert calc(t, 1.00) == pytest.approx(+400 - 1.3, abs=0.01)
+        assert calc(t, 1.00) == pytest.approx(+400 - _comm(5.00, 1, "put", "cash_secured_put"), abs=0.01)
 
     def test_stock_no_multiplier(self):
         t = FakeTrade(100.0, 50, "stock", "stock")
-        assert calc(t, 110.0) == pytest.approx(500 - 65.0, abs=0.01)
+        assert calc(t, 110.0) == pytest.approx(500 - _comm(100.0, 50, "stock", "stock"), abs=0.01)
 
 
 # ---------------------------------------------------------------------------

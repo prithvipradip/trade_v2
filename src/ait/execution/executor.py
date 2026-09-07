@@ -2485,10 +2485,28 @@ class TradeExecutor:
 
     @staticmethod
     def commission_estimate(trade) -> float:
-        """Flat round-trip commission estimate: $0.65/contract/side per leg.
+        """Round-trip commission ESTIMATE, all-in per contract-leg.
+
         Single source of truth — the fill-time booking subtracts this, and
         the completed-exit true-up adds it back before subtracting the REAL
-        ledger commission. The two must stay the same formula."""
+        ledger commission. The two must stay the same formula.
+
+        R24 hardcoded-live-03: this was a flat $0.65/leg (=$5.20 per 1-lot
+        condor round trip) — the IBKR *commission line only*, omitting the
+        exchange/regulatory/clearing pass-throughs. Measured against our own
+        execution ledger (94 real leg fills): mean $0.9089/leg, and 9 closed
+        condor round trips averaging $7.62 (range $6.64-$8.89). The estimate
+        therefore understated every close by ~$2.42, and because the true-up
+        only runs when the ledger is complete, any close booked by the
+        recovery path kept that optimistic figure permanently. Now reads the
+        W5-calibrated config home (backtest.commission_per_contract +
+        regulatory_fees_per_contract = $0.9168), which matches the measured
+        mean to within a cent, so research and live share one cost model.
+
+        Per-fill cost varies $0.62-$1.06 with exchange routing, which we do
+        not control — this is an ESTIMATE that the ledger true-up replaces
+        with the truth as soon as the commissionReports arrive.
+        """
         qty = max(1, int(getattr(trade, "quantity", 1) or 1))
         legs_per_side = 1
         if trade.contract_type == "iron_condor":
@@ -2497,7 +2515,14 @@ class TradeExecutor:
             "long_straddle", "event_straddle", "short_strangle", "calendar_spread",
         ):
             legs_per_side = 2
-        return 0.65 * legs_per_side * qty * 2  # entry + exit
+        try:
+            from ait.config.settings import load_settings
+            _bt = load_settings().backtest
+            per_leg = float(_bt.commission_per_contract) + float(
+                _bt.regulatory_fees_per_contract)
+        except Exception:  # noqa: BLE001 — never let config block a booking
+            per_leg = 0.9168  # the measured all-in mean
+        return per_leg * legs_per_side * qty * 2  # entry + exit
 
     def _update_trade_filled(
         self, pending: PendingOrder, actual_price: float,

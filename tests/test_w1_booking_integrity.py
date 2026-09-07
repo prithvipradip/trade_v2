@@ -62,9 +62,20 @@ def _orch(st: StateManager):
     o._thompson = MagicMock()
     o._trainer = MagicMock()
     o._send_notification = AsyncMock()
+    # Mirror the real TradeRecord shape: commission_estimate reads
+    # contract_type/quantity directly, so an incomplete stub silently sends
+    # the true-up into its own exception guard.
     o._find_trade_by_id = lambda tid: SimpleNamespace(
         trade_id=tid, symbol="QQQ", strategy="iron_condor",
-        entry_time=datetime.now().isoformat(), legs="[]")
+        contract_type="iron_condor", quantity=1,
+        entry_time=datetime.now().isoformat(),
+        # A real 4-leg condor: the true-up requires a COMPLETE ledger
+        # (>= 2 x leg count), so leg count has to be truthful or the
+        # partial-ledger guard cannot be exercised.
+        legs=('[{"strike":700,"right":"P","action":"BUY"},'
+              '{"strike":710,"right":"P","action":"SELL"},'
+              '{"strike":760,"right":"C","action":"SELL"},'
+              '{"strike":770,"right":"C","action":"BUY"}]'))
     return o
 
 
@@ -225,3 +236,68 @@ class TestBreakerFailClosed:
         b = CircuitBreaker(_breaker_cfg())
         b.attach_state(_state(tmp_path))
         assert b._tripped is False
+
+class TestCommissionTrueUpOnBothPaths:
+    """R24 regress-live-09 / pnl-money-02 + hardcoded-live-03.
+
+    The fill-time booking subtracts an ESTIMATE; the executions ledger holds
+    what IBKR actually charged (measured over our own 94 leg fills: mean
+    $0.9089/leg, per-condor round trips $6.64-$8.89). The true-up used to run
+    ONLY on the executor callback path, so any close booked by the outbox
+    drain kept the estimate permanently and left trades.commission at 0.0 —
+    a one-directional overstatement of the go-live P&L.
+    """
+
+    def _seed_ledger(self, st, trade_id, per_leg, legs=4):
+        import sqlite3 as sq
+        with sq.connect(st._db_path) as conn:
+            for i in range(legs * 2):          # entry side + exit side
+                conn.execute(
+                    "INSERT INTO executions (exec_id, trade_id, symbol, side, "
+                    "shares, price, exec_time, commission) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (f"{trade_id}-x{i}", trade_id, "QQQ",
+                     "BOT" if i % 2 else "SLD", 1, 1.0,
+                     datetime.now().isoformat(), per_leg))
+
+    def test_estimate_is_the_config_homed_all_in_figure(self):
+        """Was a flat $0.65/leg = $5.20 per condor; the measured mean is
+        $7.62, so the estimate understated every close by ~$2.42."""
+        from ait.execution.executor import TradeExecutor
+        est = TradeExecutor.commission_estimate(
+            SimpleNamespace(quantity=1, contract_type="iron_condor",
+                            strategy="iron_condor"))
+        assert est > 5.20, "still the commission-line-only estimate"
+        assert 7.0 <= est <= 8.0, est
+
+    def test_drain_trues_up_against_the_ledger(self, tmp_path):
+        st = _state(tmp_path)
+        _seed_trade(st, "T-TU")
+        st.close_trade("T-TU", 2.0, -100.0, exit_reason_detailed="stop_loss (x)")
+        _backdate_outbox(st, "T-TU", minutes=3)
+        self._seed_ledger(st, "T-TU", per_leg=1.02)   # real: 8 x 1.02 = $8.16
+        o = _orch(st)
+        asyncio.run(o._drain_exit_outbox())
+        with sqlite3.connect(st._db_path) as conn:
+            pnl, comm = conn.execute(
+                "SELECT realized_pnl, commission FROM trades "
+                "WHERE trade_id='T-TU'").fetchone()
+        # estimate ($7.33) swapped for the ledger truth ($8.16): P&L worsens
+        assert pnl < -100.0, f"drain kept the optimistic estimate: {pnl}"
+        assert comm == pytest.approx(8.16, abs=0.01), comm
+
+    def test_partial_ledger_defers_instead_of_overstating(self, tmp_path):
+        """Exit commissionReports arrive async; truing up against entry-only
+        rows would overstate realized_pnl permanently."""
+        st = _state(tmp_path)
+        _seed_trade(st, "T-PART")
+        st.close_trade("T-PART", 2.0, -100.0, exit_reason_detailed="stop_loss (x)")
+        _backdate_outbox(st, "T-PART", minutes=3)
+        self._seed_ledger(st, "T-PART", per_leg=1.02, legs=2)  # only 4 rows
+        o = _orch(st)
+        asyncio.run(o._drain_exit_outbox())
+        with sqlite3.connect(st._db_path) as conn:
+            pnl = conn.execute("SELECT realized_pnl FROM trades "
+                               "WHERE trade_id='T-PART'").fetchone()[0]
+        assert pnl == pytest.approx(-100.0, abs=0.01)
+        assert st.get_state("trueup_pending_T-PART", "") != ""
