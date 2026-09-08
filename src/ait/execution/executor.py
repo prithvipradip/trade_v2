@@ -2566,21 +2566,51 @@ class TradeExecutor:
             TradeStatus.FILLED,
         )
         if not _cas_ok:
-            log.error(
-                "fill_landed_on_terminal_row",
-                trade_id=pending.trade_id,
-                symbol=signal.symbol,
-                fill_price=actual_price,
-                note="row already closed/cancelled — a REAL position may be "
-                     "live at the broker with no managing trade row",
-            )
+            # W14 (R24 concurrency-03): a refused CAS is NOT always a terminal
+            # row. The sweep/reconciler can legitimately promote the SAME
+            # PENDING row to FILLED concurrently — a non-terminal outcome that
+            # W1 nevertheless treated as "fill landed on a dead row", throwing
+            # away the REAL fill price and filled quantity. entry_price then
+            # kept the optimistic signal price (overstating realized_pnl by
+            # the entry slippage — a go-live verdict input) and, on a partial
+            # fill promoted at full size, the reverse-combo exit was sized
+            # LARGER than the live position and could open an inverse one.
+            # Read the row's ACTUAL status and only bail on a truly terminal
+            # one.
+            _cur = None
             try:
-                self._state.set_state(
-                    "alert_fill_after_close",
-                    f"{pending.trade_id}|{signal.symbol}|{actual_price}")
+                _t = self._state.get_trade_by_id(pending.trade_id)
+                _cur = getattr(_t, "status", None) if _t else None
+                _cur = getattr(_cur, "value", _cur)
             except Exception:  # noqa: BLE001
-                pass
-            return
+                _cur = None
+            if _cur == TradeStatus.FILLED.value:
+                log.warning(
+                    "fill_cas_refused_row_already_filled",
+                    trade_id=pending.trade_id, symbol=signal.symbol,
+                    fill_price=actual_price,
+                    note="concurrent promotion by the sweep/reconciler — "
+                         "recording the REAL fill price and quantity rather "
+                         "than discarding them",
+                )
+                # fall through: the row is FILLED, which is where we wanted it
+            else:
+                log.error(
+                    "fill_landed_on_terminal_row",
+                    trade_id=pending.trade_id,
+                    symbol=signal.symbol,
+                    fill_price=actual_price,
+                    current_status=_cur,
+                    note="row already closed/cancelled — a REAL position may "
+                         "be live at the broker with no managing trade row",
+                )
+                try:
+                    self._state.set_state(
+                        "alert_fill_after_close",
+                        f"{pending.trade_id}|{signal.symbol}|{actual_price}")
+                except Exception:  # noqa: BLE001
+                    pass
+                return
 
         # Book the REAL fill into trades.entry_price (audit R2/C1): it was
         # only stored in open_positions while every P&L computation read the

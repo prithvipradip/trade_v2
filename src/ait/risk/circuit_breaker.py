@@ -61,6 +61,7 @@ class CircuitBreaker:
         # existing construction site (orchestrator.py:85, tests) keeps working;
         # attach_state() is the seam the RiskManager uses for the live wiring.
         self._state = None
+        self._state_unreadable = False  # W14: set when a load fails
         if state is not None:
             self.attach_state(state)
 
@@ -105,12 +106,21 @@ class CircuitBreaker:
             # (or the resume timer) lifts it.
             log.error("circuit_breaker_state_unreadable_fail_closed",
                       error=str(e))
+            # W14 (R24 regress-live-04): the fail-closed trip auto-resumes
+            # after one pause window, and the first _persist() after that
+            # OVERWROTE the still-intact blob with tripped=false / streak 0 /
+            # daily 0. A real 2-loss streak became 0 permanently and the
+            # realized daily-loss gate read $0 for the rest of the day — the
+            # fix for one fail-open created another. Remember that our
+            # in-memory state is NOT authoritative until a successful read.
+            self._state_unreadable = True
             self._tripped = True
             self._trip_reason = "state_unreadable_fail_closed"
             self._resume_time = time.time() + max(
                 60.0, float(getattr(self._config,
                                     "pause_minutes_after_losses", 30)) * 60.0)
             return
+        self._state_unreadable = False  # W14: a good read makes us authoritative
         if not isinstance(blob, dict):
             return  # empty/first-run store: genuinely fresh, no fail-close
         try:
@@ -144,6 +154,14 @@ class CircuitBreaker:
         propagate into the trading loop from a protection component."""
         state = getattr(self, "_state", None)
         if state is None:
+            return
+        if getattr(self, "_state_unreadable", False):
+            # W14 (regress-live-04): we could not READ the persisted state, so
+            # our in-memory counters are a fail-closed placeholder, not truth.
+            # Writing them would destroy a real streak/daily-loss the next
+            # process would otherwise recover. Stay read-only until a
+            # successful load makes us authoritative again.
+            log.warning("circuit_breaker_persist_skipped_unreadable_state")
             return
         try:
             state.set_state(self.STATE_KEY, json.dumps({

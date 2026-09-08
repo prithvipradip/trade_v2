@@ -253,6 +253,16 @@ class StateManager:
                     exit_reason TEXT DEFAULT '',
                     exit_time TEXT NOT NULL
                 )""",
+                # W14 (R24 concurrency-01): MUST come after the CREATE above —
+                # this tuple executes in order and a duplicate/missing-table
+                # ALTER is swallowed, so an ALTER placed earlier failed
+                # silently and left the column absent on fresh databases.
+                # The outbox was AT-MOST-once: the claim was a committed
+                # DELETE performed BEFORE any booking write, so a crash in
+                # that window destroyed the only record of the obligation
+                # while nothing had been booked. Claiming now MARKS the row;
+                # it is deleted only once the booking lands.
+                "ALTER TABLE exit_outbox ADD COLUMN claimed_at TEXT",
             ):
                 try:
                     conn.execute(ddl)
@@ -794,15 +804,43 @@ class StateManager:
 
     # --- Bot State (Key-Value) ---
 
+    #: W14: a claim older than this is assumed to belong to a booker that
+    #: died mid-flight, and the obligation is re-offered. Long enough that a
+    #: slow-but-live booker is never overtaken.
+    CLAIM_STALE_SECONDS = 300.0
+
     def claim_exit_booking(self, trade_id: str) -> bool:
-        """W1: atomically claim the right to book a close's stats/breaker
-        effects. DELETE is serialized by sqlite, so of N concurrent bookers
-        exactly one gets True. Returns False when the row was already claimed
-        (or never enqueued — pre-outbox legacy closes)."""
+        """Claim the right to book a close's stats/breaker effects.
+
+        W14 (R24 concurrency-01): this used to DELETE the row and return
+        rowcount — a committed destruction performed BEFORE any booking write.
+        A process kill or sqlite error in that window lost the obligation
+        entirely: nothing had been booked, and the drain had nothing left to
+        find, so a real stop-out could vanish from the breaker and daily stats
+        for good. The claim now MARKS the row (UPDATE ... WHERE claimed_at IS
+        NULL, still serialized by sqlite, so exactly one claimer wins) and
+        :meth:`complete_exit_booking` deletes it once the booking has landed.
+        A claim left stale by a crash is re-offered by
+        :meth:`pending_exit_bookings`.
+        """
+        from datetime import datetime as _dt, timedelta as _td
+        stale = (_dt.now() - _td(seconds=self.CLAIM_STALE_SECONDS)).isoformat()
         with sqlite3.connect(self._db_path) as conn:
             cur = conn.execute(
-                "DELETE FROM exit_outbox WHERE trade_id = ?", (trade_id,))
+                "UPDATE exit_outbox SET claimed_at = ? "
+                "WHERE trade_id = ? AND (claimed_at IS NULL OR claimed_at < ?)",
+                (_dt.now().isoformat(), trade_id, stale))
             return cur.rowcount > 0
+
+    def complete_exit_booking(self, trade_id: str) -> None:
+        """W14: the booking landed — retire the obligation.
+
+        Called ONLY after stats/breaker/PDT/Thompson have been updated. Until
+        this runs the row survives, so a crash mid-booking leaves work the
+        drain will retry rather than silently dropping a loss.
+        """
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute("DELETE FROM exit_outbox WHERE trade_id = ?", (trade_id,))
 
     def pending_exit_bookings(self, older_than_seconds: float = 120.0) -> list[dict]:
         """W1: closes whose booking nobody has claimed yet. The grace period
@@ -813,10 +851,14 @@ class StateManager:
         cutoff = (_dt.now() - _td(seconds=older_than_seconds)).isoformat()
         with sqlite3.connect(self._db_path) as conn:
             conn.row_factory = sqlite3.Row
+            # W14: unclaimed rows, PLUS rows whose claim went stale because
+            # the booker died between claiming and writing.
+            stale = (_dt.now() - _td(seconds=self.CLAIM_STALE_SECONDS)).isoformat()
             rows = conn.execute(
                 "SELECT trade_id, realized_pnl, exit_reason, exit_time "
-                "FROM exit_outbox WHERE exit_time < ? ORDER BY exit_time",
-                (cutoff,)).fetchall()
+                "FROM exit_outbox WHERE exit_time < ? "
+                "AND (claimed_at IS NULL OR claimed_at < ?) ORDER BY exit_time",
+                (cutoff, stale)).fetchall()
             return [dict(r) for r in rows]
 
     def set_state(self, key: str, value: str) -> None:

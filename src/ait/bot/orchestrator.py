@@ -678,6 +678,20 @@ class TradingOrchestrator:
             try:
                 if not self._state.claim_exit_booking(trade_id):
                     continue  # lost the race to a concurrent booker — correct
+                # W14 (R24 regress-live-01 / pnl-money-01): the reconciler's
+                # $0 bookkeeping rows are NOT trades. Booking them called
+                # record_trade_result(0.0), which RESETS an active
+                # consecutive-loss streak — two real losses plus one swept
+                # never-filled entry meant the third real loss no longer
+                # tripped the 3-loss pause. W3 built this authority for
+                # exactly these rows; the drain never consulted it.
+                from ait.reporting.go_live import is_real_close
+                if not is_real_close(row.get("exit_reason")):
+                    self._state.complete_exit_booking(trade_id)
+                    log.info("not_real_close_outbox_discarded",
+                             trade_id=trade_id,
+                             reason=row.get("exit_reason", ""))
+                    continue
                 pnl = float(row["realized_pnl"] or 0.0)
                 # R24 regress-live-09: the drain used to book the fill-time
                 # ESTIMATE forever. Same correction the callback path applies.
@@ -690,6 +704,7 @@ class TradingOrchestrator:
                     # Stats/breaker are DAILY quantities — booking a prior-day
                     # close into today's halt math errs the other direction.
                     # Claimed (never resurfaces), logged for the human ledger.
+                    self._state.complete_exit_booking(trade_id)
                     log.warning("stale_exit_booking_skipped", trade_id=trade_id,
                                 exit_time=row["exit_time"], pnl=pnl)
                     continue
@@ -715,6 +730,11 @@ class TradingOrchestrator:
                 if _t:
                     self._thompson.record_outcome(
                         strategy=_t.strategy, won=pnl > 0, pnl=pnl)
+                # W14 (concurrency-01): the obligation is retired only NOW,
+                # after every booking write above has landed. A crash before
+                # this point leaves the row for the next drain instead of
+                # destroying it.
+                self._state.complete_exit_booking(trade_id)
                 log.warning("orphan_close_booked", trade_id=trade_id, pnl=pnl,
                             reason=row.get("exit_reason", ""))
                 await self._send_notification(
@@ -741,8 +761,17 @@ class TradingOrchestrator:
             # it into stats/breaker/Thompson.
             try:
                 _claimed = self._state.claim_exit_booking(trade_id)
-            except Exception:  # noqa: BLE001 — outbox unavailable: book as before
-                _claimed = True
+            except Exception as _ce:  # noqa: BLE001
+                # W14 (R24 concurrency-02 / regress-live-02): this used to set
+                # _claimed = True and book anyway. But the row survives a
+                # failed claim, so the cycle drain claimed it minutes later
+                # and booked the SAME close a second time — one -$150 stop
+                # read as -$300 to the breaker, and two such exits tripped the
+                # 3-loss pause on a two-loss day. Skip instead: the outbox is
+                # durable, so the drain books it exactly once.
+                log.error("exit_booking_claim_failed_deferred_to_drain",
+                          trade_id=trade_id, error=str(_ce))
+                continue
             if not _claimed:
                 log.warning("exit_booking_already_claimed", trade_id=trade_id)
                 continue
@@ -835,6 +864,17 @@ class TradingOrchestrator:
                 f"Exit price: {ex['exit_price']:.2f}\n"
                 f"P&L: ${realized_pnl:.2f}"
             )
+            # W14 (concurrency-01): retire the obligation only now, after
+            # every booking write above has landed. Claiming merely MARKS the
+            # row, so a crash anywhere in this block leaves work for the drain
+            # instead of destroying the record of a real close.
+            try:
+                self._state.complete_exit_booking(trade_id)
+            except Exception as _e:  # noqa: BLE001
+                log.warning("exit_booking_complete_failed",
+                            trade_id=trade_id, error=str(_e),
+                            note="row stays claimed; the drain retries it "
+                                 "once the claim goes stale")
             await self._send_notification(msg)
             log.info(
                 "exit_fill_processed",

@@ -1991,3 +1991,49 @@ expires, exhausted budget escalates instead of looping, missing script and a
 raising Popen are both survivable, and a replay of today's 201-minute outage.
 Suite 1547 green, type gate OK, SMOKE PASS 13.
 NOT YET DEPLOYED — next restart.
+
+## 2026-09-08 - W14: BOOKING EXACTLY-ONCE (5 findings, one design problem)
+The cluster all shared one root: the claim happened BEFORE the booking rather
+than atomically with it, and nothing filtered WHAT got booked.
+[concurrency-01] The claim was a committed DELETE performed before any booking
+  write — a crash in that window destroyed the only record of the obligation
+  while nothing had been booked, and the drain had nothing left to find. Now
+  TWO-PHASE: claim_exit_booking UPDATEs claimed_at (still serialized by
+  sqlite, exactly one winner), complete_exit_booking DELETEs only AFTER every
+  stats/breaker/PDT/Thompson write lands, and pending_exit_bookings re-offers
+  a claim left stale (>300s) by a dead booker. Both booking paths complete.
+[concurrency-02 / regress-live-02] A claim that RAISED set _claimed=True and
+  booked anyway — but the row survived, so the drain booked the SAME close
+  again 2-5 min later: one -$150 stop read as -$300 to the breaker, and two
+  such exits tripped the 3-loss pause on a two-loss day. Now a failed claim
+  SKIPS booking and defers to the drain, which books it exactly once.
+[regress-live-01 / pnl-money-01] The drain booked the reconciler's $0
+  bookkeeping rows as LOSSES, and record_trade_result(0.0) RESETS an active
+  streak — two real losses plus one swept never-filled entry meant the third
+  real loss no longer tripped the pause. Now filtered through W3's
+  is_real_close authority (which existed for exactly these rows and the drain
+  never consulted) and retired without booking.
+[regress-live-04] The fail-closed breaker auto-resumes after one pause window,
+  and its first _persist() OVERWROTE the still-intact blob with zeros — the
+  W1 fix for one fail-open created another. The breaker now refuses to
+  persist while its own state is unreadable; a good read restores authority.
+[concurrency-03] A CAS refusal was ALWAYS read as "terminal row", so a
+  legitimate concurrent promotion (sweep/reconciler promoting the same PENDING
+  row to FILLED) discarded the REAL fill price and quantity: entry_price kept
+  the optimistic signal price (overstating realized_pnl by the entry slippage,
+  a verdict input) and a partial fill promoted at full size could size the
+  reverse-combo exit LARGER than the live position. Now reads the row's actual
+  status: FILLED falls through and records the truth; only genuinely terminal
+  rows refuse and page.
+BUG FOUND WHILE FIXING: the claimed_at ALTER was placed BEFORE the
+exit_outbox CREATE in the same ordered migration tuple, so it failed silently
+(swallowed OperationalError) and the column was absent on fresh databases —
+caught because the tests exercise a fresh DB.
+PROOF: tests/test_w14_booking_exactly_once.py, 15 executing tests on real
+StateManager/CircuitBreaker/TradeExecutor: claim marks rather than deletes,
+completion retires, stale claims re-offered while fresh ones are not, an
+end-to-end crash-between-claim-and-booking recovery, all three $0 sentinel
+spellings leaving a 2-loss streak intact, a real loss still booking, the
+breaker refusing to persist unreadable state (and an intact streak surviving a
+locked relaunch), and both CAS branches.
+Suite 1562 green, type gate OK, SMOKE PASS 13. NOT YET DEPLOYED.
