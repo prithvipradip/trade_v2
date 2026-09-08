@@ -98,6 +98,12 @@ class TestBlackoutFailsClosed:
         orch._settings = SimpleNamespace(
             risk=SimpleNamespace(pre_event_blackout_days=1))
         orch._get_trade_budget = MagicMock(side_effect=_BudgetReached)
+        # W15: the post-stop cooldown now FAILS CLOSED for credit structures
+        # (R24 regress-live-07 — a bare `pass` used to disable it silently on
+        # any calendar/DB fault). A stub without this method raises
+        # AttributeError inside the guard, which correctly blocks the entry
+        # and so never reaches the budget sentinel. Model the real object.
+        orch._post_stop_cooldown_until = MagicMock(return_value=None)
         return orch
 
     def _sig(self, strategy: str):

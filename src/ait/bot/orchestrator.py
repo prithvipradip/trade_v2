@@ -2360,19 +2360,11 @@ class TradingOrchestrator:
             except Exception:  # noqa: BLE001
                 return True
 
-        # R12-B4 (user-approved): post-stop re-entry discipline. The old
-        # cooldown keyed on ENTRY time, so a symbol stopped out on day 3 of a
-        # trend could re-enter on the very next scan into the same move —
-        # the most autocorrelated loss sequence condors produce. A stop-loss
-        # close now blocks NEW entries on that symbol for 1 trading day.
-        try:
-            _stopped_at = self._post_stop_cooldown_until(signal.symbol)
-            if _stopped_at:
-                log.info("entry_blocked_post_stop_cooldown",
-                         symbol=signal.symbol, stopped_at=_stopped_at)
-                return False
-        except Exception:  # noqa: BLE001 — cooldown must never block the loop
-            pass
+        # R12-B4 (user-approved): post-stop re-entry discipline — extracted
+        # to _cooldown_blocks_entry so its FAIL DIRECTION is testable by
+        # execution rather than by reading the source.
+        if await self._cooldown_blocks_entry(signal):
+            return False
 
         # Check trade budget (time-based pacing)
         remaining = self._get_trade_budget()
@@ -3239,6 +3231,53 @@ class TradingOrchestrator:
                         trade_id=trade_id, error=str(e))
         return pnl
 
+    async def _cooldown_blocks_entry(self, signal) -> bool:
+        """R12-B4 post-stop re-entry discipline. True = refuse this entry.
+
+        The old cooldown keyed on ENTRY time, so a symbol stopped out on day 3
+        of a trend could re-enter on the very next scan into the same move —
+        the most autocorrelated loss sequence condors produce.
+
+        W15 (R24 regress-live-07 / time-calendar-02): the caller used to
+        swallow every exception with a bare `pass`. W4 had just given this
+        gate a NYSE-calendar dependency and a fresh sqlite connection, so a
+        calendar fault or a busy/locked DB silently DISABLED the guard for
+        every symbol on every scan — no log line, no page — and the bot could
+        re-enter the symbol it was just stopped out of (the 2026-08-24 QQQ
+        shape). Now fails CLOSED for credit structures, matching how W2
+        hardened the sibling calendar-dependent gates (PDT fail-direction-09,
+        the executor's market-hours guard fail-direction-12). Debit shapes
+        keep the permissive behaviour: they are not the autocorrelated-loss
+        case this rule exists for.
+        """
+        try:
+            stopped_at = self._post_stop_cooldown_until(signal.symbol)
+            if stopped_at:
+                log.info("entry_blocked_post_stop_cooldown",
+                         symbol=signal.symbol, stopped_at=stopped_at)
+                return True
+            return False
+        except Exception as e:  # noqa: BLE001
+            log.error("post_stop_cooldown_check_failed_fail_closed",
+                      symbol=signal.symbol, error=str(e))
+            try:
+                from ait.strategies.base import CREDIT_STRATEGIES as _CS15
+                is_credit = signal.strategy_name in _CS15
+            except Exception:  # noqa: BLE001
+                is_credit = True
+            if not is_credit:
+                return False
+            try:
+                if self._alert_gate(f"cooldown_unavailable:{signal.symbol}", 3600):
+                    await self._send_notification(
+                        f"COOLDOWN CHECK FAILED ({signal.symbol}): the "
+                        f"post-stop re-entry guard could not run "
+                        f"({type(e).__name__}). Credit entries are blocked "
+                        f"until it recovers.")
+            except Exception:  # noqa: BLE001 — paging must not un-block the gate
+                pass
+            return True
+
     def _entry_range_context(self, symbol: str) -> dict:
         """W10: range-model fields for save_trade_context, from this scan's
         stashed prediction. All None when the model produced nothing — that
@@ -3994,17 +4033,31 @@ class TradingOrchestrator:
 
         days_until_next_event() counts calendar days, so a Friday entry with a
         Monday event reads 3 and clears a 1-day blackout despite there being
-        NO session in between — the gate could never see the weekend. Counts
-        weekdays strictly between today and the event (holidays ignored:
-        erring toward MORE sessions is the fail-safe direction for a gate that
-        blocks entries).
+        NO session in between — the gate could never see the weekend.
+
+        W15 (R24 time-calendar-01): this counted WEEKDAYS and its docstring
+        claimed "erring toward MORE sessions is the fail-safe direction". That
+        is backwards. The consumer blocks when ``sessions <= blackout``, so
+        MORE sessions means FEWER blocks — counting a NYSE holiday as a
+        session makes the gate fail OPEN. Executed proof (clock pinned to Fri
+        2026-09-04, Labor Day 09-07 a holiday): an event on Wed 09-09 gave
+        _sessions_until=2 while only ONE real session (Tue) separates entry
+        from the event, so a blackout of 1 did not block. Now counts real
+        trading days via the same calendar the cooldown uses.
         """
         if calendar_days is None:
             return None
         today = datetime.now().date()
         sessions = 0
         for i in range(1, max(1, calendar_days) + 1):
-            if (today + timedelta(days=i)).weekday() < 5:
+            day = today + timedelta(days=i)
+            try:
+                from ait.utils.time import is_trading_day as _itd
+                trading = _itd(day)
+            except Exception:  # noqa: BLE001 — calendar fault: fall back to
+                # weekdays, but WITHOUT the old docstring's false comfort.
+                trading = day.weekday() < 5
+            if trading:
                 sessions += 1
         return max(0, sessions - 1)  # exclude the event day itself
 

@@ -2037,3 +2037,41 @@ spellings leaving a 2-loss streak intact, a real loss still booking, the
 breaker refusing to persist unreadable state (and an intact streak surviving a
 locked relaunch), and both CAS branches.
 Suite 1562 green, type gate OK, SMOKE PASS 13. NOT YET DEPLOYED.
+
+## 2026-09-08 - W15: TWO GATES THAT FAILED OPEN
+[time-calendar-01] The pre-event blackout converted calendar days to sessions
+by counting WEEKDAYS, so every NYSE holiday counted as a trading session. The
+consumer blocks when sessions <= blackout, so an INFLATED count means FEWER
+blocks — the gate failed OPEN across every holiday, in exactly the direction
+its own docstring called fail-safe ("erring toward MORE sessions is the
+fail-safe direction" — backwards). Executed proof with the clock pinned to Fri
+2026-09-04 (Labor Day 09-07 a holiday): an event on Wed 09-09 counted 2
+sessions when only ONE real session (Tue) separates entry from the event, so
+blackout=1 did not block. Now counts real trading days via the same calendar
+the cooldown uses; the Fri->Wed case reads 1 and blocks. A calendar fault
+degrades to weekdays without crashing, and the R16 weekend behaviour
+(Fri entry, Mon event -> 0 sessions) is preserved.
+[regress-live-07 / time-calendar-02] The post-stop cooldown's caller swallowed
+every exception with a bare `pass`. W4 had just given that gate a NYSE-calendar
+dependency and a fresh sqlite connection, so a calendar fault or a busy/locked
+DB silently DISABLED the re-entry guard for every symbol on every scan — no
+log line, no page — and the bot could re-enter the symbol it was just stopped
+out of (the 08-24 QQQ shape). Now fails CLOSED for credit structures with a
+throttled page, matching how W2 hardened the sibling calendar-dependent gates.
+Debit shapes keep the permissive behaviour: they are not the
+autocorrelated-loss case the rule exists for, and a paging failure must never
+un-block the gate.
+DESIGN NOTE: the decision was EXTRACTED to _cooldown_blocks_entry so its fail
+direction is testable by execution. My first draft of the test asserted on
+inspect.getsource — the exact pattern this project forbids (it decays into a
+no-op on rename, and two such tests already had). Replaced with 7 executing
+tests against the real helper.
+PROOF: tests/test_w15_fail_open_gates.py, 16 executing tests (holiday matrix,
+the gate now blocking that entry, weekend preserved, calendar-fault
+degradation; locked DB and calendar fault both blocking, the operator paged, a
+failing pager not un-blocking, debit shapes permissive, active and clear
+cooldowns).
+Also fixed: tests/test_r16_round2_fixes.py's blackout fixture lacked
+_post_stop_cooldown_until, so the new fail-closed guard correctly blocked its
+entry before the budget sentinel — the stub now models the real object.
+Suite 1578 green, type gate OK, SMOKE PASS 13. NOT YET DEPLOYED.
