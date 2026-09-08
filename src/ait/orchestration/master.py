@@ -126,6 +126,39 @@ def _alert_gate(key: str, interval_s: float, _now: float | None = None) -> bool:
     return True
 
 
+
+# ops-substrate-01 (R24, materialized TWICE): when IB Gateway is not listening
+# the supervisor deferred the bot start indefinitely and never tried to bring
+# the Gateway back. On 2026-07-01 that cost 5h10m (3h15m inside RTH); on
+# 2026-09-08 a Gateway java process started at 08:56 and never opened port
+# 4002, so the supervisor logged bot_restart_deferred_gateway_down every two
+# minutes until 12:17 — three and a half hours of a trading day with open
+# positions and no exit engine. The process EXISTED, so nothing detected it.
+GATEWAY_RECOVERY_AFTER_S = 600.0     # 10 min down before we intervene
+GATEWAY_RECOVERY_COOLDOWN_S = 1800.0  # at most one attempt per 30 min
+GATEWAY_MAX_RECOVERIES = 3           # then escalate to a human, do not loop
+GATEWAY_START_SCRIPT = os.environ.get(
+    "AIT_GATEWAY_START_SCRIPT", r"C:\IBC\StartGateway.bat")
+
+
+def _gateway_process_alive() -> bool:
+    """Is an IB Gateway JVM running at all?
+
+    Distinguishes "Gateway not started" from "Gateway started but wedged" —
+    the 2026-09-08 shape, where killing the stuck JVM is REQUIRED before a
+    relaunch can bind the port.
+    """
+    try:
+        import subprocess as _sp
+        out = _sp.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-Process java -ErrorAction SilentlyContinue | "
+             "Measure-Object).Count"],
+            capture_output=True, text=True, timeout=15)
+        return int((out.stdout or "0").strip() or 0) > 0
+    except Exception:  # noqa: BLE001
+        return False
+
 def _gateway_listening(port: int, host: str = "127.0.0.1") -> bool:
     """Cheap check: is something accepting connections on the Gateway port?
 
@@ -337,6 +370,83 @@ class BotManager:
         self._max_restarts = 10
         self._last_restart: datetime | None = None
         self._last_gateway_alert: datetime | None = None
+        # ops-substrate-01: a Gateway that never opens its port is an
+        # ABSORBING state — see _maybe_recover_gateway.
+        self._gateway_down_since: datetime | None = None
+        self._gateway_recoveries = 0
+        self._last_gateway_recovery: datetime | None = None
+
+
+    def _maybe_recover_gateway(self, port: int, now: datetime) -> None:
+        """ops-substrate-01: restart a wedged IB Gateway instead of waiting.
+
+        Materialized twice. 2026-07-01: 5h10m down, 3h15m inside RTH.
+        2026-09-08: a Gateway JVM started 08:56 and NEVER opened port 4002;
+        the supervisor logged bot_restart_deferred_gateway_down every two
+        minutes until a human intervened at 12:17 — 3.5 hours of a trading
+        day with open positions and no exit engine. The JVM existed, so no
+        process-level check saw anything wrong; only the PORT was dead.
+
+        Deliberately conservative, because restarting a broker connection is
+        not free:
+          * a GRACE PERIOD first — IB's own nightly maintenance takes the
+            Gateway down for 30-60 min and recovers on its own; we must not
+            fight it. 10 minutes is well inside a trading session but long
+            enough to ignore a blip.
+          * a COOLDOWN between attempts, so a Gateway that cannot come up
+            (expired credentials, 2FA prompt) is not thrashed.
+          * a BUDGET, then escalate. Looping forever is how the original
+            defect behaved; a human must be told when automation is out of
+            ideas.
+          * the JVM is KILLED FIRST when one exists — the 09-08 shape was a
+            live-but-wedged process, and a relaunch cannot bind the port
+            while it holds it.
+        """
+        down_for = (now - (self._gateway_down_since or now)).total_seconds()
+        if down_for < GATEWAY_RECOVERY_AFTER_S:
+            return
+        if (self._last_gateway_recovery is not None
+                and (now - self._last_gateway_recovery).total_seconds()
+                < GATEWAY_RECOVERY_COOLDOWN_S):
+            return
+        if self._gateway_recoveries >= GATEWAY_MAX_RECOVERIES:
+            if (self._last_gateway_alert is None
+                    or (now - self._last_gateway_alert) > timedelta(minutes=30)):
+                self._last_gateway_alert = now
+                _alert(f"IB Gateway STILL down on port {port} after "
+                       f"{GATEWAY_MAX_RECOVERIES} automatic restart attempts "
+                       f"({down_for / 60:.0f} min). MANUAL ACTION NEEDED — "
+                       f"check for a login/2FA prompt on the Gateway window.")
+            return
+
+        script = GATEWAY_START_SCRIPT
+        if not os.path.exists(script):
+            _log("warn", "gateway_recovery_unavailable", script=script)
+            return
+
+        self._gateway_recoveries += 1
+        self._last_gateway_recovery = now
+        wedged = _gateway_process_alive()
+        _log("warn", "gateway_recovery_attempt",
+             attempt=self._gateway_recoveries, down_minutes=round(down_for / 60),
+             wedged_process=wedged, script=script)
+        try:
+            if wedged:
+                # A JVM that never opened the port holds it against a relaunch.
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Get-Process java -ErrorAction SilentlyContinue | "
+                     "Stop-Process -Force"],
+                    capture_output=True, timeout=30)
+                time.sleep(5)
+            subprocess.Popen([script], shell=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _alert(f"IB Gateway was down {down_for / 60:.0f} min — attempted "
+                   f"automatic restart ({self._gateway_recoveries}/"
+                   f"{GATEWAY_MAX_RECOVERIES}). The bot resumes on its own "
+                   f"once port {port} answers.")
+        except Exception as e:  # noqa: BLE001 — recovery must never kill the supervisor
+            _log("error", "gateway_recovery_failed", error=str(e))
 
     @property
     def is_running(self) -> bool:
@@ -575,17 +685,31 @@ class BotManager:
         if not _gateway_listening(gw_port):
             _log("info", "bot_restart_deferred_gateway_down", port=gw_port)
             now = datetime.now()
+            if self._gateway_down_since is None:
+                self._gateway_down_since = now
             if (self._last_gateway_alert is None
                     or (now - self._last_gateway_alert) > timedelta(minutes=30)):
                 self._last_gateway_alert = now
                 _alert(f"IB Gateway unreachable on port {gw_port} (likely daily "
                        f"maintenance). Bot start deferred; will resume "
                        f"automatically when Gateway returns. No budget spent.")
+            # ops-substrate-01: deferring FOREVER is the absorbing state. After
+            # a grace period, try to bring the Gateway back ourselves.
+            self._maybe_recover_gateway(gw_port, now)
             return
 
         # Gateway is up — a fresh start attempt may have cleared whatever was
         # wrong; reset the gateway-alert latch so the next outage re-alerts.
         self._last_gateway_alert = None
+        # ops-substrate-01: Gateway is answering again — reset the outage
+        # timer and the recovery budget so a LATER outage gets fresh attempts.
+        if self._gateway_down_since is not None:
+            _log("info", "gateway_recovered",
+                 down_seconds=round(
+                     (datetime.now() - self._gateway_down_since).total_seconds()),
+                 recoveries_used=self._gateway_recoveries)
+            self._gateway_down_since = None
+            self._gateway_recoveries = 0
 
         # Reset restart counter if last restart was >30 min ago — a transient
         # blip shouldn't burn the budget toward a permanent give-up.

@@ -1957,3 +1957,37 @@ symmetry).
 Suite 1535 green, type gate OK, SMOKE PASS 13.
 NOT YET DEPLOYED — next restart. No exit has been priced under W7 yet either,
 so the first close will be the first real test of both.
+
+## 2026-09-08 - W13: GATEWAY AUTO-RECOVERY (ops-substrate-01, materialized TWICE)
+IT HAPPENED AGAIN TODAY, AND I WATCHED IT. A Gateway JVM started 08:56 and
+NEVER opened port 4002. master.py logged bot_restart_deferred_gateway_down
+every 2 minutes until I intervened manually at 12:17 — 3h21m of a trading day
+with two open condors and NO exit engine. The process EXISTED, so nothing
+process-level saw a fault; only the PORT was dead, and the only thing watching
+the port was the deferral that did nothing. Prior occurrence 2026-07-01: 5h10m,
+3h15m inside RTH. This has now cost more real trading time than every other
+finding in the register combined.
+FIX: BotManager._maybe_recover_gateway. Deliberately conservative, because
+restarting a broker connection is not free:
+  * GRACE 10 min — IB's own nightly maintenance takes the Gateway down 30-60
+    min and recovers unaided; we must not fight it. 10 min is well inside a
+    session but ignores a blip.
+  * KILL FIRST when a JVM exists — the 09-08 shape was live-but-wedged, and a
+    relaunch cannot bind a port the old process still holds. (This is why a
+    process-existence check was never enough.)
+  * COOLDOWN 30 min between attempts — a Gateway that cannot come up (expired
+    credentials, 2FA prompt) must not be thrashed every polling cycle.
+  * BUDGET 3, then ESCALATE with "MANUAL ACTION NEEDED — check for a login/2FA
+    prompt". Looping forever IS the original defect; automation must say when
+    it is out of ideas.
+  * Timer and budget RESET on recovery (gateway_recovered logs the outage
+    length), so a later unrelated outage gets fresh attempts.
+  * Start script config-overridable via AIT_GATEWAY_START_SCRIPT.
+PROOF: tests/test_w13_gateway_recovery.py, 12 executing tests against the real
+BotManager method: grace period protects nightly maintenance (and its exact
+boundary), wedged JVM is killed before relaunch vs absent process simply
+started, cooldown blocks a rapid second attempt then allows one after it
+expires, exhausted budget escalates instead of looping, missing script and a
+raising Popen are both survivable, and a replay of today's 201-minute outage.
+Suite 1547 green, type gate OK, SMOKE PASS 13.
+NOT YET DEPLOYED — next restart.
