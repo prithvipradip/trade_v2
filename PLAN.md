@@ -1921,3 +1921,39 @@ CI. Now reads the module global at CALL time. Proven hermetic by moving the
 real log aside and re-running (5 passed). This is the same late-binding class
 the W6 work fixed in verify_deadman.py and missed here.
 Suite 1524 green, type gate OK, SMOKE PASS 13.
+
+## 2026-09-08 - W12: EXIT FILL QUALITY (slippage measurable on BOTH halves)
+CORRECTION TO THE BROKER STUDY'S PREMISE: it read "109 of 116 executions have
+nbbo_spread=0.0" as "slippage is uninstrumented". Measuring the ledger
+directly is sharper — ALL 7 entry combo rows carry live_mid and nbbo_spread;
+the leg rows are zeroed DELIBERATELY (R16 puts combo context on the BAG row
+only). Entry slippage has been instrumented since R19. What was missing is the
+EXIT half: PendingExitOrder had no quality fields and _order_ctx_map was
+written only on the entry path (executor.py:437), so every exit fill resolved
+through _ledger_context to (0,0,0).
+WHY IT MATTERS MORE THAN W11's COMMISSIONS: on the 7 instrumented entries the
+NBBO spread averaged $0.1429/leg — ~15x the $0.9168 all-in per-leg commission
+we spent yesterday calibrating. We had instrumented the small cost to four
+decimals and left the large one half-measured.
+FIX: PendingExitOrder gains signal_price/live_mid/nbbo_spread;
+register_exit_order accepts and stores them AND mirrors them into
+_order_ctx_map (which survives the pending-dict cleanup — the R13
+shadow-referee break the entry path already guards); _close_multi_leg stashes
+the quote context on BOTH pricing paths (BAG NBBO -> mid and ask-bid; leg
+synthesis -> the synthesized cost, with spread 0 because no two-sided combo
+NBBO exists there) and the orchestrator threads it at registration, consuming
+the stash so it cannot leak to the next exit.
+ENTRY SLIPPAGE, MEASURED FROM THE 7 EXISTING ROWS (fill vs live_mid, credit
+convention so positive = better than mid): +0.355, +0.07, -0.41, -0.045,
+-0.14, -0.02, 0.00 -> mean -0.027/share = about -$2.70 per contract, i.e.
+comparable to the entire commission. n=7 is not a sample; the point is that
+the term is the same order of magnitude as the one we just fixed, and until
+today we could only see half of it.
+PROOF: tests/test_w12_exit_fill_quality.py, 11 executing tests against the
+real executor (slots preserved, quality reaches the tracker AND the ctx map,
+resolves after tracker cleanup — the pre-fix zero case, absent quality does
+not pollute the map, backwards-compatible calls still register, and entry/exit
+symmetry).
+Suite 1535 green, type gate OK, SMOKE PASS 13.
+NOT YET DEPLOYED — next restart. No exit has been priced under W7 yet either,
+so the first close will be the first real test of both.

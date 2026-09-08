@@ -189,13 +189,25 @@ class PendingOrder:
 class PendingExitOrder:
     """Tracks a pending exit/close order."""
 
-    __slots__ = ("trade_id", "exit_reason", "estimated_pnl", "submitted_at")
+    __slots__ = ("trade_id", "exit_reason", "estimated_pnl", "submitted_at",
+                 "signal_price", "live_mid", "nbbo_spread")
 
-    def __init__(self, trade_id: str, exit_reason: str, estimated_pnl: float) -> None:
+    def __init__(self, trade_id: str, exit_reason: str, estimated_pnl: float,
+                 signal_price: float = 0.0, live_mid: float = 0.0,
+                 nbbo_spread: float = 0.0) -> None:
         self.trade_id = trade_id
         self.exit_reason = exit_reason
         self.estimated_pnl = estimated_pnl
         self.submitted_at = time.time()
+        # W12 (R24 data-integrity-08): fill-quality context for the EXIT half
+        # of the round trip. Entries have recorded it since R19 (7 of 7 entry
+        # BAG rows carry live_mid/nbbo_spread), but exits never did — the
+        # ledger measured slippage on one side of every trade. That matters
+        # more than commission: on the 7 instrumented entries the NBBO spread
+        # averaged $0.1429/leg, ~15x the $0.9168 all-in per-leg commission.
+        self.signal_price = signal_price
+        self.live_mid = live_mid
+        self.nbbo_spread = nbbo_spread
 
     @property
     def age_seconds(self) -> float:
@@ -2717,6 +2729,9 @@ class TradeExecutor:
         trade_id: str,
         exit_reason: str,
         estimated_pnl: float,
+        signal_price: float = 0.0,
+        live_mid: float = 0.0,
+        nbbo_spread: float = 0.0,
     ) -> None:
         # R8: exit orders were never added to the orderId->trade_id map, so
         # exit-leg fills landed in the executions ledger with trade_id='' and
@@ -2734,11 +2749,24 @@ class TradeExecutor:
             trade_id=trade_id,
             exit_reason=exit_reason,
             estimated_pnl=estimated_pnl,
+            signal_price=signal_price,
+            live_mid=live_mid,
+            nbbo_spread=nbbo_spread,
         )
+        # W12: mirror into the placement-time context map, which survives the
+        # pending-dict cleanup — an event-driven fill can be swept after the
+        # tracker is gone (the R13 shadow-referee break the entry path already
+        # guards against).
+        if live_mid or nbbo_spread or signal_price:
+            if not hasattr(self, "_order_ctx_map"):
+                self._order_ctx_map = {}
+            self._order_ctx_map[order_id] = (signal_price, live_mid, nbbo_spread)
         log.info(
             "exit_order_registered",
             order_id=order_id,
             trade_id=trade_id,
+            live_mid=live_mid or None,
+            nbbo_spread=nbbo_spread or None,
         )
 
     def adopt_exit_order(self, order_id: int, trade_id: str, reason: str) -> None:

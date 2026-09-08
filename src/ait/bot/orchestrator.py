@@ -2763,12 +2763,17 @@ class TradingOrchestrator:
 
             # Register the exit order with the executor for fill tracking
             if exit_trade.order.orderId:
+                # W12: hand the exit's fill-quality context to the ledger so
+                # slippage is measurable on BOTH halves of the round trip.
+                _q = getattr(self, "_last_exit_quality", (0.0, 0.0, 0.0))
                 self._executor.register_exit_order(
                     order_id=exit_trade.order.orderId,
                     trade_id=pos.trade_id,
                     exit_reason=pos.exit_reason,
                     estimated_pnl=pos.unrealized_pnl,
+                    signal_price=_q[0], live_mid=_q[1], nbbo_spread=_q[2],
                 )
+                self._last_exit_quality = (0.0, 0.0, 0.0)  # consume
 
             log.info(
                 "exit_order_placed",
@@ -3404,6 +3409,17 @@ class TradingOrchestrator:
                             limit_price = round(bid - EXIT_CROSS, 2)
                         elif ask is not None:
                             limit_price = round(ask - EXIT_CROSS, 2)
+                    # W12 (R24 data-integrity-08): stash the EXIT's fill-
+                    # quality context. Entries have recorded this since R19;
+                    # exits never did, so every measured slippage figure
+                    # covered only half the round trip.
+                    _mk_q = self._marked_cost_to_close(trade)
+                    _two_sided = bid is not None and ask is not None
+                    self._last_exit_quality = (
+                        round(_mk_q, 4) if _mk_q else 0.0,
+                        round((bid + ask) / 2.0, 4) if _two_sided else 0.0,
+                        round(abs(ask - bid), 4) if _two_sided else 0.0,
+                    )
         except Exception as e:
             log.warning("combo_mid_price_failed", error=str(e))
 
@@ -3421,6 +3437,11 @@ class TradingOrchestrator:
                          trade_id=trade.trade_id, synthesized_cost=synth,
                          action=combo_action, limit_price=limit_price,
                          note="BAG never ticked; priced from the four legs")
+                # W12: the synthesized cost IS the market's marketable price
+                # here; no two-sided combo NBBO exists to measure a spread.
+                _mk = self._marked_cost_to_close(trade)
+                self._last_exit_quality = (round(_mk, 4) if _mk else 0.0,
+                                           round(abs(synth), 4), 0.0)
 
         # R13 (market-catastrophe lens): the exit had NO price sanity bound —
         # `ask + cross` with no ceiling, and a MARKET order on a 4-leg BAG
