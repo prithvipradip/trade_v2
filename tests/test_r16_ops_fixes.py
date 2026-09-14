@@ -330,3 +330,43 @@ class TestForeignBotRefusal:
         assert gateway_calls == [int(os.environ.get("IBKR_PORT", "4002"))]
         assert mgr._proc is None
         assert not any("REFUSING" in a for a in alerts)
+
+
+# ==========================================================================
+# 8. _scan_foreign_bot_pids real body, cross-platform (macOS fix 2026-09-14)
+# ==========================================================================
+# The tests above stub _scan_foreign_bot_pids entirely — they cover start()'s
+# CONSUMPTION of a result but never the scan itself. That gap is exactly how
+# a Windows-only PowerShell/WMI implementation shipped and silently no-op'd
+# (FileNotFoundError('powershell') swallowed, read as "no foreign bot found")
+# on every non-Windows host. These drive the real function body.
+
+class TestScanForeignBotPidsRealBody:
+    def test_finds_a_process_whose_cmdline_names_ait_main(self):
+        # A real short-lived process whose OS-level argv contains the
+        # literal token 'ait.main' without importing the real module (the
+        # trailing arg to `-c` becomes part of the actual cmdline psutil
+        # reads — it is never parsed by the -c script itself).
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(10)", "ait.main"])
+        try:
+            deadline = time.time() + 5
+            found: list[int] = []
+            while time.time() < deadline:
+                found = _master._scan_foreign_bot_pids()
+                if proc.pid in found:
+                    break
+                time.sleep(0.1)
+            assert proc.pid in found
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_finds_nothing_when_no_match_is_running(self):
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(10)"])
+        try:
+            assert proc.pid not in _master._scan_foreign_bot_pids()
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)

@@ -2075,3 +2075,99 @@ Also fixed: tests/test_r16_round2_fixes.py's blackout fixture lacked
 _post_stop_cooldown_until, so the new fail-closed guard correctly blocked its
 entry before the budget sentinel — the stub now models the real object.
 Suite 1578 green, type gate OK, SMOKE PASS 13. NOT YET DEPLOYED.
+
+## 2026-09-14 - FIRST MACOS DEPLOY: two findings from actually running the bot
+First run of feature/event-straddle (4dbba32) off the Windows box, on a
+separate paper account (TWS, not Gateway). Local ait_analytics.duckdb also
+purged of pre-2026-07-11-class pytest fixture pollution (105 T-ML-TRAIN-*/
+T-00N rows) carried in a stale local file predating that fix; not a code
+change (backup kept: ait_analytics.duckdb.bak_pre_purge_20260914).
+[1] _scan_foreign_bot_pids (R16 #10) was Windows-only (PowerShell/WMI) and
+    fails open — silently, every 2-min health cycle — on any non-Windows
+    host: FileNotFoundError('powershell') is swallowed and read as "no
+    foreign bot found." Fixed via psutil.process_iter (already a pinned
+    dependency, previously used only for self memory introspection) —
+    cross-platform, no shell dependency. Existing test only stubbed the
+    function; new test drives the real body against a spawned process.
+[2] verify_can_trade()'s startup read-only probe (BUY 1 SPY @ $1, self-
+    cancelled) never logged its own trading_verified confirmation on a
+    successful run — its recognized-status tuple didn't include
+    PendingSubmit/PendingCancel/ApiCancelled, the exact statuses this
+    self-cancelling probe passes through. Not a correctness bug (still
+    returned True, never blocked trading) — a pure observability gap: zero
+    log evidence this self-test ever ran. Fixed by logging trading_verified
+    whenever the probe completes and isn't flagged read-only, instead of
+    matching against an enumerated status list.
+DEFERRED (found, not fixed): three sibling Windows-only powershell
+shell-outs in master.py (_gateway_process_alive, _clear_dashboard_port,
+_maybe_recover_gateway's JVM-kill) — all tied to Windows IB Gateway/IBC
+process management (hardcoded C:\IBC\StartGateway.bat), which doesn't apply
+to this machine's TWS-based, manually-managed setup regardless of platform.
+Separate, larger question; not in scope here.
+PROOF: tests/test_r16_ops_fixes.py::TestScanForeignBotPidsRealBody (2 tests)
++ tests/test_r16_broker_fixes.py::TestVerifyCanTradeLogsConfirmation (2
+tests) — all 4 proven to fail against pre-fix source (git stash of the two
+source files only), pass restored. Suite 1581 green (was 1577), SMOKE PASS
+13. DEPLOYED same day (bot restart 13:56:59): live log confirms zero
+foreign_bot_scan_failed warnings and trading_verified status=PreSubmitted
+now logging on the startup probe.
+
+## 2026-09-14 - THIRD FINDING: dashboard (8501) crashed on every load, PLUS a flawed first fix caught by verification
+After the restart above, opening http://localhost:8501 (the Streamlit
+monitoring dashboard) hit `RuntimeError: There is no current event loop in
+thread 'ScriptRunner.scriptThread'` — deterministic, every load, not a
+glitch. TRACED (file:line): dashboard/app.py imports one constant
+(NOT_REAL_CLOSE_PATTERNS) from reporting/go_live.py; go_live.py imported
+GO_LIVE_VERDICT_STRATEGIES from strategies/base.py; base.py imports
+data/options_chain.py -> data/market_data.py -> `from ib_insync import
+Stock, util`; ib_insync's eventkit dependency calls
+asyncio.get_event_loop() AT IMPORT TIME, which only auto-creates a loop in
+the main thread (Python 3.10+) — Streamlit re-executes a page's entire
+script, imports included, inside a dedicated non-main
+`ScriptRunner.scriptThread` on every load. status_server.py (8503) and
+web_logs.py (8502) hit the identical import chain but are unaffected: their
+imports run once at main-thread process startup (Flask's threaded=True only
+threads per-REQUEST handling, not the module imports already done before
+app.run()) — this is Streamlit-specific, not a three-dashboards problem.
+FIRST FIX ATTEMPT WAS ITSELF WRONG, CAUGHT BEFORE SHIPPING: moved
+GO_LIVE_VERDICT_STRATEGIES into a new src/ait/strategies/constants.py,
+re-exported from base.py. Verifying it with a direct import still pulled in
+ib_insync — root cause was one layer deeper: ait/strategies/__init__.py
+itself eagerly does `from ait.strategies.base import Strategy, Signal,
+SignalDirection`, so importing ANY submodule under ait.strategies (even a
+brand new one with zero imports of its own) forces that package __init__ to
+run first, dragging in the same heavy chain regardless. Verified directly
+(import ait.strategies.constants alone still loaded ib_insync/eventkit).
+CORRECTED FIX: GO_LIVE_VERDICT_STRATEGIES now defined directly in
+reporting/go_live.py (that package's own __init__.py docstring already
+declares it "deliberately import-light... must never pull the broker ... in
+at import time" — go_live.py itself has zero ties to ait.strategies now);
+strategies/base.py re-exports it FROM go_live.py instead of the reverse
+(mechanically identical for the one pinned consumer,
+test_verdict_strategies_come_from_base, which only asserts object equality).
+Considered and rejected: moving the three sibling constants
+(LIVE_CREDIT_STRATEGIES/BACKTEST_CREDIT_STRATEGIES/UNDEFINED_RISK_STRATEGIES)
+too — full-repo grep found every consumer is live-trading/backtest code
+that already needs the broker stack for its actual job; would have been
+pure churn for zero benefit. Also considered and rejected: patching
+strategies/__init__.py's own eager import to be lazy — correct instance of
+the same disease, much bigger blast radius (touches how the whole package
+imports everywhere) for one bug.
+PROOF: tests/test_w3_scorecard_truth.py (32 tests, incl. the single-
+authority pin) unaffected; full suite 1581 green; smoke_deploy PASS 13;
+python -c import confirmed zero ib_insync/eventkit modules loaded via
+`import ait.reporting.go_live` or `import ait.dashboard.app` (still loaded,
+correctly, via `import ait.strategies.base`); LIVE VERIFIED in a real
+browser (Playwright/webapp-testing skill, installed for this) after
+restarting just the dashboard subprocess (killed pid 13319, supervisor
+health_check relaunched at pid 20670 within one 2-min cycle) — screenshot
+shows the real dashboard (Portfolio Overview, 8 tabs, correct zero-position/
+zero-trade state), no RuntimeError/ScriptRunner text anywhere in the DOM.
+LESSON (process, not just code): I verified this fix with a plain `import`
+statement first and declared it fixed — which was WRONG, because a bare
+`import ait.strategies.constants` alone doesn't reveal that the package
+`__init__.py` is what's actually heavy until you check what importing the
+PARENT PACKAGE costs, not just the leaf module. Caught only because
+verification kept going instead of stopping at the first green check — the
+same "fixes ship with bugs of their own until an adversarial pass runs"
+pattern R14 named for someone else's fix.

@@ -48,9 +48,28 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from ait.bot.state import TradeStatus
-from ait.strategies.base import GO_LIVE_VERDICT_STRATEGIES
+
+# R19d/R20b follow-up: the go-live verdict metric (status.py) counts ONLY
+# strategies actually promoted to production, which is a STRICT SUBSET of
+# CREDIT_STRATEGIES (most of which are backtest-only experiments) — a
+# different concept, not a narrowing of the same one. iron_condor is the
+# sole promotion today; extend this set (not a bare string literal at each
+# report call site) when a second strategy is promoted.
+#
+# 2026-09-14: moved here (was ait.strategies.base) so reporting-only
+# consumers (this module, and therefore the dashboard/status tooling) never
+# have to pay for importing ait.strategies — that package's __init__.py
+# eagerly imports Strategy/Signal/SignalDirection from base.py regardless of
+# which submodule is actually requested, which pulls in the live broker
+# stack (options_chain -> market_data -> ib_insync) whose eventkit
+# dependency crashes inside Streamlit's ScriptRunner thread at import time.
+# This package is documented as deliberately import-light for exactly this
+# reason (see this package's __init__.py); strategies/base.py re-exports
+# this constant from here, not the other way around.
+GO_LIVE_VERDICT_STRATEGIES = frozenset({"iron_condor"})
 
 __all__ = [
+    "GO_LIVE_VERDICT_STRATEGIES",
     "NOT_REAL_CLOSE_PATTERNS",
     "not_real_close_sql",
     "is_real_close",

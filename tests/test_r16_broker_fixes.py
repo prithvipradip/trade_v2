@@ -785,3 +785,85 @@ class TestReconnectConcurrency:
         c.connect.assert_not_called()
         assert sock.disconnects == 0
         assert c._reconnect_attempts == 0
+
+
+# ===========================================================================
+# [H] verify_can_trade() positive-confirmation gap (macOS deploy, 2026-09-14)
+# ===========================================================================
+# The startup read-only probe (BUY 1 SPY @ $1, self-cancelled) never logged
+# its own trading_verified confirmation on a fully successful run: the old
+# code only logged for status in ("PreSubmitted","Submitted","Filled",
+# "Cancelled"), but this self-cancelling probe's real live lifecycle passes
+# through PendingSubmit / PendingCancel / ApiCancelled -- none of which were
+# in that tuple, so a healthy paper session logged NOTHING. Not a
+# correctness bug (still returned True) -- read_only detection is already
+# independent of status -- but zero log evidence the self-test ever ran.
+
+def _log_events(events, name: str) -> list[dict]:
+    return [e for e in events if e.get("event") == name]
+
+
+class TestVerifyCanTradeLogsConfirmation:
+    async def test_logs_trading_verified_on_a_status_outside_the_old_tuple(self, monkeypatch):
+        """Reproduces the exact live gap: PendingSubmit was never in the old
+        enumerated tuple, yet is a real, non-blocked probe outcome."""
+        from structlog.testing import capture_logs
+
+        async def _no_sleep(_secs):
+            return None
+
+        monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+        ib = FakeIB()
+        orig_place = ib.placeOrder
+
+        def _place_pending(contract, order):
+            trade = orig_place(contract, order)
+            trade.orderStatus.status = "PendingSubmit"
+            return trade
+
+        ib.placeOrder = _place_pending
+        c = IBKRClient.__new__(IBKRClient)
+        c._ib = ib
+        c._connected = True
+
+        with capture_logs() as events:
+            result = await c.verify_can_trade()
+
+        assert result is True
+        verified = _log_events(events, "trading_verified")
+        assert len(verified) == 1
+        assert verified[0]["status"] == "PendingSubmit"
+        assert not _log_events(events, "trading_blocked_read_only")
+
+    async def test_still_detects_read_only_regardless_of_status(self, monkeypatch):
+        """read_only detection reads trade.log message text, not status --
+        must fire (and skip trading_verified) no matter what status shows."""
+        from structlog.testing import capture_logs
+
+        async def _no_sleep(_secs):
+            return None
+
+        monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+        ib = FakeIB()
+        orig_place = ib.placeOrder
+
+        def _place_rejected(contract, order):
+            trade = orig_place(contract, order)
+            trade.orderStatus.status = "PendingSubmit"
+            trade.log.append(
+                SimpleNamespace(message="Order rejected - reason: Read-Only session"))
+            return trade
+
+        ib.placeOrder = _place_rejected
+        c = IBKRClient.__new__(IBKRClient)
+        c._ib = ib
+        c._connected = True
+
+        with capture_logs() as events:
+            result = await c.verify_can_trade()
+
+        assert result is False
+        assert len(_log_events(events, "trading_blocked_read_only")) == 1
+        assert not _log_events(events, "trading_verified")
