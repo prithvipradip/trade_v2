@@ -2238,3 +2238,187 @@ this was the routine path for nearly every contract. No condor signal came
 out of this particular pass (range_no_edge / vol_mag_no_edge -- an ML-gate
 outcome, unrelated to this fix), but the chain+Greeks pipeline itself is
 now confirmed working end-to-end on the live account, not just in tests.
+
+## 2026-09-14 - FIFTH FINDING: implied_vol never actually gets backfilled (dead solver import)
+Follow-up investigation (user asked "why do we look at tick data instead of
+bar data for Greeks" while digging into the earlier partial-Greeks finding):
+answered directly (IBKR's API has no historical-bar endpoint for
+delta/gamma/theta/vega, only for IV, and that's used elsewhere for research
+history, not live strike selection) -- and while re-reading _calculate_greeks
+end to end to answer it, found _calculate_greeks imports
+py_vollib.black_scholes.implied_volatility.implied_volatility (line 913) --
+the tool that solves IV from a real observed price -- AND NEVER CALLS IT.
+Dead import. The function's actual behavior: whenever implied_vol is
+missing, chain-median IV is used as scratch sigma to backfill
+delta/gamma/theta/vega via forward Black-Scholes, but the contract's own
+implied_vol field is NEVER corrected -- confirmed by the existing test's own
+pinned assertion (test_r16_data_fixes.py:260, "assert bad.implied_vol ==
+0.0 # coerced to missing") asserting the gap as correct. Compounded by the
+`if c.delta != 0: continue` gate found in the prior finding: when delta
+arrives from IBKR but implied_vol doesn't, the whole block is skipped, so
+implied_vol never even reaches the chain-median fallback.
+WEB-VALIDATED (per request): IBKR's own docs
+(interactivebrokers.github.io/tws-api/option_computations.html) confirm live
+Greeks need subscriptions to BOTH option and underlying -- another
+contributor to partial ticks on this account's incomplete entitlement. An
+experienced-user ib_insync mailing-list thread (insync@groups.io, "Delta
+Hedging") explicitly recommends never trusting IBKR's derived Greeks
+directly -- calibrate your own vol model against IBKR's real prices instead
+-- which is exactly what wiring up the existing (dead) implied_volatility
+import does.
+FIX: _calculate_greeks restructured so implied_vol, delta, gamma, theta,
+vega are each checked and backfilled INDEPENDENTLY instead of gated on
+delta alone. When implied_vol is missing/below-floor and a real two-sided
+quote exists, solve the genuine contract-specific IV via
+implied_volatility(c.mid, ...) (verified live: 784P's real mid price ->
+16.95%, a sensible number; degenerate prices raise a specific
+BelowIntrinsicException, caught same as the existing BS block). No real
+quote -> falls back to the chain median as before, but now WRITTEN onto
+c.implied_vol instead of only used as scratch sigma. delta/gamma/theta/vega
+already populated by IBKR are left untouched (never redundantly
+recomputed).
+PROOF: tests/test_r16_data_fixes.py -- one existing assertion corrected
+(was pinning the bug), two new tests (delta-present/IV-missing exact
+reproduction; no-quote chain-median-now-written-back), all three proven to
+fail against pre-fix source (git stash of the source file only). Suite
+1583 green (was 1581, +2 net new tests), same single pre-existing
+unrelated local-.env test failure as the prior finding (not caused by
+this), smoke_deploy PASS 13. NOT YET DEPLOYED to the running bot (restart
+is the user's call, per standing preference this session).
+
+## 2026-09-14 - R25 FULL AUDIT: the STRUCTURE audit — 4 architectural findings, 19 verified, 6 refuted
+User: "plan and conduct a code audit ... document your findings in PLAN.md". First draft of the
+plan was rejected by the user with the right question — "did you look at the whole design
+holistically and then audit individual components line by line?" — and the answer was no. The
+first plan was LEAD-DRIVEN: chase whatever reconnaissance surfaced, no design pass, no coverage
+guarantee. Rebuilt on two axes: the system as a whole, then components with the gaps made
+countable. That correction produced the round's headline; a per-file sweep could not have.
+Register: reports/full_audit_r25_20260914.md. REGISTERED, NOT FIXED (user-confirmed, as R24).
+
+THE FOUR ARCHITECTURAL FINDINGS — why 24 rounds and ~465 instance-fixes have not stopped this:
+[A1] THE BROKER BOUNDARY DOES NOT EXIST. IBKRClient publishes the raw ib_insync handle as a
+    public .ib property; 7 modules reach past it across ~40 sites. There is NO reqMktData
+    wrapper — instead SIX independent copies of the request/settle/cancel dance, and
+    reqMarketDataType set from two places. The 09-14 snapshot=True defect was one of the six
+    having drifted. That fix closed the instance; the generator is untouched.
+[A2] THE STATE BOUNDARY DOES NOT EXIST. StateManager nominally owns the DB; 13 modules and 8
+    scripts sqlite3.connect the same files directly (historical.py alone 20x). Schema knowledge
+    is duplicated tree-wide with no owner — which is WHY there is no schema_version anywhere,
+    why state.py:194-266's migration tuple can only be idempotent-by-swallowing
+    (`except OperationalError: pass` cannot tell "column exists" from "no such table"), and why
+    the DuckDB mirror (six CREATE TABLE IF NOT EXISTS, ZERO ALTER TABLE) can diverge forever
+    with no detector.
+[A3] THE LAYERING IS CYCLIC. bot<->execution, bot<->risk, bot<->reporting, plus ml->execution.
+    The 09-14 Streamlit crash was a symptom; the ledger's own account shows the first fix was
+    wrong and the second WORKED AROUND the cycle by moving a constant. The cycle is still there
+    and strategies/__init__.py is still eagerly heavy.
+[A4] THE ORCHESTRATOR IS A GOD OBJECT. 4,336 lines, 56 methods, 89 except-blocks (21% of the
+    tree), owning market data, ML, selection, risk, placement, exits, booking, commissions, IV,
+    notifications, calendar, cooldowns and reconciliation — reaching past risk/manager.py,
+    execution/executor.py and strategies/selector.py, which exist for those jobs. FOUR waves
+    (W11/W12/W14/W15) edited it in EIGHT DAYS, none re-reading the others. "Fix velocity mints
+    new audit surface" is a description of this file.
+
+COUNTS, HONESTLY: 74 raw candidates -> 19 VERIFIED (two-lens: code-reading AND execution probe,
+both conceding) / 6 REFUTED / 49 REGISTERED-UNVERIFIED. Verified severity: live_money 4,
+research_validity 3, ops_reporting 10, cosmetic 2. The 49 are LEADS, NOT FINDINGS — R24 refuted
+28 of 137 at exactly this stage, and they must not be cited as defects until probed.
+
+THE HOST-MOVE CLASS — every one of these PROVEN BY RUNNING THE CODE ON THIS MAC, not by reading:
+[plat-01] W13's GATEWAY RECOVERY IS INERT AND ITS ESCALATION CAN NEVER FIRE. master.py:433-435
+    returns on `os.path.exists(r"C:\IBC\StartGateway.bat")` == False — BEFORE
+    `self._gateway_recoveries += 1` at :436 — so the counter never increments and the
+    GATEWAY_MAX_RECOVERIES escalation ("MANUAL ACTION NEEDED") at :422-431 is unreachable. W13
+    exists to end the absorbing state that materialized twice, once 3h25m INSIDE RTH with open
+    positions and no exit engine. That state is restored here. And
+    tests/test_w13_gateway_recovery.py patches os.path.exists->True at six sites: 177 lines of
+    test pass green on macOS while the mechanism they test is inert on macOS.
+[plat-02] _gateway_process_alive() returns False SILENTLY (no log at all — the only one of the
+    four siblings with a fully silent except), and that unmeasured False is stamped into the
+    gateway_recovery_attempt record as wedged_process=False. The log asserts a fact it never
+    measured.
+[plat-03] A FOURTH powershell sibling the 09-14 entry missed: status.py:46-58 _proc_running().
+    Probed live while the bot was running: returns (False, 0) — reports the bot DOWN while it is
+    UP. Same Get-CimInstance idiom as the function fixed on 09-14: the fix went to one call
+    site, not to the idiom.
+[plat-05] THE OPS SUBSTRATE DOES NOT EXIST ON THIS HOST. keeper_ait.bat is BOTH the 90-second
+    supervisor relauncher AND the healthchecks.io dead-man ping gate (ops_health.py:565-566,
+    972-973). `find . -name "*.sh" -o -name "*.plist"` returns ZERO. Nothing relaunches a dead
+    supervisor here and the dead-man never fires. Failing loud is the right direction — but only
+    if healthchecks.io is still configured, which nothing in-repo checks. scripts/verify_deadman.py
+    is itself Windows-shaped and will now validate a file that is no longer the live mechanism.
+[plat-06] THE SINGLETON LOCK FAILS OPEN. master.py:219-222 — `except Exception: return True`,
+    and True means "you hold the lock, proceed." Any permission/disk/fcntl fault ADMITS A SECOND
+    SUPERVISOR. This is the double-bot guard one layer ABOVE the one fixed on 09-14, and two
+    bots is the class that produced the 07-13 position-reversal incident.
+[tz-01] hour_of_day IS AN ML FEATURE STAMPED FROM THE HOST CLOCK. This box runs CEST = ET+6.
+    META_FEATURES' hour_of_day has FOUR producers and THREE conventions: orchestrator.py:1579
+    (live inference) and :3108 (persisted label context) use naive datetime.now() = CEST;
+    meta_label.py:536 derives it from stored entry_time (ET for pre-move rows, CEST after);
+    meta_label.py:435 and engine.py:634 hardcode 10. Same market hours map to {9..16} on the old
+    ET box and {15..22} here. Every row written from this host is six hours off the historical
+    corpus, so a model trained on the mix learns a split encoding WHICH MACHINE WROTE THE ROW.
+    It reaches a live veto (orchestrator.py:1583->1601). SEVERITY, HONESTLY: the meta-labeler is
+    untrained and default-off, so predict() returns None and the veto is inert — research_validity
+    TODAY, live_money the moment it is armed at 100+ closes. Registering now is the point: arming
+    it later on a contaminated corpus is the failure mode.
+
+LINE-BY-LINE (data/quality.py, 185 LOC): [qual-01] the outlier anchor is LAST SEEN, not last
+known good — :106-108 stores the price unconditionally, BEFORE is_valid is computed at :110, so
+the anchor is poisoned by exactly the outlier it exists to catch; on the live exit path one bad
+tick yields TWO consecutive `degraded` verdicts, and degraded withdraws the touch stop's
+authority — a credit position's primary loss cap — for two cycles instead of one. The test file
+exercises a single jump and cannot see it. [qual-02] `ts = timestamp or now` treats a falsy 0.0
+epoch — a common "no time" sentinel — as "caller passed nothing", so staleness reads 0 and the
+gate cannot fire on exactly the dead feed it exists for. [qual-03] validate_option_quote is
+PRODUCTION-DEAD (27 lines of options validation, test-only call sites) — dead safety code that
+reads as coverage, the same shape R14 found when DataQualityValidator was instantiated with zero
+call sites. [qual-04] the live exit validator overrides only max_staleness_seconds from config;
+max_spread_pct=0.15 and max_price_jump_pct=0.10 run on code defaults, outside R19c.
+
+REFUTED — SIX, AND THREE OF THEM WERE MINE. A round that only confirms is not verifying.
+(1) R24's "nothing writes executions.live_mid, so go-live criterion [4] is unmeasurable" is
+    WRONG: two writers exist (executor.py:449-453 entry, :2778-2793 exit/W12, persisted
+    state.py:890-921). The real gap is narrower — a monotonic-nonzero upsert that can never
+    correct a bad first capture downward, and a conditional mirror at :2790 that silently shrinks
+    the slippage sample. (2) MY scoping claim that the post-stop cooldown now resolves to 03:30
+    ET and releases early: REFUTED BY PROBE — both an ET and a CEST host return BLOCKS=True,
+    because inside the operating window (09:00-16:15 ET) the two calendars agree and every RTH
+    exit maps above the 09:30 cutoff in both conventions. (3) MY claim that bot/scheduler.py is
+    dead: it is imported at orchestrator.py:18. (4) MY claim that the APScheduler crons shift 6h:
+    master.py:1710 pins timezone="US/Eastern". (5) utils/time.py and bot/scheduler.py are
+    CORRECT — every helper defaults through now_et(), scheduler uses tzinfo=ET throughout.
+    (6) R14's exit-input staleness gate DOES fire — portfolio.py:180 passes a real timestamp.
+METHOD LIMITATION, recorded so the next round does not inherit a false map: the coverage
+heuristic (in-code round markers x register mentions) UNDER-DETECTS modules whose audit trail
+lives in a CONSUMER's comments or a dedicated test file. data/quality.py scored "never audited"
+but was wired and tested by R14. It is a prioritiser, never proof.
+
+COVERAGE — stated honestly, because an audit that overclaims its own reach is the thing this
+ledger exists to prevent. Inventory 75 files / 43,757 LOC + 6 entry points / 1,434 LOC. DONE:
+the holistic pass (all files), the host-move class in full, line-by-line on quality.py /
+scheduler.py / utils/time.py, and six cross-cutting censuses (129 naive-datetime sites; 54
+silent-swallow of 419 except-blocks; 40 raw .ib bypasses across 7 modules; 13 modules + 8 scripts
+raw sqlite3.connect; 4 Windows shell-outs where the ledger had 3; hardcoded paths and ports).
+NOT DONE: T1-b/T1-c line-by-line (broker/orders.py, account.py, capital_tiers, correlation,
+selector, thompson, ops_health, telegram, gateway, pricing.py, result.py, pdt_guard,
+position_sizer, diagnostics 876 LOC, dormant strategies 503 LOC); T2 — the four-wave collision
+surface in orchestrator.py/executor.py; and the ENTIRE register triage (109 R24 + 78 prior; only
+~15 named closed by W7-W15). R25 is a FOUNDATION: the durable artifact is the coverage matrix in
+§6 of the register, so the next round inherits a map instead of a list.
+
+FIX WAVES PROPOSED (ordered by whether the bot can survive its own failure modes on the host it
+is actually running on, not by finding count): (W16) plat-01/02/05/06 — this host cannot today
+recover a wedged Gateway, relaunch a dead supervisor, fire its dead-man, or refuse a second bot;
+all four are live NOW. (W17) probe the top-10 leads, above all ops_health.py:608-614, where a
+calendar-import failure routes to ok=True/not_rth and the dead-man ping would stay GREEN while
+the bot is dead. (W18) tz-01 before the meta-labeler is ever armed, plus qual-01/02/04 — cheap,
+bounded, and tz-01 is only cheap while the corpus is small. (W19) A1 then A3, one seam each.
+(W20) register triage, then A2 and A4.
+NOTE: the FIFTH FINDING entry above was written by the user at 21:24 DURING this audit; R25's
+register carries three audit points on that change which its entry does not address — it alters
+STRIKE SELECTION (strategies pick strikes by delta; delta now comes from a per-contract solved
+sigma, not the chain median) under a data-correctness heading, it puts a py_vollib Newton solve
+on the live path for every contract in a ~1,500-contract chain, and its
+`except Exception: c.implied_vol = _chain_iv` masks BelowIntrinsicException — a genuinely
+mispriced quote — as an ordinary fallback with no counter.
