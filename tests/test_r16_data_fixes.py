@@ -306,6 +306,7 @@ def _make_md_service(model_greeks="default", ticker_raises=False):
     class _FakeIB:
         def __init__(self):
             self.md_reqs = []
+            self.md_req_args = []
             self.md_cancels = []
 
         async def qualifyContractsAsync(self, *batch):
@@ -314,8 +315,9 @@ def _make_md_service(model_greeks="default", ticker_raises=False):
                 for i, c in enumerate(batch)
             ]
 
-        def reqMktData(self, q, *_a):
+        def reqMktData(self, q, *args):
             self.md_reqs.append(q)
+            self.md_req_args.append(args)  # (genericTickList, snapshot, regulatorySnapshot)
 
         def cancelMktData(self, q):
             self.md_cancels.append(q)
@@ -368,6 +370,21 @@ class TestSnapshotCancelPairing:
         )
         assert chain is None  # harvest failed
         assert len(fake_ib.md_cancels) == len(fake_ib.md_reqs) > 0
+
+    async def test_requests_are_streaming_not_snapshot(self):
+        """R16's modelGreeks gap: snapshot=True's ~11s server-side collection
+        window never fit inside the 2-3s per-batch wait, so modelGreeks
+        silently never arrived. Confirmed live 2026-09-14 (isolated clientId
+        test against the real account): streaming delivers modelGreeks
+        within ~4s where snapshot didn't even at 11s."""
+        svc, fake_ib = _make_md_service()
+        chain = await svc._fetch_ibkr_expiry(
+            "SPY", MagicMock(), date.today() + timedelta(days=20), [100.0], 100.0
+        )
+        assert chain is not None
+        assert fake_ib.md_req_args  # at least one request happened
+        for args in fake_ib.md_req_args:
+            assert args[1] is False, "options quotes must stream, not snapshot"
 
 
 # ---------------------------------------------------------------------------

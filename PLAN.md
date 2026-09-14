@@ -2171,3 +2171,70 @@ PARENT PACKAGE costs, not just the leaf module. Caught only because
 verification kept going instead of stopping at the first green check — the
 same "fixes ship with bugs of their own until an adversarial pass runs"
 pattern R14 named for someone else's fix.
+
+## 2026-09-14 - FOURTH FINDING: option-chain modelGreeks gap (snapshot -> streaming)
+Live option-chain scans were taking minutes per symbol with a flood of
+Error 10091 in the logs. Investigated with the user in two steps:
+[1] RULED OUT market data type: AIT_MARKET_DATA_TYPE 1/3/4 all made zero
+    difference to the errors -- never a data-type problem.
+[2] CONFIRMED Error 10091 is loud but non-blocking for reqMktData, two
+    independent ways: (a) a controlled live test (isolated clientId 95,
+    real OPRA-subscribed account, connected outside the bot) got real
+    bid/ask in all 4 combinations of snapshot/streaming x live/delayed
+    despite the error firing every time; (b) the installed ib_insync
+    wrapper.py's own error handler only takes blocking action
+    (_endReq / order-cancel) for one-shot future requests or orders -- a
+    live market-data ticker is neither, so the error is logged at ERROR
+    severity (10091 isn't in ib_insync's own warningCodes set) and
+    nothing else happens. Not chasing this further; it's cosmetic noise
+    for this call path, confirmed from the library's own source, not
+    assumed.
+[3] FOUND THE REAL GAP: options_chain.py:687 was the ONLY reqMktData call
+    in the entire src/ait/ tree using snapshot=True (grepped every site --
+    reconciler, executor, orchestrator x3, market_data x2 -- all already
+    streamed). Snapshot's ~11s server-side collection window for
+    modelGreeks never fit inside the code's 2s per-batch wait, so
+    delta/gamma/theta/vega/IV silently never arrived (the exact complaint
+    an earlier R16 comment on this file already recorded and never
+    actually landed a fix for -- the cancel-hygiene half got fixed, the
+    snapshot-mode half didn't). Live test confirmed streaming delivers
+    modelGreeks within ~4s where snapshot didn't even at 11s.
+FIX: snapshot=True -> False (options_chain.py:687, aligning with every
+other call site in the codebase); md_wait_s 2.0 -> 3.0
+(options_chain.py:674, evidence-anchored to the live test, not a guess).
+Cancellation already handled correctly for either mode by an existing R16
+`finally` block -- confirmed by reading the full function, no change
+needed there.
+NOT IN SCOPE (found, not fixed): the ±20% price-band strike filter
+(options_chain.py:610) is a separate, larger question -- likely the real
+driver of multi-minute-per-symbol scan WALL-CLOCK time (~1,500 contracts
+for a high-priced underlying like QQQ); this fix addresses data
+CORRECTNESS (Greeks actually arriving), not scan speed.
+SEPARATELY FOUND IN PASSING (pre-existing, not caused by this fix, not
+fixed): tests/test_r19_config_authority.py::TestContractIsTheSingleAuthority
+::test_applier_and_readers_share_one_table fails on this machine because
+this session's earlier AIT_MARKET_DATA_TYPE=3 line in the (gitignored,
+local-only) .env is a real, deliberate override -- but
+apply_runtime_env_defaults() legitimately loads the real .env file on disk,
+and the test isn't isolated from it, so its "env unset -> falls back to the
+CONTRACT_DEFAULTS safety net" assumption breaks the moment a local .env
+sets that key to anything other than the default. Confirmed by temporarily
+removing the .env line (test passes) and restoring it (test fails again).
+Local-only (.env is gitignored) -- does not affect CI or any other
+machine's copy of this repo. A real test-isolation gap, not touched here
+(out of scope for this fix).
+PROOF: tests/test_r16_data_fixes.py::TestSnapshotCancelPairing, new test
+`test_requests_are_streaming_not_snapshot` pinning snapshot=False, proven
+to fail against pre-fix source (git stash of the source file only).
+Suite 1581 passed / 1 pre-existing-unrelated-local-env failure (see above)
+/ 43 skipped, smoke_deploy PASS 13.
+LIVE VERIFIED post-restart (2026-09-14, ~15:39 UTC, SPY scan): chain_source
+confirmed a real IBKR fetch (3 expiries); chain_quoteless_contracts_dropped
+showed only 7 of 520 and 7 of 290 contracts lacked a two-sided market
+(~98.6% got real bid/ask) -- ruling out a cache hit or early-exit before
+trusting the fast (~217ms) scan_symbol_timing total; zero
+ibkr_none_greeks_coerced events fired in that scan, where before the fix
+this was the routine path for nearly every contract. No condor signal came
+out of this particular pass (range_no_edge / vol_mag_no_edge -- an ML-gate
+outcome, unrelated to this fix), but the chain+Greeks pipeline itself is
+now confirmed working end-to-end on the live account, not just in tests.

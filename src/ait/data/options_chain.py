@@ -664,14 +664,27 @@ class OptionsChainService:
 
         # Qualify in batches to avoid timeout
         batch_size = 50
-        # R16: the old snapshot pattern (50 concurrent reqMktData, 0.5s wait,
-        # no cancel) meant delayed-snapshot modelGreeks essentially never
-        # arrived (chain-wide IV/delta = 0) and un-cancelled subs stacked
-        # toward the market-data line cap while their ~11s snapshotEnd
-        # windows overlapped (10091/10197 error floods). Request fewer
-        # concurrently, wait longer, and always cancel in a finally.
+        # R16 tried: 50 concurrent SNAPSHOT reqMktData, 0.5s wait, no cancel
+        # -> delayed-snapshot modelGreeks essentially never arrived
+        # (chain-wide IV/delta = 0) and un-cancelled subs stacked toward the
+        # market-data line cap while their ~11s snapshotEnd windows
+        # overlapped (10091/10197 error floods). R16 fixed the cancel (the
+        # `finally` below) and reduced concurrency, but LEFT snapshot=True —
+        # so modelGreeks still couldn't arrive: IBKR's snapshot collection
+        # window is ~11s, far longer than any wait budget this loop could
+        # afford. Confirmed live 2026-09-14 (isolated-clientId test against
+        # the real account): snapshot mode got bid/ask but NO modelGreeks
+        # even after waiting the full 11s; streaming mode (snapshot=False)
+        # got modelGreeks within ~4s. Streaming is also what every OTHER
+        # reqMktData call site in this codebase already uses (reconciler,
+        # executor, orchestrator, market_data) — this was the one outlier.
+        # Error 10091 ("additional subscription... delayed available") still
+        # fires per-contract on this account regardless of snapshot/type —
+        # confirmed benign for reqMktData (ib_insync's own error handler only
+        # blocks one-shot future requests / orders, neither of which this
+        # is); not a symptom to chase here.
         md_batch_size = 25
-        md_wait_s = 2.0
+        md_wait_s = 3.0
         for i in range(0, len(option_contracts), batch_size):
             batch = option_contracts[i : i + batch_size]
             try:
@@ -683,8 +696,9 @@ class OptionsChainService:
                     requested: list = []
                     try:
                         for q in md_batch:
-                            # Request market data (snapshot)
-                            self._ibkr.ib.reqMktData(q, "", True, False)
+                            # Request market data (streaming, not snapshot —
+                            # see comment above).
+                            self._ibkr.ib.reqMktData(q, "", False, False)
                             requested.append(q)
 
                         await asyncio.sleep(md_wait_s)
