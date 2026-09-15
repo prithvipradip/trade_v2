@@ -1,0 +1,30 @@
+{
+ "variant": "flat_40",
+ "ladder": [
+  [
+   -1000000000,
+   1.0,
+   0.4
+  ]
+ ],
+ "entry_dte": 18,
+ "n": 50,
+ "windows": 16,
+ "wins": 23,
+ "win_rate_pct": 46.0,
+ "net": -4552.15,
+ "pf": 0.536,
+ "avg_trade": -91.04,
+ "max_dd_dollars": 5171.77,
+ "max_dd_pct": 5.14,
+ "mean_hold_days": 7.94,
+ "position_days": 398,
+ "net_per_position_day": -11.438,
+ "closes_per_window": 3.12,
+ "exit_reasons": {
+  "touch_stop": 24,
+  "take_profit_short": 19,
+  "backtest_end": 6,
+  "expiry_approaching": 1
+ }
+}

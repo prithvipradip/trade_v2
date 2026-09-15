@@ -1,0 +1,23 @@
+{
+ "variant": "live_ladder",
+ "ladder": null,
+ "n": 57,
+ "windows": 17,
+ "wins": 30,
+ "win_rate_pct": 52.6,
+ "net": -4020.42,
+ "pf": 0.583,
+ "avg_trade": -70.53,
+ "max_dd_dollars": 4993.4,
+ "max_dd_pct": 4.96,
+ "mean_hold_days": 5.67,
+ "position_days": 324,
+ "net_per_position_day": -12.409,
+ "closes_per_window": 3.35,
+ "exit_reasons": {
+  "take_profit_short": 26,
+  "touch_stop": 22,
+  "backtest_end": 6,
+  "expiry_approaching": 3
+ }
+}

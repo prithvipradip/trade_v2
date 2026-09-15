@@ -5,11 +5,27 @@ ML-gated entries, automated exits, hands-off ops. Paper account DUN603821.
 **Goal:** a trustworthy real track record answering "does this have edge?" before funding
 $3,000 CAD.
 
-**Current state (2026-08-15):**
-- **Track record: 16 closes, 9W-7L, +$150.83 (broker-true, referee 0 BREAKS).** POSITIVE for
-  the first time — three consecutive auto take-profits (+$243 QQQ 08-07 through NFP, +$154 SPY
-  08-11, +$206 QQQ 08-12) since the blackout relaxation + wide-wing promotion. Book FLAT.
-  Sample: 16/50 closes. Sim caveat stands: the live sample is the only verdict that counts.
+**Current state (2026-09-11):**
+- **Verdict metric (iron_condor only): 12 closes, 8W-4L, +$1,235.74, PF 3.89.** Gates 2/3/4
+  PASS (PF 3.89 > 1.3; maxDD $272 = 3.2% of ~$8,421 deployed risk < 8%; median slip 1.6% of
+  credit over 9 fills < 8%). Gate 1 FAILS on sample only: 12/50 prelim, 12/100 funding.
+  Book-level incl. retired experiments: 21 closes, 13W-8L, +$933.68, PF 1.82. Book FLAT.
+- **2026-09-11 — first two closes under the W7/W11/W12/W14 exit rebuild, both take-profits:**
+  SPY +$203.65 @41.6% and QQQ +$241.77 @40.1% (+$445.42). All four waves verified on live
+  fills: W7's 1.5x-mark ceiling priced SPY's 7 no-quote attempts at 4.58-4.79 where the old
+  formula gave 14.32; W12's leg synthesis fired once (QQQ, synthesized 4.43); W11 trued up
+  commission to the broker ledger (SPY est $7.33 vs real $7.35; QQQ $7.34 vs $8.24 — both
+  inside the documented $0.62-$1.06/leg routing range); W14 booked each close exactly once
+  (exit_outbox empty, daily_stats 2 trades/$445.42, breaker daily_pnl matches).
+- **PACE IS THE BINDING CONSTRAINT, and it is a regime not a defect.** 1.2 verdict closes/wk
+  over the trailing 28d against a 3-4/wk target — ~30 weeks to the 50-close prelim read. The
+  structural ceiling is ~3.1/wk (3 symbols / 6.9-day mean hold), so the gap is entry supply:
+  slot utilisation is 55% (16 of 20 sessions at 2 open, never 3). Cause is low IV, confirmed
+  09-09: IWM iv_rank 5.95 emits ZERO signals; SPY 19.44 and QQQ 34.92 emit but are rejected on
+  `credit_width_ratio` (SPY credit 3.05/width 41; QQQ 4.55/54). The strategy is correctly
+  declining to sell cheap vol — but the verdict timeline is hostage to IV mean-reverting.
+  NOTE: the "IWM alive since the 08-10 tradingClass fix" claim below is stale in effect —
+  IWM's chain, ML and scan all run, but it has produced no signal since 07-17 on IV rank alone.
 - **Live config (wide-wing epoch):** iron_condor ONLY, SPY/QQQ/IWM (IWM alive again since the
   08-10 tradingClass fix), k=1.6 wings / 0.10 scaled ratio floor, ML entry gates ON (B1
   confirm: DD 34.6%->10.0% over 11y), pre-event blackout 1 TRADING day, condors hold through
@@ -2075,3 +2091,46 @@ Also fixed: tests/test_r16_round2_fixes.py's blackout fixture lacked
 _post_stop_cooldown_until, so the new fail-closed guard correctly blocked its
 entry before the budget sentinel — the stub now models the real object.
 Suite 1578 green, type gate OK, SMOKE PASS 13. NOT YET DEPLOYED.
+
+## 2026-09-14 - TAKE-PROFIT LADDER STUDY: NO LIVE CHANGE (engine cannot reproduce live entries)
+Prompted by "could we have gotten more than 40%?" on the 09-11 closes.
+HINDSIGHT (real IBKR mids, 1-min and 15-min bars): both condors kept decaying after the
+40% close. SPY reached ~50% and QQQ 50.9% by the afternoon: ~+$120-134 gross on the two.
+CORRECTION to my first read: execution was NOT half of SPY's gap. The 1-min mid at the
+13:48 UTC fill was 3.19, and we filled at 3.21 (+0.02). I had compared against a 15-min
+bar LABELLED 13:45, whose close is the 14:00 price. QQQ filled at mid +0.08 (natural +0.01).
+The gap was the threshold, not the fill.
+STUDY (scripts/take_profit_study.py, rule written into its docstring before any run):
+8 variants, SPY/QQQ/IWM IC-only, 2022-11..2026-09, 22 non-overlapping windows, ungated
+entries (live observe mode), W5 cost model. Research-only injection:
+exit_policy ladder= arg + WalkForwardConfig.credit_tp_ladder / entry_dte (refused with
+optimize_per_window, whose Optuna trials would score the defaults). Sanity arm
+(explicit live ladder) reproduced the default run exactly in both runs.
+| run | live ladder PF | flat_40 | flat_50 | flat_60 | ladder+10 | 14dte_50 | no TP | rule picks |
+| entry DTE 14 (config) | 0.583 (n57) | 0.765 | 0.769 | 0.828 | 0.765 | 0.583 | 0.848 | no_take_profit |
+| entry DTE 18 (live median) | 0.445 (n51) | 0.536 | 0.629 | 0.760 | 0.541 | 0.450 | 0.757 | flat_60 |
+Direction is consistent: higher or no take-profit beats the ladder at both DTEs.
+WHY NO CHANGE: (1) every variant LOSES money; the rule as written has no PF>1 floor
+(wingk's did) so it nominates a losing arm. I did not edit the rule after seeing results.
+(2) The engine does not reproduce live: from 2026-06 on it took 2 trades where live closed
+~10; its entry rate is ~1/3 of live's; touch-stops 22/57 vs live's handful. (3) Live
+enters at median 18 DTE (14-25 over 14 condors), not the engine's fixed 14. This is the
+research re-run problem in concrete form: the engine's ENTRY model must match live before
+any exit parameter can be chosen on it.
+SLIPPAGE (plan step 3): only the two 09-11 closes carry W12 telemetry. There is no evidence
+yet that exits near the open are worse. Revisit at ~10 instrumented closes.
+DEFECT FOUND (live exit path, NOT fixed, awaiting approval): W7's price-band repricing never
+engages on real IBKR rejects. ib_insync 0.9.86 classes error 202 as a WARNING, and warnings
+are only logged: the "more aggressive than X / market price of Y" text is never appended to
+trade.log, which is the only place parse_price_band_reject reads. On 09-11 IBKR rejected 7
+SPY exits (band 3.61-3.69, market 3.09-3.17) and the bot logged band_price=None each time
+and re-placed at 4.58-4.79 for 16 minutes. Harmless that day (flat market); in a fast market
+it would repeat on the touch-stop path. W7's tests wrote the message into trade.log
+directly, which the real library never does. Fix: capture errorEvent 201/202 per orderId in
+IBKRClient and feed it to the parser; test by driving the real Wrapper.error.
+ALSO: range.pkl alternates between 9-day and 30-day horizons (master.py retrain script
+hardcodes horizon_days=30), reported 09-14 morning, not yet fixed. My 09-11 "horizon_days=None"
+claim was wrong (wrong key name).
+PROOF: tests/test_take_profit_study_injection.py, 28 executing tests (26 failed pre-change;
+the other 2 are regression guards on already-correct behaviour). Suite 1606 green, type gate OK. Reports:
+reports/take_profit_study/entry_dte_config/, entry_dte_18/.

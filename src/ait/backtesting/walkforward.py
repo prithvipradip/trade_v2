@@ -157,6 +157,16 @@ class WalkForwardConfig:
     pre_event_blackout_days: int | None = None    # R16 #7: None -> engine resolves from
                                                   # load_settings().risk (live parity),
                                                   # falling back to the RiskConfig default
+    # Research-only credit take-profit ladder, rows (dte_floor, long, short)
+    # as in exit_policy.CREDIT_TP_LADDER. None = the live ladder. A dataclass
+    # field (not a module patch) so it pickles into ProcessPoolExecutor window
+    # workers. scripts/take_profit_study.py is the consumer.
+    credit_tp_ladder: tuple | None = None
+    # Research-only entry DTE for BS pricing/decay. None = the engine's
+    # options.dte_range[0] (14). Live picks among every expiry in
+    # dte_range and measured a median 18 DTE (14-25) over its first 14
+    # condors, so studies keyed to DTE (the take-profit ladder) set it.
+    entry_dte: int | None = None
     optimize_n_jobs: int = 1              # Number of walk-forward WINDOWS to run in parallel via
                                           # ProcessPoolExecutor. Despite the "optimize_" prefix this
                                           # controls WINDOW-LEVEL parallelism, NOT Optuna trial-level
@@ -178,6 +188,20 @@ class WalkForwardConfig:
         None is the sentinel meaning "resolve from the contract/config";
         explicit values always win (a historical reproduction must pass them).
         """
+        if self.credit_tp_ladder is not None:
+            from ait.execution.exit_policy import validate_ladder
+            self.credit_tp_ladder = validate_ladder(self.credit_tp_ladder)
+        if self.entry_dte is not None:
+            self.entry_dte = int(self.entry_dte)
+        _research_only = [name for name in ("credit_tp_ladder", "entry_dte")
+                          if getattr(self, name) is not None]
+        if _research_only and self.optimize_per_window:
+            # StrategyOptimizer trials build their own Backtester without
+            # these overrides, so trials would score the config defaults while
+            # the OOS run used the override. Refuse the combination.
+            raise ValueError(
+                f"{', '.join(_research_only)} not threaded into per-window "
+                "Optuna trials; run with optimize_per_window=False")
         if self.wing_k is None:
             from ait.config.runtime_env import contract_float
             self.wing_k = contract_float("AIT_IC_WING_K")
@@ -1435,6 +1459,8 @@ class WalkForwardBacktester:
                 macro_event_gate=getattr(window_cfg, "macro_event_gate", True),
                 # R16 #7: None -> engine resolves from loaded settings (live parity)
                 pre_event_blackout_days=getattr(window_cfg, "pre_event_blackout_days", None),
+                credit_tp_ladder=getattr(window_cfg, "credit_tp_ladder", None),
+                entry_dte=getattr(window_cfg, "entry_dte", None),
                 # R16 #1: NEVER score an OOS window with the live (future-
                 # trained) models/ensemble.pkl. If the window model failed to
                 # train, the window trades ungated — the documented fallback.
@@ -2541,6 +2567,8 @@ class WalkForwardBacktester:
                 ic_min_credit_width=getattr(window_cfg, "ic_min_credit_width", None),
                 macro_event_gate=getattr(window_cfg, "macro_event_gate", True),
                 pre_event_blackout_days=getattr(window_cfg, "pre_event_blackout_days", None),
+                credit_tp_ladder=getattr(window_cfg, "credit_tp_ladder", None),
+                entry_dte=getattr(window_cfg, "entry_dte", None),
                 # R16 #1: shadow labelling runs with the window predictor
                 # (possibly None) — never with the live artifact.
                 allow_live_model_fallback=False,
