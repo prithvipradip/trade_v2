@@ -26,6 +26,8 @@ from threading import Event
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from ait.utils.process import scan_pids
+
 # Project root
 ROOT = Path(__file__).resolve().parents[3]
 LOGS_DIR = ROOT / "logs"
@@ -147,17 +149,24 @@ def _gateway_process_alive() -> bool:
     Distinguishes "Gateway not started" from "Gateway started but wedged" —
     the 2026-09-08 shape, where killing the stuck JVM is REQUIRED before a
     relaunch can bind the port.
+
+    R25 plat-02 (W16 A2): this was a `powershell Get-Process java` shell-out,
+    so on any non-Windows host FileNotFoundError('powershell') was caught and
+    read as "no JVM running" — SILENTLY. It is the only one of the four
+    Windows-only siblings with no log line at all, and its unmeasured False is
+    stamped into the gateway_recovery_attempt record as wedged_process=False:
+    the log asserted a fact it never measured. A psutil name scan finds the TWS
+    JVM on macOS as readily as the Gateway JVM on Windows.
+
+    The fail direction is UNCHANGED (False), but it is no longer silent —
+    "no JVM" and "could not look" imply different recovery actions.
     """
-    try:
-        import subprocess as _sp
-        out = _sp.run(
-            ["powershell", "-NoProfile", "-Command",
-             "(Get-Process java -ErrorAction SilentlyContinue | "
-             "Measure-Object).Count"],
-            capture_output=True, text=True, timeout=15)
-        return int((out.stdout or "0").strip() or 0) > 0
-    except Exception:  # noqa: BLE001
+    pids = scan_pids(name_contains="java")
+    if pids is None:
+        _log("warning", "gateway_process_scan_failed",
+             detail="process table unreadable; treating as no JVM")
         return False
+    return bool(pids)
 
 def _gateway_listening(port: int, host: str = "127.0.0.1") -> bool:
     """Cheap check: is something accepting connections on the Gateway port?
@@ -217,9 +226,27 @@ def _acquire_singleton_lock(lock_path: Path | None = None) -> bool:
             pass
         _singleton_lock_handle = fh
         return True
-    except Exception as e:  # noqa: BLE001 — lock plumbing must never keep the bot down
-        _log("warning", "singleton_lock_error", error=str(e))
-        return True
+    except Exception as e:  # noqa: BLE001
+        # R25 plat-06 (W16 A4): this returned True — and True means "you hold
+        # the lock, proceed". A permission fault, a full disk, or a missing
+        # fcntl therefore ADMITTED A SECOND SUPERVISOR: two supervisors means
+        # two bots on one account, the class behind the 2026-07-13 triple-fill
+        # that built four accidental reverse iron condors.
+        #
+        # The old comment argued "lock plumbing must never keep the bot down".
+        # W15 settled that trade for the sibling gates and it settles this one:
+        # a stopped bot is visible, recoverable, and costs opportunity; a
+        # second bot placing duplicate orders costs money and corrupts the
+        # book. Fail CLOSED — and page, so the refusal is never silent.
+        _log("critical", "singleton_lock_error_fail_closed", error=str(e))
+        try:
+            _alert(f"SINGLETON LOCK UNAVAILABLE ({type(e).__name__}: {e}). "
+                   f"Refusing to start the supervisor rather than risk a "
+                   f"SECOND BOT on the same account. MANUAL ACTION NEEDED — "
+                   f"check data/ permissions and free disk space.")
+        except Exception:  # noqa: BLE001 — paging must never flip the gate open
+            pass
+        return False
 
 
 def _release_singleton_lock() -> None:
@@ -262,19 +289,30 @@ def _scan_foreign_bot_pids() -> list[int]:
     by the except below and silently read as "no foreign bot found" — the
     guard was a standing no-op on macOS/Linux, every 2-min health cycle, not
     just at startup. psutil (already a pinned dependency) replaces it
-    cross-platform, no shell dependency."""
-    pids: list[int] = []
-    try:
-        import psutil
-        for p in psutil.process_iter(["pid", "name", "cmdline"]):
-            try:
-                cmdline = p.info.get("cmdline") or []
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                continue
-            if "ait.main" in " ".join(cmdline):
-                pids.append(p.info["pid"])
-    except Exception as e:  # noqa: BLE001 — a failed scan must not block a start
-        _log("warning", "foreign_bot_scan_failed", error=str(e))
+    cross-platform, no shell dependency.
+
+    W16 A3: the scan itself now lives in ait.utils.process.scan_pids, shared
+    with status.py — the 2026-09-14 fix was applied to this call site rather
+    than to the idiom, so status.py kept its PowerShell copy and went on
+    reporting the bot DOWN while it was UP on any non-Windows host.
+
+    The match is now `-m` ADJACENCY, not a substring of the joined command
+    line. `"ait.main" in " ".join(cmdline)` also matched `grep -r ait.main
+    src/`, an editor with the file open, or an audit session — and the consumer
+    of this answer REFUSES to start the trading bot, so a false positive is
+    fail-closed and costs a session. A whole-argv token is not enough either:
+    in `grep -r ait.main src/` the token is its own element (a W16 test caught
+    exactly that). The real bot is spawned at master.py:585 as
+    [sys.executable, "-m", "ait.main", "--paper"], so `-m` adjacency is exact.
+
+    Fail direction is unchanged and still fail-OPEN ([] = "no foreign bot",
+    which permits a start). R25 registered that as a standing lead; changing
+    it would block starts on a transient scan failure and is out of W16 scope.
+    """
+    pids = scan_pids(module="ait.main")
+    if pids is None:
+        _log("warning", "foreign_bot_scan_failed",
+             detail="process table unreadable; proceeding as if none found")
         return []
     return pids
 
@@ -431,7 +469,26 @@ class BotManager:
 
         script = GATEWAY_START_SCRIPT
         if not os.path.exists(script):
+            # R25 plat-01: this returned SILENTLY, and the return sits BEFORE
+            # the counter increment below — so _gateway_recoveries never moved
+            # and the escalation above ("MANUAL ACTION NEEDED") was unreachable
+            # on any host without the start script. Materialized 2026-09-15:
+            # TWS was closed by accident at 07:33 and the supervisor deferred
+            # for 8h36m — 134 of these log lines, ZERO pages, ~40 min of it
+            # inside RTH. Nothing can automate away a broker app a human
+            # closed, so for this shape the page IS the recovery.
+            # The counter is deliberately NOT incremented (no attempt was
+            # made); this shares the 30-min throttle above so the 2-min health
+            # loop cannot spam.
             _log("warn", "gateway_recovery_unavailable", script=script)
+            if (self._last_gateway_alert is None
+                    or (now - self._last_gateway_alert) > timedelta(minutes=30)):
+                self._last_gateway_alert = now
+                _alert(f"IB Gateway/TWS has not answered on port {port} for "
+                       f"{down_for / 60:.0f} min, and NO automated recovery is "
+                       f"configured on this host ({script} not found). "
+                       f"MANUAL ACTION NEEDED — start TWS/Gateway; the bot "
+                       f"resumes on its own once the port answers.")
             return
 
         self._gateway_recoveries += 1

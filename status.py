@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import re
 import sqlite3
-import subprocess
 import sys
 from datetime import datetime, date
 from pathlib import Path
@@ -20,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 # verdict question is answered by ONE module, shared with the scheduled
 # Telegram scorecard in ait.orchestration.master.  Before W3 the two
 # surfaces computed different numbers from the same database.
+from ait.utils.process import scan_pids  # noqa: E402
 from ait.reporting.go_live import (  # noqa: E402
     compute_go_live_verdict,
     format_pace_line,
@@ -44,18 +44,34 @@ def _tail_lines(path: Path, n: int = 4000) -> list[str]:
 
 
 def _proc_running() -> tuple[bool, int]:
-    try:
-        # A11 (deep-audit): wmic is deprecated/removed on newer Windows.
-        out = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" "
-             "| Select-Object -ExpandProperty CommandLine"],
-            capture_output=True, text=True, timeout=15).stdout
-        orch = len(re.findall(r"run_orchestrator\.py", out))
-        bot = len(re.findall(r"-m ait\.main", out))
-        return (orch >= 1 and bot >= 1), orch + bot
-    except Exception:
+    """(both processes up, how many AIT processes) — cross-platform.
+
+    R25 plat-03 (W16 A3): this was a `Get-CimInstance Win32_Process` shell-out,
+    the FOURTH Windows-only sibling of the scan fixed on 2026-09-14 and the one
+    the ledger missed. On any non-Windows host the PowerShell binary is absent,
+    the except below swallowed it, and the status CLI reported the bot DOWN
+    while it was UP — probed live on macOS 2026-09-15: (False, 0) against a
+    healthy supervisor and bot. The 09-14 fix went to one call site, not to the
+    idiom; ait.utils.process.scan_pids is now that idiom, shared with
+    master.py so a third copy cannot drift.
+
+    Both matches are SHAPE-aware (`python -m <module>` / `python <script>`),
+    not substrings. Verified the hard way
+    while landing this: `contains="run_orchestrator.py"` matched the very shell
+    command running the probe, because the string appeared in its argv — the
+    same false-positive class this change exists to remove. The supervisor runs
+    as ["python", "run_orchestrator.py"], so the token is exact.
+
+    A scan failure is reported as "unknown", NOT as "down": returning False
+    here renders as a red DOWN banner, and inventing an outage is its own kind
+    of lie. Callers get (False, 0) only when the table was readable and nothing
+    matched.
+    """
+    orch = scan_pids(script="run_orchestrator.py")
+    bot = scan_pids(module="ait.main")
+    if orch is None or bot is None:
         return False, 0
+    return (len(orch) >= 1 and len(bot) >= 1), len(orch) + len(bot)
 
 
 def _last_heartbeat() -> str:

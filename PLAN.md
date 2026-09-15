@@ -2422,3 +2422,102 @@ sigma, not the chain median) under a data-correctness heading, it puts a py_voll
 on the live path for every contract in a ~1,500-contract chain, and its
 `except Exception: c.implied_vol = _chain_iv` masks BelowIntrinsicException — a genuinely
 mispriced quote — as an ordinary fallback with no counter.
+
+## 2026-09-15 - W16 EXECUTED: the four platform gaps, one of which had already fired
+R25's plat-01 MATERIALIZED before the fix landed, and the logs are the proof:
+07:33:41 -> 16:09:41 CEST, `bot_restart_deferred_gateway_down` x133,
+`gateway_recovery_unavailable` x134, `gateway_recovery_attempt` x0, pages x0.
+TWS had been closed by accident at 07:33; the supervisor deferred for 8h36m
+(~40 min of it inside RTH) and NOTHING told anyone. Book was FLAT (0 open
+positions), so the cost was lost opportunity, not unmanaged exposure — but with
+an open book this is the 2026-09-08 shape exactly: positions, no exit engine.
+The accidental cause is what makes the fix matter MORE, not less: no automation
+can un-close an app a human closed, so for this shape the PAGE IS the recovery.
+
+[A1] `master.py:433` returned silently when the start script is absent, and that
+    return sits BEFORE `self._gateway_recoveries += 1`, so the counter never
+    moved and the "MANUAL ACTION NEEDED" escalation at :422-431 was unreachable
+    on any host without C:\IBC\StartGateway.bat. Now pages on the unavailable
+    path, sharing the existing 30-min `_last_gateway_alert` throttle so the
+    2-min health loop cannot spam. The counter is deliberately NOT incremented
+    (no attempt was made). EXECUTION PROOF on this host, nothing mocked: 3
+    simulated cycles -> 2 pages (cycle 2 throttled, cycle 3 past 30 min),
+    message naming port, duration and the action.
+    W13's own suite passed green here throughout, because
+    test_w13_gateway_recovery.py patches `os.path.exists -> True` at six sites.
+    Its `test_missing_start_script_is_reported_not_crashed` asserted only what
+    did NOT happen (no Popen, counter 0) and never asserted a page — it
+    PERMITTED the silence. Both original assertions still hold; the missing one
+    is now there, plus two throttle tests.
+[A2] `_gateway_process_alive()` was `powershell Get-Process java` — the only one
+    of the four Windows-only siblings with a FULLY silent except, and its
+    unmeasured False is stamped into gateway_recovery_attempt as
+    wedged_process=False: the log asserted a fact it never measured. Now psutil.
+    Probed live: True (finds the TWS JVM); was False. Fail direction unchanged,
+    silence removed.
+[A3] `status.py:_proc_running()` — the FOURTH powershell sibling, the one the
+    09-14 entry missed. Probed live against a healthy supervisor+bot: (False, 0)
+    — reported the bot DOWN while it was UP; now (True, 2). The 09-14 fix went
+    to one CALL SITE, not to the IDIOM, so the scan existed in four places. It
+    now lives once, in `ait/utils/process.py`, shared by master.py and
+    status.py. A failed scan returns None, never [] — "I could not look" and "I
+    looked and found nothing" are different facts, and collapsing them is how
+    the guard became a silent no-op in the first place.
+[A4] `_acquire_singleton_lock` ended `except Exception: return True`, and True
+    means "you hold the lock, proceed" — a permission/disk/fcntl fault ADMITTED
+    A SECOND SUPERVISOR, one layer above the guard fixed on 09-14. Two bots is
+    the 07-13 triple-fill/position-reversal class. Now fails CLOSED and pages,
+    following W15's pattern (log _fail_closed, throttled page, inner try so a
+    paging failure cannot flip the gate open). The old comment argued "lock
+    plumbing must never keep the bot down"; W15 settled that trade — a stopped
+    bot is visible and recoverable, a second bot corrupts the book.
+[B1] THE OPS SUBSTRATE NOW EXISTS OFF WINDOWS. `find . -name "*.sh" -o -name
+    "*.plist"` returned ZERO: keeper_ait.bat is BOTH the 90s relauncher AND the
+    dead-man ping gate, and on macOS neither existed. The supervisor was found
+    running out of a VS Code integrated terminal (zsh <- Code Helper <- Visual
+    Studio Code) — quitting the editor would have killed the trading bot. Added
+    ops/keeper_ait.sh + a launchd template + installer, ADDITIVE: keeper_ait.bat
+    is byte-stable because test_r16_tail_fixes::TestKeeperBat and
+    test_w6_ops_surfaces pin its exact text. Reuses what already exists rather
+    than reimplementing it — `_acquire_singleton_lock` is the real double-launch
+    guard (the keeper's check is advisory), and `_ROTATE_TARGETS` already caps
+    keeper.log. Paths are derived, never baked: the .bat hardcodes another
+    user's home, which is the mistake the template exists to avoid. NOT
+    INSTALLED — starting a process that manages the bot is the user's call.
+[B2] scripts/verify_deadman.py hardcoded keeper_ait.bat and asserted `curl.exe`,
+    so on macOS it validated a file that never runs here — reassurance about the
+    wrong mechanism. Now platform-selects the live keeper. It currently reports:
+    keeper wired to ping TRUE, ping gated on bot TRUE, liveness ALIVE
+    [heartbeat_fresh], deadman file MISSING -> STATUS: NOT ARMED.
+TWO SELF-CORRECTIONS, recorded because the register is only worth what its
+honesty is worth. (1) My first shared-helper design was WRONG: I claimed
+whole-argv TOKEN matching was precise, and a test I wrote caught that it is not
+— in `grep -r ait.main src/` the token IS its own element. Only `-m` adjacency
+distinguishes a bot from a mention; the real bot is spawned at master.py:585 as
+[sys.executable, "-m", "ait.main", "--paper"]. I had also left a docstring still
+asserting the old claim — the same stale-comment defect R25 registered against
+strategies/base.py. (2) That change failed
+test_r16_ops_fixes::TestScanForeignBotPidsRealBody, whose fixture spawned
+`python -c ... ait.main` — a STRAY token, i.e. the fixture enshrined the
+false-positive shape. Amended to the real spawn shape and a negative test added
+pinning that a mere mention is not a bot. An existing assertion was changed, so
+it is said out loud here rather than buried in a diff.
+PROOF: every new test proven to fail against pre-fix source (git stash of the
+source files only) — 3 for A1, 10 for A2/A3/A4, 4 for B2 — then pass restored.
+Suite 1612 passed / 43 skipped / 1 pre-existing local-.env failure
+(test_r19_config_authority, unchanged and gitignored), was 1583. typecheck OK,
+byte-compile OK, SMOKE PASS 13.
+LESSON (process): my FIRST full-suite run reported 3 failures, two of which I
+caused by editing master.py WHILE the suite ran — test_r16_tail_fixes uses
+inspect.getsource(), which reads the file from disk at line offsets captured at
+import time, so the offsets went stale mid-run. Not a defect, not pollution: a
+full-suite result is only meaningful if the tree holds still underneath it. The
+clean re-run is the one quoted above.
+STILL OPEN, USER-SIDE: (U1) the dead-man has NEVER been armed —
+data/deadman_url.txt does not exist, unarmed since 07-09, and the keeper is half
+a safety net without it; (2) ops/install_launchd.sh is written but not run;
+(3) three false `gateway_recovery_unavailable` lines at 20:47:29 in
+logs/orchestrator.log were planted by my own A1 execution probe — `_log`
+suppresses its file sink only under pytest (R16 #56), not for ad-hoc probes.
+Removing them was correctly refused as audit-log tampering; the call is the
+user's.
