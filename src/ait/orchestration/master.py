@@ -460,11 +460,17 @@ class BotManager:
         if self._gateway_recoveries >= GATEWAY_MAX_RECOVERIES:
             if (self._last_gateway_alert is None
                     or (now - self._last_gateway_alert) > timedelta(minutes=30)):
-                self._last_gateway_alert = now
-                _alert(f"IB Gateway STILL down on port {port} after "
-                       f"{GATEWAY_MAX_RECOVERIES} automatic restart attempts "
-                       f"({down_for / 60:.0f} min). MANUAL ACTION NEEDED — "
-                       f"check for a login/2FA prompt on the Gateway window.")
+                # W17 w17-01b: consume the throttle only on a DELIVERED page.
+                # _alert (:64) is single-shot — one urlopen, no retry, no
+                # dead-channel accounting — and returns False on a dropped
+                # send. Setting the timestamp FIRST meant one failed packet
+                # bought 30 minutes of silence on the page that exists
+                # because of an 8h36m silent outage.
+                if _alert(f"IB Gateway STILL down on port {port} after "
+                          f"{GATEWAY_MAX_RECOVERIES} automatic restart attempts "
+                          f"({down_for / 60:.0f} min). MANUAL ACTION NEEDED — "
+                          f"check for a login/2FA prompt on the Gateway window."):
+                    self._last_gateway_alert = now
             return
 
         script = GATEWAY_START_SCRIPT
@@ -483,12 +489,18 @@ class BotManager:
             _log("warn", "gateway_recovery_unavailable", script=script)
             if (self._last_gateway_alert is None
                     or (now - self._last_gateway_alert) > timedelta(minutes=30)):
-                self._last_gateway_alert = now
-                _alert(f"IB Gateway/TWS has not answered on port {port} for "
-                       f"{down_for / 60:.0f} min, and NO automated recovery is "
-                       f"configured on this host ({script} not found). "
-                       f"MANUAL ACTION NEEDED — start TWS/Gateway; the bot "
-                       f"resumes on its own once the port answers.")
+                # W17 w17-01b: consume the throttle only on a DELIVERED page.
+                # _alert (:64) is single-shot — one urlopen, no retry, no
+                # dead-channel accounting — and returns False on a dropped
+                # send. Setting the timestamp FIRST meant one failed packet
+                # bought 30 minutes of silence on the page that exists
+                # because of an 8h36m silent outage.
+                if _alert(f"IB Gateway/TWS has not answered on port {port} for "
+                          f"{down_for / 60:.0f} min, and NO automated recovery is "
+                          f"configured on this host ({script} not found). "
+                          f"MANUAL ACTION NEEDED — start TWS/Gateway; the bot "
+                          f"resumes on its own once the port answers."):
+                    self._last_gateway_alert = now
             return
 
         self._gateway_recoveries += 1

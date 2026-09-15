@@ -17,6 +17,7 @@ simulated, only `scan_pids` is substituted — never the logic under test.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import pytest
@@ -212,3 +213,55 @@ class TestDeadmanVerifierIsPlatformAware:
         posix = 'curl -fsS -m 10 "$URL"  data/deadman_url.txt ait.monitoring.ops_health'
         assert m.keeper_gating(posix)["pings"] is True
         assert m.keeper_gating(posix)["gated"] is True
+
+
+class TestFailedPageDoesNotBurnTheThrottle:
+    """W17 w17-01b. `_alert` (master.py:64) is single-shot — one urlopen, no
+    retry, no dead-channel accounting — and returns False on a dropped send.
+
+    Both gateway-escalation sites used to set `_last_gateway_alert = now`
+    BEFORE calling it and discard the result, so a single failed packet
+    consumed the 30-minute throttle and bought 30 minutes of silence on the
+    page that exists because of the 2026-09-15 8h36m silent outage.
+
+    W16 shipped one of those two sites; this is a defect I copied faithfully
+    from the pre-existing sibling rather than invented, and both are fixed."""
+
+    def _mgr(self, down_minutes, *, recoveries=0):
+        import ait.orchestration.master as _M
+        m = _M.BotManager.__new__(_M.BotManager)
+        now = datetime.now()
+        m._gateway_down_since = now - timedelta(minutes=down_minutes)
+        m._gateway_recoveries = recoveries
+        m._last_gateway_recovery = None
+        m._last_gateway_alert = None
+        return m, now
+
+    def test_failed_page_leaves_the_throttle_unconsumed(self):
+        m, now = self._mgr(20)
+        with patch.object(M.os.path, "exists", return_value=False), \
+             patch.object(M, "_alert", return_value=False) as alert:
+            m._maybe_recover_gateway(7497, now)
+            assert m._last_gateway_alert is None, "a dropped page must not burn the throttle"
+            m._maybe_recover_gateway(7497, now + timedelta(minutes=2))
+        assert alert.call_count == 2, "the next cycle must retry a page that never landed"
+
+    def test_delivered_page_does_consume_the_throttle(self):
+        m, now = self._mgr(20)
+        with patch.object(M.os.path, "exists", return_value=False), \
+             patch.object(M, "_alert", return_value=True) as alert:
+            m._maybe_recover_gateway(7497, now)
+            assert m._last_gateway_alert is not None
+            m._maybe_recover_gateway(7497, now + timedelta(minutes=2))
+        assert alert.call_count == 1, "a delivered page must still be throttled"
+
+    def test_same_rule_on_the_budget_exhausted_sibling(self):
+        """Fix the CLASS: the pre-existing escalation block had the identical
+        ordering, and fixing only the one W16 touched would leave it broken."""
+        m, now = self._mgr(200, recoveries=M.GATEWAY_MAX_RECOVERIES)
+        with patch.object(M, "_alert", return_value=False) as alert:
+            m._maybe_recover_gateway(7497, now)
+            assert m._last_gateway_alert is None
+            m._maybe_recover_gateway(7497, now + timedelta(minutes=2))
+        assert alert.call_count == 2
+

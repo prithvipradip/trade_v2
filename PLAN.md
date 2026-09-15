@@ -2589,3 +2589,80 @@ operator authorization (backup kept outside the repo). The underlying gap is
 real and unfixed: `_log` suppresses its file sink only under pytest (R16 #56),
 so any ad-hoc probe still writes to the production forensic log. Registered, not
 fixed.
+
+## 2026-09-15 - W17 BATCH 1: five R25 leads probed — 4 VERIFIED, 1 PARTIAL, 2 NEW (one of them mine)
+R25 left 49 single-lens leads. W17 converts them to verdicts in consequence order, stopping after
+each batch so the tail can be re-ranked. Register: reports/w17_probes_batch1_20260915.md; the five
+§5 entries in the R25 register are stamped inline with their verdicts so it stops presenting
+settled leads as open. Method unchanged: two-lens, and every probe drove the REAL function with
+mocks only at the external edge. Probe hygiene held — PYTEST_CURRENT_TEST set before any
+supervisor call, and 0 probe lines reached logs/orchestrator.log (the hazard that planted three
+false lines during W16).
+
+RE-RANKED BEFORE PROBING, because W16b changed the board: retiring the dead-man made Telegram the
+ONLY alerting channel, which promoted the alert path itself from lead 7 to rank 1 — and A1, shipped
+hours earlier, rides exactly that path.
+
+[w17-01] `_alert()` IS SINGLE-SHOT AND NOTHING COUNTS ITS FAILURES — VERIFIED. Probe: 1 urlopen
+    attempt (a retrying impl would be >1), returns False, and NO TELEGRAM_DEAD marker after 7
+    consecutive failures. orchestrator.py:4278-4318 does 3 attempts with backoff and trips a
+    dead-channel marker at 5; the supervisor's 21 call sites — including STATE DB BACKUP FAILED
+    (:1177) and GO-LIVE SCORECARD FAILED (:1480) — have none of it.
+[w17-01b] AND A1 PROPAGATED A THROTTLE DEFECT — VERIFIED, NEW, MINE. Both gateway-escalation sites
+    set `_last_gateway_alert = now` BEFORE calling _alert() and discarded its bool, so a FAILED
+    send still consumed the 30-minute throttle. Probe: after one dropped page, 0 further attempts
+    in the next 20 minutes. One dropped packet bought 30 minutes of silence on the page that
+    exists BECAUSE of an 8h36m silent outage. The pre-existing sibling at :422-431 had the
+    identical ordering — I copied a defect faithfully rather than inventing one. FIXED AT BOTH
+    SITES (fix the class, not the instance): the throttle is now consumed only on a delivered
+    page. Re-probed: 3 attempts over 20 min when Telegram drops, 1 when it delivers.
+[w17-02] A CALENDAR FAULT MAKES A DEAD BOT READ HEALTHY — VERIFIED, CONSEQUENCE RESTATED. Same
+    6-hour-stale heartbeat: with a working calendar `ok=False state=heartbeat_stale`; with the
+    calendar raising, `ok=True state=not_rth`. Driven end-to-end through the real dashboard panel:
+    liveness_panel() returns 'stale' normally and 'ok' under the fault. R25 claimed the victim was
+    the dead-man ping — that consumer no longer exists after W16b. The live victim is
+    dashboard/app.py:475. The lead was right about the mechanism and wrong about the blast radius;
+    both are recorded. Fix direction: an unavailable calendar is UNKNOWN, not CLOSED — return a
+    third state and render NOT WIRED, the pattern read_channel_state already uses at :924-971.
+[w17-03] combo() VALIDATES NOTHING, BUT THE EXIT PATH CANNOT EXPLOIT IT — PARTIAL, and R25
+    OVERSTATED THIS. Probe: every leg shape the entry gate rejects is built silently — action
+    'HOLD', conId 0, ratio 99, ratio None, lowercase 'buy'. That half is VERIFIED. But the exit
+    path's legs are well-formed BY CONSTRUCTION: :3390-3392 aborts on a failed qualify (conId
+    cannot be 0), the action is rebuilt as a literal, and ratio always resolves to the default.
+    No reachable path produces a malformed leg. The real risk is that the invariant rests on three
+    unrelated implementation details with nothing enforcing it, on a builder with zero tests.
+[w17-03b] LEG `ratio` IS DROPPED ON PERSISTENCE — VERIFIED, NEW. executor.py:367-375 writes only
+    strike/right/action/expiry, so every exit rebuilds at ratio=1 regardless of entry. Inert today
+    (all strategies 1:1); becomes a silent structure change the moment a ratio spread is enabled —
+    the exit would close a different shape than the entry opened.
+[w17-04] THE DASHBOARD'S "WIN RATE" DIVIDES CLOSE-DAY WINS BY ENTRY-DAY ENTRIES — VERIFIED, with a
+    real instance in this DB. trades_taken increments at ENTRY (:2620); trades_won/lost at CLOSE
+    (:788-791); app.py:640-642 divides one by the other. Both real daily_stats rows —
+    2026-04-23 and 04-24, taken=5 won=0 lost=0 — render as "Win Rate 0%" on days with FIVE entries
+    and ZERO losses. Boundaries from the same expression: taken=0/won=2 shows "N/A" (a day of pure
+    wins shows nothing), taken=1/won=3 shows "300%". Compounded by the real-close asymmetry: the
+    drain path consults is_real_close (:688-691), the fill-callback path (:785-797) does not, and
+    the dashboard cannot filter what daily_stats has already aggregated.
+[w17-05] THE PARTIAL-EXIT ORDER CARRIES NO orderRef — VERIFIED. OrderBuilder.market() returns a
+    bare MarketOrder; the tree has exactly five orderRef assignments (executor 570/798,
+    orchestrator 3046/3087/3674) and :2849 is not among them. reconciler.py:604-609 documents the
+    invariant "every entry/exit order has carried its trade_id in orderRef since R17" and falls
+    back to the symbol/leg heuristic ONLY for pre-R17 orders — so this emits a post-R17 order that
+    reads as pre-R17, triggering the matcher R19 replaced because it could cancel a different
+    trade's working order, "including a live EXIT combo". LATENT: the partial-exit ladder is dead
+    at 1 contract, so it wakes on funding.
+COUNTS: 5 probed -> 4 VERIFIED, 1 PARTIAL, 0 REFUTED, 2 NEW findings surfaced while probing. Zero
+refutations is a smaller sample, not a better hit rate — batch 1 was deliberately the end of the
+list where claims had already survived the most scrutiny. R24 refuted 28 of 137 at this stage and
+R25 refuted 6 of its own, three of them mine.
+PROOF: w17-01b's fix has 3 tests, 2 proven to fail against pre-fix source (the third passes both
+ways ON PURPOSE — it guards against over-correcting into no throttle at all). Suite 1609 passed /
+43 skipped / 1 pre-existing local-.env failure. typecheck OK.
+PROPOSED FIX ORDER: (now, done) w17-01b. (W18) w17-01 give supervisor alerts retry + dead-channel
+accounting — Telegram is the only channel left; w17-02 render a calendar fault as NOT WIRED rather
+than green. (W19) w17-04 compute the Overview metrics from `trades` with _REAL_CLOSE_SQL like every
+other panel already does; then w17-03/03b/05, which are latent today and wake on funding or on a
+strategy change.
+BATCH 2 CANDIDATES: R25 §5 leads 5, 6, 8, 9, 10 and the 39 area leads. Ordering should be revisited
+against what this batch changed — anything whose stated consequence depended on the dead-man needs
+its blast radius restated the way w17-02 did.
