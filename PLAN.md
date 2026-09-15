@@ -2521,3 +2521,71 @@ logs/orchestrator.log were planted by my own A1 execution probe — `_log`
 suppresses its file sink only under pytest (R16 #56), not for ad-hoc probes.
 Removing them was correctly refused as audit-log tampering; the call is the
 user's.
+
+## 2026-09-15 - W16b CORRECTION: the POSIX keeper, launchd and the dead-man are RETIRED
+The W16 entry above is now PARTLY WRONG and this corrects it rather than
+rewriting it. W16's [A1]-[A4] and [B2] stand and are DEPLOYED (supervisor pid
+41807 started 22:33:24, after the 21:40:59 commit — A1's page is live). [B1] —
+ops/keeper_ait.sh, ops/install_launchd.sh, ops/com.ait.keeper.plist.template —
+has been DELETED, and the healthchecks.io dead-man with it.
+
+WHY, and the mistake underneath it. I built B1 on an unexamined premise. The
+keeper exists on Windows for a reason its own header states plainly
+(keeper_ait.bat:4-7): it "survives whatever is killing python on this machine
+on a ~30-60 min cycle. This is a band-aid over that machine-level issue, not a
+fix for it." That pathology is WINDOWS-BOX-SPECIFIC. Nothing establishes it
+happens on the Mac — the supervisor ran 18h41m straight here without dying. I
+ported the band-aid without checking whether this machine has the wound. R24's
+own critic list warns about exactly this class (machinery carried forward
+because it exists, not because it earns its place).
+
+THE OPERATOR MODEL I HAD WRONG. W16 was scoped from "the bot must survive
+unattended", which I read as "needs a keeper + a login-time daemon". The actual
+model, stated 2026-09-15: "I maintain control on when I start the bot. Once
+started, it should be kept running, until I shut it down." Start and stop are
+DELIBERATE HUMAN ACTS. The keeper cannot tell "crashed" from "the operator
+stopped it" — both are just an absent process — so with it installed, Ctrl-C
+would have been undone within one ~90s loop and the bot could not have been
+turned off at all. That is a direct functional conflict with the operating
+model, not a tuning detail.
+
+THE DEAD-MAN, AND WHY U1 IS NOW A DECISION NOT A GAP. healthchecks.io was armed
+(Period 5m / Grace 15m, per verify_deadman.py's own docstring) and then found to
+assume CONTINUOUS uptime: the keeper pings every ~90s including outside RTH
+(bot_liveness returns ok=True [not_rth]), so any planned shutdown is
+indistinguishable from a crash and alarms 20 min later. PLAN.md:33 already
+records that this bot's machines are NOT always-on ("box on by 09:25 ET on
+trading days (Start-menu shutdowns at ~22:00 are fine)"), so the configuration I
+recommended would have false-alarmed every night — and a nightly alert you learn
+to ignore is worse than no alert. The operator's call: delete the check, the
+layer is premature. U1 ("dead-man UNARMED since 07-09") should therefore no
+longer be read as an oversight to close; it is a DEFERRED DECISION. Revisit it
+if and when the box becomes genuinely always-on or unattended for long stretches
+— at which point the clean design (no keeper) is: bot pings on its own health
+cycle, and master.py's existing SIGINT/SIGTERM graceful_shutdown pauses the check
+as its last act, so Ctrl-C is indistinguishable from intent. That needs a
+healthchecks.io management API key (there is no /pause ping endpoint).
+
+ALSO FOUND AND NOT WORTH FIXING: the LaunchAgent could not run at all on this
+host — `Operation not permitted` on getcwd and on the script itself (exit 126, 6
+throttled retries before I unloaded it). Cause is macOS TCC: ~/Documents is a
+protected folder and a launchd-spawned job inherits none of the grant the
+Terminal/VS Code process tree already has, and a headless agent cannot show the
+consent prompt. The fix would have been Full Disk Access for /bin/bash (coarse,
+system-wide) or relocating the repo out of ~/Documents. Both were made moot by
+the decision above — worth recording because any future attempt to daemonise
+anything in this repo will hit the same wall.
+WHAT SURVIVES AND IS LIVE: A1 (gateway escalation — the 8h36m fix), A2/A3
+(psutil process scans, one shared idiom in ait/utils/process.py), A4 (singleton
+lock fails closed), B2 (verify_deadman platform selection). keeper_ait.bat and
+verify_deadman.py remain valid for the WINDOWS host, which is still primary
+alongside the Mac; on macOS the verifier now correctly reports "not plumbed",
+true by decision rather than oversight. tests/test_w16_platform_gaps.py keeps a
+note where TestPosixKeeper used to be, so a later round does not "restore
+missing coverage" by resurrecting retired machinery.
+HOUSEKEEPING: the three false `gateway_recovery_unavailable` lines my own A1
+execution probe planted in logs/orchestrator.log at 20:47:29 were REMOVED with
+operator authorization (backup kept outside the repo). The underlying gap is
+real and unfixed: `_log` suppresses its file sink only under pytest (R16 #56),
+so any ad-hoc probe still writes to the production forensic log. Registered, not
+fixed.

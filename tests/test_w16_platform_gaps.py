@@ -178,59 +178,18 @@ class TestStatusProcRunning:
             "status.py no longer shells out; the import should be gone"
 
 
-class TestPosixKeeper:
-    """W16 B1/B2 (R25 plat-05): keeper_ait.bat is BOTH the ~90s supervisor
-    relauncher AND the gate on the healthchecks.io dead-man ping — and it is
-    cmd.exe-only. Before W16 `find . -name "*.sh" -o -name "*.plist"` returned
-    ZERO, so on macOS nothing relaunched a dead supervisor and the dead-man
-    could never fire. The supervisor was in fact found running out of a VS Code
-    integrated terminal on 2026-09-15: quitting the editor would have killed it.
-
-    These mirror TestKeeperBat / test_w6_ops_surfaces for the POSIX sibling."""
-
-    @pytest.fixture(scope="class")
-    def root(self):
-        import pathlib
-        return pathlib.Path(__file__).resolve().parents[1]
-
-    def test_the_posix_keeper_exists_and_is_executable(self, root):
-        import os
-        k = root / "ops" / "keeper_ait.sh"
-        assert k.exists(), "macOS/Linux hosts have no keeper without this file"
-        assert os.access(k, os.X_OK)
-
-    def test_it_pings_and_the_ping_is_gated_on_bot_liveness(self, root):
-        """bot-day-02: an ungated ping attests only that a PROCESS exists, so a
-        bot with a dead Telegram and a down gateway shows GREEN for hours."""
-        text = (root / "ops" / "keeper_ait.sh").read_text()
-        assert "deadman_url.txt" in text
-        assert "curl " in text
-        assert "ait.monitoring.ops_health" in text
-        assert "/fail" in text
-
-    def test_it_relaunches_the_supervisor(self, root):
-        text = (root / "ops" / "keeper_ait.sh").read_text()
-        assert "run_orchestrator.py" in text
-
-    def test_it_hardcodes_nobody_s_home_directory(self, root):
-        """keeper_ait.bat hardcodes C:\\Users\\prith\\... — the mistake the
-        launchd template exists to avoid. Paths must be derived."""
-        for name in ("keeper_ait.sh", "com.ait.keeper.plist.template",
-                     "install_launchd.sh"):
-            text = (root / "ops" / name).read_text()
-            assert "/Users/" not in text, f"{name} hardcodes a home directory"
-
-    def test_windows_keeper_is_untouched(self, root):
-        """The .bat must stay byte-stable — test_r16_tail_fixes asserts its
-        exact text, and this change is ADDITIVE."""
-        text = (root / "keeper_ait.bat").read_text()
-        assert "ping -n 91 127.0.0.1" in text
-        assert "curl.exe" in text
-
-
 class TestDeadmanVerifierIsPlatformAware:
     """W16 B2: scripts/verify_deadman.py hardcoded keeper_ait.bat, so on macOS
-    it validated a file that never runs here — attesting the wrong mechanism."""
+    it validated a file that never runs here — attesting the wrong mechanism.
+
+    RETIRED 2026-09-15: the POSIX keeper (ops/keeper_ait.sh), its launchd
+    installer and the dead-man ping were REMOVED by operator decision, so the
+    TestPosixKeeper class that used to sit here is gone with them. Do not
+    "restore missing coverage" by recreating those files — see the PLAN.md
+    entry of 2026-09-15. keeper_ait.bat and this verifier remain live for the
+    WINDOWS host, which is why platform selection is still tested below; on
+    macOS the verifier now correctly reports 'not plumbed', which is true by
+    decision rather than by oversight."""
 
     def _mod(self):
         import importlib, sys, pathlib
@@ -253,11 +212,3 @@ class TestDeadmanVerifierIsPlatformAware:
         posix = 'curl -fsS -m 10 "$URL"  data/deadman_url.txt ait.monitoring.ops_health'
         assert m.keeper_gating(posix)["pings"] is True
         assert m.keeper_gating(posix)["gated"] is True
-
-    def test_the_shipped_posix_keeper_passes_its_own_verifier(self):
-        import pathlib
-        m = self._mod()
-        text = (pathlib.Path(__file__).resolve().parents[1]
-                / "ops" / "keeper_ait.sh").read_text()
-        v = m.keeper_gating(text)
-        assert v["pings"] and v["gated"], v["detail"]
