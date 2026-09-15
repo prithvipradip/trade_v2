@@ -14,6 +14,7 @@ from enum import Enum
 import pandas as pd
 
 from ait.data.options_chain import OptionsChain, OptionContract
+from ait.reporting.go_live import GO_LIVE_VERDICT_STRATEGIES  # noqa: F401 — re-export; this module (base.py) already pays the broker-import cost anyway, but go_live.py must stay import-light for reporting-only consumers (dashboard/status), so the single definition lives there now
 
 
 class SignalDirection(str, Enum):
@@ -54,13 +55,10 @@ BACKTEST_CREDIT_STRATEGIES = frozenset({
 
 CREDIT_STRATEGIES = LIVE_CREDIT_STRATEGIES | BACKTEST_CREDIT_STRATEGIES
 
-# R19d/R20b follow-up: the go-live verdict metric (status.py) counts ONLY
-# strategies actually promoted to production, which is a STRICT SUBSET of
-# CREDIT_STRATEGIES (most of which are backtest-only experiments) — a
-# different concept, not a narrowing of the same one. iron_condor is the
-# sole promotion today; extend this set (not a bare string literal at each
-# report call site) when a second strategy is promoted.
-GO_LIVE_VERDICT_STRATEGIES = frozenset({"iron_condor"})
+# GO_LIVE_VERDICT_STRATEGIES lives in ait.strategies.constants (2026-09-14,
+# re-exported above) — reporting-only consumers (go_live.py, dashboard,
+# status tooling) must not have to import this whole broker-touching module
+# just for that one classification constant.
 
 # R16: strategies whose max loss is NOT structurally capped. Signal.max_loss
 # for these is a stress ESTIMATE (always > 0), so "max_loss > 0" could never

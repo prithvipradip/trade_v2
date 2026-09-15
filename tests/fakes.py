@@ -172,6 +172,9 @@ class FakeIB:
         self._next_order_id = 1000
 
     # -- orders ------------------------------------------------------------
+    async def qualifyContractsAsync(self, *contracts):  # noqa: N802
+        return list(contracts)
+
     def placeOrder(self, contract, order):  # noqa: N802 - ib_insync casing
         self.placed.append((contract, order))
         if not getattr(order, "orderId", 0):

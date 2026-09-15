@@ -249,24 +249,34 @@ def _release_singleton_lock() -> None:
 # ---------------------------------------------------------------------------
 
 def _scan_foreign_bot_pids() -> list[int]:
-    """R16 #10: PIDs of any pre-existing 'ait.main' trading-bot process.
+    """R16 #10 (+ macOS fix 2026-09-14): PIDs of any pre-existing 'ait.main'
+    trading-bot process.
 
     An ait.main child orphaned by a master-only death survives (no Job
     object), the keeper's guard used to match only 'run_orchestrator', and a
     relaunched master would spawn a SECOND bot trading the same account/DB
-    (the clientId fallback defeats IBKR's duplicate-id rejection). Same
-    Get-CimInstance approach as the keeper (wmic is deprecated, A11)."""
+    (the clientId fallback defeats IBKR's duplicate-id rejection).
+
+    Originally shelled out to PowerShell/Get-CimInstance (Windows-only): on
+    any non-Windows host that raised FileNotFoundError('powershell'), caught
+    by the except below and silently read as "no foreign bot found" — the
+    guard was a standing no-op on macOS/Linux, every 2-min health cycle, not
+    just at startup. psutil (already a pinned dependency) replaces it
+    cross-platform, no shell dependency."""
+    pids: list[int] = []
     try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
-             "Where-Object { $_.CommandLine -match 'ait\\.main' } | "
-             "Select-Object -ExpandProperty ProcessId"],
-            capture_output=True, text=True, timeout=30)
-        return [int(tok) for tok in result.stdout.split() if tok.strip().isdigit()]
+        import psutil
+        for p in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                cmdline = p.info.get("cmdline") or []
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+            if "ait.main" in " ".join(cmdline):
+                pids.append(p.info["pid"])
     except Exception as e:  # noqa: BLE001 — a failed scan must not block a start
         _log("warning", "foreign_bot_scan_failed", error=str(e))
         return []
+    return pids
 
 
 def _clear_dashboard_port(port: int = 8501) -> bool:

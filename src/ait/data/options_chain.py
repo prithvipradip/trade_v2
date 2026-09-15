@@ -664,14 +664,27 @@ class OptionsChainService:
 
         # Qualify in batches to avoid timeout
         batch_size = 50
-        # R16: the old snapshot pattern (50 concurrent reqMktData, 0.5s wait,
-        # no cancel) meant delayed-snapshot modelGreeks essentially never
-        # arrived (chain-wide IV/delta = 0) and un-cancelled subs stacked
-        # toward the market-data line cap while their ~11s snapshotEnd
-        # windows overlapped (10091/10197 error floods). Request fewer
-        # concurrently, wait longer, and always cancel in a finally.
+        # R16 tried: 50 concurrent SNAPSHOT reqMktData, 0.5s wait, no cancel
+        # -> delayed-snapshot modelGreeks essentially never arrived
+        # (chain-wide IV/delta = 0) and un-cancelled subs stacked toward the
+        # market-data line cap while their ~11s snapshotEnd windows
+        # overlapped (10091/10197 error floods). R16 fixed the cancel (the
+        # `finally` below) and reduced concurrency, but LEFT snapshot=True —
+        # so modelGreeks still couldn't arrive: IBKR's snapshot collection
+        # window is ~11s, far longer than any wait budget this loop could
+        # afford. Confirmed live 2026-09-14 (isolated-clientId test against
+        # the real account): snapshot mode got bid/ask but NO modelGreeks
+        # even after waiting the full 11s; streaming mode (snapshot=False)
+        # got modelGreeks within ~4s. Streaming is also what every OTHER
+        # reqMktData call site in this codebase already uses (reconciler,
+        # executor, orchestrator, market_data) — this was the one outlier.
+        # Error 10091 ("additional subscription... delayed available") still
+        # fires per-contract on this account regardless of snapshot/type —
+        # confirmed benign for reqMktData (ib_insync's own error handler only
+        # blocks one-shot future requests / orders, neither of which this
+        # is); not a symptom to chase here.
         md_batch_size = 25
-        md_wait_s = 2.0
+        md_wait_s = 3.0
         for i in range(0, len(option_contracts), batch_size):
             batch = option_contracts[i : i + batch_size]
             try:
@@ -683,8 +696,9 @@ class OptionsChainService:
                     requested: list = []
                     try:
                         for q in md_batch:
-                            # Request market data (snapshot)
-                            self._ibkr.ib.reqMktData(q, "", True, False)
+                            # Request market data (streaming, not snapshot —
+                            # see comment above).
+                            self._ibkr.ib.reqMktData(q, "", False, False)
                             requested.append(q)
 
                         await asyncio.sleep(md_wait_s)
@@ -916,6 +930,7 @@ class OptionsChainService:
         _chain_iv = _ivs[len(_ivs) // 2] if _ivs else 0.30
 
         none_greeks = 0
+        iv_solved_from_price = 0
         for contracts in (chain.calls, chain.puts):
             for c in contracts:
                 # R16: ib_insync maps IB's "not yet computed" sentinels to
@@ -929,27 +944,59 @@ class OptionsChainService:
                     c.gamma = c.gamma or 0.0
                     c.theta = c.theta or 0.0
                     c.vega = c.vega or 0.0
-                if c.delta != 0:
-                    continue  # Already has Greeks (from IBKR)
 
                 flag = "c" if c.right == "C" else "p"
-                # R16: placeholder floor — a degenerate ~1e-5 sigma must never
-                # feed the BS backfill (it pins deltas to 0/±1).
-                sigma = (
-                    c.implied_vol
-                    if c.implied_vol and c.implied_vol >= MIN_PHYSICAL_IV
-                    else _chain_iv
-                )
 
-                try:
-                    c.delta = delta(flag, S, c.strike, t, r, sigma)
-                    c.gamma = gamma(flag, S, c.strike, t, r, sigma)
-                    c.theta = theta(flag, S, c.strike, t, r, sigma) / 365.0  # Daily theta
-                    c.vega = vega(flag, S, c.strike, t, r, sigma) / 100.0  # Per 1% vol move
-                except Exception:
-                    pass  # Leave as 0 if calculation fails
+                # 2026-09-14: IBKR reports each Greek field independently on
+                # the wire (confirmed from ib_insync's own tickOptionComputation
+                # handler — impliedVol's sentinel is -1, delta's is -2, sent
+                # separately), so a tick can carry a real delta while
+                # impliedVol is still missing. The old `if c.delta != 0:
+                # continue` gate above this block skipped IV entirely
+                # whenever delta happened to be populated — implied_vol could
+                # stay 0.0 forever even with a real market price sitting
+                # right there. Also: this function imported
+                # implied_volatility specifically to solve IV from a real
+                # price but never called it — chain-median was used only as
+                # scratch sigma for delta/gamma/theta/vega, never written
+                # back onto the contract's own implied_vol. Now: solve the
+                # genuine contract-specific IV from its own quote when one
+                # exists (the community-recommended approach — calibrate
+                # against IBKR's real prices rather than trust its half-
+                # populated derived Greeks); fall back to the chain median,
+                # written onto implied_vol either way, not just used as
+                # scratch input.
+                if not c.implied_vol or c.implied_vol < MIN_PHYSICAL_IV:
+                    if c.has_two_sided_quote:
+                        try:
+                            c.implied_vol = implied_volatility(
+                                c.mid, S, c.strike, t, r, flag)
+                            iv_solved_from_price += 1
+                        except Exception:
+                            c.implied_vol = _chain_iv
+                    else:
+                        c.implied_vol = _chain_iv
+
+                if c.delta == 0 or c.gamma == 0 or c.theta == 0 or c.vega == 0:
+                    sigma = c.implied_vol
+                    try:
+                        if c.delta == 0:
+                            c.delta = delta(flag, S, c.strike, t, r, sigma)
+                        if c.gamma == 0:
+                            c.gamma = gamma(flag, S, c.strike, t, r, sigma)
+                        if c.theta == 0:
+                            c.theta = theta(flag, S, c.strike, t, r, sigma) / 365.0  # Daily theta
+                        if c.vega == 0:
+                            c.vega = vega(flag, S, c.strike, t, r, sigma) / 100.0  # Per 1% vol move
+                    except Exception:
+                        pass  # Leave as 0 if calculation fails
 
         if none_greeks:
             log.debug(
                 "greeks_none_coerced", symbol=chain.symbol, contracts=none_greeks
+            )
+        if iv_solved_from_price:
+            log.debug(
+                "iv_solved_from_price", symbol=chain.symbol,
+                contracts=iv_solved_from_price,
             )

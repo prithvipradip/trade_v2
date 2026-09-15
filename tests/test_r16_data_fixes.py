@@ -232,8 +232,11 @@ class TestPlaceholderIVFilter:
 
     def test_bs_backfill_never_uses_placeholder_sigma(self):
         pytest.importorskip("py_vollib")
-        # delta==0 contract with placeholder IV: sigma must come from the
-        # chain median (0.20), not 1e-5 (which pins delta to ~0).
+        # delta==0 contract with placeholder IV: sigma must never be the
+        # degenerate 1e-5 (which pins delta to ~0) — 2026-09-14: now solved
+        # from the contract's own real quote (bid=1.0/ask=1.2 from the
+        # _contract default) rather than the chain median, since a real
+        # two-sided market is available; either source clears the floor.
         bad = _contract(105.0, "C", iv=1e-5, delta=0.0)
         chain = _chain(
             calls=[_contract(95.0, "C", iv=0.20), bad],
@@ -257,8 +260,12 @@ class TestNoneGreeksGuard:
             puts=[_contract(100.0, "P", iv=0.20)],
         )
         _svc()._calculate_greeks(chain)  # must not raise
-        assert bad.implied_vol == 0.0  # coerced to missing
-        assert bad.delta != 0.0  # BS backfill ran with the chain median
+        # 2026-09-14: implied_vol is now actually corrected (solved from the
+        # contract's own real quote, bid=1.0/ask=1.2 from the _contract
+        # default) rather than permanently left at 0.0 — see the FIFTH
+        # FINDING dead-import fix.
+        assert bad.implied_vol > 0
+        assert bad.delta != 0.0  # BS backfill ran
 
     def test_calculate_greeks_survives_none_delta(self):
         pytest.importorskip("py_vollib")
@@ -266,6 +273,39 @@ class TestNoneGreeksGuard:
         chain = _chain(calls=[_contract(95.0, "C", iv=0.20)], puts=[bad])
         _svc()._calculate_greeks(chain)  # must not raise
         assert bad.delta is not None and bad.delta < 0  # put delta backfilled
+
+    def test_delta_present_but_iv_missing_still_solves_iv(self):
+        """2026-09-14 FIFTH FINDING: live-observed pattern — IBKR delivers a
+        real delta while impliedVol is still its own '-1 not computed'
+        sentinel (independent per-field sentinels, confirmed from
+        ib_insync's tickOptionComputation handler). The old `if c.delta !=
+        0: continue` gate skipped IV entirely whenever delta was already
+        populated, leaving implied_vol stuck at 0.0 forever despite a real
+        quote being available to solve it from."""
+        pytest.importorskip("py_vollib")
+        real_delta = 0.42  # as if genuinely reported by IBKR
+        bad = _contract(100.0, "C", iv=None, delta=real_delta)
+        chain = _chain(
+            calls=[bad, _contract(95.0, "C", iv=0.20)],
+            puts=[_contract(100.0, "P", iv=0.20)],
+        )
+        _svc()._calculate_greeks(chain)
+        assert bad.implied_vol > 0, "IV must be solved even when delta already arrived"
+        assert bad.delta == real_delta, "a real IBKR delta must never be overwritten"
+
+    def test_iv_missing_no_quote_falls_back_to_chain_median_and_persists(self):
+        """No two-sided quote to solve IV from -> chain median, but (unlike
+        before this fix) actually WRITTEN onto implied_vol, not just used as
+        scratch sigma for the delta/gamma/theta/vega backfill."""
+        pytest.importorskip("py_vollib")
+        bad = _contract(100.0, "C", iv=None, delta=0.0, bid=0.0, ask=0.0)
+        chain = _chain(
+            calls=[bad, _contract(95.0, "C", iv=0.20)],
+            puts=[_contract(100.0, "P", iv=0.20)],
+        )
+        _svc()._calculate_greeks(chain)
+        assert bad.implied_vol == pytest.approx(0.20)  # the chain median
+        assert bad.delta != 0.0  # backfilled using that median as sigma
 
     def test_filter_by_delta_skips_none_delta(self):
         # Pre-R16: abs(None) TypeError aborted the symbol's scan.
@@ -306,6 +346,7 @@ def _make_md_service(model_greeks="default", ticker_raises=False):
     class _FakeIB:
         def __init__(self):
             self.md_reqs = []
+            self.md_req_args = []
             self.md_cancels = []
 
         async def qualifyContractsAsync(self, *batch):
@@ -314,8 +355,9 @@ def _make_md_service(model_greeks="default", ticker_raises=False):
                 for i, c in enumerate(batch)
             ]
 
-        def reqMktData(self, q, *_a):
+        def reqMktData(self, q, *args):
             self.md_reqs.append(q)
+            self.md_req_args.append(args)  # (genericTickList, snapshot, regulatorySnapshot)
 
         def cancelMktData(self, q):
             self.md_cancels.append(q)
@@ -368,6 +410,21 @@ class TestSnapshotCancelPairing:
         )
         assert chain is None  # harvest failed
         assert len(fake_ib.md_cancels) == len(fake_ib.md_reqs) > 0
+
+    async def test_requests_are_streaming_not_snapshot(self):
+        """R16's modelGreeks gap: snapshot=True's ~11s server-side collection
+        window never fit inside the 2-3s per-batch wait, so modelGreeks
+        silently never arrived. Confirmed live 2026-09-14 (isolated clientId
+        test against the real account): streaming delivers modelGreeks
+        within ~4s where snapshot didn't even at 11s."""
+        svc, fake_ib = _make_md_service()
+        chain = await svc._fetch_ibkr_expiry(
+            "SPY", MagicMock(), date.today() + timedelta(days=20), [100.0], 100.0
+        )
+        assert chain is not None
+        assert fake_ib.md_req_args  # at least one request happened
+        for args in fake_ib.md_req_args:
+            assert args[1] is False, "options quotes must stream, not snapshot"
 
 
 # ---------------------------------------------------------------------------

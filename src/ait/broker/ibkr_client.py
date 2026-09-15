@@ -362,10 +362,15 @@ class IBKRClient:
                              detail="Gateway session is READ-ONLY — orders rejected (Error 321). "
                                     "Restart IB Gateway and log in as IB API to clear.")
                 return False
-            if status in ("PreSubmitted", "Submitted", "Filled", "Cancelled"):
-                log.info("trading_verified", status=status)
-                return True
-            return True  # unknown/transient — don't false-alarm
+            # read_only already did the real detection (scanning trade.log
+            # text), independent of status — so any status here (known or
+            # not) is a real, non-blocked response. Previously only logged
+            # for a fixed status tuple that didn't include this
+            # self-cancelling probe's actual statuses (PendingSubmit /
+            # PendingCancel / ApiCancelled), so a fully successful probe
+            # never logged its own confirmation.
+            log.info("trading_verified", status=status)
+            return True
         except Exception as e:  # noqa: BLE001
             log.warning("verify_can_trade_error", error=str(e))
             return True  # probe failed for another reason; don't block
