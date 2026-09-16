@@ -27,6 +27,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from ait.utils.process import scan_pids
+from ait.utils.time import ET, now_et
 
 # Project root
 ROOT = Path(__file__).resolve().parents[3]
@@ -1862,6 +1863,20 @@ def _backtest_catchup_run_at(now: datetime) -> datetime:
     return run_at
 
 
+def _retrain_catchup_run_at(now: datetime) -> datetime:
+    """W23: mirrors _backtest_catchup_run_at's shape for the same reason —
+    a small, independently-testable unit rather than an inline expression at
+    the call site. `now` MUST be aware ET here: this value becomes the
+    scheduler's run_date directly, and W23 probed that a naive datetime
+    passed through the "date" alias is mislabeled with the scheduler's own
+    offset rather than converted (confirmed live: retrain_catchup registered
+    "2026-09-14 21:31:45 EDT", actually ran 2026-09-15 03:31:45 -- 6h late,
+    to the second). No market-hours dodge needed here (unlike the backtest
+    catch-up) -- the model-reload restart this unblocks already defers
+    until market close on its own."""
+    return now + timedelta(minutes=2)
+
+
 def _check_telegram_dead():
     """R16 #15: the bot writes data/TELEGRAM_DEAD after 5 consecutive dropped
     sends — and until now NOTHING read it (the writer's own comment claimed
@@ -1945,20 +1960,20 @@ def main():
 
     # Daily model retrain: 7:30 AM ET on trading days (Mon-Fri)
     scheduler.add_job(retrain_models,
-                      CronTrigger(day_of_week="mon-fri", hour=7, minute=30),
+                      CronTrigger(day_of_week="mon-fri", hour=7, minute=30, timezone=ET),
                       id="daily_retrain")
 
     # Daily performance report: 4:30 PM ET
-    scheduler.add_job(backup_state_db, CronTrigger(day_of_week="mon-fri", hour=17, minute=0),
+    scheduler.add_job(backup_state_db, CronTrigger(day_of_week="mon-fri", hour=17, minute=0, timezone=ET),
                       id="db_backup", name="State DB backup")
     scheduler.add_job(weekly_scorecard,
-                      CronTrigger(day_of_week="fri", hour=16, minute=10),
+                      CronTrigger(day_of_week="fri", hour=16, minute=10, timezone=ET),
                       id="weekly_scorecard")
     scheduler.add_job(daily_digest,
-                      CronTrigger(day_of_week="mon-fri", hour=9, minute=35),
+                      CronTrigger(day_of_week="mon-fri", hour=9, minute=35, timezone=ET),
                       id="digest_am")
     scheduler.add_job(daily_digest,
-                      CronTrigger(day_of_week="mon-fri", hour=16, minute=5),
+                      CronTrigger(day_of_week="mon-fri", hour=16, minute=5, timezone=ET),
                       id="digest_pm")
     # R6: catch-up backup at supervisor start when the newest snapshot is
     # >24h old — a machine-down day silently skips the 17:00 slot (observed
@@ -1991,7 +2006,7 @@ def main():
         if (_now_c.weekday() < 5 and (_now_c.hour, _now_c.minute) >= (7, 35)
                 and not list(LOGS_DIR.glob(
                     f"retrain_{_now_c.strftime('%Y%m%d')}_*.log"))):
-            _rt_at = datetime.now() + timedelta(minutes=2)
+            _rt_at = _retrain_catchup_run_at(_now_c)  # _now_c is already aware ET
             scheduler.add_job(retrain_models, "date", run_date=_rt_at,
                               id="retrain_catchup",
                               name="Daily retrain catch-up")
@@ -2012,7 +2027,7 @@ def main():
     except Exception as _e:  # noqa: BLE001
         _log("warning", "startup_digest_check_failed", error=str(_e))
     scheduler.add_job(daily_report,
-                      CronTrigger(day_of_week="mon-fri", hour=16, minute=30),
+                      CronTrigger(day_of_week="mon-fri", hour=16, minute=30, timezone=ET),
                       id="daily_report")
     # R16 #59: same missed-slot catch-up for the 16:30 report (a boot after
     # 16:30 skips the cron entirely — in-memory jobstore, grace only applies
@@ -2027,7 +2042,7 @@ def main():
 
     # Weekly deep backtest: Sunday 8 PM ET
     scheduler.add_job(run_backtest,
-                      CronTrigger(day_of_week="sun", hour=20, minute=0),
+                      CronTrigger(day_of_week="sun", hour=20, minute=0, timezone=ET),
                       id="weekly_backtest")
     # R16 #59: weekly-backtest catch-up — fired ONCE since March (Apr 26);
     # the box is routinely off Sunday 20:00. Unlike the report, this one is
@@ -2039,7 +2054,16 @@ def main():
         # CODE is still right: both sides of the comparison are naive local.
         _now_bt = datetime.now()
         if _backtest_catchup_due(_now_bt):
-            _bt_at = _backtest_catchup_run_at(_now_bt)
+            # W23: a SECOND, deliberately DIFFERENT clock for the run-at
+            # computation — _backtest_catchup_run_at's market-hours check
+            # needs real ET hours (a naive host-local hour compared against
+            # 9:15/16:30 ET thresholds is checking the wrong clock), and its
+            # return value becomes the scheduler's run_date directly, which
+            # W23 probed must be aware or apscheduler mislabels it. Do not
+            # "simplify" this back to reusing _now_bt — the due-check above
+            # and the run-at computation below need genuinely different
+            # clocks, on purpose.
+            _bt_at = _backtest_catchup_run_at(now_et())
             scheduler.add_job(run_backtest, "date", run_date=_bt_at,
                               id="backtest_catchup",
                               name="Weekly backtest catch-up")
@@ -2050,13 +2074,13 @@ def main():
 
     # Monthly log cleanup: 1st of month at midnight
     scheduler.add_job(cleanup_old_logs,
-                      CronTrigger(day=1, hour=0, minute=0),
+                      CronTrigger(day=1, hour=0, minute=0, timezone=ET),
                       id="monthly_cleanup")
     # R16: DAILY size cap for the append-only logs (keeper/dashboard/weblog/
     # orchestrator). Monthly was far too slow for a keeper.log that can gain
     # 144k lines in one day when the .bat pacing collapses.
     scheduler.add_job(rotate_oversized_logs,
-                      CronTrigger(hour=0, minute=5),
+                      CronTrigger(hour=0, minute=5, timezone=ET),
                       id="daily_log_rotation")
 
     _log("info", "scheduler_ready", jobs=len(scheduler.get_jobs()))
