@@ -4007,3 +4007,154 @@ fail-open sites are next after that, with one flag: #2 (reconciler.py, the HALT_
 freeze-file claim) needs RE-VERIFICATION before probing — W22 rewrote that entire code path
 today, so the original finding may be stale, moot, or still real in a different form; not
 re-checked yet.
+
+---
+
+## REGISTER TRIAGE BATCH 1 — the 20 live_money findings, re-verified against today's source
+
+The last major unclaimed item, deferred through W17, W18, W19, W20 and effectively every wave
+since. Pure triage: no source file was modified. The register lives in
+`reports/register_triage_20260916.md` (a living document, appended per batch) rather than here,
+because a 206-row table does not belong in a 4,000-line ledger.
+
+[1] SCOPE, MEASURED BEFORE PLANNING rather than assumed. Universe = **206**: R24's own 109
+    standing findings + 78 carried-over OPEN from the prior register + 19 R24-marked PARTIAL.
+    HONEST COUNT DISCREPANCY, stated rather than absorbed: R24's header says it triaged "123
+    prior findings" but its triage section holds **126** rows (78 OPEN + 19 PARTIAL + 28 FIXED
+    + 1 OBSOLETE). Three rows unaccounted for. NOT resolved; carried forward.
+
+[2] WHY BATCHED, and this is the number that shaped the whole approach. Only 22 of 109 R24
+    findings are mentioned anywhere in PLAN.md after R24 was written; ZERO of the 78 carried-over
+    ones are; only 17 of 109 carry a fix-marker comment in `src/` or `tests/`. So **165 of 187
+    have no trace at all** across ten days and ~18 waves. There is no grep shortcut — the
+    fix-marker convention is real but is a LOWER bound on what's closed, never an upper one.
+    Closing 206 in one pass would either burn many sessions with nothing durable in between or
+    silently degrade into skimming, which is worse than not doing it: a wrongly-closed finding
+    is a live defect marked safe.
+
+[3] THE METHOD ASYMMETRY, which is what makes the output trustworthy. Marking OPEN is cheap —
+    re-read the cited `Where:` and see whether the claim still holds. Marking CLOSED must be
+    expensive: the fix in code AND a test that pins it. A wrongly-OPEN finding costs a re-check;
+    a wrongly-CLOSED one retires a real defect in silence.
+
+[4] RESULTS — ALL 20 ASSESSED: 12 CLOSED, 2 CLOSED (untested), 6 OPEN.
+    CLOSED (12): concurrency-01, concurrency-03, regress-live-01, regress-live-04, pnl-money-01
+    (all W14, each with a dedicated test section); pnl-money-02 (W11 — the drain path now calls
+    the same `_true_up_commission` at orchestrator.py:729/:813 that the finding said it lacked);
+    time-calendar-01 (W15 primary path uses the real NYSE calendar; W20c replaced the fallback's
+    `weekday() < 5` heuristic — the exact claimed defect — with `trading = False`, erring toward
+    MORE blocking, so both directions of the claim are gone); time-calendar-02 and the overlapping
+    regress-live-07 (the bare `except Exception: pass` is gone; the caller now logs
+    `post_stop_cooldown_check_failed_fail_closed` at ERROR and fails CLOSED — one fix, and it
+    closes both claimed failure surfaces: the calendar raise and the sqlite busy window);
+    logic-exit-risk-01 and logic-exit-risk-02 (W7 — the `entry_credit + 0.25*wing_width` term that
+    shipped SPY as BUY LMT 14.04 against a 1.40 mark is gone from BOTH the fallback and the quoted
+    anchor, replaced by `_exit_price_ceiling` anchored to current worth; the broker band is now
+    parsed and honoured rather than treated as a cancel. `tests/test_w7_exit_pricing.py` replays
+    the real incident numbers and the VERBATIM IBKR warning text, and carries a
+    `TestTheIncidentCannotRecur` class); ops-substrate-01 (W13, which has its own ledger entry at
+    PLAN.md:1977 — the bot-down branch now calls `_maybe_recover_gateway` (master.py:882) under a
+    comment naming the finding, so the absorbing state is gone; three test files pin it).
+    CLOSED (untested) (2): concurrency-02 and its true duplicate regress-live-02. A NEW status added
+    mid-batch because the binary didn't fit reality: `_claimed = True` no longer exists as
+    executable code anywhere in `src/` (the sole remaining occurrence is inside a comment
+    describing the old behavior), so the defect is structurally unreachable — a stronger
+    guarantee than a test — but NO test exercises the claim-raises path, so an edit could
+    reintroduce it unnoticed. Recorded as a known regression risk, not as a fix task.
+    OPEN (2), both re-read and confirmed still true today:
+      - data-integrity-07 — `stats.trades_taken += 1` still fires on every order PLACED
+        (orchestrator.py:2695) with NO decrement anywhere; the symbol appears at only four sites
+        and has ZERO references in reconciler.py, so the stale-pending sweep still cannot return
+        the budget. The intraday entry budget remains consumable by phantom trades.
+      - regress-live-06 — `_credit_floors_hold` (executor.py:1411) is invoked ONLY at reprice
+        (:1390). A grep across the entire `_execute_multi_leg` initial-placement path returns no
+        floor check at all, exactly as claimed.
+      - params-trading-01 — THE SHARPEST FINDING IN THE BATCH, all three sub-claims intact, and
+        one of them deserves to be read on its own: `manager.py:615` is still
+        `final_contracts = max(1, int(final_contracts * haircut))`. When the sizer has already
+        returned 0 contracts and `correlated_count > 0`, that evaluates to `max(1, 0) = 1` and the
+        `if final_contracts <= 0` refusal on the very next line never fires. A FAIL-CLOSED
+        0-viability verdict is silently converted into a live 1-contract position — and only when
+        a correlated position is already open, i.e. exactly when it is least wanted. Also intact:
+        the sizer's hard cap at position_sizer.py:166, and the fact that
+        _launch_size_coherence_check never reads max_position_pct at all.
+      - logic-entry-01 — the same self-test, failing the same operator. It still models
+        `min_width = max(1.0, min_credit / 0.45)` (the $1.56 wing the real builder never
+        constructs) and still never executes IronCondor.generate_signals, so it can still report
+        COHERENT for budgets that deterministically emit zero signals.
+      - logic-exit-risk-03 — primary claim stands: the cooldown query is still `WHERE symbol=?`
+        (orchestrator.py:2244) with no cluster scoping, so a SPY touch stop still leaves QQQ and
+        IWM free to enter the same move. PARTIAL CREDIT recorded precisely: its secondary half
+        (the adjacent silent fail-open) is CLOSED by the same fix that closed time-calendar-02.
+      - docs-policy-04 — OPEN IN A CHANGED FORM, the most interesting result of the batch. The
+        RUNBOOK (:41-42) still tells the operator to "stop the bot processes" and still names no
+        supervisor. `data/HALT` first genuinely fixes the ENTRY side, but the claimed hazard is
+        the EXIT engine and startup reconcile returning mid-close, and HALT by the RUNBOOK's own
+        wording does not stop those ("exits keep managing"). What MOVED is the mechanism: W16b
+        retired the POSIX keeper and the host is macOS, so the cited `keeper_ait.bat` is inert —
+        but master.py IS the supervisor now and `combined_health_check` runs every 2 MINUTES
+        (master.py:1959) calling `bot.health_check()` -> `self.start()`. Same hazard, ≤2-minute
+        window, different component than the finding names — and RUNBOOK:93 still offers
+        `keeper_ait.bat` as a restart path, so the doc is now wrong in a second way too.
+
+[5] VERIFICATION — spot-checked in the DANGEROUS direction, per the wave plan. For three CLOSED
+    rows the bar was not "a test exists" but "the cited test would FAIL against the pre-fix
+    behavior." All three turned out to be built as negative controls with the defect named in
+    the assertion itself: `assert n == 1, "claim destroyed the obligation (the pre-W14 defect)"`;
+    `assert ... _consecutive_losses == 2, "streak was reset"`; and
+    `assert recovered._consecutive_losses == 2, "the streak was destroyed"` sitting directly
+    below `crashed._persist()  # pre-W14: wrote zeros`. W14 file: 15 passed.
+    Count reconciliation: 20 batch-1 rows + 186 untouched = 206 nominal IDs; within the batch,
+    20 assessed = 12 + 2 + 6, none deferred. The EFFECTIVE universe is 205 distinct defects
+    (concurrency-02/regress-live-02 being one defect under two IDs), and more such pairs are
+    likely among the untouched 186.
+
+[6] FINDING THAT CHANGES THE UNIVERSE: **the register contains duplicates** — and a SELF-CORRECTION
+    made before this entry was committed, recorded because the error is instructive.
+    I first wrote that this batch held TWO duplicate pairs. Re-reading both pairs in full against
+    R24 showed only ONE is real: concurrency-02 / regress-live-02 share the same `Where:`
+    (orchestrator.py:739-742, `_claimed = True`), the same claim, and the same probe shape — a true
+    duplicate under two IDs. time-calendar-02 / regress-live-07 are NOT: they share the caller
+    (the bare `except Exception: pass` at :2345-2352) and one root fix closes both, but they claim
+    DIFFERENT failure surfaces — regress-live-07 the calendar-library raise plus the
+    cache-only-on-success recurrence; time-calendar-02 the calendar raise AND the sqlite
+    busy/locked window AND a malformed exit_time. R24's own interaction analysis treats them as
+    distinct protections. Overlapping, not duplicate.
+    The lesson generalizes and is worth more than the count: the method asymmetry in [3] was
+    written to guard against over-calling CLOSED, but "duplicate" is the same hazard wearing
+    different clothes — collapsing two findings into one retires a claim nobody re-checked. A
+    dedup pass is still worth doing, and it must compare `Where:` AND `Claim:` in full, never a
+    shared code location. The CLOSED status of all four IDs is unaffected: it rested on the code
+    and the tests, not on the duplicate call.
+    SECOND FINDING, with its own caveat: 11 of 13 assessed came back CLOSED. That rate does NOT
+    generalize — this batch is the highest-severity slice, which is exactly where the fix waves
+    concentrated. Expect the research_validity and cosmetic tiers to close far lower.
+
+STATE AT HANDOFF: no source modified; `reports/register_triage_20260916.md` added.
+Suite: 1811 passed / 43 skipped / 1 known local-.env failure — byte-for-byte the W23 baseline,
+which is the point: this wave read code and wrote a document, and the unchanged suite proves it.
+Cited-test spot-runs: test_w14_booking_exactly_once 15 passed; test_w7_exit_pricing +
+test_w13_gateway_recovery 34 passed.
+NEXT, chosen from the re-ranked tail rather than assumed, per [C4]. Batch 1 did its job: it
+turned a 20-item unknown into SIX confirmed live-money defects, so the next move is a FIX wave,
+not more triage.
+  (a) W25 — THE GO-LIVE SIZING WAVE, and this outranks everything else because the operator is
+      pre-funding. params-trading-01 + logic-entry-01 are ONE wave, not two: both fail at
+      `_launch_size_coherence_check`, the self-test the go-live recipe explicitly tells the
+      operator to trust before funding. Ship manager.py:615 `max(1,...)` -> `max(0,...)` (or skip
+      the haircut when size.contracts == 0), teach the coherence check to read max_position_pct,
+      and make it exercise the REAL builder instead of the `min_credit/0.45` model wing.
+      Non-negotiable per this session's standing rule: a NEGATIVE CONTROL proving the pre-fix
+      code really did turn a 0-contract verdict into 1, and an executing test at the documented
+      $2.1k/7% recipe.
+  (b) Then data-integrity-07 (bounded: give the budget back in the stale-pending sweep) and
+      logic-exit-risk-03 (scope the cooldown to SECTOR_GROUPS, one authority shared with
+      correlation.py). regress-live-06 is the most delicate of the six — it touches
+      initial-placement pricing on the live path — so it wants its own wave with a live probe.
+  (c) docs-policy-04 is a doc fix but NOT a trivial one: the RUNBOOK must name master.py's
+      2-minute health_check as the thing to stop, and drop the stale keeper_ait.bat path. Cheap,
+      and it protects a manual close.
+  (d) Batch 2 of the triage = the next tier down (the remaining live_path findings), plus the
+      dedup pass from [6]. Now genuinely lower priority than (a)-(c).
+  Still open from before, unchanged: the 10 remaining batch-3 fail-open sites, with #2
+  (reconciler.py / HALT_UNTRACKED) still needing re-verification because W22 rewrote that path.
