@@ -3662,3 +3662,93 @@ Suite: 1708 passed / 43 skipped / 1 known local-.env failure.
 NEXT: W22 (untracked-position mechanism — inbound Telegram, ask-once, declared-manual
 handling) is next in line. W23 (scheduler CronTrigger timezone class) and the register triage
 remain registered, not started.
+
+## 2026-09-16 - W22 EXECUTED + DEPLOYED: declared manual positions, proven live on the real legs
+Built, tested, deployed mid-day (operator-authorized), and verified against the operator's
+OWN two real untracked positions rather than a synthetic one — both prompts are sitting in
+their Telegram right now with tappable buttons.
+
+[1] THE MECHANISM. `ait/notifications/telegram.py` gains four HTTP primitives
+    (send_with_buttons, edit_message, answer_callback, get_updates), same lazy-aiohttp-import
+    style as the existing send(). New `ait/execution/manual_positions.py` owns the business
+    logic — declare/reject/query against the existing bot_state KV table (no schema change,
+    same convention as digest markers), the update dispatch, the long-poll loop, and the
+    "confirms when it disappears" cleanup. Runs as its own asyncio task in main.py, decoupled
+    from the trading loop's own shutdown semantics.
+
+[2] REPLY UX, exactly as the operator chose: tappable inline-keyboard buttons, PLUS a
+    plain-text reply-to-the-prompt-message as an explicit correction path at any time — their
+    own follow-up question ("if I select the wrong choice, will I be able to correct it") is
+    what shaped this. Both directions tested (button-then-text-fix, text-then-button-fix), and
+    the edited message always shows whichever answer is CURRENT, not the first one.
+
+[3] THREE DEFECTS REGISTERED LAST SESSION, CLOSED — and now LIVE-CONFIRMED, not just tested:
+    (a) only the LAST untracked position reached HALT_UNTRACKED (per-iteration write_text
+        clobbered itself). Today's real halt file, post-deploy:
+          QQQ:712.0:C:2026-10-16
+          QQQ:712.0:C:2026-09-18
+        BOTH legs, in one file. The exact scenario that exposed this bug twice last session
+        is now the exact scenario proving it fixed.
+    (b)/(c) the sighting debounce (`_untracked_sightings`) was an in-memory dict, reset on
+        every restart. Today's real bot_state: first sighting 11:44:11 ET (this deploy's
+        first restart), second sighting 12:06:07 ET (the SECOND restart, a fresh process) —
+        the ~22-minute gap was correctly measured ACROSS a real restart, which is precisely
+        what the old code could never do.
+
+[4] A FOURTH DEFECT, FOUND BY THIS WAVE'S OWN TEST SUITE, NOT REGISTERED BEFOREHAND — fixed
+    before deploy, not after. The "write the halt file as a complete snapshot of this pass"
+    design, combined with the PRE-EXISTING debounce's gap-since-the-LAST-call semantics
+    (which W22 preserved as-is, not introduced), meant an ALREADY-CONFIRMED frozen position
+    could transiently UN-FREEZE for a cycle if two reconcile() calls happened to land within
+    the 2-minute debounce window — record_sighting resets last_seen on every call, deferred
+    or not. Fixed with a reconciler-owned `is_confirmed`/`mark_confirmed` marker, deliberately
+    independent of whether Telegram is configured or a send succeeds (INST-3 must not depend
+    on that). A dedicated regression test proves two reconciles seconds apart after
+    confirmation stay frozen. Caught by testing, before it could ever reach production.
+
+[5] A FIFTH THING, ALSO CAUGHT BY THE SUITE: `record_sighting` crashed
+    (`datetime.fromisoformat` on a non-string) against several PRE-EXISTING tests that
+    construct `PositionReconciler` via `__new__` (bypassing `__init__`) with a bare
+    `MagicMock()` state — a recurring, deliberate pattern in this codebase's own test suite
+    (test_pnl_accounting.py, test_r15_review_fixes.py, others). Hardened to match
+    `StateManager.get_state`'s actual contract (always returns str) rather than trusting a
+    test double that doesn't honor it. 11 tests across those files were failing before this
+    fix; all pass after.
+
+[6] TESTS. 63 across three new files: the two interaction paths (buttons, text) as
+    first-class SEPARATE cases per the operator's own request, the correction scenario in
+    both directions, ambiguous/unambiguous bare replies, offset persistence across a
+    simulated restart, the Telegram HTTP primitives against a faked aiohttp
+    (sys.modules-level — telegram.py imports aiohttp lazily per-method, so there is no
+    module-level attribute to monkeypatch the normal way), and the reconciler integration
+    driven through the REAL reconcile() with the existing tests/fakes.py doubles (not a
+    reimplementation of the logic under test).
+    SUITE HAD A FALSE ALARM WORTH RECORDING: the first full run showed 2 failures in files
+    never touched by this wave (test_r16_round2_fixes.py, test_r17_dormant_strategy_fixes.py).
+    Isolated, they passed; combined with all three new W22 files, they passed; combined with
+    each other's full files, they passed. A full rerun showed only the one known baseline
+    failure. Flaky, not a regression — confirmed by reproduction attempts, not assumed.
+    Final: 1757 passed / 43 skipped / 1 known local-.env failure (unchanged since W16).
+
+[7] DEPLOY, mid-day, operator-authorized. Full supervisor restart (touches main.py's task
+    wiring). Verified the RUNNING code, not disk: imported the live modules and confirmed the
+    specific new functions/gates are present in the executing source. TWO restarts total —
+    the first to deploy (produced the real first sighting on the operator's own two legs,
+    11:44 ET), the second three minutes later at the operator's own choice specifically to
+    prove the restart-survives-the-debounce fix live rather than waiting for a natural
+    post-market reconcile (produced the real freeze + real Telegram prompts, message_ids 104
+    and 105, both delivered successfully). This is the strongest verification this session
+    has done: not a synthetic test position, not a mocked broker — the operator's actual
+    account, actual Gateway connection, actual Telegram bot.
+
+[8] WHAT'S LEFT, DELIBERATELY NOT DONE HERE: the operator has not yet tapped either button.
+    That is their decision, not mine — I did not simulate a reply on their behalf. Once
+    answered, `is_declared` will read it directly from bot_state; no further deploy needed.
+
+STATE AT HANDOFF: HEAD (this entry's commit) on branch feature/event-straddle, NOT PUSHED.
+Live bot: supervisor 44522 / bot (post-restart), stable, zero errors. Both real untracked
+legs frozen and prompted; HALT_UNTRACKED correctly names both.
+Suite: 1757 passed / 43 skipped / 1 known local-.env failure.
+NEXT: W23 (scheduler CronTrigger timezone class — a DIFFERENT bug family from W24's race,
+still unfixed: 9 host-local triggers, 2 naive catch-up run_dates) and the register triage
+(109 R24 + 78 carried, deferred five waves now) remain the open backlog.
