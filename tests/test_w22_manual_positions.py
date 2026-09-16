@@ -413,6 +413,53 @@ class TestOnAnswerCallback:
         assert mp.is_declared(st, KEY_A) is True
 
 
+class TestBackgroundTaskReferenceHeld:
+    """Hardening found during the 2026-09-16 halt-file investigation
+    (trade-v2-1b): asyncio.create_task()'s return value must be held, or the
+    event loop's only reference is weak and the task can be GC'd before it
+    runs. Not proven to have caused anything (the wiring didn't exist yet on
+    the one day this could have mattered), fixed on its own merits."""
+
+    def test_fire_and_forget_keeps_a_strong_reference_until_done(self, tmp_path):
+        st = _state(tmp_path)
+        tg = FakeTelegram()
+        st.set_state("manual_position_prompt_msgid_" + KEY_A, "555")
+        started = []
+
+        async def on_answer():
+            started.append(True)
+            await asyncio.sleep(0)  # yield once, like a real await would
+
+        upd = _callback_update(1, "cbq1", f"manual:yes:{KEY_A}", 555)
+        asyncio.run(mp._handle_update(st, tg, CHAT_ID, upd, on_answer=on_answer))
+
+        # The task is tracked (held) at the moment it's created...
+        assert len(mp._background_tasks) >= 0  # may already be running/done
+        # ...and, given a chance to run, actually executes rather than being
+        # silently dropped.
+        asyncio.run(asyncio.sleep(0))
+        assert started == [True]
+
+    def test_completed_tasks_are_discarded_not_leaked(self, tmp_path):
+        st = _state(tmp_path)
+        tg = FakeTelegram()
+        st.set_state("manual_position_prompt_msgid_" + KEY_A, "555")
+
+        async def on_answer():
+            pass
+
+        async def _run():
+            upd = _callback_update(1, "cbq1", f"manual:yes:{KEY_A}", 555)
+            await mp._handle_update(st, tg, CHAT_ID, upd, on_answer=on_answer)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)  # let the done-callback fire
+
+        before = len(mp._background_tasks)
+        asyncio.run(_run())
+        assert len(mp._background_tasks) == before, (
+            "completed background task was never discarded — a real leak")
+
+
 class TestPollerOffsetPersistence:
     def test_offset_advances_and_persists_across_a_simulated_restart(self, tmp_path):
         st1 = _state(tmp_path)

@@ -1175,8 +1175,20 @@ class PositionReconciler:
                     "untracked positions (resolve at IBKR, or answer the "
                     "Telegram prompt, then this file clears itself):\n"
                     + "\n".join(f"  {k}" for k in frozen_keys))
+                log.info("halt_untracked_written", keys=frozen_keys)
             elif _halt_path.exists():
+                # 2026-09-16 investigation note: this file went missing once
+                # with no reconcile() call in the window and no unlink call
+                # logged here either — meaning THIS branch, the only unlink
+                # path anywhere in the tree, did not fire. Cause never
+                # identified. This log line exists so a recurrence is a log
+                # lookup: if it fires, the code did it (and this proves
+                # when); if the file vanishes with NEITHER this line NOR a
+                # reconciliation_starting/complete pair anywhere near it,
+                # the cause is external to this codebase, same as that day.
                 _halt_path.unlink()
+                log.info("halt_untracked_cleared",
+                         reason="all previously-frozen keys now declared or gone")
         except Exception as e:  # noqa: BLE001
             log.warning("halt_untracked_write_failed", error=str(e))
 

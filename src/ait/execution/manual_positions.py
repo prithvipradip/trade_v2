@@ -32,6 +32,8 @@ trueup_pending_<id>:
 """
 from __future__ import annotations
 
+import asyncio
+
 from ait.bot.state import StateManager
 from ait.notifications.telegram import TelegramNotifier
 from ait.utils.logging import get_logger
@@ -44,6 +46,22 @@ _MSGID_PREFIX = "manual_position_prompt_msgid_"
 _LAST_SEEN_PREFIX = "manual_position_last_seen_"
 _CONFIRMED_PREFIX = "manual_position_confirmed_"
 _OFFSET_KEY = "telegram_update_offset"
+
+# W22 hardening (trade-v2-1b, 2026-09-16): asyncio.create_task()'s return
+# value must be held somewhere, or the event loop's only reference to the
+# task is a weak one — nothing stops it being garbage-collected before it
+# ever runs, per asyncio's own documented guidance. Not proven to have
+# happened here (verified against git history: the wiring this protects
+# didn't exist yet on the one occasion it could have explained something),
+# but the risk is real and unrelated to that, so fixed on its own merits
+# rather than left as a latent footgun.
+_background_tasks: set = set()
+
+
+def _fire_and_forget(coro) -> None:
+    task = asyncio.ensure_future(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 def is_declared(state: StateManager, key: str) -> bool | None:
@@ -186,8 +204,7 @@ async def _record_and_edit(
     log.info("manual_position_answer_recorded", key=key, answer=answer,
               message_id=message_id)
     if on_answer is not None:
-        import asyncio
-        asyncio.create_task(on_answer())
+        _fire_and_forget(on_answer())
 
 
 async def _handle_update(
@@ -264,7 +281,6 @@ async def run_poller(state: StateManager, telegram: TelegramNotifier, chat_id: s
     e.g. in tests, or if reconcile_now itself is slow or fails — it never
     blocks processing the NEXT inbound update.
     """
-    import asyncio
     if not telegram.enabled:
         log.info("manual_position_poller_skipped_telegram_disabled")
         return

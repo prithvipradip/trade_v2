@@ -241,6 +241,60 @@ class TestAlreadyConfirmedNeverTransientlyUnfreezes:
             "two reconcile() calls landed within the debounce window")
 
 
+class TestHaltFileLifecycleIsLogged:
+    """Diagnostic hardening from the 2026-09-16 investigation: both halves
+    of the file's lifecycle (written / cleared) now get a dedicated log
+    line, not just the general reconciliation_complete summary — so a
+    future occurrence of that day's unexplained disappearance is a log
+    lookup instead of a multi-session investigation."""
+
+    def test_writing_the_halt_file_is_logged_with_the_keys(self, tmp_path, caplog):
+        st = _state(tmp_path)
+        ib = FakeIB()
+        ib.positions_list = [_option_position("QQQ", 712.0, "C", "20260918", -1.0)]
+        rec = _rec(st, ib)
+        asyncio.run(rec.reconcile())
+        _backdate_last_seen(st, KEY_SHORT, minutes_ago=10)
+
+        logged = []
+        import ait.execution.reconciler as recmod
+        orig = recmod.log.info
+        recmod.log.info = lambda event, **kw: (logged.append((event, kw)), orig(event, **kw))[0]
+        try:
+            asyncio.run(rec.reconcile())
+        finally:
+            recmod.log.info = orig
+
+        matches = [kw for ev, kw in logged if ev == "halt_untracked_written"]
+        assert matches, "halt_untracked_written never logged"
+        assert KEY_SHORT in matches[-1]["keys"]
+
+    def test_clearing_the_halt_file_is_logged(self, tmp_path):
+        st = _state(tmp_path)
+        ib = FakeIB()
+        ib.positions_list = [_option_position("QQQ", 712.0, "C", "20260918", -1.0)]
+        rec = _rec(st, ib)
+        asyncio.run(rec.reconcile())
+        _backdate_last_seen(st, KEY_SHORT, minutes_ago=10)
+        asyncio.run(rec.reconcile())
+        assert _halt_text(tmp_path) is not None  # frozen, file present
+
+        st.set_state(f"manual_position_answer_{KEY_SHORT}", "yes")
+
+        logged = []
+        import ait.execution.reconciler as recmod
+        orig = recmod.log.info
+        recmod.log.info = lambda event, **kw: (logged.append((event, kw)), orig(event, **kw))[0]
+        try:
+            asyncio.run(rec.reconcile())
+        finally:
+            recmod.log.info = orig
+
+        assert _halt_text(tmp_path) is None  # actually cleared
+        assert any(ev == "halt_untracked_cleared" for ev, _ in logged), (
+            "file was cleared but no diagnostic log line fired")
+
+
 class TestPromptIsSentOnFreeze:
     def test_prompt_sent_when_telegram_is_wired(self, tmp_path):
         st = _state(tmp_path)
