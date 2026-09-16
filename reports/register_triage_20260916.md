@@ -233,3 +233,47 @@ in the untouched 186; (b) the 126-vs-123 discrepancy in R24's own header is stil
 only. The full suite at the end returned **1811 passed / 43 skipped / 1 failed** — the failure
 being the known local-`.env` `test_r19_config_authority` case — which is byte-for-byte the
 baseline PLAN.md recorded at the close of W23. Nothing was touched.
+
+---
+
+## W25 ADDENDUM — registered, not fixed: the cap-grid skew that masked params-trading-01
+
+Recorded during the W25 fix wave (2026-09-16). This is a **new finding**, not a batch-1 row, and
+it is registered rather than fixed because changing either knob moves live sizing and wants its
+own wave with a backtest.
+
+**Claim.** Two knobs govern the same quantity — "how much capital may one trade put at risk" —
+and nothing ties them together:
+
+| knob | value | enforced at | measures |
+|---|---|---|---|
+| `risk.max_position_risk_pct` | 0.03 | `manager.py:512` (gate 6b) | `request.max_loss` vs NLV |
+| `positions.max_position_pct` | 0.05 | `position_sizer.py:166` | per-contract cost vs NLV |
+
+**Why it matters, and it is not the obvious reason.** The ordering `3% < 5%` is the *only* thing
+that kept params-trading-01 off the live path. Gate 6b rejects every defined-risk request before
+the sizer can return its 0-contract verdict, so the `max(1, ...)` fail-open at `manager.py:615`
+was unreachable whenever `max_loss` was set — which, for an iron condor, is always
+(`iron_condor.py:318-322` refuses to emit a structure with `max_loss <= 0`). That containment is
+**incidental**. Raise `max_position_risk_pct` above `max_position_pct`, or lower the latter, and
+the fail-open becomes live on the normal IC path with no other code change. W25 removed the
+fail-open itself, so the hazard is closed today; this entry exists so a future wave that tunes
+either knob knows what it is standing on.
+
+**Verified by execution, not by reading.** Probe drove the real `RiskManager.validate_trade` with
+the real `PositionSizer`, real `CorrelationGuard` and real `config.yaml`:
+
+- $2.1k, IC with `max_loss=165`, one correlated position open → rejected at gate 6b
+  (`position risk $165 exceeds 3% account limit $63`); the sizer's 0-verdict never reached :615.
+- $2.1k, same request with `max_loss` falsy → gate 6b skipped, sizer returns 0
+  (`single contract exceeds max_position_pct cap`), and pre-fix the result was
+  **approved=True, position_size=1, max_risk=0.0**.
+
+**Second-order defect in the same evidence, also registered:** on that approval `max_risk` came
+back as **0.0**, because `TradeValidation.max_risk` is `size.max_risk_dollars` and the 0-contract
+verdict carries zero risk. A position approved as risk-free is invisible to the aggregate
+capital-at-risk cap at `manager.py:529`. W25 pins this behaviorally (`approved => max_risk > 0`)
+but the underlying coupling — validation risk sourced from a sizer result that may not describe
+the approved size — is untouched.
+
+**Status:** OPEN (registered). Not scheduled. Do not tune either knob without reading this entry.

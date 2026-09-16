@@ -2038,34 +2038,107 @@ class TradingOrchestrator:
         to trade (or unable to survive one normal stop-out).
         """
         try:
-            budget = nlv * self._settings.risk.max_position_risk_pct
-            import os as _os_c
+            # W25 (logic-entry-01): the budget is the TIGHTEST of the two caps a
+            # trade must clear, not just one of them. gate 6b (manager.py:512)
+            # rejects on risk.max_position_risk_pct; the sizer
+            # (position_sizer.py:166) independently returns 0 contracts on
+            # positions.max_position_pct. The old check read only the first, so
+            # it could report COHERENT while the other cap bricked every entry.
+            budget_gate = nlv * self._settings.risk.max_position_risk_pct
+            budget_sizer = nlv * self._settings.positions.max_position_pct
+            budget = min(budget_gate, budget_sizer)
             min_credit = contract_float("AIT_IC_MIN_CREDIT")
             min_ratio = contract_float("AIT_IC_MIN_CREDIT_WIDTH")
-            # Minimum viable condor given the economics floors: the narrowest
-            # width whose floor credit is even possible (credit <= ~0.45x
-            # width in practice at 0.20 delta), then its max loss.
-            min_width = max(1.0, min_credit / 0.45)
+            # W25 (logic-entry-01): the minimum viable condor is now measured
+            # with the REAL width authority — IronCondor._vol_scaled_width, the
+            # same method the live builder uses — instead of the modelled
+            # `max(1.0, min_credit / 0.45)` wing ($1.56), a structure the real
+            # builder never constructs. A fresh local instance, never the shared
+            # one the selector mutates (base.py:142 — that instance is not
+            # coroutine-safe and this runs off the trading loop).
+            # The probe price is deliberately $1: it drives the vol term below
+            # the builder's own `max(2.0, ...)` floor, so the REAL method returns
+            # the NARROWEST structure it can ever construct — which is exactly
+            # what "can this account afford any condor at all?" must ask. Real
+            # market prices only widen the wing and raise the cost, so a budget
+            # that fails here fails for every chain. Not a trading value: the
+            # width, the $2 floor and the budget cap all stay owned by
+            # iron_condor.py, which is the point of calling it instead of
+            # re-deriving it here.
+            from ait.strategies.iron_condor import IronCondor as _IC
+            _probe = _IC()
+            _probe.risk_budget = budget
+            min_width = _probe._vol_scaled_width(1.0, None, None, None)
             min_viable_cost = (min_width - min_credit) * 100
-            # Typical stopped-trade loss under the 1.25x credit limit
+            # W25 (logic-entry-01, second arm): affordability is NOT viability.
+            # The budget cap can shrink the wing until the builder constructs a
+            # structure whose credit floor is unreachable — iron_condor.py:293
+            # then rejects EVERY signal at entry, and the old check, which only
+            # ever compared dollars, reported COHERENT while the bot sat unable
+            # to trade. This is the surviving piece of the old `min_credit/0.45`
+            # model: 0.45 is the practitioner credit/width ceiling at ~0.20
+            # delta. It belongs HERE, applied to the real builder's width, not
+            # used to invent a width the builder never constructs.
+            credit_ratio_at_20d = 0.45
+            achievable_credit = credit_ratio_at_20d * min_width
+            # W25 (NEW, found probing logic-entry-01): this arm was arithmetically
+            # DEAD. AIT_CREDIT_LOSS_LIMIT contract-defaults to "0" = credit stop
+            # DISABLED (runtime_env.py:85, portfolio.py:230), so typical_stop_loss
+            # was 0 and `breaker_usd < 1.5 * 0` was always False — the check could
+            # never fire the very condition it exists to catch.
+            # With the credit stop OFF, the honest bound on one trade's loss is
+            # not zero, it is the structure's DEFINED-RISK max loss: nothing else
+            # closes the position early. Assess against that instead of skipping,
+            # so the arm stays live without alerting on every healthy account.
             loss_mult = contract_float("AIT_CREDIT_LOSS_LIMIT")
-            typical_stop_loss = loss_mult * max(min_credit, min_ratio * min_width) * 100
+            if loss_mult > 0:
+                typical_stop_loss = loss_mult * max(min_credit, min_ratio * min_width) * 100
+                _stop_basis = f"{loss_mult:.2f}x credit stop"
+            else:
+                typical_stop_loss = min_viable_cost
+                _stop_basis = "defined-risk max loss (credit stop DISABLED)"
             breaker_pct = float(getattr(self._settings.risk, "max_daily_loss_pct", 0.02) or 0.02)  # R8: real field name
             breaker_usd = nlv * breaker_pct
+            max_contracts = self._settings.positions.max_contracts_per_trade
             problems = []
             if budget < min_viable_cost:
+                _binding = ("risk.max_position_risk_pct" if budget_gate <= budget_sizer
+                            else "positions.max_position_pct")
                 problems.append(
-                    f"per-trade budget ${budget:.0f} < minimum viable condor "
-                    f"~${min_viable_cost:.0f} (width ${min_width:.1f}, credit "
-                    f"floor ${min_credit:.2f}) — NO condor can pass sizing")
+                    f"per-trade budget ${budget:.0f} (binding cap: {_binding}) < "
+                    f"minimum viable condor ~${min_viable_cost:.0f} (real builder "
+                    f"width ${min_width:.2f}, credit floor ${min_credit:.2f}) — NO "
+                    f"condor can pass sizing")
+            if achievable_credit < min_credit:
+                problems.append(
+                    f"credit floor UNREACHABLE at this budget: the builder caps the "
+                    f"wing at ${min_width:.2f}, which can yield ~${achievable_credit:.2f} "
+                    f"credit against a ${min_credit:.2f} floor — every signal will be "
+                    f"rejected at iron_condor.py credit_floor, so the bot emits ZERO "
+                    f"trades. Widen the budget to ~${(min_credit / credit_ratio_at_20d - min_credit) * 100:.0f} "
+                    f"or lower AIT_IC_MIN_CREDIT")
+            if min_width > 0 and (achievable_credit / min_width) < min_ratio:
+                problems.append(
+                    f"credit/width ratio UNREACHABLE: ~{achievable_credit / min_width:.0%} "
+                    f"achievable vs {min_ratio:.0%} floor (AIT_IC_MIN_CREDIT_WIDTH) — "
+                    f"every signal rejected at credit_width_ratio")
+            # W25 (NEW, found probing logic-entry-01): this arm was arithmetically
+            # DEAD. AIT_CREDIT_LOSS_LIMIT contract-defaults to "0" = credit stop
+            # DISABLED (runtime_env.py:85, portfolio.py:230), so typical_stop_loss
+            # was 0 and `breaker_usd < 1.5 * 0` was always False — the check could
+            # never fire the very condition it exists to catch. A stop that does
+            # not exist cannot be sized: say so instead of passing silently.
             if breaker_usd < 1.5 * typical_stop_loss:
                 problems.append(
                     f"daily-loss breaker ${breaker_usd:.0f} < 1.5x one normal "
-                    f"stop-out ~${typical_stop_loss:.0f} — a single stopped "
-                    f"trade halts the whole day")
+                    f"stop-out ~${typical_stop_loss:.0f} [{_stop_basis}] — a single "
+                    f"stopped trade halts the whole day")
             log.info("launch_size_coherence",
                      nlv=round(nlv), budget=round(budget),
+                     budget_gate=round(budget_gate), budget_sizer=round(budget_sizer),
                      min_viable_ic=round(min_viable_cost),
+                     builder_width=round(min_width, 2),
+                     max_contracts_per_trade=max_contracts,
                      breaker=round(breaker_usd),
                      problems=len(problems))
             if problems:

@@ -610,7 +610,29 @@ class RiskManager:
 
         # Correlation haircut: reduce size by 30% per correlated open position,
         # capped at 70% reduction (floor at 30% of calculated size)
-        if correlated_count > 0:
+        # W25 (params-trading-01): `final_contracts > 0` is the fix, and it is load-
+        # bearing in BOTH directions.
+        #   - Pre-W25 this read `final_contracts = max(1, int(final_contracts * haircut))`
+        #     with no guard, so a fail-closed 0-contract sizer verdict became
+        #     max(1, 0) = 1: the `<= 0` refusal below could never see a zero, and the
+        #     trade was approved carrying max_risk=0.0 (invisible to the aggregate
+        #     cap too). It fired only when a correlated position was already open —
+        #     exactly when it was least wanted.
+        #   - The obvious repair, max(0, ...), is WRONG and was measured before being
+        #     rejected: with positions.max_contracts_per_trade = 1 the sizer returns 1,
+        #     int(1 * 0.70) = 0, and every entry with one correlated position open
+        #     would be REFUSED. The universe is SPY/QQQ/IWM — one cluster — so the bot
+        #     would go flat after its first fill. That is a trading-behavior change,
+        #     not a fail-open fix.
+        # The rule a haircut must obey: it may only REDUCE an already-viable size. It
+        # may never manufacture one from a refusal, and never turn a viable size into
+        # a refusal. Guarding the branch keeps the floor of 1 meaningful for real
+        # sizes and leaves a 0 verdict untouched for the refusal below.
+        # Reachable today only when request.max_loss is falsy (gate 6b at :512 masks
+        # every defined-risk path because max_position_risk_pct 3% <
+        # positions.max_position_pct 5%); that masking is incidental, not a design,
+        # and is registered separately.
+        if correlated_count > 0 and final_contracts > 0:
             haircut = max(0.30, 1.0 - 0.30 * correlated_count)
             final_contracts = max(1, int(final_contracts * haircut))
 
