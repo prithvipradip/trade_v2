@@ -4158,3 +4158,57 @@ not more triage.
       dedup pass from [6]. Now genuinely lower priority than (a)-(c).
   Still open from before, unchanged: the 10 remaining batch-3 fail-open sites, with #2
   (reconciler.py / HALT_UNTRACKED) still needing re-verification because W22 rewrote that path.
+
+---
+
+## REGISTER TRIAGE BATCH 1 — CORRECTIONS + LIVE STATE (same session, appended not edited)
+
+Three gaps found by re-reading the entry above as a COLD READER would — the test that matters,
+since the project convention is that a new session starts from PLAN.md's last entries, not from
+a summary. Appended rather than edited, per the append-only rule.
+
+[C1] INTERNAL CONTRADICTION in the entry above, and the numbers to trust.
+     PLAN.md:4040 says "ALL 20 ASSESSED: 12 CLOSED, 2 CLOSED (untested), 6 OPEN" — CORRECT.
+     PLAN.md:4129 says "11 of 13 assessed came back CLOSED" — STALE. It survived from the point
+     where the batch was planned to stop at 13 findings; the scope was then extended to all 20
+     and that one sentence was not updated (the parallel sentence in
+     `reports/register_triage_20260916.md` WAS). The correct figure is **14 of 20** came back
+     CLOSED or CLOSED (untested).
+     The caveat attached to it still stands and still matters: that rate does NOT generalize.
+     This batch was the highest-severity slice, which is exactly where the fix waves
+     concentrated; expect the research_validity and cosmetic tiers to close far lower.
+
+[C2] LIVE BOT STATE — omitted above; prior entries carry it and a new session needs it.
+     Verified 2026-09-16 16:29 ET, after the close:
+       - supervisor PID 77009 (`run_orchestrator.py`) and bot PID 77028 (`python -m ait.main`)
+         both alive — the same supervisor W23 started at 15:11 ET, so it has run a full session
+         without a restart.
+       - NO kill-switch files present: `data/HALT`, `data/HALT_UNTRACKED` and
+         `data/RESTRICTED.txt` all absent. Entries are NOT frozen. (HALT_UNTRACKED stays lifted
+         because the operator's manual TWS positions are declared — W22.)
+       - `data/bot_heartbeat` last written 15:59:55 ET, i.e. 30 min stale at the time of
+         writing. This is EXPECTED, not a fault: the market closed at 16:00 ET and the trading
+         loop legitimately stops. `ops_health.bot_liveness` encodes exactly this, returning
+         `ok=True, state="not_rth"` when the market is closed.
+
+[C3] THE OPEN WATCH LIST, carried forward — the entry above dropped it, which would have lost it.
+     - W1 (heartbeat liveness): **HEALTHY**, and checked in the dangerous direction rather than
+       assumed. The heartbeat FILE stores a naive host-local ISO string
+       (`orchestrator.py:1073` writes `datetime.now().isoformat()`), which is superficially the
+       exact bug class W20/W21/W23 spent this session fixing — on this host naive local is ET+6,
+       so a consumer parsing that text would be 6 hours wrong. It is NOT a bug: all three
+       consumers read **mtime**, never the text. `ops_health.py:642` uses
+       `now.timestamp() - hb.stat().st_mtime` (epoch, timezone-proof); `master.py:1505` and the
+       dashboard both use `datetime.now() - datetime.fromtimestamp(st_mtime)` (naive minus naive,
+       internally consistent). The string in the file is decorative. Recorded here so the next
+       session does not re-open it, and does not "fix" the writer into a real inconsistency.
+     - W2 (the two calendar-fault warnings must NEVER appear): **CLEAN**, zero occurrences in
+       `logs/ait.log`.
+
+STATE AT HANDOFF (supersedes the one above): HEAD = this entry's commit, branch
+feature/event-straddle, pushed. No source modified by the triage. Live bot up, entries unfrozen.
+Suite 1811 / 43 skipped / 1 known local-.env failure.
+NEXT: unchanged from the entry above — (a) W25 the go-live sizing wave
+(params-trading-01 + logic-entry-01, one wave, both failing at `_launch_size_coherence_check`),
+then (b) data-integrity-07 and logic-exit-risk-03, regress-live-06 in its own wave,
+(c) docs-policy-04's RUNBOOK fix, (d) triage batch 2 + the dedup pass.
