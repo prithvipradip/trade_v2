@@ -153,10 +153,24 @@ def _key_for_message_id(state: StateManager, message_id: int) -> str | None:
 
 async def _record_and_edit(
         state: StateManager, telegram: TelegramNotifier, key: str, answer: str,
-        message_id: int) -> None:
+        message_id: int, on_answer=None) -> None:
     """The one place an answer is written — used by every path (button tap,
     reply-to correction, bare unambiguous reply), so the edited message
-    always reflects whichever answer is CURRENT."""
+    always reflects whichever answer is CURRENT.
+
+    `on_answer`, if given, is an async callable (TradingOrchestrator.
+    reconcile_now, in production) fired as a background task so HALT_UNTRACKED
+    reflects the new answer immediately rather than waiting for the next
+    natural reconcile pass — without making the poller wait on a broker call
+    before it can process the NEXT inbound update.
+
+    Sends TWO things, deliberately, not one: the original prompt is edited
+    in place (self-documenting if you scroll back to that specific
+    question), AND a separate, standalone confirmation message is sent as
+    its own chat bubble. The edit alone was not a clear enough "received"
+    signal in practice — easy to miss inside a longer message you're not
+    re-reading — so a distinct new message is the explicit acknowledgment.
+    """
     state.set_state(_ANSWER_PREFIX + key, answer)
     label = ("✅ YES — declared manual, ignored for management"
               if answer == "yes" else
@@ -165,12 +179,20 @@ async def _record_and_edit(
             f"You said: {label}\n\n"
             f"(tap a button or reply to THIS message to change your answer)")
     await telegram.edit_message(message_id, text, _buttons(key))
+    confirm = ("✅ Got it — recorded as YES"
+               if answer == "yes" else
+               "📝 Got it — recorded as NO")
+    await telegram.send(f"{confirm}: {key}")
     log.info("manual_position_answer_recorded", key=key, answer=answer,
               message_id=message_id)
+    if on_answer is not None:
+        import asyncio
+        asyncio.create_task(on_answer())
 
 
 async def _handle_update(
-        state: StateManager, telegram: TelegramNotifier, chat_id: str, upd: dict) -> None:
+        state: StateManager, telegram: TelegramNotifier, chat_id: str, upd: dict,
+        on_answer=None) -> None:
     cq = upd.get("callback_query")
     if cq is not None:
         msg = cq.get("message") or {}
@@ -180,7 +202,8 @@ async def _handle_update(
         parts = data.split(":", 2)
         if len(parts) == 3 and parts[0] == "manual" and parts[1] in ("yes", "no"):
             _, answer, key = parts
-            await _record_and_edit(state, telegram, key, answer, msg["message_id"])
+            await _record_and_edit(state, telegram, key, answer, msg["message_id"],
+                                   on_answer=on_answer)
             await telegram.answer_callback(cq["id"], f"Recorded: {answer}")
         else:
             await telegram.answer_callback(cq["id"])
@@ -207,14 +230,15 @@ async def _handle_update(
             log.debug("manual_position_reply_unmatched",
                        message_id=reply_to["message_id"])
             return
-        await _record_and_edit(state, telegram, key, answer, reply_to["message_id"])
+        await _record_and_edit(state, telegram, key, answer, reply_to["message_id"],
+                               on_answer=on_answer)
         return
 
     pending = pending_keys(state)
     if len(pending) == 1:
         key = pending[0]
         msgid = int(state.get_state(_MSGID_PREFIX + key))
-        await _record_and_edit(state, telegram, key, answer, msgid)
+        await _record_and_edit(state, telegram, key, answer, msgid, on_answer=on_answer)
     elif len(pending) > 1:
         await telegram.send(
             "Multiple positions are awaiting a reply — please reply "
@@ -223,12 +247,22 @@ async def _handle_update(
     # len(pending) == 0: nothing awaiting an answer; ignore silently.
 
 
-async def run_poller(state: StateManager, telegram: TelegramNotifier, chat_id: str) -> None:
+async def run_poller(state: StateManager, telegram: TelegramNotifier, chat_id: str,
+                     on_answer=None) -> None:
     """Long-poll Telegram for inbound updates (button taps + replies) and
     apply them. Runs as its own task alongside the trading loop (main.py),
     cancelled the same way on shutdown. A single bad poll or a single
     malformed update never kills the task — both are caught and logged so
     the poller keeps running.
+
+    `on_answer`, if given, is an async callable fired (as a background task,
+    never awaited inline) each time an answer is recorded — in production,
+    TradingOrchestrator.reconcile_now, so HALT_UNTRACKED reflects a new
+    answer immediately instead of waiting for the next natural reconcile
+    pass. Optional and decoupled on purpose: the poller must keep working
+    (recording answers, editing messages) even with no orchestrator wired,
+    e.g. in tests, or if reconcile_now itself is slow or fails — it never
+    blocks processing the NEXT inbound update.
     """
     import asyncio
     if not telegram.enabled:
@@ -249,7 +283,7 @@ async def run_poller(state: StateManager, telegram: TelegramNotifier, chat_id: s
         for upd in updates:
             offset = max(offset, upd.get("update_id", offset - 1) + 1)
             try:
-                await _handle_update(state, telegram, chat_id, upd)
+                await _handle_update(state, telegram, chat_id, upd, on_answer=on_answer)
             except Exception as e:  # noqa: BLE001
                 log.warning("manual_position_update_handling_failed",
                             error=str(e), update_id=upd.get("update_id"))

@@ -172,9 +172,13 @@ async def run_bot(args: argparse.Namespace) -> None:
     # DB file (WAL mode; StateManager already opens a fresh sqlite3
     # connection per call, so concurrent instances are the existing,
     # already-relied-on pattern, not a new risk).
+    # on_answer=orchestrator.reconcile_now: an answered prompt lifts
+    # HALT_UNTRACKED immediately instead of waiting for the next natural
+    # reconcile pass (startup/pre-market/post-market) or a restart.
     poller_task = asyncio.create_task(
         manual_positions.run_poller(
-            StateManager(), telegram, settings.api_keys.telegram_chat_id))
+            StateManager(), telegram, settings.api_keys.telegram_chat_id,
+            on_answer=orchestrator.reconcile_now))
 
     # Run bot with shutdown handler
     try:

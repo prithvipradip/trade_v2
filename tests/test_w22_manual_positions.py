@@ -300,6 +300,119 @@ class TestBareReplyAmbiguity:
         assert tg.edited == []
 
 
+class TestStandaloneConfirmationMessage:
+    """The operator's own follow-up: an edited prompt was not a clear enough
+    'received' signal in practice (easy to miss inside a message you're not
+    re-reading) — a distinct new chat message is the explicit ack."""
+
+    def test_button_tap_sends_a_separate_confirmation_message(self, tmp_path):
+        st = _state(tmp_path)
+        tg = FakeTelegram()
+        st.set_state("manual_position_prompt_msgid_" + KEY_A, "555")
+        upd = _callback_update(1, "cbq1", f"manual:yes:{KEY_A}", 555)
+        asyncio.run(mp._handle_update(st, tg, CHAT_ID, upd))
+
+        assert len(tg.sent) == 1
+        assert KEY_A in tg.sent[0]
+        assert "YES" in tg.sent[0]
+        # It's a NEW message, distinct from the edit — both must exist.
+        assert "YES" in tg.last_edit_for(555)
+
+    def test_no_tap_also_sends_a_distinguishable_confirmation(self, tmp_path):
+        st = _state(tmp_path)
+        tg = FakeTelegram()
+        st.set_state("manual_position_prompt_msgid_" + KEY_A, "555")
+        upd = _callback_update(1, "cbq1", f"manual:no:{KEY_A}", 555)
+        asyncio.run(mp._handle_update(st, tg, CHAT_ID, upd))
+        assert len(tg.sent) == 1
+        assert "NO" in tg.sent[0]
+
+    def test_text_correction_also_sends_a_fresh_confirmation(self, tmp_path):
+        """Each answer/correction gets its OWN confirmation — not just the
+        first one — so a corrected answer is just as clearly acknowledged."""
+        st = _state(tmp_path)
+        tg = FakeTelegram()
+        st.set_state("manual_position_prompt_msgid_" + KEY_A, "555")
+
+        tap = _callback_update(1, "cbq1", f"manual:no:{KEY_A}", 555)
+        asyncio.run(mp._handle_update(st, tg, CHAT_ID, tap))
+        fix = _text_update(2, 602, "yes", reply_to_message_id=555)
+        asyncio.run(mp._handle_update(st, tg, CHAT_ID, fix))
+
+        assert len(tg.sent) == 2
+        assert "NO" in tg.sent[0]
+        assert "YES" in tg.sent[1]
+
+
+class TestOnAnswerCallback:
+    """An answered prompt should trigger an immediate reconcile (in
+    production, TradingOrchestrator.reconcile_now) rather than waiting for
+    the next natural pass — the operator's own follow-up question after
+    declaring both real positions."""
+
+    def test_button_tap_fires_on_answer(self, tmp_path):
+        st = _state(tmp_path)
+        tg = FakeTelegram()
+        st.set_state("manual_position_prompt_msgid_" + KEY_A, "555")
+        fired = []
+
+        async def on_answer():
+            fired.append(True)
+
+        upd = _callback_update(1, "cbq1", f"manual:yes:{KEY_A}", 555)
+        asyncio.run(mp._handle_update(st, tg, CHAT_ID, upd, on_answer=on_answer))
+        # on_answer is scheduled as a background task (asyncio.create_task),
+        # not awaited inline — give the loop one more tick to run it before
+        # asyncio.run() tears the loop down.
+        asyncio.run(asyncio.sleep(0))
+        assert fired == [True]
+
+    def test_text_correction_also_fires_on_answer(self, tmp_path):
+        st = _state(tmp_path)
+        tg = FakeTelegram()
+        st.set_state("manual_position_prompt_msgid_" + KEY_A, "555")
+        fired = []
+
+        async def on_answer():
+            fired.append(True)
+
+        async def _run():
+            upd = _text_update(1, 601, "no", reply_to_message_id=555)
+            await mp._handle_update(st, tg, CHAT_ID, upd, on_answer=on_answer)
+            await asyncio.sleep(0)
+
+        asyncio.run(_run())
+        assert fired == [True]
+
+    def test_no_callback_given_does_not_crash(self, tmp_path):
+        """on_answer is optional — must not be required."""
+        st = _state(tmp_path)
+        tg = FakeTelegram()
+        st.set_state("manual_position_prompt_msgid_" + KEY_A, "555")
+        upd = _callback_update(1, "cbq1", f"manual:yes:{KEY_A}", 555)
+        asyncio.run(mp._handle_update(st, tg, CHAT_ID, upd))  # no on_answer
+        assert mp.is_declared(st, KEY_A) is True
+
+    def test_a_failing_on_answer_does_not_break_answer_recording(self, tmp_path):
+        """reconcile_now already catches its own errors in production; this
+        proves the poller side doesn't depend on that — a broken callback
+        must never make an answer fail to record."""
+        st = _state(tmp_path)
+        tg = FakeTelegram()
+        st.set_state("manual_position_prompt_msgid_" + KEY_A, "555")
+
+        async def _exploding_on_answer():
+            raise RuntimeError("broker unavailable")
+
+        async def _run():
+            upd = _callback_update(1, "cbq1", f"manual:yes:{KEY_A}", 555)
+            await mp._handle_update(st, tg, CHAT_ID, upd, on_answer=_exploding_on_answer)
+            await asyncio.sleep(0)  # let the failing background task run+fail
+
+        asyncio.run(_run())
+        assert mp.is_declared(st, KEY_A) is True
+
+
 class TestPollerOffsetPersistence:
     def test_offset_advances_and_persists_across_a_simulated_restart(self, tmp_path):
         st1 = _state(tmp_path)

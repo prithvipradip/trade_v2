@@ -466,6 +466,23 @@ class TradingOrchestrator:
         into the private _reconciler attribute directly."""
         self._reconciler.set_telegram(telegram)
 
+    async def reconcile_now(self) -> None:
+        """W22: run one reconcile() pass on demand, outside the normal
+        startup/pre-market/post-market cadence — specifically so answering a
+        manual-position Telegram prompt lifts HALT_UNTRACKED immediately
+        instead of waiting for the next natural pass (or a restart). Passed
+        into the poller task as a callback (main.py) rather than the poller
+        holding a reference to the reconciler/IBKR client directly — the
+        poller is deliberately lightweight (DB + Telegram only) so a slow or
+        failed broker call can never block answering a prompt. Errors are
+        logged, not raised: a failed on-demand reconcile must not crash the
+        poller loop that triggered it; the next natural pass still runs.
+        """
+        try:
+            await self._reconciler.reconcile()
+        except Exception as e:  # noqa: BLE001
+            log.warning("reconcile_now_failed", error=str(e))
+
     async def run(self) -> None:
         """Main loop — runs continuously, trading during market hours."""
         self._running = True
