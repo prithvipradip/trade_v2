@@ -3858,3 +3858,80 @@ STATE AT HANDOFF: HEAD (this entry's commit) on branch feature/event-straddle, N
 Live bot: supervisor 57775 / bot 57777, restarted 13:21 ET, stable, zero errors.
 Suite: 1764 passed / 43 skipped / 1 known local-.env failure.
 NEXT: unchanged — W23 (scheduler CronTrigger timezone class) and the register triage.
+
+## 2026-09-16 - MERGE + W22 HARDENING: an unresolved anomaly, cross-session-investigated, closed as best it can be
+Two unrelated things landed in the same stretch: reconciling this branch with independent work
+pushed under the repo owner's own identity, and a real investigation into a live-trading safety
+file that vanished with no explanation anyone could find — three sessions looked, including two
+peer Claude sessions on this same machine (trade-v2-c6, trade-v2-1b), and it stayed unsolved.
+
+[1] THE MERGE. `git push` was rejected — 4 commits existed on origin that weren't local
+    (`57ba9aa`..`f09cc38`, a take-profit-ladder backtesting study, 403 files, mostly generated
+    report data). Verified before merging, not assumed: every commit authored by
+    `Prithvi Pradip <prithvi.pradip@gmail.com>` (the repo owner) — NOT either peer session running
+    on this machine, an early guess that was wrong and corrected once checked. File-level diff
+    showed exactly ONE overlapping path across all 403+31 changed files: `PLAN.md`, which is
+    append-only by design for precisely this situation. `git merge` resolved clean — verified by
+    diffing both parent tips against the merge result, confirming both sides' full content
+    survived with correct chronological placement, no conflict markers anywhere. Full suite on the
+    combined tree: 1793 passed / 43 skipped / 1 known failure (up from 1764, matching their new
+    tests) — pushed only after that came back green, not before.
+
+[2] THE ANOMALY. `data/HALT_UNTRACKED` (INST-3's live freeze flag) was confirmed present and
+    actively blocking entries at 12:51:21 ET (`entries_frozen`, firing on a steady ~5-min cadence)
+    and confirmed ABSENT at 13:20:11 ET. In that 29-minute window: zero `reconcile()` calls (the
+    ONLY code path anywhere in the tree that touches this file — confirmed by full-repo grep, not
+    assumed), zero bot restarts, and every one of the 150 log lines that fell inside the window
+    checked individually — nothing touches it. Ruled out, each independently verified rather than
+    assumed: every other code path in the repo (dashboard, status server, weblog, generic cleanup
+    routines — `cleanup_old_logs` only ever touches `logs/`/`reports/`, never `data/`); Finder/GUI
+    deletion (not in `~/.Trash`, which a programmatic `unlink()` never populates anyway); iCloud/
+    Dropbox sync (no markers); this session's own test runs (different process, can't touch
+    another process's files); the operator, directly, by their own account.
+    TWO PEER SESSIONS EACH PROPOSED A MECHANISM. Both were checked against the precise timeline,
+    not accepted on description alone, and both failed the check:
+      - trade-v2-1b's first theory credited the restart at 13:21:32 ET with clearing the file —
+        but the file was independently confirmed gone at 13:20:11 ET, a full 74 seconds BEFORE the
+        SIGTERM that led to that restart was even sent. Wrong event, right mechanism description.
+      - trade-v2-1b's second theory (on_answer's asyncio.create_task() being silently GC'd,
+        meaning reconcile_now() never fired for any of four Telegram answers in the gap) was
+        checked against git history directly: `_record_and_edit`'s signature had no `on_answer`
+        parameter at all until commit `8d963c7`, timestamped 13:20:04 ET — after all four answers
+        (12:17, 12:44, 13:08 x2). The wiring that could have failed this way did not exist yet.
+        Retracted by its own author once shown the diff.
+    One genuinely separate, now-fully-resolved side thread: a "no" then "yes" toggle at 13:08:25-27
+    ET on the 2026-09-18 leg's prompt — confirmed by the operator as a deliberate test of the
+    correction UX, unrelated to the file (that path only writes bot_state and edits a Telegram
+    message; never touches HALT_UNTRACKED).
+    STATUS: genuinely unresolved. Not "probably fine" — actually unexplained, stated plainly. What
+    makes it tolerable rather than urgent: the STATE it left behind was correct (nothing needed
+    freezing; both real positions were legitimately declared), and the mechanism enumeration above
+    is exhaustive enough that a repeat is unlikely to hide the same way twice.
+
+[3] TWO DEFENSIVE FIXES, neither explaining [2], both worth doing regardless:
+    (a) `manual_positions.py`'s `asyncio.create_task(on_answer())` discarded its return value —
+        a real, independent footgun (the event loop holds only a weak reference; an unreferenced
+        task can be GC'd before running, per asyncio's own docs) that happened to not be the cause
+        THIS time only because of when it shipped, not because it's safe. `_fire_and_forget()` now
+        holds every background task in a module-level set with a done-callback.
+    (b) `reconciler.py`'s halt-file write AND clear each get a dedicated log line now
+        (`halt_untracked_written` / `halt_untracked_cleared`, both with the affected keys) instead
+        of only the general `reconciliation_complete` summary — so a recurrence is a log lookup,
+        not a repeat of today's multi-session investigation.
+    4 new tests. Suite: 1797 passed / 43 skipped / 1 known failure, up from 1793.
+
+[4] CROSS-SESSION COORDINATION, worth recording as its own data point. Three Claude sessions
+    (this one, trade-v2-c6, trade-v2-1b) share ONE working directory on this machine, not separate
+    clones — confirmed by trade-v2-1b directly. Messaged both peers this session; both responded
+    with real, checkable evidence (not just assertions), both self-corrected when shown a timeline
+    that contradicted their own theory, and both explicitly retracted rather than defended once
+    checked. Two attribution mistakes were mine, not theirs — corrected in both directions.
+
+STATE AT HANDOFF: HEAD (this entry's commit) on branch feature/event-straddle, PUSHED — origin and
+local in sync as of this session (confirmed both directions, 0 commits ahead/behind either way).
+Live bot: supervisor 70821, restarted 14:35 ET, stable, zero errors, both hardening fixes verified
+running (not just on disk).
+Suite: 1797 passed / 43 skipped / 1 known local-.env failure.
+NEXT: W23 (scheduler CronTrigger timezone class) and the register triage — unchanged by any of
+this. The HALT_UNTRACKED anomaly in [2] is not a wave; it's a registered open question with no
+concrete next action beyond [3]'s logging, which is already done.
