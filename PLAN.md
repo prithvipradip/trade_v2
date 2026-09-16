@@ -2857,3 +2857,43 @@ and changing them changes backtest results, which breaks comparability with ever
 study this repo has run. That needs its own wave WITH a re-run plan, not a side effect of this one.
 PROOF: 7 tests, 5 proven to fail against pre-fix source; the 2 that pass both ways are deliberate
 regression guards (the fallback still yields a usable IV; the legacy no-delta check is retained).
+
+## 2026-09-16 - W19 DEPLOYED + WATCH LIST FOR THE OPEN
+This entry closes a gap: the decision/fix record above was written BEFORE the restart, and
+everything after — the deploy itself and what to watch — was only said in chat, not committed. The
+ledger is the persistent record; chat is not. Same class of mistake as the plan-file durability gap
+found earlier this session, now made against PLAN.md itself.
+
+DEPLOY: graceful SIGTERM to supervisor pid 51749's predecessor; took ~45s this time (vs ~1s on the
+prior W18 restart) because the bot child had a live IBKR connection to close — waited rather than
+force-killing a trading process; log confirms shutdown_signal -> bot_stopping -> web_services_stopped
+end to end. Relaunched detached (nohup, PPID reparents to launchd pid 1, survives this session).
+Deployed commit 40e677a (matches `git log -1` on the running tree). Gates before deploy: suite 1630
+passed / 43 skipped / 1 pre-existing local-.env failure, typecheck OK, SMOKE PASS 13.
+VERIFIED POST-RESTART: trading_verified logged (the read-only probe passed on Gateway); 0
+deferred/error/CRITICAL lines in the first 5 min; OptionsChain.iv_is_guessed confirmed present on
+the running code (the W19 gate is live, not just committed).
+
+MANUAL POSITIONS — CONFIRMED BY OPERATOR, NOT A BOT DEFECT. Shutdown logged updatePortfolio for two
+QQQ option legs (strike 712, expiries 2026-09-18 and 2026-10-16) while open_positions read 0 rows.
+Operator confirms: entered MANUALLY, not through the bot. open_positions still reads 0 and
+data/HALT_UNTRACKED has not fired, so nothing is currently frozen — but this is exactly the
+broker-vs-DB shape the untracked-position tripwire (reconciler.py:1078-1088) exists to catch, and
+the reconciler runs every cycle against the LIVE broker state, so this is not a one-time check.
+WATCH: if reconcile() ever decides these ARE untracked (vs. correctly recognizing them as
+operator-owned and out of scope), it freezes ALL new entries via HALT_UNTRACKED until a human
+deletes the file. Confirmed benign right now; not verified to STAY benign through the session.
+
+WATCH LIST FOR THE 2026-09-16 OPEN (09:30 ET, first RTH session on Gateway with W18+W19 live):
+1. Manual QQQ positions above — does data/HALT_UNTRACKED fire once the reconciler runs live?
+2. degraded_greeks rejections (W19) — expected RARE; means a chain arrived with NO usable IV
+   anywhere (every delta a flat-0.30 guess). This is the gate working, not a new fault — but if it
+   fires on every scan rather than occasionally, that says something is wrong with the FEED, not
+   the gate.
+3. iv_solve_quote_outside_arbitrage_bounds / chain_iv_is_a_guess (W19) — new log events; first time
+   they will appear under real market data rather than test fixtures.
+4. Gateway read-only (W18) — first live cycle on Gateway; if it restarts read-only, confirm the new
+   CANNOT VERIFY TRADING alert actually pages rather than assuming the fix works because it passed
+   in tests.
+5. Standard post-deploy check per this repo's own deploy discipline: fresh heartbeat,
+   scan_symbol_timing events, no LOOP IMPAIRED alert.
