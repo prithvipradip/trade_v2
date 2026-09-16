@@ -3131,3 +3131,60 @@ over, because probing contradicted me both times. Both corrections are the entry
     own evidence: (a) and (b) are one class, and the trigger that made (a) look urgent is
     implausible. The register is only worth keeping if it shows that as prominently as it shows
     the confirmations.
+
+## 2026-09-16 - W20 DEPLOYED + WATCH LIST FOR THE OPEN
+Operator authorised the restart. Deployed 12:15 local / 06:15 ET — PRE-MARKET, 3h15m before the
+bell, with ZERO open trades. W20 touches restart logic and a live entry gate, so an in-session
+deploy was not acceptable.
+
+WHY THE SUPERVISOR, NOT JUST THE BOT. W20d lives in master.py — the SUPERVISOR's own code. A
+bot-only restart would have deployed W20a/b/c and silently left the headline fix (the mid-RTH
+restart fail-open) running on the old code. Full supervisor restart was required and performed.
+
+SEQUENCE. SIGTERM -> 51749 (same handler as the operator's Ctrl-C: graceful_shutdown stops bot,
+web services and scheduler). Clean trace: shutdown_signal 15 -> bot_stopping 51751 -> bot_stopped
+(30s) -> all three web services stopped. Relaunched with nohup (NOT setsid — it does not exist on
+macOS, a lesson this session already paid for once). New tree: supervisor 81012 (reparented to 1,
+properly detached), bot 81032, dashboard 81069, weblog 81070, status 81071. Scheduler ready with
+10 jobs, all crons ET-pinned.
+
+THE STALE LOCK WAS CHECKED BEFORE RESTARTING, NOT AFTER. data/orchestrator.lock still held the
+dead pid 51749. W16 A4 made that lock FAIL CLOSED, so "will it refuse to start?" had to be
+answered first: it reclaims correctly. The guard is the fcntl flock, released by the OS on process
+death; the pid in the file is informational only, and fail-closed applies to plumbing exceptions
+(permissions, full disk, missing fcntl), not to a stale file.
+
+VERIFIED RUNNING THE NEW CODE, positively — not inferred from "the files on disk have it":
+_assume_market_open_on_clock present; health_check calls it; three _now_et().hour sites in
+orchestrator; _sessions_until's EXECUTABLE lines are `trading = _itd(day)` / `trading = False`
+with no weekday heuristic (the string survives only inside the W20c comment, which quotes the old
+code — the first check I wrote was fooled by exactly that and was corrected). Working tree clean
+at f6e3c36. 47 W20 tests re-run against the deployed source: all pass. Bot connected to Gateway
+4002, placed and cancelled the $1 SPY probe order (W17-08 verify_can_trade), so the account is
+trading-enabled and not read-only. No errors, warnings or criticals since restart.
+
+WATCH LIST FOR THE 09:30 ET OPEN:
+[W1] HEARTBEAT AT THE BELL — the highest-risk item and NOT caused by W20. data/bot_heartbeat is
+     856 min stale right now, because the bot only touches it while the trading loop runs (last
+     write was yesterday's close: 22:00 local = 16:00 ET, and 856 min lands exactly there). At
+     09:30 ET is_market_open() flips True; if the loop has not refreshed the marker by then, the
+     >15min rule restarts the bot and pages. Expected behaviour is a refresh as the loop starts.
+     W20 touched this block, so confirm it is the ORDINARY path that runs, not the new fallback.
+[W2] THE TWO NEW WARNINGS MUST NEVER APPEAR — fresh_models_market_check_failed and
+     heartbeat_market_check_failed fire only on a genuine calendar fault. W20's whole re-scope
+     rests on the claim that such faults are implausible (no network call, no date limits, zero
+     ever recorded). If either line appears, that claim is WRONG and the wave's ranking needs
+     revisiting. Their absence is the falsifiable prediction this wave makes.
+[W3] hour_of_day IN THE FIRST LIVE ROW — the first entry today should write hour_of_day in 9..16
+     (ET) into trade_context.entry_signals, not 15..22 (CEST). This is the only W20a change with
+     an observable artifact; check it on the first fill rather than assuming.
+[W4] NO RESTART LOOP — confirm the supervisor does not restart the bot repeatedly. W20d changed
+     a branch that gates a restart; the failure mode of getting it wrong is visible within two
+     health-check cycles (4 min).
+[W5] PRE-EVENT BLACKOUT — _sessions_until now anchors on the ET date. Watch
+     credit_entry_skipped_pre_event for appearing or disappearing unexpectedly; W20c made its
+     calendar fallback strictly MORE blocking, which is the safe direction but is still a change
+     in behaviour on a fault.
+[W6] hour_blocked_by_learning should stay silent — the gate now reads ET, but no blocked_hours
+     state exists on disk, so nothing should block. A block appearing at an odd hour would mean
+     the learner wrote one and the convention is still mismatched somewhere.
