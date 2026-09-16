@@ -2897,3 +2897,75 @@ WATCH LIST FOR THE 2026-09-16 OPEN (09:30 ET, first RTH session on Gateway with 
    in tests.
 5. Standard post-deploy check per this repo's own deploy discipline: fresh heartbeat,
    scan_symbol_timing events, no LOOP IMPAIRED alert.
+
+## 2026-09-16 - BACKLOG CORRECTION: R25's §7 wave table is stale; consolidated here
+User asked directly whether PLAN.md now reflects ALL future work the audit surfaced. Checked
+rather than assumed the answer, and the honest answer was no — worse, the one place that claimed
+to say what's next (reports/full_audit_r25_20260914.md §7) is now WRONG: it proposed W18=tz-01+
+qual-01/02/04, W19=arch-01+arch-03, W20=triage+arch-02+arch-04. Real events consumed those wave
+numbers for the Gateway-port emergency (W18) and the strike-selection decision (W19) instead.
+Anyone reading §7 today would look for undone work under a label now occupied by something else.
+This entry supersedes it — R25 §7 is left in place as history, not edited (this ledger is
+append-only), but is no longer the source of truth for what remains.
+
+VERIFIED UNTOUCHED SINCE R25 (2026-09-14), zero PLAN.md mentions since:
+* tz-01 — hour_of_day (an ML feature) stamped from the host clock; CEST vs ET mismatch on this
+  machine. Cheap only while the meta-labeler corpus stays small (still untrained/default-off).
+* qual-01/02/04 (data/quality.py) — the outlier anchor is poisoned by the outlier it exists to
+  catch (stores the bad price BEFORE checking validity); `ts = timestamp or now` reads a real
+  epoch-0 sentinel as "no timestamp given"; the live exit validator's spread/jump thresholds are
+  code defaults, not config, against the R19c policy.
+* arch-01..04 — the four ARCHITECTURAL findings from R25's holistic pass: no broker boundary
+  (.ib escape hatch, six independent copies of the reqMktData dance — the class behind BOTH the
+  09-14 snapshot bug and the W19 options_chain trio); no state boundary (13 modules + 8 scripts
+  open the DB directly, no schema_version anywhere); cyclic imports (bot<->execution/risk/
+  reporting — the class behind the 09-14 Streamlit crash); orchestrator.py as a god object
+  (4,336 lines, 89 except-blocks, four waves collided in it in eight days). These are STRUCTURAL
+  and explain why instance-fixes keep recurring; none has been started.
+
+VERIFIED UNTOUCHED FROM R25's "remaining leads" AREA LIST (39 leads, by area):
+* Fail-open census (batch 3) — 355 except clauses -> 177 candidates -> 120 traced, 12-site ranked
+  shortlist in reports/w17_batch3_failopen_census_20260916.md. CENSUS DONE, ZERO SITES PROBED.
+  Four of the twelve share one dependency (a calendar fault) — flagged to probe as a class.
+* Broker (ibkr_client.py) — FX cache has no TTL in a days-long process; connect()'s clientId
+  fallback loop, place_order, cancel_order are untested; the local .env account mismatch (demoted
+  to hygiene after a W17 probe showed the account IS enforced at connect, but the stale
+  comment/fixture was never actually fixed).
+* Orders/contracts dead surface — 5 of 9 OrderBuilder methods, 4 of 6 ContractBuilder methods,
+  never called in production.
+* Capital chain — capital_tiers.py:102-108 currency-agnostic thresholds (a CAD figure sits in the
+  comment next to USD-compared numbers); :140 silently falls back to symbols[:4] if the tier's
+  preferred list doesn't intersect the configured universe, bypassing the gate with no signal.
+* Dashboard — five bare-`pass` handlers blank a whole analytics panel while its header still
+  renders (app.py:819,1225,1239,1264,1278); `_safe_query` renders a failed query as an empty book
+  indistinguishable from a real empty book; the real-close predicate has THREE independent
+  implementations with different call conventions.
+* Backtest display — dashboard/walkforward/export.py:687,820-821 return hardcoded 0.16/0.15
+  volatility constants from an except clause, feeding pricing displays.
+* Stale residue — strategies/base.py:58-61 still points readers at ait.strategies.constants, the
+  module the 09-14 dashboard fix ABANDONED; it does not exist. A future reader will chase a ghost.
+* Test isolation — tests/test_r19_config_authority.py::test_applier_and_readers_share_one_table
+  has failed on THIS machine's local .env on every single suite run this entire session (W16
+  through W19, unchanged). Local-only, gitignored, does not affect CI — but it is now a permanent
+  fixture of every `pytest -q` on this box and nobody has fixed the test's isolation gap.
+* Triage (angle E) — the 109 R24 findings + 78 carried-over, re-verification against TODAY's
+  source. NEVER STARTED. Explicitly its own wave, not foldable into a lead-probing batch — it is
+  re-verification work, not new-defect probing, and is the single largest item outstanding.
+
+ALSO REGISTERED, NOT FIXED, BY EXPLICIT OPERATOR DECISION (not oversights — recorded here so they
+are not mistaken for either): the r=0.05 hardcoded rate + missing dividend yield in options_chain
+and the backtest engine (W19; needs its own wave with a re-run plan, since two of three sites are
+in the backtest engine and changing them breaks comparability with every pre-registered study).
+
+WHAT WAS ACTUALLY DONE, for contrast (so this entry reads as a gap list, not a verdict that
+nothing happened): R25 (holistic + host-move class, full), W16 (4 platform fixes), W16b (keeper/
+dead-man retired on reflection), W17 batch 1 (5 leads, 4 verified + 1 partial), W17 batch 2 (6
+leads, all verified), W18 (Gateway-port unblock + 4 of the batch-2 findings fixed), W19 (strike-
+selection decision recorded + 2 more batch-2-family findings fixed). Every item above is what
+those rounds did NOT reach, not a claim that the rounds were unproductive.
+
+NEXT WAVE NUMBERING, corrected: W20 is unclaimed. Candidates in rough priority — (a) probe the
+batch-3 calendar-fault class (4 sites, one dependency, highest measured consequence of what
+remains unprobed); (b) tz-01 + qual-01/02/04 (cheap, bounded, tz-01 only stays cheap while the ML
+corpus is small); (c) the register triage (109+78) — largest, and the one thing every other wave
+has deferred past twice now.
