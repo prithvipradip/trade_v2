@@ -4414,3 +4414,33 @@ batch 2 + the dedup pass — with the funding decision in [C2] now the actual #1
 funding proceeds at all.
 
 ---
+
+## 2026-09-17 - [C2] RESOLVED (operator decision): AIT_SIMULATED_CAPITAL=10000, not yet live
+
+Closes the funding gap the corrections entry flagged as blocking the next session. No capital
+moves — this is the paper account, and `AIT_SIMULATED_CAPITAL` (`broker/account.py:216`) only
+scales every reported balance (NLV, buying power, available funds, etc.) down to a target, so the
+risk stack sizes as if the account were that small while the real paper balance sits underneath.
+
+[1] $5,000 (the operator's first number, rounded up from the earlier ~$4,700 estimate) does NOT
+    clear the coherence check. That ~$4,700 figure was itself incomplete — it only solved the
+    CREDIT-FLOOR arm of `_launch_size_coherence_check` (D2), not the BREAKER arm (D3, last wave's
+    fix). Run against the real function: $5,000 clears the credit floor but still trips the
+    breaker (`$100 < 1.5x $130`). Swept in $500 steps: the crossover is exactly **$9,750**
+    (breaker `1.5 * $130 = $195` needs `nlv * 2% >= $195`). $10,000 clears both arms with margin,
+    confirmed by running `_launch_size_coherence_check(10000.0)` directly: zero alerts.
+[2] AIT_SIMULATED_CAPITAL=10000 added to `.env` (gitignored, not in this diff) with a comment
+    citing this entry. Verified through the REAL startup path, not assumed: `apply_runtime_env_defaults()`
+    loads it into `os.environ` correctly. `scripts/smoke_deploy.py` re-run, still SMOKE PASS
+    (13 checks).
+[3] NOT YET LIVE. The running bot (supervisor 20950 / bot 20967, per the W25 deploy entry) started
+    before this env var was added; dotenv loads once at process startup, so it will not pick this
+    up without a restart. Awaiting the operator's go-ahead for that restart, per standing policy.
+[4] OPERATOR'S OWN CAVEAT, recorded because it matters for how much weight to put on this number:
+    "we will revisit those numbers later anyway." $10,000 is a probe value to exercise the sizing
+    path end-to-end on paper, not a considered final funding target — treat it as provisional in
+    any future analysis that assumes it as a real constraint.
+
+STATE AT HANDOFF: `.env` has the new var; process has not been restarted to pick it up.
+
+---
