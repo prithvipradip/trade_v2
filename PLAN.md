@@ -2796,3 +2796,64 @@ text, or the operator would have silently lost a number).
 PROOF: every fix has tests proven to fail against pre-fix source (6 for item 0, 6 for items 1+4),
 then pass restored. NOT YET DEPLOYED — .env's new port needs the SUPERVISOR restarted, not just the
 bot child, and that restart is the operator's call.
+
+## 2026-09-16 - W19 DECISION: per-contract solved IV is KEPT for strike selection (chosen, not inherited)
+THE GAP THIS CLOSES IS PROVENANCE, NOT BEHAVIOUR. df704d7 ("Fix implied_vol never getting a real
+backfilled value") changed WHICH STRIKES THE BOT SELLS and nothing in this ledger said anyone chose
+that. W17 batch 2 measured it against a real QQQ chain through the real _find_strike_by_delta: 4 of
+5 delta targets select a DIFFERENT strike, by up to 20 points, including 0.20 — the value
+iron_condor.py:169,177 actually uses. It shipped under a data-correctness heading. An unchosen
+improvement is harder to notice than a defect.
+
+DECISION: KEEP IT. The evidence, measured, not argued:
+* The codebase already documents the mechanism. options_chain.py (finding A6): "when a contract
+  lacks IV, use the chain's MEDIAN observed IV instead of a flat 30% — a wrong sigma shifts the
+  computed delta, and strategies pick strikes BY delta." The trajectory was ALREADY
+  flat-0.30 -> chain-median. Per-contract solved IV is the next step on that same path.
+* How wrong is the median? Against real per-strike IV in data/historical.db
+  (option_spread_samples), restricted to the strikes a condor actually sells (0.08-0.32 delta):
+      QQQ  5d  median IV 0.293  |dIV| 0.0498  =  2.9 strike steps of delta error
+      QQQ 12d  median IV 0.303  |dIV| 0.0747  =  6.4
+      QQQ 19d  median IV 0.261  |dIV| 0.0512  =  5.6
+      QQQ 33d  median IV 0.236  |dIV| 0.0446  =  6.6
+      QQQ 37d  median IV 0.336  |dIV| 0.0804  =  9.7
+  MEDIAN 6.4 STRIKE STEPS of systematic delta error, on every scan, at exactly the traded strikes.
+  The solved sigma removes it.
+LIMIT OF THAT EVIDENCE, STATED SO IT IS NOT OVERSOLD: backfill only fires when IBKR did NOT supply
+a delta, so there is no ground-truth delta to check the result against. This measures the ERROR THE
+MEDIAN INTRODUCES under the standard assumption that the market prices each strike's own vol. It is
+NOT a backtest of outcomes and must not be cited as one. If that assumption is ever to be tested,
+it needs a study, not this entry.
+
+[w17-07 FIXED, part 1] SOLVER FAILURES ARE NOW COUNTABLE. iv_solved_from_price was incremented
+INSIDE the try, after success — a success-only counter with no attempt counter, so failures could
+not even be derived by subtraction, and the except was bare and silent. Now counts attempted /
+solved / failed_arbitrage / failed_other, and logs a WARNING naming contracts whose quote sits
+OUTSIDE THE NO-ARBITRAGE BAND (BelowIntrinsic / AboveMaximum). That is a BAD QUOTE — stale, crossed
+or genuinely mispriced — and is a data-quality signal in its own right, not a solver hiccup.
+
+[w17-07 FIXED, part 2] THE degraded_greeks GATE IS RE-ARMED. It rejected only when NO delta was
+non-zero — and the 09-14 backfill gives EVERY contract a non-zero delta, so the gate became
+unreachable: disarmed by the very degradation it exists to catch. Its own comment names the
+incident it was built for ("the 07-07 SPY condor fill its short call at 0.49 DELTA (designed
+0.20)"). The genuinely degraded case is now explicit: when NO contract carries a usable IV,
+_chain_iv falls back to a hardcoded 0.30 and every backfilled delta is a guess. OptionsChain
+.iv_is_guessed carries that, filter_by_delta and filter_liquid PROPAGATE it (a filtered chain that
+dropped the flag would silently disarm the gate again — the same fragility atm_iv already has), and
+iron_condor rejects on it BEFORE the legacy check, which is retained.
+DELIBERATELY NARROW: not "any backfill happened". A few solved contracts per expiry is routine —
+live logs show 2-55 — and rejecting on that would refuse normal chains. BEHAVIOUR CHANGE ON A
+TRADING GATE: it can now reject entries that currently pass. That is the intent; those are exactly
+the entries the 07-07 incident produced.
+
+[REGISTERED, NOT FIXED — its own wave] THE PRICING CONSTANTS. r = 0.05 is hardcoded at THREE sites
+(options_chain.py, backtesting/engine.py x2) with NO config home — a clean R19c violation. The
+solve also uses py_vollib.black_scholes (no dividend yield) while IBKR's impliedVol uses a dividend
+schedule, so _chain_iv takes a median over TWO DIFFERENT MODELS. Measured at a ~0.20-delta short
+put: dividend yield shifts delta 0.0010 (QQQ) to 0.0027 (IWM); r at 3% vs the hardcoded 5% shifts
+it 0.0044; one $1 strike step is 0.0048 — so roughly ONE strike step, against the 6.4 the decision
+above addresses. Deferred by operator decision: two of the three sites are in the BACKTEST ENGINE,
+and changing them changes backtest results, which breaks comparability with every pre-registered
+study this repo has run. That needs its own wave WITH a re-run plan, not a side effect of this one.
+PROOF: 7 tests, 5 proven to fail against pre-fix source; the 2 that pass both ways are deliberate
+regression guards (the fallback still yields a usable IV; the legacy no-delta check is retained).

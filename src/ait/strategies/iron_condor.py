@@ -158,6 +158,20 @@ class IronCondor(Strategy):
         # selection is meaningless — this is the exact failure mode that let
         # the 07-07 SPY condor fill its short call at 0.49 DELTA (designed
         # 0.20). Reject before selecting anything.
+        # W19 (w17-07): the condition above could NEVER fire after the
+        # 2026-09-14 backfill change — _calculate_greeks now gives every
+        # contract a non-zero delta, so "no deltas at all" became
+        # unreachable and this gate was disarmed by the very degradation it
+        # exists to catch. The genuinely degraded case is narrower and now
+        # explicit: the chain carried NO usable IV anywhere, so _chain_iv fell
+        # back to a hardcoded 0.30 and every backfilled delta is a guess.
+        # Deliberately NOT "any backfill happened" — a few solved contracts
+        # per expiry is routine (live logs show 2-55) and rejecting on that
+        # would refuse normal chains.
+        if getattr(chain, "iv_is_guessed", False):
+            self._log_entry_quality(symbol, "rejected", "degraded_greeks", chain)
+            return []
+
         if (not any(abs(p.delta) > 0 for p in liquid_puts)
                 and not any(abs(c.delta) > 0 for c in liquid_calls)):
             self._log_entry_quality(symbol, "rejected", "degraded_greeks", chain)
