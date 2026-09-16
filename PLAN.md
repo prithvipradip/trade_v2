@@ -4337,3 +4337,80 @@ NEXT, unchanged in order from the corrections entry, with (a) now closed:
   (reconciler.py / HALT_UNTRACKED) still needing re-verification because W22 rewrote that path.
 
 ---
+
+## 2026-09-17 - W25 CORRECTIONS + DEPLOYED — the $140 hint fix, the funding conclusion, the restart
+
+Two gaps in the entry above, found answering the operator's own follow-up questions rather than by
+a fresh audit pass. Appended per the append-only rule; the entry above is not edited.
+
+[C1] THE ADVISED REMEDY IN [3]'S ALERT WAS WRONG BY 1.6x, and it is operator-facing text, not an
+     internal log line — the same class of error the register itself would flag. The credit-floor
+     problem message advised "Widen the budget to ~$86". $86 is `(min_width - min_credit) * 100`
+     — the MAX LOSS of the needed structure. The operator does not set max loss; they set the
+     per-trade budget, which reaches the wing only through `iron_condor.py:121`
+     `affordable = risk_budget / (100 * (1 - min_ratio))`. Inverting that correctly gives **$140**.
+     FIXED (commit cf2911c, same day, no separate ledger entry made at the time — that omission is
+     itself part of what this correction records): the message now computes the budget by
+     inverting the real formula, and a new test applies the advised number to the REAL
+     `IronCondor._vol_scaled_width` and asserts the wing it produces actually clears the credit
+     floor, so the message cannot drift back to a plausible-looking wrong quantity. 29 tests green
+     (28 + 1), typecheck OK, compileall OK.
+
+[C2] THE FUNDING CONCLUSION — asked for by the operator, derived after [3] shipped, and it belongs
+     in the record, not only in chat: **at $2,100 there is no setting of `max_position_risk_pct`
+     alone that lets an iron condor trade.**
+       | NLV     | budget @ risk.max_position_risk_pct (3%) | budget @ positions.max_position_pct (5%, ceiling) | needed |
+       |---------|-------------------------------------------|------------------------------------------------------|--------|
+       | $2,100  | $63                                        | $105                                                   | $140   |
+       | $2,800  | $84                                        | $140                                                   | $140   |
+       | $4,667  | $140                                       | $233                                                   | $140   |
+     The $140 requirement exceeds even the 5% sizer ceiling at $2.1k, so raising
+     `risk.max_position_risk_pct` toward 5% is NOT sufficient by itself at that NLV — the sizer's
+     OWN cap (positions.max_position_pct) also has to clear $140, which needs ~$2,800 NLV even at
+     the full 5%. Options, none applied (operator's call, not scheduled):
+       (i)   fund ~$4,700 at today's knobs (3%/5% unchanged);
+       (ii)  fund ~$2,800 AND raise `risk.max_position_risk_pct` 3% -> 5% (this is exactly the
+             skew [6]/the W25 ADDENDUM registered as a hazard — moving that knob un-masks
+             params-trading-01's containment, so it cannot be done as a side effect of a funding
+             decision; it needs its own look);
+       (iii) lower `AIT_IC_MIN_CREDIT` below $0.70 — REJECTED as evaluated: the $0.70 floor is
+             R6's 3x-round-trip-cost bar (8 legs x ~$0.65 + entry/exit crossing = $10-13); a $0.45
+             credit is ~$45 gross on 1 contract, under 4x the low end of that cost estimate and a
+             clear regression of the floor's own rationale.
+     This is a PLANNING finding, not a code defect — recorded here because the operator asked, and
+     because a future session should not have to re-derive it from chat scrollback that no longer
+     exists.
+
+[C3] DEPLOYED. Per the operator's explicit instruction this session ("go ahead and restart now"),
+     outside RTH (19:08 ET on 2026-09-16 / 01:08 CEST on 2026-09-17 — market closed at 16:00 ET,
+     matching the RUNBOOK's outside-RTH deploy window), following the documented stop/restart path
+     (`docs/RUNBOOK.md:92-93`): `smoke_deploy.py` re-run green immediately before touching anything
+     (13 checks, post-cf2911c); `kill -TERM` the supervisor (the lock-file PID, a real `flock()`,
+     confirmed by reading `_acquire_singleton_lock` rather than assumed) rather than the bot
+     directly, since `graceful_shutdown` -> `bot.stop()` -> `web.stop()` is the path the code
+     itself defines; both processes confirmed exited (not just the parent) before relaunch;
+     relaunched via the documented command (`python run_orchestrator.py`, nohup'd, the macOS path
+     per the known docs/code discrepancy above — no `setsid`).
+     New PIDs: supervisor 20950, bot 20967 (were 77009 / 77028). Verified past the
+     `bot_launch_verified` grace window, scheduler re-registered all 10 jobs, dashboard/weblog/
+     status all restarted clean. Confirmed the RUNNING process is W25, not asserted: imported
+     `ait.risk.manager` from the live interpreter and read back
+     `inspect.getsource(RiskManager.validate_trade)` — the `params-trading-01` provenance comment
+     and the `correlated_count > 0 and final_contracts > 0` guard are both present. Zero
+     errors/tracebacks in `bot_stdout.log` or `ait.log` timestamped after the new start; W2 still
+     CLEAN (zero occurrences of either calendar-fault warning, checked across all of `logs/` again
+     post-restart). No kill-switch files. Rollback point if needed: `git checkout cf2911c` is
+     already HEAD, so rollback is `git checkout 74b636e` (last commit before this wave) + the same
+     restart path.
+
+STATE AT HANDOFF: branch feature/event-straddle, HEAD cf2911c, pushed to origin. W25 is LIVE —
+supervisor PID 20950, bot PID 20967, entries unfrozen, no HALT/HALT_UNTRACKED/RESTRICTED.txt.
+Market closed; first live observation of the new code is the RTH open on 2026-09-17. The [C2]
+funding gap ($140 needed, no knob at $2.1k alone provides it) is UNRESOLVED and blocks funding —
+next session should check the operator's decision before assuming the account has been funded.
+NEXT: unchanged from the W25 entry above — (b) data-integrity-07 + logic-exit-risk-03,
+regress-live-06 in its own wave with a live probe, (c) docs-policy-04's RUNBOOK fix, (d) triage
+batch 2 + the dedup pass — with the funding decision in [C2] now the actual #1 blocker on whether
+funding proceeds at all.
+
+---
