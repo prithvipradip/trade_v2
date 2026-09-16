@@ -4444,3 +4444,21 @@ risk stack sizes as if the account were that small while the real paper balance 
 STATE AT HANDOFF: `.env` has the new var; process has not been restarted to pick it up.
 
 ---
+
+## 2026-09-17 - AIT_SIMULATED_CAPITAL=10000 DEPLOYED
+
+Per operator go-ahead. Same documented path as the W25 deploy: outside RTH (19:27 ET, book flat —
+0 open positions), `smoke_deploy.py` re-run green immediately before, `SIGTERM` to the supervisor
+lock-file PID (20950), both old PIDs confirmed exited, relaunched via `python run_orchestrator.py`.
+
+New PIDs: supervisor 25177, bot 25224 (were 20950 / 25224... were 20950 / 20967). Verified past
+`bot_launch_verified`, scheduler re-registered all 10 jobs. Confirmed the var is actually in the
+NEW process's environment (`ps eww -p 25224`), not just in `.env` — direct proof rather than
+waiting on a log line that only fires on the next account-snapshot refresh, which outside RTH may
+not happen for a while. Zero errors/tracebacks since the new start; W2 still clean.
+
+STATE AT HANDOFF: branch feature/event-straddle, HEAD 00aac6d. Supervisor 25177 / bot 25224 live,
+entries unfrozen, book flat, AIT_SIMULATED_CAPITAL=10000 active. Per the operator's own caveat
+recorded above, treat $10,000 as a provisional probe value, not a settled funding target.
+
+---
