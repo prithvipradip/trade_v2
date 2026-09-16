@@ -342,13 +342,24 @@ class TestForeignBotRefusal:
 # on every non-Windows host. These drive the real function body.
 
 class TestScanForeignBotPidsRealBody:
-    def test_finds_a_process_whose_cmdline_names_ait_main(self):
-        # A real short-lived process whose OS-level argv contains the
-        # literal token 'ait.main' without importing the real module (the
-        # trailing arg to `-c` becomes part of the actual cmdline psutil
-        # reads — it is never parsed by the -c script itself).
+    def test_finds_a_process_SPAWNED_AS_the_bot(self):
+        # W16 (R25): this fixture used to be
+        #     [sys.executable, "-c", "...sleep...", "ait.main"]
+        # — a STRAY 'ait.main' argv token, which is not how the bot is ever
+        # started and is exactly the false-positive shape the scan must now
+        # reject (`grep -r ait.main src/` and an editor with the file open
+        # have the same shape). Since the consumer, BotManager.start(), REFUSES
+        # to launch the trading bot when this returns non-empty, a false
+        # positive is fail-closed and costs a session.
+        #
+        # The real bot is spawned at master.py:585 as
+        #     [sys.executable, "-m", "ait.main", "--paper"]
+        # and the live process on 2026-09-15 confirmed that argv exactly, so
+        # the fixture now mirrors it. `-m` adjacency is what distinguishes a
+        # bot from a mention. The negative case is pinned below.
         proc = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(10)", "ait.main"])
+            [sys.executable, "-m", "ait.main", "--probe-never-runs"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             deadline = time.time() + 5
             found: list[int] = []
@@ -366,6 +377,19 @@ class TestScanForeignBotPidsRealBody:
         proc = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(10)"])
         try:
+            assert proc.pid not in _master._scan_foreign_bot_pids()
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_a_stray_ait_main_ARGV_TOKEN_is_not_a_bot(self):
+        """W16 (R25): the false positive the old fixture enshrined. A process
+        that merely NAMES ait.main — a grep, an editor, an audit session — must
+        not make BotManager.start() refuse to launch the real bot."""
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(10)", "ait.main"])
+        try:
+            time.sleep(0.3)
             assert proc.pid not in _master._scan_foreign_bot_pids()
         finally:
             proc.terminate()

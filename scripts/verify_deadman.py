@@ -41,11 +41,28 @@ sys.path.insert(0, str(ROOT / "src"))
 from ait.monitoring.ops_health import bot_liveness  # noqa: E402
 
 URL_FILE = ROOT / "data" / "deadman_url.txt"
-KEEPER = ROOT / "keeper_ait.bat"
 
-#: The marker that proves keeper_ait.bat consults the liveness gate.
+
+def active_keeper(root: Path = ROOT, platform: str | None = None) -> Path:
+    """The keeper that actually runs on THIS host (W16 B2, R25 plat-05).
+
+    This module used to hardcode ``keeper_ait.bat``. On macOS that is not the
+    live mechanism — ops/keeper_ait.sh is — so the verifier would have reported
+    a perfectly good keeper as "does not ping at all", which is the opposite of
+    the reassurance it exists to provide.
+    """
+    plat = sys.platform if platform is None else platform
+    return (root / "keeper_ait.bat") if plat == "win32" else (root / "ops" / "keeper_ait.sh")
+
+
+KEEPER = active_keeper()
+
+#: The marker that proves the keeper consults the liveness gate.
 LIVENESS_MODULE = "ait.monitoring.ops_health"
 
+#: Suggested patch when the keeper pings but does NOT gate. Windows form; the
+#: POSIX keeper (ops/keeper_ait.sh) ships gated, so this is only ever printed
+#: for keeper_ait.bat.
 KEEPER_PATCH = """\
     REM W6 bot-day-02: gate the dead-man on EVIDENCE the bot is trading, not on
     REM a process-table match. Exit 0 = alive (ping), 1 = not alive (ping /fail).
@@ -81,7 +98,9 @@ def keeper_gating(keeper_text: str) -> dict:
     Returns ``{"pings", "gated", "detail"}``.  ``gated`` False is the
     bot-day-02 defect: a green monitor that only attests the supervisor.
     """
-    pings = "deadman_url.txt" in keeper_text and "curl.exe" in keeper_text
+    # curl.exe on Windows, plain curl on POSIX — accept either.
+    pings = "deadman_url.txt" in keeper_text and (
+        "curl.exe" in keeper_text or "curl " in keeper_text)
     gated = LIVENESS_MODULE in keeper_text
     if not pings:
         detail = "keeper does not ping at all — the dead-man is not plumbed."

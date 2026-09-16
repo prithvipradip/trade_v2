@@ -155,7 +155,10 @@ class TestTradingDayBlackout:
 
         class _FakeDT:
             @staticmethod
-            def now():
+            def now(tz=None):
+                # W20b: _sessions_until now anchors on the ET date rather than
+                # the host's local date, so it calls now(tz). The pinned date
+                # is what this test is about and is the same either way.
                 return SimpleNamespace(date=lambda: date(2026, 8, 7))  # Friday
         monkeypatch.setattr(mod, "datetime", _FakeDT)
         # Monday event = 3 calendar days out, but NO session in between

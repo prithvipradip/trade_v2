@@ -132,13 +132,51 @@ class TestCooldownAndBudget:
 
 
 class TestSafety:
-    def test_missing_start_script_is_reported_not_crashed(self):
+    def test_missing_start_script_is_reported_AND_escalated(self):
+        """R25 plat-01. This test used to assert only what did NOT happen —
+        no Popen, counter untouched — and so it PERMITTED total silence.
+
+        That silence was the defect: the early return sat before the counter
+        increment, so `_gateway_recoveries` never moved and the escalation
+        branch was unreachable on any host without the start script. On
+        2026-09-15 TWS was closed by accident and the supervisor deferred for
+        8h36m behind 134 `gateway_recovery_unavailable` lines and zero pages.
+
+        The two original assertions still hold — there is genuinely nothing to
+        launch and no attempt was made. What was missing is the page."""
         m, now = _mgr(down_minutes=20)
         with patch.object(M.os.path, "exists", return_value=False), \
-             patch.object(M.subprocess, "Popen") as popen:
+             patch.object(M.subprocess, "Popen") as popen, \
+             patch.object(M, "_alert") as alert:
             m._maybe_recover_gateway(4002, now)
         popen.assert_not_called()
-        assert m._gateway_recoveries == 0
+        assert m._gateway_recoveries == 0      # no attempt was made
+        alert.assert_called_once()             # but a human MUST be told
+        msg = alert.call_args[0][0]
+        assert "MANUAL ACTION NEEDED" in msg
+        assert "4002" in msg
+
+    def test_unavailable_recovery_page_is_throttled(self):
+        """The health loop runs every 2 min; the page must not ride it.
+        Shares the 30-minute throttle the budget-exhausted branch uses."""
+        m, now = _mgr(down_minutes=20)
+        with patch.object(M.os.path, "exists", return_value=False), \
+             patch.object(M.subprocess, "Popen"), \
+             patch.object(M, "_alert") as alert:
+            m._maybe_recover_gateway(4002, now)
+            m._maybe_recover_gateway(4002, now + timedelta(minutes=2))
+            m._maybe_recover_gateway(4002, now + timedelta(minutes=10))
+        assert alert.call_count == 1
+
+    def test_unavailable_recovery_pages_again_once_throttle_expires(self):
+        """A still-down gateway half an hour later deserves a fresh page."""
+        m, now = _mgr(down_minutes=20)
+        with patch.object(M.os.path, "exists", return_value=False), \
+             patch.object(M.subprocess, "Popen"), \
+             patch.object(M, "_alert") as alert:
+            m._maybe_recover_gateway(4002, now)
+            m._maybe_recover_gateway(4002, now + timedelta(minutes=31))
+        assert alert.call_count == 2
 
     def test_a_failing_restart_never_kills_the_supervisor(self):
         """The supervisor is the last line of defence; recovery must not

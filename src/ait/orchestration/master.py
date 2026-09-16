@@ -26,6 +26,8 @@ from threading import Event
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from ait.utils.process import scan_pids
+
 # Project root
 ROOT = Path(__file__).resolve().parents[3]
 LOGS_DIR = ROOT / "logs"
@@ -147,17 +149,24 @@ def _gateway_process_alive() -> bool:
     Distinguishes "Gateway not started" from "Gateway started but wedged" —
     the 2026-09-08 shape, where killing the stuck JVM is REQUIRED before a
     relaunch can bind the port.
+
+    R25 plat-02 (W16 A2): this was a `powershell Get-Process java` shell-out,
+    so on any non-Windows host FileNotFoundError('powershell') was caught and
+    read as "no JVM running" — SILENTLY. It is the only one of the four
+    Windows-only siblings with no log line at all, and its unmeasured False is
+    stamped into the gateway_recovery_attempt record as wedged_process=False:
+    the log asserted a fact it never measured. A psutil name scan finds the TWS
+    JVM on macOS as readily as the Gateway JVM on Windows.
+
+    The fail direction is UNCHANGED (False), but it is no longer silent —
+    "no JVM" and "could not look" imply different recovery actions.
     """
-    try:
-        import subprocess as _sp
-        out = _sp.run(
-            ["powershell", "-NoProfile", "-Command",
-             "(Get-Process java -ErrorAction SilentlyContinue | "
-             "Measure-Object).Count"],
-            capture_output=True, text=True, timeout=15)
-        return int((out.stdout or "0").strip() or 0) > 0
-    except Exception:  # noqa: BLE001
+    pids = scan_pids(name_contains="java")
+    if pids is None:
+        _log("warning", "gateway_process_scan_failed",
+             detail="process table unreadable; treating as no JVM")
         return False
+    return bool(pids)
 
 def _gateway_listening(port: int, host: str = "127.0.0.1") -> bool:
     """Cheap check: is something accepting connections on the Gateway port?
@@ -191,6 +200,36 @@ def _gateway_listening(port: int, host: str = "127.0.0.1") -> bool:
 _singleton_lock_handle = None  # module-held: lock lives exactly as long as this process
 
 
+# W18: the IB API ports, with what each one means. This is the same set
+# .env's own inline comment documents.
+_IB_PORTS = {
+    4002: "IB Gateway paper",
+    4001: "IB Gateway live",
+    7497: "TWS paper",
+    7496: "TWS live",
+}
+
+
+def _port_hint(configured: int) -> str:
+    """If the configured port is dead but another IB port answers, name it.
+
+    W18: after the operator moved from TWS to IB Gateway, .env still said
+    IBKR_PORT=7497 while Gateway listened on 4002. The supervisor deferred the
+    bot for 9h47m behind a bare `bot_restart_deferred_gateway_down | port=7497`
+    — the mismatch was measurable the entire time and nothing looked. Returns a
+    leading-space fragment for splicing into an alert, or "" when there is
+    nothing to add.
+    """
+    try:
+        for port, label in _IB_PORTS.items():
+            if port != configured and _gateway_listening(port):
+                return (f" NOTE: nothing is on {configured}, but {port} ({label}) IS "
+                        f"open — check IBKR_PORT in .env matches the app you are running.")
+    except Exception:  # noqa: BLE001 — a hint must never break the alert it decorates
+        pass
+    return ""
+
+
 def _acquire_singleton_lock(lock_path: Path | None = None) -> bool:
     """Atomically claim the single-orchestrator lock. False = already held."""
     global _singleton_lock_handle
@@ -217,9 +256,27 @@ def _acquire_singleton_lock(lock_path: Path | None = None) -> bool:
             pass
         _singleton_lock_handle = fh
         return True
-    except Exception as e:  # noqa: BLE001 — lock plumbing must never keep the bot down
-        _log("warning", "singleton_lock_error", error=str(e))
-        return True
+    except Exception as e:  # noqa: BLE001
+        # R25 plat-06 (W16 A4): this returned True — and True means "you hold
+        # the lock, proceed". A permission fault, a full disk, or a missing
+        # fcntl therefore ADMITTED A SECOND SUPERVISOR: two supervisors means
+        # two bots on one account, the class behind the 2026-07-13 triple-fill
+        # that built four accidental reverse iron condors.
+        #
+        # The old comment argued "lock plumbing must never keep the bot down".
+        # W15 settled that trade for the sibling gates and it settles this one:
+        # a stopped bot is visible, recoverable, and costs opportunity; a
+        # second bot placing duplicate orders costs money and corrupts the
+        # book. Fail CLOSED — and page, so the refusal is never silent.
+        _log("critical", "singleton_lock_error_fail_closed", error=str(e))
+        try:
+            _alert(f"SINGLETON LOCK UNAVAILABLE ({type(e).__name__}: {e}). "
+                   f"Refusing to start the supervisor rather than risk a "
+                   f"SECOND BOT on the same account. MANUAL ACTION NEEDED — "
+                   f"check data/ permissions and free disk space.")
+        except Exception:  # noqa: BLE001 — paging must never flip the gate open
+            pass
+        return False
 
 
 def _release_singleton_lock() -> None:
@@ -262,19 +319,30 @@ def _scan_foreign_bot_pids() -> list[int]:
     by the except below and silently read as "no foreign bot found" — the
     guard was a standing no-op on macOS/Linux, every 2-min health cycle, not
     just at startup. psutil (already a pinned dependency) replaces it
-    cross-platform, no shell dependency."""
-    pids: list[int] = []
-    try:
-        import psutil
-        for p in psutil.process_iter(["pid", "name", "cmdline"]):
-            try:
-                cmdline = p.info.get("cmdline") or []
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                continue
-            if "ait.main" in " ".join(cmdline):
-                pids.append(p.info["pid"])
-    except Exception as e:  # noqa: BLE001 — a failed scan must not block a start
-        _log("warning", "foreign_bot_scan_failed", error=str(e))
+    cross-platform, no shell dependency.
+
+    W16 A3: the scan itself now lives in ait.utils.process.scan_pids, shared
+    with status.py — the 2026-09-14 fix was applied to this call site rather
+    than to the idiom, so status.py kept its PowerShell copy and went on
+    reporting the bot DOWN while it was UP on any non-Windows host.
+
+    The match is now `-m` ADJACENCY, not a substring of the joined command
+    line. `"ait.main" in " ".join(cmdline)` also matched `grep -r ait.main
+    src/`, an editor with the file open, or an audit session — and the consumer
+    of this answer REFUSES to start the trading bot, so a false positive is
+    fail-closed and costs a session. A whole-argv token is not enough either:
+    in `grep -r ait.main src/` the token is its own element (a W16 test caught
+    exactly that). The real bot is spawned at master.py:585 as
+    [sys.executable, "-m", "ait.main", "--paper"], so `-m` adjacency is exact.
+
+    Fail direction is unchanged and still fail-OPEN ([] = "no foreign bot",
+    which permits a start). R25 registered that as a standing lead; changing
+    it would block starts on a transient scan failure and is out of W16 scope.
+    """
+    pids = scan_pids(module="ait.main")
+    if pids is None:
+        _log("warning", "foreign_bot_scan_failed",
+             detail="process table unreadable; proceeding as if none found")
         return []
     return pids
 
@@ -334,6 +402,33 @@ def _clear_dashboard_port(port: int = 8501) -> bool:
     return False
 
 
+def _assume_market_open_on_clock(now: datetime | None = None) -> bool:
+    """Calendar-FREE conservative answer to "is the market open?".
+
+    Used only when the NYSE calendar is unavailable. A weekday 09:30-16:00 ET
+    is treated as "may be open". Resolves ET through stdlib ``zoneinfo``, not
+    ``ait.utils.time`` — the latter imports ``pandas_market_calendars`` at
+    module scope, so in the very scenario that calls this it may be the thing
+    that is broken.
+
+    W20d — on the DIRECTION of this heuristic, because it looks like the one
+    W15 deleted: W15 removed ``weekday() < 5`` from the pre-event blackout
+    because counting a holiday as a session made that gate fail OPEN. Here the
+    same heuristic errs the other way. Every caller asks "is it open?" in order
+    to be MORE cautious when the answer is yes, so a holiday wrongly counted as
+    a session only defers a restart or keeps hang-detection armed. Never
+    reuse it anywhere the true branch is the permissive one.
+    """
+    from zoneinfo import ZoneInfo as _ZI
+    _et = _ZI("US/Eastern")
+    n = now or datetime.now(_et)
+    n = n.replace(tzinfo=_et) if n.tzinfo is None else n.astimezone(_et)
+    if n.weekday() >= 5:
+        return False
+    mins = n.hour * 60 + n.minute
+    return (9 * 60 + 30) <= mins < (16 * 60)
+
+
 def _in_post_market_window(now: datetime | None = None,
                            grace_minutes: int = 20) -> bool:
     """R16: is NOW inside the bot's own POST_MARKET phase (+grace)?
@@ -345,9 +440,15 @@ def _in_post_market_window(now: datetime | None = None,
     and adds 5 minutes of slack so a restart cannot land on the boundary.
 
     If the market calendar is unavailable it falls back to the regular-session
-    clock (16:00 ET, the box's local time) rather than a blanket True — fail
-    closed INSIDE the window, but never wedge the model-reload restart forever
-    on a calendar outage.
+    clock (16:00 **ET**) rather than a blanket True — fail closed INSIDE the
+    window, but never wedge the model-reload restart forever on a calendar
+    outage.
+
+    W20b: that fallback previously read the BOX's local clock, and this
+    docstring claimed "16:00 ET, the box's local time" — true on the old ET
+    host, false since the move to CEST (= ET+6). Measured on the CEST box, it
+    protected 10:00-10:15 ET by accident and allowed a mid-RTH restart at
+    09:05, 11:05, 13:05 and 15:05 ET.
     """
     try:
         from datetime import timedelta as _td
@@ -361,7 +462,15 @@ def _in_post_market_window(now: datetime | None = None,
         return close_dt <= n < close_dt + _td(minutes=15 + grace_minutes)
     except Exception as e:  # noqa: BLE001
         _log("warning", "post_market_window_check_failed", error=str(e))
-        n2 = now or datetime.now()
+        # W20b: resolve ET from stdlib zoneinfo, NOT ait.utils.time — the
+        # latter imports pandas_market_calendars at module scope, so in the
+        # very scenario that lands us here (a broken calendar package) it may
+        # be unavailable. zoneinfo has no such dependency. A naive `now` is
+        # treated as ET, matching the primary path above.
+        from zoneinfo import ZoneInfo as _ZI
+        _et = _ZI("US/Eastern")
+        n2 = now or datetime.now(_et)
+        n2 = n2.replace(tzinfo=_et) if n2.tzinfo is None else n2.astimezone(_et)
         mins = n2.hour * 60 + n2.minute
         return (16 * 60) <= mins < (16 * 60 + 15 + grace_minutes)
 
@@ -422,16 +531,47 @@ class BotManager:
         if self._gateway_recoveries >= GATEWAY_MAX_RECOVERIES:
             if (self._last_gateway_alert is None
                     or (now - self._last_gateway_alert) > timedelta(minutes=30)):
-                self._last_gateway_alert = now
-                _alert(f"IB Gateway STILL down on port {port} after "
-                       f"{GATEWAY_MAX_RECOVERIES} automatic restart attempts "
-                       f"({down_for / 60:.0f} min). MANUAL ACTION NEEDED — "
-                       f"check for a login/2FA prompt on the Gateway window.")
+                # W17 w17-01b: consume the throttle only on a DELIVERED page.
+                # _alert (:64) is single-shot — one urlopen, no retry, no
+                # dead-channel accounting — and returns False on a dropped
+                # send. Setting the timestamp FIRST meant one failed packet
+                # bought 30 minutes of silence on the page that exists
+                # because of an 8h36m silent outage.
+                if _alert(f"IB Gateway STILL down on port {port} after "
+                          f"{GATEWAY_MAX_RECOVERIES} automatic restart attempts "
+                          f"({down_for / 60:.0f} min). MANUAL ACTION NEEDED — "
+                          f"check for a login/2FA prompt on the Gateway window."):
+                    self._last_gateway_alert = now
             return
 
         script = GATEWAY_START_SCRIPT
         if not os.path.exists(script):
+            # R25 plat-01: this returned SILENTLY, and the return sits BEFORE
+            # the counter increment below — so _gateway_recoveries never moved
+            # and the escalation above ("MANUAL ACTION NEEDED") was unreachable
+            # on any host without the start script. Materialized 2026-09-15:
+            # TWS was closed by accident at 07:33 and the supervisor deferred
+            # for 8h36m — 134 of these log lines, ZERO pages, ~40 min of it
+            # inside RTH. Nothing can automate away a broker app a human
+            # closed, so for this shape the page IS the recovery.
+            # The counter is deliberately NOT incremented (no attempt was
+            # made); this shares the 30-min throttle above so the 2-min health
+            # loop cannot spam.
             _log("warn", "gateway_recovery_unavailable", script=script)
+            if (self._last_gateway_alert is None
+                    or (now - self._last_gateway_alert) > timedelta(minutes=30)):
+                # W17 w17-01b: consume the throttle only on a DELIVERED page.
+                # _alert (:64) is single-shot — one urlopen, no retry, no
+                # dead-channel accounting — and returns False on a dropped
+                # send. Setting the timestamp FIRST meant one failed packet
+                # bought 30 minutes of silence on the page that exists
+                # because of an 8h36m silent outage.
+                if _alert(f"IB Gateway/TWS has not answered on port {port} for "
+                          f"{down_for / 60:.0f} min, and NO automated recovery is "
+                          f"configured on this host ({script} not found). "
+                          f"MANUAL ACTION NEEDED — start TWS/Gateway; the bot "
+                          f"resumes on its own once the port answers."):
+                    self._last_gateway_alert = now
             return
 
         self._gateway_recoveries += 1
@@ -500,9 +640,13 @@ class BotManager:
             now = datetime.now()
             if (self._last_gateway_alert is None
                     or (now - self._last_gateway_alert) > timedelta(minutes=30)):
-                self._last_gateway_alert = now
-                _alert(f"cannot start bot — IB Gateway not available on port {gw_port}. "
-                       f"Is Gateway/TWS logged in?")
+                # W18: consume the throttle only on a DELIVERED page. W17's
+                # w17-01b fixed this ordering in _maybe_recover_gateway and
+                # claimed the class; it covered 2 of the 4 sites sharing
+                # _last_gateway_alert. This is one of the two it missed.
+                if _alert(f"cannot start bot — IB Gateway not available on port "
+                          f"{gw_port}.{_port_hint(gw_port)} Is Gateway/TWS logged in?"):
+                    self._last_gateway_alert = now
             return
 
         _log("info", "bot_starting")
@@ -612,8 +756,21 @@ class BotManager:
             # were blind to (R5-D1). Restart + alert.
             try:
                 _hb = DATA_DIR / "bot_heartbeat"
-                from ait.utils.time import is_market_open as _imo_hb
-                if _imo_hb() and _hb.exists():
+                try:
+                    from ait.utils.time import is_market_open as _imo_hb
+                    _mkt_open = _imo_hb()
+                except Exception as _ce:  # noqa: BLE001
+                    # W20d, same class as the marker site below: a calendar
+                    # fault here escaped to the OUTER handler and silently
+                    # disarmed hang detection for the whole outage — a hung
+                    # event loop mid-session would then go unnoticed, which is
+                    # the exact failure class (R5-D1) this check exists for.
+                    # Fall back to the calendar-free clock proxy so the check
+                    # stays armed through a weekday RTH.
+                    _log("warning", "heartbeat_market_check_failed",
+                         error=str(_ce))
+                    _mkt_open = _assume_market_open_on_clock()
+                if _mkt_open and _hb.exists():
                     _age_min = (datetime.now() - datetime.fromtimestamp(
                         _hb.stat().st_mtime)).total_seconds() / 60
                     if _age_min > 15:
@@ -640,8 +797,21 @@ class BotManager:
                 try:
                     from ait.utils.time import is_market_open
                     market_open = is_market_open()
-                except Exception:
-                    market_open = False
+                except Exception as _e:  # noqa: BLE001
+                    # W20d: this was a bare `market_open = False`, which FAILS
+                    # OPEN — "I don't know" unlocked the restart branch below,
+                    # so a single calendar fault restarts the LIVE bot
+                    # mid-session with positions open. Probed 2026-09-16 on
+                    # this CEST box: with the calendar faulted, 09:05, 10:05,
+                    # 11:05, 13:05 and 15:05 ET ALL took the restart branch.
+                    # Note W20b alone does not close this — making
+                    # _in_post_market_window timezone-correct fixes the
+                    # function and leaves the hole, because returning False
+                    # mid-RTH is the *right* answer to "are we post-market?".
+                    # The hole is here, in the caller.
+                    _log("warning", "fresh_models_market_check_failed",
+                         error=str(_e))
+                    market_open = _assume_market_open_on_clock()
                 if market_open:
                     _log("info", "fresh_models_restart_deferred_market_open")
                 elif _in_post_market_window():
@@ -693,16 +863,19 @@ class BotManager:
         # (incl. FOMC eve 2026-06-16 and FOMC morning 2026-06-17).
         gw_port = int(os.environ.get("IBKR_PORT", "4002"))
         if not _gateway_listening(gw_port):
-            _log("info", "bot_restart_deferred_gateway_down", port=gw_port)
+            _log("info", "bot_restart_deferred_gateway_down", port=gw_port,
+                 other_ib_port_open=(_port_hint(gw_port) or "none"))
             now = datetime.now()
             if self._gateway_down_since is None:
                 self._gateway_down_since = now
             if (self._last_gateway_alert is None
                     or (now - self._last_gateway_alert) > timedelta(minutes=30)):
-                self._last_gateway_alert = now
-                _alert(f"IB Gateway unreachable on port {gw_port} (likely daily "
-                       f"maintenance). Bot start deferred; will resume "
-                       f"automatically when Gateway returns. No budget spent.")
+                # W18: same missed throttle-ordering site as above.
+                if _alert(f"IB Gateway unreachable on port {gw_port} (likely daily "
+                          f"maintenance).{_port_hint(gw_port)} Bot start deferred; "
+                          f"will resume automatically when Gateway returns. "
+                          f"No budget spent."):
+                    self._last_gateway_alert = now
             # ops-substrate-01: deferring FOREVER is the absorbing state. After
             # a grace period, try to bring the Gateway back ourselves.
             self._maybe_recover_gateway(gw_port, now)
@@ -1628,8 +1801,14 @@ def _backtest_catchup_due(now: datetime, reports_dir: Path | None = None) -> boo
 
     True when the newest backtest_*.json predates the most recent Sunday
     20:00 slot (or none exists at all — the observed state: exactly one run
-    since March). `now` is naive local time (box runs ET), matching the
-    artifact mtimes it is compared against."""
+    since March). `now` is naive local time, matching the artifact mtimes it
+    is compared against.
+
+    W20: this said "naive local time (box runs ET)" — false since the CEST
+    move, and harmless only because BOTH sides of the comparison are naive
+    local. The Sunday-20:00 slot is therefore the BOX's 20:00, not ET's;
+    immaterial for a weekly catch-up, but do not read an ET guarantee into
+    this function."""
     d = reports_dir if reports_dir is not None else REPORTS_DIR
     # Most recent Sunday-20:00 slot at or before `now` (Mon=0..Sun=6).
     due = (now - timedelta(days=(now.weekday() + 1) % 7)).replace(
@@ -1830,7 +2009,10 @@ def main():
     # DEFERRED 10 min (never synchronously in main(), #69) and never runs
     # during market hours: pushed past 16:30 ET if it would land in-session.
     try:
-        _now_bt = datetime.now()  # naive local (=ET box), matches file mtimes
+        # W20: naive local, matching the file mtimes it is compared against.
+        # The old comment said "(=ET box)" — false since the CEST move. The
+        # CODE is still right: both sides of the comparison are naive local.
+        _now_bt = datetime.now()
         if _backtest_catchup_due(_now_bt):
             _bt_at = _backtest_catchup_run_at(_now_bt)
             scheduler.add_job(run_backtest, "date", run_date=_bt_at,

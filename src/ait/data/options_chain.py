@@ -314,6 +314,12 @@ class OptionsChain:
     # R12-B: computed once on build (see __post_init__) so strategies read
     # them off the chain without refetching or re-deriving vol.
     atm_iv: float = 0.0
+    # W19 (w17-07): True when NO contract in the chain carried a usable IV, so
+    # _chain_iv fell back to a hardcoded 0.30 and every backfilled delta is a
+    # guess. iron_condor's degraded_greeks gate reads this — before W19 that
+    # gate rejected only when no delta was non-zero, which the backfill
+    # guarantees never happens.
+    iv_is_guessed: bool = False
     expected_move: float = 0.0
     # R16: which feed actually produced this chain ("ibkr" | "yahoo_delayed").
     # The IBKR->Yahoo degradation was completely silent, so entry telemetry
@@ -373,6 +379,10 @@ class OptionsChain:
             # R12-B: carry the FULL chain's vol stats — recomputing from a
             # delta-filtered (OTM-only) subset would bias ATM IV.
             atm_iv=self.atm_iv,
+            # W19: must propagate with atm_iv — a filtered chain that
+            # loses this flag silently re-arms nothing and disarms the
+            # degraded_greeks gate again.
+            iv_is_guessed=self.iv_is_guessed,
             expected_move=self.expected_move,
             source=self.source,
         )
@@ -432,6 +442,10 @@ class OptionsChain:
             ],
             # R12-B: carry the full chain's vol stats (see filter_by_delta).
             atm_iv=self.atm_iv,
+            # W19: must propagate with atm_iv — a filtered chain that
+            # loses this flag silently re-arms nothing and disarms the
+            # degraded_greeks gate again.
+            iv_is_guessed=self.iv_is_guessed,
             expected_move=self.expected_move,
             source=self.source,
         )
@@ -911,6 +925,18 @@ class OptionsChainService:
         try:
             from py_vollib.black_scholes.greeks.analytical import delta, gamma, theta, vega
             from py_vollib.black_scholes.implied_volatility import implied_volatility
+            # W19 (w17-07): py_lets_be_rational raises these when the observed
+            # price sits outside the no-arbitrage band — i.e. the QUOTE is
+            # impossible, not the solve. Kept separate from convergence
+            # failures so a bad market can be counted as a bad market.
+            try:
+                from py_lets_be_rational.exceptions import (
+                    AboveMaximumException,
+                    BelowIntrinsicException,
+                )
+                _ARBITRAGE_ERRORS: tuple = (BelowIntrinsicException, AboveMaximumException)
+            except Exception:  # noqa: BLE001 — older/newer lib layout
+                _ARBITRAGE_ERRORS = ()
         except ImportError:
             log.debug("py_vollib_not_available", action="skipping greeks calculation")
             return
@@ -927,10 +953,28 @@ class OptionsChainService:
         _ivs = sorted(c.implied_vol for grp in (chain.calls, chain.puts)
                       for c in grp
                       if c.implied_vol and c.implied_vol >= MIN_PHYSICAL_IV)
+        # W19 (w17-07): when the chain carries NO usable IV at all, this is a
+        # hardcoded GUESS, and every delta backfilled from it is a guess too.
+        # That is the genuinely degraded case — surfaced on the chain so
+        # iron_condor's degraded_greeks gate can see it. Before W19 the gate
+        # rejected only when NO delta was non-zero, which backfill guarantees
+        # never happens: the gate was disarmed by the very degradation it
+        # exists to catch (its comment names the 07-07 SPY condor that filled
+        # a "0.20-delta" short call at 0.49 DELTA).
         _chain_iv = _ivs[len(_ivs) // 2] if _ivs else 0.30
+        chain.iv_is_guessed = not _ivs
 
         none_greeks = 0
+        # W19 (w17-07): iv_solved_from_price was incremented INSIDE the try,
+        # after success — it counted successes only, and with no attempt
+        # counter failures could not even be derived by subtraction. A quote
+        # outside the no-arbitrage bounds (stale, crossed, genuinely
+        # mispriced) was indistinguishable from a convergence miss, and both
+        # were silent.
+        iv_solve_attempted = 0
         iv_solved_from_price = 0
+        iv_solve_failed_arbitrage = 0
+        iv_solve_failed_other = 0
         for contracts in (chain.calls, chain.puts):
             for c in contracts:
                 # R16: ib_insync maps IB's "not yet computed" sentinels to
@@ -968,11 +1012,19 @@ class OptionsChainService:
                 # scratch input.
                 if not c.implied_vol or c.implied_vol < MIN_PHYSICAL_IV:
                     if c.has_two_sided_quote:
+                        iv_solve_attempted += 1
                         try:
                             c.implied_vol = implied_volatility(
                                 c.mid, S, c.strike, t, r, flag)
                             iv_solved_from_price += 1
+                        except _ARBITRAGE_ERRORS:
+                            # The QUOTE is impossible, not the solver: mid is
+                            # outside the no-arbitrage band. A data-quality
+                            # signal worth surfacing on its own.
+                            iv_solve_failed_arbitrage += 1
+                            c.implied_vol = _chain_iv
                         except Exception:
+                            iv_solve_failed_other += 1
                             c.implied_vol = _chain_iv
                     else:
                         c.implied_vol = _chain_iv
@@ -995,8 +1047,24 @@ class OptionsChainService:
             log.debug(
                 "greeks_none_coerced", symbol=chain.symbol, contracts=none_greeks
             )
-        if iv_solved_from_price:
+        if iv_solve_attempted:
             log.debug(
                 "iv_solved_from_price", symbol=chain.symbol,
                 contracts=iv_solved_from_price,
+                attempted=iv_solve_attempted,
+                failed_arbitrage=iv_solve_failed_arbitrage,
+                failed_other=iv_solve_failed_other,
+            )
+        if iv_solve_failed_arbitrage:
+            log.warning(
+                "iv_solve_quote_outside_arbitrage_bounds", symbol=chain.symbol,
+                contracts=iv_solve_failed_arbitrage,
+                detail="mid is below intrinsic or above maximum — stale, "
+                       "crossed or mispriced quote; chain median substituted",
+            )
+        if chain.iv_is_guessed:
+            log.warning(
+                "chain_iv_is_a_guess", symbol=chain.symbol,
+                detail="no contract carried a usable IV; every backfilled "
+                       "delta derives from a flat 0.30 assumption",
             )

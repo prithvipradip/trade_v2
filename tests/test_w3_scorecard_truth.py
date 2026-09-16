@@ -243,6 +243,14 @@ class TestVerdictMetric:
 # ==========================================================================
 class TestSlippageCriterion:
     def test_is_a_percent_of_credit_median_not_a_dollar_mean(self, tmp_path):
+        """W3's property — a PERCENT median, never a dollar mean — still holds.
+
+        W18 (w17-09) changed what the criterion DOES with that number: the
+        executions table has no entry/exit marker, so the population is all
+        fills and is not the pinned ENTRY slip. The criterion is therefore
+        UNAVAILABLE and the median is rendered as FYI. The statistic W3 fixed
+        is unchanged and still asserted here; only `passed` moved, because a
+        criterion that cannot be computed as pinned must not pass a gate."""
         st = _seed(tmp_path)
         v = compute_go_live_verdict(st._db_path)
         # |fill-mid| dollars are 0.10/0.12/0.16/0.28 -> a DOLLAR MEAN of 0.165
@@ -253,13 +261,29 @@ class TestSlippageCriterion:
         text = v.criterion("slippage").render()
         assert "median 3.0% of credit" in text
         assert "$0.16" not in text and "$0.17" not in text
-        assert v.criterion("slippage").passed is True
+        # W18: no longer gates — it cannot be computed as pinned.
+        assert v.criterion("slippage").available is False
+        assert v.criterion("slippage").passed is None
+        assert "not comparable" in text
 
     def test_trend_clause_is_reported(self, tmp_path):
+        """The trend suffix survives W18's UNAVAILABLE change — the operator
+        keeps every number they had, just without a false gate verdict."""
         st = _seed(tmp_path)
         v = compute_go_live_verdict(st._db_path)
         assert v.slip_trend is not None
         assert "trend" in v.criterion("slippage").render()
+
+    def test_w18_reports_what_the_filters_dropped(self, tmp_path):
+        """w17-09: slip_n reported SURVIVORS as if it were the sample size.
+
+        Criteria [1] and [3] in this same module already surface their coverage
+        holes (v.excluded, dd_missing_car); [4] did not, so a shrinking sample
+        was indistinguishable from a healthy one."""
+        st = _seed(tmp_path)
+        v = compute_go_live_verdict(st._db_path)
+        assert v.slip_total_fills >= v.slip_n, "total must be countable, not just survivors"
+        assert hasattr(v, "slip_dropped_orphan") and hasattr(v, "slip_dropped_no_mid")
 
     def test_unavailable_when_no_fill_carries_a_live_mid(self, tmp_path):
         st = _seed(tmp_path, executions=[])

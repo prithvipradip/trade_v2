@@ -327,7 +327,7 @@ class IBKRClient:
         log.warning("ibkr_not_connected", action="reconnecting")
         return await self._reconnect()
 
-    async def verify_can_trade(self) -> bool:
+    async def verify_can_trade(self) -> bool | None:
         """Detect whether the Gateway session can actually place orders.
 
         The recurring silent killer: Gateway logs in READ-ONLY (session-level,
@@ -346,7 +346,9 @@ class IBKRClient:
             spy = Stock("SPY", "SMART", "USD")
             q = await self._ib.qualifyContractsAsync(spy)
             if not q:
-                return True  # can't probe; don't false-alarm
+                # W18 (w17-08): UNKNOWN, not True. The probe could not run, so
+                # we have not established that orders work.
+                return None
             order = LimitOrder("BUY", 1, 1.00, tif="DAY")
             trade = self._ib.placeOrder(q[0], order)
             await asyncio.sleep(2.5)
@@ -372,8 +374,16 @@ class IBKRClient:
             log.info("trading_verified", status=status)
             return True
         except Exception as e:  # noqa: BLE001
+            # W18 (w17-08): this returned True — "this session can place
+            # orders" — after failing to place the probe. W17 batch 2 proved it
+            # for ConnectionError/TimeoutError/RuntimeError with placeOrder
+            # never called. The probe exists to catch a READ-ONLY Gateway
+            # session (Error 321, orders rejected while the bot logs
+            # trading_verified); answering True on an error restores exactly
+            # that silent failure. None == UNKNOWN, the sentinel this repo
+            # already uses (RESTRICTED_UNREADABLE, get_all_open_trades).
             log.warning("verify_can_trade_error", error=str(e))
-            return True  # probe failed for another reason; don't block
+            return None
 
     def _get_reconnect_lock(self) -> asyncio.Lock:
         """R16: lazily-created reconnect mutex (instances built via __new__ in

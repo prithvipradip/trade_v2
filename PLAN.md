@@ -2481,3 +2481,915 @@ claim was wrong (wrong key name).
 PROOF: tests/test_take_profit_study_injection.py, 28 executing tests (26 failed pre-change;
 the other 2 are regression guards on already-correct behaviour). Suite 1606 green, type gate OK. Reports:
 reports/take_profit_study/entry_dte_config/, entry_dte_18/.
+
+## 2026-09-15 - W16 EXECUTED: the four platform gaps, one of which had already fired
+R25's plat-01 MATERIALIZED before the fix landed, and the logs are the proof:
+07:33:41 -> 16:09:41 CEST, `bot_restart_deferred_gateway_down` x133,
+`gateway_recovery_unavailable` x134, `gateway_recovery_attempt` x0, pages x0.
+TWS had been closed by accident at 07:33; the supervisor deferred for 8h36m
+(~40 min of it inside RTH) and NOTHING told anyone. Book was FLAT (0 open
+positions), so the cost was lost opportunity, not unmanaged exposure — but with
+an open book this is the 2026-09-08 shape exactly: positions, no exit engine.
+The accidental cause is what makes the fix matter MORE, not less: no automation
+can un-close an app a human closed, so for this shape the PAGE IS the recovery.
+
+[A1] `master.py:433` returned silently when the start script is absent, and that
+    return sits BEFORE `self._gateway_recoveries += 1`, so the counter never
+    moved and the "MANUAL ACTION NEEDED" escalation at :422-431 was unreachable
+    on any host without C:\IBC\StartGateway.bat. Now pages on the unavailable
+    path, sharing the existing 30-min `_last_gateway_alert` throttle so the
+    2-min health loop cannot spam. The counter is deliberately NOT incremented
+    (no attempt was made). EXECUTION PROOF on this host, nothing mocked: 3
+    simulated cycles -> 2 pages (cycle 2 throttled, cycle 3 past 30 min),
+    message naming port, duration and the action.
+    W13's own suite passed green here throughout, because
+    test_w13_gateway_recovery.py patches `os.path.exists -> True` at six sites.
+    Its `test_missing_start_script_is_reported_not_crashed` asserted only what
+    did NOT happen (no Popen, counter 0) and never asserted a page — it
+    PERMITTED the silence. Both original assertions still hold; the missing one
+    is now there, plus two throttle tests.
+[A2] `_gateway_process_alive()` was `powershell Get-Process java` — the only one
+    of the four Windows-only siblings with a FULLY silent except, and its
+    unmeasured False is stamped into gateway_recovery_attempt as
+    wedged_process=False: the log asserted a fact it never measured. Now psutil.
+    Probed live: True (finds the TWS JVM); was False. Fail direction unchanged,
+    silence removed.
+[A3] `status.py:_proc_running()` — the FOURTH powershell sibling, the one the
+    09-14 entry missed. Probed live against a healthy supervisor+bot: (False, 0)
+    — reported the bot DOWN while it was UP; now (True, 2). The 09-14 fix went
+    to one CALL SITE, not to the IDIOM, so the scan existed in four places. It
+    now lives once, in `ait/utils/process.py`, shared by master.py and
+    status.py. A failed scan returns None, never [] — "I could not look" and "I
+    looked and found nothing" are different facts, and collapsing them is how
+    the guard became a silent no-op in the first place.
+[A4] `_acquire_singleton_lock` ended `except Exception: return True`, and True
+    means "you hold the lock, proceed" — a permission/disk/fcntl fault ADMITTED
+    A SECOND SUPERVISOR, one layer above the guard fixed on 09-14. Two bots is
+    the 07-13 triple-fill/position-reversal class. Now fails CLOSED and pages,
+    following W15's pattern (log _fail_closed, throttled page, inner try so a
+    paging failure cannot flip the gate open). The old comment argued "lock
+    plumbing must never keep the bot down"; W15 settled that trade — a stopped
+    bot is visible and recoverable, a second bot corrupts the book.
+[B1] THE OPS SUBSTRATE NOW EXISTS OFF WINDOWS. `find . -name "*.sh" -o -name
+    "*.plist"` returned ZERO: keeper_ait.bat is BOTH the 90s relauncher AND the
+    dead-man ping gate, and on macOS neither existed. The supervisor was found
+    running out of a VS Code integrated terminal (zsh <- Code Helper <- Visual
+    Studio Code) — quitting the editor would have killed the trading bot. Added
+    ops/keeper_ait.sh + a launchd template + installer, ADDITIVE: keeper_ait.bat
+    is byte-stable because test_r16_tail_fixes::TestKeeperBat and
+    test_w6_ops_surfaces pin its exact text. Reuses what already exists rather
+    than reimplementing it — `_acquire_singleton_lock` is the real double-launch
+    guard (the keeper's check is advisory), and `_ROTATE_TARGETS` already caps
+    keeper.log. Paths are derived, never baked: the .bat hardcodes another
+    user's home, which is the mistake the template exists to avoid. NOT
+    INSTALLED — starting a process that manages the bot is the user's call.
+[B2] scripts/verify_deadman.py hardcoded keeper_ait.bat and asserted `curl.exe`,
+    so on macOS it validated a file that never runs here — reassurance about the
+    wrong mechanism. Now platform-selects the live keeper. It currently reports:
+    keeper wired to ping TRUE, ping gated on bot TRUE, liveness ALIVE
+    [heartbeat_fresh], deadman file MISSING -> STATUS: NOT ARMED.
+TWO SELF-CORRECTIONS, recorded because the register is only worth what its
+honesty is worth. (1) My first shared-helper design was WRONG: I claimed
+whole-argv TOKEN matching was precise, and a test I wrote caught that it is not
+— in `grep -r ait.main src/` the token IS its own element. Only `-m` adjacency
+distinguishes a bot from a mention; the real bot is spawned at master.py:585 as
+[sys.executable, "-m", "ait.main", "--paper"]. I had also left a docstring still
+asserting the old claim — the same stale-comment defect R25 registered against
+strategies/base.py. (2) That change failed
+test_r16_ops_fixes::TestScanForeignBotPidsRealBody, whose fixture spawned
+`python -c ... ait.main` — a STRAY token, i.e. the fixture enshrined the
+false-positive shape. Amended to the real spawn shape and a negative test added
+pinning that a mere mention is not a bot. An existing assertion was changed, so
+it is said out loud here rather than buried in a diff.
+PROOF: every new test proven to fail against pre-fix source (git stash of the
+source files only) — 3 for A1, 10 for A2/A3/A4, 4 for B2 — then pass restored.
+Suite 1612 passed / 43 skipped / 1 pre-existing local-.env failure
+(test_r19_config_authority, unchanged and gitignored), was 1583. typecheck OK,
+byte-compile OK, SMOKE PASS 13.
+LESSON (process): my FIRST full-suite run reported 3 failures, two of which I
+caused by editing master.py WHILE the suite ran — test_r16_tail_fixes uses
+inspect.getsource(), which reads the file from disk at line offsets captured at
+import time, so the offsets went stale mid-run. Not a defect, not pollution: a
+full-suite result is only meaningful if the tree holds still underneath it. The
+clean re-run is the one quoted above.
+STILL OPEN, USER-SIDE: (U1) the dead-man has NEVER been armed —
+data/deadman_url.txt does not exist, unarmed since 07-09, and the keeper is half
+a safety net without it; (2) ops/install_launchd.sh is written but not run;
+(3) three false `gateway_recovery_unavailable` lines at 20:47:29 in
+logs/orchestrator.log were planted by my own A1 execution probe — `_log`
+suppresses its file sink only under pytest (R16 #56), not for ad-hoc probes.
+Removing them was correctly refused as audit-log tampering; the call is the
+user's.
+
+## 2026-09-15 - W16b CORRECTION: the POSIX keeper, launchd and the dead-man are RETIRED
+The W16 entry above is now PARTLY WRONG and this corrects it rather than
+rewriting it. W16's [A1]-[A4] and [B2] stand and are DEPLOYED (supervisor pid
+41807 started 22:33:24, after the 21:40:59 commit — A1's page is live). [B1] —
+ops/keeper_ait.sh, ops/install_launchd.sh, ops/com.ait.keeper.plist.template —
+has been DELETED, and the healthchecks.io dead-man with it.
+
+WHY, and the mistake underneath it. I built B1 on an unexamined premise. The
+keeper exists on Windows for a reason its own header states plainly
+(keeper_ait.bat:4-7): it "survives whatever is killing python on this machine
+on a ~30-60 min cycle. This is a band-aid over that machine-level issue, not a
+fix for it." That pathology is WINDOWS-BOX-SPECIFIC. Nothing establishes it
+happens on the Mac — the supervisor ran 18h41m straight here without dying. I
+ported the band-aid without checking whether this machine has the wound. R24's
+own critic list warns about exactly this class (machinery carried forward
+because it exists, not because it earns its place).
+
+THE OPERATOR MODEL I HAD WRONG. W16 was scoped from "the bot must survive
+unattended", which I read as "needs a keeper + a login-time daemon". The actual
+model, stated 2026-09-15: "I maintain control on when I start the bot. Once
+started, it should be kept running, until I shut it down." Start and stop are
+DELIBERATE HUMAN ACTS. The keeper cannot tell "crashed" from "the operator
+stopped it" — both are just an absent process — so with it installed, Ctrl-C
+would have been undone within one ~90s loop and the bot could not have been
+turned off at all. That is a direct functional conflict with the operating
+model, not a tuning detail.
+
+THE DEAD-MAN, AND WHY U1 IS NOW A DECISION NOT A GAP. healthchecks.io was armed
+(Period 5m / Grace 15m, per verify_deadman.py's own docstring) and then found to
+assume CONTINUOUS uptime: the keeper pings every ~90s including outside RTH
+(bot_liveness returns ok=True [not_rth]), so any planned shutdown is
+indistinguishable from a crash and alarms 20 min later. PLAN.md:33 already
+records that this bot's machines are NOT always-on ("box on by 09:25 ET on
+trading days (Start-menu shutdowns at ~22:00 are fine)"), so the configuration I
+recommended would have false-alarmed every night — and a nightly alert you learn
+to ignore is worse than no alert. The operator's call: delete the check, the
+layer is premature. U1 ("dead-man UNARMED since 07-09") should therefore no
+longer be read as an oversight to close; it is a DEFERRED DECISION. Revisit it
+if and when the box becomes genuinely always-on or unattended for long stretches
+— at which point the clean design (no keeper) is: bot pings on its own health
+cycle, and master.py's existing SIGINT/SIGTERM graceful_shutdown pauses the check
+as its last act, so Ctrl-C is indistinguishable from intent. That needs a
+healthchecks.io management API key (there is no /pause ping endpoint).
+
+ALSO FOUND AND NOT WORTH FIXING: the LaunchAgent could not run at all on this
+host — `Operation not permitted` on getcwd and on the script itself (exit 126, 6
+throttled retries before I unloaded it). Cause is macOS TCC: ~/Documents is a
+protected folder and a launchd-spawned job inherits none of the grant the
+Terminal/VS Code process tree already has, and a headless agent cannot show the
+consent prompt. The fix would have been Full Disk Access for /bin/bash (coarse,
+system-wide) or relocating the repo out of ~/Documents. Both were made moot by
+the decision above — worth recording because any future attempt to daemonise
+anything in this repo will hit the same wall.
+WHAT SURVIVES AND IS LIVE: A1 (gateway escalation — the 8h36m fix), A2/A3
+(psutil process scans, one shared idiom in ait/utils/process.py), A4 (singleton
+lock fails closed), B2 (verify_deadman platform selection). keeper_ait.bat and
+verify_deadman.py remain valid for the WINDOWS host, which is still primary
+alongside the Mac; on macOS the verifier now correctly reports "not plumbed",
+true by decision rather than oversight. tests/test_w16_platform_gaps.py keeps a
+note where TestPosixKeeper used to be, so a later round does not "restore
+missing coverage" by resurrecting retired machinery.
+HOUSEKEEPING: the three false `gateway_recovery_unavailable` lines my own A1
+execution probe planted in logs/orchestrator.log at 20:47:29 were REMOVED with
+operator authorization (backup kept outside the repo). The underlying gap is
+real and unfixed: `_log` suppresses its file sink only under pytest (R16 #56),
+so any ad-hoc probe still writes to the production forensic log. Registered, not
+fixed.
+
+## 2026-09-15 - W17 BATCH 1: five R25 leads probed — 4 VERIFIED, 1 PARTIAL, 2 NEW (one of them mine)
+R25 left 49 single-lens leads. W17 converts them to verdicts in consequence order, stopping after
+each batch so the tail can be re-ranked. Register: reports/w17_probes_batch1_20260915.md; the five
+§5 entries in the R25 register are stamped inline with their verdicts so it stops presenting
+settled leads as open. Method unchanged: two-lens, and every probe drove the REAL function with
+mocks only at the external edge. Probe hygiene held — PYTEST_CURRENT_TEST set before any
+supervisor call, and 0 probe lines reached logs/orchestrator.log (the hazard that planted three
+false lines during W16).
+
+RE-RANKED BEFORE PROBING, because W16b changed the board: retiring the dead-man made Telegram the
+ONLY alerting channel, which promoted the alert path itself from lead 7 to rank 1 — and A1, shipped
+hours earlier, rides exactly that path.
+
+[w17-01] `_alert()` IS SINGLE-SHOT AND NOTHING COUNTS ITS FAILURES — VERIFIED. Probe: 1 urlopen
+    attempt (a retrying impl would be >1), returns False, and NO TELEGRAM_DEAD marker after 7
+    consecutive failures. orchestrator.py:4278-4318 does 3 attempts with backoff and trips a
+    dead-channel marker at 5; the supervisor's 21 call sites — including STATE DB BACKUP FAILED
+    (:1177) and GO-LIVE SCORECARD FAILED (:1480) — have none of it.
+[w17-01b] AND A1 PROPAGATED A THROTTLE DEFECT — VERIFIED, NEW, MINE. Both gateway-escalation sites
+    set `_last_gateway_alert = now` BEFORE calling _alert() and discarded its bool, so a FAILED
+    send still consumed the 30-minute throttle. Probe: after one dropped page, 0 further attempts
+    in the next 20 minutes. One dropped packet bought 30 minutes of silence on the page that
+    exists BECAUSE of an 8h36m silent outage. The pre-existing sibling at :422-431 had the
+    identical ordering — I copied a defect faithfully rather than inventing one. FIXED AT BOTH
+    SITES (fix the class, not the instance): the throttle is now consumed only on a delivered
+    page. Re-probed: 3 attempts over 20 min when Telegram drops, 1 when it delivers.
+[w17-02] A CALENDAR FAULT MAKES A DEAD BOT READ HEALTHY — VERIFIED, CONSEQUENCE RESTATED. Same
+    6-hour-stale heartbeat: with a working calendar `ok=False state=heartbeat_stale`; with the
+    calendar raising, `ok=True state=not_rth`. Driven end-to-end through the real dashboard panel:
+    liveness_panel() returns 'stale' normally and 'ok' under the fault. R25 claimed the victim was
+    the dead-man ping — that consumer no longer exists after W16b. The live victim is
+    dashboard/app.py:475. The lead was right about the mechanism and wrong about the blast radius;
+    both are recorded. Fix direction: an unavailable calendar is UNKNOWN, not CLOSED — return a
+    third state and render NOT WIRED, the pattern read_channel_state already uses at :924-971.
+[w17-03] combo() VALIDATES NOTHING, BUT THE EXIT PATH CANNOT EXPLOIT IT — PARTIAL, and R25
+    OVERSTATED THIS. Probe: every leg shape the entry gate rejects is built silently — action
+    'HOLD', conId 0, ratio 99, ratio None, lowercase 'buy'. That half is VERIFIED. But the exit
+    path's legs are well-formed BY CONSTRUCTION: :3390-3392 aborts on a failed qualify (conId
+    cannot be 0), the action is rebuilt as a literal, and ratio always resolves to the default.
+    No reachable path produces a malformed leg. The real risk is that the invariant rests on three
+    unrelated implementation details with nothing enforcing it, on a builder with zero tests.
+[w17-03b] LEG `ratio` IS DROPPED ON PERSISTENCE — VERIFIED, NEW. executor.py:367-375 writes only
+    strike/right/action/expiry, so every exit rebuilds at ratio=1 regardless of entry. Inert today
+    (all strategies 1:1); becomes a silent structure change the moment a ratio spread is enabled —
+    the exit would close a different shape than the entry opened.
+[w17-04] THE DASHBOARD'S "WIN RATE" DIVIDES CLOSE-DAY WINS BY ENTRY-DAY ENTRIES — VERIFIED, with a
+    real instance in this DB. trades_taken increments at ENTRY (:2620); trades_won/lost at CLOSE
+    (:788-791); app.py:640-642 divides one by the other. Both real daily_stats rows —
+    2026-04-23 and 04-24, taken=5 won=0 lost=0 — render as "Win Rate 0%" on days with FIVE entries
+    and ZERO losses. Boundaries from the same expression: taken=0/won=2 shows "N/A" (a day of pure
+    wins shows nothing), taken=1/won=3 shows "300%". Compounded by the real-close asymmetry: the
+    drain path consults is_real_close (:688-691), the fill-callback path (:785-797) does not, and
+    the dashboard cannot filter what daily_stats has already aggregated.
+[w17-05] THE PARTIAL-EXIT ORDER CARRIES NO orderRef — VERIFIED. OrderBuilder.market() returns a
+    bare MarketOrder; the tree has exactly five orderRef assignments (executor 570/798,
+    orchestrator 3046/3087/3674) and :2849 is not among them. reconciler.py:604-609 documents the
+    invariant "every entry/exit order has carried its trade_id in orderRef since R17" and falls
+    back to the symbol/leg heuristic ONLY for pre-R17 orders — so this emits a post-R17 order that
+    reads as pre-R17, triggering the matcher R19 replaced because it could cancel a different
+    trade's working order, "including a live EXIT combo". LATENT: the partial-exit ladder is dead
+    at 1 contract, so it wakes on funding.
+COUNTS: 5 probed -> 4 VERIFIED, 1 PARTIAL, 0 REFUTED, 2 NEW findings surfaced while probing. Zero
+refutations is a smaller sample, not a better hit rate — batch 1 was deliberately the end of the
+list where claims had already survived the most scrutiny. R24 refuted 28 of 137 at this stage and
+R25 refuted 6 of its own, three of them mine.
+PROOF: w17-01b's fix has 3 tests, 2 proven to fail against pre-fix source (the third passes both
+ways ON PURPOSE — it guards against over-correcting into no throttle at all). Suite 1609 passed /
+43 skipped / 1 pre-existing local-.env failure. typecheck OK.
+PROPOSED FIX ORDER: (now, done) w17-01b. (W18) w17-01 give supervisor alerts retry + dead-channel
+accounting — Telegram is the only channel left; w17-02 render a calendar fault as NOT WIRED rather
+than green. (W19) w17-04 compute the Overview metrics from `trades` with _REAL_CLOSE_SQL like every
+other panel already does; then w17-03/03b/05, which are latent today and wake on funding or on a
+strategy change.
+BATCH 2 CANDIDATES: R25 §5 leads 5, 6, 8, 9, 10 and the 39 area leads. Ordering should be revisited
+against what this batch changed — anything whose stated consequence depended on the dead-man needs
+its blast radius restated the way w17-02 did.
+
+## 2026-09-16 - W17 BATCH 2: six probes, all VERIFIED — one consequence corrected downward
+Register: reports/w17_probes_batch2_20260916.md. Pre-probe findings and the batch-3 census were
+committed BEFORE probing (a20f370, b33fa83) because planning artefacts do not survive a session —
+the plan file lives outside the repo. 6 probed, 6 VERIFIED, 0 refuted. Zero refutations is a
+PRE-SELECTED SAMPLE, not a hit rate: 1(b) was refuted and three register claims corrected during
+planning, i.e. before this table existed. No fixes applied (register-don't-fix). No live state
+touched: fixture DBs throughout, data/ait_state.db never written, bot pid 41807 undisturbed.
+
+[w17-06] A SOLVED PER-CONTRACT SIGMA SELECTS A DIFFERENT STRIKE. Real QQQ chain from
+    historical.db (117 puts, S~682, dte=33) through the REAL _find_strike_by_delta: 4 of 5 delta
+    targets pick a different strike — 20, 15, 5 and 5 points — INCLUDING 0.20, the value
+    iron_condor.py:169,177 actually uses. df704d7 changed which strikes the live bot sells; that
+    is a strategy change shipped under a data-correctness heading. NOT PROVEN: the tolerance=0.07
+    trade/no-trade flip did not fire in this slice and must not be cited.
+[w17-07] A BELOW-INTRINSIC QUOTE IS LAUNDERED INTO A HEALTHY-LOOKING CONTRACT. K=60 call, S=100,
+    intrinsic 40, mid 5.0 — py_vollib raises BelowIntrinsicException ("this price is impossible")
+    and _calculate_greeks writes implied_vol=0.24 (chain median) and delta=0.9999 with ZERO log
+    lines. iv_solved_from_price does not increment (it counts successes only). Honest scoping: a
+    ~1.0 delta will not win a 0.20 argmin, so selection risk is low. The real damage is that
+    degraded_greeks (iron_condor.py:161) CANNOT FIRE once backfill has made every delta non-zero —
+    the gate designed to catch a degraded chain is disarmed by the degradation.
+[w17-08] verify_can_trade FAILS OPEN — AND I CORRECTED MY OWN RE-SCOPING. Patched at
+    qualifyContractsAsync (nothing reached a broker): ConnectionError/TimeoutError/RuntimeError all
+    return True with placeOrder never called. But I had called this "a pre-trade safety probe that
+    fails open", implying trading proceeds unguarded. It does not: orchestrator.py:2117 is the sole
+    caller, and BOTH of ITS callers (:513, :900) DISCARD the return value. What can_trade=False
+    actually does is send a Telegram alert — so the real consequence is that THE READ-ONLY ALARM
+    NEVER FIRES, returning the operator to the silent failure the probe exists to prevent.
+    Severity ops_reporting, NOT live_money. R25's framing and my correction of it were both wrong.
+[w17-09] THE GO-LIVE SLIPPAGE GATE MEASURES THE WRONG POPULATION (3 sub-claims, all verified).
+    Fixture: entry fill slipping 2%, EXIT fill slipping 30%, one row with live_mid=0. Result:
+    3 rows written, slip_n=2 (the dropped row vanished uncounted), median 16.0% — the exit fill is
+    in the pool and is divided by the ENTRY credit, and 16% FAILS the 8% gate on the strength of a
+    fill the criterion claims not to measure. At n==1: available=True, passed=True, rendered
+    "median 0.5% of credit over trailing 1 fills". A SINGLE FILL AUTHORISES THE GATE; UNAVAILABLE
+    fires only at n==0.
+[w17-10] THE RESTATE SCRIPT WOULD ZERO DATA THE CURRENT WRITER PRODUCES. Ran the REAL script
+    main() dry against a fixture with one legitimate single-leg fill. It printed that row under
+    "sample rows currently feeding the gate" and then "would clear context on 1 leg rows". Its
+    predicate is con_id != BAG_CON_ID (true of EVERY single-leg order) while the writer branches on
+    is_combo (executor.py:1530-1537) and stores live_mid deliberately on that shape. Compounding:
+    state.py:913-918 never restores a zeroed value and go_live.py:327's WHERE live_mid > 0 then
+    hides it while slip_n reports only survivors — destruction is invisible at the gate BY
+    CONSTRUCTION. This already happened once: three single-leg fills zeroed 2026-08-10.
+[w17-11] _capital_base() REVERTS TO A 3.7x WRONG DENOMINATOR, SILENTLY. With the authority import
+    forced to fail, all three copies return 196,000.00 against a live 723,071.22 — 73% off — behind
+    a bare unlogged except. Also confirmed the three copies are byte-IDENTICAL to each other, so
+    R25's register (which never claimed otherwise) was right and my planning note was wrong. The
+    divergence is copies-vs-authority: they lack the live-NLV tier. app.py:1004 raises this to the
+    12th power for the annualised-return metric.
+PROPOSED FIX ORDER: (W18) w17-09 + w17-10 together — they are ONE LOOP: the gate authorising real
+capital measures the wrong population, and an untested script can silently destroy its inputs; plus
+w17-11. (W19) w17-06 + w17-07 — first DECIDE whether per-contract solved IV is wanted for strike
+selection (it may well be an improvement), then make the choice explicit and instrument the solver's
+failures; plus w17-08's failure counting.
+BATCH 3 IS PRE-STAGED: reports/w17_batch3_failopen_census_20260916.md. R25 registered "54
+silent-swallow sites"; the real scale is 355 except clauses -> 177 candidates -> 120 traced
+(38 decision-affecting / 51 telemetry / 31 cleanup), with a 12-site ranked shortlist. Four of the
+twelve are CALENDAR FAULTS — a single NYSE-calendar failure would concurrently restart the live bot
+mid-session, open the pre-event blackout, and disable both event-driven exits. Probe that as a
+CLASS, not five instances.
+
+## 2026-09-16 - W18 EXECUTED: Gateway port unblock + 4 verified findings fixed (and a W17 miss owned)
+Operator moved TWS -> IB Gateway. That created no defect; it exposed a stale line. Register:
+reports/w17_probes_batch2_20260916.md (the findings), this entry (the fixes).
+
+[0] THE BLOCKER. Port 4002 was OPEN (Gateway paper), 7497 closed, and .env still said
+    IBKR_PORT=7497 — so the supervisor (pid 41807) logged bot_restart_deferred_gateway_down every
+    2 min for 9h47m. Both the supervisor probe and the bot's own connection read that variable,
+    and master.py:603 spawns the child with env={**os.environ}, so the child inherits the
+    SUPERVISOR's env: editing .env does nothing until the supervisor itself restarts. Fixed .env
+    -> 4002 (gitignored, local). The bot had ALREADY been down since ~05:00 for an unrelated
+    reason (TWS disconnect -> SIGTERM), so this outage was not caused by the switch.
+[0b] AND MADE IT SELF-DIAGNOSING. New _port_hint() scans the other known IB ports (4001/4002/
+    7496/7497 — the set .env's own comment documents) and splices a hint into the alert and the
+    log: "nothing is on 7497, but 4002 (IB Gateway paper) IS open — check IBKR_PORT in .env".
+    Verified against live machine state. The mismatch was measurable for ten hours and nothing
+    looked.
+[0c] A W17 MISS, OWNED. W17's w17-01b fixed the "consume the throttle only on a DELIVERED page"
+    ordering and its commit claimed the CLASS. There are FOUR sites sharing _last_gateway_alert;
+    it fixed two (both inside _maybe_recover_gateway) and MISSED two — :572 and :771 — and :771 is
+    the one that had been firing every two minutes for ten hours. The one that actually mattered
+    was the one I missed. Both now gated on delivery; a new test pins all four so the class cannot
+    regress again. This is the third time this session one of my own claims was wrong and the
+    two-lens discipline caught it.
+[1] w17-08 THE READ-ONLY ALARM NO LONGER FAILS OPEN. verify_can_trade returned True after failing
+    to place its probe. It now returns None for UNKNOWN — the sentinel this repo already uses
+    (RESTRICTED_UNREADABLE, get_all_open_trades) — distinct from True (accepted) and False
+    (read-only), and _check_trading_enabled pages on UNKNOWN with its own throttle key. The return
+    value stays unused, correctly: both callers discard it, and the function's job is the ALERT.
+    PROMOTED by the Gateway switch: READ-ONLY login is the failure Gateway actually has, and it
+    recurs on Gateway's daily restart.
+[2] w17-09 THE GO-LIVE SLIPPAGE GATE IS NOW HONEST. It is PINNED as median ENTRY slip, but the
+    executions table has no lifecycle marker (`side` is BOT/SLD direction, not entry/exit), so the
+    pinned statistic CANNOT be computed. Per this module's own promise — "any criterion whose data
+    cannot support the PINNED definition is returned UNAVAILABLE with a reason rather than
+    substituted by a differently-defined number" — criterion [4] is now UNAVAILABLE. The all-fills
+    median is still rendered as explicitly-FYI so no visibility is lost, and the coverage hole is
+    reported the way criteria [1] and [3] already do: "dropped: 1 with no matching trade, 1 with no
+    live_mid of 4 fills". n==1 can no longer pass a gate.
+    VISIBLE BEHAVIOUR CHANGE, NOT A REGRESSION: the scorecard will now show [4] as UNAVAILABLE
+    rather than a number. That is the point — it was showing a differently-defined number.
+    Chose UNAVAILABLE over adding a lifecycle column (operator decision): arch-02 found there is
+    no migration engine, so a schema change carries its own risk.
+[3] w17-10 scripts/restate_r16_executions.py DELETED. Its predicate (con_id != BAG_CON_ID) is true
+    of EVERY single-leg order while the writer branches on is_combo, so it would zero fill-quality
+    context the current writer legitimately produces — W17 batch 2 ran it for real and it printed a
+    legitimate row under "sample rows currently feeding the gate" then declared it would clear it.
+    One-off repair, applied on the Windows box 2026-08-10, never applied here, zero tests. Ledger
+    records what it did; git retains the file. The tested sibling restate_r16_dailystats is kept.
+[4] w17-11 NO MORE SILENT WRONG DENOMINATOR. The three local _capital_base() copies are gone,
+    replaced by a direct import of runtime_env.capital_base (which already resolves env -> live NLV
+    -> default, and imports only os/pathlib so it costs no import weight). Each copy had wrapped
+    the authority in a bare unlogged except and fallen back to a SECOND hardcoded 196000 —
+    measured at 196,000 against a live 723,071, then raised to the 12th power for the annualised
+    return. If the authority is ever unreachable the module now fails LOUDLY at import instead of
+    rendering a plausible lie. Also fixed the dead key: app.py queried bot_state['account_value'],
+    NEVER WRITTEN anywhere in src/; it now reads 'last_net_liquidation', which orchestrator.py:1180
+    actually writes.
+TESTS AMENDED, SAID OUT LOUD: two tests in test_w3_scorecard_truth.py pinned the old slippage
+rendering. W3's actual property — a PERCENT median, never a dollar mean — is unchanged and still
+asserted; only `passed` moved, because a criterion that cannot be computed as pinned must not pass
+a gate. A third test was added for the drop reporting. Writing the render also caught two bugs in
+my own first attempt: render() already prepends "UNAVAILABLE — " (I double-prefixed it) and
+DISCARDS the suffix for an unavailable criterion (so the trend clause had to be folded into the
+text, or the operator would have silently lost a number).
+PROOF: every fix has tests proven to fail against pre-fix source (6 for item 0, 6 for items 1+4),
+then pass restored. NOT YET DEPLOYED — .env's new port needs the SUPERVISOR restarted, not just the
+bot child, and that restart is the operator's call.
+
+## 2026-09-16 - W19 DECISION: per-contract solved IV is KEPT for strike selection (chosen, not inherited)
+THE GAP THIS CLOSES IS PROVENANCE, NOT BEHAVIOUR. df704d7 ("Fix implied_vol never getting a real
+backfilled value") changed WHICH STRIKES THE BOT SELLS and nothing in this ledger said anyone chose
+that. W17 batch 2 measured it against a real QQQ chain through the real _find_strike_by_delta: 4 of
+5 delta targets select a DIFFERENT strike, by up to 20 points, including 0.20 — the value
+iron_condor.py:169,177 actually uses. It shipped under a data-correctness heading. An unchosen
+improvement is harder to notice than a defect.
+
+DECISION: KEEP IT. The evidence, measured, not argued:
+* The codebase already documents the mechanism. options_chain.py (finding A6): "when a contract
+  lacks IV, use the chain's MEDIAN observed IV instead of a flat 30% — a wrong sigma shifts the
+  computed delta, and strategies pick strikes BY delta." The trajectory was ALREADY
+  flat-0.30 -> chain-median. Per-contract solved IV is the next step on that same path.
+* How wrong is the median? Against real per-strike IV in data/historical.db
+  (option_spread_samples), restricted to the strikes a condor actually sells (0.08-0.32 delta):
+      QQQ  5d  median IV 0.293  |dIV| 0.0498  =  2.9 strike steps of delta error
+      QQQ 12d  median IV 0.303  |dIV| 0.0747  =  6.4
+      QQQ 19d  median IV 0.261  |dIV| 0.0512  =  5.6
+      QQQ 33d  median IV 0.236  |dIV| 0.0446  =  6.6
+      QQQ 37d  median IV 0.336  |dIV| 0.0804  =  9.7
+  MEDIAN 6.4 STRIKE STEPS of systematic delta error, on every scan, at exactly the traded strikes.
+  The solved sigma removes it.
+LIMIT OF THAT EVIDENCE, STATED SO IT IS NOT OVERSOLD: backfill only fires when IBKR did NOT supply
+a delta, so there is no ground-truth delta to check the result against. This measures the ERROR THE
+MEDIAN INTRODUCES under the standard assumption that the market prices each strike's own vol. It is
+NOT a backtest of outcomes and must not be cited as one. If that assumption is ever to be tested,
+it needs a study, not this entry.
+
+[w17-07 FIXED, part 1] SOLVER FAILURES ARE NOW COUNTABLE. iv_solved_from_price was incremented
+INSIDE the try, after success — a success-only counter with no attempt counter, so failures could
+not even be derived by subtraction, and the except was bare and silent. Now counts attempted /
+solved / failed_arbitrage / failed_other, and logs a WARNING naming contracts whose quote sits
+OUTSIDE THE NO-ARBITRAGE BAND (BelowIntrinsic / AboveMaximum). That is a BAD QUOTE — stale, crossed
+or genuinely mispriced — and is a data-quality signal in its own right, not a solver hiccup.
+
+[w17-07 FIXED, part 2] THE degraded_greeks GATE IS RE-ARMED. It rejected only when NO delta was
+non-zero — and the 09-14 backfill gives EVERY contract a non-zero delta, so the gate became
+unreachable: disarmed by the very degradation it exists to catch. Its own comment names the
+incident it was built for ("the 07-07 SPY condor fill its short call at 0.49 DELTA (designed
+0.20)"). The genuinely degraded case is now explicit: when NO contract carries a usable IV,
+_chain_iv falls back to a hardcoded 0.30 and every backfilled delta is a guess. OptionsChain
+.iv_is_guessed carries that, filter_by_delta and filter_liquid PROPAGATE it (a filtered chain that
+dropped the flag would silently disarm the gate again — the same fragility atm_iv already has), and
+iron_condor rejects on it BEFORE the legacy check, which is retained.
+DELIBERATELY NARROW: not "any backfill happened". A few solved contracts per expiry is routine —
+live logs show 2-55 — and rejecting on that would refuse normal chains. BEHAVIOUR CHANGE ON A
+TRADING GATE: it can now reject entries that currently pass. That is the intent; those are exactly
+the entries the 07-07 incident produced.
+
+[REGISTERED, NOT FIXED — its own wave] THE PRICING CONSTANTS. r = 0.05 is hardcoded at THREE sites
+(options_chain.py, backtesting/engine.py x2) with NO config home — a clean R19c violation. The
+solve also uses py_vollib.black_scholes (no dividend yield) while IBKR's impliedVol uses a dividend
+schedule, so _chain_iv takes a median over TWO DIFFERENT MODELS. Measured at a ~0.20-delta short
+put: dividend yield shifts delta 0.0010 (QQQ) to 0.0027 (IWM); r at 3% vs the hardcoded 5% shifts
+it 0.0044; one $1 strike step is 0.0048 — so roughly ONE strike step, against the 6.4 the decision
+above addresses. Deferred by operator decision: two of the three sites are in the BACKTEST ENGINE,
+and changing them changes backtest results, which breaks comparability with every pre-registered
+study this repo has run. That needs its own wave WITH a re-run plan, not a side effect of this one.
+PROOF: 7 tests, 5 proven to fail against pre-fix source; the 2 that pass both ways are deliberate
+regression guards (the fallback still yields a usable IV; the legacy no-delta check is retained).
+
+## 2026-09-16 - W19 DEPLOYED + WATCH LIST FOR THE OPEN
+This entry closes a gap: the decision/fix record above was written BEFORE the restart, and
+everything after — the deploy itself and what to watch — was only said in chat, not committed. The
+ledger is the persistent record; chat is not. Same class of mistake as the plan-file durability gap
+found earlier this session, now made against PLAN.md itself.
+
+DEPLOY: graceful SIGTERM to supervisor pid 51749's predecessor; took ~45s this time (vs ~1s on the
+prior W18 restart) because the bot child had a live IBKR connection to close — waited rather than
+force-killing a trading process; log confirms shutdown_signal -> bot_stopping -> web_services_stopped
+end to end. Relaunched detached (nohup, PPID reparents to launchd pid 1, survives this session).
+Deployed commit 40e677a (matches `git log -1` on the running tree). Gates before deploy: suite 1630
+passed / 43 skipped / 1 pre-existing local-.env failure, typecheck OK, SMOKE PASS 13.
+VERIFIED POST-RESTART: trading_verified logged (the read-only probe passed on Gateway); 0
+deferred/error/CRITICAL lines in the first 5 min; OptionsChain.iv_is_guessed confirmed present on
+the running code (the W19 gate is live, not just committed).
+
+MANUAL POSITIONS — CONFIRMED BY OPERATOR, NOT A BOT DEFECT. Shutdown logged updatePortfolio for two
+QQQ option legs (strike 712, expiries 2026-09-18 and 2026-10-16) while open_positions read 0 rows.
+Operator confirms: entered MANUALLY, not through the bot. open_positions still reads 0 and
+data/HALT_UNTRACKED has not fired, so nothing is currently frozen — but this is exactly the
+broker-vs-DB shape the untracked-position tripwire (reconciler.py:1078-1088) exists to catch, and
+the reconciler runs every cycle against the LIVE broker state, so this is not a one-time check.
+WATCH: if reconcile() ever decides these ARE untracked (vs. correctly recognizing them as
+operator-owned and out of scope), it freezes ALL new entries via HALT_UNTRACKED until a human
+deletes the file. Confirmed benign right now; not verified to STAY benign through the session.
+
+WATCH LIST FOR THE 2026-09-16 OPEN (09:30 ET, first RTH session on Gateway with W18+W19 live):
+1. Manual QQQ positions above — does data/HALT_UNTRACKED fire once the reconciler runs live?
+2. degraded_greeks rejections (W19) — expected RARE; means a chain arrived with NO usable IV
+   anywhere (every delta a flat-0.30 guess). This is the gate working, not a new fault — but if it
+   fires on every scan rather than occasionally, that says something is wrong with the FEED, not
+   the gate.
+3. iv_solve_quote_outside_arbitrage_bounds / chain_iv_is_a_guess (W19) — new log events; first time
+   they will appear under real market data rather than test fixtures.
+4. Gateway read-only (W18) — first live cycle on Gateway; if it restarts read-only, confirm the new
+   CANNOT VERIFY TRADING alert actually pages rather than assuming the fix works because it passed
+   in tests.
+5. Standard post-deploy check per this repo's own deploy discipline: fresh heartbeat,
+   scan_symbol_timing events, no LOOP IMPAIRED alert.
+
+## 2026-09-16 - BACKLOG CORRECTION: R25's §7 wave table is stale; consolidated here
+User asked directly whether PLAN.md now reflects ALL future work the audit surfaced. Checked
+rather than assumed the answer, and the honest answer was no — worse, the one place that claimed
+to say what's next (reports/full_audit_r25_20260914.md §7) is now WRONG: it proposed W18=tz-01+
+qual-01/02/04, W19=arch-01+arch-03, W20=triage+arch-02+arch-04. Real events consumed those wave
+numbers for the Gateway-port emergency (W18) and the strike-selection decision (W19) instead.
+Anyone reading §7 today would look for undone work under a label now occupied by something else.
+This entry supersedes it — R25 §7 is left in place as history, not edited (this ledger is
+append-only), but is no longer the source of truth for what remains.
+
+VERIFIED UNTOUCHED SINCE R25 (2026-09-14), zero PLAN.md mentions since:
+* tz-01 — hour_of_day (an ML feature) stamped from the host clock; CEST vs ET mismatch on this
+  machine. Cheap only while the meta-labeler corpus stays small (still untrained/default-off).
+* qual-01/02/04 (data/quality.py) — the outlier anchor is poisoned by the outlier it exists to
+  catch (stores the bad price BEFORE checking validity); `ts = timestamp or now` reads a real
+  epoch-0 sentinel as "no timestamp given"; the live exit validator's spread/jump thresholds are
+  code defaults, not config, against the R19c policy.
+* arch-01..04 — the four ARCHITECTURAL findings from R25's holistic pass: no broker boundary
+  (.ib escape hatch, six independent copies of the reqMktData dance — the class behind BOTH the
+  09-14 snapshot bug and the W19 options_chain trio); no state boundary (13 modules + 8 scripts
+  open the DB directly, no schema_version anywhere); cyclic imports (bot<->execution/risk/
+  reporting — the class behind the 09-14 Streamlit crash); orchestrator.py as a god object
+  (4,336 lines, 89 except-blocks, four waves collided in it in eight days). These are STRUCTURAL
+  and explain why instance-fixes keep recurring; none has been started.
+
+VERIFIED UNTOUCHED FROM R25's "remaining leads" AREA LIST (39 leads, by area):
+* Fail-open census (batch 3) — 355 except clauses -> 177 candidates -> 120 traced, 12-site ranked
+  shortlist in reports/w17_batch3_failopen_census_20260916.md. CENSUS DONE, ZERO SITES PROBED.
+  Four of the twelve share one dependency (a calendar fault) — flagged to probe as a class.
+* Broker (ibkr_client.py) — FX cache has no TTL in a days-long process; connect()'s clientId
+  fallback loop, place_order, cancel_order are untested; the local .env account mismatch (demoted
+  to hygiene after a W17 probe showed the account IS enforced at connect, but the stale
+  comment/fixture was never actually fixed).
+* Orders/contracts dead surface — 5 of 9 OrderBuilder methods, 4 of 6 ContractBuilder methods,
+  never called in production.
+* Capital chain — capital_tiers.py:102-108 currency-agnostic thresholds (a CAD figure sits in the
+  comment next to USD-compared numbers); :140 silently falls back to symbols[:4] if the tier's
+  preferred list doesn't intersect the configured universe, bypassing the gate with no signal.
+* Dashboard — five bare-`pass` handlers blank a whole analytics panel while its header still
+  renders (app.py:819,1225,1239,1264,1278); `_safe_query` renders a failed query as an empty book
+  indistinguishable from a real empty book; the real-close predicate has THREE independent
+  implementations with different call conventions.
+* Backtest display — dashboard/walkforward/export.py:687,820-821 return hardcoded 0.16/0.15
+  volatility constants from an except clause, feeding pricing displays.
+* Stale residue — strategies/base.py:58-61 still points readers at ait.strategies.constants, the
+  module the 09-14 dashboard fix ABANDONED; it does not exist. A future reader will chase a ghost.
+* Test isolation — tests/test_r19_config_authority.py::test_applier_and_readers_share_one_table
+  has failed on THIS machine's local .env on every single suite run this entire session (W16
+  through W19, unchanged). Local-only, gitignored, does not affect CI — but it is now a permanent
+  fixture of every `pytest -q` on this box and nobody has fixed the test's isolation gap.
+* Triage (angle E) — the 109 R24 findings + 78 carried-over, re-verification against TODAY's
+  source. NEVER STARTED. Explicitly its own wave, not foldable into a lead-probing batch — it is
+  re-verification work, not new-defect probing, and is the single largest item outstanding.
+
+ALSO REGISTERED, NOT FIXED, BY EXPLICIT OPERATOR DECISION (not oversights — recorded here so they
+are not mistaken for either): the r=0.05 hardcoded rate + missing dividend yield in options_chain
+and the backtest engine (W19; needs its own wave with a re-run plan, since two of three sites are
+in the backtest engine and changing them breaks comparability with every pre-registered study).
+
+WHAT WAS ACTUALLY DONE, for contrast (so this entry reads as a gap list, not a verdict that
+nothing happened): R25 (holistic + host-move class, full), W16 (4 platform fixes), W16b (keeper/
+dead-man retired on reflection), W17 batch 1 (5 leads, 4 verified + 1 partial), W17 batch 2 (6
+leads, all verified), W18 (Gateway-port unblock + 4 of the batch-2 findings fixed), W19 (strike-
+selection decision recorded + 2 more batch-2-family findings fixed). Every item above is what
+those rounds did NOT reach, not a claim that the rounds were unproductive.
+
+NEXT WAVE NUMBERING, corrected: W20 is unclaimed. Candidates in rough priority — (a) probe the
+batch-3 calendar-fault class (4 sites, one dependency, highest measured consequence of what
+remains unprobed); (b) tz-01 + qual-01/02/04 (cheap, bounded, tz-01 only stays cheap while the ML
+corpus is small); (c) the register triage (109+78) — largest, and the one thing every other wave
+has deferred past twice now.
+
+## 2026-09-16 - W20 EXECUTED: the naive-local-clock class — re-scoped twice, by its own probes
+W20 was planned as "probe the batch-3 CALENDAR-FAULT class". It shipped as something else, twice
+over, because probing contradicted me both times. Both corrections are the entry.
+
+[0] FIRST RE-SCOPE: THE TRIGGER I NEVER TESTED. The batch-3 census claimed a single NYSE-calendar
+    failure would concurrently restart the live bot mid-session, open the pre-event blackout and
+    disable both event-driven exits. I ranked W20 on that consequence without probing how likely
+    the trigger is. It isn't: pandas_market_calendars makes NO network call at schedule() time
+    (verified in source), does NOT raise on out-of-range dates (1700 and 2100 both return
+    normally), and there are ZERO calendar faults in any log or ledger entry, ever — the 13
+    "calendar" hits in ait.log are all calendar_skip, the economic-event blackout working
+    normally. Two fallback tests already existed. So "calendar fault" was the wrong organizing
+    principle; what is actually broken is the FALLBACK BEHAVIOUR, for a reason with nothing to do
+    with calendars — this host runs CEST (= ET+6) and the fallbacks read a naive local clock.
+    That makes it the same root cause as tz-01, which the backlog ranked separately at (b). One
+    wave, organized by root cause instead of by trigger.
+
+[0b] SECOND RE-SCOPE, AND THE FINDING THIS WAVE ACTUALLY TURNS ON. After writing W20b I ran the
+    post-fix probe and read its output properly: making _in_post_market_window timezone-correct
+    DOES NOT CLOSE THE HOLE. It fixes the FUNCTION. "False, we are not post-market" is the RIGHT
+    answer mid-RTH. The fail-open is one frame up, in the caller —
+
+        except Exception: market_open = False     # the pre-W20 caller, now master.py:814
+
+    — which turns "I don't know" into "safe to restart". Probed on this box with the calendar
+    faulted and the .retrained marker present: 09:05, 10:05, 11:05, 13:05 and 15:05 ET ALL took
+    the restart branch. That is a stop()/start() of the LIVE bot, mid-session, with positions open.
+    WORSE, AND THIS IS THE PART WORTH RECORDING: W20b made one hour NEWLY exposed. On this CEST
+    box the old naive fallback protected 10:00-10:15 ET BY ACCIDENT (10:05 ET = 16:05 local), and
+    correcting the timezone removed that accident without closing the hole. W20b shipped alone
+    would have been a net regression for that hour. The pre-fix test matrix proves it: with the
+    fix stashed, does_not_restart_during_RTH[10] PASSES while [11] [13] [15] FAIL.
+
+[1] W20d THE CALLER FAILS CLOSED NOW. New _assume_market_open_on_clock(): a calendar-FREE answer
+    to "is the market open?" — weekday 09:30-16:00 ET, resolved through stdlib zoneinfo, NOT
+    ait.utils.time (that module imports pandas_market_calendars at module scope, so in the very
+    scenario that calls this it may be the broken thing). On a fault the marker site now DEFERS
+    through RTH and the marker survives. Both halves of the contract are pinned: it still restarts
+    overnight, at weekends and pre-open, so fresh models are never wedged by a fault — they land
+    the same night. NOTE THE DIRECTION, because this looks like the heuristic W15 DELETED: W15
+    removed weekday()<5 from the pre-event blackout because counting a holiday as a session made
+    that gate fail OPEN. Here every caller asks "is it open?" in order to be MORE cautious when
+    the answer is yes, so a holiday wrongly counted as a session only defers a restart. The
+    docstring says so explicitly and forbids reuse where the true branch is the permissive one.
+[1b] SAME CLASS, SECOND INSTANCE, FIXED WITH IT. The heartbeat HANG check (master.py:760-772) called
+    is_market_open() inside the outer try, so a calendar fault escaped to the outer handler and
+    silently DISARMED hang detection for the whole outage — a hung event loop mid-session going
+    unnoticed is the exact failure class (R5-D1) that check exists for. Now falls back to the same
+    proxy and stays armed. Fixing the class, not the instance — see W18 [0c] for why that rule is
+    in force.
+
+[2] W20a tz-01, THE LIVE ONE, AND A THIRD PRODUCER I DID NOT FIND BY READING. hour_of_day is an ML
+    FEATURE. The historical corpus was written on an ET box; this one is CEST, so the same market
+    hours that read {9..16} there read {15..22} here and a model trained on the mix learns a split
+    that encodes WHICH MACHINE WROTE THE ROW. Unlike everything else in this wave it is gated on
+    no fault at all — every row written on this host since 09-14 already carries it. I fixed the
+    two producers I knew about (orchestrator.py:1597 live inference context, :3150 the PERSISTED
+    entry_signals) and wrote a cheap class-guard test asserting no live code stamps an hour from a
+    naive clock. THE GUARD IMMEDIATELY FOUND A THIRD: orchestrator.py:1221, and it is not
+    telemetry — it is a LIVE ENTRY GATE. analyzer.py:461 derives the blocked hour from
+    trades.entry_time and adaptor._block_hour (adaptor.py:382) accepts only 9<=hour<=16; both are ET-RTH
+    conventions, while the gate read the naive CEST clock. Consequence: an ET-learned block (say
+    10:00 ET) could only ever match at 10:00 CEST = 04:00 ET, outside RTH, so it NEVER fired; and
+    CEST hours 17-22 (= 11:00-16:00 ET) fall outside _block_hour's guard, so most of the session
+    was unblockable in the first place. LATENT, NOT FIRING: no blocked_hours state exists anywhere
+    on disk, so nothing is blocked today — it fires the first time the learner blocks an hour.
+    This is the second time in two waves that a class-guard test caught what my reading missed.
+[2b] NOT FIXABLE HERE, REGISTERED. meta_label.py's training-side entry_hour stays contaminated:
+    trades.entry_time is written naive-local at executor.py:389 with no offset, so pre-move rows
+    are ET and post-move rows are CEST and the convention cannot be recovered on read. That is
+    correct code operating on mixed-convention data. It clears only when entry_time becomes
+    timezone-aware or the rows are restated. Cheap today only because the meta-labeler is
+    untrained and default-off.
+[2c] BACKTEST PARITY, CHECKED AND DELIBERATELY UNCHANGED. engine.py:634's hardcoded
+    hour_of_day=10 is a CONSTANT, not a clock read, so it has no timezone bug — and it is an
+    ET-plausible RTH hour. Fixing the live producers is precisely what RESTORES agreement with it
+    (pre-fix, live rows on this host wrote 15..22 against the backtest's 10). Changing it would
+    have been the error. Pinned by a test so a later reader does not "fix" it.
+
+[3] W20b/c THE TWO REMAINING NAIVE FALLBACKS. _in_post_market_window's calendar fallback now
+    resolves ET through stdlib zoneinfo (measured pre-fix: protected 10:00-10:15 ET by accident,
+    allowed restarts at 09:05/11:05/13:05/15:05). _sessions_until anchored on
+    datetime.now().date() — the HOST's date, which on CEST rolls over at 18:00 ET, so any evening
+    run counted sessions from TOMORROW. And its calendar fallback was `day.weekday() < 5`, the
+    EXACT heuristic W15 removed from the primary path directly above it: the consumer blocks when
+    sessions <= blackout, so inflating the count makes the gate fail OPEN. W15 fixed the instance
+    and left the fallback carrying the defect. Now `trading = False` — fewer sessions, more
+    blocking, the safe direction when a holiday is unknowable.
+
+[4] VERIFICATION. tests/test_w20_host_clock_and_calendar_faults.py, 47 tests. Every one PINS A
+    REAL NON-ET HOST TZ (TZ + tzset) and drives the no-argument clock path, because that is
+    exactly the gap that let test_calendar_outage_falls_back_to_the_clock_not_forever (R16) pass
+    for months while the fallback was wrong on this machine — it passes EXPLICIT NAIVE DATETIMES,
+    so it only ever exercised the arithmetic. Two tests test the HARNESS, so a silently
+    ineffective TZ pin cannot make the other 45 vacuous.
+    PROVEN AGAINST PRE-FIX SOURCE (source stashed, tests kept): 35 failed / 12 passed. The 12 are
+    signal, not slack, and each is accounted for: the 2 harness tests; [US/Eastern] passing while
+    [Europe/Berlin] fails, which LOCALIZES the defect to this host rather than the logic; the
+    accidental 10:05 pass from [0b]; the 2 "still restarts overnight/at the weekend" tests, never
+    broken and present so a future fix cannot over-correct into permanent deferral; the backtest
+    parity pin from [2c], which asserts something deliberately UNCHANGED; and the 2 learning-gate
+    tests, which pin the writer/reader invariant rather than the fix (the fix itself is pinned by
+    the class-guard test, which does fail pre-fix).
+    ONE OF MY OWN TESTS WAS TOO WEAK AND WAS REPLACED. test_anchors_on_the_ET_date_not_the_host_date
+    first used a midweek evening, where BOTH anchors return 0 — it passed pre-fix and proved
+    nothing, the same defect as the R16 test this wave exists to correct. Rewritten onto a FRIDAY
+    evening, where the wrong anchor skips the weekend: it now fails pre-fix with 1 != 0, and that
+    1 is the fail-open — the consumer blocks when sessions <= blackout, so a spurious session
+    means no block.
+    ONE EXISTING TEST NEEDED UPDATING: test_r16_round2_fixes.py's _FakeDT.now() took no arguments
+    and _sessions_until now calls now(tz); the pinned date it asserts on is unchanged.
+    FULL SUITE: 1677 passed / 43 skipped / 1 failed in 15:07 — the single failure is
+    test_r19_config_authority::test_applier_and_readers_share_one_table, the local-.env isolation
+    gap that has failed on THIS box on every suite run since W16, unchanged and unrelated. The
+    baseline was 1630 passed, so +47 is exactly this wave's new tests and no regressions.
+    scripts/typecheck.py clean. scripts/smoke_deploy.py -> SMOKE PASS (13 checks), including the
+    real dry-run trading cycle. Probe hygiene held: PYTEST_CURRENT_TEST set before every
+    supervisor call, 0 probe lines in logs/orchestrator.log (verified, not assumed).
+
+[5] NOT DONE, DELIBERATELY. portfolio.py:779/:811 (the earnings and macro exits) are in the
+    census's calendar-fault group but their fallback is a plain `except: pass` with no clock
+    involved — a different defect in a different class (the fail-open census). Folding them in
+    would recreate the organize-by-trigger error this wave exists to correct. The remaining 11
+    batch-3 shortlist sites are still unprobed.
+
+[5b] ONE LEAD RAISED AND REFUTED DURING THIS WAVE, plus my own bad probe. Sweeping master.py for
+    other naive-clock reads surfaced _backtest_catchup_run_at, which tests `run_at.hour` against
+    the ET session window (9,15)-(16,30) with the explicit intent "the 10-min full-core backtest
+    has no business running beside the live bot". Read on a CEST host that looks catastrophic, and
+    my FIRST probe said so: 6 of 9 boot times landing a full-core backtest inside RTH, three of
+    them pushed to 10:40 ET by the very guard meant to prevent it. THAT PROBE WAS WRONG. It
+    interpreted the function's naive return as local time, when the consumer passes it straight to
+    APScheduler as run_date and the scheduler is pinned timezone="US/Eastern" (master.py:1884), so
+    a naive run_date is read AS ET. The corrected probe swept all 24 boot hours: NONE lands inside
+    RTH. The guard is robust by construction, not by luck — the same naive value is both the
+    window-test input and the scheduled time, so the two agree whatever timezone it nominally
+    represents. I also probed the counterfactual (what if a naive-clock sweep "fixed" this site to
+    now_et() in isolation?): still none. REFUTED, and recorded here at the same weight as the
+    confirmations, per the standing rule. Residue, ops-tier, NOT fixed: because the value is a
+    local wall clock read as ET, the weekly catch-up fires about six hours later in real time than
+    its docstring implies, and a boot after 18:00 ET stamps it with tomorrow's date. Never in RTH.
+[5c] REGISTERED, NOT FIXED — two conventions for one marker. daily_digest writes
+    data/digest_sent_<LOCAL date> (master.py:1512) while _digest_catchup_due reads
+    digest_sent_<ET date> (:1534, correctly fed now_et()). They disagree only between 18:00 ET and
+    midnight ET, and both digest crons fire at 09:35/16:05 ET — outside that window — so the
+    marker is written with the right date in normal operation and nothing is currently broken. The
+    same line's SQL date filter (:1458) has the same window. Latent; a digest sent inside that
+    window would suppress the next day's. ops_reporting, out of this wave's live-path scope.
+[5d] TWO STALE COMMENTS FIXED, because a false timezone claim in a codebase that just had a
+    timezone bug class is worse than no comment. master.py:2006 read "naive local (=ET box),
+    matches file mtimes" and _backtest_catchup_due's docstring said "`now` is naive local time
+    (box runs ET)". The CODE is correct in both — the comparison is against file mtimes, which are
+    also naive local. Only the parenthetical was false, and it is exactly the assumption this
+    entire wave exists to retire.
+
+[6] THE RECORD. This is the THIRD time this session that probing corrected one of my own priority
+    calls, and the second time within this single wave. The ranking I wrote in the BACKLOG
+    CORRECTION entry hours earlier — (a) calendar-fault class, (b) tz-01 — is superseded by its
+    own evidence: (a) and (b) are one class, and the trigger that made (a) look urgent is
+    implausible. The register is only worth keeping if it shows that as prominently as it shows
+    the confirmations.
+
+## 2026-09-16 - W20 DEPLOYED + WATCH LIST FOR THE OPEN
+Operator authorised the restart. Deployed 12:15 local / 06:15 ET — PRE-MARKET, 3h15m before the
+bell, with ZERO open trades. W20 touches restart logic and a live entry gate, so an in-session
+deploy was not acceptable.
+
+WHY THE SUPERVISOR, NOT JUST THE BOT. W20d lives in master.py — the SUPERVISOR's own code. A
+bot-only restart would have deployed W20a/b/c and silently left the headline fix (the mid-RTH
+restart fail-open) running on the old code. Full supervisor restart was required and performed.
+
+SEQUENCE. SIGTERM -> 51749 (same handler as the operator's Ctrl-C: graceful_shutdown stops bot,
+web services and scheduler). Clean trace: shutdown_signal 15 -> bot_stopping 51751 -> bot_stopped
+(30s) -> all three web services stopped. Relaunched with nohup (NOT setsid — it does not exist on
+macOS, a lesson this session already paid for once). New tree: supervisor 81012 (reparented to 1,
+properly detached), bot 81032, dashboard 81069, weblog 81070, status 81071. Scheduler ready with
+10 jobs, all crons ET-pinned.
+
+THE STALE LOCK WAS CHECKED BEFORE RESTARTING, NOT AFTER. data/orchestrator.lock still held the
+dead pid 51749. W16 A4 made that lock FAIL CLOSED, so "will it refuse to start?" had to be
+answered first: it reclaims correctly. The guard is the fcntl flock, released by the OS on process
+death; the pid in the file is informational only, and fail-closed applies to plumbing exceptions
+(permissions, full disk, missing fcntl), not to a stale file.
+
+VERIFIED RUNNING THE NEW CODE, positively — not inferred from "the files on disk have it":
+_assume_market_open_on_clock present; health_check calls it; three _now_et().hour sites in
+orchestrator; _sessions_until's EXECUTABLE lines are `trading = _itd(day)` / `trading = False`
+with no weekday heuristic (the string survives only inside the W20c comment, which quotes the old
+code — the first check I wrote was fooled by exactly that and was corrected). Working tree clean
+at f6e3c36. 47 W20 tests re-run against the deployed source: all pass. Bot connected to Gateway
+4002, placed and cancelled the $1 SPY probe order (W17-08 verify_can_trade), so the account is
+trading-enabled and not read-only. No errors, warnings or criticals since restart.
+
+WATCH LIST FOR THE 09:30 ET OPEN:
+[W1] HEARTBEAT AT THE BELL — the highest-risk item and NOT caused by W20. data/bot_heartbeat is
+     856 min stale right now, because the bot only touches it while the trading loop runs (last
+     write was yesterday's close: 22:00 local = 16:00 ET, and 856 min lands exactly there). At
+     09:30 ET is_market_open() flips True; if the loop has not refreshed the marker by then, the
+     >15min rule restarts the bot and pages. Expected behaviour is a refresh as the loop starts.
+     W20 touched this block, so confirm it is the ORDINARY path that runs, not the new fallback.
+[W2] THE TWO NEW WARNINGS MUST NEVER APPEAR — fresh_models_market_check_failed and
+     heartbeat_market_check_failed fire only on a genuine calendar fault. W20's whole re-scope
+     rests on the claim that such faults are implausible (no network call, no date limits, zero
+     ever recorded). If either line appears, that claim is WRONG and the wave's ranking needs
+     revisiting. Their absence is the falsifiable prediction this wave makes.
+[W3] hour_of_day IN THE FIRST LIVE ROW — the first entry today should write hour_of_day in 9..16
+     (ET) into trade_context.entry_signals, not 15..22 (CEST). This is the only W20a change with
+     an observable artifact; check it on the first fill rather than assuming.
+[W4] NO RESTART LOOP — confirm the supervisor does not restart the bot repeatedly. W20d changed
+     a branch that gates a restart; the failure mode of getting it wrong is visible within two
+     health-check cycles (4 min).
+[W5] PRE-EVENT BLACKOUT — _sessions_until now anchors on the ET date. Watch
+     credit_entry_skipped_pre_event for appearing or disappearing unexpectedly; W20c made its
+     calendar fallback strictly MORE blocking, which is the safe direction but is still a change
+     in behaviour on a fault.
+[W6] hour_blocked_by_learning should stay silent — the gate now reads ET, but no blocked_hours
+     state exists on disk, so nothing should block. A block appearing at an odd hour would mean
+     the learner wrote one and the convention is still mismatched somewhere.
+
+## 2026-09-16 - W20 CORRECTIONS + W21 POINTER
+Four corrections to the W20 entry above, and the "what next" pointer it failed to leave. Appended,
+not edited, per the ledger rule.
+
+[C1] THE CENSUS ALREADY NAMED W20d. MY PLAN DROPPED IT. The W20 entry's [0b] reads as though my
+     post-fix probe discovered the caller's fail-open. It did not. The batch-3 census names it
+     verbatim as shortlist site #11: "Calendar fault => market_open=False => _in_post_market_window()
+     False at e.g. 11:00 => the post-retrain branch runs stop(); start() — restarting the live bot
+     mid-RTH with positions open." That is W20d, written down a day before W20 existed. What
+     happened is the reverse of the credit I gave myself: while re-scoping the wave from "trigger"
+     to "root cause" I narrowed the target to _in_post_market_window's TIMEZONE and lost the
+     caller the census had correctly identified; the probe then recovered it. The re-scope was
+     still right — but re-scoping is where a correct finding got dropped, and that is the lesson
+     worth keeping, not "probing found what reading missed".
+[C2] THE TRIGGER SURFACE IS WIDER THAN "CALENDAR FAULT", so [0]'s implausibility argument is
+     narrower than it sounds. The guard is a bare `except Exception` around BOTH the import and
+     the call:  `from ait.utils.time import is_market_open; market_open = is_market_open()`.
+     ANY failure of either — import error, a transient inside is_market_open, not just a broken
+     pandas_market_calendars — set market_open=False and unlocked the restart. W20's evidence that
+     calendar FAULTS are implausible stands; it does not establish that the except never fires.
+     W20d is therefore justified on its own, independent of how likely calendar faults are.
+[C3] COUNT CORRECTION: the W20 entry says "the remaining 11 batch-3 shortlist sites are still
+     unprobed". It is 10. W20 probed and FIXED two of the twelve — #11 (master.py health_check,
+     = W20d) and #12 (orchestrator _sessions_until, = W20b/c). Sites #4 and #5
+     (portfolio.py:779/:811) remain deliberately unprobed and are a DIFFERENT class: plain
+     `except: pass`, no clock.
+[C4] THE STALE-POINTER MISTAKE, REPEATED ONE WAVE LATER. PLAN.md line 2967 still reads "NEXT WAVE
+     NUMBERING, corrected: W20 is unclaimed" with candidates (a)/(b)/(c). That is now false —
+     (a) and (b) were one class and W20 executed both. This is precisely the staleness the
+     BACKLOG CORRECTION entry was appended to fix, recreated by the very wave that superseded it.
+     A wave entry is not finished until it leaves a correct pointer to the next one.
+
+W21 IS UNCLAIMED. RANKED, and this ranking is the one to follow:
+ (a) THE REGISTER TRIAGE — 109 R24 findings + 78 carried over, re-verified against TODAY's source.
+     The largest outstanding item, never started, now deferred past FOUR times (W17, W18, W19,
+     W20). It is re-verification of existing claims, not new-defect probing, so it has never won
+     a priority contest against live-path work — and that is exactly why it should stop competing
+     and simply be scheduled.
+ (b) THE 10 REMAINING BATCH-3 FAIL-OPEN SITES, consequence-ranked in
+     reports/w17_batch3_failopen_census_20260916.md. Highest first: #2 reconciler.py:1083 (the
+     HALT_UNTRACKED freeze file is never written), #3 orchestrator.py:701 (one unparseable
+     exit_time silently drops realized P&L from the day), #6 state.py:705 (corrupt partial_exits
+     JSON re-fires a completed exit level), #10 orchestrator.py:1074 (watchdog recovery action
+     lost). Probe in batches, stop after each, re-rank the tail — the cadence the operator chose.
+ (c) arch-01..04, qual-01/02/04, broker/orders/contracts dead & untested code, capital_tiers.py,
+     5 silent dashboard panels + 3 conflicting real-close SQL implementations, hardcoded
+     backtest-display constants.
+ (d) SMALL AND VERIFIED-STILL-BROKEN TODAY, cheap enough to fold into any wave: strategies/base.py
+     :58-61 points readers at ait.strategies.constants, which does NOT exist (confirmed 09-16);
+     tests/test_r19_config_authority.py::test_applier_and_readers_share_one_table still fails on
+     this box's local .env on every suite run (confirmed 09-16, unchanged since W16) — it is now a
+     permanent fixture of every `pytest -q` here and nobody has fixed the isolation gap.
+ (e) NEW FROM W20, registered not fixed: the two digest-marker date conventions (daily_digest
+     writes a LOCAL-date marker, _digest_catchup_due reads an ET-date one; they disagree only
+     18:00 ET -> midnight, and both crons fire outside that window, so nothing is broken today).
+ DEFERRED BY EXPLICIT OPERATOR DECISION, not oversight: the r=0.05 hardcoded rate + missing
+     dividend yield (needs its own wave with a re-run plan — two of three sites are in the
+     backtest engine, so changing them breaks comparability with every pre-registered study).
+
+STATE AT HANDOFF: HEAD b7be0be on branch feature/event-straddle, NOT PUSHED. Live bot runs W20
+(supervisor 81012 / bot 81032) since 06:15 ET. The W20 DEPLOYED entry's 6-item watch list is
+UNCHECKED — the market had not opened when this was written. Check W1 (heartbeat at the bell) and
+W2 (the two new warnings must never appear) before starting any new wave.
+
+## 2026-09-16 - W1 REFINED (pre-open code read) — no margin, and R8 makes staleness a real signal
+Reading the heartbeat path before the open changed W1 from "watch it" to something specific. The
+W20 DEPLOYED entry's [W1] is correct but incomplete; this supersedes it.
+
+[a] THERE IS NO PRE-MARKET MARGIN. I first said the loop starts at the 09:00 ET PRE_MARKET phase,
+    giving 30 minutes of slack before is_market_open() flips at 09:30. WRONG. _trading_loop is
+    gated `while ... get_current_phase() == TradingPhase.MARKET_OPEN` (orchestrator.py:1027), and
+    MARKET_OPEN begins at 09:30. At PRE_MARKET the bot runs _pre_market() and then
+    wait_for_phase(MARKET_OPEN) (:519-521) — it does NOT write the heartbeat. So the marker starts
+    refreshing at 09:30:00, the SAME INSTANT the supervisor's market gate opens. Zero designed
+    margin; it is a race.
+[b] THE BOT NORMALLY WINS THAT RACE, and the reason is worth knowing rather than assuming: the
+    heartbeat write is the FIRST statement in the loop body (orchestrator.py:1042, right after the
+    in-process watchdog touch), before any scan or IB call. It lands within milliseconds of the
+    phase flip, while the supervisor only re-checks every 2 minutes.
+[c] SO THE TWO REAL FAILURE MODES ARE NARROW AND NAMED:
+    (i)  _pre_market() overruns past 09:30 — it is awaited BEFORE wait_for_phase, so a slow
+         pre-market (chain fetch, IB latency, a retry) delays loop entry and therefore the first
+         heartbeat, while the supervisor's gate is already open.
+    (ii) R8 SUPPRESSION. The write is conditional: `if not any(n for n, _ in _err_streaks.values())`
+         — R8 deliberately lets the heartbeat go stale during an active error streak, precisely so
+         the supervisor's 15-min restart+alert DOES fire (the 07-10 error loop kept hang detection
+         blind while stops were dead). CONSEQUENCE FOR WHOEVER WATCHES THIS: a stale heartbeat at
+         the bell is a GENUINE SIGNAL, not a startup artifact. Do not dismiss it as "the loop just
+         hasn't started yet" — check _err_streaks first.
+[d] WHAT TO CHECK, CONCRETELY: at ~09:32 ET confirm data/bot_heartbeat mtime is within 1 min, and
+    that logs/orchestrator.log contains no bot_hung_heartbeat_stale and no restart around 09:30.
+    If it DID restart, [c](i) vs [c](ii) is distinguishable from the bot log: an error streak
+    leaves error lines, a slow pre-market does not.
+
+W2 STATUS AT 06:30 ET, partially closed already: 0 occurrences of heartbeat_market_check_failed
+across 10 health-check cycles since the restart — that site calls is_market_open() every cycle, so
+those are real clean samples and the calendar is working. The fresh_models_market_check_failed half
+has NOT been exercised yet: it only runs when models/.retrained exists, which the 07:30 ET retrain
+cron creates. That half closes at ~07:32 ET, still pre-open.
+
+## 2026-09-16 - SESSION CLOSE: handoff state, and a CLOSING WINDOW worth acting on first
+Final entry of the session. Supersedes the handoff block in "W20 CORRECTIONS + W21 POINTER".
+
+[X1] CORRECTION — THE TRAINING CORPUS IS CLEAN. W20's [2] claims the tz-01 defect "is gated on no
+     fault at all — every row written on this host since 09-14 already carries it" (line 3028).
+     THAT IS FALSE, and measuring it was the only way to find out. `select ... where entry_time >=
+     '2026-09-14'` returns ZERO rows. The ENTIRE trade corpus is 10 trades, all entered
+     2026-04-23/24 — on the OLD ET host. So the corpus is uniformly ET and the contamination I
+     described is hypothetical, not actual. W20a landed BEFORE a single bad row was written. The
+     mechanism was real; the damage was zero. Both halves matter, and the entry above only said
+     one of them.
+[X2] THE WINDOW THAT IS CLOSING, AND WHY IT IS WORTH DOING BEFORE ALMOST ANYTHING ELSE.
+     executor.py:389 still writes `entry_time=datetime.now().isoformat()` — naive, no offset — and
+     both entry_time and exit_time are stored offset-free (verified against the live DB). The FIRST
+     trade entered on this CEST box writes the first non-ET row into an otherwise-ET corpus. That
+     can happen at the very next open. While the corpus is still uniformly ET, making these
+     timestamps timezone-aware is a CONVENTION CHANGE with no data restatement. After the first
+     live entry it needs a restatement with a pre/post boundary, which is the expensive version and
+     the one W20's [2b] described as "clears only when entry_time becomes timezone-aware or the
+     rows are restated". The cheap door is open right now and closes on the next fill.
+[X3] BUT IT IS NOT A ONE-LINER — SCOPE IT BEFORE STARTING. 19 sites parse these two columns across
+     9 modules (learning/analyzer ×5, dashboard/app ×3, monitoring/analytics ×3, bot/orchestrator
+     ×4, ml/meta_label, execution/portfolio, execution/reconciler, dashboard/walkforward/export).
+     At least one does ARITHMETIC against a naive clock — reconciler.py:788 computes
+     `now - datetime.fromisoformat(t.entry_time)` — which raises TypeError the moment awareness is
+     mixed. So the writer cannot change alone. Treat it as its own wave with the 19 readers
+     enumerated, not as a quick fix folded into something else.
+[X4] CONTEXT THAT CHANGES SEVERITY RANKINGS: the corpus is TEN TRADES, all from April. Every
+     ML/meta-labelling finding in this ledger (tz-01, the meta-labeller contamination, the
+     counterfactual/Thompson state) is research-validity work on a corpus too small to train on,
+     and the meta-labeller is untrained and default-off. Do not rank those above live-path work on
+     the strength of the word "contamination".
+[X5] SECURITY POSTURE, RE-VERIFIED TODAY so it is not re-litigated: repo prithvipradip/trade_v2 is
+     PRIVATE; `logs/`, `/data/` and `.env` are all gitignored; the account number appears in NO
+     tracked file. It does appear in local logs/ait.log, which is correctly ignored. Nothing to do.
+[X6] HANDOFF STATE, CURRENT: HEAD 47facfc on branch feature/event-straddle. FOUR COMMITS UNPUSHED
+     (f6e3c36, b7be0be, 3d8871d, 47facfc) — fine for a next session on THIS machine, not fine
+     against machine loss or a session elsewhere. Live bot runs W20: supervisor 81012 / bot 81032,
+     restarted 06:15 ET. Suite baseline is now 1677 passed / 43 skipped / 1 known local-.env
+     failure — a new agent seeing 1677 should NOT read the +47 over the old 1630 baseline as drift.
+[X7] THE WATCH LIST IS STILL OPEN. W2 is half-closed (10 clean cycles; the fresh_models half needs
+     the 07:30 ET retrain marker). W1 is unresolved and now has a specific 09:32 ET check with two
+     named failure modes — see the "W1 REFINED" entry directly above; read it BEFORE interpreting
+     a stale heartbeat, because R8 makes staleness a deliberate signal rather than an artifact.
+     W3-W6 untouched. Check these before opening W21.
