@@ -43,6 +43,8 @@ def _bt(**kw):
     # trigger checked separately from expiry_date — bare fixtures need it
     # set to something that won't fire within the ~8-day test windows here.
     bt._max_hold_days = kw.get("max_hold_days", 30)
+    # Take-profit study: research ladder override, None = live ladder.
+    bt._credit_tp_ladder = None
     return bt
 
 

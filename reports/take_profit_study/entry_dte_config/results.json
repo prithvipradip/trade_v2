@@ -1,0 +1,284 @@
+{
+ "rows": [
+  {
+   "variant": "live_ladder",
+   "ladder": null,
+   "n": 57,
+   "windows": 17,
+   "wins": 30,
+   "win_rate_pct": 52.6,
+   "net": -4020.42,
+   "pf": 0.583,
+   "avg_trade": -70.53,
+   "max_dd_dollars": 4993.4,
+   "max_dd_pct": 4.96,
+   "mean_hold_days": 5.67,
+   "position_days": 324,
+   "net_per_position_day": -12.409,
+   "closes_per_window": 3.35,
+   "exit_reasons": {
+    "take_profit_short": 26,
+    "touch_stop": 22,
+    "backtest_end": 6,
+    "expiry_approaching": 3
+   }
+  },
+  {
+   "variant": "live_ladder_explicit",
+   "ladder": [
+    [
+     20,
+     1.0,
+     0.5
+    ],
+    [
+     10,
+     0.75,
+     0.4
+    ],
+    [
+     5,
+     0.5,
+     0.3
+    ],
+    [
+     -1000000000,
+     0.25,
+     0.2
+    ]
+   ],
+   "n": 57,
+   "windows": 17,
+   "wins": 30,
+   "win_rate_pct": 52.6,
+   "net": -4020.42,
+   "pf": 0.583,
+   "avg_trade": -70.53,
+   "max_dd_dollars": 4993.4,
+   "max_dd_pct": 4.96,
+   "mean_hold_days": 5.67,
+   "position_days": 324,
+   "net_per_position_day": -12.409,
+   "closes_per_window": 3.35,
+   "exit_reasons": {
+    "take_profit_short": 26,
+    "touch_stop": 22,
+    "backtest_end": 6,
+    "expiry_approaching": 3
+   }
+  },
+  {
+   "variant": "flat_40",
+   "ladder": [
+    [
+     -1000000000,
+     1.0,
+     0.4
+    ]
+   ],
+   "n": 56,
+   "windows": 17,
+   "wins": 28,
+   "win_rate_pct": 50.0,
+   "net": -2203.11,
+   "pf": 0.765,
+   "avg_trade": -39.34,
+   "max_dd_dollars": 3866.28,
+   "max_dd_pct": 3.81,
+   "mean_hold_days": 6.38,
+   "position_days": 358,
+   "net_per_position_day": -6.154,
+   "closes_per_window": 3.29,
+   "exit_reasons": {
+    "take_profit_short": 24,
+    "touch_stop": 23,
+    "backtest_end": 6,
+    "expiry_approaching": 3
+   }
+  },
+  {
+   "variant": "flat_50",
+   "ladder": [
+    [
+     -1000000000,
+     1.0,
+     0.5
+    ]
+   ],
+   "n": 56,
+   "windows": 17,
+   "wins": 27,
+   "win_rate_pct": 48.2,
+   "net": -2260.85,
+   "pf": 0.769,
+   "avg_trade": -40.37,
+   "max_dd_dollars": 3614.77,
+   "max_dd_pct": 3.58,
+   "mean_hold_days": 6.77,
+   "position_days": 380,
+   "net_per_position_day": -5.95,
+   "closes_per_window": 3.29,
+   "exit_reasons": {
+    "touch_stop": 24,
+    "take_profit_short": 18,
+    "expiry_approaching": 8,
+    "backtest_end": 6
+   }
+  },
+  {
+   "variant": "flat_60",
+   "ladder": [
+    [
+     -1000000000,
+     1.0,
+     0.6
+    ]
+   ],
+   "n": 56,
+   "windows": 17,
+   "wins": 27,
+   "win_rate_pct": 48.2,
+   "net": -1682.25,
+   "pf": 0.828,
+   "avg_trade": -30.04,
+   "max_dd_dollars": 3473.27,
+   "max_dd_pct": 3.43,
+   "mean_hold_days": 6.91,
+   "position_days": 388,
+   "net_per_position_day": -4.336,
+   "closes_per_window": 3.29,
+   "exit_reasons": {
+    "touch_stop": 24,
+    "take_profit_short": 15,
+    "expiry_approaching": 11,
+    "backtest_end": 6
+   }
+  },
+  {
+   "variant": "ladder_plus_10",
+   "ladder": [
+    [
+     20,
+     1.0,
+     0.6
+    ],
+    [
+     10,
+     0.75,
+     0.5
+    ],
+    [
+     5,
+     0.5,
+     0.4
+    ],
+    [
+     -1000000000,
+     0.25,
+     0.3
+    ]
+   ],
+   "n": 56,
+   "windows": 17,
+   "wins": 28,
+   "win_rate_pct": 50.0,
+   "net": -2203.11,
+   "pf": 0.765,
+   "avg_trade": -39.34,
+   "max_dd_dollars": 3866.28,
+   "max_dd_pct": 3.81,
+   "mean_hold_days": 6.38,
+   "position_days": 358,
+   "net_per_position_day": -6.154,
+   "closes_per_window": 3.29,
+   "exit_reasons": {
+    "take_profit_short": 24,
+    "touch_stop": 23,
+    "backtest_end": 6,
+    "expiry_approaching": 3
+   }
+  },
+  {
+   "variant": "ladder_14dte_50",
+   "ladder": [
+    [
+     20,
+     1.0,
+     0.5
+    ],
+    [
+     10,
+     0.75,
+     0.5
+    ],
+    [
+     5,
+     0.5,
+     0.3
+    ],
+    [
+     -1000000000,
+     0.25,
+     0.2
+    ]
+   ],
+   "n": 57,
+   "windows": 17,
+   "wins": 30,
+   "win_rate_pct": 52.6,
+   "net": -4020.42,
+   "pf": 0.583,
+   "avg_trade": -70.53,
+   "max_dd_dollars": 4993.4,
+   "max_dd_pct": 4.96,
+   "mean_hold_days": 5.67,
+   "position_days": 324,
+   "net_per_position_day": -12.409,
+   "closes_per_window": 3.35,
+   "exit_reasons": {
+    "take_profit_short": 26,
+    "touch_stop": 22,
+    "backtest_end": 6,
+    "expiry_approaching": 3
+   }
+  },
+  {
+   "variant": "no_take_profit",
+   "ladder": [
+    [
+     -1000000000,
+     1.0,
+     "inf"
+    ]
+   ],
+   "n": 56,
+   "windows": 17,
+   "wins": 27,
+   "win_rate_pct": 48.2,
+   "net": -1491.83,
+   "pf": 0.848,
+   "avg_trade": -26.64,
+   "max_dd_dollars": 3469.57,
+   "max_dd_pct": 3.42,
+   "mean_hold_days": 6.98,
+   "position_days": 392,
+   "net_per_position_day": -3.806,
+   "closes_per_window": 3.29,
+   "exit_reasons": {
+    "expiry_approaching": 26,
+    "touch_stop": 24,
+    "backtest_end": 6
+   }
+  }
+ ],
+ "verdict": "CANDIDATE no_take_profit (PF 0.848 vs 0.583); live change needs operator approval and starts a new sample epoch",
+ "notes": [
+  "sanity: explicit ladder reproduces the default run exactly",
+  "flat_40: QUALIFIES",
+  "flat_50: QUALIFIES",
+  "flat_60: QUALIFIES",
+  "ladder_plus_10: QUALIFIES",
+  "ladder_14dte_50: fails pf>base+0.10",
+  "no_take_profit: QUALIFIES"
+ ]
+}

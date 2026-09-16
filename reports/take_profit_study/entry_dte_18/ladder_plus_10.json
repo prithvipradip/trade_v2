@@ -1,0 +1,45 @@
+{
+ "variant": "ladder_plus_10",
+ "ladder": [
+  [
+   20,
+   1.0,
+   0.6
+  ],
+  [
+   10,
+   0.75,
+   0.5
+  ],
+  [
+   5,
+   0.5,
+   0.4
+  ],
+  [
+   -1000000000,
+   0.25,
+   0.3
+  ]
+ ],
+ "entry_dte": 18,
+ "n": 50,
+ "windows": 16,
+ "wins": 23,
+ "win_rate_pct": 46.0,
+ "net": -4506.15,
+ "pf": 0.541,
+ "avg_trade": -90.12,
+ "max_dd_dollars": 5125.77,
+ "max_dd_pct": 5.09,
+ "mean_hold_days": 7.98,
+ "position_days": 400,
+ "net_per_position_day": -11.265,
+ "closes_per_window": 3.12,
+ "exit_reasons": {
+  "touch_stop": 24,
+  "take_profit_short": 19,
+  "backtest_end": 6,
+  "expiry_approaching": 1
+ }
+}

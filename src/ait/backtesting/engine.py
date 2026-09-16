@@ -229,6 +229,10 @@ class Backtester:
         # construction re-reading and re-validating the file from disk.
         # None (default) preserves the original behavior — load it here.
         settings: Any = None,
+        # Research-only credit take-profit ladder (scripts/take_profit_study.py
+        # via WalkForwardConfig.credit_tp_ladder). None = the shared live
+        # ladder in exit_policy.CREDIT_TP_LADDER; live never sets this.
+        credit_tp_ladder: Any = None,
     ) -> None:
         self._data = self._prepare_data(data)
         self._strategies = strategies
@@ -374,6 +378,10 @@ class Backtester:
         # always follows the loaded/default config, same as before.
         self._exit_time_decay_scaling = bool(_resolve_setting(
             None, "exit", "time_decay_scaling", ExitConfig, _settings))
+        self._credit_tp_ladder = (
+            exit_policy.validate_ladder(credit_tp_ladder)
+            if credit_tp_ladder is not None else None
+        )
         self._meta_labeler = meta_labeler
         self._eval_start_date = eval_start_date
 
@@ -2367,17 +2375,22 @@ class Backtester:
         return self._check_exit_fixed(pos, pnl_pct, current_date)
 
     @staticmethod
-    def _credit_take_profit_pct(dte: int | None, time_decay_scaling: bool = True) -> float:
+    def _credit_take_profit_pct(
+        dte: int | None,
+        time_decay_scaling: bool = True,
+        ladder: "exit_policy.Ladder | None" = None,
+    ) -> float:
         """DTE-laddered take-profit target as a fraction of credit received.
 
         R20 #5a: the ladder (0.50/0.40/0.30/0.20 + breakpoints) used to be a
         hand copy of portfolio.py _get_take_profit_targets — now imported from
         the shared ait.execution.exit_policy authority. Stays a staticmethod
-        with a defaulted flag because run_backtest.py calls it UNBOUND for its
-        drift-check table; the exit path passes self._exit_time_decay_scaling.
+        with defaulted args because run_backtest.py calls it UNBOUND for its
+        drift-check table; the exit path passes self._exit_time_decay_scaling
+        and self._credit_tp_ladder (None unless a research study set one).
         """
         return exit_policy.credit_take_profit_pct(
-            dte, time_decay_scaling=time_decay_scaling
+            dte, time_decay_scaling=time_decay_scaling, ladder=ladder
         )
 
     def _check_exit_credit(self, pos: dict, pnl_pct: float, current_date: date,
@@ -2458,7 +2471,7 @@ class Backtester:
         # also honors exit.time_decay_scaling exactly as live does; the flag
         # off collapses to live's flat 0.50 short target).
         if pnl_pct >= self._credit_take_profit_pct(
-                remaining_dte, self._exit_time_decay_scaling):
+                remaining_dte, self._exit_time_decay_scaling, self._credit_tp_ladder):
             return {"exit_date": str(current_date), "exit_reason": "take_profit_short"}
 
         # 2b. Max-hold-days cap — RESEARCH-ONLY knob (Optuna-searched): live

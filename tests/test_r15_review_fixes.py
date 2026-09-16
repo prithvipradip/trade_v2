@@ -377,6 +377,7 @@ class TestPreEventBlackoutRelaxed:
         bt._touch_stop_enabled = False        # rule 0 out of the way
         bt._credit_loss_limit_mult = 0.0      # rule 1 disabled (live parity)
         bt._exit_time_decay_scaling = True    # R20: shared exit_policy ladder flag
+        bt._credit_tp_ladder = None           # take-profit study override: live ladder
         bt._max_hold_days = 60                # DTE/hold-cap fix: keep the new
                                                # hold-cap check from firing here
         cal = MagicMock()

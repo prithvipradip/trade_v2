@@ -1,0 +1,28 @@
+{
+ "variant": "no_take_profit",
+ "ladder": [
+  [
+   -1000000000,
+   1.0,
+   "inf"
+  ]
+ ],
+ "n": 56,
+ "windows": 17,
+ "wins": 27,
+ "win_rate_pct": 48.2,
+ "net": -1491.83,
+ "pf": 0.848,
+ "avg_trade": -26.64,
+ "max_dd_dollars": 3469.57,
+ "max_dd_pct": 3.42,
+ "mean_hold_days": 6.98,
+ "position_days": 392,
+ "net_per_position_day": -3.806,
+ "closes_per_window": 3.29,
+ "exit_reasons": {
+  "expiry_approaching": 26,
+  "touch_stop": 24,
+  "backtest_end": 6
+ }
+}
