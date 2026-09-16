@@ -2969,3 +2969,165 @@ batch-3 calendar-fault class (4 sites, one dependency, highest measured conseque
 remains unprobed); (b) tz-01 + qual-01/02/04 (cheap, bounded, tz-01 only stays cheap while the ML
 corpus is small); (c) the register triage (109+78) — largest, and the one thing every other wave
 has deferred past twice now.
+
+## 2026-09-16 - W20 EXECUTED: the naive-local-clock class — re-scoped twice, by its own probes
+W20 was planned as "probe the batch-3 CALENDAR-FAULT class". It shipped as something else, twice
+over, because probing contradicted me both times. Both corrections are the entry.
+
+[0] FIRST RE-SCOPE: THE TRIGGER I NEVER TESTED. The batch-3 census claimed a single NYSE-calendar
+    failure would concurrently restart the live bot mid-session, open the pre-event blackout and
+    disable both event-driven exits. I ranked W20 on that consequence without probing how likely
+    the trigger is. It isn't: pandas_market_calendars makes NO network call at schedule() time
+    (verified in source), does NOT raise on out-of-range dates (1700 and 2100 both return
+    normally), and there are ZERO calendar faults in any log or ledger entry, ever — the 13
+    "calendar" hits in ait.log are all calendar_skip, the economic-event blackout working
+    normally. Two fallback tests already existed. So "calendar fault" was the wrong organizing
+    principle; what is actually broken is the FALLBACK BEHAVIOUR, for a reason with nothing to do
+    with calendars — this host runs CEST (= ET+6) and the fallbacks read a naive local clock.
+    That makes it the same root cause as tz-01, which the backlog ranked separately at (b). One
+    wave, organized by root cause instead of by trigger.
+
+[0b] SECOND RE-SCOPE, AND THE FINDING THIS WAVE ACTUALLY TURNS ON. After writing W20b I ran the
+    post-fix probe and read its output properly: making _in_post_market_window timezone-correct
+    DOES NOT CLOSE THE HOLE. It fixes the FUNCTION. "False, we are not post-market" is the RIGHT
+    answer mid-RTH. The fail-open is one frame up, in the caller —
+
+        except Exception: market_open = False     # the pre-W20 caller, now master.py:814
+
+    — which turns "I don't know" into "safe to restart". Probed on this box with the calendar
+    faulted and the .retrained marker present: 09:05, 10:05, 11:05, 13:05 and 15:05 ET ALL took
+    the restart branch. That is a stop()/start() of the LIVE bot, mid-session, with positions open.
+    WORSE, AND THIS IS THE PART WORTH RECORDING: W20b made one hour NEWLY exposed. On this CEST
+    box the old naive fallback protected 10:00-10:15 ET BY ACCIDENT (10:05 ET = 16:05 local), and
+    correcting the timezone removed that accident without closing the hole. W20b shipped alone
+    would have been a net regression for that hour. The pre-fix test matrix proves it: with the
+    fix stashed, does_not_restart_during_RTH[10] PASSES while [11] [13] [15] FAIL.
+
+[1] W20d THE CALLER FAILS CLOSED NOW. New _assume_market_open_on_clock(): a calendar-FREE answer
+    to "is the market open?" — weekday 09:30-16:00 ET, resolved through stdlib zoneinfo, NOT
+    ait.utils.time (that module imports pandas_market_calendars at module scope, so in the very
+    scenario that calls this it may be the broken thing). On a fault the marker site now DEFERS
+    through RTH and the marker survives. Both halves of the contract are pinned: it still restarts
+    overnight, at weekends and pre-open, so fresh models are never wedged by a fault — they land
+    the same night. NOTE THE DIRECTION, because this looks like the heuristic W15 DELETED: W15
+    removed weekday()<5 from the pre-event blackout because counting a holiday as a session made
+    that gate fail OPEN. Here every caller asks "is it open?" in order to be MORE cautious when
+    the answer is yes, so a holiday wrongly counted as a session only defers a restart. The
+    docstring says so explicitly and forbids reuse where the true branch is the permissive one.
+[1b] SAME CLASS, SECOND INSTANCE, FIXED WITH IT. The heartbeat HANG check (master.py:760-772) called
+    is_market_open() inside the outer try, so a calendar fault escaped to the outer handler and
+    silently DISARMED hang detection for the whole outage — a hung event loop mid-session going
+    unnoticed is the exact failure class (R5-D1) that check exists for. Now falls back to the same
+    proxy and stays armed. Fixing the class, not the instance — see W18 [0c] for why that rule is
+    in force.
+
+[2] W20a tz-01, THE LIVE ONE, AND A THIRD PRODUCER I DID NOT FIND BY READING. hour_of_day is an ML
+    FEATURE. The historical corpus was written on an ET box; this one is CEST, so the same market
+    hours that read {9..16} there read {15..22} here and a model trained on the mix learns a split
+    that encodes WHICH MACHINE WROTE THE ROW. Unlike everything else in this wave it is gated on
+    no fault at all — every row written on this host since 09-14 already carries it. I fixed the
+    two producers I knew about (orchestrator.py:1597 live inference context, :3150 the PERSISTED
+    entry_signals) and wrote a cheap class-guard test asserting no live code stamps an hour from a
+    naive clock. THE GUARD IMMEDIATELY FOUND A THIRD: orchestrator.py:1221, and it is not
+    telemetry — it is a LIVE ENTRY GATE. analyzer.py:461 derives the blocked hour from
+    trades.entry_time and adaptor._block_hour (adaptor.py:382) accepts only 9<=hour<=16; both are ET-RTH
+    conventions, while the gate read the naive CEST clock. Consequence: an ET-learned block (say
+    10:00 ET) could only ever match at 10:00 CEST = 04:00 ET, outside RTH, so it NEVER fired; and
+    CEST hours 17-22 (= 11:00-16:00 ET) fall outside _block_hour's guard, so most of the session
+    was unblockable in the first place. LATENT, NOT FIRING: no blocked_hours state exists anywhere
+    on disk, so nothing is blocked today — it fires the first time the learner blocks an hour.
+    This is the second time in two waves that a class-guard test caught what my reading missed.
+[2b] NOT FIXABLE HERE, REGISTERED. meta_label.py's training-side entry_hour stays contaminated:
+    trades.entry_time is written naive-local at executor.py:389 with no offset, so pre-move rows
+    are ET and post-move rows are CEST and the convention cannot be recovered on read. That is
+    correct code operating on mixed-convention data. It clears only when entry_time becomes
+    timezone-aware or the rows are restated. Cheap today only because the meta-labeler is
+    untrained and default-off.
+[2c] BACKTEST PARITY, CHECKED AND DELIBERATELY UNCHANGED. engine.py:634's hardcoded
+    hour_of_day=10 is a CONSTANT, not a clock read, so it has no timezone bug — and it is an
+    ET-plausible RTH hour. Fixing the live producers is precisely what RESTORES agreement with it
+    (pre-fix, live rows on this host wrote 15..22 against the backtest's 10). Changing it would
+    have been the error. Pinned by a test so a later reader does not "fix" it.
+
+[3] W20b/c THE TWO REMAINING NAIVE FALLBACKS. _in_post_market_window's calendar fallback now
+    resolves ET through stdlib zoneinfo (measured pre-fix: protected 10:00-10:15 ET by accident,
+    allowed restarts at 09:05/11:05/13:05/15:05). _sessions_until anchored on
+    datetime.now().date() — the HOST's date, which on CEST rolls over at 18:00 ET, so any evening
+    run counted sessions from TOMORROW. And its calendar fallback was `day.weekday() < 5`, the
+    EXACT heuristic W15 removed from the primary path directly above it: the consumer blocks when
+    sessions <= blackout, so inflating the count makes the gate fail OPEN. W15 fixed the instance
+    and left the fallback carrying the defect. Now `trading = False` — fewer sessions, more
+    blocking, the safe direction when a holiday is unknowable.
+
+[4] VERIFICATION. tests/test_w20_host_clock_and_calendar_faults.py, 47 tests. Every one PINS A
+    REAL NON-ET HOST TZ (TZ + tzset) and drives the no-argument clock path, because that is
+    exactly the gap that let test_calendar_outage_falls_back_to_the_clock_not_forever (R16) pass
+    for months while the fallback was wrong on this machine — it passes EXPLICIT NAIVE DATETIMES,
+    so it only ever exercised the arithmetic. Two tests test the HARNESS, so a silently
+    ineffective TZ pin cannot make the other 45 vacuous.
+    PROVEN AGAINST PRE-FIX SOURCE (source stashed, tests kept): 35 failed / 12 passed. The 12 are
+    signal, not slack, and each is accounted for: the 2 harness tests; [US/Eastern] passing while
+    [Europe/Berlin] fails, which LOCALIZES the defect to this host rather than the logic; the
+    accidental 10:05 pass from [0b]; the 2 "still restarts overnight/at the weekend" tests, never
+    broken and present so a future fix cannot over-correct into permanent deferral; the backtest
+    parity pin from [2c], which asserts something deliberately UNCHANGED; and the 2 learning-gate
+    tests, which pin the writer/reader invariant rather than the fix (the fix itself is pinned by
+    the class-guard test, which does fail pre-fix).
+    ONE OF MY OWN TESTS WAS TOO WEAK AND WAS REPLACED. test_anchors_on_the_ET_date_not_the_host_date
+    first used a midweek evening, where BOTH anchors return 0 — it passed pre-fix and proved
+    nothing, the same defect as the R16 test this wave exists to correct. Rewritten onto a FRIDAY
+    evening, where the wrong anchor skips the weekend: it now fails pre-fix with 1 != 0, and that
+    1 is the fail-open — the consumer blocks when sessions <= blackout, so a spurious session
+    means no block.
+    ONE EXISTING TEST NEEDED UPDATING: test_r16_round2_fixes.py's _FakeDT.now() took no arguments
+    and _sessions_until now calls now(tz); the pinned date it asserts on is unchanged.
+    FULL SUITE: 1677 passed / 43 skipped / 1 failed in 15:07 — the single failure is
+    test_r19_config_authority::test_applier_and_readers_share_one_table, the local-.env isolation
+    gap that has failed on THIS box on every suite run since W16, unchanged and unrelated. The
+    baseline was 1630 passed, so +47 is exactly this wave's new tests and no regressions.
+    scripts/typecheck.py clean. scripts/smoke_deploy.py -> SMOKE PASS (13 checks), including the
+    real dry-run trading cycle. Probe hygiene held: PYTEST_CURRENT_TEST set before every
+    supervisor call, 0 probe lines in logs/orchestrator.log (verified, not assumed).
+
+[5] NOT DONE, DELIBERATELY. portfolio.py:779/:811 (the earnings and macro exits) are in the
+    census's calendar-fault group but their fallback is a plain `except: pass` with no clock
+    involved — a different defect in a different class (the fail-open census). Folding them in
+    would recreate the organize-by-trigger error this wave exists to correct. The remaining 11
+    batch-3 shortlist sites are still unprobed.
+
+[5b] ONE LEAD RAISED AND REFUTED DURING THIS WAVE, plus my own bad probe. Sweeping master.py for
+    other naive-clock reads surfaced _backtest_catchup_run_at, which tests `run_at.hour` against
+    the ET session window (9,15)-(16,30) with the explicit intent "the 10-min full-core backtest
+    has no business running beside the live bot". Read on a CEST host that looks catastrophic, and
+    my FIRST probe said so: 6 of 9 boot times landing a full-core backtest inside RTH, three of
+    them pushed to 10:40 ET by the very guard meant to prevent it. THAT PROBE WAS WRONG. It
+    interpreted the function's naive return as local time, when the consumer passes it straight to
+    APScheduler as run_date and the scheduler is pinned timezone="US/Eastern" (master.py:1884), so
+    a naive run_date is read AS ET. The corrected probe swept all 24 boot hours: NONE lands inside
+    RTH. The guard is robust by construction, not by luck — the same naive value is both the
+    window-test input and the scheduled time, so the two agree whatever timezone it nominally
+    represents. I also probed the counterfactual (what if a naive-clock sweep "fixed" this site to
+    now_et() in isolation?): still none. REFUTED, and recorded here at the same weight as the
+    confirmations, per the standing rule. Residue, ops-tier, NOT fixed: because the value is a
+    local wall clock read as ET, the weekly catch-up fires about six hours later in real time than
+    its docstring implies, and a boot after 18:00 ET stamps it with tomorrow's date. Never in RTH.
+[5c] REGISTERED, NOT FIXED — two conventions for one marker. daily_digest writes
+    data/digest_sent_<LOCAL date> (master.py:1512) while _digest_catchup_due reads
+    digest_sent_<ET date> (:1534, correctly fed now_et()). They disagree only between 18:00 ET and
+    midnight ET, and both digest crons fire at 09:35/16:05 ET — outside that window — so the
+    marker is written with the right date in normal operation and nothing is currently broken. The
+    same line's SQL date filter (:1458) has the same window. Latent; a digest sent inside that
+    window would suppress the next day's. ops_reporting, out of this wave's live-path scope.
+[5d] TWO STALE COMMENTS FIXED, because a false timezone claim in a codebase that just had a
+    timezone bug class is worse than no comment. master.py:2006 read "naive local (=ET box),
+    matches file mtimes" and _backtest_catchup_due's docstring said "`now` is naive local time
+    (box runs ET)". The CODE is correct in both — the comparison is against file mtimes, which are
+    also naive local. Only the parenthetical was false, and it is exactly the assumption this
+    entire wave exists to retire.
+
+[6] THE RECORD. This is the THIRD time this session that probing corrected one of my own priority
+    calls, and the second time within this single wave. The ranking I wrote in the BACKLOG
+    CORRECTION entry hours earlier — (a) calendar-fault class, (b) tz-01 — is superseded by its
+    own evidence: (a) and (b) are one class, and the trigger that made (a) look urgent is
+    implausible. The register is only worth keeping if it shows that as prominently as it shows
+    the confirmations.

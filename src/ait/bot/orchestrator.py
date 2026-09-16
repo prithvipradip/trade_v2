@@ -1206,8 +1206,19 @@ class TradingOrchestrator:
                   universe=universe)
 
         # 7b. Check if current hour is blocked by learning
-        from datetime import datetime as dt_now
-        current_hour = dt_now.now().hour
+        # W20a, THIRD instance of the class — found by the class-guard test,
+        # not by me reading the two I already knew about. This one is a LIVE
+        # ENTRY GATE, not telemetry. The set it compares against is built in
+        # analyzer.py:459 from trades.entry_time, and adaptor._block_hour
+        # accepts only `9 <= hour <= 16` — both ET-RTH conventions. Reading
+        # the naive CEST clock here meant: an ET-learned block (say 10:00 ET)
+        # could only ever match at 10:00 CEST = 04:00 ET, outside RTH, so it
+        # NEVER fired; and CEST hours 17-22 (= 11:00-16:00 ET) fall outside
+        # _block_hour's guard, so most of the session was unblockable. Latent
+        # today only because no hour has ever been blocked (no persisted
+        # blocked_hours anywhere on disk) — it fires the first time one is.
+        from ait.utils.time import now_et as _now_et
+        current_hour = _now_et().hour
         if not adaptor.is_hour_allowed(current_hour):
             log.debug("hour_blocked_by_learning", hour=current_hour)
             return
@@ -1566,7 +1577,14 @@ class TradingOrchestrator:
                     "sma_10_20_cross": float(last_row.get("sma_10_20_cross", 0)),
                 }
 
-            from datetime import datetime as dt
+            # W20a (R25 tz-01): hour_of_day is an ML FEATURE and was stamped
+            # from the naive LOCAL clock. This host runs CEST = ET+6, so the
+            # same market hours that read {9..16} on the old ET box read
+            # {15..22} here — a model trained on the mix learns a split that
+            # encodes WHICH MACHINE WROTE THE ROW, not time of day. now_et()
+            # is the repo's canonical helper and is already correct everywhere
+            # else it is used.
+            from ait.utils.time import now_et as _now_et
             meta_context = {
                 "primary_confidence": final_confidence,
                 "regime_trending_up": 1.0 if regime and regime.regime.value == "trending_up" else 0.0,
@@ -1576,7 +1594,7 @@ class TradingOrchestrator:
                 "vix": vix or 0,
                 "iv_rank": iv_rank,
                 "sentiment_score": sentiment.composite_score if sentiment and hasattr(sentiment, "composite_score") else 0,
-                "hour_of_day": dt.now().hour,
+                "hour_of_day": _now_et().hour,
                 **last_features,
             }
 
@@ -3124,7 +3142,12 @@ class TradingOrchestrator:
             out: dict[str, float] = {}
             for name in META_FEATURES:
                 if name == "hour_of_day":
-                    out[name] = float(datetime.now().hour)
+                    # W20a (R25 tz-01): ET, not the host's local clock. This
+                    # value is PERSISTED into trade_context.entry_signals and
+                    # becomes training data — a naive-local hour here writes a
+                    # CEST value into a corpus whose historical rows are ET.
+                    from ait.utils.time import now_et as _now_et
+                    out[name] = float(_now_et().hour)
                     continue
                 if name in getattr(row, "index", ()):
                     try:
@@ -4066,16 +4089,30 @@ class TradingOrchestrator:
         """
         if calendar_days is None:
             return None
-        today = datetime.now().date()
+        # W20b (R25 tz-01): anchored on datetime.now().date() — the HOST's
+        # local date. On a CEST (= ET+6) box the local date rolls over at
+        # 18:00 ET, so any evening run counted sessions from TOMORROW.
+        # zoneinfo, not ait.utils.time: the calendar package this function
+        # already guards against can take that module down with it.
+        from zoneinfo import ZoneInfo as _ZI
+        today = datetime.now(_ZI("US/Eastern")).date()
         sessions = 0
         for i in range(1, max(1, calendar_days) + 1):
             day = today + timedelta(days=i)
             try:
                 from ait.utils.time import is_trading_day as _itd
                 trading = _itd(day)
-            except Exception:  # noqa: BLE001 — calendar fault: fall back to
-                # weekdays, but WITHOUT the old docstring's false comfort.
-                trading = day.weekday() < 5
+            except Exception:  # noqa: BLE001
+                # W20c: the fallback used `day.weekday() < 5` — the EXACT
+                # weekday heuristic W15 removed from the primary path above,
+                # and for the same reason: the consumer blocks when
+                # `sessions <= blackout`, so counting a NYSE holiday as a
+                # session inflates the count and makes the gate fail OPEN.
+                # W15 fixed the instance and left the fallback carrying the
+                # defect. A holiday is not knowable without the calendar, so
+                # the fallback now errs the SAFE way — fewer sessions, more
+                # blocking — instead of the direction that admits an entry.
+                trading = False
             if trading:
                 sessions += 1
         return max(0, sessions - 1)  # exclude the event day itself

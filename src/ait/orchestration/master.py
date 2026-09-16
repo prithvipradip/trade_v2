@@ -402,6 +402,33 @@ def _clear_dashboard_port(port: int = 8501) -> bool:
     return False
 
 
+def _assume_market_open_on_clock(now: datetime | None = None) -> bool:
+    """Calendar-FREE conservative answer to "is the market open?".
+
+    Used only when the NYSE calendar is unavailable. A weekday 09:30-16:00 ET
+    is treated as "may be open". Resolves ET through stdlib ``zoneinfo``, not
+    ``ait.utils.time`` — the latter imports ``pandas_market_calendars`` at
+    module scope, so in the very scenario that calls this it may be the thing
+    that is broken.
+
+    W20d — on the DIRECTION of this heuristic, because it looks like the one
+    W15 deleted: W15 removed ``weekday() < 5`` from the pre-event blackout
+    because counting a holiday as a session made that gate fail OPEN. Here the
+    same heuristic errs the other way. Every caller asks "is it open?" in order
+    to be MORE cautious when the answer is yes, so a holiday wrongly counted as
+    a session only defers a restart or keeps hang-detection armed. Never
+    reuse it anywhere the true branch is the permissive one.
+    """
+    from zoneinfo import ZoneInfo as _ZI
+    _et = _ZI("US/Eastern")
+    n = now or datetime.now(_et)
+    n = n.replace(tzinfo=_et) if n.tzinfo is None else n.astimezone(_et)
+    if n.weekday() >= 5:
+        return False
+    mins = n.hour * 60 + n.minute
+    return (9 * 60 + 30) <= mins < (16 * 60)
+
+
 def _in_post_market_window(now: datetime | None = None,
                            grace_minutes: int = 20) -> bool:
     """R16: is NOW inside the bot's own POST_MARKET phase (+grace)?
@@ -413,9 +440,15 @@ def _in_post_market_window(now: datetime | None = None,
     and adds 5 minutes of slack so a restart cannot land on the boundary.
 
     If the market calendar is unavailable it falls back to the regular-session
-    clock (16:00 ET, the box's local time) rather than a blanket True — fail
-    closed INSIDE the window, but never wedge the model-reload restart forever
-    on a calendar outage.
+    clock (16:00 **ET**) rather than a blanket True — fail closed INSIDE the
+    window, but never wedge the model-reload restart forever on a calendar
+    outage.
+
+    W20b: that fallback previously read the BOX's local clock, and this
+    docstring claimed "16:00 ET, the box's local time" — true on the old ET
+    host, false since the move to CEST (= ET+6). Measured on the CEST box, it
+    protected 10:00-10:15 ET by accident and allowed a mid-RTH restart at
+    09:05, 11:05, 13:05 and 15:05 ET.
     """
     try:
         from datetime import timedelta as _td
@@ -429,7 +462,15 @@ def _in_post_market_window(now: datetime | None = None,
         return close_dt <= n < close_dt + _td(minutes=15 + grace_minutes)
     except Exception as e:  # noqa: BLE001
         _log("warning", "post_market_window_check_failed", error=str(e))
-        n2 = now or datetime.now()
+        # W20b: resolve ET from stdlib zoneinfo, NOT ait.utils.time — the
+        # latter imports pandas_market_calendars at module scope, so in the
+        # very scenario that lands us here (a broken calendar package) it may
+        # be unavailable. zoneinfo has no such dependency. A naive `now` is
+        # treated as ET, matching the primary path above.
+        from zoneinfo import ZoneInfo as _ZI
+        _et = _ZI("US/Eastern")
+        n2 = now or datetime.now(_et)
+        n2 = n2.replace(tzinfo=_et) if n2.tzinfo is None else n2.astimezone(_et)
         mins = n2.hour * 60 + n2.minute
         return (16 * 60) <= mins < (16 * 60 + 15 + grace_minutes)
 
@@ -715,8 +756,21 @@ class BotManager:
             # were blind to (R5-D1). Restart + alert.
             try:
                 _hb = DATA_DIR / "bot_heartbeat"
-                from ait.utils.time import is_market_open as _imo_hb
-                if _imo_hb() and _hb.exists():
+                try:
+                    from ait.utils.time import is_market_open as _imo_hb
+                    _mkt_open = _imo_hb()
+                except Exception as _ce:  # noqa: BLE001
+                    # W20d, same class as the marker site below: a calendar
+                    # fault here escaped to the OUTER handler and silently
+                    # disarmed hang detection for the whole outage — a hung
+                    # event loop mid-session would then go unnoticed, which is
+                    # the exact failure class (R5-D1) this check exists for.
+                    # Fall back to the calendar-free clock proxy so the check
+                    # stays armed through a weekday RTH.
+                    _log("warning", "heartbeat_market_check_failed",
+                         error=str(_ce))
+                    _mkt_open = _assume_market_open_on_clock()
+                if _mkt_open and _hb.exists():
                     _age_min = (datetime.now() - datetime.fromtimestamp(
                         _hb.stat().st_mtime)).total_seconds() / 60
                     if _age_min > 15:
@@ -743,8 +797,21 @@ class BotManager:
                 try:
                     from ait.utils.time import is_market_open
                     market_open = is_market_open()
-                except Exception:
-                    market_open = False
+                except Exception as _e:  # noqa: BLE001
+                    # W20d: this was a bare `market_open = False`, which FAILS
+                    # OPEN — "I don't know" unlocked the restart branch below,
+                    # so a single calendar fault restarts the LIVE bot
+                    # mid-session with positions open. Probed 2026-09-16 on
+                    # this CEST box: with the calendar faulted, 09:05, 10:05,
+                    # 11:05, 13:05 and 15:05 ET ALL took the restart branch.
+                    # Note W20b alone does not close this — making
+                    # _in_post_market_window timezone-correct fixes the
+                    # function and leaves the hole, because returning False
+                    # mid-RTH is the *right* answer to "are we post-market?".
+                    # The hole is here, in the caller.
+                    _log("warning", "fresh_models_market_check_failed",
+                         error=str(_e))
+                    market_open = _assume_market_open_on_clock()
                 if market_open:
                     _log("info", "fresh_models_restart_deferred_market_open")
                 elif _in_post_market_window():
@@ -1734,8 +1801,14 @@ def _backtest_catchup_due(now: datetime, reports_dir: Path | None = None) -> boo
 
     True when the newest backtest_*.json predates the most recent Sunday
     20:00 slot (or none exists at all — the observed state: exactly one run
-    since March). `now` is naive local time (box runs ET), matching the
-    artifact mtimes it is compared against."""
+    since March). `now` is naive local time, matching the artifact mtimes it
+    is compared against.
+
+    W20: this said "naive local time (box runs ET)" — false since the CEST
+    move, and harmless only because BOTH sides of the comparison are naive
+    local. The Sunday-20:00 slot is therefore the BOX's 20:00, not ET's;
+    immaterial for a weekly catch-up, but do not read an ET guarantee into
+    this function."""
     d = reports_dir if reports_dir is not None else REPORTS_DIR
     # Most recent Sunday-20:00 slot at or before `now` (Mon=0..Sun=6).
     due = (now - timedelta(days=(now.weekday() + 1) % 7)).replace(
@@ -1936,7 +2009,10 @@ def main():
     # DEFERRED 10 min (never synchronously in main(), #69) and never runs
     # during market hours: pushed past 16:30 ET if it would land in-session.
     try:
-        _now_bt = datetime.now()  # naive local (=ET box), matches file mtimes
+        # W20: naive local, matching the file mtimes it is compared against.
+        # The old comment said "(=ET box)" — false since the CEST move. The
+        # CODE is still right: both sides of the comparison are naive local.
+        _now_bt = datetime.now()
         if _backtest_catchup_due(_now_bt):
             _bt_at = _backtest_catchup_run_at(_now_bt)
             scheduler.add_job(run_backtest, "date", run_date=_bt_at,

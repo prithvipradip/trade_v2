@@ -496,6 +496,18 @@ class MetaLabeler:
 
         for row in results:
             r = dict(row)
+            # W20a (R25 tz-01) — KNOWN CONTAMINATION, NOT FIXABLE HERE.
+            # trades.entry_time is written naive-local (executor.py:389
+            # `datetime.now().isoformat()`), so this hour inherits whatever
+            # timezone the WRITING HOST was in: ET for rows written before the
+            # 2026-09-14 move, CEST (= ET+6) for rows after it. The string
+            # carries no offset, so the convention cannot be recovered on read
+            # — this parse is correct code operating on mixed-convention data.
+            # The two LIVE producers (orchestrator.py) are fixed to now_et();
+            # this training-side derivation stays contaminated until either
+            # entry_time becomes timezone-aware or the pre/post-move rows are
+            # restated. Registered, not silently tolerated: the meta-labeler is
+            # untrained and default-off, so the corpus is still small.
             entry_hour = 10  # Default
             try:
                 from datetime import datetime
