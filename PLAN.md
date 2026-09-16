@@ -2728,3 +2728,71 @@ silent-swallow sites"; the real scale is 355 except clauses -> 177 candidates ->
 twelve are CALENDAR FAULTS — a single NYSE-calendar failure would concurrently restart the live bot
 mid-session, open the pre-event blackout, and disable both event-driven exits. Probe that as a
 CLASS, not five instances.
+
+## 2026-09-16 - W18 EXECUTED: Gateway port unblock + 4 verified findings fixed (and a W17 miss owned)
+Operator moved TWS -> IB Gateway. That created no defect; it exposed a stale line. Register:
+reports/w17_probes_batch2_20260916.md (the findings), this entry (the fixes).
+
+[0] THE BLOCKER. Port 4002 was OPEN (Gateway paper), 7497 closed, and .env still said
+    IBKR_PORT=7497 — so the supervisor (pid 41807) logged bot_restart_deferred_gateway_down every
+    2 min for 9h47m. Both the supervisor probe and the bot's own connection read that variable,
+    and master.py:603 spawns the child with env={**os.environ}, so the child inherits the
+    SUPERVISOR's env: editing .env does nothing until the supervisor itself restarts. Fixed .env
+    -> 4002 (gitignored, local). The bot had ALREADY been down since ~05:00 for an unrelated
+    reason (TWS disconnect -> SIGTERM), so this outage was not caused by the switch.
+[0b] AND MADE IT SELF-DIAGNOSING. New _port_hint() scans the other known IB ports (4001/4002/
+    7496/7497 — the set .env's own comment documents) and splices a hint into the alert and the
+    log: "nothing is on 7497, but 4002 (IB Gateway paper) IS open — check IBKR_PORT in .env".
+    Verified against live machine state. The mismatch was measurable for ten hours and nothing
+    looked.
+[0c] A W17 MISS, OWNED. W17's w17-01b fixed the "consume the throttle only on a DELIVERED page"
+    ordering and its commit claimed the CLASS. There are FOUR sites sharing _last_gateway_alert;
+    it fixed two (both inside _maybe_recover_gateway) and MISSED two — :572 and :771 — and :771 is
+    the one that had been firing every two minutes for ten hours. The one that actually mattered
+    was the one I missed. Both now gated on delivery; a new test pins all four so the class cannot
+    regress again. This is the third time this session one of my own claims was wrong and the
+    two-lens discipline caught it.
+[1] w17-08 THE READ-ONLY ALARM NO LONGER FAILS OPEN. verify_can_trade returned True after failing
+    to place its probe. It now returns None for UNKNOWN — the sentinel this repo already uses
+    (RESTRICTED_UNREADABLE, get_all_open_trades) — distinct from True (accepted) and False
+    (read-only), and _check_trading_enabled pages on UNKNOWN with its own throttle key. The return
+    value stays unused, correctly: both callers discard it, and the function's job is the ALERT.
+    PROMOTED by the Gateway switch: READ-ONLY login is the failure Gateway actually has, and it
+    recurs on Gateway's daily restart.
+[2] w17-09 THE GO-LIVE SLIPPAGE GATE IS NOW HONEST. It is PINNED as median ENTRY slip, but the
+    executions table has no lifecycle marker (`side` is BOT/SLD direction, not entry/exit), so the
+    pinned statistic CANNOT be computed. Per this module's own promise — "any criterion whose data
+    cannot support the PINNED definition is returned UNAVAILABLE with a reason rather than
+    substituted by a differently-defined number" — criterion [4] is now UNAVAILABLE. The all-fills
+    median is still rendered as explicitly-FYI so no visibility is lost, and the coverage hole is
+    reported the way criteria [1] and [3] already do: "dropped: 1 with no matching trade, 1 with no
+    live_mid of 4 fills". n==1 can no longer pass a gate.
+    VISIBLE BEHAVIOUR CHANGE, NOT A REGRESSION: the scorecard will now show [4] as UNAVAILABLE
+    rather than a number. That is the point — it was showing a differently-defined number.
+    Chose UNAVAILABLE over adding a lifecycle column (operator decision): arch-02 found there is
+    no migration engine, so a schema change carries its own risk.
+[3] w17-10 scripts/restate_r16_executions.py DELETED. Its predicate (con_id != BAG_CON_ID) is true
+    of EVERY single-leg order while the writer branches on is_combo, so it would zero fill-quality
+    context the current writer legitimately produces — W17 batch 2 ran it for real and it printed a
+    legitimate row under "sample rows currently feeding the gate" then declared it would clear it.
+    One-off repair, applied on the Windows box 2026-08-10, never applied here, zero tests. Ledger
+    records what it did; git retains the file. The tested sibling restate_r16_dailystats is kept.
+[4] w17-11 NO MORE SILENT WRONG DENOMINATOR. The three local _capital_base() copies are gone,
+    replaced by a direct import of runtime_env.capital_base (which already resolves env -> live NLV
+    -> default, and imports only os/pathlib so it costs no import weight). Each copy had wrapped
+    the authority in a bare unlogged except and fallen back to a SECOND hardcoded 196000 —
+    measured at 196,000 against a live 723,071, then raised to the 12th power for the annualised
+    return. If the authority is ever unreachable the module now fails LOUDLY at import instead of
+    rendering a plausible lie. Also fixed the dead key: app.py queried bot_state['account_value'],
+    NEVER WRITTEN anywhere in src/; it now reads 'last_net_liquidation', which orchestrator.py:1180
+    actually writes.
+TESTS AMENDED, SAID OUT LOUD: two tests in test_w3_scorecard_truth.py pinned the old slippage
+rendering. W3's actual property — a PERCENT median, never a dollar mean — is unchanged and still
+asserted; only `passed` moved, because a criterion that cannot be computed as pinned must not pass
+a gate. A third test was added for the drop reporting. Writing the render also caught two bugs in
+my own first attempt: render() already prepends "UNAVAILABLE — " (I double-prefixed it) and
+DISCARDS the suffix for an unavailable criterion (so the trend clause had to be folded into the
+text, or the operator would have silently lost a number).
+PROOF: every fix has tests proven to fail against pre-fix source (6 for item 0, 6 for items 1+4),
+then pass restored. NOT YET DEPLOYED — .env's new port needs the SUPERVISOR restarted, not just the
+bot child, and that restart is the operator's call.

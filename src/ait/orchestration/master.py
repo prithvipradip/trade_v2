@@ -200,6 +200,36 @@ def _gateway_listening(port: int, host: str = "127.0.0.1") -> bool:
 _singleton_lock_handle = None  # module-held: lock lives exactly as long as this process
 
 
+# W18: the IB API ports, with what each one means. This is the same set
+# .env's own inline comment documents.
+_IB_PORTS = {
+    4002: "IB Gateway paper",
+    4001: "IB Gateway live",
+    7497: "TWS paper",
+    7496: "TWS live",
+}
+
+
+def _port_hint(configured: int) -> str:
+    """If the configured port is dead but another IB port answers, name it.
+
+    W18: after the operator moved from TWS to IB Gateway, .env still said
+    IBKR_PORT=7497 while Gateway listened on 4002. The supervisor deferred the
+    bot for 9h47m behind a bare `bot_restart_deferred_gateway_down | port=7497`
+    — the mismatch was measurable the entire time and nothing looked. Returns a
+    leading-space fragment for splicing into an alert, or "" when there is
+    nothing to add.
+    """
+    try:
+        for port, label in _IB_PORTS.items():
+            if port != configured and _gateway_listening(port):
+                return (f" NOTE: nothing is on {configured}, but {port} ({label}) IS "
+                        f"open — check IBKR_PORT in .env matches the app you are running.")
+    except Exception:  # noqa: BLE001 — a hint must never break the alert it decorates
+        pass
+    return ""
+
+
 def _acquire_singleton_lock(lock_path: Path | None = None) -> bool:
     """Atomically claim the single-orchestrator lock. False = already held."""
     global _singleton_lock_handle
@@ -569,9 +599,13 @@ class BotManager:
             now = datetime.now()
             if (self._last_gateway_alert is None
                     or (now - self._last_gateway_alert) > timedelta(minutes=30)):
-                self._last_gateway_alert = now
-                _alert(f"cannot start bot — IB Gateway not available on port {gw_port}. "
-                       f"Is Gateway/TWS logged in?")
+                # W18: consume the throttle only on a DELIVERED page. W17's
+                # w17-01b fixed this ordering in _maybe_recover_gateway and
+                # claimed the class; it covered 2 of the 4 sites sharing
+                # _last_gateway_alert. This is one of the two it missed.
+                if _alert(f"cannot start bot — IB Gateway not available on port "
+                          f"{gw_port}.{_port_hint(gw_port)} Is Gateway/TWS logged in?"):
+                    self._last_gateway_alert = now
             return
 
         _log("info", "bot_starting")
@@ -762,16 +796,19 @@ class BotManager:
         # (incl. FOMC eve 2026-06-16 and FOMC morning 2026-06-17).
         gw_port = int(os.environ.get("IBKR_PORT", "4002"))
         if not _gateway_listening(gw_port):
-            _log("info", "bot_restart_deferred_gateway_down", port=gw_port)
+            _log("info", "bot_restart_deferred_gateway_down", port=gw_port,
+                 other_ib_port_open=(_port_hint(gw_port) or "none"))
             now = datetime.now()
             if self._gateway_down_since is None:
                 self._gateway_down_since = now
             if (self._last_gateway_alert is None
                     or (now - self._last_gateway_alert) > timedelta(minutes=30)):
-                self._last_gateway_alert = now
-                _alert(f"IB Gateway unreachable on port {gw_port} (likely daily "
-                       f"maintenance). Bot start deferred; will resume "
-                       f"automatically when Gateway returns. No budget spent.")
+                # W18: same missed throttle-ordering site as above.
+                if _alert(f"IB Gateway unreachable on port {gw_port} (likely daily "
+                          f"maintenance).{_port_hint(gw_port)} Bot start deferred; "
+                          f"will resume automatically when Gateway returns. "
+                          f"No budget spent."):
+                    self._last_gateway_alert = now
             # ops-substrate-01: deferring FOREVER is the absorbing state. After
             # a grace period, try to bring the Gateway back ourselves.
             self._maybe_recover_gateway(gw_port, now)

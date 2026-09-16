@@ -2105,7 +2105,7 @@ class TradingOrchestrator:
             )
         return None
 
-    async def _check_trading_enabled(self) -> bool:
+    async def _check_trading_enabled(self) -> bool | None:
         """Probe whether orders can actually be placed; alert loudly if not.
 
         Guardrail against the silent read-only lock. Called at startup and
@@ -2115,8 +2115,27 @@ class TradingOrchestrator:
         """
         try:
             can_trade = await self._ibkr.verify_can_trade()
-        except Exception:
-            return True  # never let the probe itself break the loop
+        except Exception as _e:  # noqa: BLE001 — the probe must not break the loop
+            can_trade = None
+            log.warning("trading_probe_raised", error=str(_e))
+
+        if can_trade is None:
+            # W18 (w17-08): UNKNOWN is not OK. The probe could not establish
+            # that orders work, and this alarm is the ONLY thing standing
+            # between a READ-ONLY Gateway session and a day of silently
+            # rejected orders — the failure mode Gateway actually has, and
+            # which recurs on its daily restart. Page on its own throttle key
+            # so it cannot be starved by the read-only page.
+            if self._alert_gate("trading_probe_unknown", 3600):
+                await self._send_notification(
+                    "CANNOT VERIFY TRADING: the read-only probe did not "
+                    "complete, so it is UNKNOWN whether IB Gateway accepts "
+                    "orders. If Gateway logged in read-only, orders are being "
+                    "rejected silently. Check the Gateway window."
+                )
+                log.critical("trading_verify_unknown_alerted")
+            return None
+
         if not can_trade:
             if not getattr(self, "_readonly_alerted", False):
                 self._readonly_alerted = True

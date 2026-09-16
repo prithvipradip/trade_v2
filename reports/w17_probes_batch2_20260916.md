@@ -1,5 +1,12 @@
 # W17 batch 2 — probe results (2026-09-16)
 
+> **FIXED IN W18 (2026-09-16):** w17-08, w17-09, w17-10 and w17-11 are all fixed — see the
+> `## 2026-09-16 - W18 EXECUTED` entry in `PLAN.md`. w17-06 and w17-07 (the options_chain
+> strike-selection and exception-masking findings) remain OPEN and are proposed for W19, because
+> they need a *decision* first: whether per-contract solved IV is actually wanted for strike
+> selection. It may well be an improvement — it was shipped as a correctness fix without anyone
+> choosing it.
+
 Six probes, executing real code. Mocks only at the external edge (broker, the authority import);
 never the logic under test. Fixture DBs throughout — `data/ait_state.db` was never written.
 

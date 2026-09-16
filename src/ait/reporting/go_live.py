@@ -249,6 +249,11 @@ class GoLiveVerdict:
     dd_missing_car: int = 0
     slip_median_pct: float | None = None
     slip_n: int = 0
+    # W18 (w17-09): coverage-hole counters, so slip_n stops being a
+    # survivor count presented as a sample size.
+    slip_total_fills: int = 0
+    slip_dropped_orphan: int = 0
+    slip_dropped_no_mid: int = 0
     slip_trend: str | None = None
     excluded: dict = field(default_factory=dict)  # bucket -> row count
     pace_per_week: float | None = None
@@ -328,9 +333,25 @@ def compute_go_live_verdict(
                 "ORDER BY e.exec_time DESC LIMIT ?",
                 (SLIP_WINDOW,),
             ).fetchall()
+            # W18 (w17-09): slip_n reported SURVIVORS as if it were the sample
+            # size. Four filters shrink this population and none was visible:
+            # live_mid > 0, entry_price > 0, the INNER JOIN (every execution in
+            # the live DB has an EMPTY trade_id and is dropped outright), and
+            # the LIMIT. Criteria [1] and [3] in this same file already surface
+            # their coverage holes (v.excluded, dd_missing_car); [4] did not.
+            slip_total = con.execute(
+                "SELECT COUNT(*) c FROM executions").fetchone()["c"]
+            slip_orphan = con.execute(
+                "SELECT COUNT(*) c FROM executions e "
+                "WHERE NOT EXISTS (SELECT 1 FROM trades t "
+                "                  WHERE t.trade_id = e.trade_id)").fetchone()["c"]
+            slip_no_mid = con.execute(
+                "SELECT COUNT(*) c FROM executions "
+                "WHERE COALESCE(live_mid,0) <= 0").fetchone()["c"]
             slip_err = None
         except sqlite3.Error as e:  # pre-migration DB with no executions table
             slips, slip_err = [], str(e)
+            slip_total = slip_orphan = slip_no_mid = 0
     finally:
         con.close()
 
@@ -371,6 +392,9 @@ def compute_go_live_verdict(
         abs(float(s["price"]) - float(s["live_mid"])) / float(s["entry_price"]) * 100.0
         for s in slips
     ]
+    v.slip_total_fills = slip_total
+    v.slip_dropped_orphan = slip_orphan
+    v.slip_dropped_no_mid = slip_no_mid
     if slip_vals:
         v.slip_median_pct = _median(slip_vals)
         v.slip_n = len(slip_vals)
@@ -447,14 +471,43 @@ def _build_criteria(v: GoLiveVerdict, slip_err: str | None) -> list:
         crit.append(Criterion(
             key="slippage", label="[4] slippage  ", text=why, available=False))
     else:
+        # W18 (w17-09): this criterion is PINNED as "median ENTRY slip as % of
+        # credit" (GATE_SLIP_PCT's own comment, shadow_referee.py:226). The
+        # query has no entry/exit discriminator, so the population is ALL
+        # fills — and W17 batch 2 measured the consequence: one exit fill,
+        # divided by the ENTRY credit, moved the median to 16% and failed an
+        # 8% gate. At n == 1 it rendered available=True, passed=True.
+        #
+        # The executions table has no lifecycle column (`side` is BOT/SLD
+        # direction, not entry/exit), so the pinned statistic CANNOT be
+        # computed from this data. Per this module's own promise at the top of
+        # compute_go_live_verdict — "Any criterion whose data cannot support
+        # the PINNED definition is returned UNAVAILABLE with a reason rather
+        # than substituted by a differently-defined number" — it is now
+        # UNAVAILABLE. The all-fills median is still shown, explicitly as
+        # information and explicitly not gating, so no visibility is lost.
+        dropped = []
+        if v.slip_dropped_orphan:
+            dropped.append(f"{v.slip_dropped_orphan} with no matching trade")
+        if v.slip_dropped_no_mid:
+            dropped.append(f"{v.slip_dropped_no_mid} with no live_mid")
+        drop_note = (f" | dropped: {', '.join(dropped)} of "
+                     f"{v.slip_total_fills} fills" if dropped else "")
+        # render() already prepends "UNAVAILABLE — " and DISCARDS the suffix
+        # for an unavailable criterion, so the trend is folded into the text
+        # rather than passed as suffix — otherwise the operator silently loses
+        # a number they used to see.
         trend = (f" | {v.slip_trend}" if v.slip_trend
                  else " | trend UNAVAILABLE (<4 fills in window)")
         crit.append(Criterion(
             key="slippage", label="[4] slippage  ",
-            text=(f"median {v.slip_median_pct:.1f}% of credit over trailing "
-                  f"{v.slip_n} fills, all strategies (gate <={GATE_SLIP_PCT:g}%)"),
-            available=True, passed=(v.slip_median_pct <= GATE_SLIP_PCT),
-            suffix=trend))
+            text=(f"entry fills cannot be identified (executions carry no "
+                  f"entry/exit marker), so this is ALL fills, not the pinned "
+                  f"ENTRY slip, and is not comparable to the "
+                  f"{GATE_SLIP_PCT:g}% gate. FYI only: median "
+                  f"{v.slip_median_pct:.1f}% of credit over {v.slip_n} "
+                  f"fill(s){drop_note}{trend}"),
+            available=False))
 
     # [5] unmanaged-position incidents — genuinely not answerable from the
     # state DB alone (HALT markers + duplicate-position detection live in

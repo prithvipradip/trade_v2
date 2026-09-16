@@ -42,20 +42,17 @@ def _real_close_sql(prefix: str = "") -> str:
     return " AND ".join(f"{col} NOT LIKE '{p}'" for p in NOT_REAL_CLOSE_PATTERNS)
 
 
-def _capital_base() -> float:
-    """Equity base for drawdown %. Defaults to 196000 (paper NLV).
-
-    Go-live MUST set AIT_CAPITAL_BASE to the funded amount, otherwise
-    drawdown % is computed off the wrong base.
-    """
-    try:
-        from ait.config.runtime_env import capital_base as _cb
-        return _cb()
-    except Exception:  # noqa: BLE001 - R16: single authority, safe fallback
-        try:
-            return float(os.environ.get("AIT_CAPITAL_BASE", "196000"))
-        except (TypeError, ValueError):
-            return 196000.0
+# W18 (w17-11): the three local _capital_base() copies are gone. Each wrapped
+# the declared single authority in a bare unlogged `except` and fell back to a
+# SECOND hardcoded 196000 — restoring the exact pre-R16 bug the authority was
+# created to fix. W17 batch 2 measured it: with the authority import forced to
+# fail, all three returned 196,000 against a live 723,071 (73% off), silently,
+# and app.py raises that to the 12th power for the annualised return.
+# runtime_env.capital_base() already resolves env -> live NLV -> default and
+# exposes capital_base_source(). It imports only os and pathlib, so this costs
+# no import weight. If it is ever unreachable the module now fails LOUDLY at
+# import rather than rendering a plausible wrong number.
+from ait.config.runtime_env import capital_base as _capital_base  # noqa: E402
 
 
 def _annualization_factor(close_times: list) -> float:

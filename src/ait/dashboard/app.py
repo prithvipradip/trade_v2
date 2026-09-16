@@ -39,20 +39,17 @@ _REAL_CLOSE_SQL = " ".join(
 ).replace("' COALESCE", "' AND COALESCE")
 
 
-def _capital_base() -> float:
-    """Account equity base. Defaults to 196000 (paper NLV).
-
-    Go-live MUST set AIT_CAPITAL_BASE to the funded amount, otherwise
-    return/drawdown percentages are computed off the wrong base.
-    """
-    try:
-        from ait.config.runtime_env import capital_base as _cb
-        return _cb()
-    except Exception:  # noqa: BLE001 - R16: single authority, safe fallback
-        try:
-            return float(os.environ.get("AIT_CAPITAL_BASE", "196000"))
-        except (TypeError, ValueError):
-            return 196000.0
+# W18 (w17-11): the three local _capital_base() copies are gone. Each wrapped
+# the declared single authority in a bare unlogged `except` and fell back to a
+# SECOND hardcoded 196000 — restoring the exact pre-R16 bug the authority was
+# created to fix. W17 batch 2 measured it: with the authority import forced to
+# fail, all three returned 196,000 against a live 723,071 (73% off), silently,
+# and app.py raises that to the 12th power for the annualised return.
+# runtime_env.capital_base() already resolves env -> live NLV -> default and
+# exposes capital_base_source(). It imports only os and pathlib, so this costs
+# no import weight. If it is ever unreachable the module now fails LOUDLY at
+# import rather than rendering a plausible wrong number.
+from ait.config.runtime_env import capital_base as _capital_base  # noqa: E402
 
 
 def _annualization_factor(trades: list[dict]) -> float:
@@ -992,7 +989,14 @@ def _live_vs_backtest_panel(conn: sqlite3.Connection) -> None:
     # (paper NLV default), not a hardcoded 250k that misstates returns
     nlv_row = _safe_fetchall(
         conn,
-        "SELECT value FROM bot_state WHERE key = 'account_value' LIMIT 1",
+        # W18 (w17-11): this queried 'account_value', a key NEVER WRITTEN
+        # anywhere in src/ — verified against the live DB, which holds only
+        # 'last_net_liquidation' (written by orchestrator.py:1180). The read
+        # therefore always missed and always fell through to _capital_base().
+        # It landed on the right number only because the AUTHORITY has a
+        # live-NLV tier; the local fallback it used to call did not, so an
+        # authority failure showed 196,000 against a live 723,071.
+        "SELECT value FROM bot_state WHERE key = 'last_net_liquidation' LIMIT 1",
     )
     nlv = float(nlv_row[0]["value"]) if nlv_row else _capital_base()
     live_return_30d = (live_total_pnl / nlv) if nlv > 0 else 0
