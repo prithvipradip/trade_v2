@@ -4212,3 +4212,128 @@ NEXT: unchanged from the entry above — (a) W25 the go-live sizing wave
 (params-trading-01 + logic-entry-01, one wave, both failing at `_launch_size_coherence_check`),
 then (b) data-integrity-07 and logic-exit-risk-03, regress-live-06 in its own wave,
 (c) docs-policy-04's RUNBOOK fix, (d) triage batch 2 + the dedup pass.
+
+## 2026-09-16 - W25 EXECUTED — the go-live sizing wave (params-trading-01 + logic-entry-01 + one new)
+
+The first FIX wave off register triage batch 1, taken in the order the corrections entry left:
+(a) W25. Both named findings fail inside `_launch_size_coherence_check`, the self-test the go-live
+recipe tells the operator to run and trust before funding at ~$2.1k, so they were taken as ONE
+wave. Register-don't-fix does not apply here. A third defect in the same function was found while
+probing the second and is fixed in the same wave.
+
+[1] params-trading-01 — CONFIRMED OPEN BY BOTH LENSES, and the register's mechanism is WRONG.
+    The code lens had already conceded on 09-16 by reading `manager.py:615`. The execution lens
+    now concedes too: a probe drove the REAL `validate_trade` with the REAL `PositionSizer`, REAL
+    `CorrelationGuard` and REAL `config.yaml`, stubbing only the account seam. Negative-control
+    pair, identical requests differing ONLY in whether a correlated position is open:
+      - nothing open  -> approved=False, "position sizer returned 0 contracts"
+      - SPY open      -> approved=True, position_size=1, **max_risk=0.0**
+    Account-size independent (reproduced at $2.1k and at $10k).
+    WHAT THE REGISTER GOT WRONG, stated rather than absorbed: it claims this fires at $2.1k via the
+    `max_position_pct` route. It does not. Gate 6b (`manager.py:512`, risk.max_position_risk_pct
+    3% = $63) rejects BEFORE sizing, and since 3% < the sizer's 5% that masking holds at EVERY
+    account size whenever `max_loss` is set. Reaching :615 requires a FALSY `max_loss`, and
+    `iron_condor.py:318-322` refuses to emit a condor with `max_loss <= 0`. So on today's IC-only
+    live path the defect was **latent, not active** — a fail-open contained by two unrelated gates
+    rather than by design. It is still worth closing: the containment is incidental, and the
+    second-order half (an approved position reporting max_risk=0.0, invisible to the aggregate cap
+    at :529) is real wherever it does fire.
+    RANKING, since the ledger asked for disagreement: W25 still goes first, but NOT for the reason
+    (a) gave. params-trading-01 is latent today; logic-entry-01 is ACTIVELY WRONG right now, at
+    exactly $2.1k, inside the one self-test the funding decision rests on. That is what earns the
+    ranking; params-trading-01 rides along in the same blast radius.
+
+[2] THE LEDGER'S SUGGESTED FIX WAS WRONG, and the test caught it rather than the reasoning.
+    (a) said ship `max(1,...) -> max(0,...)`. That was implemented, and the "haircut must still
+    reduce a viable size" test failed immediately. Measured: with
+    `positions.max_contracts_per_trade = 1` the sizer returns 1, `int(1 * 0.70) = 0`, so `max(0,...)`
+    REFUSES every entry made while one correlated position is open — and the universe is
+    SPY/QQQ/IWM, a single cluster, so the bot would have gone flat after its first fill. A silent
+    trading-behavior change shipped as a fail-open fix. This is the wave's most useful result and
+    the reason the negative control is non-negotiable.
+    SHIPPED INSTEAD: guard the branch — `if correlated_count > 0 and final_contracts > 0:`. The
+    rule a haircut must obey is that it may only REDUCE an already-viable size: never manufacture
+    one from a refusal, never turn a viable size into a refusal. Live sizing behavior is
+    byte-identical to pre-W25 for every viable size; only the 0-verdict path changes.
+
+[3] logic-entry-01 — FIXED, and the check was wrong in a THIRD way nobody had registered.
+    - It modelled the wing as `max(1.0, min_credit / 0.45)` = $1.56, a structure the real builder
+      never constructs. Now calls the REAL authority, `IronCondor._vol_scaled_width`
+      (`iron_condor.py:76`), which is fully duck-typed and runs at startup without a live chain.
+    - It read only `risk.max_position_risk_pct`. The sizer independently returns 0 contracts on
+      `positions.max_position_pct` (`position_sizer.py:166`), so the check could report COHERENT
+      while the OTHER cap bricked every entry. Now binds on the tighter of the two and names which.
+    - NEW, and this is what the $1.56 model was accidentally hiding: affordability is not
+      viability. At $2.1k the real builder caps the wing at $1.00, which can yield ~$0.45 credit
+      against a $0.70 floor, so `iron_condor.py:293` rejects EVERY signal — the bot emits ZERO
+      trades. The old check compared dollars only and never asked this. The first version of this
+      fix swapped the width source alone and reported COHERENT at $2.1k, which is the exact failure
+      logic-entry-01 describes; caught by running it, not by reading it. The credit-floor and
+      credit/width arms are now separate checks against the real builder's width.
+
+[4] D3, NEW FINDING, found while probing [3]: the breaker arm was ARITHMETICALLY DEAD.
+    `AIT_CREDIT_LOSS_LIMIT` contract-defaults to `"0"` = credit stop DISABLED (`runtime_env.py:85`,
+    `portfolio.py:230`), so `typical_stop_loss = 0` and `breaker_usd < 1.5 * 0` was False for every
+    account that has ever existed. The arm meant to catch "one stop-out halts the whole day" could
+    never fire — at $2.1k, where the breaker is $42, that is precisely the regime it exists for.
+    FIXED honestly rather than loudly: the first attempt reported "cannot be assessed" and alerted
+    at EVERY NLV including the paper account's $197k, which is alert fatigue, not a fix. With the
+    credit stop off, the honest bound on one trade's loss is the structure's DEFINED-RISK max loss
+    — nothing else closes the position early — so the arm now assesses against that. It fires at
+    $2.1k ($42 breaker vs $30) and $5k, and is silent at $10k and above.
+
+[5] VERIFICATION. `tests/test_w25_sizing_coherence.py`, 28 tests, all green.
+    - NEGATIVE CONTROL: feeds the REAL sizer's REAL 0-verdict into the pre-W25 expression and
+      asserts it yields 1, with the defect named in the assertion. It asserts the PREMISE first
+      (`verdict.contracts == 0`), so it fails loudly if the sizer ever stops returning 0 there
+      instead of quietly testing nothing.
+    - SECOND NEGATIVE CONTROL, added after [2]: pins why `max(0,...)` was rejected, so nobody
+      "simplifies" the guard back into a trading halt.
+    - CLASS GUARD, behavioral not syntactic: over the grid (sizer verdict 0/1/2/5 x correlated
+      0/1/2), `approved => 1 <= position_size <= sizer_verdict` and `verdict == 0 => refused`.
+      An AST guard was written FIRST and REJECTED — recorded because it is instructive: `qty =
+      max(1, ...)` is also the shape of `portfolio.py:963` (flooring a partial CLOSE at one
+      contract, correct) and `manager.py:172` (a divisor normalizer). The defect is about entry
+      sizing, not syntax, so a syntactic guard produces false positives and would have been
+      silenced or deleted by the next session.
+    - Gates: full fast lane **1839 passed / 43 skipped / 1 failed** — 1811 baseline + 28 new, and
+      the single failure is the known local-`.env` `test_r19_config_authority` case, unchanged
+      since W16. `compileall` OK. `scripts/typecheck.py` OK. `scripts/smoke_deploy.py` SMOKE PASS
+      (13 checks).
+
+[6] REGISTERED, NOT FIXED (operator decision this session), in
+    `reports/register_triage_20260916.md` under "W25 ADDENDUM": the cap-grid skew.
+    `risk.max_position_risk_pct` (3%, gate 6b) and `positions.max_position_pct` (5%, the sizer)
+    govern the same quantity through two unlinked knobs, and their ordering is the ONLY thing that
+    kept params-trading-01 off the live path. Raise the first above the second and the fail-open
+    would have become live on the normal IC path with no other code change. W25 removed the
+    fail-open, so the hazard is closed today; the entry exists so a future tuning wave knows what
+    it is standing on. Also registered there: `TradeValidation.max_risk` is sourced from a sizer
+    result that may not describe the approved size.
+
+STATE AT HANDOFF: branch feature/event-straddle. Live bot re-checked and UNCHANGED throughout —
+supervisor PID 77009 / `ait.main` PID 77028 both alive, `ait.log` writing, no `data/HALT`,
+`HALT_UNTRACKED` or `RESTRICTED.txt`; entries unfrozen. `data/bot_heartbeat` legitimately stale
+outside RTH (`ops_health.bot_liveness()` run, not assumed: `ok=True, state='not_rth'`).
+**NOT DEPLOYED — DELIBERATELY.** Per the operator's decision this session the wave is STAGED ONLY.
+`manager.py` and `orchestrator.py` are both loaded by the running bot, so **W25 is not live until
+the operator restarts `ait.main`**; the process still running is pre-W25 code. The operator owns
+that restart.
+WATCH LIST, carried forward and both CHECKED this session before any new work (per [C3]):
+  - W1 (heartbeat liveness): HEALTHY, verified through the real consumer. The writer was NOT
+    touched — the naive host-local string is decorative and every consumer reads mtime.
+  - W2 (the two calendar-fault warnings must NEVER appear): CLEAN, zero occurrences across all of
+    `logs/`. Both emit sites (`master.py:771`, `:813`) still exist, so the grep is not vacuous.
+NEXT, unchanged in order from the corrections entry, with (a) now closed:
+  (b) data-integrity-07 (give the entry budget back in the stale-pending sweep) and
+      logic-exit-risk-03 (scope the cooldown to SECTOR_GROUPS, one authority shared with
+      correlation.py). regress-live-06 wants its OWN wave with a live probe — it touches
+      initial-placement pricing on the live path.
+  (c) docs-policy-04's RUNBOOK fix: name master.py's 2-minute `combined_health_check` as the thing
+      to stop, drop the stale `keeper_ait.bat` path.
+  (d) Triage batch 2 (the remaining live_path tier) + the dedup pass from batch 1 [6], comparing
+      `Where:` AND `Claim:` in full, never a shared code location.
+  Still open from before, unchanged: the 10 remaining batch-3 fail-open sites, with #2
+  (reconciler.py / HALT_UNTRACKED) still needing re-verification because W22 rewrote that path.
+
+---
