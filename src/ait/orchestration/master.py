@@ -1477,9 +1477,28 @@ def daily_digest():
             o = con.execute(
                 "SELECT COUNT(*), COALESCE(SUM(unrealized_pnl),0) "
                 "FROM open_positions").fetchone()
+            # W22: the reminder cadence the operator chose — folded into
+            # this existing digest rather than a new schedule or extra
+            # Telegram traffic. Declared positions are otherwise silent
+            # (by design, they're ignored for management); this is the
+            # only place they resurface periodically.
+            declared = {r[0][len("manual_position_answer_"):] for r in con.execute(
+                "SELECT key FROM bot_state WHERE key LIKE "
+                "'manual_position_answer_%' AND value='yes'")}
+            prompted = {r[0][len("manual_position_prompt_msgid_"):] for r in con.execute(
+                "SELECT key FROM bot_state WHERE key LIKE "
+                "'manual_position_prompt_msgid_%'")}
+            answered = {r[0][len("manual_position_answer_"):] for r in con.execute(
+                "SELECT key FROM bot_state WHERE key LIKE "
+                "'manual_position_answer_%'")}
+            awaiting_reply = prompted - answered
             con.close()
             parts.append(f"open {o[0]} (unreal ${o[1]:+,.0f})")
             parts.append(f"today {e[0]} entries / {t[0]} closes ${t[1]:+,.0f}")
+            if declared:
+                parts.append(f"{len(declared)} manual position(s) declared, still open")
+            if awaiting_reply:
+                parts.append(f"{len(awaiting_reply)} manual position(s) awaiting your reply")
         hb = DATA_DIR / "bot_heartbeat"
         if hb.exists():
             age = (datetime.now() - datetime.fromtimestamp(

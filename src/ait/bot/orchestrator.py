@@ -458,6 +458,14 @@ class TradingOrchestrator:
         # self._notify) with a 1/hour cooldown; the raw callback would page
         # on every check pass of a flapping component.
 
+    def set_telegram(self, telegram) -> None:
+        """W22: wire the full TelegramNotifier (buttons/edit/callbacks, not
+        just .send) down to the reconciler, which needs it to prompt on an
+        untracked position. Mirrors set_notification_callback's shape —
+        main.py calls orchestrator.set_telegram(...) rather than reaching
+        into the private _reconciler attribute directly."""
+        self._reconciler.set_telegram(telegram)
+
     async def run(self) -> None:
         """Main loop — runs continuously, trading during market hours."""
         self._running = True

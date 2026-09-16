@@ -48,8 +48,10 @@ except Exception:
     faulthandler.enable()
 
 from ait.bot.orchestrator import TradingOrchestrator
+from ait.bot.state import StateManager
 from ait.broker.ibkr_client import IBKRClient
 from ait.config.settings import load_settings
+from ait.execution import manual_positions
 from ait.notifications.telegram import TelegramNotifier
 from ait.utils.logging import get_logger, setup_logging
 
@@ -150,6 +152,9 @@ async def run_bot(args: argparse.Namespace) -> None:
     # Create orchestrator
     orchestrator = TradingOrchestrator(settings, ibkr)
     orchestrator.set_notification_callback(telegram.send)
+    # W22: full TelegramNotifier (buttons/edit/callbacks), not just .send —
+    # the reconciler needs it to prompt on an untracked position.
+    orchestrator.set_telegram(telegram)
 
     # Setup graceful shutdown
     shutdown_event = asyncio.Event()
@@ -160,6 +165,16 @@ async def run_bot(args: argparse.Namespace) -> None:
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
+
+    # W22: inbound Telegram polling (button taps + reply-to corrections)
+    # runs as its own task, decoupled from the trading loop's own run()/
+    # shutdown semantics below — a separate StateManager instance, same
+    # DB file (WAL mode; StateManager already opens a fresh sqlite3
+    # connection per call, so concurrent instances are the existing,
+    # already-relied-on pattern, not a new risk).
+    poller_task = asyncio.create_task(
+        manual_positions.run_poller(
+            StateManager(), telegram, settings.api_keys.telegram_chat_id))
 
     # Run bot with shutdown handler
     try:
@@ -184,6 +199,11 @@ async def run_bot(args: argparse.Namespace) -> None:
                 pass
 
     finally:
+        poller_task.cancel()
+        try:
+            await poller_task
+        except asyncio.CancelledError:
+            pass
         await orchestrator.stop()
         await ibkr.disconnect()
         log.info("ait_shutdown_complete")

@@ -77,6 +77,19 @@ class PositionReconciler:
     def __init__(self, ibkr_client: IBKRClient, state: StateManager) -> None:
         self._ibkr = ibkr_client
         self._state = state
+        # W22: optional — set via set_telegram(). None means the declare/
+        # reject prompt is simply skipped (logged), same as an unconfigured
+        # TelegramNotifier no-op's; INST-3's freeze itself never depends on
+        # this being set.
+        self._telegram = None
+
+    def set_telegram(self, telegram) -> None:
+        """W22: wire in the TelegramNotifier so untracked-position prompts
+        can be sent. Mirrors TradingOrchestrator.set_notification_callback's
+        shape — a setter rather than a constructor arg, so existing
+        `PositionReconciler(ibkr, state)` call sites (tests included) don't
+        need to change."""
+        self._telegram = telegram
 
     @staticmethod
     def _normalize_expiry(expiry: str | None) -> str:
@@ -946,6 +959,13 @@ class PositionReconciler:
         if any(t.status == TradeStatus.CLOSING for t in local_trades):
             working_orders = await self._fetch_working_orders()
 
+        # W22: collected across this pass, written to HALT_UNTRACKED ONCE
+        # after the loop — fixes the old per-iteration write_text, which
+        # overwrote itself on every untracked key and left the file naming
+        # only the LAST one (live-confirmed twice with a real two-leg
+        # spread: both legs froze, the file named only one).
+        frozen_keys: list[str] = []
+
         # Check IBKR positions against local state
         promoted_ids: set[str] = set()
         # R16: a CLOSING trade kept because the broker order view is
@@ -1049,10 +1069,24 @@ class PositionReconciler:
                 # orchestrator can alert; without handling it corrupts both
                 # the position count and every margin-based check.
                 if ibkr_pos.get("sec_type") == "OPT":
+                    # W22: a DECLARED manual position (operator confirmed via
+                    # Telegram) is ignored for management — never re-enters
+                    # the debounce/freeze machinery below — but stays counted
+                    # in result.new_from_ibkr above like any other broker
+                    # position, and in every exposure/delta calculation
+                    # elsewhere (those read ib.portfolio() directly, never
+                    # filtered by local-trades membership).
+                    from ait.execution import manual_positions as _mp
+                    if _mp.is_declared(self._state, key):
+                        log.info("declared_manual_position_seen", position=key,
+                                 qty=ibkr_pos["quantity"])
+                        continue
+
                     # INST-3: a live OPTION at the broker with no local record
                     # = the mid-placement crash window. It has no stop, no TP,
                     # no expiry handling. Freeze new entries until a human
-                    # resolves it (delete data/HALT_UNTRACKED to resume).
+                    # resolves it (delete data/HALT_UNTRACKED to resume) —
+                    # or, W22, declares it manual via the Telegram prompt.
                     #
                     # R5 follow-up (2026-07-09): DEBOUNCE — the Gateway's
                     # morning position stream produced a phantom row twice
@@ -1064,14 +1098,23 @@ class PositionReconciler:
                     # <=8 h apart) before freezing; a real crash-window
                     # position persists at the broker and halts on the next
                     # periodic reconcile.
-                    from datetime import datetime as _dtd
-                    if not hasattr(self, "_untracked_sightings"):
-                        self._untracked_sightings: dict[str, _dtd] = {}
-                    _now = _dtd.now()
-                    _prev = self._untracked_sightings.get(key)
-                    self._untracked_sightings[key] = _now
-                    _gap_min = (_now - _prev).total_seconds() / 60 if _prev else None
-                    if _gap_min is None or _gap_min < 2 or _gap_min > 480:
+                    # W22: durable now (bot_state), not an in-memory dict —
+                    # the old _untracked_sightings dict reset on every
+                    # restart, and this box restarts often; a genuine
+                    # crash-window position could evade the freeze
+                    # indefinitely on a frequently-restarted box.
+                    _gap_min = _mp.record_sighting(self._state, key)
+                    # W22: once a key is CONFIRMED, do not re-run the gap
+                    # check on later passes — record_sighting resets
+                    # last_seen every call, so two reconcile() calls landing
+                    # within 2 minutes of each other would otherwise re-read
+                    # as "1st sighting, deferred" and silently drop an
+                    # already-live freeze for a cycle. The debounce's job is
+                    # proving persistence; once proven, it stays proven
+                    # until declared or gone — independent of whether the
+                    # Telegram prompt below actually sends.
+                    if not _mp.is_confirmed(self._state, key) and (
+                            _gap_min is None or _gap_min < 2 or _gap_min > 480):
                         # R12 F3.1/chaos#4B follow-through: the debounce was
                         # meant to delay the FREEZE, but it also swallowed the
                         # discrepancy — the EOD recon Telegram reported 0
@@ -1086,17 +1129,20 @@ class PositionReconciler:
                                     position=key, qty=ibkr_pos["quantity"],
                                     note="will freeze if still present next reconcile")
                         continue
-                    try:
-                        from pathlib import Path as _P
-                        _P("data/HALT_UNTRACKED").write_text(
-                            f"untracked {key} qty={ibkr_pos['quantity']} — "
-                            f"resolve at IBKR then delete this file")
-                    except Exception:  # noqa: BLE001
-                        pass
+                    frozen_keys.append(key)
+                    _mp.mark_confirmed(self._state, key)
+                    # getattr-guarded: several existing tests construct this
+                    # class via __new__ (bypassing __init__) to avoid a full
+                    # IBKR client — _telegram would not exist on those at all.
+                    _telegram = getattr(self, "_telegram", None)
+                    if _telegram is not None:
+                        await _mp.prompt_if_needed(
+                            self._state, _telegram, key, ibkr_pos["quantity"])
                     msg = (
                         f"UNTRACKED OPTION POSITION (no local record): {key}, "
                         f"qty={ibkr_pos['quantity']} — NEW ENTRIES FROZEN "
-                        f"(data/HALT_UNTRACKED). Resolve manually, then delete the file."
+                        f"(data/HALT_UNTRACKED). Resolve manually, reply to the "
+                        f"Telegram prompt if it's yours, or delete the file."
                     )
                     log.critical("reconcile_untracked_option_freeze",
                                  position=key, qty=ibkr_pos["quantity"])
@@ -1115,6 +1161,36 @@ class PositionReconciler:
                     )
                     log.warning("reconcile_new_ibkr_position", position=key)
                 result.discrepancies.append(msg)
+
+        # W22: write HALT_UNTRACKED as ONE complete snapshot of this pass's
+        # frozen keys — a declared or since-closed key that was frozen on a
+        # PRIOR pass and isn't in frozen_keys this time is correctly dropped
+        # here, no separate cleanup needed. Empty list -> no undeclared,
+        # unresolved untracked option remains -> delete the file.
+        from pathlib import Path as _P
+        _halt_path = _P("data/HALT_UNTRACKED")
+        try:
+            if frozen_keys:
+                _halt_path.write_text(
+                    "untracked positions (resolve at IBKR, or answer the "
+                    "Telegram prompt, then this file clears itself):\n"
+                    + "\n".join(f"  {k}" for k in frozen_keys))
+            elif _halt_path.exists():
+                _halt_path.unlink()
+        except Exception as e:  # noqa: BLE001
+            log.warning("halt_untracked_write_failed", error=str(e))
+
+        # W22: confirm + clean up any DECLARED position the operator has
+        # since closed at the broker — the "confirms when it disappears"
+        # half of the design.
+        _telegram = getattr(self, "_telegram", None)
+        if _telegram is not None:
+            from ait.execution import manual_positions as _mp
+            try:
+                await _mp.reconcile_declared_positions(
+                    self._state, _telegram, set(ibkr_map.keys()))
+            except Exception as e:  # noqa: BLE001
+                log.warning("manual_position_cleanup_failed", error=str(e))
 
         # Check local positions not in IBKR (may have been closed while bot was down).
         # SAFETY: if IBKR reports ZERO OPTION positions while we hold open
