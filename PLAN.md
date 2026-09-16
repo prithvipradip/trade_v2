@@ -3752,3 +3752,50 @@ Suite: 1757 passed / 43 skipped / 1 known local-.env failure.
 NEXT: W23 (scheduler CronTrigger timezone class — a DIFFERENT bug family from W24's race,
 still unfixed: 9 host-local triggers, 2 naive catch-up run_dates) and the register triage
 (109 R24 + 78 carried, deferred five waves now) remain the open backlog.
+
+## 2026-09-16 - W22 FOLLOW-UP: two UX gaps found by actually using it, both closed same-day
+Not new findings from review — the operator declared both real positions, then immediately
+hit two rough edges that only using the feature (not reading the code) would surface.
+
+[1] THE HALT DIDN'T LIFT ON ANSWERING. Both real positions were declared "yes" (12:17 and
+    12:44 ET), but HALT_UNTRACKED only clears on the NEXT reconcile() pass — which under the
+    original design meant waiting for post-market, tomorrow's pre-market, or another restart.
+    `TradingOrchestrator.reconcile_now()` runs one pass on demand; the poller fires it (as a
+    background task, never awaited inline) immediately after recording an answer. Kept
+    deliberately decoupled: the poller still holds no broker reference of its own, so a slow
+    or failed reconcile can never block it from processing the NEXT inbound update, and
+    reconcile_now catches its own errors so a broken callback can't take the poller down.
+
+[2] THE CONFIRMATION WASN'T VISIBLE. The operator tapped both buttons, then asked whether
+    their reply was received — the actual answer (edited prompt text) was there, but it was
+    genuinely easy to miss inside a message they weren't re-reading, and the Telegram
+    answerCallback toast (required by the API regardless) is even easier to miss. Every
+    recorded answer now ALSO sends a distinct new chat message — kept alongside the edit, not
+    instead of it, since the edit is still useful as a self-documenting record at the prompt
+    itself if you scroll back.
+
+[3] A DISCREPANCY WORTH RECORDING HONESTLY, NOT PAPERING OVER: by the time this follow-up was
+    ready to deploy, HALT_UNTRACKED had ALREADY cleared for both real positions — but the log
+    shows no reconcile() ran between the second answer (12:44 ET) and the check (13:20 ET),
+    and the bot process hadn't restarted (same pid). Neither this session's code nor a restart
+    did it. Most likely a manual deletion of the file outside the bot, but that is inference,
+    not confirmed — stated plainly rather than claimed as this fix's doing.
+
+[4] TESTS: 17 new — the callback fires on both interaction paths (button, text-correction),
+    is optional and never required (existing no-callback call sites unaffected), a failing
+    callback doesn't break answer recording, the confirmation message is distinct from the
+    edit and sent FRESH on every correction, not just the first answer. Full suite: 1764
+    passed / 43 skipped / 1 known local-.env failure — confirmed across two full runs (one
+    per fix layered on), no regressions either time.
+
+[5] DEPLOY, same-day, same mechanism (full supervisor restart, mid-day, operator's standing
+    authorization for today). Verified the running code behaviorally. Startup reconcile
+    correctly read BOTH positions as declared_manual_position_seen — the is_declared() gate
+    from the original W22 deploy, still working, now paired with reconcile_now for anything
+    NEW. Nothing left to prove live against these two specific positions — both are already
+    fully resolved; the new behavior applies to whatever the next untracked position is.
+
+STATE AT HANDOFF: HEAD (this entry's commit) on branch feature/event-straddle, NOT PUSHED.
+Live bot: supervisor 57775 / bot 57777, restarted 13:21 ET, stable, zero errors.
+Suite: 1764 passed / 43 skipped / 1 known local-.env failure.
+NEXT: unchanged — W23 (scheduler CronTrigger timezone class) and the register triage.
