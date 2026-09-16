@@ -3188,3 +3188,67 @@ WATCH LIST FOR THE 09:30 ET OPEN:
 [W6] hour_blocked_by_learning should stay silent — the gate now reads ET, but no blocked_hours
      state exists on disk, so nothing should block. A block appearing at an odd hour would mean
      the learner wrote one and the convention is still mismatched somewhere.
+
+## 2026-09-16 - W20 CORRECTIONS + W21 POINTER (read this entry first, next session)
+Four corrections to the W20 entry above, and the "what next" pointer it failed to leave. Appended,
+not edited, per the ledger rule.
+
+[C1] THE CENSUS ALREADY NAMED W20d. MY PLAN DROPPED IT. The W20 entry's [0b] reads as though my
+     post-fix probe discovered the caller's fail-open. It did not. The batch-3 census names it
+     verbatim as shortlist site #11: "Calendar fault => market_open=False => _in_post_market_window()
+     False at e.g. 11:00 => the post-retrain branch runs stop(); start() — restarting the live bot
+     mid-RTH with positions open." That is W20d, written down a day before W20 existed. What
+     happened is the reverse of the credit I gave myself: while re-scoping the wave from "trigger"
+     to "root cause" I narrowed the target to _in_post_market_window's TIMEZONE and lost the
+     caller the census had correctly identified; the probe then recovered it. The re-scope was
+     still right — but re-scoping is where a correct finding got dropped, and that is the lesson
+     worth keeping, not "probing found what reading missed".
+[C2] THE TRIGGER SURFACE IS WIDER THAN "CALENDAR FAULT", so [0]'s implausibility argument is
+     narrower than it sounds. The guard is a bare `except Exception` around BOTH the import and
+     the call:  `from ait.utils.time import is_market_open; market_open = is_market_open()`.
+     ANY failure of either — import error, a transient inside is_market_open, not just a broken
+     pandas_market_calendars — set market_open=False and unlocked the restart. W20's evidence that
+     calendar FAULTS are implausible stands; it does not establish that the except never fires.
+     W20d is therefore justified on its own, independent of how likely calendar faults are.
+[C3] COUNT CORRECTION: the W20 entry says "the remaining 11 batch-3 shortlist sites are still
+     unprobed". It is 10. W20 probed and FIXED two of the twelve — #11 (master.py health_check,
+     = W20d) and #12 (orchestrator _sessions_until, = W20b/c). Sites #4 and #5
+     (portfolio.py:779/:811) remain deliberately unprobed and are a DIFFERENT class: plain
+     `except: pass`, no clock.
+[C4] THE STALE-POINTER MISTAKE, REPEATED ONE WAVE LATER. PLAN.md line 2967 still reads "NEXT WAVE
+     NUMBERING, corrected: W20 is unclaimed" with candidates (a)/(b)/(c). That is now false —
+     (a) and (b) were one class and W20 executed both. This is precisely the staleness the
+     BACKLOG CORRECTION entry was appended to fix, recreated by the very wave that superseded it.
+     A wave entry is not finished until it leaves a correct pointer to the next one.
+
+W21 IS UNCLAIMED. RANKED, and this ranking is the one to follow:
+ (a) THE REGISTER TRIAGE — 109 R24 findings + 78 carried over, re-verified against TODAY's source.
+     The largest outstanding item, never started, now deferred past FOUR times (W17, W18, W19,
+     W20). It is re-verification of existing claims, not new-defect probing, so it has never won
+     a priority contest against live-path work — and that is exactly why it should stop competing
+     and simply be scheduled.
+ (b) THE 10 REMAINING BATCH-3 FAIL-OPEN SITES, consequence-ranked in
+     reports/w17_batch3_failopen_census_20260916.md. Highest first: #2 reconciler.py:1083 (the
+     HALT_UNTRACKED freeze file is never written), #3 orchestrator.py:701 (one unparseable
+     exit_time silently drops realized P&L from the day), #6 state.py:705 (corrupt partial_exits
+     JSON re-fires a completed exit level), #10 orchestrator.py:1074 (watchdog recovery action
+     lost). Probe in batches, stop after each, re-rank the tail — the cadence the operator chose.
+ (c) arch-01..04, qual-01/02/04, broker/orders/contracts dead & untested code, capital_tiers.py,
+     5 silent dashboard panels + 3 conflicting real-close SQL implementations, hardcoded
+     backtest-display constants.
+ (d) SMALL AND VERIFIED-STILL-BROKEN TODAY, cheap enough to fold into any wave: strategies/base.py
+     :58-61 points readers at ait.strategies.constants, which does NOT exist (confirmed 09-16);
+     tests/test_r19_config_authority.py::test_applier_and_readers_share_one_table still fails on
+     this box's local .env on every suite run (confirmed 09-16, unchanged since W16) — it is now a
+     permanent fixture of every `pytest -q` here and nobody has fixed the isolation gap.
+ (e) NEW FROM W20, registered not fixed: the two digest-marker date conventions (daily_digest
+     writes a LOCAL-date marker, _digest_catchup_due reads an ET-date one; they disagree only
+     18:00 ET -> midnight, and both crons fire outside that window, so nothing is broken today).
+ DEFERRED BY EXPLICIT OPERATOR DECISION, not oversight: the r=0.05 hardcoded rate + missing
+     dividend yield (needs its own wave with a re-run plan — two of three sites are in the
+     backtest engine, so changing them breaks comparability with every pre-registered study).
+
+STATE AT HANDOFF: HEAD b7be0be on branch feature/event-straddle, NOT PUSHED. Live bot runs W20
+(supervisor 81012 / bot 81032) since 06:15 ET. The W20 DEPLOYED entry's 6-item watch list is
+UNCHECKED — the market had not opened when this was written. Check W1 (heartbeat at the bell) and
+W2 (the two new warnings must never appear) before starting any new wave.
