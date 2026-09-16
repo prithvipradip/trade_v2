@@ -3334,3 +3334,164 @@ Final entry of the session. Supersedes the handoff block in "W20 CORRECTIONS + W
      named failure modes — see the "W1 REFINED" entry directly above; read it BEFORE interpreting
      a stale heartbeat, because R8 makes staleness a deliberate signal rather than an artifact.
      W3-W6 untouched. Check these before opening W21.
+
+## 2026-09-16 - W21 EXECUTED: tz-aware trade timestamps — and three live bugs the suite found, not I
+SESSION CLOSE [X2] said the cheap door closes at the next live fill. It was still open this
+morning and this wave walked through it. Chosen over the ledger's own ranking (register triage
+first) for one reason: the triage costs the same next week and this did not. The migration itself
+was routine. What was NOT routine is that my method for enumerating the work was unsound, and
+only the suite exposed it — see [4].
+
+[0] WHAT WAS MEASURED FIRST, because the whole cost argument rests on it. `data/ait_state.db` at
+    07:2x ET: 10 trades, ALL entered 2026-04-23/24, all `closed`; `open_positions` 0 rows,
+    `exit_outbox` 0 rows, 0 rows with `entry_time >= '2026-09-14'`. [X1]'s correction holds — the
+    corpus is uniformly ET and the contamination W20 [2] described never happened. So this was a
+    CONVENTION CHANGE (stamp the offset each row already meant) and NOT a restatement. Nothing in
+    the data moved: re-read after the backfill, the ET trading days are still 2026-04-23/24 and the
+    entry hours are still 9/10/14 ET. That last number is the check that matters — had the naive
+    values been misread as host-local CEST, the hours would have landed on 3/4/8, outside RTH.
+
+[1] WHY THE WINDOW WAS STILL OPEN, and it was not luck. `data/HALT_UNTRACKED` has frozen ALL new
+    entries since 09-15 20:00Z (orchestrator.py:2325 returns "symbol handled" for every signal
+    while it exists). No fill could land. The operator wants that halt lifted within days — and
+    LIFTING IT IS WHAT CLOSES THIS WINDOW. W21 before W22 is causal ordering, not preference.
+
+[2] THE [X3] CORRECTION — THE FAILURE MODE IS SILENCE, NOT A CRASH. [X3] says reconciler.py:788
+    "raises TypeError the moment awareness is mixed". It raises, but the raise is CAUGHT:
+    `except (ValueError, TypeError): continue`. A half-migrated corpus therefore does not crash —
+    the trade is dropped from the stale-PENDING sweep and the sweep degrades to a no-op with
+    nothing in the log. That is why this wave added a `log.warning` on that path, pinned by an AST
+    test so a future tidy-up cannot restore the silence.
+
+[3] THE SCOPE [X3] MISSED — 5 COLUMNS, NOT 2.
+    (a) `open_positions.entry_time` (state.py:490) — a fourth surface, 0 rows, migrated now rather
+        than left as a naive island.
+    (b) `exit_outbox.exit_time` cutoffs (state.py:851/:856) are compared as TEXT
+        (`WHERE exit_time < ?`). A naive cutoff against an aware column mis-selects SILENTLY, and
+        on a CEST box it mis-selects in the dangerous direction: a naive local string sorts ABOVE
+        an ET cutoff, so every pending booking goes unclaimed.
+    (c) `exit_outbox.claimed_at` (state.py:827/:832) — NOT in the plan. Found only because it is
+        compared against a value (b) was changing.
+
+[4] THE METHOD FAILURE, AND IT IS THE POINT OF THIS ENTRY. [X3] enumerated "19 sites" by grepping
+    `fromisoformat` lines that NAME entry_time/exit_time. I inherited that method, and my first
+    class-guard test encoded the same blind spot. IT IS UNSOUND: a reader can select the column in
+    SQL and parse `_row[0]`, so the column name never appears on the parse line. TWO such readers
+    existed, both in live paths, and BOTH were found by the test suite rather than by reading:
+    (a) `orchestrator._post_stop_cooldown_until` (:2221). A LIVE ENTRY GATE. Its
+        `_cooldown_now()` docstring stated the coupling outright — "kept naive-local on purpose —
+        trades.exit_time is written with datetime.now() (state.py) and the host runs ET, so the DB
+        rows and this clock share one convention". W21 broke the first half of that premise; the
+        CEST host move had ALREADY broken the second, so its reference DATE was rolling over six
+        hours early and selecting the wrong session — a W20-class defect W20 did not reach. Both
+        halves fixed: `_cooldown_now()` returns `now_et()`, and the cutoff is aware ET.
+    (b) `master._mirror_content_age_hours` (:1440). `MAX(entry_time)/MAX(exit_time)` minus a naive
+        `datetime.now()` raised TypeError into the surrounding `except`, which returns None — and
+        the caller reads None as a MISSING alarm. The backup-mirror freshness check would have
+        alarmed permanently instead of measuring anything.
+    THE GUARD NOW ASKS A QUESTION A GREP CANNOT: at FUNCTION scope, does this function touch a
+    migrated column AND parse a timestamp by hand? That formulation catches both misses. Four
+    allowlisted exceptions, each with a stated reason.
+
+[5] A THIRD BUG, MINE, ALSO CAUGHT BY THE SUITE. orchestrator.py:2252 — I migrated the cooldown's
+    `entry_time` parse but not the `cutoff = dt.now()` it is compared against. TypeError, swallowed
+    by a bare `except`, verdict "unverified" — and that guard FAILS CLOSED, so it would have
+    REFUSED EVERY ENTRY. Deploying without running the suite would have silently stopped the bot
+    trading. Recorded plainly: three live-path defects in this wave, and reading found none of them.
+
+[6] READERS: 18 BY NAME + 2 BY INDEX. `dashboard/walkforward/export.py:91` is NOT migrated and must
+    not be — it slices `[:10]` for a DATE (no offset can perturb ten characters) and also handles
+    backtest rows whose `exit_date` is a plain date. Migrating it would have been the error.
+
+[7] VERIFIED, NOT ASSUMED: the DuckDB mirror is unaffected. Its `entry_time`/`exit_time` are
+    `TIMESTAMP` (not `TIMESTAMPTZ`) and DuckDB DROPS the offset on ingest — probed 09-16, an aware
+    string and a naive one land as the identical naive value. Both sides of its hold-time
+    subtraction stay naive ET wall-clock, so `duckdb_analytics.py:416/417` is consistent and
+    deliberately untouched. Had it converted to UTC instead, every duckdb hold time and date bucket
+    would have shifted four hours.
+
+[8] WHAT LANDED. `parse_trade_ts()` in ait/utils/time.py is the single reconciliation point: naive
+    in -> localised ET, aware in -> CONVERTED to ET, so `.date()` and `.hour` are ET calendar
+    semantics for every caller regardless of what offset a row carries. Writers emit
+    `now_et().isoformat()`. Backfill is `scripts/restate_w21_tz_aware.py` (dry-run default,
+    `--apply` snapshots first, idempotent, derives each offset from the ET zone so EST and EDT rows
+    are each right, and ABORTS rather than relabelling any row written on/after the 09-14 host
+    move). Snapshot taken: `data/backups/ait_state.pre_w21_tz.20260916_133646.db`.
+
+[9] TESTS. `tests/test_w21_tz_aware_trade_timestamps.py` (15), following W20's rules: a real non-ET
+    `TZ` pin driving the no-argument clock path, plus a harness test so an ineffective pin cannot
+    make the rest vacuous. Ten EXISTING test files also had fixtures migrated — they seed rows the
+    writer produces, so they must follow the writer. That migration was not bookkeeping: making
+    `test_r21_post_stop_cooldown`'s fixture honest is what exposed [4](a).
+    SUITE (final, post-fix): 1692 passed / 43 skipped / 1 known local-`.env` failure (153 deselected — slow/integration markers), up from the 1677/43/1 baseline in [X6]. Every new pass is a test this wave added or migrated; the one known failure is unchanged —
+    `test_r19_config_authority.py::test_applier_and_readers_share_one_table`, the local-`.env`
+    isolation gap open since W16.
+
+[10] NOT DEPLOYED BY ME. The operator restarts `ait.main`. Ordering that matters: the backfill is
+     ALREADY applied, so the DB is aware while the RUNNING bot (81032, up since 06:15 ET) still
+     holds the old naive-writer code. Nothing can write a naive row right now — entries are frozen
+     by HALT_UNTRACKED and there are no open positions — but that gap closes the moment the halt is
+     lifted. RESTART BEFORE LIFTING THE HALT.
+
+[11] CORRECTION OF A STALE POINTER, per [C4]. PLAN.md:2967 still reads "NEXT WAVE NUMBERING,
+     corrected: W20 is unclaimed". False since W20 executed, flagged once by [C4], and false twice
+     over now. Appended, not edited: W20 and W21 are both DONE; W22 is next.
+
+[12] W22 IS NEXT, AND IT IS OPERATOR-BLOCKING. The halt is freezing entries on a bot the operator
+     wants trading, and will keep doing so for days. The untracked legs are the operator's own TWS
+     calendar spread (QQQ 712C 2026-10-16 +1 / 2026-09-18 -1), not a crash-window position.
+     DESIGN CHOSEN BY THE OPERATOR: on first sighting the bot ASKS via Telegram, records the answer
+     durably, suppresses future freezes for that contract, and confirms when the position
+     disappears. Declared-manual legs are IGNORED FOR MANAGEMENT BUT STILL COUNTED IN EXPOSURE —
+     portfolio.py:300/1013 reads `ib.portfolio()` directly and the bot's risk math must stay true
+     to the account. Undeclared untracked options still freeze; INST-3 is not downgraded.
+     FEASIBILITY, measured not assumed: ait/notifications/telegram.py is SEND-ONLY. `getUpdates`
+     appears once, in a setup docstring, and nothing polls it. An inbound path (offset-tracked
+     long-poll, pinned to the configured chat_id) has to be built, and THAT is the bulk of W22.
+     THREE DEFECTS FOUND IN THAT PATH TODAY, registered not fixed:
+     (a) Only the LAST untracked position reaches the halt file — reconciler.py:1080 does
+         `write_text` per position inside the loop. There are TWO legs; the file names one.
+         Resolving the named one and deleting the file leaves the other live.
+     (b) The INST-3 debounce loses state on every bot restart. `_untracked_sightings` is
+         per-instance; today's log re-logs "1st sighting, freeze deferred" at 06:56Z, 07:25Z and
+         10:15Z — each exactly a bot restart. On a frequently-restarted box a genuine crash-window
+         position can evade the freeze indefinitely.
+     (c) The freeze that IS active came from a single two-sighting window inside one process
+         lifetime (09-15 18:38Z -> 20:00Z). It is sticky only because the FILE persists, not
+         because detection re-armed.
+     NOTE ON THE BATCH-3 CENSUS: today's file proves the HAPPY PATH of reconciler.py:1080 writes.
+     That does NOT refute census site #2, whose claim is about the `except Exception: pass` around
+     the write — the freeze announced in the log while the file never appears. Still unprobed.
+
+[13] W23 REGISTERED — THE SCHEDULER TIMEZONE CLASS, same family as W20, still live, found by doing
+     the W2 watch check rather than by looking for it. master.py:1889 builds
+     `BlockingScheduler(timezone="US/Eastern")` and then hands `add_job` NINE PRE-BUILT
+     `CronTrigger` INSTANCES. APScheduler only injects the scheduler's timezone when IT builds the
+     trigger from an alias string, so all nine silently fall back to `get_localzone()`.
+     PROBED on this box (apscheduler 3.11.2): instance -> `Europe/Madrid`, alias -> `US/Eastern`.
+     Every one of those jobs runs 6h early in ET terms. `daily_report` fires 10:30 ET instead of
+     16:30, `digest_pm` 10:05, `db_backup` 11:00, `weekly_scorecard` Fri 10:10 — all MID-SESSION;
+     `digest_am` fired today at 03:35 ET, ~6h BEFORE the open (`data/digest_sent_20260916`), and
+     the retrain log `retrain_20260916_073000.log` is 01:30 ET.
+     SEPARATE SECOND DEFECT, same file: the two catch-up jobs (master.py:1970, :2018) pass a NAIVE
+     LOCAL `run_date` to an Eastern scheduler. Registered `date[2026-09-14 21:31:45 EDT]`, actually
+     ran `[2026-09-15 03:31:45]` local — 6h late, to the second. W20 REFUTED the
+     `_backtest_catchup_run_at` lead on this exact mechanism; the lead was right and W20's
+     refutation was wrong. Correcting my own call, prominently, per the ledger rule.
+     THIRD, minor, same family: the heartbeat marker's CONTENT is a naive local stamp
+     (`data/bot_heartbeat` reads `2026-09-15T21:59:38`). Cosmetic only — the staleness check uses
+     `st_mtime`, not the content — but it is the same class and belongs in the same sweep.
+     NOT FOLDED INTO W21: different class, and folding it in is exactly the re-scope mistake [C1]
+     recorded. Fix is mechanical (alias form or explicit `timezone=`, and an aware `run_date`).
+
+[14] WATCH LIST. W2 IS CLOSED, BOTH HALVES: `heartbeat_market_check_failed` and
+     `fresh_models_market_check_failed` have 0 occurrences across all of logs/. The fresh_models
+     half is no longer untested — `bot_restart_for_fresh_models` fired today and the marker was
+     consumed, no warning. "W1 REFINED" predicted that half would close ~07:32 ET; it closed at
+     01:30 ET, and asking WHY is what produced [13].
+     W1 IS STILL OPEN AND STILL UNCHECKED — everything above was done pre-open (last look 08:19 ET;
+     supervisor 81012 / bot 81032 up since 06:15 ET, no restart, no `bot_hung_heartbeat_stale`).
+     The 09:32 ET check in "W1 REFINED"[d] HAS NOT HAPPENED: confirm `data/bot_heartbeat` mtime is
+     within 1 min and that orchestrator.log shows no `bot_hung_heartbeat_stale` and no restart
+     around 09:30. Do not dismiss a stale heartbeat as a startup artifact — R8 makes it deliberate;
+     check `_err_streaks` first. W3-W6 untouched.

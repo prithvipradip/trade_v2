@@ -26,6 +26,8 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from datetime import datetime, timedelta
+
+from ait.utils.time import now_et
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -48,13 +50,13 @@ def _seed(st, trade_id="T-1", status="filled"):
             "status, entry_time, entry_price, quantity, contract_type) "
             "VALUES (?,?,?,?,?,?,?,1,'iron_condor')",
             (trade_id, "QQQ", "iron_condor", "short", status,
-             datetime.now().isoformat(), 1.90))
+             now_et().isoformat(), 1.90))
 
 
 def _backdate(st, trade_id, minutes):
     with sqlite3.connect(st._db_path) as conn:
         conn.execute("UPDATE exit_outbox SET exit_time = ? WHERE trade_id = ?",
-                     ((datetime.now() - timedelta(minutes=minutes)).isoformat(),
+                     ((now_et() - timedelta(minutes=minutes)).isoformat(),
                       trade_id))
 
 
@@ -74,7 +76,7 @@ def _orch(st):
     o._find_trade_by_id = lambda tid: SimpleNamespace(
         trade_id=tid, symbol="QQQ", strategy="iron_condor",
         contract_type="iron_condor", quantity=1,
-        entry_time=datetime.now().isoformat(), legs="[]")
+        entry_time=now_et().isoformat(), legs="[]")
     return o
 
 
@@ -110,7 +112,7 @@ class TestObligationSurvivesACrash:
         with sqlite3.connect(st._db_path) as conn:  # simulate a dead claimer
             conn.execute(
                 "UPDATE exit_outbox SET claimed_at = ? WHERE trade_id='T-1'",
-                ((datetime.now() - timedelta(seconds=st.CLAIM_STALE_SECONDS + 60))
+                ((now_et() - timedelta(seconds=st.CLAIM_STALE_SECONDS + 60))
                  .isoformat(),))
         assert [r["trade_id"] for r in
                 st.pending_exit_bookings(older_than_seconds=120.0)] == ["T-1"]
@@ -135,8 +137,8 @@ class TestObligationSurvivesACrash:
             conn.execute(
                 "UPDATE exit_outbox SET claimed_at = ?, exit_time = ? "
                 "WHERE trade_id='T-1'",
-                ((datetime.now() - timedelta(seconds=st.CLAIM_STALE_SECONDS + 60)).isoformat(),
-                 (datetime.now() - timedelta(minutes=10)).isoformat()))
+                ((now_et() - timedelta(seconds=st.CLAIM_STALE_SECONDS + 60)).isoformat(),
+                 (now_et() - timedelta(minutes=10)).isoformat()))
         o = _orch(st)
         asyncio.run(o._drain_exit_outbox())
         assert o._circuit_breaker._daily_pnl == pytest.approx(-150.0)

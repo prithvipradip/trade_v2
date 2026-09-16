@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from datetime import datetime, timedelta
+
+from ait.utils.time import now_et
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -32,7 +34,7 @@ def _state(tmp_path) -> StateManager:
 
 def _seed_trade(st: StateManager, trade_id="T-W1", status="filled",
                 entry_price=1.90, entry_time=None) -> None:
-    entry_time = entry_time or datetime.now().isoformat()
+    entry_time = entry_time or now_et().isoformat()
     with sqlite3.connect(st._db_path) as conn:
         conn.execute(
             "INSERT INTO trades (trade_id, symbol, strategy, direction, "
@@ -46,7 +48,7 @@ def _backdate_outbox(st: StateManager, trade_id: str, minutes: float) -> None:
     with sqlite3.connect(st._db_path) as conn:
         conn.execute(
             "UPDATE exit_outbox SET exit_time = ? WHERE trade_id = ?",
-            ((datetime.now() - timedelta(minutes=minutes)).isoformat(), trade_id))
+            ((now_et() - timedelta(minutes=minutes)).isoformat(), trade_id))
 
 
 def _breaker_cfg():
@@ -68,7 +70,7 @@ def _orch(st: StateManager):
     o._find_trade_by_id = lambda tid: SimpleNamespace(
         trade_id=tid, symbol="QQQ", strategy="iron_condor",
         contract_type="iron_condor", quantity=1,
-        entry_time=datetime.now().isoformat(),
+        entry_time=now_et().isoformat(),
         # A real 4-leg condor: the true-up requires a COMPLETE ledger
         # (>= 2 x leg count), so leg count has to be truthful or the
         # partial-ledger guard cannot be exercised.

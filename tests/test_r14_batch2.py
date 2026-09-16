@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timedelta
+
+from ait.utils.time import now_et
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -312,7 +314,8 @@ def _write_mirror(path, newest_iso):
     con = sqlite3.connect(str(path))
     con.execute("CREATE TABLE trades (entry_time TEXT, exit_time TEXT)")
     if newest_iso is not None:
-        con.execute("INSERT INTO trades VALUES (?, ?)", ("2026-07-01T10:00:00", newest_iso))
+        con.execute("INSERT INTO trades VALUES (?, ?)",
+                    ("2026-07-01T10:00:00-04:00", newest_iso))
     con.commit()
     con.close()
 
@@ -322,7 +325,10 @@ class TestMirrorContentAge:
         home = tmp_path / "home"
         (home / "Documents" / "ait_backups").mkdir(parents=True)
         mirror = home / "Documents" / "ait_backups" / "ait_state.latest.db"
-        newest = (datetime.now() - timedelta(hours=5)).isoformat()
+        # W21: the mirror's trades.exit_time is stored AWARE ET, so the seed
+        # must be too — a naive local stamp reads 6h into the future here
+        # and the age clamps to 0.0.
+        newest = (now_et() - timedelta(hours=5)).isoformat()
         _write_mirror(mirror, newest)
         monkeypatch.setattr(_master.Path, "home", staticmethod(lambda: home))
         age = _master._mirror_content_age_hours()

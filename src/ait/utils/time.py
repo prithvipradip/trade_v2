@@ -52,6 +52,27 @@ def now_et() -> datetime:
     return datetime.now(ET)
 
 
+def parse_trade_ts(value: str) -> datetime:
+    """Parse a stored trade timestamp and return it as an AWARE ET datetime.
+
+    W21: `trades.entry_time` / `trades.exit_time` (and the `open_positions` /
+    `exit_outbox` mirrors) were written offset-free by `datetime.now()`, so the
+    whole corpus is ET only by accident of the host. Writers now emit
+    `now_et().isoformat()`, but a naive legacy row must keep parsing correctly
+    and must keep meaning ET — otherwise a half-migrated DB silently shifts
+    every trading-day and hour-of-day bucket downstream.
+
+    Naive input is localised to ET; aware input is CONVERTED to ET, so `.date()`
+    and `.hour` are ET calendar semantics for every caller regardless of which
+    offset the row happens to carry. Raises ValueError/TypeError exactly as
+    `datetime.fromisoformat` does, so existing caller guards still apply.
+    """
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=ET)
+    return parsed.astimezone(ET)
+
+
 def is_market_open() -> bool:
     """Check if the market is currently open for regular trading."""
     now = now_et()

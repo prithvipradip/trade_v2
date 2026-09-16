@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import date, datetime, timedelta
+
+from ait.utils.time import now_et
 from types import SimpleNamespace
 
 import pytest
@@ -352,7 +354,7 @@ def _pending_ic_record(state: StateManager, trade_id: str, age_minutes: int) -> 
         strategy="iron_condor",
         direction=TradeDirection.SHORT,
         status=TradeStatus.PENDING,
-        entry_time=(datetime.now() - timedelta(minutes=age_minutes)).isoformat(),
+        entry_time=(now_et() - timedelta(minutes=age_minutes)).isoformat(),
         entry_price=1.00,
         quantity=1,
         contract_type="iron_condor",

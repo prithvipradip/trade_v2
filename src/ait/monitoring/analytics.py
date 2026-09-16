@@ -23,6 +23,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from ait.utils.logging import get_logger
+from ait.utils.time import parse_trade_ts
 
 log = get_logger("monitoring.analytics")
 
@@ -68,7 +69,7 @@ def _annualization_factor(trades: list[dict]) -> float:
     """
     try:
         dates = sorted(
-            datetime.fromisoformat(str(t.get("exit_time") or t.get("entry_time"))[:19]).date()
+            parse_trade_ts(str(t.get("exit_time") or t.get("entry_time"))).date()
             for t in trades
             if (t.get("exit_time") or t.get("entry_time"))
         )
@@ -391,8 +392,8 @@ class TradeAnalytics:
         for t in trades:
             if t.get("entry_time") and t.get("exit_time"):
                 try:
-                    entry = datetime.fromisoformat(t["entry_time"])
-                    exit_ = datetime.fromisoformat(t["exit_time"])
+                    entry = parse_trade_ts(t["entry_time"])
+                    exit_ = parse_trade_ts(t["exit_time"])
                     hold_times.append((exit_ - entry).total_seconds() / 3600)
                 except (ValueError, TypeError):
                     pass

@@ -26,6 +26,8 @@ import pickle
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+
+from ait.utils.time import now_et
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -271,7 +273,7 @@ def _rec_trade(trade_id="T-MINE", status=TradeStatus.PENDING, symbol="SPY",
         trade_id=trade_id, symbol=symbol, strategy="iron_condor",
         contract_type="iron_condor", quantity=1, entry_price=4.24,
         expiry="2026-12-18", strike=None, status=status,
-        entry_time=(datetime.now() - timedelta(minutes=age_min)).isoformat(),
+        entry_time=(now_et() - timedelta(minutes=age_min)).isoformat(),
         legs=json.dumps(legs if legs is not None else CONDOR_LEGS),
     )
 

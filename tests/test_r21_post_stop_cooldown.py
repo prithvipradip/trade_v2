@@ -13,6 +13,8 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timedelta
 
+from ait.utils.time import ET, now_et
+
 import ait.bot.orchestrator as orch_mod
 from ait.bot.orchestrator import TradingOrchestrator
 
@@ -28,7 +30,11 @@ def _mk_db(tmp_path, reason: str, hours_ago: float = 1.0, symbol: str = "QQQ",
     # numeric-pairs-02: `exit_time` (an absolute stamp) was added because the
     # window is now calendar-relative, so a case like "the previous session
     # has passed" cannot be expressed as an offset from an arbitrary now.
-    stamp = exit_time or (datetime.now() - timedelta(hours=hours_ago))
+    stamp = exit_time or (now_et() - timedelta(hours=hours_ago))
+    # W21: stored exit_time is AWARE ET; naive literals from call sites are
+    # localised here rather than at each one.
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=ET)
     con.execute(
         "INSERT INTO trades VALUES (?,?,?,?)",
         (symbol, status, reason, stamp.isoformat()))

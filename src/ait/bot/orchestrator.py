@@ -53,6 +53,7 @@ from ait.strategies.selector import StrategySelector
 from ait.strategies.thompson import ThompsonSampler
 from ait.utils.logging import get_logger
 from ait.utils.time import next_market_open
+from ait.utils.time import now_et, parse_trade_ts
 
 log = get_logger("bot.orchestrator")
 
@@ -66,14 +67,18 @@ log = get_logger("bot.orchestrator")
 RANGE_GATED_STRATEGIES: frozenset[str] = frozenset({"iron_condor", "short_strangle"})
 
 def _cooldown_now() -> datetime:
-    """Reference instant for the post-stop cooldown, naive-LOCAL.
+    """Reference instant for the post-stop cooldown, AWARE ET.
 
-    numeric-pairs-02 (R22): kept naive-local on purpose — trades.exit_time is
-    written with datetime.now() (state.py) and the host runs ET, so the DB
-    rows and this clock share one convention. Extracted as a module function
-    so tests can pin it and stay deterministic on any weekday.
+    numeric-pairs-02 (R22) kept this naive-local on the stated premise that
+    "trades.exit_time is written with datetime.now() and the host runs ET, so
+    the DB rows and this clock share one convention". W21 broke the first half
+    of that premise (exit_time is now aware ET) and the CEST host move had
+    already broken the second: a naive-local reference rolls its DATE over six
+    hours early here, moving the cooldown to the wrong session. Both halves are
+    fixed by reading ET explicitly. Still a module function so tests can pin
+    it; a naive pin is tolerated because only .date() is taken from it.
     """
-    return datetime.now()
+    return now_et()
 
 
 # Cutoff depends only on the reference DATE, and each lookup costs an NYSE
@@ -99,7 +104,7 @@ def _post_stop_cooldown_cutoff(now: datetime | None = None) -> datetime:
     not), mid-week it is yesterday 09:30, and after a market holiday the
     calendar walks back to the last real session on its own.
     """
-    from ait.utils.time import MARKET_OPEN, is_trading_day
+    from ait.utils.time import ET, MARKET_OPEN, is_trading_day
 
     now = now or _cooldown_now()
     ref = now.date()
@@ -112,7 +117,8 @@ def _post_stop_cooldown_cutoff(now: datetime | None = None) -> datetime:
         if is_trading_day(prev):
             break
         prev -= timedelta(days=1)
-    cutoff = datetime.combine(prev, MARKET_OPEN)
+    # W21: aware ET, so it can be compared against an aware exit_time.
+    cutoff = datetime.combine(prev, MARKET_OPEN, tzinfo=ET)
 
     if len(_COOLDOWN_CUTOFF_CACHE) > 8:
         _COOLDOWN_CUTOFF_CACHE.clear()
@@ -697,7 +703,7 @@ class TradingOrchestrator:
                 # ESTIMATE forever. Same correction the callback path applies.
                 pnl = self._true_up_commission(trade_id, pnl)
                 try:
-                    exit_d = datetime.fromisoformat(row["exit_time"]).date()
+                    exit_d = parse_trade_ts(row["exit_time"]).date()
                 except Exception:  # noqa: BLE001
                     exit_d = None
                 if exit_d != today:
@@ -723,7 +729,7 @@ class TradingOrchestrator:
                 _t = self._find_trade_by_id(trade_id)
                 if _t and _t.entry_time:
                     try:
-                        if datetime.fromisoformat(_t.entry_time).date() == today:
+                        if parse_trade_ts(_t.entry_time).date() == today:
                             self._pdt_guard.record_day_trade(_t.symbol)
                     except Exception as _e:  # noqa: BLE001
                         log.debug("pdt_record_failed", error=str(_e))
@@ -815,7 +821,7 @@ class TradingOrchestrator:
                 _t = self._find_trade_by_id(trade_id)
                 if _t and _t.entry_time:
                     from ait.utils.time import now_et as _now_et
-                    _entry_d = datetime.fromisoformat(_t.entry_time).date()
+                    _entry_d = parse_trade_ts(_t.entry_time).date()
                     if _entry_d == _now_et().date():
                         self._pdt_guard.record_day_trade(_t.symbol)
             except Exception as _e:  # noqa: BLE001
@@ -2217,8 +2223,10 @@ class TradingOrchestrator:
         finally:
             _con.close()
         if _row and _row[0]:
-            from datetime import datetime as _dt12
-            _exit_t = _dt12.fromisoformat(_row[0])
+            # W21: this reader selects exit_time in SQL but parses _row[0],
+            # so it carries no column name on the parse line and the migration's
+            # column-name grep missed it. Found by the suite, not by reading.
+            _exit_t = parse_trade_ts(_row[0])
             # numeric-pairs-02 (R22): was `_dt12.now() - _exit_t < 30h` — a
             # flat wall-clock window with no calendar, so every Friday and
             # pre-holiday stop bought ZERO post-stop sessions of cooldown.
@@ -2248,17 +2256,22 @@ class TradingOrchestrator:
         # (fragile) in-memory pending tracker.
         COOLDOWN_MINUTES = 120
         try:
-            cutoff = dt.now() - timedelta(minutes=COOLDOWN_MINUTES)
+            # W21: entry_time is now timezone-aware, so the cutoff it is
+            # compared against must be too. A naive cutoff here raised
+            # "can't compare offset-naive and offset-aware datetimes", the
+            # bare `except` below caught it, and the guard FAILED CLOSED —
+            # every entry refused as "unverified". Caught by the suite.
+            cutoff = now_et() - timedelta(minutes=COOLDOWN_MINUTES)
             for rt in self._state.get_recent_trades(n=30):
                 if rt.symbol == signal.symbol and rt.strategy == signal.strategy_name:
                     try:
-                        entered = datetime.fromisoformat(rt.entry_time)
+                        entered = parse_trade_ts(rt.entry_time)
                     except (ValueError, TypeError):
                         continue
                     if entered >= cutoff:
                         log.info("cooldown_skip", symbol=signal.symbol,
                                  strategy=signal.strategy_name,
-                                 minutes_ago=int((dt.now() - entered).total_seconds() / 60))
+                                 minutes_ago=int((now_et() - entered).total_seconds() / 60))
                         return "duplicate"  # symbol+strategy recently traded
         except Exception as e:  # noqa: BLE001 — fail CLOSED (was log.debug + place)
             log.warning("cooldown_check_failed_entry_refused",

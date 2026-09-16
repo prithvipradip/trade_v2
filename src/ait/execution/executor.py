@@ -26,6 +26,7 @@ from ait.bot.state import StateManager, TradeDirection, TradeRecord, TradeStatus
 from ait.risk.circuit_breaker import CircuitBreaker
 from ait.strategies.base import CREDIT_STRATEGIES, Signal, SignalDirection
 from ait.utils.logging import get_logger
+from ait.utils.time import now_et
 
 log = get_logger("execution.executor")
 
@@ -386,7 +387,7 @@ class TradeExecutor:
                     else TradeDirection.LONG
                 ),
                 status=TradeStatus.PENDING,
-                entry_time=datetime.now().isoformat(),
+                entry_time=now_et().isoformat(),
                 entry_price=signal.entry_price,
                 quantity=contracts,
                 contract_type=self._get_contract_type(signal),

@@ -25,6 +25,7 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 
 from ait.utils.logging import get_logger
+from ait.utils.time import parse_trade_ts
 
 log = get_logger("ml.meta_label")
 
@@ -511,7 +512,7 @@ class MetaLabeler:
             entry_hour = 10  # Default
             try:
                 from datetime import datetime
-                entry_hour = datetime.fromisoformat(r["entry_time"]).hour
+                entry_hour = parse_trade_ts(r["entry_time"]).hour
             except (ValueError, TypeError):
                 pass
 

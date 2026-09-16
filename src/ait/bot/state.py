@@ -15,6 +15,7 @@ from enum import Enum
 from pathlib import Path
 
 from ait.utils.logging import get_logger
+from ait.utils.time import now_et
 
 log = get_logger("bot.state")
 
@@ -406,7 +407,7 @@ class StateManager:
         can never be booked as "never filled"/$0. Default keeps all four
         open statuses.
         """
-        now = datetime.now().isoformat()
+        now = now_et().isoformat()
 
         # Compute journaling fields
         peak_pnl_pct = self.get_high_water_mark(trade_id)
@@ -487,7 +488,7 @@ class StateManager:
 
         Uses trade_id as position_id.  Called when an entry order fills.
         """
-        now = datetime.now().isoformat()
+        now = now_et().isoformat()
         with sqlite3.connect(self._db_path) as conn:
             conn.execute(
                 """INSERT OR IGNORE INTO open_positions
@@ -823,13 +824,13 @@ class StateManager:
         A claim left stale by a crash is re-offered by
         :meth:`pending_exit_bookings`.
         """
-        from datetime import datetime as _dt, timedelta as _td
-        stale = (_dt.now() - _td(seconds=self.CLAIM_STALE_SECONDS)).isoformat()
+        from datetime import timedelta as _td
+        stale = (now_et() - _td(seconds=self.CLAIM_STALE_SECONDS)).isoformat()
         with sqlite3.connect(self._db_path) as conn:
             cur = conn.execute(
                 "UPDATE exit_outbox SET claimed_at = ? "
                 "WHERE trade_id = ? AND (claimed_at IS NULL OR claimed_at < ?)",
-                (_dt.now().isoformat(), trade_id, stale))
+                (now_et().isoformat(), trade_id, stale))
             return cur.rowcount > 0
 
     def complete_exit_booking(self, trade_id: str) -> None:
@@ -847,13 +848,13 @@ class StateManager:
         keeps the drain from racing an in-flight executor booking callback —
         the callback claims within seconds; anything older is an orphan
         (reconciler/sweep close, or a booking lost to a crash)."""
-        from datetime import datetime as _dt, timedelta as _td
-        cutoff = (_dt.now() - _td(seconds=older_than_seconds)).isoformat()
+        from datetime import timedelta as _td
+        cutoff = (now_et() - _td(seconds=older_than_seconds)).isoformat()
         with sqlite3.connect(self._db_path) as conn:
             conn.row_factory = sqlite3.Row
             # W14: unclaimed rows, PLUS rows whose claim went stale because
             # the booker died between claiming and writing.
-            stale = (_dt.now() - _td(seconds=self.CLAIM_STALE_SECONDS)).isoformat()
+            stale = (now_et() - _td(seconds=self.CLAIM_STALE_SECONDS)).isoformat()
             rows = conn.execute(
                 "SELECT trade_id, realized_pnl, exit_reason, exit_time "
                 "FROM exit_outbox WHERE exit_time < ? "

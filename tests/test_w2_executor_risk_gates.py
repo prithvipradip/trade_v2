@@ -35,6 +35,8 @@ import json
 import sqlite3
 import time
 from datetime import date, datetime, timedelta
+
+from ait.utils.time import now_et
 from types import SimpleNamespace
 
 import pytest
@@ -209,7 +211,7 @@ class TestComboNbboGate:
 # ===========================================================================
 def _seed_trade(state: StateManager, symbol="SPY", strategy="iron_condor",
                 minutes_ago: float = 5.0, trade_id="T-DUP") -> None:
-    entry = (datetime.now() - timedelta(minutes=minutes_ago)).isoformat()
+    entry = (now_et() - timedelta(minutes=minutes_ago)).isoformat()
     with sqlite3.connect(state._db_path) as conn:
         conn.execute(
             "INSERT INTO trades (trade_id, symbol, strategy, direction, "
@@ -661,7 +663,7 @@ class TestCreditFloorsAtReprice:
                 "status, entry_time, entry_price, quantity, contract_type, "
                 "legs) VALUES (?,?,?,?,?,?,?,1,'iron_condor',?)",
                 ("T-LEGS", "SPY", "iron_condor", "short", "pending",
-                 datetime.now().isoformat(), 1.39, legs))
+                 now_et().isoformat(), 1.39, legs))
 
         ex = self._executor(state=state)
         pending = SimpleNamespace(trade_id="T-LEGS",

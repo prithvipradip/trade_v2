@@ -42,6 +42,8 @@ from __future__ import annotations
 import sqlite3
 import time
 from datetime import datetime
+
+from ait.utils.time import ET
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -295,6 +297,10 @@ def _mk_db(tmp_path, reason: str, exit_time: datetime, symbol: str = "QQQ",
     con = sqlite3.connect(tmp_path / "data" / "ait_state.db")
     con.execute("CREATE TABLE IF NOT EXISTS trades (symbol TEXT, status TEXT, "
                 "exit_reason_detailed TEXT, exit_time TEXT)")
+    # W21: exit_time is stored AWARE ET, so the seed must be too. Call sites
+    # keep their readable naive literals; the helper applies the convention.
+    if exit_time.tzinfo is None:
+        exit_time = exit_time.replace(tzinfo=ET)
     con.execute("INSERT INTO trades VALUES (?,?,?,?)",
                 (symbol, status, reason, exit_time.isoformat()))
     con.commit()
@@ -380,12 +386,12 @@ class TestPostStopCooldownIsOneTradingDay:
 
     def test_cutoff_is_the_previous_sessions_open(self):
         # The cutoff itself, executed: 09:30 on the latest session strictly
-        # before the reference date, naive-local like the DB's exit_time rows.
+        # before the reference date, AWARE ET like the DB's exit_time rows (W21).
         orch_mod._COOLDOWN_CUTOFF_CACHE.clear()
         try:
-            assert orch_mod._post_stop_cooldown_cutoff(MON) == datetime(2026, 8, 28, 9, 30)
+            assert orch_mod._post_stop_cooldown_cutoff(MON) == datetime(2026, 8, 28, 9, 30, tzinfo=ET)
             assert orch_mod._post_stop_cooldown_cutoff(
-                datetime(2026, 9, 8, 10, 0)) == datetime(2026, 9, 4, 9, 30)
+                datetime(2026, 9, 8, 10, 0)) == datetime(2026, 9, 4, 9, 30, tzinfo=ET)
         finally:
             orch_mod._COOLDOWN_CUTOFF_CACHE.clear()
 

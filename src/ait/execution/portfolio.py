@@ -31,6 +31,7 @@ from ait.data.quality import DataQualityValidator
 from ait.risk.circuit_breaker import CircuitBreaker
 from ait.risk.pdt_guard import PDTGuard
 from ait.utils.logging import get_logger
+from ait.utils.time import parse_trade_ts
 from ait.config.runtime_env import contract_flag, contract_float  # R19: ONE authority for env-contract defaults
 
 log = get_logger("execution.portfolio")
@@ -822,7 +823,7 @@ class PortfolioManager:
 
         # 5. Check PDT before recommending exit
         if (should_exit or partial_exit_quantity > 0) and trade.entry_time:
-            entry_date = datetime.fromisoformat(trade.entry_time).date()
+            entry_date = parse_trade_ts(trade.entry_time).date()
             if self._pdt_guard.would_be_day_trade(trade.symbol, entry_date):
                 if not self._pdt_guard.can_day_trade():
                     should_exit = False

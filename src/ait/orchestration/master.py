@@ -1437,8 +1437,14 @@ def _mirror_content_age_hours() -> float | None:
             con.close()
         if not row or not row[0]:
             return None
-        newest = datetime.fromisoformat(str(row[0]))
-        return max(0.0, (datetime.now() - newest).total_seconds() / 3600)
+        # W21: MAX(entry_time)/MAX(exit_time) are now timezone-aware, so both
+        # the parse and the clock they are subtracted from must be. Left naive
+        # this raised TypeError into the `except` below, which returns None —
+        # and the caller reads None as a MISSING alarm, so the mirror-age check
+        # would have alarmed permanently instead of measuring anything.
+        from ait.utils.time import now_et, parse_trade_ts
+        newest = parse_trade_ts(str(row[0]))
+        return max(0.0, (now_et() - newest).total_seconds() / 3600)
     except Exception as e:  # noqa: BLE001
         _log("warning", "mirror_content_age_failed", error=str(e))
         return None

@@ -17,6 +17,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from ait.utils.logging import get_logger
+from ait.utils.time import parse_trade_ts
 from ait.reporting.go_live import (
     not_real_close_sql as _not_real_close_sql,  # W3/string-contracts-4
 )
@@ -128,8 +129,8 @@ class TradeAnalyzer:
             # Hold time
             if t["entry_time"] and t["exit_time"]:
                 try:
-                    entry = datetime.fromisoformat(t["entry_time"])
-                    exit_ = datetime.fromisoformat(t["exit_time"])
+                    entry = parse_trade_ts(t["entry_time"])
+                    exit_ = parse_trade_ts(t["exit_time"])
                     s.avg_hold_time_hours += (exit_ - entry).total_seconds() / 3600
                 except (ValueError, TypeError):
                     pass
@@ -335,8 +336,8 @@ class TradeAnalyzer:
             if not t.get("entry_time") or not t.get("exit_time"):
                 continue
             try:
-                entry = datetime.fromisoformat(t["entry_time"])
-                exit_ = datetime.fromisoformat(t["exit_time"])
+                entry = parse_trade_ts(t["entry_time"])
+                exit_ = parse_trade_ts(t["exit_time"])
                 hours = (exit_ - entry).total_seconds() / 3600
                 if t["realized_pnl"] > 0:
                     winners.append(hours)
@@ -457,7 +458,7 @@ class TradeAnalyzer:
             if not t.get("entry_time"):
                 continue
             try:
-                entry = datetime.fromisoformat(t["entry_time"])
+                entry = parse_trade_ts(t["entry_time"])
                 hour = entry.hour
                 by_hour.setdefault(hour, []).append(t)
             except (ValueError, TypeError):

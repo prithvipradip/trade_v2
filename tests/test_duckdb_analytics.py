@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+
+from ait.utils.time import now_et
 from pathlib import Path
 
 import pytest
@@ -136,10 +138,10 @@ class TestTradeIngestion:
         duck_db.ingest_trade({
             "trade_id": "test1", "symbol": "SPY", "strategy": "long_call",
             "direction": "long", "status": "closed",
-            "entry_time": datetime.now().isoformat(),
+            "entry_time": now_et().isoformat(),
             "entry_price": 2.50, "quantity": 1, "contract_type": "call",
             "strike": 450.0, "expiry": "2025-04-15",
-            "exit_time": datetime.now().isoformat(),
+            "exit_time": now_et().isoformat(),
             "exit_price": 3.50, "realized_pnl": 100.0, "commission": 1.30,
             "ml_confidence": 0.85, "sentiment_score": 0.2,
             "market_regime": "trending_up", "notes": "", "legs": "[]",
@@ -153,7 +155,7 @@ class TestTradeIngestion:
         trade = {
             "trade_id": "upsert1", "symbol": "SPY", "strategy": "long_call",
             "direction": "long", "status": "filled",
-            "entry_time": datetime.now().isoformat(),
+            "entry_time": now_et().isoformat(),
             "entry_price": 2.50, "quantity": 1, "contract_type": "call",
             "strike": 450.0, "expiry": "2025-04-15",
             "exit_time": None, "exit_price": None,

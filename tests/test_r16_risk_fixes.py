@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from ait.bot.state import TradeStatus
+from ait.utils.time import now_et
 from ait.execution.portfolio import PortfolioManager
 from ait.execution.reconciler import PositionReconciler
 from ait.risk.circuit_breaker import CircuitBreaker
@@ -347,7 +348,7 @@ class TestPromotionInsertsOpenPositionRow:
         state = MagicMock()
         t = _trade("T-SWEEP")
         # 40 minutes old -> past STALE_PENDING_MINUTES
-        t.entry_time = (__import__("datetime").datetime.now()
+        t.entry_time = (now_et()
                         - timedelta(minutes=40)).isoformat()
         state.get_open_trades.return_value = [t]
         state.transition.return_value = True
@@ -360,7 +361,7 @@ class TestPromotionInsertsOpenPositionRow:
     def test_sweep_promotion_skips_insert_when_cas_refused(self):
         state = MagicMock()
         t = _trade("T-CAS")
-        t.entry_time = (__import__("datetime").datetime.now()
+        t.entry_time = (now_et()
                         - timedelta(minutes=40)).isoformat()
         state.get_open_trades.return_value = [t]
         state.transition.return_value = False  # someone else moved the row

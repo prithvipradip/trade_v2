@@ -50,6 +50,7 @@ _REAL_CLOSE_SQL = " ".join(
 # no import weight. If it is ever unreachable the module now fails LOUDLY at
 # import rather than rendering a plausible wrong number.
 from ait.config.runtime_env import capital_base as _capital_base  # noqa: E402
+from ait.utils.time import parse_trade_ts  # noqa: E402
 
 
 def _annualization_factor(trades: list[dict]) -> float:
@@ -62,7 +63,7 @@ def _annualization_factor(trades: list[dict]) -> float:
     """
     try:
         dates = sorted(
-            datetime.fromisoformat(str(t.get("exit_time") or t.get("entry_time"))[:19]).date()
+            parse_trade_ts(str(t.get("exit_time") or t.get("entry_time"))).date()
             for t in trades
             if (t.get("exit_time") or t.get("entry_time"))
         )
@@ -1140,8 +1141,8 @@ def _tab_analytics(conn: sqlite3.Connection) -> None:
     for t in trades:
         if t.get("entry_time") and t.get("exit_time"):
             try:
-                entry = datetime.fromisoformat(t["entry_time"])
-                exit_ = datetime.fromisoformat(t["exit_time"])
+                entry = parse_trade_ts(t["entry_time"])
+                exit_ = parse_trade_ts(t["exit_time"])
                 hold_hours.append((exit_ - entry).total_seconds() / 3600)
             except (ValueError, TypeError):
                 pass

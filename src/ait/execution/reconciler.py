@@ -19,6 +19,7 @@ from ait.broker.ibkr_client import IBKRClient
 from ait.bot.state import StateManager, TradeStatus
 from ait.strategies.base import CREDIT_STRATEGIES
 from ait.utils.logging import get_logger
+from ait.utils.time import now_et, parse_trade_ts
 
 log = get_logger("execution.reconciler")
 
@@ -779,14 +780,24 @@ class PositionReconciler:
         self._fresh_keys_for_sweep = None
         closed = 0
         try:
-            now = datetime.now()
+            now = now_et()
             stale = []
             for t in self._state.get_open_trades():
                 if t.status != TradeStatus.PENDING:
                     continue
                 try:
-                    age_min = (now - datetime.fromisoformat(t.entry_time)).total_seconds() / 60
-                except (ValueError, TypeError):
+                    age_min = (now - parse_trade_ts(t.entry_time)).total_seconds() / 60
+                except (ValueError, TypeError) as _pe:
+                    # W21: this guard is what would make a half-migrated corpus
+                    # SILENT. Mixing naive and aware entry_time raises TypeError
+                    # here, and the bare `continue` then drops the trade from the
+                    # sweep entirely — stale-PENDING reconciliation degrades to a
+                    # no-op with nothing in the log to say so. Keep the guard (a
+                    # single bad row must not abort the sweep) but never keep
+                    # quiet about which row it was.
+                    log.warning("sweep_entry_time_unparseable",
+                                trade_id=t.trade_id, entry_time=t.entry_time,
+                                error=str(_pe))
                     continue
                 if age_min >= self.STALE_PENDING_MINUTES:
                     stale.append((t, age_min))
