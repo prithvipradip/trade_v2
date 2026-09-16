@@ -3288,3 +3288,49 @@ across 10 health-check cycles since the restart — that site calls is_market_op
 those are real clean samples and the calendar is working. The fresh_models_market_check_failed half
 has NOT been exercised yet: it only runs when models/.retrained exists, which the 07:30 ET retrain
 cron creates. That half closes at ~07:32 ET, still pre-open.
+
+## 2026-09-16 - SESSION CLOSE: handoff state, and a CLOSING WINDOW worth acting on first
+Final entry of the session. Supersedes the handoff block in "W20 CORRECTIONS + W21 POINTER".
+
+[X1] CORRECTION — THE TRAINING CORPUS IS CLEAN. W20's [2] claims the tz-01 defect "is gated on no
+     fault at all — every row written on this host since 09-14 already carries it" (line 3028).
+     THAT IS FALSE, and measuring it was the only way to find out. `select ... where entry_time >=
+     '2026-09-14'` returns ZERO rows. The ENTIRE trade corpus is 10 trades, all entered
+     2026-04-23/24 — on the OLD ET host. So the corpus is uniformly ET and the contamination I
+     described is hypothetical, not actual. W20a landed BEFORE a single bad row was written. The
+     mechanism was real; the damage was zero. Both halves matter, and the entry above only said
+     one of them.
+[X2] THE WINDOW THAT IS CLOSING, AND WHY IT IS WORTH DOING BEFORE ALMOST ANYTHING ELSE.
+     executor.py:389 still writes `entry_time=datetime.now().isoformat()` — naive, no offset — and
+     both entry_time and exit_time are stored offset-free (verified against the live DB). The FIRST
+     trade entered on this CEST box writes the first non-ET row into an otherwise-ET corpus. That
+     can happen at the very next open. While the corpus is still uniformly ET, making these
+     timestamps timezone-aware is a CONVENTION CHANGE with no data restatement. After the first
+     live entry it needs a restatement with a pre/post boundary, which is the expensive version and
+     the one W20's [2b] described as "clears only when entry_time becomes timezone-aware or the
+     rows are restated". The cheap door is open right now and closes on the next fill.
+[X3] BUT IT IS NOT A ONE-LINER — SCOPE IT BEFORE STARTING. 19 sites parse these two columns across
+     9 modules (learning/analyzer ×5, dashboard/app ×3, monitoring/analytics ×3, bot/orchestrator
+     ×4, ml/meta_label, execution/portfolio, execution/reconciler, dashboard/walkforward/export).
+     At least one does ARITHMETIC against a naive clock — reconciler.py:788 computes
+     `now - datetime.fromisoformat(t.entry_time)` — which raises TypeError the moment awareness is
+     mixed. So the writer cannot change alone. Treat it as its own wave with the 19 readers
+     enumerated, not as a quick fix folded into something else.
+[X4] CONTEXT THAT CHANGES SEVERITY RANKINGS: the corpus is TEN TRADES, all from April. Every
+     ML/meta-labelling finding in this ledger (tz-01, the meta-labeller contamination, the
+     counterfactual/Thompson state) is research-validity work on a corpus too small to train on,
+     and the meta-labeller is untrained and default-off. Do not rank those above live-path work on
+     the strength of the word "contamination".
+[X5] SECURITY POSTURE, RE-VERIFIED TODAY so it is not re-litigated: repo prithvipradip/trade_v2 is
+     PRIVATE; `logs/`, `/data/` and `.env` are all gitignored; the account number appears in NO
+     tracked file. It does appear in local logs/ait.log, which is correctly ignored. Nothing to do.
+[X6] HANDOFF STATE, CURRENT: HEAD 47facfc on branch feature/event-straddle. FOUR COMMITS UNPUSHED
+     (f6e3c36, b7be0be, 3d8871d, 47facfc) — fine for a next session on THIS machine, not fine
+     against machine loss or a session elsewhere. Live bot runs W20: supervisor 81012 / bot 81032,
+     restarted 06:15 ET. Suite baseline is now 1677 passed / 43 skipped / 1 known local-.env
+     failure — a new agent seeing 1677 should NOT read the +47 over the old 1630 baseline as drift.
+[X7] THE WATCH LIST IS STILL OPEN. W2 is half-closed (10 clean cycles; the fresh_models half needs
+     the 07:30 ET retrain marker). W1 is unresolved and now has a specific 09:32 ET check with two
+     named failure modes — see the "W1 REFINED" entry directly above; read it BEFORE interpreting
+     a stale heartbeat, because R8 makes staleness a deliberate signal rather than an artifact.
+     W3-W6 untouched. Check these before opening W21.
