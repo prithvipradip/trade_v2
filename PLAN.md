@@ -3935,3 +3935,75 @@ Suite: 1797 passed / 43 skipped / 1 known local-.env failure.
 NEXT: W23 (scheduler CronTrigger timezone class) and the register triage — unchanged by any of
 this. The HALT_UNTRACKED anomaly in [2] is not a wave; it's a registered open question with no
 concrete next action beyond [3]'s logging, which is already done.
+
+## 2026-09-16 - W23 EXECUTED + DEPLOYED: the scheduler's silent timezone fallback, closed
+Confirmed live at 09-13-16 09:35 ET (digest_am firing at 03:35 ET), registered across three
+sessions, finally probed to precision and fixed today.
+
+[1] THREE BUGS, NOT ONE — each confirmed by direct probe against this box's real apscheduler
+    3.11.2, not assumed from the API surface, and each needing a DIFFERENT fix:
+    (a) Nine pre-built `CronTrigger(...)` objects never inherited the scheduler's own
+        `timezone="US/Eastern"` — apscheduler only injects that when IT builds a trigger from an
+        alias string ("cron"); a pre-built object keeps `get_localzone()` at construction time
+        (probed: Europe/Madrid, this host). Fixed with explicit `timezone=ET` on all nine.
+    (b) The two naive `run_date=` catch-up jobs are a DIFFERENT mechanism, easy to conflate with
+        (a) but confirmed distinct: a naive datetime through the `"date"` alias is MISLABELED
+        with the scheduler's offset, not converted — probed fresh today, naive `20:38:13` (real
+        host wall clock) came back labeled `20:38:13-04:00`, an instant 6h in the future.
+        Live-evidence match: `retrain_catchup` registered `21:31:45 EDT`, ran `03:31:45` local.
+        An AWARE `run_date` passes through byte-for-byte unchanged — probed and now a permanent
+        regression test, not just a plan-time claim.
+    (c) `_backtest_catchup_run_at`'s own market-hours-avoidance check compared naive-host-local
+        hours against ET thresholds (9:15/16:30) — the wrong clock, independent of what the
+        scheduler later did with the result.
+
+[2] DELIBERATELY UNCHANGED, and the reason is now load-bearing, not incidental:
+    `_backtest_catchup_due`'s naive-local `now` stays naive — its own prior docstring already
+    explained this is intentional (compared against equally-naive file mtimes; a naive
+    Sunday-20:00 slot is immaterial for a coarse weekly gate). Fixing (b)/(c) means the SAME
+    catch-up now passes TWO deliberately different clocks to two sibling functions — the
+    due-check keeps naive `datetime.now()`, the run-at computation gets a fresh `now_et()`. A
+    comment at the call site says so explicitly, and a dedicated test
+    (`test_call_site_uses_two_different_clocks_not_one`) checks the SOURCE keeps them separate —
+    the exact kind of "helpful simplification" that would silently reintroduce (c).
+
+[3] THE RETRAIN CATCH-UP FIX REUSED AN ALREADY-AWARE CLOCK RATHER THAN READING A NEW ONE.
+    `_now_c` (the retrain due-check's own clock) was ALREADY `now_et()` under a local alias —
+    only the separate `_rt_at = datetime.now() + timedelta(minutes=2)` was naive. Fixed by
+    reusing `_now_c` for the new `_retrain_catchup_run_at(_now_c)` call instead of reading the
+    clock a second time — one `now` per decision, the same discipline W24 established for the
+    market-open race.
+
+[4] TESTS — new file, 14 tests, zero prior coverage of this exact class existed (though
+    `_backtest_catchup_due`/`_backtest_catchup_run_at` had none dedicated either before today).
+    An AST scan of `main()`'s source catches a future 10th `CronTrigger` site missing the fix —
+    this codebase's own established rule (W20's `hour_of_day`, W21's 19-vs-18 reader count were
+    BOTH found this way, not by re-checking known-fixed sites). Real execution against a real
+    `BlockingScheduler`, not just the keyword's presence: `daily_report`'s next fire time,
+    computed from a known instant, lands on 16:30 ET, not 10:30. NEGATIVE CONTROLS proving the
+    underlying bugs are real, not just that the fix's shape looks plausible — the same
+    `CronTrigger(...)` call WITHOUT `timezone=` resolves to something other than `US/Eastern`;
+    the same naive `run_date` through the same alias comes back mislabeled, reproducing the
+    exact 6h-late live incident as a permanent regression test. Both market-hours boundary
+    instants (9:15 and 16:30 ET) exercised directly, not just interior points.
+    Suite: 1811 passed / 43 skipped / 1 known local-.env failure — up from 1797, no regressions.
+
+[5] DEPLOY. Full supervisor restart (master.py IS the supervisor). Clean shutdown (~31s), clean
+    startup, zero errors. VERIFIED BEHAVIORALLY on the loaded module, not source-read: imported
+    the live `ait.orchestration.master`, reconstructed the exact `CronTrigger(..., timezone=M.ET)`
+    calls `main()` uses and confirmed `.timezone == US/Eastern`; called the live
+    `_retrain_catchup_run_at` and confirmed it returns an aware datetime; confirmed the source of
+    the loaded `main` function contains the aware `now_et()` call at the backtest catch-up site.
+    File mtime confirmed older than the process start. The `job_registered` log line's trigger
+    repr does not surface timezone (a logging-format limitation, not a verification gap — the
+    behavioral check above covers what that log line can't show).
+
+STATE AT HANDOFF: HEAD (this entry's commit) on branch feature/event-straddle.
+Live bot: supervisor 77009, restarted 15:11 ET, stable, zero errors.
+Suite: 1811 passed / 43 skipped / 1 known local-.env failure.
+NEXT: the register triage (109 R24 + 78 carried) is now the only major item left unclaimed —
+deferred through W17, W18, W19, W20, and effectively every wave since. The 10 remaining batch-3
+fail-open sites are next after that, with one flag: #2 (reconciler.py, the HALT_UNTRACKED
+freeze-file claim) needs RE-VERIFICATION before probing — W22 rewrote that entire code path
+today, so the original finding may be stale, moot, or still real in a different form; not
+re-checked yet.
