@@ -4462,3 +4462,12 @@ entries unfrozen, book flat, AIT_SIMULATED_CAPITAL=10000 active. Per the operato
 recorded above, treat $10,000 as a provisional probe value, not a settled funding target.
 
 ---
+
+## 2026-09-17 - TYPO CORRECTION to the entry above
+
+The line "New PIDs: supervisor 25177, bot 25224 (were 20950 / 25224... were 20950 / 20967)" carries
+a garbled mid-edit fragment. Correct reading, no facts changed: new PIDs are supervisor 25177 / bot
+25224; old PIDs (from the prior restart) were supervisor 20950 / bot 20967. Appended per the
+append-only rule rather than fixed in place.
+
+---
