@@ -2666,3 +2666,65 @@ strategy change.
 BATCH 2 CANDIDATES: R25 §5 leads 5, 6, 8, 9, 10 and the 39 area leads. Ordering should be revisited
 against what this batch changed — anything whose stated consequence depended on the dead-man needs
 its blast radius restated the way w17-02 did.
+
+## 2026-09-16 - W17 BATCH 2: six probes, all VERIFIED — one consequence corrected downward
+Register: reports/w17_probes_batch2_20260916.md. Pre-probe findings and the batch-3 census were
+committed BEFORE probing (a20f370, b33fa83) because planning artefacts do not survive a session —
+the plan file lives outside the repo. 6 probed, 6 VERIFIED, 0 refuted. Zero refutations is a
+PRE-SELECTED SAMPLE, not a hit rate: 1(b) was refuted and three register claims corrected during
+planning, i.e. before this table existed. No fixes applied (register-don't-fix). No live state
+touched: fixture DBs throughout, data/ait_state.db never written, bot pid 41807 undisturbed.
+
+[w17-06] A SOLVED PER-CONTRACT SIGMA SELECTS A DIFFERENT STRIKE. Real QQQ chain from
+    historical.db (117 puts, S~682, dte=33) through the REAL _find_strike_by_delta: 4 of 5 delta
+    targets pick a different strike — 20, 15, 5 and 5 points — INCLUDING 0.20, the value
+    iron_condor.py:169,177 actually uses. df704d7 changed which strikes the live bot sells; that
+    is a strategy change shipped under a data-correctness heading. NOT PROVEN: the tolerance=0.07
+    trade/no-trade flip did not fire in this slice and must not be cited.
+[w17-07] A BELOW-INTRINSIC QUOTE IS LAUNDERED INTO A HEALTHY-LOOKING CONTRACT. K=60 call, S=100,
+    intrinsic 40, mid 5.0 — py_vollib raises BelowIntrinsicException ("this price is impossible")
+    and _calculate_greeks writes implied_vol=0.24 (chain median) and delta=0.9999 with ZERO log
+    lines. iv_solved_from_price does not increment (it counts successes only). Honest scoping: a
+    ~1.0 delta will not win a 0.20 argmin, so selection risk is low. The real damage is that
+    degraded_greeks (iron_condor.py:161) CANNOT FIRE once backfill has made every delta non-zero —
+    the gate designed to catch a degraded chain is disarmed by the degradation.
+[w17-08] verify_can_trade FAILS OPEN — AND I CORRECTED MY OWN RE-SCOPING. Patched at
+    qualifyContractsAsync (nothing reached a broker): ConnectionError/TimeoutError/RuntimeError all
+    return True with placeOrder never called. But I had called this "a pre-trade safety probe that
+    fails open", implying trading proceeds unguarded. It does not: orchestrator.py:2117 is the sole
+    caller, and BOTH of ITS callers (:513, :900) DISCARD the return value. What can_trade=False
+    actually does is send a Telegram alert — so the real consequence is that THE READ-ONLY ALARM
+    NEVER FIRES, returning the operator to the silent failure the probe exists to prevent.
+    Severity ops_reporting, NOT live_money. R25's framing and my correction of it were both wrong.
+[w17-09] THE GO-LIVE SLIPPAGE GATE MEASURES THE WRONG POPULATION (3 sub-claims, all verified).
+    Fixture: entry fill slipping 2%, EXIT fill slipping 30%, one row with live_mid=0. Result:
+    3 rows written, slip_n=2 (the dropped row vanished uncounted), median 16.0% — the exit fill is
+    in the pool and is divided by the ENTRY credit, and 16% FAILS the 8% gate on the strength of a
+    fill the criterion claims not to measure. At n==1: available=True, passed=True, rendered
+    "median 0.5% of credit over trailing 1 fills". A SINGLE FILL AUTHORISES THE GATE; UNAVAILABLE
+    fires only at n==0.
+[w17-10] THE RESTATE SCRIPT WOULD ZERO DATA THE CURRENT WRITER PRODUCES. Ran the REAL script
+    main() dry against a fixture with one legitimate single-leg fill. It printed that row under
+    "sample rows currently feeding the gate" and then "would clear context on 1 leg rows". Its
+    predicate is con_id != BAG_CON_ID (true of EVERY single-leg order) while the writer branches on
+    is_combo (executor.py:1530-1537) and stores live_mid deliberately on that shape. Compounding:
+    state.py:913-918 never restores a zeroed value and go_live.py:327's WHERE live_mid > 0 then
+    hides it while slip_n reports only survivors — destruction is invisible at the gate BY
+    CONSTRUCTION. This already happened once: three single-leg fills zeroed 2026-08-10.
+[w17-11] _capital_base() REVERTS TO A 3.7x WRONG DENOMINATOR, SILENTLY. With the authority import
+    forced to fail, all three copies return 196,000.00 against a live 723,071.22 — 73% off — behind
+    a bare unlogged except. Also confirmed the three copies are byte-IDENTICAL to each other, so
+    R25's register (which never claimed otherwise) was right and my planning note was wrong. The
+    divergence is copies-vs-authority: they lack the live-NLV tier. app.py:1004 raises this to the
+    12th power for the annualised-return metric.
+PROPOSED FIX ORDER: (W18) w17-09 + w17-10 together — they are ONE LOOP: the gate authorising real
+capital measures the wrong population, and an untested script can silently destroy its inputs; plus
+w17-11. (W19) w17-06 + w17-07 — first DECIDE whether per-contract solved IV is wanted for strike
+selection (it may well be an improvement), then make the choice explicit and instrument the solver's
+failures; plus w17-08's failure counting.
+BATCH 3 IS PRE-STAGED: reports/w17_batch3_failopen_census_20260916.md. R25 registered "54
+silent-swallow sites"; the real scale is 355 except clauses -> 177 candidates -> 120 traced
+(38 decision-affecting / 51 telemetry / 31 cleanup), with a 12-site ranked shortlist. Four of the
+twelve are CALENDAR FAULTS — a single NYSE-calendar failure would concurrently restart the live bot
+mid-session, open the pre-event blackout, and disable both event-driven exits. Probe that as a
+CLASS, not five instances.
