@@ -95,9 +95,17 @@ def is_trading_day(d: date | None = None) -> bool:
     return not schedule.empty
 
 
-def next_market_open() -> datetime:
-    """Get the next market open time."""
-    now = now_et()
+def next_market_open(now: datetime | None = None) -> datetime:
+    """Get the next market open time.
+
+    W24: accepts an optional `now` so a caller making several related decisions
+    in one breath (see MarketScheduler.wait_for_phase) can pass a SINGLE frozen
+    instant instead of each call deriving its own fresh now_et() — which is
+    exactly what let a caller observe "today's open already happened" here
+    while a near-simultaneous read elsewhere still said "not yet", producing a
+    spurious ~1-hour wait at the open itself (confirmed live 2026-09-16).
+    """
+    now = now or now_et()
     d = now.date()
 
     # If market hasn't opened yet today and today is a trading day

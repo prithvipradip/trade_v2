@@ -40,11 +40,17 @@ class TradingPhase(str, Enum):
 class MarketScheduler:
     """Determines what the bot should be doing based on current time."""
 
-    def get_current_phase(self) -> TradingPhase:
-        """Get the current trading phase."""
-        now = now_et()
+    def get_current_phase(self, now: datetime | None = None) -> TradingPhase:
+        """Get the current trading phase.
 
-        if not is_trading_day():
+        W24: accepts an optional `now` so callers making several related
+        decisions together (wait_for_phase, its log line) can share ONE
+        instant instead of each derivation re-reading the clock — see
+        wait_for_phase's docstring for the race that motivated this.
+        """
+        now = now or now_et()
+
+        if not is_trading_day(now.date()):
             return TradingPhase.OFF_HOURS
 
         current_time = now.time()
@@ -65,29 +71,57 @@ class MarketScheduler:
             return TradingPhase.OFF_HOURS
 
     async def wait_for_phase(self, target: TradingPhase) -> None:
-        """Sleep until the target phase begins."""
-        while self.get_current_phase() != target:
+        """Sleep until the target phase begins.
+
+        W24: every decision below shares ONE `now`, captured fresh at the top
+        of each loop iteration, and the phase is re-checked against THAT now
+        before any wait is computed. Before this fix, get_current_phase() (the
+        while condition), next_market_open() and the log line's current_phase
+        each called now_et() independently — up to five unsynchronized clock
+        reads per iteration. When two of them landed on opposite sides of the
+        MARKET_OPEN boundary, the function could observe "already open" for
+        the log line while having already committed to a wait computed a
+        moment earlier when it still looked like "not yet" — and that earlier
+        read's branch treats "today's open must be in the past" as certain,
+        handing off to next_market_open() for TOMORROW's open: a ~1-hour
+        sleep, entered at the single moment the bot most needs to be running.
+        Confirmed live 2026-09-16, 09:30:00 ET:
+            {"target": "market_open", "wait_seconds": 3600,
+             "current_phase": "market_open", "event": "waiting_for_phase"}
+        — current_phase was already "market_open" in the very log line that
+        committed to a 3600s sleep. Recovered only because the supervisor's
+        independent heartbeat-staleness check happened to tick 7 seconds
+        later; not a safeguard this function knows about or should rely on.
+
+        With a single shared `now`, that contradiction is structurally
+        impossible: if `now` already satisfies target, every branch below is
+        skipped entirely via the early return, so a stale wait can never be
+        computed, logged, or slept on.
+        """
+        while True:
             now = now_et()
+            if self.get_current_phase(now) == target:
+                return
 
             if target == TradingPhase.PRE_MARKET:
-                if is_trading_day():
+                if is_trading_day(now.date()):
                     target_time = datetime.combine(now.date(), PRE_MARKET_START, tzinfo=ET)
                     if now >= target_time:
                         # Today's pre-market passed, wait for tomorrow
-                        next_open = next_market_open()
+                        next_open = next_market_open(now)
                         wait = (next_open - timedelta(minutes=30) - now).total_seconds()
                     else:
                         wait = (target_time - now).total_seconds()
                 else:
-                    next_open = next_market_open()
+                    next_open = next_market_open(now)
                     wait = (next_open - timedelta(minutes=30) - now).total_seconds()
 
             elif target == TradingPhase.MARKET_OPEN:
-                if is_trading_day() and now.time() < MARKET_OPEN:
+                if is_trading_day(now.date()) and now.time() < MARKET_OPEN:
                     target_time = datetime.combine(now.date(), MARKET_OPEN, tzinfo=ET)
                     wait = (target_time - now).total_seconds()
                 else:
-                    next_open = next_market_open()
+                    next_open = next_market_open(now)
                     wait = (next_open - now).total_seconds()
 
             else:
@@ -98,7 +132,7 @@ class MarketScheduler:
                 "waiting_for_phase",
                 target=target.value,
                 wait_seconds=int(wait),
-                current_phase=self.get_current_phase().value,
+                current_phase=self.get_current_phase(now).value,
             )
             await asyncio.sleep(wait)
 
