@@ -3495,3 +3495,86 @@ only the suite exposed it — see [4].
      within 1 min and that orchestrator.log shows no `bot_hung_heartbeat_stale` and no restart
      around 09:30. Do not dismiss a stale heartbeat as a startup artifact — R8 makes it deliberate;
      check `_err_streaks` first. W3-W6 untouched.
+
+## 2026-09-16 - W21 DEPLOYED, W1 FIRED FOR REAL, AND A NEW LIVE RACE CONFIRMED (not W20d's class)
+Restarted, watched the open, and W1's check caught a genuine live defect while checking it —
+not the two failure modes "W1 REFINED" named, a third one, fully root-caused with the bot's own
+log line as the smoking gun.
+
+[D1] DEPLOY. Full supervisor restart (required — master.py changed): SIGTERM 81012 at 08:36 ET,
+     clean shutdown confirmed (bot/dashboard/weblog/status all stopped in sequence, ~36s), relaunched
+     via nohup. New supervisor pid 7458. VERIFIED THE RUNNING CODE, not the files on disk: imported
+     the loaded modules and asserted the specific changed lines are present in the executing source
+     (now_et() in the cooldown guard, parse_trade_ts in the mirror-age check, the logging guard in
+     reconciler, all seven checks OK). Trading verified via a self-placed/cancelled SPY probe order
+     (same mechanism W20's deploy used) — Gateway connected, orders route. Zero errors/warnings in
+     orchestrator.log across the whole startup sequence.
+
+[D2] HALT_UNTRACKED: deleted 08:41 ET, and the self-reinstatement was PREDICTED before acting, then
+     CONFIRMED. Reconciler had already logged a fresh "1st sighting" for both legs at bot startup
+     (08:38 ET, new process = empty _untracked_sightings); the debounce's second sighting was
+     guaranteed at the next reconcile, which is _pre_market() at 09:00:00 ET sharp — inside the
+     [2min, 8h] window. It fired exactly on schedule: `pre_market_starting` -> both legs re-detected
+     -> `reconcile_untracked_option_freeze` for BOTH -> file rewritten. Net effect of lifting it
+     today: a 19-minute window that closed itself before the market even opened — not a fix, and
+     not intended as one; W22 or the operator closing the position at IBKR are the real paths.
+     LIVE CONFIRMATION OF A W22 FINDING: the freeze fired for BOTH legs but the file, again, names
+     only the LAST one (2026-09-18) — reconciler.py:1080's per-position write_text inside the loop,
+     now confirmed at a second, independent freeze event, not just the original 09-15 one.
+
+[D3] W1 — THE CHECK CAUGHT A REAL DEFECT, LIVE, DURING THE CHECK ITSELF. At 09:32:00 ET the
+     heartbeat was 63142s (17.5h) stale, `bot_hung_heartbeat_stale` had fired once, and the bot
+     process was mid-restart. This is NOT "W1 REFINED"[c](i) slow pre-market (ait.log shows the bot
+     already past _pre_market and inside wait_for_phase(MARKET_OPEN) at 09:30:00.071 ET) and NOT
+     [c](ii) R8 suppression (zero error-level lines in the whole window). It is a THIRD failure mode,
+     root-caused with the bot's own log line as proof, not inference:
+
+       {"target": "market_open", "wait_seconds": 3600, "current_phase": "market_open",
+        "event": "waiting_for_phase", "timestamp": "2026-09-16T13:30:00.071453Z"}
+
+     scheduler.py's wait_for_phase(MARKET_OPEN): when `now.time() < MARKET_OPEN` is false (i.e. now
+     is AT OR PAST 09:30:00.000, which it always eventually is), it falls to
+     `next_open = next_market_open(); wait = (next_open - now).total_seconds()`.
+     utils/time.py's next_market_open() makes the SAME strict `now.time() < MARKET_OPEN` check on
+     its OWN fresh now_et() read, so at or past the boundary it ALSO takes the "today is done" path
+     and returns TOMORROW's 09:30 ET — wait becomes ~86400s, clamped by
+     `max(1, min(wait, 3600))` to exactly 3600. The log line proves it: current_phase had ALREADY
+     ticked over to "market_open" by the time the log call re-read it microseconds later, but
+     `wait_seconds=3600` had already been computed and committed — and the function sleeps
+     UNCONDITIONALLY after logging, with no re-check before the sleep. The bug is a race between two
+     independent fresh now_et() reads (one in wait_for_phase, one inside next_market_open()) and the
+     wall clock crossing 09:30:00.000 between them — narrow, but guaranteed to be attempted at least
+     once every trading day, at the one instant that matters most.
+     BOUNDED, NOT BY DESIGN — BY LUCK. asyncio.sleep(3600) was entered at 09:30:00 ET. The ONLY
+     recovery path is the supervisor's independent heartbeat-staleness check, and today's 2-minute
+     health_check tick happened to land at 09:30:07 — 7 seconds after the open — and caught it via
+     the heartbeat's age, not via any awareness of this bug. A tick landing at, say, 09:31:50 instead
+     would have looked identical from the supervisor's side (heartbeat still stale, same alert), so
+     the worst case is bounded by the health_check's own 2-minute cadence, not by anything in the
+     buggy code path. RECOVERY ITSELF WAS ALSO NOT CLEAN: bot_stopping (09:30:07) -> bot_stopped
+     (09:30:37) -> bot_already_running (09:30:37, a stop()/start() race — start() ran before the old
+     process had actually released) -> bot_down exit_code=-9 (09:32:07, SIGKILL — it did not exit on
+     SIGTERM alone) -> bot_restarting -> bot_started -> bot_launch_verified (09:32:15). Total outage:
+     09:30:00 to 09:32:15, ~2m15s. A SIGKILL-required exit while nominally inside asyncio.sleep is
+     itself worth a follow-up look — asyncio.sleep should cancel cleanly on SIGTERM.
+     IMPACT TODAY: NONE on trading — entries were already frozen by [D2]'s self-reinstated halt
+     before this fired. On a day WITHOUT that halt, this is ~2 minutes of zero entry/exit management
+     at the open, bounded by the supervisor's independent safety net, not by any fix in this path.
+     REGISTERED AS W24, NOT FIXED HERE — mid-check is not the place to make severity/urgency calls
+     alone; flagged prominently to the operator instead. Two-lens satisfied: code read (both `<`
+     comparisons, both fresh now_et() reads) AND the live log line, which is direct evidence, not an
+     execution probe standing in for one.
+     CURRENT STATE: stable since 09:32:15 ET, heartbeat fresh (checked 09:35:30 ET), no further
+     restarts, bot pid 17922.
+
+[D4] W2 — reconfirmed still clean straight through the open: zero `heartbeat_market_check_failed`
+     / `fresh_models_market_check_failed` since the restart, including across the [D3] incident (the
+     heartbeat CHECK itself worked correctly throughout; what failed was the trading loop's own entry
+     into MARKET_OPEN, a different code path).
+
+STATE AT HANDOFF: HEAD c309d31 on branch feature/event-straddle (plus this entry's commit).
+Live bot: supervisor 7458 / bot 17922, restarted 08:37-09:32 ET (see [D3] for the mid-open restart).
+Suite baseline unchanged at 1692 passed / 43 skipped / 1 known local-.env failure.
+W22 (untracked-position mechanism) and W23 (scheduler timezone class) still registered, not started.
+W24 (this entry's [D3]) is NEW and UNCLAIMED — live_path, fires at least once per trading day,
+currently unprotected by anything except the supervisor's 2-minute heartbeat cadence.
