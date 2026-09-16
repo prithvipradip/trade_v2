@@ -213,3 +213,45 @@ not an error in it):
 2. The `options_chain` performance claim is mechanically wrong — the removed `continue` guarded the
    analytic BS calls, not a solver that did not yet exist — and the magnitude is refuted.
 3. `ibkr_client.py:350` should read as a **fail-open probe**, not "it places a real order".
+
+---
+
+# The six probes batch 2 still owes
+
+Every finding above marked **[CODE]** is a candidate until an execution probe concedes too. This
+is the concrete probe list, written here rather than left in a planning artefact.
+
+| # | Lead | Probe | Must show |
+|---|---|---|---|
+| **P1** | 1(a) strike selection | Build two contract sets identical except that deltas derive from the chain median vs a solved per-contract sigma. Drive the **real** `_find_strike_by_delta` (`strategies/base.py:186-207`) on both | The argmin returns a **different strike**; and with `tolerance` set, one set returns `None` — a trade/no-trade flip |
+| **P2** | 1(c) exception masking | Construct a quote **below intrinsic** (e.g. deep-ITM call priced under `S−K`), drive the real `_calculate_greeks` | `implied_volatility` raises `BelowIntrinsicException`, the contract silently receives `_chain_iv`, a BS delta is computed from it, and `iv_solved_from_price` does **not** increment — so the failure is invisible in both the log and the counter |
+| **P3** | 2 `verify_can_trade` | Patch `qualifyContractsAsync` (or `placeOrder`) to raise; call the real `verify_can_trade` | Returns `True` — a pre-trade safety probe reporting "trading works" after failing to test it |
+| **P4** | 3 go-live slippage | Build a **fixture** DB (never the live one) with `executions` rows: some entry fills, some exit fills carrying `live_mid`, plus rows with `live_mid=0`. Run the real `compute_go_live_verdict` | Exit fills enter the pool; the exit rows are divided by `t.entry_price`; `slip_n` counts only survivors while the dropped rows are invisible; and **n == 1 renders `available=True, passed=True`** |
+| **P5** | 3b restate script | Copy the DB to a temp path. Insert one synthetic **single-leg** fill with a real `live_mid` (what `executor.py:1537` legitimately writes). Run the script **dry-run** against the copy | Its `con_id != BAG_CON_ID` predicate matches that row — i.e. it would zero data the current writer is designed to produce |
+| **P6** | 5 `_capital_base` | Force `from ait.config.runtime_env import capital_base` to raise (e.g. `sys.modules` injection), then call all three copies | All three return `196000` while the live authority returns `723,071.22` — a 3.7× error, with a bare unlogged `except` producing no signal |
+
+## Hazards that apply to these specific probes
+
+- **P3 places no order** if patched at `qualifyContractsAsync`; patch there, not deeper, so nothing
+  reaches the broker. The live bot (PID 41807) must not be disturbed.
+- **P4/P5 must never touch `data/ait_state.db`.** Copy first. P5 in particular exercises a script
+  whose real-world apply already destroyed three fills on 2026-08-10.
+- **P2/P6 are pure computation** — no live state involved.
+- Set `PYTEST_CURRENT_TEST` before any probe that reaches supervisor code, then confirm 0 probe
+  lines reached `logs/orchestrator.log`.
+- Do not edit source files while a suite runs (37 `inspect.getsource()` sites).
+
+## Posture
+
+**Register, do not fix** — R24/R25 standard. The one exception rule: if a probe shows something
+actively unsafe on the *running* bot, stop the batch and report immediately rather than finishing.
+
+## Deliverables when the probes run
+
+1. `reports/w17_probes_batch2_<date>.md` — per-lead verdict in R25's finding format with probe output.
+2. `PLAN.md` — appended W17 batch-2 entry: verdicts, honest counts, the three register corrections,
+   proposed fix order.
+3. Stamp the probed §5 entries in `reports/full_audit_r25_20260914.md`.
+
+Gates before commit: full suite (baseline **1609 passed / 43 skipped / 1** known local-`.env`
+failure), `scripts/typecheck.py`, `scripts/smoke_deploy.py` → SMOKE PASS.
