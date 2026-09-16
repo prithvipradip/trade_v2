@@ -32,20 +32,40 @@ import ait.orchestration.master as M
 
 ET = ZoneInfo("US/Eastern")
 
+# The pinned host zone, read by _naive_local below. TZ + tzset moves the REAL
+# process clock, which is the strongest form of this pin — but tzset is POSIX
+# only, and Windows ignores TZ, so on the Windows box (the one that runs live)
+# the whole file errored in setup AND teardown. Holding the zone explicitly
+# makes every test below work on either host; on POSIX the real clock is still
+# moved as well, so nothing is weakened there.
+_HOST: dict = {"zone": None}
+
+
+def _naive_local(instant):
+    """`instant` as NAIVE LOCAL time on the pinned host — the quantity every
+    bug in this file turns on."""
+    zone = _HOST["zone"]
+    return (instant.astimezone(zone) if zone
+            else instant.astimezone()).replace(tzinfo=None)
+
 
 @pytest.fixture
 def host_tz(monkeypatch):
     """Pin the process's LOCAL timezone, the way the box's own clock is set.
 
-    Yields a setter. Restores via monkeypatch + an explicit tzset so no later
-    test in the session inherits a foreign clock.
+    Yields a setter. Restores via monkeypatch (+ an explicit tzset where the
+    platform has one) so no later test in the session inherits a foreign clock.
     """
     def _set(name: str) -> None:
         monkeypatch.setenv("TZ", name)
-        _time.tzset()
+        if hasattr(_time, "tzset"):
+            _time.tzset()
+        _HOST["zone"] = ZoneInfo(name)
     yield _set
+    _HOST["zone"] = None
     monkeypatch.undo()
-    _time.tzset()
+    if hasattr(_time, "tzset"):
+        _time.tzset()
 
 
 @pytest.fixture
@@ -63,7 +83,7 @@ def frozen(monkeypatch):
             @classmethod
             def now(cls, tz=None):
                 if tz is None:
-                    return instant_et.astimezone().replace(tzinfo=None)
+                    return _naive_local(instant_et)
                 return instant_et.astimezone(tz)
 
         for mod in mods or (M,):
@@ -87,15 +107,26 @@ class TestTheHarnessItself:
     """If the TZ pin silently no-ops, every test below becomes vacuous."""
 
     def test_tz_pin_actually_moves_the_naive_local_clock(self, host_tz):
+        instant = datetime.now(ET)
         host_tz("Europe/Berlin")
-        berlin = datetime.now()
+        berlin = _naive_local(instant)
         host_tz("US/Eastern")
-        eastern = datetime.now()
+        eastern = _naive_local(instant)
         drift_h = round((berlin - eastern).total_seconds() / 3600)
         assert drift_h in (5, 6), (
             f"TZ pin did not take effect (drift {drift_h}h); the CEST/ET gap "
             "is 6h in summer, 5h in winter"
         )
+
+    @pytest.mark.skipif(not hasattr(_time, "tzset"), reason="POSIX only")
+    def test_tz_pin_also_moves_the_real_process_clock(self, host_tz):
+        """Where the platform allows it, the pin is the real thing and not
+        just the seam — this is what proves the seam models the host."""
+        host_tz("Europe/Berlin")
+        berlin = datetime.now()
+        host_tz("US/Eastern")
+        eastern = datetime.now()
+        assert round((berlin - eastern).total_seconds() / 3600) in (5, 6)
 
     def test_frozen_clock_separates_local_from_et(self, host_tz, frozen):
         host_tz("Europe/Berlin")
@@ -244,7 +275,7 @@ class TestFreshModelsRestartNeverFiresMidRTH:
         mgr, calls = self._manager(monkeypatch, tmp_path, marker=False)
         hb = tmp_path / "data" / "bot_heartbeat"
         hb.write_text("")
-        stale = instant.astimezone().replace(tzinfo=None).timestamp() - 40 * 60
+        stale = _naive_local(instant).timestamp() - 40 * 60
         os.utime(hb, (stale, stale))
         monkeypatch.setattr(M, "_alert", lambda *a, **k: None)
         mgr.health_check()

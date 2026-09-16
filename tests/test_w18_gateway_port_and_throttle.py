@@ -156,7 +156,7 @@ class TestCapitalBaseHasNoSilentFallback:
         for rel in ("src/ait/dashboard/app.py",
                     "src/ait/monitoring/analytics.py",
                     "src/ait/monitoring/duckdb_analytics.py"):
-            src = (root / rel).read_text()
+            src = (root / rel).read_text(encoding="utf-8")
             code = "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("#"))
             assert not re.search(r'["\']196000["\']|\b196000\.0\b', code), (
                 f"{rel} still carries its own capital-base literal")
@@ -172,7 +172,7 @@ class TestCapitalBaseHasNoSilentFallback:
         anywhere in src/. The live DB holds only 'last_net_liquidation'."""
         import pathlib
         root = pathlib.Path(__file__).resolve().parents[1]
-        app = (root / "src/ait/dashboard/app.py").read_text()
+        app = (root / "src/ait/dashboard/app.py").read_text(encoding="utf-8")
         assert "key = 'last_net_liquidation'" in app
-        writers = (root / "src/ait/bot/orchestrator.py").read_text()
+        writers = (root / "src/ait/bot/orchestrator.py").read_text(encoding="utf-8")
         assert 'set_state("last_net_liquidation"' in writers, "the key must have a writer"
