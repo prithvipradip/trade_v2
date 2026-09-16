@@ -3189,7 +3189,7 @@ WATCH LIST FOR THE 09:30 ET OPEN:
      state exists on disk, so nothing should block. A block appearing at an odd hour would mean
      the learner wrote one and the convention is still mismatched somewhere.
 
-## 2026-09-16 - W20 CORRECTIONS + W21 POINTER (read this entry first, next session)
+## 2026-09-16 - W20 CORRECTIONS + W21 POINTER
 Four corrections to the W20 entry above, and the "what next" pointer it failed to leave. Appended,
 not edited, per the ledger rule.
 
@@ -3252,3 +3252,39 @@ STATE AT HANDOFF: HEAD b7be0be on branch feature/event-straddle, NOT PUSHED. Liv
 (supervisor 81012 / bot 81032) since 06:15 ET. The W20 DEPLOYED entry's 6-item watch list is
 UNCHECKED — the market had not opened when this was written. Check W1 (heartbeat at the bell) and
 W2 (the two new warnings must never appear) before starting any new wave.
+
+## 2026-09-16 - W1 REFINED (pre-open code read) — no margin, and R8 makes staleness a real signal
+Reading the heartbeat path before the open changed W1 from "watch it" to something specific. The
+W20 DEPLOYED entry's [W1] is correct but incomplete; this supersedes it.
+
+[a] THERE IS NO PRE-MARKET MARGIN. I first said the loop starts at the 09:00 ET PRE_MARKET phase,
+    giving 30 minutes of slack before is_market_open() flips at 09:30. WRONG. _trading_loop is
+    gated `while ... get_current_phase() == TradingPhase.MARKET_OPEN` (orchestrator.py:1027), and
+    MARKET_OPEN begins at 09:30. At PRE_MARKET the bot runs _pre_market() and then
+    wait_for_phase(MARKET_OPEN) (:519-521) — it does NOT write the heartbeat. So the marker starts
+    refreshing at 09:30:00, the SAME INSTANT the supervisor's market gate opens. Zero designed
+    margin; it is a race.
+[b] THE BOT NORMALLY WINS THAT RACE, and the reason is worth knowing rather than assuming: the
+    heartbeat write is the FIRST statement in the loop body (orchestrator.py:1042, right after the
+    in-process watchdog touch), before any scan or IB call. It lands within milliseconds of the
+    phase flip, while the supervisor only re-checks every 2 minutes.
+[c] SO THE TWO REAL FAILURE MODES ARE NARROW AND NAMED:
+    (i)  _pre_market() overruns past 09:30 — it is awaited BEFORE wait_for_phase, so a slow
+         pre-market (chain fetch, IB latency, a retry) delays loop entry and therefore the first
+         heartbeat, while the supervisor's gate is already open.
+    (ii) R8 SUPPRESSION. The write is conditional: `if not any(n for n, _ in _err_streaks.values())`
+         — R8 deliberately lets the heartbeat go stale during an active error streak, precisely so
+         the supervisor's 15-min restart+alert DOES fire (the 07-10 error loop kept hang detection
+         blind while stops were dead). CONSEQUENCE FOR WHOEVER WATCHES THIS: a stale heartbeat at
+         the bell is a GENUINE SIGNAL, not a startup artifact. Do not dismiss it as "the loop just
+         hasn't started yet" — check _err_streaks first.
+[d] WHAT TO CHECK, CONCRETELY: at ~09:32 ET confirm data/bot_heartbeat mtime is within 1 min, and
+    that logs/orchestrator.log contains no bot_hung_heartbeat_stale and no restart around 09:30.
+    If it DID restart, [c](i) vs [c](ii) is distinguishable from the bot log: an error streak
+    leaves error lines, a slow pre-market does not.
+
+W2 STATUS AT 06:30 ET, partially closed already: 0 occurrences of heartbeat_market_check_failed
+across 10 health-check cycles since the restart — that site calls is_market_open() every cycle, so
+those are real clean samples and the calendar is working. The fresh_models_market_check_failed half
+has NOT been exercised yet: it only runs when models/.retrained exists, which the 07:30 ET retrain
+cron creates. That half closes at ~07:32 ET, still pre-open.
