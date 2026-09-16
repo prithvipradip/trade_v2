@@ -3578,3 +3578,87 @@ Suite baseline unchanged at 1692 passed / 43 skipped / 1 known local-.env failur
 W22 (untracked-position mechanism) and W23 (scheduler timezone class) still registered, not started.
 W24 (this entry's [D3]) is NEW and UNCLAIMED — live_path, fires at least once per trading day,
 currently unprotected by anything except the supervisor's 2-minute heartbeat cadence.
+
+## 2026-09-16 - W24 EXECUTED: the market-open race closed, deployed mid-day
+Same-day turnaround from discovery to fix: the race W1's check caught live is now closed,
+tested, and running.
+
+[1] ROOT CAUSE, RESTATED PRECISELY. `wait_for_phase`, `get_current_phase` and
+    `next_market_open` each independently called `now_et()` — up to five unsynchronized
+    clock reads per loop iteration. Today's incident is the proof, not an inference: the
+    bot's own log line showed `current_phase: "market_open"` (a late read) alongside
+    `wait_seconds: 3600` (committed from an earlier read that still saw pre-market, whose
+    branch treats "today's open already passed" as certain and hands off to
+    `next_market_open()` for TOMORROW's open). No re-check before the `await`.
+
+[2] FIX IS STRUCTURAL, NOT A PATCH OF THE ONE BRANCH THAT FIRED. `get_current_phase()` and
+    `next_market_open()` both gained an optional `now: datetime | None = None` parameter —
+    the SAME precedent already in this codebase (`orchestrator._post_stop_cooldown_cutoff`,
+    W21). `wait_for_phase` now captures exactly ONE `now = now_et()` per loop iteration and
+    threads it through every decision in that iteration: the phase check, both boundary
+    comparisons, `next_market_open(now)`, and the log line's `current_phase`
+    (`self.get_current_phase(now).value`, not a fresh call). An early return the instant that
+    single read already satisfies the target means the contradictory branch can no longer
+    execute in that case — not "less likely", structurally unreachable.
+
+[3] BLAST RADIUS CONFIRMED NARROW BEFORE TOUCHING ANYTHING. Grepped `master.py` for all three
+    function names: zero references. This lives entirely inside the bot's own process
+    (`ait.main`), not the supervisor. All four existing no-arg call sites in orchestrator.py
+    (`next_market_open()` x2, `get_current_phase()` x2) needed zero changes — the new
+    parameters default to identical prior behavior. Two files touched:
+    `ait/utils/time.py`, `ait/bot/scheduler.py`.
+
+[4] TESTS — new file `tests/test_w24_market_open_race.py`, 16 tests, zero prior coverage of
+    this module existed. The load-bearing one reproduces TODAY'S EXACT TWO OBSERVED INSTANTS
+    (09:29:59.998, 09:30:00.071) via a queued fake clock and asserts the contradiction is now
+    structurally unreachable: exactly one log line, `current_phase` and `wait_seconds` AGREE
+    (pre_market / <=1s), converges in two single-read iterations with no hour-long sleep at
+    any point. Plus: a boundary sweep (-100ms to the exact instant) proving no value near the
+    boundary produces anything resembling 3600s; explicit-`now` unit tests for both helper
+    functions including the exact-boundary instant (09:30:00.000000 -> MARKET_OPEN, not
+    PRE_MARKET); a happy-path non-regression check (called from comfortably pre-open, still
+    computes the genuine ~30 minute wait); a harness test proving the fake clock actually
+    delivers staged values in order and errors on exhaustion rather than silently passing.
+    ONE TEST BUG FOUND AND FIXED DURING WRITING, worth recording: a "no-arg still works"
+    test for `next_market_open()` initially patched `now_et` in the WRONG module
+    (`ait.bot.scheduler`, matching the `queued_clock` fixture's usual target) — but
+    `next_market_open` is DEFINED in `ait.utils.time` and resolves `now_et` from ITS OWN
+    namespace, so the patch had no effect and the test called the REAL wall clock. Caught by
+    the test failing against real time rather than passing vacuously; fixed by patching
+    `ait.utils.time.now_et` directly for that one case. Same class of lesson W21 kept paying
+    for: know WHICH module's copy of an imported name you're actually patching.
+    Suite: 1708 passed / 43 skipped / 1 known local-`.env` failure, up from 1692 — the 16 new
+    tests, no regressions. Also re-ran the full orchestrator/scheduler/w20/w21/w24 cluster
+    (124 passed, 1 skipped) before the full suite, for fast feedback.
+
+[5] DEPLOY — mid-day restart, explicitly authorized by the operator for this fix. Same proven
+    mechanism as this morning's W21 deploy: SIGTERM the supervisor (clean shutdown, ~27-30s,
+    bot/dashboard/weblog/status all stopped in sequence), relaunch via `nohup`. New supervisor
+    pid 24192, bot pid 24198. VERIFIED BEHAVIORALLY, not by grepping source: imported the
+    actually-running modules fresh and (a) confirmed `get_current_phase`/`next_market_open`
+    resolve the exact boundary correctly, (b) replayed TODAY'S EXACT incident sequence against
+    the live-loaded code and confirmed no contradiction, no hour-long sleep — the same proof
+    as the test suite, run again against what's actually deployed. File mtimes (15:50 host)
+    confirmed well before the bot's start (16:08 host). Trading reverified (`trading_verified`,
+    status Submitted). Zero errors/warnings since restart.
+    A full supervisor restart was more than strictly required (only the bot subprocess's own
+    modules changed; master.py never touches this code) but is the already-validated path from
+    this morning and the cost difference is a few seconds.
+
+[6] CONTEXT THAT DECIDED THE SEQUENCING, for the record. The operator asked directly whether
+    W22 should still go first, since that was the standing ranking. Re-ranked W24 ahead of it
+    for two reasons, not raw severity: (a) W24's "harmless today" status is fragile — it is
+    covered only by `HALT_UNTRACKED`'s self-reinstatement, which ends whenever the operator
+    closes the two manual TWS legs, on THEIR timeline, independent of any wave sequencing;
+    (b) W24 was a small, fully root-caused, surgical fix (two files, additive-optional
+    signatures) against W22's larger from-scratch surface (a new inbound Telegram channel that
+    does not exist yet, new persistence, new UX flow). W22 remains next — nothing about doing
+    W24 first argues against building it, only against building it before a smaller, currently
+    live, trading-loop-entry defect with a diagnosed fix sitting there.
+
+STATE AT HANDOFF: HEAD (this entry's commit) on branch feature/event-straddle, NOT PUSHED.
+Live bot: supervisor 24192 / bot 24198, restarted 10:07-10:08 ET, stable, zero errors.
+Suite: 1708 passed / 43 skipped / 1 known local-.env failure.
+NEXT: W22 (untracked-position mechanism — inbound Telegram, ask-once, declared-manual
+handling) is next in line. W23 (scheduler CronTrigger timezone class) and the register triage
+remain registered, not started.
