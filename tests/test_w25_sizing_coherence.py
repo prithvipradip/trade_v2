@@ -333,6 +333,38 @@ class TestLaunchSizeCoherenceCheck:
         assert "ZERO" in body
 
     @pytest.mark.asyncio
+    async def test_the_remedy_it_advises_actually_works(self, settings):
+        """The advised budget must be the one that FIXES it — checked by applying it.
+
+        The first cut of this message advised ~$86, the max LOSS of the needed
+        structure. The operator sets the BUDGET, which reaches the wing only through
+        `affordable = risk_budget / (100 * (1 - min_ratio))`, so the real answer is
+        $140. Advice that does not work is worse than no advice: it sends the
+        operator to move a knob that leaves the account still unable to trade.
+        """
+        import re
+
+        from ait.strategies.iron_condor import IronCondor
+
+        probe = _CoherenceProbe(settings)
+        await probe._launch_size_coherence_check(2100.0)
+        advised = re.search(r"per-trade budget of ~\$(\d+)", probe.alerts[0])
+        assert advised, f"no budget advice in: {probe.alerts[0]}"
+
+        # Apply exactly what it advised, to the REAL builder.
+        ic = IronCondor()
+        ic.risk_budget = float(advised.group(1))
+        width = ic._vol_scaled_width(1.0, None, None, None)
+
+        from ait.config.runtime_env import contract_float
+        min_credit = contract_float("AIT_IC_MIN_CREDIT")
+        assert 0.45 * width >= min_credit, (
+            f"the check advised a ${advised.group(1)} budget, but at that budget the "
+            f"real builder still caps the wing at ${width:.2f} (~${0.45 * width:.2f} "
+            f"credit vs a ${min_credit:.2f} floor) — the advice does not work"
+        )
+
+    @pytest.mark.asyncio
     async def test_it_reads_both_caps_not_just_one(self, settings):
         """D2: the binding budget is the tighter of gate 6b and the sizer's own cap.
 

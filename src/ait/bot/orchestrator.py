@@ -2081,6 +2081,16 @@ class TradingOrchestrator:
             # used to invent a width the builder never constructs.
             credit_ratio_at_20d = 0.45
             achievable_credit = credit_ratio_at_20d * min_width
+            # The budget that would actually FIX it. Not (width - credit) * 100:
+            # that is the max LOSS of the needed structure, and the operator does
+            # not set max loss — they set the budget, which reaches the wing only
+            # through iron_condor.py:121 `affordable = risk_budget / (100 * (1 -
+            # min_ratio))`. Inverting that is the difference between the $140 this
+            # account needs and the $86 the first cut of this message advised.
+            _width_for_credit_floor = min_credit / credit_ratio_at_20d
+            _budget_for_credit_floor = (
+                _width_for_credit_floor * 100.0 * max(0.5, 1.0 - min_ratio)
+            )
             # W25 (NEW, found probing logic-entry-01): this arm was arithmetically
             # DEAD. AIT_CREDIT_LOSS_LIMIT contract-defaults to "0" = credit stop
             # DISABLED (runtime_env.py:85, portfolio.py:230), so typical_stop_loss
@@ -2115,8 +2125,9 @@ class TradingOrchestrator:
                     f"wing at ${min_width:.2f}, which can yield ~${achievable_credit:.2f} "
                     f"credit against a ${min_credit:.2f} floor — every signal will be "
                     f"rejected at iron_condor.py credit_floor, so the bot emits ZERO "
-                    f"trades. Widen the budget to ~${(min_credit / credit_ratio_at_20d - min_credit) * 100:.0f} "
-                    f"or lower AIT_IC_MIN_CREDIT")
+                    f"trades. Needs a per-trade budget of ~${_budget_for_credit_floor:.0f} "
+                    f"(={_width_for_credit_floor:.2f} wing) or AIT_IC_MIN_CREDIT <= "
+                    f"${achievable_credit:.2f}")
             if min_width > 0 and (achievable_credit / min_width) < min_ratio:
                 problems.append(
                     f"credit/width ratio UNREACHABLE: ~{achievable_credit / min_width:.0%} "
