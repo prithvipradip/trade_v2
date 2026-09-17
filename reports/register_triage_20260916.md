@@ -1,5 +1,13 @@
 # Register triage — living document
 
+> **⚠ SUPERSEDED IN PART — read the "R26 CORRECTION" section at the end of this file before
+> trusting any CLOSED row.** R26's independent close-out (2026-09-17,
+> `reports/full_audit_r26_20260916.md`) re-probed the twenty batch-1 rows and disputes SIX of the
+> CLOSED calls below: `concurrency-01`, `concurrency-03`, `regress-live-04`, `logic-exit-risk-02`
+> (evidence favours R26), `logic-exit-risk-01` (shared), `ops-substrate-01` (this register's call
+> stands, with residuals). The claim "batch-1 fully closed" is RETRACTED. The rows are left as
+> written — this is a record of what was concluded and why it was wrong, not a rewrite.
+
 Re-verification of the standing finding register against CURRENT source. Started 2026-09-16,
 after the triage had been deferred through W17, W18, W19, W20 and effectively every wave since.
 
@@ -337,3 +345,66 @@ wing_k incident R19 was written about — four disagreeing sources for one numbe
 **Status:** OPEN (registered). Wants its own wave, alongside the `date.today()` census from W26 [4].
 The two are the same class of problem — an enforcement mechanism whose reach was never measured —
 and are probably one wave, not two.
+
+---
+
+## R26 CORRECTION — six CLOSED rows disputed, and the method that produced them
+
+Written 2026-09-17 after R26's independent close-out (`reports/full_audit_r26_20260916.md`,
+`reports/r26_integration_20260917.md`) re-probed all twenty batch-1 rows at HEAD. Appended, not
+edited: the original rows above stay exactly as written, because a register that quietly rewrites
+its own wrong calls teaches nothing.
+
+**Headline: the claim "batch-1 fully closed" is RETRACTED.** Fourteen of twenty rows are agreed.
+Six are disputed:
+
+| Row | This register said | Residual that still reproduces | Evidence favours |
+|---|---|---|---|
+| `concurrency-01` | CLOSED (W14 claim-as-mark, 3 tests) | booking is at-least-once with non-idempotent writes — one −$272.29 stop books as **−$544.58 / 2 losses** after a mid-booking failure | **R26** |
+| `concurrency-03` | CLOSED (W14 CAS re-read) | `_update_trade_partial` still treats a promotion as terminal; alert key still single | **R26** |
+| `regress-live-04` | CLOSED (W14 persist latch) | `is_tripped` lifts the fail-closed trip after one window **without re-reading the store** | **R26** |
+| `logic-exit-risk-02` | CLOSED (W7 band parser) | the parser is fed from `trade.log`, which ib_insync 0.9.86 never populates for a 202 — **the mechanism is dead live** | **R26** |
+| `logic-exit-risk-01` | CLOSED (W7 `_exit_price_ceiling`) | stale-mark clause never built: mark >900s + silent BAG → BUY LMT 39.00 on a 1.40 mark | shared |
+| `ops-substrate-01` | CLOSED (W13 recovery) | recovery does fire; residuals: no test pins `health_check → launcher`, IBC `AutoRestartTime` empty | **this register**, with residuals |
+
+### Two of these were verified independently here, not taken on trust
+
+**`logic-exit-risk-02` — confirmed, and the refutation was already in our own ledger.**
+`grep -rn "errorEvent" src/` returns **nothing**. `parse_price_band_reject` can only read an order's
+`trade.log` messages, and ib_insync 0.9.86 classes error 202 as a warning that never lands there.
+The mechanism cannot fire live. Worse: `PLAN.md:2469-2476`, written 2026-09-14 — **two days before
+this triage** — records exactly that, ending "Fix: capture errorEvent 201/202 per orderId in
+IBKRClient and feed it to the parser." The ledger already contained the refutation when this
+register marked the row CLOSED.
+
+**The `regress-live-04` test cited at line ~220 of this file cannot fail.** R26's F7 flags it; it is
+confirmed here by execution. In
+`test_w14_booking_exactly_once.py::test_the_intact_streak_survives_a_locked_relaunch`, the `crashed`
+breaker is attached to a **MagicMock**, while the assertion re-reads the **real** `StateManager`.
+Probed directly: after `crashed._persist()`, `circuit_breaker_state` in the real store is
+**unchanged** — the crash cannot reach the store the assertion reads, so the assertion holds
+whatever `_persist()` does. The comment `# pre-W14: wrote zeros` describes something the test does
+not exercise. **This register's §5 promoted that test to a dangerous-direction negative control
+("the cited test would FAIL against the pre-fix behavior"). That promotion is withdrawn.**
+
+### The method gap — the part worth keeping
+
+This register's §3 set the right bar ("marking CLOSED must be expensive: the fix in code AND a test
+that pins it") and then applied it too narrowly. Two failures, both systematic:
+
+1. **It verified the FIX, never re-ran the FINDING.** R26's §2 observes that on every disputed row,
+   *the finding's own acceptance test would have caught the residual*. Confirming a fix exists and
+   confirming the reported defect no longer reproduces are different acts; only the second closes
+   a finding.
+2. **It read assertion strings as evidence of what a test exercises.** §5 claimed three rows were
+   spot-checked "in the DANGEROUS direction" by quoting their assertion messages
+   (`"the streak was destroyed"`). An assertion message is documentation, not behaviour — as the
+   `regress-live-04` tautology above shows. The check required is: revert the fix, or trace the
+   wiring, and watch the test go red.
+
+Neither is fixed by trying harder. The durable form: **a finding closes when its own reproduction
+steps stop reproducing**, run against the current tree — not when the patch and a green test exist.
+
+**Status of the six:** reopened. `concurrency-01`, `concurrency-03`, `regress-live-04` sit in R26's
+F2 (owner: R26 author, two tests already failing). `logic-exit-risk-01/-02` sit in F1 (same owner,
+gated "before the next take-profit exit"). `ops-substrate-01`'s residuals sit in F6.

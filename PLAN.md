@@ -4958,3 +4958,77 @@ NEXT:
   Unchanged since R25: arch-01..04 and qual-01/02/04.
 
 ---
+
+## 2026-09-17 - REGISTER CORRECTION: "batch-1 fully closed" RETRACTED (six rows disputed by R26)
+
+No code changed. This entry exists because the ledger currently asserts a false state, and every
+prioritisation after it reads that state. R26's independent close-out re-probed all twenty batch-1
+rows at HEAD and disputes six of the CLOSED calls. `reports/register_triage_20260916.md` now carries
+a supersession banner at the top and a full "R26 CORRECTION" section at the end.
+
+[1] WHAT IS RETRACTED. The W27 entry above says "the LAST of the six confirmed-OPEN batch-1
+    findings" and "all six batch-1 findings now closed", and the batch-1 entry's own handoff says
+    the batch turned a 20-item unknown into six confirmed defects. **Fourteen of twenty are agreed;
+    six are disputed**, four of them favouring R26:
+      - `concurrency-01`  -> R26. Booking is at-least-once with non-idempotent writes: one −$272.29
+        stop books as −$544.58 / 2 losses after a mid-booking failure.
+      - `concurrency-03`  -> R26. `_update_trade_partial` still treats a promotion as terminal.
+      - `regress-live-04` -> R26. `is_tripped` lifts the fail-closed trip without re-reading the store.
+      - `logic-exit-risk-02` -> R26. The band parser is fed from `trade.log`, which ib_insync 0.9.86
+        never populates for a 202 — the mechanism is DEAD LIVE.
+      - `logic-exit-risk-01` -> shared. Stale-mark clause never built (BUY LMT 39.00 on a 1.40 mark).
+      - `ops-substrate-01` -> MINE, with residuals (no test pins `health_check -> launcher`; IBC
+        `AutoRestartTime` still empty).
+
+[2] TWO VERIFIED HERE, NOT TAKEN ON TRUST — the two-lens rule applies to a correction as much as to
+    a finding.
+    (a) `logic-exit-risk-02` CONFIRMED: `grep -rn "errorEvent" src/` returns NOTHING, so
+        `parse_price_band_reject` can only ever read `trade.log`. **And the refutation was already
+        in this ledger**: PLAN.md:2469-2476, written 2026-09-14 — TWO DAYS BEFORE the triage —
+        records the defect verbatim and ends "Fix: capture errorEvent 201/202 per orderId". The
+        triage marked the row CLOSED with its own contradiction sitting 1,500 lines above.
+    (b) The `regress-live-04` test this ledger cited as a negative control CANNOT FAIL. Probed:
+        in `test_the_intact_streak_survives_a_locked_relaunch` the `crashed` breaker is attached to
+        a MagicMock while the assertion re-reads the REAL StateManager. After `crashed._persist()`,
+        `circuit_breaker_state` in the real store is UNCHANGED — the crash cannot reach the store
+        the assertion reads. The comment `# pre-W14: wrote zeros` describes something the test does
+        not do. The batch-1 entry's [5] presented this as one of three rows checked "in the
+        DANGEROUS direction"; that claim is withdrawn.
+
+[3] THE METHOD GAP, which is the only durable output of this entry. Batch-1's [3] set the bar
+    correctly — "marking CLOSED must be expensive: the fix in code AND a test that pins it" — and
+    then applied it too narrowly, in two systematic ways:
+      (a) IT VERIFIED THE FIX, NEVER RE-RAN THE FINDING. R26's §2 notes that on every disputed row
+          the finding's OWN acceptance test would have caught the residual. "The patch is present
+          and a test is green" and "the reported defect no longer reproduces" are different claims;
+          only the second closes a finding.
+      (b) IT READ ASSERTION STRINGS AS EVIDENCE OF BEHAVIOUR. [5] quoted assertion messages
+          (`"the streak was destroyed"`) as proof of a dangerous-direction check. An assertion
+          message is documentation. The `regress-live-04` tautology is what that costs.
+    THE RULE GOING FORWARD: **a finding closes when its own reproduction steps stop reproducing**
+    against the current tree — not when the patch exists and the suite is green. Where a fix cannot
+    be reverted cheaply, trace the wiring and show the test goes red.
+    This is the same failure mode batch-1's [3] named and feared ("a wrongly-CLOSED finding is a
+    live defect marked safe"); it simply did not recognise itself in it.
+
+[4] NOT A WHOLESALE REVERSAL. R26's own §2 records that on no row was the CLOSED call "simply
+    wrong" — each rested on a real fix that really landed; what was missed is a residual the
+    finding's acceptance test would have caught. `ops-substrate-01` went the other way: the
+    objection rested partly on a false premise about this host, and the register's call stands.
+
+STATE AT HANDOFF: no source modified. `reports/register_triage_20260916.md` banner + correction
+section added. Live bot unchanged (supervisor 58879 / bot 60685 on W26+W27); W28 committed and
+pushed, still not deployed.
+NEXT, per the agreed sequence (sequential waves, not batched):
+  (a) W29 — the simulated-capital reporting leak (R26 F5 #6): `orchestrator.py:1227` persists the
+      SCALED NLV as `last_net_liquidation`, which `capital_base()` uses as the performance
+      denominator. Mine, from this morning's deploy.
+  (b) W30 — R26 F3, the W22 cached-snapshot class: six findings, one seam
+      (`reconcile_declared_positions` gated on `get_positions()`'s CACHE, in defiance of the
+      contract `get_positions_fresh` states and the sibling guard 30 lines below honours).
+  (c) W31 — R26 F4, the W25 sizing self-test finished (breaker arm still fail-open, sized from a
+      $1 probe wing; `generate_signals` still never executed).
+  Owned elsewhere, deliberately NOT picked up: F1 exit rebuild (gated "before the next take-profit
+  exit"), F2 booking/breaker, F6 ops substrate, the W21 Windows fixture.
+
+---
