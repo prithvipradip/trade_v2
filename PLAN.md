@@ -4785,3 +4785,54 @@ W26 [4] + the 21 unregistered env keys from W27 [5], one wave, same root class),
 batch-3 fail-open sites, then docs-policy-04, then triage batch 2 + the dedup pass.
 
 ---
+
+## 2026-09-17 - R26 CLOSE-OUT + INTEGRATION: the R24 register fully triaged, reconciled with W21-W27
+Two documents, both under reports/: full_audit_r26_20260916.md (3,275 lines, every finding block
+with its probe transcript) and r26_integration_20260917.md (the one-page reconciliation, deployment
+state and the complete outstanding list with owners). This entry is the pointer; the numbers below
+are the ones a reader needs without opening either.
+REGISTER (203 rows = 109 R24 + 94 August OPEN/PARTIAL), two lenses each, one tie-break, zero
+code-vs-probe disagreements: FIXED 8 (executing test fails on revert), PARTIAL 40, STILL_OPEN 152
+after W26/W27's three claimed closes (data-integrity-07, logic-exit-risk-03 with a stated 120-min
+sibling deviation, regress-live-06) whose test files pass on the Windows box. Live_money still open
+in some form: 35. Twenty waves closed 11 register rows; they closed clusters, not the register.
+DISAGREEMENTS with register_triage_20260916.md batch-1 (his CLOSED vs this round's PARTIAL), all
+settled by execution at HEAD: concurrency-01 (one -272.29 stop books as -544.58 / 2 losses after a
+mid-booking failure), concurrency-03 (_update_trade_partial gate unpatched), regress-live-04
+(is_tripped auto-resumes without re-reading the store), logic-exit-risk-02 (ib_insync 0.9.86 never
+appends a 202 to trade.log: parse -> (None, None); the W7 band mechanism is DEAD live) - evidence
+mine; logic-exit-risk-01 shared (his anchor fix real, the stale-mark clause never built: BUY LMT
+39.00 on a 1.40 mark); ops-substrate-01 weighted to HIM (recovery fires on this host; residuals are
+test coverage, IBC AutoRestartTime, and a false premise of mine). On no row was his CLOSED simply
+wrong. His register still reads CLOSED on all six and "batch-1 fully closed" - these documents are
+the correction.
+NEW FINDINGS 53 (17 live_money). SIX live_money in MY OWN W7 exit rebuild, one broken pricing path
+(band never reaches the parser; fallback prices above the band; band cap rounds 1.745 -> 1.75; mark
+ceiling 0.60 -> limit 0.90 vs 1.08 ask, i.e. cheap condors cannot be closed; zero-bid wing aborts
+synthesis; one-sided leg priced from the wrong side; full wing width still reachable on a stale
+mark) while tests/test_w7_exit_pricing.py passes 20/20. FIVE in his W22 with ONE root cause:
+irreversible action on ib.positions()'s cache - R25's own arch-01 producing five instances; a
+declared position is invisible to every risk gate despite the docstring. Two in W14 with failing
+tests already written (double-book; breaker never re-reads). One each in W16 and W25.
+W21-W27 RECONCILED: W25 closed the money-losing half of params-trading-01 (proven by revert) and
+refuted half of my logic-entry-01 residual. W21's backfill was NEVER APPLIED here: 0 of 30 live rows
+are tz-aware; the restate script returns 0 on failure and has no test. W27's placement floor exempts
+exits (checked: _execute_multi_leg serves exits). Numbering: he consumed W26/W27 while the report
+proposed W26-W33, so the report's fix sets are relabelled F1-F8 (not wave numbers) - the R25 §7
+stale-table failure must not recur.
+SUITE ON THIS BOX at 8faed40: 8 failed / 1875 passed / 43 skipped / 5 errors, all 13 in
+test_w21_tz_aware_trade_timestamps.py, every one time.tzset (POSIX-only) - the same class fixed in
+his W20 tests on 09-16 (57ba9aa), reintroduced by W21. Green on macOS, red on the box that trades.
+LIVE INCIDENT 09-17 pre-open: Gateway exited 23:45 (nightly), relaunched 07:31:35 by the
+supervisor's ensure_gateway() during the fresh-models restart (new bot 10212 = W21-W25 code from
+the working tree); operator closed the Gateway window by mistake 07:42:21; supervisor kept logging
+bot_healthy (it watches the process, not the port); relaunched via IBC 07:52:38; the bot's
+disconnect handler reconnects lazily - woke 08:32:30, went back to sleep to 09:00 without
+reconnecting. The ops-substrate-01 residual, seen live; with open positions it blinds the exit engine.
+DEPLOYMENT: this box bot = W21-W25 (07:31:48), supervisor = 57ba9aa, tree = 8faed40, no
+AIT_SIMULATED_CAPITAL; his box = W21-W27 with AIT_SIMULATED_CAPITAL=10000. Canonical box is an
+operator decision.
+STATUS: REGISTERED, NOT FIXED. No production code changed by either document. Next, in order:
+W21 Windows fixture (me), F2 booking/breaker (me, tests in hand), F1 exit rebuild corrective (me,
+before the next take-profit exit), F3 W22 cache class (Ahmed). Full list with owners: integration
+report §7.
