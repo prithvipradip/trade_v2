@@ -4836,3 +4836,125 @@ STATUS: REGISTERED, NOT FIXED. No production code changed by either document. Ne
 W21 Windows fixture (me), F2 booking/breaker (me, tests in hand), F1 exit rebuild corrective (me,
 before the next take-profit exit), F3 W22 cache class (Ahmed). Full list with owners: integration
 report §7.
+
+---
+
+## 2026-09-17 - W28 EXECUTED — today_et() as the single ET date authority (the date.today() census)
+
+The first half of the combined census wave. Operator decision: fix all 49 `date.today()` sites now,
+defer the 21 env keys to their own wave (W29) because R19c requires a `config.yaml` home per
+trading-economics key — a design decision per key, not mechanical work. STAGED, NOT DEPLOYED.
+
+[1] SEVERITY, MEASURED — AND THIS CORRECTS MY OWN W26 ENTRY.
+    I pinned the host to Europe/Berlin and swept the clock rather than reasoning about it. **The
+    entire RTH session (09:30-16:00 ET = 15:30-22:00 CEST) falls inside the band where the host date
+    and the ET date AGREE.** Divergence is 18:00-24:00 ET only.
+    So the live scan/exit loops were NEVER wrong on this host. W26 [4] called this finding
+    "UNCONDITIONAL, not fault-gated — every evening evaluation is already wrong" and used that to
+    rank it above the batch-3 fail-open sites. The first clause is true; the ranking inference was
+    OVER-STATED, because the evaluations that matter do not happen in the evening. Recorded here
+    rather than quietly re-ranked: a register entry that oversells is the same failure as one that
+    undersells, and this ledger is where that gets corrected.
+    WHAT WAS REALLY WRONG: the 18:00-24:00 ET window. Every evening restart this session — 19:08 and
+    19:27 ET on 09-16 — ran startup reconcile and `_launch_size_coherence_check` against TOMORROW's
+    date. That is the live instance, and it is ours.
+    WHY FIX ALL 49 ANYWAY: the correctness is ACCIDENTAL. It holds only because the offset is +6. A
+    host at ET+13 puts RTH itself across the date line and the live path IS wrong. Same shape as
+    W25's cap-grid skew — contained by coincidence, not design.
+
+[2] THE FIX. New `ait.utils.time.today_et()`, one named authority, and all 49 sites converted.
+    Named rather than open-coded as `now_et().date()` for the reason W26/W27 both used, and for one
+    more: it lets the guard forbid `.today()` OUTRIGHT, with **zero allowlist**. That is the whole
+    argument for doing all 49 rather than a subset — a guard carrying 49 documented exceptions is a
+    catalogue, which is precisely why W26 declined to ship this check against a partly-fixed tree.
+    `utils/time.py` imports nothing from `ait`, so it is a leaf and the 16 new imports cannot create
+    a cycle — checked before relying on it.
+
+[3] ONE SITE WAS NOT A MECHANICAL SWAP, as the plan predicted. `ml/trainer.py` compares today's date
+    against one recovered from `datetime.fromtimestamp(f.stat().st_mtime)` — naive host-local.
+    Converting only the comparison side would subtract an ET date from a host-local one:
+    re-introducing the mixed-convention defect W21 spent a whole wave removing, via the fix meant to
+    prevent it. Both sides now read ET. Verified `min(candidates)` can never see a naive/aware MIX
+    (the mtime path only runs when the list is empty), so no TypeError was introduced.
+    AND THE INVERSE, recorded because it is the more dangerous half: the OTHER 9 `fromtimestamp`
+    sites (master.py x5, ops_health.py x3, meta_label.py x1) are `datetime.now() - fromtimestamp(...)`
+    — naive minus naive, internally consistent, CORRECT. They are deliberately untouched. This is
+    the W1/[C3] heartbeat lesson exactly: the value looks like the bug class, every consumer agrees
+    with every other, and "fixing" one side is what would break it.
+
+[4] THE BULK REWRITE OVERREACHED, AND IT WAS CAUGHT. The regex rewrote 51 sites, not 49 — two in
+    PROSE. One was R17's own provenance comment ("R17: was `date.today()` (server-local clock)"),
+    which became self-contradictory nonsense claiming the old code was `today_et()`. Restored, and
+    extended to note that W28 generalised R17's one-site fix. The other was a docstring USAGE
+    EXAMPLE in economic_calendar.py, deliberately KEPT converted: demonstrating a now-banned idiom
+    in a how-to-call example would actively mislead. An AST recount confirmed 0 `.today()` calls
+    remain, and the guard's detector was verified against all four aliased forms (`date.`, `_date.`,
+    `_d.`, `__import__`) with no false positive on `today_et()` or `now_et().date()`.
+
+[5] A REGRESSION AND A VACUOUS PASS, BOTH FROM A MOVED SEAM — the most instructive result.
+    `is_near_earnings` used to call `now_et().date()`, so `monkeypatch.setattr(mod, "now_et", ...)`
+    controlled it. It now calls `today_et()`, which resolves through `ait.utils.time` and ignores a
+    patch on the earnings module.
+      - `test_r17_live_fixes::test_is_near_earnings_follows_mocked_et_not_system_clock` FAILED
+        loudly. Good: that is how it was found.
+      - Its sibling `..._false_outside_window_per_et_clock` kept PASSING, VACUOUSLY. It pinned
+        earnings 2026-03-15 against a mocked 2026-01-01 and asserted False — but the REAL clock also
+        yields False, so the assertion held whether or not the mock was ever read. A wrongly-green
+        test is worse than a failing one, and this one was wrongly green BEFORE W28 too; the seam
+        move merely exposed it.
+    Both now patch the seam that exists. The vacuous one is STRENGTHENED rather than merely
+    repointed: the earnings date now sits INSIDE the danger window for the real clock, so ignoring
+    the mock returns True and trips the assertion — verified by executing it, not by reasoning.
+    BLAST RADIUS CHECKED, NOT ASSUMED: only 4 tests anywhere patch `now_et` in a module namespace,
+    and the other 2 patch `ait.utils.time.now_et` itself, which `today_et()` routes through — so
+    they still bite. That is also the more robust idiom and worth preferring in future tests.
+    ON CHANGING TESTS TO MAKE CODE PASS, since that deserves scrutiny: the tests' INTENT — earnings
+    follows the ET clock, not the system clock — is unchanged, and both are now MORE falsifiable
+    than before. The seam was an implementation detail, never the contract.
+
+[6] VERIFICATION. `tests/test_w28_et_date_authority.py`, 17 tests (16 + 1 skipped outside the
+    divergence window).
+    - NEGATIVE CONTROL: on a Berlin host at 19:30 ET, `date.today()` returns TOMORROW while the ET
+      date is today. Without it the wave is unfalsifiable.
+    - TWO HARNESS TESTS, following W20's precedent: a silently ineffective TZ pin must not make
+      every other test in the file vacuous.
+    - RTH NEUTRALITY pinned as a property across 09:30->16:00 ET. This is what licensed landing the
+      wave beside today's W26/W27 observation, so it is a test rather than a claim in prose: if the
+      two expressions ever disagree during RTH, the deploy reasoning is void.
+    - CLASS GUARD with zero allowlist, plus an ANTI-VACUITY GUARD ON THE GUARD (a broken glob would
+      make it pass by scanning nothing — W27's lesson applied to its own successor).
+    - Gates: full fast lane **1898 passed / 44 skipped / 1 failed** (the known local-`.env`
+      `test_r19_config_authority` case). Reconciled: 1882 + 16 passed, 43 + 1 skipped.
+      `compileall` OK, `scripts/typecheck.py` OK, `smoke_deploy.py` SMOKE PASS (13 checks).
+
+[7] OBSERVED WHILE VERIFYING, REGISTERED NOT FIXED: **every bot stop this session ended in SIGKILL.**
+    The supervisor's planned `bot_restart_for_fresh_models` at 07:31 ET (the 07:30 retrain landing —
+    W20d behaving correctly, restarting PRE-OPEN rather than mid-RTH) logged
+    `bot_down | exit_code=-9`. -9 is SIGKILL, i.e. `bot.stop()`'s `terminate()` waited its full 30s
+    and then killed. Every manual restart this session shows the same 30s gap
+    (`bot_stopping` -> 30s -> `bot_stopped`). So `ait.main` never completes a graceful shutdown: any
+    cleanup on that path — final state flush, order cancellation, connection teardown — is not
+    running. Benign with a flat book; not obviously benign with open positions. Pre-existing, NOT
+    caused by W26/W27/W28. Wants a probe of what `ait.main`'s shutdown path actually does and why it
+    outlives 30s.
+
+STATE AT HANDOFF: branch feature/event-straddle, HEAD e4c003e. **W28 NOT DEPLOYED.** The live bot
+(supervisor 58879 / bot 60685, relaunched by the fresh-models restart at 07:31 ET) runs W26+W27.
+Book flat, entries unfrozen, AIT_SIMULATED_CAPITAL=10000 active. Market opens 09:30 ET with the
+W26+W27 watch list [V1]-[V6] live for the first time.
+DEPLOY NOTE: W28 is provably an RTH NO-OP on this host ([1], pinned by test), so it cannot corrupt
+today's W26/W27 observation whenever it lands. **Read [V1]-[V6] first anyway**, so the two
+observations stay separable.
+NEXT:
+  (a) W29 — the 21 unregistered `AIT_*` env keys (W27 [5], table in
+      `reports/register_triage_20260916.md`). 16 carry a competing fallback literal, 5 are bare
+      presence reads. ~12 need a config.yaml home per R19c.
+  (b) The 10 remaining batch-3 fail-open sites — highest: #2 reconciler.py:1083 (HALT_UNTRACKED
+      never written), #3 orchestrator.py:701 (an unparseable exit_time silently drops realized P&L).
+      With [1]'s correction, this is no longer outranked by the date census.
+  (c) The SIGKILL shutdown finding from [7].
+  (d) docs-policy-04's RUNBOOK fix.
+  (e) Triage batch 2 (~167 findings) + the dedup pass from batch 1 [6].
+  Unchanged since R25: arch-01..04 and qual-01/02/04.
+
+---
