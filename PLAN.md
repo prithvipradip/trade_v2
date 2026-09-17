@@ -4730,3 +4730,58 @@ NEXT — with all six batch-1 findings now closed, the queue is:
   Unchanged since R25: arch-01..04 and qual-01/02/04 remain untouched.
 
 ---
+
+## 2026-09-17 - W26 + W27 DEPLOYED (pre-open), with the first-RTH watch list
+
+Deployed TOGETHER at 07:25 ET, ~2 hours before the open, on the operator's go-ahead. Two waves had
+accumulated undeployed while the bot ran 11h52m on pre-W26 code; deploying before this open rather
+than after the close makes TODAY the first-RTH observation W27 asked for instead of slipping it a
+session. Conditions were the usual ones, checked not assumed: outside RTH, book FLAT (0 open
+positions), no HALT/HALT_UNTRACKED/RESTRICTED.txt, `smoke_deploy.py` re-run green immediately
+before (13 checks).
+
+Same documented path: `kill -TERM` the supervisor lock-file PID (25177), both old PIDs confirmed
+exited (`bot_stopped` then `web_services_stopped`), relaunched via `python run_orchestrator.py`.
+New PIDs: **supervisor 58879 / bot 58894** (were 25177 / 25224).
+
+VERIFIED IN THE RUNNING INTERPRETER, not on disk — the check that matters, since the whole point of
+a restart is that the process was executing older code:
+  - `TradeExecutor._credit_floor_minimum` exists (W27)
+  - `credit_floor_breached_at_placement_refused` present in `_execute_multi_leg`'s source (W27 gate
+    wired, not merely defined)
+  - `not is_exit` present in the same source — the exit exclusion is live (W27's load-bearing detail)
+  - `PositionReconciler._refund_entry_budget` exists (W26)
+  - `cluster_symbols` present in `_post_stop_cooldown_until`'s source (W26)
+Scheduler re-registered all 10 jobs; dashboard/weblog/status restarted; `bot_healthy` at 07:27 ET;
+zero errors/tracebacks in `ait.log` after the new start.
+
+ATTRIBUTION CAVEAT, stated because deploying two waves at once costs something: if the open looks
+wrong, the cause is ambiguous between W26 and W27 until the logs are read. Accepted deliberately —
+they touch different surfaces and each logs distinctively. Splitting would have cost two restarts
+and two observation windows.
+
+FIRST-RTH WATCH LIST (2026-09-17 open) — the falsifiable predictions these two waves make:
+ [V1] W27: every `combo_entry_priced` limit on a CREDIT entry is at or above the floor. Any
+      `credit_floor_clamped_at_placement` should name `was`/`now`, and any
+      `credit_floor_breached_at_placement_refused` should name the `live_mid` that caused it.
+ [V2] W27: EXITS must be untouched — no credit_floor_* event may ever carry an exit's trade_id.
+      This is the direction that would be catastrophic, so it is watched explicitly rather than
+      trusted to the tests.
+ [V3] W27: EXPECT FEWER FILLS on marginal signals. That is the floor working, not a fault. W26
+      makes the unfilled ones refund their entry-budget slot, so the cost is bounded — do not
+      "fix" a drop in fill count without reading the credit_floor_* lines first.
+ [V4] W26: any `entry_blocked_post_stop_cooldown` carrying `via_cluster=True` names a DIFFERENT
+      `stopped_symbol` than `symbol`. First live evidence of cluster scoping; it only fires after a
+      touch stop, so it may not appear today at all.
+ [V5] W26: `budget_refunded_never_filled` should appear if and only if a stale PENDING is booked
+      never-filled, and must name the TRADE'S OWN date — never today's when swept next morning.
+ [V6] Neither wave may produce `sweep_close_lost_cas` in normal operation; it means a CAS race,
+      which is worth reading rather than ignoring.
+
+STATE AT HANDOFF: branch feature/event-straddle, HEAD f146e72, pushed. Supervisor 58879 / bot 58894
+live on W26+W27, entries unfrozen, book flat, AIT_SIMULATED_CAPITAL=10000 active.
+NEXT: unchanged from the W27 entry — the combined census wave (the 49 `date.today()` sites from
+W26 [4] + the 21 unregistered env keys from W27 [5], one wave, same root class), then the 10
+batch-3 fail-open sites, then docs-policy-04, then triage batch 2 + the dedup pass.
+
+---
