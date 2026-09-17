@@ -5113,3 +5113,24 @@ NEXT, per the agreed sequence:
   exit"), F2 booking/breaker, F6 ops substrate, the W21 Windows fixture.
 
 ---
+
+## 2026-09-17 - W21 TEST FILE MADE WINDOWS-PORTABLE (R26 F5 #7) - suite green on the live box
+Test-only change; no production code touched. At d84957a this box ran 8 failed / 5 errors, all in
+tests/test_w21_tz_aware_trade_timestamps.py (W28's portability commit 1637b21 covered only its own
+new file). Three causes, all the host-move class: (1) host_tz called time.tzset (POSIX-only) - the
+W20 seam applied: pinned zone held explicitly, a _HostClock patched into bot.state,
+execution.executor, execution.reconciler and utils.time so a naive datetime.now() returns the
+pinned zone's wall clock while datetime.now(tz) stays genuine; POSIX still runs the real tzset; the
+harness self-test asserts through the seam the writers see, plus a test that now_et()'s
+conversion is not pinned (the vacuity risk); (2) three class-guard read_text() calls with no
+encoding - cp1252 dies on the em-dashes in orchestrator.py; (3) the function-scope guard compared
+str(WindowsPath) (backslashes) against a "/"-spelled allowlist and an "ait/backtesting/" prefix, so
+the backtest engine's entry_date parses were reported as offenders here and nowhere else -
+as_posix(). ALSO: TestTheCorpusIsUniformlyAware asserts on the LIVE state DB, which is 30 naive
+rows + today's first aware fill (T-20260917-095601-aa4fa8, 09:56:01-04:00) until the F5 restate
+runs with the bot stopped; a test that is red until a deploy step runs makes red normal, so it is
+now a deploy check gated on AIT_CHECK_LIVE_CORPUS=1 (forced on here: red, correctly).
+RESULT on the Windows box: 1909 passed / 46 skipped / 0 failed, scripts/typecheck.py OK.
+Rule restated, fourth instance in three days: whoever ships a wave runs the suite on THIS box before
+calling it green. Live: QQQ condor T-20260917-095601-aa4fa8 open (645/691/734/775 Oct-2, credit
+4.99, DTE 15), bot 15248 on W21-W27, first position on the new exit code.

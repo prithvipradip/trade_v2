@@ -23,16 +23,23 @@ mechanically rather than asserted.
 from __future__ import annotations
 
 import ast
+import os
 import sqlite3
 import time as _time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
+import ait.bot.state as _state_mod
+import ait.execution.executor as _executor_mod
+import ait.execution.reconciler as _reconciler_mod
+import ait.utils.time as _time_mod
 from ait.bot.state import StateManager
 from ait.utils.time import ET, now_et, parse_trade_ts
+
+_real_datetime = datetime
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 
@@ -40,15 +47,44 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 MIGRATED_COLUMNS = ("entry_time", "exit_time")
 
 
+# The pinned host zone. TZ + tzset moves the REAL process clock, which is the
+# strongest form of this pin — but tzset is POSIX-only and Windows ignores TZ,
+# so on the Windows box (the one that trades) every test in this file errored
+# in setup AND teardown (R26: w21-tz-pin-fixture-calls-tzset). The seam below
+# models the host instead: in every module that writes these columns,
+# `datetime.now()` with no argument returns the pinned zone's NAIVE wall
+# clock, while `datetime.now(tz)` stays a genuine conversion — so a writer
+# that regresses to a naive `datetime.now()` stores Berlin wall time and the
+# offset assertions catch it, on any host. POSIX still gets the real tzset.
+_HOST: dict = {"zone": None}
+_CLOCK_MODULES = (_state_mod, _executor_mod, _reconciler_mod, _time_mod)
+
+
+class _HostClock(_real_datetime):
+    @classmethod
+    def now(cls, tz=None):
+        real = _real_datetime.now(timezone.utc)
+        if tz is None:
+            zone = _HOST["zone"]
+            return (real.astimezone(zone) if zone else real.astimezone()).replace(tzinfo=None)
+        return real.astimezone(tz)
+
+
 @pytest.fixture
 def host_tz(monkeypatch):
     """Pin the process's LOCAL timezone, the way the box's own clock is set."""
     def _set(name: str) -> None:
         monkeypatch.setenv("TZ", name)
-        _time.tzset()
+        if hasattr(_time, "tzset"):
+            _time.tzset()
+        _HOST["zone"] = ZoneInfo(name)
+        for mod in _CLOCK_MODULES:
+            monkeypatch.setattr(mod, "datetime", _HostClock)
     yield _set
+    _HOST["zone"] = None
     monkeypatch.undo()
-    _time.tzset()
+    if hasattr(_time, "tzset"):
+        _time.tzset()
 
 
 def _state(tmp_path) -> StateManager:
@@ -71,14 +107,30 @@ class TestTheHarnessItself:
 
     def test_tz_pin_actually_moves_the_naive_local_clock(self, host_tz):
         host_tz("Europe/Berlin")
-        berlin = datetime.now()
+        berlin = _state_mod.datetime.now()      # the clock the WRITERS see
         host_tz("US/Eastern")
-        eastern = datetime.now()
+        eastern = _state_mod.datetime.now()
         drift_h = round((berlin - eastern).total_seconds() / 3600)
         assert drift_h in (5, 6), (
             f"TZ pin did not take effect (drift {drift_h}h); the CEST/ET gap "
             "is 6h in summer, 5h in winter"
         )
+
+    def test_the_seam_leaves_aware_conversion_genuine(self, host_tz):
+        """`datetime.now(tz)` must stay a real conversion or the writers'
+        `now_et()` would be pinned too and every offset assertion vacuous."""
+        host_tz("Europe/Berlin")
+        assert _time_mod.datetime.now(ET).utcoffset() == _real_datetime.now(ET).utcoffset()
+
+    @pytest.mark.skipif(not hasattr(_time, "tzset"), reason="POSIX only")
+    def test_tz_pin_also_moves_the_real_process_clock(self, host_tz):
+        """Where the platform allows it the pin is the real thing, which is
+        what proves the seam models the host rather than replacing it."""
+        host_tz("Europe/Berlin")
+        berlin = _real_datetime.now()
+        host_tz("US/Eastern")
+        eastern = _real_datetime.now()
+        assert round((berlin - eastern).total_seconds() / 3600) in (5, 6)
 
 
 class TestParseTradeTs:
@@ -172,11 +224,11 @@ class TestTheClassGuard:
         """`entry_time=datetime.now()...` must not reappear in any writer."""
         offenders = []
         for path in SRC.rglob("*.py"):
-            for i, line in enumerate(path.read_text().splitlines(), 1):
+            for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
                 if "datetime.now()" not in line:
                     continue
                 if any(f"{c}=" in line or f"{c} =" in line for c in MIGRATED_COLUMNS):
-                    offenders.append(f"{path.relative_to(SRC)}:{i}: {line.strip()}")
+                    offenders.append(f"{path.relative_to(SRC).as_posix()}:{i}: {line.strip()}")
         assert not offenders, "naive writes to a migrated column:\n" + "\n".join(offenders)
 
     def test_no_bare_fromisoformat_in_a_function_that_touches_these_columns(self):
@@ -209,11 +261,13 @@ class TestTheClassGuard:
         }
         offenders = []
         for path in SRC.rglob("*.py"):
-            rel = str(path.relative_to(SRC))
+            # POSIX form on every host: the allowlist and the prefix test below
+            # are written with "/", and str() of a WindowsPath gives "\\".
+            rel = path.relative_to(SRC).as_posix()
             # The backtest engine keeps its own entry_date/expiry_date corpus.
             if rel in allowed or rel.startswith("ait/backtesting/"):
                 continue
-            text = path.read_text()
+            text = path.read_text(encoding="utf-8")
             try:
                 tree = ast.parse(text)
             except SyntaxError:
@@ -240,7 +294,7 @@ class TestTheClassGuard:
         bare-`continue`ing, so a future tidy-up cannot quietly restore the
         silence.
         """
-        tree = ast.parse((SRC / "ait/execution/reconciler.py").read_text())
+        tree = ast.parse((SRC / "ait/execution/reconciler.py").read_text(encoding="utf-8"))
         guards = [
             h for node in ast.walk(tree) if isinstance(node, ast.Try)
             for h in node.handlers
@@ -258,6 +312,15 @@ class TestTheCorpusIsUniformlyAware:
     """The post-condition that makes W21 a convention change, not a restatement."""
 
     def test_live_db_has_no_naive_trade_timestamps(self):
+        # R26 (w21-backfill-was-never-applied-to-the-live-corpus): this asserts
+        # on the LIVE state DB, which stays naive until the operator runs the
+        # F5 restate with the bot stopped — on the Windows box 30 naive rows
+        # plus the first aware fill of 2026-09-17. A test that is red until a
+        # deploy step runs teaches everyone to read red as normal, so it only
+        # runs when asked for as that deploy check.
+        if os.environ.get("AIT_CHECK_LIVE_CORPUS") != "1":
+            pytest.skip("deploy check: set AIT_CHECK_LIVE_CORPUS=1 after "
+                        "scripts/restate_w21_tz_aware.py --apply (F5)")
         db = Path(__file__).resolve().parents[1] / "data" / "ait_state.db"
         if not db.exists():
             pytest.skip("no live state DB on this box")
