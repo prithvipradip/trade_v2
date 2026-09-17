@@ -4615,3 +4615,118 @@ NEXT, re-ranked with (b)'s first half now closed:
   Unchanged: arch-01..04 and qual-01/02/04 remain untouched since R25.
 
 ---
+
+## 2026-09-17 - W27 EXECUTED — the credit floor at initial placement (regress-live-06)
+
+(a) from the W26 pointer, and the LAST of the six confirmed-OPEN batch-1 findings. It was ranked
+"most delicate" because it touches live entry pricing, so it got its own wave. STAGED, NOT DEPLOYED.
+
+[1] CONFIRMED BY BOTH LENSES, AND SHARPER THAN THE REGISTER STATES.
+    The register's claim is correct as far as it goes: `_credit_floors_hold` (executor.py) is called
+    only from the reprice ladder, and the initial-placement path in `_execute_multi_leg` had no
+    floor check. Probing it produced two facts the register does not contain:
+      (a) A SIGNAL SITTING EXACTLY ON THE FLOOR ALWAYS BREACHED — with a perfectly fresh quote and
+          no adverse move. `combo_entry_limit`'s offset has a 10c MINIMUM, so step 0 concedes 2.5c
+          unconditionally: a $0.70 signal was placed at $0.67. This is not a tail case, it is EVERY
+          MARGINAL SIGNAL — precisely the trades the floor exists to filter. The register reads as
+          though the breach needs an adverse move; it does not.
+      (b) THE SYSTEM REFUSED AT REPRICE EXACTLY WHAT IT ACCEPTED AT PLACEMENT. Probed directly:
+          `_credit_floors_hold(pending, -0.67)` returns False for the very price the placement path
+          put on the wire unchecked. The guard was correct all along and simply was never wired to
+          the ladder's FIRST and LARGEST concession.
+    Compounding both: the pricing anchor is the LIVE MID, not the signal's validated credit, and the
+    staleness gate admits a mid up to 35% away — so the worst case the gates permit is ~30% below
+    the floor ($0.70 signal placed at $0.49).
+
+[2] THE FIX, and both halves mirror guards that ALREADY EXISTED on sibling paths rather than
+    inventing a new policy:
+      - REFUSE when `_base_mag < floor_min`: the market's own mid cannot pay the economics that
+        justified the signal, so the premise is void. CAS PENDING->CANCELLED and return None — the
+        same shape as the disorderly-spread and stale-signal refusals a few lines above.
+      - CLAMP otherwise: raise the limit magnitude to the floor so step 0 never concedes below it.
+        The same shape as the debit side's `_debit_cap`, which has had this protection since R8.
+        Safe by construction: on a credit, demanding MORE credit can never make an order more
+        aggressive than it already was.
+    ENTRIES ONLY, and this is the detail that could have made this wave a disaster:
+    `_execute_multi_leg` SERVES EXITS TOO. The floors describe the economics that justify OPENING a
+    position; applying them to a close would refuse or reprice the exit of a losing trade — the
+    exact inversion of protection, and a missed exit is the worst outcome this system has. The gate
+    is `is_credit and not is_exit`, and two tests pin that exits are untouched in both directions
+    (still placed, and NOT repriced to the entry floor).
+
+[3] TWO NEW SINGLE AUTHORITIES, because placement and reprice must never drift again:
+    `_credit_floor_minimum(width)` (max(min_credit, min_ratio*width); min_credit when width<=0,
+    preserving `_credit_floors_hold`'s pre-W27 semantics exactly) and `_wing_width_from_legs(legs)`.
+    The width split was FORCED by the defect's own shape: at placement time NO PendingOrder exists
+    yet — the caller builds it only after `place_order` returns — so the check there has a signal
+    and its legs and nothing else. `_pending_wing_width` keeps its trade-row legs-JSON fallback
+    (meaningful only there) and delegates the arithmetic. Verified the persisted legs JSON always
+    carries `expiry`, which `_leg_fields` requires, before routing the fallback through it.
+
+[4] PROVEN LOAD-BEARING, NOT MERELY GREEN. A suite that passes proves nothing about a guard unless
+    its absence fails. Neutralising `_credit_floor_minimum` at runtime (returning 0.0, i.e. the
+    pre-W27 behaviour) reproduces the defect EXACTLY through the real `execute_signal`:
+    `placed=[0.67]` with the floor off, `placed=[0.70]` with the real code.
+
+[5] REGISTERED, NOT FIXED (operator decision), in `reports/register_triage_20260916.md` under
+    "W27 ADDENDUM": 22 `AIT_*` keys are read via raw `os.environ.get` in `src/` and **21 are absent
+    from CONTRACT_DEFAULTS**. A distinction I would have missed by trusting my own first number, so
+    it is recorded rather than smoothed over: **16** carry a COMPETING FALLBACK LITERAL — the actual
+    R19c violation ("no production module may carry a private default for a contract key") — while
+    **5 are bare presence reads** with no competing default and are a weaker case, listed separately
+    rather than inflating the headline count.
+    THE STRUCTURAL POINT, worth more than the list: `test_no_raw_environ_reads_of_contract_keys`
+    BUILDS ITS REGEX FROM `CONTRACT_DEFAULTS`, so it polices only keys already registered and is
+    blind to every key that never was. That is the same guard-hole shape as W26 [4]'s `date.today()`
+    finding, and the pattern deserves naming: **a class guard keyed on a registry cannot catch what
+    was never registered.** The load-bearing members are not hygiene —
+    `AIT_IC_DELTA_MIN`/`MAX` and `AIT_IRON_CONDOR_IV_FLOOR` decide STRIKE SELECTION and entry gating
+    for the only live strategy, `AIT_CREDIT_TOUCH_STOP` arms the primary loss exit,
+    `AIT_IV_RANK_CAP`/`AIT_MAX_PER_EXPIRY` are risk gates, `AIT_ALLOW_AFTER_HOURS` gates
+    market-hours enforcement — each with a private default `config.yaml` cannot override and the
+    divergence report cannot see. The wing_k incident R19 was written about is the same shape.
+    W27 does not depend on any of it: the clamp binds whatever `AIT_ENTRY_LADDER_START` is set to.
+
+[6] VERIFICATION. `tests/test_w27_credit_floor_at_placement.py`, 23 tests, reusing the established
+    builders in `test_w2_executor_risk_gates.py` (real executor, real StateManager on a tmp DB, only
+    the broker boundary faked).
+    - NEGATIVE CONTROL: reconstructs the pre-W27 step-0 arithmetic and asks the UNCHANGED reprice
+      guard what it thinks of that price — it refuses. The asymmetry in one test. Asserts the
+      premise ($0.70 -> $0.67) first so it cannot pass vacuously.
+    - EXIT SAFETY in both directions (see [2]).
+    - CLASS GUARD: over a 12-case credit x width grid, every limit the placement path emits must
+      satisfy `_credit_floors_hold` — the general form of the defect (an entry priced without
+      consulting the floor), not the one line that caused it.
+    - AN ANTI-VACUITY GUARD ON THAT GUARD, because the drift test passes trivially for any case it
+      refuses: 8 of the 12 grid cases must actually place an order, so a future change that made the
+      floor refuse everything cannot turn the suite green while placing nothing.
+    - Gates: full fast lane **1882 passed / 43 skipped / 1 failed** (the known local-`.env`
+      `test_r19_config_authority` case). Reconciled: 1859 + 23 = 1882. `compileall` OK,
+      `scripts/typecheck.py` OK, `scripts/smoke_deploy.py` SMOKE PASS (13 checks).
+
+STATE AT HANDOFF: branch feature/event-straddle, HEAD 4484115. **NOT DEPLOYED** — `executor.py` is
+loaded by the running bot (supervisor 25177 / bot 25224), so the process is still pre-W27. Book
+flat, entries unfrozen, no kill-switch files, AIT_SIMULATED_CAPITAL=10000 active in the live process.
+DEPLOY NOTE, stronger than the usual one: this wave changes WHAT PRICE REACHES THE BROKER on every
+credit entry. It deserves a first-RTH observation rather than an assumed-good deploy — after the
+restart the first entries should log `combo_entry_priced` limits at or above the floor, with any
+`credit_floor_clamped_at_placement` / `credit_floor_breached_at_placement_refused` naming the mid
+that caused it. Expect FEWER fills on marginal signals: that is the floor doing its job, and W26
+made the unfilled ones refund their entry-budget slot, so the cost of a no-fill is now bounded.
+NEXT — with all six batch-1 findings now closed, the queue is:
+  (a) The 10 remaining batch-3 fail-open sites, consequence-ranked in
+      reports/w17_batch3_failopen_census_20260916.md. Highest: #2 reconciler.py:1083
+      (HALT_UNTRACKED never written), #3 orchestrator.py:701 (one unparseable exit_time silently
+      drops realized P&L from the day).
+  (b) THE TWO CENSUS FINDINGS, and they are probably ONE wave rather than two: the 49 `date.today()`
+      sites (W26 [4]) and the 21 unregistered env keys (W27 [5]). Same class — an enforcement
+      mechanism whose reach was never measured — and both have a guard that already exists and
+      simply cannot see the population. The date.today() half is UNCONDITIONAL (every evening
+      evaluation on this CEST box is already wrong, no trigger required), which is what lifts this
+      above (a) in my judgement; the ledger records both orderings so the next session can choose.
+  (c) docs-policy-04's RUNBOOK fix (name master.py's 2-minute combined_health_check as the thing to
+      stop; drop the stale keeper_ait.bat path).
+  (d) Triage batch 2 (~167 remaining R24 + carried-over findings) + the dedup pass from batch 1 [6].
+  Unchanged since R25: arch-01..04 and qual-01/02/04 remain untouched.
+
+---
