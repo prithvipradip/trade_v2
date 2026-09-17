@@ -277,3 +277,63 @@ but the underlying coupling — validation risk sourced from a sizer result that
 the approved size — is untouched.
 
 **Status:** OPEN (registered). Not scheduled. Do not tune either knob without reading this entry.
+
+---
+
+## W27 ADDENDUM — registered, not fixed: 21 unregistered `AIT_*` env keys, and the guard that cannot see them
+
+Recorded during the W27 fix wave (2026-09-17). A **new finding**, not a batch-1 row. Registered
+rather than fixed by operator decision: W27 does not depend on it (its clamp binds whatever
+`AIT_ENTRY_LADDER_START` is set to), and converting 1 of 21 would make the guard look more complete
+than it is.
+
+**Claim, measured not estimated.** 22 `AIT_*` keys are read via raw `os.environ.get` in `src/`.
+**21 are absent from `CONTRACT_DEFAULTS`.** R19c's rule is "no production module may carry a private
+default for a contract key — a promotion must edit exactly one place and take effect everywhere",
+and `tests/test_r19_config_authority.py::test_no_raw_environ_reads_of_contract_keys` exists to
+enforce it.
+
+**THE GUARD BUILDS ITS REGEX FROM `CONTRACT_DEFAULTS`.** So it polices only keys already registered,
+and is structurally blind to every key that was never added — which is the entire population above.
+The enforcement's coverage is defined by the thing it is meant to police. This is the same
+guard-hole shape as W26 [4]'s `date.today()` finding (W20's naive-clock guard covers
+`datetime.now()` and not `date.today()`), and it is worth naming as a pattern: **a class guard keyed
+on a registry cannot catch what was never registered.**
+
+**16 carry a competing local fallback literal** — the exact R19c violation:
+
+| key | site | private default |
+|---|---|---|
+| `AIT_IC_DELTA_MIN` | `ait/strategies/iron_condor.py:203` | `"0.15"` |
+| `AIT_IC_DELTA_MAX` | `ait/strategies/iron_condor.py:204` | `"0.30"` |
+| `AIT_IC_EM_MIN` | `ait/strategies/iron_condor.py:224` | `"0.6"` |
+| `AIT_IC_EM_MAX` | `ait/strategies/iron_condor.py:225` | `"1.3"` |
+| `AIT_IRON_CONDOR_IV_FLOOR` | `ait/strategies/iron_condor.py:144` | `"15"` |
+| `AIT_CREDIT_TOUCH_STOP` | `ait/execution/portfolio.py:570` | `"1"` |
+| `AIT_ENTRY_LADDER_START` | `ait/execution/executor.py:755` | `"0.25"` |
+| `AIT_ENTRY_ORDER_TIMEOUT` | `ait/execution/executor.py:38` | `"240"` |
+| `AIT_IV_RANK_CAP` | `ait/risk/manager.py:435` | `"85"` |
+| `AIT_MAX_PER_EXPIRY` | `ait/risk/manager.py:470` | `"3"` |
+| `AIT_LIQ_MAX_SPREAD` | `ait/bot/orchestrator.py:332` | `"0.15"` |
+| `AIT_LIQ_MIN_VOLUME` | `ait/bot/orchestrator.py:333` | `"10"` |
+| `AIT_BT_CALIBRATED_SPREADS` | `ait/backtesting/engine.py:296` | `"1"` |
+| `AIT_BT_TOUCH_STOP` | `ait/backtesting/engine.py:404` | `"1"` |
+| `AIT_GATEWAY_START_SCRIPT` | `ait/orchestration/master.py:143` | `r"C:\IBC\StartGateway.bat"` |
+| `AIT_STATE_DB` | `ait/monitoring/ops_health.py:789` | `str(DEFAULT_STATE_DB)` |
+
+**5 are bare presence reads** with no competing default, so they are a WEAKER case and should not be
+lumped in with the 16 — recorded separately rather than inflating the count:
+`AIT_ACCOUNT` (`broker/ibkr_client.py:134`), `AIT_EXPECT_LIVE_ACCOUNT` (`:173`),
+`AIT_SIMULATED_CAPITAL` (`broker/account.py:216`), `AIT_ALLOW_AFTER_HOURS`
+(`execution/executor.py:340`), `AIT_HEALTH_STATE` (`monitoring/ops_health.py:793`).
+
+**Why it matters beyond hygiene.** The load-bearing ones govern live trading decisions with a
+private default that `config.yaml` cannot override and the divergence report cannot see:
+`AIT_IC_DELTA_MIN`/`MAX` and `AIT_IRON_CONDOR_IV_FLOOR` decide STRIKE SELECTION and entry gating for
+the only live strategy; `AIT_CREDIT_TOUCH_STOP` arms the primary loss exit; `AIT_IV_RANK_CAP` and
+`AIT_MAX_PER_EXPIRY` are risk gates; `AIT_ALLOW_AFTER_HOURS` gates market-hours enforcement. The
+wing_k incident R19 was written about — four disagreeing sources for one number — is the same shape.
+
+**Status:** OPEN (registered). Wants its own wave, alongside the `date.today()` census from W26 [4].
+The two are the same class of problem — an enforcement mechanism whose reach was never measured —
+and are probably one wave, not two.

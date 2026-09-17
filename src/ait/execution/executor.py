@@ -776,6 +776,47 @@ class TradeExecutor:
             if limit_price > _validated > 0:
                 limit_price = round(_validated, 2)
         self._last_debit_cap = _debit_cap
+
+        # W27 (regress-live-06): the credit economics floors are enforced at
+        # SIGNAL time (iron_condor.py) and at REPRICE (_credit_floors_hold), but
+        # never here — at the ladder's FIRST and largest concession. Measured:
+        # a signal sitting exactly on the $0.70 floor is placed at $0.67 with a
+        # perfectly fresh quote (combo_entry_limit's offset has a 10c minimum,
+        # so step 0 concedes 2.5c unconditionally), and _credit_floors_hold
+        # REFUSES that very price one code path over. Worst case admitted by the
+        # staleness gate above is ~30% below the floor, because _base_mag is the
+        # live mid rather than the signal's validated credit.
+        #
+        # ENTRIES ONLY. This function serves exits too (see is_exit above), and
+        # the floors describe the economics that justify OPENING a position.
+        # Applying them to a close would refuse or reprice the exit of a losing
+        # trade — the opposite of protection.
+        if is_credit and not is_exit:
+            _floor_min = self._credit_floor_minimum(
+                self._wing_width_from_legs(getattr(signal, "legs", None)))
+            if _base_mag < _floor_min:
+                # The market's own mid cannot pay the economics that justified
+                # this signal — the premise is void, so do not trade. Mirrors
+                # the disorderly-spread and stale-signal refusals above.
+                log.warning("credit_floor_breached_at_placement_refused",
+                            trade_id=trade_id, symbol=signal.symbol,
+                            live_mid=round(_base_mag, 2),
+                            floor_min=round(_floor_min, 2))
+                self._state.transition(
+                    trade_id, (TradeStatus.PENDING,), TradeStatus.CANCELLED)
+                return None
+            if abs(limit_price) < _floor_min:
+                # The mid clears the floor but step 0's concession would not.
+                # Clamp rather than refuse: demanding MORE credit can never make
+                # the order more aggressive, and the entry stays viable. Mirrors
+                # the debit side's _debit_cap clamp directly above.
+                _clamped = -round(_floor_min, 2)
+                log.info("credit_floor_clamped_at_placement",
+                         trade_id=trade_id, symbol=signal.symbol,
+                         was=round(limit_price, 2), now=_clamped,
+                         floor_min=round(_floor_min, 2))
+                limit_price = _clamped
+
         log.info("combo_entry_priced", strategy=signal.strategy_name,
                  target=signal.entry_price, offset=aggressive_offset,
                  limit=limit_price, is_credit=is_credit)
@@ -1408,6 +1449,28 @@ class TradeExecutor:
                 log.warning("entry_ladder_reprice_failed",
                             trade_id=pending.trade_id, error=str(e))
 
+    @staticmethod
+    def _credit_floor_minimum(width: float) -> float:
+        """Least ENTRY credit that satisfies both signal-time economics floors.
+
+        W27 (regress-live-06): one authority for the threshold, because it now
+        has two callers that must never drift — the reprice guard
+        (_credit_floors_hold) and the initial-placement clamp in
+        _execute_multi_leg. The defect this wave fixes is precisely that the two
+        paths did not share it: placement had no floor at all, so the ladder's
+        FIRST and largest concession was the only unchecked one.
+
+        width <= 0 means the structure's wings are unknown, in which case the
+        ratio floor is unenforceable and only the absolute floor applies —
+        preserving the pre-W27 semantics of _credit_floors_hold exactly.
+        """
+        from ait.config.runtime_env import contract_float
+
+        min_credit = contract_float("AIT_IC_MIN_CREDIT")
+        if width and width > 0:
+            return max(min_credit, contract_float("AIT_IC_MIN_CREDIT_WIDTH") * width)
+        return min_credit
+
     def _credit_floors_hold(self, pending, limit_price: float) -> bool:
         """trade-life-credit-econ-floors-signal-time-only: do the signal-time
         credit-economics floors still hold for this re-priced ENTRY credit?
@@ -1425,7 +1488,7 @@ class TradeExecutor:
         min_ratio = contract_float("AIT_IC_MIN_CREDIT_WIDTH")
         width = self._pending_wing_width(pending)
         ratio = (credit / width) if width > 0 else None
-        if credit < min_credit or (ratio is not None and ratio < min_ratio):
+        if credit < self._credit_floor_minimum(width):
             log.warning("credit_floor_breached_at_reprice",
                         trade_id=getattr(pending, "trade_id", ""),
                         credit=credit, min_credit=min_credit,
@@ -1435,15 +1498,20 @@ class TradeExecutor:
             return False
         return True
 
-    def _pending_wing_width(self, pending) -> float:
-        """Wider wing width of a pending credit structure, derived the way the
-        signal-time floor derives it: max(put_width, call_width) over the
-        order's own legs. Falls back to the PENDING trade row's legs JSON when
-        the in-memory signal carries no legs. 0.0 = width unknown (the ratio
-        floor is then skipped; the absolute credit floor still applies)."""
-        legs = list(getattr(getattr(pending, "signal", None), "legs", None) or [])
+    def _wing_width_from_legs(self, legs) -> float:
+        """Wider wing width over a leg list: max(put_width, call_width).
+
+        W27 (regress-live-06): split out of _pending_wing_width so the INITIAL
+        PLACEMENT path can derive the width too — at placement time no
+        PendingOrder exists yet (the caller builds it only after place_order
+        returns), so the floor check there has a signal and its legs, nothing
+        more. One arithmetic, two callers.
+
+        0.0 = width unknown; callers must read that as "skip the ratio floor,
+        the absolute credit floor still applies".
+        """
         strikes: dict[str, list[float]] = {"P": [], "C": []}
-        for leg in legs:
+        for leg in list(legs or []):
             try:
                 strike, right, _ = self._leg_fields(leg)
             except Exception:  # noqa: BLE001 — an odd leg shape is not fatal
@@ -1451,21 +1519,32 @@ class TradeExecutor:
             side = str(right or "").upper()[:1]
             if side in strikes and strike:
                 strikes[side].append(float(strike))
-        if not any(len(v) >= 2 for v in strikes.values()):
-            strikes = {"P": [], "C": []}
-            try:
-                row = self._state.get_trade_by_id(
-                    getattr(pending, "trade_id", "")) if self._state else None
-                for leg in json.loads(getattr(row, "legs", "[]") or "[]"):
-                    side = str(leg.get("right") or "").upper()[:1]
-                    if side in strikes and leg.get("strike"):
-                        strikes[side].append(float(leg["strike"]))
-            except Exception as _e:  # noqa: BLE001
-                log.debug("pending_wing_width_legs_unavailable",
-                          trade_id=getattr(pending, "trade_id", ""),
-                          error=str(_e))
         widths = [max(v) - min(v) for v in strikes.values() if len(v) >= 2]
         return round(max(widths), 4) if widths else 0.0
+
+    def _pending_wing_width(self, pending) -> float:
+        """Wider wing width of a pending credit structure, derived the way the
+        signal-time floor derives it: max(put_width, call_width) over the
+        order's own legs. Falls back to the PENDING trade row's legs JSON when
+        the in-memory signal carries no legs. 0.0 = width unknown (the ratio
+        floor is then skipped; the absolute credit floor still applies)."""
+        # W27: the strike arithmetic moved to _wing_width_from_legs (shared with
+        # the placement-time floor). This keeps the trade-row fallback, which is
+        # meaningful only here — placement has the signal in hand by definition.
+        width = self._wing_width_from_legs(
+            getattr(getattr(pending, "signal", None), "legs", None))
+        if width > 0:
+            return width
+        try:
+            row = self._state.get_trade_by_id(
+                getattr(pending, "trade_id", "")) if self._state else None
+            return self._wing_width_from_legs(
+                json.loads(getattr(row, "legs", "[]") or "[]"))
+        except Exception as _e:  # noqa: BLE001
+            log.debug("pending_wing_width_legs_unavailable",
+                      trade_id=getattr(pending, "trade_id", ""),
+                      error=str(_e))
+            return 0.0
 
     @staticmethod
     def _is_bag_row(fill) -> bool:
