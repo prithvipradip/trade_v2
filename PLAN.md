@@ -5032,3 +5032,84 @@ NEXT, per the agreed sequence (sequential waves, not batched):
   exit"), F2 booking/breaker, F6 ops substrate, the W21 Windows fixture.
 
 ---
+
+## 2026-09-17 - W29 EXECUTED — the simulated-capital reporting leak (R26 F5 #6)
+
+First of the three waves agreed after R26, and first because it is MINE: introduced by this
+session's own `AIT_SIMULATED_CAPITAL=10000` deploy at 07:25 ET today. STAGED, NOT DEPLOYED.
+
+[1] THE DEFECT. `AIT_SIMULATED_CAPITAL` is meant to shrink the RISK STACK's view of the account so
+    the go-live configuration can be exercised on a big paper account — that part works and must
+    keep working. It ALSO shrank the PERFORMANCE DENOMINATOR: `account.py:216-227` rewrites
+    `values["NetLiquidation"]` IN PLACE before the snapshot is built, `orchestrator.py` persisted
+    that scaled figure as `bot_state.last_net_liquidation`, and `capital_base()`
+    (`runtime_env.py:211-218`) resolves that row ahead of its default.
+    R26's measurement against the real closed-trade series: the SAME $863 drawdown reads **0.43%
+    against $201k and 8.29% against $10k** — across this project's own `<8%` go-live gate
+    (`go_live.py:185 GATE_DD_PCT`). `reporting/go_live.py` is immune (it divides by
+    `max_concurrent_car`), so the Friday scorecard and the dashboard would disagree ~72x about ONE
+    book, and a later session reading the dashboard would conclude the strategy failed the
+    drawdown gate.
+    CONFIRMED HERE BEFORE FIXING: this box's row held the real **$719,449.02** (written
+    2026-09-16T21:42), `capital_base()` returned it with source `live_nlv`. The leak had not yet
+    fired; it fires on the first trading cycle after the open.
+
+[2] THE FIX. `AccountSnapshot` gains `real_net_liquidation`, captured BEFORE the scaling block
+    rewrites the dict, and the orchestrator persists that. Behaviour with the var unset is
+    unchanged by construction (the captured value equals the scaled one).
+    `_reporting_nlv()` was extracted as a REAL SEAM rather than left as an inline expression,
+    specifically so the test can drive the actual decision instead of re-implementing it — R26's F7
+    flags "negative controls reimplement the line under test" as its own finding class.
+    NO RESTATE SCRIPT, verified rather than assumed: the row is rewritten every cycle, and no
+    drawdown PERCENTAGE is persisted anywhere (`daily_stats.max_drawdown` is a dollar figure; every
+    consumer divides at read time). So the next cycle after deploy self-heals the row. The only
+    exposure is the window between today's open and the deploy — reporting only.
+
+[3] THE OPPOSITE FAILURE, GUARDED. Two tests assert `net_liquidation` and `buying_power` are STILL
+    scaled when the var is set. A "fix" that un-scaled them would silently restore full-size
+    position sizing on a probe account — far worse than the reporting bug it repaired. Also pinned:
+    a pre-W29 snapshot (no field) still resolves to its `net_liquidation` rather than persisting
+    0.0 and blanking the denominator.
+
+[4] A REGRESSION THIS WAVE CAUSED AND CAUGHT, recorded because the lesson is about OUR OWN RULES.
+    Wrapping the `set_state` call across three lines for readability broke
+    `test_w18_gateway_port_and_throttle::test_dashboard_reads_a_key_that_is_actually_written`,
+    which greps the literal `set_state("last_net_liquidation"` out of `orchestrator.py` to prove
+    the dashboard's key has a writer. **Behaviour was identical; only the substring moved.**
+    That is precisely the anti-pattern the house rules forbid ("execute the real code path, never
+    assert on source strings"), and R26's F7 already carries a sibling W18 item for the same cause.
+    The test's INTENT is sound — the dashboard's key must have a writer — so it was not edited
+    mid-wave. Instead the call keeps to one line (via a local, to stay inside 100 cols) with a
+    comment at the site explaining WHY it must stay that way, so the next tidy-up does not silently
+    break it again. Registered for F7's source-string sweep.
+
+[5] VERIFICATION. `tests/test_w29_simulated_capital_reporting.py`, 10 tests.
+    - NEGATIVE CONTROL: asserts the pre-W29 source of the persisted value (`net_liquidation`) really
+      is the scaled one, so the wave is demonstrably fixing something. Demonstrated separately by
+      execution: pre-W29 the persisted figure is 10,000.00, post-W29 it is 201,475.35.
+    - The go-live consequence is pinned as a test, not left in prose, so a later reader can see why
+      a reporting-only bug was treated as urgent.
+    - Gates: full fast lane **1908 passed / 44 skipped / 1 failed** (the known local-`.env`
+      `test_r19_config_authority` case). Reconciled: 1898 + 10 = 1908. `compileall` OK,
+      `scripts/typecheck.py` OK, `smoke_deploy.py` SMOKE PASS (13 checks).
+
+STATE AT HANDOFF: branch feature/event-straddle, HEAD 9c36cd5. **NOT DEPLOYED** — the live bot
+(supervisor 58879 / bot 60685) still runs W26+W27; W28 and W29 are both staged. Market open since
+09:30 ET, so the leak has by now written 10000 into the row; it self-heals on the first cycle after
+W29 deploys. Book was flat at the open.
+NEXT, per the agreed sequence:
+  (a) W30 — R26 F3, the W22 cached-snapshot class. Six findings, ONE seam:
+      `reconciler.py:1202` passes `set(ibkr_map.keys())` — built from `get_positions()`, the CACHE —
+      into `reconcile_declared_positions`, which treats absence as proof the operator closed the
+      position (four `delete_state` calls + a Telegram message saying a LIVE position closed). The
+      contract `get_positions_fresh` states in its own docstring forbids exactly this, and the
+      sibling guard 30 lines below honours it correctly — it just runs SECOND. Sharpest trigger:
+      `reconcile_now()` has no connection guard (`orchestrator.py:481-482`) and `main.py:181` wires
+      it to the Telegram answer callback, so the operator's own button tap during a disconnect
+      window triggers the destructive path.
+  (b) W31 — R26 F4, the W25 sizing self-test finished (breaker arm still fail-open, sized from a $1
+      probe wing; `generate_signals` still never executed).
+  Owned elsewhere, deliberately not picked up: F1 exit rebuild (gated "before the next take-profit
+  exit"), F2 booking/breaker, F6 ops substrate, the W21 Windows fixture.
+
+---
