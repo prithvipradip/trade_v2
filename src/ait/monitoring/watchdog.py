@@ -50,6 +50,13 @@ class ComponentHealth:
     error_count: int = 0
     last_error: str = ""
     latency_ms: float = 0.0
+    # Live incident 2026-09-17: a component whose natural heartbeat cadence is
+    # SLOWER than the instance-wide default (e.g. one per multi-minute scan
+    # cycle, not one per fast-loop tick) spends most of its life looking
+    # "stale" against that shared default and pages every check_and_recover
+    # tick. None = use the instance default (self._heartbeat_timeout) —
+    # existing single-timeout behaviour, byte-for-byte, when unset.
+    heartbeat_timeout: float | None = None
 
 
 @dataclass
@@ -100,9 +107,19 @@ class Watchdog:
             state_publisher = _HSP()
         self._state_publisher = state_publisher
 
-    def register_component(self, name: str) -> None:
-        """Register a component to monitor."""
-        self._components[name] = ComponentHealth(name=name)
+    def register_component(
+        self, name: str, *, heartbeat_timeout: float | None = None
+    ) -> None:
+        """Register a component to monitor.
+
+        `heartbeat_timeout` overrides the instance-wide default for THIS
+        component only — for a component whose real heartbeat cadence is
+        legitimately slower than the shared default (see ComponentHealth's
+        docstring). Keyword-only so every existing single-arg call site
+        (register_component("name")) is untouched.
+        """
+        self._components[name] = ComponentHealth(
+            name=name, heartbeat_timeout=heartbeat_timeout)
 
     def heartbeat(self, component: str) -> None:
         """Record a heartbeat from a component."""
@@ -219,7 +236,9 @@ class Watchdog:
         for comp in self._components.values():
             if comp.last_heartbeat > 0:
                 age = now - comp.last_heartbeat
-                if age > self._heartbeat_timeout:
+                timeout = (comp.heartbeat_timeout if comp.heartbeat_timeout is not None
+                          else self._heartbeat_timeout)
+                if age > timeout:
                     comp.status = ComponentStatus.DOWN
 
         # Memory check

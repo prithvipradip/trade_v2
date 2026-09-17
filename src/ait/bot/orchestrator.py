@@ -405,7 +405,21 @@ class TradingOrchestrator:
             self._executor.attach_fill_events()
         except Exception as _e:  # noqa: BLE001
             log.warning("fill_events_wiring_failed", error=str(_e))
-        self._watchdog.register_component("market_data")
+        # Live incident 2026-09-17: registered with the instance-wide 120s
+        # default, but heartbeat("market_data") below fires at most once per
+        # SYMBOL inside a full scan cycle (scan_interval_seconds, 300s) --
+        # never on the 30s fast-loop tick that keeps trading_loop/ibkr fresh.
+        # Measured on the live book: consecutive heartbeats land 201-434s
+        # apart, so EVERY gap exceeded 120s and check_and_recover (running
+        # every ~5th fast-tick) paged "market_data is DOWN and recovery
+        # failed" on an otherwise perfectly healthy scan loop -- repeatedly,
+        # because market_data has no recovery callback (see below) to ever
+        # clear it. 3x the scan interval comfortably covers the measured
+        # variance (up to ~1.4x one cycle) with margin for a slow cycle,
+        # while still paging within 2-3 missed cycles of a genuine stall.
+        self._watchdog.register_component(
+            "market_data",
+            heartbeat_timeout=3 * self._settings.trading.scan_interval_seconds)
         self._watchdog.on_recovery("ibkr", self._ibkr.ensure_connected)
 
         # Analytics

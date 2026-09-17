@@ -5319,3 +5319,93 @@ probe wing; `generate_signals` still never executed) is next in the agreed seque
 timing-margin item from [5] and R26 F5 #7's own residuals are both cheap housekeeping behind it.
 
 ---
+
+## 2026-09-17 - LIVE INCIDENT FIXED: the market_data watchdog false alarm
+
+Not a register finding, not part of R26 or any numbered wave — a live-ops bug the operator flagged
+mid-session ("WATCHDOG ALERT: market_data is DOWN and recovery failed... since 3:58pm"), traced and
+fixed end to end in this entry.
+
+[1] THE INVESTIGATION, because the wrong diagnosis was very nearly the reported one. The alert
+    text matched `watchdog.py:282` exactly, so the mechanism was never in doubt — but the FIRST
+    hypothesis (an active market-data outage, motivated by the sheer volume of live Error 10091 /
+    "Unknown contract" noise for SPY/IWM options in `logs/bot_stdout.log`) was wrong, and ruled out
+    by evidence rather than assumption:
+      - Error 10091 is NOT new: a comment already sitting in `options_chain.py`
+        ("R16... confirmed live 2026-09-14... confirmed benign for reqMktData... not a symptom to
+        chase here") shows a prior audit round investigated this EXACT noise on this EXACT code
+        path and closed it as harmless. Re-reading old comments before chasing new alarms would
+        have saved a detour.
+      - "Unknown contract" is ib_insync's own internal wording (confirmed: zero hits for that
+        string anywhere in `src/`), and the code that triggers it (`qualifyContractsAsync` inside
+        `_fetch_ibkr_expiry`) already filters failed qualifications out (`conId != 0`) — a normal,
+        tolerated consequence of `reqSecDefOptParams` returning a strikes UNION across expiries,
+        not a fetch failure.
+      - `hist_data_error` / `hist_data_empty` (the actual gate in front of the `market_data`
+        heartbeat): ZERO occurrences today. The underlying daily-bar fetch was never failing.
+      - Polygon auth failures (an R26-noted, genuinely-live operator item): ZERO occurrences today.
+    THE REAL EVIDENCE: `ml_prediction` log events (fired unconditionally two lines after the
+    heartbeat, in the same execution path) at 18:03:43, 18:07:15, 18:14:29, 18:17:50, 18:21:23,
+    18:28:32 UTC — the last one 90 SECONDS before this was checked. The scan loop was running,
+    successfully, continuously, in real time. Gaps between consecutive events: 213s, 434s, 201s,
+    213s, 429s — **every single one exceeding the 120-second timeout**.
+
+[2] ROOT CAUSE. `Watchdog()` at `orchestrator.py` uses the class default `heartbeat_timeout=120.0`
+    for EVERY registered component, uniformly — there was no per-component override anywhere in
+    the class. `market_data` heartbeats exactly once per SYMBOL inside a FULL scan cycle
+    (`scan_interval_seconds`, 300s), never on the 30s fast-loop tick that keeps `trading_loop` and
+    `ibkr` fresh against that same 120s window. The natural gap between market_data heartbeats was
+    therefore ALWAYS going to exceed 120s, on every single cycle, by architecture — not by fault.
+    Compounding it: `market_data` has NO recovery callback registered (only `ibkr` does, via
+    `on_recovery("ibkr", self._ibkr.ensure_connected)`). `check_and_recover()`'s alert branch fires
+    UNCONDITIONALLY whenever a component is found DOWN and nothing recovered it — so this was
+    guaranteed to repage on every ~5-minute `check_and_recover` tick, indefinitely, exactly matching
+    "getting these messages... since 3:58pm."
+
+[3] THE FIX. `ComponentHealth` gains an optional `heartbeat_timeout: float | None` field (None =
+    fall back to the instance default — existing single-timeout behaviour, unchanged, when unset).
+    `register_component(name, *, heartbeat_timeout=None)` — keyword-only, so every existing
+    single-argument call site (`register_component("trading_loop")`, `("ibkr")`, three more in
+    `tests/test_w6_ops_surfaces.py`, five in `tests/test_watchdog.py` itself) is untouched;
+    confirmed by grep before changing the signature. `_compute_health()`'s staleness check now
+    reads the per-component override when set.
+    `orchestrator.py` registers `market_data` with `heartbeat_timeout=3 * scan_interval_seconds`
+    (900s) — derived from the live config value rather than a new hardcoded literal, sized with
+    real margin: 900s comfortably covers the measured worst gap (434s, ~1.4x one cycle) while still
+    paging within 2-3 missed cycles of a genuine stall.
+
+[4] PROVEN, NOT ASSUMED, in both directions.
+      - Ran the fix against the REAL measured worst-case gap (434s): `market_data` stays HEALTHY;
+        `trading_loop`, unaffected by the change (no override requested for it), correctly still
+        reads DOWN at that same 434s gap — proving the fix is scoped to the one component that
+        needed it, not a blanket loosening.
+      - Ran it against 1000s (beyond the 900s override): still correctly DOWN — guards against
+        over-correcting into a monitor that never alerts.
+      - NEGATIVE CONTROL, disabled and confirmed: forced the staleness check back onto the shared
+        instance timeout only (simulating the pre-fix single-timeout shape) and re-ran the new test
+        class. Exactly the three tests asserting the override actually works FAILED — including an
+        end-to-end one that fires the real alert text
+        (`"ALERT: market_data is DOWN and recovery failed..."`) through the real `check_and_recover`
+        path. The other five (negative control itself, the genuine-stall guard, backward-compat,
+        auto-registration) correctly stayed green, since they do not depend on the override at all.
+        Restored immediately after; all 20 tests in the file green again.
+
+[5] VERIFICATION. `tests/test_watchdog.py`, 8 new tests (12 -> 20). Full fast lane
+    **1936 passed / 45 skipped / 1 failed** (the known local-`.env` `test_r19_config_authority`
+    case) — zero new or unexpected failures. Notably, the PRIOR run's `test_watchdog.py::
+    TestOverallHealth` flakiness (diagnosed in the W30 entry above as a too-tight 5.0s test-fixture
+    margin tripping under system load) did NOT recur here, one more data point for that diagnosis
+    being load-related rather than a real defect. `compileall` OK, `scripts/typecheck.py` OK,
+    `scripts/smoke_deploy.py` -> SMOKE PASS (13 checks). Orchestrator-adjacent files re-run given
+    `__init__` was touched: `test_w2_orchestrator_gates.py` + `test_w6_ops_surfaces.py` +
+    `test_hot_path_smoke.py`, 114 passed.
+
+STATE AT HANDOFF: **DEPLOYED nowhere yet — staged, like W28/W29/W30.** `watchdog.py` and
+`orchestrator.py` are both loaded by the running bot (still on W26+W27), so the false alarm will
+keep firing on the live process until the next restart. Not urgent to restart immediately for this
+alone (paper account, book flat, purely a monitoring/alerting defect — no trading behaviour is
+affected), but worth folding into whichever restart deploys W28/W29/W30.
+NEXT: W31 (R26 F4, the W25 sizing self-test finished) remains the next queued item. This entry does
+not change that queue — it was an out-of-band live-ops fix, not part of the R26 sequence.
+
+---
