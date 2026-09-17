@@ -42,26 +42,52 @@ ET = ZoneInfo("US/Eastern")
 BERLIN = "Europe/Berlin"
 
 
+HAS_TZSET = hasattr(time, "tzset")
+posix_only = pytest.mark.skipif(not HAS_TZSET, reason="TZ + tzset is POSIX only")
+
+
 @pytest.fixture
 def host_tz():
-    """Pin the process TZ, restoring it afterwards."""
+    """Pin the process TZ, restoring it afterwards.
+
+    W28: `time.tzset()` is POSIX-only and is guarded, following the pattern
+    W20's fixture already uses. R26 recorded the cost of not doing so — W21's
+    test file calls tzset unconditionally and throws 8 failures / 5 errors on
+    the WINDOWS trading box, a class W20's tests had fixed the day before. An
+    unconditional call here would not merely skip on Windows, it would raise
+    AttributeError in the fixture and take every test in this file with it.
+    """
     original = os.environ.get("TZ")
 
     def _set(name: str) -> None:
         os.environ["TZ"] = name
-        time.tzset()
+        if HAS_TZSET:
+            time.tzset()
 
     yield _set
     if original is None:
         os.environ.pop("TZ", None)
     else:
         os.environ["TZ"] = original
-    time.tzset()
+    if HAS_TZSET:
+        time.tzset()
 
 
 def _at(et_hour: int, et_minute: int = 30, day: int = 17):
     """A real ET instant on 2026-09-<day>."""
     return datetime(2026, 9, day, et_hour, et_minute, tzinfo=ET)
+
+
+def _as_host(instant: datetime) -> datetime:
+    """The instant as the PINNED host zone would see it.
+
+    Deliberately an explicit ZoneInfo conversion rather than `.astimezone()`:
+    the latter reads the process's local zone, which only tracks the TZ env var
+    where tzset exists. Explicit is both portable and a stronger statement of
+    what is being asserted — the tests that genuinely need the REAL process
+    clock are marked `posix_only` instead.
+    """
+    return instant.astimezone(ZoneInfo(BERLIN))
 
 
 class TestTheHarnessActuallyBites:
@@ -71,7 +97,7 @@ class TestTheHarnessActuallyBites:
     def test_tz_pin_changes_the_host_date_at_19_et(self, host_tz):
         host_tz(BERLIN)
         evening = _at(19)
-        assert evening.astimezone().date() != evening.date(), (
+        assert _as_host(evening).date() != evening.date(), (
             "the TZ pin is not taking effect — every divergence test below "
             "would pass vacuously"
         )
@@ -79,7 +105,7 @@ class TestTheHarnessActuallyBites:
     def test_tz_pin_is_a_no_op_at_midday_et(self, host_tz):
         host_tz(BERLIN)
         midday = _at(12)
-        assert midday.astimezone().date() == midday.date()
+        assert _as_host(midday).date() == midday.date()
 
 
 class TestTodayEtIsTheEtDate:
@@ -92,7 +118,7 @@ class TestTodayEtIsTheEtDate:
         """
         host_tz(BERLIN)
         evening_et = _at(19)
-        host_date = evening_et.astimezone().date()
+        host_date = _as_host(evening_et).date()
 
         assert host_date == date(2026, 9, 18), "expected the host to have rolled over"
         assert evening_et.date() == date(2026, 9, 17)
@@ -108,6 +134,7 @@ class TestTodayEtIsTheEtDate:
         host_tz(BERLIN)
         assert today_et() == now_et().date()
 
+    @posix_only
     def test_today_et_never_returns_the_bare_host_date_in_the_window(self, host_tz):
         """Executed rather than reasoned: if the run happens to land inside
         18:00-24:00 ET, today_et() must disagree with date.today()."""
@@ -131,7 +158,7 @@ class TestRthNeutrality:
     def test_host_and_et_dates_agree_across_the_session(self, host_tz, et_hour):
         host_tz(BERLIN)
         instant = _at(et_hour)
-        assert instant.astimezone().date() == instant.date(), (
+        assert _as_host(instant).date() == instant.date(), (
             f"{et_hour}:30 ET falls outside the agreement band — the RTH "
             "no-op property this wave was deployed on no longer holds"
         )
