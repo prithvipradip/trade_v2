@@ -493,9 +493,28 @@ class TradingOrchestrator:
         failed broker call can never block answering a prompt. Errors are
         logged, not raised: a failed on-demand reconcile must not crash the
         poller loop that triggered it; the next natural pass still runs.
+
+        W30 (R26 F3, finding #6): this runs DETACHED (manual_positions.
+        _fire_and_forget) from an operator's Telegram reply at ANY time,
+        including mid-shutdown after IBKR has already disconnected —
+        reconcile() against a dead client can only read an empty/stale
+        snapshot, so skip rather than run it for no benefit. It also used to
+        discard reconcile()'s result: a kept-CLOSING trade's working exit
+        order was never re-adopted, exactly the gap the startup/post-market
+        call sites already close.
         """
+        if not getattr(self._ibkr, "connected", False):
+            log.info("reconcile_now_skipped_disconnected")
+            return
         try:
-            await self._reconciler.reconcile()
+            recon = await self._reconciler.reconcile()
+            for _tid, _oid in getattr(recon, "closing_exit_orders", {}).items():
+                try:
+                    self._executor.adopt_exit_order(
+                        _oid, _tid, reason="reconcile_readopt")
+                except Exception as _e:  # noqa: BLE001
+                    log.warning("exit_order_adopt_failed",
+                                trade_id=_tid, error=str(_e))
         except Exception as e:  # noqa: BLE001
             log.warning("reconcile_now_failed", error=str(e))
 
@@ -4269,6 +4288,11 @@ class TradingOrchestrator:
                     # notional is a reasonable standing proxy.
                     "market_value": abs(trade.entry_price) * trade.quantity * 100,
                 })
+
+            # W30 (R26 F3, finding #3): declared manual positions have no
+            # local trade row — without this they are invisible to every
+            # cap above (aggregate risk, concentration, correlation, count).
+            positions_for_risk.extend(self._reconciler.declared_position_risk_rows())
 
             self._risk_manager.update_positions(positions_for_risk)
             log.debug("risk_manager_synced", position_count=len(positions_for_risk))

@@ -734,6 +734,58 @@ class PositionReconciler:
                 continue
         return keys
 
+    def declared_position_risk_rows(self) -> list[dict]:
+        """W30 (R26 F3, finding #3): a declared manual position has no local
+        trade row, so orchestrator._sync_risk_manager_positions — the SOLE
+        producer of RiskManager._open_positions — never saw it: invisible to
+        the aggregate capital-at-risk cap, the symbol-concentration cap, the
+        per-expiry cap, correlation, and the open-position count. Synthesizes
+        one row per declared key from the (cached) broker position list,
+        priced via the same conservative structural/Reg-T proxy a real
+        position's aggregate-risk backfill already uses.
+        """
+        from ait.execution import manual_positions as _mp
+        from ait.risk.manager import RiskManager
+        rows: list[dict] = []
+        try:
+            positions = self._ibkr.get_positions()
+        except Exception as e:  # noqa: BLE001 — a sync failure must not break the risk sync
+            log.warning("declared_position_risk_rows_failed", error=str(e))
+            return rows
+        for pos in positions:
+            qty = getattr(pos, "position", 0)
+            if not qty:
+                continue
+            c = pos.contract
+            if getattr(c, "secType", "") != "OPT":
+                continue
+            key = self._make_position_key(
+                symbol=c.symbol, strike=c.strike, right=c.right,
+                expiry=c.lastTradeDateOrContractMonth)
+            if not _mp.is_declared(self._state, key):
+                continue
+            action = "SELL" if qty < 0 else "BUY"
+            max_loss = RiskManager._structural_max_loss(
+                [{"strike": c.strike, "right": c.right, "action": action}], qty)
+            if max_loss <= 0:
+                # A long option (or an unpriceable structure) — the premium
+                # already paid is the conservative floor; never zero for a
+                # real position (the R16 aggregate-risk lesson).
+                try:
+                    max_loss = abs(float(getattr(pos, "avgCost", 0) or 0)) * abs(qty)
+                except (TypeError, ValueError):
+                    max_loss = 0.0
+            rows.append({
+                "symbol": c.symbol,
+                "strategy": "declared_manual",
+                "expiry": self._normalize_expiry(c.lastTradeDateOrContractMonth),
+                "quantity": qty,
+                "delta": 0, "gamma": 0, "theta": 0, "vega": 0,
+                "max_loss": max_loss,
+                "market_value": max_loss,
+            })
+        return rows
+
     async def sweep_stale_pending(self) -> int:
         """R19: async entry point for the stale-PENDING sweep that can resolve
         an empty position cache authoritatively before anything is booked.
@@ -1143,7 +1195,8 @@ class PositionReconciler:
                     # elsewhere (those read ib.portfolio() directly, never
                     # filtered by local-trades membership).
                     from ait.execution import manual_positions as _mp
-                    if _mp.is_declared(self._state, key):
+                    if _mp.declared_quantity_matches(
+                            self._state, key, ibkr_pos["quantity"]):
                         log.info("declared_manual_position_seen", position=key,
                                  qty=ibkr_pos["quantity"])
                         continue
@@ -1233,6 +1286,41 @@ class PositionReconciler:
         # PRIOR pass and isn't in frozen_keys this time is correctly dropped
         # here, no separate cleanup needed. Empty list -> no undeclared,
         # unresolved untracked option remains -> delete the file.
+        # W30 (R26 F3, findings #1/#2): both the HALT_UNTRACKED clear below
+        # and reconcile_declared_positions() take an IRREVERSIBLE action —
+        # unlinking an operator kill-switch file, deleting declared-position
+        # state — on "absent from ibkr_map". ibkr_map is built from
+        # get_positions()'s CACHE, which reads back EMPTY on any disconnect
+        # or Gateway hiccup, identically to a genuinely flat book
+        # (get_positions_fresh's own docstring already makes this contract).
+        # R26 caught a single reconcile() pass emitting halt_untracked_cleared
+        # AND reconcile_skipping_stale_close (the mass-close guard further
+        # below, refusing to trust this SAME empty snapshot) together —
+        # resolve the ambiguity the same way here instead of contradicting it.
+        # Only an EMPTY cache is ambiguous: a non-empty ibkr_map is positive
+        # proof the client is connected and answering for real.
+        positions_confirmed_flat = True
+        fresh_declared_keys: set[str] | None = None
+        if not ibkr_positions:
+            _declared_fresh_fn = getattr(self._ibkr, "get_positions_fresh", None)
+            if callable(_declared_fresh_fn):
+                _declared_fresh = await _declared_fresh_fn()
+                if _declared_fresh is None:
+                    positions_confirmed_flat = False
+                    log.warning(
+                        "declared_position_reconcile_unconfirmed",
+                        note="position cache is empty and a fresh re-query "
+                             "could not confirm the book is flat — skipping "
+                             "the HALT_UNTRACKED clear and the declared-"
+                             "position cleanup this pass",
+                    )
+                else:
+                    fresh_declared_keys = self._fresh_leg_keys(_declared_fresh)
+            # else: no authoritative-query surface on this client at all
+            # (legacy client / test fake) — nothing to confirm against; keep
+            # the pre-W30 cache-trusting behaviour rather than wedging every
+            # freeze/declared-position cleanup forever.
+
         from pathlib import Path as _P
         _halt_path = _P("data/HALT_UNTRACKED")
         try:
@@ -1242,7 +1330,7 @@ class PositionReconciler:
                     "Telegram prompt, then this file clears itself):\n"
                     + "\n".join(f"  {k}" for k in frozen_keys))
                 log.info("halt_untracked_written", keys=frozen_keys)
-            elif _halt_path.exists():
+            elif _halt_path.exists() and positions_confirmed_flat:
                 # 2026-09-16 investigation note: this file went missing once
                 # with no reconcile() call in the window and no unlink call
                 # logged here either — meaning THIS branch, the only unlink
@@ -1261,12 +1349,16 @@ class PositionReconciler:
         # W22: confirm + clean up any DECLARED position the operator has
         # since closed at the broker — the "confirms when it disappears"
         # half of the design.
+        # W30: skipped outright when the pass above could not confirm the
+        # book is flat (positions_confirmed_flat is False) — see above.
         _telegram = getattr(self, "_telegram", None)
-        if _telegram is not None:
+        if _telegram is not None and positions_confirmed_flat:
             from ait.execution import manual_positions as _mp
+            _declared_keys = (fresh_declared_keys if fresh_declared_keys is not None
+                              else set(ibkr_map.keys()))
             try:
                 await _mp.reconcile_declared_positions(
-                    self._state, _telegram, set(ibkr_map.keys()))
+                    self._state, _telegram, _declared_keys)
             except Exception as e:  # noqa: BLE001
                 log.warning("manual_position_cleanup_failed", error=str(e))
 

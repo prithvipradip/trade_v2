@@ -14,10 +14,16 @@ DESIGN, per the operator's own choices:
     paths funnel through _record_and_edit so a wrong tap is always visibly
     fixable, not just technically reversible: the prompt message is edited
     to show whichever answer is CURRENT.
-  - A declared position is ignored for management but still counted in
-    exposure — that needs no code here: portfolio.py's exposure/delta/mark
-    functions already iterate ib.portfolio() directly, never filtered by
-    "is this in our local trades table".
+  - A declared position is ignored for management but stays counted in
+    exposure for portfolio.py's exposure/delta/mark functions, which already
+    iterate ib.portfolio() directly, never filtered by "is this in our local
+    trades table". RiskManager._open_positions is NOT one of those — it is
+    built only from local trades (orchestrator._sync_risk_manager_positions),
+    so a declared naked position was invisible to the aggregate capital-at-
+    risk cap, the symbol-concentration cap, correlation, and the open-
+    position count (W30, R26 F3 finding #3). Fixed via
+    PositionReconciler.declared_position_risk_rows(), which synthesizes a
+    risk row per declared key from the broker position.
 
 All durable state lives in the existing bot_state key/value table (no schema
 change), the same convention already used for digest markers and
@@ -45,6 +51,10 @@ _ANSWER_PREFIX = "manual_position_answer_"
 _MSGID_PREFIX = "manual_position_prompt_msgid_"
 _LAST_SEEN_PREFIX = "manual_position_last_seen_"
 _CONFIRMED_PREFIX = "manual_position_confirmed_"
+# W30 (R26 F3, finding #5): the quantity in effect at the moment a key was
+# DECLARED. is_declared() alone matches on contract identity only (symbol:
+# strike:right:expiry) — see declared_quantity_matches().
+_QTY_PREFIX = "manual_position_declared_qty_"
 _OFFSET_KEY = "telegram_update_offset"
 
 # W22 hardening (trade-v2-1b, 2026-09-16): asyncio.create_task()'s return
@@ -62,6 +72,25 @@ def _fire_and_forget(coro) -> None:
     task = asyncio.ensure_future(coro)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+
+
+async def drain_background_tasks(timeout: float = 5.0) -> None:
+    """W30 (R26 F3, finding #6): on_answer (TradingOrchestrator.reconcile_now)
+    runs detached via _fire_and_forget — nothing in the shutdown path ever
+    waited for one to finish, so a prompt answered right as the bot shuts
+    down could have its reconcile_now() call abandoned mid-write when
+    main.py disconnects IBKR and exits. Call this AFTER the poller task is
+    cancelled (so no new answer can be recorded) and BEFORE disconnecting
+    IBKR. Bounded so a wedged task cannot hang shutdown forever.
+    """
+    pending = [t for t in _background_tasks if not t.done()]
+    if not pending:
+        return
+    log.info("manual_position_draining_background_tasks", count=len(pending))
+    _done, still_pending = await asyncio.wait(pending, timeout=timeout)
+    if still_pending:
+        log.warning("manual_position_background_drain_timed_out",
+                    count=len(still_pending))
 
 
 def is_declared(state: StateManager, key: str) -> bool | None:
@@ -122,6 +151,51 @@ def mark_confirmed(state: StateManager, key: str) -> None:
     state.set_state(_CONFIRMED_PREFIX + key, "1")
 
 
+def _clear_key_state(state: StateManager, key: str) -> None:
+    """Every durable state key this module writes for `key` — one place, so
+    a cleanup path can never miss one and leave a stale row behind (W30,
+    R26 F3 findings #2/#4)."""
+    state.delete_state(_ANSWER_PREFIX + key)
+    state.delete_state(_MSGID_PREFIX + key)
+    state.delete_state(_LAST_SEEN_PREFIX + key)
+    state.delete_state(_CONFIRMED_PREFIX + key)
+    state.delete_state(_QTY_PREFIX + key)
+
+
+def declared_quantity_matches(state: StateManager, key: str, qty: float) -> bool:
+    """W30 (R26 F3, finding #5): is_declared() matches on CONTRACT IDENTITY
+    alone — an operator who declared qty=-1 as theirs had a LATER, undeclared
+    qty=-3 at the identical contract silently waved through too, invisible to
+    every risk gate. Returns True only when the position is declared YES
+    *and* the broker's current quantity still matches what was declared at
+    prompt time; otherwise clears the stale answer/prompt (but deliberately
+    NOT the sighting/confirmed state) so the size change re-enters the
+    freeze/re-prompt path on THIS pass — immediately, not after a fresh
+    2-sighting debounce, because a size change on an already-approved
+    contract is MORE suspect than a brand-new untracked one, not less.
+
+    A key declared before this quantity tracking existed has no recorded
+    qty (empty string): treated as a match (nothing to compare against yet)
+    rather than an automatic freeze of every pre-existing declaration.
+    """
+    if is_declared(state, key) is not True:
+        return False
+    declared_qty = state.get_state(_QTY_PREFIX + key)
+    if not declared_qty:
+        return True
+    try:
+        if float(declared_qty) == float(qty):
+            return True
+    except (TypeError, ValueError):
+        return True  # unparseable stored value — a data glitch, not a size change
+    log.warning("manual_position_quantity_changed", key=key,
+                declared_qty=declared_qty, current_qty=qty)
+    state.delete_state(_ANSWER_PREFIX + key)
+    state.delete_state(_MSGID_PREFIX + key)
+    state.delete_state(_QTY_PREFIX + key)
+    return False
+
+
 def pending_keys(state: StateManager) -> list[str]:
     """Keys that have been prompted but not yet answered — used to decide
     whether a bare (no reply-to) yes/no reply is unambiguous."""
@@ -147,6 +221,9 @@ async def prompt_if_needed(
     first."""
     if state.get_state(_MSGID_PREFIX + key):
         return  # already asked
+    # W30 (finding #5): the qty the operator is being SHOWN, so a later size
+    # change on the same contract can be detected against this baseline.
+    state.set_state(_QTY_PREFIX + key, str(qty))
     text = (f"🔔 Unmanaged option position detected:\n{key}  qty={qty}\n\n"
             f"Is this a manual/intentional trade of yours? New entries stay "
             f"frozen until you answer.")
@@ -309,10 +386,13 @@ async def run_poller(state: StateManager, telegram: TelegramNotifier, chat_id: s
 
 async def reconcile_declared_positions(
         state: StateManager, telegram: TelegramNotifier, ibkr_keys: set[str]) -> None:
-    """Confirm and clean up declared positions that have disappeared from
+    """Confirm and clean up state for positions that have disappeared from
     the broker (the operator closed them) — the "confirms when the position
     disappears" half of the design. Called once per reconcile() pass with
-    the CURRENT set of broker position keys.
+    the CURRENT set of broker position keys — the caller (reconciler.py)
+    must already have resolved `ibkr_keys` AUTHORITATIVELY (W30, R26 F3):
+    absence from this set is taken as proof the position is gone, so an
+    ambiguous/stale cache must never reach here as if it were confirmed.
     """
     for k in state.state_keys_like(_ANSWER_PREFIX + "%"):
         key = k[len(_ANSWER_PREFIX):]
@@ -323,8 +403,23 @@ async def reconcile_declared_positions(
         await telegram.send(
             f"✅ {key} is no longer at the broker — no longer tracking it "
             f"as a declared manual position.")
-        state.delete_state(_ANSWER_PREFIX + key)
-        state.delete_state(_MSGID_PREFIX + key)
-        state.delete_state(_LAST_SEEN_PREFIX + key)
-        state.delete_state(_CONFIRMED_PREFIX + key)
+        _clear_key_state(state, key)
         log.info("manual_position_closed_confirmed", key=key)
+
+    # W30 (R26 F3, finding #4): a key that was SIGHTED/CONFIRMED (frozen,
+    # maybe prompted) but never got an explicit yes/no answer leaked its
+    # sighting/prompt state forever once the position closed — the loop
+    # above only ever looks at ANSWERED keys. A stale
+    # manual_position_confirmed_<key> then let a LATER, genuinely NEW
+    # sighting of the identical contract skip the R5 debounce entirely
+    # (is_confirmed() treats it as already-proven), and a stale
+    # manual_position_prompt_msgid_<key> silently suppressed the new prompt
+    # (prompt_if_needed treats any stored msgid as "already asked").
+    for k in state.state_keys_like(_LAST_SEEN_PREFIX + "%"):
+        key = k[len(_LAST_SEEN_PREFIX):]
+        if is_declared(state, key) is not None:
+            continue  # answered yes (handled above) or no (kept, by design)
+        if key in ibkr_keys:
+            continue  # still open
+        _clear_key_state(state, key)
+        log.info("manual_position_sighting_state_cleared", key=key)

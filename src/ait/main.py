@@ -208,6 +208,11 @@ async def run_bot(args: argparse.Namespace) -> None:
             await poller_task
         except asyncio.CancelledError:
             pass
+        # W30 (R26 F3, finding #6): the poller is cancelled (no NEW answers
+        # can be recorded) but any reconcile_now() it already fired via
+        # _fire_and_forget is still running detached — wait for it before
+        # IBKR disconnects out from under it.
+        await manual_positions.drain_background_tasks()
         await orchestrator.stop()
         await ibkr.disconnect()
         log.info("ait_shutdown_complete")

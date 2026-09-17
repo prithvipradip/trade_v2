@@ -5134,3 +5134,188 @@ RESULT on the Windows box: 1909 passed / 46 skipped / 0 failed, scripts/typechec
 Rule restated, fourth instance in three days: whoever ships a wave runs the suite on THIS box before
 calling it green. Live: QQQ condor T-20260917-095601-aa4fa8 open (645/691/734/775 Oct-2, credit
 4.99, DTE 15), bot 15248 on W21-W27, first position on the new exit code.
+
+---
+
+## 2026-09-17 - W30 EXECUTED — R26 F3, the W22 cached-snapshot class (six findings, one seam)
+
+Plan: `Plans4agent_next_session/W30_plan_R26_F3_w22_cache_class.md`, archived verbatim at
+`reports/w30_plan_20260917.md`. All six findings landed together (they share one seam and the
+plan's own decision was to keep R26's F3 grouping intact).
+
+**The seam.** `PositionReconciler.reconcile()` built `ibkr_map` from `get_positions()` — the CACHE,
+which reads back EMPTY on any disconnect/Gateway hiccup exactly like a genuinely flat book
+(`get_positions_fresh`'s own docstring). Two call sites acted on that cache as if it were
+authoritative: the `HALT_UNTRACKED` clear (`elif _halt_path.exists(): unlink()`) and
+`reconcile_declared_positions()` (four `delete_state` calls + a "closed" Telegram message). FIX:
+when `ibkr_positions` (the raw cache read) is empty, resolve via `get_positions_fresh()` once —
+`None` (broker won't answer) skips BOTH the unlink and the declared-position cleanup for this pass
+and logs `declared_position_reconcile_unconfirmed`; a real (possibly empty) fresh list authorizes
+both, keyed via the existing `_fresh_leg_keys()` (same key shape as `ibkr_map`, no mismatch trap).
+A client exposing no `get_positions_fresh` at all (legacy/test double) falls back to the pre-W30
+cache-trusting behaviour rather than wedging the freeze/cleanup open forever — this is what keeps
+every existing `test_w22_*` test green with zero changes to those files: none of them attach a
+`get_positions_fresh` mock, so none of them exercise the new gate; it only activates when the
+client actually supports the authoritative query, which the real `IBKRClient` always does.
+
+**#3 [design].** A declared manual position has no local trade row, so
+`orchestrator._sync_risk_manager_positions` (the sole producer of `RiskManager._open_positions`)
+never saw it — invisible to the aggregate capital-at-risk cap, symbol concentration, per-expiry
+cap, correlation, and the open-position count. Fixed via new
+`PositionReconciler.declared_position_risk_rows()`: one synthesized row per declared key from the
+broker's own cached position, priced through `RiskManager._structural_max_loss` (naked-short Reg-T
+proxy) with an `avgCost`-based floor for the long-option case; wired into
+`_sync_risk_manager_positions` right before `update_positions()`. The false claim in
+`manual_positions.py`'s own module docstring ("exposure already counted via `ib.portfolio()`") is
+corrected in place — true for `portfolio.py`'s exposure/delta/mark functions, never true for the
+risk manager.
+
+**#4 (never-answered keys leak).** `reconcile_declared_positions()` only ever swept keys with a
+recorded "yes" answer. A key that was sighted/confirmed/prompted but never answered, then vanished
+from the broker, leaked its `last_seen`/`confirmed`/`msgid` rows forever — a LATER, genuinely new
+sighting of the identical contract then skipped the R5 debounce entirely (stale `confirmed` flag)
+and never re-prompted (stale `msgid` read as "already asked"). Fixed with a second sweep pass over
+`_LAST_SEEN_PREFIX` keys with no recorded answer, and a shared `_clear_key_state()` helper (one
+place that knows every prefix this module writes, so a cleanup path can no longer miss one). "no"-
+answered keys are deliberately left untouched, unchanged from before.
+
+**#5 (declared key is contract identity only).** `is_declared()` matched on
+`symbol:strike:right:expiry` alone, no quantity — a later, undeclared size increase on an already-
+approved contract (declare −1, broker later shows −3) went unnoticed by every risk gate. New
+`manual_positions.declared_quantity_matches()` compares the CURRENT broker quantity against the
+quantity recorded at prompt time (`prompt_if_needed` now stamps `manual_position_declared_qty_
+<key>`); a mismatch clears only the answer/msgid/qty (deliberately NOT the sighting/confirmed
+state), so the size change freezes and re-prompts on the SAME pass rather than waiting through a
+fresh 2-sighting debounce — a size change on an approved contract is MORE suspect than a brand-new
+untracked one, not less. A key declared before this quantity tracking existed (no recorded qty) is
+grandfathered as a match rather than auto-frozen on deploy — preserves every pre-existing
+`test_w22_*` fixture and any live declared position with no baseline to compare against.
+
+**#6 (`reconcile_now()` discards its result).** Restored the same `closing_exit_orders` →
+`executor.adopt_exit_order()` re-adoption the startup and post-market call sites already do — a
+kept-CLOSING trade's working exit order answered via Telegram used to come back invisible. Added a
+connection guard (`if not self._ibkr.connected: return`) — `reconcile_now` runs DETACHED from a
+Telegram reply at ANY time, including mid-shutdown after IBKR disconnects. Added
+`manual_positions.drain_background_tasks()` (bounded `asyncio.wait` over the module's own
+`_background_tasks` set) and wired it into `main.py`'s shutdown, between the poller cancellation
+and `ibkr.disconnect()` — an answer recorded right as the bot shuts down no longer risks its
+detached `reconcile_now()` call being abandoned mid-write.
+
+**Verification.** New `tests/test_w30_declared_position_cache_class.py`, 19 tests, each written
+against the plan's own acceptance-test table (finding #1 pinned first, as recommended, via the
+negative-control "empty cache + pre-existing halt file -> survives" case). Full re-run of every
+file the plan named as regression-sensitive — `test_w22_manual_positions.py`,
+`test_w22_reconciler_declared_positions.py`, `test_w22_telegram_primitives.py`,
+`test_r19_state_ml_fixes.py`, `test_w2_executor_risk_gates.py`, `test_w2_orchestrator_gates.py`,
+`test_hot_path_smoke.py` — **191 passed, 0 failed, 0 skipped**, zero edits needed to any of them.
+Full fast lane (`pytest tests/ -q -m "not ibkr and not slow"`) kicked off separately to confirm
+against the 1908-passed/44-skipped/1-known-failed baseline; long-running, result to be confirmed
+before deploy. `python -m compileall -q src`, `scripts/typecheck.py` and
+`scripts/smoke_deploy.py` still to run before this is called deploy-ready.
+
+**STATE AT HANDOFF:** not yet committed, not deployed. `data/HALT_UNTRACKED` semantics changed in
+the safe direction only (an ambiguous empty cache now REFUSES to clear the freeze, where before it
+cleared unconditionally) — per the plan's own flag, worth the operator's eye before the next
+restart, same as W28/W29 which remain staged ahead of this. `reconciler.py` owns exactly-once
+booking and `HALT_UNTRACKED`, so this keeps its own deploy lane rather than batching with W28/W29.
+NEXT: confirm the full fast-lane run, `compileall`, `scripts/typecheck.py`,
+`scripts/smoke_deploy.py` all pass; commit (`W30: ...`); then W31 (R26 F4) is next in the agreed
+sequence.
+
+
+## 2026-09-17 - W30 COMPLETED — picked up where the prior session's agent left off
+
+The entry above (W30 EXECUTED) was written by the session that implemented this wave; that session
+ended while the full fast lane was still running, before compileall/typecheck/smoke_deploy/commit.
+This entry closes it out. Every claim in the entry above was independently re-verified here, not
+taken on trust — the same two-lens standard this ledger has applied to every other wave and to R26
+itself.
+
+[1] CODE REVIEW, independent of the prior entry's own description. Read all four diffs
+    (`reconciler.py`, `manual_positions.py`, `orchestrator.py`, `main.py`) line by line before
+    trusting the summary. Two things worth recording:
+      - The seam fix reuses `_fresh_leg_keys()` — the SAME key-builder `sweep_stale_pending`'s async
+        wrapper already uses — for the fresh-confirmed path, so there is no key-shape mismatch
+        between the cache-built `ibkr_map` and the fresh-built confirmation set. Checked directly:
+        both go through `_make_position_key` for options and the identical `f"{symbol}:STK"` form
+        for stock. A mismatch here would have made every declared position look absent — a WORSE
+        bug than the one being fixed — so this was verified rather than assumed.
+      - Finding #3's `avgCost`-based fallback for a long-option declared position: `avgCost * qty`
+        with no `x100`. Checked against the one other precedent in this codebase
+        (`account.py:197`, `abs(p.position) * p.avgCost`) — consistent; ib_insync's `avgCost` for
+        options is already the per-contract total, not per-share.
+
+[2] A REAL DEFECT FOUND AND FIXED: a literal `—` — six raw ASCII characters, NOT an em-dash —
+    sitting in a checked-in comment in `main.py`, confirmed via the file's raw bytes (not a `git
+    diff` rendering artifact). Purely cosmetic; harmless to any test or behaviour. Scanned all four
+    changed files plus the new test file for the same class of slip: two more `\u` hits exist, both
+    in `orchestrator.py`, both PRE-EXISTING and intentional (`﻿`, describing an actual BOM bug
+    in a docstring) — confirmed via `git diff` that neither is part of this wave. Fixed at the byte
+    level after the standard `Edit` tool proved unable to target it: passing `—` as a search
+    pattern gets silently decoded to a real em-dash by JSON/string-literal interpretation before
+    the tool ever sees it, so old_string and new_string looked identical to the tool twice in a
+    row. `\\u2014` (escaping the backslash itself) was the correct form and still didn't match
+    byte-for-byte, so the fix went through direct binary read/replace/write, then re-verified via
+    `compileall` and a byte-level re-read confirming the correct UTF-8 em-dash (`\xe2\x80\x94`).
+
+[3] THE NEGATIVE CONTROL FOR FINDING #1 (`HALT_UNTRACKED`, the sharpest of the six — a kill-switch
+    file `docs/RUNBOOK.md` makes a human act) WAS PROVEN LOAD-BEARING BY EXECUTION, not assumed from
+    reading the test. The seam gate was neutralised in place (`if False and not ibkr_positions:`,
+    reproducing the pre-W30 cache-trusting behaviour) and `TestSeamRequiresAuthoritativeConfirmation`
+    re-run: exactly the two tests asserting the ambiguous-cache claim FAILED —
+    `test_halt_file_survives_when_fresh_query_cannot_confirm` and
+    `test_declared_position_state_survives_when_fresh_query_cannot_confirm` — with the log showing
+    `manual_position_closed_confirmed` firing on an UNCONFIRMED empty cache, the exact defect R26
+    reproduced. The other three tests in that class (confirmed-flat, confirmed-gone, legacy-client)
+    correctly stayed green, because their scenarios do not depend on the branch that was disabled —
+    both the real fix and the disabled version resolve to the same empty confirmation set when
+    cache and fresh query already agree. Real fix restored immediately after; diff verified
+    byte-identical to before (`100 insertions` in both `git diff --stat` reads); all 19 tests green
+    again.
+
+[4] THE PRIOR SESSION'S PYTEST OUTPUT WAS UNRECOVERABLE. Its process redirected stdout to a macOS
+    temp file that had already been unlinked from disk while still open (`lsof` showed the fd; the
+    path itself read empty). Rather than trust the "191 passed" / "kicked off separately" language
+    in the entry above on faith, the full fast lane was re-run independently end to end.
+
+[5] INDEPENDENT FULL LANE: **1925 passed / 44 skipped / 3 failed** in 29:08. One is the known local
+    `.env` `test_r19_config_authority` case. The other two are NEW: `test_watchdog.py::
+    TestOverallHealth::test_all_healthy` and `::test_one_down_marks_overall_down`.
+    DIAGNOSED, not dismissed: `watchdog.py` is untouched by every file in this wave's diff, and the
+    two W30-adjacent repro attempts both came back clean —
+    `pytest tests/test_w30_declared_position_cache_class.py tests/test_watchdog.py` (31 passed) and
+    the full 9-file slice of everything collected between them (`test_w2_*` through `test_w7_*`,
+    276 passed). `Watchdog` itself carries no module-level or class-level shared state — the
+    fixture builds a fresh instance per test — and `get_health()`'s HEALTHY/DOWN computation
+    compares `time.time()` against `self._heartbeat_timeout`, which this test file's fixture sets
+    to **5.0 seconds** (the production default is 120.0). Re-run five consecutive times outside the
+    full-suite load: 5/5 clean. Conclusion: a pre-existing, too-tight wall-clock margin that this
+    session's ~29-minute, ~2,000-test run was enough to trip under ordinary system load — not a
+    W30 regression, and not order-dependent pollution (the isolation attempts rule that out).
+    REGISTERED, NOT FIXED: `tests/test_watchdog.py`'s `heartbeat_timeout=5.0` fixture margin is
+    fragile under a loaded full-suite run. Out of W30's scope; a future session should widen it or
+    mock the clock rather than compare live wall-clock time against a 5-second window.
+    ACCOUNTING CHECK on the delta, run before trusting the diagnosis: baseline (W29, `d84957a`) was
+    1908 passed / 44 skipped / 1 failed. `1908 - 2 (flaked) + 19 (new W30 tests) = 1925` — matches
+    exactly, skip count unchanged, confirming there is no OTHER unexplained shift anywhere in the
+    ~2,000-test suite.
+
+[6] REMAINING GATES, run after the diagnosis above: `compileall` OK (including the byte-fix in
+    [2]); `scripts/typecheck.py` OK; `scripts/smoke_deploy.py` -> SMOKE PASS (13 checks).
+
+[7] A COLLISION AVOIDED, not hit. `git fetch` surfaced one new commit on `origin/feature/event-
+    straddle` since this wave began — `c368a0f`, "Make the W21 timestamp tests run on the Windows
+    box (R26 F5 #7)" — touching only `tests/test_w21_tz_aware_trade_timestamps.py`. Checked before
+    committing: zero overlap with any file this wave touches. Rebased cleanly.
+
+STATE AT HANDOFF: W30 committed. **NOT DEPLOYED** — `reconciler.py`, `manual_positions.py`,
+`orchestrator.py` and `main.py` are all loaded by the running bot (supervisor 58879 / bot 60685,
+still on W26+W27). W28, W29 and now W30 are all staged, all pushed, none live. Per the plan's own
+flag: `data/HALT_UNTRACKED` semantics changed in the SAFE direction only (an ambiguous empty cache
+now REFUSES to clear the freeze, where before it cleared unconditionally) — still worth the
+operator's eye before the next restart, same as W28/W29.
+NEXT: W31 (R26 F4, the W25 sizing self-test finished — breaker arm still fail-open, sized from a $1
+probe wing; `generate_signals` still never executed) is next in the agreed sequence. The watchdog
+timing-margin item from [5] and R26 F5 #7's own residuals are both cheap housekeeping behind it.
+
+---
