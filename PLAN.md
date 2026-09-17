@@ -4471,3 +4471,147 @@ a garbled mid-edit fragment. Correct reading, no facts changed: new PIDs are sup
 append-only rule rather than fixed in place.
 
 ---
+
+## 2026-09-17 - W26 EXECUTED — the entry-budget give-back + the cluster-scoped cooldown
+
+(b) from the W25 pointer, both findings from register-triage batch 1, both on the live entry path.
+Register-don't-fix does not apply to the two named findings. STAGED, NOT DEPLOYED.
+
+[1] data-integrity-07 — FIXED, and LATENT rather than materialized, measured before planning.
+    The live DB has ZERO `stale_pending_never_filled` rows; 10 trades placed, 10 closed, and
+    `daily_stats.trades_taken` reads 5 + 5 — matching exactly. So the counter has never actually
+    been wrong in the live record. Worth fixing anyway, and the consequence is larger now than when
+    it was found: the first-hour budget is 2, so ONE phantom halves first-hour capacity.
+    The sweep (`reconciler._sweep_stale_pending`) now calls a new `_refund_entry_budget` when it
+    books a never-filled close. Three correctness points, each of which would make this a WORSE bug
+    than the one being fixed if got wrong:
+      (a) GATED ON THE CAS. `close_trade` returns "True iff the close landed" and the sweep
+          DISCARDED it, then ran `closed += 1` unconditionally — so a lost CAS was already being
+          miscounted as a close. A refund on that path would credit a slot back for an order that
+          actually FILLED. Now captured; on False it refunds nothing, counts nothing, and logs
+          `sweep_close_lost_cas`.
+      (b) THE TRADE'S OWN ENTRY DATE, never today. `reconcile()` runs on every startup, so a
+          phantom placed Monday is typically swept Tuesday morning. Crediting TODAY would hand back
+          a slot today never spent, and `taken = -1` makes `_get_trade_budget` return
+          `max_trades + 1` — a FAIL-OPEN on the daily cap, produced by a data-integrity fix.
+      (c) FLOORED AT 0. A negative counter inflates the budget the same way. W25 shipped the
+          mirror image of this lesson (a floor of 1 manufacturing a position where 0 was correct):
+          a floor is only safe in the direction that cannot create permission.
+    REJECTED ALTERNATIVE, recorded because it is the obvious one: move the increment to
+    fill-confirmation so the counter only counts real trades. The budget's purpose is pacing
+    PLACEMENT (2 in the first hour, 4 by mid-day); counting only fills lets a whole scan cycle place
+    orders before any fill, bypassing the tiers entirely. Same shape as W25's rejected `max(0,...)`
+    — the tidier-looking fix changes trading behaviour.
+
+[2] logic-exit-risk-03 — FIXED, with a DELIBERATE DEVIATION from the literal spec, stated here
+    rather than left to read as a faithful implementation.
+    One authority now: `correlation.symbol_clusters()` / `cluster_symbols()`. The fact lived in
+    three shapes before — `CorrelationGuard._same_sector_cluster` (pairwise),
+    `RiskManager._count_correlated_positions` (re-inlining the intersection off a direct
+    SECTOR_GROUPS import), and NOT AT ALL in the cooldown, which is the defect. Both existing
+    consumers delegate. The delegation is deliberately NOT `sym2 in cluster_symbols(sym1)`:
+    cluster_symbols() always contains the symbol itself, which would make
+    `_same_sector_cluster("GLD","GLD")` True where the original is False — unreachable through
+    check_correlation today (the `existing == new_symbol` arm short-circuits) but an exact
+    delegation cannot be broken by a future caller that does reach it. Pinned by a test.
+    THE WINDOW IS GRADUATED, and this is the operator decision of the wave: the stopped symbol keeps
+    the full R12-B4 one-trading-day window; cluster SIBLINGS get
+    `risk.post_stop_cluster_cooldown_minutes` (default 120, `0` disables and restores the exact
+    pre-W26 behaviour without a code change). Strict cluster-wide scoping — the finding as written —
+    would darken the ENTIRE BOOK, because the universe is a single cluster, for the rest of the
+    session AND all of the next (a Monday 14:00 stop clears only Wednesday: Tuesday's cutoff is
+    Monday 09:30). With a touch stop as the primary loss exit and a volume-tuned config
+    (max_daily_trades 12, min_confidence 0.50, 1 contract "= max # of trades") that is close to
+    "the first stop ends the trading day". The hazard R12-B4 actually targets is IMMEDIATE re-entry
+    into the same adverse move — the live 08-24 QQQ instance was 13 minutes. So: faithful for the
+    stopped symbol, shorter for siblings. THIS DEVIATES from the spec's "one trading day" for
+    siblings; a future reader should treat 120 as a tunable, not as R12-B4.
+    The verdict return type changed from a bare exit_time to `CooldownBlock(symbol, exit_time)`
+    because the blocking symbol is no longer necessarily the blocked one — an operator reading
+    "QQQ entry blocked" otherwise has no way to see that a SPY stop caused it. The log now carries
+    `stopped_symbol` and `via_cluster`.
+
+[3] AN EXISTING TEST ASSERTED THE DEFECT, and was split rather than deleted.
+    `test_r21_post_stop_cooldown.py::test_other_symbol_unaffected` asserted that a QQQ touch stop
+    does NOT block SPY — which is precisely logic-exit-risk-03. The assertion was not wrong so much
+    as under-specified: what it protected is that an UNRELATED symbol is not swept up, and SPY/QQQ
+    were a poor example of "unrelated". Replaced by `test_unrelated_symbol_unaffected` using GLD
+    (in no SECTOR_GROUPS set) with sibling scoping ON; the sibling case is pinned in the new file.
+    That file's `_orch()` helper also had to start carrying Settings, and its comment claiming it
+    "touches no orchestrator state besides the DB file" was corrected. It defaults to
+    sibling_minutes=0 so every other test in it keeps measuring exactly what R12-B4/R22 wrote it to
+    measure.
+
+[4] MY OWN PLAN'S ITEM 3 WAS WRONG BY 16x, and the guard was NOT shipped.
+    The plan said "three live `date.today()` sites" and proposed extending W20's naive-clock
+    class-guard with a 3-site allowlist. That count came from grepping `src/ait/risk/` and
+    `src/ait/bot/` only. An AST sweep of `src/ait` (call nodes, so docstrings and comments are
+    excluded — the raw grep's ~50 was itself inflated by a docstring usage example in
+    economic_calendar.py and R17's own fix-note comment in earnings.py) finds **49 REAL executable
+    sites**: monitoring 16, data 15, dashboard 4, ml 4, learning 3, bot 2, execution 2,
+    diagnostics 1, risk 1, strategies 1.
+    An allowlist of 49 is a catalogue, not a guard, and scoping one to risk/+bot/ would have
+    encoded my own bad grep into the suite while giving false comfort. So nothing shipped.
+    THE LIVE-PATH SUBSET IS SHARPER THAN THE PLAN SAID, which is the reason this needs its own wave:
+    `options_chain.py` x5 (:209, :301, :340, :550, :551) computes DTE, which drives STRIKE AND
+    EXPIRY SELECTION; `iron_condor.py:104` feeds DTE into the wing-width formula
+    (`sqrt(dte/365)`) — the very function W25's coherence check calls; `portfolio.py:467` is exit
+    DTE and `:772` days-to-earnings; `orchestrator.py:2650` is the earnings blackout ENTRY gate;
+    `economic_calendar.py` x6 resolves macro-blackout dates; `risk/manager.py:132` is the
+    losing-days throttle. On this CEST box `date.today()` rolls at 18:00 ET, so every evening
+    evaluation of these asks about the wrong day.
+    ALSO REGISTERED: W20's class-guard covers `datetime.now()` and NOT `date.today()`, so the guard
+    that was supposed to catch the next instance of this family cannot see any of these 49. And
+    `earnings.py:88` carries a comment showing R17 already fixed ONE instance of exactly this class
+    — instance-fixed, class left open, which is the arch-04 pattern R25 named.
+    WANTS THE CENSUS TREATMENT W17 GAVE THE FAIL-OPEN CLASS (355 except clauses -> 177 candidates
+    -> 120 traced -> 12-site ranked shortlist), as its own wave. Not scheduled.
+
+[5] COLLATERAL FROM MY OWN EARLIER CHANGE, found here and fixed as a class.
+    `AIT_SIMULATED_CAPITAL=10000` (added to `.env` earlier today) leaked into every test run and
+    silently rewrote risk-gate arithmetic: the per-trade 3% cap became $300 instead of $3,000, which
+    broke two PASSING `test_w2_orchestrator_gates::TestEntryVixUsesTheValidatedValue` tests that
+    assert on a $380 max_loss and have nothing to do with simulated capital. I ran `smoke_deploy`
+    after that `.env` edit and NOT the suite, which is how it was missed — so the real suite
+    baseline was silently 1837/3, not 1840/1, between that change and this wave.
+    Fixed in `tests/conftest.py` as an autouse fixture that unsets the var for the whole suite,
+    rather than patching the two tests: no test should depend on an operator's local `.env`, and
+    pinning NLV in those two would leave the next env var to do the same thing. Same isolation
+    family as the known-failing `test_r19_config_authority::test_applier_and_readers_share_one_table`
+    (failing on this box since W16 for exactly this reason). Verified no test sets or wants the var.
+
+[6] VERIFICATION. `tests/test_w26_budget_and_cluster_cooldown.py`, 19 tests.
+    - NEGATIVE CONTROL per finding. For data-integrity-07 the real sweep runs with the refund
+      disabled — the literal pre-W26 path — and the slot is asserted still spent, with the PREMISE
+      (a never-filled close really was booked) asserted first so it cannot pass by not sweeping.
+    - A WIRING GUARD, not just a helper test: the refund helper can be perfect while the sweep
+      stops calling it, so one test asserts refunds == bookings on the never-filled path.
+    - BOTH HALVES of the graduated contract (sibling clears after its window while the stopped
+      symbol does not), and the `0` escape hatch — an untested escape hatch is not an escape hatch.
+    - Gates: full fast lane **1859 passed / 43 skipped / 1 failed** (the known local-`.env` case).
+      Count reconciled rather than assumed: the pre-W26 baseline was **1840**, not the 1839 recorded
+      at W25's lane, because cf2911c added one test afterwards and only that file was re-run.
+      1840 + 19 = 1859. `compileall` OK, `scripts/typecheck.py` OK, `smoke_deploy.py` SMOKE PASS.
+
+STATE AT HANDOFF: branch feature/event-straddle, HEAD 78d49c7. **NOT DEPLOYED** — `orchestrator.py`,
+`reconciler.py`, `correlation.py`, `manager.py` and `settings.py` are all loaded by the running bot
+(supervisor 25177 / bot 25224), so the process is still pre-W26 and W26 is not live until the
+operator restarts. Book flat, entries unfrozen, no kill-switch files, AIT_SIMULATED_CAPITAL=10000
+active in the live process.
+NEXT, re-ranked with (b)'s first half now closed:
+  (a) regress-live-06 — the credit floor is enforced at reprice but NOT at initial placement. Its
+      own wave with a live probe, per the batch-1 ranking: it touches live entry pricing.
+  (b) The 10 remaining batch-3 fail-open sites, consequence-ranked in
+      reports/w17_batch3_failopen_census_20260916.md. Highest: #2 reconciler.py:1083
+      (HALT_UNTRACKED never written) and #3 orchestrator.py:701 (one unparseable exit_time silently
+      drops realized P&L from the day).
+  (c) THE date.today() CENSUS from [4] — 49 sites, live-path subset touching strike/expiry
+      selection, wing width, both blackout gates and exit DTE. New, and arguably outranks (b):
+      unlike the fail-open sites it is UNCONDITIONAL, not fault-gated — every evening evaluation is
+      already wrong, no trigger required.
+  (d) docs-policy-04's RUNBOOK fix (name master.py's 2-minute combined_health_check as the thing to
+      stop; drop the stale keeper_ait.bat path).
+  (e) Triage batch 2 (~167 remaining R24 + carried-over findings) + the dedup pass from batch 1 [6].
+  Unchanged: arch-01..04 and qual-01/02/04 remain untouched since R25.
+
+---
