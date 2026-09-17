@@ -1224,7 +1224,26 @@ class TradingOrchestrator:
         # (and would be ~65x wrong at the planned $3k go-live scale).
         if account_snapshot and current_capital > 0:
             try:
-                self._state.set_state("last_net_liquidation", str(current_capital))
+                # W29 (R26 F5 #6): persist the UNSCALED NLV. current_capital is
+                # the snapshot's net_liquidation, which AIT_SIMULATED_CAPITAL
+                # scales on purpose so the RISK STACK sizes as a small account.
+                # This row is not risk input -- capital_base() resolves it as
+                # the PERFORMANCE DENOMINATOR ahead of the default, so writing
+                # the scaled figure re-scores the whole track record: the same
+                # $863 drawdown reads 0.43% against $201k and 8.29% against
+                # $10k, crossing the project's own <8% go-live gate, while
+                # go_live.py (which divides by max_concurrent_car) stays right
+                # and the dashboard disagrees with the scorecard ~72x.
+                # The back-compat fallback lives in _reporting_nlv().
+                # KEEP THE set_state CALL ON ONE LINE: test_w18_gateway_port_
+                # and_throttle::test_dashboard_reads_a_key_that_is_actually_
+                # written greps the literal `set_state("last_net_liquidation"`
+                # to prove the dashboard's key has a writer. Wrapping the call
+                # across lines breaks that substring and fails a test that has
+                # nothing wrong with its INTENT -- only its implementation.
+                # (Source-string assertion; registered for R26's F7 sweep.)
+                _reporting = self._reporting_nlv(account_snapshot)
+                self._state.set_state("last_net_liquidation", str(_reporting))
             except Exception:  # noqa: BLE001
                 pass
         tier_config = self._capital_tiers.get_config(current_capital)
@@ -2017,6 +2036,31 @@ class TradingOrchestrator:
         if max_loss > 0:
             return max_loss * max(1, int(quantity))
         return 0.0
+
+    @staticmethod
+    def _reporting_nlv(snapshot) -> float:
+        """W29 (R26 F5 #6): the NLV that belongs in the PERFORMANCE denominator.
+
+        `snapshot.net_liquidation` is deliberately SCALED when
+        AIT_SIMULATED_CAPITAL is set, so the whole risk stack sizes as a small
+        account. That value must never reach `bot_state.last_net_liquidation`,
+        because `capital_base()` resolves that row ahead of its default and every
+        drawdown/return percentage divides by it. Persisting the scaled figure
+        re-scores the entire track record: the same $863 drawdown reads 0.43%
+        against $201k and 8.29% against $10k — across the project's own <8%
+        go-live gate — while `reporting/go_live.py` (which divides by
+        `max_concurrent_car`) stays correct, so the scorecard and the dashboard
+        disagree ~72x about one book.
+
+        A separate method rather than an inline expression so a test can drive
+        the real decision instead of re-implementing it (R26 F7:
+        "negative controls reimplement the line under test").
+
+        `or net_liquidation` keeps snapshots built before this field existed
+        working, and makes the unset-AIT_SIMULATED_CAPITAL path a no-op.
+        """
+        return (getattr(snapshot, "real_net_liquidation", 0.0) or 0.0) or float(
+            getattr(snapshot, "net_liquidation", 0.0) or 0.0)
 
     def _get_trade_budget(self) -> int:
         """Return how many trades are allowed this scan based on time of day.

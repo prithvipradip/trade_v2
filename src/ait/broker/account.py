@@ -29,6 +29,12 @@ class AccountSnapshot:
     unrealized_pnl: float = 0.0
     realized_pnl: float = 0.0
     cash_balance: float = 0.0
+    # W29: the UNSCALED broker NetLiquidation. Equal to net_liquidation unless
+    # AIT_SIMULATED_CAPITAL is set, in which case net_liquidation is the scaled
+    # value the RISK STACK must see and this is the real one REPORTING must use.
+    # Defaults to 0.0 so older callers/snapshots keep working; readers should
+    # use `real_net_liquidation or net_liquidation`.
+    real_net_liquidation: float = 0.0
 
 
 class AccountManager:
@@ -213,6 +219,15 @@ class AccountManager:
         # actual go-live configuration (e.g. $2k CAD ~= $1.4k USD -> MICRO
         # tier, SPY credit spreads) on the big paper account. Opt-in via env.
         import os as _os
+        # W29 (R26 F5 #6): capture the real NLV BEFORE any scaling. The block
+        # below rewrites values["NetLiquidation"] in place, so after it runs the
+        # unscaled figure is unrecoverable -- and orchestrator.py persists what
+        # it finds as bot_state.last_net_liquidation, which capital_base()
+        # resolves as the PERFORMANCE DENOMINATOR. Scaling the risk stack is the
+        # point; scaling the historical denominator silently re-scores the track
+        # record (a $863 drawdown reads 0.43% at $201k and 8.29% at $10k, across
+        # the project's own <8% go-live gate).
+        _real_nlv_unscaled = float(values.get("NetLiquidation", 0) or 0)
         _sim = _os.environ.get("AIT_SIMULATED_CAPITAL")
         if _sim:
             try:
@@ -239,6 +254,7 @@ class AccountManager:
             unrealized_pnl=float(values.get("UnrealizedPnL", 0)),
             realized_pnl=float(values.get("RealizedPnL", 0)),
             cash_balance=float(values.get("CashBalance", 0)),
+            real_net_liquidation=_real_nlv_unscaled,
         )
         self._last_fetch = now
         self._stale_escalated = False  # R17: outage over — re-arm the escalation latch
