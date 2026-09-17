@@ -764,6 +764,59 @@ class PositionReconciler:
         finally:
             self._fresh_keys_for_sweep = None
 
+    def _refund_entry_budget(self, trade) -> None:
+        """W26 (data-integrity-07): give back the intraday entry slot a phantom took.
+
+        `stats.trades_taken += 1` fires when an order is PLACED
+        (orchestrator.py, inside `if trade_id:`) and had NO decrement anywhere,
+        so an order that never filled consumed a trade slot permanently.
+        _get_trade_budget returns `min(budget, max_trades) - taken`, and the
+        first-hour budget is 2 — one phantom halved first-hour capacity for the
+        rest of the session.
+
+        Two correctness points, both of which would turn this fix into a worse bug
+        if got wrong:
+
+        * THE TRADE'S OWN DATE, never today. reconcile() runs on every startup, so
+          a phantom placed Monday is typically swept Tuesday morning. Decrementing
+          TODAY would credit a slot that today never spent, and `taken = -1` makes
+          the budget expression return max_trades + 1 — a fail-open on the daily
+          cap, from a data-integrity fix.
+        * FLOOR AT 0. A negative counter inflates the budget the same way. (W25
+          shipped the mirror-image lesson: there a floor of 1 manufactured a
+          position where 0 was correct. A floor is only ever safe in the
+          direction that cannot create permission.)
+
+        Never raises: the sweep's job is booking, and a stats hiccup must not
+        abort it or leave the trade wrongly open.
+        """
+        try:
+            entry_date = parse_trade_ts(trade.entry_time).date()
+        except (ValueError, TypeError) as e:
+            log.warning("budget_refund_skipped_unparseable_entry_time",
+                        trade_id=getattr(trade, "trade_id", None),
+                        entry_time=getattr(trade, "entry_time", None), error=str(e))
+            return
+        try:
+            stats = self._state.get_daily_stats(entry_date)
+            before = int(stats.trades_taken or 0)
+            if before <= 0:
+                # Nothing to give back. Not an error: the counter may legitimately
+                # be 0 on a restored/backfilled row, and driving it negative is
+                # the one outcome this must never produce.
+                log.info("budget_refund_noop", trade_id=trade.trade_id,
+                         date=entry_date.isoformat(), trades_taken=before)
+                return
+            stats.trades_taken = before - 1
+            self._state.update_daily_stats(stats)
+            log.info("budget_refunded_never_filled",
+                     trade_id=trade.trade_id, symbol=trade.symbol,
+                     date=entry_date.isoformat(),
+                     trades_taken_before=before, trades_taken_after=before - 1)
+        except Exception as e:  # noqa: BLE001 — must never abort the sweep
+            log.warning("budget_refund_failed", trade_id=trade.trade_id,
+                        date=entry_date.isoformat(), error=str(e))
+
     def _sweep_stale_pending(self) -> int:
         """Close PENDING trades too old to still be live working orders.
 
@@ -876,12 +929,25 @@ class PositionReconciler:
                 # R16: CAS narrowed to PENDING — a concurrent promotion to
                 # FILLED (second process / broker-lag race) must always win
                 # over a $0 "never filled" booking.
-                self._state.close_trade(
+                # W26 (data-integrity-07): the return value was DISCARDED and
+                # `closed += 1` ran unconditionally, so a lost CAS was counted as
+                # a close. It also gates the budget give-back below: handing a
+                # trade slot back for an order that actually FILLED would be
+                # strictly worse than the bug being fixed.
+                _booked = self._state.close_trade(
                     trade_id=t.trade_id, exit_price=0.0, realized_pnl=0.0,
                     exit_reason_detailed=NEVER_FILLED_EXIT_REASON,
                     from_statuses=(TradeStatus.PENDING,),
                 )
+                if not _booked:
+                    log.warning("sweep_close_lost_cas",
+                                trade_id=t.trade_id, symbol=t.symbol,
+                                note="close CAS refused — the row left PENDING "
+                                     "concurrently (promoted to FILLED); neither "
+                                     "counted nor refunded")
+                    continue
                 closed += 1
+                self._refund_entry_budget(t)
                 log.warning("reconcile_stale_pending_closed",
                             trade_id=t.trade_id, symbol=t.symbol,
                             strategy=t.strategy, age_min=int(age_min))

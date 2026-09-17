@@ -14,6 +14,7 @@ import asyncio
 import time
 import traceback
 from datetime import date, datetime, timedelta
+from typing import NamedTuple
 
 from ait.bot.scheduler import MarketScheduler, TradingPhase
 from ait.bot.state import DailyStats, StateManager, TradeRecord, TradeStatus
@@ -65,6 +66,21 @@ log = get_logger("bot.orchestrator")
 # copies at the override and the neutral-only filter are set-membership-6, a
 # separate register entry, and are left untouched by this wave.)
 RANGE_GATED_STRATEGIES: frozenset[str] = frozenset({"iron_condor", "short_strangle"})
+
+
+class CooldownBlock(NamedTuple):
+    """W26: which stop is blocking, and when it closed.
+
+    The post-stop cooldown used to return a bare exit_time, which was enough
+    while it could only ever block the symbol it was asked about. Now that the
+    window is cluster-scoped (logic-exit-risk-03) the blocking symbol is often
+    NOT the blocked one, and an operator reading "QQQ entry blocked" has no way
+    to know a SPY stop caused it unless the verdict carries it.
+    """
+
+    symbol: str
+    exit_time: str
+
 
 def _cooldown_now() -> datetime:
     """Reference instant for the post-stop cooldown, AWARE ET.
@@ -2302,11 +2318,24 @@ class TradingOrchestrator:
                 "tables in economic_calendar.py — see logs for details."
             )
 
-    def _post_stop_cooldown_until(self, symbol: str) -> str | None:
+    def _post_stop_cooldown_until(self, symbol: str) -> CooldownBlock | None:
         """R12-B4 query, extracted so tests can execute it against a real DB.
 
-        Returns the exit_time of the most recent qualifying stop close inside
-        the cooldown window, else None.
+        Returns the most recent qualifying stop close inside the cooldown window
+        as (symbol, exit_time), else None. W26: carries the BLOCKING symbol
+        because it is no longer necessarily the symbol being blocked — an
+        operator seeing "QQQ entry blocked" needs to know a SPY stop caused it.
+
+        W26 (logic-exit-risk-03): the window is CLUSTER-SCOPED and GRADUATED.
+        This asked `WHERE symbol=?`, so a SPY touch stop left QQQ and IWM free to
+        re-enter the same move — and the bot's own SECTOR_GROUPS calls all three
+        one ~0.95 cluster, i.e. the same macro bet. Now:
+          - the stopped symbol ITSELF keeps the full one-trading-day window;
+          - cluster SIBLINGS get risk.post_stop_cluster_cooldown_minutes
+            (0 = disabled, restoring the pre-W26 per-symbol behaviour).
+        Graduated rather than cluster-wide-for-a-full-day because the universe is
+        a single cluster: the strict reading darkens the entire book for the rest
+        of the session and all of the next. See the config field's description.
 
         2026-08-25 defect: the query matched only '%stop_loss%', but the
         short-strike touch stop — live's PRIMARY loss exit since R12-B1 —
@@ -2321,28 +2350,67 @@ class TradingOrchestrator:
         numeric-pairs-02 (R22): the window is ONE TRADING DAY (the spec), not
         a flat 30 wall-clock hours — see _post_stop_cooldown_cutoff.
         """
+        from ait.risk.correlation import cluster_symbols
+
+        # Tolerant read on purpose. Several test files construct a deliberately
+        # minimal orchestrator (`__new__`, DB file only) to exercise this query in
+        # isolation, and that is a pattern worth keeping rather than forcing every
+        # caller to carry a Settings. Absent config means sibling scoping OFF —
+        # the pre-W26 per-symbol behaviour — which can only ever refuse FEWER
+        # entries, never more. Not a silent-disable hazard in production: the
+        # field has a Pydantic default and the models are extra="forbid", so a
+        # config missing it is a startup error, never a quiet 0.
+        _risk_cfg = getattr(getattr(self, "_settings", None), "risk", None)
+        _sibling_minutes = int(
+            getattr(_risk_cfg, "post_stop_cluster_cooldown_minutes", 0) or 0
+        )
+        # 0 = sibling scoping disabled: ask only about the symbol itself, which
+        # is byte-for-byte the pre-W26 query.
+        _scope = sorted(cluster_symbols(symbol)) if _sibling_minutes > 0 else [symbol]
+
+        # One query PER symbol, keeping the original single-row shape rather than
+        # an unbounded `IN (...)` fetch: the scope is <=4 symbols, only each
+        # symbol's MOST RECENT qualifying stop can block (an older one cannot
+        # block if the newest does not), and the proven query is reused verbatim.
         import sqlite3 as _sq12
+        _latest: list[tuple[str, str]] = []
         _con = _sq12.connect("file:data/ait_state.db?mode=ro", uri=True)
         try:
-            _row = _con.execute(
-                "SELECT exit_time FROM trades WHERE symbol=? AND status='closed' "
-                "AND (COALESCE(exit_reason_detailed,'') LIKE '%stop_loss%' "
-                "OR COALESCE(exit_reason_detailed,'') LIKE '%short_strike_touch%') "
-                "ORDER BY exit_time DESC LIMIT 1", (symbol,)).fetchone()
+            for _sym in _scope:
+                _row = _con.execute(
+                    "SELECT exit_time FROM trades WHERE symbol=? AND status='closed' "
+                    "AND (COALESCE(exit_reason_detailed,'') LIKE '%stop_loss%' "
+                    "OR COALESCE(exit_reason_detailed,'') LIKE '%short_strike_touch%') "
+                    "ORDER BY exit_time DESC LIMIT 1", (_sym,)).fetchone()
+                if _row and _row[0]:
+                    _latest.append((_sym, _row[0]))
         finally:
             _con.close()
-        if _row and _row[0]:
-            # W21: this reader selects exit_time in SQL but parses _row[0],
+
+        # numeric-pairs-02 (R22): the SELF window is ONE TRADING day, not a flat
+        # 30 wall-clock hours — see _post_stop_cooldown_cutoff. W26: the SIBLING
+        # window is a plain duration and needs no calendar, being scoped in hours
+        # rather than sessions.
+        _self_cutoff = _post_stop_cooldown_cutoff()
+        _sibling_cutoff = (
+            _cooldown_now() - timedelta(minutes=_sibling_minutes)
+            if _sibling_minutes > 0 else None
+        )
+
+        _blocks: list[CooldownBlock] = []
+        for _sym, _raw in _latest:
+            # W21: this reader selects exit_time in SQL but parses the row value,
             # so it carries no column name on the parse line and the migration's
             # column-name grep missed it. Found by the suite, not by reading.
-            _exit_t = parse_trade_ts(_row[0])
-            # numeric-pairs-02 (R22): was `_dt12.now() - _exit_t < 30h` — a
-            # flat wall-clock window with no calendar, so every Friday and
-            # pre-holiday stop bought ZERO post-stop sessions of cooldown.
-            # The spec is ONE TRADING day; see _post_stop_cooldown_cutoff.
-            if _exit_t >= _post_stop_cooldown_cutoff():
-                return _row[0]
-        return None
+            _exit_t = parse_trade_ts(_raw)
+            _cutoff = _self_cutoff if _sym == symbol else _sibling_cutoff
+            if _cutoff is not None and _exit_t >= _cutoff:
+                _blocks.append(CooldownBlock(symbol=_sym, exit_time=_raw))
+        if not _blocks:
+            return None
+        # Report the most recent blocking stop, so the log names the freshest
+        # cause rather than whichever symbol happened to sort first.
+        return max(_blocks, key=lambda b: parse_trade_ts(b.exit_time))
 
     def _duplicate_guard_verdict(self, signal) -> str:
         """fail-direction-08: verdict of the three duplicate-order layers.
@@ -3415,10 +3483,14 @@ class TradingOrchestrator:
         case this rule exists for.
         """
         try:
-            stopped_at = self._post_stop_cooldown_until(signal.symbol)
-            if stopped_at:
+            block = self._post_stop_cooldown_until(signal.symbol)
+            if block:
+                # W26: stopped_symbol is NOT always symbol — a cluster sibling's
+                # stop blocks too now, and the operator needs the cause named.
                 log.info("entry_blocked_post_stop_cooldown",
-                         symbol=signal.symbol, stopped_at=stopped_at)
+                         symbol=signal.symbol, stopped_symbol=block.symbol,
+                         stopped_at=block.exit_time,
+                         via_cluster=block.symbol != signal.symbol)
                 return True
             return False
         except Exception as e:  # noqa: BLE001

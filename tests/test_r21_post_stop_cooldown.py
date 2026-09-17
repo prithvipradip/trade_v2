@@ -12,13 +12,16 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timedelta
+from pathlib import Path
 
+from ait.config.settings import load_settings
 from ait.utils.time import ET, now_et
 
 import ait.bot.orchestrator as orch_mod
 from ait.bot.orchestrator import TradingOrchestrator
 
 LIVE_TOUCH_REASON = "short_strike_touch (spot 703.86 <= put 704.00)"
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 
 
 def _mk_db(tmp_path, reason: str, hours_ago: float = 1.0, symbol: str = "QQQ",
@@ -42,9 +45,24 @@ def _mk_db(tmp_path, reason: str, hours_ago: float = 1.0, symbol: str = "QQQ",
     con.close()
 
 
-def _orch() -> TradingOrchestrator:
-    # The helper touches no orchestrator state besides the DB file.
-    return TradingOrchestrator.__new__(TradingOrchestrator)
+def _orch(sibling_minutes: int = 0) -> TradingOrchestrator:
+    """W26: the helper now needs SETTINGS as well as the DB file.
+
+    The old comment ("touches no orchestrator state besides the DB file") stopped
+    being true when the cooldown became cluster-scoped and had to read
+    risk.post_stop_cluster_cooldown_minutes.
+
+    DEFAULT 0 = sibling scoping OFF, which keeps every test in this file measuring
+    exactly what R12-B4/R22 wrote it to measure: the SELF window, one symbol, the
+    trading-day calendar. The cluster behaviour is a separate contract and is
+    pinned in tests/test_w26_budget_and_cluster_cooldown.py rather than by
+    quietly re-purposing these.
+    """
+    o = TradingOrchestrator.__new__(TradingOrchestrator)
+    settings = load_settings(str(CONFIG_PATH))
+    settings.risk.post_stop_cluster_cooldown_minutes = sibling_minutes
+    o._settings = settings
+    return o
 
 
 def test_touch_stop_blocks_reentry(tmp_path, monkeypatch):
@@ -104,10 +122,23 @@ def test_window_expires_after_one_trading_day(tmp_path, monkeypatch):
         orch_mod._COOLDOWN_CUTOFF_CACHE.clear()
 
 
-def test_other_symbol_unaffected(tmp_path, monkeypatch):
-    _mk_db(tmp_path, LIVE_TOUCH_REASON)
+def test_unrelated_symbol_unaffected(tmp_path, monkeypatch):
+    """W26 REPLACES test_other_symbol_unaffected, which pinned the DEFECT.
+
+    The old test asserted that a QQQ touch stop does not block SPY. That is
+    exactly what logic-exit-risk-03 calls the bug: SPY and QQQ are the same
+    ~0.95 index cluster, so re-entering SPY after a QQQ stop IS re-entering the
+    same move. The assertion was not wrong so much as under-specified — what it
+    was really protecting is that an UNRELATED symbol is not swept up, and
+    SPY/QQQ were a poor choice of example.
+
+    GLD is in no SECTOR_GROUPS set, so it tests the intended property with
+    sibling scoping ON. The cluster-sibling case (a QQQ stop DOES block SPY) is
+    pinned in tests/test_w26_budget_and_cluster_cooldown.py.
+    """
+    _mk_db(tmp_path, LIVE_TOUCH_REASON)                    # QQQ stop, 1h ago
     monkeypatch.chdir(tmp_path)
-    assert _orch()._post_stop_cooldown_until("SPY") is None
+    assert _orch(sibling_minutes=120)._post_stop_cooldown_until("GLD") is None
 
 
 def test_open_trade_rows_ignored(tmp_path, monkeypatch):

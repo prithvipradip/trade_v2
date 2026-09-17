@@ -76,6 +76,19 @@ class RiskConfig(_StrictModel):
         description="Max simultaneous positions within one correlated cluster "
                     "(SPY/QQQ/IWM/DIA correlate ~0.95). Was a CorrelationGuard "
                     "code default — audit item 3.3.")
+    post_stop_cluster_cooldown_minutes: int = Field(default=120, ge=0, le=1440,
+        description="W26 (logic-exit-risk-03): post-stop re-entry cooldown for "
+                    "CLUSTER SIBLINGS of a stopped-out symbol. The stopped "
+                    "symbol itself keeps the full R12-B4 one-trading-day window; "
+                    "siblings get this shorter one. Graduated on purpose: the "
+                    "universe (SPY/QQQ/IWM) is ONE cluster, so applying the full "
+                    "trading-day window cluster-wide darkens the whole book for "
+                    "the rest of the session AND all of the next (a Mon 14:00 "
+                    "stop clears only Wed), which fights the volume-for-learning "
+                    "config. The hazard R12-B4 targets is IMMEDIATE re-entry into "
+                    "the same adverse move — the live 08-24 QQQ instance was 13 "
+                    "minutes. 0 DISABLES sibling scoping entirely, restoring the "
+                    "pre-W26 per-symbol behaviour without a code change.")
     max_credit_positions: int = Field(default=6, ge=1, le=20,
         description="Max simultaneous short-premium (credit) positions. The "
                     "delta gate is dead and the daily breaker only sees "

@@ -50,6 +50,10 @@ risk:
   max_position_risk_pct: 0.03          # Per-trade max_loss cap vs NLV (was hardcoded in manager.py)
   max_correlation: 0.75                # Correlation above which symbols count as the same bet
   max_correlated_positions: 2          # Positions per correlated cluster (was code default)
+  post_stop_cluster_cooldown_minutes: 120  # W26: post-stop re-entry block for CLUSTER SIBLINGS
+                                       # (SPY/QQQ/IWM are one cluster). The stopped symbol itself
+                                       # keeps the full 1-trading-day R12-B4 window; siblings get
+                                       # this. 0 = disable sibling scoping (pre-W26 behaviour).
   max_credit_positions: 6              # Cap on simultaneous short-premium positions (audit R2)
   # R20b follow-up: these three RiskConfig fields were claimed "relocated to
   # config.yaml" (PLAN.md R20 entry / settings.py descriptions) but were

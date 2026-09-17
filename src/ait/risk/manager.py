@@ -112,16 +112,16 @@ class RiskManager:
 
         Uses CorrelationGuard's sector groups as the quick heuristic.
         """
-        from ait.risk.correlation import SECTOR_GROUPS
-        count = 0
-        new_groups = {g for g, syms in SECTOR_GROUPS.items() if new_symbol in syms}
-        for sym in open_symbols:
-            if not sym or sym == new_symbol:
-                continue
-            sym_groups = {g for g, syms in SECTOR_GROUPS.items() if sym in syms}
-            if new_groups & sym_groups:
-                count += 1
-        return count
+        # W26 (logic-exit-risk-03): was a third re-implementation of the
+        # SECTOR_GROUPS intersection. Delegates to the one authority now — the
+        # same one the post-stop cooldown uses, so "same macro bet" cannot mean
+        # two different things in two gates.
+        from ait.risk.correlation import cluster_symbols
+        cluster = cluster_symbols(new_symbol)
+        return sum(
+            1 for sym in open_symbols
+            if sym and sym != new_symbol and sym in cluster
+        )
 
     def _count_recent_losing_days(self) -> int:
         """Count consecutive losing days in recent trading history."""

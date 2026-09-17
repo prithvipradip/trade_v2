@@ -20,6 +20,31 @@ def pytest_configure(config: pytest.Config) -> None:
         "excluded from the default selection, run nightly with -m slow",
     )
 
+@pytest.fixture(autouse=True)
+def _neutralise_simulated_capital(monkeypatch):
+    """W26: the suite must not inherit the operator's AIT_SIMULATED_CAPITAL.
+
+    That env var (broker/account.py) SCALES every account balance so the risk
+    stack sizes as if the account were smaller. It is a live operator setting
+    read from the gitignored .env, and it silently rewrote risk-gate arithmetic
+    underneath the tests: setting it to 10000 on 2026-09-17 turned the per-trade
+    3% cap from $3,000 into $300 and broke two passing
+    test_w2_orchestrator_gates tests that assert on a $380 max_loss — tests with
+    nothing to do with simulated capital.
+
+    Fixing the CLASS rather than those two tests: no test should depend on an
+    operator's local .env value, and the alternative (every account-sensitive
+    test pinning its own NLV) is the same bug waiting for the next env var. This
+    is the same isolation family as the known-failing
+    test_r19_config_authority::test_applier_and_readers_share_one_table, which
+    has failed on this box since W16 for exactly this reason.
+
+    No test sets or depends on this var (verified), so unsetting it is safe. A
+    test that ever WANTS it can monkeypatch it back inside its own body.
+    """
+    monkeypatch.delenv("AIT_SIMULATED_CAPITAL", raising=False)
+
+
 from ait.config.settings import (
     AccountConfig,
     MLConfig,

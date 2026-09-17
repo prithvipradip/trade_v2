@@ -26,6 +26,37 @@ SECTOR_GROUPS = {
 }
 
 
+def symbol_clusters(symbol: str) -> list[set[str]]:
+    """The SECTOR_GROUPS sets this symbol belongs to (may be more than one, or none).
+
+    W26: the one place that answers "which clusters is this symbol in?". Both
+    cluster_symbols() and CorrelationGuard._same_sector_cluster() are derived
+    views over this, so the membership fact has a single owner.
+    """
+    return [g for g in SECTOR_GROUPS.values() if symbol in g]
+
+
+def cluster_symbols(symbol: str) -> set[str]:
+    """Every symbol sharing a SECTOR_GROUPS cluster with `symbol`, itself included.
+
+    W26 (logic-exit-risk-03): the SINGLE authority on "is this the same macro
+    bet?". It existed three times before — CorrelationGuard._same_sector_cluster
+    (pairwise), RiskManager._count_correlated_positions (re-inlining the set
+    intersection off a direct SECTOR_GROUPS import), and NOT AT ALL in the
+    post-stop cooldown, which is the defect: the cooldown asked `WHERE symbol=?`
+    so a SPY touch stop left QQQ and IWM free to re-enter the same move the rule
+    exists to sit out. All three now route here.
+
+    A symbol in no known group returns just itself, so callers can always treat
+    the result as "the set to consider" with no None-handling. A symbol may sit
+    in more than one group; the union is returned.
+    """
+    out: set[str] = {symbol}
+    for g in symbol_clusters(symbol):
+        out |= g
+    return out
+
+
 class CorrelationGuard:
     """Prevents stacking correlated positions."""
 
@@ -112,8 +143,18 @@ class CorrelationGuard:
         strict threshold and admits a THIRD index short-vol condor while at
         the 2-position cluster cap. Two index ETFs are the same macro bet
         regardless of a marginal correlation print; membership in the same
-        SECTOR_GROUPS set always counts toward the cluster."""
-        return any(sym1 in g and sym2 in g for g in SECTOR_GROUPS.values())
+        SECTOR_GROUPS set always counts toward the cluster.
+
+        W26: delegates to symbol_clusters() so SECTOR_GROUPS has ONE owner —
+        this used to re-implement the intersection, as did
+        RiskManager._count_correlated_positions. Deliberately NOT written as
+        `sym2 in cluster_symbols(sym1)`: cluster_symbols() always includes the
+        symbol itself (callers want a usable set), which would make
+        _same_sector_cluster("GLD", "GLD") True where this returns False for a
+        symbol in no group. Unreachable through check_correlation today — the
+        `existing == new_symbol` arm short-circuits first — but an exact
+        delegation cannot be broken by a future caller that does reach it."""
+        return any(sym2 in g for g in symbol_clusters(sym1))
 
     def _get_correlation(self, sym1: str, sym2: str) -> float | None:
         """Get correlation between two symbols."""
