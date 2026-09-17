@@ -14,6 +14,7 @@ from ait.data.market_data import MarketDataService
 from ait.ml.drift import DriftDetector
 from ait.ml.ensemble import DirectionPredictor
 from ait.utils.logging import get_logger
+from ait.utils.time import today_et
 
 log = get_logger("ml.trainer")
 
@@ -88,7 +89,7 @@ class ModelTrainer:
         if self._last_train_date is None:
             return True
 
-        days_since = (date.today() - self._last_train_date).days
+        days_since = (today_et() - self._last_train_date).days
         if days_since >= self._config.retrain_interval_days:
             return True
 
@@ -180,10 +181,20 @@ class ModelTrainer:
             # so mtime is an honest lower bound on training recency.
             try:
                 from ait.ml.range_predictor import MODEL_DIR as _model_dir
+                from ait.utils.time import ET as _ET
                 for name in ("ensemble.pkl", "range.pkl", "vol_magnitude.pkl"):
                     f = _model_dir / name
                     if f.exists():
-                        candidates.append(datetime.fromtimestamp(f.stat().st_mtime))
+                        # W28: read the mtime IN ET. This is the one site in the
+                        # date.today() sweep that was not a mechanical swap: the
+                        # recovered date is subtracted from today's date below
+                        # and in needs_training(), so converting only THAT side
+                        # to ET would subtract an ET date from a host-local one —
+                        # re-creating the mixed-convention defect W21 spent a
+                        # whole wave removing. Both sides move together or
+                        # neither does.
+                        candidates.append(
+                            datetime.fromtimestamp(f.stat().st_mtime, tz=_ET))
             except Exception:  # noqa: BLE001
                 pass
 
@@ -193,7 +204,7 @@ class ModelTrainer:
         log.info(
             "last_train_date_recovered",
             trained=recovered.isoformat(),
-            age_days=(date.today() - recovered).days,
+            age_days=(today_et() - recovered).days,
             sources=len(candidates),
             hint="fresh artifacts -> boot retrain skipped (R9 fix)",
         )
@@ -272,7 +283,7 @@ class ModelTrainer:
                 except Exception as e:
                     log.warning("vol_mag_training_failed", symbol=symbol, error=str(e))
 
-        self._last_train_date = date.today()
+        self._last_train_date = today_et()
         self._drift_detector.acknowledge_retrain()
 
         # Auto-rollback: if new model is significantly worse, revert.

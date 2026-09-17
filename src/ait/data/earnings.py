@@ -15,7 +15,7 @@ from datetime import date, datetime, timedelta
 
 from ait.data.cache import TTLCache
 from ait.utils.logging import get_logger
-from ait.utils.time import now_et
+from ait.utils.time import now_et, today_et
 
 log = get_logger("data.earnings")
 
@@ -85,10 +85,12 @@ class EarningsCalendar:
         Danger zone = [earnings - buffer_before, earnings + buffer_after]
         Default: 2 days before through 1 day after earnings.
         """
-        # R17: was date.today() (server-local clock) instead of this
+        # R17: was `date.today()` (server-local clock) instead of this
         # codebase's ET convention -- a multi-hour window around midnight
         # UTC could misclassify a same-day earnings date as "already past".
-        check_date = check_date or now_et().date()
+        # W28 generalised that one-site fix into today_et(); this call was
+        # already correct, so it only adopts the shared name.
+        check_date = check_date or today_et()
         info = self.get_next_earnings(symbol)
 
         if info.next_earnings_date is None:

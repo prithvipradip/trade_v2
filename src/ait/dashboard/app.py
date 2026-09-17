@@ -50,7 +50,7 @@ _REAL_CLOSE_SQL = " ".join(
 # no import weight. If it is ever unreachable the module now fails LOUDLY at
 # import rather than rendering a plausible wrong number.
 from ait.config.runtime_env import capital_base as _capital_base  # noqa: E402
-from ait.utils.time import parse_trade_ts  # noqa: E402
+from ait.utils.time import parse_trade_ts, today_et  # noqa: E402
 
 
 def _annualization_factor(trades: list[dict]) -> float:
@@ -625,7 +625,7 @@ def _tab_portfolio_overview(conn: sqlite3.Connection) -> None:
 
     col1, col2, col3, col4 = st.columns(4)
 
-    today_str = date.today().isoformat()
+    today_str = today_et().isoformat()
     stats = _safe_query(
         conn, "SELECT * FROM daily_stats WHERE date = ?", (today_str,)
     )
@@ -967,7 +967,7 @@ def _live_vs_backtest_panel(conn: sqlite3.Connection) -> None:
     # Get live stats — last 30 days of closed trades.
     # Window on EXIT time: a trade opened 35 days ago but closed yesterday at
     # a big loss must count. Exclude bookkeeping closes (never_filled etc.).
-    end = date.today()
+    end = today_et()
     start = end - timedelta(days=30)
     live_trades = _safe_fetchall(
         conn,
@@ -2059,9 +2059,9 @@ def main() -> None:
 
     st.sidebar.divider()
     st.sidebar.header("Date Range Filter")
-    default_start = date.today() - timedelta(days=30)
+    default_start = today_et() - timedelta(days=30)
     start_date = st.sidebar.date_input("Start date", value=default_start)
-    end_date = st.sidebar.date_input("End date", value=date.today())
+    end_date = st.sidebar.date_input("End date", value=today_et())
 
     # --- Tabs ---
     tabs = st.tabs(

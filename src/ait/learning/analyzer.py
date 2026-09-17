@@ -17,7 +17,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from ait.utils.logging import get_logger
-from ait.utils.time import parse_trade_ts
+from ait.utils.time import parse_trade_ts, today_et
 from ait.reporting.go_live import (
     not_real_close_sql as _not_real_close_sql,  # W3/string-contracts-4
 )
@@ -80,7 +80,7 @@ class TradeAnalyzer:
     def analyze_all(self, lookback_days: int = 30) -> list[TradeInsight]:
         """Run all analyses and return actionable insights."""
         insights = []
-        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        cutoff = (today_et() - timedelta(days=lookback_days)).isoformat()
 
         trades = self._get_closed_trades(cutoff)
         if len(trades) < 5:
@@ -105,7 +105,7 @@ class TradeAnalyzer:
 
     def get_strategy_stats(self, lookback_days: int = 60) -> dict[str, StrategyStats]:
         """Get performance stats grouped by strategy."""
-        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        cutoff = (today_et() - timedelta(days=lookback_days)).isoformat()
         trades = self._get_closed_trades(cutoff)
 
         stats: dict[str, StrategyStats] = {}
@@ -154,7 +154,7 @@ class TradeAnalyzer:
 
     def get_symbol_stats(self, lookback_days: int = 60) -> dict[str, SymbolStats]:
         """Get performance stats grouped by symbol."""
-        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        cutoff = (today_et() - timedelta(days=lookback_days)).isoformat()
         trades = self._get_closed_trades(cutoff)
 
         stats: dict[str, SymbolStats] = {}

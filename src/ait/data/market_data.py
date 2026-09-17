@@ -31,6 +31,7 @@ from ait.broker.ibkr_client import IBKRClient
 from ait.data.cache import TTLCache
 from ait.utils.logging import get_logger
 from ait.config.runtime_env import contract_str  # R19: ONE authority for env-contract defaults
+from ait.utils.time import today_et
 
 log = get_logger("data.market")
 
@@ -106,7 +107,7 @@ def load_daily_ohlcv(
                  requested_days=days, expected_trading_days=_expected,
                  needed=_needed)
         try:
-            start = (date.today() - timedelta(days=days + 30)).isoformat()
+            start = (today_et() - timedelta(days=days + 30)).isoformat()
             ydf = yf.Ticker(symbol).history(start=start, interval="1d", auto_adjust=False)
             if not ydf.empty:
                 df = ydf[["Open", "High", "Low", "Close", "Volume"]].copy()
@@ -576,7 +577,7 @@ class MarketDataService:
             return None
 
         try:
-            end = date.today()
+            end = today_et()
             start = end - timedelta(days=int(days * 1.5))  # Extra days for non-trading days
 
             # Network iteration + DataFrame build both offloaded — the agg

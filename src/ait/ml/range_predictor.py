@@ -25,6 +25,7 @@ from sklearn.preprocessing import StandardScaler
 
 from ait.ml.features import FeatureEngine
 from ait.utils.logging import get_logger
+from ait.utils.time import today_et
 
 log = get_logger("ml.range_predictor")
 
@@ -307,7 +308,7 @@ class RangePredictor:
                         except Exception:
                             pass
                 self._symbol_models[symbol] = {
-                    "fitted_at": __import__("datetime").date.today().isoformat(),  # A7
+                    "fitted_at": today_et().isoformat(),  # A7
                     # Real label spec of THIS symbol's model — predictions must
                     # report these, not the instance defaults (R9 log fix).
                     "threshold": self._threshold,

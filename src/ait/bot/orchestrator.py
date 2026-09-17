@@ -53,7 +53,7 @@ from ait.strategies.base import CREDIT_STRATEGIES, SignalDirection
 from ait.strategies.selector import StrategySelector
 from ait.strategies.thompson import ThompsonSampler
 from ait.utils.logging import get_logger
-from ait.utils.time import next_market_open
+from ait.utils.time import next_market_open, today_et
 from ait.utils.time import now_et, parse_trade_ts
 
 log = get_logger("bot.orchestrator")
@@ -2656,7 +2656,7 @@ class TradingOrchestrator:
         if signal.expiry:
             from datetime import date as date_cls
             expiry_date = signal.expiry if isinstance(signal.expiry, date_cls) else date_cls.fromisoformat(str(signal.expiry))
-            if self._earnings.would_hold_through_earnings(signal.symbol, date.today(), expiry_date):
+            if self._earnings.would_hold_through_earnings(signal.symbol, today_et(), expiry_date):
                 log.info("trade_blocked_earnings", symbol=signal.symbol, expiry=str(signal.expiry))
                 return True  # symbol blocked through earnings
 
@@ -4038,7 +4038,7 @@ class TradingOrchestrator:
         self._prestamp_mtm_baseline(float(summary["total_unrealized_pnl"]))
 
         report = (
-            f"DAILY SUMMARY ({date.today().isoformat()})\n"
+            f"DAILY SUMMARY ({today_et().isoformat()})\n"
             f"Trades: {stats.trades_taken} | "
             f"Won: {stats.trades_won} | Lost: {stats.trades_lost}\n"
             f"Realized P&L: ${stats.total_pnl:.2f}\n"

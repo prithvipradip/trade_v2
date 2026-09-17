@@ -18,6 +18,7 @@ from ait.risk.correlation import CorrelationGuard
 from ait.risk.pdt_guard import PDTGuard
 from ait.risk.position_sizer import PositionSizer
 from ait.utils.logging import get_logger
+from ait.utils.time import today_et
 
 log = get_logger("risk.manager")
 
@@ -129,7 +130,7 @@ class RiskManager:
             return 0
         try:
             from datetime import date, timedelta
-            today = date.today()
+            today = today_et()
             losing_streak = 0
             for days_back in range(1, 11):  # Look back up to 10 days
                 d = today - timedelta(days=days_back)

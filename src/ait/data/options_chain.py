@@ -21,6 +21,7 @@ from ait.config.settings import OptionsConfig
 from ait.data.cache import TTLCache
 from ait.data.market_data import MarketDataService
 from ait.utils.logging import get_logger
+from ait.utils.time import today_et
 
 log = get_logger("data.options")
 
@@ -206,7 +207,7 @@ class OptionContract:
 
     @property
     def dte(self) -> int:
-        return (self.expiry - date.today()).days
+        return (self.expiry - today_et()).days
 
     @property
     def is_liquid(self) -> bool:
@@ -298,7 +299,7 @@ def expected_move(chain: "OptionsChain", spot: float | None = None) -> float:
     iv = chain.atm_iv if getattr(chain, "atm_iv", 0.0) > 0 else atm_iv(chain)
     if iv <= 0 or spot <= 0:
         return 0.0
-    dte = max((chain.expiry - date.today()).days, 0)
+    dte = max((chain.expiry - today_et()).days, 0)
     return spot * iv * math.sqrt(dte / 365.0)
 
 
@@ -337,7 +338,7 @@ class OptionsChain:
 
     @property
     def dte(self) -> int:
-        return (self.expiry - date.today()).days
+        return (self.expiry - today_et()).days
 
     def get_atm_strike(self) -> float:
         """Get the at-the-money strike (closest to underlying price)."""
@@ -547,8 +548,8 @@ class OptionsChainService:
         """Get a specific expiry's options chain."""
         chains = await self.get_chain(
             symbol,
-            min_dte=(expiry - date.today()).days - 1,
-            max_dte=(expiry - date.today()).days + 1,
+            min_dte=(expiry - today_et()).days - 1,
+            max_dte=(expiry - today_et()).days + 1,
         )
         for chain in chains:
             if chain.expiry == expiry:
@@ -608,7 +609,7 @@ class OptionsChainService:
                 )
 
             # Filter expiries by DTE range
-            today = date.today()
+            today = today_et()
             target_expiries = []
             for exp_str in sorted(chain_def.expirations):
                 exp_date = datetime.strptime(exp_str, "%Y%m%d").date()
@@ -799,7 +800,7 @@ class OptionsChainService:
         if not expiry_strings:
             return []
 
-        today = date.today()
+        today = today_et()
         chains = []
 
         def _safe_int(val, default=0):

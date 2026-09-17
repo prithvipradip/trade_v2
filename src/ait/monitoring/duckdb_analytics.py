@@ -23,6 +23,7 @@ from pathlib import Path
 import duckdb
 
 from ait.utils.logging import get_logger
+from ait.utils.time import today_et
 
 log = get_logger("monitoring.duckdb")
 
@@ -308,7 +309,7 @@ class DuckDBAnalytics:
 
     def get_performance(self, lookback_days: int = 30) -> PerformanceSnapshot:
         """Compute comprehensive performance metrics using DuckDB."""
-        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        cutoff = (today_et() - timedelta(days=lookback_days)).isoformat()
 
         with self._get_conn(read_only=True) as conn:
             # Exit-time window: a trade opened before the lookback window but
@@ -424,7 +425,7 @@ class DuckDBAnalytics:
 
     def get_daily_pnl(self, lookback_days: int = 30) -> list[dict]:
         """Get daily P&L with cumulative running total — uses DuckDB window function."""
-        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        cutoff = (today_et() - timedelta(days=lookback_days)).isoformat()
 
         with self._get_conn(read_only=True) as conn:
             rows = conn.execute("""
@@ -454,7 +455,7 @@ class DuckDBAnalytics:
 
     def get_strategy_breakdown(self, lookback_days: int = 60) -> list[dict]:
         """Strategy performance breakdown — single DuckDB query."""
-        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        cutoff = (today_et() - timedelta(days=lookback_days)).isoformat()
 
         with self._get_conn(read_only=True) as conn:
             # exit-time window + real-close filter (see get_performance)
@@ -486,7 +487,7 @@ class DuckDBAnalytics:
 
     def get_symbol_breakdown(self, lookback_days: int = 60) -> list[dict]:
         """Symbol performance breakdown."""
-        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        cutoff = (today_et() - timedelta(days=lookback_days)).isoformat()
 
         with self._get_conn(read_only=True) as conn:
             # exit-time window + real-close filter (see get_performance)
@@ -511,7 +512,7 @@ class DuckDBAnalytics:
 
     def get_regime_breakdown(self, lookback_days: int = 60) -> list[dict]:
         """Performance breakdown by market regime — new analytics not in SQLite."""
-        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        cutoff = (today_et() - timedelta(days=lookback_days)).isoformat()
 
         with self._get_conn(read_only=True) as conn:
             # exit-time window + real-close filter (see get_performance)
@@ -542,7 +543,7 @@ class DuckDBAnalytics:
 
     def get_strategy_regime_matrix(self, lookback_days: int = 90) -> list[dict]:
         """Strategy x Regime performance matrix — which strategies work in which regimes."""
-        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        cutoff = (today_et() - timedelta(days=lookback_days)).isoformat()
 
         with self._get_conn(read_only=True) as conn:
             # exit-time window + real-close filter (see get_performance)
@@ -568,7 +569,7 @@ class DuckDBAnalytics:
 
     def get_hourly_performance(self, lookback_days: int = 60) -> list[dict]:
         """Win rate by hour of day — find bad trading hours."""
-        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        cutoff = (today_et() - timedelta(days=lookback_days)).isoformat()
 
         with self._get_conn(read_only=True) as conn:
             # exit-time window + real-close filter (see get_performance);
@@ -597,7 +598,7 @@ class DuckDBAnalytics:
         NOTE: SQRT(252) is CORRECT here — this operates on DAILY P&L from
         daily_stats, not per-trade P&L, so daily annualization applies.
         """
-        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        cutoff = (today_et() - timedelta(days=lookback_days)).isoformat()
         # R8: the window size is INLINED — a bound '?' inside a named WINDOW
         # gets duplicated by DuckDB's OVER-w expansion (6 params wanted, 2
         # supplied), so this method raised on every call since it was written.
@@ -637,7 +638,7 @@ class DuckDBAnalytics:
 
     def get_exit_efficiency(self, lookback_days: int = 60) -> list[dict]:
         """Analyze profit capture efficiency per strategy."""
-        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        cutoff = (today_et() - timedelta(days=lookback_days)).isoformat()
 
         with self._get_conn(read_only=True) as conn:
             # exit-time window + real-close filter (see get_performance)
@@ -662,7 +663,7 @@ class DuckDBAnalytics:
 
     def get_confidence_band_analysis(self, lookback_days: int = 60) -> list[dict]:
         """Analyze win rate by ML confidence bands."""
-        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        cutoff = (today_et() - timedelta(days=lookback_days)).isoformat()
 
         with self._get_conn(read_only=True) as conn:
             # exit-time window + real-close filter (see get_performance)
@@ -693,7 +694,7 @@ class DuckDBAnalytics:
 
     def get_iv_rank_analysis(self, lookback_days: int = 90) -> list[dict]:
         """Analyze strategy performance across IV rank quintiles."""
-        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        cutoff = (today_et() - timedelta(days=lookback_days)).isoformat()
 
         with self._get_conn(read_only=True) as conn:
             # exit-time window + real-close filter (see get_performance)

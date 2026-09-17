@@ -15,6 +15,7 @@ from ait.data.options_chain import OptionsChain, OptionContract
 from ait.strategies.base import Signal, SignalDirection, Strategy
 from ait.utils.logging import get_logger
 from ait.config.runtime_env import contract_float  # R19: ONE authority for env-contract defaults
+from ait.utils.time import today_et
 
 log = get_logger("strategies.iron_condor")
 
@@ -101,7 +102,7 @@ class IronCondor(Strategy):
             exp = getattr(chain, "expiry", None)
             if exp:
                 exp_d = _dt.fromisoformat(str(exp)[:10]).date()
-                dte = max(1, (exp_d - _date.today()).days)
+                dte = max(1, (exp_d - today_et()).days)
         except Exception:  # noqa: BLE001
             pass
         import os as _os_w

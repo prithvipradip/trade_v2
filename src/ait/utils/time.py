@@ -52,6 +52,27 @@ def now_et() -> datetime:
     return datetime.now(ET)
 
 
+def today_et() -> date:
+    """The current ET calendar date — this codebase's date convention.
+
+    W28: the single authority replacing 49 `date.today()` reads across src/.
+    `date.today()` returns the HOST's date, and on this box (CEST = ET+6) that
+    is tomorrow's date from 18:00 ET onward — so an evening restart ran startup
+    reconcile and the launch coherence check against the wrong day.
+
+    Measured, because the honest severity is narrower than the raw count
+    suggests and narrower than W26's ledger entry implied: the whole RTH session
+    (09:30-16:00 ET = 15:30-22:00 CEST) falls inside the band where the host
+    date and the ET date AGREE, so the live scan/exit loops were never wrong on
+    this host. That correctness is ACCIDENTAL — it holds only because the offset
+    happens to be +6. A host at ET+13 would put RTH itself across the date line.
+    Named rather than open-coded as `now_et().date()` so intent is explicit at
+    the call site and the class guard can forbid `.today()` outright, with no
+    allowlist.
+    """
+    return now_et().date()
+
+
 def parse_trade_ts(value: str) -> datetime:
     """Parse a stored trade timestamp and return it as an AWARE ET datetime.
 

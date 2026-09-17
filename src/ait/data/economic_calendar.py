@@ -20,6 +20,7 @@ from datetime import date, timedelta
 from enum import Enum
 
 from ait.utils.logging import get_logger
+from ait.utils.time import today_et
 
 log = get_logger("data.economic_calendar")
 
@@ -213,7 +214,7 @@ class EconomicCalendar:
 
     Usage:
         cal = EconomicCalendar()
-        if cal.should_skip_trading(date.today()):
+        if cal.should_skip_trading(today_et()):
             log.info("skipping trades — macro event window")
             return
     """
@@ -266,7 +267,7 @@ class EconomicCalendar:
 
     def is_event_day(self, check_date: date | None = None) -> bool:
         """Return True if the given date has a major economic release."""
-        check_date = check_date or date.today()
+        check_date = check_date or today_et()
         self._warn_if_nearly_exhausted(check_date)
         return check_date in self._event_dates
 
@@ -278,7 +279,7 @@ class EconomicCalendar:
         conservative (we might skip a Friday before a Monday event, which
         is exactly what we want — no weekend gap risk into an event).
         """
-        check_date = check_date or date.today()
+        check_date = check_date or today_et()
         tomorrow = check_date + timedelta(days=1)
         # Also check Monday if today is Friday
         if check_date.weekday() == 4:  # Friday
@@ -293,7 +294,7 @@ class EconomicCalendar:
         - Event days (release already happened or happening, IV crush in play)
         - Pre-event days (holding overnight into the event is the risk)
         """
-        check_date = check_date or date.today()
+        check_date = check_date or today_et()
         skip = self.is_event_day(check_date) or self.is_pre_event_day(check_date)
         if skip:
             events = self.get_events_on(check_date)
@@ -311,12 +312,12 @@ class EconomicCalendar:
 
     def get_events_on(self, check_date: date | None = None) -> list[EconomicEvent]:
         """Get all economic events on a specific date."""
-        check_date = check_date or date.today()
+        check_date = check_date or today_et()
         return [e for e in self._events if e.date == check_date]
 
     def get_upcoming_events(self, days: int = 7) -> list[EconomicEvent]:
         """Get all events in the next N calendar days (inclusive of today)."""
-        today = date.today()
+        today = today_et()
         cutoff = today + timedelta(days=days)
         return [e for e in self._events if today <= e.date <= cutoff]
 
@@ -328,7 +329,7 @@ class EconomicCalendar:
         macro gate) treat None as "no event", so the staleness alarm below is
         the guard rail against silently trading blind.
         """
-        check_date = check_date or date.today()
+        check_date = check_date or today_et()
         self._warn_if_nearly_exhausted(check_date)
         for event in self._events:
             if event.date >= check_date:

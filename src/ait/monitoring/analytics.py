@@ -23,7 +23,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from ait.utils.logging import get_logger
-from ait.utils.time import parse_trade_ts
+from ait.utils.time import parse_trade_ts, today_et
 
 log = get_logger("monitoring.analytics")
 
@@ -156,7 +156,7 @@ class TradeAnalytics:
                 log.warning("duckdb_fallback", method="get_performance", error=str(e))
 
         # SQLite fallback
-        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        cutoff = (today_et() - timedelta(days=lookback_days)).isoformat()
         trades = self._get_closed_trades(cutoff)
 
         if not trades:
@@ -241,7 +241,7 @@ class TradeAnalytics:
                 log.warning("duckdb_fallback", method="get_daily_pnl", error=str(e))
 
         # SQLite fallback
-        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        cutoff = (today_et() - timedelta(days=lookback_days)).isoformat()
 
         if not self._db_path.exists():
             return []
@@ -278,7 +278,7 @@ class TradeAnalytics:
                 log.warning("duckdb_fallback", method="get_strategy_breakdown", error=str(e))
 
         # SQLite fallback
-        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        cutoff = (today_et() - timedelta(days=lookback_days)).isoformat()
         trades = self._get_closed_trades(cutoff)
 
         by_strategy: dict[str, list[float]] = {}
@@ -313,7 +313,7 @@ class TradeAnalytics:
                 log.warning("duckdb_fallback", method="get_symbol_breakdown", error=str(e))
 
         # SQLite fallback
-        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        cutoff = (today_et() - timedelta(days=lookback_days)).isoformat()
         trades = self._get_closed_trades(cutoff)
 
         by_symbol: dict[str, list[float]] = {}

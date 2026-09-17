@@ -39,6 +39,7 @@ from ait.diagnostics.vlmc_report import (
     plot_volume_profile_distribution,
 )
 from ait.utils.logging import get_logger
+from ait.utils.time import today_et
 
 log = get_logger("diagnostics.report")
 
@@ -91,7 +92,7 @@ def generate_report(
         try:
             from datetime import date as _date
             # Fetch enough history to cover start date from today
-            days = (_date.today() - _date.fromisoformat(start)).days + 30
+            days = (today_et() - _date.fromisoformat(start)).days + 30
             df = load_daily_ohlcv(symbol, days=days, db_path=store_path)
             if df is not None and not df.empty:
                 df = df.loc[start:end]

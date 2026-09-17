@@ -31,7 +31,7 @@ from ait.data.quality import DataQualityValidator
 from ait.risk.circuit_breaker import CircuitBreaker
 from ait.risk.pdt_guard import PDTGuard
 from ait.utils.logging import get_logger
-from ait.utils.time import parse_trade_ts
+from ait.utils.time import parse_trade_ts, today_et
 from ait.config.runtime_env import contract_flag, contract_float  # R19: ONE authority for env-contract defaults
 
 log = get_logger("execution.portfolio")
@@ -464,7 +464,7 @@ class PortfolioManager:
         if trade.expiry:
             try:
                 expiry_date = date.fromisoformat(trade.expiry)
-                dte = (expiry_date - date.today()).days
+                dte = (expiry_date - today_et()).days
             except ValueError:
                 pass
 
@@ -769,7 +769,7 @@ class PortfolioManager:
                 info = self._earnings.get_next_earnings(trade.symbol)
                 if info and info.next_earnings_date:
                     from datetime import date as _d
-                    days_to_earnings = (info.next_earnings_date - _d.today()).days
+                    days_to_earnings = (info.next_earnings_date - today_et()).days
                     # R6: the pnl_pct > 0 gate meant a LOSING short-premium
                     # position — maximum gamma/vega into the event — rode
                     # through earnings hoping for breakeven. Close regardless

@@ -325,18 +325,41 @@ class TestEarningsUsesEtClock:
         # 1 day before earnings, per the mocked ET clock -- deliberately far
         # from the real system date so a lingering date.today() call would
         # fail this assertion.
-        monkeypatch.setattr(mod, "now_et", lambda: datetime(2026, 3, 14, 23, 30))
+        # W28: the seam moved. is_near_earnings used to call `now_et().date()`,
+        # so patching this module's `now_et` controlled it; it now calls the
+        # shared `today_et()` authority, which resolves through
+        # ait.utils.time.now_et and is unaffected by a patch here. Patch the
+        # seam that actually exists. The test's INTENT is unchanged and still
+        # falsifiable: a host-clock read would return the real date, which is
+        # nowhere near 2026-03-15, and this assertion would fail.
+        monkeypatch.setattr(mod, "today_et", lambda: date(2026, 3, 14))
 
         assert cal.is_near_earnings("XYZ") is True
 
     def test_is_near_earnings_false_outside_window_per_et_clock(self, monkeypatch):
+        """W28: STRENGTHENED, because this test could not fail.
+
+        It pinned earnings 2026-03-15 against a mocked 2026-01-01 and asserted
+        False — but the REAL clock also yields False (that date is long past),
+        so the assertion was satisfied whether or not the mock was consulted.
+        When W28 moved the seam it kept passing, silently, for the wrong reason:
+        exactly the wrongly-green case this suite exists to prevent.
+
+        Now the earnings date sits INSIDE the danger window for the real clock,
+        so ignoring the mock gives True and the test fails. It can only pass by
+        actually reading the mocked ET date.
+        """
+        from ait.utils.time import today_et as _real_today_et
+
         import ait.data.earnings as mod
 
         cal = mod.EarningsCalendar()
+        imminent = _real_today_et() + timedelta(days=1)
         cal._cache.set(
             "earnings_XYZ",
-            mod.EarningsInfo(symbol="XYZ", next_earnings_date=date(2026, 3, 15)),
+            mod.EarningsInfo(symbol="XYZ", next_earnings_date=imminent),
         )
-        monkeypatch.setattr(mod, "now_et", lambda: datetime(2026, 1, 1, 12, 0))
+        # Far from the real date, and far from `imminent`.
+        monkeypatch.setattr(mod, "today_et", lambda: date(2026, 1, 1))
 
         assert cal.is_near_earnings("XYZ") is False

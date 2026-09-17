@@ -36,6 +36,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from ait.utils.time import today_et
+
 __all__ = [
     # parsing
     "ANSI_RE",
@@ -440,7 +442,7 @@ class IncrementalEventCounter:
 
     def snapshot(self) -> DayEventCounts:
         return DayEventCounts(
-            day=self._day or date.today(),
+            day=self._day or today_et(),
             counts=dict(self._counts),
             last_record=dict(self._last_record) if self._last_record else None,
             last_by_event={k: dict(v) for k, v in self._last_by_event.items()},
