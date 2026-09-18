@@ -2583,7 +2583,21 @@ class TradeExecutor:
         # commission_estimate) before any stats/breaker/learning booking.
         # Class-qualified (not self.): tests drive this method through a
         # minimal host shim that only carries CREDIT_STRATEGIES.
-        pnl -= TradeExecutor.commission_estimate(trade)
+        _est = TradeExecutor.commission_estimate(trade)
+        pnl -= _est
+        # W37 (R26 commission-estimate, part c): REMEMBER what was subtracted.
+        # The true-up computes booked + (estimate - real); it used to re-derive
+        # `estimate` from whatever config the process held at true-up time, and
+        # the deferred true-up routinely runs after a restart — a recalibrated
+        # cost model in between left realized P&L permanently off by the
+        # difference ($2.13 on a one-lot condor, measured).
+        _store = getattr(self, "_state", None)
+        if _store is not None:
+            try:
+                _store.set_state(f"commission_est_{trade.trade_id}", repr(float(_est)))
+            except Exception as _e:  # noqa: BLE001 — never block a booking on this
+                log.warning("commission_estimate_not_remembered",
+                            trade_id=getattr(trade, "trade_id", None), error=str(_e))
 
         return round(pnl, 2)
 

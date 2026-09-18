@@ -820,13 +820,53 @@ class TradingOrchestrator:
                     exit_d = parse_trade_ts(row["exit_time"]).date()
                 except Exception:  # noqa: BLE001
                     exit_d = None
-                if exit_d != today:
-                    # Stats/breaker are DAILY quantities — booking a prior-day
-                    # close into today's halt math errs the other direction.
-                    # Claimed (never resurfaces), logged for the human ledger.
+                if exit_d is None:
+                    # No usable exit_time: there is no day to credit. Claimed
+                    # (never resurfaces), logged for the human ledger.
                     self._state.complete_exit_booking(trade_id)
                     log.warning("stale_exit_booking_skipped", trade_id=trade_id,
                                 exit_time=row["exit_time"], pnl=pnl)
+                    continue
+                if exit_d != today:
+                    # W37 (register time-calendar-03): stats and the breaker
+                    # are DAILY quantities, so a prior-day close must not enter
+                    # TODAY's halt math — that much of the old rule was right.
+                    # But it DISCARDED the row: every close found by the
+                    # 16:00-16:15 reconcile (undrainable until the next session
+                    # because of the 120s grace), every overnight close, every
+                    # Friday close found on Monday was booked nowhere — its
+                    # day's ledger permanently short, Thompson blind to it, no
+                    # page. Bucket by session instead: credit the day it
+                    # closed, leave today's breaker and PDT count alone.
+                    _booked = self._book_prior_session_core(
+                        trade_id, pnl, exit_d.isoformat())
+                    try:
+                        self._state.delete_state(f"trade_maxloss_{trade_id}")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    _t = self._find_trade_by_id(trade_id)
+                    _done = self._exit_steps_done(trade_id)
+
+                    def _thompson_prior(_t=_t, pnl=pnl):
+                        if _t:
+                            self._thompson.record_outcome(
+                                strategy=_t.strategy, won=pnl > 0, pnl=pnl)
+
+                    _ok = self._exit_step(trade_id, _done, "thompson",
+                                          _thompson_prior)
+                    _ok = await self._exit_notify_once(
+                        trade_id, _done,
+                        f"ORPHAN CLOSE BOOKED (prior session {exit_d.isoformat()}): "
+                        f"{(_t.symbol if _t else trade_id)} P&L ${pnl:.2f} "
+                        f"({row.get('exit_reason') or 'unknown'}) — credited to "
+                        f"that day's stats; today's breaker/PDT not touched."
+                    ) and _ok
+                    log.warning("prior_session_close_booked", trade_id=trade_id,
+                                exit_time=row["exit_time"], pnl=pnl,
+                                stats_date=exit_d.isoformat(),
+                                core_booked_now=_booked, steps_complete=_ok)
+                    if _ok:
+                        self._state.complete_exit_booking(trade_id)
                     continue
                 # W32: money effects exactly once (one transaction + marker),
                 # every other effect flagged as it lands — a retry resumes.
@@ -864,6 +904,19 @@ class TradingOrchestrator:
             except Exception as e:  # noqa: BLE001 — one bad row must not stop the drain
                 log.error("exit_outbox_booking_failed", trade_id=trade_id,
                           error=str(e))
+
+    def _book_prior_session_core(self, trade_id: str, pnl: float,
+                                 stats_date: str) -> bool:
+        """W37: book a close into the daily_stats row of the day it CLOSED.
+
+        The circuit breaker is deliberately not touched — it is a daily
+        quantity and this loss is not today's. Same exactly-once marker as
+        _book_exit_core. Returns True iff this call booked it.
+        """
+        if self._state.exit_core_booked(trade_id) is True:
+            return False
+        return bool(self._state.book_exit_core(
+            trade_id, pnl, None, None, stats_date=stats_date))
 
     def _book_exit_core(self, trade_id: str, pnl: float) -> bool:
         """W32: apply a close's stats + breaker effects EXACTLY once.
@@ -3656,6 +3709,54 @@ class TradingOrchestrator:
                 total -= ratio * bid
         return round(total, 2)
 
+    def _booked_commission_estimate(self, trade) -> float:
+        """W37: the commission estimate the FILL actually subtracted.
+
+        Falls back to today's formula for closes booked before W37 (no key) or
+        when the store cannot be read — the pre-W37 behaviour, never worse.
+        """
+        try:
+            raw = self._state.get_state(f"commission_est_{trade.trade_id}", "")
+            # Only a stored STRING is a remembered estimate (a mocked store
+            # returns a MagicMock, and float(MagicMock()) is 1.0).
+            if isinstance(raw, str) and raw:
+                return float(raw)
+        except Exception:  # noqa: BLE001
+            pass
+        from ait.execution.executor import TradeExecutor as _TE
+        return float(_TE.commission_estimate(trade))
+
+    def _forget_commission_estimate(self, trade_id: str) -> None:
+        try:
+            self._state.delete_state(f"commission_est_{trade_id}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _settle_deferred_trueups(self) -> None:
+        """R16: settle deferred commission true-ups once the day's
+        commissionReports have all landed (the booking-time ledger was partial).
+        W37: extracted from _post_market so it can be driven for real, and
+        reverses the REMEMBERED estimate rather than re-deriving one."""
+        for _tid in self._state.pending_trueup_trade_ids():
+            try:
+                _t = self._find_trade_by_id(_tid)
+                _real = self._state.total_commission(_tid)
+                if _t is not None and _real > 0 and _t.realized_pnl is not None:
+                    _delta = round(self._booked_commission_estimate(_t) - _real, 2)
+                    if abs(_delta) >= 0.01:
+                        _new_pnl = round(float(_t.realized_pnl) + _delta, 2)
+                        self._state.update_trade_realized_pnl(_tid, _new_pnl)
+                        _st = self._state.get_daily_stats()
+                        _st.total_pnl = round(_st.total_pnl + _delta, 2)
+                        self._state.update_daily_stats(_st)
+                        log.info("commission_trueup_settled_post_market",
+                                 trade_id=_tid, delta=_delta)
+                    self._forget_commission_estimate(_tid)
+                self._state.delete_state(f"trueup_pending_{_tid}")
+            except Exception as _e:  # noqa: BLE001
+                log.warning("post_market_trueup_failed", trade_id=_tid,
+                            error=str(_e))
+
     def _true_up_commission(self, trade_id: str, pnl: float) -> float:
         """Replace the fill-time commission ESTIMATE inside a realized P&L
         with the broker's actual ledger figure. Returns the corrected P&L.
@@ -3689,8 +3790,8 @@ class TradingOrchestrator:
                 pass
             exec_n = self._state.count_executions(trade_id)
             if real > 0 and trade and exec_n >= 2 * legs_n:
-                from ait.execution.executor import TradeExecutor as _TE
-                delta = round(_TE.commission_estimate(trade) - real, 2)
+                delta = round(self._booked_commission_estimate(trade) - real, 2)
+                self._forget_commission_estimate(trade_id)
                 if abs(delta) >= 0.01:
                     pnl = round(pnl + delta, 2)
                     self._state.update_trade_realized_pnl(trade_id, pnl)
@@ -4320,30 +4421,33 @@ class TradingOrchestrator:
         except Exception as _e:  # noqa: BLE001
             log.warning("maxloss_key_sweep_failed", error=str(_e))
 
-        # R16: settle deferred commission true-ups now that the day's
-        # commissionReports have all landed (booking-time ledger was partial).
-        for _tid in self._state.pending_trueup_trade_ids():
-            try:
-                _t = self._find_trade_by_id(_tid)
-                _real = self._state.total_commission(_tid)
-                if _t is not None and _real > 0 and _t.realized_pnl is not None:
-                    from ait.execution.executor import TradeExecutor as _TE
-                    _delta = round(_TE.commission_estimate(_t) - _real, 2)
-                    if abs(_delta) >= 0.01:
-                        _new_pnl = round(float(_t.realized_pnl) + _delta, 2)
-                        self._state.update_trade_realized_pnl(_tid, _new_pnl)
-                        _st = self._state.get_daily_stats()
-                        _st.total_pnl = round(_st.total_pnl + _delta, 2)
-                        self._state.update_daily_stats(_st)
-                        log.info("commission_trueup_settled_post_market",
-                                 trade_id=_tid, delta=_delta)
-                self._state.delete_state(f"trueup_pending_{_tid}")
-            except Exception as _e:  # noqa: BLE001
-                log.warning("post_market_trueup_failed", trade_id=_tid,
-                            error=str(_e))
+        # R16: settle deferred commission true-ups (see the method).
+        self._settle_deferred_trueups()
+
+        # W37: a remembered commission estimate is only needed until its
+        # true-up has run; sweep the ones no open or still-pending trade owns
+        # (same orphan class as trade_maxloss_* above).
+        try:
+            _keep = {t.trade_id for t in self._state.get_open_trades()} | set(
+                self._state.pending_trueup_trade_ids())
+            for _k in self._state.state_keys_like("commission_est_%"):
+                if _k[len("commission_est_"):] not in _keep:
+                    self._state.delete_state(_k)
+        except Exception as _e:  # noqa: BLE001
+            log.warning("commission_est_key_sweep_failed", error=str(_e))
 
         # 1. Reconcile with IBKR
         recon = await self._reconciler.reconcile()
+
+        # W37 (time-calendar-03): the trading cycle stops at the bell, so
+        # nothing drained after this reconcile — the one that discovers manual
+        # flattens and assignments. Rows younger than the drain's 120s grace
+        # stay for the next session, where they are now credited to TODAY's
+        # date instead of being dropped.
+        try:
+            await self._drain_exit_outbox()
+        except Exception as _e:  # noqa: BLE001 — never block the rest of post-market
+            log.warning("post_market_outbox_drain_failed", error=str(_e))
 
         # R12-A (F4.1): re-adopt working exit orders the reconciler found
         # for kept-CLOSING trades — without a tracker, a restart-surviving

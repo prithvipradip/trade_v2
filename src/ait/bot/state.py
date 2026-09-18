@@ -863,7 +863,8 @@ class StateManager:
 
     def book_exit_core(self, trade_id: str, pnl: float,
                        breaker_key: str | None = None,
-                       breaker_blob: str | None = None) -> bool:
+                       breaker_blob: str | None = None,
+                       stats_date: str | None = None) -> bool:
         """W32: apply a close's MONEY effects exactly once.
 
         One sqlite transaction writes today's daily_stats delta, the circuit
@@ -872,8 +873,12 @@ class StateManager:
         by the drain in this process, or by the next process after a kill —
         can tell "already counted" from "never counted" instead of guessing.
         Returns True iff THIS call booked it.
+
+        W37: ``stats_date`` (ISO) credits a PRIOR session's daily_stats row
+        instead of today's — for a close the drain finds a day late. The
+        caller passes no breaker blob for those: the breaker is today's.
         """
-        day = now_et().date().isoformat()
+        day = stats_date or now_et().date().isoformat()
         with sqlite3.connect(self._db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -896,7 +901,7 @@ class StateManager:
                          (trade_id,))
         if self._duck:  # best-effort mirror, never part of the transaction
             try:
-                st = self.get_daily_stats()
+                st = self.get_daily_stats(date.fromisoformat(day))
                 self._duck.ingest_daily_stats({
                     "date": st.date, "trades_taken": st.trades_taken,
                     "trades_won": st.trades_won, "trades_lost": st.trades_lost,

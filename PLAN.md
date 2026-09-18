@@ -5946,3 +5946,71 @@ the verdict sample from growing on days like today — it now has a config home
 on evidence (a walk-forward at the candidate floor), not to force activity.
 
 ---
+
+## 2026-09-18 - W37 EXECUTED — the last two items on this box: the remembered commission estimate, and prior-session closes booked to their own day
+
+Both were listed "still open on this box" at the end of W36. Built in the dev worktree, same as W36.
+
+[1] R26 `commission-estimate-live-config-read`, PART (c) — the estimate was never remembered.
+    A close is booked in two steps: at fill time the executor subtracts a commission ESTIMATE; the
+    true-up later computes `booked + (estimate - real)`. That is only correct if `estimate` is the
+    number the fill subtracted. It was stored nowhere: both true-up sites RE-DERIVED it from
+    whatever cost model the process held at that moment. W35's frozen settings remove the drift
+    inside one process and cannot remove it ACROSS a restart — and the deferred true-up (partial
+    ledger at booking, settled post-market or after the next start) crosses restarts routinely.
+    Reproduced to the cent on the real booking and true-up code with a real StateManager and
+    executions ledger: fill booked under $0.65/leg, trued up under $0.9168/leg ->
+    `realized P&L is off by +2.13` on a one-lot condor — R26's own measured figure — permanently,
+    in the go-live verdict's input.
+    FIX: `_calculate_realized_pnl` writes `commission_est_<trade_id>` when it subtracts; both
+    true-up sites read it through `_booked_commission_estimate` (falling back to today's formula
+    for closes booked before W37 — never worse than before) and delete it once used; post-market
+    sweeps keys no open or still-pending trade owns. The post-market settle loop became
+    `_settle_deferred_trueups()` so it can be driven for real, and the deferred path is tested
+    through it. Parts (a)/(d) were removed by W35's freeze; part (b) ("unproven") is what these
+    tests are. The finding is closed by its own reproduction.
+
+[2] Register `time-calendar-03`, SECOND HALF — prior-session closes were dropped, not deferred.
+    W36 moved the drain above the no-new-entries `return`. What remained was the drain's date rule:
+    a row whose exit_time is not TODAY was claimed, logged `stale_exit_booking_skipped`, and booked
+    NOWHERE. That is every close the 16:00-16:15 post-market reconcile discovers (the drain's 120s
+    grace makes those undrainable until the next session), every close booked while the bot was
+    down overnight, every Friday close found on Monday: the day's `daily_stats` permanently short,
+    Thompson blind to the outcome, no ORPHAN CLOSE page, and the sizer's `recent_losing_days` able
+    to read one fewer losing day.
+    The reason for the skip was right and is KEPT: stats and the breaker are daily quantities, so a
+    prior-day loss must not enter today's halt math. The fix buckets by session instead of
+    discarding: `book_exit_core(..., stats_date=<the day it closed>)` credits that day's row under
+    the same exactly-once marker W32 introduced; today's breaker and PDT count are not touched;
+    Thompson records the outcome; the operator is paged with the date. `_post_market` now drains
+    right after its reconcile. A row with no parseable exit_time is still skipped — there is no day
+    to credit.
+
+PROOF. `tests/test_w37_commission_estimate_is_remembered.py` (5) and
+`tests/test_w37_prior_session_closes_are_booked.py` (6). Against the pre-fix worktree: **3 failed /
+2 passed** and **4 failed / 2 passed**. All four greens are controls that must hold on both trees:
+a close with no remembered estimate still trues up; the estimate is still subtracted through the
+minimal host shim; today's halt math is untouched by a prior-day row; a same-day orphan still counts
+against today. No `inspect.getsource`.
+
+ONE OLDER TEST EXPOSED A SHARP EDGE IN THE FIRST VERSION: `test_r15::test_estimate_swapped_for_
+ledger_truth` drives the booking with a MagicMock state store, and `float(MagicMock())` is 1.0 — so
+the helper read a "remembered estimate" of $1.00. It now trusts only a stored STRING. Caught by the
+full suite, not by the new tests.
+
+VERIFICATION: full fast lane in the dev worktree **2065 passed / 46 skipped / 0 failed** (416s),
+`scripts/typecheck.py` OK; deploy smoke run in the live tree after the fast-forward.
+
+STATE AT HANDOFF: committed, fast-forwarded into the live tree and pushed. **Not running yet** — the
+processes started at 13:25 ET hold W32-W35; W36 and W37 load at the next restart. Neither changes a
+trading value or entry selection, so that restart needs no special timing. After it, the first close
+writes a `commission_est_<trade_id>` key, and the first prior-day orphan logs
+`prior_session_close_booked` instead of `stale_exit_booking_skipped`.
+THIS BOX'S LIST IS NOW EMPTY. Everything assigned here by `reports/r26_integration_20260917.md`
+(F1, F2, F6, F8, the F7 share) and everything this session registered for itself (the deploy-order
+hazard, the forensic-log encoding, the AIT_* census, both halves of time-calendar-03, the
+commission estimate) is shipped. What remains is on Ahmed's side (F4 = his W31, the F5 remainder,
+the two W22 Telegram rows, his F7 rows, the W25 credit-ratio literal), plus the 23 register
+live-money items outside F1-F8 and the research re-run, none of which is assigned.
+
+---
