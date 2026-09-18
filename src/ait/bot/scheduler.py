@@ -40,6 +40,15 @@ class TradingPhase(str, Enum):
 class MarketScheduler:
     """Determines what the bot should be doing based on current time."""
 
+    def __init__(self, settings=None) -> None:
+        # W35 (R26 entry-blackout-cutoff-900s): the no-new-entries window
+        # before the close was a bare `900` in should_avoid_new_trades.
+        # config.yaml trading.no_new_entries_minutes_before_close is its home;
+        # a scheduler built bare keeps the historical 15 minutes.
+        _minutes = getattr(getattr(settings, "trading", None),
+                           "no_new_entries_minutes_before_close", 15)
+        self._no_new_entries_s = int(_minutes) * 60
+
     def get_current_phase(self, now: datetime | None = None) -> TradingPhase:
         """Get the current trading phase.
 
@@ -156,4 +165,4 @@ class MarketScheduler:
         Don't enter new positions in the last 15 minutes.
         """
         remaining = self.seconds_until_close()
-        return 0 < remaining < 900  # Last 15 minutes
+        return 0 < remaining < self._no_new_entries_s

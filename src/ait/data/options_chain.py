@@ -946,25 +946,16 @@ class OptionsChainService:
         r = 0.05  # Risk-free rate approximation
         t = max(chain.dte / 365.0, 0.001)  # Time to expiry in years
 
-        # A6 (deep-audit DATA-M6 residual): when a contract lacks IV, use the
-        # chain's MEDIAN observed IV instead of a flat 30% — a wrong sigma
-        # shifts the computed delta, and strategies pick strikes BY delta.
-        # R16: `c.implied_vol and ...` is None-safe, and the MIN_PHYSICAL_IV
-        # floor keeps Yahoo's ~1e-5 placeholders out of the median.
-        _ivs = sorted(c.implied_vol for grp in (chain.calls, chain.puts)
-                      for c in grp
-                      if c.implied_vol and c.implied_vol >= MIN_PHYSICAL_IV)
-        # W19 (w17-07): when the chain carries NO usable IV at all, this is a
-        # hardcoded GUESS, and every delta backfilled from it is a guess too.
-        # That is the genuinely degraded case — surfaced on the chain so
-        # iron_condor's degraded_greeks gate can see it. Before W19 the gate
-        # rejected only when NO delta was non-zero, which backfill guarantees
-        # never happens: the gate was disarmed by the very degradation it
-        # exists to catch (its comment names the 07-07 SPY condor that filled
-        # a "0.20-delta" short call at 0.49 DELTA).
-        _chain_iv = _ivs[len(_ivs) // 2] if _ivs else 0.30
-        chain.iv_is_guessed = not _ivs
-
+        # W35 (R26 iv-is-guessed-computed-before-the-solve /
+        # atm-iv-and-expected-move-never-refreshed): this used to be ONE pass
+        # that computed the chain median, the iv_is_guessed flag and (in
+        # __post_init__, earlier still) atm_iv/expected_move BEFORE solving any
+        # contract — on a feed whose contracts arrive with implied_vol=0. So a
+        # chain whose every contract then solved cleanly from real prices was
+        # flagged "guessed" (iron_condor refuses it), sized its wings from
+        # atm_iv=0.0 (-> the flat 0.20 fallback) and backfilled quote-less
+        # contracts from 0.30. Two passes now: SOLVE first, then derive every
+        # chain-level fact from the post-solve IV set, then backfill.
         none_greeks = 0
         # W19 (w17-07): iv_solved_from_price was incremented INSIDE the try,
         # after success — it counted successes only, and with no attempt
@@ -992,6 +983,7 @@ class OptionsChainService:
 
                 flag = "c" if c.right == "C" else "p"
 
+                # ---- PASS 1: solve only. No fallback sigma is assigned here.
                 # 2026-09-14: IBKR reports each Greek field independently on
                 # the wire (confirmed from ib_insync's own tickOptionComputation
                 # handler — impliedVol's sentinel is -1, delta's is -2, sent
@@ -1012,23 +1004,60 @@ class OptionsChainService:
                 # written onto implied_vol either way, not just used as
                 # scratch input.
                 if not c.implied_vol or c.implied_vol < MIN_PHYSICAL_IV:
+                    c.implied_vol = 0.0            # missing until proven otherwise
                     if c.has_two_sided_quote:
                         iv_solve_attempted += 1
                         try:
-                            c.implied_vol = implied_volatility(
+                            _solved = implied_volatility(
                                 c.mid, S, c.strike, t, r, flag)
-                            iv_solved_from_price += 1
+                            if _solved and _solved >= MIN_PHYSICAL_IV:
+                                c.implied_vol = _solved
+                                iv_solved_from_price += 1
+                            else:
+                                iv_solve_failed_other += 1
                         except _ARBITRAGE_ERRORS:
                             # The QUOTE is impossible, not the solver: mid is
                             # outside the no-arbitrage band. A data-quality
                             # signal worth surfacing on its own.
                             iv_solve_failed_arbitrage += 1
-                            c.implied_vol = _chain_iv
                         except Exception:
                             iv_solve_failed_other += 1
-                            c.implied_vol = _chain_iv
-                    else:
-                        c.implied_vol = _chain_iv
+
+        # ---- chain-level facts, from the POST-solve IV set -----------------
+        # A6 (deep-audit DATA-M6 residual): when a contract lacks IV, use the
+        # chain's MEDIAN observed IV instead of a flat 30% — a wrong sigma
+        # shifts the computed delta, and strategies pick strikes BY delta.
+        # R16: `c.implied_vol and ...` is None-safe, and the MIN_PHYSICAL_IV
+        # floor keeps Yahoo's ~1e-5 placeholders out of the median.
+        _ivs = sorted(c.implied_vol for grp in (chain.calls, chain.puts)
+                      for c in grp
+                      if c.implied_vol and c.implied_vol >= MIN_PHYSICAL_IV)
+        # W19 (w17-07): when the chain carries NO usable IV at all, this is a
+        # hardcoded GUESS, and every delta backfilled from it is a guess too.
+        # That is the genuinely degraded case — surfaced on the chain so
+        # iron_condor's degraded_greeks gate can see it. Before W19 the gate
+        # rejected only when NO delta was non-zero, which backfill guarantees
+        # never happens: the gate was disarmed by the very degradation it
+        # exists to catch (its comment names the 07-07 SPY condor that filled
+        # a "0.20-delta" short call at 0.49 DELTA).
+        _chain_iv = _ivs[len(_ivs) // 2] if _ivs else 0.30
+        chain.iv_is_guessed = not _ivs
+        # W35: refresh what __post_init__ computed before anything was solved.
+        # Done HERE — after the solve, before the backfill below — so it reads
+        # delivered and solved IVs only; a fallback sigma written onto a
+        # quote-less strike is not an observation of the vol surface.
+        if iv_solved_from_price:
+            _atm = atm_iv(chain)
+            if _atm > 0:
+                chain.atm_iv = _atm
+                chain.expected_move = expected_move(chain, S)
+
+        # ---- PASS 2: fallback sigma for what could not be solved, then Greeks
+        for contracts in (chain.calls, chain.puts):
+            for c in contracts:
+                flag = "c" if c.right == "C" else "p"
+                if not c.implied_vol or c.implied_vol < MIN_PHYSICAL_IV:
+                    c.implied_vol = _chain_iv
 
                 if c.delta == 0 or c.gamma == 0 or c.theta == 0 or c.vega == 0:
                     sigma = c.implied_vol

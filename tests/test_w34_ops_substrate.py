@@ -310,6 +310,19 @@ class TestTheForensicLogNeedsAnOptIn:
         assert "orchestrator_already_running" in (
             tmp_path / "orchestrator.log").read_text(encoding="utf-8")
 
+    def test_the_sink_is_written_in_the_encoding_its_readers_use(self, tmp_path):
+        """W35: status.py and web_logs.py decode this file as utf-8; the
+        writer used the host locale (cp1252 here), so an em dash in an error
+        text could not be read back. Found when a W35 warning carrying one
+        broke this file's own strict utf-8 read."""
+        r = _run(_LOG_SNIPPET.format(logs=tmp_path, body=(
+            'M._enable_file_sink()\n'
+            '    M._log("warning", "config_error", error="not found \\u2014 refusing")')),
+            tmp_path)
+        assert r.returncode == 0, r.stderr[-400:]
+        text = (tmp_path / "orchestrator.log").read_bytes().decode("utf-8")  # strict
+        assert "\u2014" in text
+
     def test_an_explicit_env_opt_in_works(self, tmp_path):
         r = _run(_LOG_SNIPPET.format(logs=tmp_path, body=(
             'M._log("info", "maintenance_event")')), tmp_path, AIT_ORCH_LIVE="1")

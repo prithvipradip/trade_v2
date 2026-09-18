@@ -359,7 +359,7 @@ class TradingOrchestrator:
         self._account._circuit_breaker = self._circuit_breaker
 
         # Scheduling
-        self._scheduler = MarketScheduler()
+        self._scheduler = MarketScheduler(settings)
         self._reconciler = PositionReconciler(ibkr_client, self._state)
 
         # Self-learning

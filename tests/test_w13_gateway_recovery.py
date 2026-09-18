@@ -198,12 +198,26 @@ class TestSafety:
             m._maybe_recover_gateway(4002, now)   # must not raise
 
     def test_budget_and_timer_reset_after_recovery(self):
-        """A later, unrelated outage deserves fresh attempts."""
+        """A later, unrelated outage deserves fresh attempts.
+
+        W35 (R26 w13-reset-test-asserts-its-own-fixture): this test used to
+        ASSIGN the two values and then assert them — it never called
+        health_check(), and deleting the reset block left all 307 supervisor
+        tests green. It now drives the real bot-down health check with the
+        Gateway answering again.
+        """
         m, _ = _mgr(down_minutes=200, recoveries=3)
-        # the healthy branch clears both
-        m._gateway_down_since = None
-        m._gateway_recoveries = 0
+        m._proc = None
+        m._restarts = 0
+        m._max_restarts = 10
+        m._last_restart = None
+        m._log_handle = None
+        with patch.object(M, "_gateway_listening", return_value=True), \
+             patch.object(M, "_alert"), \
+             patch.object(M.BotManager, "start") as start:
+            m.health_check()
         assert m._gateway_recoveries == 0 and m._gateway_down_since is None
+        start.assert_called_once()
 
 
 class TestTheOutageThatMotivatedThis:

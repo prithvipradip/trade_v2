@@ -5734,3 +5734,121 @@ NEXT: W35 (F8 + the F7 share). The two `options_chain.py` findings first — the
 selection; their tests are written and red (5 failed / 2 controls).
 
 ---
+
+## 2026-09-18 - W35 EXECUTED — R26 F8 (research validity + config homes), the F7 share, and the deploy-order hazard closed
+
+[1] THE TWO FINDINGS THAT REACH STRIKE SELECTION (`data/options_chain.py::_calculate_greeks`).
+    On this feed contracts arrive with `implied_vol=0` and each one's IV is solved from its own
+    quote. Everything chain-level was computed BEFORE that solve:
+      - `iv_is_guessed` came from the pre-solve IV set, so a chain whose every contract solved
+        cleanly from real prices was still flagged a guess — and `iron_condor.py` refuses a
+        flagged chain (`degraded_greeks`).
+      - `atm_iv` / `expected_move` are set in `OptionsChain.__post_init__` and were never
+        refreshed: wings were sized from `atm_iv=0.0` -> the flat 0.20 fallback, and the
+        expected-move gate saw 0, while the contracts carried a correct solved sigma.
+      - the fallback sigma for a quote-less contract was the pre-solve median — i.e. the flat
+        0.30 guess, in a chain whose other contracts solve to their real vol a few lines later.
+    Now two passes: SOLVE every contract that can be; derive the median, the flag and (when
+    anything was solved) `atm_iv`/`expected_move` from the post-solve set — read between the
+    passes, so a backfilled sigma never counts as an observation; THEN backfill and compute
+    Greeks. Tests generate quotes with py_vollib at a known sigma, so the answers are exact
+    (six contracts at 0.22 -> atm_iv 0.22, EM = S*0.22*sqrt(30/365)).
+    Two W19 tests pinned the defect: their "no usable IV anywhere" chain carried a solvable
+    1.0 x 1.2 quote (the log shows attempted=2 contracts=2). They now use genuinely quote-less
+    contracts, which is what the W19 gate is for.
+    RESEARCH-VALIDITY NOTE: this changes what the live condor builder sees on every scan of the
+    delayed-data path — real ATM vol instead of 0.20 for wing sizing, and no more spurious
+    `degraded_greeks` refusals. Expect `atm_iv` in `condor_entry_quality` telemetry to become
+    non-zero and entry counts to be able to rise. It starts at the next restart; it is a change
+    to entry selection, so the verdict sample's entries from that restart onward are not
+    like-for-like with those before it.
+
+[2] range.pkl FLAPPED DAILY BETWEEN TWO SPECS. The live bot builds its range model from
+    `ait.ml.range_spec.live_range_spec` (0.05, horizon 9 = the reachable hold). The supervisor's
+    07:30 retrain script hardcoded `RangePredictor(threshold_pct=0.05, horizon_days=30)`, so every
+    retrain rebuilt the artifact at a spec the live 0.65 floor was never calibrated for. (This
+    corrects my own earlier wrong diagnosis of this symptom as a `horizon_days=None` key.) The
+    script now reads the one authority. The test captures the script `retrain_models()` REALLY
+    launches and executes it with training and I/O stubbed: pre-fix it built (0.05, 30).
+
+[3] THE DEPLOY-ORDER HAZARD (registered in W33) IS CLOSED AT THE ROOT. `freeze_settings()`:
+    the two long-lived entry points (`ait.main.run_bot`, the supervisor's `main()`) freeze the
+    settings they started with; every later `load_settings()` in that process returns a COPY of
+    that snapshot and never re-reads the file. Proven with real processes: load, then add an
+    unknown key to config.yaml, then reload -> `ValidationError` without the freeze (the control —
+    this is what hit the live window on 09-18), fine with it. Tests/scripts/research never freeze
+    (a conftest fence resets it), so they keep reading the file. This also makes the documented
+    contract true ("editing config.yaml requires a process restart"): until now a process ran on
+    its startup settings AND on whatever the file said later. It does not retire F7's
+    `commission-estimate-live-config-read` (the per-call read and its literal fallback are still
+    there) — it removes the way that read could hurt.
+    NOT YET LIVE: the processes started at 12:20 predate this. Until the next restart, adding a
+    config.yaml key is still unsafe on this box. So this wave's one new key
+    (`trading.no_new_entries_minutes_before_close`) ships as a settings default; its yaml line
+    goes in AT the restart. After that restart, yaml edits are always safe.
+
+[4] CONFIG HOMES. `trading.no_new_entries_minutes_before_close` (15) replaces the bare `900` in
+    `MarketScheduler.should_avoid_new_trades`; the orchestrator hands its settings to the
+    scheduler (asserted through the real `__init__` via the hot-path smoke rig). The Gateway
+    start script has one authority: `IBC_DIR` (which already drove the boot launcher) now also
+    locates the recovery launcher's default; `AIT_GATEWAY_START_SCRIPT` stays as an explicit
+    override. The recovery LAUNCH SHAPE is deliberately unchanged — it has a successful
+    production run (09-11) and tonight is W34's first supervisor-driven nightly relaunch.
+
+[5] F7 SHARE. `test_w13::test_budget_and_timer_reset_after_recovery` assigned two values and then
+    asserted them; deleting the reset block left all 307 supervisor tests green. It now drives the
+    real bot-down `health_check()` with the Gateway answering, and a mutation run (the reset
+    replaced by a no-op) makes it FAIL. LEDGER CORRECTION: PLAN.md's W13 entry counts "12
+    executing tests" as proof; one of the twelve executed nothing under test. The W13 mechanism
+    was right — W34's `test_recovery_resets_the_outage_state` and this rewrite now prove the reset
+    — but the original proof claim for the reset did not. (W14's intact-streak test was rebuilt in
+    W32. W18's `getsource` tests, W22's background-task test, W25's negative controls and the W25
+    deploy-proof line are Ahmed's waves and remain open on his side.)
+
+STILL OPEN IN F8, AND WHY: `w25-credit-ratio-literal` sits in W25 sizing code (Ahmed's F4, queued
+as his W31). The August-register config items — the risk-free `r = 0.05` / dividend yield in the
+Greeks math, and the 21 `AIT_*` keys without homes — are not specified in the R26 report, and the
+working notes that located them were lost when today's Windows upgrade wiped the session scratch
+directory; they need re-deriving from `reports/full_audit_r24_20260906.md` before anyone fixes
+them. Also noticed and NOT fixed (register `time-calendar-03`, still true at HEAD, checked): in
+the last `no_new_entries` minutes `_trading_cycle` returns before its only `_drain_exit_outbox()`
+call. Ordinary fills are unaffected — the fast monitor calls `check_fills_safe()` and books
+completed exits on every cycle — so the exposure is the ORPHAN path only: a close that reaches the
+outbox in that window (reconciler/sweep/vanished booking) waits for the next session's drain. The
+new config key now sets that window's length too.
+
+[6] FOUND BY THIS WAVE'S OWN SUITE RUN: the supervisor's forensic log was written in the host's
+    locale encoding (cp1252 here) while both of its readers (`status.py`, `web_logs.py`) decode
+    utf-8. W35's new `settings_freeze_failed` warning carries an em dash from the config error
+    text, and the W34 subprocess test that reads the log as strict utf-8 failed on it. `_log` now
+    writes utf-8 explicitly — the same host-move class as W20/W21.
+
+PROOF. `tests/test_w35_chain_iv_after_the_solve.py` (7), `tests/test_w35_config_and_retrain.py`
+(12) and one new test in `test_w34_ops_substrate.py`. Re-run against the pre-fix source in this
+session (the six `src/` files stashed, tests kept): **15 failed, 5 passed**. The five green ones
+are controls that must hold on both trees: a chain nothing can be solved from is still a guess; a
+delivered ATM IV is not disturbed when nothing was solved; the config hazard reproduces WITHOUT
+the freeze; a scheduler built bare still works; an explicit `AIT_GATEWAY_START_SCRIPT` still wins.
+The W13 reset rewrite was proven separately by mutation (reset -> no-op => the test fails). No
+`inspect.getsource`.
+
+VERIFICATION (Windows box, the live host): full fast lane **2027 passed / 46 skipped / 0 failed**
+(422s), zero `refusing to kill` lines, no stray page stamps; `scripts/typecheck.py` OK;
+`scripts/smoke_deploy.py` -> SMOKE PASS (13 checks). All 67 test files that touch option chains or
+the condor builder: 1300 passed.
+
+STATE AT HANDOFF: committed and pushed, **NOT live** — the processes started at 12:20 ET run
+W32+W33+W34. W35 takes effect at the next restart; because it changes entry selection ([1]) and
+the range-model spec the retrain writes ([2]), do that restart deliberately, outside RTH, and in
+this order: stop the stack -> add `no_new_entries_minutes_before_close: 15` under `trading:` in
+config.yaml -> start the stack. Tomorrow's 07:30 retrain will then rebuild range.pkl at the live
+spec (0.05, 9) and the bot's own spec guard should stop flagging its fresh artifact.
+WHAT TO WATCH AFTER THAT RESTART: `condor_entry_quality` shows a non-zero `atm_iv`; no
+`chain_iv_is_a_guess` on chains that log `iv_solved_from_price contracts=N` with N>0;
+`range_train_spec_mismatch` absent from the retrain log.
+NEXT (this box): nothing queued from the fix sets assigned here — F1, F2, F6, F8 and the F7 share
+are shipped. Open on Ahmed's side: F4 (his W31), the F5 remainder, the two W22 Telegram rows, his
+F7 rows. Open for whoever takes them: the F8 leftovers named above, `time-calendar-03`, and the 23
+register live-money items outside F1-F8 listed in `reports/r26_integration_20260917.md`.
+
+---

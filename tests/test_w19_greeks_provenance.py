@@ -70,8 +70,13 @@ class TestSolverFailuresAreCountable:
 class TestGuessedIvIsSurfaced:
     def test_a_chain_with_no_usable_iv_anywhere_is_flagged(self):
         pytest.importorskip("py_vollib")
-        chain = _chain([_c(100.0, "C", iv=0.0, delta=0.0)],
-                       [_c(95.0, "P", iv=0.0, delta=0.0)])
+        # W35: these contracts used to carry a solvable 1.0 x 1.2 quote, so
+        # both were SOLVED from price and the chain was not a guess at all —
+        # the flag was simply computed before the solve (R26
+        # iv-is-guessed-computed-before-the-solve). "No usable IV anywhere"
+        # means no delivered IV AND nothing to solve one from.
+        chain = _chain([_c(100.0, "C", iv=0.0, delta=0.0, bid=0.0, ask=0.0)],
+                       [_c(95.0, "P", iv=0.0, delta=0.0, bid=0.0, ask=0.0)])
         OptionsChainService.__new__(OptionsChainService)._calculate_greeks(chain)
         assert chain.iv_is_guessed is True, \
             "no usable IV anywhere means every backfilled delta is a guess"
@@ -90,8 +95,8 @@ class TestGuessedIvIsSurfaced:
         that drops this flag would silently disarm the gate all over again —
         the same fragility atm_iv already has."""
         pytest.importorskip("py_vollib")
-        chain = _chain([_c(100.0, "C", iv=0.0, delta=0.0)],
-                       [_c(95.0, "P", iv=0.0, delta=0.0)])
+        chain = _chain([_c(100.0, "C", iv=0.0, delta=0.0, bid=0.0, ask=0.0)],
+                       [_c(95.0, "P", iv=0.0, delta=0.0, bid=0.0, ask=0.0)])
         OptionsChainService.__new__(OptionsChainService)._calculate_greeks(chain)
         assert chain.iv_is_guessed is True
         assert chain.filter_liquid().iv_is_guessed is True

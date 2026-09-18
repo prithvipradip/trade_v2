@@ -120,3 +120,14 @@ def _fence_supervisor_page_stamps(tmp_path, monkeypatch):
     pytest.)"""
     import ait.orchestration.master as _m
     monkeypatch.setattr(_m, "_page_stamp_dirs", lambda: [tmp_path], raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _never_leak_frozen_settings():
+    """W35: freeze_settings() makes one configuration permanent for a PROCESS —
+    correct for the bot and the supervisor, poison for a test session, where
+    the next test would silently read the previous test's config. Any test
+    that reaches an entry point in-process is cleaned up after."""
+    import ait.config.settings as _s
+    yield
+    _s._FROZEN = None

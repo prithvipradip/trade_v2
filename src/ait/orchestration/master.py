@@ -89,7 +89,12 @@ def _log(level: str, event: str, **kw):
         return
     if not (_FILE_SINK_ENABLED or os.environ.get("AIT_ORCH_LIVE") == "1"):
         return
-    with open(LOGS_DIR / "orchestrator.log", "a") as f:
+    # W35: utf-8, explicitly. Both readers (status.py, web_logs.py) decode
+    # this file as utf-8; the writer used the host's locale encoding, so on
+    # this Windows box any non-ASCII character in an error text (an em dash in
+    # a config error, a path) was written as cp1252 and read back as U+FFFD —
+    # or raised in a strict reader. Same host-move class as W20/W21.
+    with open(LOGS_DIR / "orchestrator.log", "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
 
@@ -209,8 +214,14 @@ def _alert_gate(key: str, interval_s: float, _now: float | None = None) -> bool:
 GATEWAY_RECOVERY_AFTER_S = 600.0     # 10 min down before we intervene
 GATEWAY_RECOVERY_COOLDOWN_S = 1800.0  # at most one attempt per 30 min
 GATEWAY_MAX_RECOVERIES = 3           # then escalate to a human, do not loop
-GATEWAY_START_SCRIPT = os.environ.get(
-    "AIT_GATEWAY_START_SCRIPT", r"C:\IBC\StartGateway.bat")
+# W35 (R26 gateway-start-script-has-two-env-authorities): the BOOT launcher
+# (orchestration/gateway.py) locates IBC through IBC_DIR; this RECOVERY
+# launcher had its own unrelated default, so a relocated IBC booted but could
+# never be recovered. IBC_DIR is the one authority; AIT_GATEWAY_START_SCRIPT
+# remains an explicit override.
+GATEWAY_START_SCRIPT = (
+    os.environ.get("AIT_GATEWAY_START_SCRIPT")
+    or str(Path(os.environ.get("IBC_DIR", r"C:\IBC")) / "StartGateway.bat"))
 
 
 def _gateway_process_alive() -> bool:
@@ -1329,7 +1340,14 @@ import asyncio
 
 settings = load_settings('config.yaml')
 predictor = DirectionPredictor(settings.ml)
-range_pred = RangePredictor(threshold_pct=0.05, horizon_days=30)
+# W35: this was RangePredictor(threshold_pct=0.05, horizon_days=30) — bare
+# literals. The live bot builds its range model from ait.ml.range_spec (0.05,
+# horizon = the reachable hold, 9d), so every daily retrain rebuilt range.pkl
+# at a spec the live gate's confidence floor was never calibrated for, and the
+# bot's spec guard flagged its own fresh artifact each morning. One authority.
+from ait.ml.range_spec import live_range_spec
+_range_threshold, _range_horizon = live_range_spec(settings)
+range_pred = RangePredictor(threshold_pct=_range_threshold, horizon_days=_range_horizon)
 vol_mag_pred = VolMagnitudePredictor(threshold_pct=0.07, horizon_days=30)
 market_data = MarketDataService(None, polygon_api_key=settings.api_keys.polygon_api_key)
 historical = HistoricalDataStore()
@@ -2109,6 +2127,13 @@ def main():
     # keeper's 90s loop and the 07:30 scheduled task can both pass their
     # check-then-launch guards in the same window; the OS lock cannot race.
     _enable_file_sink()   # W34: this process IS the supervisor
+    # W35: run on the configuration we started with (see freeze_settings) — a
+    # deploy that adds a config.yaml key must not break this process's pages.
+    try:
+        from ait.config.settings import freeze_settings, load_settings
+        freeze_settings(load_settings())
+    except Exception as e:  # noqa: BLE001 — never block the supervisor on config
+        _log("warning", "settings_freeze_failed", error=str(e))
     if not _acquire_singleton_lock():
         if _singleton_lock_status == "unavailable":
             _log("critical", "orchestrator_lock_unavailable", action="exiting")

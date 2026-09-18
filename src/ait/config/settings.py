@@ -32,6 +32,11 @@ class TradingConfig(_StrictModel):
     scan_interval_seconds: int = Field(default=300, ge=30, le=3600)
     max_daily_trades: int = Field(default=5, ge=1, le=50)
     trading_hours_only: bool = True
+    no_new_entries_minutes_before_close: int = Field(default=15, ge=0, le=120,
+        description="W35 (R26 entry-blackout-cutoff-900s-is-a-bare-literal): "
+                    "no new entries inside this many minutes of the session "
+                    "close. Was `remaining < 900` in bot/scheduler.py — a "
+                    "value that manages trading with no config home (R19c).")
 
 
 class AccountConfig(_StrictModel):
@@ -603,8 +608,36 @@ def resolve_config_value(explicit, section: str, field: str, fallback_cls, setti
         return getattr(fallback_cls(), field)
 
 
+# W35: the deploy-order hazard registered in W33. Long-lived processes re-read
+# config.yaml at RUNTIME (executor.commission_estimate, options_chain's
+# liquidity resolver, the range/vol predictors, the supervisor's first page)
+# and validate it against the settings MODEL they imported at start. Every
+# model is extra=forbid, so adding ONE key to config.yaml — which every wave
+# with a new config home does — made load_settings() raise inside every
+# running process until it restarted. It happened live on 2026-09-18 (11:48-
+# 11:57 ET, position open). A process now freezes the settings it started
+# with: later reads get a COPY of that snapshot and never touch the file.
+# That is also the documented contract ("editing .env or config.yaml requires
+# a process restart", options_chain.py) — until now only half true, because a
+# process ran on its startup settings AND on whatever the file said later.
+_FROZEN: "Settings | None" = None
+
+
+def freeze_settings(settings: "Settings") -> None:
+    """Make `settings` this PROCESS's configuration for the rest of its life.
+
+    Called once by the two long-lived entry points (ait.main, the supervisor's
+    main()). Tests, scripts and research never freeze, so they keep reading
+    the file.
+    """
+    global _FROZEN
+    _FROZEN = settings.model_copy(deep=True)
+
+
 def load_settings(config_path: str | Path = "config.yaml") -> Settings:
     """Load settings from YAML file, with env var overrides for secrets."""
+    if _FROZEN is not None:
+        return _FROZEN.model_copy(deep=True)
     config_path = Path(config_path)
 
     # R5 audit: silently falling back to all-defaults gave a materially

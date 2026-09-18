@@ -102,6 +102,12 @@ async def run_bot(args: argparse.Namespace) -> None:
     if args.paper:
         settings.trading.mode = "paper"
 
+    # W35: this process runs on THIS configuration until it exits — runtime
+    # load_settings() calls get a copy of it instead of re-reading a
+    # config.yaml that a later deploy may have extended (see freeze_settings).
+    from ait.config.settings import freeze_settings
+    freeze_settings(settings)
+
     # Setup logging
     setup_logging(settings.logging)
 
