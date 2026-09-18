@@ -142,8 +142,14 @@ class IronCondor(Strategy):
         # but data collection rate matters more right now).
         # Research suggests IV rank > 50 is ideal but trades too rarely.
         import os
-        iv_floor = float(os.environ.get("AIT_IRON_CONDOR_IV_FLOOR", "15"))
+        iv_floor = contract_float("AIT_IRON_CONDOR_IV_FLOOR")
         if iv_rank < iv_floor:
+            # W36: this returned SILENTLY. On 2026-09-18 it refused every
+            # condor all session and the only trace was
+            # `signals_generated total_signals=0` — indistinguishable from a
+            # broken builder without reading this file.
+            log.info("condor_rejected_iv_rank_floor", symbol=symbol,
+                     iv_rank=round(float(iv_rank), 2), floor=iv_floor)
             return []
 
         liquid_calls = self._filter_liquid(chain.calls)
@@ -201,8 +207,8 @@ class IronCondor(Strategy):
         # upper delta bound a mis-selected 0.49-delta short PASSES every gate
         # more easily than the intended 0.20 ("the gate stack's equilibrium,
         # not an accident"). Both shorts must sit in |delta| [0.15, 0.30].
-        _band_lo = float(os.environ.get("AIT_IC_DELTA_MIN", "0.15"))
-        _band_hi = float(os.environ.get("AIT_IC_DELTA_MAX", "0.30"))
+        _band_lo = contract_float("AIT_IC_DELTA_MIN")
+        _band_hi = contract_float("AIT_IC_DELTA_MAX")
         _spd, _scd = abs(short_put.delta), abs(short_call.delta)
         if _spd == 0 and _scd == 0:
             # Deltas 0/missing on BOTH shorts — the degraded-greeks failure
@@ -222,8 +228,8 @@ class IronCondor(Strategy):
         # ~0.20-delta / ~1-EM condor). Reject when EM is unavailable: we
         # cannot verify the structure we'd be selling.
         _em = float(getattr(chain, "expected_move", 0.0) or 0.0)
-        _em_lo = float(os.environ.get("AIT_IC_EM_MIN", "0.6"))
-        _em_hi = float(os.environ.get("AIT_IC_EM_MAX", "1.3"))
+        _em_lo = contract_float("AIT_IC_EM_MIN")
+        _em_hi = contract_float("AIT_IC_EM_MAX")
         if _em <= 0:
             self._log_entry_quality(
                 symbol, "rejected", "em_unavailable", chain, short_put, short_call)

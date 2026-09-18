@@ -567,7 +567,7 @@ class PortfolioManager:
         # Uses the UNDERLYING price, so it protects even when option marks
         # are missing. Env AIT_CREDIT_TOUCH_STOP=0 disables.
         if (not should_exit and is_credit
-                and os.environ.get("AIT_CREDIT_TOUCH_STOP", "1") == "1"):
+                and contract_flag("AIT_CREDIT_TOUCH_STOP")):
             try:
                 import json as _json
                 _legs = _json.loads(trade.legs) if trade.legs else []

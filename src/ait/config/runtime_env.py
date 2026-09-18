@@ -85,6 +85,21 @@ CONTRACT_DEFAULTS: dict[str, str] = {
     "AIT_CREDIT_LOSS_LIMIT": "0",
     "AIT_ALLOW_UNDEFINED_RISK": "0",
     "AIT_SKIP_MACRO_EVENTS": "1",
+    # W36: ten values that manage trading were still raw
+    # os.environ.get("AIT_...", "<literal>") reads at their use sites — outside
+    # this contract, so outside R19c and outside the test that enforces it.
+    # Each default below IS the literal it replaces (.env on the live box sets
+    # none of them, so these are what live has been running).
+    "AIT_IRON_CONDOR_IV_FLOOR": "15",
+    "AIT_IC_DELTA_MIN": "0.15",
+    "AIT_IC_DELTA_MAX": "0.30",
+    "AIT_IC_EM_MIN": "0.6",
+    "AIT_IC_EM_MAX": "1.3",
+    "AIT_IV_RANK_CAP": "85",
+    "AIT_MAX_PER_EXPIRY": "3",
+    "AIT_ENTRY_LADDER_START": "0.25",
+    "AIT_ENTRY_ORDER_TIMEOUT": "240",
+    "AIT_CREDIT_TOUCH_STOP": "1",
 }
 
 
@@ -115,6 +130,17 @@ CONFIG_BACKED: dict[str, tuple[str, str]] = {
     "AIT_IC_MIN_CREDIT": ("backtest", "ic_min_credit"),
     "AIT_CREDIT_LOSS_LIMIT": ("backtest", "credit_loss_limit"),
     "AIT_SKIP_MACRO_EVENTS": ("risk", "skip_macro_events"),
+    # W36 — see CONTRACT_DEFAULTS.
+    "AIT_IRON_CONDOR_IV_FLOOR": ("backtest", "ic_iv_rank_floor"),
+    "AIT_IC_DELTA_MIN": ("backtest", "ic_delta_min"),
+    "AIT_IC_DELTA_MAX": ("backtest", "ic_delta_max"),
+    "AIT_IC_EM_MIN": ("backtest", "ic_em_min"),
+    "AIT_IC_EM_MAX": ("backtest", "ic_em_max"),
+    "AIT_IV_RANK_CAP": ("risk", "iv_rank_cap"),
+    "AIT_MAX_PER_EXPIRY": ("risk", "max_positions_per_expiry"),
+    "AIT_ENTRY_LADDER_START": ("positions", "entry_ladder_start"),
+    "AIT_ENTRY_ORDER_TIMEOUT": ("positions", "entry_order_timeout_seconds"),
+    "AIT_CREDIT_TOUCH_STOP": ("exit", "credit_touch_stop"),
 }
 
 _yaml_cache: dict | None = None

@@ -5852,3 +5852,97 @@ F7 rows. Open for whoever takes them: the F8 leftovers named above, `time-calend
 register live-money items outside F1-F8 listed in `reports/r26_integration_20260917.md`.
 
 ---
+
+## 2026-09-18 - W36 EXECUTED — the leftovers on this box: ten trading knobs get config homes, the silent IV floor speaks, the drain reaches the final minutes
+
+FIRST, TWO FACTS ABOUT TODAY THAT CHANGE HOW THE EARLIER ENTRIES READ.
+(a) **W35 IS LIVE, since 13:25 ET** — not "at the next deliberate restart" as its entry says. The
+    box was restarted a FOURTH time at 13:23 (System log 1074, StartMenuExperienceHost — the Start
+    menu, under the `prith` account), eleven minutes after W35 was committed. The tree was clean at
+    `1889426`, so exactly the committed code loaded. Verified: connected 13:25:46, reconcile 4 legs
+    / 0 discrepancies, zero errors or tracebacks since; 34 chains logged `iv_solved_from_price`
+    with no `chain_iv_is_a_guess`; `ibkr_order_error_captured` is firing on the bot's own probe
+    orders (W33's errorEvent route, live for the first time). CONSEQUENCE: the like-for-like
+    boundary for entry selection is **2026-09-18 13:25 ET**, and every long-lived process on this
+    box now freezes its settings, so the config.yaml lines deferred in W35 are in this commit.
+(b) **NO NEW ENTRY ALL SESSION, AND IT IS NOT A REGRESSION.** `signals_generated total_signals=0` on
+    every scan both before and after the W35 restart. Cause, measured: the condor builder's IV-rank
+    floor is 15 and today's ranks were IWM 3.6, QQQ 12.3, SPY 12.7. The builder returned `[]`
+    without a log line, so answering "why is nothing trading?" meant reading its source.
+
+HOW THIS WAVE WAS BUILT — a process change forced by (a). Four restarts in one session each deployed
+whatever the working tree held. W36 was developed in a separate git worktree
+(`../trade_v2_dev`, branch `w36-dev`) and reaches the directory the bot runs from only as a finished
+fast-forward. One trap, measured: the package is installed editable against the LIVE tree, so tests
+run from another checkout import the live source unless `PYTHONPATH=<that checkout>/src` is set.
+With it set, the worktree's HEAD baseline is identical to the live tree's (2027 passed / 46
+skipped), which is what makes it a valid place to work. Pre-fix baselines are now taken from a
+throwaway checkout of HEAD rather than by stashing files under a running bot.
+
+[1] TEN VALUES THAT MANAGE TRADING HAD NO CONFIG HOME (the R19c class; the "AIT_* keys" item of
+    F8). A census of every RAW `os.environ.get("AIT_…")` read in `src/` found 24 keys. One is a
+    contract key read raw on purpose (`AIT_ALLOW_UNDEFINED_RISK`, the env-only interlock). Nine are
+    deployment/ops switches (account, state-db and health-state paths, live-account assertion,
+    after-hours, gateway script, the supervisor's log opt-in, simulated capital, capital base); two
+    are research toggles (`AIT_BT_*`); two (`AIT_LIQ_MAX_SPREAD/MIN_VOLUME`) already override
+    config-homed `options.*` values. The remaining TEN are trading values read as
+    `os.environ.get("AIT_…", "<literal>")` at their use sites — outside the contract, so outside
+    `test_every_trading_key_has_a_config_home`, which only inspects `CONTRACT_DEFAULTS`:
+      condor builder   AIT_IRON_CONDOR_IV_FLOOR 15 · AIT_IC_DELTA_MIN/MAX 0.15/0.30 ·
+                       AIT_IC_EM_MIN/MAX 0.6/1.3            -> backtest.ic_*
+      risk manager     AIT_IV_RANK_CAP 85 · AIT_MAX_PER_EXPIRY 3   -> risk.*
+      executor         AIT_ENTRY_LADDER_START 0.25 · AIT_ENTRY_ORDER_TIMEOUT 240 -> positions.*
+      exit monitor     AIT_CREDIT_TOUCH_STOP 1                     -> exit.credit_touch_stop
+    All ten are now contract keys with `CONFIG_BACKED` homes, a settings field and a config.yaml
+    line; their readers go through `contract_float/flag`, so the existing
+    `test_no_raw_environ_reads_of_contract_keys` polices them from here on. WHERE, NOT WHAT: `.env`
+    on the live box sets none of the ten, so live has been running the literals; each default and
+    each yaml value is asserted equal to the literal it replaces. Precedence is unchanged
+    (env > config.yaml > contract default).
+
+[2] THE IV-RANK FLOOR NOW SAYS WHEN IT REFUSES: `condor_rejected_iv_rank_floor symbol iv_rank floor`.
+
+[3] `options.risk_free_rate` (0.05) replaces the bare `r = 0.05` in `_calculate_greeks`. NO dividend
+    yield was added: the R24 register examined carry/dividend structure and cleared it
+    (`model-vs-reality-cleared-checks`, "No code change"), and adding q would move every solved IV
+    and delta — a modelling change that needs its own evidence, not a config-home wave.
+
+[4] REGISTER `time-calendar-03`. `_trading_cycle` returned for the no-new-entries window ABOVE its
+    fill check and its outbox drain, and that drain call is the only one in the codebase. Ordinary
+    fills were never affected (the fast monitor books them every cycle); an ORPHAN close landing in
+    the final minutes — a reconciler/sweep/vanished booking — waited for the next session. The
+    booking steps now run first and the blackout `return` follows them. Driven through the real
+    `_trading_cycle` on the hot-path smoke rig, with a control that no entry is attempted in that
+    window. NOT DONE: the finding's second half (drain once from `_post_market`, and bucket stale
+    rows by session instead of skipping them) — W14/W32 rebuilt the claim and staleness rules since
+    R24, so that half needs re-verifying against today's drain before anyone changes it.
+
+STATUS OF F7's `commission-estimate-live-config-read`: W35's `freeze_settings` removed parts (a)
+and (d) in every live process (the read is served from the frozen snapshot, so it is neither
+CWD-bound nor re-parsed, and the per-call divergence log is gone). Part (c) — the subtracted
+estimate is not persisted, so a config change ACROSS a restart between fill and true-up can drift
+the booked P&L by the difference — is still open.
+
+PROOF. `tests/test_w36_config_homes_and_drain.py`, 27 executing tests. Run against an untouched
+checkout of `1889426`: **26 failed, 1 passed** — the pass is the control (no entry is attempted
+inside the no-new-entries window, true on both trees). One test was strengthened after its first
+pre-fix run showed it passing vacuously ("the floor follows config" asserted the ABSENCE of a log
+line that pre-fix never existed); it now raises the configured floor to 50 and requires the refusal
+to report floor=50. No `inspect.getsource`.
+
+VERIFICATION: full fast lane in the dev worktree **2054 passed / 46 skipped / 0 failed** (373s),
+`scripts/typecheck.py` OK; deploy smoke run in the live tree after the fast-forward (below).
+
+STATE AT HANDOFF: committed, fast-forwarded into the live tree and pushed. **Not running yet** — the
+processes started at 13:25 ET hold W32-W35 in memory; W36 loads at the next restart. It changes no
+trading value, so that restart needs no special timing. Because those processes freeze their
+settings, the config.yaml lines added here cannot disturb them.
+WHAT TO WATCH AFTER THE NEXT RESTART: `condor_rejected_iv_rank_floor` on low-IV days (it will be
+the common line until IV rank clears 15); `liquidity_thresholds_resolved` unchanged.
+STILL OPEN ON THIS BOX: part (c) of the commission-estimate finding; the second half of
+`time-calendar-03`. A decision that is YOURS, not code: the IV-rank floor of 15 is what is keeping
+the verdict sample from growing on days like today — it now has a config home
+(`backtest.ic_iv_rank_floor`), and lowering it is a change to entry selection that should be made
+on evidence (a walk-forward at the candidate floor), not to force activity.
+
+---

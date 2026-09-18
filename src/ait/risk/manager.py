@@ -433,7 +433,8 @@ class RiskManager:
             # sat at the 98.8th percentile PRE-EARNINGS and the IV-rank floor
             # said TRADE). Fires only on a real iv_rank; 0/unknown skips
             # (orchestrator must pass signal.iv_rank — flagged for main).
-            _iv_cap = float(os.environ.get("AIT_IV_RANK_CAP", "85"))
+            from ait.config.runtime_env import contract_float as _cf
+            _iv_cap = _cf("AIT_IV_RANK_CAP")
             if request.iv_rank and request.iv_rank > _iv_cap:
                 return TradeValidation(
                     False,
@@ -468,7 +469,8 @@ class RiskManager:
         if request.option is not None and getattr(request.option, "expiry", None):
             _req_expiry = str(request.option.expiry).replace("-", "")[:8]
         if _req_expiry:
-            _max_per_expiry = int(os.environ.get("AIT_MAX_PER_EXPIRY", "3"))
+            from ait.config.runtime_env import contract_float as _cf2
+            _max_per_expiry = int(_cf2("AIT_MAX_PER_EXPIRY"))
             _same_expiry = 0
             for p in self._open_positions:
                 _pe = p.get("expiry")

@@ -1362,18 +1362,23 @@ class TradingOrchestrator:
         # executor guardrail (rate limit, INST-5 defined-risk, GOV-1 NBBO,
         # market-hours). Module retired to deprecated/src/.
 
-        # 5. Check if we should avoid new trades (last 15 min)
-        if self._scheduler.should_avoid_new_trades():
-            log.debug("skipping_new_trades", reason="close_to_market_close")
-            return
-
-        # 6. Check fill status of pending orders (entry + exit)
+        # 5. Check fill status of pending orders (entry + exit)
         _filled_entries, completed_exits = await self._executor.check_fills_safe()
         await self._process_completed_exits(completed_exits)
 
-        # 6b. W1: book closes nobody booked — reconciler/sweep closes and
+        # 5b. W1: book closes nobody booked — reconciler/sweep closes and
         # bookings lost to a crash between the sqlite close and the callback.
         await self._drain_exit_outbox()
+
+        # 6. Check if we should avoid new trades (the no-new-entries window).
+        # W36 (register time-calendar-03): this `return` used to sit ABOVE
+        # steps 5/5b, and 5b is the ONLY call site of the outbox drain — so an
+        # orphan close landing in the last minutes of the session was not
+        # booked until the next one. Booking is not an entry; only what
+        # follows this line is.
+        if self._scheduler.should_avoid_new_trades():
+            log.debug("skipping_new_trades", reason="close_to_market_close")
+            return
 
         # 7. Get effective universe (learning + capital tier filtering)
         adaptor = self._learning.adaptor

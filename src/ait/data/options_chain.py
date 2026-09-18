@@ -131,6 +131,18 @@ def _resolve_liquidity(config: "OptionsConfig | None") -> tuple[int, int, float]
 
 
 @lru_cache(maxsize=1)
+def _risk_free_rate() -> float:
+    """W36: the Black-Scholes rate for the IV solve and the Greeks backfill —
+    config.yaml options.risk_free_rate. Was a bare `r = 0.05`. Cached like the
+    liquidity thresholds (one value per process)."""
+    try:
+        from ait.config.settings import load_settings
+        return float(load_settings().options.risk_free_rate)
+    except Exception:  # noqa: BLE001 — never let config break the Greeks
+        return 0.05
+
+
+@lru_cache(maxsize=1)
 def _liquidity_thresholds() -> tuple[int, int, float]:
     """Process-wide resolved thresholds (see _resolve_liquidity).
 
@@ -943,7 +955,7 @@ class OptionsChainService:
             return
 
         S = chain.underlying_price
-        r = 0.05  # Risk-free rate approximation
+        r = _risk_free_rate()
         t = max(chain.dte / 365.0, 0.001)  # Time to expiry in years
 
         # W35 (R26 iv-is-guessed-computed-before-the-solve /

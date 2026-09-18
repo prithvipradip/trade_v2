@@ -35,7 +35,8 @@ log = get_logger("execution.executor")
 import os as _os_t
 # R7: 240s default — the mid-first reprice ladder needs 3 steps x 45s before
 # the cancel; 90s cancelled orders before the marketable step could fire.
-DEFAULT_ORDER_TIMEOUT = int(_os_t.environ.get("AIT_ENTRY_ORDER_TIMEOUT", "240"))
+from ait.config.runtime_env import contract_float as _contract_float_t  # W36
+DEFAULT_ORDER_TIMEOUT = int(_contract_float_t("AIT_ENTRY_ORDER_TIMEOUT"))
 
 # R19 (audit finding executor.py:453): terminal fallback for the single-leg
 # wide-spread reject. The 0.15 literal used to live inline in
@@ -752,7 +753,7 @@ class TradeExecutor:
         import os as _os_l
         _base_mag = _live_mid_mag if _live_mid_mag else abs(signal.entry_price)
         _, aggressive_offset = combo_entry_limit(_base_mag, is_credit)
-        _start_frac = float(_os_l.environ.get("AIT_ENTRY_LADDER_START", "0.25"))
+        _start_frac = _contract_float_t("AIT_ENTRY_LADDER_START")
         limit_price = _ladder_limit(_base_mag, aggressive_offset,
                                     _start_frac, is_credit)
         # R5 audit: for debit combos the marketable cross (up to +15%) pushed

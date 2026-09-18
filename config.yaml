@@ -20,6 +20,7 @@ trading:
   scan_interval_seconds: 300           # 5 minutes between scans
   max_daily_trades: 12                  # Raised for higher trade volume / faster learning
   trading_hours_only: true             # Only trade during RTH (9:30-16:00 ET)
+  no_new_entries_minutes_before_close: 15   # W35: was a bare 900s in bot/scheduler.py
 
 account:
   pdt_protection: true                 # Enable Pattern Day Trader guard
@@ -36,6 +37,8 @@ positions:
                                        # adding short-premium exposure (credit cap stays 6)
   max_position_pct: 0.05               # 5% of portfolio per position
   max_contracts_per_trade: 1           # Learning mode: 1 contract/trade = min cost = max # of trades
+  entry_ladder_start: 0.25             # W36: home for AIT_ENTRY_LADDER_START
+  entry_order_timeout_seconds: 240     # W36: home for AIT_ENTRY_ORDER_TIMEOUT
   max_portfolio_delta: 0.30            # Net delta limit (absolute)
   max_portfolio_risk_pct: 0.20         # Aggregate open capital-at-risk cap (now WIRED — was a
                                        # phantom 0.02 never read while manager hardcoded 0.20;
@@ -67,6 +70,8 @@ risk:
     - [999.0, 2]
   max_symbol_concentration_pct: 0.20   # Max fraction of account in one symbol (gate 6c)
   skip_macro_events: true              # R19c: macro-event protection (2026-07-08 decision).
+  iv_rank_cap: 85                      # W36: home for AIT_IV_RANK_CAP (no new short premium above)
+  max_positions_per_expiry: 3          # W36: home for AIT_MAX_PER_EXPIRY
                                        # Condors are code-exempt from the flatten; this governs
                                        # entry gates + undefined-risk flattens.
   credit_vix_halt: 28                  # No NEW credit entries at/above this VIX (audit R2)
@@ -83,6 +88,7 @@ options:
   min_open_interest: 10                # Loosened: paper account on delayed data
   min_volume: 0                        # Delayed feeds report volume=0; relaxed pydantic floor too
   max_bid_ask_spread_pct: 0.40         # Loosened: stale-quote spreads run wider
+  risk_free_rate: 0.05                 # W36: was a bare r = 0.05 in the Greeks math
   strategies:
     # USER DECISION 2026-07-22 (at close #12): IRON CONDOR ONLY — the stated
     # mission (PLAN line 3). The fillers were churn: long_straddle bled -55%
@@ -135,6 +141,14 @@ backtest:
   ic_min_credit_width: 0.10            # Credit/width floor — 0.10 pairs with k=1.6 wings
                                        # (2026-08-04 promotion: absolute credit demand unchanged)
   ic_min_credit: 0.70                  # Min total credit $/share (50% TP must clear ~3x costs)
+  # W36: homes for the condor builder's remaining env knobs. Values = what live
+  # has been running. The IV-rank floor is what refused every condor on
+  # 2026-09-18 (IWM 3.6 / QQQ 12.3 / SPY 12.7) — it now logs when it does.
+  ic_iv_rank_floor: 15                 # AIT_IRON_CONDOR_IV_FLOOR
+  ic_delta_min: 0.15                   # AIT_IC_DELTA_MIN  (short-strike |delta| band)
+  ic_delta_max: 0.30                   # AIT_IC_DELTA_MAX
+  ic_em_min: 0.6                       # AIT_IC_EM_MIN     (short strike, in expected moves)
+  ic_em_max: 1.3                       # AIT_IC_EM_MAX
   credit_loss_limit: 0                 # Flat credit stop x credit; 0 = DISABLED
                                        # (R6/R12-B1: every flat level underperformed touch-close)
                                        # Optuna optimizes per walk-forward window [0.3 – 2.0]
@@ -225,6 +239,7 @@ exit:
   # W33: with no quote and no fresh mark, pay at most this multiple of the
   # entry credit (never more than the wing width). Was: the raw wing width.
   exit_blind_credit_multiple: 2.0
+  credit_touch_stop: true              # W36: home for AIT_CREDIT_TOUCH_STOP
   trailing_stop_pct: 0.25             # Trail 25% below high water mark
   breakeven_trigger_pct: 0.30         # Move stop to breakeven at +30% P&L
   initial_stop_loss_pct: 0.50         # Fixed stop before breakeven activates

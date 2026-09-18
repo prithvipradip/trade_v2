@@ -54,6 +54,13 @@ class PositionConfig(_StrictModel):
                     "real cap was hardcoded 0.20 in manager.py — now wired "
                     "(audit 2026-07-07 item 3.3). Default matches the "
                     "2026-06-30 operating value.")
+    entry_ladder_start: float = Field(default=0.25, ge=0.0, le=1.0,
+        description="W36: config home for AIT_ENTRY_LADDER_START — the "
+                    "fraction of the way from mid to the marketable price at "
+                    "which a combo entry ladder starts.")
+    entry_order_timeout_seconds: int = Field(default=240, ge=30, le=3600,
+        description="W36: config home for AIT_ENTRY_ORDER_TIMEOUT — how long "
+                    "an entry order may work before it is cancelled.")
     max_contracts_per_trade: int = Field(default=10, ge=1, le=100,
         description="Hard cap on contracts per trade. Low values (e.g. 1) keep "
                     "cost-per-trade minimal so the account can hold many more "
@@ -111,6 +118,14 @@ class RiskConfig(_StrictModel):
                     "was a hardcoded 0.20 that numerically shadowed "
                     "positions.max_portfolio_risk_pct while meaning something "
                     "different.")
+    iv_rank_cap: float = Field(default=85.0, ge=0.0, le=100.0,
+        description="W36: config home for AIT_IV_RANK_CAP — no new short "
+                    "premium above this IV rank (R12: top-bucket IV carried "
+                    "negative VRP).")
+    max_positions_per_expiry: int = Field(default=3, ge=1, le=20,
+        description="W36: config home for AIT_MAX_PER_EXPIRY — positions "
+                    "sharing one expiry stack pin/gamma risk into a single "
+                    "settlement date.")
     skip_macro_events: bool = Field(default=True,
         description="R19c: macro-event protection (entry gates + rule-3d "
                     "flatten for undefined-risk shapes). Config home for "
@@ -159,6 +174,12 @@ class OptionsConfig(_StrictModel):
     min_open_interest: int = Field(default=100, ge=0)
     min_volume: int = Field(default=50, ge=0)
     max_bid_ask_spread_pct: float = Field(default=0.10, ge=0.01, le=0.50)
+    risk_free_rate: float = Field(default=0.05, ge=0.0, le=0.25,
+        description="W36: the Black-Scholes risk-free rate used to solve IVs "
+                    "and backfill Greeks (was a bare `r = 0.05` in "
+                    "options_chain._calculate_greeks). No dividend yield is "
+                    "modelled: the R24 register checked carry/dividend "
+                    "structure and cleared it.")
     strategies: list[str] = [
         "long_call",
         "long_put",
@@ -205,6 +226,20 @@ class BacktestConfig(_StrictModel):
                     "config.yaml home for AIT_IC_MIN_CREDIT_WIDTH (contract "
                     "default 0.10 since the 2026-08-04 wide-wing promotion). "
                     "Precedence: env > this > CONTRACT_DEFAULTS.")
+    ic_iv_rank_floor: float = Field(default=15.0, ge=0.0, le=100.0,
+        description="W36: config home for AIT_IRON_CONDOR_IV_FLOOR — the "
+                    "condor builder refuses below this IV rank. It did so "
+                    "SILENTLY: on 2026-09-18 it refused every condor all "
+                    "session (IWM 3.6, QQQ 12.3, SPY 12.7) with no log line.")
+    ic_delta_min: float = Field(default=0.15, ge=0.01, le=0.50,
+        description="W36: config home for AIT_IC_DELTA_MIN (R12-B delta band).")
+    ic_delta_max: float = Field(default=0.30, ge=0.05, le=0.60,
+        description="W36: config home for AIT_IC_DELTA_MAX (R12-B delta band).")
+    ic_em_min: float = Field(default=0.6, ge=0.0, le=3.0,
+        description="W36: config home for AIT_IC_EM_MIN — each short strike "
+                    "must sit at least this many expected moves from spot.")
+    ic_em_max: float = Field(default=1.3, ge=0.1, le=5.0,
+        description="W36: config home for AIT_IC_EM_MAX.")
     ic_min_credit: float = Field(default=0.70, ge=0.10, le=5.0,
         description="R19c: absolute minimum total credit ($/share) for a "
                     "condor — config.yaml home for AIT_IC_MIN_CREDIT. At a 50% "
@@ -463,6 +498,10 @@ class ExitConfig(_StrictModel):
                     "may pay is this multiple of the entry credit (and never "
                     "more than the wing width). W7 priced that state at the "
                     "raw width — the structural max loss.")
+    credit_touch_stop: bool = Field(default=True,
+        description="W36: config home for AIT_CREDIT_TOUCH_STOP — close a "
+                    "credit structure when the underlying touches a short "
+                    "strike (R12-B1: the best-ranked credit stop).")
     trailing_stop_pct: float = Field(default=0.25, ge=0.10, le=0.50)
     breakeven_trigger_pct: float = Field(default=0.30, ge=0.10, le=0.80)
     partial_exit_levels: list[dict] = [
