@@ -48,6 +48,7 @@ def _mgr_down(*, last_alert=None):
     m._last_restart = None
     m._gateway_down_since = None
     m._last_gateway_alert = last_alert
+    m._last_gateway_escalation = None   # W34: the escalation's own throttle
     m._gateway_recoveries = 0
     m._last_gateway_recovery = None
     m._log_handle = None

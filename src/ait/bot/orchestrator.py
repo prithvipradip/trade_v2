@@ -629,17 +629,52 @@ class TradingOrchestrator:
 
     # --- Trading Phases ---
 
-    async def _pre_market(self) -> None:
-        """Pre-market preparation (runs 30 min before open)."""
-        log.info("pre_market_starting")
+    async def _reconcile_with_broker(self, phase: str) -> bool:
+        """W34 (2026-09-17 incident): reconcile only against a CONNECTED broker.
 
-        # 1. Reconcile positions with IBKR
+        The Gateway was down from 07:59 ET. ibkr_client.get_positions()
+        returns [] when disconnected, so the 09:00 pre-market reconcile
+        compared the book against NOTHING and reported clean — the one check
+        that exists to catch a book/broker mismatch, passing because it could
+        not see. The bot reconnects lazily (only client calls that go through
+        ensure_connected), and _pre_market made none before reconciling.
+        Returns False, pages, and leaves the reconcile OWED when the broker
+        cannot be reached; _trading_cycle settles the debt.
+        """
+        if not await self._ibkr.ensure_connected():
+            self._reconcile_pending = True
+            log.error("reconcile_skipped_broker_disconnected", phase=phase)
+            await self._send_notification(
+                f"{phase.upper().replace('_', '-')}: broker NOT connected — "
+                f"positions were NOT reconciled. This is not a clean result. "
+                f"I will reconcile as soon as the connection returns; check "
+                f"the Gateway."
+            )
+            return False
+        self._reconcile_pending = False
         result = await self._reconciler.reconcile()
         if result.discrepancies:
             await self._send_notification(
                 f"Position discrepancies found:\n" +
                 "\n".join(result.discrepancies[:5])
             )
+        return True
+
+    async def _reconcile_if_owed(self) -> None:
+        """W34: run the reconcile a disconnected phase could not."""
+        if not getattr(self, "_reconcile_pending", False):
+            return
+        if not await self._ibkr.ensure_connected():
+            return
+        log.warning("reconcile_owed_running_now")
+        await self._reconcile_with_broker("deferred")
+
+    async def _pre_market(self) -> None:
+        """Pre-market preparation (runs 30 min before open)."""
+        log.info("pre_market_starting")
+
+        # 1. Reconcile positions with IBKR
+        await self._reconcile_with_broker("pre_market")
 
         # 2. Reset daily counters
         self._circuit_breaker.check_daily_reset()
@@ -1288,6 +1323,9 @@ class TradingOrchestrator:
             self._cb_was_tripped = True
             return
         self._cb_was_tripped = False
+
+        # W34: a phase that found the broker disconnected still owes a reconcile.
+        await self._reconcile_if_owed()
 
         # 2. Sync risk manager with live positions (fixes stale position tracking)
         await self._sync_risk_manager_positions()

@@ -117,16 +117,21 @@ class TestSingletonLockFailsClosed:
     Two bots on one account is the 2026-07-13 position-reversal class."""
 
     def test_lock_plumbing_failure_refuses_to_start(self, tmp_path):
+        # W34: the page is durably throttled (a stamp file) because the
+        # process exits after sending it - keep the stamp out of the box's
+        # real logs/ and temp dirs.
         with patch("builtins.open", side_effect=PermissionError("denied")), \
+             patch.object(M, "_page_stamp_dirs", return_value=[tmp_path]), \
              patch.object(M, "_alert") as alert:
             got = M._acquire_singleton_lock(tmp_path / "orchestrator.lock")
         assert got is False, "a failed lock must NOT report the lock as held"
         alert.assert_called_once()
         assert "SECOND BOT" in alert.call_args[0][0]
 
-    def test_a_failing_page_cannot_flip_the_gate_open(self):
+    def test_a_failing_page_cannot_flip_the_gate_open(self, tmp_path):
         """Paging is best-effort; it must never turn a refusal into consent."""
         with patch("builtins.open", side_effect=PermissionError("denied")), \
+             patch.object(M, "_page_stamp_dirs", return_value=[tmp_path]), \
              patch.object(M, "_alert", side_effect=RuntimeError("telegram down")):
             assert M._acquire_singleton_lock() is False
 
@@ -235,6 +240,7 @@ class TestFailedPageDoesNotBurnTheThrottle:
         m._gateway_recoveries = recoveries
         m._last_gateway_recovery = None
         m._last_gateway_alert = None
+        m._last_gateway_escalation = None   # W34: the escalation's own throttle
         return m, now
 
     def test_failed_page_leaves_the_throttle_unconsumed(self):
@@ -242,7 +248,7 @@ class TestFailedPageDoesNotBurnTheThrottle:
         with patch.object(M.os.path, "exists", return_value=False), \
              patch.object(M, "_alert", return_value=False) as alert:
             m._maybe_recover_gateway(7497, now)
-            assert m._last_gateway_alert is None, "a dropped page must not burn the throttle"
+            assert m._last_gateway_escalation is None, "a dropped page must not burn the throttle"
             m._maybe_recover_gateway(7497, now + timedelta(minutes=2))
         assert alert.call_count == 2, "the next cycle must retry a page that never landed"
 
@@ -251,7 +257,7 @@ class TestFailedPageDoesNotBurnTheThrottle:
         with patch.object(M.os.path, "exists", return_value=False), \
              patch.object(M, "_alert", return_value=True) as alert:
             m._maybe_recover_gateway(7497, now)
-            assert m._last_gateway_alert is not None
+            assert m._last_gateway_escalation is not None
             m._maybe_recover_gateway(7497, now + timedelta(minutes=2))
         assert alert.call_count == 1, "a delivered page must still be throttled"
 
@@ -261,7 +267,7 @@ class TestFailedPageDoesNotBurnTheThrottle:
         m, now = self._mgr(200, recoveries=M.GATEWAY_MAX_RECOVERIES)
         with patch.object(M, "_alert", return_value=False) as alert:
             m._maybe_recover_gateway(7497, now)
-            assert m._last_gateway_alert is None
+            assert m._last_gateway_escalation is None
             m._maybe_recover_gateway(7497, now + timedelta(minutes=2))
         assert alert.call_count == 2
 

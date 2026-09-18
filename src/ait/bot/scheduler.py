@@ -54,7 +54,12 @@ class MarketScheduler:
             return TradingPhase.OFF_HOURS
 
         current_time = now.time()
-        close = get_market_close()
+        # W34 (R26 w24-get-current-phase-ignores-its-own-now): bare
+        # get_market_close() reads the REAL clock's date, so the caller's
+        # `now` — W24's whole mechanism — was ignored for the close boundary:
+        # 13:30 ET on a 13:00 half-day read MARKET_OPEN unless today happened
+        # to be that half-day.
+        close = get_market_close(now.date())
         # On half-days the post-market window is 15 minutes after actual close
         close_dt = datetime.combine(now.date(), close, tzinfo=ET)
         post_market_end = (close_dt + timedelta(minutes=15)).time()
@@ -142,7 +147,7 @@ class MarketScheduler:
             return 0
 
         now = now_et()
-        close = datetime.combine(now.date(), get_market_close(), tzinfo=ET)
+        close = datetime.combine(now.date(), get_market_close(now.date()), tzinfo=ET)
         return max(0, (close - now).total_seconds())
 
     def should_avoid_new_trades(self) -> bool:

@@ -5597,3 +5597,140 @@ stepping by 0.10 under `cap`.
 NEXT: W34 (F6, ops substrate) — tests written, in progress in the same session.
 
 ---
+
+## 2026-09-18 - W34 EXECUTED — R26 F6, ops substrate and supervisor honesty (+ the two 09-17 incident items)
+
+READ THIS FIRST — W32, W33 AND W34 ARE LIVE ON THE WINDOWS BOX, AND NOT BY A PLANNED DEPLOY. This
+box took a Windows 10 -> 11 feature upgrade today and rebooted THREE times mid-session with the QQQ
+condor open: 08:49, 10:44 (System log 1074, MusNotificationUx.exe) and 12:13 ET (1074, winlogon).
+The stack auto-started each time on whatever the working tree held:
+  - 10:48 ET: a clean 9819c28 (W21-W30). Verified: the live `exit_outbox` had no `core_booked`.
+  - 12:20 ET: 85c165a (W32 + W33, committed and suite-green) PLUS the W34 source below, which was
+    fully applied (12:06) and green on its own 22 tests but had NOT yet passed the full suite.
+    Verified after the fact: `core_booked`/`steps_done` now exist on the live table; the bot
+    connected 12:20:54, reconcile matched 4 legs / 0 discrepancies; zero errors or tracebacks in
+    `ait.log` / `bot_stdout.log` since; the supervisor's forensic log is being written (so
+    `main()` enabled the new opt-in sink); position +$92 (+18.5%) at 12:26.
+The full suite then passed on exactly that source (below), so nothing had to be rolled back. The
+lesson is registered under OPERATOR ACTIONS: this host must not be allowed to reboot itself in RTH,
+and "the working tree IS the deploy" means an unfinished wave is one reboot from production.
+
+WHAT R26 FOUND, AND WHAT CHANGED (all in `orchestration/master.py` unless noted):
+
+[1] foreign-bot-scan-unreadable-process-table-permits-a-second-bot (live_money, fail-open). An
+    unreadable process table returned [] = "no foreign bot", and `ait.main` takes no lock of its
+    own, so any psutil fault admitted a second bot on the account. `_scan_foreign_bot_pids` now
+    returns None for "could not look"; `start()` refuses and pages (30-min gate). A transient fault
+    costs one 2-minute health cycle.
+
+[2] w23-module-scope-time-import. W23 added `from ait.utils.time import ET, now_et` at module
+    scope; that module builds the NYSE calendar at import, so a broken pandas stack killed the
+    SUPERVISOR at import — no restart, no recovery, no page. `ET`/`now_et` are now stdlib zoneinfo
+    here (same "US/Eastern" key, so the same object). Proven in a real subprocess with
+    `pandas_market_calendars` blocked at import.
+
+[3] gateway-escalation-page-starved-by-shared-throttle. `health_check` stamped
+    `_last_gateway_alert` with the generic "will resume automatically" page and handed the SAME
+    `now` to the escalation gate: `(now - now) > 30min` is never true, so with Telegram HEALTHY the
+    MANUAL ACTION page never arrived. The escalations have their own latch
+    (`_last_gateway_escalation`). Driven through the real `health_check` for 80 simulated minutes,
+    both shapes (budget spent; script-absent host = the 09-15 TWS-closed case).
+
+[4] wedged-jvm-kill. (i) The attempt was counted BEFORE the try, so a kill/launch that raised
+    still spent budget and the escalation then claimed "3 automatic restart attempts" for three
+    no-ops. The cooldown still applies to a failure; the budget counts only real launches; a launch
+    that cannot start pages MANUAL ACTION itself. (ii) The kill was
+    `Get-Process java | Stop-Process -Force` — every JVM on the box, none of the scanned pids,
+    PowerShell-only. It is now `_gateway_jvm_pids()` (JVMs whose command line carries
+    ibgateway / ibcalpha / \Jts\ / Trader Workstation — checked against the live Gateway's real
+    command line) killed by pid through psutil.
+
+    A SAFETY PROPERTY THIS FORCED: the new kill path scans the REAL process table, and this suite
+    runs on the live trading host. On the first run two older W13 tests (which patch only
+    `_gateway_process_alive`) reached it with the live Gateway's pid in hand. `_kill_pid` refuses
+    to run under pytest, and that refusal is what the log shows:
+    `gateway_recovery_failed | error=refusing to kill pid 17872 under pytest` — twice. Without the
+    guard the suite would have killed the broker Gateway mid-session. Pinned by
+    `test_the_real_kill_refuses_to_run_under_pytest`.
+
+[5] probe-output-planted-in-production-forensic-log. `PYTEST_CURRENT_TEST` was the only gate on
+    the file sink, so any probe/REPL/script importing this module wrote to
+    `logs/orchestrator.log` (the 09-16 record asserts a 3.5h hang and a fabricated Gateway outage).
+    The sink is OFF unless the process is the supervisor (`main()` enables it) or sets
+    `AIT_ORCH_LIVE=1`. `tests/test_r16_ops_fixes.py::test_production_run_appends` pinned the
+    opposite; it now opts in, and a sibling asserts the default is no-write. Proven in real
+    subprocesses, and live: the supervisor restarted at 12:20 is logging normally.
+
+[6] singleton-lock page unthrottled under the keeper. The page is sent by a process that then
+    exits; `_ALERT_GATE_LAST` is a module dict, so each ~90s keeper relaunch paged again (~960 a
+    day). `_durable_alert_gate` keeps the stamp as a file mtime — in logs/ or the temp dir, NOT
+    data/, because the faults that trigger this are faults OF data/. Proven with three real
+    processes -> one page. `main()` also now distinguishes `held` from `unavailable` instead of
+    logging both as `orchestrator_already_running`.
+    SECOND FENCE FOUND THE SAME WAY: the first W34 run left
+    `logs/.ait_page_singleton_lock_unavailable.stamp` on the live box — for 30 minutes a REAL
+    singleton failure would not have paged. Removed, and `tests/conftest.py` now redirects every
+    test's stamps to tmp_path (same class as the R12 model-artifact fence).
+
+[7] w24-get-current-phase-ignores-its-own-now (`bot/scheduler.py`). Bare `get_market_close()` read
+    the real clock's date, so 13:30 ET on a 13:00 half-day was MARKET_OPEN unless today happened to
+    be that half-day. Both call sites pass `now.date()`.
+
+[8] 09-17 INCIDENT, supervisor half: the Gateway port was examined ONLY on the bot-DOWN branch. The
+    Gateway window was closed by mistake at 07:59 ET; the bot process stayed up, every health check
+    said `bot_healthy`, and recovery never ran. `_check_gateway_while_bot_runs` now runs on the
+    healthy branch: no page of its own inside the 10-minute grace (IBC's nightly 23:45 exit must
+    not become a nightly page), then the same `_maybe_recover_gateway` as the bot-down branch.
+    BEHAVIOUR CHANGE TO EXPECT TONIGHT: ~23:55 ET the supervisor will relaunch the Gateway itself
+    and send one "attempted automatic restart (1/3)" page. That supersedes operator item A1 (IBC
+    `AutoRestartTime`) unless the nightly page is unwanted, in which case A1 removes it.
+
+[9] 09-17 INCIDENT, bot half (`bot/orchestrator.py`): `get_positions()` returns [] when
+    disconnected, so the 09:00 pre-market reconcile compared the book against nothing and reported
+    clean. `_reconcile_with_broker` reconciles only against a connected broker; otherwise it pages
+    "NOT reconciled — this is not a clean result" and leaves the reconcile OWED, which
+    `_trading_cycle` settles once `ensure_connected()` succeeds.
+
+NOT DONE HERE, ON PURPOSE: the F6 table's two W22 Telegram rows
+(`w22-unrecognised-telegram-updates-are-dropped`, `w22-leaked-msgid-keeps-a-dead-position-pending`)
+are in `execution/manual_positions.py` — Ahmed's W22/W30 module — and were not in the list assigned
+to this box. Still open. Also still open from Ahmed's own registration: every bot stop ends in
+SIGKILL.
+
+OLDER TESTS CHANGED, AND WHY: `test_w13::test_live_but_wedged_jvm_is_killed_before_relaunch`
+asserted `"Stop-Process"` in the argv — the defect itself; it now asserts the scanned pid is what
+gets killed. The W13/W16/W18 `__new__`-built managers gained `_last_gateway_escalation`, and the
+three W16 "failed page does not burn the throttle" tests assert on the escalation latch they are
+actually about. Two W16 singleton tests keep their stamp in tmp_path.
+
+W33 FOLLOW-THROUGH: the four `exit:` keys are now in config.yaml. That was unsafe at 11:48 (old
+in-memory models, `extra=forbid`) and is safe now only because every long-lived process restarted at
+12:20 with the new model. The deploy-order hazard itself remains registered and unfixed.
+
+OPERATOR ACTIONS (yours, not code): (a) keep this host from rebooting in RTH. Measured at 12:40 ET:
+Windows 11 Pro 10.0.26200, NO restart pending (WU RebootRequired=False, CBS RebootPending=False),
+active hours already 8-17. Active hours did not help because the 10:44 restart was started from the
+update prompt under the `prith` account (the upgrade's second reboot at 12:13 was SYSTEM) — so the
+rule is procedural: no "Restart now" while a position is open. (b) Decide whether tonight's supervisor-driven
+Gateway relaunch page is acceptable or whether to set IBC `AutoRestartTime` (A1).
+
+PROOF. `tests/test_w34_ops_substrate.py`, 22 executing tests; real subprocesses wherever the claim is
+about separate processes (the import, the forensic sink, the durable throttle). Re-run against the
+pre-fix source in this session (the three `src/` files stashed, tests kept): **19 failed, 3 passed**.
+The three green ones are controls: a readable empty process table still starts, and the two
+forensic-log opt-in paths (which pre-fix wrote unconditionally). No `inspect.getsource`.
+
+VERIFICATION (Windows box, the live host): full fast lane **2007 passed / 46 skipped / 0 failed**
+(467s) with zero `refusing to kill` lines (no test reached the real kill path) and no stray page
+stamps left in logs/ or the temp dir; `scripts/typecheck.py` OK; `scripts/smoke_deploy.py` ->
+SMOKE PASS (13 checks).
+
+STATE AT HANDOFF: committed and pushed; **LIVE on the Windows box since the 12:20 ET restart** (see
+the top of this entry). Ahmed's box is unaffected until he pulls and restarts.
+WHAT TO WATCH: tonight ~23:55 ET `gateway_down_while_bot_running` then `gateway_recovery_attempt`
+and one restart page; `gateway_recovered` when port 4002 answers. Any `bot_start_refused_process_
+table_unreadable` would be new and means psutil cannot read the table on this host.
+NEXT: W35 (F8 + the F7 share). The two `options_chain.py` findings first — they reach strike
+selection; their tests are written and red (5 failed / 2 controls).
+
+---

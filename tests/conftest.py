@@ -105,3 +105,18 @@ def _isolate_model_artifacts(tmp_path, monkeypatch):
     for _mod in (_rp, _vp, _en, _ml):
         if hasattr(_mod, "MODEL_DIR"):
             monkeypatch.setattr(_mod, "MODEL_DIR", tmp_path, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _fence_supervisor_page_stamps(tmp_path, monkeypatch):
+    """W34: the supervisor's durable page throttle is a stamp FILE (the process
+    that pages then exits, so a module dict cannot remember). The first W34 run
+    left logs/.ait_page_singleton_lock_unavailable.stamp on the live box — for
+    the next 30 minutes a REAL singleton-lock failure would not have paged.
+    Same class as the model-artifact fence above: this suite runs on the
+    trading host, so every test gets its stamps in tmp_path. (The other W34
+    hazard, a test reaching the real process table and killing the live
+    Gateway, is fenced in production code: master._kill_pid refuses under
+    pytest.)"""
+    import ait.orchestration.master as _m
+    monkeypatch.setattr(_m, "_page_stamp_dirs", lambda: [tmp_path], raising=False)

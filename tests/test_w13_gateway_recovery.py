@@ -36,6 +36,7 @@ def _mgr(down_minutes: float, *, recoveries: int = 0,
         None if last_recovery_minutes_ago is None
         else now - timedelta(minutes=last_recovery_minutes_ago))
     m._last_gateway_alert = None
+    m._last_gateway_escalation = None   # W34: the escalation's own throttle
     return m, now
 
 
@@ -72,14 +73,21 @@ class TestWedgedProcessIsKilledFirst:
         """THE 2026-09-08 SHAPE: a JVM that never opened the port holds it
         against a relaunch, so starting on top of it cannot work."""
         m, now = _mgr(down_minutes=20)
+        # W34 (R26 wedged-jvm-kill): this test pinned the defect — it asserted
+        # `Stop-Process` in a name-wide `Get-Process java` shell-out that took
+        # none of the scanned pids and killed every JVM on the box. The kill
+        # is now by pid, Gateway JVMs only, no shell.
+        killed: list[int] = []
         with patch.object(M, "_gateway_process_alive", return_value=True), \
+             patch.object(M, "_gateway_jvm_pids", return_value=[17964]), \
+             patch.object(M, "_kill_pid", side_effect=killed.append), \
              patch.object(M.os.path, "exists", return_value=True), \
              patch.object(M.subprocess, "run") as run, \
              patch.object(M.subprocess, "Popen") as popen, \
              patch.object(M.time, "sleep"), patch.object(M, "_alert"):
             m._maybe_recover_gateway(4002, now)
-        assert run.called, "wedged JVM was not killed"
-        assert "Stop-Process" in " ".join(run.call_args[0][0])
+        assert killed == [17964], "wedged Gateway JVM was not killed"
+        run.assert_not_called()
         popen.assert_called_once()
 
     def test_absent_process_is_simply_started(self):
@@ -205,6 +213,8 @@ class TestTheOutageThatMotivatedThis:
         boundary."""
         m, now = _mgr(down_minutes=201)
         with patch.object(M, "_gateway_process_alive", return_value=True), \
+             patch.object(M, "_gateway_jvm_pids", return_value=[17964]), \
+             patch.object(M, "_kill_pid"), \
              patch.object(M.os.path, "exists", return_value=True), \
              patch.object(M.subprocess, "run"), \
              patch.object(M.subprocess, "Popen") as popen, \

@@ -249,12 +249,29 @@ class TestLogPytestGuard:
     def test_production_run_appends(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(_master, "LOGS_DIR", tmp_path)
         monkeypatch.delenv("PYTEST_CURRENT_TEST")
+        # W34 (R26 probe-output-planted-in-production-forensic-log): "not
+        # under pytest" is no longer enough — the supervisor's main() enables
+        # the sink. This is that process.
+        monkeypatch.setattr(_master, "_FILE_SINK_ENABLED", True)
         _master._log("info", "real_event", pid=42)
         content = (tmp_path / "orchestrator.log").read_text()
         assert "orchestrator.real_event" in content
         assert "pid=42" in content
         # stdout sink is unconditional in both modes
         assert "orchestrator.real_event" in capsys.readouterr().out
+
+    def test_a_process_that_merely_imports_master_writes_nothing(
+            self, tmp_path, monkeypatch, capsys):
+        """W34: this test used to pin the OPPOSITE — that any non-pytest
+        process appends. That is how probe output reached the production
+        forensic log (a fabricated outage and a 3.5h hang on 2026-09-16)."""
+        monkeypatch.setattr(_master, "LOGS_DIR", tmp_path)
+        monkeypatch.delenv("PYTEST_CURRENT_TEST")
+        monkeypatch.delenv("AIT_ORCH_LIVE", raising=False)
+        monkeypatch.setattr(_master, "_FILE_SINK_ENABLED", False)
+        _master._log("error", "bot_hung_heartbeat_stale", age_min=180)
+        assert not (tmp_path / "orchestrator.log").exists()
+        assert "bot_hung_heartbeat_stale" in capsys.readouterr().out
 
 
 # ==========================================================================

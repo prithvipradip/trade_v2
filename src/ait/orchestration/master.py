@@ -26,8 +26,24 @@ from threading import Event
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from zoneinfo import ZoneInfo
+
 from ait.utils.process import scan_pids
-from ait.utils.time import ET, now_et
+
+# W34 (R26 w23-module-scope-time-import): W23 added
+# `from ait.utils.time import ET, now_et` here. That module builds the NYSE
+# calendar at import (pandas_market_calendars -> pandas -> numpy), so a broken
+# scientific stack — the classic ABI break after an upgrade — killed the
+# SUPERVISOR at import: no bot restart, no Gateway recovery, no page, while
+# the bot may be holding condors. This file states the rule itself, twice
+# (_assume_market_open_on_clock, _in_post_market_window): resolve ET through
+# stdlib zoneinfo. Same key as ait.utils.time.ET, so it is the same object.
+ET = ZoneInfo("US/Eastern")
+
+
+def now_et() -> datetime:
+    """Current ET time — stdlib only (see the note above)."""
+    return datetime.now(ET)
 
 # Project root
 ROOT = Path(__file__).resolve().parents[3]
@@ -42,6 +58,21 @@ REPORTS_DIR.mkdir(exist_ok=True)
 # Logging — standalone (no structlog dependency so orchestrator stays light)
 # ---------------------------------------------------------------------------
 
+# W34 (R26 probe-output-planted-in-production-forensic-log): the file sink was
+# gated ONLY on PYTEST_CURRENT_TEST, so any probe, script or REPL that imported
+# this module and drove BotManager appended to logs/orchestrator.log. The
+# 2026-09-16 record asserts a 3.5h hang, a fabricated 09:06-10:10 Gateway outage
+# and a tmp-fixture singleton failure — none of which happened. The sink is
+# now OFF unless the process is the supervisor (main() enables it) or sets
+# AIT_ORCH_LIVE=1 on purpose. stdout is unchanged.
+_FILE_SINK_ENABLED = False
+
+
+def _enable_file_sink() -> None:
+    global _FILE_SINK_ENABLED
+    _FILE_SINK_ENABLED = True
+
+
 def _log(level: str, event: str, **kw):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     extras = " | ".join(f"{k}={v}" for k, v in kw.items())
@@ -55,6 +86,8 @@ def _log(level: str, event: str, **kw):
     # failures during incident forensics. Under pytest, drop the file sink
     # (the print above still reaches captured stdout for assertions).
     if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    if not (_FILE_SINK_ENABLED or os.environ.get("AIT_ORCH_LIVE") == "1"):
         return
     with open(LOGS_DIR / "orchestrator.log", "a") as f:
         f.write(line + "\n")
@@ -115,6 +148,42 @@ def _alert(message: str) -> bool:
 _ALERT_GATE_LAST: dict[str, float] = {}
 
 
+def _page_stamp_dirs() -> list[Path]:
+    """Where a durable page stamp may live. NOT data/: the faults that need a
+    durable throttle (permissions, a full disk) are faults OF data/."""
+    import tempfile
+    return [LOGS_DIR, Path(tempfile.gettempdir())]
+
+
+def _durable_alert_gate(key: str, interval_s: float) -> bool:
+    """W34: _alert_gate for a page sent by a process that then EXITS.
+
+    _ALERT_GATE_LAST is a module dict; a relaunched process re-imports it
+    empty. keeper_ait.bat relaunches a supervisor that cannot take its lock
+    every ~90s, so the SINGLETON LOCK page went out once per relaunch — ~960
+    a day on the only alert channel, while the whole stack was down. The
+    stamp is a file's mtime. If no stamp can be written anywhere, page: loud
+    beats silent.
+    """
+    now = time.time()
+    name = f".ait_page_{key}.stamp"
+    dirs = _page_stamp_dirs()
+    for d in dirs:
+        try:
+            f = Path(d) / name
+            if f.exists() and (now - f.stat().st_mtime) < interval_s:
+                return False
+        except OSError:
+            continue
+    for d in dirs:
+        try:
+            (Path(d) / name).write_text(str(now))
+            break
+        except OSError:
+            continue
+    return True
+
+
 def _alert_gate(key: str, interval_s: float, _now: float | None = None) -> bool:
     """True if an alert keyed `key` may fire now; records the attempt.
 
@@ -169,6 +238,53 @@ def _gateway_process_alive() -> bool:
         return False
     return bool(pids)
 
+#: What marks a JVM as IB's. The live Gateway's command line carries
+#: C:\Jts\ibgateway\<ver>\jars\... and, under IBC, ibcalpha.ibc.IbcGateway.
+_GATEWAY_JVM_MARKERS = ("ibgateway", "ibcalpha", "\\jts\\", "/jts/",
+                        "trader workstation")
+
+
+def _gateway_jvm_pids() -> list[int] | None:
+    """W34 (R26 wedged-jvm-kill): PIDs of IB Gateway/TWS JVMs — and only those.
+
+    The wedged-JVM kill was `Get-Process java | Stop-Process -Force`: every
+    JVM on the box, none of the pids the scan had just found, PowerShell-only.
+    None = the process table could not be read.
+    """
+    try:
+        import psutil
+        pids: list[int] = []
+        for p in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                name = (p.info.get("name") or "").lower()
+                cmd = " ".join(p.info.get("cmdline") or []).lower()
+                pid = p.info["pid"]
+            except (psutil.NoSuchProcess, psutil.AccessDenied,
+                    psutil.ZombieProcess):
+                continue
+            if "java" in name and any(m in cmd for m in _GATEWAY_JVM_MARKERS):
+                pids.append(pid)
+        return pids
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _kill_pid(pid: int) -> None:
+    """Kill one process by pid (cross-platform, no shell).
+
+    Refuses under pytest. The suite runs ON the live trading host, and this
+    path scans the REAL process table: a test that forgets one patch would
+    otherwise kill the live broker Gateway mid-session. Tests replace this
+    function; nothing in a test run may reach the real one.
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        raise RuntimeError(f"refusing to kill pid {pid} under pytest")
+    import psutil
+    proc = psutil.Process(pid)
+    proc.kill()
+    proc.wait(timeout=10)
+
+
 def _gateway_listening(port: int, host: str = "127.0.0.1") -> bool:
     """Cheap check: is something accepting connections on the Gateway port?
 
@@ -199,6 +315,11 @@ def _gateway_listening(port: int, host: str = "127.0.0.1") -> bool:
 # process exclusion behaves identically either way.
 
 _singleton_lock_handle = None  # module-held: lock lives exactly as long as this process
+# W34: WHY the last acquisition returned what it did. "held" (another
+# supervisor has it) and "unavailable" (the lock plumbing itself failed) both
+# return False, and main() logged both as orchestrator_already_running — a
+# false forensic line pointing away from the real cause one line above it.
+_singleton_lock_status = "unknown"   # acquired | held | unavailable
 
 
 # W18: the IB API ports, with what each one means. This is the same set
@@ -233,7 +354,7 @@ def _port_hint(configured: int) -> str:
 
 def _acquire_singleton_lock(lock_path: Path | None = None) -> bool:
     """Atomically claim the single-orchestrator lock. False = already held."""
-    global _singleton_lock_handle
+    global _singleton_lock_handle, _singleton_lock_status
     path = lock_path or (DATA_DIR / "orchestrator.lock")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -248,6 +369,7 @@ def _acquire_singleton_lock(lock_path: Path | None = None) -> bool:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             fh.close()
+            _singleton_lock_status = "held"
             return False
         try:  # informational only — who holds it (the LOCK is the guard)
             fh.truncate(0)
@@ -256,8 +378,10 @@ def _acquire_singleton_lock(lock_path: Path | None = None) -> bool:
         except OSError:
             pass
         _singleton_lock_handle = fh
+        _singleton_lock_status = "acquired"
         return True
     except Exception as e:  # noqa: BLE001
+        _singleton_lock_status = "unavailable"
         # R25 plat-06 (W16 A4): this returned True — and True means "you hold
         # the lock, proceed". A permission fault, a full disk, or a missing
         # fcntl therefore ADMITTED A SECOND SUPERVISOR: two supervisors means
@@ -271,10 +395,13 @@ def _acquire_singleton_lock(lock_path: Path | None = None) -> bool:
         # book. Fail CLOSED — and page, so the refusal is never silent.
         _log("critical", "singleton_lock_error_fail_closed", error=str(e))
         try:
-            _alert(f"SINGLETON LOCK UNAVAILABLE ({type(e).__name__}: {e}). "
-                   f"Refusing to start the supervisor rather than risk a "
-                   f"SECOND BOT on the same account. MANUAL ACTION NEEDED — "
-                   f"check data/ permissions and free disk space.")
+            # W34: durable throttle — this process exits right after paging
+            # and the keeper relaunches it every ~90s.
+            if _durable_alert_gate("singleton_lock_unavailable", 1800):
+                _alert(f"SINGLETON LOCK UNAVAILABLE ({type(e).__name__}: {e}). "
+                       f"Refusing to start the supervisor rather than risk a "
+                       f"SECOND BOT on the same account. MANUAL ACTION NEEDED — "
+                       f"check data/ permissions and free disk space.")
         except Exception:  # noqa: BLE001 — paging must never flip the gate open
             pass
         return False
@@ -306,7 +433,7 @@ def _release_singleton_lock() -> None:
 # Process-table scans (R16 #10 / #57)
 # ---------------------------------------------------------------------------
 
-def _scan_foreign_bot_pids() -> list[int]:
+def _scan_foreign_bot_pids() -> list[int] | None:
     """R16 #10 (+ macOS fix 2026-09-14): PIDs of any pre-existing 'ait.main'
     trading-bot process.
 
@@ -336,15 +463,20 @@ def _scan_foreign_bot_pids() -> list[int]:
     exactly that). The real bot is spawned at master.py:585 as
     [sys.executable, "-m", "ait.main", "--paper"], so `-m` adjacency is exact.
 
-    Fail direction is unchanged and still fail-OPEN ([] = "no foreign bot",
-    which permits a start). R25 registered that as a standing lead; changing
-    it would block starts on a transient scan failure and is out of W16 scope.
+    W34 (R26 foreign-bot-scan-unreadable-process-table-permits-a-second-bot):
+    this failed OPEN — an unreadable process table returned [] ("no foreign
+    bot"), and nothing downstream self-limits (ait.main takes no lock), so any
+    psutil fault admitted a second bot on the account. W15/W16 settled this
+    trade for the sibling gates: a bot that does not start is visible and
+    costs opportunity; two bots cost money and corrupt the book. None now
+    means "could not look" and the caller refuses. A transient fault costs one
+    2-minute health cycle.
     """
     pids = scan_pids(module="ait.main")
     if pids is None:
         _log("warning", "foreign_bot_scan_failed",
-             detail="process table unreadable; proceeding as if none found")
-        return []
+             detail="process table unreadable; refusing to assume none")
+        return None
     return pids
 
 
@@ -490,6 +622,13 @@ class BotManager:
         self._max_restarts = 10
         self._last_restart: datetime | None = None
         self._last_gateway_alert: datetime | None = None
+        # W34 (R26 gateway-escalation-page-starved-by-shared-throttle): the
+        # MANUAL ACTION pages shared _last_gateway_alert with the generic
+        # "unreachable ... will resume automatically" page. health_check
+        # stamped that latch and then handed the SAME `now` to the escalation
+        # gate, so (now - now) > 30min was never true: with Telegram healthy
+        # the operator got the wrong instruction for the whole outage.
+        self._last_gateway_escalation: datetime | None = None
         # ops-substrate-01: a Gateway that never opens its port is an
         # ABSORBING state — see _maybe_recover_gateway.
         self._gateway_down_since: datetime | None = None
@@ -530,8 +669,8 @@ class BotManager:
                 < GATEWAY_RECOVERY_COOLDOWN_S):
             return
         if self._gateway_recoveries >= GATEWAY_MAX_RECOVERIES:
-            if (self._last_gateway_alert is None
-                    or (now - self._last_gateway_alert) > timedelta(minutes=30)):
+            if (self._last_gateway_escalation is None
+                    or (now - self._last_gateway_escalation) > timedelta(minutes=30)):
                 # W17 w17-01b: consume the throttle only on a DELIVERED page.
                 # _alert (:64) is single-shot — one urlopen, no retry, no
                 # dead-channel accounting — and returns False on a dropped
@@ -542,7 +681,7 @@ class BotManager:
                           f"{GATEWAY_MAX_RECOVERIES} automatic restart attempts "
                           f"({down_for / 60:.0f} min). MANUAL ACTION NEEDED — "
                           f"check for a login/2FA prompt on the Gateway window."):
-                    self._last_gateway_alert = now
+                    self._last_gateway_escalation = now
             return
 
         script = GATEWAY_START_SCRIPT
@@ -559,8 +698,8 @@ class BotManager:
             # made); this shares the 30-min throttle above so the 2-min health
             # loop cannot spam.
             _log("warn", "gateway_recovery_unavailable", script=script)
-            if (self._last_gateway_alert is None
-                    or (now - self._last_gateway_alert) > timedelta(minutes=30)):
+            if (self._last_gateway_escalation is None
+                    or (now - self._last_gateway_escalation) > timedelta(minutes=30)):
                 # W17 w17-01b: consume the throttle only on a DELIVERED page.
                 # _alert (:64) is single-shot — one urlopen, no retry, no
                 # dead-channel accounting — and returns False on a dropped
@@ -572,32 +711,82 @@ class BotManager:
                           f"configured on this host ({script} not found). "
                           f"MANUAL ACTION NEEDED — start TWS/Gateway; the bot "
                           f"resumes on its own once the port answers."):
-                    self._last_gateway_alert = now
+                    self._last_gateway_escalation = now
             return
 
-        self._gateway_recoveries += 1
+        # W34 (R26 wedged-jvm-kill): the counter used to move BEFORE the try,
+        # so a kill/launch that raised still spent budget — three no-ops then
+        # produced an escalation claiming "3 automatic restart attempts". The
+        # COOLDOWN applies to a failure too (else a broken launcher is retried
+        # every 2-minute health check); the BUDGET counts only real launches.
         self._last_gateway_recovery = now
         wedged = _gateway_process_alive()
+        jvm_pids = (_gateway_jvm_pids() or []) if wedged else []
         _log("warn", "gateway_recovery_attempt",
-             attempt=self._gateway_recoveries, down_minutes=round(down_for / 60),
-             wedged_process=wedged, script=script)
+             attempt=self._gateway_recoveries + 1,
+             down_minutes=round(down_for / 60),
+             wedged_process=wedged, jvm_pids=jvm_pids, script=script)
         try:
-            if wedged:
-                # A JVM that never opened the port holds it against a relaunch.
-                subprocess.run(
-                    ["powershell", "-NoProfile", "-Command",
-                     "Get-Process java -ErrorAction SilentlyContinue | "
-                     "Stop-Process -Force"],
-                    capture_output=True, timeout=30)
+            if jvm_pids:
+                # A JVM that never opened the port holds it against a
+                # relaunch. Kill exactly the Gateway JVMs that were scanned —
+                # never every `java` on the box.
+                for _pid in jvm_pids:
+                    _kill_pid(_pid)
                 time.sleep(5)
             subprocess.Popen([script], shell=True,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            _alert(f"IB Gateway was down {down_for / 60:.0f} min — attempted "
-                   f"automatic restart ({self._gateway_recoveries}/"
-                   f"{GATEWAY_MAX_RECOVERIES}). The bot resumes on its own "
-                   f"once port {port} answers.")
         except Exception as e:  # noqa: BLE001 — recovery must never kill the supervisor
             _log("error", "gateway_recovery_failed", error=str(e))
+            if _alert_gate("gateway_launch_failed", 1800):
+                _alert(f"IB Gateway has been down {down_for / 60:.0f} min and the "
+                       f"automatic restart could not be launched "
+                       f"({type(e).__name__}: {e}). MANUAL ACTION NEEDED — "
+                       f"start the Gateway by hand.")
+            return
+        self._gateway_recoveries += 1
+        _alert(f"IB Gateway was down {down_for / 60:.0f} min — attempted "
+               f"automatic restart ({self._gateway_recoveries}/"
+               f"{GATEWAY_MAX_RECOVERIES}). The bot resumes on its own "
+               f"once port {port} answers.")
+
+    def _note_gateway_up(self) -> None:
+        """Gateway is answering: clear the outage state so a LATER outage
+        re-alerts and gets a fresh recovery budget."""
+        self._last_gateway_alert = None
+        self._last_gateway_escalation = None
+        if self._gateway_down_since is not None:
+            _log("info", "gateway_recovered",
+                 down_seconds=round(
+                     (datetime.now() - self._gateway_down_since).total_seconds()),
+                 recoveries_used=self._gateway_recoveries)
+            self._gateway_down_since = None
+            self._gateway_recoveries = 0
+
+    def _check_gateway_while_bot_runs(self) -> None:
+        """W34 (2026-09-17 incident): the Gateway port was examined ONLY on
+        the bot-DOWN branch. At 07:59 ET the Gateway window was closed by
+        mistake; the bot process stayed up, so every health check logged
+        bot_healthy and recovery never ran — a running bot that cannot mark,
+        trade or exit is not healthy. No page of its own before the grace
+        period (IBC's nightly exit would make it a nightly page); after it,
+        _maybe_recover_gateway relaunches and pages exactly as it does when
+        the bot is down.
+        """
+        try:
+            gw_port = int(os.environ.get("IBKR_PORT", "4002"))
+            if _gateway_listening(gw_port):
+                self._note_gateway_up()
+                return
+            now = datetime.now()
+            if self._gateway_down_since is None:
+                self._gateway_down_since = now
+            _log("warn", "gateway_down_while_bot_running", port=gw_port,
+                 down_seconds=round(
+                     (now - self._gateway_down_since).total_seconds()))
+            self._maybe_recover_gateway(gw_port, now)
+        except Exception as e:  # noqa: BLE001 — never break the health loop
+            _log("warning", "gateway_check_while_running_failed", error=str(e))
 
     @property
     def is_running(self) -> bool:
@@ -617,6 +806,18 @@ class BotManager:
         # one connect). Refuse loudly instead; the operator must resolve the
         # orphan (it is a live trading process — never auto-kill a bot).
         foreign = _scan_foreign_bot_pids()
+        if foreign is None:
+            _log("critical", "bot_start_refused_process_table_unreadable")
+            if _alert_gate("foreign_bot_scan_unreadable", 1800):
+                _alert(
+                    "REFUSING to start the trading bot: the process table "
+                    "could not be read, so I cannot rule out a bot that is "
+                    "already running — and two bots on one account is the "
+                    "07-13 duplicate-order class. Retrying every health "
+                    "cycle; if this persists, check psutil/permissions on "
+                    "the host."
+                )
+            return
         if foreign:
             _log("critical", "bot_start_refused_foreign_bot_running",
                  pids=foreign)
@@ -749,6 +950,7 @@ class BotManager:
         """Check if bot is alive, restart if crashed."""
         if self.is_running:
             _log("debug", "bot_healthy", pid=self._proc.pid)
+            self._check_gateway_while_bot_runs()
             # R6 (user-approved): HANG detection — process-exists is not
             # process-alive. The bot touches data/bot_heartbeat every ~30s
             # while its trading loop runs; stale >15 min DURING MARKET HOURS
@@ -883,17 +1085,9 @@ class BotManager:
             return
 
         # Gateway is up — a fresh start attempt may have cleared whatever was
-        # wrong; reset the gateway-alert latch so the next outage re-alerts.
-        self._last_gateway_alert = None
-        # ops-substrate-01: Gateway is answering again — reset the outage
-        # timer and the recovery budget so a LATER outage gets fresh attempts.
-        if self._gateway_down_since is not None:
-            _log("info", "gateway_recovered",
-                 down_seconds=round(
-                     (datetime.now() - self._gateway_down_since).total_seconds()),
-                 recoveries_used=self._gateway_recoveries)
-            self._gateway_down_since = None
-            self._gateway_recoveries = 0
+        # wrong; reset the gateway-alert latches so the next outage re-alerts,
+        # and the outage timer + recovery budget so it gets fresh attempts.
+        self._note_gateway_up()
 
         # Reset restart counter if last restart was >30 min ago — a transient
         # blip shouldn't burn the budget toward a permanent give-up.
@@ -1914,8 +2108,12 @@ def main():
     # R16 #66: atomic single-instance gate BEFORE any side effects — the
     # keeper's 90s loop and the 07:30 scheduled task can both pass their
     # check-then-launch guards in the same window; the OS lock cannot race.
+    _enable_file_sink()   # W34: this process IS the supervisor
     if not _acquire_singleton_lock():
-        _log("info", "orchestrator_already_running", action="exiting")
+        if _singleton_lock_status == "unavailable":
+            _log("critical", "orchestrator_lock_unavailable", action="exiting")
+        else:
+            _log("info", "orchestrator_already_running", action="exiting")
         return
     _log("info", "orchestrator_starting", pid=os.getpid())
     _alert("supervisor started — bot + web services coming up.")

@@ -212,6 +212,19 @@ exit:
   # wing width, which dominated at $39-60 wings and priced take-profits at
   # 6-10x the mark (61 of 63 exits rejected by IBKR's price band).
   exit_mark_multiple: 1.5
+  # W33 / R26 F1: the ceiling is compared with an ASK-side price, so it keeps
+  # at least this much absolute headroom above the mark (four-leg half-spreads
+  # do not shrink with the mark; 0.52-0.58 measured on QQQ 09-11).
+  exit_min_ceiling_headroom: 0.60
+  # W33: a broker-stated price band caps later exit attempts for this long.
+  # Was a hardcoded hour, which could pin a stop below a market that had moved.
+  exit_band_ttl_seconds: 300
+  # W33: each consecutive no-quote exit placement steps this far above the
+  # last (anchor + cross + n*step, capped) instead of repeating itself.
+  exit_reprice_step: 0.10
+  # W33: with no quote and no fresh mark, pay at most this multiple of the
+  # entry credit (never more than the wing width). Was: the raw wing width.
+  exit_blind_credit_multiple: 2.0
   trailing_stop_pct: 0.25             # Trail 25% below high water mark
   breakeven_trigger_pct: 0.30         # Move stop to breakeven at +30% P&L
   initial_stop_loss_pct: 0.50         # Fixed stop before breakeven activates
