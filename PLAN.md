@@ -5480,3 +5480,120 @@ c368a0f with one QQQ condor open; `state.py`, `orchestrator.py`, `executor.py` a
 NEXT: W33 (F1) — the exit path, in progress in the same session.
 
 ---
+
+## 2026-09-18 - W33 EXECUTED — R26 F1, the W7 exit rebuild corrected (seven findings + two riders)
+
+WHY THIS ONE FIRST AFTER F2: a QQQ condor is open (T-20260917-095601-aa4fa8, +16% at 11:50 ET, 40%
+take-profit tier). Its exit will run this code path. On 09-11 that path produced seven consecutive
+band-rejected orders in sixteen minutes and only cleared when the BAG happened to quote.
+
+W7 shipped 20/20 green with every one of these defects present, because each W7 test called one
+helper in isolation with a fresh mark in hand. Every W33 test drives the real path instead: the real
+ib_insync `Wrapper`, the real `IBKRClient`, the real `TradeExecutor.check_fills`, the real
+`_close_multi_leg`.
+
+THE SEVEN, AND WHAT CHANGED:
+
+[1] exit-band-reject-text-never-reaches-parser. ib_insync 0.9.86 lists 202 in `warningCodes` and
+    never appends a warning to `trade.log` (pinned by a test, so an upgrade that changes this is
+    noticed). `ib.errorEvent` was the only route and nothing subscribed. No `exit_band_*` key has
+    ever been written — 204 `Warning 202` lines in the retained logs, zero captures — so every band
+    rule W7 built was inert. `IBKRClient` now subscribes, keeps the broker's text per orderId for
+    codes 110/201/202/10318 (bounded: 256 orders x 8 messages), and `check_fills` reads it next to
+    the order log. Proven wire-to-state: `Wrapper.error(77, 202, <the verbatim 09-11 text>)` +
+    `orderStatus(Cancelled)` -> `bot_state['exit_band_T-SPY'] == {band: 3.69, market: 3.17}`.
+
+[2] band-cap-clamps-at-or-above-the-band. `max(min(l, b), min(f, b))` with `l > b` is `b` on every
+    input, and IBKR's text is "at or MORE aggressive than". `_under_band()` lands one whole tick
+    below (1.745 -> 1.74, 3.50 -> 3.49); a mark-derived floor can no longer lift it back over.
+
+[3] no-quote-fallback-prices-at-the-ceiling. The ceiling WAS the order price: 1.5 x mark, 0.94-1.14
+    above the stated band on 7 of 7 live attempts, identical on every backoff. A no-quote order is
+    now `anchor + cross + n * exit_reprice_step`, capped — the ceiling is only ever a cap. `n`
+    counts this trade's consecutive no-quote placements (own counter: R14's strike count resets on
+    the slow re-price cadence, which is exactly the resting-unfilled case that needs the step). All
+    seven live 09-11 marks now price under their own bands on the first attempt (3.29 vs 3.69).
+
+[4] zero-bid-sold-wing-aborts-leg-synthesis and [5] one-sided-leg-priced-from-the-wrong-side. Every
+    leg is priced from its conservative side and never the other: a leg we buy needs an OFFER (bid
+    only -> None, a decision rather than an accident); a leg we sell is worth its bid, and 0.00 is a
+    bid. IBKR's -1 ("nobody bids") contributes 0 on a CREDIT buyback only. That restriction is not
+    in the audit's suggested fix and is deliberate: the first version applied it everywhere and the
+    R13 suite caught it pricing a long straddle's close at zero — giving the position away. NaN / a
+    silent ticker is missing data, not a quote, and still returns None, so a dead feed cannot
+    synthesize a price from half the legs.
+
+[6] mark-ceiling-clamps-below-the-ask-at-low-marks. The ceiling is compared with an ask-side price
+    while the mark is a mid, and a four-leg half-spread does not shrink with the mark (0.52-0.58
+    measured on QQQ 09-11). `exit_min_ceiling_headroom` (0.60) floors the headroom:
+    `mark + max(cross, (mult-1)*mark, headroom)`. The probe case (mark 0.60, legs offering 1.08) now
+    places 1.18, was 0.90. The incident ceilings are unchanged (1.40 -> 2.10, 8.76 -> 13.14) and the
+    R13 garbage-quote guard still binds (9.90 ask on a 1.00 mark -> 1.60).
+
+[7] raw-wing-width-fallback-still-reachable. A mark 901s old priced the exit at the raw width
+    ($39-60 wings: the structural max loss; 0.90 vs 39.00 for a 120-second difference in mark age).
+    Now: a stale mark is still the anchor (cap widened to the blind cap, since the market may have
+    moved); with no mark at all the anchor is the entry credit; the blind cap is
+    `min(width, exit_blind_credit_multiple * credit)` (2.0). With nothing to anchor on, refuse and
+    page. DEVIATION FROM THE AUDIT'S SUGGESTION: it asked for `entry_credit + k * expected_move`.
+    Expected move needs spot and IV, which are unavailable in exactly the no-feed state this branch
+    handles; the entry credit is the one number always in hand.
+
+RIDERS: `stale-exit-quality-tuple` (F8) — `_last_exit_quality` is cleared at the top of every
+multi-leg close and set by the no-quote branch, so a non-placing exit can no longer hand its numbers
+to the next trade's slippage record. Poll telemetry — one `combo_exit_quote_poll` line per attempt
+with what the BAG and each leg actually showed (`nan/nan`, `0/nan`, `-1/0.05`); the 09-11 diagnosis
+had to be reconstructed from a probe because nothing logged it.
+
+A HAZARD W33 CREATES AND CLOSES. Bands were never captured before, so W7's one-hour band lifetime
+was never exercised. Live, it would cap a touch stop at 13:50 below a market that had moved through
+a band stated against a take-profit at 13:31 — and an order under the market draws no new reject to
+correct it. Bands now expire after `exit_band_ttl_seconds` (300; a live reject loop re-states one
+every 30-180s) and are ignored once the fresh mark has risen to or through them.
+
+TWO R13 TESTS CHANGED ON PURPOSE. `test_exit_order_safety.py` pinned "no quote -> LMT AT the width".
+That is the finding. They now assert: still a LMT, still bounded by the width, still paged, priced
+at entry credit + cross.
+
+NEW FINDING, REGISTERED (deploy-order hazard, live-affecting, not fixed here). `_StrictModel` is
+`extra=forbid`, and long-lived processes re-read config.yaml at runtime (`executor.py:2623`
+commission estimate, `options_chain.py:98`, the supervisor's first `_alert`). Adding a key to
+config.yaml therefore breaks `load_settings()` in every RUNNING process until it restarts. I did
+exactly that at 11:48 ET today with the bot live and a position open, caught it at 11:57, reverted
+the yaml, and confirmed neither process logged a failure in the window. Proven against the
+in-memory model: `ExitConfig(**yaml_with_new_key)` at 9819c28 -> `extra_forbidden`. CONSEQUENCE FOR
+THIS WAVE: the four new settings ship as defaults in `settings.py` only; their config.yaml lines are
+added in the restart step, not before. The root fix is F7's
+`commission-estimate-live-config-read` class (resolve through injected settings, never re-read).
+
+ALSO FOUND WHILE WORKING: Windows Update restarted this box at 10:44 ET today, mid-RTH, with the
+position open (System log 1074, MusNotificationUx.exe). The stack auto-started at 10:48 on a clean
+9819c28 tree — verified, not assumed: the live `exit_outbox` table has no `core_booked` column, so
+the bot's StateManager was the pre-W32 one (my W32 patch scripts are stamped 11:27+). **W28/W29/W30
+and the watchdog fix are therefore now DEPLOYED here**, by accident. Active hours need setting on this box (operator action).
+
+PROOF. `tests/test_w33_exit_pricing_corrective.py`, 32 executing tests. Re-run against the pre-fix
+source in this session (the four `src/` files stashed, tests kept): **29 failed, 3 passed**. The
+three green ones are controls that must hold on both trees: the ib_insync premise
+(`test_ib_insync_really_does_drop_the_202_from_the_order_log`), `test_stepping_never_passes_the_ceiling`
+and `test_the_incident_ceilings_are_unchanged`. Honest note: one of the 29
+(`test_fully_quoted_legs_are_unchanged`) is red pre-fix only because the helper's new
+`credit_buyback` keyword does not exist there; its arithmetic was already right. No
+`inspect.getsource`.
+
+VERIFICATION (Windows box, the live host): full fast lane **1984 passed / 46 skipped / 0 failed**
+(465s); `scripts/typecheck.py` OK; `scripts/smoke_deploy.py` -> SMOKE PASS (13 checks).
+
+STATE AT HANDOFF: committed and pushed, **deployed nowhere**. The running bot (PID 10448, started
+10:48 ET by the Windows Update reboot) is on 9819c28 — W21-W30 — with the QQQ condor open. W32 and
+W33 both take effect at the next restart. DEPLOY STEP FOR W33 (in this order): stop the stack, add
+the four `exit:` keys to config.yaml (`exit_min_ceiling_headroom: 0.60`, `exit_band_ttl_seconds: 300`,
+`exit_reprice_step: 0.10`, `exit_blind_credit_multiple: 2.0`), start the stack. Until then they run
+on the identical defaults in `settings.py`.
+WHAT TO WATCH ON THE FIRST LIVE EXIT: `combo_exit_quote_poll` (what the BAG and legs showed);
+`ibkr_order_error_captured` + a non-empty `exit_band_<trade_id>` if the broker band-rejects; on a
+no-quote exit, `combo_exit_no_quote_pricing_from_anchor` with `attempt` rising and `limit_price`
+stepping by 0.10 under `cap`.
+NEXT: W34 (F6, ops substrate) — tests written, in progress in the same session.
+
+---

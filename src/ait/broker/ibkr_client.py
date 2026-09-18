@@ -52,8 +52,16 @@ class IBKRClient:
         # loop on first acquire; the client can be built before one exists).
         self._reconnect_lock: asyncio.Lock | None = None
 
+        # W33 (R26 exit-band-reject-text-never-reaches-parser): what the broker
+        # SAID about an order, keyed by orderId. ib_insync 0.9.86 classes 202
+        # ("Order Canceled - reason: ...") as a WARNING and never appends it
+        # to trade.log, so the executor's band parser read an empty log on
+        # every one of 204 band rejects. errorEvent is the only route.
+        self._order_errors: dict[int, list[tuple[float, int, str]]] = {}
+
         # Wire up disconnect handler
         self._ib.disconnectedEvent += self._on_disconnect
+        self._ib.errorEvent += self._on_error
 
     @property
     def ib(self) -> IB:
@@ -458,6 +466,34 @@ class IBKRClient:
         """Handle unexpected disconnection."""
         self._connected = False
         log.warning("ibkr_unexpected_disconnect")
+
+    #: Codes that carry the broker's reason for refusing or cancelling an
+    #: ORDER. 201 rejected, 202 cancelled (incl. the price-band text), 110
+    #: price does not conform, 10318 price-band/cap variants.
+    _ORDER_ERROR_CODES = frozenset({110, 201, 202, 10318})
+    _ORDER_ERRORS_MAX_ORDERS = 256
+    _ORDER_ERRORS_MAX_PER_ORDER = 8
+
+    def _on_error(self, reqId, errorCode, errorString, contract=None) -> None:
+        """W33: keep the broker's stated reason per order (bounded)."""
+        try:
+            if errorCode not in self._ORDER_ERROR_CODES or reqId is None or reqId <= 0:
+                return
+            import time as _time
+            bucket = self._order_errors.setdefault(int(reqId), [])
+            bucket.append((_time.time(), int(errorCode), str(errorString)))
+            del bucket[:-self._ORDER_ERRORS_MAX_PER_ORDER]
+            while len(self._order_errors) > self._ORDER_ERRORS_MAX_ORDERS:
+                # dicts iterate in insertion order: drop the oldest order
+                self._order_errors.pop(next(iter(self._order_errors)))
+            log.info("ibkr_order_error_captured", order_id=int(reqId),
+                     code=int(errorCode), text=str(errorString)[:240])
+        except Exception as e:  # noqa: BLE001 — never raise into ib_insync's loop
+            log.debug("ibkr_order_error_capture_failed", error=str(e))
+
+    def order_error_messages(self, order_id: int) -> list[str]:
+        """The broker's error/warning texts for one order, oldest first."""
+        return [text for _, _, text in self._order_errors.get(int(order_id), [])]
 
     async def qualify_contract(self, contract: Contract) -> Contract | None:
         """Qualify a contract with IBKR to get full details."""

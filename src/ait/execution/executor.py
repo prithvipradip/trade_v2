@@ -1304,11 +1304,21 @@ class TradeExecutor:
                 # re-placing the identical rejected limit forever.
                 _band, _mkt = (None, None)
                 try:
+                    # W33: the order log alone never carried it — ib_insync
+                    # treats 202 as a warning and keeps it off trade.log. The
+                    # client now captures errorEvent text per orderId; read
+                    # both, broker text last so it wins (newest-first scan).
+                    _msgs: list = []
                     for _t in all_trades:
                         if _t.order.orderId == order_id:
-                            _band, _mkt = self.parse_price_band_reject(
-                                getattr(_t, "log", None))
+                            _msgs.extend(getattr(_t, "log", None) or [])
                             break
+                    _oem = getattr(self._ibkr, "order_error_messages", None)
+                    if callable(_oem):
+                        _texts = _oem(order_id)
+                        if isinstance(_texts, (list, tuple)):
+                            _msgs.extend(_texts)
+                    _band, _mkt = self.parse_price_band_reject(_msgs)
                     if _band is not None or _mkt is not None:
                         self._state.set_state(
                             f"exit_band_{pending_exit.trade_id}",
@@ -2363,7 +2373,8 @@ class TradeExecutor:
         reports its most recent rejection.
         """
         for msg in reversed(list(messages or [])):
-            text = getattr(msg, "message", None) or str(msg)
+            text = msg if isinstance(msg, str) else (
+                getattr(msg, "message", None) or str(msg))
             band = cls._BAND_RE.search(text)
             mkt = cls._MKT_RE.search(text)
             if band or mkt:

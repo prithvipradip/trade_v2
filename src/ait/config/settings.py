@@ -434,6 +434,30 @@ class ExitConfig(_StrictModel):
                     "the mark alone; the wing width remains the structural "
                     "cap above it, and mark+exit_cross_amount is the floor so "
                     "the order stays marketable.")
+    exit_min_ceiling_headroom: float = Field(default=0.60, ge=0.10, le=2.0,
+        description="W33 (R26 mark-ceiling-clamps-below-the-ask-at-low-marks): "
+                    "the least absolute headroom the mark-anchored ceiling "
+                    "leaves above the mark. The ceiling is compared with an "
+                    "ASK-side price and the mark is a mid; a four-leg combo's "
+                    "summed half-spread does not shrink with the mark (0.52-"
+                    "0.58 measured on QQQ 09-11), so a purely proportional "
+                    "1.5x overwrote marketable limits at marks under ~1.1.")
+    exit_band_ttl_seconds: float = Field(default=300.0, ge=30.0, le=3600.0,
+        description="W33: how long a broker-stated price band caps later exit "
+                    "attempts. The band is the broker's view of one moment; "
+                    "W7 kept it an hour, which (once bands were actually "
+                    "captured) could pin a stop below a market that had "
+                    "moved. A live reject loop re-states it every 30-180s.")
+    exit_reprice_step: float = Field(default=0.10, ge=0.01, le=1.0,
+        description="W33: how far each consecutive NO-QUOTE exit placement "
+                    "steps above the last (anchor + cross + n*step, capped). "
+                    "W7 re-placed the identical price every backoff.")
+    exit_blind_credit_multiple: float = Field(default=2.0, ge=1.0, le=5.0,
+        description="W33 (R26 raw-wing-width-fallback-still-reachable): with "
+                    "no quote and no fresh mark, the most a credit buyback "
+                    "may pay is this multiple of the entry credit (and never "
+                    "more than the wing width). W7 priced that state at the "
+                    "raw width — the structural max loss.")
     trailing_stop_pct: float = Field(default=0.25, ge=0.10, le=0.50)
     breakeven_trigger_pct: float = Field(default=0.30, ge=0.10, le=0.80)
     partial_exit_levels: list[dict] = [

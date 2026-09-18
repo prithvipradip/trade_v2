@@ -220,8 +220,12 @@ class TestCloseMultiLegPricing:
 
     async def test_credit_condor_no_quote_prices_at_wing_width_not_market(self):
         """Pre-fix the no-quote fallback was a MARKET order on a 4-leg BAG —
-        unbounded fill exactly when quotes evaporate. Now: LMT at the width
-        (the max loss the wings already guarantee), operator paged."""
+        unbounded fill exactly when quotes evaporate. R13: LMT at the width,
+        operator paged. W33 (R26 raw-wing-width-fallback-still-reachable): at
+        $39-60 wings "the width" is the structural max loss, so with no quote
+        and no mark the order is anchored on the entry credit (1.00 + the
+        cross) and stepped — still a LMT, still bounded by the width, still
+        paged."""
         orch, place_order, notes = _orchestrator(
             _quote(bid=float("nan"), ask=float("nan"))
         )
@@ -230,7 +234,8 @@ class TestCloseMultiLegPricing:
         assert result is not None
         order = place_order.call_args.args[1]
         assert order.orderType == "LMT"
-        assert order.lmtPrice == pytest.approx(2.00)
+        assert order.lmtPrice == pytest.approx(1.05)
+        assert order.lmtPrice <= 2.00          # the width still bounds it
         assert any("EXIT WITHOUT QUOTES" in n for n in notes)
 
     async def test_credit_condor_zero_quote_treated_as_no_quote(self):
@@ -240,7 +245,8 @@ class TestCloseMultiLegPricing:
         trade = FakeTrade()
         await orch._close_multi_leg(trade, CONDOR_LEGS)
         order = place_order.call_args.args[1]
-        assert order.lmtPrice == pytest.approx(2.00)
+        # W33: anchored on the entry credit, not priced at the width
+        assert order.lmtPrice == pytest.approx(1.05)
         assert any("EXIT WITHOUT QUOTES" in n for n in notes)
 
     async def test_debit_spread_no_quote_defers_instead_of_market(self):
