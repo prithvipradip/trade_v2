@@ -5409,3 +5409,74 @@ NEXT: W31 (R26 F4, the W25 sizing self-test finished) remains the next queued it
 not change that queue — it was an out-of-band live-ops fix, not part of the R26 sequence.
 
 ---
+
+## 2026-09-18 - W32 EXECUTED — R26 F2, booking & breaker integrity (three findings, one seam)
+
+NUMBERING: W31 stays reserved for Ahmed's queued R26 F4 (the W25 sizing self-test). The Windows box
+takes **W32-W35** for the fix sets assigned to it in `reports/r26_integration_20260917.md`:
+W32 = F2 (this entry), W33 = F1 (exit rebuild corrective), W34 = F6 (ops substrate),
+W35 = F8 + the F7 share. Ahmed's queue continues at W31 and then W36+.
+
+WHAT R26 FOUND (all three reproduced against the tree before anything was changed):
+
+[1] two-phase-claim-double-books (live_money). W14 made the outbox claim a MARK instead of a
+    delete, which fixed the lost-close half of the race and left the double-book half open: the
+    booking body was five independent writes (daily_stats, breaker, PDT, Thompson, drift) with the
+    outbox row deleted last. A lock, a crash, or an exception after the first write left the row in
+    place, and the drain re-booked the WHOLE close on its next pass — the P&L added to daily_stats
+    twice and the loss counted twice against the breaker's streak. Reproduced with a store that
+    fails once after the stats write: total_pnl -200 for a single -100 close, consecutive_losses 2.
+
+[2] breaker-unreadable-never-reloads (live_money, fail-open). W14 stopped a breaker that could not
+    read its store from OVERWRITING the intact blob with zeros. Nothing ever read the blob again.
+    One transient `database is locked` at startup left the breaker on a zero placeholder for the
+    rest of the process: `is_tripped` lifted the fail-closed pause after one window without looking,
+    persistence stayed off, and a daily-loss halt sitting intact on disk was not enforced.
+    Reproduced: persisted tripped blob + one failing read -> `is_tripped` False 31 minutes later.
+
+[3] concurrency-03 residual (live_money). W14 taught the FILL path that a refused CAS can mean
+    "the sweep promoted this row to FILLED first" rather than "terminal". Its twin,
+    `_update_trade_partial`, kept the old reading: the real partial quantity was discarded, the row
+    stayed FILLED at the full SIGNAL size (so the reverse-combo exit was sized larger than the live
+    position) and a false CRITICAL page fired. Separately the page flag was ONE key
+    (`alert_fill_after_close`), so a second refusal overwrote the first and only the last was paged.
+
+WHAT CHANGED:
+
+  - `state.py`: `exit_outbox` gains `core_booked` and `steps_done`. `book_exit_core()` lands
+    daily_stats, the breaker blob and the `core_booked` marker in ONE `BEGIN IMMEDIATE` transaction;
+    a second call for the same close is a no-op that returns False. `mark_exit_step()` /
+    `exit_steps_done()` record each non-money side effect so a retry skips what already landed.
+  - `circuit_breaker.py`: `snapshot()`/`restore()`/`persistable_blob()` so the orchestrator can apply
+    a result in memory, write it inside the state transaction, and undo it if that transaction
+    fails. `_maybe_reload()` re-reads the store at most every 30s while unreadable; `is_tripped`
+    returns True until a read succeeds; results recorded while blind are queued and replayed onto
+    the store's truth once it does.
+  - `orchestrator.py`: both booking paths (`_process_completed_exits`, `_drain_exit_outbox`) go
+    through `_book_exit_core` then the flagged steps pdt/thompson/drift/notify; the outbox row is
+    completed only when every step has landed. A core failure in the callback path is deferred to
+    the drain rather than half-booked. The fill-after-close pager drains every
+    `alert_fill_after_close_<trade_id>` key (and the bare pre-W32 key if one is still stored).
+  - `executor.py`: `_update_trade_partial` reads the actual status on a refused CAS — terminal rows
+    bail and flag per trade; a promoted FILLED row gets the REAL partial quantity and price.
+
+PROOF. `tests/test_w32_booking_breaker_integrity.py`, 16 executing tests. Re-run against the
+pre-fix source in this session (the four `src/` files stashed, tests kept): **14 failed, 2 passed**.
+The two green ones are the controls that must hold on both trees —
+`test_re_reads_are_rate_limited` and `test_a_terminal_row_is_still_refused`. No `inspect.getsource`. Three existing tests asserted the old seam and were moved
+to the new one with the same intent (`test_w1`, `test_w14` per-trade key; `test_r15` now asserts
+`book_exit_core` receives the trued-up P&L). W14's `test_the_intact_streak_survives_a_locked_relaunch`
+was the F7 "cannot fail" case — its mock swallowed the write it claimed to guard. Rebuilt on a
+wrapper whose reads fail and whose writes reach the real store, and proven RED with the W14 latch
+removed.
+
+VERIFICATION (Windows box, the live host): full fast lane **1952 passed / 46 skipped / 0 failed**
+(490s); `scripts/typecheck.py` OK.
+
+STATE AT HANDOFF: committed and pushed, **deployed nowhere**. The running bot (PID 16684) is on
+c368a0f with one QQQ condor open; `state.py`, `orchestrator.py`, `executor.py` and
+`circuit_breaker.py` are all loaded by it, so W32 takes effect at the next restart. The
+`exit_outbox` migration is additive (two defaulted columns) and runs at StateManager init.
+NEXT: W33 (F1) — the exit path, in progress in the same session.
+
+---

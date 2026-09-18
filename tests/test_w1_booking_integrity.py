@@ -195,7 +195,8 @@ class TestFillCasGate:
         assert price == pytest.approx(1.90)
         assert status == "closed"
         assert open_rows == 0
-        assert st.get_state("alert_fill_after_close", "").startswith("T-W1|QQQ")
+        # W32: the flag is keyed per trade (one key was overwritten by the next refusal)
+        assert st.get_state("alert_fill_after_close_T-W1", "").startswith("T-W1|QQQ")
 
     def test_partial_fill_on_closed_row_writes_nothing(self, tmp_path):
         st = _state(tmp_path)

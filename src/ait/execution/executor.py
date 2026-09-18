@@ -2685,8 +2685,10 @@ class TradeExecutor:
                          "be live at the broker with no managing trade row",
                 )
                 try:
+                    # W32: keyed per trade — the single key was overwritten by
+                    # the next refusal and only the last was ever paged.
                     self._state.set_state(
-                        "alert_fill_after_close",
+                        f"alert_fill_after_close_{pending.trade_id}",
                         f"{pending.trade_id}|{signal.symbol}|{actual_price}")
                 except Exception:  # noqa: BLE001
                     pass
@@ -2752,18 +2754,43 @@ class TradeExecutor:
             (TradeStatus.PENDING, TradeStatus.PARTIAL),
             TradeStatus.PARTIAL,
         ):
-            log.error(
-                "partial_fill_landed_on_terminal_row",
-                trade_id=pending.trade_id, symbol=signal.symbol,
-                filled_qty=filled_qty,
-            )
+            # W32 (R26 concurrency-03 residual): W14 taught the FILL path that
+            # a refused CAS can mean "the sweep/reconciler promoted this row to
+            # FILLED first" rather than "terminal"; this twin kept the old
+            # reading. The real partial quantity was discarded, the row stayed
+            # FILLED at the full SIGNAL size — so the reverse-combo exit was
+            # sized larger than the live position — and a false CRITICAL page
+            # fired. Read the actual status and only bail on a truly terminal
+            # row. A promoted row stays FILLED (no status downgrade: a later
+            # full fill's own CAS handles FILLED); only the truth about size
+            # and price is written.
+            _cur = None
             try:
-                self._state.set_state(
-                    "alert_fill_after_close",
-                    f"{pending.trade_id}|{signal.symbol}|partial:{filled_qty}")
+                _t = self._state.get_trade_by_id(pending.trade_id)
+                _cur = getattr(_t, "status", None) if _t else None
+                _cur = getattr(_cur, "value", _cur)
             except Exception:  # noqa: BLE001
-                pass
-            return
+                _cur = None
+            if _cur != TradeStatus.FILLED.value:
+                log.error(
+                    "partial_fill_landed_on_terminal_row",
+                    trade_id=pending.trade_id, symbol=signal.symbol,
+                    filled_qty=filled_qty, current_status=_cur,
+                )
+                try:
+                    self._state.set_state(
+                        f"alert_fill_after_close_{pending.trade_id}",
+                        f"{pending.trade_id}|{signal.symbol}|partial:{filled_qty}")
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+            log.warning(
+                "partial_fill_cas_refused_row_already_filled",
+                trade_id=pending.trade_id, symbol=signal.symbol,
+                filled_qty=filled_qty, fill_price=actual_price,
+                note="concurrent promotion — recording the REAL partial "
+                     "quantity and price rather than discarding them",
+            )
         self._state.update_trade_quantity(pending.trade_id, filled_qty)
         if actual_price is not None and actual_price != 0:
             self._state.update_trade_entry_price(pending.trade_id, abs(actual_price))

@@ -203,7 +203,11 @@ class TestCommissionTrueUp:
         _est = TradeExecutor.commission_estimate(trade)
         _expected = round(-10.00 + round(_est - 8.89, 2), 2)
         state.update_trade_realized_pnl.assert_called_once_with("T-X", _expected)
-        assert stats.total_pnl == pytest.approx(_expected)
+        # W32: stats + breaker are booked through ONE transactional call
+        # (StateManager.book_exit_core); the number that reaches it must be
+        # the trued-up one, not the fill-time estimate.
+        state.book_exit_core.assert_called_once()
+        assert state.book_exit_core.call_args.args[:2] == ("T-X", pytest.approx(_expected))
 
     async def test_partial_ledger_defers_trueup(self):
         # R16: commissionReports arrive async — a partial ledger (entry legs

@@ -264,6 +264,15 @@ class StateManager:
                 # while nothing had been booked. Claiming now MARKS the row;
                 # it is deleted only once the booking lands.
                 "ALTER TABLE exit_outbox ADD COLUMN claimed_at TEXT",
+                # W32 (R26 two-phase-claim-double-books): W14's claim-as-mark made
+                # the booking AT-LEAST-once — a fault after some of the booking
+                # writes left the claim to go stale and the drain re-applied the
+                # whole close (one -272.29 stop read as -544.58 / 2 losses).
+                # core_booked marks that the MONEY writes (daily_stats + the
+                # breaker blob) landed, in the same transaction that wrote them;
+                # steps_done lists the other side effects as each one lands.
+                "ALTER TABLE exit_outbox ADD COLUMN core_booked INTEGER DEFAULT 0",
+                "ALTER TABLE exit_outbox ADD COLUMN steps_done TEXT DEFAULT ''",
             ):
                 try:
                     conn.execute(ddl)
@@ -842,6 +851,85 @@ class StateManager:
         """
         with sqlite3.connect(self._db_path) as conn:
             conn.execute("DELETE FROM exit_outbox WHERE trade_id = ?", (trade_id,))
+
+    def exit_core_booked(self, trade_id: str) -> bool | None:
+        """W32: have this close's money writes landed? None = no outbox row
+        (already retired, or never enqueued)."""
+        with sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(
+                "SELECT core_booked FROM exit_outbox WHERE trade_id = ?",
+                (trade_id,)).fetchone()
+        return None if row is None else bool(row[0])
+
+    def book_exit_core(self, trade_id: str, pnl: float,
+                       breaker_key: str | None = None,
+                       breaker_blob: str | None = None) -> bool:
+        """W32: apply a close's MONEY effects exactly once.
+
+        One sqlite transaction writes today's daily_stats delta, the circuit
+        breaker's persisted blob (when the caller supplies one) and the
+        core_booked marker. Either all three land or none does, so a retry —
+        by the drain in this process, or by the next process after a kill —
+        can tell "already counted" from "never counted" instead of guessing.
+        Returns True iff THIS call booked it.
+        """
+        day = now_et().date().isoformat()
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT core_booked FROM exit_outbox WHERE trade_id = ?",
+                (trade_id,)).fetchone()
+            if row is None or row[0]:
+                return False
+            conn.execute("INSERT OR IGNORE INTO daily_stats (date) VALUES (?)", (day,))
+            conn.execute(
+                "UPDATE daily_stats SET total_pnl = COALESCE(total_pnl, 0) + ?, "
+                "trades_won = COALESCE(trades_won, 0) + ?, "
+                "trades_lost = COALESCE(trades_lost, 0) + ? WHERE date = ?",
+                (pnl, 1 if pnl > 0 else 0, 0 if pnl > 0 else 1, day))
+            if breaker_key and breaker_blob is not None:
+                conn.execute(
+                    "INSERT OR REPLACE INTO bot_state (key, value, updated_at) "
+                    "VALUES (?, ?, ?)",
+                    (breaker_key, breaker_blob, datetime.now().isoformat()))
+            conn.execute("UPDATE exit_outbox SET core_booked = 1 WHERE trade_id = ?",
+                         (trade_id,))
+        if self._duck:  # best-effort mirror, never part of the transaction
+            try:
+                st = self.get_daily_stats()
+                self._duck.ingest_daily_stats({
+                    "date": st.date, "trades_taken": st.trades_taken,
+                    "trades_won": st.trades_won, "trades_lost": st.trades_lost,
+                    "total_pnl": st.total_pnl, "max_drawdown": st.max_drawdown,
+                    "day_trades_count": st.day_trades_count,
+                    "circuit_breaker_triggered": st.circuit_breaker_triggered,
+                })
+            except Exception as e:  # noqa: BLE001
+                log.warning("duckdb_daily_sync_failed", error=str(e))
+        return True
+
+    def exit_steps_done(self, trade_id: str) -> set[str]:
+        """W32: the non-money booking steps that have already landed."""
+        with sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(
+                "SELECT steps_done FROM exit_outbox WHERE trade_id = ?",
+                (trade_id,)).fetchone()
+        return {x for x in ((row[0] or "") if row else "").split(",") if x}
+
+    def mark_exit_step(self, trade_id: str, step: str) -> None:
+        """W32: record that one side effect of a close has landed, so a retry
+        skips it instead of repeating it."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT steps_done FROM exit_outbox WHERE trade_id = ?",
+                (trade_id,)).fetchone()
+            if row is None:
+                return
+            done = {x for x in (row[0] or "").split(",") if x}
+            done.add(step)
+            conn.execute("UPDATE exit_outbox SET steps_done = ? WHERE trade_id = ?",
+                         (",".join(sorted(done)), trade_id))
 
     def pending_exit_bookings(self, older_than_seconds: float = 120.0) -> list[dict]:
         """W1: closes whose booking nobody has claimed yet. The grace period

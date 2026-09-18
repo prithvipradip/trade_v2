@@ -217,11 +217,20 @@ class TestBreakerNeverOverwritesAnIntactBlob:
         good.record_trade_result(-100.0)
         assert good._consecutive_losses == 2
 
-        blocked = MagicMock()
-        blocked.get_state.side_effect = sqlite3.OperationalError("locked")
+        # R26 (w14-intact-streak-test-cannot-fail): `blocked` used to be a
+        # bare MagicMock, so the crashed breaker's write could never reach the
+        # store this test then re-reads — it passed against pre-W14 code too.
+        # The store's READ is what is locked; its WRITE path is the real one.
+        class _ReadLocked:
+            def get_state(self, key, default=""):
+                raise sqlite3.OperationalError("locked")
+
+            def __getattr__(self, name):
+                return getattr(st, name)
+
         crashed = CircuitBreaker(_cfg())
-        crashed.attach_state(blocked)
-        crashed._persist()                     # pre-W14: wrote zeros
+        crashed.attach_state(_ReadLocked())
+        crashed._persist()                     # pre-W14: wrote zeros OVER the real blob
 
         recovered = CircuitBreaker(_cfg())
         recovered.attach_state(st)
@@ -264,4 +273,5 @@ class TestCasRefusalDistinguishesPromotionFromTerminal:
             price = conn.execute("SELECT entry_price FROM trades "
                                  "WHERE trade_id='T-2'").fetchone()[0]
         assert price == pytest.approx(1.90), "wrote to a closed row"
-        assert st.get_state("alert_fill_after_close", "").startswith("T-2|QQQ")
+        # W32: the flag is keyed per trade (one key was overwritten by the next refusal)
+        assert st.get_state("alert_fill_after_close_T-2", "").startswith("T-2|QQQ")

@@ -733,14 +733,19 @@ class TradingOrchestrator:
         """
         # W1 (concurrency-1): page the fill-after-close flag the executor sets
         # when a fill's CAS is refused — a real position may be unmanaged.
+        # W32 (concurrency-03 residual): the flag was ONE key, so a second
+        # refused fill overwrote the first and only the last was ever paged.
+        # The executor now writes alert_fill_after_close_<trade_id>; drain
+        # every such key (and the pre-W32 bare key, if one is still stored).
         try:
-            _fac = self._state.get_state("alert_fill_after_close", "")
-            if _fac:
-                self._state.delete_state("alert_fill_after_close")
-                await self._send_notification(
-                    f"CRITICAL: fill landed on a TERMINAL trade row ({_fac}). "
-                    "A REAL position may be live at the broker with no "
-                    "managing row — check TWS and the untracked-option freeze.")
+            for _k in list(self._state.state_keys_like("alert_fill_after_close%")):
+                _fac = self._state.get_state(_k, "")
+                self._state.delete_state(_k)
+                if _fac:
+                    await self._send_notification(
+                        f"CRITICAL: fill landed on a TERMINAL trade row ({_fac}). "
+                        "A REAL position may be live at the broker with no "
+                        "managing row — check TWS and the untracked-option freeze.")
         except Exception:  # noqa: BLE001
             pass
 
@@ -788,42 +793,109 @@ class TradingOrchestrator:
                     log.warning("stale_exit_booking_skipped", trade_id=trade_id,
                                 exit_time=row["exit_time"], pnl=pnl)
                     continue
-                stats = self._state.get_daily_stats()
-                stats.total_pnl += pnl
-                if pnl > 0:
-                    stats.trades_won += 1
-                else:
-                    stats.trades_lost += 1
-                self._circuit_breaker.record_trade_result(pnl)
-                self._state.update_daily_stats(stats)
+                # W32: money effects exactly once (one transaction + marker),
+                # every other effect flagged as it lands — a retry resumes.
+                _booked = self._book_exit_core(trade_id, pnl)
                 try:
                     self._state.delete_state(f"trade_maxloss_{trade_id}")
                 except Exception:  # noqa: BLE001
                     pass
                 _t = self._find_trade_by_id(trade_id)
-                if _t and _t.entry_time:
-                    try:
-                        if parse_trade_ts(_t.entry_time).date() == today:
-                            self._pdt_guard.record_day_trade(_t.symbol)
-                    except Exception as _e:  # noqa: BLE001
-                        log.debug("pdt_record_failed", error=str(_e))
-                if _t:
-                    self._thompson.record_outcome(
-                        strategy=_t.strategy, won=pnl > 0, pnl=pnl)
-                # W14 (concurrency-01): the obligation is retired only NOW,
-                # after every booking write above has landed. A crash before
-                # this point leaves the row for the next drain instead of
-                # destroying it.
-                self._state.complete_exit_booking(trade_id)
-                log.warning("orphan_close_booked", trade_id=trade_id, pnl=pnl,
-                            reason=row.get("exit_reason", ""))
-                await self._send_notification(
+                _done = self._exit_steps_done(trade_id)
+
+                def _pdt(_t=_t):
+                    if _t and _t.entry_time and \
+                            parse_trade_ts(_t.entry_time).date() == today:
+                        self._pdt_guard.record_day_trade(_t.symbol)
+
+                def _thompson(_t=_t, pnl=pnl):
+                    if _t:
+                        self._thompson.record_outcome(
+                            strategy=_t.strategy, won=pnl > 0, pnl=pnl)
+
+                _ok = self._exit_step(trade_id, _done, "pdt", _pdt)
+                _ok = self._exit_step(trade_id, _done, "thompson", _thompson) and _ok
+                _ok = await self._exit_notify_once(
+                    trade_id, _done,
                     f"ORPHAN CLOSE BOOKED: {(_t.symbol if _t else trade_id)} "
                     f"P&L ${pnl:.2f} ({row.get('exit_reason') or 'unknown'}) — "
-                    "found by reconcile; breaker/stats now counted it.")
+                    "found by reconcile; breaker/stats now counted it.") and _ok
+                log.warning("orphan_close_booked", trade_id=trade_id, pnl=pnl,
+                            reason=row.get("exit_reason", ""),
+                            core_booked_now=_booked, steps_complete=_ok)
+                if _ok:
+                    # W14 (concurrency-01): retired only after everything landed.
+                    self._state.complete_exit_booking(trade_id)
             except Exception as e:  # noqa: BLE001 — one bad row must not stop the drain
                 log.error("exit_outbox_booking_failed", trade_id=trade_id,
                           error=str(e))
+
+    def _book_exit_core(self, trade_id: str, pnl: float) -> bool:
+        """W32: apply a close's stats + breaker effects EXACTLY once.
+
+        The breaker is updated in memory, then its blob, today's daily_stats
+        delta and the outbox's core_booked marker are written in one sqlite
+        transaction (StateManager.book_exit_core). If that write fails the
+        in-memory breaker is rolled back — this process lives on, and a loss
+        it kept without making durable would be counted again by the retry.
+        Returns True iff this call booked it.
+        """
+        if self._state.exit_core_booked(trade_id) is True:
+            return False
+        cb = self._circuit_breaker
+        snap = cb.snapshot()
+        cb.record_trade_result(pnl, persist=False)
+        try:
+            booked = bool(self._state.book_exit_core(
+                trade_id, pnl, cb.STATE_KEY, cb.persistable_blob()))
+        except Exception:
+            cb.restore(snap)
+            raise
+        if not booked:
+            cb.restore(snap)  # another pass booked it between the check and the write
+        return booked
+
+    def _exit_steps_done(self, trade_id: str) -> set:
+        try:
+            return set(self._state.exit_steps_done(trade_id))
+        except Exception:  # noqa: BLE001 — unknown = nothing proven done
+            return set()
+
+    def _exit_step(self, trade_id: str, done: set, step: str, fn) -> bool:
+        """W32: run one non-money side effect of a close at most once per
+        success. A failure is contained (one broken learning store must not
+        stop the page or the other steps) and left unflagged for the drain."""
+        if step in done:
+            return True
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            log.warning("exit_booking_step_failed", trade_id=trade_id,
+                        step=step, error=str(e),
+                        note="left unflagged; the drain retries this step")
+            return False
+        try:
+            self._state.mark_exit_step(trade_id, step)
+        except Exception as e:  # noqa: BLE001
+            log.warning("exit_booking_step_mark_failed", trade_id=trade_id,
+                        step=step, error=str(e))
+        return True
+
+    async def _exit_notify_once(self, trade_id: str, done: set, msg: str) -> bool:
+        if "notify" in done:
+            return True
+        try:
+            await self._send_notification(msg)
+        except Exception as e:  # noqa: BLE001
+            log.warning("exit_booking_step_failed", trade_id=trade_id,
+                        step="notify", error=str(e))
+            return False
+        try:
+            self._state.mark_exit_step(trade_id, "notify")
+        except Exception as e:  # noqa: BLE001
+            log.warning("exit_booking_step_mark_failed", trade_id=trade_id,
+                        step="notify", error=str(e))
+        return True
 
     async def _process_completed_exits(self, completed_exits: list[dict]) -> None:
         """Book completed exits: daily stats, circuit breaker, Thompson, drift.
@@ -864,17 +936,23 @@ class TradingOrchestrator:
 
             realized_pnl = ex["realized_pnl"]
 
-            stats = self._state.get_daily_stats()
-            stats.total_pnl += realized_pnl
-            if realized_pnl > 0:
-                stats.trades_won += 1
-            else:
-                stats.trades_lost += 1
-            # Feed ALL results to the breaker, not just losses — its daily
-            # P&L must net wins against losses or it trips on any losing
-            # streak within an otherwise green day.
-            self._circuit_breaker.record_trade_result(realized_pnl)
-            self._state.update_daily_stats(stats)
+            # W32 (R26 two-phase-claim-double-books): daily_stats and the
+            # breaker used to be written one after the other, outside any
+            # transaction, with the obligation retired at the very end — so a
+            # fault after these writes left the claim to go stale and the drain
+            # re-applied the whole close (-272.29 read as -544.58 / 2 losses).
+            # They now land together with a core_booked marker, exactly once.
+            # ALL results reach the breaker, not just losses: its daily P&L
+            # must net wins against losses.
+            try:
+                self._book_exit_core(trade_id, realized_pnl)
+            except Exception as _be:  # noqa: BLE001
+                log.error("exit_booking_core_failed_deferred_to_drain",
+                          trade_id=trade_id, error=str(_be),
+                          note="breaker rolled back; the row stays claimed and "
+                               "the drain books it once the claim goes stale")
+                continue
+            _done = self._exit_steps_done(trade_id)
 
             # Drop the per-trade risk key so the aggregate cap's namespace
             # doesn't accumulate dead entries (28 stale keys found in the
@@ -891,15 +969,14 @@ class TradingOrchestrator:
             # Deep-audit SR-H1: the PDT guard was fully built but NOTHING
             # ever called record_day_trade — it always reported 0/3 used.
             # A same-ET-day open+close is a day trade; record it.
-            try:
+            def _pdt(trade_id=trade_id):
                 _t = self._find_trade_by_id(trade_id)
                 if _t and _t.entry_time:
                     from ait.utils.time import now_et as _now_et
-                    _entry_d = parse_trade_ts(_t.entry_time).date()
-                    if _entry_d == _now_et().date():
+                    if parse_trade_ts(_t.entry_time).date() == _now_et().date():
                         self._pdt_guard.record_day_trade(_t.symbol)
-            except Exception as _e:  # noqa: BLE001
-                log.debug("pdt_record_failed", error=str(_e))
+
+            _ok = self._exit_step(trade_id, _done, "pdt", _pdt)
 
             trade = self._find_trade_by_id(trade_id)
             # R7: stamp the REAL round-trip commission (from the executions
@@ -911,11 +988,14 @@ class TradingOrchestrator:
             except Exception:  # noqa: BLE001
                 pass
             if trade:
-                self._thompson.record_outcome(
-                    strategy=trade.strategy,
-                    won=realized_pnl > 0,
-                    pnl=realized_pnl,
-                )
+                def _thompson(trade=trade, realized_pnl=realized_pnl):
+                    self._thompson.record_outcome(
+                        strategy=trade.strategy,
+                        won=realized_pnl > 0,
+                        pnl=realized_pnl,
+                    )
+
+                _ok = self._exit_step(trade_id, _done, "thompson", _thompson) and _ok
                 # Deep-audit BC-L2: deriving direction from P&L sign is
                 # meaningless for market-neutral strategies (a strangle win
                 # is NOT "bullish") and poisons drift accuracy tracking.
@@ -933,10 +1013,14 @@ class TradingOrchestrator:
                     _tdir = str(getattr(getattr(trade, "direction", ""), "value",
                                         getattr(trade, "direction", "")) or "")
                     _dir = {"long": "bullish", "short": "bearish"}.get(_tdir, _tdir)
-                    self._trainer.drift_detector.record_outcome(
-                        trade_id=f"{trade.symbol}-{_dir}",
-                        actual_direction=actual_dir,
-                    )
+
+                    def _drift(trade=trade, _dir=_dir, actual_dir=actual_dir):
+                        self._trainer.drift_detector.record_outcome(
+                            trade_id=f"{trade.symbol}-{_dir}",
+                            actual_direction=actual_dir,
+                        )
+
+                    _ok = self._exit_step(trade_id, _done, "drift", _drift) and _ok
 
             msg = (
                 f"EXIT FILLED: {trade.symbol if trade else trade_id}\n"
@@ -944,18 +1028,24 @@ class TradingOrchestrator:
                 f"Exit price: {ex['exit_price']:.2f}\n"
                 f"P&L: ${realized_pnl:.2f}"
             )
+            _ok = await self._exit_notify_once(trade_id, _done, msg) and _ok
             # W14 (concurrency-01): retire the obligation only now, after
             # every booking write above has landed. Claiming merely MARKS the
             # row, so a crash anywhere in this block leaves work for the drain
-            # instead of destroying the record of a real close.
-            try:
-                self._state.complete_exit_booking(trade_id)
-            except Exception as _e:  # noqa: BLE001
-                log.warning("exit_booking_complete_failed",
-                            trade_id=trade_id, error=str(_e),
-                            note="row stays claimed; the drain retries it "
-                                 "once the claim goes stale")
-            await self._send_notification(msg)
+            # instead of destroying the record of a real close. W32: a step
+            # that FAILED leaves the row too — the drain retries just that
+            # step, since everything that landed is flagged.
+            if _ok:
+                try:
+                    self._state.complete_exit_booking(trade_id)
+                except Exception as _e:  # noqa: BLE001
+                    log.warning("exit_booking_complete_failed",
+                                trade_id=trade_id, error=str(_e),
+                                note="row stays claimed; the drain retries it "
+                                     "once the claim goes stale")
+            else:
+                log.warning("exit_booking_incomplete_left_for_drain",
+                            trade_id=trade_id)
             log.info(
                 "exit_fill_processed",
                 trade_id=trade_id,

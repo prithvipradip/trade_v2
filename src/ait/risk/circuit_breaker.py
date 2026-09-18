@@ -164,20 +164,86 @@ class CircuitBreaker:
             log.warning("circuit_breaker_persist_skipped_unreadable_state")
             return
         try:
-            state.set_state(self.STATE_KEY, json.dumps({
-                "date": self._last_reset_date.isoformat(),
-                "consecutive_losses": self._consecutive_losses,
-                "daily_pnl": round(float(self._daily_pnl), 4),
-                "tripped": bool(self._tripped),
-                "reason": self._trip_reason,
-                "resume_time": float(self._resume_time),
-            }))
+            state.set_state(self.STATE_KEY, self._blob())
         except Exception as e:  # noqa: BLE001
             log.warning("circuit_breaker_state_persist_failed", error=str(e))
+
+    def _blob(self) -> str:
+        return json.dumps({
+            "date": self._last_reset_date.isoformat(),
+            "consecutive_losses": self._consecutive_losses,
+            "daily_pnl": round(float(self._daily_pnl), 4),
+            "tripped": bool(self._tripped),
+            "reason": self._trip_reason,
+            "resume_time": float(self._resume_time),
+        })
+
+    # --- W32 (R26 two-phase-claim-double-books): transactional booking hooks.
+    # The orchestrator applies a close to this breaker in memory, then writes
+    # the blob in the SAME sqlite transaction as daily_stats and the outbox
+    # marker. If that transaction fails the process lives on, so the in-memory
+    # change must be undone or the retry counts the loss twice.
+    _SNAP_FIELDS = ("_daily_pnl", "_consecutive_losses", "_tripped",
+                    "_trip_reason", "_resume_time")
+
+    def snapshot(self) -> dict:
+        snap = {f: getattr(self, f) for f in self._SNAP_FIELDS}
+        snap["_pending_results"] = list(getattr(self, "_pending_results", []))
+        return snap
+
+    def restore(self, snap: dict) -> None:
+        for f, v in snap.items():
+            setattr(self, f, list(v) if isinstance(v, list) else v)
+
+    def persistable_blob(self) -> str | None:
+        """The blob to persist, or None while our state is a fail-closed
+        placeholder (W14: never write what we could not read)."""
+        if getattr(self, "_state", None) is None:
+            return None
+        return None if getattr(self, "_state_unreadable", False) else self._blob()
+
+    #: W32: how often a breaker that could not read its store tries again.
+    _RELOAD_MIN_INTERVAL_S = 30.0
+
+    def _maybe_reload(self) -> None:
+        """W32 (R26 breaker-unreadable-never-reloads): keep trying to become
+        authoritative again.
+
+        W14 stopped the placeholder from OVERWRITING an intact blob, but
+        nothing ever re-read it: after one transient lock at startup the
+        breaker ran the rest of the process on zeros, is_tripped lifted the
+        fail-closed pause after one window without looking, and persistence
+        stayed off until the next restart. A daily-loss halt sitting intact
+        on disk was simply not enforced. Results recorded while blind are
+        queued and replayed onto the store's truth once a read succeeds.
+        """
+        if not getattr(self, "_state_unreadable", False):
+            return
+        now = time.time()
+        if now - getattr(self, "_last_reload_attempt", 0.0) < self._RELOAD_MIN_INTERVAL_S:
+            return
+        self._last_reload_attempt = now
+        pending = list(getattr(self, "_pending_results", []))
+        self._load_persisted()          # a failure re-arms the fail-closed window
+        if self._state_unreadable:
+            return
+        self._pending_results = []
+        log.warning("circuit_breaker_state_reloaded", replayed=len(pending),
+                    tripped=self._tripped, reason=self._trip_reason,
+                    consecutive_losses=self._consecutive_losses,
+                    daily_pnl=round(self._daily_pnl, 2))
+        for pnl in pending:
+            self.record_trade_result(pnl)
 
     @property
     def is_tripped(self) -> bool:
         """Check if circuit breaker is currently active."""
+        if getattr(self, "_state_unreadable", False):
+            self._maybe_reload()
+            if self._state_unreadable:
+                # W32: the pause window ending proves nothing about what the
+                # store holds. Stay closed until a read succeeds.
+                return True
         if not self._tripped:
             return False
 
@@ -230,8 +296,19 @@ class CircuitBreaker:
         self._daily_pnl += pnl
         self._persist()  # R16
 
-    def record_trade_result(self, pnl: float) -> None:
-        """Record a trade's P&L and check for circuit breaker triggers."""
+    def record_trade_result(self, pnl: float, persist: bool = True) -> None:
+        """Record a trade's P&L and check for circuit breaker triggers.
+
+        persist=False (W32) leaves the write to the caller, which lands the
+        blob in the same transaction as daily_stats — see persistable_blob().
+        """
+        if getattr(self, "_state_unreadable", False):
+            self._maybe_reload()
+            if self._state_unreadable:
+                # Still blind: count it in memory (3 fresh losses must still
+                # pause) and remember it for replay onto the store's truth.
+                self._pending_results = list(
+                    getattr(self, "_pending_results", [])) + [pnl]
         self._daily_pnl += pnl
 
         if pnl < 0:
@@ -244,9 +321,9 @@ class CircuitBreaker:
             pause_seconds = self._config.pause_minutes_after_losses * 60
             self._trip(
                 f"consecutive_losses ({self._consecutive_losses})",
-                pause_seconds=pause_seconds,
+                pause_seconds=pause_seconds, persist=persist,
             )
-        else:
+        elif persist:
             # R16: _trip persists; a non-tripping result still moved the
             # streak and the daily total, so it must be written too.
             self._persist()
@@ -340,14 +417,15 @@ class CircuitBreaker:
 
     # --- Private ---
 
-    def _trip(self, reason: str, pause_seconds: int = 0) -> None:
+    def _trip(self, reason: str, pause_seconds: int = 0, persist: bool = True) -> None:
         """Trip the circuit breaker."""
         self._tripped = True
         self._trip_reason = reason
         self._resume_time = (time.time() + pause_seconds) if pause_seconds > 0 else 0.0
         # R16: persist BEFORE logging — a trip that a keeper-kill erases is
         # the exact failure this fix exists for.
-        self._persist()
+        if persist:
+            self._persist()
 
         log.critical(
             "circuit_breaker_tripped",
