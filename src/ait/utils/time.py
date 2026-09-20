@@ -10,7 +10,10 @@ from zoneinfo import ZoneInfo
 
 import pandas_market_calendars as mcal
 
-ET = ZoneInfo("US/Eastern")
+# W38: ET and the stored-timestamp convention live in a stdlib-only leaf so the
+# supervisor and reporting-only consumers can import them without this module's
+# calendar stack. Re-exported here; every existing caller is unchanged.
+from ait.utils.tz import ET, parse_trade_ts as _parse_trade_ts  # noqa: F401
 UTC = ZoneInfo("UTC")
 
 # NYSE calendar for market hours
@@ -87,11 +90,15 @@ def parse_trade_ts(value: str) -> datetime:
     and `.hour` are ET calendar semantics for every caller regardless of which
     offset the row happens to carry. Raises ValueError/TypeError exactly as
     `datetime.fromisoformat` does, so existing caller guards still apply.
+
+    W38: the implementation moved to `ait.utils.tz`, a stdlib-only leaf, so the
+    supervisor and go_live can share it without paying for this module's market
+    calendar (pandas_market_calendars -> pandas -> numpy at import, which is
+    what killed the supervisor in the incident W34 fixed). Re-exported here so
+    every existing caller and every `from ait.utils.time import ...` is
+    unchanged. This is a delegation, not a copy — there is one implementation.
     """
-    parsed = datetime.fromisoformat(value)
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=ET)
-    return parsed.astimezone(ET)
+    return _parse_trade_ts(value)
 
 
 def is_market_open() -> bool:

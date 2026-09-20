@@ -6172,3 +6172,165 @@ but it is a value someone must revisit. Unassigned as before: the 23 register li
 outside F1-F8 and the research re-run.
 
 ---
+
+## 2026-09-20 - W38 EXECUTED — R26 F5: the W21 convention change's unmigrated readers
+
+First of three waves clearing this box's remaining R26 queue (W38 = F5 remainder, W39 = the two
+W22 Telegram rows, W40 = the F7 rows outside `test_w25_sizing_coherence.py`). Sequential, not
+batched, because the blast radii differ: this one changes what the dashboard and the Friday
+scorecard REPORT.
+
+THE SHAPE OF F5, because it is not what the fix-set line suggests. W21 enumerated its readers by
+grepping `fromisoformat` and walking its AST. That method is blind to two whole classes — SQL date
+functions, and a function that calls a HELPER naming a migrated column — and R26 found three
+survivors in exactly those blind spots. The script half is separate and was done first because it
+gates the Windows box's migration.
+
+[1] `--apply` IS A NO-OP ON THIS BOX, AND THE LEDGER SHOULD SAY SO. R26 F5 #1 reads "run
+    `scripts/restate_w21_tz_aware.py --apply` with the bot stopped". Measured here read-only:
+    **12/12 trades carry an offset on both columns, 0 naive values across all five target
+    columns**, and the pre-migration snapshot `data/backups/ait_state.pre_w21_tz.20260916_133646.db`
+    exists locally holding the naive pre-state. R26's "0 of 30 live rows are tz-aware" was measured
+    on the WINDOWS box (its §-header records the bot running with pids this DB has never seen).
+    Running it here takes the `nothing to do` return, which PRECEDES the snapshot — so it writes
+    nothing, snapshots nothing, and proves nothing. A LEDGER CORRECTION while I am here:
+    PLAN.md:3405's "10 trades, ALL entered 2026-04-23/24" describes neither box today (this one has
+    12 trades, two of them 2026-09-17). The migration is handed to the Windows box as a RUNBOOK
+    step with independent verification — see [6].
+
+[2] THE POST-CONDITION COULD NOT FAIL (R26 `w21-restate-post-condition-is-unsatisfiable`). The
+    script's own verification read `parse_trade_ts(row[col]).tzinfo is None`, and `parse_trade_ts`
+    localises naive input and converts aware input — it can NEVER return naive. So `bad` stayed 0,
+    the success line always printed, and `main()` returned 0 even for a run that wrote nothing: the
+    one automated statement an operator would rely on to confirm the money-bearing corpus really
+    migrated was a constant. Now reads the STORED text via `fromisoformat`, with an unparseable row
+    reported as `POST-CHECK UNPARSEABLE` rather than raising AFTER the writes.
+    REPRODUCED, then closed: against a pre-W38 copy with a trigger reverting every UPDATE, the
+    script printed `post-check: every stored timestamp is timezone-aware` and returned **0** with
+    the row still naive. Post-fix the same scenario returns 1.
+
+[3] THE SCRIPT HAD ZERO TEST COVERAGE (R26 `w21-restate-script-has-zero-test-coverage`) — nothing
+    executed `main()`; the only `restate_w21` string in `tests/` was an assertion MESSAGE. `main()`
+    gains `argv` / `db_path` / `host_move` seams (defaults reproduce the command line exactly, so
+    `__main__` and every operator invocation are unchanged), and 14 tests now drive it against
+    throwaway DBs. The highest-value one is the **HOST_MOVE abort**: a plain string compare against
+    `"2026-09-14"` that is the only thing standing between a convention change and a silent
+    restatement of the trading record, and it had never been executed. Also pinned: idempotency,
+    the snapshot holding the PRE state, per-row EST/EDT derivation (-05:00 in January, -04:00 in
+    July), that an abort leaves the DB BYTE-IDENTICAL, and that the "nothing to do" path takes no
+    snapshot — [1]'s behaviour, so it cannot be mistaken for a backup.
+    Also corrected: the docstring pointed at a `--before` flag that does not exist and never did.
+
+[4] THE DASHBOARD BUCKETED BY THE UTC DAY (R26 `w21-sqlite-date-normalises-aware-timestamps-to-utc`).
+    SQLite's date functions convert an offset-bearing ISO string to UTC first and leave a naive one
+    alone, so W21's aware writes silently changed what seven queries MEAN:
+        date('2026-09-13T21:05:00')       -> '2026-09-13'   the ET day
+        date('2026-09-13T21:05:00-04:00') -> '2026-09-14'   the UTC day
+        strftime('%w', ...)               -> '0' vs '1'     Sunday vs Monday
+    Any close at or after 20:00 EDT landed in tomorrow's P&L row, tomorrow's calendar cell and
+    tomorrow's weekday bucket, while `master.py`'s LIKE counters and every `parse_trade_ts` caller
+    still called it today — two irreconcilable daily series over one table, nothing raised. **This
+    is LIVE on this box, not latent**: every row here is now aware.
+    Six sites take `substr(COALESCE(exit_time, entry_time),1,10)`; the seventh is different and the
+    plan initially got it wrong — `strftime('%w', entry_time)` needs `strftime` OVER `substr`,
+    because substr alone yields no weekday. Declared as `_ET_DAY_WINDOW_SQL` /
+    `_ET_ENTRY_WEEKDAY_SQL` beside the existing `_REAL_CLOSE_SQL`, so the tests bind the same text
+    the app runs rather than reading source.
+    CLASS GUARD, which is the payoff: a scan for `date(`/`strftime(`/`julianday(`/`datetime(`
+    applied directly to a migrated column — the check W21's `fromisoformat` walk structurally could
+    not make. Run against the PRE-FIX file it reports exactly **7 offenders**, matching the 7 sites
+    fixed; against HEAD, zero.
+
+[5] `_mirror_lag` WAS AN UNMIGRATED READER (R26 `w21-mirror-lag-is-an-unmigrated-reader`). Bare
+    `fromisoformat` on both sides, so a naive/aware pair raised TypeError into a bare `except` and
+    the digest degraded from "mirror BEHIND live by 28h" to a bare "BEHIND" with no magnitude —
+    exactly when the mirror IS behind, leaving the operator unable to tell a one-run lag from the
+    multi-day 07-14 failure the check exists to catch. W21's function-scoped guard could not see it
+    because the function's own body never names a migrated column; they live in `_newest_trade_ts`.
+    The existing `test_mirror_behind_source_reports_the_lag` seeds `datetime.now().isoformat()` on
+    BOTH sides, so it could never observe this. A parametrized sibling now covers aware/naive,
+    naive/aware and aware/aware. Under the pre-W38 mutation: **3 failed / 5 passed**, the two MIXED
+    cases red and `[True-True]` green — a control that must hold on both trees.
+
+[6] THE POST-MIGRATION CHECK COULD NOT RUN. `c368a0f` gated the live-corpus assertion behind
+    `AIT_CHECK_LIVE_CORPUS=1`, which NOTHING in the repo sets — no runbook, no CI, no smoke. The
+    verification existed and was unreachable. It is now `scripts/smoke_deploy.py
+    --check-live-corpus`, opt-in as a 14th check (SMOKE PASS (14 checks), 22 timestamps verified),
+    with the default path unchanged at 13. Deliberately NOT unconditional: on the un-migrated
+    Windows box that would turn SMOKE PASS red BEFORE the migration, which is the "red is normal"
+    trap the skip was added to avoid. `docs/RUNBOOK.md` carries the three-command sequence and one
+    instruction in bold — **do not trust the script's exit code**. Its post-check could not fail
+    until [2], and a migration should not be verified by the tool that performed it; the smoke
+    check re-reads the DB independently.
+
+[7] W21's DuckDB ALLOWLIST ENTRY IS NOW EXECUTABLE. PLAN.md:3484-3488 cleared the analytics mirror
+    "VERIFIED, NOT ASSUMED" on a one-time probe: its columns are `TIMESTAMP` not `TIMESTAMPTZ` and
+    DuckDB drops the offset on ingest. Re-measured on duckdb 1.5.2 — still true, an aware and a
+    naive string land byte-identical and naive. But it rested on library behaviour this project
+    does not control, and flipping that column type would shift every hold time and date bucket in
+    the mirror by 4-5 hours, silently, with nothing to notice. Four control tests now say so.
+
+[8] ONE PLANNED FIX WAS UNSAFE AS WRITTEN, AND THE DEVIATION IS THE INTERESTING PART. The plan said
+    "use `parse_trade_ts` on both sides" for [5] and the pace window. But `ait/utils/time.py`
+    imports `pandas_market_calendars` and builds the NYSE calendar AT MODULE SCOPE — importing it
+    in `master.py` is precisely what W23 did and W34 removed, because a broken scientific stack then
+    kills the SUPERVISOR at import: no bot restart, no Gateway recovery, no page, while the bot may
+    be holding condors. `strategies/base.py:17` separately requires `go_live.py` stay import-light
+    for the dashboard and status server. Two constrained callers, and W38 was about to add a third
+    hand-rolled copy of the same rule.
+    So the rule moved to `src/ait/utils/tz.py`, a leaf importing nothing outside the standard
+    library. `ait/utils/time.py` DELEGATES to it (not a copy — one implementation), and `master.py`
+    and `go_live.py` import it directly. Guarded three ways: an AST check that the leaf imports only
+    stdlib, a SUBPROCESS check that importing it pulls in no pandas/numpy/structlog/pydantic
+    (transitive cost is what actually matters), and a module-scope check that neither constrained
+    module reaches `ait.utils.time` again. The supervisor's parser is asserted by IDENTITY, not
+    equality — equality would pass for a copy that agrees today and drifts tomorrow, which is the
+    failure mode this project keeps hitting.
+    CAUGHT BY THE SUITE, NOT BY ME: W21's own class guard went red on the move, because its
+    allowlist named `ait/utils/time.py` as the legitimate home of the hand-rolled parse. The
+    authority relocated; the allowlist now says so, with the reason. The guard worked.
+
+[9] THE GO-LIVE PACE WINDOW READ THE WRONG CLOCK (R26 `w21-go-live-pace-window-compares-a-naive-
+    cutoff-to-aware-rows`). `ref = now or datetime.now()` built a NAIVE cutoff and compared it as
+    TEXT against aware rows. Nothing raised — both sides are strings and ISO ordering survives an
+    offset suffix — so the error was invisible and equalled the host's offset from ET. Pace is a
+    GO-LIVE GATE CRITERION on the Friday scorecard.
+    `now_et()` alone is necessary but NOT sufficient: a text compare is only correct while both
+    offsets match, and across the EST/EDT boundary or against a microsecond-free row it is
+    byte-ordering luck. Instants are now parsed and compared; an unparseable row is skipped rather
+    than taking the whole operator readout down.
+    MEASURED on the same in-window close (27d23h old): pre-fix counted on an ET host and DROPPED on
+    UTC, Berlin and Sydney. This box runs at ET+6, so it was being dropped here. Post-fix it counts
+    on all four. No test existed for pace at all before this wave.
+
+PROOF. `tests/test_w38_restate_script.py` (14), `tests/test_w38_et_day_bucketing.py` (9),
+`tests/test_w38_pace_window.py` (9), `tests/test_w38_duckdb_offset_control.py` (4), and 4 added to
+`tests/test_r16_tail_fixes.py`. Pre-fix evidence is per-finding rather than one red count, because
+three of these fixes are in files the new tests must import: the post-condition reproduced against a
+reverted copy ([2]); the class guard fired on 7 real offenders in the pre-fix dashboard ([4]); the
+mirror-lag mutation ran 3 failed / 5 passed with the green one named ([5]); the pace shift measured
+across four host zones ([9]). Controls that must hold on BOTH trees are named in each file — the
+aware/aware mirror pair, a naive row still bucketing to its own ET day, an explicit naive `now`
+still accepted, the live 10% credit/width floor still reachable. **No `inspect.getsource`.**
+
+VERIFICATION. Full fast lane **2145 passed / 45 skipped / 1 failed** (905s) — the failure is the
+standing local-`.env` `test_r19_config_authority` case (`AIT_MARKET_DATA_TYPE` env=3 vs contract=4).
+Reconciled arithmetically: W31's 2105 + 40 new (14+9+9+4+4) = 2145. `compileall` OK;
+`scripts/typecheck.py` OK; `scripts/smoke_deploy.py` -> SMOKE PASS (13 checks), and with
+`--check-live-corpus` SMOKE PASS (14 checks).
+
+STATE AT HANDOFF: committed and pushed on `feature/event-straddle`. **NOT RUNNING** — nothing is
+running on this box, so the changes load whenever it next starts. `master.py` changed, so deploying
+this needs a **full supervisor restart**, not a bot restart. Nothing in the order, sizing or scan
+path moved; the dashboard changes are read-only queries and the rest is reporting.
+
+ON THE WINDOWS BOX, NOT HERE: the actual `--apply`, with the bot stopped, per the RUNBOOK sequence
+in [6], then `smoke_deploy.py --check-live-corpus`. Its corpus is the one with naive rows. Until
+that runs, F5 #1 stays open THERE while everything else in F5 is closed.
+
+NEXT, on this box: **W39** — the two W22 Telegram rows (`w22-unrecognised-telegram-updates-are-
+dropped-with-no-trace`, and the narrowed residuals of `w22-leaked-msgid-keeps-a-dead-position-
+pending-forever`, whose "pending forever" repro W30 appears to have already closed — to be
+re-derived before anything is claimed), plus the dead `notifications.telegram` config block, which
+nothing in `src/` reads. Then **W40** — the F7 rows: W18's `getsource` tests, W22's background-task
+test, and the four ledger corrections. REGISTERED BY W38, NOT FIXED: nothing new.

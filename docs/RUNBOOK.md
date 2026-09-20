@@ -78,6 +78,25 @@ unmanaged), found a day later. Do all five steps, in order:
    don't (imports, real-config load, real-DB row mapping, digests, learning
    state, wing sizing) read-only, no IBKR needed — this is the 5-minute check
    that would have caught 07-10. Optional: `--telegram` sends the verdict.
+
+   **One-off, on a box whose W21 timestamp migration is still outstanding**
+   (R26 F5 — the Windows box as of 2026-09-20; the macOS box is already
+   migrated). Stop the bot first; the script snapshots and writes:
+
+   ```
+   python scripts/restate_w21_tz_aware.py              # dry run — read the plan
+   python scripts/restate_w21_tz_aware.py --apply      # snapshot + write
+   python scripts/smoke_deploy.py --check-live-corpus  # 14 checks, not 13
+   ```
+
+   Do **not** treat the script's own exit code as proof. Its post-check could
+   not fail before W38, and a migration should not be verified by the tool
+   that performed it — `--check-live-corpus` re-reads the DB independently and
+   is what closes F5. If it reports naive rows, the migration did not land;
+   the snapshot path is printed by the `--apply` run.
+   `--apply` aborts rather than relabelling any row written on or after
+   `HOST_MOVE` (2026-09-14) — those are a restatement, not a convention
+   change, and need handling by hand.
 4. **Confirm liveness after the next RTH open** (~09:35–09:45 ET):
    - fresh heartbeat: `Get-Item data\bot_heartbeat | Select-Object LastWriteTime`
      — must be minutes old and refreshing;

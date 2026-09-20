@@ -45,6 +45,14 @@ def now_et() -> datetime:
     """Current ET time — stdlib only (see the note above)."""
     return datetime.now(ET)
 
+
+# W38: the stored-timestamp convention, from the stdlib-only leaf. NOT from
+# `ait.utils.time` — that module's NYSE calendar build at import is precisely
+# what W34 removed from this file, because a broken scientific stack then kills
+# the SUPERVISOR. `ait.utils.tz` imports nothing outside the standard library
+# and a guard test keeps it that way.
+from ait.utils.tz import parse_trade_ts as _as_et  # noqa: E402
+
 # Project root
 ROOT = Path(__file__).resolve().parents[3]
 LOGS_DIR = ROOT / "logs"
@@ -1614,8 +1622,17 @@ def _mirror_lag() -> tuple[str, float | None]:
     if m_ts == s_ts:
         return ("current", 0.0)
     try:
-        lag = (datetime.fromisoformat(s_ts)
-               - datetime.fromisoformat(m_ts)).total_seconds() / 3600
+        # W38 (R26 `w21-mirror-lag-is-an-unmigrated-reader`): these were bare
+        # `fromisoformat` calls, so once W21 made the live corpus aware while a
+        # mirror still held naive rows (or the reverse, after a restore),
+        # subtracting them raised TypeError into the except below and the
+        # digest lost the NUMBER — degrading to a bare "mirror BEHIND live"
+        # exactly when the mirror IS behind, so the operator could not tell a
+        # one-run lag from the multi-day 07-14 failure this check exists to
+        # catch. W21's function-scoped AST guard structurally could not see it:
+        # this function's own body never names a migrated column — they live in
+        # `_newest_trade_ts`.
+        lag = (_as_et(s_ts) - _as_et(m_ts)).total_seconds() / 3600
     except Exception:  # noqa: BLE001
         return ("behind", None)
     if lag <= 0:

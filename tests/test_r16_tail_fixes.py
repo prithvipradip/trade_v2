@@ -782,6 +782,74 @@ class TestMirrorLag:
         assert state == "behind"
         assert 27 < lag < 29
 
+    @pytest.mark.parametrize("source_aware,mirror_aware", [
+        (True, False),   # live migrated by W21, mirror not yet copied
+        (False, True),   # after a restore from an already-migrated snapshot
+        (True, True),    # both migrated — the steady state
+    ])
+    def test_the_lag_survives_a_half_migrated_pair(
+        self, tmp_path, monkeypatch, source_aware, mirror_aware
+    ):
+        """W38 (R26 `w21-mirror-lag-is-an-unmigrated-reader`).
+
+        The sibling above seeds `datetime.now().isoformat()` on BOTH sides, so
+        the two always agree about awareness and it cannot see this defect.
+        W21 made the live corpus aware; until the next mirror copy — and again
+        after any restore — the two sides disagree, bare `fromisoformat`
+        subtraction raises TypeError into the bare except, and the digest loses
+        the NUMBER exactly when the mirror IS behind. The operator then cannot
+        tell a one-run lag from the multi-day 07-14 failure.
+
+        Pre-fix this returns ("behind", None) for the two mixed cases.
+        """
+        from zoneinfo import ZoneInfo
+
+        from ait.orchestration import master as _m
+        ET = ZoneInfo("US/Eastern")
+        home = tmp_path / "home"
+        (home / "Documents" / "ait_backups").mkdir(parents=True)
+        data = tmp_path / "data"
+        data.mkdir()
+
+        def _stamp(hours_ago: int, aware: bool) -> str:
+            t = datetime.now(ET) - timedelta(hours=hours_ago)
+            return t.isoformat() if aware else t.replace(tzinfo=None).isoformat()
+
+        self._db(home / "Documents" / "ait_backups" / "ait_state.latest.db",
+                 _stamp(30, mirror_aware))
+        self._db(data / "ait_state.db", _stamp(2, source_aware))
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        monkeypatch.setattr(_m, "DATA_DIR", data)
+
+        state, lag = _m._mirror_lag()
+        assert state == "behind"
+        assert lag is not None, (
+            "the lag number was lost — the digest degrades to a bare 'BEHIND' "
+            "with no magnitude"
+        )
+        assert 27 < lag < 29, f"lag {lag} is not the seeded 28h"
+
+    def test_the_supervisor_shares_the_one_parser_rather_than_copying_it(self):
+        """W38: `master._as_et` must BE the authority, not agree with it.
+
+        Identity, not equality: before W38 this file resolved the convention
+        inline, and go_live was about to add a third copy. Equality would pass
+        for a copy that happens to agree today and drifts tomorrow, which is
+        the failure mode this project has hit repeatedly. The import must also
+        stay off `ait.utils.time`, whose NYSE calendar build at import is what
+        killed the supervisor in the incident W34 fixed.
+        """
+        from ait.orchestration import master as _m
+        from ait.utils.time import parse_trade_ts as via_time
+        from ait.utils.tz import parse_trade_ts as authority
+
+        assert _m._as_et is authority, (
+            "the supervisor is resolving ET with its own copy again"
+        )
+        assert via_time("2026-09-13T21:05:00") == authority("2026-09-13T21:05:00"), (
+            "ait.utils.time no longer delegates to the leaf"
+        )
+
     def test_missing_mirror_still_reported(self, tmp_path, monkeypatch):
         from ait.orchestration import master as _m
         home = tmp_path / "home"

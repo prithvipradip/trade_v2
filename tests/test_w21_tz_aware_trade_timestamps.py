@@ -258,6 +258,13 @@ class TestTheClassGuard:
             "ait/monitoring/duckdb_analytics.py",
             # The helper itself.
             "ait/utils/time.py",
+            # W38: and its implementation, which moved to a stdlib-only leaf so
+            # the SUPERVISOR and go_live can share one parser without paying
+            # for utils/time.py's NYSE calendar build at import (the failure
+            # W34 removed from master.py). `ait/utils/time.py` now delegates
+            # here; this is the same single authority, relocated — not a
+            # second hand-rolled parse.
+            "ait/utils/tz.py",
         }
         offenders = []
         for path in SRC.rglob("*.py"):

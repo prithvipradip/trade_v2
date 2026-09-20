@@ -38,6 +38,26 @@ _REAL_CLOSE_SQL = " ".join(
     for _p in _NOT_REAL_PATTERNS
 ).replace("' COALESCE", "' AND COALESCE")
 
+# W38 (R26 F5, `w21-sqlite-date-normalises-aware-timestamps-to-utc-in-the-dashboard`).
+# SQLite's date functions convert an offset-bearing ISO string to UTC FIRST and
+# leave a naive one alone. Under W21's aware writes that silently changed what
+# every one of these queries means:
+#     date('2026-09-13T21:05:00')        -> '2026-09-13'   (the ET day)
+#     date('2026-09-13T21:05:00-04:00')  -> '2026-09-14'   (the UTC day)
+#     strftime('%w', ...)                -> '0' vs '1'     (Sunday vs Monday)
+# So any close at or after 20:00 EDT landed in tomorrow's P&L row, tomorrow's
+# calendar cell and tomorrow's weekday bucket, while master.py's LIKE counters
+# and every parse_trade_ts caller still called it today — two irreconcilable
+# daily series over one table, no error raised anywhere. W21 enumerated readers
+# by grepping `fromisoformat` and walking its AST, which is blind to SQL by
+# construction, so this class was never examined.
+# Taking the first 10 characters is offset-proof and agrees with the LIKE
+# readers already in master.py and bot/state.py. Declared here so the tests
+# bind the same text the app runs.
+_ET_DAY = "substr(COALESCE(exit_time, entry_time),1,10)"
+_ET_DAY_WINDOW_SQL = f"{_ET_DAY} BETWEEN ? AND ?"
+_ET_ENTRY_WEEKDAY_SQL = "strftime('%w', substr(entry_time,1,10))"
+
 
 # W18 (w17-11): the three local _capital_base() copies are gone. Each wrapped
 # the declared single authority in a bare unlogged `except` and fell back to a
@@ -722,7 +742,7 @@ def _tab_trade_history(
         # before the window but closed inside it must appear in the range
         "SELECT trade_id, symbol, strategy, direction, status, "
         "entry_price, exit_price, realized_pnl, entry_time, exit_time "
-        "FROM trades WHERE date(COALESCE(exit_time, entry_time)) BETWEEN ? AND ? "
+        f"FROM trades WHERE {_ET_DAY_WINDOW_SQL} "
         "ORDER BY entry_time DESC LIMIT 100",
         (start_iso, end_iso),
     )
@@ -757,7 +777,7 @@ def _tab_trade_history(
             f"ROUND(SUM(realized_pnl), 2) as total_pnl, "
             f"ROUND(AVG(realized_pnl), 2) as avg_pnl "
             f"FROM trades WHERE status = 'closed' "
-            f"AND date(COALESCE(exit_time, entry_time)) BETWEEN ? AND ? "
+            f"AND {_ET_DAY_WINDOW_SQL} "
             f"AND {_REAL_CLOSE_SQL} "
             f"GROUP BY strategy ORDER BY total_pnl DESC",
             (start_iso, end_iso),
@@ -792,7 +812,7 @@ def _tab_trade_history(
             f"ROUND(SUM(realized_pnl), 2) as total_pnl, "
             f"ROUND(AVG(realized_pnl), 2) as avg_pnl "
             f"FROM trades WHERE status = 'closed' "
-            f"AND date(COALESCE(exit_time, entry_time)) BETWEEN ? AND ? "
+            f"AND {_ET_DAY_WINDOW_SQL} "
             f"AND {_REAL_CLOSE_SQL} "
             f"GROUP BY symbol ORDER BY total_pnl DESC",
             (start_iso, end_iso),
@@ -844,7 +864,7 @@ def _tab_trade_history(
             ROUND(AVG(realized_pnl), 2) as avg_pnl
         FROM trades
         WHERE status = 'closed'
-          AND date(COALESCE(exit_time, entry_time)) BETWEEN ? AND ?
+          AND {_ET_DAY_WINDOW_SQL}
           AND {_REAL_CLOSE_SQL}
           AND ml_confidence > 0
         GROUP BY confidence_bucket
@@ -867,7 +887,7 @@ def _tab_trade_history(
         # weekday — the question is entry timing
         f"""
         SELECT
-            CASE strftime('%w', entry_time)
+            CASE {_ET_ENTRY_WEEKDAY_SQL}
                 WHEN '1' THEN '1. Monday'
                 WHEN '2' THEN '2. Tuesday'
                 WHEN '3' THEN '3. Wednesday'
@@ -880,7 +900,7 @@ def _tab_trade_history(
             ROUND(AVG(realized_pnl), 2) as avg_pnl
         FROM trades
         WHERE status = 'closed'
-          AND date(COALESCE(exit_time, entry_time)) BETWEEN ? AND ?
+          AND {_ET_DAY_WINDOW_SQL}
           AND {_REAL_CLOSE_SQL}
         GROUP BY day_of_week
         ORDER BY day_of_week
@@ -973,7 +993,7 @@ def _live_vs_backtest_panel(conn: sqlite3.Connection) -> None:
         conn,
         f"SELECT realized_pnl, entry_time, exit_time FROM trades "
         f"WHERE status = 'closed' "
-        f"AND date(COALESCE(exit_time, entry_time)) BETWEEN ? AND ? "
+        f"AND {_ET_DAY_WINDOW_SQL} "
         f"AND {_REAL_CLOSE_SQL}",
         (start.isoformat(), end.isoformat()),
     )

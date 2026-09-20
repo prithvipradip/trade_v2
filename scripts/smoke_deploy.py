@@ -57,7 +57,7 @@ import sqlite3
 import sys
 import time
 import traceback
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -631,6 +631,50 @@ def check_iron_condor_width() -> str:
     return f"width ${w_free:.2f} free -> ${w_capped:.2f} under $147 budget"
 
 
+def check_live_corpus_tz_aware() -> str:
+    """(h) W38/F5: every stored trade timestamp carries an offset.
+
+    The post-migration verification for `scripts/restate_w21_tz_aware.py`.
+    W21 shipped this assertion inside the unit suite, where a box whose
+    migration was still outstanding failed the whole fast lane for a reason
+    that is not a code defect; c368a0f then gated it behind
+    AIT_CHECK_LIVE_CORPUS=1, which nothing in the repo ever set — so the check
+    existed but could not run. It belongs here: a deploy gate, opt-in, run
+    against the real DB at the moment it is the right question to ask.
+
+    Deliberately independent of the script's own exit code. R26 found that
+    post-check could not fail (W38 fixed it), and a migration is not a thing to
+    verify with the tool that performed it.
+    """
+    db = ROOT / "data" / "ait_state.db"
+    assert db.exists(), f"no state DB at {db}"
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        naive: list[str] = []
+        total = 0
+        for table, cols in (("trades", ("entry_time", "exit_time")),
+                            ("open_positions", ("entry_time",)),
+                            ("exit_outbox", ("exit_time", "claimed_at"))):
+            for row in con.execute(
+                    f"SELECT {', '.join(cols)} FROM {table}"):  # noqa: S608
+                for col, raw in zip(cols, row):
+                    if not raw:
+                        continue
+                    total += 1
+                    try:
+                        if datetime.fromisoformat(raw).tzinfo is None:
+                            naive.append(f"{table}.{col}={raw}")
+                    except (ValueError, TypeError):
+                        naive.append(f"{table}.{col}={raw!r} unparseable")
+    finally:
+        con.close()
+    assert not naive, (
+        f"{len(naive)} of {total} stored timestamps are not timezone-aware — "
+        f"the W21 migration is outstanding on this box. First: {naive[:3]}"
+    )
+    return f"{total} stored timestamp(s) across 3 tables, all timezone-aware"
+
+
 # ---------------------------------------------------------------------------
 # Optional Telegram verdict
 # ---------------------------------------------------------------------------
@@ -659,6 +703,12 @@ def main(argv: list[str] | None = None) -> int:
                     "read-only against the real config and DBs.")
     parser.add_argument("--telegram", action="store_true",
                         help="send the verdict via ait.notifications (default off)")
+    parser.add_argument(
+        "--check-live-corpus", action="store_true",
+        help="also assert every stored trade timestamp is timezone-aware "
+             "(W21/F5). OFF by default because a box whose migration is still "
+             "outstanding would fail this legitimately; run it AFTER "
+             "scripts/restate_w21_tz_aware.py --apply.")
     args = parser.parse_args(argv)
 
     _bootstrap()
@@ -678,6 +728,8 @@ def main(argv: list[str] | None = None) -> int:
     _run("counterfactual_tracker.state_load", check_counterfactual_state)
     _run("thompson_sampler.state_load", check_thompson_state)
     _run("iron_condor.vol_scaled_width", check_iron_condor_width)
+    if args.check_live_corpus:
+        _run("trade_timestamps_all_tz_aware(F5)", check_live_corpus_tz_aware)
     _run("no_writes(both DBs)", guard.verify)
 
     for w in WARNINGS:

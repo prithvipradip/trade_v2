@@ -49,6 +49,11 @@ from pathlib import Path
 
 from ait.bot.state import TradeStatus
 
+# W38: stdlib-only leaf. NOT `ait.utils.time` — this module must stay
+# import-light for its reporting-only consumers (see strategies/base.py:17),
+# and that one builds the NYSE calendar at import.
+from ait.utils.tz import ET, now_et, parse_trade_ts
+
 # R19d/R20b follow-up: the go-live verdict metric (status.py) counts ONLY
 # strategies actually promoted to production, which is a STRICT SUBSET of
 # CREDIT_STRATEGIES (most of which are backtest-only experiments) — a
@@ -410,9 +415,37 @@ def compute_go_live_verdict(
             )
 
     # ---- pace (policy-vs-impl-1: 'on track' used to mean n >= 1) -----------
-    ref = now or datetime.now()
-    cutoff = (ref - timedelta(days=PACE_WINDOW_DAYS)).isoformat()
-    recent = sum(1 for r in ic if (r["exit_time"] or r["entry_time"] or "") >= cutoff)
+    # W38 (R26 `w21-go-live-pace-window-compares-a-naive-cutoff-to-aware-rows`):
+    # this built the cutoff from the NAIVE host clock and compared it as TEXT
+    # against rows W21 made aware ET. Nothing raised — both sides are strings
+    # and ISO ordering survives an offset suffix — so the error was invisible
+    # and equalled the host's offset from ET (six hours on the CEST box whose
+    # move motivated W21). Pace is a go-live gate criterion on the Friday
+    # scorecard, so a close near the boundary was counted in or out by where
+    # the operator happened to be sitting.
+    # `now_et()` alone is necessary but NOT sufficient: a text compare is only
+    # correct while both offsets match, and across the EST/EDT boundary or
+    # against a microsecond-free row it is byte-ordering luck. Compare parsed
+    # instants. (A bare `fromisoformat` here would also trip W21's guard.)
+    ref = now or now_et()
+    cutoff = ref - timedelta(days=PACE_WINDOW_DAYS)
+    if cutoff.tzinfo is None:            # an explicit naive `now` from a caller
+        cutoff = cutoff.replace(tzinfo=ET)
+    recent = 0
+    for r in ic:
+        raw = r["exit_time"] or r["entry_time"] or ""
+        if not raw:
+            continue
+        try:
+            if parse_trade_ts(raw) >= cutoff:
+                recent += 1
+        except (ValueError, TypeError):
+            # Skipped, not raised: one malformed row must not take the whole
+            # operator scorecard down. Not logged because this module is
+            # deliberately import-light (strategies/base.py:17) and a logger
+            # would cost structlog + the settings model; the restate script's
+            # UNVOUCHABLE report is where an unparseable timestamp surfaces.
+            continue
     v.pace_per_week = recent / (PACE_WINDOW_DAYS / 7.0)
 
     v.criteria = _build_criteria(v, slip_err)
