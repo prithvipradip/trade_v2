@@ -557,11 +557,24 @@ class LearningConfig(_StrictModel):
 
 
 class TelegramConfig(_StrictModel):
-    enabled: bool = True
-    send_trades: bool = True
-    send_errors: bool = True
-    send_daily_summary: bool = True
-    send_circuit_breaker: bool = True
+    enabled: bool = Field(default=True,
+        description="W39: the ONLY switch here that does anything. It gates "
+                    "the notifier at its single construction site in main.py; "
+                    "the effective state is `enabled and bool(token and "
+                    "chat_id)`. Turning it off also stops the manual-position "
+                    "POLLER, so a HALT_UNTRACKED prompt can no longer be "
+                    "answered and entries stay frozen — the warning at startup "
+                    "says so.\n"
+                    "The four `send_trades` / `send_errors` / "
+                    "`send_daily_summary` / `send_circuit_breaker` flags that "
+                    "used to sit beside this were DELETED rather than wired: "
+                    "nothing in src/ ever read them, so an operator setting "
+                    "one to false changed nothing. Wiring them would have "
+                    "added four new fail-open decisions on alert paths, which "
+                    "is the wrong direction for this programme — an alert that "
+                    "silently does not fire is the R8 class. If per-category "
+                    "muting is ever wanted it needs its own wave, fail-closed, "
+                    "with tests per path.")
 
 
 class NotificationsConfig(_StrictModel):

@@ -285,11 +285,14 @@ sentiment:
 
 notifications:
   telegram:
+    # W39: `enabled` now actually gates the notifier (it did not before — the
+    # only real switch was whether .env carried a token and chat id, so setting
+    # this to false changed nothing). Turning it off ALSO stops the
+    # manual-position poller, so HALT_UNTRACKED prompts cannot be answered and
+    # entries stay frozen; startup warns when that happens.
+    # The four send_* flags that used to live here were deleted: nothing read
+    # them, and wiring them would have put four fail-open gates on alert paths.
     enabled: true
-    send_trades: true
-    send_errors: true
-    send_daily_summary: true
-    send_circuit_breaker: true
 
 dashboard:
   enabled: true

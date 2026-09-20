@@ -28,6 +28,36 @@ KEY_A = "QQQ:712.0:C:2026-09-18"
 KEY_B = "QQQ:712.0:C:2026-10-16"
 
 
+@pytest.fixture(autouse=True)
+def _reset_nudge_throttle():
+    """W39: `_last_nudge_at` is module-level (the poller is one long-lived
+    task), so without this the first test to nudge would silence every later
+    one and the suite would depend on collection order."""
+    mp._last_nudge_at = 0.0
+    yield
+    mp._last_nudge_at = 0.0
+
+
+@pytest.fixture
+def discards(monkeypatch):
+    """The `reason=` of every discard the module logged, in order.
+
+    W39: structlog does not route through stdlib logging, so `caplog` sees
+    nothing — record the real module logger instead. Returns a callable so a
+    test reads the list AFTER driving the code.
+    """
+    seen: list[str] = []
+    real = mp.log.info
+
+    def _spy(event, **kw):
+        if event == "manual_position_update_discarded":
+            seen.append(kw.get("reason", "?"))
+        return real(event, **kw)
+
+    monkeypatch.setattr(mp.log, "info", _spy)
+    return lambda: seen
+
+
 class FakeTelegram:
     """Duck-typed TelegramNotifier double. Records every call so tests can
     assert on exactly what was sent/edited/answered."""
@@ -170,13 +200,42 @@ class TestButtonPathStandalone:
         assert mp.is_declared(st, KEY_A) is False
         assert "NO" in tg.last_edit_for(555)
 
-    def test_callback_from_a_different_chat_is_ignored(self, tmp_path):
+    def test_callback_from_a_different_chat_is_ignored(self, tmp_path, discards):
+        """W39 INVERSION (R26 `w22-unrecognised-telegram-updates-are-dropped`).
+
+        The assertion `tg.answered_callbacks == []` pinned the DEFECT: an
+        unanswered callback_query leaves the button spinning on the sender's
+        phone forever. Telegram requires every callback to be answered; that
+        is a transport obligation, not an endorsement of the tap.
+
+        The INTENT — never act on a foreign chat's input — is unchanged and
+        still asserted, and is now joined by the trace that was missing.
+        """
         st = _state(tmp_path)
         tg = FakeTelegram()
         upd = _callback_update(1, "cbq1", f"manual:yes:{KEY_A}", 555, chat_id="999999")
         asyncio.run(mp._handle_update(st, tg, CHAT_ID, upd))
+
+        assert mp.is_declared(st, KEY_A) is None, "a foreign chat set an answer"
+        assert [cq for cq, _ in tg.answered_callbacks] == ["cbq1"], (
+            "the callback was never answered — the button spins forever"
+        )
+        assert not tg.sent, "replied into a chat that is not the configured one"
+        assert discards() == ["callback_foreign_chat"]
+
+    def test_a_callback_with_no_message_is_answered_and_logged(self, tmp_path, discards):
+        """`cq.get("message") or {}` made an ABSENT message indistinguishable
+        from a foreign-chat one, so this fell through the chat check having
+        answered nothing."""
+        st = _state(tmp_path)
+        tg = FakeTelegram()
+        upd = {"update_id": 1,
+               "callback_query": {"id": "cbq1", "data": f"manual:yes:{KEY_A}"}}
+        asyncio.run(mp._handle_update(st, tg, CHAT_ID, upd))
+
+        assert [cq for cq, _ in tg.answered_callbacks] == ["cbq1"]
         assert mp.is_declared(st, KEY_A) is None
-        assert tg.answered_callbacks == []
+        assert discards() == ["callback_without_message"]
 
 
 class TestTextPathStandalone:
@@ -199,8 +258,15 @@ class TestTextPathStandalone:
         asyncio.run(mp._handle_update(st, tg, CHAT_ID, upd))
         assert mp.is_declared(st, KEY_A) is True
 
-    def test_reply_to_an_unmatched_message_id_is_ignored_not_misapplied(self, tmp_path):
-        """A reply to some unrelated message must never be guessed at."""
+    def test_reply_to_an_unmatched_message_id_is_ignored_not_misapplied(
+        self, tmp_path, discards
+    ):
+        """A reply to some unrelated message must never be guessed at.
+
+        W39: the intent is unchanged — still not guessed at — but the operator
+        now learns that their reply went nowhere instead of being met with
+        silence at `log.debug`.
+        """
         st = _state(tmp_path)
         tg = FakeTelegram()
         st.set_state("manual_position_prompt_msgid_" + KEY_A, "555")
@@ -208,14 +274,94 @@ class TestTextPathStandalone:
         asyncio.run(mp._handle_update(st, tg, CHAT_ID, upd))
         assert mp.is_declared(st, KEY_A) is None
         assert tg.edited == []
+        assert discards() == ["reply_to_unmatched_message"]
+        assert tg.sent and "prompt" in tg.sent[0].lower()
 
-    def test_text_from_a_different_chat_is_ignored(self, tmp_path):
+    def test_text_from_a_different_chat_is_ignored(self, tmp_path, discards):
+        """W39: logged, and still never replied to — answering would leak the
+        bot's existence to a chat that is not the configured one."""
         st = _state(tmp_path)
         tg = FakeTelegram()
         st.set_state("manual_position_prompt_msgid_" + KEY_A, "555")
         upd = _text_update(1, 601, "yes", reply_to_message_id=555, chat_id="999999")
         asyncio.run(mp._handle_update(st, tg, CHAT_ID, upd))
         assert mp.is_declared(st, KEY_A) is None
+        assert discards() == ["foreign_chat"]
+        assert tg.sent == [], "replied into a foreign chat"
+
+
+class TestUnrecognisedTextIsAnswered:
+    """R26 `w22-unrecognised-telegram-updates-are-dropped-with-no-trace`.
+
+    The prompt invites a free-form reply while the parser accepts exactly four
+    tokens and discarded everything else in total silence — no edit, no
+    confirmation, no log — while HALT_UNTRACKED kept every new entry frozen.
+    "The answer never came" was undiagnosable: identical to a prompt never
+    seen, a getUpdates outage, or a dead poller.
+    """
+
+    def test_yes_please_gets_an_answer_and_a_log_line(self, tmp_path, discards):
+        """R26's own acceptance case, verbatim: send "yes please"."""
+        st = _state(tmp_path)
+        tg = FakeTelegram()
+        st.set_state("manual_position_prompt_msgid_" + KEY_A, "555")
+
+        asyncio.run(mp._handle_update(
+            st, tg, CHAT_ID, _text_update(1, 601, "yes please")))
+
+        assert mp.is_declared(st, KEY_A) is None, (
+            "a fuzzy reply was guessed into an answer"
+        )
+        assert discards() == ["unrecognised_text"]
+        assert tg.sent, "the operator got nothing back"
+        assert "yes" in tg.sent[0].lower() and "no" in tg.sent[0].lower(), (
+            f"the nudge does not name the accepted replies: {tg.sent[0]!r}"
+        )
+
+    def test_the_nudge_is_throttled(self, tmp_path):
+        """A chatty chat must not turn the poller into an echo loop."""
+        st = _state(tmp_path)
+        tg = FakeTelegram()
+        st.set_state("manual_position_prompt_msgid_" + KEY_A, "555")
+        for i in range(5):
+            asyncio.run(mp._handle_update(
+                st, tg, CHAT_ID, _text_update(i, 600 + i, f"chatter {i}")))
+        assert len(tg.sent) == 1, f"sent {len(tg.sent)} nudges for 5 messages"
+
+    def test_no_nudge_when_nothing_is_pending(self, tmp_path, discards):
+        """CONTROL: ordinary chat traffic with no open prompt stays silent.
+
+        Without this the fix would turn every unrelated message in the chat
+        into a reply — a worse failure than the silence it replaces.
+        """
+        st = _state(tmp_path)
+        tg = FakeTelegram()
+        asyncio.run(mp._handle_update(
+            st, tg, CHAT_ID, _text_update(1, 601, "good morning")))
+        assert tg.sent == []
+        assert discards() == ["unrecognised_text"], (
+            "the discard should still be traceable even when no prompt is open"
+        )
+
+    def test_a_real_answer_still_works(self, tmp_path):
+        """CONTROL: must hold on both trees — the four tokens still record."""
+        st = _state(tmp_path)
+        tg = FakeTelegram()
+        st.set_state("manual_position_prompt_msgid_" + KEY_A, "555")
+        asyncio.run(mp._handle_update(st, tg, CHAT_ID, _text_update(1, 601, "yes")))
+        assert mp.is_declared(st, KEY_A) is True
+
+    def test_the_prompt_names_the_accepted_replies(self, tmp_path):
+        """The silence was half the defect; the other half was a prompt that
+        invited a reply without saying what would be understood."""
+        st = _state(tmp_path)
+        tg = FakeTelegram()
+        asyncio.run(mp.prompt_if_needed(st, tg, KEY_A, 1.0))
+        assert tg.buttoned, "no prompt was sent"
+        text = tg.buttoned[0]["text"]
+        assert "yes" in text.lower() and "no" in text.lower(), (
+            f"the prompt does not name the accepted replies: {text!r}"
+        )
 
 
 class TestTheCorrectionScenario:

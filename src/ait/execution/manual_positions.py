@@ -55,6 +55,19 @@ _CONFIRMED_PREFIX = "manual_position_confirmed_"
 # DECLARED. is_declared() alone matches on contract identity only (symbol:
 # strike:right:expiry) — see declared_quantity_matches().
 _QTY_PREFIX = "manual_position_declared_qty_"
+
+#: The only replies that record an answer. Declared once so the guidance the
+#: operator is shown cannot drift from what `_handle_update` actually accepts —
+#: W39 found the prompt inviting a free-form reply while the parser took four
+#: tokens and discarded everything else in silence.
+_ACCEPTED_REPLIES = ("yes", "y", "no", "n")
+_ACCEPTED_HELP = "reply **yes** or **no** (y / n work too), or tap a button"
+
+#: W39: one nudge per this many seconds, so an unrecognised-text reply in a
+#: busy chat cannot turn the poller into an echo loop. Module-level because the
+#: poller is a single long-lived task.
+_NUDGE_INTERVAL_S = 300.0
+_last_nudge_at: float = 0.0
 _OFFSET_KEY = "telegram_update_offset"
 
 # W22 hardening (trade-v2-1b, 2026-09-16): asyncio.create_task()'s return
@@ -196,6 +209,18 @@ def declared_quantity_matches(state: StateManager, key: str, qty: float) -> bool
     return False
 
 
+def _nudge_is_due(_now: float | None = None) -> bool:
+    """True at most once per `_NUDGE_INTERVAL_S`, so a chatty chat cannot turn
+    an unrecognised-reply nudge into an echo loop. Stamps on success."""
+    global _last_nudge_at
+    import time as _t
+    now = _t.monotonic() if _now is None else _now
+    if now - _last_nudge_at < _NUDGE_INTERVAL_S:
+        return False
+    _last_nudge_at = now
+    return True
+
+
 def pending_keys(state: StateManager) -> list[str]:
     """Keys that have been prompted but not yet answered — used to decide
     whether a bare (no reply-to) yes/no reply is unambiguous."""
@@ -226,7 +251,8 @@ async def prompt_if_needed(
     state.set_state(_QTY_PREFIX + key, str(qty))
     text = (f"🔔 Unmanaged option position detected:\n{key}  qty={qty}\n\n"
             f"Is this a manual/intentional trade of yours? New entries stay "
-            f"frozen until you answer.")
+            f"frozen until you answer.\n"
+            f"({_ACCEPTED_HELP}.)")
     msg_id = await telegram.send_with_buttons(text, _buttons(key))
     if msg_id is not None:
         state.set_state(_MSGID_PREFIX + key, str(msg_id))
@@ -272,7 +298,8 @@ async def _record_and_edit(
               "❌ NO — still frozen for review")
     text = (f"🔔 Unmanaged option position:\n{key}\n\n"
             f"You said: {label}\n\n"
-            f"(tap a button or reply to THIS message to change your answer)")
+            f"(to change your answer, tap a button or reply to THIS message "
+            f"with {' / '.join(_ACCEPTED_REPLIES)})")
     await telegram.edit_message(message_id, text, _buttons(key))
     confirm = ("✅ Got it — recorded as YES"
                if answer == "yes" else
@@ -289,8 +316,23 @@ async def _handle_update(
         on_answer=None) -> None:
     cq = upd.get("callback_query")
     if cq is not None:
-        msg = cq.get("message") or {}
+        # W39 (R26 `w22-unrecognised-telegram-updates-are-dropped-with-no-trace`):
+        # `cq.get("message") or {}` made an ABSENT message behave exactly like a
+        # foreign-chat one, so both fell out of the next line having answered
+        # nothing — and an unanswered callback_query leaves the button spinning
+        # on the operator's phone indefinitely. Answer first, then decide.
+        msg = cq.get("message")
+        if msg is None:
+            await telegram.answer_callback(cq["id"])
+            log.info("manual_position_update_discarded",
+                     reason="callback_without_message", update_id=upd.get("update_id"))
+            return
         if str((msg.get("chat") or {}).get("id", "")) != str(chat_id):
+            await telegram.answer_callback(cq["id"])
+            log.info("manual_position_update_discarded",
+                     reason="callback_foreign_chat",
+                     from_chat=str((msg.get("chat") or {}).get("id", "")),
+                     update_id=upd.get("update_id"))
             return
         data = cq.get("data", "")
         parts = data.split(":", 2)
@@ -305,11 +347,29 @@ async def _handle_update(
 
     msg = upd.get("message")
     if msg is None:
+        log.info("manual_position_update_discarded", reason="not_a_message",
+                 update_id=upd.get("update_id"))
         return
     if str((msg.get("chat") or {}).get("id", "")) != str(chat_id):
+        # Logged but NEVER answered: replying into a chat that is not the
+        # configured one would leak the bot's existence to it.
+        log.info("manual_position_update_discarded", reason="foreign_chat",
+                 from_chat=str((msg.get("chat") or {}).get("id", "")),
+                 update_id=upd.get("update_id"))
         return
     text = (msg.get("text") or "").strip().lower()
-    if text not in ("yes", "y", "no", "n"):
+    if text not in _ACCEPTED_REPLIES:
+        # W39: this was the sharpest of the four silent drops. The prompt
+        # invites a free-form reply, so an operator answering "Yes it's mine"
+        # got NOTHING back — no edit, no confirmation, no log — while
+        # HALT_UNTRACKED kept every new entry frozen. Indistinguishable from a
+        # dead poller, a missed prompt or a getUpdates outage, and therefore
+        # undiagnosable from the logs.
+        log.info("manual_position_update_discarded", reason="unrecognised_text",
+                 text=text[:80], update_id=upd.get("update_id"))
+        if pending_keys(state) and _nudge_is_due():
+            await telegram.send(
+                f"I didn't understand that — {_ACCEPTED_HELP}.")
         return
     answer = "yes" if text in ("yes", "y") else "no"
 
@@ -321,8 +381,16 @@ async def _handle_update(
         # guessed at.
         key = _key_for_message_id(state, reply_to["message_id"])
         if key is None:
-            log.debug("manual_position_reply_unmatched",
-                       message_id=reply_to["message_id"])
+            # W39: was log.debug, i.e. invisible at the live INFO level. The
+            # operator replied to SOMETHING and got silence.
+            log.info("manual_position_update_discarded",
+                     reason="reply_to_unmatched_message",
+                     message_id=reply_to["message_id"])
+            if _nudge_is_due():
+                await telegram.send(
+                    "That reply wasn't attached to one of my position prompts, "
+                    "so I've left it alone. Reply to the prompt message itself, "
+                    "or tap its buttons.")
             return
         await _record_and_edit(state, telegram, key, answer, reply_to["message_id"],
                                on_answer=on_answer)

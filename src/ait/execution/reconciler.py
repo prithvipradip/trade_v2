@@ -1361,6 +1361,27 @@ class PositionReconciler:
                     self._state, _telegram, _declared_keys)
             except Exception as e:  # noqa: BLE001
                 log.warning("manual_position_cleanup_failed", error=str(e))
+        else:
+            # W39 (R26 `w22-leaked-msgid-keeps-a-dead-position-pending-forever`,
+            # residual). Skipping is CORRECT — W30 made this fail closed so an
+            # ambiguous position cache can never be taken as proof a position
+            # is gone — but it was silent, and the skip is the only state in
+            # which a prompt for a closed position lingers. Both consumers
+            # (pending_keys, and the digest's awaiting_reply) read the msgid
+            # row this sweep would have cleared, so while it is skipped the
+            # operator sees "awaiting your reply" for something that may be
+            # long gone, with nothing to explain why. Say so instead.
+            from ait.execution import manual_positions as _mp
+            _stale = _mp.pending_keys(self._state)
+            if _stale:
+                log.info(
+                    "manual_position_cleanup_skipped",
+                    reason=("no_telegram" if _telegram is None
+                            else "positions_not_confirmed_flat"),
+                    pending=len(_stale),
+                    note="prompts stay pending until a pass can confirm the "
+                         "broker set authoritatively",
+                )
 
         # Check local positions not in IBKR (may have been closed while bot was down).
         # SAFETY: if IBKR reports ZERO OPTION positions while we hold open

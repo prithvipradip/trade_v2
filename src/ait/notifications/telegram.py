@@ -20,16 +20,33 @@ log = get_logger("notifications.telegram")
 class TelegramNotifier:
     """Sends notifications via Telegram bot."""
 
-    def __init__(self, bot_token: str, chat_id: str) -> None:
+    def __init__(self, bot_token: str, chat_id: str, *, enabled: bool = True) -> None:
         self._token = bot_token
         self._chat_id = chat_id
-        self._enabled = bool(bot_token and chat_id)
+        configured = bool(bot_token and chat_id)
+        # W39: `notifications.telegram.enabled` was read by NOTHING in src/ —
+        # the only real switch was whether .env carried credentials, so an
+        # operator setting it to false to silence a misbehaving poller changed
+        # nothing at all. Now it gates here, at the one construction site.
+        self._enabled = configured and enabled
         self._bot = None
 
-        if not self._enabled:
+        if not configured:
             log.warning(
                 "telegram_not_configured",
                 hint="Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env",
+            )
+        elif not enabled:
+            # Loud, and it names the consequence: the manual-position poller
+            # skips when the notifier is disabled, so a HALT_UNTRACKED prompt
+            # can no longer be answered and new entries stay frozen.
+            log.warning(
+                "telegram_disabled_by_config",
+                key="notifications.telegram.enabled",
+                consequence="no alerts, and the manual-position poller will "
+                            "not run — HALT_UNTRACKED prompts cannot be "
+                            "answered, so entries stay frozen until this is "
+                            "re-enabled or the position is resolved at IBKR",
             )
 
     @property

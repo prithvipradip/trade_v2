@@ -153,6 +153,7 @@ async def run_bot(args: argparse.Namespace) -> None:
     telegram = TelegramNotifier(
         bot_token=settings.api_keys.telegram_bot_token,
         chat_id=settings.api_keys.telegram_chat_id,
+        enabled=settings.notifications.telegram.enabled,  # W39: was never read
     )
 
     # Create orchestrator

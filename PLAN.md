@@ -6334,3 +6334,124 @@ pending-forever`, whose "pending forever" repro W30 appears to have already clos
 re-derived before anything is claimed), plus the dead `notifications.telegram` config block, which
 nothing in `src/` reads. Then **W40** — the F7 rows: W18's `getsource` tests, W22's background-task
 test, and the four ledger corrections. REGISTERED BY W38, NOT FIXED: nothing new.
+
+---
+
+## 2026-09-20 - W39 EXECUTED — R26 F6 rows 7-8: the Telegram poller stops dropping updates in silence
+
+Second of the three waves clearing this box's R26 queue. These two rows are in
+`execution/manual_positions.py` — this box's module — and were explicitly skipped by the other
+box's W34 (PLAN.md:5694-5697) for that reason.
+
+ONE OF THE TWO FINDINGS WAS ALREADY CLOSED, AND SAYING SO IS THE POINT OF THIS ENTRY. The wave
+plan named both as fixes. Re-deriving them at HEAD first — the programme's own rule, that a
+finding closes when its reproduction stops reproducing — showed one of them already does not
+reproduce. It is recorded as closed BY W30, not by this wave.
+
+[1] FINDING A, `w22-unrecognised-telegram-updates-are-dropped-with-no-trace` — REAL, FIXED.
+    Four drop paths in `_handle_update` emitted nothing at all. Reproduced against a pre-fix copy
+    of the module before anything changed:
+        PRE-FIX 'yes please'      -> replies=[]  discard_logs=[]
+        PRE-FIX callback, no msg  -> answered=[]     (the button spins forever)
+        PRE-FIX foreign callback  -> answered=[]
+    The sharpest is the text path. The prompt invites a free-form reply; the parser accepts exactly
+    four tokens and discarded everything else with no edit, no confirmation and no log — while
+    `HALT_UNTRACKED` kept every new entry frozen. "The answer never came" was undiagnosable:
+    identical in the logs to a prompt never seen, a `getUpdates` outage, or a dead poller.
+    All four now log `manual_position_update_discarded` with a reason. Both callback paths
+    `answer_callback()` BEFORE returning — an unanswered callback_query leaves the button spinning
+    on the operator's phone, and answering is a transport obligation, not an endorsement of the
+    tap. `cq.get("message") or {}` made an ABSENT message behave exactly like a foreign-chat one,
+    so both fell through having answered nothing; they are separate branches now.
+    Unrecognised text in the CONFIGURED chat gets a reply naming the accepted tokens, throttled to
+    one nudge per five minutes so a chatty chat cannot turn the poller into an echo loop, and only
+    when something is actually pending. A foreign chat is logged and never replied to — answering
+    would leak the bot's existence to it. `_ACCEPTED_REPLIES` is declared once and interpolated
+    into both prompts, so the guidance the operator is shown cannot drift from what the parser
+    takes; that drift IS the finding.
+
+[2] FINDING B, `w22-leaked-msgid-keeps-a-dead-position-pending-forever` — **CLOSED BY W30.**
+    Measured at HEAD with a real StateManager, both halves the finding names:
+        prompted, unanswered      -> pending_keys ['QQQ:712.0:C:2026-09-18']   digest {…}
+        after authoritative sweep -> pending_keys []                            digest set()
+    A `manual_position_prompt_msgid_` row can only exist downstream of `record_sighting()`, so a
+    `manual_position_last_seen_` row always accompanies it, and W30's second cleanup loop
+    (`manual_positions.py:418-425`) clears both through `_clear_key_state`. The finding treats
+    `pending_keys()` and the digest's `awaiting_reply` as two separate leaks; they read the SAME
+    msgid row, so both self-heal on the next pass that can confirm the broker set.
+    AND R26's SUGGESTED FIX IS NOT IMPLEMENTABLE AS WRITTEN — "filter to keys still present at the
+    broker". The only state in which a stale prompt lingers is the one where the sweep is SKIPPED
+    because the broker set is not authoritative, so there is nothing authoritative to filter
+    against; and the digest runs in the SUPERVISOR, which has no IB connection at all. The obvious
+    proxy is worse than nothing: a `last_seen` freshness TTL would mark a genuinely live position
+    stale every morning, because no reconcile passes run overnight. Inferring presence there is
+    precisely the guessing W30 removed when it made this path fail closed.
+    SO THE RESIDUAL IS TREATED AS WHAT IT IS: a correct fail-closed skip that was INVISIBLE. The
+    skip now logs `manual_position_cleanup_skipped` with its reason and the pending count, because
+    that window is the only one in which the operator can see "awaiting your reply" for a position
+    that is long gone, and nothing explained why. Three regression tests pin the self-healing so a
+    future change to the sweep cannot silently reopen the finding, with a control that a position
+    still AT the broker keeps its prompt.
+
+[3] THE CONFIG SWITCH SWITCHED NOTHING. `notifications.telegram.enabled`, plus `send_trades`,
+    `send_errors`, `send_daily_summary` and `send_circuit_breaker`, were declared in `config.yaml`
+    and in `TelegramConfig` and read by NOTHING in `src/` — the only real switch was whether `.env`
+    carried a token and a chat id. An operator setting `enabled: false` to silence a misbehaving
+    poller changed nothing at all. Same R19c dead-config class W36 fixed for ten trading knobs,
+    with a safety edge: this is the switch someone reaches for in a hurry.
+    `enabled` is now wired at the single construction site (`main.py`), as
+    `configured and enabled`, and a disabled notifier logs `telegram_disabled_by_config` naming the
+    consequence — the manual-position POLLER skips when the notifier is disabled, so
+    `HALT_UNTRACKED` prompts can no longer be answered and entries stay frozen. That is not
+    obvious from the knob's name, so it is in the warning, the field description and the yaml.
+    THE OTHER FOUR WERE DELETED, NOT WIRED. Gating `_alert` / `_send_notification` /
+    `send_circuit_breaker_alert` on four config booleans would add four new FAIL-OPEN decisions on
+    alert paths — an alert that silently does not fire is the R8 class this programme keeps
+    fixing. Per-category muting, if it is ever wanted, needs its own wave with a test per path.
+    `extra="forbid"` means the model and the yaml had to land in the same commit.
+
+[4] ONE EXISTING TEST INVERTED, and it pinned the defect exactly.
+    `test_callback_from_a_different_chat_is_ignored` asserted `tg.answered_callbacks == []` — i.e.
+    it required the spinning button. Its INTENT (never act on a foreign chat's input) is unchanged
+    and still asserted, now joined by "and never reply into it" and the discard log line. Also
+    strengthened: `test_reply_to_an_unmatched_message_id_is_ignored_not_misapplied` still proves
+    the reply is not guessed at, and now also proves the operator is told.
+    A TEST-INFRASTRUCTURE NOTE worth carrying forward: `caplog` sees NOTHING from this project's
+    logging. structlog does not route through stdlib handlers, so the first version of these
+    assertions passed vacuously against lines that were being emitted to stdout the whole time.
+    The `discards` fixture records the real module logger instead. An autouse fixture also resets
+    the module-level nudge throttle between tests — without it the first test to nudge silences
+    every later one and the file depends on collection order.
+
+PROOF. `tests/test_w39_telegram_visibility.py` (10) and 6 added to
+`tests/test_w22_manual_positions.py` (34 -> 40). Finding A's pre-fix evidence is the transcript in
+[1], taken against `HEAD:src/ait/execution/manual_positions.py` loaded as a separate module — the
+new assertions are on behaviour that did not exist, so there was no `manual_position_update_
+discarded` event to go red. Finding B's tests are REGRESSION PINS on W30's behaviour and pass on
+both trees BY DESIGN; they are labelled as such rather than counted as evidence of a fix.
+Controls that must hold on both trees: a real four-token answer still records, a live position
+keeps its prompt, a disabled-by-credentials notifier is still disabled, and the default
+construction (no keyword) is still enabled. **No `inspect.getsource`.**
+
+VERIFICATION. Full fast lane **2161 passed / 45 skipped / 1 failed** (927s) — the standing
+local-`.env` `test_r19_config_authority` case. Reconciled: W38's 2145 + 16 new (10 + 6) = 2161.
+`compileall` OK; `scripts/typecheck.py` OK; `scripts/smoke_deploy.py` -> SMOKE PASS (13 checks).
+
+STATE AT HANDOFF: committed on `feature/event-straddle`. **NOT RUNNING** — nothing runs on this
+box. `reconciler.py` and `main.py` changed, so this loads on the next bot start; the config change
+is safe for a running pre-W35 process only because nothing is running.
+WHAT TO WATCH AFTER THE NEXT RESTART: `manual_position_update_discarded` should appear the first
+time anything that is not `yes`/`y`/`no`/`n` arrives in the chat, and
+`manual_position_cleanup_skipped` only on passes that could not confirm the broker set. Neither
+should be common; `cleanup_skipped` recurring every pass means the position cache is persistently
+ambiguous, which is its own problem.
+
+NEXT, on this box: **W40** — the remaining F7 rows, no production code. W18's `getsource` tests
+(one of which W34 turned into a permanent no-op when it moved the recovery pages onto
+`_last_gateway_escalation`, and one of the four throttle sites has no coverage anywhere), W22's
+background-task test (`len(x) >= 0`, asserted after the loop is torn down), and the four ledger
+corrections: PLAN.md:2811's "pins all four", :3921's proof claim, :4396-4399's `getsource` deploy
+proof (downgrade "confirmed" to "consistent with"), and :4299-4302's gate line (a dated retraction
+pointing at W28, not a re-run). REGISTERED BY W39, NOT FIXED: nothing new — but note for W40 that
+`caplog` is useless against structlog, which is worth stating in the ledger where future waves
+will look for it.
