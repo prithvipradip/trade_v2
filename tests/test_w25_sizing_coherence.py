@@ -91,60 +91,111 @@ SPY_OPEN = [{"symbol": "SPY", "strategy": "iron_condor"}]
 class TestZeroContractVerdictCannotBecomeOne:
     """The 0-contract refusal must survive the correlation haircut."""
 
-    def test_negative_control_the_pre_fix_expression_really_did_manufacture_a_contract(
-        self, settings
+    @pytest.mark.asyncio
+    async def test_negative_control_the_pre_fix_expression_really_did_manufacture_a_contract(
+        self, settings, monkeypatch
     ):
-        """NEGATIVE CONTROL: the old line, fed the REAL sizer's real verdict, yields 1.
+        """NEGATIVE CONTROL: the pre-W25 line, run through the REAL validate_trade.
 
-        Not a hypothetical. The inputs below are read out of the real objects, so
-        this fails the moment the premise (sizer really returns 0 here) stops holding.
+        W31 REBUILD (R26 F7 w25-negative-controls-reimplement-the-line-under-test).
+        This used to compute `max(1, int(final_contracts * haircut))` in the test
+        body and assert the answer was 1 — arithmetic on test-local values that
+        never entered risk/manager.py. R26 proved it: with validate_trade replaced
+        by an always-approve stub (the maximal form of the very defect it claims
+        to control) this test still PASSED. A control that re-implements the line
+        it controls cannot detect that line changing.
+
+        Now it substitutes the old expression at the real seam and drives the real
+        validate_trade, so it fails if the defect is reintroduced ANYWHERE on that
+        path — and the shipped code is exercised in the same breath.
         """
-        sizer = PositionSizer(settings.positions, settings.risk)
+        rm = _manager(settings, 2100.0, SPY_OPEN)
         req = _zero_verdict_request()
-        verdict = sizer.calculate(
-            account_value=2100.0, option_price=req.entry_price, confidence=req.confidence,
-            implied_vol=req.implied_vol, strategy=req.strategy, underlying_price=0,
-            recent_losing_days=0, vix=req.vix,
+
+        assert rm._count_correlated_positions("QQQ", ["SPY"]) == 1, (
+            "premise broken: SPY/QQQ must share a cluster or the haircut branch "
+            "is never entered"
+        )
+        verdict = rm._sizer.calculate(
+            account_value=2100.0, option_price=req.entry_price,
+            confidence=req.confidence, implied_vol=req.implied_vol,
+            strategy=req.strategy, underlying_price=0, recent_losing_days=0,
+            vix=req.vix,
         )
         assert verdict.contracts == 0, (
             "premise broken: the real sizer no longer returns 0 here, so this "
             f"control no longer tests anything (got {verdict.contracts}: {verdict.reason})"
         )
 
-        final_contracts = min(req.contracts, verdict.contracts)
-        haircut = max(0.30, 1.0 - 0.30 * 1)  # one correlated position open
-
-        # The pre-W25 line, unguarded.
-        pre_fix = max(1, int(final_contracts * haircut))
-        # The W25 line: the haircut branch is skipped entirely for a 0 verdict.
-        post_fix = (max(1, int(final_contracts * haircut))
-                    if final_contracts > 0 else final_contracts)
-
-        assert pre_fix == 1, (
-            "the pre-W25 defect: max(1, ...) converted a fail-closed 0-contract "
-            "verdict into a live 1-contract position"
+        # The pre-W25 line: max(1, ...) with NO `final_contracts > 0` guard.
+        monkeypatch.setattr(
+            RiskManager, "_haircut_contracts",
+            lambda self, n, c: (max(1, int(n * max(0.30, 1.0 - 0.30 * c)))
+                                if c > 0 else n),
         )
-        assert post_fix == 0, "the W25 fix must let the 0 through to the <= 0 refusal"
+        defect = await rm.validate_trade(req)
 
-    def test_the_rejected_repair_would_have_stopped_the_bot_trading(self, settings):
-        """Why the guard, and not `max(0, ...)` — measured, not assumed.
+        assert defect.approved and defect.position_size == 1, (
+            "premise broken: the pre-W25 expression no longer manufactures a "
+            f"contract from a 0 verdict (got approved={defect.approved} "
+            f"size={defect.position_size}) — this control is no longer negative"
+        )
+        assert defect.max_risk == 0.0, (
+            "the full defect: the manufactured position was also invisible to the "
+            f"aggregate capital-at-risk cap (max_risk={defect.max_risk})"
+        )
 
-        With positions.max_contracts_per_trade = 1 the sizer returns 1, and
-        int(1 * 0.70) = 0. `max(0, ...)` would therefore REFUSE every entry made
-        while one correlated position is open. The universe is SPY/QQQ/IWM, a
-        single cluster, so the bot would go flat after its first fill.
+        # And the shipped line, on the same inputs, refuses.
+        monkeypatch.undo()
+        shipped = await _manager(settings, 2100.0, SPY_OPEN).validate_trade(req)
+        assert not shipped.approved, (
+            f"a 0-contract sizer verdict was approved: {shipped.reason}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_rejected_repair_would_have_stopped_the_bot_trading(
+        self, settings, monkeypatch
+    ):
+        """Why the guard, and not `max(0, ...)` — measured through the real path.
+
+        W31 REBUILD, same finding as the control above: this asserted
+        `max(0, int(1 * 0.70)) == 0` over two test-local literals and never
+        entered risk/manager.py.
+
+        The reasoning it records is still right and still worth pinning. With
+        positions.max_contracts_per_trade = 1 the sizer returns 1 and
+        int(1 * 0.70) = 0, so `max(0, ...)` REFUSES every entry made while one
+        correlated position is open. The universe is SPY/QQQ/IWM — a single
+        cluster — so the bot goes flat after its first fill. That is a trading
+        behaviour change masquerading as a fail-open fix, which is why W25
+        rejected it. Now the claim is made against the real validate_trade.
         """
         assert settings.positions.max_contracts_per_trade == 1, (
             "premise moved: this reasoning depends on the hard cap being 1"
         )
-        haircut = max(0.30, 1.0 - 0.30 * 1)
-        viable_size = 1
-
-        assert max(0, int(viable_size * haircut)) == 0, (
-            "the naive repair silently converts a VIABLE 1-contract size into a refusal"
+        # A genuinely VIABLE request — big account, small structure.
+        req = TradeRequest(
+            symbol="QQQ", strategy="iron_condor", direction="short", contracts=1,
+            entry_price=1.20, confidence=0.70, implied_vol=0.22,
+            max_loss=None, vix=16.0, iv_rank=55.0,
         )
-        assert max(1, int(viable_size * haircut)) == 1, (
-            "the guarded haircut must leave a viable size tradeable"
+        shipped = await _manager(settings, 500_000.0, SPY_OPEN).validate_trade(req)
+        assert shipped.approved and shipped.position_size == 1, (
+            "premise broken: this request is no longer viable with a correlated "
+            f"position open, so the comparison below is meaningless ({shipped.reason})"
+        )
+
+        monkeypatch.setattr(
+            RiskManager, "_haircut_contracts",
+            lambda self, n, c: (max(0, int(n * max(0.30, 1.0 - 0.30 * c)))
+                                if c > 0 else n),
+        )
+        repaired = await _manager(settings, 500_000.0, SPY_OPEN).validate_trade(req)
+
+        assert not repaired.approved, (
+            "the rejected repair no longer refuses a viable 1-lot — the reason "
+            "W25 chose the guard over max(0, ...) has stopped applying, and the "
+            "choice should be revisited rather than silently kept"
         )
 
     @pytest.mark.asyncio
@@ -285,11 +336,23 @@ class _CoherenceProbe:
     def __init__(self, settings):
         self._settings = settings
         self.alerts: list[str] = []
+        self.loop_errors: list[tuple[str, str]] = []
 
     async def _send_notification(self, message: str) -> None:
         self.alerts.append(message)
 
+    async def _note_loop_error(self, kind: str, error: str, *, threshold: int = 5) -> None:
+        self.loop_errors.append((kind, error))
+
     _launch_size_coherence_check = TradingOrchestrator._launch_size_coherence_check
+    # W31: the check now runs the REAL builder, so the carrier needs the
+    # helpers that do it. `_probe_grid_of` must be re-wrapped: copying a
+    # staticmethod off the class onto another class turns it back into an
+    # instance method, and it would silently receive `self` as its chain.
+    _probe_cap_grid = TradingOrchestrator._probe_cap_grid
+    _build_probe_chains = TradingOrchestrator._build_probe_chains
+    _run_probe_builder = TradingOrchestrator._run_probe_builder
+    _probe_grid_of = staticmethod(TradingOrchestrator._probe_grid_of)
 
 
 class TestLaunchSizeCoherenceCheck:
@@ -351,49 +414,70 @@ class TestLaunchSizeCoherenceCheck:
         advised = re.search(r"per-trade budget of ~\$(\d+)", probe.alerts[0])
         assert advised, f"no budget advice in: {probe.alerts[0]}"
 
-        # Apply exactly what it advised, to the REAL builder.
-        ic = IronCondor()
-        ic.risk_budget = float(advised.group(1))
-        width = ic._vol_scaled_width(1.0, None, None, None)
-
-        from ait.config.runtime_env import contract_float
-        min_credit = contract_float("AIT_IC_MIN_CREDIT")
-        assert 0.45 * width >= min_credit, (
-            f"the check advised a ${advised.group(1)} budget, but at that budget the "
-            f"real builder still caps the wing at ${width:.2f} (~${0.45 * width:.2f} "
-            f"credit vs a ${min_credit:.2f} floor) — the advice does not work"
+        # W31: apply exactly what it advised, to the REAL builder on the REAL
+        # probe chains — the same question the check itself asked. This used to
+        # re-derive `0.45 * _vol_scaled_width(1.0, ...)`, i.e. it checked the
+        # advice against the retired $1-probe model rather than against the
+        # builder, so it could bless advice the builder would refuse.
+        probes = probe._probe_cap_grid(float(advised.group(1)))["probes"]
+        assert any(p["max_loss"] is not None for p in probes), (
+            f"the check advised a ${advised.group(1)} per-trade budget, but at "
+            f"that budget the real builder STILL emits nothing: "
+            f"{[(p['grid'], p['reason']) for p in probes]} — the advice does not work"
         )
 
     @pytest.mark.asyncio
     async def test_it_reads_both_caps_not_just_one(self, settings):
-        """D2: the binding budget is the tighter of gate 6b and the sizer's own cap.
+        """D2: positions.max_position_pct must reach the verdict, not just gate 6b.
 
-        Measured as a difference, which is the only way to prove the second cap is
-        READ: the same NLV is silent on the real config and must alert once
-        positions.max_position_pct alone is made impossibly tight. Pre-W25 the check
-        never looked at that knob, so both runs were identical.
+        W31 REWRITE. This used to assert the $50k run was SILENT and the starved
+        run alerted. Post-W31 both runs alert — $50k trips the breaker arm (see
+        TestTheBreakerArmSeesTheLargestStructure) — so "silent vs alerting" would
+        pass while measuring nothing, the vacuity this file exists to prevent.
+        The claim was never about silence: it is that the sizer cap is READ. So
+        compare the PROBLEM SETS, and require a problem that names that knob and
+        appears only when it binds.
         """
         healthy = _CoherenceProbe(settings)
         await healthy._launch_size_coherence_check(50_000.0)
-        assert not healthy.alerts, "premise moved: $50k is no longer a healthy account"
+        assert not any("positions.max_position_pct" in a for a in healthy.alerts), (
+            "premise moved: the sizer cap already binds at $50k on the real "
+            f"config, so this can no longer isolate it: {healthy.alerts}"
+        )
 
         starved = _CoherenceProbe(settings)
         starved._settings = settings.model_copy(deep=True)
-        starved._settings.positions.max_position_pct = 0.001  # $50 budget at $50k
+        starved._settings.positions.max_position_pct = 0.001  # $50 cap at $50k
 
         await starved._launch_size_coherence_check(50_000.0)
 
-        assert starved.alerts, (
-            "a 0.1% sizer cap bricks every entry, but the check stayed silent — "
-            "it is reading only risk.max_position_risk_pct again"
+        assert any("positions.max_position_pct" in a for a in starved.alerts), (
+            "a 0.1% sizer cap caps a position at $50 while the builder is funded "
+            "$1,500 and emits a structure risking far more — the check never "
+            "named that knob, so it is reading only risk.max_position_risk_pct "
+            f"again: {starved.alerts}"
         )
 
     @pytest.mark.asyncio
-    async def test_the_breaker_arm_is_not_vacuous(self, settings):
+    @pytest.mark.parametrize("nlv,expected", [
+        (2_100.0, "emits ZERO"),          # nothing is built: A1, not the breaker
+        (10_000.0, "daily-loss breaker"),
+        (201_475.0, "daily-loss breaker"),
+    ])
+    async def test_the_breaker_arm_is_not_vacuous(self, settings, nlv, expected):
         """D3: with the credit stop disabled the arm must still be able to fire.
 
-        Pre-fix, AIT_CREDIT_LOSS_LIMIT=0 made typical_stop_loss 0, so
+        Pre-W25, AIT_CREDIT_LOSS_LIMIT=0 made typical_stop_loss 0, so
         `breaker_usd < 1.5 * 0` was False for every account that has ever existed.
+
+        W31 REWRITE. W25's fix replaced that with the cost of a $1-probe wing,
+        which is a CONSTANT $130 above ~$6k NLV — so the arm fired only at $2.1k,
+        the one size this test happened to check, and was fail-open everywhere the
+        operator might actually fund. Its old premise ("$42 breaker vs a $30
+        defined-risk loss") was an artefact of that probe. The arm is now sized
+        from the largest structure the real builder emits, so the vacuity test
+        has to span the range: below the trading floor nothing is built at all,
+        and at both real funding levels the breaker cannot absorb one max loss.
         """
         from ait.config.runtime_env import contract_float
 
@@ -403,23 +487,52 @@ class TestLaunchSizeCoherenceCheck:
         )
 
         probe = _CoherenceProbe(settings)
-        await probe._launch_size_coherence_check(2100.0)
+        await probe._launch_size_coherence_check(nlv)
 
-        assert any("daily-loss breaker" in a for a in probe.alerts), (
-            "the breaker arm did not fire at $2.1k, where the breaker is $42 against "
-            "a $30 defined-risk loss — it is vacuous again"
+        assert any(expected in a for a in probe.alerts), (
+            f"at NLV ${nlv:,.0f} the check did not report {expected!r} — "
+            f"got: {probe.alerts}"
         )
 
     @pytest.mark.asyncio
-    async def test_it_stays_quiet_on_a_healthy_account(self, settings):
-        """No alert where the grid is genuinely coherent.
+    async def test_it_speaks_at_197k_because_one_loss_outruns_the_breaker(self, settings):
+        """W31 INVERSION of test_it_stays_quiet_on_a_healthy_account.
 
-        $197k is the PAPER account's balance (orchestrator.py:1270), not live money
-        — nothing is funded yet. The reason this must stay silent is not deference
-        to an account but arithmetic: at $197k the builder gets its full $2.00 wing
-        and the breaker is $3,940 against a $130 defined-risk loss. The alert has to
-        fire where the grid really is incoherent ($2.1k, $5k) and nowhere else.
+        That test asserted SILENCE at $197k on this reasoning: "at $197k the
+        builder gets its full $2.00 wing and the breaker is $3,940 against a $130
+        defined-risk loss". Both numbers came from the $1 probe. The real builder
+        at this budget emits a ~$50 wing risking ~$4,400, and R26 measured the
+        live book's own largest condor at $5,356 against a $4,030 breaker: three
+        of eleven real condors carried a single max loss exceeding the ENTIRE
+        daily breaker while this check reported problems=0.
+
+        So the silence WAS the defect, and pinning it was pinning the bug. What
+        must hold instead is that the account is told.
         """
         probe = _CoherenceProbe(settings)
         await probe._launch_size_coherence_check(197_000.0)
-        assert not probe.alerts, f"spurious CAP-GRID alert at $197k: {probe.alerts}"
+
+        assert any("daily-loss breaker" in a for a in probe.alerts), (
+            "at $197k one max-loss condor exceeds the whole daily breaker and the "
+            f"check said nothing: {probe.alerts}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_coherent_grid_is_silent(self, settings):
+        """CONTROL: the check must still be capable of saying nothing.
+
+        Replaces the negative half of the inverted test above, which is the part
+        that was worth keeping: an alert on every input is as useless as an alert
+        on none. Widen the breaker until it can absorb the structure the builder
+        builds, and the check must go quiet — proving the arms measure the grid
+        rather than firing unconditionally.
+        """
+        s = settings.model_copy(deep=True)
+        s.risk.max_daily_loss_pct = 0.10  # 10% of NLV absorbs any 3%-funded trade
+        probe = _CoherenceProbe(s)
+
+        await probe._launch_size_coherence_check(197_000.0)
+
+        assert not probe.alerts, (
+            f"the check alerts even on a coherent grid: {probe.alerts}"
+        )

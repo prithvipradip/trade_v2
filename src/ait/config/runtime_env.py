@@ -100,6 +100,12 @@ CONTRACT_DEFAULTS: dict[str, str] = {
     "AIT_ENTRY_LADDER_START": "0.25",
     "AIT_ENTRY_ORDER_TIMEOUT": "240",
     "AIT_CREDIT_TOUCH_STOP": "1",
+    # W31 (R26 F4 w25-credit-ratio-literal): the practitioner credit/width
+    # ratio at ~0.20 delta. It set the operator-facing funding number — the
+    # $140 in PLAN.md's funding table, which drove the simulated-capital
+    # decision — from a bare literal in orchestrator.py, invisible to the
+    # divergence audit R19 exists to make possible. Default IS that literal.
+    "AIT_IC_CREDIT_RATIO_20D": "0.45",
 }
 
 
@@ -141,6 +147,8 @@ CONFIG_BACKED: dict[str, tuple[str, str]] = {
     "AIT_ENTRY_LADDER_START": ("positions", "entry_ladder_start"),
     "AIT_ENTRY_ORDER_TIMEOUT": ("positions", "entry_order_timeout_seconds"),
     "AIT_CREDIT_TOUCH_STOP": ("exit", "credit_touch_stop"),
+    # W31 — see CONTRACT_DEFAULTS.
+    "AIT_IC_CREDIT_RATIO_20D": ("backtest", "ic_credit_ratio_at_20d"),
 }
 
 _yaml_cache: dict | None = None

@@ -67,6 +67,28 @@ log = get_logger("bot.orchestrator")
 # separate register entry, and are left untouched by this wave.)
 RANGE_GATED_STRATEGIES: frozenset[str] = frozenset({"iron_condor", "short_strangle"})
 
+# W31: the condor builder's own rejection tokens, in operator English, for the
+# launch cap-grid self-test. The RAW token is always reported beside the
+# phrase — the phrase is for reading, the token is for grepping the builder.
+# An unmapped reason falls through as its token rather than being dropped, so
+# a new rejection path cannot silently become "no reason given".
+_PROBE_REASON_PHRASE: dict[str, str] = {
+    "credit_floor": "credit floor UNREACHABLE — the wing this budget affords "
+                    "cannot yield the minimum credit",
+    "credit_width_ratio": "credit/width ratio UNREACHABLE at the wing this "
+                          "budget affords",
+    "max_loss_over_budget": "the structure exceeds the per-trade budget once "
+                            "strikes are SNAPPED to the real grid (the wing "
+                            "the width formula asks for is not on the ladder)",
+    "iv_rank_floor": "IV rank below backtest.ic_iv_rank_floor — the probe "
+                     "never reached the cap grid",
+    "insufficient_liquid_contracts": "too few liquid contracts in the probe "
+                                     "chain (this is a probe defect, not an "
+                                     "account finding)",
+    "degraded_greeks": "the probe chain was judged to have guessed IV (this "
+                       "is a probe defect, not an account finding)",
+}
+
 
 class CooldownBlock(NamedTuple):
     """W26: which stop is blocking, and when it closed.
@@ -1531,8 +1553,13 @@ class TradingOrchestrator:
                 self._risk_budget = _nlv * self._settings.risk.max_position_risk_pct
                 _last = getattr(self, "_coherence_checked_nlv", 0.0)
                 if not _last or abs(_nlv - _last) / _last > 0.20:
-                    self._coherence_checked_nlv = _nlv
-                    await self._launch_size_coherence_check(_nlv)
+                    # W31: record it as checked only AFTER it reports success.
+                    # This assignment used to sit ABOVE the await, so a check
+                    # that threw was booked as done and never retried until
+                    # NLV moved 20% — a self-test that failed once was off for
+                    # the rest of the process.
+                    if await self._launch_size_coherence_check(_nlv):
+                        self._coherence_checked_nlv = _nlv
         except Exception as _e:  # noqa: BLE001
             log.debug("risk_budget_refresh_failed", error=str(_e))
 
@@ -2308,7 +2335,86 @@ class TradingOrchestrator:
 
         return min(budget, max_trades) - taken
 
-    async def _launch_size_coherence_check(self, nlv: float) -> None:
+    def _build_probe_chains(self) -> list:
+        """W31: one synthetic chain per configured strike grid."""
+        from ait.data.synthetic_chain import build_probe_chain
+
+        cfg = self._settings.sizing_probe
+        return [
+            build_probe_chain(
+                underlying_price=cfg.underlying_price,
+                implied_vol=cfg.implied_vol,
+                dte=cfg.dte,
+                strike_grid=g,
+                risk_free_rate=self._settings.options.risk_free_rate,
+            )
+            for g in cfg.strike_grids
+        ]
+
+    def _run_probe_builder(self, chains, budget: float) -> list[dict]:
+        """W31: run the REAL condor builder at `budget`, once per chain.
+
+        Each result is what the builder DID: the structure it emitted, or its
+        own stated reason for emitting nothing. Asking the builder is the
+        whole point — a model of it cannot observe it refusing.
+        """
+        from ait.strategies.iron_condor import IronCondor as _IC
+
+        results = []
+        for chain in chains:
+            # A FRESH instance per probe, never the shared one the selector
+            # mutates (base.py:142 — not coroutine-safe, and this runs off
+            # the trading loop).
+            probe = _IC()
+            probe.risk_budget = budget
+            signals = probe.generate_signals(
+                chain.symbol, chain, SignalDirection.NEUTRAL,
+                self._settings.risk.min_confidence,
+                self._settings.sizing_probe.iv_rank, None,
+            )
+            sig = signals[0] if signals else None
+            results.append({
+                "grid": self._probe_grid_of(chain),
+                "max_loss": round(float(sig.max_loss), 2) if sig else None,
+                "reason": None if sig else (probe.last_entry_reason or "unknown"),
+            })
+        return results
+
+    @staticmethod
+    def _probe_grid_of(chain) -> float:
+        """Smallest gap between adjacent strikes — the ladder the builder had."""
+        strikes = sorted({c.strike for c in chain.calls})
+        gaps = [round(b - a, 2) for a, b in zip(strikes, strikes[1:])]
+        return min(gaps) if gaps else 0.0
+
+    def _probe_cap_grid(self, budget: float, chains=None) -> dict:
+        """W31: the whole CPU-bound half of the self-test, in one call.
+
+        Synchronous on purpose — the caller hands it to a thread once, rather
+        than hopping per probe. Returns the per-grid verdicts and, when NOTHING
+        was emitted, the budget that would fix it.
+        """
+        chains = chains if chains is not None else self._build_probe_chains()
+        probes = self._run_probe_builder(chains, budget)
+        advised = None
+        if not any(p["max_loss"] is not None for p in probes):
+            # MEASURED, not derived. W25 advised $86 where the account needed
+            # $140 (PLAN.md W25 [C1]) because it inverted the width formula by
+            # hand; asking the builder cannot drift from the builder. Reuses
+            # the chains already built — the ladder is 20 builder runs, not 20
+            # chain builds.
+            ladder = max(budget, 1.0)
+            for _ in range(20):
+                ladder *= 1.25
+                if any(p["max_loss"] is not None
+                       for p in self._run_probe_builder(chains, ladder)):
+                    advised = ladder
+                    break
+        return {"probes": probes, "advised_budget": advised}
+
+    async def _launch_size_coherence_check(
+        self, nlv: float, *, chains=None,
+    ) -> bool:
         """R7-SOON: assert the cap grid is mutually satisfiable at this NLV.
 
         The Phase-2 launch account bricked silently before: sizer budget <
@@ -2316,122 +2422,125 @@ class TradingOrchestrator:
         single trade's stop. Runs at startup and whenever NLV moves >20%;
         alerts LOUDLY instead of letting the account sit structurally unable
         to trade (or unable to survive one normal stop-out).
+
+        W31 (R26 F4) rebuilt it around the REAL builder. It used to call the
+        private `_vol_scaled_width` with a $1 underlying and reason about the
+        width that came back — a probe that returns the NARROWEST structure
+        the builder can ever make. Correct for "can this account afford
+        anything at all"; exactly backwards for "can the breaker absorb one
+        stop-out", which needs the LARGEST. So `builder_width` was
+        bit-identical at $9,750 and $201,475, the breaker arm compared every
+        account against a fixed $130, and three of eleven real condors in the
+        live book carried a single max loss exceeding the whole daily breaker
+        while this check reported problems=0.
+
+        Nothing downstream of width selection ran either: strike snapping was
+        unmodelled and `max_loss_over_budget` had no arm, so on a $5 grid the
+        check was silent while the builder emitted ZERO.
         """
         try:
-            # W25 (logic-entry-01): the budget is the TIGHTEST of the two caps a
-            # trade must clear, not just one of them. gate 6b (manager.py:512)
-            # rejects on risk.max_position_risk_pct; the sizer
-            # (position_sizer.py:166) independently returns 0 contracts on
-            # positions.max_position_pct. The old check read only the first, so
-            # it could report COHERENT while the other cap bricked every entry.
+            # W31 (R26 F4 w25-coherence-probe-uses-a-budget-the-live-builder-
+            # never-receives): probe with the budget the builder is ACTUALLY
+            # handed — `nlv * risk.max_position_risk_pct`, the same expression
+            # the live scan uses. W25 used min(gate, sizer), reasoning that a
+            # trade must clear both caps. True, but they bind at DIFFERENT
+            # layers: gate 6b (manager.py) rejects on max_position_risk_pct
+            # before the sizer (position_sizer.py) ever returns its 0-contract
+            # verdict on max_position_pct. Pre-shrinking the builder's budget
+            # to the min models a NARROWER wing than the builder will build
+            # whenever the gate cap is the looser of the two — so the check
+            # passed while the real structure blew the sizer's cap and every
+            # entry was refused. The sizer cap is not ignored: it is now tested
+            # against the RESULT, in A3.
             budget_gate = nlv * self._settings.risk.max_position_risk_pct
             budget_sizer = nlv * self._settings.positions.max_position_pct
-            budget = min(budget_gate, budget_sizer)
+            budget = budget_gate
             min_credit = contract_float("AIT_IC_MIN_CREDIT")
-            min_ratio = contract_float("AIT_IC_MIN_CREDIT_WIDTH")
-            # W25 (logic-entry-01): the minimum viable condor is now measured
-            # with the REAL width authority — IronCondor._vol_scaled_width, the
-            # same method the live builder uses — instead of the modelled
-            # `max(1.0, min_credit / 0.45)` wing ($1.56), a structure the real
-            # builder never constructs. A fresh local instance, never the shared
-            # one the selector mutates (base.py:142 — that instance is not
-            # coroutine-safe and this runs off the trading loop).
-            # The probe price is deliberately $1: it drives the vol term below
-            # the builder's own `max(2.0, ...)` floor, so the REAL method returns
-            # the NARROWEST structure it can ever construct — which is exactly
-            # what "can this account afford any condor at all?" must ask. Real
-            # market prices only widen the wing and raise the cost, so a budget
-            # that fails here fails for every chain. Not a trading value: the
-            # width, the $2 floor and the budget cap all stay owned by
-            # iron_condor.py, which is the point of calling it instead of
-            # re-deriving it here.
-            from ait.strategies.iron_condor import IronCondor as _IC
-            _probe = _IC()
-            _probe.risk_budget = budget
-            min_width = _probe._vol_scaled_width(1.0, None, None, None)
-            min_viable_cost = (min_width - min_credit) * 100
-            # W25 (logic-entry-01, second arm): affordability is NOT viability.
-            # The budget cap can shrink the wing until the builder constructs a
-            # structure whose credit floor is unreachable — iron_condor.py:293
-            # then rejects EVERY signal at entry, and the old check, which only
-            # ever compared dollars, reported COHERENT while the bot sat unable
-            # to trade. This is the surviving piece of the old `min_credit/0.45`
-            # model: 0.45 is the practitioner credit/width ceiling at ~0.20
-            # delta. It belongs HERE, applied to the real builder's width, not
-            # used to invent a width the builder never constructs.
-            credit_ratio_at_20d = 0.45
-            achievable_credit = credit_ratio_at_20d * min_width
-            # The budget that would actually FIX it. Not (width - credit) * 100:
-            # that is the max LOSS of the needed structure, and the operator does
-            # not set max loss — they set the budget, which reaches the wing only
-            # through iron_condor.py:121 `affordable = risk_budget / (100 * (1 -
-            # min_ratio))`. Inverting that is the difference between the $140 this
-            # account needs and the $86 the first cut of this message advised.
-            _width_for_credit_floor = min_credit / credit_ratio_at_20d
-            _budget_for_credit_floor = (
-                _width_for_credit_floor * 100.0 * max(0.5, 1.0 - min_ratio)
-            )
-            # W25 (NEW, found probing logic-entry-01): this arm was arithmetically
-            # DEAD. AIT_CREDIT_LOSS_LIMIT contract-defaults to "0" = credit stop
-            # DISABLED (runtime_env.py:85, portfolio.py:230), so typical_stop_loss
-            # was 0 and `breaker_usd < 1.5 * 0` was always False — the check could
-            # never fire the very condition it exists to catch.
-            # With the credit stop OFF, the honest bound on one trade's loss is
-            # not zero, it is the structure's DEFINED-RISK max loss: nothing else
-            # closes the position early. Assess against that instead of skipping,
-            # so the arm stays live without alerting on every healthy account.
-            loss_mult = contract_float("AIT_CREDIT_LOSS_LIMIT")
-            if loss_mult > 0:
-                typical_stop_loss = loss_mult * max(min_credit, min_ratio * min_width) * 100
-                _stop_basis = f"{loss_mult:.2f}x credit stop"
-            else:
-                typical_stop_loss = min_viable_cost
-                _stop_basis = "defined-risk max loss (credit stop DISABLED)"
-            breaker_pct = float(getattr(self._settings.risk, "max_daily_loss_pct", 0.02) or 0.02)  # R8: real field name
-            breaker_usd = nlv * breaker_pct
-            max_contracts = self._settings.positions.max_contracts_per_trade
+            breaker_usd = nlv * self._settings.risk.max_daily_loss_pct
+
+            # The CPU-bound half: build the probe chains and run the real
+            # builder on each, once, off the event loop.
+            probe = await asyncio.to_thread(self._probe_cap_grid, budget, chains)
+            probes = probe["probes"]
+            emitted = [p for p in probes if p["max_loss"] is not None]
+            # The LARGEST structure the builder can emit here. This is the
+            # number the breaker must survive, and the one the $1 probe could
+            # never see.
+            worst = max((p["max_loss"] for p in emitted), default=0.0)
+
             problems = []
-            if budget < min_viable_cost:
-                _binding = ("risk.max_position_risk_pct" if budget_gate <= budget_sizer
-                            else "positions.max_position_pct")
+
+            # A1 — NO STRUCTURE. Subsumes W25's separate affordability and
+            # credit-floor arms: both asked "will the builder emit?" of a
+            # model. Now the builder answers, and says why.
+            if not emitted:
+                _detail = "; ".join(
+                    f"${p['grid']:.0f} grid -> "
+                    f"{_PROBE_REASON_PHRASE.get(p['reason'], p['reason'])} "
+                    f"[{p['reason']}]"
+                    for p in probes
+                )
+                _advised = probe["advised_budget"]
+                _fix = (f"Needs a per-trade budget of ~${_advised:.0f} "
+                        f"(measured: the smallest budget at which the real "
+                        f"builder emits)"
+                        if _advised else
+                        "No budget up to 85x this one makes the builder emit — "
+                        "the credit floors, not the budget, are what refuse")
                 problems.append(
-                    f"per-trade budget ${budget:.0f} (binding cap: {_binding}) < "
-                    f"minimum viable condor ~${min_viable_cost:.0f} (real builder "
-                    f"width ${min_width:.2f}, credit floor ${min_credit:.2f}) — NO "
-                    f"condor can pass sizing")
-            if achievable_credit < min_credit:
+                    f"the REAL builder emits ZERO trades at a per-trade budget "
+                    f"of ${budget:.0f} (risk.max_position_risk_pct) — {_detail}. "
+                    f"{_fix}. Credit floor ${min_credit:.2f} "
+                    f"(AIT_IC_MIN_CREDIT).")
+
+            # A2 — BREAKER. W25's version measured "one normal stop-out" from
+            # the NARROWEST structure the builder can make, so it compared
+            # every account above ~$6k against a fixed $130 and never fired.
+            # With the credit stop disabled (AIT_CREDIT_LOSS_LIMIT=0) nothing
+            # closes a condor early, so the honest bound on one trade's loss is
+            # the defined-risk max loss of the LARGEST structure — measured
+            # here from the signal the builder actually produced.
+            if worst > 0 and breaker_usd < 1.5 * worst:
                 problems.append(
-                    f"credit floor UNREACHABLE at this budget: the builder caps the "
-                    f"wing at ${min_width:.2f}, which can yield ~${achievable_credit:.2f} "
-                    f"credit against a ${min_credit:.2f} floor — every signal will be "
-                    f"rejected at iron_condor.py credit_floor, so the bot emits ZERO "
-                    f"trades. Needs a per-trade budget of ~${_budget_for_credit_floor:.0f} "
-                    f"(={_width_for_credit_floor:.2f} wing) or AIT_IC_MIN_CREDIT <= "
-                    f"${achievable_credit:.2f}")
-            if min_width > 0 and (achievable_credit / min_width) < min_ratio:
+                    f"daily-loss breaker ${breaker_usd:.0f} "
+                    f"({self._settings.risk.max_daily_loss_pct:.1%} of NLV) < 1.5x "
+                    f"the largest single max loss the builder emits here "
+                    f"(${worst:.0f}, defined-risk: the credit stop is DISABLED, "
+                    f"so nothing closes it early) — one stopped trade halts the "
+                    f"whole day. risk.max_position_risk_pct "
+                    f"({self._settings.risk.max_position_risk_pct:.1%}) funds a "
+                    f"trade the breaker cannot absorb; they need to be set "
+                    f"together.")
+
+            # A3 — THE TWO-KNOB CAP GRID (the W25 ADDENDUM, registered then and
+            # still not linked). gate 6b and the sizer enforce the same
+            # quantity at different layers with nothing tying them: raising
+            # risk.max_position_risk_pct above positions.max_position_pct lets
+            # the builder construct a structure gate 6b passes and the sizer
+            # then refuses, one 0-contract verdict at a time, logged as routine.
+            # DETECTION ONLY — linking the knobs moves live sizing and wants a
+            # backtest, so it stays registered rather than fixed here.
+            if worst > 0 and worst > budget_sizer:
                 problems.append(
-                    f"credit/width ratio UNREACHABLE: ~{achievable_credit / min_width:.0%} "
-                    f"achievable vs {min_ratio:.0%} floor (AIT_IC_MIN_CREDIT_WIDTH) — "
-                    f"every signal rejected at credit_width_ratio")
-            # W25 (NEW, found probing logic-entry-01): this arm was arithmetically
-            # DEAD. AIT_CREDIT_LOSS_LIMIT contract-defaults to "0" = credit stop
-            # DISABLED (runtime_env.py:85, portfolio.py:230), so typical_stop_loss
-            # was 0 and `breaker_usd < 1.5 * 0` was always False — the check could
-            # never fire the very condition it exists to catch. A stop that does
-            # not exist cannot be sized: say so instead of passing silently.
-            if breaker_usd < 1.5 * typical_stop_loss:
-                problems.append(
-                    f"daily-loss breaker ${breaker_usd:.0f} < 1.5x one normal "
-                    f"stop-out ~${typical_stop_loss:.0f} [{_stop_basis}] — a single "
-                    f"stopped trade halts the whole day")
+                    f"cap-grid SKEW: the builder is funded ${budget:.0f} by "
+                    f"risk.max_position_risk_pct and emits a structure risking "
+                    f"${worst:.0f}, but positions.max_position_pct caps a "
+                    f"position at ${budget_sizer:.0f} — gate 6b passes it and "
+                    f"the position sizer then returns 0 contracts, so entries "
+                    f"brick silently. Lower risk.max_position_risk_pct or raise "
+                    f"positions.max_position_pct.")
+
             log.info("launch_size_coherence",
                      nlv=round(nlv), budget=round(budget),
                      budget_gate=round(budget_gate), budget_sizer=round(budget_sizer),
-                     min_viable_ic=round(min_viable_cost),
-                     builder_width=round(min_width, 2),
-                     max_contracts_per_trade=max_contracts,
                      breaker=round(breaker_usd),
-                     problems=len(problems))
+                     worst_max_loss=round(worst),
+                     probes=probes,
+                     problems=len(problems),
+                     # W31: the TEXT, not just the count. _send_notification
+                     # returns early when Telegram is unconfigured, so the
+                     # count was all an operator reading logs ever saw.
+                     problem_text=problems)
             if problems:
                 await self._send_notification(
                     "CAP-GRID INCOHERENT at NLV ${:,.0f}:\n- ".format(nlv)
@@ -2439,23 +2548,45 @@ class TradingOrchestrator:
                     + "\nFix knobs (risk.max_position_risk_pct / breaker / "
                       "credit floors) before expecting trades."
                 )
+            return True
         except Exception as _e:  # noqa: BLE001
-            log.warning("coherence_check_failed", error=str(_e))
+            # W31: still caught — a self-test must never kill the trading
+            # cycle — but no longer SILENT. This used to be a log.warning that
+            # discarded the verdict, so any change that made the check throw
+            # (a renamed private method, a chain the builder chokes on) turned
+            # it into a permanent no-op reporting nothing, indistinguishable in
+            # the logs from a clean account. threshold=1 because this site runs
+            # ONCE per process: the default streak of 5 can never be reached,
+            # which is the same can't-fire shape as the arms this wave removed.
+            # Returning False (rather than raising) keeps the promise above
+            # literally true while telling the caller not to record this NLV as
+            # checked, so the next cycle retries.
+            log.exception("coherence_check_failed", error=str(_e))
+            await self._note_loop_error(
+                "size_coherence_check", str(_e), threshold=1)
+            return False
 
-    async def _note_loop_error(self, kind: str, error: str) -> None:
+    async def _note_loop_error(self, kind: str, error: str, *,
+                               threshold: int = 5) -> None:
         """R8 (incident 2026-07-10): 516 fast-monitor + 145 trading-cycle
         errors produced ZERO alerts — per-iteration try/excepts logged a
         WARNING and kept looping while stops/TPs were dead all session. Any
-        streak of >=5 consecutive failures at one site pages Telegram once,
-        re-pages hourly while it persists; the streak resets on the first
-        clean iteration (_clear_loop_errors)."""
+        streak of >=`threshold` consecutive failures at one site pages Telegram
+        once, re-pages hourly while it persists; the streak resets on the first
+        clean iteration (_clear_loop_errors).
+
+        W31: `threshold` exists because the default of 5 assumes a LOOP. A
+        site that runs once per process can never reach five consecutive
+        failures, so routing it here would have paged never — the same
+        can't-fire shape as the dead arms W31 removed. Default unchanged, so
+        every existing caller keeps the streak semantics R8 designed."""
         import time as _t
         st = getattr(self, "_err_streaks", None)
         if st is None:
             st = self._err_streaks = {}
         n, last_alert = st.get(kind, (0, 0.0))
         n += 1
-        if n >= 5 and (_t.time() - last_alert) > 3600:
+        if n >= threshold and (_t.time() - last_alert) > 3600:
             last_alert = _t.time()
             # W6/log-contracts-2: "LOOP IMPAIRED" existed ONLY inside the
             # Telegram f-string, so every log consumer (deploy gate, status,

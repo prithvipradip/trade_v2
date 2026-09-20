@@ -635,9 +635,7 @@ class RiskManager:
         # every defined-risk path because max_position_risk_pct 3% <
         # positions.max_position_pct 5%); that masking is incidental, not a design,
         # and is registered separately.
-        if correlated_count > 0 and final_contracts > 0:
-            haircut = max(0.30, 1.0 - 0.30 * correlated_count)
-            final_contracts = max(1, int(final_contracts * haircut))
+        final_contracts = self._haircut_contracts(final_contracts, correlated_count)
 
         if final_contracts <= 0:
             return TradeValidation(False, "position sizer returned 0 contracts")
@@ -657,6 +655,24 @@ class RiskManager:
             position_size=final_contracts,
             max_risk=size.max_risk_dollars,
         )
+
+    def _haircut_contracts(self, final_contracts: int, correlated_count: int) -> int:
+        """Reduce an already-viable size by 30% per correlated open position.
+
+        W31: extracted verbatim from validate_trade as a SEAM, with no change
+        in behaviour. W25's two "negative controls" for this line re-implemented
+        it in the test file and asserted on their own arithmetic, so R26 proved
+        both of them PASS with `validate_trade` replaced by an always-approve
+        stub — a control that re-implements the line it controls cannot detect
+        that line changing. With the expression addressable, the controls can
+        substitute the pre-W25 and rejected-repair forms and run the REAL
+        validate_trade over them. The rationale for the guard itself is in the
+        comment at the call site.
+        """
+        if correlated_count > 0 and final_contracts > 0:
+            haircut = max(0.30, 1.0 - 0.30 * correlated_count)
+            return max(1, int(final_contracts * haircut))
+        return final_contracts
 
     def _recalculate_portfolio_greeks(self) -> None:
         """Recalculate aggregate portfolio Greeks from open positions."""

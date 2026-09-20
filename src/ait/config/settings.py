@@ -244,6 +244,18 @@ class BacktestConfig(_StrictModel):
         description="R19c: absolute minimum total credit ($/share) for a "
                     "condor — config.yaml home for AIT_IC_MIN_CREDIT. At a 50% "
                     "TP the gross must clear ~3x round-trip costs.")
+    ic_credit_ratio_at_20d: float = Field(default=0.45, ge=0.05, le=1.0,
+        description="W31: config home for AIT_IC_CREDIT_RATIO_20D — the "
+                    "practitioner credit/width ratio at ~0.20 delta, used by "
+                    "the sizing self-test to advise a per-trade budget. Was a "
+                    "bare `credit_ratio_at_20d = 0.45` at orchestrator.py, so "
+                    "the $140 funding figure that drove the simulated-capital "
+                    "decision derived from a literal the operator could not "
+                    "see or change (R19c violation, R26 F4). The default IS "
+                    "the literal it replaces. R26 measured the REALIZED ratio "
+                    "at the designed 0.20-delta shorts at 0.375-0.386; moving "
+                    "this value changes the advised budget, so a retune is "
+                    "registered as its own wave rather than folded in here.")
     credit_loss_limit: float = Field(default=0.0, ge=0.0, le=5.0,
         description="R19c: flat credit-structure stop as a multiple of credit "
                     "received; 0 = DISABLED (R6/R12-B1 evidence: every flat "
@@ -568,6 +580,46 @@ class LoggingConfig(_StrictModel):
     backup_count: int = Field(default=5, ge=1, le=20)
 
 
+class SizingProbeConfig(_StrictModel):
+    """W31: the synthetic chain the sizing self-test builds to run the REAL
+    condor builder against.
+
+    These are SELF-TEST FIXTURES, not trading values, and they live in their
+    own section for that reason: nothing in the entry, exit or backtest path
+    reads them, and putting them under `backtest:` would invite a future
+    `_resolve_setting` call to pull a fixture into the real engine. They are
+    in config.yaml rather than buried as literals because the self-test's
+    verdict depends on them — an operator who cannot see the probe cannot
+    judge the answer (the R19c argument, applied to a diagnostic).
+    """
+
+    underlying_price: float = Field(default=660.0, ge=1.0, le=10_000.0,
+        description="Probe spot, near the live universe's largest name so the "
+                    "structure the builder returns resembles what it really "
+                    "builds. The $1 price this replaced drove the vol term "
+                    "under the builder's own $2 floor, so EVERY account was "
+                    "sized from the narrowest structure the builder can make "
+                    "(R26 F4: `builder_width` was bit-identical at $9.75k and "
+                    "$201k, and the breaker arm compared against a fixed $130).")
+    implied_vol: float = Field(default=0.20, ge=0.01, le=3.0,
+        description="Probe IV. Wing width scales with it, so this sets how "
+                    "large a structure the self-test believes the builder can "
+                    "emit; the breaker arm is sized from the result.")
+    dte: int = Field(default=21, ge=1, le=365,
+        description="Probe days to expiry — the builder's own fallback DTE.")
+    strike_grids: list[float] = Field(default=[1.0, 5.0],
+        description="Strike spacings to probe, in dollars. BOTH matter: a $5 "
+                    "grid is what reproduces R26 F4's silent case, where "
+                    "snapping widens the structure past the budget and the "
+                    "builder emits zero while the old check reported "
+                    "problems=0. A $1 grid alone cannot see it.")
+    iv_rank: float = Field(default=55.0, ge=0.0, le=100.0,
+        description="IV rank handed to the builder. Must clear "
+                    "backtest.ic_iv_rank_floor or the builder refuses before "
+                    "constructing anything and the self-test measures the "
+                    "floor instead of the cap grid.")
+
+
 class IBKREnvConfig(BaseSettings):
     """IBKR connection settings from environment variables."""
 
@@ -607,6 +659,7 @@ class Settings(_StrictModel):
     notifications: NotificationsConfig = NotificationsConfig()
     dashboard: DashboardConfig = DashboardConfig()
     logging: LoggingConfig = LoggingConfig()
+    sizing_probe: SizingProbeConfig = SizingProbeConfig()
 
     # Loaded from environment
     ibkr: IBKREnvConfig = IBKREnvConfig()

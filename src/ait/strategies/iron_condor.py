@@ -23,6 +23,13 @@ log = get_logger("strategies.iron_condor")
 class IronCondor(Strategy):
     """Iron condor — sell premium on both sides."""
 
+    #: W31: why the last generate_signals() call emitted nothing (None once it
+    #: emitted). Write-only here — no live path reads it. It exists so the
+    #: launch sizing self-test can report the BUILDER'S OWN refusal instead of
+    #: re-deriving one: R26 F4 found the check modelling a rejection it never
+    #: observed, while the real builder refused for a different reason.
+    last_entry_reason: str | None = None
+
     @property
     def name(self) -> str:
         return "iron_condor"
@@ -30,6 +37,32 @@ class IronCondor(Strategy):
     @property
     def direction_bias(self) -> SignalDirection | None:
         return None  # Direction neutral
+
+    @staticmethod
+    def affordable_width(risk_budget: float) -> float:
+        """Widest wing a per-trade budget can carry, before the $1 floor.
+
+        W31: the ONE authority for the budget<->width relationship, which the
+        orchestrator's sizing self-test used to hand-copy (R26 F4
+        w25-credit-ratio-literal: "a hand-copied algebraic inverse of
+        iron_condor.py:121"). Worst-case max_loss = (width - credit) * 100 with
+        credit >= min_ratio * width, so width <= budget / (100 * (1 - ratio)).
+        `budget_for_width` is its exact inverse; the pair is pinned by a test.
+        """
+        min_ratio = contract_float("AIT_IC_MIN_CREDIT_WIDTH")
+        return risk_budget / (100.0 * max(0.5, 1.0 - min_ratio))
+
+    @staticmethod
+    def budget_for_width(width: float) -> float:
+        """Per-trade budget needed to carry `width` — inverse of the above.
+
+        This is the number to advise an operator: they do not set max loss,
+        they set the budget, and it reaches the wing only through this
+        relationship. Confusing the two is what made the self-test's first cut
+        advise $86 where the account needed $140 (PLAN.md W25 [C1]).
+        """
+        min_ratio = contract_float("AIT_IC_MIN_CREDIT_WIDTH")
+        return width * 100.0 * max(0.5, 1.0 - min_ratio)
 
     def _log_entry_quality(
         self,
@@ -49,6 +82,10 @@ class IronCondor(Strategy):
         (designed 0.20) and left NO trace of the gap between the designed and
         the filled structure — this line is that audit trail.
         """
+        # W31: remember WHY, so a caller that got no signal can say so without
+        # guessing. Rejections only — a generated condor clears it.
+        self.last_entry_reason = reason if status == "rejected" else None
+
         em = float(getattr(chain, "expected_move", 0.0) or 0.0)
         spot = chain.underlying_price
 
@@ -118,8 +155,8 @@ class IronCondor(Strategy):
         # whether the narrow structure is economically WORTH trading — at
         # launch scale the bot should trade less, only when premium is rich.
         if self.risk_budget and self.risk_budget > 0:
-            min_ratio = contract_float("AIT_IC_MIN_CREDIT_WIDTH")
-            affordable = self.risk_budget / (100.0 * max(0.5, 1.0 - min_ratio))
+            # W31: same arithmetic, one owner (see affordable_width).
+            affordable = self.affordable_width(self.risk_budget)
             if affordable < width:
                 width = max(1.0, affordable)
         return width
@@ -150,12 +187,15 @@ class IronCondor(Strategy):
             # broken builder without reading this file.
             log.info("condor_rejected_iv_rank_floor", symbol=symbol,
                      iv_rank=round(float(iv_rank), 2), floor=iv_floor)
+            self.last_entry_reason = "iv_rank_floor"  # W31
             return []
 
         liquid_calls = self._filter_liquid(chain.calls)
         liquid_puts = self._filter_liquid(chain.puts)
 
         if len(liquid_calls) < 2 or len(liquid_puts) < 2:
+            # W31: the other return that never reached _log_entry_quality.
+            self.last_entry_reason = "insufficient_liquid_contracts"
             return []
 
         price = chain.underlying_price

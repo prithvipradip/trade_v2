@@ -149,6 +149,12 @@ backtest:
   ic_delta_max: 0.30                   # AIT_IC_DELTA_MAX
   ic_em_min: 0.6                       # AIT_IC_EM_MIN     (short strike, in expected moves)
   ic_em_max: 1.3                       # AIT_IC_EM_MAX
+  # W31: home for AIT_IC_CREDIT_RATIO_20D — the credit/width ratio at ~0.20
+  # delta that the sizing self-test uses to advise a per-trade budget. Was a
+  # bare 0.45 in orchestrator.py; this value IS that literal. R26 measured the
+  # realized ratio at 0.375-0.386, so a retune is owed — but it moves the
+  # advised funding number, so it gets its own wave with evidence.
+  ic_credit_ratio_at_20d: 0.45
   credit_loss_limit: 0                 # Flat credit stop x credit; 0 = DISABLED
                                        # (R6/R12-B1: every flat level underperformed touch-close)
                                        # Optuna optimizes per walk-forward window [0.3 – 2.0]
@@ -294,3 +300,20 @@ logging:
   file: logs/ait.log
   max_bytes: 20971520                  # 20 MB (10MB x5 held ~20 min under IBKR error spam —
   backup_count: 10                     #  destroyed forensic evidence; now ~200MB / hours of history)
+
+# W31 (R26 F4): the synthetic chain the launch sizing self-test builds so it can
+# run the REAL condor builder instead of modelling it. SELF-TEST FIXTURES, not
+# trading values — nothing in the entry/exit/backtest path reads them. They are
+# here rather than as literals because the self-test's verdict depends on them.
+# The $1 probe price these replace drove the vol term under the builder's own $2
+# floor, so every account above ~$6k was sized from the same $130 structure
+# while real condors risk $30-60 wings.
+sizing_probe:
+  underlying_price: 660.0              # near the live universe's largest name
+  implied_vol: 0.20
+  dte: 21                              # the builder's own fallback DTE
+  strike_grids: [1.0, 5.0]             # $5 is what reproduces the silent case:
+                                       #  snapping widens past the budget and the
+                                       #  builder emits zero (old check: problems=0)
+  iv_rank: 55.0                        # must clear backtest.ic_iv_rank_floor, or
+                                       #  the probe measures the floor, not the caps

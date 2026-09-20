@@ -6014,3 +6014,161 @@ the two W22 Telegram rows, his F7 rows, the W25 credit-ratio literal), plus the 
 live-money items outside F1-F8 and the research re-run, none of which is assigned.
 
 ---
+
+## 2026-09-20 - W31 EXECUTED — R26 F4: the sizing self-test now runs the real builder
+
+The wave reserved for this box since 2026-09-17. All five F4 items plus the credit-ratio literal
+the Windows box reassigned here from F8, plus the F7 rows that live in the same test file. Built
+and verified on the macOS box (nothing was running on it: `ps` clean, heartbeat stale since 09-18).
+
+THE ONE ROOT CAUSE, because all five items are downstream of it. `_launch_size_coherence_check`
+never ran the builder. It called the private `_vol_scaled_width` with a **$1 underlying price** and
+reasoned about the width that came back. That price drives the vol term under the builder's own
+`max(2.0, ...)` floor, so the probe returned the NARROWEST structure the builder can ever make —
+correct for "can this account afford anything at all", exactly backwards for "can the breaker
+absorb one stop-out", and blind to everything downstream of width selection. Reproduced on an
+untouched worktree at `0ca47f3` before anything was changed:
+
+    NLV      9,750  builder_width=2.0  min_viable_ic=130  breaker=195   problems=0
+    NLV     10,000  builder_width=2.0  min_viable_ic=130  breaker=200   problems=0
+    NLV     50,000  builder_width=2.0  min_viable_ic=130  breaker=1000  problems=0
+    NLV    201,475  builder_width=2.0  min_viable_ic=130  breaker=4030  problems=0
+
+Bit-identical at a 20x range of account sizes, and silent at every one.
+
+[1] THE PROBE CHAIN (new, `src/ait/data/synthetic_chain.py`). `build_probe_chain()` — a
+    deterministic Black-Scholes chain on a configurable strike ladder, IO-free, reusing
+    `backtesting/pricing.py` (a pure numpy/scipy leaf, no `ait` imports, so no cycle). It lives in
+    `data/` because a chain is a data fact; an orchestrator method could not be tested without a
+    broker and an `IronCondor` classmethod would tie chain construction to one strategy. An AST
+    guard pins `bot/orchestrator.py` as its ONLY importer in `src/` — a synthetic chain must never
+    reach the entry, exit or backtest path.
+    UNPLANNED CORROBORATION: the probe's shorts land at delta -0.196/0.200 with credit/width
+    0.367-0.385. R26 independently measured the realized ratio at the designed 0.20-delta shorts at
+    **0.375-0.386**. Two different methods, same number — evidence the probe resembles the real
+    structure rather than a convenient fiction.
+
+[2] F4 #1 `w25-d3-breaker-arm-still-fail-open-sized-from-a-1-dollar-probe-wing` (live_money). The
+    arm is now sized from the LARGEST structure the real builder emits at this NLV, taken from the
+    signal itself. Measured post-fix: at $201,475 the builder emits max_loss **$4,419** ($1 grid) /
+    $4,340 ($5 grid) against a $4,030 breaker — $4,419 is R26's own figure to the dollar. The arm
+    fires at 9,750 / 10,000 / 50,000 / 201,475, all of which were silent.
+    ONE HONEST DIFFERENCE FROM THE REPORT: R26's acceptance line for NLV 10,000 quotes "$263 vs
+    $200"; this probe measures $190 vs $200, because R26 probed SPY 660 at iv 0.15 and
+    `sizing_probe.implied_vol` is 0.20. The arm fires either way (1.5 x 190 > 200) and the
+    acceptance criterion is met, but the dollar figure is the probe's, not the live book's.
+
+[3] F4 #2 `w25-coherence-probe-uses-a-budget-the-live-builder-never-receives`. The probe is funded
+    `nlv * risk.max_position_risk_pct` — the same expression the live scan uses — instead of
+    `min(gate, sizer)`. The sizer cap is not discarded: it is tested against the RESULT (arm A3).
+    NOTE FOR THE LEDGER: this is a NO-OP on today's config, where 3% < 5% makes `min()` resolve to
+    the gate anyway. It changes behaviour only under the documented Phase-2 recipe
+    (`max_position_risk_pct` 0.03 -> 0.07), which is exactly when the defect bit. Pinned by
+    observing what the builder is actually handed, not by reading the expression.
+
+[4] F4 #3, the `logic-entry-01` residual. The check runs the real `generate_signals` on one probe
+    chain per configured strike grid. `max_loss_over_budget` now has an arm because the builder
+    reports it: at NLV 9,750 and 10,000 on a **$5 grid** the builder emits ZERO and says
+    `max_loss_over_budget` — the silent case the finding is about. The builder's own rejection
+    token is reported beside an English phrase, so a new rejection path cannot become "no reason".
+
+[5] F4 #4 `w25-credit-width-ratio-arm-is-arithmetically-dead` — **DELETED, and said so**. The arm
+    tested `(achievable_credit / min_width) < min_ratio` where `achievable_credit` was DEFINED as
+    `credit_ratio * min_width`: identically the constant 0.45 at every NLV. R26 permitted deletion
+    provided its real case still surfaces, and it does — through the builder's own
+    `credit_width_ratio` rejection, proven reachable by raising `AIT_IC_MIN_CREDIT_WIDTH` to 0.20,
+    with a control that the live 0.10 floor does NOT trip it.
+
+[6] F4 #5, the two-knob cap grid (the W25 ADDENDUM). DETECTION ONLY, per the ADDENDUM's own
+    instruction that tuning either knob "wants its own wave with a backtest". Arm A3 fires when the
+    structure the gate cap funds exceeds what `positions.max_position_pct` allows, naming the knob.
+    Pinned against the REAL `RiskManager.validate_trade`: at gate 10% / sizer 5% the manager really
+    does refuse the structure the builder really does build, and the check really does say so.
+    The knob unification stays registered, unfixed.
+
+[7] F4 #6 `w25-credit-ratio-literal`. `AIT_IC_CREDIT_RATIO_20D` -> `backtest.ic_credit_ratio_at_20d`
+    (CONTRACT_DEFAULTS + CONFIG_BACKED + settings field + config.yaml line), default 0.45 = the
+    literal it replaced, per W36's where-not-what rule. The hand-copied inverse of
+    `iron_condor.py:121` is gone: `IronCondor.affordable_width()` / `budget_for_width()` are one
+    authority, pinned by a round-trip test and by a table of `_vol_scaled_width` outputs that must
+    not move. A new `sizing_probe:` config section holds the probe's own parameters — its OWN
+    section, not `backtest:`, so a fixture can never be mistaken for a trading value.
+    AND THE ADVICE IS NOW MEASURED: the "needs a per-trade budget of ~$N" line walks a ladder
+    re-running the real builder until it emits, instead of inverting a formula by hand. That hand
+    inversion is what made W25's first cut advise $86 where the account needed $140.
+
+[8] THE F7 ROWS IN THIS FILE, rebuilt (`w25-negative-controls-reimplement-the-line-under-test`).
+    R26 proved both of W25's "negative controls" PASS under an always-approve regression of
+    `validate_trade`, because they did arithmetic on test-local literals and never entered
+    `risk/manager.py`. `RiskManager._haircut_contracts()` is now a seam (extracted verbatim, no
+    behaviour change), and both controls substitute the pre-W25 and rejected-repair expressions at
+    that seam and drive the REAL `validate_trade`. PROVEN BY MUTATION: with the seam reverted to
+    the unguarded pre-W25 form, the file goes **5 failed / 27 passed**, and the rebuilt control is
+    among the failures. Under R26's equivalent regression, W25's version passed.
+
+[9] REGISTERED BY THIS WAVE, FIXED HERE because W31 created the need. Running the real builder
+    gives the check many more ways to throw, and the old blanket `except` logged a warning and
+    discarded the verdict — any such change would have turned the self-test into a permanent no-op
+    indistinguishable in the logs from a clean account. It now logs `log.exception`, pages through
+    `_note_loop_error` and returns False. That helper only paged at 5 CONSECUTIVE failures, which a
+    once-per-process site can never reach — the same can't-fire shape as the arms this wave
+    removed — so it gained a `threshold` parameter, default 5, every existing caller unchanged.
+    The call site now records `_coherence_checked_nlv` only AFTER a successful run (it was set
+    BEFORE the await, so a check that threw was booked as done and never retried). The log line
+    carries `problem_text` and the per-grid probe results, and no longer carries
+    `max_contracts_per_trade`, which was reported as though checked while no arm read it.
+
+[10] THREE EXISTING W25 TESTS INVERTED, each because it pinned the defect. Recorded individually
+    because changing a test to make code pass deserves scrutiny:
+      - `test_it_stays_quiet_on_a_healthy_account` asserted SILENCE at $197k on the reasoning "the
+        breaker is $3,940 against a $130 defined-risk loss". Both numbers are $1-probe artefacts.
+        The silence WAS the defect. Replaced by `test_it_speaks_at_197k_because_one_loss_outruns_
+        the_breaker`, plus a NEW control that a genuinely coherent grid is still silent — an arm
+        that always fires is as dead as one that never does.
+      - `test_the_breaker_arm_is_not_vacuous` only ever probed NLV 2,100, the one size where the
+        old arm fired. Parameterized over {2.1k -> A1, 10k -> breaker, 201k -> breaker}.
+      - `test_it_reads_both_caps_not_just_one` asserted the $50k run was silent; post-W31 both its
+        runs alert, so it would have passed while measuring nothing. It now compares PROBLEM SETS
+        and requires a problem naming `positions.max_position_pct` that appears only when that knob
+        binds — which is what it was always trying to measure.
+
+PROOF. `tests/test_w31_sizing_selftest.py`, 37 executing tests; `tests/test_w25_sizing_coherence.py`
+29 -> 32. The new module cannot import against the pre-fix tree (it references API this wave adds),
+so the pre-fix evidence is the FINDING'S OWN REPRODUCTION rather than a red count — which is the
+rule R26 set for closing a finding. On an untouched `0ca47f3` worktree (module path printed to
+prove which tree ran): all four NLVs above report `alerts=0` and the breaker arm never fires. On
+this tree all four alert. The F7 rebuild is proven by the mutation run in [8]. No
+`inspect.getsource`.
+
+VERIFICATION. Full fast lane **2105 passed / 45 skipped / 1 failed** (893s) — the failure is the
+standing local-`.env` `test_r19_config_authority` case (`AIT_MARKET_DATA_TYPE` env=3 vs contract=4,
+set in this box's `.env`), confirmed by isolating the divergent key. Reconciled arithmetically
+against W37's Windows-box baseline: 2065 + 40 new tests (37 + 3) = 2105. `compileall` OK;
+`scripts/typecheck.py` OK; `scripts/smoke_deploy.py` -> **SMOKE PASS (13 checks)**.
+
+STATE AT HANDOFF: committed on `feature/event-straddle`. **NOT RUNNING** — nothing is running on
+this box at all, so the new config keys cannot disturb a live process. Note this checkout predates
+W35's `freeze_settings`: if a bot is started before those keys are deployed elsewhere, a
+config.yaml addition is still unsafe until restart on any box running pre-W35 code.
+
+WHAT TO EXPECT AT THE NEXT RESTART, AND IT IS NOT A BUG: **the breaker arm will fire on every
+funded account.** `risk.max_position_risk_pct` (3%) exceeds `max_daily_loss_pct / 1.5` (1.33%), so
+one max-loss condor genuinely cannot be absorbed by the daily breaker at any NLV — which is
+precisely why R26 demanded the arm fire at both 10,000 and 201,475. The check runs once per process
+and on >20% NLV moves, so this is one page per restart, not a nag. THE REMEDY IS AN OPERATOR
+DECISION, deliberately not taken here: lower `risk.max_position_risk_pct` to <=1.33%, or raise
+`risk.max_daily_loss_pct`, on backtest evidence. Until then the self-test is telling the truth.
+
+NEXT, on this box: the F5 remainder (the W21 restate script's post-condition + tests, then `--apply`
+with the bot stopped; the dashboard/mirror/pace readers), the two W22 Telegram rows, and the
+remaining F7 rows outside this file (W18's `getsource` tests, W22's background-task test, and the
+W25 deploy-proof ledger line, which rests on `inspect.getsource` and is a ledger correction rather
+than a code fix). REGISTERED BY W31, NOT FIXED: (a) the two-knob unification — one per-trade cap
+should govern, but it moves live sizing and needs a backtest; (b) `ic_credit_ratio_at_20d` is homed
+at 0.45 while R26 measured the realized ratio at 0.375-0.386 — the retune moves the operator-facing
+funding number and wants its own evidence; (c) `sizing_probe.underlying_price` (660) will go stale
+as the universe reprices, and the breaker arm's margin depends on it — a test pins the direction,
+but it is a value someone must revisit. Unassigned as before: the 23 register live-money items
+outside F1-F8 and the research re-run.
+
+---
