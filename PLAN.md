@@ -6709,3 +6709,111 @@ touched. No tests added — nothing here is a claim about behavior, so there is 
 NEXT: **W41** — five findings, detailed above, no operator decision and no re-probe required.
 
 No `inspect.getsource` — this entry doesn't touch test files at all.
+
+---
+
+## 2026-09-21 - W41 EXECUTED — five cheap live-money floors, first wave of the unowned roadmap
+
+First implementation wave of the 2026-09-21 roadmap entry above. No operator decision, no
+re-probe — all five verified independently against HEAD before this wave started, and each
+production defect reproduced against its pre-fix source before being fixed.
+
+[1] `regress-live-05` — PDT history destroyed on an unreadable-store write. `pdt_guard.py`'s
+    `_load_state()` already set `_state_unreadable=True` and failed closed on a bad READ
+    (`can_day_trade()` blocks via `:159`); `_save_state()` wrote unconditionally, so the first
+    `record_day_trade()` after a merely-TRANSIENT unreadable load persisted a fresh empty deque
+    plus one entry OVER the real history. Reproduced against the untouched module first: a
+    healthy guard persists 3 real entries; a guard whose store is wrapped to raise on every read
+    (fakes only the failing verb, delegates the rest — the same idiom
+    `test_w14_booking_exactly_once.py`'s intact-streak test uses) records one trade; the next
+    fresh guard reads back **1 entry**, not 3.
+    Fix: `record_day_trade` retries `_load_state()` when unreadable (the lock may already be gone
+    by the time a trade closes) and, only while still unreadable, suppresses the persist and logs
+    `pdt_history_write_suppressed_store_unverified` instead of writing.
+    ONE ROUND OF SELF-CORRECTION WORTH RECORDING: the first cut retried-and-REPLACED — a second
+    `record_day_trade` call landing exactly on the recovery boundary would silently drop the trade
+    recorded during the outage from the persisted history (caught by my own test, not assumed
+    safe). The finding's suggested fix names "re-read + merge", not "re-read" alone; the shipped
+    version folds any not-yet-persisted in-memory entries back in after a successful re-load
+    instead of overwriting them. Latent today only because `config.yaml:26
+    pdt_account_under_25k: false`; it is the exact knob the sub-$25k funding plan flips.
+
+[2] `time-authority-2` + `time-authority-4` — test-only. Verified directly against HEAD that both
+    are already fixed: `executor.py:391` writes `entry_time=now_et().isoformat()` (W21, `c309d31`)
+    and `orchestrator.py:3055` calls `would_hold_through_earnings(signal.symbol, today_et(),
+    expiry_date)` (W28, `832f197`). Neither wave's own tests exercised these two call sites'
+    ET-vs-host-clock behavior, which is what closes the finding.
+    A DESIGN NOTE, because the first draft of these tests was wrong in an instructive way: the
+    obvious approach — pin the process `TZ` env var (the `host_tz` fixture pattern used elsewhere
+    in this project) and assert the code still reads ET — provides ZERO signal here. Verified by
+    execution: `now_et()` is `datetime.now(ET)` with an explicit `tzinfo` argument, which is
+    immune to the process `TZ` environment variable by construction (confirmed: identical output
+    under `TZ=Europe/Berlin` and unset). The TZ trick only has power against a BARE
+    `datetime.now()`/`date.today()` — exactly the class already retired at both sites. Testing
+    already-fixed code with a tool built to catch the retired bug would have proven nothing; the
+    shipped tests assert the real, host-independent structural properties instead (an AWARE ET
+    offset on the entry-time write; a same-ET-day earnings block driven through the real
+    `would_hold_through_earnings`).
+
+[3] `model-vs-reality-margin-model-unimplemented`, piece 1 (of 2 — the deep half, `whatIfOrder` +
+    `errorEvent` subscription, is W51). `can_afford` checked only `buying_power` (IBKR's ~4x
+    leveraged figure); `available_funds` (cash after margin requirements) has always been fetched
+    into every snapshot — same `accountSummary` subscription tuple as `buying_power`, confirmed at
+    `account.py:237` — and was read by no gate anywhere. Reproduced pre-fix: `buying_power=$50,000,
+    available_funds=$200` (a drained-margin account) approved a $1,000 trade. Fix:
+    `min(snapshot.buying_power, snapshot.available_funds)`. Verified `available_funds` is not a
+    key that can be legitimately absent while `buying_power` is present (identical fetch source),
+    so no defensive fallback was added — an unconditional `min()` is correct, and a soft fallback
+    would have been the R25 plat-06 class of defensive code masking a real depletion.
+
+[4] `model-vs-reality-ex-div-assignment-void`, piece 1 (of 3 — the daily pre-ex-div check and the
+    entry-blocking window are W51). The untracked-position loop in `reconciler.py` has three
+    branches (OPT / STK / other); only OPT appended its key to `frozen_keys`, the list that becomes
+    the `HALT_UNTRACKED` snapshot. The STK branch — the shape a short call's ASSIGNMENT leaves
+    behind — logged `log.critical` and reported a discrepancy but left new entries completely
+    UNFROZEN. Reproduced pre-fix: an assigned SPY stock position logs
+    `reconcile_untracked_stock_assignment` and `HALT_UNTRACKED` is never written. Fix: the STK
+    branch now also appends to `frozen_keys`; its operator-facing message updated to say so.
+    DELIBERATELY NOT given the OPT branch's sighting debounce: that exists for an EMPIRICALLY
+    OBSERVED position-stream flicker (R5, 2026-07-09, a phantom QQQ row sighted-then-disproved
+    twice) — assignment is a discrete overnight broker event, not a stream artifact, and there is
+    no equivalent evidence a stock-position sighting flickers the same way. Whether STK should get
+    its own debounce, and whether it should route through the Telegram declare-yes/no flow the OPT
+    branch uses, is a real design question, left to W51 rather than decided here under a different
+    finding's scope.
+
+[5] NEW — `max_contracts_per_trade` startup guard-rail (GOV-6). `settings.py`'s own field default
+    is **10** — the exact value that arms all three findings queued for W50 (`money-flow-05`,
+    `trade-life-partial-slice-pnl-erased`, `trade-life-promotion-ignores-broker-quantity`, none
+    fixed yet). `config.yaml` currently pins `1`, but nothing stops that pin from being edited
+    before W50 ships. Added next to the existing GOV-5/GOV-3 assertions in
+    `TradingOrchestrator.__init__`: refuses construction with `max_contracts_per_trade > 1`,
+    naming the three findings and PLAN.md. Deliberately NOT gated on `trading.mode != "paper"` the
+    way GOV-5 is — a paper-account multi-contract fill would corrupt the go-live track record just
+    as surely as a live one, and the account is currently paper.
+
+PROOF. `tests/test_w41_live_money_floors.py`, 14 executing tests. Every production defect ([1],
+[3], [4]) reproduced against an untouched copy of its module before the fix, not assumed from the
+finding text — see the pre-fix outputs above (1 entry not 3; `can_afford(1000)` -> `True` on a
+drained account; `HALT_UNTRACKED` not written on assignment). [2] needed no reproduction — the
+code was already correct, verified by reading, and the tests close the finding rather than fix
+anything. Controls named explicitly: a genuinely corrupt (not just locked) PDT store still blocks;
+a tight `buying_power` still refuses even with ample `available_funds`; the OPT branch's existing
+debounce is unchanged; a flat book still clears `HALT_UNTRACKED`; `max_contracts_per_trade=1`
+still constructs cleanly. **No `inspect.getsource`.**
+
+VERIFICATION. Full fast lane **2178 passed / 45 skipped / 1 failed** (880s) — the standing local-
+`.env` `test_r19_config_authority` case. Reconciled by collecting the new file directly (not
+computed by hand, after W40's miss on exactly this): `--collect-only` on
+`test_w41_live_money_floors.py` reports 14; `2164 + 14 = 2178`. `compileall` OK;
+`scripts/typecheck.py` OK; `scripts/smoke_deploy.py` -> SMOKE PASS (13 checks).
+
+STATE AT HANDOFF: committed on `feature/event-straddle`. **NOT RUNNING** — nothing runs on this
+box. `orchestrator.py` changed (GOV-6), so this needs a full supervisor restart to deploy, same as
+any wave touching that file.
+
+NEXT: **W42** — `policy-vs-impl-4` (off-by-one volume floor), `set-membership-6` (finish adopting
+`RANGE_GATED_STRATEGIES` at 4 remaining bare-literal sites), and re-probing `fail-direction-10` and
+`money-flow-01` (both likely substantially closed by W14/W32/W37 — verify before writing anything,
+per this wave's own [2] lesson about testing what's already true). Full roadmap through W51 plus
+the test-honesty track is in the 2026-09-21 REGISTER CORRECTION + ROADMAP entry above.

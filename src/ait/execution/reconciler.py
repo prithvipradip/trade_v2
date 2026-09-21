@@ -1266,10 +1266,29 @@ class PositionReconciler:
                     log.critical("reconcile_untracked_option_freeze",
                                  position=key, qty=ibkr_pos["quantity"])
                 elif ibkr_pos.get("sec_type") == "STK":
+                    # W41 (R26 model-vs-reality-ex-div-assignment-void, piece
+                    # 1): this branch logged and reported a discrepancy but
+                    # never joined `frozen_keys` — the ONLY branch of the
+                    # three that doesn't. An assigned/exercised short option
+                    # leaves a live, unmanaged stock position (no stop, no
+                    # exit) while new entries stayed completely UNFROZEN.
+                    # Deliberately NOT given the OPT branch's debounce above:
+                    # that exists for an empirically observed position-STREAM
+                    # flicker (R5, 2026-07-09, QQQ 500C sighted-then-disproved
+                    # twice); assignment is a discrete overnight broker event,
+                    # not a stream artifact, and there's no equivalent
+                    # evidence a stock-position sighting flickers the same
+                    # way. Whether STK should get its own debounce, and
+                    # whether it should route through the Telegram
+                    # declare-yes/no flow the OPT branch uses, is a real
+                    # design question left to W51's deeper pass — this piece
+                    # only closes the "never freezes at all" gap.
+                    frozen_keys.append(key)
                     msg = (
                         f"UNTRACKED STOCK POSITION (possible ASSIGNMENT): {key}, "
                         f"qty={ibkr_pos['quantity']}, avg_cost={ibkr_pos['avg_cost']} "
-                        f"— needs manual liquidation/review"
+                        f"— needs manual liquidation/review — NEW ENTRIES FROZEN "
+                        f"(data/HALT_UNTRACKED)"
                     )
                     log.critical("reconcile_untracked_stock_assignment",
                                  position=key, qty=ibkr_pos["quantity"])

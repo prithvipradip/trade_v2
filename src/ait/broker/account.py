@@ -268,14 +268,28 @@ class AccountManager:
         return self._snapshot
 
     async def can_afford(self, estimated_cost: float) -> bool:
-        """Check if account has enough buying power for a trade."""
+        """Check if account has enough margin for a trade."""
         snapshot = await self.get_snapshot()
-        can = snapshot.buying_power >= estimated_cost
+        # W41 (R26 model-vs-reality-margin-model-unimplemented, piece 1):
+        # `buying_power` alone is IBKR's ~4x leveraged figure — checking only
+        # that gate ignores `available_funds` (cash after margin
+        # requirements), which the snapshot has always fetched (same
+        # accountSummary subscription as buying_power, line ~250) and no gate
+        # anywhere read. Armed by: the go-live recipe's documented bump of
+        # max_position_risk_pct to 0.07, any off-model AvailableFunds drain
+        # (an ex-div assignment is a named trigger — see
+        # execution/reconciler.py's STK-branch HALT_UNTRACKED, same wave), or
+        # an undefined-risk structure. Not `.5` or a floor: the true
+        # constraint is whichever of the two is tighter.
+        available = min(snapshot.buying_power, snapshot.available_funds)
+        can = available >= estimated_cost
         if not can:
             log.warning(
                 "insufficient_buying_power",
                 required=estimated_cost,
-                available=snapshot.buying_power,
+                available=available,
+                buying_power=snapshot.buying_power,
+                available_funds=snapshot.available_funds,
             )
         return can
 

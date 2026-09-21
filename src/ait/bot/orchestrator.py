@@ -363,6 +363,28 @@ class TradingOrchestrator:
                     "them before live (see docs/RUNBOOK.md go-live checklist)."
                 )
 
+        # GOV-6 (W41, R26 register Group F — the qty>1 ledger fork):
+        # money-flow-05, trade-life-partial-slice-pnl-erased and trade-life-
+        # promotion-ignores-broker-quantity are three live-money findings,
+        # none fixed yet, all dormant ONLY because max_contracts_per_trade is
+        # 1 — the moment a multi-contract position exists, a partial exit's
+        # P&L is erased on close, the commission true-up runs against the
+        # wrong quantity, and reconciler promotion can open an inverted
+        # position on restart. settings.py's own field default is 10, the
+        # exact value that arms all three; config.yaml pins 1 today, but
+        # nothing stops that pin from being edited before the register is
+        # cleared. NOT gated on trading.mode: a paper-account multi-contract
+        # fill corrupts the go-live track record just as surely as a live
+        # one, and the account is currently paper.
+        if settings.positions.max_contracts_per_trade > 1:
+            raise RuntimeError(
+                "max_contracts_per_trade > 1 is refused until the qty>1 "
+                "booking path is fixed (PLAN.md W50; R26 register: "
+                "money-flow-05, trade-life-partial-slice-pnl-erased, "
+                "trade-life-promotion-ignores-broker-quantity). "
+                f"Got {settings.positions.max_contracts_per_trade}."
+            )
+
         # GOV-3 (governance audit): defined-risk-only keyed to TRADING MODE,
         # not just an env default. In any non-paper mode the undefined-risk
         # allowance is force-stripped — the executor then refuses strangles

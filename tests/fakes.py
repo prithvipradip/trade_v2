@@ -98,6 +98,22 @@ def _open_trade(
     )
 
 
+def _stock_position(
+    symbol: str,
+    qty: float,
+    avg_cost: float = 0.0,
+) -> SimpleNamespace:
+    """An ib_insync ``Position`` lookalike (``ib.positions()`` row) for a
+    stock leg — the shape a short call's ASSIGNMENT leaves behind. Sibling of
+    ``_option_position`` (W41): reconciler.py:1041 keys these as
+    ``f"{symbol}:STK"``, distinct from the option-key scheme."""
+    return SimpleNamespace(
+        contract=SimpleNamespace(secType="STK", symbol=symbol),
+        position=qty,
+        avgCost=avg_cost,
+    )
+
+
 def _option_position(
     symbol: str,
     strike: float,

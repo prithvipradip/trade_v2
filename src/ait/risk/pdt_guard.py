@@ -112,9 +112,48 @@ class PDTGuard:
         if not self._enabled:
             return
 
+        # W41 (R26 regress-live-05): a load that failed left _day_trades as an
+        # EMPTY deque (see _load_state) while _state_unreadable stayed sticky
+        # true. _save_state() used to write unconditionally, so the FIRST day
+        # trade recorded after a merely-transient unreadable load persisted
+        # that empty deque plus today's one entry OVER the real 5-day history
+        # — a locked store for one read became permanent history loss, not a
+        # blocked trade. can_day_trade() already fails closed on
+        # _state_unreadable; the store itself must fail closed too.
+        #
+        # Retry-and-MERGE, not retry-and-replace: the lock may already be gone
+        # by the time a trade closes, so re-read first — but a bare re-read
+        # would DISCARD any trade this same process recorded in-memory while
+        # still unreadable (suppressed from the store, per the branch below,
+        # but real for THIS process's own can_day_trade() count). A second
+        # record_day_trade call straddling the recovery moment would then
+        # silently drop the first trade from the persisted history — the
+        # exact under-count class this finding is about, one call later.
+        # Fold any not-yet-persisted entries back in once a real read
+        # succeeds, instead of overwriting them.
+        if self._state_unreadable:
+            _pending = list(self._day_trades)  # recorded here, never saved
+            self._load_state()
+            if not self._state_unreadable:
+                _known = set(self._day_trades)
+                for _entry in _pending:
+                    if _entry not in _known:
+                        self._day_trades.append(_entry)
+                        _known.add(_entry)
+
         today = now_et().date().isoformat()  # ET-pinned (deep-audit SR-M6)
         self._day_trades.append((today, symbol))
-        self._save_state()
+        if self._state_unreadable:
+            log.warning(
+                "pdt_history_write_suppressed_store_unverified",
+                symbol=symbol,
+                detail=("day trade recorded in-memory for this process, but "
+                        "NOT persisted — the store is still unreadable, and "
+                        "writing now would overwrite real history with an "
+                        "incomplete deque"),
+            )
+        else:
+            self._save_state()
 
         remaining = MAX_DAY_TRADES - self._count_in_window()
         log.warning(
