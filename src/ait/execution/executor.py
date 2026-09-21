@@ -24,7 +24,12 @@ from ait.broker.ibkr_client import IBKRClient
 from ait.broker.orders import OrderBuilder
 from ait.bot.state import StateManager, TradeDirection, TradeRecord, TradeStatus
 from ait.risk.circuit_breaker import CircuitBreaker
-from ait.strategies.base import CREDIT_STRATEGIES, Signal, SignalDirection
+from ait.strategies.base import (
+    CREDIT_STRATEGIES,
+    Signal,
+    SignalDirection,
+    restated_capital_at_risk,
+)
 from ait.utils.logging import get_logger
 from ait.utils.time import now_et
 
@@ -2646,6 +2651,55 @@ class TradeExecutor:
             per_leg = 0.9168  # the measured all-in mean
         return per_leg * legs_per_side * qty * 2  # entry + exit
 
+    def _restate_capital_at_risk_from_fill(
+        self, pending: PendingOrder, actual_price: float | None, quantity: int,
+    ) -> None:
+        """W48 (trade-life-credit-econ-floors-signal-time-only, restate
+        half): `_position_capital_at_risk` (orchestrator.py) stamps
+        `trade_maxloss_<id>` and `trades.capital_at_risk` once, right after
+        `execute_signal` returns — order PLACEMENT time, before the real
+        fill price is known (a credit order can ladder for 45s+). Neither
+        was ever restated once the fill landed. Called from both
+        `_update_trade_filled` and `_update_trade_partial` — a partial
+        fill's actual (smaller, possibly differently priced) quantity is
+        exactly the case the signal-time stamp cannot have accounted for.
+
+        Delegates the actual math to `strategies.base.restated_capital_at_
+        risk` (defined-risk credit strategies only; returns None otherwise,
+        including when there is no genuine signal-time max_loss to restate
+        from) rather than to `TradingOrchestrator._position_capital_at_
+        risk` directly — this module cannot import that one (orchestrator.py
+        already imports THIS module, so the reverse would be circular).
+
+        Never raises: this runs inside the fill-booking path, and a
+        secondary risk-bookkeeping figure must never block booking the
+        fill itself.
+        """
+        try:
+            if actual_price is None or actual_price == 0:
+                return
+            signal = pending.signal
+            restated = restated_capital_at_risk(
+                strategy_name=getattr(signal, "strategy_name", ""),
+                signal_max_loss=float(getattr(signal, "max_loss", 0.0) or 0.0),
+                signal_entry_price=float(getattr(signal, "entry_price", 0.0) or 0.0),
+                actual_fill_price=abs(actual_price),
+                quantity=quantity,
+            )
+            if restated is None:
+                return
+            self._state.set_state(f"trade_maxloss_{pending.trade_id}", str(restated))
+            self._state.set_trade_capital_at_risk(pending.trade_id, restated)
+            log.info(
+                "capital_at_risk_restated_from_fill",
+                trade_id=pending.trade_id,
+                signal_time_max_loss=getattr(signal, "max_loss", None),
+                restated_total=round(restated, 2),
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("capital_at_risk_restatement_failed",
+                        trade_id=getattr(pending, "trade_id", ""), error=str(e))
+
     def _update_trade_filled(
         self, pending: PendingOrder, actual_price: float,
         filled_qty: int | None = None,
@@ -2732,6 +2786,7 @@ class TradeExecutor:
         # the unsigned premium convention; BAG credit fills come signed.
         if actual_price is not None and actual_price != 0:
             self._state.update_trade_entry_price(pending.trade_id, abs(actual_price))
+        self._restate_capital_at_risk_from_fill(pending, actual_price, true_qty)
 
         # Build legs JSON for open_positions (handles both contract-shaped and
         # plain-dict legs via _leg_fields so dict-shaped legs don't crash here)
@@ -2824,6 +2879,7 @@ class TradeExecutor:
         self._state.update_trade_quantity(pending.trade_id, filled_qty)
         if actual_price is not None and actual_price != 0:
             self._state.update_trade_entry_price(pending.trade_id, abs(actual_price))
+        self._restate_capital_at_risk_from_fill(pending, actual_price, filled_qty)
         # Register the filled portion so PortfolioManager manages it
         # (check_positions iterates FILLED/PARTIAL).
         legs_json = json.dumps([
