@@ -7903,3 +7903,141 @@ landing before more of the 50-close sample accrues. Re-verify against HEAD befor
 about W48 has been re-checked this session, same discipline every wave since W41 has needed.
 
 No inspect.getsource.
+
+---
+
+## 2026-09-21 - W48 EXECUTED — the commission true-up gate measures commission presence now, not row presence; capital-at-risk restates from the actual fill
+
+Both findings re-verified against HEAD before scoping (the standing discipline every wave since
+W41), landed as two commits per the roadmap (PLAN.md:6696): `trade-life-commission-trueup-gate-
+measures-wrong-quantity` Path A (plus its Path B sibling, found still open at HEAD — see below),
+then `trade-life-credit-econ-floors-signal-time-only`'s restate half.
+
+**1. `trade-life-commission-trueup-gate-measures-wrong-quantity`.** `_true_up_commission`
+([orchestrator.py](src/ait/bot/orchestrator.py)) gated the inline true-up on
+`count_executions(trade_id) >= 2*legs_n` — raw row PRESENCE. `_sweep_executions`
+([executor.py](src/ait/execution/executor.py)) wrote `commission=0.0` the instant any fill was
+seen, real or not, and a combo order's BAG summary row inflated the row count on top of that (a
+4-leg condor's 10 total rows satisfied `>= 8` while real leg commissions were still outstanding) —
+permanently overstating realized P&L by whatever exit-side commissions hadn't landed yet.
+
+**Found only by reading `tests/test_r16_broker_fixes.py`'s own production fixture (a real
+2026-08-04 SPY condor), not stated in the original finding's text:** the BAG summary row gets its
+own `commissionReport` too — reported as a genuine `0.0`, not a missing one. This meant
+"`commission IS NOT NULL`" alone would have been an incomplete fix: a couple of quickly-reported
+BAG rows could substitute for still-pending LEG rows and reproduce the exact same defect from a
+different angle. The completeness check (`count_executions_with_commission`, new) excludes the BAG
+row explicitly (`con_id != BAG_CON_ID`) — a genuinely load-bearing detail, not decoration; the first
+version of the fix, before this was noticed, would not have closed the finding.
+
+`commission` now defaults to `NULL` ("not yet reported") rather than `0.0` — no schema migration,
+since the column already permitted `NULL` and only ever received a literal `0.0`. The upsert also
+gained the same "never regress a known value" protection `signal_price`/`live_mid`/`nbbo_spread`
+already had, which `commission` alone was missing. `count_executions` itself is untouched — it has
+a second, legitimate, different caller (a reconnect fill-reconstruction liveness check that
+genuinely wants raw row presence) and must keep meaning that.
+
+**Path B, `_settle_deferred_trueups` (the post-market path), was still open at HEAD** — the
+original finding's own second half, which W37 (per this wave's roadmap entry) fixed only the
+day-attribution half of, not the completeness half. It had **zero** completeness check at all
+(`_real > 0` only) and deleted its `trueup_pending_*` marker **unconditionally**, win or lose — a
+trade caught mid-ledger at post-market time got trued up against a partial ledger anyway, and never
+got a second chance regardless of outcome. Now shares the exact same completeness gate as the
+inline path, keeps the marker set (retries the next post-market run) when still incomplete, and —
+per the original finding's own suggested fix, previously undone — now stamps `trades.commission`
+with broker truth once it does settle, matching what the inline path already did.
+
+**2. `trade-life-credit-econ-floors-signal-time-only` (restate half).** `_position_capital_at_risk`
+stamps `trade_maxloss_<id>` (bot_state) and `trades.capital_at_risk` once, right after
+`execute_signal` returns — order **placement** time, before the real fill price is known (a credit
+order can ladder for 45s+). Neither was ever restated once the fill landed, even though
+`_update_trade_filled`/`_update_trade_partial` already correct `trades.entry_price` to the real
+fill. The go-live DD denominator and the aggregate-risk-cap input both read the signal's pre-fill
+guess for the position's whole life.
+
+New `restated_capital_at_risk` (`strategies/base.py`, alongside `CREDIT_STRATEGIES`/
+`UNDEFINED_RISK_STRATEGIES` — the existing single-source-of-truth home for this classification)
+restates from the algebraic identity every defined-risk credit strategy's signal already encodes
+(`max_loss = (max_width - total_credit) * 100`, confirmed against `iron_condor.py:362-365`; wing
+width is fixed between signal and fill, only credit can move):
+`true_max_loss = signal_max_loss + (signal_entry_price - actual_fill_price) * 100`, no new field
+needed. Scoped **deliberately** to defined-risk credit strategies only (`iron_condor` today,
+matching "the live selector is IC-only," CLAUDE.md) — `short_strangle`/`covered_call`/
+`cash_secured_put`/`short_straddle`/`jade_lizard` price `max_loss` as a stress **estimate**
+(straddles.py), not a width-minus-credit figure, and this identity would be flatly wrong for them;
+the guard is written against the existing named sets, not a hardcoded string, so a future
+defined-risk credit spread is covered for free. Lives in `strategies/base.py` rather than reusing
+`TradingOrchestrator._position_capital_at_risk` directly, to avoid the executor→orchestrator
+circular import (orchestrator already imports executor) — `_position_capital_at_risk` itself is
+untouched, still owning the signal-time stamp.
+
+Wired into **both** `_update_trade_filled` and `_update_trade_partial` (a shared
+`_restate_capital_at_risk_from_fill` helper) — the partial-fill site included deliberately: the
+placement-time stamp assumed the full requested size, so a partial fill's actual (smaller, possibly
+differently priced) quantity is exactly the case the signal-time number cannot have accounted for,
+and skipping it would have left a known gap. Confirmed **no further wiring needed**, not assumed:
+`_sync_risk_manager_positions` re-reads the `trade_maxloss_*` KV fresh every cycle (verified by
+driving it for real through the smoke rig), so the aggregate-risk-cap consumer (`risk/manager.py`)
+picks up the restated number automatically; `reporting/go_live.py`'s `max_concurrent_car` reads
+`trades.capital_at_risk` directly by SQL, so the DD-denominator consumer does too.
+
+PROOF, both mutation-tested via `git stash push -- <file>` (never a hand-revert):
+- Finding 1: 7 of 8 new tests fail against the reverted code (the 8th, the orphaned-marker case,
+  correctly stays green — that behaviour was never in question). Confirmed via the count helper
+  directly, via `_true_up_commission` end to end, and via `_settle_deferred_trueups`'s new
+  keep-pending behaviour.
+- Finding 2: all 14 new tests fail against the reverted code (`ImportError` — the function does not
+  exist pre-fix) before passing clean (14/14) against the fix.
+
+VERIFICATION:
+- `python -m compileall -q src` / `python scripts/typecheck.py` clean throughout, every edit round.
+- New files: `tests/test_w48_commission_completeness_gate.py` (8), `tests/test_w48_capital_at_risk_
+  restatement.py` (14) — 22 tests total, none `inspect.getsource`.
+- Anticipated test update (a genuine gap in an existing mock, not a problem with the fix — matching
+  the standing precedent for this class of change): `tests/test_r15_review_fixes.py`'s two
+  `state.count_executions.return_value` mocks moved to `state.count_executions_with_commission`,
+  since they were driving the exact gate this wave replaced.
+- Combined run of every file touching the changed paths (grep-audited first, not discovered one at
+  a time): `test_r15_review_fixes`, `test_r16_broker_fixes`, `test_r19_executor_fixes`,
+  `test_audit_fixes`, `test_w1_booking_integrity`, `test_w14_booking_exactly_once`,
+  `test_w32_booking_breaker_integrity`, `test_w37_commission_estimate_is_remembered`,
+  `test_w3_scorecard_truth`, `test_r14_batch2`, `test_r17_dormant_strategy_fixes`,
+  `test_single_leg_entry_ladder`, `test_w2_executor_risk_gates`, `test_w27_credit_floor_at_placement`,
+  `test_hot_path_smoke`, plus the two new W48 files, **one single run, not summed from the two
+  separate per-part sweeps done during implementation** (those overlapped on several files and a
+  naive 208+263 add double-counts them — caught by actually running the combined set before writing
+  this line, not by trusting the arithmetic): **342 passed**.
+- `python scripts/smoke_deploy.py` → `SMOKE PASS (13 checks)`, both times (once per part).
+- Full fast lane, count taken by **running** it (the standing rule since W40): **2275 passed / 46
+  skipped / 3 failed / 153 deselected** (1972s). The 3 failures confirmed BY NAME: the standing
+  local-`.env` `test_r19_config_authority` artifact, and the W30-registered `test_watchdog.py`
+  wall-clock flake (`test_all_healthy` + `test_one_down_marks_overall_down`) — the identical two
+  classes every wave since their registration has seen, nothing new. **Arithmetic reconciles
+  exactly this time** (the W47 entry above had to flag and investigate a gap; no such gap here):
+  `2253 (W47 close) + 22 (this wave's new tests) = 2275` — exact match, skipped and deselected both
+  unchanged (46, 153).
+
+STATE AT HANDOFF: two commits (`W48: trade-life-commission-trueup-gate... `, `W48: trade-life-
+credit-econ-floors-signal-time-only ...`), each independently revertible on a live-money system,
+plus this entry. **NOT RUNNING** — nothing on the Windows box is restarted by me; the bot restart is
+the operator's call per the standing rule, and neither part needs anything beyond the normal
+restart-to-load-new-code (no loop/task-structure change this wave, unlike W47's Part 3). Scope
+boundaries a future session should not misread as more than they are: the capital-at-risk
+restatement deliberately covers only defined-risk credit strategies (`iron_condor` today) and
+leaves undefined-risk strategies' `capital_at_risk` exactly as unrestated as before, on purpose —
+widening it to short_strangle/etc. would require deriving their stress-estimate formula's own
+fill-time restatement, a different and unexamined problem; the commission-completeness gate's
+BAG-row exclusion depends on `BAG_CON_ID` staying the sentinel `con_id` IBKR/ib_insync report for a
+combo summary leg — if that ever changes upstream, the exclusion silently stops working (no test
+here would catch an upstream constant change, only a regression in this codebase's own use of it).
+
+NEXT: **W49** — `policy-vs-impl-7` (30/50/100 close-count floor — docs disagree) + `docs-policy-04`
+(doc-only, or build `KEEPER_PAUSE` enforcement?), per the roadmap (PLAN.md:6697). **Flagging, not
+resolving:** the roadmap marks this wave as needing an **operator decision before scoping** —
+`docs-policy-04` has been queued and deferred **seven times already** (this file, 4154 onward per
+the original roadmap note); the decision that has blocked it each time has not been surfaced or
+made this session. A future session should raise it explicitly rather than let it become the eighth
+deferral by default. Re-verify both items against HEAD before scoping either way, same discipline
+every wave since W41 has needed.
+
+No inspect.getsource.
