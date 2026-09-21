@@ -7519,3 +7519,68 @@ QQQ condor in an active touch-stop exit this morning nothing is being restarted.
 next start.
 
 ---
+
+## 2026-09-21 - W33b EXECUTED (Windows box) — the first live exit on W33: what worked, what did not, and the fix. Trade closed -$503.32
+
+THE TRADE. QQQ iron condor T-20260917-095601-aa4fa8 (645P/691P/734C/775C, exp 10-02, credit 4.99,
+1 lot) closed on its touch stop. QQQ gapped from 721.33 (Fri close) to 728 at the open and ran
+through the 734 short call. Closed 9.94 -> gross -$495.00, real commission $8.32 over 10 fills,
+**realized -$503.32**. First close on W32-W37, and first live exercise of W33's exit pricing.
+
+THE FUNDAMENTAL CONSTRAINT, STATED FIRST: **this account prices everything off DELAYED data** —
+`market_data_type_set type=4`, and IBKR warning 10167 ("Displaying delayed market data") on QQQ
+stock AND on the exit BAG itself. Quotes are ~15 minutes old (U6: the live account is still
+unfunded, so there is no real-time entitlement). The touch stop itself fired ~15 minutes after the
+real touch, and every exit limit below was built from a 15-minute-old combo quote in a rising tape.
+
+THE EXIT, FROM THE LOGS AND A READ-ONLY BROKER CLIENT (clientId 83, placed and cancelled nothing):
+  10:25:02  short_strike_touch (spot 734.55 >= call 734.00)
+  10:25:04  combo_exit_quote_poll bag=8.46/8.57 -> BUY LMT 8.67
+            broker: order 1897552 Submitted, filled=0 — worked ELEVEN minutes unfilled
+  10:36:08  exit_order_stale_working_cancel_requested age_seconds=664 (the rule is 300s; scan
+            cycles held the event loop, heartbeat stale 6.5 min — the R9 "monitor blind while
+            scanning" finding, live)
+  10:37:10  bag=9.50/9.66 -> BUY LMT 9.76; broker: Submitted, filled=0 — twelve more minutes
+  10:49:04  cancel requested age_seconds=714
+  10:50:06  bag=10.09/10.19 -> BUY LMT 10.29 -> **FILLED 9.94** at 10:50:08 (QQQ had eased to
+            734.96, so the real market was BELOW the stale quote — a limit fills at the offer, not
+            at our number)
+25 minutes from trigger to fill. Marked at the first attempt's quote the loss was ~-$360; it
+closed at -$503. About $140 of that is the cost of chasing a trending market with stale prices.
+
+WHAT WORKED (each live for the first time): W33's `combo_exit_quote_poll` answered "what did the
+BAG show?" on every attempt without a probe; `ibkr_order_error_captured` recorded each of our own
+cancels (code 202, empty reason — no band reject occurred, so no `exit_band_*` key was written,
+correctly); W32 booked the close EXACTLY once (daily_stats -503.32 / 0W 1L; breaker
+consecutive_losses=1, daily_pnl=-503.32; outbox empty); W37's remembered estimate was used by the
+true-up and its key deleted (`realized_pnl_commission_trueup`, ledger complete at 10 executions);
+the broker is flat — no open orders, no QQQ option positions.
+
+WHAT DID NOT, AND IS MINE. W33 taught the NO-QUOTE exit to step its price each attempt and left the
+QUOTED path at `ask + cross`, reasoning that a limit through a live ask fills. On delayed data that
+reasoning does not hold, and the quoted path had no memory: attempt two started from the next stale
+quote as if attempt one had never failed. FIX: every consecutive unfilled QUOTED placement for the
+same trade raises the next limit by `exit.exit_unfilled_escalation_pct` (0.05) of the marketable
+price — n-th retry: x(1 + pct*n). Credit buybacks only (a price we PAY; a debit close is never
+pushed upward — tested); the wing-width cap, the mark-anchored ceiling and the broker band all still
+bind (tested); the counter clears when the exit completes or after an hour. Replayed on this
+morning's numbers the second attempt is 10.25, not 9.76.
+
+WHAT THIS DOES NOT FIX: (1) the 15-minute delay itself — only funding the live account does. How
+the $140 splits between the delay and the missing escalation cannot be measured from delayed
+data, so it is not claimed here; (2) the 300s rest before a re-price, which scan
+cycles stretched to 11-12 minutes. A shorter window for STOP exits and moving scans off the event
+loop are both real and both bigger than a same-day corrective; registered, not done.
+
+PROOF. `tests/test_w33b_quoted_exit_escalation.py`, 7 executing tests through the real
+`_close_multi_leg`. Pre-fix: **5 failed / 2 passed** — the failure text is this morning verbatim
+("second attempt placed 9.76"); the two greens are controls (the broker band still wins; a debit
+close is never escalated upward).
+VERIFICATION: dev worktree, on top of Ahmed's W45: **2224 passed / 46 skipped / 0 failed** (408s),
+typecheck OK.
+
+STATE AT HANDOFF: committed, pushed, and fast-forwarded into the live tree now that the book is
+FLAT. Not running — the processes started 08:33/08:37 ET hold W32-W37. The next restart loads
+Ahmed's W31 + W38-W45, W34b and W33b together; all were suite-green on this box first.
+
+---

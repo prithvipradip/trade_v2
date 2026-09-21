@@ -251,6 +251,10 @@ exit:
   # W33: a broker-stated price band caps later exit attempts for this long.
   # Was a hardcoded hour, which could pin a stop below a market that had moved.
   exit_band_ttl_seconds: 300
+  # W33b: each consecutive QUOTED exit that did not fill raises the next limit
+  # by this fraction of the marketable price (caps unchanged). On delayed data
+  # `ask + cross` never catches a trending tape (2026-09-21 touch stop).
+  exit_unfilled_escalation_pct: 0.05
   # W33: each consecutive no-quote exit placement steps this far above the
   # last (anchor + cross + n*step, capped) instead of repeating itself.
   exit_reprice_step: 0.10

@@ -529,6 +529,15 @@ class ExitConfig(_StrictModel):
                     "W7 kept it an hour, which (once bands were actually "
                     "captured) could pin a stop below a market that had "
                     "moved. A live reject loop re-states it every 30-180s.")
+    exit_unfilled_escalation_pct: float = Field(default=0.05, ge=0.0, le=0.25,
+        description="W33b: each consecutive QUOTED exit placement that did not "
+                    "fill raises the next limit by this fraction of the "
+                    "marketable price (n-th retry: x(1 + pct*n)), under the "
+                    "same caps (wing width, mark-anchored ceiling, broker "
+                    "band). On delayed data every quote is ~15 minutes old, "
+                    "so `ask + cross` chases a trending tape without ever "
+                    "catching it (2026-09-21: 8.67 then 9.76, both unfilled). "
+                    "0 disables.")
     exit_reprice_step: float = Field(default=0.10, ge=0.01, le=1.0,
         description="W33: how far each consecutive NO-QUOTE exit placement "
                     "steps above the last (anchor + cross + n*step, capped). "

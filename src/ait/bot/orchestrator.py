@@ -1109,6 +1109,7 @@ class TradingOrchestrator:
             # future, unrelated exit on this trade_id starts with a clean slate.
             getattr(self, "_exit_attempts", {}).pop(trade_id, None)
             getattr(self, "_exit_noquote_attempts", {}).pop(trade_id, None)
+            getattr(self, "_exit_quoted_attempts", {}).pop(trade_id, None)
 
             # Deep-audit SR-H1: the PDT guard was fully built but NOTHING
             # ever called record_day_trade — it always reported 0/3 used.
@@ -4359,6 +4360,40 @@ class TradingOrchestrator:
                             limit_price = round(ask + EXIT_CROSS, 2)
                         elif bid is not None:
                             limit_price = round(bid + EXIT_CROSS, 2)
+                        # W33b: a quoted exit that did NOT fill must not
+                        # repeat itself. First live exit on W33, 2026-09-21,
+                        # DELAYED data (warning 10167 on this very BAG): BUY
+                        # LMT 8.67 off an 8.46/8.57 quote worked 11 minutes
+                        # unfilled; the re-price, 9.76 off 9.50/9.66, likewise
+                        # — each built from a quote ~15 minutes old in a
+                        # rising tape, with no memory that the last one
+                        # failed. Every consecutive unfilled placement for
+                        # this trade now raises the limit by a fraction of the
+                        # marketable price. Credit buybacks only (a positive
+                        # price we PAY); the caps below still bind; it is a
+                        # LIMIT, so it fills at the offer, not at our number.
+                        if (limit_price is not None and limit_price > 0
+                                and trade.strategy in CREDIT_STRATEGIES):
+                            import time as _time_q
+                            _qa: dict = getattr(self, "_exit_quoted_attempts", None)
+                            if _qa is None:
+                                _qa = self._exit_quoted_attempts = {}
+                            _qrec = _qa.get(trade.trade_id)
+                            _qnow = _time_q.monotonic()
+                            _qn = (_qrec["n"] if _qrec
+                                   and (_qnow - _qrec["at"]) < 3600.0 else 0)
+                            _qa[trade.trade_id] = {"n": _qn + 1, "at": _qnow}
+                            if _qn:
+                                _pct = float(getattr(
+                                    self._settings.exit,
+                                    "exit_unfilled_escalation_pct", 0.05))
+                                _base = limit_price
+                                limit_price = round(_base * (1.0 + _pct * _qn), 2)
+                                log.warning(
+                                    "combo_exit_limit_escalated",
+                                    symbol=trade.symbol, trade_id=trade.trade_id,
+                                    prior_unfilled_attempts=_qn,
+                                    marketable=_base, escalated_to=limit_price)
                     else:  # SELL
                         if bid is not None:
                             limit_price = round(bid - EXIT_CROSS, 2)
