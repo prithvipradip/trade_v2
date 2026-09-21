@@ -1247,113 +1247,122 @@ class TradingOrchestrator:
         for the full 5-minute scan interval.
         """
         try:
-            # Read-only guardrail: re-probe at most every 20 min so mid-session
-            # read-only (Gateway daily restart relogging read-only) is caught
-            # and alerted, not just at startup.
-            now = datetime.now()
-            last = getattr(self, "_last_readonly_check", None)
-            if last is None or (now - last).total_seconds() >= 1200:
-                self._last_readonly_check = now
-                await self._check_trading_enabled()
+            # W47 bot-day-10: the whole tick is one position-protection pass
+            # -- locked against _trading_cycle's own position-check block so
+            # the two never interleave (see _get_position_lock). This task
+            # now runs on its own guaranteed cadence regardless of scan
+            # duration, so what used to be "mutually exclusive with the
+            # scan" is now "serialized against the scan's position-check
+            # specifically".
+            async with self._get_position_lock():
+                # Read-only guardrail: re-probe at most every 20 min so
+                # mid-session read-only (Gateway daily restart relogging
+                # read-only) is caught and alerted, not just at startup.
+                now = datetime.now()
+                last = getattr(self, "_last_readonly_check", None)
+                if last is None or (now - last).total_seconds() >= 1200:
+                    self._last_readonly_check = now
+                    await self._check_trading_enabled()
 
-            await self._check_economic_calendar_exhaustion()
+                await self._check_economic_calendar_exhaustion()
 
-            positions = await self._portfolio.check_positions()
-            # A5: a successful portfolio read == IBKR is genuinely alive.
-            try:
-                self._watchdog.heartbeat("ibkr")
-            except Exception:
-                pass
+                positions = await self._portfolio.check_positions()
+                # A5: a successful portfolio read == IBKR is genuinely alive.
+                try:
+                    self._watchdog.heartbeat("ibkr")
+                except Exception:
+                    pass
 
-            # A1: mark-to-market daily-loss brake (the realized-only breaker
-            # is entry-gated and blind to unrealized gap-day bleeding).
-            # mtm_day = realized_today + (unrealized_now - unrealized_at_SOD).
-            try:
-                from ait.utils.time import now_et as _net
-                # W47 money-flow-02: a marks-missing position returns
-                # unrealized_pnl=0.0 (portfolio.py), indistinguishable from a
-                # real zero to everything below. Summing those in is a
-                # PHANTOM GAIN equal to the book's actual carry -- the one
-                # brake built to halt a bleeding gap day structurally cannot
-                # trip while it is reading fabricated numbers, and (if the
-                # SOD key happens to be empty this tick) would also LOCK that
-                # phantom in as today's baseline. Skip the evaluation AND the
-                # lazy stamp entirely; check_daily_loss_mtm is a pure per-tick
-                # evaluate-and-maybe-trip, so a skipped tick costs nothing --
-                # the next clean tick (real marks) re-evaluates for real.
-                _missing_ids = [p.trade_id for p in positions if p.marks_missing]
-                if _missing_ids:
-                    log.warning(
-                        "mtm_check_skipped_marks_missing",
-                        count=len(_missing_ids), trade_ids=_missing_ids,
-                        note="one or more positions have no IBKR marks this "
-                             "tick -- the MTM daily-loss brake did not "
-                             "evaluate, rather than evaluate on a fabricated "
-                             "zero. Per-position stop/TP paging is unchanged "
-                             "(portfolio.py's own marks-missing alert).",
-                    )
-                else:
-                    _unreal_now = sum((p.unrealized_pnl or 0.0) for p in positions)
-                    _sod_key = f"mtm_sod_{_net().date().isoformat()}"
-                    _sod_raw = self._state.get_state(_sod_key, "")
-                    if _sod_raw == "":
-                        _sod = await self._capture_mtm_baseline(positions, _unreal_now)
-                        self._state.set_state(_sod_key, str(_sod))
+                # A1: mark-to-market daily-loss brake (the realized-only
+                # breaker is entry-gated and blind to unrealized gap-day
+                # bleeding). mtm_day = realized_today + (unrealized_now -
+                # unrealized_at_SOD).
+                try:
+                    from ait.utils.time import now_et as _net
+                    # W47 money-flow-02: a marks-missing position returns
+                    # unrealized_pnl=0.0 (portfolio.py), indistinguishable from a
+                    # real zero to everything below. Summing those in is a
+                    # PHANTOM GAIN equal to the book's actual carry -- the one
+                    # brake built to halt a bleeding gap day structurally cannot
+                    # trip while it is reading fabricated numbers, and (if the
+                    # SOD key happens to be empty this tick) would also LOCK that
+                    # phantom in as today's baseline. Skip the evaluation AND the
+                    # lazy stamp entirely; check_daily_loss_mtm is a pure per-tick
+                    # evaluate-and-maybe-trip, so a skipped tick costs nothing --
+                    # the next clean tick (real marks) re-evaluates for real.
+                    _missing_ids = [p.trade_id for p in positions if p.marks_missing]
+                    if _missing_ids:
+                        log.warning(
+                            "mtm_check_skipped_marks_missing",
+                            count=len(_missing_ids), trade_ids=_missing_ids,
+                            note="one or more positions have no IBKR marks this "
+                                 "tick -- the MTM daily-loss brake did not "
+                                 "evaluate, rather than evaluate on a fabricated "
+                                 "zero. Per-position stop/TP paging is unchanged "
+                                 "(portfolio.py's own marks-missing alert).",
+                        )
                     else:
-                        _sod = float(_sod_raw)
-                    _realized_today = self._state.get_daily_stats().total_pnl
-                    _mtm_day = _realized_today + (_unreal_now - _sod)
-                    _nlv = await self._account.get_net_liquidation()
-                    if _nlv > 0 and self._circuit_breaker.check_daily_loss_mtm(_mtm_day, _nlv):
-                        if not getattr(self, "_mtm_halt_alerted", False):
-                            self._mtm_halt_alerted = True
-                            await self._send_notification(
-                                f"DAILY MTM LOSS HALT: day P&L ${_mtm_day:,.0f} "
-                                f"(realized ${_realized_today:,.0f} + unrealized move) "
-                                f"breached the daily-loss cap. New entries blocked; "
-                                f"exits still active."
-                            )
-            except Exception as _e:  # noqa: BLE001
-                # R16: was DEBUG — the gap-day daily-loss brake could fail on
-                # every tick and be invisible at the configured log level, so
-                # the one control that stops a bleeding day would look healthy
-                # while doing nothing. WARNING + a page (gated) instead.
-                log.warning("mtm_check_failed", error=str(_e),
-                            note="daily MTM loss brake did not evaluate this "
-                                 "tick — the gap-day halt is not protecting "
-                                 "the book until this clears")
-                if self._alert_gate("mtm_brake_broken", interval_s=3600):
-                    await self._send_notification(
-                        f"MTM BRAKE NOT EVALUATING: {type(_e).__name__}: {_e}. "
-                        f"The daily-loss halt is inactive until fixed; entries "
-                        f"are NOT being blocked by it."
-                    )
+                        _unreal_now = sum((p.unrealized_pnl or 0.0) for p in positions)
+                        _sod_key = f"mtm_sod_{_net().date().isoformat()}"
+                        _sod_raw = self._state.get_state(_sod_key, "")
+                        if _sod_raw == "":
+                            _sod = await self._capture_mtm_baseline(positions, _unreal_now)
+                            self._state.set_state(_sod_key, str(_sod))
+                        else:
+                            _sod = float(_sod_raw)
+                        _realized_today = self._state.get_daily_stats().total_pnl
+                        _mtm_day = _realized_today + (_unreal_now - _sod)
+                        _nlv = await self._account.get_net_liquidation()
+                        if _nlv > 0 and self._circuit_breaker.check_daily_loss_mtm(_mtm_day, _nlv):
+                            if not getattr(self, "_mtm_halt_alerted", False):
+                                self._mtm_halt_alerted = True
+                                await self._send_notification(
+                                    f"DAILY MTM LOSS HALT: day P&L ${_mtm_day:,.0f} "
+                                    f"(realized ${_realized_today:,.0f} + unrealized move) "
+                                    f"breached the daily-loss cap. New entries blocked; "
+                                    f"exits still active."
+                                )
+                except Exception as _e:  # noqa: BLE001
+                    # R16: was DEBUG — the gap-day daily-loss brake could fail on
+                    # every tick and be invisible at the configured log level, so
+                    # the one control that stops a bleeding day would look healthy
+                    # while doing nothing. WARNING + a page (gated) instead.
+                    log.warning("mtm_check_failed", error=str(_e),
+                                note="daily MTM loss brake did not evaluate this "
+                                     "tick — the gap-day halt is not protecting "
+                                     "the book until this clears")
+                    if self._alert_gate("mtm_brake_broken", interval_s=3600):
+                        await self._send_notification(
+                            f"MTM BRAKE NOT EVALUATING: {type(_e).__name__}: {_e}. "
+                            f"The daily-loss halt is inactive until fixed; entries "
+                            f"are NOT being blocked by it."
+                        )
 
-            # Skip positions already in CLOSING state (exit order already placed)
-            closing_ids = {
-                pe.trade_id for pe in self._executor._pending_exit_orders.values()
-            }
-            exits_needed = [
-                p for p in positions
-                if p.should_exit and p.trade_id not in closing_ids
-            ]
+                # Skip positions already in CLOSING state (exit order already placed)
+                closing_ids = {
+                    pe.trade_id for pe in self._executor._pending_exit_orders.values()
+                }
+                exits_needed = [
+                    p for p in positions
+                    if p.should_exit and p.trade_id not in closing_ids
+                ]
 
-            for pos in exits_needed:
-                log.info("fast_monitor_exit", symbol=pos.symbol, reason=pos.exit_reason)
-                await self._execute_exit(pos)
+                for pos in exits_needed:
+                    log.info("fast_monitor_exit", symbol=pos.symbol, reason=pos.exit_reason)
+                    await self._execute_exit(pos)
 
-            # Also check pending order fills — and BOOK the completed exits
-            # (stats/breaker/Thompson); they used to be silently discarded.
-            _entries, completed_exits = await self._executor.check_fills_safe()
-            await self._process_completed_exits(completed_exits)
+                # Also check pending order fills — and BOOK the completed exits
+                # (stats/breaker/Thompson); they used to be silently discarded.
+                _entries, completed_exits = await self._executor.check_fills_safe()
+                await self._process_completed_exits(completed_exits)
 
-            # SEC 8-K material-event check every ~5 min (every 10th fast cycle)
-            self._edgar_check_count += 1
-            if self._edgar_check_count >= 10:
-                self._edgar_check_count = 0
-                await self._check_material_events()
-            self._clear_loop_error("fast_monitor_error")  # R8: success resets streak
-            self._watchdog.note_success("trading_loop")
+                # SEC 8-K material-event check every ~5 min (every 10th fast cycle)
+                self._edgar_check_count += 1
+                if self._edgar_check_count >= 10:
+                    self._edgar_check_count = 0
+                    await self._check_material_events()
+                self._clear_loop_error("fast_monitor_error")  # R8: success resets streak
+                self._watchdog.note_success("trading_loop")
         except Exception as e:
             # Deep-audit BC-H1: this was log.debug — the 30s stop/TP engine
             # could silently no-op for HOURS with a green heartbeat. Surface
@@ -1394,20 +1403,93 @@ class TradingOrchestrator:
             # SEC blocking the UA) looked identical to "no filings" for months.
             log.warning("material_event_check_failed", error=str(e))
 
+    def _get_position_lock(self) -> asyncio.Lock:
+        """W47 bot-day-10: serializes every check_positions()-and-exit pass.
+
+        `_monitor_positions_fast` now runs on its OWN independent task
+        (`_trading_loop` below), concurrently with `_trading_cycle`'s own
+        position-check block (steps 3/3b/5/5b) rather than mutually
+        exclusive with it. Two overlapping `check_positions()` calls are not
+        merely redundant: `PortfolioManager._pass_quote_verdicts` is
+        per-pass instance state (set at the top of `check_positions`, nulled
+        in its `finally`) — an overlapping second pass would null the
+        first's memo mid-flight, and `_spot_quote`'s per-symbol verdict
+        (portfolio.py) is exactly the mechanism R19 added to stop a healthy
+        feed from being misclassified "frozen" (which downgrades the touch
+        stop to a 2-tick confirmation — the same +30-60s cost the R16/R19
+        incident record already prices as a live loss). This lock makes the
+        two callers take turns instead.
+
+        Deliberately NOT held across `_trading_cycle`'s entry-scan tail
+        (steps 6+): that part is minutes long and touches no position state,
+        which is the entire point of running the fast monitor concurrently
+        with it rather than after it.
+
+        Lazy getattr-or-create, matching this class's existing pattern for
+        state that post-dates `__init__` (see `PortfolioManager.
+        _quality_validator`) — many existing tests build an orchestrator via
+        `TradingOrchestrator.__new__` and none of them set this, so a plain
+        `self._position_pass_lock` would raise AttributeError in all of them.
+        """
+        lock = getattr(self, "_position_pass_lock", None)
+        if lock is None:
+            lock = self._position_pass_lock = asyncio.Lock()
+        return lock
+
     async def _trading_loop(self) -> None:
         """Main trading loop during market hours.
 
-        Full scan every 5 minutes, but positions monitored every 30 seconds.
+        W47 bot-day-10: position protection and the entry scan run as two
+        INDEPENDENT concurrent tasks, not one sequential loop alternating
+        between them. Before this, _trading_cycle's entry-scan tail
+        (per-symbol chain fetches, NBBO waits, partial-fill waits — unbounded,
+        no asyncio.wait_for anywhere in it) ran to completion before the next
+        position check, so the real inter-check gap was `30s + scan
+        duration`, not 30s — multi-minute exposure on the touch stop, the
+        only credit-loss exit, during exactly the slow scans a volatile tape
+        produces (the 2026-09-21 live exit log already shows this: "heartbeat
+        stale 6.5 min" while a scan held the loop).
+
+        Now `_protection_task_loop` runs `_monitor_positions_fast` on its own
+        guaranteed FAST_MONITOR_CADENCE_SECONDS cadence no matter how long a
+        scan takes, and also owns the supervisor file-heartbeat and the
+        periodic watchdog recovery check — both used to run once per
+        iteration of THIS loop, so a long scan silently stretched them
+        exactly alongside the position-check gap this restructure closes.
+        `_get_position_lock` (shared with `_trading_cycle`'s own position
+        check) is the only thing genuine concurrency here needs: it stops
+        the two from ever evaluating positions at the same instant, which
+        would otherwise reintroduce R19's per-pass quote-verdict memo race
+        (see that method's docstring). Nothing else needs guarding — a
+        duplicated `_execute_exit` cannot double-place (W45's
+        `_cas_to_closing` refuses the loser before `place_order`) and
+        `check_fills_safe` already carries its own reentrancy guard (R11).
         """
         log.info("trading_loop_starting")
         scan_interval = self._settings.trading.scan_interval_seconds
-        # W47 numeric-pairs-07: shared authority, not a bare literal — see
-        # ait.utils.cadence for why this number must stay in lockstep with
-        # market_data's quote TTL and portfolio's marks-missing alert window.
-        monitor_interval = FAST_MONITOR_CADENCE_SECONDS
-        time_since_scan = 0
 
-        while self._running and self._scheduler.get_current_phase() == TradingPhase.MARKET_OPEN:
+        protect_task = asyncio.create_task(self._protection_task_loop())
+        try:
+            await self._scan_task_loop(scan_interval)
+        finally:
+            # Scoped to this phase: created on entry above, torn down here on
+            # any exit (market close, bot stop, or an exception) — nothing
+            # outlives the phase that started it.
+            protect_task.cancel()
+            try:
+                await protect_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _protection_task_loop(self) -> None:
+        """Task A: position protection, every FAST_MONITOR_CADENCE_SECONDS,
+        unconditionally — regardless of any scan in flight. Runs until
+        cancelled by `_trading_loop`; it does not check phase/`_running`
+        itself, matching the "supervisor decides the lifetime" shape the
+        entry-scan task (`_scan_task_loop`) hands control back through.
+        """
+        wd_tick = 0
+        while True:
             try:
                 self._watchdog.heartbeat("trading_loop")
                 # R6: file heartbeat for the SUPERVISOR's hang detection —
@@ -1426,44 +1508,64 @@ class TradingOrchestrator:
                 except Exception:  # noqa: BLE001
                     pass
 
+                await self._monitor_positions_fast()
 
-                if time_since_scan >= scan_interval:
-                    # Full cycle: scan for new trades + check positions.
-                    # R18 AMPLIFIER FIX: time_since_scan used to reset ONLY on
-                    # success. When _trading_cycle raised, the counter kept
-                    # growing, so EVERY subsequent 30s iteration re-took this
-                    # branch and _monitor_positions_fast never ran again — the
-                    # 2026-08-11 outage killed the MTM daily-loss brake, the
-                    # 8-K material-event check and the read-only re-probe as
-                    # collateral, not just entries. The scan cadence must
-                    # advance whether or not the cycle succeeded, so a broken
-                    # scan can never starve the fast monitor.
+                # R8: check_and_recover was only reachable from the outer
+                # exception handler (i.e. never) — run it periodically so
+                # component-down states can actually page.
+                wd_tick += 1
+                if wd_tick % 10 == 0:
                     try:
-                        await self._trading_cycle()
-                        self._clear_loop_error("trading_cycle_error")  # R8: success resets streak
-                        self._watchdog.note_success("trading_loop")
-                    finally:
-                        time_since_scan = 0
-                else:
-                    # Fast check: only monitor existing positions and fills
-                    await self._monitor_positions_fast()
-                    # R8: check_and_recover was only reachable from the outer
-                    # exception handler (i.e. never) — run it periodically so
-                    # component-down states can actually page.
-                    self._wd_tick = getattr(self, "_wd_tick", 0) + 1
-                    if self._wd_tick % 10 == 0:
-                        try:
-                            await self._watchdog.check_and_recover()
-                        except Exception:  # noqa: BLE001
-                            pass
+                        await self._watchdog.check_and_recover()
+                    except Exception:  # noqa: BLE001
+                        pass
             except Exception as e:
                 log.error("trading_cycle_error", error=str(e))
                 await self._note_loop_error("trading_cycle_error", str(e))
                 self._circuit_breaker.record_api_failure()
                 self._watchdog.record_error("trading_loop", str(e))
 
-            await asyncio.sleep(monitor_interval)
-            time_since_scan += monitor_interval
+            await asyncio.sleep(FAST_MONITOR_CADENCE_SECONDS)
+
+    async def _scan_task_loop(self, scan_interval: float) -> None:
+        """Task B: the entry scan, every scan_interval seconds.
+
+        Self-terminating (unlike the protection task): this loop's own
+        while-condition is what lets `_trading_loop` return once the market
+        closes or the bot stops, so it can cancel the protection task and
+        hand control back to `run()`'s phase state machine.
+
+        Cadence matches the original single-loop version exactly: the first
+        scan fires after `scan_interval` seconds of accumulated sleep, and
+        each subsequent one `scan_interval` seconds after the PREVIOUS scan
+        completes (not from when it started) — a slow scan pushes the next
+        one back by its own duration, same as before.
+        """
+        time_since_scan = 0.0
+        while self._running and self._scheduler.get_current_phase() == TradingPhase.MARKET_OPEN:
+            await asyncio.sleep(FAST_MONITOR_CADENCE_SECONDS)
+            time_since_scan += FAST_MONITOR_CADENCE_SECONDS
+            if time_since_scan < scan_interval:
+                continue
+            # R18 AMPLIFIER FIX: this reset used to happen only on success.
+            # When _trading_cycle raised, the counter kept growing, so this
+            # branch never re-armed and _monitor_positions_fast (now the
+            # independent protection task) never ran again — the 2026-08-11
+            # outage killed the MTM daily-loss brake, the 8-K material-event
+            # check and the read-only re-probe as collateral, not just
+            # entries. Reset BEFORE the call, unconditionally, so a raising
+            # scan can never starve anything ever again — including, now,
+            # itself: the next scan is still exactly scan_interval away.
+            time_since_scan = 0.0
+            try:
+                await self._trading_cycle()
+                self._clear_loop_error("trading_cycle_error")  # R8: success resets streak
+                self._watchdog.note_success("trading_loop")
+            except Exception as e:
+                log.error("trading_cycle_error", error=str(e))
+                await self._note_loop_error("trading_cycle_error", str(e))
+                self._circuit_breaker.record_api_failure()
+                self._watchdog.record_error("trading_loop", str(e))
 
     async def _trading_cycle(self) -> None:
         """Single trading cycle: scan all symbols, check positions, execute signals."""
@@ -1507,45 +1609,53 @@ class TradingOrchestrator:
         # 2. Sync risk manager with live positions (fixes stale position tracking)
         await self._sync_risk_manager_positions()
 
-        # 3. Check and manage existing positions
-        positions = await self._portfolio.check_positions()
+        # 3/3b/5/5b: position protection, locked against _monitor_positions_
+        # fast's now-independent task (W47 bot-day-10 — see
+        # _get_position_lock). Deliberately NOT wrapping steps 1/1b/2 above
+        # (circuit breaker / reconcile_if_owed / sync_risk_manager_positions)
+        # or step 6+ below (the entry scan) — those touch no position state,
+        # and the entry scan is exactly the minutes-long tail that must stay
+        # free to run without blocking the fast monitor.
+        async with self._get_position_lock():
+            # 3. Check and manage existing positions
+            positions = await self._portfolio.check_positions()
 
-        # Handle full exits
-        exits_needed = [p for p in positions if p.should_exit]
-        for pos in exits_needed:
-            log.info("position_exit_triggered", symbol=pos.symbol, reason=pos.exit_reason)
-            await self._execute_exit(pos)
-
-        # Handle partial exits (scale-out at profit milestones)
-        partial_exits = [p for p in positions if not p.should_exit and p.partial_exit_quantity > 0]
-        for pos in partial_exits:
-            log.info("partial_exit_triggered", symbol=pos.symbol, reason=pos.exit_reason,
-                     quantity=pos.partial_exit_quantity)
-            await self._execute_partial_exit(pos)
-
-        # 3b. Thesis re-evaluation — exit early if original thesis invalidated
-        remaining_positions = [p for p in positions if not p.should_exit and p.partial_exit_quantity == 0]
-        for pos in remaining_positions:
-            invalidated, reason = await self._check_thesis_valid(pos)
-            if invalidated:
-                log.info("thesis_invalidated", symbol=pos.symbol, reason=reason)
-                pos.should_exit = True
-                pos.exit_reason = f"thesis_invalidated: {reason}"
+            # Handle full exits
+            exits_needed = [p for p in positions if p.should_exit]
+            for pos in exits_needed:
+                log.info("position_exit_triggered", symbol=pos.symbol, reason=pos.exit_reason)
                 await self._execute_exit(pos)
 
-        # R12-C: delta-hedging check REMOVED — dead since inception (greeks
-        # feed ~0) and dangerous: its auto-execute path placed SPY stock
-        # MARKET orders directly via the broker client, bypassing every
-        # executor guardrail (rate limit, INST-5 defined-risk, GOV-1 NBBO,
-        # market-hours). Module retired to deprecated/src/.
+            # Handle partial exits (scale-out at profit milestones)
+            partial_exits = [p for p in positions if not p.should_exit and p.partial_exit_quantity > 0]
+            for pos in partial_exits:
+                log.info("partial_exit_triggered", symbol=pos.symbol, reason=pos.exit_reason,
+                         quantity=pos.partial_exit_quantity)
+                await self._execute_partial_exit(pos)
 
-        # 5. Check fill status of pending orders (entry + exit)
-        _filled_entries, completed_exits = await self._executor.check_fills_safe()
-        await self._process_completed_exits(completed_exits)
+            # 3b. Thesis re-evaluation — exit early if original thesis invalidated
+            remaining_positions = [p for p in positions if not p.should_exit and p.partial_exit_quantity == 0]
+            for pos in remaining_positions:
+                invalidated, reason = await self._check_thesis_valid(pos)
+                if invalidated:
+                    log.info("thesis_invalidated", symbol=pos.symbol, reason=reason)
+                    pos.should_exit = True
+                    pos.exit_reason = f"thesis_invalidated: {reason}"
+                    await self._execute_exit(pos)
 
-        # 5b. W1: book closes nobody booked — reconciler/sweep closes and
-        # bookings lost to a crash between the sqlite close and the callback.
-        await self._drain_exit_outbox()
+            # R12-C: delta-hedging check REMOVED — dead since inception (greeks
+            # feed ~0) and dangerous: its auto-execute path placed SPY stock
+            # MARKET orders directly via the broker client, bypassing every
+            # executor guardrail (rate limit, INST-5 defined-risk, GOV-1 NBBO,
+            # market-hours). Module retired to deprecated/src/.
+
+            # 5. Check fill status of pending orders (entry + exit)
+            _filled_entries, completed_exits = await self._executor.check_fills_safe()
+            await self._process_completed_exits(completed_exits)
+
+            # 5b. W1: book closes nobody booked — reconciler/sweep closes and
+            # bookings lost to a crash between the sqlite close and the callback.
+            await self._drain_exit_outbox()
 
         # 6. Check if we should avoid new trades (the no-new-entries window).
         # W36 (register time-calendar-03): this `return` used to sit ABOVE
