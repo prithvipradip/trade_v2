@@ -111,6 +111,12 @@ def _orchestrator(
     ibkr.ib.ticker = MagicMock(return_value=ticker)
     orch._ibkr = ibkr
 
+    # W45 (bot-day-05): _close_multi_leg/_close_single_leg now CAS the trade
+    # to CLOSING immediately before placing — these pricing-focused tests
+    # don't exercise that transition's own behavior, so a MagicMock (True-ish
+    # by default on any call) is enough to let placement proceed unchanged.
+    orch._state = MagicMock()
+
     orch._settings = SimpleNamespace(
         exit=SimpleNamespace(exit_cross_amount=exit_cross)
     )
@@ -639,12 +645,17 @@ class TestExecuteExitLivenessGate:
 
     async def test_unknown_liveness_proceeds(self):
         """Broker view unavailable: the exit MUST still go out. A wedged data
-        feed must never silently disable a stop."""
+        feed must never silently disable a stop.
+
+        W45: the CAS to CLOSING moved inside _close_multi_leg (immediately
+        before its own placeOrder call), so it no longer happens at the
+        _execute_exit level at all -- close.assert_called_once() is now the
+        complete proof that this liveness value proceeds to attempt the
+        exit, matching test_live_at_broker_proceeds just below."""
         trade = FakeTrade(contract_type="spread")
-        orch, close, state, _ = _exit_orchestrator("unknown", trade)
+        orch, close, _, _ = _exit_orchestrator("unknown", trade)
         await orch._execute_exit(_pos_status())
         close.assert_called_once()
-        state.update_trade_status.assert_called_once()
 
     async def test_live_at_broker_proceeds(self):
         trade = FakeTrade(contract_type="spread")

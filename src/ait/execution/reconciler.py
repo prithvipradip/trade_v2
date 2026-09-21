@@ -607,9 +607,22 @@ class PositionReconciler:
 
         Returns True when a matching open order was found (cancel requested —
         the caller must NOT book "never filled" this cycle; the next sweep
-        sees either the cancel or a late fill). Uses the in-session
-        openTrades cache: same-clientId orders only, which is exactly the
-        population the sweep can own.
+        sees either the cancel or a late fill).
+
+        W45 (bot-day-08): Pass 1/2 below use the in-session openTrades cache,
+        which in practice sees orders under OTHER clientIds too (ib_insync's
+        Wrapper.openOrder caches every clientId unconditionally, and
+        openTrades() applies no clientId filter — verified directly against
+        the installed ib_insync==0.9.86) — this docstring used to claim the
+        opposite ("same-clientId orders only"), which was simply wrong. That
+        protection is real but UNENFORCED: it depends on a disconnect never
+        having wiped the cache (it does, on every reconnect) without a
+        stash-refetch since (which only fires on a clientId CHANGE, not a
+        same-clientId reconnect). Pass 3 backs it with
+        IBKRClient.foreign_open_order_ids — populated from an authoritative
+        all-clientId snapshot at connect time and kept accurate by
+        sweep_stale_pending()'s periodic prune (see there) — so correctness
+        no longer depends on that cache accident holding.
 
         R19: the matcher used to accept ANY active same-symbol BAG order, and
         for plain options a strike SUBSTRING test ("45.0" matches
@@ -685,6 +698,41 @@ class PositionReconciler:
                     return True
         except Exception as e:  # noqa: BLE001 — sweep must survive broker hiccups
             log.warning("sweep_cancel_check_failed",
+                        trade_id=trade.trade_id, error=str(e))
+            return True  # unknown broker state: defer booking, never fiction
+
+        # W45 (bot-day-08) Pass 3 — neither pass above found a match in the
+        # LOCAL openTrades cache. That cache can be blind (wiped by any
+        # disconnect, never repopulated on a same-clientId reconnect), so
+        # before concluding "no working order" at all, check the explicit
+        # signal: IBKRClient.foreign_open_order_ids, populated from an
+        # authoritative all-clientId snapshot at connect time and kept
+        # accurate by sweep_stale_pending()'s periodic prune (self._ibkr's
+        # stash, not something passed in here — the 30s hot path, which
+        # cannot afford a fresh broker round-trip every tick, still checks
+        # against whatever the last successful prune left, which is
+        # slightly-stale-at-worst but never fabricated). This can't say
+        # WHICH trade a stashed id belongs to (bare order ids carry no
+        # symbol/orderRef, and a still-PENDING trade has no persisted
+        # order-id column to match against) — so it defers every
+        # stale-PENDING candidate this pass rather than guessing, not just
+        # this one. Bounded cost: the stash is only non-empty in the window
+        # after a clientId-changing reconnect until pruned back to empty, and
+        # a deferred booking just retries next sweep.
+        try:
+            if self._ibkr.foreign_open_order_ids:
+                log.warning(
+                    "sweep_deferred_foreign_order_uncertainty",
+                    trade_id=trade.trade_id,
+                    foreign_ids=sorted(self._ibkr.foreign_open_order_ids),
+                    note="a known foreign-session order id is still stashed "
+                         "(broker-confirmed open at the last successful "
+                         "check); deferring this stale-PENDING booking "
+                         "rather than risk it belongs to this trade",
+                )
+                return True
+        except Exception as e:  # noqa: BLE001 — sweep must survive broker hiccups
+            log.warning("sweep_foreign_check_failed",
                         trade_id=trade.trade_id, error=str(e))
             return True  # unknown broker state: defer booking, never fiction
         return False
@@ -799,6 +847,21 @@ class PositionReconciler:
         _sweep_stale_pending keeps the zero-arg signature the orchestrator's
         30s cycle calls it with; it is consumed exactly once, so a
         confirmation can never be re-used on a later cycle.
+
+        W45 (bot-day-08): also refreshes the foreign-order-id stash
+        (IBKRClient.foreign_open_order_ids) against authoritative broker
+        truth before the sweep runs. That stash is add-only at connect time
+        and otherwise never shrinks on its own; _cancel_working_entry_order's
+        Pass 3 (below) defers a booking whenever it's non-empty, so pruning
+        it here against a fresh get_all_open_order_ids() snapshot is what
+        keeps Pass 3 from deferring forever once a stashed order has actually
+        resolved (filled/cancelled/expired) at the broker. Deliberately NOT
+        threaded down as a parameter (unlike fresh_keys): Pass 3 just reads
+        the stash directly, so a call with no fresh prune this cycle (the
+        orchestrator's 30s hot path, which cannot afford this round-trip
+        every tick) still checks against the last successfully-pruned state
+        rather than skipping the check entirely — slightly stale is still
+        grounded in a real broker observation, never fabricated.
         """
         fresh_keys = None
         try:
@@ -811,6 +874,17 @@ class PositionReconciler:
             log.warning("sweep_fresh_positions_failed", error=str(e))
             fresh_keys = None
         self._fresh_keys_for_sweep = fresh_keys
+
+        try:
+            ids_fn = getattr(self._ibkr, "get_all_open_order_ids", None)
+            prune_fn = getattr(self._ibkr, "prune_foreign_open_orders", None)
+            if callable(ids_fn) and callable(prune_fn):
+                broker_open_ids = await ids_fn()
+                prune_fn(broker_open_ids)
+        except Exception as e:  # noqa: BLE001 — a failed refresh just leaves
+            # the stash as it was; never treat a failed prune as "resolved".
+            log.warning("sweep_foreign_stash_refresh_failed", error=str(e))
+
         try:
             return self._sweep_stale_pending()
         finally:

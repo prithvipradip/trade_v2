@@ -282,6 +282,11 @@ def _reconciler(state=None):
     rec = PositionReconciler.__new__(PositionReconciler)
     rec._state = state if state is not None else MagicMock()
     rec._ibkr = MagicMock()
+    # W45 (bot-day-08): the real IBKRClient always initializes this to a real
+    # set() (ibkr_client.py); an unconfigured MagicMock attribute is truthy
+    # by default (even though it iterates as empty), which would make
+    # _cancel_working_entry_order's Pass 3 spuriously defer on every call.
+    rec._ibkr.foreign_open_order_ids = set()
     return rec
 
 

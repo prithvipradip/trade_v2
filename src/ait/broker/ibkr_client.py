@@ -32,9 +32,18 @@ class IBKRClient:
         self._fx_cache: dict[str, float] = {}  # ccy -> units per 1 USD, cached per session
         # R12 F3.1 (clientId-fallback blindness): orderIds of working orders
         # that belong to ANOTHER clientId session (typically our own previous
-        # session after a mid-run reconnect landed on a fallback id). These
-        # orders are invisible to ib.trades()/openTrades() on this session,
-        # so the executor must never read their absence as "cancelled".
+        # session after a mid-run reconnect landed on a fallback id).
+        # W45: NOT actually invisible to ib.trades()/openTrades() in
+        # practice — ib_insync's Wrapper.openOrder caches every clientId
+        # unconditionally and openTrades() applies no clientId filter
+        # (verified against the installed ib_insync==0.9.86). But that is an
+        # UNENFORCED cache side effect, not something this repo controls: a
+        # disconnect wipes the cache entirely, and a same-clientId reconnect
+        # never re-issues the reqAllOpenOrders that would repopulate it. This
+        # stash is the explicit, authoritative backstop for exactly that gap
+        # (see reconciler.py's stale-PENDING sweep, Pass 3) — the executor
+        # must never read a foreign order's absence FROM THE CACHE as
+        # "cancelled" without also checking this.
         self.foreign_open_order_ids: set[int] = set()
         self._ever_connected = False  # distinguishes first connect from mid-session reconnect
         self._last_client_id: int | None = None
@@ -191,11 +200,15 @@ class IBKRClient:
                     self._ib.disconnect()
                     return False
                 # R12 F3.1 / chaos#4B: a mid-session reconnect that lands on a
-                # FALLBACK clientId cannot see the previous session's working
-                # orders via ib.trades()/openTrades() — check_fills would read
-                # every one of them as vanished and mass-flip live trades to
-                # CANCELLED. Snapshot all-clients open orders once and stash
-                # their orderIds so the executor refuses those false verdicts.
+                # FALLBACK clientId is NOT reliably able to see the previous
+                # session's working orders via ib.trades()/openTrades() — the
+                # cache accident that usually makes them visible (W45: see
+                # foreign_open_order_ids above) depends on THIS reqAllOpenOrders
+                # call actually firing, which a same-clientId reconnect never
+                # re-triggers. Snapshot all-clients open orders once here and
+                # stash their orderIds so the executor (and the reconciler's
+                # stale-PENDING sweep) refuse false verdicts even when the
+                # cache itself has nothing.
                 # R15 #5: stash on any reconnect whose clientId DIFFERS from
                 # the PREVIOUS session's — not just base->fallback. The old
                 # `!= base_id` test missed the return leg (fallback 105 ->

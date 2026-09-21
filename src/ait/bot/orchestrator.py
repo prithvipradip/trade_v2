@@ -3333,6 +3333,25 @@ class TradingOrchestrator:
         # for this scan whether or not the order ultimately fills.
         return True
 
+    def _cas_to_closing(self, trade: TradeRecord) -> bool:
+        """W45 (bot-day-05, R12-mirror): the CAS to CLOSING happens on the
+        line immediately before the placeOrder call it guards, not after --
+        a hard kill in between leaves a CLOSING row (armed for the
+        reconciler's existing working-order recovery, reconciler.py
+        ~1128-1170) instead of a live, untracked broker order on a row that
+        still reads FILLED. Called only once a builder has already decided
+        to place something; every defer/no-quote/qualification-failure path
+        returns before reaching this, so nothing needs a revert on the
+        not-placed side -- a path that never CASes never needs to un-CAS.
+        """
+        ok = self._state.update_trade_status(
+            trade.trade_id, TradeStatus.CLOSING,
+            from_statuses=(TradeStatus.FILLED, TradeStatus.PARTIAL))
+        if not ok:
+            log.critical("closing_transition_refused_before_place",
+                         trade_id=trade.trade_id)
+        return ok
+
     async def _execute_exit(self, pos: PositionStatus) -> None:
         """Execute an exit order for a position that needs to be closed."""
         trade = self._find_trade_record(pos.trade_id)
@@ -3468,29 +3487,21 @@ class TradingOrchestrator:
                     return
 
             if exit_trade is None:
+                # W45: the CAS to CLOSING (if it happened at all) already
+                # happened inside the builder, immediately before ITS OWN
+                # placeOrder call -- every path that reaches here with
+                # exit_trade None returned from the builder before that
+                # point, so the trade is still FILLED/PARTIAL, unchanged.
+                # Nothing to revert.
                 log.error("exit_order_not_placed", trade_id=pos.trade_id)
                 return
 
-            # Mark trade as CLOSING — actual close happens when the exit
-            # order fills (detected in executor.check_fills).
-            # R12-A: CAS — the last blind status write; only FILLED/PARTIAL
-            # positions may move to CLOSING (a CLOSED/CANCELLED row must not
-            # be resurrected into the exit path).
-            if not self._state.update_trade_status(
-                    pos.trade_id, TradeStatus.CLOSING,
-                    from_statuses=(TradeStatus.FILLED, TradeStatus.PARTIAL)):
-                # Race window only (pre-check passed above): another path
-                # closed the trade between order placement and here. A live
-                # close order now exists on a closed position — cancel it.
-                log.critical("closing_transition_refused_cancelling_order",
-                             trade_id=pos.trade_id)
-                try:
-                    if exit_trade is not None and getattr(exit_trade, "order", None):
-                        self._ibkr.ib.cancelOrder(exit_trade.order)
-                except Exception as _e:  # noqa: BLE001
-                    log.error("race_exit_cancel_failed",
-                              trade_id=pos.trade_id, error=str(_e))
-                return
+            # W45: CLOSING was already CAS'd inside the builder, on the line
+            # immediately before the placeOrder call that produced
+            # exit_trade -- see _cas_to_closing. Nothing left to do here but
+            # register the fill tracker; the old post-placement CAS (and its
+            # cancel-on-race-loss cleanup, which only existed because the
+            # order used to be placed BEFORE this point) is gone.
 
             # Register the exit order with the executor for fill tracking
             if exit_trade.order.orderId:
@@ -3743,6 +3754,8 @@ class TradingOrchestrator:
                 order = OrderBuilder.market(action="SELL", quantity=trade.quantity)
             # R17: tag with trade_id for exact reconciler matching.
             order.orderRef = trade.trade_id
+            if not self._cas_to_closing(trade):
+                return None
             return await self._ibkr.place_order(qualified, order)
 
         # BUY-to-close a short: unbounded risk if done at market. LIMIT only.
@@ -3784,6 +3797,8 @@ class TradingOrchestrator:
                                    limit_price=limit_price)
         # R17: tag with trade_id for exact reconciler matching.
         order.orderRef = trade.trade_id
+        if not self._cas_to_closing(trade):
+            return None
         return await self._ibkr.place_order(qualified, order)
 
     def _entry_signals_json(self, symbol: str) -> str:
@@ -4605,6 +4620,8 @@ class TradingOrchestrator:
 
         # R17: tag with trade_id for exact reconciler matching.
         order.orderRef = trade.trade_id
+        if not self._cas_to_closing(trade):
+            return None
         return await self._ibkr.place_order(combo, order)
 
     async def _post_market(self) -> None:

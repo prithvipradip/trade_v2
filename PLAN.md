@@ -7286,3 +7286,166 @@ CORRECTION + ROADMAP entry — re-verify against HEAD before scoping, same disci
 every wave since W41 has needed; nothing about W45 has been re-checked yet.
 
 No inspect.getsource.
+
+---
+
+## 2026-09-21 - W45: bot-day-05 + bot-day-08 — reconciler/exit-path crash safety
+
+Planned in full via EnterPlanMode before any code, approved, then re-derived mid-implementation
+where the research (two parallel Explore agents plus direct reads of every touched function) turned
+up a materially better fix shape than the original 2026-08-25 audit's own suggested fix for
+bot-day-05, and a simpler, more test-compatible shape than this session's own first plan for
+bot-day-08. Both findings from `reports/blindspot_composition_hunt_20260825.md`, re-confirmed
+still-open in the 2026-09-06 R24 audit; neither had been re-verified against HEAD before this
+session.
+
+**1. `bot-day-05`** — `_execute_exit` (`src/ait/bot/orchestrator.py`) placed the closing broker
+order BEFORE CASing the trade to `CLOSING` and before `register_exit_order`. A hard kill in that
+window left a live, working exit order with the DB row still reading `FILLED` — every recovery
+layer missed it (reconciler's working-order fetch gated on the trade already being `CLOSING`; the
+fast monitor's `_pending_exit_orders` skip-set in-memory-only, empty after restart) — so
+`portfolio.check_positions` re-demanded the exit and `_execute_exit` fired again: a second reverse
+combo, either a reversed book or an untracked inverse position. The single most dangerous item in
+the current roadmap batch — a reversal, not a reporting bug.
+
+**2. `bot-day-08`** — the stale-PENDING sweep's entry-order cancel check
+(`_cancel_working_entry_order`, `src/ait/execution/reconciler.py`) was supposed to see a pre-crash
+entry order still working at the broker under a different (pre-restart) clientId, so it wouldn't
+wrongly book a $0 "never filled" close while the order could still fill. Its own docstring claimed
+this worked because `ib.openTrades()` is "same-clientId orders only" — false: verified directly
+against the actually-installed `ib_insync==0.9.86` that `Wrapper.openOrder` caches every clientId
+unconditionally and `openTrades()` applies no clientId filter at all. The protection was real but
+only as an undocumented side effect of a third-party library cache — and this session's research
+found it isn't even reliably true: a disconnect wipes that cache entirely, and on a **same**-clientId
+reconnect (not just a fallback) the stash re-fetch never re-fires, so the accidental protection
+evaporates on an ordinary reconnect, not just the fallback-clientId scenario the finding named.
+
+PROOF (pre-fix reproductions and mutation checks, both via `git stash push -- <file>` / pop, not a
+hand-revert):
+- bot-day-05: with the fix stashed out, 4 of 6 targeted tests correctly failed —
+  `AttributeError: 'TradingOrchestrator' object has no attribute '_cas_to_closing'` on the tests
+  calling it directly, and the two CAS-observed-before-place tests failing because the CAS had
+  reverted to happening after placement. The 2 that stayed green
+  (`test_no_order_paths_never_cas_and_never_place`,
+  `test_buy_to_close_no_quote_defers_without_touching_status`) are legitimate controls: a path that
+  never places an order never reached the CAS either way, old or new ordering.
+- bot-day-08: with the fix stashed out, 3 of 5 targeted tests correctly failed — Pass 3 didn't
+  exist, so the foreign-stash-aware defer and the periodic-prune tests both failed. The 2 that
+  stayed green (empty-stash-books-$0, failed-snapshot-leaves-stash-untouched) are legitimate
+  controls for the same reason.
+
+Fix (`src/ait/bot/orchestrator.py`, `src/ait/execution/reconciler.py`, `src/ait/broker/ibkr_client.py`
+comment-only, `pyproject.toml` — 174 insertions/36 deletions across the 4 source files, plus 4 test
+files updated for fixture gaps the fix exposed):
+
+- **bot-day-05.** The original audit's suggested fix (move the CAS earlier in `_execute_exit`,
+  before calling the builders) was read directly and rejected: `_close_multi_leg` polls for a quote
+  with `for _ in range(5): await asyncio.sleep(0.5)` — up to 2.5s of real waiting, on every
+  multi-leg exit attempt, successful or not, before it ever reaches `place_order`. CASing that early
+  would make a perfectly healthy position invisible to `portfolio.check_positions` (FILLED/PARTIAL
+  only) for up to 2.5s on every routine exit, not just at crash time. Instead: new
+  `_cas_to_closing(trade)` helper, called on the line immediately before each of the 3 real
+  `place_order` call sites (two in `_close_single_leg`, one in `_close_multi_leg`) — every
+  defer/no-quote/qualification-failure path in both functions already `return`s `None` *before*
+  reaching its function's placement line, so **no revert-on-failure logic was needed anywhere**: a
+  path that never CASes never needs to un-CAS. The old post-placement CAS block in `_execute_exit`
+  (including its "race window only... cancel it" cleanup, which only existed because the order used
+  to be placed *before* that point) was deleted as dead code, not relocated. No new persisted
+  "pending-exit intent" record either — the `CLOSING` write itself is the persisted intent, already
+  exactly the signal `reconciler.py`'s existing working-order-promotion recovery (`:1128-1170` in
+  session line numbers, unchanged) keys off; that net just never observed a crash in this window
+  before because the write didn't exist there yet.
+- **bot-day-08.** `sweep_stale_pending()` (the async wrapper) now also fetches
+  `IBKRClient.get_all_open_order_ids()` (authoritative, all-clientId, already existed for the
+  CLOSING-recovery path, just never wired here) and feeds it to `prune_foreign_open_orders()`
+  (already existed too) before the sweep runs, keeping `foreign_open_order_ids` accurate over time.
+  `_cancel_working_entry_order` gained a new Pass 3: if Pass 1/2 find nothing in the local
+  `openTrades()` cache, defer (don't book $0) whenever `foreign_open_order_ids` is non-empty.
+  **Design correction made mid-implementation**: the original plan threaded a `broker_open_ids`
+  parameter through `_cancel_working_entry_order` explicitly — found, before writing any tests, that
+  this would break two existing test monkeypatches (`lambda tr: False`, single-arg) in
+  `tests/test_r19_state_ml_fixes.py` and `tests/test_w26_budget_and_cluster_cooldown.py`. Redesigned
+  to have Pass 3 read `self._ibkr.foreign_open_order_ids` directly instead — simpler, doesn't touch
+  the function's call signature at all, and the periodic prune keeps the stash accurate whether or
+  not a given call happened to run with a fresh snapshot (the 30s hot path, which cannot afford a
+  `reqAllOpenOrdersAsync` round-trip every tick, just checks whatever the last successful prune
+  left — slightly stale at worst, never fabricated). Deliberately pass-wide, not per-trade-precise:
+  `get_all_open_order_ids()` returns bare order ids with no symbol/orderRef, and `TradeRecord` has no
+  persisted entry-order-id column to match against (the `executions.order_id` column only populates
+  on an actual fill) — a coarser "defer every stale-PENDING candidate this pass" gate needs no schema
+  change and is strictly safer.
+- Corrected the false "same-clientId orders only" / "invisible to ib.trades()/openTrades()"
+  docstring claims in both files (comment-only, zero behavior change).
+- Addendum found during research, not part of either original finding: `pyproject.toml` pinned
+  `ib_insync` to `==0.9.86` (was `>=0.9.86`) — matches what `constraints.txt` already pins for the
+  trading box; an unpinned bound let a bare `pip install -e ".[dev]"` silently pull a newer
+  `ib_insync` whose cache behavior differs, re-opening bot-day-08's blind spot from a different
+  angle.
+
+Four existing test fixtures needed small, targeted updates — each a genuine gap in a lightweight
+orchestrator/reconciler stand-in that predated this wave's new code paths, not a problem with the
+fix itself, confirmed by running before changing:
+- `tests/test_r19_state_ml_fixes.py`'s shared `_reconciler()` helper built `_ibkr = MagicMock()`
+  with no `foreign_open_order_ids` — an unconfigured MagicMock attribute is truthy by default (even
+  though it iterates as empty), so Pass 3 spuriously deferred on every call. Added
+  `rec._ibkr.foreign_open_order_ids = set()`, matching the real `IBKRClient`'s own always-initialized
+  shape.
+- `tests/test_exit_order_safety.py`'s `_orchestrator()` and `tests/test_r14_batch2.py`'s
+  `_single_leg_orch()` built a bare `TradingOrchestrator.__new__(...)` with no `_state` at all (never
+  needed before, since the CAS used to live in `_execute_exit`, not the builders these helpers
+  exercise directly) — added `orch._state = MagicMock()` to both.
+- `tests/test_w33_exit_pricing_corrective.py`'s `_Store` stand-in (deliberately minimal, "the three
+  state calls exit pricing makes") gained a fourth: `update_trade_status`, returning `True`.
+- `tests/test_exit_order_safety.py::TestExecuteExitLivenessGate::test_unknown_liveness_proceeds` —
+  a genuine test-semantics update, not a workaround: it asserted `state.update_trade_status.
+  assert_called_once()`, which was a correct proxy for "the exit proceeded" when `_execute_exit`
+  itself called it, but that responsibility moved into the (here, mocked-out) builder. Removed the
+  now-stale assertion; `close.assert_called_once()` alone is already the complete proof, matching how
+  the sibling `test_live_at_broker_proceeds` was already asserting.
+
+VERIFICATION:
+- `python -m compileall -q src` / `python scripts/typecheck.py` clean throughout (re-run after every
+  edit round, not just once at the end).
+- New file `tests/test_w45_exit_cas_and_sweep_safety.py`, 11 tests: multi-leg and both single-leg
+  branches' CAS-observed-before-place (captured via a `place_order` wrapper reading the DB status at
+  the exact moment of the call — not a source-string check); the no-order/no-quote paths proving
+  neither placement nor the status transition ever happens; an end-to-end reconciler self-heal test
+  (CAS lands via the real `_cas_to_closing`, nothing else happens, `reconcile()` promotes back to
+  `FILLED`); the Pass 3 foreign-order backstop (defers on a stashed id, doesn't defer on an empty
+  stash, doesn't discriminate by trade since it structurally can't); the periodic prune (empties a
+  resolved id, leaves the stash alone on a failed snapshot).
+- Full combined run of every file this wave touches or could plausibly affect (test_w45 itself,
+  `test_order_lifecycle`, `test_exit_order_safety`, `test_r19_state_ml_fixes`, `test_r16_core_fixes`,
+  `test_r16_broker_fixes`, `test_w33_exit_pricing_corrective`, `test_w26_budget_and_cluster_cooldown`,
+  plus every other file referencing `PositionReconciler` or constructing
+  `TradingOrchestrator.__new__` near the exit path — `test_audit_fixes`, `test_pnl_accounting`,
+  `test_r16_risk_fixes`, `test_r15_review_fixes`, `test_r14_batch2`, `test_r17_risk_data_fixes`,
+  `test_w22_reconciler_declared_positions`, `test_w30_declared_position_cache_class`,
+  `test_w41_live_money_floors`, `test_w42_live_money_floors`, `test_r16_round2_fixes`): **444
+  passed**, found by grep-auditing every construction site rather than waiting for the full lane to
+  surface them one at a time.
+- Full fast lane, count taken by **running** it, not computed by hand (the standing rule since W40):
+  **1 failed, 2212 passed, 45 skipped, 153 deselected**. Arithmetic reconciles exactly: 2201 (W44's
+  close) + 11 this wave's new tests = 2212 — zero regressions elsewhere. The 1 failure is the same
+  long-standing local-`.env` artifact documented since before W16 (PLAN.md:2229-2239, :3143-3146,
+  and this session's own continuity-note root-cause), unrelated to this wave.
+- `python scripts/smoke_deploy.py` → `SMOKE PASS (13 checks)`, including `no_writes(both DBs)`.
+
+STATE AT HANDOFF: both findings closed — the CAS-before-place reproduction and the foreign-order
+blind-spot reproduction both stop reproducing post-fix, confirmed by mutation testing rather than by
+the existence of a patch. **Read this before touching either fix again**: (a) the CAS placement is
+inside the builders, immediately before each `place_order` call, specifically because CASing earlier
+in `_execute_exit` reintroduces a real (if smaller) monitoring gap on every routine multi-leg exit,
+not just at crash time — a future "simplification" back to one CAS in the caller would be a
+regression, not a cleanup; (b) bot-day-08's Pass 3 gate is pass-wide (defers every stale-PENDING
+candidate, not just the one that might actually own the foreign order) because there is no persisted
+entry-order-id to match against — narrowing it to per-trade precision would need a new schema column,
+not a logic change.
+
+NEXT: **W46** — `bot-day-03` + `bot-day-04` (hang-detector has no startup grace; training blocks
+protection-arming). Per the roadmap table, must land as one wave — 03's kill loop re-opens 04's
+window every ~2 min — and closes R24's `ops-substrate-03` meta-finding too. Re-verify against HEAD
+before scoping; nothing about W46 has been re-checked this session, same discipline every wave since
+W41 has needed.
+
+No inspect.getsource.

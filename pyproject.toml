@@ -9,7 +9,15 @@ description = "Autonomous Intelligent Trading - Options trading bot with ML and 
 requires-python = ">=3.13,<3.14"  # R5: the running venv is 3.13; older pins were uninstallable on it
 dependencies = [
     # IBKR
-    "ib_insync>=0.9.86",
+    # W45 (bot-day-08): pinned exact, not >=. This library is archived
+    # (CLAUDE.md) and its cache behavior (Wrapper.openOrder caching every
+    # clientId, openTrades() applying no clientId filter) is something
+    # reconciler.py's stale-PENDING sweep depends on as a BACKSTOP signal —
+    # an unpinned bound let a bare `pip install -e ".[dev]"` (no
+    # -c constraints.txt) silently pull a newer version whose caching
+    # differs, re-opening the same blind spot from a different angle.
+    # Matches constraints.txt, which already pins this for the trading box.
+    "ib_insync==0.9.86",
     # Data
     "yfinance>=0.2.36",
     "polygon-api-client>=1.14",

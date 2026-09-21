@@ -83,6 +83,10 @@ def _single_leg_orch(bid, ask, cross=0.05):
     ibkr.ib.cancelMktData = MagicMock()
     ibkr.ib.ticker = MagicMock(return_value=SimpleNamespace(bid=bid, ask=ask))
     orch._ibkr = ibkr
+    # W45 (bot-day-05): _close_single_leg now CASes to CLOSING immediately
+    # before placing — these order-shape tests don't exercise that
+    # transition itself, so a MagicMock (True-ish by default) is enough.
+    orch._state = MagicMock()
     orch._settings = SimpleNamespace(exit=SimpleNamespace(exit_cross_amount=cross))
 
     async def _notify(m):

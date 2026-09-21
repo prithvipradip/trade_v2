@@ -155,7 +155,7 @@ LEGS = [
 
 
 class _Store:
-    """The three state calls exit pricing makes, over plain dicts."""
+    """The state calls exit pricing makes, over plain dicts."""
 
     def __init__(self):
         self.kv: dict[str, str] = {}
@@ -169,6 +169,12 @@ class _Store:
 
     def get_position_mark(self, trade_id):
         return self.mark
+
+    def update_trade_status(self, trade_id, status, from_statuses=None):
+        # W45 (bot-day-05): _close_multi_leg/_close_single_leg CAS to CLOSING
+        # immediately before placing. These pricing tests don't exercise that
+        # transition itself, so always succeed, matching a real FILLED trade.
+        return True
 
 
 def _rig(*, leg_quotes, bag=(NAN, NAN), entry=5.32, mark_cost=None,
