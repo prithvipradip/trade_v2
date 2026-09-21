@@ -55,6 +55,13 @@ class PositionStatus:
     should_exit: bool
     exit_reason: str
     partial_exit_quantity: int = 0  # Non-zero if partial exit needed
+    # W47 money-flow-02: the flag already existed as a LOCAL in
+    # _evaluate_position (it correctly gates stop/TP/partials there) but
+    # never left the function, so unrealized_pnl=0.0 during a marks outage
+    # was indistinguishable from a real zero to every caller — including the
+    # MTM daily-loss brake, which summed the zeros as if they were real and
+    # could not tell it was reading a phantom flat book.
+    marks_missing: bool = False
 
 
 class PortfolioManager:
@@ -877,6 +884,7 @@ class PortfolioManager:
             should_exit=should_exit,
             exit_reason=exit_reason,
             partial_exit_quantity=partial_exit_quantity,
+            marks_missing=marks_missing,
         )
 
     def _calculate_dynamic_stop(

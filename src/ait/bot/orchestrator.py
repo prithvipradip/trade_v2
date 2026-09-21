@@ -1270,26 +1270,49 @@ class TradingOrchestrator:
             # mtm_day = realized_today + (unrealized_now - unrealized_at_SOD).
             try:
                 from ait.utils.time import now_et as _net
-                _unreal_now = sum((p.unrealized_pnl or 0.0) for p in positions)
-                _sod_key = f"mtm_sod_{_net().date().isoformat()}"
-                _sod_raw = self._state.get_state(_sod_key, "")
-                if _sod_raw == "":
-                    self._state.set_state(_sod_key, str(_unreal_now))
-                    _sod = _unreal_now
+                # W47 money-flow-02: a marks-missing position returns
+                # unrealized_pnl=0.0 (portfolio.py), indistinguishable from a
+                # real zero to everything below. Summing those in is a
+                # PHANTOM GAIN equal to the book's actual carry -- the one
+                # brake built to halt a bleeding gap day structurally cannot
+                # trip while it is reading fabricated numbers, and (if the
+                # SOD key happens to be empty this tick) would also LOCK that
+                # phantom in as today's baseline. Skip the evaluation AND the
+                # lazy stamp entirely; check_daily_loss_mtm is a pure per-tick
+                # evaluate-and-maybe-trip, so a skipped tick costs nothing --
+                # the next clean tick (real marks) re-evaluates for real.
+                _missing_ids = [p.trade_id for p in positions if p.marks_missing]
+                if _missing_ids:
+                    log.warning(
+                        "mtm_check_skipped_marks_missing",
+                        count=len(_missing_ids), trade_ids=_missing_ids,
+                        note="one or more positions have no IBKR marks this "
+                             "tick -- the MTM daily-loss brake did not "
+                             "evaluate, rather than evaluate on a fabricated "
+                             "zero. Per-position stop/TP paging is unchanged "
+                             "(portfolio.py's own marks-missing alert).",
+                    )
                 else:
-                    _sod = float(_sod_raw)
-                _realized_today = self._state.get_daily_stats().total_pnl
-                _mtm_day = _realized_today + (_unreal_now - _sod)
-                _nlv = await self._account.get_net_liquidation()
-                if _nlv > 0 and self._circuit_breaker.check_daily_loss_mtm(_mtm_day, _nlv):
-                    if not getattr(self, "_mtm_halt_alerted", False):
-                        self._mtm_halt_alerted = True
-                        await self._send_notification(
-                            f"DAILY MTM LOSS HALT: day P&L ${_mtm_day:,.0f} "
-                            f"(realized ${_realized_today:,.0f} + unrealized move) "
-                            f"breached the daily-loss cap. New entries blocked; "
-                            f"exits still active."
-                        )
+                    _unreal_now = sum((p.unrealized_pnl or 0.0) for p in positions)
+                    _sod_key = f"mtm_sod_{_net().date().isoformat()}"
+                    _sod_raw = self._state.get_state(_sod_key, "")
+                    if _sod_raw == "":
+                        _sod = await self._capture_mtm_baseline(positions, _unreal_now)
+                        self._state.set_state(_sod_key, str(_sod))
+                    else:
+                        _sod = float(_sod_raw)
+                    _realized_today = self._state.get_daily_stats().total_pnl
+                    _mtm_day = _realized_today + (_unreal_now - _sod)
+                    _nlv = await self._account.get_net_liquidation()
+                    if _nlv > 0 and self._circuit_breaker.check_daily_loss_mtm(_mtm_day, _nlv):
+                        if not getattr(self, "_mtm_halt_alerted", False):
+                            self._mtm_halt_alerted = True
+                            await self._send_notification(
+                                f"DAILY MTM LOSS HALT: day P&L ${_mtm_day:,.0f} "
+                                f"(realized ${_realized_today:,.0f} + unrealized move) "
+                                f"breached the daily-loss cap. New entries blocked; "
+                                f"exits still active."
+                            )
             except Exception as _e:  # noqa: BLE001
                 # R16: was DEBUG — the gap-day daily-loss brake could fail on
                 # every tick and be invisible at the configured log level, so
@@ -2335,6 +2358,63 @@ class TradingOrchestrator:
                 if handled:
                     break  # executed or symbol-level block — done with this symbol
                 # else: risk-rejected — try the next-ranked strategy
+
+    async def _capture_mtm_baseline(
+        self, positions: list[PositionStatus], fallback_unrealized: float
+    ) -> float:
+        """W47 bot-day-09: the lazy SOD-key capture (the ONLY path this runs
+        on, since `_prestamp_mtm_baseline` already claimed the key when it
+        ran) used to stamp whatever the current tick's unrealized P&L was,
+        with no log and no page -- indistinguishable from the outside from a
+        genuinely fresh baseline. A bot down across the whole POST_MARKET
+        window (nightly shutdown, or restarted after OFF_HOURS/PRE_MARKET),
+        or simply never reaching `_post_market` the evening before, arrives
+        here with no prestamp, and the next gap-down morning silently ran on
+        this blind baseline -- the exact blindness the prestamp exists to
+        prevent, reintroduced whenever the prestamp itself doesn't run.
+
+        Prefer the last REAL persisted mark per position
+        (StateManager.get_position_mark -- the same numbers master.py's
+        digest already trusts, since the DB mark writer is itself guarded
+        against marks-missing ticks, portfolio.py's `not marks_missing and
+        persist` gate) over the current tick's number. Only when EVERY open
+        position has one does this fully replace the fallback; a genuinely
+        new position (no tick has ever marked it) has nothing to reconstruct
+        from, so the fallback is used for it too -- but that case pages,
+        because a baseline built from any current-tick number is a degraded
+        one and the prior silence was itself the defect.
+        """
+        if not positions:
+            return fallback_unrealized
+
+        marks = [self._state.get_position_mark(p.trade_id) for p in positions]
+        missing = [p.trade_id for p, m in zip(positions, marks) if m is None]
+        if not missing:
+            reconstructed = sum(m["unrealized_pnl"] for m in marks if m is not None)
+            log.info(
+                "mtm_baseline_reconstructed_from_persisted_marks",
+                baseline=round(reconstructed, 2), positions=len(positions),
+            )
+            return reconstructed
+
+        log.warning(
+            "mtm_baseline_degraded_post_open",
+            positions=len(positions), missing_persisted_marks=len(missing),
+            missing_trade_ids=missing, fallback_baseline=round(fallback_unrealized, 2),
+            note="today's MTM baseline was captured post-open instead of "
+                 "prestamped at the prior close -- the bot likely missed the "
+                 "_post_market window. A real overnight gap may be "
+                 "under-counted today.",
+        )
+        if self._alert_gate("mtm_baseline_degraded", interval_s=3600):
+            await self._send_notification(
+                f"MTM BASELINE DEGRADED: today's daily-loss brake baseline was "
+                f"captured post-open ({len(missing)}/{len(positions)} open "
+                f"positions had no prior mark) instead of pre-stamped at the "
+                f"prior close. A real overnight gap may be under-counted "
+                f"until tomorrow's clean prestamp."
+            )
+        return fallback_unrealized
 
     def _prestamp_mtm_baseline(self, unrealized_at_close: float) -> None:
         """R14 #8: stamp the NEXT trading day's MTM baseline with the PRIOR
