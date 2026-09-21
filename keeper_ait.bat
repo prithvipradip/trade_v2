@@ -31,6 +31,24 @@ if %KLSIZE% GTR 20971520 (
     echo [keeper] %date% %time% rotated keeper.log at %KLSIZE% bytes >> logs\keeper.log
 )
 
+REM W49 (docs-policy-04): the RUNBOOK's "Full stop" / manual-intervention
+REM procedures told the operator to stop the bot processes but never to
+REM pause THIS loop -- so a manual stop was undone within <=90s (executed
+REM evidence in keeper.log: "orchestrator DOWN - relaunching" firing 6 min
+REM after an operator-initiated stop), racing the operator's in-flight
+REM manual close (the exact R13 hazard the procedure exists to prevent).
+REM Enforced, not just documented: while data\KEEPER_PAUSE exists, skip
+REM BOTH the alive-check/relaunch below AND the deadman ping for this tick
+REM -- observable every cycle via keeper.log, and going quiet on the
+REM external monitor during a DELIBERATE pause is expected (it alerts on
+REM its own if the pause is ever forgotten long enough to miss its grace
+REM period). Bare marker file, same convention as data\HALT: create =
+REM engage, delete = resume.
+if exist data\KEEPER_PAUSE (
+    echo [keeper] %date% %time% paused by data\KEEPER_PAUSE - not checking/relaunching >> logs\keeper.log
+    goto sleep
+)
+
 REM Is an orchestrator process alive?
 REM A11 (deep-audit): wmic is deprecated/removed on newer Windows -- its
 REM disappearance would have silently broken the keeper AND the dup-guard.
@@ -80,6 +98,7 @@ REM from the one channel that has to stay reliable.
 REM Three independent delays, cheapest first, none needing console input.
 REM `ping -n 91` waits ~1s between echoes = ~90s. No cmd chaining operators
 REM anywhere (parser-safe): each fallback is guarded by `if errorlevel 1`.
+:sleep
 ping -n 91 127.0.0.1 >nul 2>&1
 if errorlevel 1 timeout /t 90 /nobreak >nul 2>&1
 if errorlevel 1 powershell -NoProfile -Command "Start-Sleep -Seconds 90"

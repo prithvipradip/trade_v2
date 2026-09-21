@@ -9,7 +9,9 @@ own; your job is responding to these messages. (Governance audit GOV-5.)
 | Stop NEW entries (exits keep managing) | create empty file `data/HALT` |
 | Resume | delete `data/HALT` |
 | Ban one symbol | add ticker line to `data/RESTRICTED.txt` |
-| Full stop | `data/HALT` first, then stop processes if truly needed |
+| Pause auto-relaunch (keeper_ait.bat) | create empty file `data/KEEPER_PAUSE` |
+| Resume auto-relaunch | delete `data/KEEPER_PAUSE` |
+| Full stop | `data/KEEPER_PAUSE` FIRST (or the keeper relaunches within ~90s and undoes the stop), then `data/HALT`, then stop processes if truly needed |
 
 ## Alert → action
 | Telegram alert | Meaning | Do this |
@@ -38,8 +40,11 @@ still demanded the exit and `_execute_exit` places the reverse combo without a
 broker-position check — the bot would rebuild what you just closed, inverted
 (same end-state class as the 07-13 incident). So, in order:
 1. `New-Item -ItemType File data\HALT` (freezes entries; exits keep managing).
-2. In TWS, CANCEL the bot's working exit orders on that position — or stop the
-   bot processes if you're closing the whole book.
+2. In TWS, CANCEL the bot's working exit orders on that position — or, if
+   you're closing the whole book, `New-Item -ItemType File data\KEEPER_PAUSE`
+   FIRST (else keeper_ait.bat relaunches the whole stack within ~90s and
+   undoes your stop — this raced the operator once, R13), then stop the bot
+   processes.
 3. Do your manual close(s). Verify fills in TWS.
 4. Positions NOT in the bot's books (untracked): safe to close anytime; the
    bot has no exit path referencing them (verified). Then delete
@@ -47,7 +52,8 @@ broker-position check — the bot would rebuild what you just closed, inverted
 5. Restart/resume the bot; the next reconcile books your closes (note: if you
    flattened the LAST option position, the zero-options mass-close guard
    refuses to book it — expect an `EOD RECON` break and resolve via
-   close/adopt with the assistant).
+   close/adopt with the assistant). If you created `data/KEEPER_PAUSE` at
+   step 2, delete it too so the keeper resumes relaunching.
 
 ## Daily 2-minute routine
 1. Glance at Telegram: any non-CLEAN EOD recon? any CRITICAL?
