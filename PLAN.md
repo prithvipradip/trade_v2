@@ -7754,3 +7754,152 @@ cosmetic — re-verify against HEAD before scoping, same discipline every wave s
 nothing about W47 has been re-checked this session.
 
 No inspect.getsource.
+
+---
+
+## 2026-09-21 - W47 EXECUTED — the cadence authority, the MTM baseline, and a real 30s protection guarantee
+
+All four findings re-verified against HEAD before scoping (same discipline every wave since W41),
+landed in the roadmap's load-bearing order: `numeric-pairs-07` first (it creates the authority the
+last part is measured against), `bot-day-09` + `money-flow-02` together (same `mtm_sod_*` key,
+cannot land apart), `bot-day-10` last.
+
+**1. `numeric-pairs-07`.** Four coupled numbers, four bare literals, zero enforcement:
+`monitor_interval = 30` (orchestrator.py), `ttl=15` (market_data.py), `MARKS_MISSING_ALERT_TICKS = 10`
+(portfolio.py), `max_quote_staleness_seconds=180.0` (settings.py). New `ait/utils/cadence.py` — a
+pure stdlib leaf, no internal imports, so `config/settings.py` can import it with no cycle — is now
+the one authority (`FAST_MONITOR_CADENCE_SECONDS`, `QUOTE_CACHE_TTL_SECONDS`,
+`MARKS_MISSING_ALERT_SECONDS`, `QUOTE_STALENESS_BUDGET_SECONDS`); all four sites import it, values
+unchanged. `tests/test_w47_cadence_invariants.py` asserts the relationships against the real
+imported constants (ttl < cadence; staleness budget ≥ 6× cadence; ticks × cadence == 300s;
+touch-confirm window fits inside the staleness budget) plus per-site import identity (`is`, not
+`==` — proves each site imports the authority rather than retyping an equal-today literal), plus an
+end-to-end `MarketDataService.get_quote()` cache-expiry drive with a patched clock.
+
+**2. `bot-day-09` + `money-flow-02`**, one block in `_monitor_positions_fast`. `PositionStatus`
+gained `marks_missing: bool = False`, set from the local `_evaluate_position` already computed
+(portfolio.py) but never surfaced — a marks-missing position returned `unrealized_pnl=0.0`,
+indistinguishable from a real zero, and the MTM daily-loss brake summed those zeros as a phantom
+gain equal to the book's actual carry, structurally unable to trip during an outage
+(`money-flow-02`). A marks-missing tick now skips the MTM evaluation AND the lazy SOD-key stamp
+entirely (logged `mtm_check_skipped_marks_missing`) rather than evaluate on fabricated data; the
+next clean tick re-evaluates for free since `check_daily_loss_mtm` is a pure per-tick
+evaluate-and-maybe-trip. New `TradingOrchestrator._capture_mtm_baseline` replaces the old silent
+lazy stamp (`bot-day-09`): it reconstructs the SOD baseline from each open position's last
+PERSISTED real mark (`StateManager.get_position_mark` — the same numbers `master.py`'s digest
+already trusts) when every position has one, and falls back to the current tick's number with a
+logged + paged `mtm_baseline_degraded_post_open` when it can't (a genuinely new position with no
+prior mark). Deliberately out of scope, not half-built: stamping the baseline opportunistically at
+bot shutdown — `orchestrator.stop()` is bare `self._running = False` with no portfolio snapshot,
+and wiring one touches supervisor shutdown ordering, a different and riskier surface for a case the
+persisted-marks reconstruction already covers well. **Registered, not fixed.**
+
+**3. `bot-day-10`.** `_trading_loop` was one sequential task: an if/else made `_trading_cycle` (the
+entry scan) and `_monitor_positions_fast` (protection) mutually exclusive per iteration.
+`_trading_cycle`'s entry-scan tail (per-symbol chain fetches, NBBO waits, partial-fill waits —
+unbounded, no `asyncio.wait_for` anywhere in it) ran to completion before the next position check,
+so the real inter-check gap was `30s + scan duration`, not 30s. The 2026-09-21 live exit log already
+shows the symptom verbatim: `heartbeat stale 6.5 min` while a scan held the loop. `_trading_loop` now
+supervises two independent concurrent tasks — `_protection_task_loop` runs `_monitor_positions_fast`
+on its own guaranteed `FAST_MONITOR_CADENCE_SECONDS` cadence regardless of scan duration (and now
+also owns the supervisor file-heartbeat and the periodic watchdog recovery check, both of which used
+to stretch alongside the position-check gap for the identical reason — **a second consequence of the
+same root cause, closed here as a side effect, not a separate finding**); `_scan_task_loop` runs the
+entry scan on its own `scan_interval_seconds` cadence, cadence-for-cadence identical to the original
+single-loop version (verified: first scan after `scan_interval` seconds of accumulated sleep, each
+next one `scan_interval` after the PREVIOUS one *completes*, matching the original's
+reset-in-`finally` semantics exactly).
+
+**Found only by reading the code, not in either original finding — the companion piece the fix
+needed:** taken literally ("run `_monitor_positions_fast` as its own independent task"), this
+reintroduces **R19**. `PortfolioManager._pass_quote_verdicts` is per-pass instance state (set at the
+top of `check_positions`, nulled in its `finally`); two overlapping passes would null each other's
+memo mid-flight, and `_spot_quote`'s per-symbol verdict is exactly the mechanism R19 added to stop a
+healthy feed being misclassified "frozen" — which downgrades the touch stop to a 2-tick confirmation,
+the same +30-60s cost the R16/R19 incident record already prices as a live loss. New
+`_get_position_lock` (a lazily-created `asyncio.Lock`) serializes `_monitor_positions_fast` against
+`_trading_cycle`'s own position-check block (steps 3/3b/5/5b only — deliberately **not** held across
+steps 1/1b/2 above it or the entry-scan tail at step 6+, which touch no position state and are the
+whole point of running concurrently). Nothing else needs guarding, verified rather than assumed: a
+duplicated `_execute_exit` cannot double-place — W45's `_cas_to_closing` is an atomic
+`FILLED|PARTIAL → CLOSING` transition and all three builder sites `return None` on refusal *before*
+`place_order`; `check_fills_safe` already carries its own R11 reentrancy guard built for exactly this
+("the event-driven path and the 30s monitor can both want check_fills").
+
+**Design correction made mid-implementation:** the plan called for the lock to live in `__init__`,
+but many existing tests construct `TradingOrchestrator` via `__new__` (bypassing `__init__`) and
+drive `_trading_cycle`/`_monitor_positions_fast` directly — a plain `self._position_pass_lock` would
+raise `AttributeError` in all of them. `_get_position_lock` instead uses this class's existing
+lazy-getattr-or-create pattern (`PortfolioManager._quality_validator` is the precedent) — same
+guarantee, zero test fallout, no test file touched to accommodate a new attribute.
+
+PROOF, every part mutation-tested via `git stash push -- <file>` (never a hand-revert), reruns
+until stable:
+- Part 1: reverting the TTL to equal the cadence fails `test_quote_ttl_is_strictly_below_the_
+  monitor_cadence` (`assert 30 < 30.0`).
+- Part 2: with `PositionStatus.marks_missing` and `_capture_mtm_baseline` stashed out, all 7 of
+  `tests/test_w47_mtm_baseline_integrity.py` fail — first `PositionStatus.__init__() got an
+  unexpected keyword argument 'marks_missing'`, then (once that's back) real assertion failures on
+  the reconstruction/skip logic itself.
+- Part 3: with the loop restructure and the lock stashed out, the central test
+  (`test_position_checks_keep_ticking_during_a_slow_trading_cycle`) fails consistently — **0**
+  position checks during the fake slow scan, 3/3 reruns — against the reverted sequential loop,
+  before passing clean (6/6, 3/3 reruns) against the fix.
+
+VERIFICATION:
+- `python -m compileall -q src` / `python scripts/typecheck.py` clean throughout, every edit round.
+- New files: `tests/test_w47_cadence_invariants.py` (10), `tests/test_w47_mtm_baseline_integrity.py`
+  (7), `tests/test_w47_protection_cadence.py` (6) — 23 tests total, none `inspect.getsource`.
+- Combined run of every file touching the changed paths or constructing `PositionStatus`/
+  `TradingOrchestrator` near them (grep-audited, not discovered one at a time): `test_hot_path_smoke`,
+  `test_r16_round2_fixes`, `test_w36_config_homes_and_drain`, `test_w18_gateway_port_and_throttle`,
+  `test_w46_startup_protection_and_hang_grace`, `test_w34_ops_substrate`, `test_exit_staleness_gate`,
+  `test_r14_batch2`, `test_r19_state_ml_fixes`, `test_r16_risk_fixes`, `test_r15_review_fixes`,
+  `test_pnl_accounting`, `test_dynamic_exits`, `test_credit_exits`, `test_exit_order_safety`,
+  `test_w14_booking_exactly_once`, `test_w1_booking_integrity`, `test_r21_post_stop_cooldown`,
+  `test_w2_orchestrator_gates`, `test_w26_budget_and_cluster_cooldown`,
+  `test_w33_exit_pricing_corrective`, `test_w45_exit_cas_and_sweep_safety`: **546 passed** across the
+  two combined sweeps.
+- `python scripts/smoke_deploy.py` → `SMOKE PASS (13 checks)`.
+- Full fast lane, count taken by **running** it (the standing rule since W40): **2253 passed / 46
+  skipped / 3 failed / 153 deselected** (2006s). The 3 failures confirmed BY NAME against the actual
+  list, not assumed: `test_r19_config_authority.py::TestContractIsTheSingleAuthority::
+  test_applier_and_readers_share_one_table` (the standing local-`.env` artifact) and
+  `test_watchdog.py::TestOverallHealth::test_all_healthy` +
+  `::test_one_down_marks_overall_down` (the W30-registered wall-clock flake) — the identical two
+  classes every prior wave since their registration has seen, nothing new.
+  **Arithmetic flagged, not silently reconciled** (W30's own precedent: surface a count anomaly
+  rather than paper over it): W46's close is written above as `2219 passed / 45 skipped / 3 failed`;
+  `2219 + 23 (this wave's new tests) = 2242`, not `2253` — an unexplained +11 passed / +1 skipped.
+  Investigated rather than assumed a regression: a `git worktree` collect-only at W46's own commit
+  (`f176474`) on this box, right now, collects **2278** tests — already 11 more than `2219+45+3=2267`
+  sums to, i.e. the gap **predates this wave** and reproduces at the pre-W47 commit itself, not
+  something W47 introduced. This wave's own collected-count delta is exact (`2301 − 2278 = 23`,
+  matching its 23 new tests precisely) and the 3 failures match by name, which is what actually rules
+  out a regression here; a full re-run of the W46 commit's suite (not just collect) would be needed
+  to pin down whether W46's written numbers went stale or this box's collection environment (optional
+  deps, `hypothesis`, something parametrized off a directory listing) has simply drifted since that
+  entry was authored — not done, since it doesn't change this wave's own verdict. Left open for
+  whoever next needs a clean baseline to reconcile against.
+
+STATE AT HANDOFF: three commits, one per part, each independently revertible on a live-money system
+(`W47: numeric-pairs-07 ...`, `W47: bot-day-09 + money-flow-02 ...`, `W47: bot-day-10 ...`), plus
+this entry. **NOT RUNNING** — nothing on the Windows box is restarted by me; the bot restart is the
+operator's call per the standing rule, and Part 3 changes the trading loop's task structure, so it
+needs a full bot restart (not a hot reload) to take effect. Scope boundaries a future session should
+not misread as more than they are: the position-pass lock is deliberately NOT held across
+`_trading_cycle`'s entry-scan tail — widening it there would silently reintroduce this wave's own
+defect from the other direction; the marks-missing MTM skip deliberately declines to evaluate rather
+than evaluating on degraded data — do not "improve" it into a best-effort estimate without re-reading
+why that was rejected; `bot-day-09`'s shutdown-stamp half is **registered, not fixed**, for the
+reason given above under finding 2.
+
+NEXT: **W48** — `trade-life-commission-trueup-gate-measures-wrong-quantity` Path A (per the residue
+column in the 2026-09-21 REGISTER CORRECTION entry: `orchestrator.py:3924` still gates the deferred
+true-up on execution-row COUNT rather than commission presence) + `trade-life-credit-econ-floors-
+signal-time-only` restate half (capital-at-risk still never restated from the ACTUAL fill, stays
+signal-time). Per the roadmap (PLAN.md:6696): both move go-live scorecard inputs, so they want
+landing before more of the 50-close sample accrues. Re-verify against HEAD before scoping — nothing
+about W48 has been re-checked this session, same discipline every wave since W41 has needed.
+
+No inspect.getsource.
