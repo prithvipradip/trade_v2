@@ -225,6 +225,18 @@ meta_label:
   min_probability: 0.50                # Min P(profitable) to take a trade (0.30-0.80)
   retrain_with_primary: true           # Retrain when primary model retrains
 
+earnings:
+  # W44 (R26 fail-direction-03/concurrency-4): unknown earnings data (never
+  # fetched, or the last fetch failed with no usable last-known-good) now
+  # refuses new entries for that symbol instead of silently allowing. Costs
+  # nothing on the current ETF-only universe (SPY/QQQ/IWM have no earnings,
+  # so their last-known-good already says so); protects the day single names
+  # return. Flip to false to restore the pre-W44 always-allow behavior.
+  refuse_entries_when_data_unavailable: true
+  lkg_max_age_hours: 168               # Reuse a confirmed fetch for up to a week before treating it as unknown again
+  buffer_days_before: 2                # Block entries / flag exits starting N days before a known earnings date
+  buffer_days_after: 1                 # Keep the danger zone open N days after earnings (post-print IV settling)
+
 exit:
   exit_cross_amount: 0.10             # How far combo exits cross the spread to guarantee fills (was hardcoded)
   # W7/R24 logic-exit-risk-01: credit buyback ceiling as a multiple of the

@@ -452,6 +452,35 @@ class MetaLabelConfig(_StrictModel):
     retrain_with_primary: bool = True  # Retrain when primary model retrains
 
 
+class EarningsConfig(_StrictModel):
+    """W44 (R26 fail-direction-03): EarningsCalendar used to build an
+    identically-shaped "unknown" answer whether a symbol genuinely has no
+    upcoming earnings or the Yahoo fetch broke, and both gates read unknown
+    as "allow" -- a fetch outage silently removed earnings protection. Fixed
+    with a last-known-good: a fetch failure now reuses the most recent
+    successful answer (which, for the ETF-only live universe, already says
+    "no earnings" -- so an outage costs nothing there) and only refuses when
+    there is no good answer to fall back on."""
+
+    refuse_entries_when_data_unavailable: bool = Field(default=True,
+        description="Refuse new entries for a symbol when its earnings data "
+                    "is unknown (never fetched, or the fetch failed with no "
+                    "usable last-known-good). Operator escape hatch if this "
+                    "ever misfires live -- flip to False to restore the old "
+                    "always-allow behavior without a code deploy.")
+    lkg_max_age_hours: int = Field(default=168, ge=1, le=720,
+        description="How long a successful earnings fetch may be reused "
+                    "after a later fetch fails. Earnings dates move rarely, "
+                    "so a week-old confirmed answer beats refusing entries "
+                    "outright; past this, treat the symbol as unknown again.")
+    buffer_days_before: int = Field(default=2, ge=0, le=10,
+        description="Block new entries/flag exits starting this many "
+                    "calendar days before a known earnings date.")
+    buffer_days_after: int = Field(default=1, ge=0, le=10,
+        description="Keep the earnings danger zone open this many calendar "
+                    "days after the earnings date (post-print IV settling).")
+
+
 class SentimentConfig(_StrictModel):
     """R12-C tombstone: the sentiment stack (ait.sentiment, ib_news,
     fundamentals_db) is retired to deprecated/src/ — verified zero influence
@@ -666,6 +695,7 @@ class Settings(_StrictModel):
     backtest: BacktestConfig = BacktestConfig()
     ml: MLConfig = MLConfig()
     meta_label: MetaLabelConfig = MetaLabelConfig()
+    earnings: EarningsConfig = EarningsConfig()
     exit: ExitConfig = ExitConfig()
     learning: LearningConfig = LearningConfig()
     sentiment: SentimentConfig = SentimentConfig()

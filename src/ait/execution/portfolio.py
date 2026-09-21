@@ -777,8 +777,15 @@ class PortfolioManager:
                     if 0 <= days_to_earnings <= 2:
                         should_exit = True
                         exit_reason = f"pre_earnings_iv_crush (days={days_to_earnings}, pnl={pnl_pct:.1%})"
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001
+                # W44: this is the EXIT side, so it deliberately stays
+                # fail-open (never refuse or force an exit on bad earnings
+                # data — both are worse than just skipping the early-close
+                # opportunity this pass). Was a silent `pass`; a persistent
+                # failure here was invisible. Logged, not alerted: a single
+                # miss just means this position rides to its normal exit
+                # rule instead of the 2-day-early IV-crush close.
+                log.warning("earnings_iv_crush_check_failed", symbol=trade.symbol, error=str(e))
 
         # 3d. Macro event flatten — close short-premium positions 1 day before
         # FOMC/CPI/NFP to avoid vol expansion. DISABLED for data-collection

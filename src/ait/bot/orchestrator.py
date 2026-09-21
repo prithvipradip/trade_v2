@@ -321,7 +321,13 @@ class TradingOrchestrator:
         # Sentiment
 
         # Calendars — needed by portfolio for event-driven exits
-        self._earnings = EarningsCalendar()
+        self._earnings = EarningsCalendar(
+            buffer_days_before=settings.earnings.buffer_days_before,
+            buffer_days_after=settings.earnings.buffer_days_after,
+            refuse_entries_when_data_unavailable=(
+                settings.earnings.refuse_entries_when_data_unavailable),
+            lkg_max_age_hours=settings.earnings.lkg_max_age_hours,
+        )
         self._economic_cal = EconomicCalendar()
 
         # SEC EDGAR 8-K monitor — flatten positions on material events
@@ -1895,7 +1901,22 @@ class TradingOrchestrator:
 
         # Check earnings proximity — skip if too close to earnings
         if self._earnings.is_near_earnings(symbol):
-            log.info("skipping_near_earnings", symbol=symbol)
+            # W44 (fail-direction-03): is_near_earnings() also returns True
+            # when the symbol's earnings data is unknown (refuse-on-unknown
+            # policy) -- distinguish that from a normal earnings skip so an
+            # outage pages instead of logging as routine.
+            info = self._earnings.get_next_earnings(symbol)
+            if not info.data_available:
+                log.warning("earnings_data_unavailable_entry_refused", symbol=symbol)
+                if self._alert_gate("earnings_data_unavailable", interval_s=3600):
+                    await self._send_notification(
+                        f"EARNINGS DATA UNAVAILABLE for {symbol} — no confirmed "
+                        f"earnings answer and no usable last-known-good. New "
+                        f"entries for this symbol are being refused FAIL-CLOSED "
+                        f"until this clears. Exits are unaffected."
+                    )
+            else:
+                log.info("skipping_near_earnings", symbol=symbol)
             return
 
         # Meta-label gate: ask secondary model if this signal is worth taking.
@@ -3093,7 +3114,22 @@ class TradingOrchestrator:
             from datetime import date as date_cls
             expiry_date = signal.expiry if isinstance(signal.expiry, date_cls) else date_cls.fromisoformat(str(signal.expiry))
             if self._earnings.would_hold_through_earnings(signal.symbol, today_et(), expiry_date):
-                log.info("trade_blocked_earnings", symbol=signal.symbol, expiry=str(signal.expiry))
+                # W44 (fail-direction-03): same distinction as the
+                # is_near_earnings gate in _scan_symbol -- an outage pages,
+                # a normal earnings block just logs.
+                info = self._earnings.get_next_earnings(signal.symbol)
+                if not info.data_available:
+                    log.warning("earnings_data_unavailable_entry_refused", symbol=signal.symbol)
+                    if self._alert_gate("earnings_data_unavailable", interval_s=3600):
+                        await self._send_notification(
+                            f"EARNINGS DATA UNAVAILABLE for {signal.symbol} — no "
+                            f"confirmed earnings answer and no usable "
+                            f"last-known-good. New entries for this symbol are "
+                            f"being refused FAIL-CLOSED until this clears. Exits "
+                            f"are unaffected."
+                        )
+                else:
+                    log.info("trade_blocked_earnings", symbol=signal.symbol, expiry=str(signal.expiry))
                 return True  # symbol blocked through earnings
 
         # Build trade request for risk validation

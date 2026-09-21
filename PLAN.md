@@ -7148,3 +7148,141 @@ hold, and one thing not previously cited was found in this pass:
 STATE AT HANDOFF: no code in this entry. NEXT: **W44**, using the pre-scoping immediately above
 rather than re-deriving it from scratch — but still verify against HEAD before writing tests, the
 same rule this note itself is an example of.
+
+---
+
+## 2026-09-21 - W44: fail-direction-03 + concurrency-4 — earnings fail-open gates, one root cause
+
+Planned in full via EnterPlanMode before any code (Context / Approach / Files / Tests /
+Verification / PLAN.md sections), approved, then implemented exactly as planned with one
+mid-implementation correction (finding 3 below). Re-verified against HEAD before writing anything,
+per the discipline every wave since W41 has needed — the pre-scoping note above held up, plus one
+new discovery that changed the fix design (finding 3).
+
+**1. `fail-direction-03`** — `EarningsCalendar` (`src/ait/data/earnings.py`) built the IDENTICAL
+`EarningsInfo(next_earnings_date=None)` shape whether a symbol genuinely has no upcoming earnings
+(every ETF in the live universe) or the Yahoo fetch broke, and cached either one for the full
+6-hour TTL. Both gates (`is_near_earnings`, `would_hold_through_earnings`) then read "no date" as
+"allow" — a fetch outage silently removed earnings protection for up to 6h, and the outage was
+invisible (the `_bg` failure log was `log.debug`, and nothing paged).
+
+**2. `concurrency-4`** — `TTLCache` (`src/ait/data/cache.py`) had no lock, while `earnings.py` is
+the one `src/ait/data/` consumer that writes into a cache instance from a background thread
+(`get_next_earnings`'s cold-miss-inside-a-running-loop path) concurrently with the main thread's
+own reads/writes of the SAME instance. `concurrency-4` is the mechanism that makes
+`fail-direction-03`'s fail-open reachable — not a separately-sequenced finding.
+
+**3. Design correction found during planning, not sketched in the original roadmap**: the live
+universe is ETF-only (`config.yaml:19`, `[SPY, QQQ, IWM]`, per the operator's 2026-07-22 decision
+at `config.yaml:15-18` taken specifically to avoid single-name earnings gaps) — a blunt "unknown ⇒
+refuse" would have refused 100% of entries forever, since ETFs have no earnings. Checked live
+against yfinance before choosing a fix: `SPY`/`QQQ`/`IWM` return an **empty dict** from
+`ticker.calendar` (yfinance swallows Yahoo's 404 internally, does not raise); `AAPL` returns a
+populated dict with a real `Earnings Date` key. So confirmed-absence and fetch-failure are already
+distinguishable today — the code just built the same shape for both. Operator decision (this
+session, via AskUserQuestion): **last-known-good-aware fail-closed** — an unknown answer refuses
+new entries UNLESS the most recent successful fetch is still fresh, in which case that answer
+(which for every ETF today says "no earnings") is reused. This closes the finding for real
+(single-name protection) at zero cost to the current universe, unlike a VIX-style blunt
+fail-closed, which would halt all entries during a Yahoo-wide outage regardless of whether the
+traded symbols have any earnings risk at all.
+
+PROOF (pre-fix reproductions, run against HEAD before any change):
+- `EarningsInfo` had no way to distinguish the two cases — confirmed by reading `_fetch_earnings`
+  (`earnings.py:189-194` pre-fix): both the "no data found" return and the `except Exception`
+  return built `EarningsInfo(symbol=symbol, next_earnings_date=None)`, byte-identical.
+- `TTLCache` race: a 6-thread stress test (`set()`/`get()` in a tight loop against a shared
+  instance, `max_size=8` to force every `set()` through the eviction path, `sys.setswitchinterval
+  (1e-6)` to maximize GIL handoff frequency) reliably reproduced `RuntimeError: dictionary changed
+  size during iteration` / `RuntimeError: dictionary keys changed during iteration` plus
+  consequential `KeyError`s, in 3/3 runs against the unlocked cache. A single precisely-timed
+  interleaving (spawn one interloper thread, sleep, evict) was tried FIRST and did NOT reproduce
+  reliably — the unlocked interloper thread simply raced to completion inside the pause window
+  rather than landing mid-iteration; replaced with the stress design before it went in the suite.
+- Third earnings-gate consumer confirmed (not previously cited before this session):
+  `execution/portfolio.py:769`, the exit-side "IV crush pre-close" check, wrapped in a bare
+  `except Exception: pass` (`:780-781` pre-fix) — a persistent failure there was completely silent.
+
+Fix (`src/ait/data/cache.py`, `src/ait/data/earnings.py`, `src/ait/config/settings.py`,
+`config.yaml`, `src/ait/bot/orchestrator.py`, `src/ait/execution/portfolio.py` — 232
+insertions/39 deletions across the 6 files):
+- `TTLCache` gained a `threading.RLock` (reentrant: `set()` calls `_evict_expired()` while already
+  holding it). `get()` reads under the lock, does the pandas `.copy()` after releasing (unchanged
+  hold-time discipline for the `options_chain`/`market_data` consumers). Eviction/expiry semantics
+  unchanged — `tests/test_cache.py` untouched and still green.
+- `EarningsInfo` gained `data_available: bool = True`. False only from the `_fetch_earnings`
+  exception path and the async cold-miss placeholder; the "no data found" path keeps the default
+  True — a confirmed absence is a real answer.
+- `EarningsCalendar` gained `self._last_good: dict[symbol -> (EarningsInfo, fetched_at)]`,
+  independent of the TTL cache so a later failure can fall back to it. `_remember()` only ever
+  caches a `data_available=True` result — a failure can no longer poison the 6h cache. `_unavail
+  able()` serves the LKG if within `lkg_max_age_hours`, else returns the unknown sentinel. Applied
+  uniformly to BOTH the async and sync call branches (an implementation gap found while writing
+  tests: the sync branch originally returned the raw failed fetch directly, bypassing LKG entirely
+  — fixed before it shipped, so "sync callers fetch inline" no longer means "sync callers skip the
+  LKG policy").
+- New `EarningsConfig` (`settings.py`, house pattern: `Field(...)` + `description=` recording why)
+  and `config.yaml` `earnings:` section: `refuse_entries_when_data_unavailable: true` (the
+  operator's escape hatch — flip to restore pre-W44 always-allow with no deploy),
+  `lkg_max_age_hours: 168`, plus `buffer_days_before`/`buffer_days_after` relocated from
+  `EarningsCalendar`'s bare constructor defaults (pure move, semantics pinned by existing +
+  new tests). `orchestrator.py`'s `EarningsCalendar()` construction now threads all four through.
+- Both entry gates (`orchestrator.py` — `is_near_earnings` call in `_scan_symbol`,
+  `would_hold_through_earnings` call in `_try_execute`) now distinguish an outage from a normal
+  earnings skip: `log.warning("earnings_data_unavailable_entry_refused", ...)` + `_alert_gate` +
+  `_send_notification`, worded like the R22 VIX-outage precedent (`_get_vix_lkg`,
+  `orchestrator.py:2651-2690`) — what broke, what it means, what is unaffected. A normal earnings
+  block still just logs `skipping_near_earnings`/`trade_blocked_earnings` at info, unchanged.
+- Exit side (`portfolio.py:763-781`) deliberately stays fail-open — refusing or forcing an exit on
+  bad data is worse than skipping one pass's early-close opportunity. Only the silence changed:
+  `except Exception: pass` → `log.warning("earnings_iv_crush_check_failed", ...)`.
+
+VERIFICATION:
+- `python -m compileall -q src tests/test_w44_earnings_fail_direction.py` clean.
+- `python scripts/typecheck.py` → `OK: no [attr-defined/call-arg/name-defined] errors`.
+- New file `tests/test_w44_earnings_fail_direction.py`, 10 tests: failed-fetch-not-cached; the
+  LKG-aware policy (confirmed-absence allows, LKG-with-a-date still blocks after a later failure,
+  never-fetched refuses, ETF LKG survives an outage, stale-LKG-beyond-max-age falls back to
+  refuse, the escape hatch restores pre-W44 behavior); the concurrency stress reproduction; the
+  `TTLCache` lock structural guard + its anti-vacuity companion (mirrors W42's
+  `RANGE_GATED_STRATEGIES` guard shape). Plus the adjacent existing consumers: `tests/test_cache.py`,
+  `tests/test_hot_path_smoke.py`, `tests/test_r17_live_fixes.py`, `tests/test_w41_live_money_floors.py`
+  — 67 total, all green.
+- Mutation-proof, both fixes, done by `git stash push -- <file>` (temporary revert, not a hand
+  edit) then restore:
+  - `cache.py` reverted: the concurrency stress test failed 3/3 repeated runs (`RuntimeError`s +
+    `KeyError`s as above); the AST lock guard failed (correctly — its own anti-vacuity companion
+    stayed green throughout, proving the detector itself was never the broken part). Restored,
+    10/10 green across 3 repeated runs (stress tests earn repetition, not a single pass).
+  - `earnings.py` reverted: 6 of 7 `TestFailedFetchNeverCached`/`TestLkgAwareGatePolicy` tests
+    failed (`TypeError` on the new constructor kwargs / `EarningsInfo` field, `AttributeError` on
+    `.data_available`). The 7th (`test_confirmed_no_earnings_allows_both_gates`) correctly stayed
+    green on both sides of the revert — it is a control proving old good behavior survived, not a
+    claim about the new behavior, and was not expected to flip.
+- Full fast lane, count taken by RUNNING it, not computed by hand (W40's own one miss, still the
+  standing rule): **1 failed, 2201 passed, 45 skipped, 153 deselected**. Arithmetic reconciles
+  exactly: 2201 − 10 (this wave's new tests) = 2191, matching a prior session baseline precisely —
+  zero regressions elsewhere. The 1 failure is
+  `test_r19_config_authority.py::TestContractIsTheSingleAuthority::test_applier_and_readers_share_one_table`,
+  re-confirmed this session (root-caused in the continuity note above, and independently documented
+  in this ledger since before W16 — see PLAN.md:2229-2239, :3143-3146) as a local, gitignored `.env`
+  artifact (`AIT_MARKET_DATA_TYPE=3` overriding the contract's `4`), unrelated to this wave.
+- `python scripts/smoke_deploy.py` → `SMOKE PASS (13 checks)`, including the `no_writes(both DBs)`
+  check — neither `data/ait_state.db` nor `data/ait_analytics.duckdb` was touched.
+
+STATE AT HANDOFF: both findings closed — the poisoned-cache reproduction and the concurrency race
+reproduction both stop reproducing post-fix, confirmed by mutation testing rather than by the
+existence of a patch. Config-driven, with an operator escape hatch
+(`earnings.refuse_entries_when_data_unavailable`) if the fail-closed policy ever misfires live.
+**Read this before touching the policy again**: it is LKG-aware on purpose — a future session
+simplifying this back to a blunt "unknown ⇒ always refuse" would silently re-arm a full-entries
+halt on any Yahoo outage, something this design specifically avoids for the ETF-only universe.
+
+NEXT: **W45** — `bot-day-05` (exit order placed before the crash-safety CAS — the single most
+dangerous item in the roadmap batch, a reversal not a reporting bug) + `bot-day-08`
+(foreign-clientId sweep protected only by an undocumented library cache side effect). Both live in
+the reconciler/exit path and share fixtures per the roadmap table in the 2026-09-21 REGISTER
+CORRECTION + ROADMAP entry — re-verify against HEAD before scoping, same discipline this wave and
+every wave since W41 has needed; nothing about W45 has been re-checked yet.
+
+No inspect.getsource.
