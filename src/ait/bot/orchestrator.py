@@ -354,7 +354,12 @@ class TradingOrchestrator:
             _spread_env = float(_os_g5.environ.get("AIT_LIQ_MAX_SPREAD", "0.15"))
             _vol_env = int(_os_g5.environ.get("AIT_LIQ_MIN_VOLUME", "10"))
             _spread_cfg = float(getattr(settings.options, "max_bid_ask_spread_pct", 0.15) or 0.15)
-            if _spread_env > 0.15 or _vol_env < 1 or _spread_cfg > 0.15:
+            # W42 (R26 policy-vs-impl-4): docs/RUNBOOK.md:153 documents this
+            # gate as "AIT_LIQ_MIN_VOLUME >= 10" and claims the live-mode
+            # startup assertion enforces it. It was `< 1`, so any value 1-9
+            # passed — the volume half of the documented floor was never
+            # actually asserted; only the spread half was.
+            if _spread_env > 0.15 or _vol_env < 10 or _spread_cfg > 0.15:
                 raise RuntimeError(
                     "LIVE-PROFILE ASSERTION FAILED: liquidity gates are still "
                     f"paper-relaxed (AIT_LIQ_MAX_SPREAD={_spread_env}, "
@@ -2061,7 +2066,14 @@ class TradingOrchestrator:
                     # still vetoing entries. With gates off, ML observes; never vetoes.
                     if self._settings.ml.entry_gates_enabled:
                         for s in signals:
-                            if s.strategy_name in ("iron_condor", "short_strangle"):
+                            # W42 (R26 set-membership-6): was a bare literal —
+                            # a fourth independent copy of the range-gated set,
+                            # alongside RANGE_GATED_STRATEGIES (:68) and the
+                            # neutral-only filter below, which can only be
+                            # non-empty because THIS check populated
+                            # model_overridden from the SAME set. A drift here
+                            # silently breaks that agreement.
+                            if s.strategy_name in RANGE_GATED_STRATEGIES:
                                 s.confidence = range_pred.probability_in_range
                                 model_overridden.add(s.strategy_name)
 
@@ -2160,7 +2172,12 @@ class TradingOrchestrator:
             if neutral_only:
                 signals = [
                     s for s in signals
-                    if s.strategy_name in ("iron_condor", "short_strangle")
+                    # W42 (R26 set-membership-6): the finding's own "must
+                    # agree" pair — this filter's set has to match the one
+                    # above that populates model_overridden, or a neutral
+                    # strategy added to one but not the other silently loses
+                    # every signal here.
+                    if s.strategy_name in RANGE_GATED_STRATEGIES
                     and (s.strategy_name in model_overridden
                          or not self._settings.ml.entry_gates_enabled)
                 ]
@@ -3042,7 +3059,8 @@ class TradingOrchestrator:
         # confidence (~0.65-0.75 scale) — requiring 0.85 structurally banned
         # iron condors for the whole first hour. Gate directional signals
         # only. (Also ET-pinned per BC-M3.)
-        _neutral = signal.strategy_name in ("iron_condor", "short_strangle")
+        # W42 (R26 set-membership-6): third independent copy of the same set.
+        _neutral = signal.strategy_name in RANGE_GATED_STRATEGIES
         if hour_min < 10.5 and not _neutral and confidence < 0.85:
             log.info("first_hour_confidence_gate",
                      symbol=signal.symbol, confidence=f"{confidence:.2f}",

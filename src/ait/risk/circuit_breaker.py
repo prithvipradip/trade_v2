@@ -31,6 +31,12 @@ class CircuitBreakerStatus:
     daily_pnl: float
     consecutive_losses: int
     api_failures: int
+    # W42 (R26 fail-direction-10 residual): False means the last persist
+    # attempt failed — this process's state, possibly including an active
+    # trip, is not on disk. No existing consumer pages on this yet; it is
+    # exposed here so one can without CircuitBreaker growing its own notify
+    # wiring.
+    store_write_healthy: bool = True
 
 
 class CircuitBreaker:
@@ -62,6 +68,13 @@ class CircuitBreaker:
         # attach_state() is the seam the RiskManager uses for the live wiring.
         self._state = None
         self._state_unreadable = False  # W14: set when a load fails
+        # W42 (R26 fail-direction-10 residual): set when a WRITE fails — the
+        # sibling of _state_unreadable, for the other direction. Distinct
+        # because a write can fail while the store is still perfectly
+        # readable (a momentary lock on this process's own attempt), so
+        # _state_unreadable's re-read machinery (_maybe_reload) never
+        # observes it and never clears it.
+        self._persist_write_failed = False
         if state is not None:
             self.attach_state(state)
 
@@ -165,8 +178,24 @@ class CircuitBreaker:
             return
         try:
             state.set_state(self.STATE_KEY, self._blob())
+            # W42 (R26 fail-direction-10 residual): clear on the NEXT success,
+            # not immediately — _persist() runs again on its own the next time
+            # any state-changing method calls it (record_trade_result, trip,
+            # reset), so there is no separate retry queue to build; this just
+            # stops the failure from being invisible in between.
+            self._persist_write_failed = False
         except Exception as e:  # noqa: BLE001
-            log.warning("circuit_breaker_state_persist_failed", error=str(e))
+            # W42: was log.warning with nothing else — a write failure here
+            # means this process's OWN in-memory state (which may include an
+            # active trip) is not on disk, so a crash before the next
+            # successful persist loses it exactly like regress-live-04 did
+            # before W14. Bumped to log.error and made queryable via
+            # get_status().store_write_healthy, since nothing pages on it yet
+            # (see PLAN.md — the paging half is a registered residual, not
+            # claimed fixed here: this component has no notify_cb, unlike
+            # PortfolioManager/AccountManager, and _persist() is sync).
+            self._persist_write_failed = True
+            log.error("circuit_breaker_state_persist_failed", error=str(e))
 
     def _blob(self) -> str:
         return json.dumps({
@@ -270,6 +299,7 @@ class CircuitBreaker:
             daily_pnl=self._daily_pnl,
             consecutive_losses=self._consecutive_losses,
             api_failures=len(self._recent_api_failures()),
+            store_write_healthy=not getattr(self, "_persist_write_failed", False),
         )
 
     def check_daily_reset(self) -> None:

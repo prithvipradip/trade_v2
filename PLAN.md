@@ -6817,3 +6817,117 @@ NEXT: **W42** — `policy-vs-impl-4` (off-by-one volume floor), `set-membership-
 `money-flow-01` (both likely substantially closed by W14/W32/W37 — verify before writing anything,
 per this wave's own [2] lesson about testing what's already true). Full roadmap through W51 plus
 the test-honesty track is in the 2026-09-21 REGISTER CORRECTION + ROADMAP entry above.
+
+---
+
+## 2026-09-21 - W42 EXECUTED — a floor, a set, a write path, and one full retirement
+
+Second wave of the 2026-09-21 roadmap. Named as four items; re-probing first — this wave's own
+instruction — changed the shape of two of them and the scope of a third. Recorded here rather than
+silently absorbed, same discipline as the 2026-09-17 REGISTER CORRECTION entry and W41's own
+merge-vs-replace correction.
+
+[1] `policy-vs-impl-4` — exactly as described. `orchestrator.py`'s GOV-5 live-profile assertion
+    checked `_vol_env < 1` while `docs/RUNBOOK.md:153` documents the enforced floor as
+    `AIT_LIQ_MIN_VOLUME >= 10` — so 1 through 9 passed a check the RUNBOOK says should refuse
+    live-mode startup. Now `< 10`. Reproduced pre-fix is unnecessary to state separately: the
+    off-by-one is visible by inspection and the new test drives the real constructor at 9 (refuses)
+    and 10 (accepts).
+
+[2] `set-membership-6` — RE-PROBED, SCOPE CORRECTED. The finding cites "4 remaining bare literals";
+    re-reading each of the 4 current sites individually (not assumed from stale line numbers) found
+    only 3 are genuine duplicates of `RANGE_GATED_STRATEGIES` — the range-model confidence override,
+    the neutral-only filter that must agree with it, and the first-hour confidence gate. The 4th
+    (`orchestrator.py:1137`, `("iron_condor", "short_strangle", "long_straddle")`) is a DIFFERENT,
+    correctly-scoped concept: a direction-inference exemption for drift tracking (long_straddle
+    belongs there because it buys both a call and a put, not because it is range-gated — folding it
+    into `RANGE_GATED_STRATEGIES` would have been semantically wrong, not a fix). That site is also
+    the flagship offender in the getsource census (`test_r17_dormant_strategy_fixes.py:97`, whose
+    own docstring says "ties the test to the actual source, not a re-derived literal") — left for
+    that track, not touched here.
+    The 3 real sites now reference `RANGE_GATED_STRATEGIES`. TESTING NOTE: this is a zero-logic-
+    change substitution — the literal and the named constant were already identical in membership,
+    so there is no CURRENT behavior to observe; the entire risk is FUTURE drift. Proportionate
+    coverage is a STRUCTURAL AST guard (same category as W38's SQL-function guard and W28's
+    `.today()` guard — a legitimate structural check, not the source-string-as-behavior-proxy
+    pattern the house rules forbid), not a forced behavioral drive of `_scan_symbol`/`_try_execute`
+    for a change with no behavior to differ. Run against the untouched pre-fix file: the guard
+    finds bare duplicates at exactly the 3 lines fixed, nothing else.
+
+[3] `fail-direction-10` — RE-PROBED, SCOPE NARROWED DELIBERATELY. The residual named in the
+    2026-09-21 roadmap entry was real: `circuit_breaker.py`'s READ-side fail-closed behavior
+    (W14's `_state_unreadable`, W32's `_maybe_reload` re-read) is intact, but the WRITE-side
+    failure path — `_persist()`'s own `except` around `state.set_state(...)` — was untouched by
+    either wave. It logged a warning and moved on; nothing anywhere could observe that a write had
+    failed, so a crash before the next successful persist could still lose an active trip exactly
+    like `regress-live-04` did before W14, just from the opposite direction (a failing write
+    instead of a failing read).
+    Reproduced pre-fix: a `CircuitBreaker` whose store's `set_state` raises records a loss, and
+    `get_status()` afterward carries no trace at all — the field this wave adds did not exist.
+    Fixed: severity bumped `log.warning` -> `log.error`, and a `store_write_healthy` field added to
+    `CircuitBreakerStatus`, cleared on the next successful persist (mirroring how `_state_unreadable`
+    clears on the next successful read) rather than needing a separate retry queue — `_persist()`
+    already runs again on its own the next time any state-changing method calls it.
+    DELIBERATELY NOT BUILT: full paging. `CircuitBreaker` has no `_notify_cb`, unlike
+    `PortfolioManager`/`AccountManager` (wired in `TradingOrchestrator.__init__`), and `_persist()`
+    is sync, so an async notify call cannot be added to it without a larger design (async wiring
+    through a sync method, or a new consumer that polls `get_status()`). Building that now would
+    have been real scope creep past this wave's budget for one narrow, now-visible-not-invisible
+    gap. Registered as the residual, not claimed as closed.
+
+[4] `money-flow-01` — RE-PROBED AND RETIRED. NOT a fix; a full trace of the real call graph shows
+    the finding's own claim ("the reconciler books real P&L via `state.close_trade` only — zero
+    `update_daily_stats`/`record_trade_result`/PDT/commission true-up") is false at HEAD, and has
+    been false since W1: `close_trade()` (`state.py:462-472`) enqueues into `exit_outbox` in the
+    SAME transaction as the close, for every caller including the reconciler — the code comment
+    there names exactly this ("no matter which path — executor callback, reconciler, sweep,
+    crash-recovery drain — discovers it"). `_drain_exit_outbox()` (`orchestrator.py:800+`) claims
+    the row, filters non-real closes, trues up commission, buckets by session (W37), books stats
+    and the breaker in one transaction (`_book_exit_core`, W32's exactly-once), records PDT when
+    the entry was also same-day, and records Thompson.
+    Every piece the finding names as missing is present, wired, and — this is the load-bearing
+    fact — ALREADY TESTED: `tests/test_w1_booking_integrity.py::TestDrainBooksOrphanCloses::
+    test_reconciler_style_close_reaches_breaker_and_stats` seeds a trade, calls `close_trade()`
+    directly with no executor callback (exactly the reconciler's own call shape), drains, and
+    asserts `daily_stats.total_pnl`, `trades_lost`, `circuit_breaker._daily_pnl` and
+    `Thompson.record_outcome` all moved. Its own docstring: "THE R23 HEADLINE: pre-W1 this loss hit
+    trades.realized_pnl and nothing else." That test has been part of the fast lane, passing,
+    since W1 — long before this wave, long before R26's own PARTIAL tie-break on this row.
+    R24's own text for this row is truncated mid-sentence in the source document (verified:
+    `full_audit_r24_20260906.md:1689` ends "...735-745" with no continuation, no period) — whatever
+    residual it originally named cannot be recovered from that file. Rather than guess at
+    unrecoverable text, this entry stands on independent, direct verification of the current call
+    graph and the existing passing test. No new test added: asserting the same claim a second time
+    is not new evidence.
+    `trade-life-close-booking-two-owners` (R24:1690, "same W1 fix and same residue as
+    money-flow-01") retires on the same evidence — not in the roadmap's 26, noted here so it is not
+    independently re-opened later.
+
+PROOF. `tests/test_w42_live_money_floors.py`, 11 executing tests. [1] and [3] each reproduced
+against an untouched copy of their module before the fix (the volume floor's off-by-one is visible
+by inspection; the write-failure path's invisibility was reproduced directly — see above). [2]'s
+AST guard was run against the untouched pre-fix `orchestrator.py` and found bare duplicates at
+exactly the 3 lines this wave fixed. [4] required no new test. Controls named explicitly: paper
+mode is unaffected by the volume-floor fix; a floor of exactly 10 still passes; the 3-element
+direction-tracking tuple is confirmed still present and untouched; `RANGE_GATED_STRATEGIES` still
+means what the finding says it means; a healthy store never sets `store_write_healthy` false; the
+W14/W32 read-side (unreadable-store) behavior is unaffected by the write-side fix. **No
+`inspect.getsource`.**
+
+VERIFICATION. Full fast lane **2189 passed / 45 skipped / 1 failed** (920s) — the standing local-
+`.env` `test_r19_config_authority` case. Reconciled by collection: `test_w42_live_money_floors.py`
+collects 11; `2178 + 11 = 2189`. `compileall` OK; `scripts/typecheck.py` OK;
+`scripts/smoke_deploy.py` -> SMOKE PASS (13 checks).
+
+STATE AT HANDOFF: committed on `feature/event-straddle`. **NOT RUNNING** — nothing runs on this
+box. `orchestrator.py` changed again, so this needs a full supervisor restart to deploy, same as
+W41.
+
+NEXT: **W43** — `w23-et-cron-tests-build-their-own-crontrigger` (and correcting its sibling
+`w23-docstring-cites-live-evidence-this-deployment-contradicts`, whose cited log lines do not
+reproduce on the box R26 was written from but DO reproduce verbatim on this box's
+`logs/orchestrator.log`). First of the test-honesty track; no live-money urgency. Full roadmap
+through W51 is in the 2026-09-21 REGISTER CORRECTION + ROADMAP entry above; this wave leaves it
+otherwise unchanged except for retiring `money-flow-01` and narrowing `fail-direction-10`'s
+remaining scope to "wire a consumer that pages on `store_write_healthy=False`," which is smaller
+than the roadmap's original "re-persist queue + page" estimate.
