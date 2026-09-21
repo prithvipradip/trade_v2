@@ -7036,3 +7036,115 @@ subsystem (`data/earnings.py`, `data/cache.py`) rather than a narrow fix in alre
 so budget time for a fresh read of both files before trusting the original roadmap's scoping —
 same discipline W41 and W42 both needed. Full roadmap through W51 plus the remaining test-honesty
 batches is in the 2026-09-21 REGISTER CORRECTION + ROADMAP entry.
+
+---
+
+## 2026-09-21 - CONTINUITY NOTE: closing what only lived in this session's local plan file, before handoff to a new session
+
+No code. This session is ending; W44 onward continues in a new session, and CLAUDE.md's own rule is
+to start from PLAN.md's last entries, not from a summary. The 2026-09-21 REGISTER CORRECTION +
+ROADMAP entry says outright that the getsource census's batch detail and W41/W43's full technical
+specs "are in the session's plan file, not duplicated here." That plan file is
+`~/.claude/plans/staged-weaving-milner.md` — a Claude Code plan-mode artifact scoped to THIS
+session. A new session has no path to it and no way to know it exists. W41 and W43's detail is moot
+now (both shipped, in this file, in full). The getsource census detail is NOT moot — nobody has
+started that track — so it is copied below in full, not summarized. Treat the local plan file as
+gone from here on; nothing this project needs going forward should depend on it.
+
+**THE GETSOURCE CENSUS, BATCHED** (computed by direct read of all 13 files, post-dates W38's edit to
+`test_r16_tail_fixes.py` — confirmed by `git log`, no file in this list has been touched since).
+32 genuine rewrite targets across 13 files (`test_w23_scheduler_timezone.py` excluded — done, W43).
+Re-verify line numbers before deep-diving any one batch; nothing below has been re-checked since it
+was first computed, only confirmed via `git log` that the files themselves haven't moved.
+
+- **Batch A — the recorder-harness lift (~9 sites, highest leverage).** `_recorder_factory` /
+  `_run_window` (`test_r20_research_validity.py:119/125`) already drive the real
+  `WalkForwardBacktester._run_single_window` and capture the kwargs handed to `Backtester`. Lifting
+  that pair into a shared conftest helper mechanically retires the kwarg-forwarding sites:
+  `test_r20_research_validity.py:275/392`, `test_r16_research_fixes.py:140/141/222/292/316/448`.
+  One piece of infra, already proven, a third of the dangerous set.
+- **Batch B — exit-policy/engine (~7 sites).** `test_r20_research_validity.py:490/527/538/548/552`
+  + `test_r16_touch_stop.py:129/136`. Needs the async `_evaluable` fixture lifted out of
+  `test_r16_risk_fixes.py` into somewhere shared.
+- **Batch C — master.py / entrypoint (~3 sites, the expensive one).**
+  `test_r16_tail_fixes.py:727` (proves `health_check` branch behavior by *slicing source text and
+  counting occurrences* — the worst site in the census; a harness already exists from the W18/W40
+  rebuild in `test_w18_gateway_port_and_throttle.py`), `test_r16_tail_fixes.py:866` (`daily_digest`
+  — same `_run_with_alert_captured` pattern W38 already used for `_mirror_lag`),
+  `test_r16_core_fixes.py:95` (`ait.main`'s CLI entrypoint — needs new `runpy`/monkeypatched-argv
+  infra, genuinely new ground).
+- **Batch D — scattered moderates (~7 sites).** `test_w19_greeks_provenance.py:116` (rejection
+  *ordering* proven by byte-offset comparison — drive both chain shapes, assert the right reason
+  fires) and `:126`; `test_w20_host_clock_and_calendar_faults.py:346`; `test_w28_et_date_authority.
+  py:211`; `test_r19_config_authority.py:245`; `test_r17_dormant_strategy_fixes.py:97` (the
+  **flagship offender** — its own docstring says *"ties the test to the actual source, not a
+  re-derived literal,"* a documented contradiction of the house rule); `test_r16_core_fixes.py:72`.
+- **Batch E — delete-only (~6 sites, near-zero cost, fold into whichever batch touches that file).**
+  `test_r20_research_validity.py:189/490-half`, `test_r16_tail_fixes.py:421/590-half`,
+  `test_r16_research_fixes.py:159`, `test_r15_review_fixes.py:293` — each already has an executable
+  assertion in the same test proving the same claim; the source-string half is redundant, not
+  load-bearing.
+- **Leave alone (9 sites, not the anti-pattern — do not rewrite).**
+  `test_r20_research_validity.py:200`, `test_r16_tail_fixes.py:313/678`,
+  `test_r16_research_fixes.py:493`, `test_r16_round2_fixes.py:61/188`,
+  `test_w20_host_clock_and_calendar_faults.py:325`, `test_r16_risk_fixes.py:624`, and
+  `test_w28_et_date_authority.py:188` (subsumed by that same file's real AST walk at `:232-265` —
+  delete as redundant, don't rewrite).
+- Update `CLAUDE.md:116`'s stale "~37" to the corrected 32 (or lower, as batches close) after each
+  batch, not just at the end.
+- Suggested sequencing: A → E (same files, cheap) → D → B → C — each earlier batch either retires
+  sites outright or builds the shared infra the next one needs.
+
+**W44 PRE-SCOPED** (`fail-direction-03` + `concurrency-4`), fresh-read against HEAD just now, not
+carried from the original research — same discipline every wave since W41 has needed. Neither
+`src/ait/data/earnings.py` nor `src/ait/data/cache.py` has been touched since before this session
+(`git log -1`: `832f197` W28 comment-only, and `08d4aad` respectively), so the underlying claims
+hold, and one thing not previously cited was found in this pass:
+
+- `earnings.py:39` — `TTLCache(default_ttl=21600, max_size=200)`, a 6-hour TTL.
+- `earnings.py:76` — a cache miss inside a running event loop returns
+  `EarningsInfo(next_earnings_date=None)` IMMEDIATELY (fires a background thread, answers "unknown"
+  for this tick) — the cold-cache-returns-open mode.
+- `earnings.py:69` and `:79` — BOTH the background-thread path and the sync-fallback path cache
+  whatever `_fetch_earnings` returns, and `_fetch_earnings` returns the IDENTICAL
+  `EarningsInfo(None)` shape whether the symbol genuinely has no upcoming earnings (`:190`) or the
+  fetch raised an exception (`:194`, caught and logged at `log.warning` only) — a real failure and a
+  confirmed absence are indistinguishable to every caller, and either way the cache holds that
+  answer for the full 6 hours.
+- `is_near_earnings` (`:96-97`) and `would_hold_through_earnings` (`:121-122`) both read
+  `next_earnings_date is None` as "allow" — unknown fails OPEN at both entry gates.
+- **Three consumers, not two** — the third wasn't explicitly cited before: `orchestrator.py:1897`
+  (`is_near_earnings`, entry), `orchestrator.py:3095` (`would_hold_through_earnings`, entry — the
+  call site W41's `time-authority-2` regression test already covers), and
+  **`execution/portfolio.py:769`** (`get_next_earnings`, EXIT — the "IV crush pre-close" trigger
+  that closes short-premium positions 2 days ahead of earnings). Verified directly: `portfolio.py:
+  768-781` wraps the whole exit check in a bare `try/except Exception: pass`, so a fetch failure
+  silently skips the early close too, not just the entry gate. All three read the same cache, so a
+  cached failure blinds all three identically.
+- `cache.py` (73 lines, read in full): confirmed zero locking of any kind — no `Lock`/`RLock`
+  anywhere in the file. `set()` (`:40-52`) and `_evict_expired()` (`:62-67`) both iterate-and-mutate
+  `self._store`; `earnings.py`'s background-thread path (`:66-75`) calls `self._cache.set(...)` from
+  a daemon thread while the main asyncio thread can concurrently call `.get()`/`.set()` on the SAME
+  `TTLCache` instance (one cache per `EarningsCalendar`, shared) — a genuine `RuntimeError:
+  dictionary changed size during iteration` risk on `set()`'s eviction sort. NOT independently
+  re-verified this pass: the original research's claim that "one OTHER site in the codebase is
+  race-guarded with a comment, proving the class is known and unevenly applied" — that comparison
+  site is somewhere outside `cache.py` itself (which has none), not re-found here; worth confirming
+  before citing it as a contrast.
+  Unreachable today only because the universe is 3 symbols against `max_size=200` (eviction never
+  runs) — arms on universe growth or a lowered `max_size`, same trigger as `fail-direction-03`'s own
+  dormancy.
+  Fix is small: a `threading.Lock` around `get`/`set`/`_evict_expired`/`invalidate` — the cache is
+  tiny, lock contention is not a real concern.
+- Suggested fix shape for `fail-direction-03` (not verified against current constraints — re-check
+  before implementing): treat unknown-earnings as BLOCKING for entries (or await the first fetch
+  with a short timeout) rather than allow; never cache the failure shape, or cache it with a much
+  shorter TTL than a confirmed answer; page on a fetch-failure streak, since nothing pages today.
+- Do `concurrency-4` first or together with `fail-direction-03` — it is the mechanism that makes the
+  fail-open reachable at all (a race exception swallowed by `_bg`'s own `except Exception: pass` at
+  `earnings.py:70-71` is indistinguishable from a genuine fetch failure), not a separate finding to
+  sequence independently.
+
+STATE AT HANDOFF: no code in this entry. NEXT: **W44**, using the pre-scoping immediately above
+rather than re-deriving it from scratch — but still verify against HEAD before writing tests, the
+same rule this note itself is an example of.
