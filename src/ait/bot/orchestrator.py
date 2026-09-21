@@ -52,6 +52,7 @@ from ait.learning.counterfactual import CounterfactualTracker
 from ait.strategies.base import CREDIT_STRATEGIES, SignalDirection
 from ait.strategies.selector import StrategySelector
 from ait.strategies.thompson import ThompsonSampler
+from ait.utils.cadence import FAST_MONITOR_CADENCE_SECONDS
 from ait.utils.logging import get_logger
 from ait.utils.time import next_market_open, today_et
 from ait.utils.time import now_et, parse_trade_ts
@@ -1377,7 +1378,10 @@ class TradingOrchestrator:
         """
         log.info("trading_loop_starting")
         scan_interval = self._settings.trading.scan_interval_seconds
-        monitor_interval = 30  # Check positions every 30 seconds
+        # W47 numeric-pairs-07: shared authority, not a bare literal — see
+        # ait.utils.cadence for why this number must stay in lockstep with
+        # market_data's quote TTL and portfolio's marks-missing alert window.
+        monitor_interval = FAST_MONITOR_CADENCE_SECONDS
         time_since_scan = 0
 
         while self._running and self._scheduler.get_current_phase() == TradingPhase.MARKET_OPEN:

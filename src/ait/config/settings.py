@@ -13,6 +13,8 @@ import yaml
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings
 
+from ait.utils.cadence import QUOTE_STALENESS_BUDGET_SECONDS
+
 
 class _StrictModel(BaseModel):
     """R13 (human-factors lens): every config model silently IGNORED unknown
@@ -565,9 +567,11 @@ class ExitConfig(_StrictModel):
     # R14: staleness gate on exit inputs. The touch stop is the only exit rule
     # that acts DIRECTLY on the underlying's price, and it read that price with
     # no quality check at all — a frozen feed could fire it on a breach that had
-    # long since passed, or hide a real one. Budget is generous because the
-    # fast monitor runs on a 30s cadence and quotes are cached for 15s.
-    max_quote_staleness_seconds: float = Field(default=180.0, ge=30.0, le=900.0,
+    # long since passed, or hide a real one. Budget is generous (6x the fast
+    # monitor's cadence) precisely because the monitor's own cadence and quote
+    # cache TTL are what it is being generous about — see ait.utils.cadence
+    # (W47 numeric-pairs-07) for the shared authority these derive from.
+    max_quote_staleness_seconds: float = Field(default=QUOTE_STALENESS_BUDGET_SECONDS, ge=30.0, le=900.0,
         description="Underlying quote older than this (by exchange tick time) "
                     "marks the touch stop's input DEGRADED — it then needs two "
                     "agreeing ticks to fire instead of one.")

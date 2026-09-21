@@ -30,6 +30,7 @@ from ait.data.market_data import MarketDataService
 from ait.data.quality import DataQualityValidator
 from ait.risk.circuit_breaker import CircuitBreaker
 from ait.risk.pdt_guard import PDTGuard
+from ait.utils.cadence import FAST_MONITOR_CADENCE_SECONDS, MARKS_MISSING_ALERT_SECONDS
 from ait.utils.logging import get_logger
 from ait.utils.time import parse_trade_ts, today_et
 from ait.config.runtime_env import contract_flag, contract_float  # R19: ONE authority for env-contract defaults
@@ -101,7 +102,9 @@ class PortfolioManager:
         # by trade because the failure is per position, not per feed).
         self._touch_fail_alerted: set[str] = set()
 
-    MARKS_MISSING_ALERT_TICKS = 10  # ~5 min at the 30s fast-monitor cadence
+    # W47 numeric-pairs-07: derived from the shared cadence authority, not a
+    # bare literal — see ait.utils.cadence for why these must agree.
+    MARKS_MISSING_ALERT_TICKS = round(MARKS_MISSING_ALERT_SECONDS / FAST_MONITOR_CADENCE_SECONDS)
 
     async def _spot_quote(self, symbol: str, persist: bool = True) -> tuple[float | None, str]:
         """R14: the underlying's price for exit decisions, WITH a health verdict.

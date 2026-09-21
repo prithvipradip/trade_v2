@@ -29,6 +29,7 @@ from ib_insync import Stock, util
 
 from ait.broker.ibkr_client import IBKRClient
 from ait.data.cache import TTLCache
+from ait.utils.cadence import QUOTE_CACHE_TTL_SECONDS
 from ait.utils.logging import get_logger
 from ait.config.runtime_env import contract_str  # R19: ONE authority for env-contract defaults
 from ait.utils.time import today_et
@@ -229,7 +230,10 @@ class MarketDataService:
                 quote = await self._get_yahoo_quote(symbol)
 
             if quote:
-                self._cache.set(cache_key, quote, ttl=15)  # 15s cache for quotes
+                # W47 numeric-pairs-07: must stay strictly below the fast
+                # monitor's cadence (ait.utils.cadence) or two consecutive
+                # monitor passes read the same cached print.
+                self._cache.set(cache_key, quote, ttl=QUOTE_CACHE_TTL_SECONDS)
 
             return quote
 
