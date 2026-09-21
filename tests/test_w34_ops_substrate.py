@@ -481,3 +481,102 @@ class TestPreMarketReconcileNeedsABroker:
         o = _bot(connected=True)
         assert asyncio.run(o._reconcile_with_broker("pre_market")) is True
         o._reconciler.reconcile.assert_awaited_once()
+
+
+# --------------------------------------------------------------------------
+# N. W46 (bot-day-03): hang-detector startup grace + restart-budget spend
+# --------------------------------------------------------------------------
+
+def _hung_manager(monkeypatch, *, heartbeat_age_min, last_restart=None,
+                  restarts=0, max_restarts=10):
+    """A BotManager that looks alive-but-hung: is_running True, a real
+    heartbeat file staled to heartbeat_age_min, stop/start faked to record
+    calls rather than touch a real process. is_market_open forced True so
+    the branch is reached regardless of wall-clock time."""
+    import ait.utils.time as _time_mod
+    monkeypatch.setattr(_time_mod, "is_market_open", lambda: True)
+    mgr = M.BotManager()
+    calls: list[str] = []
+    monkeypatch.setattr(type(mgr), "is_running", property(lambda self: True))
+    mgr._proc = type("P", (), {"pid": 424242})()
+    monkeypatch.setattr(mgr, "stop", lambda: calls.append("stop"))
+    monkeypatch.setattr(mgr, "start", lambda: calls.append("start"))
+    mgr._last_restart = last_restart
+    mgr._restarts = restarts
+    mgr._max_restarts = max_restarts
+    hb = M.DATA_DIR / "bot_heartbeat"
+    hb.parent.mkdir(parents=True, exist_ok=True)
+    hb.write_text("")
+    stale = (datetime.now() - timedelta(minutes=heartbeat_age_min)).timestamp()
+    os.utime(hb, (stale, stale))
+    return mgr, calls
+
+
+class TestHangDetectorGraceAndBudget:
+    """A startup-anchored grace before the hang-kill can even fire, and the
+    kill now spends the same restart budget every other recovery path in
+    this file already uses, instead of bypassing it entirely — both driven
+    through the real health_check(), not asserted from reading the source.
+    """
+
+    def test_recently_restarted_boot_is_not_killed(self, monkeypatch, pages):
+        now = datetime.now()
+        mgr, calls = _hung_manager(
+            monkeypatch, heartbeat_age_min=40,
+            last_restart=now - timedelta(minutes=5))
+        mgr.health_check()
+        assert calls == [], "a boot inside the grace window must not be killed"
+        assert mgr._restarts == 0
+
+    def test_grace_expired_boot_is_killed_and_spends_budget(self, monkeypatch, pages):
+        now = datetime.now()
+        mgr, calls = _hung_manager(
+            monkeypatch, heartbeat_age_min=40,
+            last_restart=now - timedelta(seconds=M.BOT_RESTART_GRACE_S + 60))
+        mgr.health_check()
+        assert calls == ["stop", "start"]
+        assert mgr._restarts == 1
+
+    def test_never_restarted_by_this_supervisor_gets_no_grace(self, monkeypatch, pages):
+        """_last_restart is None (this supervisor instance never called its
+        own start()) falls straight through to today's behavior — matching
+        test_w20_host_clock_and_calendar_faults.py's existing
+        test_hang_detection_stays_armed_through_a_calendar_fault, which uses
+        the same bare-manager shape and must stay green unmodified."""
+        mgr, calls = _hung_manager(
+            monkeypatch, heartbeat_age_min=40, last_restart=None)
+        mgr.health_check()
+        assert calls == ["stop", "start"]
+        assert mgr._restarts == 1
+
+    def test_budget_exhausted_gives_up_instead_of_looping_forever(
+            self, monkeypatch, pages):
+        now = datetime.now()
+        mgr, calls = _hung_manager(
+            monkeypatch, heartbeat_age_min=40,
+            last_restart=now - timedelta(seconds=M.BOT_RESTART_GRACE_S + 60),
+            restarts=10, max_restarts=10)
+        mgr.health_check()
+        assert calls == [], "budget exhausted — must not attempt another restart"
+        assert mgr._restarts == 10, "must not increment past what was already spent"
+        assert any("gave up" in p for p in pages)
+
+    def test_alert_gate_throttles_the_page_not_the_recovery(
+            self, monkeypatch, pages):
+        """Two grace-expired hangs inside the same 1800s window: the page
+        must be throttled, but the recovery action (and the budget spend)
+        must fire every time — gating the page must never gate the fix."""
+        now = datetime.now()
+        clk = _Clock(monkeypatch, now)
+        mgr, calls = _hung_manager(
+            monkeypatch, heartbeat_age_min=40,
+            last_restart=now - timedelta(seconds=M.BOT_RESTART_GRACE_S + 60))
+        mgr.health_check()
+        clk.tick(minutes=2)
+        mgr.health_check()
+        hung_pages = [p for p in pages if "BOT HUNG" in p]
+        assert len(hung_pages) == 1, "the page must be throttled within 1800s"
+        assert calls == ["stop", "start", "stop", "start"], (
+            "the recovery action itself must fire every time, unthrottled"
+        )
+        assert mgr._restarts == 2

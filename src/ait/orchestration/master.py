@@ -222,6 +222,19 @@ def _alert_gate(key: str, interval_s: float, _now: float | None = None) -> bool:
 GATEWAY_RECOVERY_AFTER_S = 600.0     # 10 min down before we intervene
 GATEWAY_RECOVERY_COOLDOWN_S = 1800.0  # at most one attempt per 30 min
 GATEWAY_MAX_RECOVERIES = 3           # then escalate to a human, do not loop
+
+# W46 (bot-day-03): the hang-detector below (health_check's heartbeat-age
+# branch) had zero startup grace, so a boot slower than its own 15-min
+# staleness threshold (pre-W46: synchronous model training, up to ~7.5 min
+# per trainer.py's own R9 comment, plus reconcile/broker-probe overhead)
+# read as "hung" and got killed on the very tick that would have written the
+# first fresh heartbeat -- and the retry repeated the same slow boot, so it
+# was killed again next tick, forever. 20 min: comfortably above that
+# worst-case boot cost even after W46's own bot-day-04 fix (which removes
+# training from the blocking path but not the event loop entirely -- a fit
+# call can still hold it in bursts), without leaving a genuine hang
+# unaddressed for the better part of a session.
+BOT_RESTART_GRACE_S = 1200.0
 # W35 (R26 gateway-start-script-has-two-env-authorities): the BOOT launcher
 # (orchestration/gateway.py) locates IBC through IBC_DIR; this RECOVERY
 # launcher had its own unrelated default, so a relocated IBC booted but could
@@ -1001,16 +1014,59 @@ class BotManager:
                          error=str(_ce))
                     _mkt_open = _assume_market_open_on_clock()
                 if _mkt_open and _hb.exists():
-                    _age_min = (datetime.now() - datetime.fromtimestamp(
+                    _now_hb = datetime.now()
+                    _age_min = (_now_hb - datetime.fromtimestamp(
                         _hb.stat().st_mtime)).total_seconds() / 60
                     if _age_min > 15:
+                        # W46 (bot-day-03): a startup-anchored grace before
+                        # this branch may even fire. Without it, a boot whose
+                        # first heartbeat write takes longer than 15 min got
+                        # killed on THIS tick, and the retry repeated the
+                        # same slow boot -- killed again next tick, forever.
+                        # _last_restart is None only when this supervisor
+                        # instance never called start() itself; that gets NO
+                        # grace, falling straight through to today's
+                        # behavior (a genuinely long-stale heartbeat with no
+                        # restart-time reference has nothing to be lenient
+                        # about).
+                        if (self._last_restart is not None
+                                and (_now_hb - self._last_restart).total_seconds()
+                                < BOT_RESTART_GRACE_S):
+                            _log("info", "hang_check_grace_skipped",
+                                 age_min=round(_age_min),
+                                 since_restart_s=int(
+                                     (_now_hb - self._last_restart).total_seconds()))
+                            return
                         _log("error", "bot_hung_heartbeat_stale",
                              age_min=round(_age_min))
-                        _alert(f"BOT HUNG: trading-loop heartbeat {_age_min:.0f} "
-                               f"min stale during market hours — restarting the bot. "
-                               f"Positions were unmanaged for that window.")
+                        if _alert_gate("bot_hung_heartbeat_stale", 1800.0):
+                            _alert(f"BOT HUNG: trading-loop heartbeat {_age_min:.0f} "
+                                   f"min stale during market hours — restarting the "
+                                   f"bot. Positions were unmanaged for that window.")
+                        # W46: spend the SAME restart budget every other
+                        # recovery path in this file uses, instead of
+                        # bypassing it via the `return` below -- a genuine
+                        # hang (not just a slow-but-healthy boot, which the
+                        # grace above already exempts) must eventually
+                        # escalate to a human, not loop forever every 2 min
+                        # with the keeper reporting green throughout.
+                        if self._restarts >= self._max_restarts:
+                            _log("error", "bot_max_restarts_reached",
+                                 max=self._max_restarts)
+                            _alert(f"BOT DOWN — gave up after "
+                                   f"{self._max_restarts} restart attempts "
+                                   f"(last cause: hung heartbeat). Manual "
+                                   f"intervention needed; check bot_stdout.log.")
+                            return
+                        # W34 lesson (see _maybe_recover_gateway): the budget
+                        # counts only real attempts. No wrapping try/except
+                        # here on purpose -- if stop()/start() raises, this
+                        # increment is never reached and the exception
+                        # propagates to the existing outer handler below,
+                        # exactly as it already does today.
                         self.stop()
                         self.start()
+                        self._restarts += 1
                         return
             except Exception as _e:  # noqa: BLE001
                 _log("warning", "heartbeat_check_failed", error=str(_e))

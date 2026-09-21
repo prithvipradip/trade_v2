@@ -587,15 +587,53 @@ class TradingOrchestrator:
         except Exception as e:  # noqa: BLE001
             log.warning("reconcile_now_failed", error=str(e))
 
+    def _launch_background_training(self) -> None:
+        """W46 (bot-day-04): fire-and-forget so reconcile/exit-adoption/the
+        trading loop start immediately instead of waiting up to ~7.5 min for
+        a synchronous boot retrain. Guarded against double-launch -- run()'s
+        startup call and _pre_market()'s call can both reach this in the
+        same boot. Entry-scanning needs no new gate here: DirectionPredictor.
+        predict / RangePredictor.predict already return None while untrained
+        (ensemble.py, range_predictor.py), and _scan_symbol already treats a
+        None prediction as skip-this-symbol -- the identical shape to the
+        existing fail-direction-02 gate for the range predictor. Exits don't
+        consult these predictors at all, so they are never gated by this.
+        """
+        existing = self._training_task
+        if existing is not None and not existing.done():
+            return
+        if self._models_ready:
+            return
+
+        async def _train() -> None:
+            try:
+                ok = await self._trainer.ensure_models_ready(
+                    self._settings.trading.universe)
+                self._models_ready = bool(ok)
+            except Exception as e:  # noqa: BLE001 — must never kill the startup sequence
+                log.error("background_training_failed", error=str(e))
+            finally:
+                log.info("background_training_finished", ready=self._models_ready)
+
+        self._training_task = asyncio.create_task(_train())
+
     async def run(self) -> None:
         """Main loop — runs continuously, trading during market hours."""
         self._running = True
         from datetime import datetime as _dt
         self._started_at = _dt.now()  # for the post-restart settling guard
+        self._training_task: asyncio.Task | None = None
+        self._models_ready = False
         log.info("orchestrator_starting", mode=self._settings.trading.mode)
 
-        # Train models on startup if not yet trained (handles case where bot starts during market hours)
-        await self._trainer.ensure_models_ready(self._settings.trading.universe)
+        # W46 (bot-day-04): was a blocking `await ensure_models_ready(...)`
+        # here -- training ran to completion BEFORE reconcile, exit-order
+        # re-adoption, and the trading loop, leaving the book with zero
+        # working loss exits (AIT_CREDIT_LOSS_LIMIT defaults to 0, so the
+        # touch stop is the ONLY credit loss exit, and it only runs inside
+        # the trading loop) for the full training duration on every slow
+        # boot. Now fire-and-forget; see _launch_background_training.
+        self._launch_background_training()
 
         # Reconcile on EVERY startup, not just at pre/post-market. A restart
         # mid-day (common — Gateway drops, machine wake) otherwise leaves
@@ -766,8 +804,11 @@ class TradingOrchestrator:
             return_exceptions=True,
         )
 
-        # 5. Ensure ML models are trained
-        await self._trainer.ensure_models_ready(self._settings.trading.universe)
+        # 5. Ensure ML models are trained. W46 (bot-day-04): was a blocking
+        # await here too -- gated steps 6+ and the transition to MARKET_OPEN
+        # on the same up-to-~7.5min training run. Fire-and-forget, guarded
+        # against double-launch with run()'s own call to the same helper.
+        self._launch_background_training()
 
         # 6. Train/load meta-labeler (learns which signals to take vs skip)
         if self._meta_labeler is not None:

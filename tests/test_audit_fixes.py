@@ -61,6 +61,12 @@ def bot_manager(monkeypatch, tmp_path):
 
     monkeypatch.setattr(master, "LOGS_DIR", tmp_path)
     monkeypatch.setattr(master, "ROOT", tmp_path)
+    # W46: was unpatched, so health_check()'s hang branch read this box's
+    # REAL data/bot_heartbeat — these tests only survived because the
+    # SimpleNamespace-less bare proc made self.stop() raise, swallowed by
+    # health_check()'s own outer handler. W46 changes control flow in that
+    # exact branch; stop depending on that accident.
+    monkeypatch.setattr(master, "DATA_DIR", tmp_path)
     (tmp_path / "models").mkdir()
     # Never touch telegram or real processes
     monkeypatch.setattr(master, "_alert", lambda *a, **k: None)

@@ -7615,3 +7615,142 @@ takes it: persist the last-known-good (bot_state), or warm the cache before the 
 suppress the page while a fetch for that symbol is in flight.
 
 ---
+
+---
+
+## 2026-09-21 - W46: bot-day-03 + bot-day-04 — startup hang/protection-arming, one root cause
+
+Planned in full via EnterPlanMode before any code, approved. Two research passes plus direct reads
+of every touched function turned up two things neither the original 2026-08-25 audit nor the
+2026-09-06 R24 re-confirmation anticipated, both of which materially shrank this wave's actual
+diff versus the roadmap's own sketch. Also closes `ops-substrate-03` (R24 meta-finding: W6 was
+declared complete without fixing either of these two — the ledger-visibility half was already
+fixed by the 2026-09-21 REGISTER CORRECTION entry; this closes the underlying code half).
+
+**1. `bot-day-04`** — `run()` (`src/ait/bot/orchestrator.py:590`) awaited
+`self._trainer.ensure_models_ready(...)` synchronously (up to ~110s-7.5min per `trainer.py`'s own
+R9 comment, whenever the 7-day retrain interval lapsed / an artifact was missing / spec mismatch /
+drift) BEFORE the startup reconcile, exit-order re-adoption, and the trading loop — leaving the
+book with zero working loss exits for the whole training window (`AIT_CREDIT_LOSS_LIMIT` defaults
+to `0` → `effective_stop=-999`, confirmed unchanged, so the touch stop is the only credit loss
+exit and it only runs inside the trading loop). `_pre_market()` had an independent second call to
+the same blocking method.
+
+**2. `bot-day-03`** — `master.py`'s `health_check()` hang branch (`:995-1006` at the time of
+research) kills+relaunches the bot whenever the market is open and `data/bot_heartbeat` is >15 min
+stale, with zero startup grace (`self._last_restart`, set only in `start()`, was never read here)
+and zero restart-budget interaction (its own `return` skipped past all of `_restarts`/
+`_max_restarts`). So a boot slower than 15 minutes — which `bot-day-04` alone could cause — got
+killed on the very tick that would have written the first fresh heartbeat, and the retry repeated
+the same slow boot: killed again next tick, forever, un-escalated, with the "BOT HUNG... restarting"
+page firing unthrottled on every cycle.
+
+**Two things found only by reading the current code, not by trusting either audit's suggested
+fix:**
+- `bot-day-04`'s entry-gating half needed no new code. `DirectionPredictor.predict`
+  (`src/ait/ml/ensemble.py:141-147`) and `RangePredictor.predict` already return `None` when
+  untrained, and `_scan_symbol` (`orchestrator.py`) already treats a `None` prediction as
+  skip-this-symbol — the identical shape to the existing `fail-direction-02` gate for the range
+  predictor. Exits don't consult these predictors at all. Proven by execution (this wave's test 3
+  drives a real scan against an untrained predictor and confirms no order reaches the executor),
+  not asserted from reading.
+- `bot-day-03`'s exact grace/cooldown/budget/escalate shape already existed in `master.py`, for a
+  different purpose: `_maybe_recover_gateway` (`:658-783`), including its own W34-documented
+  ordering lesson — the budget counter must move *after* a real attempt, not before, so a
+  kill/launch that raises doesn't still spend budget. The hang-branch fix mirrors that lesson
+  directly: `self._restarts += 1` sits after `self.stop(); self.start()` with no wrapping
+  try/except, so a raise propagates to the branch's own existing outer handler and the increment
+  is simply never reached.
+
+PROOF (pre-fix reproductions via `git stash push -- <file>` / pop, mutation-checking every
+behavioral claim, not a hand-revert):
+- `bot-day-04`: with the fix stashed out, 2 of 3 non-hanging targeted tests correctly failed
+  (`AttributeError: no attribute '_launch_background_training'`); the 3rd (the untrained-predictor
+  control) correctly stayed green, since it exercises pre-existing, unchanged behavior. The 4th
+  test — driving the real `run()` with a mocked, gate-blocked `ensure_models_ready` — didn't fail
+  cleanly against the reverted code, it **hung**: pre-fix, `run()` genuinely awaits training
+  directly, so with the gate never set until after `await orch.run()` returns, it never returns.
+  Arguably stronger evidence than a clean red — a live catastrophic version of exactly the
+  "unmanaged for the whole training window" consequence the finding describes. Stopped the stuck
+  run rather than wait it out; restored the fix, all 4 green again.
+- `bot-day-03`: with the fix stashed out, all 5 targeted tests correctly failed — 3 with
+  `AttributeError: no attribute 'BOT_RESTART_GRACE_S'`, 1 on the grace-skip assertion, and 1
+  (`test_never_restarted_by_this_supervisor_gets_no_grace`) on its `_restarts == 1` half
+  specifically — its `calls == ["stop", "start"]` half correctly stayed green (matching the
+  pre-existing, still-unconditional kill for `_last_restart is None`), confirming that test
+  exercises one old invariant and one new one, precisely as designed.
+
+Fix (`src/ait/bot/orchestrator.py`, `src/ait/orchestration/master.py`, plus two existing test
+fixtures — 210 insertions/8 deletions across the 4 changed files):
+- `orchestrator.py`: new `_launch_background_training()`, guarded against double-launch (both
+  `run()`'s startup call and `_pre_market()`'s call reach it in one boot) and against relaunching
+  once `self._models_ready` is already `True`. Wraps `ensure_models_ready` in a fire-and-forget
+  `asyncio.create_task`, never lets an exception escape the task (logged, not raised — must never
+  kill the startup sequence). Both former blocking call sites replaced.
+  **Explicit scope boundary, recorded so a future session doesn't misread this as more than it
+  is**: this decouples training from the startup *sequence* — reconcile, exit re-adoption, and
+  reaching the trading loop no longer wait on it in series. It does not thread-pool-offload the
+  synchronous XGBoost/LightGBM fitting itself (`train_all_symbols` has zero
+  `run_in_executor`/`to_thread`); a fit call can still hold the event loop for its own duration
+  once the background task gets a turn. True thread offload is a materially bigger, separate change
+  (numpy/xgboost thread-safety, GIL-release behavior) neither finding asked for.
+  Side effect, not a separate fix: `_started_at` (feeds the existing 5-minute post-restart settling
+  guard) was already stamped before training — today a 7.5-minute training run silently consumed
+  the entire settling window before the first scan was even possible. This fix doesn't touch
+  `_started_at`; once training no longer blocks the loop from starting, that guard becomes live
+  again for the first time in this scenario, for free.
+- `master.py`: new `BOT_RESTART_GRACE_S = 1200.0` (20 min, the original audit's own number)
+  constant. Hang branch: grace-skip when `_last_restart` is set and recent (`_last_restart is None`
+  gets no grace, falling straight through to today's behavior — verified this keeps
+  `test_w20_host_clock_and_calendar_faults.py`'s existing hang test green unmodified, not assumed);
+  the existing page gated with `_alert_gate("bot_hung_heartbeat_stale", 1800.0)` (was unthrottled);
+  a real hang now spends `self._restarts` and, once exhausted, gives up with the same
+  `bot_max_restarts_reached` wording the bot-DOWN branch already uses, instead of looping every
+  2 minutes forever.
+- `tests/test_audit_fixes.py`: its `bot_manager` fixture patched `LOGS_DIR`/`ROOT` but not
+  `DATA_DIR` — found in passing, its two hang-adjacent tests were already running against this
+  box's real `data/bot_heartbeat`, surviving only because their bare proc made `self.stop()` raise
+  into the (until now, silent) outer handler. This wave changes control flow in exactly that
+  branch; fixed rather than continuing to rely on the accident.
+
+VERIFICATION:
+- `python -m compileall -q src` / `python scripts/typecheck.py` clean throughout.
+- New file `tests/test_w46_startup_protection_and_hang_grace.py` (4 tests) plus a new
+  `TestHangDetectorGraceAndBudget` class extending `tests/test_w34_ops_substrate.py`'s existing
+  real-`health_check()`-driving harness (5 tests) — 9 new tests total, not duplicating either
+  file's existing fixtures.
+- Full combined run of every file this wave touches or the research flagged as adjacent
+  (`test_w46_*`, `test_w34_ops_substrate`, `test_w20_host_clock_and_calendar_faults`,
+  `test_audit_fixes`, `test_w13_gateway_recovery`, `test_w18_gateway_port_and_throttle`,
+  `test_hot_path_smoke`, `test_r17_live_fixes`, `test_w35_config_and_retrain`,
+  `test_r19_state_ml_fixes`): **212 passed**.
+- Full fast lane, count taken by **running** it (the standing rule since W40): **2219 passed / 45
+  skipped / 3 failed**. One is the known long-standing local-`.env` artifact. The other two —
+  `test_watchdog.py::TestOverallHealth::test_all_healthy` and `::test_one_down_marks_overall_down`
+  — are **not** a W46 regression: this exact flake was diagnosed and registered by a prior session
+  in this project's own W30 entry (search this file for "REGISTERED, NOT FIXED" —
+  `tests/test_watchdog.py`'s fixture uses a real-wall-clock `heartbeat_timeout=5.0`, tight enough
+  to trip under a loaded ~30-40 min full-suite run; ruled out as order-dependent pollution there,
+  and independently re-confirmed clean in a later, unrelated wave's own full-lane run). Re-verified
+  here rather than assumed: passes standalone, passes in combination with every file this wave
+  touched, and `git log` confirms neither `test_watchdog.py` nor `watchdog.py` has been touched
+  since long before this session. Accounting check, same discipline as W30's own: `2212 (W45
+  close) − 2 (flaked) + 9 (this wave's new tests) = 2219` — exact match, confirming no other
+  unexplained shift anywhere in the ~2,200-test suite.
+- `python scripts/smoke_deploy.py` → `SMOKE PASS (13 checks)`.
+
+STATE AT HANDOFF: both findings closed — the background-training reproduction and the
+hang-grace/budget reproduction both stop reproducing post-fix, confirmed by mutation testing
+(including the training case's dramatic hang-not-fail-cleanly result) rather than by the existence
+of a patch. `ops-substrate-03` closed. The `test_watchdog.py` flake remains explicitly
+**registered, not fixed** (per W30's own original scoping) — still out of scope for whichever wave
+next happens to hit it; a future session should widen the fixture's margin or mock the clock
+rather than re-diagnose this from scratch.
+
+NEXT: **W47** — `numeric-pairs-07` (land first, names the 30s cadence coupling as a guard) →
+`bot-day-09` + `money-flow-02` (same `mtm_sod_*` key) → `bot-day-10` (cadence restructure, land
+last so the new guard proves it). Ordering is explicitly load-bearing per the roadmap table, not
+cosmetic — re-verify against HEAD before scoping, same discipline every wave since W41 has needed;
+nothing about W47 has been re-checked this session.
+
+No inspect.getsource.
