@@ -7449,3 +7449,73 @@ before scoping; nothing about W46 has been re-checked this session, same discipl
 W41 has needed.
 
 No inspect.getsource.
+## 2026-09-21 - W34b EXECUTED (Windows box) — W34's Gateway recovery FAILED its first live use; one launcher now, and its output is kept
+
+NUMBERING: W41-W51 are Ahmed's roadmap, so this corrective to W34 is labelled W34b rather than
+taking a number from his range.
+
+WHAT HAPPENED (2026-09-20, Sunday; market closed; QQQ condor open). Windows System log first, then
+`logs/orchestrator.log`:
+  19:05:09  System 1074  power off requested from the Start menu (user `prith`)
+  19:06:15  System 1073  "The attempt by user prith to restart/shutdown computer failed" — the
+                         power-off was ABORTED, but it had already closed the Gateway's window
+  19:08:49  gateway_down_while_bot_running port=4002 down_seconds=0        <- W34's new check, live
+  19:20:49  gateway_recovery_attempt attempt=1 down_minutes=12 wedged_process=False jvm_pids=[]
+  19:52:49  gateway_recovery_attempt attempt=2 down_minutes=44 wedged_process=False jvm_pids=[]
+  20:22:49  gateway_recovery_attempt attempt=3 down_minutes=74 wedged_process=False jvm_pids=[]
+  ...       gateway_down_while_bot_running every 2 min (94 lines) until 22:14:49 down_seconds=11160
+  22:16:09  System 6006  the box shut down for the night
+So the OUTAGE has a known cause — an aborted Windows power-off took the Gateway with it while the
+python processes survived, the same shape as the 09-17 closed-window incident. The aborted
+shutdown ended at 19:06, fourteen minutes BEFORE the first relaunch, so it does not by itself
+explain why the relaunches failed.
+DETECTION, COOLDOWN AND BUDGET ALL BEHAVED AS DESIGNED. THE RELAUNCH DID NOT: three launches, and
+30 minutes after each one there was no Gateway JVM at all and the port was still closed. Had this
+been a weekday the bot would have been blind for the rest of the session.
+
+WHY IT FAILED IS NOT KNOWN — and that is the second defect. The launcher ran with
+`stdout=DEVNULL`, and IBC overwrites `C:\IBC\Logs\IBC-3.19.0_GATEWAY-1044_.txt` on every start
+(its weekday-suffixed names stopped after the Windows 11 upgrade changed the `%DATE%` format), so
+Monday's 08:33 boot erased the only evidence. I will not guess at a cause.
+
+WHAT IS KNOWN: there were TWO launch shapes (R26
+`gateway-start-script-has-two-env-authorities-and-two-launch-shapes`). BOOT —
+`gateway.start_gateway_ibc`: `[script, "/INLINE"]`, cwd=IBC_DIR, CREATE_NO_WINDOW — has worked at
+every bot start, including 08:33 the next morning on the same install. RECOVERY —
+`Popen([script], shell=True, stdout=DEVNULL)` — takes `StartGateway.bat`'s OTHER branch
+(`start "<title>" ... DisplayBannerAndLaunch.bat`, a new console window) and is 0 for 3. W35
+unified the script PATH and I left the SHAPE alone on purpose, writing that it "has a successful
+production run (09-11)". One good run against three bad ones: that call was wrong.
+
+THE FIX: `gateway.launch_ibc_gateway(script, log_dir)` is the one launcher. Boot and recovery both
+call it, so they cannot drift again; it uses the boot shape; and it writes the launcher's output to
+`logs/gateway_launch_<timestamp>.log` (with `/INLINE` the script runs IBC inside that child, so its
+banner and any login failure land in the file). `master.start()` passes the same log dir to the
+boot path. `tests/conftest.py` now also fences `master.LOGS_DIR` to tmp_path — older supervisor
+tests drive the recovery with a mocked Popen and the REAL log dir, and would each have left a
+launcher log in the live box's `logs/`.
+
+WHAT THIS DOES NOT PROVE: that recovery will now succeed. It proves recovery uses the shape that
+boots, and that the next failure will say why. If Sunday's cause was not the launch shape (an IBKR
+weekend login window, a dialog IBC could not answer), the next outage will show it in
+`gateway_launch_*.log` instead of leaving nothing.
+
+ALSO VALIDATED HERE, per the "whoever ships runs it on the Windows box" rule: Ahmed's ten weekend
+commits (W31, W38-W44, `d7350a3..dcb86a7`) — full fast lane on this box **2201 passed / 46 skipped /
+0 failed**, typecheck OK, before anything of mine was applied on top.
+
+PROOF. `tests/test_w34b_gateway_recovery_launch.py`, 5 executing tests. Pre-fix: **3 failed / 2
+passed** (the two greens are the boot-path controls). One of the three is a real `.bat` run with no
+mocks: a launcher that prints "IBC: login failed - existing session detected" and exits 1 now leaves
+that text, and `arg1=/INLINE`, in `logs/gateway_launch_*.log`. One older test stubbed
+`ensure_gateway` as `lambda port:` and was widened to accept the new `log_dir` keyword.
+
+VERIFICATION: full fast lane in the dev worktree **2206 passed / 46 skipped / 0 failed** (384s),
+typecheck OK, zero launcher logs leaked into `logs/`.
+
+STATE AT HANDOFF: committed, fast-forwarded into the live tree (together with Ahmed's ten commits)
+and pushed. NOT running: the supervisor started at 08:33 ET holds the old launch shape, and with the
+QQQ condor in an active touch-stop exit this morning nothing is being restarted. It loads at the
+next start.
+
+---

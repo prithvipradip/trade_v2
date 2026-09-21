@@ -57,7 +57,46 @@ def wait_for_gateway(host: str = "127.0.0.1", port: int = 4002,
     return False
 
 
-def start_gateway_ibc(trading_mode: str = "paper") -> bool:
+def launch_ibc_gateway(script, log_dir=None):
+    """The ONE way this codebase starts the Gateway through IBC.
+
+    W34b. There were two launch shapes. BOOT (this one: `/INLINE`, cwd = the
+    script's directory, no console window) has worked at every bot start.
+    RECOVERY (master.py: `Popen([script], shell=True, stdout=DEVNULL)`) took
+    the script's other branch — `start "<title>" ...` in a new console — and
+    failed 3 of 3 on 2026-09-20, its first real outage: three relaunches, no
+    Gateway JVM after any of them, port down until the box was shut off. The
+    boot shape started the same Gateway on the same install the next morning.
+
+    `log_dir`: keep the launcher's output. With `/INLINE` the script runs IBC
+    in THIS child, so its banner and any login failure land in the file. On
+    2026-09-20 nothing recorded why the launches failed — the output went to
+    DEVNULL and IBC overwrites its own log on every start.
+
+    Raises on failure to launch; callers choose their own fail direction.
+    """
+    script = Path(script)
+    kwargs: dict = {}
+    out = None
+    if log_dir is not None:
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        out = open(Path(log_dir) / f"gateway_launch_{stamp}.log", "ab")
+        kwargs.update(stdout=out, stderr=subprocess.STDOUT,
+                      stdin=subprocess.DEVNULL)
+    try:
+        return subprocess.Popen(
+            [str(script), "/INLINE"],
+            cwd=str(script.parent),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            **kwargs,
+        )
+    finally:
+        if out is not None:
+            out.close()        # the child keeps its own handle
+
+
+def start_gateway_ibc(trading_mode: str = "paper", log_dir=None) -> bool:
     """Start IB Gateway via IBC (automated login).
 
     Requires IBC installed at IBC_DIR with credentials in config.ini.
@@ -68,11 +107,7 @@ def start_gateway_ibc(trading_mode: str = "paper") -> bool:
 
     log.info("gateway_starting_ibc", mode=trading_mode)
     try:
-        subprocess.Popen(
-            [str(IBC_GATEWAY_SCRIPT), "/INLINE"],
-            cwd=str(IBC_DIR),
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
+        launch_ibc_gateway(IBC_GATEWAY_SCRIPT, log_dir=log_dir)
         return True
     except Exception as e:
         log.error("ibc_start_failed", error=str(e))
@@ -99,7 +134,7 @@ def start_gateway_direct() -> bool:
 
 
 def ensure_gateway(host: str = "127.0.0.1", port: int = 4002,
-                   trading_mode: str = "paper") -> bool:
+                   trading_mode: str = "paper", log_dir=None) -> bool:
     """Ensure IB Gateway is running. Start it if not.
 
     Priority:
@@ -115,7 +150,7 @@ def ensure_gateway(host: str = "127.0.0.1", port: int = 4002,
 
     # Try IBC first (automated login via IB Gateway, not TWS)
     if IBC_GATEWAY_SCRIPT.exists():
-        if start_gateway_ibc(trading_mode):
+        if start_gateway_ibc(trading_mode, log_dir=log_dir):
             return wait_for_gateway(host, port, timeout=120)
 
     # Fallback: launch Gateway directly

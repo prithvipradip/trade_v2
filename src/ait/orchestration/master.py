@@ -753,8 +753,16 @@ class BotManager:
                 for _pid in jvm_pids:
                     _kill_pid(_pid)
                 time.sleep(5)
-            subprocess.Popen([script], shell=True,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # W34b: the SAME launcher the boot path uses, and keep its output.
+            # This was Popen([script], shell=True, stdout=DEVNULL) — the
+            # script's `start`-a-new-console branch. First real outage,
+            # 2026-09-20: three relaunches, none produced a Gateway, and
+            # nothing recorded why (see gateway.launch_ibc_gateway).
+            from ait.orchestration.gateway import launch_ibc_gateway
+            _launched = launch_ibc_gateway(script, log_dir=LOGS_DIR)
+            _log("info", "gateway_recovery_launched",
+                 pid=getattr(_launched, "pid", None),
+                 output="logs/gateway_launch_*.log")
         except Exception as e:  # noqa: BLE001 — recovery must never kill the supervisor
             _log("error", "gateway_recovery_failed", error=str(e))
             if _alert_gate("gateway_launch_failed", 1800):
@@ -854,7 +862,7 @@ class BotManager:
         # Ensure IB Gateway is running before starting bot
         from ait.orchestration.gateway import ensure_gateway
         gw_port = int(os.environ.get("IBKR_PORT", "4002"))
-        if not ensure_gateway(port=gw_port):
+        if not ensure_gateway(port=gw_port, log_dir=LOGS_DIR):
             _log("error", "bot_start_aborted", reason="gateway_not_available")
             # Alert at most once per 30 min so a long Gateway outage pings
             # once rather than every 2-min health check.

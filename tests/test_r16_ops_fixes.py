@@ -341,8 +341,9 @@ class TestForeignBotRefusal:
         gateway_calls = []
         # gateway unavailable -> start() aborts AFTER the scan guard, without
         # ever spawning — proves the guard let a clean start proceed
+        # W34b: start() now also hands the boot launcher a log dir.
         monkeypatch.setattr(gw, "ensure_gateway",
-                            lambda port: gateway_calls.append(port) and False)
+                            lambda port, **kw: gateway_calls.append(port) and False)
         mgr.start()
         assert gateway_calls == [int(os.environ.get("IBKR_PORT", "4002"))]
         assert mgr._proc is None

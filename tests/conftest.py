@@ -120,6 +120,11 @@ def _fence_supervisor_page_stamps(tmp_path, monkeypatch):
     pytest.)"""
     import ait.orchestration.master as _m
     monkeypatch.setattr(_m, "_page_stamp_dirs", lambda: [tmp_path], raising=False)
+    # W34b: the recovery launcher now keeps its output under LOGS_DIR. Older
+    # supervisor tests drive _maybe_recover_gateway with a mocked Popen and the
+    # REAL LOGS_DIR - each run would leave gateway_launch_*.log files in the
+    # live box's logs/. Same fence, same reason.
+    monkeypatch.setattr(_m, "LOGS_DIR", tmp_path, raising=False)
 
 
 @pytest.fixture(autouse=True)
