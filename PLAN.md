@@ -6614,3 +6614,98 @@ the F7 rows (W40) are all shipped. What remains, none of it assigned:
   - AN OPERATOR DECISION, not code: W31's breaker arm now pages on every funded account because
     `risk.max_position_risk_pct` (3%) exceeds `max_daily_loss_pct / 1.5` (1.33%). It is telling the
     truth; the remedy is a knob change on backtest evidence.
+
+---
+
+## 2026-09-21 - REGISTER CORRECTION + ROADMAP: the 26 unassigned live-money findings, the getsource census recount, and the W41-W51 plan
+
+No code in this entry. W40 emptied this box's *assigned* queue; three categories of genuinely
+unowned work remained (named by the operator): the `w23-et-cron-tests-build-their-own-crontrigger`
+test-honesty finding, the `inspect.getsource` census W40 didn't touch, and the register's live-money
+findings outside fix sets F1-F8. Scoping all three surfaced register data wrong enough that it needs
+correcting before any of it is planned as work — the same reason the 2026-09-17 REGISTER CORRECTION
+entry above exists, and the same rule: correct the register the moment the correction is found, not
+when the fix ships.
+
+[1] THE COUNT IS 26, NOT 23. `reports/r26_integration_20260917.md` section C is headed
+    *"C. Register live-money items outside F1-F8 (23)"* but the list under it is 26 distinct slugs
+    (`bot-day-03/04/05/08/09/10`, `money-flow-01/02/05`, four `trade-life-*`, `fail-direction-03/10`,
+    two `model-vs-reality-*`, `policy-vs-impl-4/7`, `time-authority-2/4`, `concurrency-4`,
+    `numeric-pairs-07`, `set-membership-6`, `regress-live-05`, `docs-policy-04`).
+    `full_audit_r26_20260916.md:73` independently reports `STILL_OPEN live_money = 26` — the two
+    numbers agree with each other and disagree with the section header. The header is the stale one.
+    Treat 26 as the real count going forward.
+
+[2] THE GETSOURCE CENSUS OVER-COUNTED BY 2, AND 9 OF THE REST ARE NOT THE ANTI-PATTERN. W40's entry
+    (this file, 2026-09-21, item [5]) reported "44 executable `inspect.getsource(` call sites across
+    14 test files." Re-run for this entry: two of those 44 are docstring PROSE describing an
+    already-fixed instance of the pattern (`tests/test_r16_risk_fixes.py:555`,
+    `tests/test_r16_round2_fixes.py:269` — both read *"this was `assert ... in
+    inspect.getsource(...)`"*, past tense, the fix already below them), not live call sites.
+    Real count, with `tests/test_w23_scheduler_timezone.py` pulled out to be handled on its own
+    (below): **41 sites across 13 files**. Of those, **9 are legitimate** — structural claims
+    (a call site that must NOT exist, checkable only by reading source, e.g.
+    `test_r16_round2_fixes.py:61`'s *"Structural check only — the executable coverage lives in
+    tests/test_exit_order_safety.py"*, which says so in its own docstring) or doc-presence checks
+    (`test_r16_tail_fixes.py:678`, literally named `test_regeneration_path_is_documented_in_source`).
+    Naming them so a future pass doesn't waste time rewriting them:
+    `test_r20_research_validity.py:200`, `test_r16_tail_fixes.py:313`, `test_r16_tail_fixes.py:678`,
+    `test_r16_research_fixes.py:493`, `test_r16_round2_fixes.py:61`, `test_r16_round2_fixes.py:188`,
+    `test_w20_host_clock_and_calendar_faults.py:325`, `test_r16_risk_fixes.py:624`,
+    `test_w28_et_date_authority.py:188` (this last one is also redundant — subsumed by the same
+    file's real AST walk at `:232-265` — delete rather than rewrite when reached).
+    **32 sites are the genuine rewrite target.** `CLAUDE.md:116` still says "~37" and has been wrong
+    since before this session; update it when the census is actually worked, not here.
+
+[3] SEVEN OF THE 26 ALREADY HAVE INCIDENTAL PROGRESS, AND THE LEDGER DID NOT KNOW IT. Cross-
+    referencing all 26 slugs against every wave from W1 through W40: **zero PLAN.md entries mention
+    any of the 26 by slug**, ever — except `money-flow-01` and `fail-direction-10` at their original
+    W1-era registration, and `docs-policy-04`'s seven deferred "NEXT item" queue lines. Every fix
+    below happened as a side effect of a wave aimed at something else entirely:
+
+    | Slug | Closed by | Residue |
+    |---|---|---|
+    | `time-authority-4` | W21 (`c309d31`) — `executor.py:391` now `entry_time=now_et().isoformat()` | code done; needs only a regression test |
+    | `time-authority-2` | W28 (`832f197`) — `orchestrator.py:3055` now calls `today_et()` | code done; needs only a regression test |
+    | `fail-direction-10` | W14 + W32 (`174e059`) — fail-closed trip + re-read now exist | `_persist` failure on write still drops silently, no page; needs re-probe |
+    | `money-flow-01` | W1 + W32 + W37 (`0ca47f3`) — one-transaction booking, drain no longer drops stale-dated closes | unknown; R26's own PARTIAL verdict predates both W32 and W37 — needs re-probe, not assumed closed |
+    | `trade-life-commission-trueup-gate-measures-wrong-quantity` | W37 (Path B half — deferred true-up now day-attributed) | Path A untouched: `orchestrator.py:3924` still gates on execution-row COUNT, not commission presence |
+    | `trade-life-credit-econ-floors-signal-time-only` | W4 + W27 (`4484115`) — reprice-ladder and initial-placement credit floors both now clamp | capital-at-risk is still never restated from the ACTUAL fill; stays signal-time |
+    | `set-membership-6` | `43d0409` — `RANGE_GATED_STRATEGIES` exists, used at 3 sites | 4 bare literals remain outside it (`orchestrator.py:1115/2042/2141/3023`) |
+
+    Verified directly against HEAD, not taken on the research's word, for the two claimed fully-
+    closed: `grep -n 'entry_time=' src/ait/execution/executor.py` -> `:391 entry_time=now_et()...`;
+    `orchestrator.py:3055` reads
+    `would_hold_through_earnings(signal.symbol, today_et(), expiry_date)`. Both confirmed.
+
+[4] THE ROADMAP. W41 through W51, plus a separate test-honesty track (W23's rebuild + the getsource
+    census in 5 batches). Live-money work is sequenced first per operator instruction — the 26
+    findings are real trading-dollar bugs (PDT undercounting, an MTM brake that structurally cannot
+    trip, an exit order placed before the crash-safety CAS, an assignment path that freezes nothing);
+    W23 and the census are proof-quality only, covering code that is already correct.
+
+    | Wave | Contents | Size | Notes |
+    |---|---|---|---|
+    | **W41** | `regress-live-05` (PDT history destroyed on an unreadable-store write); `time-authority-2`+`4` (test-only, per [3]); `model-vs-reality-margin-model-unimplemented` piece 1 (`can_afford` ignores `available_funds`); `model-vs-reality-ex-div-assignment-void` piece 1 (assigned stock never freezes entries); a new `max_contracts_per_trade` startup guard-rail | ~1 day | No operator decision, no re-probe. Next. |
+    | **W42** | `policy-vs-impl-4` (off-by-one volume floor); `set-membership-6` (finish, per [3]); re-probe `fail-direction-10` and `money-flow-01` (per [3]) | ~1 day | Re-probe outcomes may shrink this wave |
+    | **W43** | `w23-et-cron-tests-build-their-own-crontrigger` (+ correcting the sibling `w23-docstring-cites-live-evidence-this-deployment-contradicts` — its cited log lines do NOT reproduce on the box R26 was written from, but DO reproduce verbatim on this box's `logs/orchestrator.log:6117`/`:6305`) | ~half day | Standalone |
+    | **W44** | `fail-direction-03` + `concurrency-4` (earnings fail-open gates + the cache's missing lock, one file) | ~1 day | `concurrency-4`'s only consequence IS `fail-direction-03`'s fail-open |
+    | **W45** | `bot-day-05` (exit order placed before the crash-safety CAS — the single most dangerous item in the batch, a reversal not a reporting bug) + `bot-day-08` (foreign-clientId sweep protected only by an undocumented library cache side effect) | ~1.5 days | Reconciler/exit path, shared fixtures |
+    | **W46** | `bot-day-03` + `bot-day-04` (hang-detector has no startup grace; training blocks protection-arming) | ~1.5 days | Must be one wave — 03's kill loop re-opens 04's window every ~2 min. Closes R24's `ops-substrate-03` meta-finding too |
+    | **W47** | `numeric-pairs-07` (land first, names the cadence coupling) -> `bot-day-09`+`money-flow-02` (same `mtm_sod_*` key) -> `bot-day-10` (cadence restructure, land last so the new guard proves it) | ~2.5 days | Ordering is load-bearing |
+    | **W48** | `trade-life-commission-trueup-gate-measures-wrong-quantity` Path A + `trade-life-credit-econ-floors-signal-time-only` restate half (both per [3]'s residue column) | ~1 day | Both move go-live scorecard inputs — land before more of the 50-close sample accrues |
+    | **W49** | `policy-vs-impl-7` (30/50/100 close-count floor — docs disagree) + `docs-policy-04` (doc-only, or build `KEEPER_PAUSE` enforcement?) | ~half day once decided | NEEDS AN OPERATOR DECISION before scoping. `docs-policy-04` has been queued and deferred 7 times (this file, 4154 onward) — don't let this be the 8th |
+    | **W50** | `money-flow-05` + `trade-life-partial-slice-pnl-erased` (near-identical erasure, one fix two tests) -> `trade-life-promotion-ignores-broker-quantity` (separate, reconciler-side, more dangerous) | ~3 days | Fully de-risked by W41's guard-rail; safe to slip |
+    | **W51** | `model-vs-reality-ex-div-assignment-void` deep half (pre-ex-div check, entry block) + `model-vs-reality-margin-model-unimplemented` deep half (`whatIfOrder`, `errorEvent` subscription) | ~3-4 days | NOT a normal implementation wave — R24's critic notes zero of 16 prior audit angles ever examined the broker-protocol layer (`ibkr_client.py`/`orders.py`/`contracts.py`/`account.py`). Start with its own probe pass |
+    | **Test-honesty track** | W43 above, then the getsource census in 5 batches (recorder-harness lift ~9 sites; exit-policy/engine ~7; master.py/entrypoint ~3, the expensive one; ~7 scattered moderates; ~6 delete-only) | ~4-5 days total | No live-money urgency; interleave freely |
+
+    Batch and per-site detail for the census, and full technical specs for W41 and W43, are in the
+    session's plan file, not duplicated here — this entry's job is the register correction and the
+    sequencing, which is what a future session needs to not re-derive [1]-[3] from scratch.
+
+STATE AT HANDOFF: this entry only, committed standalone before any W41 code. No production files
+touched. No tests added — nothing here is a claim about behavior, so there is nothing to prove.
+
+NEXT: **W41** — five findings, detailed above, no operator decision and no re-probe required.
+
+No `inspect.getsource` — this entry doesn't touch test files at all.
