@@ -7584,3 +7584,34 @@ FLAT. Not running — the processes started 08:33/08:37 ET hold W32-W37. The nex
 Ahmed's W31 + W38-W45, W34b and W33b together; all were suite-green on this box first.
 
 ---
+
+## 2026-09-21 - DEPLOYED on the Windows box: everything through `0b0963b` (W31, W38-W45, W34b, W33b) — operator-approved restart, book flat
+
+PRE-FLIGHT (11:42 ET): tree clean at `0b0963b`; 0 open/working trades, 0 outbox rows; read-only
+broker client: 0 open orders, no QQQ option positions; `scripts/smoke_deploy.py` on the real
+config -> SMOKE PASS (13) — which also proves W41's GOV-6 guard admits this box
+(`max_contracts_per_trade: 1`) and W31's self-test builds real condors on the probe chain.
+HOW: stopped the supervisor first, then the bot and the three web services (5 processes); left
+`keeper_ait.bat` and the Gateway JVM alone. The keeper logged `orchestrator DOWN - relaunching` at
+11:43:51; supervisor pid 8368, bot pid 10132, `bot_launch_verified` 11:44:00. 44 seconds with no bot,
+on a flat book.
+VERIFIED RUNNING: `ibkr_connected` clientId 1, no fallback; `trading_verified` x2; reconcile
+0 matched / 0 discrepancies; `circuit_breaker_state_restored consecutive_losses=1
+daily_pnl=-503.32` — this morning's loss survived the restart, which is W32's persistence doing its
+job; `range_models_loaded horizon=9 version=range-v-20260921-083607` — W35's retrain fix, first
+artifact built at the live spec; zero errors, zero tracebacks; second scan reaches the builder and
+logs `condor_rejected_iv_rank_floor` (SPY 3.17 / floor 15).
+
+ONE OBSERVATION ON W44, FROM ITS FIRST LIVE START (Ahmed's wave; recorded, not changed). The
+earnings last-known-good store is in-memory, so it is empty after every restart. The first scan
+finds a cold cache, `get_next_earnings` returns "unknown" for that tick while its background fetch
+runs, and W44's refuse-on-unknown policy refuses entries for ALL THREE ETFs on that scan:
+  15:49:04Z earnings_data_unavailable_entry_refused SPY   (then QQQ 15:49:06, IWM 15:49:07)
+  15:49:05Z no_earnings_data SPY                          <- the fetch answering, one second later
+and the gated "EARNINGS DATA UNAVAILABLE ... FAIL-CLOSED" page goes out once. The second scan is
+clean. So W44's "costs nothing on the ETF-only universe" holds in steady state but not at start:
+every restart costs one scan of entries (~5 min) and one false page. Cheap fixes, for whoever
+takes it: persist the last-known-good (bot_state), or warm the cache before the first scan, or
+suppress the page while a fetch for that symbol is in flight.
+
+---
