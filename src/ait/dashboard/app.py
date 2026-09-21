@@ -58,6 +58,14 @@ _ET_DAY = "substr(COALESCE(exit_time, entry_time),1,10)"
 _ET_DAY_WINDOW_SQL = f"{_ET_DAY} BETWEEN ? AND ?"
 _ET_ENTRY_WEEKDAY_SQL = "strftime('%w', substr(entry_time,1,10))"
 
+# W40: the account-value read, declared so its test can EXECUTE the same text
+# the dashboard runs. It used to be pinned by substring-matching this file and
+# orchestrator.py, which forced a "KEEP THIS CALL ON ONE LINE" comment onto the
+# writer (W29 reformatted it, behaviour identical, and the test went red) —
+# the test wagging the production code. The round trip is the real contract:
+# whatever key the orchestrator writes, this must read back.
+_NLV_QUERY = "SELECT value FROM bot_state WHERE key = 'last_net_liquidation' LIMIT 1"
+
 
 # W18 (w17-11): the three local _capital_base() copies are gone. Each wrapped
 # the declared single authority in a bare unlogged `except` and fell back to a
@@ -1017,7 +1025,7 @@ def _live_vs_backtest_panel(conn: sqlite3.Connection) -> None:
         # It landed on the right number only because the AUTHORITY has a
         # live-NLV tier; the local fallback it used to call did not, so an
         # authority failure showed 196,000 against a live 723,071.
-        "SELECT value FROM bot_state WHERE key = 'last_net_liquidation' LIMIT 1",
+        _NLV_QUERY,
     )
     nlv = float(nlv_row[0]["value"]) if nlv_row else _capital_base()
     live_return_30d = (live_total_pnl / nlv) if nlv > 0 else 0

@@ -10,7 +10,18 @@ AND A CORRECTION. W17's w17-01b fixed the "consume the throttle only on a
 DELIVERED page" ordering and its commit claimed the class. There are FOUR
 sites sharing `_last_gateway_alert`; it fixed two (both inside
 _maybe_recover_gateway) and missed two — including the one that had been
-firing every two minutes for ten hours. These tests pin all four.
+firing every two minutes for ten hours.
+
+W40 CORRECTION (R26 `w18-throttle-tests-getsource-and-three-of-four-sites`).
+This docstring used to end "These tests pin all four." It was not true. The
+class EXECUTED one site (health_check), pinned two by `inspect.getsource` —
+hollow when written, and made a permanent no-op by W34, which moved those two
+pages onto their own `_last_gateway_escalation` latch so the asserted string
+vanished from the method entirely — and left the fourth, in `BotManager.start()`,
+with no assertion coverage anywhere in the suite. R26 measured that: reverting
+start() to consume-on-drop left all 308 supervisor tests green.
+All four are now driven through the real methods, and the start() site's
+mutation goes red.
 """
 from __future__ import annotations
 
@@ -83,12 +94,88 @@ class TestThrottleOrderingCoversAllFourSites:
             m.health_check()
         assert alert.call_count == 1, "a delivered page must still be throttled"
 
-    def test_the_two_recovery_sites_are_still_gated(self):
-        """W17 fixed these; pin them so a later edit cannot regress the class."""
-        import inspect
-        src = inspect.getsource(M.BotManager._maybe_recover_gateway)
-        assert src.count("if _alert(") == 2, "both recovery pages must gate on delivery"
-        assert "\n                self._last_gateway_alert = now\n                _alert(" not in src
+    def test_the_budget_exhausted_escalation_retries_after_a_dropped_page(self):
+        """W40 (R26 `w18-throttle-tests-getsource-and-three-of-four-sites`).
+
+        This replaces an `inspect.getsource` pin that counted `"if _alert("`
+        occurrences in `_maybe_recover_gateway`. It was hollow when written —
+        R26 added `or True` to both gates and the class still reported 3 passed
+        — and W34 then made it a PERMANENT no-op by moving these pages onto
+        their own `_last_gateway_escalation` latch, so the method no longer
+        contains the string `_last_gateway_alert` at all and the second
+        assertion became unconditionally true. A source-string assertion proves
+        code was WRITTEN, never that it RUNS, and decays into silence on
+        rename; this drives the real method instead.
+        """
+        m = _mgr_down()
+        m._gateway_down_since = datetime.now() - timedelta(hours=3)
+        m._gateway_recoveries = M.GATEWAY_MAX_RECOVERIES   # budget spent
+        now = datetime.now()
+
+        with patch.object(M, "_alert", return_value=False) as alert:
+            m._maybe_recover_gateway(4002, now)
+            assert m._last_gateway_escalation is None, (
+                "a dropped MANUAL ACTION page burned the 30-minute throttle — "
+                "the operator is told nothing for half an hour about an outage "
+                "automation has already given up on"
+            )
+            m._maybe_recover_gateway(4002, now + timedelta(seconds=1))
+        assert alert.call_count == 2, "the next cycle must retry a page that never landed"
+
+    def test_the_budget_exhausted_escalation_throttles_a_delivered_page(self):
+        """CONTROL: a page that DID land must still be throttled."""
+        m = _mgr_down()
+        m._gateway_down_since = datetime.now() - timedelta(hours=3)
+        m._gateway_recoveries = M.GATEWAY_MAX_RECOVERIES
+        now = datetime.now()
+
+        with patch.object(M, "_alert", return_value=True) as alert:
+            m._maybe_recover_gateway(4002, now)
+            assert m._last_gateway_escalation is not None
+            m._maybe_recover_gateway(4002, now + timedelta(seconds=1))
+        assert alert.call_count == 1, "a delivered page must still be throttled"
+
+    def test_the_start_site_retries_after_a_dropped_page(self):
+        """THE FOURTH SITE — which had no assertion coverage anywhere.
+
+        R26 measured it: reverting `BotManager.start()`'s throttle to
+        consume-on-drop left all 308 supervisor tests green, and the whole
+        suite unchanged at 8 failed / 1841 passed. The class this file is named
+        for ("covers all four sites") executed ONE.
+
+        Trap, and the reason this is not a copy of the health_check tests:
+        `ensure_gateway` is imported INSIDE start(), so patching
+        `M.ensure_gateway` silently does nothing and the real launcher runs.
+        """
+        m = _mgr_down()
+        now_before = datetime.now()
+
+        with patch("ait.orchestration.gateway.ensure_gateway", return_value=False), \
+             patch.object(M, "_scan_foreign_bot_pids", return_value=[]), \
+             patch.object(M, "_port_hint", return_value=""), \
+             patch.object(M, "_alert", return_value=False) as alert:
+            m.start()
+            assert m._last_gateway_alert is None, (
+                "a dropped 'cannot start bot — Gateway not available' page "
+                "burned the throttle, so the next attempt stays silent"
+            )
+            m.start()
+
+        assert alert.call_count == 2, "the next attempt must retry a dropped page"
+        assert m._proc is None, "premise moved: start() launched a bot without a Gateway"
+        assert now_before <= datetime.now()
+
+    def test_the_start_site_throttles_a_delivered_page(self):
+        """CONTROL: the same site must still throttle a page that landed."""
+        m = _mgr_down()
+        with patch("ait.orchestration.gateway.ensure_gateway", return_value=False), \
+             patch.object(M, "_scan_foreign_bot_pids", return_value=[]), \
+             patch.object(M, "_port_hint", return_value=""), \
+             patch.object(M, "_alert", return_value=True) as alert:
+            m.start()
+            assert m._last_gateway_alert is not None
+            m.start()
+        assert alert.call_count == 1, "a delivered page must still be throttled"
 
 
 class TestReadOnlyAlarmDoesNotFailOpen:
@@ -151,16 +238,36 @@ class TestCapitalBaseHasNoSilentFallback:
     196,000 against a live 723,071, silently, then raised to the 12th power for
     the annualised return."""
 
-    def test_no_module_carries_its_own_capital_literal(self):
-        import pathlib, re
-        root = pathlib.Path(__file__).resolve().parents[1]
-        for rel in ("src/ait/dashboard/app.py",
-                    "src/ait/monitoring/analytics.py",
-                    "src/ait/monitoring/duckdb_analytics.py"):
-            src = (root / rel).read_text(encoding="utf-8")
-            code = "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("#"))
-            assert not re.search(r'["\']196000["\']|\b196000\.0\b', code), (
-                f"{rel} still carries its own capital-base literal")
+    def test_each_module_resolves_the_base_from_the_authority(self, monkeypatch):
+        """W40 (R26 `w18-throttle-tests-getsource-and-three-of-four-sites`).
+
+        This replaces a `read_text()` regex for the literal `196000` across
+        three files. That check could not observe whether any module EXECUTES
+        a fallback, and a reintroduced one spelled `196_000`, `1.96e5` or via
+        a named constant passed it cleanly.
+
+        Executed instead: move the authority and require every module's
+        resolved base to move with it. A module holding its own literal
+        diverges here whatever its spelling. The sibling below pins identity;
+        this pins the VALUE actually returned, which is what the annualised
+        return is computed from.
+        """
+        from ait.config import runtime_env as RE
+        from ait.monitoring import analytics as AN, duckdb_analytics as DK
+
+        monkeypatch.setenv("AIT_CAPITAL_BASE", "424242")
+        RE._capital_base_cache = None  # if one exists; harmless otherwise
+
+        expected = RE.capital_base()
+        assert expected == 424242, (
+            f"premise moved: the authority no longer follows AIT_CAPITAL_BASE "
+            f"(got {expected})"
+        )
+        for name, mod in (("analytics", AN), ("duckdb_analytics", DK)):
+            assert mod._capital_base() == expected, (
+                f"{name} resolved {mod._capital_base()} while the authority "
+                f"says {expected} — it is carrying its own base"
+            )
 
     def test_all_three_resolve_through_the_single_authority(self):
         from ait.config.runtime_env import capital_base
@@ -168,12 +275,45 @@ class TestCapitalBaseHasNoSilentFallback:
         assert AN._capital_base is capital_base
         assert DK._capital_base is capital_base
 
-    def test_dashboard_reads_a_key_that_is_actually_written(self):
+    def test_dashboard_reads_a_key_that_is_actually_written(self, tmp_path, monkeypatch):
         """app.py queried bot_state['account_value'], which is never written
-        anywhere in src/. The live DB holds only 'last_net_liquidation'."""
-        import pathlib
-        root = pathlib.Path(__file__).resolve().parents[1]
-        app = (root / "src/ait/dashboard/app.py").read_text(encoding="utf-8")
-        assert "key = 'last_net_liquidation'" in app
-        writers = (root / "src/ait/bot/orchestrator.py").read_text(encoding="utf-8")
-        assert 'set_state("last_net_liquidation"' in writers, "the key must have a writer"
+        anywhere in src/. The live DB holds only 'last_net_liquidation'.
+
+        W40: this substring-matched `key = 'last_net_liquidation'` in app.py
+        and `set_state("last_net_liquidation"` in orchestrator.py. It ALREADY
+        broke once for no behavioural reason — W29 reformatted the `set_state`
+        call across three lines, behaviour identical, and the test went red
+        (PLAN.md:5073-5084 registered it for this sweep). Worse, it had pushed
+        a "KEEP THIS CALL ON ONE LINE" comment into production code: the test
+        constraining the source it was meant to observe.
+
+        The INTENT — the dashboard's key must have a writer — is unchanged, and
+        is now proved as the round trip it always was: drive a REAL trading
+        cycle, then read it back with the dashboard's OWN query. A rename on
+        either side breaks this; a reformat cannot.
+        """
+        import asyncio
+        import sqlite3
+
+        from tests.test_hot_path_smoke import build_smoke_orchestrator
+        from ait.dashboard.app import _NLV_QUERY
+
+        monkeypatch.chdir(tmp_path)          # the rig's caller contract
+        rig = build_smoke_orchestrator()
+        try:
+            asyncio.run(rig.orch._trading_cycle())
+            db_path = rig.orch._state._db_path
+        finally:
+            rig.restore()
+
+        con = sqlite3.connect(str(db_path))
+        try:
+            row = con.execute(_NLV_QUERY).fetchone()
+        finally:
+            con.close()
+
+        assert row is not None, (
+            "the dashboard's account-value query found nothing after a real "
+            "trading cycle — the key it reads has no writer again"
+        )
+        assert float(row[0]) > 0, f"the key was written but holds {row[0]!r}"

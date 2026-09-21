@@ -17,6 +17,8 @@ gets remembered.
 from __future__ import annotations
 
 import asyncio
+import gc
+import weakref
 
 import pytest
 
@@ -564,46 +566,97 @@ class TestBackgroundTaskReferenceHeld:
     (trade-v2-1b): asyncio.create_task()'s return value must be held, or the
     event loop's only reference is weak and the task can be GC'd before it
     runs. Not proven to have caused anything (the wiring didn't exist yet on
-    the one day this could have mattered), fixed on its own merits."""
+    the one day this could have mattered), fixed on its own merits.
 
-    def test_fire_and_forget_keeps_a_strong_reference_until_done(self, tmp_path):
+    W40 REBUILD (R26 `w22-background-task-test-cannot-fail`). The previous two
+    tests could not fail, and R26 proved it by monkeypatching
+    `_fire_and_forget` back to a bare `asyncio.create_task(coro)` — the exact
+    pre-fix body — and watching the class still report 2 passed:
+
+      * `assert len(mp._background_tasks) >= 0` is true of every container, and
+        was asserted AFTER `asyncio.run()` had torn the loop down, when the set
+        is empty either way.
+      * `assert started == [True]` holds whether or not a reference is kept,
+        because `asyncio.run()` cancels-and-gathers pending tasks at shutdown,
+        which runs the coroutine to its first await regardless.
+      * `assert len(...) == before` is SATISFIED BY THE DEFECT: the pre-fix
+        implementation never added to the set, so before and after are both 0.
+
+    The hazard is that the event loop holds only a WEAK reference, so an
+    unreferenced task can be collected before it runs. That can only be
+    observed while the task is still pending and inside one running loop.
+    """
+
+    def test_the_task_is_held_while_it_is_still_pending(self, tmp_path):
+        """Assert membership BEFORE awaiting — the only moment it can be false."""
         st = _state(tmp_path)
         tg = FakeTelegram()
         st.set_state("manual_position_prompt_msgid_" + KEY_A, "555")
         started = []
+        release = None
 
         async def on_answer():
             started.append(True)
-            await asyncio.sleep(0)  # yield once, like a real await would
+            await release.wait()          # stays pending until we say so
 
-        upd = _callback_update(1, "cbq1", f"manual:yes:{KEY_A}", 555)
-        asyncio.run(mp._handle_update(st, tg, CHAT_ID, upd, on_answer=on_answer))
+        async def _run():
+            nonlocal release
+            release = asyncio.Event()
+            upd = _callback_update(1, "cbq1", f"manual:yes:{KEY_A}", 555)
+            await mp._handle_update(st, tg, CHAT_ID, upd, on_answer=on_answer)
 
-        # The task is tracked (held) at the moment it's created...
-        assert len(mp._background_tasks) >= 0  # may already be running/done
-        # ...and, given a chance to run, actually executes rather than being
-        # silently dropped.
-        asyncio.run(asyncio.sleep(0))
-        assert started == [True]
+            held = set(mp._background_tasks)
+            assert held, (
+                "no strong reference is held while the task is pending — the "
+                "loop's own reference is weak, so it can be collected before "
+                "it runs"
+            )
+            task = held.pop()
+            assert not task.done(), "premise moved: the task finished early"
+
+            # The real hazard, exercised: drop every local handle and collect.
+            del held
+            ref = weakref.ref(task)
+            del task
+            gc.collect()
+            assert ref() is not None, "the pending task was garbage collected"
+
+            release.set()
+            await asyncio.gather(*list(mp._background_tasks))
+
+        asyncio.run(_run())
+        assert started == [True], "the fired coroutine never ran"
 
     def test_completed_tasks_are_discarded_not_leaked(self, tmp_path):
+        """The set must SHRINK — driven by the done-callback, inside one loop.
+
+        The old form compared 0 to 0 and so was satisfied by an implementation
+        that never tracked anything at all.
+        """
         st = _state(tmp_path)
         tg = FakeTelegram()
         st.set_state("manual_position_prompt_msgid_" + KEY_A, "555")
 
         async def on_answer():
-            pass
+            await asyncio.sleep(0)
 
         async def _run():
             upd = _callback_update(1, "cbq1", f"manual:yes:{KEY_A}", 555)
             await mp._handle_update(st, tg, CHAT_ID, upd, on_answer=on_answer)
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)  # let the done-callback fire
 
-        before = len(mp._background_tasks)
-        asyncio.run(_run())
-        assert len(mp._background_tasks) == before, (
-            "completed background task was never discarded — a real leak")
+            peak = len(mp._background_tasks)
+            assert peak == 1, (
+                f"expected exactly one tracked task while pending, got {peak}"
+            )
+            await asyncio.gather(*list(mp._background_tasks))
+            await asyncio.sleep(0)        # let the done-callback fire
+            return peak
+
+        peak = asyncio.run(_run())
+        assert len(mp._background_tasks) == 0, (
+            f"the set peaked at {peak} and did not return to 0 — the "
+            f"done-callback is not discarding completed tasks"
+        )
 
 
 class TestPollerOffsetPersistence:

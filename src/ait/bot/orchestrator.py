@@ -1477,13 +1477,14 @@ class TradingOrchestrator:
                 # go_live.py (which divides by max_concurrent_car) stays right
                 # and the dashboard disagrees with the scorecard ~72x.
                 # The back-compat fallback lives in _reporting_nlv().
-                # KEEP THE set_state CALL ON ONE LINE: test_w18_gateway_port_
-                # and_throttle::test_dashboard_reads_a_key_that_is_actually_
-                # written greps the literal `set_state("last_net_liquidation"`
-                # to prove the dashboard's key has a writer. Wrapping the call
-                # across lines breaks that substring and fails a test that has
-                # nothing wrong with its INTENT -- only its implementation.
-                # (Source-string assertion; registered for R26's F7 sweep.)
+                # W40: a "KEEP THIS CALL ON ONE LINE" instruction used to sit
+                # here, because a test grepped the literal
+                # `set_state("last_net_liquidation"` out of this file to prove
+                # the dashboard's key had a writer — so a W29 reformat with
+                # identical behaviour failed it. The test now drives a real
+                # trading cycle and reads the key back through the dashboard's
+                # own query, so this line is free to be written however it
+                # reads best.
                 _reporting = self._reporting_nlv(account_snapshot)
                 self._state.set_state("last_net_liquidation", str(_reporting))
             except Exception:  # noqa: BLE001

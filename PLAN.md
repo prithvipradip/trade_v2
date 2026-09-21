@@ -6455,3 +6455,162 @@ proof (downgrade "confirmed" to "consistent with"), and :4299-4302's gate line (
 pointing at W28, not a re-run). REGISTERED BY W39, NOT FIXED: nothing new — but note for W40 that
 `caplog` is useless against structlog, which is worth stating in the ledger where future waves
 will look for it.
+
+---
+
+## 2026-09-21 - W40 EXECUTED — R26 F7: the tests that could not fail, and four ledger retractions
+
+Last of the three waves clearing this box's R26 queue. F7 is about TEST HONESTY: tests that claim
+to prove something and cannot fail, and ledger claims resting on them. Almost no production code —
+two small changes, both made because a TEST was constraining the source it was meant to observe.
+
+THE RULE BEING APPLIED, which this project already wrote down and then broke in its own fixes
+(PLAN.md:1138): *a source-string assertion proves code was WRITTEN, never that it RUNS — and it
+decays into a silent no-op on rename.*
+
+[1] W18's THROTTLE CLASS EXECUTED ONE OF THE FOUR SITES IT CLAIMED
+    (`w18-throttle-tests-getsource-and-three-of-four-sites`). The class is named
+    `TestThrottleOrderingCoversAllFourSites` and its docstring said "These tests pin all four".
+    It executed ONE (`health_check`), pinned two with `inspect.getsource`, and left the fourth —
+    in `BotManager.start()` — with no assertion coverage anywhere in the suite. R26 measured the
+    cost: reverting `start()` to consume-on-drop left all 308 supervisor tests green, and the whole
+    suite unchanged at 8 failed / 1841 passed.
+    THE getsource PIN WAS WORSE THAN HOLLOW BY THE TIME W40 REACHED IT. It asserted
+    `src.count("if _alert(") == 2` and that a whitespace-exact literal containing
+    `self._last_gateway_alert = now` was absent from `_maybe_recover_gateway`. R26 showed it was
+    already inert (adding `or True` to both gates left the class reporting 3 passed); then W34
+    moved those two pages onto their own `_last_gateway_escalation` latch, so the method stopped
+    containing the string `_last_gateway_alert` at all and the second assertion became
+    UNCONDITIONALLY TRUE. Exactly the decay-on-rename the standing lesson names.
+    All four sites are now driven through the real methods: two over `_maybe_recover_gateway`
+    (dropped page must not burn the escalation latch; delivered page must still throttle) and two
+    over `start()`. MUTATION PROOF for the site that had none — reverting `start()` to
+    consume-on-drop, line-count preserving per PLAN.md:2569-2574 — gives **1 failed / 15 passed**,
+    the failure being `test_the_start_site_retries_after_a_dropped_page`.
+    A TRAP WORTH RECORDING: `ensure_gateway` is imported INSIDE `start()`, so patching
+    `M.ensure_gateway` silently does nothing and the real launcher runs. The test patches
+    `ait.orchestration.gateway.ensure_gateway`.
+
+[2] THE TWO `read_text()` TESTS IN THE SAME FILE, rebuilt.
+    The capital-literal one regexed three source files for `196000`; it could not observe whether
+    any module EXECUTES a fallback, and a reintroduced literal spelled `196_000` or `1.96e5` passed
+    it cleanly. It now MOVES the authority (`AIT_CAPITAL_BASE`) and requires every module's
+    resolved base to move with it — a module carrying its own diverges whatever its spelling.
+    The dashboard-key one substring-matched `key = 'last_net_liquidation'` in `app.py` and
+    `set_state("last_net_liquidation"` in `orchestrator.py`. It had ALREADY broken once for no
+    behavioural reason: W29 reformatted the `set_state` call across three lines and it went red
+    (PLAN.md:5073-5084 registered it for this sweep). Worse, it had pushed a comment into
+    PRODUCTION code — "KEEP THE set_state CALL ON ONE LINE" — so the test was constraining the
+    source it was meant to observe. That comment is gone. The test now drives a REAL
+    `_trading_cycle` through the hot-path smoke rig and reads the key back with the dashboard's OWN
+    query, which is the round trip the contract always was. A rename on either side breaks it; a
+    reformat cannot.
+    PRODUCTION CHANGE, AND THE ONLY ONE IN THIS WAVE BESIDES THE DELETED COMMENT: the dashboard's
+    account-value SQL is declared as `_NLV_QUERY` so the test binds the exact text the app runs —
+    the same pattern W38 used for `_ET_DAY_WINDOW_SQL`, and the alternative to reading source.
+
+[3] W22's BACKGROUND-TASK CLASS COULD NOT FAIL (`w22-background-task-test-cannot-fail`). Three
+    assertions, none of which could go red:
+      * `assert len(mp._background_tasks) >= 0` — true of every container, and asserted AFTER
+        `asyncio.run()` had torn the loop down, when the set is empty either way.
+      * `assert started == [True]` — holds whether or not a strong reference is kept, because
+        `asyncio.run()` cancels-and-gathers pending tasks at shutdown and runs the coroutine to its
+        first await regardless.
+      * `assert len(...) == before` — SATISFIED BY THE DEFECT. The pre-fix implementation never
+        added to the set, so before and after are both 0.
+    The hazard is that the event loop holds only a WEAK reference, so an unreferenced task can be
+    collected before it runs — observable only while the task is still PENDING, inside one running
+    loop. Rebuilt that way: assert membership before awaiting, take a `weakref`, drop every local
+    handle, `gc.collect()`, require the referent to survive, then release and require the set to
+    return to 0 via the done-callback.
+    MUTATION PROOF, using R26's own regression (`_fire_and_forget` reverted to a bare
+    `asyncio.create_task(coro)`): **both rebuilt tests FAIL**, where the originals reported 2
+    passed.
+
+[4] LEDGER CORRECTIONS. Append-only, so these are corrections here and nothing above is edited.
+    (a) **PLAN.md:2811 — RETRACTED.** "a new test pins all four so the class cannot regress again"
+        is false, and was false when written. See [1]: one executed, two by source string, one
+        uncovered. The W18 FIX itself was real and is not in question; the proof claim was not.
+    (b) **PLAN.md:3921 — CORRECTED.** W22's "4 new tests" counts the class in [3] as evidence. Two
+        of those four could not fail. The `_fire_and_forget` fix at PLAN.md:3915-3916 is real,
+        correct and now genuinely covered; only the evidence claim was wrong.
+    (c) **PLAN.md:4396-4399 — DOWNGRADED from "confirmed" to "consistent with".** The W25 deploy
+        entry says *"Confirmed the RUNNING process is W25, not asserted: imported ait.risk.manager
+        from the live interpreter and read back inspect.getsource(...)"*. `inspect.getsource` reads
+        the `.py` from DISK at import-time line offsets; it cannot distinguish code loaded into a
+        running process from code edited onto disk a second earlier, so the cited evidence is
+        equivalent to `cat src/ait/risk/manager.py` and is satisfied by any checkout at that HEAD.
+        This project had already ruled on exactly that at PLAN.md:2571 and called it "the exact
+        pattern this project forbids" at :2082.
+        WHAT SURVIVES, and it is not nothing: the restart itself, new PIDs (supervisor 20950 / bot
+        20967), `bot_launch_verified` past its grace window, 10 jobs re-registered. That makes the
+        claim CONSISTENT WITH W25 running, not a confirmation of it. The process is long gone, so
+        the discriminating check cannot be supplied retroactively.
+        THE STANDARD FOR FUTURE DEPLOY ENTRIES, which the two NEIGHBOURING entries already met and
+        this one did not: file mtime strictly older than process start (W24 [5] at PLAN.md:3700,
+        and W23 [5]), or a behaviour only the new code emits.
+    (d) **PLAN.md:4299-4302 — RETRACTED, dated.** The W25 gate line reads "1839 passed / 43 skipped
+        / 1 failed ... the single failure is the known local-`.env` test_r19_config_authority case".
+        R26 re-ran the prescribed command at that HEAD and measured **8 failed / 1833 passed / 43
+        skipped / 5 errors**, all thirteen in `test_w21_tz_aware_trade_timestamps.py`, and
+        `test_r19_config_authority` PASSED on that box. Three causes: `time.tzset()` is POSIX-only,
+        two class guards called `read_text()` with no encoding and died on cp1252, and a live-DB
+        post-condition asserted against a corpus that had not been migrated.
+        NOT A RE-RUN, AND NOTHING TO FIX: all three were closed by W28 (PLAN.md:5118-5132), which
+        gave the guards `encoding="utf-8"`, routed the TZ pin through W20's `_HostClock` seam, and
+        put the corpus check behind `AIT_CHECK_LIVE_CORPUS=1` (which W38 then made runnable). The
+        current count on this box is W39's: 2161 passed / 45 skipped / 1 failed.
+    (e) A POINTER, not a retraction: PLAN.md:4136-4137 re-quotes `test_w14_booking_exactly_once`
+        and `test_w13_gateway_recovery` spot-runs as proof in the W21-W25 handoff. Both files were
+        later shown to contain cannot-fail tests — W14's intact-streak rebuilt in W32, W13's reset
+        rebuilt in W35. The counts were real; what they proved was less than claimed.
+
+[5] REGISTERED, NOT FIXED — `w23-et-cron-tests-build-their-own-crontrigger`
+    (`tests/test_w23_scheduler_timezone.py:204-215`, `inspect.getsource(M.main)` with literal
+    substring assertions including `assert "_now_bt = datetime.now()" in src`). It is in R26's F7
+    correction table with no entry closing it, but W35's enumeration of THIS box's F7 rows does not
+    include it and W23 was the other box's wave. Taking it risks duplicating work in flight — this
+    programme already had one near-collision (W30's [7]). Whoever owns W23 should take it.
+    THE CENSUS, corrected while here: **44 executable `inspect.getsource(` call sites across 14
+    test files** (was 45/15 before this wave removed W18's). CLAUDE.md:116 still says "~37"; the
+    class has grown since that line was written. The biggest concentrations are
+    `test_r20_research_validity.py` (9), `test_r16_tail_fixes.py` (8) and
+    `test_r16_research_fixes.py` (8) — none assigned to anyone.
+
+PROOF. This wave's evidence is mutation, not a red count, because its subject is tests rather than
+behaviour: `start()` reverted to consume-on-drop -> **1 failed / 15 passed**; `_fire_and_forget`
+reverted to a bare `create_task` -> **both rebuilt background-task tests fail**, where the
+originals passed. Controls that must hold on both trees and are named as such: the delivered-page
+throttle at both the `start()` and escalation sites, and `test_all_three_resolve_through_the_single_
+authority` (identity, which the value test in [2] complements rather than replaces).
+**No `inspect.getsource`** — and one fewer in the suite than before.
+
+VERIFICATION. Full fast lane **2164 passed / 45 skipped / 1 failed** — the standing local-`.env`
+`test_r19_config_authority` case. Reconciled arithmetically, file by file rather than assumed:
+`git show HEAD -- tests/test_w18_gateway_port_and_throttle.py tests/test_w22_manual_positions.py`
+against this tree's versions collects **53 -> 56**. All of the net +3 is in [1] — the throttle class
+went from 3 tests (2 executing, 1 `getsource`) to 6 (2 escalation-site + 2 `start()`-site, alongside
+the unchanged 2 `health_check` ones); the capital-literal class in [2] is a 1-for-1 replacement
+(3 -> 3) and the dashboard-key test in [2] and both background-task tests in [3] were rewritten in
+place under their existing names, neither adding nor removing a collected test. `2161 + 3 = 2164`.
+(An earlier draft of this paragraph claimed the count was unchanged, on arithmetic that turned out
+to be wrong — caught by running the count instead of trusting the mental sum, before it was
+committed. Left visible here rather than silently corrected, since getting a test count wrong is
+exactly the failure class this wave exists to catch.)
+`compileall` OK; `scripts/typecheck.py` OK; `scripts/smoke_deploy.py` -> SMOKE PASS (13 checks).
+
+STATE AT HANDOFF: committed on `feature/event-straddle`. **NOT RUNNING** — nothing runs on this
+box. The two production touches (`_NLV_QUERY`, and the deleted one-line-only comment) are
+behaviour-neutral.
+
+NEXT: **this box's R26 queue is now empty.** F4 (W31), F5 (W38), the two F6 Telegram rows (W39) and
+the F7 rows (W40) are all shipped. What remains, none of it assigned:
+  - ON THE WINDOWS BOX: `scripts/restate_w21_tz_aware.py --apply` with the bot stopped, then
+    `smoke_deploy.py --check-live-corpus` (W38's RUNBOOK sequence). F5 #1 stays open there.
+  - UNOWNED: `w23-et-cron-tests-build-their-own-crontrigger`, the 44-site `getsource` census above,
+    the 23 register live-money items outside F1-F8 in `reports/r26_integration_20260917.md`, and
+    the research re-run (the engine takes 2 trades where live took ~10 — the largest open strategic
+    item, and the one that decides whether the parameters are trustworthy at all).
+  - AN OPERATOR DECISION, not code: W31's breaker arm now pages on every funded account because
+    `risk.max_position_risk_pct` (3%) exceeds `max_daily_loss_pct / 1.5` (1.33%). It is telling the
+    truth; the remedy is a knob change on backtest evidence.
