@@ -1839,6 +1839,41 @@ class TradingOrchestrator:
             pass
         return context
 
+    def _meta_label_arm_sufficient(self) -> bool:
+        """W49 (policy-vs-impl-7): is the real track record long enough to
+        TRUST the meta-labeler's opinion for a live entry?
+
+        `enabled=true` + `is_trained` alone proved nothing about this --
+        three documents disagreed on the number (config.yaml said 50,
+        PLAN.md said 100+, the code enforced neither at arm time). Now one
+        adjustable number, `settings.meta_label.min_closes_to_enable`,
+        checked against the SAME real-close population the go-live
+        scorecard itself grades (`reporting.go_live.real_close_count` --
+        real closes, IC-only, the same "how long is our track record"
+        question, not a second counting convention).
+
+        Fails CLOSED on any error (an unreadable count must not silently
+        arm an unvalidated extra filter) -- for THIS gate specifically,
+        "closed" means falling back to today's baseline of no meta-label
+        opinion at all (skip the reject check below), not a blanket
+        fail-closed-always rule: the meta-labeler is an ADDITIONAL filter
+        that can only make entries MORE conservative, so not consulting it
+        reverts to the already-proven primary-model-only behaviour rather
+        than blocking anything.
+        """
+        try:
+            from ait.reporting.go_live import real_close_count
+            n = real_close_count(self._state._db_path)
+            required = self._settings.meta_label.min_closes_to_enable
+            sufficient = n >= required
+            if not sufficient:
+                log.info("meta_label_gate_insufficient_closes",
+                         real_closes=n, required=required)
+            return sufficient
+        except Exception as e:  # noqa: BLE001
+            log.warning("meta_label_close_count_check_failed", error=str(e))
+            return False
+
     async def _scan_symbol(self, symbol: str, vix: float | None, market_context: dict | None = None, collect: list | None = None) -> None:
         """Analyze a single symbol for trading opportunities.
 
@@ -2100,7 +2135,13 @@ class TradingOrchestrator:
 
         # Meta-label gate: ask secondary model if this signal is worth taking.
         # Bypassed in paper_trading_mode so backtest and paper P&L are comparable (Gap Z1 interim).
-        if not paper_mode and self._meta_labeler is not None and self._meta_labeler.is_trained:
+        # W49 (policy-vs-impl-7): `enabled`+`is_trained` alone proved nothing about
+        # whether the live track record is long enough to TRUST what it says --
+        # _meta_label_arm_sufficient() is the real-close-count floor, re-checked
+        # every scan (not just once at startup) so crossing it mid-day takes
+        # effect immediately.
+        if (not paper_mode and self._meta_labeler is not None and self._meta_labeler.is_trained
+                and self._meta_label_arm_sufficient()):
             last_features = {}
             if not features_df.empty:
                 last_row = features_df.iloc[-1]

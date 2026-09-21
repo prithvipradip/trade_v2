@@ -452,6 +452,19 @@ class MetaLabelConfig(_StrictModel):
     enabled: bool = False
     min_probability: float = Field(default=0.50, ge=0.30, le=0.80)
     retrain_with_primary: bool = True  # Retrain when primary model retrains
+    min_closes_to_enable: int = Field(default=100, ge=30, le=500,
+        description="Real, verdict-eligible closed trades (the same population "
+                    "reporting.go_live.real_close_count/the go-live scorecard grades) "
+                    "required before the meta-label gate is trusted for LIVE entries -- "
+                    "regardless of `enabled` above or whether a model has already "
+                    "trained. W49 (policy-vs-impl-7): config.yaml's own comment said "
+                    "50, PLAN.md's tracking table said 100+, and the code enforced "
+                    "neither at arm time -- this is now the one number, adjustable "
+                    "here without a code deploy. Floor of 30 matches "
+                    "meta_label.MIN_TRADES_FOR_TRAINING, the separate (unchanged) "
+                    "statistical minimum for fitting the model at all; this field is "
+                    "the different question of when its output should be TRUSTED for "
+                    "live risk.")
 
 
 class EarningsConfig(_StrictModel):

@@ -78,6 +78,7 @@ __all__ = [
     "NOT_REAL_CLOSE_PATTERNS",
     "not_real_close_sql",
     "is_real_close",
+    "real_close_count",
     "not_real_close_bucket",
     "OPEN_TRADE_STATUSES",
     "TERMINAL_TRADE_STATUSES",
@@ -143,6 +144,27 @@ def is_real_close(exit_reason_detailed: str | None) -> bool:
     """Python twin of :func:`not_real_close_sql` (same membership)."""
     r = (exit_reason_detailed or "").lower()
     return not any(p.strip("%") in r for p in NOT_REAL_CLOSE_PATTERNS)
+
+
+def real_close_count(db_path, *, strategies: frozenset = GO_LIVE_VERDICT_STRATEGIES) -> int:
+    """W49 (policy-vs-impl-7): the count-only sibling of
+    :func:`compute_go_live_verdict` — same population (real closes,
+    ``not_real_close_sql``-filtered, restricted to ``strategies``), for a
+    caller that only needs "how long is our real track record" and would
+    otherwise have to run the full verdict (slippage, drawdown, pace) just to
+    read one number off it. Single authority so a future policy gate keyed on
+    the live track record's length (this wave's meta-label arm check, the
+    scorecard's own ``n/50`` pace line) always means the same population.
+    """
+    con = sqlite3.connect(str(db_path))
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            f"SELECT strategy FROM trades WHERE status='closed' {not_real_close_sql()}"
+        ).fetchall()
+    finally:
+        con.close()
+    return sum(1 for r in rows if r["strategy"] in strategies)
 
 
 def not_real_close_bucket(exit_reason_detailed: str | None) -> str | None:

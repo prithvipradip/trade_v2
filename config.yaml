@@ -221,9 +221,15 @@ ml:
   observe_mode_neutral_confidence: 0.60  # direction-neutral structures skip the DIRECTIONAL min_confidence gate
 
 meta_label:
-  enabled: false                       # Disabled: trained on corrupted data, rejects everything. Re-enable after 50+ clean trades.
+  enabled: false                       # Disabled: trained on corrupted data, rejects everything. See min_closes_to_enable below before re-enabling.
   min_probability: 0.50                # Min P(profitable) to take a trade (0.30-0.80)
   retrain_with_primary: true           # Retrain when primary model retrains
+  # W49 (policy-vs-impl-7): the ONE close-count policy number -- config.yaml
+  # used to say 50 here, PLAN.md's tracking table said 100+, and neither was
+  # ever enforced in code. Real live entries stay ungated by this model until
+  # reporting.go_live.real_close_count (IC-only, real closes) reaches this,
+  # regardless of `enabled` above. Change it here, not in code.
+  min_closes_to_enable: 100            # (30-500)
 
 earnings:
   # W44 (R26 fail-direction-03/concurrency-4): unknown earnings data (never
