@@ -32,7 +32,7 @@ from ait.data.market_data import MarketDataService
 from ait.data.options_chain import OptionsChainService
 from ait.data.multi_timeframe import MultiTimeframeAnalyzer
 from ait.data.quality import DataQualityValidator
-from ait.execution.executor import TradeExecutor
+from ait.execution.executor import BAG_CON_ID, TradeExecutor
 from ait.execution.portfolio import PortfolioManager, PositionStatus
 from ait.execution.reconciler import PositionReconciler
 from ait.learning.engine import LearningEngine
@@ -4191,16 +4191,56 @@ class TradingOrchestrator:
         except Exception:  # noqa: BLE001
             pass
 
+    @staticmethod
+    def _legs_count(trade) -> int:
+        """W48: expected leg count for a trade's completeness math (the
+        commission true-up needs `2 * legs_n` execution rows — entry + exit
+        per leg). Extracted so both true-up call sites derive it the same
+        way; previously inline in `_true_up_commission` only."""
+        try:
+            import json as _json
+            return max(1, len(_json.loads(trade.legs))) if trade and trade.legs else 4
+        except Exception:  # noqa: BLE001
+            return 4
+
     def _settle_deferred_trueups(self) -> None:
         """R16: settle deferred commission true-ups once the day's
         commissionReports have all landed (the booking-time ledger was partial).
         W37: extracted from _post_market so it can be driven for real, and
-        reverses the REMEMBERED estimate rather than re-deriving one."""
+        reverses the REMEMBERED estimate rather than re-deriving one.
+
+        W48 (trade-life-commission-trueup-gate-measures-wrong-quantity, Path
+        B): this used to have NO completeness check at all -- any nonzero
+        `_real` settled, even against a still-partial ledger, permanently
+        overstating realized_pnl by whatever exit-side commissions hadn't
+        landed yet; and the `trueup_pending_*` marker was deleted
+        UNCONDITIONALLY, so a trade caught mid-ledger never got a second
+        chance. Now mirrors `_true_up_commission`'s own completeness gate
+        exactly (excluding the BAG summary row, which reports its own
+        -- genuinely real -- commission before leg rows do; see
+        `count_executions_with_commission`'s docstring) and keeps the marker
+        set, not deleted, whenever the ledger is still incomplete -- the
+        NEXT post-market run (or a later session) retries.
+        """
         for _tid in self._state.pending_trueup_trade_ids():
             try:
                 _t = self._find_trade_by_id(_tid)
+                if _t is None:
+                    # No trade row for this marker (should not happen in
+                    # practice) -- nothing to ever settle against; clear the
+                    # orphan rather than retry it forever.
+                    self._state.delete_state(f"trueup_pending_{_tid}")
+                    continue
+                _legs_n = self._legs_count(_t)
+                _exec_n = self._state.count_executions_with_commission(
+                    _tid, exclude_con_id=BAG_CON_ID)
+                if _exec_n < 2 * _legs_n:
+                    log.info("commission_trueup_deferred_partial_ledger_post_market",
+                             trade_id=_tid, executions=_exec_n,
+                             expected=2 * _legs_n)
+                    continue
                 _real = self._state.total_commission(_tid)
-                if _t is not None and _real > 0 and _t.realized_pnl is not None:
+                if _real > 0 and _t.realized_pnl is not None:
                     _delta = round(self._booked_commission_estimate(_t) - _real, 2)
                     if abs(_delta) >= 0.01:
                         _new_pnl = round(float(_t.realized_pnl) + _delta, 2)
@@ -4211,6 +4251,14 @@ class TradingOrchestrator:
                         log.info("commission_trueup_settled_post_market",
                                  trade_id=_tid, delta=_delta)
                     self._forget_commission_estimate(_tid)
+                    # W48: Path A already stamped trades.commission with
+                    # broker truth once complete; Path B never did, leaving
+                    # the PF verdict's commission line at whatever the
+                    # fill-time estimate happened to write.
+                    try:
+                        self._state.update_trade_commission(_tid, _real)
+                    except Exception:  # noqa: BLE001
+                        pass
                 self._state.delete_state(f"trueup_pending_{_tid}")
             except Exception as _e:  # noqa: BLE001
                 log.warning("post_market_trueup_failed", trade_id=_tid,
@@ -4230,6 +4278,19 @@ class TradingOrchestrator:
         permanently, so require a COMPLETE ledger (>= 2x leg count) and
         otherwise defer to the post-market re-true-up.
 
+        W48 (trade-life-commission-trueup-gate-measures-wrong-quantity): the
+        completeness gate used to be `count_executions(trade_id) >= 2*legs_n`
+        -- raw ROW presence. `_sweep_executions` (executor.py) writes a row
+        the instant a fill is seen, commission-known or not (0.0 either way,
+        pre-W48), and combo orders add a BAG summary row on top -- so a
+        4-leg condor's 10 total rows (8 legs + 2 BAG) satisfied `>= 8` while
+        real leg commissions were still outstanding. Now gates on rows whose
+        commission is actually KNOWN (`count_executions_with_commission`,
+        NULL until a real commissionReport lands), excluding the BAG row
+        (which reports its own -- genuinely real, typically 0.0 --
+        commission before the legs do, and would otherwise let a couple of
+        quick BAG reports substitute for still-pending leg ones).
+
         R24 regress-live-09 / pnl-money-02: this used to live inline in
         _process_completed_exits only, so any close booked by the outbox
         drain (crash between the close and the callback, or a callback later
@@ -4240,14 +4301,9 @@ class TradingOrchestrator:
         try:
             real = self._state.total_commission(trade_id)
             trade = self._find_trade_by_id(trade_id)
-            legs_n = 4
-            try:
-                import json as _json
-                legs_n = (max(1, len(_json.loads(trade.legs)))
-                          if trade and trade.legs else 4)
-            except Exception:  # noqa: BLE001
-                pass
-            exec_n = self._state.count_executions(trade_id)
+            legs_n = self._legs_count(trade)
+            exec_n = self._state.count_executions_with_commission(
+                trade_id, exclude_con_id=BAG_CON_ID)
             if real > 0 and trade and exec_n >= 2 * legs_n:
                 delta = round(self._booked_commission_estimate(trade) - real, 2)
                 self._forget_commission_estimate(trade_id)

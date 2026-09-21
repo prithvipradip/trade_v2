@@ -1626,7 +1626,11 @@ class TradeExecutor:
                             row_sig = row_mid = row_nbbo = 0.0
                     else:
                         row_sig, row_mid, row_nbbo = sig_price, live_mid, nbbo
-                    comm = 0.0
+                    # W48: None means "not yet reported" -- a real 0.0
+                    # broker report (routine for a BAG summary row) must
+                    # stay distinguishable from a fill still awaiting one.
+                    # See record_execution's docstring.
+                    comm = None
                     rpnl = 0.0
                     if f.commissionReport:
                         comm = float(f.commissionReport.commission or 0.0)

@@ -178,7 +178,10 @@ class TestCommissionTrueUp:
                                 trades_taken=0)
         state.get_daily_stats.return_value = stats
         state.total_commission.return_value = 8.89       # ledger truth
-        state.count_executions.return_value = 8          # R16: complete ledger (2x4 legs)
+        # W48: the gate now counts rows with a KNOWN commission (excluding
+        # the BAG summary row), not raw row presence -- see
+        # count_executions_with_commission's docstring.
+        state.count_executions_with_commission.return_value = 8  # R16: complete ledger (2x4 legs)
         orch._state = state
         trade = SimpleNamespace(trade_id="T-X", symbol="NVDA",
                                 strategy="iron_condor", contract_type="iron_condor",
@@ -218,7 +221,8 @@ class TestCommissionTrueUp:
                                 trades_taken=0)
         state.get_daily_stats.return_value = stats
         state.total_commission.return_value = 2.60       # entry side only
-        state.count_executions.return_value = 4          # < 2x4 legs
+        # W48: see the sibling test above -- same gate rename.
+        state.count_executions_with_commission.return_value = 4  # < 2x4 legs
         orch._state = state
         trade = SimpleNamespace(trade_id="T-Y", symbol="SPY",
                                 strategy="iron_condor", contract_type="iron_condor",

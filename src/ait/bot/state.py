@@ -984,11 +984,21 @@ class StateManager:
     def record_execution(self, exec_id: str, order_id: int, perm_id: int,
                          trade_id: str, symbol: str, con_id: int, side: str,
                          shares: float, price: float, exec_time: str,
-                         commission: float = 0.0, realized_pnl: float = 0.0,
+                         commission: float | None = None, realized_pnl: float = 0.0,
                          signal_price: float = 0.0, live_mid: float = 0.0,
                          nbbo_spread: float = 0.0) -> None:
         """R7: upsert one broker execution (commission may arrive later —
-        re-upserting the same exec_id refreshes it)."""
+        re-upserting the same exec_id refreshes it).
+
+        W48 (trade-life-commission-trueup-gate-measures-wrong-quantity):
+        `commission=None` means "not yet reported", NOT "reported as zero" —
+        the column already allows NULL (no NOT NULL constraint), so this
+        needed no migration. Before this, every fill was written with a
+        literal 0.0 the instant it was seen, indistinguishable from a broker
+        report that genuinely said $0 — a completeness check built on row
+        presence (or even on `commission IS NOT NULL` without this change)
+        could never tell "reported" from "not yet reported".
+        """
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO executions
@@ -997,7 +1007,13 @@ class StateManager:
                     signal_price, live_mid, nbbo_spread)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(exec_id) DO UPDATE SET
-                     commission=excluded.commission,
+                     -- W48: never regress a known commission back to unknown
+                     -- (a later sweep pass re-seeing the same fill without a
+                     -- fresh commissionReport attached must not erase one
+                     -- already recorded) -- the same "never zero a known
+                     -- value" principle the three fields below already had,
+                     -- which commission alone was missing until now.
+                     commission=COALESCE(excluded.commission, commission),
                      realized_pnl=excluded.realized_pnl,
                      trade_id=CASE WHEN excluded.trade_id != ''
                                    THEN excluded.trade_id ELSE trade_id END,
@@ -1024,12 +1040,59 @@ class StateManager:
             return float(row[0] or 0.0)
 
     def count_executions(self, trade_id: str) -> int:
-        """R16: execution rows recorded for a trade — completeness check for
-        the commission true-up (a partial ledger must defer, not true up)."""
+        """R16: execution rows recorded for a trade.
+
+        W48: this is raw row PRESENCE, not commission presence — it has a
+        second, different caller (executor.py's reconnect fill-reconstruction
+        liveness check) that genuinely wants "did any fill get recorded at
+        all", regardless of commission. The commission true-up's own
+        completeness check is `count_executions_with_commission` below; do
+        not repurpose this method for that again.
+        """
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT COUNT(*) FROM executions WHERE trade_id = ?",
                 (trade_id,)).fetchone()
+            return int(row[0] or 0)
+
+    def count_executions_with_commission(
+        self, trade_id: str, exclude_con_id: int | None = None,
+    ) -> int:
+        """W48: execution rows for a trade whose commission is actually
+        KNOWN (reported by the broker), for the commission true-up's real
+        completeness check — see `record_execution`'s docstring for why
+        `commission IS NOT NULL` is the right test now that NULL means
+        "not yet reported" rather than a placeholder zero.
+
+        `exclude_con_id` matters: a combo order's synthetic BAG summary row
+        gets its own commissionReport too (real production case study,
+        `tests/test_r16_broker_fixes.py`'s 2026-08-04 SPY condor fixture —
+        reported as exactly 0.0, a real report, not a missing one). Counting
+        it toward completeness lets a handful of quickly-reported BAG rows
+        substitute for still-pending LEG rows and satisfy the gate early —
+        this wave's own version of the original defect. Callers pass
+        `BAG_CON_ID` (execution.executor) to exclude it; `None` counts every
+        row (this trade has no combo leg, or the caller has already excluded
+        BAG rows some other way).
+        """
+        with self._connect() as conn:
+            if exclude_con_id is None:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM executions "
+                    "WHERE trade_id = ? AND commission IS NOT NULL",
+                    (trade_id,)).fetchone()
+            else:
+                # SQL three-valued logic: `con_id != ?` is NULL (not TRUE)
+                # for a row whose con_id is itself NULL, so a bare != would
+                # silently EXCLUDE it -- the opposite of "count every row
+                # that isn't the BAG one". Production rows always populate
+                # con_id (executor.py's `getattr(..., 0) or 0`), but this
+                # must not depend on that; treat NULL as "not the BAG row".
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM executions WHERE trade_id = ? "
+                    "AND commission IS NOT NULL "
+                    "AND (con_id IS NULL OR con_id != ?)",
+                    (trade_id, exclude_con_id)).fetchone()
             return int(row[0] or 0)
 
     def state_keys_like(self, pattern: str) -> list[str]:
