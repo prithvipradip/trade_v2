@@ -8177,3 +8177,47 @@ safe to slip"). Re-verify against HEAD before scoping — nothing about W50 has 
 session, same discipline every wave since W41 has needed.
 
 No inspect.getsource.
+
+---
+
+## 2026-09-22 - REGISTER CORRECTION: source-report pointers for the remaining roadmap items (W50, W51)
+
+No code. Prompted by a direct question about whether PLAN.md alone (per CLAUDE.md's own rule —
+"start each session from PLAN.md's last entries, not from a summary") gives a cold-start session
+everything it needs to pick up W50. Answer verified by actually doing the exercise, not asserted:
+every wave entry through W49 (mine included) names a finding by slug and a roadmap line number, but
+never the `reports/` file that holds its actual Where/Proof/Consequence/Suggested-fix text — every
+session so far (confirmed for W47/W48/W49, this session) has had to grep `reports/*.md` for the
+slug heading to find it. That grep always succeeds in one shot, so it is not a blocking gap — but
+it is an unstated step, and worth closing now that it's been noticed rather than leaving the ninth
+consecutive session to rediscover it.
+
+**Checked directly against the files, not assumed:** every remaining roadmap slug through W51
+lives in the SAME report —
+
+- `reports/blindspot_composition_hunt_20260825.md`:
+  - `money-flow-05` — line 532
+  - `trade-life-partial-slice-pnl-erased` — line 540
+  - `trade-life-promotion-ignores-broker-quantity` — line 548
+  - `model-vs-reality-ex-div-assignment-void` — line 162
+  - `model-vs-reality-margin-model-unimplemented` — line 170
+
+(Line numbers are today's; re-grep the slug heading rather than trust them if this file has been
+edited since — the same "re-verify against HEAD" discipline as everything else in this register.)
+
+**A second, related check while here, prompted by re-reading the 2026-09-21 CONTINUITY NOTE entry
+above** (a prior session's own session-scoped Claude Code plan file, `~/.claude/plans/staged-
+weaving-milner.md`, went out of reach of every later session — exactly the failure class this
+correction is about, one layer up): this session's own equivalent plan file
+(`~/.claude/plans/wiggly-yawning-penguin.md`) was checked and holds nothing beyond the now-shipped
+W49 plan, already carried in full in this file's own W49 entry above. Nothing stranded this time —
+stated plainly because the CONTINUITY NOTE's own lesson is that this needs checking, not assuming,
+every time a session that used a local plan file ends.
+
+STATE AT HANDOFF: this entry only. No production files, no tests — nothing here is a behavioral
+claim, so there is nothing to prove.
+
+NEXT: **W50** (unchanged from the entry above) — re-verify against HEAD before scoping; the pointer
+above saves the grep, not the re-verification.
+
+No inspect.getsource — this entry doesn't touch test files at all.
