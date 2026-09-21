@@ -2139,6 +2139,113 @@ def _check_telegram_dead():
 # Main
 # ---------------------------------------------------------------------------
 
+def _register_recurring_jobs(scheduler, bot, web) -> None:
+    """W43 (R26 `w23-et-cron-tests-build-their-own-crontrigger`): the ten
+    unconditional cron/interval jobs, extracted from `main()` so a test can
+    get back a REAL scheduler with real jobs registered on it without
+    fighting `main()`'s side effects (the singleton lock, `bot.start()` /
+    `web.start()`, signal handlers, the startup Telegram alert).
+
+    Deliberately does NOT include the four catch-up blocks
+    (backup/retrain/digest/report) that follow these in `main()` — each of
+    those can synchronously fire a real side effect (`backup_state_db()`,
+    `daily_digest()`, `daily_report()`) when its own due-check is true, which
+    it can be by DEFAULT in an empty test sandbox (e.g. the backup catch-up's
+    `not _snaps` is true when no backup exists yet). Mixing that into a
+    function a test calls directly would risk a real Telegram send from a
+    unit test. The one catch-up job this file's own tests need to reach —
+    the backtest date job — is `_maybe_schedule_backtest_catchup` below,
+    which registers a future job and does not run anything synchronously.
+    """
+    # Health check: every 2 minutes (bot + web services)
+    def combined_health_check():
+        bot.health_check()
+        web.health_check()
+        # R16 #15: surface a dead Telegram channel (bot-written marker that
+        # nothing read); probes hourly, clears itself on a successful send.
+        _check_telegram_dead()
+
+    scheduler.add_job(combined_health_check, "interval", minutes=2, id="health_check")
+
+    # Daily model retrain: 7:30 AM ET on trading days (Mon-Fri)
+    scheduler.add_job(retrain_models,
+                      CronTrigger(day_of_week="mon-fri", hour=7, minute=30, timezone=ET),
+                      id="daily_retrain")
+
+    # Daily performance report: 4:30 PM ET
+    scheduler.add_job(backup_state_db, CronTrigger(day_of_week="mon-fri", hour=17, minute=0, timezone=ET),
+                      id="db_backup", name="State DB backup")
+    scheduler.add_job(weekly_scorecard,
+                      CronTrigger(day_of_week="fri", hour=16, minute=10, timezone=ET),
+                      id="weekly_scorecard")
+    scheduler.add_job(daily_digest,
+                      CronTrigger(day_of_week="mon-fri", hour=9, minute=35, timezone=ET),
+                      id="digest_am")
+    scheduler.add_job(daily_digest,
+                      CronTrigger(day_of_week="mon-fri", hour=16, minute=5, timezone=ET),
+                      id="digest_pm")
+    scheduler.add_job(daily_report,
+                      CronTrigger(day_of_week="mon-fri", hour=16, minute=30, timezone=ET),
+                      id="daily_report")
+
+    # Weekly deep backtest: Sunday 8 PM ET
+    scheduler.add_job(run_backtest,
+                      CronTrigger(day_of_week="sun", hour=20, minute=0, timezone=ET),
+                      id="weekly_backtest")
+
+    # Monthly log cleanup: 1st of month at midnight
+    scheduler.add_job(cleanup_old_logs,
+                      CronTrigger(day=1, hour=0, minute=0, timezone=ET),
+                      id="monthly_cleanup")
+    # R16: DAILY size cap for the append-only logs (keeper/dashboard/weblog/
+    # orchestrator). Monthly was far too slow for a keeper.log that can gain
+    # 144k lines in one day when the .bat pacing collapses.
+    scheduler.add_job(rotate_oversized_logs,
+                      CronTrigger(hour=0, minute=5, timezone=ET),
+                      id="daily_log_rotation")
+
+
+def _maybe_schedule_backtest_catchup(scheduler, now_bt: datetime | None = None) -> None:
+    """R16 #59: weekly-backtest catch-up — register a ONE-TIME date job when
+    the box missed its Sunday 20:00 ET slot. Registration only: this never
+    calls `run_backtest()` itself, so it is safe to call directly in a test.
+
+    W43: extracted so the date job's `run_date` (which W23 hardened to come
+    from the AWARE `now_et()` clock, deliberately different from the naive
+    `now_bt` the due-check uses — see the comment inline below, preserved
+    verbatim) can be asserted on directly instead of via
+    `inspect.getsource(main)`. `now_bt` is injectable for the same reason
+    every other catch-up helper in this file takes `now: datetime` explicitly
+    (`_backtest_catchup_due`, `_digest_catchup_due`, ...) rather than reading
+    the clock itself; defaults to `datetime.now()` so `main()`'s own call
+    (below) is unchanged.
+    """
+    if now_bt is None:
+        # W20: naive local, matching the file mtimes it is compared against.
+        # The old comment said "(=ET box)" — false since the CEST move. The
+        # CODE is still right: both sides of the comparison are naive local.
+        now_bt = datetime.now()
+    try:
+        if _backtest_catchup_due(now_bt):
+            # W23: a SECOND, deliberately DIFFERENT clock for the run-at
+            # computation — _backtest_catchup_run_at's market-hours check
+            # needs real ET hours (a naive host-local hour compared against
+            # 9:15/16:30 ET thresholds is checking the wrong clock), and its
+            # return value becomes the scheduler's run_date directly, which
+            # W23 probed must be aware or apscheduler mislabels it. Do not
+            # "simplify" this back to reusing now_bt — the due-check above
+            # and the run-at computation below need genuinely different
+            # clocks, on purpose.
+            _bt_at = _backtest_catchup_run_at(now_et())
+            scheduler.add_job(run_backtest, "date", run_date=_bt_at,
+                              id="backtest_catchup",
+                              name="Weekly backtest catch-up")
+            _log("info", "startup_catchup_backtest_scheduled",
+                 run_at=_bt_at.strftime("%Y-%m-%d %H:%M"))
+    except Exception as _e:  # noqa: BLE001
+        _log("warning", "startup_backtest_check_failed", error=str(_e))
+
+
 def main():
     # R16 #66: atomic single-instance gate BEFORE any side effects — the
     # keeper's 90s loop and the 07:30 scheduled task can both pass their
@@ -2188,33 +2295,11 @@ def main():
 
     # --- Schedule tasks ---
 
-    # Health check: every 2 minutes (bot + web services)
-    def combined_health_check():
-        bot.health_check()
-        web.health_check()
-        # R16 #15: surface a dead Telegram channel (bot-written marker that
-        # nothing read); probes hourly, clears itself on a successful send.
-        _check_telegram_dead()
+    # W43: the ten unconditional recurring jobs, extracted so a test can
+    # register real jobs on a real scheduler without main()'s other side
+    # effects (see _register_recurring_jobs's own docstring).
+    _register_recurring_jobs(scheduler, bot, web)
 
-    scheduler.add_job(combined_health_check, "interval", minutes=2, id="health_check")
-
-    # Daily model retrain: 7:30 AM ET on trading days (Mon-Fri)
-    scheduler.add_job(retrain_models,
-                      CronTrigger(day_of_week="mon-fri", hour=7, minute=30, timezone=ET),
-                      id="daily_retrain")
-
-    # Daily performance report: 4:30 PM ET
-    scheduler.add_job(backup_state_db, CronTrigger(day_of_week="mon-fri", hour=17, minute=0, timezone=ET),
-                      id="db_backup", name="State DB backup")
-    scheduler.add_job(weekly_scorecard,
-                      CronTrigger(day_of_week="fri", hour=16, minute=10, timezone=ET),
-                      id="weekly_scorecard")
-    scheduler.add_job(daily_digest,
-                      CronTrigger(day_of_week="mon-fri", hour=9, minute=35, timezone=ET),
-                      id="digest_am")
-    scheduler.add_job(daily_digest,
-                      CronTrigger(day_of_week="mon-fri", hour=16, minute=5, timezone=ET),
-                      id="digest_pm")
     # R6: catch-up backup at supervisor start when the newest snapshot is
     # >24h old — a machine-down day silently skips the 17:00 slot (observed
     # Jul 8: the 18h outage covered it and nothing noticed).
@@ -2266,9 +2351,6 @@ def main():
             daily_digest()
     except Exception as _e:  # noqa: BLE001
         _log("warning", "startup_digest_check_failed", error=str(_e))
-    scheduler.add_job(daily_report,
-                      CronTrigger(day_of_week="mon-fri", hour=16, minute=30, timezone=ET),
-                      id="daily_report")
     # R16 #59: same missed-slot catch-up for the 16:30 report (a boot after
     # 16:30 skips the cron entirely — in-memory jobstore, grace only applies
     # while the process is alive).
@@ -2280,48 +2362,12 @@ def main():
     except Exception as _e:  # noqa: BLE001
         _log("warning", "startup_daily_report_check_failed", error=str(_e))
 
-    # Weekly deep backtest: Sunday 8 PM ET
-    scheduler.add_job(run_backtest,
-                      CronTrigger(day_of_week="sun", hour=20, minute=0, timezone=ET),
-                      id="weekly_backtest")
     # R16 #59: weekly-backtest catch-up — fired ONCE since March (Apr 26);
     # the box is routinely off Sunday 20:00. Unlike the report, this one is
     # DEFERRED 10 min (never synchronously in main(), #69) and never runs
     # during market hours: pushed past 16:30 ET if it would land in-session.
-    try:
-        # W20: naive local, matching the file mtimes it is compared against.
-        # The old comment said "(=ET box)" — false since the CEST move. The
-        # CODE is still right: both sides of the comparison are naive local.
-        _now_bt = datetime.now()
-        if _backtest_catchup_due(_now_bt):
-            # W23: a SECOND, deliberately DIFFERENT clock for the run-at
-            # computation — _backtest_catchup_run_at's market-hours check
-            # needs real ET hours (a naive host-local hour compared against
-            # 9:15/16:30 ET thresholds is checking the wrong clock), and its
-            # return value becomes the scheduler's run_date directly, which
-            # W23 probed must be aware or apscheduler mislabels it. Do not
-            # "simplify" this back to reusing _now_bt — the due-check above
-            # and the run-at computation below need genuinely different
-            # clocks, on purpose.
-            _bt_at = _backtest_catchup_run_at(now_et())
-            scheduler.add_job(run_backtest, "date", run_date=_bt_at,
-                              id="backtest_catchup",
-                              name="Weekly backtest catch-up")
-            _log("info", "startup_catchup_backtest_scheduled",
-                 run_at=_bt_at.strftime("%Y-%m-%d %H:%M"))
-    except Exception as _e:  # noqa: BLE001
-        _log("warning", "startup_backtest_check_failed", error=str(_e))
-
-    # Monthly log cleanup: 1st of month at midnight
-    scheduler.add_job(cleanup_old_logs,
-                      CronTrigger(day=1, hour=0, minute=0, timezone=ET),
-                      id="monthly_cleanup")
-    # R16: DAILY size cap for the append-only logs (keeper/dashboard/weblog/
-    # orchestrator). Monthly was far too slow for a keeper.log that can gain
-    # 144k lines in one day when the .bat pacing collapses.
-    scheduler.add_job(rotate_oversized_logs,
-                      CronTrigger(hour=0, minute=5, timezone=ET),
-                      id="daily_log_rotation")
+    # W43: registration extracted to _maybe_schedule_backtest_catchup.
+    _maybe_schedule_backtest_catchup(scheduler)
 
     _log("info", "scheduler_ready", jobs=len(scheduler.get_jobs()))
     for job in scheduler.get_jobs():

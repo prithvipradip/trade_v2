@@ -6931,3 +6931,108 @@ through W51 is in the 2026-09-21 REGISTER CORRECTION + ROADMAP entry above; this
 otherwise unchanged except for retiring `money-flow-01` and narrowing `fail-direction-10`'s
 remaining scope to "wire a consumer that pages on `store_write_healthy=False`," which is smaller
 than the roadmap's original "re-persist queue + page" estimate.
+
+---
+
+## 2026-09-21 - W43 EXECUTED — the W23 cron tests now drive the real scheduler
+
+Third wave of the 2026-09-21 roadmap; first of the test-honesty track. No live-money urgency — the
+code these tests cover was already correct. Re-verified the sketch before starting: `master.py` had
+not been touched since W38 and `tests/test_w23_scheduler_timezone.py` not since W23 itself, so
+nothing in it had drifted across W41/W42.
+
+[1] `w23-et-cron-tests-build-their-own-crontrigger`. Two of fourteen tests were the anti-pattern:
+    `TestCronJobsActuallyResolveToET`'s two tests built their OWN `BackgroundScheduler` +
+    `CronTrigger(timezone=M.ET)` and asserted on APScheduler's own behaviour — the only `master`
+    reference was `M.ET` itself. `test_call_site_uses_two_different_clocks_not_one` did
+    `inspect.getsource(M.main)` with a literal substring pin.
+    THE SKETCH'S OWN PROPOSED FIX WAS TOO BIG, AND READING THE FULL BLOCK BEFORE CUTTING IT FOUND
+    WHY. The plan (this file's 2026-09-21 roadmap entry, carried from the original planning session)
+    called for extracting `main()`'s whole scheduler-construction-and-registration section into one
+    `_build_scheduler(bot, web)`. That section is not just ten `add_job` calls — it interleaves FOUR
+    catch-up blocks, three of which fire a SYNCHRONOUS side effect (`backup_state_db()`,
+    `daily_digest()`, `daily_report()`) when their own due-check is true, and the backup one's
+    check (`not _snaps`) is true BY DEFAULT in an empty test sandbox. A test calling one monolithic
+    function directly could have triggered a real backup write or a real Telegram send.
+    Split narrower instead, mirroring this file's own established pattern of small, independently-
+    testable helpers (`_backtest_catchup_due`, `_retrain_catchup_run_at`, etc., all already taking
+    `now: datetime` explicitly rather than reading the clock themselves):
+      - `_register_recurring_jobs(scheduler, bot, web)` — the ten UNCONDITIONAL cron/interval jobs,
+        zero side effects, extracted verbatim.
+      - `_maybe_schedule_backtest_catchup(scheduler, now_bt: datetime | None = None)` — just the
+        backtest catch-up block. Registration-only (it schedules a future job, never calls
+        `run_backtest()` itself), so safe to call directly. `now_bt` is injectable, matching the
+        file's own convention, defaulting to `datetime.now()` so `main()`'s own call is unchanged.
+      - The other three catch-up blocks (backup/retrain/digest/report) stay exactly where they were,
+        inline in `main()`, untouched — neither target test needs them, and extracting them would
+        have been scope beyond what the finding asks for.
+    `main()`'s own sequence is otherwise byte-for-byte the same operations in the same order, now
+    via two calls instead of inline code.
+    A STRUCTURAL GUARD BROKE AS A SIDE EFFECT OF THE EXTRACTION, AND ITS OWN ANTI-VACUITY COMPANION
+    CAUGHT IT — worth recording because it is exactly this project's own methodology working.
+    `TestEveryCronTriggerHasATimezone`'s AST scan was scoped to `main`'s FunctionDef specifically;
+    once all nine `CronTrigger` calls moved into `_register_recurring_jobs`, that scan started
+    finding ZERO calls and would have reported "no offenders" — vacuously true, not because the
+    class guard held, but because nothing was scanned. Its own sanity-floor test
+    (`test_exactly_nine_crontrigger_calls_are_covered`) failed loudly instead: `expected 9, found 0`.
+    Rescoped both to the WHOLE MODULE rather than one function — not merely a fix for this
+    extraction but robust to the next one, since it no longer assumes any particular function holds
+    these calls. Added a third test proving the scan's count does not still coincidentally depend on
+    one function (an AST property, not a source-string check — checking that would have repeated the
+    exact anti-pattern this wave removes elsewhere in the same file).
+    THE TWO TARGET TESTS, rebuilt: `test_daily_retrain_resolves_to_us_eastern` and
+    `test_daily_report_resolves_to_us_eastern_not_host_local` now call the real
+    `_register_recurring_jobs` against a real, unstarted `BlockingScheduler` (confirmed directly:
+    `get_jobs()`/`get_job(id)` work without `.start()`) and assert `job.trigger.timezone` — never the
+    repr, since `str(CronTrigger)` does not surface the timezone at all. The getsource test is
+    replaced by driving `_maybe_schedule_backtest_catchup` with the due-check forced true (an empty,
+    monkeypatched `REPORTS_DIR`) and `now_et()` patched to a date DELIBERATELY far from the injected
+    naive `now_bt` — if the call site reverted to computing `run_date` from `now_bt` instead of
+    `now_et()` (bug #2/#3 this whole file exists to guard), the registered job lands on the wrong
+    DAY, not just the wrong offset, which is unambiguous under mutation.
+    MUTATION PROOF, run before trusting either rebuild: reverted `_maybe_schedule_backtest_catchup`
+    to compute `run_date` from `now_bt` (the retired bug) and re-ran the full file — exactly the one
+    target test failed (`run_date=2026-09-14 ... does not match ... 2026-09-20`), all fifteen others
+    stayed green, including the two rebuilt `TestCronJobsActuallyResolveToET` tests (confirming they
+    test something genuinely different from what this one catches).
+
+[2] `w23-docstring-cites-live-evidence-this-deployment-contradicts` — CORRECTED, NOT REWRITTEN. R26's
+    finding claims the docstring's cited incident (`retrain_catchup` registered `21:31:45 EDT`,
+    actually ran `03:31:45` local — 6h late) does not reproduce: `grep -a '21:31:45\|03:31:45'
+    logs/orchestrator.log` returned nothing on the machine R26's probe ran from
+    (`tzlocal.get_localzone() = America/New_York` there — RTH-neutral, so the incident could not
+    have shown up regardless). Re-verified directly on THIS box, twice — once during this wave's own
+    planning and again just now before writing this entry: `logs/orchestrator.log:6117` registers
+    `trigger=date[2026-09-14 21:31:45 EDT]`; `:6305` shows `retrain_starting` at `2026-09-15 03:31:45`
+    — the exact incident, to the second, still sitting in this box's own logs. This box's host clock
+    is `Europe/Madrid` (ET+6), matching what the docstring and W23's own ledger entry already
+    documented. The docstring is accurate for the deployment it was written about; only R26's probe
+    ran somewhere it could not reproduce. No code or docstring change — this paragraph is the
+    correction, and the `timezone=` hardening the finding calls "correct and harmless" is unaffected
+    either way.
+
+PROOF. `tests/test_w23_scheduler_timezone.py`, 14 -> 16 tests (net +2: the two rebuilds are 1-for-1
+replacements; +1 anti-vacuity test for the rescoped class guard; +1 control listing all nine
+recurring job ids). Mutation proof in [1] above is the pre-fix evidence — there is no separate
+"red count" because the rebuilt tests did not exist in executable form before this wave; the
+mutation shows precisely what each one catches. **No `inspect.getsource`** — the only remaining hit
+in this file is a docstring mention of what was removed.
+
+VERIFICATION. Full fast lane **2191 passed / 45 skipped / 1 failed** (964s) — the standing local-
+`.env` `test_r19_config_authority` case. Reconciled by collection: the test file now collects 16;
+`2189 + 2 = 2191`. `compileall` OK. `scripts/typecheck.py` OK (its blocking scope is
+config/bot/execution/risk and does not cover `orchestration/`, but `compileall` plus 58 passing
+tests across every file that drives `master.py` cover the syntax and behaviour this wave touched).
+`scripts/smoke_deploy.py` -> SMOKE PASS (13 checks).
+
+STATE AT HANDOFF: committed on `feature/event-straddle`. **NOT RUNNING** — nothing runs on this box.
+`master.py` changed (the extraction), so this needs a **full supervisor restart** to deploy, not a
+bot restart — same file, same restart class as W34/W35's changes to it.
+
+NEXT: **W44** — `fail-direction-03` + `concurrency-4` (earnings fail-open gates + the cache's
+missing lock, one file/module, one root cause — `concurrency-4`'s only consequence is
+`fail-direction-03`'s fail-open). Back to the live-money track; first wave with a genuinely new
+subsystem (`data/earnings.py`, `data/cache.py`) rather than a narrow fix in already-familiar code,
+so budget time for a fresh read of both files before trusting the original roadmap's scoping —
+same discipline W41 and W42 both needed. Full roadmap through W51 plus the remaining test-honesty
+batches is in the 2026-09-21 REGISTER CORRECTION + ROADMAP entry.
