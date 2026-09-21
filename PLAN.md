@@ -8041,3 +8041,139 @@ deferral by default. Re-verify both items against HEAD before scoping either way
 every wave since W41 has needed.
 
 No inspect.getsource.
+
+---
+
+## 2026-09-22 - W49 EXECUTED — the meta-labeler's close-count floor is a real config field now, and the keeper's relaunch loop has a real pause switch
+
+`policy-vs-impl-7` and `docs-policy-04` were the one wave the roadmap itself flagged as needing an
+**operator decision before scoping** (PLAN.md:6697), and `docs-policy-04` had already been queued
+and deferred seven times. Both decisions were made this session, in a planning conversation before
+any code:
+
+- **`policy-vs-impl-7`**: three documents disagreed on the meta-labeler's minimum real-close floor
+  before it should be trusted for live entries — `config.yaml`'s comment said 50, PLAN.md's own
+  tracking table said 100+, and the code enforced neither at arm time
+  (`orchestrator.py` armed the gate on `settings.meta_label.enabled` alone). Operator instinct,
+  confirmed by reading the code first: rather than picking one of the three numbers, expose it as a
+  real config field the operator can change without a code deploy. Confirmed there was nothing to
+  leverage in config.yaml yet — the "50+" was a bare comment, `MetaLabelConfig` had no close-count
+  field at all.
+- **`docs-policy-04`**: build `KEEPER_PAUSE` enforcement, not the doc-only alternative — matching
+  this project's general bias toward enforced-not-remembered kill switches.
+
+**1. `policy-vs-impl-7`.** New `MetaLabelConfig.min_closes_to_enable` (default 100, matching what
+the audit calls "the current-policy document"; bounds `30-500`, the floor matching the separate,
+unchanged `MIN_TRADES_FOR_TRAINING` statistical minimum). New
+`reporting.go_live.real_close_count(db_path, strategies=GO_LIVE_VERDICT_STRATEGIES)` — the
+count-only sibling of `compute_go_live_verdict`, same population (real closes,
+`not_real_close_sql`-filtered, IC-only), so the meta-label gate and the go-live scorecard agree on
+"how long is our track record" instead of a third counting convention. New
+`TradingOrchestrator._meta_label_arm_sufficient()` wired as a fourth `and` clause into the existing
+live entry-consumption gate inside `_scan_symbol` — the only place live entries are actually
+influenced; `__init__`-time construction and training already have their own separate,
+unrelated gates, left untouched. Re-checked every scan (not cached at startup), so crossing the
+threshold mid-day takes effect on the very next scan. Fails CLOSED on any error, which for this
+specific gate means falling back to today's baseline of no meta-label opinion at all — the
+meta-labeler can only make entries MORE conservative, so skipping it on an unreadable count reverts
+to the already-proven primary-model-only behaviour rather than blocking anything.
+
+**2. `docs-policy-04`.** `keeper_ait.bat` (the Windows box's outer supervisor, relaunching
+`run_orchestrator.py` within ~90s of no matching process existing) now checks for
+`data\KEEPER_PAUSE` immediately after its existing log-rotation block: if present, logs the pause
+and skips BOTH the alive-check/relaunch AND the deadman ping for that tick, via a new `:sleep` label
+placed right before the existing three-fallback delay chain. Bare marker file, same convention as
+`data/HALT` (create = engage, delete = resume). `docs/RUNBOOK.md`'s kill-switch table gained the
+`data/KEEPER_PAUSE` row pair and the "Full stop" row now creates it first; the manual-intervention
+procedure's step 2 creates it before stopping bot processes, step 5 deletes it.
+
+**Cannot be executed from this Mac dev box** — `keeper_ait.bat` is Windows batch syntax. Verified
+instead by a careful dry-run trace of both branches against the script's own already-proven idioms:
+confirmed byte-identical behaviour in the no-pause case (the new `if exist` block is a no-op when
+the file is absent; the new `:sleep` label is a no-op when reached by normal fall-through, since a
+label alone does not alter control flow) and the intended skip-to-sleep behaviour when paused,
+traced line by line against the actual current file. **This needs a human with hands on the
+Windows box to confirm the branch behaves as read, the first time it actually fires** — registered
+here, not silently assumed.
+
+**`CLAUDE.md` was also edited to list `data/KEEPER_PAUSE`, but this is LOCAL TO THIS MAC CHECKOUT
+ONLY, not shipped anywhere.** Found mid-implementation, not anticipated when this was planned:
+`CLAUDE.md` is gitignored in this repo (`.gitignore:35` — the operator's own pre-existing comment,
+"Agent context — local-only for now; decide later whether to share it with the repo"). The edit was
+never staged, committed, or pushed, and there is no git-based path for it to reach the Windows box
+or any other checkout. Stating this plainly rather than letting "CLAUDE.md updated" read as
+"shipped everywhere" — a future session (or the operator) needs to either edit that box's own copy
+directly, or decide to stop gitignoring the file.
+
+PROOF: Part 1's `git stash` mutation — all 7 new tests fail (`ImportError`, the function does not
+exist) against the reverted code before passing clean against the fix. Part 2 has no automated
+proof, per the limitation above — the dry-run transcript is the proof, recorded honestly as such.
+
+VERIFICATION:
+- `python -m compileall -q src` / `python scripts/typecheck.py` clean throughout.
+- New file `tests/test_w49_meta_label_close_floor.py` (7 tests, no `inspect.getsource`): the count
+  helper against a real StateManager; the new method's both directions plus the fail-closed error
+  path; and — proving the WIRING, not just the helper in isolation — a real `_scan_symbol` driven
+  through the `build_smoke_orchestrator` rig with a fake trained meta-labeler configured to always
+  reject, showing the reject is skipped below the floor and respected at/above it.
+- Grep-audited every file referencing `go_live`/`meta_label` in `tests/` (18 files) and re-ran them
+  **together, in one combined run** — an earlier partial sweep during Part 1 implementation had
+  missed several of the 18 (including, briefly, this wave's own new test file) and reported 312;
+  caught before committing, not after, by actually running the complete list: **447 passed / 2
+  skipped / 80 deselected** (1 failed — the same standing local-`.env` artifact, addressed below).
+- `python scripts/smoke_deploy.py` → `SMOKE PASS (13 checks)`.
+- Full fast lane, count taken by **running** it: **2 failed / 2284 passed / 45 skipped / 153
+  deselected** (1699s). Reconciles exactly once both failures are understood, neither a W49
+  regression:
+  - `test_r19_config_authority.py::...test_applier_and_readers_share_one_table` — the standing
+    local-`.env` artifact, unchanged, confirmed by name.
+  - The W30-registered `test_watchdog.py` wall-clock flake did **not** fire this run (consistent
+    with it being genuinely intermittent, not a permanent failure) — its 2 tests passed instead,
+    which is where 2 of this run's "extra" passes over a naive `2275+7=2282` estimate come from.
+  - **A THIRD, previously unseen failure this session, found and fully diagnosed, not a W49
+    regression — registered here, not fixed:** `test_r17_live_fixes.py::
+    TestEarningsExitReachableDespiteInertDelta::test_pre_earnings_exit_fires_two_days_out`. Root
+    cause verified directly, not assumed: the test's own mock fixture builds its earnings date with
+    bare `date.today()` (server-local clock) instead of `now_et().date()`, while the production code
+    it exercises (`portfolio.py`'s rule 3c, `earnings.py` finding [7] in this SAME test file's own
+    docstring) correctly uses the ET-authoritative clock. This dev box's local clock is CEST
+    (confirmed: `date.today()` returned 2026-09-22 while `today_et()` returned 2026-09-21, a 6-hour
+    gap matching orchestrator.py's own documented "this host runs CEST = ET+6" note elsewhere) — so
+    this specific test flakes during the ~6-hour daily window when CEST's calendar date has already
+    rolled over but ET's has not, which is exactly the window this full-lane run happened to fall
+    in (00:47 CEST / 18:48 ET the previous day). Confirmed isolated and unrelated to this wave: the
+    test passes in isolation outside that window, fails in isolation inside it (not an
+    ordering/suite-pollution flake), and neither the test file nor `portfolio.py`'s rule 3c nor
+    `earnings.py` were touched by W47, W48, or W49. This is the exact "host clock vs ET" bug class
+    this project's own audit programme (R17, W20, W21, W23) has repeatedly hunted in PRODUCTION
+    code — this instance is a blind spot in a TEST'S OWN fixture that no prior round caught, in the
+    very test file that exists to prove an `earnings.py` clock-authority bug was fixed. **Not fixed
+    here** (out of scope for W49, per this project's own register-don't-fix discipline — this wave
+    does not touch `portfolio.py`, `earnings.py`, or this test file for any other reason). Suggested
+    fix for whoever takes it: `next_earnings_date=now_et().date() + timedelta(days=earnings_in_days)`
+    in the test's `_manager()` helper, matching the exact convention `earnings.py` itself already
+    uses.
+  - A minor, unexplained residual: skipped count moved 46 → 45 (a −1), not fully chased down (the
+    file with the new failure shows 0 skips on its own, so it is a different, small, unrelated
+    shift somewhere else in the ~2,300-test suite) — flagged rather than silently absorbed into the
+    arithmetic, matching the standing discipline since W30/W47 of surfacing count anomalies instead
+    of hiding them. Left for whoever next needs a clean baseline.
+  - Arithmetic: `2275 (W48 close) + 2 (test_watchdog tests that passed instead of flaking this run)
+    + 7 (this wave's new tests) = 2284` — exact match.
+
+STATE AT HANDOFF: two commits (`W49: policy-vs-impl-7 ...`, `W49: docs-policy-04 ...`), each
+independently revertible, plus this entry. **NOT RUNNING** — nothing on the Windows box is
+restarted by me; the bot restart is the operator's call per the standing rule. Two real open items
+left on purpose: (1) `keeper_ait.bat` needs a human with hands on the Windows box to confirm the new
+branch behaves as read, since this session could not execute it; (2) the `CLAUDE.md` edit is local
+to this Mac checkout only, per the gitignore finding above — the Windows box's own copy (if any)
+does not know about `data/KEEPER_PAUSE` unless someone edits it there directly. Also newly
+registered, not fixed: the `test_r17_live_fixes.py` CEST/ET test-clock bug detailed above.
+
+NEXT: **W50** — `money-flow-05` + `trade-life-partial-slice-pnl-erased` (near-identical erasure,
+one fix two tests) → `trade-life-promotion-ignores-broker-quantity` (separate, reconciler-side,
+more dangerous), per the roadmap (PLAN.md:6698, sized ~3 days, "fully de-risked by W41's guard-rail;
+safe to slip"). Re-verify against HEAD before scoping — nothing about W50 has been re-checked this
+session, same discipline every wave since W41 has needed.
+
+No inspect.getsource.
