@@ -24,6 +24,7 @@ from ait.broker.ibkr_client import IBKRClient
 from ait.broker.orders import OrderBuilder
 from ait.config.runtime_env import capital_base, capital_base_source, contract_flag, contract_float
 from ait.config.settings import Settings
+from ait.data.dividends import DividendCalendar
 from ait.data.earnings import EarningsCalendar
 from ait.data.economic_calendar import EconomicCalendar
 from ait.data.edgar_filings import EDGARMonitor
@@ -329,6 +330,14 @@ class TradingOrchestrator:
                 settings.earnings.refuse_entries_when_data_unavailable),
             lkg_max_age_hours=settings.earnings.lkg_max_age_hours,
         )
+        # W51 (model-vs-reality-ex-div-assignment-void): EarningsCalendar's
+        # twin, protecting against early-assignment risk around ex-dividend
+        # dates instead of IV crush around earnings.
+        self._dividends = DividendCalendar(
+            refuse_entries_when_data_unavailable=(
+                settings.dividends.refuse_entries_when_data_unavailable),
+            lkg_max_age_hours=settings.dividends.lkg_max_age_hours,
+        )
         self._economic_cal = EconomicCalendar()
 
         # SEC EDGAR 8-K monitor — flatten positions on material events
@@ -350,6 +359,7 @@ class TradingOrchestrator:
             exit_config=settings.exit,
             earnings_calendar=self._earnings,
             economic_calendar=self._economic_cal,
+            dividend_calendar=self._dividends,
         )
         # GOV-5 (governance audit): live-profile assertion — the liquidity
         # gates were deliberately relaxed for paper/delayed data
@@ -3439,6 +3449,28 @@ class TradingOrchestrator:
                     log.info("trade_blocked_earnings", symbol=signal.symbol, expiry=str(signal.expiry))
                 return True  # symbol blocked through earnings
 
+            # W51 (model-vs-reality-ex-div-assignment-void): same slot as the
+            # earnings gate above, one slot later. Only relevant for a
+            # signal that SELLS a call — the leg an ex-div early-assignment
+            # actually hits.
+            if self._signal_sells_a_call(signal) and self._dividends.would_hold_through_ex_div(
+                    signal.symbol, today_et(), expiry_date):
+                # Same data_available distinction as the earnings gate.
+                info = self._dividends.get_next_ex_div(signal.symbol)
+                if not info.data_available:
+                    log.warning("dividend_data_unavailable_entry_refused", symbol=signal.symbol)
+                    if self._alert_gate("dividend_data_unavailable", interval_s=3600):
+                        await self._send_notification(
+                            f"DIVIDEND DATA UNAVAILABLE for {signal.symbol} — no "
+                            f"confirmed ex-dividend answer and no usable "
+                            f"last-known-good. New short-call entries for this "
+                            f"symbol are being refused FAIL-CLOSED until this "
+                            f"clears. Exits are unaffected."
+                        )
+                else:
+                    log.info("trade_blocked_ex_div", symbol=signal.symbol, expiry=str(signal.expiry))
+                return True  # symbol blocked through ex-dividend
+
         # Build trade request for risk validation
         # R7: VIX with last-known-good fallback. `or 0.0` made the VIX-28
         # credit halt FAIL OPEN on any fetch hiccup (0 is falsy, gate skipped).
@@ -4296,6 +4328,31 @@ class TradingOrchestrator:
             return max(1, len(_json.loads(trade.legs))) if trade and trade.legs else 4
         except Exception:  # noqa: BLE001
             return 4
+
+    @staticmethod
+    def _signal_sells_a_call(signal) -> bool:
+        """W51 (model-vs-reality-ex-div-assignment-void): does this SIGNAL
+        (pre-trade — not yet a TradeRecord) sell a call leg? The only shape
+        the ex-div entry gate cares about, since that's the leg an early
+        assignment actually hits. Extracted as its own testable unit rather
+        than left inline in _try_execute, matching _legs_count/
+        _archived_partial_pnl above.
+
+        signal.legs carries {"contract": OptionContract, "action": ...} (the
+        pre-serialization in-memory shape) — NOT trade.legs' flat JSON dicts
+        used by portfolio.py's rule 3e (the exit-side twin of this gate),
+        which is a genuinely different shape, not just a naming accident:
+        a Signal is built once by a strategy and never round-tripped through
+        JSON until execute_signal writes the trade row.
+        """
+        if signal.legs:
+            return any(
+                str(leg.get("action", "")).upper() == "SELL"
+                and getattr(leg.get("contract"), "right", None) == "C"
+                for leg in signal.legs
+            )
+        return (str(signal.action).upper() == "SELL"
+               and signal.contract is not None and signal.contract.right == "C")
 
     def _settle_deferred_trueups(self) -> None:
         """R16: settle deferred commission true-ups once the day's

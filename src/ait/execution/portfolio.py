@@ -80,6 +80,7 @@ class PortfolioManager:
         exit_config: ExitConfig | None = None,
         earnings_calendar=None,
         economic_calendar=None,
+        dividend_calendar=None,
     ) -> None:
         self._ibkr = ibkr_client
         self._market_data = market_data
@@ -89,6 +90,9 @@ class PortfolioManager:
         self._exit_config = exit_config or ExitConfig()
         self._earnings = earnings_calendar
         self._economic_cal = economic_calendar
+        # W51 (model-vs-reality-ex-div-assignment-void): EarningsCalendar's
+        # twin — see rule 3e below (pre_ex_div_assignment_risk).
+        self._dividends = dividend_calendar
         # Optional async notifier (orchestrator wires _send_notification):
         # used for prolonged marks-missing and PDT-blocked-stop alerts, both
         # states where positions are silently unprotected (audit R2).
@@ -828,6 +832,78 @@ class PortfolioManager:
                     exit_reason = f"macro_event_flatten (days_to_event={days_to_event})"
             except Exception:
                 pass
+
+        # 3e. Ex-dividend early-assignment risk — close a short call whose
+        # extrinsic value is below the expected dividend, the day before
+        # ex-div, REGARDLESS of DTE (unlike rule 3 above, which is dte<=1
+        # only and keyed off trade.strike — meaningless for a multi-leg
+        # trade like an iron condor, whose real short-call strike lives in
+        # trade.legs). W51 (model-vs-reality-ex-div-assignment-void):
+        # early assignment is sharpest right before ex-div, when the
+        # dividend an assignor would capture exceeds the option's remaining
+        # time value — a risk this book had NO check for at any DTE before
+        # this wave. Same strategy list as 3c (pre_earnings_iv_crush) for
+        # consistency, though only iron_condor is live today.
+        # getattr-guarded (not self._dividends directly): many existing
+        # tests construct PortfolioManager via __new__ and set only the
+        # attributes their own scenario needs — _dividends didn't exist
+        # before this wave, so a bare attribute access here raised
+        # AttributeError OUTSIDE the try/except below (the condition itself
+        # isn't wrapped), crashing _evaluate_position for every such test.
+        # Reproduced directly: 27 pre-existing tests failed this way before
+        # this fix (see PLAN.md).
+        elif not should_exit and getattr(self, "_dividends", None) and trade.strategy in (
+            "iron_condor", "short_strangle", "cash_secured_put", "covered_call",
+        ):
+            try:
+                short_call_strike: float | None = None
+                short_call_expiry: str = trade.expiry or ""
+                try:
+                    _legs = json.loads(trade.legs) if trade.legs else []
+                except (ValueError, TypeError):
+                    _legs = []
+                if _legs:
+                    # Same idiom as rule 1b's touch-stop short-call lookup.
+                    for _leg in _legs:
+                        if (str(_leg.get("action", "")).upper() == "SELL"
+                                and str(_leg.get("right", _leg.get("type", ""))
+                                        ).upper().startswith("C")):
+                            _k = float(_leg["strike"])
+                            if short_call_strike is None or _k < short_call_strike:
+                                short_call_strike = _k
+                                short_call_expiry = str(_leg.get("expiry", trade.expiry or ""))
+                elif trade.contract_type == "call" and trade.strike:
+                    # Single-leg synthesis, same shape as
+                    # _option_position_unrealized's — a covered_call/short
+                    # naked call has no legs JSON, trade.strike IS the short
+                    # call's own strike.
+                    short_call_strike = float(trade.strike)
+
+                if short_call_strike is not None and current_price:
+                    info = self._dividends.get_next_ex_div(trade.symbol)
+                    if info.next_ex_div_date is not None:
+                        days_to_ex_div = (info.next_ex_div_date - today_et()).days
+                        if days_to_ex_div == 1 and (info.expected_amount or 0) > 0:
+                            _expiry_key = short_call_expiry.replace("-", "")[:8]
+                            mark = (option_marks or {}).get(
+                                (trade.symbol, _expiry_key, short_call_strike, "C"))
+                            if mark is not None:
+                                extrinsic = mark - max(0.0, current_price - short_call_strike)
+                                if extrinsic < info.expected_amount:
+                                    should_exit = True
+                                    exit_reason = (
+                                        f"pre_ex_div_assignment_risk (extrinsic="
+                                        f"{extrinsic:.2f}, dividend="
+                                        f"{info.expected_amount:.2f}, "
+                                        f"strike={short_call_strike:.2f})"
+                                    )
+            except Exception as e:  # noqa: BLE001
+                # This is the exit side: fail OPEN, matching rule 3c's own
+                # documented rationale — a missed early-close on bad
+                # calendar/mark data is strictly better than a forced exit,
+                # and the position's other exit rules (touch, assignment
+                # dte<=1, expiry) still apply as a backstop.
+                log.warning("ex_div_check_failed", symbol=trade.symbol, error=str(e))
 
         # 4. Check for partial exit milestones (only if not already exiting
         # fully, and only with real marks)

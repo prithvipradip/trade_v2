@@ -1489,23 +1489,41 @@ class PositionReconciler:
                     # three that doesn't. An assigned/exercised short option
                     # leaves a live, unmanaged stock position (no stop, no
                     # exit) while new entries stayed completely UNFROZEN.
-                    # Deliberately NOT given the OPT branch's debounce above:
-                    # that exists for an empirically observed position-STREAM
+                    # Fixed there; two follow-ups explicitly left open for
+                    # "W51's deeper pass" are resolved here:
+                    #
+                    # (1) No debounce, deliberately (kept from W41's own
+                    # reasoning, not revisited): the OPT branch's two-sighting
+                    # rule exists for an empirically observed position-STREAM
                     # flicker (R5, 2026-07-09, QQQ 500C sighted-then-disproved
-                    # twice); assignment is a discrete overnight broker event,
-                    # not a stream artifact, and there's no equivalent
-                    # evidence a stock-position sighting flickers the same
-                    # way. Whether STK should get its own debounce, and
-                    # whether it should route through the Telegram
-                    # declare-yes/no flow the OPT branch uses, is a real
-                    # design question left to W51's deeper pass — this piece
-                    # only closes the "never freezes at all" gap.
+                    # twice). Assignment is a discrete overnight broker event,
+                    # not a stream artifact, and nothing suggests a STK
+                    # sighting flickers the same way — freezing on the first
+                    # sighting is correct here, not a gap.
+                    # (2) DOES now route through the same Telegram
+                    # declare-yes/no flow the OPT branch uses (kind="stock"
+                    # so the prompt correctly says "stock", not "option") —
+                    # for consistency and so a genuinely manual stock
+                    # position (a declared hedge, a transferred-in holding)
+                    # doesn't re-freeze every single reconcile pass forever.
+                    from ait.execution import manual_positions as _mp
+                    if _mp.declared_quantity_matches(
+                            self._state, key, ibkr_pos["quantity"]):
+                        log.info("declared_manual_position_seen", position=key,
+                                 qty=ibkr_pos["quantity"])
+                        continue
                     frozen_keys.append(key)
+                    _telegram = getattr(self, "_telegram", None)
+                    if _telegram is not None:
+                        await _mp.prompt_if_needed(
+                            self._state, _telegram, key, ibkr_pos["quantity"],
+                            kind="stock")
                     msg = (
                         f"UNTRACKED STOCK POSITION (possible ASSIGNMENT): {key}, "
                         f"qty={ibkr_pos['quantity']}, avg_cost={ibkr_pos['avg_cost']} "
                         f"— needs manual liquidation/review — NEW ENTRIES FROZEN "
-                        f"(data/HALT_UNTRACKED)"
+                        f"(data/HALT_UNTRACKED). Resolve manually, reply to the "
+                        f"Telegram prompt if it's yours, or delete the file."
                     )
                     log.critical("reconcile_untracked_stock_assignment",
                                  position=key, qty=ibkr_pos["quantity"])

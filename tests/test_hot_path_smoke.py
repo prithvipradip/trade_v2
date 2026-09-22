@@ -431,6 +431,11 @@ def build_smoke_orchestrator(config_path: Path | str = CONFIG_PATH) -> SmokeRig:
     orch._scheduler.should_avoid_new_trades = lambda: False
     orch._earnings.is_near_earnings = lambda *a, **k: False
     orch._earnings.would_hold_through_earnings = lambda *a, **k: False
+    # W51 (model-vs-reality-ex-div-assignment-void): the ex-div entry gate is
+    # the earnings gate's twin, added this wave — same reason it needs
+    # neutralizing here: real yfinance dividend history is date-relative to
+    # whenever this smoke runs, and must not accidentally block trades.
+    orch._dividends.would_hold_through_ex_div = lambda *a, **k: False
     orch._economic_cal.days_until_next_event = lambda: 30
     orch._economic_cal.should_skip_trading = lambda: False
 

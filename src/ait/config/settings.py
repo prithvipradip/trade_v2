@@ -496,6 +496,28 @@ class EarningsConfig(_StrictModel):
                     "days after the earnings date (post-print IV settling).")
 
 
+class DividendConfig(_StrictModel):
+    """W51 (model-vs-reality-ex-div-assignment-void): DividendCalendar's
+    twin of EarningsConfig above — same last-known-good policy, applied to
+    ex-dividend dates instead of earnings dates. Unlike earnings (dead for
+    the ETF-only live universe — no symbol has a per-company earnings date),
+    every name in the universe pays a real, regular dividend, so this gate
+    is live every quarter (monthly for TLT) rather than effectively inert."""
+
+    refuse_entries_when_data_unavailable: bool = Field(default=True,
+        description="Refuse new entries for a symbol when its dividend data "
+                    "is unknown (never fetched, or the fetch failed with no "
+                    "usable last-known-good). Operator escape hatch if this "
+                    "ever misfires live -- flip to False to restore the old "
+                    "always-allow behavior without a code deploy.")
+    lkg_max_age_hours: int = Field(default=168, ge=1, le=720,
+        description="How long a successful dividend fetch may be reused "
+                    "after a later fetch fails. Ex-dividend dates move "
+                    "rarely once a schedule is established, so a week-old "
+                    "confirmed answer beats refusing entries outright; past "
+                    "this, treat the symbol as unknown again.")
+
+
 class SentimentConfig(_StrictModel):
     """R12-C tombstone: the sentiment stack (ait.sentiment, ib_news,
     fundamentals_db) is retired to deprecated/src/ — verified zero influence
@@ -722,6 +744,7 @@ class Settings(_StrictModel):
     ml: MLConfig = MLConfig()
     meta_label: MetaLabelConfig = MetaLabelConfig()
     earnings: EarningsConfig = EarningsConfig()
+    dividends: DividendConfig = DividendConfig()
     exit: ExitConfig = ExitConfig()
     learning: LearningConfig = LearningConfig()
     sentiment: SentimentConfig = SentimentConfig()

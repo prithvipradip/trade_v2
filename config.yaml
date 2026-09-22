@@ -243,6 +243,15 @@ earnings:
   buffer_days_before: 2                # Block entries / flag exits starting N days before a known earnings date
   buffer_days_after: 1                 # Keep the danger zone open N days after earnings (post-print IV settling)
 
+dividends:
+  # W51 (model-vs-reality-ex-div-assignment-void deep half): unlike earnings
+  # above, this universe is NOT dividend-inert -- SPY/QQQ/IWM pay quarterly
+  # and TLT pays monthly, so unknown dividend data refusing entries is a
+  # real, regularly-armed protection, not a no-op. Flip to false to restore
+  # always-allow if this ever misfires live.
+  refuse_entries_when_data_unavailable: true
+  lkg_max_age_hours: 168               # Reuse a confirmed fetch for up to a week before treating it as unknown again
+
 exit:
   exit_cross_amount: 0.10             # How far combo exits cross the spread to guarantee fills (was hardcoded)
   # W7/R24 logic-exit-risk-01: credit buyback ceiling as a multiple of the

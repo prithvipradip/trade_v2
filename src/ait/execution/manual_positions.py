@@ -240,16 +240,24 @@ def _buttons(key: str) -> list[tuple[str, str]]:
 
 
 async def prompt_if_needed(
-        state: StateManager, telegram: TelegramNotifier, key: str, qty: float) -> None:
+        state: StateManager, telegram: TelegramNotifier, key: str, qty: float,
+        kind: str = "option") -> None:
     """Send the declare/reject prompt exactly once per key — re-entrant safe
     across reconcile cycles, since it checks for an existing message_id
-    first."""
+    first.
+
+    W51 (model-vs-reality-ex-div-assignment-void): `kind` defaults to
+    "option" so the existing OPT-branch call site (reconciler.py) is
+    unchanged; the STK branch (an assignment) passes "stock" so the operator
+    isn't told an assignment's 100-share stock position is an "option
+    position".
+    """
     if state.get_state(_MSGID_PREFIX + key):
         return  # already asked
     # W30 (finding #5): the qty the operator is being SHOWN, so a later size
     # change on the same contract can be detected against this baseline.
     state.set_state(_QTY_PREFIX + key, str(qty))
-    text = (f"🔔 Unmanaged option position detected:\n{key}  qty={qty}\n\n"
+    text = (f"🔔 Unmanaged {kind} position detected:\n{key}  qty={qty}\n\n"
             f"Is this a manual/intentional trade of yours? New entries stay "
             f"frozen until you answer.\n"
             f"({_ACCEPTED_HELP}.)")
