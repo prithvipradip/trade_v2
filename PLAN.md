@@ -8221,3 +8221,239 @@ NEXT: **W50** (unchanged from the entry above) — re-verify against HEAD before
 above saves the grep, not the re-verification.
 
 No inspect.getsource — this entry doesn't touch test files at all.
+
+---
+
+## 2026-09-22 - W50 EXECUTED — partial-exit P&L now survives the close, and reconciler promotion adopts broker quantity
+
+Third and final wave of the "qty>1 ledger fork" (R26 register Group F), following the roadmap
+(PLAN.md:6698) and W41's GOV-6 guard-rail. All three source findings are in
+`reports/blindspot_composition_hunt_20260825.md`: `money-flow-05` (line 532),
+`trade-life-partial-slice-pnl-erased` (line 540), `trade-life-promotion-ignores-broker-quantity`
+(line 548).
+
+**Three decisions made this session, in a planning conversation before any code** (the roadmap
+flagged none of these as *requiring* an operator decision, unlike W49's pair, but they were
+genuine judgment calls a plan alone shouldn't make silently):
+
+1. When a partial slice closes, `daily_stats`/the breaker see it **immediately** (both partial-exit
+   paths feed them in real time; final close contributes the remainder only) rather than deferring
+   to final close as the register's own suggested fix reads — the deferred version would regress
+   BC-H3's real-time breaker visibility on a locked-in partial loss.
+2. GOV-6 (W41's startup refusal) **comes down** once Parts 1-2 are proven, rather than staying as
+   permanent defense-in-depth or being left for a later session to decide. `config.yaml`'s
+   `max_contracts_per_trade: 1` pin is untouched.
+3. Reconciler promotion **adopts** broker quantity when every leg agrees, and **freezes** new
+   entries (not the promotion itself) when legs disagree — chosen over always-adopt (silently
+   normalizes a genuinely broken structure) and always-refuse (leaves a live position unmonitored).
+
+**Re-verification against HEAD (this session), before any of the above was decided:** all three
+findings' mechanisms confirmed intact, but the register's own line numbers are stale everywhere
+(the report is dated 2026-08-25; every file it cites has moved substantially since — W37, W41, W48
+all touched this territory), and dormancy is TWO independent gates, not the one the register
+describes: `position_sizer.py`'s hard cap (`contracts = min(max_contracts, account_scale_cap,
+hard_cap)`, keyed to `config.yaml`'s `max_contracts_per_trade`) bounds the position sizer's own
+arithmetic; `paper_trading_mode: true` separately pins the learning multiplier at 1.0
+(`orchestrator.py` `apply_adaptations=not settings.learning.paper_trading_mode` ->
+`StrategyAdaptor(active=False)` -> `get_strategy_multiplier` returns 1.0 unconditionally). GOV-6
+only ever guarded the first gate — see the newly-registered finding below.
+
+**1. `money-flow-05` + `trade-life-partial-slice-pnl-erased`.** `state.py` `close_trade` DELETEd
+`open_positions.partial_exits` before anyone folded it into `realized_pnl` — a scaled-out trade's
+go-live PF input (`reporting/go_live.py` reads `trades.realized_pnl` directly) silently dropped
+every closed slice's P&L, permanently, the instant the DELETE ran. The executor's own true-partial
+branch (`_book_partial_exit`, the path a multi-leg fill like a condor scaling out actually takes —
+money-flow-05's own correction: the orchestrator's single-leg ladder path can never take a
+multi-leg partial) reached NO ledger at all, not even `daily_stats`, until the eventual final close.
+
+Fixed: `close_trade` now reads `open_positions.partial_exits`, sums the slices' `pnl`, and folds it
+into `realized_pnl` — atomically with the DELETE, via `BEGIN IMMEDIATE` (same idiom `book_exit_core`
+already uses), so a concurrent `record_partial_exit` for the same trade_id cannot land in the gap
+and be silently lost. The JSON is archived onto a new `trades.partial_exits` column (also added to
+`TradeRecord`) rather than just discarded — the erasure this closes. The `exit_outbox` row (read by
+the crash-recovery drain) carries the same folded total, not the bare remainder that used to be
+written there.
+
+The executor's true-partial branch now feeds `daily_stats`/the breaker in real time via
+`record_partial_pnl`, mirroring the orchestrator's own ladder path (`_execute_partial_exit`, which
+has done this since BC-H3) instead of reaching no ledger. This creates a new problem the register's
+own suggested fix doesn't address: with BOTH partial paths now feeding stats/breaker in real time,
+booking the FULL folded total again at final close would double-count every slice. Resolved by
+splitting "the money delta" from "the win/loss verdict" at the booking layer:
+`book_exit_core`/`record_trade_result` both gain an `outcome_pnl` parameter (defaults to `pnl`,
+so every existing call site is behaviourally unchanged); the orchestrator computes
+`money_delta = realized_pnl - _archived_partial_pnl(trade)` (the new helper reads
+`trades.partial_exits`, so the live callback path and the `_drain_exit_outbox` crash-recovery path
+derive the identical number from the identical source, not from anything threaded through
+`completed_exits`/`exit_outbox`) and passes `outcome_pnl=realized_pnl` — so `daily_stats.total_pnl`
+gets each dollar exactly once, while Thompson, drift, the human-facing notification, and the
+consecutive-loss counter all read the trade's FULL round trip (a trade that nets positive overall
+via an earlier partial gain resets the loss streak even if its remainder slice alone was a loss).
+
+**A bug in my own first pass, caught by writing the tests before declaring done, not by review:**
+the executor's two `completed_exits.append(...)` call sites (the main fill-handling path and
+`_book_partial_exit`'s "covered the whole remaining position" branch) built their dict from the
+PRE-`close_trade` local `realized_pnl` variable — never reassigned after `close_trade` folded the
+real number into the DB. For any trade with partial history this would have fed the in-process
+booking path the bare remainder while the crash-recovery drain (reading `exit_outbox` directly)
+got the correct folded total — the two paths disagreeing on "this trade's P&L" depending on which
+one happened to book it. Invisible for every trade with no partial history (folded == remainder),
+which is every trade tested until `tests/test_w50_qty_ledger_fork.py`'s
+`TestFinalBookingDoesNotDoubleCountRealTimeFedSlices` was written against the real code path rather
+than a hand-built `completed_exits` dict. Fixed: both sites now re-read `trades.realized_pnl` from
+the DB after a successful close instead of reusing the pre-close local.
+
+The commission true-up's remembered estimate (`commission_est_{trade_id}`, W37) used to be
+OVERWRITTEN by each `_calculate_realized_pnl` call — a trade with partial history calls it once per
+slice plus once for the remainder, and the true-up diffs whatever is remembered against
+`total_commission()`, which sums EVERY execution row (entry + every partial + final leg). Now
+accumulates (read-add-write) instead of overwriting, so the remembered figure is the total estimate
+across every slice — the right basis for the diff.
+
+**2. `trade-life-promotion-ignores-broker-quantity`** (separate commit, the more dangerous of the
+two per the roadmap). Reconciler promotion (`reconcile()`'s PENDING->FILLED and CLOSING->FILLED
+branches, and `_sweep_stale_pending`'s own PENDING rescue) adopted the LOCAL trade quantity
+unconditionally — `grep update_trade_quantity src/ait/execution/reconciler.py` returned zero hits
+before this wave, at any of the three sites. The later exit then reverses `trade.quantity` blind
+(`orchestrator.py`'s `combo_limit(quantity=trade.quantity)` calls), so a restart that missed a
+partial fill or exit could close what exists at the broker and open the difference inverted — the
+R12 F4.3 reversal incident class, resurrected on the restart path.
+
+Fixed two ways. New `_adopt_or_flag_quantity`, called at all three promotion sites right before the
+`open_positions` row is written: when every leg of the trade agrees with the broker at some OTHER
+quantity, adopt it (`update_trade_quantity`) and use the adopted trade for the row; when legs
+disagree, do not guess which number is real — append to `frozen_keys` so `HALT_UNTRACKED` freezes
+new entries, the exact path the untracked-position branches already use, and leave `trade.quantity`
+untouched. `matching_trades` is kept in sync (index-based iteration, not a fresh loop variable) so
+the pre-existing report-only quantity-mismatch diagnostic a few lines later reads the adopted
+figure, not a now-stale one.
+
+Separately, and this is the change that actually closes the reversal risk regardless of whether a
+given promotion adopted or froze: `position_liveness` — the gate the exit path already consults
+before every reverse combo, refusing on `"partial"` (`orchestrator.py`, `if liveness == "partial":
+... needs a human`) — was a pure KEY-SET comparison. Every leg present, at ANY quantity, read as
+`"live"`; a leg present but at HALF `trade.quantity` was indistinguishable from a fully intact
+position. Now quantity-aware: `_live_ibkr_leg_keys` returns a key -> quantity dict instead of a bare
+key set (its one other caller, the sweep's `isdisjoint` check, is unaffected — a dict iterates as
+its keys), and `position_liveness` returns `"partial"` when every leg is present but short of
+`trade.quantity`. This is the actual safety net: even a mismatch nothing adopted (or one from any
+other cause) is caught before the reversal, not just at promotion time.
+
+**3. GOV-6 retired.** W41's startup refusal on `max_contracts_per_trade > 1` existed "until the
+qty>1 booking path is fixed (PLAN.md W50)". Removed in its own commit, once Parts 1-2 were proven —
+a guard-rail that outlives its bug is a false statement about the system.
+`tests/test_w41_live_money_floors.py`'s test asserting the refusal retires with it; its
+`=1`-constructs-cleanly control stays, since that remains true. `config.yaml`'s pin is unchanged;
+raising it is a separate trading decision (Phase-2 learning volume), not a consequence of this fix.
+
+**Newly registered, not fixed — the multiplier bypass (`orchestrator.py:3501-3523`).** Found while
+tracing exactly how `adjusted_size` could exceed 1 despite the sizer's hard cap, to confirm GOV-6
+only ever guarded ONE of the two dormancy gates (see re-verification above). The post-validation
+learning-multiplier scale-up re-validates at the larger size
+(`self._risk_manager.validate_trade(TradeRequest(..., contracts=adjusted_size, ...))`) specifically
+BECAUSE a naive scale-up would bypass every dollar-gate the smaller size passed (the GATE-BYPASS FIX
+comment at this same site, from 2026-07-07). But the revalidation's OWN result is only consulted for
+its `approved` boolean: `if not revalidation.approved: adjusted_size = max(1,
+validation.position_size)`. An APPROVED-BUT-SMALLER revalidation (the sizer's own hard cap
+independently clamps `size.contracts` regardless of what was requested, so `final_contracts =
+min(request.contracts, size.contracts)` can legitimately approve fewer than asked) leaves
+`adjusted_size` at the larger, NEVER-VALIDATED-AT-THAT-SIZE value — which is what
+`execute_signal(signal, adjusted_size)` then receives. Inert today: reaching `adjusted_size > 1`
+requires `strategy_mult != 1.0`, and `paper_trading_mode: true` pins the multiplier's own source
+(`StrategyAdaptor.get_strategy_multiplier`) at exactly 1.0 (verified — `apply_adaptations =
+not settings.learning.paper_trading_mode`, `active=False` short-circuits to `return 1.0`
+unconditionally). This is the one route to qty>1 that GOV-6 never covered (it only asserted the
+config knob), and the one Part 3 removes the guard on without touching. Worth its own wave: the fix
+is not "clamp to `revalidation.contracts`" alone — `revalidation.max_loss` and every other dollar
+figure computed off the ORIGINAL `adjusted_size` (the aggregate-risk key at
+`self._position_capital_at_risk(signal, adjusted_size)`, the Telegram message) would also need to
+shrink consistently, and that needs its own careful pass, not a one-line patch under this wave's
+findings.
+
+**Newly registered, not fixed — a wall-clock-boundary test flake, same bug class as the
+`test_r17_live_fixes.py` CEST/ET finding W49 registered, different file.**
+`tests/test_w41_live_money_floors.py::TestPDTHistorySurvivesATransientLock` (both tests) started
+failing partway through this session — NOT caused by this wave, confirmed by reproducing the
+identical failure with all five W50 implementation files fully `git stash`-reverted. Root cause
+verified precisely, not assumed: `pdt_guard.py`'s `_purge_old_trades()` runs on every
+`_load_state()`/construction and drops day-trade entries older than
+`get_recent_trading_days(WINDOW_DAYS=5)`'s cutoff, computed from `now_et().date()` AT CALL TIME
+(`utils/time.py:178`, `today = now_et().date()`) — not pinned to any fixture. The test hardcodes
+three entries at 2026-09-15/16/17 and asserts all three survive. With "today" (ET) at 2026-09-21,
+the 5 most recent NYSE trading days are exactly {09-15, 16, 17, 18, 21} — 09-15 survives. With
+"today" at 2026-09-22 (this session crossed that boundary — confirmed, this Mac's CEST clock runs
+ET+6 per W49's own finding, so ET's midnight rollover into 09-22 lands at 06:00 CEST, and this
+session's wall-clock runtime crossed it), the window becomes {09-16, 17, 18, 21, 22} — 09-15 is
+purged, and the test's "three survive" premise fails by exactly one entry, exactly matching the
+observed failure (`deque([('2026-09-16', 'SYM1'), ('2026-09-17', 'SYM2')])`, SYM0/09-15 missing).
+Not fixed here (out of scope — this wave doesn't touch `pdt_guard.py` or this test file for any
+other reason). Suggested fix for whoever takes it: pin `now_et()` in the test (the `host_tz`-fixture
+idiom W41 itself used elsewhere in this same file for a different clock hazard) rather than hardcode
+dates relative to an unpinned "today".
+
+PROOF: every defect reproduced against pre-fix source before being fixed, via `git stash` of all
+five implementation files (state.py, executor.py, orchestrator.py, circuit_breaker.py,
+reconciler.py), leaving the new test file in place against the reverted code — 15 of 21 new
+tests failed, each for the exact reason it targets (the fold missing, the
+commission estimate overwritten not summed, the double-count, the win/loss misclassification, the
+executor's true-partial branch reaching no ledger, promotion not adopting, no `HALT_UNTRACKED`
+write on a non-uniform mismatch, `position_liveness` returning `"live"` instead of `"partial"`); the
+other 6 (every regression control) passed both before and after, as they should. Stash popped,
+full file re-run clean (21/21) before any commit.
+
+VERIFICATION:
+- `python -m compileall -q src tests` clean.
+- `python scripts/typecheck.py` -> `OK: no [attr-defined/call-arg/name-defined] errors in
+  src/ait/config, src/ait/bot, src/ait/execution, src/ait/risk`.
+- `python scripts/smoke_deploy.py` -> `SMOKE PASS (13 checks)`, including the no-write guarantee
+  (`no_writes(both DBs)` — row counts unchanged in both stores) across the new
+  `partial_exits`-column migration; `sqlite schema_version 23 -> 24` and one `data_version moved`
+  warning, both explicitly flagged by the script itself as expected on a migration-bearing deploy /
+  a concurrent commit, not failures.
+- Combined targeted run, all 61 files referencing the five changed modules, run together in one
+  invocation (not per-file — exactly the W49-learned lesson about partial sweeps missing files):
+  1272 passed, 3 skipped, 3 failed — the standing local-`.env` `test_r19_config_authority` case plus
+  the two newly-registered PDT-window tests above; zero failures attributable to this wave.
+- Full fast lane, count taken by running it: **2300 passed / 46 skipped / 153 deselected / 5
+  failed** (1081s). Reconciles exactly against the W49 baseline (2284 passed / 45 skipped / 153
+  deselected / 2 failed): this wave's own file changes are `tests/test_w50_qty_ledger_fork.py` (+21)
+  and `tests/test_w41_live_money_floors.py` (-1, the retired GOV-6 test), net +20 — `(2284+45+2) +
+  20 = 2351 = 2300+46+5`, exact match. Deselected is byte-identical (153), as expected (marker
+  selection, untouched by this wave). All 5 failures accounted for, none a W50 regression:
+  - `test_r19_config_authority.py::...test_applier_and_readers_share_one_table` — the standing
+    local-`.env` artifact, unchanged, confirmed by name (same as every wave since W41).
+  - The two newly-registered `TestPDTHistorySurvivesATransientLock` tests (above).
+  - `test_watchdog.py::TestOverallHealth::test_all_healthy` and `test_one_down_marks_overall_down`
+    — NEW to this run, not seen in the targeted sweep (that file isn't among the 61). Both assert on
+    `watchdog.get_health().status`; both got `DEGRADED`/`DOWN`-adjacent instead, with
+    `high_memory_usage limit_mb=1000.0 memory_mb=1023.4` logged alongside — the full lane's own
+    2300+ tests in one 18-minute process pushed resident memory past the watchdog's hardcoded 1GB
+    threshold, which the watchdog then (correctly, by ITS OWN logic) reports as degraded health.
+    Verified, not assumed: `pytest tests/test_watchdog.py` alone is 20/20 green. Consistent with —
+    though a more specific mechanism than — the W30-registered `test_watchdog.py` intermittent
+    full-lane flake W49's own entry names (that session's run happened not to trigger it; this one
+    did, via memory rather than wall-clock). The W49-session `test_r17_live_fixes.py` CEST/ET
+    failure it registered did NOT fire in this run — consistent with genuine intermittency: this
+    run executed at 08:09-08:27 CEST (2026-09-22), after ET's own midnight rollover into 09-22
+    (00:00 ET = 06:00 CEST), i.e. outside the CEST-ahead-of-ET window that bug needs; the PDT-window
+    bug above fires for the OPPOSITE reason (BECAUSE "today" has now fully rolled to 09-22 in both
+    clocks) — both are wall-clock-boundary sensitivities, at different boundaries, and this run's
+    specific timing landed past one and squarely inside the other.
+
+STATE AT HANDOFF: three commits on `feature/event-straddle`
+(`money-flow-05 + trade-life-partial-slice-pnl-erased`, `trade-life-promotion-ignores-broker-quantity`,
+`retire GOV-6`), each independently revertible — reverting the third alone restores GOV-6's guard —
+plus this entry. **NOT RUNNING** — nothing on this box is restarted by me; `orchestrator.py`
+changed, so deploying this needs a full supervisor restart, the operator's call per the standing
+rule. Two items newly registered above, not fixed: the multiplier-bypass gate and the PDT-window
+test flake.
+
+NEXT: **W51** — `model-vs-reality-ex-div-assignment-void` deep half (the daily pre-ex-div check and
+entry-blocking window, source report line 162) + `model-vs-reality-margin-model-unimplemented` deep
+half (`whatIfOrder`, `errorEvent` subscription, line 170), ~3-4 days per the roadmap
+(PLAN.md:6699). Not a normal implementation wave: R24's critic notes zero of 16 prior audit angles
+ever examined the broker-protocol layer (`ibkr_client.py`/`orders.py`/`contracts.py`/`account.py`) —
+start with its own probe pass. Re-verify against HEAD before scoping, same discipline every wave
+since W41 has needed.
+
+No inspect.getsource.
