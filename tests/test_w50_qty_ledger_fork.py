@@ -53,6 +53,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -462,3 +463,157 @@ class TestExecutorTruePartialFeedsStatsInRealTime:
             "a partial slice must never advance (or reset) the "
             "consecutive-loss counter — it is not a completed trade"
         )
+
+
+# ---------------------------------------------------------------------------
+# Part 2: trade-life-promotion-ignores-broker-quantity
+# ---------------------------------------------------------------------------
+
+def _condor_positions(qtys: list[float]) -> list:
+    """One position per CONDOR_LEGS entry, signed by short(-)/long(+),
+    magnitude from qtys (parallel list)."""
+    out = []
+    for leg, qty in zip(CONDOR_LEGS, qtys):
+        signed = -qty if leg["action"] == "SELL" else qty
+        out.append(_option_position(
+            "SPY", leg["strike"], leg["right"],
+            leg["expiry"].replace("-", ""), signed))
+    return out
+
+
+class TestPromotionAdoptsUniformBrokerQuantity:
+    def test_uniform_shortfall_is_adopted_not_left_stale(self, tmp_path):
+        """The defect, reproduced then closed: local quantity=2, every leg
+        at the broker shows only 1 (a fill/partial-exit missed while down).
+        Before this wave, promotion adopted the row as-is at quantity=2 —
+        the later exit would have reversed 2 units of a 1-unit position."""
+        st = _state(tmp_path)
+        _seed(st, quantity=2, legs=CONDOR_LEGS, status="pending")
+        ib = FakeIB()
+        ib.positions_list = _condor_positions([1.0, 1.0, 1.0, 1.0])
+
+        result = asyncio.run(_rec(st, ib).reconcile())
+
+        trade = st.get_trade_by_id(TID)
+        assert trade.status == TradeStatus.FILLED
+        assert trade.quantity == 1, (
+            f"expected the broker's confirmed quantity (1) to be adopted, "
+            f"got {trade.quantity}"
+        )
+        with sqlite3.connect(st._db_path) as conn:
+            row = conn.execute(
+                "SELECT quantity FROM open_positions WHERE trade_id = ?",
+                (TID,)).fetchone()
+        assert row[0] == 1, "open_positions must agree, not the stale pre-adoption figure"
+        assert result.promoted == 1
+
+    def test_no_shortfall_promotes_unchanged(self, tmp_path):
+        """CONTROL: the ordinary case — broker confirms exactly what's
+        recorded — must promote with no adoption and no freeze."""
+        st = _state(tmp_path)
+        _seed(st, quantity=2, legs=CONDOR_LEGS, status="pending")
+        ib = FakeIB()
+        ib.positions_list = _condor_positions([2.0, 2.0, 2.0, 2.0])
+
+        asyncio.run(_rec(st, ib).reconcile())
+
+        trade = st.get_trade_by_id(TID)
+        assert trade.status == TradeStatus.FILLED
+        assert trade.quantity == 2
+        assert _halt_text(tmp_path) is None
+
+    def test_closing_trade_promotion_also_adopts(self, tmp_path):
+        """The MORE dangerous of the two promotion sites: a CLOSING trade
+        rescued here is about to be re-offered to the exit monitor, whose
+        reverse combo prices at trade.quantity."""
+        st = _state(tmp_path)
+        _seed(st, quantity=2, legs=CONDOR_LEGS, status="closing")
+        ib = FakeIB()
+        ib.positions_list = _condor_positions([1.0, 1.0, 1.0, 1.0])
+
+        asyncio.run(_rec(st, ib).reconcile())
+
+        trade = st.get_trade_by_id(TID)
+        assert trade.status == TradeStatus.FILLED
+        assert trade.quantity == 1
+
+
+class TestPromotionFreezesNonUniformQuantity:
+    def test_non_uniform_legs_are_not_adopted_and_freeze_new_entries(self, tmp_path):
+        st = _state(tmp_path)
+        _seed(st, quantity=2, legs=CONDOR_LEGS, status="pending")
+        ib = FakeIB()
+        # Two legs still at 2, two legs down to 1 -- a genuinely broken
+        # structure, not a clean partial. Nothing here should guess.
+        ib.positions_list = _condor_positions([2.0, 1.0, 2.0, 1.0])
+
+        asyncio.run(_rec(st, ib).reconcile())
+
+        trade = st.get_trade_by_id(TID)
+        assert trade.status == TradeStatus.FILLED, "still promoted — must stay monitored"
+        assert trade.quantity == 2, "must NOT guess which leg's quantity is real"
+
+        text = _halt_text(tmp_path)
+        assert text is not None, "a non-uniform promotion must freeze new entries"
+        assert TID in text
+
+
+class TestSweepPromotionAlsoAdoptsBrokerQuantity:
+    def test_the_stale_pending_sweep_adopts_too(self, tmp_path):
+        """The third promotion site — bare grep confirmed zero
+        update_trade_quantity calls anywhere in reconciler.py before this
+        wave, at any of the three."""
+        st = _state(tmp_path)
+        _seed(st, quantity=2, legs=CONDOR_LEGS, status="pending",
+              entry_time=(now_et() - timedelta(minutes=45)).isoformat())
+        ib = FakeIB()
+        ib.positions_list = _condor_positions([1.0, 1.0, 1.0, 1.0])
+        rec = _rec(st, ib)
+
+        closed = rec._sweep_stale_pending()
+
+        assert closed == 0, "the order filled — it must be PROMOTED, not booked $0"
+        trade = st.get_trade_by_id(TID)
+        assert trade.status == TradeStatus.FILLED
+        assert trade.quantity == 1, "the sweep rescue must also adopt broker quantity"
+
+
+class TestPositionLivenessIsQuantityAware:
+    """The exit path's own gate — orchestrator.py already refuses a
+    reverse combo on "partial" liveness. Before this wave, presence alone
+    (any quantity > 0) read as "live"; the caller's combo_limit prices at
+    trade.quantity regardless, so a leg present but SHORT of it reversed
+    more than actually existed."""
+
+    def test_every_leg_present_but_short_of_quantity_is_partial_not_live(self, tmp_path):
+        st = _state(tmp_path)
+        _seed(st, quantity=2, legs=CONDOR_LEGS, status="filled")
+        ib = FakeIB()
+        ib.positions_list = _condor_positions([1.0, 1.0, 1.0, 1.0])
+        trade = st.get_trade_by_id(TID)
+
+        liveness = asyncio.run(_rec(st, ib).position_liveness(trade))
+        assert liveness == "partial", (
+            "every leg present at HALF trade.quantity must not read as "
+            "live — the caller's reverse combo would reverse more than exists"
+        )
+
+    def test_every_leg_at_full_quantity_is_live(self, tmp_path):
+        st = _state(tmp_path)
+        _seed(st, quantity=2, legs=CONDOR_LEGS, status="filled")
+        ib = FakeIB()
+        ib.positions_list = _condor_positions([2.0, 2.0, 2.0, 2.0])
+        trade = st.get_trade_by_id(TID)
+
+        assert asyncio.run(_rec(st, ib).position_liveness(trade)) == "live"
+
+    def test_disconnected_feed_is_unknown_not_partial(self, tmp_path):
+        """CONTROL: a wedged/disconnected feed must never masquerade as a
+        quantity-short position — it stays unknown so a data problem never
+        silently disables a stop."""
+        st = _state(tmp_path)
+        _seed(st, quantity=2, legs=CONDOR_LEGS, status="filled")
+        trade = st.get_trade_by_id(TID)
+        rec = PositionReconciler(FakeIBKRClient(FakeIB(), connected=False), st)
+
+        assert asyncio.run(rec.position_liveness(trade)) == "unknown"

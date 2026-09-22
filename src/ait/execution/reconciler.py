@@ -153,6 +153,75 @@ class PositionReconciler:
             log.warning("promoted_open_position_insert_failed",
                         trade_id=getattr(trade, "trade_id", "?"), error=str(e))
 
+    def _adopt_or_flag_quantity(self, trade, broker_qty_map: dict[str, int],
+                                frozen_keys: list[str]):
+        """W50 (trade-life-promotion-ignores-broker-quantity): called right
+        before a promotion writes the open_positions row.
+
+        Promotion used to adopt the LOCAL quantity unconditionally — a fill
+        or partial-exit this process missed while it was down left
+        trade.quantity wrong, and nothing in this file ever called
+        update_trade_quantity (grep confirmed zero call sites here before
+        this wave). The later exit then reverses trade.quantity blind
+        (orchestrator.py's combo_limit(quantity=trade.quantity) calls),
+        closing what exists and opening the difference inverted — the R12
+        F4.3 reversal incident class, resurrected on the restart path.
+
+        Policy (operator-confirmed): every leg at the SAME broker quantity
+        -> adopt it (a clean fill/partial-exit while down; safe to
+        normalize). Legs at INCONSISTENT quantities -> do not guess which
+        number is real; freeze new entries via the same frozen_keys /
+        HALT_UNTRACKED path the untracked-position branches below already
+        use, and leave trade.quantity as-is. That is not a silent gap:
+        position_liveness's own quantity-awareness then reads this trade as
+        "partial" at the next exit attempt, and the exit path already
+        refuses a "partial" reverse combo (orchestrator.py, `if liveness ==
+        "partial"`) — this only adds an IMMEDIATE alert instead of waiting
+        for a stop to fire before anyone finds out.
+
+        `broker_qty_map` is a plain leg-key -> abs(quantity) mapping (what
+        _live_ibkr_leg_keys returns directly, or reconcile()'s own
+        ibkr_map reduced to just the quantity) — a shape both callers can
+        produce without each inventing their own.
+
+        Returns the trade to use for the open_positions row: the same
+        object unless the quantity was adopted, in which case an updated
+        copy — the in-memory dataclass does not observe the DB write below.
+        """
+        leg_keys = self._trade_leg_keys(trade)
+        if not leg_keys or leg_keys == {f"{trade.symbol}:STK"}:
+            return trade  # unkeyable shape — nothing to compare against
+        broker_qtys = {
+            k: abs(int(broker_qty_map[k])) if k in broker_qty_map else 0
+            for k in leg_keys
+        }
+        distinct = set(broker_qtys.values())
+        local_qty = abs(int(trade.quantity))
+        if len(distinct) == 1:
+            adopted = distinct.pop()
+            # adopted == 0 cannot actually happen here: this method only
+            # runs from inside the ibkr_map key-match loop, so at least one
+            # of `trade`'s own legs (the one that matched) is confirmed
+            # nonzero — kept as a guard anyway, not a promise.
+            if adopted and adopted != local_qty:
+                self._state.update_trade_quantity(trade.trade_id, adopted)
+                log.warning("reconcile_promotion_adopted_broker_quantity",
+                            trade_id=trade.trade_id, symbol=trade.symbol,
+                            local_quantity=local_qty, adopted_quantity=adopted)
+                import dataclasses as _dc
+                return _dc.replace(trade, quantity=adopted)
+            return trade
+        # Non-uniform legs: a genuinely broken structure, not a clean
+        # partial. Freeze new entries and alert a human; leave
+        # trade.quantity untouched.
+        frozen_keys.append(
+            f"{trade.symbol} {trade.trade_id} quantity mismatch at "
+            f"promotion: local={local_qty}, broker legs={broker_qtys}")
+        log.critical("reconcile_promotion_quantity_inconsistent",
+                     trade_id=trade.trade_id, symbol=trade.symbol,
+                     local_quantity=local_qty, broker_leg_quantities=broker_qtys)
+        return trade
+
     async def _underlying_last(self, symbol: str) -> float | None:
         """Best-effort current/last price of the underlying via IBKR."""
         try:
@@ -254,10 +323,14 @@ class PositionReconciler:
         """R14: does this trade's structure still exist at the broker, and is
         it WHOLE? Returns one of:
 
-          "live"    — every leg is present; a reverse combo closes exactly it.
+          "live"    — every leg is present at >= trade.quantity; a reverse
+                      combo closes exactly it.
           "partial" — SOME legs present, some gone (manual half-flatten,
-                      assignment). Reversing all legs would SELL the already-
-                      flat ones and OPEN new inverted positions. Needs a human.
+                      assignment) OR every leg present but SHORT of
+                      trade.quantity (a fill/partial-exit this process missed
+                      while it was down — W50). Reversing all legs at
+                      trade.quantity would SELL the already-flat/short ones
+                      and OPEN new inverted positions. Needs a human.
           "gone"    — authoritatively absent. Reversing would REBUILD the
                       position inverted (the 07-13 end-state, reachable by an
                       operator with no bug at all).
@@ -272,17 +345,33 @@ class PositionReconciler:
         refuse every exit — a stop-loss disabled exactly when the broker link
         is flaky. So before ever returning "gone" we re-request positions from
         the broker authoritatively; only a FRESH answer can retire a position.
+
+        W50 (trade-life-promotion-ignores-broker-quantity): this used to be a
+        pure KEY-SET comparison — every leg present, at ANY quantity, read as
+        "live", so a trade whose broker legs were all present but at HALF the
+        locally recorded quantity (a partial fill/exit the process missed
+        while down, then reconciler-promoted without adopting the broker
+        figure) passed here identically to a fully intact position. The
+        caller's reverse combo prices at `trade.quantity` regardless
+        (orchestrator.py's combo_limit calls), so it reversed more than
+        actually existed. Quantity is now part of the "whole" test.
         """
         keys = self._trade_leg_keys(trade)
         if not keys or keys == {f"{trade.symbol}:STK"}:
             return "unknown"  # shape we can't key — don't block the exit on it
+        try:
+            needed = abs(int(trade.quantity))
+        except (TypeError, ValueError):
+            needed = 0  # unreadable quantity: presence-only, same as pre-W50
 
         live = self._live_ibkr_leg_keys()
         if live is None:
             return "unknown"
 
-        present = keys & live
+        present = keys & live.keys()
         if present == keys:
+            if needed and any(live[k] < needed for k in keys):
+                return "partial"
             return "live"
         if present:
             return "partial"
@@ -298,23 +387,25 @@ class PositionReconciler:
                              "as unknown so the exit still goes out")
             return "unknown"
 
-        fresh_keys: set[str] = set()
+        fresh_map: dict[str, int] = {}
         for pos in fresh:
             if not getattr(pos, "position", 0):
                 continue  # R15b: zeroed row = closed, not live
             try:
                 if pos.contract.secType == "OPT":
-                    fresh_keys.add(self._make_position_key(
+                    fresh_map[self._make_position_key(
                         symbol=pos.contract.symbol,
                         strike=pos.contract.strike,
                         right=pos.contract.right,
                         expiry=pos.contract.lastTradeDateOrContractMonth,
-                    ))
+                    )] = abs(int(pos.position))
             except (AttributeError, TypeError, ValueError):
                 continue
 
-        present = keys & fresh_keys
+        present = keys & fresh_map.keys()
         if present == keys:
+            if needed and any(fresh_map[k] < needed for k in keys):
+                return "partial"
             return "live"
         if present:
             return "partial"
@@ -497,24 +588,32 @@ class PositionReconciler:
                       trade_id=trade.trade_id, error=str(e))
             return False
 
-    def _live_ibkr_leg_keys(self) -> set[str] | None:
-        """Position keys currently live at IBKR, or None if unavailable."""
+    def _live_ibkr_leg_keys(self) -> dict[str, int] | None:
+        """Position keys currently live at IBKR, mapped to their ABS
+        quantity, or None if unavailable.
+
+        W50 (trade-life-promotion-ignores-broker-quantity): was `set[str]`;
+        position_liveness needs the quantity to detect a leg present but
+        SHORT of trade.quantity, not just presence/absence. Callers that
+        only need presence (e.g. _sweep_stale_pending's `.isdisjoint(...)`)
+        are unaffected — a dict iterates as its keys, same as a set would.
+        """
         try:
             if not self._ibkr.connected:
                 return None
-            live: set[str] = set()
+            live: dict[str, int] = {}
             for pos in self._ibkr.get_positions():
                 if not getattr(pos, "position", 0):
                     continue  # R15b: zeroed row = closed, not live
                 if pos.contract.secType == "OPT":
-                    live.add(self._make_position_key(
+                    live[self._make_position_key(
                         symbol=pos.contract.symbol,
                         strike=pos.contract.strike,
                         right=pos.contract.right,
                         expiry=pos.contract.lastTradeDateOrContractMonth,
-                    ))
+                    )] = abs(int(pos.position))
                 else:
-                    live.add(f"{pos.contract.symbol}:STK")
+                    live[f"{pos.contract.symbol}:STK"] = abs(int(pos.position))
             return live
         except Exception as e:  # noqa: BLE001
             log.warning("live_leg_keys_failed", error=str(e))
@@ -1034,9 +1133,28 @@ class PositionReconciler:
                     # may have moved the trade since get_open_trades()).
                     if self._state.transition(
                             t.trade_id, (TradeStatus.PENDING,), TradeStatus.FILLED):
+                        # W50: adopt broker quantity when we have it — this
+                        # is a PENDING rescue, so a partial fill this process
+                        # missed is exactly as dangerous here as in
+                        # reconcile()'s own PENDING->FILLED branch. Only when
+                        # live_keys carries quantities (the common case,
+                        # sourced from _live_ibkr_leg_keys); the R19 empty-
+                        # cache fallback (fresh_keys, a bare set[str] with no
+                        # quantity signal) has nothing to adopt or flag
+                        # against, so this is skipped rather than guessed.
+                        # No frozen_keys list here — this function doesn't
+                        # own the HALT_UNTRACKED write (reconcile() does,
+                        # once per pass); a non-uniform find is logged
+                        # loudly and left for the next reconcile() pass to
+                        # freeze, while position_liveness's own quantity
+                        # check (not this freeze) is what actually keeps the
+                        # later exit from reversing the wrong amount.
+                        _t = t
+                        if isinstance(live_keys, dict):
+                            _t = self._adopt_or_flag_quantity(t, live_keys, [])
                         # R16: rescued trades had no open_positions row, so
                         # HWM/trailing-lock/partial-exit tracking was dead.
-                        self._ensure_open_position_row(t)
+                        self._ensure_open_position_row(_t)
                     log.warning("sweep_promoted_filled_pending",
                                 trade_id=t.trade_id, symbol=t.symbol,
                                 strategy=t.strategy, age_min=int(age_min))
@@ -1120,6 +1238,10 @@ class PositionReconciler:
                 "avg_cost": pos.avgCost,
                 "contract": pos.contract,
             }
+        # W50: plain key -> abs(quantity), the shape _adopt_or_flag_quantity
+        # takes — computed once rather than re-derived from ibkr_map on
+        # every promoted trade.
+        ibkr_qty_map = {k: abs(int(v["quantity"])) for k, v in ibkr_map.items()}
 
         # Get local open trades. Multi-leg positions live in IBKR as 2-4
         # SEPARATE option positions, so each local trade maps to a SET of
@@ -1176,7 +1298,7 @@ class PositionReconciler:
                 # in-memory fill tracker was lost on restart. Promote it to
                 # FILLED so the portfolio monitor manages it (check_positions
                 # only evaluates FILLED/PARTIAL).
-                for local_trade in matching_trades:
+                for _mt_idx, local_trade in enumerate(matching_trades):
                     if local_trade.trade_id in promoted_ids:
                         continue
                     if local_trade.trade_id in result.closing_exit_orders:
@@ -1190,6 +1312,16 @@ class PositionReconciler:
                                 from_statuses=(TradeStatus.PENDING,)):
                             promoted_ids.add(local_trade.trade_id)
                             result.promoted += 1
+                            # W50: adopt broker quantity (or flag + freeze)
+                            # BEFORE the open_positions row is written, so
+                            # HWM/partial-exit tracking and the exit path
+                            # both see the right number from the start.
+                            # Keep matching_trades in sync so the quantity-
+                            # mismatch check below reads the adopted figure,
+                            # not a now-stale one.
+                            local_trade = self._adopt_or_flag_quantity(
+                                local_trade, ibkr_qty_map, frozen_keys)
+                            matching_trades[_mt_idx] = local_trade
                             # R16: promotions never inserted the
                             # open_positions row the HWM/partial-exit
                             # ledger lives in.
@@ -1233,6 +1365,17 @@ class PositionReconciler:
                                     (TradeStatus.CLOSING,), TradeStatus.FILLED):
                                 promoted_ids.add(local_trade.trade_id)
                                 result.promoted += 1
+                                # W50: same adoption/flag as the PENDING
+                                # branch above — see _adopt_or_flag_quantity.
+                                # This is the MORE dangerous of the two: a
+                                # CLOSING trade rescued here is about to be
+                                # re-offered to the exit monitor, and a stale
+                                # quantity here is exactly the reversal risk
+                                # trade-life-promotion-ignores-broker-quantity
+                                # describes.
+                                local_trade = self._adopt_or_flag_quantity(
+                                    local_trade, ibkr_qty_map, frozen_keys)
+                                matching_trades[_mt_idx] = local_trade
                                 # R16: see _ensure_open_position_row — a
                                 # CLOSING->FILLED rescue is exactly the case
                                 # where the row went missing at restart.
