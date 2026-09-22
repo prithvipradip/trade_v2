@@ -8457,3 +8457,179 @@ start with its own probe pass. Re-verify against HEAD before scoping, same disci
 since W41 has needed.
 
 No inspect.getsource.
+
+---
+
+## 2026-09-22 - W51 EXECUTED — the broker-protocol deep halves: reject-reason capture, pre-ex-div close, entry block
+
+Closes the "deep half" of the last two `ENFORCEMENT_GAP | live_money` findings from the R23 sibling
+audit, following W41's shallow-half fixes. `model-vs-reality-margin-model-unimplemented`
+(`reports/blindspot_composition_hunt_20260825.md:170`) and `model-vs-reality-ex-div-assignment-void`
+(same file, line 162). The roadmap (PLAN.md:6699) flagged this explicitly as **not a normal
+implementation wave** — "R24's critic notes zero of 16 prior audit angles ever examined the
+broker-protocol layer" — so this session ran a probe pass (two parallel Explore agents, one over
+`ibkr_client.py`/`orders.py`/`contracts.py`/`account.py`, one over the earnings-gate pattern and
+dividend-data availability) before designing anything, then verified every claim directly against
+HEAD and, for the external yfinance surface, against live data.
+
+**Two scope decisions made this session, with the operator, backed by evidence the probe pass
+turned up:**
+
+1. **Skip `whatIfOrder`; finish `errorEvent`/reject-reason capture only.** The probe surfaced a
+   contradiction in this project's own audit history that nobody had reconciled: `GAP_AUDIT_R7.md:330`
+   calls broker whatIf consultation "rightly skipped at this scale... for a defined-risk IC book,
+   spread margin = width - credit = max_loss, so the existing max_loss check is already exact" —
+   while `GAP_AUDIT_R7.md:510`, in a different section of the SAME document, calls it "must exist
+   before funding." Given the live selector is IC-only (defined-risk, per CLAUDE.md) and `can_afford`
+   already compares against `min(buying_power, available_funds)` (W41), the `:330` reasoning holds
+   for the account's actual current shape — and building `whatIfOrder` properly would mean solving a
+   real hazard (`AIT_SIMULATED_CAPITAL` scales the account snapshot but not `whatIfOrder`'s real
+   broker margin numbers; confirmed no `OrderState.excessLiquidity` field exists, so the check would
+   need synthesizing from `maintMarginChange`) with zero existing test precedent. `errorEvent`, by
+   contrast, was ~80% built already (W33) and is unambiguously useful regardless of margin-model
+   sophistication. Registered as deferred: re-open if the IC-only decision changes, or launch-size
+   caps are raised toward go-live (the scenario `GAP_AUDIT_R7.md:343` itself names as when the
+   "rightly skipped" reasoning stops holding).
+2. **Close only, no roll, for an at-risk short call.** No roll/replace-order machinery exists
+   anywhere in this codebase (`grep` for "roll" returns nothing relevant) — building one is
+   greenfield and larger than the rest of this wave combined. Closing fully removes the assignment
+   risk the finding is about and matches the shape of the one existing exit rule that does something
+   similar (`portfolio.py`'s `assignment_risk`, dte<=1, close-only, never roll).
+
+**1. `model-vs-reality-margin-model-unimplemented` deep half — reject-reason capture.** Re-verified
+at HEAD before any code, not assumed from the finding text: `ibkr_client.py:73` already did
+`self._ib.errorEvent += self._on_error` (W33); `_on_error`/`_order_errors`/`_ORDER_ERROR_CODES`
+already existed and already tracked 201 (margin reject); the only accessor,
+`order_error_messages(order_id)`, already existed too — it just threw the numeric code away and had
+exactly ONE caller, on the exit-side price-band parser (`executor.py`, the W33 branch). The
+entry-cancelled path consulted nothing at all: a real IBKR 201 and a routine timeout both collapsed
+into the identical `trade_cancelled` log line.
+
+Fixed: `321` (read-only account) and `200` (no security definition) added to `_ORDER_ERROR_CODES`
+alongside the already-tracked `110/201/202/10318`. New `order_error_codes(order_id) ->
+list[tuple[int, str]]` accessor alongside (not replacing) the existing text-only one — the W33 exit
+path is byte-unaffected. `_update_trade_cancelled` now takes the `order_id` that was already in
+scope at its one call site, consults the new accessor (`getattr`+`callable` guarded, mirroring the
+exact defensive style the W33 exit-path call site already uses, since `FakeIBKRClient` implements
+neither accessor), and stamps the result before the CAS. New `trades.reject_code`/`reject_text`
+columns (+ `TradeRecord` fields), via the same migration-list idiom W50's `partial_exits` used.
+`TradeStatus.REJECTED` (confirmed dead — zero transitions to it anywhere) deliberately left unused:
+repurposing it touches more surface (`go_live.py`'s terminal-status filter, anything else keyed on
+status) than this finding needs; the new columns supply the distinct reason without a status-taxonomy
+change. Confirmed not a reconnect hazard: `IBKRClient._ib` is built once in `__init__` and never
+rebuilt; ib_insync's own `disconnect()` doesn't clear listeners, so `errorEvent` survives reconnect
+for free, same as the pre-existing `disconnectedEvent`/`orderStatusEvent` wiring.
+
+**2. `model-vs-reality-ex-div-assignment-void` deep half — pre-ex-div close + entry block.** W41's
+piece 1 (the reconciler STK branch freezes new entries on an untracked stock position — the
+signature of an assignment) reconfirmed still in place at `reconciler.py:1503`. Its own comment
+explicitly named two follow-ups as "a real design question left to W51's deeper pass," both resolved
+this wave: **no debounce** for STK (kept from W41's own reasoning — the OPT branch's two-sighting
+rule exists for an empirically observed position-STREAM flicker, R5 2026-07-09; assignment is a
+discrete overnight broker event, not a stream artifact, and nothing suggests a stock-position sighting
+flickers the same way); **does now route through** the same Telegram declare-yes/no flow the OPT
+branch uses — `manual_positions.prompt_if_needed` gained a `kind="stock"` parameter (default
+`"option"`, so the existing OPT call site needed zero changes) so the prompt text is accurate instead
+of calling an assignment's 100 shares of stock an "option position", and a declared-manual stock
+position now stops re-freezing every single reconcile pass.
+
+No ex-dividend date or amount existed anywhere in this codebase before this wave — checked directly
+against LIVE yfinance output, not assumed: `ticker.calendar` (`earnings.py`'s own primary source) is
+**empty** for SPY/TLT (a 404, "No fundamentals data found" — ETFs have no fundamentals calendar).
+New `src/ait/data/dividends.py`, `DividendCalendar`, structurally `EarningsCalendar`'s twin (same
+6h-TTL-cache / last-known-good / fail-open-on-exit / fail-closed-on-entry shape) sourcing
+`ticker.dividends` instead — real historical per-payment dates and amounts — and projecting the next
+payment forward from the average interval between the last 4. Verified against real output for the
+whole universe plus TLT: SPY/QQQ/IWM project ~91 days out (quarterly, amounts $0.75-$1.89), TLT ~30
+days out (monthly, ~$0.315-$0.345) — confirming the generic interval-averaging approach handles both
+cadences without hardcoding either.
+
+**A design correction found during implementation, not just planning.** The finding's suggested fix
+calls this "a daily pre-ex-div check," which reads as a job for the out-of-process APScheduler or the
+in-bot `_pre_market()` phase hook (which only fires on a phase *transition* — a mid-session restart
+skips it, a documented gap class). Direct inspection of `portfolio.py`'s `check_positions` found a
+closer, better-fitting precedent already living there: rule 3c, `pre_earnings_iv_crush`, runs on the
+fast monitor's own ~30s cadence — same as every sibling exit rule — and already includes
+`iron_condor`. The "daily" framing is about the dividend *lookup* being cheap to cache (the same 6h
+TTL earnings already uses), not the comparison needing to run once a day; landing it on the 30s
+cadence instead is more responsive, needs no new restart-safety latch, and reuses live spot/mark data
+the function already fetches every cycle. New rule 3e, `pre_ex_div_assignment_risk`, immediately
+after 3d: finds the short call leg (same `trade.legs`-parsing idiom as rule 1b's touch-stop),
+computes extrinsic (`mark - max(0, spot - strike)`, from the same `option_marks` dict every sibling
+rule already receives), and closes when extrinsic is below the expected dividend exactly one day
+before ex-div — bypassing rule 3's existing `dte<=1` restriction (which is also keyed off
+`trade.strike` directly, meaningless for a multi-leg iron condor's real short-call strike). Fails
+OPEN on any exception, matching rule 3c's own documented rationale for the exit side. Entry block
+mirrors the existing `would_hold_through_earnings` call site exactly (`orchestrator.py`, inside
+`_try_execute`), gated on a new `_signal_sells_a_call` static helper — genuinely new detection logic
+(the earnings gate blocks unconditionally; this one only matters for a signal that sells a call),
+extracted and independently tested rather than left inline, matching `_legs_count`/
+`_archived_partial_pnl`'s existing pattern.
+
+**A bug in my own first pass, caught by the regression sweep, not by review.** Rule 3e's guard
+originally read `self._dividends` directly in the `elif` condition — outside its own `try/except`,
+which only wraps the branch body. `PortfolioManager` gained no `__init__` change that would set this
+on every instance automatically; dozens of existing tests construct it via `PortfolioManager.__new__`
+and hand-set only the attributes their own scenario needs (a well-established pattern in this test
+suite, e.g. `test_r17_live_fixes.py`'s rule-3c rig). Every one of those hit `AttributeError:
+'PortfolioManager' object has no attribute '_dividends'` the instant `check_positions` reached the
+new `elif` — **27 pre-existing tests failed** on the first full regression sweep. Fixed with
+`getattr(self, "_dividends", None)`, the exact defensive style this file already uses throughout for
+the identical reason (`_marks_missing_streak`, `_notify_cb`, etc.). Re-swept clean afterward — see
+VERIFICATION.
+
+PROOF: every defect reproduced against pre-fix source before being fixed, via `git stash` of each
+part's implementation files separately (Part A: `ibkr_client.py`/`state.py`/`executor.py`; Part B:
+`dividends.py` — a NEW untracked file, moved aside rather than stashed, since `git stash push`
+cannot target an untracked path by pathspec alone — plus `settings.py`/`config.yaml`/
+`orchestrator.py`/`portfolio.py`/`manual_positions.py`/`reconciler.py`/the smoke-test
+neutralization). Part A: all 7 new tests failed against reverted code (`AttributeError: no attribute
+'order_error_codes'` / `'reject_code'`; `TypeError: unexpected keyword argument 'order_id'`), each
+for the reason it targets. Part B: the entire new test module failed to even **collect**
+(`ModuleNotFoundError: No module named 'ait.data.dividends'`) — the strongest form of the proof,
+since it shows the whole capability didn't exist pre-fix, not just one behavior of it. Both stashes
+popped, both full files re-run clean before committing.
+
+VERIFICATION:
+- `python -m compileall -q src tests` clean.
+- `python scripts/typecheck.py` -> `OK: no [attr-defined/call-arg/name-defined] errors in
+  src/ait/config, src/ait/bot, src/ait/execution, src/ait/risk`.
+- `python scripts/smoke_deploy.py` -> `SMOKE PASS (13 checks)`, including the no-write guarantee
+  across the new `reject_code`/`reject_text` columns' migration (`sqlite schema_version 24 -> 26`,
+  flagged by the script itself as expected on a migration-bearing deploy, not a failure).
+- Combined targeted runs (not per-file), one per part: Part A's 51 files touching
+  `ibkr_client`/`state`/`executor` — 995 passed, 3 skipped, 2 failed (the standing PDT wall-clock
+  flake, unrelated, already registered in W50's entry). Part B's 73 files touching
+  `portfolio`/`orchestrator`/`reconciler`/`manual_positions`/`settings`/`dividends`/`earnings` —
+  first run 27 failed (the `self._dividends` regression above); after the fix, re-swept clean: 1487
+  passed, 3 skipped (config-authority standing artifact + the same 2 PDT tests) — zero failures
+  attributable to this wave.
+- Full fast lane, count taken by running it: **2333 passed / 46 skipped / 153 deselected / 3
+  failed** (1395s). Reconciles exactly against this session's own W50 baseline (2300 passed / 46
+  skipped / 153 deselected / 5 failed): this wave's two new test files add 31 tests (7 + 24, no
+  deletions this time) — `(2300+46+153+5) + 31 = 2535 = 2333+46+153+3`, exact match. Skipped and
+  deselected are byte-identical to W50 (46, 153), as expected. The failed count moved 5 -> 3, fully
+  explained: the same 2 `test_watchdog.py` tests W50's entry diagnosed as a cumulative-process-
+  memory flake (not wall-clock, verified there by running the file alone) did NOT fire this run —
+  consistent with genuine intermittency tied to how much the process had accumulated by the time
+  that file ran, not this wave's content — which is where 2 of the "extra" 33 passed-count delta
+  over the naive 31-new-tests estimate come from. The remaining 3 failures are exactly the standing
+  set: `test_r19_config_authority`'s local-`.env` artifact, and the same 2
+  `TestPDTHistorySurvivesATransientLock` wall-clock-boundary tests W50's entry root-caused and
+  registered — still on the far side of that boundary, several hours later, as expected (nothing
+  moves the ET trading-day forward except the calendar itself).
+
+STATE AT HANDOFF: two commits on `feature/event-straddle`
+(`model-vs-reality-margin-model-unimplemented deep half`, `model-vs-reality-ex-div-assignment-void
+deep half`), independently revertible (disjoint files, no ordering dependency) — plus this entry.
+**NOT RUNNING** — nothing on this box is restarted by me; `orchestrator.py` and `portfolio.py` both
+changed, so deploying this needs a full supervisor restart, the operator's call per the standing
+rule. One item registered above, not fixed: `whatIfOrder`, with the re-open conditions stated.
+
+NEXT: the remaining item from the 2026-09-21 roadmap (PLAN.md:6700) is the test-honesty /
+`inspect.getsource` census track — no live-money urgency, interleave freely. Re-check PLAN.md's own
+tail for the current state before scoping, same discipline every wave has needed; this entry's own
+NEXT pointer may itself be stale by the time a future session reads it, per the register's standing
+rule about re-verifying rather than trusting a prior pointer.
+
+No inspect.getsource.
