@@ -1,0 +1,165 @@
+{
+ "rows": [
+  {
+   "variant": "no_buffer",
+   "post_fomc_blackout_days": null,
+   "entry_dte": 18,
+   "run_seconds": 25,
+   "n": 57,
+   "windows": 18,
+   "wins": 29,
+   "win_rate_pct": 50.9,
+   "net": -3520.99,
+   "pf": 0.628,
+   "avg_trade": -61.77,
+   "max_dd_dollars": 4670.72,
+   "max_dd_pct": 4.32,
+   "mean_hold_days": 6.96,
+   "position_days": 400,
+   "net_per_position_day": -8.802,
+   "closes_per_window": 3.17,
+   "exit_reasons": {
+    "take_profit_short": 25,
+    "touch_stop": 25,
+    "backtest_end": 7
+   }
+  },
+  {
+   "variant": "no_buffer_dates_only",
+   "post_fomc_blackout_days": null,
+   "entry_dte": 18,
+   "run_seconds": 25,
+   "n": 57,
+   "windows": 18,
+   "wins": 29,
+   "win_rate_pct": 50.9,
+   "net": -3520.99,
+   "pf": 0.628,
+   "avg_trade": -61.77,
+   "max_dd_dollars": 4670.72,
+   "max_dd_pct": 4.32,
+   "mean_hold_days": 6.96,
+   "position_days": 400,
+   "net_per_position_day": -8.802,
+   "closes_per_window": 3.17,
+   "exit_reasons": {
+    "take_profit_short": 25,
+    "touch_stop": 25,
+    "backtest_end": 7
+   }
+  },
+  {
+   "variant": "post_fomc_1d",
+   "post_fomc_blackout_days": 1,
+   "entry_dte": 18,
+   "run_seconds": 25,
+   "n": 54,
+   "windows": 17,
+   "wins": 28,
+   "win_rate_pct": 51.9,
+   "net": -3424.32,
+   "pf": 0.627,
+   "avg_trade": -63.41,
+   "max_dd_dollars": 4574.05,
+   "max_dd_pct": 4.22,
+   "mean_hold_days": 7.19,
+   "position_days": 390,
+   "net_per_position_day": -8.78,
+   "closes_per_window": 3.18,
+   "exit_reasons": {
+    "take_profit_short": 25,
+    "touch_stop": 24,
+    "backtest_end": 5
+   },
+   "removed_trades": 3,
+   "removed_pnl": -96.67,
+   "added_trades": 0,
+   "added_pnl": 0
+  },
+  {
+   "variant": "post_fomc_2d",
+   "post_fomc_blackout_days": 2,
+   "entry_dte": 18,
+   "run_seconds": 25,
+   "n": 53,
+   "windows": 17,
+   "wins": 27,
+   "win_rate_pct": 50.9,
+   "net": -2980.45,
+   "pf": 0.659,
+   "avg_trade": -56.23,
+   "max_dd_dollars": 4068.06,
+   "max_dd_pct": 3.75,
+   "mean_hold_days": 7.23,
+   "position_days": 385,
+   "net_per_position_day": -7.741,
+   "closes_per_window": 3.12,
+   "exit_reasons": {
+    "take_profit_short": 25,
+    "touch_stop": 23,
+    "backtest_end": 5
+   },
+   "removed_trades": 6,
+   "removed_pnl": -748.21,
+   "added_trades": 2,
+   "added_pnl": -207.67
+  },
+  {
+   "variant": "post_fomc_3d",
+   "post_fomc_blackout_days": 3,
+   "entry_dte": 18,
+   "run_seconds": 25,
+   "n": 53,
+   "windows": 17,
+   "wins": 27,
+   "win_rate_pct": 50.9,
+   "net": -2980.45,
+   "pf": 0.659,
+   "avg_trade": -56.23,
+   "max_dd_dollars": 4068.06,
+   "max_dd_pct": 3.75,
+   "mean_hold_days": 7.23,
+   "position_days": 385,
+   "net_per_position_day": -7.741,
+   "closes_per_window": 3.12,
+   "exit_reasons": {
+    "take_profit_short": 25,
+    "touch_stop": 23,
+    "backtest_end": 5
+   },
+   "removed_trades": 6,
+   "removed_pnl": -748.21,
+   "added_trades": 2,
+   "added_pnl": -207.67
+  }
+ ],
+ "verdict": "NO BUFFER (no variant clears every condition)",
+ "notes": [
+  "sanity: dates without a window reproduce the baseline exactly",
+  "take-profit study live_ladder (advisory, different data window): n 51 vs 57 here, pf 0.445 vs 0.628 here, net -5441.86 vs -3520.99 here, max_dd_dollars 5995.38 vs 4670.72 here",
+  "post_fomc_1d: fails pf>base+0.10",
+  "post_fomc_2d: fails pf>base+0.10",
+  "post_fomc_3d: fails pf>base+0.10"
+ ],
+ "data_store": "C:\\Users\\prith\\Documents\\Git\\agent_trade\\trade_v2\\data\\historical.db",
+ "data": {
+  "SPY": {
+   "rows": 1051,
+   "first": "2022-07-15",
+   "last": "2026-09-22",
+   "stored_iv_rows": 516
+  },
+  "QQQ": {
+   "rows": 1051,
+   "first": "2022-07-15",
+   "last": "2026-09-22",
+   "stored_iv_rows": 516
+  },
+  "IWM": {
+   "rows": 1051,
+   "first": "2022-07-15",
+   "last": "2026-09-22",
+   "stored_iv_rows": 516
+  }
+ }
+}

@@ -167,6 +167,11 @@ class WalkForwardConfig:
     # dte_range and measured a median 18 DTE (14-25) over its first 14
     # condors, so studies keyed to DTE (the take-profit ladder) set it.
     entry_dte: int | None = None
+    # Research-only post-event blackout (scripts/post_event_study.py): block
+    # credit entries for N calendar days after each date in post_event_dates
+    # (ISO strings, so the config pickles into window workers). None = off.
+    post_event_blackout_days: int | None = None
+    post_event_dates: tuple | None = None
     optimize_n_jobs: int = 1              # Number of walk-forward WINDOWS to run in parallel via
                                           # ProcessPoolExecutor. Despite the "optimize_" prefix this
                                           # controls WINDOW-LEVEL parallelism, NOT Optuna trial-level
@@ -193,7 +198,14 @@ class WalkForwardConfig:
             self.credit_tp_ladder = validate_ladder(self.credit_tp_ladder)
         if self.entry_dte is not None:
             self.entry_dte = int(self.entry_dte)
-        _research_only = [name for name in ("credit_tp_ladder", "entry_dte")
+        if self.post_event_blackout_days is not None:
+            self.post_event_blackout_days = int(self.post_event_blackout_days)
+            if self.post_event_blackout_days < 0:
+                raise ValueError("post_event_blackout_days must be >= 0")
+        if self.post_event_dates is not None:
+            self.post_event_dates = tuple(str(d)[:10] for d in self.post_event_dates)
+        _research_only = [name for name in ("credit_tp_ladder", "entry_dte",
+                                            "post_event_blackout_days")
                           if getattr(self, name) is not None]
         if _research_only and self.optimize_per_window:
             # StrategyOptimizer trials build their own Backtester without
@@ -1461,6 +1473,8 @@ class WalkForwardBacktester:
                 pre_event_blackout_days=getattr(window_cfg, "pre_event_blackout_days", None),
                 credit_tp_ladder=getattr(window_cfg, "credit_tp_ladder", None),
                 entry_dte=getattr(window_cfg, "entry_dte", None),
+                post_event_blackout_days=getattr(window_cfg, "post_event_blackout_days", None),
+                post_event_dates=getattr(window_cfg, "post_event_dates", None),
                 # R16 #1: NEVER score an OOS window with the live (future-
                 # trained) models/ensemble.pkl. If the window model failed to
                 # train, the window trades ungated — the documented fallback.
@@ -2569,6 +2583,8 @@ class WalkForwardBacktester:
                 pre_event_blackout_days=getattr(window_cfg, "pre_event_blackout_days", None),
                 credit_tp_ladder=getattr(window_cfg, "credit_tp_ladder", None),
                 entry_dte=getattr(window_cfg, "entry_dte", None),
+                post_event_blackout_days=getattr(window_cfg, "post_event_blackout_days", None),
+                post_event_dates=getattr(window_cfg, "post_event_dates", None),
                 # R16 #1: shadow labelling runs with the window predictor
                 # (possibly None) — never with the live artifact.
                 allow_live_model_fallback=False,

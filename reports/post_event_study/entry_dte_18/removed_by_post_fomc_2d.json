@@ -1,0 +1,62 @@
+{
+ "removed": [
+  {
+   "entry_date": "2023-03-24",
+   "exit_date": "2023-03-29",
+   "symbol": "SPY",
+   "pnl": 12.7,
+   "exit_reason": "backtest_end"
+  },
+  {
+   "entry_date": "2024-07-31",
+   "exit_date": "2024-08-02",
+   "symbol": "QQQ",
+   "pnl": -274.28,
+   "exit_reason": "touch_stop"
+  },
+  {
+   "entry_date": "2024-12-18",
+   "exit_date": "2024-12-18",
+   "symbol": "QQQ",
+   "pnl": -14.8,
+   "exit_reason": "backtest_end"
+  },
+  {
+   "entry_date": "2025-06-18",
+   "exit_date": "2025-06-25",
+   "symbol": "IWM",
+   "pnl": 192.41,
+   "exit_reason": "backtest_end"
+  },
+  {
+   "entry_date": "2025-10-31",
+   "exit_date": "2025-11-07",
+   "symbol": "IWM",
+   "pnl": -214.09,
+   "exit_reason": "touch_stop"
+  },
+  {
+   "entry_date": "2025-11-11",
+   "exit_date": "2025-11-14",
+   "symbol": "IWM",
+   "pnl": -450.15,
+   "exit_reason": "touch_stop"
+  }
+ ],
+ "added": [
+  {
+   "entry_date": "2023-03-27",
+   "exit_date": "2023-03-29",
+   "symbol": "SPY",
+   "pnl": -49.42,
+   "exit_reason": "backtest_end"
+  },
+  {
+   "entry_date": "2025-11-05",
+   "exit_date": "2025-11-13",
+   "symbol": "IWM",
+   "pnl": -158.25,
+   "exit_reason": "touch_stop"
+  }
+ ]
+}

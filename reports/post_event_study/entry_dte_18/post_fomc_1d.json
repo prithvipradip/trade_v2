@@ -1,0 +1,28 @@
+{
+ "variant": "post_fomc_1d",
+ "post_fomc_blackout_days": 1,
+ "entry_dte": 18,
+ "run_seconds": 25,
+ "n": 54,
+ "windows": 17,
+ "wins": 28,
+ "win_rate_pct": 51.9,
+ "net": -3424.32,
+ "pf": 0.627,
+ "avg_trade": -63.41,
+ "max_dd_dollars": 4574.05,
+ "max_dd_pct": 4.22,
+ "mean_hold_days": 7.19,
+ "position_days": 390,
+ "net_per_position_day": -8.78,
+ "closes_per_window": 3.18,
+ "exit_reasons": {
+  "take_profit_short": 25,
+  "touch_stop": 24,
+  "backtest_end": 5
+ },
+ "removed_trades": 3,
+ "removed_pnl": -96.67,
+ "added_trades": 0,
+ "added_pnl": 0
+}

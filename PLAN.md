@@ -9025,3 +9025,74 @@ next restart**, which is the operator's call. Recommended before the 09:30 open 
 W47's protection task is the fix for yesterday's 11-12 minute exit re-price delay.
 
 ---
+
+## 2026-09-22 - STUDY: post-FOMC entry blackout (walk-forward) — verdict NO BUFFER; and a research-harness hazard found on the way
+
+QUESTION (operator, after the 09-21 -$503 stop). Should condor entries be blocked for N days AFTER
+a macro event, as they are 1 day before? The trade was entered the morning after the 09-16 FOMC.
+In the live record it is the only day-after-event entry in 13 closes, so live evidence is one trade.
+
+HOW. `scripts/post_event_study.py`, same harness as the take-profit study (SPY/QQQ/IWM, condor only,
+train126/test63/step63/gap5, entry DTE 18, ungated entries, W5 cost model), one new research-only
+engine gate (`Backtester(post_event_blackout_days, post_event_dates)`, threaded through
+`WalkForwardConfig`; inert unless set — proven by a within-run sanity variant that passes the dates
+with no window and reproduces the baseline to the cent). FOMC only, because the live calendar knows
+2026-2027 and the harness needs 2022-2026: 28 historical decision days transcribed from the Fed's
+published schedule (in the script, with the source URL — verify before acting on anything here).
+Decision rule written before the run (in the script docstring): n >= 30 both; variant n >= 0.85x
+baseline (a buffer removes entries and pace is the binding constraint); PF > baseline + 0.10;
+net/position-day >= baseline; max DD <= baseline + 1pp. Smallest qualifying N wins.
+
+RESULT (live data store, entry DTE 18, 22 windows, 2023-01..2026-09):
+  | variant      | n  | PF    | net $  | DD % | removed (P&L)    | added (P&L)   |
+  | no_buffer    | 57 | 0.628 | -3,521 | 4.32 |                  |               |
+  | post_fomc_1d | 54 | 0.627 | -3,424 | 4.22 | 3 (-$97)         | 0             |
+  | post_fomc_2d | 53 | 0.659 | -2,980 | 3.75 | 6 (-$748)        | 2 (-$208)     |
+  | post_fomc_3d |    identical to 2d (FOMC is a Wednesday; day +3 is Saturday)               |
+  **NO BUFFER.** Every variant fails `PF > base + 0.10` (0.728 needed; best 0.659). The 2-day
+  buffer is the best of them — PF +0.03, DD -0.6pp — for 7% fewer closes; inside noise.
+  What the harness actually exercised: the three entries a 1-day buffer removed are all DAY-0
+  entries (2024-07-31, 2024-12-18, 2025-06-18: the FOMC day itself), which live ALREADY blocks via
+  the pre-event gate (days_to_event = 0 <= 1) — the harness's pre-event gate is inactive before
+  2026, so these exist only in the simulation. In four simulated years there was NOT ONE entry on
+  the day after an FOMC decision (the 09-17 shape) at 18 DTE with one slot per symbol; the only
+  directly-gated day-after-event trade at 2d is 2025-10-31 (day +2, -$214). The question the
+  operator asked has a sample of roughly one in the harness as well as live. The rule says no
+  buffer; the honest reading is "no evidence for one, and almost none against".
+
+WHAT THE HARNESS CANNOT TEST (registered in the script; not hidden): the live IV-rank floor (the
+engine's `iv_rank` is a realized-vol range rank, not the implied-vol percentile live gates on);
+the short-strike expected-move band (the engine places shorts by delta, which sits at ~0.84 EM by
+construction). Both arms the operator asked about need engine parity work before they can be
+tested. And ABSOLUTE LEVEL: this harness puts the live ruleset at PF 0.63 with touch stops on 44%
+of trades; the live book is PF 1.79 with 2 stops in 13. Only the RELATIVE effect is read here.
+
+A RESEARCH-HARNESS HAZARD, FOUND THE HARD WAY. The first run of this study (from the dev
+worktree) reported baseline n 87 / PF 0.831 — nothing like the take-profit study's n 51 / PF 0.445
+on 09-14, with the engine and walk-forward code unchanged and the OHLCV bars byte-identical (2,211
+bar-days compared against the bars that run saved). Cause, proven by reproduction: the worktree
+held an EMPTY `data/historical.db` — `HistoricalDataStore.__init__` creates the file if absent —
+so `load_daily_ohlcv` fell back to Yahoo for everything with NO stored IBKR implied vol, and
+`_load_calibrated_spreads` (which opens the store by cwd-relative default path, ignoring the
+`db_path` the walk-forward was given) found no calibration. Same code, same dates, pointed at the
+live store: n 50 / PF 0.449 — the 09-14 figure. So the engine prices 2024-07-onward windows with
+stored implied vol when it has it and with a VIX-scaled realized vol when it does not, and the two
+harnesses disagree by a factor of ~2 in PF. Nothing warned. The study now takes `--data-root`,
+runs from it, and ABORTS unless every symbol carries stored IV on >= 400 rows; the results record
+the store and its coverage. The take-profit study (run in the live tree on 09-14) was on the right
+store. OPEN, for whoever owns the engine: thread `db_path` into `_load_calibrated_spreads` and into
+the settings load, and make an empty store a loud failure rather than a silent fallback.
+
+PROOF. `tests/test_post_event_study_injection.py`, 14 executing tests (gate inert by default; blocks
+exactly days 0..N; only the most recent event counts; ISO dates accepted; applied at the real entry
+path — a run gated on every day opens zero positions; pickles across the process-pool boundary;
+reaches the OOS and shadow Backtesters; refused with per-window optimisation). All 14 red before the
+engine change (unknown keyword). Full fast lane with the change: **2350 passed / 46 skipped / 0
+failed**, typecheck OK. No live code path reads the new parameters.
+
+Outputs: `reports/post_event_study/entry_dte_18/` (per-variant json + summaries, `removed_by_*.json`
+with the exact trades each buffer took away and added, results.md/json with data provenance,
+run.log). Progress directories (timeseries bars, 6 MB) are not committed, as with the take-profit
+study.
+
+---

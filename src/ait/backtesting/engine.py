@@ -223,6 +223,16 @@ class Backtester:
         # from load_settings() (config.yaml authority; falls back to
         # OptionsConfig's pydantic default when no config.yaml is reachable).
         entry_dte: int | None = None,
+        # Research-only (scripts/post_event_study.py): block CREDIT entries for
+        # this many calendar days AFTER an event date (day 0 = the event day
+        # itself, when the decision lands intraday). None = off, which is the
+        # engine's behaviour before this parameter existed. The live pre-event
+        # gate above is untouched. `post_event_dates` is the event list this
+        # gate uses — the study passes FOMC decision days 2022-2026, because
+        # ait.data.economic_calendar only knows 2026-2027 and a buffer tested
+        # on the 2026 windows alone would be a test of one year.
+        post_event_blackout_days: int | None = None,
+        post_event_dates: tuple | None = None,
         # R20b follow-up: optional pre-loaded Settings, so a caller building
         # many Backtester instances (StrategyOptimizer: one per Optuna trial)
         # can load config.yaml ONCE and thread it through instead of every
@@ -335,6 +345,11 @@ class Backtester:
         # live's actual chain selection (dte_range[0]) — see constructor
         # comment. Not itself Optuna-searched; max_hold_days (below) stays
         # the searched hold-cap knob.
+        self._post_event_blackout_days = (
+            int(post_event_blackout_days) if post_event_blackout_days is not None else None)
+        self._post_event_dates = tuple(sorted(
+            d if isinstance(d, date) else date.fromisoformat(str(d)[:10])
+            for d in (post_event_dates or ())))
         self._entry_dte = int(entry_dte) if entry_dte is not None else int(
             _resolve_setting(None, "options", "dte_range", OptionsConfig, _settings)[0])
         self._scan_interval_minutes = int(_resolve_setting(
@@ -688,6 +703,18 @@ class Backtester:
                         days_to_event=_d2e,
                     )
                     continue
+
+            # Research-only post-event blackout (see __init__). Inert unless
+            # scripts/post_event_study.py sets it.
+            if strategy in CREDIT_STRATEGIES and self._post_event_blocked(today_date):
+                _entry_decision["post_event_gate"] = {
+                    "days_since_event": self._days_since_event(today_date),
+                    "blocked": True,
+                }
+                log.debug("post_event_entry_skip", date=str(today_date),
+                          strategy=strategy,
+                          days_since_event=self._days_since_event(today_date))
+                continue
 
             # Regime gate: iron condors / short strangles fail in trending-down regimes.
             # Exp 21 post-mortem: 4 trending_down trades, 25% win rate, avg PnL -$195.
@@ -1311,6 +1338,20 @@ class Backtester:
     # ------------------------------------------------------------------
     # Strategy selection — now IV-aware
     # ------------------------------------------------------------------
+
+    def _days_since_event(self, today: date) -> int | None:
+        """Calendar days since the most recent post_event_date on/before today."""
+        past = [d for d in self._post_event_dates if d <= today]
+        return (today - past[-1]).days if past else None
+
+    def _post_event_blocked(self, today: date) -> bool:
+        """True when a research post-event blackout is set and today sits inside
+        it: 0 <= days_since_event <= post_event_blackout_days."""
+        n = self._post_event_blackout_days
+        if n is None or not self._post_event_dates:
+            return False
+        since = self._days_since_event(today)
+        return since is not None and 0 <= since <= n
 
     def _select_strategy(
         self,
