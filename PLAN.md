@@ -8633,3 +8633,327 @@ NEXT pointer may itself be stale by the time a future session reads it, per the 
 rule about re-verifying rather than trusting a prior pointer.
 
 No inspect.getsource.
+
+---
+
+## 2026-09-22 - ROADMAP: assignment-response policy (close/roll/close-or-roll) scoped as W52-W54, and a rule-3 multi-leg diagnosis gap found while scoping it
+
+No code in this entry. Operator asked to assess — not implement — the effort for a config-driven
+close/roll/close-or-roll policy on at-risk short option legs, prompted by reviewing W51's "close
+only, no roll" scope cut, and to register the result as the next wave(s), ahead of the still-
+pending test-honesty/`inspect.getsource` track (operator's explicit sequencing instruction this
+session — same live-work-first precedent as the 2026-09-21 REGISTER CORRECTION + ROADMAP entry).
+
+[1] CORRECTION TO W51's OWN FRAMING: "close or roll" is not call-specific; the ex-div finding is.
+    W51's entry above says "close only, no roll, for an at-risk short call" in a way that reads as
+    if the close/roll choice itself is about calls. It isn't — two different things were
+    compressed into one sentence and shouldn't have been:
+    - The GENERAL pattern — how to handle any at-risk short leg, call or put, for any reason — is
+      symmetric by nature, and this codebase's own design already treats it that way in source:
+      `portfolio.py`'s pre-existing rule 3 (`:711-737`, "Assignment risk — ITM shorts on expiry
+      day") has an explicit branch for each side — `trade.contract_type == "put"` and
+      `== "call"` — with its own comment pairing "short puts ITM -> stock gets put to you" against
+      "short calls ITM -> shares called away." The design intent has never been call-only. (Whether
+      that code path actually *executes* for the live strategy is a separate question — see [2].)
+    - W51's NEW rule (3e, `pre_ex_div_assignment_risk`, `:836`+) is deliberately call-only, and
+      that scoping is economically correct, not an oversight or asymmetric treatment of puts:
+      early assignment ahead of a dividend is the textbook "dividend capture" trade — a long CALL
+      holder can profit from exercising early, forfeiting remaining extrinsic value, specifically
+      to become the stock's owner of record before the ex-div date and collect the dividend. A
+      long PUT holder has no analogous incentive — exercising early forfeits extrinsic value for
+      no offsetting gain, and the ex-div date's mechanical price drop makes a put MORE valuable
+      held, not less. 3e stays call-only permanently; a future wave should not "fix" it by adding
+      a put branch.
+
+[2] A REAL FINDING, SURFACED WHILE ANSWERING [1] — and corrected once mid-check, the way this
+    register expects: rule 3's per-side ITM diagnosis is unreachable for the only live strategy.
+    It is NOT that the rule never fires (first pass assumed `trade.strike` was `None` for a
+    multi-leg trade and was about to say so — checked before writing it down, and that's wrong).
+    What's actually true, verified at HEAD: `iron_condor.py:410` sets `contract=short_put` as the
+    signal's "primary reference leg," so `executor.py:400`'s
+    `strike=signal.contract.strike if signal.contract else None` DOES store a real value (the
+    short put's strike) on every iron condor trade — rule 3's outer gate (`portfolio.py:715`,
+    `dte<=1 and is_credit and trade.strike`) fires as expected. But `executor.py:3145-3153`'s
+    `_get_contract_type` returns `"iron_condor"` for any 4-leg signal (`"spread"` for a 2-leg one,
+    e.g. `short_strangle`) — never `"put"`/`"call"` for a multi-leg trade — and rule 3's ITM check
+    (`:723-726`) branches on exactly `trade.contract_type == "put"` / `"call"`. Neither matches
+    `"iron_condor"`, so `itm` stays `False` unconditionally, and the `if not should_exit:` fallback
+    two lines later (`:735-737`) fires instead every time, labeling the close
+    `"expiry_approaching (DTE: {dte})"` — the same generic label whether the position is genuinely
+    ITM-and-at-risk or not.
+    Net effect, precisely stated: a live iron condor at dte<=1 still closes either way (the
+    fallback guarantees it) — **this is not a live protection hole**. What's lost is the
+    diagnosis: rule 3 can never tell a future policy which side is ITM, or that assignment risk
+    (as opposed to routine time-decay) is why it's closing. A close/roll policy needs exactly that
+    per-leg answer — which leg, is it really ITM — to decide whether there's anything to react to,
+    and which leg to roll if rolling. Rule 3e already solved this correctly for its own (call-only)
+    case by reading `trade.legs` JSON instead of `trade.contract_type`/`trade.strike` — the same
+    idiom rule 1b (`:578`+, short-strike touch stop) uses. Rule 3 needs the identical treatment,
+    extended to both sides, to become the general per-leg ITM detector a roll-capable policy would
+    dispatch from. The same gap applies to `short_strangle` (2-leg, also credit, also gets
+    `contract_type="spread"`) if that strategy is ever re-enabled — not just `iron_condor`.
+    Folded into W52 below rather than filed as its own standalone finding: it's the same fix shape
+    3e already used, on the same underlying pattern.
+
+[3] WHAT A ROLL ACTUALLY NEEDS — researched against this codebase's real primitives, not estimated
+    from first principles. Reused, proven machinery (not new cost): `ContractBuilder.combo()`
+    (`contracts.py:68-98`) is a generic conId/action/ratio Bag builder with no concept of "closing"
+    vs. "opening" — it already underlies both entry (`executor.py:668`) and exit
+    (`orchestrator.py:4712`, which builds its closing combo by re-qualifying each `trade.legs`
+    entry and reversing its action). `qualify_contract(s_batch)`, the NBBO-based marketable-limit
+    combo pricing/reprice ladder (the R16-fixed raw-`Bag` `reqMktData` path), and the legs-JSON
+    "find the short call/put strike" idiom (rule 1b, rule 3e) all transfer directly — none of this
+    needs to be built.
+    Genuinely new, roughly in the order each blocks the next:
+    a. Roll-target contract selection. Nothing today picks an option contract outside of a
+       from-scratch entry (the iron-condor strategy's own strike picker assumes it's building a
+       fresh 4-leg condor, not replacing one leg of an open position). Needs a small, new selector:
+       given an at-risk leg plus a live chain, pick a defensive replacement (later expiry, same
+       strike; or a delta-matched strike, same expiry; or both).
+    b. `_validate_combo_legs`/`_EXPECTED_LEG_SHAPE` (`executor.py:68-99`) is keyed by
+       `strategy_name`, with a fixed expected (SELL, BUY) count per known strategy; a roll's leg
+       shape (e.g. one BUY-to-close plus one SELL-to-open) matches no existing key. Needs either a
+       new pseudo-strategy entry or its own validator — small, but a real gap in a gate the R5
+       audit put there on purpose ("a single reversed leg turns defined-risk into undefined-risk").
+    c. Atomicity is an open, unproven question, not a design detail to wave through: one BAG combo
+       mixing a to-be-closed existing conId with a to-be-opened new conId (what a TWS "roll"
+       ticket does under the hood), vs. two sequential orders (`_close_multi_leg` then
+       `_execute_multi_leg`, reused almost as-is). Atomic removes the gap-risk window between legs
+       but needs to be proven against paper, not assumed from `Bag`/`ComboLeg` being generic.
+       Sequential is safer to build first but creates a new partial-failure state this codebase has
+       never had to handle (old position closed, new one's placement then fails or reprices away).
+    d. `close_or_roll`'s comparison model is a real modeling task, not a config toggle — "the bot
+       considers both and picks the better" means comparing crystallizing the close now against
+       the roll's net credit/debit, new max-loss profile, new DTE, and whether the new position
+       still carries near-term assignment risk. Should start as an explicit, auditable heuristic
+       (e.g. roll only on a net credit that doesn't increase max-loss vs. closing), not a full
+       pricing-model EV calculation — but that sophistication call belongs to whoever scopes that
+       wave, not decided here.
+    e. DB/reporting linkage. A roll is naturally "close trade A, open trade B"; needs a link field
+       (e.g. `rolled_from_trade_id`) so the two rows read as one continuous position, and
+       `go_live.py`'s real-close/verdict logic (CLAUDE.md-flagged single-source-of-truth file)
+       needs to know a roll's close isn't a normal win/loss close, or the 50-close paper-verdict
+       sample gets contaminated by rolls counting as extra closes.
+    f. Both rule 3 (general, once fixed per [2]) and rule 3e (ex-div, calls only, per [1]) need to
+       stop unconditionally setting `should_exit=True` the moment they detect risk, and instead
+       consult the new policy — a control-flow change to `check_positions`'s exit-decision shape
+       (every rule today just flips a boolean), not an additive elif.
+
+[4] CONFIG SHAPE — a sketch to size against, not a final schema; field names will move once
+    [3]b-f are actually designed. A new `AssignmentResponseConfig(_StrictModel)` in `settings.py`,
+    mirroring `DividendConfig`'s shape (`:499-518`): a `policy` field typed
+    `Literal["close_only", "roll_only", "close_or_roll"]` (`Literal` is already the house idiom for
+    this exact kind of field — `trading.mode`, `logging.level`), defaulting to `close_only` (so
+    shipping the config plumbing changes no live behavior until an operator opts in), plus whatever
+    [3]a/d need (a roll-target DTE floor, a minimum roll credit, etc. — TBD at implementation). A
+    matching `assignment_response:` block in `config.yaml`, next to `dividends:`/`earnings:`.
+
+[5] THE ROADMAP. Next three wave numbers, sequenced ahead of the test-honesty/`inspect.getsource`
+    track per the operator's explicit instruction this session — that track carries no live-money
+    urgency and keeps interleaving freely once this lands. (Disambiguation: this is unrelated to
+    the *other* "roll" idea already registered at `GAP_AUDIT_R7.md:252-253` — rolling the
+    untested side of a still-healthy condor toward the money for extra credit, a POST-VERDICT/M
+    tactical-defense idea. This entry is about an at-risk/assigned short leg, not a healthy one.)
+
+    | Wave | Contents | Size | Notes |
+    |---|---|---|---|
+    | **W52** | Fix rule 3's multi-leg ITM diagnosis ([2]): rewrite its per-leg check to use the legs-JSON idiom (rule 1b/3e's pattern) instead of `trade.contract_type`/`trade.strike`, so it can name which side of a multi-leg trade is genuinely ITM instead of always falling through to the generic `expiry_approaching` label | ~half day | Standalone, no operator decision. Worth landing even if W53/54 slip — it's the per-leg diagnosis a roll policy needs, independent of whether roll ever ships |
+    | **W53** | Roll mechanics: contract selection ([3]a), combo construction + `_validate_combo_legs` extension ([3]b), the atomicity decision proven against paper ([3]c), DB linkage ([3]e first half). Ships `close_only`/`roll_only` as real, testable, config-selected behaviors | ~2-2.5 days | The atomicity probe ([3]c) may re-scope this wave once run — same "probe before designing" discipline W51 used for the broker-protocol layer |
+    | **W54** | `close_or_roll`'s comparison model ([3]d) + wiring rule 3 (post-W52) and rule 3e through the new policy dispatch ([3]f) + `go_live.py` roll-accounting interaction ([3]e second half) | ~1.5-2 days | Comparison-model sophistication (heuristic vs. fuller EV) is an operator decision to make when this wave is actually scoped, not here |
+
+    Total ~4.5-5 days across three waves — larger than any single wave run to date (W47 at ~2.5
+    days was the prior largest), consistent with the "greenfield, larger than the rest of W51"
+    read that prompted this assessment. W52 is sequenced first and deliberately decoupled from
+    W53/54's fate: it's cheap, touches disjoint code from the rest, and closes a real (if narrow,
+    per [2]) diagnosis gap on its own regardless of whether or when rolling ships.
+
+STATE AT HANDOFF: this entry only, register-only — no code, no config, no tests touched. Nothing
+to deploy or restart.
+
+NEXT: **W52** — rule 3's multi-leg ITM-diagnosis fix, detailed above, no operator decision
+required. W53 needs the atomicity question ([3]c) probed against paper before its own scope is
+trusted. W54's comparison-model sophistication is an operator decision at scoping time. The
+test-honesty/`inspect.getsource` track (W51's NEXT pointer, above) resumes after these three, per
+[5]'s sequencing.
+
+No inspect.getsource — this entry doesn't touch test files.
+
+---
+
+## 2026-09-22 - ROADMAP EXTENSION: tastytrade-style tested/untested-side condor defense scoped as W55-W57, plus a soundness review of the operator's playbook document
+
+No code in this entry — same register-only discipline as the entry above. Operator supplied a
+document describing the standard (tastytrade-school) iron condor adjustment playbook — roll the
+untested side toward the tested side for a credit, vs. roll the tested side itself for a debit,
+choosing between them on a short strike's delta and DTE — and asked for (a) a soundness check,
+(b) this scoped as new wave(s), (c) a `tested_only` / `untested_only` / `both` config choice, gated
+on rolling being available at all, and (d) the document's own decision-framework thresholds exposed
+as configured defaults. Two design forks were real enough to put to the operator rather than decide
+unilaterally; both are resolved below before sizing anything.
+
+[1] SOUNDNESS REVIEW: the playbook is accurate tastytrade-school doctrine, correctly reasoned on
+    its own mechanics (rolling the untested spread closer for a credit does widen the aggregate
+    breakeven and does converge the shape toward an iron butterfly; rolling the tested side for a
+    debit does trade cost for distance). Two caveats, neither disqualifying:
+    - It is one dominant retail/education-sourced philosophy, not a law of options math — its own
+      hedging ("both approaches exist... more advanced playbooks combine both") is appropriate.
+      The specific decision-table numbers (0.25/0.30/0.40 delta, 14/21 DTE) come from retail
+      options-education sources cited in the document, not first-party research. Treating them as
+      **configured defaults**, not hardcoded constants, is the right call — see [4].
+    - The document is delta-native throughout and cannot know this codebase's own state: **there is
+      no live delta/greeks feed on the exit/monitor path today.** Re-verified at HEAD (not assumed
+      from the existing rule 3b comment): `portfolio.py:1073`'s `_get_position_delta` docstring
+      (R16, already audited) confirms `ib.ticker(contract).modelGreeks` requires an open
+      market-data subscription the exit loop never holds (every `reqMktData` elsewhere is
+      snapshot-style, opened and cancelled in a `finally`), and ib_insync 0.9.86's `PortfolioItem`
+      carries zero greeks fields — verified by its full field list in the same docstring. This is
+      why rule 3b (delta_breach) is already documented dead. Separately re-verified:
+      `_get_option_marks()` (`:312-324`), the ONE live per-leg data source the monitor loop
+      actually has, returns only `item.marketPrice` keyed by `(symbol, expiry, strike, right)` —
+      no IV, no greeks, price only. A framework keyed on delta thresholds cannot run against this
+      bot's real data without new machinery. This is the first fork put to the operator (below).
+
+[2] SECOND FORK: "roll a side" is ambiguous at the leg level. The document says "close the untested
+    spread... and reopen it closer to the current price" — for an iron condor's short+long pair,
+    "spread" is naturally the 2-leg vertical (short and its paired long together), not the short
+    strike alone. Rolling only the short would leave the original long wing behind at its old
+    strike, silently changing that side's width and max-loss — a real risk-shape question, not a
+    style choice, and one the document doesn't itself address since it's written for single-vertical
+    defenses generically rather than this codebase's defined-risk-IC-only posture (CLAUDE.md flags
+    the undefined-risk boundary as a standing, sensitive concern).
+
+[3] OPERATOR DECISIONS (both taken as given, not re-litigated below):
+    - **Delta source: synthetic, from the live price the monitor loop already has — not a new
+      broker subscription.** `options_chain.py:936-1030`'s `_calculate_greeks` already runs a real,
+      well-audited (R16, W19, W35, w17-07) two-pass py_vollib pipeline — solve IV from an observed
+      price via `implied_volatility()`, then `delta()`/`gamma()`/`theta()`/`vega()` from the solved
+      IV — today only at entry-time chain scanning, fed by a chain snapshot's bid/ask mid. The new
+      work is adapting this proven pattern to the monitor loop, fed by `_get_option_marks()`'s
+      already-live `marketPrice` instead of a chain snapshot, and validating the solve behaves on
+      real monitor-loop prices before trusting it (this codebase's standing discipline for any
+      external-data-adjacent calculation — verify against real output, don't assume a working
+      pattern transfers unchanged to a new calling context). This does NOT, by itself, revive rule
+      3b (that needs the real-subscription path, explicitly not chosen) — but the same new synthetic
+      helper COULD be substituted into `_get_position_delta` later at near-zero extra cost, if
+      wanted; noted as available, not committed to any wave below.
+    - **Roll scope: the full 2-leg vertical, short + long together.** Preserves the defined-risk
+      wing structure and matches the document's literal description, at the cost of a 4-leg combo
+      (2 closing legs + 2 opening legs) rather than the 2-leg combo (1 closing + 1 opening) W53
+      above was scoped around for a single at-risk leg. `_validate_combo_legs`/
+      `_EXPECTED_LEG_SHAPE` (`executor.py:68-99`) needs a second new leg-shape accommodation beyond
+      W53's, for this different combo shape — the two rolls (single-leg assignment-driven, per
+      W52-54; two-leg vertical, tactical, per this entry) are not the same order shape and
+      shouldn't be forced through one validator case.
+
+[4] CONFIG SHAPE (sketch, sized against, not final): a new `CondorDefenseConfig(_StrictModel)` in
+    `settings.py`, structurally distinct from W52-54's `AssignmentResponseConfig` (different
+    trigger — delta/DTE bands on a still-healthy position, not near-expiry/ex-div assignment risk
+    on an already-at-risk one) but consuming the same underlying roll-order machinery once W53
+    exists.
+    ```
+    enabled: bool = False            # see the POST-VERDICT note in [5] for why the default is off
+    side: Literal["tested_only", "untested_only", "both"] = "untested_only"
+    monitor_delta_max: float = 0.25          # below this, do nothing
+    roll_untested_delta_min: float = 0.25    # document's table, row 2
+    roll_untested_delta_max: float = 0.30
+    roll_untested_dte_min: int = 14
+    roll_untested_dte_max: int = 21
+    untested_roll_target_delta: float = 0.20 # roll the untested short toward this delta
+    roll_tested_delta_min: float = 0.30      # document's table, row 3 (low-gamma / >21 DTE)
+    close_delta_threshold: float = 0.40      # document's table, row 4 (high-gamma / near-expiry)
+    ```
+    Field names and the exact threshold set will move once the wave below is actually designed —
+    this sizes the surface, following `DividendConfig`'s established shape (`settings.py:499-518`)
+    and the house `Literal[...]` idiom (`trading.mode`, `logging.level`) for the policy field, same
+    as W52-54's entry used for `assignment_response.policy`. A matching `condor_defense:` block in
+    `config.yaml`, next to the `assignment_response:` block W53/54 will add.
+
+[5] SEQUENCING AND THE POST-VERDICT QUESTION, MADE EXPLICIT. This exact idea — rolling the untested
+    side for credit and/or rolling out in time near 21 DTE — is not new to this register:
+    `GAP_AUDIT_R7.md:252-253` already evaluated it and called it POST-VERDICT/M: *"at 1 contract
+    each roll costs 2 legs (~$2.60 + crossing) for maybe $10-25 extra credit — thin, and changing
+    exit mechanics mid-sample corrupts the 50-close measurement. The flat 1.25x loss close is a
+    defensible defense until the verdict."* That reasoning is not overridden here — the register
+    is append-only and that entry stands. What changes is that the operator has now asked for this
+    to be scoped and built with a config surface, which this entry does. The two are reconciled the
+    same way W52-54's own roll capability was: **`enabled` defaults to `False`** ([4]), so shipping
+    the code changes no live behavior — the corruption risk GAP_AUDIT_R7 named only materializes on
+    an explicit opt-in, which stays the operator's call, ideally after the 50-close paper verdict
+    per that prior reasoning, not assumed here either way.
+
+    | Wave | Contents | Size | Notes |
+    |---|---|---|---|
+    | **W55** | Synthetic per-leg delta for the monitor loop ([3] first bullet): adapt `options_chain.py`'s py_vollib IV-solve-then-Greeks pattern to `_get_option_marks()`'s live price; validate the solve against real monitor-loop prices before anything depends on it | ~1-1.5 days | No dependency on W52-54 or on anything else in this entry — could run any time, including before W52. Sequenced here only for register locality |
+    | **W56** | Tested/untested decision logic: per-tick, per open iron condor, compute both short legs' synthetic delta (W55) and evaluate against [4]'s configurable delta+DTE bands to decide do-nothing / roll-untested / roll-tested / close | ~1-1.5 days | Needs a non-boolean decision output from `check_positions` — the same structural extension W54 above already needs for its own close-vs-roll choice. Design once, use for both, rather than two independent bolt-ons |
+    | **W57** | The roll-a-vertical action: 4-leg combo construction reusing W53's contract-selection/qualify/NBBO-pricing primitives, the second `_validate_combo_legs` accommodation ([3] second bullet), the `CondorDefenseConfig` policy wiring ([4]), DB linkage for a (potentially two-sided) roll event | ~2-2.5 days | Depends on W53 (shared roll mechanics) and W56 (the decision to act on). The largest of the three |
+
+    Total ~4.5-5.5 days across three more waves, on top of W52-54's ~4.5-5 days — call it ~9-10.5
+    days for the complete at-risk-plus-tactical roll capability across six waves (W52-W57). Worth
+    the operator seeing that sum in one place before committing to all of it; nothing here forces
+    building all six before any one is useful; W52 and W55 in particular are already independently
+    useful on their own.
+
+STATE AT HANDOFF: this entry only, register-only — no code, no config, no tests touched. Nothing
+to deploy or restart.
+
+NEXT: unchanged from the entry above — **W52** first (no operator decision required). W55 has no
+dependency on W52-54 and can be pulled forward if live per-leg delta is wanted sooner for its own
+sake (it would also make a future `_get_position_delta` fix cheaper, per [3], if that's ever
+wanted). W56 and W57 wait on W55 and W53 respectively. `condor_defense.enabled` stays `False` at
+every step per [5] until the operator opts in.
+
+No inspect.getsource — this entry doesn't touch test files.
+
+---
+
+## 2026-09-22 - REGISTER CORRECTION: test-honesty/`inspect.getsource` census gets stable batch labels (CENSUS-1..5), pointer restated in full
+
+No code in this entry — a pointer/labeling fix only, same register-only discipline as the two
+entries above. Operator asked directly whether the test-honesty/`inspect.getsource` census (scoped
+in the 2026-09-21 REGISTER CORRECTION + ROADMAP entry, `PLAN.md:6700`) had gotten lost under the
+W52-57 additions. Traced the `NEXT` pointer chain end to end to check, rather than assert: W43's
+`NEXT` correctly moved to W44 (W43 closed only the `w23-et-cron-tests-build-their-own-crontrigger`
+finding, not the census — a separate component of the same "test-honesty track" row); every
+live-money wave since deferred the census correctly; W51's `NEXT` (`:8629`) named it explicitly
+once the live-money queue ran dry; the W52-54 entry above (`:8773`) restated it by name ("resumes
+after these three"); the W55-57 entry above (`:8899`) shortened that to "unchanged from the entry
+above" — still correct by reference, but the first link in the chain that needs a prior entry
+opened to know what it points at. Not lost, but a real discoverability regression — the same class
+of drift this register has caught before (`W20 CORRECTIONS + W21 POINTER`, and the 2026-09-17 and
+2026-09-22 REGISTER CORRECTION entries). Fixed the same way those were: correct it going forward,
+don't edit the entry that drifted.
+
+STATUS, RESTATED IN FULL SO NO FURTHER HOP IS NEEDED: the census is exactly as scoped at
+`PLAN.md:6700` and untouched since — zero sites rewritten, nothing started. W43 remains the only
+piece of the original test-honesty track actually executed; the getsource census itself is a
+separate, still fully open component of that same row. Its 5 batches, unchanged in content or
+estimate from the 2026-09-21 entry, now get stable labels so a future `NEXT` line can cite one
+without re-describing it:
+
+| Label | Contents | Sites |
+|---|---|---|
+| **CENSUS-1** | Recorder-harness lift | ~9 |
+| **CENSUS-2** | Exit-policy / engine | ~7 |
+| **CENSUS-3** | `master.py` / entrypoint — the expensive one despite fewest sites | ~3 |
+| **CENSUS-4** | Scattered moderates | ~7 |
+| **CENSUS-5** | Delete-only | ~6 |
+
+32 sites total — matches the 2026-09-21 entry's own recount (its finding [2]: "32 sites are the
+genuine rewrite target"). Deliberately NOT given a `W`-number: unlike W52-57, this track carries no
+live-money urgency and was explicitly scoped to interleave freely, in any order, whenever there are
+spare cycles between real waves — folding it into the sequential wave numbering would misrepresent
+it as gated/ordered work it was never meant to be. `CENSUS-1` through `CENSUS-5` are independent of
+each other and of every wave in this register; none blocks or is blocked by W52-W57.
+
+STATE AT HANDOFF: this entry only — a label and a restated pointer, nothing rescoped, nothing
+resequenced, no code or config touched.
+
+NEXT: **W52** (rule 3's multi-leg ITM-diagnosis fix, detailed in the entry above, no operator
+decision required) remains first in the live-feature queue. `CENSUS-1` through `CENSUS-5` remain
+open, un-started, and free to interleave at any point — whichever a future session picks up first
+should not need to hop to a prior entry to know its status. Standing discipline from here: a `NEXT`
+pointer that would otherwise just say "unchanged from the entry above" should name every still-open
+item explicitly instead, even briefly — this entry exists because that shorthand cost one
+re-derivation already.
+
+No inspect.getsource — this entry doesn't touch test files.
