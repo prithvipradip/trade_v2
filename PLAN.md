@@ -8957,3 +8957,71 @@ item explicitly instead, even briefly — this entry exists because that shortha
 re-derivation already.
 
 No inspect.getsource — this entry doesn't touch test files.
+
+## 2026-09-22 - W41b (Windows box) — Ahmed's W46-W51 validated here; one W41 test was calendar-date-dependent and went red this morning
+
+THE PULL. 20 commits from `curious-talleb` since yesterday's deploy (`7cb99a9..7479596`: W46-W51
+plus roadmap/register entries through W57). Full fast lane on this box, in the dev worktree, on
+exactly that tree: **2 failed / 2334 passed / 46 skipped**, typecheck OK. Both failures in
+`tests/test_w41_live_money_floors.py::TestPDTHistorySurvivesATransientLock`; both deterministic
+(3 of 3 runs); `src/ait/risk/pdt_guard.py` unchanged since yesterday's green run of the same tests.
+
+WHY. The fixtures seeded PDT history with the LITERAL dates 2026-09-15/16/17 and 2026-09-15. The
+guard purges anything outside its rolling 5-business-day window. On 09-21 that window was
+{15,16,17,18,21} and the fixture sat inside it; on 09-22 it is {16,17,18,21,22}, the guard correctly
+purged 09-15, and the test read that purge as "the locked write destroyed real history". A
+calendar-date-dependent test — the same class the R26 register filed against the W23/W24 tests —
+that was green on the day it was written and red from the next trading day on. Production behaviour
+is correct; the test's premise moved.
+
+THE FIX. `_in_window_days(n)` seeds the n oldest days of the guard's OWN window
+(`get_recent_trading_days(WINDOW_DAYS)`, the real calendar), so the premise holds on any date. The
+two tests keep their meaning exactly (real in-window history must survive a locked write / a
+recovered store must merge, not clobber). 25/25 in the two PDT files; full lane below.
+
+OBSERVATIONS ON THE PULL, RECORDED FOR AHMED (nothing else changed here):
+  - W47's `bot-day-10` is the item this box registered yesterday as "not fixed" in W33b: the exit
+    cancel/re-price that took 11-12 minutes instead of 5 because scans held the event loop.
+    Protection now runs on its own task. Not exercised live yet.
+  - W48 extended `_settle_deferred_trueups` (W37's method) with the completeness gate the inline
+    path already had. W37's remembered estimate and W48's gate compose — the W37 tests are in the
+    green run.
+  - W51's dividend gate is armed on this universe (SPY/QQQ/IWM all pay). Run against the real
+    calendar this morning: next ex-div SPY 12-18, QQQ 12-21, IWM 12-15 — no entry is blocked until
+    the December windows. But its last-known-good store is in-memory like W44's, so the FIRST scan
+    after every restart will refuse all three (and page) until the yfinance fetch answers, on top of
+    W44's identical cold-start refusal. Two false pages per restart now.
+  - W49's `KEEPER_PAUSE` branch in `keeper_ait.bat` — Ahmed's open item (1), "needs a human with
+    hands on the Windows box" — is verified below.
+  - W34b's boot launcher wrote its first log this morning (`logs/gateway_launch_20260922_075530.log`,
+    after the operator's 21:31 Mon power-off and 07:54 boot): IBC's `StartGateway.bat` prints
+    `'wmic' is not recognized` (Windows 11 removed wmic) and two "file in use" lines, and the
+    Gateway still came up and the bot connected at 07:55:50. The boot shape works on this install
+    despite those warnings — the evidence W34b said the next launch would provide.
+
+KEEPER_PAUSE VERIFIED ON THE LIVE BOX (Ahmed's W49 open item 1). Because `cmd.exe` reads a running
+batch file by byte offset, the old keeper (pid 21028) was stopped BEFORE the fast-forward rewrote
+`keeper_ait.bat`, and a fresh one launched from the new file the way the Startup shortcut does
+(pid 18480); the supervisor (3268) and bot (15808) were not touched. Then, against the real loop:
+  08:16:43  orchestrator alive                                   <- first tick of the new keeper
+  08:18:15  paused by data\KEEPER_PAUSE - not checking/relaunching  <- marker created at 08:16:5x
+  08:19:45  orchestrator alive                                   <- marker deleted
+The branch behaves as written: engage = create the file, resume = delete it, one tick (<=90s) of
+latency each way, observable in `logs/keeper.log`. RUNBOOK note for this box: create
+`data\KEEPER_PAUSE` BEFORE stopping processes by hand, or the keeper relaunches them within 90s.
+
+DEPLOY SMOKE on the live tree at `7479596`: SMOKE PASS (13 checks). It also reports
+`sqlite schema_version 26 -> 29: StateManager applied its idempotent startup DDL` — W46-W51 carry
+three additive migrations and the smoke's StateManager applied them to the LIVE `ait_state.db` while
+the running bot (started 07:59 on `7cb99a9`, schema 26) is still up. Additive columns/tables only;
+the running bot does not read them; row data unchanged (the smoke's no-writes check held).
+
+VERIFICATION: full fast lane in the dev worktree on `7479596` + this fixture fix: **2336 passed /
+46 skipped / 0 failed** (449s), typecheck OK.
+
+STATE AT HANDOFF: live tree fast-forwarded to Ahmed's HEAD plus this commit; keeper is on the new
+script; supervisor and bot are still on `7cb99a9` (W32-W45 + W34b/W33b) — **W46-W51 load at the
+next restart**, which is the operator's call. Recommended before the 09:30 open on a flat book:
+W47's protection task is the fix for yesterday's 11-12 minute exit re-price delay.
+
+---

@@ -58,6 +58,15 @@ class _ReadLocked:
         return getattr(self._real, name)
 
 
+def _in_window_days(n: int) -> list[str]:
+    """The n OLDEST trading days still inside the guard's rolling window, as
+    the ISO strings the guard stores - real calendar, never a literal date."""
+    from ait.risk import pdt_guard as _pg
+    days = list(_pg.get_recent_trading_days(_pg.WINDOW_DAYS))
+    assert len(days) >= n, days
+    return [d.isoformat() if hasattr(d, "isoformat") else str(d)[:10] for d in days[:n]]
+
+
 class TestPDTHistorySurvivesATransientLock:
 
     def test_a_locked_write_does_not_destroy_real_history(self, tmp_path):
@@ -71,8 +80,13 @@ class TestPDTHistorySurvivesATransientLock:
         """
         st = StateManager(db_path=tmp_path / "ait_state.db")
         healthy = _pdt(st)
-        for i in range(3):
-            healthy._day_trades.append((f"2026-09-{15+i:02d}", f"SYM{i}"))
+        # W41b: dated INSIDE the guard's rolling window, whatever today is.
+        # These were the literals 2026-09-15/16/17 - green on 09-21, red on
+        # 09-22 once 09-15 rolled out of the 5-business-day window (the
+        # guard's own purge, not a defect). Same class as the W23/W24
+        # calendar-date-dependent tests.
+        for i, day in enumerate(_in_window_days(3)):
+            healthy._day_trades.append((day, f"SYM{i}"))
         healthy._save_state()
         assert len(healthy._day_trades) == 3, "premise: three real entries exist"
 
@@ -91,7 +105,7 @@ class TestPDTHistorySurvivesATransientLock:
         everything, including the trade recorded while still locked."""
         st = StateManager(db_path=tmp_path / "ait_state.db")
         healthy = _pdt(st)
-        healthy._day_trades.append(("2026-09-15", "SYM0"))
+        healthy._day_trades.append((_in_window_days(1)[0], "SYM0"))  # W41b: see above
         healthy._save_state()
 
         locked = _pdt(_ReadLocked(st))
