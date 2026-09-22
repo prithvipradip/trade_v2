@@ -12,8 +12,10 @@ HEAD before this wave started.
    available_funds.
 4. model-vs-reality-ex-div-assignment-void, piece 1 — an assigned stock
    position never froze new entries.
-5. The max_contracts_per_trade startup guard-rail (new — protects the three
-   findings queued for W50 from ever arming before they're fixed).
+5. The max_contracts_per_trade startup guard-rail (GOV-6) — protected the
+   three findings queued for W50 from ever arming before they were fixed.
+   RETIRED by W50 once those three were actually fixed; only the
+   still-true "the pinned config value constructs cleanly" control remains.
 
 Every test executes the real code path. No inspect.getsource.
 """
@@ -301,27 +303,19 @@ class TestAssignedStockFreezesEntries:
 
 
 # ---------------------------------------------------------------------------
-# 5. max_contracts_per_trade startup guard-rail
+# 5. max_contracts_per_trade startup guard-rail (GOV-6)
+#
+# W50: GOV-6 itself was RETIRED — the startup RuntimeError this class used to
+# assert (test_more_than_one_contract_refuses_construction, removed) existed
+# only "until the qty>1 booking path is fixed (PLAN.md W50)". All three
+# findings it guarded (money-flow-05, trade-life-partial-slice-pnl-erased,
+# trade-life-promotion-ignores-broker-quantity) are fixed and proven by
+# tests/test_w50_qty_ledger_fork.py; asserting the refusal here would now be
+# asserting something false. The construction control stays: it is still
+# true, and still worth pinning, that the live config value builds cleanly.
 # ---------------------------------------------------------------------------
 
 class TestMaxContractsGuardRail:
-
-    def test_more_than_one_contract_refuses_construction(self, tmp_path, monkeypatch):
-        from ait.bot.orchestrator import TradingOrchestrator
-        from ait.config.settings import load_settings
-        from tests.test_hot_path_smoke import CONFIG_PATH, SmokeIBKRClient
-        from tests.fakes import FakeIB
-
-        (tmp_path / "data").mkdir(parents=True, exist_ok=True)
-        (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
-        monkeypatch.chdir(tmp_path)
-
-        settings = load_settings(CONFIG_PATH)
-        settings.positions.max_contracts_per_trade = 2
-        ibkr = SmokeIBKRClient(FakeIB())
-
-        with pytest.raises(RuntimeError, match="max_contracts_per_trade"):
-            TradingOrchestrator(settings, ibkr)
 
     def test_one_contract_still_constructs(self, tmp_path, monkeypatch):
         """CONTROL: the live config value (1) must keep working — this is
