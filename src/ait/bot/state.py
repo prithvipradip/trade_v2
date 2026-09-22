@@ -83,6 +83,14 @@ class TradeRecord:
     # here by close_trade before the open_positions row is deleted — the
     # round-trip's slice-by-slice history otherwise vanished with the DELETE.
     partial_exits: str = "[]"
+    # W51 (model-vs-reality-margin-model-unimplemented): the broker's own
+    # reason an order died, stamped on a CANCELLED entry when IBKR's
+    # errorEvent captured one (see ibkr_client.order_error_codes) — without
+    # this a margin reject (201) was indistinguishable from a routine
+    # timeout/cancel. 0 / "" means no broker error was captured for this
+    # trade's order, not "no rejection happened" (status still says that).
+    reject_code: int = 0
+    reject_text: str = ""
 
 
 @dataclass
@@ -283,6 +291,12 @@ class StateManager:
                 # close_trade before that row is DELETEd. See TradeRecord's
                 # own field comment for why this exists.
                 "ALTER TABLE trades ADD COLUMN partial_exits TEXT DEFAULT '[]'",
+                # W51 (model-vs-reality-margin-model-unimplemented): the
+                # broker's own reason an entry order was cancelled, when
+                # errorEvent captured one. See TradeRecord's own field
+                # comment.
+                "ALTER TABLE trades ADD COLUMN reject_code INTEGER DEFAULT 0",
+                "ALTER TABLE trades ADD COLUMN reject_text TEXT DEFAULT ''",
             ):
                 try:
                     conn.execute(ddl)
@@ -1206,6 +1220,16 @@ class StateManager:
                 except Exception as e:
                     log.warning("duckdb_commission_sync_failed",
                                 trade_id=trade_id, error=str(e))
+
+    def update_trade_reject_reason(self, trade_id: str, code: int, text: str) -> None:
+        """W51 (model-vs-reality-margin-model-unimplemented): stamp the
+        broker's own reason a CANCELLED entry died, when errorEvent captured
+        one. No DuckDB re-ingest — a cancelled entry never reaches
+        close_trade's dual-write, so there is no DuckDB row to keep in sync."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE trades SET reject_code = ?, reject_text = ? WHERE trade_id = ?",
+                (code, text, trade_id))
 
     def set_trade_capital_at_risk(self, trade_id: str, car: float) -> None:
         with self._connect() as conn:

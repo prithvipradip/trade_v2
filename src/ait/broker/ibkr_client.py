@@ -482,8 +482,12 @@ class IBKRClient:
 
     #: Codes that carry the broker's reason for refusing or cancelling an
     #: ORDER. 201 rejected, 202 cancelled (incl. the price-band text), 110
-    #: price does not conform, 10318 price-band/cap variants.
-    _ORDER_ERROR_CODES = frozenset({110, 201, 202, 10318})
+    #: price does not conform, 10318 price-band/cap variants. W51
+    #: (model-vs-reality-margin-model-unimplemented, reject-reason capture
+    #: half): added 321 (order rejected - read-only/no trading permission on
+    #: the account/contract) and 200 (no security definition found) — named
+    #: explicitly by the finding alongside the already-tracked 201/110.
+    _ORDER_ERROR_CODES = frozenset({110, 200, 201, 202, 321, 10318})
     _ORDER_ERRORS_MAX_ORDERS = 256
     _ORDER_ERRORS_MAX_PER_ORDER = 8
 
@@ -507,6 +511,19 @@ class IBKRClient:
     def order_error_messages(self, order_id: int) -> list[str]:
         """The broker's error/warning texts for one order, oldest first."""
         return [text for _, _, text in self._order_errors.get(int(order_id), [])]
+
+    def order_error_codes(self, order_id: int) -> list[tuple[int, str]]:
+        """W51 (model-vs-reality-margin-model-unimplemented): the broker's
+        (code, text) pairs for one order, oldest first — order_error_messages
+        above discards the code, which is exactly what a caller needs to
+        distinguish a margin reject (201) from a price-tick reject (110) from
+        a routine cancel, instead of every rejection reading as the same
+        generic 'cancelled' status. Same underlying capture, same bounds
+        (_ORDER_ERROR_CODES / _ORDER_ERRORS_MAX_PER_ORDER above); this is an
+        additional accessor, not a replacement — order_error_messages keeps
+        its existing callers untouched.
+        """
+        return [(code, text) for _, code, text in self._order_errors.get(int(order_id), [])]
 
     async def qualify_contract(self, contract: Contract) -> Contract | None:
         """Qualify a contract with IBKR to get full details."""

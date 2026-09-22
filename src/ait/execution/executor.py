@@ -1081,7 +1081,7 @@ class TradeExecutor:
                 # refused (contracts are live) — the trade is handed back as
                 # a live position instead, exactly like the terminal-partial
                 # branch above.
-                if self._update_trade_cancelled(pending):
+                if self._update_trade_cancelled(pending, order_id=order_id):
                     cancelled.append(pending.trade_id)
                     log.info(
                         "trade_cancelled",
@@ -2964,7 +2964,7 @@ class TradeExecutor:
             requested=pending.contracts,
         )
 
-    def _update_trade_cancelled(self, pending: PendingOrder) -> bool:
+    def _update_trade_cancelled(self, pending: PendingOrder, order_id: int | None = None) -> bool:
         """Update a trade record to CANCELLED status (real write — see
         _update_trade_partial docstring for the INSERT OR IGNORE no-op bug).
 
@@ -2980,6 +2980,14 @@ class TradeExecutor:
         all_trades at all. A PARTIAL row therefore resolves to FILLED at the
         already-booked partial quantity: the order is dead, the contracts are
         not. Returns True when the trade was really cancelled.
+
+        W51 (model-vs-reality-margin-model-unimplemented): `order_id`, when
+        given, is used to stamp the broker's own reason (errorEvent-captured
+        code + text) onto the trade row before the CAS — the entry-side twin
+        of the exit path's existing W33 band-reject capture just above.
+        getattr+callable guarded like that call site: FakeIBKRClient does not
+        implement order_error_codes, and this must degrade to a no-op rather
+        than break every other executor test that constructs one.
         """
         try:
             row = self._state.get_trade_by_id(pending.trade_id)
@@ -3001,6 +3009,20 @@ class TradeExecutor:
                      "quantity) instead of being orphaned as CANCELLED",
             )
             return False
+        if order_id is not None:
+            try:
+                _oec = getattr(self._ibkr, "order_error_codes", None)
+                if callable(_oec):
+                    _errs = _oec(order_id)
+                    if isinstance(_errs, (list, tuple)) and _errs:
+                        _code, _text = _errs[-1]  # most recent captured reason
+                        self._state.update_trade_reject_reason(
+                            pending.trade_id, int(_code), str(_text))
+                        log.info("entry_reject_reason_captured",
+                                 trade_id=pending.trade_id, code=int(_code))
+            except Exception as e:  # noqa: BLE001 — never let this block the cancel
+                log.warning("entry_reject_reason_capture_failed",
+                            trade_id=pending.trade_id, error=str(e))
         self._state.transition(
             pending.trade_id,
             (TradeStatus.PENDING,),
