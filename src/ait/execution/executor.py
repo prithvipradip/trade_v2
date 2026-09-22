@@ -1259,17 +1259,29 @@ class TradeExecutor:
                     exit_reason_detailed=exit_reason,
                 )
                 if closed_ok is not False:  # True or legacy None both count
+                    # W50 (money-flow-05 / trade-life-partial-slice-pnl-erased):
+                    # close_trade may have folded prior partial-exit history
+                    # into realized_pnl (the common case — no partials — folds
+                    # to the same number, so this is a no-op there). Read the
+                    # row back rather than reuse the pre-close local: this
+                    # dict feeds Thompson/drift/the notification, and the
+                    # exit_outbox drain already reads the folded figure
+                    # straight from the DB (see close_trade) — both paths
+                    # must agree on what "this trade's P&L" means.
+                    _closed_row = self._state.get_trade_by_id(pending_exit.trade_id)
+                    _booked_pnl = (_closed_row.realized_pnl
+                                   if _closed_row is not None else realized_pnl)
                     completed_exits.append({
                         "trade_id": pending_exit.trade_id,
                         "exit_price": actual_exit_price if actual_exit_price is not None else 0.0,
-                        "realized_pnl": realized_pnl,
+                        "realized_pnl": _booked_pnl,
                         "exit_reason": exit_reason,
                     })
                     log.info(
                         "exit_order_filled",
                         trade_id=pending_exit.trade_id,
                         actual_exit_price=actual_exit_price,
-                        realized_pnl=realized_pnl,
+                        realized_pnl=_booked_pnl,
                     )
                 else:
                     log.warning(
@@ -2522,14 +2534,23 @@ class TradeExecutor:
                 exit_reason_detailed=exit_reason,
             )
             if closed_ok is not False:  # R12 Tier-A #1: no event on refused close
+                # W50: this is the site most likely to actually carry partial
+                # history (a trade whose earlier slices went through THIS
+                # same method's true-partial branch below, now closing on
+                # its final fill) — read the folded total back rather than
+                # reuse the pre-close local. See the identical comment on
+                # the main fill-handling path above.
+                _closed_row = self._state.get_trade_by_id(trade_id)
+                _booked_pnl = (_closed_row.realized_pnl
+                               if _closed_row is not None else realized_pnl)
                 completed_exits.append({
                     "trade_id": trade_id,
                     "exit_price": exit_price if exit_price is not None else 0.0,
-                    "realized_pnl": realized_pnl,
+                    "realized_pnl": _booked_pnl,
                     "exit_reason": exit_reason,
                 })
                 log.info("exit_order_filled", trade_id=trade_id,
-                         actual_exit_price=exit_price, realized_pnl=realized_pnl,
+                         actual_exit_price=exit_price, realized_pnl=_booked_pnl,
                          via="partial_verdict_full_quantity")
             return
 
@@ -2544,6 +2565,24 @@ class TradeExecutor:
             price=exit_price if exit_price is not None else 0.0,
             pnl=partial_pnl,
         )
+        # W50 (money-flow-05): this branch used to reach NO ledger at all —
+        # unlike the full-close branch above (which appends to
+        # completed_exits) and unlike the orchestrator's own single-leg
+        # ladder path (_execute_partial_exit, which has fed daily_stats +
+        # breaker in real time since BC-H3), a multi-leg true-partial fill
+        # (a condor scaling out) booked into open_positions.partial_exits
+        # and nowhere else until the FINAL close. Mirror the ladder path so
+        # both partial-exit paths behave the same. record_partial_pnl (not
+        # record_trade_result): a scale-out is not a completed trade and
+        # must not touch the consecutive-loss counter.
+        try:
+            stats = self._state.get_daily_stats()
+            stats.total_pnl += partial_pnl
+            self._state.update_daily_stats(stats)
+            self._circuit_breaker.record_partial_pnl(partial_pnl)
+        except Exception as _pe:  # noqa: BLE001 — never block the fill booking on this
+            log.warning("exit_partial_stats_feed_failed",
+                        trade_id=trade_id, error=str(_pe))
         remaining = int(trade_record.quantity) - filled_units
         self._state.update_trade_quantity(trade_id, remaining)
         # Remainder goes back to the monitor for a fresh exit at the REDUCED
@@ -2603,7 +2642,30 @@ class TradeExecutor:
         _store = getattr(self, "_state", None)
         if _store is not None:
             try:
-                _store.set_state(f"commission_est_{trade.trade_id}", repr(float(_est)))
+                # W50 (trade-life-partial-slice-pnl-erased): ACCUMULATE, not
+                # overwrite. A trade with partial-exit history reaches this
+                # method once per closed slice plus once more for the
+                # remainder — each call correctly subtracted its OWN
+                # estimate from its OWN slice's pnl, but the true-up
+                # (orchestrator._true_up_commission) diffs whatever is
+                # remembered here against total_commission(), which sums
+                # EVERY execution row for the trade (entry + every partial +
+                # final leg). Overwriting left only the LAST call's estimate
+                # remembered while the real ledger summed all of them, so
+                # the true-up delta was wrong by the earlier slices'
+                # estimated commission on every partial-exit trade.
+                _prior = 0.0
+                try:
+                    _raw_prior = _store.get_state(f"commission_est_{trade.trade_id}", "")
+                    # Same "only a stored STRING counts" guard as
+                    # _booked_commission_estimate — a mocked store returns a
+                    # MagicMock, and float(MagicMock()) is 1.0, not a miss.
+                    if isinstance(_raw_prior, str) and _raw_prior:
+                        _prior = float(_raw_prior)
+                except Exception:  # noqa: BLE001
+                    _prior = 0.0
+                _store.set_state(f"commission_est_{trade.trade_id}",
+                                 repr(float(_prior + _est)))
             except Exception as _e:  # noqa: BLE001 — never block a booking on this
                 log.warning("commission_estimate_not_remembered",
                             trade_id=getattr(trade, "trade_id", None), error=str(_e))

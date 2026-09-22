@@ -78,6 +78,11 @@ class TradeRecord:
     time_to_peak_hours: float = 0.0
     direction_correct: int = -1  # -1 = unknown, 0 = wrong, 1 = correct
     capital_at_risk: float = 0.0  # R7: retained max_loss at entry (verdict math)
+    # W50 (money-flow-05 / trade-life-partial-slice-pnl-erased): archived
+    # open_positions.partial_exits JSON, folded into realized_pnl and copied
+    # here by close_trade before the open_positions row is deleted — the
+    # round-trip's slice-by-slice history otherwise vanished with the DELETE.
+    partial_exits: str = "[]"
 
 
 @dataclass
@@ -273,6 +278,11 @@ class StateManager:
                 # steps_done lists the other side effects as each one lands.
                 "ALTER TABLE exit_outbox ADD COLUMN core_booked INTEGER DEFAULT 0",
                 "ALTER TABLE exit_outbox ADD COLUMN steps_done TEXT DEFAULT ''",
+                # W50 (money-flow-05 / trade-life-partial-slice-pnl-erased):
+                # archive of open_positions.partial_exits, copied in by
+                # close_trade before that row is DELETEd. See TradeRecord's
+                # own field comment for why this exists.
+                "ALTER TABLE trades ADD COLUMN partial_exits TEXT DEFAULT '[]'",
             ):
                 try:
                     conn.execute(ddl)
@@ -415,6 +425,15 @@ class StateManager:
         concurrent process (second bot, operator script, broker-lag race)
         can never be booked as "never filled"/$0. Default keeps all four
         open statuses.
+
+        W50 (money-flow-05 / trade-life-partial-slice-pnl-erased): `realized_pnl`
+        here is the REMAINDER slice's own P&L (unchanged contract — callers do
+        not need to change). Before this closes, any prior partial-exit
+        history in open_positions.partial_exits is folded in so the trade's
+        FULL round trip lands in trades.realized_pnl — the go-live verdict
+        (reporting/go_live.py) reads that column directly, and the old
+        behaviour silently discarded every partial slice's P&L when the
+        DELETE below ran.
         """
         now = now_et().isoformat()
 
@@ -431,16 +450,41 @@ class StateManager:
             _open = (TradeStatus.PENDING.value, TradeStatus.FILLED.value,
                      TradeStatus.PARTIAL.value, TradeStatus.CLOSING.value)
         with sqlite3.connect(self._db_path) as conn:
+            # W50: BEGIN IMMEDIATE (same idiom as book_exit_core) so the read
+            # of partial_exits below and the UPDATE that folds it in are one
+            # atomic unit — a concurrent record_partial_exit for this SAME
+            # trade_id cannot land between the read and the DELETE and be
+            # silently lost.
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT partial_exits FROM open_positions WHERE trade_id = ?",
+                (trade_id,),
+            ).fetchone()
+            partial_exits_json = row[0] if row and row[0] else "[]"
+            slices_pnl = 0.0
+            if row and row[0]:
+                try:
+                    slices_pnl = sum(
+                        float(entry.get("pnl", 0.0))
+                        for entry in json.loads(row[0]))
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    # Fail closed on the NUMBER (don't invent P&L from
+                    # unparseable data) but keep the raw string archived
+                    # below for forensics rather than discarding it too.
+                    log.warning("partial_exits_archive_unparseable",
+                                trade_id=trade_id, raw=row[0])
+            folded_realized_pnl = round(realized_pnl + slices_pnl, 2)
+
             cur = conn.execute(
                 """UPDATE trades
                    SET status = ?, exit_time = ?, exit_price = ?,
                        realized_pnl = ?, commission = ?,
                        exit_reason_detailed = ?, peak_pnl_pct = ?,
-                       time_to_peak_hours = ?
+                       time_to_peak_hours = ?, partial_exits = ?
                    WHERE trade_id = ? AND status IN (?, ?, ?, ?)""",
-                (TradeStatus.CLOSED.value, now, exit_price, realized_pnl,
+                (TradeStatus.CLOSED.value, now, exit_price, folded_realized_pnl,
                  commission, exit_reason_detailed, peak_pnl_pct,
-                 time_to_peak_hours, trade_id, *_open),
+                 time_to_peak_hours, partial_exits_json, trade_id, *_open),
             )
             if cur.rowcount != 1:
                 # R12 Tier-A #1: double-close / close-of-terminal blocked.
@@ -464,11 +508,17 @@ class StateManager:
             # first (claim_exit_booking), so a close can be booked exactly
             # once no matter which path (executor callback, reconciler,
             # sweep, crash-recovery drain) discovers it.
+            # W50: folded_realized_pnl (the WHOLE round trip), not the bare
+            # `realized_pnl` argument (the remainder slice alone) — the
+            # outbox drain (pending_exit_bookings) reads this column as if it
+            # were the trade's total P&L, same as the in-process callback
+            # path reads completed_exits[...]["realized_pnl"]. Both paths
+            # must agree on what "the trade's P&L" means.
             conn.execute(
                 "INSERT OR REPLACE INTO exit_outbox "
                 "(trade_id, realized_pnl, exit_reason, exit_time) "
                 "VALUES (?, ?, ?, ?)",
-                (trade_id, realized_pnl, exit_reason_detailed, now),
+                (trade_id, folded_realized_pnl, exit_reason_detailed, now),
             )
 
             # Dual-write: sync closed trade to DuckDB analytics
@@ -864,7 +914,8 @@ class StateManager:
     def book_exit_core(self, trade_id: str, pnl: float,
                        breaker_key: str | None = None,
                        breaker_blob: str | None = None,
-                       stats_date: str | None = None) -> bool:
+                       stats_date: str | None = None,
+                       outcome_pnl: float | None = None) -> bool:
         """W32: apply a close's MONEY effects exactly once.
 
         One sqlite transaction writes today's daily_stats delta, the circuit
@@ -877,7 +928,17 @@ class StateManager:
         W37: ``stats_date`` (ISO) credits a PRIOR session's daily_stats row
         instead of today's — for a close the drain finds a day late. The
         caller passes no breaker blob for those: the breaker is today's.
+
+        W50 (money-flow-05): ``pnl`` is the total_pnl DELTA — for a trade
+        with partial-exit history this is the remainder only, since the
+        slices already fed daily_stats/breaker in real time when they closed
+        (see orchestrator._archived_partial_pnl). ``outcome_pnl`` (defaults
+        to ``pnl``) is the trade's FULL round-trip P&L and decides the
+        trades_won/trades_lost classification — a trade that nets positive
+        overall must count as a win even when its remainder slice alone was
+        a loss.
         """
+        _outcome = pnl if outcome_pnl is None else outcome_pnl
         day = stats_date or now_et().date().isoformat()
         with sqlite3.connect(self._db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -891,7 +952,7 @@ class StateManager:
                 "UPDATE daily_stats SET total_pnl = COALESCE(total_pnl, 0) + ?, "
                 "trades_won = COALESCE(trades_won, 0) + ?, "
                 "trades_lost = COALESCE(trades_lost, 0) + ? WHERE date = ?",
-                (pnl, 1 if pnl > 0 else 0, 0 if pnl > 0 else 1, day))
+                (pnl, 1 if _outcome > 0 else 0, 0 if _outcome > 0 else 1, day))
             if breaker_key and breaker_blob is not None:
                 conn.execute(
                     "INSERT OR REPLACE INTO bot_state (key, value, updated_at) "

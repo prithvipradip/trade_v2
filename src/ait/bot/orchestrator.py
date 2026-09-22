@@ -935,13 +935,21 @@ class TradingOrchestrator:
                     # day's ledger permanently short, Thompson blind to it, no
                     # page. Bucket by session instead: credit the day it
                     # closed, leave today's breaker and PDT count alone.
+                    # W50 (money-flow-05): fetch before booking (not after)
+                    # so the money/outcome split has trade.partial_exits —
+                    # see _archived_partial_pnl. A trade with no partial
+                    # history has _archived == 0.0, so _money_delta == pnl:
+                    # byte-identical to pre-W50 behaviour.
+                    _t = self._find_trade_by_id(trade_id)
+                    _archived = self._archived_partial_pnl(_t)
+                    _money_delta = round(pnl - _archived, 2)
                     _booked = self._book_prior_session_core(
-                        trade_id, pnl, exit_d.isoformat())
+                        trade_id, _money_delta, exit_d.isoformat(),
+                        outcome_pnl=pnl)
                     try:
                         self._state.delete_state(f"trade_maxloss_{trade_id}")
                     except Exception:  # noqa: BLE001
                         pass
-                    _t = self._find_trade_by_id(trade_id)
                     _done = self._exit_steps_done(trade_id)
 
                     def _thompson_prior(_t=_t, pnl=pnl):
@@ -967,12 +975,15 @@ class TradingOrchestrator:
                     continue
                 # W32: money effects exactly once (one transaction + marker),
                 # every other effect flagged as it lands — a retry resumes.
-                _booked = self._book_exit_core(trade_id, pnl)
+                # W50: fetch before booking — see _archived_partial_pnl.
+                _t = self._find_trade_by_id(trade_id)
+                _archived = self._archived_partial_pnl(_t)
+                _money_delta = round(pnl - _archived, 2)
+                _booked = self._book_exit_core(trade_id, _money_delta, outcome_pnl=pnl)
                 try:
                     self._state.delete_state(f"trade_maxloss_{trade_id}")
                 except Exception:  # noqa: BLE001
                     pass
-                _t = self._find_trade_by_id(trade_id)
                 _done = self._exit_steps_done(trade_id)
 
                 def _pdt(_t=_t):
@@ -1003,19 +1014,24 @@ class TradingOrchestrator:
                           error=str(e))
 
     def _book_prior_session_core(self, trade_id: str, pnl: float,
-                                 stats_date: str) -> bool:
+                                 stats_date: str,
+                                 outcome_pnl: float | None = None) -> bool:
         """W37: book a close into the daily_stats row of the day it CLOSED.
 
         The circuit breaker is deliberately not touched — it is a daily
         quantity and this loss is not today's. Same exactly-once marker as
         _book_exit_core. Returns True iff this call booked it.
+
+        W50: `outcome_pnl` passthrough — see _archived_partial_pnl.
         """
         if self._state.exit_core_booked(trade_id) is True:
             return False
         return bool(self._state.book_exit_core(
-            trade_id, pnl, None, None, stats_date=stats_date))
+            trade_id, pnl, None, None, stats_date=stats_date,
+            outcome_pnl=outcome_pnl))
 
-    def _book_exit_core(self, trade_id: str, pnl: float) -> bool:
+    def _book_exit_core(self, trade_id: str, pnl: float,
+                        outcome_pnl: float | None = None) -> bool:
         """W32: apply a close's stats + breaker effects EXACTLY once.
 
         The breaker is updated in memory, then its blob, today's daily_stats
@@ -1024,15 +1040,20 @@ class TradingOrchestrator:
         in-memory breaker is rolled back — this process lives on, and a loss
         it kept without making durable would be counted again by the retry.
         Returns True iff this call booked it.
+
+        W50: see _archived_partial_pnl — `pnl` (the money delta) and
+        `outcome_pnl` (the win/loss verdict) can differ for a trade with
+        partial-exit history.
         """
         if self._state.exit_core_booked(trade_id) is True:
             return False
         cb = self._circuit_breaker
         snap = cb.snapshot()
-        cb.record_trade_result(pnl, persist=False)
+        cb.record_trade_result(pnl, persist=False, outcome_pnl=outcome_pnl)
         try:
             booked = bool(self._state.book_exit_core(
-                trade_id, pnl, cb.STATE_KEY, cb.persistable_blob()))
+                trade_id, pnl, cb.STATE_KEY, cb.persistable_blob(),
+                outcome_pnl=outcome_pnl))
         except Exception:
             cb.restore(snap)
             raise
@@ -1119,7 +1140,16 @@ class TradingOrchestrator:
             ex["realized_pnl"] = self._true_up_commission(
                 trade_id, ex["realized_pnl"])
 
-            realized_pnl = ex["realized_pnl"]
+            realized_pnl = ex["realized_pnl"]  # FULL round trip (folded by close_trade)
+
+            # W50 (money-flow-05): fetched here (not later) so the money/
+            # outcome split below has it. A trade with no partial-exit
+            # history has _archived_partial_pnl == 0.0, so money_delta ==
+            # realized_pnl and every write below is byte-identical to before
+            # this wave — the regression control for the no-partial case.
+            trade = self._find_trade_by_id(trade_id)
+            _archived = self._archived_partial_pnl(trade)
+            money_delta = round(realized_pnl - _archived, 2)
 
             # W32 (R26 two-phase-claim-double-books): daily_stats and the
             # breaker used to be written one after the other, outside any
@@ -1129,8 +1159,13 @@ class TradingOrchestrator:
             # They now land together with a core_booked marker, exactly once.
             # ALL results reach the breaker, not just losses: its daily P&L
             # must net wins against losses.
+            #
+            # W50: `money_delta` excludes partial slices already fed to
+            # daily_stats/breaker in real time (see _archived_partial_pnl);
+            # `outcome_pnl=realized_pnl` keeps the win/loss verdict reading
+            # the trade's FULL round trip.
             try:
-                self._book_exit_core(trade_id, realized_pnl)
+                self._book_exit_core(trade_id, money_delta, outcome_pnl=realized_pnl)
             except Exception as _be:  # noqa: BLE001
                 log.error("exit_booking_core_failed_deferred_to_drain",
                           trade_id=trade_id, error=str(_be),
@@ -1165,7 +1200,8 @@ class TradingOrchestrator:
 
             _ok = self._exit_step(trade_id, _done, "pdt", _pdt)
 
-            trade = self._find_trade_by_id(trade_id)
+            # W50: `trade` was already fetched above (before _book_exit_core)
+            # to compute the money/outcome split — no need to re-fetch here.
             # R7: stamp the REAL round-trip commission (from the executions
             # ledger) onto the closed trade row for the PF verdict.
             try:
@@ -4231,6 +4267,29 @@ class TradingOrchestrator:
             self._state.delete_state(f"commission_est_{trade_id}")
         except Exception:  # noqa: BLE001
             pass
+
+    @staticmethod
+    def _archived_partial_pnl(trade) -> float:
+        """W50 (money-flow-05 / trade-life-partial-slice-pnl-erased): sum of
+        partial-exit slices close_trade already folded into this trade's
+        realized_pnl (state.py:close_trade, before the open_positions row is
+        deleted). Those slices were ALSO fed to daily_stats/breaker in real
+        time as each one closed — executor._book_partial_exit and
+        orchestrator._execute_partial_exit both call record_partial_pnl — so
+        the MONEY booked at final close must exclude them, or they are
+        counted twice. Reads trades.partial_exits (the archive close_trade
+        writes) rather than anything threaded through completed_exits or the
+        exit_outbox row, so the live callback path and the crash-recovery
+        drain derive the identical number from the identical source.
+        """
+        try:
+            if not trade or not getattr(trade, "partial_exits", None):
+                return 0.0
+            import json as _json
+            return round(sum(float(e.get("pnl", 0.0))
+                             for e in _json.loads(trade.partial_exits)), 2)
+        except Exception:  # noqa: BLE001 — never block booking on this
+            return 0.0
 
     @staticmethod
     def _legs_count(trade) -> int:

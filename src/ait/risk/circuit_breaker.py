@@ -326,12 +326,22 @@ class CircuitBreaker:
         self._daily_pnl += pnl
         self._persist()  # R16
 
-    def record_trade_result(self, pnl: float, persist: bool = True) -> None:
+    def record_trade_result(self, pnl: float, persist: bool = True,
+                            outcome_pnl: float | None = None) -> None:
         """Record a trade's P&L and check for circuit breaker triggers.
 
         persist=False (W32) leaves the write to the caller, which lands the
         blob in the same transaction as daily_stats — see persistable_blob().
+
+        W50 (money-flow-05): `pnl` is the amount ADDED to `_daily_pnl` — for
+        a trade with partial-exit history this is the remainder only, since
+        the slices already moved `_daily_pnl` via record_partial_pnl when
+        each one closed. `outcome_pnl` (defaults to `pnl`) is the trade's
+        FULL round-trip P&L and decides the consecutive-loss counter — a
+        trade that nets positive overall must reset the streak even when its
+        remainder slice alone was a loss.
         """
+        _outcome = pnl if outcome_pnl is None else outcome_pnl
         if getattr(self, "_state_unreadable", False):
             self._maybe_reload()
             if self._state_unreadable:
@@ -341,7 +351,7 @@ class CircuitBreaker:
                     getattr(self, "_pending_results", [])) + [pnl]
         self._daily_pnl += pnl
 
-        if pnl < 0:
+        if _outcome < 0:
             self._consecutive_losses += 1
         else:
             self._consecutive_losses = 0
