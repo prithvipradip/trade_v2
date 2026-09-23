@@ -9280,3 +9280,131 @@ No inspect.getsource — this wave's new test file drives the real
 `_evaluate_position`/`_short_strikes_from_legs`, never asserts on source strings.
 
 ---
+
+## 2026-09-23 - W53 (first slice) EXECUTED — roll-mechanics groundwork: config, vertical-roll leg validator, roll-target selection, DB linkage
+
+SCOPE. W53 per the roadmap (`:8639-8779`): roll mechanics for the assignment-response
+policy. Before building, two Explore agents re-verified the register's own claims at HEAD
+`2dbd7a3`/`12b0354` and found the real shape bigger and different than estimated:
+
+- `_close_multi_leg`/`_execute_multi_leg` do NOT reuse "almost as-is" as `:8720-8724` assumed
+  — both manage a WHOLE position's lifecycle (all legs, one trade row); neither can replace
+  one leg, or one vertical, of an open position while leaving the rest alone. **No code path
+  anywhere in this codebase has ever mutated a trade's legs/expiry/entry_price after entry.**
+- Rolling only the at-risk short leg (the framing `:8698-8740` scoped W53 around) breaks the
+  defined-risk gate: the paired long is left behind at the old expiry, so the short is naked
+  between expiries. The separately-scoped W55-57 (`:8783-8894`) independently hit the same
+  problem for its own tactical-roll idea and already chose to roll the full vertical.
+- No cross-expiry combo has EVER been placed live by this bot — the only strategy that built
+  one, `calendar_spread`, was retired before going live (`selector.py:23-35`). Every existing
+  order-placement test is fully mocked; the codebase's one `@pytest.mark.ibkr` test
+  (`test_ibkr_intraday.py:252`) only reads market data, places nothing. The atomicity question
+  `:8718-8724` flagged is genuinely first-of-its-kind, not a variation on something proven.
+- `get_chain` costs 110-209s median per symbol (live `scan_symbol_timing` logs) — slow for
+  something meant to react to next-day assignment risk.
+
+DECISIONS THIS SESSION (recorded so a future session doesn't re-litigate them):
+1. **Vertical roll, not single-leg** — stays defined-risk throughout, reuses existing
+   wing-width logic unchanged, shares machinery with W55-57 instead of building single-leg
+   machinery now and vertical machinery later.
+2. **W53 is split.** This entry covers only the first slice: everything buildable and fully
+   testable on the existing mocked-broker harness, ZERO live orders placed, ZERO live
+   behavior change. The atomicity probe and the actual combo-placement/fill-handling are an
+   explicit follow-up, scoped in NEXT below, not built here.
+3. **When the probe runs, Claude runs it** — flagged clearly immediately before placing
+   anything, on the paper account. Not this entry.
+
+FIX (all four pieces additive; `assignment_response.policy` defaults `close_only`, so nothing
+built here is reachable from any live code path):
+1. **Config** — `settings.py`: new `AssignmentResponseConfig(_StrictModel)`, mirroring
+   `DividendConfig`'s shape (`:499-518`): `policy: Literal["close_only","roll_only",
+   "close_or_roll"] = "close_only"`, `roll_target_dte_min/max` (14/30, matching
+   `options.dte_range`'s live window), `roll_min_credit` (0.20, provisional — no roll has
+   executed live to calibrate against). Matching `assignment_response:` block in
+   `config.yaml`, next to `dividends:`.
+2. **Vertical-roll leg validator** — `executor.py`: new `_validate_roll_legs(trade,
+   closing_legs, opening_legs)`, next to `_validate_combo_legs`/`_EXPECTED_LEG_SHAPE`
+   (`:69-103`, confirmed unchanged) but a genuinely different check — that function only
+   counts legs against a per-strategy-name table (the research found NO test anywhere
+   exercises it or its `combo_legs_rejected` event), which can't tell a valid roll apart from
+   the exact reversed-leg hazard the R5 audit built it to catch. The new validator checks
+   closing legs match real open legs in `trade.legs` (strike+side, action reversed), opening
+   legs are genuinely new, both pairs share one side (put/put or call/call), and the opening
+   pair is itself a valid short+long vertical. Runs BEFORE qualification (no conId expected)
+   — a cheap logical check ahead of spending an API call on a structurally invalid roll.
+3. **Roll-target selection** — new `execution/roll_selector.py` (`execution/`, not
+   `strategies/`, since it adapts an EXISTING position rather than generating a new entry
+   signal — CLAUDE.md's package-by-concern split). `_at_risk_vertical(trade, side)` extends
+   W52's `_short_strikes_from_legs` idiom to also return the paired LONG strike, which that
+   helper deliberately doesn't. `select_roll_target(trade, side, chain_service, config)`
+   reuses the SAME delta convention (`0.20`, tolerance `0.07`) `iron_condor.py:230,238` uses
+   for entries, `get_chain(symbol, min_dte=, max_dte=)`, `.filter_liquid()`; picks the
+   furthest expiry in the config window, the strike nearest the delta target, and a new long
+   preserving the ORIGINAL vertical's width in dollars (simplest — a defensive roll doesn't
+   need `_vol_scaled_width`'s fresh-entry vol recompute). Never raises — wraps the chain fetch
+   itself in try/except so a broker fault returns `None` like every other failure mode, matching
+   the docstring's own promise (caught by this wave's own tests before being shipped).
+   **Deliberately does NOT call `get_chain_for_expiry`** (`options_chain.py:557-569`): nothing
+   calls it today, and it silently returns a DIFFERENT expiry's chain when the exact one is
+   missing — a live landmine for daily-expiry symbols (SPY/QQQ/IWM). Registered here as a
+   separate, pre-existing, still-dormant finding; not fixed, since nothing in this design uses
+   it and it remains uncalled by anything else in `src/`.
+4. **DB linkage** — `state.py`: `ALTER TABLE trades ADD COLUMN rolled_from_trade_id TEXT`
+   appended to the idempotent migration tuple (`:209-300`, never the `executescript` block,
+   which has no try/except and would abort startup on an existing DB), `TradeRecord` gains
+   `rolled_from_trade_id: str | None = None`. Nullable, no default, no FK (this codebase never
+   enforces FKs outside `_init_db`'s own connection). Not wired into `record_trade` or any
+   writer — that's fill-handling, the follow-up.
+
+Nothing here is called by any live path: `check_positions`/rule 3/rule 3e still unconditionally
+close (W54 owns wiring them through the policy, finding `[3]f`); no caller invokes
+`select_roll_target` or `_validate_roll_legs`.
+
+PROOF. 29 new tests across three files (`test_w53_roll_leg_validator.py` 13,
+`test_w53_roll_target_selection.py` 12, `test_w53_db_migration.py` 4), each written and run
+red against a stub/absent implementation before being made to pass — one genuine test-fixture
+bug caught and fixed along the way (a validator test's opening-leg strike collided with the
+fixture condor's own existing long-call strike, tripping the duplicate-leg check instead of
+the side-consistency check it meant to isolate; not a defect in `_validate_roll_legs`).
+Neighbor files most likely to interact (`test_w2_executor_risk_gates.py`,
+`test_order_lifecycle.py`, `test_w27_credit_floor_at_placement.py`,
+`test_w32_booking_breaker_integrity.py`, `test_w52_multileg_itm_diagnosis.py`,
+`test_hot_path_smoke.py`): 123/123 unaffected. Full fast lane on this box: **3 failed / 2449
+passed / 46 skipped / 153 deselected** (1623.91s) — exactly W52's 2420 plus this slice's 29,
+the SAME 3 pre-existing failures verbatim (`test_r19_config_authority.py`, 2x
+`test_watchdog.py` — re-confirmed unrelated to this wave's files), zero new failures.
+`python -m compileall -q src`: OK. `python scripts/typecheck.py`: OK — the non-blocking
+finding tally is IDENTICAL in every count to the W52 run, confirming zero new mypy findings
+of any kind from this slice, not just zero fatal ones.
+
+STATE AT HANDOFF. Config, a validator, a selector module and a nullable DB column — all
+additive, all unreachable from any live path today. No restart required for correctness (the
+new column is inert until something writes it), though the next restart will pick up the
+schema migration and config surface alongside whatever else is pending.
+
+NEXT, naming every open item explicitly (the standing discipline from the 09-22 REGISTER
+CORRECTION entry): **the W53 follow-up** — the atomicity probe (a minimal cross-expiry combo
+on the PAPER account, Claude running it, flagged clearly immediately before anything is
+placed, with defined success/fail criteria: clean qualification, sane NBBO-based net pricing,
+a fill or a sane reprice-ladder response, no rejected order or surprising margin hold) informs
+atomic-vs-sequential for the combo-placement/fill-handling build that depends on its outcome
+(a new roll-in-flight trade state either way, the fill handler that books the old trade's
+close and writes the new trade's `rolled_from_trade_id`-linked row, and — for the sequential
+branch specifically — explicit interim-state handling so the gap between close and open reads
+as a known, retried condition to the reconciler rather than an anomaly). **W54** — the
+close-or-roll comparison model (operator decision) plus wiring rule 3/rule 3e through the
+policy dispatch (`[3]f`) plus `go_live.py` roll-accounting (`[3]e` second half) plus the four
+items W52's own NEXT already assigned it (fast-rest for `assignment_risk`/expiry-day exits;
+consolidating the legs-JSON lookup across rules 1b/3/3e; rule 3e's now-outdated
+"keyed off trade.strike" comment; `spot_health` gating for a future label-reading policy).
+**W55** (synthetic per-leg delta) independent, pullable any time. **W56** follows W55, **W57**
+follows W53 (now: the full follow-up, not just this slice) and W56. **CENSUS-1..5** (32 sites)
+still open, no urgency. **W52a's four deliberately-registered items** still open, unchanged.
+The dormant `get_chain_for_expiry` wrong-expiry bug (`options_chain.py:557-569`, this entry)
+is new to the register — uncalled by anything today, but a landmine for whoever calls it next.
+
+No inspect.getsource — this wave's new tests drive the real `_validate_roll_legs`,
+`select_roll_target`/`_at_risk_vertical`, and `StateManager`'s migration, never assert on
+source strings.
+
+---
