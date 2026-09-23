@@ -711,6 +711,15 @@ class PortfolioManager:
         # 3. Assignment risk — ITM shorts on expiry day (DTE 0-1) MUST close
         # Short puts ITM → stock gets put to you (cash drain)
         # Short calls ITM → shares called away (may cause forced cover)
+        # W52: contract_type is "iron_condor"/"spread" for any multi-leg
+        # credit trade (executor.py _get_contract_type), never "put"/"call",
+        # so a condor never matched either branch below and always fell
+        # through to the generic expiry_approaching label regardless of
+        # which side (if any) was really ITM. The new elif reads the real
+        # short strikes from trade.legs — same idiom as rule 1b's touch
+        # stop and rule 3e's ex-div check — so a multi-leg position gets
+        # the same per-side diagnosis a single-leg one already had. Does
+        # NOT change should_exit: the fallback below still fires either way.
         elif (not should_exit
                 and dte is not None and dte <= 1 and is_credit and trade.strike):
             try:
@@ -719,16 +728,23 @@ class PortfolioManager:
                 # costs us the ITM label, never the exit itself.
                 current_underlying = current_price
                 if current_underlying:
-                    itm = False
+                    itm_side: str | None = None
+                    itm_strike: float | None = None
                     if trade.contract_type == "put" and current_underlying < trade.strike:
-                        itm = True
+                        itm_side, itm_strike = "put", trade.strike
                     elif trade.contract_type == "call" and current_underlying > trade.strike:
-                        itm = True
-                    if itm:
+                        itm_side, itm_strike = "call", trade.strike
+                    elif trade.contract_type not in ("put", "call"):
+                        short_put, short_call = self._short_strikes_from_legs(trade)
+                        if short_put is not None and current_underlying < short_put:
+                            itm_side, itm_strike = "put", short_put
+                        elif short_call is not None and current_underlying > short_call:
+                            itm_side, itm_strike = "call", short_call
+                    if itm_side is not None:
                         should_exit = True
                         exit_reason = (
-                            f"assignment_risk (short {trade.contract_type} ITM, "
-                            f"underlying=${current_underlying:.2f}, strike=${trade.strike:.2f})"
+                            f"assignment_risk (short {itm_side} ITM, "
+                            f"underlying=${current_underlying:.2f}, strike=${itm_strike:.2f})"
                         )
             except Exception:
                 pass
@@ -962,6 +978,34 @@ class PortfolioManager:
             partial_exit_quantity=partial_exit_quantity,
             marks_missing=marks_missing,
         )
+
+    @staticmethod
+    def _short_strikes_from_legs(trade) -> tuple[float | None, float | None]:
+        """(short_put_strike, short_call_strike) parsed from trade.legs.
+
+        W52: the same legs-JSON idiom rule 1b's touch-stop lookup and rule
+        3e's ex-div lookup already use — a multi-leg credit structure's
+        contract_type is "iron_condor" or "spread", never "put"/"call", so
+        trade.strike (the entry-time "primary reference leg", set to the
+        short put for iron_condor) cannot be trusted to be the ITM side.
+        Ties resolve to the strike closest to the money — max() of SELL
+        puts, min() of SELL calls — matching rule 1b's tie-break.
+        """
+        try:
+            legs = json.loads(trade.legs) if trade.legs else []
+        except (ValueError, TypeError):
+            return None, None
+        short_put = max(
+            (float(leg["strike"]) for leg in legs
+             if str(leg.get("action", "")).upper() == "SELL"
+             and str(leg.get("right", leg.get("type", ""))).upper().startswith("P")),
+            default=None)
+        short_call = min(
+            (float(leg["strike"]) for leg in legs
+             if str(leg.get("action", "")).upper() == "SELL"
+             and str(leg.get("right", leg.get("type", ""))).upper().startswith("C")),
+            default=None)
+        return short_put, short_call
 
     def _calculate_dynamic_stop(
         self,
