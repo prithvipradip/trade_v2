@@ -518,6 +518,41 @@ class DividendConfig(_StrictModel):
                     "this, treat the symbol as unknown again.")
 
 
+class AssignmentResponseConfig(_StrictModel):
+    """W53 (roll-mechanics groundwork): whether an at-risk short leg (rule 3/
+    3e in portfolio.py) closes outright or rolls to a later expiry instead.
+    `policy` defaults to "close_only" so shipping this config surface and
+    the roll machinery behind it changes NO live behavior -- nothing calls
+    into the roll path yet (wiring rule 3/3e to consult this policy is W54,
+    per PLAN.md finding [3]f). A roll always replaces the full short+long
+    vertical, never a single leg alone, so the position stays defined-risk
+    through the swap -- see this wave's PLAN.md entry for why."""
+
+    policy: Literal["close_only", "roll_only", "close_or_roll"] = Field(
+        default="close_only",
+        description="close_only: today's behavior, always close an at-risk "
+                    "leg. roll_only/close_or_roll: not live until W54 wires "
+                    "rule 3/3e to consult this field -- setting either today "
+                    "has no effect.")
+    roll_target_dte_min: int = Field(default=14, ge=1, le=90,
+        description="Floor of the later-expiry search window for a roll "
+                    "target. Matches options.dte_range's live floor (14) so "
+                    "a rolled position lands in the same DTE sweet spot a "
+                    "fresh entry would, well clear of EXPIRY_APPROACHING_DTE "
+                    "(5) and rule 3's dte<=1 danger zone.")
+    roll_target_dte_max: int = Field(default=30, ge=2, le=120,
+        description="Ceiling of the later-expiry search window for a roll "
+                    "target. Matches options.dte_range's live ceiling (30).")
+    roll_min_credit: float = Field(default=0.20, ge=0.0, le=5.0,
+        description="Refuse a roll whose net credit (old vertical bought "
+                    "back, new vertical sold) is below this. Provisional: "
+                    "no roll has ever executed live to calibrate against; "
+                    "GAP_AUDIT_R7 estimated ~$2.60+crossing commission for a "
+                    "2-leg roll, roughly double for this wave's 4-leg "
+                    "vertical roll, so this floor needs real evidence before "
+                    "it should be trusted at the cent.")
+
+
 class SentimentConfig(_StrictModel):
     """R12-C tombstone: the sentiment stack (ait.sentiment, ib_news,
     fundamentals_db) is retired to deprecated/src/ — verified zero influence
@@ -757,6 +792,7 @@ class Settings(_StrictModel):
     meta_label: MetaLabelConfig = MetaLabelConfig()
     earnings: EarningsConfig = EarningsConfig()
     dividends: DividendConfig = DividendConfig()
+    assignment_response: AssignmentResponseConfig = AssignmentResponseConfig()
     exit: ExitConfig = ExitConfig()
     learning: LearningConfig = LearningConfig()
     sentiment: SentimentConfig = SentimentConfig()

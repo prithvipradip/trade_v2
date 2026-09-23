@@ -252,6 +252,14 @@ dividends:
   refuse_entries_when_data_unavailable: true
   lkg_max_age_hours: 168               # Reuse a confirmed fetch for up to a week before treating it as unknown again
 
+assignment_response:
+  # W53 (roll-mechanics groundwork): policy stays close_only until W54 wires
+  # rule 3/3e to consult it -- roll_only/close_or_roll have no live effect yet.
+  policy: close_only
+  roll_target_dte_min: 14              # Matches options.dte_range's live floor
+  roll_target_dte_max: 30              # Matches options.dte_range's live ceiling
+  roll_min_credit: 0.20                # Provisional -- no roll has executed live to calibrate against
+
 exit:
   exit_cross_amount: 0.10             # How far combo exits cross the spread to guarantee fills (was hardcoded)
   # W7/R24 logic-exit-risk-01: credit buyback ceiling as a multiple of the

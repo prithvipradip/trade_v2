@@ -103,6 +103,84 @@ def _validate_combo_legs(strategy_name: str, legs: list[dict]) -> str | None:
     return None
 
 
+def _roll_leg_side(leg: dict) -> str:
+    """"P" or "C" from a leg's right/type field, "?" if neither -- same
+    idiom rule 1b's touch-stop lookup and W52's _short_strikes_from_legs
+    use (portfolio.py)."""
+    right = str(leg.get("right", leg.get("type", ""))).upper()
+    return "P" if right.startswith("P") else "C" if right.startswith("C") else "?"
+
+
+def _validate_roll_legs(
+    trade: TradeRecord, closing_legs: list[dict], opening_legs: list[dict],
+) -> str | None:
+    """Return an error string if a proposed vertical roll is malformed
+    against the trade's REAL open legs, else None.
+
+    W53: unlike _validate_combo_legs above (which only counts legs against a
+    per-strategy-name table), a roll must be checked against what's
+    ACTUALLY still open -- the exact failure mode the R5 audit built that
+    check to catch (a single reversed leg turns defined-risk into
+    undefined-risk) applies just as directly to a roll's closing legs. A
+    count-only check can't tell a valid roll apart from, say, a leg set
+    that sells MORE of the existing short instead of buying it back.
+
+    `closing_legs`/`opening_legs` are in the same {"strike","right","action",
+    "expiry"} shape as trade.legs (executor.py's legs-JSON idiom throughout
+    this file) -- this runs BEFORE qualification, so no conId is expected
+    yet; it's a cheap logical check ahead of spending an API call on a
+    structurally invalid roll. This wave does not wire any caller to this
+    function -- W54 dispatches rule 3/3e's exit decision through the
+    assignment-response policy, which is the first real caller.
+    """
+    try:
+        open_legs = json.loads(trade.legs) if trade.legs else []
+    except (ValueError, TypeError):
+        return "trade.legs is not valid JSON"
+
+    if len(closing_legs) != 2 or len(opening_legs) != 2:
+        return (f"a vertical roll needs exactly 2 closing + 2 opening legs, "
+                f"got {len(closing_legs)} closing + {len(opening_legs)} opening")
+
+    def _key(leg: dict) -> tuple[float, str]:
+        return (float(leg["strike"]), _roll_leg_side(leg))
+
+    # Each closing leg must exactly match a still-open leg, action reversed
+    # (the open leg was SELL to establish a short; closing it is BUY).
+    for leg in closing_legs:
+        match = next(
+            (o for o in open_legs if _key(o) == _key(leg)
+             and str(o.get("action", "")).upper()
+                 != str(leg.get("action", "")).upper()),
+            None)
+        if match is None:
+            return f"closing leg {_key(leg)} does not match an open leg on this trade"
+
+    # Each opening leg must be genuinely new, not already part of the position.
+    for leg in opening_legs:
+        if any(_key(o) == _key(leg) for o in open_legs):
+            return f"opening leg {_key(leg)} duplicates an already-open leg"
+
+    # Both pairs must be a single side (put/put or call/call) -- rolling a
+    # put vertical must stay a put vertical, never mix into a call.
+    closing_sides = {_key(leg)[1] for leg in closing_legs}
+    opening_sides = {_key(leg)[1] for leg in opening_legs}
+    if len(closing_sides) != 1 or len(opening_sides) != 1:
+        return "closing/opening legs mix put and call -- not a single vertical"
+    if closing_sides != opening_sides:
+        return (f"rolling a {closing_sides} vertical must open a "
+                f"{closing_sides} vertical, not {opening_sides}")
+
+    # The opening pair must itself be a valid short+long vertical -- this is
+    # what keeps the rolled position defined-risk (this wave's decision: a
+    # roll always replaces the full vertical, never a single leg alone).
+    opening_actions = sorted(str(leg.get("action", "")).upper() for leg in opening_legs)
+    if opening_actions != ["BUY", "SELL"]:
+        return "opening legs must be one SELL (new short) and one BUY (new long)"
+
+    return None
+
+
 def _ladder_limit(base_mag: float, full_offset: float, frac: float,
                   is_credit: bool) -> float:
     """R7: limit price at `frac` of the marketable offset from |mid|.

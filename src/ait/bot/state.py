@@ -91,6 +91,12 @@ class TradeRecord:
     # trade's order, not "no rejection happened" (status still says that).
     reject_code: int = 0
     reject_text: str = ""
+    # W53 (roll-mechanics groundwork): links a roll's new trade row back to
+    # the trade it replaced. Nullable, no default -- unset for every trade
+    # that isn't the product of a roll (i.e. every trade today). Not yet
+    # written by any code path; the fill handler that would set it is a
+    # follow-up wave, gated on the atomicity probe.
+    rolled_from_trade_id: str | None = None
 
 
 @dataclass
@@ -297,6 +303,11 @@ class StateManager:
                 # comment.
                 "ALTER TABLE trades ADD COLUMN reject_code INTEGER DEFAULT 0",
                 "ALTER TABLE trades ADD COLUMN reject_text TEXT DEFAULT ''",
+                # W53 (roll-mechanics groundwork): see TradeRecord's own
+                # field comment. Nullable, no FK (this codebase never
+                # enforces FKs outside _init_db's own connection; existing
+                # link columns like exit_outbox.trade_id are plain TEXT too).
+                "ALTER TABLE trades ADD COLUMN rolled_from_trade_id TEXT",
             ):
                 try:
                     conn.execute(ddl)
