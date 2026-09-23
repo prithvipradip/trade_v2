@@ -26,6 +26,7 @@ quarterly cadence and TLT's monthly one without hardcoding either).
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -72,9 +73,14 @@ class DividendCalendar:
         self,
         refuse_entries_when_data_unavailable: bool = True,
         lkg_max_age_hours: int = 168,
+        persist=None,
     ) -> None:
         self._refuse_when_unavailable = refuse_entries_when_data_unavailable
         self._lkg_max_age_s = lkg_max_age_hours * 3600
+        # W52a: same as EarningsCalendar — the last-known-good is written
+        # through to the bot state (dividend_lkg_<symbol>) so a restart does
+        # not begin with none and refuse on the first ticks.
+        self._persist = persist
         # Same 6h TTL as EarningsCalendar — dividend schedules change even
         # less often than earnings dates.
         self._cache = TTLCache(default_ttl=21600, max_size=200)
@@ -127,12 +133,57 @@ class DividendCalendar:
         TTL, same lesson earnings.py's W44 already applied here."""
         if info.data_available:
             self._cache.set(f"div_{symbol}", info)
-            self._last_good[symbol] = (info, time.time())
+            fetched_at = time.time()
+            self._last_good[symbol] = (info, fetched_at)
+            self._persist_lkg(symbol, info, fetched_at)
+
+    def _persist_lkg(self, symbol: str, info: DividendInfo, fetched_at: float) -> None:
+        """W52a: write a REAL answer through to the bot state (best effort)."""
+        if self._persist is None:
+            return
+        try:
+            self._persist.set_state(f"dividend_lkg_{symbol}", json.dumps({
+                "symbol": symbol,
+                "next_ex_div_date": (info.next_ex_div_date.isoformat()
+                                     if info.next_ex_div_date else None),
+                "expected_amount": (float(info.expected_amount)
+                                    if info.expected_amount is not None else None),
+                "fetched_at": fetched_at,
+            }))
+        except Exception as e:  # noqa: BLE001
+            log.warning("dividend_lkg_persist_failed", symbol=symbol, error=str(e))
+
+    def _load_persisted_lkg(self, symbol: str) -> tuple[DividendInfo, float] | None:
+        """W52a: the previous process's last real answer, or None."""
+        if self._persist is None:
+            return None
+        try:
+            raw = self._persist.get_state(f"dividend_lkg_{symbol}", "")
+            if not raw:
+                return None
+            row = json.loads(raw)
+            d = row.get("next_ex_div_date")
+            amt = row.get("expected_amount")
+            info = DividendInfo(
+                symbol=symbol,
+                next_ex_div_date=date.fromisoformat(d) if d else None,
+                expected_amount=float(amt) if amt is not None else None,
+                data_available=True,
+            )
+            return info, float(row["fetched_at"])
+        except Exception as e:  # noqa: BLE001
+            log.warning("dividend_lkg_unreadable", symbol=symbol, error=str(e))
+            return None
 
     def _unavailable(self, symbol: str) -> DividendInfo:
         """No fresh cached answer — fetch is pending or just failed. Serve
         the last-known-good if still within lkg_max_age_hours."""
         lkg = self._last_good.get(symbol)
+        if lkg is None:
+            # W52a: cold start — hydrate from the previous process's answer.
+            lkg = self._load_persisted_lkg(symbol)
+            if lkg is not None:
+                self._last_good[symbol] = lkg
         if lkg is not None:
             info, fetched_at = lkg
             age_s = time.time() - fetched_at

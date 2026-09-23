@@ -9,6 +9,7 @@ Uses Yahoo Finance (free, no API key) as the primary source.
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -44,11 +45,20 @@ class EarningsCalendar:
         buffer_days_after: int = 1,
         refuse_entries_when_data_unavailable: bool = True,
         lkg_max_age_hours: int = 168,
+        persist=None,
     ) -> None:
         self._buffer_before = buffer_days_before
         self._buffer_after = buffer_days_after
         self._refuse_when_unavailable = refuse_entries_when_data_unavailable
         self._lkg_max_age_s = lkg_max_age_hours * 3600
+        # W52a: the last-known-good used to live only in _last_good below, so
+        # every restart began with none — the first ticks after a cold start
+        # refused (and paged) on symbols whose answer had been "confirmed no
+        # earnings" for weeks (2026-09-22 09:35). `persist` is anything with
+        # StateManager's get_state/set_state; each real answer is written as
+        # earnings_lkg_<symbol> and a cold instance hydrates from it on its
+        # first miss, under the same max-age rule.
+        self._persist = persist
         # Cache earnings dates for 6 hours (they don't change often). W44:
         # only ever populated with data_available=True answers via
         # _remember() below -- a fetch failure must not poison this for the
@@ -122,7 +132,46 @@ class EarningsCalendar:
         """
         if info.data_available:
             self._cache.set(f"earnings_{symbol}", info)
-            self._last_good[symbol] = (info, time.time())
+            fetched_at = time.time()
+            self._last_good[symbol] = (info, fetched_at)
+            self._persist_lkg(symbol, info, fetched_at)
+
+    def _persist_lkg(self, symbol: str, info: EarningsInfo, fetched_at: float) -> None:
+        """W52a: write a REAL answer through to the bot state (best effort;
+        a persistence failure never blocks the fetch that produced it)."""
+        if self._persist is None:
+            return
+        try:
+            self._persist.set_state(f"earnings_lkg_{symbol}", json.dumps({
+                "symbol": symbol,
+                "next_earnings_date": (info.next_earnings_date.isoformat()
+                                       if info.next_earnings_date else None),
+                "is_confirmed": bool(info.is_confirmed),
+                "fetched_at": fetched_at,
+            }))
+        except Exception as e:  # noqa: BLE001
+            log.warning("earnings_lkg_persist_failed", symbol=symbol, error=str(e))
+
+    def _load_persisted_lkg(self, symbol: str) -> tuple[EarningsInfo, float] | None:
+        """W52a: the previous process's last real answer, or None."""
+        if self._persist is None:
+            return None
+        try:
+            raw = self._persist.get_state(f"earnings_lkg_{symbol}", "")
+            if not raw:
+                return None
+            row = json.loads(raw)
+            d = row.get("next_earnings_date")
+            info = EarningsInfo(
+                symbol=symbol,
+                next_earnings_date=date.fromisoformat(d) if d else None,
+                is_confirmed=bool(row.get("is_confirmed", False)),
+                data_available=True,
+            )
+            return info, float(row["fetched_at"])
+        except Exception as e:  # noqa: BLE001
+            log.warning("earnings_lkg_unreadable", symbol=symbol, error=str(e))
+            return None
 
     def _unavailable(self, symbol: str) -> EarningsInfo:
         """W44: no fresh cached answer -- fetch is pending or just failed.
@@ -133,6 +182,11 @@ class EarningsCalendar:
         them). Otherwise the symbol is genuinely unknown.
         """
         lkg = self._last_good.get(symbol)
+        if lkg is None:
+            # W52a: cold start — hydrate from the previous process's answer.
+            lkg = self._load_persisted_lkg(symbol)
+            if lkg is not None:
+                self._last_good[symbol] = lkg
         if lkg is not None:
             info, fetched_at = lkg
             age_s = time.time() - fetched_at

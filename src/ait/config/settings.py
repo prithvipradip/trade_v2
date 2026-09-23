@@ -579,6 +579,18 @@ class ExitConfig(_StrictModel):
         description="W33: how far each consecutive NO-QUOTE exit placement "
                     "steps above the last (anchor + cross + n*step, capped). "
                     "W7 re-placed the identical price every backoff.")
+    exit_pending_rest_seconds: float = Field(default=300.0, ge=30.0, le=1800.0,
+        description="W52a: how long a working, unfilled close order rests "
+                    "before check_fills cancels it so the monitor can "
+                    "re-trigger (and W33b escalate) the exit. The old "
+                    "hard-coded 300s, now the value for every non-stop exit.")
+    exit_stop_pending_rest_seconds: float = Field(default=120.0, ge=15.0, le=1800.0,
+        description="W52a: the same rest for STOP exits (stop_loss, "
+                    "short_strike_touch, trailing_stop, breakeven_stop). "
+                    "2026-09-21 QQQ: the touch stop took 25 minutes to fill "
+                    "because each unfilled placement rested the take-profit "
+                    "300s on 15-minute-old quotes. A marketable limit that "
+                    "has not filled in two minutes is not going to.")
     exit_blind_credit_multiple: float = Field(default=2.0, ge=1.0, le=5.0,
         description="W33 (R26 raw-wing-width-fallback-still-reachable): with "
                     "no quote and no fresh mark, the most a credit buyback "

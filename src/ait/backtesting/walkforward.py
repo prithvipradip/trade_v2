@@ -1473,6 +1473,7 @@ class WalkForwardBacktester:
                 pre_event_blackout_days=getattr(window_cfg, "pre_event_blackout_days", None),
                 credit_tp_ladder=getattr(window_cfg, "credit_tp_ladder", None),
                 entry_dte=getattr(window_cfg, "entry_dte", None),
+                db_path=self._db_path,  # W52a: the engine reads THIS store
                 post_event_blackout_days=getattr(window_cfg, "post_event_blackout_days", None),
                 post_event_dates=getattr(window_cfg, "post_event_dates", None),
                 # R16 #1: NEVER score an OOS window with the live (future-
@@ -2583,6 +2584,7 @@ class WalkForwardBacktester:
                 pre_event_blackout_days=getattr(window_cfg, "pre_event_blackout_days", None),
                 credit_tp_ladder=getattr(window_cfg, "credit_tp_ladder", None),
                 entry_dte=getattr(window_cfg, "entry_dte", None),
+                db_path=self._db_path,  # W52a: the engine reads THIS store
                 post_event_blackout_days=getattr(window_cfg, "post_event_blackout_days", None),
                 post_event_dates=getattr(window_cfg, "post_event_dates", None),
                 # R16 #1: shadow labelling runs with the window predictor

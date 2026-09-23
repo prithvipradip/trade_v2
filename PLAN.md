@@ -9096,3 +9096,101 @@ run.log). Progress directories (timeseries bars, 6 MB) are not committed, as wit
 study.
 
 ---
+
+## 2026-09-22 - W52a EXECUTED: the registered-not-fixed list, ours and Ahmed's — six fixes, one parity finding, four items left as registered on purpose
+
+SCOPE. Everything still marked "registered, not fixed" in this ledger that needs no operator
+decision, from both authors. Each fix: executing tests red before the change (counts below are the
+red ones), full fast lane after, `scripts/typecheck.py` OK. Nothing here changes an entry rule, a
+strike, a size at the current paper settings, or the sample epoch.
+
+**1. Multiplier re-validation honours the approved size (Ahmed, registered in W50).**
+`_try_execute` re-validates a multiplier-scaled size and, on rejection, fell back to the base size —
+but `RiskManager.validate_trade` can APPROVE at a smaller size than asked (`min(request, sizer)`,
+then the correlation haircut), and only `.approved` was read: the multiplied size went out even when
+the sizer had just cut it. Now an approved `position_size` below the asked size is the size executed
+(`multiplier_size_capped_by_revalidation`); an approval carrying 0 (stub/legacy shape) is not a cap.
+Inert at today's paper settings (multiplier pinned at 1.0, sizer caps at 1 contract) — it is live
+the day either changes. `tests/test_w52a_multiplier_revalidation_size.py`: 4 tests on the smoke rig;
+1 red pre-fix (asked 3, approved 2, executed 3), 3 pin the unchanged paths.
+
+**2. `tests/test_r17_live_fixes.py` nightly flake (Ahmed, registered).** Lines 93/110 built the
+earnings date and the condor expiry from server-local `date.today()` while the code under test dates
+everything in ET — finding [7] of that very file. Between 00:00 and 04:00 UTC the two disagreed.
+Both now `today_et()`. Test-only.
+
+**3. Stop exits rest 120s, not 300s, before a re-price (ours, from the 09-21 chase).** The QQQ touch
+stop took 25 minutes to fill (8.67 unfilled, 9.76 unfilled, 10.29 filled at 9.94) because every
+unfilled placement rested the hard-coded 300s of `check_fills` before the cancel that lets the
+monitor re-trigger (and W33b escalate). That rest was sized for a take-profit on a quiet book; on
+15-minute-old quotes a marketable limit that has not filled in two minutes is not going to. Two
+knobs on `exit`: `exit_pending_rest_seconds` (300 — the old literal, every non-stop exit) and
+`exit_stop_pending_rest_seconds` (120 — `stop_loss`, `short_strike_touch`, `trailing_stop`,
+`breakeven_stop`, matched on the portfolio's exit_reason prefix). Both `check_fills` sites read
+them (the working order and the invisible-pending order); the 900s zombie cap and the foreign-order
+escalations are untouched. Config keys added AFTER the 19:26 restart, so every long-lived process
+runs W35's frozen settings and the extra=forbid hazard does not apply. Expected effect on the next
+stop: ~3 attempts in 6-7 minutes instead of 15-25. `tests/test_w52a_stop_exit_rest.py`: 14 tests,
+12 red (helper, model, yaml, and a 121s-old working touch-stop order left uncancelled pre-fix).
+
+**4. Earnings/dividend last-known-good survives a restart (ours; the W44/W51 cold-start pages).**
+W44 and W51 gave both calendars an LKG so an outage falls back to the last real answer — in a dict
+on the instance, so every restart began with none and the first ticks after a cold start refused
+and paged on symbols whose answer had been "confirmed no earnings" for weeks (09-22 09:35, 0.5s
+after the fetch was kicked). Both calendars take `persist=` (the StateManager; wired in the
+orchestrator) and write each REAL answer as `earnings_lkg_<sym>` / `dividend_lkg_<sym>` JSON with
+its fetch time; a cold instance hydrates on its first miss under the same `lkg_max_age_hours` rule
+(a persisted answer past its age is not served; a corrupt row is ignored and logged). Failures are
+never persisted; the TTL cache, the fetch and the fail-direction policy are unchanged. The
+background-thread write opens its own sqlite connection, as `set_state` always has.
+`tests/test_w52a_calendar_lkg_persists.py`: 11 tests, 10 red. W44 (18) and W51 (16) still green.
+
+**5. The research engine reads the store it was pointed at, loudly (ours; the study hazard).**
+`Backtester(db_path=)` exists and both walk-forward construction sites pass their own `db_path`;
+`_load_calibrated_spreads` opens THAT store (it opened the cwd-relative default and ignored the
+walk-forward's). The daily loader now WARNS `daily_ohlcv_store_empty_yahoo_only` (with the store
+path) when the store holds nothing at all for a symbol — the "different harness" case — and keeps
+the info line for short-but-present coverage (R23's case). The engine WARNS
+`engine_settings_unavailable_using_defaults` (with cwd) where it used to swallow a missing
+config.yaml silently; `calibrated_spreads_absent` is now an info line, not nothing.
+`tests/test_w52a_engine_store_path.py`: 8 tests, 5 red. Baseline check on the live store with the
+new engine, gate off (`reports/post_event_study/entry_dte_18_w52a_check/`): n 57 / PF 0.628 /
+net -3,521 / DD 4.32% — the 09-22 figures to the cent.
+
+**6. The live expected-move band in the engine — built, measured on the live store, ON by default
+(ours; the study's "cannot test" arm).** `Backtester(ic_em_min, ic_em_max, em_gate)` mirrors
+iron_condor.py's R12-B gate from the same contract keys (`AIT_IC_EM_MIN/MAX`, home
+`backtest.ic_em_min/max`); `em_ratio_call` / `em_ratio_put` are recorded on every simulated condor;
+`AIT_BT_EM_GATE=0` / `em_gate=False` turns it off. WHAT BUILDING IT FOUND: the engine's whole-dollar
+0.20-delta placement sits at ~0.90-1.00 EM on the call side and ~0.70-0.82 on the put side (the
+lognormal drift pulls puts in; the $1 grid does the rest) — not the ~0.84 both sides the flat-normal
+sketch in the 09-22 study entry assumed. Applied to the live store (`AIT_BT_EM_GATE=1`,
+`reports/post_event_study/entry_dte_18_em_gate/`): n 57 / PF 0.628 / net -3,521 / DD 4.32% —
+identical to gate-off to the cent. Not taken on trust: the window JSON does not carry the new ratio
+fields, so the 57 baseline entries were recomputed from their recorded legs (EM = wing width / 1.6)
+and the entry-day close (25 from the saved bar series, 32 from Yahoo — the study's own source):
+call 0.865-1.005, put 0.701-0.821, none within 0.10 of either edge, none at the wing floor. The
+live band is inert on this universe at the live delta, so the recorded study baselines stand with
+the gate on. It is NOT inert everywhere: on the suite's $100 synthetic series (EM under ~5) the $1
+grid pushes some puts below 0.6 EM and the gate rejects them, as live would — kept executable in
+`tests/test_w52a_engine_em_band_parity.py` (12 tests; 11 red pre-change). The arm the operator asked
+about on 09-22 can now be swept. `scripts/post_event_study.py --tag` added so a re-run under an
+engine switch does not overwrite recorded results.
+
+**Left as registered, deliberately — not oversights:**
+- `bot-day-09` shutdown-side MTM stamp: Ahmed's W47 finding 2 scoped it out on the merits
+  ("touches supervisor shutdown ordering ... the persisted-marks reconstruction already covers
+  well"). Not overridden here.
+- `whatIfOrder` pre-trade margin: deferred by operator decision in W51 with stated re-open
+  conditions. Not built.
+- W31 two-knob unification (`max_position_risk_pct` vs `max_daily_loss_pct/1.5`): operator decision.
+- IV-rank floor in the engine: the engine's `iv_rank` is a realized-vol range rank, live gates on an
+  implied-vol percentile; parity needs an IV-percentile series in the store first. Registered, not
+  built (the 400-row stored-IV guard in the study script is the current protection).
+
+PROOF. New tests 49, red-first as counted above. Full fast lane on this box: **2400 passed / 46 skipped / 0 failed** (472s; a first run during which engine.py was still being edited showed 5 `inspect.getsource` tests reading shifted line numbers — the CENSUS pattern, not a defect — and 0 on the clean re-run), typecheck OK.
+Config keys: `exit.exit_pending_rest_seconds`, `exit.exit_stop_pending_rest_seconds` (declared in
+config.yaml, asserted by test). Live-code changes need a restart to load (orchestrator, executor,
+calendars, settings); restarted after this entry with no position open and the market closed, with notice in the session.
+
+---

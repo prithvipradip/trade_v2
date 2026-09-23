@@ -104,9 +104,21 @@ def load_daily_ohlcv(
     _expected = max(1, int(days * 252 / 365))
     _needed = max(60, int(_expected * 0.8))
     if len(df) < _needed:
-        log.info("daily_ohlcv_yahoo_fallback", symbol=symbol, ib_rows=len(df),
-                 requested_days=days, expected_trading_days=_expected,
-                 needed=_needed)
+        if len(df) == 0:
+            # W52a: an EMPTY store is not "short coverage" — it is a run on
+            # a store that holds nothing for this symbol (no bars, no stored
+            # IBKR implied vol, no spread calibration), which the 2026-09-22
+            # post-FOMC study found reports a different harness (n 87 /
+            # PF 0.83 vs n 50 / PF 0.45, same code). Say so at WARNING.
+            log.warning("daily_ohlcv_store_empty_yahoo_only", symbol=symbol,
+                        db_path=str(getattr(store, "_db_path", db_path or _DEFAULT_DB)),
+                        requested_days=days,
+                        note="Yahoo is the only source for this frame; no "
+                             "stored implied vol will be joined")
+        else:
+            log.info("daily_ohlcv_yahoo_fallback", symbol=symbol, ib_rows=len(df),
+                     requested_days=days, expected_trading_days=_expected,
+                     needed=_needed)
         try:
             start = (today_et() - timedelta(days=days + 30)).isoformat()
             ydf = yf.Ticker(symbol).history(start=start, interval="1d", auto_adjust=False)

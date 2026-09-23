@@ -321,6 +321,10 @@ async def main():
     ap.add_argument("--data-root", default=str(ROOT),
                     help="tree whose data/historical.db holds the IBKR daily IV backfill "
                          "and the spread calibration (default: this checkout)")
+    ap.add_argument("--tag", default="",
+                    help="suffix for the output directory (a re-run under a different "
+                         "engine switch, e.g. AIT_BT_EM_GATE=1, must not overwrite the "
+                         "recorded results)")
     args = ap.parse_args()
     db_path = Path(args.data_root) / "data" / "historical.db"
     # Two engine paths resolve the store RELATIVE TO CWD regardless of db_path
@@ -337,7 +341,7 @@ async def main():
 
     settings = load_settings(str(ROOT / "config.yaml"))
     lower_priority()
-    out = OUT_BASE / f"entry_dte_{args.entry_dte}"
+    out = OUT_BASE / (f"entry_dte_{args.entry_dte}" + (f"_{args.tag}" if args.tag else ""))
     out.mkdir(parents=True, exist_ok=True)
     print(f"[pe] entry_dte={args.entry_dte} -> {out} | FOMC dates: {len(fomc_dates())} "
           f"({fomc_dates()[0]}..{fomc_dates()[-1]})", flush=True)

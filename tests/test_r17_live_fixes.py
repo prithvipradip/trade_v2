@@ -29,6 +29,8 @@ from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+from ait.utils.time import today_et
+
 import pandas as pd
 import pytest
 
@@ -89,8 +91,11 @@ def _manager(spot: float, unrealized: float, earnings_in_days: int):
     mgr._exit_config = ExitConfig()
 
     earnings = MagicMock()
+    # W52a: the code under test dates everything in ET (that is finding [7]
+    # of this very file); a server-local date.today() disagrees with it
+    # between 00:00 and 04:00 UTC and turned these into a nightly flake.
     earnings.get_next_earnings.return_value = SimpleNamespace(
-        next_earnings_date=date.today() + timedelta(days=earnings_in_days))
+        next_earnings_date=today_et() + timedelta(days=earnings_in_days))
     mgr._earnings = earnings
     mgr._economic_cal = None
 
@@ -107,7 +112,7 @@ def _manager(spot: float, unrealized: float, earnings_in_days: int):
 
 
 def _condor(dte: int) -> _FakeTrade:
-    t = _FakeTrade(expiry=(date.today() + timedelta(days=dte)).isoformat())
+    t = _FakeTrade(expiry=(today_et() + timedelta(days=dte)).isoformat())
     t.direction = SimpleNamespace(value="neutral")
     return t
 

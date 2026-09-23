@@ -273,6 +273,12 @@ exit:
   # W33: each consecutive no-quote exit placement steps this far above the
   # last (anchor + cross + n*step, capped) instead of repeating itself.
   exit_reprice_step: 0.10
+  # W52a: how long a working, unfilled close order rests before check_fills
+  # cancels it for a re-price. Stops (stop_loss / short_strike_touch /
+  # trailing_stop / breakeven_stop) rest the shorter value — the 2026-09-21
+  # touch stop took 25 minutes at the old 300s on 15-minute-old quotes.
+  exit_pending_rest_seconds: 300
+  exit_stop_pending_rest_seconds: 120
   # W33: with no quote and no fresh mark, pay at most this multiple of the
   # entry credit (never more than the wing width). Was: the raw wing width.
   exit_blind_credit_multiple: 2.0

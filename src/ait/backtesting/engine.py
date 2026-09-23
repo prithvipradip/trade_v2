@@ -167,6 +167,11 @@ class Backtester:
         # (skip open volatility) is the historically correct value; '09:30'
         # was constructor drift.
         intraday_store: Any = None,
+        # W52a: the store this run reads (calibrated spreads today; the
+        # walk-forward threads its own db_path here). None keeps the
+        # cwd-relative default — which is how the 2026-09-22 study silently
+        # ran on an empty auto-created historical.db from a dev worktree.
+        db_path: Any = None,
         scan_interval_minutes: int | None = None,
         entry_window_start_et: str | None = None,
         entry_window_end_et: str | None = None,
@@ -188,6 +193,22 @@ class Backtester:
         # minimum credit/max-width ratio (env AIT_IC_MIN_CREDIT_WIDTH, 0.20).
         ic_min_credit: float | None = None,
         ic_min_credit_width: float | None = None,
+        # W52a: the live expected-move band on condor short strikes
+        # (iron_condor.py R12-B gate: each short must sit within
+        # [em_min, em_max] x expected move of spot). None -> the same contract
+        # keys live reads (AIT_IC_EM_MIN/MAX, home backtest.ic_em_min/max).
+        # ON by default (AIT_BT_EM_GATE=0 or em_gate=False turns it off).
+        # The engine's whole-dollar 0.20-delta placement sits at ~0.90-1.00
+        # EM on the call side and ~0.68-0.73 on the put side; on the live
+        # store every one of the 57 baseline condors is inside the band
+        # (W52a: n 57 / PF 0.628 gate on and off, to the cent), so the
+        # recorded study baselines do not move. On a $100 synthetic series
+        # with EM under ~5 the $1 strike grid can push a put outside — the
+        # gate then rejects, as live would. The ratios are recorded on
+        # every position either way.
+        ic_em_min: float | None = None,
+        ic_em_max: float | None = None,
+        em_gate: bool | None = None,
         # Macro-event gate: live orchestrator blocks CREDIT entries <=4 days
         # before FOMC/CPI/NFP/GDP/PCE; live portfolio flattens defined-risk
         # credit <=1 day before (strangles <=5) when AIT_SKIP_MACRO_EVENTS=1.
@@ -302,6 +323,7 @@ class Backtester:
         self._max_entry_vol_annual = max_entry_vol_annual
         self._market_context = market_context
         self._symbol = symbol or ""
+        self._db_path = db_path
         # R16: must run AFTER _symbol is set — the calibration is per-symbol.
         if os.environ.get("AIT_BT_CALIBRATED_SPREADS", "1") != "0":
             self._load_calibrated_spreads()
@@ -319,8 +341,13 @@ class Backtester:
             try:
                 from ait.config.settings import load_settings as _ls
                 _settings = _ls()
-            except Exception:  # noqa: BLE001 — no config.yaml -> per-field defaults
+            except Exception as _e:  # noqa: BLE001 — no config.yaml -> per-field defaults
                 _settings = None
+                # W52a: this used to be silent. A run from the wrong cwd is
+                # a different harness (every settings-backed knob at its
+                # model default) and must say so.
+                log.warning("engine_settings_unavailable_using_defaults",
+                            cwd=os.getcwd(), error=str(_e))
         # R20 #4/#5b + R20b (pre-registered PLAN 2026-08-21): every knob below
         # follows the same explicit > settings.<section>.<field> > config-model
         # default precedence (_resolve_setting); explicit constructor args
@@ -424,6 +451,18 @@ class Backtester:
         self._ic_min_credit_width = (
             float(ic_min_credit_width) if ic_min_credit_width is not None
             else contract_float("AIT_IC_MIN_CREDIT_WIDTH")
+        )
+        self._ic_em_min = (
+            float(ic_em_min) if ic_em_min is not None
+            else contract_float("AIT_IC_EM_MIN")
+        )
+        self._ic_em_max = (
+            float(ic_em_max) if ic_em_max is not None
+            else contract_float("AIT_IC_EM_MAX")
+        )
+        self._em_gate = (
+            bool(em_gate) if em_gate is not None
+            else os.environ.get("AIT_BT_EM_GATE", "1") != "0"
         )
         self._macro_event_gate = macro_event_gate
         self._economic_cal = None
@@ -1522,8 +1561,13 @@ class Backtester:
             return
         try:
             from ait.data.historical import HistoricalDataStore
-            p = HistoricalDataStore().load_spread_params(sym)
+            # W52a: the store this run was pointed at, not the cwd default.
+            _store = (HistoricalDataStore(db_path=self._db_path)
+                      if self._db_path is not None else HistoricalDataStore())
+            p = _store.load_spread_params(sym)
             if not p:
+                log.info("calibrated_spreads_absent", symbol=sym,
+                         db_path=str(getattr(_store, "_db_path", "")))
                 return
             self._spread_base = float(p.get("spread_base", self._spread_base))
             self._spread_iv_sensitivity = float(
@@ -1731,6 +1775,24 @@ class Backtester:
             # Wings: vol-scaled by wing_k; wing_floor_dollars is the hard safety minimum.
             # wing_k=1.0 → 1-sigma expected move; wing_k=2.0 → 2-sigma (wider, safer).
             expected_move = S * iv * (dte / 365.0) ** 0.5
+            # W52a: the live EM sanity gate (iron_condor.py R12-B), same
+            # rule and same contract keys: each short strike's distance from
+            # spot must sit within [em_min, em_max] x expected move; reject
+            # when the EM is unavailable. On unless em_gate is off (see
+            # __init__); the ratios are recorded on the position either way.
+            if expected_move <= 0:
+                log.debug("condor_rejected_em_unavailable", date=str(today_date))
+                return None
+            em_ratio_call = (short_call_strike - S) / expected_move
+            em_ratio_put = (S - short_put_strike) / expected_move
+            if self._em_gate and not (
+                    self._ic_em_min <= em_ratio_put <= self._ic_em_max
+                    and self._ic_em_min <= em_ratio_call <= self._ic_em_max):
+                log.debug("condor_rejected_em_band", date=str(today_date),
+                          em_ratio_call=round(em_ratio_call, 3),
+                          em_ratio_put=round(em_ratio_put, 3),
+                          em_min=self._ic_em_min, em_max=self._ic_em_max)
+                return None
             wing_width = max(self._wing_k * expected_move, self._wing_floor_dollars)
             long_call_strike = short_call_strike + wing_width
             long_put_strike = short_put_strike - wing_width
@@ -1801,6 +1863,8 @@ class Backtester:
                 "strike": round(S, 0),  # Reference: underlying at entry
                 "option_type": "iron_condor",
                 "entry_iv": round(iv, 4),
+                "em_ratio_call": round(em_ratio_call, 4),  # W52a
+                "em_ratio_put": round(em_ratio_put, 4),
                 "underlying_at_entry": round(S, 2),
                 "max_loss_per_share": round(max_loss_per_share, 4),
                 "expiry_date": str(today_date + timedelta(days=dte)),

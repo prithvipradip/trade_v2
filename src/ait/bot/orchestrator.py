@@ -329,6 +329,7 @@ class TradingOrchestrator:
             refuse_entries_when_data_unavailable=(
                 settings.earnings.refuse_entries_when_data_unavailable),
             lkg_max_age_hours=settings.earnings.lkg_max_age_hours,
+            persist=self._state,  # W52a: LKG survives a restart
         )
         # W51 (model-vs-reality-ex-div-assignment-void): EarningsCalendar's
         # twin, protecting against early-assignment risk around ex-dividend
@@ -337,6 +338,7 @@ class TradingOrchestrator:
             refuse_entries_when_data_unavailable=(
                 settings.dividends.refuse_entries_when_data_unavailable),
             lkg_max_age_hours=settings.dividends.lkg_max_age_hours,
+            persist=self._state,  # W52a: LKG survives a restart
         )
         self._economic_cal = EconomicCalendar()
 
@@ -3553,6 +3555,19 @@ class TradingOrchestrator:
                          wanted=adjusted_size, using=validation.position_size,
                          reason=revalidation.reason)
                 adjusted_size = max(1, validation.position_size)
+            elif 0 < int(revalidation.position_size or 0) < adjusted_size:
+                # W52a (registered in W50): validate_trade can APPROVE at a
+                # smaller size than asked (min(request, sizer) and the
+                # correlation haircut). Only `.approved` was read here, so
+                # the multiplied size went out even when the sizer had just
+                # cut it — the multiplier bypassed the sizer exactly where the
+                # sizer said "less". A position_size of 0 on an approval is
+                # a stub/legacy shape, not a cap.
+                log.info("multiplier_size_capped_by_revalidation",
+                         symbol=signal.symbol, strategy=signal.strategy_name,
+                         wanted=adjusted_size, using=revalidation.position_size,
+                         reason=revalidation.reason)
+                adjusted_size = int(revalidation.position_size)
 
         # Apply adaptor exit overrides to the signal (Gap Z8 / Fix 6a).
         # Bypassed in paper_trading_mode so exit params match the backtest's fixed values.

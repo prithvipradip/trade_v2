@@ -42,6 +42,10 @@ import os as _os_t
 # the cancel; 90s cancelled orders before the marketable step could fire.
 from ait.config.runtime_env import contract_float as _contract_float_t  # W36
 DEFAULT_ORDER_TIMEOUT = int(_contract_float_t("AIT_ENTRY_ORDER_TIMEOUT"))
+# W52a: exit_reason prefixes the portfolio uses for the exits that must get
+# out (portfolio.py _evaluate_position). These rest the shorter
+# exit.exit_stop_pending_rest_seconds before a re-price.
+_STOP_EXIT_PREFIXES = ("stop_loss", "short_strike_touch", "trailing_stop", "breakeven_stop")
 
 # R19 (audit finding executor.py:453): terminal fallback for the single-leg
 # wide-spread reject. The 0.15 literal used to live inline in
@@ -1187,7 +1191,10 @@ class TradeExecutor:
                 # for a clean marketable re-trigger. Never revert while the
                 # broker shows the order working (a halt can reject cancels;
                 # reverting would re-arm the duplicate-exit incident).
-                if (pending_exit.age_seconds > 300
+                # W52a: the rest is per exit kind — a stop rests
+                # exit_stop_pending_rest_seconds (120), everything else
+                # exit_pending_rest_seconds (300, the old literal).
+                if (pending_exit.age_seconds > self._exit_rest_seconds(pending_exit)
                         and order_id not in self._exit_cancels_requested):
                     log.warning(
                         "exit_order_stale_working_cancel_requested",
@@ -1357,8 +1364,10 @@ class TradeExecutor:
                 )
                 del self._pending_exit_orders[order_id]
 
-            elif exit_status == "pending" and pending_exit.age_seconds > 300:
-                # Exit stuck pending 5+ min — request cancel but KEEP TRACKING
+            elif (exit_status == "pending"
+                    and pending_exit.age_seconds > self._exit_rest_seconds(pending_exit)):
+                # Exit stuck pending past its rest (W52a: 300s, 120s for a
+                # stop) — request cancel but KEEP TRACKING
                 # (audit R2/H1): the old code cancelled, reverted to FILLED and
                 # dropped the tracker in one shot. If the cancel raced a fill
                 # (order fills as the cancel arrives), the portfolio re-triggered
@@ -3029,6 +3038,20 @@ class TradeExecutor:
             TradeStatus.CANCELLED,
         )
         return True
+
+    def _exit_rest_seconds(self, pending_exit: PendingExitOrder) -> float:
+        """W52a: how long this exit may sit unfilled before check_fills
+        cancels it for a re-price. Stops (by exit_reason prefix — the
+        portfolio's strings are "stop_loss (P&L: ...)", "short_strike_touch
+        (spot ...)", "trailing_stop (...)", "breakeven_stop (...)") rest
+        ``exit.exit_stop_pending_rest_seconds``; everything else rests
+        ``exit.exit_pending_rest_seconds``. Defaults match the config model
+        so an executor built without settings behaves the same."""
+        _exit_cfg = getattr(self._settings, "exit", None)
+        reason = str(getattr(pending_exit, "exit_reason", "") or "")
+        if reason.startswith(_STOP_EXIT_PREFIXES):
+            return float(getattr(_exit_cfg, "exit_stop_pending_rest_seconds", 120.0))
+        return float(getattr(_exit_cfg, "exit_pending_rest_seconds", 300.0))
 
     def register_exit_order(
         self,
