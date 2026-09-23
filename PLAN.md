@@ -9194,3 +9194,89 @@ config.yaml, asserted by test). Live-code changes need a restart to load (orches
 calendars, settings); restarted after this entry with no position open and the market closed, with notice in the session.
 
 ---
+
+## 2026-09-23 - W52 EXECUTED — rule 3 now names the ITM leg of a multi-leg credit position
+
+SCOPE. The roadmap's first queued wave (finding [2], `:8668-8696`, the 2026-09-22 "ROADMAP:
+assignment-response policy" entry). Rule 3 ("Assignment risk — ITM shorts on expiry day",
+`portfolio.py:711-737`) is meant to say which short leg is ITM at DTE<=1, but its check
+branched on `trade.contract_type == "put"/"call"`, and `_get_contract_type` (executor.py)
+returns `"iron_condor"`/`"spread"` for any multi-leg trade — never `"put"`/`"call"`. So the
+ITM test never matched for a condor and every such close at DTE<=1 fell through to the
+generic `expiry_approaching` label regardless of whether it was really ITM. Not W52a (that
+wave, earlier the same day, cleared the unrelated registered-not-fixed list).
+
+NOT A PROTECTION HOLE. `should_exit` was already `True` in this branch either way — the
+fallback guarantees it, both before and after this wave. Only the diagnostic label changes.
+Checked against the live DB before starting (10 closes total, none tagged with either label)
+and pinned by `TestShouldExitInvariant` below.
+
+FIX. `portfolio.py`: new `@staticmethod PortfolioManager._short_strikes_from_legs(trade)`,
+reading `trade.legs` JSON with the exact expressions rule 1b's touch-stop lookup already uses
+(`max` of SELL puts, `min` of SELL calls, `default=None`) — a JSON parse failure returns
+`(None, None)`, same as rule 3e's fallback. Rule 3's body gets one new
+`elif trade.contract_type not in ("put", "call")` branch that calls the helper and checks the
+underlying against both short strikes; the existing single-leg `"put"`/`"call"` branches, the
+outer gate, the `try/except Exception: pass`, and the `expiry_approaching` fallback are
+byte-identical to before. Deliberately NOT touched: rule 1b, rule 3e (including its now
+partly-outdated "keyed off trade.strike" comment, `:838-841` — left for W54),
+`_get_contract_type` itself (other live consumers, e.g. `orchestrator.py:3810`'s
+single-leg-vs-combo close routing, depend on its existing return values), and executor.py's
+`_STOP_EXIT_PREFIXES` (an `assignment_risk` exit still rests the default 300s before a
+re-price, same as `expiry_approaching` already did — deferred to W54 as a policy question,
+not decided here).
+
+PROOF. `tests/test_w52_multileg_itm_diagnosis.py`, 23 tests: 14 red before the fix (5 on the
+new helper directly — AttributeError, it didn't exist yet; 5 condor/strangle/degraded-quote
+integration cases mislabeled `expiry_approaching`; 3 parametrized against the REAL
+`TradeExecutor._get_contract_type` over 2/3/4-leg shapes — a class guard so a future leg
+shape or a renamed contract_type string stays covered without another fix here; 1 pinning the
+fix is host-timezone-independent), 9 green pre-fix as controls (condor spot inside/on the
+strike, single-leg CSP/covered_call text unchanged, malformed legs, missing quote, and the
+`should_exit` invariant across ITM/not-ITM). Mutation-checked: `git stash` on `portfolio.py`
+alone reproduces the identical 14/9 split; `git stash pop` restores all 23 green. Neighbor
+files (`test_credit_exits.py`, `test_exit_staleness_gate.py`, `test_w51_ex_div_assignment.py`,
+`test_pnl_accounting.py`, `test_w47_protection_cadence.py`): 82/82 unaffected.
+
+Full fast lane, this box (Python 3.11.13 / numpy 1.26.4 conda env, not the 3.13 trading-box
+runtime): baseline on unfixed HEAD **3 failed / 2397 passed / 46 skipped / 153 deselected**
+(2499.65s); with the fix, **3 failed / 2420 passed / 46 skipped / 153 deselected** — exactly
+the 23 new tests added, the same 3 pre-existing failures verbatim
+(`test_r19_config_authority.py::TestContractIsTheSingleAuthority::test_applier_and_readers_share_one_table`,
+`test_watchdog.py::TestOverallHealth::test_all_healthy`,
+`test_watchdog.py::TestOverallHealth::test_one_down_marks_overall_down` — pre-existing on
+this box, in files this wave never touches, unrelated to portfolio.py). Wall time on the
+post-fix run ballooned to 12401.48s (3:26:41) vs. the baseline's 2499.65s (41:39) despite
+comparable-looking CPU accumulation observed mid-run — likely this box idling/throttling for
+a stretch, not a correctness signal; exit code 0 either way. `python -m compileall -q src`:
+OK. `python scripts/typecheck.py`: OK, zero attr-defined/call-arg/name-defined in
+`src/ait/{config,bot,execution,risk}`. Side note for whoever hits this next: mypy was not
+installed in this box's conda env, and `pip install -e ".[dev]"` itself is blocked here —
+`ait` requires `>=3.13` and this env is 3.11.13 — even though `ait` is already registered
+installed regardless (pip only enforces `requires-python` on a fresh resolve). A standalone
+`pip install "mypy>=1.8"` was enough to run the real gate rather than skip it; this is the
+same known discrepancy CLAUDE.md already documents, one layer deeper.
+
+STATE AT HANDOFF. Live-code change (`portfolio.py`). Per W41b, the Windows bot still runs
+pre-W46 code, so W52 loads alongside W46-W52a at the next operator-approved restart; no
+restart taken from this session.
+
+NEXT: **W53** (roll mechanics) — the atomicity question ([3]c in the 2026-09-22 ROADMAP
+entry) still needs probing against paper before its scope is trusted. **W54** (close-or-roll
+comparison model, an operator decision) also now owns four small items surfaced by this wave:
+whether `assignment_risk`/expiry-day exits should get the fast 120s re-price rest;
+consolidating the legs-JSON lookup across rules 1b/3/3e into one helper (this wave
+deliberately kept `_short_strikes_from_legs` used by rule 3 alone); rule 3e's outdated
+"keyed off trade.strike" comment; and whether a future policy reading rule 3's label should
+gate on `spot_health` the way rule 1b's touch stop already does (rule 3 uses the same
+health-checked quote but, unlike 1b, does not distinguish fresh/degraded/frozen — not a new
+risk from this wave, since `should_exit` doesn't depend on it, but relevant once a policy
+treats the label as actionable). **W55** (synthetic per-leg delta) is independent and can be
+pulled forward any time. **W56** follows W55, **W57** follows W53 and W56. **CENSUS-1..5**
+(test-honesty/`inspect.getsource` cleanup, 32 sites) remain open, no urgency, interleave any
+time. W52a's four deliberately-registered items are still open, unchanged.
+
+No inspect.getsource — this wave's new test file drives the real
+`_evaluate_position`/`_short_strikes_from_legs`, never asserts on source strings.
+
+---
