@@ -10824,3 +10824,39 @@ entry).
 No inspect.getsource in any of the 3 rewritten tests — all now drive real code paths,
 mutation-verified above.
 
+---
+
+## 2026-09-28 - CENSUS-3 fast lane confirmed — 2 failures, both pre-existing and
+already registered, zero new
+
+Full fast lane after CENSUS-3: **2515 passed / 2 failed / 45 skipped / 153 deselected,
+801.58s (13m21s)**. Both failures are already-known, already-registered, and unrelated
+to this batch: the standing `AIT_MARKET_DATA_TYPE` env divergence
+(`test_r19_config_authority.py`), and `test_w51_ex_div_assignment.py`'s local-midnight-
+vs-`today_et()` fixture bug (registered in the CENSUS-2 entry above) — still reproducing,
+consistent with this box's clock still being in the divergent window at run time.
+`test_watchdog.py`'s flaky pair ran clean this time (its own tally: five clean, one
+failed, unresolved, untouched).
+
+Count check: pre-batch baseline (CENSUS-2's fast lane) was 2513 passed + 4 failed = 2517.
+This run: 2515 + 2 failed = 2517 — same total, reconciling exactly: 2 of the 4 prior
+failures (`test_watchdog.py`'s pair) passed clean this run, the other 2 (env divergence,
+ex-div timing) are unchanged. Zero new failures. `test_r16_tail_fixes.py` alone stayed
+79/79 and `test_r16_core_fixes.py` alone stayed 10/10 before and after, confirmed
+separately above.
+
+No `src/ait` file differs from HEAD (`git diff --stat src/ait` empty) — this entry
+reports a suite run only.
+
+NEXT: unchanged from the entry above — the census is **not closed**; **4 newly-
+registered offender sites** need their own scoping pass; the 2-site delete-only
+discrepancy; the `_run_override_block` follow-up; **W53's placing run** and **W55's live
+validation run** waiting on TWS during an RTH session; **W54** waiting on the operator;
+**W56/57**; **W52a's four items**; `get_chain_for_expiry`; **`test_watchdog.py`** (five
+clean, one failed, still unresolved); **`test_w51_ex_div_assignment.py`**'s local-
+midnight fixture bug, still reproducing, still not fixed (out of scope for every batch
+that has touched it so far).
+
+No inspect.getsource — this entry touches no test files, only reports a suite run.
+
+---
