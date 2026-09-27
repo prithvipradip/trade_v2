@@ -10375,3 +10375,122 @@ three-clean-one-failed, still unresolved.
 No inspect.getsource — this entry touches no test files, only reports a suite run.
 
 ---
+
+## 2026-09-27 - CENSUS-4 EXECUTED — the "scattered moderates" rewrite batch of the
+test-honesty `inspect.getsource` census, 7 sites, zero production changes
+
+SCOPE. "Batch D — scattered moderates" (`PLAN.md:7076-7081`), the register's own
+suggested next step after A (CENSUS-1) and E (CENSUS-5): 7 sites across 6 files, no
+shared theme or reusable harness this time — strategy entry gating, backtest engine
+meta-label context, ML trainer date recovery, risk manager config reads, orchestrator
+exit-step dispatch, reconciler sweep gating. Every rewrite was EMPIRICALLY PROBED in a
+throwaway process before being written, AND mutation-checked afterward against the real
+source (a targeted, reverted source edit per site, confirming the new assertion actually
+fails against the un-fixed behavior) — a step beyond CENSUS-1's own proof discipline,
+applied here because this batch has no shared harness to lean on for confidence.
+
+TWO SITES HAD BUGS IN THE ORIGINAL TEST ITSELF, not just the anti-pattern — worth
+recording since they're corrections to what the tests actually claimed, not merely style:
+- `test_w19_greeks_provenance.py:116/126`: the original assertion checked BYTE-OFFSET
+  ORDERING between `iron_condor.py`'s `iv_is_guessed` check and its legacy zero-delta
+  check. Mutation-verified directly: swapping the two checks' order produces
+  BYTE-IDENTICAL output for every probed chain shape (`iron_condor.py:218-226`, both
+  return `[]` with the SAME `"degraded_greeks"` reason) — the ordering the original test
+  pinned has no observable behavioral effect at all. The real, worthwhile claim (the
+  guessed-IV check firing before strike selection, so a guessed chain with
+  technically-nonzero-but-off-target deltas still reports `degraded_greeks` rather than a
+  later, unrelated rejection) is what the rewrite actually proves.
+- `test_w28_et_date_authority.py` (`:205`, shifted from `:211` by CENSUS-5's own earlier
+  edit to this file): `hasattr(tr, "_ModelTrainer")` was always False — `_ModelTrainer`
+  has never existed in `trainer.py` (confirmed directly; only `ModelTrainer` does) — so
+  the getsource call had always grepped the ENTIRE MODULE, not the intended class. A
+  second, related discovery: the seemingly-adjacent sibling test
+  (`test_recovered_date_is_an_et_date`) is NOT real coverage — it re-derives the same
+  `fromtimestamp(..., tz=ET)` computation inline instead of calling the trainer, itself a
+  "re-derived literal" variant of the same anti-pattern this whole census exists to catch.
+
+FIX (test-only; zero `src/ait` changes — every rewrite drives EXISTING, already-correct
+`src/ait` behavior):
+1. `test_w19_greeks_provenance.py:116/126` — drives the real `IronCondor.generate_
+   signals` against three real chain shapes (guessed+on-target-deltas, guessed+off-target-
+   0.9-deltas, unguessed+zero-deltas), reading back `last_entry_reason`. Trap avoided:
+   always pairs a flagged shape with its unflagged twin, since an unflagged chain can
+   still fail a later, unrelated economic gate (`em_gate` on the synthetic chain used
+   here) — a bare "gets a real signal" assertion would have been too strong; narrowed to
+   "does not reject with `degraded_greeks`" for that half.
+2. `test_w20_host_clock_and_calendar_faults.py:346` — drives the real
+   `Backtester(...).run()` with a stub `meta_labeler` that records every context it's
+   called with; asserts calls happened (>0, since `predict` is wrapped in a bare `except
+   Exception: pass` at `engine.py:708` that would otherwise silently swallow a broken
+   stub) and every recorded `hour_of_day == 10`.
+3. `test_w28_et_date_authority.py:205` — bare `ModelTrainer.__new__` with `trained_at`/
+   `model_version` sources left empty so the mtime fallback path actually runs, an
+   artifact mtime set via `os.utime` at an ET instant chosen so the host-local (Berlin)
+   and ET calendar dates DISAGREE (proving the test isn't vacuous), asserts the real
+   `_artifact_train_date()` recovers the ET date, not the host-local one.
+4. `test_r19_config_authority.py:245` — every EXISTING risk test (`test_risk_
+   guardrails.py`, `test_r16_risk_fixes.py`, `test_w30_*`) passes the historical DEFAULT
+   `credit_cap_vix_tiers`/`max_symbol_concentration_pct` values, so none could tell a
+   real config read apart from a hardcoded literal matching that default. Drives the real
+   `RiskManager.validate_trade` with NON-default values for both, confirming each
+   actually changes the outcome, plus a positive control at the default. Real trap found:
+   with the real default `max_position_risk_pct=0.03`, an unrelated earlier gate fires
+   first for a naively-sized test trade — raised it in the test's own config and asserted
+   on the specific rejection-reason substring, not just rejection.
+5. `test_r17_dormant_strategy_fixes.py:97` ("the flagship offender" — its own docstring
+   admitted the anti-pattern outright) — reuses `test_r15_review_fixes.py`'s
+   `TestCommissionTrueUp` harness construction pattern to drive the real
+   `TradingOrchestrator._process_completed_exits` for all three excluded strategies
+   (`iron_condor`/`short_strangle`/`long_straddle`) AND a mandatory positive control
+   (`long_call`, which MUST record a drift outcome) — `_exit_step` swallows exceptions
+   (`orchestrator.py:1082-1088`), so without the control a silently-erroring drift step
+   would look identical to a correctly-skipped one. 1 test became 4 (net +3 collected).
+   **A second, related offender surfaced in the same file, deliberately OUT of this
+   batch's scope**: `_run_override_block` (`:64-74`, no getsource — not part of this
+   census) "mirrors the source" of `orchestrator.py:2416-2435`/`_scan_symbol` instead of
+   calling it. Registered as its own future item, not folded in here — driving the real
+   code means entering `_scan_symbol`, materially larger work.
+6. `test_r16_core_fixes.py:72` — three real cases, the first against a REAL
+   `StateManager` (tmp_path sqlite, genuine CAS SQL, not a MagicMock told what to
+   return): (a) a trade that races to FILLED between the sweep's snapshot and its close
+   attempt must survive as FILLED — proves `from_statuses=(TradeStatus.PENDING,))`
+   actually narrows the CAS, not just that the kwarg is passed; (b) a working entry
+   order must defer, not book fiction (reused `test_w26_budget_and_cluster_cooldown.py`'s
+   `_reconciler`/`_pending_trade`/`_state_with` helpers directly); (c) a genuine stale
+   PENDING control still closes normally, proving (a)/(b) didn't just disable the sweep.
+
+PROOF. Per-file counts, before → after: `test_w19_greeks_provenance.py` 7→7,
+`test_w20_host_clock_and_calendar_faults.py` 48→48, `test_w28_et_date_authority.py`
+16→16 (15 passed + 1 pre-existing skip, unchanged), `test_r19_config_authority.py`
+20→20, `test_r17_dormant_strategy_fixes.py` 9→12 (net +3, one test split into four),
+`test_r16_core_fixes.py` 10→10. All six together: **111 passed + 1 pre-existing failure
+(the standing `AIT_MARKET_DATA_TYPE` env divergence, unrelated) + 1 skipped = 113**,
+reconciling exactly against the six individual baselines summed (7+48+16+20+12+10=113).
+Every one of the 7 rewrites was ALSO mutation-checked individually — a real, targeted
+edit to the guarded `src/ait` behavior, confirmed the new test fails, reverted (`git
+diff --stat` confirmed clean before moving to the next site each time) — not just that it
+passes today. `python -m compileall -q tests`: OK. Census recount, same reconciliation
+as CENSUS-1/5 (excluding `test_w23_scheduler_timezone.py` and the 2 known prose
+mentions): **20 real sites remain**, down from 27.
+
+STATE AT HANDOFF. Test-file-only changes across 6 files; zero `src/ait` files touched
+(every mutation made during verification was reverted before moving to the next site);
+zero config changes. Nothing to deploy or restart. Full fast lane kicked off in the
+background at this entry's writing; its result folds into the NEXT entry.
+
+NEXT, naming every open item explicitly: **CENSUS-2** (exit-policy/engine, ~7 sites,
+`PLAN.md:7066-7068`) and **CENSUS-3** (`master.py`/entrypoint, ~3, "the expensive one
+despite fewest sites", `PLAN.md:7069-7075`) — both still open, no urgency, re-verify
+against current source before deep-diving (per the rediscovered entry's own warning).
+The still-open 3-site delete-only discrepancy (REGISTER CORRECTION entry above). The
+`_run_override_block` follow-up this wave surfaced (item 5 above) — a second, non-
+getsource instance of the same anti-pattern, not yet scoped as its own item. Separately:
+**W53's placing run** and **W55's live validation run** both still wait on TWS reachable
+during an RTH session; **W54** waits on the operator; **W56/57**; **W52a's four items**;
+the dormant `get_chain_for_expiry` bug; **`test_watchdog.py`**'s load-sensitivity
+discrepancy, three data points in, still unresolved.
+
+No inspect.getsource — every test this wave touched now drives the real code path; the
+rewrites themselves, mutation-verified above, are proof positive.
+
+---

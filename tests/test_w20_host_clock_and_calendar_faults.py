@@ -335,16 +335,56 @@ class TestHourOfDayIsStampedInET:
         )
 
     def test_backtest_constant_is_parity_with_the_live_producers(self):
-        """Parity check required by the W20 plan. engine.py's hardcoded 10 is
-        a CONSTANT, not a clock read, so it has no timezone bug and must NOT
-        change: it is an ET-plausible RTH hour, and fixing the live producers
-        is precisely what restores agreement with it. Pre-fix, live rows on
-        this host wrote 15..22 against the backtest's 10."""
-        import inspect
-        import ait.backtesting.engine as _e
+        """CENSUS-4 (2026-09-27): parity check required by the W20 plan.
+        engine.py's hardcoded 10 is a CONSTANT, not a clock read, so it has
+        no timezone bug and must NOT change: it is an ET-plausible RTH hour,
+        and fixing the live producers is precisely what restores agreement
+        with it. Pre-fix, live rows on this host wrote 15..22 against the
+        backtest's 10. Drives the real Backtester.run() with a stub meta_
+        labeler that RECORDS every context it's called with, instead of
+        grepping engine.py's source for the literal assignment."""
+        import numpy as np
+        import pandas as pd
+        from types import SimpleNamespace
 
-        src = inspect.getsource(_e)
-        assert 'meta_ctx.setdefault("hour_of_day", 10)' in src
+        from ait.backtesting.engine import Backtester
+        from ait.ml.features import FeatureEngine
+
+        idx = pd.bdate_range("2024-01-02", periods=160)
+        rng = np.random.default_rng(42)
+        close = 100 * np.exp(np.cumsum(rng.normal(0.0, 0.008, len(idx))))
+        df = pd.DataFrame(
+            {"Open": close, "High": close * 1.004, "Low": close * 0.996,
+             "Close": close, "Volume": 1e6},
+            index=idx,
+        )
+        features = FeatureEngine().compute(df)
+
+        seen_ctx: list[dict] = []
+
+        class _RecordingMetaLabeler:
+            is_trained = True
+
+            def predict(self, ctx: dict):
+                seen_ctx.append(dict(ctx))
+                return SimpleNamespace(take_trade=True, probability=0.9)
+
+        bt = Backtester(
+            data=df, strategies=["iron_condor"], initial_capital=100_000,
+            macro_event_gate=False, allow_live_model_fallback=False,
+            hurst_hard_veto_multiplier=0.0, hurst_regime_threshold=0.0,
+            iv_rank_rise_threshold=10.0, ic_min_credit=0.0,
+            ic_min_credit_width=0.0, iv_floor=0.01, features_cache=features,
+            meta_labeler=_RecordingMetaLabeler(),
+        )
+        bt.run()
+
+        assert seen_ctx, "meta_labeler.predict was never called"
+        hours = {ctx["hour_of_day"] for ctx in seen_ctx}
+        assert hours == {10}, (
+            f"the backtest's meta-label context must always carry the fixed "
+            f"RTH-plausible hour 10 (constant, not a clock read); saw {hours}"
+        )
         assert 9 <= 10 < 16, "the backtest constant must be inside ET RTH"
 
 

@@ -239,15 +239,81 @@ class TestR20LiveRegisterMigrations:
         assert (cap(15.0), cap(19.9), cap(20.0), cap(24.9), cap(25.0), cap(40.0)) \
             == (6, 6, 4, 4, 2, 2)
 
-    def test_manager_reads_config_not_literals(self):
-        import inspect
-        from ait.risk import manager
-        src = inspect.getsource(manager)
-        assert "credit_cap_vix_tiers" in src
-        assert "max_symbol_concentration_pct" in src
-        # the old literals must be gone from the validation path
-        assert "6 if request.vix < 20" not in src
-        assert "account_value * 0.20" not in src
+    async def test_manager_reads_config_not_literals(self):
+        """CENSUS-4 (2026-09-27): every existing risk test passes the
+        HISTORICAL DEFAULT values for credit_cap_vix_tiers/max_symbol_
+        concentration_pct, so none of them can tell a real config read
+        apart from a hardcoded literal that happens to match the default.
+        Drives the real RiskManager.validate_trade with NON-default values
+        for both and confirms they actually change the outcome, instead of
+        grepping manager.py's source for the field names."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from ait.risk.manager import RiskManager, TradeRequest
+
+        def _manager(risk_overrides: dict, open_positions=None,
+                    net_liq=200_000.0) -> RiskManager:
+            pos_config = MagicMock(max_open_positions=5, max_position_pct=0.05,
+                                   max_portfolio_delta=1.0, max_portfolio_risk_pct=0.20)
+            risk_config = MagicMock(
+                min_confidence=0.50, max_position_risk_pct=0.10,
+                max_credit_positions=6, credit_vix_halt=28.0,
+                credit_cap_vix_tiers=[[20.0, 6], [25.0, 4], [999.0, 2]],
+                max_symbol_concentration_pct=0.20,
+            )
+            for k, v in risk_overrides.items():
+                setattr(risk_config, k, v)
+            account = MagicMock()
+            account.get_net_liquidation = AsyncMock(return_value=net_liq)
+            account.can_afford = AsyncMock(return_value=True)
+            account.get_buying_power = AsyncMock(return_value=net_liq)
+            cb = MagicMock(is_tripped=False)
+            pdt = MagicMock()
+            pdt.can_open_position = MagicMock(return_value=(True, ""))
+            sizer = MagicMock()
+            sizer.calculate = MagicMock(
+                return_value=MagicMock(contracts=1, max_risk_dollars=500))
+            corr = MagicMock()
+            corr.check_correlation = MagicMock(return_value=(True, ""))
+            rm = RiskManager(pos_config, risk_config, account, cb, pdt, sizer,
+                             correlation_guard=corr, state=None)
+            rm._open_positions = open_positions or []
+            return rm
+
+        def _req(symbol="SPY", strategy="iron_condor", max_loss=2000.0):
+            return TradeRequest(
+                symbol=symbol, strategy=strategy, direction="neutral",
+                contracts=1, entry_price=1.0, confidence=0.95,
+                max_loss=max_loss, vix=18.0)
+
+        # credit_cap_vix_tiers: a tier of 1 (way below the historical
+        # default's 6) with one credit position already open must reject --
+        # the default tiers would have allowed this.
+        rm = _manager(
+            {"credit_cap_vix_tiers": [[999.0, 1]], "max_position_risk_pct": 0.50},
+            open_positions=[{"symbol": "QQQ", "strategy": "iron_condor",
+                             "max_loss": 500.0}],
+        )
+        v = await rm.validate_trade(_req(max_loss=500.0))
+        assert not v.approved and "short-premium cap" in v.reason, v.reason
+
+        # max_symbol_concentration_pct: a 5% cap on a trade sized at 7.5% of
+        # net liq must reject on concentration -- the default 20% would not.
+        # max_position_risk_pct raised so the (unrelated) per-trade gate
+        # doesn't fire first and mask which reason actually rejected this.
+        rm = _manager(
+            {"max_symbol_concentration_pct": 0.05, "max_position_risk_pct": 0.50},
+            net_liq=200_000.0,
+        )
+        v = await rm.validate_trade(_req(symbol="SPY", max_loss=15_000.0))
+        assert not v.approved and "concentration" in v.reason, v.reason
+
+        # Control: the same concentration trade at the historical-default
+        # 20% cap is approved -- proves the rejection above came from the
+        # CONFIGURED value, not some other gate.
+        rm = _manager({"max_position_risk_pct": 0.50}, net_liq=200_000.0)
+        v = await rm.validate_trade(_req(symbol="SPY", max_loss=15_000.0))
+        assert v.approved, v.reason
 
     def test_entry_signals_capture_shape(self):
         """R20: trade_context.entry_signals must carry the 11 technical

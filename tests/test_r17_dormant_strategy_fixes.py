@@ -90,15 +90,72 @@ class TestVolMagOverrideRespectsMasterGate:
 
 
 class TestLongStraddleExcludedFromDirectionInference:
-    def test_long_straddle_in_the_real_exclusion_tuple(self):
-        """Ties the test to the actual source, not a re-derived literal --
-        pre-fix, "long_straddle" was absent from this exact line."""
-        import inspect
-        src = inspect.getsource(TradingOrchestrator._process_completed_exits)
-        assert (
-            'if trade.strategy not in ("iron_condor", "short_strangle", '
-            '"long_straddle"):'
-        ) in src
+    """CENSUS-4 (2026-09-27): the class docstring's own admission --
+    "flagship offender" -- said it outright: "ties the test to the actual
+    source, not a re-derived literal." Rewritten to drive the real
+    TradingOrchestrator._process_completed_exits (same harness
+    test_r15_review_fixes.py's TestCommissionTrueUp already proves out,
+    reused here rather than rebuilt), and to assert on whether
+    orch._trainer.drift_detector.record_outcome actually gets called --
+    _exit_step silently swallows any exception a drift call raises
+    (orchestrator.py:1082-1088), so a positive control (a DIRECTIONAL
+    strategy that MUST record an outcome) is not optional here: without it,
+    a drift step that errors out looks identical to one that correctly
+    didn't run."""
+
+    def _orch(self, strategy: str, realized_pnl: float = 100.0):
+        orch = TradingOrchestrator.__new__(TradingOrchestrator)
+        state = MagicMock()
+        stats = SimpleNamespace(total_pnl=0.0, trades_won=0, trades_lost=0,
+                                trades_taken=0)
+        state.get_daily_stats.return_value = stats
+        state.total_commission.return_value = 0.0
+        state.count_executions_with_commission.return_value = 0
+        orch._state = state
+        trade = SimpleNamespace(
+            trade_id="T-DIR", symbol="SPY", strategy=strategy,
+            contract_type=strategy, quantity=1, entry_time=None,
+            legs="[]", direction=SimpleNamespace(value="long"))
+        orch._find_trade_by_id = lambda tid: trade
+        orch._circuit_breaker = MagicMock()
+        orch._thompson = MagicMock()
+        orch._pdt_guard = MagicMock()
+        orch._trainer = MagicMock()
+        orch._exit_attempts = {}
+
+        async def _notify(m):
+            pass
+
+        orch._send_notification = _notify
+        ex = {"trade_id": "T-DIR", "realized_pnl": realized_pnl,
+              "exit_reason": "take_profit", "exit_price": 1.0}
+        return orch, ex
+
+    async def _run(self, strategy: str) -> MagicMock:
+        orch, ex = self._orch(strategy)
+        await orch._process_completed_exits([ex])
+        return orch._trainer.drift_detector.record_outcome
+
+    async def test_iron_condor_is_excluded(self):
+        record_outcome = await self._run("iron_condor")
+        record_outcome.assert_not_called()
+
+    async def test_short_strangle_is_excluded(self):
+        record_outcome = await self._run("short_strangle")
+        record_outcome.assert_not_called()
+
+    async def test_long_straddle_is_excluded(self):
+        record_outcome = await self._run("long_straddle")
+        record_outcome.assert_not_called()
+
+    async def test_a_directional_strategy_control_still_records(self):
+        """The mandatory positive control: proves the drift step actually
+        runs (and _exit_step's exception-swallowing isn't hiding a silent
+        failure) for a strategy that SHOULD feed the drift detector."""
+        record_outcome = await self._run("long_call")
+        record_outcome.assert_called_once()
+        assert record_outcome.call_args.kwargs["trade_id"] == "SPY-bullish"
+        assert record_outcome.call_args.kwargs["actual_direction"] == "bullish"
 
 
 class TestRestateDailystatsDerivesWinLoss:

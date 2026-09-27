@@ -20,6 +20,7 @@ from ait.data.options_chain import (
     OptionsChain,
     OptionsChainService,
 )
+from ait.strategies.base import SignalDirection
 
 
 def _c(strike, right, iv=0.20, delta=0.2, bid=1.0, ask=1.2):
@@ -108,20 +109,69 @@ class TestDegradedGreeksGateIsReArmed:
         from ait.strategies.iron_condor import IronCondor
         return IronCondor.__new__(IronCondor)
 
+    def _wide_chain(self, delta: float, iv_is_guessed: bool) -> OptionsChain:
+        """2 calls + 2 puts, all liquid, so only the gate under test (not the
+        `len(liquid_*) < 2` guard) can be the reason for a rejection."""
+        chain = _chain(
+            [_c(100.0, "C", delta=delta), _c(105.0, "C", delta=delta)],
+            [_c(95.0, "P", delta=-delta), _c(90.0, "P", delta=-delta)],
+        )
+        chain.iv_is_guessed = iv_is_guessed
+        return chain
+
     def test_a_guessed_iv_chain_is_rejected(self):
-        """Before W19 this was unreachable: backfill gives every contract a
-        non-zero delta, so 'no deltas at all' never happened."""
-        import inspect
-        from ait.strategies import iron_condor as IC
-        src = inspect.getsource(IC.IronCondor.generate_signals)
-        assert "iv_is_guessed" in src, "the gate must consult the guessed-IV flag"
-        assert src.index("iv_is_guessed") < src.index("not any(abs(p.delta) > 0"), \
-            "the guessed-IV check must run BEFORE the unreachable legacy check"
+        """CENSUS-4 (2026-09-27): mutation-verified the ORIGINAL claim (byte-
+        offset ordering between the two checks) has NO observable effect --
+        both return [] with the identical 'degraded_greeks' reason, so their
+        relative order is unobservable. What actually matters, and what this
+        drives for real through IronCondor.generate_signals: the guessed-IV
+        check fires BEFORE strike selection, so a guessed chain with
+        technically-nonzero (but wildly off-target) deltas still reports
+        degraded_greeks -- not a later, unrelated rejection reason."""
+        strategy = self._strategy()
+
+        # Good deltas (0.20, on-target): guessed -> rejected; the SAME chain
+        # unflagged -> an actual signal (the gate, not incidental data, is
+        # what's rejecting it).
+        guessed = self._wide_chain(delta=0.20, iv_is_guessed=True)
+        sigs = strategy.generate_signals(
+            "SPY", guessed, SignalDirection.NEUTRAL, confidence=0.6, iv_rank=50.0)
+        assert sigs == []
+        assert strategy.last_entry_reason == "degraded_greeks"
+
+        unguessed = self._wide_chain(delta=0.20, iv_is_guessed=False)
+        strategy.generate_signals(
+            "SPY", unguessed, SignalDirection.NEUTRAL, confidence=0.6, iv_rank=50.0)
+        assert strategy.last_entry_reason != "degraded_greeks", (
+            "an unflagged, on-target chain must clear the guessed-IV gate "
+            "(it may still be rejected downstream by an unrelated economic "
+            "gate -- em_gate, credit floor, etc. -- on this synthetic chain, "
+            "which is not what this test is checking)"
+        )
+
+        # 0.9-magnitude deltas: nonzero, so the LEGACY check alone would NOT
+        # catch this -- it would fall through to strike selection, which (0.9
+        # is far outside the 0.20+/-0.07 tolerance) would reject with
+        # short_put_outside_delta_tolerance instead. Guessed must still win.
+        guessed_offtarget = self._wide_chain(delta=0.9, iv_is_guessed=True)
+        sigs = strategy.generate_signals(
+            "SPY", guessed_offtarget, SignalDirection.NEUTRAL,
+            confidence=0.6, iv_rank=50.0)
+        assert sigs == []
+        assert strategy.last_entry_reason == "degraded_greeks", (
+            "the guessed-IV check must fire before strike selection even "
+            "when deltas are technically nonzero"
+        )
 
     def test_the_legacy_no_delta_check_is_retained(self):
         """Keep it: a chain that somehow arrives with all-zero deltas and a
-        usable IV is still meaningless for delta selection."""
-        import inspect
-        from ait.strategies import iron_condor as IC
-        src = inspect.getsource(IC.IronCondor.generate_signals)
-        assert src.count("degraded_greeks") >= 2
+        usable (unguessed) IV is still meaningless for delta selection."""
+        strategy = self._strategy()
+        chain = self._wide_chain(delta=0.0, iv_is_guessed=False)
+        sigs = strategy.generate_signals(
+            "SPY", chain, SignalDirection.NEUTRAL, confidence=0.6, iv_rank=50.0)
+        assert sigs == []
+        assert strategy.last_entry_reason == "degraded_greeks", (
+            "an unguessed chain with all-zero deltas must still be caught by "
+            "the legacy check"
+        )

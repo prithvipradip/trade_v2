@@ -197,16 +197,51 @@ class TestTrainerBothSidesShareOneConvention:
     prevent it.
     """
 
-    def test_artifact_mtimes_are_read_in_et(self):
-        import inspect
+    def test_artifact_mtimes_are_read_in_et(self, host_tz):
+        """CENSUS-4 (2026-09-27): the original check had a live bug of its
+        own -- `tr._ModelTrainer` has never existed (only `ModelTrainer`
+        does), so `hasattr(tr, "_ModelTrainer")` was always False and the
+        getsource call always grepped the WHOLE MODULE, not the intended
+        method. Drives the real _artifact_train_date() instead: writes an
+        artifact whose mtime sits at an ET instant that falls on a
+        DIFFERENT calendar date than the host-local zone would read it as
+        (proving the test isn't vacuous), and asserts the recovered date is
+        the ET one."""
+        import os
+        from datetime import datetime
 
-        import ait.ml.trainer as tr
+        from ait.ml.trainer import ModelTrainer
 
-        src = inspect.getsource(tr._ModelTrainer if hasattr(tr, "_ModelTrainer")
-                                else tr)
-        assert "fromtimestamp(f.stat().st_mtime, tz=" in src, (
-            "the artifact mtime is read in host-local time while the date it is "
-            "compared against is ET — the two sides disagree"
+        host_tz(BERLIN)
+        import ait.ml.range_predictor as _rp
+
+        # trained_at / model_version are tried FIRST (highest priority) --
+        # leave them unset so the mtime fallback actually runs.
+        trainer = ModelTrainer.__new__(ModelTrainer)
+        trainer._range_predictor = None
+        trainer._vol_mag_predictor = None
+        from types import SimpleNamespace
+        trainer._predictor = SimpleNamespace(model_version="")
+
+        # 23:00 ET on the 17th is 05:00 CEST on the 18th -- host-local and ET
+        # calendar dates disagree, so a naive (host-local) mtime read would
+        # recover the WRONG date.
+        et_instant = datetime(2026, 9, 17, 23, 0, tzinfo=ET)
+        f = _rp.MODEL_DIR / "ensemble.pkl"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_bytes(b"x")
+        os.utime(f, (et_instant.timestamp(), et_instant.timestamp()))
+        host_local_date = datetime.fromtimestamp(et_instant.timestamp()).date()
+        assert host_local_date != et_instant.date(), (
+            "test setup bug: host-local and ET dates must actually disagree "
+            "for this to prove anything"
+        )
+
+        recovered = trainer._artifact_train_date()
+        assert recovered == et_instant.date(), (
+            f"recovered {recovered}, the host-local date {host_local_date} -- "
+            "the artifact mtime is being read in host-local time while the "
+            "date it is compared against is ET"
         )
 
     def test_recovered_date_is_an_et_date(self, tmp_path, host_tz):

@@ -67,12 +67,86 @@ class TestSweepCasNarrowed:
         assert "from_statuses" in inspect.signature(
             StateManager.close_trade).parameters
 
-    def test_sweep_passes_pending_only(self):
-        from ait.execution import reconciler
-        src = inspect.getsource(reconciler.PositionReconciler._sweep_stale_pending)
-        assert "from_statuses=(TradeStatus.PENDING,)" in src
-        # and the sweep must consult working orders before booking fiction
-        assert "_cancel_working_entry_order" in src
+    def test_sweep_passes_pending_only(self, tmp_path):
+        """CENSUS-4 (2026-09-27): three real behaviors, none previously
+        covered -- every existing sweep test (test_w26_*, test_r19_state_ml_
+        fixes.py) stubs _cancel_working_entry_order=False and never checks
+        from_statuses at all."""
+        import json
+        from datetime import timedelta
+        from unittest.mock import MagicMock
+
+        from ait.bot.state import StateManager, TradeDirection, TradeRecord, TradeStatus
+        from ait.execution.reconciler import NEVER_FILLED_EXIT_REASON, PositionReconciler
+        from ait.utils.time import now_et
+        from tests.test_w26_budget_and_cluster_cooldown import (
+            CONDOR_LEGS, _pending_trade, _reconciler, _state_with,
+        )
+
+        # (a) THE from_statuses NARROWING, against a REAL StateManager --
+        # not a MagicMock told what to return, the genuine CAS SQL. A trade
+        # that races to FILLED between the sweep's snapshot and its close
+        # attempt must survive as FILLED, not get force-closed to fiction.
+        db = tmp_path / "state.db"
+        state = StateManager(db_path=db)
+        stale_entry = (now_et() - timedelta(minutes=40)).isoformat()
+        state.record_trade(TradeRecord(
+            trade_id="T-RACE", symbol="SPY", strategy="iron_condor",
+            direction=TradeDirection.SHORT, status=TradeStatus.PENDING,
+            entry_time=stale_entry, entry_price=1.50, quantity=1,
+            contract_type="iron_condor", legs=json.dumps(CONDOR_LEGS)))
+        # The race: a concurrent writer promotes it to FILLED before the
+        # sweep's own close_trade CAS attempt runs.
+        assert state.transition("T-RACE", (TradeStatus.PENDING,), TradeStatus.FILLED)
+
+        rec = PositionReconciler.__new__(PositionReconciler)
+        rec._state = state
+        rec._ibkr = MagicMock()
+        rec._live_ibkr_leg_keys = lambda: {("XXX", "P", 1.0, "20261218")}
+        rec._cancel_working_entry_order = lambda tr: False
+        rec._refund_entry_budget = lambda tr: None
+        # get_open_trades() would no longer return T-RACE (it's FILLED, not
+        # PENDING) -- simulate the exact race by handing the sweep a stale
+        # PENDING snapshot directly, same technique reconciler.py's own
+        # comment describes ("a concurrent writer may have moved the trade
+        # since get_open_trades()").
+        stale_snapshot = TradeRecord(
+            trade_id="T-RACE", symbol="SPY", strategy="iron_condor",
+            direction=TradeDirection.SHORT, status=TradeStatus.PENDING,
+            entry_time=stale_entry, entry_price=1.50, quantity=1,
+            contract_type="iron_condor", legs=json.dumps(CONDOR_LEGS))
+        state.get_open_trades = lambda: [stale_snapshot]
+
+        booked = rec._sweep_stale_pending()
+        assert booked == 0, "a row that raced to FILLED must not be counted as closed"
+        after = state.get_trade_by_id("T-RACE")
+        assert after.status == TradeStatus.FILLED, (
+            f"from_statuses=(PENDING,) must refuse the CAS once the row is "
+            f"no longer PENDING -- got {after.status}"
+        )
+
+        # (b) A WORKING entry order must be deferred, not booked as fiction.
+        today = now_et().date()
+        trade_b = _pending_trade(trade_id="T-WORKING")
+        state_b = _state_with(trade_b, {today: 1})
+        rec_b = _reconciler(state_b)
+        rec_b._cancel_working_entry_order = lambda tr: True
+        assert rec_b._sweep_stale_pending() == 0
+        state_b.close_trade.assert_not_called()
+
+        # (c) Control: a genuinely stale PENDING trade with no working order
+        # still closes normally -- proves (a)/(b) didn't just disable the
+        # sweep entirely.
+        trade_c = _pending_trade(trade_id="T-STALE")
+        state_c = _state_with(trade_c, {today: 1})
+        rec_c = _reconciler(state_c)
+        assert rec_c._sweep_stale_pending() == 1
+        assert state_c.close_trade.call_args.kwargs["exit_reason_detailed"] == (
+            NEVER_FILLED_EXIT_REASON
+        )
+        assert state_c.close_trade.call_args.kwargs["from_statuses"] == (
+            TradeStatus.PENDING,
+        )
 
 
 class TestRuntimeEnvContract:
