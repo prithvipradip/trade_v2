@@ -10157,3 +10157,192 @@ both waiting on TWS reachable during an RTH session; **W54** waiting on the oper
 No inspect.getsource — this entry touches no test files, only reports a suite run.
 
 ---
+
+## 2026-09-27 - REGISTER CORRECTION: the getsource census worklist was never lost — CENSUS-5's
+own entry said otherwise, plus a 3-site discrepancy the rediscovery surfaced
+
+No code in this entry — a pointer/labeling fix only, same register-only discipline as every
+prior REGISTER CORRECTION entry (2026-09-17, 2026-09-21, twice on 2026-09-22). Found while
+researching CENSUS-1: the CENSUS-5 entry above claims "the original per-site worklist was
+never written into PLAN.md... lived in that session's now-gone local plan file." **That's
+wrong.** PLAN.md `:7042-7096` — a 2026-09-21 "CONTINUITY NOTE" entry — copied the full
+5-batch worklist in FULL, explicitly BECAUSE its own author foresaw the local plan file
+(`~/.claude/plans/staged-weaving-milner.md`) wouldn't survive to a new session: "Treat the
+local plan file as gone from here on; nothing this project needs going forward should
+depend on it." It was never lost. This session's earlier search for it (before CENSUS-5)
+simply didn't find it. Per this register's own standing rule ("correct the register the
+moment the correction is found, not when the fix ships") — not editing the CENSUS-5 entry
+itself, appending this instead.
+
+Cross-checking the rediscovered original list against CENSUS-5's actual work found it was
+correct on every site it touched, with one genuine value-add: CENSUS-5's own fresh
+re-derivation classified `test_w28_et_date_authority.py:188` as delete-only, while the
+ORIGINAL 2026-09-21 list had filed it under the 9-item "legitimate, don't touch" bucket —
+inconsistently, since that SAME original entry also separately noted it as "delete rather
+than rewrite when reached." CENSUS-5 resolved that pre-existing contradiction correctly by
+actually deleting it (already recorded in CENSUS-5's own entry).
+
+**A second thing this rediscovery surfaces, not yet verified or fixed**: the original
+list's own "Batch E — delete-only (~6 sites)" names 3 sites CENSUS-5 never touched, because
+this session's independent fresh re-derivation (done before this rediscovery) classified
+them as "needs rewrite" instead: `test_r16_tail_fixes.py:590-half`,
+`test_r16_research_fixes.py:159`, `test_r15_review_fixes.py:293`. The original entry's own
+one-line justification for each ("each already has an executable assertion in the same
+test proving the same claim") was itself never independently re-checked before being
+written (that entry says so of itself: "nothing below has been re-checked since it was
+first computed"). Two independent classifications disagree and neither has been proven
+against current source. Registered, not resolved here — whoever next touches a delete-only
+pass or those three files should verify directly (the same read-both-sides discipline
+CENSUS-5 used for its own 6 sites) rather than trust either list blindly.
+
+STATE AT HANDOFF: this entry only — a pointer correction and an open discrepancy, no code
+or test file touched.
+
+NEXT: the rediscovered `PLAN.md:7042-7096` worklist should be treated as the authoritative
+starting point for CENSUS-2/3/4 (not re-derived from zero each time the way this session
+did for CENSUS-1, now that it's known to still be there) — but per that same entry's own
+warning, "re-verify line numbers before deep-diving any one batch," since nothing in it has
+been checked against current source except what CENSUS-1/5 have now covered. The 3-site
+discrepancy above is a smaller, standalone open item for whenever a delete-only pass is
+next convenient.
+
+No inspect.getsource — this entry doesn't touch test files.
+
+---
+
+## 2026-09-27 - CENSUS-1 EXECUTED — the recorder-harness rewrite batch of the test-honesty
+`inspect.getsource` census, 8 sites, zero production changes
+
+SCOPE. The "recorder-harness lift" batch (register's own "highest leverage" label,
+`PLAN.md:7060-7065`), confirmed as exactly 8 sites two ways — a fresh independent
+Explore re-derivation done before finding the rediscovered original list, and that
+original list itself (see the REGISTER CORRECTION entry above) — which agree exactly:
+`test_r20_research_validity.py:274,391`, `test_r16_research_fixes.py:140,141,222,292,
+316,448`. All 8 rewritten into real executable coverage; zero deleted (unlike CENSUS-5,
+every one of these had a genuine wiring/behavior claim worth actually proving, not a
+redundant duplicate of coverage already sitting nearby).
+
+THE REUSABLE PATTERN, already proven before this wave touched it: `test_r20_research_
+validity.py:106-138`'s `_RecordingBacktester`/`_recorder_factory`/`_run_window` — plain
+module-level helpers (not fixtures) that drive the REAL `WalkForwardBacktester.
+_run_single_window` and record every kwarg the resulting `Backtester(...)` call receives.
+Already imported by three sibling files (`test_post_event_study_injection.py`, `test_take_
+profit_study_injection.py`, `test_w52a_engine_store_path.py`) for genuinely real,
+executable assertions — not a promising-looking helper taken on faith, a working one this
+wave extended to `test_r16_research_fixes.py` for the first time (`import ait.backtesting.
+walkforward as wf_mod`, `from tests.test_r20_research_validity import _recorder_factory,
+_run_window` — deliberately NOT importing r20's `synth_df`/`synth_features`, which would
+collide with r16's own identically-defined local fixtures of the same name).
+
+FIX (test-only; zero `src/ait` changes — every rewrite drives EXISTING, already-correct
+`src/ait` behavior; nothing here needed a production fix):
+1. `test_r16_research_fixes.py:140/141` (`TestLookAheadFence.test_walkforward_wires_
+   fallback_off_for_oos_and_shadow`) — drives the real OOS Backtester construction (via
+   the harness) AND the real shadow Backtester construction
+   (`wf._train_window_meta_labeler(...)`, the exact pattern the sibling files already
+   proved works), reads back the actual `allow_live_model_fallback` kwarg each received,
+   instead of grepping two methods' source for the literal string.
+2. `test_r16_research_fixes.py:222` (`TestDirectionPredictorFence.test_walkforward_
+   window_training_never_persists`) — the harness can't reach this (not a `Backtester`
+   kwarg; `WalkForwardBacktester._train_window_model` constructs its own
+   `DirectionPredictor` internally). Reused the file's own existing `_train_with_dummies`
+   technique (patch `_train_xgboost`/`_train_lightgbm` with a dummy model, spy on
+   `_save_models` at CLASS level since `_train_window_model` builds its own instance) —
+   but through the real `wf._train_window_model(...)` call, not `DirectionPredictor`
+   constructed directly. **A real trap found and avoided**: `synth_df`'s training slice
+   is only 49 rows, below `MLConfig().min_training_samples=100` — training would silently
+   return `{}` before ever reaching the save decision, making a naive rewrite pass
+   without testing anything. Used a fresh 400-business-day synthetic frame instead (same
+   shape the file's own `_train_with_dummies` helper already uses for exactly this
+   reason).
+3. `test_r16_research_fixes.py:292` (`TestRangeGateContract.test_run_single_window_uses_
+   resolver`) — the SIBLING test `test_threshold_resolver` (unchanged, already real)
+   already exhaustively proves `_resolve_oos_range_min_conf`'s own pure logic; this
+   site's actual job was always the WIRING claim, that `_run_single_window` really calls
+   it with the real range-training outcome. Patches `_train_window_range_model` to
+   return a failure shape and a success shape, drives the real `_run_single_window` (via
+   the harness), and reads the resolved `range_min_confidence` back off the real OOS
+   Backtester's own kwargs — confirmed failure blocks (1.0), success keeps the
+   configured threshold (0.55).
+4. `test_r16_research_fixes.py:316` (`TestTrainWindowModelsFlag.test_run_single_window_
+   gates_range_training`) — traced the exact source (`walkforward.py:1230-1235`) before
+   designing: when `train_window_models=False`, `_run_single_window` takes an early-exit
+   branch that hardcodes `_range_result = (None, "disabled_by_config", 0.05)` and NEVER
+   calls `_train_window_range_model` (or, further down, `_train_window_range_model_
+   inprocess`) at all — confirming the sibling test `test_pretrain_skipped_when_disabled`
+   (unchanged; tests a DIFFERENT method, `_pretrain_range_models`) proves a related but
+   not identical claim. Reused that same test's own `_explode`-if-called spy technique on
+   `_train_window_range_model_inprocess`, through `_run_single_window` this time — proves
+   BOTH that range training is never attempted when disabled AND that the OOS Backtester
+   runs ungated at the configured threshold, not blocked at 1.0.
+5. `test_r16_research_fixes.py:448` (`TestBlackoutWiring.test_walkforward_passes_field_
+   through`) — kept the existing (already real) default-value assertion, replaced the
+   source-string half with the harness: `WalkForwardConfig(pre_event_blackout_days=3)`
+   in, `sink[-1]["pre_event_blackout_days"] == 3` out.
+6. `test_r20_research_validity.py:274` (`TestOptunaParamsReachEngine.test_walkforward_
+   threads_baselines_to_optimizer`) — the sibling `test_baselines_threaded_from_
+   constructor` (unchanged) already proves `StrategyOptimizer` → trial `Backtester`
+   wiring; this site's own job was the missing link one level up — that
+   `_optimize_window_params` actually constructs `StrategyOptimizer` (imported locally
+   inside the method, `walkforward.py:1726`) with the walk-forward config's own
+   baselines. Stubbed `StrategyOptimizer` itself at its import site
+   (`ait.optimization.optimizer`) to record its constructor kwargs and return a minimal
+   real-shaped result (`SimpleNamespace(best_params={}, best_value=0.0, study=None)` —
+   confirmed safe by reading `_build_optuna_window_data`'s own `getattr(res, "study",
+   None)` guard before relying on it), called the real `_optimize_window_params(...)`,
+   asserted the recorded kwargs match the configured baselines exactly.
+7. `test_r20_research_validity.py:391` (`TestMetaLabelerAblationGate.test_run_wires_
+   meta_status_into_result`) — the three sibling tests in the same class (unchanged)
+   already prove `_run_single_window`'s own meta-labeler gating in isolation; this site's
+   job was that the TOP-LEVEL `run()` orchestration actually surfaces that per-window
+   status on its returned `WalkForwardResult` across real generated windows, not a
+   single hand-built one. Found `run(data=...)` accepts pre-supplied data directly (per
+   an existing sibling test's own pattern, `test_r16_research_fixes.py`'s
+   `test_run_normalizes_provided_data_defensively`) — no need to mock
+   `market_data.load_daily_ohlcv` at all. Ran the real `asyncio.run(wf.run(data=
+   {"SPY": synth_df}))` under a shortened window config (`train_days=120, test_days=30,
+   step_days=30, gap_days=5`, fitting inside `synth_df`'s 160 business days) with
+   `train_window_models=False` (fast, no real ML), asserted `meta_training_status` was
+   populated for real generated windows.
+Also added the missing `import asyncio` `test_r20_research_validity.py` needed for item 7
+(this file never imported it before; `test_r16_research_fixes.py` already had it).
+
+PROOF. Both files' full suites re-run: `test_r16_research_fixes.py` 39/39 (unchanged count
+— in-place rewrites, no tests added or removed), `test_r20_research_validity.py` 30/30
+(unchanged count, same reason). The three sibling files depending on the shared harness
+(`test_post_event_study_injection.py`, `test_take_profit_study_injection.py`, `test_w52a_
+engine_store_path.py`) re-run standalone: 50/50, confirming extending the harness to a new
+file didn't disturb it. `python -m compileall -q tests`: OK. Census recount, same
+reconciliation method as CENSUS-5 (excluding `test_w23_scheduler_timezone.py` and the 2
+known prose mentions): **27 real sites remain, still across 12 files** — exactly 35 minus
+this batch's 8, both files still carrying other (legitimate or later-batch) getsource
+sites so neither drops out of the file count.
+
+Design decisions made while implementing, not assumed from the plan: item 3's original
+design (per the plan) sketched a 5-row outcome table; simplified to 2 rows (failure,
+success) once `test_threshold_resolver` was found already covering the pure resolver
+logic exhaustively — testing the WIRING claim only, not re-testing logic a sibling test
+already owns. Item 4's spy target was confirmed by tracing the exact early-exit branch in
+`walkforward.py` (`_train_window_range_model_inprocess` is provably unreachable when
+`train_window_models=False`, not merely assumed unreachable) before writing the test.
+
+STATE AT HANDOFF. Test-file-only changes across 2 files; zero `src/ait` files touched,
+zero config changes. Nothing to deploy or restart. Full fast lane kicked off in the
+background at this entry's writing; its result folds into the NEXT entry, same
+register-don't-block discipline every wave this session has used.
+
+NEXT, naming every open item explicitly: **CENSUS-2** (exit-policy/engine, ~7 sites —
+`PLAN.md:7066-7068` names them, re-verify against current source before deep-diving, per
+that entry's own warning), **CENSUS-3** (`master.py`/entrypoint, ~3, "the expensive one
+despite fewest sites"), **CENSUS-4** (scattered moderates, ~7) — all independent, no
+urgency, the rediscovered original worklist now the starting point rather than re-derived
+from zero. The 3-site delete-only discrepancy from the REGISTER CORRECTION entry above.
+Separately: **W53's placing run** and **W55's live validation run** both still wait on
+TWS reachable during an RTH session; **W54** waits on the operator; **W56/57**; **W52a's
+four items**; the dormant `get_chain_for_expiry` bug; **`test_watchdog.py`**'s
+load-sensitivity discrepancy, three data points in, still unresolved.
+
+No inspect.getsource — every test this wave touched now drives the real code path; the
+rewrites themselves are proof positive (grep-verified above).
+
+---

@@ -30,6 +30,7 @@ Every test here FAILED against the pre-R20 tree (run log in the R20 report).
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from datetime import date
 from types import SimpleNamespace
@@ -270,10 +271,34 @@ class TestOptunaParamsReachEngine:
         assert bt._iv_rank_rise_threshold == pytest.approx(0.42)
         assert bt._min_edge_over_baseline == pytest.approx(0.09)
 
-    def test_walkforward_threads_baselines_to_optimizer(self):
-        src = inspect.getsource(WalkForwardBacktester._optimize_window_params)
-        assert "iv_rank_rise_threshold=self._config.iv_rank_rise_threshold" in src
-        assert "min_edge_over_baseline=self._config.min_edge_over_baseline" in src
+    def test_walkforward_threads_baselines_to_optimizer(self, synth_df, monkeypatch):
+        """CENSUS-1 (2026-09-27): test_baselines_threaded_from_constructor
+        above already proves StrategyOptimizer->Backtester wiring; this test's
+        own job is the missing link -- that _optimize_window_params actually
+        constructs StrategyOptimizer with the walk-forward config's baselines,
+        not a StrategyOptimizer built some other way. Stubs StrategyOptimizer
+        itself (imported locally inside the method) to record its own
+        constructor kwargs, instead of checking the literal source text."""
+        import ait.optimization.optimizer as optimizer_mod
+
+        captured: dict = {}
+
+        class _RecordingOptimizer:
+            def __init__(self, **kwargs) -> None:
+                captured.update(kwargs)
+
+            def run(self, data, prior_params=None):
+                return SimpleNamespace(best_params={}, best_value=0.0, study=None)
+
+        monkeypatch.setattr(optimizer_mod, "StrategyOptimizer", _RecordingOptimizer)
+        cfg = WalkForwardConfig(
+            iv_rank_rise_threshold=0.44, min_edge_over_baseline=0.11)
+        wf = WalkForwardBacktester(["SPY"], ["iron_condor"], config=cfg)
+        wf._optimize_window_params(synth_df, "SPY", 1, ["iron_condor"])
+
+        assert captured, "StrategyOptimizer was never constructed"
+        assert captured["iv_rank_rise_threshold"] == pytest.approx(0.44)
+        assert captured["min_edge_over_baseline"] == pytest.approx(0.11)
 
     def test_max_hold_days_changes_iron_condor_trial(self, synth_df, synth_features):
         # End-to-end guard: changing max_hold_days must change IC exits.
@@ -387,11 +412,32 @@ class TestMetaLabelerAblationGate:
         assert "disabled_by_config" in text
         assert "not_trained" in text
 
-    def test_run_wires_meta_status_into_result(self):
-        src = inspect.getsource(WalkForwardBacktester.run)
-        assert "meta_training_status" in src, (
-            "run() must surface per-window meta-labeler status like "
-            "range_training_status"
+    def test_run_wires_meta_status_into_result(self, synth_df, monkeypatch):
+        """CENSUS-1 (2026-09-27): the three tests above already prove
+        _run_single_window's own meta-labeler gating; this test's own job is
+        that the top-level run() orchestration actually SURFACES that
+        per-window status on its returned WalkForwardResult -- driven end to
+        end with real windows generated from synth_df, not a source-text
+        check. train_window_models=False keeps this fast (no real ML)."""
+        cfg = WalkForwardConfig(
+            train_window_models=False, train_days=120, test_days=30,
+            step_days=30, gap_days=5)
+        wf = WalkForwardBacktester(["SPY"], ["iron_condor"], config=cfg)
+        monkeypatch.setattr(wf_mod, "Backtester", _recorder_factory([]))
+
+        result = asyncio.run(wf.run(data={"SPY": synth_df}))
+
+        assert result.meta_training_status, (
+            "run() must populate meta_training_status from real windows"
+        )
+        assert all(
+            "SPY" in per_symbol
+            for per_symbol in result.meta_training_status.values()
+        )
+        assert all(
+            status == "disabled_by_config"
+            for per_symbol in result.meta_training_status.values()
+            for status in per_symbol.values()
         )
 
 

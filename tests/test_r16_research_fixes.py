@@ -27,11 +27,13 @@ import asyncio
 import inspect
 import pickle
 from datetime import date, timedelta
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
 
+import ait.backtesting.walkforward as wf_mod
 from ait.backtesting.engine import (
     NEUTRAL_CREDIT_GATED,
     Backtester,
@@ -43,6 +45,11 @@ from ait.backtesting.walkforward import (
     WindowResult,
 )
 from ait.config.settings import MLConfig
+
+from tests.test_r20_research_validity import (  # noqa: F401 — shared harness
+    _recorder_factory,
+    _run_window,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -136,11 +143,28 @@ class TestLookAheadFence:
         )
         assert bt._predictor is sentinel
 
-    def test_walkforward_wires_fallback_off_for_oos_and_shadow(self):
-        src_oos = inspect.getsource(WalkForwardBacktester._run_single_window)
-        src_meta = inspect.getsource(WalkForwardBacktester._train_window_meta_labeler)
-        assert "allow_live_model_fallback=False" in src_oos
-        assert "allow_live_model_fallback=False" in src_meta
+    def test_walkforward_wires_fallback_off_for_oos_and_shadow(self, synth_df, monkeypatch):
+        """CENSUS-1 (2026-09-27): drives the real OOS Backtester construction
+        (_run_single_window, via the harness) and the real shadow Backtester
+        construction (_train_window_meta_labeler), and reads back the actual
+        allow_live_model_fallback kwarg each one was built with -- instead of
+        checking the literal string was present in source."""
+        cfg = WalkForwardConfig(train_window_models=False)
+        wf = WalkForwardBacktester(["SPY"], ["iron_condor"], config=cfg)
+
+        sink_oos: list = []
+        monkeypatch.setattr(wf_mod, "Backtester", _recorder_factory(sink_oos))
+        _run_window(wf, synth_df)
+        assert sink_oos, "no OOS Backtester was constructed"
+        assert sink_oos[-1]["allow_live_model_fallback"] is False
+
+        sink_meta: list = []
+        monkeypatch.setattr(wf_mod, "Backtester", _recorder_factory(sink_meta))
+        wf._train_window_meta_labeler(
+            train_df=synth_df, symbol="SPY", window_id=1,
+            predictor=None, window_cfg=cfg)
+        assert sink_meta, "shadow Backtester was not constructed"
+        assert sink_meta[-1]["allow_live_model_fallback"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -218,9 +242,44 @@ class TestDirectionPredictorFence:
         assert accs
         assert calls == [1], "default (live) training keeps persisting"
 
-    def test_walkforward_window_training_never_persists(self):
-        src = inspect.getsource(WalkForwardBacktester._train_window_model)
-        assert "persist_artifacts=False" in src, (
+    def test_walkforward_window_training_never_persists(self, monkeypatch):
+        """CENSUS-1 (2026-09-27): drives the real
+        WalkForwardBacktester._train_window_model end to end (same
+        _train_with_dummies technique as test_persist_artifacts_false_never_
+        saves above, just through the walk-forward caller instead of
+        DirectionPredictor directly). synth_df's training slice is only 49
+        rows -- below MLConfig().min_training_samples=100 -- so training
+        would silently return {} before ever reaching the save decision;
+        a 400-row frame is used instead so the claim is actually exercised."""
+        from ait.ml.ensemble import DirectionPredictor
+
+        def fake_xgb(self, X, y, tscv):
+            self._models["xgboost"] = _DummyModel()
+            return 0.6
+
+        def fake_lgbm(self, X, y, tscv):
+            self._models["lightgbm"] = _DummyModel()
+            return 0.6
+
+        monkeypatch.setattr(DirectionPredictor, "_train_xgboost", fake_xgb)
+        monkeypatch.setattr(DirectionPredictor, "_train_lightgbm", fake_lgbm)
+        save_calls: list[int] = []
+        monkeypatch.setattr(
+            DirectionPredictor, "_save_models",
+            lambda self: save_calls.append(1))
+
+        idx = pd.bdate_range("2022-01-03", periods=400)
+        rng = np.random.default_rng(3)
+        close = 100 * np.exp(np.cumsum(rng.normal(0.0002, 0.01, len(idx))))
+        train_df = pd.DataFrame(
+            {"Open": close, "High": close * 1.01, "Low": close * 0.99,
+             "Close": close, "Volume": 1e6},
+            index=idx,
+        )
+        wf = WalkForwardBacktester(["SPY"], ["iron_condor"], config=WalkForwardConfig())
+        result = wf._train_window_model(train_df, "SPY", 1)
+        assert result is not None, "training should still succeed"
+        assert save_calls == [], (
             "window models must never be persisted (live ensemble.pkl clobber)"
         )
 
@@ -288,9 +347,35 @@ class TestRangeGateContract:
         )
         assert wr.range_model_status == {"SPY": "ok"}
 
-    def test_run_single_window_uses_resolver(self):
-        src = inspect.getsource(WalkForwardBacktester._run_single_window)
-        assert "self._resolve_oos_range_min_conf(" in src
+    def test_run_single_window_uses_resolver(self, synth_df, monkeypatch):
+        """CENSUS-1 (2026-09-27): test_threshold_resolver above already proves
+        _resolve_oos_range_min_conf's own logic exhaustively -- this test's
+        job is the WIRING claim: that _run_single_window actually calls it
+        with the REAL range-training outcome, not just that the resolver
+        works in isolation. Drives the real _run_single_window (via the
+        harness) with _train_window_range_model returning a failure and a
+        success shape, and reads the resolved threshold back off the real
+        OOS Backtester's own kwargs."""
+        cfg = WalkForwardConfig(train_window_models=True, range_min_confidence=0.55)
+
+        def _patched(range_result):
+            wf = WalkForwardBacktester(["SPY"], ["iron_condor"], config=cfg)
+            monkeypatch.setattr(wf, "_train_window_model", lambda *a, **k: None)
+            monkeypatch.setattr(wf, "_train_window_meta_labeler", lambda *a, **k: None)
+            monkeypatch.setattr(
+                wf, "_train_window_range_model", lambda *a, **k: range_result)
+            sink: list = []
+            monkeypatch.setattr(wf_mod, "Backtester", _recorder_factory(sink))
+            _run_window(wf, synth_df)
+            assert sink, "no OOS Backtester was constructed"
+            return sink[-1]["range_min_confidence"]
+
+        assert _patched((None, "training_returned_no_accuracy", 0.05)) == 1.0, (
+            "a failed range-training attempt must BLOCK OOS entries"
+        )
+        assert _patched(
+            (SimpleNamespace(fitted_weights={}, is_trained=True), "ok", 0.05)
+        ) == 0.55, "a successful range model must run at the configured threshold"
 
 
 # ---------------------------------------------------------------------------
@@ -312,10 +397,26 @@ class TestTrainWindowModelsFlag:
         out = wf._pretrain_range_models(windows, {"SPY": synth_df}, pd.DataFrame())
         assert out == [{"SPY": (None, "disabled_by_config", 0.05)}]
 
-    def test_run_single_window_gates_range_training(self):
-        src = inspect.getsource(WalkForwardBacktester._run_single_window)
-        assert "if not self._config.train_window_models:" in src
-        assert '"disabled_by_config"' in src
+    def test_run_single_window_gates_range_training(self, synth_df, monkeypatch):
+        """CENSUS-1 (2026-09-27): same _explode-if-called spy technique as
+        test_pretrain_skipped_when_disabled above, through _run_single_window
+        (via the harness) instead of _pretrain_range_models -- proves BOTH
+        that range training is never even attempted when train_window_models
+        is False, AND that the resulting OOS Backtester runs UNGATED at the
+        configured threshold rather than blocked at 1.0."""
+        cfg = WalkForwardConfig(train_window_models=False, range_min_confidence=0.55)
+        wf = WalkForwardBacktester(["SPY"], ["iron_condor"], config=cfg)
+
+        def _explode(*a, **k):  # pragma: no cover - failure path
+            raise AssertionError("range training ran despite train_window_models=False")
+
+        monkeypatch.setattr(
+            WalkForwardBacktester, "_train_window_range_model_inprocess", _explode)
+        sink: list = []
+        monkeypatch.setattr(wf_mod, "Backtester", _recorder_factory(sink))
+        _run_window(wf, synth_df)
+        assert sink, "no OOS Backtester was constructed"
+        assert sink[-1]["range_min_confidence"] == 0.55
 
 
 # ---------------------------------------------------------------------------
@@ -443,10 +544,18 @@ class TestBlackoutWiring:
         bt = Backtester(**_engine_kwargs(synth_df, synth_features))
         assert bt._pre_event_blackout_days == RiskConfig().pre_event_blackout_days
 
-    def test_walkforward_passes_field_through(self):
+    def test_walkforward_passes_field_through(self, synth_df, monkeypatch):
+        """CENSUS-1 (2026-09-27): the default-value check stays (it's a real
+        assertion already); the source-string half is replaced by driving the
+        real OOS Backtester construction and reading the actual kwarg back."""
         assert WalkForwardConfig().pre_event_blackout_days is None
-        src = inspect.getsource(WalkForwardBacktester._run_single_window)
-        assert "pre_event_blackout_days=" in src
+        cfg = WalkForwardConfig(train_window_models=False, pre_event_blackout_days=3)
+        wf = WalkForwardBacktester(["SPY"], ["iron_condor"], config=cfg)
+        sink: list = []
+        monkeypatch.setattr(wf_mod, "Backtester", _recorder_factory(sink))
+        _run_window(wf, synth_df)
+        assert sink, "no OOS Backtester was constructed"
+        assert sink[-1]["pre_event_blackout_days"] == 3
 
 
 # ---------------------------------------------------------------------------
