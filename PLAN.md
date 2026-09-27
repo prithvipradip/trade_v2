@@ -9577,3 +9577,50 @@ synthesis, reprice ladder, and `open`/`roll`/`flatten` orchestration, never asse
 source strings.
 
 ---
+
+## 2026-09-27 - W53 (probe build) fast lane confirmed -- 1 failure, not the 3 W52 recorded
+
+The full fast lane the entry above deferred (`pytest tests/ -q -m "not ibkr and not slow"`)
+finished: **2490 passed / 1 failed / 46 skipped / 153 deselected, 2874.38s (47m54s)** on
+this box. Written as its own short entry rather than folded silently into the next
+placing-run entry, since the count diverges from what W52/W53-first-slice recorded and
+that divergence deserves its own line, not a buried footnote.
+
+The one failure, confirmed by direct inspection --
+`test_r19_config_authority.py::TestContractIsTheSingleAuthority::test_applier_and_readers_share_one_table`
+-- is the SAME pre-existing, environment-specific failure W52's entry already named
+(`:9244-9247`): this Mac's `.env` sets `AIT_MARKET_DATA_TYPE=3`, diverging from
+`CONTRACT_DEFAULTS`'s declared `4` (`3.0 == 4.0 ± 4e-06` in the assertion output) --
+unrelated to this or any other wave, a standing fact about this box's local config, not a
+regression.
+
+DISCREPANCY FROM THE RECORDED BASELINE, checked rather than assumed: W52's entry
+(`:9244-9247`) also named two `test_watchdog.py` failures
+(`TestOverallHealth::test_all_healthy`, `TestOverallHealth::test_one_down_marks_overall_down`)
+as pre-existing on this box. Neither failed this run, and a standalone re-run just now
+confirms it: `pytest tests/test_watchdog.py -q -m "not ibkr and not slow"` -> **20/20
+passed**. Not chased further (out of this wave's scope, and the file itself is untouched by
+this or the W52/W53 waves) -- registered as an open, unexplained discrepancy for whoever
+next touches `test_watchdog.py` or the health-check machinery it exercises. Plausible but
+unconfirmed: those two tests read real system health metrics and may be timing/load
+sensitive rather than deterministically broken.
+
+Collected-test count sanity check: W53-first-slice's own entry (`:9372-9375`) recorded 2449
+passed against 3 known failures; this wave adds 39 new tests
+(`tests/test_w53_probe_script.py`), giving an expected ~2488 if the same 3 failures held.
+Actual: 2490 passed + 1 failed = 2491 run. The small drift is consistent with the
+watchdog discrepancy just above (2 fewer failures than expected accounts for most of the
+gap) -- not independently investigated beyond that.
+
+No `src/ait` or test file changed by this entry -- register-only, same discipline as the
+entry above.
+
+NEXT: unchanged from the entry above -- the live placing run (open -> roll -> flatten,
+RTH, Mac TWS paper, Mac bot stopped), flagged clearly with an explicit go-ahead before
+anything is placed. Whoever next touches `test_watchdog.py` should also check whether the
+two-failure discrepancy above still reproduces on a clean run, before assuming either
+number is the current truth.
+
+No inspect.getsource -- this entry touches no test files, only reports a suite run.
+
+---
