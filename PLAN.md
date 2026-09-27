@@ -10120,3 +10120,40 @@ No inspect.getsource — this wave's edits only ever DELETE getsource-based asse
 never add one; the deletions themselves are proof positive (grep-verified above).
 
 ---
+
+## 2026-09-27 - CENSUS-5 fast lane confirmed — 1 failure, and a third data point on the
+test_watchdog.py discrepancy (this time clean)
+
+Full fast lane after the CENSUS-5 deletions: **2512 passed / 1 failed / 46 skipped / 153
+deselected, 981.89s (16m22s)**. Count reconciles exactly: the prior entry's 2515 passed + 3
+failed = 2518 run; this run's 2512 + 1 = 2513; **2518 - 2513 = 5**, exactly this wave's net
+collected-test delta (5 whole tests deleted; the 6th site was a 2-line deletion inside an
+existing test, no collected-count change).
+
+The one failure is the same standing `AIT_MARKET_DATA_TYPE` env divergence
+(`test_r19_config_authority.py::TestContractIsTheSingleAuthority::
+test_applier_and_readers_share_one_table`) every entry this session has already named as
+unrelated to any wave — this Mac's local `.env`, not a regression.
+
+THIRD DATA POINT on the `test_watchdog.py` discrepancy two entries above registered as open:
+both `TestOverallHealth` tests are CLEAN in this run — no watchdog failures at all. Tally
+now stands at 2 clean-under-full-suite-load runs (this one, and this morning's W53-probe
+fast lane) against 1 failed-under-load run (W55's), with every standalone re-run of the file
+clean every time it's been checked. Continues to support "timing/load-sensitive under
+full-suite resource contention, not deterministically broken" over a real defect, now with
+one more observation in the "clean" column. Still not chased further — the file is untouched
+by every wave this session (W53 probe, W55, CENSUS-5) — registered for whoever eventually
+looks at `test_watchdog.py` or the health-check machinery it exercises.
+
+No `src/ait` or test file changed by this entry — register-only.
+
+NEXT: unchanged from the entry above — **CENSUS-1..4** open, no urgency, ~25 sites total
+(the per-category `~9/~7/~3/~7` estimates not yet re-verified against the current tree, per
+the correction in the entry above); **W53's placing run** and **W55's live validation run**
+both waiting on TWS reachable during an RTH session; **W54** waiting on the operator;
+**W56/57**; **W52a's four items**; the dormant `get_chain_for_expiry` bug; and the
+`test_watchdog.py` discrepancy, now with a third data point but still unresolved.
+
+No inspect.getsource — this entry touches no test files, only reports a suite run.
+
+---
