@@ -9624,3 +9624,181 @@ number is the current truth.
 No inspect.getsource -- this entry touches no test files, only reports a suite run.
 
 ---
+
+## 2026-09-27 - SCOPING NOTE: W54's heuristic-vs-fuller-EV fork, worked through with the
+operator -- and a hard, currently-unmet prerequisite for backtesting the EV path found while doing it
+
+No code in this entry -- register-only, same discipline as the 2026-09-22 ROADMAP entries
+(`:8639`, `:8783`). Operator asked what W54's own "operator decision" (`:8762`, `:8775`)
+actually is, and the conversation worked through the heuristic-vs-EV fork in enough depth
+that the conclusions -- and one real, load-bearing finding surfaced while checking a claim
+against the codebase rather than assuming it -- are worth registering before W54 is ever
+formally scoped, so the next session doesn't re-derive them from scratch. **W54 has not
+been started or wave-numbered by this entry** -- this is pre-wave scoping, the same status
+the 2026-09-22 entries had before W52-57 were assigned.
+
+[1] THE FORK, RESTATED PRECISELY. `[3]d` (`:8725-8731`) already leans toward starting with
+    an explicit heuristic ("roll only on a net credit that doesn't increase max-loss vs.
+    closing") over a full EV calculation, but leaves the sophistication call open. Worked
+    through to: **both should be built as a config-selectable pair**, `Literal["heuristic",
+    "ev"]` (naming TBD at implementation), nested so it only takes effect once
+    `assignment_response.policy == "close_or_roll"` is itself chosen -- inert otherwise,
+    same gating idiom `policy` and `condor_defense.enabled` already use. Defaults to
+    `"heuristic"`, for the same reason every other model-risk toggle in this register
+    defaults to the cheaper/safer arm.
+
+[2] A REAL CONSEQUENCE OF CHOOSING RISK-NEUTRAL DRIFT, worth recording because it changes
+    what "fuller EV" even needs to be built as. Risk-neutral valuation means the discounted
+    expected payoff of holding a position to expiry IS, by definition, that position's
+    theoretical fair value today -- so "compute the EV of holding the new position to
+    expiry" collapses to "price both alternatives accurately," not a Monte-Carlo-style
+    simulation over a terminal price distribution. Two consequences: (a) the EV path is a
+    smaller, more auditable build than the phrase suggests -- accurate present-value
+    pricing of both sides (reusing the existing py_vollib IV-solve pipeline,
+    options_chain.py:936-1030), not a new simulation engine; (b) it cannot, by
+    construction, find genuine directional edge -- it can only catch cases the heuristic's
+    crude credit/max-loss proxy misses (e.g. a "net credit" roll that's actually giving
+    away more time value than it collects). Recorded so nobody later expects the EV path to
+    systematically outperform the market, only to account for it more carefully than the
+    heuristic does.
+
+[3] THREE GAPS THE OPERATOR'S OWN 3-POINT PROPOSAL DIDN'T COVER, worked through to concrete
+    recommendations (none built, all for whoever scopes W54 for real):
+    a. **Portfolio-level risk gating.** A roll's opening leg should pass through the SAME
+       entry gates a fresh signal would (`risk/manager.py` -- concentration, correlation,
+       VIX credit tiers), not just its own standalone EV-vs-close comparison -- reusing the
+       existing gate rather than a parallel check, per CLAUDE.md's duplication-causes-
+       silent-divergence theme. The real wrinkle: a roll REPLACES an existing position, so
+       the gate needs to net the new position's risk against what the old one already
+       contributed, not treat it as pure incremental exposure on an unchanged book (a naive
+       reuse would double-count). Flag as its own labelled sub-item (a `[3]g`, continuing
+       the existing lettering) when W54 is actually scoped.
+    b. **Fill-price conservatism inside the EV number itself.** Price both sides of the
+       comparison using the SAME conservative per-leg synthesis already used elsewhere
+       (`orchestrator._synthesize_combo_cost`'s BUY-at-ask/SELL-at-bid idiom,
+       `combo_entry_limit`'s natural-vs-mid ladder) rather than a fantasy mid -- otherwise
+       the model can systematically overstate its own edge relative to what the reprice
+       ladder can actually fill.
+    c. **A repeat-roll safeguard.** Nothing today caps how many times one position can
+       roll. Recommend two layers: a hard `max_rolls_per_position` count cap (cheap,
+       `Field(...)`-bounded, walks the `rolled_from_trade_id` chain W53 already built --
+       ship this one, non-negotiable) plus a documented-but-deferred cumulative-roll-cost
+       cap (catches "death by a thousand small rolls" a count cap alone would miss) --
+       same "ship the simple version, register the sophisticated one" pattern this register
+       already used for the heuristic-vs-EV choice itself.
+
+[4] DATA-QUALITY FALLBACK, refined from the operator's own proposal (fall back to
+    heuristic + alert on bad IV, naming the expiry in question): reuse the EXISTING
+    detection signal (`chain_iv_is_a_guess`, `options_chain.py` -- confirmed live this
+    session, see the probe-preflight entries above) rather than inventing a second
+    IV-quality detector; make the trigger graduated (a config threshold, same idiom as
+    `options.min_open_interest`/`max_bid_ask_spread_pct`) rather than a strict binary, since
+    "the whole chain is quoteless" and "one far-OTM strike is missing" are very different
+    severities; and use PER-STRIKE IV (already computed by the existing solve) rather than
+    a single flattened ATM number, since the roll's own OTM strikes are exactly where skew
+    matters most.
+
+[5] LATENCY: A CONFIG-EXPOSED RE-EVAL CADENCE (operator's proposal), refined. `get_chain`'s
+    measured 110-209s median cost (W53's own register entry, `:9303`) makes a per-tick EV
+    re-evaluation infeasible; agreed on a config-gated interval (only reachable under
+    `policy=="close_or_roll"` AND the EV comparison model, `Field(...)`-bounded so it can't
+    be set to something that re-introduces the same latency problem or defeats reactivity
+    entirely). Two refinements:
+    - Skip a cycle rather than fire a new chain fetch while the previous one is still in
+      flight -- the same "never act on an unanswered request" discipline the reconciler
+      already applies (`get_all_open_order_ids` returning `None` on an unanswered request,
+      never read as "nothing working"). Not a new pattern to invent.
+    - Per [2] above, the EXPENSIVE part is target SELECTION (a chain scan, to find the
+      right delta/strike), not repricing an already-selected target (a few targeted
+      quotes). Worth considering two cadences rather than one -- a slow one for
+      re-selecting the roll target, a fast one for re-checking its live economics -- though
+      this is a refinement to weigh at implementation, not decided here. Note this
+      "cache an expensive result, reuse it for a while" shape already exists in this
+      codebase (`OptionsChainService`'s 2-min `TTLCache` on `get_chain`,
+      options_chain.py:479) -- a slower EV-verdict cache is the same idiom one layer up,
+      not a new one.
+
+[6] THE HARD FINDING: BACKTESTING THE EV PATH BEFORE IT COULD EVER GO LIVE (operator's own
+    requirement, agreed on early in this conversation) HAS A PREREQUISITE THAT DOESN'T EXIST
+    YET, AND CANNOT BE BUILT QUICKLY. Checked directly against the codebase rather than
+    assumed, prompted by the operator's own "are we sure we store this" question --
+    findings from an Explore agent this session, HEAD `52f818b`:
+    - `data/historical.db` (`HistoricalDataStore`, `src/ait/data/historical.py`) has TWO
+      structurally different kinds of IV data, not one: a per-strike/per-expiry-shaped
+      table (`option_spread_samples`: symbol, sample_date, right, strike, dte, iv, bid,
+      ask, mid, half_spread_pct) that is the only table shaped like a real vol surface, and
+      a composite-scalar level series (`daily_prices.implied_vol` / `daily_iv`: one number
+      per symbol per day).
+    - The operator's own recollection of "2 snapshots" is exactly right and not
+      approximate: `option_spread_samples` holds precisely 2 sample dates (2026-05-24,
+      2026-08-25), QQQ only, 1,963 rows total.
+    - **Nothing scheduled writes surface data.** `orchestration/master.py`'s APScheduler job
+      list has zero jobs touching `historical.db`. The live bot's only automatic write
+      (`orchestrator.py:5549`, `_persist_daily_iv`, once per symbol per day) is the
+      composite scalar, not a surface. `scripts/calibrate_option_spreads.py` is the only
+      code that ever captures a real surface, and it is manual-only, never wired into any
+      scheduled job -- confirmed by grep, zero hits outside `scripts/`/`tests/`/
+      `backtesting/`/`diagnostics/`.
+    - **This is not merely an un-cadenced job -- the data cannot be backfilled at all.**
+      `calibrate_option_spreads.py` can only ever snapshot TODAY's chain (via yfinance or
+      an IBKR live snapshot); there is no historical options-chain data source anywhere in
+      this codebase. Starting a scheduled surface-snapshot job today only accumulates
+      history forward from today -- it cannot reconstruct the past. The only avenue for
+      genuine historical per-strike coverage would be integrating a paid historical-options
+      provider (Polygon is already a runtime dependency for other data, per
+      `constraints.txt` -- whether its endpoints cover historical option chains is
+      UNCONFIRMED, not checked this session).
+    - **Corroborating evidence this gap is real and already known in a different guise**:
+      the composite-level series has genuine depth ONLY for QQQ (daily_prices/daily_iv back
+      to 2011-08-26, ~3,780-3,790 rows) and SPY/IWM (since 2024, ~500-510 rows each) -- the
+      rest of the live universe has none. And confirmed directly against source: `iv_rank`
+      in BOTH the backtest engine (`ml/features.py:_add_iv_features:660-682`) and
+      `ml/regime.py:_measure_iv_rank:156-174` is a pure realized-vol range rank computed
+      from OHLCV log-returns -- "no stored IV is read at all" (the function's own
+      docstring). Only the LIVE bot's `_estimate_iv_rank`
+      (`bot/orchestrator.py:5558-5660`) attempts a true IV percentile first, falling back to
+      the same realized-vol proxy when the stored series is short (<60 rows) or stale (>5
+      days). This is exactly the "parity needs an IV-percentile series in the store first.
+      Registered, not built" item W52a's entry already named (`:9187-9189`) -- now traced
+      to source and confirmed, not just repeated.
+    - **No cross-date interpolation exists anywhere**, confirmed by direct grep
+      (`ffill`/`forward_fill`/`gap_fill`/`interpolat` across `data/`, `backtesting/`,
+      `ml/`) -- every real consumer treats a gap as something to react to, never to paper
+      over: `post_event_study.py`'s 400-row guard (`MIN_STORED_IV_ROWS`, `:105,224-248`)
+      hard-aborts on thin data (distinct from and stricter than `_load_calibrated_spreads`'
+      `calibrated_spreads_absent` no-op-to-config-default, `engine.py:1553-1583`); `iv_rank`
+      falls back to realized vol in both live and backtest, as above. What DOES exist:
+      within-day, across-STRIKE interpolation for a LIVE chain snapshot only
+      (`options_chain.py:atm_iv():243-294`, linear between the two strikes bracketing
+      spot) -- never against stored history; and a tenor-interpolation scheme
+      (VIX9D/VIX/VIX3M/VIX6M flat-forward-variance) that exists only on the unmerged branch
+      `Interactive-modeling-1` (`scripts/calibrate_term_structure.py`, not on
+      `feature/event-straddle`/`main`) plus an untracked notebook in this working tree
+      (`QQQ_IronCondor_TermStructure_WalkForward.ipynb`) that ports the same function --
+      neither is part of this branch's `src/`.
+
+STATE AT HANDOFF. Register-only -- no `src/ait`, config, or test file touched. Nothing to
+deploy or restart. `data/historical.db` was read via `file:...?mode=ro`, nothing written.
+
+NEXT: W54 remains unscoped and un-wave-numbered. Before it is, whoever scopes it should
+treat [6] above as a real, load-bearing prerequisite question, not a detail to discover
+mid-build: does the EV path wait for a forward-accumulating daily surface-snapshot job to
+build enough history (months, realistically, and only from whenever such a job starts --
+recommend wiring `calibrate_option_spreads.py`'s logic into a scheduled job as the first
+concrete step if this route is chosen, rather than leaving it manual-only), or does W54
+instead validate against a paid historical-options provider (Polygon's options-history
+coverage, if any, would need its own check first), or does it ship the EV *comparison
+logic* now (behind the config gate, defaulting off, per [1]) while treating "properly
+backtested" as a separate, later gate before `comparison_model: ev` is ever operator-
+selected live -- these are three different sequencing answers with very different
+timelines, and the operator should pick one rather than have it assumed. [1]-[5] above
+(the config shape, the risk-neutral-drift consequence, the three new gaps, the
+data-quality fallback design, and the latency/cadence design) are otherwise ready to fold
+directly into W54's eventual scoping entry without re-litigation. Every other open item is
+unchanged from the entries above: the live placing run (still the nearer-term NEXT for the
+W53 probe itself), W55-57, CENSUS-1..5, W52a's four items, `get_chain_for_expiry`, and the
+`test_watchdog.py` discrepancy from the entry immediately above.
+
+No inspect.getsource -- this entry touches no test files.
+
+---
