@@ -10494,3 +10494,32 @@ No inspect.getsource — every test this wave touched now drives the real code p
 rewrites themselves, mutation-verified above, are proof positive.
 
 ---
+
+## 2026-09-27 - CENSUS-4 fast lane confirmed — 1 failure, count reconciles exactly against
+CENSUS-4's own net collected-test delta
+
+Full fast lane after CENSUS-4: **2515 passed / 1 failed / 46 skipped / 153 deselected,
+848.58s (14m8s)**. The one failure is the same standing `AIT_MARKET_DATA_TYPE` env
+divergence every entry this session has already named as unrelated. `test_watchdog.py`
+clean again this run — fourth clean-under-load run against one failed-under-load, tally
+unchanged from the entries above.
+
+Count check: pre-batch baseline (CENSUS-1's fast lane) was 2512 passed + 1 failed = 2513
+run. This run: 2515 + 1 = 2516 — a delta of exactly +3, matching CENSUS-4's own recorded
+net collected-test change (`test_r17_dormant_strategy_fixes.py` 9→12, every other touched
+file unchanged; `test_r16_core_fixes.py`'s single rewritten test stayed one test despite
+growing from 6 lines to ~75, not 3 — the collected-count math is about test FUNCTIONS,
+not test CASES within one function).
+
+No `src/ait` or test file changed by this entry — register-only.
+
+NEXT: unchanged from the entry above — **CENSUS-2/3** open, no urgency, the rediscovered
+`PLAN.md:7066-7075` worklist the starting point (re-verify line numbers first); the
+3-site delete-only discrepancy; the `_run_override_block` follow-up; **W53's placing
+run** and **W55's live validation run** waiting on TWS during an RTH session; **W54**
+waiting on the operator; **W56/57**; **W52a's four items**; `get_chain_for_expiry`;
+**`test_watchdog.py`**, now four-clean-one-failed, still unresolved.
+
+No inspect.getsource — this entry touches no test files, only reports a suite run.
+
+---
