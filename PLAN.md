@@ -9408,3 +9408,172 @@ No inspect.getsource — this wave's new tests drive the real `_validate_roll_le
 source strings.
 
 ---
+
+## 2026-09-27 - W53 (probe build + preflight) EXECUTED — the cross-expiry roll-combo
+atomicity probe script, and a live finding: a cold weekend session gets no option quotes at any market-data type
+
+SCOPE. The W53 follow-up the register has pointed at since `81bad54`: PLAN.md `:8718-8724`
+([3]c) and the W53 first-slice entry's NEXT (`:9385-9394`) both gate the actual
+combo-placement/fill-handling build on one unproven question -- will IB accept, price and
+fill ONE BAG that CLOSES a vertical at expiry A and OPENS a vertical at expiry B,
+atomically? This entry covers building the probe and running its read-only `preflight`
+step against the live PAPER account; the placing steps (`open`/`roll`/`flatten`) still wait
+on an RTH session per [5] below.
+
+OPERATOR DECISIONS THIS SESSION (recorded so a future session doesn't re-litigate them):
+1. Environment: **this Mac's TWS paper (127.0.0.1:7497), the Mac bot kept stopped**
+   throughout -- not the Windows box's Gateway (unreachable from here per this session's
+   own connectivity research), not run alongside a live Mac bot session.
+2. Probe shape: **open -> roll -> flatten** (not a roll-shaped BAG with no prior position,
+   not a preflight-only run) -- tests the real close-an-existing-position case the build
+   depends on, using three combos: a 2-leg SPY put vertical open, one 4-leg cross-expiry
+   roll BAG, a 2-leg flatten.
+
+FIX (research/tooling only -- no `src/ait` changes; nothing here is reachable from any live
+code path):
+1. **`scripts/probe_w53_roll_atomicity.py`** (797 lines). Reuses the bot's own real
+   primitives rather than hand-rolling ib_insync calls: `ContractBuilder.option/combo`
+   (contracts.py:27-98), `OrderBuilder.combo_limit` (orders.py:86-99), `IBKRClient.connect/
+   qualify_contracts_batch/place_order/cancel_order` (ibkr_client.py), W53's own
+   `_validate_roll_legs` (executor.py:114-181) and `select_roll_target`
+   (roll_selector.py:64-136). Five subcommands (`preflight` default/read-only, `open`,
+   `roll`, `flatten`, `status`), sharing a per-day state file at
+   `reports/w53_probe/<date>/state.json` plus per-step JSONL evidence.
+   Safety, all enforced as hard guards checked BEFORE any `placeOrder`:
+   - `guard_account`: refuses a non-paper ("D"-prefixed) session account, on top of
+     `IBKRClient.connect()`'s own existing live/paper gate.
+   - `guard_rth_window`: refuses outside market hours and within 30 minutes of the
+     open/close (`ait.utils.time.is_market_open/get_market_close`, never a bare
+     `datetime.now()`).
+   - `guard_no_collision`: refuses any contract key already in `data/HALT_UNTRACKED` or
+     already a leg of an open DB trade, reading both via the SAME
+     `"SYMBOL:STRIKE:RIGHT:EXPIRY"` key format `reconciler.py` uses -- confirmed against
+     the real file this session (see finding 2 below).
+   - `guard_no_working_step`: refuses re-entering a step the state file says is still
+     in-flight.
+   - Hard caps: 1 contract, SPY only, wing width <=$5, roll net debit <=$2.00
+     (`place_combo_ladder`'s `debit_cap` check, computed from a real per-leg mid/natural
+     synthesis before any order is built).
+   - Every order this script places carries `orderRef="W53PROBE-<step>-<ts>"`, so the live
+     bot's untagged-BAG sweep (reconciler.py:694-701, 767-797) can never adopt or cancel
+     one.
+   - ClientId 97 -- outside the bot's own ladder (1, then 101-105 on fallback,
+     ibkr_client.py:117) and every prior ad-hoc script's id (83/88/90/91/95, this session's
+     own connectivity research).
+   - On any guard refusal or unexpected error during `open`/`roll`, `main()` attempts an
+     emergency `flatten` automatically before exiting non-zero.
+2. **`tests/test_w53_probe_script.py`** (722 lines, 39 tests). IBKR is mocked at the
+   network edge only (`connect_probe`/`build_services`, replaced with a `_FakeIBKRClient`/
+   `_FakeChainService`) -- every guard, the per-leg pricing synthesis, the reprice ladder,
+   contract selection, and the `open`/`roll`/`flatten` orchestration run for real, same
+   convention `test_w53_roll_target_selection.py` set (real `OptionContract`/`OptionsChain`
+   objects, never `MagicMock`).
+
+A REAL BUG CAUGHT AND FIXED WHILE BUILDING, not a design choice: `record_evidence`'s
+positional parameter was originally named `step`, colliding with a `step=step_idx` keyword
+argument at the one call site inside the reprice ladder (`_monitor_and_ladder`) -- a
+`TypeError` the ladder-monotonicity test caught on its first run, genuinely red before
+green. Fixed by renaming the parameter to `step_name` (every call site already passed it
+positionally, so nothing else changed). Left as a note for whoever reads this: it is exactly
+the kind of bug a test written AFTER the implementation, rather than strictly before it,
+can still catch -- the test exercised the real reprice code path and the collision only
+fires once `target_step > step_idx` actually goes true, which the happy-path fill tests
+never reach.
+
+PROOF. `tests/test_w53_probe_script.py`: 39/39 green, including the one genuine red-then-
+green case above. Mutation-checked the way a brand-new file's tests are proven when there
+is no prior committed version to `git stash` against: the script was moved aside entirely
+(`mv scripts/probe_w53_roll_atomicity.py /tmp/...`) and the suite failed to even collect
+(`FileNotFoundError` on the module load) -- confirming the tests import and exercise the
+real file, not a stale cached module. Restored, 39/39 green again. Neighbor files
+unaffected: `test_w53_roll_leg_validator.py` + `test_w53_roll_target_selection.py` +
+`test_w53_db_migration.py` + `test_w52_multileg_itm_diagnosis.py` (91/91 combined with this
+wave's own file) and, further out, `test_order_lifecycle.py` + `test_w2_executor_risk_gates.py`
++ `test_w27_credit_floor_at_placement.py` + `test_w32_booking_breaker_integrity.py`
++ `test_hot_path_smoke.py` (100/100). `python -m compileall -q src scripts`: OK.
+`python scripts/typecheck.py`: OK -- zero attr-defined/call-arg/name-defined in
+`src/ait/{config,bot,execution,risk}` (this wave adds no `src/` files, so this gate was
+never at risk; run anyway per house discipline). Full fast lane (`pytest tests/ -q -m "not
+ibkr and not slow"`) was still running at this entry's writing (started before the live
+preflight step, ~30+ min in at 17% on this box, consistent with the box-throttling variance
+W52's own entry already measured 41 min-3h27m for) -- not blocking this entry per the
+register's "register-don't-fix" discipline for research/tooling that touches no `src/`
+file; its result will be folded into the next entry (the live placing run) rather than
+held for separately.
+
+2. LIVE FINDING (`preflight`, run against this Mac's TWS paper, account DUO442667
+[[paper account, "D"-prefixed, confirmed by `guard_account`]], Sunday 2026-09-27, market
+closed): **a freshly-connected session gets zero option quotes at ANY market-data type on
+a closed weekend market, not just the delayed (type 3) this Mac's `.env` defaults to.**
+   - First run (unmodified): `AIT_MARKET_DATA_TYPE=3` (delayed) from `.env` -- type 3 goes
+     silent outside RTH by design (no live delayed feed to delay when the exchange is
+     shut). `pick_vertical` correctly refused (`ProbeGuardError: no liquid P contracts at
+     expiry 2026-10-02`) rather than proceeding on data it didn't have -- the guard doing
+     its job, not a defect.
+   - Second run: added an explicit `ibkr.ib.reqMarketDataType(4)` override in
+     `connect_probe()`, specific to the probe's own session (clientId 97; harmless to the
+     live bot, which holds a separate clientId/session) -- type 4 is delayed-FROZEN,
+     meant to serve the last snapshot when markets are shut. Confirmed applied (evidence:
+     `{"event": "connected", ..., "market_data_type": 4}` in
+     `reports/w53_probe/2026-09-27/preflight.jsonl`). Identical result: EVERY contract in
+     EVERY expiry chain fetched -- the near window (5-10 DTE, one expiry: 2026-10-02) AND
+     the far window (14-30 DTE, three expiries: 2026-10-12/16/23) -- came back quoteless
+     (`chain_quoteless_contracts_dropped`, component=`data.options`: 292 dropped @2026-10-02,
+     60 @2026-10-12, 300 @2026-10-16, 292 @2026-10-23; every sampled contract bid=ask=0.0,
+     volume=0, open_interest=0). IV was equally unavailable
+     (`chain_iv_is_a_guess`/`atm_iv_unavailable` -- every delta in the chain is backfilled
+     from a flat 0.30 IV assumption, not a real one).
+   - Working theory, not yet independently confirmed: IB's "frozen" tick is a frozen COPY
+     of whatever THIS session's own delayed feed last held, not a queryable historical
+     database -- a clientId that was never subscribed during Friday's live session has
+     nothing to freeze. If true, type 4 only helps a session that was already live and
+     subscribed before the market closed, not a cold Sunday connect. Registered here as a
+     live-account behavior worth knowing for ANY future ad-hoc weekend script against this
+     paper account, not specific to this probe.
+   - Net effect on THIS wave: the quote/whatIf-margin half of `preflight` (contract
+     qualification, `select_roll_target`, `_validate_roll_legs` logic itself all ran and
+     would work fine on real data) could not be completed today -- it needs a live or
+     very-recently-live RTH session. Folds into the Monday RTH run already scoped in NEXT
+     below, not a new wave.
+
+Nothing here is called by any live code path: this entry adds no `src/ait` file, and the
+one `src/ait` change from earlier today (see the mutation-check bug fix above) touched only
+`scripts/probe_w53_roll_atomicity.py`'s own `record_evidence`, which nothing outside this
+script calls.
+
+STATE AT HANDOFF. Probe script + tests built and proven; `preflight` run twice live
+against the real paper account (DUO442667) with no orders placed either time (by design --
+`preflight` never calls `placeOrder`). `data/HALT_UNTRACKED`'s 10 untracked QQQ legs (dated
+2026-09-25, unrelated to this SPY-only probe) are unchanged and remain a separate open
+operator item -- not touched, not resolved, not blocking this wave. No `src/ait` file
+changed; no restart needed or relevant.
+
+NEXT: **the live placing run** (open -> roll -> flatten on SPY, RTH, this Mac's TWS paper,
+Mac bot kept stopped) -- needs a session that has been live long enough for real quotes to
+exist, i.e. during RTH itself, not immediately after a weekend cold-connect; Claude runs it,
+flagged clearly with the exact contracts/caps/orderRefs, with an explicit go-ahead
+immediately before anything is placed, per the register's standing convention for this
+probe. Its result (ATOMIC / SEQUENTIAL / INCONCLUSIVE per the verdict rule fixed in the
+approved plan before any order was placed) determines the combo-placement/fill-handling
+build's atomic-vs-sequential design. **The already-running full fast lane's result** folds
+into that same next entry once it finishes, rather than being held for separately. Every
+other open item is unchanged from W53's own NEXT (`:9385-9404`): **W54** (close-or-roll
+comparison model, rule 3/3e policy wiring, `go_live.py` roll-accounting, plus the four
+items W52 assigned it), **W55** (synthetic per-leg delta, independent, pullable any time),
+**W56** follows W55, **W57** follows the full W53 (roll build, still pending) and W56,
+**CENSUS-1..5** (32 sites) still open, no urgency, **W52a's four deliberately-registered
+items** still open, unchanged, the dormant `get_chain_for_expiry` wrong-expiry bug
+(`options_chain.py:557-569`) still uncalled and unfixed, and this entry's own new hazards
+(the W53 validators'/selector's expiry-blindness, single-`TradeRecord.expiry`,
+`_wing_width_from_legs`/`_defined_risk_width` across two expiries, entry-path quote
+refusal/sign-by-name, `_reconstruct_bag_price` summary-row risk -- all named in the W53
+first-slice entry above, `:9385-9404`, unchanged by this session) remain exactly as
+registered there. Separately new to the register, worth a future session confirming or
+refuting: the cold-weekend-session frozen-data finding above, if it recurs, is relevant to
+any future ad-hoc script against this account, not just this probe.
+
+No inspect.getsource -- this wave's new test file drives the real guard functions, pricing
+synthesis, reprice ladder, and `open`/`roll`/`flatten` orchestration, never asserts on
+source strings.
+
+---
