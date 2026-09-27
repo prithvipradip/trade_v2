@@ -414,13 +414,13 @@ class TestCondorBudgetOvershoot:
         """risk_budget None (paper big-account behavior) must be unchanged."""
         assert len(self._signals(budget=None)) == 1
 
-    def test_gate_matches_risk_manager_semantics(self):
-        """The gate must compare (max_width - credit)*100 to risk_budget — the
-        same quantity RiskManager 6b uses — not some looser proxy."""
-        import ait.strategies.iron_condor as _ic
-        src = inspect.getsource(_ic.IronCondor.generate_signals)
-        assert "max_loss_over_budget" in src
-        assert "max_loss > self.risk_budget" in src
+    # CENSUS-5 (2026-09-27): test_gate_matches_risk_manager_semantics deleted
+    # here -- checked two literal strings ("max_loss_over_budget",
+    # "max_loss > self.risk_budget") in generate_signals' SOURCE TEXT.
+    # Strictly subsumed by test_over_budget_structure_is_rejected_in_strategy
+    # above (real structlog capture of the actual rejection reason) and
+    # test_gate_boundary_is_the_budget_itself above (proves the STRICT ">"
+    # directly: budget == max_loss passes, budget == max_loss - 1 fails).
 
 
 # ---------------------------------------------------------------------------

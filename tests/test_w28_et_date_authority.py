@@ -179,18 +179,12 @@ class TestTheSharpestLiveSites:
         widths = {ic._vol_scaled_width(100.0, None, None, None) for _ in range(3)}
         assert len(widths) == 1, "wing width is not deterministic within a run"
 
-    def test_no_live_dte_helper_reads_the_host_date(self):
-        """The DTE helpers must resolve their 'today' through the authority."""
-        import inspect
-
-        import ait.data.options_chain as oc
-
-        src = inspect.getsource(oc)
-        assert "date.today()" not in src, (
-            "options_chain computes DTE from the host date again — DTE drives "
-            "strike and expiry selection"
-        )
-        assert "today_et" in src
+    # CENSUS-5 (2026-09-27): test_no_live_dte_helper_reads_the_host_date deleted
+    # here -- asserted "date.today()" absent from options_chain's SOURCE TEXT
+    # alone. Strictly subsumed by TestNoHostDateReadsRemain::
+    # test_src_contains_no_today_calls below, a real AST walk across ALL of
+    # src/ with deliberately no allowlist -- covers options_chain.py with no
+    # carve-out, and every other module besides.
 
 
 class TestTrainerBothSidesShareOneConvention:

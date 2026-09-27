@@ -10002,3 +10002,121 @@ now-twice-observed `test_watchdog.py` discrepancy.
 No inspect.getsource — this entry touches no test files, only reports a suite run.
 
 ---
+
+## 2026-09-27 - CENSUS-5 EXECUTED — the delete-only batch of the test-honesty
+`inspect.getsource` census, 6 sites, zero production changes
+
+SCOPE. The 2026-09-22 REGISTER CORRECTION entry (`:8909-8959`) scoped the getsource census
+into 5 batches by rough category and size, but the per-site worklist itself lived only in
+that session's now-gone local plan file — PLAN.md never carried it. This wave re-derived
+the current list from scratch (Explore, then independently verified every candidate by
+reading both the target and its claimed replacement directly, not trusting the agent's
+report alone), confirming the census is unchanged since 2026-09-21: still 41 real
+executable `inspect.getsource(` call sites across 13 files (12 after this wave — see below),
+all 9 originally-named "LEGITIMATE" items still at the same lines (one of the 9 turns out
+to be miscategorized — see the correction in NEXT below), nothing drifted or was fixed as a
+side effect of any intervening wave. Not wave-numbered, per the 2026-09-22
+entry's own explicit decision (`:8942-8946`) — this track carries no live-money urgency and
+interleaves freely; CENSUS-5 is a label, not a W-number.
+
+FIX (test-only; zero `src/ait` changes — this batch's whole premise is that the real
+behavioral coverage these deletions lean on ALREADY EXISTS and ALREADY PASSES):
+Deleted 5 whole tests + 2 lines from a 6th, each independently verified against its
+replacement before deletion (not assumed from the register):
+1. `tests/test_w28_et_date_authority.py` — `test_no_live_dte_helper_reads_the_host_date`
+   (checked `"date.today()"` absent from `options_chain`'s source text alone). Subsumed by
+   `TestNoHostDateReadsRemain::test_src_contains_no_today_calls` in the SAME file — a real
+   AST walk across ALL of `src/`, "DELIBERATELY NO ALLOWLIST," already covering
+   `options_chain.py` with no carve-out.
+2. `tests/test_r16_touch_stop.py` — `TestWiring` class deleted whole (both its tests:
+   `test_dispatch_threads_row`, `test_exit_repriced_at_touched_strike` — checked literal
+   substrings in `_dispatch_exit_check`/`_check_exit`'s source). Subsumed by
+   `test_w5_engine_cost_model.py`'s `TestTouchGapPricing` class, which calls the REAL
+   `Backtester._check_exit()` with varying `row` OHLC data and shows `exit_price`/
+   `exit_underlying` genuinely differ by gap size (provably depends on `row` threading
+   through, not the literal word appearing), and
+   `test_non_gapped_touch_still_books_the_strike_touch_price`, which compares the real
+   `exit_price` against `_reprice_position`'s own output directly.
+3. `tests/test_r20_research_validity.py` — `test_build_position_call_site_passes_context`
+   (regexed `Backtester.run`'s source for `market_context` inside a `_build_position(...)`
+   call). Subsumed by `test_vix_context_changes_entry_pricing` and `test_per_symbol_
+   multiplier_reaches_entry_pricing` in the same class, both of which run the REAL engine
+   with different `market_context` and show real trades' `entry_iv` actually differs / lands
+   on the calibrated value.
+4. `tests/test_r20_research_validity.py` — 2 lines only (the `inspect.getsource`/string-
+   containment prelude) deleted from `test_engine_ladder_delegates_to_shared_module`; the
+   test's own real for-loop (calling BOTH `Backtester._credit_take_profit_pct` and
+   `exit_policy.credit_take_profit_pct` at 5 DTEs and asserting they agree) already proved
+   delegation more strongly than the string check ever did, and stays untouched.
+5. `tests/test_r16_tail_fixes.py` — `test_gate_matches_risk_manager_semantics` (checked two
+   literal strings in `IronCondor.generate_signals`'s source). Subsumed by two sibling
+   tests in the same class: `test_over_budget_structure_is_rejected_in_strategy` (real
+   structlog capture of the actual rejection reason) and `test_gate_boundary_is_the_budget_
+   itself` (proves the STRICT `>` directly: budget == max_loss passes, budget == max_loss
+   minus 1 fails).
+Also removed `test_r20_research_validity.py`'s module-level `import re` (line 34), confirmed
+by direct grep to have no other use in the file once its one caller (item 3 above) was
+deleted — dead-import cleanup, not left behind.
+
+DELIBERATELY EXCLUDED FROM THIS BATCH, registered so they aren't lost the way the original
+per-site worklist was: `test_r20_research_validity.py:538` (a getsource line inside
+`test_macro_flatten_windows_match_live_source`, which ALSO covers a genuine rewrite-needed
+claim at `:527` in the same function — can't be split cleanly into a delete-only piece) and
+`test_r16_research_fixes.py:316` (candidate replacement coverage exists at
+`test_r20b_default_migration.py:188-215`, but whether it would actually catch a regression
+here wasn't confirmed — "if unsure, don't call it delete-only"). Both left exactly as-is,
+open for whoever takes CENSUS-1..4 or a future pass.
+
+PROOF. Per-file collected-test counts, before -> after (all remaining tests green, zero new
+failures): `test_w28_et_date_authority.py` 17 -> 16 (15 passed, 1 skipped, unchanged skip);
+`test_r16_touch_stop.py` 10 -> 8; `test_r20_research_validity.py` 31 -> 30;
+`test_r16_tail_fixes.py` 80 -> 79. `test_w5_engine_cost_model.py` (the replacement-coverage
+file the touch-stop deletions lean on) re-run standalone: 28/28 green, unaffected. All four
+touched files plus the replacement-coverage file together: 160 passed, 1 skipped.
+`python -m compileall -q tests`: OK.
+
+Census recount, reconciled precisely rather than taken from a single raw grep (a naive
+whole-`tests/`-tree grep for `inspect.getsource(` returns 38, which is NOT directly
+comparable to "41" — it includes 2 known prose mentions of an already-fixed instance
+[`test_r16_round2_fixes.py:269`, `test_r16_risk_fixes.py:555`] and `test_w23_scheduler_
+timezone.py`'s own separately-owned site, none of which were ever part of the curated 41):
+excluding that file and those 2 prose lines, the real count is **35 executable call sites
+across 12 files** (was 41 across 13 -- `test_r16_touch_stop.py` now has zero and drops out
+of the file count entirely) -- exactly 41 minus this batch's 6 deletions, reconciled two
+ways (per-file before/after grep counts, and a fresh curated recount) rather than assumed.
+
+STATE AT HANDOFF. Test-file-only changes across 4 files; zero `src/ait` files touched, zero
+config changes. Nothing to deploy or restart. Full fast lane kicked off in the background at
+this entry's writing; its result folds into the NEXT entry, same register-don't-block
+discipline used for the W53 probe's and W55's own build entries.
+
+NEXT, naming every open item explicitly (the standing discipline this census track itself
+exists to enforce, per the 2026-09-22 REGISTER CORRECTION entry, `:8954-8957`):
+**CENSUS-1** (Recorder-harness lift, ~9 sites), **CENSUS-2** (Exit-policy/engine, ~7),
+**CENSUS-3** (`master.py`/entrypoint, ~3, "the expensive one despite fewest sites"),
+**CENSUS-4** (Scattered moderates, ~7) — all still open, no urgency, independent of each
+other and of every live-money wave, free to interleave any time.
+
+A SMALL CORRECTION TO THE 2026-09-22 COUNT, surfaced by re-verifying rather than reusing it:
+that entry's own 9-item "legitimate, don't touch" list included
+`test_w28_et_date_authority.py:188` — but the SAME entry also separately noted that exact
+site as "delete rather than rewrite when reached." Both can't be true; this wave resolved
+the contradiction by actually deleting it (item 1 above), which is what "delete rather than
+rewrite" always meant. So: 8 sites are genuinely legitimate (not 9), and the arithmetic for
+what remains is: 41 total -> 6 deleted this wave -> **35 remain** = 8 legitimate (untouched)
++ 2 deliberately-excluded-from-this-batch (flagged above) + **25 in the actual current
+CENSUS-1..4 rewrite pool**. The four batches' original `~9/~7/~3/~7` per-category estimates
+(summing to 26, close to 25 but never re-verified against the current tree) are carried
+forward as approximate, same as CENSUS-5's own `~6` was before this wave's exact recount --
+whoever picks up CENSUS-1..4 should re-derive their current exact site lists the same way
+this wave re-derived CENSUS-5's, not assume the old estimates are still precise. Separately:
+**W53's placing run** and
+**W55's live validation run** both still wait on TWS reachable during an RTH session (not
+reachable as of the last check); **W54** waits on the operator per its scoping-note entry;
+**W56/57**; **W52a's four items**; the dormant `get_chain_for_expiry` bug; and the
+twice-observed `test_watchdog.py` load-sensitivity discrepancy.
+
+No inspect.getsource — this wave's edits only ever DELETE getsource-based assertions,
+never add one; the deletions themselves are proof positive (grep-verified above).
+
+---

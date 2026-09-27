@@ -122,17 +122,12 @@ class TestPrecedenceAndFlag:
                                      current_date=date(2026, 8, 12),
                                      row=None) is None
 
-
-class TestWiring:
-    def test_dispatch_threads_row(self):
-        import inspect
-        src = inspect.getsource(Backtester._dispatch_exit_check)
-        assert "row" in inspect.signature(
-            Backtester._dispatch_exit_check).parameters
-        assert "_check_exit_credit(pos, pnl_pct, current_date, row)" in src
-
-    def test_exit_repriced_at_touched_strike(self):
-        import inspect
-        src = inspect.getsource(Backtester._check_exit)
-        assert 'result.get("exit_reason") == "touch_stop"' in src
-        assert "_reprice_position(pos, _tu" in src
+    # CENSUS-5 (2026-09-27): TestWiring (test_dispatch_threads_row,
+    # test_exit_repriced_at_touched_strike) deleted here -- both asserted
+    # literal source substrings against Backtester._dispatch_exit_check/
+    # _check_exit instead of calling them. Strictly subsumed by
+    # test_w5_engine_cost_model.py's TestTouchGapPricing, which calls the
+    # real Backtester._check_exit() with varying `row` OHLC data and proves
+    # exit_price/exit_underlying actually depend on it, and by that same
+    # file's test_non_gapped_touch_still_books_the_strike_touch_price, which
+    # compares the real exit_price against _reprice_position's own output.

@@ -31,7 +31,6 @@ Every test here FAILED against the pre-R20 tree (run log in the R20 report).
 from __future__ import annotations
 
 import inspect
-import re
 from datetime import date
 from types import SimpleNamespace
 
@@ -185,13 +184,13 @@ class TestMarketContextThreading:
             t["entry_iv"] == pytest.approx(0.30, abs=1e-4) for t in res_spy.trades
         )
 
-    def test_build_position_call_site_passes_context(self):
-        src = inspect.getsource(Backtester.run)
-        m = re.search(r"self\._build_position\(([^)]*)\)", src)
-        assert m is not None
-        assert "market_context" in m.group(1), (
-            "run() must forward self._market_context to _build_position"
-        )
+    # CENSUS-5 (2026-09-27): test_build_position_call_site_passes_context
+    # deleted here -- regexed run()'s SOURCE TEXT for "market_context" inside
+    # the _build_position(...) call instead of proving it actually reaches
+    # pricing. Strictly subsumed by test_vix_context_changes_entry_pricing and
+    # test_per_symbol_multiplier_reaches_entry_pricing above, both of which
+    # run() the real engine with different market_context and show real
+    # trades' entry_iv actually differs / lands on the calibrated value.
 
     def test_no_context_free_get_iv_call_sites(self):
         # The one other _get_iv call site (_select_strategy) was a dead,
@@ -485,12 +484,13 @@ class TestIntradayKnobsWired:
 
 class TestSharedExitPolicy:
     def test_engine_ladder_delegates_to_shared_module(self):
+        # CENSUS-5 (2026-09-27): the getsource/string-containment prelude that
+        # used to sit here ("exit_policy" in Backtester._credit_take_profit_pct's
+        # source) is deleted -- the loop below already proves delegation far
+        # more strongly, by calling BOTH implementations at 5 DTEs and showing
+        # they agree; a source-text match doesn't prove the two stay in sync.
         from ait.execution import exit_policy
 
-        src = inspect.getsource(Backtester._credit_take_profit_pct)
-        assert "exit_policy" in src, (
-            "engine must import the ladder, not hand-copy it"
-        )
         for dte, expect in ((25, 0.50), (15, 0.40), (8, 0.30), (3, 0.20), (None, 0.50)):
             assert Backtester._credit_take_profit_pct(dte) == pytest.approx(expect)
             assert exit_policy.credit_take_profit_pct(dte) == pytest.approx(expect)
