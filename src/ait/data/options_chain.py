@@ -142,6 +142,87 @@ def _risk_free_rate() -> float:
         return 0.05
 
 
+def solve_iv_from_price(
+    price: float, spot: float, strike: float, t: float, r: float, flag: str,
+) -> tuple[float | None, str]:
+    """Solve implied vol from ONE observed option price via py_vollib.
+
+    W55: extracted from `_calculate_greeks`'s pass-1 solve block (the exact
+    same `implied_volatility()` call and arbitrage-exception handling) so the
+    monitor loop's synthetic per-leg delta (execution/synthetic_delta.py) and
+    the entry-time chain scan share one py_vollib call site instead of two
+    that could silently drift apart. `_calculate_greeks` calls this now
+    rather than inlining the solve.
+
+    No two-sided-quote gate here — that's a caller concern (the chain scan
+    only calls this when `c.has_two_sided_quote`; the monitor loop has no
+    bid/ask at all, only a single mark, and gates on `price > 0` instead).
+
+    Returns `(iv, outcome)`. `outcome` is:
+    - `"solved"` — iv is the solved value, >= MIN_PHYSICAL_IV.
+    - `"failed_arbitrage"` — the quote sits outside the no-arbitrage band
+      (W19/w17-07: a data-quality signal, not a solver failure).
+    - `"failed_other"` — no convergence, a solved value below
+      MIN_PHYSICAL_IV, or py_vollib itself is unavailable.
+    iv is None whenever outcome isn't "solved".
+    """
+    try:
+        from py_vollib.black_scholes.implied_volatility import implied_volatility
+    except ImportError:
+        return None, "failed_other"
+    try:
+        from py_lets_be_rational.exceptions import (
+            AboveMaximumException,
+            BelowIntrinsicException,
+        )
+        arbitrage_errors: tuple = (BelowIntrinsicException, AboveMaximumException)
+    except Exception:  # noqa: BLE001 — older/newer lib layout
+        arbitrage_errors = ()
+    try:
+        solved = implied_volatility(price, spot, strike, t, r, flag)
+        if solved and solved >= MIN_PHYSICAL_IV:
+            return solved, "solved"
+        return None, "failed_other"
+    except arbitrage_errors:
+        return None, "failed_arbitrage"
+    except Exception:
+        return None, "failed_other"
+
+
+def compute_greeks_from_sigma(
+    spot: float, strike: float, t: float, r: float, sigma: float, flag: str,
+) -> tuple[float, float, float, float] | None:
+    """Delta, gamma, theta (per day), vega (per 1 vol point) from a KNOWN
+    sigma via py_vollib.
+
+    W55: a NEW function for the monitor loop's synthetic per-leg delta, not
+    an extraction from `_calculate_greeks`'s pass-2 Greeks loop. Pass 2 has a
+    subtler contract: it only recomputes a Greek IBKR hasn't already
+    delivered, and a mid-computation exception there leaves whatever was
+    already assigned in place (partial success survives). This function has
+    no such partial state to preserve -- the monitor loop always starts from
+    nothing and wants all four fresh -- so it computes all four unconditionally
+    and returns None on ANY exception, all four or nothing. `_calculate_greeks`
+    keeps its own pass-2 loop calling `delta`/`gamma`/`theta`/`vega` directly;
+    sharing this function there would change its partial-failure behavior.
+
+    Returns `(delta, gamma, theta, vega)` or None if the calculation fails.
+    """
+    try:
+        from py_vollib.black_scholes.greeks.analytical import delta, gamma, theta, vega
+    except ImportError:
+        return None
+    try:
+        return (
+            delta(flag, spot, strike, t, r, sigma),
+            gamma(flag, spot, strike, t, r, sigma),
+            theta(flag, spot, strike, t, r, sigma) / 365.0,
+            vega(flag, spot, strike, t, r, sigma) / 100.0,
+        )
+    except Exception:
+        return None
+
+
 @lru_cache(maxsize=1)
 def _liquidity_thresholds() -> tuple[int, int, float]:
     """Process-wide resolved thresholds (see _resolve_liquidity).
@@ -937,19 +1018,6 @@ class OptionsChainService:
         """Calculate Greeks using Black-Scholes for contracts missing them."""
         try:
             from py_vollib.black_scholes.greeks.analytical import delta, gamma, theta, vega
-            from py_vollib.black_scholes.implied_volatility import implied_volatility
-            # W19 (w17-07): py_lets_be_rational raises these when the observed
-            # price sits outside the no-arbitrage band — i.e. the QUOTE is
-            # impossible, not the solve. Kept separate from convergence
-            # failures so a bad market can be counted as a bad market.
-            try:
-                from py_lets_be_rational.exceptions import (
-                    AboveMaximumException,
-                    BelowIntrinsicException,
-                )
-                _ARBITRAGE_ERRORS: tuple = (BelowIntrinsicException, AboveMaximumException)
-            except Exception:  # noqa: BLE001 — older/newer lib layout
-                _ARBITRAGE_ERRORS = ()
         except ImportError:
             log.debug("py_vollib_not_available", action="skipping greeks calculation")
             return
@@ -1019,20 +1087,21 @@ class OptionsChainService:
                     c.implied_vol = 0.0            # missing until proven otherwise
                     if c.has_two_sided_quote:
                         iv_solve_attempted += 1
-                        try:
-                            _solved = implied_volatility(
-                                c.mid, S, c.strike, t, r, flag)
-                            if _solved and _solved >= MIN_PHYSICAL_IV:
-                                c.implied_vol = _solved
-                                iv_solved_from_price += 1
-                            else:
-                                iv_solve_failed_other += 1
-                        except _ARBITRAGE_ERRORS:
+                        # W55: the solve itself now lives in solve_iv_from_price
+                        # (module-level, shared with the monitor loop's
+                        # synthetic per-leg delta) — same call, same
+                        # arbitrage-exception handling, just no longer inlined.
+                        _solved, _outcome = solve_iv_from_price(
+                            c.mid, S, c.strike, t, r, flag)
+                        if _outcome == "solved":
+                            c.implied_vol = _solved
+                            iv_solved_from_price += 1
+                        elif _outcome == "failed_arbitrage":
                             # The QUOTE is impossible, not the solver: mid is
                             # outside the no-arbitrage band. A data-quality
                             # signal worth surfacing on its own.
                             iv_solve_failed_arbitrage += 1
-                        except Exception:
+                        else:
                             iv_solve_failed_other += 1
 
         # ---- chain-level facts, from the POST-solve IV set -----------------

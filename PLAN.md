@@ -9802,3 +9802,161 @@ W53 probe itself), W55-57, CENSUS-1..5, W52a's four items, `get_chain_for_expiry
 No inspect.getsource -- this entry touches no test files.
 
 ---
+
+## 2026-09-27 - W55 EXECUTED — synthetic per-leg delta for the monitor loop
+
+SCOPE. Per the 2026-09-22 ROADMAP EXTENSION (`:8783-8905`), explicitly independent of
+W52-54/W53's atomicity probe: no rule on the exit/monitor path has a live per-leg delta
+today. Rule 3b (delta_breach) is dead -- `_get_position_delta` (portfolio.py:1117-1166)
+requires `ib.ticker(contract).modelGreeks`, a live market-data subscription the exit loop
+never holds, and ib_insync 0.9.86's `PortfolioItem` carries zero greeks fields (its own R16
+docstring). The ONE live per-leg data source the monitor loop has is `_get_option_marks()`
+(portfolio.py:312-324) -- a single `marketPrice`, no bid/ask, no IV. This wave adapts the
+existing, already-audited py_vollib IV-solve-then-Greeks pattern
+(`options_chain.py:936-1112`, entry-time chain scanning only) to run off that single live
+price instead, and validates it against real prices before anything is wired to depend on
+it. **Nothing calls the new code from this wave** -- same "additive, unreachable from any
+live path" convention W53's first slice used.
+
+OPERATOR DECISION THIS SESSION: the new monitor-loop solver shares code with the existing
+entry-time Greeks pipeline via an extract-function refactor (proven behavior-preserving
+below), rather than duplicating the py_vollib calls in a second, parallel implementation --
+the single-source-of-truth choice, so a future audit fix to the solve lands in both call
+sites automatically.
+
+FIX:
+1. **`data/options_chain.py`** -- two new module-level pure functions, both usable
+   standalone (no chain, no `self`):
+   - `solve_iv_from_price(price, spot, strike, t, r, flag) -> (iv|None, outcome)`:
+     extracted VERBATIM from `_calculate_greeks`'s pass-1 solve block (the exact
+     `implied_volatility()` call and the W19/w17-07 arbitrage-exception handling that
+     tells a genuinely-impossible quote apart from a convergence miss). `outcome` is
+     `"solved"` / `"failed_arbitrage"` / `"failed_other"`.
+   - `compute_greeks_from_sigma(spot, strike, t, r, sigma, flag) -> (d,g,th,v)|None`: a
+     NEW function, deliberately NOT extracted from pass-2's Greeks loop -- pass 2 has a
+     subtler contract (only recomputes a Greek IBKR hasn't already delivered; a
+     mid-computation exception leaves whatever was already assigned in place, partial
+     success survives) that the monitor loop's "always start from nothing, want all four
+     fresh, all-or-nothing on any exception" need doesn't share. Sharing it there would
+     have changed pass 2's partial-failure behavior -- left untouched, duplicated with
+     simpler semantics instead. This distinction (share where the contract genuinely
+     matches, don't force-share where it doesn't) is worth a future reader noting before
+     assuming "extract everything" was the goal.
+   - `_calculate_greeks` refactored to CALL `solve_iv_from_price` in its pass-1 loop
+     instead of inlining the same code; its own now-redundant top-level
+     `implied_volatility`/arbitrage-exception imports removed (dead after the extraction --
+     confirmed unused, `implied_volatility` is no longer called anywhere else in the
+     method). Pass 2 is BYTE-IDENTICAL, untouched.
+2. **New module `execution/synthetic_delta.py`** (same "nothing calls into this module
+   yet" convention as `roll_selector.py`; no import-cycle risk confirmed --
+   `roll_selector.py:17` already imports `data/options_chain.py`, direct precedent):
+   - `synthetic_leg_greeks(option_marks, symbol, expiry, strike, right, spot) ->
+     ContractGreeks | None`: builds the exact `YYYYMMDD` key `_get_option_marks()`/
+     `_option_position_unrealized()` use (`str(expiry).replace("-","")[:8]`,
+     portfolio.py:322,370), requires `price > 0` (the one guard `_get_option_marks()`
+     itself lacks -- it only filters None/NaN), calls `solve_iv_from_price` then
+     `compute_greeks_from_sigma`. ANY failure -- missing mark, non-positive price, bad
+     expiry, solve failure, arbitrage exception -- returns `None`, never a guessed value:
+     matches `_get_position_delta`'s own None-on-failure convention exactly. No
+     chain-level median fallback exists for a single leg outside a chain, and none is
+     invented here. `t` uses the IDENTICAL whole-calendar-day convention
+     `OptionsChain.dte`/`OptionContract.dte` use (`today_et()`-based, floored at 0.001)
+     -- consistency with the audited pattern, not a new time-resolution scheme. Calls
+     `_risk_free_rate()` directly (imported from `options_chain.py`) rather than taking a
+     rate parameter, so a caller can't accidentally pass an inconsistent rate.
+   - `synthetic_vertical_deltas(trade, side, option_marks, spot) -> {"short":..., "long":
+     ...}`: the trade-level wrapper, same legs-JSON idiom W52's `_short_strikes_from_legs`
+     and W53's `_at_risk_vertical` (roll_selector.py:41-61) use. Requires a CLEAN single
+     short+long pair on `side` -- same invariant `_at_risk_vertical` enforces -- returning
+     `{"short": None, "long": None}` otherwise, not a partial result.
+   - `_get_position_delta`'s own separate bug (sums every `ib.portfolio()` item for the
+     SYMBOL without matching the trade's own legs, double-counting across two trades on
+     the same symbol, portfolio.py:1152-1154) is dead-code-only, out of this wave's scope,
+     registered not fixed.
+3. **`scripts/validate_w55_synthetic_delta.py`** -- the wave's own explicit "validate
+   against real monitor-loop prices before anything depends on it" requirement. Read-only:
+   places no orders, calls no whatIfOrder, requests no Greeks subscription. Fetches a real
+   live chain via the audited path (a cross-check IV/delta source), simulates what a
+   monitor-loop mark would look like for the same contracts (that chain's own mid, standing
+   in for `_get_option_marks()`'s `marketPrice`), runs the NEW synthetic path against it,
+   and reports both side by side plus a sanity verdict (delta in [-1,1], IV positive,
+   chain-vs-synthetic delta within 0.10). Also checks `ib.portfolio()` directly against any
+   REAL open positions, if any exist by the time it runs -- the actual production data
+   shape, not a stand-in. ClientId 98 -- outside the bot's ladder (1, 101-105) and the W53
+   probe's 97.
+
+A REAL BUG CAUGHT BY A TEST WRITTEN AFTER THE IMPLEMENTATION, not a design choice:
+`synthetic_vertical_deltas`'s docstring said "a clean single short+long pair," but the
+first implementation checked each side (`len(shorts)==1`, `len(longs)==1`) independently --
+a single-leg trade with only a short would still return a solved `"short"` result instead
+of the documented `{"short": None, "long": None}`. `test_a_single_leg_trade_not_a_clean_
+vertical_returns_none_pair` caught the mismatch on first run; fixed to require both
+conditions together before computing either leg, matching `_at_risk_vertical`'s own
+invariant. Kept as a note: writing tests after an implementation still catches real bugs
+when the test is driven by the function's OWN documented contract rather than by what the
+code happens to do -- same lesson the W53 probe's `record_evidence` kwarg collision taught.
+
+PROOF. `tests/test_w55_solve_contract_greeks.py` (11 tests) + `tests/test_w55_synthetic_
+delta.py` (16 tests) = 27 new, all real py_vollib round-trips or real `TradeRecord`/legs-JSON
+fixtures with a plain dict for `option_marks` (never `MagicMock`, matching W51's own
+convention for this exact dict shape) -- covers: a healthy solve (calls and puts), the
+below-intrinsic and above-maximum arbitrage failures, a solve landing below
+`MIN_PHYSICAL_IV` (empirically confirmed: a genuine sigma=0.001 price solves to exactly
+0.0, a real "failed_other" case, not manufactured), a `t=0` py_vollib exception (empirically
+confirmed: `ValueError: cannot convert float NaN to integer`, unreachable via either real
+caller since both floor `t` at 0.001, but proves the all-four-or-nothing contract), a
+missing/zero/negative mark, a malformed expiry, a malformed `trade.legs`, a condor's
+call-side legs not being touched when only the put side is requested, and the expiry-key
+class-guard (`_expiry_key` proven identical to `_get_option_marks()`'s real inline
+normalization across three string shapes). Mutation-checked the way a brand-new file is
+proven: `git stash push -- src/ait/data/options_chain.py` made
+`test_w55_solve_contract_greeks.py` fail collection (`ImportError: cannot import name
+'compute_greeks_from_sigma'`) -- confirmed the tests exercise the real functions, not a
+stale import; `git stash pop` restored, 27/27 green again.
+
+Refactor regression proof: `test_w35_chain_iv_after_the_solve.py` + `test_w19_greeks_
+provenance.py` + `test_r16_data_fixes.py` + `test_w36_config_homes_and_drain.py` (61 tests,
+the full existing Greeks suite) re-run UNCHANGED after the `_calculate_greeks` refactor --
+61/61 green, identical to before. Neighbor files most likely to interact
+(`test_credit_exits.py`, `test_w52_multileg_itm_diagnosis.py`, `test_w51_ex_div_
+assignment.py`, `test_exit_staleness_gate.py`, `test_w53_roll_target_selection.py`):
+79/79 unaffected. All ten files together: 167/167. `python -m compileall -q src`: OK.
+`python scripts/typecheck.py`: OK, zero attr-defined/call-arg/name-defined in
+`src/ait/{config,bot,execution,risk}` -- and the two new non-blocking `arg-type` findings
+`synthetic_delta.py` introduced (mypy couldn't narrow `iv: float | None` past the
+`outcome == "solved"` check) were fixed with an explicit `or iv is None` guard rather than
+left as noise, confirmed clean by a standalone `mypy` run on the two touched files.
+
+STATE AT HANDOFF. `data/options_chain.py` (live, already-audited file) changed via a
+mechanical extract-refactor, proven zero-behavior-change by the full existing Greeks suite
+passing unchanged. `execution/synthetic_delta.py` is new, additive, and unreachable from
+any live path -- no caller wired in this wave. `scripts/validate_w55_synthetic_delta.py`
+built but NOT YET RUN live -- TWS paper was reachable earlier this session (the W53 probe
+connected to it) but is no longer listening on 127.0.0.1:7497 as of this entry, and it's
+still Sunday 2026-09-27 outside RTH regardless. No restart needed for correctness (nothing
+new is wired to any live path), though the next restart will pick up the refactored
+`options_chain.py` alongside whatever else is pending.
+
+NEXT: **the live validation run** (`scripts/validate_w55_synthetic_delta.py`, read-only, no
+orders) -- needs TWS reachable during an RTH session, same window as W53's still-pending
+placing run; both can run back-to-back in the same live session rather than needing separate
+ones. Its output (sane ranges, chain-vs-synthetic delta agreement) folds into a follow-up
+entry the same way the W53 probe's preflight-then-live split worked. Once validated,
+`synthetic_leg_greeks`/`synthetic_vertical_deltas` are ready for a real caller -- W56
+("Tested/untested decision logic," needs this) is the first candidate, still itself gated
+on the same non-boolean `check_positions` decision-output extension W54 needs (design once,
+use for both, per the original roadmap entry). Also available but not committed to any
+wave, noted `:8836-8838` and reconfirmed here: `_get_position_delta` could be revived by
+substituting this new synthetic solve in place of its dead `modelGreeks` dependency, at
+near-zero extra cost -- not decided or built. The full fast lane was kicked off in the
+background at this entry's writing; its result folds into the NEXT entry once it finishes,
+same "register-don't-fix, don't block on it" discipline used for the W53 probe's own build
+entry. Every other open item is unchanged: W53's placing run, W54 (waiting on the operator
+per the W54 scoping-note entry above), W56/57, CENSUS-1..5, W52a's four items,
+`get_chain_for_expiry`, and the `test_watchdog.py` discrepancy.
+
+No inspect.getsource -- this wave's new tests drive the real `solve_iv_from_price`,
+`compute_greeks_from_sigma`, `synthetic_leg_greeks`, `synthetic_vertical_deltas`, and
+`_expiry_key`, never assert on source strings.
+
+---
