@@ -9960,3 +9960,45 @@ No inspect.getsource -- this wave's new tests drive the real `solve_iv_from_pric
 `_expiry_key`, never assert on source strings.
 
 ---
+
+## 2026-09-27 - W55 fast lane confirmed — same 3 pre-existing failures, and a second
+data point on the test_watchdog.py discrepancy
+
+The full fast lane the entry above deferred: **2515 passed / 3 failed / 46 skipped / 153
+deselected, 958.61s (15m59s)** — faster than the W53-probe fast lane's 47m54s on the same
+box the same day, consistent with the box's already-registered throttling variance, not a
+correctness signal.
+
+All 3 failures are the SAME ones the two entries above already named — confirmed, not
+assumed: `test_r19_config_authority.py::TestContractIsTheSingleAuthority::
+test_applier_and_readers_share_one_table` (the standing `AIT_MARKET_DATA_TYPE` env
+divergence) and BOTH `test_watchdog.py::TestOverallHealth` tests
+(`test_all_healthy`, `test_one_down_marks_overall_down`). Zero new failures from this
+wave's `options_chain.py`/`execution/synthetic_delta.py` changes.
+
+A SECOND DATA POINT on the `test_watchdog.py` discrepancy the entry immediately above
+registered as open and unexplained: this run reproduces both failures under the full
+suite, while a standalone re-run right after (`pytest tests/test_watchdog.py -q -m "not
+ibkr and not slow"`) is 20/20 green again — the SAME pattern as this morning's W53-probe
+fast lane (which had 20/20 clean standalone but zero watchdog failures in that day's full
+run — the reverse pairing, both directions now observed). This is real, if still
+circumstantial, support for the "timing/load-sensitive under full-suite resource
+contention, not deterministically broken" theory that entry registered as unconfirmed —
+two full-suite runs on the same day disagreeing with each other, and both disagreeing with
+a clean standalone run each time, is hard to explain any other way. Not chased further
+(the file is untouched by W52/W53/W55, and out of scope for all three) — still registered
+for whoever next touches `test_watchdog.py` or the health-check machinery it exercises,
+now with a second confirming observation rather than one.
+
+No `src/ait` or test file changed by this entry — register-only.
+
+NEXT: unchanged from the entry above — the live validation run (`scripts/validate_w55_
+synthetic_delta.py`) alongside W53's still-pending placing run, both waiting on the next
+RTH session with TWS reachable (confirmed not reachable as of this entry — the operator
+closed it after the earlier probe work). Every other open item is unchanged: W54 (waiting
+on the operator), W56/57, CENSUS-1..5, W52a's four items, `get_chain_for_expiry`, and the
+now-twice-observed `test_watchdog.py` discrepancy.
+
+No inspect.getsource — this entry touches no test files, only reports a suite run.
+
+---
