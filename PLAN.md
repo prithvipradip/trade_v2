@@ -10523,3 +10523,138 @@ waiting on the operator; **W56/57**; **W52a's four items**; `get_chain_for_expir
 No inspect.getsource — this entry touches no test files, only reports a suite run.
 
 ---
+
+## 2026-09-27 - CENSUS-2 EXECUTED — the "exit-policy/engine" rewrite batch of the
+test-honesty `inspect.getsource` census
+
+Batch B (register sequence A→E→D→B done; C remains). Scope reconciled BEFORE research,
+not assumed from the stale 2026-09-21 count: the original entry named 7 sites for this
+batch, but 3 were already resolved incidentally by earlier, differently-scoped work —
+`test_r16_touch_stop.py:129/136` (the whole `TestWiring` class CENSUS-5 deleted) and
+`test_r20_research_validity.py:490` (a 2-line getsource prelude CENSUS-5 already stripped
+from a test that kept its own real assertions). **Actual scope: 4 sites, all in
+`test_r20_research_validity.py`** — `TestSharedExitPolicy.test_macro_flatten_windows_
+match_live_source` (getsource halves at the old `:573`/`:584`) and
+`test_expiry_close_dte_matches_live_source` (`:594`/`:598`). A 5th getsource call in the
+same file (`:200`, `test_no_context_free_get_iv_call_sites`) is a genuine absence check,
+independently re-confirmed, and stays untouched (as it has every prior batch this file
+was touched in).
+
+FINDING (independent of the census, worth recording on its own): the two production call
+sites this batch's tests are supposed to prove "share one source of truth" read the SAME
+`ait.execution.exit_policy` constants ASYMMETRICALLY. `backtesting/engine.py:2597,2609`
+reads `exit_policy.EXPIRY_APPROACHING_DTE` / calls `exit_policy.macro_flatten_window_
+days(...)` as MODULE-ATTRIBUTE lookups at call time — monkeypatching the module's
+attribute genuinely moves the engine. `execution/portfolio.py:24-25` does `from
+ait.execution.exit_policy import (EXPIRY_APPROACHING_DTE, ...)` — a VALUE import,
+binding a private copy into `portfolio.py`'s own namespace at import time; monkeypatching
+`exit_policy.EXPIRY_APPROACHING_DTE` afterward does NOT move what live already bound
+(confirmed directly: a live-side probe of the patched constant kept reading the original
+value). Consequence: "live and engine agree on `EXPIRY_APPROACHING_DTE`" can only be
+proven honestly by a BOUNDARY-VALUE comparison (both close at dte==5, both hold at
+dte==6), never by a shared-patch-and-compare. `macro_flatten_window_days` does NOT have
+this trap — it reads a mutable dict (`MACRO_FLATTEN_WINDOW_DAYS`), and `setitem`-patching
+the dict genuinely moves both call sites, since neither one binds a copy of the dict
+itself. Future test-honesty work near an import boundary should check which import form
+is in play before assuming a shared monkeypatch proves delegation.
+
+REWRITES (both in `TestSharedExitPolicy`, `tests/test_r20_research_validity.py`):
+1. `test_macro_flatten_windows_match_live_source` → renamed
+   `test_macro_flatten_windows_match_across_live_and_engine`. Kept the file's own existing
+   real `exit_policy.macro_flatten_window_days(...)` assertions. Replaced both getsource
+   halves with a sweep over `{short_strangle, jade_lizard, cash_secured_put, covered_call,
+   iron_condor} × {0,1,2,5,6}` days-to-event, driving the REAL engine
+   (`Backtester._check_exit_credit`, stub `_economic_cal`, `AIT_SKIP_MACRO_EVENTS=1`) and
+   the REAL live path (`_evaluate_position` via new local `_live_pm`/`_live_trade`
+   helpers, adapted from `test_r15_review_fixes.py:319-363`), asserting both flatten
+   exactly when `d2e <= window` and hold otherwise. Plus a delegation case:
+   `monkeypatch.setitem(exit_policy.MACRO_FLATTEN_WINDOW_DAYS, "cash_secured_put", 3)` at
+   d2e=3 flattens BOTH engines.
+2. `test_expiry_close_dte_matches_live_source` → renamed
+   `test_expiry_close_dte_matches_across_live_and_engine`. Kept the existing real
+   `EXPIRY_APPROACHING_DTE == 5` assertion. Replaced both getsource halves with the
+   boundary-value proof described in the finding above (both engines close at dte==5,
+   hold at dte==6; engine-only, `monkeypatch.setattr(exit_policy, "EXPIRY_APPROACHING_
+   DTE", 7)` moves the engine's own boundary to 7 — live cannot be proven this way, so it
+   isn't asserted there).
+
+BUGS CAUGHT DURING IMPLEMENTATION, both real, both fixed before this entry:
+- **A self-referential proof bug in the first draft of rewrite 1**: the sweep computed
+  its own `window = exit_policy.macro_flatten_window_days(strategy)` INSIDE the test,
+  making `expect_flatten` derive from the very function under test — mutation-checking
+  (`MACRO_FLATTEN_WINDOW_DAYS["cash_secured_put"]` 1→4, real edit, reverted after) proved
+  this: with the file's pre-existing flat assertion temporarily disabled to isolate the
+  new sweep code, the sweep PASSED even against the mutated value, because its own
+  expectation moved with the mutation. Fixed by hardcoding `expected_windows` as a
+  literal dict in the test instead of re-deriving it from `exit_policy`. Re-verified after
+  the fix: the same mutation now fails at the sweep itself (`d2e=2 (window=1) should
+  hold, got macro_event_flatten`), independent of the flat assertion.
+- **A wrong wall-clock source for the live half of rewrite 2**: `PortfolioManager.
+  _evaluate_position`'s DTE math reads `today_et()` (`portfolio.py:481`), not the fixed
+  `date(2026, 6, 3)` the engine side uses as `current_date` — the first draft built the
+  live trade's `expiry` off the engine's fixed date, which is wrong on any day this test
+  runs except that literal one. Fixed by computing `live_expiry` from the real
+  `ait.utils.time.today_et()` for the live-side trade construction, keeping the engine
+  side on its own fixed clock (a legitimate difference: the engine test is date-
+  parametrized by design, the live helper's DTE math is a runtime read).
+
+PROOF. `tests/test_r20_research_validity.py` alone: 30/30 (unchanged count — both
+rewrites are in-place, same as CENSUS-1's discipline, not parametrize-expanded). Both
+trap-relevant claims mutation-checked against real, reverted edits to
+`src/ait/execution/exit_policy.py` (`MACRO_FLATTEN_WINDOW_DAYS["cash_secured_put"]` 1→4,
+and separately `EXPIRY_APPROACHING_DTE` 5→3) — each confirmed to fail the corresponding
+rewritten test, then reverted (`git diff --stat src/ait/execution/exit_policy.py` empty
+before moving on). Sibling files this rewrite leans on for context re-run standalone,
+confirming they're unaffected: `test_r15_review_fixes.py` + `test_r16_tail_fixes.py` +
+`test_credit_exits.py` together, 115/115. `python -m compileall -q src tests`: OK. Census
+recount, same reconciliation method as CENSUS-1/4/5 (grep `inspect.getsource` across
+`tests/`, excluding `test_w23_scheduler_timezone.py` and the 2 known prose mentions in
+`test_w18_gateway_port_and_throttle.py`): **16 real sites remain, across 8 files** —
+exactly 20 minus this batch's 4 (`test_r15_review_fixes.py` 1, `test_r16_tail_fixes.py` 6,
+`test_r16_core_fixes.py` 1, `test_r16_round2_fixes.py` 2, `test_r20_research_validity.py`
+1 — the confirmed-legitimate `:200` absence check, `test_r16_research_fixes.py` 2,
+`test_w20_host_clock_and_calendar_faults.py` 1, `test_r16_risk_fixes.py` 1).
+
+NEW, UNRELATED DISCOVERY (registered, not fixed — out of this batch's scope): the full
+fast lane run after this batch (next entry) surfaced a genuine, pre-existing environment-
+timing bug in `tests/test_w51_ex_div_assignment.py`, unrelated to anything CENSUS-2
+touched. Root-caused directly, not guessed: this machine's local clock is CEST (UTC+2);
+at the moment of the run it was just past local midnight (2026-09-28 00:xx local) while
+`America/New_York` was still 2026-09-27 ~18:30 (`today_et()` six hours behind local
+`date.today()`). `_manager()`'s test fixture builds `next_ex_div_date = date.today() +
+timedelta(days=next_ex_div_days)` — LOCAL wall-clock, not `today_et()` — while the
+production code it's exercising (`portfolio.py:901`, `days_to_ex_div = (info.
+next_ex_div_date - today_et()).days`) correctly uses ET. With local a day ahead of ET,
+`next_ex_div_days=1` fixture input produces `days_to_ex_div == 2`, missing the `== 1`
+check the test means to hit — `should_exit` stays `False`. This is exactly the "bare
+`date.today()`/`datetime.now()` in scheduling or gating" bug class CLAUDE.md already
+names for waves W20/W21/W23, now found in a TEST fixture rather than production code, and
+purely a function of this Mac's timezone plus the hour the suite happened to run.
+Confirmed NOT a CENSUS-2 regression: `git diff --stat src/ait` is empty (only test files
+touched all batch), the test fails in complete isolation with no other tests run first,
+and the arithmetic above reproduces the exact `dte=21`/`should_exit=False` result seen in
+the failure. Registered for whoever next touches that file (fix: build the fixture's
+`next_ex_div_date` from `ait.utils.time.today_et()` instead of `date.today()`) — not
+fixed here, matching register-don't-fix discipline for a file this batch has no other
+reason to touch.
+
+STATE AT HANDOFF. Test-file-only change, 1 file (`tests/test_r20_research_validity.py`);
+zero `src/ait` files touched (every mutation made during verification was reverted before
+moving to the next check). Zero config changes. Nothing to deploy or restart. Full fast
+lane already run (result in the next entry, not deferred this time).
+
+NEXT, naming every open item explicitly: **CENSUS-3** (`master.py`/entrypoint, ~3 sites,
+"the expensive one despite fewest sites" per its own prior scoping — not yet re-verified
+against current HEAD) is the last remaining batch of the original 5. Still open from
+prior entries: the 3-site delete-only discrepancy (`test_r16_tail_fixes.py:590`-half,
+`test_r16_research_fixes.py:159`, `test_r15_review_fixes.py:293`); the
+`_run_override_block` follow-up (`test_r17_dormant_strategy_fixes.py:64-74`); **W53's
+placing run** and **W55's live validation run**, both waiting on TWS reachable during an
+RTH session; **W54** waiting on the operator; **W56/57**; **W52a's four items**; the
+dormant `get_chain_for_expiry` bug; **`test_watchdog.py`**'s load-sensitivity
+discrepancy (four clean, one failed, still unresolved); and the newly-registered
+**`test_w51_ex_div_assignment.py` local-midnight/`today_et()` fixture bug** above.
+
+No inspect.getsource in either rewritten test — both now drive the real engine and real
+live code paths directly, mutation-verified above.
+

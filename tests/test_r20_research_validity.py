@@ -32,8 +32,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from datetime import date
+import json
+from datetime import date, datetime
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
 import pandas as pd
@@ -563,40 +565,203 @@ class TestSharedExitPolicy:
             25, time_decay_scaling=False
         ) == (1.0, 0.50)
 
-    def test_macro_flatten_windows_match_live_source(self):
-        from ait.execution import exit_policy
-        from ait.execution.portfolio import PortfolioManager
+    # --- shared live-side harness, adapted from test_r15_review_fixes.py's
+    # TestPreEventBlackoutRelaxed._live_pm/_live_trade (kept local -- this
+    # file's own convention -- rather than imported across test modules).
 
-        # R20 #5a follow-up: live portfolio.py now DELEGATES to the shared
-        # table instead of hand-copying the strategy/window mapping (was a
-        # source-regex tripwire for the inline copy; now checks delegation).
-        src = inspect.getsource(PortfolioManager._evaluate_position)
-        assert "macro_flatten_window_days" in src, (
-            "live portfolio.py should delegate macro-flatten windows to exit_policy"
-        )
+    def _live_pm(self, *, d2e):
+        """PortfolioManager wired far enough to run _evaluate_position."""
+        from ait.config.settings import ExitConfig
+        from ait.execution.portfolio import PortfolioManager
+        pm = PortfolioManager.__new__(PortfolioManager)
+        pm._last_quote_ts = {}
+        pm._frozen_alerted = set()
+        pm._touch_confirm = {}
+        pm._marks_missing_streak = {}
+        pm._pdt_alerted = set()
+        pm._notify_cb = None
+        pm._earnings = None
+        pm._exit_config = ExitConfig()
+        pm._quality = MagicMock()
+        pm._quality.validate_quote.return_value = SimpleNamespace(
+            is_valid=True, issues=[], staleness_seconds=1.0)
+        pm._ibkr = MagicMock()
+        pm._ibkr.connected = False
+        pm._market_data = MagicMock()
+        pm._market_data.get_quote = AsyncMock(return_value=SimpleNamespace(
+            mid=700.0, bid=699.99, ask=700.01, last=700.0, volume=1000,
+            timestamp=datetime(2026, 8, 10, 14, 0, 0)))
+        pm._option_position_unrealized = lambda *a, **k: 12.0  # small winner
+        pm._state = MagicMock()
+        pm._state.get_high_water_mark.return_value = 0.05
+        pm._pdt_guard = MagicMock()
+        pm._pdt_guard.would_be_day_trade.return_value = False
+        cal = MagicMock()
+        cal.days_until_next_event.return_value = d2e
+        pm._economic_cal = cal
+        return pm
+
+    def _live_trade(self, strategy, expiry=None):
+        legs = [{"strike": 690.0, "right": "P", "action": "SELL"},
+                {"strike": 720.0, "right": "C", "action": "SELL"}]
+        if strategy == "iron_condor":
+            legs += [{"strike": 660.0, "right": "P", "action": "BUY"},
+                     {"strike": 750.0, "right": "C", "action": "BUY"}]
+        return SimpleNamespace(
+            trade_id=f"T-{strategy}", symbol="SPY", strategy=strategy,
+            contract_type=strategy, quantity=1, entry_price=4.24,
+            direction=SimpleNamespace(value="neutral"),
+            expiry=expiry, strike=None, entry_time="2026-08-04T10:51:37",
+            legs=json.dumps(legs))
+
+    async def test_macro_flatten_windows_match_across_live_and_engine(
+            self, synth_df, synth_features, monkeypatch):
+        """CENSUS-2 (2026-09-27): drives BOTH the real engine
+        (Backtester._check_exit_credit) and the real live path
+        (PortfolioManager._evaluate_position) across every strategy and a
+        spread of days-to-event, instead of grepping each one's source for
+        the shared table's name. exit_policy.macro_flatten_window_days
+        (imported via `from ... import exit_policy`, a MODULE reference, not
+        a value import) is what both engines actually call at run time --
+        confirmed by reading engine.py:2609 and portfolio.py directly."""
+        from ait.execution import exit_policy
+
         assert exit_policy.macro_flatten_window_days("short_strangle") == 5
         assert exit_policy.macro_flatten_window_days("jade_lizard") == 5
         assert exit_policy.macro_flatten_window_days("cash_secured_put") == 1
         assert exit_policy.macro_flatten_window_days("covered_call") == 1
         # Defined-risk condors hold through events (PLAN 2026-08-04)
         assert exit_policy.macro_flatten_window_days("iron_condor") is None
-        # Engine consumes the shared table, not its own tuple
-        eng_src = inspect.getsource(Backtester._check_exit_credit)
-        assert "macro_flatten_window_days" in eng_src or "MACRO_FLATTEN_WINDOW" in eng_src
 
-    def test_expiry_close_dte_matches_live_source(self):
+        monkeypatch.setenv("AIT_SKIP_MACRO_EVENTS", "1")
+
+        class _Cal:
+            def __init__(self, d2e):
+                self._d2e = d2e
+
+            def days_until_next_event(self, d):
+                return self._d2e
+
+        bt = Backtester(**_engine_kwargs(synth_df, synth_features))
+        today = date(2026, 6, 3)
+        pos_common = {"expiry_date": "2026-07-03",  # 30 DTE, clear of the
+                      "entry_date": "2026-06-03"}    # DTE<=5 close below
+
+        # Hardcoded, not re-derived from macro_flatten_window_days itself --
+        # deriving `window` from the function under test would make
+        # expect_flatten self-referential and unable to catch a mutation of
+        # the table (confirmed: an earlier draft that called
+        # macro_flatten_window_days() here passed even with
+        # cash_secured_put's window mutated to 4).
+        expected_windows = {"short_strangle": 5, "jade_lizard": 5,
+                            "cash_secured_put": 1, "covered_call": 1,
+                            "iron_condor": None}
+        for strategy in ("short_strangle", "jade_lizard", "cash_secured_put",
+                         "covered_call", "iron_condor"):
+            window = expected_windows[strategy]
+            for d2e in (0, 1, 2, 5, 6):
+                expect_flatten = window is not None and d2e <= window
+
+                bt._economic_cal = _Cal(d2e)
+                out = bt._check_exit_credit(
+                    dict(pos_common, strategy=strategy), pnl_pct=0.05,
+                    current_date=today)
+                if expect_flatten:
+                    assert out is not None and out["exit_reason"] == "macro_event_flatten", (
+                        f"engine: {strategy} at d2e={d2e} (window={window}) "
+                        f"should flatten, got {out}"
+                    )
+                else:
+                    assert out is None, (
+                        f"engine: {strategy} at d2e={d2e} (window={window}) "
+                        f"should hold, got {out}"
+                    )
+
+                pm = self._live_pm(d2e=d2e)
+                st = await pm._evaluate_position(self._live_trade(strategy))
+                if expect_flatten:
+                    assert st.should_exit is True and "macro_event_flatten" in (st.exit_reason or ""), (
+                        f"live: {strategy} at d2e={d2e} (window={window}) "
+                        f"should flatten, got {st}"
+                    )
+                else:
+                    assert "macro_event_flatten" not in (st.exit_reason or ""), (
+                        f"live: {strategy} at d2e={d2e} (window={window}) "
+                        f"should not macro-flatten, got {st}"
+                    )
+
+        # Delegation, not a hand-copy: patching the SHARED table must move
+        # BOTH engines together.
+        monkeypatch.setitem(exit_policy.MACRO_FLATTEN_WINDOW_DAYS, "cash_secured_put", 3)
+        bt._economic_cal = _Cal(3)
+        out = bt._check_exit_credit(
+            dict(pos_common, strategy="cash_secured_put"), pnl_pct=0.05,
+            current_date=today)
+        assert out is not None and out["exit_reason"] == "macro_event_flatten"
+        pm = self._live_pm(d2e=3)
+        st = await pm._evaluate_position(self._live_trade("cash_secured_put"))
+        assert st.should_exit is True and "macro_event_flatten" in (st.exit_reason or "")
+
+    async def test_expiry_close_dte_matches_across_live_and_engine(
+            self, synth_df, synth_features, monkeypatch):
+        """CENSUS-2 (2026-09-27): both engine.py:2597 and portfolio.py read
+        EXPIRY_APPROACHING_DTE, but NOT the same way -- engine.py does
+        `exit_policy.EXPIRY_APPROACHING_DTE` (a module-attribute lookup at
+        call time), while portfolio.py does `from ...exit_policy import
+        (EXPIRY_APPROACHING_DTE, ...)` (a VALUE import, bound once at import
+        time) -- confirmed directly: patching exit_policy's attribute moves
+        the engine but NOT live's already-bound name. So "delegates to the
+        same constant" can only be proven live-side by a BOUNDARY-VALUE
+        match, not by a patch-and-compare -- the engine gets both proofs."""
         from ait.execution import exit_policy
-        from ait.execution.portfolio import PortfolioManager
+        from ait.utils.time import today_et
 
         assert exit_policy.EXPIRY_APPROACHING_DTE == 5
-        # R20 #5a follow-up: live portfolio.py now DELEGATES (dte <=
-        # EXPIRY_APPROACHING_DTE) instead of hand-copying the literal 5.
-        src = inspect.getsource(PortfolioManager._evaluate_position)
-        assert "EXPIRY_APPROACHING_DTE" in src, (
-            "live portfolio.py should delegate the DTE-close rule to exit_policy"
-        )
-        eng_src = inspect.getsource(Backtester._check_exit_credit)
-        assert "EXPIRY_APPROACHING_DTE" in eng_src
+        monkeypatch.setenv("AIT_SKIP_MACRO_EVENTS", "0")  # keep macro out of the way
+
+        bt = Backtester(**_engine_kwargs(synth_df, synth_features))
+        today = date(2026, 6, 3)
+        # Live's own DTE math reads today_et() (portfolio.py:481), not the
+        # engine's `current_date` -- expiry must be built off the REAL
+        # wall-clock today for the live half of this comparison to be honest.
+        live_today = today_et()
+
+        for dte, expect_close in ((5, True), (6, False)):
+            expiry = today + pd.Timedelta(days=dte)
+            pos = {"expiry_date": str(expiry), "entry_date": str(today),
+                  "strategy": "iron_condor"}
+            out = bt._check_exit_credit(dict(pos), pnl_pct=0.05, current_date=today)
+            if expect_close:
+                assert out is not None and out["exit_reason"] in (
+                    "expiry", "expiry_approaching"), (
+                    f"engine: dte={dte} should close at the shared DTE "
+                    f"boundary, got {out}"
+                )
+            else:
+                assert out is None, f"engine: dte={dte} should hold, got {out}"
+
+            live_expiry = live_today + pd.Timedelta(days=dte)
+            trade = self._live_trade("iron_condor", expiry=str(live_expiry))
+            st = await self._live_pm(d2e=99)._evaluate_position(trade)
+            if expect_close:
+                assert st.should_exit is True and "expiry_approaching" in (st.exit_reason or ""), (
+                    f"live: dte={dte} should close at the shared DTE "
+                    f"boundary, got {st}"
+                )
+            else:
+                assert "expiry_approaching" not in (st.exit_reason or ""), (
+                    f"live: dte={dte} should hold, got {st}"
+                )
+
+        # Engine-only: the boundary itself must come from the shared
+        # constant, not a hand-copied 5 (live can't be proven this way --
+        # see the docstring's value-import note).
+        monkeypatch.setattr(exit_policy, "EXPIRY_APPROACHING_DTE", 7)
+        expiry7 = today + pd.Timedelta(days=7)
+        pos7 = {"expiry_date": str(expiry7), "entry_date": str(today),
+               "strategy": "iron_condor"}
+        out7 = bt._check_exit_credit(dict(pos7), pnl_pct=0.05, current_date=today)
+        assert out7 is not None and out7["exit_reason"] in ("expiry", "expiry_approaching")
 
     def test_engine_honors_time_decay_scaling_config(
         self, synth_df, synth_features, monkeypatch
