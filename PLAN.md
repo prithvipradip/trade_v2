@@ -10658,3 +10658,40 @@ discrepancy (four clean, one failed, still unresolved); and the newly-registered
 No inspect.getsource in either rewritten test — both now drive the real engine and real
 live code paths directly, mutation-verified above.
 
+---
+
+## 2026-09-28 - CENSUS-2 fast lane confirmed — 3 new observations, none a CENSUS-2
+regression, each independently root-caused
+
+Full fast lane after CENSUS-2: **2513 passed / 4 failed / 45 skipped / 153 deselected,
+853.39s (14m13s)**. Three distinct failure sources, none touching anything this batch
+rewrote:
+1. The standing `AIT_MARKET_DATA_TYPE` env divergence (`test_r19_config_authority.py`) —
+   unchanged, present in literally every fast-lane run this session.
+2. `test_watchdog.py`'s two flaky tests — fifth and sixth data points (four clean-under-
+   load, two failed-under-load now, both in the same run) — still unresolved, still out
+   of scope for whatever wave touches it next.
+3. **New**: `test_w51_ex_div_assignment.py::test_low_extrinsic_the_day_before_ex_div_
+   closes_regardless_of_dte`, root-caused and registered in the entry above (a local-
+   midnight-vs-`today_et()` fixture bug, not a CENSUS-2 regression).
+
+Count check: pre-batch baseline (CENSUS-4's fast lane) was 2515 passed + 1 failed = 2516.
+This run: 2513 + 4 failed = 2517 collected, but the collected-test COUNT itself is
+unchanged (CENSUS-2 rewrote 2 tests in place, added none) — the delta between 2516 and
+2517 total outcomes is the 3 additional distinct failures above, not a test-count change;
+`test_r20_research_validity.py` alone stayed 30/30 before and after, confirmed separately
+above.
+
+No `src/ait` file differs from HEAD (`git diff --stat src/ait` empty) — this entry
+reports a suite run only.
+
+NEXT: unchanged from the entry above — **CENSUS-3** (last remaining batch); the 3-site
+delete-only discrepancy; the `_run_override_block` follow-up; **W53's placing run** and
+**W55's live validation run** waiting on TWS during an RTH session; **W54** waiting on
+the operator; **W56/57**; **W52a's four items**; `get_chain_for_expiry`;
+**`test_watchdog.py`** (six data points, still unresolved); **`test_w51_ex_div_
+assignment.py`**'s newly-registered local-midnight fixture bug.
+
+No inspect.getsource — this entry touches no test files, only reports a suite run.
+
+---
