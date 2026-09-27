@@ -10695,3 +10695,132 @@ assignment.py`**'s newly-registered local-midnight fixture bug.
 No inspect.getsource — this entry touches no test files, only reports a suite run.
 
 ---
+
+## 2026-09-28 - CENSUS-3 EXECUTED — the "master.py/entrypoint" rewrite batch, PLUS a
+correction: the census does NOT fully close here after all
+
+Batch C, the last of the original 5 (A→E→D→B→C sequence now complete as originally
+planned). Re-verified against HEAD `9c31009` before touching anything: all 3 originally-
+named sites were still exactly where they were named, untouched since W38/CENSUS-2 —
+`test_r16_tail_fixes.py:727` (`health_check` post-market defer), `test_r16_tail_fixes.
+py:866` (`daily_digest` mirror-lag line), `test_r16_core_fixes.py:169` (bare `ait.main`
+import applies the runtime env contract).
+
+REWRITES:
+1. `TestPostMarketRestartWindow.test_health_check_consults_the_window` — now constructs a
+   real `BotManager()`, monkeypatches `ROOT`/`DATA_DIR` to `tmp_path`, `is_running` to
+   `True`, stubs `stop`/`start` to record calls, monkeypatches `ait.utils.time.
+   is_market_open` to `False` at ITS OWN module (the trap `test_r16_ops_fixes.py:112-113`
+   already documents — `master.py` imports it inside the function, so patching a
+   `master` attribute is a no-op), writes a real `.retrained` marker file, and drives
+   `health_check()` twice: `_in_post_market_window` patched `True` → asserts no
+   stop/start calls AND the marker file still exists (a real file check, not counting
+   `marker.unlink()` occurrences in a source slice); patched `False` → asserts
+   `["stop", "start"]` and the marker is gone — the mandatory positive control proving
+   the first case wasn't just "health_check never restarts."
+2. `TestMirrorLag.test_digest_prints_the_lag_state` — drives the real `daily_digest()`
+   twice with `master._mirror_lag` monkeypatched to `("current", 0.0)` and
+   `("behind", 28.3)`, capturing the actual message passed to a stubbed `_alert`, and
+   asserts on the CAPTURED TEXT (`"mirror current"`, `"mirror BEHIND live by 28h"`)
+   instead of grepping `daily_digest`'s source for the same two literals.
+3. `TestRuntimeEnvContract.test_bare_main_applies_contract` — a bare `import ait.main` in
+   a real subprocess (this repo already has 3 files with a `subprocess.run([sys.
+   executable, "-c", ...])` helper for exactly this shape of claim:
+   `test_w34_ops_substrate.py`, `test_w35_config_and_retrain.py`, `test_w38_pace_
+   window.py`), with 5 contract keys stripped from the child's env first
+   (`KMP_DUPLICATE_LIB_OK`, `OMP_NUM_THREADS`, `AIT_ALLOW_UNDEFINED_RISK`, `AIT_SKIP_
+   MACRO_EVENTS`, `AIT_IC_WING_K`), reading them back via a JSON print after the bare
+   import and asserting the exact resolved dict — instead of grepping `main.py`'s source
+   for the literal call `apply_runtime_env_defaults()`. No `main()`/`runpy`/argv
+   machinery needed — the site's own claim is about the import-time side effect, which a
+   bare import already proves directly. Runs in ~6s per the mutation-check run (heavy
+   imports and all).
+
+PROOF. `test_r16_tail_fixes.py` alone: 79/79 (unchanged — in-place rewrites). `test_r16_
+core_fixes.py` alone: 10/10 (unchanged). All 3 mutation-checked against real, reverted
+`src/ait` edits: (1) made the post-market branch also `marker.unlink()` — confirmed the
+rewritten test failed (`AssertionError: the marker must survive the deferral`), reverted;
+(2) changed `daily_digest`'s `"mirror current"` literal to `"mirror OK"` — confirmed
+failure (`'mirror current' in 'DIGEST: mirror OK'`), reverted; (3) flipped
+`CONTRACT_DEFAULTS["AIT_ALLOW_UNDEFINED_RISK"]` from `"0"` to `"1"` — confirmed the
+subprocess test failed on the real resolved value, reverted (note: the FIRST mutation
+attempt used `AIT_IC_WING_K`, which is `CONFIG_BACKED` to `config.yaml`'s `wing_k: 1.6` —
+config.yaml's value wins over `CONTRACT_DEFAULTS` by design, so that mutation was silently
+absorbed and never reached the test; caught before drawing a false "mutation-verified"
+conclusion, and re-run against a non-config-backed key instead — the same self-
+referential-proof risk CENSUS-2 registered, here on the MUTATION side rather than the
+test's own logic). `git diff --stat src/ait/orchestration/master.py src/ait/config/
+runtime_env.py` empty after all three reverts. Sibling re-run (`test_w20_host_clock_and_
+calendar_faults.py`, `test_audit_fixes.py`, `test_r16_ops_fixes.py` alongside the two
+rewritten files): 193/193. `python -m compileall -q src tests`: OK.
+
+**CORRECTION TO THIS BATCH'S OWN PLAN: the census does not fully close here.** The
+mandatory final re-grep (same reconciliation as every prior batch) found **13 real
+`inspect.getsource()` call sites remain — matching the plan's predicted 16-3=13 count
+numerically, but NOT matching its composition.** The plan assumed all 13 would be the
+already-confirmed-legitimate "leave alone" list. Direct classification of all 13 instead
+found:
+- **7 confirmed-legitimate** (absence/AST checks, no action ever needed, matching the
+  2026-09-21 worklist's own "leave alone" list): `test_r16_tail_fixes.py:314/679`,
+  `test_r20_research_validity.py:202`, `test_r16_round2_fixes.py:61/188`, `test_r16_
+  risk_fixes.py:624`, `test_w20_host_clock_and_calendar_faults.py:325`.
+- **2 already-registered, still-open** (the "3-site delete-only discrepancy" from
+  CENSUS-1's REGISTER CORRECTION entry — now down to 2 of its original 3, since the
+  third, `test_r16_research_fixes.py:159`, was incidentally resolved by CENSUS-1's own
+  rewrite of that file and no longer exists): `test_r16_tail_fixes.py:591` (was `:590`),
+  `test_r15_review_fixes.py:297` (was `:293`).
+- **4 GENUINELY NEW, previously-uncounted offenders** — real assert-on-source-string
+  sites that were never named in any of the 5 original batches (A-E) NOR the "leave
+  alone" list, discovered only because this batch's mandatory closing re-grep actually
+  classified every remaining hit instead of trusting the predicted count:
+  `test_r16_tail_fixes.py:166` (`test_drawdown_gate_is_not_iron_condor_only` — checks
+  `"_pct_from_60d_high_threshold > -0.99" in src`), `test_r16_tail_fixes.py:224`
+  (`test_annotation_block_sets_legs_credit_and_max_loss` — checks a literal dispatch
+  condition string in `Backtester.run`'s source), `test_r16_research_fixes.py:183`
+  (`test_module_model_dir_is_repo_anchored_absolute` — a near-exact TWIN of the
+  already-registered `test_r16_tail_fixes.py:591` MODEL_DIR-repo-anchoring pattern in a
+  sibling module, missed from that same discrepancy list), `test_r16_research_fixes.
+  py:602` (`test_all_six_dispatch_sites_use_shared_tuple` — counts occurrences of a
+  symbol NAME in source as a proxy for "6 dispatch sites use it," not a real per-site
+  execution). `git log -L` on all 4 confirms every one predates the 2026-09-21 census by
+  a month or more (`test_r16_tail_fixes.py`'s two sites: 2026-08-10, `1c8fcf6`;
+  `test_r16_research_fixes.py`'s two sites: 2026-08-07, `fc16531`) — a genuine gap in
+  that session's manual "direct read of all 13 files" pass, not new code added since.
+  None of the 4 is delete-only by inspection (unlike the 2 already-registered ones,
+  none has an obviously-redundant real assertion already sitting next to it) — at least
+  3 look like they need a genuine behavioral rewrite (drive a non-iron_condor
+  NEUTRAL_CREDIT_GATED strategy through the drawdown gate for real; exercise all 6 named
+  veto/gate dispatch sites in `Backtester.run` directly rather than counting a substring)
+  — real research work for whoever scopes it, not assumed here.
+
+Registered, not fixed — all 4 are out of this batch's approved scope (3 named sites
+only); fixing them now would have been unauthorized scope expansion mid-implementation.
+
+`CLAUDE.md:116`'s stale "~37 inspect.getsource() sites" note corrected to the true
+current count, **13** (verified by the same grep this entry's recount used, across the
+whole `tests/` tree including `test_w23_scheduler_timezone.py`, which itself now carries
+zero `inspect.getsource()` calls at all — fully converted to its own AST-walk style at
+some point, consistent with it being excluded from the census's own count).
+
+STATE AT HANDOFF. Test-file-only changes across 2 files (`tests/test_r16_tail_fixes.py`,
+`tests/test_r16_core_fixes.py`); one register-only doc change (`CLAUDE.md`); zero
+`src/ait` files differ from HEAD (every mutation made during verification was reverted).
+Zero config changes. Nothing to deploy or restart. Full fast lane already run (result in
+the next entry).
+
+NEXT, naming every open item explicitly: the census is **not** closed — **4 newly-
+registered offender sites** above (`test_r16_tail_fixes.py:166/224`, `test_r16_research_
+fixes.py:183/602`) need their own scoping pass (call it CENSUS-6, or fold into a fresh
+audit round) before the `inspect.getsource` anti-pattern can be called fully retired;
+the **2-site delete-only discrepancy** (down from 3; `test_r16_tail_fixes.py:591`,
+`test_r15_review_fixes.py:297`); the `_run_override_block` follow-up (`test_r17_
+dormant_strategy_fixes.py:64-74`); **W53's placing run** and **W55's live validation
+run**, both waiting on TWS during an RTH session; **W54** waiting on the operator;
+**W56/57**; **W52a's four items**; the dormant `get_chain_for_expiry` bug; **`test_
+watchdog.py`**'s load-sensitivity discrepancy; **`test_w51_ex_div_assignment.py`**'s
+local-midnight/`today_et()` fixture bug (still unfixed, still reproducing — see the next
+entry).
+
+No inspect.getsource in any of the 3 rewritten tests — all now drive real code paths,
+mutation-verified above.
+

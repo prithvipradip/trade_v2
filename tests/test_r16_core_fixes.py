@@ -165,9 +165,46 @@ class TestRuntimeEnvContract:
         assert os.environ["AIT_SKIP_MACRO_EVENTS"] == "1"
 
     def test_bare_main_applies_contract(self):
-        import ait.main as m
-        src = inspect.getsource(m)
-        assert "apply_runtime_env_defaults()" in src
+        """CENSUS-3 (2026-09-28): apply_runtime_env_defaults() is called at
+        MODULE level in main.py (not inside main()/if __name__), so the
+        honest proof is a bare `import ait.main` in a clean subprocess with
+        the contract keys stripped from its env first -- not grepping
+        main.py's source text for the literal call."""
+        import json
+        import os
+        import subprocess
+        import sys
+        import textwrap
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parents[1]
+        strip = ("KMP_DUPLICATE_LIB_OK", "OMP_NUM_THREADS",
+                 "AIT_ALLOW_UNDEFINED_RISK", "AIT_SKIP_MACRO_EVENTS",
+                 "AIT_IC_WING_K")
+        env = {k: v for k, v in os.environ.items() if k not in strip}
+        env["PYTHONPATH"] = str(repo_root / "src")
+        code = textwrap.dedent(f"""
+            import os
+            import ait.main  # noqa: F401 -- the bare import IS the claim
+            import json
+            print(json.dumps({{k: os.environ.get(k) for k in {strip!r}}}))
+        """)
+        result = subprocess.run(
+            [sys.executable, "-c", code], cwd=repo_root, env=env,
+            capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+        assert got == {
+            "KMP_DUPLICATE_LIB_OK": "TRUE",
+            "OMP_NUM_THREADS": "1",
+            "AIT_ALLOW_UNDEFINED_RISK": "0",
+            "AIT_SKIP_MACRO_EVENTS": "1",
+            "AIT_IC_WING_K": "1.6",
+        }, (
+            f"bare `import ait.main` did not apply the runtime env contract: "
+            f"{got}"
+        )
 
 
 class TestExitMarkAnchor:

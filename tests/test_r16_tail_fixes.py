@@ -30,6 +30,7 @@ import os
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
@@ -722,14 +723,48 @@ class TestPostMarketRestartWindow:
         assert _in_post_market_window(datetime(2026, 8, 10, 16, 5)) is True
         assert _in_post_market_window(datetime(2026, 8, 10, 18, 0)) is False
 
-    def test_health_check_consults_the_window(self):
-        from ait.orchestration import master as _m
-        src = inspect.getsource(_m.BotManager.health_check)
-        assert "_in_post_market_window()" in src
-        assert "fresh_models_restart_deferred_post_market" in src
-        # The marker must survive the deferral (no unlink in that branch).
-        deferred = src.split("fresh_models_restart_deferred_post_market")[0]
-        assert deferred.count("marker.unlink()") == 0
+    def test_health_check_consults_the_window(self, monkeypatch, tmp_path):
+        """CENSUS-3 (2026-09-28): drives the REAL health_check() dispatch
+        instead of grepping its source for '_in_post_market_window()' and
+        'fresh_models_restart_deferred_post_market', and checks the marker
+        FILE instead of counting 'marker.unlink()' occurrences in a source
+        slice. `_in_post_market_window` is called unqualified in master.py,
+        so patching it on the module genuinely moves the call site (same
+        trick test_audit_fixes.py:122 already uses for the opposite value)."""
+        import ait.orchestration.master as _m
+        import ait.utils.time as _time_mod
+
+        monkeypatch.setattr(_m, "ROOT", tmp_path)
+        monkeypatch.setattr(_m, "DATA_DIR", tmp_path / "data")
+        (tmp_path / "data").mkdir()
+        (tmp_path / "models").mkdir()
+        marker = tmp_path / "models" / ".retrained"
+        marker.write_text("")
+
+        # master.py does `from ait.utils.time import is_market_open` INSIDE
+        # the function -- patching a master attribute would be a no-op.
+        monkeypatch.setattr(_time_mod, "is_market_open", lambda: False)
+
+        mgr = _m.BotManager()
+        monkeypatch.setattr(type(mgr), "is_running", property(lambda self: True))
+        mgr._proc = SimpleNamespace(pid=424242)
+        calls: list[str] = []
+        monkeypatch.setattr(mgr, "stop", lambda: calls.append("stop"))
+        monkeypatch.setattr(mgr, "start", lambda: calls.append("start"))
+
+        monkeypatch.setattr(_m, "_in_post_market_window", lambda: True)
+        mgr.health_check()
+        assert calls == [], (
+            "the post-market window should defer the restart, not fire it"
+        )
+        assert marker.exists(), "the marker must survive the deferral"
+
+        # Positive control: the window closing must still restart for real --
+        # proves the assertion above isn't just "health_check never restarts".
+        monkeypatch.setattr(_m, "_in_post_market_window", lambda: False)
+        mgr.health_check()
+        assert calls == ["stop", "start"]
+        assert not marker.exists()
 
 
 class TestMirrorLag:
@@ -861,12 +896,32 @@ class TestMirrorLag:
         monkeypatch.setattr(_m, "DATA_DIR", data)
         assert _m._mirror_lag() == ("missing", None)
 
-    def test_digest_prints_the_lag_state(self):
-        from ait.orchestration import master as _m
-        src = inspect.getsource(_m.daily_digest)
-        assert "_mirror_lag()" in src
-        assert "mirror current" in src
-        assert "mirror BEHIND live" in src
+    def test_digest_prints_the_lag_state(self, tmp_path, monkeypatch):
+        """CENSUS-3 (2026-09-28): drives the REAL daily_digest() and
+        captures the actual message it sends, instead of grepping its
+        source for '_mirror_lag()' and the two literal strings it prints.
+        `_mirror_lag` is called unqualified, so patching it on the module
+        genuinely controls what daily_digest sees."""
+        import ait.orchestration.master as _m
+
+        monkeypatch.setattr(_m, "DATA_DIR", tmp_path)  # no ait_state.db ->
+        # the trade-count block is skipped gracefully (src.exists() guard)
+        monkeypatch.setattr(_m, "_mirror_content_age_hours", lambda: None)
+        sent: list[str] = []
+
+        def _capture(msg):
+            sent.append(msg)
+            return True
+
+        monkeypatch.setattr(_m, "_alert", _capture)
+
+        monkeypatch.setattr(_m, "_mirror_lag", lambda: ("current", 0.0))
+        _m.daily_digest()
+        assert "mirror current" in sent[-1]
+
+        monkeypatch.setattr(_m, "_mirror_lag", lambda: ("behind", 28.3))
+        _m.daily_digest()
+        assert "mirror BEHIND live by 28h" in sent[-1]
 
 
 class TestLogRotation:
