@@ -12270,3 +12270,120 @@ Also checked while validating, since two condors are open (QQQ/SPY, entered 10:0
 evaluation already sits inside `check_positions`' own try — it cannot take the exit monitor down.
 
 ---
+
+## 2026-09-28 - BUILT — roll-combo construction mechanics (`execution/roll_executor.py`),
+unwired: the piece W57 needs before order placement
+
+SCOPE, per the operator's explicit choice. `condor_defense.py`'s ROLL verdict is
+decision-only because no code builds an actual roll order. `roll_selector.select_roll_
+target` already picks WHERE to roll to; `executor.py`'s `_validate_roll_legs`
+(`:114-181`, built during W53) already validates a proposed roll against a trade's real
+open legs, fully tested but with no production caller. This wave builds the missing piece
+in between — turning a `RollTarget` into a qualified, priced, ready-to-place 4-leg BAG
+combo — as a new, additive module that **nothing calls**, matching the exact posture
+`roll_selector.py`/`synthetic_delta.py`/`condor_defense.py` were each built with. The
+module **never calls `ibkr.place_order()`** — it stops at a fully validated, qualified,
+priced `Contract`+`Order` pair and hands it back. Actual placement, and the harder problem
+it surfaces (sequencing a roll's booking so the reconciler's one-order-one-trade
+assumption doesn't break), is separate, later, more consequential work — not started here,
+matching the same "combo mechanics only" scope boundary decided for this wave. `condor_
+defense`'s ROLL verdict remains fully decision-only; `TradeRecord.rolled_from_trade_id`
+(already exists, `state.py:99`, unpopulated by any code path) stays unpopulated.
+
+`scripts/probe_w53_roll_atomicity.py` already proved this exact 4-leg combo shape live
+against TWS paper earlier this session — its `preflight` produced a real `whatIfOrder`
+margin preview for both the closing and opening legs of an actual roll. This wave lifts
+the probe's generic mechanics into production code; probe-only scaffolding (clientId 97,
+hardcoded SPY, a blocking poll loop, JSONL evidence files) does not carry over.
+
+DESIGN. New `src/ait/execution/roll_executor.py`, five pieces: `legs_for_roll(trade, side,
+roll_target)` bridges `RollTarget`'s output to the legs-JSON shape `_validate_roll_legs`
+expects (closing = trade's own open legs on `side`, action reversed; opening = the
+target's new short/long at the target's expiry) — the same construction the probe's
+`cmd_roll` (`:658-667`) already proved, given its own name and tests instead of living
+inline in a probe command. `qualify_roll_legs`/`poll_leg_quotes`/`leg_net_price` are
+lifted near-verbatim from the probe (`:254-364`), parameterized by `symbol` (was
+hardcoded) and made fail-safe (return `None`, never raise — the probe raised
+`ProbeGuardError`, production code here follows `roll_selector`/`synthetic_delta`'s own
+None-on-failure convention). `prepare_roll_combo` orchestrates all of it in order:
+`legs_for_roll` → the EXISTING `_validate_roll_legs` (imported from `executor.py`, reused
+not duplicated) BEFORE any API call, exactly matching that function's own documented
+intent → `qualify_roll_legs` for all 4 legs → build the BAG (`ContractBuilder.combo`) →
+poll quotes, compute `mid_net`/`natural_net` (`leg_net_price`) → refuse on a missing quote
+or over `debit_cap` → construct (never place) an `OrderBuilder.combo_limit` `Order`.
+Returns a `PreparedRollCombo` dataclass (`bag`, `order`, `closing_legs`, `opening_legs`,
+`mid_net`, `natural_net`) — everything a future placement step needs, nothing placed. No
+changes to `executor.py`, `orchestrator.py`, `reconciler.py`, `state.py`, or
+`condor_defense.py`.
+
+PROOF. `tests/test_roll_executor.py`, 16 new tests, no `inspect.getsource`, real
+`TradeRecord`/legs-JSON fixtures (same convention `test_w53_roll_target_selection.py`/
+`test_w56_condor_defense.py` use), a fake IB for the broker boundary (never `MagicMock`
+for quotes/marks). `TestLegsForRoll` (4 tests) — correct closing-leg reversal, opening-leg
+construction at the target's own expiry, the untouched-other-side guarantee, and the
+not-a-clean-vertical/malformed-JSON fail-safe cases. `TestLegNetPrice` (4 tests) — mirrors
+`test_w53_probe_script.py::TestLegNetPrice` exactly (same function, same proof): credit/
+debit signing, natural-side BUY-at-ask/SELL-at-bid, a missing quote returns `None`.
+`TestQualifyRollLegs` (2 tests) — happy path enriches every leg; one leg failing fails the
+WHOLE batch, never a partial list. `TestPrepareRollCombo` (6 tests) — happy path returns a
+`PreparedRollCombo` with `mid_net` matching an independently hand-computed value; **a real
+design subtlety caught while writing this**: `legs_for_roll` is correct-by-construction
+(it faithfully reverses a trade's own real legs), so it can never itself hand
+`_validate_roll_legs` a malformed pair — the "not a clean vertical" test only exercises
+`legs_for_roll`'s OWN guard, never reaching `_validate_roll_legs` at all. Added a SEPARATE
+test that monkeypatches `legs_for_roll`'s output directly (a non-vertical opening pair) to
+isolate and prove `prepare_roll_combo` genuinely calls `_validate_roll_legs` and respects
+ITS refusal too, distinct from `legs_for_roll`'s own — confirmed via a first mutation
+attempt against the ORIGINAL (unisolated) test, which passed even with `_validate_roll_
+legs` skipped entirely, proving the original test didn't actually exercise that path.
+Missing-quote and over-`debit_cap` refusals round out the class. **`ibkr.place_order` is
+never called anywhere in this module** — the fake IB doesn't even implement it, so an
+accidental call would raise `AttributeError`, the direct regression guard for the
+"unwired, stops short of placing" scope boundary; every `PrepareRollCombo`-returning test
+passing at all is proof this was never hit.
+
+Mutation-checked 2 mechanisms (temporarily broken, confirmed the intended test failed for
+the predicted reason, reverted; `md5` of `roll_executor.py` confirmed identical before and
+after both, since the file is new/untracked and `git diff --stat` shows nothing for it):
+skipping the `_validate_roll_legs` call broke the isolated validation test exactly as
+predicted; disabling the `debit_cap` check broke the over-cap test exactly as predicted.
+
+Neighbors: `test_roll_executor.py` + `test_w53_roll_target_selection.py` + `test_w53_
+roll_leg_validator.py` + `test_w53_probe_script.py` + `test_w56_condor_defense.py` +
+`test_condor_defense_wiring.py`: **136/136**. `python -m compileall -q src tests`: OK.
+`python scripts/typecheck.py`: OK, zero attr-defined/call-arg/name-defined in
+`src/ait/{config,bot,execution,risk}`.
+
+Full fast lane: **2660 passed / 1 failed / 46 skipped / 153 deselected, 1114.12s
+(18m34s)** — the one failure is the same standing `test_r19_config_authority.py::
+TestContractIsTheSingleAuthority::test_applier_and_readers_share_one_table`
+(`AIT_MARKET_DATA_TYPE` divergence). Count check against the immediately-prior full fast
+lane (2644+1=2645): this run is 2660+1=2661 — a delta of exactly **16**, matching the new
+test count precisely.
+
+STATE AT HANDOFF. `src/ait/execution/roll_executor.py` (new), `tests/test_roll_executor.py`
+(new). Zero existing files touched, zero config changes. Nothing new is reachable from any
+live path — `condor_defense`'s ROLL verdict is unchanged (still decision-only), no
+executor/orchestrator caller exists. No restart needed for correctness; none performed.
+
+NEXT, naming every open item explicitly: **the actual placement + reconciler dual-trade-
+booking sequencing** — the real remaining hard work: today `_order_trade_map`/
+`PendingExitOrder` both carry a single `trade_id`, so a roll's one fill needs the closing
+trade in CLOSING and the opening trade in PENDING, both written to the DB BEFORE
+placement, and a fill handler that books both exactly once, keyed by orderId (not
+`orderRef==trade_id` as every other order today). **`go_live.py`'s roll-accounting fix** —
+a rolled close must fold into its chain's terminal outcome, not just be excluded from the
+50-close verdict sample (excluding it would silently drop real, already-realized P&L).
+**Wiring `condor_defense`'s ROLL verdict to actually call this module** — depends on both
+of the above. **W54's rule 3/3e wiring** — still needs the latency/cadence design the
+2026-09-27 scoping note flagged. **W53's placing run** — still needs explicit operator
+go-ahead plus a `flatten` commitment. **W52a's four items** — deliberately registered.
+**The ongoing QQQ backfill** — operator-run, unaffected. **The surface-construction
+quality filter**, **the zero-bars inefficiency**, **the risk-free-rate script's Phase B
+connection-reuse note** — all unchanged.
+
+No inspect.getsource — every new test drives the real `legs_for_roll`, `qualify_roll_
+legs`, `leg_net_price`, and `prepare_roll_combo` (including the real, imported
+`_validate_roll_legs`), never asserts on source strings.
+
+---
