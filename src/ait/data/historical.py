@@ -29,6 +29,40 @@ log = get_logger("data.historical")
 
 DB_PATH = Path("data/historical.db")
 
+# Historical risk-free-rate follow-up: the SOFR term structure's tenor
+# points in days-to-maturity, in the SAME order get_risk_free_rate's SELECT
+# reads its columns (sofr, sofr_30d_avg, sofr_90d_avg, sofr_180d_avg) --
+# SOFR itself stands in for the "overnight" (1-day) anchor.
+SOFR_TENOR_DAYS: dict[str, int] = {
+    "sofr": 1,
+    "sofr_30d_avg": 30,
+    "sofr_90d_avg": 90,
+    "sofr_180d_avg": 180,
+}
+
+
+def interpolate_rate(tenor_points: list[tuple[int, float]], dte: int) -> float | None:
+    """Piecewise-linear interpolation across a short-end rate term
+    structure, flat-extrapolated beyond the shortest/longest anchor -- the
+    same scheme this codebase's own half-built VIX9D/VIX/VIX3M/VIX6M
+    term-structure idea uses elsewhere (per the W54 scoping-note entry),
+    applied here to the SOFR curve instead. `tenor_points` need not be
+    pre-sorted. Returns None if `tenor_points` is empty."""
+    points = sorted(tenor_points, key=lambda p: p[0])
+    if not points:
+        return None
+    if dte <= points[0][0]:
+        return points[0][1]
+    if dte >= points[-1][0]:
+        return points[-1][1]
+    for (d0, r0), (d1, r1) in zip(points, points[1:]):
+        if d0 <= dte <= d1:
+            if d1 == d0:
+                return r0
+            frac = (dte - d0) / (d1 - d0)
+            return r0 + frac * (r1 - r0)
+    return points[-1][1]  # unreachable given the bounds checks above
+
 
 class HistoricalDataStore:
     """SQLite-backed store for historical price data.
@@ -50,6 +84,7 @@ class HistoricalDataStore:
         self._spread_samples_table = f"{table_prefix}option_spread_samples"
         self._spread_params_table = f"{table_prefix}option_spread_params"
         self._option_daily_bars_table = f"{table_prefix}option_daily_bars"
+        self._risk_free_rates_table = f"{table_prefix}risk_free_rates"
         self._init_db()
 
     def _init_db(self) -> None:
@@ -199,6 +234,21 @@ class HistoricalDataStore:
             conn.execute(f"""
                 CREATE INDEX IF NOT EXISTS idx_{self._option_daily_bars_table}_und_dt
                 ON {self._option_daily_bars_table}(underlying, date)
+            """)
+            # Historical risk-free-rate series (SOFR term structure) for
+            # re-solving option_daily_bars' IV/greeks once real rates exist,
+            # replacing the placeholder options.risk_free_rate config value
+            # the backfill used at ingestion. Unlike option_daily_bars, this
+            # data SHOULD refresh on re-fetch (FRED occasionally revises
+            # recent prints) -- see save_risk_free_rates' upsert.
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._risk_free_rates_table} (
+                    date          TEXT NOT NULL PRIMARY KEY,
+                    sofr          REAL,
+                    sofr_30d_avg  REAL,
+                    sofr_90d_avg  REAL,
+                    sofr_180d_avg REAL
+                )
             """)
 
     def save(self, symbol: str, df: pd.DataFrame) -> int:
@@ -876,3 +926,101 @@ class HistoricalDataStore:
                 (option_ticker,),
             ).fetchone()
         return row is not None
+
+    def update_option_bar_iv(
+        self,
+        option_ticker: str,
+        date_: date | str,
+        iv: float | None,
+        iv_outcome: str | None,
+        delta: float | None,
+        gamma: float | None,
+        theta: float | None,
+        vega: float | None,
+        risk_free_rate: float,
+    ) -> int:
+        """Overwrite a stored bar's IV/greeks/risk_free_rate in place -- the
+        re-solve primitive (historical risk-free-rate follow-up). Unlike
+        save_option_daily_bars' INSERT OR IGNORE (deliberately never
+        overwrites, what makes ingestion resume-safe), this DELIBERATELY
+        overwrites -- and deliberately never touches the raw price columns.
+        Returns rows affected (0 if no such (option_ticker, date) row
+        exists -- a no-op, not an error)."""
+        with sqlite3.connect(self._db_path) as conn:
+            cur = conn.execute(
+                f"""UPDATE {self._option_daily_bars_table}
+                   SET iv=?, iv_outcome=?, delta=?, gamma=?, theta=?, vega=?,
+                       risk_free_rate=?
+                   WHERE option_ticker=? AND date=?""",
+                (iv, iv_outcome, delta, gamma, theta, vega, risk_free_rate,
+                 option_ticker, str(date_)),
+            )
+        return cur.rowcount
+
+    # ------------------------------------------------------------------
+    # Historical risk-free-rate series (SOFR term structure)
+    # ------------------------------------------------------------------
+
+    def save_risk_free_rates(self, df: pd.DataFrame) -> int:
+        """Upsert daily SOFR term-structure rates. DataFrame must have
+        columns: date, sofr, sofr_30d_avg, sofr_90d_avg, sofr_180d_avg (any
+        may be NaN/absent for a given date). Unlike option_daily_bars, this
+        table SHOULD refresh on re-fetch -- FRED occasionally revises
+        recent prints. Returns number of rows passed (matches this
+        module's own save_option_daily_bars/save_spread_samples
+        convention, not rows actually changed)."""
+        if df is None or df.empty:
+            return 0
+
+        def _f(v):
+            return None if v is None or v != v else float(v)  # NaN-safe
+
+        rows = []
+        for _, row in df.iterrows():
+            rows.append((
+                str(row["date"]), _f(row.get("sofr")),
+                _f(row.get("sofr_30d_avg")), _f(row.get("sofr_90d_avg")),
+                _f(row.get("sofr_180d_avg")),
+            ))
+
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                f"""INSERT INTO {self._risk_free_rates_table}
+                   (date, sofr, sofr_30d_avg, sofr_90d_avg, sofr_180d_avg)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(date) DO UPDATE SET
+                       sofr=excluded.sofr,
+                       sofr_30d_avg=excluded.sofr_30d_avg,
+                       sofr_90d_avg=excluded.sofr_90d_avg,
+                       sofr_180d_avg=excluded.sofr_180d_avg""",
+                rows,
+            )
+
+        log.debug("risk_free_rates_saved", rows=len(rows))
+        return len(rows)
+
+    def get_risk_free_rate(self, as_of: date, dte: int) -> float | None:
+        """Real historical risk-free rate for an option with `dte` days to
+        expiry, as of `as_of`. Forward-fills to the most recently
+        PUBLISHED date at or before `as_of` (FRED only publishes on
+        business days; a requested weekend/holiday date uses the last
+        published print -- the rate genuinely didn't change on days
+        nothing was published, standard practice), then linearly
+        interpolates across whichever SOFR tenor points are available on
+        that date via interpolate_rate(). Returns None only if there is no
+        rate data at or before `as_of` at all."""
+        with sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(
+                f"SELECT sofr, sofr_30d_avg, sofr_90d_avg, sofr_180d_avg "
+                f"FROM {self._risk_free_rates_table} WHERE date <= ? "
+                f"ORDER BY date DESC LIMIT 1",
+                (str(as_of),),
+            ).fetchone()
+        if row is None:
+            return None
+        tenor_points = [
+            (days, rate)
+            for (days, rate) in zip(SOFR_TENOR_DAYS.values(), row)
+            if rate is not None
+        ]
+        return interpolate_rate(tenor_points, dte)

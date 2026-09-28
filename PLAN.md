@@ -11384,3 +11384,140 @@ real exception type, the real `main()`/`_run()` control flow, the real status-fi
 writer).
 
 ---
+
+## 2026-09-28 - W59 BUILT — historical risk-free-rate series, closes W58's registered
+follow-up; real SOFR term structure re-solves the 9 existing option_daily_bars rows
+
+Every row `backfill_option_history.py` writes stores a PLACEHOLDER risk-free rate (the
+static `options.risk_free_rate` config value, 5%) — a deliberate decision registered at
+build time: use the placeholder now, store it per-row, re-solve later once a real
+historical rate series exists. This wave builds that series and does the re-solve. No
+production trading-path code touched — `src/ait/bot`/`execution`/`risk`/`strategies` all
+untouched; the live bot's own IV solve still uses the static config placeholder
+unchanged (this wave only rewrites already-stored historical rows).
+
+**SOFR, NOT TREASURY — REVISED AFTER OPERATOR PUSHBACK.** The first draft of this plan
+used Treasury CMT rates (DGS1MO/DGS3MO) with a binary switch at 45 DTE. The operator
+rejected it on sight with two questions: are we getting SOFR, and are we getting a real
+term structure covering the short end (0-2 DTE) as well as the 14-60 DTE calibration
+window? Both were right. Re-researched live before revising: `SOFR`, `SOFR30DAYAVG`,
+`SOFR90DAYAVG`, `SOFR180DAYAVG` (NY Fed compounded averages) are all free, keyless, and
+confirmed live via curl against FRED's public CSV endpoint, all starting 2018 —
+comfortably before any date the options backfill's rolling 2-year window will ever
+reach. SOFR is the actual modern industry-standard risk-free reference for derivatives
+pricing (the post-LIBOR standard); Treasury CMT's shortest tenor (1-month) has no usable
+anchor for 0-2 DTE at all. Final design is a genuine 4-point term structure, not a
+threshold.
+
+**DESIGN.** `src/ait/data/historical.py`: new `SOFR_TENOR_DAYS` mapping (column name →
+tenor in days: `sofr`→1, `sofr_30d_avg`→30, `sofr_90d_avg`→90, `sofr_180d_avg`→180) and a
+pure `interpolate_rate(tenor_points, dte) -> float | None` function — piecewise-linear
+across whichever anchors are present, flat-extrapolated beyond the shortest/longest (the
+same scheme this codebase's own half-built VIX9D/VIX/VIX3M/VIX6M term-structure idea
+already uses elsewhere, per the earlier W54 scoping-note entry, just applied to SOFR).
+New `risk_free_rates` table (`date TEXT PRIMARY KEY, sofr, sofr_30d_avg, sofr_90d_avg,
+sofr_180d_avg`) with `save_risk_free_rates(df) -> int`, an upsert (`ON CONFLICT DO
+UPDATE`) — unlike option-bar ingestion's `INSERT OR IGNORE`, this data SHOULD refresh on
+re-fetch since FRED occasionally revises recent prints. `get_risk_free_rate(as_of, dte)
+-> float | None` forward-fills to the most recent row with `date <= as_of` (FRED
+publishes only on business days), then calls `interpolate_rate`. `update_option_bar_iv(
+option_ticker, date, iv, iv_outcome, delta, gamma, theta, vega, risk_free_rate) -> int`
+is a plain `UPDATE ... WHERE option_ticker=? AND date=?` — deliberately never touches the
+raw price columns, per this file's own DATA-H2 lesson (INSERT OR REPLACE nulls out
+untouched columns; a plain UPDATE has no such hazard).
+
+New script `scripts/backfill_risk_free_rate.py`, two phases. Phase A always runs (even
+under `--dry-run`, deliberately — an empty `risk_free_rates` table would make
+`get_risk_free_rate` always return `None`, making a dry-run report meaningless): fetches
+all 4 SOFR series via the existing `MacroDataFetcher.fetch_series()` (`src/ait/data/
+macro.py`, reused as-is, zero new HTTP/CSV code) and upserts them. Phase B (gated by
+`--dry-run`) reads `option_daily_bars` directly, computes each row's real rate via
+`get_risk_free_rate(row.date, row.dte)`, skips if missing or already within 1e-6 of the
+stored rate, otherwise re-runs the same W55 `solve_iv_from_price`/`compute_greeks_from_
+sigma` pipeline the original backfill used against the row's own already-stored `close`/
+`underlying_close` and calls `update_option_bar_iv`. `_update_with_retry` tolerates a
+transient `sqlite3.OperationalError: database is locked` with a short `[0,1,2,5]`s
+backoff (local disk contention from a concurrently-running `backfill_option_history.py`
+— a different failure class from that script's own network-retry backoff, so a much
+shorter budget) and re-raises any non-lock `OperationalError` immediately. CLI:
+`--symbol` (optional filter), `--db-path`/`--table-prefix`, `--dry-run`.
+
+**A REAL BUG THIS WAVE'S OWN TESTS CAUGHT BEFORE IT REACHED LIVE DATA.** FRED publishes
+these series as raw percentages (`4.12` meaning 4.12%), but `solve_iv_from_price`'s `r`
+and `options.risk_free_rate`'s own config units are a decimal fraction (`0.0412`).
+Feeding the raw percentage straight into Black-Scholes would have been badly wrong (a
+~412% "rate"). Caught by `test_resolves_when_the_real_rate_differs_from_stored` asserting
+`pytest.approx(0.0412)` and getting `4.12` — fixed with a `series / 100.0` conversion in
+`fetch_rate_table()`, applied once at the fetch boundary so everything downstream (the
+stored table, `get_risk_free_rate`, `interpolate_rate`) stays unit-consistent with the
+rest of the codebase.
+
+**PROOF.** 17 new tests in `tests/test_backfill_historical_data.py` (now 48 total):
+`TestInterpolateRate` (exact anchors, interpolation, both flat-extrapolation edges, empty/
+unsorted input), `TestRiskFreeRatesTable` (schema, save/round-trip, upsert-overwrites-on-
+refresh, empty-df), `TestGetRiskFreeRate` (forward-fill, before-any-data returns `None`,
+interpolation from a stored row), `TestUpdateOptionBarIv` (overwrites iv/greeks without
+touching raw price columns, no-such-row is a no-op not an error). New `tests/test_
+backfill_risk_free_rate.py` (12 tests, no `inspect.getsource`, no real HTTP — `fetch_
+rate_table` tested against a fake `MacroDataFetcher`): `TestResolveRows` (real re-solve
+against a real temp store — not mocked — including the percent/decimal bug's own
+regression test, skip-when-unchanged, skip-when-no-rate-data, dry-run doesn't write,
+`--symbol` filter isolation), `TestUpdateWithRetry` (against a fake store that raises a
+real `sqlite3.OperationalError("database is locked")`: retries-then-succeeds, exhausts-
+and-raises, non-lock-error-not-retried), `TestFetchRateTable` (merge, the percent-to-
+decimal conversion, missing-series-tolerance, all-missing-returns-empty). Mutation-
+checked 3 mechanisms, each temporarily broken, confirmed the relevant test failed for the
+predicted reason, reverted, confirmed `git diff --stat` clean: `interpolate_rate`'s
+linear-fraction math; `get_risk_free_rate`'s forward-fill query (`<=` → `=`); the percent-
+to-decimal conversion (removed `/100.0`, confirmed the exact `4.12 vs 0.0412` mismatch).
+`python -m compileall -q src scripts tests`: OK.
+
+**LIVE SMOKE TEST, against the real `data/historical.db`** (checked `data/backfill_
+option_history_status.json` and the process list first — confirmed no operator backfill
+run active at the time, safe to proceed without lock contention). `--dry-run`: fetched
+and stored 2142 real SOFR rows from FRED via the real `MacroDataFetcher` (not curl, not a
+fake — the actual reused code path), reported `9 rows checked, 9 would be re-solved, 0
+already match, 0 have no rate data yet` against the 9 pre-existing rows from the original
+W58 build's own smoke tests (all of which carried the 0.05 placeholder). Real run (no
+`--dry-run`): `resolve_complete checked=9 resolved=9 skipped_no_rate=0
+skipped_unchanged=0`. Direct read of the table after confirmed all 9 rows' `risk_free_
+rate` changed from the 0.05 placeholder to real SOFR-derived values (0.0364–0.0368 for
+these rows' dte=0 — the overnight `sofr` anchor, correctly selected by `interpolate_
+rate`), with `iv`/`iv_outcome` genuinely re-solved alongside (unchanged `failed_
+arbitrage` outcomes stayed `failed_arbitrage`, `solved` rows kept solving with the new
+rate baked in — confirms the re-solve pipeline is deterministic on price, not silently
+flipping outcomes).
+
+Full fast lane: `tests/test_backfill_historical_data.py` + `tests/test_backfill_risk_
+free_rate.py` together, 60/60 passed standalone. Full suite: **2569 passed / 1 failed /
+46 skipped / 153 deselected, 1227.86s (20m27s)** — the one failure is the same standing
+`test_r19_config_authority.py::TestContractIsTheSingleAuthority::
+test_applier_and_readers_share_one_table` (`AIT_MARKET_DATA_TYPE` local-`.env`
+divergence) every entry this session has already named; zero new failures. Count check
+against the W58 build's own fast lane (2540+1=2541 non-deselected): this run is
+2569+1=2570 — a delta of exactly +29, matching the 17+12=29 new tests precisely (no
+other test file touched).
+
+STATE AT HANDOFF. Files touched: `src/ait/data/historical.py`, `tests/test_backfill_
+historical_data.py` (both modified), `scripts/backfill_risk_free_rate.py`, `tests/test_
+backfill_risk_free_rate.py` (both new). Zero production trading-path files touched. Zero
+config changes. The real multi-week `backfill_option_history.py` run is unaffected by
+this wave — it keeps writing the placeholder at ingestion time exactly as before; this
+re-solve pass is a separate, independently-runnable, idempotent pass over already-stored
+data, safe to re-run any time (already-matching rows are skipped, not rewritten) and safe
+to run concurrently with the ingestion backfill (lock-tolerant).
+
+NEXT, naming every open item explicitly: **the config-gated surface-construction quality
+filter** — still deferred, W54's own scope, now unblocked by real (not placeholder) rates
+being available whenever it's picked up. **The real multi-week backfill run itself** —
+ongoing, operator-run, unaffected by this wave. **The zero-bars-retried-forever minor
+inefficiency** — still registered, unchanged, not urgent. **W54 itself** — operator
+decision on backtesting sequencing. Everything else unchanged and unrelated: W53's
+placing run and W55's live validation run waiting on TWS during an RTH session; W56/57;
+W52a's four items.
+
+No inspect.getsource in either test file — every new test drives real code (the real
+interpolation function, a real temp `HistoricalDataStore`, the real re-solve pipeline
+against a fake network boundary only).
+
+---

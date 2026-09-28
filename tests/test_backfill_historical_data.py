@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ait.data.historical import HistoricalDataStore
+from ait.data.historical import HistoricalDataStore, interpolate_rate
 
 
 # ---------------------------------------------------------------------------
@@ -572,3 +572,174 @@ class TestOptionDailyBarsTable:
         assert store.option_ticker_has_data(df.iloc[0]["option_ticker"]) is True
         # A different, never-saved contract must still read False.
         assert store.option_ticker_has_data("O:QQQ990101C00001000") is False
+
+
+# ---------------------------------------------------------------------------
+# Historical risk-free-rate follow-up: interpolate_rate (pure function)
+# ---------------------------------------------------------------------------
+
+_TENOR_POINTS = [(1, 4.00), (30, 4.20), (90, 4.10), (180, 4.05)]
+
+
+class TestInterpolateRate:
+    def test_exact_anchor_points_return_exactly(self):
+        assert interpolate_rate(_TENOR_POINTS, 1) == pytest.approx(4.00)
+        assert interpolate_rate(_TENOR_POINTS, 30) == pytest.approx(4.20)
+        assert interpolate_rate(_TENOR_POINTS, 90) == pytest.approx(4.10)
+        assert interpolate_rate(_TENOR_POINTS, 180) == pytest.approx(4.05)
+
+    def test_interpolates_between_the_1day_and_30day_points(self):
+        # dte=14 is (14-1)/(30-1) = 13/29 of the way from the 1d to 30d point
+        expected = 4.00 + (13 / 29) * (4.20 - 4.00)
+        assert interpolate_rate(_TENOR_POINTS, 14) == pytest.approx(expected)
+
+    def test_interpolates_between_the_30day_and_90day_points(self):
+        # dte=60 is exactly the midpoint of 30 and 90
+        expected = (4.20 + 4.10) / 2
+        assert interpolate_rate(_TENOR_POINTS, 60) == pytest.approx(expected)
+
+    def test_clamps_flat_below_the_shortest_anchor(self):
+        assert interpolate_rate(_TENOR_POINTS, 0) == pytest.approx(4.00)
+
+    def test_clamps_flat_beyond_the_longest_anchor(self):
+        assert interpolate_rate(_TENOR_POINTS, 365) == pytest.approx(4.05)
+
+    def test_empty_points_returns_none(self):
+        assert interpolate_rate([], 30) is None
+
+    def test_unsorted_input_still_works(self):
+        shuffled = [(180, 4.05), (1, 4.00), (90, 4.10), (30, 4.20)]
+        assert interpolate_rate(shuffled, 60) == pytest.approx((4.20 + 4.10) / 2)
+
+
+# ---------------------------------------------------------------------------
+# Historical risk-free-rate follow-up: risk_free_rates table + the
+# update_option_bar_iv re-solve primitive
+# ---------------------------------------------------------------------------
+
+def _make_rate_rows(dates_and_rates: list[tuple[str, float, float, float, float]]) -> pd.DataFrame:
+    return pd.DataFrame([
+        {"date": d, "sofr": s, "sofr_30d_avg": s30, "sofr_90d_avg": s90,
+         "sofr_180d_avg": s180}
+        for d, s, s30, s90, s180 in dates_and_rates
+    ])
+
+
+class TestRiskFreeRatesTable:
+    def test_table_created_with_expected_columns(self) -> None:
+        store = _temp_store()
+        with sqlite3.connect(store._db_path) as conn:
+            cols = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(risk_free_rates)"
+                ).fetchall()
+            }
+        assert {"date", "sofr", "sofr_30d_avg", "sofr_90d_avg",
+                "sofr_180d_avg"} <= cols
+
+    def test_save_and_load_round_trip(self) -> None:
+        store = _temp_store()
+        df = _make_rate_rows([("2026-06-01", 4.00, 4.20, 4.10, 4.05)])
+        stored = store.save_risk_free_rates(df)
+        assert stored == 1
+        with sqlite3.connect(store._db_path) as conn:
+            row = conn.execute(
+                "SELECT sofr, sofr_30d_avg FROM risk_free_rates WHERE date=?",
+                ("2026-06-01",),
+            ).fetchone()
+        assert row == (4.00, 4.20)
+
+    def test_upsert_overwrites_on_refresh(self) -> None:
+        """Unlike option_daily_bars' INSERT OR IGNORE, re-saving the SAME
+        date with a DIFFERENT rate must actually update it -- FRED
+        occasionally revises recent prints."""
+        store = _temp_store()
+        store.save_risk_free_rates(_make_rate_rows(
+            [("2026-06-01", 4.00, 4.20, 4.10, 4.05)]))
+        store.save_risk_free_rates(_make_rate_rows(
+            [("2026-06-01", 4.11, 4.31, 4.21, 4.16)]))
+
+        with sqlite3.connect(store._db_path) as conn:
+            row = conn.execute(
+                "SELECT sofr FROM risk_free_rates WHERE date=?",
+                ("2026-06-01",),
+            ).fetchone()
+        assert row == (4.11,), "the revised rate must overwrite the old one"
+
+    def test_save_empty_df(self) -> None:
+        store = _temp_store()
+        assert store.save_risk_free_rates(pd.DataFrame()) == 0
+
+
+class TestGetRiskFreeRate:
+    def test_forward_fills_to_the_most_recent_prior_date(self) -> None:
+        """FRED only publishes on business days -- a requested holiday/
+        weekend date must use the last published print."""
+        store = _temp_store()
+        store.save_risk_free_rates(_make_rate_rows(
+            [("2026-06-01", 4.00, 4.20, 4.10, 4.05)]))
+        # 2026-06-02 has no row of its own -- must forward-fill from 06-01.
+        rate = store.get_risk_free_rate(dt.date(2026, 6, 2), dte=1)
+        assert rate == pytest.approx(4.00)
+
+    def test_returns_none_before_any_stored_data(self) -> None:
+        store = _temp_store()
+        store.save_risk_free_rates(_make_rate_rows(
+            [("2026-06-01", 4.00, 4.20, 4.10, 4.05)]))
+        assert store.get_risk_free_rate(dt.date(2026, 1, 1), dte=1) is None
+
+    def test_interpolates_using_the_stored_days_row(self) -> None:
+        store = _temp_store()
+        store.save_risk_free_rates(_make_rate_rows(
+            [("2026-06-01", 4.00, 4.20, 4.10, 4.05)]))
+        rate = store.get_risk_free_rate(dt.date(2026, 6, 1), dte=60)
+        assert rate == pytest.approx((4.20 + 4.10) / 2)
+
+
+class TestUpdateOptionBarIv:
+    def test_overwrites_a_stored_rows_iv_and_greeks(self) -> None:
+        store = _temp_store()
+        df = _make_option_daily_bars(n=1)
+        store.save_option_daily_bars("QQQ", df)
+        ticker = df.iloc[0]["option_ticker"]
+
+        affected = store.update_option_bar_iv(
+            ticker, df.iloc[0]["date"], iv=0.35, iv_outcome="solved",
+            delta=0.55, gamma=0.03, theta=-0.06, vega=0.12,
+            risk_free_rate=0.0412)
+
+        assert affected == 1
+        with sqlite3.connect(store._db_path) as conn:
+            row = conn.execute(
+                "SELECT iv, iv_outcome, delta, risk_free_rate FROM "
+                "option_daily_bars WHERE option_ticker=? AND date=?",
+                (ticker, df.iloc[0]["date"]),
+            ).fetchone()
+        assert row == (0.35, "solved", 0.55, 0.0412)
+
+    def test_does_not_touch_raw_price_columns(self) -> None:
+        store = _temp_store()
+        df = _make_option_daily_bars(n=1)
+        store.save_option_daily_bars("QQQ", df)
+        ticker = df.iloc[0]["option_ticker"]
+        original_close = df.iloc[0]["close"]
+
+        store.update_option_bar_iv(
+            ticker, df.iloc[0]["date"], iv=0.99, iv_outcome="solved",
+            delta=0.1, gamma=0.1, theta=-0.1, vega=0.1, risk_free_rate=0.05)
+
+        with sqlite3.connect(store._db_path) as conn:
+            close = conn.execute(
+                "SELECT close FROM option_daily_bars WHERE option_ticker=? "
+                "AND date=?", (ticker, df.iloc[0]["date"]),
+            ).fetchone()[0]
+        assert close == pytest.approx(original_close)
+
+    def test_no_such_row_is_a_noop_not_an_error(self) -> None:
+        store = _temp_store()
+        affected = store.update_option_bar_iv(
+            "O:QQQ990101C00001000", "2026-01-01", iv=0.3,
+            iv_outcome="solved", delta=0.5, gamma=0.02, theta=-0.05,
+            vega=0.1, risk_free_rate=0.05)
+        assert affected == 0
