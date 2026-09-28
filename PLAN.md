@@ -11684,3 +11684,55 @@ No inspect.getsource — every new test drives the real `classify_tested_delta`,
 source strings.
 
 ---
+
+## 2026-09-28 - W55's LIVE VALIDATION RUN CLOSED — synthetic delta confirmed against a
+real chain during RTH, TWS paper reachable at last
+
+W55's own NEXT (`:9940-9956`) and W56's NEXT (immediately above) both named the same
+outstanding prerequisite: `scripts/validate_w55_synthetic_delta.py` had been built but
+never run live, needing TWS reachable during an RTH session — unavailable all session
+until now. TWS paper (127.0.0.1:7497) came up reachable mid-session; confirmed real RTH
+via the codebase's own `is_market_open()` (not wall-clock guesswork) before running:
+`now_et() = 2026-09-28 12:12:21-04:00`, `is_market_open() = True`. Read-only run (places
+no orders, no `whatIfOrder`, no Greeks subscription — clientId 98, outside the bot's own
+ladder), against SPY's real live chain.
+
+RESULT: `verdict.all_synthetic_outputs_in_range = true`,
+`verdict.chain_vs_synthetic_delta_within_0_10 = true`. Six real strikes compared
+side-by-side (chain-path IV/delta — the existing, already-audited entry-time solve — vs.
+the NEW W55 monitor-loop-path synthetic solve, same live marks): `delta_diff` ranged
+0.0000–0.0004 across all six, three orders of magnitude inside the 0.10 tolerance.
+`chain_iv_is_guessed = false` (a real per-contract solve, not a median fallback).
+`real_open_position_check = []` — no real open positions existed at run time to
+cross-check against (paper account currently flat), so that half of the script's design
+is still unexercised; not a blocker, since the chain-vs-synthetic comparison is the part
+that actually proves the solve, and a future position will exercise the other path
+incidentally the next time this account holds one. A trailing `ibkr_unexpected_disconnect`
+warning in the log is the client's own generic `disconnectedEvent` handler firing on the
+script's OWN clean `ibkr.disconnect()` call in its `finally` block (confirmed by the
+`ibkr_disconnected` info log immediately after it, from `disconnect()` itself,
+`ibkr_client.py:266`) — a known label mismatch, not a new finding; exit code 0.
+
+**`synthetic_leg_greeks`/`synthetic_vertical_deltas` (W55) and, by extension,
+`condor_defense.py` (W56)'s solve underneath it are now validated against real live
+data, not just fixture prices.** This closes the LAST prerequisite W55's NEXT named
+before those two modules could ever be wired into a live path — the other one (the joint
+W54/W56 non-boolean `check_positions` decision-output design) remains open and still
+needs the operator's design input; validating the solve doesn't design that extension.
+
+STATE AT HANDOFF. No code changed — this is a live-run result only. No restart needed
+(nothing new wired to any live path).
+
+NEXT, unchanged except this one item closing: **the joint W54/W56 `check_positions`
+non-boolean-output design** is now the ONLY remaining prerequisite before either W54 or
+W56 can be wired in — worth prioritizing next specifically because it was the sole
+blocker left standing once this entry closes. **W53's placing run**
+(`scripts/probe_w53_roll_atomicity.py open/roll/flatten`) — TWS paper is reachable
+right now too, same RTH window this entry used, but places REAL paper orders and was
+deliberately deferred to a separate explicit decision, not bundled into this read-only
+run. **W57**, **W54**, **W52a's four items**, **the ongoing QQQ backfill**, **the
+surface-construction quality filter**, **the zero-bars inefficiency**, and **the
+risk-free-rate script's Phase B connection-reuse note** all unchanged from the entry
+immediately above.
+
+---
