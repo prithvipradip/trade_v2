@@ -21,7 +21,8 @@ from enum import Enum
 from ait.bot.state import StateManager, TradeRecord, TradeStatus
 from ait.broker.ibkr_client import IBKRClient
 from ait.strategies.base import CREDIT_STRATEGIES
-from ait.config.settings import ExitConfig
+from ait.config.settings import CondorDefenseConfig, ExitConfig
+from ait.execution.condor_defense import DefenseAction, evaluate_condor_defense
 from ait.execution.exit_policy import (
     EXPIRY_APPROACHING_DTE,
     macro_flatten_window_days,
@@ -43,10 +44,13 @@ class PositionAction(str, Enum):
     """check_positions' own output vocabulary -- what an executor would act
     on. Deliberately simpler than condor_defense.DefenseAction (HOLD/
     ROLL_UNTESTED/ROLL_TESTED/CLOSE, a decision TABLE's internal
-    vocabulary, W56) -- a future wiring wave maps DefenseAction.ROLL_
+    vocabulary, W56) -- _map_condor_defense_action maps DefenseAction.ROLL_
     UNTESTED/ROLL_TESTED both onto ROLL here (roll_side names which
-    physical side, exit_reason carries the table-row nuance). Nothing
-    produces ROLL yet -- see _derive_position_action."""
+    physical side, action_reason carries the table-row nuance).
+    _derive_position_action never produces ROLL -- only a wired decision
+    module (condor_defense today; a future W54 rule 3/3e wiring later) does,
+    and DECISION-ONLY: see _evaluate_position's condor_defense call site --
+    a ROLL or CLOSE verdict from there never touches should_exit."""
 
     HOLD = "hold"
     CLOSE = "close"
@@ -59,15 +63,33 @@ def _derive_position_action(should_exit: bool, partial_exit_quantity: int) -> Po
     existing exit rule already sets -- same split this register uses
     elsewhere (classify_tested_delta vs evaluate_condor_defense,
     interpolate_rate vs get_risk_free_rate): isolate the pure logic from
-    the data-gathering context it's called from. Never returns ROLL --
-    that value has no producer yet; a future rule (W54's rule 3/3e once
-    wired to assignment_response.policy, or a wired condor_defense) sets
-    action=ROLL directly instead of calling this, the same way it would
-    otherwise call this for the close/hold/partial cases."""
+    the data-gathering context it's called from. Never returns ROLL itself
+    -- this function only ever sees should_exit/partial_exit_quantity, and
+    no existing rule sets either of those to mean "roll". The condor_
+    defense call site in _evaluate_position computes ROLL separately (via
+    _map_condor_defense_action) and only falls back to this function's
+    result when condor_defense's own verdict was HOLD -- see the call
+    site's comment for why (decision-only: a ROLL/CLOSE verdict from there
+    never touches should_exit, so it can't flow through here)."""
     if should_exit:
         return PositionAction.CLOSE
     if partial_exit_quantity > 0:
         return PositionAction.PARTIAL_CLOSE
+    return PositionAction.HOLD
+
+
+def _map_condor_defense_action(action: DefenseAction) -> PositionAction:
+    """condor_defense.DefenseAction (a decision TABLE's internal vocabulary
+    -- HOLD/ROLL_UNTESTED/ROLL_TESTED/CLOSE, W56) -> PositionAction
+    (check_positions' own, simpler output vocabulary). ROLL_UNTESTED and
+    ROLL_TESTED both collapse to ROLL here -- the caller reads WHICH
+    physical side from DefenseDecision.tested_side and WHY from
+    DefenseDecision.reason (folded into PositionStatus.action_reason),
+    not from the action value itself."""
+    if action == DefenseAction.CLOSE:
+        return PositionAction.CLOSE
+    if action in (DefenseAction.ROLL_UNTESTED, DefenseAction.ROLL_TESTED):
+        return PositionAction.ROLL
     return PositionAction.HOLD
 
 
@@ -97,12 +119,21 @@ class PositionStatus:
     marks_missing: bool = False
     # Shared check_positions decision-output extension (register: "design
     # once, use for both" W54's rule 3/3e roll-vs-close dispatch and W56's
-    # condor_defense). Purely additive -- action is always derived from
-    # should_exit/partial_exit_quantity today (_derive_position_action),
-    # and roll_side is always None; no existing rule sets either directly,
-    # and no caller reads them yet. See PLAN.md for the full writeup.
+    # condor_defense). action/roll_side default to a plain derivation of
+    # should_exit/partial_exit_quantity (_derive_position_action) unless a
+    # wired decision module (condor_defense, wired this wave) overrides
+    # them -- DECISION-ONLY: that override never touches should_exit, so
+    # flipping condor_defense.enabled=True changes what's reported here,
+    # never what a live executor actually does. No caller reads these
+    # fields yet. See PLAN.md for the full writeup.
     action: PositionAction = PositionAction.HOLD
     roll_side: str | None = None  # "P" or "C" when action == ROLL
+    # Free-text reason for action/roll_side, kept separate from exit_reason
+    # (which stays should_exit/partial_exit_quantity's own narrative) so a
+    # condor_defense verdict never collides with an unrelated partial-exit
+    # message in the same tick -- the two fields describe independent
+    # things and may coexist. None unless a wired decision module set it.
+    action_reason: str | None = None
 
 
 class PortfolioManager:
@@ -122,6 +153,7 @@ class PortfolioManager:
         earnings_calendar=None,
         economic_calendar=None,
         dividend_calendar=None,
+        condor_defense_config: CondorDefenseConfig | None = None,
     ) -> None:
         self._ibkr = ibkr_client
         self._market_data = market_data
@@ -131,6 +163,11 @@ class PortfolioManager:
         self._exit_config = exit_config or ExitConfig()
         self._earnings = earnings_calendar
         self._economic_cal = economic_calendar
+        # W56 wiring: decision-only (see PositionStatus.action's docstring
+        # and the call site in _evaluate_position) -- defaults to
+        # enabled=False, so constructing without this kwarg (every existing
+        # test via __new__ never even sets the attribute) changes nothing.
+        self._condor_defense_config = condor_defense_config or CondorDefenseConfig()
         # W51 (model-vs-reality-ex-div-assignment-void): EarningsCalendar's
         # twin — see rule 3e below (pre_ex_div_assignment_risk).
         self._dividends = dividend_calendar
@@ -962,6 +999,27 @@ class PortfolioManager:
                 # dte<=1, expiry) still apply as a backstop.
                 log.warning("ex_div_check_failed", symbol=trade.symbol, error=str(e))
 
+        # W56 wiring: tested/untested condor defense -- a DECISION-ONLY
+        # verdict, never should_exit. Gated on not should_exit so a
+        # position some OTHER rule already wants to close never gets a
+        # redundant/confusing verdict logged alongside it (getattr-guarded:
+        # tests constructing via __new__ don't set _condor_defense_config,
+        # same convention rule 3e's _dividends guard above uses).
+        # evaluate_condor_defense already handles enabled=False and
+        # non-iron_condor strategies internally (HOLD either way) -- no
+        # need to duplicate those guards here.
+        condor_action = PositionAction.HOLD
+        condor_roll_side: str | None = None
+        condor_action_reason: str | None = None
+        if not should_exit and getattr(self, "_condor_defense_config", None):
+            verdict = evaluate_condor_defense(
+                trade, option_marks or {}, current_price, dte, self._condor_defense_config,
+            )
+            if verdict.action != DefenseAction.HOLD:
+                condor_action = _map_condor_defense_action(verdict.action)
+                condor_roll_side = verdict.tested_side if condor_action == PositionAction.ROLL else None
+                condor_action_reason = f"condor_defense_{verdict.reason}"
+
         # 4. Check for partial exit milestones (only if not already exiting
         # fully, and only with real marks)
         if not should_exit and not marks_missing and trade.quantity > 1:
@@ -1018,8 +1076,10 @@ class PortfolioManager:
             exit_reason=exit_reason,
             partial_exit_quantity=partial_exit_quantity,
             marks_missing=marks_missing,
-            action=_derive_position_action(should_exit, partial_exit_quantity),
-            roll_side=None,
+            action=(condor_action if condor_action != PositionAction.HOLD
+                    else _derive_position_action(should_exit, partial_exit_quantity)),
+            roll_side=condor_roll_side,
+            action_reason=condor_action_reason,
         )
 
     @staticmethod

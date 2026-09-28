@@ -362,6 +362,7 @@ class TradingOrchestrator:
             earnings_calendar=self._earnings,
             economic_calendar=self._economic_cal,
             dividend_calendar=self._dividends,
+            condor_defense_config=settings.condor_defense,
         )
         # GOV-5 (governance audit): live-profile assertion — the liquidity
         # gates were deliberately relaxed for paper/delayed data

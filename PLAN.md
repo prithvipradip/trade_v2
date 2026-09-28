@@ -12034,3 +12034,109 @@ No inspect.getsource — every new test drives the real `_derive_position_action
 real `_evaluate_position`, never asserts on source strings.
 
 ---
+
+## 2026-09-28 - WIRED — `condor_defense.py` into `check_positions`, decision-only: the
+last step of the W55→W56 arc, closed
+
+SCOPE. `condor_defense.py` (W56) and its own live-validated synthetic-delta solve (W55)
+existed but were called by nothing. The `check_positions` decision-output extension
+(immediately above) exists specifically to give a caller like this something richer than
+a boolean to report through. This wave makes `_evaluate_position` actually call `evaluate_
+condor_defense` for open iron condors and report its verdict.
+
+**Two operator decisions this session, both toward the conservative arm:**
+1. **Decision-only, for both CLOSE and ROLL.** `condor_defense.enabled` stays `False` by
+   default, unchanged. Once flipped to `True` in the future, NOTHING about real order
+   behavior changes — the verdict is recorded in `PositionStatus.action`/`roll_side`/the
+   new `action_reason` field, never in `should_exit`. `should_exit` stays 100% owned by
+   the existing ~10 rules exactly as before this wave. This was the wave's own centerpiece
+   and its primary proof target (see Proof).
+2. This wave does NOT make condor_defense's verdict actionable — a separate, explicitly-
+   approved future step would be needed for either CLOSE (could reuse the existing
+   should_exit path near-immediately, no new order machinery needed) or ROLL (still has
+   no executor at all — that's W57's job).
+
+DESIGN. `src/ait/execution/portfolio.py`: `PositionStatus` gains `action_reason: str |
+None = None`, deliberately separate from `exit_reason` (which stays should_exit/partial_
+exit_quantity's own narrative) so a condor_defense verdict never collides with an
+unrelated partial-exit message in the same tick. `_map_condor_defense_action(DefenseAction)
+-> PositionAction` — a small pure function (same split as `_derive_position_action`/
+`classify_tested_delta`) collapsing condor_defense's richer table vocabulary (`HOLD`/
+`ROLL_UNTESTED`/`ROLL_TESTED`/`CLOSE`) onto `check_positions`' simpler one (`HOLD`/`CLOSE`/
+`ROLL`) — `roll_side`/`action_reason` carry which physical side and why.
+`PortfolioManager.__init__` gains `condor_defense_config: CondorDefenseConfig | None =
+None` (same pattern `exit_config` already uses; defaults to `CondorDefenseConfig()`,
+`enabled=False`). In `_evaluate_position`, right after rule 3e and before rule 4 (partial
+exit): if `not should_exit` and `getattr(self, "_condor_defense_config", None)` is set
+(`getattr`-guarded, matching rule 3e's own `_dividends` convention, so every existing test
+constructing `PortfolioManager` via `__new__` — all 324 of them — is unaffected), call the
+synchronous `evaluate_condor_defense(trade, option_marks, current_price, dte, self.
+_condor_defense_config)`. Gated on `not should_exit` so a position some OTHER rule already
+wants to close never gets a redundant/confusing verdict logged alongside it. At the return
+site: `action = condor_action if condor_action != HOLD else _derive_position_action(...)`,
+`roll_side`/`action_reason` set from the verdict when non-HOLD, else `None` — byte-
+identical to before this wave whenever condor_defense wasn't computed or returned `HOLD`.
+`src/ait/bot/orchestrator.py`'s `PortfolioManager(...)` construction (`:358-366`) gains
+`condor_defense_config=settings.condor_defense` — the actual live wiring.
+
+PROOF. `tests/test_condor_defense_wiring.py`, 12 new tests, no `inspect.getsource`, driven
+through the REAL `_evaluate_position` (same `__new__`-with-mocked-collaborators harness as
+`test_credit_exits.py`/`test_position_action_output.py`), with real iron-condor fixtures
+reused directly from `test_w56_condor_defense.py` (brentq-against-py_vollib-delta strike
+selection, same cross-test-file import convention `test_r16_tail_fixes.py` already uses).
+`TestMapCondorDefenseAction`: exhaustive, all 4 `DefenseAction` values. `TestDecisionOnly
+Wiring` — the centerpiece: a CLOSE verdict (delta ≥ 0.40) asserts `should_exit is False`
+explicitly, alongside `action == CLOSE`/`action_reason` set — the actual proof this wave's
+whole design promise holds; ROLL_UNTESTED and ROLL_TESTED verdicts likewise never touch
+`should_exit`. `TestFallsThroughToPlainDerivation` — below-monitor-band (HOLD), disabled
+config, `_condor_defense_config` never set at all (the regression proof — every pre-
+existing test), non-iron-condor strategy, and an EARLIER rule already exiting (a real
+touch-stop, `short_strike_touch`) — all six leave `action_reason is None`, byte-identical
+to the prior wave.
+
+Mutation-checked: temporarily dropped the `not should_exit` gate on the new call site →
+confirmed the touch-stop-already-exiting test failed exactly as predicted (an unwanted
+`action_reason='condor_defense_close_delta_threshold'` leaked in alongside the real
+`should_exit=True` touch-stop exit) — reverted, `git diff --stat` confirmed clean.
+
+**Full regression surface — 379/379, zero new failures**: the same 311 `portfolio.py`
+files, `test_position_action_output.py` (13), `test_w56_condor_defense.py` (43, unchanged
+— condor_defense.py itself wasn't touched, only its NEW caller), and the 12 new. `python -m
+compileall -q src tests`: OK. `python scripts/typecheck.py`: OK, zero attr-defined/
+call-arg/name-defined in `src/ait/{config,bot,execution,risk}` (this wave touches both
+`execution/` and `bot/`, both gated paths). `python scripts/smoke_deploy.py`: **SMOKE PASS
+(13 checks)** — confirms the real `orchestrator.py` → `PortfolioManager` construction with
+the new kwarg works end to end against the real account state, no DB writes.
+
+Full fast lane: **2643 passed / 1 failed / 46 skipped / 153 deselected, 923.05s (15m23s)**
+— the one failure is the same standing `test_r19_config_authority.py::TestContractIsThe
+SingleAuthority::test_applier_and_readers_share_one_table` (`AIT_MARKET_DATA_TYPE`
+divergence). Count check against the immediately-prior full fast lane (2631+1=2632): this
+run is 2643+1=2644 — a delta of exactly **12**, matching the new test count precisely.
+
+STATE AT HANDOFF. `src/ait/execution/portfolio.py` and `src/ait/bot/orchestrator.py`
+(both modified), `tests/test_condor_defense_wiring.py` (new). Zero config changes — the
+`condor_defense:` block already existed (W56), `enabled: false` unchanged. **Live
+behavior is unchanged even after a restart**: with `enabled=False`, `evaluate_condor_
+defense` returns `HOLD`/`disabled` immediately for every position, same as before this
+wave existed at all. A restart is not required for correctness and none was performed —
+the operator's own call, per CLAUDE.md's bot-restart-ownership rule, whenever they choose
+one for unrelated reasons.
+
+NEXT, naming every open item explicitly: **making condor_defense's verdict actually
+actionable** — a separate, explicitly-approved future step, not decided or built here;
+CLOSE could reuse the existing `should_exit` path near-immediately once approved, ROLL
+still needs W57's executor. **W54's rule 3/3e wiring** — still needs the latency/cadence
+design the 2026-09-27 scoping note flagged (`get_chain`'s 100s+ measured cost makes
+per-tick re-evaluation infeasible), now the more clearly larger of the two remaining
+wiring jobs since this one is closed. **W57**. **W53's placing run** — still needs
+explicit operator go-ahead plus a `flatten` commitment (confirmed this session: nothing
+auto-closes a successful fill). **W52a's four items** — deliberately registered. **The
+ongoing QQQ backfill** — operator-run, unaffected. **The surface-construction quality
+filter**, **the zero-bars inefficiency**, **the risk-free-rate script's Phase B
+connection-reuse note** — all unchanged.
+
+No inspect.getsource — every new test drives the real `_map_condor_defense_action` and the
+real `_evaluate_position`, never asserts on source strings.
+
+---
