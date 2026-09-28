@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 from ait.utils.cadence import QUOTE_STALENESS_BUDGET_SECONDS
@@ -553,6 +553,90 @@ class AssignmentResponseConfig(_StrictModel):
                     "it should be trusted at the cent.")
 
 
+class CondorDefenseConfig(_StrictModel):
+    """W56 (tastytrade-style tested/untested-side condor defense, decision
+    layer): per open iron condor, classify the TESTED short's synthetic
+    delta (W55, execution/synthetic_delta.py) plus DTE against this table
+    to decide hold / roll-untested / roll-tested / close. `enabled` defaults
+    to False so shipping this config surface and execution/condor_defense.py
+    behind it changes NO live behavior — nothing calls into it yet (the
+    same convention AssignmentResponseConfig above and W53/W55's additive
+    modules use). See PLAN.md's 2026-09-22 ROADMAP EXTENSION [4]/[5] for the
+    playbook table this mirrors and the GAP_AUDIT_R7 POST-VERDICT reasoning
+    for the off-by-default choice — thin edge at 1 contract, and changing
+    exit mechanics mid-sample corrupts the 50-close measurement."""
+
+    enabled: bool = Field(default=False,
+        description="Off: check_positions never consults this config (once "
+                    "a future wave wires it in) — always hold. On: the "
+                    "decision table below becomes live. Stays off pending "
+                    "the 50-close paper verdict, per GAP_AUDIT_R7.")
+    side: Literal["tested_only", "untested_only", "both"] = Field(
+        default="untested_only",
+        description="Which rolls are allowed. tested_only: only roll the "
+                    "side under pressure (a debit, buys distance). "
+                    "untested_only: only roll the side NOT under pressure "
+                    "(a credit, widens the aggregate breakeven — the "
+                    "playbook's primary recommendation). both: either, per "
+                    "the table. A roll the current side setting disallows "
+                    "holds instead (does not escalate to close) — the "
+                    "0.40-delta close row is never side-filtered.")
+    monitor_delta_max: float = Field(default=0.25, ge=0.0, le=1.0,
+        description="Below this, the tested short is not under enough "
+                    "pressure to act on — hold. Document's table, row 1.")
+    roll_untested_delta_min: float = Field(default=0.25, ge=0.0, le=1.0,
+        description="Floor of the tested-short delta band (inclusive) that "
+                    "triggers rolling the UNTESTED side for a credit. "
+                    "Document's table, row 2.")
+    roll_untested_delta_max: float = Field(default=0.30, ge=0.0, le=1.0,
+        description="Ceiling of the roll-untested delta band (exclusive — "
+                    "at this delta the tested-side row below takes over). "
+                    "Document's table, row 2.")
+    roll_untested_dte_min: int = Field(default=14, ge=1, le=365,
+        description="Floor (inclusive) of the DTE window the roll-untested "
+                    "row applies in. Document's table, row 2.")
+    roll_untested_dte_max: int = Field(default=21, ge=1, le=365,
+        description="Ceiling (inclusive) of the DTE window the "
+                    "roll-untested row applies in — beyond this the "
+                    "tested-side row takes over. Document's table, row 2.")
+    roll_tested_delta_min: float = Field(default=0.30, ge=0.0, le=1.0,
+        description="Floor (inclusive) of the tested-short delta band that "
+                    "triggers rolling the TESTED side itself for a debit, "
+                    "when DTE is also >= roll_tested_dte_min. Document's "
+                    "table, row 3 (low-gamma / >21 DTE).")
+    roll_tested_dte_min: int = Field(default=22, ge=1, le=365,
+        description="Floor (inclusive) of the DTE window the roll-tested "
+                    "row applies in — explicit (not just \"not in the "
+                    "roll-untested window\") so the two bands can't "
+                    "silently overlap if either is retuned independently.")
+    close_delta_threshold: float = Field(default=0.40, ge=0.0, le=1.0,
+        description="At or above this delta, close outright regardless of "
+                    "DTE or side setting — high-gamma / near-expiry, the "
+                    "document's table row 4. Not side-filtered: closing is "
+                    "not a roll.")
+
+    @model_validator(mode="after")
+    def _validate_bands(self) -> "CondorDefenseConfig":
+        if not (self.monitor_delta_max <= self.roll_untested_delta_min
+                < self.roll_untested_delta_max <= self.roll_tested_delta_min
+                < self.close_delta_threshold):
+            raise ValueError(
+                "condor_defense delta bands must satisfy monitor_delta_max <= "
+                "roll_untested_delta_min < roll_untested_delta_max <= "
+                "roll_tested_delta_min < close_delta_threshold "
+                f"(got {self.monitor_delta_max}, {self.roll_untested_delta_min}, "
+                f"{self.roll_untested_delta_max}, {self.roll_tested_delta_min}, "
+                f"{self.close_delta_threshold})")
+        if not (self.roll_untested_dte_min <= self.roll_untested_dte_max
+                < self.roll_tested_dte_min):
+            raise ValueError(
+                "condor_defense DTE windows must satisfy roll_untested_dte_min "
+                "<= roll_untested_dte_max < roll_tested_dte_min "
+                f"(got {self.roll_untested_dte_min}, {self.roll_untested_dte_max}, "
+                f"{self.roll_tested_dte_min})")
+        return self
+
+
 class SentimentConfig(_StrictModel):
     """R12-C tombstone: the sentiment stack (ait.sentiment, ib_news,
     fundamentals_db) is retired to deprecated/src/ — verified zero influence
@@ -793,6 +877,7 @@ class Settings(_StrictModel):
     earnings: EarningsConfig = EarningsConfig()
     dividends: DividendConfig = DividendConfig()
     assignment_response: AssignmentResponseConfig = AssignmentResponseConfig()
+    condor_defense: CondorDefenseConfig = CondorDefenseConfig()
     exit: ExitConfig = ExitConfig()
     learning: LearningConfig = LearningConfig()
     sentiment: SentimentConfig = SentimentConfig()

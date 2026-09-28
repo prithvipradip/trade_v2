@@ -11521,3 +11521,166 @@ interpolation function, a real temp `HistoricalDataStore`, the real re-solve pip
 against a fake network boundary only).
 
 ---
+
+## 2026-09-28 - W56 BUILT — tested/untested condor-defense decision logic, a pure
+additive module, nothing wired to any live path
+
+SCOPE. Per the 2026-09-22 ROADMAP EXTENSION (`:8783-8905`): W55 (synthetic per-leg delta)
+is built; W56 is the decision layer that reads a tested short's delta+DTE and decides
+hold / roll-untested / roll-tested / close against the operator's playbook table
+(0.25/0.30/0.40 delta, 14/21 DTE — `:8848-8869`; the document itself isn't in the repo).
+W55's own NEXT flagged two prerequisites for WIRING this in: its own live TWS/RTH
+validation run (still not run) and a shared non-boolean `check_positions` output W54
+also needs (`PositionStatus` today is `should_exit: bool` + `exit_reason: str`,
+`portfolio.py:41-64`). This wave does not touch either — it builds the decision logic and
+config surface as an additive module nothing calls, the same convention W53's
+`roll_selector.py` and W55's `synthetic_delta.py` used. No production trading-path
+behavior changes; `portfolio.py` is untouched.
+
+THREE OPERATOR DECISIONS THIS SESSION (the [4] sketch's table leaves real gaps and
+ambiguities the operator resolved before building):
+1. **Scope: pure module only.** No change to `portfolio.py`/`PositionStatus` this wave —
+   that structural extension is deferred to when W54 and W56's wiring are designed
+   together, per W55's own NEXT.
+2. **Table gaps** (tested-short |Δ| 0.30–0.40 at ≤21 DTE; 0.25–0.30 at >21 DTE; 0.25–0.40
+   at <14 DTE — cells neither row of the table covers) → **HOLD**, reason
+   `no_rule_matched`. Cheapest/safest arm; the existing exits (1.25x stop, touch stop,
+   DTE≤5 close) still backstop the position regardless.
+3. **A roll the `side` setting disallows** (e.g. the table says roll-tested but
+   `side=untested_only`) → **HOLD**, reason names the blocked roll. `side` governs rolls
+   only — the close row is never side-filtered, so a genuine 0.40-delta blowout still
+   closes under any `side` setting.
+
+DESIGN.
+1. **`CondorDefenseConfig`** (`src/ait/config/settings.py`, after `AssignmentResponseConfig`,
+   registered on `Settings.condor_defense`) — `enabled: bool = False` (GAP_AUDIT_R7
+   POST-VERDICT reasoning, `:8871-8882`: thin edge at 1 contract, changing exit mechanics
+   mid-sample corrupts the 50-close measurement — stays off pending that verdict),
+   `side: Literal["tested_only","untested_only","both"] = "untested_only"`, and the table's
+   6 threshold fields (`monitor_delta_max`, `roll_untested_delta_min/max`,
+   `roll_untested_dte_min/max`, `roll_tested_delta_min`, `roll_tested_dte_min`,
+   `close_delta_threshold`) at the table's own defaults. A `model_validator(mode="after")`
+   refuses inverted/overlapping bands (`monitor_delta_max <= roll_untested_delta_min <
+   roll_untested_delta_max <= roll_tested_delta_min < close_delta_threshold`, and the DTE
+   windows can't overlap either) — a future retune that breaks the ordering fails fast at
+   config load, not silently at decision time. `roll_tested_dte_min` (22) is its own
+   explicit field rather than "not in the untested window," specifically so the two bands
+   can't silently drift into overlap if either is retuned independently.
+   `untested_roll_target_delta` from the [4] sketch is deliberately NOT added — nothing in
+   W56 reads it; it ships with its actual consumer, W57. Matching `condor_defense:` block
+   added to `config.yaml`, `enabled: false`, same commit as the code (no
+   `extra="forbid"` deploy-ordering hazard).
+2. **`src/ait/execution/condor_defense.py`** (new, called by nothing):
+   `classify_tested_delta(abs_delta, dte, config) -> (DefenseAction, reason)` is the pure
+   table lookup — no data access, kept separate from the rest so band edges are testable
+   with exact numbers alone (same split this register used for `interpolate_rate` vs. the
+   DB-backed `get_risk_free_rate` in W59, immediately above). Order: close threshold first
+   (applies at any DTE, never side-filtered) → monitor floor → tested band (needs both the
+   delta AND `dte >= roll_tested_dte_min`) → untested band (delta AND DTE window) →
+   otherwise `no_rule_matched`.
+   `evaluate_condor_defense(trade, option_marks, spot, dte, config) -> DefenseDecision`
+   does the data work: `enabled` is checked FIRST, before touching marks or the legs JSON
+   at all (`disabled` reason, so an empty `option_marks` dict never even gets read);
+   `trade.strategy != "iron_condor"` → `not_an_iron_condor`; reuses `_at_risk_vertical`
+   (`roll_selector.py:41`, W53) to require a clean short+long pair on BOTH sides before
+   picking a tested side (`no_clean_condor` otherwise) — an ambiguous condor never
+   half-decides. Never raises; every failure path returns a HOLD with a named reason,
+   matching `select_roll_target`'s and `synthetic_leg_greeks`'s own fail-safe convention.
+3. **Tested-side selection is by relative strike distance to spot, not by comparing two
+   solved deltas.** `(spot - put_short)/spot` vs. `(call_short - spot)/spot`; the smaller
+   wins (an ITM short's distance goes negative, so it's always picked over an OTM one;
+   ties — a genuinely centered condor — go to the put, where skew makes the real delta
+   larger at the same relative distance). Deliberately not "whichever leg's synthetic delta
+   solves larger": the untested side is often far OTM with a near-zero mark, exactly where
+   W55's IV solve is most likely to fail (`failed_other` / a sub-floor sigma) — requiring
+   BOTH sides to solve successfully would blind the decision precisely when the tested side
+   is under real pressure. Only the tested short's own delta (via `synthetic_vertical_
+   deltas`, `synthetic_delta.py:100`, W55) is ever solved for; the untested side's marks
+   (and even the tested side's own paired long's mark) can be entirely absent without
+   blocking a decision — proven by a dedicated test, not assumed.
+
+PROOF. `tests/test_w56_condor_defense.py`, 43 new tests, no `inspect.getsource`, no
+MagicMock for `option_marks` (real dict, matching W51/W55's own convention) — driven end
+to end through the REAL W55 solve pipeline (`synthetic_vertical_deltas` ->
+`solve_iv_from_price`), with marks priced by py_vollib's own `black_scholes` at strikes
+chosen via a `scipy.optimize.brentq` root-find against py_vollib's own `delta()` — each
+fixture's precondition (the solved |Δ| really lands in its intended band) is asserted, not
+assumed. Covers: `classify_tested_delta` at every table row, every gap cell, and every
+band edge (inclusive/exclusive checked explicitly, e.g. exactly 0.30@18-DTE falls through
+to `no_rule_matched` since the untested upper bound is exclusive); `evaluate_condor_
+defense`'s four live-band decisions; the side filter both directions plus `both`; close
+never side-filtered; tested-side selection (call tested near the money, ITM put tested
+over an OTM call); every failure path (`disabled` before any solve, non-condor, malformed
+legs JSON, one side not a clean pair, missing tested-short mark, `dte=None`, untested-side
+marks entirely absent); config defaults match the table, every inversion/overlap the
+validator should reject, `extra="forbid"` on an unknown key, and the real `config.yaml`
+loading through `load_settings` with `condor_defense.enabled == False`.
+
+A REAL BUG THIS WAVE'S OWN TESTS CAUGHT WHILE BUILDING THE FIXTURES, not a design choice:
+the first fixture draft used a fixed calendar-date expiry regardless of the DTE a test
+wanted, not realizing `synthetic_leg_greeks` (W55) recomputes DTE itself from `(expiry_date
+- today_et()).days` rather than trusting any passed-in value — so a price synthesized at
+one `t` and the `t` re-derived inside the real solve diverged, and the first close-band
+test's solved delta (0.4224) landed outside its asserted tolerance of the 0.45 target.
+Fixed by deriving every fixture's expiry as `today_et() + timedelta(days=dte_days)`,
+consistent with what the code under test actually does — a useful reminder that the
+correct default-tolerance check in a test occasionally finds a fixture bug in the TEST,
+not the code.
+
+Mutation-checked 3 mechanisms (temporarily broken, confirmed the intended test failed for
+the predicted reason, reverted; `md5` of `condor_defense.py` confirmed identical before and
+after all three, since the file is new/untracked and `git diff --stat` shows nothing for
+it): the untested band's exclusive upper bound (`<` -> `<=`) broke `test_untested_upper_
+bound_is_exclusive`; dropping the ROLL_TESTED side-filter check broke `test_untested_only_
+blocks_a_roll_tested_verdict`; inverting the tested-side distance comparison broke BOTH
+`TestTestedSideSelection` tests.
+
+Neighbors: `test_w55_solve_contract_greeks.py` + `test_w55_synthetic_delta.py` +
+`test_w53_roll_target_selection.py` + `test_w53_roll_leg_validator.py` +
+`test_w53_probe_script.py` + `test_w53_db_migration.py` + the new file: 138/138.
+`test_config.py` + `test_r19_config_authority.py` + `test_w35_config_and_retrain.py` +
+`test_w36_config_homes_and_drain.py`: 86/87 (the one failure is the standing
+`AIT_MARKET_DATA_TYPE` divergence, unrelated). `python -m compileall -q src tests`: OK.
+`python scripts/typecheck.py`: OK, zero attr-defined/call-arg/name-defined in
+`src/ait/{config,bot,execution,risk}`. `python scripts/smoke_deploy.py`: **SMOKE PASS (13
+checks)** — read-only, confirms the real `config.yaml` with the new `condor_defense` block
+loads and runs end to end through the real orchestrator dry-run path, no DB writes.
+
+Full fast lane: **2612 passed / 1 failed / 46 skipped / 153 deselected, 1197.91s
+(19m57s)** — the one failure is the same standing `test_r19_config_authority.py::
+TestContractIsTheSingleAuthority::test_applier_and_readers_share_one_table`
+(`AIT_MARKET_DATA_TYPE` local-`.env` divergence). Count check against W59's own fast lane
+(2569+1=2570 non-deselected): this run is 2612+1=2613 — a delta of exactly +43, matching
+the 43 new tests precisely (no other test file touched).
+
+STATE AT HANDOFF. Files touched: `src/ait/config/settings.py`, `config.yaml` (both
+modified — new `CondorDefenseConfig`/`condor_defense:` block, `enabled: false`),
+`src/ait/execution/condor_defense.py` (new), `tests/test_w56_condor_defense.py` (new).
+Zero production trading-path files touched — `portfolio.py` is byte-identical to before
+this wave. No restart needed for correctness (nothing new is wired to any live path,
+`enabled` defaults False); the next restart will pick up the new inert config block
+alongside whatever else is pending.
+
+NEXT, naming every open item explicitly: **W55's live validation run**
+(`scripts/validate_w55_synthetic_delta.py`, needs TWS during RTH, still not run) — the
+first real prerequisite before anything wires `condor_defense.py` or `synthetic_delta.py`
+into a live path. **The joint W54/W56 `check_positions` non-boolean-output design** —
+still not designed; needed before either can be wired in, per W55's own NEXT (design once,
+use for both). **W57** (the roll-a-vertical action) — needs the full W53 placing build
+(still waits on TWS/RTH) plus this wave, and is where `untested_roll_target_delta`
+finally gets added. **W54** — operator decision on the heuristic-vs-EV roll-decision
+fork, per the 2026-09-27 scoping note. **W53's placing run** — waits on TWS during an RTH
+session. **W52a's four items** — deliberately registered, not oversights. **The ongoing
+QQQ options backfill** (`backfill_option_history.py`) — operator-run, unaffected by this
+wave. **The config-gated surface-construction quality filter** — deferred, W54's own data
+scope. **The zero-bars-retried-forever minor inefficiency** — registered, not urgent.
+**The risk-free-rate script's Phase B per-row SQLite connection** (W59, immediately
+above) — `update_option_bar_iv` opens a fresh connection per row, measured ~0.33s/row;
+fine at today's row counts, worth batching before a full-scale re-solve once the real
+backfill has produced substantially more rows.
+
+No inspect.getsource — every new test drives the real `classify_tested_delta`,
+`evaluate_condor_defense`, and the real W55 solve pipeline underneath it, never asserts on
+source strings.
+
+---

@@ -260,6 +260,21 @@ assignment_response:
   roll_target_dte_max: 30              # Matches options.dte_range's live ceiling
   roll_min_credit: 0.20                # Provisional -- no roll has executed live to calibrate against
 
+condor_defense:
+  # W56 (tastytrade-style tested/untested-side condor defense, decision
+  # layer): enabled stays false until a future wave wires check_positions
+  # to consult it -- the values below have no live effect yet.
+  enabled: false
+  side: untested_only                  # tested_only / untested_only / both
+  monitor_delta_max: 0.25              # Below this, hold
+  roll_untested_delta_min: 0.25        # Roll the untested side for a credit in this band...
+  roll_untested_delta_max: 0.30        # ...at this DTE window
+  roll_untested_dte_min: 14
+  roll_untested_dte_max: 21
+  roll_tested_delta_min: 0.30          # Roll the tested side itself for a debit beyond this delta...
+  roll_tested_dte_min: 22              # ...once DTE is beyond the roll-untested window
+  close_delta_threshold: 0.40          # At or above this delta, close outright regardless of DTE/side
+
 exit:
   exit_cross_amount: 0.10             # How far combo exits cross the spread to guarantee fills (was hardcoded)
   # W7/R24 logic-exit-risk-01: credit buyback ceiling as a multiple of the
