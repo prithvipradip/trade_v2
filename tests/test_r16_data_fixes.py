@@ -19,7 +19,7 @@ Pins the corrected behavior for:
 from __future__ import annotations
 
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -106,8 +106,16 @@ class TestChainDefSelection:
         )
         captured = []
 
-        async def _fake_fetch(symbol, underlying, exp_date, strikes, price):
-            captured.append((exp_date, list(strikes)))
+        # Bug-fix note: strike discovery moved from _get_ibkr_chain (which
+        # used to pre-filter chain_def.strikes -- a COMBINED, all-expiries
+        # set -- and pass the guess down) into _fetch_ibkr_expiry itself
+        # (per-expiry, via reqContractDetailsAsync). This class tests
+        # chain_def/expirations SELECTION only, which is unaffected by that
+        # move -- captured now records exp_date, the one signal that
+        # survives it. Strike-discovery itself is covered by
+        # TestFetchExpiryPerExpiryStrikes below.
+        async def _fake_fetch(symbol, underlying, exp_date, price):
+            captured.append(exp_date)
             return None
 
         svc._fetch_ibkr_expiry = _fake_fetch
@@ -117,42 +125,50 @@ class TestChainDefSelection:
         # Adjusted '2IWM' def listed FIRST — the pre-R16 code picked it.
         svc, captured = self._service([_adj_def_in_window(), _std_def()])
         await svc._get_ibkr_chain("IWM", 300.0, 14, 45)
+        # _std_def() has 2 in-window expirations, _adj_def_in_window() has 1
+        # -- the count alone distinguishes which def actually got used.
+        std_expiries = {
+            datetime.strptime(e, "%Y%m%d").date() for e in _std_def().expirations
+        }
         assert captured, "standard-class def has in-window expiries — fetch must run"
-        for _exp, strikes in captured:
-            # Standard-class grid brackets spot; the 2IWM mini-grid (266/286)
-            # sits entirely below it.
-            assert any(s > 300.0 for s in strikes)
-            assert 266.0 not in strikes  # outside ±20% of 300 anyway, but pin it
+        assert set(captured) == std_expiries
 
     async def test_falls_back_to_any_smart_when_no_class_match(self):
         svc, captured = self._service([_adj_def_in_window()])
         await svc._get_ibkr_chain("IWM", 300.0, 14, 45)
         # Fallback keeps the old behavior alive rather than returning nothing.
-        assert len(captured) == 1
-        assert captured[0][1] == [266.0, 286.0]
+        adj_expiry = datetime.strptime(
+            _adj_def_in_window().expirations[0], "%Y%m%d"
+        ).date()
+        assert captured == [adj_expiry]
 
     async def test_option_contracts_pin_trading_class(self):
-        """_fetch_ibkr_expiry must build Option(..., tradingClass=symbol)."""
+        """_fetch_ibkr_expiry must request contract details with
+        Option(..., tradingClass=symbol), once per side."""
         svc = _svc()
         seen = []
 
-        async def _qualify(*batch):
-            seen.extend(batch)
-            return [SimpleNamespace(conId=0) for _ in batch]  # nothing qualifies
+        async def _req_contract_details(opt):
+            seen.append(opt)
+            return []  # nothing listed -- proves the pin without needing real strikes
 
         svc._ibkr = SimpleNamespace(
             connected=True,
             ib=SimpleNamespace(
-                qualifyContractsAsync=_qualify,
+                reqContractDetailsAsync=_req_contract_details,
                 reqMktData=MagicMock(),
                 cancelMktData=MagicMock(),
             ),
         )
         out = await svc._fetch_ibkr_expiry(
-            "IWM", MagicMock(), date.today() + timedelta(days=20), [290.0, 300.0], 300.0
+            "IWM", MagicMock(), date.today() + timedelta(days=20), 300.0
         )
-        assert out is None  # no leg qualified
-        assert seen and all(c.tradingClass == "IWM" for c in seen)
+        assert out is None  # nothing listed for either side
+        assert len(seen) == 2, "one reqContractDetailsAsync call per side (C, P)"
+        assert all(c.tradingClass == "IWM" for c in seen)
+        assert {c.right for c in seen} == {"C", "P"}
+        assert all(c.strike == 0.0 for c in seen), \
+            "strike=0.0 means 'every real strike at this expiry' to IB's API"
 
     def test_contract_builder_defaults_trading_class_to_symbol(self):
         opt = ContractBuilder.option("SPY", "2026-09-04", 682.0, "C")
@@ -162,6 +178,178 @@ class TestChainDefSelection:
             "SPX", "2026-09-04", 6800.0, "P", trading_class="SPXW"
         )
         assert opt2.tradingClass == "SPXW"
+
+
+# ---------------------------------------------------------------------------
+# [1b] the actual bug fix: strike discovery is per-expiry, not guessed from
+# reqSecDefOptParamsAsync's ALL-expiries combined strike list. Confirmed
+# live 2026-09-28: SPY at ~$765 spot generated hundreds of invalid-strike
+# qualify attempts per near-dated expiry ("No security definition"/"Unknown
+# contract"), enough to stall a chain fetch outright — and this was already
+# happening silently on the live bot's own entry scan (~8,800 error-200
+# lines in logs/ait.log), not just the probe script that surfaced it.
+# ---------------------------------------------------------------------------
+
+def _fake_contract_details_ib(strikes_by_expiry: dict[str, list[float]]):
+    """A fake ib whose reqContractDetailsAsync returns ONLY the strikes
+    registered for the SPECIFIC (expiry, right) requested — the real IB API
+    behavior this fix relies on, unlike reqSecDefOptParamsAsync's combined
+    all-expiries set. `strikes_by_expiry` keys are `lastTradeDateOrContractMonth`
+    strings (e.g. "20261006"); the same strikes are listed for both rights."""
+
+    class _FakeIB:
+        def __init__(self):
+            self.contract_details_calls: list = []
+            self.qualify_calls: list = []
+            self.md_reqs: list = []
+
+        async def reqContractDetailsAsync(self, opt):
+            self.contract_details_calls.append(opt)
+            strikes = strikes_by_expiry.get(opt.lastTradeDateOrContractMonth, [])
+            return [
+                SimpleNamespace(contract=SimpleNamespace(
+                    symbol=opt.symbol,
+                    lastTradeDateOrContractMonth=opt.lastTradeDateOrContractMonth,
+                    strike=s, right=opt.right,
+                    conId=int(s * 10) + (1 if opt.right == "C" else 2),
+                ))
+                for s in strikes
+            ]
+
+        async def qualifyContractsAsync(self, *batch):  # pragma: no cover
+            # Must never be called post-fix — reqContractDetailsAsync's
+            # results are already qualified. Recorded, not raised, so the
+            # "never called" test gets a clear assertion failure instead of
+            # an opaque crash if this regresses.
+            self.qualify_calls.extend(batch)
+            return [SimpleNamespace(conId=0) for _ in batch]
+
+        def reqMktData(self, q, *args):
+            self.md_reqs.append(q)
+
+        def cancelMktData(self, q):
+            pass
+
+        def ticker(self, q):
+            return SimpleNamespace(
+                bid=1.0, ask=1.2, last=1.1, volume=10.0,
+                modelGreeks=SimpleNamespace(
+                    impliedVol=0.2, delta=0.3, gamma=0.01, theta=-0.02, vega=0.05),
+            )
+
+    svc = _svc()
+    fake_ib = _FakeIB()
+    svc._ibkr = SimpleNamespace(connected=True, ib=fake_ib)
+    return svc, fake_ib
+
+
+class TestFetchExpiryPerExpiryStrikes:
+    async def test_narrow_and_wide_expiries_never_cross_contaminate(self):
+        """The literal bug: a near-dated 'weekly' with few real strikes must
+        never end up with a contract at a strike that only exists on a
+        different, wider 'monthly' expiry."""
+        narrow_exp = "20261006"
+        wide_exp = "20261012"
+        svc, fake_ib = _fake_contract_details_ib({
+            narrow_exp: [99.0, 100.0, 101.0],
+            wide_exp: [90.0, 95.0, 99.0, 100.0, 101.0, 105.0, 110.0],
+        })
+
+        narrow_chain = await svc._fetch_ibkr_expiry(
+            "SPY", MagicMock(), date(2026, 10, 6), 100.0)
+        wide_chain = await svc._fetch_ibkr_expiry(
+            "SPY", MagicMock(), date(2026, 10, 12), 100.0)
+
+        narrow_strikes = {c.strike for c in narrow_chain.calls + narrow_chain.puts}
+        wide_strikes = {c.strike for c in wide_chain.calls + wide_chain.puts}
+        # The bug this guards against: a combined-strikes guess would have
+        # let the narrow expiry reach for 90/95/105/110 -- strikes that only
+        # exist on the wide expiry. Exact equality proves neither expiry's
+        # result contains a strike outside its own registered set.
+        assert narrow_strikes == {99.0, 100.0, 101.0}
+        assert wide_strikes == {90.0, 95.0, 99.0, 100.0, 101.0, 105.0, 110.0}
+
+    async def test_qualify_contracts_async_is_never_called(self):
+        """reqContractDetailsAsync's results are already qualified (real
+        conId) — the old per-strike qualify step must be gone entirely."""
+        svc, fake_ib = _fake_contract_details_ib({"20261006": [99.0, 100.0]})
+        await svc._fetch_ibkr_expiry("SPY", MagicMock(), date(2026, 10, 6), 100.0)
+        assert fake_ib.qualify_calls == []
+
+    async def test_price_band_excludes_a_real_but_out_of_band_strike(self):
+        """A strike IBKR genuinely lists for this expiry, but outside the
+        ±20% ATM band, must still be excluded — the band filter moved
+        location (into this method) but not behavior."""
+        svc, fake_ib = _fake_contract_details_ib({
+            "20261006": [80.0, 100.0, 130.0],  # 130 is 30% above spot 100
+        })
+        chain = await svc._fetch_ibkr_expiry(
+            "SPY", MagicMock(), date(2026, 10, 6), 100.0)
+        strikes = {c.strike for c in chain.calls + chain.puts}
+        assert strikes == {80.0, 100.0}
+        assert 130.0 not in strikes
+
+    async def test_quarter_dollar_strike_still_excluded(self):
+        """deep-audit DATA-M7: allow $0.50 strikes, skip finer (adjusted-
+        class-only) increments — preserved at the new call site."""
+        svc, fake_ib = _fake_contract_details_ib({
+            "20261006": [99.0, 99.25, 99.5],
+        })
+        chain = await svc._fetch_ibkr_expiry(
+            "SPY", MagicMock(), date(2026, 10, 6), 100.0)
+        strikes = {c.strike for c in chain.calls + chain.puts}
+        assert strikes == {99.0, 99.5}
+        assert 99.25 not in strikes
+
+    async def test_one_side_failing_does_not_block_the_other(self):
+        """A real Exception from reqContractDetailsAsync on one side (e.g.
+        no listings for puts on this expiry) must not abort the whole
+        expiry — matches this method's existing per-side fail-open."""
+        exp = "20261006"
+
+        class _FlakyIB:
+            def __init__(self):
+                self.md_reqs = []
+
+            async def reqContractDetailsAsync(self, opt):
+                if opt.right == "P":
+                    raise RuntimeError("no security definition")
+                return [SimpleNamespace(contract=SimpleNamespace(
+                    symbol=opt.symbol, lastTradeDateOrContractMonth=exp,
+                    strike=100.0, right="C", conId=1))]
+
+            def reqMktData(self, q, *args):
+                self.md_reqs.append(q)
+
+            def cancelMktData(self, q):
+                pass
+
+            def ticker(self, q):
+                return SimpleNamespace(
+                    bid=1.0, ask=1.2, last=1.1, volume=10.0,
+                    modelGreeks=SimpleNamespace(
+                        impliedVol=0.2, delta=0.3, gamma=0.01, theta=-0.02, vega=0.05))
+
+        svc = _svc()
+        svc._ibkr = SimpleNamespace(connected=True, ib=_FlakyIB())
+        chain = await svc._fetch_ibkr_expiry(
+            "SPY", MagicMock(), date(2026, 10, 6), 100.0)
+        assert chain is not None
+        assert len(chain.calls) == 1
+        assert len(chain.puts) == 0
+
+    async def test_resulting_contracts_carry_the_real_conid(self):
+        svc, fake_ib = _fake_contract_details_ib({"20261006": [100.0]})
+        chain = await svc._fetch_ibkr_expiry(
+            "SPY", MagicMock(), date(2026, 10, 6), 100.0)
+        all_contracts = chain.calls + chain.puts
+        assert len(all_contracts) == 2  # one call, one put at strike 100.0
+        assert all(c.con_id != 0 for c in all_contracts)
+        # conId encodes strike*10 + side offset in the fake -- confirms the
+        # REAL per-expiry contract (not a placeholder) reached OptionContract.
+        for c in all_contracts:
+            expected = int(c.strike * 10) + (1 if c.right == "C" else 2)
+            assert c.con_id == expected
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +512,7 @@ class TestNoneGreeksGuard:
             )
         )
         chain = await svc._fetch_ibkr_expiry(
-            "SPY", MagicMock(), date.today() + timedelta(days=20), [100.0], 100.0
+            "SPY", MagicMock(), date.today() + timedelta(days=20), 100.0
         )
         assert chain is not None
         for c in chain.calls + chain.puts:
@@ -336,8 +524,15 @@ class TestNoneGreeksGuard:
 # [4] snapshot hygiene: every reqMktData paired with cancelMktData
 # ---------------------------------------------------------------------------
 
-def _make_md_service(model_greeks="default", ticker_raises=False):
-    """Service + fake ib for _fetch_ibkr_expiry (fast: sleep patched out)."""
+def _make_md_service(model_greeks="default", ticker_raises=False, strikes=(100.0,)):
+    """Service + fake ib for _fetch_ibkr_expiry (fast: sleep patched out).
+
+    `strikes` stands in for what reqContractDetailsAsync would really
+    return for a given (expiry, right) — the SAME set for both C and P here
+    (these tests exercise the reqMktData/cancel/greeks plumbing downstream
+    of strike discovery, not strike discovery itself — see
+    TestFetchExpiryPerExpiryStrikes for that).
+    """
     if model_greeks == "default":
         model_greeks = SimpleNamespace(
             impliedVol=0.2, delta=0.3, gamma=0.01, theta=-0.02, vega=0.05
@@ -348,11 +543,18 @@ def _make_md_service(model_greeks="default", ticker_raises=False):
             self.md_reqs = []
             self.md_req_args = []
             self.md_cancels = []
+            self.contract_details_calls = []
 
-        async def qualifyContractsAsync(self, *batch):
+        async def reqContractDetailsAsync(self, opt):
+            self.contract_details_calls.append(opt)
             return [
-                SimpleNamespace(conId=i + 1, strike=c.strike, right=c.right)
-                for i, c in enumerate(batch)
+                SimpleNamespace(contract=SimpleNamespace(
+                    symbol=opt.symbol,
+                    lastTradeDateOrContractMonth=opt.lastTradeDateOrContractMonth,
+                    strike=s, right=opt.right,
+                    conId=int(s * 10) + (1 if opt.right == "C" else 2),
+                ))
+                for s in strikes
             ]
 
         def reqMktData(self, q, *args):
@@ -393,10 +595,13 @@ def _fast_sleep(monkeypatch):
 
 class TestSnapshotCancelPairing:
     async def test_every_request_is_cancelled(self):
-        svc, fake_ib = _make_md_service()
         strikes = [95.0 + i for i in range(30)]  # 60 contracts → several md batches
+        # price=110 keeps the whole 95-124 range inside the ±20% band
+        # _fetch_ibkr_expiry now applies itself (moved there from
+        # _get_ibkr_chain by this fix) — unrelated to what this test checks.
+        svc, fake_ib = _make_md_service(strikes=strikes)
         chain = await svc._fetch_ibkr_expiry(
-            "SPY", MagicMock(), date.today() + timedelta(days=20), strikes, 100.0
+            "SPY", MagicMock(), date.today() + timedelta(days=20), 110.0
         )
         assert chain is not None
         assert len(fake_ib.md_reqs) == 60
@@ -404,9 +609,9 @@ class TestSnapshotCancelPairing:
         assert {id(q) for q in fake_ib.md_reqs} == {id(q) for q in fake_ib.md_cancels}
 
     async def test_cancel_runs_even_when_harvest_raises(self):
-        svc, fake_ib = _make_md_service(ticker_raises=True)
+        svc, fake_ib = _make_md_service(ticker_raises=True, strikes=(100.0, 101.0))
         chain = await svc._fetch_ibkr_expiry(
-            "SPY", MagicMock(), date.today() + timedelta(days=20), [100.0, 101.0], 100.0
+            "SPY", MagicMock(), date.today() + timedelta(days=20), 100.0
         )
         assert chain is None  # harvest failed
         assert len(fake_ib.md_cancels) == len(fake_ib.md_reqs) > 0
@@ -419,7 +624,7 @@ class TestSnapshotCancelPairing:
         within ~4s where snapshot didn't even at 11s."""
         svc, fake_ib = _make_md_service()
         chain = await svc._fetch_ibkr_expiry(
-            "SPY", MagicMock(), date.today() + timedelta(days=20), [100.0], 100.0
+            "SPY", MagicMock(), date.today() + timedelta(days=20), 100.0
         )
         assert chain is not None
         assert fake_ib.md_req_args  # at least one request happened

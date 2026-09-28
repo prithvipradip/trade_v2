@@ -11814,3 +11814,104 @@ risk-free-rate script's Phase B connection-reuse note** — unchanged from the e
 immediately above.
 
 ---
+
+## 2026-09-28 - FIXED — `_get_ibkr_chain`'s all-expiries strike-band bug, proven live:
+W53's probe now completes end-to-end with a real preflight result
+
+Closes the bug the entry immediately above found and registered. No W-number assigned —
+this is a bug fix to shared, R16-audited data infrastructure, not a new capability wave.
+
+SCOPE. `src/ait/data/options_chain.py`, two methods, no other `src/` files, no config
+changes. `_get_ibkr_chain` (`:654-737`) no longer computes a `target_strikes` list from
+`chain_def.strikes` (the trading class's ALL-EXPIRIES combined strike set from
+`reqSecDefOptParamsAsync`) and reuses it across every target expiry. `_fetch_ibkr_expiry`
+(`:747-...`) drops its `strikes` parameter and instead, per expiry, calls
+`reqContractDetailsAsync(Option(symbol, exp_str, 0.0, right, "SMART",
+tradingClass=symbol))` once per side (confirmed against ib_insync 0.9.86's own source:
+`strike=0.0` is `Option`'s own default, `ib.py:932-941`'s docstring confirms it returns
+every real, listed match) — each result's `cd.contract` already carries a real `conId`,
+so the old `qualifyContractsAsync` batch step is gone entirely, not just fixed. The
+existing ±20% ATM band and DATA-M7 half-dollar-strike filters moved from `_get_ibkr_chain`
+(applied to the guessed combined list) to `_fetch_ibkr_expiry` (applied to the REAL
+per-expiry contracts) — filtering now costs zero extra round trips regardless of band
+width, which is what makes this a general fix, not a narrow SPY-at-$765 patch. The
+downstream `reqMktData`/modelGreeks batching loop (streaming-not-snapshot, cancel-in-
+finally, `_num()` None-coercion — all R16-audited) is completely untouched; it now simply
+receives the real contracts directly instead of a `qualifyContractsAsync`-filtered subset.
+
+TESTS. `tests/test_r16_data_fixes.py`: rewrote `TestChainDefSelection`'s 3 tests for the
+new (no-`strikes`) `_fetch_ibkr_expiry` signature — the two chain_def-selection tests now
+assert on `exp_date` (the signal that survives the fix; chain_def/expirations selection
+itself is untouched) instead of a `strikes` list that no longer exists; the trading-class-
+pin test now stubs `reqContractDetailsAsync` and asserts `Option(..., tradingClass=symbol,
+strike=0.0)` for both sides. New `TestFetchExpiryPerExpiryStrikes` (6 tests) — the actual
+class-guard this bug needed (CLAUDE.md house rule: catch the *next* instance of the bug
+class): two expiries given DIFFERENT fake per-expiry strike sets, proving neither's result
+ever contains a strike that only exists in the other's set (the literal bug); confirms
+`qualifyContractsAsync` is never called at all post-fix; the ±20% band and half-dollar
+filters still exclude real-but-invalid strikes at the new call site; a `reqContractDetailsAsync`
+exception on one side doesn't block the other (fail-open, real `Exception`, not a mock
+assertion); resulting `OptionContract`s carry the REAL `conId` from the fake response.
+`_make_md_service` (used by 4 pre-existing reqMktData/cancel-pairing tests) gained a
+`strikes=` param feeding a new `reqContractDetailsAsync` fake in place of the removed
+`qualifyContractsAsync` one; one test's fixture price was adjusted (100→110) so its
+pre-existing 30-strike fixture stays inside the ±20% band the filter now applies at that
+call site (unrelated to what that test checks — snapshot/cancel pairing). 28/28 in the
+file (22 pre-existing behavior re-proven unchanged + 6 new).
+
+Mutation-checked 2 mechanisms (temporarily broken, confirmed the predicted test failure,
+reverted; `git diff --stat` clean after both): the ±20%/half-dollar filter (temporarily
+`if True:`) broke the band-exclusion and quarter-dollar-strike tests exactly as predicted;
+a reintroduced stray `qualifyContractsAsync` call broke the "never called" test exactly as
+predicted.
+
+NEIGHBORS: `test_r16_data_fixes.py` + `test_r16_tail_fixes.py` + `test_hot_path_smoke.py`
++ `test_w53_roll_target_selection.py` + `test_w53_probe_script.py` + `test_w53_db_migration.py`
++ `test_w53_roll_leg_validator.py` + `test_w55_solve_contract_greeks.py` +
+`test_w55_synthetic_delta.py` + `test_w56_condor_defense.py`: **258/258**.
+`python -m compileall -q src tests`: OK. `python scripts/typecheck.py`: OK, zero
+attr-defined/call-arg/name-defined in `src/ait/{config,bot,execution,risk}` (this fix
+touches only `data/`, outside typecheck's gated paths — no new findings expected or found).
+
+**LIVE PROOF, the actual point of this fix — two runs against real TWS paper during RTH,
+same live window the bug was originally found in.** Run 1 (100s bound): **zero**
+"No security definition"/"Unknown contract" lines across the entire log (was thousands
+before the fix, in the entry immediately above) — 528 reqIds issued, all real contracts,
+only the benign, expected 10091 market-data-entitlement notice per contract (this account's
+known delayed-data limitation, unrelated to this bug). Confirmed the remaining wall-clock
+cost is legitimate: SPY's real chain at ~$765 spot genuinely lists 264+ strikes inside the
+±20% band for a single near-dated expiry — not a bug, the R16-mandated reqMktData pacing
+(3s sleep per 25-contract batch) simply needs more than 100s for a chain this size. Run 2
+(300s bound): **completed successfully, exit code 0, zero qualification errors**, and
+printed a full, real JSON preflight result — a genuine put vertical selected (short 756 /
+long 753, expiry 2026-10-05) and a genuine roll target (short 743 / long 740, expiry
+2026-10-23), with `whatIfOrder` margin previews succeeding for BOTH the `open` and the
+`roll` legs (`"ok": true` on both, `validation_error: null`). This is the atomicity
+question's preflight-level answer this whole probe exists to get, now actually reachable —
+previously unattainable because the chain fetch itself never converged.
+
+STATE AT HANDOFF. `src/ait/data/options_chain.py` and `tests/test_r16_data_fixes.py` are
+the only files changed. Zero config changes. This is shared code the LIVE bot's own entry
+scan depends on — **not restarted as part of this fix** (the operator's call, per
+CLAUDE.md's bot-restart-ownership rule); the running bot process will keep hitting the
+pre-fix behavior (and its own ~8,800/~61,400-line error volume) until its next restart,
+whenever the operator chooses that.
+
+NEXT, naming every open item explicitly: **W53's placing run** (`open`/`roll`/`flatten`)
+— the chain-fetch blocker is gone and preflight now proves the atomicity question is
+answerable at the whatIf level; still needs explicit operator go-ahead before placing real
+orders (unchanged standing requirement — this fix only unblocked the read-only step).
+**Whether the probe's own DTE/band choice is worth narrowing** — a full ±20% SPY chain
+fetch legitimately takes 100-300s under this codebase's existing pacing; not a defect, but
+worth the operator's call on whether to accept that runtime for future placing-run attempts
+or scope a narrower probe-only band as its own separate follow-up (not built here — would
+touch probe-only constants, not the shared fix above). **Restarting the live bot** to pick
+up this fix — operator's call, not done here. Everything else unchanged: **the joint
+W54/W56 `check_positions` design**, **W57**, **W54**, **W52a's four items**, **the ongoing
+QQQ backfill**, **the surface-construction quality filter**, **the zero-bars
+inefficiency**, **the risk-free-rate script's Phase B connection-reuse note**.
+
+No inspect.getsource — every new/rewritten test drives the real `_get_ibkr_chain`/
+`_fetch_ibkr_expiry`, never asserts on source strings.
+
+---

@@ -713,19 +713,27 @@ class OptionsChainService:
             if not target_expiries:
                 return []
 
-            # Filter strikes around ATM (±20% of price)
-            # Skip non-standard (adjusted) strikes — e.g. .5 increments from stock splits
-            strike_range = price * 0.20
-            target_strikes = [
-                s for s in chain_def.strikes
-                if abs(s - price) <= strike_range and (s * 2) == int(s * 2)  # allow $0.50 strikes; whole-dollar-only deleted ATM strikes on sub-$25 names (deep-audit DATA-M7)
-            ]
+            # Strike discovery moved into _fetch_ibkr_expiry (per-expiry, via
+            # reqContractDetailsAsync) -- see the bug-fix note there.
+            # reqSecDefOptParamsAsync's chain_def.strikes is a COMBINED set
+            # across every expiry of this trading class, not scoped to any
+            # one of them; filtering it here and reusing it for every expiry
+            # produced qualify requests for strikes that don't exist on a
+            # given near-dated expiry (near-dated weeklies routinely list
+            # far fewer strikes than the class's LEAPS/monthlies). Confirmed
+            # live 2026-09-28: SPY at ~$765 spot generated hundreds of
+            # invalid-strike qualify attempts per expiry ("No security
+            # definition"/"Unknown contract"), enough to stall a chain fetch
+            # outright -- and, per a log audit the same day, this was
+            # already happening silently on the LIVE bot's own 14-30 DTE
+            # entry scan (~8,800 error-200 lines in logs/ait.log), not just
+            # this probe script. See PLAN.md for the full writeup.
 
             # Fetch option contracts for each expiry
             chains = []
             for exp_date in target_expiries[:3]:  # Limit to 3 closest expiries
                 chain = await self._fetch_ibkr_expiry(
-                    symbol, qualified, exp_date, target_strikes, price
+                    symbol, qualified, exp_date, price
                 )
                 if chain:
                     chains.append(chain)
@@ -741,7 +749,6 @@ class OptionsChainService:
         symbol: str,
         underlying,
         expiry: date,
-        strikes: list[float],
         price: float,
     ) -> OptionsChain | None:
         """Fetch a single expiry's chain from IBKR."""
@@ -751,15 +758,42 @@ class OptionsChainService:
         puts = []
         exp_str = expiry.strftime("%Y%m%d")
 
-        # Build option contracts for qualification.
+        # Fetch this expiry's REAL contracts directly, per side, instead of
+        # guessing strikes from the trading class's ALL-EXPIRIES combined
+        # list and hoping they qualify (the pre-fix bug -- see
+        # _get_ibkr_chain's note above). reqContractDetailsAsync with
+        # strike=0.0 (Option's own default) returns ContractDetails for
+        # EVERY real, listed contract matching the rest of the spec -- i.e.
+        # every genuine strike for this one (symbol, expiry, right,
+        # tradingClass) combination, each already carrying a real conId, so
+        # no separate qualifyContractsAsync step is needed below.
         # R16: pin tradingClass=symbol — strikes that exist in BOTH the
         # standard and the adjusted class ('2IWM' etc.) came back 'Ambiguous
-        # contract' from qualifyContractsAsync and were silently dropped.
-        option_contracts = []
-        for strike in strikes:
-            for right in ("C", "P"):
-                opt = Option(symbol, exp_str, strike, right, "SMART", tradingClass=symbol)
-                option_contracts.append(opt)
+        # contract' from qualifyContractsAsync and were silently dropped;
+        # the same pin here scopes reqContractDetailsAsync to the standard
+        # class only.
+        strike_range = price * 0.20
+        all_contracts = []
+        for right in ("C", "P"):
+            try:
+                details = await self._ibkr.ib.reqContractDetailsAsync(
+                    Option(symbol, exp_str, 0.0, right, "SMART", tradingClass=symbol)
+                )
+            except Exception as e:
+                log.debug("ibkr_contract_details_failed", symbol=symbol,
+                          expiry=exp_str, right=right, error=str(e))
+                continue
+            for cd in details:
+                c = cd.contract
+                # Same ATM band + non-adjusted-strike filters this method
+                # used to apply to the guessed pre-fetch list (deep-audit
+                # DATA-M7: allow $0.50 strikes; whole-dollar-only deleted
+                # ATM strikes on sub-$25 names) -- now applied to REAL
+                # strikes, so they cost zero extra round trips regardless
+                # of band width.
+                if (abs(c.strike - price) <= strike_range
+                        and (c.strike * 2) == int(c.strike * 2)):
+                    all_contracts.append(c)
 
         def _num(val) -> float:
             # R16: ib_insync maps IB's -1/-2 "not yet computed" sentinels to
@@ -770,7 +804,10 @@ class OptionsChainService:
 
         none_greek_contracts = 0
 
-        # Qualify in batches to avoid timeout
+        # Chunk the (already-qualified, real) contracts to pace reqMktData
+        # subscription bursts -- unchanged from before this fix, which only
+        # removed the qualifyContractsAsync call this loop used to make
+        # per batch (all_contracts is already real/qualified).
         batch_size = 50
         # R16 tried: 50 concurrent SNAPSHOT reqMktData, 0.5s wait, no cancel
         # -> delayed-snapshot modelGreeks essentially never arrived
@@ -793,12 +830,9 @@ class OptionsChainService:
         # is); not a symptom to chase here.
         md_batch_size = 25
         md_wait_s = 3.0
-        for i in range(0, len(option_contracts), batch_size):
-            batch = option_contracts[i : i + batch_size]
+        for i in range(0, len(all_contracts), batch_size):
+            valid = all_contracts[i : i + batch_size]
             try:
-                qualified = await self._ibkr.ib.qualifyContractsAsync(*batch)
-                valid = [q for q in qualified if q.conId != 0]
-
                 for j in range(0, len(valid), md_batch_size):
                     md_batch = valid[j : j + md_batch_size]
                     requested: list = []
