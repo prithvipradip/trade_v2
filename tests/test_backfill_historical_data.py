@@ -482,3 +482,93 @@ class TestSpreadParamsTable:
             "spread_cap", "sample_count", "rmse",
         }
         assert expected <= cols
+
+
+# ---------------------------------------------------------------------------
+# W58: option_daily_bars round-trip
+# ---------------------------------------------------------------------------
+
+def _make_option_daily_bars(n: int = 5) -> pd.DataFrame:
+    """Build a minimal option daily bars DataFrame (Polygon aggregates shape)."""
+    rows = []
+    base_date = dt.date(2024, 9, 1)
+    expiry = dt.date(2024, 10, 18)
+    for i in range(n):
+        d = base_date + dt.timedelta(days=i)
+        rows.append({
+            "option_ticker": f"O:QQQ241018C0048{i}000",
+            "expiry": str(expiry),
+            "right": "C",
+            "strike": 480.0 + i,
+            "date": str(d),
+            "dte": (expiry - d).days,
+            "open": 5.0 + i, "high": 5.5 + i, "low": 4.5 + i, "close": 5.2 + i,
+            "volume": 1000 + i, "vwap": 5.1 + i, "transactions": 100 + i,
+            "underlying_close": 480.0 + i,
+            "iv": 0.20 + i * 0.01, "iv_outcome": "solved",
+            "delta": 0.5, "gamma": 0.02, "theta": -0.05, "vega": 0.10,
+            "risk_free_rate": 0.05,
+        })
+    return pd.DataFrame(rows)
+
+
+class TestOptionDailyBarsTable:
+    """W58: historical option daily bars table (Polygon/Massive backfill)."""
+
+    def test_table_created_with_expected_columns(self) -> None:
+        store = _temp_store()
+        with sqlite3.connect(store._db_path) as conn:
+            cols = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(option_daily_bars)"
+                ).fetchall()
+            }
+        expected = {
+            "underlying", "option_ticker", "expiry", "right", "strike", "date",
+            "dte", "open", "high", "low", "close", "volume", "vwap",
+            "transactions", "underlying_close", "iv", "iv_outcome",
+            "delta", "gamma", "theta", "vega", "risk_free_rate",
+        }
+        assert expected <= cols
+
+    def test_save_and_load_option_daily_bars(self) -> None:
+        store = _temp_store()
+        df = _make_option_daily_bars(n=5)
+        stored = store.save_option_daily_bars("QQQ", df)
+        assert stored == 5
+
+        with sqlite3.connect(store._db_path) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM option_daily_bars WHERE underlying = 'QQQ'"
+            ).fetchone()[0]
+        assert count == 5
+
+    def test_option_daily_bars_upsert_idempotency(self) -> None:
+        store = _temp_store()
+        df = _make_option_daily_bars(n=5)
+        store.save_option_daily_bars("QQQ", df)
+        store.save_option_daily_bars("QQQ", df)  # second call should not duplicate
+
+        with sqlite3.connect(store._db_path) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM option_daily_bars WHERE underlying = 'QQQ'"
+            ).fetchone()[0]
+        assert count == 5, "Duplicate save should not insert extra rows"
+
+    def test_save_option_daily_bars_empty_df(self) -> None:
+        store = _temp_store()
+        stored = store.save_option_daily_bars("QQQ", pd.DataFrame())
+        assert stored == 0
+
+    def test_option_ticker_has_data_false_when_absent(self) -> None:
+        store = _temp_store()
+        assert store.option_ticker_has_data("O:QQQ241018C00480000") is False
+
+    def test_option_ticker_has_data_true_after_save(self) -> None:
+        store = _temp_store()
+        df = _make_option_daily_bars(n=1)
+        store.save_option_daily_bars("QQQ", df)
+        assert store.option_ticker_has_data(df.iloc[0]["option_ticker"]) is True
+        # A different, never-saved contract must still read False.
+        assert store.option_ticker_has_data("O:QQQ990101C00001000") is False

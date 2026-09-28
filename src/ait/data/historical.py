@@ -49,6 +49,7 @@ class HistoricalDataStore:
         self._intraday_iv_table = f"{table_prefix}intraday_iv"
         self._spread_samples_table = f"{table_prefix}option_spread_samples"
         self._spread_params_table = f"{table_prefix}option_spread_params"
+        self._option_daily_bars_table = f"{table_prefix}option_daily_bars"
         self._init_db()
 
     def _init_db(self) -> None:
@@ -155,6 +156,49 @@ class HistoricalDataStore:
                     sample_count          INTEGER NOT NULL,
                     rmse                  REAL
                 )
+            """)
+            # W58: historical per-contract EOD option bars (Polygon/Massive
+            # aggregates, trade-based -- NOT reusing option_spread_samples,
+            # whose bid/ask/mid columns are NOT NULL and assume a live-quote
+            # source this data doesn't have). IV/greeks are precomputed and
+            # stored at ingestion (not solved lazily); risk_free_rate is
+            # stored per-row so a later re-solve pass (once a real historical
+            # rate series exists) can find and update stale rows without
+            # re-fetching prices.
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._option_daily_bars_table} (
+                    underlying       TEXT    NOT NULL,
+                    option_ticker    TEXT    NOT NULL,
+                    expiry           TEXT    NOT NULL,
+                    right            TEXT    NOT NULL,
+                    strike           REAL    NOT NULL,
+                    date             TEXT    NOT NULL,
+                    dte              INTEGER NOT NULL,
+                    open             REAL,
+                    high             REAL,
+                    low              REAL,
+                    close            REAL,
+                    volume           INTEGER,
+                    vwap             REAL,
+                    transactions     INTEGER,
+                    underlying_close REAL,
+                    iv               REAL,
+                    iv_outcome       TEXT,
+                    delta            REAL,
+                    gamma            REAL,
+                    theta            REAL,
+                    vega             REAL,
+                    risk_free_rate   REAL,
+                    PRIMARY KEY (option_ticker, date)
+                )
+            """)
+            conn.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_{self._option_daily_bars_table}_und_exp_dt
+                ON {self._option_daily_bars_table}(underlying, expiry, date)
+            """)
+            conn.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_{self._option_daily_bars_table}_und_dt
+                ON {self._option_daily_bars_table}(underlying, date)
             """)
 
     def save(self, symbol: str, df: pd.DataFrame) -> int:
@@ -759,3 +803,76 @@ class HistoricalDataStore:
             "sample_count": row[8],
             "rmse": row[9],
         }
+
+    # ------------------------------------------------------------------
+    # W58: historical option daily bars (Polygon/Massive backfill)
+    # ------------------------------------------------------------------
+
+    def save_option_daily_bars(self, symbol: str, df: pd.DataFrame) -> int:
+        """Bulk INSERT OR IGNORE historical option daily bars from a DataFrame.
+
+        DataFrame must have columns: option_ticker, expiry, right, strike,
+        date, dte, open, high, low, close, volume, vwap, transactions,
+        underlying_close, iv, iv_outcome, delta, gamma, theta, vega,
+        risk_free_rate. Returns number of rows passed (matches
+        save_spread_samples's own convention, not rows actually inserted).
+        """
+        if df is None or df.empty:
+            return 0
+
+        def _f(v):
+            return None if v is None or v != v else float(v)  # NaN-safe
+
+        def _i(v):
+            return None if v is None or v != v else int(v)
+
+        rows = []
+        for _, row in df.iterrows():
+            rows.append((
+                symbol,
+                str(row["option_ticker"]),
+                str(row["expiry"]),
+                str(row["right"]),
+                float(row["strike"]),
+                str(row["date"]),
+                int(row["dte"]),
+                _f(row.get("open")), _f(row.get("high")),
+                _f(row.get("low")), _f(row.get("close")),
+                _i(row.get("volume")), _f(row.get("vwap")),
+                _i(row.get("transactions")), _f(row.get("underlying_close")),
+                _f(row.get("iv")), row.get("iv_outcome"),
+                _f(row.get("delta")), _f(row.get("gamma")),
+                _f(row.get("theta")), _f(row.get("vega")),
+                _f(row.get("risk_free_rate")),
+            ))
+
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                f"""INSERT OR IGNORE INTO {self._option_daily_bars_table}
+                   (underlying, option_ticker, expiry, right, strike, date, dte,
+                    open, high, low, close, volume, vwap, transactions,
+                    underlying_close, iv, iv_outcome, delta, gamma, theta, vega,
+                    risk_free_rate)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                rows,
+            )
+
+        log.debug("option_daily_bars_saved", symbol=symbol, rows=len(rows))
+        return len(rows)
+
+    def option_ticker_has_data(self, option_ticker: str) -> bool:
+        """Resume-skip check: has this contract already been fetched?
+
+        Safe as a coarse per-contract check because save_option_daily_bars's
+        executemany commits or rolls back as one unit (sqlite3's `with
+        connect(...)` semantics) -- a crash mid-write can never leave a
+        partial batch for one contract, so "any row exists" means "this
+        contract's fetch already completed."
+        """
+        with sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(
+                f"SELECT 1 FROM {self._option_daily_bars_table} "
+                f"WHERE option_ticker = ? LIMIT 1",
+                (option_ticker,),
+            ).fetchone()
+        return row is not None

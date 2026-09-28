@@ -11097,3 +11097,138 @@ No inspect.getsource in any of the 3 rewritten files — item 1 now drives the r
 `Watchdog.get_health()` with only the shared-resource dependencies pinned.
 
 ---
+
+## 2026-09-28 - W58 BUILT — historical options vol-surface backfill tool (QQQ, via
+Polygon/Massive), proven end-to-end against real live data
+
+W54's EV-comparison model needs historical per-strike, per-expiry option data to ever be
+backtested — the 2026-09-27 scoping-note entry found this data doesn't exist and can't be
+backfilled from anything already wired into this repo. This wave builds and proves the
+tool that closes that gap. No production trading-path code touched — pure data
+infrastructure, `src/ait/bot`/`execution`/`risk`/`strategies` all untouched.
+
+**THE DATA SOURCE, TESTED LIVE BEFORE ANYTHING WAS BUILT.** The operator surfaced a
+candidate ("Massive," `massive.com`, Options Basic free tier) mid-session; testing it
+directly against the real API (not just reading the pricing page) found it IS Polygon
+under a different brand — its own `NOT_AUTHORIZED` errors point at `polygon.io/pricing`
+verbatim. Critically, the *existing* `.env` `POLYGON_API_KEY` already carries the
+identical entitlement: same rolling 2-year window (tested the exact boundary — a range
+straddling it silently truncates, a range fully outside it 403s), same 5-calls/min
+throttle (empirically: 4 calls succeed, 5th+ return 429), byte-identical responses on
+every comparison test. **No new account was needed.** No bid/ask anywhere on this tier —
+confirmed by testing `/v3/quotes/...` and `/v2/last/nbbo/...` directly, both
+`NOT_AUTHORIZED`; only trade-based OHLC (`o,h,l,c,v,vw,n,t`) is available.
+
+**SCOPE, SETTLED OVER SEVERAL ROUNDS WITH THE OPERATOR** (each a real trade-off, not a
+default): QQQ first (already has a 2-snapshot head start in `option_spread_samples`);
+±30% moneyness band checked across each contract's WHOLE trading life, not a single date
+(a contract ATM at issuance that drifts 46%+ out of band by expiry must still be
+included — the naive expiry-day-only check was mutation-tested and confirmed to miss
+exactly this case); full expiry density including 0-2 DTE, not a weekly sample (QQQ
+turned out to have DAILY expiry cadence just like SPY — an earlier "9/month" estimate
+was a live bug in the *research*, not the design: an unfiltered contracts query
+truncated at the API's 1000-row page limit before reaching later dates in the month,
+caught and corrected mid-conversation by re-querying with a strike filter); EOD
+resolution only, never minute bars; IV/greeks precomputed and stored at ingestion, not
+solved lazily; raw prices stored UNFILTERED (no `n`/`v` liquidity floor at ingestion —
+that's separate, later, config-gated work reading this table, explicitly out of this
+wave's scope); risk-free rate uses today's static `options.risk_free_rate` config
+placeholder, stored per-row so a later re-solve pass (once a real historical rate series
+exists — FRED's DGS1MO/DGS3MO is the recommended source, registered as a follow-up, not
+built here) can update IV/greeks from already-stored raw prices with **no re-fetch**.
+
+**BUILD.**
+1. `src/ait/data/historical.py` — new `option_daily_bars` table (`underlying,
+   option_ticker, expiry, right, strike, date, dte, open, high, low, close, volume, vwap,
+   transactions, underlying_close, iv, iv_outcome, delta, gamma, theta, vega,
+   risk_free_rate`, PK `(option_ticker, date)`, 2 indices). Deliberately NOT reusing
+   `option_spread_samples`'s schema — its `bid`/`ask`/`mid` are `NOT NULL` and it's built
+   for a live-quote source this OHLC/trade-based data doesn't have (the operator's own
+   conclusion, confirmed against the DDL directly). `save_option_daily_bars()` mirrors
+   `save_spread_samples`'s exact `INSERT OR IGNORE` + `executemany` idiom.
+   `option_ticker_has_data()` is the resume-skip check — safe as a coarse per-contract
+   test because `executemany` inside `with sqlite3.connect(...)` commits or rolls back as
+   one unit, so a crash mid-write can never leave a partial batch for one contract.
+2. New `scripts/backfill_option_history.py`. Flow: load the underlying's own daily
+   closes (already in `daily_prices`, no separate fetch) → paginate Polygon's contracts
+   reference endpoint → filter to the moneyness-over-life band → skip contracts already
+   stored → fetch each survivor's full daily history in ONE call (`/v2/aggs/.../range/1/
+   day/{from}/{to}`, up to 50k bars) → solve IV via the existing `solve_iv_from_price`/
+   `compute_greeks_from_sigma` (`options_chain.py`, W55) → store raw + solved, unfiltered.
+   Raw `requests` HTTP, not the `polygon-api-client` SDK's own pagination/retry (neither
+   has a throttle hook for 5/min — confirmed by reading the installed SDK's source
+   directly) — a uniform `time.sleep(pause_secs)` (default 12.5s) after every single
+   outbound call, contracts-page or aggs-call alike, is what actually governs the whole
+   job's pace. A `_POLYGON_AUTH_FAILURE_LIMIT`-style breaker (mirroring `MarketDataService
+   `'s own idiom) aborts on repeated 401s rather than retrying into a dead key, while a
+   per-request `NOT_AUTHORIZED` (e.g. the rolling window shifting mid-run) is logged and
+   skipped, not treated as fatal — the two failure modes are genuinely different and were
+   deliberately NOT conflated. `--max-contracts` is a smoke-test escape hatch;
+   `--dry-run` prints the request plan without fetching or writing.
+
+**PROOF.**
+- Unit tests: `TestOptionDailyBarsTable` (6, in `test_backfill_historical_data.py`,
+  modeled directly on `TestSpreadSamplesTable`'s own convention) + `test_backfill_
+  option_history.py` (8: the moneyness-over-life filter's 3 real cases plus an empty-
+  window case, and `process_contract`'s resume-skip / real-IV-solve / missing-underlying-
+  close / no-bars-returned cases, against a fake `PolygonClient` at the network boundary
+  only — real domain data, no `MagicMock`). 39 collected across both files. Mutation-
+  checked the moneyness filter: swapped in the naive expiry-day-only version, confirmed
+  the "drifts out of band by expiry, must still be included" case fails exactly as
+  predicted, reverted.
+- **Live smoke tests against the REAL API** (not mocked, matching this session's
+  standing "prove it against reality" discipline for W53/W55): first attempt used a
+  hardcoded 2024 date that had — since this session began — drifted outside the *now-
+  current* rolling 2-year window, reproducing the exact `NOT_AUTHORIZED: plan doesn't
+  include this timeframe` response live and confirming the script's own default
+  (`start_date = end_date - 730 days`, computed at runtime, never hardcoded) is the
+  right design, not merely a convenience. Corrected to relative recent dates and re-ran:
+  **9 real rows landed in `data/historical.db`'s `option_daily_bars`** across two runs
+  (2 `solved`, 7 `failed_arbitrage`) — a genuine, honest mix, not cherry-picked: the
+  `failed_arbitrage` rows are real single-print, thin-volume (`transactions` 1-5) dte=0
+  contracts trading below intrinsic, exactly the low-quality data point the config-gated
+  liquidity filter (deferred to later work) exists to catch; the `solved` rows carry
+  real (if numerically extreme, expected at dte≈0 — IV solves lose meaning near expiry)
+  computed IV/delta values. Re-ran the identical command a second time: the 8 contracts
+  that landed data completed instantly (resume-skip, no re-fetch); the 2 that returned
+  zero bars on the first run were retried (a real, honest, minor limitation — only
+  contracts that stored at least one row get skip-protection; a genuinely zero-trade
+  contract gets retried on every re-run — registered below, not fixed now, out of this
+  wave's scope).
+- `python -m compileall -q src scripts tests`: OK. Full fast lane: **2536 passed / 1
+  failed / 46 skipped / 153 deselected, 802.83s (13m22s)** — the one failure is the
+  standing `AIT_MARKET_DATA_TYPE` divergence, zero new failures.
+
+STATE AT HANDOFF. New table + 2 new methods in `historical.py`; new script; new test
+file; 6 new tests added to `test_backfill_historical_data.py`. Zero production trading-
+path files touched. `data/historical.db`'s new `option_daily_bars` table already holds 9
+real QQQ rows from the smoke tests (kept — legitimate data, not test pollution, a small
+real head start on the actual backfill). Nothing to deploy or restart — this tool runs
+standalone, outside the live bot process.
+
+NEXT, naming every open item explicitly: **the real multi-week backfill run itself** —
+this wave built and proved the tool; running it to completion against the full 2-year
+QQQ universe (≈140,000 contracts ≈ ~467 hours ≈ ~19-20 days of continuous 12.5s-paced
+polling, per this session's own live-measured contract-density numbers) is separate,
+ongoing, background work, not done here — run intermittently (`--table-prefix`-free,
+default `data/historical.db`, safely resumable via `option_ticker_has_data` at any
+interruption point). **The config-gated surface-construction quality filter** — deferred,
+W54's own scope; the smoke test's real `failed_arbitrage`/thin-`transactions` rows are
+now concrete evidence for what that filter needs to catch, and the numeric threshold is
+still to be chosen empirically once more real data exists, per the operator's own
+explicit call to decide the number later, not now. **The historical risk-free-rate
+series** — registered follow-up, FRED's DGS1MO/DGS3MO recommended; once available, re-
+solving IV/greeks for every stored row is a cheap local pass, no re-fetch. **The zero-
+bars-retried-forever minor inefficiency** noted above — a future refinement, not urgent.
+**W54 itself** — still an operator decision on backtesting sequencing (the three-way
+fork from the 2026-09-27 scoping-note entry), now materially informed by this being
+technically proven out end-to-end rather than theoretical. Everything else unchanged and
+unrelated: `_run_override_block`/`get_chain_for_expiry`/`test_watchdog.py` all closed
+(prior entry); W53's placing run and W55's live validation run waiting on TWS during an
+RTH session; W56/57; W52a's four items.
+
+No inspect.getsource — every new test drives real code (the real filter function, the
+real DB methods, the real `solve_iv_from_price`/`compute_greeks_from_sigma`), and the
+live smoke tests drove the real script against the real API.
+
+---

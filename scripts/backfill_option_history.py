@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""W58: historical options vol-surface backfill (via Polygon/Massive).
+
+    python scripts/backfill_option_history.py --dry-run
+    python scripts/backfill_option_history.py --max-contracts 20
+    python scripts/backfill_option_history.py
+
+Why this exists: W54's EV-comparison model needs historical per-strike,
+per-expiry option data to ever be backtested -- nothing in this repo could
+previously capture it (the only existing tool, calibrate_option_spreads.py,
+snapshots only TODAY's chain). The existing .env POLYGON_API_KEY already
+carries free-tier entitlement to 2 years of rolling historical options data
+(confirmed live against the real API before this script was written).
+
+What this does, and nothing else:
+  1. Loads the underlying's own daily closes from HistoricalDataStore
+     (already present -- no separate underlying-price fetch).
+  2. Enumerates option contracts for the symbol via Polygon's contracts
+     reference endpoint, paginated, rate-limited.
+  3. Filters to contracts whose strike was within +/-max-moneyness of the
+     underlying's close on ANY day of the requested window (not just on
+     the contract's own expiry day -- a contract that started ATM and
+     drifted out of band by expiry must still be included).
+  4. For each surviving contract NOT already stored (resume-safe -- see
+     HistoricalDataStore.option_ticker_has_data's own docstring for why a
+     coarse per-contract check is sound), fetches its full daily OHLC
+     history in ONE rate-limited call, solves IV + greeks per bar via the
+     existing py_vollib pipeline (options_chain.py), and stores everything
+     -- raw prices AND solved IV/greeks -- unfiltered, in a new table.
+
+No quality filtering happens here on purpose (an operator decision, see
+PLAN.md's W58 entry): raw data is stored as-is; a config-gated liquidity
+filter for SURFACE CONSTRUCTION is separate, later work that reads this
+table, not built here. The risk-free rate used for the IV solve is today's
+static config value (options.risk_free_rate) -- a placeholder; it is stored
+per-row (risk_free_rate column) so a later pass can cheaply re-solve IV
+once a real historical rate series exists, with no re-fetch needed.
+
+Strictly respects the free tier's 5-calls/minute limit via a uniform sleep
+after every single outbound HTTP call (contracts pages and aggregate
+fetches alike) -- not the polygon-api-client SDK's own pagination/retry
+(neither has a throttle hook that fits this limit), raw HTTP via `requests`
+instead, matching exactly what was manually verified against the live API
+before this script was written.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
+from ait.config.runtime_env import apply_runtime_env_defaults  # noqa: E402
+
+apply_runtime_env_defaults()
+
+import argparse  # noqa: E402
+import os  # noqa: E402
+import time  # noqa: E402
+from datetime import date, datetime, timedelta, timezone  # noqa: E402
+
+import pandas as pd  # noqa: E402
+import requests  # noqa: E402
+
+from ait.data.historical import HistoricalDataStore  # noqa: E402
+from ait.data.options_chain import (  # noqa: E402
+    _risk_free_rate,
+    compute_greeks_from_sigma,
+    solve_iv_from_price,
+)
+from ait.utils.logging import get_logger  # noqa: E402
+
+log = get_logger("scripts.backfill_option_history")
+
+BASE_URL = "https://api.polygon.io"
+AUTH_FAILURE_LIMIT = 3
+
+
+# ---------------------------------------------------------------------------
+# Pure selection logic (unit-tested in isolation)
+# ---------------------------------------------------------------------------
+
+def in_moneyness_band_over_life(
+    strike: float,
+    underlying_closes: "pd.Series",
+    window_start: date,
+    expiry_date: date,
+    max_moneyness: float,
+) -> bool:
+    """True if `strike` was within +/-max_moneyness of the underlying's
+    close on ANY trading day between window_start and expiry_date
+    (inclusive) -- not just on the expiry date. A contract that started
+    at-the-money and drifted out of band by expiry must still pass: the
+    check is against the observed [min, max] close over the window, not a
+    single date's close.
+    """
+    window = underlying_closes.loc[str(window_start):str(expiry_date)]
+    if window.empty:
+        return False
+    lo = float(window.min()) * (1 - max_moneyness)
+    hi = float(window.max()) * (1 + max_moneyness)
+    return lo <= strike <= hi
+
+
+# ---------------------------------------------------------------------------
+# Rate-limited Polygon HTTP client (raw requests, not the SDK's own
+# pagination/retry -- neither has a throttle hook for the 5/min tier)
+# ---------------------------------------------------------------------------
+
+class PolygonClient:
+    def __init__(self, api_key: str, pause_secs: float, session=None) -> None:
+        self._api_key = api_key
+        self._pause = pause_secs
+        self._session = session or requests.Session()
+        self._auth_failures = 0
+
+    def _get(self, url: str, params: dict | None = None) -> dict:
+        params = dict(params or {})
+        params["apiKey"] = self._api_key
+        resp = self._session.get(url, params=params, timeout=30)
+        time.sleep(self._pause)
+        if resp.status_code == 401:
+            self._auth_failures += 1
+            log.warning("polygon_auth_failed", status=resp.status_code,
+                       failures=self._auth_failures)
+            if self._auth_failures >= AUTH_FAILURE_LIMIT:
+                raise RuntimeError(
+                    "Polygon API key rejected repeatedly (401) -- aborting "
+                    "rather than retrying into a dead key."
+                )
+            return {}
+        self._auth_failures = 0
+        try:
+            data = resp.json()
+        except ValueError:
+            resp.raise_for_status()
+            return {}
+        if data.get("status") == "NOT_AUTHORIZED":
+            # Entitlement/timeframe issue for THIS specific request (e.g.
+            # the rolling 2-year window shifted mid-run) -- log and skip,
+            # not a dead-key abort.
+            log.warning("polygon_not_authorized_for_request", url=url,
+                       message=data.get("message"))
+            return {}
+        return data
+
+    def list_contracts_pages(self, **params):
+        """Yields each page of the contracts-reference response, following
+        next_url until exhausted."""
+        url = f"{BASE_URL}/v3/reference/options/contracts"
+        data = self._get(url, params=params)
+        if data:
+            yield data
+        next_url = data.get("next_url") if data else None
+        while next_url:
+            data = self._get(next_url)
+            if data:
+                yield data
+            next_url = data.get("next_url") if data else None
+
+    def get_daily_bars(self, option_ticker: str, from_date: date, to_date: date) -> list[dict]:
+        url = f"{BASE_URL}/v2/aggs/ticker/{option_ticker}/range/1/day/{from_date}/{to_date}"
+        data = self._get(url, params={"adjusted": "true", "sort": "asc", "limit": 50000})
+        return data.get("results", []) if data else []
+
+
+# ---------------------------------------------------------------------------
+# Contract enumeration + filtering
+# ---------------------------------------------------------------------------
+
+def enumerate_contracts(
+    client: PolygonClient,
+    symbol: str,
+    start_date: date,
+    end_date: date,
+    max_moneyness: float,
+    underlying_closes: "pd.Series",
+    max_contracts: int | None = None,
+) -> list[dict]:
+    """Return the filtered contract list: [{option_ticker, expiry, right,
+    strike}, ...], in-band per in_moneyness_band_over_life."""
+    selected: list[dict] = []
+    params = {
+        "underlying_ticker": symbol,
+        "expired": "true",
+        "limit": 1000,
+        "expiration_date.gte": str(start_date),
+        "expiration_date.lte": str(end_date),
+        "sort": "ticker",
+        "order": "asc",
+    }
+    for page in client.list_contracts_pages(**params):
+        for c in page.get("results", []):
+            if max_contracts is not None and len(selected) >= max_contracts:
+                return selected
+            try:
+                expiry = date.fromisoformat(c["expiration_date"])
+                strike = float(c["strike_price"])
+            except (KeyError, ValueError):
+                continue
+            if in_moneyness_band_over_life(
+                strike, underlying_closes, start_date, expiry, max_moneyness
+            ):
+                selected.append({
+                    "option_ticker": c["ticker"],
+                    "expiry": c["expiration_date"],
+                    "right": "C" if c.get("contract_type") == "call" else "P",
+                    "strike": strike,
+                })
+    return selected
+
+
+# ---------------------------------------------------------------------------
+# Per-contract fetch + IV solve + store
+# ---------------------------------------------------------------------------
+
+def process_contract(
+    client: PolygonClient,
+    store: HistoricalDataStore,
+    symbol: str,
+    contract: dict,
+    underlying_closes: "pd.Series",
+    start_date: date,
+    end_date: date,
+    risk_free_rate: float,
+) -> int:
+    ticker = contract["option_ticker"]
+    if store.option_ticker_has_data(ticker):
+        return 0
+
+    expiry = date.fromisoformat(contract["expiry"])
+    fetch_to = min(expiry, end_date)
+    bars = client.get_daily_bars(ticker, start_date, fetch_to)
+    if not bars:
+        return 0
+
+    flag = "c" if contract["right"] == "C" else "p"
+    rows = []
+    for bar in bars:
+        bar_date = datetime.fromtimestamp(bar["t"] / 1000, tz=timezone.utc).date()
+        u_close = underlying_closes.get(pd.Timestamp(bar_date))
+        if u_close is None or u_close != u_close:  # missing or NaN
+            continue
+        dte = (expiry - bar_date).days
+        t = max(dte / 365.0, 0.001)
+        iv, outcome = solve_iv_from_price(
+            bar.get("c", 0.0), float(u_close), contract["strike"], t,
+            risk_free_rate, flag)
+        greeks = (
+            compute_greeks_from_sigma(
+                float(u_close), contract["strike"], t, risk_free_rate, iv, flag)
+            if outcome == "solved" else None
+        )
+        rows.append({
+            "option_ticker": ticker, "expiry": contract["expiry"],
+            "right": contract["right"], "strike": contract["strike"],
+            "date": str(bar_date), "dte": dte,
+            "open": bar.get("o"), "high": bar.get("h"),
+            "low": bar.get("l"), "close": bar.get("c"),
+            "volume": bar.get("v"), "vwap": bar.get("vw"),
+            "transactions": bar.get("n"), "underlying_close": float(u_close),
+            "iv": iv, "iv_outcome": outcome,
+            "delta": greeks[0] if greeks else None,
+            "gamma": greeks[1] if greeks else None,
+            "theta": greeks[2] if greeks else None,
+            "vega": greeks[3] if greeks else None,
+            "risk_free_rate": risk_free_rate,
+        })
+    if not rows:
+        return 0
+    return store.save_option_daily_bars(symbol, pd.DataFrame(rows))
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="backfill_option_history",
+        description="Backfill historical per-contract EOD option bars + "
+                    "solved IV/greeks from Polygon/Massive.",
+    )
+    parser.add_argument("--symbol", default="QQQ", metavar="SYMBOL")
+    parser.add_argument("--start-date", default=None, metavar="YYYY-MM-DD",
+                       help="Default: 730 days before --end-date.")
+    parser.add_argument("--end-date", default=None, metavar="YYYY-MM-DD",
+                       help="Default: today.")
+    parser.add_argument("--max-moneyness", type=float, default=0.30, metavar="FRAC",
+                       help="Max |strike/spot - 1| over the contract's life "
+                            "(default: 0.30 = 30%%, matching calibrate_"
+                            "option_spreads.py's own default).")
+    parser.add_argument("--db-path", default="data/historical.db", metavar="PATH")
+    parser.add_argument("--table-prefix", default="", metavar="PREFIX")
+    parser.add_argument("--pause-secs", type=float, default=12.5, metavar="SECS",
+                       help="Sleep after every outbound HTTP call "
+                            "(default: 12.5s, under the 5/min free-tier limit).")
+    parser.add_argument("--max-contracts", type=int, default=None, metavar="N",
+                       help="Stop after N contracts pass the filter -- a "
+                            "smoke-test escape hatch before the full run.")
+    parser.add_argument("--dry-run", action="store_true",
+                       help="Print the request plan without fetching or storing.")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+
+    api_key = os.environ.get("POLYGON_API_KEY", "")
+    if not api_key:
+        log.error("no_polygon_api_key")
+        return 1
+
+    end_date = date.fromisoformat(args.end_date) if args.end_date else date.today()
+    start_date = (
+        date.fromisoformat(args.start_date) if args.start_date
+        else end_date - timedelta(days=730)
+    )
+
+    store = HistoricalDataStore(db_path=Path(args.db_path), table_prefix=args.table_prefix)
+    underlying_df = store.load(args.symbol, start_date, end_date)
+    if underlying_df.empty:
+        log.error("no_underlying_price_history", symbol=args.symbol,
+                 note="daily_prices has no rows for this symbol/window; "
+                      "the moneyness filter and IV solve both need it")
+        return 1
+    underlying_closes = underlying_df["Close"]
+
+    client = PolygonClient(api_key, args.pause_secs)
+
+    log.info("enumerating_contracts", symbol=args.symbol,
+             start=str(start_date), end=str(end_date),
+             max_moneyness=args.max_moneyness)
+    contracts = enumerate_contracts(
+        client, args.symbol, start_date, end_date, args.max_moneyness,
+        underlying_closes, args.max_contracts)
+    log.info("contracts_selected", count=len(contracts))
+
+    if args.dry_run:
+        est_hours = len(contracts) * args.pause_secs / 3600
+        print(
+            f"[DRY RUN] {len(contracts)} contracts selected after the "
+            f"+/-{args.max_moneyness:.0%} moneyness-over-life filter. "
+            f"Estimated {len(contracts)} aggregate calls, "
+            f"~{est_hours:.1f} hours at {args.pause_secs}s/call."
+        )
+        return 0
+
+    r = _risk_free_rate()
+    total_rows = 0
+    for i, contract in enumerate(contracts):
+        try:
+            rows = process_contract(
+                client, store, args.symbol, contract, underlying_closes,
+                start_date, end_date, r)
+        except Exception as e:  # noqa: BLE001 -- one bad contract must not kill the run
+            log.warning("contract_fetch_failed", ticker=contract["option_ticker"],
+                       error=str(e))
+            continue
+        total_rows += rows
+        log.info("contract_processed", ticker=contract["option_ticker"],
+                 rows=rows, progress=f"{i + 1}/{len(contracts)}")
+
+    log.info("backfill_complete", symbol=args.symbol,
+             contracts=len(contracts), rows=total_rows)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
