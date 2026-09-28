@@ -11736,3 +11736,81 @@ risk-free-rate script's Phase B connection-reuse note** all unchanged from the e
 immediately above.
 
 ---
+
+## 2026-09-28 - W53's PLACING RUN ATTEMPTED, BLOCKED — a real chain-fetch bug found live,
+`open` NOT run, no orders placed
+
+With TWS paper reachable and `is_market_open()` confirmed True (the same live window the
+entry immediately above used for W55's validation), attempted `scripts/probe_w53_roll_
+atomicity.py preflight` as the documented first step before `open`/`roll`/`flatten`.
+`preflight` places no orders by design — safe to attempt regardless of outcome.
+
+RESULT: **preflight did not complete.** Two attempts, 100s and 240s bounded (`timeout`),
+both ended the same way — no JSON result, no traceback, no `GUARD REFUSED`/`UNEXPECTED
+ERROR` line, process dead, log static, nothing left listening on clientId 97 or lingering
+in `ps aux` afterward (confirmed both times). Both logs show the identical pathology: an
+unbroken flood of `Error 200: No security definition has been found` and `Unknown
+contract` for hundreds of `SPY` strikes (roughly 616–713 and 639–713 across the two
+attempts, expiries 20261006/20261012) interleaved with `Error 10091` (real-time top-of-
+book not entitled, delayed available) — never converging to a usable quote set in either
+window.
+
+ROOT CAUSE, confirmed by direct read of `_get_ibkr_chain` (`src/ait/data/
+options_chain.py:716-722`), not guessed: `target_strikes` is filtered from `chain_def.
+strikes` by `abs(s - price) <= price * 0.20` (a flat ±20% band) with no per-expiry
+availability check. `reqSecDefOptParamsAsync` returns ONE combined strike set for the
+whole trading class across ALL its expiries, not one set per expiry — near-dated weeklies
+routinely list a narrower strike range than the class's LEAPS. At SPY's current spot
+(~$765, confirmed via the W55 validation entry immediately above), ±20% is a ~$306 band
+in $0.50/$1 increments — several hundred strikes, a large fraction of which belong to
+other expiries and don't exist for the specific near-dated expiry `_fetch_ibkr_expiry`
+then tries to qualify them against, one `Option()` object per strike per right. This is
+the SAME failure class the file's own R16 comment two lines above already documents for a
+related symptom (wrong `chain_def` class serving nonexistent strikes) — this is a
+different trigger (right class, wrong per-expiry strike scope) landing on the identical
+symptom (`Option()` qualification against strikes IBKR doesn't recognize for that
+contract).
+
+Why this wasn't seen before in this session: `smoke_deploy.py`'s own SPY scan (this
+entry's predecessor, `17:47:22`) logged `scan_symbol_timing chain=0` — a near-zero chain
+fetch, meaning it hit either the chain cache or a DTE-range/expiry combination that
+doesn't trigger the pathology (the live bot's own `options.dte_range` default differs
+from this probe's `OPEN_DTE_MIN=5/OPEN_DTE_MAX=10`). W55's own live validation
+(immediately above) used a DIFFERENT, already-cached SPY chain fetched moments earlier in
+the session, at a wider/different DTE window, and also completed cleanly. This is the
+FIRST time this session exercised `_get_ibkr_chain` fresh against these specific near-
+dated 5-10 DTE expiries at today's live SPY price — and it's a live, reproducible bug,
+not a fluke: identical symptom on both the 100s and 240s attempts, different expiry
+(20261006 then 20261012 — the chain naturally rolled between attempts, ruling out a
+one-off transient IBKR-side glitch on a single expiry).
+
+DECISION: **did not proceed to `open`.** `cmd_open` calls the exact same `pick_vertical` ->
+`chain_service.get_chain` path that just failed to converge twice: placing a real order
+(even a capped, paper, auto-flatten-guarded one) against a chain-fetch pipeline that
+cannot currently produce a clean strike list would be placing an order based on
+whatever partial/garbage state existed at time of failure, not a validated decision. The
+probe's own safety design (paper-only, capped, auto-flatten-on-error) protects against a
+BAD fill, not against building the order request on top of a chain that never finished
+resolving in the first place — a different risk this session chose not to take.
+
+STATE AT HANDOFF. No code changed. No orders placed (preflight never calls `placeOrder`
+by design; confirmed no lingering process/connection either time). No `reports/w53_probe/
+2026-09-28/state.json` was ever written (both hangs occurred before `cmd_preflight`
+reaches its own `save_state` call) — nothing for a future `flatten`/`status` invocation to
+find stale.
+
+NEXT, naming every open item explicitly: **`_get_ibkr_chain`'s all-expiries strike-band
+bug** — newly found, real, live-bot-shared code (not probe-only) — worth its own
+investigation/fix wave before W53's placing run is retried; the fix likely needs either a
+per-expiry strike filter (if IBKR's API exposes one) or a narrower band for near-dated
+expiries specifically, and should be scoped and confirmed with the operator before
+touching `data/options_chain.py` (R16-audited, shared with the live bot's own entry-time
+scan). **W53's placing run itself** — still not exercised; blocked on the bug above
+being fixed, not merely on TWS/RTH access (which IS available right now and wasn't the
+limiting factor this time). Everything else — **the joint W54/W56 `check_positions`
+design**, **W57**, **W54**, **W52a's four items**, **the ongoing QQQ backfill**, **the
+surface-construction quality filter**, **the zero-bars inefficiency**, **the
+risk-free-rate script's Phase B connection-reuse note** — unchanged from the entry
+immediately above.
+
+---
