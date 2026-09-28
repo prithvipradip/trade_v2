@@ -16,6 +16,7 @@ import math
 import os
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from enum import Enum
 
 from ait.bot.state import StateManager, TradeRecord, TradeStatus
 from ait.broker.ibkr_client import IBKRClient
@@ -36,6 +37,38 @@ from ait.utils.time import parse_trade_ts, today_et
 from ait.config.runtime_env import contract_flag, contract_float  # R19: ONE authority for env-contract defaults
 
 log = get_logger("execution.portfolio")
+
+
+class PositionAction(str, Enum):
+    """check_positions' own output vocabulary -- what an executor would act
+    on. Deliberately simpler than condor_defense.DefenseAction (HOLD/
+    ROLL_UNTESTED/ROLL_TESTED/CLOSE, a decision TABLE's internal
+    vocabulary, W56) -- a future wiring wave maps DefenseAction.ROLL_
+    UNTESTED/ROLL_TESTED both onto ROLL here (roll_side names which
+    physical side, exit_reason carries the table-row nuance). Nothing
+    produces ROLL yet -- see _derive_position_action."""
+
+    HOLD = "hold"
+    CLOSE = "close"
+    PARTIAL_CLOSE = "partial_close"
+    ROLL = "roll"
+
+
+def _derive_position_action(should_exit: bool, partial_exit_quantity: int) -> PositionAction:
+    """Pure derivation of PositionStatus.action from the two fields every
+    existing exit rule already sets -- same split this register uses
+    elsewhere (classify_tested_delta vs evaluate_condor_defense,
+    interpolate_rate vs get_risk_free_rate): isolate the pure logic from
+    the data-gathering context it's called from. Never returns ROLL --
+    that value has no producer yet; a future rule (W54's rule 3/3e once
+    wired to assignment_response.policy, or a wired condor_defense) sets
+    action=ROLL directly instead of calling this, the same way it would
+    otherwise call this for the close/hold/partial cases."""
+    if should_exit:
+        return PositionAction.CLOSE
+    if partial_exit_quantity > 0:
+        return PositionAction.PARTIAL_CLOSE
+    return PositionAction.HOLD
 
 
 @dataclass
@@ -62,6 +95,14 @@ class PositionStatus:
     # MTM daily-loss brake, which summed the zeros as if they were real and
     # could not tell it was reading a phantom flat book.
     marks_missing: bool = False
+    # Shared check_positions decision-output extension (register: "design
+    # once, use for both" W54's rule 3/3e roll-vs-close dispatch and W56's
+    # condor_defense). Purely additive -- action is always derived from
+    # should_exit/partial_exit_quantity today (_derive_position_action),
+    # and roll_side is always None; no existing rule sets either directly,
+    # and no caller reads them yet. See PLAN.md for the full writeup.
+    action: PositionAction = PositionAction.HOLD
+    roll_side: str | None = None  # "P" or "C" when action == ROLL
 
 
 class PortfolioManager:
@@ -977,6 +1018,8 @@ class PortfolioManager:
             exit_reason=exit_reason,
             partial_exit_quantity=partial_exit_quantity,
             marks_missing=marks_missing,
+            action=_derive_position_action(should_exit, partial_exit_quantity),
+            roll_side=None,
         )
 
     @staticmethod

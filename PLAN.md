@@ -11915,3 +11915,122 @@ No inspect.getsource — every new/rewritten test drives the real `_get_ibkr_cha
 `_fetch_ibkr_expiry`, never asserts on source strings.
 
 ---
+
+## 2026-09-28 - BUILT — `check_positions` non-boolean decision-output extension (shared
+design, no wave number): the sole remaining blocker for wiring W54 and W56, closed at the
+shape level
+
+SCOPE, deliberately narrow. Two registered items both needed the same structural
+extension before either could ever be wired into the live exit path: W54's rule 3/rule 3e
+need to stop unconditionally closing an at-risk leg and instead consult `assignment_
+response.policy` to decide close-vs-roll (finding `[3]f`, `:8737-8740`: "a control-flow
+change to `check_positions`'s exit-decision shape ... not an additive elif"); W56
+(`condor_defense.py`, built and live-validated earlier this session) needs a caller that
+can express hold/roll-untested/roll-tested/close instead of a bare boolean. The
+2026-09-22 roadmap entry named this explicitly: "Design once, use for both" (`:8887`).
+This wave builds ONLY the shared shape — it does NOT wire rule 3/3e to consult the policy
+or call `roll_selector.select_roll_target` (still W54's own job per `[3]f`), and does NOT
+wire `condor_defense.py` into `check_positions` (a separate future step). Every existing
+exit rule's behavior is byte-identical to before this wave.
+
+**Touches `execution/portfolio.py`** — a CLAUDE.md-flagged critical/sensitive area. The
+touch is deliberately minimal and was flagged plainly in this wave's plan before starting,
+approved as that plan's own confirmation: two new dataclass fields with defaults
+(backward-compatible with every existing keyword construction site) and a small derivation
+inserted at the single point `_evaluate_position` already builds its return value.
+
+DESIGN. `PositionAction(str, Enum)`: `HOLD`, `CLOSE`, `PARTIAL_CLOSE`, `ROLL` —
+deliberately simpler than `condor_defense.DefenseAction` (`HOLD`/`ROLL_UNTESTED`/
+`ROLL_TESTED`/`CLOSE`, a decision TABLE's internal vocabulary); `PositionAction` is
+`check_positions`' OUTPUT vocabulary, what a future executor would act on. A future wiring
+wave maps `DefenseAction.ROLL_UNTESTED`/`ROLL_TESTED` both onto `PositionAction.ROLL`
+(`roll_side` names which physical side, `exit_reason` carries the table-row nuance) —
+not decided or built here, just proven sufficient (see Proof). `PositionStatus` (`:42-96`)
+gains `action: PositionAction = PositionAction.HOLD` and `roll_side: str | None = None`,
+appended after the existing `marks_missing: bool = False` so every existing keyword
+construction site stays valid unchanged. `_derive_position_action(should_exit: bool,
+partial_exit_quantity: int) -> PositionAction` is a small, pure, module-level function
+(same split this register uses repeatedly: `classify_tested_delta` vs `evaluate_condor_
+defense`, `interpolate_rate` vs `get_risk_free_rate`) — `should_exit` → `CLOSE`;
+else `partial_exit_quantity > 0` → `PARTIAL_CLOSE`; else `HOLD`. Never returns `ROLL` —
+nothing produces that value yet; a future rule sets `action=ROLL` directly instead of
+calling this. `_evaluate_position`'s existing final `return PositionStatus(...)` gets two
+new kwargs (`action=_derive_position_action(should_exit, partial_exit_quantity)`,
+`roll_side=None`); nothing above that line changes — every one of the ~10 existing rules
+(1, 1b, 2, 3, 3a-3e, 4, 5) keeps setting `should_exit`/`exit_reason`/`partial_exit_quantity`
+exactly as before. No caller of `check_positions`/`PositionStatus` (`orchestrator.py`,
+dashboards) is touched — the new fields are unused by every existing consumer.
+
+PROOF. `tests/test_position_action_output.py`, 13 new tests, no `inspect.getsource`:
+`TestDerivePositionAction` — all 4 `(should_exit, partial_exit_quantity)` combinations
+mapped to the exact expected `PositionAction`, plus a construction-based "never returns
+ROLL" guard. `TestPositionStatusShape` — defaults are backward-compatible; an illustrative
+test constructs `PositionStatus(action=ROLL, roll_side="P", ...)` the way a future rule-3/
+3e or `condor_defense` caller would, proving the shape needs no second structural change
+later. `TestActionMatchesDerivationAcrossRealRules` — 6 scenarios driven through the REAL
+`_evaluate_position` (same `__new__`-with-mocked-collaborators harness `test_credit_
+exits.py` uses): touch-stop close, take-profit close, expiry-approaching close, a genuine
+healthy hold, a partial-exit-only case (a debit `long_call` at +50% — credit strategies
+can't isolate a partial-only case under default config, since `take_profit_short`'s
+loosest DTE>20 target (0.50) exactly floors at the same level as `partial_exit_levels[0]`
+(0.50), so a credit position always trips full take-profit at or before any partial level;
+worth registering as a minor, pre-existing config-tuning observation, not a bug — DEFAULT_
+TAKE_PROFIT's own values aren't this wave's concern), and a PDT-blocked exit — proving
+`action` reflects the POST-veto `should_exit=False` (`HOLD`), not the pre-veto `CLOSE`
+intent a touch stop wanted. Every scenario additionally asserts `action`/`roll_side`
+exactly equal what `_derive_position_action` independently computes from that SAME
+result's `should_exit`/`partial_exit_quantity` — proving the wiring at the return site,
+not just the pure function in isolation.
+
+Mutation-checked: temporarily dropped the `partial_exit_quantity > 0` branch from
+`_derive_position_action` (always `HOLD` otherwise) → both the pure-function parametrized
+case and the real-`_evaluate_position` partial-exit scenario failed exactly as predicted
+(`PARTIAL_CLOSE` expected, `HOLD` got) — reverted, `git diff --stat` confirmed clean.
+
+**Full existing regression surface for `portfolio.py` — 311 pre-existing tests plus the 13
+new, 324/324, zero new failures**: `test_credit_exits.py`, `test_exit_staleness_gate.py`,
+`test_pnl_accounting.py`, `test_r15_review_fixes.py`, `test_r16_risk_fixes.py`, `test_r16_
+round2_fixes.py`, `test_r17_live_fixes.py`, `test_r19_state_ml_fixes.py`, `test_r20_
+research_validity.py`, `test_w2_chain_portfolio_gates.py`, `test_w45_exit_cas_and_sweep_
+safety.py`, `test_w47_mtm_baseline_integrity.py`, `test_w47_protection_cadence.py`,
+`test_w51_ex_div_assignment.py`, `test_w52_multileg_itm_diagnosis.py`. `python -m
+compileall -q src tests`: OK. `python scripts/typecheck.py`: OK, zero attr-defined/
+call-arg/name-defined in `src/ait/{config,bot,execution,risk}`.
+
+Full fast lane: **2631 passed / 1 failed / 46 skipped / 153 deselected, 1546.01s
+(25m46s)** — the one failure is the same standing `test_r19_config_authority.py::
+TestContractIsTheSingleAuthority::test_applier_and_readers_share_one_table`
+(`AIT_MARKET_DATA_TYPE` local-`.env` divergence). Count check: the last FULL fast lane
+in this session was W56's (2612+1=2613); the `_get_ibkr_chain` fix immediately above only
+ran its own neighbor set, never a full suite, so its own net +6 tests (`test_r16_data_
+fixes.py` 22→28) were never captured in a full-suite count before now. Expected delta
+against the W56 baseline is therefore 13 (this wave) + 6 (the chain-fetch fix) = 19; this
+run is 2631+1=2632 — 2632−2613 = **19 exactly**, reconciling both waves' test growth in
+one number.
+
+STATE AT HANDOFF. `src/ait/execution/portfolio.py` (modified) and `tests/test_position_
+action_output.py` (new) are the only files changed. Zero config changes. No restart
+needed for correctness — every existing rule's live behavior is byte-identical; the two
+new fields are additive and unread by any current caller. The next restart (whenever the
+operator chooses one, for unrelated reasons) will pick this up alongside whatever else is
+pending, with no behavior change.
+
+NEXT, naming every open item explicitly: **W54's rule 3/3e wiring** through `assignment_
+response.policy` — now unblocked at the shape level; still needs the operator's
+heuristic-vs-EV decision and the `[6]` historical-surface prerequisite from the
+2026-09-27 scoping note before the EV arm specifically could ever go live (the heuristic
+arm has no such blocker). **W56's `condor_defense.py` wiring** into `check_positions` —
+now unblocked at the shape level; its own live validation already closed (two entries
+above). **W57** — needs the full W53 placing build plus W56's wiring. **W53's placing
+run** (`open`/`roll`/`flatten`) — the chain-fetch blocker is fixed and proven; still needs
+explicit operator go-ahead before placing real orders, and a commitment to run `flatten`
+afterward (confirmed this session: nothing auto-closes a successful fill). **W52a's four
+items** — deliberately registered, not oversights. **The ongoing QQQ backfill** —
+operator-run, unaffected. **The surface-construction quality filter**, **the zero-bars
+inefficiency**, **the risk-free-rate script's Phase B connection-reuse note** — all
+unchanged.
+
+No inspect.getsource — every new test drives the real `_derive_position_action` and the
+real `_evaluate_position`, never asserts on source strings.
+
+---
