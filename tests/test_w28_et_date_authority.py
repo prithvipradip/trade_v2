@@ -197,7 +197,7 @@ class TestTrainerBothSidesShareOneConvention:
     prevent it.
     """
 
-    def test_artifact_mtimes_are_read_in_et(self, host_tz):
+    def test_artifact_mtimes_are_read_in_et(self, host_tz, monkeypatch):
         """CENSUS-4 (2026-09-27): the original check had a live bug of its
         own -- `tr._ModelTrainer` has never existed (only `ModelTrainer`
         does), so `hasattr(tr, "_ModelTrainer")` was always False and the
@@ -214,6 +214,24 @@ class TestTrainerBothSidesShareOneConvention:
 
         host_tz(BERLIN)
         import ait.ml.range_predictor as _rp
+        import ait.ml.trainer as _trainer_mod
+
+        # host_tz() moves the process zone with time.tzset(), which exists
+        # only on POSIX. On the Windows trading box (whose host zone IS ET)
+        # the zone never moves, host-local and ET dates always agree, and the
+        # setup guard below tripped (2026-09-28, first run of this rewrite on
+        # that box). Stand a Berlin host clock in at the module's own
+        # `datetime` name instead: a tz-aware read (the code under test) is
+        # unchanged, a naive host-local read -- the regression this test
+        # exists to catch -- now reads Berlin on every platform.
+        class _BerlinHostDatetime(datetime):
+            @classmethod
+            def fromtimestamp(cls, ts, tz=None):
+                if tz is None:
+                    return datetime.fromtimestamp(ts, ZoneInfo(BERLIN)).replace(tzinfo=None)
+                return datetime.fromtimestamp(ts, tz)
+
+        monkeypatch.setattr(_trainer_mod, "datetime", _BerlinHostDatetime)
 
         # trained_at / model_version are tried FIRST (highest priority) --
         # leave them unset so the mtime fallback actually runs.
@@ -231,7 +249,7 @@ class TestTrainerBothSidesShareOneConvention:
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_bytes(b"x")
         os.utime(f, (et_instant.timestamp(), et_instant.timestamp()))
-        host_local_date = datetime.fromtimestamp(et_instant.timestamp()).date()
+        host_local_date = _BerlinHostDatetime.fromtimestamp(et_instant.timestamp()).date()
         assert host_local_date != et_instant.date(), (
             "test setup bug: host-local and ET dates must actually disagree "
             "for this to prove anything"

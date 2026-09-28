@@ -12245,5 +12245,28 @@ unchanged.
 
 No inspect.getsource — every test drives the real `_map_condor_defense_action` and the
 real `_evaluate_position`, never asserts on source strings.
+## 2026-09-28 - W28 test portability: `test_artifact_mtimes_are_read_in_et` now builds its premise on Windows too
+
+Validating Ahmed's 09-27/28 push (`cce07fe..d2e4f39`, 27 commits: CENSUS-1..6, W53 probe, W55,
+W56, W58, W59, the `_get_ibkr_chain` per-expiry strike fix, `condor_defense` wired decision-only)
+on the Windows trading box: full fast lane **2643 passed / 46 skipped / 1 failed**, typecheck
+not re-run for a test-only change. The one failure was CENSUS-4's rewrite of
+`TestTrainerBothSidesShareOneConvention::test_artifact_mtimes_are_read_in_et` tripping its own
+setup guard ("host-local and ET dates must actually disagree"): the `host_tz` fixture moves the
+process zone with `time.tzset()`, which is POSIX-only and deliberately guarded, so on this box —
+whose host zone IS ET — the zone never moves and 23:00 ET reads as the same date either way. It
+passes on Ahmed's macOS/CEST box, which is why his fast-lane runs never saw it. Not a live-code
+defect: `_artifact_train_date` reads mtimes with `tz=_ET` and is correct on both hosts.
+
+FIX (test-only). The test now stands a Berlin host clock in at `ait.ml.trainer.datetime` (a
+`datetime` subclass whose naive `fromtimestamp` reads Europe/Berlin; tz-aware calls pass through),
+so the scenario is constructed on every platform instead of depending on `tzset`. PROOF: green
+here with the code as shipped; **red** with `tz=_ET` removed from `trainer.py:197` (the exact
+regression it exists to catch — reverted after the check); the file runs 15 passed / 1 skipped.
+
+Also checked while validating, since two condors are open (QQQ/SPY, entered 10:09 today): the new
+`condor_defense` call in `_evaluate_position` returns HOLD immediately while
+`condor_defense.enabled: false` (config), is documented never-raise, and each position's
+evaluation already sits inside `check_positions`' own try — it cannot take the exit monitor down.
 
 ---
