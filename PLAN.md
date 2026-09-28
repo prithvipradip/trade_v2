@@ -11232,3 +11232,155 @@ real DB methods, the real `solve_iv_from_price`/`compute_greeks_from_sigma`), an
 live smoke tests drove the real script against the real API.
 
 ---
+
+## 2026-09-28 - W58 FOLLOW-UP: operational hardening for the multi-day backfill run —
+network-retry resilience, a status file, and the launchd wall re-confirmed
+
+The operator seriously considered launchd (auto-restart across sleep/reboot) for the
+real ~20-day backfill run and correctly abandoned it once this repo's own prior finding
+was surfaced: launchd-spawned processes cannot access this repo at all (PLAN.md,
+2026-09-15 "W16b correction" — `~/Documents` is macOS-TCC-protected, no consent-dialog
+path exists for a headless job). Resolved design instead: the operator starts the
+script themselves in a normal terminal (inherits Terminal/VS Code's already-granted
+Documents access, no TCC wall), optionally `nohup`'d, and manually resumes after any
+interruption — safe today (resume-skip via `option_ticker_has_data`, proven live in the
+original W58 build) but not yet OBSERVABLE or RESILIENT to what an unattended multi-day
+stretch actually hits. This entry closes both gaps.
+
+**FINDING, CONFIRMED BY DIRECT READ:** `PolygonClient._get()` had no retry around the
+HTTP call — a `requests.exceptions.RequestException` (connection drop, timeout — exactly
+what a post-sleep WiFi reconnection looks like) propagated straight up uncaught.
+`get_daily_bars()`'s failures were already survived (the per-contract loop in `main()`
+already wraps `process_contract(...)` in `try/except Exception: continue`), but
+`list_contracts_pages()` — called once, up front, for the whole multi-page contracts
+enumeration — had no such protection: a network blip during that phase crashed the
+entire process with a raw traceback. The one real structural gap, not a rewrite of
+working code.
+
+**BUILD.**
+1. `PolygonClient._get()` — bounded retry loop (backoff `[0, 5, 10, 20, 40, 60]`
+   seconds, patient enough for a typical post-wake reconnection), catching
+   `requests.exceptions.RequestException` specifically (not a bare `except Exception` —
+   a real programming error still surfaces immediately, isn't silently retried).
+   Exhausting retries raises a clear `RuntimeError` wrapping the original exception.
+2. `main()`'s enumeration call is now wrapped in its own try/except: a persistent
+   failure there logs `backfill_enumeration_failed`, writes the status file as
+   `status: "crashed"`, and exits 1 — closing the structural gap above.
+3. A top-level try/except around the whole run (`main()` now delegates to `_run()`) so
+   ANY otherwise-unhandled exception still produces one clear final log line and a
+   `status: "crashed"` status-file write before exiting non-zero, regardless of where
+   something breaks.
+4. New status file, `data/backfill_option_history_status.json` (same "small file in
+   `data/`, cheap to `cat`" spirit as the existing `data/bot_heartbeat` convention,
+   just with real progress fields a bare timestamp can't carry): written at run start
+   (`status: "running"`, `contracts_total`, `started_at`), after every processed
+   contract (`contracts_done`, `rows_written`, `current_ticker`, `last_updated`), on
+   clean completion (`status: "complete"`), and on any crash path (`status: "crashed"`,
+   `last_error`). One `cat` now answers "still running?", "how far along?", and "why did
+   it die?" without scrolling a log.
+5. Docstring rewritten with the actual recommended operational pattern (see RUN
+   COMMANDS below) — including the launchd-wall explanation inline, so the reasoning
+   isn't lost outside this register entry.
+
+**A REAL BUG FOUND BY THE NEW TESTS THEMSELVES, before this entry was written**:
+`write_status(path: Path = STATUS_FILE, ...)`'s default argument was bound to
+`STATUS_FILE`'s value ONCE, at function-definition time (a classic Python mutable/
+late-binding-default gotcha) — a test that `monkeypatch.setattr(m, "STATUS_FILE",
+tmp_path / "status.json")` to redirect writes away from the real `data/` directory
+silently failed to do so; the function kept writing to the original path regardless.
+Caught immediately (`FileNotFoundError` at the tmp_path location — the real file went
+elsewhere), fixed by resolving `STATUS_FILE` inside the function body at call time
+(`path = path or STATUS_FILE`) instead of as a bound default. A leftover fake status
+file this bug's own test run left in the real `data/` directory (`status: "complete",
+symbol: "QQQ", rows_written: 3` — obviously synthetic test data, not real backfill
+progress) was found and deleted before this entry was written, so nobody mistakes it
+for real progress later.
+
+**RUN COMMANDS** (per the operator's explicit request — copying the docstring's own
+canonical text so it isn't only discoverable by reading the script):
+
+Always run from the repo root (`trade_v2`) — `--db-path`'s default and the status
+file's path are both resolved relative to the CURRENT WORKING DIRECTORY at invocation,
+not to the script's own location (unlike `.env` loading, which resolves correctly
+regardless of cwd via `apply_runtime_env_defaults()`'s own `REPO_ROOT` computation).
+Running from elsewhere would silently create/use a different, empty `data/
+historical.db` with no error — the operator explicitly chose documentation over a code
+fix for this (`STATUS_FILE`/`--db-path` staying cwd-relative), since always invoking
+from the repo root is how they'll actually use it.
+
+```
+cd /path/to/trade_v2
+
+# Foreground (blocks the terminal, stops if you close it):
+python scripts/backfill_option_history.py
+
+# Background, survives closing the terminal (recommended for the real run):
+nohup python scripts/backfill_option_history.py \
+    > logs/backfill_option_history.log 2>&1 &
+```
+
+Checking on it: `cat data/backfill_option_history_status.json` (structured snapshot —
+stale `last_updated` while the process is confirmed alive means something's stuck;
+`status: "crashed"` means `last_error` says why); `tail -f logs/backfill_option_
+history.log` (live detail); `ps aux | grep backfill_option_history` (is the process
+alive). Interrupted for any reason — just re-run the identical command; already-fetched
+contracts are skipped, nothing lost, nothing re-downloaded.
+
+**WINDOWS, PER THE OPERATOR'S QUESTION.** Confirmed: `POLYGON_API_KEY` is already set
+in the Windows box's own `.env`. Code-level assessment (not live-tested on Windows):
+the script is expected to run there unmodified — pure Python, `pathlib` throughout (no
+hardcoded `/`-separated strings), no POSIX-only calls (no `os.fork`, no Unix-specific
+signal handling), and `.env`/config loading is already proven cross-platform (the live
+bot itself runs on the Windows box today). The one piece that IS platform-specific is
+the launch command, not the code: `nohup` is bash/POSIX-only. The Windows equivalent
+for "survives closing the terminal" is PowerShell's `Start-Process`:
+
+```
+Start-Process python -ArgumentList "scripts\backfill_option_history.py" `
+    -RedirectStandardOutput logs\backfill_option_history.log `
+    -RedirectStandardError logs\backfill_option_history.err -WindowStyle Hidden
+```
+
+(also run from the repo root, same reasoning as above). Flagged honestly as untested,
+not asserted as proven — the Mac is where this was actually built and smoke-tested.
+
+**PROOF.** 4 new tests in `tests/test_backfill_option_history.py` (now 12 total):
+`TestPolygonClientGetRetry` (retries-then-succeeds against a real
+`requests.exceptions.ConnectionError`-raising fake session, and exhausts-retries-raises)
+and `TestRunEnumerationFailure`/`TestRunStatusFile` (drive the real `main()`/`_run()`
+end to end with `enumerate_contracts`/`process_contract` faked at the network boundary,
+asserting on the real written status-file JSON). Mutation-checked the retry logic:
+temporarily truncated `NETWORK_RETRY_BACKOFFS` to a single attempt, confirmed the
+retries-then-succeeds test failed exactly as predicted (`RuntimeError: ... after 1
+attempts`), reverted — `git diff --stat scripts/backfill_option_history.py` confirmed
+clean before moving on. `python -m compileall -q scripts tests`: OK. Re-ran a small
+real dry-run (`--max-contracts 3 --dry-run`) against the live API after all changes —
+still works end to end. Full fast lane: **2540 passed / 1 failed / 46 skipped / 153
+deselected, 976.80s (16m16s)** — the one failure is the standing `AIT_MARKET_DATA_TYPE`
+divergence; zero new failures. Count check against the original W58 build's fast lane
+(2536+1=2537 total): this run is 2540+1=2541 — a delta of exactly +4, matching the 4
+new tests precisely (no other test file touched).
+
+STATE AT HANDOFF. `scripts/backfill_option_history.py` and `tests/test_backfill_
+option_history.py` are the only files changed. Zero production trading-path files
+touched. Zero config changes. Nothing to deploy or restart — this tool still runs
+standalone, outside the live bot process, exactly as before. The real multi-day run has
+still NOT been started — this entry hardens and documents the tool; starting it is the
+operator's own call, in their own terminal, whenever they're ready.
+
+NEXT, naming every open item explicitly: **the real multi-week backfill run itself** —
+tool is now hardened and documented, starting it is the operator's call (Mac first, per
+the build; Windows untested but expected to work, per the assessment above). **The
+config-gated surface-construction quality filter** — deferred, W54's scope. **The
+historical risk-free-rate series** — registered follow-up (FRED's DGS1MO/DGS3MO). **The
+zero-bars-retried-forever minor inefficiency** (registered in the original W58 entry,
+unchanged, not urgent). **W54 itself** — operator decision on backtesting sequencing.
+Everything else unchanged and unrelated: `_run_override_block`/`get_chain_for_expiry`/
+`test_watchdog.py` all closed; W53's placing run and W55's live validation run waiting
+on TWS during an RTH session; W56/57; W52a's four items.
+
+No inspect.getsource — every new test drives real code (the real retry loop against a
+real exception type, the real `main()`/`_run()` control flow, the real status-file
+writer).
+
+---

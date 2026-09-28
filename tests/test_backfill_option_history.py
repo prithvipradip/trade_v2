@@ -8,6 +8,7 @@ No inspect.getsource.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import tempfile
 from datetime import date, timedelta
@@ -184,3 +185,131 @@ class TestProcessContract:
 
         assert rows == 0
         assert store.option_ticker_has_data(contract["option_ticker"]) is False
+
+
+# ---------------------------------------------------------------------------
+# W58 follow-up: network-retry resilience (PolygonClient._get)
+# ---------------------------------------------------------------------------
+
+class _FakeResponse:
+    def __init__(self, status_code=200, json_data=None):
+        self.status_code = status_code
+        self._json_data = json_data if json_data is not None else {}
+
+    def json(self):
+        return self._json_data
+
+
+class _FlakySession:
+    """Raises a real requests ConnectionError `fail_times` times, then
+    returns a real (fake-content) response -- proves the retry loop is
+    driven by genuine requests.exceptions.RequestException handling, not a
+    stand-in exception type."""
+
+    def __init__(self, fail_times: int, response):
+        self._fail_times = fail_times
+        self._response = response
+        self.calls = 0
+
+    def get(self, url, params=None, timeout=None):
+        self.calls += 1
+        if self.calls <= self._fail_times:
+            raise m.requests.exceptions.ConnectionError("simulated network blip")
+        return self._response
+
+
+class _AlwaysFailsSession:
+    def __init__(self):
+        self.calls = 0
+
+    def get(self, url, params=None, timeout=None):
+        self.calls += 1
+        raise m.requests.exceptions.ConnectionError("permanent simulated failure")
+
+
+class TestPolygonClientGetRetry:
+    def test_retries_transient_network_errors_then_succeeds(self, monkeypatch):
+        monkeypatch.setattr(m.time, "sleep", lambda s: None)  # no real waiting in tests
+        response = _FakeResponse(json_data={"status": "OK", "results": []})
+        session = _FlakySession(fail_times=3, response=response)
+        client = m.PolygonClient("fake-key", pause_secs=0, session=session)
+
+        data = client._get("https://api.polygon.io/v3/reference/options/contracts")
+
+        assert data == {"status": "OK", "results": []}
+        assert session.calls == 4, "3 failures + 1 success"
+
+    def test_exhausting_retries_raises_runtime_error(self, monkeypatch):
+        monkeypatch.setattr(m.time, "sleep", lambda s: None)
+        session = _AlwaysFailsSession()
+        client = m.PolygonClient("fake-key", pause_secs=0, session=session)
+
+        with pytest.raises(RuntimeError, match="Polygon request failed"):
+            client._get("https://api.polygon.io/v3/reference/options/contracts")
+
+        assert session.calls == len(m.NETWORK_RETRY_BACKOFFS)
+
+
+# ---------------------------------------------------------------------------
+# W58 follow-up: main()/_run()'s enumeration-failure and status-file paths
+# ---------------------------------------------------------------------------
+
+def _seed_underlying(store: HistoricalDataStore, symbol: str = "QQQ") -> None:
+    df = pd.DataFrame({
+        "Open": [100.0], "High": [101.0], "Low": [99.0], "Close": [100.0],
+        "Volume": [1000],
+    }, index=pd.to_datetime(["2026-06-01"]))
+    store.save(symbol, df)
+
+
+class TestRunEnumerationFailure:
+    def test_enumeration_failure_writes_crashed_status_and_returns_nonzero(
+            self, monkeypatch, tmp_path):
+        monkeypatch.setattr(m, "STATUS_FILE", tmp_path / "status.json")
+        monkeypatch.setenv("POLYGON_API_KEY", "fake-key-for-test")
+        store = _temp_store()
+        _seed_underlying(store)
+        monkeypatch.setattr(m, "HistoricalDataStore", lambda **kw: store)
+
+        def _boom(*a, **kw):
+            raise m.requests.exceptions.ConnectionError("simulated enumeration failure")
+
+        monkeypatch.setattr(m, "enumerate_contracts", _boom)
+
+        rc = m.main(["--symbol", "QQQ", "--start-date", "2026-06-01",
+                    "--end-date", "2026-06-02"])
+
+        assert rc == 1
+        status = json.loads((tmp_path / "status.json").read_text())
+        assert status["status"] == "crashed"
+        assert "enumeration failed" in status["last_error"]
+
+
+class TestRunStatusFile:
+    def test_status_file_after_a_successful_small_run(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(m, "STATUS_FILE", tmp_path / "status.json")
+        monkeypatch.setenv("POLYGON_API_KEY", "fake-key-for-test")
+        store = _temp_store()
+        _seed_underlying(store)
+        monkeypatch.setattr(m, "HistoricalDataStore", lambda **kw: store)
+
+        fake_contracts = [{
+            "option_ticker": "O:QQQ260601C00100000", "expiry": "2026-06-01",
+            "right": "C", "strike": 100.0,
+        }]
+        monkeypatch.setattr(m, "enumerate_contracts", lambda *a, **kw: fake_contracts)
+        monkeypatch.setattr(m, "process_contract", lambda *a, **kw: 3)
+
+        rc = m.main(["--symbol", "QQQ", "--start-date", "2026-06-01",
+                    "--end-date", "2026-06-02"])
+
+        assert rc == 0
+        status = json.loads((tmp_path / "status.json").read_text())
+        assert status["status"] == "complete"
+        assert status["symbol"] == "QQQ"
+        assert status["contracts_total"] == 1
+        assert status["contracts_done"] == 1
+        assert status["rows_written"] == 3
+        assert status["current_ticker"] is None
+        assert status["last_error"] is None
+        assert "started_at" in status and "last_updated" in status

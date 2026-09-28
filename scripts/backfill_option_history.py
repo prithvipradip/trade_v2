@@ -42,6 +42,56 @@ fetches alike) -- not the polygon-api-client SDK's own pagination/retry
 (neither has a throttle hook that fits this limit), raw HTTP via `requests`
 instead, matching exactly what was manually verified against the live API
 before this script was written.
+
+RUNNING THE REAL, MULTI-DAY JOB (~140,000 contracts for QQQ's full 2-year
+window at the default +/-30% band -- see PLAN.md's W58 entry for the
+measured math). This deliberately does NOT run via launchd: a launchd-
+spawned process cannot access this repo at all (PLAN.md, 2026-09-15 "W16b
+correction" -- `~/Documents` is macOS-TCC-protected, and a launchd child
+inherits no "responsible app" grant, unlike a process launched from an
+interactive Terminal/VS Code session). Start it yourself, in a normal
+terminal.
+
+ALWAYS RUN FROM THE REPO ROOT (the `trade_v2` directory). `--db-path`'s
+default (`data/historical.db`) and the status file's path are both
+relative to the CURRENT WORKING DIRECTORY at invocation, not to this
+script's own location -- unlike `.env` loading, which resolves correctly
+regardless of cwd. Running from elsewhere would silently create/use a
+DIFFERENT, empty `data/historical.db` wherever you happened to be, with no
+error. `cd` into the repo root first, every time.
+
+    cd /path/to/trade_v2
+
+Foreground (blocks the terminal, stops if you close it):
+
+    python scripts/backfill_option_history.py
+
+Background, survives closing the terminal (recommended for the real run):
+
+    nohup python scripts/backfill_option_history.py \
+        > logs/backfill_option_history.log 2>&1 &
+
+Windows: the script itself is expected to run unmodified there (pure
+Python, `pathlib` throughout, no POSIX-only calls) -- but this is UNTESTED
+on Windows, and `nohup` is bash/POSIX-only. The Windows equivalent for a
+terminal-survives-close background run is PowerShell's `Start-Process`,
+e.g. `Start-Process python -ArgumentList "scripts\backfill_option_history.py" -RedirectStandardOutput logs\backfill_option_history.log -RedirectStandardError logs\backfill_option_history.err -WindowStyle Hidden` (also run from the repo root, same reasoning as above).
+
+Three ways to check on it while it runs:
+  - `cat data/backfill_option_history_status.json` -- structured snapshot
+    (status/contracts_done/contracts_total/rows_written/current_ticker/
+    last_error/last_updated). If `last_updated` is stale (more than a
+    minute or so old) while the process is confirmed alive, something's
+    stuck; if `status` reads "crashed", `last_error` says why.
+  - `tail -f logs/backfill_option_history.log` -- live per-contract detail.
+  - `ps aux | grep backfill_option_history` -- is the process itself alive.
+
+If it's interrupted for any reason (sleep, a closed terminal without
+`nohup`, a crash, a reboot) -- just re-run the exact same command. Already-
+fetched contracts are skipped (option_ticker_has_data), nothing is lost,
+nothing is re-downloaded. Network blips (e.g. WiFi reconnecting after
+sleep) are retried internally with backoff before anything is treated as a
+real failure -- see PolygonClient._get()'s own docstring.
 """
 from __future__ import annotations
 
@@ -55,6 +105,7 @@ from ait.config.runtime_env import apply_runtime_env_defaults  # noqa: E402
 apply_runtime_env_defaults()
 
 import argparse  # noqa: E402
+import json  # noqa: E402
 import os  # noqa: E402
 import time  # noqa: E402
 from datetime import date, datetime, timedelta, timezone  # noqa: E402
@@ -74,6 +125,13 @@ log = get_logger("scripts.backfill_option_history")
 
 BASE_URL = "https://api.polygon.io"
 AUTH_FAILURE_LIMIT = 3
+STATUS_FILE = Path("data") / "backfill_option_history_status.json"
+# Network-retry backoff (seconds); [0, ...] so the first attempt has no
+# extra delay. Patient enough to ride out a post-sleep WiFi reconnection,
+# which typically settles within seconds to a couple minutes -- this is
+# about surviving a transient blip, not about the 5/min rate-limit pacing
+# (that's `pause_secs`, applied only after a response is actually received).
+NETWORK_RETRY_BACKOFFS = [0, 5, 10, 20, 40, 60]
 
 
 # ---------------------------------------------------------------------------
@@ -115,9 +173,36 @@ class PolygonClient:
         self._auth_failures = 0
 
     def _get(self, url: str, params: dict | None = None) -> dict:
+        """One rate-limited, network-retried GET. A `requests.exceptions.
+        RequestException` (connection drop, timeout -- e.g. WiFi still
+        reconnecting right after a sleep/wake) is retried per
+        NETWORK_RETRY_BACKOFFS before giving up and raising RuntimeError;
+        this is about surviving a TRANSIENT blip, not the 5/min rate-limit
+        pacing (`self._pause`, applied only after a response is actually
+        received). A 401 or a per-request NOT_AUTHORIZED body are handled
+        separately below -- those are real API responses, not network
+        failures, and need different (auth-breaker vs. skip-and-continue)
+        handling."""
         params = dict(params or {})
         params["apiKey"] = self._api_key
-        resp = self._session.get(url, params=params, timeout=30)
+        resp = None
+        last_exc: Exception | None = None
+        for attempt, backoff in enumerate(NETWORK_RETRY_BACKOFFS):
+            if backoff:
+                log.warning("polygon_request_retry", url=url, attempt=attempt,
+                           backoff_secs=backoff)
+                time.sleep(backoff)
+            try:
+                resp = self._session.get(url, params=params, timeout=30)
+                last_exc = None
+                break
+            except requests.exceptions.RequestException as e:
+                last_exc = e
+        if last_exc is not None:
+            raise RuntimeError(
+                f"Polygon request failed after {len(NETWORK_RETRY_BACKOFFS)} "
+                f"attempts: {url}"
+            ) from last_exc
         time.sleep(self._pause)
         if resp.status_code == 401:
             self._auth_failures += 1
@@ -162,6 +247,29 @@ class PolygonClient:
         url = f"{BASE_URL}/v2/aggs/ticker/{option_ticker}/range/1/day/{from_date}/{to_date}"
         data = self._get(url, params={"adjusted": "true", "sort": "asc", "limit": 50000})
         return data.get("results", []) if data else []
+
+
+# ---------------------------------------------------------------------------
+# Status file -- same "small file in data/, cheap to write, cheap to cat"
+# spirit as data/bot_heartbeat, with the progress/outcome fields a bare
+# timestamp can't carry. Lets an operator running this unattended for
+# hours/days tell "still running" from "died silently" from "why it died"
+# with one `cat`, no log-scrolling required.
+# ---------------------------------------------------------------------------
+
+def write_status(path: Path | None = None, **fields) -> None:
+    # Resolved at CALL time, not as a bound default -- a plain
+    # `path: Path = STATUS_FILE` default is evaluated once at def time and
+    # would silently ignore any later monkeypatch/reassignment of the
+    # module-level STATUS_FILE (a real bug caught by this file's own tests).
+    path = path or STATUS_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(fields)
+    payload["last_updated"] = datetime.now().isoformat()
+    try:
+        path.write_text(json.dumps(payload, indent=2))
+    except OSError as e:  # noqa: BLE001 -- a status-file write must never crash the job
+        log.warning("status_file_write_failed", error=str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +412,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Top-level crash boundary: whatever goes wrong, log one clear line,
+    mark the status file "crashed" with the reason, and exit non-zero --
+    never a bare traceback with no record of why."""
+    try:
+        return _run(argv)
+    except Exception as e:  # noqa: BLE001 -- see docstring
+        log.error("backfill_crashed", error=str(e))
+        write_status(status="crashed", last_error=str(e))
+        return 1
+
+
+def _run(argv: list[str] | None) -> int:
     args = _parse_args(argv)
 
     api_key = os.environ.get("POLYGON_API_KEY", "")
@@ -331,9 +451,17 @@ def main(argv: list[str] | None = None) -> int:
     log.info("enumerating_contracts", symbol=args.symbol,
              start=str(start_date), end=str(end_date),
              max_moneyness=args.max_moneyness)
-    contracts = enumerate_contracts(
-        client, args.symbol, start_date, end_date, args.max_moneyness,
-        underlying_closes, args.max_contracts)
+    try:
+        contracts = enumerate_contracts(
+            client, args.symbol, start_date, end_date, args.max_moneyness,
+            underlying_closes, args.max_contracts)
+    except Exception as e:  # noqa: BLE001 -- a multi-page enumeration failing
+        # (e.g. a network blip right after sleep/wake) must not crash the
+        # whole run with a raw traceback -- log clearly, mark status, stop.
+        log.error("backfill_enumeration_failed", error=str(e))
+        write_status(status="crashed", symbol=args.symbol,
+                    last_error=f"enumeration failed: {e}")
+        return 1
     log.info("contracts_selected", count=len(contracts))
 
     if args.dry_run:
@@ -346,6 +474,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    started_at = datetime.now().isoformat()
+    write_status(status="running", symbol=args.symbol, started_at=started_at,
+                contracts_total=len(contracts), contracts_done=0,
+                rows_written=0, current_ticker=None, last_error=None)
+
     r = _risk_free_rate()
     total_rows = 0
     for i, contract in enumerate(contracts):
@@ -356,13 +489,24 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as e:  # noqa: BLE001 -- one bad contract must not kill the run
             log.warning("contract_fetch_failed", ticker=contract["option_ticker"],
                        error=str(e))
+            write_status(status="running", symbol=args.symbol, started_at=started_at,
+                        contracts_total=len(contracts), contracts_done=i + 1,
+                        rows_written=total_rows,
+                        current_ticker=contract["option_ticker"], last_error=str(e))
             continue
         total_rows += rows
         log.info("contract_processed", ticker=contract["option_ticker"],
                  rows=rows, progress=f"{i + 1}/{len(contracts)}")
+        write_status(status="running", symbol=args.symbol, started_at=started_at,
+                    contracts_total=len(contracts), contracts_done=i + 1,
+                    rows_written=total_rows,
+                    current_ticker=contract["option_ticker"], last_error=None)
 
     log.info("backfill_complete", symbol=args.symbol,
              contracts=len(contracts), rows=total_rows)
+    write_status(status="complete", symbol=args.symbol, started_at=started_at,
+                contracts_total=len(contracts), contracts_done=len(contracts),
+                rows_written=total_rows, current_ticker=None, last_error=None)
     return 0
 
 
