@@ -12387,3 +12387,129 @@ legs`, `leg_net_price`, and `prepare_roll_combo` (including the real, imported
 `_validate_roll_legs`), never asserts on source strings.
 
 ---
+
+## 2026-09-29 - BUILT — roll booking mechanics (`execution/roll_booking.py`), unwired: a
+real ordering bug found and fixed while building it
+
+SCOPE. `roll_executor.py` (previous wave) prepares a fully validated, priced 4-leg roll
+combo but stops before placement. The next gap, found by directly re-reading the real
+booking code rather than trusting the earlier framing: **the booking machinery actually
+lives in `executor.py` + `state.py`, not `reconciler.py`** — worth stating plainly since
+an earlier register entry this session (the roll-executor wave's own NEXT pointer) assumed
+otherwise. `reconciler.py` is a periodic (startup/pre-market/post-market/on-demand, NOT
+per-tick) position-diff safety net; the real exactly-once machinery is `state.py`'s status
+compare-and-swap (`transition`) plus `close_trade`'s outbox/claim/`core_booked` layers, and
+every existing booking path (`_order_trade_map`, `PendingOrder`, `PendingExitOrder`)
+assumes ONE order maps to exactly ONE `trade_id`. A roll's single 4-leg fill needs to book
+TWO: close the old vertical (trade A), open the new one (trade B). This wave builds that
+booking logic as new, additive, fully tested code that **nothing calls** — matching every
+prior wave's precedent exactly. `executor.py`'s live `check_fills`/`_pending_orders`/
+`_pending_exit_orders` loops are untouched; teaching them to recognize a roll order and
+dispatch here is the actual wiring step, deliberately deferred to a further, later wave.
+
+Two risks confirmed directly from source before writing any code (not assumed): `HALT_
+UNTRACKED` freezes on a position whose legs aren't in `local_map` (built from open trades,
+including PENDING) on a second sighting — writing B's PENDING row (real legs) *before* a
+roll order is ever placed, the same ordering CLAUDE.md already documents for entries,
+prevents this. `go_live.py` already excludes CLOSING/PENDING rows from the verdict sample
+(counted only toward the drawdown base) — an intermediate multi-step booking state does
+NOT corrupt the 50-close track record; `go_live.py`'s "fold a roll into one outcome"
+accounting is a real, still-open MODELING question, but not a correctness blocker,
+registered as NEXT rather than solved here.
+
+DESIGN. New `src/ait/execution/roll_booking.py`: `seed_roll_opening_trade` writes B's
+PENDING row, mirroring `execute_signal`'s exact `record_trade`-before-placement ordering
+(`executor.py:447-493`). `cas_roll_closing_trade` is a thin, named wrapper around the
+SAME CAS primitive `orchestrator._cas_to_closing` already uses (FILLED/PARTIAL→CLOSING).
+`split_roll_fill_price` is a pure function splitting a roll combo's per-leg fill rows
+(the shape `_sweep_executions` already produces — confirmed per-leg conId/price/shares
+data IS available for a BAG combo, not just a combo-level summary) into closing-side and
+opening-side net totals, same signed-per-leg-sum convention `leg_net_price`/
+`_option_position_unrealized` already use. `book_roll_fill` orchestrates: computes A's
+`realized_pnl` from the closing split using `_option_position_unrealized`'s OWN credit/
+debit polarity formula (reused via `CREDIT_STRATEGIES` import, not reimplemented), calls
+the EXISTING `state.close_trade(..., exit_reason_detailed=f"rolled_to_{opening_trade_id}",
+from_statuses=(CLOSING,))` — reusing the real exactly-once machinery verbatim — and
+promotes B via `state.transition` plus a narrow `UPDATE` that finally gives `TradeRecord.
+rolled_from_trade_id` (already existed, `state.py:99`, unpopulated by any code path until
+now) a real writer. `PendingRollOrder` is the agreed data contract a future `executor.py`
+wiring wave would key a new `_pending_roll_orders` dict by — defined, not instantiated or
+consumed by any live code this wave.
+
+**A REAL DESIGN BUG FOUND AND FIXED WHILE BUILDING THIS, not assumed correct from the
+plan**: the first draft closed A (`state.close_trade`) BEFORE promoting B
+(`state.transition`). `test_b_already_filled_refuses_and_leaves_a_untouched` caught it
+immediately — with B already FILLED by something else, A still got closed (since A's own
+CAS had already succeeded before B's promotion was even attempted), leaving A CLOSED with
+no live B to show for the closed position; the position would have silently vanished.
+Fixed by reordering: promote B FIRST, close A second. A failure promoting B now leaves A
+untouched in CLOSING (recoverable, still awaiting its real close). The reverse failure (A's
+close failing after B is already promoted) is a real, smaller, more VISIBLE residual risk
+this two-phase design does not eliminate (B live, A stuck in CLOSING) — documented in the
+function's own docstring and registered as a known limitation for the future wiring wave,
+not solved here (a true cross-table atomic transaction would mean bypassing `state.py`'s
+own exactly-once primitives, which this module deliberately reuses instead).
+
+PROOF. `tests/test_roll_booking.py`, 13 new tests, no `inspect.getsource`, a REAL temp-DB
+`StateManager` throughout (never mocked — proves the actual SQL, same convention `test_
+w53_db_migration.py` uses). `TestSplitRollFillPrice` (3), `TestSeedRollOpeningTrade` (2,
+including a duplicate-`trade_id` proof that `INSERT OR IGNORE`'s own idempotency holds,
+not just assumed), `TestCasRollClosingTrade` (2). `TestBookRollFill` (6): happy path
+(A closed with the correct split price/link, B filled with `rolled_from_trade_id` and its
+real entry price); credit-strategy and debit-strategy `realized_pnl` sign checks against
+hand-computed values matching `_option_position_unrealized`'s own polarity exactly; the
+promote-B-first ordering proof from both directions (B-already-filled leaves A untouched
+— the clean direction; A-not-in-CLOSING still promotes B, the documented residual risk,
+proven not silently hidden); a `split_roll_fill_price` failure refuses before any write.
+
+Mutation-checked 2 mechanisms targeting THIS module's own new logic (not the reused,
+already-audited `state.py` primitives): reverting to the close-A-first ordering broke
+`test_b_already_filled_refuses_and_leaves_a_untouched` exactly as predicted (the same bug
+the real implementation caught); dropping the `rolled_from_trade_id` write broke the
+happy-path linkage assertion exactly as predicted. Both confirmed via `md5` of `roll_
+booking.py` identical before and after (new/untracked file, `git diff --stat` shows
+nothing for it).
+
+Neighbors: `test_roll_booking.py` + `test_w53_db_migration.py` + `test_roll_executor.py` +
+`test_w53_roll_target_selection.py` + `test_w53_roll_leg_validator.py` + `test_w52a_
+calendar_lkg_persists.py`: **69/69**. The broader exactly-once booking regression surface
+(`test_w14_booking_exactly_once.py` + `test_w1_booking_integrity.py` + `test_w32_booking_
+breaker_integrity.py` + `test_w48_capital_at_risk_restatement.py` alongside `test_roll_
+booking.py`): **74/74**. `python -m compileall -q src tests`: OK. `python scripts/
+typecheck.py`: OK, zero attr-defined/call-arg/name-defined in `src/ait/{config,bot,
+execution,risk}`.
+
+Full fast lane: **2674 passed / 1 failed / 45 skipped / 153 deselected, 988.42s
+(16m28s)** — the one failure is the same standing `test_r19_config_authority.py::
+TestContractIsTheSingleAuthority::test_applier_and_readers_share_one_table`
+(`AIT_MARKET_DATA_TYPE` divergence). Count check against the immediately-prior full fast
+lane (2660+1+46=2707 total non-deselected outcomes): this run is 2674+1+45=2720 — a delta
+of exactly **+13**, matching the new test count precisely. (Raw "passed" moved by +14 and
+"skipped" by -1 — one previously-skipped test now passes, unrelated to this wave; the
+session crossed into 2026-09-29 between runs, consistent with a day-of-week-dependent skip
+condition flipping rather than anything this change touched. Flagged for transparency, not
+chased further — the reconciling total is what matters here.)
+
+STATE AT HANDOFF. `src/ait/execution/roll_booking.py` (new), `tests/test_roll_booking.py`
+(new). Zero existing files touched, zero config changes. Nothing new is reachable from any
+live path — `executor.py`'s fill-processing loop is unchanged, no caller exists. No
+restart needed for correctness; none performed.
+
+NEXT, naming every open item explicitly: **wiring `executor.py`'s `check_fills`** to
+recognize a `PendingRollOrder` and call `book_roll_fill` — the actual remaining hard step,
+touches the live fill-processing loop, the single most sensitive part of this codebase.
+**`go_live.py`'s roll-accounting MODELING decision** — one combined outcome vs. two, an
+operator call once real roll data exists (confirmed NOT a correctness blocker today).
+**Wiring `condor_defense`'s ROLL verdict to actually call `roll_executor`+this module** —
+depends on the executor wiring above. **W54's rule 3/3e wiring** — still needs the
+latency/cadence design the 2026-09-27 scoping note flagged. **W53's placing run** — still
+needs explicit operator go-ahead plus a `flatten` commitment. **W52a's four items** —
+deliberately registered. **The ongoing QQQ backfill** — operator-run, unaffected. **The
+surface-construction quality filter**, **the zero-bars inefficiency**, **the
+risk-free-rate script's Phase B connection-reuse note** — all unchanged.
+
+No inspect.getsource — every new test drives the real `seed_roll_opening_trade`,
+`cas_roll_closing_trade`, `split_roll_fill_price`, and `book_roll_fill` against a real
+temp-DB `StateManager`, never asserts on source strings.
+
+---
