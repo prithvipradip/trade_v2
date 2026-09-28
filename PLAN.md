@@ -10860,3 +10860,131 @@ that has touched it so far).
 No inspect.getsource — this entry touches no test files, only reports a suite run.
 
 ---
+
+## 2026-09-28 - CENSUS-6 + CLEANUP EXECUTED — closes out everything CENSUS-3 identified;
+the `inspect.getsource` anti-pattern is now fully retired from the suite
+
+Two phases, both executed in this pass. Phase A: the 2-site delete-only discrepancy
+(open since CENSUS-1), its previously-uncounted twin, and the `test_w51_ex_div_
+assignment.py` local-midnight fixture bug (open since CENSUS-2, re-confirmed reproducing
+in CENSUS-3). Phase B: the 2 remaining new offender sites named in CENSUS-3's closing
+entry, needing real behavioral rewrites. Research for the harder Phase B sites used one
+Explore agent, with every load-bearing claim (event-name strings, the jade_lizard
+annotation block's exact shape, the cross-import pattern) independently re-verified by
+direct read before trusting it in the plan — two-lens verification, not agent-report-as-
+fact.
+
+**PHASE A — 4 fixes, 3 files:**
+1. `test_r16_tail_fixes.py:591` (`TestMetaLabelQuarantine.test_model_dir_is_repo_
+   anchored`) and `test_r16_research_fixes.py:183` (`TestDirectionPredictorFence.
+   test_module_model_dir_is_repo_anchored_absolute`, the previously-uncounted twin) —
+   both rewritten to compare the REAL `MODEL_DIR` constant against an independently-
+   computed repo-anchored path. **Discovered mid-implementation**: a plain in-process
+   comparison doesn't work here — `tests/conftest.py`'s autouse `_isolate_model_
+   artifacts` fixture monkeypatches `MODEL_DIR` to `tmp_path` on EVERY test (by design,
+   to fence real model-artifact writes), so the live in-process attribute can never show
+   the real value. This is actually *why* the original getsource-based tests existed —
+   they were dodging the fixture by reading source text instead of the (permanently
+   patched) live attribute. Fixed by using a bare subprocess import (same technique
+   CENSUS-3's site 3 already established for `ait.main` — no pytest, no conftest.py, no
+   fixture interference), printing whether `MODEL_DIR == Path(__file__).resolve().
+   parents[3] / "models"` computed fresh inside the child process.
+2. `test_r15_review_fixes.py:297` (`TestPreEventBlackoutRelaxed.
+   test_engine_parity_uses_config_default`) — rewritten to construct a real `Backtester`
+   and check `bt._pre_event_blackout_days` directly: once at the default (must equal
+   `RiskConfig().pre_event_blackout_days`) and once with an explicit override (`7`, must
+   be respected). Needed the `_engine_kwargs`/`synth_df`/`synth_features` cross-import
+   added to this file (it had none before).
+3. `test_w51_ex_div_assignment.py` — the actual bug fix (test-file-only, no `src/ait`
+   change; the bug was always in the test fixture). `_manager()` and `_condor()` both
+   built dates via local `date.today()`; changed both to `ait.utils.time.today_et()`,
+   matching what the production code they exercise (`portfolio.py:901`) actually reads.
+
+**PHASE B — 3 rewrites, 2 files:**
+4. `test_r16_tail_fixes.py:166` (`test_drawdown_gate_is_not_iron_condor_only`) —
+   rewritten to drive the REAL `engine.run()` drawdown-from-60d-high veto for
+   `short_strangle` (a non-iron_condor `NEUTRAL_CREDIT_GATED` arm), asserting the real
+   `drawdown_veto_fired` structlog event plus a control run (default threshold, disabled)
+   that trades strictly more. `synth_df`'s natural pullbacks were enough — no crafted
+   drawdown series needed, per the Explore agent's finding (independently confirmed: the
+   test passed clean on the first try).
+5. `test_r16_tail_fixes.py:224` (`test_annotation_block_sets_legs_credit_and_max_loss`)
+   — rewritten to drive `engine.run()` for `jade_lizard` end-to-end and assert on the
+   REAL trade dicts `res.trades` books (`legs`/`credit`/`max_loss`), instead of hand-
+   replicating the expected shape in the test body. Confirmed by direct read of the
+   annotation block (`engine.py:1037-1055`) before writing the test, not taken on the
+   agent's word.
+6. `test_r16_research_fixes.py:602` (`test_all_six_dispatch_sites_use_shared_tuple`) —
+   the user chose the full 6-gate-matrix depth over a pragmatic fallback. Split into a
+   parametrized test over 5 real veto dispatch sites (`engine.py:634/766/791/835/860` —
+   hurst hard veto, regime veto, range gate, vol gate, iv-rank-rise veto; a 6th line-885
+   "hit" is a comment, not a real site, further confirming the old `src.count(...) >= 6`
+   check was already foolable) each forced to fire via its own constructor knob or a
+   features-cache override, asserting the matching structlog event AND zero trades; plus
+   one standalone test for the 6th dispatch site (`engine.py:661`, the direction-
+   confidence-gate BYPASS for neutral arms — a structurally different claim, "trades
+   still happen despite `min_confidence=0.99`", not a veto). **Bug found and fixed during
+   implementation, twice**: the first draft (features-cache overrides broadcast across
+   every row, no `eval_start_date`) let 3 of the 5 vetoes leak trades through on early
+   days — `features_df` is empty before enough history exists, so the regime/hurst
+   blocks are structurally SKIPPED (not merely non-triggering) on those days, letting an
+   unvetoed trade through before the override could ever apply. Fixed with
+   `eval_start_date=synth_features.index[0].date()`; the iv-rank case STILL leaked 2
+   trades after that fix, because it additionally needs `len(features_df) >= 11` before
+   it evaluates at all — pushed to `index[15]` to clear both margins. Both fixes
+   confirmed by re-running, not assumed correct after the first partial fix.
+
+**PROOF.** All 4 touched files together: `test_r16_tail_fixes.py` (79, unchanged),
+`test_r16_research_fixes.py` (44, up from 39 — the 6-gate matrix nets +5: 6 new tests
+replacing 1 old one), `test_r15_review_fixes.py` (27, unchanged), `test_w51_ex_div_
+assignment.py` (24, unchanged) — 174/174. Every rewrite mutation-checked against real,
+reverted `src/ait` edits: both `MODEL_DIR` sites (dropped `parents[3]`, confirmed both
+fail, reverted); `_pre_event_blackout_days` (hardcoded to `4`, confirmed fail, reverted);
+the drawdown gate (restricted back to `strategy == "iron_condor"` only, confirmed fail,
+reverted); the jade_lizard annotation (disabled the dispatch condition, confirmed fail,
+reverted); 3 of the 6 matrix gates — hurst hard veto, vol gate, AND the direction-gate
+bypass (all `continue`/branch conditions individually neutralized, each confirmed to
+fail its own parametrized case, each reverted) — one more than the plan's stated minimum
+of 2, since the bypass case is a structurally different assertion shape worth its own
+proof. `git diff --stat src/ait` empty after every single revert, confirmed before
+moving to the next site each time. Sibling re-run (`test_r20_research_validity.py`,
+`test_post_event_study_injection.py`, `test_take_profit_study_injection.py`,
+`test_w52a_engine_store_path.py` — files depending on the same shared `synth_df`/
+`_engine_kwargs` harness): 80/80. `python -m compileall -q src tests`: OK.
+
+**CENSUS RECOUNT — closes the register.** Same reconciliation as every prior batch:
+**7 real `inspect.getsource()` sites remain, all on the already-confirmed "leave alone"
+list, nothing else outstanding** — `test_r16_tail_fixes.py:346` (was `:314`) and `:735`
+(was `:679`), `test_r16_round2_fixes.py:61/188`, `test_r20_research_validity.py:202`,
+`test_r16_risk_fixes.py:624`, `test_w20_host_clock_and_calendar_faults.py:325`. Every
+one is an absence/AST check the census has independently confirmed legitimate at least
+once already this session — none needs further action, ever. **The `inspect.getsource`
+"assert on source text" anti-pattern this whole census tracked is retired from the
+suite.**
+
+Full fast lane after this batch: **2520 passed / 1 failed / 46 skipped / 153 deselected,
+797.03s (13m17s)**. The one failure is the standing `AIT_MARKET_DATA_TYPE` env
+divergence, present in literally every fast-lane run this session. `test_watchdog.py`'s
+pair AND `test_w51_ex_div_assignment.py`'s previously-failing case are BOTH clean this
+run — the ex-div fix's own proof. Count check: pre-batch baseline (CENSUS-3's fast lane)
+was 2515+2+45+153=2715 total outcomes. This run: 2520+1+46+153=2720 — a delta of exactly
++5, matching Phase B's own net collected-test change precisely (the +1 skip-vs-run swap
+between runs is unrelated environment noise, not a test-count change).
+
+STATE AT HANDOFF. Test-file-only changes across 4 files; zero `src/ait` files differ
+from HEAD (every mutation made during verification was reverted before moving to the
+next site). Zero config changes. Nothing to deploy or restart.
+
+NEXT, naming every open item explicitly: the `inspect.getsource` census (all 6 batches:
+CENSUS-1 through CENSUS-6, plus this cleanup pass) is **closed** — nothing further to
+scope there. Still fully open, unrelated to the census: the `_run_override_block`
+follow-up (`test_r17_dormant_strategy_fixes.py:64-74`); **W53's placing run** and
+**W55's live validation run**, both waiting on TWS reachable during an RTH session;
+**W54** waiting on the operator; **W56/57**; **W52a's four items**; the dormant
+`get_chain_for_expiry` bug; **`test_watchdog.py`**'s load-sensitivity discrepancy (clean
+this run, still unresolved/unchased overall).
+
+No inspect.getsource in any of the 6 rewritten tests — all now drive real code paths,
+mutation-verified above.
+
+---

@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import pickle
+from contextlib import contextmanager
 from datetime import date, timedelta
 from types import SimpleNamespace
 
@@ -50,6 +51,19 @@ from tests.test_r20_research_validity import (  # noqa: F401 — shared harness
     _recorder_factory,
     _run_window,
 )
+
+
+@contextmanager
+def structlog_events():
+    """Capture structlog events regardless of level (setup_logging() is
+    never called under pytest, so caplog sees nothing)."""
+    from structlog.testing import capture_logs
+    with capture_logs() as events:
+        yield events
+
+
+def _has_event(events, name: str) -> bool:
+    return any(e.get("event") == name for e in events)
 
 
 # ---------------------------------------------------------------------------
@@ -178,16 +192,36 @@ class _DummyModel:
 
 class TestDirectionPredictorFence:
     def test_module_model_dir_is_repo_anchored_absolute(self):
-        import ait.ml.ensemble as ens
-
-        src = inspect.getsource(ens)
-        assert 'Path(__file__).resolve().parents[3] / "models"' in src, (
-            "MODEL_DIR must be repo-anchored, never CWD-relative"
-        )
-        # parents[3] of src/ait/ml/ensemble.py is the repo root (trade_v2)
+        """CENSUS-6 (2026-09-28): compares the REAL MODEL_DIR constant
+        against an independently-computed repo-anchored path, in a bare
+        subprocess import -- NOT by grepping the module's source (the twin
+        of test_r16_tail_fixes.py's meta_label.MODEL_DIR check, same reason
+        a subprocess is needed: tests/conftest.py's autouse
+        `_isolate_model_artifacts` fixture monkeypatches MODEL_DIR to
+        tmp_path on every in-process test)."""
+        import os
+        import subprocess
+        import sys
         from pathlib import Path
 
-        expected = Path(ens.__file__).resolve().parents[3] / "models"
+        repo_root = Path(__file__).resolve().parents[1]
+        expected = repo_root / "models"
+        code = (
+            "from pathlib import Path\n"
+            "import ait.ml.ensemble as m\n"
+            "expected = Path(m.__file__).resolve().parents[3] / 'models'\n"
+            "print(m.MODEL_DIR == expected)\n"
+        )
+        env = {**os.environ, "PYTHONPATH": str(repo_root / "src")}
+        result = subprocess.run(
+            [sys.executable, "-c", code], cwd=repo_root, env=env,
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "True", (
+            f"ensemble.MODEL_DIR is not repo-anchored: {result.stdout!r}"
+        )
+        # parents[3] of src/ait/ml/ensemble.py is the repo root (trade_v2)
         assert expected.is_absolute()
         assert expected.parts[-1] == "models"
         assert (expected.parent / "src" / "ait" / "ml").is_dir()
@@ -598,14 +632,67 @@ class TestNeutralGateDispatch:
                   "broken_wing_condor", "short_strangle"):
             assert s in NEUTRAL_CREDIT_GATED
 
-    def test_all_six_dispatch_sites_use_shared_tuple(self):
-        src = inspect.getsource(Backtester.run)
-        assert src.count("NEUTRAL_CREDIT_GATED") >= 6, (
-            "hurst veto, direction-gate bypass, regime veto, range gate, "
-            "vol gate, and iv-rank-rise veto must all dispatch on the shared set"
+    _SIX_GATE_CASES = [
+        ("hurst_hard_veto",
+         dict(hurst_regime_threshold=0.01, hurst_hard_veto_multiplier=1.0),
+         {"hurst_scale_spread": 0.9}, "hard_veto_fired"),
+        ("regime_veto", {},
+         {"vol_regime_expanding": 1.0, "price_vs_sma_20": -0.10},
+         "regime_veto_fired"),
+        ("range_gate", dict(range_min_confidence=1.0), {},
+         "range_gate_blocked_no_predictor"),
+        ("vol_gate", dict(max_entry_vol_annual=0.0), {}, "vol_gate_skip"),
+        ("iv_rank_veto", dict(iv_rank_rise_threshold=-10.0), {},
+         "iv_rank_veto_fired"),
+    ]
+
+    @pytest.mark.parametrize(
+        "name,overrides,feature_overrides,event", _SIX_GATE_CASES,
+        ids=[c[0] for c in _SIX_GATE_CASES])
+    def test_five_veto_dispatch_sites_fire_for_real(
+            self, synth_df, synth_features, name, overrides,
+            feature_overrides, event):
+        """CENSUS-6 (2026-09-28): 5 of the 6 real NEUTRAL_CREDIT_GATED
+        dispatch sites (engine.py:634/766/791/835/860), each forced to
+        VETO for real via its own constructor knob or a features-cache
+        override, asserting the matching structlog event and zero trades
+        -- instead of counting occurrences of the tuple's NAME in run()'s
+        source (already foolable by a comment mentioning it)."""
+        f = synth_features.copy()
+        for col, val in feature_overrides.items():
+            f[col] = val
+        kw = _engine_kwargs(
+            synth_df, synth_features, strategies=["jade_lizard"],
+            features_cache=f,
+            # Days before enough history exists get an empty features_df (or,
+            # for the iv-rank check specifically, fewer than the 11 rows it
+            # needs), which SKIPS these gates entirely (not merely "doesn't
+            # veto") -- letting an early trade slip through before the
+            # override could ever apply. index[15] clears both margins.
+            eval_start_date=synth_features.index[15].date(),
+            **overrides)
+        with structlog_events() as events:
+            res = Backtester(**kw).run()
+        assert _has_event(events, event), (
+            f"{name}: expected {event!r} to fire and it never did"
         )
-        # No stale hand-rolled tuple may remain in the entry loop
-        assert '"broken_wing_condor", "short_strangle")' not in src
+        assert res.total_trades == 0, (
+            f"{name}: a vetoed run should never book a trade"
+        )
+
+    def test_sixth_site_direction_gate_bypassed_for_neutral_arm(
+            self, synth_df, synth_features):
+        """The 6th dispatch site (engine.py:661) is a BYPASS, not a veto: a
+        NEUTRAL_CREDIT_GATED arm must still trade despite a directional
+        min_confidence floor no real signal could clear."""
+        kw = _engine_kwargs(
+            synth_df, synth_features, strategies=["jade_lizard"],
+            min_confidence=0.99)
+        res = Backtester(**kw).run()
+        assert res.total_trades > 0, (
+            "direction-confidence gate must be bypassed for a "
+            "NEUTRAL_CREDIT_GATED arm, not silently applied"
+        )
 
     def test_shadow_arms_now_trade(self, synth_df, synth_features):
         # Pre-fix these arms produced ZERO trades: NEUTRAL@0.4 from

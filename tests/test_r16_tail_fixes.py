@@ -41,6 +41,11 @@ from ait.backtesting import engine as _engine
 from ait.backtesting.engine import Backtester
 from ait.data.options_chain import OptionContract, OptionsChain
 from ait.strategies import base as _base
+from tests.test_r20_research_validity import (  # noqa: F401 — shared fixtures
+    _engine_kwargs,
+    synth_df,
+    synth_features,
+)
 
 
 @contextmanager
@@ -162,13 +167,36 @@ class TestPatchedCreditBuilders:
         NEUTRAL signals, so it belongs to the same entry population."""
         assert strategy in _engine.NEUTRAL_CREDIT_GATED
 
-    def test_drawdown_gate_is_not_iron_condor_only(self):
-        src = inspect.getsource(Backtester.run)
-        assert "_pct_from_60d_high_threshold > -0.99" in src
-        assert 'strategy == "iron_condor" and self._pct_from_60d_high_threshold' not in src, (
-            "drawdown-from-60d-high gate is back to iron_condor-only: the "
-            "baseline arm would carry a veto the condor-family arms skip"
+    def test_drawdown_gate_is_not_iron_condor_only(self, synth_df, synth_features):
+        """CENSUS-6 (2026-09-28): drives the REAL engine.run() drawdown-from-
+        60d-high veto for a non-iron_condor NEUTRAL_CREDIT_GATED arm, instead
+        of grepping run()'s source for the threshold literal and the absence
+        of an iron_condor-only condition. synth_df's natural pullbacks are
+        enough to trip the veto once activated -- no crafted series needed."""
+        active = _engine_kwargs(
+            synth_df, synth_features, strategies=["short_strangle"],
+            pct_from_60d_high_threshold=-0.03)
+        with structlog_events() as events:
+            active_res = Backtester(**active).run()
+        assert _has_event(events, "drawdown_veto_fired"), (
+            "drawdown-from-60d-high gate never fired for short_strangle -- "
+            "gate is back to iron_condor-only"
         )
+        fired = [e for e in events if e.get("event") == "drawdown_veto_fired"]
+        assert all(e.get("strategy") == "short_strangle" for e in fired)
+        for t in active_res.trades:
+            if "pct_from_60d_high" in t.get("decision", {}):
+                assert t["decision"]["pct_from_60d_high"] >= -0.03
+
+        # Control: gate disabled (default threshold) must not veto and must
+        # trade strictly more -- proves the active run wasn't vetoing for
+        # some unrelated reason.
+        control = _engine_kwargs(
+            synth_df, synth_features, strategies=["short_strangle"])
+        with structlog_events() as control_events:
+            control_res = Backtester(**control).run()
+        assert not _has_event(control_events, "drawdown_veto_fired")
+        assert control_res.total_trades > active_res.total_trades
 
     def test_contracts_below_one_is_attributable_not_silent(self):
         """The budget gate is intentional policy; being SILENT about it is what
@@ -218,24 +246,28 @@ class TestJadeLizardDispatch:
         assert pos is not None
         return pos
 
-    def test_annotation_block_sets_legs_credit_and_max_loss(self):
-        """Previously fell to the else -> legs=[] and NO credit/max_loss keys,
+    def test_annotation_block_sets_legs_credit_and_max_loss(
+            self, synth_df, synth_features):
+        """CENSUS-6 (2026-09-28): drives the REAL engine.run() end-to-end for
+        jade_lizard and asserts on the REAL trade dicts it books, instead of
+        grepping run()'s source for the dispatch condition and hand-
+        replicating the expected legs/credit/max_loss shape in the test.
+        Previously fell to the else -> legs=[] and NO credit/max_loss keys,
         so result.py fell back to `abs(pnl)*2` as the risk proxy."""
-        src = inspect.getsource(Backtester.run)
-        assert 'pos.get("strategy") == "jade_lizard"' in src
-
-        # Replicate the annotation the run loop applies.
-        pos = self._pos()
-        ep = pos["entry_price"]
-        contracts = pos["contracts"]
-        legs = [
-            {"type": "short_put",  "strike": pos["short_put_strike"]},
-            {"type": "short_call", "strike": pos["short_call_strike"]},
-            {"type": "long_call",  "strike": pos["long_call_strike"]},
-        ]
-        assert len(legs) == pos["n_legs"] == 3
-        assert round(ep * 100 * contracts, 2) > 0
-        assert pos["max_loss_per_share"] > 0
+        res = Backtester(**_engine_kwargs(
+            synth_df, synth_features, strategies=["jade_lizard"],
+            range_min_confidence=0.55)).run()
+        assert res.trades, "jade_lizard never traded on this harness"
+        for t in res.trades:
+            assert [leg["type"] for leg in t["legs"]] == [
+                "short_put", "short_call", "long_call"]
+            assert t["legs"][0]["strike"] == t["short_put_strike"]
+            assert t["legs"][1]["strike"] == t["short_call_strike"]
+            assert t["legs"][2]["strike"] == t["long_call_strike"]
+            contracts = t["contracts"]
+            assert t["credit"] == round(t["entry_price"] * 100 * contracts, 2) > 0
+            assert t["max_loss"] == round(
+                t["max_loss_per_share"] * 100 * contracts, 2) > 0
 
     def test_macro_flatten_covers_the_naked_put_side(self, monkeypatch):
         """jade_lizard carries a NAKED short put — the 'wings cap the surprise'
@@ -587,10 +619,34 @@ class TestMetaLabelQuarantine:
     way — these tests assert observability and refusal, never re-arming."""
 
     def test_model_dir_is_repo_anchored(self):
-        import ait.ml.meta_label as _ml
-        src = inspect.getsource(_ml)
-        assert 'MODEL_DIR = Path("models")' not in src
-        assert "parents[3]" in src
+        """CENSUS-6 (2026-09-28): compares the REAL MODEL_DIR constant
+        against an independently-computed repo-anchored path, in a bare
+        subprocess import -- NOT by grepping the module's source. A plain
+        in-process import can't prove this: tests/conftest.py's autouse
+        `_isolate_model_artifacts` fixture monkeypatches MODEL_DIR to
+        tmp_path on every test (by design, to fence real model-artifact
+        writes), so the live in-process attribute never shows the real
+        value; a subprocess import has no such fixture running."""
+        import os
+        import subprocess
+        import sys
+
+        repo_root = Path(__file__).resolve().parents[1]
+        code = (
+            "from pathlib import Path\n"
+            "import ait.ml.meta_label as m\n"
+            "expected = Path(m.__file__).resolve().parents[3] / 'models'\n"
+            "print(m.MODEL_DIR == expected)\n"
+        )
+        env = {**os.environ, "PYTHONPATH": str(repo_root / "src")}
+        result = subprocess.run(
+            [sys.executable, "-c", code], cwd=repo_root, env=env,
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "True", (
+            f"meta_label.MODEL_DIR is not repo-anchored: {result.stdout!r}"
+        )
 
     def test_missing_artifact_logs_at_error(self, tmp_path, monkeypatch):
         import ait.ml.meta_label as _ml

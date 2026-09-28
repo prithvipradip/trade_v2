@@ -19,6 +19,11 @@ from ait.execution.executor import TradeExecutor
 from ait.execution.reconciler import PositionReconciler
 from ait.risk.circuit_breaker import CircuitBreaker
 from ait.risk.position_sizer import PositionSizer
+from tests.test_r20_research_validity import (  # noqa: F401 — shared fixtures
+    _engine_kwargs,
+    synth_df,
+    synth_features,
+)
 
 
 # [1] intrinsic expiry booking: single-leg DEBIT must synthesize a BUY leg
@@ -290,13 +295,19 @@ class TestPreEventBlackoutRelaxed:
         from ait.config.settings import RiskConfig
         assert RiskConfig().pre_event_blackout_days == 1
 
-    def test_engine_parity_uses_config_default(self):
-        # the backtest gate must read the SAME default (no drifting constant)
-        import inspect
-        from ait.backtesting import engine
-        src = inspect.getsource(engine)
-        assert "pre_event_blackout_days" in src
-        assert "_d2e <= 4" not in src
+    def test_engine_parity_uses_config_default(self, synth_df, synth_features):
+        """CENSUS-6 (2026-09-28): checks the REAL Backtester attribute
+        against RiskConfig()'s default and an explicit override, instead of
+        grepping engine.py's source for the presence of the config-reading
+        call and the absence of a hardcoded "_d2e <= 4"."""
+        from ait.config.settings import RiskConfig
+
+        bt = Backtester(**_engine_kwargs(synth_df, synth_features))
+        assert bt._pre_event_blackout_days == RiskConfig().pre_event_blackout_days
+
+        bt_override = Backtester(
+            **_engine_kwargs(synth_df, synth_features, pre_event_blackout_days=7))
+        assert bt_override._pre_event_blackout_days == 7
 
     def test_two_days_out_no_longer_blocked(self):
         from ait.config.settings import RiskConfig

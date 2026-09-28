@@ -44,6 +44,7 @@ from ait.config.settings import ExitConfig
 from ait.data.dividends import DividendCalendar, DividendInfo
 from ait.data.market_data import Quote
 from ait.execution.portfolio import PortfolioManager
+from ait.utils.time import today_et
 
 CONDOR_LEGS = json.dumps([
     {"strike": 95.0, "right": "P", "action": "BUY", "expiry": "2026-12-18"},
@@ -182,7 +183,12 @@ def _manager(spot: float, next_ex_div_days: int | None, dividend_amount: float |
     if next_ex_div_days is None:
         _next_date = None
     else:
-        _next_date = date.today() + timedelta(days=next_ex_div_days)
+        # CENSUS-6 (2026-09-28): days_to_ex_div is computed against
+        # today_et() (portfolio.py:901), not local wall-clock -- date.today()
+        # here diverges from it whenever local time has crossed midnight but
+        # ET hasn't yet, producing a spurious off-by-one that made this
+        # fixture flaky near local midnight.
+        _next_date = today_et() + timedelta(days=next_ex_div_days)
     dividends = MagicMock()
     dividends.get_next_ex_div.return_value = DividendInfo(
         symbol="SPY", next_ex_div_date=_next_date,
@@ -199,7 +205,7 @@ def _manager(spot: float, next_ex_div_days: int | None, dividend_amount: float |
 
 
 def _condor(dte: int, entry_price: float = 1.00) -> _FakeTrade:
-    t = _FakeTrade(expiry=(date.today() + timedelta(days=dte)).isoformat(),
+    t = _FakeTrade(expiry=(today_et() + timedelta(days=dte)).isoformat(),
                   entry_price=entry_price)
     t.direction = SimpleNamespace(value="neutral")
     return t
