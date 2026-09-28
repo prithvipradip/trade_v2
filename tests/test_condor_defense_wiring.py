@@ -96,22 +96,49 @@ def _manager(spot: float, unrealized: float, *, condor_defense_config=None) -> P
     return mgr
 
 
-class TestDecisionOnlyWiring:
-    """The centerpiece: should_exit is untouched by condor_defense, for
-    BOTH CLOSE and ROLL verdicts -- the operator's explicit decision-only
-    choice this wave."""
+class TestCloseIsActionable:
+    """CLOSE is now folded into should_exit -- reuses the existing,
+    already-audited close path, exactly like every other exit rule. ROLL
+    stays decision-only (TestDecisionOnlyWiring below)."""
 
-    async def test_close_verdict_never_sets_should_exit(self, monkeypatch):
+    async def test_close_verdict_sets_should_exit(self, monkeypatch):
         monkeypatch.setenv("AIT_CREDIT_TOUCH_STOP", "1")
         trade, marks, dte = _put_tested_condor(0.45, 18)  # >= close_delta_threshold
         mgr = _manager(SPOT, unrealized=5.0,
                        condor_defense_config=CondorDefenseConfig(enabled=True))
         trade.expiry = _expiry_for_dte(dte)
         status = await mgr._evaluate_position(trade, marks)
-        assert status.should_exit is False, "decision-only: CLOSE must never set should_exit"
+        assert status.should_exit is True
+        assert "condor_defense_close" in status.exit_reason
+        assert "tested_side=P" in status.exit_reason
         assert status.action == PositionAction.CLOSE
         assert status.roll_side is None
-        assert status.action_reason == "condor_defense_close_delta_threshold"
+        assert status.action_reason is None, \
+            "action_reason is reserved for the decision-only ROLL case now"
+
+    async def test_close_verdict_vetoed_by_pdt_reports_hold_not_close(self, monkeypatch):
+        """The direct regression guard for a real design issue found while
+        implementing this: folding CLOSE into should_exit means rule 5's
+        PDT veto (further down _evaluate_position) can reset should_exit
+        back to False for THIS close too -- the return site must reflect
+        that (action=HOLD), not report a stale CLOSE that didn't actually
+        happen."""
+        monkeypatch.setenv("AIT_CREDIT_TOUCH_STOP", "1")
+        trade, marks, dte = _put_tested_condor(0.45, 18)
+        mgr = _manager(SPOT, unrealized=5.0,
+                       condor_defense_config=CondorDefenseConfig(enabled=True))
+        mgr._pdt_guard.would_be_day_trade.return_value = True
+        mgr._pdt_guard.can_day_trade.return_value = False
+        trade.expiry = _expiry_for_dte(dte)
+        status = await mgr._evaluate_position(trade, marks)
+        assert status.should_exit is False
+        assert status.exit_reason == "exit_blocked_by_pdt"
+        assert status.action == PositionAction.HOLD
+        assert status.action_reason is None
+
+
+class TestDecisionOnlyWiring:
+    """ROLL stays decision-only -- it has no executor yet (W57)."""
 
     async def test_roll_untested_verdict(self, monkeypatch):
         monkeypatch.setenv("AIT_CREDIT_TOUCH_STOP", "1")

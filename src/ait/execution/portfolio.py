@@ -999,25 +999,41 @@ class PortfolioManager:
                 # dte<=1, expiry) still apply as a backstop.
                 log.warning("ex_div_check_failed", symbol=trade.symbol, error=str(e))
 
-        # W56 wiring: tested/untested condor defense -- a DECISION-ONLY
-        # verdict, never should_exit. Gated on not should_exit so a
-        # position some OTHER rule already wants to close never gets a
-        # redundant/confusing verdict logged alongside it (getattr-guarded:
+        # W56 wiring: tested/untested condor defense. Gated on not should_exit
+        # so a position some OTHER rule already wants to close never gets a
+        # redundant/confusing verdict computed alongside it (getattr-guarded:
         # tests constructing via __new__ don't set _condor_defense_config,
         # same convention rule 3e's _dividends guard above uses).
         # evaluate_condor_defense already handles enabled=False and
         # non-iron_condor strategies internally (HOLD either way) -- no
         # need to duplicate those guards here.
-        condor_action = PositionAction.HOLD
+        #
+        # CLOSE is ACTIONABLE: folded into should_exit/exit_reason exactly
+        # like every other rule, reusing the existing, already-audited close
+        # path -- no new executor code. Deliberately NOT captured as a local
+        # override consulted at the return site: rule 5's PDT veto below can
+        # still reset should_exit=False for this close the same as any
+        # other, and the return site's normal should_exit-based derivation
+        # then correctly reports HOLD instead of a stale CLOSE that didn't
+        # actually happen.
+        #
+        # ROLL stays DECISION-ONLY -- it has no executor yet (W57) -- via
+        # condor_roll_side/condor_action_reason, never should_exit.
         condor_roll_side: str | None = None
         condor_action_reason: str | None = None
         if not should_exit and getattr(self, "_condor_defense_config", None):
             verdict = evaluate_condor_defense(
                 trade, option_marks or {}, current_price, dte, self._condor_defense_config,
             )
-            if verdict.action != DefenseAction.HOLD:
-                condor_action = _map_condor_defense_action(verdict.action)
-                condor_roll_side = verdict.tested_side if condor_action == PositionAction.ROLL else None
+            mapped = _map_condor_defense_action(verdict.action)
+            if mapped == PositionAction.CLOSE:
+                should_exit = True
+                exit_reason = (
+                    f"condor_defense_close (tested_side={verdict.tested_side}, "
+                    f"delta={verdict.tested_short_delta:.2f})"
+                )
+            elif mapped == PositionAction.ROLL:
+                condor_roll_side = verdict.tested_side
                 condor_action_reason = f"condor_defense_{verdict.reason}"
 
         # 4. Check for partial exit milestones (only if not already exiting
@@ -1076,7 +1092,7 @@ class PortfolioManager:
             exit_reason=exit_reason,
             partial_exit_quantity=partial_exit_quantity,
             marks_missing=marks_missing,
-            action=(condor_action if condor_action != PositionAction.HOLD
+            action=(PositionAction.ROLL if condor_roll_side is not None
                     else _derive_position_action(should_exit, partial_exit_quantity)),
             roll_side=condor_roll_side,
             action_reason=condor_action_reason,

@@ -12140,3 +12140,110 @@ No inspect.getsource — every new test drives the real `_map_condor_defense_act
 real `_evaluate_position`, never asserts on source strings.
 
 ---
+
+## 2026-09-28 - MADE ACTIONABLE — condor_defense's CLOSE verdict now sets should_exit; ROLL
+stays decision-only, a real PDT-interaction bug found and fixed during design
+
+SCOPE, per the operator's explicit choice: the just-shipped wiring (immediately above) was
+fully decision-only for both CLOSE and ROLL. This wave activates ONLY the CLOSE arm — a
+tested-short delta ≥ `close_delta_threshold` (0.40 by default) now sets `should_exit=True`
+and reuses the existing, already-audited close path, the SAME mechanism every other exit
+rule (touch stop, take-profit, assignment risk, ...) already uses for iron condors. No new
+executor code anywhere. ROLL is untouched — still fully decision-only, since it has no
+executor at all (that remains W57's own, separately-scoped, much larger job from the
+original roadmap sizing table; not to be confused with this CLOSE-only change).
+
+**Real consequence, stated plainly**: once an operator flips `condor_defense.enabled` to
+`True` in `config.yaml` (still `false` today, unchanged by this wave), a tested short
+crossing 0.40 delta will cause a REAL close order on a live/paper iron condor. This wave
+changes no default, no config, and no currently-running behavior — only what a future
+explicit opt-in would do. The live bot was NOT restarted.
+
+**A REAL DESIGN ISSUE FOUND WHILE IMPLEMENTING THIS, not from a live bug**: the condor_
+defense call site sits between rule 3e and rule 4, but rule 5 (further down) can reset
+`should_exit=False`/`exit_reason="exit_blocked_by_pdt"` when a day-trade would occur. The
+first draft captured a local `condor_action` before rule 5 ran and used IT (not the final
+`should_exit`) at the return site to decide `PositionStatus.action` — meaning a PDT-vetoed
+condor_defense close would have reported `action=CLOSE` while `should_exit` was actually
+`False`: a false report of a close that never happened. Fixed structurally, not patched:
+CLOSE is no longer captured as a pre-veto override at all — it's folded into `should_exit`/
+`exit_reason` directly at the call site, exactly like every other rule, so the return
+site's normal `should_exit`-based derivation (`_derive_position_action`) automatically
+reflects a later PDT veto the same way it already does for every other exit rule. ROLL
+(which never touches `should_exit`) is unaffected by this issue and needed no such fix.
+
+DESIGN. `src/ait/execution/portfolio.py`'s condor_defense call site (`:1002-1036`): maps
+the verdict via the already-existing `_map_condor_defense_action` (now genuinely
+consumed, not orphaned); on `PositionAction.CLOSE`, sets `should_exit = True` and
+`exit_reason = f"condor_defense_close (tested_side={verdict.tested_side},
+delta={verdict.tested_short_delta:.2f})"` — same shape as every other rule's exit_reason
+(a code plus inline data, matching `assignment_risk`'s `(short {side} ITM, ...)` /
+`take_profit_short`'s `(P&L: ...)` style). On `PositionAction.ROLL`, behavior is
+UNCHANGED from the prior wave — `condor_roll_side`/`condor_action_reason` set,
+`should_exit` never touched. At the return site: `action = (PositionAction.ROLL if
+condor_roll_side is not None else _derive_position_action(should_exit,
+partial_exit_quantity))` — no CLOSE-specific branch at all now, since CLOSE flows through
+the normal derivation exactly like a touch stop or take-profit would.
+`action_reason` is now reserved exclusively for the decision-only ROLL case — a real
+CLOSE (from condor_defense or any other rule) is fully described by `exit_reason`, matching
+how every other real exit already works.
+
+PROOF. `tests/test_condor_defense_wiring.py`, 13 tests (12 prior, one rewritten in place +
+one new — net +1): `TestCloseIsActionable` (renamed from `TestDecisionOnlyWiring`'s CLOSE
+half) — `test_close_verdict_sets_should_exit` now asserts `should_exit is True`,
+`exit_reason` contains `"condor_defense_close"` and `"tested_side=P"`, `action == CLOSE`,
+`action_reason is None`. **`test_close_verdict_vetoed_by_pdt_reports_hold_not_close`** — the
+direct regression guard for the design issue above, not just a description of the fix: a
+PDT-blocked condor_defense close asserts `should_exit is False`, `exit_reason ==
+"exit_blocked_by_pdt"`, and critically **`action == HOLD`, not CLOSE** — proving the return
+site no longer reports a close that didn't happen. `TestDecisionOnlyWiring` (ROLL only
+now) and `TestFallsThroughToPlainDerivation`'s 5 tests: unchanged, still pass, confirming
+ROLL and every HOLD-producing path are untouched.
+
+Mutation-checked 2 mechanisms (temporarily broken, confirmed the intended test failed for
+the predicted reason, reverted; `git diff --stat` confirmed clean after both): reverting
+the CLOSE branch to decision-only (not touching `should_exit`) broke `test_close_verdict_
+sets_should_exit` exactly as predicted; reintroducing the stale-pre-veto-capture bug (a
+`condor_wants_close` flag read at the return site instead of the final `should_exit`)
+broke `test_close_verdict_vetoed_by_pdt_reports_hold_not_close` exactly as predicted —
+reproducing the EXACT bug this design avoids, not a synthetic stand-in for it.
+
+**Full regression surface — 380/380, zero new failures** (379 prior + net +1): the same
+311 `portfolio.py` files, `test_position_action_output.py` (13), `test_w56_condor_
+defense.py` (43, unchanged), `test_condor_defense_wiring.py` (13). `python -m compileall
+-q src tests`: OK. `python scripts/typecheck.py`: OK, zero attr-defined/call-arg/
+name-defined in `src/ait/{config,bot,execution,risk}`. `python scripts/smoke_deploy.py`:
+**SMOKE PASS (13 checks)** — confirms the real `config.yaml` (`condor_defense.enabled:
+false`, unchanged) and orchestrator construction still work end to end, no DB writes.
+
+Full fast lane: **2644 passed / 1 failed / 46 skipped / 153 deselected, 1118.31s
+(18m38s)** — the one failure is the same standing `test_r19_config_authority.py::
+TestContractIsTheSingleAuthority::test_applier_and_readers_share_one_table`
+(`AIT_MARKET_DATA_TYPE` divergence). Count check against the immediately-prior full fast
+lane (2643+1=2644): this run is 2644+1=2645 — a delta of exactly **+1**, matching the net
+test-count change precisely (one test rewritten, one added).
+
+STATE AT HANDOFF. `src/ait/execution/portfolio.py` (modified), `tests/test_condor_
+defense_wiring.py` (modified). Zero config changes — `condor_defense.enabled` is still
+`false` in `config.yaml`. **Live behavior is unchanged even after a restart**: with
+`enabled=False`, `evaluate_condor_defense` returns `HOLD`/`disabled` immediately for every
+position, same as before this wave and the one before it existed at all. The live bot was
+NOT restarted — the operator's own call, per CLAUDE.md's bot-restart-ownership rule,
+whenever they choose one for unrelated reasons. Flipping `enabled=True` for real, live use
+remains a separate, explicit, not-yet-made operator decision.
+
+NEXT, naming every open item explicitly: **ROLL still has no executor** — W57 (the
+roadmap's own larger, separately-scoped roll-a-vertical action wave), not touched or
+implied here. **W54's rule 3/3e wiring** — still needs the latency/cadence design the
+2026-09-27 scoping note flagged (`get_chain`'s 100s+ measured cost makes per-tick
+re-evaluation infeasible). **W53's placing run** — still needs explicit operator go-ahead
+plus a `flatten` commitment (confirmed this session: nothing auto-closes a successful
+fill). **W52a's four items** — deliberately registered. **The ongoing QQQ backfill** —
+operator-run, unaffected. **The surface-construction quality filter**, **the zero-bars
+inefficiency**, **the risk-free-rate script's Phase B connection-reuse note** — all
+unchanged.
+
+No inspect.getsource — every test drives the real `_map_condor_defense_action` and the
+real `_evaluate_position`, never asserts on source strings.
+
+---
