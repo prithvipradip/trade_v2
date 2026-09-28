@@ -49,44 +49,87 @@ class TestCapitalAtRiskForUndefinedRiskStrategies:
         assert TradingOrchestrator._position_capital_at_risk(_sig(400.0), 3) == 1200.0
 
 
+@pytest.fixture
+def rig(tmp_path, monkeypatch):
+    """Real orchestrator, fakes only at the I/O boundary -- the same rig
+    test_w2_orchestrator_gates.py uses to drive _scan_symbol for real."""
+    from tests.test_hot_path_smoke import build_smoke_orchestrator
+    monkeypatch.chdir(tmp_path)     # sandbox FIRST: __init__ writes data/*.db
+    smoke = build_smoke_orchestrator()
+    try:
+        yield smoke
+    finally:
+        smoke.restore()
+
+
+async def _scan_one(rig, monkeypatch, signal) -> list:
+    """Drive the real _scan_symbol with signal generation pinned, and return
+    the candidates it collected."""
+    from tests.test_hot_path_smoke import SYMBOL, VIX
+    monkeypatch.setattr(rig.orch._strategy_selector, "generate_all_signals",
+                        lambda **kw: [signal])
+    rig.orch._risk_budget = 3000.0
+    collected: list = []
+    await rig.orch._scan_symbol(SYMBOL, VIX, market_context={}, collect=collected)
+    await rig.drain_notifications()
+    return collected
+
+
+class _VolMagStub:
+    """Stands in for VolMagnitudePredictor at the model boundary (same idiom
+    as test_w2_orchestrator_gates.py's _RangeStub)."""
+
+    def __init__(self) -> None:
+        self.is_trained = True
+        self.calls = 0
+
+    def predict(self, hist, **kw):
+        self.calls += 1
+        return SimpleNamespace(probability_big_move=0.91, threshold_pct=0.05,
+                               horizon_days=5)
+
+
 class TestVolMagOverrideRespectsMasterGate:
-    def _orch(self, entry_gates_enabled: bool):
-        orch = TradingOrchestrator.__new__(TradingOrchestrator)
-        orch._settings = SimpleNamespace(ml=SimpleNamespace(
-            entry_gates_enabled=entry_gates_enabled))
-        orch._range_predictor = None
-        orch._vol_mag_predictor = MagicMock()
-        orch._vol_mag_predictor.is_trained = True
-        orch._vol_mag_predictor.predict.return_value = SimpleNamespace(
-            probability_big_move=0.91, threshold_pct=0.05, horizon_days=5)
-        return orch
+    """CENSUS-4 (2026-09-27) flagged _run_override_block, this class's own
+    former helper, as a second offender in this file: it hand-copied
+    (mirrored) the vol-mag override block from orchestrator.py's
+    _scan_symbol instead of calling it. Rewritten to drive the real
+    _scan_symbol via the same real-orchestrator rig
+    test_w2_orchestrator_gates.py's TestRangeGateFailsClosed already
+    established for the sibling range-model override."""
 
-    def _run_override_block(self, orch, signals):
-        """Drive exactly the vol-mag override block (mirrors the source)."""
-        model_overridden: set[str] = set()
-        if orch._vol_mag_predictor and orch._vol_mag_predictor.is_trained:
-            vm_pred = orch._vol_mag_predictor.predict(None, symbol="SPY", market_context={})
-            if vm_pred and orch._settings.ml.entry_gates_enabled:
-                for s in signals:
-                    if s.strategy_name == "long_straddle":
-                        s.confidence = vm_pred.probability_big_move
-                        model_overridden.add(s.strategy_name)
-        return model_overridden
+    async def test_override_applies_when_gates_enabled(self, rig, monkeypatch):
+        from tests.test_hot_path_smoke import iron_condor_signal
+        rig.orch._settings.ml.entry_gates_enabled = True
+        stub = _VolMagStub()
+        rig.orch._vol_mag_predictor = stub
+        sig = iron_condor_signal(confidence=0.5)
+        sig.strategy_name = "long_straddle"
 
-    def test_override_applies_when_gates_enabled(self):
-        orch = self._orch(entry_gates_enabled=True)
-        sig = SimpleNamespace(strategy_name="long_straddle", confidence=0.5)
-        overridden = self._run_override_block(orch, [sig])
-        assert "long_straddle" in overridden
+        collected = await _scan_one(rig, monkeypatch, sig)
+
+        assert collected, "long_straddle never reached the ranking pass"
+        assert stub.calls == 1, (
+            "the vol-mag model was never consulted -- a silently-skipped "
+            "block would look identical to a correctly-applied one"
+        )
         assert sig.confidence == pytest.approx(0.91)
+        assert "vol_mag_prediction" in rig.log.names()
 
-    def test_override_suppressed_when_gates_disabled(self):
-        # Pre-fix: this fired unconditionally regardless of the flag.
-        orch = self._orch(entry_gates_enabled=False)
-        sig = SimpleNamespace(strategy_name="long_straddle", confidence=0.5)
-        overridden = self._run_override_block(orch, [sig])
-        assert "long_straddle" not in overridden
-        assert sig.confidence == pytest.approx(0.5)
+    async def test_override_suppressed_when_gates_disabled(self, rig, monkeypatch):
+        # Pre-fix (R17): this fired unconditionally regardless of the flag.
+        from tests.test_hot_path_smoke import iron_condor_signal
+        rig.orch._settings.ml.entry_gates_enabled = False
+        stub = _VolMagStub()
+        rig.orch._vol_mag_predictor = stub
+        sig = iron_condor_signal(confidence=0.5)
+        sig.strategy_name = "long_straddle"
+
+        await _scan_one(rig, monkeypatch, sig)
+
+        assert sig.confidence == pytest.approx(0.5), (
+            "R17: the vol-mag override must not apply while gates are OFF"
+        )
 
 
 class TestLongStraddleExcludedFromDirectionInference:

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import time
+from types import SimpleNamespace
 
 import pytest
 
+import ait.monitoring.watchdog as _wd
 from ait.monitoring.watchdog import ComponentStatus, Watchdog
 
 
@@ -72,13 +74,31 @@ class TestErrorTracking:
 class TestOverallHealth:
     """Test overall health status computation."""
 
-    def test_all_healthy(self, watchdog):
+    def test_all_healthy(self, watchdog, monkeypatch):
+        """Pinned clock AND pinned memory: get_health() compares real
+        time.time() against the fixture's tight 5.0s heartbeat_timeout, and
+        separately reads the REAL pytest process's RSS against the
+        fixture's max_memory_mb=1000.0 -- both real, shared resources a
+        loaded full-suite run can push past a margin this test never meant
+        to exercise (W30's original diagnosis named only the clock; a
+        second full-lane run after that fix still failed here, this time on
+        `high_memory_usage` at memory_mb=1001.0 -- the same class of bug,
+        one mechanism deeper). Neither mechanism is what THIS test is
+        about -- that's TestPerComponentHeartbeatTimeout's job for the
+        clock, with its own deliberate real-clock offsets (untouched: this
+        patch replaces watchdog.py's own `time`/`_get_memory_mb`
+        references on this ONE instance, not global state)."""
+        monkeypatch.setattr(_wd, "time", SimpleNamespace(time=lambda: 1_700_000_000.0))
+        monkeypatch.setattr(watchdog, "_get_memory_mb", lambda: 100.0)
         watchdog.heartbeat("a")
         watchdog.heartbeat("b")
         health = watchdog.get_health()
         assert health.status == ComponentStatus.HEALTHY
 
-    def test_one_down_marks_overall_down(self, watchdog):
+    def test_one_down_marks_overall_down(self, watchdog, monkeypatch):
+        """Same clock- and memory-pinning as test_all_healthy, same reason."""
+        monkeypatch.setattr(_wd, "time", SimpleNamespace(time=lambda: 1_700_000_000.0))
+        monkeypatch.setattr(watchdog, "_get_memory_mb", lambda: 100.0)
         watchdog.heartbeat("a")
         for i in range(3):
             watchdog.record_error("b", f"err {i}")

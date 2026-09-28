@@ -10988,3 +10988,112 @@ No inspect.getsource in any of the 6 rewritten tests — all now drive real code
 mutation-verified above.
 
 ---
+
+## 2026-09-28 - THREE STANDING REGISTER ITEMS CLOSED — `_run_override_block`,
+`get_chain_for_expiry`, and `test_watchdog.py`'s load-sensitivity flake (a SECOND,
+previously-undiagnosed mechanism found and fixed along the way)
+
+Three independent, self-contained items named in prior NEXT pointers, none depending on
+TWS/RTH/operator input — planned and executed together in one pass (W54, the fourth
+standing item, is explicitly excluded — operator decision, unchanged from the 2026-09-27
+scoping-note entry).
+
+**1. `_run_override_block` (`test_r17_dormant_strategy_fixes.py`).** A CENSUS-4 side-
+finding: `TestVolMagOverrideRespectsMasterGate` hand-copied (mirrored) `orchestrator.py`'s
+vol-magnitude override block (`:2413-2435`) instead of calling it. Rewritten to drive the
+REAL `_scan_symbol` via the same real-orchestrator rig `test_w2_orchestrator_gates.py`'s
+`TestRangeGateFailsClosed` already established for the sibling range-model override (`rig`
+fixture wrapping `build_smoke_orchestrator()`, `_scan_one` helper pinning
+`generate_all_signals`). Added a local `_VolMagStub` (`is_trained`/`calls`/`predict`,
+same idiom as `test_w2`'s own `_RangeStub`), reused `iron_condor_signal()` with
+`strategy_name` overridden to `"long_straddle"`. Confirmed directly before writing
+(not assumed): `config.yaml`'s `ml.range_min_confidence: 0.65` is below the stub's
+`0.91`, so the override survives the downstream confidence floor; `Signal.is_defined_
+risk`'s partition at `:2488` is a no-op with a single signal, so renaming `strategy_name`
+is safe. Both tests passed on the first real run.
+
+**2. `get_chain_for_expiry` (`src/ait/data/options_chain.py:638-650`).** The dormant
+wrong-expiry landmine registered while scoping W53: `return chains[0] if chains else
+None` silently handed back a DIFFERENT expiry's chain when the exact one requested
+wasn't found. Re-confirmed zero callers anywhere in `src/` before touching it (zero
+live-path risk). Fixed to `return None`. Added `TestGetChainForExpiry` to
+`tests/test_r16_data_fixes.py`, reusing its existing `_svc()`/`_contract()`/`_chain()`
+helpers — two cases: exact expiry missing → `None`; exact expiry present among others →
+that exact chain object (`is` identity).
+
+**3. `test_watchdog.py`'s load-sensitivity flake — TWO mechanisms, not one.** W30's
+original diagnosis (months old) named only the fixture's tight `heartbeat_timeout=5.0`
+wall-clock margin. Fixed `TestOverallHealth::test_all_healthy` and
+`::test_one_down_marks_overall_down` by pinning `ait.monitoring.watchdog`'s own `time`
+module reference to a fixed clock (`monkeypatch.setattr(_wd, "time",
+SimpleNamespace(time=lambda: ...))` — replaces the MODULE's own name, not the global
+stdlib `time` module, so `TestPerComponentHeartbeatTimeout`'s deliberate real-clock
+offset tests are untouched) — scoped to just these 2 tests since the shared `watchdog`
+fixture itself cannot be touched without breaking that other class. **First full fast
+lane after this fix still failed on the SAME two tests** — not the staleness mechanism
+this fix targeted, but a SECOND, previously-undiagnosed one: `high_memory_usage`,
+`memory_mb=1001.0` against the fixture's `max_memory_mb=1000.0`, which forces
+`ComponentStatus.DEGRADED` in `_compute_health()` regardless of component health.
+Confirmed by grep that no test anywhere in the file actually exercises the memory-
+threshold behavior on purpose — it's a real, shared resource (the pytest PROCESS's own
+RSS) incidentally coupled into every test using the fixture, exactly the same class of
+bug as the clock, one mechanism deeper. Fixed by additionally pinning `Watchdog.
+_get_memory_mb` (a staticmethod, patchable per-instance) to a safe fixed value on the
+same two tests. **Did not silently declare victory on the first fix** — the plan's own
+contingency ("if it's ever observed flaking again... that would mean the mechanism
+understanding was incomplete, worth flagging explicitly") is exactly what happened, and
+is recorded here rather than glossed over.
+
+PROOF. All 3 touched files together: `test_r17_dormant_strategy_fixes.py` (12,
+unchanged — in-place), `test_r16_data_fixes.py` (22, up from 20 — 2 new tests),
+`test_watchdog.py` (20, unchanged — in-place) — 63/63 (item 1's files) + item 2/3 files
+all green, confirmed together: 105/105 including siblings `test_w2_orchestrator_gates.py`
+and `test_hot_path_smoke.py`. Every rewrite mutation-checked against real, reverted
+`src/ait` edits: item 1 — reproduced the exact pre-R17 bug (unconditional override
+regardless of the gate) and separately, as an extra check beyond the plan's own minimum,
+disabled the whole vol-mag block to confirm the `stub.calls == 1` positive control
+independently catches a silently-skipped block, both confirmed failing then reverted;
+item 2 — restored the buggy `chains[0]` fallback, confirmed the new "missing expiry"
+test failed by actually returning the wrong chain, reverted. Item 3 has no `src/ait`
+claim to mutate (test-fixture-only); instead verified by real injection twice — a real
+`time.sleep(6)` between heartbeat and get_health confirmed BOTH tests stay green with
+the clock pinned, and confirmed the SAME sleep breaks them with the pin removed (the
+negative control, proving the sleep-injection methodology itself is sound, not that
+these tests are just timing-insensitive for some other reason); separately, temporarily
+setting the memory pin to `1500.0` (above the 1000 threshold) reproduced the exact
+`DEGRADED` failure the full-suite run hit, confirming that mechanism too before
+restoring the real `100.0` fix. `git diff --stat src/ait` empty after every revert
+(final diff: only the intended `options_chain.py` one-line fix remains).
+`python -m compileall -q src tests`: OK.
+
+Full fast lane, run TWICE: first (clock fix only) — **2520 passed / 3 failed / 46
+skipped / 153 deselected, 910.76s** — the standing env-divergence failure plus BOTH
+`test_watchdog.py` tests, on the newly-discovered memory mechanism (not the one the
+first fix targeted, confirmed by reading the actual failure output rather than assuming
+the fix worked). Second (clock + memory fix) — **2522 passed / 1 failed / 46 skipped /
+153 deselected, 914.14s** — only the standing env-divergence failure; `test_watchdog.py`
+clean under real full-suite load. Count check against CENSUS-6's baseline fast lane
+(2520+1+46+153=2720 total outcomes): this run is 2522+1+46+153=2722 — a delta of exactly
++2, matching item 2's own net new test count precisely (items 1 and 3 were both in-place
+rewrites, zero net).
+
+STATE AT HANDOFF. Test-file-only changes across 3 files; zero `src/ait` files differ
+from HEAD (the one production line touched — `options_chain.py`'s fallback — was
+reverted during mutation-checking and re-applied as the real fix, confirmed clean by the
+final diff). Zero config changes. Nothing to deploy or restart.
+
+NEXT, naming every open item explicitly: **W54** remains the one item waiting on the
+operator (three sequencing options for the EV-path backtesting prerequisite, per the
+2026-09-27 scoping-note entry — unchanged, nothing new to add). **W53's placing run**
+and **W55's live validation run**, both waiting on TWS reachable during an RTH session.
+**W56/57**. **W52a's four items**. `test_watchdog.py`'s flake is now believed CLOSED —
+two mechanisms found and fixed, confirmed clean under one real full-suite run after the
+second fix — but per this entry's own methodology, a single clean run is a data point,
+not proof; if it is ever observed flaking on these two tests again, that means a THIRD
+mechanism exists and this entry's understanding was still incomplete.
+
+No inspect.getsource in any of the 3 rewritten files — item 1 now drives the real
+`_scan_symbol`, item 2 drives the real `get_chain_for_expiry`, item 3 drives the real
+`Watchdog.get_health()` with only the shared-resource dependencies pinned.
+
+---

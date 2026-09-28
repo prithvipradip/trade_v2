@@ -453,3 +453,44 @@ class TestPolygonAuthBreaker:
         for _ in range(MarketDataService._POLYGON_AUTH_FAILURE_LIMIT + 2):
             assert await svc._get_polygon_historical("SPY", 30) is None
         assert svc._polygon_client is not None
+
+
+# ---------------------------------------------------------------------------
+# [6] get_chain_for_expiry must never silently return a DIFFERENT expiry's
+# chain (the dormant landmine registered while scoping W53) — nothing calls
+# it today, but a caller trusting its return value must be able to trust the
+# expiry actually matches.
+# ---------------------------------------------------------------------------
+
+class TestGetChainForExpiry:
+    def _svc_with_chains(self, chains):
+        svc = _svc()
+
+        async def _get_chain(symbol, min_dte=None, max_dte=None):
+            return chains
+
+        svc.get_chain = _get_chain
+        return svc
+
+    async def test_returns_none_when_exact_expiry_missing(self):
+        other = _chain([], [])  # expiry = today + 30 (the helper's default)
+        svc = self._svc_with_chains([other])
+        requested = date.today() + timedelta(days=45)
+
+        result = await svc.get_chain_for_expiry("SPY", requested)
+
+        assert result is None, (
+            "a missing exact expiry must return None, not a different "
+            "expiry's chain mislabeled as the one asked for"
+        )
+
+    async def test_returns_the_matching_chain_when_present(self):
+        target = date.today() + timedelta(days=45)
+        other = _chain([], [])  # expiry = today + 30, a decoy
+        wanted = OptionsChain(symbol="SPY", underlying_price=100.0,
+                              expiry=target, calls=[], puts=[])
+        svc = self._svc_with_chains([other, wanted])
+
+        result = await svc.get_chain_for_expiry("SPY", target)
+
+        assert result is wanted

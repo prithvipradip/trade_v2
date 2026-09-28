@@ -647,7 +647,7 @@ class OptionsChainService:
         for chain in chains:
             if chain.expiry == expiry:
                 return chain
-        return chains[0] if chains else None
+        return None
 
     # --- Private methods ---
 
