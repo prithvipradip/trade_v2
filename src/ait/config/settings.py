@@ -521,27 +521,39 @@ class DividendConfig(_StrictModel):
 class AssignmentResponseConfig(_StrictModel):
     """W53 (roll-mechanics groundwork): whether an at-risk short leg (rule 3/
     3e in portfolio.py) closes outright or rolls to a later expiry instead.
-    `policy` defaults to "close_only" so shipping this config surface and
-    the roll machinery behind it changes NO live behavior -- nothing calls
-    into the roll path yet (wiring rule 3/3e to consult this policy is
-    W54b, per PLAN.md finding [3]f -- W54a built the comparison models
-    themselves, comparison_model/max_rolls_per_position below, still
-    unreachable from rule 3/3e until W54b). A roll always replaces the
-    full short+long vertical, never a single leg alone, so the position
-    stays defined-risk through the swap -- see this wave's PLAN.md entry
-    for why."""
+    `policy` and `execute_rolls` both default off/False so shipping this
+    config surface changes NO live behavior until the operator explicitly
+    flips both (rule 3/3e are wired to consult `policy` as of W54b, but
+    `close_only` is the default and `execute_rolls=False` is a separate,
+    additionally-required gate before anything is ever compared or
+    placed). A roll always replaces the full short+long vertical, never a
+    single leg alone, so the position stays defined-risk through the
+    swap -- see this wave's PLAN.md entry for why."""
 
     policy: Literal["close_only", "roll_only", "close_or_roll"] = Field(
         default="close_only",
         description="close_only: today's behavior, always close an at-risk "
-                    "leg. roll_only/close_or_roll: not live until W54b wires "
-                    "rule 3/3e to consult this field -- setting either today "
-                    "has no effect.")
+                    "leg. roll_only/close_or_roll: rule 3/3e report a roll "
+                    "candidate (PositionStatus.roll_side) instead of closing "
+                    "outright, but execute_rolls below is ADDITIONALLY "
+                    "required before anything is actually compared or placed "
+                    "-- same two-layer gate condor_defense.enabled/"
+                    "execute_rolls already uses.")
+    execute_rolls: bool = Field(default=False,
+        description="W54b: a SEPARATE opt-in from policy above, mirroring "
+                    "CondorDefenseConfig.execute_rolls exactly. policy != "
+                    "'close_only' alone still only makes rule 3/3e REPORT a "
+                    "roll candidate -- execute_rolls=True is additionally "
+                    "required before the orchestrator ever runs the close-"
+                    "or-roll comparison or places a real order. Defaults "
+                    "False so shipping this wave changes NO live behavior "
+                    "until the operator explicitly flips both this and "
+                    "policy.")
     comparison_model: Literal["heuristic", "ev"] = Field(
         default="heuristic",
-        description="W54a: which model decides close-vs-roll once policy == "
-                    "'close_or_roll' (W54b wires this in -- setting it has no "
-                    "effect until then either). 'heuristic': the cheap "
+        description="Which model decides close-vs-roll once policy == "
+                    "'close_or_roll' AND execute_rolls is True. 'heuristic': "
+                    "the cheap "
                     "credit/max-loss proxy (execution/roll_comparison.py, "
                     "heuristic_should_roll). 'ev': prices both sides at each "
                     "leg's own model-implied fair value instead of raw market "

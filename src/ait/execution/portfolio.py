@@ -21,7 +21,7 @@ from enum import Enum
 from ait.bot.state import StateManager, TradeRecord, TradeStatus
 from ait.broker.ibkr_client import IBKRClient
 from ait.strategies.base import CREDIT_STRATEGIES
-from ait.config.settings import CondorDefenseConfig, ExitConfig
+from ait.config.settings import AssignmentResponseConfig, CondorDefenseConfig, ExitConfig
 from ait.execution.condor_defense import DefenseAction, evaluate_condor_defense
 from ait.execution.exit_policy import (
     EXPIRY_APPROACHING_DTE,
@@ -154,6 +154,7 @@ class PortfolioManager:
         economic_calendar=None,
         dividend_calendar=None,
         condor_defense_config: CondorDefenseConfig | None = None,
+        assignment_response_config: AssignmentResponseConfig | None = None,
     ) -> None:
         self._ibkr = ibkr_client
         self._market_data = market_data
@@ -168,6 +169,11 @@ class PortfolioManager:
         # enabled=False, so constructing without this kwarg (every existing
         # test via __new__ never even sets the attribute) changes nothing.
         self._condor_defense_config = condor_defense_config or CondorDefenseConfig()
+        # W54b: same pattern as condor_defense_config immediately above --
+        # policy defaults "close_only", so constructing without this kwarg
+        # changes nothing. Only rule 3/3e (below) read it.
+        self._assignment_response_config = (
+            assignment_response_config or AssignmentResponseConfig())
         # W51 (model-vs-reality-ex-div-assignment-void): EarningsCalendar's
         # twin — see rule 3e below (pre_ex_div_assignment_risk).
         self._dividends = dividend_calendar
@@ -770,6 +776,23 @@ class PortfolioManager:
                     # fire alerts (nor consume the once-per-outage page).
                     await self._alert_touch_stop_failed(trade, _e)
 
+        # W54b: rule 3/rule 3e's own roll-candidate signal -- a SEPARATE
+        # local from condor_defense's condor_roll_side/condor_action_reason
+        # below, deliberately. Rule 3/3e keep setting should_exit=True
+        # exactly as before even when they ALSO populate this (a dual
+        # signal: "close, unless the orchestrator's close-or-roll
+        # comparison decides to roll instead") -- which means condor_
+        # defense's own `if not should_exit` gate already keeps the two
+        # systems from ever both firing on the same tick, with no new
+        # arbitration logic needed. Reset to None by the PDT veto (rule 5)
+        # below if it fires -- a PDT-blocked position must report no roll
+        # candidate either, or _partition_roll_positions (which only checks
+        # `not should_exit`) would wrongly treat a PDT-vetoed position
+        # (should_exit reset to False) as a condor_defense-style ready-to-
+        # place roll, bypassing the PDT protection entirely.
+        assignment_roll_side: str | None = None
+        assignment_action_reason: str | None = None
+
         # 2. Take profit (time-decay adjusted) — needs real marks
         # R13-CRIT-2: this was `elif`, chained to the R12 touch-stop `if`
         # above. For every credit position with the touch stop enabled (the
@@ -824,6 +847,18 @@ class PortfolioManager:
                             f"assignment_risk (short {itm_side} ITM, "
                             f"underlying=${current_underlying:.2f}, strike=${itm_strike:.2f})"
                         )
+                        # W54b: report a roll candidate ALONGSIDE the close
+                        # above (should_exit stays True) -- the orchestrator
+                        # decides whether to actually roll instead, via the
+                        # close-or-roll comparison, before ever calling
+                        # _execute_exit. "put"/"call" -> "P"/"C": itm_side's
+                        # OWN string (used in exit_reason above) is left
+                        # untouched -- only the NEW roll_side gets the
+                        # translation select_roll_target requires.
+                        _assign_cfg = getattr(self, "_assignment_response_config", None)
+                        if _assign_cfg is not None and _assign_cfg.policy != "close_only":
+                            assignment_roll_side = "P" if itm_side == "put" else "C"
+                            assignment_action_reason = f"assignment_risk_{_assign_cfg.policy}"
             except Exception:
                 pass
             if not should_exit:
@@ -991,6 +1026,18 @@ class PortfolioManager:
                                         f"{info.expected_amount:.2f}, "
                                         f"strike={short_call_strike:.2f})"
                                     )
+                                    # W54b: same dual-signal pattern as rule
+                                    # 3 above. Calls-only by this rule's own
+                                    # construction (short_call_strike), so
+                                    # no "put"/"call" translation is needed
+                                    # -- always "C".
+                                    _assign_cfg = getattr(
+                                        self, "_assignment_response_config", None)
+                                    if (_assign_cfg is not None
+                                            and _assign_cfg.policy != "close_only"):
+                                        assignment_roll_side = "C"
+                                        assignment_action_reason = (
+                                            f"assignment_risk_{_assign_cfg.policy}")
             except Exception as e:  # noqa: BLE001
                 # This is the exit side: fail OPEN, matching rule 3c's own
                 # documented rationale — a missed early-close on bad
@@ -1053,6 +1100,15 @@ class PortfolioManager:
                     should_exit = False
                     partial_exit_quantity = 0
                     exit_reason = "exit_blocked_by_pdt"
+                    # W54b: a PDT-vetoed position must report NO roll
+                    # candidate either. Without this, should_exit=False
+                    # above combined with a still-set assignment_roll_side
+                    # produces EXACTLY the shape _partition_roll_positions
+                    # (W61) treats as a condor_defense-style roll ready to
+                    # place -- silently bypassing the PDT protection this
+                    # whole block exists to enforce.
+                    assignment_roll_side = None
+                    assignment_action_reason = None
                     log.warning(
                         "exit_blocked_pdt",
                         trade_id=trade.trade_id,
@@ -1077,6 +1133,16 @@ class PortfolioManager:
                         except Exception:  # noqa: BLE001
                             pass
 
+        # W54b: merge condor_defense's and rule 3/3e's roll signals. The two
+        # are never both set on the same tick -- rule 3/3e run FIRST and,
+        # whenever they populate assignment_roll_side, should_exit is ALSO
+        # True, which blocks condor_defense's own block (gated `if not
+        # should_exit`) from ever setting condor_roll_side -- so `or` here
+        # is a safe merge, not a silent precedence call between two
+        # simultaneously-true signals.
+        roll_side = condor_roll_side or assignment_roll_side
+        action_reason = condor_action_reason or assignment_action_reason
+
         return PositionStatus(
             trade_id=trade.trade_id,
             symbol=trade.symbol,
@@ -1092,10 +1158,10 @@ class PortfolioManager:
             exit_reason=exit_reason,
             partial_exit_quantity=partial_exit_quantity,
             marks_missing=marks_missing,
-            action=(PositionAction.ROLL if condor_roll_side is not None
+            action=(PositionAction.ROLL if roll_side is not None
                     else _derive_position_action(should_exit, partial_exit_quantity)),
-            roll_side=condor_roll_side,
-            action_reason=condor_action_reason,
+            roll_side=roll_side,
+            action_reason=action_reason,
         )
 
     @staticmethod

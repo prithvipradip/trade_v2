@@ -13228,3 +13228,178 @@ No inspect.getsource — every new test drives the real `black_scholes_price`,
 the real `_execute_roll` cap check, never asserts on source strings.
 
 ---
+
+## 2026-09-29 - BUILT — W54b: wire rule 3/rule 3e to the close-or-roll comparison, gated by
+`policy` + `execute_rolls`
+
+SCOPE. W54a (`e5a3011`) shipped the comparison models but left them fully unreachable. This
+wave makes rule 3 (ITM assignment risk) and rule 3e (pre-ex-div assignment risk) in
+`portfolio.py` actually consult `assignment_response.policy` and, when it allows rolling,
+run the close-or-roll comparison in the orchestrator before deciding to close. Re-reading
+the exact current code (unchanged since W54a) resolved the two risks W54a's own research
+flagged, and surfaced a third, more subtle one, all confirmed by direct source read before
+writing any code:
+
+1. **The arbitration conflict turned out to be nearly free.** `condor_defense`'s block was
+   already gated `if not should_exit`. Rule 3/3e's new roll-candidate signal lives in a
+   SEPARATE local (`assignment_roll_side`, not `condor_roll_side`) and — the key move —
+   rule 3/3e keep setting `should_exit=True` exactly as before even when they ALSO offer a
+   roll candidate. That alone means the existing gate already prevents `condor_defense`
+   from ever running on a tick rule 3/3e already claimed. No new arbitration logic was
+   needed — proven directly (see PROOF), not just argued.
+2. **The side-encoding fix** ("put"/"call" → "P"/"C") is a one-line translation at the
+   point `assignment_roll_side` is set; `itm_side`'s own string (used in the CLOSE
+   exit_reason text) is untouched.
+3. **New finding, not in W54a's own list: the PDT veto (rule 5) would have silently
+   mis-routed a blocked position.** It already resets `should_exit`/`partial_exit_
+   quantity`/`exit_reason` on a veto, but nothing reset a roll-candidate local. A
+   PDT-vetoed position would then report `should_exit=False, roll_side=<set>` — EXACTLY the
+   shape `_partition_roll_positions` (W61) already treats as a condor_defense-style roll
+   ready to place, feeding it straight into `_execute_roll` and bypassing the PDT
+   protection entirely. Found while writing the plan, fixed, and mutation-checked (removing
+   the fix reproduces the exact bug it prevents).
+
+**Also found while writing the plan, not assumed fixed**: `PortfolioManager` had no
+`assignment_response_config` at all — only the orchestrator read `assignment_response`
+directly. Added, mirroring `condor_defense_config`'s own exact threading pattern.
+
+DESIGN.
+
+`src/ait/execution/roll_executor.py`: `PreparedRollCombo` gains `quotes: dict[int,
+tuple[float | None, float | None]]` — the raw per-conId bid/ask dict `poll_leg_quotes`
+already builds, exposed so the EV comparison's per-leg IV gathering can reuse data already
+fetched instead of a second broker round-trip.
+
+`src/ait/execution/portfolio.py`: `PortfolioManager.__init__` gains
+`assignment_response_config` (the missed-gap fix). New locals `assignment_roll_side`/
+`assignment_action_reason`, declared before the take-profit/rule-3 if/elif chain (moving
+statements INTO the middle of an existing elif chain is a syntax error — caught immediately
+by `py_compile`, fixed by placing them before the chain starts instead). Rule 3, inside `if
+itm_side is not None:`, after the existing (unchanged) `should_exit = True`: when `policy !=
+"close_only"`, sets `assignment_roll_side = "P" if itm_side == "put" else "C"` and
+`assignment_action_reason = f"assignment_risk_{policy}"`. Rule 3e: same pattern, always
+`"C"` (calls-only by construction). PDT veto: resets both locals to `None` alongside its
+existing resets — finding 3's fix. Return site: `roll_side = condor_roll_side or
+assignment_roll_side`; `action = ROLL if roll_side is not None else derive(...)` — the two
+locals are provably never both set (finding 1), so `or` is a safe merge.
+
+`src/ait/config/settings.py` / `config.yaml`: `AssignmentResponseConfig` gains
+`execute_rolls: bool = False` — mirrors `condor_defense.execute_rolls` exactly, a
+placement-level opt-in separate from `policy`, added now because its consumer exists.
+
+`src/ait/bot/orchestrator.py`: `PortfolioManager(...)`'s construction site threads
+`assignment_response_config=settings.assignment_response`. `_execute_roll` gains optional
+`prepared`/`roll_target` params — when the caller already has them (the comparison must
+prepare a combo to run the comparison in the first place), skips a SECOND ~110-209s chain
+fetch for the same decision; fully backward compatible, `condor_defense`'s own call site
+passes neither. New `_compare_close_or_roll(pos) -> bool`: `execute_rolls=False` → `False`
+immediately; fetches trade/target/combo (stopping short of CAS/seed/place); `policy==
+"roll_only"` → always roll once prepared; `"close_or_roll"` → `heuristic_should_roll` or,
+for `"ev"`, a data-quality fallback (`roll_target.iv_is_guessed`) then a new
+`_gather_ev_leg_inputs` (solves each leg's IV from `prepared.quotes` via
+`solve_iv_from_price`, `None` on any REQUIRED leg's failure — a carried leg's own failure
+just drops it, same as `carried_value`'s own fallback elsewhere) feeding `ev_should_roll`,
+itself falling back to the heuristic if it returns `None`. On a roll verdict: `await self.
+_execute_roll(pos, prepared=prepared, roll_target=roll_target)`. `_trading_cycle`'s exit
+loop: `if pos.roll_side and await self._compare_close_or_roll(pos): continue` before
+`_execute_exit` — `pos.roll_side` alone is a safe, sufficient gate per finding 1's dual-
+shape argument (a `should_exit=True` position with `roll_side` set can only have come from
+rule 3/3e, never `condor_defense`).
+
+PROOF. `tests/test_w54b_assignment_roll_dispatch.py` (new, 17 tests). Part A (real
+`_evaluate_position` calls, same `PortfolioManager.__new__` harness `test_w52_multileg_itm_
+diagnosis.py` uses): `policy=="close_only"` reports no roll candidate (byte-identical to
+before this wave); `roll_only`/`close_or_roll` report the correctly-translated `"P"`/`"C"`
+side, `should_exit` UNCHANGED (still `True`); a `getattr`-guarded config-less manager
+behaves like `close_only`; rule 3e always reports `"C"`; the PDT-veto fix, both directly
+asserted AND mutation-checked (removing the reset reproduces `roll_side='P'` on a
+`should_exit=False` position — the exact bug finding 3 names); the arbitration claim,
+proven not assumed — `evaluate_condor_defense` monkeypatched to a FORCED ROLL verdict,
+asserting it is called ZERO times once rule 3 has already claimed the tick, mutation-checked
+by temporarily removing the `not should_exit` gate (the test then fails with `call_count==1`,
+confirming the gate is genuinely load-bearing, not incidentally passing).
+
+Part B (`orchestrator._compare_close_or_roll`/`_gather_ev_leg_inputs`, real `StateManager`,
+monkeypatched `select_roll_target`/`prepare_roll_combo`/`heuristic_should_roll`/`ev_should_
+roll` as spies): `execute_rolls=False` returns `False` with ZERO calls into `select_roll_
+target`; `policy=="roll_only"` always rolls with the heuristic never even called;
+`comparison_model=="heuristic"` — a losing position rolls, a winning one closes (real
+`heuristic_should_roll` outputs, not mocked); `"ev"` with `iv_is_guessed=True` falls back to
+heuristic with `ev_should_roll` never called; `"ev"` with every leg's quote missing falls
+back to heuristic (via `_gather_ev_leg_inputs` returning `None`); a REAL `ev_should_roll`
+call with solvable legs, `select_roll_target`/`prepare_roll_combo` each confirmed called
+EXACTLY ONCE — the direct proof of the no-second-broker-round-trip claim, not just "should
+be". `_gather_ev_leg_inputs` directly: a missing quote refuses the whole result; a carried
+leg's own missing quote just drops it (closing/opening still build); the happy path builds
+all three lists with real solved IVs (`> 0`) and the correct lowercase `flag`.
+
+A real phantom-failure incident, caught and correctly diagnosed rather than treated as a
+regression: mid-way through this wave's gates, an unrelated `inspect.getsource`-based test
+(`test_r16_round2_fixes.py::TestBagQuotePathAlive`) failed in a background fast-lane run
+because `orchestrator.py` was edited (a small mypy type-narrowing fix) WHILE that run was
+still executing — exactly the "Never edit a source file while the test suite is running"
+failure class CLAUDE.md documents. Confirmed by re-running that one test in isolation
+immediately afterward (passed cleanly) and then re-running the FULL fast lane with no
+concurrent edits, which came back clean. Recorded so a future session recognizes the same
+symptom fast — the same discipline as `roll_booking.py`'s own W57-era `git checkout`
+incident.
+
+Regression: `test_roll_wiring.py` + `test_roll_executor.py` + `test_roll_ancestors.py` +
+`test_roll_comparison.py` + `test_roll_booking.py` + `test_go_live_roll_folding.py` +
+`test_reconciler_roll_awareness.py` + `test_condor_defense_wiring.py` + `test_w56_condor_
+defense.py`: **176/176**. The full `portfolio.py`-touching surface (every test file
+referencing `PortfolioManager`/`_evaluate_position`/`check_positions`, 21 files): **425
+passed, 1 skipped** (was 408 passed, 1 skipped before this wave's own +17 — zero
+regressions). `python -m compileall -q src tests`: OK. `python scripts/typecheck.py`: found
+one real (non-blocking) type-narrowing gap in `_gather_ev_leg_inputs` — mypy couldn't infer
+that `any(x is None for x in closing_raw)` already excluded `None` from the returned list;
+fixed by rebuilding explicitly-typed `list[dict]` filters rather than relying on flow
+narrowing, confirmed clean afterward with the exact same informational-finding counts as
+before this wave. Zero attr-defined/call-arg/name-defined in `src/ait/{config,bot,execution,
+risk}`. `python scripts/smoke_deploy.py`: **SMOKE PASS (13 checks)**, `config.yaml`'s new
+`execute_rolls: false` loads cleanly, no writes.
+
+Full fast lane: **2781 passed / 1 failed / 46 skipped / 153 deselected, 1044.37s
+(17m24s)** — the one failure is the same standing `test_r19_config_authority.py::
+TestContractIsTheSingleAuthority::test_applier_and_readers_share_one_table`
+(`AIT_MARKET_DATA_TYPE` divergence, unrelated). Count check against the immediately-prior
+full fast lane (2764+1+46=2811 total non-deselected outcomes): this run is 2781+1+46=2828 —
+a delta of exactly **+17**, matching the new test count precisely (all 17 in the one new
+`test_w54b_assignment_roll_dispatch.py`).
+
+STATE AT HANDOFF. `src/ait/execution/roll_executor.py`, `src/ait/execution/portfolio.py`,
+`src/ait/config/settings.py`, `config.yaml`, `src/ait/bot/orchestrator.py` (all modified),
+`tests/test_w54b_assignment_roll_dispatch.py` (new). `AssignmentResponseConfig.policy`
+stays `"close_only"` and `execute_rolls` stays `False` in both the Pydantic model and
+`config.yaml` — nothing about current live behavior changes until an operator explicitly
+flips BOTH, same two-layer gate `condor_defense.enabled`/`execute_rolls` already
+established as this register's own idiom. Rule 3/rule 3e are now genuinely wired end to
+end: decision (portfolio.py) → comparison (orchestrator.py) → placement (`_execute_roll`,
+W61) → fill recognition/booking (`executor.py`/`roll_booking.py`, W60/W61) — the full W52-
+W54 roadmap arc is code-complete, gated off by three independent config values
+(`condor_defense.enabled`/`execute_rolls` for the delta-band trigger, `assignment_response.
+policy`/`execute_rolls` for the ITM/ex-div trigger) plus a shared roll-count cap
+(`max_rolls_per_position`, W54a) neither trigger can bypass.
+
+NEXT, naming every open item explicitly: **the portfolio-risk-gate netting** for a roll's
+opening leg (`risk/manager.py`) — still registered, per the operator's own explicit choice
+this session; `validate_trade` would reject a roll's opening leg outright today (the
+duplicate-position gate, double-counted aggregate/concentration risk) if naively reused, so
+this remains a real, unsolved gap, just not one either roll-trigger's placement path
+depends on closing first. **Backtesting the EV path against real history** — still the
+prerequisite before `comparison_model: "ev"` should ever be operator-selected on a
+live/paper account; the vol-surface backfill run itself is the blocking piece, its own
+completion unconfirmed as of this entry. **Per-strike IV-quality tracking** beyond the
+existing whole-chain `iv_is_guessed` boolean — registered if the coarser signal proves too
+blunt in practice. **W53's placing run** — still the prerequisite live proof the whole roll
+chain (of either trigger) has never been exercised against a real fill; TWS was unreachable
+as of this entry. **The real multi-day vol-surface backfill run's own progress** — operator-
+run, status unconfirmed. **W52a's four items**, the surface-construction quality filter,
+the zero-bars inefficiency, and the risk-free-rate Phase B connection-reuse note — all
+unchanged.
+
+No inspect.getsource — every new test drives the real `_evaluate_position`, `_compare_
+close_or_roll`, `_gather_ev_leg_inputs`, and the real (unpatched) `not should_exit`
+arbitration gate, never asserts on source strings.
+
+---

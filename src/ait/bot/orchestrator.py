@@ -30,15 +30,16 @@ from ait.data.economic_calendar import EconomicCalendar
 from ait.data.edgar_filings import EDGARMonitor
 from ait.data.historical import HistoricalDataStore
 from ait.data.market_data import MarketDataService
-from ait.data.options_chain import OptionsChainService
+from ait.data.options_chain import OptionsChainService, solve_iv_from_price
 from ait.data.multi_timeframe import MultiTimeframeAnalyzer
 from ait.data.quality import DataQualityValidator
 from ait.execution.executor import BAG_CON_ID, TradeExecutor
 from ait.execution.portfolio import PortfolioManager, PositionAction, PositionStatus
 from ait.execution.reconciler import PositionReconciler
 from ait.execution.roll_booking import cas_roll_closing_trade, roll_order_ref, seed_roll_opening_trade
+from ait.execution.roll_comparison import ev_should_roll, heuristic_should_roll
 from ait.execution.roll_executor import prepare_roll_combo
-from ait.execution.roll_selector import select_roll_target
+from ait.execution.roll_selector import RollTarget, select_roll_target
 from ait.learning.engine import LearningEngine
 from ait.ml.ensemble import DirectionPredictor
 from ait.ml.meta_label import MetaLabeler
@@ -366,6 +367,7 @@ class TradingOrchestrator:
             economic_calendar=self._economic_cal,
             dividend_calendar=self._dividends,
             condor_defense_config=settings.condor_defense,
+            assignment_response_config=settings.assignment_response,
         )
         # GOV-5 (governance audit): live-profile assertion — the liquidity
         # gates were deliberately relaxed for paper/delayed data
@@ -1669,6 +1671,17 @@ class TradingOrchestrator:
             # Handle full exits
             exits_needed = [p for p in positions if p.should_exit]
             for pos in exits_needed:
+                # W54b: rule 3/rule 3e's dual should_exit=True + roll_side
+                # shape (never condor_defense's, which is should_exit=False
+                # -- see PositionStatus/_evaluate_position's own docstrings)
+                # gets a chance to roll instead of closing, via the
+                # close-or-roll comparison. pos.roll_side alone is a safe,
+                # sufficient gate: _compare_close_or_roll's OWN execute_
+                # rolls/policy checks handle everything else, including
+                # being a correct no-op when this wave's config stays at
+                # its defaults.
+                if pos.roll_side and await self._compare_close_or_roll(pos):
+                    continue
                 log.info("position_exit_triggered", symbol=pos.symbol, reason=pos.exit_reason)
                 await self._execute_exit(pos)
 
@@ -3920,13 +3933,133 @@ class TradingOrchestrator:
         remaining = [p for p in candidates if p.action != PositionAction.ROLL]
         return rolls, remaining
 
-    async def _execute_roll(self, pos: PositionStatus) -> None:
+    def _gather_ev_leg_inputs(
+        self, prepared, spot: float,
+    ) -> tuple[list[dict], list[dict], list[dict]] | None:
+        """W54b: build ev_should_roll's three per-leg input lists from
+        `prepared`'s ALREADY-fetched quotes (no second broker round-trip) --
+        solves each leg's own IV via solve_iv_from_price, the SAME
+        py_vollib call site the live chain scan already uses. Returns None
+        (defer to the heuristic, never guess) if a REQUIRED (closing or
+        opening) leg's quote or IV solve fails; a carried leg's own failure
+        just drops it from the carried list -- ev_should_roll already
+        treats an empty carried list as carried_net=0.0, the SAME fallback
+        carried_value has elsewhere in this arc.
+        """
+        r = self._settings.options.risk_free_rate
+
+        def _leg_input(leg: dict) -> dict | None:
+            quote = prepared.quotes.get(leg.get("conId"))
+            if not quote or quote[0] is None or quote[1] is None:
+                return None
+            mid = (quote[0] + quote[1]) / 2.0
+            try:
+                expiry = datetime.strptime(str(leg["expiry"])[:10], "%Y-%m-%d").date()
+            except (ValueError, TypeError, KeyError):
+                return None
+            t = max((expiry - now_et().date()).days / 365.0, 0.001)
+            flag = "c" if str(leg.get("right", "")).upper().startswith("C") else "p"
+            iv, outcome = solve_iv_from_price(mid, spot, float(leg["strike"]), t, r, flag)
+            if outcome != "solved":
+                return None
+            return {"strike": float(leg["strike"]), "action": leg["action"],
+                    "spot": spot, "t": t, "iv": iv, "flag": flag}
+
+        closing_raw = [_leg_input(leg) for leg in prepared.closing_legs]
+        if any(x is None for x in closing_raw):
+            return None
+        opening_raw = [_leg_input(leg) for leg in prepared.opening_legs]
+        if any(x is None for x in opening_raw):
+            return None
+        closing_inputs: list[dict] = [x for x in closing_raw if x is not None]
+        opening_inputs: list[dict] = [x for x in opening_raw if x is not None]
+        carried_inputs: list[dict] = [
+            x for x in (_leg_input(leg) for leg in prepared.carried_legs) if x is not None
+        ]
+        return closing_inputs, opening_inputs, carried_inputs
+
+    async def _compare_close_or_roll(self, pos: PositionStatus) -> bool:
+        """W54b: for a rule 3/rule 3e roll candidate (should_exit=True AND
+        pos.roll_side set -- the dual shape only rule 3/3e ever produce,
+        never condor_defense), decide whether to actually roll instead of
+        closing. Called from _trading_cycle's exit loop, BEFORE
+        _execute_exit, for exactly those positions.
+
+        Returns True if a roll was ATTEMPTED (successfully or not -- the
+        caller must NOT also call _execute_exit either way: a failed
+        attempt already logged/handled itself via _execute_roll's own
+        fail-safe returns, and should_exit=True will still be there next
+        cycle to retry closing if the roll genuinely didn't happen).
+        Returns False if closing should proceed exactly as it does today
+        (execute_rolls off, no target/combo found, or the comparison
+        itself says close).
+        """
+        cfg = self._settings.assignment_response
+        if not cfg.execute_rolls:
+            return False
+
+        trade = self._find_trade_record(pos.trade_id)
+        if not trade or not pos.roll_side:
+            return False
+
+        roll_target = await select_roll_target(
+            trade, pos.roll_side, self._options_chain, cfg)
+        if roll_target is None:
+            return False
+
+        prepared = await prepare_roll_combo(
+            self._ibkr, trade, pos.roll_side, roll_target, trade.symbol,
+            trade.quantity, order_ref=roll_order_ref(trade.trade_id, "PENDING"),
+            debit_cap=-cfg.roll_min_credit,
+        )
+        if prepared is None:
+            return False
+
+        if cfg.policy == "roll_only":
+            should_roll = True
+        else:  # close_or_roll
+            if cfg.comparison_model == "heuristic":
+                should_roll = heuristic_should_roll(prepared)
+            else:  # "ev" -- data-quality fallback first (W54a's own field)
+                if roll_target.iv_is_guessed:
+                    log.warning("ev_comparison_iv_guessed_fallback", trade_id=trade.trade_id)
+                    should_roll = heuristic_should_roll(prepared)
+                else:
+                    ev_inputs = self._gather_ev_leg_inputs(prepared, pos.current_price)
+                    if ev_inputs is None:
+                        log.warning("ev_comparison_inputs_unavailable_fallback",
+                                   trade_id=trade.trade_id)
+                        should_roll = heuristic_should_roll(prepared)
+                    else:
+                        closing_i, opening_i, carried_i = ev_inputs
+                        ev_verdict = ev_should_roll(
+                            closing_i, opening_i, carried_i,
+                            self._settings.options.risk_free_rate)
+                        should_roll = (ev_verdict if ev_verdict is not None
+                                      else heuristic_should_roll(prepared))
+
+        if not should_roll:
+            return False
+
+        await self._execute_roll(pos, prepared=prepared, roll_target=roll_target)
+        return True
+
+    async def _execute_roll(
+        self, pos: PositionStatus, prepared=None, roll_target: RollTarget | None = None,
+    ) -> None:
         """W61: act on a ROLL verdict — select a replacement vertical,
         prepare/qualify/price the combo, seed the DB rows, and place it.
-        Today the only caller is condor_defense (gated in _trading_cycle on
-        execute_rolls, a separate opt-in from condor_defense.enabled
-        itself); W54b will add rule 3/3e as a second caller through this
-        same function.
+        Callers: condor_defense (gated in _trading_cycle on execute_rolls,
+        a separate opt-in from condor_defense.enabled itself), and — as of
+        W54b — rule 3/3e, via _compare_close_or_roll.
+
+        `prepared`/`roll_target` (W54b): when the caller already has them
+        (e.g. _compare_close_or_roll, which must prepare a combo to run the
+        close-or-roll comparison in the first place), pass them through
+        directly to skip a SECOND chain fetch / quote poll for the same
+        decision — get_chain's own measured 110-209s median cost makes
+        re-fetching for the same roll wasteful, not just slow. Fully
+        backward compatible: condor_defense's own call site passes neither.
 
         Each step, cheapest/most-reversible first — W54a's roll-count cap
         first of all, before any chain fetch — so a failure partway through
@@ -3944,8 +4077,7 @@ class TradingOrchestrator:
 
         # W54a: the cheapest possible check, first, before any chain fetch —
         # a hard cap on repeat-rolling ONE position, regardless of which
-        # system triggered this call. Applies today even though only
-        # condor_defense can reach this function yet.
+        # system triggered this call.
         depth = self._state.count_roll_ancestors(trade.trade_id)
         if depth >= self._settings.assignment_response.max_rolls_per_position:
             log.warning("roll_cap_reached", trade_id=trade.trade_id, depth=depth,
@@ -3953,28 +4085,31 @@ class TradingOrchestrator:
             return
 
         try:
-            roll_target = await select_roll_target(
-                trade, pos.roll_side, self._options_chain,
-                self._settings.assignment_response,
-            )
             if roll_target is None:
-                log.warning("roll_no_target_found", trade_id=trade.trade_id,
-                           side=pos.roll_side)
-                return
+                roll_target = await select_roll_target(
+                    trade, pos.roll_side, self._options_chain,
+                    self._settings.assignment_response,
+                )
+                if roll_target is None:
+                    log.warning("roll_no_target_found", trade_id=trade.trade_id,
+                               side=pos.roll_side)
+                    return
 
-            # roll_min_credit is a CREDIT floor (leg_net_price's BUY+/SELL-
-            # convention makes a net credit NEGATIVE) — prepare_roll_combo's
-            # debit_cap is a DEBIT ceiling, so "require at least $X credit"
-            # becomes "refuse mid_net > -X": negate, don't pass through.
-            prepared = await prepare_roll_combo(
-                self._ibkr, trade, pos.roll_side, roll_target, trade.symbol,
-                trade.quantity, order_ref=roll_order_ref(trade.trade_id, "PENDING"),
-                debit_cap=-self._settings.assignment_response.roll_min_credit,
-            )
             if prepared is None:
-                log.warning("roll_prepare_failed", trade_id=trade.trade_id,
-                           side=pos.roll_side)
-                return
+                # roll_min_credit is a CREDIT floor (leg_net_price's BUY+/
+                # SELL- convention makes a net credit NEGATIVE) —
+                # prepare_roll_combo's debit_cap is a DEBIT ceiling, so
+                # "require at least $X credit" becomes "refuse mid_net >
+                # -X": negate, don't pass through.
+                prepared = await prepare_roll_combo(
+                    self._ibkr, trade, pos.roll_side, roll_target, trade.symbol,
+                    trade.quantity, order_ref=roll_order_ref(trade.trade_id, "PENDING"),
+                    debit_cap=-self._settings.assignment_response.roll_min_credit,
+                )
+                if prepared is None:
+                    log.warning("roll_prepare_failed", trade_id=trade.trade_id,
+                               side=pos.roll_side)
+                    return
 
             if not cas_roll_closing_trade(self._state, trade.trade_id):
                 log.warning("roll_cas_to_closing_refused", trade_id=trade.trade_id)

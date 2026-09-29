@@ -253,15 +253,18 @@ dividends:
   lkg_max_age_hours: 168               # Reuse a confirmed fetch for up to a week before treating it as unknown again
 
 assignment_response:
-  # W53 (roll-mechanics groundwork): policy stays close_only until W54b wires
-  # rule 3/3e to consult it -- roll_only/close_or_roll have no live effect yet.
+  # W53/W54b: rule 3/3e are wired to consult policy, but policy stays
+  # close_only (today's real behavior) and execute_rolls stays false --
+  # BOTH must be explicitly flipped before rule 3/3e ever compares or
+  # places a roll instead of closing outright.
   policy: close_only
-  # W54a: which model decides close-vs-roll once policy == close_or_roll
-  # (also has no live effect until W54b wires rule 3/3e in). "ev" has NOT
-  # been backtested -- the historical per-strike vol-surface backfill it
-  # needs is still running. RECOMMENDED: leave this on "heuristic" until a
-  # real backtest validates "ev" against history -- do not switch to "ev"
-  # in a live/paper account before then.
+  execute_rolls: false
+  # Which model decides close-vs-roll once policy == close_or_roll AND
+  # execute_rolls is true. "ev" has NOT been backtested -- the historical
+  # per-strike vol-surface backfill it needs is still running.
+  # RECOMMENDED: leave this on "heuristic" until a real backtest validates
+  # "ev" against history -- do not switch to "ev" in a live/paper account
+  # before then.
   comparison_model: heuristic          # heuristic (recommended for now) / ev
   max_rolls_per_position: 2            # Hard cap, any roll, any trigger -- see settings.py
   roll_target_dte_min: 14              # Matches options.dte_range's live floor

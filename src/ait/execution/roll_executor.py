@@ -53,7 +53,13 @@ class PreparedRollCombo:
     right now" (closing_net - carried_value, the SAME formula roll_booking.
     book_roll_fill uses for a REAL fill, applied here to a MID estimate)
     without re-deriving the split. Purely additive: mid_net's own meaning
-    and every existing consumer are unchanged."""
+    and every existing consumer are unchanged.
+
+    `quotes` (W54b) is the raw per-conId {conId: (bid, ask)} dict
+    poll_leg_quotes already builds internally -- exposed so a caller (the
+    EV comparison's per-leg IV gathering, execution/roll_comparison.py's
+    ev_should_roll) can solve each leg's implied vol from data ALREADY
+    fetched, rather than a second broker round-trip for the same legs."""
 
     bag: object
     order: object
@@ -65,6 +71,7 @@ class PreparedRollCombo:
     natural_net: float
     closing_net: float
     opening_net: float
+    quotes: dict[int, tuple[float | None, float | None]]
 
 
 def legs_for_roll(
@@ -302,4 +309,5 @@ async def prepare_roll_combo(
         carried_legs=qualified_carried, carried_value=carried_value,
         mid_net=mid_net, natural_net=natural_net,
         closing_net=closing_net, opening_net=opening_net,
+        quotes=quotes,
     )
