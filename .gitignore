@@ -19,7 +19,6 @@ env/
 /data/
 models/
 logs/
-logs_ahmed/
 reports/integration_test/
 reports/runs/
 
@@ -31,6 +30,13 @@ mlruns/
 .env
 *.key
 
+# Agent context — local-only for now; decide later whether to share it with
+# the repo (to commit: drop this line, or `git add -f CLAUDE.md`).
+/CLAUDE.md
+
 # OS
 .DS_Store
 Thumbs.db
+
+# Session-to-session handoff plans (not project artifacts — see PLAN.md/reports/ for those)
+/Plans4agent_next_session/
