@@ -13614,3 +13614,206 @@ entry's four "left as registered, deliberately" items (operator working session,
 in the engine — still blocked on the vol-surface backfill, not yet discussed.
 
 ---
+
+## 2026-09-29 - CLOSED — W52a item 3: `max_position_risk_pct` lowered to close the W31 two-knob gap
+
+**SCOPE**: W52a (2026-09-22) registered, not fixed: `risk.max_position_risk_pct` (3%) and
+`risk.max_daily_loss_pct` (2%, the daily circuit breaker actually trips at `/1.5` = 1.33%)
+were independent knobs; a single max-loss iron condor sized at the 3% position cap could
+alone exceed the 1.33% daily-loss breaker threshold — the breaker could be blown through by
+ONE bad trade before its own consecutive-loss logic ever got a second data point. W52a
+explicitly deferred the remedy to an operator decision: lower `max_position_risk_pct` to
+`<=1.33%`, or raise `max_daily_loss_pct`, on backtest evidence.
+
+**DECISION (operator, 2026-09-29)**: lower `max_position_risk_pct` to 1.33%
+(`= max_daily_loss_pct / 1.5`), rather than raise `max_daily_loss_pct`. Chosen for
+confidence: it guarantees no single trade, at any account size, can alone trip the daily
+breaker — independent of wherever `max_daily_loss_pct` itself ends up landing later (see
+GUIDANCE below, that half of the original finding is still open).
+
+**CHANGE**:
+- `config.yaml` `risk.max_position_risk_pct`: `0.03` -> `0.0133`.
+- `src/ait/config/settings.py` `RiskConfig.max_position_risk_pct` Field default: `0.03` ->
+  `0.0133` (keeps the pydantic fallback honest if the config.yaml key is ever removed).
+
+**VERIFICATION**: the launch-size coherence self-test suite
+(`test_w31_sizing_selftest.py`, `test_w25_sizing_coherence.py`) demonstrated the breaker arm
+firing using the REAL config's own numbers as its acceptance case (R26's documented $5,356
+max condor vs a $4,030 breaker at $201k NLV) — that demonstration case is now, by design,
+gone: at 1.33% the largest structure the real builder emits (measured directly, not
+estimated) is ~$2,412 against a $4,030+ breaker at the same account sizes, comfortably under.
+8 tests across those two files (5 in `test_w31_sizing_selftest.py`, 3 in
+`test_w25_sizing_coherence.py`) used the live config as their real-world demonstration case;
+all 8 were updated to inject R26's original 3% cap instead, so they keep proving the arm
+itself still fires on a genuinely incoherent config rather than silently losing coverage
+because the live config stopped being broken. Full risk/orchestrator/backtest-adjacent test
+surface run clean afterward: `test_risk_guardrails.py`, `test_r16_risk_fixes.py`,
+`test_w52a_multiplier_revalidation_size.py`, `test_walkforward.py`,
+`test_w5_engine_cost_model.py`, `test_w30_declared_position_cache_class.py`,
+`test_hot_path_smoke.py`, `test_observe_mode_neutral_confidence.py`, `test_properties.py`,
+`test_r16_tail_fixes.py`, `test_r17_dormant_strategy_fixes.py`, `test_r17_minor_fixes.py`,
+`test_r17_risk_data_fixes.py`, `test_w26_budget_and_cluster_cooldown.py`,
+`test_w28_et_date_authority.py`, `test_w2_orchestrator_gates.py` — zero new failures across
+all of the above. One unrelated, pre-existing failure
+(`test_r19_config_authority.py::TestContractIsTheSingleAuthority::
+test_applier_and_readers_share_one_table`, a `CONTRACT_DEFAULTS` 3.0-vs-4.0 mismatch with no
+connection to `risk.*` config) surfaced in a background fast-lane run during this session;
+flagged separately, not caused by or fixed by this change.
+
+**GUIDANCE FOR THE REMAINING KNOB** (`max_daily_loss_pct`, currently 2%, unchanged this
+entry) — how to infer a value from backtest evidence, since this is the still-open half of
+the original two-knob finding:
+1. `run_backtest.py`'s own JSON report (`reports/backtest_*.json`) and the daily reports
+   (`reports/daily_*.json`) only carry whole-run/whole-day AGGREGATES
+   (`total_return`/`max_drawdown_pct`/etc, checked directly against
+   `reports/backtest_20260921_131135.json` and `reports/backtest_20260928_224000.json` —
+   both all-zero, no trades ran in either window at the current backfill state). What's
+   needed instead is the per-day REALIZED P&L series, which lives in the DuckDB
+   `ait_analytics.duckdb` closed-trades/daily-stats mirror once there's a real trade history
+   to mine, or from a fresh `run_backtest.py --optimize-per-window` run's underlying
+   per-window results once the backfill supports one across the full universe.
+2. Build the empirical distribution of realized daily P&L as a % of NLV across that window
+   — every trading day, not just loss days; the tail is what matters here.
+3. Read off the 95th/99th-percentile worst day, and separately the single worst day on
+   record. Cross-check against how many concurrent positions a genuinely bad day can
+   realistically produce: SPY/QQQ/IWM correlate ~0.95 (`risk.max_correlation`) and
+   `max_correlated_positions` caps simultaneous same-cluster entries at 2 — so the bar is
+   "the breaker should comfortably absorb 1-2 simultaneous max-loss condors," not just one
+   (which the 1.33% position cap decided above already guarantees alone, structurally, with
+   no backtest evidence needed).
+4. A `max_daily_loss_pct` such that the arm's own existing threshold formula
+   (`max_daily_loss_pct / 1.5`, unchanged by this wave) sits comfortably above that empirical
+   worst realistic 1-2-position day, while still being tight enough to halt trading
+   meaningfully before a bad day becomes a bad week, is the target. This is a real
+   backtest-evidence question, not something to derive from the two knobs alone — it needs
+   the actual daily P&L tail once there is enough real backfilled history to measure it
+   against.
+5. Blocked on: the same vol-surface backfill progress as W52a item 4 (IV-rank floor) — both
+   remaining pieces of the original W52a register (this knob, and item 4) now share one
+   blocker.
+
+**STATE AT HANDOFF**: W52a items 1-3 of 4 resolved this working session (1 closed via code,
+2 register-only survey, 3 closed via this config decision). Item 4 (IV-rank floor) remains,
+blocked on the same backfill that also blocks picking `max_daily_loss_pct`'s value.
+
+**NEXT**: once the backfill is far enough along to produce real daily P&L evidence, revisit
+`max_daily_loss_pct` using the methodology above; that same evidence run also unblocks W52a
+item 4. Discuss item 4 with the operator next.
+
+**CORRECTION (same session, minutes later)**: the NEXT section above dropped the standing
+carried-forward pointer list every entry since W53 has restated (most recently W54b's own
+NEXT, this file). Restating in full, nothing here resolved by this entry:
+- **W53's placing run** — the live open->roll->flatten probe on SPY against real TWS paper
+  (`scripts/probe_w53_roll_atomicity.py`), needs an RTH session with TWS reachable and the
+  Mac bot stopped for the duration; its ATOMIC/SEQUENTIAL/INCONCLUSIVE verdict determines
+  the roll combo-placement/fill-handling design W60/W61 already built ahead of this evidence.
+  **Checked right now (2026-09-29, Tue ~12:07 ET): market is open, TWS paper (127.0.0.1:7497)
+  is reachable — the precondition this item has been waiting on since 2026-09-27. The Mac
+  bot is currently RUNNING (`ait.main --paper`, live heartbeat) and would need to be stopped
+  first**, which is an operator-confirm action per CLAUDE.md, not something to do
+  unilaterally.
+- **The portfolio-risk-gate netting** for a roll's opening leg (`risk/manager.py`) — still
+  registered, operator's own explicit prior choice.
+- **Backtesting the EV path against real history** — still the prerequisite before
+  `comparison_model: "ev"` should be operator-selected live/paper; blocked on the
+  vol-surface backfill.
+- **Per-strike IV-quality tracking** beyond the existing whole-chain `iv_is_guessed`
+  boolean — registered if the coarser signal proves too blunt in practice.
+- **The real multi-day vol-surface backfill run's own progress** — operator-run, status
+  unconfirmed as of this entry.
+- **W52a's four items** — 1-3 now resolved (this session); item 4 (IV-rank floor) remains,
+  sharing the same backfill blocker as `max_daily_loss_pct`'s own still-open value above.
+
+---
+
+## 2026-09-29 - RUN — W53's live placing run: two INCONCLUSIVE trials, real, repeatable, not the answer the wave needed
+
+**SCOPE**: `scripts/probe_w53_roll_atomicity.py` has been waiting since 2026-09-27 for an RTH
+session with TWS reachable, per W53's own NEXT (`:9551-9557`). Checked mid-session
+(2026-09-29, Tue ~12:07 ET): market open, TWS paper (127.0.0.1:7497) reachable — operator
+confirmed running it. The Mac bot (`ait.main --paper`, PID 33377) and supervisor
+(`run_orchestrator.py`, PID 27234) were running; both stopped cleanly via `SIGTERM` to the
+supervisor (its own `graceful_shutdown` handler — `bot.stop()`, `web.stop()`,
+`scheduler.shutdown()`), confirmed exited before anything was placed. This exercised the
+bot-day-09 shutdown-marks-snapshot fix (same session, above) live for the first time.
+
+**PREFLIGHT** (fresh run, read-only, no orders): clean. Vertical A (open) SELL 753P/BUY 750P
+exp 2026-10-05; vertical B (roll target) SELL 740P/BUY 737P exp 2026-10-23. Both legs'
+`whatIfOrder` returned `ok: true` (~$310 maintenance margin, ~$61 credit on open, ~$16 net
+debit on the roll). `_validate_roll_legs` raised no error. Roll combo bag quoted $0.00/$0.10
+— tight, seemingly fillable. Operator explicit go-ahead given after reviewing this exact
+output, per the register's standing convention for this probe.
+
+**TRIAL 1** (12:21-12:27 ET): `open` filled cleanly — order 2276, SELL 752P/BUY 749P
+(strikes drifted slightly from preflight, ~9 min later; `open` re-picks the vertical live,
+expected), $0.39/contract credit. `roll` (order 2946, the 4-leg cross-expiry BAG, closing
+752/749 + opening 740/737, net debit capped at $2.00) was placed at mid, repriced to
+50%-to-natural at +45s, repriced to natural (most aggressive marketable price) at +90s, held
+there for the full 60s budget, and was **cancelled by the script itself** at +150s —
+never partially filled, never rejected or errored by IB at any point (`code=202 "Order
+Canceled - reason:"` is IB's ack of the CLIENT's own cancel, not a rejection). `main()`'s
+own safety net then auto-ran `flatten`, closing the original 752/749 vertical A for a
+$0.40/contract debit — filled immediately, $0.01/contract round-trip cost. `status` after:
+`probe_positions: []`, `probe_open_orders: []` — flat, clean.
+
+**TRIAL 2** (12:35-12:47 ET, operator-approved retry): the script's own daily one-cycle
+guard (state keyed by `reports/w53_probe/<ET date>/state.json`) refused a second `open` —
+a deliberate rate-limit rail, not a bug. Operator explicitly chose to override it rather
+than wait for tomorrow's RTH; state.json backed up to `state_trial1.json` (not deleted) and
+reset so a second full cycle could run today, with today's evidence trail intact under both
+names. `open` filled again (order 3758, SELL 753P/BUY 750P, $0.43/contract credit). `roll`
+(order 4428) reproduced trial 1's EXACT cadence: placed, repriced at +45s, repriced at +90s
+(both squarely on `LADDER_STEP_SECONDS=45`), and this time reported `PendingCancel` rather
+than `Cancelled` at the +60s cancel deadline (a client-cancel-in-flight status, same
+underlying self-cancel, same non-fill outcome) — again never partially filled, again no
+IB-side error or rejection. Auto-`flatten` ran again (order 4436, closing the same 753/750
+vertical, this time itself needing two reprices before filling at $0.48/contract debit,
+~$0.05/contract worse than trial 1's immediate fill — general fill friction today, not
+specific to the 4-leg combo). `status` after: `probe_positions: []`, `probe_open_orders: []`
+— flat, clean again.
+
+**VERDICT**: **INCONCLUSIVE, twice, with the same repeatable failure shape** — not ATOMIC,
+not SEQUENTIAL, per the verdict rule W53 itself defined before any order was placed. Both
+trials: IB fully accepted and worked the 4-leg cross-expiry roll BAG through the entire
+price ladder (mid -> 50%-to-natural -> natural) with zero errors or rejections, and it
+simply never traded, even at the natural (most aggressive marketable) price, within the
+script's ~2.5-minute total budget (90s of laddering + 60s held at natural). This is real,
+repeatable evidence, not a fluke — the exact same 45s/45s/60s cadence produced the exact
+same outcome twice, on two different strike/expiry pairs, ~24 minutes apart.
+
+**WHAT THIS DOES AND DOESN'T ANSWER**: it does NOT tell us whether a filled cross-expiry
+roll BAG fills atomically or leg-by-leg — no fill occurred either time, so that question
+remains genuinely open. It DOES tell us something arguably more load-bearing for the
+`execute_rolls` build (W60/W61, already built, currently gated off): a 4-leg cross-expiry
+roll combo, priced and capped exactly the way this wave's design intends
+(`MAX_ROLL_NET_DEBIT=2.00`, natural-price ceiling), is not a reliable same-session fill on
+this environment within a ~2.5-minute window, twice in a row. Two honest caveats: (1) this
+is PAPER trading — IB's paper matching engine is known to sometimes simulate multi-leg BAG
+fills more conservatively than live order flow would; this evidence cannot rule that out.
+(2) two trials is still a small sample — real distribution unknown.
+
+**COST**: two open/flatten round trips on 1-contract SPY verticals, ~$0.01 and ~$0.05 per
+contract respectively — trivial, paper account, by design (the script's own hard caps: 1
+contract, SPY only, width <=$5, roll debit <=$2.00).
+
+**STATE AT HANDOFF**: probe confirmed flat (`probe_positions: []`, `probe_open_orders: []`)
+after both trials. `reports/w53_probe/2026-09-29/` holds both trials' full evidence
+(`state_trial1.json`, `state_trial2.json`, and the appended `preflight/open/roll/flatten/
+status.jsonl` files covering both). No `src/ait` file changed — this entry, like W53's own,
+touches only the probe script's own state files and PLAN.md. Bot/supervisor were stopped for
+the duration; **not yet restarted** as of this entry — operator's call per CLAUDE.md
+(`ait.main`/the supervisor restart is the operator's, not Claude's, to make unilaterally).
+
+**NEXT**: this result is real input the `execute_rolls` design (still gated OFF) should
+account for before it's ever turned on: either the ladder/hold budget needs to be more
+patient than 2.5 minutes for a 4-leg cross-expiry combo, or the design needs an explicit
+fallback for "the atomic BAG didn't fill in budget" (e.g., cancel and leg the close/open
+sequentially, accepting the ATOMIC-vs-SEQUENTIAL question then answers itself operationally
+rather than by design choice) — an operator decision, not something to default silently.
+A third trial (different DTE windows, a longer hold, or accepting a worse net debit) would
+add another data point if the operator wants one; today's probe is done. Restart the
+bot/supervisor when the operator says so. Every other open item is unchanged from the
+correction above (portfolio-risk-gate netting, EV path backtest, per-strike IV-quality
+tracking, the backfill run's own progress, W52a item 4).
+
+---

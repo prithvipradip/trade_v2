@@ -129,8 +129,17 @@ class TestTheBreakerArmSeesTheLargestStructure:
 
         At HEAD both were silent: the $1 probe pinned one trade's loss at $130
         for every account, so `breaker_usd < 1.5 * 130` was False above ~$6k.
+
+        PLAN 2026-09-29: the live config's max_position_risk_pct was lowered
+        to 1.33% (= max_daily_loss_pct / 1.5) specifically so this class of
+        structure can no longer occur for real — that closed W52a item 3, the
+        two-knob unification. This test now injects R26's original 3% cap to
+        prove the arm still catches an incoherent config, rather than relying
+        on the live config being broken.
         """
-        probe = _Probe(settings)
+        s = settings.model_copy(deep=True)
+        s.risk.max_position_risk_pct = 0.03
+        probe = _Probe(s)
         assert _run(probe, nlv)
 
         assert any("daily-loss breaker" in a for a in probe.alerts), (
@@ -144,13 +153,19 @@ class TestTheBreakerArmSeesTheLargestStructure:
         This is the defect in one assertion: the number driving the arm has to
         MOVE with the account. At HEAD it was $130 at $9,750 and $130 at
         $201,475.
+
+        PLAN 2026-09-29: injects R26's own 3% cap (rather than the now-lower
+        live 1.33%, W52a item 3) so this test keeps measuring against R26's
+        documented acceptance numbers regardless of where the live knob sits.
         """
-        probe = _Probe(settings)
+        s = settings.model_copy(deep=True)
+        s.risk.max_position_risk_pct = 0.03
+        probe = _Probe(s)
         losses = {
             nlv: max(
                 (p["max_loss"] or 0.0)
                 for p in probe._probe_cap_grid(
-                    nlv * settings.risk.max_position_risk_pct)["probes"]
+                    nlv * s.risk.max_position_risk_pct)["probes"]
             )
             for nlv in (DEPLOYED_NLV, 50_000.0, LIVE_NLV)
         }
@@ -377,10 +392,18 @@ class TestNoArmIsAnAlgebraicIdentity:
         )
 
     def test_the_verdict_itself_is_not_constant(self, settings):
-        """Anti-vacuity: an arm that ALWAYS fires is as dead as one that never does."""
-        loud = _Probe(settings)
+        """Anti-vacuity: an arm that ALWAYS fires is as dead as one that never does.
+
+        PLAN 2026-09-29: the live config is coherent by design now (W52a item
+        3 closed max_position_risk_pct at max_daily_loss_pct / 1.5), so "loud"
+        injects R26's own 3% cap to demonstrate the arm still fires on a
+        known-incoherent config.
+        """
+        loud_s = settings.model_copy(deep=True)
+        loud_s.risk.max_position_risk_pct = 0.03
+        loud = _Probe(loud_s)
         _run(loud, LIVE_NLV)
-        assert loud.alerts, "premise moved: the real config is coherent at $201k"
+        assert loud.alerts, "the arm did not fire on a known-incoherent config"
 
         s = settings.model_copy(deep=True)
         s.risk.max_daily_loss_pct = 0.10
@@ -459,7 +482,11 @@ class TestTheOperatorCanSeeWhatHappened:
 
     def test_the_log_carries_the_problem_text_not_just_a_count(self, settings, monkeypatch):
         """_send_notification returns early when Telegram is unconfigured, so
-        the count was all an operator reading logs ever saw."""
+        the count was all an operator reading logs ever saw.
+
+        PLAN 2026-09-29: injects R26's own 3% cap since the live config is now
+        coherent by design (W52a item 3) and would log problems=0.
+        """
         from ait.bot import orchestrator as orch_mod
 
         captured: list[dict] = []
@@ -471,7 +498,9 @@ class TestTheOperatorCanSeeWhatHappened:
             return real(event, **kw)
 
         monkeypatch.setattr(orch_mod.log, "info", _spy)
-        _run(_Probe(settings), LIVE_NLV)
+        s = settings.model_copy(deep=True)
+        s.risk.max_position_risk_pct = 0.03
+        _run(_Probe(s), LIVE_NLV)
 
         assert captured, "the check logged no launch_size_coherence line"
         line = captured[0]

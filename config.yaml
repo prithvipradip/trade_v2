@@ -50,7 +50,14 @@ risk:
   pause_minutes_after_losses: 30       # Cool-down period
   max_api_failures: 5                  # Halt after 5 API failures in 10 min
   min_confidence: 0.50                 # At learning floor — capture more marginal signals to learn from (was 0.55)
-  max_position_risk_pct: 0.03          # Per-trade max_loss cap vs NLV (was hardcoded in manager.py)
+  max_position_risk_pct: 0.0133        # PLAN 2026-09-29: lowered 0.03->0.0133 (operator decision,
+                                       # closes W52a item 3, the two-knob unification). At 0.03,
+                                       # a single max-loss condor could alone exceed the daily
+                                       # circuit breaker (max_daily_loss_pct / 1.5 = 0.0133) before
+                                       # the breaker's own consecutive-loss logic ever got a second
+                                       # data point. Aligning this cap to the breaker's own trip
+                                       # threshold means no single trade can breach the daily
+                                       # breaker alone. Per-trade max_loss cap vs NLV.
   max_correlation: 0.75                # Correlation above which symbols count as the same bet
   max_correlated_positions: 2          # Positions per correlated cluster (was code default)
   post_stop_cluster_cooldown_minutes: 120  # W26: post-stop re-entry block for CLUSTER SIBLINGS

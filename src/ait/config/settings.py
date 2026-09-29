@@ -81,9 +81,12 @@ class RiskConfig(_StrictModel):
                     "(user-approved) - the <=4 window blacked out ~half of all "
                     "trading days and refused the richest premium; every 14-30 "
                     "DTE hold spans events regardless, wings cap the surprise.")
-    max_position_risk_pct: float = Field(default=0.03, ge=0.005, le=0.10,
+    max_position_risk_pct: float = Field(default=0.0133, ge=0.005, le=0.10,
         description="Per-trade max_loss cap as a fraction of NLV (was "
-                    "hardcoded 0.03 in manager.py — audit item 3.3).")
+                    "hardcoded 0.03 in manager.py — audit item 3.3). PLAN "
+                    "2026-09-29: lowered 0.03->0.0133 to align with the daily "
+                    "circuit breaker's own trip threshold (max_daily_loss_pct "
+                    "/ 1.5) — closes W52a item 3, the two-knob unification.")
     max_correlation: float = Field(default=0.75, ge=0.30, le=0.99,
         description="Correlation above which two symbols count as the same bet.")
     max_correlated_positions: int = Field(default=2, ge=1, le=8,

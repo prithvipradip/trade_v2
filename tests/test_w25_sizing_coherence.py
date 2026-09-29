@@ -486,7 +486,17 @@ class TestLaunchSizeCoherenceCheck:
             "this no longer tests the vacuous case"
         )
 
-        probe = _CoherenceProbe(settings)
+        # PLAN 2026-09-29: the live config's max_position_risk_pct was lowered
+        # to 1.33% (W52a item 3, the two-knob unification), so the two
+        # "daily-loss breaker" cases below no longer occur for real. Inject
+        # R26's original 3% cap to keep proving the arm fires on an
+        # incoherent config; the "emits ZERO" case (below the trading floor)
+        # is unaffected by this knob and keeps using the real settings.
+        s = settings
+        if expected == "daily-loss breaker":
+            s = settings.model_copy(deep=True)
+            s.risk.max_position_risk_pct = 0.03
+        probe = _CoherenceProbe(s)
         await probe._launch_size_coherence_check(nlv)
 
         assert any(expected in a for a in probe.alerts), (
@@ -508,8 +518,13 @@ class TestLaunchSizeCoherenceCheck:
 
         So the silence WAS the defect, and pinning it was pinning the bug. What
         must hold instead is that the account is told.
+
+        PLAN 2026-09-29: injects R26's own 3% cap since the live config is now
+        coherent by design (W52a item 3) and would log problems=0.
         """
-        probe = _CoherenceProbe(settings)
+        s = settings.model_copy(deep=True)
+        s.risk.max_position_risk_pct = 0.03
+        probe = _CoherenceProbe(s)
         await probe._launch_size_coherence_check(197_000.0)
 
         assert any("daily-loss breaker" in a for a in probe.alerts), (
