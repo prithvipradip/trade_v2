@@ -13606,4 +13606,11 @@ hard structural cap); only `covered_call`/`covered_put` (undefined-risk, or shar
 dependent) would actually require real margin modeling, and both have their own more
 fundamental blockers first. Everything else in the register unchanged from the prior entry.
 
+**Cross-reference**: the entry immediately above is item 2 of the 2026-09-22 W52a EXECUTED
+entry's four "left as registered, deliberately" items (operator working session, 2026-09-29):
+(1) bot-day-09 shutdown MTM stamp — closed same day, see the CLOSED entry above; (2)
+`whatIfOrder` pre-trade margin — this entry; (3) the `risk.max_position_risk_pct` /
+`max_daily_loss_pct` two-knob unification from W31 — next under discussion; (4) IV-rank floor
+in the engine — still blocked on the vol-surface backfill, not yet discussed.
+
 ---
