@@ -14165,3 +14165,22 @@ again.
 **NEXT**: restart the bot/supervisor when the operator wants the new config-backed
 thresholds live (operator's call, not forced by this entry). The register-restatement
 entry's remaining priority order still applies: arch-04/arch-01/02 next, then the rest.
+
+**CORRECTION (operator follow-up, same day)**: the line immediately above restates the
+register-restatement entry's own stated order — arch-04/arch-01/02 ranked ABOVE qual-01/02/04
+— which is not what actually happened. Asked directly which item to address first, the
+recommendation given (and the one the operator approved, leading to this wave) was
+**qual-01/02/04 first**, ahead of arch-01..04, on different reasoning than the register
+entry's own "stated root cause per R25" framing: qual-01/02/04 sit directly on the touch
+stop's protection path, and the operator had already said, earlier this session, that
+closing gaps in the bot's own protection mechanisms mattered most to them (the same reasoning
+that drove the bot-day-09 close). arch-01..04 is real and arguably the deeper, more
+consequential root cause long-term — but it is a bigger, more strategic undertaking
+(touching `orchestrator.py`'s own structure) with no single position-protection payoff, so it
+lost to the more urgent, narrower fix on direct request. Both orderings are defensible; the
+problem was the ledger asserting one (arch first) while the operator and this session
+actually acted on the other (qual first) — that mismatch, not either ordering itself, is
+what's being corrected here. Going forward, the accurate priority order, given qual-01/02/04
+is now closed: **arch-04 (`orchestrator.py` god object) and arch-01/02 next**, then the
+batch-3/SIGKILL/AutoRestartTime cluster, then triage batch 2 — same as the register
+entry's items (2)-(4), just with item (1) now done and no longer first in line.
