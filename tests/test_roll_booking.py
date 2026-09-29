@@ -13,9 +13,12 @@ import pytest
 
 from ait.bot.state import StateManager, TradeDirection, TradeRecord, TradeStatus
 from ait.execution.roll_booking import (
+    _persistable_legs,
     _promote_and_link_opening_trade,
     book_roll_fill,
     cas_roll_closing_trade,
+    parse_roll_order_ref,
+    roll_order_ref,
     seed_roll_opening_trade,
     split_roll_fill_price,
 )
@@ -30,6 +33,10 @@ OPENING_LEGS = [
     {"strike": 450.0, "right": "P", "action": "BUY", "expiry": "2026-10-23"},
     {"strike": 460.0, "right": "P", "action": "SELL", "expiry": "2026-10-23"},
 ]
+# W57: a plain-vertical roll carries no other side -- most existing tests
+# use this (carried_legs=[], carried_value=0.0). A dedicated section below
+# covers a 4-leg IC's carried call vertical.
+NO_CARRIED: list[dict] = []
 
 
 def _state(tmp_path) -> StateManager:
@@ -85,11 +92,48 @@ class TestSplitRollFillPrice:
 
 
 # ---------------------------------------------------------------------------
+# roll_order_ref / parse_roll_order_ref -- the reconciler's marker
+# ---------------------------------------------------------------------------
+
+class TestRollOrderRef:
+    def test_round_trips(self):
+        ref = roll_order_ref("T-A", "T-B")
+        assert parse_roll_order_ref(ref) == ("T-A", "T-B")
+
+    def test_plain_trade_id_is_not_a_roll_ref(self):
+        """A normal exit's order_ref is a bare trade_id -- must never be
+        misread as a roll (no colons to split on)."""
+        assert parse_roll_order_ref("T-A") is None
+
+    def test_empty_string_is_not_a_roll_ref(self):
+        assert parse_roll_order_ref("") is None
+
+
+# ---------------------------------------------------------------------------
+# _persistable_legs -- W57 bug 3 (unserializable legs)
+# ---------------------------------------------------------------------------
+
+class TestPersistableLegs:
+    def test_strips_contract_but_keeps_everything_else(self):
+        legs = [{"strike": 460.0, "right": "P", "action": "SELL", "expiry": "2026-10-23",
+                 "conId": 111, "ratio": 1, "_contract": object()}]
+        out = _persistable_legs(legs)
+        assert out == [{"strike": 460.0, "right": "P", "action": "SELL",
+                        "expiry": "2026-10-23", "conId": 111, "ratio": 1}]
+        # The real regression guard: json.dumps must not raise on the
+        # ORIGINAL legs' worth of data once passed through this.
+        json.dumps(out)
+
+    def test_legs_without_contract_pass_through_unchanged(self):
+        assert _persistable_legs(OPENING_LEGS) == OPENING_LEGS
+
+
+# ---------------------------------------------------------------------------
 # seed_roll_opening_trade
 # ---------------------------------------------------------------------------
 
 class TestSeedRollOpeningTrade:
-    def test_writes_a_pending_row_with_the_opening_legs(self, tmp_path):
+    def test_writes_a_pending_row_with_the_opening_legs_only(self, tmp_path):
         state = _state(tmp_path)
         closing = _closing_trade()
         state.record_trade(closing)
@@ -104,6 +148,39 @@ class TestSeedRollOpeningTrade:
         assert fetched is not None
         assert fetched.status == TradeStatus.PENDING
         assert json.loads(fetched.legs) == OPENING_LEGS
+
+    def test_rolled_from_trade_id_is_set_at_seed_time_not_deferred_to_promotion(self, tmp_path):
+        """W57: record_trade()'s own INSERT doesn't carry the column
+        (state.py:340-369) -- must be set by an explicit follow-up write,
+        and must be visible immediately, before any fill lands."""
+        state = _state(tmp_path)
+        closing = _closing_trade()
+        state.record_trade(closing)
+        opened = seed_roll_opening_trade(
+            state, closing, OPENING_LEGS, _roll_target(), quantity=1, entry_price_estimate=0.75,
+        )
+        fetched = state.get_trade_by_id(opened.trade_id)
+        assert fetched.rolled_from_trade_id == closing.trade_id
+
+    def test_serializes_legs_straight_out_of_qualify_roll_legs(self, tmp_path):
+        """W57 bug 3, reproduced directly: qualify_roll_legs' own output
+        shape (each leg carrying a live, non-JSON-serializable '_contract')
+        must not raise here."""
+        state = _state(tmp_path)
+        closing = _closing_trade()
+        state.record_trade(closing)
+        qualified_opening = [
+            {**leg, "conId": 900 + i, "ratio": 1, "_contract": object()}
+            for i, leg in enumerate(OPENING_LEGS)
+        ]
+        opened = seed_roll_opening_trade(
+            state, closing, qualified_opening, _roll_target(),
+            quantity=1, entry_price_estimate=0.75,
+        )
+        fetched = state.get_trade_by_id(opened.trade_id)
+        stored = json.loads(fetched.legs)
+        assert all("_contract" not in leg for leg in stored)
+        assert {leg["conId"] for leg in stored} == {900, 901}
 
     def test_duplicate_trade_id_does_not_duplicate_the_row(self, tmp_path, monkeypatch):
         """INSERT OR IGNORE's own existing guarantee, proven here (via a
@@ -165,37 +242,45 @@ class TestPromoteAndLinkOpeningTrade:
         )
         return state, closing, opening
 
-    def test_promotes_and_links_together(self, tmp_path):
+    def test_promotes_links_and_sets_legs_together(self, tmp_path):
         state, closing, opening = self._pending_opening(tmp_path)
+        merged = json.dumps(OPENING_LEGS)
         ok = _promote_and_link_opening_trade(
-            state, opening.trade_id, 0.65, 1, closing.trade_id,
+            state, opening.trade_id, 0.65, 1, closing.trade_id, merged,
         )
         assert ok is True
         b = state.get_trade_by_id(opening.trade_id)
         assert b.status == TradeStatus.FILLED
         assert b.rolled_from_trade_id == closing.trade_id
         assert b.entry_price == pytest.approx(0.65)
+        assert json.loads(b.legs) == OPENING_LEGS
 
-    def test_refused_when_not_pending_or_partial_leaves_both_untouched(self, tmp_path):
-        """Proves the two fields are coupled in one CAS, not two independent
-        writes: a refused promotion must leave rolled_from_trade_id unset
-        too, not just status unchanged."""
+    def test_refused_when_not_pending_or_partial_leaves_everything_untouched(self, tmp_path):
+        """Proves the CAS is refused wholesale on a wrong status -- the
+        legs write (this test's own new field, on top of status +
+        rolled_from_trade_id) must never land on a non-PENDING/PARTIAL row
+        either. rolled_from_trade_id is already set at SEED time (not
+        deferred to promotion -- see TestSeedRollOpeningTrade), so a
+        refused promotion here leaves it exactly as seed_roll_opening_trade
+        left it, not None."""
         state, closing, opening = self._pending_opening(tmp_path)
         state.transition(opening.trade_id, (TradeStatus.PENDING,), TradeStatus.CANCELLED)
+        original_legs = state.get_trade_by_id(opening.trade_id).legs
 
         ok = _promote_and_link_opening_trade(
-            state, opening.trade_id, 0.65, 1, closing.trade_id,
+            state, opening.trade_id, 0.65, 1, closing.trade_id, json.dumps(CARRIED_CALL_LEGS),
         )
         assert ok is False
         b = state.get_trade_by_id(opening.trade_id)
         assert b.status == TradeStatus.CANCELLED
-        assert b.rolled_from_trade_id is None
+        assert b.rolled_from_trade_id == closing.trade_id  # set at seed, untouched by the refusal
+        assert b.legs == original_legs  # NOT overwritten with the attempted merged legs
 
     def test_single_atomic_update_statement(self, tmp_path, monkeypatch):
         """The direct regression guard for the bug this fix closes: the
-        status CAS and the rolled_from_trade_id write must be ONE
-        statement, not state.transition() followed by a separate UPDATE
-        (the prior design's real crash window)."""
+        status CAS, the rolled_from_trade_id write, and the legs write must
+        be ONE statement, not several (the prior design's real crash
+        window)."""
         state, closing, opening = self._pending_opening(tmp_path)
 
         import sqlite3 as real_sqlite3
@@ -225,11 +310,14 @@ class TestPromoteAndLinkOpeningTrade:
         import ait.execution.roll_booking as rb_mod
         monkeypatch.setattr(rb_mod.sqlite3, "connect", _spy_connect)
 
-        _promote_and_link_opening_trade(state, opening.trade_id, 0.65, 1, closing.trade_id)
+        _promote_and_link_opening_trade(
+            state, opening.trade_id, 0.65, 1, closing.trade_id, json.dumps(OPENING_LEGS),
+        )
 
         updates = [s for s in executed_sql if s.strip().upper().startswith("UPDATE")]
         assert len(updates) == 1, f"expected exactly one UPDATE, got {len(updates)}: {updates}"
         assert "status" in updates[0] and "rolled_from_trade_id" in updates[0]
+        assert "legs" in updates[0]
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +332,11 @@ LEG_FILLS = [
 ]
 CLOSING_CONIDS = {1, 2}
 OPENING_CONIDS = {3, 4}
+
+CARRIED_CALL_LEGS = [
+    {"strike": 520.0, "right": "C", "action": "SELL", "expiry": "2026-10-05"},
+    {"strike": 530.0, "right": "C", "action": "BUY", "expiry": "2026-10-05"},
+]
 
 
 class TestBookRollFill:
@@ -268,6 +361,7 @@ class TestBookRollFill:
         state, closing, opening = self._seeded(tmp_path)
         ok = book_roll_fill(
             state, closing, opening.trade_id, LEG_FILLS, CLOSING_CONIDS, OPENING_CONIDS,
+            NO_CARRIED, 0.0,
         )
         assert ok is True
 
@@ -279,11 +373,13 @@ class TestBookRollFill:
         b = state.get_trade_by_id(opening.trade_id)
         assert b.status == TradeStatus.FILLED
         assert b.rolled_from_trade_id == closing.trade_id
-        assert b.entry_price == pytest.approx(-0.90 + 0.15)
+        assert b.entry_price == pytest.approx(abs(-0.90 + 0.15))
+        assert json.loads(b.legs) == OPENING_LEGS
 
     def test_capital_at_risk_defaults_to_as_own(self, tmp_path):
         state, closing, opening = self._seeded(tmp_path, capital_at_risk=190.0)
-        book_roll_fill(state, closing, opening.trade_id, LEG_FILLS, CLOSING_CONIDS, OPENING_CONIDS)
+        book_roll_fill(state, closing, opening.trade_id, LEG_FILLS, CLOSING_CONIDS,
+                       OPENING_CONIDS, NO_CARRIED, 0.0)
         b = state.get_trade_by_id(opening.trade_id)
         assert b.capital_at_risk == pytest.approx(190.0)
 
@@ -291,32 +387,32 @@ class TestBookRollFill:
         state, closing, opening = self._seeded(tmp_path, capital_at_risk=190.0)
         book_roll_fill(
             state, closing, opening.trade_id, LEG_FILLS, CLOSING_CONIDS, OPENING_CONIDS,
-            capital_at_risk=250.0,
+            NO_CARRIED, 0.0, capital_at_risk=250.0,
         )
         b = state.get_trade_by_id(opening.trade_id)
         assert b.capital_at_risk == pytest.approx(250.0)
 
-    def test_credit_strategy_closed_for_a_debit_is_a_realized_loss(self, tmp_path):
-        """A credit vertical (entry_price=1.50 received) closed by paying
-        0.80 net (BUY back 1.00, SELL back 0.20) nets a LOSS: received 1.50,
-        paid 0.80 more than that would be a gain -- check the actual sign
-        against _option_position_unrealized's own polarity directly."""
+    def test_credit_strategy_closed_for_less_than_its_credit_is_a_gain(self, tmp_path):
+        """W57 bug 2 (fixed): a credit vertical (entry_price=1.50 received)
+        bought back for a net 0.80 debit (BUY back 1.00, SELL back 0.20) is
+        a GAIN of $70 -- received 1.50, paid back only 0.80. The pre-fix
+        formula booked +$230 here (entry/exit sign inverted); this is the
+        corrected value, matching _calculate_realized_pnl's own credit
+        formula (executor.py:2708-2710) with carried_value=0."""
         state, closing, opening = self._seeded(tmp_path, strategy="iron_condor", entry_price=1.50)
-        book_roll_fill(state, closing, opening.trade_id, LEG_FILLS, CLOSING_CONIDS, OPENING_CONIDS)
+        book_roll_fill(state, closing, opening.trade_id, LEG_FILLS, CLOSING_CONIDS,
+                       OPENING_CONIDS, NO_CARRIED, 0.0)
         a = state.get_trade_by_id(closing.trade_id)
-        # signed_entry = -1.50 (credit); closing_net = 0.80; pnl = (0.80 - (-1.50))*100*1 = 230
-        # i.e. paying only 0.80 to close a 1.50 credit is a GAIN, matching
-        # _option_position_unrealized's own formula exactly.
-        assert a.realized_pnl == pytest.approx((0.80 - (-1.50)) * 100)
+        assert a.realized_pnl == pytest.approx((1.50 - 0.80) * 100)
 
     def test_debit_strategy_polarity_is_the_mirror_of_credit(self, tmp_path):
         state, closing, opening = self._seeded(
             tmp_path, strategy="long_straddle", entry_price=1.50,
         )
-        book_roll_fill(state, closing, opening.trade_id, LEG_FILLS, CLOSING_CONIDS, OPENING_CONIDS)
+        book_roll_fill(state, closing, opening.trade_id, LEG_FILLS, CLOSING_CONIDS,
+                       OPENING_CONIDS, NO_CARRIED, 0.0)
         a = state.get_trade_by_id(closing.trade_id)
-        # signed_entry = +1.50 (debit paid); closing_net = 0.80;
-        # pnl = (0.80 - 1.50) * 100 = -70 (a loss -- paid 1.50, got back 0.80).
+        # Debit: paid 1.50 to open, got back 0.80 on close -- a $70 LOSS.
         assert a.realized_pnl == pytest.approx((0.80 - 1.50) * 100)
 
     def test_a_not_in_closing_refuses_the_close_but_b_still_promotes(self, tmp_path):
@@ -336,6 +432,7 @@ class TestBookRollFill:
         )
         ok = book_roll_fill(
             state, closing, opening.trade_id, LEG_FILLS, CLOSING_CONIDS, OPENING_CONIDS,
+            NO_CARRIED, 0.0,
         )
         assert ok is False
         assert state.get_trade_by_id(closing.trade_id).status == TradeStatus.FILLED
@@ -350,6 +447,7 @@ class TestBookRollFill:
 
         ok = book_roll_fill(
             state, closing, opening.trade_id, LEG_FILLS, CLOSING_CONIDS, OPENING_CONIDS,
+            NO_CARRIED, 0.0,
         )
         assert ok is False
         # Promote-B-first means this is the CLEAN failure direction: B's
@@ -362,7 +460,81 @@ class TestBookRollFill:
         bad_fills = [{"conId": 999, "side": "BUY", "price": 1.0, "shares": 1}]
         ok = book_roll_fill(
             state, closing, opening.trade_id, bad_fills, CLOSING_CONIDS, OPENING_CONIDS,
+            NO_CARRIED, 0.0,
         )
         assert ok is False
         assert state.get_trade_by_id(closing.trade_id).status == TradeStatus.CLOSING
         assert state.get_trade_by_id(opening.trade_id).status == TradeStatus.PENDING
+
+    def test_opening_trade_missing_refuses(self, tmp_path):
+        """book_roll_fill now reads B's seeded legs from the DB (to merge
+        with carried_legs) -- a B row that doesn't exist must refuse
+        cleanly, not raise."""
+        state, closing, _opening = self._seeded(tmp_path)
+        ok = book_roll_fill(
+            state, closing, "T-DOES-NOT-EXIST", LEG_FILLS, CLOSING_CONIDS, OPENING_CONIDS,
+            NO_CARRIED, 0.0,
+        )
+        assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# book_roll_fill with a carried vertical -- W57 bug 1 (orphaned vertical)
+# ---------------------------------------------------------------------------
+
+class TestBookRollFillWithCarriedVertical:
+    def _seeded(self, tmp_path, *, entry_price=1.50):
+        state = _state(tmp_path)
+        closing = _closing_trade(entry_price=entry_price, status=TradeStatus.FILLED)
+        state.record_trade(closing)
+        assert cas_roll_closing_trade(state, closing.trade_id) is True
+        closing = state.get_trade_by_id(closing.trade_id)
+        opening = seed_roll_opening_trade(
+            state, closing, OPENING_LEGS, _roll_target(), quantity=1, entry_price_estimate=0.75,
+        )
+        return state, closing, opening
+
+    def test_carried_vertical_is_attached_to_b_not_orphaned(self, tmp_path):
+        state, closing, opening = self._seeded(tmp_path)
+        ok = book_roll_fill(
+            state, closing, opening.trade_id, LEG_FILLS, CLOSING_CONIDS, OPENING_CONIDS,
+            CARRIED_CALL_LEGS, carried_value=-0.75,
+        )
+        assert ok is True
+        b = state.get_trade_by_id(opening.trade_id)
+        stored_legs = json.loads(b.legs)
+        assert len(stored_legs) == 4
+        assert {(leg["strike"], leg["right"]) for leg in stored_legs} == {
+            (450.0, "P"), (460.0, "P"), (520.0, "C"), (530.0, "C"),
+        }
+
+    def test_pnl_with_carried_vertical_matches_hand_computed_cash_flow(self, tmp_path):
+        """The worked example from PLAN.md's W57 entry: $1.50 credit IC,
+        rolled put side bought back at 0.80 net debit, carried call
+        vertical marked at -0.30 (still a $0.30 liability). A must realize
+        +$40, and B's entry basis must be 1.05 (0.75 new credit + the 0.30
+        inherited from the carried side) -- both cash flows sum correctly
+        across the chain (the carried mark cancels: A books +0.30 worth of
+        it via exit_price, B absorbs the same 0.30 into its entry)."""
+        state, closing, opening = self._seeded(tmp_path)
+        ok = book_roll_fill(
+            state, closing, opening.trade_id, LEG_FILLS, CLOSING_CONIDS, OPENING_CONIDS,
+            CARRIED_CALL_LEGS, carried_value=-0.30,
+        )
+        assert ok is True
+        a = state.get_trade_by_id(closing.trade_id)
+        assert a.realized_pnl == pytest.approx(40.0)
+        b = state.get_trade_by_id(opening.trade_id)
+        assert b.entry_price == pytest.approx(1.05)
+
+    def test_no_carried_legs_is_pnl_neutral_versus_the_plain_case(self, tmp_path):
+        """carried_value=0.0 with an empty carried_legs list must reduce
+        exactly to the plain-vertical-roll numbers above -- the carried
+        machinery must not perturb a roll that has nothing to carry."""
+        state, closing, opening = self._seeded(tmp_path)
+        book_roll_fill(
+            state, closing, opening.trade_id, LEG_FILLS, CLOSING_CONIDS, OPENING_CONIDS,
+            [], 0.0,
+        )
+        a = state.get_trade_by_id(closing.trade_id)
+        assert a.realized_pnl == pytest.approx((1.50 - 0.80) * 100)

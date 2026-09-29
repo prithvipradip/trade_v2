@@ -89,7 +89,7 @@ class TestLegsForRoll:
     def test_reverses_the_closing_side_and_builds_the_opening_side(self):
         result = legs_for_roll(_trade(), "P", _roll_target())
         assert result is not None
-        closing, opening = result
+        closing, opening, _carried = result
         assert {(leg["strike"], leg["action"]) for leg in closing} == {
             (480.0, "BUY"), (470.0, "SELL"),
         }
@@ -99,8 +99,26 @@ class TestLegsForRoll:
         assert all(leg["expiry"] == "2026-10-23" for leg in opening)
 
     def test_call_side_untouched_when_rolling_the_put_side(self):
-        closing, _opening = legs_for_roll(_trade(), "P", _roll_target())
+        closing, _opening, _carried = legs_for_roll(_trade(), "P", _roll_target())
         assert all(leg["right"] == "P" for leg in closing)
+
+    def test_carried_legs_are_the_other_side_with_actions_unchanged(self):
+        """W57: rolling the put side of a 4-leg IC must hand back the call
+        vertical's own two legs, actions UNCHANGED (still the real open
+        position) -- these are what a caller attaches to the new trade so
+        the call vertical isn't orphaned at the broker."""
+        _closing, _opening, carried = legs_for_roll(_trade(), "P", _roll_target())
+        assert {(leg["strike"], leg["right"], leg["action"]) for leg in carried} == {
+            (520.0, "C", "SELL"), (530.0, "C", "BUY"),
+        }
+
+    def test_carried_legs_empty_for_a_plain_vertical(self):
+        legs = json.dumps([
+            {"strike": 470.0, "right": "P", "action": "SELL", "expiry": "2026-10-05"},
+            {"strike": 460.0, "right": "P", "action": "BUY", "expiry": "2026-10-05"},
+        ])
+        _closing, _opening, carried = legs_for_roll(_trade(legs), "P", _roll_target())
+        assert carried == []
 
     def test_not_a_clean_vertical_returns_none(self):
         legs = json.dumps([
@@ -209,6 +227,7 @@ class _FakeIB:
 DEFAULT_QUOTES = {
     480.0: (1.00, 1.10), 470.0: (0.20, 0.30),   # closing put vertical
     460.0: (0.90, 1.00), 450.0: (0.15, 0.25),   # opening put vertical
+    520.0: (0.85, 0.95), 530.0: (0.10, 0.20),   # carried call vertical (untouched)
 }
 
 
@@ -290,7 +309,7 @@ class TestPrepareRollCombo:
             {"strike": 470.0, "right": "P", "action": "SELL", "expiry": "2026-10-05"},
         ]
         monkeypatch.setattr(re_mod, "legs_for_roll",
-                            lambda trade, side, target: (good_closing, bad_opening))
+                            lambda trade, side, target: (good_closing, bad_opening, []))
 
         fake = _FakeIB(quotes_by_strike=DEFAULT_QUOTES)
         result = await prepare_roll_combo(
@@ -313,3 +332,44 @@ class TestPrepareRollCombo:
             debit_cap=0.01,
         )
         assert result is None
+
+    async def test_carried_vertical_is_qualified_and_marked_but_never_in_the_bag(self):
+        """W57: a 4-leg IC rolling its put side must qualify+quote the
+        untouched call vertical too, but the BAG order must still trade
+        only the 4 rolled-vertical legs (2 closing + 2 opening), never the
+        carried ones -- the carried side stays a separate, untouched
+        position at the broker."""
+        fake = _FakeIB(quotes_by_strike=DEFAULT_QUOTES)
+        result = await prepare_roll_combo(
+            fake, _trade(), "P", _roll_target(), SYMBOL, quantity=1, order_ref="TEST-ROLL",
+        )
+        assert isinstance(result, PreparedRollCombo)
+        assert {leg["strike"] for leg in result.carried_legs} == {520.0, 530.0}
+        assert all("conId" in leg for leg in result.carried_legs)
+        bag_con_ids = {leg["conId"] for leg in result.closing_legs + result.opening_legs}
+        carried_con_ids = {leg["conId"] for leg in result.carried_legs}
+        assert bag_con_ids.isdisjoint(carried_con_ids)
+        # position-sign mid: short 520C SELL -0.90, long 530C BUY +0.15
+        assert result.carried_value == pytest.approx(-0.90 + 0.15)
+
+    async def test_carried_vertical_missing_quote_refuses(self):
+        quotes = dict(DEFAULT_QUOTES)
+        del quotes[520.0]
+        fake = _FakeIB(quotes_by_strike=quotes)
+        result = await prepare_roll_combo(
+            fake, _trade(), "P", _roll_target(), SYMBOL, quantity=1, order_ref="TEST-ROLL",
+        )
+        assert result is None
+
+    async def test_no_carried_legs_for_a_plain_vertical_roll(self):
+        legs = json.dumps([
+            {"strike": 480.0, "right": "P", "action": "SELL", "expiry": "2026-10-05"},
+            {"strike": 470.0, "right": "P", "action": "BUY", "expiry": "2026-10-05"},
+        ])
+        fake = _FakeIB(quotes_by_strike=DEFAULT_QUOTES)
+        result = await prepare_roll_combo(
+            fake, _trade(legs), "P", _roll_target(), SYMBOL, quantity=1, order_ref="TEST-ROLL",
+        )
+        assert isinstance(result, PreparedRollCombo)
+        assert result.carried_legs == []
+        assert result.carried_value == 0.0

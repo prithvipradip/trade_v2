@@ -17,6 +17,7 @@ from datetime import datetime
 
 from ait.broker.ibkr_client import IBKRClient
 from ait.bot.state import StateManager, TradeStatus
+from ait.execution.roll_booking import parse_roll_order_ref
 from ait.strategies.base import CREDIT_STRATEGIES
 from ait.utils.logging import get_logger
 from ait.utils.time import now_et, parse_trade_ts
@@ -69,6 +70,15 @@ class ReconciliationResult:
     # orchestrator must call executor.adopt_exit_order(order_id, trade_id,
     # reason) for each so the exit tracker survives the restart.
     closing_exit_orders: dict[str, int] = field(default_factory=dict)
+    # W57: CLOSING trades KEPT closing because a working ROLL order (an
+    # orderRef built by roll_booking.roll_order_ref, "ROLL:<A>:<B>") names
+    # them as the closing side: trade_id -> broker orderId. Deliberately
+    # SEPARATE from closing_exit_orders above -- a roll order must never be
+    # re-adopted via executor.adopt_exit_order (that would track it as a
+    # plain single-trade exit and double-book the eventual fill against
+    # book_roll_fill's own booking). A future wiring wave re-registers
+    # these against its own _pending_roll_orders tracking instead.
+    closing_roll_orders: dict[str, int] = field(default_factory=dict)
 
 
 class PositionReconciler:
@@ -672,6 +682,26 @@ class PositionReconciler:
             log.warning("working_orders_fetch_failed", error=str(e))
             return None
 
+    def _working_roll_order_for(
+        self, trade, working: list[tuple[int, set[str], str, str]]
+    ) -> int | None:
+        """W57: orderId of a working ROLL order (orderRef built by
+        roll_booking.roll_order_ref, "ROLL:<A>:<B>") whose CLOSING side is
+        this trade. Checked BEFORE _working_exit_order_for's plain-exit
+        match by this module's one caller -- a roll order's orderRef never
+        equals trade.trade_id verbatim (it names TWO trades), so without
+        this check _working_exit_order_for would return None for it and
+        the CLOSING branch would revert A to FILLED mid-roll (the fill has
+        not landed yet; A's legs are still genuinely CLOSING at the
+        broker). A roll order's orderRef is never empty, so it can never
+        reach _working_exit_order_for's symbol/leg-key fallback either --
+        confirming the two paths cannot both claim the same working order."""
+        for order_id, _keys, _symbol, order_ref in working:
+            parsed = parse_roll_order_ref(order_ref)
+            if parsed is not None and parsed[0] == trade.trade_id:
+                return order_id
+        return None
+
     def _working_exit_order_for(
         self, trade, working: list[tuple[int, set[str], str, str]]
     ) -> int | None:
@@ -761,6 +791,23 @@ class PositionReconciler:
                 if ref and ref == trade.trade_id:
                     ib.cancelOrder(bt.order)
                     log.info("sweep_cancelled_by_order_ref",
+                             trade_id=trade.trade_id, order_ref=ref)
+                    return True
+
+            # Pass 1b (W57) — a working roll order tagged ROLL:<A>:<B>
+            # belongs to B (this trade, the roll's opening/PENDING side)
+            # even though its orderRef never equals trade.trade_id verbatim
+            # (it names two trades). Without this, Pass 2 below would
+            # `continue` past it (it HAS a ref, just not an exact match),
+            # Pass 3's foreign-order check would not recognise it either,
+            # and the sweep would eventually book B "never filled" while
+            # the roll order is still genuinely working at the broker.
+            for bt in active:
+                ref = str(getattr(getattr(bt, "order", None), "orderRef", "") or "")
+                parsed = parse_roll_order_ref(ref)
+                if parsed is not None and parsed[1] == trade.trade_id:
+                    ib.cancelOrder(bt.order)
+                    log.info("sweep_cancelled_roll_order_by_ref",
                              trade_id=trade.trade_id, order_ref=ref)
                     return True
 
@@ -1191,7 +1238,27 @@ class PositionReconciler:
                                      "counted nor refunded")
                     continue
                 closed += 1
-                self._refund_entry_budget(t)
+                if getattr(t, "rolled_from_trade_id", None):
+                    # W57: a roll child B that never filled consumed no
+                    # entry-budget slot (its "entry" was never a fresh
+                    # signal), so there is nothing to refund here -- doing
+                    # so anyway would hand back a slot never spent. Its
+                    # parent A was CAS'd FILLED->CLOSING when the roll was
+                    # seeded (cas_roll_closing_trade) and must come back to
+                    # FILLED now that the roll is confirmed abandoned (no
+                    # working order, no live legs — the two checks already
+                    # passed above), or it sits CLOSING — invisible to
+                    # check_positions (FILLED/PARTIAL only) — until the
+                    # next post-market reconcile.
+                    _restored = self._state.transition(
+                        t.rolled_from_trade_id, (TradeStatus.CLOSING,), TradeStatus.FILLED)
+                    log.warning(
+                        "roll_abandoned_parent_restored" if _restored
+                        else "roll_abandoned_parent_restore_failed",
+                        trade_id=t.trade_id, parent_trade_id=t.rolled_from_trade_id,
+                        restored=_restored)
+                else:
+                    self._refund_entry_budget(t)
                 log.warning("reconcile_stale_pending_closed",
                             trade_id=t.trade_id, symbol=t.symbol,
                             strategy=t.strategy, age_min=int(age_min))
@@ -1338,6 +1405,25 @@ class PositionReconciler:
                         # CLOSING and report the orderId so the orchestrator
                         # re-registers the exit tracker via
                         # executor.adopt_exit_order().
+                        #
+                        # W57: checked FIRST, before the plain-exit match --
+                        # a working roll order names this trade only as the
+                        # CLOSING side of a 2-trade orderRef, which
+                        # _working_exit_order_for's exact-match can never
+                        # recognise (see _working_roll_order_for's own
+                        # docstring for why misreading this as "no working
+                        # order" would be a live bug: A gets reverted to
+                        # FILLED while its legs are still mid-roll at the
+                        # broker).
+                        _roll_oid = (self._working_roll_order_for(local_trade, working_orders)
+                                     if working_orders else None)
+                        if _roll_oid is not None:
+                            result.closing_roll_orders[local_trade.trade_id] = _roll_oid
+                            log.warning("reconcile_closing_kept_roll_order",
+                                        trade_id=local_trade.trade_id,
+                                        symbol=local_trade.symbol,
+                                        order_id=_roll_oid)
+                            continue
                         _oid = (self._working_exit_order_for(local_trade, working_orders)
                                 if working_orders else None)
                         if _oid is not None:

@@ -12654,3 +12654,217 @@ link_opening_trade`, `compute_go_live_verdict`, and `real_close_count`, never as
 source strings.
 
 ---
+
+## 2026-09-29 - BUILT — W57: roll foundation fixes (carried vertical, P&L sign, leg
+serialization, reconciler roll-awareness) -- still unreachable from any live path
+
+SCOPE. The operator confirmed the next wave as "the full ROLL wiring" (placement +
+`check_fills` fill recognition). Before writing that plan, direct research into
+`executor.py`'s fill-recognition machinery, `condor_defense`'s config gating, and
+`roll_booking.py`'s own already-committed code surfaced that the roll modules built across
+the last several waves would book **wrong state** the instant anything called them, and
+that `reconciler.py` -- which runs every cycle regardless of what triggered a roll -- would
+actively fight a working roll order. Given CLAUDE.md's explicit sensitivity around
+`execution/executor.py`/`reconciler.py` and this session's own "build additively, fix the
+foundation before wiring" discipline, the operator chose to fix these four bugs FIRST, as
+their own separate wave, deferring placement/`check_fills` wiring to the wave after.
+**Nothing in this wave is reachable from any live path** -- no order is placed, no config
+flag changed, `condor_defense`'s ROLL verdict stays decision-only exactly as every prior
+wave left it. `reconciler.py` DOES run live every cycle, but every change here is additive
+and keyed only on a roll marker (`ROLL:<A>:<B>` orderRef, `rolled_from_trade_id`) that no
+row or order carries today -- confirmed by the regression suite passing byte-identical.
+
+THE FOUR BUGS, each confirmed by direct source read before any code was written:
+
+1. **Orphaned carried vertical.** `roll_executor.legs_for_roll` built legs for only the
+   ROLLED side (2 of a 4-leg IC's legs). But `book_roll_fill` closed ALL of A and
+   `seed_roll_opening_trade` gave B only the 2 new legs -- the untouched vertical (e.g. the
+   call side of a put-side roll) would go live at IBKR attached to NO trade row: HALT_
+   UNTRACKED on the second reconcile sighting, no stop/TP managing it, and A booked as if
+   its whole 4-leg credit were realized when only half of it actually traded.
+
+2. **Realized-P&L sign inverted for credit strategies.** `book_roll_fill`'s formula used
+   `signed_entry = -abs(entry)` then computed `closing_net - signed_entry` -- which is
+   `closing_net + abs(entry)`, not `abs(entry) - closing_net`. A $1.50 credit IC bought back
+   for a $0.80 net debit is a $70 GAIN; the old formula booked **+$230**. `test_roll_
+   booking.py`'s own pre-existing assertions encoded the bug (asserting the wrong number,
+   and one test's own name -- "is_a_realized_loss" -- contradicted the positive value it
+   asserted). The debit-strategy branch was coincidentally already correct (verified by
+   direct derivation, not assumed) -- only credit strategies were wrong.
+
+3. **Unserializable legs.** `qualify_roll_legs` enriches every leg with `_contract` (a live
+   ib_insync `Option`, not JSON-serializable). `seed_roll_opening_trade` did
+   `json.dumps(opening_legs)` straight on that output -- `TypeError` on the first real call,
+   never caught because no test had driven a fixture shaped like qualification's real
+   output.
+
+4. **`reconciler.py` fights a working roll order.** Its order matching (`_working_exit_
+   order_for` / `_cancel_working_entry_order`) is exact `orderRef == trade_id`, and both
+   explicitly refuse to claim an order tagged for a different trade. A roll order's
+   orderRef (`ROLL:<A>:<B>`) is neither -- it names TWO trades, matching neither's `trade_id`
+   verbatim, yet it isn't empty either (so the untagged-legacy fallback doesn't catch it).
+   Concretely, unfixed: (a) a working roll order for A would fail `_working_exit_order_for`,
+   fall to "no working order", and CLOSING would be REVERTED to FILLED mid-roll (a position
+   REVERSAL risk -- the exit monitor would try to close an already-in-flight position
+   again); (b) the every-cycle stale-pending sweep would book a stale roll-child B "never
+   filled" after 30 minutes even while its roll order is genuinely still working, and would
+   refund an entry-budget slot B never actually consumed.
+
+DESIGN.
+
+`src/ait/execution/roll_executor.py`: `legs_for_roll` now returns a 3-tuple `(closing_legs,
+opening_legs, carried_legs)` -- carried_legs are trade's own legs NOT on the rolled side,
+actions UNCHANGED (the real, still-open position). `prepare_roll_combo` qualifies and
+quotes the carried vertical alongside the BAG's own legs in the SAME `poll_leg_quotes` call
+but never adds it to the BAG (only the rolled vertical is placed as a combo; the carried
+side stays untouched at IBKR, transferred to B at booking time instead). `carried_value` is
+the carried vertical's mark, in `portfolio.py`'s own POSITION-sign convention (BUY+/SELL-,
+via the leg's UNCHANGED action) -- reusing `leg_net_price` directly rather than inventing
+new math, since that function already implements exactly this sign convention when given
+non-reversed actions. `PreparedRollCombo` gains `carried_legs`/`carried_value`.
+
+`src/ait/execution/roll_booking.py`: new `_persistable_legs()` strips `_contract` before
+every `json.dumps` of a legs list (bug 3's fix, applied at every write site). New
+`roll_order_ref(closing_id, opening_id)` / `parse_roll_order_ref(ref)` -- the single source
+for the `"ROLL:<A>:<B>"` marker, imported by `reconciler.py` rather than re-derived.
+`seed_roll_opening_trade` now persists B's legs through `_persistable_legs`, seeds ONLY the
+new (opening) legs -- not the carried vertical, which would make reconcile/the sweep see
+those legs as "live" and promote/count B against them before the roll ever fills -- and
+sets `rolled_from_trade_id` via an explicit UPDATE immediately after `record_trade` (that
+column isn't in `record_trade`'s own INSERT, same gap `capital_at_risk` has), so a roll's
+PENDING row is recognisable as roll-linked from the moment it exists, not deferred to
+promotion. `_promote_and_link_opening_trade` gains a `legs` parameter, now writing the
+MERGED (carried + opening) legs into the SAME atomic UPDATE as the status/link write -- B's
+`legs` column reflects the whole post-roll position only from this one atomic statement,
+never a separate follow-up write that could crash half-done. `book_roll_fill` gains
+`carried_legs`/`carried_value` parameters; fetches B's seeded opening legs via `state.
+get_trade_by_id` and merges with `carried_legs` for the promotion write; computes A's
+`exit_price = closing_net - carried_value` (converting `carried_value`'s POSITION-sign
+convention to the TRADE-cost "cost to close" convention `_calculate_realized_pnl`
+(executor.py:2695-2713) already uses, by negating it) and `realized_pnl` via that SAME
+credit/debit branching (bug 2's fix); B's `entry_price = abs(opening_net + carried_value)`,
+the whole post-roll position's entry basis in the SAME unsigned-premium convention every
+other `trades.entry_price` uses. Verified by hand: $1.50 credit IC, rolled side bought back
+for $0.80, carried side marked -$0.30 -> A realizes exactly +$40, B's entry becomes exactly
+$1.05 -- proven by a dedicated test against these exact numbers, not just the formula.
+
+`src/ait/execution/reconciler.py` (CLAUDE.md-critical; every change additive, keyed only on
+the roll marker, verified via the full regression suite staying byte-identical):
+new `_working_roll_order_for(trade, working)` -- checked BEFORE `_working_exit_order_for`
+in the CLOSING branch; a match records `trade_id -> order_id` into a NEW, deliberately
+SEPARATE `ReconciliationResult.closing_roll_orders` field (never `closing_exit_orders`, so
+the orchestrator's existing `adopt_exit_order` re-registration never touches a roll order
+and can never double-book its eventual fill against `book_roll_fill`'s own booking) and
+`continue`s past the plain-exit/revert branches entirely (fixes bug 4a). `_cancel_working_
+entry_order` gains a new Pass 1b recognising a roll order whose OPENING side names the
+trade being swept (fixes half of bug 4b, B's side). `_sweep_stale_pending`'s booking branch:
+a stale roll-child B (`rolled_from_trade_id` set) skips `_refund_entry_budget` (B's "entry"
+was never a fresh signal, so there is no slot to give back) and instead CASes its parent A
+from CLOSING back to FILLED (`roll_abandoned_parent_restored`) -- confirmed the roll is
+genuinely abandoned (no working order, no live legs -- both already checked above) before
+restoring, so `check_positions` (FILLED/PARTIAL only) manages A again instead of leaving it
+stuck CLOSING, invisible, until the next post-market reconcile (fixes the other half of bug
+4b, A's side).
+
+PROOF. `tests/test_roll_executor.py` (16 -> 21, +5): carried legs are the untouched side's
+own 2 legs with actions unchanged; empty for a plain vertical roll; `prepare_roll_combo`
+qualifies+marks the carried vertical but the BAG never includes it (con_id-set disjointness
+asserted directly, not just count); a missing carried quote refuses the whole combo (the
+same fail-safe every other missing-quote path already uses); no-carried-legs case leaves
+`carried_value == 0.0` exactly. `tests/test_roll_booking.py` (18 -> 29, +11): `_persistable_
+legs` strips `_contract` and the round-tripped output survives a real `json.dumps`;
+`roll_order_ref`/`parse_roll_order_ref` round-trip and a plain trade_id is never misread as
+a roll ref; `rolled_from_trade_id` is set at SEED time (not deferred to promotion) and
+survives a refused promotion untouched; `seed_roll_opening_trade` accepts legs straight out
+of `qualify_roll_legs`'s real shape (a live, non-serializable `_contract`) without raising;
+`_promote_and_link_opening_trade`'s legs write is in the SAME single atomic UPDATE as
+status/link (a real SQL-spy on `sqlite3.connect` asserts exactly one UPDATE statement
+contains all three); the corrected credit-strategy P&L assertion (was $230, now $70,
+matching the hand-derivation above) with an explicit note on why the debit branch was
+already correct; a dedicated `TestBookRollFillWithCarriedVertical` class proves the carried
+vertical lands in B's merged legs (4 legs, not 2) and the $40/$1.05 worked example exactly;
+`book_roll_fill` with a missing B row refuses cleanly (new: it now reads B's seeded legs
+from the DB, so a missing row is a new failure mode needing its own guard).
+
+`tests/test_reconciler_roll_awareness.py` (new, 11 tests): `_working_roll_order_for`
+matches only the CLOSING side of a roll ref, never the opening side (that's `_cancel_
+working_entry_order`'s job) and never a plain exit's bare-trade_id ref; `_cancel_working_
+entry_order` cancels a roll order tagged for the trade being swept as ITS opening side, and
+refuses one tagged for a different opening trade; a full `reconcile()` run (real temp-DB
+`StateManager`, `tests.fakes.FakeIB`/`FakeIBKRClient`) proves a working roll order keeps A
+CLOSING and lands in `closing_roll_orders` (not `closing_exit_orders`), a plain working exit
+order is UNAFFECTED by the new roll check (R17 behaviour survives unchanged), and -- the
+existing self-heal this fix must never break -- NO working order of any kind still reverts
+CLOSING to FILLED exactly as before; `_sweep_stale_pending` on a real backdated stale roll-
+child B books it never-filled with the budget counter UNCHANGED (not refunded) and restores
+parent A to FILLED, while an ordinary (non-roll) stale PENDING is still refunded exactly as
+before (the explicit regression guard that the roll branch doesn't swallow the normal path).
+
+Mutation-checked 4 mechanisms via Edit (not `git checkout`, after an earlier `git checkout
+--` in this same wave accidentally discarded the day's roll_booking.py work entirely --
+recovered by reconstructing the file from the conversation's own record and re-verifying
+all 29+21 tests passed before proceeding; the file is now backed by git-tracked diffs only,
+never reverted via checkout again this wave), each temporarily broken, confirmed the
+intended test failed for the predicted reason, reverted: flipping the `carried_value` sign
+in `exit_price` broke the $40 worked-example test (got $100, wrong); dropping carried_legs
+from the promotion's merged-legs write broke the 4-leg assertion (got 2); disabling `_working_
+roll_order_for`'s call in the CLOSING branch broke the "stays CLOSING" test (A reverted to
+FILLED, exactly the bug being fixed); disabling the refund-skip broke the "unchanged budget
+counter" assertion (got decremented by 1, exactly the bug being fixed).
+
+Regression: `test_roll_booking.py` + `test_roll_executor.py` + `test_reconciler_roll_
+awareness.py` + `test_go_live_roll_folding.py`: **69/69**. Full named surface (`reconcil`,
+`r12`, `r16`, `r17`, `r19`, `w50`, `roll`, `go_live`, `w3` keyword match): **877 passed / 1
+failed / 2 skipped** -- the one failure is the same standing `test_r19_config_authority.py
+::TestContractIsTheSingleAuthority::test_applier_and_readers_share_one_table`
+(`AIT_MARKET_DATA_TYPE` divergence, unrelated to this wave). `python -m compileall -q src
+tests`: OK. `python scripts/typecheck.py`: OK, zero attr-defined/call-arg/name-defined in
+`src/ait/{config,bot,execution,risk}`. `python scripts/smoke_deploy.py`: **SMOKE PASS (13
+checks)**, no writes to either DB.
+
+Full fast lane: **2713 passed / 1 failed / 46 skipped / 153 deselected, 805.13s (13m25s)**
+-- the one failure is the same standing divergence. Count check against the immediately-
+prior full fast lane (2687+1+45=2733 total non-deselected outcomes): this run is
+2713+1+46=2760 -- a delta of exactly **+27**, matching the new test count precisely (5
+net-new in `test_roll_executor.py` + 11 net-new in `test_roll_booking.py` + 11 new in
+`test_reconciler_roll_awareness.py`).
+
+STATE AT HANDOFF. `src/ait/execution/roll_executor.py`, `src/ait/execution/roll_booking.py`,
+`src/ait/execution/reconciler.py` (all modified), `tests/test_reconciler_roll_awareness.py`
+(new). Zero config changes -- no new flag, nothing gated, because nothing here is placed or
+dispatched yet. `condor_defense`'s ROLL verdict remains decision-only, exactly as every
+prior wave left it. `reconciler.py`'s new roll-awareness is additive and dormant until a
+roll order/row actually exists (confirmed: the full regression suite is byte-identical
+otherwise).
+
+NEXT, naming every open item explicitly: **the actual placement + `check_fills` wiring**
+this foundation wave was carved out of -- `executor.py`'s `place_roll_combo` (with its own
+market-hours + shared-`_order_times`-rate-limit check, since exits currently skip all three
+`execute_signal`-only gates by placing directly, and a roll's opening leg is economically a
+new position the same way an entry is), a new `_pending_roll_orders` tracking dict (fully
+isolated from `_pending_orders`/`_pending_exit_orders`, confirmed by direct read that the
+existing entry/exit loops iterate their OWN dicts rather than broker orders broadly), a
+THIRD `check_fills` loop dispatching to `book_roll_fill`, orchestrator `_execute_roll`
+dispatched from `_trading_cycle` only (not the fast 30s monitor, to avoid blocking
+time-critical touch-stop processing while the position lock is held), and a new
+`CondorDefenseConfig.execute_rolls: bool = False` gate -- still needs its own scoped plan
+and, per CLAUDE.md, explicit confirmation before touching `execution/executor.py`.
+**`_cancel_stale_orders`'s own iteration scope against a slow-filling roll combo** --
+flagged during this wave's design but deliberately deferred to be checked precisely when
+the wiring wave actually places an order, not assumed resolved here. **Untracked roll-fill
+recovery** (a roll that fills while the bot is down, or whose tracker is lost --
+reconcile/sweep would promote B with only its new legs today; the wiring wave needs
+orderRef-based re-registration at startup). **The IB `orderRef` length limit** for
+`"ROLL:<A>:<B>"` (~54 chars) -- unverified, should be checked in W53's placing run. **W53's
+placing run** itself -- still the prerequisite live proof this whole chain has never been
+exercised against a real fill. **W54's rule 3/3e wiring** -- can reuse `_execute_roll`/
+`place_roll_combo` once they exist. **W52a's four items**, the ongoing QQQ backfill, the
+surface-construction quality filter, the zero-bars inefficiency, and the risk-free-rate
+Phase B connection-reuse note -- all unchanged.
+
+No inspect.getsource -- every new test drives the real `legs_for_roll`, `prepare_roll_
+combo`, `_persistable_legs`, `_promote_and_link_opening_trade`, `book_roll_fill`,
+`_working_roll_order_for`, `_cancel_working_entry_order`, and a real `reconcile()`/
+`_sweep_stale_pending()` pass, never asserts on source strings.
+
+---

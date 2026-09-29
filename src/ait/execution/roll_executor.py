@@ -36,28 +36,43 @@ log = get_logger("execution.roll_executor")
 @dataclass
 class PreparedRollCombo:
     """A fully validated, qualified, priced roll combo -- ready to place,
-    not placed. `bag` is the qualified 4-leg Contract, `order` a configured
-    combo_limit Order (orderId not yet assigned)."""
+    not placed. `bag` is the qualified 4-leg Contract (the rolled vertical
+    only), `order` a configured combo_limit Order (orderId not yet
+    assigned). `carried_legs`/`carried_value` describe trade A's OTHER
+    vertical -- not part of the BAG, never placed -- so a roll of the put
+    side doesn't orphan the call side at the broker (W57: the fixed bug).
+    `carried_value` is that vertical's current mark, in the same
+    BUY-positive/SELL-negative POSITION-sign convention portfolio.py's own
+    _position_unrealized_pnl (:445-460) uses for an open position's
+    net_liq -- distinct from mid_net/natural_net's REVERSED-action
+    closing-TRADE-cost convention below."""
 
     bag: object
     order: object
     closing_legs: list[dict]
     opening_legs: list[dict]
+    carried_legs: list[dict]
+    carried_value: float
     mid_net: float
     natural_net: float
 
 
 def legs_for_roll(
     trade: TradeRecord, side: str, roll_target: RollTarget,
-) -> tuple[list[dict], list[dict]] | None:
-    """(closing_legs, opening_legs) in the {"strike","right","action",
-    "expiry"} shape _validate_roll_legs/qualify_roll_legs expect. Closing
-    legs are trade's own open legs on `side`, action reversed (the open
-    SELL becomes a closing BUY, the open BUY becomes a closing SELL).
+) -> tuple[list[dict], list[dict], list[dict]] | None:
+    """(closing_legs, opening_legs, carried_legs) in the {"strike","right",
+    "action","expiry"} shape _validate_roll_legs/qualify_roll_legs expect.
+    Closing legs are trade's own open legs on `side`, action reversed (the
+    open SELL becomes a closing BUY, the open BUY becomes a closing SELL).
     Opening legs are roll_target's new short (SELL) and new long (BUY) at
     roll_target.expiry. Same construction probe_w53_roll_atomicity.py's
     cmd_roll (:658-667) already proved live -- given its own name/tests
     here instead of living inline in a probe command.
+
+    Carried legs are trade's own open legs NOT on `side`, actions
+    UNCHANGED (still the real, currently-open position) -- W57: a put-side
+    roll on a 4-leg iron condor must not silently orphan the still-open
+    call vertical at the broker with no trade row managing it.
 
     Returns None if `side` isn't a clean single short+long pair on `trade`
     -- same invariant _at_risk_vertical (roll_selector.py:41) enforces,
@@ -69,11 +84,13 @@ def legs_for_roll(
     except (ValueError, TypeError):
         return None
 
+    def _on_side(leg: dict) -> bool:
+        return str(leg.get("right", leg.get("type", ""))).upper().startswith(side)
+
     def _side_legs(action: str) -> list[dict]:
         return [
             leg for leg in legs
-            if str(leg.get("action", "")).upper() == action
-            and str(leg.get("right", leg.get("type", ""))).upper().startswith(side)
+            if str(leg.get("action", "")).upper() == action and _on_side(leg)
         ]
 
     shorts, longs = _side_legs("SELL"), _side_legs("BUY")
@@ -90,7 +107,8 @@ def legs_for_roll(
         {"strike": roll_target.new_long.strike, "right": side, "action": "BUY",
          "expiry": roll_target.expiry},
     ]
-    return closing_legs, opening_legs
+    carried_legs = [leg for leg in legs if not _on_side(leg)]
+    return closing_legs, opening_legs, carried_legs
 
 
 async def qualify_roll_legs(
@@ -190,12 +208,19 @@ async def prepare_roll_combo(
     EXISTING, already-tested validator, executor.py:114-181 -- reused, not
     duplicated) BEFORE any API call, exactly matching that function's own
     documented intent -- THEN qualification, THEN quotes/pricing.
+
+    W57: also qualifies and marks trade's CARRIED vertical (the side not
+    being rolled) so a caller can attach it to the new trade row instead of
+    leaving it orphaned at the broker -- it is priced alongside the BAG's
+    own legs in one quote poll, but never added to the BAG itself (only
+    `side`'s vertical is placed as a combo; the carried side is untouched
+    at IBKR).
     """
     derived = legs_for_roll(trade, side, roll_target)
     if derived is None:
         log.warning("roll_prep_no_clean_vertical", trade_id=trade.trade_id, side=side)
         return None
-    closing_legs, opening_legs = derived
+    closing_legs, opening_legs, carried_legs = derived
 
     err = _validate_roll_legs(trade, closing_legs, opening_legs)
     if err:
@@ -208,15 +233,21 @@ async def prepare_roll_combo(
     qualified_opening = await qualify_roll_legs(ibkr, symbol, opening_legs)
     if qualified_opening is None:
         return None
-    all_legs = qualified_closing + qualified_opening
+    qualified_carried: list[dict] = []
+    if carried_legs:
+        qualified_carried = await qualify_roll_legs(ibkr, symbol, carried_legs)
+        if qualified_carried is None:
+            return None
+    combo_legs = qualified_closing + qualified_opening
+    all_legs = combo_legs + qualified_carried
 
     bag = ContractBuilder.combo(
         symbol, [{"conId": leg["conId"], "action": leg["action"], "ratio": leg.get("ratio", 1)}
-                 for leg in all_legs])
+                 for leg in combo_legs])
 
     quotes = await poll_leg_quotes(ibkr, [leg["_contract"] for leg in all_legs])
-    mid_net = leg_net_price(all_legs, quotes, "mid")
-    natural_net = leg_net_price(all_legs, quotes, "natural")
+    mid_net = leg_net_price(combo_legs, quotes, "mid")
+    natural_net = leg_net_price(combo_legs, quotes, "natural")
     if mid_net is None or natural_net is None:
         log.warning("roll_prep_missing_quote", trade_id=trade.trade_id)
         return None
@@ -225,10 +256,22 @@ async def prepare_roll_combo(
                     mid_net=mid_net, natural_net=natural_net, debit_cap=debit_cap)
         return None
 
+    carried_value = 0.0
+    if qualified_carried:
+        # Position-sign convention (unchanged carried actions) -- leg_net_price
+        # applies BUY+/SELL- to whatever action each leg carries, which for
+        # carried legs is the REAL open position action, not a closing reversal.
+        _cv = leg_net_price(qualified_carried, quotes, "mid")
+        if _cv is None:
+            log.warning("roll_prep_missing_carried_quote", trade_id=trade.trade_id)
+            return None
+        carried_value = _cv
+
     order = OrderBuilder.combo_limit(action="BUY", quantity=quantity, limit_price=round(mid_net, 2))
     order.orderRef = order_ref
 
     return PreparedRollCombo(
         bag=bag, order=order, closing_legs=qualified_closing, opening_legs=qualified_opening,
+        carried_legs=qualified_carried, carried_value=carried_value,
         mid_net=mid_net, natural_net=natural_net,
     )
