@@ -34,8 +34,11 @@ from ait.data.options_chain import OptionsChainService
 from ait.data.multi_timeframe import MultiTimeframeAnalyzer
 from ait.data.quality import DataQualityValidator
 from ait.execution.executor import BAG_CON_ID, TradeExecutor
-from ait.execution.portfolio import PortfolioManager, PositionStatus
+from ait.execution.portfolio import PortfolioManager, PositionAction, PositionStatus
 from ait.execution.reconciler import PositionReconciler
+from ait.execution.roll_booking import cas_roll_closing_trade, roll_order_ref, seed_roll_opening_trade
+from ait.execution.roll_executor import prepare_roll_combo
+from ait.execution.roll_selector import select_roll_target
 from ait.learning.engine import LearningEngine
 from ait.ml.ensemble import DirectionPredictor
 from ait.ml.meta_label import MetaLabeler
@@ -1676,8 +1679,25 @@ class TradingOrchestrator:
                          quantity=pos.partial_exit_quantity)
                 await self._execute_partial_exit(pos)
 
+            # 3c. W61: roll dispatch — condor_defense's ROLL verdict, made
+            # actionable ONLY when execute_rolls is ALSO on (a separate
+            # opt-in from `enabled`, which alone still just reports the
+            # verdict — see CondorDefenseConfig.execute_rolls). Mirrors
+            # exactly how portfolio.py:1024 itself reads this config; there
+            # is no separate orchestrator-level copy of it. When rolls_
+            # enabled is False (today's only reachable state), ROLL
+            # positions fall through to thesis re-evaluation below exactly
+            # as they do today — byte-identical, unchanged behavior.
+            _condor_cfg = getattr(self._portfolio, "_condor_defense_config", None)
+            rolls_enabled = bool(_condor_cfg and _condor_cfg.enabled and _condor_cfg.execute_rolls)
+            roll_positions, remaining_positions = self._partition_roll_positions(
+                positions, rolls_enabled)
+            for pos in roll_positions:
+                log.info("roll_triggered", symbol=pos.symbol, side=pos.roll_side,
+                         reason=pos.action_reason)
+                await self._execute_roll(pos)
+
             # 3b. Thesis re-evaluation — exit early if original thesis invalidated
-            remaining_positions = [p for p in positions if not p.should_exit and p.partial_exit_quantity == 0]
             for pos in remaining_positions:
                 invalidated, reason = await self._check_thesis_valid(pos)
                 if invalidated:
@@ -3883,6 +3903,95 @@ class TradingOrchestrator:
         except Exception as e:
             log.error("exit_execution_failed", trade_id=pos.trade_id, error=str(e))
             self._watchdog.record_error("trading_loop", f"exit failed: {e}")
+
+    @staticmethod
+    def _partition_roll_positions(
+        positions: list[PositionStatus], rolls_enabled: bool,
+    ) -> tuple[list[PositionStatus], list[PositionStatus]]:
+        """W61: split not-already-exiting positions into (roll_positions,
+        remaining_for_thesis_reeval). When rolls_enabled is False,
+        roll_positions is always [] and every ROLL-action position falls
+        through to remaining -- byte-identical to this wave's own prior
+        behavior (a ROLL verdict is reported, never acted on)."""
+        candidates = [p for p in positions if not p.should_exit and p.partial_exit_quantity == 0]
+        if not rolls_enabled:
+            return [], candidates
+        rolls = [p for p in candidates if p.action == PositionAction.ROLL]
+        remaining = [p for p in candidates if p.action != PositionAction.ROLL]
+        return rolls, remaining
+
+    async def _execute_roll(self, pos: PositionStatus) -> None:
+        """W61: act on a condor_defense ROLL verdict — select a replacement
+        vertical, prepare/qualify/price the combo, seed the DB rows, and
+        place it. Gated (by the caller in _trading_cycle) on execute_rolls,
+        a separate opt-in from condor_defense.enabled itself.
+
+        Each step, cheapest/most-reversible first, so a failure partway
+        through leaves the least mess — same principle roll_booking.book_
+        roll_fill's own promote-B-first ordering already established. A
+        placement failure at the end is logged and left for the
+        reconciler's own stale-pending sweep to clean up (cancel/restore) on
+        its normal 30-minute cadence — no new recovery path is invented
+        here.
+        """
+        trade = self._find_trade_record(pos.trade_id)
+        if not trade or not pos.roll_side:
+            log.warning("roll_skipped_no_trade_or_side", trade_id=pos.trade_id)
+            return
+
+        try:
+            roll_target = await select_roll_target(
+                trade, pos.roll_side, self._options_chain,
+                self._settings.assignment_response,
+            )
+            if roll_target is None:
+                log.warning("roll_no_target_found", trade_id=trade.trade_id,
+                           side=pos.roll_side)
+                return
+
+            # roll_min_credit is a CREDIT floor (leg_net_price's BUY+/SELL-
+            # convention makes a net credit NEGATIVE) — prepare_roll_combo's
+            # debit_cap is a DEBIT ceiling, so "require at least $X credit"
+            # becomes "refuse mid_net > -X": negate, don't pass through.
+            prepared = await prepare_roll_combo(
+                self._ibkr, trade, pos.roll_side, roll_target, trade.symbol,
+                trade.quantity, order_ref=roll_order_ref(trade.trade_id, "PENDING"),
+                debit_cap=-self._settings.assignment_response.roll_min_credit,
+            )
+            if prepared is None:
+                log.warning("roll_prepare_failed", trade_id=trade.trade_id,
+                           side=pos.roll_side)
+                return
+
+            if not cas_roll_closing_trade(self._state, trade.trade_id):
+                log.warning("roll_cas_to_closing_refused", trade_id=trade.trade_id)
+                return
+
+            opening = seed_roll_opening_trade(
+                self._state, trade, prepared.opening_legs, roll_target,
+                trade.quantity, entry_price_estimate=prepared.mid_net,
+            )
+            # PreparedRollCombo.order is deliberately typed `object` (avoids
+            # importing roll_executor.py's own ib_insync-typed Order here —
+            # see place_roll_combo's docstring on the circular-import reason).
+            prepared.order.orderRef = (  # type: ignore[attr-defined]
+                roll_order_ref(trade.trade_id, opening.trade_id))
+
+            placed = await self._executor.place_roll_combo(
+                prepared, trade.trade_id, opening.trade_id,
+                prepared.carried_legs, prepared.carried_value,
+            )
+            if not placed:
+                log.error("roll_placement_failed", trade_id=trade.trade_id,
+                         opening_trade_id=opening.trade_id)
+                return
+
+            log.info("roll_order_submitted", trade_id=trade.trade_id,
+                     opening_trade_id=opening.trade_id, side=pos.roll_side)
+
+        except Exception as e:  # noqa: BLE001 — a roll attempt must never crash the cycle
+            log.error("roll_execution_failed", trade_id=pos.trade_id, error=str(e))
+            self._watchdog.record_error("trading_loop", f"roll failed: {e}")
 
     async def _execute_partial_exit(self, pos: PositionStatus) -> None:
         """Execute a partial exit — close some contracts while keeping the rest open."""

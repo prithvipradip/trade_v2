@@ -262,9 +262,14 @@ assignment_response:
 
 condor_defense:
   # W56 (tastytrade-style tested/untested-side condor defense, decision
-  # layer): enabled stays false until a future wave wires check_positions
-  # to consult it -- the values below have no live effect yet.
+  # layer): enabled stays false pending the 50-close paper verdict -- the
+  # values below have no live effect while it's off. check_positions is
+  # already wired to consult this: enabled=true alone makes CLOSE
+  # actionable and reports (but never acts on) a ROLL verdict.
+  # execute_rolls is a further, separate opt-in (W61) required before a
+  # ROLL verdict places a real order.
   enabled: false
+  execute_rolls: false
   side: untested_only                  # tested_only / untested_only / both
   monitor_delta_max: 0.25              # Below this, hold
   roll_untested_delta_min: 0.25        # Roll the untested side for a credit in this band...

@@ -614,6 +614,14 @@ class CondorDefenseConfig(_StrictModel):
                     "DTE or side setting — high-gamma / near-expiry, the "
                     "document's table row 4. Not side-filtered: closing is "
                     "not a roll.")
+    execute_rolls: bool = Field(default=False,
+        description="W61: a SEPARATE opt-in from `enabled` above. enabled=True "
+                    "alone still only makes CLOSE actionable and reports a ROLL "
+                    "verdict (action=ROLL) without acting on it — execute_rolls="
+                    "True is additionally required before orchestrator._execute_"
+                    "roll ever selects a target, prepares a combo, or places a "
+                    "real order. Defaults False so shipping the wiring changes "
+                    "NO live behavior until the operator explicitly flips both.")
 
     @model_validator(mode="after")
     def _validate_bands(self) -> "CondorDefenseConfig":

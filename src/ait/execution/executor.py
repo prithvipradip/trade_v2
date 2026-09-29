@@ -23,6 +23,7 @@ from ait.broker.contracts import ContractBuilder
 from ait.broker.ibkr_client import IBKRClient
 from ait.broker.orders import OrderBuilder
 from ait.bot.state import StateManager, TradeDirection, TradeRecord, TradeStatus
+from ait.execution.roll_booking import PendingRollOrder, book_roll_fill
 from ait.risk.circuit_breaker import CircuitBreaker
 from ait.strategies.base import (
     CREDIT_STRATEGIES,
@@ -336,6 +337,12 @@ class TradeExecutor:
             self._max_spread_pct = DEFAULT_MAX_SPREAD_PCT
         self._pending_orders: dict[int, PendingOrder] = {}  # order_id → PendingOrder
         self._pending_exit_orders: dict[int, PendingExitOrder] = {}  # order_id → PendingExitOrder
+        # W61: a roll's single 4-leg fill books TWO trades (closing + opening)
+        # -- deliberately isolated from the two dicts above, never touched by
+        # the entry/exit loops or _cancel_stale_orders (both iterate their own
+        # dict directly, never broker orders broadly — confirmed by direct
+        # read before relying on it).
+        self._pending_roll_orders: dict[int, PendingRollOrder] = {}
         # R13: exit orderIds we already asked the broker to cancel while they
         # were still WORKING (stale >300s) — one cancel per order, not per pass.
         self._exit_cancels_requested: set[int] = set()
@@ -928,6 +935,80 @@ class TradeExecutor:
         order.orderRef = trade_id
         return await self._ibkr.place_order(combo, order)
 
+    async def place_roll_combo(
+        self, prepared, closing_trade_id: str, opening_trade_id: str,
+        carried_legs: list[dict], carried_value: float,
+    ) -> bool:
+        """W61: place an already-validated/qualified/priced roll combo
+        (`roll_executor.prepare_roll_combo`'s own output -- never imported by
+        name here, to avoid a circular import: roll_executor.py already
+        imports `_validate_roll_legs` FROM this module) and track it for
+        `check_fills`'s own roll-recognition block.
+
+        A roll's opening leg is economically a new position the same way any
+        fresh entry is -- unlike exits, which place directly via
+        `ibkr.place_order()` and so skip every gate below. The undefined-risk
+        gate is moot by construction (`_validate_roll_legs` already refuses
+        anything but a clean single short+long vertical), so only market-
+        hours and the rate backstop are checked here, deliberately mirroring
+        `execute_signal`'s own checks (:391-441) rather than silently
+        inheriting the exit path's gate-free placement.
+
+        Deliberately does NOT revert trade A's CLOSING status or trade B's
+        PENDING row on a placement failure -- matches normal exits' own
+        existing convention (no revert there either after CAS-to-CLOSING),
+        and the reconciler's stale-pending sweep (roll-aware since the prior
+        wave) already cancels an abandoned roll attempt and restores A to
+        FILLED on its own 30-minute cadence, so no new recovery path is
+        needed here.
+        """
+        import os as _os
+
+        if _os.environ.get("AIT_ALLOW_AFTER_HOURS") != "1":
+            try:
+                from ait.utils.time import is_market_open as _imo
+                _mkt_open = _imo()
+            except Exception as _mh_err:  # noqa: BLE001 — fail CLOSED, loudly
+                log.error("roll_market_hours_guard_failed",
+                          closing_trade_id=closing_trade_id, error=str(_mh_err))
+                return False
+            if not _mkt_open:
+                log.error("roll_refused_market_closed", closing_trade_id=closing_trade_id)
+                return False
+
+        _bucket = getattr(self, "_order_times", None)
+        if _bucket is None:
+            _bucket = self._order_times = []
+        _now = time.time()
+        _bucket[:] = [t for t in _bucket if _now - t < 60]
+        if len(_bucket) >= 8:
+            log.critical("roll_order_rate_limit_tripped", orders_last_60s=len(_bucket))
+            return False
+        _bucket.append(_now)
+
+        trade = await self._ibkr.place_order(prepared.bag, prepared.order)
+        if trade is None or not trade.order.orderId:
+            log.error("roll_placement_failed", closing_trade_id=closing_trade_id,
+                      opening_trade_id=opening_trade_id)
+            return False
+
+        order_id = trade.order.orderId
+        closing_conids = {leg["conId"] for leg in prepared.closing_legs}
+        opening_conids = {leg["conId"] for leg in prepared.opening_legs}
+        self._pending_roll_orders[order_id] = PendingRollOrder(
+            order_id=order_id, closing_trade_id=closing_trade_id,
+            opening_trade_id=opening_trade_id, closing_conids=closing_conids,
+            opening_conids=opening_conids, carried_legs=carried_legs,
+            carried_value=carried_value,
+        )
+        # Ledger-row attribution only (_sweep_executions/_ledger_context) --
+        # never read for booking correctness, since book_roll_fill splits
+        # fills by conId directly from trade.fills, not from this map.
+        self._order_trade_map[order_id] = closing_trade_id
+        log.info("roll_order_placed", order_id=order_id, closing_trade_id=closing_trade_id,
+                 opening_trade_id=opening_trade_id)
+        return True
+
     def attach_fill_events(self) -> None:
         """R11 (R9 latency finding): fill DETECTION measured at ~33s because
         it rode the 30s polling loop. Subscribe to ib_insync's orderStatus
@@ -1511,6 +1592,56 @@ class TradeExecutor:
                         TradeStatus.FILLED,
                     )
                     del self._pending_exit_orders[order_id]
+
+        # W61: roll fill recognition -- fully isolated from the two loops
+        # above (a separate dict, never iterated by them). Deliberately
+        # conservative: acts ONLY on a clean "Filled" verdict, never a
+        # partial/working/cancelled one -- a partial 4-leg combo fill needs
+        # its own design (not invented here), and an abandoned roll order is
+        # already handled by the reconciler's own stale-pending sweep.
+        for order_id, pending_roll in list(self._pending_roll_orders.items()):
+            _roll_trade = next(
+                (t for t in all_trades if t.order.orderId == order_id), None)
+            if _roll_trade is None:
+                continue
+            if str(_roll_trade.orderStatus.status or "").lower() != "filled":
+                continue
+            leg_fills = [
+                {
+                    "conId": getattr(f.contract, "conId", 0),
+                    # ib_insync's real convention is "BOT"/"SLD", not
+                    # "BUY"/"SELL" -- split_roll_fill_price expects the
+                    # latter (confirmed by direct read of executor.py:2401's
+                    # own "SLD" == sell check before writing this).
+                    "side": "SELL" if f.execution.side == "SLD" else "BUY",
+                    "price": float(f.execution.price or 0),
+                    "shares": float(f.execution.shares or 0),
+                }
+                for f in _roll_trade.fills
+                if not self._is_bag_row(f)
+            ]
+            closing_trade = self._state.get_trade_by_id(pending_roll.closing_trade_id)
+            if closing_trade is None:
+                log.error("roll_fill_closing_trade_missing", order_id=order_id,
+                          closing_trade_id=pending_roll.closing_trade_id)
+                del self._pending_roll_orders[order_id]
+                continue
+            booked = book_roll_fill(
+                self._state, closing_trade, pending_roll.opening_trade_id,
+                leg_fills, pending_roll.closing_conids, pending_roll.opening_conids,
+                pending_roll.carried_legs, pending_roll.carried_value,
+            )
+            if booked:
+                log.info("roll_fill_booked", order_id=order_id,
+                         closing_trade_id=pending_roll.closing_trade_id,
+                         opening_trade_id=pending_roll.opening_trade_id)
+            else:
+                # Not retried: a retry against an already-consumed fill could
+                # double-book. Logged for manual reconciliation.
+                log.error("roll_fill_booking_failed", order_id=order_id,
+                          closing_trade_id=pending_roll.closing_trade_id,
+                          opening_trade_id=pending_roll.opening_trade_id)
+            del self._pending_roll_orders[order_id]
 
         return filled, completed_exits
 

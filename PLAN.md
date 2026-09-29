@@ -12868,3 +12868,172 @@ combo`, `_persistable_legs`, `_promote_and_link_opening_trade`, `book_roll_fill`
 `_sweep_stale_pending()` pass, never asserts on source strings.
 
 ---
+
+## 2026-09-29 - BUILT — W61: wire ROLL end-to-end (placement + fill recognition),
+gated off by `CondorDefenseConfig.execute_rolls` (default `False`)
+
+SCOPE. Connects every already-built roll piece — `condor_defense`'s ROLL verdict →
+`roll_selector.select_roll_target` → `roll_executor.prepare_roll_combo` → a real placed
+order → `executor.py`'s fill recognition → `roll_booking.book_roll_fill` — into one live
+path for the first time. Kept inert the same way `condor_defense.enabled` itself is: a new
+`CondorDefenseConfig.execute_rolls: bool = False` gate, required IN ADDITION to `enabled`
+before anything places an order. Nothing about current running behavior changes until an
+operator flips both — confirmed by the full fast lane staying at the expected count delta
+with zero new failures.
+
+A genuine simplification found during research, not assumed going in: W60's own reconciler
+fix (`_cancel_working_entry_order`'s roll-aware Pass 1b) already cancels a stale (30+ min)
+working roll order, and the stale-pending sweep already books an abandoned roll child B as
+never-filled and restores parent A to FILLED. This wave needed NO new timeout/staleness/
+revert mechanism for a roll that never fills — that backstop already existed and was
+already tested by W60.
+
+Two things resolved by direct source verification before writing any code, not assumed:
+`f.execution.side` is ib_insync's own `"BOT"`/`"SLD"`, not `"BUY"`/`"SELL"` — confirmed
+against `executor.py:2401`'s own existing `"SLD"` == sell check — so the new `check_fills`
+roll block translates this explicitly before handing fills to `split_roll_fill_price`, which
+expects the latter; a raw pass-through was proven (mutation-checked) to silently invert
+every fill's sign. And market-hours/the 8-orders-60s rate backstop, which exits currently
+skip by placing directly via `ibkr.place_order()`: a roll's opening leg is economically a
+new position the same way an entry is, so `place_roll_combo` checks both explicitly
+(undefined-risk is moot by construction — `_validate_roll_legs` already refuses anything but
+a clean vertical).
+
+**Also this wave: PLAN.md's own numbering was corrected.** The previous wave (originally
+committed as "W57") was renamed to **W60** in a small standalone commit
+(`e0c9225`) before this wave's own code changes began — the 2026-09-22 roadmap had reserved
+W57 for THIS wave, not the foundation-fix one. This entry is W61, not W57.
+
+DESIGN.
+
+`src/ait/config/settings.py` / `config.yaml`: `CondorDefenseConfig.execute_rolls: bool =
+False` — a roll is placed only when BOTH `enabled` and `execute_rolls` are `True`.
+
+`src/ait/execution/executor.py`: new `self._pending_roll_orders: dict[int, PendingRollOrder]`,
+fully isolated from `_pending_orders`/`_pending_exit_orders` (confirmed by a dedicated
+Explore pass before relying on it: `_cancel_stale_orders` only ever walks `_pending_orders`
+itself — no broad broker-order scan exists anywhere in this file — and both `check_fills`
+loops iterate their own dict directly, never broker orders broadly, so an orderId never
+added to either is never visited by them). New `place_roll_combo(prepared, closing_trade_id,
+opening_trade_id, carried_legs, carried_value)`: market-hours + shared-`_order_times`
+rate-limit checks (mirroring `execute_signal`'s own gates exactly), places via
+`ibkr.place_order`, registers the `PendingRollOrder` and (for `_sweep_executions`'s own
+ledger-row attribution only — never read for booking correctness) `_order_trade_map[order_
+id] = closing_trade_id`. New roll-recognition block appended to the end of `check_fills`
+(return signature unchanged — a booked/failed roll logs a structured event rather than
+threading a third value through `check_fills_safe`'s three call sites, since nothing
+downstream consumes one): acts ONLY on a clean `"Filled"` verdict — a still-working or
+partially-filled combo is left alone (partial-combo-fill handling is explicitly out of
+scope, registered in NEXT) — builds `leg_fills` from `trade.fills` excluding the existing
+`_is_bag_row` combo-summary check, translates `"BOT"/"SLD"` to `"BUY"/"SELL"`, and calls
+`book_roll_fill`, removing the entry whether booking succeeds or fails (never retried — a
+retry against an already-consumed fill could double-book). `PreparedRollCombo` is
+deliberately never imported into `executor.py` (only `roll_booking`'s `PendingRollOrder`/
+`book_roll_fill` are) — `roll_executor.py` already imports `_validate_roll_legs` FROM
+`executor.py`, so the reverse import would cycle; `place_roll_combo`'s `prepared` parameter
+stays duck-typed.
+
+`src/ait/bot/orchestrator.py`: new `_partition_roll_positions(positions, rolls_enabled)`
+(a small pure staticmethod, factored out specifically so the gate logic is unit-testable
+without driving the whole `_trading_cycle` method) splits not-already-exiting positions into
+(roll_positions, remaining_for_thesis_reeval) — when `rolls_enabled` is `False`, every
+ROLL-action position falls through to `remaining` exactly as it always has, byte-identical.
+`_trading_cycle` computes `rolls_enabled` by reading `self._portfolio._condor_defense_config`
+directly (mirrors exactly how `portfolio.py:1024` itself reads this config — there is no
+separate orchestrator-level copy) and dispatches `roll_positions` to new `_execute_roll`
+inside the same position lock, before the (now-reduced) thesis-reevaluation loop. `_execute_
+roll`, cheapest/most-reversible steps first: `select_roll_target` (reusing `assignment_
+response.roll_target_dte_min/max` — not a duplicate window in `CondorDefenseConfig`, since a
+condor_defense-triggered roll and a future W54 rule-3/3e-triggered roll share one "where do
+we roll to" policy) → `prepare_roll_combo` with `debit_cap=-assignment_response.
+roll_min_credit` (the sign flip: `roll_min_credit` is a CREDIT floor in `leg_net_price`'s
+BUY+/SELL- convention, where a net credit is NEGATIVE — "require at least $0.20 credit"
+means refusing `mid_net > -0.20`) → `cas_roll_closing_trade` → `seed_roll_opening_trade` →
+stamp the REAL `roll_order_ref(A, B)` onto `prepared.order` (the earlier `prepare_roll_
+combo` call used a placeholder ref, since B's trade_id doesn't exist until seeded) →
+`executor.place_roll_combo`. A failure at any step after the first two logs and returns
+without reverting anything already written — matches normal exits' own existing convention
+(no revert after CAS-to-CLOSING there either), and W60's reconciler fix already cleans up an
+abandoned attempt on its own 30-minute cadence, so no new recovery path was invented.
+
+PROOF. `tests/test_roll_wiring.py` (new, 24 tests): `TestPlaceRollComboGates` — market-hours
+refusal (both the explicit-override bypass and a raising calendar failing closed);
+rate-limit refusal sharing `_order_times` with 8 pre-existing entries (proves shared state,
+not a parallel counter); a placement failure registers nothing.
+`TestPlaceRollComboHappyPath` — `PendingRollOrder` registered with the exact conId sets/
+carried fields; `_order_trade_map` set to A; `_pending_orders`/`_pending_exit_orders`
+untouched (the isolation claim, proven not assumed). `TestCheckFillsRollRecognition` (real
+`StateManager` + `tests.fakes.FakeIB`/`FakeIBKRClient`, a real `TradeExecutor`, a real
+`check_fills()` pass — not a mock call-count) — a filled roll order books both trades
+correctly and is removed; the BAG summary row never poisons the leg split; a still-working
+order is left completely untouched (both A and B's status unchanged); a booking failure
+(unattributed conId) still removes the order without touching A. `TestPartitionRollPositions`
+— disabled means every ROLL position falls through to remaining; enabled splits correctly by
+action; an already-exiting or already-partial position is excluded either way.
+`TestExecuteRoll` — each early-return path (no target, prep failure, CAS refusal) writes
+literally nothing beyond what pre-existed (a real row-count assertion, not just the return
+value); the debit_cap sign-flip, asserted against the real negated value; a full happy path
+seeds B with `rolled_from_trade_id` set and the real (not placeholder) orderRef stamped; a
+placement failure leaves both A (CLOSING) and B (PENDING) exactly as seeded, proving no new
+revert path was accidentally added. `TestExecuteRollsGate` — `execute_rolls` defaults
+`False`; both flags are independently required.
+
+Mutation-checked 3 mechanisms via `Edit` (never `git checkout`, learned the hard way in
+W60), each temporarily broken, confirmed the predicted test failure, reverted: the `"BOT"/
+"SLD"` translation, replaced with a raw pass-through, produced a materially wrong booked
+P&L ($270 instead of $70 — every leg's sign inverted, since `split_roll_fill_price`'s own
+`str(side).upper() == "BUY"` check silently treats an untranslated `"BOT"`/`"SLD"` as never
+a BUY); the `debit_cap` sign flip, un-negated, captured `+0.20` instead of `-0.20`; the
+`_partition_roll_positions` gate, forced to always split, made a disabled-rolls position
+wrongly appear in `roll_positions`.
+
+Regression: `test_roll_wiring.py`: **24/24**. Full named surface (`roll`, `reconcil`, `r12`,
+`r16`, `r17`, `r19`, `w50`, `go_live`, `w3`, `executor`, `trading_cycle`, `thesis`,
+`condor_defense`, `w56` keyword match — considerably broader than intended, several of those
+substrings match widely, effectively most of the suite): **998 passed / 1 failed / 2
+skipped** — the one failure is the same standing `test_r19_config_authority.py::
+TestContractIsTheSingleAuthority::test_applier_and_readers_share_one_table`
+(`AIT_MARKET_DATA_TYPE` divergence, unrelated). `python -m compileall -q src tests`: OK.
+`python scripts/typecheck.py`: found one real, if cosmetic, issue —
+`PreparedRollCombo.order` is deliberately typed `object` (avoiding an ib_insync import
+outside `roll_executor.py`), and `_execute_roll`'s `prepared.order.orderRef = ...` was the
+first access to it from outside that module. Fixed with a narrow, commented `# type:
+ignore[attr-defined]` at that one call site rather than widening the dataclass's own typing
+(out of scope for this wave) — OK afterward, zero attr-defined/call-arg/name-defined in
+`src/ait/{config,bot,execution,risk}`. `python scripts/smoke_deploy.py`: **SMOKE PASS (13
+checks)**, `config.yaml`'s `execute_rolls: false` loads cleanly, no writes to either DB.
+
+Full fast lane: **2737 passed / 1 failed / 46 skipped / 153 deselected, 910.73s
+(15m10s)** — the one failure is the same standing divergence. Count check against the
+immediately-prior full fast lane (2713+1+46=2760 total non-deselected outcomes): this run
+is 2737+1+46=2784 — a delta of exactly **+24**, matching the new test count precisely (all
+24 in `test_roll_wiring.py`, a new file).
+
+STATE AT HANDOFF. `src/ait/config/settings.py`, `config.yaml`, `src/ait/execution/
+executor.py`, `src/ait/bot/orchestrator.py` (all modified), `tests/test_roll_wiring.py`
+(new). `execute_rolls` defaults `False` in both the Pydantic model and `config.yaml` — a
+ROLL verdict is computed and reported exactly as W60 left it until an operator explicitly
+flips both `enabled` and `execute_rolls`. That is a separate, not-yet-made operator decision,
+same as `condor_defense.enabled` itself always has been.
+
+NEXT, naming every open item explicitly: **untracked roll-fill recovery at startup** — a
+roll that fills while the bot is down; the reconciler's CLOSING-branch/roll-ref recognition
+already keeps A CLOSING and reports `closing_roll_orders`, but nothing yet RE-REGISTERS that
+order into a live session's `_pending_roll_orders` after a restart. **Partial-combo-fill
+handling** — some but not all 4 legs execute; deliberately out of scope this wave, the roll
+loop only acts on a clean "Filled" verdict; needs its own design (probably `_page_stuck_
+order`). **A real Telegram/operator notification on roll completion** — a structured log
+line only for now. **The IB `orderRef` length limit** for `"ROLL:<A>:<B>"` (~54 chars) —
+still unverified, still deferred to W53's placing run. **Whether/when the operator flips
+`execute_rolls=True` for real, live use** — a separate, explicit, not-yet-made decision,
+same as `condor_defense.enabled` itself. **W54's rule 3/3e wiring** — can now reuse
+`_execute_roll`/`place_roll_combo`, still needs its own latency/cadence design. **W53's
+placing run** — still the prerequisite live proof this whole chain has never been exercised
+against a real fill. **W52a's four items**, the ongoing QQQ backfill, the surface-
+construction quality filter, the zero-bars inefficiency, and the risk-free-rate Phase B
+connection-reuse note — all unchanged.
+
+No inspect.getsource — every new test drives the real `place_roll_combo`, `check_fills`,
+`_partition_roll_positions`, and `_execute_roll`, never asserts on source strings.
+
+---
