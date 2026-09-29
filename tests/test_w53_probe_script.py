@@ -454,10 +454,14 @@ class TestMonitorAndLadder:
         assert result["status"] == "Filled"
 
     async def test_unfilled_order_ladders_monotonically_then_cancels(self, tmp_path, monkeypatch):
-        """mid=-1.00 (credit), natural=-0.60 (less credit, marketable). The
-        ladder must move price monotonically from mid toward natural and
-        never past it, then cancel once the final rung has rested past
-        CANCEL_AFTER_SECONDS."""
+        """mid=-1.00 (credit), natural=-0.60 (less credit, marketable).
+
+        2026-09-29 same-day W53 retry: LADDER_STEPS was extended past natural
+        (0.0, 0.5, 1.0, 1.5, 2.0) to see whether a more aggressive price gets
+        the roll combo to actually fill instead of cancelling unfilled (it
+        did, on the 3rd trial). So the ladder now moves monotonically from
+        mid toward AND PAST natural, ending at the final extrapolated rung,
+        then cancels once that rung has rested past CANCEL_AFTER_SECONDS."""
         monkeypatch.setattr(probe, "STATE_DIR", tmp_path)
         monkeypatch.setattr(probe, "LADDER_STEP_SECONDS", 10)
         monkeypatch.setattr(probe, "CANCEL_AFTER_SECONDS", 10)
@@ -484,12 +488,13 @@ class TestMonitorAndLadder:
         reprice_log = [json.loads(line) for line in evidence_path.read_text().splitlines()]
         reprices = [e["limit"] for e in reprice_log if e["event"] == "reprice"]
         assert reprices, "expected at least one reprice"
-        # monotonic toward natural: increasing (less negative == less credit
-        # conceded each step), bounded within [mid, natural], ending AT
-        # natural -- never overshooting past it.
+        # monotonic toward and past natural: increasing (less negative ==
+        # less credit conceded each step), bounded within [mid, the final
+        # extrapolated rung at frac=2.0], ending there.
+        natural_overshoot = -1.00 + 2.0 * (-0.60 - -1.00)  # frac=2.0 rung == -0.20
         assert reprices == sorted(reprices)
-        assert all(-1.00 - 1e-9 <= r <= -0.60 + 1e-9 for r in reprices)
-        assert reprices[-1] == pytest.approx(-0.60)
+        assert all(-1.00 - 1e-9 <= r <= natural_overshoot + 1e-9 for r in reprices)
+        assert reprices[-1] == pytest.approx(natural_overshoot)
         assert result["status"] == "Cancelled"
 
 

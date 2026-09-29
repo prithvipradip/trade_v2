@@ -12,6 +12,7 @@ Never trade on data you can't trust.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 
@@ -47,6 +48,10 @@ class DataQualityValidator:
         # Track last known good prices for outlier detection
         self._last_prices: dict[str, float] = {}
         self._last_timestamps: dict[str, float] = {}
+        # qual-01: a candidate price that failed the jump check vs. the
+        # CONFIRMED anchor above. Promoted to _last_prices only once a
+        # second, agreeing print arrives — see validate_quote step 4.
+        self._pending_prices: dict[str, float] = {}
 
     def validate_quote(
         self,
@@ -60,7 +65,21 @@ class DataQualityValidator:
         """Validate a market quote. Returns quality assessment."""
         issues = []
         now = time.time()
-        ts = timestamp or now
+        # qual-02: `timestamp or now` used truthiness, so an explicit 0/0.0
+        # (a real "no data" sentinel) silently became `now` and defeated the
+        # staleness check below on exactly the dead-feed case it exists to
+        # catch. `is None` means "caller passed nothing" -- the only case
+        # that should default to now.
+        if timestamp is None:
+            ts = now
+        elif not math.isfinite(timestamp):
+            # A NaN/inf timestamp is a malformed sentinel, not "no data" --
+            # `now - NaN` is NaN and `NaN > max` is False in Python, which
+            # would otherwise ALSO silently defeat the staleness check.
+            # Fail toward stale (suspicious), never toward trusted.
+            ts = now - self._max_staleness - 1
+        else:
+            ts = timestamp
 
         # 1. Check staleness
         staleness = now - ts
@@ -88,12 +107,14 @@ class DataQualityValidator:
         else:
             spread_pct = 0.0
 
-        # 4. Check for price outliers vs last known
+        # 4. Check for price outliers vs last known GOOD price.
+        is_jump = False
         if symbol in self._last_prices and last > 0:
             prev = self._last_prices[symbol]
             if prev > 0:
                 change_pct = abs(last - prev) / prev
                 if change_pct > self._max_price_jump:
+                    is_jump = True
                     issues.append(
                         f"price jump ({change_pct:.1%} from ${prev:.2f} to ${last:.2f})"
                     )
@@ -102,10 +123,29 @@ class DataQualityValidator:
         if volume == 0 and last > 0:
             log.debug("zero_volume", symbol=symbol)
 
-        # Update tracking
+        # qual-01: the anchor used to update unconditionally here, so a
+        # rejected print became next cycle's own baseline -- poisoning the
+        # very check meant to catch it (a bad print of size x makes its own
+        # recovery read as a jump of x/(1-x), always > x). A jump vs. the
+        # CONFIRMED anchor no longer updates it directly; it needs a SECOND,
+        # agreeing print first -- the same two-agreeing-observations shape
+        # touch_confirm_ticks already uses elsewhere in this codebase. This
+        # is what lets a genuine sustained move re-anchor within two prints
+        # instead of reading degraded forever.
         if last > 0:
-            self._last_prices[symbol] = last
-            self._last_timestamps[symbol] = ts
+            if is_jump:
+                pending = self._pending_prices.get(symbol)
+                if (pending is not None and pending > 0
+                        and abs(last - pending) / pending <= self._max_price_jump):
+                    self._last_prices[symbol] = last
+                    self._last_timestamps[symbol] = ts
+                    self._pending_prices.pop(symbol, None)
+                else:
+                    self._pending_prices[symbol] = last
+            else:
+                self._last_prices[symbol] = last
+                self._last_timestamps[symbol] = ts
+                self._pending_prices.pop(symbol, None)
 
         is_valid = len(issues) == 0
 
@@ -160,7 +200,6 @@ class DataQualityValidator:
             return False
 
         # Check for too many zeros or NaNs
-        import math
         valid_prices = [p for p in prices if p > 0 and not math.isnan(p)]
         if len(valid_prices) < len(prices) * 0.9:
             log.warning("too_many_invalid_prices", symbol=symbol,
@@ -180,6 +219,8 @@ class DataQualityValidator:
         if symbol:
             self._last_prices.pop(symbol, None)
             self._last_timestamps.pop(symbol, None)
+            self._pending_prices.pop(symbol, None)
         else:
             self._last_prices.clear()
             self._last_timestamps.clear()
+            self._pending_prices.clear()

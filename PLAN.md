@@ -14058,3 +14058,110 @@ effort on its own. Everything under ACTIVELY TRACKED and AMBIGUOUS is unchanged 
 this session already left it.
 
 ---
+
+## 2026-09-29 - CLOSED — W62: qual-01/02/04, the touch stop's own quality gate
+
+**SCOPE**: closes the three highest-priority findings from the same-day REGISTER
+RESTATEMENT entry above — `data/quality.py` bugs originally found in R25 (2026-09-14), never
+fixed, silently dropped from every NEXT pointer after W27/28 (2026-09-17). All three sit
+directly on the touch stop's own protection path (the credit position's primary loss cap).
+Planned via plan mode (approved) before any file was touched, since `execution/portfolio.py`
+is on CLAUDE.md's own critical-areas list.
+
+**qual-01** (`quality.py:105-108`, pre-fix): the outlier-detection anchor (`_last_prices`)
+updated unconditionally on any `last > 0`, BEFORE `is_valid` was computed — a rejected print
+became the next comparison's own baseline.
+
+**qual-02** (`quality.py:63`, pre-fix): `ts = timestamp or now` used truthiness, so an
+explicit `timestamp=0`/`0.0` (a real "no data" sentinel) silently became `now`, defeating the
+staleness check on exactly the dead-feed case it exists to catch.
+
+**qual-04** (`quality.py:40-41`): `max_spread_pct`/`max_price_jump_pct` were
+`DataQualityValidator`'s own class defaults, never overridden by either live construction
+site in `portfolio.py` (`__init__` and the lazy `_quality_validator()` fallback) — the same
+hardcoded-value-instead-of-config pattern CLAUDE.md calls a regression of the R19c theme.
+
+**DESIGN**:
+- **qual-01 fix**: replaced the single anchor with a pending/confirmed two-tier scheme,
+  mirroring `touch_confirm_ticks`'s own two-agreeing-observations shape (already used
+  elsewhere in this file's call path): a jump vs. the CONFIRMED anchor no longer updates it
+  directly; it needs a SECOND, agreeing print first. A single bad print can no longer poison
+  the anchor for the next, unrelated comparison; a genuine sustained move still re-anchors
+  within two consecutive agreeing observations rather than reading degraded forever (the
+  regression a naive "only update when valid" fix would have caused — traced by hand before
+  writing any code, then proven by test).
+- **qual-02 fix**: `timestamp is None` (not truthiness) decides the "caller passed nothing"
+  default; an explicit 0/0.0 now passes through unchanged and correctly reads as enormously
+  stale. Added, same bug class, a guard for non-finite (`NaN`/`inf`) timestamps too — `NaN >
+  max_staleness` is `False` in Python and would otherwise silently defeat the same check via
+  a different malformed value; treated as maximally stale rather than trusted.
+- **qual-04 fix**: two new `ExitConfig` fields (`max_quote_spread_pct`, `max_quote_jump_pct`),
+  same defaults as the code constants they replace (0.15/0.10, so wiring changes nothing
+  until tuned), wired into both `portfolio.py` construction sites. Not added to config.yaml,
+  matching the sibling fields' own established precedent (`max_quote_staleness_seconds`,
+  `touch_confirm_ticks` are Field-default-only there too).
+
+**CORRECTED UNDERSTANDING, found during implementation (register the correction, not just
+the fix)**: the plan's own Context section claimed qual-01 costs "an extra ~30s of held-back
+touch-stop authority." Traced by hand and then proven with a real test
+(`test_sustained_gap_through_the_strike_still_fires_by_second_tick`,
+`test_exit_staleness_gate.py`): for a GENUINE sustained touch, this is not true. The touch
+stop's own existing `touch_confirm_ticks` mechanism (2 agreeing degraded ticks) already fires
+by the second cycle regardless of whether `spot_health` reads "degraded" or "fresh" at that
+cycle — because `_touched` (does the raw spot cross the strike) is computed independently of
+quality validity. Both the old buggy anchor and the new fixed one fire a genuine sustained
+breach at the same cycle; verified identical timing under both, by mutation-checking this
+specific test against the reverted source (it passes both ways, as a regression check
+should). The fix's REAL value is narrower and more honest: an isolated bad print no longer
+poisons the baseline for later, UNRELATED comparisons on that symbol (which do matter for
+logging accuracy and anything else that reads `spot_health` for a non-touching quote), and
+the anchor's own "last known GOOD price" semantic is now actually true rather than "last seen
+price regardless of validity."
+
+**PROOF**: 11 new tests across `tests/test_data_quality.py` (7: anchor-poisoning,
+re-anchoring, disagreeing-prints-don't-falsely-promote, reset-clears-pending, epoch-0/NaN/
+None timestamp handling) and `tests/test_data_quality.py`'s new
+`TestSpreadAndJumpThresholdsAreConfigBacked` class (2: real `PortfolioManager.__init__` and
+the lazy fallback both wire the configured thresholds, teeth-checked against the code
+defaults), plus 1 new regression-safety test in `test_exit_staleness_gate.py`. Mutation-check
+against the reverted real source: all 7 qual-01/02 tests failed exactly as expected when
+`quality.py` was stashed back to its pre-fix form (via `git stash`); both qual-04 wiring
+tests failed identically when `portfolio.py`'s wiring was stashed back; the regression-safety
+test passed under BOTH versions, as intended (it proves no timing change, not a bug).
+No `inspect.getsource` — every test drives the real `validate_quote`/`_spot_quote`/touch
+confirmation path.
+
+**SIDE FIX, found by this wave's own full fast lane, unrelated to qual-01/02/04**: the same
+run surfaced one NEW failure —
+`test_w53_probe_script.py::TestMonitorAndLadder::test_unfilled_order_ladders_monotonically_
+then_cancels` — caused by this session's own earlier `LADDER_STEPS` extension
+(`scripts/probe_w53_roll_atomicity.py`, commit `342e4d0`, the W53 trial-3 price-ladder
+change) which was never checked against this script's own test suite at the time (only the
+live probe itself was run). The test asserted the old 3-rung ladder's bound (`[mid,
+natural]`) and exact final price (`natural`); updated to the new 5-rung bound (`[mid, the
+frac=2.0 extrapolated rung]`) and final price, with the same mutation-check discipline
+(reverted to the pre-`342e4d0` script version via `git show`, confirmed the updated test
+correctly fails, restored, confirmed it passes). Script-only test fix, no `src/ait` touched.
+
+**VERIFICATION**: `compileall`, `scripts/typecheck.py` (same baseline mypy findings, no new
+blocking errors), `scripts/smoke_deploy.py` (SMOKE PASS, 13 checks, confirms the new
+`ExitConfig` fields don't break construction — every model is `extra="forbid"`). Full fast
+lane: **2 failed / 2797 passed / 46 skipped** before the W53 probe-test fix (one of the two
+failures was the side fix above, now resolved; the other,
+`test_r19_config_authority.py::TestContractIsTheSingleAuthority::
+test_applier_and_readers_share_one_table`, is the same pre-existing, unrelated
+`CONTRACT_DEFAULTS` 3.0-vs-4.0 mismatch flagged multiple times earlier this session — not
+caused by this wave). Targeted re-run after the side fix: `test_data_quality.py`,
+`test_exit_staleness_gate.py`, `test_w53_probe_script.py`, `test_r15_review_fixes.py`,
+`test_r16_risk_fixes.py`, `test_r20_research_validity.py` — **169 passed**, zero failures.
+
+**STATE AT HANDOFF**: qual-01/02/04 closed. `test_r19_config_authority`'s pre-existing
+failure remains open, unrelated, still not investigated this session. Settings changes
+(the two new `ExitConfig` fields) take effect on the next process restart (every long-lived
+process freezes its settings at start, W35) — the currently-running bot/supervisor (restarted
+by the operator earlier today) is running on the OLD, unwired thresholds until restarted
+again.
+
+**NEXT**: restart the bot/supervisor when the operator wants the new config-backed
+thresholds live (operator's call, not forced by this entry). The register-restatement
+entry's remaining priority order still applies: arch-04/arch-01/02 next, then the rest.

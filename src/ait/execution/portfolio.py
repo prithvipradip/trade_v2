@@ -188,6 +188,8 @@ class PortfolioManager:
         # ZERO call sites — the exit path never checked a single quote.
         self._quality = DataQualityValidator(
             max_staleness_seconds=self._exit_config.max_quote_staleness_seconds,
+            max_spread_pct=self._exit_config.max_quote_spread_pct,
+            max_price_jump_pct=self._exit_config.max_quote_jump_pct,
         )
         self._last_quote_ts: dict[str, datetime] = {}   # symbol -> last tick time
         self._frozen_alerted: set[str] = set()
@@ -295,6 +297,8 @@ class PortfolioManager:
         if q is None:
             q = self._quality = DataQualityValidator(
                 max_staleness_seconds=self._exit_config.max_quote_staleness_seconds,
+                max_spread_pct=self._exit_config.max_quote_spread_pct,
+                max_price_jump_pct=self._exit_config.max_quote_jump_pct,
             )
         return q
 

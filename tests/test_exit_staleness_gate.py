@@ -236,6 +236,39 @@ async def test_recovery_inside_strikes_resets_the_streak():
 
 
 # --------------------------------------------------------------------------
+# qual-01 regression check (data/quality.py): the anchor-poisoning fix must
+# not add extra delay to a GENUINE sustained touch. touch_confirm_ticks'
+# own 2-agreeing-ticks path already covers a jump-vs-anchor "degraded"
+# classification regardless of whether the anchor itself has re-promoted
+# yet, so this must still fire by the second tick, exactly as before.
+# --------------------------------------------------------------------------
+
+async def test_sustained_gap_through_the_strike_still_fires_by_second_tick():
+    trade = _condor()
+    # Baseline tick, well inside the strikes -- establishes the quality
+    # validator's own price anchor at 100 before the gap.
+    mgr = _manager(_QuoteFeed(spot=100.0), touch_ticks=2)
+    baseline = await mgr._evaluate_position(trade)
+    assert not baseline.should_exit
+
+    # Genuine, sustained gap down through the 98 put -- a real >10% jump vs
+    # the anchor, so the first look reads degraded (not fresh) and needs a
+    # second agreeing tick, same as any other degraded case.
+    mgr._market_data.get_quote = _QuoteFeed(spot=85.0).get_quote
+    first = await mgr._evaluate_position(trade)
+    assert not first.should_exit  # 1 of 2
+
+    # Second tick, same sustained level (ordinary quote-to-quote noise).
+    # Must still fire here -- the anchor fix must not cost an extra cycle.
+    mgr._market_data.get_quote = _QuoteFeed(spot=84.7).get_quote
+    second = await mgr._evaluate_position(trade)
+    assert second.should_exit, (
+        "a genuine sustained breach must still confirm by the second tick"
+    )
+    assert "short_strike_touch" in second.exit_reason
+
+
+# --------------------------------------------------------------------------
 # Missing underlying quote — must NOT disable the position wholesale.
 # --------------------------------------------------------------------------
 

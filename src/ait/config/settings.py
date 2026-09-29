@@ -794,6 +794,17 @@ class ExitConfig(_StrictModel):
         description="Consecutive agreeing evaluations required before a touch "
                     "stop fires on a degraded/frozen quote. 1 = fire on a "
                     "single stale print (the pre-R14 behaviour).")
+    max_quote_spread_pct: float = Field(default=0.15, ge=0.02, le=0.50,
+        description="Underlying quote bid-ask spread above this marks the "
+                    "touch stop's input DEGRADED — same two-agreeing-ticks "
+                    "confirmation as a stale or outlier print. Was a "
+                    "data.quality.py code default, never config-backed "
+                    "(qual-04, R25).")
+    max_quote_jump_pct: float = Field(default=0.10, ge=0.02, le=0.50,
+        description="Underlying quote change vs. the last confirmed price "
+                    "above this marks the touch stop's input DEGRADED "
+                    "(qual-01/04, R25). Was a data.quality.py code default, "
+                    "never config-backed.")
 
 
 class LearningConfig(_StrictModel):
