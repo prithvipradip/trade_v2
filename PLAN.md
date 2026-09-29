@@ -13520,6 +13520,39 @@ on source strings.
 
 ---
 
+## 2026-09-29 - Validated `7d0b2f9..e4676a0` on the Windows box; one test pinned; review notes for when rolls are enabled
+
+Ahmed's 9 commits (roll-combo construction + booking, W57 foundation fixes, W61 roll placement,
+W54a/b close-or-roll comparison wired into rules 3/3e, bot-day-09 shutdown mark snapshot). Full fast
+lane here: **2787 passed / 46 skipped / 1 failed**. The failure was
+`test_roll_booking.py::TestSeedRollOpeningTrade::test_duplicate_trade_id_does_not_duplicate_the_row`:
+its comment says "fixed clock+uuid" but only uuid4 was pinned, and `seed_roll_opening_trade`'s
+trade_id carries a `%H%M%S` stamp, so the two calls straddled a second on this host
+(`...111842-fixed0` vs `...111843-fixed0`). Fixed test-only by pinning `roll_booking.datetime`
+too; the file runs 29 passed.
+
+Live-path review with two condors open (QQQ/SPY, exp 10-16): `assignment_response.policy:
+close_only` and `execute_rolls: false` (both blocks) leave every exit path byte-equivalent —
+rule 3/3e only set `roll_side` off `close_only`; the exit loop's new
+`if pos.roll_side and await self._compare_close_or_roll(pos): continue` returns False first thing
+when `execute_rolls` is off, so the close proceeds; `_partition_roll_positions` returns no rolls
+when disabled; the reconciler's roll-order match only fires on a `ROLL:` orderRef, which nothing
+places yet; the shutdown snapshot is bounded (10 s `wait_for`) and swallows every exception.
+
+NOTES FOR WHEN ROLLS ARE SWITCHED ON (not defects today):
+1. `condor_defense` CLOSE at |delta| >= 0.40 pre-empts the touch stop (~0.5 delta at the strike) —
+   a stop-behaviour change that wants a harness sweep before it is enabled.
+2. `condor_defense_close` is not in executor `_STOP_EXIT_PREFIXES`, so it rests the 300 s general
+   exit rest, not W52a's 120 s stop rest. One-word fix, but only meaningful once enabled.
+3. The synthetic delta pairs a leg's IBKR mark (delayed data) with a fresher spot — noisy near
+   the 0.40 line.
+4. Under `policy: roll_only`, `_compare_close_or_roll` returns True whenever a roll was ATTEMPTED,
+   so on expiry day (rule 3, DTE<=1) a roll that keeps failing is retried each cycle instead of
+   the position closing; only `max_rolls_per_position` bounds it if attempts count. Worth an
+   explicit "DTE<=1 and roll failed -> close" fallback before `roll_only` is ever set.
+
+---
+
 ## 2026-09-29 - REGISTER-ONLY: `whatIfOrder`'s re-open condition has fired (the operator is
 exploring other strategy types); a real strategy-by-strategy survey of what that actually means
 

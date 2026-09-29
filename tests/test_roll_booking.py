@@ -191,6 +191,17 @@ class TestSeedRollOpeningTrade:
 
         import ait.execution.roll_booking as rb_mod
         monkeypatch.setattr(rb_mod.uuid, "uuid4", lambda: type("_U", (), {"hex": "fixed0"})())
+        # The trade_id also carries a %H%M%S stamp: pin the clock too, or the
+        # two calls straddle a second boundary on a slow host and get
+        # different ids (seen on the Windows box, 2026-09-29).
+        from datetime import datetime as _dt
+
+        class _FixedClock(_dt):
+            @classmethod
+            def now(cls, tz=None):
+                return _dt(2026, 9, 29, 11, 18, 42, tzinfo=tz)
+
+        monkeypatch.setattr(rb_mod, "datetime", _FixedClock)
 
         first = seed_roll_opening_trade(
             state, closing, OPENING_LEGS, _roll_target(), quantity=1, entry_price_estimate=0.75,
