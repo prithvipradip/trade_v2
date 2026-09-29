@@ -12513,3 +12513,144 @@ No inspect.getsource — every new test drives the real `seed_roll_opening_trade
 temp-DB `StateManager`, never asserts on source strings.
 
 ---
+
+## 2026-09-29 - BUILT — fold rolled trade chains into one `go_live.py` outcome + harden
+`roll_booking.py`'s linkage: two real bugs found and fixed during implementation
+
+SCOPE. `roll_booking.py` (previous wave) books a roll correctly at the row level, but
+nothing read `rolled_from_trade_id` anywhere in this codebase (confirmed greenfield by
+grep), and `go_live.py` — the CLAUDE.md-flagged single-source-of-truth for the 50-close
+paper verdict — had no roll awareness at all: `rolled_to_` matches none of `NOT_REAL_
+CLOSE_PATTERNS`, so trade A currently counts as a normal, independent real close, and B
+(inheriting A's `strategy`) will too once it eventually closes for real — one economic
+position silently becoming two IC samples in the gate that decides go-live readiness.
+
+**Operator decision: fold, don't exclude.** A rolled chain (A→B, or longer — the schema
+has no roll cap) counts as ONE outcome, credited at the chain's TERMINAL real close:
+summed `realized_pnl` across every leg, the chain's ORIGINAL `entry_time`, the terminal
+leg's `exit_time`. Naive pattern-exclusion (the existing `%pending%`-style mechanism)
+would have silently discarded A's real, already-realized P&L — wrong, not just
+incomplete, which is why this needed new logic rather than a new pattern.
+
+**Scope boundary, deliberately held**: only the WIN/LOSS/PF/n sample computation
+(`BookStats.from_pnls`) is folded. `max_concurrent_car`'s drawdown computation
+deliberately still uses the UNFOLDED rows — A's and B's capital-at-risk exposure windows
+were genuinely separate real periods of risk even though economically linked; folding
+them would claim continuous exposure across the gap between A's close and B's open, using
+a blended `car` that matches neither leg's real exposure at any actual moment. The
+existing `NOT_REAL_CLOSE_PATTERNS`/`not_real_close_sql`/`not_real_close_bucket` list is
+NOT touched either — it's imported by 7+ other files (dashboard, ML training sets,
+`learning/analyzer.py`, `scripts/shadow_referee.py`, ...); touching it would silently
+change what THOSE consumers count too, a far broader blast radius than this file's own
+verdict. Folding is new, local, additive logic inside `go_live.py` only.
+
+**Also fixes two real gaps in `roll_booking.py`**, per the operator's explicit choice to
+bundle them in — directly relevant since they're the reliability of the very field this
+wave gives its first real reader: B's row never got `capital_at_risk` set (nothing called
+the existing `set_trade_capital_at_risk`) — now defaults to A's own (`roll_selector.
+select_roll_target` deliberately rolls to the SAME width, so A's max-loss is a reasonable
+estimate), overridable via a new `book_roll_fill(capital_at_risk=...)` parameter. And the
+`rolled_from_trade_id` back-link was written in a THIRD, separate step after both B's
+promotion and A's close already landed — a crash between steps left A pointing forward to
+B with no way back. Fixed with a new `_promote_and_link_opening_trade` primitive: ONE
+atomic `UPDATE` combining the status CAS and the linkage write, same `BEGIN IMMEDIATE`
+idiom `close_trade` already uses (not a duplicate of `state.transition()` — that only ever
+sets status, so it genuinely can't carry the extra columns; this is a new primitive for a
+new need, not a reimplementation).
+
+DESIGN. `src/ait/reporting/go_live.py`: `fold_roll_chains(rows) -> (folded, removed_count)`
+— pure function. Discovers chain membership by walking the FORWARD link (`rolled_to_<id>`
+regex-parsed from `reason`) from each row not itself pointed-to, using `rolled_from_
+trade_id` only as a cheap pre-filter for which rows to start a walk from, never as the
+sole source of truth — a `consumed` set guards against double-counting regardless of link
+write ordering. A chain whose next hop isn't in the batch (still open) is excluded
+ENTIRELY, no partial credit. `_fetch_closed_rows` is a new shared helper both `compute_
+go_live_verdict` and `real_close_count` call for the raw (unfolded) fetch, so the two
+functions' notion of "the real close population" can never silently drift apart
+(CLAUDE.md's duplication-causes-divergence theme). `compute_go_live_verdict`: `closed`
+(folded, feeds the sample) is now separate from `closed_raw`/`ic_raw` (unfolded, feeds
+drawdown) — explicit, commented, and deliberate per the scope boundary above. `v.excluded`
+gains a `rolled_intermediate` bucket (local-only, not touching the shared pattern
+machinery) reporting how many non-terminal roll legs were folded away.
+
+**A REAL BUG CAUGHT BY THE TEST SUITE DURING IMPLEMENTATION**: the first draft of `fold_
+roll_chains` assumed every caller selects `realized_pnl`/`entry_time` and unconditionally
+summed/read them when merging a chain. `real_close_count` only selects `strategy` (it
+doesn't need P&L data to count rows) — its own test raised a bare `KeyError:
+'realized_pnl'` the instant a real rolled chain existed in its query result. Fixed by
+making both fields OPTIONAL in the merge (folded only when the terminal row actually
+carries them), confirmed by the SAME test then passing and `real_close_count`'s own
+"agrees with the verdict's `n`" assertion holding.
+
+PROOF. `tests/test_go_live_roll_folding.py` (new, 8 tests): `TestFoldRollChains` — a
+non-rolled row passes through unchanged; a simple A→B fold; a 3-hop A→B→C fold (the
+schema's "no roll cap" genuinely exercised, not just claimed); an incomplete/still-open
+chain excludes entirely; **a chain with a MISSING back-link still folds correctly and
+doesn't double-count** — the direct proof this design is robust to the exact roll_
+booking.py gap being fixed alongside it, not merely dependent on that fix landing
+perfectly; two independent chains in the same batch don't cross-contaminate.
+`TestVerdictAndCountAgreeOnFoldedRolls` (real temp-DB `StateManager`, direct SQL seed
+matching `test_w3_scorecard_truth.py`'s own convention): a real A→B chain plus a
+non-rolled trade — `verdict.book.n` counts the chain once, `realized_pnl` sums correctly,
+`real_close_count` agrees with the verdict's own `n` exactly (the single-source-of-truth
+proof `real_close_count`'s docstring already promises); an in-flight chain contributes
+nothing to either.
+
+`tests/test_roll_booking.py` (5 net-new, 18 total): `capital_at_risk` defaults to A's own
+and is independently overridable; `_promote_and_link_opening_trade`'s own class —
+promotes-and-links together, a refused CAS (wrong starting status) leaves BOTH fields
+untouched (not just status), and **a direct single-atomic-statement proof via a real SQL
+spy on `sqlite3.connect`** asserting exactly one `UPDATE` (not two) carries both `status`
+and `rolled_from_trade_id` together.
+
+Mutation-checked 3 mechanisms, each temporarily broken, confirmed the intended test failed
+for the predicted reason, reverted (`git diff --stat`/checksum clean after each): `go_live.
+py` — crediting an incomplete chain anyway broke both the unit-level and end-to-end
+in-flight-chain tests; dropping the `consumed`-set guard broke the missing-back-link test
+(B genuinely double-counted, `len(folded)` went 1→2, exactly as predicted). `roll_booking.
+py` — reverting to the two-step promote-then-link design broke the SQL-spy's "exactly one
+UPDATE" assertion (caught 2, not 1) — the literal bug this fix closes, reproduced then
+fixed, not assumed.
+
+Regression surfaces: `test_roll_booking.py` + `test_w53_db_migration.py` + `test_w14_
+booking_exactly_once.py` + `test_w1_booking_integrity.py` + `test_w32_booking_breaker_
+integrity.py` + `test_w48_capital_at_risk_restatement.py` + `test_go_live_roll_folding.py`
++ `test_w3_scorecard_truth.py` + `test_w38_pace_window.py` + `test_w49_meta_label_close_
+floor.py`: **140/140**. `python -m compileall -q src tests`: OK. `python scripts/
+typecheck.py`: OK, zero attr-defined/call-arg/name-defined in `src/ait/{config,bot,
+execution,risk}` (`go_live.py` lives in `reporting/`, outside this gate's scope — mypy on
+it stays informational-only, matching this repo's own documented convention).
+
+Full fast lane: **2687 passed / 1 failed / 45 skipped / 153 deselected, 889.78s
+(14m49s)** — the one failure is the same standing `test_r19_config_authority.py::
+TestContractIsTheSingleAuthority::test_applier_and_readers_share_one_table`
+(`AIT_MARKET_DATA_TYPE` divergence). Count check against the immediately-prior full fast
+lane (2674+1+45=2720 total non-deselected outcomes): this run is 2687+1+45=2733 — a delta
+of exactly **+13**, matching the new test count precisely (5 net-new in `test_roll_
+booking.py` + 8 new in `test_go_live_roll_folding.py`).
+
+STATE AT HANDOFF. `src/ait/execution/roll_booking.py` and `src/ait/reporting/go_live.py`
+(both modified), `tests/test_go_live_roll_folding.py` (new). Zero config changes. Nothing
+new is reachable from any live path for `roll_booking.py` (still uncalled). `go_live.py`
+IS live-consumed (both `status.py` and the Friday Telegram scorecard call `compute_go_
+live_verdict`) — but on a DB with zero rolled trades (every current real trade, confirmed
+by the 49 pre-existing tests passing byte-identical before any new test was added),
+`fold_roll_chains` is a pure identity pass-through, so this wave changes NOTHING about the
+CURRENT live verdict output — only what happens once a real roll chain exists in the DB.
+
+NEXT, naming every open item explicitly: **wiring `executor.py`'s `check_fills`** to
+recognize a `PendingRollOrder` and call `book_roll_fill` — still the actual remaining hard
+step, untouched by this wave, touches the live fill-processing loop. **Wiring `condor_
+defense`'s ROLL verdict to actually call `roll_executor`+`roll_booking`** — depends on the
+executor wiring above. **W54's rule 3/3e wiring** — still needs the latency/cadence design
+the 2026-09-27 scoping note flagged. **W53's placing run** — still needs explicit
+operator go-ahead plus a `flatten` commitment. **W52a's four items** — deliberately
+registered. **The ongoing QQQ backfill** — operator-run, unaffected. **The surface-
+construction quality filter**, **the zero-bars inefficiency**, **the risk-free-rate
+script's Phase B connection-reuse note** — all unchanged.
+
+No inspect.getsource — every new test drives the real `fold_roll_chains`, `_promote_and_
+link_opening_trade`, `compute_go_live_verdict`, and `real_close_count`, never asserts on
+source strings.
+
+---

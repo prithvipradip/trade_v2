@@ -41,11 +41,13 @@ Import-light on purpose — ``status.py`` imports this.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import statistics
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Mapping, Sequence
 
 from ait.bot.state import TradeStatus
 
@@ -149,22 +151,23 @@ def is_real_close(exit_reason_detailed: str | None) -> bool:
 def real_close_count(db_path, *, strategies: frozenset = GO_LIVE_VERDICT_STRATEGIES) -> int:
     """W49 (policy-vs-impl-7): the count-only sibling of
     :func:`compute_go_live_verdict` — same population (real closes,
-    ``not_real_close_sql``-filtered, restricted to ``strategies``), for a
+    ``not_real_close_sql``-filtered, restricted to ``strategies``, rolled
+    chains folded into one outcome each — :func:`fold_roll_chains`), for a
     caller that only needs "how long is our real track record" and would
     otherwise have to run the full verdict (slippage, drawdown, pace) just to
-    read one number off it. Single authority so a future policy gate keyed on
-    the live track record's length (this wave's meta-label arm check, the
+    read one number off it. Single authority (via :func:`_fetch_closed_rows`,
+    shared with :func:`compute_go_live_verdict`) so a future policy gate keyed
+    on the live track record's length (this wave's meta-label arm check, the
     scorecard's own ``n/50`` pace line) always means the same population.
     """
     con = sqlite3.connect(str(db_path))
     con.row_factory = sqlite3.Row
     try:
-        rows = con.execute(
-            f"SELECT strategy FROM trades WHERE status='closed' {not_real_close_sql()}"
-        ).fetchall()
+        raw = _fetch_closed_rows(con, "strategy")
     finally:
         con.close()
-    return sum(1 for r in rows if r["strategy"] in strategies)
+    folded, _non_terminal_removed = fold_roll_chains(raw)
+    return sum(1 for r in folded if r["strategy"] in strategies)
 
 
 def not_real_close_bucket(exit_reason_detailed: str | None) -> str | None:
@@ -177,6 +180,140 @@ def not_real_close_bucket(exit_reason_detailed: str | None) -> str | None:
     if "migrated" in r:
         return "migrated"
     return None
+
+
+# ---------------------------------------------------------------------------
+# Rolled-chain folding — a rolled position (trade A closed via
+# execution/roll_booking.py, exit_reason_detailed="rolled_to_<B>") is NOT a
+# real, independent win/loss on its own: it's an interim leg of a position
+# that continues as trade B. Counting A independently would double-count one
+# economic position as two IC samples in the go-live gate once real rolls
+# happen. Naive exclusion (adding "rolled_to_%" to NOT_REAL_CLOSE_PATTERNS,
+# the existing mechanism for $0 placeholder rows) is the WRONG fix here — A's
+# realized_pnl is real, already-booked money, not a placeholder; dropping it
+# would silently understate the book. Deliberately kept OUT of
+# NOT_REAL_CLOSE_PATTERNS/not_real_close_sql/not_real_close_bucket — those
+# are imported by 7+ other files (dashboard, ML training sets, learning/
+# analyzer.py, ...) and touching them would change what THOSE consumers
+# count too, a far broader blast radius than this file's own verdict. Chain
+# folding is local to this file, applied only to the two functions that read
+# the "real close" population for the verdict itself.
+_ROLL_TARGET_RE = re.compile(r"rolled_to_(\S+)")
+
+
+def fold_roll_chains(rows: Sequence[Mapping]) -> tuple[list[dict], int]:
+    """Fold each rolled chain (A -> B -> ... -> terminal) in `rows` into ONE
+    outcome, credited at the chain's TERMINAL (non-roll) close: summed
+    realized_pnl across every leg, the chain's ORIGIN entry_time, every
+    other field (strategy, exit_time, car) from the terminal leg. A chain
+    whose next hop isn't present in `rows` (still open, or beyond this
+    batch) is excluded ENTIRELY — not a decided outcome yet, no partial
+    credit. Returns (folded_rows, non_terminal_legs_removed) — the second
+    value is for the caller's own transparency reporting.
+
+    Each row must have `trade_id`, `rolled_from_trade_id`, `reason` (the
+    already-COALESCE'd exit_reason_detailed) -- everything else is optional:
+    `realized_pnl`/`entry_time` are folded (summed / taken from the origin)
+    ONLY when the terminal row actually carries them, so a caller with a
+    narrower select_cols (real_close_count selects only `strategy`, since it
+    doesn't need P&L data to count rows) doesn't KeyError.
+
+    Chain membership is discovered by walking the FORWARD link
+    (`rolled_to_<id>` parsed out of `reason`) from each row that isn't
+    itself pointed to (`rolled_from_trade_id` falsy) -- `rolled_from_trade_id`
+    is used only as a cheap pre-filter for which rows to start a walk from,
+    never as the sole source of truth. A `consumed` set guards against
+    double-counting any row regardless of how that pre-filter or the write
+    ordering of the two links behaves — this function still folds a chain
+    correctly even if a row's own `rolled_from_trade_id` back-link never
+    landed, as long as the row it points AWAY FROM correctly names it via
+    `rolled_to_<id>`.
+    """
+    by_id = {r["trade_id"]: r for r in rows if r["trade_id"]}
+    folded: list[dict] = []
+    consumed: set[str] = set()
+    non_terminal_removed = 0
+
+    for row in rows:
+        trade_id = row["trade_id"]
+        if not trade_id or trade_id in consumed:
+            continue
+        if row["rolled_from_trade_id"]:
+            # Not a chain origin -- reached (or excluded) by walking
+            # forward from its own origin below, whenever that origin is
+            # processed (order-independent: this row is simply skipped
+            # here either way).
+            continue
+
+        chain = [row]
+        current = row
+        incomplete = False
+        while True:
+            match = _ROLL_TARGET_RE.search(current["reason"] or "")
+            if not match:
+                break  # current is the terminal, real close
+            target_id = match.group(1)
+            nxt = by_id.get(target_id)
+            if nxt is None:
+                incomplete = True  # chain continues past this batch / still open
+                break
+            chain.append(nxt)
+            current = nxt
+
+        for leg in chain:
+            consumed.add(leg["trade_id"])
+
+        if incomplete:
+            non_terminal_removed += len(chain)
+            continue
+
+        if len(chain) == 1:
+            folded.append(dict(row))
+            continue
+
+        # realized_pnl/entry_time are OPTIONAL here -- a caller like
+        # real_close_count only selects `strategy` (plus the fixed roll
+        # columns), since it doesn't need P&L data to count rows. Only
+        # fold fields a caller actually selected; .get() rather than [] so
+        # a minimal select_cols doesn't KeyError.
+        terminal = chain[-1]
+        merged = dict(terminal)
+        if "realized_pnl" in terminal:
+            merged["realized_pnl"] = sum(leg.get("realized_pnl") or 0.0 for leg in chain)
+        if "entry_time" in terminal:
+            merged["entry_time"] = chain[0].get("entry_time")
+        folded.append(merged)
+        non_terminal_removed += len(chain) - 1
+
+    return folded, non_terminal_removed
+
+
+# Fixed columns every caller needs for fold_roll_chains itself (chain
+# discovery), on top of whatever caller-specific columns it also wants.
+# `reason` lives here, not in a caller's own select_cols, so it's supplied
+# exactly once regardless of how many callers exist.
+_CLOSED_ROLL_COLUMNS = "trade_id, rolled_from_trade_id, COALESCE(exit_reason_detailed,'') reason"
+
+
+def _fetch_closed_rows(con: sqlite3.Connection, select_cols: str) -> list[dict]:
+    """The existing not_real_close_sql()-filtered closed-rows query
+    (select_cols is the caller's OWN columns, e.g. "strategy" or the fuller
+    verdict column list -- never include exit_reason_detailed/reason there,
+    _CLOSED_ROLL_COLUMNS already supplies it), UNFOLDED -- one row per DB
+    row. ONE place compute_go_live_verdict and real_close_count both call
+    for the raw fetch, so they can never silently drift apart on what "the
+    real close population" means before either applies fold_roll_chains
+    (CLAUDE.md's own duplication-causes-divergence theme, applied here).
+    Deliberately returns the UNFOLDED rows, not a folded view -- some
+    callers (drawdown/capital-at-risk tracking) need each leg's own real
+    exposure window, not a chain-summed one; see fold_roll_chains' and
+    compute_go_live_verdict's own comments for why."""
+    rows = con.execute(
+        f"SELECT {select_cols}, {_CLOSED_ROLL_COLUMNS} "
+        f"FROM trades WHERE status='closed' {not_real_close_sql()} "
+        "ORDER BY COALESCE(exit_time, entry_time)"
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -335,13 +472,10 @@ def compute_go_live_verdict(
     con = sqlite3.connect(str(db_path))
     con.row_factory = sqlite3.Row
     try:
-        closed = con.execute(
-            "SELECT realized_pnl, strategy, entry_time, exit_time, "
-            "COALESCE(capital_at_risk, 0) car, "
-            "COALESCE(exit_reason_detailed,'') reason "
-            f"FROM trades WHERE status='closed' {not_real_close_sql()} "
-            "ORDER BY COALESCE(exit_time, entry_time)"
-        ).fetchall()
+        closed_raw = _fetch_closed_rows(
+            con, "realized_pnl, strategy, entry_time, exit_time, "
+                 "COALESCE(capital_at_risk, 0) car",
+        )
         # Surface (rather than silently drop) what the filter removed —
         # string-contracts-4 asked for a needs-review count on the surface.
         all_reasons = con.execute(
@@ -389,6 +523,14 @@ def compute_go_live_verdict(
         bucket = not_real_close_bucket(r["reason"])
         if bucket:
             excluded[bucket] = excluded.get(bucket, 0) + int(r["n"])
+    # Rolled-chain legs folded into one outcome each -- see fold_roll_chains
+    # and the module comment above it. Deliberately a SEPARATE, local-only
+    # bucket, not folded into the buckets above: those come from
+    # not_real_close_bucket/NOT_REAL_CLOSE_PATTERNS, which this fold
+    # deliberately does not touch (7+ other files import that shared list).
+    closed, non_terminal_rolled = fold_roll_chains(closed_raw)
+    if non_terminal_rolled:
+        excluded["rolled_intermediate"] = non_terminal_rolled
     v.excluded = excluded
 
     ic = [r for r in closed if r["strategy"] in v.strategies]
@@ -399,12 +541,24 @@ def compute_go_live_verdict(
     # D2 base restricted to the SAME population being graded (money-flow-04):
     # grading IC drawdown against a base inflated by retired-experiment risk
     # would flatter the percentage.
+    #
+    # Deliberately uses closed_raw (UNFOLDED), not the folded `ic` above: A's
+    # and B's capital-at-risk exposure windows were genuinely SEPARATE real
+    # periods of risk even though they're one economic position for P&L
+    # purposes -- folding them into one [origin.entry_time, terminal.
+    # exit_time) window would claim capital was continuously at risk across
+    # the gap between A's close and B's open, and use a summed/blended car
+    # that doesn't match either leg's real exposure at any actual moment.
+    # Drawdown tracks real capital exposure over real time; the sample above
+    # tracks economic outcomes -- two different things this file measures,
+    # not to be conflated just because they now share an input query.
+    ic_raw = [r for r in closed_raw if r["strategy"] in v.strategies]
     ic_open = [r for r in open_rows if r["strategy"] in v.strategies]
     base = max_concurrent_car(
-        [(r["entry_time"], r["exit_time"], r["car"]) for r in ic]
+        [(r["entry_time"], r["exit_time"], r["car"]) for r in ic_raw]
         + [(r["entry_time"], r["exit_time"], r["car"]) for r in ic_open]
     )
-    v.dd_missing_car = sum(1 for r in ic if (r["car"] or 0) <= 0)
+    v.dd_missing_car = sum(1 for r in ic_raw if (r["car"] or 0) <= 0)
     if base > 0:
         v.dd_base = base
         v.dd_pct = v.verdict.max_dd / base * 100.0

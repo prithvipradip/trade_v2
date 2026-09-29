@@ -131,6 +131,33 @@ def split_roll_fill_price(
     return round(closing_net, 4), round(opening_net, 4)
 
 
+def _promote_and_link_opening_trade(
+    state: StateManager, opening_trade_id: str, entry_price: float, quantity: int,
+    closing_trade_id: str,
+) -> bool:
+    """Promote B (PENDING/PARTIAL -> FILLED) and set its rolled_from_trade_id
+    back-link in ONE atomic statement -- not state.transition() followed by
+    a separate UPDATE. The two-step version left a real crash window: a
+    process dying between "B promoted" and "B linked back to A" leaves B as
+    a live FILLED trade with no way back to A, breaking the one field this
+    wave gives its first real reader (go_live.py's chain folding). state.
+    transition() only ever sets status, so it can't carry the extra columns
+    -- this is a genuinely new primitive, not a reimplementation of an
+    existing one, built with the SAME BEGIN IMMEDIATE CAS idiom close_trade
+    already uses."""
+    with sqlite3.connect(state._db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            """UPDATE trades SET status = ?, entry_price = ?, quantity = ?,
+                   rolled_from_trade_id = ?
+               WHERE trade_id = ? AND status IN (?, ?)""",
+            (TradeStatus.FILLED.value, entry_price, quantity, closing_trade_id,
+             opening_trade_id, TradeStatus.PENDING.value, TradeStatus.PARTIAL.value),
+        )
+        conn.commit()
+    return cur.rowcount > 0
+
+
 def book_roll_fill(
     state: StateManager,
     closing_trade: TradeRecord,
@@ -139,13 +166,20 @@ def book_roll_fill(
     closing_conids: set[int],
     opening_conids: set[int],
     commission: float = 0.0,
+    capital_at_risk: float | None = None,
 ) -> bool:
     """Book a filled roll combo's single fill as TWO trade updates: promote
     B from PENDING to FILLED (real entry price, rolled_from_trade_id set to
-    A's trade_id -- state.py:99, unpopulated by any code path until now)
-    FIRST, then close A (via the EXISTING close_trade outbox/claim/
-    core_booked exactly-once machinery, CAS narrowed to CLOSING only -- a
-    stray fill on a non-CLOSING A is refused, not silently booked).
+    A's trade_id -- state.py:99, unpopulated by any code path until now,
+    written atomically with the promotion -- see
+    _promote_and_link_opening_trade) FIRST, then close A (via the EXISTING
+    close_trade outbox/claim/core_booked exactly-once machinery, CAS
+    narrowed to CLOSING only -- a stray fill on a non-CLOSING A is refused,
+    not silently booked). `capital_at_risk` defaults to A's own (roll_
+    selector.select_roll_target deliberately rolls to the SAME width, so
+    A's max-loss is a reasonable estimate for B's until a more precise
+    figure is available).
+
     Returns True only if BOTH sides land, each logged for the operator to
     reconcile manually on any refusal. The ordering is deliberate: if B's
     promotion fails, A is left untouched in CLOSING (recoverable). If A's
@@ -167,23 +201,23 @@ def book_roll_fill(
         signed_entry = abs(closing_trade.entry_price)
     realized_pnl = round((closing_net - signed_entry) * 100 * closing_trade.quantity, 2)
 
-    # Order matters: promote B FIRST. close_trade and transition are two
-    # independent CAS calls (each internally atomic, not a single shared
-    # transaction across both trades' rows -- composing them into one true
-    # cross-table transaction would mean bypassing state.py's own
-    # exactly-once primitives, which this module deliberately reuses
-    # rather than reimplements). Promoting B first means a failure there
-    # (caught directly by this module's own tests) leaves A untouched in
-    # CLOSING -- recoverable, still awaiting its real close. Closing A
-    # first and having B's promotion fail would instead leave A already
-    # CLOSED while B never existed as a real fill -- the position would
-    # have silently vanished. The residual risk this ordering does NOT
-    # eliminate (A's close failing AFTER B is already promoted, leaving
+    # Order matters: promote B FIRST. close_trade and this module's own
+    # atomic promotion are two independent CAS calls (each internally
+    # atomic, not a single shared transaction across both trades' rows --
+    # composing them into one true cross-table transaction would mean
+    # bypassing state.py's own exactly-once primitives, which this module
+    # deliberately reuses rather than reimplements). Promoting B first means
+    # a failure there (caught directly by this module's own tests) leaves A
+    # untouched in CLOSING -- recoverable, still awaiting its real close.
+    # Closing A first and having B's promotion fail would instead leave A
+    # already CLOSED while B never existed as a real fill -- the position
+    # would have silently vanished. The residual risk this ordering does
+    # NOT eliminate (A's close failing AFTER B is already promoted, leaving
     # both a live B and a stuck-CLOSING A) is smaller and more visible --
     # registered as a known limitation for whoever wires this into
     # executor.py's live fill loop, not solved here.
-    promoted = state.transition(
-        opening_trade_id, (TradeStatus.PENDING, TradeStatus.PARTIAL), TradeStatus.FILLED,
+    promoted = _promote_and_link_opening_trade(
+        state, opening_trade_id, opening_net, closing_trade.quantity, closing_trade.trade_id,
     )
     if not promoted:
         log.error("roll_booking_promote_refused", closing_trade_id=closing_trade.trade_id,
@@ -203,14 +237,10 @@ def book_roll_fill(
                   opening_trade_id=opening_trade_id)
         return False
 
-    with sqlite3.connect(state._db_path) as conn:
-        conn.execute(
-            """UPDATE trades SET entry_price = ?, quantity = ?, rolled_from_trade_id = ?
-               WHERE trade_id = ? AND status = ?""",
-            (opening_net, closing_trade.quantity, closing_trade.trade_id,
-             opening_trade_id, TradeStatus.FILLED.value),
-        )
-        conn.commit()
+    state.set_trade_capital_at_risk(
+        opening_trade_id,
+        capital_at_risk if capital_at_risk is not None else closing_trade.capital_at_risk,
+    )
 
     log.info("roll_booking_complete", closing_trade_id=closing_trade.trade_id,
              opening_trade_id=opening_trade_id, realized_pnl=realized_pnl)

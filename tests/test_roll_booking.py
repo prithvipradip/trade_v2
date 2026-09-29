@@ -13,6 +13,7 @@ import pytest
 
 from ait.bot.state import StateManager, TradeDirection, TradeRecord, TradeStatus
 from ait.execution.roll_booking import (
+    _promote_and_link_opening_trade,
     book_roll_fill,
     cas_roll_closing_trade,
     seed_roll_opening_trade,
@@ -36,12 +37,12 @@ def _state(tmp_path) -> StateManager:
 
 
 def _closing_trade(trade_id="T-A", strategy="iron_condor", entry_price=1.50,
-                    quantity=1, status=TradeStatus.FILLED) -> TradeRecord:
+                    quantity=1, status=TradeStatus.FILLED, capital_at_risk=0.0) -> TradeRecord:
     return TradeRecord(
         trade_id=trade_id, symbol="SPY", strategy=strategy,
         direction=TradeDirection.SHORT, status=status,
         entry_time="2026-09-27T10:00:00", entry_price=entry_price, quantity=quantity,
-        contract_type="iron_condor", legs=CLOSING_LEGS_JSON,
+        contract_type="iron_condor", legs=CLOSING_LEGS_JSON, capital_at_risk=capital_at_risk,
     )
 
 
@@ -151,6 +152,87 @@ class TestCasRollClosingTrade:
 
 
 # ---------------------------------------------------------------------------
+# _promote_and_link_opening_trade -- the atomic-write fix's own proof
+# ---------------------------------------------------------------------------
+
+class TestPromoteAndLinkOpeningTrade:
+    def _pending_opening(self, tmp_path):
+        state = _state(tmp_path)
+        closing = _closing_trade()
+        state.record_trade(closing)
+        opening = seed_roll_opening_trade(
+            state, closing, OPENING_LEGS, _roll_target(), quantity=1, entry_price_estimate=0.75,
+        )
+        return state, closing, opening
+
+    def test_promotes_and_links_together(self, tmp_path):
+        state, closing, opening = self._pending_opening(tmp_path)
+        ok = _promote_and_link_opening_trade(
+            state, opening.trade_id, 0.65, 1, closing.trade_id,
+        )
+        assert ok is True
+        b = state.get_trade_by_id(opening.trade_id)
+        assert b.status == TradeStatus.FILLED
+        assert b.rolled_from_trade_id == closing.trade_id
+        assert b.entry_price == pytest.approx(0.65)
+
+    def test_refused_when_not_pending_or_partial_leaves_both_untouched(self, tmp_path):
+        """Proves the two fields are coupled in one CAS, not two independent
+        writes: a refused promotion must leave rolled_from_trade_id unset
+        too, not just status unchanged."""
+        state, closing, opening = self._pending_opening(tmp_path)
+        state.transition(opening.trade_id, (TradeStatus.PENDING,), TradeStatus.CANCELLED)
+
+        ok = _promote_and_link_opening_trade(
+            state, opening.trade_id, 0.65, 1, closing.trade_id,
+        )
+        assert ok is False
+        b = state.get_trade_by_id(opening.trade_id)
+        assert b.status == TradeStatus.CANCELLED
+        assert b.rolled_from_trade_id is None
+
+    def test_single_atomic_update_statement(self, tmp_path, monkeypatch):
+        """The direct regression guard for the bug this fix closes: the
+        status CAS and the rolled_from_trade_id write must be ONE
+        statement, not state.transition() followed by a separate UPDATE
+        (the prior design's real crash window)."""
+        state, closing, opening = self._pending_opening(tmp_path)
+
+        import sqlite3 as real_sqlite3
+        executed_sql: list[str] = []
+        real_connect = real_sqlite3.connect
+
+        class _SpyConn:
+            def __init__(self, conn):
+                self._conn = conn
+
+            def execute(self, sql, *args, **kwargs):
+                executed_sql.append(sql)
+                return self._conn.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return self._conn.__exit__(*exc)
+
+        def _spy_connect(*args, **kwargs):
+            return _SpyConn(real_connect(*args, **kwargs))
+
+        import ait.execution.roll_booking as rb_mod
+        monkeypatch.setattr(rb_mod.sqlite3, "connect", _spy_connect)
+
+        _promote_and_link_opening_trade(state, opening.trade_id, 0.65, 1, closing.trade_id)
+
+        updates = [s for s in executed_sql if s.strip().upper().startswith("UPDATE")]
+        assert len(updates) == 1, f"expected exactly one UPDATE, got {len(updates)}: {updates}"
+        assert "status" in updates[0] and "rolled_from_trade_id" in updates[0]
+
+
+# ---------------------------------------------------------------------------
 # book_roll_fill -- end to end, real StateManager
 # ---------------------------------------------------------------------------
 
@@ -165,11 +247,16 @@ OPENING_CONIDS = {3, 4}
 
 
 class TestBookRollFill:
-    def _seeded(self, tmp_path, *, strategy="iron_condor", entry_price=1.50):
+    def _seeded(self, tmp_path, *, strategy="iron_condor", entry_price=1.50, capital_at_risk=0.0):
         state = _state(tmp_path)
         closing = _closing_trade(strategy=strategy, entry_price=entry_price,
-                                 status=TradeStatus.FILLED)
+                                 status=TradeStatus.FILLED, capital_at_risk=capital_at_risk)
         state.record_trade(closing)
+        # record_trade's own INSERT doesn't carry capital_at_risk at all
+        # (state.py:349-367) -- only set_trade_capital_at_risk's separate
+        # UPDATE does, matching how a real entry populates it live.
+        if capital_at_risk:
+            state.set_trade_capital_at_risk(closing.trade_id, capital_at_risk)
         assert cas_roll_closing_trade(state, closing.trade_id) is True
         closing = state.get_trade_by_id(closing.trade_id)  # re-fetch: now CLOSING
         opening = seed_roll_opening_trade(
@@ -193,6 +280,21 @@ class TestBookRollFill:
         assert b.status == TradeStatus.FILLED
         assert b.rolled_from_trade_id == closing.trade_id
         assert b.entry_price == pytest.approx(-0.90 + 0.15)
+
+    def test_capital_at_risk_defaults_to_as_own(self, tmp_path):
+        state, closing, opening = self._seeded(tmp_path, capital_at_risk=190.0)
+        book_roll_fill(state, closing, opening.trade_id, LEG_FILLS, CLOSING_CONIDS, OPENING_CONIDS)
+        b = state.get_trade_by_id(opening.trade_id)
+        assert b.capital_at_risk == pytest.approx(190.0)
+
+    def test_capital_at_risk_explicit_override(self, tmp_path):
+        state, closing, opening = self._seeded(tmp_path, capital_at_risk=190.0)
+        book_roll_fill(
+            state, closing, opening.trade_id, LEG_FILLS, CLOSING_CONIDS, OPENING_CONIDS,
+            capital_at_risk=250.0,
+        )
+        b = state.get_trade_by_id(opening.trade_id)
+        assert b.capital_at_risk == pytest.approx(250.0)
 
     def test_credit_strategy_closed_for_a_debit_is_a_realized_loss(self, tmp_path):
         """A credit vertical (entry_price=1.50 received) closed by paying
