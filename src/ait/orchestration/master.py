@@ -55,7 +55,7 @@ from ait.utils.tz import parse_trade_ts as _as_et  # noqa: E402
 
 # Project root
 ROOT = Path(__file__).resolve().parents[3]
-LOGS_DIR = ROOT / "logs"
+LOGS_DIR = ROOT / "logs_ahmed"
 DATA_DIR = ROOT / "data"
 REPORTS_DIR = ROOT / "reports"
 
@@ -68,7 +68,7 @@ REPORTS_DIR.mkdir(exist_ok=True)
 
 # W34 (R26 probe-output-planted-in-production-forensic-log): the file sink was
 # gated ONLY on PYTEST_CURRENT_TEST, so any probe, script or REPL that imported
-# this module and drove BotManager appended to logs/orchestrator.log. The
+# this module and drove BotManager appended to logs_ahmed/orchestrator.log. The
 # 2026-09-16 record asserts a 3.5h hang, a fabricated 09:06-10:10 Gateway outage
 # and a tmp-fixture singleton failure — none of which happened. The sink is
 # now OFF unless the process is the supervisor (main() enables it) or sets
@@ -775,7 +775,7 @@ class BotManager:
             _launched = launch_ibc_gateway(script, log_dir=LOGS_DIR)
             _log("info", "gateway_recovery_launched",
                  pid=getattr(_launched, "pid", None),
-                 output="logs/gateway_launch_*.log")
+                 output="logs_ahmed/gateway_launch_*.log")
         except Exception as e:  # noqa: BLE001 — recovery must never kill the supervisor
             _log("error", "gateway_recovery_failed", error=str(e))
             if _alert_gate("gateway_launch_failed", 1800):
@@ -943,7 +943,7 @@ class BotManager:
                 _alert(
                     f"BOT RELAUNCH FAILED: the process exited within "
                     f"{self._LAUNCH_GRACE_S:.0f}s of launch (exit_code={code}). "
-                    f"It is NOT running — check logs/bot_stdout.log. The keeper "
+                    f"It is NOT running — check logs_ahmed/bot_stdout.log. The keeper "
                     f"will keep retrying."
                 )
                 return False

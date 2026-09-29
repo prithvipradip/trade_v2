@@ -19,6 +19,7 @@ env/
 /data/
 models/
 logs/
+logs_ahmed/
 reports/integration_test/
 reports/runs/
 

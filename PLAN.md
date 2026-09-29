@@ -14184,3 +14184,74 @@ what's being corrected here. Going forward, the accurate priority order, given q
 is now closed: **arch-04 (`orchestrator.py` god object) and arch-01/02 next**, then the
 batch-3/SIGKILL/AutoRestartTime cluster, then triage batch 2 — same as the register
 entry's items (2)-(4), just with item (1) now done and no longer first in line.
+
+---
+
+## 2026-09-30 - OPS: log directory renamed `logs/` -> `logs_ahmed/`, operator request
+
+**SCOPE**: operator asked to redirect the bot's own logs from `logs/` to `logs_ahmed/` in
+the repo root. Not a defect fix — a straightforward operator preference, executed
+thoroughly given how many live paths derive from the old name.
+
+**CHANGE**: every functional path constant/default that wrote to or read from `logs/` was
+updated to `logs_ahmed/`, plus the informational strings (Telegram alert text, dashboard UI
+labels, CLI help, docstrings describing current/ongoing behavior) that named the old path,
+so an operator reading an alert or a doc sees the real location. Historical/provenance
+comments describing a specific PAST incident (per CLAUDE.md's "comments carry provenance"
+convention) were deliberately left referencing the old path, since they describe what was
+true at the time, not current behavior.
+
+Functional changes:
+- `config.yaml` `logging.file` and `settings.py` `LoggingConfig.file` default: the main
+  bot's own structlog file sink.
+- `src/ait/orchestration/master.py` `LOGS_DIR` constant — the single source every one of the
+  supervisor's own log files derive from (`orchestrator.log`, `bot_stdout.log` + its rotation
+  chain, `dashboard.log`, `weblog.log`, `status_server.log`, `retrain_*.log`,
+  `gateway_launch_*.log`, the monthly log-cleanup sweep). Changing this one constant
+  redirects all of them.
+- `src/ait/main.py` — the faulthandler fatal-crash sink (`fatal.log`) and its directory
+  creation.
+- `src/ait/monitoring/ops_health.py` `FATAL_LOG`/`LEGACY_CRASH_LOGS` — must track
+  `main.py`'s actual write location, since this module counts native crashes from it.
+- `status.py` `LOGS`, `web_logs.py` `LOG_FILE`/`ORCH_LOG` — the two log-reading dashboards'
+  own constants.
+- `scripts/check_first_rth_liveness.py`, `scripts/run_integration_test.py` (its own
+  `LoggingConfig(file=...)` construction — a known collision risk with the live bot's
+  handler if ever run concurrently, per an earlier audit finding; now tracks the same,
+  current production path instead of the old one).
+- `.gitignore` — added `logs_ahmed/` alongside the existing `logs/` entry. Load-bearing: this
+  project has a real history (R13, U10) of a live API key leaking into log files; the new
+  directory must stay untracked from the first write.
+- `tests/test_hot_path_smoke.py`'s shared smoke/test rig — creates `logs_ahmed/` instead of
+  `logs/` in its sandbox, matching the real config.yaml it loads.
+
+Cosmetic/docs, updated for consistency: `src/ait/dashboard/app.py` (UI labels + a docstring),
+`scripts/smoke_deploy.py` (a comment + an error-message hint), `scripts/backfill_option_
+history.py` (usage-example docstring, both POSIX and PowerShell forms), `docs/RUNBOOK.md`,
+`README.md`.
+
+Deliberately NOT touched: `deprecated/` (retired code), `reports/*.md` (point-in-time audit
+snapshots — CLAUDE.md's own note that these are frozen, not current state), PLAN.md's own
+historical entries (append-only), and `.claude/worktrees/` (a separate worktree checkout,
+not this working tree). Existing log files under `logs/` were left in place, untouched —
+the request was about where the bot logs GOING FORWARD, not a migration of history, and
+this project treats old logs as forensic evidence worth preserving, not clutter to move.
+
+**VERIFICATION**: `compileall`, `scripts/typecheck.py` (same baseline, no new blocking
+errors), `scripts/smoke_deploy.py` (SMOKE PASS, 13 checks — confirmed `logs_ahmed/` was
+actually created in the real repo root with `fatal.log` inside, proving the new path
+resolves end-to-end, not just in a sandbox). Targeted run
+(`test_w34_ops_substrate.py`, `test_w6_ops_surfaces.py`, `test_hot_path_smoke.py`, all
+touch `LOGS_DIR`/the shared smoke rig): 104 passed. Full fast lane: **1 failed / 2799
+passed / 45 skipped** — the one failure is the same pre-existing, unrelated
+`test_r19_config_authority` `CONTRACT_DEFAULTS` mismatch flagged repeatedly this session,
+not caused by this change.
+
+**STATE AT HANDOFF**: `master.py` changed, so per CLAUDE.md this needs a **full supervisor
+restart**, not just a bot restart, to take effect — the currently-running
+bot/supervisor (started by the operator earlier) is still writing to the OLD `logs/`
+location until restarted. Old `logs/` files are untouched and still readable at their
+original path in the meantime.
+
+**NEXT**: restart the bot/supervisor when the operator wants the new location live
+(operator's call). Everything else unchanged from the prior entry's priority order.

@@ -383,7 +383,7 @@ dashboard:
 
 logging:
   level: INFO
-  file: logs/ait.log
+  file: logs_ahmed/ait.log
   max_bytes: 20971520                  # 20 MB (10MB x5 held ~20 min under IBKR error spam —
   backup_count: 10                     #  destroyed forensic evidence; now ~200MB / hours of history)
 

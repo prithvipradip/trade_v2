@@ -94,7 +94,7 @@ _SETTINGS = None  # cached by check_load_settings for --telegram reuse
 
 def _bootstrap() -> None:
     """Run from repo root regardless of cwd; make stdout unicode-safe."""
-    os.chdir(ROOT)  # config.yaml, data/, logs/ are all cwd-relative in src
+    os.chdir(ROOT)  # config.yaml, data/, logs_ahmed/ are all cwd-relative in src
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -541,7 +541,7 @@ def _run_with_alert_captured(fn_name: str) -> list[str]:
     if not sent:
         raise RuntimeError(
             f"{fn_name} produced no alert — it swallowed an internal error "
-            "(see logs/orchestrator.log for the *_failed warning)")
+            "(see logs_ahmed/orchestrator.log for the *_failed warning)")
     return sent
 
 

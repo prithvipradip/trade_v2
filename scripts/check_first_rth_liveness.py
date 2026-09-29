@@ -31,7 +31,7 @@ FRESH_SECS = 600
 
 
 def _log_tail() -> str:
-    p = ROOT / "logs" / "ait.log"
+    p = ROOT / "logs_ahmed" / "ait.log"
     if not p.exists():
         return ""
     with open(p, "rb") as f:
