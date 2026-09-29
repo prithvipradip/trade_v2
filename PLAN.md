@@ -13946,3 +13946,115 @@ open item unchanged from the prior entries (portfolio-risk-gate netting, EV path
 per-strike IV-quality tracking, the backfill run's own progress, W52a item 4).
 
 ---
+
+## 2026-09-29 - REGISTER RESTATEMENT: full open-item inventory, restoring findings silently dropped from NEXT pointers
+
+**WHY THIS ENTRY EXISTS**: operator asked for a careful read of the whole ledger (13,948
+lines, 189 entries at the time) to say what's actually still open. A full read-through (every
+entry, start to end, cross-checked for later closure) found that several substantial R25/W27
+findings were carried faithfully in every wave's own NEXT pointer for about a month, then
+simply stopped appearing in later restatements — never marked CLOSED, never refuted, no
+"deprioritized" note. This is exactly the failure mode the audit programme's own conventions
+warn against (register-don't-fix only works if the register stays visible). No code changed;
+this entry restores visibility and gives one accurate current snapshot. Compiled via a full
+read of PLAN.md plus spot-verification of the most consequential claims against direct greps
+(line numbers below are real, checked, not estimated).
+
+**RESTORED FROM SILENT DROP** — last actually mentioned on the date given, nothing after it
+anywhere in the remaining ledger through today:
+
+1. **arch-01..04** (R25's own headline architectural findings, `:2977`) — no broker boundary
+   (`IBKRClient.ib` is a public attribute; 6 independent copies of the reqMktData
+   request/settle/cancel dance exist across modules); no state boundary (13 modules + 8
+   scripts open sqlite directly, no `schema_version` anywhere); cyclic imports
+   (bot<->execution, bot<->risk, bot<->reporting); `orchestrator.py` as a god object
+   (4,300+ lines, ~89 except-blocks, multiple waves editing it in the same week without
+   cross-reading each other — this session's own W54a/b/W60/W61/bot-day-09 work all touched
+   it too, unchanged pattern). Last restated `:4958` ("Unchanged since R25: arch-01..04 and
+   qual-01/02/04"), dated 2026-09-17 (W27/28). Nothing since.
+2. **qual-01/02/04** (`data/quality.py`, same `:4958` restatement) — qual-01: the
+   outlier-detection anchor stores the new price BEFORE validity is checked, so it's poisoned
+   by the very outlier it exists to catch, which on the live exit path can withdraw the touch
+   stop's authority for two cycles instead of one. qual-02: `ts = timestamp or now` reads a
+   real epoch-0 "no data" sentinel as "caller passed nothing," defeating staleness detection
+   on exactly the dead feed it's meant to catch. qual-04: the live exit validator's
+   `max_spread_pct`/`max_price_jump_pct` run on code defaults, not config — a documented
+   R19c policy violation. Last restated same as arch-01..04, 2026-09-17. Nothing since.
+3. **10 remaining batch-3 fail-open census sites** (`:4952`, highest-consequence four named
+   repeatedly) — #2 `reconciler.py:1083`, the `except Exception: pass` around the
+   `HALT_UNTRACKED` freeze-file write, unconfirmed whether the write itself can silently
+   fail; #3 `orchestrator.py:701`, one unparseable `exit_time` silently drops that day's
+   realized P&L from daily stats; #6 `state.py:705`, corrupt `partial_exits` JSON re-fires an
+   already-completed exit level; #10 `orchestrator.py:1074`, a watchdog recovery action can be
+   lost. Last restated 2026-09-17. Nothing since.
+4. **Register triage batch 2** (`:4957`, "~167 findings" — the non-live-money tier of R24's
+   123-finding register plus R26's independent 203-row re-triage) — the live_money-severity
+   subset (26 items) was fully worked through via W41-W51 and is closed; this much larger
+   research_validity/ops_reporting/cosmetic tier was never revisited after R26, and the
+   planned dedup pass (the register is known to contain at least one true duplicate pair) was
+   never done. Last restated 2026-09-17. Nothing since.
+5. **"Every bot stop ends in SIGKILL"** (registered W28, restated `:5697-5698`) — `bot.stop()`'s
+   `terminate()` waits its full 30s and every observed stop that session ended
+   `exit_code=-9`, i.e. force-killed, not graceful. Last restated 2026-09-18 (W34, the
+   Windows-box ops-substrate wave) — one wave LATER than arch-01..04/qual/batch-3/triage, not
+   the same cutoff. Nothing since. Worth noting directly: this session stopped the Mac
+   bot/supervisor twice today (SIGTERM to the supervisor, for the W53 probe runs) and both
+   times the processes exited cleanly inside my own wait loop without a manual force-kill —
+   but I did not check exit-code evidence closely enough to say whether that was genuinely
+   graceful or an internal SIGKILL fallback I simply didn't observe from outside the process.
+   Treat as unresolved, not assumed-fixed by today's incidental observation.
+6. **`AutoRestartTime` (A1) operator decision** (`:5685-5686`, `:5715`) — whether the
+   supervisor's own nightly Gateway-relaunch page (added by W34's `[8]`) is acceptable, or
+   whether IBC's `AutoRestartTime` should be set to suppress the nightly restart entirely.
+   Same last-restated date as SIGKILL, 2026-09-18. Nothing since — a small, cheap decision
+   that's simply been sitting unresolved for 11 days as of this entry.
+
+**ACTIVELY TRACKED** (unchanged from this session's own recent entries — restated here only
+for a single consolidated snapshot, not because anything new was found):
+- Roll/condor-defense arc (W52a->W61, code-complete, gated off by `condor_defense.enabled`/
+  `execute_rolls`/`assignment_response.policy`, all at their off/default values): live-path
+  fill-recognition never exercised against a real fill with the bot running; untracked
+  roll-fill recovery after a bot restart not wired; partial-combo-fill handling out of scope;
+  roll-completion notification is a log line only, no Telegram; `"ROLL:<A>:<B>"` orderRef
+  length unverified against IBKR's real limit; `policy: roll_only`'s retry-forever risk on
+  expiry day has no close fallback; portfolio-risk-gate netting for a roll's opening leg
+  registered, operator's own explicit deferral; stop-behavior interactions
+  (`condor_defense` CLOSE pre-empting the touch stop, `_STOP_EXIT_PREFIXES` gap,
+  `STALE_PENDING_MINUTES` possibly too loose specifically for rolls) not yet swept.
+- Blocked on the vol-surface backfill (operator-run, ~4.4% done last checked): the EV
+  roll-comparison backtest, W52a item 4 (IV-rank floor parity), `max_daily_loss_pct`'s actual
+  value, the surface-construction quality filter.
+- W52a's 4 items: 1 (bot-day-09) and 3 (two-knob gap) CLOSED this session; 2 (`whatIfOrder`)
+  surveyed, nothing built, depends on which strategy is eventually chosen; 4 (IV-rank floor)
+  blocked on the same backfill.
+- Strategy-expansion blockers: `calendar_spread` has zero backtest-engine simulation logic
+  (build from scratch); `covered_call` has a real, still-unfixed naked-call safety bug that
+  must be fixed before revival, independent of margin modeling; `covered_put` doesn't exist
+  anywhere in the codebase. `bear_put_spread`/`call_credit_spread` have no blocker and are
+  already backtestable today.
+
+**AMBIGUOUS — needs operator verification, not code**:
+- Finnhub API key rotation (U10, from R13 security findings, 2026-07-14): the log-scrubbing
+  half is confirmed done ("U10 logs clean," 07-22); whether the key was actually rotated at
+  finnhub.io was never confirmed in the ledger text as a completed action.
+- Windows-box `scripts/restate_w21_tz_aware.py --apply`: proven a no-op on the Mac (corpus
+  already tz-aware) but explicitly still needed on the Windows trading box as of W38
+  (~2026-09-20); no later confirmation it was ever run there.
+- `test_watchdog.py`'s load-sensitivity flake fix (closed 2026-09-28): the closing entry
+  itself caveats "a single clean run is a data point, not proof; if it is ever observed
+  flaking on these two tests again, that means a third mechanism exists." Treat as
+  provisionally closed, not definitively.
+
+**NEXT**: no action forced by this entry alone — it is a visibility restoration, not a
+decision. Suggest discussing with the operator, in priority order that roughly follows
+consequence: (1) arch-04 (`orchestrator.py` god object) and arch-01/02 (no broker/state
+boundary), since they are the stated root cause of "why 24 rounds and ~465 instance-fixes
+have not stopped this" per R25's own framing, and this session's own work today is more
+evidence of the same pattern (more waves editing the same file); (2) qual-01/02/04, since two
+of the three sit directly on the live exit/stop-authority path; (3) the 10 remaining batch-3
+sites and the SIGKILL/AutoRestartTime pair, all cheap-to-medium effort with a known fix
+shape; (4) triage batch 2, the largest but lowest-severity-tier item, likely a multi-session
+effort on its own. Everything under ACTIVELY TRACKED and AMBIGUOUS is unchanged from where
+this session already left it.
+
+---
