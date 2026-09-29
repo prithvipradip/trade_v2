@@ -75,9 +75,16 @@ QUANTITY = 1
 MAX_WIDTH = 5.0
 MAX_ROLL_NET_DEBIT = 2.00
 RTH_BUFFER_MINUTES = 30
-LADDER_STEPS = (0.0, 0.5, 1.0)  # fraction of the way from mid to natural
+LADDER_STEPS = (0.0, 0.5, 1.0, 1.5, 2.0)  # fraction of the way from mid to natural;
+# 2026-09-29 same-day retry (2 prior trials both cancelled unfilled at natural=1.0,
+# never rejected/errored): extrapolates two more rungs PAST natural, i.e. paying
+# through each leg's own synthesized ask/bid by an extra 1x-2x the (small) mid-to-
+# natural gap, to see whether the roll fills at all with a more aggressive price
+# before concluding IB paper's BAG matching won't fill this combo regardless of
+# price. Actual dollar amounts stay tiny (observed mid-to-natural gaps ~$0.05-0.10
+# on this combo) and the existing MAX_ROLL_NET_DEBIT cap is unchanged.
 LADDER_STEP_SECONDS = 45
-CANCEL_AFTER_SECONDS = 60  # after the final (natural) rung
+CANCEL_AFTER_SECONDS = 60  # after the final (now more aggressive) rung
 
 OPEN_DTE_MIN = 5
 OPEN_DTE_MAX = 10

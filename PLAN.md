@@ -13875,3 +13875,74 @@ resolved within ~2.5 minutes, not 30) as a future tuning question, not a defect 
 gap here; `execute_rolls` remains gated off regardless.
 
 ---
+
+## 2026-09-29 - TRIAL 3: the roll combo filled — ATOMIC, first real evidence, resolves W53's original question
+
+**SCOPE**: operator asked whether it was worth extending the probe's price ladder past
+"natural" to see if the roll would actually fill instead of expiring twice more. Real value
+identified: two prior trials never filled AT ALL, so the original ATOMIC-vs-SEQUENTIAL
+question (the whole reason W53's probe exists) remained totally unanswered — only an actual
+fill can answer it.
+
+**CHANGE**: `scripts/probe_w53_roll_atomicity.py` `LADDER_STEPS` extended from `(0.0, 0.5,
+1.0)` to `(0.0, 0.5, 1.0, 1.5, 2.0)` — two more 45s-spaced rungs pushing past "natural,"
+reusing the existing `mid_net + frac*(natural_net - mid_net)` formula unchanged. Script-only
+change, no `src/ait` touched, same small-dollar bounds (`MAX_ROLL_NET_DEBIT` unchanged).
+Operator go-ahead given before stopping the bot (running again after trial 2) and before
+placing orders, per the register's standing convention.
+
+**RESULT**: `open` filled (order 5240, SELL 754P/BUY 751P exp 2026-10-05, $0.45/contract
+credit). `roll` (order 5910, closing 754/751 + opening SELL 741P/BUY 738P exp 2026-10-23)
+**FILLED** — avg price $0.08/contract, well inside the debit cap. `flatten` then closed the
+rolled-to vertical B cleanly (order 5918, `"source": "roll"` — correctly recognized the NEW
+position, not A — $0.40/contract debit). `status` after: flat, clean, same as prior trials.
+
+**HONEST CAVEAT ON THE LADDER CHANGE ITSELF**: the extended rungs were never used. Timeline:
+placed 20:36:43, repriced to 50%-to-natural at 20:37:29, repriced to natural (frac=1.0) at
+20:38:14, filled ~3-4s later — the SAME price ceiling that failed on both prior trials. So
+this result does not confirm the ladder extension was the cause; it may just be this trial's
+own market conditions (a market maker present this time that wasn't on the two prior tries).
+The extension is a real, low-cost improvement to keep for future trials regardless, but
+today's evidence can't credit it for this particular fill.
+
+**THE ACTUAL FINDING — ATOMICITY**: this DOES answer W53's original question, and the
+verdict rule is now dispositive rather than inconclusive. The roll order reported 5 individual
+leg executions (some legs split across two prints, ordinary IB behavior) spanning from
+18:38:17.976656 to 18:38:18.023755 — **a 47.1 millisecond total span across every fill**.
+This is as close to simultaneous as order-execution timestamps get; real evidence the 4-leg
+cross-expiry combo filled as ONE atomic transaction, not leg-by-leg with meaningful gaps
+between them. **Verdict: ATOMIC.**
+
+**WHAT THIS DOES NOT ANSWER**: the live bot/orchestrator was stopped for this whole trial
+(required to run the probe safely) — so this proves IB itself can and did fill the combo
+atomically, but does NOT exercise the live path's own fill-recognition/booking code
+(`book_roll_fill`, `roll_booking.py`, the reconciler's roll-aware `check_fills` block) against
+a real fill event; that code has only been tested against synthetic/mocked fills so far. A
+future trial with the live bot actually running (not the standalone probe) would be needed to
+close that specific gap — a materially bigger, more carefully-scoped undertaking than today's
+probe runs, not something to do casually.
+
+**SAMPLE SIZE**: n=1 fill against n=2 non-fills. One atomic fill is real, positive evidence
+that atomic execution is *possible* and *does happen* on this environment — it does not by
+itself establish a fill rate, nor rule out that sequential/partial fills can also occur under
+different conditions. Treat as "atomic execution is achievable," not "always atomic."
+
+**STATE AT HANDOFF**: probe confirmed flat after trial 3 (`probe_positions: []`,
+`probe_open_orders: []`). `reports/w53_probe/2026-09-29/` now holds `state_trial1.json`,
+`state_trial2.json`, `state_trial3.json` plus the appended per-step `.jsonl` evidence files
+covering all three trials. `scripts/probe_w53_roll_atomicity.py`'s `LADDER_STEPS` change is
+the only code touched this entry (script-only, no `src/ait`). Bot/supervisor stopped again for
+this trial; not yet restarted as of this entry — operator's call.
+
+**NEXT**: this genuinely strengthens the case that `execute_rolls` CAN work as designed on
+this environment when it does fill — combined with the earlier correction (a non-fill already
+has a safe, tested fallback via the reconciler's stale-pending sweep), the picture is now:
+fills happen and are atomic when they happen; non-fills are handled safely when they don't.
+The one real remaining gap before `execute_rolls` should be switched on is the live-path
+fill-recognition exercise noted above (real bot running, real fill, confirm `book_roll_fill`
+actually books it correctly) — a genuinely separate, bigger next step, not something
+implied by today's work. Restart the bot/supervisor when the operator says so. Every other
+open item unchanged from the prior entries (portfolio-risk-gate netting, EV path backtest,
+per-strike IV-quality tracking, the backfill run's own progress, W52a item 4).
+
+---
