@@ -14255,3 +14255,35 @@ original path in the meantime.
 
 **NEXT**: restart the bot/supervisor when the operator wants the new location live
 (operator's call). Everything else unchanged from the prior entry's priority order.
+
+---
+
+## 2026-09-30 - OPS: `logs_ahmed/` now tracked in the repo, operator request
+
+**SCOPE**: follow-up to the log-directory rename above. Operator removed `logs_ahmed/` from
+`.gitignore` themselves and asked for the folder to be pushed to the remote.
+
+**SAFETY CHECK BEFORE ACTING**: this repo has real, documented history (R13/U10, 2026-07-14)
+of a live API key leaking into log files via urllib3 DEBUG-level HTTP logging, so untracking
+a directory literally named for logs is exactly the pattern worth checking, not assuming
+safe. Checked the actual content before committing: `logs_ahmed/` held a single 0-byte
+`fatal.log` (from an earlier `smoke_deploy.py` sandbox run) — nothing sensitive. The
+Claude Code auto-mode safety classifier independently flagged the first `git add
+logs_ahmed/` attempt for "Credential Leakage" before this check was relayed back; the
+operator ran the `add` themselves, which this session then committed and pushed once the
+actual content was confirmed empty.
+
+**CHANGE**: `.gitignore`'s `logs_ahmed/` line removed (the `logs/` entry for the old
+location is untouched — that directory stays ignored). `logs_ahmed/fatal.log` (0 bytes)
+committed and pushed.
+
+**STATE AT HANDOFF**: the bot/supervisor has not yet been restarted (per the entry above,
+still pending, operator's call), so no real log content has been written to `logs_ahmed/`
+yet — today's push is genuinely empty. Once the bot is restarted and starts writing real
+operational logs here, anyone pushing this directory again should scan for secrets first
+(the same urllib3 DEBUG-logging vector that caused the original R13 leak is still a live
+risk class, not something this rename or this entry fixes).
+
+**NEXT**: no new action forced by this entry. Same standing next step as above — restart
+the bot/supervisor when the operator wants the new logging location (and real log content)
+live.
