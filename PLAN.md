@@ -13519,3 +13519,91 @@ shutdown`, and a real `check_positions()`/`update_position_mark` round trip, nev
 on source strings.
 
 ---
+
+## 2026-09-29 - REGISTER-ONLY: `whatIfOrder`'s re-open condition has fired (the operator is
+exploring other strategy types); a real strategy-by-strategy survey of what that actually means
+
+No code touched — this is investigation only, working through the operator's own W52a
+open items conversationally. `whatIfOrder` pre-trade margin (deferred by W51, explicit
+re-open conditions on file: the IC-only strategy decision changing, or launch-size caps
+rising toward go-live) is genuinely back on the table — the operator is now exploring
+enabling another strategy type, at minimum via backtesting first. Direct research (not
+assumed) into what that actually means, strategy by strategy:
+
+**Live-selectable today, zero new code** (`strategies/selector.py`'s `STRATEGY_MAP`):
+`long_call`, `long_put`, `bull_call_spread`, `bear_put_spread`, `iron_condor` (the only one
+actually enabled), `long_straddle`, `short_strangle`. `bear_put_spread` and `short_strangle`
+in particular are both real, working classes today.
+
+**Retired to `deprecated/src/`, not just unbuilt** (R12-C, `strategies/selector.py:22-26`):
+- **`covered_call`** (`deprecated/src/covered.py`) — the retirement reason is a real,
+  still-unfixed SAFETY BUG, not merely "unused": *"covered.py could emit naked calls when
+  the share-ownership premise wasn't checked."* A covered call is only defined-risk if the
+  account genuinely owns the shares; the retired code never verified that. Reviving this
+  strategy means fixing that bug FIRST — `whatIfOrder`/margin-modeling would not be the
+  blocking piece, the strategy builder itself is unsafe as it stands.
+- **`calendar_spread`** (`deprecated/src/calendar.py`, 149 lines, read in full) — genuinely,
+  structurally defined-risk (max_loss = net debit paid, guarded by `if debit <= 0: return
+  []`; `is_defined_risk`'s own identity-based check, `strategies/base.py:163-172`, would
+  correctly classify it as defined-risk if revived — it was never in `UNDEFINED_RISK_
+  STRATEGIES`). No naked-leg risk like `covered_call`'s bug. BUT: **`backtesting/engine.py`
+  has ZERO simulation logic for it** — confirmed by grepping every "calendar" hit in that
+  file; all of them are the unrelated ECONOMIC EVENT calendar. "Explore via backtesting
+  first" cannot currently happen for this strategy without building engine simulation from
+  scratch — a real, separate piece of work, and the actual first blocker, not `whatIfOrder`
+  or even live-selector wiring. Secondary gaps found in the retired code itself: `max_
+  profit_est` is an acknowledged rough heuristic (`debit * 3`), not model-derived; `_filter_
+  liquid` hardcodes its own 20% spread threshold instead of reading `options.max_bid_ask_
+  spread_pct` (0.40 live today) the way every other live strategy does — the exact
+  "duplicated trading value instead of importing from config" pattern this project's own
+  audit history is strict about; its near/far DTE windows (14-40 / 45-80) predate this
+  session's various DTE conventions and haven't been re-checked against current config.
+  Never wired into `STRATEGY_MAP` even before retirement — one original commit (`aabb0dd
+  Add calendar spread strategy`), then removed.
+
+**Doesn't exist anywhere in this codebase, not even in `deprecated/`**: `covered_put` —
+zero references anywhere in `src/`. Would be built from scratch, both concept and code.
+
+**`bear_call_spread` — genuinely backtestable TODAY, under a different name, with a real
+nuance worth knowing before running it.** Confirmed by direct read of `backtesting/
+engine.py`'s own simulation blocks (not assumed from the name lists): the engine's
+`call_credit_spread` (`:2061-2100`) IS the same structure a trader calls a bear call
+spread — its own comment says so explicitly ("SHADOW R2: bearish twin of put_credit_
+spread"), sell lower/near call + buy higher/far call, net credit, fully simulated with real
+Black-Scholes leg pricing (`black_scholes_price`, the SAME scipy-based function `roll_
+comparison.py`'s W54a research already found and deliberately did NOT reuse for the live
+roll-comparison path, to avoid a second pricing library there — this IS that second
+library, confined to backtesting, which is fine since nothing live calls it). **The
+nuance**: despite the resulting position being labeled `direction=BEARISH`, ENTRY into
+`call_credit_spread` is gated by `NEUTRAL_CREDIT_GATED` (`engine.py:57-64`, referenced at 9+
+sites) — grouped with `iron_condor`/`short_strangle`/`jade_lizard` as a range-bound/neutral
+premium-selling arm, entered only on a NEUTRAL market read, not on genuine bearish
+directional confidence. A trader's usual intent for a bear call spread (a moderately
+bearish directional bet) is NOT what this engine's own gating produces if selected —
+important to know before interpreting a backtest run's results, not a defect, just a real
+design choice worth being explicit about.
+
+**`bear_put_spread` — already one of `run_backtest.py`'s own FOUR DEFAULT strategies**
+(`run_backtest.py:238-247`: `["put_credit_spread", "bull_call_spread", "bear_put_spread",
+"iron_condor"]`), no flags needed. Real, complete simulation in `engine.py:1656-1672`
+(delta-targeted strike selection via `find_strike_by_delta`, real Black-Scholes leg
+pricing), gated as a genuine directional (`DEBIT_STRATEGIES`, `engine.py:46`) bearish arm
+— NOT the neutral-gated treatment `call_credit_spread` gets. This is the cleanest of
+everything surveyed today: already backtestable, already the intended directional
+semantics, zero new code.
+
+NEXT: the operator's own next step — run `run_backtest.py --strategies bear_put_spread
+call_credit_spread ...` (plus whichever symbols/window) to actually see both in the walk-
+forward results, informed by the neutral-vs-directional gating difference above. Beyond
+that, three separable follow-ups, none started: (1) if `calendar_spread` remains of
+interest, engine simulation logic needs building from scratch — the real blocker, not
+`whatIfOrder`; (2) if `covered_call` remains of interest, the naked-call safety bug needs
+fixing before anything else, in the strategy builder itself; (3) `whatIfOrder`'s own re-open
+condition — genuinely live now, but its actual necessity depends on which strategy the
+operator lands on: every defined-risk candidate surveyed today (`bear_put_spread`,
+`call_credit_spread`, `calendar_spread`) still doesn't need it (`max_loss` is already a
+hard structural cap); only `covered_call`/`covered_put` (undefined-risk, or share-ownership-
+dependent) would actually require real margin modeling, and both have their own more
+fundamental blockers first. Everything else in the register unchanged from the prior entry.
+
+---
