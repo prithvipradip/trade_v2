@@ -523,17 +523,43 @@ class AssignmentResponseConfig(_StrictModel):
     3e in portfolio.py) closes outright or rolls to a later expiry instead.
     `policy` defaults to "close_only" so shipping this config surface and
     the roll machinery behind it changes NO live behavior -- nothing calls
-    into the roll path yet (wiring rule 3/3e to consult this policy is W54,
-    per PLAN.md finding [3]f). A roll always replaces the full short+long
-    vertical, never a single leg alone, so the position stays defined-risk
-    through the swap -- see this wave's PLAN.md entry for why."""
+    into the roll path yet (wiring rule 3/3e to consult this policy is
+    W54b, per PLAN.md finding [3]f -- W54a built the comparison models
+    themselves, comparison_model/max_rolls_per_position below, still
+    unreachable from rule 3/3e until W54b). A roll always replaces the
+    full short+long vertical, never a single leg alone, so the position
+    stays defined-risk through the swap -- see this wave's PLAN.md entry
+    for why."""
 
     policy: Literal["close_only", "roll_only", "close_or_roll"] = Field(
         default="close_only",
         description="close_only: today's behavior, always close an at-risk "
-                    "leg. roll_only/close_or_roll: not live until W54 wires "
+                    "leg. roll_only/close_or_roll: not live until W54b wires "
                     "rule 3/3e to consult this field -- setting either today "
                     "has no effect.")
+    comparison_model: Literal["heuristic", "ev"] = Field(
+        default="heuristic",
+        description="W54a: which model decides close-vs-roll once policy == "
+                    "'close_or_roll' (W54b wires this in -- setting it has no "
+                    "effect until then either). 'heuristic': the cheap "
+                    "credit/max-loss proxy (execution/roll_comparison.py, "
+                    "heuristic_should_roll). 'ev': prices both sides at each "
+                    "leg's own model-implied fair value instead of raw market "
+                    "quotes (ev_should_roll) -- more precise in principle, but "
+                    "has NOT been backtested: the historical per-strike vol-"
+                    "surface backfill this needs (PLAN.md's 2026-09-27 W54 "
+                    "scoping note, finding [6]) is still running as of W54a. "
+                    "RECOMMENDED: stay on 'heuristic' until that backtest "
+                    "exists and validates 'ev' against real history -- do not "
+                    "switch this to 'ev' in a live/paper account before then.")
+    max_rolls_per_position: int = Field(default=2, ge=0, le=10,
+        description="W54a: hard cap on how many times ONE position may be "
+                    "rolled (walks rolled_from_trade_id via state.py's "
+                    "count_roll_ancestors), enforced once in orchestrator."
+                    "_execute_roll regardless of which system triggered the "
+                    "roll. Catches unbounded repeat-rolling a single credit/"
+                    "max-loss check per attempt wouldn't -- PLAN.md's W54 "
+                    "scoping note [3]c calls this non-negotiable.")
     roll_target_dte_min: int = Field(default=14, ge=1, le=90,
         description="Floor of the later-expiry search window for a roll "
                     "target. Matches options.dte_range's live floor (14) so "

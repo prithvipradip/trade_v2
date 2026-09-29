@@ -13037,3 +13037,194 @@ No inspect.getsource — every new test drives the real `place_roll_combo`, `che
 `_partition_roll_positions`, and `_execute_roll`, never asserts on source strings.
 
 ---
+
+## 2026-09-29 - BUILT — W54a: close-or-roll comparison models (heuristic default, EV built
+but gated), the missing fair-value pricing primitive, and a roll-count cap — still
+unreachable from rule 3/3e (W54b, next)
+
+SCOPE. The operator asked to ship W54's EV-comparison logic now, defaulting to the cheap
+heuristic, with a config comment recommending backtesting before ever switching to `"ev"`
+(the historical vol-surface backfill this needs is still running). Direct research before
+writing any code found the 2026-09-27 scoping note's own premises didn't fully hold, and
+that wiring rule 3/3e (the trigger) to actually USE a comparison needs more than a config
+flag: rule 3/3e and `condor_defense` currently share ONE decision variable
+(`condor_roll_side`) with no arbitration between them, a real conflict risk the moment
+either could independently choose ROLL; rule 3's `itm_side` is `"put"`/`"call"`, not the
+`"P"`/`"C"` `select_roll_target` expects; and portfolio.py has no broker access, so the
+comparison can't run where rule 3/3e's decision is made (the same reason `condor_defense`'s
+own roll stays decision-only there). Given that, **split into two waves, per the operator's
+explicit choice**, mirroring this register's own `W52a` lettering precedent:
+- **W54a (this entry)**: the comparison models, the fair-value pricing primitive they need,
+  the config selector, and the roll-count cap — built, tested, callable, genuinely
+  unreachable from any live path. Also wires the roll-count cap into the ALREADY-shipped
+  `_execute_roll` (W61), since that function is live-reachable today (once `condor_defense.
+  execute_rolls` is flipped) and benefits from the cap regardless of trigger.
+- **W54b (next, separately scoped)**: the arbitration fix, the side-encoding fix, and the
+  actual rule 3/3e → orchestrator dispatch.
+
+THREE RESEARCH FINDINGS, each confirmed by direct source read before writing any code:
+1. **No theoretical fair-value function exists anywhere on the live path.**
+   `options_chain.py` only solves IV FROM a price (`solve_iv_from_price`); nothing prices
+   FROM an IV. The scoping note's premise ("risk-neutral valuation collapses to pricing
+   both sides accurately, reusing the existing pipeline") was correct in spirit, but the
+   pricing half didn't exist — it had to be built.
+2. **`leg_net_price`/`poll_leg_quotes` (the roll path's own pricer, W60/W61) had a latent
+   gap the exit path's separate, divergent pricer (`_synthesize_combo_cost`) already
+   handles**: IBKR's `-1` "no bid" sentinel read `b >= 0` as false, so a worthless wing's
+   bid was treated as MISSING — refusing the whole roll — instead of $0. A real bug in
+   already-shipped code, fixed here regardless of W54b.
+3. **`go_live.py`'s `fold_roll_chains` cannot be reused for a live roll-count cap.** It only
+   walks CLOSED rows FORWARD for historical accounting and explicitly drops any chain that
+   ends at a still-open trade — exactly the live, open-position case a cap needs. A new,
+   small backward walk was required.
+
+DESIGN.
+
+`src/ait/data/options_chain.py`: new `black_scholes_price(spot, strike, t, r, sigma, flag)
+-> float | None`, next to `solve_iv_from_price`, using the SAME `py_vollib` dependency
+(not `backtesting/pricing.py`'s separate scipy-based implementation — one pricing library on
+the live path, not two, per CLAUDE.md's duplication theme). Never raises; `None` on
+`t<=0`/`sigma<=0`/any py_vollib failure.
+
+`src/ait/execution/roll_executor.py`: `poll_leg_quotes`'s bid-acceptance condition (`b >=
+0`) becomes `b >= -1`, normalizing a `-1` read to `0.0` — finding 2's fix, mutation-checked.
+`PreparedRollCombo` gains `closing_net`/`opening_net` (the two subtotals `mid_net` already
+sums internally, exposed separately, purely additive — `mid_net`'s own meaning and every
+existing consumer unchanged) so a caller can estimate "cost to close everything right now"
+(`closing_net - carried_value`, the SAME formula `roll_booking.book_roll_fill` already uses
+for a REAL fill, applied here to a MID estimate) without re-deriving the split.
+
+`src/ait/execution/roll_selector.py`: `RollTarget` gains `iv_is_guessed: bool = False`, set
+from the chain `select_roll_target` already fetches — the existing chain-level signal
+(`OptionsChain.iv_is_guessed`) threaded through so a future caller can refuse the EV
+comparison on a chain with no usable IV data, reusing the SAME signal `iron_condor.py`'s
+own entry path already checks, not a new detector.
+
+`src/ait/execution/roll_comparison.py` (new): mirrors `roll_selector.py`/`roll_executor.py`'s
+own shape — nothing in `src/` calls into it yet, same "build additively, wire later"
+discipline as every prior piece of this arc.
+- `close_cost_now(prepared) -> float`: `closing_net - carried_value`.
+- `heuristic_should_roll(prepared) -> bool`: the tastytrade-style rule from the scoping
+  note ([1]/[3]d), worked down to what's actually left to decide once `prepare_roll_combo`'s
+  own gates (`roll_min_credit`/`debit_cap`, same-width target selection) already
+  structurally guarantee the roll clears "net credit" and "no larger max-loss": **don't
+  roll a position that would already be profitable or breakeven if closed now — only roll
+  one that would realize a loss**, where the roll's own (already-guaranteed) credit reduces
+  that loss rather than locking it in. `roll only when close_cost_now(prepared) > 0`.
+- `ev_should_roll(closing_legs_priced, opening_legs_priced, carried_legs_priced, r) -> bool
+  | None`: the same comparison, but each leg priced via `black_scholes_price` at its own
+  solved IV (model fair value) instead of raw market mid quotes — catches finding [2] from
+  the scoping note: a roll whose raw market credit looks fine but is actually giving away
+  more theoretical time value than it collects. Takes explicit, already-resolved per-leg
+  inputs rather than reaching for a chain itself, staying pure and directly testable;
+  gathering those inputs live (the carried legs' CURRENT IV in particular has no existing
+  source yet) is explicitly a W54b wiring detail. Returns `None` — defer to the heuristic —
+  if any leg's IV is missing/unsolved, never guesses.
+
+`src/ait/config/settings.py` / `config.yaml`: `AssignmentResponseConfig` gains
+`comparison_model: Literal["heuristic","ev"] = "heuristic"` (nested under `policy`, same
+gating idiom `policy` and `condor_defense.enabled` already use; the description AND the
+`config.yaml` comment both carry the operator's requested backtest warning verbatim: "'ev'
+has NOT been backtested ... RECOMMENDED: stay on 'heuristic' ... do not switch this to 'ev'
+in a live/paper account before then") and `max_rolls_per_position: int = 2` (applies to ANY
+roll regardless of trigger).
+
+`src/ait/bot/state.py`: new `StateManager.count_roll_ancestors(trade_id, max_depth=20) ->
+int` — a single recursive-CTE query walking `rolled_from_trade_id` BACKWARD from `trade_id`
+to its origin, counting hops. Bounded by `max_depth` (belt-and-suspenders — the field is
+written exactly once, at seed time, so a cycle should never exist, but the bound costs
+nothing). Explicitly documented as distinct from `fold_roll_chains` (finding 3), so a future
+reader doesn't try to unify them.
+
+`src/ait/bot/orchestrator.py`: `_execute_roll` (already exists, W61) gains one new, cheap,
+FIRST check — `depth = state.count_roll_ancestors(trade.trade_id); if depth >=
+assignment_response.max_rolls_per_position: log + return` — before any chain fetch. The
+one piece of W54a touching a function already on a live-reachable path.
+
+PROOF. `tests/test_roll_comparison.py` (new, 16 tests): `black_scholes_price` — deep-ITM
+approaches intrinsic, deep-OTM near zero, put-call parity holds within tolerance, `t<=0`/
+`sigma<=0` return `None` never raise, and a round-trip through `solve_iv_from_price`
+recovers the original sigma (the two py_vollib call sites agree with each other).
+`heuristic_should_roll` — a losing position rolls, a winning/breakeven one doesn't, and a
+profitable CARRIED vertical can flip a losing rolled vertical's own verdict (proving
+`carried_value` is genuinely part of the decision, not just the rolled side).
+`ev_should_roll` — missing IV on any leg returns `None`; **a concrete scenario where the
+heuristic and EV verdicts genuinely DIFFER**, both sides' real outputs computed and
+compared, not asserted a priori — the direct proof EV is a second opinion, not a relabeled
+heuristic.
+
+`tests/test_roll_executor.py` (21 → 25, +4): the `-1` bid becomes `0.0` (mutation-checked:
+reverting `b >= -1` to `b >= 0` makes the test fail exactly as predicted); a real positive
+bid and a real `0.0` bid are both unaffected (the sentinel fix doesn't touch real values);
+`closing_net + opening_net == mid_net` exactly, each independently matching a direct
+`leg_net_price` computation over just its own legs.
+
+`tests/test_roll_ancestors.py` (new, 5 tests): a never-rolled trade and a missing trade_id
+both have depth 0; a one-hop chain has depth 1 at the child, still 0 at the origin; a
+3-hop chain has depth 2 at the open leaf (mutation-checked: dropping the CTE's `+1` makes
+the 3-hop test fail exactly as predicted); depth is correctly bounded by `max_depth` (5 real
+hops capped at 2 when asked, uncapped at 5 when the bound is raised) — the belt-and-
+suspenders proven to actually work, not just declared.
+
+`tests/test_roll_wiring.py` (24 → 26, +2): a position at the cap (`max_rolls_per_position=
+0`) is refused BEFORE `select_roll_target` is ever awaited (spy/call-count proof, mutation-
+checked: disabling the cap condition makes the "not awaited" assertion fail exactly as
+predicted); a position below the cap proceeds to call it normally.
+
+Regression: the full W54a-touched surface (`test_roll_wiring.py` + `test_roll_executor.py`
++ `test_roll_ancestors.py` + `test_roll_comparison.py` + `test_roll_booking.py` +
+`test_go_live_roll_folding.py` + `test_reconciler_roll_awareness.py`): **120/120**. The
+condor_defense/W56 suites (`test_condor_defense_wiring.py` + `test_w56_condor_defense.py`):
+**56/56**, zero new failures, confirming the roll-count cap addition to `_execute_roll`
+didn't perturb condor_defense's own already-shipped happy path. `python -m compileall -q
+src tests`: OK. `python scripts/typecheck.py`: OK, zero attr-defined/call-arg/name-defined
+in `src/ait/{config,bot,execution,risk}`. `python scripts/smoke_deploy.py`: **SMOKE PASS
+(13 checks)**, `config.yaml`'s new `assignment_response` fields load cleanly, no writes.
+
+Full fast lane: **2764 passed / 1 failed / 46 skipped / 153 deselected, 1681.20s
+(28m01s — noticeably slower than this session's typical ~15min run, environmental, not a
+correctness signal)** — the one failure is the same standing `test_r19_config_authority.py
+::TestContractIsTheSingleAuthority::test_applier_and_readers_share_one_table`
+(`AIT_MARKET_DATA_TYPE` divergence, unrelated). Count check against the immediately-prior
+full fast lane (2737+1+46=2784 total non-deselected outcomes): this run is 2764+1+46=2811 —
+a delta of exactly **+27**, matching the new test count precisely (16 new in `test_roll_
+comparison.py` + 5 new in `test_roll_ancestors.py` + 4 net-new in `test_roll_executor.py` +
+2 net-new in `test_roll_wiring.py`).
+
+STATE AT HANDOFF. `src/ait/data/options_chain.py`, `src/ait/execution/roll_executor.py`,
+`src/ait/execution/roll_selector.py`, `src/ait/execution/roll_comparison.py` (new),
+`src/ait/bot/state.py`, `src/ait/bot/orchestrator.py`, `src/ait/config/settings.py`,
+`config.yaml` (all modified/new). `comparison_model` defaults `"heuristic"`,
+`max_rolls_per_position` defaults `2` — neither has any live effect until W54b wires rule
+3/3e to consult `assignment_response.policy` at all. The one live-reachable change is the
+roll-count cap inside `_execute_roll`, active today for condor_defense-triggered rolls
+(once `execute_rolls` is flipped), confirmed non-disruptive by the condor_defense
+regression suite staying byte-identical.
+
+NEXT, naming every open item explicitly: **W54b** (the arbitration fix between rule 3/3e
+and `condor_defense` sharing one decision variable; the `"put"`/`"call"` → `"P"`/`"C"`
+side-encoding fix; the actual rule 3/3e → orchestrator dispatch; gathering the carried
+legs' live IV for `ev_should_roll`'s real inputs; `AssignmentResponseConfig.execute_rolls`,
+added exactly when its consumer exists, not before). **Per-strike IV-quality tracking** —
+only the existing whole-chain `iv_is_guessed` boolean is reused this wave; a per-contract
+solved/filled marker doesn't exist anywhere yet, registered as separate future work if the
+coarser chain-level signal proves too blunt in practice. **The portfolio-risk-gate netting**
+for a roll's opening leg (risk/manager.py, the double-counting wrinkle the scoping note's
+own `[3]a`/`[3]g` flagged) — per the operator's own explicit choice this session, still
+registered as a follow-up, not solved here. **W53's placing run** — still the prerequisite
+live proof the whole roll chain has never been exercised against a real fill. **The real
+multi-day vol-surface backfill run** — in progress as of this entry (started since W58's
+own entry left it as the operator's call); its own completion is what would actually let
+`comparison_model: "ev"` ever be responsibly flipped live. **W52a's four items**, the
+surface-construction quality filter, the zero-bars inefficiency, and the risk-free-rate
+Phase B connection-reuse note — all unchanged. Confirmed this wave: the W59 SOFR series
+stays fully dormant; real-time EV pricing (when W54b wires it) will reuse the SAME static
+`options.risk_free_rate` config the live IV-solve already uses via `_risk_free_rate()`, not
+the historical SOFR series, which remains backtesting-only infrastructure with zero live
+consumers.
+
+No inspect.getsource — every new test drives the real `black_scholes_price`,
+`heuristic_should_roll`, `ev_should_roll`, `poll_leg_quotes`, `count_roll_ancestors`, and
+the real `_execute_roll` cap check, never asserts on source strings.
+
+---

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,6 +24,7 @@ from ait.execution.roll_executor import (
     PreparedRollCombo,
     leg_net_price,
     legs_for_roll,
+    poll_leg_quotes,
     prepare_roll_combo,
     qualify_roll_legs,
 )
@@ -247,6 +249,31 @@ class TestQualifyRollLegs:
         assert await qualify_roll_legs(fake, SYMBOL, legs) is None
 
 
+class TestPollLegQuotesNegativeBid:
+    """W54a: IBKR's -1 sentinel ("no bid") on a worthless/no-interest leg
+    must be normalized to 0.0, not treated as still-missing -- confirmed as
+    a real gap against the exit path's own separate pricer
+    (_synthesize_combo_cost), which already does this."""
+
+    async def test_negative_one_bid_becomes_zero(self):
+        fake = _FakeIB(quotes_by_strike={480.0: (-1, 0.05)})
+        contract = SimpleNamespace(conId=1, strike=480.0)
+        quotes = await poll_leg_quotes(fake, [contract])
+        assert quotes[1] == (0.0, 0.05)
+
+    async def test_a_real_positive_bid_is_unaffected(self):
+        fake = _FakeIB(quotes_by_strike={480.0: (1.05, 1.10)})
+        contract = SimpleNamespace(conId=1, strike=480.0)
+        quotes = await poll_leg_quotes(fake, [contract])
+        assert quotes[1] == (1.05, 1.10)
+
+    async def test_zero_bid_is_a_real_zero_not_a_sentinel(self):
+        fake = _FakeIB(quotes_by_strike={480.0: (0.0, 0.05)})
+        contract = SimpleNamespace(conId=1, strike=480.0)
+        quotes = await poll_leg_quotes(fake, [contract])
+        assert quotes[1] == (0.0, 0.05)
+
+
 class TestPrepareRollCombo:
     async def test_happy_path_returns_a_prepared_combo_never_placed(self):
         fake = _FakeIB(quotes_by_strike=DEFAULT_QUOTES)
@@ -261,6 +288,24 @@ class TestPrepareRollCombo:
             leg_net_price(result.closing_legs + result.opening_legs,
                           {leg["conId"]: DEFAULT_QUOTES[leg["strike"]]
                            for leg in result.closing_legs + result.opening_legs},
+                          "mid"))
+
+    async def test_closing_net_and_opening_net_sum_to_mid_net(self):
+        """W54a: the two subtotals must reproduce mid_net exactly, and each
+        individually match a direct leg_net_price computation over just its
+        own legs."""
+        fake = _FakeIB(quotes_by_strike=DEFAULT_QUOTES)
+        result = await prepare_roll_combo(
+            fake, _trade(), "P", _roll_target(), SYMBOL, quantity=1, order_ref="TEST-ROLL",
+        )
+        assert result.closing_net + result.opening_net == pytest.approx(result.mid_net)
+        assert result.closing_net == pytest.approx(
+            leg_net_price(result.closing_legs,
+                          {leg["conId"]: DEFAULT_QUOTES[leg["strike"]] for leg in result.closing_legs},
+                          "mid"))
+        assert result.opening_net == pytest.approx(
+            leg_net_price(result.opening_legs,
+                          {leg["conId"]: DEFAULT_QUOTES[leg["strike"]] for leg in result.opening_legs},
                           "mid"))
 
     async def test_place_order_is_never_even_attempted(self):

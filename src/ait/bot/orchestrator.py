@@ -3921,14 +3921,17 @@ class TradingOrchestrator:
         return rolls, remaining
 
     async def _execute_roll(self, pos: PositionStatus) -> None:
-        """W61: act on a condor_defense ROLL verdict — select a replacement
-        vertical, prepare/qualify/price the combo, seed the DB rows, and
-        place it. Gated (by the caller in _trading_cycle) on execute_rolls,
-        a separate opt-in from condor_defense.enabled itself.
+        """W61: act on a ROLL verdict — select a replacement vertical,
+        prepare/qualify/price the combo, seed the DB rows, and place it.
+        Today the only caller is condor_defense (gated in _trading_cycle on
+        execute_rolls, a separate opt-in from condor_defense.enabled
+        itself); W54b will add rule 3/3e as a second caller through this
+        same function.
 
-        Each step, cheapest/most-reversible first, so a failure partway
-        through leaves the least mess — same principle roll_booking.book_
-        roll_fill's own promote-B-first ordering already established. A
+        Each step, cheapest/most-reversible first — W54a's roll-count cap
+        first of all, before any chain fetch — so a failure partway through
+        leaves the least mess — same principle roll_booking.book_roll_
+        fill's own promote-B-first ordering already established. A
         placement failure at the end is logged and left for the
         reconciler's own stale-pending sweep to clean up (cancel/restore) on
         its normal 30-minute cadence — no new recovery path is invented
@@ -3937,6 +3940,16 @@ class TradingOrchestrator:
         trade = self._find_trade_record(pos.trade_id)
         if not trade or not pos.roll_side:
             log.warning("roll_skipped_no_trade_or_side", trade_id=pos.trade_id)
+            return
+
+        # W54a: the cheapest possible check, first, before any chain fetch —
+        # a hard cap on repeat-rolling ONE position, regardless of which
+        # system triggered this call. Applies today even though only
+        # condor_defense can reach this function yet.
+        depth = self._state.count_roll_ancestors(trade.trade_id)
+        if depth >= self._settings.assignment_response.max_rolls_per_position:
+            log.warning("roll_cap_reached", trade_id=trade.trade_id, depth=depth,
+                       max_rolls=self._settings.assignment_response.max_rolls_per_position)
             return
 
         try:

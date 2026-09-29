@@ -45,7 +45,15 @@ class PreparedRollCombo:
     BUY-positive/SELL-negative POSITION-sign convention portfolio.py's own
     _position_unrealized_pnl (:445-460) uses for an open position's
     net_liq -- distinct from mid_net/natural_net's REVERSED-action
-    closing-TRADE-cost convention below."""
+    closing-TRADE-cost convention below.
+
+    `closing_net`/`opening_net` (W54a) are the two subtotals `mid_net`
+    already sums internally (mid_net == closing_net + opening_net) --
+    exposed separately so a caller can estimate "cost to close everything
+    right now" (closing_net - carried_value, the SAME formula roll_booking.
+    book_roll_fill uses for a REAL fill, applied here to a MID estimate)
+    without re-deriving the split. Purely additive: mid_net's own meaning
+    and every existing consumer are unchanged."""
 
     bag: object
     order: object
@@ -55,6 +63,8 @@ class PreparedRollCombo:
     carried_value: float
     mid_net: float
     natural_net: float
+    closing_net: float
+    opening_net: float
 
 
 def legs_for_roll(
@@ -149,8 +159,16 @@ async def poll_leg_quotes(
                 if not t:
                     continue
                 b, a = t.bid, t.ask
-                if b is not None and b == b and b >= 0:
-                    bid = b
+                # W54a: IBKR's "-1" is its own sentinel for "no bid" on a
+                # worthless/no-interest leg, not a real negative price. The
+                # old `b >= 0` condition treated -1 as still-missing, so a
+                # single worthless wing looped the poll to exhaustion and
+                # then refused the WHOLE combo as "missing quote" -- the
+                # exit path's own separate pricer (_synthesize_combo_cost,
+                # orchestrator.py) already normalizes this same sentinel to
+                # 0.0; this brings the roll path's pricer to parity with it.
+                if b is not None and b == b and b >= -1:
+                    bid = 0.0 if b < 0 else b
                 if a is not None and a == a and a > 0:
                     ask = a
                 if bid is not None and ask is not None:
@@ -251,6 +269,15 @@ async def prepare_roll_combo(
     if mid_net is None or natural_net is None:
         log.warning("roll_prep_missing_quote", trade_id=trade.trade_id)
         return None
+    # W54a: the two subtotals mid_net already sums internally, exposed
+    # separately -- see PreparedRollCombo's own docstring for why. Computed
+    # from the SAME quotes/convention as mid_net itself, so
+    # closing_net + opening_net always reproduces it exactly.
+    closing_net = leg_net_price(qualified_closing, quotes, "mid")
+    opening_net = leg_net_price(qualified_opening, quotes, "mid")
+    if closing_net is None or opening_net is None:
+        log.warning("roll_prep_missing_quote", trade_id=trade.trade_id)
+        return None
     if debit_cap is not None and mid_net > debit_cap and natural_net > debit_cap:
         log.warning("roll_prep_over_debit_cap", trade_id=trade.trade_id,
                     mid_net=mid_net, natural_net=natural_net, debit_cap=debit_cap)
@@ -274,4 +301,5 @@ async def prepare_roll_combo(
         bag=bag, order=order, closing_legs=qualified_closing, opening_legs=qualified_opening,
         carried_legs=qualified_carried, carried_value=carried_value,
         mid_net=mid_net, natural_net=natural_net,
+        closing_net=closing_net, opening_net=opening_net,
     )

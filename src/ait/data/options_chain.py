@@ -189,6 +189,33 @@ def solve_iv_from_price(
         return None, "failed_other"
 
 
+def black_scholes_price(
+    spot: float, strike: float, t: float, r: float, sigma: float, flag: str,
+) -> float | None:
+    """Theoretical fair value from a KNOWN sigma via py_vollib -- the
+    pricing counterpart `solve_iv_from_price` above never had. W54a: nothing
+    in this codebase's live path prices FROM an implied vol -- only from a
+    quoted price TO one. `backtesting/pricing.black_scholes_price` exists
+    but is scipy-based, a second implementation of the same math; this uses
+    the SAME py_vollib dependency `solve_iv_from_price`/
+    `compute_greeks_from_sigma` already use, so the live pricing pipeline
+    stays on one library, not two.
+
+    Never raises; returns None on `t<=0`, `sigma<=0`, or any py_vollib
+    failure, matching `solve_iv_from_price`'s own fail-safe convention.
+    """
+    if t <= 0 or sigma <= 0:
+        return None
+    try:
+        from py_vollib.black_scholes import black_scholes
+    except ImportError:
+        return None
+    try:
+        return float(black_scholes(flag, spot, strike, t, r, sigma))
+    except Exception:
+        return None
+
+
 def compute_greeks_from_sigma(
     spot: float, strike: float, t: float, r: float, sigma: float, flag: str,
 ) -> tuple[float, float, float, float] | None:

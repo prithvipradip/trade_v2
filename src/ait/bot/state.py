@@ -1248,6 +1248,39 @@ class StateManager:
                 "UPDATE trades SET capital_at_risk = ? WHERE trade_id = ?",
                 (car, trade_id))
 
+    def count_roll_ancestors(self, trade_id: str, max_depth: int = 20) -> int:
+        """W54a: how many times has `trade_id` already been rolled -- a
+        single recursive-CTE walk BACKWARD from `trade_id` via
+        rolled_from_trade_id to its origin, counting hops. A never-rolled
+        trade returns 0.
+
+        Deliberately NOT go_live.py's fold_roll_chains, confirmed by direct
+        read this session that function can't be reused here: it only walks
+        CLOSED rows FORWARD for historical accounting and drops any chain
+        that ends at a still-open trade entirely -- exactly the live,
+        open-position case this exists for.
+
+        `max_depth` bounds the recursion (belt-and-suspenders -- rolled_
+        from_trade_id is written exactly once, at seed time, by roll_
+        booking.seed_roll_opening_trade, so a cycle should never exist, but
+        the bound costs nothing and this must never be the query that hangs
+        a live decision).
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                """WITH RECURSIVE anc(id, parent, depth) AS (
+                       SELECT trade_id, rolled_from_trade_id, 0 FROM trades
+                       WHERE trade_id = ?
+                       UNION ALL
+                       SELECT t.trade_id, t.rolled_from_trade_id, anc.depth + 1
+                       FROM trades t JOIN anc ON t.trade_id = anc.parent
+                       WHERE anc.depth < ?
+                   )
+                   SELECT MAX(depth) FROM anc""",
+                (trade_id, max_depth),
+            ).fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
     def delete_state(self, key: str) -> None:
         """Delete a key from bot state (e.g. per-trade risk keys on close)."""
         with sqlite3.connect(self._db_path) as conn:

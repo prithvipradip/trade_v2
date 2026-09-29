@@ -402,6 +402,44 @@ def _prepared_combo(mid_net=-0.75, carried_legs=None, carried_value=0.0):
     )
 
 
+class TestExecuteRollCountCap:
+    async def test_at_cap_refuses_before_any_chain_fetch(self, tmp_path, monkeypatch):
+        st = StateManager(db_path=tmp_path / "ait_state.db")
+        a = _trade()
+        st.record_trade(a)
+        select_spy = AsyncMock(return_value=None)
+        monkeypatch.setattr("ait.bot.orchestrator.select_roll_target", select_spy)
+        settings = SimpleNamespace(
+            assignment_response=AssignmentResponseConfig(max_rolls_per_position=0))
+        o = _orch(st, MagicMock(), MagicMock(), settings=settings)
+        o._find_trade_record = lambda tid: st.get_trade_by_id(tid)
+        # A never-rolled trade is already at depth 0 -- with the cap set to
+        # 0, it must be refused immediately.
+        monkeypatch.setattr(st, "count_roll_ancestors", lambda *a, **k: 0)
+
+        await o._execute_roll(_pos(a.trade_id))
+
+        select_spy.assert_not_awaited()
+        assert st.get_trade_by_id(a.trade_id).status == TradeStatus.FILLED  # untouched
+
+    async def test_below_cap_proceeds_normally(self, tmp_path, monkeypatch):
+        st = StateManager(db_path=tmp_path / "ait_state.db")
+        a = _trade()
+        st.record_trade(a)
+        select_spy = AsyncMock(return_value=_roll_target())
+        monkeypatch.setattr("ait.bot.orchestrator.select_roll_target", select_spy)
+        monkeypatch.setattr("ait.bot.orchestrator.prepare_roll_combo",
+                            AsyncMock(return_value=None))
+        settings = SimpleNamespace(
+            assignment_response=AssignmentResponseConfig(max_rolls_per_position=2))
+        o = _orch(st, MagicMock(), MagicMock(), settings=settings)
+        o._find_trade_record = lambda tid: st.get_trade_by_id(tid)
+
+        await o._execute_roll(_pos(a.trade_id))
+
+        select_spy.assert_awaited_once()
+
+
 class TestExecuteRoll:
     async def test_no_target_found_writes_nothing(self, tmp_path, monkeypatch):
         st = StateManager(db_path=tmp_path / "ait_state.db")

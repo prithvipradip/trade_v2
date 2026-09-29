@@ -31,11 +31,18 @@ _ROLL_SHORT_DELTA_TOLERANCE = 0.07
 @dataclass
 class RollTarget:
     """A replacement vertical: sell `new_short`, buy `new_long`, at `expiry`
-    (ISO date string, matching the trade.legs JSON convention)."""
+    (ISO date string, matching the trade.legs JSON convention).
+
+    `iv_is_guessed` (W54a) is the target chain's own OptionsChain.
+    iv_is_guessed flag, carried through so a caller deciding whether to run
+    the EV comparison (execution/roll_comparison.py) can refuse it on a
+    chain with no usable IV data -- the SAME chain-level signal iron_
+    condor.py's own entry path already reuses, not a new detector."""
 
     new_short: OptionContract
     new_long: OptionContract
     expiry: str
+    iv_is_guessed: bool = False
 
 
 def _at_risk_vertical(trade: TradeRecord, side: str) -> tuple[float, float] | None:
@@ -133,4 +140,5 @@ async def select_roll_target(
                     symbol=trade.symbol, side=side)
         return None
 
-    return RollTarget(new_short=new_short, new_long=new_long, expiry=str(chain.expiry))
+    return RollTarget(new_short=new_short, new_long=new_long, expiry=str(chain.expiry),
+                      iv_is_guessed=bool(getattr(chain, "iv_is_guessed", False)))
