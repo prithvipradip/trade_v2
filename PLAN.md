@@ -13849,4 +13849,29 @@ bot/supervisor when the operator says so. Every other open item is unchanged fro
 correction above (portfolio-risk-gate netting, EV path backtest, per-strike IV-quality
 tracking, the backfill run's own progress, W52a item 4).
 
+**CORRECTION (same day, operator follow-up)**: the NEXT paragraph above reads as if a roll
+combo not filling were an open gap in the `execute_rolls` build. It isn't — checked directly
+against the real live path (not the probe script) and it already handles this safely,
+by design: `TradeExecutor.place_roll_combo` (`execution/executor.py`) has no ladder/timeout
+of its own for a roll order, but that's deliberate — `check_fills`'s roll-fill block acts
+only on a clean `Filled` status and leaves a working/cancelled roll order alone, because
+`reconciler.py`'s existing 30-minute stale-pending sweep (`STALE_PENDING_MINUTES = 30`,
+`reconciler.py:138`) already covers it: once a roll attempt has been stale that long, it
+cancels the stuck order and restores the original position from `CLOSING` back to `FILLED`
+(`roll_abandoned_parent_restored`, `reconciler.py:1256`), so normal stop/TP management
+resumes automatically. A failed roll attempt also does not consume a `max_rolls_per_position`
+slot, so the position is free to retry next cycle. This is documented, not incidental — W61's
+own entry above states it "needed NO new timeout/staleness/revert mechanism for a roll that
+never fills — that backstop already existed and was already tested by W60," and it's covered
+by `test_reconciler_roll_awareness.py` (11 tests).
+
+What today's two trials actually add, then, is not a bug report — it's a real cost estimate
+for that existing fallback: IF this non-fill pattern is common for this combo type/
+environment (still just n=2), each failed roll attempt means up to 30 minutes where the
+position sits in `CLOSING`, excluded from normal stop/TP protection, before the reconciler's
+sweep restores it — worth knowing before `execute_rolls` is switched on, and worth
+considering a tighter `STALE_PENDING_MINUTES` specifically for roll orders (today's evidence
+resolved within ~2.5 minutes, not 30) as a future tuning question, not a defect fix. No code
+gap here; `execute_rolls` remains gated off regardless.
+
 ---
