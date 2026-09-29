@@ -13403,3 +13403,119 @@ close_or_roll`, `_gather_ev_leg_inputs`, and the real (unpatched) `not should_ex
 arbitration gate, never asserts on source strings.
 
 ---
+
+## 2026-09-29 - CLOSED — bot-day-09: snapshot position marks on graceful shutdown
+
+SCOPE. W47 (2026-09-21) fixed the dangerous half of a two-part finding (`money-flow-02`:
+the MTM daily-loss breaker was structurally unable to trip during a marks outage) but left
+the narrower half (`bot-day-09`: no real snapshot of position marks at shutdown,
+`orchestrator.stop()` was just `self._running = False`) registered, not fixed —
+"touches supervisor shutdown ordering, a different and riskier surface" for a case the
+startup-side reconstruction (`_capture_mtm_baseline`) "already covers well." The operator
+asked to close this for confidence that the bot has no known gaps on the path toward real
+money. Direct re-reading of the FULL shutdown path (not assumed from the old finding's
+framing) found the actual risk much smaller than "touches shutdown ordering" suggested:
+
+- `orchestrator.stop()` is trivial — just flips `self._running`.
+- The real graceful-shutdown sequence lives in `main.py`: `_graceful_shutdown_bot_task`
+  calls `orchestrator.stop()`, then waits (bounded, 30s) for the trading loop to exit
+  naturally and reach `orchestrator._shutdown()` — which ALREADY EXISTS as a clean async
+  hook (sends a "bot shutting down" notification, drains in-flight tasks with its own 15s
+  sub-budget).
+- **IBKR is still connected when `_shutdown()` runs** — `main.py` calls
+  `ibkr.disconnect()` only AFTER the whole `run()`/`_shutdown()` sequence completes.
+- Marks are already persisted on every `~30s` monitoring pass (`portfolio.py`,
+  `update_position_mark`) — the actual exposure window this closes is bounded to at most
+  one `FAST_MONITOR_CADENCE_SECONDS` (~30s) of price movement between the last regular pass
+  and the actual shutdown, not an open-ended gap.
+- **No lock race**: `_protection_task_loop` (the only other concurrent position-evaluator)
+  is explicitly cancelled and awaited in `_trading_loop`'s own `finally` before
+  `_trading_loop` returns — a precondition for `run()`'s outer loop to exit and
+  `_shutdown()` to ever be reached. By the time `_shutdown()` runs, nothing else is
+  concurrently evaluating positions.
+
+Given this, the fix was small: one more `check_positions()` call — the exact same call
+`_monitor_positions_fast` already makes every cycle — inside `_shutdown()`, reusing 100% of
+its existing quote-fetch, marks-missing, and persistence machinery. No new mechanics.
+
+DESIGN. `src/ait/bot/orchestrator.py`: new `_snapshot_marks_on_shutdown()`, called as the
+FIRST step of `_shutdown()` (before the existing notification). Body: `async with self.
+_get_position_lock(): await asyncio.wait_for(self._portfolio.check_positions(),
+timeout=SHUTDOWN_MARKS_SNAPSHOT_TIMEOUT_SECONDS)` — the SAME lock and the SAME call
+`_monitor_positions_fast` already uses. New module-level constant
+`SHUTDOWN_MARKS_SNAPSHOT_TIMEOUT_SECONDS = 10` (named, not a magic number, and directly
+monkeypatchable by tests) leaves room inside `main.py`'s 30s total grace window alongside
+the notify-drain's own 15s sub-budget. Wrapped in `try/except` (`asyncio.TimeoutError`
+separately from a general `Exception`) — a failure here must never block or crash the rest
+of shutdown; logs `shutdown_marks_snapshotted`/`_timed_out`/`_failed` for visibility. Places
+no orders and triggers no exits itself — `check_positions()`'s return value is discarded;
+that dispatch lives only in `_trading_cycle`, never called here.
+
+PROOF. `tests/test_bot_day_09_shutdown_snapshot.py` (new, 6 tests): the snapshot is awaited
+BEFORE the shutdown notification is sent (real ordering proof, not assumed); the
+established minimal-fixture shape (`test_r16_round2_fixes.py`'s own `test_shutdown_drains`,
+which never sets `_portfolio` at all) still passes unchanged — the missing-attribute
+`AttributeError` is swallowed by the same fail-safe path; `check_positions()` raising, and
+`check_positions()` hanging past the timeout, both still result in the shutdown
+notification being sent — mutation-checked by temporarily removing the `try/except`
+entirely (both failure-injection tests then fail exactly as predicted, confirming the
+guard is genuinely load-bearing); a `should_exit=True` verdict from the snapshot triggers
+ZERO calls to `_execute_exit`/`_execute_roll` (spied, would raise if called); an end-to-end
+test with a REAL `StateManager` + real `PortfolioManager` (not mocked) confirms
+`state.get_position_mark(trade_id)` actually reflects a fresh value after `_shutdown()` —
+proving the full path, not just "check_positions was called" — mutation-checked by
+temporarily removing the `_snapshot_marks_on_shutdown()` call from `_shutdown()` (both the
+ordering test and the end-to-end persistence test then fail exactly as predicted, revealing
+this catches a REAL regression, not a trivial assertion).
+
+Regression: the pre-existing `_shutdown`-touching suite (`test_r16_round2_fixes.py` +
+`test_r17_minor_fixes.py`, 26 tests) — zero new failures. The full `portfolio.py`-touching
+surface (every test file referencing `PortfolioManager`/`_evaluate_position`/
+`check_positions`, 22 files): **431 passed, 1 skipped** (was 425 passed, 1 skipped before
+this wave's own +6 — exact match, zero regressions). `python -m compileall -q src tests`:
+OK. `python scripts/typecheck.py`: OK, identical informational-finding counts to before
+this wave, zero attr-defined/call-arg/name-defined in `src/ait/{config,bot,execution,
+risk}`. `python scripts/smoke_deploy.py`: **SMOKE PASS (13 checks)** — one benign note
+("sqlite data_version moved... counts unchanged"), the script's own already-documented
+handling of a concurrent-process race (another process, unrelated to this wave, committed
+during the smoke run — row counts confirmed unchanged), not a new failure mode.
+
+Full fast lane: **2787 passed / 1 failed / 46 skipped / 153 deselected, 3594.46s
+(59m54s — genuinely environmental, not a correctness signal: system load average 13-15
+during this run, with Trader Workstation independently consuming 122% CPU and the QQQ
+vol-surface backfill running concurrently, together starving the suite's usual ~17-28min
+run of CPU; re-verified the one `F` seen mid-run in the live progress dots WAS the standing
+failure below, not a second one, before treating the run as clean)** — the one failure is
+the same standing `test_r19_config_authority.py::TestContractIsTheSingleAuthority::
+test_applier_and_readers_share_one_table` (`AIT_MARKET_DATA_TYPE` divergence, unrelated).
+Count check against the immediately-prior full fast lane (2781+1+46=2828 total
+non-deselected outcomes): this run is 2787+1+46=2834 — a delta of exactly **+6**, matching
+the new test count precisely (all 6 in the one new `test_bot_day_09_shutdown_snapshot.py`).
+
+STATE AT HANDOFF. `src/ait/bot/orchestrator.py` (modified — new constant,
+`_snapshot_marks_on_shutdown`, one new line in `_shutdown()`),
+`tests/test_bot_day_09_shutdown_snapshot.py` (new). Zero config changes. This closes
+`bot-day-09` as a registered item — no longer an open gap. It has NO effect on any
+currently-running process until the bot is next gracefully stopped and restarted (the
+supervisor's own deploy step); the change only runs at shutdown time, changes no entry/exit
+decision logic, and fails safe by design (proven, not just claimed, per PROOF above).
+
+NEXT: this closes one of the operator's four W52a-registered items being worked through
+this session. The other three remain open decisions: `whatIfOrder` pre-trade margin
+(explicit re-open conditions already on file: the IC-only strategy decision changing, or
+launch-size caps rising toward go-live — neither has happened), W31's two-knob unification
+(`risk.max_position_risk_pct` vs `max_daily_loss_pct/1.5`, wants backtest evidence before
+picking a number), and the IV-rank floor in the engine (blocked on the SAME vol-surface
+backfill as the EV comparison path — ~4.4% complete as of this entry, 6,679/151,282
+contracts). Everything else unchanged: the real multi-day backfill run's own progress
+(operator-run), W53's placing run (TWS reachability unconfirmed as of this entry — though
+TWS.app itself was observed running heavily on this box during the fast lane above, its
+API port status was not re-checked), the surface-construction quality filter (blocked on
+the same backfill), the zero-bars inefficiency (not urgent), and the risk-free-rate Phase B
+connection-reuse note.
+
+No inspect.getsource — every new test drives the real `_shutdown`, `_snapshot_marks_on_
+shutdown`, and a real `check_positions()`/`update_position_mark` round trip, never asserts
+on source strings.
+
+---

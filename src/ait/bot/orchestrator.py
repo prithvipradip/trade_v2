@@ -176,6 +176,12 @@ RESTRICTED_LIST_PATH = "data/RESTRICTED.txt"
 # raises instead of silently reading "no bans".
 RESTRICTED_UNREADABLE = None
 
+# bot-day-09 (W47 registered, not fixed -- closed here): bound on
+# _snapshot_marks_on_shutdown's own check_positions() call, leaving room
+# inside main.py's 30s GRACEFUL_SHUTDOWN_TIMEOUT alongside the notify-drain's
+# own 15s sub-budget.
+SHUTDOWN_MARKS_SNAPSHOT_TIMEOUT_SECONDS = 10
+
 
 def read_restricted_symbols(path: str | None = None) -> set[str] | None:
     """Read the operator's hard-ban list (data/RESTRICTED.txt, one symbol/line).
@@ -5541,9 +5547,54 @@ class TradingOrchestrator:
         await self._send_notification(report)
         log.info("post_market_complete", summary=summary, metrics=vars(metrics))
 
+    async def _snapshot_marks_on_shutdown(self) -> None:
+        """Closes the bot-day-09 gap (W47 registered, not fixed): stamp each
+        open position's mark one last time before the process actually
+        exits, instead of leaving it up to whatever the last regular
+        FAST_MONITOR_CADENCE_SECONDS (~30s) pass happened to persist.
+
+        Deliberately just one more check_positions() call -- the SAME call
+        _monitor_positions_fast already makes every cycle, under the SAME
+        _get_position_lock -- so this reuses 100% of the existing quote-
+        fetch/marks-missing/persistence machinery (portfolio.py's
+        update_position_mark) rather than inventing new mechanics. Read-
+        only from a TRADING perspective: check_positions() never places an
+        order or triggers an exit itself (that dispatch lives in
+        _trading_cycle, never called here) -- it only returns a verdict per
+        position, which this method discards.
+
+        Safe to call here specifically because IBKR is still connected at
+        this point in the shutdown sequence (main.py's ibkr.disconnect()
+        runs only after run()/_shutdown() both return), and because nothing
+        else can be concurrently evaluating positions by the time
+        _shutdown() is ever reached: _protection_task_loop (the only other
+        _get_position_lock holder) is unconditionally cancelled and awaited
+        in _trading_loop's own `finally` before _trading_loop returns, and
+        that return is itself a precondition for run()'s outer loop to
+        exit and _shutdown() to run.
+
+        Bounded and fail-safe: a slow quote or a broker hiccup here must
+        never block or crash the rest of shutdown (the notification below
+        is the more important signal that the bot is actually going away).
+        10s leaves room inside the 30s total GRACEFUL_SHUTDOWN_TIMEOUT
+        (main.py) alongside the notify-drain's own 15s sub-budget just
+        below.
+        """
+        try:
+            async with self._get_position_lock():
+                positions = await asyncio.wait_for(
+                    self._portfolio.check_positions(),
+                    timeout=SHUTDOWN_MARKS_SNAPSHOT_TIMEOUT_SECONDS)
+            log.info("shutdown_marks_snapshotted", count=len(positions))
+        except asyncio.TimeoutError:
+            log.warning("shutdown_marks_snapshot_timed_out")
+        except Exception as e:  # noqa: BLE001 — must never block shutdown
+            log.warning("shutdown_marks_snapshot_failed", error=str(e))
+
     async def _shutdown(self) -> None:
         """Clean shutdown."""
         log.info("orchestrator_shutting_down")
+        await self._snapshot_marks_on_shutdown()
         health = self._watchdog.get_summary()
         await self._send_notification(f"Bot shutting down\n\n{health}")
         # R16: drain in-flight notification tasks. The shutdown page is
