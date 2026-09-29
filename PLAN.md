@@ -12655,7 +12655,7 @@ source strings.
 
 ---
 
-## 2026-09-29 - BUILT — W57: roll foundation fixes (carried vertical, P&L sign, leg
+## 2026-09-29 - BUILT — W60: roll foundation fixes (carried vertical, P&L sign, leg
 serialization, reconciler roll-awareness) -- still unreachable from any live path
 
 SCOPE. The operator confirmed the next wave as "the full ROLL wiring" (placement +
