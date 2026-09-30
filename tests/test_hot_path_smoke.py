@@ -395,7 +395,7 @@ def build_smoke_orchestrator(config_path: Path | str = CONFIG_PATH) -> SmokeRig:
     Call ``rig.restore()`` when done.
     """
     Path("data").mkdir(parents=True, exist_ok=True)
-    Path("logs_ahmed").mkdir(parents=True, exist_ok=True)
+    Path("logs").mkdir(parents=True, exist_ok=True)
 
     # 1. REAL settings from the REAL config.yaml. This is what gives the smoke
     #    its teeth: a wrong attribute path raises AttributeError instead of

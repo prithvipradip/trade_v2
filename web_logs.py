@@ -39,8 +39,8 @@ from ait.monitoring.ops_health import (  # noqa: E402
 
 app = Flask(__name__)
 
-LOG_FILE = Path(__file__).parent / "logs_ahmed" / "bot_stdout.log"
-ORCH_LOG = Path(__file__).parent / "logs_ahmed" / "orchestrator.log"
+LOG_FILE = Path(__file__).parent / "logs" / "bot_stdout.log"
+ORCH_LOG = Path(__file__).parent / "logs" / "orchestrator.log"
 
 #: Bytes of the tail rendered in the scrollback pane. 512 KB is ~2-4k lines of
 #: production log — orders of magnitude more history than the old 200 lines,

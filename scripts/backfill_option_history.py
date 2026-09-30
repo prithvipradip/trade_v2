@@ -69,13 +69,13 @@ Foreground (blocks the terminal, stops if you close it):
 Background, survives closing the terminal (recommended for the real run):
 
     nohup python scripts/backfill_option_history.py \
-        > logs_ahmed/backfill_option_history.log 2>&1 &
+        > logs/backfill_option_history.log 2>&1 &
 
 Windows: the script itself is expected to run unmodified there (pure
 Python, `pathlib` throughout, no POSIX-only calls) -- but this is UNTESTED
 on Windows, and `nohup` is bash/POSIX-only. The Windows equivalent for a
 terminal-survives-close background run is PowerShell's `Start-Process`,
-e.g. `Start-Process python -ArgumentList "scripts\backfill_option_history.py" -RedirectStandardOutput logs_ahmed\backfill_option_history.log -RedirectStandardError logs_ahmed\backfill_option_history.err -WindowStyle Hidden` (also run from the repo root, same reasoning as above).
+e.g. `Start-Process python -ArgumentList "scripts\backfill_option_history.py" -RedirectStandardOutput logs\backfill_option_history.log -RedirectStandardError logs\backfill_option_history.err -WindowStyle Hidden` (also run from the repo root, same reasoning as above).
 
 Three ways to check on it while it runs:
   - `cat data/backfill_option_history_status.json` -- structured snapshot
@@ -83,7 +83,7 @@ Three ways to check on it while it runs:
     last_error/last_updated). If `last_updated` is stale (more than a
     minute or so old) while the process is confirmed alive, something's
     stuck; if `status` reads "crashed", `last_error` says why.
-  - `tail -f logs_ahmed/backfill_option_history.log` -- live per-contract detail.
+  - `tail -f logs/backfill_option_history.log` -- live per-contract detail.
   - `ps aux | grep backfill_option_history` -- is the process itself alive.
 
 If it's interrupted for any reason (sleep, a closed terminal without

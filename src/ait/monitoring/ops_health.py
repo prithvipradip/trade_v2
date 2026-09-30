@@ -12,7 +12,7 @@ The surfaces that share this module:
 * ``ait.monitoring.watchdog``   - the writer half of the health channel
 * ``status.py``          - MUST call :func:`native_crash_report` (see
   log-contracts-3); it still greps ``bot_stdout.log``, where faulthandler has
-  not written since ``src/ait/main.py`` moved the sink to ``logs_ahmed/fatal.log``.
+  not written since ``src/ait/main.py`` moved the sink to ``logs/fatal.log``.
 
 Sections
 --------
@@ -90,7 +90,7 @@ __all__ = [
 #   console + ANSI  \x1b[2m<ts>\x1b[0m [\x1b[32m\x1b[1minfo ...] <event> ... k=v
 #   console plain   2026-08-26 07:09:35 [info     ] config_default_divergence  k=v
 #
-# The plain-console shape is not hypothetical either: logs_ahmed/bot_stdout.log
+# The plain-console shape is not hypothetical either: logs/bot_stdout.log
 # line 1 in production is exactly that (structlog's pre-setup_logging default).
 
 ANSI_RE = re.compile(r"\x1B\[[0-9;]*[A-Za-z]")
@@ -473,14 +473,14 @@ def count_events_today(
 # 3. Native crash counting  (log-contracts-3)
 # ---------------------------------------------------------------------------
 #
-# src/ait/main.py:43-48 points faulthandler at logs_ahmed/fatal.log ("dumps used to
+# src/ait/main.py:43-48 points faulthandler at logs/fatal.log ("dumps used to
 # go to stderr -> bot_stdout.log, where the rotation cycle destroyed every one
 # of them").  status.py still counts the header in bot_stdout.log and so
 # reports "native crashes: 0" forever, beside "keeper relaunches: 8".
 
 FATAL_HEADERS = ("Windows fatal exception", "Fatal Python error")
-FATAL_LOG = Path("logs_ahmed") / "fatal.log"
-LEGACY_CRASH_LOGS = (Path("logs_ahmed") / "bot_stdout.log",)
+FATAL_LOG = Path("logs") / "fatal.log"
+LEGACY_CRASH_LOGS = (Path("logs") / "bot_stdout.log",)
 
 
 def _count_headers(text: str) -> int:
@@ -500,7 +500,7 @@ def native_crash_report(
     Returns ``{"count", "fatal_count", "legacy_count", "channel_wired",
     "last_write", "sources", "detail"}``.
 
-    ``channel_wired`` is False when ``logs_ahmed/fatal.log`` does not exist at all -
+    ``channel_wired`` is False when ``logs/fatal.log`` does not exist at all -
     that is the difference between "no crashes" and "nothing would record a
     crash", and it must never be rendered as a plain 0.
     """
@@ -943,7 +943,7 @@ def read_channel_state(
             wired=False, fresh=False, updated_at=None, age_s=None,
             detail=("health channel NOT WIRED - nothing has ever published "
                     f"bot_state['{HEALTH_CHANNEL_KEY}']. This is not an "
-                    "all-clear; read logs_ahmed/ait.log directly."),
+                    "all-clear; read logs/ait.log directly."),
         )
     value, updated_at = row[0], row[1]
     stamp = updated_at

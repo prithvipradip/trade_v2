@@ -30,7 +30,7 @@ from ait.reporting.go_live import (  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
 DB = ROOT / "data" / "ait_state.db"
-LOGS = ROOT / "logs_ahmed"
+LOGS = ROOT / "logs"
 
 
 def _tail_lines(path: Path, n: int = 4000) -> list[str]:
@@ -91,7 +91,7 @@ def _last_connect() -> str:
 
 
 def _crash_count() -> int:
-    """W6/log-contracts-3: crashes land in logs_ahmed/fatal.log (the faulthandler
+    """W6/log-contracts-3: crashes land in logs/fatal.log (the faulthandler
     sink), NOT bot_stdout.log — this reported 0 while tracebacks piled up.
     ops_health also distinguishes "no crashes" from "nothing records crashes"."""
     from ait.monitoring.ops_health import count_native_crashes

@@ -613,7 +613,7 @@ pip install "transformers>=4.38,<4.45"
 
 ### Bot won't start
 - Check Gateway is running: `netstat -ano | grep 4002`
-- Check logs: `tail logs_ahmed/orchestrator.log`
+- Check logs: `tail logs/orchestrator.log`
 - Kill stale Python: `powershell Stop-Process -Name python -Force`
 
 ---
@@ -736,7 +736,7 @@ trade_v2/
 ├── models/                     ← Trained models (gitignored)
 │   ├── ensemble.pkl            ← Current ensemble
 │   └── archive/                ← Versioned backups
-├── logs_ahmed/                 ← Log files (gitignored)
+├── logs/                       ← Log files (gitignored)
 │   ├── ait.log                 ← Main bot log
 │   ├── orchestrator.log
 │   └── bot_stdout.log
@@ -809,7 +809,7 @@ Private repository — for personal/educational use. Not distributed under an op
 
 For issues:
 1. Check the [Troubleshooting](#troubleshooting) section
-2. Check `logs_ahmed/ait.log` for errors
+2. Check `logs/ait.log` for errors
 3. Verify IBKR Gateway is connected (green Status Bar)
 4. File a GitHub issue with log excerpts
 

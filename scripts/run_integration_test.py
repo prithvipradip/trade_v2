@@ -149,7 +149,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help=(
             "Minimum log level printed to stdout (default: WARNING). "
-            "DEBUG/INFO always captured in logs_ahmed/ait.log regardless. "
+            "DEBUG/INFO always captured in logs/ait.log regardless. "
             "Use WARNING to prevent stdout from growing large when running "
             "background experiments."
         ),
@@ -941,7 +941,7 @@ def _create_run_archive(
         runs_dir = Path("reports/runs") / run_id
         runs_dir.mkdir(parents=True, exist_ok=True)
 
-        # Copy all artifacts from integration_test output dir (exclude .log — lives in logs_ahmed/)
+        # Copy all artifacts from integration_test output dir (exclude .log — lives in logs/)
         for src in out.iterdir():
             dst = runs_dir / src.name
             if src.is_file() and src.suffix != ".log":
@@ -1183,13 +1183,13 @@ def _archive_to_data_branch(runs_dir: Path, run_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 async def _main(args: argparse.Namespace) -> int:
-    # Configure logging early: DEBUG/INFO go to logs_ahmed/ait.log; stdout gets
+    # Configure logging early: DEBUG/INFO go to logs/ait.log; stdout gets
     # console_log_level (default WARNING) to prevent the tmp task-output
     # buffer from filling up during long experiments.
     from ait.config.settings import LoggingConfig
     from ait.utils.logging import setup_logging
     setup_logging(
-        LoggingConfig(level="DEBUG", file="logs_ahmed/ait.log"),
+        LoggingConfig(level="DEBUG", file="logs/ait.log"),
         console_level=getattr(args, "console_log_level", "WARNING"),
     )
 

@@ -41,8 +41,8 @@ apply_runtime_env_defaults()
 # file; falls back to stderr if the logs dir is unwritable.
 try:
     from pathlib import Path as _P
-    _P("logs_ahmed").mkdir(exist_ok=True)
-    _fatal_log = open("logs_ahmed/fatal.log", "a")
+    _P("logs").mkdir(exist_ok=True)
+    _fatal_log = open("logs/fatal.log", "a")
     faulthandler.enable(file=_fatal_log)
 except Exception:
     faulthandler.enable()

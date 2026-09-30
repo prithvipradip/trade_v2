@@ -856,7 +856,7 @@ class DashboardConfig(_StrictModel):
 
 class LoggingConfig(_StrictModel):
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
-    file: str = "logs_ahmed/ait.log"
+    file: str = "logs/ait.log"
     max_bytes: int = Field(default=10_485_760, ge=1_048_576)
     backup_count: int = Field(default=5, ge=1, le=20)
 

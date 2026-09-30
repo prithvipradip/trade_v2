@@ -353,7 +353,7 @@ def error_panel(conn: sqlite3.Connection, *, now: datetime | None = None) -> dic
                 "Error channel NOT WIRED — neither bot_state['error_log'] nor "
                 "bot_state['watchdog_errors'] has ever been written, so this "
                 "panel cannot show an error even during a total outage. "
-                "This is NOT an all-clear: read logs_ahmed/ait.log."
+                "This is NOT an all-clear: read logs/ait.log."
             ),
         }
     if isinstance(errors, list) and errors:
@@ -468,7 +468,7 @@ def crash_panel(fatal_log=None, legacy_logs=None) -> dict:
 
     status.py still counts 'Windows fatal exception' in bot_stdout.log, where
     faulthandler stopped writing when src/ait/main.py:43-48 moved the sink to
-    logs_ahmed/fatal.log — so it prints "native crashes: 0" forever.  This panel
+    logs/fatal.log — so it prints "native crashes: 0" forever.  This panel
     counts the real sink, and reports NOT WIRED when the sink is absent rather
     than a reassuring zero.
     """
@@ -1691,7 +1691,7 @@ def _tab_system_health(conn: sqlite3.Connection) -> None:
         report = crashes["report"]
         cc1, cc2 = st.columns(2)
         cc1.metric("faulthandler dumps", report["count"])
-        cc2.metric("in logs_ahmed/fatal.log", report["fatal_count"])
+        cc2.metric("in logs/fatal.log", report["fatal_count"])
         st.caption(crashes["message"])
         if report.get("last_write"):
             st.caption(f"fatal.log last written: {report['last_write']}")
