@@ -14287,3 +14287,56 @@ risk class, not something this rename or this entry fixes).
 **NEXT**: no new action forced by this entry. Same standing next step as above — restart
 the bot/supervisor when the operator wants the new logging location (and real log content)
 live.
+
+## 2026-09-29 - SHARED LOGS: `logs_ahmed/` rename reverted by agreement; per-box event export to an orphan `shared-logs` branch instead
+
+WHY. Both operators want to read each other's bot logs (09-29: Prithvi's bot opened QQQ/SPY condors on
+09-28, Ahmed's did not, and nobody could say why — each box's `logs/` is git-ignored). Ahmed's first
+attempt (`ab6204f` rename `logs/` -> `logs_ahmed/` in shared code, `aab9dd1` track it) is REVERTED here,
+agreed with him, for four reasons found reviewing it on the Windows box before any pull:
+1. The folder name was a code constant (`config.yaml`, `settings.py`, `main.py`, `master.py`,
+   `ops_health.py`, `status.py`, `web_logs.py`) — the same code runs on both boxes, so the Windows bot
+   would have written into `logs_ahmed/` too, with no way to name itself.
+2. A TRACKED folder the bot writes to constantly leaves every live tree dirty and makes the deploy's
+   `git merge --ff-only` fail (or overwrite a live log) the moment the other box commits a same-named file.
+3. Raw logs are ~213 MB/day here (`ait.log` rotates every 20 MB; most lines are IBKR 10091/10167 prints).
+4. R13/U10 (a live API key leaked into logs via urllib3 DEBUG) — nothing stopped a push.
+Also found: `keeper_ait.bat` still wrote `logs\keeper.log`, and the monthly cleanup would have stopped
+sweeping `logs/`. The revert restores every path to `logs/`; his two unrelated `.gitignore` additions
+(`/CLAUDE.md`, `/Plans4agent_next_session/`) are kept; his PLAN.md entries stay (append-only).
+
+WHAT REPLACES IT (`src/ait/orchestration/shared_logs.py`, `scripts/publish_shared_logs.py`,
+`scripts/read_shared_logs.py`, supervisor job `shared_logs_publish` at 16:45 ET Mon-Fri):
+- Raw logs stay in `logs/`, ignored, unchanged, on both boxes.
+- Each box names itself ONCE in its own `.env`: `AIT_LOG_OWNER=prithvi` / `AIT_LOG_OWNER=ahmed`
+  (`^[a-z][a-z0-9_-]{1,30}$`; unset or malformed = publishing off, nothing else changes).
+- After the close the supervisor runs the publisher as a SUBPROCESS (600 s timeout): one file per ET
+  trading day, `<owner>_logs/YYYY-MM-DD.jsonl.gz` — every structured JSON event the bot wrote (all levels:
+  IV ranks and gate outcomes are debug), IBKR print lines and tracebacks skipped, HTTP-library loggers
+  dropped, key/token/password/bearer values and IBKR account ids (`DU…`, `U…`) redacted, a `_meta`
+  header recording event count and first/last timestamp so rotation or downtime gaps are VISIBLE. It also
+  catches up the last 4 weekdays if the box was off at 16:45, and re-publishes a day only if it grew.
+- It commits to a SEPARATE ORPHAN BRANCH, `shared-logs`, through a SEPARATE worktree
+  (`../<repo>_shared_logs`). The code branch and the live tree are never committed to, checked out or
+  modified — proven by test (HEAD, branch and tracked status unchanged). Two boxes pushing race-free:
+  each writes only its own folder, a rejected push rebases and retries.
+- Read: `python scripts/read_shared_logs.py --owner ahmed --date 2026-09-28` prints a summary (scans,
+  last IV rank per symbol, rejection counts, orders, warning/error names); `--event`/`--symbol` filter.
+Measured on this box's real logs (read-only export to temp): 09-28 = 70,304 events, 741 KB gz, 252 scans,
+ranks SPY 25.0 / QQQ 38.5 / IWM 13.9, 84 `condor_rejected_iv_rank_floor`, 2 dividend refusals, 2 orders —
+0 account ids / keys left after scrubbing. ~0.2-0.8 MB/day per box.
+
+TO TURN IT ON (each operator, own box): add `AIT_LOG_OWNER=<name>` to `.env`; it takes effect at the next
+supervisor start (or run `python scripts/publish_shared_logs.py` by hand; `--dry-run` exports without git).
+
+PROOF. `tests/test_shared_logs.py`, 33 tests (owner validation, scrubbing, ET-day selection across
+rotations incl. the UTC-midnight edge, export/read round trip, real `git` against a throwaway bare origin
+with two clones for the two boxes, live-tree-untouched, republish-only-when-grown, never-raises, the
+supervisor job's no-owner/timeout/failure paths and its 16:45 schedule). Full fast lane: **2832 passed / 46 skipped / 0 failed** (the two `test_w23_scheduler_timezone.py` job-count tests updated 9 -> 10 for the new job), typecheck OK.
+
+NOT PULLED INTO THE WINDOWS LIVE TREE (operator instruction): it stays at `16e35df` (so it keeps
+`max_position_risk_pct: 0.03` until Prithvi decides); the shared branch keeps Ahmed's `0.0133` as he set it.
+`feature/event-straddle` is fast-forwarded into `main` after this entry (main had no commits of its own
+since 2026-08-18, `674791d`).
+
+---

@@ -91,8 +91,9 @@ class TestEveryCronTriggerHasATimezone:
         anti-vacuity companion: it is what actually caught the W43 refactor
         moving every call out of `main`, when the guard above stayed
         (vacuously) green on its own."""
+        # 10 since 2026-09-29: + shared_logs_publish (16:45 ET, shared_logs.py).
         count = len(self._crontrigger_calls())
-        assert count == 9, f"expected 9 CronTrigger(...) sites, found {count}"
+        assert count == 10, f"expected 10 CronTrigger(...) sites, found {count}"
 
     def test_the_scan_does_not_depend_on_which_function_holds_the_calls(self):
         """Anti-vacuity for the anti-vacuity fix itself. Not a source-string
@@ -184,6 +185,7 @@ class TestCronJobsActuallyResolveToET:
             "health_check", "daily_retrain", "db_backup", "weekly_scorecard",
             "digest_am", "digest_pm", "daily_report", "weekly_backtest",
             "monthly_cleanup", "daily_log_rotation",
+            "shared_logs_publish",   # 2026-09-29
         }
 
     def test_without_the_fix_it_would_have_used_the_host_zone(self):

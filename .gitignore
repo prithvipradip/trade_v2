@@ -33,3 +33,10 @@ mlruns/
 # OS
 .DS_Store
 Thumbs.db
+
+# Agent context — local-only for now; decide later whether to share it with
+# the repo (to commit: drop this line, or `git add -f CLAUDE.md`).
+/CLAUDE.md
+
+# Session-to-session handoff plans (not project artifacts — see PLAN.md/reports/ for those)
+/Plans4agent_next_session/

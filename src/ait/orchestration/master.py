@@ -1569,6 +1569,29 @@ with open(sys.argv[1], 'w') as f:
         _log("error", "daily_report_failed", error=str(e))
 
 
+def publish_shared_logs():
+    """Shared per-machine logs (2026-09-29, agreed by both operators): export
+    this box's bot events for today (and any of the last 4 weekdays missed while
+    the box was off) to the `shared-logs` orphan branch, as
+    `<AIT_LOG_OWNER>_logs/YYYY-MM-DD.jsonl.gz`. Runs the publisher as a SUBPROCESS
+    with a hard timeout so git/network trouble can never stall the scheduler;
+    never touches the live tree's own branch or files (see shared_logs.py)."""
+    from ait.orchestration.shared_logs import resolve_owner
+    if not resolve_owner():
+        _log("DEBUG", "shared_logs_publish_skipped_no_owner")
+        return
+    try:
+        r = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "publish_shared_logs.py")],
+            cwd=str(ROOT), capture_output=True, text=True, timeout=600)
+        tail = (r.stdout or r.stderr or "").strip()[-400:]
+        _log("INFO" if r.returncode == 0 else "WARNING",
+             "shared_logs_published" if r.returncode == 0 else "shared_logs_publish_failed",
+             rc=r.returncode, result=tail)
+    except Exception as e:  # noqa: BLE001 — publishing must never hurt the supervisor
+        _log("WARNING", "shared_logs_publish_failed", error=str(e))
+
+
 def backup_state_db():
     """INST-1 (institutional audit): the entire real track record — the whole
     basis of the go/no-go decision — lives in ONE unreplicated SQLite file on
@@ -2251,6 +2274,10 @@ def _register_recurring_jobs(scheduler, bot, web) -> None:
     scheduler.add_job(daily_report,
                       CronTrigger(day_of_week="mon-fri", hour=16, minute=30, timezone=ET),
                       id="daily_report")
+    # Shared per-machine logs: after the post-market run and the 16:30 report.
+    scheduler.add_job(publish_shared_logs,
+                      CronTrigger(day_of_week="mon-fri", hour=16, minute=45, timezone=ET),
+                      id="shared_logs_publish")
 
     # Weekly deep backtest: Sunday 8 PM ET
     scheduler.add_job(run_backtest,
