@@ -3,6 +3,7 @@
     python scripts/publish_shared_logs.py                 # today + last 4 weekdays (catch-up)
     python scripts/publish_shared_logs.py --date 2026-09-28
     python scripts/publish_shared_logs.py --dry-run        # export locally, no git
+    python scripts/publish_shared_logs.py --logs-dir ../trade_v2/logs   # read another tree's logs
 
 The owner comes from AIT_LOG_OWNER (set once per machine in .env). Run by the
 supervisor at 16:45 ET on weekdays; safe to run by hand. See
@@ -27,6 +28,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", help="one ET date (YYYY-MM-DD); default: today + catch-up")
     ap.add_argument("--dry-run", action="store_true", help="export to reports/, no git")
+    ap.add_argument("--logs-dir", default=str(ROOT / "logs"),
+                    help="raw logs to read (read-only); default: this checkout's logs/. "
+                         "Lets a dev checkout publish a live tree's logs without touching it.")
     args = ap.parse_args()
 
     _load_dotenv(ROOT / ".env")
@@ -40,10 +44,10 @@ def main() -> int:
         out = []
         for d in days:
             dest = ROOT / "reports" / "shared_logs_dryrun" / f"{owner}_logs" / f"{d}.jsonl.gz"
-            out.append(sl.export_day(ROOT / "logs", d, dest, owner))
+            out.append(sl.export_day(Path(args.logs_dir), d, dest, owner))
         print(json.dumps({"ok": True, "dry_run": out}, indent=1))
         return 0
-    res = sl.publish(ROOT, owner, days)
+    res = sl.publish(ROOT, owner, days, logs_dir=Path(args.logs_dir))
     print(json.dumps(res.__dict__))
     return 0 if res.ok else 1
 
