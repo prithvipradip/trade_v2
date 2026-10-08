@@ -69,7 +69,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--n-jobs", type=int, default=1, help="Parallel Optuna workers")
     p.add_argument("--train-days", type=int, default=365, help="Days of historical data")
-    p.add_argument("--capital", type=float, default=50_000.0, help="Initial capital per backtest")
+    p.add_argument("--capital", type=float, default=None,
+                   help="Initial capital per backtest. Default: config.yaml "
+                        "account.capital (W-capital: the single home).")
     p.add_argument("--optimize-ml", action="store_true", help="Also search ML hyperparameter spaces")
     p.add_argument("--storage", type=str, default=None, help="Optuna storage URL, e.g. sqlite:///data/optuna.db")
     p.add_argument("--study-name", type=str, default=None, help="Optuna study name (for resuming)")
@@ -92,6 +94,9 @@ def main() -> None:
     args = parse_args()
 
     from ait.optimization.optimizer import StrategyOptimizer
+    if args.capital is None:
+        from ait.config.runtime_env import research_capital
+        args.capital = research_capital()
 
     print("=" * 70)
     print("  AIT v2 — STRATEGY PARAMETER OPTIMIZER")

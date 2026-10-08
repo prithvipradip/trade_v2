@@ -213,12 +213,12 @@ class AccountManager:
                 log.warning("account_fetch_empty", using="cached_values")
             return self._snapshot
 
-        # AIT_SIMULATED_CAPITAL: cap every balance at a target size so the
-        # ENTIRE risk stack (capital tiers, position sizing, aggregate caps)
+        # account.capital (env AIT_SIMULATED_CAPITAL overrides per box): cap every
+        # balance at a target size so the ENTIRE risk stack (capital tiers, position sizing, aggregate caps)
         # behaves as if the account were that small. Purpose: validate the
         # actual go-live configuration (e.g. $2k CAD ~= $1.4k USD -> MICRO
-        # tier, SPY credit spreads) on the big paper account. Opt-in via env.
-        import os as _os
+        # tier, SPY credit spreads) on the big paper account. Opt-out via
+        # account.simulate_live_capital (W-capital: was opt-in via env only).
         # W29 (R26 F5 #6): capture the real NLV BEFORE any scaling. The block
         # below rewrites values["NetLiquidation"] in place, so after it runs the
         # unscaled figure is unrecoverable -- and orchestrator.py persists what
@@ -228,7 +228,12 @@ class AccountManager:
         # record (a $863 drawdown reads 0.43% at $201k and 8.29% at $10k, across
         # the project's own <8% go-live gate).
         _real_nlv_unscaled = float(values.get("NetLiquidation", 0) or 0)
-        _sim = _os.environ.get("AIT_SIMULATED_CAPITAL")
+        # W-capital: resolved by runtime_env.simulated_capital() -- env
+        # AIT_SIMULATED_CAPITAL (per-box override, '0' = off) > config.yaml
+        # account.capital while account.simulate_live_capital > off. This was
+        # a raw os.environ read outside the R19c config-backed contract.
+        from ait.config.runtime_env import simulated_capital, simulated_capital_source
+        _sim = simulated_capital()
         if _sim:
             try:
                 _cap = float(_sim)
@@ -239,7 +244,8 @@ class AccountManager:
                     if values.get(_k):
                         values[_k] = str(float(values[_k]) * _scale)
                 log.info("simulated_capital_active", target=_cap,
-                         real_nlv=round(_real_nlv, 0))
+                         real_nlv=round(_real_nlv, 0),
+                         source=simulated_capital_source())
             except (TypeError, ValueError):
                 pass
 

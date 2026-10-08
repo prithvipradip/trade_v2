@@ -1761,7 +1761,8 @@ class TradingOrchestrator:
         if account_snapshot and current_capital > 0:
             try:
                 # W29 (R26 F5 #6): persist the UNSCALED NLV. current_capital is
-                # the snapshot's net_liquidation, which AIT_SIMULATED_CAPITAL
+                # the snapshot's net_liquidation, which account.capital
+                # (W-capital; env AIT_SIMULATED_CAPITAL overrides)
                 # scales on purpose so the RISK STACK sizes as a small account.
                 # This row is not risk input -- capital_base() resolves it as
                 # the PERFORMANCE DENOMINATOR ahead of the default, so writing
@@ -1840,8 +1841,8 @@ class TradingOrchestrator:
         # 9. Scan universe for new opportunities
         # R7-SOON: refresh the per-trade dollar budget once per cycle so
         # strategy construction fits the CURRENT account (paper $197k today,
-        # $2.1k at Phase 2 via AIT_SIMULATED_CAPITAL) — and run the launch-
-        # size coherence self-test whenever NLV moves >20%.
+        # $2.1k at Phase 2 via account.capital / AIT_SIMULATED_CAPITAL) — and run
+        # the launch-size coherence self-test whenever NLV moves >20%.
         try:
             _nlv = await self._account.get_net_liquidation()
             if _nlv and _nlv > 0:
@@ -2709,8 +2710,8 @@ class TradingOrchestrator:
         """W29 (R26 F5 #6): the NLV that belongs in the PERFORMANCE denominator.
 
         `snapshot.net_liquidation` is deliberately SCALED when
-        AIT_SIMULATED_CAPITAL is set, so the whole risk stack sizes as a small
-        account. That value must never reach `bot_state.last_net_liquidation`,
+        account.capital simulation is on (W-capital; was env-only), so the whole
+        risk stack sizes as a small account. That value must never reach `bot_state.last_net_liquidation`,
         because `capital_base()` resolves that row ahead of its default and every
         drawdown/return percentage divides by it. Persisting the scaled figure
         re-scores the entire track record: the same $863 drawdown reads 0.43%

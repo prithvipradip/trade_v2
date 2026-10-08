@@ -1351,7 +1351,8 @@ def run_backtest():
                 # locked by the pre-registered rules regardless of results.
                 "--symbols", "SPY", "QQQ", "IWM",
                 "--strategies", "iron_condor",
-                "--capital", "50000",
+                # W-capital: no --capital here -- run_backtest resolves
+                # config.yaml account.capital (was a hardcoded "50000").
             ],
             cwd=str(ROOT),
             capture_output=True,

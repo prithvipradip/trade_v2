@@ -53,7 +53,11 @@ class WalkForwardConfig:
                                  # triple-counting trades in pooled metrics and
                                  # compounding overlapping windows in total_return)
     gap_days: int = 5            # Purge gap between train and test
-    initial_capital: float = 100_000.0
+    # W-capital: TOTAL starting equity, ONE shared pool across all symbols.
+    # None -> __post_init__ resolves config.yaml account.capital via
+    # runtime_env.research_capital() (was a 100_000 literal; BT-H3 gave every
+    # symbol its own full-capital sleeve, superseded by the pool allocator).
+    initial_capital: float | None = None
     commission_per_contract: float = 0.65
     slippage_pct: float = 0.03  # 3% realistic for multi-leg options
     position_size_pct: float = 0.05
@@ -214,6 +218,9 @@ class WalkForwardConfig:
             raise ValueError(
                 f"{', '.join(_research_only)} not threaded into per-window "
                 "Optuna trials; run with optimize_per_window=False")
+        if self.initial_capital is None:
+            from ait.config.runtime_env import research_capital
+            self.initial_capital = research_capital()
         if self.wing_k is None:
             from ait.config.runtime_env import contract_float
             self.wing_k = contract_float("AIT_IC_WING_K")
@@ -275,6 +282,9 @@ class WindowResult:
     test_end: date
     backtest_result: BacktestResult
     model_accuracy: float = 0.0
+    # W-capital: why candidate trades never reached the shared pool, by reason
+    # (unaffordable | portfolio_risk | max_open_positions | no_contracts).
+    pool_rejections: dict = field(default_factory=dict)
     # R16 #3: per-symbol range-model training status for this window
     # ("ok" | "disabled_by_config" | failure reasons — anything not
     # ok/disabled means OOS IC entries were BLOCKED for that symbol).
@@ -1194,8 +1204,12 @@ class WalkForwardBacktester:
         _model_weights: dict = {}  # initialised here so it's always bound even if loop is empty
         _range_status_local: dict[str, str] = {}  # R16 #3: symbol -> range training status
         _meta_status_local: dict[str, str] = {}   # R20 #3: symbol -> meta-labeler status
-        # Use full capital per symbol — splitting by symbol count makes iron condors
-        # impossible on stocks priced >$50 (max_loss_per_contract too large).
+        # W-capital: every symbol's engine run is seeded with the WHOLE pool so its
+        # own affordability gate sees the budget live sees (a percentage of the
+        # total NLV, not of a sleeve -- splitting by symbol count makes condors
+        # unaffordable). The pool itself is enforced AFTER the per-symbol runs by
+        # allocate_pool (backtesting/pool.py), which replays all symbols' trades
+        # chronologically against ONE equity. Supersedes the BT-H3 per-symbol sleeves.
         per_symbol_capital = self._config.initial_capital
 
         for symbol, df in data.items():
@@ -1534,6 +1548,10 @@ class WalkForwardBacktester:
 
             for t in result.trades:
                 t["symbol"] = symbol
+                # W-capital: allocate_pool sizes with the SAME effective fraction
+                # this symbol's engine used (learner multipliers included); the
+                # allocator strips this private key from its output.
+                t["_pool_size_pct"] = effective_position_size
             all_symbol_trades.extend(result.trades)
             # (sorted chronologically after the loop — BT-M9: drawdown was
             # computed on symbol-grouped, non-chronological order)
@@ -1555,19 +1573,32 @@ class WalkForwardBacktester:
         all_symbol_trades.sort(
             key=lambda t: str(t.get("entry_date") or t.get("entry_time") or ""))
         if all_symbol_trades:
+            # W-capital: ONE shared pool. Replay every symbol's candidate trades
+            # chronologically against a single equity, with live's per-trade
+            # budget, aggregate-risk and open-position gates (backtesting/pool.py).
+            # Supersedes Deep-audit BT-H3 (full-capital sleeve per symbol, window
+            # capital = capital x N) and R17 #14 (N = active symbols): the
+            # window's capital base is now exactly the configured pool, so the
+            # reported return is on the money the account actually has.
+            from ait.backtesting.pool import allocate_pool
+            _pos = getattr(self._settings, "positions", None)
+            _pool = allocate_pool(
+                all_symbol_trades,
+                pool_capital=self._config.initial_capital,
+                position_size_pct=self._config.position_size_pct,
+                max_portfolio_risk_pct=float(
+                    getattr(_pos, "max_portfolio_risk_pct", 0.20)),
+                max_open_positions=int(getattr(_pos, "max_open_positions", 10)),
+            )
+            log.info("window_pool_allocation", window=window_id,
+                     pool=self._config.initial_capital,
+                     candidates=len(all_symbol_trades),
+                     accepted=len(_pool.accepted),
+                     rejections=dict(_pool.rejections),
+                     peak_open_risk=round(_pool.peak_open_risk, 2))
+            all_symbol_trades = _pool.accepted
             total_pnl = sum(t.get("pnl", 0) for t in all_symbol_trades)
-            # Deep-audit BT-H3: each symbol is deliberately seeded with FULL
-            # capital (per-symbol sleeve — splitting made condors unaffordable),
-            # so the window's deployed capital is capital x N sleeves. Summing
-            # sleeve P&L onto a single full-capital account inflated returns
-            # ~N x (the mechanism behind the untrustworthy +311%).
-            # R17: N was len(data) (every symbol passed INTO the window),
-            # not active_symbols (the ones that actually passed the
-            # learner-allowed + min-row-count gates and deployed a sleeve of
-            # capital) -- once the self-learning feature drops a symbol
-            # mid-run, this understated the window's real capital base and
-            # hence its reported return.
-            window_capital = self._config.initial_capital * max(1, active_symbols)
+            window_capital = self._config.initial_capital
             window_result = WindowResult(
                 window_id=window_id,
                 train_start=train_start,
@@ -1582,6 +1613,7 @@ class WalkForwardBacktester:
                     end_date=test_end,
                 ),
                 model_accuracy=model_accuracy,
+                pool_rejections=dict(_pool.rejections),
                 range_model_status=dict(_range_status_local),
                 meta_labeler_status=dict(_meta_status_local),  # R20 #3
             )
@@ -2738,9 +2770,10 @@ class WalkForwardBacktester:
                 symbol_trades.setdefault(sym, []).append(t)
 
         results = {}
-        # BT-M7: each symbol trades a FULL-capital sleeve (see BT-H3), so its
-        # return denominator is full capital — dividing by capital/N showed
-        # a +8% symbol as +40% on a 5-symbol run.
+        # BT-M7 / W-capital: the denominator is the ONE shared pool. Each symbol's
+        # P&L is attributed against the account it was drawn from (the BT-H3
+        # sleeve model is superseded by allocate_pool), so per-symbol returns
+        # add up to the pooled return instead of each reading as its own account.
         per_symbol_capital = self._config.initial_capital
         for sym, trades in symbol_trades.items():
             total_pnl = sum(t.get("pnl", 0) for t in trades)

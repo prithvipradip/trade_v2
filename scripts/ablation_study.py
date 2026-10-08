@@ -43,7 +43,7 @@ async def run_k(arm, bc, data):
         wing_k=0.8,
         train_window_models=train_ml,
         train_days=126, test_days=63, step_days=42, gap_days=5,
-        initial_capital=bc.initial_capital,
+        initial_capital=None,  # W-capital: None -> account.capital (one pool)
         position_size_pct=bc.position_size_pct,
         wing_floor_dollars=bc.wing_floor_dollars,
         iv_floor=bc.iv_floor,

@@ -29,6 +29,18 @@ account:
                                        # guard was able to VETO same-day stop-loss
                                        # exits ("riding unprotected"). RE-FLIP TO
                                        # true at go-live if the real account < $25k.
+  capital: 5000                        # W-capital: THE one capital number (operator decision
+                                       # 2026-10-08). Research starts every run with this much
+                                       # TOTAL equity as ONE shared pool across symbols; live
+                                       # simulates this NLV while simulate_live_capital is true.
+                                       # Change it here and nowhere else. Replaces .env
+                                       # AIT_SIMULATED_CAPITAL (10000) and backtest.initial_capital.
+                                       # NOTE at $5k: risk.max_position_risk_pct (1.33%) funds $66
+                                       # per trade and the 2% breaker is $100 -> the cap-grid
+                                       # coherence check fires and the bot emits no condors until
+                                       # the risk knobs are revisited (accepted by the operator).
+  simulate_live_capital: true          # false at go-live. Per-box override: .env
+                                       # AIT_SIMULATED_CAPITAL=<n> (or 0 = off) beats this.
 
 positions:
   max_open_positions: 10               # R6 (user-approved): 423 of 500 logged entry
@@ -130,7 +142,7 @@ options:
     #                     accepts entry AFTER 8:30am releases, buying straight into IV crush.
 
 backtest:
-  initial_capital: 100000              # Starting capital for walk-forward / integration tests
+  # initial_capital REMOVED (W-capital): lives at account.capital.
   position_size_pct: 0.05             # 5% of capital risked per trade (max-loss basis)
                                        # Raise to 0.20 for accounts < $10k (increases concentration risk)
   wing_floor_dollars: 5.0             # Hard minimum spread width in dollars (safety floor only)

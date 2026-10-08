@@ -158,5 +158,5 @@ switch or backup is a hope, not a control.
 - [ ] Revert paper-relaxed liquidity gates: `AIT_LIQ_MAX_SPREAD` ≤ 0.15,
       `AIT_LIQ_MIN_VOLUME` ≥ 10, config `max_bid_ask_spread_pct` ≤ 0.15
       (startup asserts this in live mode and will refuse to run otherwise)
-- [ ] `AIT_SIMULATED_CAPITAL` removed; account funded $3k CAD
+- [ ] simulated capital OFF: `account.simulate_live_capital: false` in config.yaml (W63; was `AIT_SIMULATED_CAPITAL` in .env — also make sure no `AIT_SIMULATED_CAPITAL` override remains in .env); account funded $3k CAD
 - [ ] Fresh DB backup taken; PLAN.md gates re-read

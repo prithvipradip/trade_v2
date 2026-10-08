@@ -44,6 +44,24 @@ class TradingConfig(_StrictModel):
 class AccountConfig(_StrictModel):
     pdt_protection: bool = True
     pdt_account_under_25k: bool = True
+    capital: float = Field(
+        default=5_000.0, ge=1_000.0, le=10_000_000.0,
+        description="THE one capital number. Research (run_backtest, run_optimizer, "
+                    "the weekly health backtest, walk-forward, ablations, dashboard) "
+                    "starts every run with exactly this much TOTAL equity, shared "
+                    "across all symbols as one pool. Live uses it as the simulated "
+                    "NLV target when simulate_live_capital is true. Replaces "
+                    "backtest.initial_capital and the six disagreeing copies "
+                    "(.env AIT_SIMULATED_CAPITAL, two --capital 50000 defaults, "
+                    "WalkForwardConfig 100k, dashboard 50k).")
+    simulate_live_capital: bool = Field(
+        default=True,
+        description="When true, broker/account.py scales every broker balance down "
+                    "to `capital` so the WHOLE live risk stack sizes as that small "
+                    "account while the real paper balance sits underneath. Set false "
+                    "at go-live (RUNBOOK checklist). The env var AIT_SIMULATED_CAPITAL "
+                    "still overrides per machine ('0' = off) because config.yaml is "
+                    "shared between boxes through git.")
 
 
 class PositionConfig(_StrictModel):
@@ -209,7 +227,6 @@ class OptionsConfig(_StrictModel):
 
 
 class BacktestConfig(_StrictModel):
-    initial_capital: float = Field(default=100_000.0, ge=1_000.0, le=10_000_000.0)
     position_size_pct: float = Field(default=0.05, ge=0.01, le=0.50,
         description="Fraction of capital risked per trade (max-loss basis).")
     wing_floor_dollars: float = Field(default=5.0, ge=0.50, le=50.0,

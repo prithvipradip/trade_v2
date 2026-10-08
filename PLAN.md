@@ -14340,3 +14340,87 @@ NOT PULLED INTO THE WINDOWS LIVE TREE (operator instruction): it stays at `16e35
 since 2026-08-18, `674791d`).
 
 ---
+
+## 2026-10-08 - W63: ONE capital number (`config.yaml account.capital`), shared-pool walk-forward
+
+WHY. A Telegram `CAP-GRID INCOHERENT at NLV $10,000` alert (builder emits ZERO trades at a $133
+per-trade budget; needs ~$166) led to asking where the $10,000 came from: `.env`
+`AIT_SIMULATED_CAPITAL=10000` (W25 / 2026-09-17 operator decision, live only). Tracing it showed capital
+lived in SIX places that disagreed: that env var (raw `os.environ` read in `broker/account.py`, outside
+the R19c config-backed contract), `backtest.initial_capital` 100k (read only by `scripts/ablation_*.py`),
+`run_backtest.py` / `run_optimizer.py` `--capital` 50k, the supervisor's hardcoded weekly-health
+`--capital 50000` (`master.py`), `WalkForwardConfig.initial_capital` 100k, dashboard 50k. Backtest and
+walk-forward never saw the simulated capital at all, so no research number was ever priced at the account
+live was simulating. Walk-forward additionally gave every symbol its OWN full-capital sleeve (BT-H3), so
+"capital" was never a total.
+
+WHY `.env` AT ALL. One defensible reason: it is per-box (config.yaml is shared through git; only this box
+simulated). The rest was convenience and skipping R19c. The per-box escape hatch is KEPT: env still beats
+config.
+
+WHAT CHANGED (operator decisions 2026-10-08: $5,000; shared pool; live accepts idle; register-only on the
+budget gap).
+[1] `config.yaml account.capital: 5000` + `account.simulate_live_capital: true` (new `AccountConfig`
+    fields). `backtest.initial_capital` REMOVED — a stale key is now a startup error (`extra="forbid"`).
+[2] `runtime_env.simulated_capital()` (env override, `"0"`/junk = off > config while flag on > None),
+    `simulated_capital_source()`, `research_capital()`. Deliberately NOT in `CONTRACT_DEFAULTS` (the applier
+    setdefaults contract keys into os.environ and would shadow the yaml); recorded in the R19c exceptions block.
+[3] LIVE: `broker/account.py` reads `simulated_capital()`; scaling math and the W29 `real_net_liquidation`
+    capture untouched; log carries `source=`. `.env` lines 30-37 (the var + its comment) replaced by a pointer
+    comment — live now resolves 5000.0 from config (verified read-only).
+[4] RESEARCH: `run_backtest.py` / `run_optimizer.py` `--capital` default None -> `research_capital()`;
+    `master.py` weekly-health call no longer passes `--capital`; `WalkForwardConfig.initial_capital` None ->
+    resolved in `__post_init__`; ablation scripts, dashboard, `compare_runs.py` / `backfill_mlflow.py`
+    (snapshot `account.capital` first, old `backtest.initial_capital` kept for archives) follow.
+    `engine.py` / `optimizer.py` constructor defaults untouched on purpose (R20b: every entry point passes
+    capital explicitly).
+[5] WALK-FORWARD POOL: new `backtesting/pool.py::allocate_pool` replays all symbols' OOS trades
+    chronologically against ONE equity with live's gates (per-trade budget -> `unaffordable`, aggregate
+    `positions.max_portfolio_risk_pct` -> `portfolio_risk`, `positions.max_open_positions`), resizing
+    contracts and scaling pnl/credit/max_loss/entry_commission linearly. Window capital = the pool, not
+    pool x active symbols. SUPERSEDES BT-H3 (sleeves) and R17 #14 (capital x active symbols); BT-M7's
+    per-symbol denominator is now the pool. Rejections are logged (`window_pool_allocation`) and stored on
+    `WindowResult.pool_rejections`. Same-day exits free capital only after that day's entries (conservative,
+    date-only exit stamps). Engine stays single-symbol; each symbol's run is seeded with the whole pool.
+[6] TESTS: `tests/test_w63_capital_unification.py` (35: resolution precedence, real AccountManager scaling
+    + W29 regression, allocator incl. a sleeve-model negative control, real walk-forward window, AST class
+    guards: no raw AIT_SIMULATED_CAPITAL read outside runtime_env, no `--capital` literal in master.py, CLI
+    defaults None, WalkForwardConfig default None). conftest W26 fixture now `setenv("...", "0")` (delenv
+    would let the yaml re-enable the simulation); `test_w29` "unset" helper likewise; `test_r17_ops_fixes`
+    window-capital test rewritten to pool semantics. Mutation-checked: restoring the sleeve behaviour fails
+    both walk-forward tests.
+
+MEASURED. Real `_launch_size_coherence_check`, no IB/Telegram: NLV $10,000 -> alert reproduced exactly
+($133 budget, needs ~$166); NLV $5,000 -> alert: $66 budget, needs ~$162. So AT $5k LIVE EMITS NO CONDORS
+and the alert fires on restart (accepted by the operator). Note the sizing consequence: one minimum condor
+risks ~$162 = 3.2% of $5k, and A2 would then need a breaker >= ~$243 = 4.9% of NLV — the 1.33% / 2%
+percentages cannot both be satisfied at this size; revisit `risk.max_position_risk_pct` /
+`risk.max_daily_loss_pct` / `AIT_IC_MIN_CREDIT` together.
+Fast lane: **2866 passed / 1 failed / 46 skipped** (153 deselected). The one failure is
+`test_r19_config_authority::test_applier_and_readers_share_one_table`, PRE-EXISTING and identical at HEAD
+before this wave: this box's `.env` sets `AIT_MARKET_DATA_TYPE=3` vs contract default `"4"`; the applier reloads
+`.env` after the test unsets the keys. Not fixed here (test-isolation fix vs changing the contract default is an
+operator call). typecheck OK; `smoke_deploy` SMOKE PASS (13 checks).
+
+REGISTERED, NOT FIXED.
+ (a) Backtest sizes with `backtest.position_size_pct` (5%) where live funds `risk.max_position_risk_pct`
+     (1.33%). Backtest default should resolve from the live knob (explicit override for studies); moves every
+     research result, wants its own study. Even at $5k a backtest funds a $250 condor where live funds $66,
+     so research at the new capital still does NOT reproduce the live alert.
+ (b) Two live per-trade knobs for one quantity (`risk.max_position_risk_pct` gate 6b vs
+     `positions.max_position_pct` sizer; W25 ADDENDUM / W31 A3, W52a item 3 closed only half). At 1.33% vs 5%
+     the sizer cap is dead for condors.
+ (c) `AIT_SIMULATED_CAPITAL` scales 5 balance tags but not margin / `whatIfOrder` (GAP_AUDIT_R7, still open).
+ (d) Every prior walk-forward / backtest number was priced at a different capital and per-symbol sleeves —
+     NOT comparable to anything run after this wave.
+
+DEPLOY / OPERATOR NOTES. No process restarted. `account.py` + orchestrator need a bot restart; the
+`master.py` change needs a FULL SUPERVISOR restart. PRITHVI'S BOX: when it pulls this, config.yaml turns the
+simulation ON at $5k unless its `.env` sets `AIT_SIMULATED_CAPITAL=0` or `simulate_live_capital: false` —
+decide before pulling (his live tree is deliberately still on an older commit). Go-live: RUNBOOK step updated
+to `account.simulate_live_capital: false`.
+
+**NEXT**: operator decides (1) the risk knobs at $5k (they cannot satisfy the coherence check as set), (2)
+when to restart bot/supervisor, (3) whether Prithvi's box pulls this. Then register (a) as its own wave.
+
+---

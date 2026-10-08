@@ -251,7 +251,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--test-days", type=int, default=63, help="Test window days")
     p.add_argument("--step-days", type=int, default=63, help="Step between windows")
     p.add_argument("--gap-days", type=int, default=5, help="Purge gap days")
-    p.add_argument("--capital", type=float, default=50_000.0, help="Initial capital")
+    p.add_argument("--capital", type=float, default=None,
+                   help="TOTAL starting equity, one shared pool across symbols. "
+                        "Default: config.yaml account.capital (W-capital: the single "
+                        "home; was a 50,000 literal here).")
     p.add_argument("--min-confidence", type=float, default=None,
                    help="Min ML confidence. Default resolves from config.yaml "
                         "risk.min_confidence (currently 0.50 via WalkForwardConfig "
@@ -310,6 +313,9 @@ def parse_args() -> argparse.Namespace:
 
 
 async def run_backtest(args: argparse.Namespace) -> None:
+    if args.capital is None:
+        from ait.config.runtime_env import research_capital
+        args.capital = research_capital()
     print("=" * 60)
     print("  AIT v2 — WALK-FORWARD BACKTEST")
     print("=" * 60)
