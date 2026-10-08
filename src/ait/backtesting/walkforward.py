@@ -60,7 +60,15 @@ class WalkForwardConfig:
     initial_capital: float | None = None
     commission_per_contract: float = 0.65
     slippage_pct: float = 0.03  # 3% realistic for multi-leg options
-    position_size_pct: float = 0.05
+    # W64: None -> resolve_position_size_pct: backtest.position_size_pct if a
+    # sizing study set one, else risk.max_position_risk_pct (live's per-trade
+    # budget). Was a 0.05 literal while live funded 0.0133-0.03.
+    position_size_pct: float | None = None
+    # W64 live parity: cap the condor wing to the per-trade budget like live,
+    # and cap contracts per trade at positions.max_contracts_per_trade (live: 1).
+    # None -> config (backtest.budget_aware_wings / positions.max_contracts_per_trade).
+    budget_aware_wings: bool | None = None
+    max_contracts_per_trade: int | None = None
     wing_floor_dollars: float = 2.0   # R6 parity: live iron_condor min wing is $2, not $5
     # R20b (pre-registered PLAN 2026-08-21): was a hardcoded 1.0 — the frozen
     # 2026-07 default that shadowed the PROMOTED live value (contract 1.6 since
@@ -239,6 +247,15 @@ class WalkForwardConfig:
             _settings = load_settings()
         except Exception:  # noqa: BLE001 — no config.yaml -> per-field model defaults
             _settings = None
+        from ait.config.settings import (
+            resolve_max_contracts_per_trade, resolve_position_size_pct)
+        self.position_size_pct = resolve_position_size_pct(
+            self.position_size_pct, _settings)
+        self.max_contracts_per_trade = resolve_max_contracts_per_trade(
+            self.max_contracts_per_trade, _settings)
+        self.budget_aware_wings = bool(resolve_config_value(
+            self.budget_aware_wings, "backtest", "budget_aware_wings",
+            BacktestConfig, _settings))
         self.range_min_confidence = float(resolve_config_value(
             self.range_min_confidence, "ml", "range_min_confidence", MLConfig, _settings))
         self.iv_floor = float(resolve_config_value(
@@ -1458,6 +1475,8 @@ class WalkForwardBacktester:
                 commission_per_contract=window_cfg.commission_per_contract,
                 slippage_pct=window_cfg.slippage_pct,
                 position_size_pct=effective_position_size,
+                budget_aware_wings=window_cfg.budget_aware_wings,
+                max_contracts_per_trade=window_cfg.max_contracts_per_trade,
                 stop_loss_pct=window_cfg.stop_loss_pct,
                 profit_target_pct=window_cfg.profit_target_pct,
                 max_hold_days=window_cfg.max_hold_days,
@@ -1813,6 +1832,8 @@ class WalkForwardBacktester:
                     initial_capital=self._config.initial_capital,
                     features_cache=features_cache,
                     position_size_pct=self._config.position_size_pct,
+                    budget_aware_wings=self._config.budget_aware_wings,
+                    max_contracts_per_trade=self._config.max_contracts_per_trade,
                     wing_floor_dollars=self._config.wing_floor_dollars,
                     wing_k=self._config.wing_k,
                     iv_floor=self._config.iv_floor,
@@ -2595,6 +2616,8 @@ class WalkForwardBacktester:
                 commission_per_contract=window_cfg.commission_per_contract,
                 slippage_pct=window_cfg.slippage_pct,
                 position_size_pct=window_cfg.position_size_pct,
+                budget_aware_wings=window_cfg.budget_aware_wings,
+                max_contracts_per_trade=window_cfg.max_contracts_per_trade,
                 stop_loss_pct=window_cfg.stop_loss_pct,
                 profit_target_pct=window_cfg.profit_target_pct,
                 max_hold_days=window_cfg.max_hold_days,

@@ -14424,3 +14424,82 @@ to `account.simulate_live_capital: false`.
 when to restart bot/supervisor, (3) whether Prithvi's box pulls this. Then register (a) as its own wave.
 
 ---
+
+## 2026-10-08 - W64: retune the live risk knobs at the $5k account (5% budget / 4.5% breaker), give research live's construction
+
+WHY. After W63 set `account.capital` to $5,000 the startup coherence check fired CAP-GRID INCOHERENT: the 1.33% budget
+($66) could not carry any condor and the 2% breaker ($100) sat under a hardcoded 1.5x rule. Separately research did not
+model live: the backtest funded 5% per trade (live 1.33%), built the full `wing_k x expected-move` wing with no budget
+cap (live caps the wing to the budget), traded >1 contract (live: 1), and checked the budget after deducting half-spread
+friction (live checks it on the mid credit).
+
+MEASURED (read-only, no order placed; TWS paper, clientId 97, 2026-10-08).
+[1] WING WIDTH FOLLOWS THE BUDGET: `IronCondor.affordable_width = budget / 90` (credit-width floor 0.10), snapped to the
+    strike grid, until it reaches the vol-scaled target (~$50 on SPY, a ~$4.5k budget). $136-$200 -> $2-wide; $250-$300 ->
+    $3-wide; $400 -> $4; $500 -> $6. `max_daily_loss_pct` never affects construction.
+[2] REAL CHAINS (IWM, SPY, 22 DTE, source=ibkr, delayed, ~all contracts two-sided; the real live builder):
+    floor $0.70: $66 -> none, $150 -> none (credit_floor), $250 -> $3-wide credit $0.88 (IWM) / $0.99 (SPY), max loss $212 / $201.
+    floor $0.55: $150 -> $2-wide credit $0.62 / $0.68, max loss $138 / $132; $250 -> same $3-wide.
+    The startup self-test's SYNTHETIC chain credits a $2-wide condor $0.755, so it would have passed 3% while live placed
+    no trades. (An earlier note here that the $0.40-$0.70 floors are interchangeable was true on the synthetic chain only.)
+[3] IB MARGIN vs the bot's max loss (whatIfOrder, clean underlying IWM). Account base currency is CAD (USD rate 1.42327);
+    the bot already converts balances to USD (ibkr_client.get_account_values, audit item 1.6). IB initial margin in USD:
+    $1 wing ~$103, $2 ~$204, $3 ~$307, $5 ~$513 = GROSS width x 100 (credit not netted in InitMarginReq). The credit lands
+    in equity-with-loan, so the net hit to AvailableFunds is ~ the bot's max loss (~$135 vs $125 at delayed quotes). The
+    repo's "margin ~ max_loss" assumption holds for AvailableFunds, not for the InitMarginReq figure. A single-vertical
+    whatIf gave inconsistent init < maint numbers, so conclusions rest on the condor figures.
+[4] ENGINE vs REAL DATA (3 ETFs, 3 years, per-bar builder scan, $5k): old behaviour 0/1881 bars build a condor; 3% budget
+    0/1881 (credit floor + friction-inflated max loss); 5% budget 190/1881 (IWM only; calm SPY/QQQ sit under the IV floor).
+    That scan ran BEFORE the mid-credit gate below; after it the builder emits the $3-wide condor across IV 14-22% at $250
+    (credit $58-120 after cost, recorded max loss $180-242), verified on a single-bar IV sweep, NOT re-run over the history.
+
+WHAT CHANGED (operator decisions 2026-10-08: raise the %s and keep the $0.70 floor -> 5% / 4.5%; breaker rule 1.0x and
+changeable; link the two knobs; full construction parity; fix the mid-credit gate).
+[1] `config.yaml`: `risk.max_position_risk_pct` 0.0133 -> 0.05 (budget $250 -> $3-wide, $201-212 max loss);
+    `risk.max_daily_loss_pct` 0.02 -> 0.045 (breaker $225); `AIT_IC_MIN_CREDIT` unchanged ($0.70). Code defaults in
+    settings.py moved to match so bare models do not skew. NEW `risk.breaker_to_max_loss_ratio` (1.0, bounds 0.5-3.0)
+    replaces the hardcoded 1.5 in the orchestrator's A2 arm (alert-only; set 1.5 for the strictest rule). 3%/3% was
+    staged mid-wave and NEVER shipped.
+[2] LINK: a `Settings` model validator requires `positions.max_position_pct >= risk.max_position_risk_pct` (0.05 vs 0.05,
+    equal allowed); a startup error otherwise. Collapsing to ONE knob stays deferred (moves position_sizer, a critical area).
+[3] RESEARCH PARITY: `backtest.position_size_pct` is now null (-> `risk.max_position_risk_pct`), new
+    `backtest.budget_aware_wings: true`; `WalkForwardConfig` and `StrategyOptimizer` resolve both plus
+    `positions.max_contracts_per_trade` and pass them to every Backtester. Engine (IC branch): wing capped with
+    `IronCondor.affordable_width` ($1 floor when capped); contracts capped at max_contracts_per_trade in `_build_position`;
+    when budget-aware, affordability and contract count use the MID-credit max loss (the recorded position and P&L keep the
+    friction). Resolvers: `resolve_position_size_pct`, `resolve_max_contracts_per_trade`. `run_backtest.py` parity manifest
+    has the three new rows (in parity). DEVIATION FROM THE APPROVED PLAN: the bare `Backtester(...)` keeps its explicit
+    harness defaults (0.05, no wing cap, no contract cap; R20b) — the new behaviour is opt-in via constructor parameters and
+    switched on at the research entry points, because hundreds of engine tests pin the bare defaults.
+[2/3] TESTS: `tests/test_w64_risk_retune_and_parity.py` (30). Ten existing tests (W25/W31 self-test, test_config) pinned the
+    old live values or the 1.5x rule; seven now inject R26's whole original incoherent setting (3% / 2% / ratio 1.5) onto a
+    copy of the settings (same technique as the 2026-09-29 wave), two pin their original premise, one default moved. The
+    pre-existing `test_r19_config_authority::test_applier_and_readers_share_one_table` failure (this box's .env sets
+    AIT_MARKET_DATA_TYPE=3, contract default "4") is fixed test-side by stubbing `_load_dotenv`; no contract value changed.
+    Fast lane: **2897 passed / 0 failed / 46 skipped** (153 deselected). typecheck OK; `smoke_deploy` SMOKE PASS (13 checks).
+
+REGISTERED, NOT FIXED.
+ (a) The coherence probe's synthetic chain is optimistic at $2-wide ($0.755 vs real $0.62-0.68): it can pass a budget that
+     builds nothing on real chains. Calibrate the probe (or test against a captured real chain) in its own wave.
+ (b) On THIS box the default walk-forward and the weekly health backtest build 0 trades regardless of sizing: the loader
+     returns only ~353-384 daily bars (2 windows at the default 365-day train); with `--train-days 126` the range model cannot
+     train (`insufficient_training_data`, `range_model_absent_blocking_oos`) and the OOS range gate blocks every entry. A
+     research run that proves the live structure end-to-end needs more history; investigate the data fetch.
+ (c) The engine's recorded max loss carries friction and can exceed the live signal's mid-based figure ($242 vs the $225
+     breaker at the top of the IV range); live fills near mid, so the live exposure is the $201-212 measured above.
+ (d) Collapse the two live per-trade knobs to one (needs backtest evidence).
+ (e) Tests that read config.yaml break on every retune (ten did); a frozen fixture-settings module for the self-test tests.
+ (f) Operational: a test-failure repr printed the Settings object, including Telegram/API credentials from .env, into this
+     session's command output. Nothing was written to a file, commit or this ledger; rotate the Telegram bot token if the
+     session transcript is treated as exposed.
+
+DEPLOY / OPERATOR NOTES. No process restarted (the bot is stopped; TWS paper is up). The values load at bot start; the W63
+`master.py` change still needs a FULL supervisor restart. PRITHVI'S BOX: when it pulls this it gets 5% / 4.5% and the $5k
+simulation (config.yaml) — decide before pulling; his live tree deliberately stays on an older commit. At $5k a max-loss
+condor is ~4.2% of NLV and at most two correlated condors can be open (~8.4%): confirm that is the intended risk.
+
+**NEXT**: operator decides (1) restart timing, (2) whether Prithvi's box pulls W63+W64, (3) whether to run (b) the
+data-length investigation before trusting any $5k backtest, then (a) probe calibration and (e) frozen test fixtures as their
+own waves.
+
+---

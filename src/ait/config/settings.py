@@ -88,7 +88,19 @@ class PositionConfig(_StrictModel):
 
 
 class RiskConfig(_StrictModel):
-    max_daily_loss_pct: float = Field(default=0.02, ge=0.005, le=0.10)
+    max_daily_loss_pct: float = Field(default=0.045, ge=0.005, le=0.10,
+        description="Daily loss breaker, fraction of NLV (realised AND mark-to-market "
+                    "trips; entries only, exits keep running). W64: 0.02 -> 0.045 at the "
+                    "$5k account (breaker $225 vs the $3-wide condor's $201-212 max "
+                    "loss on real chains); the startup self-test's rule is breaker >= "
+                    "breaker_to_max_loss_ratio x the largest max loss the builder emits.")
+    breaker_to_max_loss_ratio: float = Field(default=1.0, ge=0.5, le=3.0,
+        description="W64: the startup coherence check (orchestrator A2) alerts when the "
+                    "daily-loss breaker is below this multiple of the LARGEST single max "
+                    "loss the real condor builder emits. Was a hardcoded 1.5 (one stopped "
+                    "trade can't halt the day alone). 1.0 = one full max-loss condor "
+                    "exactly reaches the breaker; 1.5 = the original, most conservative "
+                    "rule. Alert-only: it never changes live sizing or the breaker.")
     max_consecutive_losses: int = Field(default=3, ge=1, le=10)
     pause_minutes_after_losses: int = Field(default=30, ge=5, le=120)
     max_api_failures: int = Field(default=5, ge=2, le=20)
@@ -99,12 +111,17 @@ class RiskConfig(_StrictModel):
                     "(user-approved) - the <=4 window blacked out ~half of all "
                     "trading days and refused the richest premium; every 14-30 "
                     "DTE hold spans events regardless, wings cap the surprise.")
-    max_position_risk_pct: float = Field(default=0.0133, ge=0.005, le=0.10,
+    max_position_risk_pct: float = Field(default=0.05, ge=0.005, le=0.10,
         description="Per-trade max_loss cap as a fraction of NLV (was "
-                    "hardcoded 0.03 in manager.py — audit item 3.3). PLAN "
-                    "2026-09-29: lowered 0.03->0.0133 to align with the daily "
-                    "circuit breaker's own trip threshold (max_daily_loss_pct "
-                    "/ 1.5) — closes W52a item 3, the two-knob unification.")
+                    "hardcoded 0.03 in manager.py — audit item 3.3), AND the budget the "
+                    "condor builder is handed (wing width = budget/90 snapped to the "
+                    "strike grid). History: 0.03 -> 0.0133 on 2026-09-29 to match the "
+                    "breaker (max_daily_loss_pct / 1.5); W64 (2026-10-08) -> 0.05 at the "
+                    "$5k account, MEASURED on live TWS chains: budgets $66/$150 build "
+                    "nothing at the $0.70 credit floor ($2-wide credits only $0.62-0.68); "
+                    "$250 builds a $3-wide condor (credit $0.88-0.99, max loss "
+                    "$201-212). Must stay <= positions.max_position_pct (the sizer's "
+                    "cap) — Settings validates it (W64).")
     max_correlation: float = Field(default=0.75, ge=0.30, le=0.99,
         description="Correlation above which two symbols count as the same bet.")
     max_correlated_positions: int = Field(default=2, ge=1, le=8,
@@ -227,8 +244,17 @@ class OptionsConfig(_StrictModel):
 
 
 class BacktestConfig(_StrictModel):
-    position_size_pct: float = Field(default=0.05, ge=0.01, le=0.50,
-        description="Fraction of capital risked per trade (max-loss basis).")
+    position_size_pct: float | None = Field(default=None, ge=0.01, le=0.50,
+        description="Fraction of capital risked per trade (max-loss basis). W64: None "
+                    "(the default) resolves to risk.max_position_risk_pct — the SAME "
+                    "per-trade budget live funds — so research and live cannot drift. "
+                    "Set a number only for a deliberate sizing study.")
+    budget_aware_wings: bool = Field(default=True,
+        description="W64: the walk-forward/optimizer condor builder caps the wing to "
+                    "the per-trade budget exactly like live (IronCondor.affordable_"
+                    "width, $1 floor when capped) and rejects a structure whose max "
+                    "loss exceeds the budget. False restores the old uncapped "
+                    "wing_k x expected-move wing for before/after comparisons only.")
     wing_floor_dollars: float = Field(default=5.0, ge=0.50, le=50.0,
         description="Hard minimum spread width in dollars (safety floor only). "
                     "Wing sizing is now primarily driven by wing_k × expected_move.")
@@ -966,6 +992,54 @@ class Settings(_StrictModel):
     # Loaded from environment
     ibkr: IBKREnvConfig = IBKREnvConfig()
     api_keys: APIKeysConfig = APIKeysConfig()
+
+    @model_validator(mode="after")
+    def _per_trade_knobs_are_linked(self) -> "Settings":
+        """W64: link the two live per-trade knobs (registered W25 ADDENDUM / W31 A3).
+
+        risk.max_position_risk_pct funds the condor builder and gate 6b;
+        positions.max_position_pct is the position sizer's hard cap. For a
+        defined-risk condor both bound the SAME number (one structure's max
+        loss), at different layers. If the gate cap exceeds the sizer cap, gate
+        6b passes a structure the sizer then refuses with 0 contracts, one
+        routine-looking verdict at a time, and entries brick silently. A startup
+        error is the same philosophy as extra="forbid"; the coherence check's A3
+        arm stays as the runtime guard.
+        """
+        if self.positions.max_position_pct < self.risk.max_position_risk_pct:
+            raise ValueError(
+                f"positions.max_position_pct ({self.positions.max_position_pct}) must be "
+                f">= risk.max_position_risk_pct ({self.risk.max_position_risk_pct}): the "
+                "sizer's cap would refuse structures the risk gate passes (W64 link)")
+        return self
+
+
+def resolve_position_size_pct(explicit, settings) -> float:
+    """W64: the per-trade budget fraction research uses.
+
+    explicit arg > backtest.position_size_pct (a deliberate sizing study) >
+    risk.max_position_risk_pct (what live funds the builder with) >
+    RiskConfig's own default. `settings` may be None or a partial test stub.
+    """
+    if explicit is not None:
+        return float(explicit)
+    bt = getattr(settings, "backtest", None)
+    if bt is not None and getattr(bt, "position_size_pct", None) is not None:
+        return float(bt.position_size_pct)
+    rk = getattr(settings, "risk", None)
+    if rk is not None and getattr(rk, "max_position_risk_pct", None) is not None:
+        return float(rk.max_position_risk_pct)
+    return float(RiskConfig().max_position_risk_pct)
+
+
+def resolve_max_contracts_per_trade(explicit, settings) -> int:
+    """W64: live's hard per-trade contract cap (positions.max_contracts_per_trade)."""
+    if explicit is not None:
+        return int(explicit)
+    pos = getattr(settings, "positions", None)
+    if pos is not None and getattr(pos, "max_contracts_per_trade", None) is not None:
+        return int(pos.max_contracts_per_trade)
+    return int(PositionConfig().max_contracts_per_trade)
 
 
 def resolve_config_value(explicit, section: str, field: str, fallback_cls, settings):

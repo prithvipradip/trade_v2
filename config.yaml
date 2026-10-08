@@ -57,19 +57,31 @@ positions:
                                        # audit 2026-07-07 item 3.3. 0.20 = operating value since 06-30)
 
 risk:
-  max_daily_loss_pct: 0.02             # 2% daily loss limit → circuit breaker
+  max_daily_loss_pct: 0.045            # W64 (2026-10-08): 0.02 -> 0.045 at the $5k account. Breaker =
+                                       # $225 vs the largest condor the live builder emits at the 5%
+                                       # budget (real IWM/SPY chains: $3-wide, max loss $201-212) =>
+                                       # >= 1.0x, inside breaker_to_max_loss_ratio. Trips on realised AND
+                                       # mark-to-market daily loss; blocks ENTRIES only.
+  breaker_to_max_loss_ratio: 1.0       # W64: startup coherence rule (alert-only), breaker >= ratio x the
+                                       # largest max loss the builder emits. Was a hardcoded 1.5; set 1.5
+                                       # to restore the strictest rule (then breaker needs ~6.4% at $5k).
   max_consecutive_losses: 3            # Pause after 3 consecutive losses
   pause_minutes_after_losses: 30       # Cool-down period
   max_api_failures: 5                  # Halt after 5 API failures in 10 min
   min_confidence: 0.50                 # At learning floor — capture more marginal signals to learn from (was 0.55)
-  max_position_risk_pct: 0.0133        # PLAN 2026-09-29: lowered 0.03->0.0133 (operator decision,
-                                       # closes W52a item 3, the two-knob unification). At 0.03,
-                                       # a single max-loss condor could alone exceed the daily
-                                       # circuit breaker (max_daily_loss_pct / 1.5 = 0.0133) before
-                                       # the breaker's own consecutive-loss logic ever got a second
-                                       # data point. Aligning this cap to the breaker's own trip
-                                       # threshold means no single trade can breach the daily
-                                       # breaker alone. Per-trade max_loss cap vs NLV.
+  max_position_risk_pct: 0.05          # W64 (2026-10-08): 0.0133 -> 0.05 at the $5k account (budget $250).
+                                       # MEASURED on live TWS chains (IWM/SPY, 22 DTE, delayed, the real
+                                       # builder): budget $66 and $150 build NOTHING at the $0.70 credit
+                                       # floor (a $2-wide condor credits only $0.62-0.68); $250 builds a
+                                       # $3-wide condor, credit $0.88-0.99, max loss $201-212. Wing width
+                                       # follows the budget (budget/90, snapped to the strike grid). The
+                                       # startup self-test's synthetic chain is more generous ($0.755 at
+                                       # $2-wide) and would have passed 3% while live placed no trades.
+                                       # History: 0.03 -> 0.0133 on 2026-09-29 (PLAN, closes W52a item 3)
+                                       # so one max-loss condor could not exceed the old 2% breaker; W64
+                                       # moves the breaker with the budget instead. Per-trade max_loss cap
+                                       # vs NLV, also the budget the builder is handed. Must stay <=
+                                       # positions.max_position_pct (Settings validates: 0.05 = equal OK).
   max_correlation: 0.75                # Correlation above which symbols count as the same bet
   max_correlated_positions: 2          # Positions per correlated cluster (was code default)
   post_stop_cluster_cooldown_minutes: 120  # W26: post-stop re-entry block for CLUSTER SIBLINGS
@@ -143,8 +155,13 @@ options:
 
 backtest:
   # initial_capital REMOVED (W-capital): lives at account.capital.
-  position_size_pct: 0.05             # 5% of capital risked per trade (max-loss basis)
-                                       # Raise to 0.20 for accounts < $10k (increases concentration risk)
+  position_size_pct: null              # W64: null -> risk.max_position_risk_pct (what live funds the
+                                       # builder with), so research cannot drift from live. Was 0.05
+                                       # (live 0.0133-0.03) — the backtest funded 1.7-3.8x more risk per
+                                       # trade than live. Set a number ONLY for a deliberate sizing study.
+  budget_aware_wings: true             # W64: research condor builder caps the wing to the budget like live
+                                       # (IronCondor.affordable_width, $1 floor when capped) and rejects a
+                                       # structure whose max loss exceeds the budget. false = old behaviour.
   wing_floor_dollars: 5.0             # Hard minimum spread width in dollars (safety floor only)
                                        # Wing sizing is now primarily driven by wing_k × expected_move
                                        # Lower to 0.5 for sub-$10 stocks (e.g. SOFI)

@@ -46,6 +46,14 @@ class TestContractIsTheSingleAuthority:
         # 0.10 -> "0.1"). Compare resolved SEMANTICS, not string formatting.
         for k in CONTRACT_DEFAULTS:
             monkeypatch.delenv(k, raising=False)
+        # W64: isolate from the operator's local .env. The applier loads .env
+        # BEFORE it seeds defaults (R17), so a box whose .env deliberately
+        # overrides a contract key (this one sets AIT_MARKET_DATA_TYPE=3, the
+        # contract default is "4") failed this test on every run since W16 even
+        # though applier and readers agree. The test is about the applier/reader
+        # TABLE, not about whose .env is on disk — same isolation class as W26.
+        import ait.config.runtime_env as _re
+        monkeypatch.setattr(_re, "_load_dotenv", lambda *_a, **_k: None)
         apply_runtime_env_defaults()
         import os
         for key, declared in CONTRACT_DEFAULTS.items():

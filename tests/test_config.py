@@ -22,7 +22,7 @@ class TestValidConfig:
         """Default Settings should validate without errors."""
         settings = Settings()
         assert settings.trading.mode == "paper"
-        assert settings.risk.max_daily_loss_pct == 0.02
+        assert settings.risk.max_daily_loss_pct == 0.045  # W64: was 0.02 (the $5k account's breaker)
 
     def test_custom_valid_config(self) -> None:
         settings = Settings(

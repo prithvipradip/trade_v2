@@ -127,7 +127,25 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
         else contract_float("AIT_IC_MIN_CREDIT_WIDTH")
     )
 
+    # W64: per-trade budget / wing cap / contract cap. The backtest side is read
+    # through the SAME resolvers WalkForwardConfig uses (there is no CLI override
+    # for these), so a future change to either side shows up here as a warning.
+    from ait.config.settings import (
+        BacktestConfig as _BTC, RiskConfig as _RC, PositionConfig as _PC,
+        resolve_config_value as _rcv, resolve_max_contracts_per_trade as _rmc,
+        resolve_position_size_pct as _rps)
+    live_budget_pct = float(settings.risk.max_position_risk_pct
+                            if settings else _RC().max_position_risk_pct)
+    live_max_contracts = int(settings.positions.max_contracts_per_trade
+                             if settings else _PC().max_contracts_per_trade)
+    bt_budget_pct = _rps(None, settings)
+    bt_max_contracts = _rmc(None, settings)
+    bt_wings = bool(_rcv(None, "backtest", "budget_aware_wings", _BTC, settings))
+
     live = {
+        "per_trade_budget_pct": live_budget_pct,
+        "budget_aware_wings": True,   # live caps the wing to the budget (iron_condor.py)
+        "max_contracts_per_trade": live_max_contracts,
         "wing_k":            float(env.get("AIT_IC_WING_K", "1.0")),
         "range_min_confidence": (settings.ml.range_min_confidence
                                   if settings else MLConfig().range_min_confidence),
@@ -154,6 +172,9 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
         "dte<=5":    Backtester._credit_take_profit_pct(3),
     }
     backtest = {
+        "per_trade_budget_pct": bt_budget_pct,
+        "budget_aware_wings": bt_wings,
+        "max_contracts_per_trade": bt_max_contracts,
         "wing_k":            resolved_wing_k,
         "range_min_confidence": resolved_range_confidence,
         "ic_min_credit":     resolved_ic_min_credit,

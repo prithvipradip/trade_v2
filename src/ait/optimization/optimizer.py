@@ -84,7 +84,12 @@ class StrategyOptimizer:
         initial_capital: float = 50_000.0,
         train_days: int = 365,
         features_cache: "pd.DataFrame | None" = None,
-        position_size_pct: float = 0.05,
+        # W64: None -> backtest.position_size_pct, else risk.max_position_risk_pct
+        # (live's per-trade budget). Was a 0.05 literal; live funded 0.0133-0.03.
+        position_size_pct: float | None = None,
+        # W64 live parity (see Backtester): None -> config.
+        budget_aware_wings: bool | None = None,
+        max_contracts_per_trade: int | None = None,
         wing_floor_dollars: float = 5.0,
         # R20b review follow-up: was a hardcoded 1.0 that shadowed the
         # promoted live/config value (1.6) for any direct optimizer caller
@@ -162,7 +167,6 @@ class StrategyOptimizer:
         self._initial_capital = initial_capital
         self._train_days = train_days
         self._features_cache = features_cache
-        self._position_size_pct = position_size_pct
         self._wing_floor_dollars = wing_floor_dollars
         # self._iv_floor resolved below once _bt_cfg exists (R20b review follow-up)
         self._delta_iv_scale = delta_iv_scale
@@ -195,6 +199,16 @@ class StrategyOptimizer:
             from ait.config.settings import BacktestConfig as _BTC
             _bt_cfg = _BTC()
         self._bt_baselines = _bt_cfg
+        # W64: per-trade budget + live-parity switches, resolved once the loaded
+        # settings exist (explicit arg > config > model default).
+        from ait.config.settings import (
+            BacktestConfig as _BTC2, resolve_config_value as _rcv,
+            resolve_max_contracts_per_trade as _rmc,
+            resolve_position_size_pct as _rps)
+        self._position_size_pct = _rps(position_size_pct, self._settings)
+        self._max_contracts_per_trade = _rmc(max_contracts_per_trade, self._settings)
+        self._budget_aware_wings = bool(_rcv(
+            budget_aware_wings, "backtest", "budget_aware_wings", _BTC2, self._settings))
         # R20b review follow-up: same None -> config-resolution pattern as
         # iv_rank_rise_threshold/min_edge_over_baseline below — a direct
         # caller that omits wing_k now gets the config/live value (1.6)
@@ -459,6 +473,8 @@ class StrategyOptimizer:
             "profit_target_pct":     self._profit_target_pct,
             "min_confidence":        self._min_confidence,
             "position_size_pct":     self._position_size_pct,
+            "budget_aware_wings":    self._budget_aware_wings,
+            "max_contracts_per_trade": self._max_contracts_per_trade,
             "trailing_stop_pct":     0.25,
             "breakeven_trigger_pct": 0.30,
             "max_hold_days":         int(_bl.max_hold_days),

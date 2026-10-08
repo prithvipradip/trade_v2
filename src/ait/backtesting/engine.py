@@ -96,6 +96,16 @@ class Backtester:
         regulatory_fees_per_contract: float | None = None,
         slippage_pct: float = 0.01,
         position_size_pct: float = 0.05,
+        # W64 live-parity switches, OFF for a bare Backtester (R20b: the bare
+        # engine's sizing knobs stay explicit harness defaults; hundreds of engine
+        # tests pin them). The research ENTRY POINTS (WalkForwardConfig,
+        # StrategyOptimizer) resolve both from config and pass them explicitly.
+        # budget_aware_wings: cap the condor wing to the per-trade budget like
+        # live (IronCondor.affordable_width) and reject a structure whose max
+        # loss exceeds it. max_contracts_per_trade: live's hard cap
+        # (positions.max_contracts_per_trade, config 1); None = uncapped.
+        budget_aware_wings: bool = False,
+        max_contracts_per_trade: int | None = None,
         stop_loss_pct: float = 0.50,
         profit_target_pct: float = 1.00,
         max_hold_days: int = 30,
@@ -287,6 +297,9 @@ class Backtester:
         # restores the config formula for A/B runs.
         self._calibrated_spreads = None
         self._position_size_pct = position_size_pct
+        self._budget_aware_wings = bool(budget_aware_wings)
+        self._max_contracts_per_trade = (
+            int(max_contracts_per_trade) if max_contracts_per_trade else None)
         self._stop_loss_pct = stop_loss_pct
         self._profit_target_pct = profit_target_pct
         self._max_hold_days = max_hold_days
@@ -1616,9 +1629,18 @@ class Backtester:
             return None
 
         if strategy in CREDIT_STRATEGIES:
-            return self._build_credit_position(strategy, underlying, iv, t, r, dte, today_date, capital)
+            pos = self._build_credit_position(strategy, underlying, iv, t, r, dte, today_date, capital)
         else:
-            return self._build_debit_position(strategy, direction, underlying, iv, t, r, dte, today_date, capital)
+            pos = self._build_debit_position(strategy, direction, underlying, iv, t, r, dte, today_date, capital)
+        # W64: live trades at most positions.max_contracts_per_trade contracts
+        # (sizer hard cap, config 1). The engine sized off capital x pct alone,
+        # so a larger account backtested 2-4 contracts/trade where live trades 1.
+        # All dollar fields (credit, max_loss, commission, pnl) are derived from
+        # `contracts` AFTER this point, so capping here is exact.
+        if (pos is not None and self._max_contracts_per_trade
+                and pos.get("contracts", 0) > self._max_contracts_per_trade):
+            pos["contracts"] = self._max_contracts_per_trade
+        return pos
 
     def _build_debit_position(
         self, strategy: str, direction: SignalDirection,
@@ -1794,6 +1816,19 @@ class Backtester:
                           em_min=self._ic_em_min, em_max=self._ic_em_max)
                 return None
             wing_width = max(self._wing_k * expected_move, self._wing_floor_dollars)
+            if self._budget_aware_wings:
+                # W64: live parity (iron_condor.py _vol_scaled_width). The per-trade
+                # budget is capital x position_size_pct; the widest wing it can
+                # carry is IronCondor.affordable_width(budget) (the ONE authority,
+                # W31), floor relaxed to $1 when budget-capped. Without this the
+                # engine built the full wing_k x EM wing (~$50 on SPY) at any
+                # account size and merely refused it, so a small account backtested
+                # ZERO trades where live builds a $2-wide condor.
+                from ait.strategies.iron_condor import IronCondor as _IC
+                _budget = float(capital) * self._position_size_pct
+                _afford = _IC.affordable_width(_budget)
+                if _afford < wing_width:
+                    wing_width = float(max(1.0, round(_afford)))
             long_call_strike = short_call_strike + wing_width
             long_put_strike = short_put_strike - wing_width
 
@@ -1825,6 +1860,12 @@ class Backtester:
             if wing_width > 0 and (net_credit / wing_width) < self._ic_min_credit_width:
                 return None
 
+            # W64: the MID credit, before friction. Live's budget gate
+            # (iron_condor.py max_loss > risk_budget) is evaluated on mid-price
+            # strikes' credit; the engine deducted half-spread friction first and
+            # then checked the budget against the inflated max loss, refusing
+            # trades live takes at small size. Kept for the budget-aware path.
+            _mid_credit = net_credit
             # Per-leg spread cost: 4 legs × half-spread (sell at bid, buy at ask)
             half_spread = self._options_half_spread(iv, dte)
             avg_leg_mid = (short_call_price + short_put_price + long_call_price + long_put_price) / 4
@@ -1839,12 +1880,18 @@ class Backtester:
 
             # Position sizing based on max loss (margin requirement)
             import math
-            if (max_loss_per_contract <= 0 or math.isnan(max_loss_per_contract)
-                    or capital < max_loss_per_contract):
+            # W64: budget-aware runs gate affordability + size on the MID-credit
+            # max loss (live parity, see _mid_credit above). The recorded
+            # position (max_loss_per_share below, P&L) still carries the friction.
+            _gate_per_contract = (
+                (wing_width - _mid_credit) * 100
+                if self._budget_aware_wings else max_loss_per_contract)
+            if (_gate_per_contract <= 0 or math.isnan(_gate_per_contract)
+                    or capital < _gate_per_contract):
                 return None
-            contracts = int(capital * self._position_size_pct / max_loss_per_contract)
+            contracts = int(capital * self._position_size_pct / _gate_per_contract)
             if contracts < 1:
-                self._log_unaffordable(strategy, max_loss_per_contract, capital)
+                self._log_unaffordable(strategy, _gate_per_contract, capital)
                 return None
 
             return {

@@ -139,6 +139,10 @@ class TestTheBreakerArmSeesTheLargestStructure:
         """
         s = settings.model_copy(deep=True)
         s.risk.max_position_risk_pct = 0.03
+        # W64: the live defaults moved (5% / 4.5% / ratio 1.0), so inject R26's WHOLE original
+        # incoherent setting (3% budget, 2% breaker, the 1.5x rule) to keep proving the arm fires.
+        s.risk.max_daily_loss_pct = 0.02
+        s.risk.breaker_to_max_loss_ratio = 1.5
         probe = _Probe(s)
         assert _run(probe, nlv)
 
@@ -160,6 +164,10 @@ class TestTheBreakerArmSeesTheLargestStructure:
         """
         s = settings.model_copy(deep=True)
         s.risk.max_position_risk_pct = 0.03
+        # W64: the live defaults moved (5% / 4.5% / ratio 1.0), so inject R26's WHOLE original
+        # incoherent setting (3% budget, 2% breaker, the 1.5x rule) to keep proving the arm fires.
+        s.risk.max_daily_loss_pct = 0.02
+        s.risk.breaker_to_max_loss_ratio = 1.5
         probe = _Probe(s)
         losses = {
             nlv: max(
@@ -279,8 +287,13 @@ class TestTheBuilderIsActuallyExecuted:
         `max_loss_over_budget` then refuses every signal. At HEAD this was the
         silent case: `problems=0` while the builder emitted ZERO.
         """
-        probe = _Probe(settings)
-        assert _run(probe, 9_750.0, chains=[_grid_chain(settings, 5.0)])
+        # W64: pin the 1.33% budget R26's acceptance case ran under ($130 at
+        # $9,750). At the live 5% ($487) a $5 wing fits, so the snapped-wider-
+        # than-budget case this test exists for no longer occurs on live config.
+        s = settings.model_copy(deep=True)
+        s.risk.max_position_risk_pct = 0.0133
+        probe = _Probe(s)
+        assert _run(probe, 9_750.0, chains=[_grid_chain(s, 5.0)])
 
         body = " ".join(probe.alerts)
         assert "max_loss_over_budget" in body, (
@@ -401,6 +414,10 @@ class TestNoArmIsAnAlgebraicIdentity:
         """
         loud_s = settings.model_copy(deep=True)
         loud_s.risk.max_position_risk_pct = 0.03
+        # W64: the live defaults moved (5% / 4.5% / ratio 1.0), so inject R26's WHOLE original
+        # incoherent setting (3% budget, 2% breaker, the 1.5x rule) to keep proving the arm fires.
+        loud_s.risk.max_daily_loss_pct = 0.02
+        loud_s.risk.breaker_to_max_loss_ratio = 1.5
         loud = _Probe(loud_s)
         _run(loud, LIVE_NLV)
         assert loud.alerts, "the arm did not fire on a known-incoherent config"
@@ -500,6 +517,10 @@ class TestTheOperatorCanSeeWhatHappened:
         monkeypatch.setattr(orch_mod.log, "info", _spy)
         s = settings.model_copy(deep=True)
         s.risk.max_position_risk_pct = 0.03
+        # W64: the live defaults moved (5% / 4.5% / ratio 1.0), so inject R26's WHOLE original
+        # incoherent setting (3% budget, 2% breaker, the 1.5x rule) to keep proving the arm fires.
+        s.risk.max_daily_loss_pct = 0.02
+        s.risk.breaker_to_max_loss_ratio = 1.5
         _run(_Probe(s), LIVE_NLV)
 
         assert captured, "the check logged no launch_size_coherence line"

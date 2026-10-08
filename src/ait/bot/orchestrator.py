@@ -2921,10 +2921,16 @@ class TradingOrchestrator:
             # closes a condor early, so the honest bound on one trade's loss is
             # the defined-risk max loss of the LARGEST structure — measured
             # here from the signal the builder actually produced.
-            if worst > 0 and breaker_usd < 1.5 * worst:
+            # W64: the multiple is risk.breaker_to_max_loss_ratio, not a literal
+            # 1.5. It was the one number in this arm with no config home, and it
+            # decided whether the alert fired (at $5k: $150 breaker vs 1.5 x $124.50
+            # = $187 fired against an otherwise coherent 3%/3% setup).
+            _ratio = self._settings.risk.breaker_to_max_loss_ratio
+            if worst > 0 and breaker_usd < _ratio * worst:
                 problems.append(
                     f"daily-loss breaker ${breaker_usd:.0f} "
-                    f"({self._settings.risk.max_daily_loss_pct:.1%} of NLV) < 1.5x "
+                    f"({self._settings.risk.max_daily_loss_pct:.1%} of NLV) < {_ratio:g}x "
+                    f"(risk.breaker_to_max_loss_ratio) "
                     f"the largest single max loss the builder emits here "
                     f"(${worst:.0f}, defined-risk: the credit stop is DISABLED, "
                     f"so nothing closes it early) — one stopped trade halts the "
