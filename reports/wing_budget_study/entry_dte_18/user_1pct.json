@@ -1,0 +1,33 @@
+{
+ "variant": "user_1pct",
+ "max_loss_cap": 1990.0,
+ "entry_dte": 18,
+ "run_seconds": 26,
+ "n": 57,
+ "windows": 19,
+ "wins": 31,
+ "win_rate_pct": 54.4,
+ "net": -1493.5,
+ "pf": 0.687,
+ "avg_trade": -26.2,
+ "max_dd_dollars": 1611.78,
+ "max_dd_pct": 1.63,
+ "mean_hold_days": 7.63,
+ "position_days": 435,
+ "net_per_position_day": -3.433,
+ "closes_per_window": 3.0,
+ "exit_reasons": {
+  "take_profit_short": 27,
+  "touch_stop": 26,
+  "backtest_end": 4
+ },
+ "cap_bound_pct": 50.9,
+ "mean_wing_width": 19.32,
+ "mean_max_loss": 1630.0,
+ "max_max_loss": 1985.0,
+ "mean_credit": 3.025,
+ "avg_win": 105.75,
+ "avg_loss": -183.53,
+ "worst_trade": -408.84,
+ "contracts_max": 1
+}

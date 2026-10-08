@@ -1,0 +1,33 @@
+{
+ "variant": "ahmed_1_33pct",
+ "max_loss_cap": 2643.0,
+ "entry_dte": 18,
+ "run_seconds": 25,
+ "n": 57,
+ "windows": 19,
+ "wins": 31,
+ "win_rate_pct": 54.4,
+ "net": -1235.98,
+ "pf": 0.751,
+ "avg_trade": -21.68,
+ "max_dd_dollars": 1625.05,
+ "max_dd_pct": 1.62,
+ "mean_hold_days": 7.58,
+ "position_days": 432,
+ "net_per_position_day": -2.861,
+ "closes_per_window": 3.0,
+ "exit_reasons": {
+  "take_profit_short": 27,
+  "touch_stop": 26,
+  "backtest_end": 4
+ },
+ "cap_bound_pct": 33.3,
+ "mean_wing_width": 22.41,
+ "mean_max_loss": 1913.0,
+ "max_max_loss": 2563.0,
+ "mean_credit": 3.282,
+ "avg_win": 120.06,
+ "avg_loss": -190.69,
+ "worst_trade": -465.36,
+ "contracts_max": 1
+}

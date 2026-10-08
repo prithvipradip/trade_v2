@@ -254,6 +254,14 @@ class Backtester:
         # on the 2026 windows alone would be a test of one year.
         post_event_blackout_days: int | None = None,
         post_event_dates: tuple | None = None,
+        # Research-only (scripts/wing_budget_study.py, 2026-10-08): the live
+        # builder's budget-aware wing cap (iron_condor._vol_scaled_width +
+        # the max_loss > risk_budget reject), as a dollar budget per
+        # contract. None = off (the engine's behaviour before this existed).
+        max_loss_per_contract_dollars: float | None = None,
+        # Research-only: cap contracts per entry (live trades 1 lot,
+        # positions.max_contracts_per_trade). None = off.
+        contracts_cap: int | None = None,
         # R20b follow-up: optional pre-loaded Settings, so a caller building
         # many Backtester instances (StrategyOptimizer: one per Optuna trial)
         # can load config.yaml ONCE and thread it through instead of every
@@ -377,6 +385,9 @@ class Backtester:
         self._post_event_dates = tuple(sorted(
             d if isinstance(d, date) else date.fromisoformat(str(d)[:10])
             for d in (post_event_dates or ())))
+        self._max_loss_cap = (float(max_loss_per_contract_dollars)
+                              if max_loss_per_contract_dollars is not None else None)
+        self._contracts_cap = int(contracts_cap) if contracts_cap is not None else None
         self._entry_dte = int(entry_dte) if entry_dte is not None else int(
             _resolve_setting(None, "options", "dte_range", OptionsConfig, _settings)[0])
         self._scan_interval_minutes = int(_resolve_setting(
@@ -1794,6 +1805,15 @@ class Backtester:
                           em_min=self._ic_em_min, em_max=self._ic_em_max)
                 return None
             wing_width = max(self._wing_k * expected_move, self._wing_floor_dollars)
+            # Research-only budget cap, mirroring live _vol_scaled_width:
+            # width <= budget / (100 * max(0.5, 1 - credit/width floor)).
+            wing_capped = False
+            if self._max_loss_cap is not None:
+                _affordable = self._max_loss_cap / (
+                    100.0 * max(0.5, 1.0 - self._ic_min_credit_width))
+                if _affordable < wing_width:
+                    wing_width = max(1.0, _affordable)
+                    wing_capped = True
             long_call_strike = short_call_strike + wing_width
             long_put_strike = short_put_strike - wing_width
 
@@ -1842,10 +1862,16 @@ class Backtester:
             if (max_loss_per_contract <= 0 or math.isnan(max_loss_per_contract)
                     or capital < max_loss_per_contract):
                 return None
+            # Research-only: live rejects a built condor whose max loss still
+            # exceeds the budget (iron_condor.py, max_loss > risk_budget).
+            if self._max_loss_cap is not None and max_loss_per_contract > self._max_loss_cap:
+                return None
             contracts = int(capital * self._position_size_pct / max_loss_per_contract)
             if contracts < 1:
                 self._log_unaffordable(strategy, max_loss_per_contract, capital)
                 return None
+            if self._contracts_cap is not None:
+                contracts = min(contracts, self._contracts_cap)
 
             return {
                 "symbol": "SIM",
@@ -1865,6 +1891,9 @@ class Backtester:
                 "entry_iv": round(iv, 4),
                 "em_ratio_call": round(em_ratio_call, 4),  # W52a
                 "em_ratio_put": round(em_ratio_put, 4),
+                "wing_width": round(wing_width, 2),
+                "wing_capped": wing_capped,
+                "max_loss_per_contract": round(max_loss_per_contract, 2),
                 "underlying_at_entry": round(S, 2),
                 "max_loss_per_share": round(max_loss_per_share, 4),
                 "expiry_date": str(today_date + timedelta(days=dte)),

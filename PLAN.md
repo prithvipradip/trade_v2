@@ -14340,3 +14340,39 @@ NOT PULLED INTO THE WINDOWS LIVE TREE (operator instruction): it stays at `16e35
 since 2026-08-18, `674791d`).
 
 ---
+
+## 2026-10-08 - STUDY: max loss per condor capped at $2,643 / $1,990 (walk-forward) - 1.33% ACCEPTABLE, $2,000 COSTLY
+
+QUESTION (Prithvi, 10-08): the QQQ condor entered 09-28 could lose at most $4,995 - cap every condor at
+~$2,000? Same harness answers Ahmed's 09-29 cap (0.0133 = ~$2,643), which the Windows live tree has not
+pulled (held at 16e35df / 0.03 pending this decision).
+
+HOW. `scripts/wing_budget_study.py`, harness identical to the post-event study (SPY/QQQ/IWM, condor only,
+train126/test63/step63/gap5, entry DTE 18, W5 costs, live data store). Two research-only engine knobs,
+inert unless set: `Backtester(max_loss_per_contract_dollars)` mirrors live's budget cap exactly
+(`iron_condor._vol_scaled_width`: width <= budget/(100 x (1 - credit/width floor)), plus the
+`max_loss > risk_budget` reject), and `contracts_cap` (live trades 1 lot; the engine otherwise sizes by
+`position_size_pct`, so narrower wings would silently become more contracts). Threaded through
+`WalkForwardConfig`, refused with per-window optimisation. Rule written before the run (script docstring):
+vs the live 3% baseline a cap is ACCEPTABLE if n >= 30, n >= 0.85x, PF >= base - 0.10, max DD$ <= base.
+
+RESULT (2022-08..2026-10, 21 windows; all 1 lot):
+  | variant        | cap $  | n  | PF    | net $  | DD $  | avg win | avg loss | worst | wing $ | cap bound |
+  | live_3pct      | 5,962  | 55 | 0.836 |   -776 | 1,678 | 131.37  | -188.67  | -505  | 25.34  |  0%       |
+  | ahmed_1_33pct  | 2,643  | 57 | 0.751 | -1,236 | 1,625 | 120.06  | -190.69  | -465  | 22.41  | 33%       |
+  | user_1pct      | 1,990  | 57 | 0.687 | -1,494 | 1,612 | 105.75  | -183.53  | -409  | 19.32  | 51%       |
+  Sanity: a non-binding $10M cap reproduces the uncapped 1-lot run exactly. VERDICT: 1.33% ACCEPTABLE
+  (PF -0.085, inside the 0.10 tolerance); 1% ($2,000) COSTLY (PF -0.149).
+  WHY: losses are touch stops at the short strike, not max losses, so narrower wings do NOT shrink the
+  typical loss (-189 -> -184) - they shrink every winner (131 -> 106, -20%) because the credit falls
+  (3.39 -> 3.03). The cap buys protection against a tail this history never reached (worst trade -505;
+  no trade came near the old max loss). Max DD barely moves (1,678 -> 1,612).
+  CAVEATS: absolute level is not trusted (harness PF 0.84 vs live 2.2). Dollar caps on 2022-2024 prices
+  (SPY ~$400) rarely bind; at today's prices (QQQ ~$750, live max loss ~$5k) the cap binds on nearly every
+  entry, so the live effect would be at least as large as the 51%-bound average shown here.
+
+PROOF. `tests/test_wing_budget_study_injection.py`, 14 executing tests, all red pre-change. Full fast lane
+2846 passed / 46 skipped / 0 failed. No live code path reads the new parameters. Outputs:
+`reports/wing_budget_study/entry_dte_18/` (per-variant json, results.json/md).
+
+---

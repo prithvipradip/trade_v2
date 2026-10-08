@@ -1,0 +1,33 @@
+{
+ "variant": "cap_huge_1lot",
+ "max_loss_cap": 10000000.0,
+ "entry_dte": 18,
+ "run_seconds": 25,
+ "n": 55,
+ "windows": 17,
+ "wins": 30,
+ "win_rate_pct": 54.5,
+ "net": -775.69,
+ "pf": 0.836,
+ "avg_trade": -14.1,
+ "max_dd_dollars": 1677.8,
+ "max_dd_pct": 1.68,
+ "mean_hold_days": 7.31,
+ "position_days": 402,
+ "net_per_position_day": -1.93,
+ "closes_per_window": 3.24,
+ "exit_reasons": {
+  "take_profit_short": 27,
+  "touch_stop": 25,
+  "backtest_end": 3
+ },
+ "cap_bound_pct": 0.0,
+ "mean_wing_width": 25.34,
+ "mean_max_loss": 2195.0,
+ "max_max_loss": 4641.0,
+ "mean_credit": 3.39,
+ "avg_win": 131.37,
+ "avg_loss": -188.67,
+ "worst_trade": -505.06,
+ "contracts_max": 1
+}

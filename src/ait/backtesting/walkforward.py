@@ -172,6 +172,11 @@ class WalkForwardConfig:
     # (ISO strings, so the config pickles into window workers). None = off.
     post_event_blackout_days: int | None = None
     post_event_dates: tuple | None = None
+    # Research-only (scripts/wing_budget_study.py): live's budget-aware wing
+    # cap as a dollar max loss per contract, and a contracts-per-entry cap
+    # (live trades 1 lot). None = off.
+    max_loss_per_contract_dollars: float | None = None
+    contracts_cap: int | None = None
     optimize_n_jobs: int = 1              # Number of walk-forward WINDOWS to run in parallel via
                                           # ProcessPoolExecutor. Despite the "optimize_" prefix this
                                           # controls WINDOW-LEVEL parallelism, NOT Optuna trial-level
@@ -204,8 +209,18 @@ class WalkForwardConfig:
                 raise ValueError("post_event_blackout_days must be >= 0")
         if self.post_event_dates is not None:
             self.post_event_dates = tuple(str(d)[:10] for d in self.post_event_dates)
+        if self.max_loss_per_contract_dollars is not None:
+            self.max_loss_per_contract_dollars = float(self.max_loss_per_contract_dollars)
+            if self.max_loss_per_contract_dollars <= 0:
+                raise ValueError("max_loss_per_contract_dollars must be > 0")
+        if self.contracts_cap is not None:
+            self.contracts_cap = int(self.contracts_cap)
+            if self.contracts_cap < 1:
+                raise ValueError("contracts_cap must be >= 1")
         _research_only = [name for name in ("credit_tp_ladder", "entry_dte",
-                                            "post_event_blackout_days")
+                                            "post_event_blackout_days",
+                                            "max_loss_per_contract_dollars",
+                                            "contracts_cap")
                           if getattr(self, name) is not None]
         if _research_only and self.optimize_per_window:
             # StrategyOptimizer trials build their own Backtester without
@@ -1476,6 +1491,9 @@ class WalkForwardBacktester:
                 db_path=self._db_path,  # W52a: the engine reads THIS store
                 post_event_blackout_days=getattr(window_cfg, "post_event_blackout_days", None),
                 post_event_dates=getattr(window_cfg, "post_event_dates", None),
+                max_loss_per_contract_dollars=getattr(
+                    window_cfg, "max_loss_per_contract_dollars", None),
+                contracts_cap=getattr(window_cfg, "contracts_cap", None),
                 # R16 #1: NEVER score an OOS window with the live (future-
                 # trained) models/ensemble.pkl. If the window model failed to
                 # train, the window trades ungated — the documented fallback.
@@ -2587,6 +2605,9 @@ class WalkForwardBacktester:
                 db_path=self._db_path,  # W52a: the engine reads THIS store
                 post_event_blackout_days=getattr(window_cfg, "post_event_blackout_days", None),
                 post_event_dates=getattr(window_cfg, "post_event_dates", None),
+                max_loss_per_contract_dollars=getattr(
+                    window_cfg, "max_loss_per_contract_dollars", None),
+                contracts_cap=getattr(window_cfg, "contracts_cap", None),
                 # R16 #1: shadow labelling runs with the window predictor
                 # (possibly None) — never with the live artifact.
                 allow_live_model_fallback=False,
