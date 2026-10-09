@@ -76,6 +76,12 @@ class WalkForwardConfig:
     friction_entry_capture: float | None = None
     friction_exit_capture: float | None = None
     friction_stress_multiplier: float | None = None
+    # W67 gate parity (None -> backtest.gates_mode / fractal_veto_spread / penalty_on_range_prob).
+    # fractal_veto_spread: an explicit legacy hurst_hard_veto_multiplier > 0 is honoured by
+    # translating it once with the original formula (see ait.ml.regime_gate.resolve_veto_spread).
+    gates_mode: str | None = None
+    fractal_veto_spread: float | None = None
+    penalty_on_range_prob: float | None = None
     # W65 research-history knobs (None = legacy behaviour; the research entry points
     # resolve them from config.yaml backtest.* and pass them explicitly).
     history_start_date: "date | None" = None   # trim data + start windows here
@@ -133,7 +139,9 @@ class WalkForwardConfig:
     optimize_per_window: bool = False
     optimize_n_trials: int = 50
     optimize_patience: int = 0       # 0 = disabled; N = stop after N non-improving trials
-    optimize_min_trades: int = 10    # Penalise trials with fewer trades than this floor
+    optimize_min_trades: int | None = None   # None -> backtest.optimize_min_trades (W67: was a 10 literal)
+    optimize_hard_min_trades: int | None = None          # W67: None -> backtest.*
+    optimize_below_floor_gradient: float | None = None   # W67: None -> backtest.*
     optimize_seed: int = 42          # TPESampler seed — fix for reproducibility
     range_threshold_pct: float = 0.05  # Target move % for range model; links to strategy profitability
     hurst_regime_threshold: float | None = None
@@ -284,6 +292,30 @@ class WalkForwardConfig:
         self.friction_stress_multiplier = float(resolve_config_value(
             self.friction_stress_multiplier, "backtest", "friction_stress_multiplier",
             BacktestConfig, _settings))
+        self.gates_mode = str(resolve_config_value(
+            self.gates_mode, "backtest", "gates_mode", BacktestConfig, _settings))
+        self.penalty_on_range_prob = float(resolve_config_value(
+            self.penalty_on_range_prob, "backtest", "penalty_on_range_prob",
+            BacktestConfig, _settings))
+        if self.fractal_veto_spread is None and self.hurst_hard_veto_multiplier > 0:
+            from ait.ml.regime_gate import resolve_veto_spread
+            _thr = float(resolve_config_value(
+                self.hurst_regime_threshold, "backtest", "hurst_regime_threshold",
+                BacktestConfig, _settings))
+            self.fractal_veto_spread = resolve_veto_spread(
+                _thr, self.hurst_hard_veto_multiplier, None)
+        self.fractal_veto_spread = float(resolve_config_value(
+            self.fractal_veto_spread, "backtest", "fractal_veto_spread",
+            BacktestConfig, _settings))
+        self.optimize_min_trades = int(resolve_config_value(
+            self.optimize_min_trades, "backtest", "optimize_min_trades",
+            BacktestConfig, _settings))
+        self.optimize_hard_min_trades = int(resolve_config_value(
+            self.optimize_hard_min_trades, "backtest", "optimize_hard_min_trades",
+            BacktestConfig, _settings))
+        self.optimize_below_floor_gradient = float(resolve_config_value(
+            self.optimize_below_floor_gradient, "backtest", "optimize_below_floor_gradient",
+            BacktestConfig, _settings))
         self.range_min_confidence = float(resolve_config_value(
             self.range_min_confidence, "ml", "range_min_confidence", MLConfig, _settings))
         self.iv_floor = float(resolve_config_value(
@@ -365,6 +397,8 @@ class WalkForwardResult:
     meta_training_status: dict = field(default_factory=dict)
     # W66: {symbol: {reason: days}} summed over every window (zero-trade windows included)
     entry_funnel: dict = field(default_factory=dict)
+    # W67: {window_id: {symbol: {"usable", "best_value", "best_n_trades"}}} (empty = no Optuna)
+    optimization_status: dict = field(default_factory=dict)
 
     @property
     def total_trades(self) -> int:
@@ -659,6 +693,16 @@ class WalkForwardResult:
                     f"trades={result.total_trades:3d} | sharpe={result.sharpe_ratio:.2f}"
                 )
 
+        if self.optimization_status:
+            studies = [(w, sym, st) for w, per in sorted(self.optimization_status.items())
+                       for sym, st in sorted(per.items())]
+            starved = [x for x in studies if not x[2]["usable"]]
+            lines.append(f"  OPTIMIZATION: {len(studies) - len(starved)} of {len(studies)} "
+                         f"per-window studies found a trading trial"
+                         + ("" if not starved else
+                            f"  --  {len(starved)} NEVER did (their 'best params' are not a "
+                            f"result): " + ", ".join(f"w{w}/{sym}" for w, sym, _ in starved[:12])
+                            + (" ..." if len(starved) > 12 else "")))
         if self.entry_funnel:
             lines.append("  ENTRY FUNNEL (days, summed over windows; why entries did not happen):")
             for sym in sorted(self.entry_funnel):
@@ -666,11 +710,17 @@ class WalkForwardResult:
                 days, taken = f.get("days_evaluated", 0), f.get("entries_taken", 0)
                 top = sorted(((k, v) for k, v in f.items()
                               if k not in ("days_evaluated", "entries_taken")
-                              and not k.startswith("builder:")), key=lambda kv: -kv[1])
+                              and not k.startswith(("builder:", "would_reject:"))),
+                             key=lambda kv: -kv[1])
+                wr_ = sorted(((k[13:], v) for k, v in f.items() if k.startswith("would_reject:")),
+                             key=lambda kv: -kv[1])
                 det = sorted(((k[8:], v) for k, v in f.items() if k.startswith("builder:")),
                              key=lambda kv: -kv[1])
                 lines.append(f"    {sym:6s} days={days} taken={taken} | " +
                              ", ".join(f"{k}={v}" for k, v in top[:6]))
+                if wr_:
+                    lines.append("           gates in observe mode would also have rejected: " +
+                                 ", ".join(f"{k}={v}" for k, v in wr_[:5]))
                 if det:
                     lines.append("           builder detail: " +
                                  ", ".join(f"{k}={v}" for k, v in det[:5]))
@@ -950,7 +1000,9 @@ def _window_task_mp(args: tuple) -> tuple:
         prev_oos=None,
         pretrained_range=pretrained_range,
     )
-    return window_id, wr, best_params, meta_status, bt._funnel_by_window.get(window_id, {})
+    return (window_id, wr, best_params, meta_status,
+            bt._funnel_by_window.get(window_id, {}),
+            bt._opt_status_by_window.get(window_id, {}))
 
 
 class WalkForwardBacktester:
@@ -990,6 +1042,10 @@ class WalkForwardBacktester:
         # zero-trade windows whose WindowResult is None (they are exactly where the
         # funnel explains the emptiness).
         self._funnel_by_window: dict[int, dict[str, dict[str, int]]] = {}
+        # W67: {window_id: {symbol: {"usable": bool, "best_value": float, "best_n_trades": int}}}
+        # for every per-window Optuna study, so a run whose studies never found a trading
+        # trial says so in its summary instead of looking like an optimized result.
+        self._opt_status_by_window: dict[int, dict[str, dict]] = {}
         # W65: research macro calendar (built in run() when macro_event_types is set).
         self._research_calendar = None
         self._progress_dir = Path(progress_dir) if progress_dir else None
@@ -1128,8 +1184,9 @@ class WalkForwardBacktester:
             with ProcessPoolExecutor(max_workers=self._config.optimize_n_jobs) as executor:
                 mp_results = list(executor.map(_window_task_mp, args_list))
 
-            for _wid, wr, curr_best_params, _meta_status, _fun in sorted(mp_results, key=lambda x: x[0]):
+            for _wid, wr, curr_best_params, _meta_status, _fun, _opt in sorted(mp_results, key=lambda x: x[0]):
                 self._funnel_by_window[_wid] = _fun
+                self._opt_status_by_window[_wid] = _opt
                 # R20b review follow-up: merge the per-symbol meta-labeler
                 # status independently of whether the window produced trades
                 # — a zero-trade parallel window (wr is None) is precisely
@@ -1207,6 +1264,7 @@ class WalkForwardBacktester:
             range_training_status=dict(self._range_status_by_window),
             meta_training_status=_meta_status_all,
             entry_funnel=self._aggregate_funnel(),
+            optimization_status=self._opt_status_by_window,
         )
 
         # Compute per-symbol results
@@ -1556,6 +1614,9 @@ class WalkForwardBacktester:
                 friction_entry_capture=window_cfg.friction_entry_capture,
                 friction_exit_capture=window_cfg.friction_exit_capture,
                 friction_stress_multiplier=window_cfg.friction_stress_multiplier,
+                gates_mode=window_cfg.gates_mode,
+                fractal_veto_spread=window_cfg.fractal_veto_spread,
+                penalty_on_range_prob=window_cfg.penalty_on_range_prob,
                 economic_calendar=self._research_calendar,
                 stop_loss_pct=window_cfg.stop_loss_pct,
                 profit_target_pct=window_cfg.profit_target_pct,
@@ -1917,6 +1978,11 @@ class WalkForwardBacktester:
                     friction_entry_capture=self._config.friction_entry_capture,
                     friction_exit_capture=self._config.friction_exit_capture,
                     friction_stress_multiplier=self._config.friction_stress_multiplier,
+                    gates_mode=self._config.gates_mode,
+                    fractal_veto_spread=self._config.fractal_veto_spread,
+                    penalty_on_range_prob=self._config.penalty_on_range_prob,
+                    hard_min_trades=self._config.optimize_hard_min_trades,
+                    below_floor_gradient=self._config.optimize_below_floor_gradient,
                     economic_calendar=self._research_calendar,
                     wing_floor_dollars=self._config.wing_floor_dollars,
                     wing_k=self._config.wing_k,
@@ -1954,6 +2020,9 @@ class WalkForwardBacktester:
                     settings=self._settings,
                 )
                 res = opt.run(data={symbol: train_df}, prior_params=warm)
+                self._opt_status_by_window.setdefault(window_id, {})[symbol] = {
+                    "usable": bool(res.usable), "best_value": float(res.best_value),
+                    "best_n_trades": res.best_n_trades}
                 all_best_params.update(res.best_params)
                 best_values[strategy] = res.best_value
                 # Collect trial data for dashboard (Layer 2b)
@@ -2702,6 +2771,9 @@ class WalkForwardBacktester:
                 friction_entry_capture=window_cfg.friction_entry_capture,
                 friction_exit_capture=window_cfg.friction_exit_capture,
                 friction_stress_multiplier=window_cfg.friction_stress_multiplier,
+                gates_mode=window_cfg.gates_mode,
+                fractal_veto_spread=window_cfg.fractal_veto_spread,
+                penalty_on_range_prob=window_cfg.penalty_on_range_prob,
                 economic_calendar=self._research_calendar,
                 stop_loss_pct=window_cfg.stop_loss_pct,
                 profit_target_pct=window_cfg.profit_target_pct,

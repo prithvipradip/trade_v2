@@ -25,7 +25,7 @@ import optuna
 import pandas as pd
 
 from ait.optimization.objectives import OBJECTIVES
-from ait.optimization.param_spaces import ML_SPACES, STRATEGY_SPACES
+from ait.optimization.param_spaces import FRACTAL_GATE_SPACE, ML_SPACES, STRATEGY_SPACES
 from ait.optimization.results import OptimizationResult
 from ait.utils.logging import get_logger
 
@@ -68,6 +68,17 @@ class _EarlyStopCallback:
         return ""
 
 
+def _top_rejections(funnel: dict | None, n: int = 3) -> list[str]:
+    """W67: the n most frequent top-level entry rejections of a trial, "reason=days" strings,
+    stored on the trial so a starved study explains itself."""
+    if not funnel:
+        return []
+    top = sorted(((k, v) for k, v in funnel.items()
+                  if k not in ("days_evaluated", "entries_taken")
+                  and not k.startswith(("builder:", "would_reject:"))), key=lambda kv: -kv[1])
+    return [f"{k}={v}" for k, v in top[:n]]
+
+
 class StrategyOptimizer:
     """Bayesian strategy + ML hyperparameter optimizer."""
 
@@ -96,6 +107,11 @@ class StrategyOptimizer:
         friction_entry_capture: float | None = None,
         friction_exit_capture: float | None = None,
         friction_stress_multiplier: float | None = None,
+        gates_mode: str | None = None,               # W67 gate parity (None -> config)
+        fractal_veto_spread: float | None = None,
+        penalty_on_range_prob: float | None = None,
+        hard_min_trades: int | None = None,          # W67 graded objective (None -> config)
+        below_floor_gradient: float | None = None,
         table_prefix: str = "",         # W65: research table prefix for the standalone data fetch
         db_path: Any = None,             # W65: store holding the research tables
         history_start_date: Any = None,  # W65: trim the standalone fetch to this date
@@ -236,6 +252,16 @@ class StrategyOptimizer:
         self._friction_stress_multiplier = float(_rcv(
             friction_stress_multiplier, "backtest", "friction_stress_multiplier", _BTC2,
             self._settings))
+        self._gates_mode = str(_rcv(gates_mode, "backtest", "gates_mode", _BTC2, self._settings))
+        self._fractal_veto_spread = float(_rcv(
+            fractal_veto_spread, "backtest", "fractal_veto_spread", _BTC2, self._settings))
+        self._penalty_on_range_prob = float(_rcv(
+            penalty_on_range_prob, "backtest", "penalty_on_range_prob", _BTC2, self._settings))
+        self._hard_min_trades = int(_rcv(
+            hard_min_trades, "backtest", "optimize_hard_min_trades", _BTC2, self._settings))
+        self._below_floor_gradient = float(_rcv(
+            below_floor_gradient, "backtest", "optimize_below_floor_gradient", _BTC2,
+            self._settings))
         # R20b review follow-up: same None -> config-resolution pattern as
         # iv_rank_rise_threshold/min_edge_over_baseline below — a direct
         # caller that omits wing_k now gets the config/live value (1.6)
@@ -363,6 +389,17 @@ class StrategyOptimizer:
                 stop_reason += f" {n_pruned} trial(s) pruned by MedianPruner."
 
         result = OptimizationResult(study)
+        best_n = study.best_trial.user_attrs.get("n_trades", 0)
+        result.best_n_trades = int(best_n)
+        result.usable = int(best_n) >= self._hard_min_trades
+        if not result.usable:
+            log.warning(
+                "optuna_no_usable_trial", study_name=self._study_name,
+                best_value=study.best_value, best_n_trades=int(best_n),
+                hard_min_trades=self._hard_min_trades, n_trials=len(study.trials),
+                top_rejections=study.best_trial.user_attrs.get("entry_funnel_top"),
+                note="no trial reached the trade floor: the reported best params are NOT an "
+                     "optimization result")
         result.stop_reason = stop_reason
         result.early_stopped = early_stopped
 
@@ -394,9 +431,15 @@ class StrategyOptimizer:
         # Tier 2: quadratic penalty between 3 and min_trades — (actual/min)^2 multiplier.
         #   Linear (×0.5 at 5 trades) leaves overfit trials competitive; quadratic (×0.25)
         #   pushes them below healthy 10-15 trade results.
-        _HARD_MIN_TRADES = 3
-        if result.total_trades < _HARD_MIN_TRADES:
-            return -100.0
+        # W67: the floor and the below-floor score are config knobs, and the score is
+        # GRADED (-100 at 0 trades rising by `below_floor_gradient` as trades approach the
+        # floor) instead of a flat -100 -- a flat plateau gave TPE nothing to climb, and 28
+        # of 30 W65 studies never left it.
+        trial.set_user_attr("n_trades", int(result.total_trades))
+        trial.set_user_attr("entry_funnel_top", _top_rejections(result.entry_funnel))
+        if result.total_trades < self._hard_min_trades:
+            return -100.0 + self._below_floor_gradient * (
+                result.total_trades / max(self._hard_min_trades, 1))
         if self._min_trades > 0 and result.total_trades < self._min_trades:
             _f = (result.total_trades / self._min_trades) ** 2
             # R5 audit: multiplying a NEGATIVE score by a <1 factor shrinks
@@ -429,6 +472,20 @@ class StrategyOptimizer:
         binds; at a larger capital the cap stops binding and wing_k is searched again.
         """
         self._dropped_params = set()
+        # W67: with a condor-only strategy set the fractal gate's penalty cannot move any
+        # result (condors skip the directional-confidence gate) unless it also acts on the
+        # range probability, and the veto is an absolute cutoff, not derived from the
+        # threshold. Searching the three FRACTAL_GATE_SPACE dimensions is then pure noise.
+        from ait.backtesting.engine import NEUTRAL_CREDIT_GATED
+        if (self._strategies and set(self._strategies) <= set(NEUTRAL_CREDIT_GATED)
+                and self._penalty_on_range_prob == 0):
+            _fractal = {f"{st}__{name}" for st in self._strategies
+                        for name in FRACTAL_GATE_SPACE}
+            self._dropped_params |= _fractal
+            log.info("optimizer_dropped_inert_param", param="fractal_gate_space",
+                     dropped=sorted(_fractal),
+                     note="condor-only strategy set and penalty_on_range_prob=0: the fractal "
+                          "penalty cannot change any entry")
         if not self._budget_aware_wings or "iron_condor" not in self._strategies:
             return
         spec = STRATEGY_SPACES.get("iron_condor", {}).get("wing_k")
@@ -453,7 +510,7 @@ class StrategyOptimizer:
             target = k_min * spot * iv * math.sqrt(dte / 365.0)
             smallest_target = target if smallest_target is None else min(smallest_target, target)
         if smallest_target is not None and affordable < smallest_target:
-            self._dropped_params = {"iron_condor__wing_k"}
+            self._dropped_params |= {"iron_condor__wing_k"}
             log.info("optimizer_dropped_inert_param", param="iron_condor__wing_k",
                      affordable_wing=round(affordable, 2),
                      smallest_searched_wing=round(smallest_target, 2),
@@ -554,6 +611,12 @@ class StrategyOptimizer:
             "friction_entry_capture": self._friction_entry_capture,
             "friction_exit_capture": self._friction_exit_capture,
             "friction_stress_multiplier": self._friction_stress_multiplier,
+            # W67: the SAME gate configuration the OOS evaluation uses. Before this the
+            # trial Backtester inherited the bare engine default (hurst veto at 1.5x), a
+            # gate the OOS run never applied -- Optuna optimized under the wrong rules.
+            "gates_mode":            self._gates_mode,
+            "fractal_veto_spread":   self._fractal_veto_spread,
+            "penalty_on_range_prob": self._penalty_on_range_prob,
             "max_contracts_per_trade": self._max_contracts_per_trade,
             "trailing_stop_pct":     0.25,
             "breakeven_trigger_pct": 0.30,

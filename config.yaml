@@ -224,7 +224,13 @@ backtest:
                                        # Optuna tunes per window in [0.25, 0.90]; 0.80 = permissive default
   optimize_n_trials: 50               # Optuna trials per walk-forward window
   optimize_patience: 20               # Early stopping: halt after N consecutive non-improving trials (0=disabled)
-  optimize_min_trades: 10             # Min trades for full score; < 3 → always −100; 3–9 → quadratic penalty
+  optimize_min_trades: 10             # Min trades for full score; 3–9 → quadratic penalty
+  optimize_hard_min_trades: 3         # W67: below this a trial scores on the graded floor (not a flat −100)
+  optimize_below_floor_gradient: 20.0 # W67: −100 (0 trades) rising toward −80; 0 restores the flat −100
+  gates_mode: observe                 # W67: observe = live parity (ml.entry_gates_enabled=false: range floor + fractal veto
+                                       # are recorded as would_reject:*, never block); enforce = historical research behaviour
+  fractal_veto_spread: 0.0            # W67: absolute hurst spread veto for neutral structures (0 = off = live today)
+  penalty_on_range_prob: 0.0          # W67: fractal penalty also lowers P(in range) (0 = off = live today)
   # R20b (pre-registered 2026-08-21): optimizer trial baselines moved from code
   # literals into config — values below = the operating literals they replace.
   stop_loss_pct: 0.35                 # Baseline stop-loss (fraction of position value)

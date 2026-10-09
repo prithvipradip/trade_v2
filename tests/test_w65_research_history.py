@@ -675,6 +675,10 @@ class TestTrainerPersistsTheProvider:
 class TestOptimizerResearchSupport:
     def _opt(self, capital, strategies=("iron_condor",), **kw):
         from ait.optimization.optimizer import StrategyOptimizer
+        # W67: these tests are about wing_k. With the default penalty_on_range_prob=0 the
+        # (condor-only) fractal dimensions are ALSO dropped as inert; a non-zero value
+        # keeps them in the search so the assertions below isolate the wing_k rule.
+        kw.setdefault("penalty_on_range_prob", 0.05)
         o = StrategyOptimizer(symbols=["SPY"], strategies=list(strategies), n_trials=1,
                               initial_capital=capital, **kw)
         df = _ohlcv("2025-01-02", 300, base=700.0)

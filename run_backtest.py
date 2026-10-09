@@ -148,6 +148,14 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
         "budget_aware_wings": True,   # live caps the wing to the budget (iron_condor.py)
         "condor_any_direction": True,  # live IronCondor ignores market_direction (iron_condor.py)
         "max_contracts_per_trade": live_max_contracts,
+        # W67: ml.entry_gates_enabled=false -> live observes; the shared fractal gate's
+        # cutoffs are read from the same backtest.* fields by the orchestrator.
+        "gates_mode": ("enforce" if (settings.ml.entry_gates_enabled if settings else True)
+                       else "observe"),
+        "fractal_veto_spread": float(settings.backtest.fractal_veto_spread
+                                     if settings else _BTC().fractal_veto_spread),
+        "penalty_on_range_prob": float(settings.backtest.penalty_on_range_prob
+                                       if settings else _BTC().penalty_on_range_prob),
         "wing_k":            float(env.get("AIT_IC_WING_K", "1.0")),
         "range_min_confidence": (settings.ml.range_min_confidence
                                   if settings else MLConfig().range_min_confidence),
@@ -179,6 +187,11 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
         "condor_any_direction": bool(_rcv(None, "backtest", "condor_any_direction", _BTC, settings)),
         "friction_model": str(_rcv(None, "backtest", "friction_model", _BTC, settings)),
         "max_contracts_per_trade": bt_max_contracts,
+        "gates_mode": str(_rcv(getattr(args, "gates_mode", None), "backtest", "gates_mode",
+                               _BTC, settings)),
+        "fractal_veto_spread": float(_rcv(None, "backtest", "fractal_veto_spread", _BTC, settings)),
+        "penalty_on_range_prob": float(_rcv(
+            None, "backtest", "penalty_on_range_prob", _BTC, settings)),
         "wing_k":            resolved_wing_k,
         "range_min_confidence": resolved_range_confidence,
         "ic_min_credit":     resolved_ic_min_credit,
@@ -348,6 +361,10 @@ def parse_args() -> argparse.Namespace:
                    help="SQLite store holding the research tables (default: data/historical.db).")
     p.add_argument("--max-windows", type=int, default=None,
                    help="Keep only the LAST N walk-forward windows (timing / pilot runs).")
+    p.add_argument("--gates-mode", choices=["observe", "enforce"], default=None,
+                   help="W67: observe = live parity (range floor + fractal veto recorded as "
+                        "would_reject:*, never block); enforce = they block. Default: "
+                        "config backtest.gates_mode.")
     return p.parse_args()
 
 
@@ -408,6 +425,7 @@ async def run_backtest(args: argparse.Namespace) -> None:
         print("  History:    legacy loader (5-min resample / Yahoo), live tables")
 
     cfg = WalkForwardConfig(
+        gates_mode=args.gates_mode,
         max_windows=args.max_windows,
         history_start_date=_start,
         history_days=_hist_days,

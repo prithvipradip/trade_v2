@@ -390,6 +390,31 @@ class BacktestConfig(_StrictModel):
     optimize_min_trades: int = Field(default=10, ge=1, le=100,
         description="Min trade count for full objective score. "
                     "Trials below this are penalised quadratically; < 3 trades always scores −100.")
+    optimize_hard_min_trades: int = Field(default=3, ge=1, le=50,
+        description="W67: below this many trades a trial is scored on the graded floor "
+                    "(-100 + optimize_below_floor_gradient x n/hard_min), not the old flat -100 "
+                    "that left TPE nothing to climb (28 of 30 W65 studies never left it).")
+    optimize_below_floor_gradient: float = Field(default=20.0, ge=0.0, le=90.0,
+        description="W67: points the below-floor score rises from -100 (0 trades) toward "
+                    "-100 + this value (hard_min_trades - 1 trades), so trading beats not "
+                    "trading. 0 restores the flat -100.")
+    gates_mode: str = Field(default="observe", pattern="^(observe|enforce)$",
+        description="W67: research ML-gate mode. observe = live parity today "
+                    "(ml.entry_gates_enabled=false: the range-model floor and fractal veto are "
+                    "computed and recorded as would_reject:* but never block); enforce = the "
+                    "research engine's historical behaviour (they block). The gate study "
+                    "(scripts/gate_study.py) compares the two on the same days.")
+    fractal_veto_spread: float = Field(default=0.0, ge=0.0, le=1.0,
+        description="W67: absolute hurst_scale_spread above which neutral credit structures "
+                    "are vetoed (0 = veto off, live parity). Replaces the research-only "
+                    "max(hurst_regime_threshold, 0.20) x multiplier that the OOS run, the "
+                    "optimizer trials and the meta-label shadow run applied inconsistently. "
+                    "Shared with the live orchestrator via ait.ml.regime_gate.")
+    penalty_on_range_prob: float = Field(default=0.0, ge=0.0, le=0.5,
+        description="W67: P(in range) is lowered by this x min(spread/threshold, 3) when the "
+                    "fractal regime is chaotic (0 = untouched, live parity). Condors are "
+                    "gated on the range probability, not on direction, so this is the "
+                    "penalty that can actually reach their entry statistic.")
     # Intraday execution params (Fix 1 / Gap H)
     scan_interval_minutes: int = Field(default=60, ge=5, le=240,
         description="How often (minutes) to scan for entry signals within a trading session.")

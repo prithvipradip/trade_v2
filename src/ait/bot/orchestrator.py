@@ -2170,10 +2170,30 @@ class TradingOrchestrator:
         # from the pre-ML features_df (they are NOT intraday-only features).
         hurst_scale_spread = float(features_df.iloc[-1].get("hurst_scale_spread", 0.0)) if not features_df.empty else 0.0
         multifractal_width = float(features_df.iloc[-1].get("multifractal_width", 0.0)) if not features_df.empty else 0.0
+        # W67: the rule itself lives in ait.ml.regime_gate (ONE implementation shared
+        # with the research engine). Today's behaviour is unchanged: the flat penalty
+        # off the DIRECTIONAL confidence. The veto cutoff and the range-probability
+        # penalty default to 0 (off) and, like every ML gate here, only ACT when
+        # ml.entry_gates_enabled (see the range override and the veto filter below).
+        from ait.ml.regime_gate import (
+            SHAPE_LIVE_FLAT,
+            apply_range_prob_delta,
+            FractalGateConfig,
+            fractal_gate,
+            resolve_veto_spread,
+        )
         bc = self._settings.backtest
-        if (hurst_scale_spread > bc.hurst_regime_threshold
-                or multifractal_width > bc.multifractal_max_width):
-            penalty = bc.hurst_regime_penalty
+        _fractal_verdict = fractal_gate(
+            hurst_scale_spread, multifractal_width,
+            FractalGateConfig(
+                threshold=bc.hurst_regime_threshold, penalty=bc.hurst_regime_penalty,
+                multifractal_max_width=bc.multifractal_max_width,
+                veto_spread=resolve_veto_spread(
+                    bc.hurst_regime_threshold, None, bc.fractal_veto_spread),
+                penalty_on_range_prob=bc.penalty_on_range_prob,
+                shape=SHAPE_LIVE_FLAT))
+        if _fractal_verdict.triggered:
+            penalty = _fractal_verdict.directional_penalty
             final_confidence = max(0.0, final_confidence - penalty)
             log.debug(
                 "fractal_penalty_applied",
@@ -2395,7 +2415,9 @@ class TradingOrchestrator:
                             # model_overridden from the SAME set. A drift here
                             # silently breaks that agreement.
                             if s.strategy_name in RANGE_GATED_STRATEGIES:
-                                s.confidence = range_pred.probability_in_range
+                                # W67: fractal penalty on P(in range); 0 by default.
+                                s.confidence = apply_range_prob_delta(
+                                    range_pred.probability_in_range, _fractal_verdict)
                                 model_overridden.add(s.strategy_name)
 
             # W10 (R24): stash the prediction — INCLUDING its absence — so
@@ -2412,6 +2434,20 @@ class TradingOrchestrator:
                 _rp[symbol] = range_pred
             except Exception:  # noqa: BLE001 — telemetry must never block a scan
                 pass
+
+            # W67: fractal hard veto for the range-gated (neutral) structures. Cutoff 0 =
+            # off (default), and like the range override above it only acts when the ML
+            # gates are enabled -- observe mode logs the verdict, never vetoes.
+            if _fractal_verdict.veto:
+                _vetoed = [s for s in signals if s.strategy_name in RANGE_GATED_STRATEGIES]
+                if _vetoed and self._settings.ml.entry_gates_enabled:
+                    signals = [s for s in signals
+                               if s.strategy_name not in RANGE_GATED_STRATEGIES]
+                log.info("fractal_veto_" + ("applied" if self._settings.ml.entry_gates_enabled
+                                            else "observed"),
+                         symbol=symbol, hurst_scale_spread=f"{hurst_scale_spread:.3f}",
+                         veto_spread=bc.fractal_veto_spread,
+                         would_block=sorted({s.strategy_name for s in _vetoed}))
 
             # fail-direction-02 (R22): ONE fail direction when the payoff-
             # matched gate has no evidence. Pre-fix, an unavailable range

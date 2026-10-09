@@ -18,6 +18,11 @@ class OptimizationResult:
     """Thin wrapper around a completed Optuna study."""
 
     study: optuna.Study
+    # W67: did the study find at least one trial that actually traded (>= hard_min_trades)?
+    # A study whose best trial is still on the graded below-floor score "optimized"
+    # nothing; callers must surface that instead of reporting its params as a result.
+    usable: bool = True
+    best_n_trades: int | None = None
 
     @property
     def best_params(self) -> dict:

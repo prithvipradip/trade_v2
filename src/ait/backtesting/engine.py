@@ -30,6 +30,7 @@ from ait.backtesting.result import BacktestResult
 # shared exit-policy module (pure, import-light) instead of a hand copy of
 # live portfolio.py — a live tuning can no longer silently de-sync research.
 from ait.execution import exit_policy
+from ait.ml.regime_gate import apply_range_prob_delta, fractal_gate
 from ait.strategies.base import CREDIT_STRATEGIES, SignalDirection
 from ait.utils.logging import get_logger
 from ait.config.runtime_env import contract_flag, contract_float  # R19: ONE authority for env-contract defaults
@@ -127,6 +128,19 @@ class Backtester:
         friction_entry_capture: float = 1.0,   # share of the quoted half-spread paid at entry
         friction_exit_capture: float = 1.0,    # ... and at exit (1.0 = full, conservative)
         friction_stress_multiplier: float = 1.0,  # scales the model (calm-sample hedge/sweeps)
+        # W67 gate parity. gates_mode "enforce" (bare default, the engine's historical
+        # behaviour) blocks entries on the range-model floor and the fractal hard veto;
+        # "observe" mirrors live today (ml.entry_gates_enabled=false): both are still
+        # COMPUTED and recorded (entry decision + `would_reject:*` funnel counters) but
+        # never block. The research entry points resolve it from backtest.gates_mode.
+        gates_mode: str = "enforce",
+        # Absolute fractal hard-veto cutoff (0 = off). None = derive from the legacy
+        # hurst_hard_veto_multiplier (max(threshold, 0.20) * multiplier) so explicit
+        # callers keep their exact behaviour. See ait.ml.regime_gate.
+        fractal_veto_spread: float | None = None,
+        # Share of the fractal penalty that ALSO lowers the range model's P(in range)
+        # before the range floor (0 = live parity: the range probability is untouched).
+        penalty_on_range_prob: float = 0.0,
         stop_loss_pct: float = 0.50,
         profit_target_pct: float = 1.00,
         max_hold_days: int = 30,
@@ -359,6 +373,18 @@ class Backtester:
         self._hurst_regime_penalty = hurst_regime_penalty
         self._hurst_hard_veto_multiplier = hurst_hard_veto_multiplier
         self._multifractal_max_width = multifractal_max_width
+        if gates_mode not in ("observe", "enforce"):
+            raise ValueError(f"gates_mode must be 'observe' or 'enforce', got {gates_mode!r}")
+        self._gates_mode = gates_mode
+        # W67: the shared fractal gate (ait.ml.regime_gate) replaces the inline copy.
+        from ait.ml.regime_gate import SHAPE_PROPORTIONAL, FractalGateConfig, resolve_veto_spread
+        self._fractal_cfg = FractalGateConfig(
+            threshold=float(hurst_regime_threshold), penalty=float(hurst_regime_penalty),
+            multifractal_max_width=float(multifractal_max_width),
+            veto_spread=resolve_veto_spread(
+                hurst_regime_threshold, hurst_hard_veto_multiplier, fractal_veto_spread),
+            penalty_on_range_prob=float(penalty_on_range_prob),
+            shape=SHAPE_PROPORTIONAL)  # the engine's historical shape; live uses live_flat
         self._iv_rank_rise_threshold = iv_rank_rise_threshold
         self._pct_from_60d_high_threshold = pct_from_60d_high_threshold
         self._min_edge_over_baseline = min_edge_over_baseline
@@ -567,6 +593,14 @@ class Backtester:
         counts here; `BacktestResult.entry_funnel` carries the totals."""
         self._funnel[reason] += 1
 
+    def _would_reject(self, reason: str) -> None:
+        """W67: observe mode -- the gate WOULD have rejected this day but did not.
+
+        Counted apart from `_reject` (prefix `would_reject:`) so the conservation
+        invariant `days_evaluated == entries_taken + sum(top-level rejections)` still
+        holds, and so the gate study can see exactly which days an enforced gate drops."""
+        self._funnel[f"would_reject:{reason}"] += 1
+
     def run(self) -> BacktestResult:
         """Execute the backtest and return results."""
         self._funnel = Counter()
@@ -677,41 +711,41 @@ class Backtester:
 
             # Apply fractal regime gate to confidence for credit strategies.
             # Features are already computed inside _get_direction — reuse them.
+            # W67: ONE implementation shared with the live orchestrator
+            # (ait.ml.regime_gate.fractal_gate); this site only applies the verdict.
+            _fractal_verdict = None
             if not features_df.empty:
                 last_f = features_df.iloc[-1]
                 spread = float(last_f.get("hurst_scale_spread", 0.0))
                 mf_w   = float(last_f.get("multifractal_width",  0.0))
-                _hurst_pass = spread <= self._hurst_regime_threshold or self._hurst_regime_threshold <= 0
+                _fractal_verdict = fractal_gate(spread, mf_w, self._fractal_cfg)
                 _entry_decision["fractal_gate"] = {
                     "hurst_spread": round(spread, 4),
+                    "multifractal_width": round(mf_w, 4),
                     "threshold": self._hurst_regime_threshold,
-                    "pass": _hurst_pass,
+                    "pass": not _fractal_verdict.over_spread,
                 }
-                if spread > self._hurst_regime_threshold and self._hurst_regime_threshold > 0:
-                    # Hard veto is optional: it only applies when multiplier > 0.
-                    # Exp 20 post-mortem showed QQQ hurst_spread rarely drops below
-                    # ~0.43 in normal conditions; overly tight thresholds can block all entries.
-                    _neutral_strat = bool(set(self._strategies) & set(NEUTRAL_CREDIT_GATED))
-                    _veto_base = max(self._hurst_regime_threshold, 0.20)
-                    _hard_veto_threshold = _veto_base * self._hurst_hard_veto_multiplier
-                    if _neutral_strat and self._hurst_hard_veto_multiplier > 0 and spread > _hard_veto_threshold:
-                        _entry_decision["fractal_gate"]["hard_veto"] = True
-                        log.debug(
-                            "hard_veto_fired",
-                            component="backtesting.engine",
-                            strategies=self._strategies,
-                            hurst_spread=round(spread, 4),
-                            hard_veto_threshold=round(_hard_veto_threshold, 4),
-                            hurst_regime_threshold=round(self._hurst_regime_threshold, 4),
-                        )
+                # Hard veto is optional (veto_spread 0 = off) and only binds the
+                # neutral credit structures. Exp 20 post-mortem showed QQQ
+                # hurst_spread rarely drops below ~0.43 in normal conditions;
+                # overly tight thresholds can block all entries.
+                _neutral_strat = bool(set(self._strategies) & set(NEUTRAL_CREDIT_GATED))
+                if _fractal_verdict.veto and _neutral_strat:
+                    _entry_decision["fractal_gate"]["hard_veto"] = True
+                    log.debug(
+                        "hard_veto_fired",
+                        component="backtesting.engine",
+                        strategies=self._strategies,
+                        hurst_spread=round(spread, 4),
+                        hard_veto_threshold=round(self._fractal_cfg.veto_spread, 4),
+                        hurst_regime_threshold=round(self._hurst_regime_threshold, 4),
+                        gates_mode=self._gates_mode,
+                    )
+                    if self._gates_mode == "enforce":
                         self._reject("hurst_hard_veto")
                         continue
-                    penalty = self._hurst_regime_penalty * (
-                        spread / self._hurst_regime_threshold
-                    )
-                    confidence = max(0.0, confidence - penalty)
-                if mf_w > 0 and mf_w > self._multifractal_max_width:
-                    confidence = max(0.0, confidence - self._hurst_regime_penalty)
+                    self._would_reject("hurst_hard_veto")
+                confidence = max(0.0, confidence - _fractal_verdict.directional_penalty)
 
             effective_min_conf = self._min_confidence
 
@@ -878,9 +912,12 @@ class Backtester:
                             date=str(today_date),
                             strategy=strategy,
                             threshold=self._range_min_confidence,
+                            gates_mode=self._gates_mode,
                         )
-                        self._reject("range_gate_no_predictor")
-                        continue
+                        if self._gates_mode == "enforce":
+                            self._reject("range_gate_no_predictor")
+                            continue
+                        self._would_reject("range_gate_no_predictor")
                 else:
                     try:
                         rp = self._range_predictor.predict(
@@ -889,15 +926,29 @@ class Backtester:
                             market_context=self._market_context,
                             min_edge_override=self._min_edge_over_baseline,
                         )
-                        if rp is None or rp.probability_in_range < self._range_min_confidence:
-                            self._reject("range_gate_below_threshold")
-                            continue  # bad range setup → skip
-                        _entry_decision["range_gate"] = {
-                            "prob": round(float(rp.probability_in_range), 4),
-                            "threshold": self._range_min_confidence,
-                            "pass": True,
-                        }
-                        confidence = rp.probability_in_range
+                        # W67: the fractal penalty may also lower P(in range) (default 0
+                        # = off, live parity); the raw model output is recorded beside it.
+                        _p_range = (None if rp is None else float(rp.probability_in_range))
+                        if _p_range is not None and _fractal_verdict is not None:
+                            _p_range = apply_range_prob_delta(_p_range, _fractal_verdict)
+                        if _p_range is None or _p_range < self._range_min_confidence:
+                            if self._gates_mode == "enforce":
+                                self._reject("range_gate_below_threshold")
+                                continue  # bad range setup → skip
+                            self._would_reject("range_gate_below_threshold")
+                            _entry_decision["range_gate"] = {
+                                "prob": None if _p_range is None else round(_p_range, 4),
+                                "threshold": self._range_min_confidence, "pass": False}
+                        else:
+                            _entry_decision["range_gate"] = {
+                                "prob": round(_p_range, 4),
+                                "threshold": self._range_min_confidence,
+                                "pass": True,
+                            }
+                        if rp is not None:
+                            _entry_decision["range_gate"]["raw_prob"] = round(
+                                float(rp.probability_in_range), 4)
+                            confidence = _p_range
                     except Exception:
                         pass
 

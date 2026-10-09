@@ -14769,3 +14769,73 @@ no-usable-trial reporting), calibration protocol; NO new multi-hour optimized ru
 alignment; whether to keep trading a construction that is negative at zero friction in research; executor attribution gap; retrain/restart timing for the IB-first flip; Telegram token rotation.
 
 ---
+
+## 2026-10-10 - W67: one fractal regime gate shared by live and research, gates_mode parity, graded optimizer objective, entry-day gate study
+
+**WHY.** Reading the gate layer for W66's "NEXT" showed research and live were not comparable, and the optimizer could not learn: (1) live runs in OBSERVE mode
+(`ml.entry_gates_enabled: false`): the range model and the Hurst penalty gate nothing live (the live penalty only lowers the DIRECTIONAL confidence, which a condor never
+uses; observe mode substitutes `ml.observe_mode_neutral_confidence`), while research enforced the 0.65 range gate; (2) the Hurst veto was applied inconsistently INSIDE research:
+the OOS run had it off (`hurst_hard_veto_multiplier` 0.0) but the optimizer's trial Backtester and the meta-label shadow Backtester never passed it, so they ran the bare engine default
+1.5 (veto ON at spread > 0.30, seen as `hard_veto_fired` in the W66 logs): Optuna optimized under a gate the OOS evaluation never applied; (3) the objective returned a flat -100 below 3
+trades (28 of 30 W65 studies, and every W66 pilot study, never left it); (4) a walk-forward run yields ~10-30 trades, too few to calibrate any gate cutoff. Operator decisions
+(2026-10-10): research defaults to live parity = observe mode, with enforce as an explicit arm; gate cutoffs are calibrated by an entry-day outcome study, not by Optuna. No live
+behaviour change: no restart, no retrain, no live config value touched; no market data / TWS used.
+
+**MEASURED.**
+- *Entry-day gate study* (`scripts/gate_study.py`, observe mode, friction v2, 40 overlapping hypothetical condors, capital scaled so the $5k construction is unchanged; monthly-block
+  bootstrap, 90% intervals; verdict rule fixed in the script before looking). NEUTRAL selector: n = 51 (SPY 2 / QQQ 15 / IWM 34), mean -$22/condor: no cutoff distinguishable. ANY-direction
+  selector: n = 436 (SPY 25 / QQQ 130 / IWM 281, 29 entry months), mean -$25.4/condor, win 41%, total -$11,055. By hurst_spread quartile: win 46.8 / 45.9 / 38.5 / 33.0%, mean P&L
+  -$19.3 / -$23.0 / -$28.2 / -$30.9. Veto-cutoff sweep, mean(kept) - mean(excluded): cutoff 0.169 +$8.3 [-1.4,16.9]; 0.241 +$10.0 [-0.6,19.8]; 0.310 +$8.8 [-3.6,20.3]; 0.400 +$11.2
+  [-3.0,22.9]; 0.619 +$17.8 [-6.8,31.6]. EVERY cutoff is "not distinguishable at this n" (intervals include 0; at 0.169 per-symbol signs also disagree). The direction is consistent (more
+  Hurst spread, worse outcome) but the best bucket (-$19/condor) is still negative: a veto would trim losses, it cannot create an edge. Macro gate blocks 222 of 675 days (33%) in that run.
+- *Observe vs enforce, plain walk-forward (6 windows, v2 friction, NEUTRAL selector)*: enforce 16 trades / -$261 / win 43.75% (identical to W66: the refactor is behaviour-preserving
+  there); observe 23 trades / -$401 / win 43.5% / PF 0.29. Observe would additionally have been rejected by the range gate on 22 (IWM), 22 (QQQ) and 52 (SPY) days; the 7 extra trades
+  net -$140 (-$20/trade, about the average trade): no evidence that the range gate adds value at this n (nor that it hurts).
+- *Pilot (2 windows x 3 symbols, 5 trials)*: 4 of 6 per-window studies now find a trading trial (every pilot study sat on the flat -100 in W66); the starved two (w1/SPY, w2/SPY) are named
+  in the summary ("OPTIMIZATION: 4 of 6 ... 2 NEVER did") and score -86.67 for 2 trades (graded), not -100. The three fractal dimensions are dropped from the search as inert.
+
+**WHAT CHANGED.**
+1. `src/ait/ml/regime_gate.py` (new): `FractalGateConfig`, `fractal_gate()`, `resolve_veto_spread()` (legacy multiplier alias: `max(threshold,0.20) x multiplier`), `apply_range_prob_delta()`.
+   Pure, no IO. Two penalty shapes keep each caller's historical behaviour bit-for-bit: `live_flat` (orchestrator) and `proportional` (engine). Proven against copies of the pre-W67 inline rules on a
+   405-point grid (x4 veto multipliers).
+2. `engine.py`: the inline fractal block now calls the shared function; new `gates_mode` ("enforce" bare default, "observe" = record `would_reject:*` and never block the range floor / range
+   no-predictor contract / fractal veto), `fractal_veto_spread` (0 = off; None derives from the legacy multiplier), `penalty_on_range_prob` (lowers P(in range) before the range floor; 0 = off).
+   `would_reject:*` counters sit beside the funnel (the conservation invariant ignores them). `orchestrator.py` (critical, confined): the fractal block calls the shared function (behaviour
+   identical today), the range override applies `range_prob_delta` (0), and a new veto filter drops range-gated structures ONLY when `ml.entry_gates_enabled` (otherwise logs `fractal_veto_observed`).
+3. One resolved gate configuration for all three engine constructions: `backtest.gates_mode` (config + code default `observe`), `fractal_veto_spread` 0.0, `penalty_on_range_prob` 0.0 resolved in
+   `WalkForwardConfig` and `StrategyOptimizer` and passed to the OOS Backtester, the shadow Backtester and the optimizer trial Backtester (closes finding 2); run_backtest parity manifest rows and
+   `--gates-mode` flag; AST guards (every walk-forward `Backtester(...)` passes the gate kwargs, the optimizer's bt_kwargs carries them, nobody outside `regime_gate.py` compares the fractal thresholds).
+4. `optimizer.py` / `results.py`: graded objective `-100 + gradient x n/hard_min` below the floor (`backtest.optimize_hard_min_trades` 3, `optimize_below_floor_gradient` 20; 0 restores flat),
+   `OptimizationResult.usable/best_n_trades`, WARNING `optuna_no_usable_trial` with the top rejection reasons stored per trial, inert fractal dimensions dropped for condor-only sets (extends the
+   W65 wing_k mechanism); `walkforward.py`: per-window study status aggregated into `WalkForwardResult.optimization_status` and a summary line; ENTRY FUNNEL prints observe-mode `would_reject:*`.
+   `WalkForwardConfig.optimize_min_trades` now resolves from config (was a literal 10, same value).
+5. `scripts/gate_study.py` (new): the entry-day outcome study, clustered bootstrap, fixed verdict rule.
+
+**TESTS.** `tests/test_w67_regime_gate.py`: 2,057 test items (the two 405-point grids parametrize to ~2,025; the logic is 33 test functions): oracle parity vs the old live and engine formulas, alias/explicit veto resolution,
+range-prob penalty off-by-default/scales/caps, observe-vs-enforce engine behaviour incl. conservation in both modes, defaults are live parity, resolve-once and class guards, orchestrator wiring (veto
+behind `entry_gates_enabled`), graded objective (monotone below the floor, unchanged above, config knobs, starved-trial attrs, usable flag, inert drop, summary line), gate-study statistics (recovers a planted
+effect, "not distinguishable" on noise, sign-disagreement blocks a pooled win, cluster bootstrap deterministic). Mutation-checked: `>=` in the gate, observe still blocking the veto, and the shadow Backtester
+missing `fractal_veto_spread` each fail the intended test. Updated 3 W65 tests (their `_dropped_params == {wing_k}` premise now pins `penalty_on_range_prob`). Fast lane 5074 passed / 45 skipped;
+slow `tests/test_optimizer.py` 39 passed; `typecheck.py` OK; `smoke_deploy.py` SMOKE PASS (13 checks).
+
+**DEVIATIONS.** (i) The shared function takes a penalty `shape` so live keeps its flat penalty and research its proportional one (the plan implied one shape). (ii) The gate study has no range-probability
+arm: it needs a per-window trained range predictor (look-ahead-safe) and was registered rather than approximated. (iii) New knobs live in `backtest.*` (where `optimize_min_trades` already was), not an `optimizer.*`
+section. (iv) Study capital is scaled x40 with the budget fraction divided by 40 to keep the construction identical under overlapping slots. (v) `--gates-mode` CLI flag added to run_backtest.
+
+**CAVEATS.** Overlapping hypothetical condors are a research device, not a portfolio simulation (autocorrelated; hence the monthly-block bootstrap). Span is 2024-2026 (macro-calendar CSV) = 29 entry months.
+The study measures THIS research model (BS flat-IV, daily bars) which is negative at zero friction (W66): gate calibration cannot rescue a construction without edge. Observe-mode default lowers research
+selectivity relative to W65/W66 numbers (enforce arm retained via `--gates-mode enforce`; reproduces W66 exactly).
+
+**REGISTERED, NOT FIXED.** (1) Range-probability arm of the gate study (per-window predictor). (2) Whether to flip `ml.entry_gates_enabled`: the observe/enforce comparison shows no measurable benefit at n = 16-23,
+so the pre-registered flip criterion is NOT met; no change proposed. (3) IV floor tests IV LEVEL 0.15 in research vs IV RANK 15 live (`builder:iv_floor` is the top builder blocker: SPY 105 days). (4) Macro gate
+blocks 33% of days. (5) `condor_any_direction` decision (live-like selector: n up 8x, mean still -$25/condor). (6) Executor attribution gap (31 executions rows without trade_id). (7) Credit put/call spreads are
+shadow arms only. (8) The negative-at-zero-friction construction itself ($2 wings, 1 contract): the strategy question is the operator's.
+
+**REPRODUCE.** `python scripts/gate_study.py [--any-direction] [--n-boot 2000]` (~2 min each, writes `reports/gate_study_<date>_<neutral|anydir>.csv`);
+`python run_backtest.py --symbols SPY QQQ IWM --strategies iron_condor [--gates-mode enforce]` (~13 min); pilot: add `--optimize-per-window --optimize-n-trials 5 --max-windows 2`.
+
+**NEXT.** Operator decisions (not code): the strategy/construction question (8), `condor_any_direction` (5), IV level-vs-rank alignment (3). Candidate W68 items once decided: the range-probability study arm (1), a
+construction study (wing width / contracts / DTE at the real friction) since gates cannot rescue a negative base, and a longer macro-calendar export to lengthen the span. No new multi-hour optimized run is
+proposed until the construction question is settled.
+
+---
