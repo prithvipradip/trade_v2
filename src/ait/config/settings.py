@@ -283,6 +283,30 @@ class BacktestConfig(_StrictModel):
     macro_event_types: list[str] = Field(default=["FOMC", "CPI", "NFP", "PCE", "GDP"],
         description="W65: which release types the RESEARCH macro-event gate blocks around "
                     "(default = the five the live gate uses). Subset of FOMC, CPI, NFP, GDP, PCE.")
+    condor_any_direction: bool = Field(default=False,
+        description="W66: research selects an iron-condor-only strategy set on ANY market "
+                    "direction, like live (live's IronCondor ignores market_direction; the "
+                    "engine only selected it on NEUTRAL days, ~81% of days removed on the "
+                    "2024-2026 span). False keeps the legacy NEUTRAL-only rule (default, so "
+                    "existing results do not move); a candidate for the operator to flip.")
+    friction_model: str = Field(default="per_leg_usd", pattern="^(legacy|per_leg_usd)$",
+        description="W66: research option-friction model for iron condors. per_leg_usd = the "
+                    "fitted per-leg DOLLAR half-spread (option_leg_spread_params, from IB BID/ASK "
+                    "bars) paid on all four legs at entry AND exit; legacy = half_spread_pct x "
+                    "leg mid at entry and the same % on the net value at exit, which overcharged "
+                    "a $0.95-credit QQQ condor $0.669 vs ~$0.085 measured (W65). A symbol with "
+                    "no fitted model falls back to legacy with a WARNING.")
+    friction_entry_capture: float = Field(default=1.0, ge=0.0, le=2.0,
+        description="W66: share of the quoted half-spread paid per leg at ENTRY (1.0 = cross "
+                    "the full half-spread, conservative; real limit fills at/inside the mid "
+                    "capture less). Tune downward only from the fill-vs-model report.")
+    friction_exit_capture: float = Field(default=1.0, ge=0.0, le=2.0,
+        description="W66: share of the quoted half-spread paid per leg at EXIT (same "
+                    "convention as friction_entry_capture).")
+    friction_stress_multiplier: float = Field(default=1.0, ge=0.0, le=5.0,
+        description="W66: multiplies the fitted model. The sample is calm-regime (IB serves "
+                    "no expired-option history); raise it to stress-test, or sweep it with "
+                    "scripts/friction_sensitivity.py.")
     budget_aware_wings: bool = Field(default=True,
         description="W64: the walk-forward/optimizer condor builder caps the wing to "
                     "the per-trade budget exactly like live (IronCondor.affordable_"

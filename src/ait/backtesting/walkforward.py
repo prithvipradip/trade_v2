@@ -70,6 +70,12 @@ class WalkForwardConfig:
     # None -> config (backtest.budget_aware_wings / positions.max_contracts_per_trade).
     budget_aware_wings: bool | None = None
     max_contracts_per_trade: int | None = None
+    condor_any_direction: bool | None = None   # W66: None -> backtest.condor_any_direction
+    # W66 friction model v2: None -> backtest.friction_* (see BacktestConfig)
+    friction_model: str | None = None
+    friction_entry_capture: float | None = None
+    friction_exit_capture: float | None = None
+    friction_stress_multiplier: float | None = None
     # W65 research-history knobs (None = legacy behaviour; the research entry points
     # resolve them from config.yaml backtest.* and pass them explicitly).
     history_start_date: "date | None" = None   # trim data + start windows here
@@ -264,6 +270,20 @@ class WalkForwardConfig:
         self.budget_aware_wings = bool(resolve_config_value(
             self.budget_aware_wings, "backtest", "budget_aware_wings",
             BacktestConfig, _settings))
+        self.condor_any_direction = bool(resolve_config_value(
+            self.condor_any_direction, "backtest", "condor_any_direction",
+            BacktestConfig, _settings))
+        self.friction_model = str(resolve_config_value(
+            self.friction_model, "backtest", "friction_model", BacktestConfig, _settings))
+        self.friction_entry_capture = float(resolve_config_value(
+            self.friction_entry_capture, "backtest", "friction_entry_capture",
+            BacktestConfig, _settings))
+        self.friction_exit_capture = float(resolve_config_value(
+            self.friction_exit_capture, "backtest", "friction_exit_capture",
+            BacktestConfig, _settings))
+        self.friction_stress_multiplier = float(resolve_config_value(
+            self.friction_stress_multiplier, "backtest", "friction_stress_multiplier",
+            BacktestConfig, _settings))
         self.range_min_confidence = float(resolve_config_value(
             self.range_min_confidence, "ml", "range_min_confidence", MLConfig, _settings))
         self.iv_floor = float(resolve_config_value(
@@ -343,6 +363,8 @@ class WalkForwardResult:
     # labelled "gates only / ML-free" that ran WITH a trained meta gate is a
     # mislabeled study (the R16 #4 failure mode through the third model).
     meta_training_status: dict = field(default_factory=dict)
+    # W66: {symbol: {reason: days}} summed over every window (zero-trade windows included)
+    entry_funnel: dict = field(default_factory=dict)
 
     @property
     def total_trades(self) -> int:
@@ -637,6 +659,22 @@ class WalkForwardResult:
                     f"trades={result.total_trades:3d} | sharpe={result.sharpe_ratio:.2f}"
                 )
 
+        if self.entry_funnel:
+            lines.append("  ENTRY FUNNEL (days, summed over windows; why entries did not happen):")
+            for sym in sorted(self.entry_funnel):
+                f = self.entry_funnel[sym]
+                days, taken = f.get("days_evaluated", 0), f.get("entries_taken", 0)
+                top = sorted(((k, v) for k, v in f.items()
+                              if k not in ("days_evaluated", "entries_taken")
+                              and not k.startswith("builder:")), key=lambda kv: -kv[1])
+                det = sorted(((k[8:], v) for k, v in f.items() if k.startswith("builder:")),
+                             key=lambda kv: -kv[1])
+                lines.append(f"    {sym:6s} days={days} taken={taken} | " +
+                             ", ".join(f"{k}={v}" for k, v in top[:6]))
+                if det:
+                    lines.append("           builder detail: " +
+                                 ", ".join(f"{k}={v}" for k, v in det[:5]))
+
         lines.append("=" * 60)
         return "\n".join(lines)
 
@@ -912,7 +950,7 @@ def _window_task_mp(args: tuple) -> tuple:
         prev_oos=None,
         pretrained_range=pretrained_range,
     )
-    return window_id, wr, best_params, meta_status
+    return window_id, wr, best_params, meta_status, bt._funnel_by_window.get(window_id, {})
 
 
 class WalkForwardBacktester:
@@ -948,6 +986,10 @@ class WalkForwardBacktester:
         # W65: set by _check_vlmc_coverage() once the data span is known. True keeps
         # the legacy behaviour (a db_path means "use the intraday store").
         self._vlmc_enabled = True
+        # W66: {window_id: {symbol: entry_funnel}} — kept for EVERY window, including the
+        # zero-trade windows whose WindowResult is None (they are exactly where the
+        # funnel explains the emptiness).
+        self._funnel_by_window: dict[int, dict[str, dict[str, int]]] = {}
         # W65: research macro calendar (built in run() when macro_event_types is set).
         self._research_calendar = None
         self._progress_dir = Path(progress_dir) if progress_dir else None
@@ -1086,7 +1128,8 @@ class WalkForwardBacktester:
             with ProcessPoolExecutor(max_workers=self._config.optimize_n_jobs) as executor:
                 mp_results = list(executor.map(_window_task_mp, args_list))
 
-            for _wid, wr, curr_best_params, _meta_status in sorted(mp_results, key=lambda x: x[0]):
+            for _wid, wr, curr_best_params, _meta_status, _fun in sorted(mp_results, key=lambda x: x[0]):
+                self._funnel_by_window[_wid] = _fun
                 # R20b review follow-up: merge the per-symbol meta-labeler
                 # status independently of whether the window produced trades
                 # — a zero-trade parallel window (wr is None) is precisely
@@ -1163,6 +1206,7 @@ class WalkForwardBacktester:
             config=self._config,
             range_training_status=dict(self._range_status_by_window),
             meta_training_status=_meta_status_all,
+            entry_funnel=self._aggregate_funnel(),
         )
 
         # Compute per-symbol results
@@ -1507,6 +1551,11 @@ class WalkForwardBacktester:
                 position_size_pct=effective_position_size,
                 budget_aware_wings=window_cfg.budget_aware_wings,
                 max_contracts_per_trade=window_cfg.max_contracts_per_trade,
+                condor_any_direction=window_cfg.condor_any_direction,
+                friction_model=window_cfg.friction_model,
+                friction_entry_capture=window_cfg.friction_entry_capture,
+                friction_exit_capture=window_cfg.friction_exit_capture,
+                friction_stress_multiplier=window_cfg.friction_stress_multiplier,
                 economic_calendar=self._research_calendar,
                 stop_loss_pct=window_cfg.stop_loss_pct,
                 profit_target_pct=window_cfg.profit_target_pct,
@@ -1569,6 +1618,7 @@ class WalkForwardBacktester:
                 settings=self._settings,
             )
             result = bt.run()
+            self._funnel_by_window.setdefault(window_id, {})[symbol] = dict(result.entry_funnel)
 
             # Evaluate range predictor on OOS data — calibration bins + Brier/AUROC
             # per model (train/test generalisation gap visible in the dashboard).
@@ -1862,6 +1912,11 @@ class WalkForwardBacktester:
                     position_size_pct=self._config.position_size_pct,
                     budget_aware_wings=self._config.budget_aware_wings,
                     max_contracts_per_trade=self._config.max_contracts_per_trade,
+                    condor_any_direction=self._config.condor_any_direction,
+                    friction_model=self._config.friction_model,
+                    friction_entry_capture=self._config.friction_entry_capture,
+                    friction_exit_capture=self._config.friction_exit_capture,
+                    friction_stress_multiplier=self._config.friction_stress_multiplier,
                     economic_calendar=self._research_calendar,
                     wing_floor_dollars=self._config.wing_floor_dollars,
                     wing_k=self._config.wing_k,
@@ -2628,6 +2683,12 @@ class WalkForwardBacktester:
 
             shadow_bt = Backtester(
                 data=train_with_ctx,
+                # W66: the shadow labeller was built WITHOUT a symbol, so it silently priced
+                # trades with the config spread formula and a 1.10 vol multiplier while the
+                # OOS run used the symbol's calibrated spreads / friction model v2 / vol
+                # multiplier -- meta-labels learned from a different cost model than the
+                # one they gate. Same symbol as the OOS Backtester now.
+                symbol=symbol,
                 context_bars=0,
                 strategies=["iron_condor"],  # meta-labeler targets the primary strategy
                 initial_capital=window_cfg.initial_capital,
@@ -2636,6 +2697,11 @@ class WalkForwardBacktester:
                 position_size_pct=window_cfg.position_size_pct,
                 budget_aware_wings=window_cfg.budget_aware_wings,
                 max_contracts_per_trade=window_cfg.max_contracts_per_trade,
+                condor_any_direction=window_cfg.condor_any_direction,
+                friction_model=window_cfg.friction_model,
+                friction_entry_capture=window_cfg.friction_entry_capture,
+                friction_exit_capture=window_cfg.friction_exit_capture,
+                friction_stress_multiplier=window_cfg.friction_stress_multiplier,
                 economic_calendar=self._research_calendar,
                 stop_loss_pct=window_cfg.stop_loss_pct,
                 profit_target_pct=window_cfg.profit_target_pct,
@@ -2783,6 +2849,16 @@ class WalkForwardBacktester:
         log.info("research_macro_calendar", event_types=list(cfg.macro_event_types),
                  span=span[:2], rows=span[2])
         return trimmed
+
+    def _aggregate_funnel(self) -> dict[str, dict[str, int]]:
+        """W66: sum the per-window entry funnels into {symbol: {reason: days}}."""
+        total: dict[str, dict[str, int]] = {}
+        for per_symbol in self._funnel_by_window.values():
+            for sym, funnel in per_symbol.items():
+                acc = total.setdefault(sym, {})
+                for reason, n in funnel.items():
+                    acc[reason] = acc.get(reason, 0) + int(n)
+        return total
 
     def _limit_windows(self, windows: list) -> list:
         """W65: keep only the most recent `max_windows` windows (timing/pilot runs)."""

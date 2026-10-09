@@ -146,6 +146,7 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
     live = {
         "per_trade_budget_pct": live_budget_pct,
         "budget_aware_wings": True,   # live caps the wing to the budget (iron_condor.py)
+        "condor_any_direction": True,  # live IronCondor ignores market_direction (iron_condor.py)
         "max_contracts_per_trade": live_max_contracts,
         "wing_k":            float(env.get("AIT_IC_WING_K", "1.0")),
         "range_min_confidence": (settings.ml.range_min_confidence
@@ -175,6 +176,8 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
     backtest = {
         "per_trade_budget_pct": bt_budget_pct,
         "budget_aware_wings": bt_wings,
+        "condor_any_direction": bool(_rcv(None, "backtest", "condor_any_direction", _BTC, settings)),
+        "friction_model": str(_rcv(None, "backtest", "friction_model", _BTC, settings)),
         "max_contracts_per_trade": bt_max_contracts,
         "wing_k":            resolved_wing_k,
         "range_min_confidence": resolved_range_confidence,
@@ -234,6 +237,9 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
         f"({live_dte[0]}) inside the live dte_range {live_dte}; the hold is "
         "capped separately by max_hold_days (entry_dte/hold-cap decoupled "
         "2026-08-24).",
+        "friction_model (backtest column only, no live counterpart: live pays real "
+        "fills) selects the research transaction-cost model; see "
+        "scripts/fill_vs_model_report.py for the forward check against real fills.",
         "credit exits: flat loss limit + DTE-laddered TP + DTE<=5 close "
         "(mirrors portfolio.py); trailing/breakeven applies to DEBIT only.",
         "the 'live' column is resolved from ait.config.runtime_env (the env "

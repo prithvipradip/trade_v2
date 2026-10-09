@@ -39,6 +39,7 @@ SOURCE_YAHOO_UNADJ = "YAHOO_UNADJ"          # Yahoo daily bars, auto_adjust=Fals
 SOURCE_IB_OPTION_IV = "IB_OPTION_IV"        # IB OPTION_IMPLIED_VOLATILITY daily close/OHLC
 SOURCE_UNRECORDED = "UNRECORDED"            # label used when READING NULL source rows
 SOURCE_INVESTING_CSV = "INVESTING_CSV"      # operator-compiled Investing.com economic calendar CSV
+SOURCE_IB_BID_ASK_BARS = "IB_BID_ASK_BARS"  # W66: IB hourly BID+ASK bars of listed options
 
 # Historical risk-free-rate follow-up: the SOFR term structure's tenor
 # points in days-to-maturity, in the SAME order get_risk_free_rate's SELECT
@@ -94,6 +95,12 @@ class HistoricalDataStore:
         self._intraday_iv_table = f"{table_prefix}intraday_iv"
         self._spread_samples_table = f"{table_prefix}option_spread_samples"
         self._spread_params_table = f"{table_prefix}option_spread_params"
+        # W66: per-leg DOLLAR half-spread samples (hourly IB BID/ASK bars) and the fitted
+        # friction model v2. Separate tables, not columns on option_spread_samples: that
+        # table's PK (symbol, sample_date, right, strike, dte) holds ONE snapshot per day,
+        # an hourly sample would collide on it.
+        self._spread_bar_table = f"{table_prefix}option_spread_bar_samples"
+        self._leg_spread_params_table = f"{table_prefix}option_leg_spread_params"
         self._option_daily_bars_table = f"{table_prefix}option_daily_bars"
         self._risk_free_rates_table = f"{table_prefix}risk_free_rates"
         self._econ_events_table = f"{table_prefix}econ_events"
@@ -245,6 +252,40 @@ class HistoricalDataStore:
                     spread_cap            REAL    NOT NULL,
                     sample_count          INTEGER NOT NULL,
                     rmse                  REAL
+                )
+            """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._spread_bar_table} (
+                    symbol            TEXT NOT NULL,
+                    bar_time          TEXT NOT NULL,   -- ET, ISO, start of the hourly bar
+                    right             TEXT NOT NULL,
+                    strike            REAL NOT NULL,
+                    expiry            TEXT NOT NULL,
+                    dte               INTEGER NOT NULL,
+                    bid               REAL NOT NULL,
+                    ask               REAL NOT NULL,
+                    mid               REAL NOT NULL,
+                    half_spread_usd   REAL NOT NULL,
+                    underlying_price  REAL,
+                    delta             REAL,
+                    iv                REAL,
+                    role              TEXT,            -- 'short' | 'wing' (delta bucket vs wing strike)
+                    source            TEXT,
+                    PRIMARY KEY (symbol, bar_time, right, strike, expiry)
+                )
+            """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._leg_spread_params_table} (
+                    symbol        TEXT NOT NULL PRIMARY KEY,
+                    form          TEXT NOT NULL,
+                    a             REAL NOT NULL,
+                    b             REAL NOT NULL,
+                    n             INTEGER NOT NULL,
+                    n_sessions    INTEGER,
+                    cv_mae        REAL,
+                    cv_mae_json   TEXT,
+                    source        TEXT,
+                    calibrated_on TEXT NOT NULL
                 )
             """)
             # W58: historical per-contract EOD option bars (Polygon/Massive
@@ -961,6 +1002,66 @@ class HistoricalDataStore:
 
         log.debug("spread_samples_saved", symbol=symbol, rows=len(rows))
         return len(rows)
+
+    def save_spread_bar_samples(self, symbol: str, df: pd.DataFrame,
+                                source: str | None = None) -> int:
+        """W66: INSERT OR IGNORE hourly per-leg spread samples (dollars).
+
+        Columns: bar_time, right, strike, expiry, dte, bid, ask, underlying_price,
+        delta, iv, role. ``half_spread_usd`` and ``mid`` are derived here so every
+        stored row is internally consistent. Returns rows offered."""
+        if df is None or df.empty:
+            return 0
+        rows = []
+        for r in df.to_dict("records"):
+            bid, ask = float(r["bid"]), float(r["ask"])
+            rows.append((
+                symbol, str(r["bar_time"]), str(r["right"]), float(r["strike"]),
+                str(r["expiry"]), int(r["dte"]), bid, ask, (bid + ask) / 2.0,
+                (ask - bid) / 2.0,
+                None if r.get("underlying_price") is None else float(r["underlying_price"]),
+                None if r.get("delta") is None else float(r["delta"]),
+                None if r.get("iv") is None else float(r["iv"]),
+                r.get("role"), source,
+            ))
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                f"""INSERT OR IGNORE INTO {self._spread_bar_table}
+                   (symbol, bar_time, right, strike, expiry, dte, bid, ask, mid,
+                    half_spread_usd, underlying_price, delta, iv, role, source)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
+        return len(rows)
+
+    def load_spread_bar_samples(self, symbol: str) -> pd.DataFrame:
+        with sqlite3.connect(self._db_path) as conn:
+            return pd.read_sql_query(
+                f"SELECT * FROM {self._spread_bar_table} WHERE symbol = ? ORDER BY bar_time",
+                conn, params=(symbol,))
+
+    def save_leg_spread_model(self, symbol: str, row: dict) -> None:
+        """INSERT OR REPLACE the fitted friction model v2 for a symbol."""
+        import json
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                f"""INSERT OR REPLACE INTO {self._leg_spread_params_table}
+                   (symbol, form, a, b, n, n_sessions, cv_mae, cv_mae_json, source,
+                    calibrated_on) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (symbol, str(row["form"]), float(row["a"]), float(row["b"]), int(row["n"]),
+                 row.get("n_sessions"), row.get("cv_mae"),
+                 json.dumps(row.get("cv_mae_by_form") or {}), row.get("source"),
+                 str(row["calibrated_on"])))
+
+    def load_leg_spread_model(self, symbol: str) -> dict | None:
+        """Fitted friction model v2 for a symbol, or None if never calibrated."""
+        with sqlite3.connect(self._db_path) as conn:
+            r = conn.execute(
+                f"""SELECT form, a, b, n, n_sessions, cv_mae, source, calibrated_on
+                   FROM {self._leg_spread_params_table} WHERE symbol = ?""",
+                (symbol,)).fetchone()
+        if r is None:
+            return None
+        return {"form": r[0], "a": r[1], "b": r[2], "n": r[3], "n_sessions": r[4],
+                "cv_mae": r[5], "source": r[6], "calibrated_on": r[7]}
 
     def save_spread_params(self, symbol: str, params: dict) -> None:
         """INSERT OR REPLACE fitted spread model params for a symbol."""

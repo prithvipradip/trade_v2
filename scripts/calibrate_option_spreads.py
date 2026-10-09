@@ -13,6 +13,16 @@ Algorithm:
   6. Store fitted params in option_spread_params table.
   7. Optionally auto-write calibrated values into a YAML config file.
 
+W66 — friction model v2 (``--source ib-bars``): samples hourly IB BID and ASK bars of
+currently LISTED options (works with the market closed; expired contracts have no data),
+stores per-leg DOLLAR half-spreads in ``option_spread_bar_samples`` and fits the winning
+form (constant $/leg | % of mid | affine) by session-grouped CV into
+``option_leg_spread_params`` (read by the engine's ``friction_model="per_leg_usd"``):
+
+    python scripts/calibrate_option_spreads.py --source ib-bars --symbols SPY QQQ IWM \\
+        --dte-targets 10 21 35 --db-path data/historical.db --port 4002 --client-id 91
+    python scripts/calibrate_option_spreads.py --source ib-bars --fit-only --symbols SPY QQQ IWM
+
 Usage:
     # Collect data + fit + update YAML (yfinance, no IBKR needed):
     python scripts/calibrate_option_spreads.py \\
@@ -100,7 +110,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="DTE levels to sample (default: 7 14 21 30 45).",
     )
     parser.add_argument(
-        "--source", choices=["yfinance", "ibkr"], default="yfinance",
+        "--source", choices=["yfinance", "ibkr", "ib-bars"], default="yfinance",
         help="Market data source (default: yfinance — no subscription needed).",
     )
     parser.add_argument(
@@ -131,6 +141,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--update-config", metavar="PATH",
         help="YAML config file to auto-update with calibrated spread values.",
     )
+    parser.add_argument(
+        "--entry-window", default="10:00-15:30", metavar="HH:MM-HH:MM",
+        help="ib-bars: keep bars whose START falls in this ET window (default covers every "
+             "hourly bar overlapping the engine's 10:30-15:30 entry window).")
+    parser.add_argument(
+        "--bars-duration", default="30 D", metavar="DUR",
+        help="ib-bars: history length requested per contract (default: 30 D).")
+    parser.add_argument(
+        "--bars-pause-secs", type=float, default=10.8, metavar="SECS",
+        help="ib-bars: pause between historical requests; IB allows 60 per 10 min "
+             "(default 10.8 s keeps under it).")
+    parser.add_argument(
+        "--fit-only", action="store_true",
+        help="ib-bars: skip sampling and (re)fit from the stored bar samples.")
     parser.add_argument(
         "--dry-run", action="store_true",
         help="Print request plan without fetching or storing data.",
@@ -463,6 +487,150 @@ async def _calibrate_symbol_ibkr(
 
 
 # ---------------------------------------------------------------------------
+# W66: IB hourly BID/ASK bar sampler + friction model v2 fit
+# ---------------------------------------------------------------------------
+
+async def _sample_symbol_ib_bars(
+    ib, symbol: str, dte_targets: list[int], store, window, duration: str,
+    pause_secs: float, dry_run: bool,
+) -> int:
+    """Sample per-leg dollar half-spreads from IB hourly BID/ASK bars. Returns rows offered."""
+    from ib_insync import Option, Stock
+
+    from ait.data.historical import SOURCE_IB_BID_ASK_BARS
+    from ait.data.option_spread_sampler import (
+        bar_start_et,
+        delta_from_mid,
+        pair_bid_ask,
+        plan_strikes,
+    )
+
+    today = date.today()
+    und = Stock(symbol, "SMART", "USD")
+    q = await ib.qualifyContractsAsync(und)
+    if not q:
+        print(f"  [{symbol}] ERROR: could not qualify underlying")
+        return 0
+    und = q[0]
+
+    ubars = await ib.reqHistoricalDataAsync(
+        und, endDateTime="", durationStr=duration, barSizeSetting="1 hour",
+        whatToShow="TRADES", useRTH=True, formatDate=2)
+    uprice = {bar_start_et(b.date).isoformat(): float(b.close) for b in ubars}
+    if not uprice:
+        print(f"  [{symbol}] ERROR: no underlying hourly bars")
+        return 0
+    spot = float(ubars[-1].close)
+    iv0 = 0.20
+    try:
+        ivs = store.load_daily_iv(symbol, days=30)
+        if not ivs.empty and 0.01 < float(ivs.iloc[-1]) < 5.0:
+            iv0 = float(ivs.iloc[-1])
+    except Exception:
+        pass
+    print(f"  [{symbol}] spot={spot:.2f} assumed_iv={iv0:.3f} underlying_bars={len(ubars)}")
+
+    params = await ib.reqSecDefOptParamsAsync(und.symbol, "", und.secType, und.conId)
+    chosen = [p for p in params or [] if p.exchange == "SMART"] or list(params or [])
+    expirations = sorted({e for p in chosen for e in p.expirations})
+    strikes = sorted({float(k) for p in chosen for k in p.strikes})
+    exp_dates = [datetime.strptime(e, "%Y%m%d").date() for e in expirations]
+    exp_dates = [d for d in exp_dates if d > today]
+    if not exp_dates or not strikes:
+        print(f"  [{symbol}] no listed expiries/strikes")
+        return 0
+    # only strikes within +-12% of spot can be a condor leg
+    strikes = [k for k in strikes if abs(k / spot - 1.0) <= 0.12]
+
+    plan: list[tuple[date, str, float, str]] = []
+    for target in dte_targets:
+        exp = min(exp_dates, key=lambda d: abs((d - today).days - target))
+        for right in ("C", "P"):
+            for k, role in plan_strikes(spot, iv0, max((exp - today).days, 1), strikes, right):
+                plan.append((exp, right, k, role))
+    plan = list(dict.fromkeys(plan))
+    print(f"  [{symbol}] plan: {len(plan)} contracts x 2 bar requests "
+          f"(~{len(plan) * 2 * pause_secs / 60:.0f} min)")
+    if dry_run:
+        for exp, right, k, role in plan[:12]:
+            print(f"    {exp} {right}{k:g} ({role})")
+        return 0
+
+    total = 0
+    for n, (exp, right, k, role) in enumerate(plan, 1):
+        c = Option(symbol, exp.strftime("%Y%m%d"), k, right, "SMART")
+        try:
+            qc = await ib.qualifyContractsAsync(c)
+            if not qc:
+                continue
+            res = {}
+            for what in ("BID", "ASK"):
+                res[what] = await ib.reqHistoricalDataAsync(
+                    qc[0], endDateTime="", durationStr=duration, barSizeSetting="1 hour",
+                    whatToShow=what, useRTH=True, formatDate=2)
+                await asyncio.sleep(pause_secs)
+        except Exception as e:  # pacing violations etc.: back off and continue
+            print(f"    [{symbol}] {exp} {right}{k:g}: {type(e).__name__}: {e}")
+            await asyncio.sleep(60.0)
+            continue
+        paired = pair_bid_ask(res["BID"], res["ASK"], window)
+        if paired.empty:
+            continue
+        rows = []
+        for r in paired.to_dict("records"):
+            u = uprice.get(r["bar_time"])
+            dte = (exp - datetime.fromisoformat(r["bar_time"]).date()).days
+            delta = iv = None
+            if u:
+                delta, iv = delta_from_mid((r["bid"] + r["ask"]) / 2.0, u, k, dte, right)
+            rows.append({**r, "right": right, "strike": k, "expiry": exp.isoformat(),
+                         "dte": dte, "underlying_price": u, "delta": delta, "iv": iv,
+                         "role": role})
+        total += store.save_spread_bar_samples(symbol, pd.DataFrame(rows),
+                                               source=SOURCE_IB_BID_ASK_BARS)
+        if n % 10 == 0:
+            print(f"    [{symbol}] {n}/{len(plan)} contracts, {total} samples so far")
+    print(f"  [{symbol}] stored {total} bar samples")
+    return total
+
+
+def _fit_leg_model_v2(symbol: str, store) -> dict | None:
+    """Fit friction model v2 from the stored bar samples and persist the winner."""
+    from ait.backtesting.friction import fit_leg_spread_models
+    from ait.data.historical import SOURCE_IB_BID_ASK_BARS
+    from ait.data.option_spread_sampler import relevant_mask, session_of
+
+    df = store.load_spread_bar_samples(symbol)
+    if df.empty:
+        print(f"  [{symbol}] no bar samples stored")
+        return None
+    rel = df[relevant_mask(df)]
+    print(f"  [{symbol}] {len(df)} samples, {len(rel)} relevant "
+          f"(DTE 7-45, mid>=0.03, |delta|<=0.45 or wing)")
+    try:
+        fit = fit_leg_spread_models(
+            rel["mid"], rel["half_spread_usd"], rel["bar_time"].map(session_of))
+    except ValueError as e:
+        print(f"  [{symbol}] {e}")
+        return None
+    best = fit["best"]
+    cv = fit["cv_mae"]
+    print(f"  [{symbol}] CV MAE ($/leg, {fit['cv']}, {fit['n_sessions']} sessions): "
+          + "  ".join(f"{k}={v:.4f}" for k, v in cv.items()) + f"  -> {best.form}")
+    bins = pd.cut(rel["mid"], [0, 0.10, 0.25, 0.50, 1.0, 2.0, 100.0])
+    print(f"  [{symbol}] observed half-spread $ by mid bucket (median / n):")
+    for b, g in rel.groupby(bins, observed=True):
+        print(f"      mid {str(b):14s} {g['half_spread_usd'].median():.4f}  n={len(g)}  "
+              f"model={best.half_spread_usd(g['mid'].median()):.4f}")
+    row = {**best.to_row(), "n": fit["n"], "n_sessions": fit["n_sessions"],
+           "cv_mae": cv[best.form], "cv_mae_by_form": cv, "source": SOURCE_IB_BID_ASK_BARS,
+           "calibrated_on": date.today().isoformat()}
+    store.save_leg_spread_model(symbol, row)
+    print(f"  [{symbol}] saved option_leg_spread_params: {best}")
+    return row
+
+
+# ---------------------------------------------------------------------------
 # Model fitting
 # ---------------------------------------------------------------------------
 
@@ -581,6 +749,33 @@ async def _main(args: argparse.Namespace) -> int:
     print(f"  DTE targets: {args.dte_targets}\n")
 
     store = HistoricalDataStore(db_path=Path(args.db_path))
+
+    if args.source == "ib-bars":
+        from ait.data.option_spread_sampler import parse_window
+        window = parse_window(args.entry_window)
+        ib = None
+        if not args.fit_only:
+            from ib_insync import IB
+            ib = IB()
+            print(f"Connecting to IBKR at {args.host}:{args.port} (clientId={args.client_id})...")
+            try:
+                await ib.connectAsync(args.host, args.port, clientId=args.client_id, timeout=10)
+            except Exception as e:
+                print(f"ERROR: could not connect to IBKR: {e}")
+                return 1
+        t_start = time.time()
+        for sym in args.symbols:
+            print(f"=== {sym} ===")
+            if ib is not None:
+                await _sample_symbol_ib_bars(
+                    ib, sym, args.dte_targets, store, window, args.bars_duration,
+                    args.bars_pause_secs, args.dry_run)
+            if not args.dry_run:
+                _fit_leg_model_v2(sym, store)
+        if ib is not None:
+            ib.disconnect()
+        print(f"\nDone in {time.time() - t_start:.1f}s.")
+        return 0
 
     if args.source == "yfinance":
         for sym in args.symbols:

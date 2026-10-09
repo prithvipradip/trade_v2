@@ -91,6 +91,11 @@ class StrategyOptimizer:
         budget_aware_wings: bool | None = None,
         max_contracts_per_trade: int | None = None,
         economic_calendar: Any = None,   # W65: research macro calendar (None = hardcoded)
+        condor_any_direction: bool | None = None,   # W66 (None -> config)
+        friction_model: str | None = None,           # W66 friction v2 (None -> config)
+        friction_entry_capture: float | None = None,
+        friction_exit_capture: float | None = None,
+        friction_stress_multiplier: float | None = None,
         table_prefix: str = "",         # W65: research table prefix for the standalone data fetch
         db_path: Any = None,             # W65: store holding the research tables
         history_start_date: Any = None,  # W65: trim the standalone fetch to this date
@@ -220,6 +225,17 @@ class StrategyOptimizer:
         self._max_contracts_per_trade = _rmc(max_contracts_per_trade, self._settings)
         self._budget_aware_wings = bool(_rcv(
             budget_aware_wings, "backtest", "budget_aware_wings", _BTC2, self._settings))
+        self._condor_any_direction = bool(_rcv(
+            condor_any_direction, "backtest", "condor_any_direction", _BTC2, self._settings))
+        self._friction_model = str(_rcv(
+            friction_model, "backtest", "friction_model", _BTC2, self._settings))
+        self._friction_entry_capture = float(_rcv(
+            friction_entry_capture, "backtest", "friction_entry_capture", _BTC2, self._settings))
+        self._friction_exit_capture = float(_rcv(
+            friction_exit_capture, "backtest", "friction_exit_capture", _BTC2, self._settings))
+        self._friction_stress_multiplier = float(_rcv(
+            friction_stress_multiplier, "backtest", "friction_stress_multiplier", _BTC2,
+            self._settings))
         # R20b review follow-up: same None -> config-resolution pattern as
         # iv_rank_rise_threshold/min_edge_over_baseline below — a direct
         # caller that omits wing_k now gets the config/live value (1.6)
@@ -533,6 +549,11 @@ class StrategyOptimizer:
             "position_size_pct":     self._position_size_pct,
             "budget_aware_wings":    self._budget_aware_wings,
             "economic_calendar":     self._economic_calendar,
+            "condor_any_direction":  self._condor_any_direction,
+            "friction_model":        self._friction_model,
+            "friction_entry_capture": self._friction_entry_capture,
+            "friction_exit_capture": self._friction_exit_capture,
+            "friction_stress_multiplier": self._friction_stress_multiplier,
             "max_contracts_per_trade": self._max_contracts_per_trade,
             "trailing_stop_pct":     0.25,
             "breakeven_trigger_pct": 0.30,
@@ -571,6 +592,10 @@ class StrategyOptimizer:
             strategies=self._strategies,
             features_cache=self._features_cache,
             symbol=self._symbol or symbol,
+            # W66: the store this run was pointed at (W52a), so the trial engines read the
+            # same calibrated spreads / friction model v2 as the OOS engine instead of the
+            # cwd-default historical.db.
+            db_path=self._db_path,
             range_predictor=self._range_predictor,
             intraday_store=self._intraday_store,
             eval_start_date=eval_start_date,

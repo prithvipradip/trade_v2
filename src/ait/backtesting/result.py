@@ -24,6 +24,10 @@ class BacktestResult:
     start_date: date | None = None
     end_date: date | None = None
     exit_mode: str = "fixed"
+    # W66: why entries did NOT happen: {reason: days}. Every evaluated day ends in
+    # exactly one reason or in `entries_taken`; includes `days_evaluated`. Empty for
+    # results built outside Backtester.run().
+    entry_funnel: dict[str, int] = field(default_factory=dict)
 
     # --- Core metrics as properties ---
 

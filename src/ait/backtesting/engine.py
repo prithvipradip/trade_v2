@@ -12,6 +12,7 @@ Supports:
 from __future__ import annotations
 
 import os
+from collections import Counter
 from datetime import date, timedelta
 from typing import Any
 
@@ -109,6 +110,23 @@ class Backtester:
         # W65: research macro calendar (EconomicCalendar built from the operator's CSV).
         # None = the hardcoded live calendar (legacy behaviour).
         economic_calendar: Any = None,
+        # W66: live's IronCondor ignores market_direction entirely ("Iron condors work
+        # in ANY direction"), but this engine only selects it when the day's direction
+        # is NEUTRAL, which removed ~81% of days on the 2024-2026 research span. True =
+        # an IC-only strategy set is selected on ANY direction (live behavior). False
+        # (default) = the legacy NEUTRAL-only rule, so existing results do not move.
+        condor_any_direction: bool = False,
+        # W66 friction model v2. "legacy" = `half_spread_pct x leg_mid` per leg at entry and
+        # the same % on the NET value at exit (the engine's historical behaviour, kept as
+        # the bare default so engine-level tests/results do not move). "per_leg_usd" =
+        # the fitted per-leg DOLLAR half-spread (option_leg_spread_params, from IB BID/ASK
+        # bars) charged symmetrically on all four legs at entry AND exit; applies to the
+        # iron condor only, and falls back to legacy (with a WARNING) when the symbol has
+        # no fitted model. The research entry points resolve it from backtest.friction_*.
+        friction_model: str = "legacy",
+        friction_entry_capture: float = 1.0,   # share of the quoted half-spread paid at entry
+        friction_exit_capture: float = 1.0,    # ... and at exit (1.0 = full, conservative)
+        friction_stress_multiplier: float = 1.0,  # scales the model (calm-sample hedge/sweeps)
         stop_loss_pct: float = 0.50,
         profit_target_pct: float = 1.00,
         max_hold_days: int = 30,
@@ -301,6 +319,16 @@ class Backtester:
         self._calibrated_spreads = None
         self._position_size_pct = position_size_pct
         self._budget_aware_wings = bool(budget_aware_wings)
+        self._condor_any_direction = bool(condor_any_direction)
+        if friction_model not in ("legacy", "per_leg_usd"):
+            raise ValueError(f"friction_model must be 'legacy' or 'per_leg_usd', got {friction_model!r}")
+        self._friction_model = friction_model
+        self._friction_entry_capture = float(friction_entry_capture)
+        self._friction_exit_capture = float(friction_exit_capture)
+        self._friction_stress = float(friction_stress_multiplier)
+        self._leg_spread_model = None  # set by _load_leg_spread_model() when per_leg_usd
+        # W66: entry-funnel counters (see _reject / BacktestResult.entry_funnel)
+        self._funnel: Counter = Counter()
         self._max_contracts_per_trade = (
             int(max_contracts_per_trade) if max_contracts_per_trade else None)
         self._stop_loss_pct = stop_loss_pct
@@ -343,6 +371,8 @@ class Backtester:
         # R16: must run AFTER _symbol is set — the calibration is per-symbol.
         if os.environ.get("AIT_BT_CALIBRATED_SPREADS", "1") != "0":
             self._load_calibrated_spreads()
+        if self._friction_model == "per_leg_usd":
+            self._load_leg_spread_model()
         self._earnings_dates: set[date] = self._load_earnings_dates(symbol, earnings_skip_days)
         self._intraday_store = intraday_store
         # R20: resolve LOADED settings once for every config-backed knob below
@@ -528,8 +558,18 @@ class Backtester:
     # Public API
     # ------------------------------------------------------------------
 
+    def _reject(self, reason: str) -> None:
+        """W66: record that an evaluated day ended in this entry rejection.
+
+        Most of the engine's entry gates used to be silent (the condor builder
+        returned None without a log), so an operator could not see WHY a run
+        produced 0-9 trades. Every `continue`/`return None` on the entry path now
+        counts here; `BacktestResult.entry_funnel` carries the totals."""
+        self._funnel[reason] += 1
+
     def run(self) -> BacktestResult:
         """Execute the backtest and return results."""
+        self._funnel = Counter()
         capital = self._initial_capital
         trades: list[dict] = []
         open_positions: list[dict] = []
@@ -557,6 +597,7 @@ class Backtester:
             today_date = today.date() if hasattr(today, "date") else today
             hist = self._data.iloc[: i + 1]
             row = self._data.iloc[i]
+            self._funnel["days_evaluated"] += 1
 
             # --- 1. Check exits on open positions ---
             still_open = []
@@ -609,10 +650,12 @@ class Backtester:
 
             # --- 2. Generate new signal (skip if at position limit) ---
             if len(open_positions) >= self._max_concurrent_positions:
+                self._reject("max_concurrent")
                 continue
 
             # H2 val-split: skip new entries before eval_start_date (exits still processed above)
             if self._eval_start_date is not None and today_date < self._eval_start_date:
+                self._reject("before_eval_start")
                 continue
 
             direction, confidence, features_df = self._get_direction(hist, market_context=self._market_context)
@@ -661,6 +704,7 @@ class Backtester:
                             hard_veto_threshold=round(_hard_veto_threshold, 4),
                             hurst_regime_threshold=round(self._hurst_regime_threshold, 4),
                         )
+                        self._reject("hurst_hard_veto")
                         continue
                     penalty = self._hurst_regime_penalty * (
                         spread / self._hurst_regime_threshold
@@ -678,8 +722,10 @@ class Backtester:
             _neutral_only = bool(set(self._strategies) & set(NEUTRAL_CREDIT_GATED))
             if not _neutral_only:
                 if confidence < effective_min_conf:
+                    self._reject("direction_confidence")
                     continue
                 if direction == SignalDirection.BEARISH and confidence < effective_min_conf + 0.05:
+                    self._reject("direction_confidence_bearish")
                     continue
 
             # MetaLabeler gate (Gap Z1): applied during OOS evaluation when a trained
@@ -720,17 +766,20 @@ class Backtester:
                             "threshold": 0.5,
                         }
                         if not meta_signal.take_trade:
+                            self._reject("meta_label")
                             continue
                 except Exception:
                     pass  # meta-labeler errors are non-fatal
 
             strategy = self._select_strategy(direction, hist, confidence, features_df)
             if strategy is None:
+                self._reject("no_strategy")
                 continue
 
             # Earnings proximity skip (Gap Z4): matches live orchestrator behaviour.
             if today_date in self._earnings_dates:
                 log.debug("earnings_skip", date=str(today_date), strategy=strategy)
+                self._reject("earnings")
                 continue
 
             # Macro-event entry gate (live orchestrator credit-block parity).
@@ -758,6 +807,7 @@ class Backtester:
                         strategy=strategy,
                         days_to_event=_d2e,
                     )
+                    self._reject("macro_event")
                     continue
 
             # Research-only post-event blackout (see __init__). Inert unless
@@ -770,6 +820,7 @@ class Backtester:
                 log.debug("post_event_entry_skip", date=str(today_date),
                           strategy=strategy,
                           days_since_event=self._days_since_event(today_date))
+                self._reject("post_event")
                 continue
 
             # Regime gate: iron condors / short strangles fail in trending-down regimes.
@@ -801,6 +852,7 @@ class Backtester:
                         vol_regime_expanding=round(float(_last_f.get("vol_regime_expanding", 0.0)), 4),
                         price_vs_sma_20=round(_px_sma_val, 4),
                     )
+                    self._reject("regime_veto")
                     continue
 
             # Range model gate: for neutral credit structures, replace
@@ -827,6 +879,7 @@ class Backtester:
                             strategy=strategy,
                             threshold=self._range_min_confidence,
                         )
+                        self._reject("range_gate_no_predictor")
                         continue
                 else:
                     try:
@@ -837,6 +890,7 @@ class Backtester:
                             min_edge_override=self._min_edge_over_baseline,
                         )
                         if rp is None or rp.probability_in_range < self._range_min_confidence:
+                            self._reject("range_gate_below_threshold")
                             continue  # bad range setup → skip
                         _entry_decision["range_gate"] = {
                             "prob": round(float(rp.probability_in_range), 4),
@@ -865,6 +919,7 @@ class Backtester:
                             vol_10d=f"{vol_10d:.2%}",
                             max_vol=f"{self._max_entry_vol_annual:.2%}",
                         )
+                        self._reject("vol_gate")
                         continue
 
             # R12-C: AEKF (OU-Kou-GARCH) direction veto removed — the GARCH
@@ -891,6 +946,7 @@ class Backtester:
                             iv_rank_rise=round(iv_rank_rise, 4),
                             threshold=self._iv_rank_rise_threshold,
                         )
+                        self._reject("iv_rank_rise")
                         continue
 
             # Drawdown-from-60d-high gate: block iron condor entry when the underlying is
@@ -920,6 +976,7 @@ class Backtester:
                             pct_from_high=round(_pct_from_high, 4),
                             threshold=self._pct_from_60d_high_threshold,
                         )
+                        self._reject("pct_from_high")
                         continue
 
             # --- 3. Build the trade ---
@@ -943,6 +1000,7 @@ class Backtester:
                         )
                     ]
                     if window_bars.empty:
+                        self._reject("no_bars_in_entry_window")
                         continue  # No bars in window today — skip entry
 
                     # Use VWAP of first scan bar as limit price (mid-market proxy)
@@ -965,6 +1023,7 @@ class Backtester:
                         limit_price, bars_after_scan, self._limit_order_timeout_bars
                     )
                     if not filled:
+                        self._reject("limit_not_filled")
                         continue  # Limit order expired without fill — skip entry
 
             # R20 #1: run() has had self._market_context all along (walkforward
@@ -978,6 +1037,7 @@ class Backtester:
                 market_context=self._market_context,
             )
             if pos is None:
+                self._reject("builder_none")
                 continue
 
             if entry_time_str:
@@ -1084,6 +1144,7 @@ class Backtester:
             pos["entry_commission"] = entry_commission
 
             open_positions.append(pos)
+            self._funnel["entries_taken"] += 1
 
         # --- Force-close remaining positions ---
         last_row = self._data.iloc[-1]
@@ -1100,6 +1161,7 @@ class Backtester:
             final_capital=round(capital, 2),
             start_date=dates[0].date() if hasattr(dates[0], "date") else dates[0],
             end_date=last_date,
+            entry_funnel=dict(self._funnel),
         )
 
         log.info(
@@ -1277,11 +1339,11 @@ class Backtester:
         for row in session_bars.itertuples(index=True):
             underlying = row.Close
             current_val = self._reprice_position(pos, underlying, days_held, None)
+            current_val = self._apply_exit_friction(
+                pos, current_val, underlying, days_held, None, exit_half_spread, trade_type)
             if trade_type == "credit":
-                current_val *= (1 + exit_half_spread)
                 pnl_pct = (entry_price - current_val) / entry_price if entry_price > 0 else 0.0
             else:
-                current_val *= (1 - exit_half_spread)
                 pnl_pct = (current_val - entry_price) / entry_price if entry_price > 0 else 0.0
 
             # Check stop / profit — routed per trade type (R6 exit parity)
@@ -1438,6 +1500,11 @@ class Backtester:
         # multi-strategy breakdown). Prefer it on NEUTRAL, but respect the
         # requested strategy set for directional signals.
         if direction == SignalDirection.NEUTRAL:
+            candidates = available & CREDIT_STRATEGIES
+        elif (self._condor_any_direction and available
+              and available <= set(NEUTRAL_CREDIT_GATED)):
+            # W66 live parity: a neutral-credit-only set (live's IC-only selector)
+            # trades on any direction.
             candidates = available & CREDIT_STRATEGIES
         elif direction == SignalDirection.BULLISH:
             candidates = available & {"bull_call_spread", "long_call"}
@@ -1599,6 +1666,53 @@ class Backtester:
         except Exception as e:  # noqa: BLE001 — never block a run on this
             log.debug("calibrated_spreads_unavailable", symbol=sym, error=str(e))
 
+    def _load_leg_spread_model(self) -> None:
+        """W66: adopt the fitted per-leg dollar half-spread model for this symbol.
+
+        Absent model -> stay on the legacy % model and say so loudly: a silent fallback
+        would put a 7-8x overcharge back into a run the operator believes is v2."""
+        from ait.backtesting.friction import LegSpreadModel
+        sym = (self._symbol or "").upper()
+        row = None
+        if sym:
+            try:
+                from ait.data.historical import HistoricalDataStore
+                _store = (HistoricalDataStore(db_path=self._db_path)
+                          if self._db_path is not None else HistoricalDataStore())
+                row = _store.load_leg_spread_model(sym)
+            except Exception as e:  # noqa: BLE001 — reported below, never blocks a run
+                log.warning("friction_params_unreadable", symbol=sym, error=str(e))
+        if not row:
+            log.warning("friction_params_absent", symbol=sym,
+                        note="friction_model=per_leg_usd requested but no fitted model; "
+                             "using the LEGACY % model for this symbol")
+            return
+        self._leg_spread_model = LegSpreadModel.from_row(row)
+        log.info("friction_model_loaded", symbol=sym, form=row["form"],
+                 a=round(float(row["a"]), 5), b=round(float(row["b"]), 5), n=row.get("n"),
+                 calibrated_on=row.get("calibrated_on"))
+
+    def _leg_friction_usd(self, capture: float, leg_mids) -> float:
+        """W66: dollars/share to cross the spread on every leg once (v2 model)."""
+        from ait.backtesting.friction import condor_leg_cost_usd
+        return condor_leg_cost_usd(self._leg_spread_model, leg_mids, capture,
+                                   self._friction_stress)
+
+    def _apply_exit_friction(self, pos: dict, value: float, underlying: float,
+                             days_held: int, hist: pd.DataFrame | None,
+                             half_spread_pct: float, trade_type: str) -> float:
+        """Price the exit transaction cost onto a repriced value.
+
+        v2 iron condor: + capture x sum(leg half-spreads) at the legs' CURRENT mids (buying
+        back the shorts at the ask / selling the wings at the bid). Everything else (and
+        the legacy model): the original `% x net value` shortcut."""
+        if self._leg_spread_model is not None and pos.get("strategy") == "iron_condor":
+            sc, sp, lc, lp = self._reprice_ic_legs(pos, underlying, days_held, hist)
+            return value + self._leg_friction_usd(self._friction_exit_capture,
+                                                  (sc, sp, lc, lp))
+        return value * (1 + half_spread_pct) if trade_type == "credit" \
+            else value * (1 - half_spread_pct)
+
     def _symbol_vol_multiplier(self) -> float:
         """Per-symbol VIX scaling, env-overridable for sensitivity runs."""
         sym = (self._symbol or "").upper()
@@ -1630,6 +1744,7 @@ class Backtester:
         # Entry gate for credit strategies: insufficient IV → premiums too small to
         # justify spread costs and risk. Honest no-trade rather than fake-pricing at floor.
         if strategy in CREDIT_STRATEGIES and iv < self._iv_floor:
+            self._reject("builder:iv_floor")  # detail of the loop's builder_none
             return None
 
         if strategy in CREDIT_STRATEGIES:
@@ -1808,6 +1923,7 @@ class Backtester:
             # __init__); the ratios are recorded on the position either way.
             if expected_move <= 0:
                 log.debug("condor_rejected_em_unavailable", date=str(today_date))
+                self._reject("builder:em_unavailable")  # detail of the loop's builder_none
                 return None
             em_ratio_call = (short_call_strike - S) / expected_move
             em_ratio_put = (S - short_put_strike) / expected_move
@@ -1818,6 +1934,7 @@ class Backtester:
                           em_ratio_call=round(em_ratio_call, 3),
                           em_ratio_put=round(em_ratio_put, 3),
                           em_min=self._ic_em_min, em_max=self._ic_em_max)
+                self._reject("builder:em_band")  # detail of the loop's builder_none
                 return None
             wing_width = max(self._wing_k * expected_move, self._wing_floor_dollars)
             if self._budget_aware_wings:
@@ -1849,6 +1966,7 @@ class Backtester:
             # Net credit received at mid prices
             net_credit = (short_call_price + short_put_price) - (long_call_price + long_put_price)
             if net_credit <= 0:
+                self._reject("builder:net_credit_nonpositive")  # detail of the loop's builder_none
                 return None
 
             # R6 live-parity construction gates (src/ait/strategies/iron_condor.py
@@ -1857,11 +1975,13 @@ class Backtester:
             #    ($0.70 default): at a 50% TP the gross must clear ~3x the
             #    round-trip commission/crossing cost.
             if net_credit < self._ic_min_credit:
+                self._reject("builder:credit_floor")  # detail of the loop's builder_none
                 return None
             # 2. Credit-to-width gate — live rejects total_credit/max_width <
             #    AIT_IC_MIN_CREDIT_WIDTH (0.20 default). Engine wings are
             #    symmetric, so max_width == wing_width.
             if wing_width > 0 and (net_credit / wing_width) < self._ic_min_credit_width:
+                self._reject("builder:credit_width_ratio")  # detail of the loop's builder_none
                 return None
 
             # W64: the MID credit, before friction. Live's budget gate
@@ -1874,8 +1994,14 @@ class Backtester:
             half_spread = self._options_half_spread(iv, dte)
             avg_leg_mid = (short_call_price + short_put_price + long_call_price + long_put_price) / 4
             spread_cost = 4 * half_spread * avg_leg_mid
+            if self._leg_spread_model is not None:
+                # W66 v2: the fitted DOLLAR half-spread on each of the four legs
+                spread_cost = self._leg_friction_usd(
+                    self._friction_entry_capture,
+                    (short_call_price, short_put_price, long_call_price, long_put_price))
             net_credit = max(0.0, net_credit - spread_cost)
             if net_credit <= 0:
+                self._reject("builder:credit_after_friction_nonpositive")  # detail of the loop's builder_none
                 return None
 
             # Max loss = wing width - net credit (per share)
@@ -1892,10 +2018,12 @@ class Backtester:
                 if self._budget_aware_wings else max_loss_per_contract)
             if (_gate_per_contract <= 0 or math.isnan(_gate_per_contract)
                     or capital < _gate_per_contract):
+                self._reject("builder:capital_below_max_loss")  # detail of the loop's builder_none
                 return None
             contracts = int(capital * self._position_size_pct / _gate_per_contract)
             if contracts < 1:
                 self._log_unaffordable(strategy, _gate_per_contract, capital)
+                self._reject("builder:unaffordable_contracts")  # detail of the loop's builder_none
                 return None
 
             return {
@@ -1905,6 +2033,8 @@ class Backtester:
                 "trade_type": "credit",
                 "entry_date": str(today_date),
                 "entry_price": round(net_credit, 4),  # Credit received per share
+                "mid_credit": round(_mid_credit, 4),  # W66: before friction
+                "entry_friction_usd": round(spread_cost, 4),  # W66: per share, whole condor
                 "contracts": contracts,
                 "n_legs": 4,
                 "short_call_strike": round(short_call_strike, 0),
@@ -2306,6 +2436,24 @@ class Backtester:
         rv = realized_vol(hist["Close"].values, window=20) * 1.15
         return max(0.70 * entry_iv + 0.30 * rv, self._iv_floor)
 
+    def _reprice_ic_legs(self, pos: dict, underlying: float, days_held: int,
+                         hist: pd.DataFrame | None = None) -> tuple[float, float, float, float]:
+        """The four condor leg mids (short call, short put, long call, long put) at this
+        underlying/age. Single source for `_reprice_position` (net value) and the W66
+        per-leg exit friction, so the two can never disagree on the leg prices."""
+        iv = self._get_current_iv(pos, hist)
+        t = max(max(self._entry_dte - days_held, 0) / 365.0, 0.0001)
+        r = 0.05
+        sc = black_scholes_price(underlying, pos["short_call_strike"], t, r,
+            self._get_leg_iv(iv, pos["short_call_strike"], underlying, OptionType.CALL), OptionType.CALL)
+        sp = black_scholes_price(underlying, pos["short_put_strike"], t, r,
+            self._get_leg_iv(iv, pos["short_put_strike"], underlying, OptionType.PUT), OptionType.PUT)
+        lc = black_scholes_price(underlying, pos["long_call_strike"], t, r,
+            self._get_leg_iv(iv, pos["long_call_strike"], underlying, OptionType.CALL), OptionType.CALL)
+        lp = black_scholes_price(underlying, pos["long_put_strike"], t, r,
+            self._get_leg_iv(iv, pos["long_put_strike"], underlying, OptionType.PUT), OptionType.PUT)
+        return sc, sp, lc, lp
+
     def _reprice_position(self, pos: dict, underlying: float, days_held: int,
                           hist: pd.DataFrame | None = None) -> float:
         """Reprice a position at the current underlying using Black-Scholes.
@@ -2325,14 +2473,7 @@ class Backtester:
         strategy = pos["strategy"]
 
         if strategy in ("iron_condor", "iron_butterfly", "wide_wing_condor", "broken_wing_condor"):
-            sc = black_scholes_price(underlying, pos["short_call_strike"], t, r,
-                self._get_leg_iv(iv, pos["short_call_strike"], underlying, OptionType.CALL), OptionType.CALL)
-            sp = black_scholes_price(underlying, pos["short_put_strike"], t, r,
-                self._get_leg_iv(iv, pos["short_put_strike"], underlying, OptionType.PUT), OptionType.PUT)
-            lc = black_scholes_price(underlying, pos["long_call_strike"], t, r,
-                self._get_leg_iv(iv, pos["long_call_strike"], underlying, OptionType.CALL), OptionType.CALL)
-            lp = black_scholes_price(underlying, pos["long_put_strike"], t, r,
-                self._get_leg_iv(iv, pos["long_put_strike"], underlying, OptionType.PUT), OptionType.PUT)
+            sc, sp, lc, lp = self._reprice_ic_legs(pos, underlying, days_held, hist)
             return (sc + sp) - (lc + lp)
 
         elif strategy == "put_credit_spread":
@@ -2475,10 +2616,9 @@ class Backtester:
         expiry = date.fromisoformat(pos["expiry_date"])
         remaining_dte = max(0, (expiry - current_date).days)
         exit_half_spread = self._options_half_spread(exit_iv, remaining_dte)
-        if trade_type == "credit":
-            current_value *= (1 + exit_half_spread)  # Buy back at ask
-        else:
-            current_value *= (1 - exit_half_spread)  # Sell at bid
+        # Buy back at the ask / sell at the bid (W66: per-leg dollars for v2 condors)
+        current_value = self._apply_exit_friction(
+            pos, current_value, underlying, days_held, hist, exit_half_spread, trade_type)
 
         result = self._dispatch_exit_check(pos, trade_type, pnl_pct, current_date, row)
 
@@ -2504,7 +2644,9 @@ class Backtester:
                     if _worse:
                         current_value = _gv
                         underlying = float(_gap)
-                current_value *= (1 + exit_half_spread)
+                current_value = self._apply_exit_friction(
+                    pos, current_value, underlying, days_held, hist, exit_half_spread,
+                    trade_type)
 
             # Calculate actual P&L
             pnl = self._calc_pnl(pos, current_value)
@@ -2763,10 +2905,9 @@ class Backtester:
         expiry = date.fromisoformat(pos["expiry_date"])
         remaining_dte = max(0, (expiry - last_date).days)
         exit_half_spread = self._options_half_spread(exit_iv, remaining_dte)
-        if trade_type == "credit":
-            current_value *= (1 + exit_half_spread)
-        else:
-            current_value *= (1 - exit_half_spread)
+        current_value = self._apply_exit_friction(
+            pos, current_value, last_row["Close"], days_held, hist, exit_half_spread,
+            trade_type)
 
         pnl = self._calc_pnl(pos, current_value)
         return {

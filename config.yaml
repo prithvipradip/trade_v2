@@ -169,6 +169,14 @@ backtest:
   vlmc_min_coverage: 0.95              # W65: 5-min day coverage required to train with VLMC/intraday-fractal features;
                                        # below it the run is daily-only (never a mix of windows with and without VLMC).
   macro_event_types: [FOMC, CPI, NFP, PCE, GDP]   # W65: research macro gate event set (= live's five, for parity)
+  condor_any_direction: false          # W66: true = research trades an IC-only set on ANY direction (live does;
+                                       # the engine's NEUTRAL-only rule removed ~81% of days). false = legacy, so no
+                                       # research result moves until the operator flips it after seeing the A/B.
+  friction_model: per_leg_usd          # W66: legacy | per_leg_usd (fitted $/leg half-spread, entry AND exit; QQQ legacy
+                                       # overcharged a $0.95-credit condor $0.669 vs ~$0.085 measured). Missing fit -> legacy + WARNING.
+  friction_entry_capture: 1.0          # W66: share of the quoted half-spread paid per leg at entry (1.0 = full, conservative)
+  friction_exit_capture: 1.0           # W66: ... and at exit; lower only from the fill-vs-model report
+  friction_stress_multiplier: 1.0      # W66: scales the fitted model (calm-regime sample hedge; sweep with friction_sensitivity.py)
   budget_aware_wings: true             # W64: research condor builder caps the wing to the budget like live
                                        # (IronCondor.affordable_width, $1 floor when capped) and rejects a
                                        # structure whose max loss exceeds the budget. false = old behaviour.

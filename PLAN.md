@@ -14691,3 +14691,81 @@ parameter, a penalty that actually reaches the condor entry statistic) remains t
 **NEXT**: operator decides the order of (a)-(e); nothing here changes code or config.
 
 ---
+
+## 2026-10-09 - W66: a trustworthy research instrument (entry-funnel telemetry + friction model v2 + sensitivity + fill report); no live behaviour change
+
+**WHY.** The W65 RESULT / CORRECTION entries showed the research engine could not be trusted as a measuring instrument at $5k: 28 of 30 Optuna studies had no
+trial with >= 3 trades (flat -100 objective), most entry rejections were silent (the condor builder returned `None` without a log), and the friction model
+overcharged ~7-8x (QQQ condor: engine `4 x 6.08% x avg leg mid` = $0.669 vs a measured $0.085 real fill) and charged entry and exit inconsistently. W66 fixes the
+instrument; it does not change live behaviour (no live file, config value, process or table was touched; no restart, no retrain).
+
+**MEASURED.**
+- *Sampler* (`calibrate_option_spreads.py --source ib-bars`, TWS paper 7497, ~53 min, 149 contracts x 2 hourly BID/ASK requests + 3 underlying): 2,598 IWM / 3,864 SPY /
+  2,406 QQQ bar samples, 3 listed expiries (DTE ~10/21/35) x delta buckets 0.08-0.40 + wings; sessions 2026-08-27..2026-10-08 (SPY/QQQ 30, IWM 21). Relevant for the fit
+  (DTE 7-45, mid >= 0.03, |delta| <= 0.45 or wing): 2,148 / 2,476 / 1,633; 18 sessions each.
+- *Fits* (leave-one-session-out CV, $/leg MAE): IWM `const_usd` $0.020 (cv 0.0080; pct 0.0107, affine 0.0084); SPY `pct` 0.383% of mid (cv 0.0090; const 0.0099);
+  QQQ `pct` 0.557% of mid (cv 0.0203; const 0.0241). Half-spread GROWS with mid on the large-underlying symbols (QQQ: ~$0.015 at mid 1, ~$0.025 at mid 4.3, ~$0.035 at
+  mid 6.5): the legs a $5k condor trades on SPY/QQQ are $2-10 options, so cost per entry is ~$0.10-0.16 per share (QQQ) against the legacy $0.67.
+- *Sensitivity* (`scripts/friction_sensitivity.py`, bare engine, 2024-01..2026-10, $5k, 5% budget, 1 contract; total P&L over SPY+QQQ+IWM): NEUTRAL-only selector (config):
+  x0 -$241, x0.25 -$383, x0.5 -$529, x1 -$632, x2 -$735 (legacy % model: SPY 0 / QQQ 6 / IWM 9 trades, -$860). Break-even friction multiple: QQQ 0.64x; SPY and IWM
+  are NEGATIVE EVEN AT ZERO FRICTION. With `condor_any_direction` (live-like selector): x0 -$1,341 ... x1 -$1,592, x2 -$1,648. Friction is therefore NOT the only
+  problem: at this construction avg win ~$14-27 vs avg loss ~$40-66, so the win rate needed to break even (~65%) is not reached (35-60%). Trade COUNT also falls as friction
+  rises (IWM 24 -> 10 trades x0 -> x2): the 1-position-at-a-time limit makes the entry set path-dependent (verified by funnel: `max_concurrent`/`credit_floor` shift), not a bug.
+- *Payoff-shape A/B* (exit policy, v2 friction x1, n = 2-18 trades per symbol, i.e. NOISE-LEVEL, evidence for a decision not a decision): the touch stop earns its keep
+  (QQQ -$8 on vs -$98 off; SPY -$42 vs -$139; IWM ~equal). A take-profit at 50% of credit (and 75%, and "hold to DTE exit") give IDENTICAL results: after friction a 50% TP
+  is practically never reached (wins are time exits at ~40% of credit); 25-35% TP changes outcomes by tens of dollars either way (QQQ 35% +$11, 25% -$40). No evidence supports
+  changing the TP; no live exit setting was changed.
+- *Plain research walk-forward* (6 windows, v2 friction, NEUTRAL selector, funnel on): 16 trades (W65: 5 on the legacy model), win 43.75%, avg win $14.13 / avg loss
+  $39.99, PF 0.27, -$261 (-5.15%). Funnel (days 440 per symbol): IWM taken 12 (no_strategy 294, max_concurrent 50, macro_event 34, range_gate 25, iv_floor 19);
+  QQQ taken 3 (no_strategy 361, range_gate 26, iv_floor 18, macro 17); SPY taken 1 (no_strategy 278, range_gate 55, iv_floor 54, macro 46).
+- *Optimized pilot* (2 windows, 5 trials): pipeline runs end to end, objective still the flat -100 for every study (as expected: W67 item), 10 trades in the one OOS window.
+- *Fill-vs-model* (`scripts/fill_vs_model_report.py`): 36 executions rows; 1 combo fill carries quote context (QQQ 2026-09-28: mid 1.005, fill 0.920 => realized $0.085/share).
+  Coverage finding: leg rows carry no context BY DESIGN (context is on the combo/BAG row), and 31 rows have no trade_id (2026-09-14 and the 28 rows of 2026-09-29).
+  So the "35 of 36 lack live_mid" gap is mostly design, not a logging bug in the entry path; the 31 unattributed rows are NOT diagnosed and executor.py was NOT changed (critical file).
+
+**WHAT CHANGED.**
+1. Funnel (closes W65 item (a)): `engine.py` `Counter` + `_reject()` at every entry decision (named gates + `builder:*` detail for the formerly silent condor returns);
+   invariant `days_evaluated == entries_taken + sum(top-level rejections)`; `BacktestResult.entry_funnel`; `walkforward.py` aggregates per symbol over ALL windows (incl. zero-trade
+   windows) and `summary()` prints an ENTRY FUNNEL table. AST guard: no `return None` in the condor branch / `_build_position` without a preceding `_reject`.
+2. Friction v2 (closes W65 item (b)): `backtesting/friction.py` (`LegSpreadModel`, grouped-CV `fit_leg_spread_models` with a 5% parsimony margin), `data/option_spread_sampler.py`
+   (pure bar pairing / entry-window filter / IV+delta inversion / strike plan), new tables `option_spread_bar_samples` + `option_leg_spread_params` in `historical.py`,
+   `SOURCE_IB_BID_ASK_BARS` provenance, sampler + `--fit-only` in `scripts/calibrate_option_spreads.py`. Engine: `friction_model` ("legacy" bare default | "per_leg_usd"),
+   `friction_entry_capture`/`friction_exit_capture`/`friction_stress_multiplier`; IC entry = capture x sum of 4 leg half-spreads in dollars, IC exit = same on the 4 legs repriced at the
+   exit (`_reprice_ic_legs`, single source shared with `_reprice_position`) through ONE helper `_apply_exit_friction` used at all four exit sites (AST class guard); trades now record
+   `mid_credit` and `entry_friction_usd`. Missing fit -> legacy + WARNING `friction_params_absent`. Config `backtest.friction_*` (research default per_leg_usd, captures 1.0, stress 1.0)
+   plumbed through WalkForwardConfig / StrategyOptimizer / run_backtest manifest.
+3. `scripts/friction_sensitivity.py` (sweep + break-even + `--exit-ab`), `scripts/fill_vs_model_report.py` (read-only `mode=ro`).
+4. Found and fixed while verifying: the meta-label SHADOW Backtester in `walkforward.py` was built without `symbol` (so it priced with the config spread formula and a 1.10 vol
+   multiplier, not the OOS engine's calibrated model/multiplier), and the optimizer's trial Backtester lacked `db_path` (read the cwd-default store). Both fixed; AST guard that every
+   `Backtester(...)` in walkforward/optimizer passes `symbol` and `db_path`. OOS results unchanged (meta gate untrained in all 30 window-symbols).
+5. `condor_any_direction` (added earlier in W66, default false) is the opt-in live-like selector; see registered items.
+
+**TESTS.** `tests/test_w66_friction_and_funnel.py`: 49 tests (conservation across 6 gate configs, per-gate forcing, walk-forward aggregation, fit recovery of known laws, hand-computed
+entry/exit friction, legacy default untouched, fallback WARNING, config bounds, store round trip/idempotence/legacy table untouched, sampler pure functions, no order calls in the sampler,
+sensitivity/fill-report functions, three AST class guards). Mutation-checked: removing a `_reject`, swapping entry/exit capture, adding a stray `exit_half_spread` shortcut and dropping `symbol`
+from the shadow Backtester each fail the intended test. Fast lane 3016 passed / 46 skipped; `typecheck.py` OK; `smoke_deploy.py` SMOKE PASS (13 checks).
+
+**DEVIATIONS from the approved plan (listed as found).** (i) New table `option_spread_bar_samples` instead of additive columns on `option_spread_samples` (its PK holds one snapshot per day; hourly
+samples collide). (ii) The new tables are UNPREFIXED, like `option_spread_params` the engine already reads unprefixed; no live code reads them. (iii) Stress multiplier is a plain scalar, not
+VIX-conditional. (iv) Fit relevance used |delta| <= 0.45 (plan said 0.05-0.40) plus wings; samples are dominated by $2-10 legs. (v) The optional 09:30 full-chain cross-check was not run.
+(vi) Port 7497 (TWS paper), not 4002.
+
+**CAVEATS.** IB serves NO history for expired options, so the 2024-2026 backtest period is priced with spreads from 2026-08-27..10-08 (assumed stationary, calm-regime). Fits use medians (MAE); QQQ's
+mean half-spread is ~2x its median (right tail of quote flickers), so capture 1.0 on the median is mildly optimistic for QQQ: use `friction_stress_multiplier`. Capture = 1.0 is conservative vs
+limit fills at/inside the mid. n = 1 real fill. The research BS/daily-bar model is an approximation; "negative at zero friction" is a statement about THIS model and construction ($2 wings, 1 contract,
+5% budget), not proof the live strategy lacks edge.
+
+**REGISTERED, NOT FIXED.** (1) `no_strategy` 81% of days (NEUTRAL-only selector) vs live's direction-agnostic IC; with `condor_any_direction` research is MORE negative (x1 -$1,592 vs -$632): the operator
+should know the live-like selector looks worse in research. (2) IV floor: research tests IV LEVEL 0.15, live tests IV RANK 15 (`builder:iv_floor` is the top builder blocker). (3) Macro gate blocks ~30% of days.
+(4) Credit floor stays on the MID credit (live parity, decided). (5) 31 executions rows without trade_id (2026-09-14, 2026-09-29) undiagnosed; executor untouched. (6) Credit put/call spreads exist only as engine
+shadow arms (live is IC-only). (7) Flat -100 optimizer objective still starves TPE (W67).
+
+**REPRODUCE.** `python scripts/calibrate_option_spreads.py --source ib-bars --symbols IWM SPY QQQ --dte-targets 10 21 35 --port 7497 --client-id 91` (~53 min, TWS up; `--fit-only` refits);
+`python scripts/friction_sensitivity.py --exit-ab [--any-direction]`; `python scripts/fill_vs_model_report.py`; `python run_backtest.py --symbols SPY QQQ IWM --strategies iron_condor` (~13 min).
+`data/` is gitignored: the samples/fits live only in `data/historical.db`.
+
+**NEXT.** W67: shared regime-gate module (veto cutoff knob, penalty on the range probability, live-parity defaults), graded optimizer objective (replace flat -100, configurable floor/min_trades, loud
+no-usable-trial reporting), calibration protocol; NO new multi-hour optimized run until the objective is fixed. Operator decisions still open: flip `condor_any_direction`? (see registered 1); IV level-vs-rank
+alignment; whether to keep trading a construction that is negative at zero friction in research; executor attribution gap; retrain/restart timing for the IB-first flip; Telegram token rotation.
+
+---
