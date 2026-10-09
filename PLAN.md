@@ -14614,3 +14614,40 @@ retrain; `master.py` (weekly health pin, MarketDataService change) needs a FULL 
 toward config; A/B the data-driven event set (NFP/CPI/FOMC only) against today's five; refresh the hardcoded calendar per (d).
 
 ---
+
+## 2026-10-09 - W65 RESULT: the 50-trial optimized walk-forward did NOT optimize (28 of 30 studies had no usable trials); research-vs-live hard-veto gap found
+
+RUN. `python run_backtest.py --symbols SPY QQQ IWM --strategies iron_condor --optimize-per-window --optimize-n-trials 50` at `a0fd328`
+(log `logs/w65_optimized_walkforward_20261009.log`, gitignored): $5k, research history 2024-01-01..2026-10-07 (IB daily + real IV), 5-min VLMC on
+(98.3% coverage), research macro calendar (five types), 10 windows, 10,060 s (2.8 h; the ~3.5 h estimate was a 25% over-estimate).
+
+RESULT AS PRINTED. 6 of 10 windows traded; 16 OOS trades (QQQ 2, IWM 14, SPY 0); win rate 6.25% (1 winner, +$5.12); average loss $50.65, worst
+-$122.90, no trade ever reached its profit target; return -14.24% (-$755), max drawdown 15.20%, Sharpe -4.19, profit factor 0.01; buy-and-hold over
+the span +63.95%. Meta-label gate trained 0/30 (not enough trades), range model trained 30/30.
+
+WHY THAT NUMBER IS NOT AN OPTIMIZED RESULT (measured from the log). In-sample, 28 of 30 Optuna studies had best_value exactly -100.0 and the other two
+-1.258 and -27.358 (0 of 30 positive). `StrategyOptimizer._objective` returns -100.0 when a trial makes fewer than 3 trades (and a (trades/min)^2
+penalty below `optimize_min_trades` = 10), so in 28 studies EVERY one of the 50 trials had < 3 trades in the 365-day training window: the objective was
+flat and TPE had nothing to learn from. With the fixed `optimize_seed` = 42 the first draw is identical in every study, which is why the "best"
+parameters repeat across windows (max_hold_days 9, hurst_regime_threshold 0.114, delta_short 0.206, ...). The OOS trades therefore ran on an
+arbitrary seed-draw parameter set, not tuned parameters.
+
+ROOT CAUSE OF THE ENTRY SCARCITY (code-verified). The research engine applies a Hurst HARD VETO on neutral credit structures: entries are blocked when
+`hurst_scale_spread > max(hurst_regime_threshold, 0.20) x hurst_hard_veto_multiplier` (engine.py ~653). The base is floored at 0.20 and the multiplier
+is fixed at 1.5 and not in the Optuna space, so the veto sits in [0.30, 0.45] for EVERY searched value, while observed spreads are typically 0.5+
+(logged 0.53, 0.69; the Exp 20 comment in the engine says QQQ rarely drops below ~0.43). `hard_veto_fired` appeared 3,780 times in the plain run
+against 1,696 predictions. THE LIVE BOT HAS NO HARD VETO: `bot/orchestrator.py` ~2166-2181 only deducts `hurst_regime_penalty` from confidence when the
+spread exceeds the threshold. So research is far stricter than live on this gate, a research-vs-live parity gap that the W64 parity manifest does not
+list (its rows: wing_k, credit floors, budget, wing cap, contract cap, ...). Other gates seen in the plain-run funnel: macro skips 372, range_no_edge 83,
+IV-rank veto 28.
+
+REGISTERED, NOT FIXED (decisions for the operator). (1) Make the hard veto a config key (`backtest.hurst_hard_veto_multiplier`; 0 disables) and add it to
+the parity manifest; live parity means 0. (2) The objective's flat -100 sentinel gives TPE no gradient when trades are scarce; consider a graded
+penalty, a longer training window, or a lower trade floor. (3) After (1), re-run the plain research run (12 min) to see whether entry counts become
+usable BEFORE spending hours on optimization. (4) A $5k account forces ~$3-wide, ~$0.88-credit condors; whether the strategy has an edge at this
+size is still unanswered by this run. (5) The 16-year IB history exists in research_* tables for longer runs, but the economic calendar only covers
+2024+ (extending the CSV back would keep the macro gate ON in every window).
+
+**NEXT**: operator picks among (1)-(3) above; nothing in this entry changes code or config.
+
+---
