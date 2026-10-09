@@ -14651,3 +14651,43 @@ size is still unanswered by this run. (5) The 16-year IB history exists in resea
 **NEXT**: operator picks among (1)-(3) above; nothing in this entry changes code or config.
 
 ---
+
+## 2026-10-09 - W65 CORRECTION: the Hurst hard veto is NOT the main entry blocker; the research friction model overstates cost; condor payoff is asymmetric at $5k
+
+CORRECTS the "ROOT CAUSE OF THE ENTRY SCARCITY" paragraph of the entry above (append-only: that text stays; this entry supersedes its conclusion). That
+paragraph said the hard veto blocks most days because "observed spreads are typically 0.5+". That was extrapolated from vetoed examples and an old code
+comment; it was not measured. Measured below.
+
+MEASURED (bare engine = no ML gates, no optimization; $5k, 5% budget, budget-aware wings, research IB history + CSV calendar, 2024-01-02..2026-10-08,
+695 bars, features computed once per symbol; each variant ~7 s; scripts were scratchpad one-offs, not committed).
+ [1] Hurst spread distribution (`hurst_scale_spread`): SPY/QQQ p25 0.05-0.06, median 0.13-0.14, p75 0.29, p95 0.79; IWM median 0.18, p75 0.37. Share of
+     days > 0.30 (the veto's minimum cutoff): 24% (SPY/QQQ), 33% (IWM); > 0.45: 16-19%.
+ [2] Veto on (multiplier 1.5) vs off (0): SPY 0 vs 0 trades; QQQ 5 vs 6; IWM 6 vs 9. Disabling it adds 4 trades in total over 2.8 years: it is a minor gate.
+ [3] Visible rejections are small (macro skips 28-36 days, IV-rank-rise veto 2-6, warm-up 21-29). Most days are rejected where NOTHING is logged: the
+     condor builder returns None silently on the IV floor, the credit floor and the credit/width ratio. SPY enters 0 times even with the veto off.
+ [4] Friction is the lever. One QQQ entry decomposed (2024-09-03, IV 0.2175, 14 DTE, $3 wing): MID credit $0.946 (passes the $0.70 floor, which is
+     checked BEFORE friction) -> engine half-spread 6.08% x 4 legs x avg leg mid $2.75 = $0.669 -> credit after friction $0.277 (the recorded entry credit).
+     Median recorded entry credit after friction: QQQ $0.12, IWM $0.55.
+ [5] Real spreads (option_spread_samples, QQQ only, 2026-05-24..08-25): for the contracts condors trade (DTE 7-30, mid >= $0.50; n=608) the half-spread is a
+     median 2.9% (mean 3.8%, p75 4.75%). The engine's stored QQQ calibration (option_spread_params) has spread_base 0.0598 (rmse 0.092, 1,874 samples) because it
+     was fit on ALL quotes including cheap illiquid wings (all-quote mean 9.3%, p95 41.7%). So the engine charges ~2x the measured friction on the contracts
+     that matter. SPY and IWM have no calibration (config formula) and no measured samples.
+ [6] Same runs with calibrated spreads disabled (`AIT_BT_CALIBRATED_SPREADS=0`) and a flat 2.9% half-spread: QQQ 6 trades/0% win/-$328/median credit $0.12 ->
+     10 trades/30% win/-$342/credit $0.53; IWM 9 trades/33% win/-$532/credit $0.55 -> 14 trades/36% win/-$507/credit $0.71. Friction explains the 0% win
+     rate and tiny credits but NOT the loss: the strategy still loses in-sample.
+ [7] Why it still loses (payoff shape, from the per-trade list): $3-wide condors with ~$0.55-0.70 credit give wins of ~$20-25 (take-profit at 50%) against
+     touch-stop losses of -$37 to -$158 (IWM: 8 touch stops vs 5 take-profits). Break-even needs a win rate well above what these entries deliver.
+ CAVEATS: n = 10-14 trades per symbol, one regime, in-sample, no ML range gate, no optimization, QQQ-only spread evidence, my earlier "zero-friction" test was
+ NOT zero (QQQ's calibrated spreads override `spread_base`), and that error is why I first concluded friction did not matter. These findings say the research
+ cost model and gates need fixing BEFORE any calibration; they do not say the strategy has or lacks an edge.
+
+REGISTERED, NOT FIXED. (a) Silent `None` returns in `_build_credit_position` (IV floor, credit floor, credit/width, net credit <= 0) need counters/telemetry so an
+entry funnel is observable. (b) The friction calibration should be fit on the contracts condors trade (DTE 7-30, mid >= $0.50, near the short deltas) and per symbol
+(fresh IB quote samples for SPY and IWM), and checked against real fills (executions ledger has live_mid / nbbo_spread). (c) The credit floor is checked on mid, the
+trade is booked after friction: decide whether the floor should apply to the executable credit, or both be reported. (d) Payoff asymmetry at $5k (touch stop vs 50%
+take-profit on ~$0.6 credits) is a strategy-design question for the operator. (e) Live/research Hurst consistency (shared regime-gate module, veto as a calibratable
+parameter, a penalty that actually reaches the condor entry statistic) remains the right design, but is lower priority than (a)-(c): the veto moves 4 trades.
+
+**NEXT**: operator decides the order of (a)-(e); nothing here changes code or config.
+
+---
