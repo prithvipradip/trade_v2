@@ -255,10 +255,7 @@ class TradingOrchestrator:
 
         # Core services
         self._account = AccountManager(ibkr_client)
-        self._market_data = MarketDataService(
-            ibkr_client,
-            polygon_api_key=settings.api_keys.polygon_api_key,
-        )
+        self._market_data = MarketDataService(ibkr_client)
         self._options_chain = OptionsChainService(
             ibkr_client, self._market_data, settings.options,
         )

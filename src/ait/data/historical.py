@@ -29,6 +29,17 @@ log = get_logger("data.historical")
 
 DB_PATH = Path("data/historical.db")
 
+# W65: provenance tags for the `source` / `iv_source` columns on the daily
+# tables, defined ONCE and imported everywhere (a typo'd literal at a writer is
+# an unreadable provenance column). Legacy rows (before W65) are NULL =
+# "unrecorded"; no provider is ever guessed for them. The intraday table keeps
+# its own pre-existing vocabulary (TRADES / MIDPOINT / YAHOO_ADJ).
+SOURCE_IB_TRADES_RTH = "IB_TRADES_RTH"      # IB daily TRADES bars, regular trading hours
+SOURCE_YAHOO_UNADJ = "YAHOO_UNADJ"          # Yahoo daily bars, auto_adjust=False
+SOURCE_IB_OPTION_IV = "IB_OPTION_IV"        # IB OPTION_IMPLIED_VOLATILITY daily close/OHLC
+SOURCE_UNRECORDED = "UNRECORDED"            # label used when READING NULL source rows
+SOURCE_INVESTING_CSV = "INVESTING_CSV"      # operator-compiled Investing.com economic calendar CSV
+
 # Historical risk-free-rate follow-up: the SOFR term structure's tenor
 # points in days-to-maturity, in the SAME order get_risk_free_rate's SELECT
 # reads its columns (sofr, sofr_30d_avg, sofr_90d_avg, sofr_180d_avg) --
@@ -85,6 +96,7 @@ class HistoricalDataStore:
         self._spread_params_table = f"{table_prefix}option_spread_params"
         self._option_daily_bars_table = f"{table_prefix}option_daily_bars"
         self._risk_free_rates_table = f"{table_prefix}risk_free_rates"
+        self._econ_events_table = f"{table_prefix}econ_events"
         self._init_db()
 
     def _init_db(self) -> None:
@@ -109,6 +121,15 @@ class HistoricalDataStore:
                 )
             except sqlite3.OperationalError:
                 pass  # column already exists
+            # W65 provenance columns (additive, nullable): who supplied the OHLCV
+            # and who supplied implied_vol on each row. Legacy rows stay NULL.
+            for _col in ("source", "iv_source"):
+                try:
+                    conn.execute(
+                        f"ALTER TABLE {self._daily_table} ADD COLUMN {_col} TEXT"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # column already exists
             conn.execute(f"""
                 CREATE INDEX IF NOT EXISTS idx_{self._daily_table}_symbol
                 ON {self._daily_table}(symbol, date)
@@ -147,6 +168,40 @@ class HistoricalDataStore:
                     PRIMARY KEY (symbol, date)
                 )
             """)
+            # W65: economic-event calendar (operator CSV). Dates are ET release dates.
+            # '' (not NULL) in the key columns so the primary key de-duplicates.
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._econ_events_table} (
+                    event_date        TEXT NOT NULL,
+                    event_time_et     TEXT NOT NULL DEFAULT '',
+                    country           TEXT NOT NULL,
+                    currency          TEXT,
+                    importance        TEXT,
+                    event             TEXT NOT NULL,
+                    reference_period  TEXT NOT NULL DEFAULT '',
+                    type              TEXT,
+                    category          TEXT,
+                    actual            REAL,
+                    forecast          REAL,
+                    previous          REAL,
+                    unit              TEXT,
+                    engine_event_type TEXT,
+                    source            TEXT,
+                    source_file       TEXT,
+                    source_sha256     TEXT,
+                    PRIMARY KEY (event_date, event_time_et, country, event, reference_period)
+                )
+            """)
+            conn.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_{self._econ_events_table}_type
+                ON {self._econ_events_table}(engine_event_type, event_date)
+            """)
+            try:  # W65 provenance column on the daily IV-bar table
+                conn.execute(
+                    f"ALTER TABLE {self._daily_iv_table} ADD COLUMN source TEXT"
+                )
+            except sqlite3.OperationalError:
+                pass  # column already exists
             conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS {self._intraday_iv_table} (
                     symbol   TEXT NOT NULL,
@@ -251,8 +306,13 @@ class HistoricalDataStore:
                 )
             """)
 
-    def save(self, symbol: str, df: pd.DataFrame) -> int:
-        """Save historical data for a symbol. Returns number of rows inserted."""
+    def save(self, symbol: str, df: pd.DataFrame, source: str | None = None) -> int:
+        """Save historical data for a symbol. Returns number of rows inserted.
+
+        W65: `source` tags the OHLCV provider (SOURCE_* constants). None leaves an
+        existing tag untouched (COALESCE below), so an untagged older caller can
+        never erase provenance.
+        """
         if df is None or df.empty:
             return 0
 
@@ -271,6 +331,7 @@ class HistoricalDataStore:
                 float(row.get("Low", 0)),
                 float(row.get("Close", 0)),
                 _safe_vol(row.get("Volume", 0)),  # int(NaN) aborted the whole batch (deep-audit DATA-L10)
+                source,
             ))
 
         with sqlite3.connect(self._db_path) as conn:
@@ -281,12 +342,13 @@ class HistoricalDataStore:
             # features. Upsert only the OHLCV columns instead.
             conn.executemany(
                 f"""INSERT INTO {self._daily_table}
-                   (symbol, date, open, high, low, close, volume)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   (symbol, date, open, high, low, close, volume, source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(symbol, date) DO UPDATE SET
                      open=excluded.open, high=excluded.high,
                      low=excluded.low, close=excluded.close,
-                     volume=excluded.volume""",
+                     volume=excluded.volume,
+                     source=COALESCE(excluded.source, source)""",
                 rows,
             )
 
@@ -335,6 +397,82 @@ class HistoricalDataStore:
             return datetime.strptime(result[0], "%Y-%m-%d").date()
         return None
 
+    def save_econ_events(self, df: pd.DataFrame, source: str, source_file: str,
+                         source_sha256: str) -> int:
+        """W65: upsert normalized economic-event rows (see scripts/load_econ_calendar_csv.py).
+
+        Required columns: event_date, event_time_et, country, event, reference_period;
+        optional: currency, importance, type, category, actual, forecast, previous, unit,
+        engine_event_type. Every row is stamped with source/file/hash."""
+        if df is None or df.empty:
+            return 0
+
+        def _f(v):
+            return None if v is None or v != v else float(v)
+
+        def _t(v):
+            return None if v is None or v != v else str(v)
+
+        rows = [(
+            str(r["event_date"]), str(r.get("event_time_et") or ""), str(r["country"]),
+            _t(r.get("currency")), _t(r.get("importance")), str(r["event"]),
+            str(r.get("reference_period") or ""), _t(r.get("type")), _t(r.get("category")),
+            _f(r.get("actual")), _f(r.get("forecast")), _f(r.get("previous")),
+            _t(r.get("unit")), _t(r.get("engine_event_type")),
+            source, source_file, source_sha256,
+        ) for _, r in df.iterrows()]
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                f"""INSERT OR REPLACE INTO {self._econ_events_table}
+                    (event_date, event_time_et, country, currency, importance, event,
+                     reference_period, type, category, actual, forecast, previous, unit,
+                     engine_event_type, source, source_file, source_sha256)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                rows,
+            )
+        log.debug("econ_events_saved", rows=len(rows), source=source)
+        return len(rows)
+
+    def load_econ_events(self, engine_event_types: "list[str] | None" = None,
+                         start: date | None = None, end: date | None = None) -> pd.DataFrame:
+        """W65: stored economic events (all rows, or only the mapped engine types)."""
+        q = f"SELECT * FROM {self._econ_events_table} WHERE 1=1"
+        params: list = []
+        if engine_event_types is not None:
+            q += " AND engine_event_type IN (" + ",".join("?" * len(engine_event_types)) + ")"
+            params += list(engine_event_types)
+        if start:
+            q += " AND event_date >= ?"
+            params.append(str(start))
+        if end:
+            q += " AND event_date <= ?"
+            params.append(str(end))
+        q += " ORDER BY event_date, event_time_et"
+        with sqlite3.connect(self._db_path) as conn:
+            df = pd.read_sql_query(q, conn, params=params)
+        return df
+
+    def econ_events_span(self) -> "tuple[str, str, int] | None":
+        """(first_date, last_date, rows) of the stored events, or None when empty."""
+        with sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(
+                f"SELECT MIN(event_date), MAX(event_date), COUNT(*) FROM {self._econ_events_table}"
+            ).fetchone()
+        return None if not row or not row[2] else (row[0], row[1], int(row[2]))
+
+    def source_summary(self, symbol: str) -> dict[str, tuple[int, str, str]]:
+        """W65: {source: (priced_rows, first_date, last_date)} for a symbol's daily
+        OHLCV. Rows written before W65 report under SOURCE_UNRECORDED (NULL)."""
+        with sqlite3.connect(self._db_path) as conn:
+            rows = conn.execute(
+                f"""SELECT COALESCE(source, ?), COUNT(*), MIN(date), MAX(date)
+                    FROM {self._daily_table}
+                    WHERE symbol = ? AND close IS NOT NULL
+                    GROUP BY COALESCE(source, ?)""",
+                (SOURCE_UNRECORDED, symbol, SOURCE_UNRECORDED),
+            ).fetchall()
+        return {src: (int(n), str(a), str(b)) for src, n, a, b in rows}
+
     def symbols_stored(self) -> list[str]:
         """Get list of all symbols with stored data."""
         with sqlite3.connect(self._db_path) as conn:
@@ -343,7 +481,8 @@ class HistoricalDataStore:
             ).fetchall()
         return [r[0] for r in rows]
 
-    def save_daily_iv(self, symbol: str, iv_series: "pd.Series") -> int:
+    def save_daily_iv(self, symbol: str, iv_series: "pd.Series",
+                      source: str | None = None) -> int:
         """Upsert implied_vol into daily_prices for a symbol.
 
         iv_series must be a pandas Series with date or datetime index and
@@ -376,9 +515,10 @@ class HistoricalDataStore:
                 [(symbol, date_str) for symbol, date_str, _ in rows],
             )
             conn.executemany(
-                f"UPDATE {self._daily_table} SET implied_vol = ? "
+                f"UPDATE {self._daily_table} SET implied_vol = ?, "
+                "iv_source = COALESCE(?, iv_source) "
                 "WHERE symbol = ? AND date = ?",
-                [(iv, sym, date_str) for sym, date_str, iv in rows],
+                [(iv, source, sym, date_str) for sym, date_str, iv in rows],
             )
 
         log.debug("daily_iv_saved", symbol=symbol, rows=len(rows))
@@ -596,7 +736,8 @@ class HistoricalDataStore:
     # single-value self-healing store in daily_prices.implied_vol above).
     # ------------------------------------------------------------------
 
-    def save_daily_iv_bars(self, symbol: str, df: "pd.DataFrame") -> int:
+    def save_daily_iv_bars(self, symbol: str, df: "pd.DataFrame",
+                           source: str | None = None) -> int:
         """Upsert daily IV OHLC bars into the daily_iv table.
 
         df must have a date/DatetimeIndex and columns Open/High/Low/Close
@@ -612,16 +753,18 @@ class HistoricalDataStore:
                 symbol, str(dt),
                 float(row["Open"]), float(row["High"]),
                 float(row["Low"]), float(row["Close"]),
+                source,
             ))
 
         with sqlite3.connect(self._db_path) as conn:
             conn.executemany(
                 f"""INSERT INTO {self._daily_iv_table}
-                   (symbol, date, iv_open, iv_high, iv_low, iv_close)
-                   VALUES (?, ?, ?, ?, ?, ?)
+                   (symbol, date, iv_open, iv_high, iv_low, iv_close, source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(symbol, date) DO UPDATE SET
                        iv_open=excluded.iv_open, iv_high=excluded.iv_high,
-                       iv_low=excluded.iv_low, iv_close=excluded.iv_close""",
+                       iv_low=excluded.iv_low, iv_close=excluded.iv_close,
+                       source=COALESCE(excluded.source, source)""",
                 rows,
             )
 
@@ -754,6 +897,22 @@ class HistoricalDataStore:
                 (cutoff,),
             )
         log.debug("intraday_cleanup_done", keep_days=keep_days)
+
+    def intraday_day_count(self, symbol: str, start: date, end: date,
+                           interval: str = "5m") -> int:
+        """W65: number of distinct session days with stored intraday bars in
+        [start, end]. Timestamps are stored UTC and an RTH session (13:30-21:00 UTC)
+        never crosses a UTC date, so the UTC date prefix IS the session date."""
+        from datetime import timedelta
+        with sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(
+                f"""SELECT COUNT(DISTINCT substr(datetime, 1, 10))
+                    FROM {self._intraday_table}
+                    WHERE symbol = ? AND interval = ?
+                      AND datetime >= ? AND datetime < ?""",
+                (symbol, interval, str(start), str(end + timedelta(days=1))),
+            ).fetchone()
+        return int(row[0] or 0)
 
     def row_count_intraday(self, symbol: str, interval: str = "5m") -> int:
         """Return the total number of stored intraday bars for a symbol."""

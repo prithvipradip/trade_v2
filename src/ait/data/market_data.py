@@ -65,6 +65,8 @@ def load_daily_ohlcv(
     symbol: str,
     days: int = 730,
     db_path: "Path | None" = None,
+    table_prefix: str = "",
+    start_date: "date | None" = None,
 ) -> pd.DataFrame:
     """Load daily OHLCV — IB SQLite store first, Yahoo Finance fallback.
 
@@ -84,15 +86,34 @@ def load_daily_ohlcv(
     onto the returned DataFrame as an `implied_vol` column. Rows without stored
     IV have NaN in that column; callers should check before using.
 
+    W65: with a non-empty `table_prefix` (research runs: config
+    backtest.research_table_prefix) the IB-sourced `{prefix}daily_prices` table is
+    read FIRST — one consistent provider with real volume and real IV, written by
+    scripts/backfill_historical_data.py --mode daily/iv — and only a short result
+    falls through to the legacy path below with a WARNING. `start_date` (config
+    backtest.history_start_date) trims the frame and replaces `days` as the
+    requested span. An empty prefix is byte-identical to the pre-W65 behaviour.
+
     Args:
         symbol:  Ticker symbol.
         days:    Calendar days of history requested (default 2 years).
         db_path: Path to SQLite DB; uses production DB_PATH if None.
+        table_prefix: Research table prefix ("" = live tables, legacy path).
+        start_date:   Earliest date to return (research path only).
 
     Returns:
         DataFrame with DatetimeIndex and [Open, High, Low, Close, Volume, implied_vol].
     """
     from ait.data.historical import HistoricalDataStore, DB_PATH as _DEFAULT_DB
+
+    if table_prefix and not symbol.startswith("^"):   # indices (^VIX) are not in the research store
+        _research = _load_research_daily(
+            symbol, days, db_path or _DEFAULT_DB, table_prefix, start_date)
+        if _research is not None:
+            return _research
+        # fall through to the legacy path (WARNING already logged)
+        if start_date is not None:
+            days = max(days, (today_et() - start_date).days + 30)
 
     store = HistoricalDataStore(db_path=db_path or _DEFAULT_DB)
     df = store.resample_to_daily(symbol, days=days)
@@ -170,43 +191,77 @@ def load_daily_ohlcv(
     return df
 
 
+def _load_research_daily(
+    symbol: str,
+    days: int,
+    db_path,
+    table_prefix: str,
+    start_date,
+) -> "pd.DataFrame | None":
+    """W65: the IB research table path of load_daily_ohlcv. None = not sufficient."""
+    from ait.data.historical import HistoricalDataStore
+
+    store = HistoricalDataStore(db_path=db_path, table_prefix=table_prefix)
+    today = today_et()
+    if start_date is not None:
+        start = start_date
+        span_days = max(1, (today - start_date).days)
+    else:
+        span_days = days
+        start = today - timedelta(days=days + 30)
+    df = store.load(symbol, start_date=start)
+    if not df.empty:
+        # IV-only skeleton rows (save_daily_iv inserts them) have NaN prices.
+        df = df.dropna(subset=["Close"])
+        # Drop today's partial session — same rule as resample_to_daily (A9).
+        df = df[df.index < pd.Timestamp(today)]
+    _expected = max(1, int(span_days * 252 / 365))
+    _needed = max(60, int(_expected * 0.8))
+    if len(df) < _needed:
+        log.warning("research_store_short", symbol=symbol, rows=len(df),
+                    needed=_needed, table_prefix=table_prefix,
+                    start=str(start),
+                    note="IB research history is short for this request; falling back "
+                         "to the legacy loader (5-min resample, then Yahoo). Run "
+                         "scripts/backfill_historical_data.py --mode daily --table-prefix "
+                         f"{table_prefix}")
+        return None
+    df.index.name = "Date"
+    # Real IBKR implied vol from the same research prefix (NaN where absent).
+    try:
+        iv_series = store.load_daily_iv(symbol, days=span_days + 30)
+        df = df.join(iv_series.rename("implied_vol"), how="left") if not iv_series.empty \
+            else df.assign(implied_vol=float("nan"))
+    except Exception as exc:  # noqa: BLE001
+        log.debug("research_iv_join_failed", symbol=symbol, error=str(exc))
+        df = df.assign(implied_vol=float("nan"))
+    log.info("daily_ohlcv_from_research_store", symbol=symbol, rows=len(df),
+             first=str(df.index[0].date()), last=str(df.index[-1].date()),
+             table_prefix=table_prefix)
+    return df
+
+
 class MarketDataService:
     """Fetches market data with per-method fallback chains.
 
-    R16 (docstring was wrong twice): get_quote / get_intraday use
-    IBKR → Yahoo (Polygon is never consulted); get_historical (daily)
-    uses Polygon → Yahoo (IBKR is never consulted).
+    W65 (operator intent: IB is the primary data source, Yahoo the fallback; Polygon
+    is for historical OPTION prices only): get_quote / get_intraday / get_historical
+    (daily) all use IBKR -> Yahoo. get_historical used to be Polygon -> Yahoo with
+    no IBKR step. The frame's `attrs["source"]` records which provider served it
+    (SOURCE_* tags) so ml/trainer.py can persist it with the rows.
     """
-
-    # R16: consecutive Polygon AUTH failures before the client is disabled
-    # for the rest of the process — a dead key burned an HTTPS roundtrip on
-    # every get_historical cache miss (~8-16/day) forever.
-    _POLYGON_AUTH_FAILURE_LIMIT = 3
 
     def __init__(
         self,
         ibkr_client: IBKRClient,
-        polygon_api_key: str = "",
         cache_ttl: int = 60,
     ) -> None:
         self._ibkr = ibkr_client
-        self._polygon_key = polygon_api_key
         self._cache = TTLCache(default_ttl=cache_ttl)
-        self._polygon_client = None
-        self._polygon_auth_failures = 0
         # R9 single-flight: per-cache-key asyncio.Lock so N concurrent cache
         # misses for the same key result in ONE network fetch (the rest wait,
         # then hit the freshly-set cache). Created lazily per key.
         self._fetch_locks: dict[str, asyncio.Lock] = {}
-
-        if polygon_api_key:
-            try:
-                from polygon import RESTClient
-
-                self._polygon_client = RESTClient(api_key=polygon_api_key)
-                log.info("polygon_client_initialized")
-            except ImportError:
-                log.warning("polygon_package_not_installed")
 
     def _lock_for(self, key: str) -> asyncio.Lock:
         """Return the single-flight lock for a cache key (creating if needed).
@@ -257,9 +312,14 @@ class MarketDataService:
     ) -> pd.DataFrame | None:
         """Get historical OHLCV data.
 
-        Tries Polygon first (better data), then Yahoo Finance.
-        Returns DataFrame with columns: Open, High, Low, Close, Volume
+        Daily bars: IBKR first, then Yahoo Finance (W65; was Polygon -> Yahoo).
+        A disconnected client, an IB error or a short IB answer falls through to
+        Yahoo with a WARNING (never silent). Returns columns Open, High, Low,
+        Close, Volume indexed by naive `Date`; `df.attrs["source"]` names the
+        provider (SOURCE_IB_TRADES_RTH / SOURCE_YAHOO_UNADJ).
         """
+        from ait.data.historical import SOURCE_IB_TRADES_RTH, SOURCE_YAHOO_UNADJ
+
         cache_key = f"hist:{symbol}:{days}:{interval}"
         cached = self._cache.get(cache_key)
         if cached is not None:
@@ -271,16 +331,22 @@ class MarketDataService:
                 return cached
 
             df = None
+            source = SOURCE_YAHOO_UNADJ
 
-            # Try Polygon (free tier: 2 years of daily data)
-            if self._polygon_client and interval == "1d":
-                df = await self._get_polygon_historical(symbol, days)
+            if interval == "1d":
+                df = await self._get_ibkr_historical(symbol, days)
+                if df is not None:
+                    source = SOURCE_IB_TRADES_RTH
+                else:
+                    log.warning("daily_history_ib_miss", symbol=symbol, days=days,
+                                note="IB daily history unavailable/short; using Yahoo")
 
             # Fallback to Yahoo
             if df is None:
                 df = await self._get_yahoo_historical(symbol, days, interval)
 
             if df is not None and not df.empty:
+                df.attrs["source"] = source
                 self._cache.set(cache_key, df, ttl=3600)  # 1hr cache for daily data
 
             return df
@@ -587,70 +653,79 @@ class MarketDataService:
 
         return None
 
-    async def _get_polygon_historical(self, symbol: str, days: int) -> pd.DataFrame | None:
-        """Get historical data from Polygon free tier."""
-        if not self._polygon_client:
-            return None
+    @staticmethod
+    def _days_to_ibkr_daily_duration(days: int) -> str:
+        """`days` (a count of daily ROWS, like every caller and the old Polygon path
+        meant it) -> IBKR durationStr for 1-day bars.
 
-        try:
-            end = today_et()
-            start = end - timedelta(days=int(days * 1.5))  # Extra days for non-trading days
+        Over-fetch 1.5x in calendar days (weekends/holidays) and trim with
+        `.tail(days)` afterwards. Measured 2026-10-09: IB rejects "504 D" for 1-day
+        bars (0 bars returned), so anything over a year is expressed in years."""
+        calendar_days = max(1, int(days * 1.5))
+        if calendar_days <= 365:
+            return f"{calendar_days} D"
+        return f"{int(math.ceil(calendar_days / 365))} Y"
 
-            # Network iteration + DataFrame build both offloaded — the agg
-            # list can be thousands of rows and the build blocked the loop.
-            def _fetch_sync() -> pd.DataFrame | None:
-                aggs = list(
-                    self._polygon_client.list_aggs(
-                        ticker=symbol,
-                        multiplier=1,
-                        timespan="day",
-                        from_=start.strftime("%Y-%m-%d"),
-                        to=end.strftime("%Y-%m-%d"),
-                        limit=50000,
-                    )
-                )
-                if not aggs:
-                    return None
-                df = pd.DataFrame(
-                    [
-                        {
-                            "Date": pd.Timestamp(a.timestamp, unit="ms"),
-                            "Open": a.open,
-                            "High": a.high,
-                            "Low": a.low,
-                            "Close": a.close,
-                            "Volume": a.volume,
-                        }
-                        for a in aggs
-                    ]
-                )
-                df.set_index("Date", inplace=True)
-                df.sort_index(inplace=True)
-                return df.tail(days)
-
-            df = await asyncio.wait_for(asyncio.to_thread(_fetch_sync), timeout=30.0)
-            self._polygon_auth_failures = 0  # R16: healthy response resets the breaker
+    @staticmethod
+    def _ibkr_daily_bars_to_df(bars: list) -> pd.DataFrame:
+        """Pure-pandas BarData(daily, formatDate=1 -> datetime.date) -> OHLCV frame."""
+        rows = []
+        for b in bars:
+            try:
+                vol = float(b.volume)
+                rows.append((pd.Timestamp(b.date), float(b.open), float(b.high),
+                             float(b.low), float(b.close), vol if vol > 0 else 0.0))
+            except (TypeError, ValueError):
+                continue
+        df = pd.DataFrame(rows, columns=["Date", "Open", "High", "Low", "Close", "Volume"])
+        if df.empty:
             return df
+        return df.drop_duplicates("Date").set_index("Date").sort_index()
 
-        except Exception as e:
-            msg = str(e)
-            log.debug("polygon_historical_failed", symbol=symbol, error=msg)
-            # R16: nothing ever disabled the client after repeated auth
-            # failures ('Unknown API Key'), so a dead key was retried on
-            # every cache miss indefinitely. Trip a breaker after
-            # _POLYGON_AUTH_FAILURE_LIMIT consecutive auth failures.
-            if any(t in msg.lower() for t in ("unknown api key", "unauthorized", "401", "403")):
-                self._polygon_auth_failures += 1
-                if (
-                    self._polygon_auth_failures >= self._POLYGON_AUTH_FAILURE_LIMIT
-                    and self._polygon_client is not None
-                ):
-                    self._polygon_client = None
-                    log.warning(
-                        "polygon_disabled_auth_failures",
-                        failures=self._polygon_auth_failures,
-                        action="daily history now served by Yahoo only",
-                    )
+    async def _get_ibkr_historical(self, symbol: str, days: int) -> pd.DataFrame | None:
+        """Daily OHLCV from IBKR (TRADES, regular hours), or None to fall to Yahoo.
+
+        Mirrors _get_ibkr_intraday: same `self._ibkr.ib` handle, no change to the
+        broker layer. `^VIX` is the CBOE index; any other `^` symbol is Yahoo-only.
+        None on: no/disconnected client, unqualifiable contract, request error or a
+        short answer (fewer than half of the `days` rows asked for)."""
+        if not self._ibkr or not self._ibkr.connected or days <= 0:
+            return None
+        if symbol.startswith("^") and symbol != "^VIX":
+            return None
+        try:
+            if symbol == "^VIX":
+                from ib_insync import Index
+                contract = Index("VIX", "CBOE", "USD")
+            else:
+                contract = Stock(symbol, "SMART", "USD")
+            qualified = await self._ibkr.qualify_contract(contract)
+            if not qualified:
+                return None
+            bars = await asyncio.wait_for(
+                self._ibkr.ib.reqHistoricalDataAsync(
+                    qualified,
+                    endDateTime="",
+                    durationStr=self._days_to_ibkr_daily_duration(days),
+                    barSizeSetting="1 day",
+                    whatToShow="TRADES",
+                    useRTH=True,
+                    formatDate=1,
+                ),
+                timeout=45.0,
+            )
+            if not bars:
+                return None
+            df = await asyncio.to_thread(self._ibkr_daily_bars_to_df, list(bars))
+            if df.empty:
+                return None
+            df = df.tail(days)
+            if len(df) < max(5, int(days * 0.5)):
+                log.debug("ibkr_daily_short", symbol=symbol, rows=len(df), wanted=days)
+                return None
+            return df
+        except Exception as e:  # noqa: BLE001
+            log.debug("ibkr_daily_failed", symbol=symbol, days=days, error=str(e))
             return None
 
     async def _get_yahoo_historical(

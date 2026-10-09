@@ -1,0 +1,71 @@
+{
+  "table_prefix": "research_",
+  "symbols": [
+    {
+      "symbol": "SPY",
+      "rows": 4021,
+      "source_summary": {
+        "IB_TRADES_RTH": [
+          4021,
+          "2010-10-13",
+          "2026-10-08"
+        ]
+      },
+      "first": "2010-10-13",
+      "last": "2026-10-08",
+      "zero_volume_days": 0,
+      "high_lt_low": 0,
+      "close_outside_range": 0,
+      "gaps_over_limit": 0,
+      "largest_gap_days": 5,
+      "iv_rows": 4019,
+      "iv_min": 0.06508548,
+      "iv_max": 0.78737559,
+      "violations": []
+    },
+    {
+      "symbol": "QQQ",
+      "rows": 4022,
+      "source_summary": {
+        "IB_TRADES_RTH": [
+          4022,
+          "2010-10-12",
+          "2026-10-08"
+        ]
+      },
+      "first": "2010-10-12",
+      "last": "2026-10-08",
+      "zero_volume_days": 0,
+      "high_lt_low": 0,
+      "close_outside_range": 0,
+      "gaps_over_limit": 0,
+      "largest_gap_days": 5,
+      "iv_rows": 4019,
+      "iv_min": 0.08572234,
+      "iv_max": 0.76197638,
+      "violations": []
+    },
+    {
+      "symbol": "IWM",
+      "rows": 4021,
+      "source_summary": {
+        "IB_TRADES_RTH": [
+          4021,
+          "2010-10-13",
+          "2026-10-08"
+        ]
+      },
+      "first": "2010-10-13",
+      "last": "2026-10-08",
+      "zero_volume_days": 0,
+      "high_lt_low": 0,
+      "close_outside_range": 0,
+      "gaps_over_limit": 0,
+      "largest_gap_days": 5,
+      "iv_rows": 4020,
+      "iv_min": 0.10159685,
+      "iv_max": 0.83023676,
+      "violations": []
+    }
+  ]
+}

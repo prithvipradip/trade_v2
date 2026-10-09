@@ -32,6 +32,7 @@ from ait.config.settings import MLConfig
 from ait.ml.ensemble import DirectionPredictor
 from ait.strategies.base import SignalDirection
 from ait.utils.logging import get_logger
+from ait.utils.time import today_et
 
 
 # R12-C: _range_model_worker (spawn-isolated GARCH/MS-GARCH/OU training) was
@@ -69,6 +70,13 @@ class WalkForwardConfig:
     # None -> config (backtest.budget_aware_wings / positions.max_contracts_per_trade).
     budget_aware_wings: bool | None = None
     max_contracts_per_trade: int | None = None
+    # W65 research-history knobs (None = legacy behaviour; the research entry points
+    # resolve them from config.yaml backtest.* and pass them explicitly).
+    history_start_date: "date | None" = None   # trim data + start windows here
+    history_days: int | None = None            # None -> legacy train+test+100
+    vlmc_min_coverage: float = 0.95            # 5-min day coverage needed for VLMC
+    macro_event_types: "tuple[str, ...] | None" = None  # None -> hardcoded live calendar
+    max_windows: int | None = None             # keep only the LAST N windows (timing/pilot runs)
     wing_floor_dollars: float = 2.0   # R6 parity: live iron_condor min wing is $2, not $5
     # R20b (pre-registered PLAN 2026-08-21): was a hardcoded 1.0 — the frozen
     # 2026-07 default that shadowed the PROMOTED live value (contract 1.6 since
@@ -878,7 +886,7 @@ def _window_task_mp(args: tuple) -> tuple:
     """
     (window_id, train_start, train_end, test_start, test_end,
      data, vix_full, spy_full, config, symbols, strategies, db_path, progress_dir,
-     pretrained_range) = args
+     pretrained_range, table_prefix, vlmc_enabled, research_calendar) = args
 
     bt = WalkForwardBacktester(
         symbols=symbols,
@@ -886,7 +894,10 @@ def _window_task_mp(args: tuple) -> tuple:
         config=config,
         db_path=db_path,
         progress_dir=progress_dir,
+        table_prefix=table_prefix,   # W65: a worker used to lose the research prefix
     )
+    bt._vlmc_enabled = vlmc_enabled
+    bt._research_calendar = research_calendar
     wr, best_params, meta_status = bt._run_single_window(
         window_id=window_id,
         train_start=train_start,
@@ -934,6 +945,11 @@ class WalkForwardBacktester:
         self._config = config or WalkForwardConfig()
         self._db_path = db_path
         self._table_prefix = table_prefix
+        # W65: set by _check_vlmc_coverage() once the data span is known. True keeps
+        # the legacy behaviour (a db_path means "use the intraday store").
+        self._vlmc_enabled = True
+        # W65: research macro calendar (built in run() when macro_event_types is set).
+        self._research_calendar = None
         self._progress_dir = Path(progress_dir) if progress_dir else None
         self._global_best_params: dict | None = None
         self._global_best_score: float = -1.0
@@ -993,8 +1009,10 @@ class WalkForwardBacktester:
         # SPY: cross-asset features (relative strength, momentum, correlation) for the ML model.
         from ait.data.market_data import load_daily_ohlcv as _load_ohlcv
         try:
+            _ctx_days = self._context_days()
             _vix_full: pd.DataFrame = _load_ohlcv(
-                "^VIX", days=self._config.train_days + 900, db_path=self._db_path
+                "^VIX", days=_ctx_days, db_path=self._db_path,
+                table_prefix=self._table_prefix,
             )
             # yfinance may return tz-aware index; normalize to tz-naive to match OHLCV data
             if not _vix_full.empty and _vix_full.index.tz is not None:
@@ -1003,7 +1021,9 @@ class WalkForwardBacktester:
             _vix_full = pd.DataFrame()
         try:
             _spy_full: pd.DataFrame = _load_ohlcv(
-                "SPY", days=self._config.train_days + 900, db_path=self._db_path
+                "SPY", days=_ctx_days, db_path=self._db_path,
+                table_prefix=self._table_prefix,
+                start_date=self._config.history_start_date,
             )
             if not _spy_full.empty and _spy_full.index.tz is not None:
                 _spy_full.index = _spy_full.index.tz_localize(None)
@@ -1011,7 +1031,19 @@ class WalkForwardBacktester:
             _spy_full = pd.DataFrame()
 
         # Generate walk-forward windows
+        data = self._apply_research_calendar(data)
         windows = self._generate_windows(data)
+        windows = self._limit_windows(windows)
+        self._check_vlmc_coverage(data)
+        if len(windows) < 3:
+            _spans = {k: (str(v.index[0].date()), str(v.index[-1].date()), len(v))
+                      for k, v in data.items() if not v.empty}
+            log.error("walk_forward_too_few_windows", windows=len(windows),
+                      minimum=3, spans=_spans,
+                      note="the common date range of all symbols is too short for "
+                           "train_days + gap + test_days; run the research backfill "
+                           "(scripts/backfill_historical_data.py --mode research) or "
+                           "lengthen history (backtest.history_start_date / history_days)")
         log.info("walk_forward_windows", count=len(windows))
 
         # Run each window — parallel or sequential depending on optimize_n_jobs
@@ -1047,6 +1079,7 @@ class WalkForwardBacktester:
                     self._symbols, self._strategies,
                     self._db_path, self._progress_dir,
                     pretrained_range_by_window[i],
+                    self._table_prefix, self._vlmc_enabled, self._research_calendar,
                 )
                 for i, (train_start, train_end, test_start, test_end) in enumerate(windows)
             ]
@@ -1461,10 +1494,7 @@ class WalkForwardBacktester:
             # described engine-default drift, not configuration) and limit-fill
             # simulation, matching the live-trading execution model. Also
             # enables capture of limit_price and fill_time on every OOS trade.
-            _oos_intraday_store = None
-            if self._db_path is not None:
-                from ait.data.historical import HistoricalDataStore
-                _oos_intraday_store = HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
+            _oos_intraday_store = self._make_intraday_store()
 
             bt = Backtester(
                 data=test_with_context,
@@ -1477,6 +1507,7 @@ class WalkForwardBacktester:
                 position_size_pct=effective_position_size,
                 budget_aware_wings=window_cfg.budget_aware_wings,
                 max_contracts_per_trade=window_cfg.max_contracts_per_trade,
+                economic_calendar=self._research_calendar,
                 stop_loss_pct=window_cfg.stop_loss_pct,
                 profit_target_pct=window_cfg.profit_target_pct,
                 max_hold_days=window_cfg.max_hold_days,
@@ -1779,10 +1810,7 @@ class WalkForwardBacktester:
             try:
                 # Pass intraday_store+symbol so VLMC features appear in features_cache,
                 # matching the training path used by _train_window_model (Gap B fix).
-                _intraday_store = None
-                if self._db_path is not None:
-                    from ait.data.historical import HistoricalDataStore
-                    _intraday_store = HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
+                _intraday_store = self._make_intraday_store()
                 features_cache = FeatureEngine().compute(
                     train_df, intraday_store=_intraday_store, symbol=symbol,
                     market_context=vix_ctx,
@@ -1834,6 +1862,7 @@ class WalkForwardBacktester:
                     position_size_pct=self._config.position_size_pct,
                     budget_aware_wings=self._config.budget_aware_wings,
                     max_contracts_per_trade=self._config.max_contracts_per_trade,
+                    economic_calendar=self._research_calendar,
                     wing_floor_dollars=self._config.wing_floor_dollars,
                     wing_k=self._config.wing_k,
                     iv_floor=self._config.iv_floor,
@@ -2472,12 +2501,7 @@ class WalkForwardBacktester:
         """
         try:
             from ait.ml.range_predictor import RESEARCH_MODEL_DIR, RangePredictor
-            intraday_store = None
-            if self._db_path is not None:
-                from ait.data.historical import HistoricalDataStore
-                intraday_store = HistoricalDataStore(
-                    db_path=self._db_path, table_prefix=self._table_prefix
-                )
+            intraday_store = self._make_intraday_store()
             rp = RangePredictor(
                 threshold_pct=threshold_pct,
                 horizon_days=max_hold_days,
@@ -2522,10 +2546,7 @@ class WalkForwardBacktester:
         Each window gets a fresh model to prevent data leakage.
         """
         try:
-            intraday_store = None
-            if self._db_path is not None:
-                from ait.data.historical import HistoricalDataStore
-                intraday_store = HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
+            intraday_store = self._make_intraday_store()
 
             _train_ctx: dict = {}
             if vix_full is not None and not vix_full.empty:
@@ -2590,10 +2611,7 @@ class WalkForwardBacktester:
 
         try:
             # Build the feature matrix for the training window (same call as training path)
-            intraday_store = None
-            if self._db_path is not None:
-                from ait.data.historical import HistoricalDataStore
-                intraday_store = HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
+            intraday_store = self._make_intraday_store()
 
             features_df = FeatureEngine().compute(
                 train_df, intraday_store=intraday_store, symbol=symbol
@@ -2618,6 +2636,7 @@ class WalkForwardBacktester:
                 position_size_pct=window_cfg.position_size_pct,
                 budget_aware_wings=window_cfg.budget_aware_wings,
                 max_contracts_per_trade=window_cfg.max_contracts_per_trade,
+                economic_calendar=self._research_calendar,
                 stop_loss_pct=window_cfg.stop_loss_pct,
                 profit_target_pct=window_cfg.profit_target_pct,
                 max_hold_days=window_cfg.max_hold_days,
@@ -2723,6 +2742,94 @@ class WalkForwardBacktester:
         results["portfolio"] = float(np.mean(list(results.values()))) if results else 0.0
         return results
 
+    def _apply_research_calendar(self, data: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+        """W65: build the research macro calendar and keep the gate CONSISTENT.
+
+        When `macro_event_types` is set and `{prefix}econ_events` has rows, the macro
+        gate uses the operator's CSV calendar instead of the hardcoded 2026-27 list.
+        Windows before the calendar's first date would have no gate at all (a mix of
+        gated and ungated windows inside one run), so the data is trimmed to the
+        calendar's span with an ERROR rather than silently mixed. No table / no rows
+        -> WARNING and the legacy hardcoded calendar (pre-W65 behaviour)."""
+        cfg = self._config
+        if cfg.macro_event_types is None or self._db_path is None or not self._table_prefix:
+            return data
+        from ait.data.economic_calendar import build_research_calendar
+        from ait.data.historical import HistoricalDataStore
+        try:
+            cal = build_research_calendar(self._db_path, self._table_prefix, cfg.macro_event_types)
+            span = HistoricalDataStore(self._db_path, self._table_prefix).econ_events_span()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("research_calendar_unavailable", error=str(exc))
+            return data
+        if cal is None or span is None:
+            log.warning("research_calendar_empty", table_prefix=self._table_prefix,
+                        note="no econ_events rows; macro gate uses the hardcoded live "
+                             "calendar (2026+ only). Load the CSV with "
+                             "scripts/load_econ_calendar_csv.py")
+            return data
+        self._research_calendar = cal
+        first = pd.Timestamp(span[0])
+        trimmed = {}
+        for sym, df in data.items():
+            idx = df.index.tz_localize(None) if df.index.tz is not None else df.index
+            if len(df) and idx[0] < first:
+                log.error("macro_calendar_not_covering_span", symbol=sym,
+                          data_start=str(idx[0].date()), calendar_start=span[0],
+                          note="data trimmed to the calendar span so the macro gate is on "
+                               "in every window")
+                df = df[idx >= first]
+            trimmed[sym] = df
+        log.info("research_macro_calendar", event_types=list(cfg.macro_event_types),
+                 span=span[:2], rows=span[2])
+        return trimmed
+
+    def _limit_windows(self, windows: list) -> list:
+        """W65: keep only the most recent `max_windows` windows (timing/pilot runs)."""
+        n = self._config.max_windows
+        if n and len(windows) > n:
+            log.info("walk_forward_windows_limited", total=len(windows), kept=n)
+            return windows[-n:]
+        return windows
+
+    def _make_intraday_store(self):
+        """W65: the (prefixed) intraday store, or None. One place for the five sites
+        that used to build it inline, so the VLMC coverage guard can switch ALL of
+        them off together (never VLMC in some windows and not in others)."""
+        if self._db_path is None or not self._vlmc_enabled:
+            return None
+        from ait.data.historical import HistoricalDataStore
+        return HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
+
+    def _check_vlmc_coverage(self, data: dict[str, pd.DataFrame]) -> None:
+        """W65: VLMC/intraday-fractal features must exist for EVERY window or none.
+
+        The features are left-joined per day from 5-min bars (NaN where a day has
+        none), so partial coverage would put a feature in some windows only — a
+        distribution shift inside one run. Below `vlmc_min_coverage` (per symbol, over
+        the whole data span) the run trains daily-only, loudly."""
+        if self._db_path is None:
+            return
+        from ait.data.historical import HistoricalDataStore
+        store = HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
+        per: dict[str, float] = {}
+        for sym, df in data.items():
+            if df.empty:
+                continue
+            first, last = df.index[0].date(), df.index[-1].date()
+            n = store.intraday_day_count(sym, first, last)
+            per[sym] = round(n / max(1, len(df)), 3)
+        threshold = self._config.vlmc_min_coverage
+        if per and min(per.values()) < threshold:
+            self._vlmc_enabled = False
+            log.warning("vlmc_disabled_low_intraday_coverage", coverage=per,
+                        threshold=threshold, table_prefix=self._table_prefix,
+                        note="daily-only features this run; backfill 5-min bars with "
+                             "scripts/backfill_historical_data.py --mode intraday "
+                             "--what-to-show TRADES --table-prefix " + self._table_prefix)
+        else:
+            log.info("vlmc_enabled", coverage=per, threshold=threshold)
+
     def _generate_windows(self, data: dict[str, pd.DataFrame]) -> list[tuple[date, date, date, date]]:
         """Generate walk-forward train/test date windows."""
         # Find common date range across all symbols
@@ -2749,22 +2856,48 @@ class WalkForwardBacktester:
 
         return windows
 
+    def _context_days(self) -> int:
+        """W65: days of VIX/SPY context to load — the legacy train+900, or the whole
+        research span plus feature warm-up when a history span is configured."""
+        cfg = self._config
+        if cfg.history_start_date is not None:
+            span = (today_et() - cfg.history_start_date).days
+        else:
+            span = cfg.history_days or 0
+        return max(cfg.train_days + 900, span + 400)
+
     async def _fetch_data(self) -> dict[str, pd.DataFrame]:
         """Load daily OHLCV from IB store (fallback: Yahoo Finance)."""
         from ait.data.market_data import load_daily_ohlcv
 
         data = {}
-        fetch_days = self._config.train_days + self._config.test_days + 100
+        cfg = self._config
+        fetch_days = cfg.train_days + cfg.test_days + 100
+        start = cfg.history_start_date
+        if start is not None:
+            fetch_days = max(fetch_days, (today_et() - start).days + 30)
+        elif cfg.history_days:
+            fetch_days = max(fetch_days, cfg.history_days)
 
         for symbol in self._symbols:
             try:
                 loop = asyncio.get_running_loop()
+                # W65: the research kwargs are passed ONLY when set, so a legacy run
+                # (no prefix, no start date) makes the exact pre-W65 call.
+                _kw: dict = {}
+                if self._table_prefix:
+                    _kw["table_prefix"] = self._table_prefix
+                if start is not None:
+                    _kw["start_date"] = start
                 df = await loop.run_in_executor(
                     None,
                     lambda s=symbol: load_daily_ohlcv(
-                        s, days=fetch_days, db_path=self._db_path
+                        s, days=fetch_days, db_path=self._db_path, **_kw
                     ),
                 )
+                if df is not None and start is not None and not df.empty:
+                    _idx = df.index.tz_localize(None) if df.index.tz is not None else df.index
+                    df = df[_idx >= pd.Timestamp(start)]
                 if df is not None and len(df) > 100:
                     # R16 #5: load_daily_ohlcv can return a tz-aware
                     # (America/New_York) index while run() normalizes VIX/SPY

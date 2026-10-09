@@ -7,6 +7,12 @@ Modes:
                         full OHLC into daily_iv
   --mode iv-intraday  — 5-min OPTION_IMPLIED_VOLATILITY OHLC into intraday_iv
   --mode both         — run intraday then iv
+  --mode daily        — (W65) daily TRADES bars with REAL volume into {prefix}daily_prices,
+                        source-tagged IB_TRADES_RTH (Yahoo YAHOO_UNADJ only as a whole-symbol
+                        fallback). Requires --table-prefix (IB volume is ~0.64-0.71x the
+                        stored Polygon/Yahoo volume, so it must never be spliced into the
+                        live table; --allow-live-tables overrides explicitly)
+  --mode research     — (W65) daily then iv, i.e. the research history in one pass
 
 Usage:
     # Seed QQQ 5-min bars for the last 2 years:
@@ -29,6 +35,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import math
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -37,6 +45,14 @@ from pathlib import Path
 _src = Path(__file__).resolve().parent.parent / "src"
 if str(_src) not in sys.path:
     sys.path.insert(0, str(_src))
+
+from ait.data.historical import (  # noqa: E402  (after the sys.path setup above)
+    SOURCE_IB_OPTION_IV, SOURCE_IB_TRADES_RTH, SOURCE_YAHOO_UNADJ,
+)
+
+# W65: a gap larger than this many calendar days in a daily series is a data hole
+# (long weekends/holidays reach 4-5 days).
+MAX_GAP_DAYS = 7
 
 
 # ---------------------------------------------------------------------------
@@ -54,9 +70,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode", default="intraday",
-        choices=["intraday", "iv", "iv-intraday", "both"],
-        help="What to backfill: 5-min bars, daily IV, 5-min IV, or both "
-             "(default: intraday).",
+        choices=["intraday", "iv", "iv-intraday", "both", "daily", "research"],
+        help="What to backfill: 5-min bars, daily IV, 5-min IV, both (intraday+iv), "
+             "daily TRADES bars (W65), or research (daily+iv) (default: intraday).",
     )
     parser.add_argument(
         "--years", type=float, default=2.0, metavar="N",
@@ -99,6 +115,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--table-prefix", default="", metavar="PREFIX",
         help='Table name prefix (default: ""). Use "test_" for test tables.',
+    )
+    parser.add_argument(
+        "--allow-live-tables", action="store_true",
+        help="W65: permit --mode daily/research with an EMPTY --table-prefix (writes IB "
+             "daily bars into the LIVE daily_prices table). Off by default.",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -330,12 +351,177 @@ async def _backfill_iv_symbol(
     )
     ohlc_df.index = pd.to_datetime(ohlc_df.index)
     ohlc_df.sort_index(inplace=True)
-    bars_stored = store.save_daily_iv_bars(symbol, ohlc_df)
+    bars_stored = store.save_daily_iv_bars(symbol, ohlc_df, source=SOURCE_IB_OPTION_IV)
     print(f"  [{symbol}] iv: {bars_stored} daily_iv OHLC rows stored")
 
-    updated = store.save_daily_iv(symbol, iv_series)
+    updated = store.save_daily_iv(symbol, iv_series, source=SOURCE_IB_OPTION_IV)
     print(f"  [{symbol}] iv: {len(all_iv)} values fetched, {updated} daily_prices rows updated")
     return updated
+
+
+# ---------------------------------------------------------------------------
+# W65: daily TRADES bars (research history) + validation
+# ---------------------------------------------------------------------------
+
+def _drop_incomplete_today(df):
+    """Drop today's bar unless the regular session has closed (16:05 ET). A bar fetched
+    mid-session is partial (partial High/Low/Volume, mid-session Close) and would be
+    stored as if it were a finished day."""
+    import pandas as pd
+    from ait.utils.time import now_et
+
+    now = now_et()
+    if df.empty or (now.hour, now.minute) >= (16, 5):
+        return df
+    return df[df.index < pd.Timestamp(now.date())]
+
+
+def _ib_bars_to_daily_df(bars):
+    """IB BarData list (daily, formatDate=1 -> datetime.date) -> OHLCV frame."""
+    import pandas as pd
+
+    rows = []
+    for b in bars:
+        try:
+            rows.append((pd.Timestamp(b.date), float(b.open), float(b.high),
+                         float(b.low), float(b.close), float(b.volume)))
+        except (TypeError, ValueError):
+            continue
+    df = pd.DataFrame(rows, columns=["date", "Open", "High", "Low", "Close", "Volume"])
+    if df.empty:
+        return df
+    df = df.drop_duplicates("date").set_index("date").sort_index()
+    return df
+
+
+async def _fetch_daily_ib(ib, qualified, years: float, pause_secs: float):
+    """One request for the whole span (verified: 16 Y works for SPY/QQQ/IWM); on an
+    error or an empty answer fall back to one-year chunks."""
+    import pandas as pd
+
+    duration = f"{int(math.ceil(max(1.0, years)))} Y"
+    try:
+        bars = await ib.reqHistoricalDataAsync(
+            qualified, endDateTime="", durationStr=duration, barSizeSetting="1 day",
+            whatToShow="TRADES", useRTH=True, formatDate=1)
+        if bars:
+            return _ib_bars_to_daily_df(bars)
+    except Exception as e:  # noqa: BLE001
+        print(f" single request failed ({e}); trying 1-year chunks", end="")
+    frames = []
+    for year_idx in range(int(math.ceil(max(1.0, years)))):
+        end_dt = datetime.now(tz=timezone.utc) - timedelta(days=year_idx * 365)
+        try:
+            bars = await ib.reqHistoricalDataAsync(
+                qualified, endDateTime=end_dt.strftime("%Y%m%d %H:%M:%S") + " UTC",
+                durationStr="1 Y", barSizeSetting="1 day", whatToShow="TRADES",
+                useRTH=True, formatDate=1)
+        except Exception:  # noqa: BLE001
+            bars = None
+        if bars:
+            frames.append(_ib_bars_to_daily_df(bars))
+        time.sleep(pause_secs)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames).sort_index()[lambda d: ~d.index.duplicated()]
+
+
+def _fetch_daily_yahoo(symbol: str, years: float):
+    """Whole-symbol Yahoo fallback (A2): never spliced with IB rows inside a symbol."""
+    import pandas as pd
+    import yfinance as yf
+
+    start = (datetime.now() - timedelta(days=int(years * 366) + 7)).date().isoformat()
+    ydf = yf.Ticker(symbol).history(start=start, interval="1d", auto_adjust=False)
+    if ydf is None or ydf.empty:
+        return pd.DataFrame()
+    df = ydf[["Open", "High", "Low", "Close", "Volume"]].copy()
+    df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
+    return df
+
+
+async def _backfill_daily_symbol(
+    ib, symbol: str, years: float, store, pause_secs: float, dry_run: bool,
+) -> tuple[int, str]:
+    """Fetch daily TRADES bars for one symbol. Returns (rows_stored, source_tag).
+
+    IB first; if IB cannot serve the symbol (qualification/request failure or an
+    empty/short answer) the WHOLE symbol comes from Yahoo and is tagged
+    YAHOO_UNADJ with a warning (its IV stays empty -> the engine's VIX-proxy path).
+    """
+    from ib_insync import Stock
+
+    print(f"  [{symbol}] daily TRADES {int(math.ceil(max(1.0, years)))} Y", end="", flush=True)
+    if dry_run:
+        print(" [DRY RUN]")
+        return 0, SOURCE_IB_TRADES_RTH
+
+    df = None
+    source = SOURCE_IB_TRADES_RTH
+    try:
+        qualified_list = await ib.qualifyContractsAsync(Stock(symbol, "SMART", "USD"))
+        if qualified_list:
+            df = await _fetch_daily_ib(ib, qualified_list[0], years, pause_secs)
+    except Exception as e:  # noqa: BLE001
+        print(f" IB error: {e}", end="")
+    expected = int(years * 252 * 0.8)
+    if df is None or df.empty or len(df) < expected:
+        print(f"\n  [{symbol}] WARNING: IB daily short/unavailable "
+              f"({0 if df is None else len(df)} < {expected}); using Yahoo for the whole symbol")
+        df = _fetch_daily_yahoo(symbol, years)
+        source = SOURCE_YAHOO_UNADJ
+    if df is None or df.empty:
+        print(f"  [{symbol}] ERROR: no daily bars from IB or Yahoo")
+        return 0, source
+    df = _drop_incomplete_today(df)
+    n = store.save(symbol, df, source=source)
+    print(f" -> {n} rows stored [{source}] {df.index[0].date()}..{df.index[-1].date()}")
+    return n, source
+
+
+def _validate_daily(store, symbol: str) -> dict:
+    """W65 validation report for one symbol's research daily rows."""
+    import pandas as pd
+
+    df = store.load(symbol).dropna(subset=["Close"])
+    rep: dict = {"symbol": symbol, "rows": int(len(df)),
+                 "source_summary": {k: list(v) for k, v in store.source_summary(symbol).items()}}
+    if df.empty:
+        rep.update(first=None, last=None, violations=["no rows"])
+        return rep
+    gaps = df.index.to_series().diff().dt.days
+    iv = store.load_daily_iv(symbol, days=int((pd.Timestamp.now() - df.index[0]).days) + 60)
+    viol: list[str] = []
+    hl = int((df.High < df.Low).sum())
+    outside = int(((df.Close > df.High + 1e-9) | (df.Close < df.Low - 1e-9)).sum())
+    zero_vol = int((df.Volume <= 0).sum())
+    big_gaps = int((gaps > MAX_GAP_DAYS).sum())
+    if hl:
+        viol.append(f"{hl} rows with high < low")
+    if outside:
+        viol.append(f"{outside} rows with close outside [low, high]")
+    if zero_vol:
+        viol.append(f"{zero_vol} zero-volume days")
+    if big_gaps:
+        viol.append(f"{big_gaps} gaps > {MAX_GAP_DAYS} calendar days")
+    rep.update(first=str(df.index[0].date()), last=str(df.index[-1].date()),
+               zero_volume_days=zero_vol, high_lt_low=hl, close_outside_range=outside,
+               gaps_over_limit=big_gaps, largest_gap_days=int(gaps.max()) if len(gaps) > 1 else 0,
+               iv_rows=int(len(iv)),
+               iv_min=float(iv.min()) if len(iv) else None,
+               iv_max=float(iv.max()) if len(iv) else None,
+               violations=viol)
+    return rep
+
+
+def _write_validation_report(reports: list[dict], table_prefix: str) -> Path:
+    from ait.utils.time import now_et
+
+    out_dir = Path(__file__).resolve().parent.parent / "reports"
+    out_dir.mkdir(exist_ok=True)
+    path = out_dir / f"research_history_{now_et().strftime('%Y%m%d')}.json"
+    path.write_text(json.dumps({"table_prefix": table_prefix, "symbols": reports}, indent=2))
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -428,8 +614,16 @@ async def _main(args: argparse.Namespace) -> int:
     from ait.data.historical import HistoricalDataStore
 
     do_intraday = args.mode in ("intraday", "both")
-    do_iv = args.mode in ("iv", "both")
+    do_iv = args.mode in ("iv", "both", "research")
     do_iv_intraday = args.mode == "iv-intraday"
+    do_daily = args.mode in ("daily", "research")
+
+    # W65 guard: IB daily volume is ~0.64-0.71x the stored (Polygon/Yahoo) volume, so
+    # daily bars must never be spliced into the live table by accident.
+    if do_daily and not args.table_prefix and not args.allow_live_tables:
+        print("ERROR: --mode daily/research needs a non-empty --table-prefix "
+              "(e.g. research_); pass --allow-live-tables to write the LIVE table.")
+        return 2
 
     intraday_chunks = (
         _build_chunks(args.years, args.chunk_months)
@@ -438,6 +632,7 @@ async def _main(args: argparse.Namespace) -> int:
     total_requests = (
         len(args.symbols) * len(intraday_chunks) * int(do_intraday or do_iv_intraday)
         + len(args.symbols) * int(max(1, args.years)) * int(do_iv)
+        + len(args.symbols) * int(do_daily)          # W65: one request per symbol
     )
 
     print(f"Backfill plan: {len(args.symbols)} symbol(s), mode={args.mode}")
@@ -449,6 +644,9 @@ async def _main(args: argparse.Namespace) -> int:
         print(f"  iv-intraday: {len(intraday_chunks)} chunk(s) × {len(args.symbols)} = "
               f"{len(intraday_chunks) * len(args.symbols)} IBKR requests "
               f"[whatToShow=OPTION_IMPLIED_VOLATILITY, bar=5 mins]")
+    if do_daily:
+        print(f"  daily TRADES: 1 request × {len(args.symbols)} symbol(s) "
+              f"({int(math.ceil(max(1.0, args.years)))} Y each) [source={SOURCE_IB_TRADES_RTH}]")
     if do_iv:
         print(f"  daily iv: {int(max(1, args.years))} chunk(s) × {len(args.symbols)} = "
               f"{int(max(1, args.years)) * len(args.symbols)} IBKR requests")
@@ -462,6 +660,9 @@ async def _main(args: argparse.Namespace) -> int:
                     print(f"  [{sym}] {'iv-intraday' if do_iv_intraday else 'intraday'} "
                           f"chunk {i}/{len(intraday_chunks)}: {dur} "
                           f"ending {end_dt.strftime('%Y%m%d %H:%M:%S')} UTC")
+            if do_daily:
+                print(f"  [{sym}] daily TRADES {int(math.ceil(max(1.0, args.years)))} Y "
+                      f"-> {args.table_prefix}daily_prices [DRY RUN]")
             if do_iv:
                 total_years = int(max(1, args.years))
                 for y in range(total_years):
@@ -508,6 +709,15 @@ async def _main(args: argparse.Namespace) -> int:
             print(f"  [{sym}] iv-intraday total rows upserted: {n}")
             grand_total += n
 
+        if do_daily:
+            print(f"  Backfilling daily TRADES bars for {sym}...")
+            n, _src_tag = await _backfill_daily_symbol(
+                ib, sym, args.years, store, pause_secs=args.pause_secs, dry_run=args.dry_run,
+            )
+            grand_total += n
+            if do_iv:
+                time.sleep(args.pause_secs)
+
         if do_iv:
             print(f"  Backfilling daily IV for {sym}...")
             n = await _backfill_iv_symbol(
@@ -520,6 +730,22 @@ async def _main(args: argparse.Namespace) -> int:
     elapsed = time.time() - t_start
     print(f"\nDone. {grand_total} total rows written across {len(args.symbols)} "
           f"symbol(s) in {elapsed:.1f}s.")
+
+    if do_daily or do_iv:
+        reports = [_validate_daily(store, sym) for sym in args.symbols]
+        path = _write_validation_report(reports, args.table_prefix)
+        bad = 0
+        print("\nValidation:")
+        for r in reports:
+            v = r.get("violations") or []
+            bad += len(v)
+            print(f"  [{r['symbol']}] rows={r['rows']} {r.get('first')}..{r.get('last')} "
+                  f"iv_rows={r.get('iv_rows')} sources={r.get('source_summary')} "
+                  f"violations={v or 'none'}")
+        print(f"  report: {path}")
+        if bad:
+            print(f"ERROR: {bad} validation violation(s)")
+            return 3
     return 0
 
 

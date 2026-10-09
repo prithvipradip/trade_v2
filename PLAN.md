@@ -14503,3 +14503,114 @@ data-length investigation before trusting any $5k backtest, then (a) probe calib
 own waves.
 
 ---
+
+## 2026-10-09 - W65: IB research history (daily + IV + 5-min + economic calendar), provenance columns, IB-first live bars, VLMC/gate consistency
+
+WHY. W64 registered finding (b): on this box the default `run_backtest` and the weekly health backtest produced 2 windows and 0
+trades regardless of sizing. Goal: run an optimized walk-forward with the W63/W64 parameters ($5k, 5% budget, 4.5% breaker, $0.70 floor).
+
+ROOT CAUSE (measured, read-only). [1] `load_daily_ohlcv` built daily bars by resampling stored 5-min bars and never read `daily_prices`;
+stored 5-min coverage SPY ~2y, QQQ/IWM 1 month. [2] `WalkForwardBacktester._fetch_data` requested train+test+100 = 528 days and
+`_generate_windows` uses the COMMON range => 353-384 bars, 2 windows. [3] `daily_prices` is a mixed history: QQQ 15y but volume 0 on
+3,283 of 3,798 days; SPY/IWM 616 rows from 2024-04 (written by the ML trainer, `ml.lookback_days: 504`; no source column).
+
+WHAT I FOUND ALONG THE WAY (evidence).
+ - IB serves 16 years (2010-10 to now) of daily TRADES bars WITH real volume and daily OPTION_IMPLIED_VOLATILITY for SPY/QQQ/IWM in one
+   request each; closes equal stored closes exactly (ratio 1.00000); IB daily volume is 0.64-0.71x the stored volume (different
+   definition), so IB history must never be spliced into the live table. IB also serves the VIX index (`Index('VIX','CBOE')`) and 5-min
+   bars to at least 2015. IB REJECTS "504 D" for daily bars (0 bars): durations over a year must be years.
+ - 5-min bars feed 26 per-day VLMC / intraday-fractal columns (13 VLMC session + 7 intraday fractal + ...), left-joined onto the daily frame,
+   used by the live orchestrator, the trainer, the ensemble and the range predictor. In walk-forward they exist only when `db_path` is passed
+   (the default run passed none => daily-only models, unlike live). Last 504 trading days: 5-min coverage SPY 97%, QQQ 4%, IWM 4% => live
+   QQQ/IWM models see VLMC NaN on ~96% of training rows (live train/serve skew, REGISTERED, not changed).
+ - LATENT BUG, FIXED: `FeatureEngine._merge_intraday_features` loaded `load_intraday(days=len(features)+10)` = the last N calendar days counted
+   back from TODAY, so for any historical frame it matched nothing (`vlmc_features_merged matched_days=0`): VLMC was NaN in older windows and
+   real only in recent ones. It now aligns by the frame's own date range (`load_intraday_range`); matched_days 0 -> 128-146 per call. LIVE
+   NOTE: the same function serves the live trainer, so after the next retrain SPY's live models see VLMC on their whole training span, not
+   only the last ~514 days.
+ - Source order: the code's daily-bar path was Polygon -> Yahoo (no IB), contrary to the intended design (IB primary, Yahoo fallback, Polygon
+   for historical OPTION prices only). Which provider wrote existing rows is unrecorded (logs inconclusive).
+ - Operator CSV `data/investing_econ_calendar_2024-01-01_onward_UTC.csv` (42,994 rows, UTC): 2024 FOMC/CPI/NFP match the official dates 32/32;
+   2026 FOMC equals the engine's hardcoded list; it differs on Jan-2026 CPI (Feb 13 vs hardcoded Feb 11), NFP (Feb 11 vs Feb 6) and Core PCE
+   (9 of 10 dates) and is consistent with the late-2025 shutdown (no Oct-2025 CPI; Oct+Nov NFP on 2025-12-16; Oct+Nov PCE on 2026-01-22), so
+   the hardcoded 2026 list looks stale for Feb-Apr 2026 (not verified against BLS/BEA; audit in `reports/econ_calendar_audit_20261008.json`).
+   Forward coverage after 2026-10-09 is FOMC-only plus one CPI (2026-10-14): it cannot replace the live forward calendar. Event-day moves
+   (SPY/QQQ/IWM, 2024-04..2026-10, 106 event days): NFP mean |ret| 1.08% vs 0.64% non-event (QQQ 1.53 vs 0.91); FOMC widens the intraday range
+   (SPY 1.26 vs 1.01); CPI mild; PCE ~ no effect; GDP advance n=3. Small samples, one regime: directional only.
+
+WHAT CHANGED.
+[1] PROVENANCE: nullable `source` / `iv_source` on `{prefix}daily_prices`, `source` on `{prefix}daily_iv` (additive ALTER, same pattern as
+    `implied_vol`; legacy rows stay NULL, reported as UNRECORDED, never guessed). Constants `SOURCE_IB_TRADES_RTH`, `SOURCE_YAHOO_UNADJ`,
+    `SOURCE_IB_OPTION_IV`, `SOURCE_INVESTING_CSV` in `data/historical.py`; `save*` take `source=None` and COALESCE so an untagged caller never
+    erases a tag; `source_summary(symbol)`, `intraday_day_count(...)`. Live `daily_prices` gained the two columns (values untouched).
+[2] RESEARCH HISTORY: `scripts/backfill_historical_data.py --mode daily|research` (IB TRADES daily bars, whole-symbol Yahoo fallback tagged
+    YAHOO_UNADJ, validation report `reports/research_history_<date>.json`; REFUSES an empty `--table-prefix` unless `--allow-live-tables`);
+    `both` keeps its old meaning. Loaded (TWS paper): `research_daily_prices` SPY/QQQ/IWM 4,021 rows each 2010-10-13..2026-10-08, IV ~4,020 rows,
+    every row tagged, validation violations none; 5-min TRADES bars 2023-10..2026-10, 171,936 rows, day coverage 98.3% for each symbol.
+    Live price/IV/intraday row counts before/after identical (10,642 / 12,808 / 40,882).
+[3] LOADER + CONFIG: `load_daily_ohlcv(table_prefix, start_date)` reads the research tables first (drops NaN-close skeleton rows and today's
+    partial bar, joins real IV, same 80% coverage test, WARNING `research_store_short` then legacy path); empty prefix and `^` index symbols
+    are byte-identical to before. `BacktestConfig`: `history_start_date` (config 2024-01-01), `history_days`, `research_table_prefix`
+    (`research_`), `vlmc_min_coverage` (0.95), `macro_event_types` (FOMC, CPI, NFP, PCE, GDP).
+[4] WALK-FORWARD: `WalkForwardConfig` research fields (all None/legacy by default), `_fetch_data`/context days from the span, the prefix and a
+    VLMC flag now reach the parallel workers (a worker used to lose the prefix), one `_make_intraday_store()` replaces five inline builders,
+    `_check_vlmc_coverage` disables VLMC for the WHOLE run (WARNING, daily-only) below the coverage threshold, `walk_forward_too_few_windows`
+    ERROR below 3 windows, `--max-windows`. `run_backtest.py` flags `--history-days --table-prefix --db-path --max-windows`; research mode is
+    now the default when the config prefix is set. `_fetch_data` passes the new kwargs only when set (legacy call signature unchanged).
+[5] ECONOMIC CALENDAR: `scripts/load_econ_calendar_csv.py` (BOM, UTC->ET, 76 duplicates dropped, five engine types derived: GDP = advance
+    estimate only, combined releases collapse to one date) -> `research_econ_events`, rows tagged INVESTING_CSV + file name + SHA-256;
+    `EconomicCalendar(events=None)` (None = the hardcoded live calendar, unchanged); `build_research_calendar`; `Backtester(economic_calendar=)`;
+    the walk-forward trims data to the calendar's span (ERROR, never a gated/ungated mix). Loaded: 32 CPI, 32 FOMC, 34 NFP, 33 PCE, 11 GDP dates.
+[6] SPAN DECISION: research history starts 2024-01-01 = the CSV's first day, so the macro gate is ON in every window: 10 windows
+    (OOS 2025-01-06 .. 2026-09-28). The 16-year daily/IV history is loaded for later runs.
+[7] LIVE SOURCE FLIP (operator decision): `MarketDataService.get_historical` is IB -> Yahoo (was Polygon -> Yahoo): new `_get_ibkr_historical`
+    (same `self._ibkr.ib` handle as the intraday path; no change to `broker/ibkr_client.py`), `^VIX` via the CBOE index, other `^` -> Yahoo,
+    `days` kept as a count of ROWS (1.5x calendar days then `.tail(days)`; 504 -> "3 Y", 30 -> "45 D"; plan text said 504 -> "2 Y": that returned
+    501 rows), a disconnected/short/failed IB answer falls to Yahoo with WARNING `daily_history_ib_miss`, frames carry `attrs["source"]` and
+    `ml/trainer.py` persists it. The Polygon stock-bar path and the unused `polygon_api_key` argument are removed (both call sites updated);
+    Polygon remains option-only (`backfill_option_history.py`). Verified live against TWS: SPY/QQQ/IWM/^VIX at 30/120/504 days all served by IB,
+    shape unchanged, closes identical to the research table.
+[8] CONSISTENCY FIXES found by running it: (a) VLMC date alignment (above); (b) the pool allocator re-rejected a trade the engine took on the
+    mid-credit gate: the engine records `budget_gate_risk_per_contract` and `allocate_pool` reuses it; (c) `master.py` weekly health backtest now
+    passes `--max-windows 4` (the 10-window run takes ~12 min against its 600 s timeout).
+[9] OPTIMIZER: drops `iron_condor__wing_k` from the search when the budget cap (budget/90 = $2.78 wing at $5k/5%) is below every searched wing_k
+    at the low end of IV (log `optimizer_dropped_inert_param`); standalone `run_optimizer.py` / `StrategyOptimizer` take the research prefix, db path,
+    start date and calendar.
+
+MEASURED (research run, SPY/QQQ/IWM, $5k, 2024-01-01 .. 2026-10-07, IB history + CSV calendar + VLMC enabled at 98.3% coverage).
+ - Plain run (no optimization, BEFORE fixes 8a/8b): 10 windows generated, 7 with results, 5 trades total, win rate 20%, return -1.66%, max
+   drawdown 1.67%, 739.5 s. Entry funnel from the log: Hurst-regime hard veto fired 3,780 times against 1,696 predictions, macro-event skips 372,
+   `range_no_edge` 83, IV-rank veto 28. The veto thresholds (`hurst_regime_threshold` etc.) are exactly what per-window Optuna tunes.
+ - Timing pilot (optimization, 5 trials, last 2 windows, after 8a/8b): 410 s for 2 windows x 3 symbols (~8 s per trial); `wing_k` dropped; 5 trades,
+   -2.79% (not a result: 5 trials). EXTRAPOLATION for 10 windows x 50 trials: ~3.5 hours (not measured end to end).
+ - Live-flip volume drift (reports/volume_feature_drift_20261009.json): raw `Volume` is NOT a model feature; the model's volume features are
+   ratios and nearly identical between IB and stored volume (mean ratios 0.94-1.00, corr 0.86-0.99); only `obv_change` on IWM drifts (mean ratio
+   -0.34, corr -0.08; SPY 0.97 / 0.99). So the post-flip retrain is advisable, not urgent.
+ - Fast lane at the final tree: 2968 passed / 0 failed / 45 skipped (153 deselected); typecheck OK; smoke_deploy SMOKE PASS (13).
+
+PLAN DEVIATIONS (all decided in-wave, recorded here). `--mode research` (daily+iv) added instead of changing `both`; the existing script's
+default `--client-id 90` kept (runs used 98 explicitly); `history_start_date` default is None in code and 2024-01-01 in config; a data-length
+guard and `--max-windows` were added; the eight-point fix list above went beyond the plan because the real run exposed it.
+
+REGISTERED, NOT FIXED.
+ (a) Trade scarcity at $5k: 5 OOS trades in ~2.5 years with default parameters; the optimized pilot is the test of whether per-window tuning
+     opens it up. Results of the 50-trial run are NOT in this entry (it was launched after this commit).
+ (b) The supervisor's retrain job builds `MarketDataService(None)` (no IB client), so it fetches daily bars from Yahoo after the flip while the
+     live bot fetches from IB. Same modest volume-scale drift as above; giving the supervisor an IB client is a critical-area change (operator).
+ (c) Live QQQ/IWM VLMC training coverage is 4% of the window (a live top-up of `intraday_prices` would fix it; needs a retrain to help).
+ (d) The hardcoded 2026 calendar looks stale for Feb-Apr 2026 (audit report); Nov/Dec 2026 and 2027-H1 dates cannot be checked from the CSV.
+ (e) `^VIX` research context still comes from Yahoo (the live path now uses IB); legacy `daily_prices` rows have NULL provenance; other tables
+     (`option_daily_bars`, `risk_free_rates`, spread samples) have none; the unprefixed loader still ignores `daily_prices`.
+ (f) `data/` is gitignored: the research tables and the CSV are NOT in git. Reproduce with `backfill_historical_data.py --mode research
+     --table-prefix research_ --years 16`, `--mode intraday --what-to-show TRADES --years 3 --chunk-months 6 --table-prefix research_`, and
+     `load_econ_calendar_csv.py --csv <file> --table-prefix research_`; the CSV's SHA-256 is stored with every calendar row.
+
+DEPLOY / OPERATOR NOTES. No process restarted, no retrain run. The bot reads the IB-first daily path and the VLMC fix only after a restart and
+retrain; `master.py` (weekly health pin, MarketDataService change) needs a FULL supervisor restart. Prithvi's box: the new defaults make
+`run_backtest` research-mode only where the `research_*` tables exist (otherwise it falls back loudly to the legacy loader).
+
+**NEXT**: operator decides (1) retrain + restart timing for the IB-first flip and the VLMC fix, (2) whether the supervisor gets an IB client (b),
+(3) whether to top up live QQQ/IWM 5-min bars (c). Then read the 50-trial optimized walk-forward result and decide which parameters, if any, move
+toward config; A/B the data-driven event set (NFP/CPI/FOMC only) against today's five; refresh the hardcoded calendar per (d).
+
+---

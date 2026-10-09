@@ -251,7 +251,8 @@ class ModelTrainer:
                 log.warning("no_data_for_training", symbol=symbol)
                 continue
 
-            self._store.save(symbol, df)
+            # W65: persist the provider that served the frame (IB_TRADES_RTH / YAHOO_UNADJ)
+            self._store.save(symbol, df, source=df.attrs.get("source"))
             accuracies = self._predictor.train(
                 df, symbol=symbol, market_context=market_context
             )

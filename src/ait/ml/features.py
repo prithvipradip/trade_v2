@@ -144,7 +144,20 @@ class FeatureEngine:
     ) -> pd.DataFrame:
         """Compute per-day VLMC features from 5-min sessions and left-join onto features."""
         try:
-            intraday = intraday_store.load_intraday(symbol, days=len(features) + 10)
+            # W65: align by the frame's own DATE RANGE. This used to load the last
+            # `len(features)+10` calendar days counted back from TODAY, so for any
+            # historical frame (a walk-forward window's train/test slice) it never
+            # overlapped the dates: every VLMC column came out NaN
+            # (`vlmc_features_merged matched_days=0`) in older windows and real only
+            # in the most recent ones. Live is unaffected where it already matched:
+            # a recent frame's range simply covers more of the stored bars.
+            _load_range = getattr(intraday_store, "load_intraday_range", None)
+            if _load_range is not None and len(features):
+                intraday = _load_range(
+                    symbol, pd.Timestamp(features.index.min()).date(),
+                    pd.Timestamp(features.index.max()).date())
+            else:
+                intraday = intraday_store.load_intraday(symbol, days=len(features) + 10)
             if intraday.empty:
                 return features
 

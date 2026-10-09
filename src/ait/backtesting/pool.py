@@ -115,12 +115,16 @@ def allocate_pool(
                     0.0, {k: v for k, v in t.items() if k != "_pool_size_pct"})
                 continue
             pct = float(t.get("_pool_size_pct") or position_size_pct)
-            afford = int(math.floor(equity * pct / per_contract))
+            # W65: gate on the SAME per-contract risk the engine's budget gate used
+            # (mid-credit when budget-aware), as live does; fall back to the recorded
+            # max loss for trades that do not carry it.
+            gate_pc = float(t.get("budget_gate_risk_per_contract") or 0.0) or per_contract
+            afford = int(math.floor(equity * pct / gate_pc))
             contracts = min(engine_contracts, afford)
             if contracts < 1:
                 result.rejections["unaffordable"] += 1
                 continue
-            risk = per_contract * contracts
+            risk = gate_pc * contracts
             if open_risk + risk > equity * max_portfolio_risk_pct:
                 result.rejections["portfolio_risk"] += 1
                 continue

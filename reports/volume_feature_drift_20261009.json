@@ -1,0 +1,150 @@
+{
+  "SPY": [
+    {
+      "feature": "Volume",
+      "mean_ratio": 0.6477297569487636,
+      "std_ratio": 0.7242079087810481,
+      "corr": 0.9603698918663308
+    },
+    {
+      "feature": "realized_vol_20",
+      "mean_ratio": 1.0,
+      "std_ratio": 1.0,
+      "corr": 1.0
+    },
+    {
+      "feature": "realized_vol_10",
+      "mean_ratio": 1.0,
+      "std_ratio": 1.0,
+      "corr": 0.9999999999999999
+    },
+    {
+      "feature": "volume_sma_20_ratio",
+      "mean_ratio": 1.0002206099261053,
+      "std_ratio": 1.0176780803268792,
+      "corr": 0.9552479662411011
+    },
+    {
+      "feature": "obv_change",
+      "mean_ratio": 0.9709145456474879,
+      "std_ratio": 1.0534370130516957,
+      "corr": 0.9925900165714102
+    },
+    {
+      "feature": "volume_trend",
+      "mean_ratio": 0.9993943429320552,
+      "std_ratio": 1.0169732557891058,
+      "corr": 0.9668185806765609
+    },
+    {
+      "feature": "volume_confirmation",
+      "mean_ratio": 0.9846153846153846,
+      "std_ratio": 0.9950227723495277,
+      "corr": 0.8633638535219424
+    },
+    {
+      "feature": "vol_ratio",
+      "mean_ratio": 1.0,
+      "std_ratio": 1.0,
+      "corr": 1.0
+    },
+    {
+      "feature": "vol_trend",
+      "mean_ratio": 1.0,
+      "std_ratio": 1.0,
+      "corr": 1.0
+    },
+    {
+      "feature": "vol_of_vol",
+      "mean_ratio": 1.0,
+      "std_ratio": 1.0,
+      "corr": 1.0
+    },
+    {
+      "feature": "vol_regime_expanding",
+      "mean_ratio": 1.0,
+      "std_ratio": 1.0,
+      "corr": 0.9999999999999999
+    },
+    {
+      "feature": "vol_mean_reversion_signal",
+      "mean_ratio": 1.0,
+      "std_ratio": 1.0,
+      "corr": 1.0
+    }
+  ],
+  "IWM": [
+    {
+      "feature": "Volume",
+      "mean_ratio": 0.659886919764393,
+      "std_ratio": 0.6834578062516645,
+      "corr": 0.9581929702782006
+    },
+    {
+      "feature": "realized_vol_20",
+      "mean_ratio": 1.0,
+      "std_ratio": 1.0,
+      "corr": 1.0
+    },
+    {
+      "feature": "realized_vol_10",
+      "mean_ratio": 1.0,
+      "std_ratio": 1.0,
+      "corr": 0.9999999999999998
+    },
+    {
+      "feature": "volume_sma_20_ratio",
+      "mean_ratio": 1.0017485746846886,
+      "std_ratio": 1.0445923351223794,
+      "corr": 0.9594314796506705
+    },
+    {
+      "feature": "obv_change",
+      "mean_ratio": -0.33661654726463297,
+      "std_ratio": 0.34980063527601407,
+      "corr": -0.07930476890437059
+    },
+    {
+      "feature": "volume_trend",
+      "mean_ratio": 1.0007684909841892,
+      "std_ratio": 1.0496190030216832,
+      "corr": 0.9668341969262683
+    },
+    {
+      "feature": "volume_confirmation",
+      "mean_ratio": 0.9387755102040817,
+      "std_ratio": 0.9812475106375513,
+      "corr": 0.8583545555009409
+    },
+    {
+      "feature": "vol_ratio",
+      "mean_ratio": 1.0,
+      "std_ratio": 1.0,
+      "corr": 1.0
+    },
+    {
+      "feature": "vol_trend",
+      "mean_ratio": 1.0,
+      "std_ratio": 1.0,
+      "corr": 1.0
+    },
+    {
+      "feature": "vol_of_vol",
+      "mean_ratio": 1.0,
+      "std_ratio": 1.0,
+      "corr": 1.0
+    },
+    {
+      "feature": "vol_regime_expanding",
+      "mean_ratio": 1.0,
+      "std_ratio": 1.0,
+      "corr": 1.0
+    },
+    {
+      "feature": "vol_mean_reversion_signal",
+      "mean_ratio": 1.0,
+      "std_ratio": 1.0,
+      "corr": 1.0
+    }
+  ]
+}

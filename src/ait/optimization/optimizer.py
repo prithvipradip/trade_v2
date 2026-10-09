@@ -90,6 +90,10 @@ class StrategyOptimizer:
         # W64 live parity (see Backtester): None -> config.
         budget_aware_wings: bool | None = None,
         max_contracts_per_trade: int | None = None,
+        economic_calendar: Any = None,   # W65: research macro calendar (None = hardcoded)
+        table_prefix: str = "",         # W65: research table prefix for the standalone data fetch
+        db_path: Any = None,             # W65: store holding the research tables
+        history_start_date: Any = None,  # W65: trim the standalone fetch to this date
         wing_floor_dollars: float = 5.0,
         # R20b review follow-up: was a hardcoded 1.0 that shadowed the
         # promoted live/config value (1.6) for any direct optimizer caller
@@ -168,6 +172,13 @@ class StrategyOptimizer:
         self._train_days = train_days
         self._features_cache = features_cache
         self._wing_floor_dollars = wing_floor_dollars
+        self._economic_calendar = economic_calendar
+        self._table_prefix = table_prefix
+        self._db_path = db_path
+        self._history_start_date = history_start_date
+        # W65: params removed from the search because they cannot affect the result
+        # (see _maybe_drop_inert_params); filled in run() once data is known.
+        self._dropped_params: set[str] = set()
         # self._iv_floor resolved below once _bt_cfg exists (R20b review follow-up)
         self._delta_iv_scale = delta_iv_scale
         self._patience = patience
@@ -285,6 +296,10 @@ class StrategyOptimizer:
         if not self._data:
             raise RuntimeError("No market data fetched — check internet connection or symbol names.")
 
+        self._maybe_drop_inert_params()
+        if prior_params and self._dropped_params:
+            prior_params = {k: v for k, v in prior_params.items() if k not in self._dropped_params}
+
         study = optuna.create_study(
             direction="maximize",
             study_name=self._study_name,
@@ -386,6 +401,49 @@ class StrategyOptimizer:
 
         return value
 
+    def _maybe_drop_inert_params(self) -> None:
+        """W65: drop iron_condor__wing_k from the search when the W64 budget cap makes
+        it inert.
+
+        With budget_aware_wings the wing is min(wing_k x expected move, budget/90).
+        At a small account (the $5k / 5% budget -> a ~$3 wing) the cap binds for every
+        wing_k in the searched range, so Optuna would spend trials on a dimension that
+        cannot change any result (pure noise). Decided from the loaded data at the LOW
+        end of IV (smallest expected move), so it only drops when the cap certainly
+        binds; at a larger capital the cap stops binding and wing_k is searched again.
+        """
+        self._dropped_params = set()
+        if not self._budget_aware_wings or "iron_condor" not in self._strategies:
+            return
+        spec = STRATEGY_SPACES.get("iron_condor", {}).get("wing_k")
+        if not spec or not self._data:
+            return
+        import math
+        from ait.strategies.iron_condor import IronCondor
+        k_min = float(spec[1])
+        affordable = IronCondor.affordable_width(self._initial_capital * self._position_size_pct)
+        try:
+            dte = int(self._settings.options.dte_range[0]) if self._settings else 21
+        except Exception:  # noqa: BLE001
+            dte = 21
+        smallest_target = None
+        for df in self._data.values():
+            if df is None or df.empty:
+                return
+            spot = float(df["Close"].iloc[-1])
+            iv = 0.15
+            if "implied_vol" in df.columns and df["implied_vol"].notna().any():
+                iv = float(df["implied_vol"].dropna().quantile(0.10))
+            target = k_min * spot * iv * math.sqrt(dte / 365.0)
+            smallest_target = target if smallest_target is None else min(smallest_target, target)
+        if smallest_target is not None and affordable < smallest_target:
+            self._dropped_params = {"iron_condor__wing_k"}
+            log.info("optimizer_dropped_inert_param", param="iron_condor__wing_k",
+                     affordable_wing=round(affordable, 2),
+                     smallest_searched_wing=round(smallest_target, 2),
+                     note="the per-trade budget caps the wing below every searched "
+                          "wing_k, so the dimension cannot change any result")
+
     def _suggest_params(self, trial: optuna.Trial) -> dict[str, Any]:
         params: dict[str, Any] = {}
 
@@ -394,7 +452,7 @@ class StrategyOptimizer:
             space = STRATEGY_SPACES.get(strategy, {})
             for name, spec in space.items():
                 key = f"{strategy}__{name}"
-                if key in params:
+                if key in params or key in self._dropped_params:
                     continue
                 params[key] = self._suggest_one(trial, key, spec)
 
@@ -474,6 +532,7 @@ class StrategyOptimizer:
             "min_confidence":        self._min_confidence,
             "position_size_pct":     self._position_size_pct,
             "budget_aware_wings":    self._budget_aware_wings,
+            "economic_calendar":     self._economic_calendar,
             "max_contracts_per_trade": self._max_contracts_per_trade,
             "trailing_stop_pct":     0.25,
             "breakeven_trigger_pct": 0.30,
@@ -542,7 +601,10 @@ class StrategyOptimizer:
         )
         for symbol in self._symbols:
             try:
-                df = load_daily_ohlcv(symbol, days=fetch_days)
+                df = load_daily_ohlcv(
+                    symbol, days=fetch_days, db_path=self._db_path,
+                    table_prefix=self._table_prefix, start_date=self._history_start_date,
+                ) if self._table_prefix else load_daily_ohlcv(symbol, days=fetch_days)
                 if len(df) > 0:
                     df = df.tail(requested_days)
                     if len(df) >= _MIN_BACKTEST_ROWS:

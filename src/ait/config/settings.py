@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
+from datetime import date
+
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
@@ -244,11 +246,43 @@ class OptionsConfig(_StrictModel):
 
 
 class BacktestConfig(_StrictModel):
+    @field_validator("macro_event_types")
+    @classmethod
+    def _valid_macro_event_types(cls, v: list[str]) -> list[str]:
+        allowed = {"FOMC", "CPI", "NFP", "GDP", "PCE"}
+        bad = sorted(set(v) - allowed)
+        if bad or not v:
+            raise ValueError(
+                f"macro_event_types must be a non-empty subset of {sorted(allowed)}; got {v}")
+        return list(dict.fromkeys(v))
+
     position_size_pct: float | None = Field(default=None, ge=0.01, le=0.50,
         description="Fraction of capital risked per trade (max-loss basis). W64: None "
                     "(the default) resolves to risk.max_position_risk_pct — the SAME "
                     "per-trade budget live funds — so research and live cannot drift. "
                     "Set a number only for a deliberate sizing study.")
+    history_start_date: date | None = Field(default=None,
+        description="W65: first date of the research history. When set it wins over "
+                    "history_days: the research loader trims frames to it and walk-forward "
+                    "windows start there. config.yaml pins 2024-01-01 = the first day of the "
+                    "operator's economic-calendar CSV, so the macro gate is ON in every window.")
+    history_days: int = Field(default=1826, ge=400, le=6000,
+        description="W65: calendar days of history a research run requests when no "
+                    "history_start_date is set (legacy fallback). The walk-forward used to "
+                    "fetch only train+test+100 days (528) = 2 windows.")
+    research_table_prefix: str = Field(default="research_", pattern=r"^([a-z][a-z0-9_]*_)?$",
+        description="W65: table prefix of the IB-sourced research history in historical.db "
+                    "(research_daily_prices, research_daily_iv, research_intraday_prices, "
+                    "research_econ_events). Empty = the live tables. Keeps research data in one "
+                    "consistent source and the live tables untouched.")
+    vlmc_min_coverage: float = Field(default=0.95, ge=0.5, le=1.0,
+        description="W65: minimum fraction of trading days that must have 5-min bars before the "
+                    "walk-forward trains with VLMC/intraday-fractal features. Below it the run "
+                    "falls back to daily-only features with a WARNING instead of mixing windows "
+                    "with and without VLMC inside one run.")
+    macro_event_types: list[str] = Field(default=["FOMC", "CPI", "NFP", "PCE", "GDP"],
+        description="W65: which release types the RESEARCH macro-event gate blocks around "
+                    "(default = the five the live gate uses). Subset of FOMC, CPI, NFP, GDP, PCE.")
     budget_aware_wings: bool = Field(default=True,
         description="W64: the walk-forward/optimizer condor builder caps the wing to "
                     "the per-trade budget exactly like live (IronCondor.affordable_"

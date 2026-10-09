@@ -1353,6 +1353,11 @@ def run_backtest():
                 "--strategies", "iron_condor",
                 # W-capital: no --capital here -- run_backtest resolves
                 # config.yaml account.capital (was a hardcoded "50000").
+                # W65: run_backtest now defaults to the IB research history
+                # (2024-01-01 -> today, 10 windows, ~12 min measured) which would
+                # blow this job's 600 s timeout; the health signal only needs the
+                # recent windows (4 -> ~5 min). Drift TRACKING, not decision-making.
+                "--max-windows", "4",
             ],
             cwd=str(ROOT),
             capture_output=True,
@@ -1422,7 +1427,7 @@ from ait.ml.range_spec import live_range_spec
 _range_threshold, _range_horizon = live_range_spec(settings)
 range_pred = RangePredictor(threshold_pct=_range_threshold, horizon_days=_range_horizon)
 vol_mag_pred = VolMagnitudePredictor(threshold_pct=0.07, horizon_days=30)
-market_data = MarketDataService(None, polygon_api_key=settings.api_keys.polygon_api_key)
+market_data = MarketDataService(None)   # W65: no IB client here -> daily bars from Yahoo; no Polygon
 historical = HistoricalDataStore()
 trainer = ModelTrainer(
     settings.ml, predictor, market_data, historical,

@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 from ait.backtesting.walkforward import WalkForwardBacktester, WalkForwardConfig
 
@@ -330,6 +331,17 @@ def parse_args() -> argparse.Namespace:
                    help="Run Optuna optimization on each training window before testing")
     p.add_argument("--optimize-n-trials", type=int, default=50,
                    help="Number of Optuna trials per walk-forward window (requires --optimize-per-window)")
+    # W65 research-history flags. Defaults come from config.yaml backtest.*.
+    p.add_argument("--history-days", type=int, default=None,
+                   help="Calendar days of history to request. Overrides config "
+                        "backtest.history_start_date (which otherwise sets the span).")
+    p.add_argument("--table-prefix", default=None,
+                   help="Research table prefix (default: config backtest.research_table_prefix, "
+                        "'research_'). Pass '' to use the live tables / legacy loader.")
+    p.add_argument("--db-path", default="data/historical.db",
+                   help="SQLite store holding the research tables (default: data/historical.db).")
+    p.add_argument("--max-windows", type=int, default=None,
+                   help="Keep only the LAST N walk-forward windows (timing / pilot runs).")
     return p.parse_args()
 
 
@@ -365,7 +377,36 @@ async def run_backtest(args: argparse.Namespace) -> None:
     else:
         print("\n  PARITY WARNINGS: none — backtest parameters match live.")
 
+    # --- W65: research history source (IB research tables) ------------------
+    # config.yaml backtest.* is the home of these values; the CLI only overrides.
+    # A non-empty prefix means "research mode": IB daily bars + IV from the
+    # research_* tables, the operator's economic calendar, and (coverage
+    # permitting) 5-min VLMC features via the prefixed intraday store.
+    try:
+        from ait.config.settings import load_settings
+        _bcfg = load_settings().backtest
+    except Exception as _exc:  # noqa: BLE001
+        print(f"  ! config unavailable ({_exc}); research defaults off")
+        _bcfg = None
+    _prefix = (args.table_prefix if args.table_prefix is not None
+               else (_bcfg.research_table_prefix if _bcfg else ""))
+    _research = bool(_prefix)
+    _start = (None if args.history_days is not None
+              else (_bcfg.history_start_date if (_bcfg and _research) else None))
+    _hist_days = (args.history_days if args.history_days is not None
+                  else (_bcfg.history_days if (_bcfg and _research) else None))
+    if _research:
+        print(f"  History:    research tables '{_prefix}*' in {args.db_path} | "
+              f"{'from ' + str(_start) if _start else str(_hist_days) + ' days'}")
+    else:
+        print("  History:    legacy loader (5-min resample / Yahoo), live tables")
+
     cfg = WalkForwardConfig(
+        max_windows=args.max_windows,
+        history_start_date=_start,
+        history_days=_hist_days,
+        vlmc_min_coverage=(_bcfg.vlmc_min_coverage if _bcfg else 0.95),
+        macro_event_types=(tuple(_bcfg.macro_event_types) if (_bcfg and _research) else None),
         train_days=args.train_days,
         test_days=args.test_days,
         step_days=args.step_days,
@@ -389,10 +430,12 @@ async def run_backtest(args: argparse.Namespace) -> None:
         symbols=args.symbols,
         strategies=args.strategies,
         config=cfg,
+        db_path=(Path(args.db_path) if _research else None),
+        table_prefix=_prefix,
     )
 
     # Fetch data
-    print("\n[1/3] Fetching historical data from Yahoo Finance...")
+    print(f"\n[1/3] Fetching historical data ({'IB research tables' if _research else 'IB store / Yahoo'})...")
     t0 = time.time()
     data = await bt._fetch_data()
     fetch_time = time.time() - t0
@@ -419,6 +462,13 @@ async def run_backtest(args: argparse.Namespace) -> None:
     result = await bt.run(data=data)
     run_time = time.time() - t0
     print(f"  Completed in {run_time:.1f}s")
+    if len(result.windows) < 3:
+        print("\n" + "!" * 60)
+        print(f"  WARNING: only {len(result.windows)} walk-forward window(s) produced trades/results. "
+              "Check the data span above (windows need train+gap+test days of history\n"
+              "  for EVERY symbol) and the log lines walk_forward_too_few_windows / "
+              "range_model_absent_blocking_oos.")
+        print("!" * 60)
 
     # Attach the parity manifest to the result object so any downstream JSON
     # serialization of this run (dashboards, experiment writers) carries it.

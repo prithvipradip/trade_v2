@@ -1,0 +1,116 @@
+{
+  "csv": "data/investing_econ_calendar_2024-01-01_onward_UTC.csv",
+  "sha256": "fd69a4e716298560ccaf6cf29f039f4a742f8dbdb83beb1005658c5514d4f291",
+  "table_prefix": "research_",
+  "stats": {
+    "rows_read": 42994,
+    "duplicates_dropped": 76,
+    "rows_loaded": 42918,
+    "first_date": "2023-12-31",
+    "last_date": "2027-12-08",
+    "engine_events": {
+      "CPI": {
+        "2024": 12,
+        "2025": 10,
+        "2026": 10
+      },
+      "FOMC": {
+        "2024": 8,
+        "2025": 8,
+        "2026": 8,
+        "2027": 8
+      },
+      "GDP": {
+        "2024": 4,
+        "2025": 4,
+        "2026": 3
+      },
+      "NFP": {
+        "2024": 12,
+        "2025": 11,
+        "2026": 10
+      },
+      "PCE": {
+        "2024": 12,
+        "2025": 10,
+        "2026": 10
+      }
+    }
+  },
+  "audit_vs_hardcoded_calendar": {
+    "FOMC": {
+      "csv_dates_in_hardcoded_range": 16,
+      "hardcoded_dates_in_csv_range": 12,
+      "in_both": 11,
+      "only_csv": [
+        "2027-06-09",
+        "2027-07-28",
+        "2027-09-15",
+        "2027-10-27",
+        "2027-12-08"
+      ],
+      "only_hardcoded": [
+        "2027-06-16"
+      ],
+      "csv_last_date": "2027-12-08"
+    },
+    "CPI": {
+      "csv_dates_in_hardcoded_range": 10,
+      "hardcoded_dates_in_csv_range": 10,
+      "in_both": 9,
+      "only_csv": [
+        "2026-02-13"
+      ],
+      "only_hardcoded": [
+        "2026-02-11"
+      ],
+      "csv_last_date": "2026-10-14"
+    },
+    "NFP": {
+      "csv_dates_in_hardcoded_range": 10,
+      "hardcoded_dates_in_csv_range": 10,
+      "in_both": 9,
+      "only_csv": [
+        "2026-02-11"
+      ],
+      "only_hardcoded": [
+        "2026-02-06"
+      ],
+      "csv_last_date": "2026-10-02"
+    },
+    "PCE": {
+      "csv_dates_in_hardcoded_range": 9,
+      "hardcoded_dates_in_csv_range": 9,
+      "in_both": 1,
+      "only_csv": [
+        "2026-02-20",
+        "2026-03-13",
+        "2026-04-09",
+        "2026-05-28",
+        "2026-06-25",
+        "2026-07-30",
+        "2026-08-26",
+        "2026-09-30"
+      ],
+      "only_hardcoded": [
+        "2026-01-30",
+        "2026-02-27",
+        "2026-03-27",
+        "2026-05-29",
+        "2026-06-26",
+        "2026-07-31",
+        "2026-08-28",
+        "2026-09-25"
+      ],
+      "csv_last_date": "2026-09-30"
+    },
+    "GDP": {
+      "csv_dates_in_hardcoded_range": 2,
+      "hardcoded_dates_in_csv_range": 2,
+      "in_both": 2,
+      "only_csv": [],
+      "only_hardcoded": [],
+      "csv_last_date": "2026-07-30"
+    }
+  }
+}

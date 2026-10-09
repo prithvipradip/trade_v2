@@ -13,8 +13,8 @@ Pins the corrected behavior for:
       raising TypeError and killing the whole symbol's scan.
   [4] chain snapshot hygiene: every reqMktData is paired with cancelMktData
       in a finally, at reduced concurrency.
-  [5] dead Polygon key: repeated auth failures disable the client instead of
-      burning an HTTPS roundtrip on every get_historical cache miss forever.
+  [5] dead Polygon key (SUPERSEDED by W65, which removed the Polygon stock-bar path;
+      see the note at the old test location).
 """
 from __future__ import annotations
 
@@ -633,31 +633,20 @@ class TestSnapshotCancelPairing:
 
 
 # ---------------------------------------------------------------------------
-# [5] Polygon dead-key breaker
+# [5] Polygon dead-key breaker — SUPERSEDED by W65
 # ---------------------------------------------------------------------------
+# R16 [5] guarded a dead Polygon key being retried on every get_historical cache
+# miss. W65 (operator intent: IB primary, Yahoo fallback, Polygon only for historical
+# OPTION prices) removed the Polygon stock-bar path from MarketDataService entirely,
+# so there is no client left to disable. What replaces the guarantee is pinned in
+# tests/test_w65_research_history.py::TestLiveSourceIsIbFirst (IB first, Yahoo
+# fallback, and the AST class guard that no Polygon aggregate call remains).
 
-class TestPolygonAuthBreaker:
-    def _service(self, error_text):
-        svc = MarketDataService.__new__(MarketDataService)
-
-        def _raise(**_kw):
-            raise Exception(error_text)
-
-        svc._polygon_client = SimpleNamespace(list_aggs=_raise)
-        svc._polygon_auth_failures = 0
-        return svc
-
-    async def test_disables_after_consecutive_auth_failures(self):
-        svc = self._service("Unknown API Key")
-        for _ in range(MarketDataService._POLYGON_AUTH_FAILURE_LIMIT):
-            assert await svc._get_polygon_historical("SPY", 30) is None
-        assert svc._polygon_client is None  # breaker tripped → Yahoo-only
-
-    async def test_transient_errors_do_not_trip_breaker(self):
-        svc = self._service("connection reset by peer")
-        for _ in range(MarketDataService._POLYGON_AUTH_FAILURE_LIMIT + 2):
-            assert await svc._get_polygon_historical("SPY", 30) is None
-        assert svc._polygon_client is not None
+class TestDeadPolygonKeyCannotBeRetried:
+    def test_there_is_no_polygon_client_to_retry(self):
+        svc = MarketDataService(None)
+        assert not hasattr(svc, "_polygon_client")
+        assert not hasattr(MarketDataService, "_get_polygon_historical")
 
 
 # ---------------------------------------------------------------------------

@@ -159,6 +159,16 @@ backtest:
                                        # builder with), so research cannot drift from live. Was 0.05
                                        # (live 0.0133-0.03) — the backtest funded 1.7-3.8x more risk per
                                        # trade than live. Set a number ONLY for a deliberate sizing study.
+  history_start_date: 2024-01-01       # W65: first day of the research history = first day of the operator's
+                                       # economic-calendar CSV (data/investing_econ_calendar_2024-01-01_onward_UTC.csv),
+                                       # so the research macro gate is ON in every window. Wins over history_days.
+  history_days: 1826                   # W65: legacy fallback span (no start date). The walk-forward used to fetch only
+                                       # train+test+100 = 528 days => 2 windows, 0 trades.
+  research_table_prefix: research_     # W65: IB-sourced research history lives in research_* tables of historical.db
+                                       # (daily bars + IV + 5-min + econ events); live tables are never written by research.
+  vlmc_min_coverage: 0.95              # W65: 5-min day coverage required to train with VLMC/intraday-fractal features;
+                                       # below it the run is daily-only (never a mix of windows with and without VLMC).
+  macro_event_types: [FOMC, CPI, NFP, PCE, GDP]   # W65: research macro gate event set (= live's five, for parity)
   budget_aware_wings: true             # W64: research condor builder caps the wing to the budget like live
                                        # (IronCondor.affordable_width, $1 floor when capped) and rejects a
                                        # structure whose max loss exceeds the budget. false = old behaviour.

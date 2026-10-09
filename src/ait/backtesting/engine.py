@@ -106,6 +106,9 @@ class Backtester:
         # (positions.max_contracts_per_trade, config 1); None = uncapped.
         budget_aware_wings: bool = False,
         max_contracts_per_trade: int | None = None,
+        # W65: research macro calendar (EconomicCalendar built from the operator's CSV).
+        # None = the hardcoded live calendar (legacy behaviour).
+        economic_calendar: Any = None,
         stop_loss_pct: float = 0.50,
         profit_target_pct: float = 1.00,
         max_hold_days: int = 30,
@@ -482,7 +485,8 @@ class Backtester:
         if macro_event_gate:
             try:
                 from ait.data.economic_calendar import EconomicCalendar
-                self._economic_cal = EconomicCalendar()
+                self._economic_cal = (economic_calendar if economic_calendar is not None
+                                      else EconomicCalendar())
             except Exception:  # noqa: BLE001 — gate is best-effort, never fatal
                 self._economic_cal = None
 
@@ -1914,6 +1918,11 @@ class Backtester:
                 "em_ratio_put": round(em_ratio_put, 4),
                 "underlying_at_entry": round(S, 2),
                 "max_loss_per_share": round(max_loss_per_share, 4),
+                # W65: the per-contract risk the BUDGET gate used (mid-credit when
+                # budget-aware, else the friction-inclusive max loss). The walk-forward
+                # pool allocator reuses it so its affordability/aggregate-risk gates
+                # agree with the engine's, instead of re-rejecting what the engine took.
+                "budget_gate_risk_per_contract": round(_gate_per_contract, 2),
                 "expiry_date": str(today_date + timedelta(days=dte)),
                 "high_water_mark": 0.0,
             }
