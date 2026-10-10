@@ -172,6 +172,51 @@ class PositionConfig(_StrictModel):
         description="Hard cap on contracts per trade. Low values (e.g. 1) keep "
                     "cost-per-trade minimal so the account can hold many more "
                     "concurrent positions — maximizes trade COUNT for learning.")
+    partial_fill_cancel_seconds: float = Field(default=30.0, ge=5.0, le=300.0,
+        description="W70: an entry order that is only PARTIALLY filled has its "
+                    "unfilled remainder cancelled once it has been working this long, "
+                    "so the position is not left with orphaned legs riding stale "
+                    "prices. Was a literal 30 in executor.check_fills. The check runs "
+                    "on the 30s fast-monitor tick, so values under 30 act at the next "
+                    "tick. Floor 5s: under that a normal leg-by-leg combo fill could be "
+                    "cancelled mid-burst (judgement, not measured). Must stay below "
+                    "entry_order_timeout_seconds, which would cancel it anyway. IMPACT: "
+                    "lower = orphaned remainders cleaned up sooner but a slow fill is "
+                    "cut short; higher = remainder rides at stale prices longer.")
+    absent_order_grace_seconds: float = Field(default=30.0, ge=10.0, le=120.0,
+        description="W70: an ENTRY order that is absent from the broker trade list is "
+                    "treated as still pending (not cancelled) while younger than this. "
+                    "Guards the deep-audit MP-F2b incident: a mid-cycle disconnect wipes "
+                    "ib_insync's caches, so every working entry briefly looks cancelled. "
+                    "Was a literal 30 in executor._determine_fill_status. Floor 10s "
+                    "(judgement: the one measured acknowledgement took under 1s, the "
+                    "monitor ticks every 30s, and the verdict is re-checked against the "
+                    "broker anyway). Must stay below entry_order_timeout_seconds. "
+                    "IMPACT: too low = a connection blip can flip live entries to "
+                    "CANCELLED while still working at IBKR; too high = a genuinely "
+                    "cancelled entry occupies its slot longer.")
+    entry_ladder_step_seconds: float = Field(default=45.0, ge=30.0, le=300.0,
+        description="W70: an unfilled entry combo's limit price steps toward marketable "
+                    "every this many seconds (steps at 0.25 / 0.60 / 1.00 of the "
+                    "offset). Was the class constant _LADDER_STEP_SECS = 45. Floor 30s "
+                    "= the fast-monitor tick: below it the steps are skipped, not "
+                    "honored (target_step = age // step). Observed: the first reprice "
+                    "of a real order fired at +49.4s because it is only seen on a tick. "
+                    "IMPACT: lower = chases the market faster and gives away more of "
+                    "the spread; higher = more time at the patient price.")
+
+    @model_validator(mode="after")
+    def _entry_durations_fit_the_timeout(self) -> "PositionConfig":
+        for name in ("partial_fill_cancel_seconds", "absent_order_grace_seconds",
+                     "entry_ladder_step_seconds"):
+            if getattr(self, name) >= self.entry_order_timeout_seconds:
+                raise ValueError(
+                    f"positions.{name} ({getattr(self, name)}) must be below "
+                    f"positions.entry_order_timeout_seconds "
+                    f"({self.entry_order_timeout_seconds}): the entry would be "
+                    "cancelled by the timeout before this could act. Lower it, or "
+                    "raise entry_order_timeout_seconds.")
+        return self
 
 
 class PositionSizingConfig(_StrictModel):
@@ -527,9 +572,24 @@ class BacktestConfig(_StrictModel):
                     "width, $1 floor when capped) and rejects a structure whose max "
                     "loss exceeds the budget. False restores the old uncapped "
                     "wing_k x expected-move wing for before/after comparisons only.")
-    wing_floor_dollars: float = Field(default=5.0, ge=0.50, le=50.0,
-        description="Hard minimum spread width in dollars (safety floor only). "
-                    "Wing sizing is now primarily driven by wing_k × expected_move.")
+    wing_floor_dollars: float = Field(default=2.0, ge=1.0, le=10.0,
+        description="W70: THE minimum iron-condor wing, in dollars, for LIVE ENTRIES AND "
+                    "RESEARCH alike. This key lives under `backtest:` but it is also the "
+                    "env-contract home of AIT_IC_WING_FLOOR, which the live builder "
+                    "(strategies/iron_condor.py _vol_scaled_width) reads — so editing it "
+                    "changes what the live bot trades, not only what a backtest simulates. "
+                    "The wing is wing_k x price x IV x sqrt(DTE/365), but never narrower "
+                    "than this. It binds only when the per-trade budget does not: a "
+                    "budget-capped wing may shrink below it (at today's $5k account the "
+                    "budget carries ~$2.78, so the floor matters only when the vol-scaled "
+                    "width comes out under $2), but never below $1 "
+                    "(invariants.IC_BUDGET_CAPPED_MIN_WING). Precedence for live: "
+                    "env/.env AIT_IC_WING_FLOOR > this key > 2.0. Bounds 1.0-10.0: under "
+                    "$1 contradicts the budget-capped minimum; over $10 is not sensible "
+                    "for this account. History: default was 5.0 (the old backtest "
+                    "default, still read by ~15 study scripts and run_optimizer); "
+                    "walk-forward, run_backtest and the engine already used 2.0 "
+                    "(R6 parity with the live literal this key replaces).")
     wing_k: float = Field(default=1.6, ge=0.1, le=3.0,
         description="Vol-scaled wing multiplier: wing_width = wing_k × price × IV × sqrt(DTE/365). "
                     "Optuna optimizes this per walk-forward window. "
@@ -744,6 +804,47 @@ class BacktestConfig(_StrictModel):
         description="R20b: minimum weighted CV edge over the base rate for the "
                     "range predictor to activate as an entry gate (Exp 28 quality "
                     "floor; 0.0 = always use the model).")
+    slippage_pct: float = Field(default=0.01, ge=0.0, le=0.10,
+        description="W70: fractional price slippage the research engine adds on top of "
+                    "the modeled spread for DEBIT / long-option structures (long call/put, "
+                    "straddles, debit spreads). Research only. NOT applied to iron "
+                    "condors (credit structures use the friction model) so it has no "
+                    "effect on the IC-only strategy set. Was the engine's "
+                    "slippage_pct=0.01 constructor default.")
+    delta_short: float = Field(default=0.20, ge=0.05, le=0.50,
+        description="W70: |delta| the research engine targets for the SHORT strikes of "
+                    "its structures. Research only: live's iron condor short delta is a "
+                    "literal ~0.20 inside strategies/iron_condor.py, NOT this key, so "
+                    "changing it moves research away from live. Was the engine's "
+                    "delta_short=0.20.")
+    delta_long: float = Field(default=0.30, ge=0.05, le=0.60,
+        description="W70: |delta| the research engine targets for LONG single options "
+                    "and long legs of debit structures. Research only; unused by the "
+                    "iron condor (its wings are set by wing_k, not delta). Was "
+                    "delta_long=0.30.")
+    hurst_hard_veto_multiplier: float = Field(default=1.5, ge=0.0, le=5.0,
+        description="W70: legacy derivation of the fractal HARD veto when "
+                    "fractal_veto_spread is unset: veto spread = max(hurst_regime_"
+                    "threshold, 0.20) x this. 0 = no derived veto. Research only. NOTE "
+                    "WalkForwardConfig deliberately passes 0.0 (disabled; Exp 20 "
+                    "post-mortem: any multiplier blocked all QQQ entries), so this "
+                    "default 1.5 only governs a bare Backtester(). Was the engine's "
+                    "hurst_hard_veto_multiplier=1.5.")
+    pct_from_60d_high_threshold: float = Field(default=-1.0, ge=-1.0, le=0.0,
+        description="W70: research-only experimental entry gate: refuse a neutral "
+                    "credit entry when spot is more than this fraction below its 60-day "
+                    "high (e.g. -0.05). -1.0 = DISABLED (the default; values <= -0.99 "
+                    "never gate). Not part of live. Was the engine's "
+                    "pct_from_60d_high_threshold=-1.0.")
+    skew_factor: float = Field(default=1.0, ge=0.0, le=5.0,
+        description="W70: multiplier on the engine's legacy flat IV-skew term (put "
+                    "0.10 / call 0.02 per unit log-moneyness). 0.0 = flat IV. Additive "
+                    "with skew_slope_per_pct_otm, the W5 measured steepening. Research "
+                    "only. Was the engine's skew_factor=1.0.")
+    context_bars: int = Field(default=0, ge=0, le=1000,
+        description="W70: extra intraday bars of lookback the research engine keeps as "
+                    "feature context (lookback = max(20, this)). 0 = the engine "
+                    "minimum. Research harness knob. Was context_bars=0.")
 
 
 class MLConfig(_StrictModel):
@@ -1255,6 +1356,70 @@ class ExitConfig(_StrictModel):
                     "0.30 in orchestrator._check_thesis_valid "
                     "(iron_condor/iron_butterfly are exempt from the check "
                     "entirely, so this only steers directional strategies).")
+    order_visibility_grace_seconds: float = Field(default=10.0, ge=5.0, le=60.0,
+        description="W70: a freshly placed EXIT order is ignored by the fill checker "
+                    "while younger than this, so it has time to appear in IBKR's trade "
+                    "list (a brand-new order would otherwise read as cancelled). Was a "
+                    "literal 10 in executor.check_fills. Evaluated on the 30s tick. "
+                    "Floor 5s is an engineering margin, not a measurement: the one "
+                    "acknowledgement we could time took under 1s (2026-09-28, an entry, "
+                    "delayed-data paper); no exit order has been timed yet (see the "
+                    "order_ack_latency log event). Must stay below "
+                    "exit_stop_pending_rest_seconds. IMPACT: too low = a not-yet-visible "
+                    "order is misread as cancelled and the bot re-arms a duplicate "
+                    "close; too high = a genuinely dead order is noticed later.")
+    foreign_exit_escalation_seconds: float = Field(default=300.0, ge=60.0, le=3600.0,
+        description="W70: an exit order that belongs to ANOTHER clientId cannot be "
+                    "cancelled from this session, so once it has been working this long "
+                    "the executor pages the operator instead of looping on a cancel "
+                    "that cannot land. Was a literal 300 in executor.check_fills. "
+                    "Must stay >= exit_pending_rest_seconds: paging before a normal "
+                    "order would even have been cancelled just reports routine slowness. "
+                    "IMPACT: lower = earlier, noisier pages; higher = a stuck "
+                    "cross-session close sits unnoticed longer.")
+    zombie_exit_revert_seconds: float = Field(default=900.0, ge=120.0, le=7200.0,
+        description="W70: the zombie cap. An exit order that is still unresolved this "
+                    "long after placement is checked against the broker and, only if "
+                    "the broker answers and does not list it, the position is reverted "
+                    "CLOSING->FILLED so a fresh exit can fire (otherwise it is held "
+                    "CLOSING and the operator is paged). Was a literal 900 in "
+                    "executor.check_fills. It is evaluated only after the cancel was "
+                    "requested at exit_pending_rest_seconds, so the window between "
+                    "them is how long a cancel is given to resolve; startup requires "
+                    "that window to be at least as long as the longer rest "
+                    "(cap >= 2 x max(exit_pending_rest_seconds, "
+                    "exit_stop_pending_rest_seconds)). IMPACT: too low = re-arms before "
+                    "the real outcome can show (a second close alongside the first: "
+                    "both fill and the condor flips into an inverse structure); too "
+                    "high = a dead order wedges the position in CLOSING longer.")
+
+    @model_validator(mode="after")
+    def _exit_durations_are_ordered(self) -> "ExitConfig":
+        if self.exit_stop_pending_rest_seconds > self.exit_pending_rest_seconds:
+            raise ValueError(
+                f"exit.exit_stop_pending_rest_seconds ({self.exit_stop_pending_rest_seconds}) "
+                f"must not exceed exit.exit_pending_rest_seconds "
+                f"({self.exit_pending_rest_seconds}): a stop exit must be re-priced no "
+                "later than an ordinary one.")
+        if self.order_visibility_grace_seconds >= self.exit_stop_pending_rest_seconds:
+            raise ValueError(
+                f"exit.order_visibility_grace_seconds ({self.order_visibility_grace_seconds}) "
+                f"must be below exit.exit_stop_pending_rest_seconds "
+                f"({self.exit_stop_pending_rest_seconds}): the grace would swallow the rest.")
+        if self.foreign_exit_escalation_seconds < self.exit_pending_rest_seconds:
+            raise ValueError(
+                f"exit.foreign_exit_escalation_seconds ({self.foreign_exit_escalation_seconds}) "
+                f"must be >= exit.exit_pending_rest_seconds ({self.exit_pending_rest_seconds}): "
+                "paging before a normal order would have been cancelled is just noise.")
+        floor = 2 * max(self.exit_pending_rest_seconds, self.exit_stop_pending_rest_seconds)
+        if self.zombie_exit_revert_seconds < floor:
+            raise ValueError(
+                f"exit.zombie_exit_revert_seconds ({self.zombie_exit_revert_seconds}) must be "
+                f">= 2 x the longer rest time = {floor}: the cancel needs at least as long "
+                "to resolve as the order was given to fill, otherwise a fill that is "
+                "merely not yet visible is re-armed as a duplicate close. Raise it, or "
+                "lower exit_pending_rest_seconds / exit_stop_pending_rest_seconds.")
+        return self
 
 
 class LearningAnalyzerConfig(_StrictModel):
@@ -1658,7 +1823,71 @@ def load_settings(config_path: str | Path = "config.yaml",
 
     settings = Settings.model_validate(yaml_data)
     _report_default_divergence(settings)
+    _report_fixed_limits()
+    _report_order_timeline(settings)
     return settings
+
+
+def _report_order_timeline(settings: "Settings") -> None:
+    """W70: log the EFFECTIVE order-lifecycle durations, tunable and fixed, in one event.
+
+    The timeline is spread across two config sections and a few fixed values; this
+    puts the whole picture in one log line so nobody has to reconstruct it. Never
+    blocks startup.
+    """
+    try:
+        from ait.config.invariants import BROKER_SNAPSHOT_TTL_SECONDS
+        from ait.utils.cadence import FAST_MONITOR_CADENCE_SECONDS
+        from ait.utils.logging import get_logger  # lazy: keep settings import-light
+        ex, po = settings.exit, settings.positions
+        get_logger("config.settings").info(
+            "order_timeline_in_effect",
+            fast_monitor_tick_seconds=FAST_MONITOR_CADENCE_SECONDS,
+            fixed={"broker_snapshot_ttl_seconds": BROKER_SNAPSHOT_TTL_SECONDS},
+            exit_order={
+                "order_visibility_grace_seconds": ex.order_visibility_grace_seconds,
+                "exit_stop_pending_rest_seconds": ex.exit_stop_pending_rest_seconds,
+                "exit_pending_rest_seconds": ex.exit_pending_rest_seconds,
+                "exit_band_ttl_seconds": ex.exit_band_ttl_seconds,
+                "foreign_exit_escalation_seconds": ex.foreign_exit_escalation_seconds,
+                "zombie_exit_revert_seconds": ex.zombie_exit_revert_seconds,
+            },
+            entry_order={
+                "entry_ladder_step_seconds": po.entry_ladder_step_seconds,
+                "partial_fill_cancel_seconds": po.partial_fill_cancel_seconds,
+                "absent_order_grace_seconds": po.absent_order_grace_seconds,
+                "entry_order_timeout_seconds": po.entry_order_timeout_seconds,
+            },
+            note="each age is evaluated on the fast-monitor tick, so a duration under "
+                 "the tick takes effect at the next tick. Meaning of each: docs/RUNBOOK.md "
+                 "'Order lifecycle timeline'.",
+        )
+    except Exception:  # noqa: BLE001 — diagnostics must never block startup
+        pass
+
+
+def _report_fixed_limits() -> None:
+    """W70: log the limits that are deliberately NOT configurable, once per load.
+
+    Sits beside `config_default_divergence` so a log reader sees both halves of
+    "what the system will do": the tunables that differ from code defaults, and
+    the fixed limits no config edit can change. Source of truth and the reason
+    each one is fixed: ait/config/invariants.py (and docs/RUNBOOK.md, which a drift
+    test keeps in step). Like its sibling it can never block startup.
+    """
+    try:
+        from ait.config.invariants import invariant_values
+        from ait.utils.logging import get_logger  # lazy: keep settings import-light
+        limits = invariant_values()
+        get_logger("config.settings").info(
+            "fixed_limits_in_effect",
+            count=len(limits),
+            limits=limits,
+            note="fixed in code on purpose (ait/config/invariants.py); not set by "
+                 "config.yaml or .env. Why each is fixed: docs/RUNBOOK.md 'Fixed limits'.",
+        )
+    except Exception:  # noqa: BLE001 — diagnostics must never block startup
+        pass
 
 
 # R19 (user audit): the SECOND shadowing layer, after the env contract.

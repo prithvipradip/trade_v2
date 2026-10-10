@@ -14,6 +14,7 @@ import pandas as pd
 from ait.data.options_chain import OptionsChain, OptionContract
 from ait.strategies.base import Signal, SignalDirection, Strategy
 from ait.utils.logging import get_logger
+from ait.config.invariants import IC_BUDGET_CAPPED_MIN_WING  # W70: fixed, visible
 from ait.config.runtime_env import contract_float  # R19: ONE authority for env-contract defaults
 from ait.utils.time import today_et
 
@@ -112,7 +113,12 @@ class IronCondor(Strategy):
         )
 
     def _vol_scaled_width(self, price, short_put, short_call_hint, chain) -> float:
-        """R6: wing width target = wing_k x price x IV x sqrt(DTE/365), min $2.
+        """R6: wing width target = wing_k x price x IV x sqrt(DTE/365), min wing_floor.
+
+        W70: the minimum is AIT_IC_WING_FLOOR (config backtest.wing_floor_dollars,
+        default $2) — it was a literal 2.0 here. It binds only when the per-trade
+        budget does not: a budget-capped wing may shrink below it (never below
+        invariants.IC_BUDGET_CAPPED_MIN_WING).
 
         Mirrors the backtest's wing sizing (config backtest.wing_k) so live
         condors are the structure the walk-forward evidence describes. IV
@@ -144,7 +150,8 @@ class IronCondor(Strategy):
             pass
         import os as _os_w
         k = contract_float("AIT_IC_WING_K")
-        width = max(2.0, k * price * iv * math.sqrt(dte / 365))
+        width = max(contract_float("AIT_IC_WING_FLOOR"),
+                    k * price * iv * math.sqrt(dte / 365))
         # R7-SOON (user-approved): budget-aware cap — the $2.1k launch
         # account cannot hold the $10-22 wings the vol formula produces on
         # index underlyings (max_loss $400-2,100 vs a ~$147 per-trade
@@ -158,7 +165,7 @@ class IronCondor(Strategy):
             # W31: same arithmetic, one owner (see affordable_width).
             affordable = self.affordable_width(self.risk_budget)
             if affordable < width:
-                width = max(1.0, affordable)
+                width = max(IC_BUDGET_CAPPED_MIN_WING, affordable)
         return width
 
     def generate_signals(

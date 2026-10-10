@@ -117,7 +117,7 @@ class StrategyOptimizer:
         table_prefix: str = "",         # W65: research table prefix for the standalone data fetch
         db_path: Any = None,             # W65: store holding the research tables
         history_start_date: Any = None,  # W65: trim the standalone fetch to this date
-        wing_floor_dollars: float = 5.0,
+        wing_floor_dollars: float | None = None,   # W70: None -> backtest.wing_floor_dollars (was 5.0)
         # R20b review follow-up: was a hardcoded 1.0 that shadowed the
         # promoted live/config value (1.6) for any direct optimizer caller
         # (run_optimizer.py never overrides it) -- same defect class as the
@@ -129,11 +129,11 @@ class StrategyOptimizer:
         # overrides it) -- same defect class as wing_k above. None resolves
         # from _bt_cfg.iv_floor once _bt_cfg exists.
         iv_floor: float | None = None,
-        delta_iv_scale: float = 0.0,
+        delta_iv_scale: float | None = None,       # W70: None -> backtest.delta_iv_scale
         patience: int = 0,
         min_trades: int = 10,
         max_concurrent_positions: int = 1,
-        max_entry_vol_annual: float = 0.80,
+        max_entry_vol_annual: float | None = None,   # W70: None -> backtest.max_entry_vol_annual
         # R20 #2: baseline values for the two iron_condor gate params Optuna
         # searches (param_spaces Exp 26/28). They were absent from bt_kwargs,
         # and the trial-override loop only applies params already present
@@ -194,7 +194,7 @@ class StrategyOptimizer:
         self._initial_capital = initial_capital
         self._train_days = train_days
         self._features_cache = features_cache
-        self._wing_floor_dollars = wing_floor_dollars
+        # self._wing_floor_dollars / _delta_iv_scale / _max_entry_vol_annual resolved below (W70)
         self._economic_calendar = economic_calendar
         self._table_prefix = table_prefix
         self._db_path = db_path
@@ -203,11 +203,9 @@ class StrategyOptimizer:
         # (see _maybe_drop_inert_params); filled in run() once data is known.
         self._dropped_params: set[str] = set()
         # self._iv_floor resolved below once _bt_cfg exists (R20b review follow-up)
-        self._delta_iv_scale = delta_iv_scale
         self._patience = patience
         self._min_trades = min_trades
         self._max_concurrent_positions = max_concurrent_positions
-        self._max_entry_vol_annual = max_entry_vol_annual
         # R20b (pre-registered PLAN 2026-08-21): resolve the config-backed
         # trial BASELINES once, from the same loaded settings live reads
         # (mirrors Backtester's R20 None->load_settings pattern). These feed
@@ -257,6 +255,23 @@ class StrategyOptimizer:
         self._gates_mode = str(_rcv(gates_mode, "backtest", "gates_mode", _BTC2, self._settings))
         self._iv_rank_gate = bool(_rcv(
             iv_rank_gate, "backtest", "iv_rank_gate", _BTC2, self._settings))
+        # W70: were literals 5.0 / 0.0 / 0.80 (and trailing 0.25, breakeven 0.30, delta 0.20 /
+        # 0.30 in _run_backtest's bt_kwargs); the wing floor moves 5.0 -> 2.0 (live parity).
+        # W70: the SAME contract call live uses (AIT_IC_WING_FLOOR) — live AND research.
+        from ait.config.runtime_env import contract_float as _cf
+        self._wing_floor_dollars = (float(wing_floor_dollars) if wing_floor_dollars is not None
+                                    else _cf("AIT_IC_WING_FLOOR"))
+        self._delta_iv_scale = float(_rcv(
+            delta_iv_scale, "backtest", "delta_iv_scale", _BTC2, self._settings))
+        self._max_entry_vol_annual = float(_rcv(
+            max_entry_vol_annual, "backtest", "max_entry_vol_annual", _BTC2, self._settings))
+        from ait.config.settings import ExitConfig as _EXC
+        self._trailing_stop_pct = float(_rcv(
+            None, "exit", "trailing_stop_pct", _EXC, self._settings))
+        self._breakeven_trigger_pct = float(_rcv(
+            None, "exit", "breakeven_trigger_pct", _EXC, self._settings))
+        self._delta_short = float(_rcv(None, "backtest", "delta_short", _BTC2, self._settings))
+        self._delta_long = float(_rcv(None, "backtest", "delta_long", _BTC2, self._settings))
         self._iv_rank_series = iv_rank_series or {}
         self._fractal_veto_spread = float(_rcv(
             fractal_veto_spread, "backtest", "fractal_veto_spread", _BTC2, self._settings))
@@ -624,11 +639,11 @@ class StrategyOptimizer:
             "fractal_veto_spread":   self._fractal_veto_spread,
             "penalty_on_range_prob": self._penalty_on_range_prob,
             "max_contracts_per_trade": self._max_contracts_per_trade,
-            "trailing_stop_pct":     0.25,
-            "breakeven_trigger_pct": 0.30,
+            "trailing_stop_pct":     self._trailing_stop_pct,
+            "breakeven_trigger_pct": self._breakeven_trigger_pct,
             "max_hold_days":         int(_bl.max_hold_days),
-            "delta_short":           0.20,
-            "delta_long":            0.30,
+            "delta_short":           self._delta_short,
+            "delta_long":            self._delta_long,
             "iv_floor":              self._iv_floor,
             "wing_floor_dollars":    self._wing_floor_dollars,
             "wing_k":                    self._wing_k,

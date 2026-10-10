@@ -22,6 +22,15 @@ from ib_insync import Trade, TradeLogEntry
 from ait.broker.contracts import ContractBuilder
 from ait.broker.ibkr_client import IBKRClient
 from ait.broker.orders import OrderBuilder
+from ait.config.settings import ExitConfig, PositionConfig
+from ait.config.invariants import (  # W70: fixed limits, one visible home
+    BROKER_SNAPSHOT_TTL_SECONDS,
+    NBBO_DISORDERLY_SPREAD_RATIO,
+    NBBO_MID_FLOOR,
+    NBBO_STALE_SIGNAL_DEVIATION,
+    ORDER_RATE_LIMIT_MAX,
+    ORDER_RATE_LIMIT_WINDOW_S,
+)
 from ait.bot.state import StateManager, TradeDirection, TradeRecord, TradeStatus
 from ait.execution.roll_booking import PendingRollOrder, book_roll_fill
 from ait.risk.circuit_breaker import CircuitBreaker
@@ -47,6 +56,19 @@ DEFAULT_ORDER_TIMEOUT = int(_contract_float_t("AIT_ENTRY_ORDER_TIMEOUT"))
 # out (portfolio.py _evaluate_position). These rest the shorter
 # exit.exit_stop_pending_rest_seconds before a re-price.
 _STOP_EXIT_PREFIXES = ("stop_loss", "short_strike_touch", "trailing_stop", "breakeven_stop")
+
+
+def _cfg_num(section, name: str, default: float) -> float:
+    """W70: a numeric config value, or `default` when absent or not a real number.
+
+    The executor is built with `settings=None`, a partial stub, or a MagicMock in
+    many tests, and `float(MagicMock())` is 1.0 — which would silently turn every
+    age threshold into one second. Only an actual int/float is accepted.
+    """
+    v = getattr(section, name, None)
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return float(default)
+    return float(v)
 
 # R19 (audit finding executor.py:453): terminal fallback for the single-leg
 # wide-spread reject. The 0.15 literal used to live inline in
@@ -307,6 +329,16 @@ class PendingExitOrder:
 class TradeExecutor:
     """Executes trade signals by placing orders with IBKR."""
 
+    # W70: order-lifecycle durations are config (positions.* / exit.*). These class
+    # attributes are the model defaults — the former literals — so an executor built
+    # without settings, or via __new__, behaves exactly as before.
+    _partial_fill_cancel_s: float = PositionConfig().partial_fill_cancel_seconds
+    _absent_order_grace_s: float = PositionConfig().absent_order_grace_seconds
+    _ladder_step_s: float = PositionConfig().entry_ladder_step_seconds
+    _exit_visibility_grace_s: float = ExitConfig().order_visibility_grace_seconds
+    _foreign_exit_escalation_s: float = ExitConfig().foreign_exit_escalation_seconds
+    _zombie_revert_s: float = ExitConfig().zombie_exit_revert_seconds
+
     def __init__(
         self,
         ibkr_client: IBKRClient,
@@ -335,6 +367,21 @@ class TradeExecutor:
                                     else DEFAULT_MAX_SPREAD_PCT)
         except (TypeError, ValueError):
             self._max_spread_pct = DEFAULT_MAX_SPREAD_PCT
+        _pos_cfg = getattr(settings, "positions", None)
+        _exit_cfg_w70 = getattr(settings, "exit", None)
+        cls = type(self)
+        self._partial_fill_cancel_s = _cfg_num(
+            _pos_cfg, "partial_fill_cancel_seconds", cls._partial_fill_cancel_s)
+        self._absent_order_grace_s = _cfg_num(
+            _pos_cfg, "absent_order_grace_seconds", cls._absent_order_grace_s)
+        self._ladder_step_s = _cfg_num(
+            _pos_cfg, "entry_ladder_step_seconds", cls._ladder_step_s)
+        self._exit_visibility_grace_s = _cfg_num(
+            _exit_cfg_w70, "order_visibility_grace_seconds", cls._exit_visibility_grace_s)
+        self._foreign_exit_escalation_s = _cfg_num(
+            _exit_cfg_w70, "foreign_exit_escalation_seconds", cls._foreign_exit_escalation_s)
+        self._zombie_revert_s = _cfg_num(
+            _exit_cfg_w70, "zombie_exit_revert_seconds", cls._zombie_revert_s)
         self._pending_orders: dict[int, PendingOrder] = {}  # order_id → PendingOrder
         self._pending_exit_orders: dict[int, PendingExitOrder] = {}  # order_id → PendingExitOrder
         # W61: a roll's single 4-leg fill books TWO trades (closing + opening)
@@ -416,8 +463,8 @@ class TradeExecutor:
         if _bucket is None:
             _bucket = self._order_times = []
         _now = _time.time()
-        _bucket[:] = [t for t in _bucket if _now - t < 60]
-        if len(_bucket) >= 8:
+        _bucket[:] = [t for t in _bucket if _now - t < ORDER_RATE_LIMIT_WINDOW_S]
+        if len(_bucket) >= ORDER_RATE_LIMIT_MAX:
             log.critical("order_rate_limit_tripped", orders_last_60s=len(_bucket))
             return None
         _bucket.append(_now)
@@ -806,7 +853,8 @@ class TradeExecutor:
             else:
                 _mid = (_bid + _ask) / 2
                 _spread = abs(_ask - _bid)
-                if abs(_mid) > 0.05 and _spread / abs(_mid) > 1.0:
+                if (abs(_mid) > NBBO_MID_FLOOR
+                        and _spread / abs(_mid) > NBBO_DISORDERLY_SPREAD_RATIO):
                     log.warning("combo_spread_disorderly_rejected",
                                 trade_id=trade_id, bid=_bid, ask=_ask)
                     # R12 Tier-A #1: CAS PENDING->CANCELLED
@@ -814,7 +862,9 @@ class TradeExecutor:
                         trade_id, (TradeStatus.PENDING,), TradeStatus.CANCELLED)
                     return None
                 # combo quotes are signed; compare magnitudes
-                if abs(_mid) > 0.05 and abs(abs(signal.entry_price) - abs(_mid)) / abs(_mid) > 0.35:
+                if (abs(_mid) > NBBO_MID_FLOOR
+                        and abs(abs(signal.entry_price) - abs(_mid)) / abs(_mid)
+                        > NBBO_STALE_SIGNAL_DEVIATION):
                     log.warning("combo_signal_price_stale_rejected",
                                 trade_id=trade_id,
                                 signal_px=signal.entry_price, live_mid=_mid)
@@ -980,8 +1030,8 @@ class TradeExecutor:
         if _bucket is None:
             _bucket = self._order_times = []
         _now = time.time()
-        _bucket[:] = [t for t in _bucket if _now - t < 60]
-        if len(_bucket) >= 8:
+        _bucket[:] = [t for t in _bucket if _now - t < ORDER_RATE_LIMIT_WINDOW_S]
+        if len(_bucket) >= ORDER_RATE_LIMIT_MAX:
             log.critical("roll_order_rate_limit_tripped", orders_last_60s=len(_bucket))
             return False
         _bucket.append(_now)
@@ -1141,6 +1191,7 @@ class TradeExecutor:
         # next disconnect — this is the only window in which the permanent
         # key of a working order can be learned.
         self._refresh_perm_ids(all_trades)
+        self._record_order_acks(all_trades)  # W70: log-only telemetry
 
         for order_id, pending in list(self._pending_orders.items()):
             still_open = any(t.order.orderId == order_id for t in open_trades)
@@ -1211,7 +1262,7 @@ class TradeExecutor:
                 # and the cancel was never transmitted: a dead safety path
                 # that logged a cancellation which never happened, leaving the
                 # remainder riding at stale prices until the 240s timeout.
-                if pending.age_seconds > 30:
+                if pending.age_seconds > self._partial_fill_cancel_s:  # W70: positions.partial_fill_cancel_seconds
                     log.warning(
                         "partial_fill_cancelling_remainder",
                         trade_id=pending.trade_id,
@@ -1299,7 +1350,7 @@ class TradeExecutor:
                     # Still working under the other session. Cross-client
                     # cancels are rejected, so escalate instead of looping on
                     # a cancel that can never land.
-                    if pending_exit.age_seconds > 300:
+                    if pending_exit.age_seconds > self._foreign_exit_escalation_s:  # W70: exit.foreign_exit_escalation_seconds
                         self._page_stuck_order(
                             order_id, "exit_order_foreign_uncancellable",
                             trade_id=pending_exit.trade_id,
@@ -1375,7 +1426,7 @@ class TradeExecutor:
 
             # Give exit orders time to appear in IBKR's trade list before checking
             # Without this, fresh orders get falsely marked as "cancelled"
-            if pending_exit.age_seconds < 10:
+            if pending_exit.age_seconds < self._exit_visibility_grace_s:  # W70: exit.order_visibility_grace_seconds
                 continue
 
             exit_status = self._determine_exit_fill_status(order_id, all_trades)
@@ -1557,7 +1608,7 @@ class TradeExecutor:
                            "be cancelled; the position stays CLOSING until "
                            "the broker or the operator resolves it",
                 )
-                if pending_exit.age_seconds > 900:
+                if pending_exit.age_seconds > self._zombie_revert_s:  # W70: exit.zombie_exit_revert_seconds
                     # R16: the zombie cap consulted NOTHING before reverting —
                     # not the foreign stash, not the broker. If the close
                     # order is in fact still working (under a previous
@@ -1646,7 +1697,7 @@ class TradeExecutor:
         return filled, completed_exits
 
     _LADDER_STEPS = (0.25, 0.60, 1.00)   # fractions of the marketable offset
-    _LADDER_STEP_SECS = 45               # escalate an unfilled entry every 45s
+    # W70: the step (was _LADDER_STEP_SECS = 45) is positions.entry_ladder_step_seconds
 
     async def _reprice_pending_entries(self) -> None:
         """R7: step unfilled entry combos toward marketable (mid-first ladder).
@@ -1658,7 +1709,7 @@ class TradeExecutor:
         for order_id, pending in list(self._pending_orders.items()):
             if not pending.base_price or not pending.full_offset:
                 continue
-            target_step = min(int(pending.age_seconds // self._LADDER_STEP_SECS),
+            target_step = min(int(pending.age_seconds // self._ladder_step_s),
                               len(self._LADDER_STEPS) - 1)
             if target_step <= pending.step:
                 continue
@@ -1975,11 +2026,59 @@ class TradeExecutor:
                 except Exception as e:
                     log.warning("cancel_failed", order_id=order_id, error=str(e))
 
+    def _record_order_acks(self, all_trades) -> None:
+        """W70 telemetry (log only, cannot change behavior, never raises).
+
+        Once per order, when this session can first see it in the trade list, emit
+        `order_ack_latency`: the seconds ib_insync's own Trade.log says passed
+        between placement (first entry) and the first non-PendingSubmit status.
+        Those timestamps are set when each broker message arrives, so unlike the
+        30s tick they resolve sub-second. This is the evidence the grace-period
+        floors (exit.order_visibility_grace_seconds, positions.absent_order_grace_seconds)
+        are meant to be set from: it covers ENTRY and EXIT orders, and being a
+        structured event it is published to the shared-logs branch (raw IBKR print
+        lines are not).
+        """
+        try:
+            done = getattr(self, "_ack_logged", None)
+            if done is None:
+                done = self._ack_logged = set()
+            by_id = None
+            # annotated: the two dicts hold different value types, which mypy would
+            # otherwise join to `object` (and flag `.age_seconds`)
+            groups: list[tuple[str, dict]] = [("entry", self._pending_orders),
+                                              ("exit", self._pending_exit_orders)]
+            for kind, pend in groups:
+                for order_id, p in list(pend.items()):
+                    if order_id in done:
+                        continue
+                    if by_id is None:
+                        by_id = {t.order.orderId: t for t in all_trades}
+                    t = by_id.get(order_id)
+                    if t is None:
+                        continue
+                    entries = list(getattr(t, "log", None) or [])
+                    if len(entries) < 2:
+                        continue
+                    ack = next((e for e in entries[1:]
+                                if str(e.status) not in ("PendingSubmit", "ApiPending")), None)
+                    if ack is None:
+                        continue
+                    done.add(order_id)
+                    log.info(
+                        "order_ack_latency", kind=kind, order_id=order_id,
+                        trade_id=getattr(p, "trade_id", ""),
+                        ack_seconds=round((ack.time - entries[0].time).total_seconds(), 3),
+                        first_status=str(ack.status),
+                        first_seen_age_seconds=round(p.age_seconds, 1))
+        except Exception:  # noqa: BLE001 — telemetry must never break a fill pass
+            pass
+
     # R16: an authoritative all-clients snapshot is a broker round trip; a
     # single check_fills pass can consult it from several places (stash prune,
     # entry cancel verdicts, exit resolution, the 900s zombie cap), so cache
     # it for a few seconds. Passes are 30s apart, so this never hides a change.
-    _BROKER_SNAPSHOT_TTL = 5.0
+    _BROKER_SNAPSHOT_TTL = BROKER_SNAPSHOT_TTL_SECONDS  # W70: ait.config.invariants
 
     async def _broker_open_order_ids(self) -> set[int] | None:
         """R16: orderIds working at the BROKER across ALL clientIds, or None
@@ -2493,7 +2592,12 @@ class TradeExecutor:
         # but that list is empty on any connection blip, so a mid-cycle
         # disconnect flipped EVERY working entry to CANCELLED while live at
         # IBKR. Mirror the exit path: treat young/unknown as still pending.
-        if pending.age_seconds < 30:
+        _grace = self._absent_order_grace_s  # W70: positions.absent_order_grace_seconds
+        # W70 telemetry (log only): how old an ABSENT entry is when it is judged.
+        log.info("order_absent_judged", order_id=order_id,
+                 age_seconds=round(pending.age_seconds, 1), grace_seconds=_grace,
+                 verdict="pending" if pending.age_seconds < _grace else "judged")
+        if pending.age_seconds < _grace:
             return "pending"
         # R12 F3.1: an order placed before a fallback-clientId reconnect is
         # ABSENT from this session's trade list by construction — that is the

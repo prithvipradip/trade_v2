@@ -40,6 +40,7 @@ from ait.execution.roll_booking import cas_roll_closing_trade, roll_order_ref, s
 from ait.execution.roll_comparison import ev_should_roll, heuristic_should_roll
 from ait.execution.roll_executor import prepare_roll_combo
 from ait.execution.roll_selector import RollTarget, select_roll_target
+from ait.config.invariants import LIVE_MAX_SPREAD_PCT, LIVE_MIN_VOLUME
 from ait.learning.adaptor import AdaptationLimits
 from ait.learning.engine import LearningEngine
 from ait.ml.ensemble import DirectionPredictor
@@ -188,8 +189,8 @@ SHUTDOWN_MARKS_SNAPSHOT_TIMEOUT_SECONDS = 10
 # config values (spread 0.40, volume 0) are checked AGAINST, so making them
 # tunable would let the same edit that loosens a gate also loosen its check.
 # docs/RUNBOOK.md's go-live checklist documents both numbers.
-_LIVE_MAX_SPREAD_PCT = 0.15
-_LIVE_MIN_VOLUME = 10
+_LIVE_MAX_SPREAD_PCT = LIVE_MAX_SPREAD_PCT   # W70: values live in ait.config.invariants
+_LIVE_MIN_VOLUME = LIVE_MIN_VOLUME
 
 
 def read_restricted_symbols(path: str | None = None) -> set[str] | None:

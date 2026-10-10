@@ -76,6 +76,10 @@ CONTRACT_DEFAULTS: dict[str, str] = {
     "OMP_NUM_THREADS": "1",
     "AIT_MARKET_DATA_TYPE": "4",
     "AIT_IC_WING_K": "1.6",
+    # W70: minimum iron-condor wing, dollars. Was a literal 2.0 inside
+    # strategies/iron_condor.py while research read backtest.wing_floor_dollars; both
+    # now read this one key (config home below), live AND research.
+    "AIT_IC_WING_FLOOR": "2.0",
     "AIT_IC_MIN_CREDIT_WIDTH": "0.10",
     "AIT_IC_MIN_CREDIT": "0.70",
     # R6/R16 evidence: flat credit stops underperform touch-close, so live
@@ -137,6 +141,7 @@ CONTRACT_DEFAULTS: dict[str, str] = {
 #                           into os.environ and that would shadow config.yaml
 CONFIG_BACKED: dict[str, tuple[str, str]] = {
     "AIT_IC_WING_K": ("backtest", "wing_k"),
+    "AIT_IC_WING_FLOOR": ("backtest", "wing_floor_dollars"),   # W70
     "AIT_IC_MIN_CREDIT_WIDTH": ("backtest", "ic_min_credit_width"),
     "AIT_IC_MIN_CREDIT": ("backtest", "ic_min_credit"),
     "AIT_CREDIT_LOSS_LIMIT": ("backtest", "credit_loss_limit"),

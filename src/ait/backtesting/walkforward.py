@@ -90,7 +90,7 @@ class WalkForwardConfig:
     vlmc_min_coverage: float = 0.95            # 5-min day coverage needed for VLMC
     macro_event_types: "tuple[str, ...] | None" = None  # None -> hardcoded live calendar
     max_windows: int | None = None             # keep only the LAST N windows (timing/pilot runs)
-    wing_floor_dollars: float = 2.0   # R6 parity: live iron_condor min wing is $2, not $5
+    wing_floor_dollars: float | None = None   # W70: None -> backtest.wing_floor_dollars (2.0; R6 parity: live iron_condor min wing is $2, not $5)
     # R20b (pre-registered PLAN 2026-08-21): was a hardcoded 1.0 — the frozen
     # 2026-07 default that shadowed the PROMOTED live value (contract 1.6 since
     # the 2026-08-04 wide-wing promotion). None -> __post_init__ resolves via
@@ -115,7 +115,7 @@ class WalkForwardConfig:
     # load_settings().backtest.iv_floor (BacktestConfig default when no
     # config.yaml is reachable). Explicit values always win.
     iv_floor: float | None = None
-    delta_iv_scale: float = 0.0
+    delta_iv_scale: float | None = None      # W70: None -> backtest.delta_iv_scale
     stop_loss_pct: float | None = None      # None -> __post_init__ resolves
     profit_target_pct: float | None = None  # settings.backtest baselines
     max_hold_days: int | None = None
@@ -133,10 +133,10 @@ class WalkForwardConfig:
     # reachable). Explicit values always win.
     range_min_confidence: float | None = None  # threshold for range model on iron condors
     trailing_stop_enabled: bool = True
-    trailing_stop_pct: float = 0.25
-    breakeven_trigger_pct: float = 0.30
+    trailing_stop_pct: float | None = None   # W70: None -> exit.trailing_stop_pct
+    breakeven_trigger_pct: float | None = None   # W70: None -> exit.breakeven_trigger_pct
     max_concurrent_positions: int = 1
-    max_entry_vol_annual: float = 0.80
+    max_entry_vol_annual: float | None = None    # W70: None -> backtest.max_entry_vol_annual
     optimize_per_window: bool = False
     optimize_n_trials: int = 50
     optimize_patience: int = 0       # 0 = disabled; N = stop after N non-improving trials
@@ -173,10 +173,12 @@ class WalkForwardConfig:
     entry_window_end_et: str | None = None      # latest allowed entry time (ET)
     limit_order_timeout_bars: int | None = None # cancel limit order after N 5-min bars without fill
     # Options spread model params (Fix 5 / Gap E)
-    spread_base: float = 0.03             # base half-spread per leg ($)
-    spread_iv_sensitivity: float = 0.10   # additional spread per unit IV above 0.20
-    spread_dte_sensitivity: float = 0.005 # additional spread per DTE below 21
-    spread_cap: float = 0.15              # maximum half-spread per leg ($)
+    # W70: None -> backtest.spread_* (these four config keys were read by NOTHING; the
+    # walk-forward carried its own literals 0.03 / 0.10 / 0.005 / 0.15).
+    spread_base: float | None = None             # base half-spread per leg ($)
+    spread_iv_sensitivity: float | None = None   # additional spread per unit IV above 0.20
+    spread_dte_sensitivity: float | None = None  # additional spread per DTE below 21
+    spread_cap: float | None = None              # maximum half-spread per leg ($)
     # R6 exit/construction parity knobs (None -> engine resolves the SAME env
     # var + default the live bot reads; see Backtester.__init__):
     credit_loss_limit_mult: float | None = None   # env AIT_CREDIT_LOSS_LIMIT (live default 0
@@ -264,7 +266,8 @@ class WalkForwardConfig:
         # independently calling load_settings() (was up to 3 redundant reads
         # per WalkForwardConfig construction, now 1).
         from ait.config.settings import (
-            BacktestConfig, MLConfig, RiskConfig, load_settings, resolve_config_value,
+            BacktestConfig, ExitConfig, MLConfig, RiskConfig, load_settings,
+            resolve_config_value,
         )
         try:
             _settings = load_settings()
@@ -349,6 +352,25 @@ class WalkForwardConfig:
         self.min_edge_over_baseline = float(resolve_config_value(
             self.min_edge_over_baseline, "backtest", "min_edge_over_baseline",
             BacktestConfig, _settings))
+        # W70: the remaining literals, now config-resolved (values unchanged at today's
+        # config.yaml except wing_floor_dollars, which was already 2.0 here).
+        # W70: the SAME contract call live's iron_condor.py uses (AIT_IC_WING_FLOOR, home
+        # backtest.wing_floor_dollars) — one key, live AND research.
+        from ait.config.runtime_env import contract_float as _cf
+        self.wing_floor_dollars = (float(self.wing_floor_dollars)
+                                   if self.wing_floor_dollars is not None
+                                   else _cf("AIT_IC_WING_FLOOR"))
+        self.delta_iv_scale = float(resolve_config_value(
+            self.delta_iv_scale, "backtest", "delta_iv_scale", BacktestConfig, _settings))
+        self.max_entry_vol_annual = float(resolve_config_value(
+            self.max_entry_vol_annual, "backtest", "max_entry_vol_annual", BacktestConfig, _settings))
+        self.trailing_stop_pct = float(resolve_config_value(
+            self.trailing_stop_pct, "exit", "trailing_stop_pct", ExitConfig, _settings))
+        self.breakeven_trigger_pct = float(resolve_config_value(
+            self.breakeven_trigger_pct, "exit", "breakeven_trigger_pct", ExitConfig, _settings))
+        for _f in ("spread_base", "spread_iv_sensitivity", "spread_dte_sensitivity", "spread_cap"):
+            setattr(self, _f, float(resolve_config_value(
+                getattr(self, _f), "backtest", _f, BacktestConfig, _settings)))
 
 
 @dataclass

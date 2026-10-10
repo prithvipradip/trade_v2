@@ -33,6 +33,7 @@ from ait.execution import exit_policy
 from ait.ml.regime_gate import apply_range_prob_delta, fractal_gate
 from ait.strategies.base import CREDIT_STRATEGIES, SignalDirection
 from ait.utils.logging import get_logger
+from ait.config.invariants import IC_BUDGET_CAPPED_MIN_WING  # W70: fixed, visible
 from ait.config.runtime_env import contract_flag, contract_float  # R19: ONE authority for env-contract defaults
 
 log = get_logger("backtesting.engine")
@@ -96,7 +97,7 @@ class Backtester:
         # pinned 0.65 keeps its commission line and only gains the fees.
         commission_per_contract: float | None = None,
         regulatory_fees_per_contract: float | None = None,
-        slippage_pct: float = 0.01,
+        slippage_pct: float | None = None,   # W70: None -> backtest.slippage_pct
         position_size_pct: float = 0.05,
         # W64 live-parity switches, OFF for a bare Backtester (R20b: the bare
         # engine's sizing knobs stay explicit harness defaults; hundreds of engine
@@ -125,9 +126,9 @@ class Backtester:
         # iron condor only, and falls back to legacy (with a WARNING) when the symbol has
         # no fitted model. The research entry points resolve it from backtest.friction_*.
         friction_model: str = "legacy",
-        friction_entry_capture: float = 1.0,   # share of the quoted half-spread paid at entry
-        friction_exit_capture: float = 1.0,    # ... and at exit (1.0 = full, conservative)
-        friction_stress_multiplier: float = 1.0,  # scales the model (calm-sample hedge/sweeps)
+        friction_entry_capture: float | None = None,   # share of the quoted half-spread paid at entry (None -> backtest.*)
+        friction_exit_capture: float | None = None,    # ... and at exit (1.0 = full, conservative; None -> backtest.*)
+        friction_stress_multiplier: float | None = None,  # scales the model (calm-sample hedge/sweeps; None -> backtest.*)
         # W67 gate parity. gates_mode "enforce" (bare default, the engine's historical
         # behaviour) blocks entries on the range-model floor and the fractal hard veto;
         # "observe" mirrors live today (ml.entry_gates_enabled=false): both are still
@@ -150,67 +151,78 @@ class Backtester:
         fractal_veto_spread: float | None = None,
         # Share of the fractal penalty that ALSO lowers the range model's P(in range)
         # before the range floor (0 = live parity: the range probability is untouched).
-        penalty_on_range_prob: float = 0.0,
+        penalty_on_range_prob: float | None = None,   # W70: None -> backtest.penalty_on_range_prob
+        # W70 D (registered, NOT resolved): stop/target stay explicit harness defaults
+        # (0.50 / 1.00) although config.yaml's research baselines are 0.35 / 0.50 — a
+        # deliberate divergence the operator will revisit; see PLAN.md W70.
         stop_loss_pct: float = 0.50,
         profit_target_pct: float = 1.00,
-        max_hold_days: int = 30,
+        max_hold_days: int | None = None,      # W70: None -> backtest.max_hold_days
         # R20b (pre-registered PLAN 2026-08-21): was 0.55, silently shadowing
         # the config with a DIFFERENT value. None -> resolve from
         # load_settings().risk.min_confidence (yaml 0.50). See the resolution
         # block below for why risk.min_confidence is the documented home.
         min_confidence: float | None = None,
         trailing_stop_enabled: bool = False,
-        trailing_stop_pct: float = 0.25,
-        breakeven_trigger_pct: float = 0.30,
+        trailing_stop_pct: float | None = None,       # W70: None -> exit.trailing_stop_pct
+        breakeven_trigger_pct: float | None = None,   # W70: None -> exit.breakeven_trigger_pct
         predictor: Any = None,
         range_predictor: Any = None,
         # R20b: was 0.55 vs live's ml.range_min_confidence = 0.65 (config.yaml;
         # 0.65 beat 0.55 across every backtest metric) — the parity gap the
         # floor sweep exposed. None -> resolve from load_settings().ml.
         range_min_confidence: float | None = None,
-        context_bars: int = 0,
-        delta_short: float = 0.20,
-        delta_long: float = 0.30,
+        context_bars: int | None = None,      # W70: None -> backtest.context_bars
+        delta_short: float | None = None,     # W70: None -> backtest.delta_short
+        delta_long: float | None = None,      # W70: None -> backtest.delta_long
         # R20b: was 0.12 vs config.yaml backtest.iv_floor = 0.20 — a bare
         # engine priced systematically thinner credits than every configured
         # path. None -> resolve from load_settings().backtest.iv_floor.
         iv_floor: float | None = None,
         # R6 parity: live iron_condor._vol_scaled_width enforces min $2, not $5.
-        wing_floor_dollars: float = 2.0,
+        wing_floor_dollars: float | None = None,   # W70: None -> backtest.wing_floor_dollars (2.0)
         # R16 #8: None -> resolve env AIT_IC_WING_K (default 1.0), mirroring
         # live iron_condor.py:107 — same pattern as ic_min_credit_width below.
         wing_k: float | None = None,
-        delta_iv_scale: float = 0.0,
-        skew_factor: float = 1.0,
+        delta_iv_scale: float | None = None,   # W70: None -> backtest.delta_iv_scale
+        skew_factor: float | None = None,      # W70: None -> backtest.skew_factor
         # W5 finding model-vs-reality-skew-10x-flat: measured put-side skew is
         # 9-11x steeper than the hardcoded 0.10 slope in _get_leg_iv, so model
         # wings were near-free ($0.08 vs $0.71-0.92 real). None -> resolve
         # from load_settings().backtest.skew_slope_per_pct_otm; 0.0 restores
         # pre-W5 pricing exactly.
         skew_slope_per_pct_otm: float | None = None,
-        hurst_regime_threshold: float = 0.20,
-        hurst_regime_penalty: float = 0.10,
-        hurst_hard_veto_multiplier: float = 1.5,
-        multifractal_max_width: float = 0.50,
-        iv_rank_rise_threshold: float = 0.30,
-        pct_from_60d_high_threshold: float = -1.0,
-        min_edge_over_baseline: float = 0.05,
+        # W70: every knob in this block is None -> backtest.<same name> (the model
+        # defaults equal the former literals 0.20 / 0.10 / 1.5 / 0.50 / 0.30 / -1.0 / 0.05).
+        hurst_regime_threshold: float | None = None,
+        hurst_regime_penalty: float | None = None,
+        hurst_hard_veto_multiplier: float | None = None,
+        multifractal_max_width: float | None = None,
+        iv_rank_rise_threshold: float | None = None,
+        pct_from_60d_high_threshold: float | None = None,
+        min_edge_over_baseline: float | None = None,
         features_cache: pd.DataFrame | None = None,
         # R20b: stays EXPLICIT (with initial_capital above) per the
         # pre-registration — harness sizing knob; 1 = the original
         # single-position semantics unit tests depend on.
         max_concurrent_positions: int = 1,
-        max_entry_vol_annual: float = 0.80,
-        # Options bid-ask spread model (per-leg, IV/DTE-aware)
-        spread_base: float = 0.03,
-        spread_iv_sensitivity: float = 0.10,
-        spread_dte_sensitivity: float = 0.005,
-        spread_cap: float = 0.15,
+        max_entry_vol_annual: float | None = None,   # W70: None -> backtest.max_entry_vol_annual
+        # Options bid-ask spread model (per-leg, IV/DTE-aware). W70: None -> backtest.spread_*
+        # (these four config keys were read by NOTHING before; the engine and the
+        # walk-forward each carried their own literals).
+        spread_base: float | None = None,
+        spread_iv_sensitivity: float | None = None,
+        spread_dte_sensitivity: float | None = None,
+        spread_cap: float | None = None,
         # Cross-asset market context forwarded from walk-forward engine (Gap Z3)
         market_context: dict | None = None,
         # Earnings-aware skip (Gap Z4): if symbol is given, skip entries near earnings dates
         symbol: str | None = None,
-        earnings_skip_days: int = 2,
+        # W70 (parity): the earnings danger window is live's, from earnings.buffer_days_before /
+        # buffer_days_after (None -> config). It replaces the private `earnings_skip_days=2`,
+        # which blocked [earnings-1, earnings+2]; live blocks [earnings-2, earnings+1].
+        earnings_buffer_days_before: int | None = None,
+        earnings_buffer_days_after: int | None = None,
         # Intraday engine (Fix 1): 5-min execution loop.
         # R20 #4/#5b: None -> resolve from load_settings().backtest (config.yaml
         # authority; BacktestConfig defaults when no config is reachable). The
@@ -320,6 +332,65 @@ class Backtester:
         # ladder in exit_policy.CREDIT_TP_LADDER; live never sets this.
         credit_tp_ladder: Any = None,
     ) -> None:
+        # W70: load settings FIRST. Constructor knobs that have a config twin are None by
+        # default and resolve here with the project-wide precedence explicit arg > loaded
+        # settings.<section>.<field> > the config model's own default (resolve_config_value).
+        # The model defaults equal the literals these parameters used to carry, so a bare
+        # Backtester() is unchanged at today's config.yaml. Knobs deliberately kept explicit
+        # (initial_capital, position_size_pct, max_concurrent_positions, stop_loss_pct,
+        # profit_target_pct) are NOT here: see PLAN.md W70 "registered, not changed".
+        if settings is not None:
+            _settings = settings
+        else:
+            try:
+                from ait.config.settings import load_settings as _ls
+                _settings = _ls()
+            except Exception as _e:  # noqa: BLE001 — no config.yaml -> per-field defaults
+                _settings = None
+                # W52a: this used to be silent. A run from the wrong cwd is
+                # a different harness (every settings-backed knob at its
+                # model default) and must say so.
+                log.warning("engine_settings_unavailable_using_defaults",
+                            cwd=os.getcwd(), error=str(_e))
+        from ait.config.settings import (
+            BacktestConfig, EarningsConfig, ExitConfig, MLConfig, OptionsConfig, RiskConfig,
+        )
+        _bt = lambda v, f: _resolve_setting(v, "backtest", f, BacktestConfig, _settings)  # noqa: E731
+        slippage_pct = float(_bt(slippage_pct, "slippage_pct"))
+        friction_entry_capture = float(_bt(friction_entry_capture, "friction_entry_capture"))
+        friction_exit_capture = float(_bt(friction_exit_capture, "friction_exit_capture"))
+        friction_stress_multiplier = float(_bt(friction_stress_multiplier, "friction_stress_multiplier"))
+        penalty_on_range_prob = float(_bt(penalty_on_range_prob, "penalty_on_range_prob"))
+        max_hold_days = int(_bt(max_hold_days, "max_hold_days"))
+        trailing_stop_pct = float(_resolve_setting(
+            trailing_stop_pct, "exit", "trailing_stop_pct", ExitConfig, _settings))
+        breakeven_trigger_pct = float(_resolve_setting(
+            breakeven_trigger_pct, "exit", "breakeven_trigger_pct", ExitConfig, _settings))
+        context_bars = int(_bt(context_bars, "context_bars"))
+        delta_short = float(_bt(delta_short, "delta_short"))
+        delta_long = float(_bt(delta_long, "delta_long"))
+        # W70: the SAME contract call live uses (AIT_IC_WING_FLOOR, home
+        # backtest.wing_floor_dollars) — one key, one value, live and research.
+        wing_floor_dollars = (float(wing_floor_dollars) if wing_floor_dollars is not None
+                              else contract_float("AIT_IC_WING_FLOOR"))
+        delta_iv_scale = float(_bt(delta_iv_scale, "delta_iv_scale"))
+        skew_factor = float(_bt(skew_factor, "skew_factor"))
+        hurst_regime_threshold = float(_bt(hurst_regime_threshold, "hurst_regime_threshold"))
+        hurst_regime_penalty = float(_bt(hurst_regime_penalty, "hurst_regime_penalty"))
+        hurst_hard_veto_multiplier = float(_bt(hurst_hard_veto_multiplier, "hurst_hard_veto_multiplier"))
+        multifractal_max_width = float(_bt(multifractal_max_width, "multifractal_max_width"))
+        iv_rank_rise_threshold = float(_bt(iv_rank_rise_threshold, "iv_rank_rise_threshold"))
+        pct_from_60d_high_threshold = float(_bt(pct_from_60d_high_threshold, "pct_from_60d_high_threshold"))
+        min_edge_over_baseline = float(_bt(min_edge_over_baseline, "min_edge_over_baseline"))
+        max_entry_vol_annual = float(_bt(max_entry_vol_annual, "max_entry_vol_annual"))
+        spread_base = float(_bt(spread_base, "spread_base"))
+        spread_iv_sensitivity = float(_bt(spread_iv_sensitivity, "spread_iv_sensitivity"))
+        spread_dte_sensitivity = float(_bt(spread_dte_sensitivity, "spread_dte_sensitivity"))
+        spread_cap = float(_bt(spread_cap, "spread_cap"))
+        earnings_buffer_days_before = int(_resolve_setting(
+            earnings_buffer_days_before, "earnings", "buffer_days_before", EarningsConfig, _settings))
+        earnings_buffer_days_after = int(_resolve_setting(
+            earnings_buffer_days_after, "earnings", "buffer_days_after", EarningsConfig, _settings))
         self._data = self._prepare_data(data)
         self._strategies = strategies
         self._initial_capital = initial_capital
@@ -414,7 +485,8 @@ class Backtester:
             self._load_calibrated_spreads()
         if self._friction_model == "per_leg_usd":
             self._load_leg_spread_model()
-        self._earnings_dates: set[date] = self._load_earnings_dates(symbol, earnings_skip_days)
+        self._earnings_dates: set[date] = self._load_earnings_dates(
+            symbol, earnings_buffer_days_before, earnings_buffer_days_after)
         self._intraday_store = intraday_store
         # R20: resolve LOADED settings once for every config-backed knob below
         # (extends the R16 #7 pre_event_blackout_days pattern).
@@ -422,19 +494,7 @@ class Backtester:
         # StrategyOptimizer loads it once and threads it through per Optuna
         # trial) instead of unconditionally re-reading + re-validating
         # config.yaml on every Backtester construction.
-        if settings is not None:
-            _settings = settings
-        else:
-            try:
-                from ait.config.settings import load_settings as _ls
-                _settings = _ls()
-            except Exception as _e:  # noqa: BLE001 — no config.yaml -> per-field defaults
-                _settings = None
-                # W52a: this used to be silent. A run from the wrong cwd is
-                # a different harness (every settings-backed knob at its
-                # model default) and must say so.
-                log.warning("engine_settings_unavailable_using_defaults",
-                            cwd=os.getcwd(), error=str(_e))
+        # W70: _settings is loaded at the top of __init__ (the constructor knobs resolve from it).
         # R20 #4/#5b + R20b (pre-registered PLAN 2026-08-21): every knob below
         # follows the same explicit > settings.<section>.<field> > config-model
         # default precedence (_resolve_setting); explicit constructor args
@@ -452,9 +512,6 @@ class Backtester:
         # exporter already maps "min_confidence" -> ("risk", "min_confidence")
         # (optimization/results.py). It is NOT ml.range_min_confidence (the
         # range-gate floor, a separate knob resolved below).
-        from ait.config.settings import (
-            BacktestConfig, ExitConfig, MLConfig, OptionsConfig, RiskConfig,
-        )
         # entry_dte: real time-to-expiration for BS pricing/decay, fixed near
         # live's actual chain selection (dte_range[0]) — see constructor
         # comment. Not itself Optuna-searched; max_hold_days (below) stays
@@ -1355,14 +1412,21 @@ class Backtester:
         return None
 
     @staticmethod
-    def _load_earnings_dates(symbol: str | None, skip_days: int) -> set[date]:
+    def _load_earnings_dates(symbol: str | None, before_days: int,
+                             after_days: int) -> set[date]:
         """Pre-fetch historical earnings dates from yfinance (Gap Z4).
 
-        Returns the set of all calendar dates within skip_days of any earnings
-        announcement, so the main loop can do an O(1) membership test.
-        Returns an empty set if symbol is None or yfinance is unavailable.
+        Returns every calendar date inside the earnings danger window of any
+        announcement, so the main loop can do an O(1) membership test: the window
+        is live's — [earnings - before_days, earnings + after_days] — i.e. the
+        days on which live's EarningsCalendar refuses entries
+        (`-buffer_after <= days_until <= buffer_before`). W70: this used to build
+        `range(-1, skip_days + 1)` around each date, i.e. 1 day before to
+        `skip_days` AFTER — the mirror image of live's 2-before / 1-after.
+        Returns an empty set if symbol is None, both buffers are 0, or yfinance
+        is unavailable.
         """
-        if not symbol or skip_days <= 0:
+        if not symbol or (before_days <= 0 and after_days <= 0):
             return set()
         try:
             import yfinance as yf
@@ -1374,7 +1438,7 @@ class Backtester:
             danger_dates: set[date] = set()
             for idx_val in eds.index:
                 ed = idx_val.date() if hasattr(idx_val, "date") else idx_val
-                for delta in range(-1, skip_days + 1):  # 1 day after through skip_days before
+                for delta in range(-int(before_days), int(after_days) + 1):
                     danger_dates.add(ed + timedelta(days=delta))
             log.debug("earnings_dates_loaded", symbol=symbol, count=len(danger_dates))
             return danger_dates
@@ -2046,7 +2110,7 @@ class Backtester:
                 _budget = float(capital) * self._position_size_pct
                 _afford = _IC.affordable_width(_budget)
                 if _afford < wing_width:
-                    wing_width = float(max(1.0, round(_afford)))
+                    wing_width = float(max(IC_BUDGET_CAPPED_MIN_WING, round(_afford)))
             long_call_strike = short_call_strike + wing_width
             long_put_strike = short_put_strike - wing_width
 

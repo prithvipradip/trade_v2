@@ -2,6 +2,25 @@
 # AIT v2 - Autonomous Intelligent Trading Configuration
 # ============================================================
 
+# ------------------------------------------------------------
+# FIXED LIMITS  (comment only: NOT keys, NOT configurable here)
+# Deliberately fixed in code, in one module: src/ait/config/invariants.py
+# (one-line reason for each: docs/RUNBOOK.md "Fixed limits"; logged at every start
+# as `fixed_limits_in_effect`). Editing this comment changes nothing; a test keeps
+# it equal to the module.
+#   ORDER_RATE_LIMIT_MAX = 8
+#   ORDER_RATE_LIMIT_WINDOW_S = 60
+#   NBBO_DISORDERLY_SPREAD_RATIO = 1.0
+#   NBBO_STALE_SIGNAL_DEVIATION = 0.35
+#   NBBO_MID_FLOOR = 0.05
+#   LIVE_MAX_SPREAD_PCT = 0.15
+#   LIVE_MIN_VOLUME = 10
+#   PDT_MAX_DAY_TRADES = 3
+#   PDT_WINDOW_DAYS = 5
+#   BROKER_SNAPSHOT_TTL_SECONDS = 5.0
+#   IC_BUDGET_CAPPED_MIN_WING = 1.0
+# ------------------------------------------------------------
+
 trading:
   mode: paper                          # paper | live
   # Universe pared down based on 4-year + 1-year backtests:
@@ -64,6 +83,27 @@ positions:
   max_contracts_per_trade: 1           # Learning mode: 1 contract/trade = min cost = max # of trades
   entry_ladder_start: 0.25             # W36: home for AIT_ENTRY_LADDER_START
   entry_order_timeout_seconds: 240     # W36: home for AIT_ENTRY_ORDER_TIMEOUT
+  # W70: the rest of the ENTRY order timeline (were literals in execution/executor.py).
+  # Every age below is checked on the 30s fast-monitor tick, so a value under 30 takes
+  # effect at the next tick. Each must stay below entry_order_timeout_seconds (startup
+  # refuses otherwise). Full timeline and the evidence behind the floors: docs/RUNBOOK.md.
+  #
+  # How often an unfilled entry's limit steps toward marketable (0.25 / 0.60 / 1.00 of the offset).
+  # Floor: 30s (the tick; below it steps are skipped, not honored) | Ceiling: 300s
+  # IMPACT: lower = chases the market faster, gives away more of the spread;
+  #         higher = more time sitting at the patient price.
+  entry_ladder_step_seconds: 45
+  # A PARTIALLY filled entry has its unfilled remainder cancelled after this long.
+  # Floor: 5s | Ceiling: 300s
+  # IMPACT: lower = orphaned remainders cleaned up sooner but a slow fill is cut short;
+  #         higher = the remainder rides at a stale price longer.
+  partial_fill_cancel_seconds: 30
+  # An entry ABSENT from the broker's trade list is treated as still pending while younger
+  # than this (a disconnect makes every working entry look cancelled for a moment).
+  # Floor: 10s | Ceiling: 120s
+  # IMPACT: too low = a connection blip can flip live entries to CANCELLED while they are
+  #         still working at IBKR; too high = a genuinely cancelled entry holds its slot longer.
+  absent_order_grace_seconds: 30
   max_portfolio_delta: 0.30            # Net delta limit (absolute)
   max_portfolio_risk_pct: 0.20         # Aggregate open capital-at-risk cap (now WIRED — was a
                                        # phantom 0.02 never read while manager hardcoded 0.20;
@@ -202,7 +242,20 @@ options:
 backtest:
   position_size_pct: 0.05             # 5% of capital risked per trade (max-loss basis)
                                        # Raise to 0.20 for accounts < $10k (increases concentration risk)
-  wing_floor_dollars: 5.0             # Hard minimum spread width in dollars (safety floor only)
+  # W70: THE minimum iron-condor wing, dollars — for LIVE ENTRIES AND RESEARCH alike.
+  # This key sits under `backtest:` but is also the config home of AIT_IC_WING_FLOOR,
+  # which the live builder (strategies/iron_condor.py) reads: editing it changes what the
+  # live bot TRADES, not only what a backtest simulates. Same precedence as wing_k:
+  # env/.env AIT_IC_WING_FLOOR > this key > 2.0.
+  # The wing is wing_k x price x IV x sqrt(DTE/365), never narrower than this. It binds
+  # only when the per-trade budget does not: a budget-capped wing may shrink below it
+  # (today's $5k account carries ~$2.78/wing), but never below $1 (a fixed limit, see
+  # FIXED LIMITS). Bounds: 1.0 - 10.0 (startup refuses outside).
+  # IMPACT: higher = wider minimum wing = more max loss per condor (the budget cap still
+  #         wins when it binds); lower = narrower, cheaper condors with less credit.
+  # History: was 5.0 (old backtest default; ~15 study scripts + run_optimizer read this
+  # key and moved from 5.0 -> 2.0 in W70); live's $2 was a literal in iron_condor.py.
+  wing_floor_dollars: 2.0
                                        # Wing sizing is now primarily driven by wing_k × expected_move
                                        # Lower to 0.5 for sub-$10 stocks (e.g. SOFI)
   # 2026-08-04 SHADOW R3 PROMOTION supersedes the 07-29 k=0.8 lock (that
@@ -278,6 +331,23 @@ backtest:
   skew_slope_per_pct_otm: 0.0736       # Relative put-side IV uplift per 1% OTM
                                        # (total slope 1.049 at atm_iv 0.1289 = the
                                        # sample-weighted measured value); 0 = pre-W5
+  # W70: research-engine knobs that were constructor literals in backtesting/engine.py.
+  # RESEARCH ONLY: none of these reaches the live bot (where one has a live twin, it is
+  # named). The engine and the walk-forward resolve them from here.
+  slippage_pct: 0.01                   # extra price slippage on DEBIT / long-option structures
+                                       # only; NOT applied to iron condors (friction model).
+  delta_short: 0.20                    # |delta| for short strikes in research. Live's IC short
+                                       # delta is a literal ~0.20 in strategies/iron_condor.py,
+                                       # NOT this key: changing this diverges research from live.
+  delta_long: 0.30                     # |delta| for long single options / debit legs (unused by IC).
+  hurst_hard_veto_multiplier: 1.5      # legacy veto = max(hurst_regime_threshold, 0.20) x this, used
+                                       # only when fractal_veto_spread is unset. WalkForwardConfig
+                                       # passes 0.0 (disabled); this governs a bare Backtester().
+  pct_from_60d_high_threshold: -1.0    # experimental entry gate; -1.0 = DISABLED. e.g. -0.05 =
+                                       # refuse neutral entries when spot is >5% below its 60d high.
+  skew_factor: 1.0                     # multiplier on the legacy flat IV-skew term (0 = flat IV);
+                                       # additive with skew_slope_per_pct_otm above.
+  context_bars: 0                      # extra intraday lookback bars (0 = the engine minimum of 20).
 
 ml:
   ensemble_weights:
@@ -436,6 +506,35 @@ exit:
   thesis_direction_flip_confidence: 0.70
   thesis_regime_shift_confidence: 0.70
   thesis_vix_spike_pct: 0.30           # exit if VIX is up more than +30% since entry
+  # W70: the rest of the EXIT order timeline (were literals in execution/executor.py).
+  # Together with exit_stop_pending_rest_seconds (120s) and exit_pending_rest_seconds
+  # (300s) above. Checked on the 30s fast-monitor tick. Full timeline and the evidence
+  # behind each floor: docs/RUNBOOK.md "Order lifecycle timeline".
+  #
+  # A freshly placed EXIT order is ignored by the fill checker for this long so it has
+  # time to appear in IBKR's trade list.
+  # Floor: 5s | Ceiling: 60s | Must be below exit_stop_pending_rest_seconds.
+  # NOTE the floor is a margin, not a measurement: the one acknowledgement we could time
+  # took under 1s (an entry, delayed-data paper); no exit has been timed yet. The
+  # order_ack_latency log event is collecting the real numbers.
+  # IMPACT: too low = a not-yet-visible order is misread as cancelled and the bot re-arms
+  #         a duplicate close; too high = a genuinely dead order is noticed later.
+  order_visibility_grace_seconds: 10
+  # An exit order that belongs to ANOTHER clientId cannot be cancelled from here; after
+  # this long the operator is paged instead.
+  # Floor: 60s | Ceiling: 3600s | Must be >= exit_pending_rest_seconds.
+  # IMPACT: lower = earlier, noisier pages; higher = a stuck cross-session close sits
+  #         unnoticed longer.
+  foreign_exit_escalation_seconds: 300
+  # Zombie cap: an exit still unresolved this long after placement is checked against
+  # the broker and, only if the broker answers and does not list it, the position is
+  # reverted CLOSING -> FILLED so a fresh exit can fire (else held CLOSING + paged).
+  # Floor: 2 x the longer rest time = 600s with today's rests (startup refuses lower)
+  # | Ceiling: 7200s
+  # IMPACT: too low = re-arms before the real outcome can show; a second close goes out
+  #         alongside the first, both fill, and the condor flips into an inverse structure.
+  #         too high = a dead order wedges the position in CLOSING for longer.
+  zombie_exit_revert_seconds: 900
 
 learning:
   enabled: true                          # Self-learning: adapt strategies from past trades

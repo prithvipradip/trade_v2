@@ -358,9 +358,9 @@ def parse_args() -> argparse.Namespace:
                         "resolves env AIT_IC_WING_K > config.yaml backtest.wing_k "
                         "> 1.6 (contract_float) -- was a stale hardcoded 1.0 "
                         "that shadowed the promoted live value (R20b follow-up).")
-    p.add_argument("--wing-floor", type=float, default=2.0,
-                   help="Hard minimum wing width in $ (live enforces $2; "
-                        "old backtest default was $5)")
+    p.add_argument("--wing-floor", type=float, default=None,
+                   help="Hard minimum wing width in $ (live enforces $2; old backtest "
+                        "default was $5). Default: config backtest.wing_floor_dollars (W70).")
     p.add_argument("--macro-gate", action=argparse.BooleanOptionalAction, default=True,
                    help="Block credit entries <=4 days before FOMC/CPI/NFP/GDP/PCE "
                         "(2026-only hardcoded calendar; inactive for earlier windows)")
@@ -395,6 +395,10 @@ async def run_backtest(args: argparse.Namespace) -> None:
     if args.capital is None:
         from ait.config.runtime_env import research_capital
         args.capital = research_capital()
+    if args.wing_floor is None:  # W70: the CLI default was a literal 2.0
+        from ait.config.runtime_env import contract_float
+        # the SAME contract call live's iron_condor.py uses (home backtest.wing_floor_dollars)
+        args.wing_floor = contract_float("AIT_IC_WING_FLOOR")
     print("=" * 60)
     print("  AIT v2 — WALK-FORWARD BACKTEST")
     print("=" * 60)

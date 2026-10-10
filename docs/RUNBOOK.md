@@ -120,6 +120,68 @@ unmanaged), found a day later. Do all five steps, in order:
    `git tag -a deploy-YYYYMMDD -m "smoke pass + first-RTH liveness OK"` then
    `git push origin --tags`. Only tag AFTER step 4 passes.
 
+## Fixed limits (NOT configurable — visible on purpose)
+
+These values are deliberately fixed in code, in ONE module: `src/ait/config/invariants.py`.
+They are not in `config.yaml` or `.env` because each is either a **backstop that exists to
+catch the system (or its configuration) being wrong**, a **rule imposed from outside**, or
+the **line a config value is checked against**. Anything in `config.yaml` is tunable
+regardless of a comment — the file is shared between machines through git and edited by
+people and AI sessions — so putting these there would let one edit loosen both a gate and
+its check. They are logged at every start (`fixed_limits_in_effect`). To change one: edit
+the module, update this table (a test compares them), and record it in PLAN.md.
+
+| Name | Value | Why it is fixed (and where enforced) |
+|---|---|---|
+| `ORDER_RATE_LIMIT_MAX` | 8 | Max orders in the window below; the next is refused and logged CRITICAL. A backstop against a logic bug spamming placements — if config could raise it, the bug it exists to stop would not be stopped. `executor.py` (entry + roll placement share one bucket). |
+| `ORDER_RATE_LIMIT_WINDOW_S` | 60 | The rolling window for the limit above. |
+| `NBBO_DISORDERLY_SPREAD_RATIO` | 1.0 | A combo entry whose (ask − bid) is wider than its own mid is rejected. Backstop against a bad quote (delayed data, crossed/locked market). Distinct from the configurable per-contract `options.max_bid_ask_spread_pct`. `executor.py`. |
+| `NBBO_STALE_SIGNAL_DEVIATION` | 0.35 | A combo entry whose signal price differs from the live mid by more than 35% is rejected: the signal was priced on a market that has since moved. `executor.py`. |
+| `NBBO_MID_FLOOR` | 0.05 | The two tests above apply only when \|mid\| exceeds this; below it ratios blow up and mean nothing. `executor.py`. |
+| `LIVE_MAX_SPREAD_PCT` | 0.15 | Startup refuses a non-paper mode if `AIT_LIQ_MAX_SPREAD` or `options.max_bid_ask_spread_pct` exceeds it. It is the line config is checked AGAINST (paper is relaxed to 0.40), so it cannot live in the file it checks. `orchestrator.py` GOV-5. |
+| `LIVE_MIN_VOLUME` | 10 | Startup refuses a non-paper mode if `AIT_LIQ_MIN_VOLUME` is below it. Same reason. Documented in the go-live checklist below. |
+| `PDT_MAX_DAY_TRADES` | 3 | Day trades the bot allows itself per window. FINRA's pattern-day-trader rule flags margin accounts under $25,000 at 4 in 5 business days; this is the law, not a preference. The *switches* are config: `account.pdt_protection`, `account.pdt_account_under_25k`. `pdt_guard.py`. |
+| `PDT_WINDOW_DAYS` | 5 | The rolling window for the rule above. |
+| `BROKER_SNAPSHOT_TTL_SECONDS` | 5.0 | How long the all-clients open-order snapshot is re-used within and across fill checks. A cache lifetime that avoids repeated broker round trips — API-call pacing, not a trading preference. `executor.py`. |
+| `IC_BUDGET_CAPPED_MIN_WING` | 1.0 | Narrowest wing a budget-capped iron condor may shrink to, in dollars: $1 is the narrowest the listed-strike grid offers. The *configurable* minimum wing is `backtest.wing_floor_dollars` (`AIT_IC_WING_FLOOR`, default $2), which binds only when the per-trade budget does not. `iron_condor.py`, `engine.py`. |
+
+The 30 s fast-monitor tick is not repeated here: its single source is
+`ait/utils/cadence.py::FAST_MONITOR_CADENCE_SECONDS`.
+
+## Order lifecycle timeline (what happens to an order, and for how long)
+
+Every age below is evaluated on the **30 s fast-monitor tick** (measured 2026-09: median
+30.9 s between ticks, 98% under 35 s, worst 100 s), so a duration under 30 s takes effect at
+the next tick. Tunables live in `config.yaml` (each key carries Floor / Ceiling / IMPACT next
+to it); the startup log `order_timeline_in_effect` prints every effective value.
+
+**Exit order (position is CLOSING)**
+
+| Age | What happens | Key (default) | Floor and why |
+|---|---|---|---|
+| 0 – grace | Ignored by the fill checker so it can appear in IBKR's trade list; a brand-new order would otherwise read as cancelled. | `exit.order_visibility_grace_seconds` (10) | 5 s. A margin, not a measurement: the one acknowledgement we could time took < 1 s (an entry). Must be below the stop rest. |
+| rest | Still unfilled: a cancel is requested but the position stays CLOSING so the monitor can re-price. Stops rest less than ordinary exits. | `exit.exit_stop_pending_rest_seconds` (120) / `exit.exit_pending_rest_seconds` (300) | 15 s / 30 s. The stop rest may not exceed the ordinary rest. |
+| band TTL | A broker "price band" reject stops capping later attempts. | `exit.exit_band_ttl_seconds` (300) | 30 s. |
+| foreign | The order belongs to ANOTHER clientId and cannot be cancelled from here: the operator is paged instead. | `exit.foreign_exit_escalation_seconds` (300) | 60 s, and not below the ordinary rest (paging earlier is noise). |
+| zombie | Still unresolved: the broker is asked; only if it answers and does not list the order is CLOSING reverted to FILLED so a fresh exit can fire (otherwise held CLOSING and paged). | `exit.zombie_exit_revert_seconds` (900) | 120 s hard floor, and **>= 2 x the longer rest time** (600 s today): the cancel needs at least as long to resolve as the order was given to fill, or a fill that is merely not yet visible is re-armed as a duplicate close. Raising a rest therefore raises this and the foreign threshold too; startup names each. |
+
+**Entry order**
+
+| Age | What happens | Key (default) | Floor and why |
+|---|---|---|---|
+| every step | An unfilled entry combo's limit steps toward marketable (0.25 / 0.60 / 1.00 of the offset). | `positions.entry_ladder_step_seconds` (45) | 30 s = the tick; below it steps are skipped, not honored. Observed: the first reprice of a real order fired at +49 s because it is only seen on a tick. |
+| partial | A PARTIALLY filled entry has its remainder cancelled so legs are not orphaned. | `positions.partial_fill_cancel_seconds` (30) | 5 s; below the entry timeout. |
+| absent | An entry ABSENT from the trade list is treated as still pending while younger than this (a disconnect makes every working entry look cancelled for a moment). | `positions.absent_order_grace_seconds` (30) | 10 s; below the entry timeout. |
+| timeout | An unfilled entry is cancelled. | `positions.entry_order_timeout_seconds` (240) | 30 s. |
+
+**What the floors rest on, honestly.** One entry order (2026-09-28) was acknowledged by IBKR
+in under 1 s; two more (QQQ and SPY, Prithvi's box) filled in 11.4 s and 14.4 s; no exit
+order has been timed and no mid-session disconnect occurred in the retained logs. The floors
+are engineering margins. The `order_ack_latency` log event (entry and exit, sub-second, from
+ib_insync's own `Trade.log`) and `order_absent_judged` collect the real distribution and are
+published to the `shared-logs` branch; revisit the floors once a few dozen paper orders,
+including exits, exist.
+
 ## Quarterly drills (scheduled — first week of Jan / Apr / Jul / Oct)
 Run both, then record the date in the log table below. An untested kill
 switch or backup is a hope, not a control.
