@@ -14952,3 +14952,79 @@ operator's call after a B1-style test. The stale test counts in that file (1854 
 **NEXT.** Start from open item 1 (cheap, parity) or item 2 (the question the evidence keeps pointing at); both need an operator decision on scope before any code.
 
 ---
+
+## 2026-10-10 - W69: live tunables externalized to config.yaml, two ignored config keys wired, account-ID scrub
+
+Operator request: a scan found hardcoded values in code with no home in `config.yaml` / `.env`; move them, fix `dashboard.port` (read from config, not hardcoded in `master.py`), and remove the paper
+account number from the docstrings. Scope chosen by the operator: **tunable live values** (not every literal). Invariant: **zero behavior change at today's config**: every new field defaults to
+the exact literal it replaces and `config.yaml` carries the same value; `TestParity` pins both.
+
+**CHANGED.**
+1. *Two config keys that were silently ignored are now read.* `dashboard.port` / `dashboard.enabled`: `master.py` hardcoded 8501 in three places (`_clear_dashboard_port` default, `_start_dashboard`,
+   Streamlit `--server.port`) and nothing read the key; the supervisor now resolves `_dashboard_cfg()` (frozen settings, W35; falls back to the model defaults on a settings failure, never blocks) and
+   passes the port to the port-clearing step, Streamlit, the log, and the held-port alert. `dashboard.enabled: false` now skips the Streamlit launch and its health-check respawn. New
+   `dashboard.weblog_port` (8502) / `dashboard.status_port` (8503); the supervisor hands each child `--port` from ITS frozen config, `web_logs.py` / `status_server.py` resolve
+   `--port > config.yaml > model default` through `resolve_dashboard_port()`. A validator rejects duplicate ports. `learning.max_adaptations_per_cycle / min_insight_confidence /
+   min_confidence_floor / min_confidence_ceiling`: `LearningEngine` built `AdaptationLimits()` from the dataclass defaults; the orchestrator now passes `limits=` built from `settings.learning`.
+2. *New config keys (all default to the former literal; `file:line` = where it lived).* `position_sizing.*` (new section: `confidence_size_floor` 0.30, IV curve `iv_full_size_max` 0.20 /
+   `iv_floor_size_min` 0.60 / `iv_floor_size_factor` 0.50, `iv_rank_adj_min/max` 0.80/1.20, `drawdown_tiers` [[3,0.50],[5,0.25]], `vix_size_tiers` [[25,0.75],[30,0.50]], `strategy_risk` table;
+   was `risk/position_sizer.py`); `trading.first_hour_end_et` "10:30", `midday_end_et` "14:00", `first_hour_trade_budget` 2, `midday_trade_budget` 4, `first_hour_min_confidence` 0.85 (was
+   `bot/orchestrator.py` `_get_trade_budget` + `first_hour_confidence_gate`); `risk.weekend_gap_cutoff_et` "14:30", `weekend_gap_min_confidence` 0.90, `weekend_gap_strategies` [short_strangle]
+   (was `risk/manager.py`); `exit.thesis_direction_flip_confidence` 0.70, `thesis_regime_shift_confidence` 0.70, `thesis_vix_spike_pct` 0.30 (was `orchestrator._check_thesis_valid`);
+   `ml.regime_override_confidence` 0.80 (was `orchestrator`); `regime.*` (new section, 11 thresholds of `ml/regime.py` `_classify`, confidences stay in code); `ml.drift_window_size` 50,
+   `drift_accuracy_threshold` 0.40, `drift_calibration_threshold` 0.25, `drift_high_confidence` 0.80 (was `ml/drift.py`); `learning.analyzer.*` (12 insight cutoffs of
+   `learning/analyzer.py`; minimum-sample counts stay in code); `account.capital_tier_small/medium/large_min` 2000/5000/25000 (was `risk/capital_tiers.py`, strictly-ascending validator);
+   `assignment_response.roll_short_delta_target` 0.20 / `roll_short_delta_tolerance` 0.07 (was `execution/roll_selector.py` module constants, removed).
+3. *Single-source cleanups.* `CorrelationGuard` signature defaults (0.75 / 2) now resolve from `RiskConfig`; `DriftDetector` defaults resolve from `MLConfig`; the GOV-5 live-profile floors are named
+   (`_LIVE_MAX_SPREAD_PCT` 0.15, `_LIVE_MIN_VOLUME` 10).
+4. *Clock fix riding along.* The Friday weekend-gap gate read a naive `datetime.now()` (the W20/W21 class); it now reads `now_et()`. On the ET-local Windows box this is a no-op; on any other
+   host the gate fired at the wrong hour of the wrong weekday. Pinned by a test under `TZ=Asia/Tokyo`.
+5. *Account-ID scrub.* The paper account number removed from the two `ibkr_client.py` docstrings/comments, and from the 4 test files that carried it plus two further account-shaped IDs in the
+   same fixtures (`test_shared_logs`, `test_r15_review_fixes`, `test_r16_broker_fixes`, `test_account_currency`), replaced by synthetic IDs of the same shape (the scrubber matches by pattern, so the tests keep
+   their meaning). A class guard asserts none of the three real IDs is in `src/`, `tests/` or `scripts/`.
+
+**DELIBERATELY LEFT IN CODE (and why).**
+- *Safety backstops:* executor 8 orders/60s rate limit; NBBO sanity gates (disorderly spread 1.0, stale-signal 0.35, mid floor 0.05); pending-order age caps 30s/300s/900s; the GOV-5 live-profile
+  floors. They are the line the configurable values are checked AGAINST; making them tunable lets the edit that loosens a gate also loosen its check.
+- *Regulatory:* PDT `MAX_DAY_TRADES = 3` / `WINDOW_DAYS = 5` (the account flags `pdt_protection` / `pdt_account_under_25k` are already config).
+- *Dead / inactive:* `selector.get_recommended_strategies` (zero callers), straddle IV-rank gates (not in `options.strategies`), `position_sizer`'s non-IC strategy rows are config but unexercised live.
+- *Research harness:* `backtesting/engine.py` bare-engine constructor defaults, kept explicit per the R20b pre-registration (hundreds of tests pin them); research entry points resolve from config.
+- *Already config-driven / not live:* `data/quality.py` thresholds (the exit-side validator is fed `exit.max_quote_*`; entry side only calls `validate_historical`); `executor.DEFAULT_MAX_SPREAD_PCT`
+  (live is fed `options.max_bid_ask_spread_pct`; the constant is the no-settings fallback); multi-timeframe internals; protocol/indicator constants; sentinel strings; `data/...` paths.
+- *`strategy_risk` key validation:* the plan called for rejecting unknown strategy names; not done because validating against the strategy registry from `settings.py` would invert the import
+  direction (strategies import settings). Values are range-checked (0, 5]; an unknown key is inert.
+- *`first_hour_trade_budget` vs `max_daily_trades`:* no cross-field validator; the code already takes `min(budget, max_trades)`, so a config with `max_daily_trades` below the budgets works exactly
+  as before. Adding the validator would have turned a working config into a startup error.
+
+**OUT OF SCOPE / REGISTERED.**
+1. IC entry short delta `0.20` (`strategies/iron_condor.py:230,238`): strategies are built bare and read the `AIT_IC_*` env contract; moving it is an env-contract change (`runtime_env.CONTRACT_DEFAULTS`).
+2. IBKR port fallback mismatch: `IBKREnvConfig.ibkr_port` defaults 7497 while `gateway.py` / `master.py` fall back to "4002" (the 2026-09-08 9h47m outage class). IB connectivity: needs sign-off.
+3. `learning/adaptor.py:382` `9 <= hour <= 16` (should use `utils.time` market hours) and the adaptor's other dead-bands (0.02-0.05).
+4. `.bat` launchers hardcode `C:\Users\prith\...` (outside the Python config system).
+5. The paper account number remains in git history (on `origin` since `63f1981`), `PLAN.md` (append-only), `reports/` (incl. 3 untracked `w53_probe/*/preflight.jsonl`), `deprecated/docs/CONTEXT.md` and
+   `.claude/worktrees/`; HEAD edits do not remove it from history. Rotating/ignoring is the operator's call.
+6. MagicMock risk-config fixtures (`test_risk_guardrails`, `test_r16_risk_fixes`, `test_r19_config_authority`) would have failed on a real Friday afternoon once the weekend gate reads config; found by
+   simulating Friday 15:00 ET over every RiskManager test and fixed in this wave (see TESTS).
+
+**DEPLOY.** `master.py` changed: **full supervisor restart**; new settings: bot restart (W35 freeze). Rollback: pre-W69 code rejects the new `config.yaml` keys at startup (`extra="forbid"`), so roll
+back `config.yaml` WITH the code (tag the deploy `deploy-YYYYMMDD`). Not restarted by this wave.
+
+**TESTS.** `tests/test_w69_config_externalization.py` (61): parity (every new default == the former literal, AND the shipped config.yaml carries the same value, AND every new key is present in the file; learning
+limits defaults == the `AdaptationLimits` dataclass), validators (duplicate ports, HH:MM, window order, ascending tiers, sizing rows, regime bands, typo'd keys), the supervisor (Streamlit launched on the
+configured port and the port-clearing step targets it, `--port` handed to the log viewer / status page, `enabled: false` launches nothing and the health check does not respawn it, the held-port alert
+names the configured port, settings failure falls back to model defaults), child port resolution (`--port > config > default`), the sizer (vix / drawdown tiers, strategy table, vol curve incl. a point
+past the configured floor, 2-arg construction unchanged), the weekend gate under a pinned `TZ=Asia/Tokyo` (fires at 14:31 ET on a host that reads Saturday 03:31; cutoff / confidence / strategy list
+are config), the intraday budget on a real `StateManager`, the thesis check (flip confidence, VIX spike %, condors stay exempt), regime / drift / capital tiers / roll delta / learning wiring, and AST class
+guards (no dashboard-port literal in `master.py` / `web_logs.py` / `status_server.py`; no moved threshold compared against a literal in `orchestrator.py`; `LearningEngine(` always gets `limits=`; no real
+account id in `src/`, `tests/`, `scripts/`). **Mutation-checked: 21 mutants, all caught** (port literal, `enabled` ignored, naive clock, cutoff / confidence literals, sizer tier / strategy / curve literals,
+budget / edge / spike / flip literals, learning limits dropped, roll delta, capital tier, regime VIX, drift window, analyzer cutoff, status port literal, real id reintroduced). One mutant (`>= 0.60` in the
+sizer curve) SURVIVED the first draft because the test probed only the floor boundary, where the line and the clamp coincide; the test now also probes a point past the configured floor and kills it.
+Fixtures: `test_risk_guardrails`, `test_r16_risk_fixes`, `test_r19_config_authority` built `MagicMock`/`SimpleNamespace` risk configs without the three `weekend_gap_*` fields; found by pinning
+`ait.risk.manager.now_et` to Friday 15:00 ET over every RiskManager test (7 failures), fixed (332 pass under the Friday pin). Gates: `compileall` OK; fast lane **5116 passed / 46 skipped / 0 failed**
+(17m38s; run before the new test module and fixture edits existed, which were then verified separately as above); `typecheck.py` OK (no attr-defined / call-arg / name-defined in config, bot, execution,
+risk); `smoke_deploy.py` **SMOKE PASS (13 checks)** including the dry-run trading cycle through the new wiring.
+
+**NEXT.** The previously flagged candidate (verify the feature-engine `iv_rank` used by `iv_rank_rise_threshold` against the stored-IV rank, then the construction study) is unchanged and becomes W70.
+Operator: whether to also move the registered out-of-scope items above, and when to restart the supervisor + bot onto W69.
+
+---
