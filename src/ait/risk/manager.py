@@ -18,7 +18,7 @@ from ait.risk.correlation import CorrelationGuard
 from ait.risk.pdt_guard import PDTGuard
 from ait.risk.position_sizer import PositionSizer
 from ait.utils.logging import get_logger
-from ait.utils.time import today_et
+from ait.utils.time import now_et, today_et
 
 log = get_logger("risk.manager")
 
@@ -355,18 +355,26 @@ class RiskManager:
                 f"confidence {request.confidence:.2f} < min {self._risk_config.min_confidence}",
             )
 
-        # 2b. Weekend gap risk — require higher confidence after 2:30 PM ET Friday
-        # for undefined-risk short strategies (short_strangle). Iron condors are
-        # defined-risk so they're OK. Long straddles benefit from weekend vol.
-        from datetime import datetime as _dt
-        now = _dt.now()
-        is_friday_late = now.weekday() == 4 and (now.hour > 14 or
-                                                   (now.hour == 14 and now.minute >= 30))
-        if is_friday_late and request.strategy in ("short_strangle",):
-            if request.confidence < 0.90:
+        # 2b. Weekend gap risk — require higher confidence after the Friday
+        # cutoff (default 2:30 PM ET) for undefined-risk short strategies
+        # (short_strangle). Iron condors are defined-risk so they're OK. Long
+        # straddles benefit from weekend vol.
+        # W69: the cutoff, the confidence and the strategy list are config
+        # (risk.weekend_gap_*) — they were 14:30 / 0.90 / ("short_strangle",)
+        # literals — and the clock is now_et(): this gate read a naive
+        # datetime.now(), the W20/W21 bug class, so on a non-ET host it fired
+        # at the wrong hour of the wrong weekday.
+        now = now_et()
+        is_friday_late = (now.weekday() == 4 and
+                          now.hour * 60 + now.minute
+                          >= self._risk_config.weekend_gap_cutoff_minutes)
+        if (is_friday_late
+                and request.strategy in self._risk_config.weekend_gap_strategies):
+            _wg_min = self._risk_config.weekend_gap_min_confidence
+            if request.confidence < _wg_min:
                 return TradeValidation(
                     False,
-                    f"weekend_gap_risk: {request.strategy} requires 90% conf on Fri PM "
+                    f"weekend_gap_risk: {request.strategy} requires {_wg_min:.0%} conf on Fri PM "
                     f"(got {request.confidence:.2f})",
                 )
 

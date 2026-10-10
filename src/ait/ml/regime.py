@@ -18,6 +18,7 @@ from enum import Enum
 import numpy as np
 import pandas as pd
 
+from ait.config.settings import RegimeConfig
 from ait.utils.logging import get_logger
 
 log = get_logger("ml.regime")
@@ -49,6 +50,11 @@ class RegimeAnalysis:
 
 class RegimeDetector:
     """Detects the current market regime from price data and VIX."""
+
+    def __init__(self, config: RegimeConfig | None = None) -> None:
+        # W69: the classification thresholds are config (`regime:`); None ->
+        # the model defaults, which are the pre-W69 literals.
+        self._cfg = config or RegimeConfig()
 
     def analyze(
         self,
@@ -221,8 +227,9 @@ class RegimeDetector:
     ) -> tuple[MarketRegime, float]:
         """Classify regime based on trend, volatility, IV rank, and Hurst exponent."""
 
-        # High volatility override (VIX > 30 or realized vol > 40%)
-        if (vix and vix > 30) or vol > 0.40:
+        c = self._cfg
+        # High volatility override (VIX > 30 or realized vol > 40% by default)
+        if (vix and vix > c.high_vol_vix) or vol > c.high_vol_realized:
             # R5 audit HIGH: confidence used to be the raw vol fraction
             # (VIX-35 crash with 25% realized vol -> 0.25), but the live
             # consumers gate defensive action at >0.70/0.80 — the crash
@@ -234,16 +241,17 @@ class RegimeDetector:
 
         # IV Crush: vol was recently high but is rapidly compressing
         # (iv_rank dropping from high, vol trend negative)
-        if iv_rank < 0.25 and vol < 0.20 and abs(trend) < 0.2:
+        if (iv_rank < c.iv_crush_iv_rank_max and vol < c.iv_crush_vol_max
+                and abs(trend) < c.iv_crush_trend_max):
             return MarketRegime.IV_CRUSH, 0.7
 
         # Mean-reverting: Hurst < 0.4 with no strong trend
-        if hurst < 0.40 and abs(trend) < 0.25:
+        if hurst < c.mean_revert_hurst_max and abs(trend) < c.mean_revert_trend_max:
             return MarketRegime.MEAN_REVERTING, max(0.6, 1.0 - hurst)
 
         # Low volatility (VIX < 15 or realized vol < 12%)
-        if (vix and vix < 15) or vol < 0.12:
-            if abs(trend) > 0.3:
+        if (vix and vix < c.low_vol_vix) or vol < c.low_vol_realized:
+            if abs(trend) > c.low_vol_trend_breakout:
                 if trend > 0:
                     return MarketRegime.TRENDING_UP, abs(trend)
                 else:
@@ -251,9 +259,9 @@ class RegimeDetector:
             return MarketRegime.LOW_VOLATILITY, 0.7
 
         # Strong trend
-        if trend > 0.35:
+        if trend > c.strong_trend:
             return MarketRegime.TRENDING_UP, min(0.95, abs(trend))
-        elif trend < -0.35:
+        elif trend < -c.strong_trend:
             return MarketRegime.TRENDING_DOWN, min(0.95, abs(trend))
 
         # Range-bound

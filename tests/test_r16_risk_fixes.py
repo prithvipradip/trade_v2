@@ -299,7 +299,14 @@ class TestAggregateRiskBackfill:
                                     credit_vix_halt=28.0, max_credit_positions=6,
                                     # R20: config-backed since the register migration
                                     credit_cap_vix_tiers=[[20.0, 6], [25.0, 4], [999.0, 2]],
-                                    max_symbol_concentration_pct=0.20)
+                                    max_symbol_concentration_pct=0.20,
+                                    # W69: the Friday weekend-gap gate reads these
+                                    # from config now; the fixture omitted them, so it
+                                    # only passed on days that are not a Friday
+                                    # afternoon (found by pinning Fri 15:00 ET).
+                                    weekend_gap_cutoff_minutes=14 * 60 + 30,
+                                    weekend_gap_min_confidence=0.90,
+                                    weekend_gap_strategies=["short_strangle"])
         cb = MagicMock()
         cb.is_tripped = False
         cb.check_daily_loss.return_value = True

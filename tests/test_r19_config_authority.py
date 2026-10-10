@@ -268,6 +268,10 @@ class TestR20LiveRegisterMigrations:
                 max_credit_positions=6, credit_vix_halt=28.0,
                 credit_cap_vix_tiers=[[20.0, 6], [25.0, 4], [999.0, 2]],
                 max_symbol_concentration_pct=0.20,
+                # W69: the Friday weekend-gap gate reads these from config now.
+                weekend_gap_cutoff_minutes=14 * 60 + 30,
+                weekend_gap_min_confidence=0.90,
+                weekend_gap_strategies=["short_strangle"],
             )
             for k, v in risk_overrides.items():
                 setattr(risk_config, k, v)

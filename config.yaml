@@ -21,6 +21,14 @@ trading:
   max_daily_trades: 12                  # Raised for higher trade volume / faster learning
   trading_hours_only: true             # Only trade during RTH (9:30-16:00 ET)
   no_new_entries_minutes_before_close: 15   # W35: was a bare 900s in bot/scheduler.py
+  # W69: the intraday trade-budget windows and the first-hour confidence gate
+  # (were literals in bot/orchestrator.py). Cumulative caps, still bounded by
+  # max_daily_trades; the whole remaining budget is released after midday_end_et.
+  first_hour_end_et: "10:30"           # ET; before this: first_hour_trade_budget
+  first_hour_trade_budget: 2
+  midday_end_et: "14:00"               # ET; before this: midday_trade_budget
+  midday_trade_budget: 4
+  first_hour_min_confidence: 0.85      # DIRECTIONAL signals only; neutral/IC exempt
 
 account:
   pdt_protection: true                 # Enable Pattern Day Trader guard
@@ -41,6 +49,11 @@ account:
                                        # the risk knobs are revisited (accepted by the operator).
   simulate_live_capital: true          # false at go-live. Per-box override: .env
                                        # AIT_SIMULATED_CAPITAL=<n> (or 0 = off) beats this.
+  # W69: capital-tier boundaries (were literals in risk/capital_tiers.py). The
+  # tier picks the universe filter; must ascend strictly.
+  capital_tier_small_min: 2000
+  capital_tier_medium_min: 5000
+  capital_tier_large_min: 25000
 
 positions:
   max_open_positions: 10               # R6 (user-approved): 423 of 500 logged entry
@@ -55,6 +68,34 @@ positions:
   max_portfolio_risk_pct: 0.20         # Aggregate open capital-at-risk cap (now WIRED — was a
                                        # phantom 0.02 never read while manager hardcoded 0.20;
                                        # audit 2026-07-07 item 3.3. 0.20 = operating value since 06-30)
+
+# W69: the position sizer's multiplier curves (were literals in
+# risk/position_sizer.py). Values are the former literals — no behavior change.
+position_sizing:
+  confidence_size_floor: 0.30          # lowest confidence multiplier
+  iv_full_size_max: 0.20               # implied vol <= this -> full size
+  iv_floor_size_min: 0.60              # implied vol >= this -> iv_floor_size_factor
+  iv_floor_size_factor: 0.50
+  iv_rank_adj_min: 0.80                # IV-rank multiplier band (sell at rank 0 / buy at 100)
+  iv_rank_adj_max: 1.20
+  drawdown_tiers:                      # [consecutive_losing_days, size_factor], ascending
+    - [3, 0.50]
+    - [5, 0.25]
+  vix_size_tiers:                      # [vix_at_or_above, size_factor], ascending
+    - [25, 0.75]
+    - [30, 0.50]
+  strategy_risk:                       # fraction of the position budget per strategy
+    long_call: 1.0
+    long_put: 1.0
+    covered_call: 0.5
+    cash_secured_put: 0.5
+    bull_call_spread: 0.6
+    bear_put_spread: 0.6
+    iron_condor: 0.4
+    long_straddle: 1.2
+    short_strangle: 0.8
+    calendar_spread: 0.7
+    event_straddle: 0.7
 
 risk:
   max_daily_loss_pct: 0.045            # W64 (2026-10-08): 0.02 -> 0.045 at the $5k account. Breaker =
@@ -106,6 +147,11 @@ risk:
                                        # Condors are code-exempt from the flatten; this governs
                                        # entry gates + undefined-risk flattens.
   credit_vix_halt: 28                  # No NEW credit entries at/above this VIX (audit R2)
+  # W69: Friday weekend-gap rule (was literals in risk/manager.py, on a naive
+  # local clock; now ET). After the cutoff these strategies need the confidence.
+  weekend_gap_cutoff_et: "14:30"
+  weekend_gap_min_confidence: 0.90
+  weekend_gap_strategies: [short_strangle]
 
 options:
   delta_range: [0.20, 0.50]            # Target delta for long options
@@ -249,6 +295,26 @@ ml:
   # the observe-mode record shows the gate would have improved PF.
   entry_gates_enabled: false
   observe_mode_neutral_confidence: 0.60  # direction-neutral structures skip the DIRECTIONAL min_confidence gate
+  # W69: were literals in bot/orchestrator.py and ml/drift.py.
+  regime_override_confidence: 0.80     # HIGH_VOLATILITY regime above this -> direction NEUTRAL
+  drift_window_size: 50                # resolved predictions the drift detector scores
+  drift_accuracy_threshold: 0.40       # rolling accuracy below this -> drift + retrain
+  drift_calibration_threshold: 0.25    # high-confidence calibration error above this -> drift
+  drift_high_confidence: 0.80          # calibration cohort cutoff / expected accuracy
+
+# W69: regime classification thresholds (were literals in ml/regime.py).
+regime:
+  high_vol_vix: 30
+  high_vol_realized: 0.40
+  iv_crush_iv_rank_max: 0.25
+  iv_crush_vol_max: 0.20
+  iv_crush_trend_max: 0.20
+  mean_revert_hurst_max: 0.40
+  mean_revert_trend_max: 0.25
+  low_vol_vix: 15
+  low_vol_realized: 0.12
+  low_vol_trend_breakout: 0.30
+  strong_trend: 0.35
 
 meta_label:
   enabled: false                       # Disabled: trained on corrupted data, rejects everything. See min_closes_to_enable below before re-enabling.
@@ -300,6 +366,8 @@ assignment_response:
   roll_target_dte_min: 14              # Matches options.dte_range's live floor
   roll_target_dte_max: 30              # Matches options.dte_range's live ceiling
   roll_min_credit: 0.20                # Provisional -- no roll has executed live to calibrate against
+  roll_short_delta_target: 0.20        # W69: new short strike |delta| (mirrors the IC entry delta)
+  roll_short_delta_tolerance: 0.07     # W69: refuse the roll if the nearest strike is farther
 
 condor_defense:
   # W56 (tastytrade-style tested/untested-side condor defense, decision
@@ -363,6 +431,11 @@ exit:
   time_decay_scaling: true            # Lower take-profit target as DTE decreases
   volatility_adjusted_stops: true     # Widen stops for high-vol underlyings (ATR-based)
   auto_hedge: false                   # Auto-execute delta hedges (enable after paper testing)
+  # W69: open-position thesis check (directional strategies only — iron condors
+  # are exempt from the whole check). Were literals in bot/orchestrator.py.
+  thesis_direction_flip_confidence: 0.70
+  thesis_regime_shift_confidence: 0.70
+  thesis_vix_spike_pct: 0.30           # exit if VIX is up more than +30% since entry
 
 learning:
   enabled: true                          # Self-learning: adapt strategies from past trades
@@ -377,6 +450,22 @@ learning:
   min_insight_confidence: 0.60           # Only act on insights above 60% confidence
   min_confidence_floor: 0.50             # Never lower min_confidence below 50%
   min_confidence_ceiling: 0.90           # Never raise min_confidence above 90%
+  # W69: the four limits above are now actually read (they were ignored), and
+  # the closed-trade analyzer's insight cutoffs live here (were literals in
+  # learning/analyzer.py). Minimum-sample counts stay in code.
+  analyzer:
+    strategy_poor_win_rate: 0.35       # strategy (>=5 closes) -> disable_<strategy>
+    strategy_strong_win_rate: 0.65     # strategy (>=5 closes, +P&L) -> boost_<strategy>
+    confidence_band_poor_win_rate: 0.40
+    symbol_poor_win_rate: 0.30
+    regime_poor_win_rate: 0.35
+    hour_poor_win_rate: 0.30
+    exit_giveback_threshold: 0.30
+    exit_min_avg_peak: 0.20
+    direction_peak_threshold: 0.05
+    direction_good_accuracy: 0.60
+    direction_exit_problem_rate: 0.40
+    direction_poor_accuracy: 0.45
 
 sentiment:
   enabled: true
@@ -401,8 +490,10 @@ notifications:
     enabled: true
 
 dashboard:
-  enabled: true
-  port: 8501
+  enabled: true                        # W69: now read — false = supervisor does not launch Streamlit
+  port: 8501                           # W69: now read by orchestration/master.py (was hardcoded)
+  weblog_port: 8502                    # W69: web_logs.py log viewer
+  status_port: 8503                    # W69: status_server.py live status / scorecard
 
 logging:
   level: INFO

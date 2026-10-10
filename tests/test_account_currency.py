@@ -27,7 +27,7 @@ def _client(rows):
     return c
 
 
-# Real shape observed on the live CAD-base paper account (DUN603821).
+# Real shape observed on the live CAD-base paper account (DU0000001).
 CAD_ROWS = [
     _av("ExchangeRate", "1.00", "BASE"),
     _av("ExchangeRate", "1.00", "CAD"),

@@ -59,8 +59,8 @@ class TestScrub:
             assert secret not in out
 
     def test_account_ids_are_redacted(self):
-        out = sl.scrub('{"account": "DUN603821", "live": "U21959335", "paper": "DUO442667"}')
-        assert "DUN603821" not in out and "U21959335" not in out and "DUO442667" not in out
+        out = sl.scrub('{"account": "DU0000001", "live": "U0000002", "paper": "DUO000003"}')
+        assert "DU0000001" not in out and "U0000002" not in out and "DUO000003" not in out
         assert out.count("[ACCOUNT]") == 3
 
     def test_ordinary_trading_fields_survive(self):
@@ -105,9 +105,9 @@ class TestSelectDay:
         logs = tmp_path / "logs"
         _write_logs(logs, {"ait.log": [
             _ev("2026-09-28T14:00:00Z", "polygon_disabled_auth_failures",
-                detail="apiKey=SECRET9999 rejected", account="DUN603821")]})
+                detail="apiKey=SECRET9999 rejected", account="DU0000001")]})
         out = sl.select_day_events(logs, DAY)[0]
-        assert "SECRET9999" not in out and "DUN603821" not in out
+        assert "SECRET9999" not in out and "DU0000001" not in out
 
 
 class TestExportAndRead:

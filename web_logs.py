@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 """Web-based log viewer for AIT v2.
 
-Open http://localhost:8502 in your browser to see live trading logs.
+Open http://localhost:<dashboard.weblog_port> (8502 by default) in your browser
+to see live trading logs.
 Auto-refreshes every 5 seconds.
 
 W6 log-contracts-1 / -4 / -6.  This viewer used to:
@@ -331,10 +332,17 @@ def api_logs():
 
 
 if __name__ == '__main__':
+    import argparse
+    from ait.config.settings import resolve_dashboard_port
+    _ap = argparse.ArgumentParser(description="AIT v2 web log viewer")
+    # W69: the supervisor passes its configured dashboard.weblog_port; run
+    # standalone, the port comes from config.yaml (was a literal 8502).
+    _ap.add_argument("--port", type=int, default=None)
+    _port = resolve_dashboard_port("weblog_port", _ap.parse_args().port)
     print("=" * 50)
     print("  AIT v2 Web Log Viewer")
-    print("  Open http://localhost:8502")
+    print(f"  Open http://localhost:{_port}")
     print("=" * 50)
     # localhost ONLY (deep-audit S1): 0.0.0.0 exposed the raw live trade
     # stream (positions, orders, P&L) to the whole LAN with no auth.
-    app.run(host='127.0.0.1', port=8502, debug=False)
+    app.run(host='127.0.0.1', port=_port, debug=False)

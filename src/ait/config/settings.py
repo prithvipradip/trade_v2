@@ -30,6 +30,21 @@ class _StrictModel(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+def _parse_hhmm(value: str, field: str = "time") -> tuple[int, int]:
+    """W69: validate an "HH:MM" (24h, ET) string and return (hour, minute).
+
+    One parser for every config clock value so a typo ("10.30", "25:00") is a
+    startup error, not a silently-wrong intraday gate.
+    """
+    parts = str(value).split(":")
+    if len(parts) != 2 or not all(p.isdigit() and len(p) == 2 for p in parts):
+        raise ValueError(f"{field} must be 'HH:MM' (24h ET), got {value!r}")
+    hour, minute = int(parts[0]), int(parts[1])
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"{field} must be a valid 24h time, got {value!r}")
+    return hour, minute
+
+
 class TradingConfig(_StrictModel):
     mode: Literal["paper", "live"] = "paper"
     universe: list[str] = ["SPY", "QQQ", "AAPL"]
@@ -41,6 +56,55 @@ class TradingConfig(_StrictModel):
                     "no new entries inside this many minutes of the session "
                     "close. Was `remaining < 900` in bot/scheduler.py — a "
                     "value that manages trading with no config home (R19c).")
+    first_hour_end_et: str = Field(default="10:30",
+        description="W69: end of the 'first hour' (ET). Before this time the "
+                    "intraday trade budget is first_hour_trade_budget and "
+                    "directional signals must clear first_hour_min_confidence. "
+                    "Was `hour_min < 10.5` in orchestrator._get_trade_budget "
+                    "and the first_hour_confidence_gate.")
+    midday_end_et: str = Field(default="14:00",
+        description="W69: end of the mid-day window (ET). From here to the "
+                    "close the whole remaining max_daily_trades is released. "
+                    "Was `hour_min < 14.0` in orchestrator._get_trade_budget.")
+    first_hour_trade_budget: int = Field(default=2, ge=1, le=50,
+        description="W69: cumulative trade ceiling while before "
+                    "first_hour_end_et (still capped by max_daily_trades). "
+                    "Was a literal 2 in orchestrator._get_trade_budget.")
+    midday_trade_budget: int = Field(default=4, ge=1, le=50,
+        description="W69: cumulative trade ceiling between first_hour_end_et "
+                    "and midday_end_et (still capped by max_daily_trades). "
+                    "Was a literal 4 in orchestrator._get_trade_budget.")
+    first_hour_min_confidence: float = Field(default=0.85, ge=0.50, le=0.99,
+        description="W69: confidence a DIRECTIONAL signal needs before "
+                    "first_hour_end_et (neutral/range-gated structures such as "
+                    "iron condors are exempt). Was a literal 0.85 in the "
+                    "orchestrator's first_hour_confidence_gate.")
+
+    @field_validator("first_hour_end_et", "midday_end_et")
+    @classmethod
+    def _validate_clock(cls, v: str, info) -> str:
+        _parse_hhmm(v, info.field_name)
+        return v
+
+    @model_validator(mode="after")
+    def _intraday_windows_are_ordered(self) -> "TradingConfig":
+        if self.first_hour_end_hour >= self.midday_end_hour:
+            raise ValueError(
+                f"trading.first_hour_end_et ({self.first_hour_end_et}) must be "
+                f"earlier than trading.midday_end_et ({self.midday_end_et})")
+        return self
+
+    @property
+    def first_hour_end_hour(self) -> float:
+        """first_hour_end_et as fractional ET hours (10:30 -> 10.5)."""
+        h, m = _parse_hhmm(self.first_hour_end_et, "first_hour_end_et")
+        return h + m / 60.0
+
+    @property
+    def midday_end_hour(self) -> float:
+        """midday_end_et as fractional ET hours (14:00 -> 14.0)."""
+        h, m = _parse_hhmm(self.midday_end_et, "midday_end_et")
+        return h + m / 60.0
 
 
 class AccountConfig(_StrictModel):
@@ -64,6 +128,27 @@ class AccountConfig(_StrictModel):
                     "at go-live (RUNBOOK checklist). The env var AIT_SIMULATED_CAPITAL "
                     "still overrides per machine ('0' = off) because config.yaml is "
                     "shared between boxes through git.")
+    capital_tier_small_min: float = Field(default=2_000.0, ge=0.0,
+        description="W69: NLV at/above which the SMALL capital tier starts "
+                    "(below it: MICRO). The tier selects the universe filter "
+                    "in risk/capital_tiers.py. Was a literal 2_000.")
+    capital_tier_medium_min: float = Field(default=5_000.0, ge=0.0,
+        description="W69: NLV at/above which the MEDIUM tier starts. Was a "
+                    "literal 5_000 in risk/capital_tiers.py.")
+    capital_tier_large_min: float = Field(default=25_000.0, ge=0.0,
+        description="W69: NLV at/above which the LARGE tier starts. Was a "
+                    "literal 25_000 in risk/capital_tiers.py.")
+
+    @model_validator(mode="after")
+    def _capital_tiers_ascend(self) -> "AccountConfig":
+        if not (self.capital_tier_small_min < self.capital_tier_medium_min
+                < self.capital_tier_large_min):
+            raise ValueError(
+                "account.capital_tier_small_min < capital_tier_medium_min < "
+                "capital_tier_large_min must hold strictly (got "
+                f"{self.capital_tier_small_min} / {self.capital_tier_medium_min} / "
+                f"{self.capital_tier_large_min})")
+        return self
 
 
 class PositionConfig(_StrictModel):
@@ -87,6 +172,107 @@ class PositionConfig(_StrictModel):
         description="Hard cap on contracts per trade. Low values (e.g. 1) keep "
                     "cost-per-trade minimal so the account can hold many more "
                     "concurrent positions — maximizes trade COUNT for learning.")
+
+
+class PositionSizingConfig(_StrictModel):
+    """W69: the position sizer's multiplier curves (risk/position_sizer.py).
+
+    Every default is the literal the sizer carried before this wave, so a
+    config.yaml that omits the section sizes exactly as before. The sizer
+    multiplies six adjustments (confidence, volatility, strategy, IV rank,
+    losing-day drawdown, VIX) into the position budget; this section is those
+    curves' breakpoints and factors. position_sizer.py still owns the formulas.
+    """
+
+    confidence_size_floor: float = Field(default=0.30, ge=0.05, le=1.0,
+        description="Lowest confidence multiplier (the confidence curve runs "
+                    "0.5 at risk.min_confidence to 1.0 at confidence 1.0 and "
+                    "is clamped to [this, 1.0]).")
+    iv_full_size_max: float = Field(default=0.20, ge=0.01, le=2.0,
+        description="Implied vol at/below which volatility_adjustment is 1.0.")
+    iv_floor_size_min: float = Field(default=0.60, ge=0.02, le=3.0,
+        description="Implied vol at/above which volatility_adjustment bottoms "
+                    "out at iv_floor_size_factor. Linear in between. Must "
+                    "exceed iv_full_size_max.")
+    iv_floor_size_factor: float = Field(default=0.50, ge=0.05, le=1.0,
+        description="The volatility multiplier at/above iv_floor_size_min.")
+    iv_rank_adj_min: float = Field(default=0.80, ge=0.1, le=1.0,
+        description="IV-rank multiplier floor: a SELLING strategy at IV rank 0 "
+                    "(or a BUYING one at rank 100) is sized at this factor.")
+    iv_rank_adj_max: float = Field(default=1.20, ge=1.0, le=3.0,
+        description="IV-rank multiplier ceiling: a SELLING strategy at IV rank "
+                    "100 (or a BUYING one at rank 0) is sized at this factor.")
+    drawdown_tiers: list[list[float]] = Field(
+        default=[[3, 0.50], [5, 0.25]],
+        description="[consecutive_losing_days, size_factor] pairs, ascending "
+                    "by days; the highest threshold met wins (0 losing days "
+                    "or below the first row = 1.0). Defensive throttle: halve "
+                    "after 3 losing days, quarter after 5.")
+    vix_size_tiers: list[list[float]] = Field(
+        default=[[25, 0.75], [30, 0.50]],
+        description="[vix_at_or_above, size_factor] pairs, ascending by VIX; "
+                    "the highest threshold met wins (below the first row = "
+                    "1.0). Shrinks positions where gamma risk is amplified: "
+                    "VIX>=25 elevated (75%), VIX>=30 crisis (half).")
+    strategy_risk: dict[str, float] = Field(
+        default={
+            "long_call": 1.0,        # Full premium at risk
+            "long_put": 1.0,
+            "covered_call": 0.5,     # Shares + short call
+            "cash_secured_put": 0.5,
+            "bull_call_spread": 0.6,  # Defined risk (max loss = net debit)
+            "bear_put_spread": 0.6,
+            "iron_condor": 0.4,      # Defined risk, both sides
+            "long_straddle": 1.2,    # Double premium
+            "short_strangle": 0.8,   # Undefined risk, margin required
+            "calendar_spread": 0.7,  # Defined risk (debit), 2 expiries
+            "event_straddle": 0.7,   # Defined risk (debit), capped at premium paid
+        },
+        description="Per-strategy fraction of the position budget. A strategy "
+                    "missing from this table is sized at 1.0 (the sizer's "
+                    "existing fallback).")
+
+    @field_validator("drawdown_tiers", "vix_size_tiers")
+    @classmethod
+    def _validate_tier_rows(cls, v: list[list[float]], info) -> list[list[float]]:
+        """Same discipline as RiskConfig.credit_cap_vix_tiers: the sizer
+        unpacks each row into (threshold, factor) and lets the last row whose
+        threshold is met win, so wrong arity, unsorted thresholds or a factor
+        outside (0, 1] would silently apply the wrong size."""
+        name = info.field_name
+        prev = float("-inf")
+        for row in v:
+            if len(row) != 2:
+                raise ValueError(f"{name} row {row!r} must be exactly [threshold, factor]")
+            threshold, factor = row
+            if not (0.0 < factor <= 1.0):
+                raise ValueError(f"{name} factor {factor!r} must be in (0, 1]")
+            if threshold <= prev:
+                raise ValueError(
+                    f"{name} thresholds must be strictly increasing "
+                    f"(row {row!r} does not exceed {prev!r})")
+            prev = threshold
+        return v
+
+    @field_validator("strategy_risk")
+    @classmethod
+    def _validate_strategy_risk(cls, v: dict[str, float]) -> dict[str, float]:
+        for name, mult in v.items():
+            if not (0.0 < mult <= 5.0):
+                raise ValueError(
+                    f"position_sizing.strategy_risk[{name!r}]={mult!r} must be in (0, 5]")
+        return v
+
+    @model_validator(mode="after")
+    def _iv_curve_is_ordered(self) -> "PositionSizingConfig":
+        if self.iv_floor_size_min <= self.iv_full_size_max:
+            raise ValueError(
+                f"position_sizing.iv_floor_size_min ({self.iv_floor_size_min}) must "
+                f"exceed iv_full_size_max ({self.iv_full_size_max})")
+        if self.iv_rank_adj_min > self.iv_rank_adj_max:
+            raise ValueError(
+                "position_sizing.iv_rank_adj_min must not exceed iv_rank_adj_max")
+        return self
 
 
 class RiskConfig(_StrictModel):
@@ -176,6 +362,34 @@ class RiskConfig(_StrictModel):
     credit_vix_halt: float = Field(default=28.0, ge=15.0, le=60.0,
         description="No NEW credit entries when VIX is at/above this level — "
                     "cheap vol-regime brake for short-premium strategies.")
+    weekend_gap_cutoff_et: str = Field(default="14:30",
+        description="W69: from this ET time on a Friday, weekend_gap_strategies "
+                    "need weekend_gap_min_confidence to be entered (weekend gap "
+                    "risk for undefined-risk shorts). Was `now.hour == 14 and "
+                    "now.minute >= 30` in risk/manager.py, on a naive local "
+                    "clock (the W20/W21 bug class) — it now reads now_et().")
+    weekend_gap_min_confidence: float = Field(default=0.90, ge=0.50, le=0.99,
+        description="W69: confidence a weekend_gap_strategies entry needs after "
+                    "weekend_gap_cutoff_et on Friday. Was a literal 0.90 in "
+                    "risk/manager.py.")
+    weekend_gap_strategies: list[str] = Field(default=["short_strangle"],
+        description="W69: strategies subject to the Friday-afternoon "
+                    "confidence rule. Iron condors are defined-risk and long "
+                    "straddles benefit from weekend vol, so only the "
+                    "undefined-risk short is listed by default. Was the "
+                    "literal tuple ('short_strangle',) in risk/manager.py.")
+
+    @field_validator("weekend_gap_cutoff_et")
+    @classmethod
+    def _validate_weekend_cutoff(cls, v: str) -> str:
+        _parse_hhmm(v, "weekend_gap_cutoff_et")
+        return v
+
+    @property
+    def weekend_gap_cutoff_minutes(self) -> int:
+        """weekend_gap_cutoff_et as minutes since ET midnight (14:30 -> 870)."""
+        h, m = _parse_hhmm(self.weekend_gap_cutoff_et, "weekend_gap_cutoff_et")
+        return h * 60 + m
 
     @field_validator("credit_cap_vix_tiers")
     @classmethod
@@ -571,6 +785,26 @@ class MLConfig(_StrictModel):
                     "risk.min_confidence or observe mode blocks itself; the "
                     "0.60 default sits above the shipped 0.50 with headroom. "
                     "Ignored entirely when gates are ON.")
+    regime_override_confidence: float = Field(default=0.80, ge=0.50, le=0.99,
+        description="W69: a regime classification above this confidence that "
+                    "is HIGH_VOLATILITY overrides the ML direction to NEUTRAL "
+                    "at entry. Was a literal 0.8 in orchestrator (the R5 "
+                    "classifier floors high-vol confidence at 0.80 so any "
+                    "VIX/vol trigger clears it — keep this at or below 0.80).")
+    drift_window_size: int = Field(default=50, ge=20, le=500,
+        description="W69: rolling window of resolved predictions the drift "
+                    "detector scores. Was DriftDetector's window_size=50.")
+    drift_accuracy_threshold: float = Field(default=0.40, ge=0.20, le=0.80,
+        description="W69: rolling accuracy below this flags drift and asks "
+                    "for a retrain. Was DriftDetector's accuracy_threshold.")
+    drift_calibration_threshold: float = Field(default=0.25, ge=0.05, le=0.60,
+        description="W69: high-confidence calibration error above this flags "
+                    "drift. Was DriftDetector's calibration_threshold.")
+    drift_high_confidence: float = Field(default=0.80, ge=0.60, le=0.99,
+        description="W69: predictions at/above this confidence form the "
+                    "calibration cohort, and are EXPECTED to be right this "
+                    "often (the shortfall is the calibration error). Was a "
+                    "literal 0.80 used for both in ml/drift.py.")
 
     @field_validator("ensemble_weights")
     @classmethod
@@ -579,6 +813,55 @@ class MLConfig(_StrictModel):
         if abs(total - 1.0) > 0.01:
             raise ValueError(f"Ensemble weights must sum to 1.0, got {total}")
         return v
+
+
+class RegimeConfig(_StrictModel):
+    """W69: market-regime classification thresholds (ml/regime.py `_classify`).
+
+    Thresholds only. The confidence each classification returns is part of the
+    classifier's design (and the R5 audit fix that makes a high-vol trigger
+    clear the 0.70/0.80 consumer gates) and stays in code. Defaults are the
+    pre-W69 literals, so omitting the section changes nothing.
+    """
+
+    high_vol_vix: float = Field(default=30.0, ge=15.0, le=80.0,
+        description="VIX above this classifies HIGH_VOLATILITY.")
+    high_vol_realized: float = Field(default=0.40, ge=0.15, le=2.0,
+        description="Annualised realised vol above this classifies "
+                    "HIGH_VOLATILITY (either trigger is enough).")
+    iv_crush_iv_rank_max: float = Field(default=0.25, ge=0.0, le=1.0,
+        description="IV_CRUSH needs IV rank (0-1) below this ...")
+    iv_crush_vol_max: float = Field(default=0.20, ge=0.01, le=1.0,
+        description="... realised vol below this ...")
+    iv_crush_trend_max: float = Field(default=0.20, ge=0.0, le=1.0,
+        description="... and |trend strength| below this.")
+    mean_revert_hurst_max: float = Field(default=0.40, ge=0.0, le=0.5,
+        description="MEAN_REVERTING needs the Hurst exponent below this ...")
+    mean_revert_trend_max: float = Field(default=0.25, ge=0.0, le=1.0,
+        description="... and |trend strength| below this.")
+    low_vol_vix: float = Field(default=15.0, ge=5.0, le=30.0,
+        description="VIX below this (or realised vol below low_vol_realized) "
+                    "is the LOW_VOLATILITY branch.")
+    low_vol_realized: float = Field(default=0.12, ge=0.02, le=0.60,
+        description="Realised vol below this is the LOW_VOLATILITY branch.")
+    low_vol_trend_breakout: float = Field(default=0.30, ge=0.05, le=1.0,
+        description="Inside the low-vol branch, |trend| above this is "
+                    "TRENDING_UP/DOWN instead of LOW_VOLATILITY.")
+    strong_trend: float = Field(default=0.35, ge=0.05, le=1.0,
+        description="|trend strength| above this (outside the branches above) "
+                    "classifies TRENDING_UP/DOWN.")
+
+    @model_validator(mode="after")
+    def _vol_bands_are_ordered(self) -> "RegimeConfig":
+        if self.low_vol_realized >= self.high_vol_realized:
+            raise ValueError(
+                f"regime.low_vol_realized ({self.low_vol_realized}) must be below "
+                f"high_vol_realized ({self.high_vol_realized})")
+        if self.low_vol_vix >= self.high_vol_vix:
+            raise ValueError(
+                f"regime.low_vol_vix ({self.low_vol_vix}) must be below "
+                f"high_vol_vix ({self.high_vol_vix})")
+        return self
 
 
 class MetaLabelConfig(_StrictModel):
@@ -726,6 +1009,19 @@ class AssignmentResponseConfig(_StrictModel):
                     "2-leg roll, roughly double for this wave's 4-leg "
                     "vertical roll, so this floor needs real evidence before "
                     "it should be trusted at the cent.")
+    roll_short_delta_target: float = Field(default=0.20, ge=0.05, le=0.50,
+        description="W69: target |delta| of the NEW short strike when a roll "
+                    "re-establishes the at-risk vertical. Mirrors the iron "
+                    "condor entry short delta (~0.20): a rolled vertical looks "
+                    "like a fresh entry at the new expiry, not a replica of "
+                    "the decayed old strike. Was _ROLL_SHORT_DELTA_TARGET in "
+                    "execution/roll_selector.py.")
+    roll_short_delta_tolerance: float = Field(default=0.07, ge=0.01, le=0.25,
+        description="W69: how far the nearest liquid strike's |delta| may sit "
+                    "from roll_short_delta_target before the roll is refused "
+                    "(select_roll_target returns None). 0.07 matches "
+                    "Strategy._find_strike_by_delta's default tolerance. Was "
+                    "_ROLL_SHORT_DELTA_TOLERANCE in roll_selector.py.")
 
 
 class CondorDefenseConfig(_StrictModel):
@@ -939,15 +1235,83 @@ class ExitConfig(_StrictModel):
                     "above this marks the touch stop's input DEGRADED "
                     "(qual-01/04, R25). Was a data.quality.py code default, "
                     "never config-backed.")
+    thesis_direction_flip_confidence: float = Field(default=0.70, ge=0.50, le=0.99,
+        description="W69: the open-position thesis check exits when the ML "
+                    "direction has flipped against the entry direction with "
+                    "confidence above this. Was a literal 0.70 in "
+                    "orchestrator._check_thesis_valid "
+                    "(iron_condor/iron_butterfly are exempt from the check "
+                    "entirely, so this only steers directional strategies).")
+    thesis_regime_shift_confidence: float = Field(default=0.70, ge=0.50, le=0.99,
+        description="W69: the thesis check treats a regime shift (trending "
+                    "-> high volatility) as invalidating only when the "
+                    "regime classification confidence is above this. Was a "
+                    "literal 0.70 in orchestrator._check_thesis_valid "
+                    "(iron_condor/iron_butterfly are exempt from the check "
+                    "entirely, so this only steers directional strategies).")
+    thesis_vix_spike_pct: float = Field(default=0.30, ge=0.05, le=2.0,
+        description="W69: the thesis check exits when VIX has risen more than "
+                    "this fraction since entry (0.30 = +30%). Was a literal "
+                    "0.30 in orchestrator._check_thesis_valid "
+                    "(iron_condor/iron_butterfly are exempt from the check "
+                    "entirely, so this only steers directional strategies).")
+
+
+class LearningAnalyzerConfig(_StrictModel):
+    """W69: the closed-trade analyzer's insight cutoffs (learning/analyzer.py).
+
+    These decide when a pattern in recent closes becomes an insight the
+    adaptor may act on. Minimum-sample counts (3 / 5 trades) stay in code.
+    Defaults are the pre-W69 literals.
+    """
+
+    strategy_poor_win_rate: float = Field(default=0.35, ge=0.05, le=0.60,
+        description="A strategy (>=5 closes) below this win rate gets a "
+                    "disable_<strategy> insight.")
+    strategy_strong_win_rate: float = Field(default=0.65, ge=0.50, le=0.95,
+        description="A strategy (>=5 closes, positive P&L) above this win "
+                    "rate gets a boost_<strategy> insight.")
+    confidence_band_poor_win_rate: float = Field(default=0.40, ge=0.05, le=0.60,
+        description="A confidence band (>=3 closes, negative avg P&L) below "
+                    "this win rate suggests raising min_confidence.")
+    symbol_poor_win_rate: float = Field(default=0.30, ge=0.05, le=0.60,
+        description="A symbol (>=3 closes, negative P&L) below this win rate "
+                    "gets a remove_symbol_<sym> insight.")
+    regime_poor_win_rate: float = Field(default=0.35, ge=0.05, le=0.60,
+        description="A market regime (>=3 closes, negative P&L) below this "
+                    "win rate gets a reduce_trading_in_<regime> insight.")
+    hour_poor_win_rate: float = Field(default=0.30, ge=0.05, le=0.60,
+        description="An entry hour (>=5 closes, negative P&L) below this win "
+                    "rate gets a block_hour_<h> insight.")
+    exit_giveback_threshold: float = Field(default=0.30, ge=0.05, le=1.0,
+        description="Average peak-minus-exit above this (with exit_min_avg_peak) "
+                    "suggests a tighter trailing stop.")
+    exit_min_avg_peak: float = Field(default=0.20, ge=0.0, le=1.0,
+        description="Minimum average peak for the giveback insight to apply.")
+    direction_peak_threshold: float = Field(default=0.05, ge=0.0, le=1.0,
+        description="High-water mark at/above this counts a trade's direction "
+                    "as at least partially correct.")
+    direction_good_accuracy: float = Field(default=0.60, ge=0.50, le=0.95,
+        description="Direction accuracy above this (with "
+                    "direction_exit_problem_rate) blames exit management.")
+    direction_exit_problem_rate: float = Field(default=0.40, ge=0.05, le=0.95,
+        description="Share of correct-direction trades that still lost, above "
+                    "which exit management is flagged.")
+    direction_poor_accuracy: float = Field(default=0.45, ge=0.05, le=0.60,
+        description="Direction accuracy below this flags the model for retrain.")
 
 
 class LearningConfig(_StrictModel):
     enabled: bool = True
     lookback_days: int = Field(default=30, ge=7, le=180)
-    max_adaptations_per_cycle: int = Field(default=3, ge=1, le=10)
+    max_adaptations_per_cycle: int = Field(default=3, ge=1, le=10,
+        description="W69: now actually read — LearningEngine builds its "
+                    "AdaptationLimits from these four keys (they were "
+                    "silently ignored; the dataclass defaults ran instead).")
     min_insight_confidence: float = Field(default=0.60, ge=0.40, le=0.95)
     min_confidence_floor: float = Field(default=0.50, ge=0.40, le=0.80)
     min_confidence_ceiling: float = Field(default=0.90, ge=0.70, le=0.99)
+    analyzer: LearningAnalyzerConfig = LearningAnalyzerConfig()
     paper_trading_mode: bool = Field(
         default=False,
         description=(
@@ -984,8 +1348,31 @@ class NotificationsConfig(_StrictModel):
 
 
 class DashboardConfig(_StrictModel):
-    enabled: bool = True
-    port: int = Field(default=8501, ge=1024, le=65535)
+    enabled: bool = Field(default=True,
+        description="W69: now read by the supervisor — false skips launching "
+                    "the Streamlit analytics dashboard (and its health-check "
+                    "respawn). It did nothing before. The log viewer and "
+                    "status page are separate and unaffected.")
+    port: int = Field(default=8501, ge=1024, le=65535,
+        description="W69: the Streamlit analytics dashboard port, read by "
+                    "orchestration/master.py. It was hardcoded 8501 there and "
+                    "this key was silently ignored.")
+    weblog_port: int = Field(default=8502, ge=1024, le=65535,
+        description="W69: the web_logs.py log-viewer port (was a literal in "
+                    "web_logs.py and master.py).")
+    status_port: int = Field(default=8503, ge=1024, le=65535,
+        description="W69: the status_server.py live-status/scorecard port "
+                    "(was a literal in status_server.py and master.py).")
+
+    @model_validator(mode="after")
+    def _ports_are_distinct(self) -> "DashboardConfig":
+        ports = {"port": self.port, "weblog_port": self.weblog_port,
+                 "status_port": self.status_port}
+        if len(set(ports.values())) != len(ports):
+            raise ValueError(
+                f"dashboard ports must be distinct (three local servers share one "
+                f"host): {ports}")
+        return self
 
 
 class LoggingConfig(_StrictModel):
@@ -1063,10 +1450,12 @@ class Settings(_StrictModel):
     trading: TradingConfig = TradingConfig()
     account: AccountConfig = AccountConfig()
     positions: PositionConfig = PositionConfig()
+    position_sizing: PositionSizingConfig = PositionSizingConfig()
     risk: RiskConfig = RiskConfig()
     options: OptionsConfig = OptionsConfig()
     backtest: BacktestConfig = BacktestConfig()
     ml: MLConfig = MLConfig()
+    regime: RegimeConfig = RegimeConfig()
     meta_label: MetaLabelConfig = MetaLabelConfig()
     earnings: EarningsConfig = EarningsConfig()
     dividends: DividendConfig = DividendConfig()
@@ -1131,6 +1520,24 @@ def resolve_max_contracts_per_trade(explicit, settings) -> int:
     if pos is not None and getattr(pos, "max_contracts_per_trade", None) is not None:
         return int(pos.max_contracts_per_trade)
     return int(PositionConfig().max_contracts_per_trade)
+
+
+def resolve_dashboard_port(field: str, cli_port: int | None = None) -> int:
+    """W69: the port a dashboard child process (web_logs.py, status_server.py) binds.
+
+    explicit `--port` from the supervisor > config.yaml dashboard.<field> >
+    DashboardConfig's own default. The supervisor passes --port from ITS frozen
+    settings, so what it logs and health-checks is always what the child binds
+    even if config.yaml was edited after the supervisor started. Run standalone
+    (no --port) the script reads the file itself.
+    """
+    settings = None
+    if cli_port is None:
+        try:
+            settings = load_settings()
+        except Exception:  # noqa: BLE001 — a broken file must not stop a log viewer
+            settings = None
+    return int(resolve_config_value(cli_port, "dashboard", field, DashboardConfig, settings))
 
 
 def resolve_config_value(explicit, section: str, field: str, fallback_cls, settings):

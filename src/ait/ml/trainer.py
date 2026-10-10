@@ -40,7 +40,12 @@ class ModelTrainer:
         self._market_data = market_data
         self._store = historical_store
         self._last_train_date: date | None = None
-        self._drift_detector = DriftDetector()
+        self._drift_detector = DriftDetector(
+            window_size=config.drift_window_size,
+            accuracy_threshold=config.drift_accuracy_threshold,
+            calibration_threshold=config.drift_calibration_threshold,
+            high_confidence=config.drift_high_confidence,
+        )  # W69: ml.drift_* config (were DriftDetector's literal defaults)
         self._range_predictor = range_predictor
         self._vol_mag_predictor = vol_mag_predictor
 

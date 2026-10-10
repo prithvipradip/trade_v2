@@ -22,6 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+from ait.config.settings import AccountConfig
 from ait.utils.logging import get_logger
 
 log = get_logger("risk.capital_tiers")
@@ -93,17 +94,20 @@ TIERS = {
 class CapitalTierManager:
     """Maps current account capital to a tier; filters the trading universe."""
 
-    def __init__(self):
+    def __init__(self, account_config: AccountConfig | None = None):
+        # W69: the tier boundaries are config (account.capital_tier_*_min);
+        # None -> the model defaults, which are the pre-W69 2k / 5k / 25k.
+        self._acct = account_config or AccountConfig()
         self._current_tier: CapitalTier | None = None
         self._last_capital: float = 0
 
     def get_tier(self, capital: float) -> CapitalTier:
         """Determine the capital tier for a given account balance."""
-        if capital >= 25_000:
+        if capital >= self._acct.capital_tier_large_min:
             tier = CapitalTier.LARGE
-        elif capital >= 5_000:
+        elif capital >= self._acct.capital_tier_medium_min:
             tier = CapitalTier.MEDIUM
-        elif capital >= 2_000:
+        elif capital >= self._acct.capital_tier_small_min:
             tier = CapitalTier.SMALL
         else:
             tier = CapitalTier.MICRO

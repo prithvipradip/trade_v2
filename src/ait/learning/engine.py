@@ -17,7 +17,8 @@ from datetime import datetime
 
 from ait.bot.state import StateManager
 from ait.learning.analyzer import TradeAnalyzer, TradeInsight
-from ait.learning.adaptor import Adaptation, StrategyAdaptor
+from ait.config.settings import LearningAnalyzerConfig
+from ait.learning.adaptor import Adaptation, AdaptationLimits, StrategyAdaptor
 from ait.utils.logging import get_logger
 
 log = get_logger("learning.engine")
@@ -32,13 +33,19 @@ class LearningEngine:
         analyzer: TradeAnalyzer | None = None,
         adaptor: StrategyAdaptor | None = None,
         apply_adaptations: bool = True,
+        limits: AdaptationLimits | None = None,
+        analyzer_thresholds: LearningAnalyzerConfig | None = None,
     ) -> None:
         # R7: apply_adaptations=False (paper_trading_mode) = analyze and log
         # insights, but never mutate live behavior — the 50-close verdict
         # must measure ONE fixed ruleset.
         self._state = state
-        self._analyzer = analyzer or TradeAnalyzer()
-        self._adaptor = adaptor or StrategyAdaptor(state, active=apply_adaptations)
+        # W69: limits / analyzer_thresholds carry the learning.* config the
+        # orchestrator used to leave unread. An explicitly passed analyzer or
+        # adaptor wins (tests inject them); None keeps the dataclass defaults.
+        self._analyzer = analyzer or TradeAnalyzer(thresholds=analyzer_thresholds)
+        self._adaptor = adaptor or StrategyAdaptor(
+            state, limits=limits, active=apply_adaptations)
         self._apply_adaptations = apply_adaptations
 
     @property

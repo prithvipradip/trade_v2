@@ -114,10 +114,10 @@ class TestMtmHaltClears:
 class TestSessionAccountResolution:
     def test_session_wins_over_config(self):
         assert IBKRClient._resolve_session_account(
-            ["U21959335"], "DUN603821") == "U21959335"
+            ["U0000002"], "DU0000001") == "U0000002"
 
     def test_config_only_when_session_empty(self):
-        assert IBKRClient._resolve_session_account([], "DUN603821") == "DUN603821"
+        assert IBKRClient._resolve_session_account([], "DU0000001") == "DU0000001"
 
     def test_unknown_when_nothing(self):
         assert IBKRClient._resolve_session_account([], None) == "unknown"

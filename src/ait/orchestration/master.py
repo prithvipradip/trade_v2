@@ -512,10 +512,30 @@ def _scan_foreign_bot_pids() -> list[int] | None:
     return pids
 
 
-def _clear_dashboard_port(port: int = 8501) -> bool:
+def _dashboard_cfg():
+    """W69: the dashboard section of the supervisor's configuration.
+
+    The three web-service ports and `enabled` were literals here (8501 in
+    three places, 8502, 8503) while `dashboard.port` / `dashboard.enabled` in
+    config.yaml were read by nothing. load_settings() returns this process's
+    frozen settings (W35), so a config.yaml edited after start never changes
+    what the supervisor supervises. A settings failure falls back to the
+    DashboardConfig MODEL defaults — the same values — and never blocks the
+    supervisor (W35: "never block the supervisor on config").
+    """
+    from ait.config.settings import DashboardConfig, load_settings
+    try:
+        return load_settings().dashboard
+    except Exception as e:  # noqa: BLE001
+        _log("warning", "dashboard_config_unavailable", error=str(e))
+        return DashboardConfig()
+
+
+def _clear_dashboard_port(port: int) -> bool:
     """R16 #57: free the dashboard port before (re)launching Streamlit.
 
-    An orphaned Streamlit from an ungracefully-dead supervisor holds 8501, so
+    An orphaned Streamlit from an ungracefully-dead supervisor holds the port
+    (8501 by default; W69: dashboard.port, so the caller passes it), so
     every relaunch died within ~1s ('Port 8501 is not available') and the
     health loop blind-respawned a doomed child every 2 minutes (663 restarts
     on 08-04 alone). Kill the orphan first. This is the ONE sanctioned
@@ -1215,43 +1235,53 @@ class WebServiceManager:
         self._start_status()
 
     def _start_status(self):
-        """Lightweight live status dashboard (http://localhost:8503).
+        """Lightweight live status dashboard (dashboard.status_port, 8503 default).
 
         Reliable real-time view of bot health, positions, today's activity,
         and real-exit P&L — reads the DB/logs directly, no IBKR clientId
-        conflict. Separate from the heavy Streamlit app on 8501.
+        conflict. Separate from the heavy Streamlit app (dashboard.port).
         """
         if self._status_proc and self._status_proc.poll() is None:
             return
-        _log("info", "status_dashboard_starting", port=8503)
+        status_port = _dashboard_cfg().status_port
+        _log("info", "status_dashboard_starting", port=status_port)
         log_path = LOGS_DIR / "status_server.log"
         self._status_log = open(log_path, "a")
         self._status_proc = subprocess.Popen(
-            [sys.executable, str(ROOT / "status_server.py")],
+            # W69: --port hands the child THIS process's configured port.
+            [sys.executable, str(ROOT / "status_server.py"), "--port", str(status_port)],
             cwd=str(ROOT),
             stdout=self._status_log,
             stderr=subprocess.STDOUT,
             env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         )
         _log("info", "status_dashboard_started", pid=self._status_proc.pid,
-             url="http://localhost:8503")
+             url=f"http://localhost:{status_port}")
 
     def _start_dashboard(self):
         if self._dashboard_proc and self._dashboard_proc.poll() is None:
             return
+        cfg = _dashboard_cfg()
+        if not cfg.enabled:
+            # W69: dashboard.enabled was read by nothing. False now means the
+            # supervisor does not launch (or health-check-respawn) Streamlit.
+            _log("info", "dashboard_disabled_by_config", key="dashboard.enabled")
+            return
+        port = cfg.port
         # R16 #57: an orphaned Streamlit (from an ungracefully-dead previous
-        # supervisor) holding 8501 made every relaunch die in ~1s and the
-        # health loop respawned a doomed child every 2 min, forever, silently.
-        # Clear the port first; if a NON-streamlit process holds it, skip the
-        # spawn entirely (alert, gated) instead of crash-looping against it.
-        if not _clear_dashboard_port(8501):
-            _log("error", "dashboard_start_skipped_port_held", port=8501)
+        # supervisor) holding the dashboard port (8501 by default) made every
+        # relaunch die in ~1s and the health loop respawned a doomed child
+        # every 2 min, forever, silently. Clear the port first; if a
+        # NON-streamlit process holds it, skip the spawn entirely (alert,
+        # gated) instead of crash-looping against it.
+        if not _clear_dashboard_port(port):
+            _log("error", "dashboard_start_skipped_port_held", port=port)
             if _alert_gate("dashboard_port_held", 3600):
-                _alert("dashboard NOT started: port 8501 is held by a process "
+                _alert(f"dashboard NOT started: port {port} is held by a process "
                        "the supervisor won't kill — see orchestrator.log "
                        "(dashboard_port_held_foreign) for the holder.")
             return
-        _log("info", "dashboard_starting", port=8501)
+        _log("info", "dashboard_starting", port=port)
         log_path = LOGS_DIR / "dashboard.log"
         # R16: rotate BEFORE reopening — this is the one moment no child holds
         # the handle, mirroring BotManager._rotate_stdout_log at bot start.
@@ -1268,7 +1298,7 @@ class WebServiceManager:
         self._dashboard_proc = subprocess.Popen(
             [sys.executable, "-m", "streamlit", "run",
              str(ROOT / "src" / "ait" / "dashboard" / "app.py"),
-             "--server.port=8501", "--server.headless=true",
+             f"--server.port={port}", "--server.headless=true",
              # localhost ONLY (deep-audit S2): streamlit's default binds all
              # interfaces, LAN-exposing the P&L dashboard with no auth.
              "--server.address=127.0.0.1",
@@ -1282,12 +1312,14 @@ class WebServiceManager:
     def _start_weblog(self):
         if self._weblog_proc and self._weblog_proc.poll() is None:
             return
-        _log("info", "weblog_starting", port=8502)
+        weblog_port = _dashboard_cfg().weblog_port
+        _log("info", "weblog_starting", port=weblog_port)
         log_path = LOGS_DIR / "weblog.log"
         _rotate_if_oversized(log_path, _ROTATE_TARGETS["weblog.log"])  # R16
         self._weblog_log = open(log_path, "a")
         self._weblog_proc = subprocess.Popen(
-            [sys.executable, str(ROOT / "web_logs.py")],
+            # W69: --port hands the child THIS process's configured port.
+            [sys.executable, str(ROOT / "web_logs.py"), "--port", str(weblog_port)],
             cwd=str(ROOT),
             stdout=self._weblog_log,
             stderr=subprocess.STDOUT,

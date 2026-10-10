@@ -25,7 +25,13 @@ def _manager(net_liq=200_000.0, open_positions=None):
                             # raise and the tier-iteration fall to its default,
                             # failing 5 tests for FIXTURE reasons, not code.
                             credit_cap_vix_tiers=[[20.0, 6], [25.0, 4], [999.0, 2]],
-                            max_symbol_concentration_pct=0.20)
+                            max_symbol_concentration_pct=0.20,
+                            # W69: the Friday weekend-gap gate reads these from
+                            # config now; without them a MagicMock made the
+                            # comparison raise TypeError on a Friday afternoon.
+                            weekend_gap_cutoff_minutes=14 * 60 + 30,
+                            weekend_gap_min_confidence=0.90,
+                            weekend_gap_strategies=["short_strangle"])
     account = MagicMock()
     account.get_net_liquidation = AsyncMock(return_value=net_liq)
     account.can_afford = AsyncMock(return_value=True)

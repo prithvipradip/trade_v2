@@ -570,27 +570,27 @@ class TestForeignStashPruning:
 
 class TestMultiAccountSession:
     def test_single_account_and_config_fallback_unchanged(self):
-        assert IBKRClient._resolve_session_account(["U21959335"], "DUN603821") \
-            == "U21959335"
-        assert IBKRClient._resolve_session_account([], "DUN603821") == "DUN603821"
+        assert IBKRClient._resolve_session_account(["U0000002"], "DU0000001") \
+            == "U0000002"
+        assert IBKRClient._resolve_session_account([], "DU0000001") == "DU0000001"
         assert IBKRClient._resolve_session_account([], None) == "unknown"
 
     def test_multi_account_without_a_selector_is_ambiguous(self):
-        # pre-fix: returned "DUN603821" and the paper gate PASSED while a live
+        # pre-fix: returned "DU0000001" and the paper gate PASSED while a live
         # account was tradeable in the same session (reversed order blocked —
         # pure list-ordering luck).
         assert IBKRClient._resolve_session_account(
-            ["DUN603821", "U1234567"], "") == IBKRClient.AMBIGUOUS_ACCOUNT
+            ["DU0000001", "U1234567"], "") == IBKRClient.AMBIGUOUS_ACCOUNT
         assert IBKRClient._resolve_session_account(
-            ["U1234567", "DUN603821"], None) == IBKRClient.AMBIGUOUS_ACCOUNT
+            ["U1234567", "DU0000001"], None) == IBKRClient.AMBIGUOUS_ACCOUNT
 
     def test_multi_account_with_a_matching_selector_resolves(self):
         assert IBKRClient._resolve_session_account(
-            ["DUN603821", "U1234567"], "U1234567") == "U1234567"
+            ["DU0000001", "U1234567"], "U1234567") == "U1234567"
 
     def test_selector_naming_a_foreign_account_is_still_ambiguous(self):
         assert IBKRClient._resolve_session_account(
-            ["DUN603821", "U1234567"], "U9999999") == IBKRClient.AMBIGUOUS_ACCOUNT
+            ["DU0000001", "U1234567"], "U9999999") == IBKRClient.AMBIGUOUS_ACCOUNT
 
     async def test_connect_refuses_an_ambiguous_session(self, monkeypatch):
         monkeypatch.delenv("AIT_ACCOUNT", raising=False)
@@ -601,7 +601,7 @@ class TestMultiAccountSession:
         c._ib = SimpleNamespace(
             connectAsync=AsyncMock(return_value=None),
             reqMarketDataType=lambda t: None,
-            managedAccounts=lambda: ["DUN603821", "U1234567"],
+            managedAccounts=lambda: ["DU0000001", "U1234567"],
             disconnect=lambda: disconnects.append(1),
             isConnected=lambda: False,
         )
@@ -638,7 +638,7 @@ class TestMultiAccountSession:
 
     async def test_place_order_pins_the_session_account(self):
         c = IBKRClient.__new__(IBKRClient)
-        c._session_account = "DUN603821"
+        c._session_account = "DU0000001"
         c.ensure_connected = AsyncMock(return_value=True)
         order = SimpleNamespace(orderId=1, action="BUY", totalQuantity=1,
                                 orderType="LMT", account="")
@@ -647,7 +647,7 @@ class TestMultiAccountSession:
             placeOrder=lambda ct, o: SimpleNamespace(order=o, contract=ct))
 
         await c.place_order(contract, order)
-        assert order.account == "DUN603821"
+        assert order.account == "DU0000001"
 
     async def test_place_order_never_pins_an_unresolved_account(self):
         c = IBKRClient.__new__(IBKRClient)

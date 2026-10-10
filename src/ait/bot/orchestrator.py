@@ -40,6 +40,7 @@ from ait.execution.roll_booking import cas_roll_closing_trade, roll_order_ref, s
 from ait.execution.roll_comparison import ev_should_roll, heuristic_should_roll
 from ait.execution.roll_executor import prepare_roll_combo
 from ait.execution.roll_selector import RollTarget, select_roll_target
+from ait.learning.adaptor import AdaptationLimits
 from ait.learning.engine import LearningEngine
 from ait.ml.ensemble import DirectionPredictor
 from ait.ml.meta_label import MetaLabeler
@@ -182,6 +183,14 @@ RESTRICTED_UNREADABLE = None
 # own 15s sub-budget.
 SHUTDOWN_MARKS_SNAPSHOT_TIMEOUT_SECONDS = 10
 
+# W69: the live-profile liquidity floors the GOV-5 startup assertion enforces.
+# They are deliberately CODE, not config: they are the line the paper-relaxed
+# config values (spread 0.40, volume 0) are checked AGAINST, so making them
+# tunable would let the same edit that loosens a gate also loosen its check.
+# docs/RUNBOOK.md's go-live checklist documents both numbers.
+_LIVE_MAX_SPREAD_PCT = 0.15
+_LIVE_MIN_VOLUME = 10
+
 
 def read_restricted_symbols(path: str | None = None) -> set[str] | None:
     """Read the operator's hard-ban list (data/RESTRICTED.txt, one symbol/line).
@@ -272,7 +281,8 @@ class TradingOrchestrator:
         # likely to accompany one.
         self._circuit_breaker = CircuitBreaker(settings.risk, state=self._state)
         self._pdt_guard = PDTGuard(settings.account, self._state)
-        self._position_sizer = PositionSizer(settings.positions, settings.risk)
+        self._position_sizer = PositionSizer(
+            settings.positions, settings.risk, settings.position_sizing)
         # Config-wired (audit item 3.3) — was CorrelationGuard() with code
         # defaults, untunable without a code edit.
         self._correlation_guard = CorrelationGuard(
@@ -289,7 +299,7 @@ class TradingOrchestrator:
 
         # ML
         self._predictor = DirectionPredictor(settings.ml)
-        self._regime_detector = RegimeDetector()
+        self._regime_detector = RegimeDetector(settings.regime)
 
         # Range predictor (Tier 1) — used for iron condor confidence.
         # units-scale-05 (R22): these were bare literals (0.05, 30) — the LIVE
@@ -379,15 +389,18 @@ class TradingOrchestrator:
         # Refuse to start in live mode with paper-relaxed gates.
         import os as _os_g5
         if str(getattr(settings.trading, "mode", "paper")).lower() != "paper":
-            _spread_env = float(_os_g5.environ.get("AIT_LIQ_MAX_SPREAD", "0.15"))
-            _vol_env = int(_os_g5.environ.get("AIT_LIQ_MIN_VOLUME", "10"))
-            _spread_cfg = float(getattr(settings.options, "max_bid_ask_spread_pct", 0.15) or 0.15)
+            _spread_env = float(_os_g5.environ.get(
+                "AIT_LIQ_MAX_SPREAD", str(_LIVE_MAX_SPREAD_PCT)))
+            _vol_env = int(_os_g5.environ.get("AIT_LIQ_MIN_VOLUME", str(_LIVE_MIN_VOLUME)))
+            _spread_cfg = float(getattr(settings.options, "max_bid_ask_spread_pct",
+                                        _LIVE_MAX_SPREAD_PCT) or _LIVE_MAX_SPREAD_PCT)
             # W42 (R26 policy-vs-impl-4): docs/RUNBOOK.md:153 documents this
             # gate as "AIT_LIQ_MIN_VOLUME >= 10" and claims the live-mode
             # startup assertion enforces it. It was `< 1`, so any value 1-9
             # passed — the volume half of the documented floor was never
             # actually asserted; only the spread half was.
-            if _spread_env > 0.15 or _vol_env < 10 or _spread_cfg > 0.15:
+            if (_spread_env > _LIVE_MAX_SPREAD_PCT or _vol_env < _LIVE_MIN_VOLUME
+                    or _spread_cfg > _LIVE_MAX_SPREAD_PCT):
                 raise RuntimeError(
                     "LIVE-PROFILE ASSERTION FAILED: liquidity gates are still "
                     f"paper-relaxed (AIT_LIQ_MAX_SPREAD={_spread_env}, "
@@ -438,6 +451,15 @@ class TradingOrchestrator:
             self._state,
             # R7: in paper mode the learning layer observes but never steers
             apply_adaptations=not self._settings.learning.paper_trading_mode,
+            # W69: learning.* limits and analyzer cutoffs were config keys that
+            # nothing read — the dataclass defaults ran instead.
+            limits=AdaptationLimits(
+                min_confidence_floor=settings.learning.min_confidence_floor,
+                min_confidence_ceiling=settings.learning.min_confidence_ceiling,
+                min_insight_confidence=settings.learning.min_insight_confidence,
+                max_adaptations_per_cycle=settings.learning.max_adaptations_per_cycle,
+            ),
+            analyzer_thresholds=settings.learning.analyzer,
         )
 
         # Data quality & market intelligence
@@ -503,7 +525,7 @@ class TradingOrchestrator:
         self._counterfactual = CounterfactualTracker()
 
         # Capital tier manager — auto-selects strategies based on account size
-        self._capital_tiers = CapitalTierManager()
+        self._capital_tiers = CapitalTierManager(settings.account)
 
         # Notification callback (set by main.py)
         self._notify = None
@@ -2208,7 +2230,7 @@ class TradingOrchestrator:
         direction = prediction.direction
 
         # Override direction if regime strongly disagrees
-        if regime.confidence > 0.8:
+        if regime.confidence > self._settings.ml.regime_override_confidence:  # W69: was 0.8
             from ait.ml.regime import MarketRegime
             if regime.regime == MarketRegime.HIGH_VOLATILITY:
                 direction = SignalDirection.NEUTRAL
@@ -2780,11 +2802,14 @@ class TradingOrchestrator:
         now = now_et()  # ET-pinned (A3): budget tiers were wall-clock local
         hour_min = now.hour + now.minute / 60.0
 
-        if hour_min < 10.5:      # 9:30-10:30 — first hour
-            budget = 2
-        elif hour_min < 14.0:    # 10:30-2:00 — mid-day
-            budget = 4
-        else:                    # 2:00-4:00 — power hour, release all
+        # W69: the window edges and per-window budgets are trading.* config
+        # (defaults 10:30 / 14:00 and 2 / 4 — the former literals).
+        _tc = self._settings.trading
+        if hour_min < _tc.first_hour_end_hour:      # open -> first_hour_end_et
+            budget = _tc.first_hour_trade_budget
+        elif hour_min < _tc.midday_end_hour:        # -> midday_end_et
+            budget = _tc.midday_trade_budget
+        else:                                       # power hour, release all
             budget = max_trades
 
         return min(budget, max_trades) - taken
@@ -3481,10 +3506,14 @@ class TradingOrchestrator:
         # only. (Also ET-pinned per BC-M3.)
         # W42 (R26 set-membership-6): third independent copy of the same set.
         _neutral = signal.strategy_name in RANGE_GATED_STRATEGIES
-        if hour_min < 10.5 and not _neutral and confidence < 0.85:
+        # W69: window end and confidence floor are trading.* config
+        # (first_hour_end_et / first_hour_min_confidence; were 10.5 / 0.85).
+        _fh_conf = self._settings.trading.first_hour_min_confidence
+        if (hour_min < self._settings.trading.first_hour_end_hour
+                and not _neutral and confidence < _fh_conf):
             log.info("first_hour_confidence_gate",
                      symbol=signal.symbol, confidence=f"{confidence:.2f}",
-                     required=0.85)
+                     required=_fh_conf)
             # R15 minor: per-signal reject, NOT symbol-handled. Neutral
             # candidates (IC/strangle) are EXEMPT from this gate and carry
             # their own model-overridden confidence — returning True here
@@ -5687,7 +5716,9 @@ class TradingOrchestrator:
                 # that killed this entire thesis check (incl. regime/VIX branches
                 # below) on every call since it was written. Audit 2026-07-07 item 1.1.
                 prediction = self._predictor.predict(hist, symbol=pos.symbol, market_context=None)
-                if prediction and prediction.confidence > 0.70:
+                # W69: threshold is exit.thesis_direction_flip_confidence (was 0.70)
+                _flip_conf = self._settings.exit.thesis_direction_flip_confidence
+                if prediction and prediction.confidence > _flip_conf:
                     # Direction has flipped with high confidence
                     if entry_direction == "bullish" and prediction.direction == SignalDirection.BEARISH:
                         return True, f"direction_flipped_to_bearish (conf={prediction.confidence:.0%})"
@@ -5698,17 +5729,19 @@ class TradingOrchestrator:
             vix = await self._market_data.get_vix()
             if hist is not None and not hist.empty:
                 regime = self._regime_detector.analyze(hist, vix)
-                if regime and regime.confidence > 0.70:
+                # W69: threshold is exit.thesis_regime_shift_confidence (was 0.70)
+                _shift_conf = self._settings.exit.thesis_regime_shift_confidence
+                if regime and regime.confidence > _shift_conf:
                     from ait.ml.regime import MarketRegime
                     current_regime = regime.regime.value
                     # If entered during trending and now high volatility, thesis is suspect
                     if entry_regime in ("trending_up", "trending_down") and current_regime == "high_volatility":
                         return True, f"regime_shift ({entry_regime} → {current_regime})"
 
-            # 3. Check VIX spike (>30% increase since entry)
+            # 3. Check VIX spike (default >30% increase since entry; W69: exit.thesis_vix_spike_pct)
             if vix and entry_vix and entry_vix > 0:
                 vix_change = (vix - entry_vix) / entry_vix
-                if vix_change > 0.30:
+                if vix_change > self._settings.exit.thesis_vix_spike_pct:
                     return True, f"vix_spike ({entry_vix:.1f} → {vix:.1f}, +{vix_change:.0%})"
 
         except Exception as e:

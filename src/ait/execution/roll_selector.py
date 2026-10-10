@@ -19,13 +19,12 @@ from ait.utils.logging import get_logger
 
 log = get_logger("execution.roll_selector")
 
-# Same delta target iron_condor.py's own short-strike picker uses
-# (strategies/iron_condor.py:230,238; tolerance 0.07 matches
-# Strategy._find_strike_by_delta's default). A rolled vertical looks like a
-# fresh entry at the new expiry, not a replica of the old position's
-# now-decayed entry delta.
-_ROLL_SHORT_DELTA_TARGET = 0.20
-_ROLL_SHORT_DELTA_TOLERANCE = 0.07
+# W69: the new-short delta target (default 0.20, the same one
+# strategies/iron_condor.py's short-strike picker uses) and its tolerance
+# (default 0.07, matching Strategy._find_strike_by_delta) moved to
+# AssignmentResponseConfig.roll_short_delta_target / _tolerance. A rolled
+# vertical looks like a fresh entry at the new expiry, not a replica of the
+# old position's now-decayed entry delta.
 
 
 @dataclass
@@ -120,9 +119,13 @@ async def select_roll_target(
                     symbol=trade.symbol, side=side, expiry=str(chain.expiry))
         return None
 
+    # W69: target/tolerance are assignment_response.roll_short_delta_* config
+    # (defaults 0.20 / 0.07 — the former module constants).
+    _delta_target = config.roll_short_delta_target
+    _delta_tol = config.roll_short_delta_tolerance
     new_short = min(candidates,
-                     key=lambda c: abs(abs(c.delta) - _ROLL_SHORT_DELTA_TARGET))
-    if abs(abs(new_short.delta) - _ROLL_SHORT_DELTA_TARGET) > _ROLL_SHORT_DELTA_TOLERANCE:
+                     key=lambda c: abs(abs(c.delta) - _delta_target))
+    if abs(abs(new_short.delta) - _delta_target) > _delta_tol:
         log.warning("roll_target_short_outside_delta_tolerance", trade_id=trade.trade_id,
                     symbol=trade.symbol, side=side, delta=new_short.delta)
         return None
