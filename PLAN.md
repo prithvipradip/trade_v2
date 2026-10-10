@@ -14924,3 +14924,31 @@ earliest rows. (iii) CLAUDE.md was NOT edited; it should gain a line pointing at
 (c) the construction question. Candidate W69: verify the feature-engine `iv_rank` used by `iv_rank_rise_threshold` against the stored-IV rank, then the construction study.
 
 ---
+
+## 2026-10-10 - W68 FOLLOW-UP: CLAUDE.md updated, open items registered
+
+No code or config changed. Records the project-instructions update that goes with W68 and registers the items the W68 entry left open, in one place, so the next session starts from them.
+
+**CLAUDE.md UPDATED (local file; it is gitignored in this repo, `.gitignore:39`, so this edit is NOT in version control and must be re-applied by hand on another box).** Added: (a) research commands
+(`run_backtest.py --gates-mode/--max-windows`, `scripts/gate_study.py`, `scripts/friction_sensitivity.py`, `calibrate_option_spreads.py --source ib-bars`); (b) a "Research overlay" convention under
+Config: research-only values live in `config_research.yaml`, deep-merged over `config.yaml` by research entry points via `use_research_config()` (validate + `freeze_settings`), never loaded by live, a key
+present in both files must differ, new research entry points must call `use_research_config()` first, `load_settings(ignore_frozen=True)` gives the live view; (c) "Research-vs-live parity is explicit": the
+manifest shows every deliberate deviation, and the shared single definitions (`ait.ml.regime_gate`, `ait.data.iv_rank`, `ait.backtesting.friction`) must not be re-implemented; (d) an "Entry-gate mode"
+critical-area note: `ml.entry_gates_enabled` stays false on purpose (CV AUC ~0.545 on SPY/QQQ fail-closed every condor in 2026-09), research enforces via `backtest.gates_mode`, flipping live is the
+operator's call after a B1-style test. The stale test counts in that file (1854 / 2007) were left as they are.
+
+**OPEN ITEMS (registered, none started).**
+1. *Feature-engine IV rank vs live's stored-IV rank.* `iv_rank_rise_threshold` (research veto, `iv_rank_rise` funnel reason) uses the FeatureEngine `iv_rank` feature, a different series than live's rank
+   (252 stored daily IVs, strict-below percentile). Verify whether live applies the same rise veto at all, and if so on which series; if not, it is a research-only gate.
+2. *Construction study.* The research condor is negative at zero friction at the $5k construction ($2-3 wings, 1 contract, 5% budget): avg win ~$14-27 vs avg loss ~$40-66. Wing width / contracts / DTE /
+   exit policy at the real friction. Operator decision whether and when.
+3. *Range-probability arm of the gate study* (needs a per-window range predictor trained without look-ahead).
+4. *Macro gate* blocks ~33% of days in research (222 of 675 in the any-direction run); extending the economic-calendar CSV backwards would lengthen the span.
+5. *Executor attribution gap*: 31 of 36 `executions` rows carry no `trade_id` (2026-09-14, 2026-09-29), undiagnosed; executor.py is a critical file (ask first).
+6. *Direction models* (neutral/bearish/bullish) are the operator's next work; `condor_any_direction` stays false until they are improved, and `gates_mode: enforce` should be re-examined once they change.
+7. *Live follow-up of the research-first parity direction*: when the research studies end, bring live up to research (IV gates are already shared; friction/gates mode are research-only by nature).
+8. *Operator-owned, still open from earlier waves*: Telegram token rotation, retrain/restart timing for the IB-first data flip and the VLMC alignment fix, live QQQ/IWM 5-min top-up, Prithvi's box pull.
+
+**NEXT.** Start from open item 1 (cheap, parity) or item 2 (the question the evidence keeps pointing at); both need an operator decision on scope before any code.
+
+---
