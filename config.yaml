@@ -154,32 +154,8 @@ options:
     #                     accepts entry AFTER 8:30am releases, buying straight into IV crush.
 
 backtest:
-  # initial_capital REMOVED (W-capital): lives at account.capital.
-  position_size_pct: null              # W64: null -> risk.max_position_risk_pct (what live funds the
-                                       # builder with), so research cannot drift from live. Was 0.05
-                                       # (live 0.0133-0.03) — the backtest funded 1.7-3.8x more risk per
-                                       # trade than live. Set a number ONLY for a deliberate sizing study.
-  history_start_date: 2024-01-01       # W65: first day of the research history = first day of the operator's
-                                       # economic-calendar CSV (data/investing_econ_calendar_2024-01-01_onward_UTC.csv),
-                                       # so the research macro gate is ON in every window. Wins over history_days.
-  history_days: 1826                   # W65: legacy fallback span (no start date). The walk-forward used to fetch only
-                                       # train+test+100 = 528 days => 2 windows, 0 trades.
-  research_table_prefix: research_     # W65: IB-sourced research history lives in research_* tables of historical.db
-                                       # (daily bars + IV + 5-min + econ events); live tables are never written by research.
-  vlmc_min_coverage: 0.95              # W65: 5-min day coverage required to train with VLMC/intraday-fractal features;
-                                       # below it the run is daily-only (never a mix of windows with and without VLMC).
-  macro_event_types: [FOMC, CPI, NFP, PCE, GDP]   # W65: research macro gate event set (= live's five, for parity)
-  condor_any_direction: false          # W66: true = research trades an IC-only set on ANY direction (live does;
-                                       # the engine's NEUTRAL-only rule removed ~81% of days). false = legacy, so no
-                                       # research result moves until the operator flips it after seeing the A/B.
-  friction_model: per_leg_usd          # W66: legacy | per_leg_usd (fitted $/leg half-spread, entry AND exit; QQQ legacy
-                                       # overcharged a $0.95-credit condor $0.669 vs ~$0.085 measured). Missing fit -> legacy + WARNING.
-  friction_entry_capture: 1.0          # W66: share of the quoted half-spread paid per leg at entry (1.0 = full, conservative)
-  friction_exit_capture: 1.0           # W66: ... and at exit; lower only from the fill-vs-model report
-  friction_stress_multiplier: 1.0      # W66: scales the fitted model (calm-regime sample hedge; sweep with friction_sensitivity.py)
-  budget_aware_wings: true             # W64: research condor builder caps the wing to the budget like live
-                                       # (IronCondor.affordable_width, $1 floor when capped) and rejects a
-                                       # structure whose max loss exceeds the budget. false = old behaviour.
+  position_size_pct: 0.05             # 5% of capital risked per trade (max-loss basis)
+                                       # Raise to 0.20 for accounts < $10k (increases concentration risk)
   wing_floor_dollars: 5.0             # Hard minimum spread width in dollars (safety floor only)
                                        # Wing sizing is now primarily driven by wing_k × expected_move
                                        # Lower to 0.5 for sub-$10 stocks (e.g. SOFI)
@@ -224,13 +200,7 @@ backtest:
                                        # Optuna tunes per window in [0.25, 0.90]; 0.80 = permissive default
   optimize_n_trials: 50               # Optuna trials per walk-forward window
   optimize_patience: 20               # Early stopping: halt after N consecutive non-improving trials (0=disabled)
-  optimize_min_trades: 10             # Min trades for full score; 3–9 → quadratic penalty
-  optimize_hard_min_trades: 3         # W67: below this a trial scores on the graded floor (not a flat −100)
-  optimize_below_floor_gradient: 20.0 # W67: −100 (0 trades) rising toward −80; 0 restores the flat −100
-  gates_mode: observe                 # W67: observe = live parity (ml.entry_gates_enabled=false: range floor + fractal veto
-                                       # are recorded as would_reject:*, never block); enforce = historical research behaviour
-  fractal_veto_spread: 0.0            # W67: absolute hurst spread veto for neutral structures (0 = off = live today)
-  penalty_on_range_prob: 0.0          # W67: fractal penalty also lowers P(in range) (0 = off = live today)
+  optimize_min_trades: 10             # Min trades for full score; < 3 → always −100; 3–9 → quadratic penalty
   # R20b (pre-registered 2026-08-21): optimizer trial baselines moved from code
   # literals into config — values below = the operating literals they replace.
   stop_loss_pct: 0.35                 # Baseline stop-loss (fraction of position value)

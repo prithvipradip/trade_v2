@@ -5923,6 +5923,7 @@ class TradingOrchestrator:
         is now None; the caller fails closed for new entries and the journal
         records NULL instead of a fabricated rank.
         """
+        from ait.data.iv_rank import iv_rank_percentile
         try:
             import sqlite3 as _sq
             con = _sq.connect("file:data/historical.db?mode=ro", uri=True)
@@ -5945,13 +5946,13 @@ class TradingOrchestrator:
                                 note="using realized-vol proxy; store should "
                                      "self-heal via daily_iv_persisted")
                     rows = []
-            if len(rows) >= 60:
-                cur = rows[0]
-                below = sum(1 for v in rows if v < cur)
-                rank = below / len(rows) * 100
+            # W68: the percentile itself lives in ait.data.iv_rank (ONE definition shared with
+            # the research engine); None below 60 observations, as before.
+            rank = iv_rank_percentile(rows)
+            if rank is not None:
                 log.debug("iv_rank_true_percentile", symbol=symbol,
                           rank=round(rank, 1), n=len(rows))
-                return max(0.0, min(100.0, rank))
+                return rank
         except Exception as _e:  # noqa: BLE001
             log.debug("iv_rank_store_read_failed", symbol=symbol, error=str(_e))
         log.debug("iv_rank_realized_proxy", symbol=symbol,

@@ -44,6 +44,13 @@ class TestRetunedConfig:
         assert s.risk.max_position_risk_pct == pytest.approx(0.05)
         assert s.risk.max_daily_loss_pct == pytest.approx(0.045)
         assert s.risk.breaker_to_max_loss_ratio == pytest.approx(1.0)
+
+    def test_research_values(self):
+        # W68: position_size_pct / budget_aware_wings are research-only knobs; they live in the
+        # research overlay (config_research.yaml), not in the live config.yaml.
+        from pathlib import Path
+        from ait.config.research import load_research_settings
+        s = load_research_settings(str(Path(__file__).resolve().parent.parent / "config.yaml"))
         # position_size_pct follows live unless a study sets it
         assert s.backtest.position_size_pct is None
         assert s.backtest.budget_aware_wings is True

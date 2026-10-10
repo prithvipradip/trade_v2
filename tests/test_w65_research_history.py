@@ -275,8 +275,10 @@ class TestVlmcConsistencyGuard:
 # =========================================================================
 class TestConfigKeys:
     def test_real_config_values(self):
-        from ait.config.settings import load_settings
-        b = load_settings(str(ROOT / "config.yaml")).backtest
+        # W68: the research history keys live in the research overlay (config_research.yaml),
+        # not in the live config.yaml.
+        from ait.config.research import load_research_settings
+        b = load_research_settings(str(ROOT / "config.yaml")).backtest
         assert b.history_start_date == date(2024, 1, 1)
         assert b.research_table_prefix == "research_"
         assert b.macro_event_types == ["FOMC", "CPI", "NFP", "PCE", "GDP"]

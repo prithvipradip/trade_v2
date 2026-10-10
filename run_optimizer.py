@@ -98,6 +98,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    from ait.config.research import use_research_config
+    use_research_config()   # W68: config.yaml + config_research.yaml (research only)
     from ait.optimization.optimizer import StrategyOptimizer
     if args.capital is None:
         from ait.config.runtime_env import research_capital

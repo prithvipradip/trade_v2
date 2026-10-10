@@ -134,6 +134,16 @@ class Backtester:
         # COMPUTED and recorded (entry decision + `would_reject:*` funnel counters) but
         # never block. The research entry points resolve it from backtest.gates_mode.
         gates_mode: str = "enforce",
+        # W68 IV-rank parity. Live gates credit entries on IV RANK (0-100 percentile of today's
+        # IV in the last 252 stored daily IVs; ait.data.iv_rank): iron_condor refuses rank <
+        # AIT_IRON_CONDOR_IV_FLOOR (15) and the risk manager refuses rank > AIT_IV_RANK_CAP (85);
+        # an unmeasurable rank fails closed. False (bare default) = the engine's historical
+        # absolute-level floor only; the research entry points resolve backtest.iv_rank_gate.
+        iv_rank_gate: bool = False,
+        # Precomputed rank by date (ait.data.iv_rank.iv_rank_series over the symbol's FULL IV
+        # history), so a short test window still sees live's 252-observation lookback. None =
+        # derived from this engine's own `implied_vol` column.
+        iv_rank_series: pd.Series | None = None,
         # Absolute fractal hard-veto cutoff (0 = off). None = derive from the legacy
         # hurst_hard_veto_multiplier (max(threshold, 0.20) * multiplier) so explicit
         # callers keep their exact behaviour. See ait.ml.regime_gate.
@@ -376,6 +386,11 @@ class Backtester:
         if gates_mode not in ("observe", "enforce"):
             raise ValueError(f"gates_mode must be 'observe' or 'enforce', got {gates_mode!r}")
         self._gates_mode = gates_mode
+        self._iv_rank_gate = bool(iv_rank_gate)
+        self._iv_rank_floor = contract_float("AIT_IRON_CONDOR_IV_FLOOR")
+        self._iv_rank_cap = contract_float("AIT_IV_RANK_CAP")
+        self._iv_rank_series_arg = iv_rank_series
+        self._iv_rank_arr = self._build_iv_rank_array()
         # W67: the shared fractal gate (ait.ml.regime_gate) replaces the inline copy.
         from ait.ml.regime_gate import SHAPE_PROPORTIONAL, FractalGateConfig, resolve_veto_spread
         self._fractal_cfg = FractalGateConfig(
@@ -593,6 +608,23 @@ class Backtester:
         counts here; `BacktestResult.entry_funnel` carries the totals."""
         self._funnel[reason] += 1
 
+    def _build_iv_rank_array(self) -> np.ndarray | None:
+        """W68: IV rank aligned to `self._data` rows (NaN = unmeasurable), or None when the gate
+        is off. Uses only observations at or before each row (no look-ahead)."""
+        if not getattr(self, "_iv_rank_gate", False):
+            return None
+        from ait.data.iv_rank import iv_rank_series
+        ser = self._iv_rank_series_arg
+        if ser is None:
+            if "implied_vol" in self._data.columns:
+                ser = iv_rank_series(self._data["implied_vol"])
+            else:
+                log.warning("iv_rank_gate_no_iv_series",
+                            note="iv_rank_gate on but no implied_vol column: every credit "
+                                 "entry fails closed, as live does when the rank is unknown")
+                return np.full(len(self._data), np.nan)
+        return ser.reindex(self._data.index).to_numpy(dtype=float)
+
     def _would_reject(self, reason: str) -> None:
         """W67: observe mode -- the gate WOULD have rejected this day but did not.
 
@@ -809,6 +841,20 @@ class Backtester:
             if strategy is None:
                 self._reject("no_strategy")
                 continue
+
+            # W68: live's two IV-rank gates (floor in iron_condor.py, cap in the risk manager).
+            if self._iv_rank_gate and strategy in CREDIT_STRATEGIES:
+                _ivr = float(self._iv_rank_arr[i]) if self._iv_rank_arr is not None else float("nan")
+                if np.isnan(_ivr):
+                    self._reject("iv_rank_unknown")   # live fails closed on an unmeasurable rank
+                    continue
+                _entry_decision["iv_rank"] = round(_ivr, 1)
+                if strategy == "iron_condor" and _ivr < self._iv_rank_floor:
+                    self._reject("iv_rank_floor")
+                    continue
+                if _ivr > self._iv_rank_cap:
+                    self._reject("iv_rank_cap")
+                    continue
 
             # Earnings proximity skip (Gap Z4): matches live orchestrator behaviour.
             if today_date in self._earnings_dates:

@@ -75,9 +75,21 @@ def _live_settings():
     """Loaded config.yaml, or None if it cannot be read."""
     try:
         from ait.config.settings import load_settings
-        return load_settings()
+        # W68: the LIVE column must show config.yaml alone, even though this process has frozen
+        # base+overlay (use_research_config) for everything else.
+        return load_settings(ignore_frozen=True)
     except Exception as e:  # noqa: BLE001
         print(f"  ! parity manifest: settings unavailable ({e})")
+        return None
+
+
+def _research_settings():
+    """config.yaml + config_research.yaml as THIS run sees it (the frozen snapshot)."""
+    try:
+        from ait.config.settings import load_settings
+        return load_settings()
+    except Exception as e:  # noqa: BLE001
+        print(f"  ! parity manifest: research settings unavailable ({e})")
         return None
 
 
@@ -94,6 +106,7 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
 
     env = _live_env()
     settings = _live_settings()
+    rsettings = _research_settings()   # backtest column: base + research overlay
     live_dte = list(settings.options.dte_range) if settings else [14, 45]
     live_blackout = (settings.risk.pre_event_blackout_days
                      if settings else None)
@@ -139,9 +152,9 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
                             if settings else _RC().max_position_risk_pct)
     live_max_contracts = int(settings.positions.max_contracts_per_trade
                              if settings else _PC().max_contracts_per_trade)
-    bt_budget_pct = _rps(None, settings)
-    bt_max_contracts = _rmc(None, settings)
-    bt_wings = bool(_rcv(None, "backtest", "budget_aware_wings", _BTC, settings))
+    bt_budget_pct = _rps(None, rsettings)
+    bt_max_contracts = _rmc(None, rsettings)
+    bt_wings = bool(_rcv(None, "backtest", "budget_aware_wings", _BTC, rsettings))
 
     live = {
         "per_trade_budget_pct": live_budget_pct,
@@ -152,6 +165,10 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
         # cutoffs are read from the same backtest.* fields by the orchestrator.
         "gates_mode": ("enforce" if (settings.ml.entry_gates_enabled if settings else True)
                        else "observe"),
+        # W68: live gates credit entries on IV RANK (floor in the condor builder, cap in the
+        # risk manager) -- both read the env contract the bot applies.
+        "iv_rank_gate": True,
+        "iv_rank_cap": contract_float("AIT_IV_RANK_CAP"),
         "fractal_veto_spread": float(settings.backtest.fractal_veto_spread
                                      if settings else _BTC().fractal_veto_spread),
         "penalty_on_range_prob": float(settings.backtest.penalty_on_range_prob
@@ -184,14 +201,16 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
     backtest = {
         "per_trade_budget_pct": bt_budget_pct,
         "budget_aware_wings": bt_wings,
-        "condor_any_direction": bool(_rcv(None, "backtest", "condor_any_direction", _BTC, settings)),
-        "friction_model": str(_rcv(None, "backtest", "friction_model", _BTC, settings)),
+        "condor_any_direction": bool(_rcv(None, "backtest", "condor_any_direction", _BTC, rsettings)),
+        "friction_model": str(_rcv(None, "backtest", "friction_model", _BTC, rsettings)),
         "max_contracts_per_trade": bt_max_contracts,
+        "iv_rank_gate": bool(_rcv(None, "backtest", "iv_rank_gate", _BTC, rsettings)),
+        "iv_rank_cap": contract_float("AIT_IV_RANK_CAP"),
         "gates_mode": str(_rcv(getattr(args, "gates_mode", None), "backtest", "gates_mode",
-                               _BTC, settings)),
-        "fractal_veto_spread": float(_rcv(None, "backtest", "fractal_veto_spread", _BTC, settings)),
+                               _BTC, rsettings)),
+        "fractal_veto_spread": float(_rcv(None, "backtest", "fractal_veto_spread", _BTC, rsettings)),
         "penalty_on_range_prob": float(_rcv(
-            None, "backtest", "penalty_on_range_prob", _BTC, settings)),
+            None, "backtest", "penalty_on_range_prob", _BTC, rsettings)),
         "wing_k":            resolved_wing_k,
         "range_min_confidence": resolved_range_confidence,
         "ic_min_credit":     resolved_ic_min_credit,
@@ -369,6 +388,10 @@ def parse_args() -> argparse.Namespace:
 
 
 async def run_backtest(args: argparse.Namespace) -> None:
+    # W68: config.yaml + config_research.yaml is THIS process's configuration (research only;
+    # the live bot never loads the overlay). Fails loudly if the overlay file is missing.
+    from ait.config.research import use_research_config
+    use_research_config()
     if args.capital is None:
         from ait.config.runtime_env import research_capital
         args.capital = research_capital()

@@ -14873,3 +14873,54 @@ B1's n >= 30 bar, and it covers a different era / selector / friction model than
 **NEXT.** Unchanged from the W67 entry: operator decisions on the construction question, `condor_any_direction`, and the IV level-vs-rank parity gap, before any further study.
 
 ---
+
+## 2026-10-10 - W68: research config overlay (`config_research.yaml`), IV-rank parity with live, research gates ON
+
+**OPERATOR DECISIONS (2026-10-10).** (1) `condor_any_direction` stays OFF in research: the neutral/bearish/bullish direction models are what is being improved next, so research keeps the
+NEUTRAL-only selector until they are. (2) Bring research UP TO LIVE on the IV gates (later, once the research studies are done, bring live up to research). (3) ML entry gates ON **in research only**:
+`backtest.gates_mode: enforce`; live `ml.entry_gates_enabled` stays false (observe) because with the current models (CV AUC ~0.545 on SPY/QQQ) live-ON blocked every condor in 2026-09 (16 candidates,
+0 orders) and the paper track record needs closes. A deliberate research-vs-live deviation, shown by the parity manifest. (4) Research-only configuration moves to ONE file.
+
+**WHY the overlay is an overlay, not a copy, and why config.yaml is not byte-for-byte main.** `main`'s config.yaml carries `backtest.initial_capital`, a field this branch's strict schema (W63,
+`extra="forbid"`) no longer has, so a literal main copy would fail at startup; and five lines of the config.yaml diff are the live risk/capital retune chosen on purpose for the $5k account
+(`account.capital` 5000, `simulate_live_capital`, `risk.max_daily_loss_pct` 0.045, `breaker_to_max_loss_ratio` 1.0, `risk.max_position_risk_pct` 0.05) which research reads through
+`research_capital()` too. A full research-config COPY would drift silently from live (the R19 shadowing bug class); an overlay holds only deltas and picks up later live changes automatically.
+
+**WHAT CHANGED.**
+1. `config.yaml` = main + exactly those five live lines, minus `backtest.initial_capital` (the diff against main is 33 added / 10 removed lines, all W63/W64 live retune comments + values).
+2. `config_research.yaml` (new): every research-only value of this branch with its provenance comment: W64 `position_size_pct: null`, `budget_aware_wings`; W65 history keys; W66 friction keys,
+   `condor_any_direction: false`; W67 `gates_mode` (now `enforce`), `fractal_veto_spread`, `penalty_on_range_prob`, graded-objective knobs; W68 `iv_rank_gate: true`, `iv_floor: 0.05`.
+   `src/ait/config/research.py` (`use_research_config()` = load base + overlay, validate, `freeze_settings`) so the 71 `load_settings()` call sites see the merged config unchanged;
+   `load_settings(..., overlay_path=, ignore_frozen=)`; overlay secrets keys refused; missing overlay = hard error. Wired into `run_backtest.py`, `run_optimizer.py`,
+   `scripts/friction_sensitivity.py`, `scripts/gate_study.py`; the weekly-health backtest picks it up through run_backtest. The parity manifest's LIVE column is read with `ignore_frozen` (config.yaml
+   alone) so it still shows what live does; overlay deviations (`gates_mode`, `condor_any_direction`) print as parity warnings. AST guard: nothing under `src/ait` references the overlay.
+3. IV-rank parity (closes the W67 CLARIFICATION gap): `src/ait/data/iv_rank.py` is the ONE definition (live's R7 true percentile: share of the last 252 stored daily IVs strictly below today's,
+   >= 60 observations, else unknown); `Orchestrator._estimate_iv_rank` now calls it (behaviour identical: verified against a verbatim copy of the old inline block); the research engine applies live's two
+   gates to credit entries: condor refuses rank < `ic_iv_rank_floor` (15), any credit structure refuses rank > `iv_rank_cap` (85), unmeasurable rank fails closed (`iv_rank_unknown`), recorded in the
+   funnel and the entry decision. The rank series is computed ONCE per symbol over the FULL IV history (no look-ahead: row t uses <= t) and handed to the OOS, shadow and optimizer-trial engines,
+   so a short test window keeps live's 252-observation lookback. The absolute-level floor is demoted to the 0.05 schema minimum (it was research's only IV gate AND the leg-IV pricing floor; left at
+   0.20 it would price 12%-IV SPY days at 20%, i.e. fat fake credits, now that the rank gate lets those days trade).
+
+**MEASURED (plain walk-forward, 10 windows, overlay on: v2 friction, gates enforced, IV-rank gates, NEUTRAL selector).** 42 trades (W67 enforce, level floor: 16), win 52.4%, avg win $17.76 / avg
+loss $43.86, PF 0.45 (was 0.27), -$486 / -9.41% (was -$261 / -5.15%): per-trade expectancy -$11.6 (was -$16.3) but 2.6x the trades, so the total loss is larger. By symbol: SPY 22 trades (was 1: its
+~12% IV never cleared the 0.20 level floor, while its RANK is often >= 15), IWM 11, QQQ 9. Funnel: IWM iv_rank_floor 51 days; QQQ floor 12 / cap 5; SPY floor 5 / cap 9; range gate still rejects
+11-49 days per symbol. 8 of 10 windows traded (the walk-forward summary counts only windows with trades). Pilot (2 windows x 3 symbols x 5 trials): 4 of 6 studies found a trading trial, 2 flagged.
+Reading: IV-rank parity moves research toward what live actually trades (more SPY, fewer low-rank IWM days) and makes the per-trade loss somewhat smaller, but the construction is still negative.
+
+**TESTS.** `tests/test_w68_research_config.py` (42): merge semantics, unknown overlay key / secrets / missing file errors, `ignore_frozen`, freeze, the real files (live vs research views differ exactly where
+intended; overlay holds only real differences; config.yaml has no research-only keys), no `src/` module references the overlay, every research entry point activates it, IV rank vs the old inline rule
+(ties, window, None below 60, series == scalar for every date, no look-ahead), engine gate (floor / cap / boundaries 15 and 85 trade / unknown fails closed / no series fails closed / series from own column /
+conservation), plumbing guards. Mutation-checked: `<=` at the floor, window off-by-one, and removing `use_research_config()` from run_backtest each fail the intended test. Updated 2 tests that read
+research keys from config.yaml (W64, W65) to read the overlay. Fast lane 5113 passed / 2 failed (the two tests above, fixed and re-run green with their files: 102 passed) / 46 skipped; slow `test_optimizer.py` 39 passed; `typecheck.py` OK; `smoke_deploy.py` SMOKE PASS (13 checks).
+
+**DEVIATIONS / CAVEATS.** (i) Risk manager's IV cap is applied to every credit structure in research, as live applies it (live's check also needs a real rank > 0; unmeasurable fails closed in research, live
+fails closed upstream in the orchestrator). (ii) The live iv series comes from `daily_prices` (live table), research from `research_daily_prices` (same IB source, longer): the rank can differ slightly on the
+earliest rows. (iii) CLAUDE.md was NOT edited; it should gain a line pointing at `config_research.yaml` (operator's file). (iv) The `ml.entry_gates_enabled` flip for live is deliberately NOT done.
+
+**REGISTERED, NOT FIXED.** Range-probability arm of the gate study; construction study (wing width / contracts / DTE at real friction); macro gate blocks ~33% of days; executor attribution gap
+(31 executions rows without trade_id); `iv_rank_rise_threshold` (research veto uses the feature-engine rank, a different series than live's stored-IV rank: a second parity item to verify).
+
+**NEXT.** Operator: (a) direction-model improvement studies (research selector stays NEUTRAL-only), (b) whether to keep `gates_mode: enforce` as the research default once those models change,
+(c) the construction question. Candidate W69: verify the feature-engine `iv_rank` used by `iv_rank_rise_threshold` against the stored-IV rank, then the construction study.
+
+---

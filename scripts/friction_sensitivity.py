@@ -64,7 +64,7 @@ def _engine_kwargs(sym, df, feats, cal, args, **over):
               allow_live_model_fallback=False, symbol=sym, economic_calendar=cal,
               hurst_hard_veto_multiplier=0.0, features_cache=feats,
               condor_any_direction=args.any_direction,
-              db_path=Path(args.db_path))
+              iv_rank_gate=args.iv_rank_gate, db_path=Path(args.db_path))
     kw.update(over)
     return kw
 
@@ -82,10 +82,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--any-direction", action="store_true",
                     help="condor_any_direction (live-like selector)")
     ap.add_argument("--exit-ab", action="store_true", help="also run the payoff-shape A/B")
+    ap.add_argument("--iv-rank-gate", action=argparse.BooleanOptionalAction, default=None,
+                    help="live's IV-rank floor/cap (default: config backtest.iv_rank_gate)")
     args = ap.parse_args(argv)
 
     from ait.config.runtime_env import apply_runtime_env_defaults, research_capital
     apply_runtime_env_defaults()
+    from ait.config.research import use_research_config
+    use_research_config()   # W68: config.yaml + config_research.yaml (research only)
     from ait.backtesting.engine import Backtester
     from ait.config.settings import load_settings
     from ait.data.economic_calendar import build_research_calendar
@@ -95,6 +99,8 @@ def main(argv: list[str] | None = None) -> int:
 
     settings = load_settings()
     args.capital = float(args.capital or research_capital())
+    if args.iv_rank_gate is None:
+        args.iv_rank_gate = bool(settings.backtest.iv_rank_gate)
     args.budget_pct = float(args.budget_pct or settings.risk.max_position_risk_pct)
     db = Path(args.db_path)
     cal = build_research_calendar(db, args.table_prefix, list(settings.backtest.macro_event_types))

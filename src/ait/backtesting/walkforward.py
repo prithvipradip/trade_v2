@@ -80,6 +80,7 @@ class WalkForwardConfig:
     # fractal_veto_spread: an explicit legacy hurst_hard_veto_multiplier > 0 is honoured by
     # translating it once with the original formula (see ait.ml.regime_gate.resolve_veto_spread).
     gates_mode: str | None = None
+    iv_rank_gate: bool | None = None          # W68: None -> backtest.iv_rank_gate
     fractal_veto_spread: float | None = None
     penalty_on_range_prob: float | None = None
     # W65 research-history knobs (None = legacy behaviour; the research entry points
@@ -294,6 +295,8 @@ class WalkForwardConfig:
             BacktestConfig, _settings))
         self.gates_mode = str(resolve_config_value(
             self.gates_mode, "backtest", "gates_mode", BacktestConfig, _settings))
+        self.iv_rank_gate = bool(resolve_config_value(
+            self.iv_rank_gate, "backtest", "iv_rank_gate", BacktestConfig, _settings))
         self.penalty_on_range_prob = float(resolve_config_value(
             self.penalty_on_range_prob, "backtest", "penalty_on_range_prob",
             BacktestConfig, _settings))
@@ -1046,6 +1049,9 @@ class WalkForwardBacktester:
         # for every per-window Optuna study, so a run whose studies never found a trading
         # trial says so in its summary instead of looking like an optimized result.
         self._opt_status_by_window: dict[int, dict[str, dict]] = {}
+        # W68: {symbol: IV-rank series by date} over each symbol's FULL history (live's 252-obs
+        # lookback), filled lazily by _ensure_iv_rank_series; empty when the gate is off.
+        self._iv_rank_series: dict[str, pd.Series] = {}
         # W65: research macro calendar (built in run() when macro_event_types is set).
         self._research_calendar = None
         self._progress_dir = Path(progress_dir) if progress_dir else None
@@ -1335,6 +1341,7 @@ class WalkForwardBacktester:
             train=f"{train_start} to {train_end}",
             test=f"{test_start} to {test_end}",
         )
+        self._ensure_iv_rank_series(data)
 
         if learner is not None:
             learned_config = learner.get_config()
@@ -1615,6 +1622,8 @@ class WalkForwardBacktester:
                 friction_exit_capture=window_cfg.friction_exit_capture,
                 friction_stress_multiplier=window_cfg.friction_stress_multiplier,
                 gates_mode=window_cfg.gates_mode,
+                iv_rank_gate=window_cfg.iv_rank_gate,
+                iv_rank_series=self._iv_rank_series.get(symbol),
                 fractal_veto_spread=window_cfg.fractal_veto_spread,
                 penalty_on_range_prob=window_cfg.penalty_on_range_prob,
                 economic_calendar=self._research_calendar,
@@ -1979,6 +1988,8 @@ class WalkForwardBacktester:
                     friction_exit_capture=self._config.friction_exit_capture,
                     friction_stress_multiplier=self._config.friction_stress_multiplier,
                     gates_mode=self._config.gates_mode,
+                    iv_rank_gate=self._config.iv_rank_gate,
+                    iv_rank_series=self._iv_rank_series,
                     fractal_veto_spread=self._config.fractal_veto_spread,
                     penalty_on_range_prob=self._config.penalty_on_range_prob,
                     hard_min_trades=self._config.optimize_hard_min_trades,
@@ -2772,6 +2783,8 @@ class WalkForwardBacktester:
                 friction_exit_capture=window_cfg.friction_exit_capture,
                 friction_stress_multiplier=window_cfg.friction_stress_multiplier,
                 gates_mode=window_cfg.gates_mode,
+                iv_rank_gate=window_cfg.iv_rank_gate,
+                iv_rank_series=self._iv_rank_series.get(symbol),
                 fractal_veto_spread=window_cfg.fractal_veto_spread,
                 penalty_on_range_prob=window_cfg.penalty_on_range_prob,
                 economic_calendar=self._research_calendar,
@@ -2921,6 +2934,20 @@ class WalkForwardBacktester:
         log.info("research_macro_calendar", event_types=list(cfg.macro_event_types),
                  span=span[:2], rows=span[2])
         return trimmed
+
+    def _ensure_iv_rank_series(self, data: "dict[str, pd.DataFrame]") -> None:
+        """W68: IV rank over each symbol's FULL history, once per instance (the parallel path
+        builds one instance per window, so this also runs inside each worker).
+
+        Ranking the full series, not the window slice, gives every day live's 252-observation
+        lookback (a slice would restart the warm-up each window); row t only ever uses
+        observations at or before t, so this introduces no look-ahead."""
+        if not self._config.iv_rank_gate or self._iv_rank_series:
+            return
+        from ait.data.iv_rank import iv_rank_series
+        for sym, df in data.items():
+            if df is not None and "implied_vol" in df.columns:
+                self._iv_rank_series[sym] = iv_rank_series(df["implied_vol"])
 
     def _aggregate_funnel(self) -> dict[str, dict[str, int]]:
         """W66: sum the per-window entry funnels into {symbol: {reason: days}}."""

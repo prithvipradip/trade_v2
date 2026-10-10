@@ -102,6 +102,8 @@ def collect_trades(symbols, db_path: Path, table_prefix: str, start: str,
     from ait.backtesting.engine import Backtester
     from ait.config.runtime_env import apply_runtime_env_defaults, research_capital
     apply_runtime_env_defaults()
+    from ait.config.research import use_research_config
+    use_research_config()   # W68: config.yaml + config_research.yaml (research only)
     from ait.config.settings import load_settings
     from ait.data.economic_calendar import build_research_calendar
     from ait.data.market_data import load_daily_ohlcv
@@ -124,7 +126,9 @@ def collect_trades(symbols, db_path: Path, table_prefix: str, start: str,
             max_contracts_per_trade=1, wing_floor_dollars=2.0, symbol=sym,
             economic_calendar=cal, features_cache=feats, db_path=db_path,
             allow_live_model_fallback=False, condor_any_direction=any_direction,
-            friction_model="per_leg_usd", gates_mode="observe", fractal_veto_spread=0.0)
+            friction_model="per_leg_usd", gates_mode="observe", fractal_veto_spread=0.0,
+            # W68: live's IV-rank floor/cap, so the study sees the days live would trade
+            iv_rank_gate=bool(settings.backtest.iv_rank_gate))
         res = bt.run()
         for t in res.trades:
             fg = (t.get("decision") or {}).get("fractal_gate", {})

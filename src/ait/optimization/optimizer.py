@@ -108,6 +108,8 @@ class StrategyOptimizer:
         friction_exit_capture: float | None = None,
         friction_stress_multiplier: float | None = None,
         gates_mode: str | None = None,               # W67 gate parity (None -> config)
+        iv_rank_gate: bool | None = None,            # W68 IV-rank parity (None -> config)
+        iv_rank_series: dict | None = None,          # W68 {symbol: rank by date}, full history
         fractal_veto_spread: float | None = None,
         penalty_on_range_prob: float | None = None,
         hard_min_trades: int | None = None,          # W67 graded objective (None -> config)
@@ -253,6 +255,9 @@ class StrategyOptimizer:
             friction_stress_multiplier, "backtest", "friction_stress_multiplier", _BTC2,
             self._settings))
         self._gates_mode = str(_rcv(gates_mode, "backtest", "gates_mode", _BTC2, self._settings))
+        self._iv_rank_gate = bool(_rcv(
+            iv_rank_gate, "backtest", "iv_rank_gate", _BTC2, self._settings))
+        self._iv_rank_series = iv_rank_series or {}
         self._fractal_veto_spread = float(_rcv(
             fractal_veto_spread, "backtest", "fractal_veto_spread", _BTC2, self._settings))
         self._penalty_on_range_prob = float(_rcv(
@@ -615,6 +620,7 @@ class StrategyOptimizer:
             # trial Backtester inherited the bare engine default (hurst veto at 1.5x), a
             # gate the OOS run never applied -- Optuna optimized under the wrong rules.
             "gates_mode":            self._gates_mode,
+            "iv_rank_gate":          self._iv_rank_gate,
             "fractal_veto_spread":   self._fractal_veto_spread,
             "penalty_on_range_prob": self._penalty_on_range_prob,
             "max_contracts_per_trade": self._max_contracts_per_trade,
@@ -659,6 +665,7 @@ class StrategyOptimizer:
             # same calibrated spreads / friction model v2 as the OOS engine instead of the
             # cwd-default historical.db.
             db_path=self._db_path,
+            iv_rank_series=self._iv_rank_series.get(self._symbol or symbol),
             range_predictor=self._range_predictor,
             intraday_store=self._intraday_store,
             eval_start_date=eval_start_date,

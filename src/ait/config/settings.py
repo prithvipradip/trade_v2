@@ -404,6 +404,14 @@ class BacktestConfig(_StrictModel):
                     "computed and recorded as would_reject:* but never block); enforce = the "
                     "research engine's historical behaviour (they block). The gate study "
                     "(scripts/gate_study.py) compares the two on the same days.")
+    iv_rank_gate: bool = Field(default=False,
+        description="W68: research applies live's two IV-RANK gates to credit entries -- iron_condor "
+                    "refuses rank < ic_iv_rank_floor (15) and the risk manager refuses rank > "
+                    "risk.iv_rank_cap (85); an unmeasurable rank fails closed. Rank = percentile of "
+                    "today's IV in the last 252 stored daily IVs (ait.data.iv_rank, shared with "
+                    "live). False = the engine's historical absolute-level floor (iv_floor) only. "
+                    "When True, lower iv_floor to its 0.05 minimum so it stays a pricing sanity "
+                    "floor and not a second entry gate live does not have.")
     fractal_veto_spread: float = Field(default=0.0, ge=0.0, le=1.0,
         description="W67: absolute hurst_scale_spread above which neutral credit structures "
                     "are vetoed (0 = veto off, live parity). Replaces the research-only "
@@ -1185,9 +1193,30 @@ def freeze_settings(settings: "Settings") -> None:
     _FROZEN = settings.model_copy(deep=True)
 
 
-def load_settings(config_path: str | Path = "config.yaml") -> Settings:
-    """Load settings from YAML file, with env var overrides for secrets."""
-    if _FROZEN is not None:
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """Overlay wins key by key; nested mappings merge, everything else (lists, scalars, an
+    explicit null) replaces. Returns a new dict."""
+    out = dict(base)
+    for k, v in overlay.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_settings(config_path: str | Path = "config.yaml",
+                  overlay_path: str | Path | None = None,
+                  *, ignore_frozen: bool = False) -> Settings:
+    """Load settings from YAML file, with env var overrides for secrets.
+
+    W68: `overlay_path` (research only, see ait/config/research.py) is deep-merged OVER the base file
+    before validation, so an overlay key the schema does not know is a startup error exactly like a
+    typo in config.yaml (extra="forbid"), and a later live change in the base flows into research.
+    `ignore_frozen` reads the file(s) even when a process-wide snapshot exists: the research parity
+    manifest uses it to show what the LIVE bot's config.yaml says next to the research overlay.
+    """
+    if _FROZEN is not None and not ignore_frozen:
         return _FROZEN.model_copy(deep=True)
     config_path = Path(config_path)
 
@@ -1202,6 +1231,19 @@ def load_settings(config_path: str | Path = "config.yaml") -> Settings:
         )
     with open(config_path) as f:
         yaml_data = yaml.safe_load(f) or {}
+    if overlay_path is not None:
+        overlay_path = Path(overlay_path)
+        if not overlay_path.exists():
+            raise FileNotFoundError(
+                f"Research overlay not found: {overlay_path.resolve()} -- refusing to run "
+                "research on the live config by accident.")
+        with open(overlay_path) as f:
+            overlay = yaml.safe_load(f) or {}
+        for forbidden in ("ibkr", "api_keys"):
+            if forbidden in overlay:
+                raise ValueError(f"the research overlay may not set {forbidden!r} (secrets "
+                                 "come from the environment only)")
+        yaml_data = _deep_merge(yaml_data, overlay)
 
     # IBKR and API keys come from environment only
     yaml_data["ibkr"] = IBKREnvConfig().model_dump()

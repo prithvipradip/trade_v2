@@ -1,0 +1,56 @@
+# AIT v2 — RESEARCH OVERLAY (W68, 2026-10-10).
+#
+# Deep-merged OVER config.yaml by RESEARCH entry points only (ait.config.research.use_research_config:
+# run_backtest.py, run_optimizer.py, scripts/friction_sensitivity.py, scripts/gate_study.py). The live
+# bot (ait.main) and the supervisor never load it. It holds ONLY the keys that differ from config.yaml,
+# so (a) this file IS the research-vs-live difference, and (b) a later live change in config.yaml flows
+# into research automatically. Unknown keys are a startup error (the schema is extra="forbid").
+#
+# Keep every research change on this branch HERE, with its provenance comment. config.yaml differs from
+# main only by the five operator-chosen live risk/capital lines (account.capital, simulate_live_capital,
+# risk.max_daily_loss_pct, risk.breaker_to_max_loss_ratio, risk.max_position_risk_pct) plus the removal of
+# backtest.initial_capital (the field no longer exists: capital lives at account.capital).
+
+backtest:
+  position_size_pct: null              # W64: null -> risk.max_position_risk_pct (what live funds the
+                                       # builder with), so research cannot drift from live. main has 0.05.
+  budget_aware_wings: true             # W64: research condor builder caps the wing to the budget like live
+                                       # (IronCondor.affordable_width, $1 floor when capped) and rejects a
+                                       # structure whose max loss exceeds the budget.
+
+  # --- W65: research history (IB-sourced research_* tables; live tables are never written) ---
+  history_start_date: 2024-01-01       # first day of the operator's economic-calendar CSV, so the research
+                                       # macro gate is ON in every window. Wins over history_days.
+  history_days: 1826                   # legacy fallback span (no start date)
+  research_table_prefix: research_
+  vlmc_min_coverage: 0.95              # 5-min day coverage required to train with VLMC/intraday-fractal features
+  macro_event_types: [FOMC, CPI, NFP, PCE, GDP]   # = live's five, for parity
+
+  # --- W66: selector + friction model v2 ---
+  condor_any_direction: false          # 2026-10-10 operator decision: keep OFF. Research keeps the NEUTRAL-only
+                                       # selector because the neutral/bearish/bullish direction models are what
+                                       # is being improved next; revisit once they are.
+  friction_model: per_leg_usd          # fitted $/leg half-spread, entry AND exit (legacy % overcharged a $0.95-credit
+                                       # QQQ condor $0.669 vs ~$0.085 measured). Missing fit -> legacy + WARNING.
+  friction_entry_capture: 1.0          # share of the quoted half-spread paid per leg at entry (1.0 = full, conservative)
+  friction_exit_capture: 1.0           # ... and at exit; lower only from the fill-vs-model report
+  friction_stress_multiplier: 1.0      # scales the fitted model (calm-regime sample hedge)
+
+  # --- W67: gate parity + graded objective ---
+  gates_mode: enforce                  # 2026-10-10 operator decision: ML gates ON in RESEARCH (range floor + fractal veto
+                                       # block) so the models being improved actually matter in studies. Live stays
+                                       # ml.entry_gates_enabled=false (observe) — a DELIBERATE research-vs-live deviation
+                                       # that the run_backtest parity manifest will show. `observe` reproduces live today.
+  fractal_veto_spread: 0.0             # absolute hurst spread veto for neutral structures (0 = off = live today)
+  penalty_on_range_prob: 0.0           # fractal penalty also lowers P(in range) (0 = off = live today)
+  optimize_hard_min_trades: 3          # below this a trial scores on the graded floor (not a flat -100)
+  optimize_below_floor_gradient: 20.0  # -100 (0 trades) rising toward -80; 0 restores the flat -100
+
+  # --- W68: IV-rank parity (research up to date with live) ---
+  iv_rank_gate: true                   # live's two IV-RANK gates on credit entries: condor refuses rank < ic_iv_rank_floor
+                                       # (15, backtest.ic_iv_rank_floor) and the risk manager refuses rank > risk.iv_rank_cap
+                                       # (85); unmeasurable rank fails closed. Shared definition: ait.data.iv_rank.
+  iv_floor: 0.05                       # the schema minimum. The absolute-level floor (main: 0.20) was research's ONLY IV gate
+                                       # and also floored leg IVs when pricing: left at 0.20 it would price a 12%-IV SPY
+                                       # day at 20% (fat fake credits) now that the rank gate lets such days trade. Demoted
+                                       # to a pricing sanity floor; live has no level gate.
