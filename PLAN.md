@@ -15028,3 +15028,85 @@ risk); `smoke_deploy.py` **SMOKE PASS (13 checks)** including the dry-run tradin
 Operator: whether to also move the registered out-of-scope items above, and when to restart the supervisor + bot onto W69.
 
 ---
+
+## 2026-10-11 - W70: fixed limits made visible (invariants module), order-timeline durations configurable, one wing floor for live AND research, earnings-window parity, phantom-key guard
+
+Operator principle (recorded as a standing preference): **separate VISIBLE from TUNABLE.** Tunables live in `config.yaml` with bounds and the consequence stated next to them; values that are deliberately
+fixed live in ONE named module, are logged at start and documented in the RUNBOOK, and are never editable config (anything in `config.yaml` is tunable regardless of a comment; the file is shared via git
+and edited by people and AI sessions; a safety floor in the file it checks lets one edit loosen both). W70 is the follow-up to W69's "tunable live values". Invariant: **zero behavior change at today's
+config**, with the THREE deliberate exceptions flagged below.
+
+**CHANGED.**
+1. *Fixed limits made visible.* New `src/ait/config/invariants.py` (stdlib-only leaf; registry rows carry value / unit / what / why-fixed / where-enforced): `ORDER_RATE_LIMIT_MAX` 8 and `_WINDOW_S` 60
+   (executor entry + roll placement share one bucket), `NBBO_DISORDERLY_SPREAD_RATIO` 1.0 / `NBBO_STALE_SIGNAL_DEVIATION` 0.35 / `NBBO_MID_FLOOR` 0.05, `LIVE_MAX_SPREAD_PCT` 0.15 / `LIVE_MIN_VOLUME` 10
+   (GOV-5 startup assertion), `PDT_MAX_DAY_TRADES` 3 / `PDT_WINDOW_DAYS` 5, `BROKER_SNAPSHOT_TTL_SECONDS` 5.0, `IC_BUDGET_CAPPED_MIN_WING` 1.0. Use sites import them (`pdt_guard.MAX_DAY_TRADES` /
+   `WINDOW_DAYS` and `orchestrator._LIVE_*` stay as aliases: tests import them). Visible in five places: the module, the `fixed_limits_in_effect` startup event (beside `config_default_divergence`),
+   docs/RUNBOOK.md "Fixed limits", a comment-only FIXED LIMITS block at the top of `config.yaml` (not keys), and the live-profile assertion's error text. Drift tests keep RUNBOOK and yaml block equal to the module.
+2. *Order-lifecycle durations -> config* (were literals in `execution/executor.py`; defaults = the literals; each yaml key carries Floor / Ceiling / IMPACT): `exit.order_visibility_grace_seconds` 10 (5-60, below
+   the stop rest), `exit.foreign_exit_escalation_seconds` 300 (60-3600, >= the ordinary rest), `exit.zombie_exit_revert_seconds` 900 (120-7200 and **>= 2 x the longer rest**; the cancel needs as long to
+   resolve as the order was given to fill), `positions.partial_fill_cancel_seconds` 30 (5-300), `positions.absent_order_grace_seconds` 30 (10-120), `positions.entry_ladder_step_seconds` 45 (30-300; floor = the
+   30 s tick). Cross-field rules: stop rest <= ordinary rest; each entry duration below `entry_order_timeout_seconds`. The executor reads them through `_cfg_num` (only a real int/float is accepted:
+   `float(MagicMock())` is 1.0) with class-level defaults, so `settings=None`, a stub or a `__new__`-built instance behave exactly as before. `order_timeline_in_effect` logs every effective duration.
+3. *Telemetry (log only, cannot change behavior, never raises).* `order_ack_latency` (once per order, entry and exit: seconds between placement and the first non-PendingSubmit status from ib_insync's own
+   `Trade.log`, plus the age at which the tick first saw it) and `order_absent_judged`. Structured JSON, so it flows through the existing `shared_logs_publish` job to the shared-logs branch (the publisher
+   drops raw IBKR print lines, which is why a structured event is the vehicle).
+4. **LIVE ENTRY CONSTRUCTION (flagged; `strategies/iron_condor.py`, an ask-first file).** Live's minimum wing was a literal `max(2.0, ...)` while research read `backtest.wing_floor_dollars`, so W70 decision C
+   alone only aligned research TO a number live did not read. New env-contract key `AIT_IC_WING_FLOOR` (default 2.0; config home `backtest.wing_floor_dollars`, same pattern as `AIT_IC_WING_K`); the live
+   builder, the engine, `WalkForwardConfig`, the optimizer and `run_backtest --wing-floor` all call `contract_float("AIT_IC_WING_FLOOR")`: one key, one value, one code path. **Zero behavior change at the
+   shipped value (2.0).** Precedence: env/.env > config.yaml > 2.0 (a `.env` `AIT_IC_WING_FLOOR` would win for live and research alike; none is set today). The key's bounds tightened 0.5-50 -> 1.0-10 because it
+   now drives live; its description and yaml comment open with "LIVE ENTRIES AND RESEARCH" and state that the floor binds only when the per-trade budget does not (at the $5k account the budget carries
+   ~$2.78/wing; a budget-capped wing may shrink below the floor but never below the `$1` invariant). The research overlay cannot override it (the contract reads raw config.yaml), same as `wing_k`.
+5. *Research knobs.* `BacktestConfig` gains `slippage_pct` 0.01, `delta_short` 0.20, `delta_long` 0.30, `hurst_hard_veto_multiplier` 1.5, `pct_from_60d_high_threshold` -1.0 (-1.0 = off), `skew_factor` 1.0,
+   `context_bars` 0 (each description says "research only; live uses X"). The engine, `WalkForwardConfig` and the optimizer resolve their former literals from config (explicit arg > config > model default):
+   `max_hold_days`, `trailing_stop_pct`, `breakeven_trigger_pct` (exit section), the hurst/fractal knobs, `iv_rank_rise_threshold`, `min_edge_over_baseline`, `max_entry_vol_annual`, `delta_iv_scale`,
+   `friction_*`, `penalty_on_range_prob`, and **`backtest.spread_*`, which were read by NOTHING before** (the engine and the walk-forward each carried their own 0.03/0.10/0.005/0.15; same class as
+   W69's `dashboard.port`). At today's config every resolved instance value is identical (snapshot diff of `Backtester()` 78 attrs and `WalkForwardConfig()` 73 attrs: no changes).
+6. *Phantom-key guard.* A test fails on any config field nothing reads, with a registered EXEMPT dict (each entry has its reason and the dict self-checks for rot) and a STRICT section-qualified rule
+   for the `spread_*` names that once hid behind a WalkForwardConfig attribute of the same name.
+
+**DELIBERATE BEHAVIOR CHANGES (3; none touches live at today's config).**
+- *Earnings window orientation (research).* The engine blocked `[earnings-1, earnings+2]` (`range(-1, skip_days+1)` around the date); live's `EarningsCalendar` blocks `[earnings-2, earnings+1]`
+  (`-buffer_after <= days_until <= buffer_before`). The engine now reads `earnings.buffer_days_before/after` (2 / 1, the live keys); `earnings_skip_days` is removed (nothing in `src/` passed it). Both 0 = off.
+  Probably a no-op for SPY/QQQ/IWM (index ETFs have no earnings dates; not verified offline); matters again when single names return.
+- *`backtest.wing_floor_dollars` 5.0 -> 2.0 (research only).* Walk-forward, run_backtest and the engine already used 2.0 (R6 parity); but ~15 study scripts read `bc.wing_floor_dollars` and
+  `StrategyOptimizer` / `run_optimizer` defaulted to 5.0, so those move to 2.0 (live parity). Past ablation / shadow / study results used 5.0 and are not directly comparable to reruns. (My first statement
+  that nothing but research code read this key was right about live and wrong that "no behavior changes": corrected here and confirmed by the operator before implementation.)
+- *Live entry construction now reads the key* (item 4): no change at 2.0, but the SOURCE of the number changed and editing the key now moves live entries.
+
+**DELIBERATELY LEFT IN CODE (and why).** Order-rate backstop, NBBO gates, live-profile floors, PDT, snapshot TTL, `$1` budget-capped wing (above: backstops / regulatory / checked-against lines / physical limit);
+`FAST_MONITOR_CADENCE_SECONDS` stays single-sourced in `utils/cadence.py` (the RUNBOOK references it). Engine `stop_loss_pct` 0.50 / `profit_target_pct` 1.00 vs config's 0.35 / 0.50,
+`max_concurrent_positions` 1 vs 3, `position_size_pct`, `initial_capital` 10k vs 5k stay explicit harness defaults (decision D: R20b pre-registered; the operator will revisit whether the bare harness should
+follow config). `WalkForwardConfig.hurst_hard_veto_multiplier` stays 0.0 (disabled) while a bare engine resolves 1.5 from the new key.
+
+**REGISTERED, NOT FIXED.** (a) The four phantom keys, each a separate decision: `trading.trading_hours_only` (RTH is enforced unconditionally; the real override is env `AIT_ALLOW_AFTER_HOURS`),
+`options.delta_range` (long-option feature; live is IC-only), `meta_label.retrain_with_primary` (live trainer has no meta retrain; gate off), `exit.auto_hedge` (no hedging code exists; `docs/AUDIT_R12.md`'s
+"one flip from live" is false). (b) Research and live still differ in wing FORMULA (`wing_k x expected_move` vs `wing_k x price x IV x sqrt(DTE/365)`) and the research budget relaxation rounds; only the
+floor is single-sourced. (c) Live IC short delta is a literal ~0.20 in `strategies/iron_condor.py` (env-contract change, own wave). (d) IBKR port fallback 7497 (settings) vs 4002 (gateway/master).
+(e) `adaptor.py:382` `9 <= hour <= 16`. (f) `.bat` launchers hardcode `C:\Users\prith\...`. (g) `executions.exec_time` is skewed by exactly the host's UTC offset (IB Execution.time 15:54:15 UTC vs the bot's
+own 17:54:16 UTC fill observation, 2026-09-28): unusable for latency, W20/W21 class. (h) Prithvi's shared-logs branch ends 2026-10-01 and `AIT_LOG_OWNER` is unset on this box (publishing is a push to a
+shared repo: operator's call).
+
+(i) *Intermittent test, pre-existing fragility, not changed:* `tests/test_w31_sizing_selftest.py::TestTheProbeChainIsFitToMeasureWith::test_every_contract_survives_the_liquidity_filter` failed ~8 of ~26 runs of the pinned risk-test set during one window and 0 of 24 in a later one (12 on a clean W69 checkout, 12 on W70). Mechanism, traced: `options_chain._liquidity_thresholds` is a process-wide `lru_cache` filled by whichever test first touches it; in the failing runs `test_w25_sizing_coherence::test_it_alerts_at_the_documented_2100_recipe` did not fill it, so a later test running in a temp cwd (`test_hot_path_smoke`, `test_observe_mode_neutral_confidence`) filled it with the last-resort defaults (50 / 100 / 0.15) because `load_settings()` found no config.yaml there. A 12-day-old `scripts/backfill_option_history.py` (still writing `data/historical.db`) was competing during the flaky window. No W70 file is involved and the full lane passed; a `cache_clear()` fixture in the affected test files would remove it. Registered, not fixed.
+
+**MEASURED EVIDENCE AND ITS LIMITS (why the grace floors are margins, not measurements).** One entry order (QQQ 2026-09-28) was acknowledged by IBKR within 0.6-0.97 s of placeOrder; two more (QQQ, SPY on
+Prithvi's box) filled in 11.4 s and 14.4 s via the event-driven path (their acknowledgement is not observable: the publisher drops raw lines). 6,735 intra-session tick gaps: median 30.9 s, 78% within
+29-31 s, 98.3% under 35 s, p99 38.4 s, worst 100 s. No exit order and no mid-session disconnect exist in the retained logs (all 15 disconnect events are nightly/weekend gateway restarts). So 5 s / 10 s
+are engineering margins labelled as such in the yaml; `order_ack_latency` collects the real distribution, including exits, pooled across both boxes.
+
+**TESTS.** `tests/test_w70_fixed_limits_and_timeline.py` (65) and `tests/test_w70_wing_floor_and_research_parity.py` (28): parity (every default == the former literal, yaml carries it, key present),
+validators (floors, cross-field, the startup message names the fix), the real executor paths driven through config (zombie, foreign page, visibility grace, partial-fill cancel, absent grace, ladder step),
+MagicMock/stub/`__new__` executors keep the old values, telemetry emits once and never raises, live builder + engine + walk-forward + optimizer + CLI follow `AIT_IC_WING_FLOOR` (env beats config; explicit
+arg beats both), AST class guards (no wing/NBBO/rate-limit literal, no literal `MAX_DAY_TRADES`), earnings window orientation against live's rule, spread keys read section-qualified, phantom-key guard,
+RUNBOOK / yaml / floor-comment drift. **Mutation-checked: 39 mutants, all caught, files restored byte-for-byte.** Equivalence proofs: AST comparison of `executor.py` / `pdt_guard.py` /
+`orchestrator.py` with invariant names substituted back to literals => 0 functions differ (and the proof tool detects a changed value); after P2 only `__init__`, `_determine_fill_status`, `check_fills`,
+`_reprice_pending_entries` and two new helpers differ, and `check_fills` / `_reprice_pending_entries` are IDENTICAL to HEAD once the new attributes are replaced by their default literals. Before/after on
+the 72 files that construct a bare `Backtester` or touch executor / PDT: **3530 passed / 3 skipped both**. Gates: `compileall` OK; full fast lane **5271 passed / 45 skipped / 0 failed** (16m17s; W69's lane was 5116 / 46, i.e. +155 passed of which 154 are the new W69 + W70 tests); `typecheck.py` OK (it caught one real error in my telemetry helper, `object` has no `.age_seconds` because mypy joined the two pending dicts; fixed with an annotation, after which the executor / PDT / W69 / W70 sets were re-run: 1004 passed); `smoke_deploy.py` **SMOKE PASS (13 checks)** twice (before and after that fix); Friday-15:00-ET pin over every RiskManager test: 332 passed.
+
+**DEPLOY / ROLLBACK.** Bot restart needed (executor, settings, live builder); `master.py` is not touched in W70 but W69 already needs the full supervisor restart. New `config.yaml` keys and the changed
+`wing_floor_dollars` bounds are rejected by pre-W70 code (`extra="forbid"`), so roll back `config.yaml` WITH the code (both waves are local commits on `W64-risk-retune`; nothing is pushed). Not restarted.
+
+**NEXT.** The W69 entry's NEXT named the feature-engine `iv_rank` vs stored-IV rank verification (then the construction study) as the W70 candidate; W70 was assigned to this work, so that candidate
+**becomes W71**. Operator: (1) decide each phantom key; (2) whether the bare research harness should follow config for stop/target/capital/concurrency; (3) publish `ahmed_logs` and ask Prithvi to publish
+newer days so exit-order acknowledgement data exists; (4) restart timing for supervisor + bot onto W69 + W70.
+
+---
