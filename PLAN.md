@@ -14839,3 +14839,37 @@ construction study (wing width / contracts / DTE at the real friction) since gat
 proposed until the construction question is settled.
 
 ---
+
+## 2026-10-10 - W67 CLARIFICATION: what `condor_any_direction`, the IV floors, "friction" and the entry-gate flip criterion actually mean (corrects two statements in the W66/W67 entries)
+
+Written at the operator's request after a review of the W66/W67 work; no code or config changed. Two statements in the entries above were wrong or loose and are corrected here (the entries
+themselves are left as written, per the append-only rule).
+
+**CORRECTIONS.**
+1. *IV floor value.* The W65-W67 entries describe research's IV floor as "level 0.15". The configured value is **0.20** (`config.yaml backtest.iv_floor`). Live's value is the rank floor **15**
+   (`backtest.ic_iv_rank_floor` = `AIT_IRON_CONDOR_IV_FLOOR`).
+2. *"Pre-registered flip criterion NOT met" (W67 REGISTERED item 2).* Imprecise: see item 4 below. The accurate statement is that the observe-vs-enforce comparison run in W67 (n = 16 vs 23 trades, 2024-26)
+   was **not a test of the registered criterion at all**, so nothing was "met" or "not met"; it only showed no visible benefit at that n.
+
+**1. `backtest.condor_any_direction` (default false).** It controls which days the research engine may pick an iron condor. False (legacy): the engine labels each day bullish / bearish / neutral and picks
+a condor only on NEUTRAL days (~81% of days were blocked as `no_strategy`). True: a condor is allowed on any day. Live's condor builder ignores direction, so `true` is the setting that matches live; it raised the
+gate-study sample from 51 to 436 condors. Implemented in `Backtester._select_strategy`; engine bare default and config default are both false so no earlier result moved.
+
+**2. The two IV floors are different gates, not a units mix-up and not a bug in either number.** Live (`iron_condor.py`): `iv_rank < 15`, where iv_rank is a 0-100 rank of current IV against its own recent
+history. Research (`engine.py _build_position`): `iv < 0.20`, an absolute annualized volatility level written as a decimal. The engine never applies an IV-RANK floor (nothing in `backtesting/` reads
+`ic_iv_rank_floor`; the "iv_rank_floor 15" row in the parity manifest is displayed but not enforced). So this is a genuine research-vs-live PARITY GAP: a quiet-volatility day can pass one test and fail the
+other. Closing it means computing an IV rank in research and applying the live floor; it is registered, not fixed, and is the largest `builder:iv_floor` blocker (SPY 105 days in the W67 observe run).
+
+**3. "Friction"** (used throughout W65-W67) = the cost of crossing the option bid/ask spread: sell below the mid, buy above it. An iron condor has 4 legs, each paying about half the quoted spread at entry and
+again at exit. It is separate from commissions. The legacy research model charged a percentage of each leg's price (QQQ condor: $0.669/share at entry vs a measured real fill of ~$0.085); friction model v2 charges
+the fitted dollar half-spread per leg from IB bid/ask bars (about $0.10-0.16/share per entry on QQQ), symmetrically at entry and exit.
+
+**4. The `ml.entry_gates_enabled` history and what "flip criterion" refers to.** (a) 2026-08: Rule B1 (registered): turn the ML gates ON if, over ~11 years, gated profit factor beats ungated by > 0.10, drawdown is
+no worse, with >= 30 trades and >= 20 trained windows. It WAS met on 2026-08-08 (PF +0.22, DD 9.97% vs 34.57%, n = 92) and the gates were turned on. (b) 2026-09-01: operator decision to run in OBSERVE mode
+(`entry_gates_enabled: false`): the range model had near-coin-flip skill on SPY/QQQ (CV AUC ~0.545) and its fail-closed gate blocked every entry (16 candidates, 0 orders) while the project needs 50 condor closes;
+the registered follow-up is a live comparison of closes with p_in_range above vs below 0.65 once enough closes exist. (c) W67's observe-vs-enforce research comparison (16 vs 23 trades) can neither meet nor fail
+B1's n >= 30 bar, and it covers a different era / selector / friction model than B1's 11-year run, so the two results do not conflict and neither settles the question. No change to the flag is proposed.
+
+**NEXT.** Unchanged from the W67 entry: operator decisions on the construction question, `condor_any_direction`, and the IV level-vs-rank parity gap, before any further study.
+
+---
