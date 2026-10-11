@@ -15142,3 +15142,77 @@ publish job is still a silent no-op on a box without it); publishing `ahmed_logs
 `ahmed_logs`, and supervisor + bot restart timing.
 
 ---
+
+## 2026-10-11 - Short-DTE parity assessment (pre-W72): findings, operator decisions, programme W72-W80
+
+No code change. Records the operator's direction, the decisions taken, and what a code-read of the research engine, the live builder/exit path and the optimizer found, so the programme that follows has a
+ledger origin. Working brief (local, git-ignored): `Plans4agent_next_session/W72-W80_short_dte_parity_programme.md`; it carries the wave status table and is edited as waves land.
+
+**OPERATOR DIRECTION.** Entry DTE anywhere in 0-45 and max hold anywhere in 0..DTE, for live AND research; Optuna walk-forward finds the optimal parameters (entry DTE, strike distance, wing width, hold),
+then paper, then live; the research engine must match the live engine as closely as possible. `options.dte_range` moves from [14, 30] to [0, 45] only AFTER the studies, as the operator's own edit.
+
+**OPERATOR DECISIONS (2026-10-11).** (1) Live wiring later: new DTE/exit rules are written once as shared pure functions and research uses them now; genuine live bugs found on the way are fixed now (W73).
+(2) Rule 3/3a (close at DTE <= 5 / DTE <= 1) becomes a guard for long-dated entries only, with a configurable threshold that Optuna searches over 0-5. (3) No historical option NBBO is assumed (Polygon
+aggregates only / not sure). (4) The operator's manual-trade statement is persisted only under the git-ignored `data/replay/`; nothing from it is kept in Claude memory or in this ledger.
+
+**FINDINGS (code-read lens; each carries file:line in the brief; a lead becomes a finding only after an execution probe).**
+1. Research prices every IC leg with Black-Scholes (`engine.py:2118-2125`, re-mark `:2606-2616`): one constant-maturity IB IV per day (`_get_iv`, `:1735-1790`), a skew with no DTE term (`_get_leg_iv`,
+   `:1685-1720`), `r = 0.05` hardcoded; the hold re-mark uses `0.7*entry_iv + 0.3*1.15*rv20` and ignores the stored daily IV. The `option_daily_bars` table (QQQ, ~887k rows) is read by NOTHING in the
+   engine or walk-forward (only the loader and backfill scripts reference it).
+2. Friction v2 was fitted on 18 sessions of IB bid/ask bars at DTE 11-64 (sampler mask `relevant_mask` = DTE 7-45, mid >= 0.03); there is no sample below 6 DTE, so 0-6 DTE friction is extrapolation.
+3. No settlement model: no assignment, pin or 16:00 settlement price; `expiry_date = entry + N calendar days` can fall on a weekend/holiday (`:2217`); on expiry day `t` is floored at 0.0001 y from 09:30.
+4. DTE cannot be searched: `entry_dte` is one instance value (`engine.py:524-525`) used by every reprice (`:2606`, `:2630`), absent from the optimizer's `bt_kwargs`, and refused together with
+   `optimize_per_window` (`walkforward.py:244-253`); `max_hold_days` spaces (1-9 / 5-14) assume a 14-DTE entry (`param_spaces.py`, with `test_r21b_pr7_review_round` pinning it).
+5. Short DTE cannot occur: DTE 0 gives `expected_move = 0` and every build is rejected `builder:em_unavailable` (research `:2085`, live `iron_condor.py:280-283`); DTE 1-5 entries are force-closed by rule 3a on
+   the next bar (`engine.py:2956`, `portfolio.py:879`); exits run before entries each day, so a same-day round trip is impossible.
+6. One range-model horizon, `max(1, dte_range[0] - 5)`, serves every trial (`range_spec.py:66`, `walkforward.py:2621-2623`), and ignores `WalkForwardConfig.entry_dte`.
+7. `build_parity_manifest` (`run_backtest.py:96`) compares parameters only; no surface measures prices, fills or exit decisions against reality.
+
+**LIVE RULES THAT ASSUME DTE >= 14 OR BREAK AT 0-5 (registered; W73 fixes the genuine bugs, W80 the rest).** Entry side: `dte_range` validator forbids 0 (`settings.py:499-504`, locked by
+`test_config.py:100`); live fetches only the 3 nearest expiries on the IBKR path (`options_chain.py:761`) while the Yahoo path is uncapped; `min_dte or ...` treats 0 as missing (`:599`) and
+`get_chain_for_expiry` mis-windows a 1-DTE expiry (`:671`); a 0-DTE expected move is 0 (`:422-423`) while the wing formula floors DTE at 1 (`iron_condor.py:148`); greeks/IV-solve use whole days with
+`t >= 0.001` (`:1088`); the 0.70 credit and 0.10 credit/width floors were calibrated on 14-30 DTE. Exit side: rules 3/3a (`portfolio.py:828-881`); TP ladder keyed on REMAINING DTE
+(`exit_policy.py:39-44`); PDT veto on same-day exits (`portfolio.py:1100`); no expiry-day flatten and monitoring stops at the 16:00/13:00 phase change (`scheduler.py:80`). Settings and
+rationale: range horizon; daily-IV persistence takes the median ATM IV across scanned chains so `iv_rank` changes meaning with 0-2 DTE chains (`orchestrator.py:5926-5933`);
+`roll_target_dte_min/max` 14/30; condor-defense DTE bands 14-21/>=22; `sizing_probe.dte` 21; `backtest.max_hold_days ge=1`; optimizer `max_hold_days` and `wing_k` inert-check; `pre_event_blackout_days`
+rationale. Reconcile: the "expired" test uses the naive host date (`reconciler.py:495`, W20/W21/W23 bug class). Data: friction sample DTE 7-45 only.
+
+**LEADS (NOT findings until probed in W72; each needs both lenses).** L1 `delta_short` is searched per trial but is not a `WalkForwardConfig` field, so the OOS run uses config 0.20
+(`optimizer.py:660-663`, `walkforward.py:2074-2079`, `:1630-1711`). L2 entry is recorded at an intraday fill time but priced at the daily close and features/gates see the full daily bar
+(`engine.py:1161-1202`, `:1899`, `:721`). L3 take-profit `pnl_pct` is computed before friction on the daily path (`:2760-2781`) and after it on the intraday path (`:1503-1506`). L4 the intraday exit
+scan has no touch-stop check (`:1479-1523`; touch only at `:2890`), so a later take-profit beats an earlier touch. L5 research invalidates condor entries on direction-model confidence >= 0.80
+(`:2698-2746`); live exempts condors. L6 IC long legs are priced at unrounded strikes at entry but re-marked at rounded strikes (`:2114-2125` vs `:2203-2204`).
+
+**MEASURED.** Option-bar backfill (`scripts/backfill_option_history.py`, QQQ, Polygon): 87,019 of 151,282 contracts done, 887,360 rows, expiries 2024-09-30 to ~2025-12-29 covered so far, last update
+2026-10-11 23:17 ET; ~887k rows still carry the 0.05 placeholder rate (the SOFR re-solve has not run); IV outcome: 830,977 solved / 56,267 failed_arbitrage, with ~25% of near-money 0-DTE rows failing to
+solve. Friction samples: `option_spread_samples` has nothing below 3 DTE (one date at 3-5 DTE) and the intraday-bar samples nothing below 6 DTE. Bot ledger on this box: 22 trade rows (11 cancelled, 1
+filled condor, 10 'closed' dated 2026-04-23/24, at least four of which (SPY condors) have an empty exit_reason, exit_price 0.0 and realized P&L equal to the full credit, i.e. bookkeeping-like rather than
+real closes; classified in W72 with `go_live.is_real_close`).
+
+**MANUAL-TRADE ASSESSMENT (qualitative only).** The operator's manual QQQ paper trades (2026-08-17 to 2026-10-09) were separated from the bot's by the ledger signature: bot fills carry a `trade_id` and a
+real order id, non-bot fills have `trade_id = ''`; the bot filled exactly one trade in the window. Conclusions: the short-DTE trades were almost all held to expiry rather than closed early; the losing
+episodes were two pin/assignment cases in which an ITM short call with an OTM long wing left unhedged shares across a session gap, and the realized loss exceeded the structure's DEFINED maximum; the sample
+is far too small to establish an edge in any DTE band. This motivates W76 (friction at 0-6 DTE) and W77 (settlement/assignment/gap). No per-trade prices, P&L or account identifiers are recorded here.
+
+**CORRECTION (owed since W70).** The W70 entry's wording that the live and research wing "formula differs" is wrong: the formula is the same, `max(floor, k * price * iv * sqrt(DTE/365))`; the INPUTS
+differ (research: fixed `entry_dte`, daily IV, rounded budget cap, whole-dollar strikes; live: chain DTE, short-leg IV, snap to listed strikes). W70's code and tests are unaffected.
+
+**ASSUMPTIONS (explicit; operator may correct any).** A1 no historical NBBO, so 0-6 DTE friction is collected forward from IB hourly bid/ask bars (needs TWS/Gateway, 15+ sessions, operator-run). A2 the
+expiry-day flatten cutoff defaults to 60 minutes before the close (searched 30-120; relative to the early close on half-days). A3 no look-ahead: a decision at time T on day D uses day D-1's end-of-day IV
+surface (sticky-moneyness) at the current spot, never day D's bars. A4 listed expiries from the bars for QQQ; SPY/IWM use a rule calendar, flagged until bars exist. A5 settlement: long options ITM by $0.01
+or more auto-exercise; a short within a $0.10 pin band takes the worse of assigned/not; delivered shares are marked at the next session's open. A6 default parity tolerance per DTE band: median
+|entry-credit error| <= 15% of credit AND |median bias| <= 10% (config, operator-owned). A7 range models use horizon buckets {1,2,3,5,7,10,14,21,30} trading days, trained lazily and cached per window.
+A8 short-DTE studies are QQQ-only until SPY/IWM bars exist. A9 time to expiry is calendar time with an intraday fraction to 16:00 ET on the expiry date (no trading-time weighting; the replay measures
+the error). A10 the fixes change research baselines; each wave records before/after on one reference study rather than claiming zero change. A11 manual trades after the backfill window need a Polygon
+top-up (operator-started) before they can be compared to bars. A12 the other box's published events are used for decision parity only if they carry strikes, credit, spot and IV (W72 checks).
+
+**PROGRAMME.** W72 parity replay v1 + lead probes (read-only vs live stores) -> check-in; W73 live bug fixes (reconciler date, `min_dte or`, 1-DTE window); W74 research engine per-position expiry, real
+clock, exit semantics; W75 real-bar IV-surface pricer (default off until validated); W76 friction at 0-6 DTE; W77 settlement/assignment/gap; W78 range gate per horizon; W79 Optuna searches DTE.
+W80 (live wiring) is listed but NOT authorized; it needs a separate decision after the studies. Nothing is pushed; no restart is made by any of these waves. W71 (iv_rank verification) stays reserved.
+
+**PRIVACY RULE (this programme).** PLAN.md is shared through git with the other box: no per-trade prices/P&L from the operator's statement and no account identifier may appear in any entry; replay
+results are reported as error statistics by DTE band only.
+
+**NEXT.** W72. Working brief: `Plans4agent_next_session/W72-W80_short_dte_parity_programme.md` (first unchecked wave = W72).
+
+---
