@@ -15110,3 +15110,35 @@ the 72 files that construct a bare `Backtester` or touch executor / PDT: **3530 
 newer days so exit-order acknowledgement data exists; (4) restart timing for supervisor + bot onto W69 + W70.
 
 ---
+
+## 2026-10-11 - W70 FOLLOW-UP: scheduled fetch of the shared-logs branch (16:50 ET)
+
+Operator request: make reading the OTHER box's published logs a scheduled job, 5 minutes after this box's 16:45 publish. Before this, reading was manual only (`scripts/read_shared_logs.py` fetches
+itself on every invocation) and nothing refreshed `origin/shared-logs` in the live checkout; the practical consequence was that Prithvi's branch had stopped at 2026-10-01 and nobody noticed until a hand fetch.
+
+**CHANGED.**
+1. `ait.orchestration.shared_logs.fetch_shared_branch(repo) -> FetchResult`: runs `git fetch --quiet origin shared-logs` (`GIT_TERMINAL_PROMPT=0` so a headless supervisor cannot block on a credential
+   prompt; `timeout=GIT_TIMEOUT_S`) and reports `advanced`, `new_commits`, `head` and `latest_by_owner` (the newest published `YYYY-MM-DD` per owner, parsed from `git ls-tree -r origin/shared-logs`).
+   **A fetch only**: it updates `origin/shared-logs`/FETCH_HEAD and nothing else (no checkout, merge, worktree or local branch; a test asserts HEAD, branch, status, branch list and the absence of a
+   sibling worktree are unchanged). Never raises: no remote / no branch yet / timeout / git missing return `ok=False` with the error.
+2. `master.fetch_shared_logs()` supervisor job, registered at `CronTrigger(day_of_week="mon-fri", hour=16, minute=50, timezone=ET)`, id `shared_logs_fetch`, directly after `shared_logs_publish`
+   (16:45). **Not gated on `AIT_LOG_OWNER`**: reading a peer's logs does not require publishing your own. Logs `shared_logs_fetched` (INFO: head, advanced, new_commits, latest_by_owner) or
+   `shared_logs_fetch_failed` (WARNING). No Telegram alert: a stalled peer is information, not a page; the stale date in `latest_by_owner` is the signal.
+3. docs/RUNBOOK.md "Daily 2-minute routine" item 4: how to read the peer's days, and that publishing your own needs `AIT_LOG_OWNER` in `.env`.
+
+**TESTS.** `tests/test_shared_logs.py` +11 (real git against a throwaway bare origin and two/three clones): the fetch refreshes `origin/shared-logs` and reports per-owner newest days (including a
+second publish and a no-op refetch), the live tree is untouched, no-branch / no-remote / missing-git / timeout never raise, it runs `fetch` (never pull/merge/checkout) with prompts disabled and the
+timeout; the job runs with no owner set, logs the right events, swallows failures, and is scheduled at 16:50 ET exactly 300 s after the publish. `tests/test_w23_scheduler_timezone.py`: CronTrigger
+count 10 -> 11 and the job-id set gains `shared_logs_fetch` (its ET-pinning scan covers the new trigger). **Mutation-checked: 10 mutants, all caught** (pull instead of fetch, prompts allowed, fetch can
+raise, oldest day reported, always-advanced, wrong minute, host zone instead of ET, gated on owner, job lets exceptions escape, failure logged as INFO). Gates: `compileall` OK; full fast lane **5281 passed / 46 skipped / 0 failed** (17m07s; the W70 lane was 5271 / 45, i.e. +11 new tests; the skipped count has alternated 46 / 45 / 46 across the last three lanes with no change in that area, not examined); `typecheck.py` OK; `smoke_deploy.py` SMOKE PASS (13 checks).
+
+**NOT DONE / OUT OF SCOPE.** Alerting on a stale peer (the data is in the log line; an alert is a separate decision); fetching code branches; setting `AIT_LOG_OWNER` in `.env` (operator's file; the
+publish job is still a silent no-op on a box without it); publishing `ahmed_logs`.
+
+**DEPLOY.** `master.py` changed: a **full supervisor restart** is needed for the new job to register (W69 and W70 already require one; this rides along). Not restarted by this change. Rollback is a clean
+`git revert` of the commit (no config keys added).
+
+**NEXT.** Unchanged from the W70 entry: the feature-engine `iv_rank` verification is W71; operator decisions on the four phantom keys, whether the bare research harness should follow config, publishing
+`ahmed_logs`, and supervisor + bot restart timing.
+
+---
