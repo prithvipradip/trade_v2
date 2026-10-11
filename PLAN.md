@@ -15216,3 +15216,76 @@ results are reported as error statistics by DTE band only.
 **NEXT.** W72. Working brief: `Plans4agent_next_session/W72-W80_short_dte_parity_programme.md` (first unchecked wave = W72).
 
 ---
+
+## 2026-10-11 - W72: parity replay v1 (research vs reality, read-only) + lead probes L1-L6
+
+First wave of the short-DTE parity programme (assessment entry above; working brief `Plans4agent_next_session/W72-W80_short_dte_parity_programme.md`). Goal: MEASURE where the research engine
+disagrees with reality before changing it. No live-path file is touched; research results do not move (equivalence proven below). **No per-trade prices, P&L or account identifiers are recorded here
+(privacy rule); every number below is a statistic by DTE band.**
+
+**CHANGED.**
+1. `ait.backtesting.pricing`: new pure `skewed_leg_iv(...)` and `ic_leg_marks(...)`. `Backtester._get_leg_iv`, the iron-condor entry build (`_build_credit_position`) and the daily re-mark
+   (`_reprice_ic_legs`) now delegate to them, so the engine, its re-mark and the replay share ONE implementation of condor leg pricing (the single-owner rule). **Zero behaviour change**: a deterministic
+   reference run (6 configurations incl. DTE 18/21/30, skew off/steep, budget-aware wings; 198 trades; every trade dict, funnel and P&L) is IDENTICAL before and after, and the checker is shown to
+   detect a deliberate 10% skew-constant mutation.
+2. `ait.backtesting.replay` (new, pure + read-only sqlite adapter): `load_trades`, `ResearchData`, `entry_replay`, `exit_replay`, `engine_exit_scan`, `implied_vol_from_price`, `summarise_bands`.
+   Two model variants are always reported so error decomposes: `engine` (what the engine does: daily close, same-day stored IV, whole days) and `clean` (knowable at the fill: 5-minute bar mid,
+   previous-session IV, fractional time to the 16:00 ET close). Sign: error = model - actual (positive = research richer). The exit scan calls the engine's REAL `_check_exit` on a position built
+   from the actual strikes and credit; nothing is re-implemented.
+3. `scripts/parity_replay.py` (CLI) and `ParityConfig` (`parity:` block, research overlay: `credit_error_pct_max` 0.15, `credit_bias_pct_max` 0.10, `min_trades_per_band` 3,
+   `dte_band_upper_edges` [2,7,14,45]); a band with fewer trades than the minimum is INSUFFICIENT, never PASS.
+4. docs/RUNBOOK.md: "Research-vs-reality parity replay".
+
+**MEASURED (13 verdict-eligible QQQ structures: 11 iron condors + 2 verticals, 2026-08-17..2026-10-09, paper account; one symbol, one two-month tape).**
+- Entry-credit parity (median |error| / signed median, relative to the actual credit): **0-2 DTE (n=4)** engine 45% / -42%, clean 23% / -10% -> FAIL both; **3-7 DTE (n=5)** engine 26% / +26%,
+  clean 23% / +23% -> FAIL both; 8-14 (n=2) and 15-45 (n=2) INSUFFICIENT. No band with enough trades is inside the 15% / 10% tolerance.
+- **The error changes sign with DTE.** Research is too RICH at 3-45 DTE (model leg IV 2-4 vol points above the market's on both wings; leg-level modelled fill minus actual fill grows with distance
+  from the money, median +$0.12/share inside 1% OTM to +$0.86 beyond 4%) and too CHEAP at 0-2 DTE (market IV 1-5 vol points above the model's). Consistent with one constant-maturity IV and a DTE-free
+  skew; on the call side the engine ADDS IV for OTM calls while the market priced them below the stored IV at 3-14 DTE.
+- **Look-ahead (L2) is material at short DTE**: using only what was knowable at the fill cuts the 0-2 DTE median error from 45% to 23%.
+- Friction: modelled per-leg friction for the bot's one filled condor 0.111/share vs realized |live_mid - fill| 0.085/share (n=1; not a calibration).
+- Exit decision parity (engine's own `_check_exit` vs what happened, 11 condors, 2 of them still open): the engine fires on the actual last-close date in 2; it would have exited EARLIER in 7
+  (touch stop 5, DTE<=5 rule 1, take-profit 1); the 2 open condors have no engine exit in the available data. This is a POLICY difference (the operator mostly held to expiry), not a pricing
+  error, but it means engine P&L is not comparable to those trades' P&L.
+- Exit value parity: n=1-2 same-instant trader closes; too thin to conclude.
+- Data caveat: `research_daily_prices` ends 2026-10-08, so the expiry-day scan of the last trade is truncated.
+
+**LEAD PROBES (execution lens; each asserted the DEFECT CLAIM against the real engine / walk-forward, so a pass = CONFIRMED). All six CONFIRMED.**
+- **L1** per-window `delta_short`: the optimizer trial scores a searched delta; `WalkForwardConfig` has no such field, the merge `if param_name in cfg_dict` drops it, and the OOS `Backtester(...)`
+  receives no `delta_short` (only `delta_iv_scale`), so OOS runs the config 0.20. Train/OOS break (same class as R20 #2). Fix: W79.
+- **L2** entry look-ahead: a fill at 10:30 ET at the day's open (limit 102.18 on the probe market) is booked with `underlying_at_entry` = the daily CLOSE (106.18), and features/gates see the full daily
+  bar. Fix: W74.
+- **L3** TP `pnl_pct` is pre-friction on the daily path and post-friction on the intraday path: the same price state triggers `take_profit_short` daily and nothing intraday. Fix: W74.
+- **L4** the intraday exit scan never evaluates the touch stop (no `row`), and runs before the daily check, so a take-profit bar later in the day (16:10 in the probe) beats an earlier pierce of the
+  short strike that the daily path books as `touch_stop`. Fix: W74.
+- **L5** engine invalidates a NEUTRAL condor when the direction model is >= 0.80 confident (`thesis_invalidated:bullish@0.90`); live's `_check_thesis_valid` returns (False, "") for condors
+  (R16 exemption). Fix: W74.
+- **L6** the entry prices UNROUNDED long strikes, then stores and re-marks ROUNDED ones: the day-0 re-mark of a fresh condor differs from its entry mid credit (probe: -0.013/share, 1.2% of a
+  $1.10 credit), a deterministic mark-to-model jump. Fix: W74.
+Probes preserved (local) at `Plans4agent_next_session/W72_lead_probes.py` to become W74/W79 regression tests.
+
+**TESTS.** `tests/test_w72_parity_replay.py`: 81 (synthetic fixtures only; CI never reads `data/replay`). Covers bit-exact equivalence of `skewed_leg_iv`/`ic_leg_marks` to the historical formulas, engine
+delegation + an AST guard that the condor legs have one pricing owner, loader/schema, read-only adapter (no write, no phantom file on a missing DB, wrong prefix fails loudly, bar-boundary and gap
+behaviour), implied-vol round trip and unreachable prices, entry replay (zero error when actual = model, sign convention, friction side/legs, variant inputs), exit value and calendar suppression, the
+engine exit scan (touch day, first check the session AFTER entry, expiry rule, no DB writes, env flag restored), verdict logic incl. "a consistent bias fails even when the spread passes", band
+edges, `ParityConfig` validation and overlay, and the privacy guard (the CLI refuses to write per-trade outputs into tracked paths, executed, not read). **Mutation-checked: 26 mutants, all
+caught, files restored byte-for-byte** (a first pass caught 23 and exposed three real gaps: the 16:00 expiry close, the exact 5-minute bar boundary, and the first-exit-check-after-entry rule; each
+now has a test). Gates: `compileall` OK; full fast lane **5363 passed / 45 skipped / 0 failed** (15m09s; the previous lane was 5281 / 46, i.e. +82 passed: the 81 new tests plus the alternating skip count); `typecheck.py` OK (blocking); `smoke_deploy.py` SMOKE PASS (13 checks); the existing parity guards (R20 shared exit policy, W70 wing floor / phantom-key, W68 overlay, W67 gate) all inside that lane.
+
+**DEVIATIONS FROM THE PLAN.** (a) Outputs go under `data/replay/out/<YYYYMMDD>/`, not `reports/parity_replay/`: `reports/` is NOT git-ignored, so per-trade prices written there could be committed
+and shared with the other box. (b) The exit scan covers condors only (verticals and calendars are priced and reported but not scanned). (c) `engine`-variant exit values are suppressed for
+multi-expiry structures (the engine prices all legs at one expiry).
+
+**REGISTERED, NOT FIXED.** (1) `t_clean` assumes a 16:00 ET expiry close; early-close expiries (13:00) are not modelled (W74 owns the real clock). (2) `r = 0.05` is hardcoded in the engine and
+mirrored by the replay; the SOFR table exists but is unread (W75). (3) Exit-value parity has n <= 2. (4) From exploration, NOT re-verified here: `scripts/take_profit_study.py:141`,
+`post_event_study.py:192`, `range_floor_study.py:58` and `shadow_round1b.py:42` read `bc.initial_capital`, which no longer exists after W63; `optimizer._suggest_one` reads `spec[2]` before the
+type check (a 2-tuple categorical spec would raise); `scan_interval_minutes` is resolved but unused (`engine.py:526`). (5) `reports/` is not git-ignored (a standing hazard for any script that
+writes trade-level data).
+
+**DEPLOY.** Research and tests only; `engine.py`/`pricing.py` are not imported by the live bot or the supervisor, so NO restart is implied by W72. `ParityConfig` adds a `parity:` model section
+(defaults apply when `config.yaml` has none). Rollback is a clean `git revert`. Nothing pushed.
+
+**NEXT.** Check-in with the operator on these results (they may reorder W74-W77), then W73 (live bug fixes: reconciler `datetime.now()` date, `min_dte or`, the 1-DTE `get_chain_for_expiry`
+window). Working brief status table updated.
+
+---
