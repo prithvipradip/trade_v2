@@ -63,6 +63,14 @@ broker-position check — the bot would rebuild what you just closed, inverted
    `STATE DB BACKUP FAILED` alert this week means the mirror is suspect):
    `python -c "import sqlite3; print(sqlite3.connect(r'file:C:/Users/prith/Documents/ait_backups/ait_state.latest.db?mode=ro', uri=True).execute('SELECT MAX(exit_time) FROM trades').fetchone())"`
    — must show this week's latest close. (And that folder syncs to cloud.)
+4. Reading the OTHER box's logs: the supervisor fetches `origin/shared-logs` itself every
+   weekday at **16:50 ET** (5 min after this box's 16:45 publish; a fetch only, it never
+   touches the checkout, and it does not need `AIT_LOG_OWNER`). Its log line
+   `shared_logs_fetched` carries `latest_by_owner`: a stale date there means that box has
+   stopped publishing. Read a day with
+   `python scripts/read_shared_logs.py --owner <name> --date YYYY-MM-DD --no-fetch`
+   (drop `--no-fetch` to force a fresh fetch). Publishing your OWN days additionally needs
+   `AIT_LOG_OWNER=<name>` in this box's `.env` (the job is silent without it).
 
 ## Deploy checklist (EVERY deploy — the 2026-07-10 incident is why)
 A green test suite is not a safe deploy: on 07-10 unit tests passed and the

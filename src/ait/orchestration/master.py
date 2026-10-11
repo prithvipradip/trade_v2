@@ -1630,6 +1630,27 @@ def publish_shared_logs():
         _log("WARNING", "shared_logs_publish_failed", error=str(e))
 
 
+def fetch_shared_logs():
+    """W70 follow-up: refresh `origin/shared-logs` in this checkout, 5 minutes after the
+    16:45 publish, so the OTHER box's published days are readable locally without anyone
+    running read_shared_logs.py first.
+
+    A fetch only (no checkout/merge; see shared_logs.fetch_shared_branch). Deliberately NOT
+    gated on AIT_LOG_OWNER: reading a peer's logs does not require publishing your own.
+    Logs the newest published day per owner (a stalled box shows up as a stale date); no
+    alert — a quiet peer is information, not a page. Never raises."""
+    try:
+        from ait.orchestration.shared_logs import fetch_shared_branch
+        res = fetch_shared_branch(ROOT)
+        if res.ok:
+            _log("INFO", "shared_logs_fetched", head=res.head, advanced=res.advanced,
+                 new_commits=res.new_commits, latest_by_owner=res.latest_by_owner)
+        else:
+            _log("WARNING", "shared_logs_fetch_failed", error=res.error)
+    except Exception as e:  # noqa: BLE001 — must never hurt the supervisor
+        _log("WARNING", "shared_logs_fetch_failed", error=str(e))
+
+
 def backup_state_db():
     """INST-1 (institutional audit): the entire real track record — the whole
     basis of the go/no-go decision — lives in ONE unreplicated SQLite file on
@@ -2316,6 +2337,11 @@ def _register_recurring_jobs(scheduler, bot, web) -> None:
     scheduler.add_job(publish_shared_logs,
                       CronTrigger(day_of_week="mon-fri", hour=16, minute=45, timezone=ET),
                       id="shared_logs_publish")
+    # W70 follow-up: refresh origin/shared-logs 5 minutes after the publish (fetch only;
+    # not gated on AIT_LOG_OWNER). See fetch_shared_logs().
+    scheduler.add_job(fetch_shared_logs,
+                      CronTrigger(day_of_week="mon-fri", hour=16, minute=50, timezone=ET),
+                      id="shared_logs_fetch")
 
     # Weekly deep backtest: Sunday 8 PM ET
     scheduler.add_job(run_backtest,
