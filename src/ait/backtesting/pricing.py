@@ -102,6 +102,56 @@ def find_strike_by_delta(
     return round((lo + hi) / 2, 0)
 
 
+def skewed_leg_iv(
+    base_iv: float, strike: float, underlying: float, option_type: OptionType,
+    skew_factor: float, skew_slope_per_pct_otm: float, iv_floor: float,
+) -> float:
+    """Per-leg IV with the engine's linear-in-log-moneyness skew.
+
+    W72: the ONE implementation. ``Backtester._get_leg_iv`` and the parity
+    replay (``ait.backtesting.replay``) both call this, so the replay can never
+    price a leg differently from the engine. Legacy (pre-W5) put term
+    ``skew_factor * otm * 0.10`` plus the W5 multiplicative put steepening
+    ``base_iv * skew_slope_per_pct_otm * (otm * 100)``; calls keep the mild
+    ``skew_factor * max(0, ln(K/S)) * 0.02``. ``skew_slope_per_pct_otm=0``
+    reproduces the pre-W5 output exactly (see the engine docstring).
+    """
+    log_m = np.log(strike / underlying)
+    if option_type == OptionType.PUT:
+        otm = max(0.0, -log_m)
+        skew_adj = skew_factor * otm * 0.10
+        # otm * 100 = distance in PERCENTAGE POINTS OTM.
+        skew_adj += base_iv * skew_slope_per_pct_otm * (otm * 100.0)
+    else:
+        skew_adj = skew_factor * max(0.0, log_m) * 0.02
+    return max(base_iv + skew_adj, iv_floor)
+
+
+def ic_leg_marks(
+    S: float, short_call: float, short_put: float, long_call: float, long_put: float,
+    t: float, r: float, base_iv: float,
+    skew_factor: float, skew_slope_per_pct_otm: float, iv_floor: float,
+) -> tuple[float, float, float, float]:
+    """The four iron-condor leg mids ``(short call, short put, long call, long put)``.
+
+    W72: single owner of condor leg pricing for the engine's entry build, its
+    daily re-mark (``_reprice_ic_legs``) and the parity replay. Each leg is
+    priced with its own skewed IV (``skewed_leg_iv``) via ``black_scholes_price``;
+    the call order below is the historical one and is part of the contract.
+    """
+    def _p(strike: float, opt: OptionType) -> float:
+        return black_scholes_price(
+            S, strike, t, r,
+            skewed_leg_iv(base_iv, strike, S, opt, skew_factor,
+                          skew_slope_per_pct_otm, iv_floor), opt)
+
+    sc = _p(short_call, OptionType.CALL)
+    sp = _p(short_put, OptionType.PUT)
+    lc = _p(long_call, OptionType.CALL)
+    lp = _p(long_put, OptionType.PUT)
+    return sc, sp, lc, lp
+
+
 def realized_vol(close_prices: np.ndarray, window: int = 20) -> float:
     """Calculate annualized realized volatility from close prices."""
     if len(close_prices) < window + 1:

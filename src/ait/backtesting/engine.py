@@ -23,7 +23,9 @@ from ait.backtesting.pricing import (
     OptionType,
     black_scholes_price,
     find_strike_by_delta,
+    ic_leg_marks,  # W72: single owner of condor leg pricing (engine + parity replay)
     realized_vol,
+    skewed_leg_iv,
 )
 from ait.backtesting.result import BacktestResult
 # R20 #5a: credit TP ladder / DTE close / macro-flatten windows come from the
@@ -1708,16 +1710,10 @@ class Backtester:
         the call-side slope at 0.064 / 0.112 / -0.089 — sign-unstable across
         symbols, so there is no measured slope to ship there.
         """
-        log_m = np.log(strike / underlying)
-        if option_type == OptionType.PUT:
-            otm = max(0.0, -log_m)
-            skew_adj = self._skew_factor * otm * 0.10
-            # W5: measured put-side steepening, relative to the vol level.
-            # otm * 100 = distance in PERCENTAGE POINTS OTM.
-            skew_adj += base_iv * self._skew_slope_per_pct_otm * (otm * 100.0)
-        else:
-            skew_adj = self._skew_factor * max(0.0, log_m) * 0.02
-        return max(base_iv + skew_adj, self._iv_floor)
+        # W72: the arithmetic lives in pricing.skewed_leg_iv (the parity replay
+        # calls the same function); this method only supplies the engine's knobs.
+        return skewed_leg_iv(base_iv, strike, underlying, option_type, self._skew_factor,
+                             self._skew_slope_per_pct_otm, self._iv_floor)
 
     def _options_half_spread(self, iv: float, dte: int) -> float:
         """Compute the per-leg half bid-ask spread for an OTM option.
@@ -2114,15 +2110,11 @@ class Backtester:
             long_call_strike = short_call_strike + wing_width
             long_put_strike = short_put_strike - wing_width
 
-            # Price each leg with its own skewed IV
-            short_call_price = black_scholes_price(S, short_call_strike, t, r,
-                self._get_leg_iv(iv, short_call_strike, S, OptionType.CALL), OptionType.CALL)
-            short_put_price = black_scholes_price(S, short_put_strike, t, r,
-                self._get_leg_iv(iv, short_put_strike, S, OptionType.PUT), OptionType.PUT)
-            long_call_price = black_scholes_price(S, long_call_strike, t, r,
-                self._get_leg_iv(iv, long_call_strike, S, OptionType.CALL), OptionType.CALL)
-            long_put_price = black_scholes_price(S, long_put_strike, t, r,
-                self._get_leg_iv(iv, long_put_strike, S, OptionType.PUT), OptionType.PUT)
+            # Price each leg with its own skewed IV (W72: pricing.ic_leg_marks,
+            # the same call the daily re-mark and the parity replay use)
+            short_call_price, short_put_price, long_call_price, long_put_price = ic_leg_marks(
+                S, short_call_strike, short_put_strike, long_call_strike, long_put_strike,
+                t, r, iv, self._skew_factor, self._skew_slope_per_pct_otm, self._iv_floor)
 
             # Net credit received at mid prices
             net_credit = (short_call_price + short_put_price) - (long_call_price + long_put_price)
@@ -2605,15 +2597,10 @@ class Backtester:
         iv = self._get_current_iv(pos, hist)
         t = max(max(self._entry_dte - days_held, 0) / 365.0, 0.0001)
         r = 0.05
-        sc = black_scholes_price(underlying, pos["short_call_strike"], t, r,
-            self._get_leg_iv(iv, pos["short_call_strike"], underlying, OptionType.CALL), OptionType.CALL)
-        sp = black_scholes_price(underlying, pos["short_put_strike"], t, r,
-            self._get_leg_iv(iv, pos["short_put_strike"], underlying, OptionType.PUT), OptionType.PUT)
-        lc = black_scholes_price(underlying, pos["long_call_strike"], t, r,
-            self._get_leg_iv(iv, pos["long_call_strike"], underlying, OptionType.CALL), OptionType.CALL)
-        lp = black_scholes_price(underlying, pos["long_put_strike"], t, r,
-            self._get_leg_iv(iv, pos["long_put_strike"], underlying, OptionType.PUT), OptionType.PUT)
-        return sc, sp, lc, lp
+        return ic_leg_marks(
+            underlying, pos["short_call_strike"], pos["short_put_strike"],
+            pos["long_call_strike"], pos["long_put_strike"], t, r, iv,
+            self._skew_factor, self._skew_slope_per_pct_otm, self._iv_floor)
 
     def _reprice_position(self, pos: dict, underlying: float, days_held: int,
                           hist: pd.DataFrame | None = None) -> float:

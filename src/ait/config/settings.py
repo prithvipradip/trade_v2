@@ -1587,6 +1587,49 @@ class SizingProbeConfig(_StrictModel):
                     "floor instead of the cap grid.")
 
 
+class ParityConfig(_StrictModel):
+    """W72: tolerances for the research-vs-reality parity replay.
+
+    ``scripts/parity_replay.py`` runs known real trades (the operator's manual
+    trades plus the bot's own fills) through the research engine's pricing code
+    and compares modelled entry credit / exit value with what actually filled.
+    These numbers decide whether a DTE band's research is trustworthy enough to
+    run an Optuna study on, so they live in config (research overlay), not in
+    the script. A band that fails is reported FAIL; a band with fewer trades
+    than ``min_trades_per_band`` is reported INSUFFICIENT, never PASS.
+    """
+
+    credit_error_pct_max: float = Field(default=0.15, gt=0.0, le=1.0,
+        description="Median |modelled - actual| entry credit, as a fraction of "
+                    "the actual credit, above which a DTE band FAILS parity. "
+                    "Default 0.15: a condor credit that is 15% off is already "
+                    "the size of the edge at 1-2 DTE (credits there are 8-25% "
+                    "of wing width). Operator-owned; tighten it as the model "
+                    "improves.")
+    credit_bias_pct_max: float = Field(default=0.10, gt=0.0, le=1.0,
+        description="|median signed error| / actual credit above which a band "
+                    "FAILS. Separate from the spread check on purpose: a model "
+                    "that is consistently 8% rich passes the spread test and "
+                    "still manufactures a fake edge in every study.")
+    min_trades_per_band: int = Field(default=3, ge=1, le=1000,
+        description="A DTE band with fewer closed trades than this is reported "
+                    "INSUFFICIENT instead of PASS/FAIL. The replay set is small "
+                    "(tens of trades), so small bands are common and a verdict "
+                    "on two trades would be noise presented as a result.")
+    dte_band_upper_edges: list[int] = Field(default=[2, 7, 14, 45],
+        description="Inclusive upper edges (calendar DTE at entry) of the "
+                    "parity bands: [2, 7, 14, 45] gives 0-2, 3-7, 8-14, 15-45 "
+                    "and a trailing 46+ catch-all. Matches the DTE regimes "
+                    "whose pricing and friction assumptions differ most.")
+
+    @field_validator("dte_band_upper_edges")
+    @classmethod
+    def _edges_strictly_ascending(cls, v: list[int]) -> list[int]:
+        if not v or any(e < 0 for e in v) or any(b <= a for a, b in zip(v, v[1:])):
+            raise ValueError("dte_band_upper_edges must be non-empty, >= 0 and strictly ascending")
+        return v
+
+
 class IBKREnvConfig(BaseSettings):
     """IBKR connection settings from environment variables."""
 
@@ -1633,6 +1676,7 @@ class Settings(_StrictModel):
     dashboard: DashboardConfig = DashboardConfig()
     logging: LoggingConfig = LoggingConfig()
     sizing_probe: SizingProbeConfig = SizingProbeConfig()
+    parity: ParityConfig = ParityConfig()  # W72: research-vs-reality replay tolerances
 
     # Loaded from environment
     ibkr: IBKREnvConfig = IBKREnvConfig()

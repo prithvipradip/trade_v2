@@ -190,6 +190,28 @@ ib_insync's own `Trade.log`) and `order_absent_judged` collect the real distribu
 published to the `shared-logs` branch; revisit the floors once a few dozen paper orders,
 including exits, exist.
 
+## Research-vs-reality parity replay (W72; research only, never touches live state)
+
+Runs known real trades through the RESEARCH engine's pricing and exit code and reports where
+research disagrees with what actually filled. Use it before trusting a DTE band in an Optuna
+study, and after any change to `backtesting/pricing.py`, `friction.py` or the engine's exit path.
+
+```bash
+python scripts/parity_replay.py                 # reads data/replay/manual_trades_*.json
+```
+
+- **Inputs (all read-only):** the replay file (`data/replay/`, git-ignored; never commit it),
+  `data/historical.db` research tables, and the bot's combo-fill context in `data/ait_state.db`.
+- **Outputs:** `data/replay/out/<YYYYMMDD>/` (`summary.md` = statistics only and safe to quote;
+  `trades.csv` / `legs.csv` carry per-trade prices and stay local). The CLI refuses any output
+  directory inside the repo outside `data/replay/`.
+- **Reading it:** error = model - actual, so positive means research is RICHER than reality.
+  `engine` = what the engine does today (daily close + same-day IV); `clean` = what was knowable at
+  the fill. A band with fewer trades than `parity.min_trades_per_band` is INSUFFICIENT, never PASS.
+- **Tolerances:** `parity:` in `config_research.yaml` (operator-owned).
+- **Never paste** per-trade prices, P&L or any account identifier into PLAN.md: it is shared via
+  git with the other box. Report error statistics by DTE band only.
+
 ## Quarterly drills (scheduled — first week of Jan / Apr / Jul / Oct)
 Run both, then record the date in the log table below. An untested kill
 switch or backup is a hope, not a control.

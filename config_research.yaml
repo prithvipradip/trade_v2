@@ -54,3 +54,13 @@ backtest:
                                        # and also floored leg IVs when pricing: left at 0.20 it would price a 12%-IV SPY
                                        # day at 20% (fat fake credits) now that the rank gate lets such days trade. Demoted
                                        # to a pricing sanity floor; live has no level gate.
+
+# --- W72: parity replay tolerances (scripts/parity_replay.py; schema: ParityConfig) ---
+# Research-only: decides whether a DTE band's research can be trusted before an Optuna study is run on it.
+# Values equal the schema defaults ON PURPOSE: this block is the operator-visible, editable home of the
+# thresholds (assumption A6 of the 2026-10-11 short-DTE programme). It does not shadow a live key.
+parity:
+  credit_error_pct_max: 0.15           # median |modelled - actual| entry credit / actual credit, per DTE band
+  credit_bias_pct_max: 0.10            # |median signed error| / actual credit, per DTE band
+  min_trades_per_band: 3               # fewer closed trades than this => INSUFFICIENT, never PASS
+  dte_band_upper_edges: [2, 7, 14, 45] # 0-2, 3-7, 8-14, 15-45, 46+
