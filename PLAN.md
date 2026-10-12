@@ -15791,3 +15791,90 @@ space.**
 **NEXT.** W78: range gate per horizon, plus the feature/gate look-ahead (amendment correction 4) and, if cheap, the ordering artifact above, since both distort short-DTE trade counts.
 
 ---
+
+## 2026-10-12 - W78: per-horizon range models, the decision-frame look-ahead, concurrency at the fill instant (research only; realistic engine)
+
+Seventh wave of the short-DTE parity programme. Research-only; no live file touched, nothing restarted or pushed. The legacy engine is still byte-identical to the pre-W72 baseline (six
+reference variants, `cmp` of the full trade dumps). `live_range_spec` returns the same pair as before (mirror-tested).
+
+**WHAT WAS WRONG.** (1) The range gate was one model at one horizon (`options.dte_range[0] - EXPIRY_APPROACHING_DTE` bars) handed to every trial; `_range_label_horizon` even ignored
+the study's own `WalkForwardConfig.entry_dte`. (2) The realistic engine filled at 10:30 but its gates and models read history through THAT day's close (W74 registered "not fixed (1)"):
+features, direction, regime, range probability, vol gate, drawdown gate, IV rank. (3) The exit loop scans a held position over the whole session before the day's entry step, so a
+late-session exit freed a slot for an earlier-session entry (W77: 20 of 179 entries at 3 DTE opened while another position was alive).
+
+**CHANGED.**
+1. `ait.ml.range_spec` (import-light): `horizon_for(entry_dte, guard_dte, hold_fraction, max_hold_days)` (the one definition of the reachable horizon; identical to the old formula over
+   the whole 0-60 x cap grid, tested), `bucket_for` (smallest bucket >= h), `RANGE_HORIZON_BUCKETS = (1, 2, 3, 5, 7, 9, 14, 21, 30)` (A7 with 9 in place of 10 so the shipped band's
+   horizon IS a bucket and the default study trains exactly what it always did). `live_range_spec` is rebuilt on `horizon_for`.
+2. `ait.backtesting.range_bank.RangeModelBank` (new): lazy, cached per-horizon `(predictor, status, threshold)` for one (window, symbol); `seed` installs the already-trained base model;
+   a failed training is cached; training runs under a save/restore of the numpy and `random` state.
+3. Walk-forward: `_range_label_horizon(entry_dte=None)` honours the study's `entry_dte` and delegates to `horizon_for`; `_range_bucket` (base DTE keeps its EXACT horizon, any other
+   DTE rounds up); `_pick_range_model` routes the OOS gate by the window config's own DTE; non-base buckets save under `models/research/h<N>/` (the `range.pkl` last-writer-wins item is
+   FIXED); OOS evaluation scores the bucket the model was trained on.
+4. Optimizer: optional `range_predictor_provider(entry_dte | None) -> predictor`, consulted per trial (W79 puts `entry_dte` in `bt_kwargs`; until then it is called with None = today's model).
+5. Engine (`engine_model: realistic` with intraday entries only): `hist_dec` (history through the previous session) feeds `_get_direction` (hence features, predictor, fractal gate,
+   regime, meta-label context, IV-rank-rise), `_select_strategy`, the range model, the vol gate and the drawdown gate; `iv_rank_arr[i-1]`. And an entry counts positions that were still
+   alive at its fill instant (`closed_today` + `_exit_instant`) toward `max_concurrent_positions`; a blocked entry is `max_concurrent_intraday` in the funnel.
+6. `scripts/range_horizon_study.py` (read-only; artifacts to a temp dir) and docs/RUNBOOK.md.
+
+**MEASURED (QQQ, realistic engine, surface pricing, per-leg friction asserted loaded, 1 contract, `max_concurrent_positions=1`, 2025-01-02..2025-12-15, flatten 60; guard 0 / 5 / 5 / 10 / none).**
+| entry DTE | before W78: n / total $ / overlapping entries | decision frame only | frame + concurrency (W78): n / total $ / overlaps / entries blocked |
+|---|---|---|---|
+| 0 | 186 / -4,633 / 0 | 186 / -4,732 / 0 | 186 / -4,732 / 0 / 0 |
+| 1 | 209 / +4,139 / 0 | 209 / +2,994 / 0 | 209 / +2,994 / 0 / 0 |
+| 3 | 179 / +1,028 / 20 | 180 / +342 / 20 | 163 / +423 / 0 / 18 |
+| 7 (guard 10) | 121 / +935 / 14 | 122 / +256 / 14 | 114 / +1,641 / 0 / 15 |
+| 14 | 64 / +830 / 10 | 65 / +495 / 10 | 61 / +2,926 / 0 / 9 |
+Reading. (a) The decision-frame fix lowers every row (-$0.1k, -$1.1k, -$0.7k, -$0.7k, -$0.3k): the previous realistic numbers were flattered by day D's information. The sign is the same at
+all five DTEs; each row alone is inside the noise (~200 trades, SE of a total about $1.5-2k). (b) The concurrency fix removes every overlap and blocks 6-9% of entries at 3-14 DTE (the
+slot an early entry took). The totals move +$0.1k / +$1.4k / +$2.4k, but over 60-160 trades that is path-dependent and NOT significant: do not read it as an edge. (c) The "before"
+column reproduces the W75 corrected table (-4,633 / +4,139 / +1,028 / +830). All earlier `realistic` reference numbers in this ledger are superseded by the right-hand column.
+
+**Range model by horizon** (QQQ, 24 rolling windows, train 252 / test 63, floor 0.65; medians over the windows where the model produced probabilities; ~0.7-1.0 s to train one model):
+| bars | windows scored / 24 | AUROC | windows with AUROC > 0.5 | base in-range | in-range when passed | pass-rate | Brier skill |
+|---|---|---|---|---|---|---|---|
+| 1 | 7 | 0.66 | 86% | 0.95 | 0.95 | 0.79 | -0.32 |
+| 2 | 11 | 0.65 | 91% | 0.80 | 0.87 | 0.69 | -0.25 |
+| 3 | 12 | 0.53 | 75% | 0.69 | 0.74 | 0.57 | -0.25 |
+| 5 | 12 | 0.62 | 67% | 0.73 | 0.84 | 0.41 | -0.39 |
+| 9 (the shipped horizon) | 10 | 0.44 | 40% | 0.62 | 0.62 | 0.53 | -0.86 |
+| 14 | 10 | 0.48 | 40% | 0.75 | 0.71 | 0.36 | -1.26 |
+| 30 | 9 | 0.50 | 44% | 0.76 | 1.00 | 0.21 | -1.61 |
+1. **The ensemble abstains in 10-15 of 24 windows at EVERY horizon** (no member has cross-validated edge, so no probability; the engine's gate then rejects in enforce, would-reject
+   in observe). Per-horizon models do not cure that: it is the model's strength, not its horizon.
+2. **At the shipped 9-bar horizon the gate has no out-of-sample lift** in this sample (in-range 0.62 when passed vs 0.62 base; AUROC below 0.5 in 60% of scored windows). There is
+   a modest lift at 2-5 bars (+4 to +11 points over base) and none at 1 bar (the base rate is already 0.95). Probabilities are worse than climatology at every horizon (negative Brier
+   skill): treat 0.65 as a rank cut, not a probability. This agrees with the 2026-09 decision to keep the live gates in observe.
+3. **The floor that would hold the base horizon's pass-rate** (0.56 at 0.65 for 9 bars) ranges from 0.89 (1 bar) to 0.11 (30 bars): one number cannot serve all horizons.
+4. **Unit slip** (calendar days used as bars): DTE 14 h=9 vs trading-day h=6: AUROC 0.44 vs 0.54, pass-rate 0.53 vs 0.50; DTE 30 h=25 vs h=18: AUROC 0.73 vs 0.62, pass-rate 0.45 vs
+   0.42. Opposite directions on 7-10 windows each and different window sets: no detectable effect; the gate's pass-rate moves about 3 points.
+5. Cost: a full nine-bucket set is about 9 s per window per symbol: lazy per-bucket training is cheap enough to switch on in W79.
+Caveats: 7-12 scored windows per horizon, so medians are coarse and windows differ across horizons (abstention); reliability deciles hold ~25-130 days each.
+
+**TESTS.** `tests/test_w78_range_per_horizon.py`: 39 (horizon truth table + identity with the old formula over the grid; bucket rounding; bank caching / seeding / RNG restore / failure
+caching; walk-forward horizon honouring the study DTE, base vs bucket, OOS routing, per-bucket artifact directory; optimizer provider; decision-frame spies on the direction, strategy and
+range calls, IV-rank lag, an AST guard on decision reads; concurrency: zero overlaps at 1/3/7 DTE, blocked entries counted, legacy ordering preserved in a scenario where it does
+overlap, `_exit_instant` incl. the early close). **Mutation-checked: 34 mutants; 32 caught on the first pass, the 2 survivors (a floor-vs-ceil fraction case and a legacy scenario that
+never overlapped, so a leak was invisible) were real gaps and are closed; files restored byte-for-byte.** Fast lane after the change: 5649 passed / 46 skipped / 0 failed (the skips sit at the same positions as the W77 lane); `smoke_deploy.py` SMOKE PASS (13 checks); `typecheck.py` OK; `compileall` OK; legacy engine byte-identical (six reference variants).
+
+**DEVIATIONS FROM THE PLAN.** (a) `_pick_range_model` was extracted from `_run_single_window` so the OOS routing is directly testable. (b) The "9-bar default must reproduce today's OOS
+metrics exactly" check is covered by identity tests (same horizon, same bucket, same training call) and the byte-identical legacy run; a full walk-forward A/B was not run. (c) The study
+uses its own rolling windows (252/63), not the walk-forward's window config, so it can run without a research-history walk-forward.
+
+**REGISTERED, NOT FIXED.** (1) The calendar-vs-trading-day unit slip (measured above; live and research must change together, W80). (2) The 0-DTE bucket-1 approximation: a daily-bar
+model cannot describe a same-session trade; at 1 bar it has AUROC 0.66 but no lift over a 0.95 base rate. (3) The 0.65 floor per bucket is not tuned (it has to be chosen on each window's
+training slice, W79). (4) The meta-labeler shadow run has no range gate (existing; gating it would score the range model on its own training data). (5) The model abstains in 42-63% of
+windows (above). (6) `exit_time` of an intraday exit is the bar START, so the concurrency test is accurate to one 5-minute bar. (7) With intraday entries but a session that has no bars the
+day falls back to a daily-close fill while still using the previous-session frame (conservative). (8) `_build_position` still receives `row`/`hist` including day D; its PRICING uses the
+fill context (W74), but a future builder that reads `hist` for a decision would reintroduce the leak: the AST guard covers the entry chain, not the builders.
+
+**OPERATOR.** (1) Decision for W79: run the DTE study with the range gate in OBSERVE as the primary and ENFORCE as a sensitivity (enforce zeroes the 42-63% of windows where the model
+abstains). `config_research.yaml` currently enforces. (2) The bucket grid (A7, with 9) is operator-reviewable in `range_spec.py`. (3) Still open from earlier: D1, D2, D8 are required
+before W79.
+
+**DEPLOY / ROLLBACK.** Research and tests only; no restart. Rollback is a clean `git revert`.
+
+**NEXT.** W79: Optuna searches the DTE (plumbing: `IRON_CONDOR_SPACE`, `bt_kwargs` incl. `entry_dte`, `WalkForwardConfig`, lifting the `entry_dte` refusal, `delta_short` L1; measure
+`flatten_minutes_before_close`, `max_hold_fraction` and `expiry_guard_dte` for flatness first).
+
+---
