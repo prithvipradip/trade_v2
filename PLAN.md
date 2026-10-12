@@ -15651,3 +15651,62 @@ if config cannot be read; an explicit `--port` still wins. RUNBOOK commands drop
 Whole-lane re-run not repeated: only a script's argument default, its RUNBOOK text and tests changed; the affected test files (W66/W72/W76 and the docs checks) pass.
 
 ---
+
+## 2026-10-12 - W76 FOLLOW-UP 2: supervisor-run short-DTE friction collection (scheduled job; default OFF)
+
+Operator request: the collection has to run once per RTH session after the close and IB keeps nothing for an expired contract, but the operator is not always at the machine at 16:10 ET.
+The supervisor already lives all day, so it runs the collector itself. **`master.py` (flagged) changed: a full supervisor restart is needed for it to take effect; with the default
+(disabled) it registers nothing and changes nothing.** Authorized by the operator before the change.
+
+**CHANGED.**
+1. `ait.orchestration.short_dte_job` (new; every external dependency injected: clock, calendar, port probe, subprocess): skips non-trading days; refuses a client id inside the bot's ids
+   (`IBKR_CLIENT_ID` and its +100..+104 fallback ladder); refuses to start when nothing listens on `IBKR_PORT`; deletes any stale status file; runs the existing script as a subprocess
+   (port NOT passed: the script resolves `IBKR_PORT` itself) with an idle timeout and a hard cap that terminate then kill; classifies the result (`ok | empty | failed | timeout |
+   idle_timeout | skipped_*`) from the exit code AND the status file the script writes (an exit 0 without a status file, or with `ok=false`, is `failed`).
+2. `master.collect_short_dte_friction` (thin wrapper; never raises) + conditional registration `CronTrigger(mon-fri, hh:mm ET)` id `short_dte_collection`, `max_instances=1`, registered
+   only when `data_collection.short_dte_enabled`. Failure-only Telegram alert, at most one per day (`_alert_gate`); healthy and skipped runs are logged only.
+3. `DataCollectionConfig` (`data_collection:`; default OFF; time `16:10`, symbols `[QQQ]`, client id 91, max DTE 6, 7 D duration, 150 min cap, 20 min idle). `config.yaml` carries it
+   as a COMMENTED block only (inert; adding live keys is a deploy-order hazard, W35).
+4. `calibrate_option_spreads.py --status-file PATH`: writes `data/short_dte_collection_status.json` on every `--short-dte` run, success or failure: counters, stored samples and sessions
+   per DTE, and per band `sessions` / `needed` / `active`. A connect failure and an exception mid-run are both written as `ok=false` with the error.
+5. docs/RUNBOOK.md "Automatic collection": enabling steps and where to look.
+
+**TESTS.** `tests/test_w76_scheduled_collection.py`: 52 (config bounds; guards; ladder boundaries; healthy / empty / non-zero exit with a good-looking status / ok=false / missing and stale
+status; idle and absolute timeouts; command arguments and "no --port"; supervisor wrapper alert gating and never-raises; disabled registers nothing, enabled registers one weekday ET job at
+the configured time; the script end to end against a fake broker including connect failure and a mid-run exception). **Mutation-checked: 25 mutants, all caught, files restored
+byte-for-byte** (the first pass caught 23/25; the two survivors were a non-zero exit with a good-looking status being reported ok, and an exception being reported ok in the status
+file: both real gaps, now tested). One harness hazard recorded: a mutant that removes a timeout made my fake process loop 10^9 polls; the double is now finite and a missing
+timeout fails fast. Gates: `compileall` OK; `typecheck.py` OK (blocking); `smoke_deploy.py` SMOKE PASS (13 checks); the legacy engine is IDENTICAL to the pre-W72 baseline (198 trades). Full fast lane **5561 passed / 1 failed / 46 skipped** (23m04s, a slower machine while a collection and two studies ran): the one failure was `test_w23_scheduler_timezone`'s CronTrigger-site count (11 -> 12), the guard working as designed (the new site carries `timezone=ET`); the count was updated with a provenance comment and the three affected test files re-run (114 passed). The full lane was NOT re-run after that one-line test edit.
+
+**FIRST REAL RUN (operator, 2026-10-12, TWS paper on 7497, clientId 91, before the open).** 85 contracts planned (5 expiries 2026-10-12..16, spot 751.24), 82 qualified: 3 calls at strike
+778 for the Oct 13 / 14 / 15 expiries returned "No security definition" (the strike list from `reqSecDefOptParams` is a COMBINED set across expiries, a known property recorded in
+`options_chain.py`; handled as `unqualified`, not an error). 164 historical requests, **3,336 samples stored, 0 errors, 1,881 s** (31 min, as estimated). Stored coverage (DTE:
+samples / sessions): 3: 102 / 1, 4: 198 / 2, 5: 300 / 3, 6: 390 / 4; **DTE 0-2: 0** (expected: those sessions had not happened yet; DTE 0 exists only on an expiry day while the
+contract is still listed). Band 3-6 fit: `const_usd a=$0.0100`, n=869, 4 sessions, CV MAE $0.0051, **collecting 4/15**; band 0-2: no relevant samples.
+
+**MEASURED from those samples (market data; DTE 3-6, mid >= $0.01, half-spread > 0, n = 986, sessions Oct 6-9).** Half-spread per leg per share: p10 $0.005, p25 $0.005, **median
+$0.010**, p75 $0.015, p90 $0.025, mean $0.0157; most common values $0.005 (361), $0.010 (256), $0.015 (159). By the leg's own price: **mid under $1: median $0.005** (n=333; half a
+tick, i.e. quotes one cent wide), $1-2: $0.010 (n=243; the all-DTE model gives $0.0082), >= $2: $0.015 (n=410; near-the-money contracts a condor does not trade). By session the median
+was $0.015, $0.015, $0.010, $0.005 (Oct 6-9).
+
+**CORRECTION TO WHAT THE OPERATOR WAS TOLD.** The pooled `$0.0100` is dominated by expensive near-the-money contracts. For the legs a condor actually trades (wings under $1, shorts at
+$1-2) the measured half-spread is **$0.005-0.010, i.e. 1.0-1.2x the all-DTE model's extrapolation and 0.5-1.0x the $0.01 floor**. The earlier suggestion that the extrapolation was
+probably "too cheap by about 2x" was a hypothesis and is WITHDRAWN: in this calm 4-session sample it was about right, and the $0.01 floor is conservative (about 2x on cheap wings).
+Reading the W76 stress table against this: the 3-DTE row (+$434 at 1x floor, break-even 1.3x) sits at roughly 0.5-1.0x floor in reality, so it is positive but small (about +$0.4k to
++$1.2k a year at one contract by interpolation, not statistically significant).
+
+**CAVEATS.** Four calm sessions (a week of QQQ highs; spreads widen in stress); hourly LAST quotes, not time-averaged; DTE 0-2 unmeasured; the band's `const_usd` form over-charges cheap
+wings and a form with a mid dependence (affine) will probably win the CV as sessions accumulate. **DTE 0 is time-critical**: today's expiring contract can only be sampled while it is
+listed, which is what the scheduled job (or a manual run after the close) is for.
+
+**REGISTERED, NOT FIXED.** (1) Nothing here has run against the real broker unattended; the operator's manual real run comes first. (2) The scheduled time is a guess: whether IB still
+serves an expiring contract at 16:10 is unverified. (3) A day the supervisor or TWS/Gateway is down is skipped, not replayed (the supervisor's one-hour misfire grace covers a late
+start only). (4) Two collectors at once with the same client id would collide: the job has `max_instances=1` but nothing stops a manual run overlapping the scheduled one.
+(5) The idle timer watches the log file size; a hang that prints something periodically would not trip it (the hard cap would).
+
+**DEPLOY.** `master.py` is flagged: a full SUPERVISOR restart. To turn it on, in `config.yaml` uncomment the `data_collection:` block and set `short_dte_enabled: true`, then restart. Rollback:
+leave it disabled, or a clean `git revert`. Nothing pushed.
+
+**NEXT.** W77 settlement / assignment / overnight gap (no external dependency).
+
+---
