@@ -31,6 +31,7 @@ from ait.backtesting.pricing import (
     realized_vol,
     skewed_leg_iv,
 )
+from ait.backtesting import settlement  # W77: expiry settlement / assignment rules
 from ait.backtesting.result import BacktestResult
 # R20 #5a: credit TP ladder / DTE close / macro-flatten windows come from the
 # shared exit-policy module (pure, import-light) instead of a hand copy of
@@ -336,6 +337,9 @@ class Backtester:
         expiry_guard_dte: int | None = None,
         max_hold_fraction: float | None = None,
         flatten_minutes_before_close: int | None = None,
+        pin_band_usd: float | None = None,                       # W77: None -> backtest.*
+        assignment_fee_per_share: float | None = None,           # W77: None -> backtest.*
+        stock_commission_per_share: float | None = None,         # W77: None -> backtest.*
         # Research-only (scripts/post_event_study.py): block CREDIT entries for
         # this many calendar days AFTER an event date (day 0 = the event day
         # itself, when the decision lands intraday). None = off, which is the
@@ -580,6 +584,12 @@ class Backtester:
             raise ValueError(f"max_hold_fraction must be in (0, 1], got {self._max_hold_fraction}")
         _fm = _bt(flatten_minutes_before_close, "flatten_minutes_before_close")
         self._flatten_minutes = None if _fm is None else int(_fm)
+        # W77: expiry settlement knobs (realistic engine only; see ait.backtesting.settlement).
+        self._pin_band = float(_bt(pin_band_usd, "pin_band_usd"))
+        self._assignment_fee = float(_bt(assignment_fee_per_share, "assignment_fee_per_share"))
+        self._stock_commission = float(_bt(stock_commission_per_share, "stock_commission_per_share"))
+        self._settlement_stats = {"settled": 0, "pending": 0, "assigned_gap": 0,
+                                  "fallback": 0, "over_max_loss": 0}
         self._scan_interval_minutes = int(_resolve_setting(
             scan_interval_minutes, "backtest", "scan_interval_minutes", BacktestConfig, _settings))
         self._entry_window_start_et = str(_resolve_setting(
@@ -791,6 +801,17 @@ class Backtester:
                     )
 
             for pos in open_positions:
+                # W77: shares carried over the expiry bell are closed at THIS session's
+                # open, before any other check (the next row of the frame is the next
+                # session, so weekends and holidays are handled).
+                if pos.get("settlement") is not None:
+                    _o = row["Open"] if "Open" in row else row["Close"]
+                    pos.update(self._close_pending_settlement(pos, float(_o), today_date))
+                    capital += pos["pnl"]
+                    trades.append(pos)
+                    log.debug("trade_closed", strategy=pos["strategy"],
+                              pnl=f"{pos['pnl']:.2f}", reason=pos["exit_reason"])
+                    continue
                 # Thesis re-evaluation: exit early if ML direction strongly contradicts entry (Gap Z6).
                 thesis_exit = self._check_thesis_invalidation(pos, hist)
                 if thesis_exit is not None:
@@ -1414,6 +1435,9 @@ class Backtester:
             log.info("friction_summary", fitted=_fs["fitted"], default=_fs["default"],
                      extrapolated=_fs["extrapolated"],
                      extrapolated_share=round(_fs["extrapolated"] / _tot, 4))
+        if self._settlement_stats and (self._settlement_stats["settled"]
+                                       or self._settlement_stats["pending"]):
+            log.info("settlement_summary", **self._settlement_stats)
         if self._surface is not None:
             _h, _m = self._surface_stats["hit"], self._surface_stats["miss"]
             log.info("surface_pricing_summary", legs_priced=_h + _m, from_surface=_h,
@@ -1636,6 +1660,8 @@ class Backtester:
         """
         if session_bars is None or session_bars.empty:
             return None
+        if pos.get("settlement") is not None:
+            return None   # W77: waiting for the next open
         entry_price = pos["entry_price"]
         trade_type = pos.get("trade_type", pos.get("position_type", "debit"))
         expiry_str = pos.get("expiry_date") or pos.get("exit_date")
@@ -1662,6 +1688,11 @@ class Backtester:
             result = self._dispatch_exit_check(pos, trade_type, pnl_pct, current_date, bar, as_of)
             if result is None:
                 continue
+            if result.pop("_settle", False):
+                # W77: this bar ends at the bell. Nothing trades after it.
+                return self._settle_at_bell(
+                    pos, float(underlying), current_date,
+                    exit_time=bar_ts.isoformat() if hasattr(bar_ts, "isoformat") else str(bar_ts))
             value, und = mid_value, underlying
             if result.get("exit_reason") == "touch_stop":
                 value, und = self._touch_exit_mark(pos, result, days_held, None, trade_type, as_of)
@@ -1949,6 +1980,11 @@ class Backtester:
     _expiry_guard_dte: int | None = None
     _max_hold_fraction: float | None = None
     _flatten_minutes: int | None = None
+    # W77: settlement knobs; the stats dict is created on first use for partial engines.
+    _pin_band: float = 0.10
+    _assignment_fee: float = 0.015
+    _stock_commission: float = 0.01
+    _settlement_stats: dict | None = None
 
     # R16: VIX -> per-symbol implied-vol multipliers (see _get_iv). Unknown
     # symbols keep the historical 1.10 so nothing silently changes for
@@ -3118,6 +3154,8 @@ class Backtester:
     def _check_exit(self, pos: dict, row: pd.Series, current_date: date,
                     hist: pd.DataFrame | None = None) -> dict | None:
         """Check if a position should be exited."""
+        if pos.get("settlement") is not None:
+            return None   # W77: waiting for the next open; run() closes it, never twice
         underlying = row["Close"]
         entry_date = date.fromisoformat(pos["entry_date"])
         days_held = (current_date - entry_date).days
@@ -3154,6 +3192,10 @@ class Backtester:
             _eod_asof)
 
         result = self._dispatch_exit_check(pos, trade_type, pnl_pct, current_date, row)
+
+        if result is not None and result.pop("_settle", False):
+            # W77: the expiry bell. Settled (closed now) or left holding shares (None).
+            return self._settle_at_bell(pos, float(underlying), current_date)
 
         if result is not None:
             # R16 touch-stop: live transacts AT the touched strike intraday, not
@@ -3385,7 +3427,14 @@ class Backtester:
         # decides at the close, where this fires. Unreachable in legacy (rule 3
         # fires first for every position); it closes guard-exempt entries.
         if _asof >= _bell:
-            return {"exit_date": str(current_date), "exit_reason": "expiry"}
+            out = {"exit_date": str(current_date), "exit_reason": "expiry"}
+            # W77: a realistic engine settles at the bell (exercise / assignment /
+            # expiry, shares carried over a gap) instead of re-marking and paying exit
+            # friction on legs that do not trade. Only structures whose legs are known
+            # (_settle_legs_of); anything else keeps the re-mark.
+            if self._realistic and self._settle_legs_of(pos) is not None:
+                out["_settle"] = True
+            return out
 
         # 4. Macro-event flatten (portfolio.py rule 3d parity). PLAN
         # 2026-08-04: defined-risk EXEMPT — condors hold through events
@@ -3484,9 +3533,107 @@ class Backtester:
 
         return raw_pnl - total_commission
 
+    # W77: option legs by strategy, as (position key, right, side). A strategy absent here
+    # (or a position missing a key) keeps the re-mark close, so settlement can never
+    # silently drop a leg.
+    _SETTLE_LEG_KEYS: dict[str, tuple[tuple[str, str, str], ...]] = {
+        **{s: (("short_call_strike", "C", "short"), ("long_call_strike", "C", "long"),
+               ("short_put_strike", "P", "short"), ("long_put_strike", "P", "long"))
+           for s in ("iron_condor", "iron_butterfly", "wide_wing_condor", "broken_wing_condor")},
+        "put_credit_spread": (("short_put_strike", "P", "short"), ("long_put_strike", "P", "long")),
+        "call_credit_spread": (("short_call_strike", "C", "short"), ("long_call_strike", "C", "long")),
+        "short_strangle": (("short_call_strike", "C", "short"), ("short_put_strike", "P", "short")),
+        "jade_lizard": (("short_put_strike", "P", "short"), ("short_call_strike", "C", "short"),
+                        ("long_call_strike", "C", "long")),
+    }
+
+    def _settle_legs_of(self, pos: dict) -> "list[settlement.SettleLeg] | None":
+        """W77: the position's option legs for settlement, or None when unknown."""
+        keys = self._SETTLE_LEG_KEYS.get(pos.get("strategy"))
+        if keys is None:
+            return None
+        out = []
+        for key, right, side in keys:
+            k = pos.get(key)
+            if k is None:
+                return None
+            out.append(settlement.SettleLeg(float(k), right, side))
+        return out
+
+    def _bump_settle(self, key: str) -> None:
+        if self._settlement_stats is None:
+            self._settlement_stats = {"settled": 0, "pending": 0, "assigned_gap": 0,
+                                      "fallback": 0, "over_max_loss": 0}
+        self._settlement_stats[key] = self._settlement_stats.get(key, 0) + 1
+
+    def _settle_at_bell(self, pos: dict, S: float, current_date: date,
+                        exit_time: str | None = None) -> dict | None:
+        """W77: settle a credit structure at the expiry bell at underlying ``S``.
+
+        Nets to zero shares in every scenario -> closed now as ``expiry_settled`` at
+        intrinsic (no option exit friction, no option exit commission: expired, exercised
+        and assigned legs do not trade). Otherwise the position stays open holding the
+        delivered shares (``pos["settlement"]``) and ``run()`` closes it at the next
+        session's open; returns None in that case.
+        """
+        legs = self._settle_legs_of(pos)
+        if legs is None:   # defensive: the caller only sets _settle when legs are known
+            return None
+        if settlement.needs_overnight(legs, S, self._pin_band):
+            pos["settlement"] = {
+                "underlying": round(float(S), 4), "expiry": str(current_date),
+                "legs": [[l.strike, l.right, l.side] for l in legs]}
+            self._bump_settle("pending")
+            return None
+        res = settlement.worst_case(legs, S, self._pin_band, S,
+                                    self._assignment_fee, self._stock_commission)
+        self._bump_settle("settled")
+        return self._finish_settlement(pos, res, S, str(current_date),
+                                       exit_time or str(current_date), "expiry_settled")
+
+    def _close_pending_settlement(self, pos: dict, price: float, on_date: date,
+                                  reason: str = "assigned_gap",
+                                  exit_time: str | None = None) -> dict:
+        """W77: close a position that carried assigned/exercised shares past the bell,
+        marking them at ``price`` (the next session's open; the last close at the end of
+        a backtest). Pins are re-resolved at the original settlement price."""
+        sett = pos.pop("settlement")
+        legs = [settlement.SettleLeg(float(k), r, s) for k, r, s in sett["legs"]]
+        res = settlement.worst_case(legs, float(sett["underlying"]), self._pin_band,
+                                    float(price), self._assignment_fee, self._stock_commission)
+        if reason == "assigned_gap":
+            self._bump_settle("assigned_gap")
+        out = self._finish_settlement(
+            pos, res, float(price), str(on_date),
+            exit_time or datetime.combine(on_date, time(9, 30), tzinfo=ET).isoformat(), reason)
+        out["settlement_underlying"] = float(sett["underlying"])
+        return out
+
+    def _finish_settlement(self, pos: dict, res: "settlement.Resolution", underlying: float,
+                           exit_date: str, exit_time: str, reason: str) -> dict:
+        """Price a settled position: credit - cost, less the stock fees and the ENTRY
+        commission. No option exit commission: nothing was traded."""
+        contracts = pos["contracts"]
+        gross = (pos["entry_price"] - res.cost) * 100 * contracts
+        fees = res.fees * 100 * contracts
+        pnl = gross - fees - pos.get("entry_commission", 0)
+        max_loss = pos.get("max_loss")
+        if max_loss is not None and gross < -float(max_loss) - 1e-6:
+            self._bump_settle("over_max_loss")   # the loss exceeded the DEFINED maximum
+        return {
+            "exit_date": exit_date, "exit_time": exit_time, "exit_reason": reason,
+            "exit_price": round(res.cost, 4), "exit_underlying": round(float(underlying), 4),
+            "pnl": round(pnl, 2), "settlement_legs": list(res.statuses),
+            "net_shares": int(res.net_shares), "settlement_fees_usd": round(fees, 2),
+        }
+
     def _force_close(self, pos: dict, last_row: pd.Series, last_date: date,
                      hist: pd.DataFrame | None = None) -> dict:
         """Force-close a position at end of backtest."""
+        if pos.get("settlement") is not None:   # W77: shares still held; mark at the close
+            return self._close_pending_settlement(
+                pos, float(last_row["Close"]), last_date, reason="backtest_end",
+                exit_time=str(last_date))
         entry_date = date.fromisoformat(pos["entry_date"])
         days_held = (last_date - entry_date).days
         _eod_asof = self._eod(last_date) if self._realistic else None

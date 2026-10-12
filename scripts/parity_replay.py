@@ -233,6 +233,39 @@ def main(argv: list[str] | None = None) -> int:
         xs = [x for x in xs if x is not None]
         L.append(f"- {v}: n={len(xs)} median signed error {_fmt(_median(xs))} $/share")
     L.append("")
+    L.append("## Expiry settlement parity (W77: ait.backtesting.settlement vs the statement)")
+    L.append("")
+    sett_rows = []
+    for t in trades:
+        r = rp.settlement_replay(t, data, pin_band=settings.backtest.pin_band_usd,
+                                 assignment_fee=settings.backtest.assignment_fee_per_share,
+                                 stock_commission=settings.backtest.stock_commission_per_share)
+        if r is not None:
+            sett_rows.append(r)
+    _write("settlement.csv", [{k: (";".join(map(str, v)) if isinstance(v, list) else v)
+                               for k, v in r.items()} for r in sett_rows])
+    ok = [r for r in sett_rows if r.get("status") == "ok"]
+    if not sett_rows:
+        L.append("- no structure in the file reached its expiry bell")
+    else:
+        scored = sum(r["legs_scored"] for r in ok)
+        match = sum(r["legs_match"] for r in ok)
+        ovn = [r for r in ok if r["overnight"]]
+        L.append(f"- structures that reached expiry: {len(sett_rows)} "
+                 f"(with settle price and next open: {len(ok)}; no data: {len(sett_rows) - len(ok)})")
+        L.append(f"- leg outcomes the model reproduced (expired / exercised / assigned): {match} of {scored}")
+        L.append(f"- shares left over the gap: model matched the statement in "
+                 f"{sum(1 for r in ok if r['net_shares_model'] == r['net_shares_actual'])} of {len(ok)}; "
+                 f"{len(ovn)} carried shares overnight")
+        errs = [abs(r["pnl_error"]) for r in ok if r["pnl_error"] is not None]
+        if errs:
+            L.append(f"- |P&L error| model vs statement: median ${statistics.median(errs):.2f}, "
+                     f"max ${max(errs):.2f} per structure (per-structure rows: settlement.csv, git-ignored)")
+        late = [r["close_after_open_min"] for r in ovn if r.get("close_after_open_min") is not None]
+        if late:
+            L.append(f"- the real shares were closed {min(late):.0f}-{max(late):.0f} min after the "
+                     "next open (the model marks AT the open: a trader who waited shows up as error)")
+    L.append("")
     L.append("## Bot execution context (live friction actually paid)")
     L.append("")
     for r in trade_rows:

@@ -11,6 +11,9 @@ the research engine's pricing code and compares:
   * exit value        modelled re-mark vs the actual buy-back (same-instant closes)
   * exit decision     which rule the ENGINE's own ``_check_exit`` would have fired
                       and when, vs what actually happened
+  * expiry settlement W77: the legs ``ait.backtesting.settlement`` says expired / were
+                      exercised / assigned, the shares carried over the gap and the
+                      resulting P&L, vs the statement's close codes and stock lines
 
 Single-owner rule. Leg pricing is ``ait.backtesting.pricing.ic_leg_marks`` /
 ``skewed_leg_iv`` — the very functions the engine's entry build and daily re-mark
@@ -100,6 +103,16 @@ class ReplayLeg:
 
 
 @dataclass(frozen=True)
+class ReplayStock:
+    """One stock line delivered by exercise/assignment (or closing it), from the statement."""
+    time: datetime
+    shares: int                    # signed: +bought, -sold
+    price: float
+    commission: float
+    code: str
+
+
+@dataclass(frozen=True)
 class ReplayTrade:
     id: str
     origin: str                    # "manual" | "bot"
@@ -112,6 +125,7 @@ class ReplayTrade:
     net_credit_usd: float          # whole structure, all contracts, USD
     commissions_usd: float
     total_pnl_usd: float | None
+    linked_stock: tuple["ReplayStock", ...] = ()   # W77: stock delivered by exercise/assignment
 
     @property
     def entry_date(self) -> date:
@@ -186,6 +200,10 @@ def load_trades(path: str | Path) -> list[ReplayTrade]:
             net_credit_usd=float(s["net_credit_usd"]),
             commissions_usd=float(s.get("commissions_usd") or 0.0),
             total_pnl_usd=(None if s.get("total_pnl_usd") is None else float(s["total_pnl_usd"])),
+            linked_stock=tuple(ReplayStock(
+                time=_et(x["time"]), shares=int(x["shares"]), price=float(x["price"]),
+                commission=float(x.get("commission") or 0.0), code=str(x.get("code") or ""),
+            ) for x in (s.get("linked_stock") or [])),
         ))
     return out
 
@@ -554,6 +572,116 @@ def engine_exit_scan(trade: ReplayTrade, data: ResearchData, entry: dict[str, An
                     "data_through": str(last_seen)}
     return {"engine_exit_date": None, "engine_exit_reason": None,
             "data_through": None if last_seen is None else str(last_seen)}
+
+
+# --------------------------------------------------------------------------
+# W77: expiry settlement replay and the live -> research exit-reason map
+# --------------------------------------------------------------------------
+
+_CODE_STATUS = {"Ep": "expired", "Ex": "exercised", "A": "assigned"}   # IB statement codes
+SETTLE_BAR_START = time(15, 55)   # the last 5-minute bar of a regular session; its close is the settle price
+
+
+def actual_leg_status(leg: ReplayLeg) -> str | None:
+    """What the statement says happened to a leg at expiry (None: a plain trader close)."""
+    for tok in str(leg.close_code or "").split(";"):
+        if tok in _CODE_STATUS:
+            return _CODE_STATUS[tok]
+    return None
+
+
+def settlement_replay(trade: ReplayTrade, data: ResearchData, *, pin_band: float,
+                      assignment_fee: float, stock_commission: float) -> dict[str, Any] | None:
+    """Run ``ait.backtesting.settlement`` on a real structure that reached its expiry.
+
+    Returns None when the structure was closed by the trader before the bell, is still open,
+    or has legs on several expiries. ``status='no_data'`` when the underlying's settle price
+    or next open is missing. Otherwise a dict comparing, per leg, the model's outcome with the
+    statement's code, the shares left over the gap, and the P&L (statement total vs model).
+
+    The next-open mark is the model's convention (assumption A5); ``close_after_open_min``
+    reports how long after that open the real shares were actually closed, so a trader who
+    waited is visible instead of being booked as model error.
+    """
+    from ait.backtesting import settlement as st
+
+    if trade.still_open or len({l.expiry for l in trade.legs}) != 1:
+        return None
+    actual = [actual_leg_status(l) for l in trade.legs]
+    if not any(a is not None for a in actual):
+        return None
+    expiry = trade.front_expiry
+    legs = [st.SettleLeg(l.strike, l.right, l.side) for l in trade.legs]
+
+    bar = data.bar_containing(datetime.combine(expiry, SETTLE_BAR_START, tzinfo=ET))
+    row = data.session_row(expiry)
+    S = bar["close"] if bar else (float(row["Close"]) if row is not None else None)
+    frame = data.daily_frame()
+    later = frame.loc[frame.index > pd.Timestamp(expiry)]
+    O = float(later.iloc[0]["Open"]) if len(later) else None
+    out: dict[str, Any] = {"id": trade.id, "expiry": expiry.isoformat(),
+                           "actual_statuses": actual}
+    if S is None or (O is None and st.needs_overnight(legs, S, pin_band)):
+        out["status"] = "no_data"
+        return out
+
+    overnight = st.needs_overnight(legs, S, pin_band)
+    res = st.worst_case(legs, S, pin_band, O if overnight else S, assignment_fee, stock_commission)
+    scored = [(m, a) for m, a in zip(res.statuses, actual) if a is not None]
+    expiry_stock = [x for x in trade.linked_stock if x.time.date() == expiry]
+    net_actual = sum(x.shares for x in expiry_stock) // 100 // max(trade.quantity, 1)
+    pnl_model = ((trade.actual_credit - res.cost) * 100.0 * trade.quantity
+                 - res.fees * 100.0 * trade.quantity + trade.commissions_usd)
+    close_gap = None
+    if overnight and trade.linked_stock and len(later):
+        nxt_open = datetime.combine(later.index[0].date(), time(9, 30), tzinfo=ET)
+        closes = [x.time for x in trade.linked_stock if x.time.date() > expiry]
+        if closes:
+            close_gap = round((max(closes) - nxt_open).total_seconds() / 60.0, 1)
+    out.update({
+        "status": "ok", "S": S, "O": O, "overnight": overnight,
+        "model_statuses": list(res.statuses), "legs_scored": len(scored),
+        "legs_match": sum(1 for m, a in scored if m == a),
+        "net_shares_model": res.net_shares, "net_shares_actual": net_actual,
+        "pnl_model": round(pnl_model, 2),
+        "pnl_actual": None if trade.total_pnl_usd is None else round(trade.total_pnl_usd, 2),
+        "pnl_error": (None if trade.total_pnl_usd is None
+                      else round(pnl_model - trade.total_pnl_usd, 2)),
+        "close_after_open_min": close_gap,
+    })
+    return out
+
+
+# Live exit reasons (execution/portfolio.py + the reconciler) -> the research engine's
+# exit_reason(s) that are their counterpart. Longest prefix wins. An empty tuple means
+# "no research twin" (a registered gap, not an error).
+LIVE_REASON_TO_RESEARCH: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("take_profit_short", ("take_profit_short",)),
+    ("partial_take_profit", ()),
+    ("take_profit", ("profit_target",)),
+    ("short_strike_touch", ("touch_stop",)),
+    ("stop_loss", ("credit_loss_limit", "stop_loss")),
+    ("trailing_stop", ("trailing_stop",)),
+    ("breakeven_stop", ("breakeven_stop",)),
+    ("expiry_approaching", ("expiry_approaching", "expiry")),
+    ("macro_event_flatten", ("macro_event_flatten",)),
+    ("delta_breach", ()),
+    ("pre_earnings_iv_crush", ()),
+    ("exit_blocked_by_pdt", ()),
+    ("reconciler_expired_intrinsic", ("expiry_settled", "assigned_gap", "expiry")),
+)
+
+
+def research_reasons_for(live_reason: str | None) -> tuple[str, ...] | None:
+    """The research exit reasons matching a live one; None if the reason is unknown to the map."""
+    if not live_reason:
+        return None
+    text = str(live_reason)
+    best: tuple[str, tuple[str, ...]] | None = None
+    for prefix, twins in LIVE_REASON_TO_RESEARCH:
+        if text.startswith(prefix) and (best is None or len(prefix) > len(best[0])):
+            best = (prefix, twins)
+    return None if best is None else best[1]
 
 
 # --------------------------------------------------------------------------

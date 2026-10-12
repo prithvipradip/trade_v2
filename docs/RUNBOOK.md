@@ -280,6 +280,15 @@ python scripts/parity_replay.py                 # reads data/replay/manual_trade
   `engine` = what the engine does today (daily close + same-day IV); `clean` = what was knowable at
   the fill. A band with fewer trades than `parity.min_trades_per_band` is INSUFFICIENT, never PASS.
 - **Tolerances:** `parity:` in `config_research.yaml` (operator-owned).
+- **Expiry settlement (W77):** `summary.md` also carries an "Expiry settlement parity" section for
+  every structure that reached its expiry bell: how many leg outcomes (expired / exercised /
+  assigned) `ait.backtesting.settlement` reproduced from the statement's close codes, whether the
+  shares left over the gap match, and the P&L error. The model marks leftover shares at the NEXT
+  session's open; a trader who waited shows up as error and the section says how long they waited.
+  The assumptions (`backtest.pin_band_usd`, `assignment_fee_per_share`,
+  `stock_commission_per_share`) are operator-owned. In the research engine the settlement path is
+  only reached with `engine_model: realistic` AND a position the take-profit ladder / touch stop did
+  not already close, so it matters most for studies that disable those exits.
 - **Never paste** per-trade prices, P&L or any account identifier into PLAN.md: it is shared via
   git with the other box. Report error statistics by DTE band only.
 

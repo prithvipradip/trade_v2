@@ -859,6 +859,24 @@ class BacktestConfig(_StrictModel):
                     "backstop so no position reaches settlement, assignment or an "
                     "unhedged gap after a one-sided expiry (the exposure that cost two "
                     "manual trades more than their defined maximum).")
+    pin_band_usd: float = Field(default=0.10, ge=0.0, le=1.0,
+        description="W77: a SHORT leg within this many dollars of its strike at the expiry "
+                    "bell is a pin: whether it is assigned cannot be known at the close, so "
+                    "the engine scores both outcomes and books the worse (assumption A5 of "
+                    "the short-DTE programme). Realistic engine only; a position only "
+                    "reaches the bell when it is exempt from the expiry guard and not "
+                    "flattened. Operator-owned: 0.10 is a judgement, not a measurement "
+                    "(none of the three real expiries on the 2026-08/10 statement was "
+                    "within it).")
+    assignment_fee_per_share: float = Field(default=0.015, ge=0.0, le=0.10,
+        description="W77: $/share charged on stock delivered by ASSIGNMENT at expiry. "
+                    "Measured on the operator's 2026-09/10 statement (0.0151-0.0155 on the "
+                    "three assignments); exercise-delivered shares carried no fee there, "
+                    "so none is charged on them. Realistic engine only.")
+    stock_commission_per_share: float = Field(default=0.01, ge=0.0, le=0.10,
+        description="W77: $/share to close shares left over after a one-sided expiry at "
+                    "the next session's open. Measured 0.0100 on the same statement. "
+                    "Realistic engine only.")
     iv_rank_rise_threshold: float = Field(default=0.30, ge=0.0, le=10.0,
         description="R20b: suppress iron-condor entry when IV rank rose more than "
                     "this over the last 10 days (Exp 20 veto). Values > 1 disable "
