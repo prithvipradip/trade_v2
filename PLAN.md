@@ -15710,3 +15710,84 @@ leave it disabled, or a clean `git revert`. Nothing pushed.
 **NEXT.** W77 settlement / assignment / overnight gap (no external dependency).
 
 ---
+
+## 2026-10-12 - W77: expiry settlement, assignment and the overnight gap (research only; realistic engine)
+
+Sixth wave of the short-DTE parity programme. Research-only; nothing is imported by the live bot, no live file was touched, nothing was restarted or pushed. The legacy engine is still
+byte-identical to the pre-W72 baseline (all six reference variants, `cmp` of the full trade dumps). The plan's reconciler move was replaced by a parity test (see DEVIATIONS), so
+`reconciler.py` (flagged) is unchanged.
+
+**WHAT WAS WRONG.** A position that reached its expiry bell was closed by W74's rule 3b as a Black-Scholes re-mark at t~0 PLUS exit friction on all four legs, as if the legs were traded
+at the close. In reality OTM legs expire for free, ITM longs are auto-exercised, ITM shorts are assigned, and a one-sided assignment leaves 100 shares per contract held across the gap
+(the exposure that exceeded the defined maximum on two of the operator's manual condors).
+
+**CHANGED.**
+1. `ait.backtesting.settlement` (new; pure, imports only `dataclasses`/`itertools`, AST-guarded): `settle_status / settle_legs` (long ITM by $0.01 or more = exercised; short beyond the pin
+   band and ITM by $0.01 or more = assigned; short within `pin_band` = pin; else expired), `scenarios` (pins resolved both ways), `stock_legs`, `settlement_cost`, `unit_fees`,
+   `needs_overnight`, `worst_case` (the A5 "worse of"). `EXERCISE_THRESHOLD_USD = 0.01` is a code constant (an exchange rule, not a tunable).
+2. Engine (`engine_model: realistic` only): rule 3b marks the exit `_settle`; `_check_exit` / `_check_intraday_exit_realistic` route it to `_settle_at_bell`. Net shares zero in every
+   scenario -> closed now as `expiry_settled` at intrinsic with NO option exit friction and NO option exit commission (only the ENTRY commission and the assignment fee on assigned
+   shares). Otherwise the position stays open holding the shares (`pos["settlement"]`); `run()` closes it first thing next session at that row's OPEN as `assigned_gap`
+   (the next frame row, so weekends and holidays are handled); a still-pending position at the end of the data is marked at the last close (`backtest_end`). A pending position is
+   never exit-checked again, and it keeps its concurrency slot overnight. New trade fields: `settlement_legs`, `net_shares`, `settlement_fees_usd`, `settlement_underlying`;
+   `settlement_summary` log line (`settled / pending / assigned_gap / over_max_loss`).
+3. `BacktestConfig`: `pin_band_usd` 0.10, `assignment_fee_per_share` 0.015, `stock_commission_per_share` 0.01 (bounded, provenance in the descriptions); engine kwargs of the same names.
+4. Replay: `ReplayStock` + `ReplayTrade.linked_stock` (loader), `settlement_replay`, `actual_leg_status`, `LIVE_REASON_TO_RESEARCH` / `research_reasons_for` (live exit reason ->
+   research twin, longest prefix; an empty tuple = no twin); `scripts/parity_replay.py` gains an "Expiry settlement parity" section and a local `settlement.csv`.
+5. docs/RUNBOOK.md: the settlement section of the parity replay.
+
+**MEASURED (statistics only; per-trade prices and P&L stay in the git-ignored `data/replay/`).**
+1. Replay of the operator's manual structures that reached their expiry: 10 structures, 9 with a settle price and a next open (the newest expires after the daily data ends).
+   **Leg outcomes reproduced 32 of 32** (expired / exercised / assigned vs the statement's close codes); delivered shares matched 9 of 9; 2 structures carried shares overnight and
+   1 was a both-wings-ITM net-zero settlement. No short was within the $0.10 pin band, so the pin rule is exercised only by tests. Median |P&L error| under $1 per structure. The one
+   large error is one overnight structure whose shares the trader closed 308 minutes AFTER the open; the model marks AT the open (A5), so a trader who waits is visible as error, not
+   hidden. The other overnight structure was closed 18 seconds after the open and differs only by the open print.
+2. Measured statement rates (now config defaults): assignment fee 0.0151-0.0155 $/share on the three assignments; exercise-delivered shares carried NO fee; closing the net shares
+   0.0100 $/share.
+3. **Under the default exit rules a position essentially never reaches the bell.** Reference study (QQQ, realistic engine, surface pricing, per-leg friction asserted loaded, 1 contract,
+   2025-01-02..2025-12-15, guard 5 / 0 as in W75): with the take-profit ladder on, 0 / 1 / 3 DTE had ZERO `expiry` exits, and flatten 60 vs flatten OFF gave IDENTICAL results
+   (-4,633 / +4,139 / +1,028, the corrected W75 numbers). The 60-minute flatten has no measured value under live exit rules on this window.
+4. Where the bell IS reached (take-profit ladder off; before = re-mark close, after = settlement; `breach` = loss beyond the defined maximum plus $15):
+| 0/1/3 DTE, exit variant | before: n / total $ / worst $ | after: n / total $ / worst $ | after: exits |
+|---|---|---|---|
+| 0 DTE, TP off, flatten OFF | 186 / -4,484 / -100 | 186 / -4,326 / -100 | 28 expiry_settled |
+| 1 DTE, TP off, flatten OFF | 209 / +2,649 / -799 | 209 / +3,017 / -799 | 65 expiry_settled |
+| 3 DTE, TP off, flatten OFF | 120 / -104 / -822 | 120 / +88 / -822 | 34 expiry_settled |
+| 0 DTE, TP off + touch off, flatten OFF | 186 / -7,285 / -888 (2 breach) | 186 / -5,218 / -1,174 (22 breach) | 88 assigned_gap, 98 expiry_settled |
+| 1 DTE, TP off + touch off, flatten OFF | 209 / -329 / -1,150 (2 breach) | 156 / -3,493 / -2,399 (3 breach) | 55 assigned_gap, 100 expiry_settled |
+| 3 DTE, TP off + touch off, flatten OFF | 87 / -1,297 / -1,654 (1 breach) | 81 / -920 / -1,635 (0 breach) | 25 assigned_gap, 55 expiry_settled |
+   Every flatten-60 row is identical before and after (it never reaches the bell). Reading: (a) with the touch stop on, settlement is worth +$0.2k to +$0.4k per year at one contract
+   (the exit friction on legs that do not trade); (b) with BOTH take-profit and the touch stop off (the way the operator's manual condors were held) the gap tail appears: the worst
+   trade moves from about -$0.9k to -$1.2k (0 DTE) and from -$1.2k to -$2.4k (1 DTE), and 22 of 186 0-DTE trades lose more than the structure's defined maximum, which the re-mark close
+   could not show. The trade counts at 1 and 3 DTE fall (209 -> 156, 87 -> 81) because a position holding shares occupies its slot overnight: totals in those rows are NOT comparable
+   per trade (1 DTE average -$1.6 -> -$22.4 per trade). Windows of ~200 trades: differences under ~$2k are inside the noise.
+5. **Exit-before-entry ordering artifact (pre-existing, found while explaining the trade-count change; registered, not fixed).** With `max_concurrent_positions=1` the realistic engine
+   opened 20 of 179 entries at 3 DTE and 7 of 136 at 7 DTE while another position was still open (0 of 186 at 0 DTE, 0 of 209 at 1 DTE; defaults, flatten 60, same window). Mechanism by code reading only
+   (the exit loop in `run()` evaluates a held position over the WHOLE session before that day's entry step, so a late-session exit frees a slot for an earlier-session entry); the probe
+   confirms the effect, not the mechanism. It inflates short-DTE trade counts and is not W77's to fix.
+
+**TESTS.** `tests/test_w77_settlement.py`: 48 (pure rules incl. exact float boundaries; 600-case parity of `settlement_cost` with `PositionReconciler._structure_intrinsic`; the engine bell on
+the daily and intraday paths incl. put side, pin, both-wings, pending never settled twice, end-of-data; a full realistic `run()` with a one-sided assignment closed at the next session's open;
+legacy and partial engines unchanged; config bounds and documented defaults; AST class guards (the bell rule marks `_settle`, every consumer of the credit dispatch pops it, the settlement
+module stays pure); replay on synthetic fixtures). **Mutation-checked: 35 mutants, all caught on the first pass, files restored byte-for-byte.** Fast lane after the change: 5610 passed / 45 skipped / 0 failed (counted from the progress output of a `-x` run, which would have stopped at a failure); `smoke_deploy.py` SMOKE PASS (13 checks); `typecheck.py` OK; `compileall` OK; legacy engine byte-identical (six reference variants).
+
+**DEVIATIONS FROM THE PLAN.** (a) The plan moved `PositionReconciler._structure_intrinsic` to a shared helper (a flagged-file edit). It was replaced by a parity test (600 random condors,
+settlement cost == the live booking), the same drift guard with no live diff. (b) The assignment fee is charged on ASSIGNED shares only: exercise delivery was free on the statement.
+(c) `hypothesis` is not installed in this checkout's environment, so the parity property uses a seeded numpy sweep. (d) The pin-episode validation did not wait for option bars (it
+needs only the underlying), as amendment correction 3 predicted.
+
+**REGISTERED, NOT FIXED.** (1) The exit-before-entry ordering artifact above. (2) Ex-dividend early assignment (live rule 3e has no research twin). (3) A flatten-failure stress knob and
+IB's own pre-expiry liquidation of at-risk positions are not modelled. (4) After-hours moves beyond the pin band; stock slippage at the open. (5) The two non-credit `expiry` sites in
+the engine still re-mark (debit structures are not on the live IC-only path). (6) Carried shares are not margined: the $75k of stock is not deducted from capital. (7) The `breach`
+column above is a crude threshold (defined maximum + $15); `settlement_summary.over_max_loss` is the exact count. (8) **W79 consequence: under the default take-profit ladder
+`flatten_minutes_before_close` is a FLAT Optuna dimension (identical results), the same shape as the W65 inert `wing_k`; measure it with the ladder searched or drop it from the
+space.**
+
+**OPERATOR.** (1) New assumption A13 (the three fee/pin defaults above) joins A5; both are yours to change in `config_research.yaml` if the statement rates differ for you.
+(2) Nothing to restart. (3) Decision for W79: keep `flatten_minutes_before_close` in the search space? Recommendation: only together with a searched or disabled take-profit ladder.
+
+**DEPLOY / ROLLBACK.** Research and tests only; `BacktestConfig` gains three defaulted fields; no restart. Rollback is a clean `git revert`.
+
+**NEXT.** W78: range gate per horizon, plus the feature/gate look-ahead (amendment correction 4) and, if cheap, the ordering artifact above, since both distort short-DTE trade counts.
+
+---
