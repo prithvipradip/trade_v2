@@ -15479,3 +15479,51 @@ vol-point richness and cuts price error 19-49% out of sample), together with `en
 settlement/assignment/overnight gap. The `surface` replay row needs the backfill to reach Aug-Sep 2026.
 
 ---
+
+## 2026-10-12 - OPERATOR ACTION & DECISION REGISTER (consolidates W69-W75; read this instead of five NEXT lines)
+
+No code change. Operator decisions and operator-only actions were recorded across the W69, W70, assessment, W73, W74 and W75 entries and the follow-up entry; there was no single list. This is
+it, with what each item BLOCKS and the default if nothing is decided. State at this entry: HEAD `72a5235` on `W64-risk-retune`, 25 commits ahead of `origin/main`, nothing pushed, nothing
+restarted; fast lane 5464 passed / 0 failed; `smoke_deploy.py` SMOKE PASS (13 checks).
+
+**A. DECISIONS ONLY THE OPERATOR CAN MAKE.**
+| # | Decision | Recommendation | Default if undecided | Blocks |
+|---|---|---|---|---|
+| D1 | `backtest.engine_model: realistic` in `config_research.yaml` (W74) | YES, before W79 | stays `legacy` (known look-ahead; every run warns) | meaningful W79 study |
+| D2 | `backtest.pricing_source: surface` in `config_research.yaml` (W75), QQQ only | YES, with D1 | stays `bs_legacy` | meaningful W79 study |
+| D3 | Authorize W80 (live wiring: `dte_range` validator, expiry cap, rules 3/3a, flatten, greeks clock, floors, PDT, reconcile) | after the studies | NOT authorized | any live short-DTE trading |
+| D4 | Programme assumptions A1-A12 (assessment entry) stand unless corrected; operator-owned: A2 expiry-day flatten default 60 min, A5 pin band $0.10, A6 parity tolerance 15% / 10% (`parity:` block) | review | as written | W77, parity verdicts |
+| D5 | Account identifiers already present in OLDER PLAN.md entries (a paper account id near lines ~9504 and ~9545, a live-account id near line ~109; they predate this session). The file is append-only and shared via git with the other box: leave / append a caution / rewrite history | operator's call | left as is | none (exposure only) |
+| D6 | Open since W69/W70: the four phantom config keys (`trading.trading_hours_only`, `options.delta_range`, `meta_label.retrain_with_primary`, `exit.auto_hedge`): wire, delete or keep exempt; and whether the bare research harness should follow config (W70 decision D) | decide each | registered, harmless | cleanliness only |
+| D7 | Whether and when to push / open a PR for the 25 local commits (W69-W75 and earlier) | operator's call | nothing pushed | sharing with the other box |
+
+**B. ACTIONS ONLY THE OPERATOR CAN TAKE.**
+1. **Restart onto the pending live code** (before the open, RUNBOOK deploy checklist): FULL SUPERVISOR restart (W69 `master.py` ports, W70, the 16:50 `shared_logs_fetch` job) AND the BOT
+   (W69, W70 executor/PDT/IC builder, W73 `reconciler.py` + `options_chain.py`). Until then none of it is live. The first `ahmed_logs` publish also happens only after the restart.
+2. **IB bid/ask collection for 0-6 DTE friction (W76), at least 15 RTH sessions** with TWS or IB Gateway running (paper is fine), one `scripts/calibrate_option_spreads.py --source ib-bars`
+   run per session. **NOT STARTABLE YET: the sampler mask is DTE 7-45 and the tooling is W76, not built.** The assistant builds it first and will say so; every session lost delays W76 and a
+   trustworthy W79 by one day. No historical NBBO is assumed (assessment A1), so there is no way to backfill this.
+3. **Let the option-bar backfill finish** (`scripts/backfill_option_history.py`, PID 34852): 89,654 / 151,282 contracts (59%) at ~6,575/day = **~9.4 more days**; do not stop it (it is
+   resumable: relaunch the same command if the box sleeps or reboots). Then, in this order: (a) the Polygon top-up from 2026-09-28 to today (A11) so the operator's manual trades are covered;
+   (b) the phase-B rate re-solve `scripts/backfill_risk_free_rate.py` (the assistant announces it first: it writes to the research store); (c) optionally SPY and IWM bars (A8), roughly
+   three weeks each at this rate, to extend short-DTE research beyond QQQ.
+4. **Keep `data/replay/manual_trades_*.json` local and private** (git-ignored): it is the validation set. Append new statement exports if replay coverage should grow; never paste its
+   contents into PLAN.md or memory.
+5. After 3a, ask the assistant to re-run `scripts/parity_replay.py`: the `surface` variant reports n=0 until the bars cover the trade dates.
+
+**C. WHAT WAITS ON WHAT.**
+| Wave | Waits on |
+|---|---|
+| W76 friction 0-6 DTE | assistant builds tooling (code only) -> B2 collection (>= 15 sessions) -> fit |
+| W77 settlement / assignment / gap | nothing |
+| W78 range gate per horizon | nothing |
+| W79 Optuna searches DTE | D1 and D2 (and ideally W76 friction); runs on QQQ only until B3c |
+| W75 `surface` replay row | B3 (backfill + top-up) |
+| W80 live wiring | D3, after W79 |
+
+**D. WHERE THINGS LIVE.** Working brief (local, git-ignored): `Plans4agent_next_session/W72-W80_short_dte_parity_programme.md` (status table + per-wave log). Replay data:
+`data/replay/` (git-ignored). Surface cache: `data/research_cache/` (git-ignored). Lead probes: `Plans4agent_next_session/W72_lead_probes.py`.
+
+**NEXT.** W76 tooling (code only), then W77 and W78 while the operator's collection and the backfill run; W79 once D1 and D2 are decided.
+
+---
