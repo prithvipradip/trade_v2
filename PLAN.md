@@ -15993,3 +15993,38 @@ pass `--optimize-strict` for numbers you will quote.
 then the promotion rule.
 
 ---
+
+## 2026-10-12 - W71 SCOPE, DEPENDENCIES AND THE CODE-READ FINDINGS (no code change)
+
+Records what W71 is, that nothing blocks it, and what reading the code already shows, before the probe runs. Nothing was restarted or pushed.
+
+**WHAT W71 IS.** Open item 1 of the W67 clarification, carried through W69 / W70: verify the feature-engine `iv_rank` that the research `iv_rank_rise_threshold` veto uses against
+live's stored-IV rank, find out whether live applies a rise veto at all and on which series, and if not, treat it as a research-only gate. The "construction study" (open item 2) is
+a different piece of work and is NOT part of W71.
+
+**DEPENDENCIES: NONE UNMET.** No option bars, no friction bands, no D2, no restart. It reads only the stored implied-vol series in `data/historical.db` (`daily_prices`,
+`research_daily_prices`) for QQQ, SPY and IWM. It should run BEFORE W79b because the DTE study searches `iv_rank_rise_threshold` (0.25-0.60 in `IRON_CONDOR_SPACE`).
+
+**CODE-READ FINDINGS (each is proven by execution in W71 itself).**
+1. **Live has no IV-rank-rise veto.** `iv_rank_rise_threshold` is read only by the research engine, the walk-forward and the optimizer; outside them it appears only as the
+   `BacktestConfig` field. Live gates on the LEVEL twice: `iron_condor.py` refuses `iv_rank < 15` (`AIT_IRON_CONDOR_IV_FLOOR`) and the risk manager refuses `iv_rank > 85` (`AIT_IV_RANK_CAP`).
+2. **The research veto uses a different series than live's rank.** The `FeatureEngine` `iv_rank` is a REALIZED-vol range rank, `(vol_20 - min252) / (max252 - min252)` in 0-1
+   with `min_periods=20`; live's rank is the percentile of today's STORED IV among the last 252 stored daily IVs (`ait.data.iv_rank`, 0-100, at least 60 observations). The engine's W68
+   level gates already use the live definition; only the rise veto uses the realized-vol proxy.
+3. **Stored IV is not one series.** Live persists the MEDIAN ATM IV across the scanned expiries (`_persist_daily_iv`), so its meaning shifts with the chain mix (0-2 DTE chains; W80-
+   linked). Research uses IB historical IV. On 2026-10-05 QQQ read 0.178 in the live store and 0.187 in the research table. Depth: QQQ live 3,791 observations since 2011; SPY and IWM
+   live 510 since 2024-04; research about 4,019 since 2010.
+4. `iv_rank_rise_threshold` is in the Optuna space, so W79b would otherwise spend a dimension on a gate the live bot does not have.
+
+**OPERATOR (2026-10-12).** Asked whether to fix the three naive `datetime.now().date()` sites in the live `bot/orchestrator.py` (`_persist_daily_iv`, the stored-IV staleness age in
+`_estimate_iv_rank`, the `_true_up_commission` marker) inside W71, the operator asked why "no" was recommended when the market is closed and the bot is not running. Answer recorded:
+the bot being down makes now the cheapest time (no extra restart, nothing in flight); the effect is small because host and ET dates agree during RTH. The sites are included as
+**W71b** (three lines, `today_et()`, tested under a pinned non-ET `TZ`, effective only at the next bot start, which stays the operator's call).
+
+**PLAN.** Part A a read-only probe of the three series; Part B a realistic-engine A/B of the veto (0.30 vs off); Part C a manifest line plus an AST guard that nothing outside the
+research modules reads the threshold; Part D (W71b) the three live sites. The outcome is a decision for the operator (D9): remove the veto from research, keep it as a declared
+research-only deviation, or port it to live (only with evidence; W80-class).
+
+**NEXT.** W71 as above, then W79b once D2, the range-gate mode and the window design are decided.
+
+---
