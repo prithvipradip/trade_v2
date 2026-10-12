@@ -15923,3 +15923,73 @@ effect; the range model abstains in 42-63% of windows at every horizon and has n
 **NEXT.** W79a as planned: the two config flips, the search definition and plumbing, `dte_report`, `scripts/dte_dimension_flatness.py`, tests, then its own PLAN entry.
 
 ---
+
+## 2026-10-12 - W79a: D1 / D8 flipped in the research overlay; DTE-search plumbing, loud failures, DTE report, flat-dimension check (research only)
+
+Eighth wave of the short-DTE parity programme. Research-only; no live file touched, nothing restarted or pushed. The legacy engine is still byte-identical to the pre-W72 baseline (six
+reference variants, `cmp` of the full trade dumps) and `IRON_CONDOR_SPACE` is unchanged (asserted). W79b (the study that produces numbers) is NOT started: it waits for the option-bar
+backfill, D2, the friction bands and the window-design decision (see OPERATOR).
+
+**CHANGED.**
+1. **D1 and D8 (operator decisions, 2026-10-12):** `backtest.engine_model: realistic` and `backtest.friction_short_dte: true` in `config_research.yaml`, with provenance comments;
+   `pricing_source` stays `bs_legacy`. Every research entry point now runs the realistic engine (previous-session decision frame, settlement, concurrency at the fill) and charges 0-6 DTE
+   legs at least the $0.01 floor. All default-research numbers recorded before this entry are superseded (assumption A10). The live bot / supervisor never load the overlay; a test
+   pins both flips and that `config.yaml` carries neither.
+2. **`DteSearchConfig`** (`BacktestConfig.dte_search`, `extra="forbid"`, bounded validators): off by default; entry DTE [0, 45], guard [0, 5], hold fraction [0.05, 1.0], flatten
+   off, `multivariate`, `strict`. `param_spaces.dte_search_space` builds the opt-in dimensions; `StrategyOptimizer` merges them for the iron condor only and REPLACES `max_hold_days`
+   with the fraction. The credit floors are never searched.
+3. **Plumbing:** `WalkForwardConfig` gains `expiry_guard_dte`, `max_hold_fraction`, `flatten_minutes_before_close`, `delta_short` (**fixes lead L1**), `dte_search`, `dte_range`,
+   `optimize_strict`, `optimize_multivariate`; the per-window refusal no longer lists `entry_dte` (`credit_tp_ladder` and `post_event_blackout_days` still refuse). The optimizer
+   takes the five baselines into `bt_kwargs` (a searched value overrides through the existing loop; an unsearched one still reaches every trial); the OOS and meta-label shadow
+   `Backtester`s receive the same fields; the `wing_k` inertness test uses the smallest searched DTE; `TPESampler(multivariate, group)` behind `optimize_multivariate`.
+4. **The silent failure is loud:** a failed per-window optimisation is recorded in `optimization_status` (`failed`, `error`; travels through the parallel workers), counted by
+   `WalkForwardResult.optimization_failures`, printed by `run_backtest.py`, and raises under `optimize_strict` / `--optimize-strict`.
+5. **Range model follows the trial:** the W78 provider now receives `(entry_dte, expiry_guard_dte, max_hold_fraction)` and the OOS routing uses the WINDOW's own guard and fraction (it
+   used the base config's; found by the end-to-end test).
+6. `ait.backtesting.dte_report` (pure): best DTE per window, top-decile bands, candidate bands (top-decile in >= 2/3 of windows). `run_backtest.py` gains `--search-dte`,
+   `--dte-range LO HI`, `--optimize-strict` and a manifest warning that a DTE study leaves the live band. The compact DTE trials are kept in `optimization_status` for DTE studies only.
+7. `scripts/dte_dimension_flatness.py` (read-only) and docs/RUNBOOK.md.
+
+**MEASURED (flat-dimension check: QQQ 2025-04-01..2025-07-31, realistic engine, per-leg friction and the short-DTE floor asserted loaded, `bs_legacy` pricing, 1 contract, 100 runs; a
+structural check, not a result).**
+| dimension | 1 DTE | 3 DTE | 7 DTE | 14 DTE |
+|---|---|---|---|---|
+| `expiry_guard_dte` (0,1,3,5) | moves (4 outcomes) | moves (3) | **FLAT** | **FLAT** |
+| `max_hold_fraction` (0.25-1.0) | **FLAT** | moves (2) | moves (2) | moves (3) |
+| `flatten_minutes_before_close` (None,30,60,120) | **FLAT** | **FLAT** | **FLAT** | **FLAT** |
+| `delta_short` (0.10-0.30) | moves | moves | moves | moves |
+| `wing_k` (0.3-2.0) | moves | moves | moves | moves |
+| `max_hold_days` (control) | FLAT | moves | moves | moves |
+Consequences, encoded: **the flatten is not searched** (`search_flatten` defaults off; it moved nothing at any DTE, as W77 predicted); **the guard is sampled only when the trial's
+entry DTE is at or below the top of its range** (it is flat above it: a define-by-run conditional); the hold fraction is searched everywhere (flat only at 1 DTE, 2 of 46 values).
+Side observation: `delta_short` 0.10 gave ZERO trades at 1 and 3 DTE under the $0.30 credit floor (the graded objective floor handles it; it is why the floors are a W79b sensitivity).
+**Wiring smoke on real data** (`run_backtest.py --symbols QQQ --optimize-per-window --search-dte --optimize-strict --max-windows 1 --optimize-n-trials 5`, `bs_legacy` pricing): the
+window optimised 5 trials without failure, the best trial chose 16 DTE, the report printed; the OOS window took no trades (the neutral-only selector found no strategy on 44 of 45 days),
+so this proves the path, not a finding.
+
+**TESTS.** `tests/test_w79a_dte_search.py`: 56 (config bounds / `extra="forbid"`; the overlay decisions; default space unchanged; opt-in space; the merge and the conditional guard;
+trial kwargs and the provider arguments; the inert-wing test at the smallest DTE; walk-forward config validation, settings resolution, pickling; forwarding to the OOS and shadow engines;
+counted and strict failures; an end-to-end window where a searched DTE reaches the OOS engine and trains the right range bucket; compact trial retention; the report). Updated by
+design: `test_take_profit_study_injection` (`entry_dte` alone is no longer refused; the ladder still is) and two W78 tests (the provider signature). **Mutation-checked: 31 mutants;
+29 caught on the first pass, the 2 survivors (the base-guard fallback and trial retention) were real gaps and are closed; files restored byte-for-byte.** Fast lane after the change: 5705 passed / 46 skipped / 0 failed; `smoke_deploy.py` SMOKE PASS (13 checks); `typecheck.py` OK; `compileall` OK; legacy engine byte-identical (six reference variants).
+
+**DEVIATIONS FROM THE PLAN.** (a) The guard is conditional on the entry DTE (not in the plan; the flatness check showed it is flat above its range). (b) The W78 provider signature was
+extended to three arguments and the OOS routing now uses the window's own guard/fraction (found by the end-to-end test). (c) Trials are retained in `optimization_status`, not a new
+result field, so they travel back from window workers without changing the worker return shape. (d) `flatten` ships OFF because the check says so, not because of a default.
+
+**REGISTERED, NOT FIXED.** (1) `max_hold_fraction` is flat at 1 DTE and is not made conditional (2 of 46 values). (2) The credit floors interact with the searched delta (zero trades at low
+delta and short DTE); W79b runs the floors as sensitivities. (3) Grouped / multivariate TPE is an experimental optuna sampler: off by default. (4) `run_backtest.py` logs
+`walk_forward_too_few_windows` below 3 windows even with `--max-windows 1` (pre-existing; the run continues). (5) The meta-labeler shadow run still has no range gate (W78). (6) The
+flatness numbers are one four-month window per cell: they show whether a dimension can move a result, not by how much.
+
+**OPERATOR (needed before W79b).** (1) **D2** `pricing_source: surface`: after the backfill finishes (about 2026-10-21) and the rate re-solve. (2) **Range-gate mode** for the DTE study:
+observe as primary, enforce as a sensitivity (the model abstains in 42-63% of windows). (3) **Window design:** the surface-priced history is at most about 24 months; shorter training
+windows (about 126 days) and/or SPY + IWM bars to pool; tell me before W79b. (4) **Start the SPY / IWM option backfill** right after QQQ finishes (about three weeks each). (5) Always
+pass `--optimize-strict` for numbers you will quote.
+
+**DEPLOY / ROLLBACK.** Research and tests only; no restart. Rollback is a clean `git revert` (the overlay flips are in the same commit).
+
+**NEXT.** W79b once D2, the gate mode and the window design are decided and the data exists: one DTE study per symbol, the credit floors as 3-value sensitivities, the report above,
+then the promotion rule.
+
+---
