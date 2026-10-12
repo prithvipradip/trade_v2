@@ -330,6 +330,9 @@ class Backtester:
         # three exit knobs are independent of it. See BacktestConfig for the meaning.
         engine_model: str | None = None,
         pricing_source: str | None = None,     # W75: None -> backtest.pricing_source
+        friction_short_dte: bool | None = None,                  # W76: None -> backtest.*
+        friction_min_sessions_per_band: int | None = None,       # W76: None -> backtest.*
+        friction_extrapolated_floor_usd: float | None = None,    # W76: None -> backtest.*
         expiry_guard_dte: int | None = None,
         max_hold_fraction: float | None = None,
         flatten_minutes_before_close: int | None = None,
@@ -443,6 +446,13 @@ class Backtester:
         self._friction_entry_capture = float(friction_entry_capture)
         self._friction_exit_capture = float(friction_exit_capture)
         self._friction_stress = float(friction_stress_multiplier)
+        # W76: friction by DTE band (0-6 DTE). Off = the single all-DTE model, as before.
+        self._friction_short_dte = bool(_bt(friction_short_dte, "friction_short_dte"))
+        self._friction_min_sessions = int(_bt(friction_min_sessions_per_band,
+                                              "friction_min_sessions_per_band"))
+        self._friction_floor_usd = float(_bt(friction_extrapolated_floor_usd,
+                                             "friction_extrapolated_floor_usd"))
+        self._friction_stats = {"fitted": 0, "default": 0, "extrapolated": 0}
         self._leg_spread_model = None  # set by _load_leg_spread_model() when per_leg_usd
         # W66: entry-funnel counters (see _reject / BacktestResult.entry_funnel)
         self._funnel: Counter = Counter()
@@ -501,7 +511,11 @@ class Backtester:
         self._max_entry_vol_annual = max_entry_vol_annual
         self._market_context = market_context
         self._symbol = symbol or ""
-        self._db_path = db_path
+        # W76: coerce to Path. HistoricalDataStore does `db_path.parent`, so a plain str made
+        # the friction/spread loaders fail with a WARNING and the run silently fell back to
+        # the LEGACY % friction model (the W74/W75 reference studies were mislabelled for
+        # exactly this reason).
+        self._db_path = Path(db_path) if db_path is not None else None
         # R16: must run AFTER _symbol is set — the calibration is per-symbol.
         if os.environ.get("AIT_BT_CALIBRATED_SPREADS", "1") != "0":
             self._load_calibrated_spreads()
@@ -1394,6 +1408,12 @@ class Backtester:
             max_dd=f"{result.max_drawdown:.2%}",
             win_rate=f"{result.win_rate:.2%}",
         )
+        if self._friction_bands is not None:
+            _fs = self._friction_stats
+            _tot = max(sum(_fs.values()), 1)
+            log.info("friction_summary", fitted=_fs["fitted"], default=_fs["default"],
+                     extrapolated=_fs["extrapolated"],
+                     extrapolated_share=round(_fs["extrapolated"] / _tot, 4))
         if self._surface is not None:
             _h, _m = self._surface_stats["hit"], self._surface_stats["miss"]
             log.info("surface_pricing_summary", legs_priced=_h + _m, from_surface=_h,
@@ -1921,6 +1941,8 @@ class Backtester:
     # and set only what they need; those instances must stay on LEGACY semantics
     # (the same idiom as the W70 executor durations). __init__ overwrites all four.
     _engine_model: str = "legacy"
+    _friction_short_dte: bool = False       # W76
+    _friction_bands = None                  # W76: BandedFriction when friction_short_dte
     _pricing_source: str = "bs_legacy"      # W75
     _surface = None                         # W75: IVSurface when pricing_source == "surface"
     _realistic: bool = False
@@ -1991,12 +2013,58 @@ class Backtester:
         log.info("friction_model_loaded", symbol=sym, form=row["form"],
                  a=round(float(row["a"]), 5), b=round(float(row["b"]), 5), n=row.get("n"),
                  calibrated_on=row.get("calibrated_on"))
+        if self._friction_short_dte:
+            self._load_friction_bands(sym, _store)
 
-    def _leg_friction_usd(self, capture: float, leg_mids) -> float:
-        """W66: dollars/share to cross the spread on every leg once (v2 model)."""
-        from ait.backtesting.friction import condor_leg_cost_usd
+    def _load_friction_bands(self, sym: str, store) -> None:
+        """W76: per-DTE-band models. Only a band with >= friction_min_sessions_per_band
+        collected sessions is used; every other short-DTE band is answered by the all-DTE
+        model floored at friction_extrapolated_floor_usd and COUNTED as extrapolated."""
+        from ait.backtesting.friction import BandedFriction, LegSpreadModel
+        try:
+            rows = store.load_leg_spread_band_models(sym)
+        except Exception as e:  # noqa: BLE001 - reported, never blocks a run
+            log.warning("friction_bands_unreadable", symbol=sym, error=str(e))
+            rows = {}
+        usable, short = {}, []
+        for band, r in rows.items():
+            if int(r.get("n_sessions") or 0) >= self._friction_min_sessions:
+                usable[band] = LegSpreadModel.from_row(r)
+            else:
+                short.append((band, int(r.get("n_sessions") or 0)))
+        self._friction_bands = BandedFriction(self._leg_spread_model, usable,
+                                              self._friction_floor_usd)
+        log.info("friction_bands_loaded", symbol=sym, fitted=sorted(usable),
+                 below_min_sessions=short, min_sessions=self._friction_min_sessions,
+                 floor_usd=self._friction_floor_usd,
+                 note="0-6 DTE bands not listed under fitted are charged the all-DTE model "
+                      "floored at the tick and reported as extrapolated")
+
+    def _leg_friction_usd(self, capture: float, leg_mids, dte: int | None = None) -> float:
+        """W66: dollars/share to cross the spread on every leg once (v2 model).
+
+        W76: with friction_short_dte on and the position's DTE known, the cost comes from
+        the DTE-band model (or the floored extrapolation) and the outcome is tallied."""
+        from ait.backtesting.friction import banded_condor_leg_cost_usd, condor_leg_cost_usd
+        if self._friction_bands is not None and dte is not None:
+            cost, ex = banded_condor_leg_cost_usd(self._friction_bands, leg_mids, int(dte),
+                                                  capture, self._friction_stress)
+            self._friction_stats["extrapolated" if ex else "fitted"] += 1
+            return cost
+        if self._friction_bands is not None:
+            self._friction_stats["default"] += 1
         return condor_leg_cost_usd(self._leg_spread_model, leg_mids, capture,
                                    self._friction_stress)
+
+    def _remaining_dte(self, pos: dict, days_held: int, as_of: datetime | None) -> int | None:
+        """Calendar days from the mark instant to this position's expiry (None if unknown)."""
+        try:
+            expiry = date.fromisoformat(str(pos["expiry_date"])[:10])
+            on = (as_of.date() if as_of is not None else
+                  date.fromisoformat(str(pos["entry_date"])[:10]) + timedelta(days=days_held))
+        except (KeyError, ValueError, TypeError):
+            return None
+        return max((expiry - on).days, 0)
 
     def _apply_exit_friction(self, pos: dict, value: float, underlying: float,
                              days_held: int, hist: pd.DataFrame | None,
@@ -2009,8 +2077,10 @@ class Backtester:
         the legacy model): the original `% x net value` shortcut."""
         if self._leg_spread_model is not None and pos.get("strategy") == "iron_condor":
             sc, sp, lc, lp = self._reprice_ic_legs(pos, underlying, days_held, hist, as_of)
-            return value + self._leg_friction_usd(self._friction_exit_capture,
-                                                  (sc, sp, lc, lp))
+            return value + self._leg_friction_usd(
+                self._friction_exit_capture, (sc, sp, lc, lp),
+                self._remaining_dte(pos, days_held, as_of) if self._friction_bands is not None
+                else None)
         return value * (1 + half_spread_pct) if trade_type == "credit" \
             else value * (1 - half_spread_pct)
 
@@ -2354,7 +2424,8 @@ class Backtester:
                 # W66 v2: the fitted DOLLAR half-spread on each of the four legs
                 spread_cost = self._leg_friction_usd(
                     self._friction_entry_capture,
-                    (short_call_price, short_put_price, long_call_price, long_put_price))
+                    (short_call_price, short_put_price, long_call_price, long_put_price),
+                    dte if self._friction_bands is not None else None)
             net_credit = max(0.0, net_credit - spread_cost)
             if net_credit <= 0:
                 self._reject("builder:credit_after_friction_nonpositive")  # detail of the loop's builder_none

@@ -190,6 +190,45 @@ ib_insync's own `Trade.log`) and `order_absent_judged` collect the real distribu
 published to the `shared-logs` branch; revisit the floors once a few dozen paper orders,
 including exits, exist.
 
+## Short-DTE friction collection (W76; research only, read-only against the broker)
+
+The research engine had no real bid/ask sample below 11 DTE, so every 0-6 DTE leg was charged an
+extrapolated half-spread. IB serves historical BID/ASK bars for currently LISTED contracts only
+(nothing for expired ones), so this data cannot be backfilled: it has to be collected forward,
+one RTH session at a time, while the 0-6 DTE contracts are still listed.
+
+**Each trading day** (paper Gateway/TWS is fine; it only requests historical data, never orders):
+
+```bash
+# 1) see the plan first (no data requested, nothing stored)
+python scripts/calibrate_option_spreads.py --source ib-bars --short-dte --symbols QQQ \
+    --port 4002 --client-id 91 --dry-run
+
+# 2) collect + fit (about 40-55 min per symbol: IB paces historical requests at 60 / 10 min)
+python scripts/calibrate_option_spreads.py --source ib-bars --short-dte --symbols QQQ \
+    --port 4002 --client-id 91
+```
+
+- **When:** after the close (16:10 ET or later) so today's 0-DTE contract has a full session of bars,
+  while it is still listed. If a run shows `DTE 0: 0 samples`, IB had already dropped the expiring
+  contract: run it instead ~15:45 ET on expiry days (the last hour's bars are then missing, which
+  does not matter: the engine flattens at ~15:00).
+- **Client id:** use one that is not the bot's (the bot uses 326 and its fallback ladder); the example
+  uses 91, the repo's calibration convention. W66 verified this request type against the paper
+  Gateway on port 4002 (historical BID and ASK bars of listed options, market closed). If a run
+  returns no bars for every contract, that is an account/permission question for IB, not a bug here.
+- **Coverage:** the run prints samples and distinct sessions per DTE 0..6 and, per band
+  (`0-2`, `3-6`), `collecting: N/15 sessions (M more needed)` until `ACTIVE`.
+- **Target:** at least 15 sessions per band (`backtest.friction_min_sessions_per_band`). Weekends
+  and holidays do not count; missing a day only delays the date, nothing is lost.
+- **Failure:** a pacing violation backs off 60 s and continues; an unqualifiable contract is skipped.
+  Re-running the same day is safe (`INSERT OR IGNORE`).
+- **Using it:** set `backtest.friction_short_dte: true` in `config_research.yaml`. A band below the
+  minimum is charged the all-DTE model floored at `friction_extrapolated_floor_usd` ($0.01 per leg)
+  and the run logs `friction_summary` (fitted / extrapolated counts). Off by default.
+- **Storage:** `data/historical.db` tables `option_spread_bar_samples` (raw) and
+  `option_leg_spread_band_params` (fits). Both are research tables; the live bot never reads them.
+
 ## Research-vs-reality parity replay (W72; research only, never touches live state)
 
 Runs known real trades through the RESEARCH engine's pricing and exit code and reports where

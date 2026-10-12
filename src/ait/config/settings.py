@@ -810,6 +810,25 @@ class BacktestConfig(_StrictModel):
                     "as stored. Flipping it changes every research baseline (assumption "
                     "A10): record a before/after on the reference study first. "
                     "Operator-owned; default 'legacy' so no study moves silently.")
+    friction_short_dte: bool = Field(default=False,
+        description="W76: charge 0-6 DTE legs from DTE-band friction instead of the single "
+                    "all-DTE per-leg model (friction_model='per_leg_usd' only). The fitted model "
+                    "has no sample below 11 DTE, so short-DTE legs were charged an extrapolated "
+                    "number. When True a band with fewer than friction_min_sessions_per_band "
+                    "collected sessions is charged the all-DTE model floored at "
+                    "friction_extrapolated_floor_usd per leg and the run reports how many legs "
+                    "were extrapolated; a band with enough sessions uses its own fit. Also "
+                    "applies to the EXIT of a long-dated position once its remaining DTE is "
+                    "below 7. Default False: no study moves silently.")
+    friction_min_sessions_per_band: int = Field(default=15, ge=1, le=250,
+        description="W76: sessions of real IB bid/ask bars a 0-6 DTE band needs before its own "
+                    "fit replaces the conservative extrapolation. 15 follows the W66 fit's "
+                    "grouped leave-one-session-out CV, which needs a few sessions per fold.")
+    friction_extrapolated_floor_usd: float = Field(default=0.01, ge=0.005, le=0.10,
+        description="W76: per-leg HALF-spread floor ($/share) used where a short-DTE band has no "
+                    "fitted model. $0.01 is one full option tick paid on each side, a "
+                    "conservative stand-in for QQQ/SPY/IWM at 0-6 DTE (quoted $0.01-0.03 wide). "
+                    "Operator-owned: raise it for a harsher study, lower it once real bars exist.")
     pricing_source: Literal["bs_legacy", "surface"] = Field(default="bs_legacy",
         description="W75: where the research engine gets each condor leg's implied vol. "
                     "'bs_legacy' = one stored 30-day IV plus a skew with no DTE term (every "

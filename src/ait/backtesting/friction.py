@@ -124,3 +124,77 @@ def condor_leg_cost_usd(model: LegSpreadModel, leg_mids, capture: float = 1.0,
                         stress: float = 1.0) -> float:
     """Total dollars/share to cross the spread on every leg of a structure once."""
     return float(capture) * float(stress) * sum(model.half_spread_usd(m) for m in leg_mids)
+
+
+# ---------------------------------------------------------------------------
+# W76: friction by DTE band (0-6 DTE)
+# ---------------------------------------------------------------------------
+#
+# The v2 fit above has no sample below 11 DTE (the sampler mask was DTE 7-45), so every
+# short-DTE leg was charged an EXTRAPOLATED half-spread. At 0-2 DTE the mids are cents,
+# the tick is a large share of them, and credits are $0.4-1.3 over four legs: friction is
+# most of the answer there. Until a band has collected enough sessions of real bid/ask
+# bars, the model below refuses to pretend: it uses the all-DTE model, floors every leg
+# at a conservative per-leg tick, and reports that the number was extrapolated.
+
+SHORT_BAND_EDGES = (2, 6)  # bands: 0-2, 3-6; DTE >= 7 belongs to the all-DTE model
+
+
+def friction_band(dte: int, edges: tuple[int, ...] = SHORT_BAND_EDGES) -> str:
+    """'0-2', '3-6' or '7+' for a (non-negative) calendar DTE."""
+    lo = 0
+    for e in edges:
+        if dte <= e:
+            return f"{lo}-{e}"
+        lo = e + 1
+    return f"{lo}+"
+
+
+def band_dte_range(band: str, edges: tuple[int, ...] = SHORT_BAND_EDGES) -> tuple[int, int]:
+    """Inclusive DTE range of a band label produced by ``friction_band``."""
+    lo = 0
+    for e in edges:
+        if band == f"{lo}-{e}":
+            return lo, e
+        lo = e + 1
+    if band == f"{lo}+":
+        return lo, 10_000
+    raise ValueError(f"unknown friction band {band!r} for edges {edges}")
+
+
+@dataclass(frozen=True)
+class BandedFriction:
+    """All-DTE model + fitted short-DTE band models + the extrapolation rule.
+
+    ``bands`` holds ONLY models whose band reached ``min_sessions`` (the loader decides);
+    a short-DTE query with no such model is answered by ``default`` floored at
+    ``floor_usd`` per leg and flagged ``extrapolated=True``.
+    """
+
+    default: LegSpreadModel
+    bands: dict
+    floor_usd: float
+    edges: tuple[int, ...] = SHORT_BAND_EDGES
+
+    def half_spread_usd(self, mid: float, dte: int) -> tuple[float, bool]:
+        """(dollars per leg per share, extrapolated?)."""
+        band = friction_band(max(int(dte), 0), self.edges)
+        fitted = self.bands.get(band)
+        if fitted is not None:
+            return fitted.half_spread_usd(mid), False
+        v = self.default.half_spread_usd(mid)
+        if band == friction_band(10_000, self.edges):    # the 7+ band: the all-DTE fit's home
+            return v, False
+        return max(v, self.floor_usd), True
+
+
+def banded_condor_leg_cost_usd(model: BandedFriction, leg_mids, dte: int, capture: float = 1.0,
+                               stress: float = 1.0) -> tuple[float, bool]:
+    """Dollars/share to cross the spread on every leg once, and whether any leg's number was
+    extrapolated (a short-DTE band without enough fitted sessions)."""
+    total, extrapolated = 0.0, False
+    for m in leg_mids:
+        v, ex = model.half_spread_usd(m, dte)
+        total += v
+        extrapolated = extrapolated or ex
+    return float(capture) * float(stress) * total, extrapolated

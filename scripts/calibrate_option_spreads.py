@@ -156,6 +156,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--fit-only", action="store_true",
         help="ib-bars: skip sampling and (re)fit from the stored bar samples.")
     parser.add_argument(
+        "--short-dte", action="store_true",
+        help="ib-bars (W76): collect hourly BID/ASK bars of every listed contract expiring in "
+             "0..--short-dte-max days (today's expiry included) and fit one friction model per "
+             "short-DTE band. Run once per RTH session; samples accumulate (INSERT OR IGNORE). "
+             "With --fit-only it only refits the bands from the stored samples.")
+    parser.add_argument(
+        "--short-dte-max", type=int, default=6, metavar="DAYS",
+        help="--short-dte: furthest expiry to sample (default 6).")
+    parser.add_argument(
+        "--short-dte-duration", default="7 D", metavar="DUR",
+        help="--short-dte: history requested per contract (default 7 D: its last week).")
+    parser.add_argument(
+        "--min-sessions", type=int, default=15, metavar="N",
+        help="--short-dte: sessions a band needs before the engine uses its fit "
+             "(mirrors backtest.friction_min_sessions_per_band; default 15).")
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Print request plan without fetching or storing data.",
     )
@@ -764,6 +780,30 @@ async def _main(args: argparse.Namespace) -> int:
                 print(f"ERROR: could not connect to IBKR: {e}")
                 return 1
         t_start = time.time()
+        if args.short_dte:
+            from ait.data.short_dte_collector import (
+                SHORT_BANDS, collect_short_dte, coverage, fit_short_dte_bands)
+            for sym in args.symbols:
+                print(f"=== {sym} (short-DTE 0-{args.short_dte_max}) ===")
+                if ib is not None:
+                    r = await collect_short_dte(
+                        ib, sym, store, window, max_dte=args.short_dte_max,
+                        duration=args.short_dte_duration, pause_secs=args.bars_pause_secs,
+                        dry_run=args.dry_run)
+                    if not args.dry_run:
+                        print(f"  [{sym}] requested={r.requested} stored={r.stored} "
+                              f"unqualified={r.unqualified} errors={r.errors}")
+                if not args.dry_run:
+                    cov = coverage(store.load_spread_bar_samples(sym), args.short_dte_max)
+                    print(f"  [{sym}] stored coverage (all runs): DTE -> samples / sessions")
+                    for d, c in cov.items():
+                        print(f"      DTE {d}: {c['samples']:6d} samples, {c['sessions']:3d} sessions")
+                    fit_short_dte_bands(sym, store, min_sessions=args.min_sessions,
+                                        bands=SHORT_BANDS)
+            if ib is not None:
+                ib.disconnect()
+            print(f"\nDone in {time.time() - t_start:.1f}s.")
+            return 0
         for sym in args.symbols:
             print(f"=== {sym} ===")
             if ib is not None:

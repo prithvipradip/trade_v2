@@ -26,6 +26,15 @@ ET = ZoneInfo("America/New_York")
 SHORT_DELTA_BUCKETS = (0.08, 0.12, 0.16, 0.20, 0.30, 0.40)
 WING_WIDTH_DOLLARS = (2.0, 3.0, 5.0)  # long-leg offsets from the 0.16-delta short strike
 
+# W76: 0-6 DTE collection. At hours-to-expiry a Black-Scholes delta bucket is a poor way to pick
+# strikes (the IV is unknown and t is tiny), so the plan is anchored on MONEYNESS: strikes at
+# these |K/S - 1| fractions on both sides, plus a few delta buckets and wings. Kept compact:
+# IB paces historical requests at 60 per 10 minutes, so every contract costs ~22 s.
+SHORT_DTE_MAX = 6
+SHORT_DTE_MONEYNESS = (0.0025, 0.005, 0.01, 0.02, 0.035)
+SHORT_DTE_DELTA_BUCKETS = (0.08, 0.16, 0.30)
+SHORT_DTE_WINGS = (2.0, 5.0)
+
 
 def parse_window(text: str) -> tuple[time, time]:
     a, b = text.split("-")
@@ -66,18 +75,38 @@ def pair_bid_ask(bid_bars, ask_bars, window: tuple[time, time]) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["bar_time", "bid", "ask"])
 
 
+def _ncdf(x: float) -> float:
+    return 0.5 * math.erfc(-x / math.sqrt(2.0))
+
+
+def _bs_fast(S: float, K: float, t: float, r: float, sigma: float, is_call: bool) -> float:
+    """Black-Scholes via ``math.erfc``: ~100x faster than SciPy's ``norm.cdf`` per call.
+
+    W76: only the IV INVERSION below uses it (62 pricings per sample row, thousands of rows
+    per collection run). The shared ``pricing.black_scholes_price`` is deliberately left
+    alone: changing its arithmetic would move every research baseline in the last bits."""
+    if t <= 0 or sigma <= 0:
+        return max(S - K, 0.0) if is_call else max(K - S, 0.0)
+    v = sigma * math.sqrt(t)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * t) / v
+    d2 = d1 - v
+    if is_call:
+        return max(S * _ncdf(d1) - K * math.exp(-r * t) * _ncdf(d2), 0.0)
+    return max(K * math.exp(-r * t) * _ncdf(-d2) - S * _ncdf(-d1), 0.0)
+
+
 def implied_vol_from_mid(mid: float, S: float, K: float, t: float, right: str,
                          r: float = 0.05) -> float | None:
     """Bisection IV; None when mid is below intrinsic or above S (no solution)."""
-    ot = OptionType.CALL if right == "C" else OptionType.PUT
+    is_call = right == "C"
     if mid <= 0 or S <= 0 or K <= 0 or t <= 0:
         return None
     lo, hi = 0.01, 4.0
-    if black_scholes_price(S, K, t, r, lo, ot) > mid or black_scholes_price(S, K, t, r, hi, ot) < mid:
+    if _bs_fast(S, K, t, r, lo, is_call) > mid or _bs_fast(S, K, t, r, hi, is_call) < mid:
         return None
     for _ in range(60):
         m = 0.5 * (lo + hi)
-        if black_scholes_price(S, K, t, r, m, ot) < mid:
+        if _bs_fast(S, K, t, r, m, is_call) < mid:
             lo = m
         else:
             hi = m
@@ -85,9 +114,14 @@ def implied_vol_from_mid(mid: float, S: float, K: float, t: float, right: str,
 
 
 def delta_from_mid(mid: float, S: float, K: float, dte: int, right: str,
-                   r: float = 0.05) -> tuple[float | None, float | None]:
-    """(delta, iv) implied by the quote mid. (None, None) when it cannot be inverted."""
-    t = max(dte, 0) / 365.0
+                   r: float = 0.05,
+                   t_years: float | None = None) -> tuple[float | None, float | None]:
+    """(delta, iv) implied by the quote mid. (None, None) when it cannot be inverted.
+
+    ``t_years`` (W76) is the real fractional time to the bell: a 0-DTE bar has hours
+    left, not ``dte/365 = 0`` (which cannot be inverted at all, so every 0-DTE row
+    lost its delta and was dropped). Without it the whole-day form is unchanged."""
+    t = float(t_years) if t_years is not None else max(dte, 0) / 365.0
     iv = implied_vol_from_mid(mid, S, K, t, right, r)
     if iv is None:
         return None, None
@@ -127,6 +161,28 @@ def plan_strikes(spot: float, iv: float, dte: int, listed_strikes, right: str,
             k = nearest_listed(listed, base_short + sign * w)
             if k not in out:
                 out[k] = "wing"
+    return sorted(out.items())
+
+
+def plan_short_dte_strikes(spot: float, iv: float, dte: int, listed_strikes, right: str,
+                           ) -> list[tuple[float, str]]:
+    """Strikes to request for one short-DTE (expiry, right): [(strike, role)], de-duplicated.
+
+    Moneyness-anchored (``SHORT_DTE_MONEYNESS``, both sides of spot, role 'short' so the
+    delta test applies) plus the compact delta buckets and dollar wings of the standard
+    plan. Only LISTED strikes are returned.
+    """
+    listed = sorted(float(k) for k in listed_strikes)
+    if not listed or spot <= 0:
+        return []
+    out: dict[float, str] = {}
+    sign = 1.0 if right == "C" else -1.0
+    for frac in SHORT_DTE_MONEYNESS:
+        k = nearest_listed(listed, spot * (1.0 + sign * frac))
+        out.setdefault(k, "short")
+    for k, role in plan_strikes(spot, iv, dte, listed, right,
+                                buckets=SHORT_DTE_DELTA_BUCKETS, wings=SHORT_DTE_WINGS):
+        out.setdefault(k, role)
     return sorted(out.items())
 
 

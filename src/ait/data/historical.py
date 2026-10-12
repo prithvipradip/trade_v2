@@ -101,6 +101,10 @@ class HistoricalDataStore:
         # an hourly sample would collide on it.
         self._spread_bar_table = f"{table_prefix}option_spread_bar_samples"
         self._leg_spread_params_table = f"{table_prefix}option_leg_spread_params"
+        # W76: per-DTE-band friction models. A separate table, not a column on the one
+        # above: that table's primary key is `symbol` alone, and rebuilding it would mean
+        # dropping a table other (possibly running) processes read.
+        self._leg_spread_band_table = f"{table_prefix}option_leg_spread_band_params"
         self._option_daily_bars_table = f"{table_prefix}option_daily_bars"
         self._risk_free_rates_table = f"{table_prefix}risk_free_rates"
         self._econ_events_table = f"{table_prefix}econ_events"
@@ -286,6 +290,22 @@ class HistoricalDataStore:
                     cv_mae_json   TEXT,
                     source        TEXT,
                     calibrated_on TEXT NOT NULL
+                )
+            """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._leg_spread_band_table} (
+                    symbol        TEXT NOT NULL,
+                    dte_band      TEXT NOT NULL,
+                    form          TEXT NOT NULL,
+                    a             REAL NOT NULL,
+                    b             REAL NOT NULL,
+                    n             INTEGER NOT NULL,
+                    n_sessions    INTEGER NOT NULL,
+                    cv_mae        REAL,
+                    cv_mae_json   TEXT,
+                    source        TEXT,
+                    calibrated_on TEXT NOT NULL,
+                    PRIMARY KEY (symbol, dte_band)
                 )
             """)
             # W58: historical per-contract EOD option bars (Polygon/Massive
@@ -1050,6 +1070,28 @@ class HistoricalDataStore:
                  row.get("n_sessions"), row.get("cv_mae"),
                  json.dumps(row.get("cv_mae_by_form") or {}), row.get("source"),
                  str(row["calibrated_on"])))
+
+    def save_leg_spread_band_model(self, symbol: str, band: str, row: dict) -> None:
+        """W76: INSERT OR REPLACE the fitted friction model of one DTE band."""
+        import json
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                f"""INSERT OR REPLACE INTO {self._leg_spread_band_table}
+                   (symbol, dte_band, form, a, b, n, n_sessions, cv_mae, cv_mae_json, source,
+                    calibrated_on) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (symbol, str(band), str(row["form"]), float(row["a"]), float(row["b"]),
+                 int(row["n"]), int(row["n_sessions"]), row.get("cv_mae"),
+                 json.dumps(row.get("cv_mae_by_form") or {}), row.get("source"),
+                 str(row["calibrated_on"])))
+
+    def load_leg_spread_band_models(self, symbol: str) -> dict[str, dict]:
+        """W76: {dte_band: row} of every stored band model for ``symbol`` (may be empty)."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"SELECT * FROM {self._leg_spread_band_table} WHERE symbol = ?",
+                (symbol,)).fetchall()
+        return {r["dte_band"]: dict(r) for r in rows}
 
     def load_leg_spread_model(self, symbol: str) -> dict | None:
         """Fitted friction model v2 for a symbol, or None if never calibrated."""

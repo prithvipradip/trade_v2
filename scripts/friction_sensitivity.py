@@ -65,6 +65,16 @@ def _engine_kwargs(sym, df, feats, cal, args, **over):
               hurst_hard_veto_multiplier=0.0, features_cache=feats,
               condor_any_direction=args.any_direction,
               iv_rank_gate=args.iv_rank_gate, db_path=Path(args.db_path))
+    # W76: optional engine selection for a SHORT-DTE sweep. Every flag defaults to unset, so a
+    # run without them is exactly the W66 sweep.
+    for flag, key in (("entry_dte", "entry_dte"), ("engine_model", "engine_model"),
+                      ("pricing_source", "pricing_source"),
+                      ("friction_short_dte", "friction_short_dte"),
+                      ("expiry_guard_dte", "expiry_guard_dte"),
+                      ("flatten_minutes", "flatten_minutes_before_close")):
+        v = getattr(args, flag, None)
+        if v is not None:
+            kw[key] = v
     kw.update(over)
     return kw
 
@@ -84,6 +94,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--exit-ab", action="store_true", help="also run the payoff-shape A/B")
     ap.add_argument("--iv-rank-gate", action=argparse.BooleanOptionalAction, default=None,
                     help="live's IV-rank floor/cap (default: config backtest.iv_rank_gate)")
+    ap.add_argument("--entry-dte", type=int, default=None, help="W76: engine entry DTE (default: config)")
+    ap.add_argument("--engine-model", choices=["legacy", "realistic"], default=None)
+    ap.add_argument("--pricing-source", choices=["bs_legacy", "surface"], default=None)
+    ap.add_argument("--friction-short-dte", action=argparse.BooleanOptionalAction, default=None,
+                    help="W76: charge 0-6 DTE legs from DTE-band friction (floored when unfitted)")
+    ap.add_argument("--expiry-guard-dte", type=int, default=None)
+    ap.add_argument("--flatten-minutes", type=int, default=None)
     args = ap.parse_args(argv)
 
     from ait.config.runtime_env import apply_runtime_env_defaults, research_capital
