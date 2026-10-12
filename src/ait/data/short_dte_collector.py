@@ -260,3 +260,51 @@ def fit_short_dte_bands(symbol: str, store: Any, *, min_sessions: int,
 def band_of(dte: int, edges: tuple[int, ...] = SHORT_BAND_EDGES) -> str:
     """Re-exported for the script's reporting (single definition lives in friction)."""
     return friction_band(dte, edges)
+
+
+# ---------------------------------------------------------------------------
+# Status file: the one place progress can be read at a glance (manual or scheduled runs)
+# ---------------------------------------------------------------------------
+
+STATUS_SCHEMA = "ait.short_dte_collection/1"
+
+
+def symbol_status(res: CollectionResult | None, cov: dict[int, dict[str, int]],
+                  band_rows: dict[str, dict], sessions_by_band: dict[str, int],
+                  min_sessions: int) -> dict:
+    """One symbol's block: this run's counters, stored coverage, and band progress.
+
+    ``band_rows`` are the models fit in this run; ``sessions_by_band`` is the stored
+    session count per band (also for bands that could not be fit yet)."""
+    bands = {}
+    for band, n in sessions_by_band.items():
+        row = band_rows.get(band) or {}
+        bands[band] = {"sessions": int(n), "needed": int(min_sessions),
+                       "active": bool(n >= min_sessions and row), "fitted": bool(row),
+                       "form": row.get("form"), "n": row.get("n")}
+    return {
+        "planned": getattr(res, "planned", 0), "requested": getattr(res, "requested", 0),
+        "stored": getattr(res, "stored", 0), "unqualified": getattr(res, "unqualified", 0),
+        "errors": getattr(res, "errors", 0), "spot": getattr(res, "spot", None),
+        "dry_run": bool(getattr(res, "dry_run", False)),
+        "coverage": {str(d): v for d, v in cov.items()}, "bands": bands,
+    }
+
+
+def write_status(path, *, ok: bool, error: str | None, symbols: dict[str, dict],
+                 min_sessions: int, duration_s: float, short_dte_max: int) -> dict:
+    """Atomically write the status file and return what was written."""
+    import json
+    import os
+    from pathlib import Path
+
+    status = {"schema": STATUS_SCHEMA, "written_at": datetime.now(ET).isoformat(timespec="seconds"),
+              "ok": bool(ok), "error": error, "duration_s": round(float(duration_s), 1),
+              "short_dte_max": int(short_dte_max), "min_sessions": int(min_sessions),
+              "symbols": symbols}
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(status, indent=1))
+    os.replace(tmp, p)
+    return status

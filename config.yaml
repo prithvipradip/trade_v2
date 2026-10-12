@@ -616,3 +616,17 @@ sizing_probe:
                                        #  builder emits zero (old check: problems=0)
   iv_rank: 55.0                        # must clear backtest.ic_iv_rank_floor, or
                                        #  the probe measures the floor, not the caps
+
+# W76: supervisor-run 0-6 DTE friction collection (research data only; never touches orders).
+# Everything below is the MODEL DEFAULT (collection OFF). To enable: uncomment the block, set
+# short_dte_enabled: true, and restart the SUPERVISOR (a process runs on the settings it started
+# with). First prove it manually: docs/RUNBOOK.md "Short-DTE friction collection".
+# data_collection:
+#   short_dte_enabled: false        # run the collector from the supervisor, Mon-Fri
+#   short_dte_time_et: "16:10"      # after the close; move to ~15:50 if DTE-0 samples are missing
+#   short_dte_symbols: [QQQ]        # ~30-55 min each at IB's historical-data pacing
+#   short_dte_client_id: 91         # must not be IBKR_CLIENT_ID or its +100..+104 ladder
+#   short_dte_max_dte: 6
+#   short_dte_duration: "7 D"
+#   short_dte_timeout_minutes: 150  # hard cap per run
+#   short_dte_idle_minutes: 20      # kill if silent this long

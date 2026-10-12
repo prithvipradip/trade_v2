@@ -232,6 +232,35 @@ python scripts/calibrate_option_spreads.py --source ib-bars --short-dte --symbol
 - **Storage:** `data/historical.db` tables `option_spread_bar_samples` (raw) and
   `option_leg_spread_band_params` (fits). Both are research tables; the live bot never reads them.
 
+### Automatic collection (supervisor job, W76)
+
+Instead of running the command by hand every session, the supervisor (`run_orchestrator.py`) can
+run it Mon-Fri after the close. It is OFF by default.
+
+1. Prove it manually once: the `--dry-run`, then one real run (above).
+2. In `config.yaml` uncomment the `data_collection:` block at the bottom and set
+   `short_dte_enabled: true` (time defaults to 16:10 ET, symbols `[QQQ]`, client id 91).
+3. **Restart the supervisor** (`run_orchestrator.py`): a process runs on the settings it started with.
+   It logs `short_dte_collection_scheduled | time_et=16:10 ...` at startup if it took effect.
+4. Keep the supervisor and TWS/Gateway running at that time. The box being off skips that day
+   (nothing else is lost); the supervisor gives a job an hour of grace if it was only just started.
+
+What it does at the scheduled time: skips non-trading days; refuses to run if the IB port
+(`IBKR_PORT`) is not listening or the client id collides with the bot's (`IBKR_CLIENT_ID` and
++100..+104); runs the same script with an idle timeout (20 min of silence) and a hard cap
+(150 min); never touches the bot or any order.
+
+How to see progress, without opening logs:
+
+- `data/short_dte_collection_status.json`: counters of the last run, stored samples per DTE and
+  sessions, and per band `sessions` vs `needed`, `active` once the band has a fit and 15 sessions.
+- `logs/short_dte_collect_YYYYMMDD.log`: the script's own output for that day.
+- `logs/orchestrator.log`: `short_dte_collection_ok | stored=... bands={...}`.
+
+You get a Telegram message (at most one per day) only when something is wrong: the IB port is
+closed, the client id is refused, the run failed or timed out, or it stored zero samples. A
+healthy day is silent.
+
 ## Research-vs-reality parity replay (W72; research only, never touches live state)
 
 Runs known real trades through the RESEARCH engine's pricing and exit code and reports where

@@ -172,6 +172,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--short-dte-duration", default="7 D", metavar="DUR",
         help="--short-dte: history requested per contract (default 7 D: its last week).")
     parser.add_argument(
+        "--status-file", default=None, metavar="PATH",
+        help="--short-dte: write a JSON progress/status file here when the run ends (counters, "
+             "per-DTE coverage, sessions per band vs the minimum). The supervisor job reads it.")
+    parser.add_argument(
         "--min-sessions", type=int, default=15, metavar="N",
         help="--short-dte: sessions a band needs before the engine uses its fit "
              "(mirrors backtest.friction_min_sessions_per_band; default 15).")
@@ -799,32 +803,59 @@ async def _main(args: argparse.Namespace) -> int:
                 await ib.connectAsync(args.host, args.port, clientId=args.client_id, timeout=10)
             except Exception as e:
                 print(f"ERROR: could not connect to IBKR: {e}")
+                if args.short_dte and args.status_file:
+                    from ait.data.short_dte_collector import write_status
+                    write_status(args.status_file, ok=False,
+                                 error=f"could not connect to IBKR: {e}", symbols={},
+                                 min_sessions=args.min_sessions, duration_s=0.0,
+                                 short_dte_max=args.short_dte_max)
                 return 1
         t_start = time.time()
         if args.short_dte:
             from ait.data.short_dte_collector import (
-                SHORT_BANDS, collect_short_dte, coverage, fit_short_dte_bands)
+                SHORT_BANDS, band_sessions, collect_short_dte, coverage, fit_short_dte_bands,
+                symbol_status, write_status)
+            sym_status: dict[str, dict] = {}
+            run_error: str | None = None
             for sym in args.symbols:
                 print(f"=== {sym} (short-DTE 0-{args.short_dte_max}) ===")
-                if ib is not None:
-                    r = await collect_short_dte(
-                        ib, sym, store, window, max_dte=args.short_dte_max,
-                        duration=args.short_dte_duration, pause_secs=args.bars_pause_secs,
-                        dry_run=args.dry_run)
+                r = None
+                try:
+                    if ib is not None:
+                        r = await collect_short_dte(
+                            ib, sym, store, window, max_dte=args.short_dte_max,
+                            duration=args.short_dte_duration, pause_secs=args.bars_pause_secs,
+                            dry_run=args.dry_run)
+                        if not args.dry_run:
+                            print(f"  [{sym}] requested={r.requested} stored={r.stored} "
+                                  f"unqualified={r.unqualified} errors={r.errors}")
                     if not args.dry_run:
-                        print(f"  [{sym}] requested={r.requested} stored={r.stored} "
-                              f"unqualified={r.unqualified} errors={r.errors}")
-                if not args.dry_run:
-                    cov = coverage(store.load_spread_bar_samples(sym), args.short_dte_max)
-                    print(f"  [{sym}] stored coverage (all runs): DTE -> samples / sessions")
-                    for d, c in cov.items():
-                        print(f"      DTE {d}: {c['samples']:6d} samples, {c['sessions']:3d} sessions")
-                    fit_short_dte_bands(sym, store, min_sessions=args.min_sessions,
-                                        bands=SHORT_BANDS)
+                        samples = store.load_spread_bar_samples(sym)
+                        cov = coverage(samples, args.short_dte_max)
+                        print(f"  [{sym}] stored coverage (all runs): DTE -> samples / sessions")
+                        for d, c in cov.items():
+                            print(f"      DTE {d}: {c['samples']:6d} samples, {c['sessions']:3d} sessions")
+                        saved = fit_short_dte_bands(sym, store, min_sessions=args.min_sessions,
+                                                    bands=SHORT_BANDS)
+                        sym_status[sym] = symbol_status(
+                            r, cov, saved,
+                            {b: band_sessions(samples, b) for b in SHORT_BANDS},
+                            args.min_sessions)
+                    else:
+                        sym_status[sym] = symbol_status(r, {}, {}, {}, args.min_sessions)
+                except Exception as e:  # noqa: BLE001 - report it in the status file, then fail
+                    run_error = f"{sym}: {type(e).__name__}: {e}"
+                    print(f"ERROR: {run_error}")
+                    break
             if ib is not None:
                 ib.disconnect()
-            print(f"\nDone in {time.time() - t_start:.1f}s.")
-            return 0
+            dur = time.time() - t_start
+            if args.status_file:
+                write_status(args.status_file, ok=run_error is None, error=run_error,
+                             symbols=sym_status, min_sessions=args.min_sessions,
+                             duration_s=dur, short_dte_max=args.short_dte_max)
+            print(f"\nDone in {dur:.1f}s.")
+            return 0 if run_error is None else 1
         for sym in args.symbols:
             print(f"=== {sym} ===")
             if ib is not None:

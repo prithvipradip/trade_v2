@@ -6,6 +6,7 @@ Validation catches misconfigurations BEFORE the bot starts trading.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -1692,6 +1693,57 @@ class ParityConfig(_StrictModel):
         return v
 
 
+class DataCollectionConfig(_StrictModel):
+    """W76: scheduled data collection run by the SUPERVISOR (research data only).
+
+    The short-DTE friction collector (``scripts/calibrate_option_spreads.py --source ib-bars
+    --short-dte``) must run once per RTH session, after the close, and IB keeps nothing for an
+    expired contract, so a day nobody runs it is a day of data lost for good. With
+    ``short_dte_enabled`` the supervisor runs it itself on weekdays. It only requests
+    historical bid/ask bars: no orders, a separate client id, no interaction with the bot.
+    Default OFF: enable it after one successful manual ``--dry-run`` (docs/RUNBOOK.md).
+    """
+
+    short_dte_enabled: bool = Field(default=False,
+        description="Run the 0-6 DTE friction collector from the supervisor on weekdays. The "
+                    "supervisor and TWS/Gateway must be running at that time; a day the box is "
+                    "off is skipped (nothing is lost but the day). Takes effect at the next "
+                    "supervisor restart (a process runs on the settings it started with).")
+    short_dte_time_et: str = Field(default="16:10", pattern=r"^([01]\d|2[0-3]):[0-5]\d$",
+        description="ET wall-clock time of the daily run, HH:MM. 16:10 is after the close so the "
+                    "session's last bars exist and today's expiring contract has a full day of "
+                    "bars; whether IB still lists an expiring contract that long is unverified "
+                    "(the first real after-close run shows DTE 0 coverage). Move it earlier "
+                    "(e.g. 15:50) if DTE-0 samples are missing.")
+    short_dte_symbols: list[str] = Field(default=["QQQ"], min_length=1, max_length=5,
+        description="Underlyings to collect. Each costs ~30-55 minutes at IB's historical-data "
+                    "pacing (60 requests per 10 minutes), run sequentially.")
+    short_dte_client_id: int = Field(default=91, ge=1, le=999_999,
+        description="IB API client id for the collector. Must differ from IBKR_CLIENT_ID and its "
+                    "fallback ladder (base+100..base+104); the job refuses to run otherwise.")
+    short_dte_max_dte: int = Field(default=6, ge=1, le=14,
+        description="Furthest expiry (days) to sample. 6 matches the friction bands (0-2, 3-6).")
+    short_dte_duration: str = Field(default="7 D", pattern=r"^\d{1,3} [DW]$",
+        description="History requested per contract. A contract's last week is all a 0-6 DTE "
+                    "sample can come from, so 7 D is enough; re-sampled bars are free "
+                    "(INSERT OR IGNORE).")
+    short_dte_timeout_minutes: int = Field(default=150, ge=10, le=600,
+        description="Hard wall-clock cap for one run; the job kills the process after this.")
+    short_dte_idle_minutes: int = Field(default=20, ge=2, le=120,
+        description="Kill the run if it prints nothing for this long (progress is printed every "
+                    "10 contracts, about 3.6 minutes apart, so silence means a hang).")
+
+    @field_validator("short_dte_symbols")
+    @classmethod
+    def _symbols_are_tickers(cls, v: list[str]) -> list[str]:
+        out = [x.strip().upper() for x in v]
+        if any(not re.fullmatch(r"[A-Z][A-Z0-9.]{0,5}", x) for x in out):
+            raise ValueError(f"short_dte_symbols must be tickers, got {v}")
+        if len(set(out)) != len(out):
+            raise ValueError("short_dte_symbols must not repeat a ticker")
+        return out
+
+
 class IBKREnvConfig(BaseSettings):
     """IBKR connection settings from environment variables."""
 
@@ -1739,6 +1791,7 @@ class Settings(_StrictModel):
     logging: LoggingConfig = LoggingConfig()
     sizing_probe: SizingProbeConfig = SizingProbeConfig()
     parity: ParityConfig = ParityConfig()  # W72: research-vs-reality replay tolerances
+    data_collection: DataCollectionConfig = DataCollectionConfig()  # W76: supervisor-run collection
 
     # Loaded from environment
     ibkr: IBKREnvConfig = IBKREnvConfig()

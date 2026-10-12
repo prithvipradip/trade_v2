@@ -531,6 +531,20 @@ def _dashboard_cfg():
         return DashboardConfig()
 
 
+def _data_collection_cfg():
+    """W76: the supervisor-run data-collection section (default: everything OFF).
+
+    Same contract as `_dashboard_cfg`: this process's frozen settings, and a settings
+    failure falls back to the MODEL defaults (collection disabled) rather than blocking
+    the supervisor."""
+    from ait.config.settings import DataCollectionConfig, load_settings
+    try:
+        return load_settings().data_collection
+    except Exception as e:  # noqa: BLE001
+        _log("warning", "data_collection_config_unavailable", error=str(e))
+        return DataCollectionConfig()
+
+
 def _clear_dashboard_port(port: int) -> bool:
     """R16 #57: free the dashboard port before (re)launching Streamlit.
 
@@ -1651,6 +1665,44 @@ def fetch_shared_logs():
         _log("WARNING", "shared_logs_fetch_failed", error=str(e))
 
 
+def collect_short_dte_friction():
+    """W76: run the 0-6 DTE friction collector, unattended, after the close.
+
+    A thin wrapper: the whole job (guards, command, idle/absolute timeout, outcome
+    classification) lives in ait.orchestration.short_dte_job and is tested without a
+    broker. Failure-only alerts, rate-limited to one per day; a healthy run is logged only
+    (progress is in data/short_dte_collection_status.json). Never raises: a collection
+    problem must never hurt the supervisor."""
+    try:
+        from ait.config.settings import IBKREnvConfig, load_settings
+        from ait.orchestration.short_dte_job import run_collection
+        from ait.utils.time import is_trading_day, today_et
+
+        cfg = _data_collection_cfg()
+        env = IBKREnvConfig()
+        port = int(os.environ.get("IBKR_PORT") or env.ibkr_port)
+        base_id = int(os.environ.get("IBKR_CLIENT_ID") or env.ibkr_client_id)
+        try:
+            min_sessions = int(load_settings().backtest.friction_min_sessions_per_band)
+        except Exception:  # noqa: BLE001
+            min_sessions = 15
+        _log("info", "short_dte_collection_starting", symbols=",".join(cfg.short_dte_symbols),
+             port=port, client_id=cfg.short_dte_client_id)
+        out = run_collection(
+            cfg, root=ROOT, data_dir=DATA_DIR, logs_dir=LOGS_DIR, min_sessions=min_sessions,
+            ibkr_port=port, base_client_id=base_id, is_trading_day=is_trading_day,
+            gateway_listening=_gateway_listening, today=today_et())
+        _log("INFO" if out.status in ("ok", "skipped_not_trading_day") else "WARNING",
+             f"short_dte_collection_{out.status}", detail=out.detail, stored=out.stored,
+             planned=out.planned, bands=out.bands, log=out.log_path)
+        if out.alert_worthy and _alert_gate("short_dte_collection", 20 * 3600):
+            _alert(f"Short-DTE friction collection {out.status}: {out.detail}. "
+                   f"Today's samples may be missing for good (IB keeps nothing for expired "
+                   f"contracts). Log: {out.log_path or 'n/a'}")
+    except Exception as e:  # noqa: BLE001 - must never hurt the supervisor
+        _log("WARNING", "short_dte_collection_failed", error=str(e))
+
+
 def backup_state_db():
     """INST-1 (institutional audit): the entire real track record — the whole
     basis of the go/no-go decision — lives in ONE unreplicated SQLite file on
@@ -2342,6 +2394,17 @@ def _register_recurring_jobs(scheduler, bot, web) -> None:
     scheduler.add_job(fetch_shared_logs,
                       CronTrigger(day_of_week="mon-fri", hour=16, minute=50, timezone=ET),
                       id="shared_logs_fetch")
+    # W76: supervisor-run 0-6 DTE friction collection. Registered ONLY when
+    # data_collection.short_dte_enabled (default off); a process runs on the settings it
+    # started with, so toggling it takes a supervisor restart. See collect_short_dte_friction().
+    _dc = _data_collection_cfg()
+    if _dc.short_dte_enabled:
+        _dc_h, _dc_m = (int(x) for x in _dc.short_dte_time_et.split(":"))
+        scheduler.add_job(collect_short_dte_friction,
+                          CronTrigger(day_of_week="mon-fri", hour=_dc_h, minute=_dc_m, timezone=ET),
+                          id="short_dte_collection", max_instances=1)
+        _log("info", "short_dte_collection_scheduled", time_et=_dc.short_dte_time_et,
+             symbols=",".join(_dc.short_dte_symbols), client_id=_dc.short_dte_client_id)
 
     # Weekly deep backtest: Sunday 8 PM ET
     scheduler.add_job(run_backtest,
