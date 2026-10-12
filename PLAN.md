@@ -15398,3 +15398,84 @@ it moves every research baseline (assumption A10) by roughly the table above. Un
 **NEXT.** W75: real-bar IV surface pricer (the largest remaining parity error, 2-4 vol points; waits partly on the backfill), then W76 friction at 0-6 DTE, W77 settlement/assignment/gap.
 
 ---
+
+## 2026-10-12 - W75: real-bar IV surface pricer (QQQ; research only; default OFF)
+
+Fourth wave of the short-DTE parity programme. The research engine priced every leg off ONE stored 30-day IV plus a DTE-free skew; W72 measured the market's leg IVs 2-4 vol points
+BELOW that at 3-45 DTE and 1-5 above at 0-2 DTE. The repo already holds ~938k real QQQ daily option bars; this wave fits a per-(date, expiry) smile from them and lets the engine price each
+leg off the expiry it actually has. `backtest.pricing_source` defaults to `bs_legacy` (schema and overlay), so **no research result moves until the operator flips it**; the legacy engine is
+still byte-identical to the pre-W72 baseline (198 trades).
+
+**CHANGED.**
+1. `ait.backtesting.iv_surface` (new, pure + read-only): volume-weighted quadratic smile in log-moneyness per (date, expiry); OTM options only, solved IV, volume >= 10, price >= $0.05,
+   |ln K/S| <= 0.10, **DTE >= 1**; lookup uses the expiry's own smile, else linear-in-total-variance between neighbouring expiries, flat IV beyond the ends, moneyness clamped to just outside
+   the fitted range, surface date bounded to 5 days stale. Parquet cache under `data/research_cache` (git-ignored), stamped with the bars' row count and newest date so it rebuilds exactly
+   when the backfill appends; bars are read through a `mode=ro` connection (never `HistoricalDataStore`, which opens for write).
+2. Engine: `pricing_source` (`None -> backtest.pricing_source`). In `surface` mode strike selection and the expected move use the TARGET EXPIRY's at-the-money IV (live reads the chain's
+   ATM IV for that expiry), and entry and every re-mark price each leg at the surface IV of the PREVIOUS session (assumption A3), falling back per leg to the legacy IV and counting it
+   (`surface_pricing_summary` at the end of the run). New pure `pricing.ic_leg_marks_from_ivs`.
+3. `scripts/surface_validate.py`: the bar-to-bar out-of-sample validation below. Parity replay gains a third entry variant, `surface`; `run_backtest` manifest warns on `bs_legacy`.
+4. `BacktestConfig.pricing_source` (`bs_legacy | surface`).
+
+**DATA FINDING THAT SHAPED THE DESIGN.** 0-DTE bar IVs are unusable: they were solved from the 16:00 close with `t` floored at 0.001 y when ~0 time remains (ATM median -6.6 vol points vs the
+prior-session stored IV, IQR 12 points). They are excluded from the fit; a 0-DTE contract is priced from the PREVIOUS session's 1-DTE smile of the same expiry, which is exactly what was
+knowable that morning (tested).
+
+**MEASURED, OUT OF SAMPLE, BAR TO BAR** (each session D predicted ONLY from D-1's surface vs the engine's model: stored 30-day IV known at D-1 plus its skew; test rows volume >= 50,
+price >= $0.10, |ln K/S| <= 0.08; ~173k rows, 2024-10..2026-01):
+
+| DTE band | rows | median option-price \|err\| $: surface vs legacy | relative | IV bias (vol pts): surface vs legacy |
+|---|---|---|---|---|
+| 1-2 | 14,256 | 0.170 vs 0.210 (-19%) | 36% vs 46% | -2.4 vs -3.4 |
+| 3-7 | 53,258 | 0.228 vs 0.418 (-46%) | 26% vs 43% | +0.2 vs +1.9 |
+| 8-14 | 50,090 | 0.304 vs 0.531 (-43%) | 15% vs 24% | +0.1 vs +1.5 |
+| 15-45 | 55,568 | 0.386 vs 0.763 (-49%) | 9% vs 16% | +0.1 vs +1.4 |
+
+The surface wins in every (band x moneyness) cell with >= 30 rows, most in the wings (15-45 DTE, 4-8% OTM: 13% vs 44% relative error). The legacy model's +1.4-1.9 vol-point richness at
+3+ DTE is the same bias the W72 replay found on the operator's real fills. The remaining 1-2 DTE error is mostly genuine day-to-day vol change, not model error.
+- **Next-day roll bias (quantified, NOT shipped).** Actual next-day IV minus the prior smile: +1.7 / +2.0 vol points at 1 DTE (early / late half) on a normal gap, +6.3 / +3.2 after a weekend,
+  -1.0 to -1.4 at 4-5 DTE, within +/-0.7 beyond 7 DTE. A per-(DTE bucket x weekend) adjustment fit on the early half removed the 1-2 DTE bias on the held-out half (+2.28 -> -0.35) but did
+  NOT improve price error (-5%, +9%, -1%, -1% by band), so by the plan's own rule (adopt only where it demonstrably wins) it is not in the pricer.
+
+**MEASURED, REFERENCE STUDY (realistic engine, QQQ, 2025-01-02..2025-12-15 = the window with near-dated smiles, 1 contract/trade, fitted per-leg friction; a fidelity A/B, NOT a
+profitability estimate):**
+
+| entry | bs_legacy: trades / win % / total $ | surface: trades / win % / total $ |
+|---|---|---|
+| 14 DTE | 56 / 51.8 / -2,963 | 60 / 60.0 / -3,599 |
+| 7 DTE, guard 5 | 131 / 47.3 / -6,978 | 135 / 48.9 / -7,210 |
+| 3 DTE, guard 5, flatten 60 | 169 / 69.8 / -2,740 | 164 / 64.0 / -6,833 |
+| 1 DTE, guard 5, flatten 60 | 209 / 60.3 / +1,082 | 209 / 59.8 / -2,060 |
+| 0 DTE, guard 0, flatten 60 | 205 / 11.2 / -7,971 | 186 / 12.9 / -7,739 |
+
+Surface pricing never makes short DTE look better: it moves the 1-3 DTE rows down by $3-4k over ~10.5 months at one contract. ~200 trades per row: directional, not significant. No
+configuration is profitable under surface pricing in this window; friction below 11 DTE is still extrapolated and there is no settlement model (W76, W77).
+
+**PARITY AGAINST THE OPERATOR'S REAL FILLS: NOT YET MEASURABLE.** The replay's `surface` variant works (priced from the previous session's per-leg smile, fractional time) but the manual
+trades (2026-08..10) lie outside the bars (newest bar 2026-06-30; smiles end 2026-01-12 while the expiry-ordered backfill is still at ~88k/151k contracts), so every band reports
+INSUFFICIENT with n=0. It becomes measurable when the backfill covers Aug-Sep 2026 expiries (its window ends 2026-09-28; 09-28 onward needs the operator-run top-up, assumption A11).
+
+**TESTS.** `tests/test_w75_iv_surface.py`: 43 (synthetic bars with a known smile and term structure; fit recovery, every row filter, own-expiry / variance interpolation / flat extrapolation /
+clamp / staleness, a thin noisy print outvoted, no look-ahead (appending later bars changes nothing before them), 0-DTE from the prior 1-DTE smile, read-only loading, cache hit / invalidation /
+corruption, engine switch (entry credit and re-mark from the surface, per-leg fallback counted, floor, ATM IV for selection, unknown symbol degrades loudly), replay variant incl. "a bar ON
+the decision day is never used"). **Mutation-checked: 18 mutants, all caught, files restored byte-for-byte** (the first pass caught 15/18; the three survivors were real gaps: entry pricing
+not checked end to end, the IV floor, and the replay's previous-session rule, each now tested). Gates: `compileall` OK; full fast lane **5464 passed / 46 skipped / 0 failed** (16m09s; W74's lane was 5422 / 45: the 43 new tests, the skip count alternating 45/46 as recorded since W70); `typecheck.py` OK (blocking); `smoke_deploy.py` SMOKE PASS (13 checks); the legacy deterministic reference run is IDENTICAL to the pre-W72 baseline (198 trades).
+
+**DEVIATIONS FROM THE PLAN.** (a) The bars getter lives in `iv_surface.load_bars`, not `historical.py`, because `HistoricalDataStore` opens the store for write. (b) `r` stays 0.05 in surface
+mode: the bar IVs were solved with the 0.05 placeholder, so pricing with them at the same rate is self-consistent; switching to SOFR waits for the phase-B re-solve. (c) The planned
+`backfill_risk_free_rate.py` run was NOT performed (it writes to the research store while the backfill is mid-run; announce first).
+
+**REGISTERED, NOT FIXED.** (1) The phase-B IV/greeks re-solve with real rates has not run (every row still carries 0.05). (2) Bar IVs come from the daily CLOSE of each option vs the 16:00
+underlying close: non-synchronous for thin strikes (volume weighting and the price floor mitigate, not remove); American early exercise is ignored (OTM-only mitigates). (3) QQQ only; SPY/IWM
+have no bars (A8). (4) Smiles end 2026-01-12 until the backfill progresses; later dates fall back per leg (counted, logged). (5) The roll-down bias above is real and unmodelled.
+(6) 0-DTE bar IVs are discarded, so intraday 0-DTE pricing relies on the prior-session 1-DTE smile alone.
+
+**DEPLOY / ROLLBACK.** Research and tests only; nothing is imported by the live bot. `BacktestConfig` gains one defaulted field. No restart. Rollback is a clean `git revert`.
+
+**DECISION FOR THE OPERATOR (pending).** Flip `backtest.pricing_source: surface` in `config_research.yaml`? Recommended for QQQ studies before W79 (it removes the measured +1.4-1.9
+vol-point richness and cuts price error 19-49% out of sample), together with `engine_model: realistic` (W74). Both move every research baseline (assumption A10).
+
+**NEXT.** W76: friction at 0-6 DTE (the next-largest error; the fitted per-leg model has no sample below 11 DTE and needs forward IB bid/ask bars, operator-run), then W77
+settlement/assignment/overnight gap. The `surface` replay row needs the backfill to reach Aug-Sep 2026.
+
+---
