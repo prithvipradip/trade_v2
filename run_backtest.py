@@ -286,6 +286,18 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
             "selector takes the three nearest expiries (W80 wires both). A result here is a "
             "research finding about the DTE, not what the live bot would do today.")
 
+    # W71: the research rise veto has no live counterpart (live gates on the rank LEVEL only:
+    # floor 15, cap 85). It is a declared research-only deviation until the operator decides.
+    _rise = getattr(_bt_cfg, "iv_rank_rise_threshold", None)
+    backtest["iv_rank_rise_threshold"] = _rise
+    if _rise is not None and float(_rise) <= 1.0:
+        warnings.append(
+            f"iv_rank_rise_threshold: {float(_rise):g} - RESEARCH-ONLY gate: entries are blocked when "
+            "the feature-engine iv_rank (a realized-vol range rank) rose by more than this over 10 "
+            "rows. Live has no such veto (it gates on the stored-IV percentile LEVEL, floor 15 / cap "
+            "85). Set backtest.iv_rank_rise_threshold >= 10 in config_research.yaml to remove it; "
+            "see scripts/iv_rank_parity_probe.py and the W71 PLAN entry.")
+
     notes = [
         # R16: this note used to hardcode a 4-day pre-event window; the
         # blackout has been risk.pre_event_blackout_days (currently 1) since

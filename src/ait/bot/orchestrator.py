@@ -4819,8 +4819,9 @@ class TradingOrchestrator:
                 except Exception:  # noqa: BLE001
                     pass
             elif trade:
+                # W71b: the ET date, not the host's (W20/W21/W23/W28 bug class).
                 self._state.set_state(f"trueup_pending_{trade_id}",
-                                      datetime.now().date().isoformat())
+                                      today_et().isoformat())
                 log.info("commission_trueup_deferred_partial_ledger",
                          trade_id=trade_id, executions=exec_n,
                          expected=2 * legs_n)
@@ -5912,7 +5913,9 @@ class TradingOrchestrator:
         """R16: write today's chain ATM IV into the daily IV store (once per
         symbol per day) so iv_rank never runs on a frozen series again."""
         try:
-            today = datetime.now().date().isoformat()
+            # W71b: ET date (the host's is already tomorrow from 18:00 ET on a CEST host,
+            # so the once-a-day marker and the stored IV row would carry the wrong day).
+            today = today_et().isoformat()
             marker = f"iv_saved_{symbol}"
             if self._state.get_state(marker, "") == today:
                 return
@@ -5972,7 +5975,8 @@ class TradingOrchestrator:
             # "cur" is not today's IV: fall through to the realized proxy
             # (tagged in logs) rather than serve a fictitious percentile.
             if pairs:
-                _age_days = (datetime.now().date()
+                # W71b: ET date, so the 5-day freshness gate cannot be off by one at night.
+                _age_days = (today_et()
                              - datetime.fromisoformat(pairs[0][0][:10]).date()).days
                 if _age_days > 5:
                     log.warning("iv_rank_store_stale", symbol=symbol,

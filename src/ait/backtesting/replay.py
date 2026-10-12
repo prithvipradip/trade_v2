@@ -272,6 +272,30 @@ class ResearchData:
         return {"open": float(row[1]), "high": float(row[2]),
                 "low": float(row[3]), "close": float(row[4])}
 
+    def load_intraday_range(self, symbol: str, start_date: date, end_date: date) -> pd.DataFrame:
+        """Read-only 5-minute bars for ``[start_date, end_date]`` (UTC index, OHLCV).
+
+        The shape the engine's ``intraday_store`` contract expects, so research studies can hand a
+        ``ResearchData`` straight to ``Backtester(intraday_store=...)`` without opening the
+        research tables through ``HistoricalDataStore`` (whose constructor may create tables)."""
+        cache = self.__dict__.setdefault("_intra_cache", {})
+        key = (symbol.upper(), start_date, end_date)
+        if key in cache:
+            return cache[key]
+        lo = datetime(start_date.year, start_date.month, start_date.day, tzinfo=timezone.utc)
+        hi = datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59, tzinfo=timezone.utc)
+        fmt = "%Y-%m-%dT%H:%M:%S+00:00"
+        with self._conn() as c:
+            df = pd.read_sql_query(
+                f"SELECT datetime, open AS Open, high AS High, low AS Low, close AS Close, "
+                f"volume AS Volume FROM {self._intra} WHERE symbol = ? AND interval = '5m' "
+                f"AND datetime >= ? AND datetime <= ? ORDER BY datetime",
+                c, params=(symbol.upper(), lo.strftime(fmt), hi.strftime(fmt)))
+        if not df.empty:
+            df.index = pd.DatetimeIndex(pd.to_datetime(df.pop("datetime"), utc=True))
+        cache[key] = df
+        return df
+
     def leg_spread_model(self) -> LegSpreadModel | None:
         """Fitted per-leg half-spread model (un-prefixed table, as the engine reads it)."""
         try:

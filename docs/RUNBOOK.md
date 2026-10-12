@@ -309,6 +309,21 @@ python scripts/parity_replay.py                 # reads data/replay/manual_trade
   entry counts positions that were still alive at its fill time toward `max_concurrent_positions`.
   Legacy and daily-close studies are unchanged.
 
+## The IV-rank rise veto is research-only (W71)
+
+- **What it is.** The research engine blocks a neutral credit entry when the FeatureEngine `iv_rank`
+  (a REALIZED-vol range rank, 0-1) rose by more than `backtest.iv_rank_rise_threshold` (0.30) over
+  10 rows. **Live has no such veto**: it gates on the LEVEL of the stored-IV percentile (condor floor
+  15, credit cap 85; `ait.data.iv_rank`). `tests/test_w71_iv_rank_parity.py` pins that nothing outside
+  the research modules reads the threshold.
+- **Measure it:** `python scripts/iv_rank_parity_probe.py [--ab --workers 6]` (read-only; seconds for
+  the series comparison, minutes for the engine A/B). It reports how the two ranks relate, how many of
+  the veto's days live would have refused anyway and how many are days live WOULD trade.
+- **Remove it from a study:** set `backtest.iv_rank_rise_threshold: 10` (any value >= 1 disables it) in
+  `config_research.yaml`. The parity manifest prints a RESEARCH-ONLY warning while it is active.
+- The research IV series and live's stored series are the same IB historical IV except on the few days
+  live's own scan wrote (a median across expiries), so the level gates are at parity.
+
 ## Searching the entry DTE (W79a; research only)
 
 - **Switch:** `python run_backtest.py --optimize-per-window --search-dte [--dte-range 0 45]

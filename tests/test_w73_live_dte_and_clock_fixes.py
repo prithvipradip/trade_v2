@@ -163,56 +163,58 @@ class TestReconcilerExpiryUsesTheEtDate:
 
 class TestNaiveNowDateRatchet:
     """CLASS GUARD for the shape W28's `.today()` guard missed: `<x>.now().date()`
-    with NO timezone. Two modules are held to ZERO; three orchestrator sites are
-    registered (they belong to the iv_rank work, W71) and may only SHRINK."""
+    with NO timezone. W73 held reconciler.py and options_chain.py to zero and registered
+    three orchestrator sites for the iv_rank work; W71b fixed those, so the WHOLE tree is
+    now held to zero and any new site fails."""
 
-    REGISTERED = {
-        ("bot/orchestrator.py", "_persist_daily_iv"),
-        ("bot/orchestrator.py", "_estimate_iv_rank"),
-        ("bot/orchestrator.py", "_true_up_commission"),
-    }
+    REGISTERED: set[tuple[str, str]] = set()
+
+    @staticmethod
+    def _sites(source: str) -> set[str]:
+        """Enclosing function names of every naive `<x>.now().date()` in ``source``."""
+        tree = ast.parse(source)
+        enclosing: dict[int, str] = {}
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for n in ast.walk(fn):
+                    enclosing[id(n)] = fn.name
+        out: set[str] = set()
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "date" and isinstance(n.func.value, ast.Call)
+                    and isinstance(n.func.value.func, ast.Attribute)
+                    and n.func.value.func.attr == "now"
+                    and not n.func.value.args and not n.func.value.keywords):
+                out.add(enclosing.get(id(n), "<module>"))
+        return out
 
     def _offenders(self) -> set[tuple[str, str]]:
         out: set[tuple[str, str]] = set()
         for path in sorted(SRC.rglob("*.py")):
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
+                text = path.read_text(encoding="utf-8", errors="ignore")
+                names = self._sites(text)
             except SyntaxError:
                 continue
-            enclosing: dict[int, str] = {}
-            for fn in ast.walk(tree):
-                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    for n in ast.walk(fn):
-                        enclosing[id(n)] = fn.name
-            for n in ast.walk(tree):
-                if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                        and n.func.attr == "date" and isinstance(n.func.value, ast.Call)
-                        and isinstance(n.func.value.func, ast.Attribute)
-                        and n.func.value.func.attr == "now"
-                        and not n.func.value.args and not n.func.value.keywords):
-                    out.add((path.relative_to(SRC).as_posix(), enclosing.get(id(n), "<module>")))
+            out |= {(path.relative_to(SRC).as_posix(), name) for name in names}
         return out
 
-    def test_reconciler_and_options_chain_have_none(self):
-        mine = {o for o in self._offenders()
-                if o[0] in ("execution/reconciler.py", "data/options_chain.py")}
-        assert mine == set(), f"naive .now().date() reintroduced: {sorted(mine)}"
+    def test_the_whole_tree_has_none(self):
+        assert self._offenders() == self.REGISTERED, (
+            "a naive `.now().date()` (host date, tomorrow from 18:00 ET on a CEST host) "
+            f"is back: {sorted(self._offenders())}. Use ait.utils.time.today_et().")
 
-    def test_no_new_site_appears_anywhere(self):
-        extra = self._offenders() - self.REGISTERED
-        assert extra == set(), (
-            "a new naive `.now().date()` (host date, tomorrow from 18:00 ET on a CEST "
-            f"host) was added: {sorted(extra)}. Use ait.utils.time.today_et().")
-
-    def test_registered_sites_still_exist_else_shrink_the_list(self):
-        gone = self.REGISTERED - self._offenders()
-        assert gone == set(), (
-            f"{sorted(gone)} no longer use a naive date: delete them from REGISTERED "
-            "(the ratchet only tightens)")
+    def test_the_guard_detects_the_shape(self):
+        """The tree is clean, so prove the detector on synthetic source instead."""
+        bad = ("from datetime import datetime\n"
+               "def f():\n    return datetime.now().date()\n"
+               "def g():\n    return datetime.now(tz).date()\n"
+               "X = datetime.now().date()\n")
+        assert self._sites(bad) == {"f", "<module>"}      # g passes a tz: not the naive shape
+        assert self._sites("def h():\n    return today_et()\n") == set()
 
     def test_the_guard_actually_scans_the_tree(self):
         assert len(list(SRC.rglob("*.py"))) > 50
-        assert self._offenders(), "the scan found nothing: the guard is broken, not the tree clean"
 
 
 # --------------------------------------------------------------------------

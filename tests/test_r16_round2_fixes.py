@@ -495,7 +495,9 @@ class TestDailyIvStoreActuallyWrites:
 
     def test_already_saved_today_is_a_noop(self):
         orch = self._orch()
-        from datetime import datetime as _dt
-        orch._state.get_state.return_value = _dt.now().date().isoformat()
+        # W71b: the once-a-day marker is the ET date (the host's is a day ahead from 18:00 ET on
+        # a CEST host); the host-date form of this test began failing after host midnight.
+        from ait.utils.time import today_et
+        orch._state.get_state.return_value = today_et().isoformat()
         orch._persist_daily_iv("SPY", [SimpleNamespace(atm_iv=0.20)])
         orch._historical.save_daily_iv.assert_not_called()
