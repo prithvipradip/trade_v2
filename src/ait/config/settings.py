@@ -505,6 +505,77 @@ class OptionsConfig(_StrictModel):
         return v
 
 
+class DteSearchConfig(_StrictModel):
+    """W79a: the opt-in DTE dimensions of an Optuna study (research only).
+
+    Off by default and switched on per study (``run_backtest.py --search-dte``): the existing
+    ``IRON_CONDOR_SPACE`` is untouched, so every other study is unchanged. When enabled the
+    condor search ADDS entry DTE, the expiry guard and the hold fraction (the fraction REPLACES
+    ``max_hold_days`` for credit structures, so "hold between 0 and DTE" is one dimension for
+    every entry DTE). The credit floors (``ic_min_credit*``) are deliberately NOT searched: they
+    are live economics floors and a search would optimise against an unmeasured cost model.
+    """
+
+    enabled: bool = Field(default=False,
+        description="W79a: add the DTE dimensions to the iron-condor search. Per-study switch "
+                    "(CLI --search-dte); requires optimize_per_window.")
+    entry_dte: list[int] = Field(default=[0, 45],
+        description="W79a: inclusive range of the searched entry DTE (calendar days). The "
+                    "operator's stated research range is 0-45; the live dte_range validator "
+                    "still forbids 0 until W80.")
+    guard_dte: list[int] = Field(default=[0, 5],
+        description="W79a: inclusive range of the searched expiry_guard_dte: entries with at "
+                    "most this many DTE are exempt from live rules 3/3a (the close at DTE<=5). "
+                    "0-5 spans 'rules apply to everything' to 'every short entry is exempt'.")
+    hold_fraction: list[float] = Field(default=[0.05, 1.0],
+        description="W79a: range of the searched max_hold_fraction: close after this share of "
+                    "the position's own life. 1.0 = hold to expiry (or the flatten).")
+    search_flatten: bool = Field(default=False,
+        description="W79a: also search flatten_minutes_before_close. OFF because the W77 study "
+                    "and the W79a flatness check show it has NO effect while the take-profit "
+                    "ladder is on (positions never reach the bell): a flat dimension only "
+                    "wastes trials (the W65 inert-wing_k rule).")
+    flatten_minutes: list[int] = Field(default=[30, 120],
+        description="W79a: range of the searched flatten (minutes before the close) when "
+                    "search_flatten is on. A hard backstop, not a profit lever.")
+    multivariate: bool = Field(default=False,
+        description="W79a: TPESampler(multivariate=True, group=True). Off: the search space is "
+                    "conditional (the guard decides which of the other dimensions bind) and "
+                    "grouped TPE is an experimental sampler in optuna.")
+    strict: bool = Field(default=False,
+        description="W79a: a per-window optimisation that FAILS aborts the study instead of "
+                    "silently falling back to the base config (the W79 'searched nothing' "
+                    "failure). Recommended on for any study whose numbers will be quoted.")
+
+    @staticmethod
+    def _pair(v, lo, hi, name, floatish=False):
+        if len(v) != 2 or not (lo <= v[0] <= v[1] <= hi):
+            raise ValueError(f"{name} must be [low, high] with {lo} <= low <= high <= {hi}")
+        return v
+
+    @field_validator("entry_dte")
+    @classmethod
+    def _v_entry(cls, v: list[int]) -> list[int]:
+        return cls._pair(v, 0, 45, "dte_search.entry_dte")
+
+    @field_validator("guard_dte")
+    @classmethod
+    def _v_guard(cls, v: list[int]) -> list[int]:
+        return cls._pair(v, 0, 45, "dte_search.guard_dte")
+
+    @field_validator("hold_fraction")
+    @classmethod
+    def _v_frac(cls, v: list[float]) -> list[float]:
+        if len(v) != 2 or not (0.0 < v[0] <= v[1] <= 1.0):
+            raise ValueError("dte_search.hold_fraction must be [low, high] with 0 < low <= high <= 1")
+        return v
+
+    @field_validator("flatten_minutes")
+    @classmethod
+    def _v_flat(cls, v: list[int]) -> list[int]:
+        return cls._pair(v, 5, 390, "dte_search.flatten_minutes")
+
+
 class BacktestConfig(_StrictModel):
     @field_validator("macro_event_types")
     @classmethod
@@ -859,6 +930,9 @@ class BacktestConfig(_StrictModel):
                     "backstop so no position reaches settlement, assignment or an "
                     "unhedged gap after a one-sided expiry (the exposure that cost two "
                     "manual trades more than their defined maximum).")
+    dte_search: DteSearchConfig = Field(default_factory=DteSearchConfig,
+        description="W79a: opt-in DTE dimensions for an Optuna study (see DteSearchConfig). "
+                    "Research only; the live bot never reads it.")
     pin_band_usd: float = Field(default=0.10, ge=0.0, le=1.0,
         description="W77: a SHORT leg within this many dollars of its strike at the expiry "
                     "bell is a pin: whether it is assigned cannot be known at the close, so "

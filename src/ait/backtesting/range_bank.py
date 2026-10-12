@@ -40,7 +40,7 @@ class RangeModelBank:
     def __init__(
         self,
         train_fn: Callable[[int], RangeResult | None],
-        bucket_fn: Callable[[int | None], int],
+        bucket_fn: Callable[..., int],
     ) -> None:
         self._train_fn = train_fn
         self._bucket_fn = bucket_fn
@@ -71,15 +71,23 @@ class RangeModelBank:
         return res
 
     # -- lookup by entry DTE --------------------------------------------------------------
-    def horizon_for(self, entry_dte: int | None = None) -> int:
-        return int(self._bucket_fn(entry_dte))
+    def horizon_for(self, entry_dte: int | None = None, guard_dte: int | None = None,
+                    hold_fraction: float | None = None) -> int:
+        """The horizon serving a trade shaped by these knobs (None = the study's base value).
 
-    def for_entry_dte(self, entry_dte: int | None = None) -> RangeResult:
-        return self.get(self.horizon_for(entry_dte))
+        W79a: the reachable horizon depends on the entry DTE AND on the expiry guard and the
+        hold fraction, all of which are searched per trial, so the bucket function takes all
+        three."""
+        return int(self._bucket_fn(entry_dte, guard_dte, hold_fraction))
 
-    def predictor_for(self, entry_dte: int | None = None) -> Any:
+    def for_entry_dte(self, entry_dte: int | None = None, guard_dte: int | None = None,
+                      hold_fraction: float | None = None) -> RangeResult:
+        return self.get(self.horizon_for(entry_dte, guard_dte, hold_fraction))
+
+    def predictor_for(self, entry_dte: int | None = None, guard_dte: int | None = None,
+                      hold_fraction: float | None = None) -> Any:
         """The optimizer's per-trial hook: just the predictor (None when training failed)."""
-        return self.for_entry_dte(entry_dte)[0]
+        return self.for_entry_dte(entry_dte, guard_dte, hold_fraction)[0]
 
     # -- introspection (tests, study) --------------------------------------------------------
     @property

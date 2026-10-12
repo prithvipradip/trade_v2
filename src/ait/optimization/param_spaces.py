@@ -173,6 +173,30 @@ LIGHTGBM_SPACE: dict[str, tuple] = {
 }
 
 # Keyed by strategy name as used in WalkForwardBacktester / Backtester
+# W79a: the opt-in DTE dimensions (research only). Not part of IRON_CONDOR_SPACE on purpose: that
+# dict feeds every other study and the reachability guard test. ``max_hold_days`` is replaced, not
+# supplemented: with a hold fraction set the engine ignores the day cap.
+DTE_SEARCH_REPLACES: tuple[str, ...] = ("max_hold_days",)
+
+
+def dte_search_space(cfg) -> dict[str, tuple]:
+    """Extra iron-condor dimensions for a DTE study, from ``BacktestConfig.dte_search``.
+
+    ``cfg`` is a ``DteSearchConfig`` (or None). Returns ``{}`` unless it is enabled, so a
+    caller can merge the result unconditionally."""
+    if cfg is None or not getattr(cfg, "enabled", False):
+        return {}
+    space: dict[str, tuple] = {
+        "entry_dte":         ("int", int(cfg.entry_dte[0]), int(cfg.entry_dte[1])),
+        "expiry_guard_dte":  ("int", int(cfg.guard_dte[0]), int(cfg.guard_dte[1])),
+        "max_hold_fraction": ("float", float(cfg.hold_fraction[0]), float(cfg.hold_fraction[1])),
+    }
+    if getattr(cfg, "search_flatten", False):
+        space["flatten_minutes_before_close"] = (
+            "int", int(cfg.flatten_minutes[0]), int(cfg.flatten_minutes[1]))
+    return space
+
+
 STRATEGY_SPACES: dict[str, dict[str, tuple]] = {
     "iron_condor":       IRON_CONDOR_SPACE,
     "short_strangle":    SHORT_STRANGLE_SPACE,

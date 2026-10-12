@@ -205,6 +205,20 @@ class WalkForwardConfig:
     # dte_range and measured a median 18 DTE (14-25) over its first 14
     # condors, so studies keyed to DTE (the take-profit ladder) set it.
     entry_dte: int | None = None
+    # W79a: the short-DTE exit knobs and the searched short delta, all research-only and None =
+    # the engine resolves from settings.backtest (so nothing moves unless a study sets them).
+    # Before W79a none of these reached a trial or the OOS run: a searched delta_short was
+    # applied to nothing (lead L1) and a study could not hold a fixed guard / fraction / flatten.
+    expiry_guard_dte: int | None = None
+    max_hold_fraction: float | None = None
+    flatten_minutes_before_close: int | None = None
+    delta_short: float | None = None
+    # W79a: search the entry DTE and its exit dimensions per window (DteSearchConfig supplies the
+    # ranges). None -> backtest.dte_search.enabled. Requires optimize_per_window.
+    dte_search: bool | None = None
+    dte_range: "tuple[int, int] | None" = None     # overrides dte_search.entry_dte (CLI --dte-range)
+    optimize_strict: bool | None = None            # None -> backtest.dte_search.strict
+    optimize_multivariate: bool | None = None      # None -> backtest.dte_search.multivariate
     # Research-only post-event blackout (scripts/post_event_study.py): block
     # credit entries for N calendar days after each date in post_event_dates
     # (ISO strings, so the config pickles into window workers). None = off.
@@ -242,8 +256,9 @@ class WalkForwardConfig:
                 raise ValueError("post_event_blackout_days must be >= 0")
         if self.post_event_dates is not None:
             self.post_event_dates = tuple(str(d)[:10] for d in self.post_event_dates)
-        _research_only = [name for name in ("credit_tp_ladder", "entry_dte",
-                                            "post_event_blackout_days")
+        # W79a: entry_dte (and the guard / fraction / flatten / delta_short baselines) now reach
+        # every trial Backtester through StrategyOptimizer, so they are no longer refused here.
+        _research_only = [name for name in ("credit_tp_ladder", "post_event_blackout_days")
                           if getattr(self, name) is not None]
         if _research_only and self.optimize_per_window:
             # StrategyOptimizer trials build their own Backtester without
@@ -252,6 +267,29 @@ class WalkForwardConfig:
             raise ValueError(
                 f"{', '.join(_research_only)} not threaded into per-window "
                 "Optuna trials; run with optimize_per_window=False")
+        # W79a: DTE-search switches resolve from the loaded settings (research overlay).
+        if self.max_hold_fraction is not None and not 0.0 < float(self.max_hold_fraction) <= 1.0:
+            raise ValueError(f"max_hold_fraction must be in (0, 1], got {self.max_hold_fraction}")
+        if self.dte_range is not None:
+            _lo, _hi = (int(x) for x in self.dte_range)
+            if not 0 <= _lo <= _hi <= 45:
+                raise ValueError(f"dte_range must satisfy 0 <= low <= high <= 45, got {self.dte_range}")
+            self.dte_range = (_lo, _hi)
+        try:
+            from ait.config.settings import DteSearchConfig as _DSC, load_settings as _ls
+            _ds = _ls().backtest.dte_search
+        except Exception:  # noqa: BLE001 - no config.yaml -> the model defaults
+            from ait.config.settings import DteSearchConfig as _DSC
+            _ds = _DSC()
+        if self.dte_search is None:
+            self.dte_search = bool(_ds.enabled)
+        if self.optimize_strict is None:
+            self.optimize_strict = bool(_ds.strict)
+        if self.optimize_multivariate is None:
+            self.optimize_multivariate = bool(_ds.multivariate)
+        if self.dte_search and not self.optimize_per_window:
+            raise ValueError("dte_search requires optimize_per_window=True (the DTE is chosen "
+                             "per window by Optuna)")
         if self.initial_capital is None:
             from ait.config.runtime_env import research_capital
             self.initial_capital = research_capital()
@@ -425,6 +463,12 @@ class WalkForwardResult:
     entry_funnel: dict = field(default_factory=dict)
     # W67: {window_id: {symbol: {"usable", "best_value", "best_n_trades"}}} (empty = no Optuna)
     optimization_status: dict = field(default_factory=dict)
+
+    @property
+    def optimization_failures(self) -> int:
+        """W79a: (window, symbol) optimisations that FAILED and fell back to the base config."""
+        return sum(1 for per_sym in self.optimization_status.values()
+                   for st in (per_sym or {}).values() if isinstance(st, dict) and st.get("failed"))
 
     @property
     def total_trades(self) -> int:
@@ -1699,6 +1743,11 @@ class WalkForwardBacktester:
                 pre_event_blackout_days=getattr(window_cfg, "pre_event_blackout_days", None),
                 credit_tp_ladder=getattr(window_cfg, "credit_tp_ladder", None),
                 entry_dte=getattr(window_cfg, "entry_dte", None),
+                # W79a: the short-DTE exit knobs and the (possibly searched) delta reach the run
+                expiry_guard_dte=getattr(window_cfg, "expiry_guard_dte", None),
+                max_hold_fraction=getattr(window_cfg, "max_hold_fraction", None),
+                flatten_minutes_before_close=getattr(window_cfg, "flatten_minutes_before_close", None),
+                delta_short=getattr(window_cfg, "delta_short", None),
                 db_path=self._db_path,  # W52a: the engine reads THIS store
                 post_event_blackout_days=getattr(window_cfg, "post_event_blackout_days", None),
                 post_event_dates=getattr(window_cfg, "post_event_dates", None),
@@ -2066,6 +2115,14 @@ class WalkForwardBacktester:
                     # W78: per-trial horizon (None provider = the single model above).
                     range_predictor_provider=(
                         range_bank.predictor_for if range_bank is not None else None),
+                    # W79a: the DTE baselines and the opt-in search block (L1: delta_short too).
+                    entry_dte=self._config.entry_dte,
+                    expiry_guard_dte=self._config.expiry_guard_dte,
+                    max_hold_fraction=self._config.max_hold_fraction,
+                    flatten_minutes_before_close=self._config.flatten_minutes_before_close,
+                    delta_short=self._config.delta_short,
+                    dte_search=self._dte_search_block(),
+                    multivariate=bool(self._config.optimize_multivariate),
                     val_split=self._config.optimize_val_split,
                     # R20b review follow-up: trial objectives priced with the
                     # same training-window VIX/SPY context as features_cache
@@ -2095,6 +2152,19 @@ class WalkForwardBacktester:
                 patience=self._config.optimize_patience,
             )
 
+            # W79a: keep the compact DTE trials with the window's optimisation status, so the
+            # report works in sequential AND parallel mode (the status dict already travels
+            # back from the window workers). Only for a DTE study: other runs are unchanged.
+            if getattr(self._config, "dte_search", False):
+                _dte_names = ("entry_dte", "expiry_guard_dte", "max_hold_fraction",
+                              "flatten_minutes_before_close")
+                _st = self._opt_status_by_window.setdefault(window_id, {}).setdefault(symbol, {})
+                _st["trials"] = [
+                    {"params": {k.rpartition("__")[2]: v for k, v in t["params"].items()
+                                if k.rpartition("__")[2] in _dte_names},
+                     "value": t["value"], "n_trades": t["n_trades"], "state": t["state"]}
+                    for t in _optuna_meta["trials"]]
+
             # Build an updated config from merged best params, falling back to originals
             import dataclasses
             cfg_dict = dataclasses.asdict(self._config)
@@ -2112,6 +2182,14 @@ class WalkForwardBacktester:
             return new_cfg, all_best_params, _optuna_meta
         except Exception as e:
             log.warning("window_optimization_failed", window=window_id, symbol=symbol, error=str(e))
+            # W79a: a failed optimisation used to vanish into a fall-back to the BASE config, so
+            # a study that searched nothing looked identical to one that did. It is now a
+            # counted status (travels through the parallel workers with the rest of
+            # optimization_status) and, under optimize_strict, an error.
+            self._opt_status_by_window.setdefault(window_id, {})[symbol] = {
+                "usable": False, "failed": True, "error": f"{type(e).__name__}: {e}"}
+            if getattr(self._config, "optimize_strict", False):
+                raise
             return None, None, None
 
     def _evaluate_range_model_oos(
@@ -2623,7 +2701,9 @@ class WalkForwardBacktester:
             results.append(per_symbol)
         return results
 
-    def _range_label_horizon(self, entry_dte: "int | None" = None) -> int:
+    def _range_label_horizon(self, entry_dte: "int | None" = None,
+                             guard_dte: "int | None" = None,
+                             hold_fraction: "float | None" = None) -> int:
         """Label/eval horizon for the range model: the REACHABLE trade horizon.
 
         PR#7 review 2026-08-25: both range-training paths passed
@@ -2649,14 +2729,19 @@ class WalkForwardBacktester:
             entry_dte = int(_opts.dte_range[0])
         # W78: ONE definition shared with the live spec (ait.ml.range_spec.horizon_for).
         # guard / hold-fraction fields arrive with W79; getattr keeps partial configs valid.
+        # W79a: a window / trial may carry its OWN guard and fraction (they are searched);
+        # None falls back to the study's base values.
         return horizon_for(
             int(entry_dte),
-            guard_dte=getattr(self._config, "expiry_guard_dte", None),
-            hold_fraction=getattr(self._config, "max_hold_fraction", None),
+            guard_dte=(guard_dte if guard_dte is not None
+                       else getattr(self._config, "expiry_guard_dte", None)),
+            hold_fraction=(hold_fraction if hold_fraction is not None
+                           else getattr(self._config, "max_hold_fraction", None)),
             max_hold_days=int(self._config.max_hold_days),
         )
 
-    def _range_bucket(self, entry_dte: "int | None" = None) -> int:
+    def _range_bucket(self, entry_dte: "int | None" = None, guard_dte: "int | None" = None,
+                      hold_fraction: "float | None" = None) -> int:
         """W78: the horizon whose range model serves ``entry_dte`` (None = the base config).
 
         The base configuration keeps its EXACT horizon (what it has always trained at); any
@@ -2665,16 +2750,37 @@ class WalkForwardBacktester:
         """
         from ait.ml.range_spec import bucket_for
         base = self._range_label_horizon()
-        if entry_dte is None:
+        if entry_dte is None and guard_dte is None and hold_fraction is None:
             return base
-        h = self._range_label_horizon(int(entry_dte))
+        h = self._range_label_horizon(
+            None if entry_dte is None else int(entry_dte), guard_dte, hold_fraction)
         return base if h == base else bucket_for(h)
 
     def _pick_range_model(self, bank: "RangeModelBank", window_cfg: "Any") -> "tuple[int, tuple]":
         """W78: (bucket, (predictor, status, threshold)) that gates this window's OOS run: the
         model for the window config's OWN entry DTE (None -> the base bucket)."""
-        bucket = self._range_bucket(getattr(window_cfg, "entry_dte", None))
+        bucket = self._range_bucket(
+            getattr(window_cfg, "entry_dte", None),
+            getattr(window_cfg, "expiry_guard_dte", None),
+            getattr(window_cfg, "max_hold_fraction", None))
         return bucket, bank.get(bucket)
+
+    def _dte_search_block(self) -> "Any | None":
+        """W79a: the DteSearchConfig handed to each window's optimizer (None = not searching).
+
+        The ranges come from the loaded settings; the per-study switches on the walk-forward
+        config (enable, ``dte_range``) win."""
+        if not getattr(self._config, "dte_search", False):
+            return None
+        from ait.config.settings import DteSearchConfig
+        try:
+            base = self._settings.backtest.dte_search
+        except Exception:  # noqa: BLE001 - partial stubs -> the model defaults
+            base = DteSearchConfig()
+        upd: dict = {"enabled": True}
+        if getattr(self._config, "dte_range", None) is not None:
+            upd["entry_dte"] = list(self._config.dte_range)
+        return base.model_copy(update=upd)
 
     def _train_range_bucket(self, train_df: pd.DataFrame, symbol: str, window_id: int,
                             bucket: int) -> "tuple[Any | None, str, float]":
@@ -2902,6 +3008,11 @@ class WalkForwardBacktester:
                 pre_event_blackout_days=getattr(window_cfg, "pre_event_blackout_days", None),
                 credit_tp_ladder=getattr(window_cfg, "credit_tp_ladder", None),
                 entry_dte=getattr(window_cfg, "entry_dte", None),
+                # W79a: the short-DTE exit knobs and the (possibly searched) delta reach the run
+                expiry_guard_dte=getattr(window_cfg, "expiry_guard_dte", None),
+                max_hold_fraction=getattr(window_cfg, "max_hold_fraction", None),
+                flatten_minutes_before_close=getattr(window_cfg, "flatten_minutes_before_close", None),
+                delta_short=getattr(window_cfg, "delta_short", None),
                 db_path=self._db_path,  # W52a: the engine reads THIS store
                 post_event_blackout_days=getattr(window_cfg, "post_event_blackout_days", None),
                 post_event_dates=getattr(window_cfg, "post_event_dates", None),

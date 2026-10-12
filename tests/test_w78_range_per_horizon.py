@@ -149,7 +149,7 @@ class TestRangeModelBank:
     def test_lookup_by_entry_dte_goes_through_the_bucket_function(self):
         seen = []
         bank = RangeModelBank(lambda h: (f"p{h}", "ok", 0.05),
-                              lambda e: (seen.append(e), 5 if e == 7 else 9)[1])
+                              lambda e, g, f: (seen.append(e), 5 if e == 7 else 9)[1])
         assert bank.predictor_for(7) == "p5"
         assert bank.predictor_for(None) == "p9"
         assert seen == [7, None]
@@ -272,9 +272,9 @@ class TestOptimizerProvider:
     def test_provider_supplies_the_trial_model_and_is_asked_per_trial(self, monkeypatch):
         asked = []
         got = self._run(monkeypatch, range_predictor="single",
-                        range_predictor_provider=lambda e: (asked.append(e), "per-trial")[1])
+                        range_predictor_provider=lambda e, g, f: (asked.append((e, g, f)), "per-trial")[1])
         assert got["range_predictor"] == "per-trial"
-        assert asked == [None]       # no entry_dte in bt_kwargs until W79 -> the base bucket
+        assert asked == [(None, None, None)]   # nothing searched or set -> the base bucket
 
 
 # --------------------------------------------------------------------------

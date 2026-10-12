@@ -25,7 +25,9 @@ import optuna
 import pandas as pd
 
 from ait.optimization.objectives import OBJECTIVES
-from ait.optimization.param_spaces import FRACTAL_GATE_SPACE, ML_SPACES, STRATEGY_SPACES
+from ait.optimization.param_spaces import (
+    DTE_SEARCH_REPLACES, FRACTAL_GATE_SPACE, ML_SPACES, STRATEGY_SPACES, dte_search_space,
+)
 from ait.optimization.results import OptimizationResult
 from ait.utils.logging import get_logger
 
@@ -164,9 +166,10 @@ class StrategyOptimizer:
         intraday_store: "Any | None" = None,
         symbol: str | None = None,
         range_predictor: "Any | None" = None,
-        # W78: optional per-trial hook ``entry_dte | None -> predictor``. When set, each trial's
-        # Backtester is gated by the range model for THAT trial's entry DTE (W79 puts the DTE in
-        # bt_kwargs); None keeps the single model above for every trial, as before.
+        # W78/W79a: optional per-trial hook ``(entry_dte, expiry_guard_dte, max_hold_fraction)
+        # -> predictor`` (each None = the study's base). When set, each trial's Backtester is
+        # gated by the range model for THAT trial's reachable horizon; None keeps the single
+        # model above for every trial, as before.
         range_predictor_provider: "Any | None" = None,
         val_split: bool = False,
         # R20b review follow-up: walkforward builds vix_ctx for the training
@@ -183,6 +186,16 @@ class StrategyOptimizer:
         # of every construction re-reading + re-validating the file from
         # disk. None (default) preserves the original behavior — load it here.
         settings: "Any | None" = None,
+        # W79a: baselines for the DTE dimensions (None = the engine resolves them from
+        # settings.backtest, exactly as before) plus the opt-in search block. A searched value
+        # overrides its baseline through the same loop as every other param.
+        entry_dte: int | None = None,
+        expiry_guard_dte: int | None = None,
+        max_hold_fraction: float | None = None,
+        flatten_minutes_before_close: int | None = None,
+        delta_short: float | None = None,        # L1: the searched value must also be the OOS one
+        dte_search: "Any | None" = None,         # DteSearchConfig | None
+        multivariate: bool = False,
     ) -> None:
         if objective not in OBJECTIVES:
             raise ValueError(f"Unknown objective '{objective}'. Choose from: {list(OBJECTIVES)}")
@@ -274,7 +287,14 @@ class StrategyOptimizer:
             None, "exit", "trailing_stop_pct", _EXC, self._settings))
         self._breakeven_trigger_pct = float(_rcv(
             None, "exit", "breakeven_trigger_pct", _EXC, self._settings))
-        self._delta_short = float(_rcv(None, "backtest", "delta_short", _BTC2, self._settings))
+        self._delta_short = float(_rcv(delta_short, "backtest", "delta_short", _BTC2, self._settings))
+        self._entry_dte = None if entry_dte is None else int(entry_dte)
+        self._expiry_guard_dte = None if expiry_guard_dte is None else int(expiry_guard_dte)
+        self._max_hold_fraction = None if max_hold_fraction is None else float(max_hold_fraction)
+        self._flatten_minutes = (None if flatten_minutes_before_close is None
+                                 else int(flatten_minutes_before_close))
+        self._dte_search = dte_search
+        self._multivariate = bool(multivariate)
         self._delta_long = float(_rcv(None, "backtest", "delta_long", _BTC2, self._settings))
         self._iv_rank_series = iv_rank_series or {}
         self._fractal_veto_spread = float(_rcv(
@@ -372,7 +392,8 @@ class StrategyOptimizer:
             study_name=self._study_name,
             storage=self._storage,
             load_if_exists=True,
-            sampler=optuna.samplers.TPESampler(seed=self._seed),
+            sampler=optuna.samplers.TPESampler(
+                seed=self._seed, multivariate=self._multivariate, group=self._multivariate),
             pruner=optuna.pruners.MedianPruner(n_warmup_steps=1),
         )
 
@@ -524,6 +545,12 @@ class StrategyOptimizer:
             dte = int(self._settings.options.dte_range[0]) if self._settings else 21
         except Exception:  # noqa: BLE001
             dte = 21
+        # W79a: the inertness test must hold at the SMALLEST DTE the study can pick, not the
+        # configured band's low end (the expected move, hence the wing target, shrinks with DTE).
+        if self._entry_dte is not None:
+            dte = self._entry_dte
+        if dte_search_space(self._dte_search):
+            dte = max(1, int(self._dte_search.entry_dte[0]))
         smallest_target = None
         for df in self._data.values():
             if df is None or df.empty:
@@ -548,9 +575,22 @@ class StrategyOptimizer:
         # Strategy-level params — merge spaces for all requested strategies
         for strategy in self._strategies:
             space = STRATEGY_SPACES.get(strategy, {})
+            if strategy == "iron_condor":
+                _extra = dte_search_space(self._dte_search)
+                if _extra:    # W79a: the hold fraction replaces the day cap
+                    space = {k: v for k, v in space.items() if k not in DTE_SEARCH_REPLACES}
+                    space = {**space, **_extra}
             for name, spec in space.items():
                 key = f"{strategy}__{name}"
                 if key in params or key in self._dropped_params:
+                    continue
+                # W79a (flatness check): the expiry guard only exempts entries AT OR BELOW it, so
+                # for a trial whose entry DTE is above the searched range the dimension is flat
+                # (identical trades at every value). Do not sample it there: a define-by-run
+                # conditional, which TPE handles, instead of spending trials on a no-op.
+                if (strategy == "iron_condor" and name == "expiry_guard_dte"
+                        and f"{strategy}__entry_dte" in params
+                        and params[f"{strategy}__entry_dte"] > int(spec[2])):
                     continue
                 params[key] = self._suggest_one(trial, key, spec)
 
@@ -660,6 +700,12 @@ class StrategyOptimizer:
             "multifractal_max_width":    float(_bl.multifractal_max_width),
             "iv_rank_rise_threshold":    self._iv_rank_rise_threshold,
             "min_edge_over_baseline":    self._min_edge_over_baseline,
+            # W79a: DTE dimensions. None = the engine resolves from settings.backtest (as
+            # before); a searched value replaces the baseline in the override loop below.
+            "entry_dte":                    self._entry_dte,
+            "expiry_guard_dte":             self._expiry_guard_dte,
+            "max_hold_fraction":            self._max_hold_fraction,
+            "flatten_minutes_before_close": self._flatten_minutes,
         }
         # Override with trial params that match Backtester signatures
         for key, val in params.items():
@@ -687,7 +733,9 @@ class StrategyOptimizer:
             db_path=self._db_path,
             iv_rank_series=self._iv_rank_series.get(self._symbol or symbol),
             range_predictor=(
-                self._range_predictor_provider(bt_kwargs.get("entry_dte"))
+                self._range_predictor_provider(
+                    bt_kwargs.get("entry_dte"), bt_kwargs.get("expiry_guard_dte"),
+                    bt_kwargs.get("max_hold_fraction"))
                 if self._range_predictor_provider is not None else self._range_predictor),
             intraday_store=self._intraday_store,
             eval_start_date=eval_start_date,

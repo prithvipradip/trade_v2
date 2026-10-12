@@ -36,6 +36,17 @@ backtest:
   friction_exit_capture: 1.0           # ... and at exit; lower only from the fill-vs-model report
   friction_stress_multiplier: 1.0      # scales the fitted model (calm-regime sample hedge)
 
+  # --- W79a: operator decisions of 2026-10-12 (D1, D8) ---
+  engine_model: realistic              # D1: the research engine at live fidelity: fill-time spot, previous-session IV and
+                                       # DECISION FRAME (W78), listed session expiries, fractional time, same-session
+                                       # exits, touch stops, expiry settlement / assignment gap (W77), concurrency at the
+                                       # fill (W78). Evidence: PLAN W74, W77, W78. Default research numbers recorded before
+                                       # this date are superseded (assumption A10). The legacy engine stays byte-identical.
+  friction_short_dte: true             # D8: a 0-6 DTE leg is charged at least the $0.01 floor until its band has 15
+                                       # collected sessions (W76); a band with its own fit then switches to it. Before the
+                                       # flip the fitted all-DTE model was EXTRAPOLATED below 11 DTE.
+                                       # pricing_source stays bs_legacy: D2 waits for the option-bar backfill.
+
   # --- W67: gate parity + graded objective ---
   gates_mode: enforce                  # 2026-10-10 operator decision: ML gates ON in RESEARCH (range floor + fractal veto
                                        # block) so the models being improved actually matter in studies. Live stays

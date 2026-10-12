@@ -309,6 +309,28 @@ python scripts/parity_replay.py                 # reads data/replay/manual_trade
   entry counts positions that were still alive at its fill time toward `max_concurrent_positions`.
   Legacy and daily-close studies are unchanged.
 
+## Searching the entry DTE (W79a; research only)
+
+- **Switch:** `python run_backtest.py --optimize-per-window --search-dte [--dte-range 0 45]
+  [--optimize-strict]`. Off by default; `backtest.dte_search` (schema defaults, overlay-overridable)
+  holds the ranges. The existing `IRON_CONDOR_SPACE` is untouched, so every other study is unchanged.
+- **What is searched:** entry DTE, the expiry guard (sampled only for entries it can exempt: at or
+  below the top of its range) and the hold fraction (which REPLACES `max_hold_days`). The flatten is
+  not searched: `scripts/dte_dimension_flatness.py` showed it moves nothing while the take-profit
+  ladder is on. The credit floors (`ic_min_credit*`) are never searched; run them as sensitivities.
+- **Always pass `--optimize-strict` for numbers you will quote.** Without it a window whose
+  optimisation fails runs the BASE config and the summary only reports a count
+  (`optimization_failures`); with it the study stops.
+- **Reading the report:** a band is a *candidate* only if it holds a top-decile trial in at least two
+  thirds of windows. Promotion also needs its parity band to PASS (`scripts/parity_replay.py`) and its
+  friction band to be ACTIVE (`data/short_dte_collection_status.json`). The report prints a reminder;
+  it does not check either.
+- **History limit:** the option-bar history is about two years (free tier), so a surface-priced study
+  has only a handful of out-of-sample quarters. Use shorter training windows and/or pool symbols, and
+  say so next to any number.
+- **Decisions D1 and D8** (realistic engine, short-DTE friction floor) are in `config_research.yaml`;
+  the live bot never loads it. `run_optimizer.py --apply` still writes only four named params.
+
 ## Quarterly drills (scheduled — first week of Jan / Apr / Jul / Oct)
 Run both, then record the date in the log table below. An untested kill
 switch or backup is a hope, not a control.

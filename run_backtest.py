@@ -272,6 +272,20 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
             "invalidated on direction (W72 leads L2-L6). 'realistic' fixes them; flip "
             "backtest.engine_model in config_research.yaml after recording a before/after (A10).")
 
+    # W79a: a DTE study deliberately leaves the live band. Say so, so the numbers are never read
+    # as "what the live bot would do today".
+    _dte_cfg = getattr(_bt_cfg, "dte_search", None)
+    _searching = bool(getattr(args, "search_dte", False)) or bool(getattr(_dte_cfg, "enabled", False))
+    backtest["dte_search"] = _searching
+    if _searching:
+        _rng = (list(getattr(args, "dte_range", None) or [])
+                or list(getattr(_dte_cfg, "entry_dte", [0, 45])))
+        warnings.append(
+            f"dte_search: ON - entry DTE is CHOSEN per window in {_rng} (plus the expiry guard and "
+            "hold fraction), while live's options.dte_range validator still refuses 0 and the live "
+            "selector takes the three nearest expiries (W80 wires both). A result here is a "
+            "research finding about the DTE, not what the live bot would do today.")
+
     notes = [
         # R16: this note used to hardcode a 4-day pre-event window; the
         # blackout has been risk.pre_event_blackout_days (currently 1) since
@@ -404,6 +418,16 @@ def parse_args() -> argparse.Namespace:
                    help="SQLite store holding the research tables (default: data/historical.db).")
     p.add_argument("--max-windows", type=int, default=None,
                    help="Keep only the LAST N walk-forward windows (timing / pilot runs).")
+    p.add_argument("--search-dte", action="store_true", default=False,
+                   help="W79a: let Optuna choose the entry DTE (and the expiry guard and hold "
+                        "fraction) per window. Requires --optimize-per-window. Ranges: "
+                        "backtest.dte_search.")
+    p.add_argument("--dte-range", type=int, nargs=2, metavar=("LOW", "HIGH"), default=None,
+                   help="W79a: inclusive entry-DTE range for --search-dte (default: backtest."
+                        "dte_search.entry_dte = 0 45).")
+    p.add_argument("--optimize-strict", action="store_true", default=False,
+                   help="W79a: abort when a window's optimisation fails instead of silently "
+                        "falling back to the base config.")
     p.add_argument("--gates-mode", choices=["observe", "enforce"], default=None,
                    help="W67: observe = live parity (range floor + fractal veto recorded as "
                         "would_reject:*, never block); enforce = they block. Default: "
@@ -492,6 +516,10 @@ async def run_backtest(args: argparse.Namespace) -> None:
         trailing_stop_enabled=args.trailing_stop,
         optimize_per_window=args.optimize_per_window,
         optimize_n_trials=args.optimize_n_trials,
+        # W79a: DTE search (None = the loaded backtest.dte_search values)
+        dte_search=(True if args.search_dte else None),
+        dte_range=(tuple(args.dte_range) if args.dte_range else None),
+        optimize_strict=(True if args.optimize_strict else None),
         # R6 live-parity knobs
         wing_k=args.wing_k,
         wing_floor_dollars=args.wing_floor,
@@ -551,6 +579,22 @@ async def run_backtest(args: argparse.Namespace) -> None:
 
     # Print results
     print(f"\n{result.summary()}")
+
+    # W79a: a failed per-window optimisation falls back to the base config; never let that pass
+    # quietly, and report what a DTE search found.
+    _failed = getattr(result, "optimization_failures", 0)
+    if _failed:
+        print(f"\n  !! {_failed} window optimisation(s) FAILED and ran the BASE config "
+              "(see window_optimization_failed in the log); this study did not search them.")
+    if cfg.dte_search:
+        from ait.backtesting.dte_report import format_report, summarise_study
+        _by_window = {}
+        for _wid, _per_sym in (getattr(result, "optimization_status", None) or {}).items():
+            _trials = [t for _st in (_per_sym or {}).values() if isinstance(_st, dict)
+                       for t in _st.get("trials", [])]
+            if _trials:
+                _by_window[_wid] = _trials
+        print("\n" + "\n".join(format_report(summarise_study(_by_window))))
 
     # Buy-and-hold benchmark
     print("\n[3/3] Buy-and-hold benchmark:")
