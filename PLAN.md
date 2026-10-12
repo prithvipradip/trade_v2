@@ -15619,3 +15619,21 @@ then without `--dry-run`, once per RTH session, after the close (~16:10 ET), >= 
 sessions exist.
 
 ---
+
+## 2026-10-12 - OPERATOR REGISTER UPDATE (after W76; amends the 2026-10-12 register entry above)
+
+No code change. Supersedes these lines of the register: B2 ("NOT STARTABLE YET") and the W76 row of table C; adds D8; re-states D1/D2 in light of the W76 correction.
+
+- **B2 is now STARTABLE.** The collector exists (`85525c1`). Procedure: docs/RUNBOOK.md "Short-DTE friction collection". First run `python scripts/calibrate_option_spreads.py --source ib-bars
+  --short-dte --symbols QQQ --port 4002 --client-id 91 --dry-run`, then without `--dry-run`, once per RTH session after the close (~16:10 ET), at least 15 sessions, ~40-55 min per symbol.
+  It has only ever run against a fake broker: report anything surprising from the first real run (what IB returns for a contract on its expiry day, pacing, qualification).
+- **D8 (new): set `backtest.friction_short_dte: true` in `config_research.yaml`?** Recommended NOW: it charges unfitted 0-6 DTE legs a conservative $0.01 per leg instead of an unmeasured
+  number, and each band switches to its own fit automatically at 15 sessions. Default if undecided: off. Blocks: nothing, but W79 would otherwise search on an unmeasured cost.
+- **D1 / D2 stand** (`engine_model: realistic`, `pricing_source: surface`). The W76 correction changed the NUMBERS in the W74/W75 tables, not the direction: the legacy engine and
+  `bs_legacy` pricing are still the optimistic ones. What it removed is the claim that short DTE "never looks profitable": with the cheap extrapolated per-leg friction it looks
+  profitable at 1-14 DTE, and that result is exactly as fragile as the friction number (3 DTE breaks even near 1.3x the $0.01 floor, 1 DTE near 3.4x). Do not treat either as an edge.
+- **Waits-on table, W76 row:** collection started by the operator -> >= 15 sessions -> `--short-dte --fit-only` (or the next run's automatic fit). W77 and W78 still wait on nothing.
+- **Process note.** Research studies now assert that the per-leg friction model loaded (a `str` `db_path` had silently put the W74/W75 tables on the legacy model); the engine coerces
+  `db_path` to `Path`. Any earlier study of the operator's own that passed a `str` db_path should be read with the same suspicion.
+
+---
