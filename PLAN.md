@@ -15289,3 +15289,42 @@ writes trade-level data).
 window). Working brief status table updated.
 
 ---
+
+## 2026-10-12 - W73: two live bugs found preparing short-DTE research (reconciler expiry date, chain `min_dte or`)
+
+Second wave of the short-DTE parity programme (brief: `Plans4agent_next_session/W72-W80_short_dte_parity_programme.md`). Both defects are unreachable-or-contained at the live
+`dte_range [14, 30]`; both were found by reading the code paths a 0-5 DTE entry would exercise. Fixed at ZERO change for today's configuration.
+
+**CHANGED.**
+1. `execution/reconciler.py` `_book_stale_trade`: the "has this position expired?" test was `datetime.fromisoformat(trade.expiry).date() <= datetime.now().date()`, the HOST's date, which is
+   tomorrow's date from 18:00 ET on a CEST host. A position that vanished from the broker the EVENING BEFORE its expiry was therefore booked "expired" at intrinsic against a spot snapshot
+   (a fabricated P&L) instead of being flagged for review (`UNKNOWN_EXIT_REASON`, $0). Now `<= today_et()`; the `<=` semantics are unchanged. W28's guard looks for `.today()` and W20's for
+   hour stamping, so the `.now().date()` shape was in neither.
+2. `data/options_chain.py` `get_chain`: `min_dte or cfg[0]` / `max_dte or cfg[1]` replaced an explicit 0 with the config bound. `get_chain_for_expiry` asks for `[days-1, days+1]`, which is
+   `[0, 2]` for a 1-DTE expiry, so it was searched in `[floor, 2]` and never found. Now `is None` for both sides.
+3. The programme's third W73 item ("the 1-DTE `get_chain_for_expiry` window") was NOT a separate defect: the `[days-1, days+1]` window and the inclusive `min_dte <= dte <= max_dte` filters on
+   both the IBKR and Yahoo paths are correct; the miss was only the `or`.
+
+**ZERO-CHANGE EVIDENCE.** Chain: an equivalence test over every input live can produce (bound None or >= 1, crossed with None/2/30/45) shows the old `x or default` and the new code resolve to
+the same band; moreover nothing in `src/` calls `get_chain_for_expiry`, the orchestrator passes no bounds, and `roll_selector` passes `roll_target_dte_min/max` (schema `ge=1`). Reconciler: with
+the host pinned to Europe/Berlin, across 09:30-15:30 ET the host and ET dates agree and the booking verdict is identical for expiries before / on / after today; the only behavioural change is
+in the 18:00-24:00 ET window, and only toward "needs review" instead of a fabricated booking.
+
+**TESTS.** `tests/test_w73_live_dte_and_clock_fixes.py`: 19 (real code, a REAL non-ET `TZ` pin, a negative control proving the pin bites; the pre-fix evening scenario booked a fabricated
+intrinsic). A class-guard ratchet on the `<x>.now().date()` shape: 4 sites existed; reconciler is fixed and `reconciler.py` / `options_chain.py` are held to zero; the three orchestrator sites
+below are REGISTERED and the set may only shrink. **Mutation-checked: 7 mutants, all caught, files restored byte-for-byte** (revert each fix, `<` for `<=`, always-expired, ignore explicit min,
+shifted default band). Gates: `compileall` OK; full fast lane **5382 passed / 45 skipped / 0 failed** (15m06s; W72's lane was 5363, i.e. exactly the 19 new tests); `typecheck.py` OK
+(blocking); `smoke_deploy.py` SMOKE PASS (13 checks); related existing suites (pnl accounting, R19 state, W53 roll target, R16 data, W20, W28) 174 passed.
+
+**REGISTERED, NOT FIXED.** (1) Three more naive `.now().date()` sites in `bot/orchestrator.py`: `_persist_daily_iv` (the once-per-day IV marker/date), `_estimate_iv_rank` (the stored-IV
+staleness age) and `_true_up_commission` (a marker date). They are low-impact during RTH (host and ET dates agree) but sit inside the iv_rank machinery W71 verifies, so they are carried there;
+the ratchet test pins the set. (2) `get_chain_for_expiry` has no caller in `src/` (dead code or an unwired roll hook). (3) The reconciler's `<=` still treats the expiry DATE itself as expired
+intraday: a position that vanishes at 10:00 ET on its expiry day is booked at intrinsic against a live spot before the 16:00 settlement; an expiry-day-aware reconcile is W80. (4) Unchanged and
+owned by W80: the `[:3]` nearest-expiry cap on the IBKR path (Yahoo uncapped), the 0-DTE `expected_move` of 0, whole-day greeks with `t >= 0.001`.
+
+**DEPLOY / ROLLBACK.** Two live files changed (`reconciler.py`, `options_chain.py`): takes effect at the next BOT restart; no config keys; the supervisor is not touched by W73 (the W69 + W70 +
+fetch-job supervisor restart is already pending and unrelated). Rollback is a clean `git revert` of the commit. Not restarted; nothing pushed.
+
+**NEXT.** W74: research engine per-position expiry and a real clock, shared exit-semantics functions, and the confirmed leads L2-L6 (each with its W72 probe as the regression test).
+
+---
