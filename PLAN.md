@@ -15878,3 +15878,48 @@ before W79.
 `flatten_minutes_before_close`, `max_hold_fraction` and `expiry_guard_dte` for flatness first).
 
 ---
+
+## 2026-10-12 - OPERATOR DECISIONS D1 / D8, W79 SPLIT, AND THE PRE-W79a FINDINGS (no code change)
+
+Records what the operator decided after the W78 hand-off and what the planning for the next work found. Nothing was restarted or pushed.
+
+**DECISIONS (operator, 2026-10-12).**
+- **D1 accepted:** `backtest.engine_model: realistic` in `config_research.yaml` (W74 + W77 + W78 are the evidence).
+- **D8 accepted:** `backtest.friction_short_dte: true` in `config_research.yaml` (a conservative $0.01-per-leg floor until a band has 15 collected sessions, W76).
+- **W79 is split.** W79a (now): the DTE-search plumbing, the loud-failure counter, the reporting and a flat-dimension check; none of it depends on data. W79b (later): the
+  Optuna study that produces numbers.
+- **Still open, needed before W79b:** D2 (`pricing_source: surface`), the range-gate mode for the study, the walk-forward window design, and starting the SPY / IWM option backfill.
+
+**BACKFILL STATE (measured 2026-10-12, read-only).**
+- 93,371 of 151,282 contracts (62%), about 1.01M rows, status `running`; contracts are processed by expiry and the current ticker expires 2026-02-06.
+- **Usable near-term smile coverage therefore ends in early February 2026.** The statement in earlier messages that the bars "end 2026-06-30" was misleading: the table's maximum
+  date is 2026-06-30 only because a few far-dated contracts reach it (2026-05 and 2026-06 hold one date each; 2026-02 holds 5).
+- ETA at about 6.5k contracts/day: roughly 2026-10-21.
+- The run window is 2024-09-28 to 2026-09-28 (its end date is the day it started), so the registered Polygon top-up from 2026-09-28 is contiguous: there is NO gap between the
+  backfill and the top-up.
+
+**HISTORY CEILING.** The free tier gives about two years of rolling option history (`backfill_option_history.py` docstring), so surface-priced research can span at most about 24
+months: 3-4 out-of-sample quarters with 252-day training windows (about 1 supported today). Waiting for the backfill does not remove this; it is why the window-design decision
+exists (shorter training windows, and/or pooling SPY and IWM, whose bars take about three weeks each at this rate).
+
+**WHAT NEEDS THE OPTION BARS.** D1: no (the engine calls `listed_expiry(today, entry_dte)` without the bar-derived expiry set, i.e. the weekday rule calendar; it uses stored daily
+IV and 5-minute prices). D8: no. The W79 code: no. D2: yes (a leg without a fitted smile falls back to `bs_legacy`, counted, which mixes pricers inside one study). The W79b
+study: yes, plus at least 15 sessions of 0-6 DTE friction (about early November).
+
+**CODE-READ FINDINGS FOR W79 (each gets a test in W79a).**
+1. A searched `entry_dte` with `optimize_per_window=True` makes `WalkForwardConfig(**cfg_dict)` raise inside `_optimize_window_params`; the surrounding `except` logs
+   `window_optimization_failed` and the window silently falls back to the BASE config: a study that looks fine and searched nothing.
+2. Trial `Backtester`s never receive `entry_dte`, the expiry guard, the hold fraction, the flatten or `delta_short` baselines, so lead L1 (the OOS run uses config
+   `delta_short`, not the searched one) is still open.
+3. `_maybe_drop_inert_params` tests `wing_k` inertness at `dte_range[0]`, not at the smallest searched DTE.
+4. `run_optimizer.py --apply` is safe for new dimensions: `apply_to_config` maps four named params and silently skips every other key.
+5. `IRON_CONDOR_SPACE` must stay unchanged (it feeds every other study and `TestHoldDimensionReachable`); the DTE dimensions are an opt-in block.
+6. `ic_min_credit` / `ic_min_credit_width` are live economics floors and will NOT be searched (a search would optimise against an unmeasured cost model); W79b runs them as
+   3-value sensitivities.
+
+**CARRIED FROM W77 / W78 (already in the ledger).** Under the default take-profit ladder a position essentially never reaches the bell, so `flatten_minutes_before_close` had no
+effect; the range model abstains in 42-63% of windows at every horizon and has no out-of-sample lift at 9 bars.
+
+**NEXT.** W79a as planned: the two config flips, the search definition and plumbing, `dte_report`, `scripts/dte_dimension_flatness.py`, tests, then its own PLAN entry.
+
+---
