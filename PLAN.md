@@ -15328,3 +15328,73 @@ fetch-job supervisor restart is already pending and unrelated). Rollback is a cl
 **NEXT.** W74: research engine per-position expiry and a real clock, shared exit-semantics functions, and the confirmed leads L2-L6 (each with its W72 probe as the regression test).
 
 ---
+
+## 2026-10-12 - W74: research engine at live fidelity (`engine_model`), per-position expiry, a real clock, short-DTE exit knobs
+
+Third wave of the short-DTE parity programme. Research-only: nothing here is imported by the live bot or the supervisor. **No research result moves until the operator flips
+`backtest.engine_model`** (schema default and overlay stay `legacy`); the default engine is proven byte-identical to its pre-W74 self.
+
+**CHANGED.**
+1. Shared pure helpers (one owner each; live adopts them in W80): `exit_policy.expiry_guard_applies / hold_limit_reached / expiry_day_flatten_due`; `utils.time.next_session_on_or_after /
+   time_to_expiry_years` (session- and early-close-aware: a 0-DTE option at 10:30 has 5.5 h, an early-close expiry 2.5 h); `pricing.expected_move(S, iv, t_years)` (no hard zero at DTE 0);
+   `backtesting/expiry_calendar.listed_expiry / actual_dte` (the first listed session on or after `entry + N`, never a weekend/holiday; accepts the real listed set once W75 reads the bars).
+2. Engine, ALL modes (proven identical in legacy): the re-mark reads each position's OWN entry/expiry dates (`_position_dte`) instead of the engine-wide `entry_dte`; the short-strike-touch
+   pricing is one shared helper (`_touch_exit_mark`) used by the daily and intraday paths.
+3. Engine, `engine_model="realistic"` (W72 leads, each with an A/B test against legacy): **L2** entry priced at the fill (limit price as spot, previous-session IV, fractional time to the
+   bell, listed session expiry); **L3** the intraday take-profit decision is mid-based (live's `pnl_pct` is the broker mark over cost basis) and the spread is paid on the booked price;
+   **L4** every 5-minute bar's OHLC reaches the credit rules, so a touch is evaluated per bar and priced at the strike (worse-of with a gapped open); **L5** condors are exempt from direction
+   thesis invalidation as in live; **L6** long strikes are rounded BEFORE pricing so a fresh condor re-marks at its entry credit; a position opened at T is exit-checked on the bars after T the
+   same session; the re-mark uses fractional time to the expiry bell at the decision instant (daily path: the session close).
+4. Three exit knobs, independent of the model switch, `None` = legacy: `expiry_guard_dte` (rules 3/3a apply only to entries above it), `max_hold_fraction` (replaces the day cap with a share
+   of the position's own life), `flatten_minutes_before_close` (hard expiry-day backstop; half-day aware). New rule 3b: nothing outlives its expiry SESSION (time-aware).
+5. `BacktestConfig`: `engine_model`, `expiry_guard_dte`, `max_hold_fraction`, `flatten_minutes_before_close` (bounded; defaults legacy/off). `run_backtest` parity manifest warns when the run
+   used the legacy engine and prints the three knobs.
+
+**EQUIVALENCE (legacy unchanged).** Deterministic reference run: 6 configurations / 198 trades, every trade dict, funnel and P&L IDENTICAL to the pre-W72 baseline after each step.
+
+**A10 BEFORE/AFTER (statistics only; real QQQ daily + 5-minute research data, 2025-01-02..2026-10-08, 443 sessions, 1 contract/trade (live's cap), fitted per-leg dollar friction, any
+direction, gates observe, no ML models, ic_min_credit 0.30 / credit-width 0.05).** This is a FIDELITY A/B, not a profitability estimate.
+
+| engine / entry | trades | win % | total $ | avg $ | avg hold d | exits |
+|---|---|---|---|---|---|---|
+| legacy, 14 DTE | 98 | 63.3 | +47 | +0.5 | 5.9 | TP 62, touch 32, DTE rule 3 |
+| realistic, 14 DTE | 104 | 51.0 | -7,538 | -72.5 | 5.5 | TP 53, touch 47, DTE rule 3 |
+| realistic, 7 DTE, guard 5 | 250 | 47.6 | -13,764 | -55.1 | 2.3 | DTE rule 136, TP 71, touch 42 |
+| realistic, 3 DTE, guard 5, flatten 60 | 327 | 68.8 | -6,071 | -18.6 | 1.8 | TP 219, touch 96, DTE rule 11 |
+| realistic, 1 DTE, guard 5, flatten 60 | 411 | 61.3 | +4,675 | +11.4 | 1.2 | TP 246, touch 165 |
+| realistic, 0 DTE, guard 0, flatten 60 | 404 | 14.9 | -19,317 | -47.8 | 0.0 | touch 260, TP 144 |
+
+Entry-day spot used by the two models differs by a median 0.46% (p90 0.98%) on the 50 entry days common to both 14-DTE runs: the daily-close look-ahead (L2).
+- Fixing L2-L6 costs about $73 per 14-DTE trade at one contract: **legacy studies were optimistic by more than the size of most gate effects.**
+- The short-DTE rows are **not evidence of an edge**: pricing is still Black-Scholes on one constant-maturity IV, friction is extrapolated below 11 DTE, and there is no settlement or
+  assignment model (W75-W77). Treat them as the baseline those waves must move.
+
+**TWO DEFECTS FOUND BY SANITY-CHECKING THE A/B (both kept as tests).** (1) A first run showed 0-DTE at +$900k on $100k with a 99.5% win rate: partly an UNCAPPED contract count (a bare
+`Backtester` is uncapped; research entry points resolve `positions.max_contracts_per_trade`=1), partly (2) a REAL bug in my first realistic implementation: entry used fractional time but the
+re-mark still used whole days floored at ~53 min, so a 0-DTE condor priced with 5.5 h was marked with 0.9 h one bar later and looked instantly profitable. Fixed by threading the decision
+instant through every re-mark path (`_remark_t`); regression tests pin continuity one bar after the fill, intrinsic at the bell, and friction on same-instant mids. A second design bug was caught
+by the tests: rule 3b first compared DATES and so fired on the first bar of a 0-DTE expiry day, before the flatten cutoff; it is now time-aware.
+
+**TESTS.** `tests/test_w74_engine_realism.py`: 40 (A/B legacy-vs-realistic per lead, knobs, same-session round trip, pure helpers, listed expiries incl. Thanksgiving and early close, partial-engine tripwire).
+**Mutation-checked: 28 mutants, all caught, files restored byte-for-byte** (the first full pass caught 22/25, a second 27/28; each survivor exposed a real test gap that now has a test: the
+gap-open worse-of rule, per-position expiry in the re-mark, earliest-listed-date selection, and the touch/friction re-mark instants). Gates: `compileall` OK; full fast lane **5422 passed / 45 skipped / 0 failed** (16m01s; W73's lane was 5382, i.e. exactly the 40 new tests). The FIRST lane run found 6 failures (R15 pre-event blackout x2, R16 touch stop x4): those tests build partial engines with `Backtester.__new__` and set only the attributes they need, so the new rules hit a missing `_flatten_minutes`. Fixed with class-level defaults (the W70 executor-duration idiom) plus a tripwire test that pins them to what `__init__` resolves; the lane was then re-run in full. `typecheck.py` OK (blocking); `smoke_deploy.py` SMOKE PASS (13 checks); the deterministic reference run is IDENTICAL to the pre-W72 baseline at the end (198 trades).
+
+**DEVIATIONS FROM THE PLAN.** (a) **Feature/gate look-ahead is NOT fixed**: `features_cache` rows and the ML/fractal/IV-rank gates still see day D's full bar; only the PRICING inputs (spot, IV,
+time) were moved to the fill. Sizing that leak needs shifting the feature cache by a session; registered, not built. (b) The daily path (no 5-minute bars) decides at the close. (c) The three
+exit knobs resolve `None -> backtest.*` in every Backtester (so OOS windows and trials inherit them from config); making them per-trial SEARCHED dimensions, and adding `entry_dte` to the search,
+is W79.
+
+**REGISTERED, NOT FIXED.** (1) Feature/gate look-ahead (above). (2) `_options_half_spread`'s IV/DTE thresholds are still hardcoded in the legacy friction model (the stored calibration's
+thresholds/cap are ignored). (3) A bare `Backtester` is uncapped on contracts; studies must pass/resolve `max_contracts_per_trade` (a 0-DTE credit of a few cents otherwise sizes into hundreds
+of contracts). (4) Whole-dollar strike rounding makes 0-DTE short strikes land at-the-money on a $100 underlying (EM-band rejection): a property of $1-grid underlyings, correct for QQQ-scale
+spots. (5) Early-close expiries are handled by `get_market_close`; a holiday-shifted listed set awaits W75's real expiry list.
+
+**DEPLOY / ROLLBACK.** Research and tests only; `engine.py`/`pricing.py`/`exit_policy.py`/`time.py` helpers are not imported by the live bot's decision path in a way that changes it (the
+`exit_policy` and `time` additions are new functions; no existing function changed). `BacktestConfig` gains four defaulted fields. No restart is implied. Rollback is a clean `git revert`.
+
+**DECISION FOR THE OPERATOR (pending).** Flip `backtest.engine_model: realistic` in `config_research.yaml`? Recommended before W79 so Optuna does not search a simulator with known look-ahead;
+it moves every research baseline (assumption A10) by roughly the table above. Until then research stays on `legacy` and the manifest says so.
+
+**NEXT.** W75: real-bar IV surface pricer (the largest remaining parity error, 2-4 vol points; waits partly on the backfill), then W76 friction at 0-6 DTE, W77 settlement/assignment/gap.
+
+---
