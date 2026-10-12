@@ -15637,3 +15637,17 @@ No code change. Supersedes these lines of the register: B2 ("NOT STARTABLE YET")
   `db_path` to `Path`. Any earlier study of the operator's own that passed a `str` db_path should be read with the same suspicion.
 
 ---
+
+## 2026-10-12 - W76 FOLLOW-UP: the collector CLI follows IBKR_PORT (operator's first dry run was refused)
+
+The operator's first `--dry-run` of the short-DTE collector failed to connect. Cause, reproduced: the script's `--port` defaulted to a literal 4002 (Gateway paper) and every example in the
+W76 entry, the register update and docs/RUNBOOK.md repeated `--port 4002`, while this box runs TWS paper on 7497 (`IBKR_PORT=7497` in `.env`; nothing listens on 4002), giving
+`ERROR: could not connect to IBKR: [Errno 61] Connect call failed ('127.0.0.1', 4002)`. That was the author's error (a hard-coded value where the repo has a single source), not an operator error.
+
+**CHANGED.** `scripts/calibrate_option_spreads.py`: `--port` defaults to `IBKREnvConfig().ibkr_port` (`.env` / environment, the value the bot and supervisor use), falling back to 4002 only
+if config cannot be read; an explicit `--port` still wins. RUNBOOK commands drop the hard-coded port and say which setting decides it. 3 tests (follows `IBKR_PORT`, explicit wins, fallback).
+
+**SUPERSEDES** every `--port 4002` in the W76 entry, the register update and the operator register entries above: use the command WITHOUT `--port`.
+Whole-lane re-run not repeated: only a script's argument default, its RUNBOOK text and tests changed; the affected test files (W66/W72/W76 and the docs checks) pass.
+
+---
