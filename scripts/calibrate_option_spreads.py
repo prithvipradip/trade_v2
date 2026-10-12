@@ -127,7 +127,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     # IBKR options (only used with --source ibkr)
     parser.add_argument("--host", default="127.0.0.1", help="IBKR host.")
-    parser.add_argument("--port", type=int, default=4002, help="IBKR port (default: 4002).")
+    parser.add_argument(
+        "--port", type=int, default=None,
+        help="IBKR port. Default: IBKR_PORT from .env / the environment (7497 TWS paper, 4002 "
+             "Gateway paper), the same source the bot and the supervisor use. Pass it only to "
+             "override.")
     parser.add_argument("--client-id", type=int, default=91, metavar="ID")
     parser.add_argument(
         "--snapshot-timeout", type=float, default=8.0, metavar="SECS",
@@ -175,7 +179,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--dry-run", action="store_true",
         help="Print request plan without fetching or storing data.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.port is None:
+        args.port = _default_ibkr_port()
+    return args
+
+
+def _default_ibkr_port() -> int:
+    """The port the rest of the system connects to (W76).
+
+    This script used to hard-code 4002 (Gateway paper); on a box running TWS paper (7497) every
+    run was refused until the operator remembered to pass --port. IBKR_PORT in .env / the
+    environment is the repo's single source for it. 4002 is only the last-resort fallback.
+    """
+    try:
+        from ait.config.settings import IBKREnvConfig
+        return int(IBKREnvConfig().ibkr_port)
+    except Exception:  # noqa: BLE001 - never block a calibration on config I/O
+        return 4002
 
 
 # ---------------------------------------------------------------------------

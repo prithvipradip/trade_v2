@@ -537,3 +537,35 @@ class TestDbPathTypes:
         from pathlib import Path
         db, _ = db_with_models
         assert isinstance(_engine(str(db))._db_path, Path)
+
+
+class TestCliPort:
+    """The collector's CLI used to hard-code port 4002; on a TWS-paper box (7497) every run was
+    refused. It must follow IBKR_PORT like the bot does, and an explicit --port must still win."""
+
+    def _mod(self):
+        import importlib.util
+        from pathlib import Path
+        spec = importlib.util.spec_from_file_location(
+            "calibrate_cli_port", Path(__file__).resolve().parents[1] / "scripts"
+            / "calibrate_option_spreads.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_default_port_follows_ibkr_port(self, monkeypatch):
+        monkeypatch.setenv("IBKR_PORT", "7497")
+        assert self._mod()._parse_args(["--source", "ib-bars", "--short-dte"]).port == 7497
+        monkeypatch.setenv("IBKR_PORT", "4002")
+        assert self._mod()._parse_args(["--source", "ib-bars", "--short-dte"]).port == 4002
+
+    def test_an_explicit_port_wins(self, monkeypatch):
+        monkeypatch.setenv("IBKR_PORT", "7497")
+        args = self._mod()._parse_args(["--source", "ib-bars", "--short-dte", "--port", "4001"])
+        assert args.port == 4001
+
+    def test_a_config_failure_falls_back_to_4002_not_a_crash(self, monkeypatch):
+        mod = self._mod()
+        import ait.config.settings as st
+        monkeypatch.setattr(st, "IBKREnvConfig", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        assert mod._default_ibkr_port() == 4002

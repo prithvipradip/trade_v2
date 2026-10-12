@@ -197,16 +197,19 @@ extrapolated half-spread. IB serves historical BID/ASK bars for currently LISTED
 (nothing for expired ones), so this data cannot be backfilled: it has to be collected forward,
 one RTH session at a time, while the 0-6 DTE contracts are still listed.
 
-**Each trading day** (paper Gateway/TWS is fine; it only requests historical data, never orders):
+**Each trading day** (paper Gateway/TWS is fine; it only requests historical data, never orders).
+The port defaults to `IBKR_PORT` from `.env` (7497 for TWS paper, 4002 for Gateway paper), the
+same value the bot uses; pass `--port` only to override. A "could not connect" error almost
+always means TWS/Gateway is not running on that port:
 
 ```bash
 # 1) see the plan first (no data requested, nothing stored)
 python scripts/calibrate_option_spreads.py --source ib-bars --short-dte --symbols QQQ \
-    --port 4002 --client-id 91 --dry-run
+    --client-id 91 --dry-run
 
 # 2) collect + fit (about 40-55 min per symbol: IB paces historical requests at 60 / 10 min)
 python scripts/calibrate_option_spreads.py --source ib-bars --short-dte --symbols QQQ \
-    --port 4002 --client-id 91
+    --client-id 91
 ```
 
 - **When:** after the close (16:10 ET or later) so today's 0-DTE contract has a full session of bars,
@@ -215,7 +218,7 @@ python scripts/calibrate_option_spreads.py --source ib-bars --short-dte --symbol
   does not matter: the engine flattens at ~15:00).
 - **Client id:** use one that is not the bot's (the bot uses 326 and its fallback ladder); the example
   uses 91, the repo's calibration convention. W66 verified this request type against the paper
-  Gateway on port 4002 (historical BID and ASK bars of listed options, market closed). If a run
+  Gateway (historical BID and ASK bars of listed options, market closed). If a run
   returns no bars for every contract, that is an account/permission question for IB, not a bug here.
 - **Coverage:** the run prints samples and distinct sessions per DTE 0..6 and, per band
   (`0-2`, `3-6`), `collecting: N/15 sessions (M more needed)` until `ACTIVE`.
