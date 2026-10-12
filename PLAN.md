@@ -15527,3 +15527,95 @@ restarted; fast lane 5464 passed / 0 failed; `smoke_deploy.py` SMOKE PASS (13 ch
 **NEXT.** W76 tooling (code only), then W77 and W78 while the operator's collection and the backfill run; W79 once D1 and D2 are decided.
 
 ---
+
+## 2026-10-12 - W76: 0-6 DTE friction tooling (collector, per-band fit, banded model) + CORRECTION of the W74 and W75 reference tables
+
+Fifth wave of the short-DTE parity programme. Research-only; nothing is imported by the live bot. `backtest.friction_short_dte` defaults to `false`, so no research result moves until the
+operator flips it; the legacy engine is still byte-identical to the pre-W72 baseline (198 trades).
+
+**CORRECTION (read first): the W74 and W75 reference-study tables in this ledger were run on the LEGACY %-of-mid friction model, not the fitted per-leg model they say.** The study
+scripts passed `db_path` as a `str`; `HistoricalDataStore` needs a `Path` (it calls `.parent`), the friction loader failed with only a WARNING (`friction_params_unreadable`,
+which the author had filtered out of the output), and the engine fell back to the legacy model exactly as designed. It was found when W76's own engine tests hit the same error and a stress sweep returned the
+SAME P&L at 0x, 1x, 2x and 3x friction. Fixed in code (the engine now coerces `db_path` to `Path`, tested) and in the study
+script (it now ASSERTS the per-leg model loaded). Corrected numbers, same windows, same engine, per-leg friction actually applied (QQQ fitted `pct` form, b = 0.0056, which has NO sample
+below 11 DTE, so every short-DTE leg is still an extrapolation):
+
+W74 table, corrected (2025-01-02..2026-10-08, 1 contract, any direction, gates observe, no ML):
+| engine / entry | trades | win % | total $ | avg $ | (was reported) |
+|---|---|---|---|---|---|
+| legacy, 14 DTE | 109 | 74.3 | +9,896 | +90.8 | +47 |
+| realistic, 14 DTE | 113 | 62.8 | +4,507 | +39.9 | -7,538 |
+| realistic, 7 DTE, guard 5 | 254 | 69.7 | +9,082 | +35.8 | -13,764 |
+| realistic, 3 DTE, guard 5, flatten 60 | 372 | 77.7 | +16,768 | +45.1 | -6,071 |
+| realistic, 1 DTE, guard 5, flatten 60 | 411 | 66.7 | +19,995 | +48.7 | +4,675 |
+| realistic, 0 DTE, guard 0, flatten 60 | 404 | 43.1 | -11,165 | -27.6 | -19,317 |
+
+W75 table, corrected (realistic engine, 2025-01-02..2025-12-15):
+| entry | bs_legacy: trades / win % / total $ | surface: trades / win % / total $ |
+|---|---|---|
+| 14 DTE | 61 / 60.7 / +1,910 | 64 / 62.5 / +830 |
+| 7 DTE, guard 5 | 135 / 70.4 / +3,593 | 136 / 65.4 / +1,380 |
+| 3 DTE, guard 5, flatten 60 | 195 / 77.4 / +6,840 | 179 / 70.4 / +1,028 |
+| 1 DTE, guard 5, flatten 60 | 209 / 65.6 / +8,341 | 209 / 64.1 / +4,139 |
+| 0 DTE, guard 0, flatten 60 | 205 / 46.8 / -4,469 | 186 / 37.1 / -4,633 |
+
+**Which earlier claims stand and which do not.**
+- STANDS: the legacy engine is unchanged (byte-identical); the W75 OUT-OF-SAMPLE bar-to-bar validation (it prices options, friction does not enter); every lead probe; the direction that
+  realistic < legacy engine and surface < bs_legacy pricing (the credits the old model collected were too rich).
+- WRONG, withdrawn: "fixing L2-L6 costs about $73 per 14-DTE trade" (corrected: $91 -> $40 per trade, about $51, i.e. -$5.4k over the 21 months); "short-DTE rows are baselines that
+  never look profitable" and, in the W75 entry, "**no configuration is profitable under surface pricing in this window**" (corrected: with the fitted per-leg friction every 1-14 DTE row is
+  POSITIVE under surface pricing, +$0.8k to +$4.1k per year at one contract; 0 DTE is negative); "surface pricing moves 1-3 DTE down by $3-4k" (corrected: 1 DTE -$4.2k, 3 DTE -$5.8k,
+  7 DTE -$2.2k, 14 DTE -$1.1k).
+- The corrected tables are about 200 trades per row (standard error of a total roughly $1.5-2k): differences under ~$2k are not significant, and the level depends on a friction number nobody
+  has measured below 11 DTE. Do not read +$4k at 1 DTE as an edge. It is the number W76's collection exists to replace.
+
+**CHANGED.**
+1. `ait.data.option_spread_sampler`: `plan_short_dte_strikes` (moneyness-anchored at 0.25/0.5/1/2/3.5% each side + compact delta buckets + $2/$5 wings), and `delta_from_mid(t_years=...)`:
+   the old whole-day form could not invert a 0-DTE bar at all (every 0-DTE row lost its delta and was dropped). The IV inversion uses a local `math.erfc` pricer (1e-13 from SciPy's) so a
+   run is seconds, not minutes, per thousand rows; the shared `black_scholes_price` is untouched.
+2. `ait.data.short_dte_collector` (new; broker handle INJECTED, so the whole plan -> request -> pair -> store pipeline is tested against a fake): every listed expiry 0..6 days out
+   (today's included), +-12% of spot, hourly BID and ASK bars over the last 7 days, 10.8 s pacing, 60 s back-off on an error, `INSERT OR IGNORE` (re-runs are free); per-DTE coverage
+   report; `fit_short_dte_bands` fits one model per band (0-2, 3-6) by the existing session-grouped CV and reports `collecting: N/15 sessions (M more needed)` until active.
+3. `calibrate_option_spreads.py --source ib-bars --short-dte [--short-dte-max 6 --short-dte-duration "7 D" --min-sessions 15] [--dry-run | --fit-only]`.
+4. Storage: `option_leg_spread_band_params` (symbol, dte_band, ...), additive. The existing `option_leg_spread_params` is keyed by `symbol` alone and is read by running processes; it is
+   not rebuilt.
+5. `friction.BandedFriction / banded_condor_leg_cost_usd / friction_band`: a short-DTE band with a fitted model uses it; otherwise the all-DTE model is FLOORED at
+   `friction_extrapolated_floor_usd` per leg and the leg is counted as extrapolated. DTE >= 7 is never floored.
+6. Engine: `friction_short_dte` (+ `friction_min_sessions_per_band` 15, `friction_extrapolated_floor_usd` 0.01), entry friction at the position's DTE, exit friction at its REMAINING DTE,
+   `friction_summary` (fitted / default / extrapolated) at the end of a run; `db_path` coerced to `Path` (the trap above).
+7. `friction_sensitivity.py`: `--entry-dte --engine-model --pricing-source --friction-short-dte --expiry-guard-dte --flatten-minutes` (unset = the W66 sweep, tested).
+8. docs/RUNBOOK.md: "Short-DTE friction collection" (the operator's daily procedure).
+
+**MEASURED, W76 stress (surface pricing, realistic engine, 2025-01-02..2025-12-15, `friction_short_dte` ON with NO fitted band, so every short-DTE leg is the $0.01 floor):**
+| entry | x0 | x1 | x2 | x3 | break-even multiple |
+|---|---|---|---|---|---|
+| 3 DTE, guard 5, flatten 60 (179 trades) | +1,872 | +434 | -939 | -2,163 | about 1.3x |
+| 1 DTE, guard 5, flatten 60 (209 trades) | +4,997 | +3,979 | +2,369 | +656 | about 3.4x (extrapolated) |
+
+The $0.01 floor alone cost 3 DTE $0.6k and 1 DTE $0.2k versus the unfloored surface rows above. A 3-DTE condor needs the real half-spread to be under about $0.013 per leg to be
+positive; a 1-DTE one survives to about $0.034. Those thresholds are what the collection must measure. (`friction_sensitivity.py` itself is a DAILY-bar model, entry at the close, and
+reported +$8.0k at 85% wins for the same 1-DTE setup: not used as evidence.)
+
+**TESTS.** `tests/test_w76_short_dte_friction.py`: 43 (strike plan, fractional-time delta, banded model incl. the never-floored 7+ band, the collector end to end against a fake broker:
+plan, dry run, 0-DTE rows keep their delta except the bar that ends at the bell, pacing, back-off, unqualifiable contract, idempotent re-run; coverage and band fit; storage;
+engine switch incl. exit friction at the REMAINING DTE and the session minimum; sensitivity flags; `str` vs `Path` db_path). **Mutation-checked: 22 mutants, all caught, files
+restored byte-for-byte** (the first pass caught 20/22; both survivors were real test gaps, now tested). Gates: `compileall` OK; full fast lane **5507 passed / 46 skipped / 0 failed** (17m10s; W75's lane was 5464: the 43 new tests). The first lane run caught one real violation in the new code, `date.today()` in the collector (the W28 zero-exception host-date guard), fixed with `today_et()` and the lane re-run in full; `typecheck.py` OK (blocking); `smoke_deploy.py` SMOKE PASS (13 checks); the legacy deterministic reference run is IDENTICAL to the pre-W72 baseline (198 trades).
+
+**DEVIATIONS FROM THE PLAN.** (a) Per-band models live in a NEW table, not a `dte_band` column (see CHANGED 4). (b) The collector is its own module rather than a refactor of the 870-line
+script. (c) The plan's "friction_sensitivity.py must show the result survives" was done with the intraday-faithful pipeline, because that script cannot represent short DTE faithfully.
+
+**REGISTERED, NOT FIXED.** (1) **The collector has only ever run against a fake broker.** Pacing, qualification of expiring contracts and what IB returns for a contract on its
+expiry day are unverified; the first operator run should be `--dry-run`, then one symbol (RUNBOOK). (2) Hourly bar quotes are the LAST quote of each hour, not a time-average spread
+(W66 caveat, unchanged). (3) The last bar of an expiry day ends at the bell: no delta, excluded from the fit unless a wing. (4) A 0-6 DTE band is stored as soon as >= 5 relevant samples
+exist but is USED only at >= `friction_min_sessions_per_band` sessions. (5) QQQ only until SPY/IWM have bars (A8) for the pricing side; the collector itself works for any symbol.
+(6) Exit friction now depends on remaining DTE under the new switch, so a 14-DTE position's exit near expiry is floored: intended, but it moves such studies slightly when the
+switch is on.
+
+**OPERATOR (also in the register above).** Start the collection: `python scripts/calibrate_option_spreads.py --source ib-bars --short-dte --symbols QQQ --port 4002 --client-id 91 --dry-run`
+then without `--dry-run`, once per RTH session, after the close (~16:10 ET), >= 15 sessions; ~40-55 min per symbol. Decision D8: set `backtest.friction_short_dte: true` in
+`config_research.yaml` now (the conservative floor is useful before any data exists) and let fitted bands replace it as they reach 15 sessions.
+
+**NEXT.** W77 settlement / assignment / overnight gap, W78 range gate per horizon; W79 after D1, D2 (and ideally D8). Re-run the corrected W75 table with the fitted bands once >= 15
+sessions exist.
+
+---
