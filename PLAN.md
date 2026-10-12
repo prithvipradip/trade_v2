@@ -16028,3 +16028,68 @@ research-only deviation, or port it to live (only with evidence; W80-class).
 **NEXT.** W71 as above, then W79b once D2, the range-gate mode and the window design are decided.
 
 ---
+
+## 2026-10-12 - W71: the research IV-rank RISE veto has no live counterpart (measured); three live host-date sites fixed (W71b)
+
+Ninth wave of the short-DTE parity programme. The research half is research-only; **W71b edits three lines in the live `bot/orchestrator.py`** (below). Nothing was restarted or pushed; W71b
+takes effect at the operator's next bot start. The legacy engine is byte-identical to the pre-W72 baseline; `IRON_CONDOR_SPACE` is unchanged.
+
+**QUESTION.** The research engine blocks a neutral credit entry when the FeatureEngine `iv_rank` rose by more than `iv_rank_rise_threshold` (0.30) over 10 rows. Does live have that gate, on
+which series, and how much of what it blocks would live have traded?
+
+**FINDINGS.**
+1. **Live has no rise veto** (code read, now pinned by an AST guard: nothing outside `backtesting/`, `optimization/`, `config/` reads `iv_rank_rise_threshold`). Live gates on the LEVEL of the
+   stored-IV percentile: condor floor 15, credit cap 85. The parity manifest now prints a RESEARCH-ONLY line while the threshold is active.
+2. **The veto reads a different series.** The feature rank is a realized-vol range rank (0-1); live's is the percentile of stored IV (0-100). Their Spearman correlation is 0.59-0.63 on the
+   full history (QQQ 0.63, SPY 0.59, IWM 0.59) and 0.46-0.57 since 2024-04; they sit on opposite sides of live's floor / cap on 34-42% of days. It is a weak proxy for the rank live gates on.
+3. **What it blocks** (research IV; 3,960 days per symbol): the veto fires on 6.3-6.7% of days. **45-58% of those days live's level gates already refuse** (QQQ 152 of 263, SPY 120 of 250, IWM 146
+   of 265). The rest (QQQ 111, SPY 130, IWM 119 days, 4.5-5.4% of live-tradeable days; 14 / 21 / 16 days since 2024-04) are days live WOULD trade: a restriction that exists only in research.
+4. **It is not a proxy for any live concept either.** A rise defined on live's own percentile fires on 11-12% of days (QQQ 451, SPY 465, IWM 487), and the two vetoes coincide on only 77-101
+   days (QQQ 77, SPY 101, IWM 98). On the live store since 2024-04 the veto would add 14 / 14 / 6 days beyond live's level gates (QQQ / SPY / IWM; 219 / 121 / 179 level-block days).
+5. **The two stored-IV series are the same data.** Research and live IV on the overlapping days (QQQ 610, SPY and IWM 510): level correlation 1.000, rank correlation 1.000 / 0.988 / 0.976;
+   they differ by more than 0.5 vol point on only 5 / 3 / 2 days (the days the live scan itself persisted: a median ATM IV across scanned expiries rather than IB's 30-day figure). The level
+   gates are at parity; only the rise veto is not.
+6. **Effect on results** (realistic engine, `bs_legacy` pricing, per-leg friction with the short-DTE floor loaded, 1 contract, entry DTE 14, `condor_any_direction`, 2024-01..2026-10):
+| symbol | veto ON (0.30): trades / win % / total $ | OFF: trades / win % / total $ | days the rise gate vetoed |
+|---|---|---|---|
+| QQQ | 126 / 68% / +5,213 | 132 / 67% / +5,643 | 22 |
+| SPY | 129 / 70% / +6,049 | 134 / 69% / +6,068 | 19 |
+| IWM | 118 / 68% / +945 | 121 / 67% / +1,019 | 18 |
+   The veto removes 3-6 trades per symbol and is slightly NEGATIVE in all three (-$0.43k, -$0.02k, -$0.07k); each is far inside the noise (~120 trades per arm). The decision rests on parity.
+
+**CHANGED.**
+1. `ait.backtesting.iv_rank_compare` (new, pure): `rise`, `veto_days`, `live_level_blocks`, `side`, `spearman`, `agreement`, `veto_vs_live`.
+2. `scripts/iv_rank_parity_probe.py` (new, read-only, `mode=ro`): the three tables above in seconds, `--ab` for the engine arms. It calls FeatureEngine's own IV-proxy block (a function of
+   Close alone) instead of `compute()`: the full feature set took 20+ minutes over 4,000 rows; a test pins the two to the same series.
+3. `ResearchData.load_intraday_range` (read-only intraday adapter, the engine's `intraday_store` contract) so studies stop carrying private copies of a reader.
+4. `run_backtest.py` parity manifest: a RESEARCH-ONLY warning while the veto is active.
+5. **W71b (live file):** `orchestrator.py` `_persist_daily_iv` (once-a-day marker and the stored row's date), `_estimate_iv_rank` (the stored-IV freshness age) and `_true_up_commission`
+   (the trueup marker) now use `today_et()` instead of the host's `datetime.now().date()`. Behaviour is identical when host and ET dates agree (RTH); from 18:00 ET on a CEST host the
+   marker, the row date and the age no longer run a day ahead. The W73 ratchet now holds the WHOLE tree to zero naive `.now().date()` sites (it had three registered).
+6. docs/RUNBOOK.md.
+
+**TESTS.** `tests/test_w71_iv_rank_parity.py`: 25 (comparator on series with known answers incl. asymmetric blocked/extra and unit scaling; the engine's 10-row window is the comparator's
+definition; the probe end to end on a temporary store incl. read-only and the narrow-rank equivalence; the AST class guard and its detector; the manifest line on and off; the read-only
+adapter; the three live sites under a host clock one day ahead of ET). `test_w73_live_dte_and_clock_fixes`: the ratchet rewritten to the whole tree (3 superseded tests replaced by 2: whole-tree zero, and a detector test on synthetic source). Collected-test reconciliation against the W79a commit: +25 (W71) +2 -3 = +24 exactly (5750 -> 5774 selected).
+**Mutation-checked: 20 mutants; 15 caught on the first pass, the 5 survivors (a symmetric fixture, two unasserted fields, an unfiltered symbol, an unasserted column) were real gaps and are
+closed; files restored byte-for-byte.** Fast lane on the final tree, run entirely after host midnight (the regime where host and ET dates differ): 5729 passed / 45 skipped / 1 failed, the failure being the second host-date-pinned test below, fixed and re-run with the related suites (129 passed); the 5729 equals the reconciled expectation (5705 + 25 + 2 - 3). `smoke_deploy.py` SMOKE PASS (13 checks); `typecheck.py` OK; `compileall` OK; legacy engine byte-identical (six reference variants).
+
+**DEVIATIONS FROM THE PLAN.** (a) The probe uses FeatureEngine's IV-proxy block directly (speed), with a test that it equals `compute()`'s column. (b) The first run of the probe used
+`compute()` and was killed after 20 CPU-minutes; the numbers above are from the corrected script. (c) **My first rewrite of the W73 ratchet class replaced everything after it and silently deleted the 7-test `TestGetChainBounds` class.** The first full lane read 5722 passed where 5729 was expected; reconciling the collected test ids against the W79a commit found exactly those 7; they were restored from git and the lane was re-run on the final tree. (d) `test_r15_review_fixes::test_partial_ledger_defers_trueup` asserted the marker equals the HOST date; after W71b it is the ET date, and the test began failing once the host clock passed midnight while ET had not. It now asserts `today_et()` (the intended semantics); a lane run past host midnight is what exposed it. `test_r16_round2_fixes::test_already_saved_today_is_a_noop` had the same host-date pin and was fixed the same way.
+
+**REGISTERED, NOT FIXED.** (1) **Executing D9 "remove the veto" needs two things, not one:** the overlay `iv_rank_rise_threshold: 10` AND the optimizer must stop searching it, because the
+searched 0.25-0.60 overrides the baseline per trial and would silently re-enable the gate; a small drop-when-disabled rule belongs to executing D9 and is not built yet. (2) Live's
+persistence takes the MEDIAN ATM IV across scanned expiries, so the stored series changes meaning with the chain mix (0-2 DTE chains): W80. (3) SPY / IWM live stores hold only 510
+observations since 2024-04 (the research tables go back to 2010). (4) The staleness / freshness machinery (5-day gate, realized-vol fallback) is live-side and was not simulated.
+(5) The "construction study" (open item 2 of the W67 clarification) is untouched.
+
+**OPERATOR.** **D9, the rise veto.** Recommendation: **remove it from research** (`iv_rank_rise_threshold: 10` in `config_research.yaml`, plus the optimizer rule above). Reasons: live does not
+have it; it is a weak proxy for the rank live gates on; half of what it blocks live already refuses; and in the A/B it only removes 3-6 trades and is slightly negative. The alternatives are to
+keep it as a declared research-only deviation (the manifest line) or to port it to live (a W80-class change that this evidence does not support). Still open from W79a: D2, the range-gate
+mode, the window design, the SPY / IWM backfill. The bot's next start picks up W71b.
+
+**DEPLOY / ROLLBACK.** Research files: no restart. W71b: live file, effective at the next bot start (operator's call; the bot is not running). Rollback is a clean `git revert`.
+
+**NEXT.** D9, then W79b once D2, the gate mode and the window design are decided.
+
+---
