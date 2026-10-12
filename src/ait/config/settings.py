@@ -796,6 +796,38 @@ class BacktestConfig(_StrictModel):
     max_hold_days: int = Field(default=30, ge=1, le=120,
         description="R20b: baseline maximum holding period (calendar days) before a "
                     "trial/engine backtest force-closes a position.")
+    engine_model: Literal["legacy", "realistic"] = Field(default="legacy",
+        description="W74: which fidelity the research engine runs at. 'legacy' = the "
+                    "engine every prior study used (entry priced at the DAILY close with "
+                    "same-day IV, expiry = entry + N calendar days even on a weekend, "
+                    "whole-day time, no same-session exit check, intraday take-profit "
+                    "decided AFTER friction and blind to touches, condors invalidated on "
+                    "direction, long strikes priced unrounded then re-marked rounded). "
+                    "'realistic' fixes each (W72 leads L2-L6): fill-time spot, "
+                    "previous-session IV, listed session expiries, fractional time to the "
+                    "bell, same-session exit checks, mid-based intraday decisions, per-bar "
+                    "touch stops, live's condor thesis exemption, rounded strikes priced "
+                    "as stored. Flipping it changes every research baseline (assumption "
+                    "A10): record a before/after on the reference study first. "
+                    "Operator-owned; default 'legacy' so no study moves silently.")
+    expiry_guard_dte: int | None = Field(default=None, ge=0, le=45,
+        description="W74: positions ENTERED with at most this many days to expiry are "
+                    "exempt from the DTE-based closes (live rules 3/3a: DTE <= "
+                    "EXPIRY_APPROACHING_DTE) and are governed by max_hold_fraction and "
+                    "the expiry-day flatten instead. None = today's behaviour: the rule "
+                    "closes every position, which makes any 0-5 DTE entry exit on the "
+                    "next bar. Searched 0-5 by the DTE study (W79).")
+    max_hold_fraction: float | None = Field(default=None, gt=0.0, le=1.0,
+        description="W74: close a credit position after this share of its life (entry "
+                    "-> expiry close). None = the legacy day cap (max_hold_days). "
+                    "Replaces max_hold_days for credit structures when set, so 'hold "
+                    "anywhere between 0 and DTE' is one dimension for every entry DTE.")
+    flatten_minutes_before_close: int | None = Field(default=None, ge=5, le=390,
+        description="W74: on a position's expiry date, flatten this many minutes before "
+                    "the session close (13:00 ET on early-close days). None = off. A hard "
+                    "backstop so no position reaches settlement, assignment or an "
+                    "unhedged gap after a one-sided expiry (the exposure that cost two "
+                    "manual trades more than their defined maximum).")
     iv_rank_rise_threshold: float = Field(default=0.30, ge=0.0, le=10.0,
         description="R20b: suppress iron-condor entry when IV rank rose more than "
                     "this over the last 10 days (Exp 20 veto). Values > 1 disable "

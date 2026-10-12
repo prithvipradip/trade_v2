@@ -248,6 +248,23 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
         if bt_val != live_val:
             warnings.append(f"{key}: live={live_val} backtest={bt_val}")
 
+    # W74: research fidelity. No live counterpart, so it is not part of the
+    # live-vs-backtest compare above; it is surfaced as its own warning because
+    # 'legacy' still carries the confirmed W72 defects (L2-L6) and a study that
+    # does not say which engine it ran is not reproducible.
+    _bt_cfg = getattr(rsettings, "backtest", None) if rsettings is not None else None
+    _engine_model = getattr(_bt_cfg, "engine_model", "legacy")
+    backtest["engine_model"] = _engine_model
+    for _k in ("expiry_guard_dte", "max_hold_fraction", "flatten_minutes_before_close"):
+        backtest[_k] = getattr(_bt_cfg, _k, None)
+    if _engine_model != "realistic":
+        warnings.append(
+            "engine_model: 'legacy' - entries are priced at the DAILY close with same-day IV, "
+            "expiry = entry + N calendar days (can be a weekend), no same-session exit check, "
+            "intraday take-profit decided after friction and blind to touches, condors "
+            "invalidated on direction (W72 leads L2-L6). 'realistic' fixes them; flip "
+            "backtest.engine_model in config_research.yaml after recording a before/after (A10).")
+
     notes = [
         # R16: this note used to hardcode a 4-day pre-event window; the
         # blackout has been risk.pre_event_blackout_days (currently 1) since

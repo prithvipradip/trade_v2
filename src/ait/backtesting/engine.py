@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import os
 from collections import Counter
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
+from functools import lru_cache
 from typing import Any
 
 import numpy as np
@@ -22,6 +23,7 @@ import pandas as pd
 from ait.backtesting.pricing import (
     OptionType,
     black_scholes_price,
+    expected_move as _expected_move,  # W74: fractional-time expected move
     find_strike_by_delta,
     ic_leg_marks,  # W72: single owner of condor leg pricing (engine + parity replay)
     realized_vol,
@@ -35,10 +37,17 @@ from ait.execution import exit_policy
 from ait.ml.regime_gate import apply_range_prob_delta, fractal_gate
 from ait.strategies.base import CREDIT_STRATEGIES, SignalDirection
 from ait.utils.logging import get_logger
+from ait.utils.time import ET, get_market_close, time_to_expiry_years  # W74: real session clock
 from ait.config.invariants import IC_BUDGET_CAPPED_MIN_WING  # W70: fixed, visible
 from ait.config.runtime_env import contract_flag, contract_float  # R19: ONE authority for env-contract defaults
 
 log = get_logger("backtesting.engine")
+
+
+@lru_cache(maxsize=4096)
+def _session_close(d: date) -> time:
+    """W74: the NYSE session close for ``d`` (13:00 ET on early-close days)."""
+    return get_market_close(d)
 
 # Strategies that collect premium (short theta).
 # R16: this module used to declare its OWN set under the same name with
@@ -313,6 +322,14 @@ class Backtester:
         # from load_settings() (config.yaml authority; falls back to
         # OptionsConfig's pydantic default when no config.yaml is reachable).
         entry_dte: int | None = None,
+        # W74 short-DTE parity programme. All four are None -> backtest.<same name>
+        # (schema defaults: 'legacy' / off / off / off), so a bare engine behaves as
+        # before. engine_model='realistic' turns on the W72 lead fixes L2-L6; the
+        # three exit knobs are independent of it. See BacktestConfig for the meaning.
+        engine_model: str | None = None,
+        expiry_guard_dte: int | None = None,
+        max_hold_fraction: float | None = None,
+        flatten_minutes_before_close: int | None = None,
         # Research-only (scripts/post_event_study.py): block CREDIT entries for
         # this many calendar days AFTER an event date (day 0 = the event day
         # itself, when the decision lands intraday). None = off, which is the
@@ -525,6 +542,19 @@ class Backtester:
             for d in (post_event_dates or ())))
         self._entry_dte = int(entry_dte) if entry_dte is not None else int(
             _resolve_setting(None, "options", "dte_range", OptionsConfig, _settings)[0])
+        # W74: fidelity switch + the three short-DTE exit knobs (None = off = legacy).
+        self._engine_model = str(_bt(engine_model, "engine_model"))
+        if self._engine_model not in ("legacy", "realistic"):
+            raise ValueError(f"engine_model must be 'legacy' or 'realistic', got {self._engine_model!r}")
+        self._realistic = self._engine_model == "realistic"
+        _g = _bt(expiry_guard_dte, "expiry_guard_dte")
+        self._expiry_guard_dte = None if _g is None else int(_g)
+        _hf = _bt(max_hold_fraction, "max_hold_fraction")
+        self._max_hold_fraction = None if _hf is None else float(_hf)
+        if self._max_hold_fraction is not None and not 0.0 < self._max_hold_fraction <= 1.0:
+            raise ValueError(f"max_hold_fraction must be in (0, 1], got {self._max_hold_fraction}")
+        _fm = _bt(flatten_minutes_before_close, "flatten_minutes_before_close")
+        self._flatten_minutes = None if _fm is None else int(_fm)
         self._scan_interval_minutes = int(_resolve_setting(
             scan_interval_minutes, "backtest", "scan_interval_minutes", BacktestConfig, _settings))
         self._entry_window_start_et = str(_resolve_setting(
@@ -1141,6 +1171,7 @@ class Backtester:
             entry_time_str: str | None = None
             limit_price: float | None = None
             fill_time_str: str | None = None
+            _session_bars = None
             if self._intraday_store is not None:
                 from ait.data.historical import HistoricalDataStore
                 session_bars = self._intraday_store.load_intraday_range(
@@ -1149,6 +1180,7 @@ class Backtester:
                     end_date=today_date,
                 )
                 if not session_bars.empty:
+                    _session_bars = session_bars
                     # Find first bar in the entry window
                     window_bars = session_bars[
                         session_bars.index.to_series().apply(
@@ -1188,9 +1220,17 @@ class Backtester:
             # vol calibration (VXN/VIX 1.228 QQQ, 1.33 IWM) were DEAD at
             # entry-pricing time — every study priced entries off the
             # priority-3 synthetic fallback realized_vol*1.15.
+            # W74 (realistic): what was knowable at the FILL — the limit price the
+            # order rested at, the fill time, and history through the previous
+            # session only (W72 lead L2).
+            fill_ctx = None
+            if self._realistic and fill_time_str is not None and limit_price is not None:
+                fill_ctx = {"spot": float(limit_price),
+                            "as_of": datetime.fromisoformat(fill_time_str).astimezone(ET),
+                            "iv_hist": hist.iloc[:-1]}
             pos = self._build_position(
                 strategy, direction, row, hist, today_date, capital,
-                market_context=self._market_context,
+                market_context=self._market_context, fill_ctx=fill_ctx,
             )
             if pos is None:
                 self._reject("builder_none")
@@ -1299,8 +1339,23 @@ class Backtester:
             entry_commission = self._cost_per_contract_leg * pos["contracts"] * n_legs
             pos["entry_commission"] = entry_commission
 
-            open_positions.append(pos)
             self._funnel["entries_taken"] += 1
+            # W74 (realistic): a position opened at T is exit-checked on the bars
+            # AFTER T the same session. The legacy loop exits before it enters, so
+            # a same-day round trip (0-DTE, or a touch an hour after the fill)
+            # was impossible.
+            _same_day_exit = None
+            if self._realistic and fill_time_str is not None and _session_bars is not None:
+                _after = _session_bars[_session_bars.index > datetime.fromisoformat(fill_time_str)]
+                _same_day_exit = self._check_intraday_exit(pos, _after, today_date)
+            if _same_day_exit is not None:
+                pos.update(_same_day_exit)
+                capital += pos["pnl"]
+                trades.append(pos)
+                log.debug("trade_closed_same_session", strategy=pos["strategy"],
+                          pnl=f"{pos['pnl']:.2f}", reason=pos["exit_reason"])
+            else:
+                open_positions.append(pos)
 
         # --- Force-close remaining positions ---
         last_row = self._data.iloc[-1]
@@ -1485,6 +1540,8 @@ class Backtester:
 
         Returns exit dict if triggered on any bar, else None.
         """
+        if self._realistic:
+            return self._check_intraday_exit_realistic(pos, session_bars, current_date)
         if session_bars is None or session_bars.empty:
             return None
 
@@ -1522,6 +1579,65 @@ class Backtester:
                 result["exit_time"] = bar_dt
                 return result
 
+        return None
+
+    def _check_intraday_exit_realistic(
+        self, pos: dict, session_bars: "pd.DataFrame", current_date: date
+    ) -> dict | None:
+        """Intraday exit scan at live fidelity (W72 leads L3, L4).
+
+        Differences from the legacy scan, each a measured defect:
+          * L3 — the take-profit DECISION uses the mid mark vs the credit
+            received (live's pnl_pct is the broker mark over cost basis); the
+            spread is paid on the booked exit price. The legacy scan decided on
+            the after-friction value, so the same price state exited on the
+            daily path and not intraday.
+          * L4 — each bar's OHLC is handed to the credit rules, so a short-strike
+            TOUCH is evaluated per bar (live polls spot every 30 s). The legacy
+            scan passed no row, so a take-profit bar later in the day beat an
+            earlier pierce.
+          * The decision instant is the bar END, which the expiry-day flatten and
+            the hold fraction need.
+        """
+        if session_bars is None or session_bars.empty:
+            return None
+        entry_price = pos["entry_price"]
+        trade_type = pos.get("trade_type", pos.get("position_type", "debit"))
+        expiry_str = pos.get("expiry_date") or pos.get("exit_date")
+        if not expiry_str:
+            return None
+        expiry = date.fromisoformat(str(expiry_str)[:10])
+        days_held = (current_date - date.fromisoformat(pos["entry_date"])).days
+        remaining_dte = max(0, (expiry - current_date).days)
+        exit_half_spread = self._options_half_spread(float(pos.get("entry_iv", 0.25)), remaining_dte)
+        bar_len = pd.Timedelta(minutes=5)
+
+        for row in session_bars.itertuples(index=True):
+            underlying = row.Close
+            bar_ts = row.Index
+            bar_end = (bar_ts + bar_len)
+            as_of = bar_end.to_pydatetime().astimezone(ET) if hasattr(bar_end, "to_pydatetime") else bar_end
+            mid_value = self._reprice_position(pos, underlying, days_held, None, as_of)
+            if trade_type == "credit":
+                pnl_pct = (entry_price - mid_value) / entry_price if entry_price > 0 else 0.0
+            else:
+                pnl_pct = (mid_value - entry_price) / entry_price if entry_price > 0 else 0.0
+            bar = pd.Series({"Open": float(row.Open), "High": float(row.High),
+                             "Low": float(row.Low), "Close": float(row.Close)})
+            result = self._dispatch_exit_check(pos, trade_type, pnl_pct, current_date, bar, as_of)
+            if result is None:
+                continue
+            value, und = mid_value, underlying
+            if result.get("exit_reason") == "touch_stop":
+                value, und = self._touch_exit_mark(pos, result, days_held, None, trade_type, as_of)
+            value = self._apply_exit_friction(
+                pos, value, und, days_held, None, exit_half_spread, trade_type, as_of)
+            pnl = self._calc_pnl(pos, value)
+            result["pnl"] = round(pnl, 2)
+            result["exit_price"] = round(value, 4)
+            result["exit_underlying"] = round(float(und), 4)
+            result["exit_time"] = bar_ts.isoformat() if hasattr(bar_ts, "isoformat") else str(bar_ts)
+            return result
         return None
 
     def _try_limit_fill(
@@ -1785,6 +1901,16 @@ class Backtester:
         rv = realized_vol(close_arr, window=20)
         return rv * 1.15
 
+    # W74: class-level defaults for the fidelity switch and the three short-DTE exit
+    # knobs. Tests (and any harness) build partial engines with ``Backtester.__new__``
+    # and set only what they need; those instances must stay on LEGACY semantics
+    # (the same idiom as the W70 executor durations). __init__ overwrites all four.
+    _engine_model: str = "legacy"
+    _realistic: bool = False
+    _expiry_guard_dte: int | None = None
+    _max_hold_fraction: float | None = None
+    _flatten_minutes: int | None = None
+
     # R16: VIX -> per-symbol implied-vol multipliers (see _get_iv). Unknown
     # symbols keep the historical 1.10 so nothing silently changes for
     # underlyings this calibration was never measured on.
@@ -1857,14 +1983,15 @@ class Backtester:
 
     def _apply_exit_friction(self, pos: dict, value: float, underlying: float,
                              days_held: int, hist: pd.DataFrame | None,
-                             half_spread_pct: float, trade_type: str) -> float:
+                             half_spread_pct: float, trade_type: str,
+                             as_of: datetime | None = None) -> float:
         """Price the exit transaction cost onto a repriced value.
 
         v2 iron condor: + capture x sum(leg half-spreads) at the legs' CURRENT mids (buying
         back the shorts at the ask / selling the wings at the bid). Everything else (and
         the legacy model): the original `% x net value` shortcut."""
         if self._leg_spread_model is not None and pos.get("strategy") == "iron_condor":
-            sc, sp, lc, lp = self._reprice_ic_legs(pos, underlying, days_held, hist)
+            sc, sp, lc, lp = self._reprice_ic_legs(pos, underlying, days_held, hist, as_of)
             return value + self._leg_friction_usd(self._friction_exit_capture,
                                                   (sc, sp, lc, lp))
         return value * (1 + half_spread_pct) if trade_type == "credit" \
@@ -1890,12 +2017,32 @@ class Backtester:
         today_date: date,
         capital: float,
         market_context: dict | None = None,
+        fill_ctx: dict | None = None,
     ) -> dict | None:
-        """Build a position dict with proper BS pricing for the strategy type."""
+        """Build a position dict with proper BS pricing for the strategy type.
+
+        ``fill_ctx`` (realistic engine model, intraday fill only) carries what was
+        knowable at the fill: ``spot`` (the limit price the order rested at),
+        ``as_of`` (tz-aware fill time) and ``iv_hist`` (history through the
+        PREVIOUS session). W72 lead L2: the legacy path priced a 10:30 fill at the
+        daily CLOSE with the same-day stored IV.
+        """
         underlying = row["Close"]
-        iv = self._get_iv(hist, market_context=market_context)
         dte = self._entry_dte
-        t = dte / 365.0
+        expiry_override: date | None = None
+        t_override: float | None = None
+        iv_hist = hist
+        if self._realistic:
+            from ait.backtesting.expiry_calendar import listed_expiry
+            expiry_override = listed_expiry(today_date, self._entry_dte)
+            dte = (expiry_override - today_date).days
+            if fill_ctx is not None:
+                underlying = float(fill_ctx["spot"])
+                t_override = time_to_expiry_years(fill_ctx["as_of"], expiry_override,
+                                                  close=_session_close(expiry_override))
+                iv_hist = fill_ctx["iv_hist"]
+        iv = self._get_iv(iv_hist, market_context=market_context)
+        t = dte / 365.0 if t_override is None else t_override
         r = 0.05
 
         # Entry gate for credit strategies: insufficient IV → premiums too small to
@@ -1905,7 +2052,8 @@ class Backtester:
             return None
 
         if strategy in CREDIT_STRATEGIES:
-            pos = self._build_credit_position(strategy, underlying, iv, t, r, dte, today_date, capital)
+            pos = self._build_credit_position(strategy, underlying, iv, t, r, dte, today_date, capital,
+                                              expiry=expiry_override)
         else:
             pos = self._build_debit_position(strategy, direction, underlying, iv, t, r, dte, today_date, capital)
         # W64: live trades at most positions.max_contracts_per_trade contracts
@@ -2059,7 +2207,7 @@ class Backtester:
     def _build_credit_position(
         self, strategy: str,
         S: float, iv: float, t: float, r: float, dte: int,
-        today_date: date, capital: float,
+        today_date: date, capital: float, expiry: date | None = None,
     ) -> dict | None:
         """Build a credit (short premium) position.
 
@@ -2072,7 +2220,12 @@ class Backtester:
 
             # Wings: vol-scaled by wing_k; wing_floor_dollars is the hard safety minimum.
             # wing_k=1.0 → 1-sigma expected move; wing_k=2.0 → 2-sigma (wider, safer).
-            expected_move = S * iv * (dte / 365.0) ** 0.5
+            if self._realistic:
+                # W74: fractional years, so a 0-DTE entry with hours left has a
+                # small positive move instead of em_unavailable.
+                expected_move = _expected_move(S, iv, t)
+            else:
+                expected_move = S * iv * (dte / 365.0) ** 0.5
             # W52a: the live EM sanity gate (iron_condor.py R12-B), same
             # rule and same contract keys: each short strike's distance from
             # spot must sit within [em_min, em_max] x expected move; reject
@@ -2109,6 +2262,20 @@ class Backtester:
                     wing_width = float(max(IC_BUDGET_CAPPED_MIN_WING, round(_afford)))
             long_call_strike = short_call_strike + wing_width
             long_put_strike = short_put_strike - wing_width
+            if self._realistic:
+                # W74 / W72 lead L6: price the strikes that are STORED and re-marked.
+                # The legacy build priced the unrounded long strikes, then stored
+                # them rounded, so a fresh condor re-marked away from its entry
+                # credit on day 0. The wing is now the WIDER of the two rounded
+                # wings (what live uses for credit/width and max loss).
+                long_call_strike = float(round(long_call_strike))
+                long_put_strike = float(round(long_put_strike))
+                _call_w = long_call_strike - short_call_strike
+                _put_w = short_put_strike - long_put_strike
+                if min(_call_w, _put_w) <= 0:
+                    self._reject("builder:wing_degenerate")  # detail of the loop's builder_none
+                    return None
+                wing_width = max(_call_w, _put_w)
 
             # Price each leg with its own skewed IV (W72: pricing.ic_leg_marks,
             # the same call the daily re-mark and the parity replay use)
@@ -2206,8 +2373,11 @@ class Backtester:
                 # pool allocator reuses it so its affordability/aggregate-risk gates
                 # agree with the engine's, instead of re-rejecting what the engine took.
                 "budget_gate_risk_per_contract": round(_gate_per_contract, 2),
-                "expiry_date": str(today_date + timedelta(days=dte)),
+                "expiry_date": str(expiry if expiry is not None
+                                   else today_date + timedelta(days=dte)),
                 "high_water_mark": 0.0,
+                **({"engine_model": "realistic", "entry_dte_actual": int(dte)}
+                   if self._realistic else {}),
             }
 
         elif strategy in ("wide_wing_condor", "broken_wing_condor"):
@@ -2576,6 +2746,21 @@ class Backtester:
     # Exit logic — handles both debit and credit positions
     # ------------------------------------------------------------------
 
+    def _position_dte(self, pos: dict) -> int:
+        """W74: calendar days from THIS position's entry to ITS expiry.
+
+        The re-mark used the engine-wide ``self._entry_dte``, which is only right
+        while every position is entered with the same DTE and a synthetic
+        ``entry + N`` expiry. Reading the position's own dates is identical in
+        that legacy case (proved by the W72 reference run) and correct as soon
+        as expiries differ (listed-session expiries, per-candidate DTE).
+        """
+        try:
+            return (date.fromisoformat(str(pos["expiry_date"])[:10])
+                    - date.fromisoformat(str(pos["entry_date"])[:10])).days
+        except (KeyError, ValueError, TypeError):
+            return self._entry_dte
+
     def _get_current_iv(self, pos: dict, hist: pd.DataFrame | None) -> float:
         """Mean-reverting IV: blends entry IV with current realized vol.
 
@@ -2589,13 +2774,38 @@ class Backtester:
         rv = realized_vol(hist["Close"].values, window=20) * 1.15
         return max(0.70 * entry_iv + 0.30 * rv, self._iv_floor)
 
+    def _eod(self, d: date) -> datetime:
+        """W74: the daily model's decision instant: the session close of ``d``."""
+        return datetime.combine(d, _session_close(d), tzinfo=ET)
+
+    def _remark_t(self, pos: dict, days_held: int, as_of: datetime | None) -> float:
+        """Time to expiry, in years, for a re-mark.
+
+        Legacy: whole calendar days, floored at 0.0001 y (~53 min) so a position
+        never reprices at t=0. Realistic with a decision instant: the real
+        fractional time to the expiry session's bell, so a 0-DTE position marked
+        an hour after its fill has 4.5 hours of life, not 53 minutes. (The
+        legacy form made a freshly-entered 0-DTE condor look instantly
+        profitable: priced with 5.5 h at the fill, marked with 0.9 h one bar
+        later.)
+        """
+        if self._realistic and as_of is not None:
+            try:
+                expiry = date.fromisoformat(str(pos["expiry_date"])[:10])
+            except (KeyError, ValueError, TypeError):
+                expiry = None
+            if expiry is not None:
+                return time_to_expiry_years(as_of, expiry, close=_session_close(expiry))
+        return max(max(self._position_dte(pos) - days_held, 0) / 365.0, 0.0001)
+
     def _reprice_ic_legs(self, pos: dict, underlying: float, days_held: int,
-                         hist: pd.DataFrame | None = None) -> tuple[float, float, float, float]:
+                         hist: pd.DataFrame | None = None,
+                         as_of: datetime | None = None) -> tuple[float, float, float, float]:
         """The four condor leg mids (short call, short put, long call, long put) at this
         underlying/age. Single source for `_reprice_position` (net value) and the W66
         per-leg exit friction, so the two can never disagree on the leg prices."""
         iv = self._get_current_iv(pos, hist)
-        t = max(max(self._entry_dte - days_held, 0) / 365.0, 0.0001)
+        t = self._remark_t(pos, days_held, as_of)
         r = 0.05
         return ic_leg_marks(
             underlying, pos["short_call_strike"], pos["short_put_strike"],
@@ -2603,7 +2813,8 @@ class Backtester:
             self._skew_factor, self._skew_slope_per_pct_otm, self._iv_floor)
 
     def _reprice_position(self, pos: dict, underlying: float, days_held: int,
-                          hist: pd.DataFrame | None = None) -> float:
+                          hist: pd.DataFrame | None = None,
+                          as_of: datetime | None = None) -> float:
         """Reprice a position at the current underlying using Black-Scholes.
 
         Returns the current value per share:
@@ -2614,14 +2825,13 @@ class Backtester:
         # Decay to the REAL expiration (entry_dte), not the hold-cap —
         # max_hold_days now closes the position early via its own exit
         # check (_check_exit_*) rather than by fabricating a shorter option.
-        dte_remaining = max(self._entry_dte - days_held, 0)
-        t = max(dte_remaining / 365.0, 0.0001)
+        t = self._remark_t(pos, days_held, as_of)
         r = 0.05
 
         strategy = pos["strategy"]
 
         if strategy in ("iron_condor", "iron_butterfly", "wide_wing_condor", "broken_wing_condor"):
-            sc, sp, lc, lp = self._reprice_ic_legs(pos, underlying, days_held, hist)
+            sc, sp, lc, lp = self._reprice_ic_legs(pos, underlying, days_held, hist, as_of)
             return (sc + sp) - (lc + lp)
 
         elif strategy == "put_credit_spread":
@@ -2696,6 +2906,12 @@ class Backtester:
         """
         if self._predictor is None:
             return None
+        # W74 / W72 lead L5: live's _check_thesis_valid EXEMPTS defined-risk NEUTRAL
+        # structures entirely (R16, 2026-08-07: a condor profits in either
+        # direction, so a direction "flip" is meaningless). The legacy engine
+        # exited condors on a >= 0.80 directional call.
+        if self._realistic and pos.get("strategy") in ("iron_condor", "iron_butterfly"):
+            return None
         # Only re-evaluate after at least 2 days held (avoid same-bar noise)
         entry_date = date.fromisoformat(pos["entry_date"])
         if not hasattr(hist.index[-1], "date"):
@@ -2739,7 +2955,8 @@ class Backtester:
         entry_date = date.fromisoformat(pos["entry_date"])
         days_held = (current_date - entry_date).days
 
-        current_value = self._reprice_position(pos, underlying, days_held, hist)
+        _eod_asof = self._eod(current_date) if self._realistic else None
+        current_value = self._reprice_position(pos, underlying, days_held, hist, _eod_asof)
 
         trade_type = pos.get("trade_type", "debit")
         entry_price = pos["entry_price"]
@@ -2766,7 +2983,8 @@ class Backtester:
         exit_half_spread = self._options_half_spread(exit_iv, remaining_dte)
         # Buy back at the ask / sell at the bid (W66: per-leg dollars for v2 condors)
         current_value = self._apply_exit_friction(
-            pos, current_value, underlying, days_held, hist, exit_half_spread, trade_type)
+            pos, current_value, underlying, days_held, hist, exit_half_spread, trade_type,
+            _eod_asof)
 
         result = self._dispatch_exit_check(pos, trade_type, pnl_pct, current_date, row)
 
@@ -2776,25 +2994,11 @@ class Backtester:
             # recovered by the bell is booked at what live would actually have
             # paid — the whole point of modelling the touch.
             if result.get("exit_reason") == "touch_stop":
-                _tu = float(result.pop("touch_underlying"))
-                current_value = self._reprice_position(pos, _tu, days_held, hist)
-                underlying = _tu
-                # W5 model-vs-reality-touch-gap-pricing: a day that OPENED
-                # beyond the short strike could never have been closed AT the
-                # strike. Reprice at the gapped open and book the worse of the
-                # two — conservative by construction, so a gap can only ever
-                # cost more than the strike-touch booking, never less.
-                _gap = result.pop("touch_gap_underlying", None)
-                if _gap is not None:
-                    _gv = self._reprice_position(pos, float(_gap), days_held, hist)
-                    _worse = (_gv > current_value if trade_type == "credit"
-                              else _gv < current_value)
-                    if _worse:
-                        current_value = _gv
-                        underlying = float(_gap)
+                current_value, underlying = self._touch_exit_mark(
+                    pos, result, days_held, hist, trade_type, _eod_asof)
                 current_value = self._apply_exit_friction(
                     pos, current_value, underlying, days_held, hist, exit_half_spread,
-                    trade_type)
+                    trade_type, _eod_asof)
 
             # Calculate actual P&L
             pnl = self._calc_pnl(pos, current_value)
@@ -2807,9 +3011,34 @@ class Backtester:
 
         return None
 
+    def _touch_exit_mark(self, pos: dict, result: dict, days_held: int,
+                         hist: pd.DataFrame | None, trade_type: str,
+                         as_of: datetime | None = None) -> tuple[float, float]:
+        """Mid value and underlying a short-strike TOUCH exit is booked at.
+
+        R16: live transacts AT the touched strike, so the structure is repriced
+        there. W5 model-vs-reality-touch-gap-pricing: a session that OPENED
+        beyond the short strike could never be closed AT the strike, so the
+        gapped open is repriced too and the WORSE of the two is booked —
+        conservative by construction. Pops the two bookkeeping keys off
+        ``result``. W74: extracted from ``_check_exit`` so the intraday scan
+        prices a touch with the very same code.
+        """
+        _tu = float(result.pop("touch_underlying"))
+        current_value = self._reprice_position(pos, _tu, days_held, hist, as_of)
+        underlying = _tu
+        _gap = result.pop("touch_gap_underlying", None)
+        if _gap is not None:
+            _gv = self._reprice_position(pos, float(_gap), days_held, hist, as_of)
+            _worse = (_gv > current_value if trade_type == "credit" else _gv < current_value)
+            if _worse:
+                current_value = _gv
+                underlying = float(_gap)
+        return current_value, underlying
+
     def _dispatch_exit_check(
         self, pos: dict, trade_type: str, pnl_pct: float, current_date: date,
-        row: pd.Series | None = None
+        row: pd.Series | None = None, as_of: datetime | None = None
     ) -> dict | None:
         """Route exit logic by trade type (R6 exit parity with live).
 
@@ -2820,7 +3049,7 @@ class Backtester:
         (trailing/breakeven when enabled, else fixed stop + profit target).
         """
         if trade_type == "credit":
-            return self._check_exit_credit(pos, pnl_pct, current_date, row)
+            return self._check_exit_credit(pos, pnl_pct, current_date, row, as_of)
         if self._trailing_stop_enabled:
             return self._check_exit_trailing(pos, pnl_pct, current_date)
         return self._check_exit_fixed(pos, pnl_pct, current_date)
@@ -2844,8 +3073,26 @@ class Backtester:
             dte, time_decay_scaling=time_decay_scaling, ladder=ladder
         )
 
+    def _entry_ts(self, pos: dict) -> datetime:
+        """W74: when this position was opened, tz-aware ET.
+
+        The intraday fill time when the entry was simulated on 5-minute bars, else
+        the daily-model convention: priced at the day's close.
+        """
+        for key in ("fill_time", "entry_time"):
+            v = pos.get(key)
+            if v:
+                try:
+                    ts = datetime.fromisoformat(str(v))
+                except ValueError:
+                    continue
+                return ts.astimezone(ET) if ts.tzinfo else ts.replace(tzinfo=ET)
+        d = date.fromisoformat(str(pos["entry_date"])[:10])
+        return datetime.combine(d, _session_close(d), tzinfo=ET)
+
     def _check_exit_credit(self, pos: dict, pnl_pct: float, current_date: date,
-                           row: pd.Series | None = None) -> dict | None:
+                           row: pd.Series | None = None,
+                           as_of: datetime | None = None) -> dict | None:
         """Credit-structure exits — R6 parity with live portfolio.py.
 
         pnl_pct is fraction of credit received (positive = value decayed).
@@ -2934,15 +3181,44 @@ class Backtester:
         # max_hold_days independently forces an earlier close, letting
         # Optuna explore shorter/longer synthetic hold horizons.
         held = (current_date - date.fromisoformat(pos["entry_date"])).days
-        if held >= self._max_hold_days:
+        # W74: decision instant. Intraday callers pass the bar's end; the daily path
+        # decides at the close (the daily-model convention).
+        _asof = as_of if as_of is not None else datetime.combine(
+            current_date, _session_close(current_date), tzinfo=ET)
+        _bell = datetime.combine(expiry, _session_close(expiry), tzinfo=ET)
+
+        # 2a. W74 expiry-day flatten: a hard backstop so no position reaches
+        # settlement/assignment mechanics. Off (None) = legacy.
+        if self._flatten_minutes is not None and exit_policy.expiry_day_flatten_due(
+                _asof, expiry, self._flatten_minutes, close_et=_session_close(expiry)):
+            return {"exit_date": str(current_date), "exit_reason": "expiry_day_flatten"}
+
+        # 2b. Hold cap. W74: a fraction of the position's own life REPLACES the
+        # day count when set, so "hold anywhere between 0 and DTE" is one
+        # dimension for every entry DTE.
+        if self._max_hold_fraction is not None:
+            if exit_policy.hold_limit_reached(self._entry_ts(pos), _asof, _bell,
+                                              self._max_hold_fraction):
+                return {"exit_date": str(current_date), "exit_reason": "max_hold_reached"}
+        elif held >= self._max_hold_days:
             return {"exit_date": str(current_date), "exit_reason": "max_hold_reached"}
 
         # 3. Expiry-approaching close — live closes any position at
         # DTE <= exit_policy.EXPIRY_APPROACHING_DTE (portfolio.py rule 3a;
-        # rule 3 assignment risk at DTE<=1 is subsumed).
-        if remaining_dte <= exit_policy.EXPIRY_APPROACHING_DTE:
+        # rule 3 assignment risk at DTE<=1 is subsumed). W74: only for positions
+        # ENTERED above expiry_guard_dte (None = every position, as before).
+        if remaining_dte <= exit_policy.EXPIRY_APPROACHING_DTE and \
+                exit_policy.expiry_guard_applies(self._position_dte(pos), self._expiry_guard_dte):
             reason = "expiry" if current_date >= expiry else "expiry_approaching"
             return {"exit_date": str(current_date), "exit_reason": reason}
+
+        # 3b. W74: nothing outlives its expiry SESSION. Time-aware on purpose: on
+        # the expiry date itself the position is alive until the bell, so the
+        # intraday scan must reach the flatten cutoff first; the daily path
+        # decides at the close, where this fires. Unreachable in legacy (rule 3
+        # fires first for every position); it closes guard-exempt entries.
+        if _asof >= _bell:
+            return {"exit_date": str(current_date), "exit_reason": "expiry"}
 
         # 4. Macro-event flatten (portfolio.py rule 3d parity). PLAN
         # 2026-08-04: defined-risk EXEMPT — condors hold through events
@@ -3046,7 +3322,8 @@ class Backtester:
         """Force-close a position at end of backtest."""
         entry_date = date.fromisoformat(pos["entry_date"])
         days_held = (last_date - entry_date).days
-        current_value = self._reprice_position(pos, last_row["Close"], days_held, hist)
+        _eod_asof = self._eod(last_date) if self._realistic else None
+        current_value = self._reprice_position(pos, last_row["Close"], days_held, hist, _eod_asof)
 
         trade_type = pos.get("trade_type", "debit")
         exit_iv = float(pos.get("entry_iv", 0.25))
@@ -3055,7 +3332,7 @@ class Backtester:
         exit_half_spread = self._options_half_spread(exit_iv, remaining_dte)
         current_value = self._apply_exit_friction(
             pos, current_value, last_row["Close"], days_held, hist, exit_half_spread,
-            trade_type)
+            trade_type, _eod_asof)
 
         pnl = self._calc_pnl(pos, current_value)
         return {

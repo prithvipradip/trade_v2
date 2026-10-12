@@ -152,6 +152,19 @@ def ic_leg_marks(
     return sc, sp, lc, lp
 
 
+def expected_move(S: float, iv: float, t_years: float) -> float:
+    """One-standard-deviation dollar move over ``t_years``: ``S * iv * sqrt(t)``.
+
+    W74: takes time in YEARS (fractional), so a 0-DTE position with hours left
+    has a small positive move instead of the whole-day ``max(dte, 0)`` form's
+    hard zero, which made the condor builder reject every 0-DTE entry with
+    ``em_unavailable``. Returns 0.0 for non-positive spot, IV or time.
+    """
+    if S <= 0.0 or iv <= 0.0 or t_years <= 0.0:
+        return 0.0
+    return float(S * iv * np.sqrt(t_years))
+
+
 def realized_vol(close_prices: np.ndarray, window: int = 20) -> float:
     """Calculate annualized realized volatility from close prices."""
     if len(close_prices) < window + 1:
