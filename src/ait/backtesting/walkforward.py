@@ -27,6 +27,7 @@ import pandas as pd
 
 from ait.backtesting.engine import Backtester
 from ait.backtesting.learner import BacktestLearner
+from ait.backtesting.range_bank import RangeModelBank
 from ait.backtesting.result import BacktestResult
 from ait.config.settings import MLConfig
 from ait.ml.ensemble import DirectionPredictor
@@ -1440,6 +1441,19 @@ class WalkForwardBacktester:
             else:
                 range_predictor, _range_model_status, _range_threshold = _range_result
 
+            # W78: per-horizon range models for this (window, symbol). The model trained /
+            # pre-trained above is the BASE bucket (so the default configuration is
+            # unchanged); any other entry DTE (a trial, or a window config that differs) is
+            # trained lazily and cached here.
+            _base_bucket = self._range_bucket()
+            _range_bank = RangeModelBank(
+                train_fn=lambda _b, _tr=train_df, _sym=symbol, _wid=window_id:
+                    self._train_range_bucket(_tr, _sym, _wid, _b),
+                bucket_fn=self._range_bucket,
+            )
+            _range_bank.seed(_base_bucket,
+                             (range_predictor, _range_model_status, _range_threshold))
+
             # R16 #3: record status for the WindowResult and run summary
             # (instance dict is guarded — tests may call _run_single_window
             # directly, bypassing run()).
@@ -1469,11 +1483,18 @@ class WalkForwardBacktester:
                     prior_oos_result=prev_oos,
                     prior_best_params=prev_best_params,
                     range_predictor=range_predictor,
+                    range_bank=_range_bank,
                     vix_ctx=_vix_train_ctx_opt,
                 )
                 window_cfg = new_cfg or self._config
                 if best_params is not None:
                     curr_best_params = best_params
+            # W78: the OOS run is gated by the model for the window config's OWN entry DTE
+            # (None -> the base bucket, so today's behaviour).
+            _oos_bucket, _oos_range = self._pick_range_model(_range_bank, window_cfg)
+            if _oos_bucket != _base_bucket:
+                range_predictor, _range_model_status, _range_threshold = _oos_range
+                _range_status_local[symbol] = _range_model_status
             if predictor and predictor.is_trained:
                 model_accuracy = max(
                     model_accuracy,
@@ -1721,7 +1742,7 @@ class WalkForwardBacktester:
                     # PR#7 review 2026-08-25: OOS eval must score the same
                     # horizon the model was trained on (see
                     # _range_label_horizon) — was max_hold_days (30).
-                    horizon_days=self._range_label_horizon(),
+                    horizon_days=_oos_bucket,
                     precomputed_features=_oos_feat_cache,
                 )
                 if _oos_scores and "range_predictor" in _model_weights:
@@ -1936,6 +1957,7 @@ class WalkForwardBacktester:
         prior_best_params: "dict | None" = None,
         range_predictor: "Any | None" = None,
         vix_ctx: "dict | None" = None,
+        range_bank: "RangeModelBank | None" = None,
     ) -> "tuple[WalkForwardConfig | None, dict | None, dict | None]":
         """Run Optuna on the training slice and return (updated_config, best_params, optuna_meta).
 
@@ -2041,6 +2063,9 @@ class WalkForwardBacktester:
                     intraday_store=_intraday_store,
                     symbol=symbol,
                     range_predictor=range_predictor,
+                    # W78: per-trial horizon (None provider = the single model above).
+                    range_predictor_provider=(
+                        range_bank.predictor_for if range_bank is not None else None),
                     val_split=self._config.optimize_val_split,
                     # R20b review follow-up: trial objectives priced with the
                     # same training-window VIX/SPY context as features_cache
@@ -2598,7 +2623,7 @@ class WalkForwardBacktester:
             results.append(per_symbol)
         return results
 
-    def _range_label_horizon(self) -> int:
+    def _range_label_horizon(self, entry_dte: "int | None" = None) -> int:
         """Label/eval horizon for the range model: the REACHABLE trade horizon.
 
         PR#7 review 2026-08-25: both range-training paths passed
@@ -2612,15 +2637,55 @@ class WalkForwardBacktester:
         actually reach; max_hold_days remains a cap, never an extender.
         """
         from ait.config.settings import OptionsConfig
-        from ait.execution.exit_policy import EXPIRY_APPROACHING_DTE
-        try:
-            _opts = (self._settings.options if self._settings is not None
-                     else OptionsConfig())
-        except Exception:  # noqa: BLE001 — partial test stubs -> field defaults
-            _opts = OptionsConfig()
-        entry_dte = int(_opts.dte_range[0])
-        reachable = max(1, entry_dte - int(EXPIRY_APPROACHING_DTE))
-        return min(int(self._config.max_hold_days), reachable)
+        from ait.ml.range_spec import horizon_for
+        if entry_dte is None:
+            entry_dte = getattr(self._config, "entry_dte", None)   # W78: a study's own DTE
+        if entry_dte is None:
+            try:
+                _opts = (self._settings.options if self._settings is not None
+                         else OptionsConfig())
+            except Exception:  # noqa: BLE001 — partial test stubs -> field defaults
+                _opts = OptionsConfig()
+            entry_dte = int(_opts.dte_range[0])
+        # W78: ONE definition shared with the live spec (ait.ml.range_spec.horizon_for).
+        # guard / hold-fraction fields arrive with W79; getattr keeps partial configs valid.
+        return horizon_for(
+            int(entry_dte),
+            guard_dte=getattr(self._config, "expiry_guard_dte", None),
+            hold_fraction=getattr(self._config, "max_hold_fraction", None),
+            max_hold_days=int(self._config.max_hold_days),
+        )
+
+    def _range_bucket(self, entry_dte: "int | None" = None) -> int:
+        """W78: the horizon whose range model serves ``entry_dte`` (None = the base config).
+
+        The base configuration keeps its EXACT horizon (what it has always trained at); any
+        other DTE whose reachable horizon differs is rounded UP to the next bucket so a study
+        that searches the DTE trains a handful of models per window, not one per DTE.
+        """
+        from ait.ml.range_spec import bucket_for
+        base = self._range_label_horizon()
+        if entry_dte is None:
+            return base
+        h = self._range_label_horizon(int(entry_dte))
+        return base if h == base else bucket_for(h)
+
+    def _pick_range_model(self, bank: "RangeModelBank", window_cfg: "Any") -> "tuple[int, tuple]":
+        """W78: (bucket, (predictor, status, threshold)) that gates this window's OOS run: the
+        model for the window config's OWN entry DTE (None -> the base bucket)."""
+        bucket = self._range_bucket(getattr(window_cfg, "entry_dte", None))
+        return bucket, bank.get(bucket)
+
+    def _train_range_bucket(self, train_df: pd.DataFrame, symbol: str, window_id: int,
+                            bucket: int) -> "tuple[Any | None, str, float]":
+        """Train the range model for a non-base bucket (artifacts under models/research/h<N>)."""
+        if not self._config.train_window_models:
+            return None, "disabled_by_config", 0.05
+        res = self._train_window_range_model(
+            train_df, symbol, window_id, max_hold_days=int(bucket),
+            model_subdir=f"h{int(bucket)}",
+        )
+        return res
 
     def _train_window_range_model(
         self,
@@ -2628,6 +2693,7 @@ class WalkForwardBacktester:
         symbol: str,
         window_id: int,
         max_hold_days: int = 30,
+        model_subdir: "str | None" = None,
     ) -> "tuple[Any | None, str, float]":
         """Train range predictor on this window's training data.
 
@@ -2640,6 +2706,7 @@ class WalkForwardBacktester:
         threshold_pct = self._adaptive_range_threshold(train_df, horizon_days=max_hold_days)
         return self._train_window_range_model_inprocess(
             train_df, symbol, window_id, max_hold_days, threshold_pct,
+            model_subdir=model_subdir,
         )
 
     def _train_window_range_model_inprocess(
@@ -2649,6 +2716,7 @@ class WalkForwardBacktester:
         window_id: int,
         max_hold_days: int,
         threshold_pct: float,
+        model_subdir: "str | None" = None,
     ) -> "tuple[Any | None, str, float]":
         """Train the ML-only (XGB/LGBM) range model in-process.
 
@@ -2664,7 +2732,10 @@ class WalkForwardBacktester:
                 horizon_days=max_hold_days,
                 # R7/R10 artifact hygiene: research runs save under
                 # models/research/ — NEVER the live models/range.pkl.
-                model_dir=RESEARCH_MODEL_DIR,
+                # W78: a non-base horizon saves under its own subdirectory so two horizons
+                # never overwrite each other's range.pkl (base keeps today's path).
+                model_dir=(RESEARCH_MODEL_DIR / model_subdir if model_subdir
+                           else RESEARCH_MODEL_DIR),
             )
             accs = rp.train(train_df, symbol=symbol, intraday_store=intraday_store)
             if accs and rp.is_trained:

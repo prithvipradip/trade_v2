@@ -292,6 +292,23 @@ python scripts/parity_replay.py                 # reads data/replay/manual_trade
 - **Never paste** per-trade prices, P&L or any account identifier into PLAN.md: it is shared via
   git with the other box. Report error statistics by DTE band only.
 
+## Per-horizon range models and the decision frame (W78; research only)
+
+- **Range models per horizon.** The walk-forward trains the range gate's model for the horizon the
+  study's entry DTE can actually reach (`ait.ml.range_spec.horizon_for`, shared with the live spec).
+  The configured band's own horizon is the base model (unchanged: 9 bars at `dte_range [14, ...]`);
+  any other DTE is rounded UP to a bucket in `RANGE_HORIZON_BUCKETS` and trained once per window, on
+  demand. Non-base buckets save under `models/research/h<N>/`; the live `models/range.pkl` is never
+  touched. `python scripts/range_horizon_study.py --symbol QQQ` measures out-of-sample skill, abstention
+  and reliability per horizon (read-only; artifacts go to a temp directory).
+- **Abstention is not a bug.** When no ensemble member has cross-validated edge over the base rate the
+  model returns no probability; the engine's range gate then rejects (enforce) or would-reject
+  (observe). The study reports how often that happens per horizon: read it before enforcing the gate.
+- **Decision frame.** With `engine_model: realistic` and intraday entries, the entry gates and models
+  see history through the PREVIOUS session (a 10:30 decision cannot know that day's close), and an
+  entry counts positions that were still alive at its fill time toward `max_concurrent_positions`.
+  Legacy and daily-close studies are unchanged.
+
 ## Quarterly drills (scheduled — first week of Jan / Apr / Jul / Oct)
 Run both, then record the date in the log table below. An untested kill
 switch or backup is a hope, not a control.

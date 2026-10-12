@@ -164,6 +164,10 @@ class StrategyOptimizer:
         intraday_store: "Any | None" = None,
         symbol: str | None = None,
         range_predictor: "Any | None" = None,
+        # W78: optional per-trial hook ``entry_dte | None -> predictor``. When set, each trial's
+        # Backtester is gated by the range model for THAT trial's entry DTE (W79 puts the DTE in
+        # bt_kwargs); None keeps the single model above for every trial, as before.
+        range_predictor_provider: "Any | None" = None,
         val_split: bool = False,
         # R20b review follow-up: walkforward builds vix_ctx for the training
         # window and threads it into features_cache above, but every trial's
@@ -328,6 +332,7 @@ class StrategyOptimizer:
         self._intraday_store = intraday_store
         self._symbol = symbol
         self._range_predictor = range_predictor
+        self._range_predictor_provider = range_predictor_provider
         self._val_split = val_split
         self._market_context = market_context
         self._data: dict[str, pd.DataFrame] = {}
@@ -681,7 +686,9 @@ class StrategyOptimizer:
             # cwd-default historical.db.
             db_path=self._db_path,
             iv_rank_series=self._iv_rank_series.get(self._symbol or symbol),
-            range_predictor=self._range_predictor,
+            range_predictor=(
+                self._range_predictor_provider(bt_kwargs.get("entry_dte"))
+                if self._range_predictor_provider is not None else self._range_predictor),
             intraday_store=self._intraday_store,
             eval_start_date=eval_start_date,
             # R16: Optuna trials must never score with the live future-trained

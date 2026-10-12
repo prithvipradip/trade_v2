@@ -800,6 +800,7 @@ class Backtester:
                         symbol=_sym, start_date=today_date, end_date=today_date
                     )
 
+            closed_today: list[dict] = []   # W78: positions this session's exit step closed
             for pos in open_positions:
                 # W77: shares carried over the expiry bell are closed at THIS session's
                 # open, before any other check (the next row of the frame is the next
@@ -836,6 +837,7 @@ class Backtester:
                     pos.update(exit_info)
                     capital += pos["pnl"]
                     trades.append(pos)
+                    closed_today.append(pos)
                     log.debug(
                         "trade_closed",
                         strategy=pos["strategy"],
@@ -859,7 +861,14 @@ class Backtester:
                 self._reject("before_eval_start")
                 continue
 
-            direction, confidence, features_df = self._get_direction(hist, market_context=self._market_context)
+            # W78: the DECISION FRAME. A realistic engine with intraday entries decides at the
+            # scan time (10:30 ET), so the gates and models may use history through the PREVIOUS
+            # session only (assumption A3). `hist` still carries day D's full bar for pricing
+            # and exits; every read below that is a decision input uses `hist_dec`
+            # (and `_dec_lag` for the IV-rank array). Legacy / daily-close entries are unchanged.
+            _dec_lag = 1 if (self._realistic and self._intraday_store is not None) else 0
+            hist_dec = hist.iloc[: len(hist) - _dec_lag]
+            direction, confidence, features_df = self._get_direction(hist_dec, market_context=self._market_context)
 
             # Decision-chain dict — populated as each gate is evaluated;
             # attached to the trade record so the dashboard can render the
@@ -972,14 +981,14 @@ class Backtester:
                 except Exception:
                     pass  # meta-labeler errors are non-fatal
 
-            strategy = self._select_strategy(direction, hist, confidence, features_df)
+            strategy = self._select_strategy(direction, hist_dec, confidence, features_df)
             if strategy is None:
                 self._reject("no_strategy")
                 continue
 
             # W68: live's two IV-rank gates (floor in iron_condor.py, cap in the risk manager).
             if self._iv_rank_gate and strategy in CREDIT_STRATEGIES:
-                _ivr = float(self._iv_rank_arr[i]) if self._iv_rank_arr is not None else float("nan")
+                _ivr = float(self._iv_rank_arr[i - _dec_lag]) if self._iv_rank_arr is not None else float("nan")
                 if np.isnan(_ivr):
                     self._reject("iv_rank_unknown")   # live fails closed on an unmeasurable rank
                     continue
@@ -1102,7 +1111,7 @@ class Backtester:
                 else:
                     try:
                         rp = self._range_predictor.predict(
-                            hist,
+                            hist_dec,
                             symbol=self._symbol,
                             market_context=self._market_context,
                             min_edge_override=self._min_edge_over_baseline,
@@ -1136,7 +1145,7 @@ class Backtester:
             # Realized-vol entry gate: neutral credit structures cannot profit
             # during high-volatility regimes (e.g. tariff shocks, VIX > 40).
             if strategy in NEUTRAL_CREDIT_GATED:
-                recent_close = hist["Close"].iloc[-11:]
+                recent_close = hist_dec["Close"].iloc[-11:]
                 if len(recent_close) >= 11:
                     vol_10d = recent_close.pct_change().std() * (252 ** 0.5)
                     _entry_decision["vol_gate"] = {
@@ -1191,7 +1200,7 @@ class Backtester:
             # iron_condor baseline a drawdown veto the butterfly/wide/broken/
             # jade/ccs arms silently skipped, biasing any promotion study.
             if strategy in NEUTRAL_CREDIT_GATED and self._pct_from_60d_high_threshold > -0.99:
-                _close_series = hist["Close"]
+                _close_series = hist_dec["Close"]
                 _rolling_high = _close_series.rolling(min(60, len(_close_series))).max().iloc[-1]
                 if _rolling_high and _rolling_high > 0:
                     _pct_from_high = (float(_close_series.iloc[-1]) - float(_rolling_high)) / float(_rolling_high)
@@ -1259,6 +1268,19 @@ class Backtester:
                     if not filled:
                         self._reject("limit_not_filled")
                         continue  # Limit order expired without fill — skip entry
+
+            # W78 (realistic): the exit step above evaluated every held position over the WHOLE
+            # session, so a position that closes at 15:00 has already left `open_positions` by
+            # the time a 10:30 entry is considered. At the fill instant it was still alive:
+            # count it, or max_concurrent_positions is violated intraday (measured in W77: 20 of
+            # 179 entries at 3 DTE, 7 of 136 at 7 DTE).
+            if self._realistic and fill_time_str is not None and closed_today:
+                _fill_ts = datetime.fromisoformat(fill_time_str).astimezone(ET)
+                _alive = len(open_positions) + sum(
+                    1 for _p in closed_today if self._exit_instant(_p) >= _fill_ts)
+                if _alive >= self._max_concurrent_positions:
+                    self._reject("max_concurrent_intraday")
+                    continue
 
             # R20 #1: run() has had self._market_context all along (walkforward
             # passes the window-aligned VIX/SPY frames) but never forwarded it
@@ -3297,6 +3319,22 @@ class Backtester:
                     continue
                 return ts.astimezone(ET) if ts.tzinfo else ts.replace(tzinfo=ET)
         d = date.fromisoformat(str(pos["entry_date"])[:10])
+        return datetime.combine(d, _session_close(d), tzinfo=ET)
+
+    def _exit_instant(self, pos: dict) -> datetime:
+        """W78: when a closed position's exit took effect, tz-aware ET.
+
+        An intraday exit carries its bar timestamp in ``exit_time``; a daily-path exit is
+        decided at the session close (the daily-model convention), so a date-only value
+        maps to that session's close."""
+        v = pos.get("exit_time") or pos.get("exit_date")
+        d = date.fromisoformat(str(pos.get("exit_date") or v)[:10])
+        if v and len(str(v)) > 10:
+            try:
+                ts = datetime.fromisoformat(str(v))
+                return ts.astimezone(ET) if ts.tzinfo else ts.replace(tzinfo=ET)
+            except ValueError:
+                pass
         return datetime.combine(d, _session_close(d), tzinfo=ET)
 
     def _check_exit_credit(self, pos: dict, pnl_pct: float, current_date: date,
