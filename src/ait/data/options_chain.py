@@ -596,8 +596,14 @@ class OptionsChainService:
 
         Returns one OptionsChain per expiry date that falls within range.
         """
-        min_dte = min_dte or self._config.dte_range[0]
-        max_dte = max_dte or self._config.dte_range[1]
+        # W73: `is None`, not `or`. `0` is a legitimate bound (a 0- or 1-DTE
+        # lookup such as get_chain_for_expiry's `days - 1`), and `x or default`
+        # silently replaced it with the config floor, so a 1-DTE expiry was
+        # searched in [floor, 2] and never found. Unreachable at the live
+        # dte_range [14, 30] (every caller passes None or a bound >= 1), so
+        # live decisions are unchanged.
+        min_dte = self._config.dte_range[0] if min_dte is None else min_dte
+        max_dte = self._config.dte_range[1] if max_dte is None else max_dte
 
         cache_key = f"chain:{symbol}:{min_dte}:{max_dte}"
         cached = self._cache.get(cache_key)
