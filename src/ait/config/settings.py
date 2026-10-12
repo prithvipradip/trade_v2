@@ -810,6 +810,17 @@ class BacktestConfig(_StrictModel):
                     "as stored. Flipping it changes every research baseline (assumption "
                     "A10): record a before/after on the reference study first. "
                     "Operator-owned; default 'legacy' so no study moves silently.")
+    pricing_source: Literal["bs_legacy", "surface"] = Field(default="bs_legacy",
+        description="W75: where the research engine gets each condor leg's implied vol. "
+                    "'bs_legacy' = one stored 30-day IV plus a skew with no DTE term (every "
+                    "prior study). 'surface' = the smile of the leg's OWN expiry from the "
+                    "real option bars (ait.backtesting.iv_surface), fit on the previous "
+                    "session so nothing from the decision day leaks. Out-of-sample, bar to "
+                    "bar, it cut median option-price error by 19% (1-2 DTE), 46% (3-7), 43% "
+                    "(8-14) and 49% (15-45) and removed the +1.4-1.9 vol-point richness "
+                    "'bs_legacy' carries at 3+ DTE. QQQ only (the bars exist for QQQ); a "
+                    "symbol or date without a smile falls back per leg and is counted. "
+                    "Operator-owned: default 'bs_legacy' so no study moves silently.")
     expiry_guard_dte: int | None = Field(default=None, ge=0, le=45,
         description="W74: positions ENTERED with at most this many days to expiry are "
                     "exempt from the DTE-based closes (live rules 3/3a: DTE <= "

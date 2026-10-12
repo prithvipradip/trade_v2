@@ -257,6 +257,13 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
     backtest["engine_model"] = _engine_model
     for _k in ("expiry_guard_dte", "max_hold_fraction", "flatten_minutes_before_close"):
         backtest[_k] = getattr(_bt_cfg, _k, None)
+    backtest["pricing_source"] = getattr(_bt_cfg, "pricing_source", "bs_legacy")
+    if backtest["pricing_source"] != "surface":
+        warnings.append(
+            "pricing_source: 'bs_legacy' - leg IVs are one stored 30-day IV plus a skew with no DTE term. "
+            "The real-bar surface cut median option-price error out-of-sample by 19% (1-2 DTE), 46% "
+            "(3-7), 43% (8-14) and 49% (15-45) on QQQ (W75); set backtest.pricing_source: surface in "
+            "config_research.yaml to use it (QQQ only; other symbols fall back per leg).")
     if _engine_model != "realistic":
         warnings.append(
             "engine_model: 'legacy' - entries are priced at the DAILY close with same-day IV, "

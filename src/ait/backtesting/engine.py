@@ -15,6 +15,7 @@ import os
 from collections import Counter
 from datetime import date, datetime, time, timedelta
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -26,6 +27,7 @@ from ait.backtesting.pricing import (
     expected_move as _expected_move,  # W74: fractional-time expected move
     find_strike_by_delta,
     ic_leg_marks,  # W72: single owner of condor leg pricing (engine + parity replay)
+    ic_leg_marks_from_ivs,  # W75: the same legs at explicit per-leg (surface) IVs
     realized_vol,
     skewed_leg_iv,
 )
@@ -327,6 +329,7 @@ class Backtester:
         # before. engine_model='realistic' turns on the W72 lead fixes L2-L6; the
         # three exit knobs are independent of it. See BacktestConfig for the meaning.
         engine_model: str | None = None,
+        pricing_source: str | None = None,     # W75: None -> backtest.pricing_source
         expiry_guard_dte: int | None = None,
         max_hold_fraction: float | None = None,
         flatten_minutes_before_close: int | None = None,
@@ -547,6 +550,14 @@ class Backtester:
         if self._engine_model not in ("legacy", "realistic"):
             raise ValueError(f"engine_model must be 'legacy' or 'realistic', got {self._engine_model!r}")
         self._realistic = self._engine_model == "realistic"
+        # W75: leg IVs from the real-bar surface of each leg's own expiry (default
+        # off). A symbol/date without a smile falls back per leg and is counted.
+        self._pricing_source = str(_bt(pricing_source, "pricing_source"))
+        if self._pricing_source not in ("bs_legacy", "surface"):
+            raise ValueError(
+                f"pricing_source must be 'bs_legacy' or 'surface', got {self._pricing_source!r}")
+        self._surface_stats = {"hit": 0, "miss": 0}
+        self._surface = self._load_surface() if self._pricing_source == "surface" else None
         _g = _bt(expiry_guard_dte, "expiry_guard_dte")
         self._expiry_guard_dte = None if _g is None else int(_g)
         _hf = _bt(max_hold_fraction, "max_hold_fraction")
@@ -1383,6 +1394,10 @@ class Backtester:
             max_dd=f"{result.max_drawdown:.2%}",
             win_rate=f"{result.win_rate:.2%}",
         )
+        if self._surface is not None:
+            _h, _m = self._surface_stats["hit"], self._surface_stats["miss"]
+            log.info("surface_pricing_summary", legs_priced=_h + _m, from_surface=_h,
+                     fell_back=_m, coverage=round(_h / max(_h + _m, 1), 4))
         return result
 
     @classmethod
@@ -1906,6 +1921,8 @@ class Backtester:
     # and set only what they need; those instances must stay on LEGACY semantics
     # (the same idiom as the W70 executor durations). __init__ overwrites all four.
     _engine_model: str = "legacy"
+    _pricing_source: str = "bs_legacy"      # W75
+    _surface = None                         # W75: IVSurface when pricing_source == "surface"
     _realistic: bool = False
     _expiry_guard_dte: int | None = None
     _max_hold_fraction: float | None = None
@@ -2042,6 +2059,16 @@ class Backtester:
                                                   close=_session_close(expiry_override))
                 iv_hist = fill_ctx["iv_hist"]
         iv = self._get_iv(iv_hist, market_context=market_context)
+        if self._surface is not None:
+            # W75: strike selection and the expected move use the TARGET EXPIRY's
+            # at-the-money IV (live reads the chain's ATM IV for that expiry), not
+            # the 30-day constant-maturity figure.
+            _exp_atm = (expiry_override if expiry_override is not None
+                        else today_date + timedelta(days=dte))
+            _atm = self._surface.iv(today_date - timedelta(days=1), _exp_atm,
+                                    float(underlying), float(underlying))
+            if _atm is not None:
+                iv = float(_atm)
         t = dte / 365.0 if t_override is None else t_override
         r = 0.05
 
@@ -2279,9 +2306,18 @@ class Backtester:
 
             # Price each leg with its own skewed IV (W72: pricing.ic_leg_marks,
             # the same call the daily re-mark and the parity replay use)
-            short_call_price, short_put_price, long_call_price, long_put_price = ic_leg_marks(
-                S, short_call_strike, short_put_strike, long_call_strike, long_put_strike,
-                t, r, iv, self._skew_factor, self._skew_slope_per_pct_otm, self._iv_floor)
+            if self._surface is not None:
+                _exp = expiry if expiry is not None else today_date + timedelta(days=dte)
+                _ivs = self._surface_leg_ivs(
+                    _exp, (short_call_strike, short_put_strike, long_call_strike, long_put_strike),
+                    S, today_date, iv)
+                short_call_price, short_put_price, long_call_price, long_put_price = \
+                    ic_leg_marks_from_ivs(S, short_call_strike, short_put_strike,
+                                          long_call_strike, long_put_strike, t, r, *_ivs)
+            else:
+                short_call_price, short_put_price, long_call_price, long_put_price = ic_leg_marks(
+                    S, short_call_strike, short_put_strike, long_call_strike, long_put_strike,
+                    t, r, iv, self._skew_factor, self._skew_slope_per_pct_otm, self._iv_floor)
 
             # Net credit received at mid prices
             net_credit = (short_call_price + short_put_price) - (long_call_price + long_put_price)
@@ -2746,6 +2782,51 @@ class Backtester:
     # Exit logic — handles both debit and credit positions
     # ------------------------------------------------------------------
 
+    def _load_surface(self):
+        """Build/load the real-bar IV surface for this symbol, or None (with a WARNING)."""
+        sym = (self._symbol or "").upper()
+        if not sym:
+            log.warning("surface_pricing_unavailable", reason="engine has no symbol",
+                        fallback="bs_legacy")
+            return None
+        try:
+            from ait.backtesting.iv_surface import build_or_load
+            from ait.data.historical import DB_PATH
+            db = Path(self._db_path) if self._db_path is not None else DB_PATH
+            surf = build_or_load(db, sym, db.parent / "research_cache")
+        except Exception as exc:  # noqa: BLE001 - research must degrade loudly, not crash
+            log.warning("surface_pricing_unavailable", symbol=sym, error=str(exc),
+                        fallback="bs_legacy")
+            return None
+        if len(surf) == 0:
+            log.warning("surface_pricing_unavailable", symbol=sym, reason="no smiles in the bars",
+                        fallback="bs_legacy")
+            return None
+        log.info("surface_pricing_active", symbol=sym, smiles=len(surf),
+                 first=str(surf.dates()[0]), last=str(surf.dates()[-1]))
+        return surf
+
+    def _surface_leg_ivs(self, expiry: date, strikes: tuple, S: float, on: date,
+                         base_iv: float) -> tuple[float, float, float, float]:
+        """Per-leg IVs (short call, short put, long call, long put) from the surface as it
+        stood at the PREVIOUS session (assumption A3: nothing from ``on`` is used).
+
+        A leg the surface cannot price falls back to the legacy base IV + skew and is
+        counted in ``self._surface_stats`` (logged at the end of the run)."""
+        opts = (OptionType.CALL, OptionType.PUT, OptionType.CALL, OptionType.PUT)
+        surface_date = on - timedelta(days=1)
+        out = []
+        for K, opt in zip(strikes, opts):
+            iv = self._surface.iv(surface_date, expiry, float(K), float(S))
+            if iv is None:
+                self._surface_stats["miss"] += 1
+                iv = self._get_leg_iv(base_iv, float(K), float(S), opt)
+            else:
+                self._surface_stats["hit"] += 1
+                iv = max(float(iv), self._iv_floor)
+            out.append(iv)
+        return out[0], out[1], out[2], out[3]
+
     def _position_dte(self, pos: dict) -> int:
         """W74: calendar days from THIS position's entry to ITS expiry.
 
@@ -2807,6 +2888,21 @@ class Backtester:
         iv = self._get_current_iv(pos, hist)
         t = self._remark_t(pos, days_held, as_of)
         r = 0.05
+        if self._surface is not None:
+            try:
+                _exp = date.fromisoformat(str(pos["expiry_date"])[:10])
+                _on = (as_of.date() if as_of is not None else
+                       date.fromisoformat(str(pos["entry_date"])[:10]) + timedelta(days=days_held))
+            except (KeyError, ValueError, TypeError):
+                _exp = None
+            if _exp is not None:
+                _ivs = self._surface_leg_ivs(
+                    _exp, (pos["short_call_strike"], pos["short_put_strike"],
+                           pos["long_call_strike"], pos["long_put_strike"]),
+                    underlying, _on, iv)
+                return ic_leg_marks_from_ivs(
+                    underlying, pos["short_call_strike"], pos["short_put_strike"],
+                    pos["long_call_strike"], pos["long_put_strike"], t, r, *_ivs)
         return ic_leg_marks(
             underlying, pos["short_call_strike"], pos["short_put_strike"],
             pos["long_call_strike"], pos["long_put_strike"], t, r, iv,

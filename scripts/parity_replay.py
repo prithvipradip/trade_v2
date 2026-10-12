@@ -77,6 +77,16 @@ def main(argv: list[str] | None = None) -> int:
     trades = [t for t in rp.load_trades(args.trades) if True]
     data = rp.ResearchData(args.historical_db, args.symbol)
     friction = data.leg_spread_model()
+    # W75: the real-bar IV surface (read-only; cached under data/research_cache). A symbol
+    # without bars simply has no 'surface' variant.
+    surface = None
+    try:
+        from ait.backtesting.iv_surface import build_or_load
+        _s = build_or_load(args.historical_db, args.symbol,
+                           Path(args.historical_db).parent / "research_cache")
+        surface = _s if len(_s) else None
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ! surface unavailable: {exc}", file=sys.stderr)
 
     trade_rows: list[dict] = []
     leg_rows: list[dict] = []
@@ -84,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
     for t in trades:
         if t.entry_time is None:
             continue
-        entry = rp.entry_replay(t, data, params, friction)
+        entry = rp.entry_replay(t, data, params, friction, surface)
         exit_ = rp.exit_replay(t, data, params, friction, entry)
         scan = rp.engine_exit_scan(t, data, entry) if t.condor_roles() is not None else None
         ctx = rp.load_bot_exec_context(args.state_db, t.bot_trade_id) if t.bot_trade_id else None
@@ -95,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
             "entry_dte": t.entry_dte, "band": band, "eligible": t.parity_eligible,
             "qty": t.quantity, "still_open": t.still_open, "actual_credit": round(t.actual_credit, 4),
         }
-        for v in rp.VARIANTS:
+        for v in rp.ENTRY_VARIANTS:
             e = entry.get(v)
             for k in ("S", "iv", "credit_mid", "friction_total", "credit_fill", "err", "err_pct"):
                 row[f"{v}_{k}"] = None if e is None else round(float(e[k]), 5)
@@ -161,6 +171,11 @@ def main(argv: list[str] | None = None) -> int:
     L.append(f"- symbol {args.symbol}; structures replayed {len(trade_rows)} "
              f"(verdict-eligible: {sum(1 for r in trade_rows if r['eligible'])})")
     L.append(f"- friction model: {'fitted per-leg ' + friction.form if friction else 'ABSENT (no half-spread applied)'}")
+    if surface is not None:
+        L.append(f"- real-bar surface: {len(surface)} smiles, {surface.dates()[0]} .. {surface.dates()[-1]} "
+                 "(trades outside that range have no 'surface' row)")
+    else:
+        L.append("- real-bar surface: unavailable")
     L.append(f"- tolerances: median |err| <= {pc.credit_error_pct_max:.0%}, |median err| <= "
              f"{pc.credit_bias_pct_max:.0%}, min trades per band {pc.min_trades_per_band}")
     L.append("")
@@ -188,7 +203,7 @@ def main(argv: list[str] | None = None) -> int:
     L.append("| band | variant | side | n legs | median gap | median abs gap |")
     L.append("|---|---|---|---|---|---|")
     for band in rp.band_order(edges):
-        for v in rp.VARIANTS:
+        for v in rp.ENTRY_VARIANTS:
             for right, lab in (("C", "calls"), ("P", "puts")):
                 xs = [r["iv_gap"] for r in leg_rows if r["band"] == band and r["variant"] == v
                       and r["right"] == right and r["iv_gap"] is not None

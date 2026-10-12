@@ -165,6 +165,25 @@ def expected_move(S: float, iv: float, t_years: float) -> float:
     return float(S * iv * np.sqrt(t_years))
 
 
+def ic_leg_marks_from_ivs(
+    S: float, short_call: float, short_put: float, long_call: float, long_put: float,
+    t: float, r: float, iv_short_call: float, iv_short_put: float,
+    iv_long_call: float, iv_long_put: float,
+) -> tuple[float, float, float, float]:
+    """Condor leg mids ``(short call, short put, long call, long put)`` at EXPLICIT per-leg IVs.
+
+    W75: the surface pricer supplies each leg's IV from the real-bar smile of the
+    leg's own expiry instead of a base IV plus a DTE-free skew. Same Black-Scholes,
+    same leg order as ``ic_leg_marks`` (the contract callers rely on).
+    """
+    return (
+        black_scholes_price(S, short_call, t, r, iv_short_call, OptionType.CALL),
+        black_scholes_price(S, short_put, t, r, iv_short_put, OptionType.PUT),
+        black_scholes_price(S, long_call, t, r, iv_long_call, OptionType.CALL),
+        black_scholes_price(S, long_put, t, r, iv_long_put, OptionType.PUT),
+    )
+
+
 def realized_vol(close_prices: np.ndarray, window: int = 20) -> float:
     """Calculate annualized realized volatility from close prices."""
     if len(close_prices) < window + 1:

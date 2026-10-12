@@ -66,6 +66,10 @@ EXPIRY_CLOSE_ET = time(16, 0)          # PM-settled ETF options stop trading 16:
 BAR_MINUTES = 5                        # research_intraday_prices interval
 SCHEMA = "ait.replay.manual_trades/1"
 VARIANTS = ("engine", "clean")
+# W75: entry parity also has a 'surface' variant (the 'clean' inputs with each leg priced
+# from the real-bar smile of its own expiry, fit on the previous session). It has no exit
+# counterpart, so exit_replay keeps iterating VARIANTS.
+ENTRY_VARIANTS = VARIANTS + ("surface",)
 PARITY_STRUCTURES = ("iron_condor", "vertical_spread")   # what the engine can build
 
 
@@ -293,12 +297,17 @@ def t_clean(expiry: date, as_of: datetime) -> float:
 
 
 def model_leg_mids(trade: ReplayTrade, S: float, base_iv: float,
-                   t_by_leg: Sequence[float], p: PricingParams) -> list[float]:
+                   t_by_leg: Sequence[float], p: PricingParams,
+                   leg_ivs: Sequence[float] | None = None) -> list[float]:
     """Modelled mid per leg, in ``trade.legs`` order.
 
     A single-expiry condor goes through ``ic_leg_marks`` — the engine's call —
     everything else (verticals, calendars) through the same per-leg primitives.
+    ``leg_ivs`` (W75) prices each leg at an explicit IV instead (the surface).
     """
+    if leg_ivs is not None:
+        return [black_scholes_price(S, l.strike, t, p.r, float(iv), l.option_type)
+                for l, t, iv in zip(trade.legs, t_by_leg, leg_ivs)]
     roles = trade.condor_roles()
     if roles is not None:
         t = t_by_leg[0]
@@ -347,8 +356,12 @@ def _fill_price(leg: ReplayLeg, mid: float, hs: float) -> float:
 
 
 def entry_replay(trade: ReplayTrade, data: ResearchData, p: PricingParams,
-                 friction: LegSpreadModel | None) -> dict[str, Any]:
-    """Model the entry under both variants. Returns {variant: result | None}."""
+                 friction: LegSpreadModel | None, surface: Any = None) -> dict[str, Any]:
+    """Model the entry under every variant. Returns {variant: result | None}.
+
+    ``surface`` (an ``ait.backtesting.iv_surface.IVSurface``) adds the W75
+    'surface' variant; without it that key is None.
+    """
     result: dict[str, Any] = {}
     D = trade.entry_date
     actual = trade.actual_credit
@@ -374,11 +387,26 @@ def entry_replay(trade: ReplayTrade, data: ResearchData, p: PricingParams,
         result["clean"] = res
     else:
         result["clean"] = None
+
+    result["surface"] = None
+    if surface is not None and bar is not None:
+        S = 0.5 * (bar["open"] + bar["close"])
+        prev_day = D - timedelta(days=1)
+        leg_ivs = [surface.iv(prev_day, l.expiry, l.strike, S) for l in trade.legs]
+        if all(v is not None for v in leg_ivs):
+            ts = [t_clean(l.expiry, trade.entry_time) for l in trade.legs]
+            # base_iv is only a label here; every leg carries its own surface IV
+            res = _entry_variant(trade, S, float(statistics.mean(float(v) for v in leg_ivs)), ts, p, friction, actual,
+                                 spot_src="bar_mid", iv_src="surface_prev_session",
+                                 leg_ivs=[float(v) for v in leg_ivs])
+            res["bar_range"] = bar["high"] - bar["low"]
+            result["surface"] = res
     return result
 
 
-def _entry_variant(trade, S, iv, t_by_leg, p, friction, actual, *, spot_src, iv_src) -> dict[str, Any]:
-    mids = model_leg_mids(trade, S, iv, t_by_leg, p)
+def _entry_variant(trade, S, iv, t_by_leg, p, friction, actual, *, spot_src, iv_src,
+                   leg_ivs: Sequence[float] | None = None) -> dict[str, Any]:
+    mids = model_leg_mids(trade, S, iv, t_by_leg, p, leg_ivs)
     hs = [friction.half_spread_usd(m) if friction is not None else 0.0 for m in mids]
     fills = [_fill_price(l, m, h) for l, m, h in zip(trade.legs, mids, hs)]
     credit_mid = structure_credit(trade, mids)
@@ -387,8 +415,9 @@ def _entry_variant(trade, S, iv, t_by_leg, p, friction, actual, *, spot_src, iv_
     # The IV the MARKET used for each leg: invert BS on the actual fill after
     # removing the (modelled) half-spread the order crossed. Compared with the
     # engine's single stored IV this is the term-structure/skew error, directly.
-    model_leg_iv = [skewed_leg_iv(iv, l.strike, S, l.option_type, p.skew_factor,
-                                  p.skew_slope_per_pct_otm, p.iv_floor) for l in trade.legs]
+    model_leg_iv = (list(leg_ivs) if leg_ivs is not None else
+                    [skewed_leg_iv(iv, l.strike, S, l.option_type, p.skew_factor,
+                                   p.skew_slope_per_pct_otm, p.iv_floor) for l in trade.legs])
     actual_leg_iv = []
     for l, h, t in zip(trade.legs, hs, t_by_leg):
         mid_est = l.open_price + h if l.side == "short" else l.open_price - h
@@ -603,7 +632,7 @@ def summarise_bands(rows: Iterable[dict[str, Any]], edges: Sequence[int], *,
     rows = [r for r in rows if r.get("eligible")]
     out: list[BandVerdict] = []
     for band in band_order(edges):
-        for variant in VARIANTS:
+        for variant in ENTRY_VARIANTS:
             vals = [r["err_pct"] for r in rows if r["band"] == band and r["variant"] == variant]
             v, mabs, msgn = verdict_for(vals, error_max=error_max, bias_max=bias_max,
                                         min_trades=min_trades)
