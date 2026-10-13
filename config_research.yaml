@@ -68,6 +68,28 @@ backtest:
                                        # IF IT EARNS ITS PLACE: set true here AND port it to live (a W80-class change), so
                                        #   research does not keep a gate the bot lacks. Until then: research-only, off.
 
+  # --- W81: the trending-down REGIME veto (research-only; switch built, operator decision D10 OPEN) ---
+  # regime_veto_gate: true             # NOT SET HERE ON PURPOSE: the schema default (true) applies, so nothing moves.
+                                       # WHAT: research-only veto. Blocks a neutral credit entry when 5-day realized vol
+                                       #   exceeds 20-day (vol_regime_expanding) AND price is more than 5% below its 20-day
+                                       #   SMA (backtest.regime_down_threshold). Live has NO such entry veto: its regime
+                                       #   class feeds only the direction override, the meta-label features and roll
+                                       #   defense. The comment that introduced it records "4 trending_down trades, 25% win
+                                       #   rate" (Exp 21), i.e. a 4-trade evidence base.
+                                       # MEASURED (W81, scripts/gate_parity_ab.py, realistic engine, 2024-01..2026-10, 1
+                                       #   contract): the veto REACHED the engine on 0 days for QQQ (entry DTE 1, 3, 7, 14)
+                                       #   and SPY (DTE 14) and on 3 days for IWM at every DTE tried: the position-slot and
+                                       #   IV-rank gates sit in front of it. It moves IWM by between -$79 and +$109 (DTE 7
+                                       #   vs 14; 3 trades) and nothing else. Inert, not shown useful.
+                                       # TO TURN IT OFF: set regime_veto_gate: false here (code, thresholds and the per-entry
+                                       #   class record are kept; a suppressed day is flagged regime_veto_suppressed). The bar
+                                       #   to KEEP it is the D9 bar: an out-of-sample gain on days live would have traded.
+                                       #   Re-run scripts/gate_parity_ab.py if the gate order, the IV-rank cap or the entry DTE
+                                       #   range changes (the gates only matter on days that reach them).
+                                       # SAME FILE, SAME QUESTION: max_entry_vol_annual (the realized-vol cap, 0.80) and the
+                                       #   live-only VIX halt (risk.credit_vix_halt) are the other two one-sided entry gates;
+                                       #   both were also inert in that A/B (0 days gated; 0 trades on VIX >= 28 days).
+
   # --- W67: gate parity + graded objective ---
   gates_mode: enforce                  # 2026-10-10 operator decision: ML gates ON in RESEARCH (range floor + fractal veto
                                        # block) so the models being improved actually matter in studies. Live stays

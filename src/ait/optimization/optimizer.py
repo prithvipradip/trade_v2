@@ -112,6 +112,7 @@ class StrategyOptimizer:
         gates_mode: str | None = None,               # W67 gate parity (None -> config)
         iv_rank_gate: bool | None = None,            # W68 IV-rank parity (None -> config)
         iv_rank_rise_gate: bool | None = None,       # W71c research-only rise veto on/off (None -> config)
+        regime_veto_gate: bool | None = None,        # W81 research-only regime veto on/off (None -> config)
         iv_rank_series: dict | None = None,          # W68 {symbol: rank by date}, full history
         fractal_veto_spread: float | None = None,
         penalty_on_range_prob: float | None = None,
@@ -275,6 +276,8 @@ class StrategyOptimizer:
             iv_rank_gate, "backtest", "iv_rank_gate", _BTC2, self._settings))
         self._iv_rank_rise_gate = bool(_rcv(
             iv_rank_rise_gate, "backtest", "iv_rank_rise_gate", _BTC2, self._settings))
+        self._regime_veto_gate = bool(_rcv(
+            regime_veto_gate, "backtest", "regime_veto_gate", _BTC2, self._settings))   # W81
         # W70: were literals 5.0 / 0.0 / 0.80 (and trailing 0.25, breakeven 0.30, delta 0.20 /
         # 0.30 in _run_backtest's bt_kwargs); the wing floor moves 5.0 -> 2.0 (live parity).
         # W70: the SAME contract call live uses (AIT_IC_WING_FLOOR) — live AND research.
@@ -698,6 +701,7 @@ class StrategyOptimizer:
             "gates_mode":            self._gates_mode,
             "iv_rank_gate":          self._iv_rank_gate,
             "iv_rank_rise_gate":     self._iv_rank_rise_gate,    # W71c
+            "regime_veto_gate":      self._regime_veto_gate,     # W81
             "fractal_veto_spread":   self._fractal_veto_spread,
             "penalty_on_range_prob": self._penalty_on_range_prob,
             "max_contracts_per_trade": self._max_contracts_per_trade,

@@ -106,6 +106,13 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
 
     env = _live_env()
     settings = _live_settings()
+    from ait.config.runtime_env import CONTRACT_DEFAULTS as _CD
+
+    def _live_contract(key: str) -> float:
+        """The live bot's value of an env-contract key: its applied env, else the contract
+        default (W81: these were literal fallbacks that could drift from CONTRACT_DEFAULTS)."""
+        return float(env.get(key, _CD[key]))
+
     rsettings = _research_settings()   # backtest column: base + research overlay
     live_dte = list(settings.options.dte_range) if settings else [14, 45]
     live_blackout = (settings.risk.pre_event_blackout_days
@@ -173,21 +180,21 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
                                      if settings else _BTC().fractal_veto_spread),
         "penalty_on_range_prob": float(settings.backtest.penalty_on_range_prob
                                        if settings else _BTC().penalty_on_range_prob),
-        "wing_k":            float(env.get("AIT_IC_WING_K", "1.0")),
+        "wing_k":            _live_contract("AIT_IC_WING_K"),
         "range_min_confidence": (settings.ml.range_min_confidence
                                   if settings else MLConfig().range_min_confidence),
-        "ic_min_credit":     float(env.get("AIT_IC_MIN_CREDIT", "0.70")),
-        "ic_min_credit_width": float(env.get("AIT_IC_MIN_CREDIT_WIDTH", "0.20")),
-        "credit_loss_limit": float(env.get("AIT_CREDIT_LOSS_LIMIT", "0")),
+        "ic_min_credit":     _live_contract("AIT_IC_MIN_CREDIT"),
+        "ic_min_credit_width": _live_contract("AIT_IC_MIN_CREDIT_WIDTH"),
+        "credit_loss_limit": _live_contract("AIT_CREDIT_LOSS_LIMIT"),
         "pre_event_blackout_days": live_blackout,
         "delta_target":      0.20,
         "dte_band":          live_dte,
         "tp_ladder":         dict(_LIVE_TP_LADDER),
-        "wing_floor":        2.0,
+        "wing_floor":        _live_contract("AIT_IC_WING_FLOOR"),
         "macro_gate_entry":  True,   # orchestrator blocks credit entries within
                                      # risk.pre_event_blackout_days of an event
         "macro_flatten_enabled": env.get("AIT_SKIP_MACRO_EVENTS", "0") == "1",
-        "iv_rank_floor":     float(env.get("AIT_IRON_CONDOR_IV_FLOOR", "15")),
+        "iv_rank_floor":     _live_contract("AIT_IRON_CONDOR_IV_FLOOR"),
     }
 
     # Backtest TP ladder read from the engine mirror itself, so this manifest
@@ -227,7 +234,10 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
         # resolution the engine performs.
         "dte_band":          [live_dte[0], live_dte[0]],
         "tp_ladder":         bt_ladder,
-        "wing_floor":        args.wing_floor,
+        # W81: report the RESOLVED floor (main() resolves it before calling; a direct call with an
+        # un-resolved args used to print None here).
+        "wing_floor":        (args.wing_floor if args.wing_floor is not None
+                              else contract_float("AIT_IC_WING_FLOOR")),
         "macro_gate_entry":  args.macro_gate,
         "macro_flatten_enabled": os.environ.get("AIT_SKIP_MACRO_EVENTS", "0") == "1",
         "iv_rank_floor":     args.iv_floor,
@@ -300,6 +310,14 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
             "85). Set backtest.iv_rank_rise_gate: false in config_research.yaml to turn it off (the "
             "code and the threshold are kept; the bar for re-enabling it is written there); see "
             "scripts/iv_rank_parity_probe.py and the W71 / W71c PLAN entries.")
+
+    # W81: gates that exist on ONE side only (the 2026-10-13 audit's P1-P3). The registry lives
+    # in ait.backtesting.gate_parity; a guard test fails if the engine grows a reason without a row.
+    from ait.backtesting.gate_parity import LIVE_ONLY_GATES, one_sided_gate_warnings
+    warnings.extend(one_sided_gate_warnings(_bt_cfg, settings))
+    backtest["regime_veto_gate"] = bool(getattr(_bt_cfg, "regime_veto_gate", True))
+    backtest["max_entry_vol_annual"] = getattr(_bt_cfg, "max_entry_vol_annual", None)
+    backtest["live_only_gates_not_simulated"] = [g.reason for g in LIVE_ONLY_GATES]
 
     notes = [
         # R16: this note used to hardcode a 4-day pre-event window; the

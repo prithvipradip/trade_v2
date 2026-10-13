@@ -965,6 +965,30 @@ class BacktestConfig(_StrictModel):
         description="R20b: suppress iron-condor entry when IV rank rose more than "
                     "this over the last 10 days (Exp 20 veto). Values > 1 disable "
                     "the veto (IV rank is 0-1). Ignored while iv_rank_rise_gate is false.")
+    regime_veto_gate: bool = Field(default=True,
+        description="W81: apply the trending-down REGIME veto at all. RESEARCH-ONLY: live has "
+                    "no such entry veto (it uses regime for the direction override, the "
+                    "meta-label features and roll defense only). The veto blocks a neutral "
+                    "credit entry when 5-day realized vol exceeds 20-day (vol_regime_expanding) "
+                    "and the close is more than regime_down_threshold below its 20-day SMA. "
+                    "False skips the VETO only: the regime class is still computed and "
+                    "recorded per entry (regime_class, regime_veto_suppressed). Schema default "
+                    "True so a bare Backtester and every regression baseline are unchanged; "
+                    "whether the research overlay turns it off is operator decision D10 "
+                    "(PLAN.md, 2026-10-13 programme entry), to be taken on the W81 A/B.")
+    regime_down_threshold: float = Field(default=-0.05, ge=-0.50, le=0.0,
+        description="W81: price_vs_sma_20 below this (with vol_regime_expanding) classes a day "
+                    "'trending_down' in the research engine: the regime veto, the "
+                    "entry_regime stored on each position and the meta-label regime features "
+                    "all read it. Was a bare -0.05 at three engine sites (Exp 22/23: -0.02 "
+                    "blocked profitable 2-4% corrections; -0.05 cleared the Yen-carry and "
+                    "tariff-shock episodes). Research only; live's RegimeDetector has its own "
+                    "thresholds (the regime: block).")
+    regime_up_threshold: float = Field(default=0.02, ge=0.0, le=0.50,
+        description="W81: price_vs_sma_20 above this (with vol_regime_expanding) classes a day "
+                    "'trending_up' in the research engine (position entry_regime and the "
+                    "meta-label regime features; it never vetoes). Was a bare 0.02. Research "
+                    "only.")
     min_edge_over_baseline: float = Field(default=0.05, ge=0.0, le=1.0,
         description="R20b: minimum weighted CV edge over the base rate for the "
                     "range predictor to activate as an entry gate (Exp 28 quality "

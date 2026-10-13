@@ -58,7 +58,8 @@ def main(argv: list[str] | None = None) -> int:
 
     use_research_config()
     settings = load_settings()
-    params = rp.PricingParams.from_backtest_config(settings.backtest)
+    params = rp.PricingParams.from_backtest_config(
+        settings.backtest, risk_free_rate=settings.options.risk_free_rate)   # W81: the engine's r
     pc = settings.parity
     edges = list(pc.dte_band_upper_edges)
 

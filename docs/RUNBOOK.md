@@ -332,6 +332,33 @@ python scripts/parity_replay.py                 # reads data/replay/manual_trade
 - The research IV series and live's stored series are the same IB historical IV except on the few days
   live's own scan wrote (a median across expiries), so the level gates are at parity.
 
+## One-sided entry gates: what research blocks that live does not, and the reverse (W81)
+
+- **Why this section exists.** Research and live can disagree about whether a condor may open
+  without any parameter differing: a gate that exists on ONE side only. The 2026-10-13 audit found
+  three: the research realized-vol cap (`backtest.max_entry_vol_annual`, 0.80; Optuna searches it),
+  the research trending-down regime veto (`backtest.regime_veto_gate`), and live's VIX halt
+  (`risk.credit_vix_halt`, 28, plus the VIX-tiered credit caps), which research does not simulate.
+- **Where it is visible.** `python run_backtest.py` prints one warning per ACTIVE one-sided gate
+  (`vol_gate`, `regime_veto`, `vix_halt`, plus the existing rise-veto line) and records
+  `live_only_gates_not_simulated`. The registry is `ait.backtesting.gate_parity`: every reason the
+  engine can reject on is classified there as a live twin, a research-only gate (with its switch) or
+  mechanics, and `tests/test_w81_gate_parity.py` fails if the engine grows a reason without a row.
+- **The switch.** `backtest.regime_veto_gate` (schema default true, so nothing moves; the overlay does
+  not set it: decision D10). False skips the veto only; the day class is still recorded per entry
+  (`regime_class`; a day the veto would have blocked is flagged `regime_veto_suppressed`). Its
+  thresholds are `backtest.regime_down_threshold` (-0.05) and `regime_up_threshold` (0.02), which
+  were bare literals at three engine sites.
+- **Measure it:** `python scripts/gate_parity_ab.py --workers 3 [--entry-dte N]` (read-only; about 8
+  minutes at three symbols and four arms; the VIX closes come from Yahoo). Arms: baseline, regime
+  veto off, vol cap off, both off; then live's VIX halt is applied after the fact (no slot re-use).
+  **Re-run it whenever the gate order, the IV-rank cap or the entry-DTE range changes: these gates
+  only matter on the days that reach them.** First result (2026-10-13): at entry DTE 14 the veto
+  reached 0 / 0 / 3 days (QQQ / SPY / IWM), the vol cap 0, and no trade entered on a day whose
+  previous VIX close was >= 28 (18 such sessions); the same at DTE 1, 3 and 7 on QQQ and IWM.
+- **Research `r`.** The engine now prices with `options.risk_free_rate` (the key live's Greeks read);
+  it was a bare 0.05 at three sites. Same value today.
+
 ## Searching the entry DTE (W79a; research only)
 
 - **Switch:** `python run_backtest.py --optimize-per-window --search-dte [--dte-range 0 45]

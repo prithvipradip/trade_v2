@@ -61,9 +61,9 @@ from ait.backtesting.pricing import (
 )
 from ait.utils.time import ET
 
-# engine.py hardcodes r = 0.05 at entry and in the daily re-mark (W72 finding);
-# the replay mirrors that so the 'engine' variant is the engine. W75 replaces it
-# with the SOFR table for the 'surface' pricer.
+# engine.py used a bare r = 0.05 at entry and in the daily re-mark (W72 finding); since W81 it reads
+# options.risk_free_rate and PricingParams.from_backtest_config takes that value from the caller.
+# This constant is only the default when no setting is passed (it equals the config default).
 ENGINE_RISK_FREE_RATE = 0.05
 EXPIRY_CLOSE_ET = time(16, 0)          # PM-settled ETF options stop trading 16:00 ET
 BAR_MINUTES = 5                        # research_intraday_prices interval
@@ -321,8 +321,11 @@ class PricingParams:
     iv_floor: float = 0.05
 
     @classmethod
-    def from_backtest_config(cls, bc: Any) -> PricingParams:
-        return cls(skew_factor=float(bc.skew_factor),
+    def from_backtest_config(cls, bc: Any, risk_free_rate: float | None = None) -> PricingParams:
+        # W81: the engine now reads options.risk_free_rate; the replay must price with the same r
+        # (callers pass settings.options.risk_free_rate; None keeps the 0.05 default).
+        return cls(r=float(risk_free_rate) if risk_free_rate is not None else ENGINE_RISK_FREE_RATE,
+                   skew_factor=float(bc.skew_factor),
                    skew_slope_per_pct_otm=float(bc.skew_slope_per_pct_otm),
                    iv_floor=float(bc.iv_floor))
 

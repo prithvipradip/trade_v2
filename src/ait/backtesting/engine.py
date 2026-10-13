@@ -59,6 +59,24 @@ def _session_close(d: date) -> time:
 # so the two can never drift apart again. The imported name stays module-level
 # here, so existing `from ait.backtesting.engine import CREDIT_STRATEGIES`
 # callers keep working unchanged.
+def research_regime(vol_expanding: bool, px_vs_sma: float, down: float, up: float) -> str:
+    """W81: the research engine's four-way day class from two features.
+
+    ``vol_expanding`` is `vol_regime_expanding > 0.5` (5-day realized vol above 20-day) and
+    ``px_vs_sma`` is `price_vs_sma_20`. ONE definition for the trending-down veto, the
+    `entry_regime` stored on each position and the meta-label context (three sites that each
+    carried the same bare -0.05 / 0.02). Research only: live's regime comes from
+    `ait.ml.regime.RegimeDetector` with the `regime:` config block.
+    """
+    if not vol_expanding:
+        return "range_bound"
+    if px_vs_sma < down:
+        return "trending_down"
+    if px_vs_sma > up:
+        return "trending_up"
+    return "high_volatility"
+
+
 # Strategies that pay premium (long theta)
 DEBIT_STRATEGIES = {"long_call", "long_put", "bull_call_spread", "bear_put_spread", "long_straddle"}
 
@@ -214,6 +232,10 @@ class Backtester:
         multifractal_max_width: float | None = None,
         iv_rank_rise_threshold: float | None = None,
         iv_rank_rise_gate: bool | None = None,          # W71c: None -> backtest.iv_rank_rise_gate
+        regime_veto_gate: bool | None = None,           # W81: None -> backtest.regime_veto_gate
+        regime_down_threshold: float | None = None,     # W81: None -> backtest.regime_down_threshold
+        regime_up_threshold: float | None = None,       # W81: None -> backtest.regime_up_threshold
+        risk_free_rate: float | None = None,            # W81: None -> options.risk_free_rate
         pct_from_60d_high_threshold: float | None = None,
         min_edge_over_baseline: float | None = None,
         features_cache: pd.DataFrame | None = None,
@@ -411,6 +433,13 @@ class Backtester:
         multifractal_max_width = float(_bt(multifractal_max_width, "multifractal_max_width"))
         iv_rank_rise_threshold = float(_bt(iv_rank_rise_threshold, "iv_rank_rise_threshold"))
         iv_rank_rise_gate = bool(_bt(iv_rank_rise_gate, "iv_rank_rise_gate"))
+        regime_veto_gate = bool(_bt(regime_veto_gate, "regime_veto_gate"))
+        regime_down_threshold = float(_bt(regime_down_threshold, "regime_down_threshold"))
+        regime_up_threshold = float(_bt(regime_up_threshold, "regime_up_threshold"))
+        # W81: the SAME key live's Greeks read (options_chain._risk_free_rate); was a bare
+        # `r = 0.05` at three pricing sites below.
+        risk_free_rate = float(_resolve_setting(
+            risk_free_rate, "options", "risk_free_rate", OptionsConfig, _settings))
         pct_from_60d_high_threshold = float(_bt(pct_from_60d_high_threshold, "pct_from_60d_high_threshold"))
         min_edge_over_baseline = float(_bt(min_edge_over_baseline, "min_edge_over_baseline"))
         max_entry_vol_annual = float(_bt(max_entry_vol_annual, "max_entry_vol_annual"))
@@ -511,6 +540,10 @@ class Backtester:
             shape=SHAPE_PROPORTIONAL)  # the engine's historical shape; live uses live_flat
         self._iv_rank_rise_threshold = iv_rank_rise_threshold
         self._iv_rank_rise_gate = iv_rank_rise_gate     # W71c: False = no veto; the rise is still logged
+        self._regime_veto_gate = regime_veto_gate       # W81: False = no veto; the class is still logged
+        self._regime_down = regime_down_threshold       # W81: was a bare -0.05 at three sites
+        self._regime_up = regime_up_threshold           # W81: was a bare 0.02 at three sites
+        self._risk_free_rate = risk_free_rate           # W81: was a bare 0.05 at three sites
         self._pct_from_60d_high_threshold = pct_from_60d_high_threshold
         self._min_edge_over_baseline = min_edge_over_baseline
         self._features_cache = features_cache
@@ -950,9 +983,11 @@ class Backtester:
                     vol_exp = float(last_f.get("vol_regime_expanding", 0.0)) > 0.5
                     px_sma  = float(last_f.get("price_vs_sma_20", 0.0))
                     meta_ctx.update({
-                        "regime_trending_up":   1.0 if (vol_exp and px_sma > 0.02)               else 0.0,
-                        "regime_trending_down":  1.0 if (vol_exp and px_sma < -0.05)               else 0.0,
-                        "regime_high_vol":       1.0 if (vol_exp and -0.05 <= px_sma <= 0.02)      else 0.0,
+                        # W81: the class thresholds are backtest.regime_{down,up}_threshold
+                        # (were bare -0.05 / 0.02 here, in the veto and in entry_regime).
+                        "regime_trending_up":   1.0 if (vol_exp and px_sma > self._regime_up) else 0.0,
+                        "regime_trending_down":  1.0 if (vol_exp and px_sma < self._regime_down) else 0.0,
+                        "regime_high_vol":       1.0 if (vol_exp and self._regime_down <= px_sma <= self._regime_up) else 0.0,
                         "regime_range_bound":    0.0 if vol_exp else 1.0,
                         "vix":                   float(last_f.get("vix_level", 0.5)),
                         "iv_rank":               float(last_f.get("iv_rank", 0.5)),
@@ -1062,14 +1097,15 @@ class Backtester:
                 _last_f        = features_df.iloc[-1]
                 _vol_exp_flag  = float(_last_f.get("vol_regime_expanding", 0.0)) > 0.5
                 _px_sma_val    = float(_last_f.get("price_vs_sma_20", 0.0))
-                _regime_class  = (
-                    "trending_down"   if (_vol_exp_flag and _px_sma_val < -0.05) else
-                    "trending_up"     if (_vol_exp_flag and _px_sma_val > 0.02)  else
-                    "high_volatility" if  _vol_exp_flag                          else
-                    "range_bound"
-                )
+                _regime_class  = research_regime(
+                    _vol_exp_flag, _px_sma_val, self._regime_down, self._regime_up)
                 _entry_decision["regime_class"] = _regime_class
-                if _regime_class == "trending_down":
+                # W81: backtest.regime_veto_gate=False skips the VETO only (research-only gate;
+                # live has none): the class is still recorded, and a day the veto WOULD have
+                # blocked is flagged so a study can evaluate it later (D10).
+                if _regime_class == "trending_down" and not self._regime_veto_gate:
+                    _entry_decision["regime_veto_suppressed"] = True
+                if _regime_class == "trending_down" and self._regime_veto_gate:
                     _entry_decision["regime_veto"] = True
                     log.debug(
                         "regime_veto_fired",
@@ -1325,15 +1361,8 @@ class Backtester:
                 pos["entry_vix_level"] = round(float(last_f.get("vix_level", 0.0)), 4)
                 vol_expanding = float(last_f.get("vol_regime_expanding", 0.0)) > 0.5
                 px_vs_sma = float(last_f.get("price_vs_sma_20", 0.0))
-                if vol_expanding:
-                    if px_vs_sma > 0.02:
-                        pos["entry_regime"] = "trending_up"
-                    elif px_vs_sma < -0.05:
-                        pos["entry_regime"] = "trending_down"
-                    else:
-                        pos["entry_regime"] = "high_volatility"
-                else:
-                    pos["entry_regime"] = "range_bound"
+                pos["entry_regime"] = research_regime(
+                    vol_expanding, px_vs_sma, self._regime_down, self._regime_up)
                 # Features snapshot for dashboard decision drawer
                 pos["features_at_entry"] = {
                     "rsi_14":              round(float(last_f.get("rsi_14", 0.0)), 2),
@@ -2011,6 +2040,12 @@ class Backtester:
     _pin_band: float = 0.10
     _assignment_fee: float = 0.015
     _stock_commission: float = 0.01
+    # W81: the former bare literals, so a partial `Backtester.__new__` engine keeps the legacy
+    # behaviour; __init__ overwrites all four from config.
+    _regime_veto_gate: bool = True
+    _regime_down: float = -0.05
+    _regime_up: float = 0.02
+    _risk_free_rate: float = 0.05
     _settlement_stats: dict | None = None
 
     # R16: VIX -> per-symbol implied-vol multipliers (see _get_iv). Unknown
@@ -2203,7 +2238,7 @@ class Backtester:
             if _atm is not None:
                 iv = float(_atm)
         t = dte / 365.0 if t_override is None else t_override
-        r = 0.05
+        r = self._risk_free_rate     # W81: options.risk_free_rate (was a bare 0.05)
 
         # Entry gate for credit strategies: insufficient IV → premiums too small to
         # justify spread costs and risk. Honest no-trade rather than fake-pricing at floor.
@@ -3021,7 +3056,7 @@ class Backtester:
         per-leg exit friction, so the two can never disagree on the leg prices."""
         iv = self._get_current_iv(pos, hist)
         t = self._remark_t(pos, days_held, as_of)
-        r = 0.05
+        r = self._risk_free_rate     # W81: options.risk_free_rate (was a bare 0.05)
         if self._surface is not None:
             try:
                 _exp = date.fromisoformat(str(pos["expiry_date"])[:10])
@@ -3056,7 +3091,7 @@ class Backtester:
         # max_hold_days now closes the position early via its own exit
         # check (_check_exit_*) rather than by fabricating a shorter option.
         t = self._remark_t(pos, days_held, as_of)
-        r = 0.05
+        r = self._risk_free_rate     # W81: options.risk_free_rate (was a bare 0.05)
 
         strategy = pos["strategy"]
 
