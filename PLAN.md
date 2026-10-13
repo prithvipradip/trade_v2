@@ -17172,3 +17172,75 @@ On approval, the first actions are, in order:
 
 ---
 
+
+
+## 2026-10-14 - W81: one-sided entry gates made visible (registry, manifest warnings, class guard), the regime veto behind a switch, research `r` from config; MEASURED: the three gates are inert on the reference studies
+
+Research and tooling only; no live file touched, nothing restarted or pushed. Closes the mechanical findings P2, P4 and P5 of the 2026-10-13 programme entry (commit b9a0e61, section 8)
+and measures P1-P3. The legacy engine is byte-identical to the pre-W72 baseline (six variants, `cmp` against both the pre-W72 dump and the W71c dump) and `IRON_CONDOR_SPACE` is unchanged.
+
+**STATUS OF THE PLAN.** AS PLANNED: the W81 block of the 2026-10-13 programme entry, section 9 item 2 (a-f). AS BUILT: all six items (below). **FELL SHORT / DIFFERED:** (1) item (d) planned
+"research with a simulated VIX >= 28 halt vs without"; it is a post-hoc filter on the trade list (no slot re-use), not an engine twin, because the measurement showed nothing to simulate (see
+MEASURED); building the twin would be new engine code for a gate that never reached a trade. (2) The 11-close lookback of the realized-vol gate, which the audit listed among the literals to
+expose, was NOT moved to config: it is the definition of "10-day realized vol" in the key's own description (`max_entry_vol_annual`), a structural constant, now registered as such.
+
+**CHANGED.**
+1. `ait.backtesting.gate_parity` (new, pure stdlib; AST-guarded): `ENGINE_REJECT_REASONS` classifies every reason the engine can reject on as `live_twin`, `research_only` (with its
+   `backtest.*` switch) or `mechanics`; `LIVE_ONLY_GATES` lists what live applies and research does not simulate (`vix_halt`, `vix_tier_credit_cap`, `account_risk`);
+   `engine_reject_reasons(source)` extracts the reasons from the engine source by AST; `one_sided_gate_warnings(bt_cfg, live_settings)` produces the manifest warnings.
+2. **Class guard** (`tests/test_w81_gate_parity.py`): fails when the engine gains a `_reject` / `_would_reject` reason without a registry row, when a reason is passed non-literally, when
+   a registry row has rotted, and when a research-only gate has neither a manifest warning nor a registered exemption.
+3. **Manifest** (`run_backtest.py`): prints `vol_gate`, `regime_veto` (while ON), `pct_from_60d_high_threshold` (when enabled) and `vix_halt` warnings and records
+   `live_only_gates_not_simulated`; `wing_floor` is the RESOLVED contract value (a direct call used to print None); the live column's literal fallbacks (wing_k 1.0, credit ratio 0.20,
+   floor 15, loss limit 0, wing floor 2.0) are replaced by `CONTRACT_DEFAULTS`, so the column cannot drift from the contract. `delta_target` 0.20 stays a literal in both columns (no config key).
+4. **Regime veto switch** (the W71c pattern): `backtest.regime_veto_gate` (schema default True, nothing moves), `regime_down_threshold` -0.05 and `regime_up_threshold` 0.02 in
+   `BacktestConfig` (were bare literals at three engine sites). One definition `engine.research_regime()` serves the veto and the position's `entry_regime`; the meta-label context keeps its own
+   expressions (their NaN semantics differ) with the configured thresholds. Gate off: no veto, the class is still recorded (`regime_class`) and a day the veto would have blocked is
+   flagged `regime_veto_suppressed`. Forwarded like `iv_rank_rise_gate`: `WalkForwardConfig` -> OOS and shadow engines and the per-window optimizer -> trial engines (`bt_kwargs`).
+   **The overlay value is NOT changed (D10 open); a comment-only block in `config_research.yaml` records what it is, the measurement and how to turn it off.**
+5. **`r` from config:** the engine reads `options.risk_free_rate` (the key live's Greeks read) at the three sites that carried a bare `r = 0.05`; `PricingParams.from_backtest_config(bc,
+   risk_free_rate)` and `scripts/parity_replay.py` take the same value. Same number today (0.05), so no baseline moves.
+6. **`scripts/gate_parity_ab.py`** (read-only, statistics only): four arms per symbol (baseline; regime veto off; vol cap off; both off) on the realistic engine, then live's VIX halt applied
+   after the fact using the previous session's VIX close; `--entry-dte`, `--dump`, prints the VIX series size so an empty download cannot read as "zero halted trades". RUNBOOK section added.
+
+**MEASURED** (realistic engine, `bs_legacy`, per-leg friction with the short-DTE floor asserted loaded, 1 contract, condor_any_direction, rise veto off, 2024-01-02..2026-10-08,
+695 sessions; VIX previous-close series 697 sessions with 18 at or above 28, in 2024-08, 2025-04 and 2026-03):
+- **The baseline arm reproduces the W71c "gate OFF" numbers exactly** (QQQ 132 trades / +$5,643; SPY 134 / +$6,068; IWM 121 / +$1,019): the realistic engine at defaults is unchanged.
+- **Entry DTE 14.** Regime veto reached the engine on 0 / 0 / 3 days (QQQ / SPY / IWM); with it off QQQ and SPY are identical and IWM goes +$1,019 -> +$910 (121 -> 121 trades). Vol cap
+  (0.80) reached 0 days on all three. **Trades entered on a day whose previous VIX close was >= 28: 0 of 132 / 134 / 121.**
+- **Entry DTE 1, 3, 7 (QQQ, IWM; baseline vs both gates off).** Regime veto reach 0 (QQQ) and 3 (IWM) days at every DTE; vol cap 0; trades on halt days 0 everywhere. IWM with the veto off takes
+  3 more trades at DTE 1 and 3 (-$68 / -$69 worse without it: 419 -> 422 trades) and at DTE 7 (+$79 better without it: 256 -> 258). QQQ is identical at all three DTEs.
+- **Why the audit's calendar-day counts (19 / 8 / 22 regime days, 18 VIX days) overstated the effect:** they counted days a gate WOULD fire if reached. In the engine each gate sits
+  behind the position-slot gate and the IV-rank floor / cap (high-stress days are IV-rank-cap days), so the vetoes are rarely reached. The decision-relevant number is the funnel count above,
+  not the incidence.
+- **Observation, not a gate effect:** at entry DTE 1 and 3 these fixed settings (credit floors 0.30 / 0.05, 1 contract, `bs_legacy`) show a 1-2% win rate and a net loss over 2.75 years
+  (QQQ about -$7k on 435 trades; IWM about -$10k on 419), worst single trade -$127 to -$335. The cause was not investigated here; it is a property of the cost model at one contract
+  against a few cents of credit, and W79b must run its credit-floor sensitivities before reading any short-DTE number.
+
+**TESTS.** `tests/test_w81_gate_parity.py`: 38 (registry and AST guard 7; one-sided warnings 6; manifest 4; regime class, thresholds and boundaries 6; engine switch 7 incl. the
+meta-label context and `entry_regime` agreement; forwarding 4; `r` 4). **Mutation-checked: 30 mutants, all caught on the first pass, files restored byte-for-byte.** Collected-test
+reconciliation: 5798 -> 5836 selected = +38 exactly. Fast lane 5792 passed / 44 skipped / 0 failed (5836 selected; the W76b lane recorded 46 skipped: the skips are environmental (integration env var, model artifacts, host timezone) and the difference of two was not traced). Typecheck OK; `compileall` OK; `smoke_deploy.py` SMOKE PASS (13 checks).
+
+**ASSUMPTION (new).** **A14:** the VIX-halt filter in `gate_parity_ab.py` treats the PREVIOUS session's VIX close as the entry-time VIX (live reads the current level at the scan), and
+removing a halted trade does not free its slot for a later one. Both make the filter approximate; with zero trades on halt days neither matters for the result recorded here.
+
+**DECISIONS.** D10 (regime veto) and D11 (the three one-sided gates) stay the operator's, now with evidence: on every configuration measured the gates are INERT (0-3 days, at most
++$109 / -$79 on one symbol), so neither decision is urgent. Recommendation: leave the values as they are; the manifest announces the gates on every run; re-run
+`scripts/gate_parity_ab.py` at the final W79b configuration (the cap is SEARCHED over 0.25-0.90 and a value well below 0.80 would reach more days). A research VIX-halt twin is not
+needed unless that re-run shows trades on halt days.
+
+**REGISTERED, NOT FIXED.** (1) The A/B covers entry DTE 14 on QQQ, SPY, IWM and DTE 1 / 3 / 7 on QQQ and IWM (SPY at short DTE not run); only two of the four arms were run at short
+DTE; the vol cap was tested at 0.80 and off, not at the searched lower values. (2) The 11-close realized-vol lookback and the 10-row rise window stay structural literals. (3) `post_event`
+is still a study-set knob with no config switch. (4) Account-level risk (circuit breaker, PDT, correlation, sizer) and the VIX-tiered credit caps remain unsimulated (registered as
+`LIVE_ONLY_GATES`). (5) The meta-label context's NaN semantics differ from the veto's (kept so the engine stays byte-identical). (6) Replay keeps `ENGINE_RISK_FREE_RATE` as the
+default when no value is passed (equal to the config default).
+
+**OPERATOR.** Nothing to restart. D10 / D11 as above (low stakes). The open list is the one in the 2026-10-13 programme entry, section 7: D2 (after the backfill, about 2026-10-21 and the
+rate re-solve), D3, D4, D5, D6, D7, the range-gate mode, the window design, the SPY / IWM backfill, the supervisor + bot restart, the scheduled collection, TWS up for the 15:30 ET run.
+
+**DEPLOY / ROLLBACK.** Research and tests only; `engine.py`, `gate_parity.py` and the scripts are not imported by the live bot. A clean `git revert` of the commit.
+
+**NEXT.** W79b once D2, the range-gate mode, the window design, the SPY / IWM backfill and the friction bands are in place; at W79b's final configuration re-run
+`scripts/gate_parity_ab.py` and run the credit-floor sensitivities before quoting any short-DTE number.
+
+---
