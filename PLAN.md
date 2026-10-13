@@ -16202,3 +16202,973 @@ DTE 5 522 / 3, DTE 6 832 / 5.
 **NEXT.** The waiter runs again at 15:30 ET on Wednesday 2026-10-14 (TWS must stay up). About 13 more sessions are needed for band 0-2 and 9 for band 3-6; the scheduled supervisor job (default 15:30 ET) is the durable route.
 
 ---
+
+## 2026-10-13 - SHORT-DTE PARITY PROGRAMME, FULL STATE IN ONE PLACE: plan as written, as built, where each wave fell short and why, assumptions, decisions, session-end audit (supersedes the git-ignored working brief and the 2026-10-12 registers)
+
+No code change. **Why this entry exists.** Operator direction (2026-10-13): PLAN.md is the ONLY programme document, and a developer who has only this repository (for example on the
+other box) must be able to continue from it: what was done, what remains, what was assumed, which decisions are made and which are the operator's, and where each wave fell short of
+its intent. Until now the plan, the wave status table, the amendment corrections and the working log lived in a git-ignored brief on one Mac
+(`Plans4agent_next_session/W72-W80_short_dte_parity_programme.md`), and the open-decision list was spread across several entries' NEXT lines. This entry carries ALL of the brief
+over (Part B, verbatim apart from three mechanical edits listed in section 1) and adds the planned-vs-built analysis, the assumption statuses, one decision register, and the answers to
+the operator's three end-of-session questions (section 8).
+
+### 1. How to use this entry
+
+- **Read in this order:** section 2 (goal and protocol) -> 3 (state right now) -> 4 (status table) -> 7 (decisions) -> 9 (what remains, in order). Then section 5 for any wave you are
+  about to touch (its AS PLANNED text, what was built, where it fell short and why, and which dated entry holds the evidence), and section 8 for the parity audit.
+- **This entry supersedes**, from today: (a) the brief above (its content is Part B; the local file is replaced by a pointer); (b) the 2026-10-12 "OPERATOR ACTION & DECISION
+  REGISTER" and "OPERATOR REGISTER UPDATE (after W76)" entries (their decisions are re-stated in section 7 with current status; nothing in them was wrong except what they say about
+  statuses that have since changed); (c) every older NEXT line that points at the brief. Older entries are not edited (append-only); they remain the evidence record.
+- **What stays where.** The dated wave entries (W72 ... W76b) hold the numbers, tables, probes and test lists. This entry holds the plan, the shortfalls, the assumptions and the
+  decisions. If this entry and a wave entry disagree on a number, the wave entry (written with the evidence in hand) wins.
+- **Three mechanical edits were made to the carried brief text, and no others:** (1) headings were demoted so this stays one `##` entry; (2) the reference to the local lead-probe
+  script was rewritten to name the regression tests that now cover L1-L6; (3) the brief's "where this plan lives" and old operator-checklist blocks are kept but marked SUPERSEDED.
+- **In the carried brief text, "you" and "your" mean the operator** (the brief was written as a plan addressed to them); "the assistant" is the coding agent.
+- **Privacy rule (unchanged):** no per-trade prices or P&L from the operator's statement and no account identifiers in this file. The manual-trade replay data lives only in the
+  git-ignored `data/replay/`.
+
+### 2. Goal, scope, protocol
+
+- **Goal (operator, 2026-10-11).** Optuna walk-forward research chooses the iron-condor parameters (entry DTE anywhere in 0-45, max hold anywhere in 0..DTE, distance OTM, wing width);
+  the bot then paper-trades the result and finally goes live. That only works if the research engine behaves like the live engine, which for short DTE it did not.
+- **Authorized:** W72-W79 (research / tooling, plus the small live bug fixes in W73 and W71b). **NOT authorized:** W80 (live wiring); it needs the operator's separate approval (D3).
+- **Protocol every wave followed:** a commit pair (`W<n>: ...` code+tests and `PLAN.md: record W<n> ...`), an append-only PLAN entry (CHANGED / MEASURED / TESTS / REGISTERED, NOT FIXED /
+  OPERATOR / NEXT), the gates (compileall, `scripts/typecheck.py`, the new tests, the fast lane with no source edits while it runs, `scripts/smoke_deploy.py` SMOKE PASS), a mutation
+  check of the new tests, and a collected-test-id reconciliation against the previous commit. **Nothing is pushed and nothing is restarted** without the operator.
+- **Hard constraints:** PLAN.md is append-only; live state DBs are opened read-only; `.env` is never echoed; the live bot / supervisor restart is the operator's call; flagged
+  files (`broker/`, `execution/executor.py|portfolio.py|exit_policy.py|reconciler.py`, `risk/`) are changed only with the operator's OK (W73 and W71b had it).
+
+### 3. State at this entry (2026-10-13)
+
+- **Repository.** Branch `W64-risk-retune`, HEAD `3e1d465` before this entry's commit, **48 commits ahead of `origin/main`, nothing pushed** (D7). Working tree: only untracked
+  files (reports, notebooks, an app) that predate this programme.
+- **Live bot.** Not running when the operator was asked on 2026-10-13 (market closed). **The following live-side code is committed but NOT yet running anywhere**: W69 and W70 (an
+  earlier programme), W73 (`reconciler.py`, `options_chain.py`), W71b (three `today_et()` fixes in `bot/orchestrator.py`), and the W76 supervisor job (`master.py`, default OFF).
+  A full SUPERVISOR restart plus a BOT restart is needed to pick them up (operator's call).
+- **Last gates (W76b entry).** Fast lane 5753 passed / 46 skipped / 0 failed; `smoke_deploy.py` SMOKE PASS (13 checks); `typecheck.py` OK; legacy engine byte-identical to the
+  pre-W72 baseline (six variants); `IRON_CONDOR_SPACE` unchanged.
+- **Research overlay (`config_research.yaml`) as it stands.** `engine_model: realistic` (D1), `friction_short_dte: true` (D8), `iv_rank_rise_gate: false` (D9, code kept),
+  `pricing_source: bs_legacy` (D2 OPEN), `gates_mode: enforce` (live is observe), `condor_any_direction: false`. The DTE search is opt-in (`--search-dte`) and off by default.
+- **Data.** Option-bar backfill 62% at 2026-10-12 (93,371 of 151,282 contracts; expiry-ordered, so usable smile coverage ends about early February 2026; ETA about 2026-10-21;
+  QQQ only; Polygon free tier, about two years of rolling history). 0-6 DTE friction collection (QQQ, IB bid/ask hourly bars) after the 2026-10-13 15:30 ET run: band 0-2 has 2 of 15
+  sessions (const half-spread about $0.005), band 3-6 has 6 of 15 (affine, about $0.005 at a $0.30 mid and $0.008 at $1.00); DTE 0 has 70 samples / 1 session. Until a band has 15
+  sessions the engine charges a conservative $0.01 per leg.
+- **Operational.** A detached waiter (outside the repo; log `logs/short_dte_waiter.log`) runs the same manual collector command at 15:30 ET on 2026-10-14; it needs TWS (paper) logged
+  in and the Mac awake. The durable route is the supervisor job (`data_collection:` block in `config.yaml`, default 15:30 ET), which the operator has not enabled.
+
+### 4. Wave status
+
+| Wave | Scope | Status | Commits (code + ledger) |
+|---|---|---|---|
+| Entry | Assessment, programme, privacy rule | DONE | fd99601 |
+| W72 | Parity replay v1, lead probes L1-L6, data hygiene | DONE (L1-L6 all CONFIRMED) | d82c3b4 + 3d0a3ee |
+| W73 | Live bug fixes (reconciler expiry date, chain `min_dte or`) | DONE (live files; take effect at the next bot restart) | 75d6a5d + 6e36a0b |
+| W74 | Engine: per-position expiry, real clock, exit semantics, L2-L6 | DONE; `engine_model` flipped by D1 | d003d47 + f5b0436 |
+| W75 | Real-bar IV surface pricer (QQQ) | DONE; `pricing_source` flip PENDING (D2) | a8b4ca0 + 72a5235 |
+| W76 | 0-6 DTE friction: collector, banded fit, scheduled job | DONE as tooling; data accumulating (2 and 6 of 15 sessions) | 85525c1 + f6333fd; a725fd1 + 9f42248; eafe548 + 831ba47; 0713d79 + 314a358 + 3e1d465 (W76b) |
+| W77 | Settlement, assignment, overnight gap | DONE (realistic engine only) | 91d32b3 + 8707a10 |
+| W78 | Range gate per horizon + decision-frame look-ahead + concurrency at the fill | DONE | f8df7a9 + ea5b3c3 |
+| W79a | DTE-search plumbing, loud failures, DTE report, flat-dimension check | DONE | 1751e10 + bb958d8 (decisions: e7373a0) |
+| W79b | The Optuna DTE study that produces numbers | NOT STARTED: waits on D2, range-gate mode, window design, data (section 9) | - |
+| W71 / W71b | IV-rank verification; three live host-date fixes | DONE | 4f35fcd + 826ab2f (scope: 9520dc3) |
+| W71c | D9 executed: rise veto behind an explicit switch, OFF | DONE | d819d50 + d650761 |
+| W81 | Gate-parity visibility and the two switches found by the session-end audit | PLANNED, approved with the plan on 2026-10-13, NOT STARTED at this entry (section 9) | - |
+| W80 | Live wiring | NOT AUTHORIZED (D3) | - |
+
+### 5. Each wave: AS PLANNED (verbatim from the brief), then AS BUILT, where it FELL SHORT and WHY, and WHERE the evidence is
+
+The AS PLANNED text is the plan as written BEFORE building. Where it conflicts with AS BUILT, AS BUILT is true. Brief section 5.0 (the AMENDMENT) is carried after the waves.
+
+#### 5.0 Assessment entry (2026-10-11)
+
+**AS PLANNED** (brief section "Before W72", verbatim):
+
+Nothing from this session is in PLAN.md yet: plan mode only allows editing the plan file. On approval I read PLAN.md's tail, then **append** one entry and commit it alone (`PLAN.md: record short-DTE parity assessment and W72-W80 programme`). Existing entries are never edited.
+
+`## 2026-10-11 - Short-DTE parity assessment (pre-W72): findings, operator decisions, programme`
+
+- **OPERATOR DIRECTION.** Entry DTE 0–45 and max hold 0..DTE, chosen by Optuna walk-forward, then paper, then live. Research must match live as closely as possible. `dte_range` goes from [14,30] to [0,45] only after the studies, and that edit is yours.
+- **OPERATOR DECISIONS (2026-10-11).** The four decisions in Context: live wiring later with genuine live bugs fixed now; rule 3/3a becomes a long-dated guard with its threshold searched 0–5; no historical quotes assumed; manual trades persisted under the git-ignored `data/replay/`, not in Claude's memory.
+- **FINDINGS (code-read lens, with file:line).** Context items 1–8:
+  - research pricing: Black-Scholes, one constant-maturity IV, a skew with no DTE term, `r = 0.05`, the re-mark ignores the stored IV, the 887k bars go unread
+  - friction calibrated at DTE 11–64 only
+  - no settlement, assignment or gap model, and synthetic weekend expiries
+  - DTE cannot be searched (instance `_entry_dte`, absent from `bt_kwargs`, refused per window)
+  - DTE 0 is rejected as `em_unavailable`; DTE 1–5 is closed on the next bar
+  - one range-model horizon for every trial
+  - the parity manifest compares parameters only
+- **LIVE RULES THAT ASSUME DTE ≥ 14 OR BREAK AT 0–5.** The 20-item census from exploration:
+  - entry selection: the validator forbids 0; the `[:3]` expiry cap versus the uncapped Yahoo path; `min_dte or`; a 0-DTE expected move of 0; whole-day greeks with `t ≥ 0.001`; the 0.70/0.10 credit floors
+  - exits: rules 3/3a; the TP ladder keyed on remaining DTE; the PDT veto on same-day exits; no expiry-day flatten, and monitoring stops at the close
+  - model, sizing and rationale settings: the range horizon; the daily-IV persistence meaning; roll targets; condor-defense bands; `sizing_probe` 21; `max_hold_days ge=1`; optimizer bounds; the blackout rationale
+  - reconcile and data: the reconciler's naive host date; the friction sample covering DTE 7–45 only
+
+  All registered. W73 fixes the genuine bugs and W80 handles the rest.
+- **LEADS (not findings until probed in W72).** L1–L6, each with its file:line.
+- **MEASURED.**
+  - Backfill state: PID, contracts done of total, expiries covered, rows still on the 0.05 placeholder, and about 25% of near-money 0-DTE IV solves failing.
+  - The DTE coverage of the friction samples.
+  - Bot ledger depth: one real filled condor on this Mac. The four "closed" April SPY rows look like bookkeeping, not real closes.
+- **MANUAL-TRADE ASSESSMENT (qualitative only in git).**
+  - Your paper QQQ trades (Aug–Oct 2026) were identified against the bot ledger: bot fills carry a `trade_id`, and the bot made exactly one fill in the window.
+  - Recorded **without** per-trade prices, P&L or any account identifier. That data lives only in the git-ignored `data/replay/`.
+  - Conclusions: the short-DTE trades were nearly all held to expiry. The losses came from two pin/assignment episodes, where an ITM short with an OTM long left unhedged stock across a session gap and the loss exceeded the structure's defined maximum. The sample is too small to establish an edge.
+  - This motivates W76 (friction) and W77 (settlement).
+- **CORRECTION (owed since W70).** The W70 entry says the live and research wing "formula differs". That is wrong: the formula is the same and the **inputs** differ. Research uses a fixed `entry_dte`, the daily IV, a rounded budget cap and whole-dollar strikes. Live uses the chain's DTE, the short legs' IV and a snap to listed strikes.
+- **ASSUMPTIONS.** A1–A12, verbatim.
+- **NEXT.** W72 (parity replay and lead probes), then a check-in with you on its results, then W73–W79 in order. W80 needs separate approval. W71 stays reserved.
+
+**Privacy rule for every PLAN entry in this programme.** PLAN.md is shared through git with the other box. It never carries per-trade prices or P&L from your statement, or any account identifier. Replay summaries in PLAN report error statistics by DTE band only.
+
+**AS BUILT.** The assessment entry "Short-DTE parity assessment (pre-W72)" is in the ledger (fd99601) with the findings, the 20-item live-rule census, the operator decisions of
+2026-10-11, A1-A12, and the privacy rule. It also carried a CORRECTION owed since W70: live and research wing formulas are the SAME formula with different INPUTS (fixed `entry_dte`,
+daily IV, rounded budget cap and whole-dollar strikes in research; chain DTE, short-leg IV and a snap to listed strikes live).
+**Fell short:** nothing material. **Note:** its NEXT line (and several later NEXT lines) name the git-ignored brief; that pointer is superseded by this entry.
+
+
+#### 5.1 W72: parity replay v1 + lead probes
+
+**AS PLANNED** (verbatim):
+
+**Step 0, data hygiene (your instruction):**
+- Write `data/replay/manual_trades_20260817_20261009.json`, covered by the `/data/` ignore rule. Per structure it holds:
+  - for each leg: strike, right, expiry, side, quantity, open time and price, close time, price and code
+  - commissions and attributed stock P&L
+  - **no name, address or account number**
+- Source: the parsed output already in this session (scratchpad `stmt.json` plus the per-leg table). The Downloads statement is not re-read.
+- Then delete the scratchpad copies (`stmt.json`, the `ibstmt*.py` scripts).
+- Rewrite memory note `project_manual_qqq_short_dte_results.md` to hold **no trade data**: only a pointer to the replay file and the manual-vs-bot ledger signature (`trade_id=''`). Update its `MEMORY.md` line to match.
+
+**New:**
+- `src/ait/backtesting/replay.py`: pure loaders and comparisons, so tests can execute them.
+- `scripts/parity_replay.py`: the CLI.
+- `tests/test_w72_parity_replay.py`: synthetic fixtures only. It never reads `data/replay`, since CI won't have it.
+
+**Inputs:**
+1. The manual-trade file.
+2. Bot trades from `data/ait_state.db`, opened read-only (`?mode=ro`):
+   - `trades.legs` JSON and BAG `executions` (`signal_price`, `live_mid`, `nbbo_spread`)
+   - filtered with `go_live.is_real_close`
+3. Optionally, `shared-logs` events (A12).
+
+**Per leg it reports:**
+- underlying at the fill time (`research_intraday_prices` 5-min bar) and DTE as a fractional day
+- **research model mid**, computed by the engine's own code
+- research friction, giving a modelled fill
+- the actual fill
+- where bars cover the contract: the real end-of-day bar close and solved IV against the model's end-of-day price
+
+**Per trade it reports:**
+- entry-credit error, exit-value error and P&L error
+- **exit-decision parity**: replaying the position through the engine's exit checks, which rule fires and when, against what actually happened
+
+**Output and tolerances:**
+- `reports/parity_replay/<YYYYMMDD>/{legs.csv, trades.csv, summary.md}`, split by DTE band (0–2, 3–7, 8–14, 15–45) and by moneyness.
+- Tolerances come from a new `parity:` block in `config_research.yaml` (A6). The summary marks each band PASS or FAIL.
+
+**Refactor:** the IC leg pricing in `engine.py:2118` and `:2606` is extracted into a pure `ic_leg_marks(...)` in `src/ait/backtesting/pricing.py`, called by both the engine and the replay. This is the single-owner rule. **Zero behaviour change**, proved by an equivalence test on the engine's reference run.
+
+**Lead probes L1–L6:** one execution probe each, written up in the PLAN entry as CONFIRMED or REFUTED. Confirmed leads are fixed in W74 (L2–L6) and W79 (L1).
+
+**Acceptance:** the replay runs end to end on your trades plus the bot's one filled condor, and the PLAN entry records error by band.
+
+**AS BUILT** (d82c3b4, 3d0a3ee; entry "W72: parity replay v1"):
+- `ait.backtesting.replay` (pure loaders and comparisons), `scripts/parity_replay.py`, `ait.backtesting.pricing` (`skewed_leg_iv`, `ic_leg_marks`: ONE owner of condor leg pricing,
+  equivalence-tested against the engine's reference run), a `parity:` block (`ParityConfig`) in `config_research.yaml`, `tests/test_w72_parity_replay.py` (synthetic fixtures only).
+- Data hygiene done: the private replay file under `data/replay/` (git-ignored), scratch copies deleted, the memory note stripped of trade data.
+- **L1-L6: all six CONFIRMED** by execution probes (both lenses). Fixed: L2-L6 in W74, L1 in W79a.
+- Headline: entry-credit error fails the A6 tolerance in every DTE band with n >= 3; the sign flips with DTE (research too rich at 3-45 DTE, too cheap at 0-2 DTE); removing the
+  look-ahead (L2) halves the 0-2 DTE error.
+**FELL SHORT / DIFFERED, and why:**
+1. Output went to `data/replay/out/<date>/`, not `reports/parity_replay/`: `reports/` is not git-ignored, so trade-level output there would have been committed (privacy rule).
+2. Exit-decision parity rests on 11 condors (2 still open) and exit-VALUE parity has n <= 2: the exit RULES are not validated against reality, only against a small sample.
+3. The `surface` pricing row of the replay has n = 0 until option bars cover August-September 2026 (the backfill is expiry-ordered and the Polygon top-up from 2026-09-28 has not been run, A11).
+4. **A12 is unresolved in the ledger:** W72 said it would check whether the other box's published events carry strikes, credit, spot and IV; no entry records the outcome. Treat decision
+   parity against the other box's logs as NOT done.
+5. Registered, not fixed (still true): `t_clean` assumes a 16:00 ET expiry close (early-close expiries, W74 owns the clock); scripts that read a removed `bc.initial_capital`
+   (`take_profit_study.py`, `post_event_study.py`, `range_floor_study.py`, `shadow_round1b.py`, from exploration, not re-verified); `scan_interval_minutes` resolved but unused.
+
+
+#### 5.2 W73: live bugs found on the way
+
+**AS PLANNED** (verbatim):
+
+- **`reconciler.py:495`:** `datetime.now().date()` becomes `today_et()` (bug class W20/W21/W23). Tested with a pinned non-ET `TZ`.
+- **`options_chain.py:599-600`:** `min_dte or …` becomes `is None` checks.
+- **`options_chain.py:669-673`:** the `get_chain_for_expiry` ±1 window must include a 1-DTE expiry.
+- Both chain fixes are unreachable at `dte_range [14,30]`; tests prove the decisions are unchanged there.
+- **Gates:** typecheck (blocking), targeted tests, `smoke_deploy.py`.
+- **Deploy:** takes effect at your next bot restart.
+
+**AS BUILT** (75d6a5d, 6e36a0b): `reconciler.py` expiry comparison uses `today_et()`; `options_chain.py` `min_dte or ...` replaced by `is None` checks (a 0-DTE bound is a bound);
+a ratchet test pins the set of naive `.now().date()` sites. Zero change at `dte_range [14, 30]` (asserted). **Live files: effective at the next BOT restart.**
+**FELL SHORT / DIFFERED, and why:**
+1. The "+/-1 window" item was not a separate defect (per the W73 entry); and `get_chain_for_expiry` has no caller in `src/` (dead code or an unwired roll hook).
+2. Three more naive host-date sites in `bot/orchestrator.py` were found and registered rather than fixed (they sit in the iv_rank machinery): fixed later in W71b.
+3. Still open and owned by W80: the reconciler's `<=` treats the expiry DATE as expired intraday; the `[:3]` nearest-expiry cap on the IBKR path (Yahoo path uncapped); the 0-DTE
+   `expected_move` of 0 in the LIVE chain code; whole-day greeks with `t >= 0.001`.
+
+
+#### 5.3 W74: research engine at live fidelity
+
+**AS PLANNED** (verbatim):
+
+**Per-position expiry:** `pos["expiry_date"]` drives `t` in `_reprice_ic_legs` and `_reprice_position`, instead of `self._entry_dte`.
+
+**Real listed expiries:** new `src/ait/backtesting/expiry_calendar.py` (A4). Target DTE maps to the nearest listed expiry at or above it, and never to a weekend.
+
+**Shared pure helpers** (one owner; research uses them now, live in W80):
+- `ait.utils.time.time_to_expiry_years(now_et, expiry, close_et)` (A9)
+- `expected_move(S, iv, t_years)` with no zero at DTE 0. Today the formula lives in both `options_chain.py:422` and `engine.py:2079`.
+
+**Entry pricing and look-ahead (L2, if confirmed):**
+- At an intraday fill, S is the fill bar's price and `t` is measured from the fill time.
+- Features and gates use data up to D−1 plus the partial session (`slice_intraday_up_to`). They never use day D's close.
+
+**Same-session exits:** a position entered at time T is exit-checked on the bars after T on the same day. 0-DTE needs this.
+
+**Exit semantics:** new pure functions in `exit_policy.py`, consumed by the engine. Live keeps its current constants until W80.
+- **`expiry_guard_applies(entry_dte, guard_dte)`:** rules 3 and 3a apply only to positions entered above `guard_dte` (your decision). Research key `backtest.expiry_guard_dte`, default 5; Optuna searches 0–5.
+- **`hold_limit_reached(entry_ts, now_ts, expiry, fraction)`:** hold up to `fraction ×` (entry → expiry close), with `fraction` in (0, 1]. This replaces `max_hold_days` for credit structures.
+- **`expiry_day_flatten_due(now_et, expiry, minutes_before_close, close_et)`:** default 60 (A2). It is a hard backstop that fires before any settlement.
+
+**Confirmed leads:** fix L3–L6 here, each with its own regression test.
+
+**Tests:**
+- New `tests/test_w74_*`.
+- `TestSharedExitPolicy` is extended to the new functions.
+- AST guard: no `self._entry_dte` read inside any reprice path.
+- A pinned non-ET `TZ` for the clock tests.
+
+**Baseline (A10):** one reference study (QQQ IC, entry 14 DTE) is recorded before and after.
+
+**AS BUILT** (d003d47, f5b0436): `backtest.engine_model: legacy | realistic` (legacy stays byte-identical, 198-trade baseline); per-position expiry drives every re-mark through one clock
+(`_remark_t`); `ait.backtesting.expiry_calendar.listed_expiry` (never a weekend; accepts a real expiry set); `ait.utils.time.time_to_expiry_years`; `expected_move` with no zero at DTE 0
+(`ait.backtesting.pricing.expected_move`); pure exit functions in `execution/exit_policy.py` (`expiry_guard_applies`, `hold_limit_reached`, `expiry_day_flatten_due`) and engine kwargs
+`expiry_guard_dte`, `max_hold_fraction`, `flatten_minutes_before_close`; L2-L6 fixed under the realistic model each with a regression test. 28/28 mutants.
+**FELL SHORT / DIFFERED, and why:**
+1. **Feature/gate look-ahead was NOT fixed here** (the plan listed it under L2 but the first build only fixed PRICING; the gates still saw day D's bar). It was assigned to W78 by
+   amendment correction 4 and fixed there for realistic + intraday entries.
+2. **The engine does not use the bar-derived listed-expiry set.** `listed_expiry(..., listed=None)` accepts it but the engine passes none, so it uses the weekday rule calendar (A4's
+   "QQQ expiries taken from the bars" is NOT in effect); holiday-shifted expiries are therefore approximated.
+3. A bare `Backtester` is uncapped on contracts (a 0-DTE credit of a few cents sizes into hundreds); every research entry point caps at 1. `_options_half_spread`'s IV/DTE thresholds
+   are still hard-coded in the LEGACY friction model.
+4. **The A10 "reference tables" in the W74 and W75 entries were later found to have run on the legacy % friction model** (a `str` `db_path`); they were corrected in the W76 entry and the
+   engine now coerces `db_path` to `Path`; study scripts assert the per-leg model loaded.
+5. The engine_model flip was left to the operator: decided YES on 2026-10-12 (D1).
+
+
+#### 5.4 W75: real-bar IV surface pricer
+
+**AS PLANNED** (verbatim; the brief's own banner is kept):
+
+> AS PLANNED (pre-build). As built: see AMENDMENT above and the PLAN.md W75 / W76 entries.
+
+**New `src/ait/backtesting/iv_surface.py`:**
+- **Inputs:** an `option_daily_bars` getter (the first read API on that table, added to `historical.py` and read-only). It uses rows with `iv_outcome='solved'`, `volume>0` and |ln K/S| ≤ 0.15.
+- **Fit:** per (date, expiry), a quadratic smile in log-moneyness, interpolated across expiries in total variance, with flat extrapolation.
+- **Cache:** `data/research_cache/iv_surface_QQQ.parquet`, stamped with the bar row count so it rebuilds when the bars grow.
+
+**Engine switch:**
+- New overlay key `backtest.pricing_source: surface | bs_legacy`, **default `bs_legacy` until validation passes**. Flipping it is your call.
+- Per-symbol fallback to `bs_legacy` where there are no bars, reported per symbol in the parity manifest.
+- Uses A3 (D−1 surface, sticky-moneyness).
+- The surface's `r` comes from the SOFR table via the existing `historical.get_risk_free_rate`.
+
+**Validation (measure):**
+- Predict day D's end-of-day bar close from the D−1 surface plus D's spot, out of sample, by DTE band and moneyness, against `bs_legacy`.
+- Re-run the W72 replay with the surface.
+- Adopt the surface for a band only where it beats `bs_legacy` **and** passes the A6 tolerance.
+
+**Timing:**
+- The method is built and validated now on the expiries already downloaded (2024-09 → 2025-12).
+- After the download completes, I run `scripts/backfill_risk_free_rate.py` (the phase-B re-solve; it writes the research rows of `historical.db`) and the validation is re-run. I'll tell you before that run.
+
+**AS BUILT** (a8b4ca0, 72a5235; amendment table above lists the deviations): `ait.backtesting.iv_surface` (quadratic smile per (date, expiry), total-variance interpolation across
+expiries, flat extrapolation; built from `option_daily_bars` rows with DTE >= 1, because 0-DTE close IVs are meaningless), a parquet cache stamped with the bar-row count,
+`backtest.pricing_source: surface | bs_legacy` (default and current `bs_legacy`), `scripts/surface_validate.py`. Out-of-sample bar-to-bar median option-price error vs `bs_legacy`:
+-19% / -46% / -43% / -49% at 1-2 / 3-7 / 8-14 / 15-45 DTE (the surface is better). 18/18 mutants.
+**FELL SHORT / DIFFERED, and why:**
+1. `r` is the bar rows' `risk_free_rate` column, which is a 0.05 PLACEHOLDER until the phase-B re-solve (`scripts/backfill_risk_free_rate.py`) runs after the backfill; it was not read
+   from the SOFR table as planned.
+2. **The flip is not made (D2)**: surface-priced history is limited by the backfill (usable smile coverage ends about early February 2026 today) and the free tier (about 24 months).
+3. QQQ only: SPY and IWM have no bars (A8). Replay-vs-real-fills waits on the backfill and the A11 top-up.
+4. The roll-down bias (next-day IV above the prior smile near expiry) is quantified, not modelled: the adjustment did not improve out-of-sample error and was not shipped.
+   American early exercise is ignored (OTM-only mitigates). 0-DTE intraday pricing relies on the prior-session 1-DTE smile alone.
+5. Reference A/B (surface vs bs_legacy, realistic engine, 2025): surface pricing is LESS favourable at 1-3 DTE (note the W76 correction to these tables).
+
+
+#### 5.5 W76 (and W76 follow-ups, W76b): friction at 0-6 DTE
+
+**AS PLANNED** (verbatim; the brief's own banner points at the amendment):
+
+> AS PLANNED (pre-build). As built: see AMENDMENT above and the PLAN.md W75 / W76 entries.
+
+- **Sampler:** `option_spread_sampler.relevant_mask` and `plan_strikes` extended to DTE 0–6, with `mid ≥ 0.01` and expiry-day bars.
+- **Calibration:** `calibrate_option_spreads.py` gains `--dte-min`.
+- **Fit by band:** fitted per (symbol, DTE band). `option_leg_spread_params` gains a `dte_band` column (default `'all'`, migration in `historical.py`). `friction.py` and the engine's `_load_leg_spread_model` pick the band row.
+- **Until a band has 15 or more sessions** (`friction.min_sessions_per_band` in the overlay):
+  - extrapolated friction is floored at the $0.01 tick per leg, stress-multiplied, and tagged `friction_extrapolated` in the manifest and reports
+  - `friction_sensitivity.py` must show the result survives
+- **Live check:** `fill_vs_model_report.py` (read-only) is run on bot fills.
+- **Your procedure** (A1): one RUNBOOK section for daily `--source ib-bars --dte-min 0` collection. A supervisor job for it is registered, not built, because `master.py` is flagged.
+
+**AS BUILT** (85525c1, f6333fd; a725fd1, 9f42248; eafe548, 831ba47; 0713d79, 314a358, 3e1d465):
+- Sampler mask widened to DTE 0-6 (`ait.data.option_spread_sampler`), `ait.data.short_dte_collector` (hourly BID/ASK bars via IB historical data), CLI
+  `scripts/calibrate_option_spreads.py --source ib-bars --short-dte [--dry-run] [--status-file ...]` (the `--port` default follows `IBKR_PORT`), a NEW table
+  `option_leg_spread_band_params` (a band per DTE group, not a `dte_band` column), banded model in `ait.backtesting.friction` and the engine
+  (`friction_short_dte`, `friction_min_sessions_per_band` 15, `friction_extrapolated_floor_usd` 0.01), a supervisor job `ait.orchestration.short_dte_job` (default OFF; `data_collection:`
+  config block; needs a SUPERVISOR restart to enable), RUNBOOK section "Short-DTE friction collection".
+- Measured: condor-relevant legs at 3-6 DTE have half-spreads of $0.005-0.010, 1.0-1.2x the all-DTE model, 0.5-1.0x the $0.01 floor: the planned "extrapolation is ~2x too cheap"
+  hypothesis is WITHDRAWN; the floor is conservative.
+- W76b: **an expiring contract is not served after the close**, so DTE 0 can only be collected before 16:00 ET; the default run time moved from 16:10 to 15:30 ET; an in-progress bar is
+  never stored (`in_progress_bars_skipped`). The 15:30 ET run on 2026-10-13 captured the first real DTE 0 samples.
+**FELL SHORT / DIFFERED, and why:**
+1. **Not yet calibrated.** Bands need 15 sessions each: 2 (band 0-2) and 6 (band 3-6) at 2026-10-13. Collection is one session per trading day and cannot be backfilled (no historical
+   NBBO, A1). Earliest realistic activation: band 3-6 about 2026-10-27, band 0-2 about early November.
+2. **A wrong instruction cost one run for DTE 0:** the assistant first told the operator to run the collector after the close; the expiring contract is gone by then (W76b). The run was
+   not wasted (it added DTE 1-6 sessions).
+3. The friction model is a function of the mid only, with no time-of-day term; morning and afternoon quotes are pooled (the samples carry `bar_time`, so this can be checked after 15 sessions).
+4. Hourly quotes are the LAST quote of each hour, not a time-average spread (W66 caveat). QQQ only (SPY/IWM collection works but has not been run).
+5. `fill_vs_model_report.py` (the planned live check on bot fills) was not run. The scheduled job and the waiter die with the host's sleep or reboot; a missed day is skipped, not replayed.
+
+
+#### 5.6 W77: settlement, assignment and the overnight gap
+
+**AS PLANNED** (verbatim):
+
+**A position still open at the expiry close** (cutoff off or missed):
+- Each leg settles at the session's last 5-min close (honours half-days).
+- Intrinsic value is computed with `PositionReconciler._structure_intrinsic`, which is static and pure. It moves to a shared pure helper with no live behaviour change.
+- Undelivered-against shares (short ITM with long OTM) are carried and marked at the next session's open. The next session is weekend- and holiday-aware via `pandas_market_calendars`. Stock commission is charged.
+- Pin band and auto-exercise follow A5.
+
+**New research exit reasons:** `expiry_settled` and `assigned_gap`, plus a live↔research exit-reason mapping table (`replay.py`).
+
+**Validation:** with the cutoff disabled, the replay must reproduce your two real pin episodes (short call assigned, long wing expired, gap at the next open).
+
+**Registered, not built:** ex-dividend early assignment (live rule 3e has no research twin) and a flatten-failure stress knob.
+
+**AS BUILT** (91d32b3, 8707a10): `ait.backtesting.settlement` (pure rules: `settle_status`, `settle_legs`, `scenarios`, `stock_legs`, `settlement_cost`, `unit_fees`, `worst_case`;
+`EXERCISE_THRESHOLD_USD = 0.01`), the engine's rule 3b now settles (`_settle_at_bell`, `_close_pending_settlement`, `_finish_settlement`; shares carried overnight and closed at the next
+session's open as `assigned_gap`), config `backtest.pin_band_usd` 0.10, `assignment_fee_per_share` 0.015, `stock_commission_per_share` 0.01 (assumption A13), replay
+`settlement_replay` and `LIVE_REASON_TO_RESEARCH`. Reproduces 32 of 32 leg outcomes and 9 of 9 net shares on the operator's statement (10 structures reached expiry; 1 lacked next-open
+data). 35/35 mutants.
+**FELL SHORT / DIFFERED, and why:**
+1. **The reconciler helper was NOT moved** (`PositionReconciler._structure_intrinsic` is in a flagged file); a 600-case parity test pins `settlement_cost` equal to it instead (still one
+   definition of the arithmetic, no live diff).
+2. **Settlement is rarely reached under the default exit rules** (take-profit ladder + touch stop): zero bell exits at 0/1/3 DTE; it matters only for studies that disable take-profit /
+   the touch stop (the way the manual trades were held). Consequence found: `flatten_minutes_before_close` is a FLAT dimension (see W79a).
+3. Not modelled: ex-dividend early assignment (live rule 3e has no research twin); IB's own pre-expiry liquidation of at-risk positions; a flatten-failure stress knob; after-hours moves
+   beyond the pin band; stock slippage at the open; **carried shares are not margined**; the two non-credit `expiry` sites in the engine still re-mark (debit structures are not on the
+   live IC-only path).
+4. The assignment fee is charged on ASSIGNED shares only (exercise delivery was free on the statement); A13 is the operator's to change in the overlay if their rates differ.
+5. Trade counts are not comparable across settlement-on and settlement-off rows (pending positions keep their slot overnight).
+
+
+#### 5.7 W78: range gate per horizon (+ decision-frame look-ahead, + concurrency at the fill)
+
+**AS PLANNED** (verbatim):
+
+- **Shared horizon function:** `range_spec.horizon_for(entry_dte, hold_fraction, guard_dte)` (pure, shared). `live_range_spec` returns today's value at the current config. Live is not wired until W80.
+- **Walk-forward models:**
+  - `_range_label_horizon` and the per-window range-model training become per horizon bucket (A7), cached per (window, symbol, bucket) and shared by trials in the same bucket.
+  - The adaptive threshold stays as it is (`walkforward.py:2506`).
+  - The 0.65 floor is not re-tuned; its calibration is reported per bucket.
+- **Meta-label:** unchanged in code. It inherits the trial's DTE through the post-optimization window config.
+- **Sensitivity run:** the DTE study's gates are also run in `observe` mode, so gate effects are visible separately.
+
+**AS BUILT** (f8df7a9, ea5b3c3): `ait.ml.range_spec.horizon_for(entry_dte, guard_dte, hold_fraction, max_hold_days)`, `bucket_for` and
+`RANGE_HORIZON_BUCKETS = (1, 2, 3, 5, 7, 9, 14, 21, 30)` (live's `live_range_spec` rebuilt on `horizon_for`, equal at live config); `ait.backtesting.range_bank.RangeModelBank` (lazy
+per-horizon models, RNG save/restore, failures cached; non-base buckets under `models/research/h<N>`); walk-forward `_range_label_horizon`, `_pick_range_model`,
+`_train_range_bucket`; the engine's decision frame `hist_dec = hist.iloc[:-1]` for realistic + intraday entries (the look-ahead fix, amendment correction 4); concurrency measured at the
+fill instant (`closed_today`, `_exit_instant`, `max_concurrent_intraday`). `scripts/range_horizon_study.py`. 34/34 mutants (two first-pass survivors were real test gaps).
+**FELL SHORT / DIFFERED, and why:**
+1. **The range model is weak and abstains.** At every horizon it abstains in 10-15 of 24 windows (42-63%); at the shipped 9 bars there is no out-of-sample lift (0.62 vs 0.62 base
+   rate); modest lift at 2-5 bars; Brier skill negative everywhere. With `gates_mode: enforce` an abstaining window fails closed, which is why the DTE study's range-gate mode is open.
+2. The **bucket grid** is 9 not 10 (A7 said 10): 9 is live's horizon at `dte_range [14, 30]` (max(1, 14 - 5)), so the must-agree pair stays equal.
+3. Not fixed (registered): the calendar-vs-trading-day unit slip in the horizon (measured: pass-rate moves about 3 points; live and research must change together, W80); the 0-DTE
+   bucket-1 approximation (a daily model cannot describe a same-session trade; AUROC 0.66 but no lift over a 0.95 base rate); the 0.65 probability floor is not tuned per bucket (it must
+   be chosen on each window's training slice); the meta-labeler shadow run has no range gate (gating it would score the model on its own training data); `exit_time` is the bar START so
+   concurrency is accurate to one 5-minute bar; `_build_position` still receives `hist` including day D (its PRICING uses the fill context; a future builder that reads `hist` for a
+   decision would reintroduce the leak; the AST guard covers the entry chain, not the builders).
+4. Effect sizes: the decision frame lowered all five reference rows (-$0.1k to -$1.1k); concurrency removed every overlap and blocked 6-9% of entries at 3-14 DTE (totals +$0.1k to +$2.4k,
+   not significant).
+
+
+#### 5.8 W79 (split into W79a and W79b): Optuna searches DTE
+
+**AS PLANNED** (verbatim):
+
+**`IRON_CONDOR_SPACE` adds** (bounds in overlay `backtest.dte_search_range: [0, 45]` etc.):
+- `entry_dte`
+- `max_hold_fraction` (0.05–1.0; replaces `max_hold_days` for credit structures, derived the way `trailing_stop_fraction` is at `optimizer.py:665`)
+- `expiry_guard_dte` (0–5)
+- `flatten_minutes_before_close` (30–120)
+- `ic_min_credit` and `ic_min_credit_width`. At 1–2 DTE, live's 0.70 credit floor rejects nearly every condor. They become engine kwargs, and the manifest warns when they differ from live.
+
+**Plumbing:**
+- Each new dimension goes into `bt_kwargs` (the R20 #2 invariant test enforces it).
+- `WalkForwardConfig` gains the fields, including `delta_short` (fixes L1 if confirmed).
+- The `entry_dte` per-window refusal is removed, because trials now receive it.
+- `_maybe_drop_inert_params`'s `wing_k` check uses the trial's DTE.
+
+**Loud failure:** a swallowed `window_optimization_failed` is counted and, under overlay `optimize_strict: true`, fails the study.
+
+**Sampler:** `TPESampler(multivariate=True, group=True)` behind overlay `optimize_multivariate`.
+
+**Report** (per window plus aggregate):
+- the best DTE
+- the DTE distribution of the top-decile trials
+- the objective and out-of-sample results by DTE band
+
+**Promotion rule** (for your decision, not automatic): a DTE region is a candidate only if:
+- it sits in the top decile in at least ⅔ of windows, **and**
+- its band passed parity (W72/W75), **and**
+- its friction is calibrated (W76)
+
+**Tests changed by design:**
+- `test_r21b_pr7_review_round::TestHoldDimensionReachable`: rewritten for fraction semantics.
+- `test_take_profit_study_injection`: the `entry_dte` refusal is gone.
+- `test_config.py:100` is **unchanged**: the live validator stays until W80.
+
+**Cost:** measured on one window before a full run. I expect 150 or more trials per window.
+
+**AS BUILT: W79a only** (1751e10, bb958d8; decisions e7373a0). The operator split W79 on 2026-10-12 into W79a (no data dependency) and W79b (the study).
+- D1 and D8 flipped in `config_research.yaml`. `DteSearchConfig` (`backtest.dte_search`, opt-in via `run_backtest.py --search-dte` / `--dte-range`; ranges entry_dte [0, 45],
+  guard_dte [0, 5], hold_fraction [0.05, 1.0]; multivariate TPE; strict) and `dte_search_space` in `optimization/param_spaces.py`; `IRON_CONDOR_SPACE` is UNCHANGED (asserted).
+- The trial `Backtester`s now receive `entry_dte`, the guard, the hold fraction, the flatten and `delta_short` baselines, and so do the OOS and shadow engines (**L1 fixed**:
+  `WalkForwardConfig` gained `delta_short`, `expiry_guard_dte`, `max_hold_fraction`, `flatten_minutes_before_close`, `dte_search`, `dte_range`, `optimize_strict`,
+  `optimize_multivariate`); the range model is routed by the window's own DTE / guard / fraction; the `entry_dte` per-window refusal is gone.
+- **Loud failure:** a failed window optimisation is recorded in `optimization_status`, counted in `WalkForwardResult.optimization_failures`, and raises under `--optimize-strict`
+  (previously the window silently fell back to the BASE config: a study that looked fine and searched nothing).
+- `ait.backtesting.dte_report` (best DTE, top-decile DTE distribution, by-band results) and `scripts/dte_dimension_flatness.py`. 31/31 mutants.
+- Measured flatness (QQQ, one 4-month window, realistic engine): `flatten_minutes_before_close` FLAT at every DTE (not searched); `expiry_guard_dte` moves only at entries <= its range
+  (so it is sampled conditionally); `max_hold_fraction` moves except at 1 DTE; `delta_short` and `wing_k` move everywhere.
+**FELL SHORT OF THE W79 PLAN, and why:**
+1. **W79b has not run: no Optuna DTE number exists.** It waits on D2 (surface pricing), the range-gate mode, the window design, SPY/IWM data and the friction bands (section 9).
+2. `flatten_minutes_before_close` and the credit floors (`ic_min_credit`, `ic_min_credit_width`) are NOT searched (the plan listed them as dimensions): flatten is flat under the default
+   take-profit ladder; the floors are live economics and searching them would optimise against an unmeasured cost model. W79b runs the floors as 3-value sensitivities.
+3. The wiring smoke ran 5 trials end to end in strict mode (DTE 16 chosen; the OOS run took no trades): a wiring check, not a result.
+4. The promotion rule (top decile in >= 2/3 of windows AND parity passed AND friction ACTIVE) is the operator's decision at W79b time, not automatic.
+5. Registered: the flatness numbers are one four-month window per cell (can-it-move, not by-how-much); `run_backtest.py` logs `walk_forward_too_few_windows` below 3 windows even with
+   `--max-windows 1`; grouped TPE is an experimental sampler (off by default).
+
+
+#### 5.9 W71 / W71b / W71c: iv_rank verification (reserved number; scope in 9520dc3)
+
+**AS PLANNED.** The brief only reserved the number ("W71 (iv_rank verification) stays reserved and is untouched"). The scope was written on 2026-10-12 (entry "W71 SCOPE,
+DEPENDENCIES AND THE CODE-READ FINDINGS"): verify the research iv_rank against live's stored-IV percentile, and find out whether live applies the 10-day rise veto at all.
+**AS BUILT** (4f35fcd, 826ab2f; D9: d819d50, d650761):
+- **Finding: live has NO IV-rank rise veto** (pinned by an AST guard: nothing outside `backtesting/`, `optimization/`, `config/` reads `iv_rank_rise_threshold`). The research veto reads
+  a realized-vol range rank that correlates only 0.46-0.63 with live's stored-IV percentile and falls on the other side of live's floor/cap on 34-42% of days; 45-58% of the days it
+  blocks live already refuses; the rest (4.5-5.4% of tradeable days) live would trade. Research IV and live stored IV are the same data (corr 1.000; 2-5 days differ).
+- A/B on the realistic engine (2024-01..2026-10): the veto removes 3-6 trades per symbol and is slightly negative (QQQ -$0.4k, SPY -$0.02k, IWM -$0.07k, inside noise).
+- **W71b (live file, takes effect at the next bot start):** `bot/orchestrator.py` `_persist_daily_iv`, `_estimate_iv_rank` age and `_true_up_commission` marker use `today_et()`; the W73
+  ratchet now holds the whole tree to zero naive `.now().date()`.
+- **W71c / D9 (operator, 2026-10-13):** `backtest.iv_rank_rise_gate` (schema default True; overlay False): code and the 0.30 threshold (searched 0.25-0.60) are KEPT; while the gate is
+  off the rise is still recorded per entry (`iv_rank_rise_10d`) and the optimizer does not search the threshold (the trap: a searched value overrode an "off" overlay). The RE-ENABLE
+  BAR is written in `config_research.yaml`: a MULTI-WINDOW walk-forward with the gate ON vs OFF showing an out-of-sample gain beyond window noise on days live's level gates would have
+  traded; then port it to live (W80-class), so research does not keep a gate the bot lacks.
+**FELL SHORT / DIFFERED, and why:** the plan was a verification, which found a research-only gate; the first recommendation ("remove it") was refined by the operator into a switch.
+Still open: live's median-across-expiries IV persistence changes meaning with the chain mix (0-2 DTE chains; W80); the SPY/IWM live stores hold only 510 observations since 2024-04;
+the live-side freshness machinery (5-day gate, realized-vol fallback) is not simulated; the "construction study" (W67 clarification open item 2) is untouched.
+
+
+#### 5.10 W80: live wiring (NOT authorized)
+
+**AS PLANNED** (verbatim):
+
+Each item has a zero-change-at-[14,30] proof where possible:
+- `dte_range` validator `0 ≤ min`
+- `options.target_dte` replacing the `[:3]` expiry cap
+- portfolio rules 3/3a through `expiry_guard_applies`
+- the expiry-day flatten and `max_hold_fraction`
+- shared time-to-expiry in greeks, IV-solve and expected move (0-DTE)
+- economics floors taken from research
+- the PDT rule for same-day round trips
+- fixed-tenor IV persistence for `iv_rank`, linked to W71
+- review of roll targets, condor-defense and sizing-probe DTE values
+- an expiry-day reconcile
+
+After that: a paper sleeve, then the go-live gates.
+
+**AS BUILT.** Nothing, by design. **Items added since the plan was written** (each is registered in its wave entry): the calendar-vs-trading-day unit slip in the live range horizon
+(W78); live's median-across-expiries IV persistence (W71); the reconciler's intraday expiry-date `<=` (W73); the live-side behaviours listed in section 8 as P3 (live-only VIX halt
+and VIX-tiered credit caps have no research twin) and the live regime use (W81 documents it); an expiry-day reconcile; ex-dividend assignment handling; a flatten-failure path.
+
+
+#### 5.11 The brief's AMENDMENT of 2026-10-12 (corrections 1-9; carried verbatim)
+
+**Verdict: the programme is still valid in goal and order (W77 -> W78 -> W79; W80 separate approval). The wave BODIES for W72-W76 below are the plan as written
+BEFORE building; PLAN.md's W72..W76 entries and the STATUS LOG at the bottom are the as-built record. Original text is left unedited so the history stays readable.**
+
+Unchanged and valid: goal, wave order, execution protocol (commit pair, append-only PLAN, no push / no restart), privacy rule, assumptions A2, A4-A9, A11, A12.
+
+**Where the plan text is stale (as built / measured):**
+
+| Plan body says | As built / measured |
+|---|---|
+| W72 output `reports/parity_replay/` | `data/replay/out/<date>/` (reports/ is not git-ignored) |
+| W75 getter added to `historical.py`; `r` from the SOFR table | `iv_surface.load_bars` (read-only); `r` is the bar rows' `risk_free_rate` column (0.05 placeholder until the phase-B re-solve); the roll adjustment was measured and NOT shipped |
+| W76 `dte_band` column, `--dte-min 0`, supervisor job "registered, not built" | new table `option_leg_spread_band_params`; `--short-dte` flag; collector is its own module (`ait.data.short_dte_collector`); supervisor job BUILT, default OFF (`data_collection:`, `ait.orchestration.short_dte_job`); `--port` follows `IBKR_PORT` |
+| W76 live check `fill_vs_model_report.py` | not run; do it after the bands are fitted |
+| A1 forward friction collection | confirmed; IB serves nothing for expired contracts; first real run: 3-6 DTE half-spreads measured at 1.0-1.2x the model, so the "~2x too cheap" hypothesis is WITHDRAWN |
+| A3 no look-ahead | holds for PRICING only; features/gates still see day D (W74 registered (1), previously assigned to no wave: see correction 4) |
+| A10 reference numbers | the W74/W75 tables ran on the legacy % friction (str db_path); corrected in the W76 PLAN entry |
+| Verification 7: historical.db written only by the W75 re-solve and operator calibration | also by the supervisor job once enabled |
+
+**Corrections to the remaining waves:**
+1. **W77 hook point.** Settlement replaces W74's rule 3b (`engine.py` ~3381-3388, `exit_reason "expiry"` at the bell, today a model re-mark), not a new path. The two other
+   `"expiry"` sites (~3432, ~3458, non-credit checks) are routed the same way or left explicitly out of scope.
+2. **W77 touches a flagged file.** Moving `PositionReconciler._structure_intrinsic` (`reconciler.py` ~263, static, pure) to a shared pure helper edits `reconciler.py`.
+   Needs the operator's explicit OK when W77 starts (as W73 did). Fallback if declined: research imports the static method as is (still one owner, no live diff).
+3. **W77 validation does not wait on option bars.** Settlement needs the underlying's last 5-min close and the next session's open (`research_intraday_prices`). The
+   pin-episode reproduction can run now; confirm first thing in W77.
+4. **W78 owns the feature/gate look-ahead.** A 10:30 entry gated on day D's close matters most at 0-3 DTE, which is what W79 searches. W78 either fixes it (features up to
+   D-1 plus the partial session, as pricing already does) or measures it and registers the effect size; it cannot stay unassigned before W79. Also:
+   `walkforward._range_label_horizon` reads `options.dte_range[0]`, not the window's `entry_dte`; the new `horizon_for` must keep the `range_spec` must-agree pair equal at live
+   config. Horizon bucket 1 approximates a 0-DTE hold (intraday); state it, do not model it.
+5. **W79 is plumbing, not engine work.** `expiry_guard_dte`, `max_hold_fraction`, `flatten_minutes_before_close`, `ic_min_credit`, `ic_min_credit_width` already exist as engine
+   kwargs (W74). W79 adds them to `IRON_CONDOR_SPACE` (replacing `max_hold_days` 1-9 at `param_spaces.py` ~44 and ~121), `bt_kwargs`, and `WalkForwardConfig` (plus
+   `delta_short`, L1), and lifts the `entry_dte` refusal (`walkforward.py` ~244). Study scripts must assert `bt._leg_spread_model is not None` (and `bt._surface` when
+   `surface`), and cap `max_contracts_per_trade` (W74 registered (3)).
+6. **W79 entry conditions made concrete.** D1 + D2 + **D8 required, not "ideally"** (else Optuna optimises on unmeasured 0-6 DTE friction). "Friction calibrated" in the
+   promotion rule means the DTE band is ACTIVE in `option_leg_spread_band_params` (>= 15 sessions). The report adds the extrapolated-leg share per DTE band
+   (`friction_summary`). Earliest realistic start with one collection per session: band 3-6 (4/15 on 2026-10-12) ~2026-10-27; band 0-2 ~2026-11-02. W77 and W78 fill the wait.
+
+**Added after W77 (2026-10-12):**
+7. **W79: `flatten_minutes_before_close` is a FLAT dimension under the default take-profit ladder.** With the ladder on, 0/1/3 DTE entries had zero `expiry` exits and
+   flatten 60 vs OFF gave identical totals. Searching it wastes trials (the W65 inert-`wing_k` shape). Either search it together with a searched/disabled TP ladder, or drop it
+   from `IRON_CONDOR_SPACE`; measure first. `max_hold_fraction` and `expiry_guard_dte` were not tested this way: check them the same way before W79.
+8. **W78 candidate: exit-before-entry ordering artifact.** With `max_concurrent_positions=1`, 20 of 179 entries (3 DTE) and 7 of 136 (7 DTE) opened while another position was still
+   open (0 at 0/1 DTE). Mechanism by code reading only (the `run()` exit loop evaluates a held position over the whole session before that day's entry step). It inflates short-DTE
+   trade counts; fix or quantify in W78 before W79 compares DTEs by trade-count-sensitive objectives.
+9. **Settlement matters for studies that disable take-profit / the touch stop** (the way the manual condors were held): the gap tail is real (worst trade -$0.9k -> -$1.2k at 0 DTE,
+   -$1.2k -> -$2.4k at 1 DTE; 22 of 186 0-DTE trades beyond the defined maximum). Under live exit rules it is rarely reached.
+
+**Where each correction landed:** 1 (W77 hook = rule 3b) and 3 (validation did not wait on bars) as built in W77; 2 (reconciler helper) not moved, parity-tested instead; 4 (W78 owns
+the look-ahead; `_range_label_horizon` reads the window's `entry_dte`) as built in W78; 5 and 6 (W79 is plumbing; D1 + D2 + D8 needed) as built in W79a, with D2 still open; 7 (flatten is
+FLAT) and 8 (ordering artifact) fixed/measured in W79a and W78; 9 (settlement matters for studies that disable take-profit) recorded in W77.
+
+
+### 6. Assumptions: A1-A13 verbatim, each with its status at this entry
+
+
+**Verbatim from the brief** (A1-A12; A13 is from the W77 entry):
+
+- **A1** No historical option NBBO is available, so 0–6 DTE friction must be collected forward from IB hourly bid/ask bars. That takes 15 or more sessions and needs TWS/Gateway; you run it.
+- **A2** The expiry-day flatten cutoff defaults to **60 min before the close** (you said "an hour or two"). Research searches 30–120. On a half-day it is relative to the early close.
+- **A3** No look-ahead. A decision at time T on day D uses day D−1's end-of-day IV surface, sticky-moneyness, applied to the current spot. It never uses day D's bars.
+- **A4** Listed expiries. QQQ expiries are taken from the bars. SPY and IWM fall back to a rule calendar (weekday expiries, holiday moves to the prior session), flagged in the manifest until bars exist.
+- **A5** Settlement.
+  - Long options ITM by $0.01 or more are auto-exercised (OCC exercise-by-exception).
+  - A short within a $0.10 pin band of its strike takes the worse of assigned and not assigned.
+  - Delivered shares are marked at the next session's open.
+- **A6** Default parity tolerance per DTE band: median |entry-credit error| ≤ 15% of credit **and** |median bias| ≤ 10%. Stored in `config_research.yaml`, and yours to change.
+- **A7** Range models use horizon buckets {1, 2, 3, 5, 7, 10, 14, 21, 30} trading days, trained lazily and cached per window. This bounds training cost.
+- **A8** Short-DTE studies are QQQ-only until SPY/IWM bars exist. The SPY backfill is registered for after QQQ finishes, about 3 weeks.
+- **A9** Time to expiry is calendar time with an intraday fraction (to 16:00 ET on the expiry date). No trading-time or weekend-variance weighting; the replay measures the error this causes.
+- **A10** The fixes change research baselines. Each wave records before/after on one fixed reference study, not a zero-change proof.
+- **A11** Your manual trades from 2026-09-29 onward are outside the backfill window. A top-up Polygon run after the main run ends (you start it, same key) covers them. Until then the replay compares those trades to the model only, not to bars.
+- **A12** The other box's events (`prithvi_logs`) are used for decision parity only if they carry strikes, credit, spot and IV. W72 checks; otherwise it is registered.
+
+- **A13** (W77) The three W77 defaults are statement-measured and operator-changeable in `config_research.yaml`: pin band `$0.10` (refines A5), assignment fee `$0.015` per assigned
+  share, stock close commission `$0.01` per share. Exercise delivery carried no fee on the statement.
+
+**Status of each assumption (this entry's own analysis, checked against the wave entries):**
+
+| # | Status | Detail |
+|---|---|---|
+| A1 | HELD, tooling built | No historical NBBO; forward IB collection; bands 2 / 6 of 15 sessions. The "~2x too cheap" hypothesis was WITHDRAWN (W76 measurement). |
+| A2 | HELD as a default, not searched | Flatten default 60 min before the close; `flatten_minutes_before_close` is a flat dimension under the default take-profit ladder (W77/W79a). Operator-owned. |
+| A3 | AMENDED | Holds for PRICING (W74). Feature/gate look-ahead fixed in W78 for realistic + intraday entries; `_build_position` still receives `hist` including day D. |
+| A4 | PARTLY | Rule calendar used for all symbols; the engine does NOT pass the bar-derived expiry set (W74 shortfall 2). The "flagged in the manifest until bars exist" is not implemented as a separate flag. |
+| A5 | HELD, refined by A13 | Built in W77 (OCC $0.01 exercise threshold, $0.10 pin band, worst-of scenarios, next-open mark). Operator-owned. |
+| A6 | HELD, FAILING | Tolerances in the `parity:` block; the W72 replay fails them in every band with n >= 3 (a finding, not a shortfall). Operator-owned. |
+| A7 | AMENDED | Buckets are (1, 2, 3, 5, 7, 9, 14, 21, 30): 9 replaces 10 so live's 9-bar horizon is a bucket (W78). |
+| A8 | HELD | QQQ only; the SPY / IWM option backfill is not started (waits on QQQ, then about three weeks each). |
+| A9 | HELD | Calendar time with an intraday fraction; the replay measures the error. |
+| A10 | HELD with one correction | Each wave recorded before/after; the W74/W75 tables ran on the legacy % friction and were corrected in W76. Default research numbers recorded with the rise veto on are not directly comparable to runs after D9. |
+| A11 | OPEN | The Polygon top-up from 2026-09-28 (operator-run, after the main backfill) has not run; the replay compares those trades to the model only. |
+| A12 | UNVERIFIED | W72 was to check whether the other box's published events carry strikes, credit, spot and IV; no entry records the result. |
+| A13 | HELD | Defaults are the statement's measured rates. |
+
+### 7. Decisions: made, and left for the operator
+
+**DECIDED:**
+| # | Decision | Date | Effect |
+|---|---|---|---|
+| D1 | `backtest.engine_model: realistic` in the research overlay | 2026-10-12 | Every default research run now uses the realistic engine; legacy remains the schema default and is byte-identical. |
+| D8 | `backtest.friction_short_dte: true` in the research overlay | 2026-10-12 | 0-6 DTE legs are charged a conservative $0.01 per leg until a band has 15 sessions. |
+| D9 | The research IV-rank rise veto OFF behind `backtest.iv_rank_rise_gate`, code kept, re-enable bar written | 2026-10-13 | Default research runs take 3-6 more trades per symbol over 2.75 years; the threshold is not searched while off. |
+| - | W79 split into W79a (now) and W79b (data-dependent) | 2026-10-12 | See 5.8. |
+| - | Live wiring later; genuine live bugs fixed now; rule 3/3a to become a guard searched 0-5; no historical quotes assumed; manual trades persisted privately | 2026-10-11 | See the assessment entry. |
+
+**LEFT FOR THE OPERATOR** (recommendation / default if undecided / what it blocks):
+| # | Decision | Recommendation | Default | Blocks |
+|---|---|---|---|---|
+| D2 | `backtest.pricing_source: surface` (QQQ only) | YES, after the backfill finishes (about 2026-10-21) AND the rate re-solve; it removes the measured +1.4-1.9 vol-point richness and cuts price error 19-49% out of sample | stays `bs_legacy` | W79b |
+| D3 | Authorize W80 (live wiring) | After the W79b studies | NOT authorized | any live short-DTE trading |
+| D4 | Review A1-A13 (operator-owned: A2, A5, A6, A13) | Review | as written | W77 parameters, parity verdicts |
+| D5 | Account identifiers already present in OLDER PLAN.md entries (a paper account id near lines ~9504 and ~9545, a live-account id near line ~109; they predate this programme): leave, append a caution, or rewrite history on a shared file | Operator's call | left as is | exposure only |
+| D6 | The four phantom config keys (`trading.trading_hours_only`, `options.delta_range`, `meta_label.retrain_with_primary`, `exit.auto_hedge`): wire, delete or keep exempt; and whether the bare research harness should follow config | Decide each | registered, harmless | cleanliness only |
+| D7 | Whether and when to push / open a PR for the local commits | Operator's call | nothing pushed | sharing with the other box |
+| D10 (NEW) | Keep the research-only trending-down REGIME VETO (finding P2, section 8)? | Do not decide on instinct: W81 adds a switch (default unchanged) and an A/B; if it earns nothing out of sample, treat it like D9 (OFF behind the switch, code kept). Its evidence base in the code comment is 4 trades. | stays on, undocumented | trustworthy W79b numbers |
+| D11 (NEW) | Research vs live disagree on vol / VIX gates (P1 research-only realized-vol cap; P3 live-only VIX >= 28 halt): which side moves? | After the W81 A/B: add a research VIX-halt twin behind a switch so studies cannot earn P&L on days live refuses to trade; decide whether the research-only vol cap stays searched | no change | trustworthy W79b numbers |
+| - | Range-gate mode for the DTE study | OBSERVE as the primary run, ENFORCE as a sensitivity (the model abstains in 42-63% of windows and enforce fails them closed); the overlay currently ENFORCES | enforce | W79b |
+| - | Window design | About 24 months of surface-priced history: shorter training windows (about 126 days) and/or pool SPY + IWM; tell the assistant before W79b | n/a | W79b |
+| - | Start the SPY / IWM option backfill after QQQ finishes (about three weeks each) | YES | not started | multi-symbol W79b |
+| - | `ml.entry_gates_enabled` (live) | Unchanged: `false` by design (CLAUDE.md); flipping is the operator's call after a B1-style test | false | - |
+
+**OPERATOR ACTIONS** (only the operator can take them):
+1. **Restart onto the pending live code**: a FULL SUPERVISOR restart (W69/W70 ports and jobs, the W76 collection job) and the BOT (W69, W70, W73, W71b). RUNBOOK deploy checklist.
+2. **Enable the scheduled collection**: uncomment the `data_collection:` block at the bottom of `config.yaml`, set `short_dte_enabled: true`, SUPERVISOR restart. Until then, run the
+   collector by hand or via the waiter before 15:30 ET each session. **Keep TWS (paper) up and the Mac awake for the waiter's run at 15:30 ET on 2026-10-14.**
+3. **Let the option-bar backfill finish** (resumable; relaunch the same command if the box sleeps), then (a) the Polygon top-up from 2026-09-28 (A11), (b) the phase-B rate re-solve
+   (the assistant announces it first: it writes the research store), (c) optionally SPY and IWM bars. Then re-run `scripts/parity_replay.py` (the surface variant has n = 0 until
+   the bars cover the trade dates).
+4. Keep `data/replay/manual_trades_*.json` local and private; never paste its contents into PLAN.md or memory.
+
+
+### 8. The operator's three end-of-session questions (2026-10-13) and their answers
+
+Method of the audit: PLAN.md entry headers and tails; `build_parity_manifest` under the research overlay; every `_reject(...)` reason in `engine.py` cross-checked against live
+(`orchestrator.py`, `risk/manager.py`, `strategies/`); an AST scan of numeric literals on the research path; and one read-only incidence count over 2024-01..2026-10 (695 trading days;
+research daily bars plus VIX from Yahoo).
+
+**Question 1: Is PLAN.md up to date and does it contain all findings, updates, assumptions and decisions (made and left to the operator)?**
+Before this entry: every wave had its own entry (assessment, W72-W78, W79a, W71, W71b, W71c, W76b and its confirmation), with no placeholder or TBD, and the decisions D1, D8, D9 and
+assumptions A1-A13 were recorded. Three gaps existed, closed by this entry: (1) the open-decision list was scattered across NEXT lines (the last combined register was from after W76);
+(2) planned-versus-built and the amendment corrections lived only in the git-ignored brief; (3) this audit's findings (below) were not recorded.
+
+**Question 2: Is research at parity with live, or are there still discrepancies?**
+Not fully. For the 14-30 DTE iron condor that live trades today, research is far closer than before W72. Some differences are deliberate and shown by the parity manifest. **Three
+are not deliberate and the manifest did not show them** (found by this audit):
+
+| # | Mismatch | Where | Days it fires, 2024-01..2026-10, QQQ / SPY / IWM (695 days) |
+|---|---|---|---|
+| P1 | Research-only realized-vol cap: blocks an IC when 10-day RV exceeds `max_entry_vol_annual` (0.80; Optuna searches 0.25-0.90). **Live has no such gate.** | `engine.py` vol gate, `backtest.max_entry_vol_annual` | 5 / 0 / 0 at 0.80 |
+| P2 | Research-only trending-down REGIME veto: blocks when `vol_5 > vol_20` and price is more than 5% below its 20-day SMA. Thresholds are hard-coded with no switch. **Live uses regime only for the direction override, meta-label features and roll defense.** It is in no earlier PLAN entry. | `engine.py` regime gate (comment: "4 trending_down trades, 25% win rate") | 19 / 8 / 22 |
+| P3 | Live-only VIX halt (no new credit entries at VIX >= 28, `risk.credit_vix_halt`) plus VIX-tiered credit caps. **Research has neither.** | `risk/manager.py` | 18 days (2024-08, 2025-04, 2026-03) |
+| P4 | Research hard-codes `r = 0.05` at three engine sites; live reads `options.risk_free_rate`. Same value today; they diverge silently if the config changes. | `engine.py` | none today |
+| P5 | The parity manifest prints `wing_floor backtest=None` (it shows the argument default, not the resolved contract) and its live column repeats literals that duplicate `CONTRACT_DEFAULTS`. Display only. | `run_backtest.py` | display only |
+
+- Together, P1-P3 make research and live disagree on whether a condor may open on 18 / 18 / 26 days per symbol (2.6-3.7% of days). Those days cluster in exactly the stress episodes
+  that drive tail losses: research can refuse crash entries that live would take (P1, P2) and allow entries live refuses (P3). **The counts are whole-day approximations from closing
+  prices, not engine runs; their P&L effect has not been measured** (W81 measures it).
+- **Matched** (shared code or measured): exit rules (take-profit ladder, rule 3a via `exit_policy`); fractal gate (`ait.ml.regime_gate`); iv_rank level floor and cap (same data);
+  range horizon at live config; macro blackout; per-leg friction calibrated on IB quotes; condor-exempt direction gate (L5); the decision frame without look-ahead and concurrency at
+  the fill (W78).
+- **Deliberate, flagged by the manifest:** `gates_mode` enforce vs observe; `condor_any_direction`; `engine_model: realistic`; the short-DTE knobs (live cannot trade below its 14-DTE
+  floor until W80); **`pricing_source: bs_legacy` (D2 open) is the largest remaining modelling gap** (out-of-sample option-price error -19% to -49% by band).
+- **Registered earlier and still open:** the live 3-expiry cap, validator and 0-DTE greeks (W80); live's median-across-expiries IV persistence (W80); builders still receive day D's
+  `hist`; ex-dividend assignment; carried shares not margined; the meta shadow run has no range gate; the calendar/trading-day unit slip; SPY/IWM use the rule expiry calendar (A4);
+  account-level risk (circuit breaker, PDT, sizer) is not simulated and research caps at one contract.
+
+**Question 3: Are there lingering literals or hard-coded values not exposed to the user?**
+Yes, in four groups. Only the first affects parity.
+1. **Affect parity (fix or switch; W81):** the P2 regime thresholds (-0.05, +0.02, the expanding flag); the P4 `r = 0.05`; the 11-close lookback of the P1 gate (the threshold itself
+   is already config).
+2. **Shared by live and research, not tunable** (`execution/exit_policy.py`): `CREDIT_TP_LADDER`, `DEFAULT_TAKE_PROFIT`, `EXPIRY_APPROACHING_DTE = 5`, `MACRO_FLATTEN_WINDOW_DAYS`.
+   Parity-neutral. **The ladder matters for W79b:** at DTE <= 5 it takes profit at 20% of credit, which is why the flatten dimension measured flat. Recommendation: keep it a code
+   invariant (fixed limits in code, logged, in the RUNBOOK) and expose it as a research knob only if the W79b design wants to search it.
+3. **Structural, documented, meant to stay in code:** `EXERCISE_THRESHOLD_USD = 0.01` (the OCC rule); `RANGE_HORIZON_BUCKETS` (A7); `LIVE_RANGE_THRESHOLD_PCT` (the must-agree
+   pair); `TERMINAL_DTE_FLOOR`; the 10-day rise window and the 60-day high window (those gates are off).
+4. **Tooling:** the manifest literals (P5); the fixed set-ups of `dte_dimension_flatness.py` and `iv_rank_parity_probe.py` (fixed on purpose for reproducibility, documented in
+   their docstrings).
+**Already exposed in this programme:** the pin band, assignment fee and stock commission; the friction floor and minimum sessions; `short_dte_time_et`; `iv_rank_rise_gate`; the
+`dte_search` ranges; guard, fraction and flatten.
+
+### 9. What remains, in order
+
+1. **Operator, now:** keep TWS (paper) up and the Mac awake for the 15:30 ET collector run on 2026-10-14; decide when to restart the supervisor + bot (section 7, action 1) and
+   enable the scheduled collection (action 2).
+2. **W81 (approved with the 2026-10-13 plan; NOT started at this entry; research and tooling only; zero behaviour change at today's configuration, to be proved byte-identical on the
+   legacy and realistic reference runs).** (a) Manifest visibility: a row and a warning for every gate that exists on one side only (P1, P2, P3, plus the existing rise-veto row); fix the
+   `wing_floor` display; make the live column read `contract_float` / `CONTRACT_DEFAULTS` instead of literals. (b) P4: the three `r` sites read `options.risk_free_rate`, resolved once
+   in `__init__`. (c) P2 behind a switch (the W71c pattern): `backtest.regime_veto_gate`, schema default True so nothing moves, thresholds moved into `BacktestConfig`, the decision
+   still recorded when the gate is off; the overlay value is NOT changed (that is D10). (d) A realistic-engine A/B per symbol over 2024-01..2026-10 (the `iv_rank_parity_probe.py --ab`
+   harness): regime veto on vs off, and research with a simulated VIX >= 28 halt vs without, reporting trades, total and worst trade; record the numbers for D10 and D11. (e) An AST
+   class guard that fails when an engine `_reject` reason has neither a live twin nor a manifest row. (f) Tests, mutation check, count reconciliation, fast lane, typecheck,
+   `smoke_deploy` SMOKE PASS; commit pair `W81: ...` + `PLAN.md: record W81 ...`.
+3. **W79b** once D2 (about 2026-10-21 + the rate re-solve), the range-gate mode, the window design, the SPY / IWM backfill and the friction bands (about 2026-10-27 for 3-6 DTE, early
+   November for 0-2 DTE) are in place; always pass `--optimize-strict` for numbers that will be quoted; report the DTE distribution, not only the best trial.
+4. **W80** (live wiring) only after the studies and the operator's separate approval (D3).
+
+**NEXT.** W81 (section 9, item 2), unless the operator redirects. This entry is the programme's single source: wave entries that follow should state AS PLANNED / AS BUILT / SHORT OF
+INTENT in their own text, and the next consolidated state entry should supersede this one.
+
+---
+
+### Part B. The working brief, carried over verbatim (reference)
+
+The material below is the git-ignored brief's text, kept so nothing exists only on one machine. Sections already reproduced in section 5 (the wave bodies and the amendment) are not
+repeated; the rest follows.
+
+
+#### B1. Context: what exploration found, and the leads L1-L6 (brief "Context")
+
+**Goal.** Optuna walk-forward research finds the condor parameters: entry DTE anywhere in 0–45, max hold anywhere in 0..DTE, how far OTM, wing width. The bot then paper-trades the result and finally goes live. That only works if the research engine behaves like the live engine, and today it does not for short DTE.
+
+**What exploration found (verified by reading the code; leads still need an execution probe):**
+
+1. **Pricing.**
+   - Research prices every leg with Black-Scholes. Inputs: one constant-maturity IB IV per day plus a DTE-free skew, with `r = 0.05` hardcoded (`engine.py:2118`, `:2606`).
+   - During the hold, legs are re-marked from `0.7·entry_iv + 0.3·1.15·rv20`, not the stored IV.
+   - The 887k real QQQ option bars (Polygon aggregates, OHLCV, no bid/ask) are read by nothing in the engine.
+   - The backfill (PID 34852) is 57% done, about 10 more days to go. 887k rows still carry the `r = 0.05` placeholder.
+2. **Friction.** The v2 per-leg model was calibrated on 18 sessions of IB bid/ask bars at DTE 11–64. The sampler mask is DTE 7–45, so 0–6 DTE friction is extrapolation.
+3. **No settlement model.**
+   - No assignment, no pin, no 16:00 settlement.
+   - Expiry is `entry + N calendar days`, which can land on a weekend.
+   - On expiry day, `t` is floored at about 53 minutes from 09:30.
+4. **DTE is not searchable.**
+   - `entry_dte` is one instance value used for every reprice (`engine.py:2606`, `:2630`).
+   - Optuna never passes it (it is not in `bt_kwargs`).
+   - Walk-forward refuses `entry_dte` together with per-window optimization (`walkforward.py:244`).
+   - `max_hold_days` 1–9 assumes a 14-DTE entry.
+5. **Short DTE cannot happen at all.**
+   - DTE 0 gives an expected move of 0, so every build is rejected with `em_unavailable`, in research and live alike.
+   - DTE 1–5 entries are force-closed by rule 3a on the next bar.
+   - Exits run before entries each day, so a same-day round trip is impossible.
+6. **Gates.** The range-model horizon is `max(1, dte_range[0] − 5)`, a single horizon shared by every trial.
+7. **Live blockers (for W80).**
+   - The `dte_range` validator forbids 0.
+   - Live fetches only the 3 nearest expiries (`options_chain.py:761`).
+   - `min_dte or …` treats 0 as missing.
+   - Greeks use whole days with `t ≥ 0.001`.
+   - There is no expiry-day flatten.
+   - The reconciler uses the naive host date (`reconciler.py:495`).
+8. **Parity surface today.** `build_parity_manifest` compares parameters only. Nothing measures prices, fills or exits against reality.
+
+**Leads to probe in W72** (each needs both lenses before it becomes a finding):
+- **L1.** Per-window `delta_short` is searched by trials, but `WalkForwardConfig` has no such field, so the out-of-sample run uses config 0.20.
+- **L2.** The entry is recorded at a 10:30 intraday fill but priced at the daily close, and features and gates see that day's full bar (look-ahead).
+- **L3.** The daily path computes the take-profit `pnl_pct` before friction; the intraday path computes it after.
+- **L4.** The intraday exit scan ignores touch stops, so a later take-profit beats an earlier touch.
+- **L5.** Research invalidates condors on direction-model confidence; live exempts condors.
+- **L6.** IC long legs are priced at unrounded strikes but re-marked at rounded ones.
+
+**Operator decisions (2026-10-11):**
+- **Live timing:** shared rules now, live wiring later. Genuine live bugs are fixed now.
+- **Rule 3/3a:** becomes a guard for long-dated entries only, with a configurable threshold that Optuna searches over 0–5.
+- **Polygon:** aggregates only / not sure. Assume no historical quotes.
+- **Manual trades:** persist them under `data/replay/` and strip that data from Claude's memory.
+
+#### B2. Execution protocol (brief)
+
+- **Order.** Waves run in order. Each wave ends with a local commit pair (`W<n>: …` and `PLAN.md: record W<n> …`), an append-only PLAN entry (CHANGED / MEASURED / TESTS / REGISTERED NOT FIXED / NEXT) and its gates. **Nothing is pushed and nothing is restarted.**
+- **Check-in.** After W72 I report the replay results before continuing, since they may reorder W74–W77.
+- **Scope of approval.** Approving this plan authorizes W72–W79 only. **W80 (live wiring) needs your separate approval** after the studies run.
+- **Number.** W71 (iv_rank verification) stays reserved and is untouched. This programme starts at W72.
+- **First actions.** The plan is copied to `Plans4agent_next_session/`, then the PLAN.md assessment entry below is appended and committed on its own, both before any code changes.
+
+#### B3. Verification, every wave (brief)
+
+1. `python -m compileall -q src` and `python scripts/typecheck.py` (blocking).
+2. The wave's new tests, plus the existing parity tests:
+   - `test_r20_research_validity`
+   - `test_w70_wing_floor_and_research_parity`
+   - `test_w68_research_config`
+   - `test_w67_regime_gate`
+3. A mutation check of the new tests: a file-hash-restoring harness, as in W70. Every mutant must be caught.
+4. The fast lane at the ends of W74, W78 and W79, and for W73. **No source edits while the suite runs.**
+5. W73 also runs `smoke_deploy.py` and must print SMOKE PASS.
+6. From W74 on: re-run `scripts/parity_replay.py`. Each wave's PLAN entry shows error by band before and after, and **no band may regress** without an explanation.
+7. Live stores are opened read-only throughout. `historical.db` writes happen only in W75 (phase-B re-solve, announced first) and W76 (calibration rows, run by you).
+
+#### B4. Critical files (brief)
+
+- **Research:**
+  - `src/ait/backtesting/{engine.py, pricing.py, friction.py, walkforward.py}`
+  - new `{replay.py, iv_surface.py, expiry_calendar.py}`
+  - `src/ait/optimization/{param_spaces.py, optimizer.py}`
+  - `src/ait/ml/range_spec.py`
+  - `src/ait/data/{historical.py, option_spread_sampler.py}`
+  - `config_research.yaml`
+  - `scripts/{parity_replay.py, calibrate_option_spreads.py}`
+- **Shared pure modules:** `src/ait/execution/exit_policy.py`, `src/ait/utils/time.py`.
+- **Live (W73 only):** `src/ait/execution/reconciler.py`, `src/ait/data/options_chain.py`.
+
+#### B5. SUPERSEDED blocks of the brief (kept for the record)
+
+> **SUPERSEDED 2026-10-13 by this entry.** The brief's "OPERATOR CHECKLIST" is replaced by section 7; "Where this plan lives, and how a later session resumes it" described the
+> git-ignored brief as the working document, which this entry retires.
+
+
+Decisions: D1 DONE 2026-10-12 | D2 `pricing_source: surface` | D3 authorize W80 | D4 review A1-A12 (A2, A5, A6)
+| D5 account ids in OLD PLAN.md entries | D6 phantom keys + harness-follows-config | D7 push / PR for the local commits (45 ahead of origin/main on 2026-10-13) | D9 DONE 2026-10-13 (rise veto OFF behind `backtest.iv_rank_rise_gate`, code kept)
+| D8 DONE 2026-10-12.
+Actions: restart supervisor + bot (W69/W70/W73 pending) | enable the scheduled collection (uncomment `data_collection:` in config.yaml, `short_dte_enabled: true`, SUPERVISOR restart) | IB bid/ask collection >= 15 sessions (W76; tooling BUILT, see RUNBOOK "Short-DTE friction collection")
+| let the backfill finish (~9 days) then Polygon top-up from 2026-09-28, phase-B re-solve, optional SPY/IWM | keep data/replay private.
+
+This is a multi-session programme: **8 authorized waves (W72–W79)** plus W80 (live wiring, separate approval), preceded by one PLAN.md assessment entry.
+
+On approval, the first actions are, in order:
+1. Copy this plan to `Plans4agent_next_session/W72-W80_short_dte_parity_programme.md`. That folder is git-ignored (`.gitignore:42`) and already holds the W30 brief, so it is local and never reaches the other box.
+2. Append the PLAN.md assessment entry (section below) and commit it alone.
+3. The entry's NEXT line names the brief's path and the first unchecked wave below.
+
+**Roles.** PLAN.md is the append-only shared ledger of decisions and results. The brief is the working document and is edited as waves land (status table below). A new session starts from PLAN.md's tail, then opens the brief.
+
+| Wave | Scope | Status |
+|---|---|---|
+| Entry | PLAN.md assessment entry | [x] fd99601 |
+| W72 | Parity replay v1, lead probes L1–L6, data hygiene | [x] d82c3b4 + 3d0a3ee. L1–L6 all CONFIRMED. Awaiting operator check-in before W73. |
+| W73 | Live bug fixes (reconciler date, `min_dte or`, ±1 window) | [x] 75d6a5d + 6e36a0b (the ±1 window was not a separate defect) |
+| W74 | Engine: per-position expiry, real clock, exit semantics | [x] d003d47 + f5b0436. engine_model flip PENDING operator decision |
+| W75 | Real-bar IV surface pricer | [x] a8b4ca0 + 72a5235. pricing_source flip PENDING operator decision; replay-vs-real-fills waits on backfill |
+| W76 | Friction at 0–6 DTE | [x] tooling 85525c1 + f6333fd; scheduled job eafe548 + 831ba47 (default OFF). First real run done; collecting, band 3–6 at 4/15 sessions, 0–2 at 0 |
+| W77 | Settlement, assignment, overnight gap | [x] 91d32b3 + 8707a10. Realistic engine only; legacy byte-identical. Settlement is NOT reached under the default exit rules (see status log) |
+| W78 | Range gate per horizon | [x] f8df7a9 + ea5b3c3. + decision-frame look-ahead + concurrency at the fill. Range model abstains in 10-15/24 windows at every horizon |
+| W79 | Optuna searches DTE | W79a [x] (D1 + D8 flipped; plumbing, report, flatness check). W79b [ ] waits on D2, gate mode, window design, data |
+| W80 | Live wiring | not authorized |
+
+**Natural session boundaries.** W72 ends with a check-in on the replay results. W75 and W76 depend on the backfill (about 10 days) and on forward IB data collection, so they may wait on calendar time. W79 is the first wave that runs studies at scale.
+
+#### B6. The brief's STATUS LOG (verbatim; the dated wave entries above and in this ledger are the evidence)
+
+##### 2026-10-12: Entry + W72 done (local commits on W64-risk-retune, nothing pushed, nothing restarted)
+- Commits: `fd99601` (assessment), `d82c3b4` (W72 code), `3d0a3ee` (W72 PLAN entry).
+- Gates: fast lane 5363 passed / 0 failed; typecheck OK; smoke_deploy SMOKE PASS; 26/26 mutants caught.
+- **Where things live now:** replay file `data/replay/manual_trades_20260817_20261009.json` (git-ignored,
+  private); outputs `data/replay/out/<YYYYMMDD>/`; code `src/ait/backtesting/replay.py`,
+  `scripts/parity_replay.py`; pure condor pricing `src/ait/backtesting/pricing.py`
+  (`skewed_leg_iv`, `ic_leg_marks`); tolerances `parity:` in `config_research.yaml`.
+- **Deviation:** outputs under `data/replay/out/`, NOT `reports/` (reports/ is not git-ignored).
+- **W72 lead probes** (all CONFIRMED) are saved as the L1-L6 probe script (kept locally, not in git; every lead is now a regression test: L2-L6 in `tests/test_w74_engine_realism.py`, L1 in `tests/test_w79a_dte_search.py`); convert
+  to regression tests while fixing: L2-L6 in W74, L1 in W79.
+- **Headline numbers** (statistics only): entry-credit error fails tolerance in every band with n>=3;
+  sign flips with DTE (research too rich at 3-45 DTE, too cheap at 0-2 DTE); look-ahead (L2) halves the
+  0-2 DTE error when removed.
+- **Open for the operator before W73:** read the W72 PLAN entry; confirm W73-W79 order still stands.
+- **Reminders:** backfill (PID 34852) still running; W75/W76 wait on it and on forward IB bars;
+  W80 needs separate approval; never put per-trade prices/P&L or account ids in PLAN.md.
+
+##### 2026-10-12: W73 done (local commits, nothing pushed, nothing restarted)
+- `75d6a5d` code+tests, `6e36a0b` PLAN. Lane 5382 passed / 0 failed; smoke PASS; 7/7 mutants caught.
+- Fixed: reconciler expiry test -> today_et(); options_chain get_chain `or` -> `is None`.
+- Registered (ratchet test pins them): 3 naive `.now().date()` sites in orchestrator.py
+  (`_persist_daily_iv`, `_estimate_iv_rank`, `_true_up_commission`) -> carry into W71 (iv_rank).
+- DEPLOY: the two live files take effect at the next BOT restart (operator's call).
+- NEXT: W74 (research engine: per-position expiry, real clock, exit semantics, leads L2-L6).
+
+##### 2026-10-12: W74 done (local commits, nothing pushed, nothing restarted)
+- `d003d47` code+tests, `f5b0436` PLAN. Lane 5422 passed / 0 failed; smoke PASS; 28/28 mutants caught;
+  legacy engine byte-identical to the pre-W72 baseline (198 trades).
+- `backtest.engine_model` defaults `legacy` (schema AND config_research.yaml); `realistic` fixes L2-L6.
+  **Operator decision pending: flip it before W79?** A/B in the PLAN W74 entry.
+- Not fixed (registered): FEATURE/GATE look-ahead (features_cache rows include day D); a bare
+  Backtester is uncapped on contracts (research entry points cap at 1); legacy friction thresholds.
+- Things W75+ must know: `_remark_t(pos, days_held, as_of)` is the single re-mark clock;
+  `listed_expiry(entry, n, listed=None)` already accepts the real expiry set from the bars;
+  the three exit knobs resolve None -> backtest.* in every Backtester; W79 makes them searched.
+- Probes: the L1-L6 probe script (kept locally, not in git; every lead is now a regression test: L2-L6 in `tests/test_w74_engine_realism.py`, L1 in `tests/test_w79a_dte_search.py`) (L2-L6 now covered by tests/test_w74_*; L1 -> W79).
+- NEXT: W75 real-bar IV surface (backfill 88k/151k contracts; expiries ~to 2025-12 so far).
+
+##### 2026-10-12: W75 done (local commits, nothing pushed, nothing restarted)
+- `a8b4ca0` code+tests, `72a5235` PLAN. Lane 5464 passed / 0 failed; smoke PASS; 18/18 mutants caught;
+  legacy engine still byte-identical to the pre-W72 baseline.
+- `backtest.pricing_source` defaults `bs_legacy`. OOS bar-to-bar: median option-price error
+  -19% / -46% / -43% / -49% (1-2 / 3-7 / 8-14 / 15-45 DTE). **Decision pending: flip to `surface` (with engine_model).**
+- Surface is built from `option_daily_bars` DTE>=1 rows (0-DTE close IVs are meaningless). Cache:
+  `data/research_cache/iv_surface_QQQ.{parquet,json}` rebuilds when the backfill appends rows.
+- Replay `surface` variant exists but has n=0 until bars cover Aug-Sep 2026 (backfill still ~88k/151k;
+  trades from 2026-09-28 need the operator-run Polygon top-up, A11). RE-RUN `scripts/parity_replay.py`
+  when `max(date)` in option_daily_bars passes 2026-09-25 (check `data/backfill_option_history_status.json`).
+- Roll bias (next-day IV above prior smile near expiry) is quantified, not modelled (adjustment did not
+  improve price error out of sample).
+- Reference A/B (surface vs bs_legacy, realistic engine, 2025): surface pricing is LESS favourable at 1-3 DTE.
+- NEXT: W76 friction at 0-6 DTE. Needs forward IB bid/ask bars (operator-run, TWS/Gateway):
+  `scripts/calibrate_option_spreads.py --source ib-bars` with the sampler extended to DTE 0-6.
+
+##### 2026-10-12: W76 done (local commits, nothing pushed, nothing restarted)
+- `85525c1` code+tests, `f6333fd` PLAN (incl. a CORRECTION of the W74/W75 reference tables), register update after it.
+- **The W74/W75 tables were run on the LEGACY % friction model** (db_path was a str). Corrected numbers are in the W76
+  PLAN entry; the engine now coerces db_path to Path and every study script must ASSERT bt._leg_spread_model is not None.
+- Collector: `python scripts/calibrate_option_spreads.py --source ib-bars --short-dte --symbols QQQ --port 4002 --client-id 91 [--dry-run]`.
+  Verified only against a fake broker. Output: per-DTE coverage + per-band "collecting N/15 sessions".
+- Engine: `backtest.friction_short_dte` (default off) + `friction_min_sessions_per_band` 15 + `friction_extrapolated_floor_usd` 0.01.
+- D8 pending: turn friction_short_dte ON in config_research.yaml (recommended).
+- NEXT: W77 settlement/assignment/overnight gap (no external dependency).
+
+##### 2026-10-12 (later): W76 follow-up 2 done: supervisor-run collection job (default OFF) + first real run
+- `eafe548` job (master.py: needs a SUPERVISOR RESTART), `831ba47` (PLAN). To enable: uncomment the
+  `data_collection:` block at the bottom of config.yaml, set short_dte_enabled: true, restart the supervisor.
+- First real collection (operator): 3,336 samples, 82/85 contracts, 31 min. Band 3-6: 4/15 sessions. DTE 0-2: 0
+  samples so far (they accrue from this week's sessions; DTE 0 only on an expiry day while listed).
+- MEASURED: condor-relevant legs at 3-6 DTE have half-spread $0.005-0.010 (1.0-1.2x the all-DTE model,
+  0.5-1.0x the $0.01 floor). The "extrapolation is ~2x too cheap" hypothesis is WITHDRAWN.
+- Process note: unquoted heredocs execute backticks. Write ledger text via a quoted heredoc or the Write tool.
+
+
+##### 2026-10-12 (later): W77 done (local commits, nothing pushed, nothing restarted)
+- `91d32b3` code+tests+RUNBOOK, `8707a10` PLAN. Fast lane 5610 passed / 45 skipped / 0 failed; smoke PASS; typecheck OK; 35/35 mutants caught;
+  legacy engine byte-identical to the pre-W72 baseline (six variants).
+- **Where things live:** `src/ait/backtesting/settlement.py` (pure rules), engine `_settle_at_bell` / `_close_pending_settlement` / `_finish_settlement`
+  (rule 3b hook), config `backtest.pin_band_usd / assignment_fee_per_share / stock_commission_per_share`, replay `settlement_replay`,
+  `LIVE_REASON_TO_RESEARCH`, `scripts/parity_replay.py` "Expiry settlement parity" section.
+- **Deviation:** the reconciler helper was NOT moved (flagged file); a 600-case parity test pins `settlement_cost` == `_structure_intrinsic` instead.
+  Assignment fee only on assigned shares (exercise delivery was free on the statement).
+- **MEASURED:** replay 32/32 leg outcomes, 9/9 net shares (10 structures reached expiry, 1 without next-open data); the model marks the open, one trader waited 308 min.
+  Default exit rules: ZERO bell exits at 0/1/3 DTE, flatten 60 == OFF. TP off + touch off: gap tail appears (see PLAN W77 entry table).
+- **Not comparable:** pending positions keep their slot overnight, so trade counts fall at 1 and 3 DTE in the TP-off+touch-off rows (209 -> 156, 87 -> 81).
+- **Registered:** ordering artifact (correction 8), flat flatten dimension (correction 7), carried shares not margined, ex-div assignment, non-credit `expiry` sites.
+- NEXT: W78 range gate per horizon + feature/gate look-ahead (correction 4) + the ordering artifact (correction 8, at least quantified). W79 needs D1, D2, D8.
+
+
+##### 2026-10-12 (later still): W78 done (local commits, nothing pushed, nothing restarted)
+- `f8df7a9` code+tests+RUNBOOK, `ea5b3c3` PLAN. Fast lane 5649 passed / 46 skipped / 0 failed; smoke PASS; typecheck OK; 34/34 mutants caught
+  (2 first-pass survivors were real test gaps); legacy byte-identical (six variants).
+- **Where things live:** `ait.ml.range_spec` (`horizon_for`, `bucket_for`, `RANGE_HORIZON_BUCKETS`), `ait.backtesting.range_bank.RangeModelBank`,
+  walk-forward `_range_label_horizon(entry_dte)` / `_range_bucket` / `_pick_range_model` / `_train_range_bucket`, optimizer `range_predictor_provider`,
+  engine `hist_dec` / `_dec_lag` / `_exit_instant` / `closed_today`, `scripts/range_horizon_study.py`.
+- **For W79:** `bt_kwargs` needs `entry_dte` (the optimizer hook is already there and is consulted per trial); `WalkForwardConfig` needs `expiry_guard_dte`,
+  `max_hold_fraction` (the horizon function already reads them with getattr); lift the `entry_dte` per-window refusal (`walkforward.py` ~244).
+- **MEASURED:** decision frame lowers all five reference rows (-$0.1k..-$1.1k); concurrency removes every overlap and blocks 6-9% of entries at 3-14 DTE (totals
+  +$0.1k..+$2.4k, not significant). Range model: abstains in 10-15 of 24 windows at EVERY horizon; at the shipped 9 bars there is no OOS lift (0.62 vs 0.62 base); modest
+  lift at 2-5 bars; Brier skill negative everywhere; floors for equal pass-rate range 0.11-0.89. Unit slip: no detectable effect (pass-rate moves ~3 points).
+  Train cost ~0.7-1.0 s per model.
+- **Operator decision for W79:** DTE study with the range gate in OBSERVE as primary, ENFORCE as sensitivity (research overlay currently enforces).
+- **Registered:** unit slip (W80), 0-DTE bucket 1, floor per bucket (W79 design), meta shadow run without a range gate, abstention rate, bar-start `exit_time` granularity,
+  builders still receive `hist` incl. day D (pricing uses fill_ctx).
+- NEXT: W79 (needs D1, D2, D8). First step there: show `flatten_minutes_before_close`, `max_hold_fraction`, `expiry_guard_dte` are not flat dimensions under the default TP ladder.
+
+
+##### 2026-10-12 (night): W79a done (local commits, nothing pushed, nothing restarted)
+- `e7373a0` PLAN (decisions + findings), `1751e10` code+tests+RUNBOOK, PLAN entry after it. Fast lane 5705 passed / 46 skipped / 0 failed; smoke PASS;
+  typecheck OK; 31/31 mutants caught (2 first-pass survivors closed); legacy byte-identical; `IRON_CONDOR_SPACE` unchanged.
+- **Done:** D1 + D8 in `config_research.yaml` (pricing_source still bs_legacy); `DteSearchConfig` (opt-in `--search-dte`); guard / fraction / flatten /
+  delta_short baselines reach every trial and the OOS + shadow engines (L1 fixed); failed windows counted, `--optimize-strict` raises; range model routed by the
+  window's own DTE/guard/fraction; `ait.backtesting.dte_report`; `scripts/dte_dimension_flatness.py`.
+- **MEASURED:** flatten FLAT at every DTE (not searched); guard moves only at entries <= its range (conditional sampling); fraction moves except at 1 DTE;
+  delta_short and wing_k move everywhere. Wiring smoke ran 5 trials end to end in strict mode (DTE 16 chosen; OOS took no trades: wiring check only).
+- **W79b needs (operator):** D2 after the backfill (~2026-10-21) + rate re-solve; range-gate mode (observe primary, enforce sensitivity); window design
+  (~24 months of surface-priced history: shorter training windows and/or SPY + IWM); start the SPY / IWM backfill after QQQ; friction bands ACTIVE (~early Nov).
+- NEXT: W79b, or W80 prep (needs D3).
+
+
+##### 2026-10-13: W71 + W71b done (local commits, nothing pushed, nothing restarted)
+- `9520dc3` PLAN (scope + findings), `4f35fcd` code+tests+RUNBOOK, PLAN entry after it. Fast lane 5729 passed / 45 skipped on the final tree (one host-date-pinned test fixed after);
+  smoke PASS; typecheck OK; 20/20 mutants caught (5 first-pass survivors closed); legacy byte-identical; `IRON_CONDOR_SPACE` unchanged.
+- **FOUND:** live has NO IV-rank rise veto (AST-pinned). The research veto reads a realized-vol range rank that correlates 0.46-0.63 with live's stored-IV percentile and sits on the
+  other side of live's floor/cap 34-42% of days; 45-58% of its blocked days live already refuses; the rest (4.5-5.4% of tradeable days) live would trade. On realistic-engine A/B it
+  removes 3-6 trades per symbol and is slightly negative (-$0.4k / -$0.02k / -$0.07k, inside noise). Research IV and live stored IV are the same data (corr 1.000; 2-5 days differ).
+- **W71b (live file):** orchestrator `_persist_daily_iv`, `_estimate_iv_rank` age and `_true_up_commission` marker use `today_et()`; takes effect at the next bot start. Ratchet = whole tree zero.
+- **Process catches:** the first W73 ratchet rewrite deleted a 7-test class (caught by count reconciliation); two older tests pinned the host date and failed after host midnight (fixed to ET).
+- **D9 execution needs two things:** overlay `iv_rank_rise_threshold: 10` AND an optimizer drop-when-disabled rule (the searched 0.25-0.60 would re-enable it). Not built yet.
+- NEXT: D9, then W79b (needs D2 ~2026-10-21, gate mode, window design, SPY/IWM backfill).
+
+
+##### 2026-10-13 (later): W71c done: D9 executed (local commits, nothing pushed, nothing restarted)
+- `d819d50` code+tests+RUNBOOK, PLAN entry after it. Fast lane 5748 passed / 46 skipped / 1 failed (a live-side guard caught a file name in a schema description; fixed, related suites 90 passed);
+  smoke PASS; typecheck OK; 14/14 mutants caught; legacy byte-identical; collected tests 5774 -> 5794 = +20 exactly.
+- **Switch:** `backtest.iv_rank_rise_gate` (schema default True; `config_research.yaml` sets False). Code, 0.30 threshold and its 0.25-0.60 range kept; the rise is still recorded per
+  entry (`iv_rank_rise_10d`); while off the optimizer does not search the threshold (closes the trap: a searched value re-enabled an "off" overlay).
+- **Re-enable bar** (written in the overlay and the ledger): multi-window walk-forward, gate ON vs OFF, same windows/engine/pricing/friction, out-of-sample gain beyond noise on days live's
+  level gates would have traded; if it earns its place, port it to live too (W80-class).
+- NEXT: W79b (needs D2 ~2026-10-21, gate mode, window design, SPY/IWM backfill).
+
+---
+
