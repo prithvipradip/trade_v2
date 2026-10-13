@@ -237,16 +237,19 @@ class TestReadOnlyIntradayAdapter:
 ALLOWED_DIRS = ("backtesting/", "optimization/", "config/")
 
 
+GATE_NAMES = ("iv_rank_rise_threshold", "iv_rank_rise_gate")     # W71c: the switch is research-only too
+
+
 def _readers(source: str) -> bool:
     tree = ast.parse(source)
     for n in ast.walk(tree):
-        if isinstance(n, ast.Attribute) and n.attr == "iv_rank_rise_threshold":
+        if isinstance(n, ast.Attribute) and n.attr in GATE_NAMES:
             return True
-        if isinstance(n, ast.keyword) and n.arg == "iv_rank_rise_threshold":
+        if isinstance(n, ast.keyword) and n.arg in GATE_NAMES:
             return True
-        if isinstance(n, ast.Name) and n.id == "iv_rank_rise_threshold":
+        if isinstance(n, ast.Name) and n.id in GATE_NAMES:
             return True
-        if isinstance(n, ast.Constant) and n.value == "iv_rank_rise_threshold":
+        if isinstance(n, ast.Constant) and n.value in GATE_NAMES:
             return True
     return False
 
@@ -270,7 +273,8 @@ class TestLiveHasNoRiseVeto:
 
     def test_the_detector_sees_every_shape(self):
         for src in ("x = s.iv_rank_rise_threshold", "f(iv_rank_rise_threshold=0.3)",
-                    "iv_rank_rise_threshold = 0.3", "d['iv_rank_rise_threshold']"):
+                    "iv_rank_rise_threshold = 0.3", "d['iv_rank_rise_threshold']",
+                    "x = s.iv_rank_rise_gate", "f(iv_rank_rise_gate=False)"):
             assert _readers(src), src
         assert not _readers("x = s.iv_rank_cap")
 

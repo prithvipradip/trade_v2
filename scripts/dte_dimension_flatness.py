@@ -88,7 +88,7 @@ def _run_one(task: dict) -> dict:
         intraday_store=_ReadOnlyIntraday(DB, task["symbol"]), symbol=task["symbol"],
         friction_model="per_leg_usd", db_path=DB, gates_mode="observe", max_contracts_per_trade=1,
         max_concurrent_positions=1, hurst_hard_veto_multiplier=0.0, hurst_regime_threshold=0.0,
-        iv_rank_rise_threshold=10.0, iv_floor=0.05, ic_min_credit=0.30, ic_min_credit_width=0.05,
+        iv_rank_rise_gate=False, iv_floor=0.05, ic_min_credit=0.30, ic_min_credit_width=0.05,
         entry_window_start_et="10:30", entry_window_end_et="15:30", scan_interval_minutes=60,
         engine_model="realistic", friction_short_dte=True, pricing_source="bs_legacy",
         entry_dte=task["dte"],

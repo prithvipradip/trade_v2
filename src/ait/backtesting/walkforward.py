@@ -158,6 +158,7 @@ class WalkForwardConfig:
     # frozen value straight into the OOS Backtester. None -> __post_init__
     # resolves load_settings().backtest.iv_rank_rise_threshold.
     iv_rank_rise_threshold: float | None = None  # Exp 20: suppress IC entry when IV rank rose > this over last 10 days
+    iv_rank_rise_gate: bool | None = None        # W71c: None -> backtest.iv_rank_rise_gate (research-only veto on/off)
     pct_from_60d_high_threshold: float = -1.0 # Exp 27: suppress IC entry when price is this far below 60d rolling high (-1.0 = disabled)
     # R20b review follow-up: same defect class as iv_rank_rise_threshold above.
     min_edge_over_baseline: float | None = None  # Exp 28: min weighted CV edge for range predictor to activate (0.0 = always use, higher = stricter quality gate)
@@ -339,6 +340,8 @@ class WalkForwardConfig:
             self.gates_mode, "backtest", "gates_mode", BacktestConfig, _settings))
         self.iv_rank_gate = bool(resolve_config_value(
             self.iv_rank_gate, "backtest", "iv_rank_gate", BacktestConfig, _settings))
+        self.iv_rank_rise_gate = bool(resolve_config_value(     # W71c
+            self.iv_rank_rise_gate, "backtest", "iv_rank_rise_gate", BacktestConfig, _settings))
         self.penalty_on_range_prob = float(resolve_config_value(
             self.penalty_on_range_prob, "backtest", "penalty_on_range_prob",
             BacktestConfig, _settings))
@@ -1710,6 +1713,7 @@ class WalkForwardBacktester:
                 friction_stress_multiplier=window_cfg.friction_stress_multiplier,
                 gates_mode=window_cfg.gates_mode,
                 iv_rank_gate=window_cfg.iv_rank_gate,
+                iv_rank_rise_gate=window_cfg.iv_rank_rise_gate,          # W71c
                 iv_rank_series=self._iv_rank_series.get(symbol),
                 fractal_veto_spread=window_cfg.fractal_veto_spread,
                 penalty_on_range_prob=window_cfg.penalty_on_range_prob,
@@ -2082,6 +2086,7 @@ class WalkForwardBacktester:
                     friction_stress_multiplier=self._config.friction_stress_multiplier,
                     gates_mode=self._config.gates_mode,
                     iv_rank_gate=self._config.iv_rank_gate,
+                    iv_rank_rise_gate=self._config.iv_rank_rise_gate,    # W71c
                     iv_rank_series=self._iv_rank_series,
                     fractal_veto_spread=self._config.fractal_veto_spread,
                     penalty_on_range_prob=self._config.penalty_on_range_prob,
@@ -2983,6 +2988,7 @@ class WalkForwardBacktester:
                 friction_stress_multiplier=window_cfg.friction_stress_multiplier,
                 gates_mode=window_cfg.gates_mode,
                 iv_rank_gate=window_cfg.iv_rank_gate,
+                iv_rank_rise_gate=window_cfg.iv_rank_rise_gate,          # W71c
                 iv_rank_series=self._iv_rank_series.get(symbol),
                 fractal_veto_spread=window_cfg.fractal_veto_spread,
                 penalty_on_range_prob=window_cfg.penalty_on_range_prob,

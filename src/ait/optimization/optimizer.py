@@ -111,6 +111,7 @@ class StrategyOptimizer:
         friction_stress_multiplier: float | None = None,
         gates_mode: str | None = None,               # W67 gate parity (None -> config)
         iv_rank_gate: bool | None = None,            # W68 IV-rank parity (None -> config)
+        iv_rank_rise_gate: bool | None = None,       # W71c research-only rise veto on/off (None -> config)
         iv_rank_series: dict | None = None,          # W68 {symbol: rank by date}, full history
         fractal_veto_spread: float | None = None,
         penalty_on_range_prob: float | None = None,
@@ -272,6 +273,8 @@ class StrategyOptimizer:
         self._gates_mode = str(_rcv(gates_mode, "backtest", "gates_mode", _BTC2, self._settings))
         self._iv_rank_gate = bool(_rcv(
             iv_rank_gate, "backtest", "iv_rank_gate", _BTC2, self._settings))
+        self._iv_rank_rise_gate = bool(_rcv(
+            iv_rank_rise_gate, "backtest", "iv_rank_rise_gate", _BTC2, self._settings))
         # W70: were literals 5.0 / 0.0 / 0.80 (and trailing 0.25, breakeven 0.30, delta 0.20 /
         # 0.30 in _run_backtest's bt_kwargs); the wing floor moves 5.0 -> 2.0 (live parity).
         # W70: the SAME contract call live uses (AIT_IC_WING_FLOOR) — live AND research.
@@ -532,6 +535,19 @@ class StrategyOptimizer:
                      dropped=sorted(_fractal),
                      note="condor-only strategy set and penalty_on_range_prob=0: the fractal "
                           "penalty cannot change any entry")
+        # W71c: with the research-only rise veto switched OFF the threshold cannot change a result,
+        # and a searched value would otherwise be applied through the override loop (the dimension
+        # is searched 0.25-0.60 whatever the baseline says). IRON_CONDOR_SPACE keeps the dimension
+        # for the day the gate is turned back on.
+        if not self._iv_rank_rise_gate:
+            _rise = {f"{st}__iv_rank_rise_threshold" for st in self._strategies
+                     if "iv_rank_rise_threshold" in STRATEGY_SPACES.get(st, {})}
+            if _rise:
+                self._dropped_params |= _rise
+                log.info("optimizer_dropped_inert_param", param="iv_rank_rise_threshold",
+                         dropped=sorted(_rise),
+                         note="backtest.iv_rank_rise_gate is false: the veto is off, so the "
+                              "threshold cannot change any entry")
         if not self._budget_aware_wings or "iron_condor" not in self._strategies:
             return
         spec = STRATEGY_SPACES.get("iron_condor", {}).get("wing_k")
@@ -681,6 +697,7 @@ class StrategyOptimizer:
             # gate the OOS run never applied -- Optuna optimized under the wrong rules.
             "gates_mode":            self._gates_mode,
             "iv_rank_gate":          self._iv_rank_gate,
+            "iv_rank_rise_gate":     self._iv_rank_rise_gate,    # W71c
             "fractal_veto_spread":   self._fractal_veto_spread,
             "penalty_on_range_prob": self._penalty_on_range_prob,
             "max_contracts_per_trade": self._max_contracts_per_trade,

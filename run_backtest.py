@@ -289,14 +289,17 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
     # W71: the research rise veto has no live counterpart (live gates on the rank LEVEL only:
     # floor 15, cap 85). It is a declared research-only deviation until the operator decides.
     _rise = getattr(_bt_cfg, "iv_rank_rise_threshold", None)
+    _rise_gate = bool(getattr(_bt_cfg, "iv_rank_rise_gate", True))
     backtest["iv_rank_rise_threshold"] = _rise
-    if _rise is not None and float(_rise) <= 1.0:
+    backtest["iv_rank_rise_gate"] = _rise_gate
+    if _rise_gate and _rise is not None and float(_rise) <= 1.0:
         warnings.append(
             f"iv_rank_rise_threshold: {float(_rise):g} - RESEARCH-ONLY gate: entries are blocked when "
             "the feature-engine iv_rank (a realized-vol range rank) rose by more than this over 10 "
             "rows. Live has no such veto (it gates on the stored-IV percentile LEVEL, floor 15 / cap "
-            "85). Set backtest.iv_rank_rise_threshold >= 10 in config_research.yaml to remove it; "
-            "see scripts/iv_rank_parity_probe.py and the W71 PLAN entry.")
+            "85). Set backtest.iv_rank_rise_gate: false in config_research.yaml to turn it off (the "
+            "code and the threshold are kept; the bar for re-enabling it is written there); see "
+            "scripts/iv_rank_parity_probe.py and the W71 / W71c PLAN entries.")
 
     notes = [
         # R16: this note used to hardcode a 4-day pre-event window; the

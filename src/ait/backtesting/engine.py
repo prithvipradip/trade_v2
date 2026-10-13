@@ -213,6 +213,7 @@ class Backtester:
         hurst_hard_veto_multiplier: float | None = None,
         multifractal_max_width: float | None = None,
         iv_rank_rise_threshold: float | None = None,
+        iv_rank_rise_gate: bool | None = None,          # W71c: None -> backtest.iv_rank_rise_gate
         pct_from_60d_high_threshold: float | None = None,
         min_edge_over_baseline: float | None = None,
         features_cache: pd.DataFrame | None = None,
@@ -409,6 +410,7 @@ class Backtester:
         hurst_hard_veto_multiplier = float(_bt(hurst_hard_veto_multiplier, "hurst_hard_veto_multiplier"))
         multifractal_max_width = float(_bt(multifractal_max_width, "multifractal_max_width"))
         iv_rank_rise_threshold = float(_bt(iv_rank_rise_threshold, "iv_rank_rise_threshold"))
+        iv_rank_rise_gate = bool(_bt(iv_rank_rise_gate, "iv_rank_rise_gate"))
         pct_from_60d_high_threshold = float(_bt(pct_from_60d_high_threshold, "pct_from_60d_high_threshold"))
         min_edge_over_baseline = float(_bt(min_edge_over_baseline, "min_edge_over_baseline"))
         max_entry_vol_annual = float(_bt(max_entry_vol_annual, "max_entry_vol_annual"))
@@ -508,6 +510,7 @@ class Backtester:
             penalty_on_range_prob=float(penalty_on_range_prob),
             shape=SHAPE_PROPORTIONAL)  # the engine's historical shape; live uses live_flat
         self._iv_rank_rise_threshold = iv_rank_rise_threshold
+        self._iv_rank_rise_gate = iv_rank_rise_gate     # W71c: False = no veto; the rise is still logged
         self._pct_from_60d_high_threshold = pct_from_60d_high_threshold
         self._min_edge_over_baseline = min_edge_over_baseline
         self._features_cache = features_cache
@@ -1170,12 +1173,14 @@ class Backtester:
             # Rising IV rank filter: if IV rank has risen by more than iv_rank_rise_threshold
             # over the last 10 days, market is in directional stress — skip iron condor entry.
             # Rise value is always logged (not just on veto) for threshold tuning.
+            # W71c: backtest.iv_rank_rise_gate=False skips the VETO only (research-only gate; live
+            # has none): the rise is still computed and recorded so a study can evaluate it later.
             if strategy in NEUTRAL_CREDIT_GATED and not features_df.empty:
                 if "iv_rank" in features_df.columns and len(features_df) >= 11:
                     iv_rank_series = features_df["iv_rank"].iloc[-11:]
                     iv_rank_rise = float(iv_rank_series.iloc[-1]) - float(iv_rank_series.iloc[0])
                     _entry_decision["iv_rank_rise_10d"] = round(iv_rank_rise, 4)
-                    if iv_rank_rise > self._iv_rank_rise_threshold:
+                    if self._iv_rank_rise_gate and iv_rank_rise > self._iv_rank_rise_threshold:
                         _entry_decision["iv_rank_veto"] = {
                             "rise": round(iv_rank_rise, 4),
                             "threshold": self._iv_rank_rise_threshold,

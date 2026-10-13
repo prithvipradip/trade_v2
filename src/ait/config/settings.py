@@ -951,10 +951,20 @@ class BacktestConfig(_StrictModel):
         description="W77: $/share to close shares left over after a one-sided expiry at "
                     "the next session's open. Measured 0.0100 on the same statement. "
                     "Realistic engine only.")
+    iv_rank_rise_gate: bool = Field(default=True,
+        description="W71c: apply the IV-rank RISE veto at all. RESEARCH-ONLY: live has no such "
+                    "veto (it gates on the stored-IV percentile LEVEL, condor floor 15 / credit "
+                    "cap 85). False skips the veto but the rise is still computed and recorded "
+                    "per entry (iv_rank_rise_10d), and the optimizer stops searching "
+                    "iv_rank_rise_threshold (a searched value would otherwise re-enable the "
+                    "gate per trial). Schema default True so a bare Backtester and every "
+                    "regression baseline are unchanged; the research overlay sets False "
+                    "(operator decision D9, PLAN.md W71) together with the bar for turning it "
+                    "back on.")
     iv_rank_rise_threshold: float = Field(default=0.30, ge=0.0, le=10.0,
         description="R20b: suppress iron-condor entry when IV rank rose more than "
                     "this over the last 10 days (Exp 20 veto). Values > 1 disable "
-                    "the veto (IV rank is 0-1).")
+                    "the veto (IV rank is 0-1). Ignored while iv_rank_rise_gate is false.")
     min_edge_over_baseline: float = Field(default=0.05, ge=0.0, le=1.0,
         description="R20b: minimum weighted CV edge over the base rate for the "
                     "range predictor to activate as an entry gate (Exp 28 quality "

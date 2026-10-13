@@ -129,28 +129,28 @@ def _arm(task: dict) -> dict:
         entry_window_end_et="15:30", scan_interval_minutes=60, engine_model="realistic",
         friction_short_dte=True, pricing_source="bs_legacy", entry_dte=14,
         iv_rank_gate=True, iv_rank_series=iv_rank_series(frame["implied_vol"]),
-        iv_rank_rise_threshold=task["threshold"],
+        iv_rank_rise_gate=bool(task["gate"]), iv_rank_rise_threshold=task["threshold"],
     )
     assert bt._leg_spread_model is not None and bt._friction_bands is not None
     tr = bt.run().trades
     pnl = [float(t.get("pnl", 0.0)) for t in tr]
     f = dict(bt._funnel)
-    return {"symbol": task["symbol"], "threshold": task["threshold"], "n": len(tr),
+    return {"symbol": task["symbol"], "threshold": task["threshold"], "gate": task["gate"], "n": len(tr),
             "win": (sum(p > 0 for p in pnl) / len(pnl)) if pnl else 0.0, "total": round(sum(pnl), 2),
             "rise_days": f.get("iv_rank_rise", 0), "rank_floor_days": f.get("iv_rank_floor", 0),
             "rank_cap_days": f.get("iv_rank_cap", 0), "days": f.get("days_evaluated", 0)}
 
 
 def ab(symbols: list[str], threshold: float, start: str, end: str, workers: int) -> None:
-    tasks = [{"symbol": s, "threshold": t, "start": start, "end": end}
-             for s in symbols for t in (threshold, 10.0)]
+    tasks = [{"symbol": s, "threshold": threshold, "gate": g, "start": start, "end": end}
+             for s in symbols for g in (True, False)]
     print(f"\n## 4. Realistic-engine A/B of the rise veto ({start}..{end}, entry DTE 14, 1 contract)\n")
     with ProcessPoolExecutor(max_workers=workers) as ex:
         res = list(ex.map(_arm, tasks))
     print("| symbol | veto | trades | win % | total $ | days vetoed by the rise gate | days at live floor | days at live cap |")
     print("|---|---|---|---|---|---|---|---|")
     for r in res:
-        arm = "ON " + f"{r['threshold']:g}" if r["threshold"] <= 1 else "OFF"
+        arm = f"ON {r['threshold']:g}" if r["gate"] else "OFF"
         print(f"| {r['symbol']} | {arm} | {r['n']} | {r['win']:.0%} | {r['total']:,.0f} | {r['rise_days']} | "
               f"{r['rank_floor_days']} | {r['rank_cap_days']} |")
     print("\nA difference of a few $k over ~60-120 trades per arm is inside the noise; the decision rests on parity.")

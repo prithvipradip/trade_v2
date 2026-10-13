@@ -319,8 +319,14 @@ python scripts/parity_replay.py                 # reads data/replay/manual_trade
 - **Measure it:** `python scripts/iv_rank_parity_probe.py [--ab --workers 6]` (read-only; seconds for
   the series comparison, minutes for the engine A/B). It reports how the two ranks relate, how many of
   the veto's days live would have refused anyway and how many are days live WOULD trade.
-- **Remove it from a study:** set `backtest.iv_rank_rise_threshold: 10` (any value >= 1 disables it) in
-  `config_research.yaml`. The parity manifest prints a RESEARCH-ONLY warning while it is active.
+- **It is OFF in research (W71c, decision D9):** `backtest.iv_rank_rise_gate: false` in
+  `config_research.yaml`. The code, the 0.30 threshold and its 0.25-0.60 search range are kept; while
+  the gate is off the rise is still recorded per entry (`iv_rank_rise_10d`) and the optimizer does not
+  search the threshold. The parity manifest prints a RESEARCH-ONLY warning only while it is ON.
+- **The bar for turning it back on** (also written next to the key): a MULTI-WINDOW walk-forward with
+  the gate ON vs OFF, same windows / engine / pricing / friction (`iv_rank_parity_probe.py --ab` is
+  the starting tool), showing an OUT-OF-SAMPLE gain beyond the window-to-window noise on days live's
+  level gates would have TRADED. If it earns its place, port it to live as well (W80-class).
 - The research IV series and live's stored series are the same IB historical IV except on the few days
   live's own scan wrote (a median across expiries), so the level gates are at parity.
 

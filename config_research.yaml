@@ -47,6 +47,27 @@ backtest:
                                        # flip the fitted all-DTE model was EXTRAPOLATED below 11 DTE.
                                        # pricing_source stays bs_legacy: D2 waits for the option-bar backfill.
 
+  # --- W71c: the IV-rank RISE veto is OFF in research (operator decision D9, 2026-10-13) ---
+  iv_rank_rise_gate: false             # WHAT: research-only veto. Blocks a neutral credit entry when the FeatureEngine
+                                       #   iv_rank (a REALIZED-vol range rank, 0-1) rose by more than
+                                       #   backtest.iv_rank_rise_threshold (0.30) over 10 rows.
+                                       # WHY OFF: live has NO such veto (it gates on the stored-IV percentile LEVEL: condor
+                                       #   floor 15, credit cap 85, ait.data.iv_rank). The research series is a weak proxy of
+                                       #   that rank (Spearman 0.46-0.63; opposite side of live's floor/cap on 34-42% of
+                                       #   days); 45-58% of the days it blocks live already refuses; the rest (4.5-5.4% of
+                                       #   tradeable days) are days live WOULD trade. A/B on the realistic engine: it removes
+                                       #   3-6 trades per symbol and is slightly negative (inside the noise). PLAN.md W71.
+                                       # WHAT WAS KEPT: the code, the threshold (0.30) and its 0.25-0.60 search range, and the
+                                       #   per-entry record `iv_rank_rise_10d`. Only the veto is off; while it is off the
+                                       #   optimizer does not search the threshold (a searched value would re-enable it).
+                                       # RE-ENABLE BAR: only if a MULTI-WINDOW walk-forward with the gate ON vs OFF (the same
+                                       #   windows, engine, pricing and friction; scripts/iv_rank_parity_probe.py --ab is the
+                                       #   starting tool) shows an OUT-OF-SAMPLE gain, beyond the window-to-window noise, on
+                                       #   days live's level gates (floor 15 / cap 85) would have TRADED. A gain that appears
+                                       #   only on days live already refuses is not evidence for it.
+                                       # IF IT EARNS ITS PLACE: set true here AND port it to live (a W80-class change), so
+                                       #   research does not keep a gate the bot lacks. Until then: research-only, off.
+
   # --- W67: gate parity + graded objective ---
   gates_mode: enforce                  # 2026-10-10 operator decision: ML gates ON in RESEARCH (range floor + fractal veto
                                        # block) so the models being improved actually matter in studies. Live stays
