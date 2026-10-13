@@ -178,6 +178,7 @@ def store(tmp_path):
 
 
 async def _run(ib, store, **kw):
+    kw.setdefault("now", datetime.combine(TODAY, time(23, 59), tzinfo=ET))   # every fake bar has ended
     sleep = AsyncMock()
     quiet = []
     res = await sc.collect_short_dte(ib, "QQQ", store, WINDOW, today=TODAY, sleep=sleep,
@@ -188,6 +189,51 @@ async def _run(ib, store, **kw):
 # --------------------------------------------------------------------------
 # the collector
 # --------------------------------------------------------------------------
+
+class TestInProgressBars:
+    """W76b: a bar whose hour is still running holds a partial quote and is never stored."""
+
+    @staticmethod
+    async def _stored_times(store, now):
+        ib = FakeIB()
+        res, _sleep, _q = await _run(ib, store, now=now)
+        return res, store.load_spread_bar_samples("QQQ")
+
+    @pytest.mark.asyncio
+    async def test_a_bar_that_has_not_ended_is_skipped(self, store):
+        mid_hour = datetime.combine(TODAY, time(12, 45), tzinfo=ET)       # the 12:00 bar is running
+        res, df = await self._stored_times(store, mid_hour)
+        assert res.skipped_partial > 0 and res.stored > 0
+        got = {t for t in df["bar_time"]}
+        today_bars = {t for t in got if t.startswith(TODAY.isoformat())}
+        assert any("T11:00" in t for t in today_bars)                     # ended at 12:00 <= 12:45
+        assert not any("T12:00" in t or "T13:00" in t or "T14:00" in t or "T15:00" in t
+                       for t in today_bars)
+        # earlier sessions are complete: stored in full
+        assert any(not t.startswith(TODAY.isoformat()) for t in got)
+
+    @pytest.mark.asyncio
+    async def test_the_last_bar_ends_at_the_bell_not_an_hour_later(self, store):
+        # 15:00 bar: its end is min(16:00, close) = 16:00
+        before_bell = datetime.combine(TODAY, time(15, 59), tzinfo=ET)
+        res, df = await self._stored_times(store, before_bell)
+        assert not any(t.startswith(TODAY.isoformat()) and "T15:00" in t for t in df["bar_time"])
+
+    @pytest.mark.asyncio
+    async def test_after_the_bell_the_last_bar_is_stored(self, store):
+        after = datetime.combine(TODAY, time(16, 1), tzinfo=ET)
+        res, df = await self._stored_times(store, after)
+        assert res.skipped_partial == 0
+        assert any(t.startswith(TODAY.isoformat()) and "T15:00" in t for t in df["bar_time"])
+
+    @pytest.mark.asyncio
+    async def test_a_later_run_completes_what_an_earlier_one_skipped(self, store):
+        ib = FakeIB()
+        early, _s, _q = await _run(ib, store, now=datetime.combine(TODAY, time(12, 45), tzinfo=ET))
+        late, _s, _q = await _run(ib, store, now=datetime.combine(TODAY, time(23, 59), tzinfo=ET))
+        assert early.skipped_partial > 0 and late.skipped_partial == 0
+        assert late.stored > 0          # the bars that were skipped are now stored (idempotent insert)
+
 
 class TestCollector:
     @pytest.mark.asyncio

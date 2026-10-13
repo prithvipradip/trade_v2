@@ -1811,12 +1811,15 @@ class DataCollectionConfig(_StrictModel):
                     "supervisor and TWS/Gateway must be running at that time; a day the box is "
                     "off is skipped (nothing is lost but the day). Takes effect at the next "
                     "supervisor restart (a process runs on the settings it started with).")
-    short_dte_time_et: str = Field(default="16:10", pattern=r"^([01]\d|2[0-3]):[0-5]\d$",
-        description="ET wall-clock time of the daily run, HH:MM. 16:10 is after the close so the "
-                    "session's last bars exist and today's expiring contract has a full day of "
-                    "bars; whether IB still lists an expiring contract that long is unverified "
-                    "(the first real after-close run shows DTE 0 coverage). Move it earlier "
-                    "(e.g. 15:50) if DTE-0 samples are missing.")
+    short_dte_time_et: str = Field(default="15:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$",
+        description="ET wall-clock time of the daily run, HH:MM. MEASURED 2026-10-13: once the "
+                    "session ends IB no longer serves that day's expiring contracts, so a run "
+                    "after the close can never capture DTE 0 (a 16:10 run listed expiries from "
+                    "the NEXT day). 15:30 is late enough that the entry window's last bar "
+                    "(14:30-15:30) has ended, so one run holds the whole expiry day, and early "
+                    "enough that the DTE-0 contracts (requested first, ~6 minutes) are done "
+                    "~20 minutes before the close even if the start is delayed. Running later "
+                    "adds no bar (the 15:30 bar is outside the entry window).")
     short_dte_symbols: list[str] = Field(default=["QQQ"], min_length=1, max_length=5,
         description="Underlyings to collect. Each costs ~30-55 minutes at IB's historical-data "
                     "pacing (60 requests per 10 minutes), run sequentially.")

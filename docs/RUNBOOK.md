@@ -212,10 +212,12 @@ python scripts/calibrate_option_spreads.py --source ib-bars --short-dte --symbol
     --client-id 91
 ```
 
-- **When:** after the close (16:10 ET or later) so today's 0-DTE contract has a full session of bars,
-  while it is still listed. If a run shows `DTE 0: 0 samples`, IB had already dropped the expiring
-  contract: run it instead ~15:45 ET on expiry days (the last hour's bars are then missing, which
-  does not matter: the engine flattens at ~15:00).
+- **When: about 15:30 ET, BEFORE the close.** Measured 2026-10-13: after the session ends IB no
+  longer serves that day's expiring contracts, so an after-close run can never capture DTE 0 (its
+  expiry list starts at the next day). At 15:30 the entry window's last bar (14:30-15:30) has ended,
+  so one run holds the whole expiry day; the DTE-0 contracts are requested first. A run any later
+  adds no bar (the 15:30 bar is outside the entry window). Bars whose hour had not ended are never
+  stored (`in_progress_bars_skipped` in the summary).
 - **Client id:** use one that is not the bot's (the bot uses 326 and its fallback ladder); the example
   uses 91, the repo's calibration convention. W66 verified this request type against the paper
   Gateway (historical BID and ASK bars of listed options, market closed). If a run
@@ -239,9 +241,9 @@ run it Mon-Fri after the close. It is OFF by default.
 
 1. Prove it manually once: the `--dry-run`, then one real run (above).
 2. In `config.yaml` uncomment the `data_collection:` block at the bottom and set
-   `short_dte_enabled: true` (time defaults to 16:10 ET, symbols `[QQQ]`, client id 91).
+   `short_dte_enabled: true` (time defaults to 15:30 ET, symbols `[QQQ]`, client id 91).
 3. **Restart the supervisor** (`run_orchestrator.py`): a process runs on the settings it started with.
-   It logs `short_dte_collection_scheduled | time_et=16:10 ...` at startup if it took effect.
+   It logs `short_dte_collection_scheduled | time_et=15:30 ...` at startup if it took effect.
 4. Keep the supervisor and TWS/Gateway running at that time. The box being off skips that day
    (nothing else is lost); the supervisor gives a job an hour of grace if it was only just started.
 

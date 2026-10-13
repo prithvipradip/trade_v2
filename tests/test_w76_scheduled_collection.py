@@ -33,7 +33,7 @@ def _cfg(**over):
 class TestConfig:
     def test_defaults_are_off_and_conservative(self):
         c = DataCollectionConfig()
-        assert c.short_dte_enabled is False and c.short_dte_time_et == "16:10"
+        assert c.short_dte_enabled is False and c.short_dte_time_et == "15:30"
         assert c.short_dte_symbols == ["QQQ"] and c.short_dte_client_id == 91
         assert c.short_dte_max_dte == 6 and c.short_dte_duration == "7 D"
 
@@ -311,11 +311,15 @@ class TestSupervisor:
         nxt = job.trigger.get_next_fire_time(None, datetime(2026, 10, 12, 12, 0, tzinfo=ET))
         assert (nxt.hour, nxt.minute) == (15, 50) and nxt.tzinfo is not None
 
-    def test_the_default_16_10_is_after_the_close(self, M, monkeypatch):
+    def test_the_default_runs_before_the_close_so_dte_zero_can_be_captured(self, M, monkeypatch):
+        """W76b, MEASURED 2026-10-13: after the session ends IB no longer serves that day's
+        expiring contracts (a 16:10 run listed expiries from the NEXT day), so the run must start
+        before 16:00 ET; 15:30 is the first moment the entry window's last bar has ended."""
         sch = self._register(M, monkeypatch, _cfg())
         job = sch.get_job("short_dte_collection")
         nxt = job.trigger.get_next_fire_time(None, datetime(2026, 10, 9, 0, 0, tzinfo=ET))   # Friday
-        assert (nxt.hour, nxt.minute) == (16, 10) and nxt.weekday() == 4
+        assert (nxt.hour, nxt.minute) == (15, 30) and nxt.weekday() == 4
+        assert (nxt.hour, nxt.minute) < (16, 0)
 
     def test_enabling_it_adds_exactly_one_cron_job(self, M, monkeypatch):
         from apscheduler.triggers.cron import CronTrigger

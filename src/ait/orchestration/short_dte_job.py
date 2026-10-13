@@ -3,7 +3,7 @@
 Why this exists. IB keeps no bid/ask history for an expired contract, so the short-DTE
 collection (``scripts/calibrate_option_spreads.py --source ib-bars --short-dte``) has to
 run once per RTH session or that day's data is gone for good. The operator is not always at
-the machine at 16:10 ET; the supervisor already lives all day. This module is the whole job,
+the machine at 15:30 ET; the supervisor already lives all day. This module is the whole job,
 with every external dependency injected so it is exercised in tests without a broker, a
 clock, a calendar or a subprocess; ``master.collect_short_dte_friction`` is a thin wrapper.
 

@@ -828,7 +828,9 @@ async def _main(args: argparse.Namespace) -> int:
                             dry_run=args.dry_run)
                         if not args.dry_run:
                             print(f"  [{sym}] requested={r.requested} stored={r.stored} "
-                                  f"unqualified={r.unqualified} errors={r.errors}")
+                                  f"unqualified={r.unqualified} errors={r.errors}"
+                                  + (f" in_progress_bars_skipped={r.skipped_partial}"
+                                     if getattr(r, "skipped_partial", 0) else ""))
                     if not args.dry_run:
                         samples = store.load_spread_bar_samples(sym)
                         cov = coverage(samples, args.short_dte_max)

@@ -67,6 +67,7 @@ class CollectionResult:
     unqualified: int = 0
     errors: int = 0
     stored: int = 0
+    skipped_partial: int = 0       # bars whose hour had not ended when the run asked (never stored)
     by_dte: dict[int, int] = field(default_factory=dict)   # samples stored per DTE (<= max_dte)
     dry_run: bool = False
 
@@ -99,7 +100,7 @@ async def collect_short_dte(
     ib: Any, symbol: str, store: Any, window, *, max_dte: int = SHORT_DTE_MAX,
     duration: str = DEFAULT_DURATION, pause_secs: float = 10.8, dry_run: bool = False,
     today: date | None = None, sleep: Callable[[float], Any] = asyncio.sleep,
-    out: Callable[[str], None] = print,
+    out: Callable[[str], None] = print, now: datetime | None = None,
 ) -> CollectionResult:
     """Request, pair and store hourly BID/ASK samples for every contract <= ``max_dte`` out."""
     from ib_insync import Option, Stock
@@ -108,6 +109,7 @@ async def collect_short_dte(
 
     res = CollectionResult(symbol=symbol, dry_run=dry_run)
     today = today or today_et()
+    now = now or datetime.now(ET)
     und = Stock(symbol, "SMART", "USD")
     q = await ib.qualifyContractsAsync(und)
     if not q:
@@ -169,6 +171,14 @@ async def collect_short_dte(
         for r in paired.to_dict("records"):
             u = uprice.get(r["bar_time"])
             start = datetime.fromisoformat(r["bar_time"])
+            # W76b: a bar whose hour is still running holds a PARTIAL quote, and the idempotent
+            # insert would keep that version forever. Store only bars that have ended (the last
+            # bar of a session ends at the bell, not an hour after it starts).
+            _end = min(start + timedelta(hours=1),
+                       datetime.combine(start.date(), _session_close(start.date()), tzinfo=ET))
+            if _end > now:
+                res.skipped_partial += 1
+                continue
             dte = (exp - start.date()).days
             delta = iv = None
             if u:

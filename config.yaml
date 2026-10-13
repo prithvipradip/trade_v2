@@ -623,7 +623,7 @@ sizing_probe:
 # with). First prove it manually: docs/RUNBOOK.md "Short-DTE friction collection".
 # data_collection:
 #   short_dte_enabled: false        # run the collector from the supervisor, Mon-Fri
-#   short_dte_time_et: "16:10"      # after the close; move to ~15:50 if DTE-0 samples are missing
+#   short_dte_time_et: "15:30"      # BEFORE the close: IB drops the expiring contract after it (DTE 0)
 #   short_dte_symbols: [QQQ]        # ~30-55 min each at IB's historical-data pacing
 #   short_dte_client_id: 91         # must not be IBKR_CLIENT_ID or its +100..+104 ladder
 #   short_dte_max_dte: 6
