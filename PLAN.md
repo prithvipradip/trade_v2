@@ -16184,3 +16184,21 @@ after 15 sessions the hour effect can be checked without another run. (2) The wa
 **NEXT.** Read `logs/short_dte_manual_20261013.log` and the status file after 15:30 ET: expect DTE 0 samples and 1 session; then W79b prerequisites as before.
 
 ---
+
+## 2026-10-13 - W76b CONFIRMED: the 15:30 ET run captured DTE 0 (first real DTE 0 samples)
+
+Follow-up to the W76b entry above; no code change. The waiter started the collector at 15:30:08 ET and it finished at 16:03:53 ET (about 34 minutes).
+
+**MEASURED (QQQ, `--source ib-bars --short-dte`).** exit 0, `ok=True`, 88 contracts planned (expiries 2026-10-13 .. 2026-10-19), 176 series requested, **3,508 samples stored**, 0 unqualified, 0
+errors, **`in_progress_bars_skipped=76`** (the W76b rule working). Cumulative coverage, samples / sessions: **DTE 0 70 / 1**, DTE 1 224 / 2, DTE 2 263 / 2, DTE 3 361 / 3, DTE 4 468 / 3,
+DTE 5 522 / 3, DTE 6 832 / 5.
+- Band 0-2: `const_usd a=0.0050`, n=495, 2 of 15 sessions, cvMAE $0.0004. Band 3-6: `affine_usd a=0.0039 b=0.0041`, n=1,870, 6 of 15 sessions, cvMAE $0.0048 (yesterday, 5 sessions:
+  `a=0.0059 b=0.0029`: intercept and slope still trade off; the implied half-spread is stable at about $0.005 at a $0.30 mid and $0.008 at $1.00). Both are below the $0.01 floor the engine
+  charges until a band has 15 sessions, so the floor stays conservative.
+- DTE 0 has one session and 70 samples and is pooled into band 0-2; there is no separate DTE 0 estimate yet.
+
+**CONCLUSION.** The diagnosis in W76b holds: an expiring contract can only be collected while it is still listed, i.e. before the close; a run at 15:30 ET holds the whole expiry day.
+
+**NEXT.** The waiter runs again at 15:30 ET on Wednesday 2026-10-14 (TWS must stay up). About 13 more sessions are needed for band 0-2 and 9 for band 3-6; the scheduled supervisor job (default 15:30 ET) is the durable route.
+
+---
