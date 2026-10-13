@@ -16144,3 +16144,43 @@ live stores, the live-side freshness machinery not simulated, and the constructi
 **NEXT.** W79b once D2, the gate mode and the window design are decided.
 
 ---
+
+## 2026-10-13 - W76b: DTE 0 can only be collected BEFORE the close (measured); the collector's default time moves to 15:30 ET; in-progress bars are never stored
+
+Research-data tooling only; no live file touched, nothing restarted or pushed. The scheduled job is still default OFF and not enabled.
+
+**MEASURED.** The operator re-ran the collector after Monday 2026-10-12's close (`--source ib-bars --short-dte --symbols QQQ --client-id 91`, spot 745.98, 70 contracts, 140 series,
+2,940 samples stored, 0 unqualified, 0 errors, 1,608 s).
+1. **The expiry list started at 2026-10-13**: Monday's own expiring contracts were no longer served once the session had ended. DTE 0 therefore still shows 0 samples / 0 sessions. The
+   risk registered in the W76 follow-up 2 entry ("whether IB still serves an expiring contract at 16:10 is unverified") is now verified: it does not.
+2. **My earlier instruction to re-run after the close was wrong for DTE 0** (it assumed the contract stays listed). The run was not wasted: it captured Monday's DTE 1 / DTE 2 bars for
+   the first time (96 and 114 samples, 1 session each) and added a session to DTE 3-6 (cumulative: DTE 3: 216 samples / 2 sessions; 4: 342 / 3; 5: 432 / 3; 6: 606 / 4).
+3. **Fits so far.** Band 0-2: `const_usd a=0.0050` (a half-cent half-spread: quotes about one tick wide), n=200, 1 session, cvMAE $0.0004 (one session: indicative only). Band 3-6:
+   `affine_usd a=0.0059 b=0.0029` (half-spread = a + b x mid: about $0.007 at a $0.30 mid, $0.009 at $1.00), n=1,385, 5 sessions, cvMAE $0.0048 (about half a tick). Both below the $0.01
+   floor the engine charges until a band has 15 sessions, so the floor is conservative. Not active: 1 and 5 of 15 sessions.
+
+**WHY 15:30 ET.** The collector asks IB for history up to "now", so a later run is a superset of an earlier one; it cannot see the expiry day's afternoon if it runs at 10:45, and it cannot see the
+expiring contract at all after 16:00. `pair_bid_ask` keeps only bars that start inside the engine's entry window (10:30 to 15:30 exclusive), so the last bar that exists is 14:30-15:30:
+at 15:30 it has ended, and waiting until 15:45 adds nothing. 15:30 leaves about 20 minutes of margin (the DTE-0 contracts are requested first, about 6 minutes) against the supervisor's
+one-hour misfire grace and a slow start. Morning bars are included in the same run (10:30 is the first entry-window bar).
+
+**CHANGED.**
+1. `data_collection.short_dte_time_et` default `16:10` -> `15:30` with the measurement in its description; the commented block in `config.yaml`, the job's docstring and the RUNBOOK follow.
+2. `collect_short_dte(..., now=...)` skips a bar whose hour had not ended when the run asked (the idempotent insert would keep a partial quote forever); the last bar of a session ends at
+   the bell, not an hour after it starts. Reported as `in_progress_bars_skipped`.
+
+**OPERATIONAL.** At the operator's request the assistant started a detached waiter (outside the repo; PID in `logs/short_dte_waiter.log`) that runs the SAME manual command at 15:30 ET on
+Tuesday 2026-10-13 and Wednesday 2026-10-14, polling the TWS port until 15:50 ET. It needs the Mac awake and TWS (paper) logged in; it never places an order and never touches the bot.
+It is a convenience, not durable infrastructure: the durable route is the supervisor job, once the operator enables it.
+
+**TESTS.** `TestInProgressBars` (4: a running bar is skipped; the last bar ends at the bell; stored after the bell; a later run completes what an earlier one skipped) and the default-time test
+now asserts the run is before the close. Fast lane 5753 passed / 46 skipped / 0 failed (5749 + 4); `smoke_deploy.py` SMOKE PASS (13 checks); `typecheck.py` OK; legacy engine byte-identical.
+
+**REGISTERED, NOT FIXED.** (1) The friction model is a function of the mid only, with no time-of-day term, so morning and afternoon quotes are pooled; the stored samples carry `bar_time`, so
+after 15 sessions the hour effect can be checked without another run. (2) The waiter dies with the Mac's sleep or reboot. (3) Only QQQ is collected.
+
+**OPERATOR.** Start TWS (paper) and log in before 15:30 ET (21:30 CEST) today, and keep the Mac awake and plugged in. Enable the supervisor job when ready (config block + supervisor restart).
+
+**NEXT.** Read `logs/short_dte_manual_20261013.log` and the status file after 15:30 ET: expect DTE 0 samples and 1 session; then W79b prerequisites as before.
+
+---
