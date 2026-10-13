@@ -16093,3 +16093,54 @@ mode, the window design, the SPY / IWM backfill. The bot's next start picks up W
 **NEXT.** D9, then W79b once D2, the gate mode and the window design are decided.
 
 ---
+
+## 2026-10-13 - W71c: D9 EXECUTED. The IV-rank rise veto is OFF in research behind an explicit switch; the code is kept; the bar for turning it back on is written in `config_research.yaml`
+
+Research-only; no live file touched, nothing restarted or pushed. The legacy engine is byte-identical to the pre-W72 baseline and `IRON_CONDOR_SPACE` is unchanged (both asserted).
+
+**DECISION (operator, 2026-10-13).** Turn the veto off, do NOT remove the code or logic, keep it research-only until further studies confirm the need, and write the reasoning and the
+re-enable bar next to the switch in `config_research.yaml` as well as in this ledger. (The operator proposed an on/off configuration variable instead of deleting code; the one
+amendment made to that idea was to use an explicit boolean rather than the existing magic number, because of the optimizer trap below.)
+
+**WHY A BOOLEAN AND NOT `iv_rank_rise_threshold >= 1`.** The number already disabled the veto, but the optimizer searches that same parameter over 0.25-0.60 and a searched value overrides
+the baseline per trial, so an "off" overlay would have been silently re-enabled inside every trial. A boolean is the intent; it also mirrors `backtest.iv_rank_gate` (the level gates).
+
+**CHANGED.**
+1. `BacktestConfig.iv_rank_rise_gate` (schema default **True**, so a bare `Backtester`, the regression baselines and every test without the overlay are unchanged); the threshold's
+   description notes it is ignored while the gate is off.
+2. Engine: new kwarg resolved like the threshold; the veto is `if self._iv_rank_rise_gate and rise > threshold`. **The rise is still computed and recorded per entry
+   (`iv_rank_rise_10d`) with the gate off**, so a later study has the data without re-running with the gate on.
+3. `WalkForwardConfig.iv_rank_rise_gate` (resolved like `iv_rank_gate`) forwarded to the OOS engine, the meta-label shadow engine and the per-window optimizer;
+   `StrategyOptimizer(iv_rank_rise_gate=...)` puts it in `bt_kwargs` and **`_maybe_drop_inert_params` drops `iron_condor__iv_rank_rise_threshold` while the gate is off**
+   (logged as `optimizer_dropped_inert_param`). `IRON_CONDOR_SPACE` keeps the dimension and its 0.25-0.60 range for the day the gate is turned back on.
+4. `config_research.yaml`: `backtest.iv_rank_rise_gate: false` with the description, the evidence, what was kept and the bar (below), verbatim.
+5. Visibility: the parity manifest prints the RESEARCH-ONLY line only while the gate is ON (and records the gate either way); RUNBOOK updated; `iv_rank_parity_probe.py --ab` and
+   `dte_dimension_flatness.py` pass the boolean instead of the 10.0 literal; the W71 AST guard now also covers `iv_rank_rise_gate`.
+
+**THE RE-ENABLE BAR (also in `config_research.yaml`).** Turn it back on only if a MULTI-WINDOW walk-forward with the gate ON vs OFF (the same windows, engine, pricing and friction;
+`scripts/iv_rank_parity_probe.py --ab` is the starting tool) shows an OUT-OF-SAMPLE gain, beyond the window-to-window noise, on days live's level gates (floor 15 / cap 85) would have
+TRADED. A gain that appears only on days live already refuses is not evidence for it. If it earns its place, set the switch back to true AND port it to live (a W80-class change), so
+research does not keep a gate the bot lacks. Until then: research-only, off.
+
+**MEASURED.**
+1. The boolean arms of the A/B reproduce the W71 numbers exactly (realistic engine, `bs_legacy`, per-leg friction with the short-DTE floor, 1 contract, entry DTE 14, 2024-01..2026-10):
+   QQQ ON 126 trades / +5,213 vs OFF 132 / +5,643; SPY ON 129 / +6,049 vs OFF 134 / +6,068; IWM ON 118 / +945 vs OFF 121 / +1,019; the rise gate vetoed 22 / 19 / 18 days ON and 0 OFF.
+2. **Effect on default research runs:** they no longer include the veto: 3-6 more trades per symbol over 2.75 years, slightly higher totals in this sample, all inside the noise.
+   Earlier default-research numbers that were recorded with the veto on are not invalidated, but are not directly comparable (assumption A10).
+
+**TESTS.** `tests/test_w71c_iv_rank_rise_gate.py`: 20 (schema default and the overlay; the written bar's key phrases present in the overlay so it cannot silently disappear; engine ON vetoes /
+OFF vetoes nothing and takes at least as many entries / the rise is still recorded; walk-forward resolution and forwarding to both engines and the optimizer; the optimizer drops and
+filters the dimension while OFF, keeps it ON, and a supplied threshold cannot re-enable the gate; the manifest on / off). The W71 guard test was extended. **Mutation-checked: 14 mutants,
+all caught on the first pass, files restored byte-for-byte.** Collected-test reconciliation: 5774 -> 5794 selected = +20 exactly. Fast lane: 5748 passed / 46 skipped / 1 failed. The failure was `test_w68_research_config::test_no_module_under_src_imports_the_research_loader`, which caught my schema description naming the research overlay file (live-side code may not); reworded to "the research overlay" and re-run with the related suites (90 passed), not the whole lane. The passed count is +19 over the previous lane, not +20, because one time-of-day test (`test_w28_et_date_authority::test_today_et_never_returns_the_bare_host_date_in_the_window`) skips outside the 18:00-24:00 ET window and ran inside it last time. `smoke_deploy.py` SMOKE PASS (13 checks); `typecheck.py` OK; legacy engine byte-identical.
+
+**REGISTERED, NOT FIXED.** (1) A bare `Backtester()` still vetoes (schema default True) on purpose; research policy lives in the overlay, as for D1 and D8, and tests that need it off keep
+passing `iv_rank_rise_threshold=10.0`, which still works. (2) The W71 findings registered earlier are unchanged: live's median-across-expiries IV persistence (W80), the 510-observation SPY / IWM
+live stores, the live-side freshness machinery not simulated, and the construction study.
+
+**OPERATOR.** Nothing new. D9 is closed. Still open from W79a: D2 (after the backfill, about 2026-10-21), the range-gate mode, the window design, the SPY / IWM backfill.
+
+**DEPLOY / ROLLBACK.** Research and tests only; no restart. Rollback is a clean `git revert`.
+
+**NEXT.** W79b once D2, the gate mode and the window design are decided.
+
+---
