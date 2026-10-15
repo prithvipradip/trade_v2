@@ -242,9 +242,12 @@ class TestCommand:
         assert "--short-dte-max 5" in flat and "--short-dte-duration 5 D" in flat
         assert "--min-sessions 15" in flat and "--status-file" in flat
 
-    def test_the_port_is_not_passed_it_comes_from_the_environment(self, tmp_path):
+    def test_the_port_the_preflight_found_is_passed_to_the_collector(self, tmp_path):
+        """W82: the job probes the configured port (and its TWS / Gateway twin) and hands the
+        one that answered to the script, so both agree about which endpoint is up."""
         _run(tmp_path, Script(status=_status()))
-        assert "--port" not in FakeProc.instances[0].cmd
+        cmd = FakeProc.instances[0].cmd
+        assert cmd[cmd.index("--port") + 1] == "7497"
 
     def test_it_runs_in_the_repo_root_with_pinned_threads(self, tmp_path):
         _run(tmp_path, Script(status=_status()))
@@ -426,5 +429,5 @@ class TestStatusFile:
         blk = st["symbols"]["QQQ"]
         assert st["ok"] is True and blk["stored"] > 0 and blk["planned"] > 0
         assert set(blk["coverage"]) == {str(d) for d in range(7)}
-        assert set(blk["bands"]) == {"0-2", "3-6"}
+        assert set(blk["bands"]) == {"0-2", "3-6", "7-13", "14-29", "30-45"}     # W82
         assert all(b["needed"] == 2 for b in blk["bands"].values())

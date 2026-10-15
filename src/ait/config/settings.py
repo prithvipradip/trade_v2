@@ -1856,6 +1856,31 @@ class DataCollectionConfig(_StrictModel):
         description="History requested per contract. A contract's last week is all a 0-6 DTE "
                     "sample can come from, so 7 D is enough; re-sampled bars are free "
                     "(INSERT OR IGNORE).")
+    lifecycle: bool = Field(default=False,
+        description="W82: capture each contract's LIFE instead of 'every contract <= "
+                    "short_dte_max_dte, every day'. Stage A = expiring today..+"
+                    "lifecycle_expiring_days (the perishable part, DTE 0 first); stage B = "
+                    "far-listed expiries at 15-21 DTE whose DTE 31-45 tail is not stored, capped "
+                    "per run. Each request asks lifecycle_duration of hourly bars, so a run also "
+                    "recovers the preceding month. About 20-35 minutes a day versus 72-108 for "
+                    "0-14 / 0-45 DTE every day, and every contract is downloaded about twice in "
+                    "its life instead of 5-11 times (PLAN.md 2026-10-16 design). Default off: "
+                    "the original behaviour. short_dte_max_dte is ignored when on.")
+    lifecycle_duration: str = Field(default="30 D", pattern=r"^\d{1,3} [DW]$",
+        description="History requested per contract in lifecycle mode. 30 D is what IB serves "
+                    "for hourly BID/ASK bars of a listed option (the all-DTE sampler has used it "
+                    "since W66).")
+    lifecycle_expiring_days: int = Field(default=1, ge=0, le=5,
+        description="Stage A covers expiries today..today+N. 1 (default) means every contract "
+                    "is requested on its last day AND the day before, so one missed day costs "
+                    "at most that day's bars.")
+    lifecycle_thin_every: int = Field(default=3, ge=1, le=10,
+        description="Plan strikes from every Nth session of the underlying's path. 3 keeps a "
+                    "contract set of about 30-50 per expiry; 1 (every session) is 2-3x larger.")
+    lifecycle_max_far_contracts: int = Field(default=120, ge=0, le=400,
+        description="Stage-B contract cap per run (120 is about 43 minutes at IB's pacing); "
+                    "the first owed expiry is always taken so a backlog drains, the rest is "
+                    "deferred to the next run.")
     short_dte_timeout_minutes: int = Field(default=150, ge=10, le=600,
         description="Hard wall-clock cap for one run; the job kills the process after this.")
     short_dte_idle_minutes: int = Field(default=20, ge=2, le=120,

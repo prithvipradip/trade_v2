@@ -38,9 +38,12 @@ from ait.backtesting.friction import (
 from ait.data.option_spread_sampler import (
     SHORT_DTE_MAX,
     bar_start_et,
+    SHORT_DTE_DELTA_BUCKETS,
+    SHORT_DTE_WINGS,
     delta_from_mid,
     pair_bid_ask,
     plan_short_dte_strikes,
+    plan_strikes,
     relevant_mask,
     session_of,
 )
@@ -54,7 +57,9 @@ def _session_close(d: date):
 
 
 DEFAULT_DURATION = "7 D"
-SHORT_BANDS = ("0-2", "3-6")      # the bands this module fits (7+ is the all-DTE model's)
+# W82: every closed band of SHORT_BAND_EDGES (0-2, 3-6, 7-13, 14-29, 30-45). A 7+ band is only
+# USED by the engine once it has the minimum sessions; before that the all-DTE model answers.
+SHORT_BANDS = tuple(friction_band(hi, SHORT_BAND_EDGES) for hi in SHORT_BAND_EDGES)
 MIN_MID_SHORT = 0.01              # a penny option is the tick; tighter than the 7-45 mask's 0.03
 
 
@@ -70,6 +75,9 @@ class CollectionResult:
     skipped_partial: int = 0       # bars whose hour had not ended when the run asked (never stored)
     by_dte: dict[int, int] = field(default_factory=dict)   # samples stored per DTE (<= max_dte)
     dry_run: bool = False
+    stage_a: int = 0               # W82: lifecycle expiries captured as stage A / B
+    stage_b: int = 0
+    deferred_b: list[str] = field(default_factory=list)    # W82: owed far expiries over the cap
 
 
 def plan_contracts(spot: float, iv: float, today: date, expirations: list[str], strikes: list[float],
@@ -96,25 +104,18 @@ def plan_contracts(spot: float, iv: float, today: date, expirations: list[str], 
     return list(dict.fromkeys(plan))
 
 
-async def collect_short_dte(
-    ib: Any, symbol: str, store: Any, window, *, max_dte: int = SHORT_DTE_MAX,
-    duration: str = DEFAULT_DURATION, pause_secs: float = 10.8, dry_run: bool = False,
-    today: date | None = None, sleep: Callable[[float], Any] = asyncio.sleep,
-    out: Callable[[str], None] = print, now: datetime | None = None,
-) -> CollectionResult:
-    """Request, pair and store hourly BID/ASK samples for every contract <= ``max_dte`` out."""
-    from ib_insync import Option, Stock
+async def _prepare(ib: Any, symbol: str, store: Any, duration: str, res: CollectionResult,
+                   out: Callable[[str], None]):
+    """Qualify the underlying, fetch its hourly path and the option chain parameters.
 
-    from ait.data.historical import SOURCE_IB_BID_ASK_BARS
+    Returns ``(uprice, iv0, expirations, strikes)`` or None (the reason is on ``out``)."""
+    from ib_insync import Stock
 
-    res = CollectionResult(symbol=symbol, dry_run=dry_run)
-    today = today or today_et()
-    now = now or datetime.now(ET)
     und = Stock(symbol, "SMART", "USD")
     q = await ib.qualifyContractsAsync(und)
     if not q:
         out(f"  [{symbol}] ERROR: could not qualify underlying")
-        return res
+        return None
     und = q[0]
     ubars = await ib.reqHistoricalDataAsync(
         und, endDateTime="", durationStr=duration, barSizeSetting="1 hour",
@@ -122,7 +123,7 @@ async def collect_short_dte(
     uprice = {bar_start_et(b.date).isoformat(): float(b.close) for b in ubars}
     if not uprice:
         out(f"  [{symbol}] ERROR: no underlying hourly bars")
-        return res
+        return None
     res.spot = float(ubars[-1].close)
     iv0 = 0.20
     try:
@@ -131,20 +132,27 @@ async def collect_short_dte(
             iv0 = float(ivs.iloc[-1])
     except Exception:  # noqa: BLE001 - the default is only a strike-planning hint
         pass
-
     params = await ib.reqSecDefOptParamsAsync(und.symbol, "", und.secType, und.conId)
     chosen = [p for p in params or [] if p.exchange == "SMART"] or list(params or [])
     expirations = sorted({e for p in chosen for e in p.expirations})
     strikes = sorted({float(k) for p in chosen for k in p.strikes})
-    plan = plan_contracts(res.spot, iv0, today, expirations, strikes, max_dte)
-    res.planned = len(plan)
-    mins = len(plan) * 2 * pause_secs / 60.0
-    by_exp = sorted({e for e, *_ in plan})
-    out(f"  [{symbol}] spot={res.spot:.2f} expiries={[e.isoformat() for e in by_exp]} "
-        f"contracts={len(plan)} (~{mins:.0f} min at {pause_secs:g}s pacing)")
-    if dry_run or not plan:
-        return res
+    return uprice, iv0, expirations, strikes
 
+
+async def _fetch_and_store(ib: Any, symbol: str, store: Any, window, plan, *, uprice: dict,
+                           duration: str, pause_secs: float, sleep: Callable[[float], Any],
+                           out: Callable[[str], None], now: datetime, report_max_dte: int,
+                           res: CollectionResult) -> dict[date, int]:
+    """Request BID and ASK bars for every planned contract, pair them and store the samples.
+
+    ``plan`` is [(expiry, right, strike, role), ...]. Returns {expiry: contracts requested}
+    so a caller can log what was captured. Shared by the 0-N DTE collector and the lifecycle
+    collector: ONE request/pair/store path."""
+    from ib_insync import Option
+
+    from ait.data.historical import SOURCE_IB_BID_ASK_BARS
+
+    requested_by_exp: dict[date, int] = {}
     for n, (exp, right, k, role) in enumerate(plan, 1):
         c = Option(symbol, exp.strftime("%Y%m%d"), k, right, "SMART")
         try:
@@ -164,6 +172,7 @@ async def collect_short_dte(
             out(f"    [{symbol}] {exp} {right}{k:g}: {type(e).__name__}: {e}")
             await sleep(60.0)
             continue
+        requested_by_exp[exp] = requested_by_exp.get(exp, 0) + 1
         paired = pair_bid_ask(bars["BID"], bars["ASK"], window)
         if paired.empty:
             continue
@@ -189,12 +198,249 @@ async def collect_short_dte(
             rows.append({**r, "right": right, "strike": k, "expiry": exp.isoformat(),
                          "dte": dte, "underlying_price": u, "delta": delta, "iv": iv,
                          "role": role})
-            if 0 <= dte <= max_dte:
+            if 0 <= dte <= report_max_dte:
                 res.by_dte[dte] = res.by_dte.get(dte, 0) + 1
         res.stored += store.save_spread_bar_samples(symbol, pd.DataFrame(rows),
                                                     source=SOURCE_IB_BID_ASK_BARS)
         if n % 10 == 0:
             out(f"    [{symbol}] {n}/{len(plan)} contracts, {res.stored} samples so far")
+    return requested_by_exp
+
+
+async def collect_short_dte(
+    ib: Any, symbol: str, store: Any, window, *, max_dte: int = SHORT_DTE_MAX,
+    duration: str = DEFAULT_DURATION, pause_secs: float = 10.8, dry_run: bool = False,
+    today: date | None = None, sleep: Callable[[float], Any] = asyncio.sleep,
+    out: Callable[[str], None] = print, now: datetime | None = None,
+) -> CollectionResult:
+    """Request, pair and store hourly BID/ASK samples for every contract <= ``max_dte`` out."""
+    res = CollectionResult(symbol=symbol, dry_run=dry_run)
+    today = today or today_et()
+    now = now or datetime.now(ET)
+    prepared = await _prepare(ib, symbol, store, duration, res, out)
+    if prepared is None:
+        return res
+    uprice, iv0, expirations, strikes = prepared
+    plan = plan_contracts(res.spot, iv0, today, expirations, strikes, max_dte)
+    res.planned = len(plan)
+    mins = len(plan) * 2 * pause_secs / 60.0
+    by_exp = sorted({e for e, *_ in plan})
+    out(f"  [{symbol}] spot={res.spot:.2f} expiries={[e.isoformat() for e in by_exp]} "
+        f"contracts={len(plan)} (~{mins:.0f} min at {pause_secs:g}s pacing)")
+    if dry_run or not plan:
+        return res
+    await _fetch_and_store(ib, symbol, store, window, plan, uprice=uprice, duration=duration,
+                           pause_secs=pause_secs, sleep=sleep, out=out, now=now,
+                           report_max_dte=max_dte, res=res)
+    return res
+
+
+# ---------------------------------------------------------------------------
+# W82: lifecycle capture. A contract is perishable at its EXPIRY, not each day: IB serves 30 days
+# of hourly BID/ASK bars for any listed contract in one request, so one capture on (or just
+# before) its last day recovers its whole DTE 0-30 profile, and one capture while it is still
+# 15-21 DTE reaches DTE 31-45. Two requests per contract's life instead of one per day.
+# ---------------------------------------------------------------------------
+
+STAGE_A = "A"            # perishable: expiring today / tomorrow
+STAGE_B = "B"            # coverage debt: the DTE 31-45 tail of far-listed expiries
+LOOKBACK_DAYS = 30       # IB serves 30 D of hourly BID/ASK bars for a listed option
+FAR_WINDOW = (15, 21)    # stage B captures an expiry once, while it is this many DTE
+FAR_TAIL_MIN_DTE = 31    # samples at or beyond this DTE are the "far tail"
+FAR_TAIL_MIN_SESSIONS = 5
+STRIKE_WINDOW = 0.12     # only strikes within +-12% of that day's spot are ever requested
+
+
+def duration_days(duration: str) -> int:
+    """'30 D' -> 30, '2 W' -> 14, '1 M' -> 30 (calendar days of IB's duration string)."""
+    parts = str(duration).split()
+    n = int(parts[0])
+    unit = parts[1].upper() if len(parts) > 1 else "D"
+    return n * {"D": 1, "W": 7, "M": 30, "Y": 365}.get(unit, 1)
+
+
+def session_path(uprice: dict[str, float], ivs: pd.Series | None = None,
+                 iv_default: float = 0.20) -> list[tuple[date, float, float]]:
+    """[(session, spot, iv)]: the LAST hourly close of each session and that session's stored
+    IV (the latest value on or before it; ``iv_default`` when none is plausible)."""
+    by_day: dict[date, float] = {}
+    for ts in sorted(uprice):
+        by_day[date.fromisoformat(ts[:10])] = float(uprice[ts])
+    ivmap: dict[date, float] = {}
+    if ivs is not None and len(ivs):
+        for idx, v in ivs.items():
+            ivmap[idx.date() if hasattr(idx, "date") else idx] = float(v)
+    ivdays = sorted(ivmap)
+    out: list[tuple[date, float, float]] = []
+    for d in sorted(by_day):
+        prior = [x for x in ivdays if x <= d]
+        v = ivmap[prior[-1]] if prior else iv_default
+        out.append((d, by_day[d], v if 0.01 < v < 5.0 else iv_default))
+    return out
+
+
+def lifecycle_strikes(expiry: date, right: str, path: list[tuple[date, float, float]],
+                      listed_strikes, *, today: date, thin_every: int = 3,
+                      ) -> list[tuple[float, str]]:
+    """[(strike, role)] to request for one (expiry, right): the UNION over the underlying's
+    path of the strikes a condor would have sold that day.
+
+    Every ``thin_every``-th session (the most recent first) applies the existing per-day rule
+    with THAT day's spot, stored IV and DTE: moneyness anchors + deltas + wings at <= 6 DTE
+    (``plan_short_dte_strikes``), the compact delta buckets + wings above it. A strike that is
+    'short' on any day is 'short' (the delta test then applies to its rows; a wing label would
+    bypass it)."""
+    listed = sorted(float(k) for k in listed_strikes)
+    days = [(d, S, iv) for d, S, iv in path if d <= min(today, expiry) and S > 0]
+    chosen = days[::-1][::max(1, int(thin_every))]
+    out: dict[float, str] = {}
+    for d, S, iv in chosen:
+        near = [k for k in listed if abs(k / S - 1.0) <= STRIKE_WINDOW]
+        if not near:
+            continue
+        dte = (expiry - d).days
+        if dte <= SHORT_DTE_MAX:
+            plan = plan_short_dte_strikes(S, iv, dte, near, right)
+        else:
+            plan = plan_strikes(S, iv, dte, near, right, buckets=SHORT_DTE_DELTA_BUCKETS,
+                                wings=SHORT_DTE_WINGS)
+        for k, role in plan:
+            # 'short' is sticky: a later wing label never downgrades it
+            out[k] = "short" if role == "short" else out.get(k, role)
+    return sorted(out.items())
+
+
+@dataclass
+class LifecyclePlan:
+    contracts: list[tuple[date, str, float, str, str]] = field(default_factory=list)
+    stage_a: list[date] = field(default_factory=list)       # expiries captured as stage A
+    stage_b: list[date] = field(default_factory=list)       # expiries captured as stage B
+    deferred_b: list[date] = field(default_factory=list)    # owed but over this run's cap
+
+
+def far_tail_done(expiry: date, samples: pd.DataFrame | None, log: pd.DataFrame | None,
+                  min_sessions: int = FAR_TAIL_MIN_SESSIONS) -> bool:
+    """True when the expiry's DTE 31-45 tail is already stored (a logged stage-B capture, or
+    enough stored sessions at DTE >= 31, e.g. from a manual 30 D catch-up run)."""
+    iso = expiry.isoformat()
+    if log is not None and len(log):
+        m = (log["expiry"] == iso) & (log["stage"] == STAGE_B)
+        if bool(m.any()):
+            return True
+    if samples is not None and len(samples):
+        e = samples[(samples["expiry"] == iso) & (samples["dte"] >= FAR_TAIL_MIN_DTE)]
+        if len(e) and int(e["bar_time"].map(session_of).nunique()) >= min_sessions:
+            return True
+    return False
+
+
+def plan_lifecycle(path: list[tuple[date, float, float]], today: date, expirations: list[str],
+                   strikes: list[float], *, samples: pd.DataFrame | None = None,
+                   log: pd.DataFrame | None = None, expiring_days: int = 1, thin_every: int = 3,
+                   max_far_contracts: int = 120,
+                   far_window: tuple[int, int] = FAR_WINDOW) -> LifecyclePlan:
+    """Stage A (expiring today..today+``expiring_days``) first, DTE 0 first, then stage B
+    (far-listed expiries inside ``far_window`` whose tail is not stored), nearest first, up to
+    ``max_far_contracts`` (the first expiry is always taken so a backlog drains)."""
+    plan = LifecyclePlan()
+    exps: list[date] = []
+    for e in expirations:
+        try:
+            exps.append(datetime.strptime(e, "%Y%m%d").date())
+        except ValueError:
+            continue
+    exps = sorted(set(exps))
+
+    def contracts_for(exp: date, stage: str) -> list[tuple[date, str, float, str, str]]:
+        out = []
+        for right in ("C", "P"):
+            for k, role in lifecycle_strikes(exp, right, path, strikes, today=today,
+                                             thin_every=thin_every):
+                out.append((exp, right, k, role, stage))
+        return out
+
+    for exp in exps:
+        if 0 <= (exp - today).days <= int(expiring_days):
+            plan.stage_a.append(exp)
+            plan.contracts += contracts_for(exp, STAGE_A)
+    lo, hi = far_window
+    owed = [e for e in exps if lo <= (e - today).days <= hi
+            and not far_tail_done(e, samples, log)]
+    taken = 0
+    for exp in owed:                       # nearest first (exps is sorted)
+        cs = contracts_for(exp, STAGE_B)
+        if taken and taken + len(cs) > int(max_far_contracts):
+            plan.deferred_b.append(exp)
+            continue
+        plan.stage_b.append(exp)
+        plan.contracts += cs
+        taken += len(cs)
+    # dedupe keeping the first (stage A wins over B for a shared contract)
+    seen: set[tuple[date, str, float]] = set()
+    uniq = []
+    for c in plan.contracts:
+        key = (c[0], c[1], c[2])
+        if key not in seen:
+            seen.add(key)
+            uniq.append(c)
+    plan.contracts = uniq
+    return plan
+
+
+async def collect_lifecycle(
+    ib: Any, symbol: str, store: Any, window, *, duration: str = f"{LOOKBACK_DAYS} D",
+    pause_secs: float = 10.8, dry_run: bool = False, today: date | None = None,
+    sleep: Callable[[float], Any] = asyncio.sleep, out: Callable[[str], None] = print,
+    now: datetime | None = None, expiring_days: int = 1, thin_every: int = 3,
+    max_far_contracts: int = 120,
+) -> CollectionResult:
+    """One lifecycle run: stage A then stage B (see the section comment)."""
+    res = CollectionResult(symbol=symbol, dry_run=dry_run)
+    today = today or today_et()
+    now = now or datetime.now(ET)
+    prepared = await _prepare(ib, symbol, store, duration, res, out)
+    if prepared is None:
+        return res
+    uprice, iv0, expirations, strikes = prepared
+    ivs = None
+    try:
+        ivs = store.load_daily_iv(symbol, days=duration_days(duration) + 10)
+    except Exception:  # noqa: BLE001 - per-day IV is a planning hint; iv0 is the fallback
+        pass
+    path = session_path(uprice, ivs, iv0)
+    samples = log = None
+    try:
+        samples = store.load_spread_bar_samples(symbol)
+        log = store.load_capture_log(symbol)
+    except Exception:  # noqa: BLE001 - no history means everything is owed, never a crash
+        pass
+    lp = plan_lifecycle(path, today, expirations, strikes, samples=samples, log=log,
+                        expiring_days=expiring_days, thin_every=thin_every,
+                        max_far_contracts=max_far_contracts)
+    plan = [(e, r, k, role) for e, r, k, role, _stage in lp.contracts]
+    stage_of = {e: STAGE_A for e in lp.stage_a} | {e: STAGE_B for e in lp.stage_b}
+    res.planned = len(plan)
+    res.stage_a, res.stage_b = len(lp.stage_a), len(lp.stage_b)
+    res.deferred_b = [e.isoformat() for e in lp.deferred_b]
+    mins = len(plan) * 2 * pause_secs / 60.0
+    out(f"  [{symbol}] spot={res.spot:.2f} lookback={duration} stage A (expiring "
+        f"<= {expiring_days}d)={[e.isoformat() for e in lp.stage_a]} stage B (far tail)="
+        f"{[e.isoformat() for e in lp.stage_b]} deferred={res.deferred_b} "
+        f"contracts={len(plan)} (~{mins:.0f} min at {pause_secs:g}s pacing)")
+    if dry_run or not plan:
+        return res
+    done = await _fetch_and_store(ib, symbol, store, window, plan, uprice=uprice,
+                                  duration=duration, pause_secs=pause_secs, sleep=sleep,
+                                  out=out, now=now, report_max_dte=FAR_WINDOW[1] + LOOKBACK_DAYS,
+                                  res=res)
+    try:
+        store.record_captures(symbol, [
+            {"expiry": e.isoformat(), "stage": stage_of.get(e, STAGE_A),
+             "captured_on": today.isoformat(), "dte_at_capture": (e - today).days,
+             "lookback_days": duration_days(duration), "contracts": n}
+            for e, n in sorted(done.items())])
+    except Exception as e:  # noqa: BLE001 - the log is bookkeeping: never fail the run on it
+        out(f"  [{symbol}] WARNING: capture log not written: {type(e).__name__}: {e}")
     return res
 
 
@@ -297,6 +543,10 @@ def symbol_status(res: CollectionResult | None, cov: dict[int, dict[str, int]],
         "stored": getattr(res, "stored", 0), "unqualified": getattr(res, "unqualified", 0),
         "errors": getattr(res, "errors", 0), "spot": getattr(res, "spot", None),
         "dry_run": bool(getattr(res, "dry_run", False)),
+        # W82 lifecycle runs: expiries captured per stage and far expiries owed but deferred
+        "stage_a": int(getattr(res, "stage_a", 0) or 0),
+        "stage_b": int(getattr(res, "stage_b", 0) or 0),
+        "deferred_b": list(getattr(res, "deferred_b", []) or []),
         "coverage": {str(d): v for d, v in cov.items()}, "bands": bands,
     }
 

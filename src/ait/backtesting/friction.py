@@ -137,11 +137,16 @@ def condor_leg_cost_usd(model: LegSpreadModel, leg_mids, capture: float = 1.0,
 # bars, the model below refuses to pretend: it uses the all-DTE model, floors every leg
 # at a conservative per-leg tick, and reports that the number was extrapolated.
 
-SHORT_BAND_EDGES = (2, 6)  # bands: 0-2, 3-6; DTE >= 7 belongs to the all-DTE model
+# W82: bands 0-2, 3-6, 7-13, 14-29, 30-45 (46+ is open). Every band is gated on
+# friction_min_sessions_per_band collected sessions like 0-6 was, but only 0-6 DTE is EXTRAPOLATED
+# (floored at the tick) while unfitted: a 7+ band without a fit keeps being answered by the
+# all-DTE model exactly as before (see BandedFriction.floor_max_dte).
+SHORT_BAND_EDGES = (2, 6, 13, 29, 45)
+FLOOR_MAX_DTE = 6          # the all-DTE sampler's mask started at DTE 7: below it, extrapolation
 
 
 def friction_band(dte: int, edges: tuple[int, ...] = SHORT_BAND_EDGES) -> str:
-    """'0-2', '3-6' or '7+' for a (non-negative) calendar DTE."""
+    """'0-2', '3-6', '7-13', '14-29', '30-45' or '46+' for a (non-negative) calendar DTE."""
     lo = 0
     for e in edges:
         if dte <= e:
@@ -175,6 +180,7 @@ class BandedFriction:
     bands: dict
     floor_usd: float
     edges: tuple[int, ...] = SHORT_BAND_EDGES
+    floor_max_dte: int = FLOOR_MAX_DTE     # bands starting above this are the all-DTE fit's home
 
     def half_spread_usd(self, mid: float, dte: int) -> tuple[float, bool]:
         """(dollars per leg per share, extrapolated?)."""
@@ -183,7 +189,8 @@ class BandedFriction:
         if fitted is not None:
             return fitted.half_spread_usd(mid), False
         v = self.default.half_spread_usd(mid)
-        if band == friction_band(10_000, self.edges):    # the 7+ band: the all-DTE fit's home
+        lo, _hi = band_dte_range(band, self.edges)
+        if lo > self.floor_max_dte:        # W82: 7+ without a fit: the all-DTE model, unfloored
             return v, False
         return max(v, self.floor_usd), True
 

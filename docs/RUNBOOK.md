@@ -234,6 +234,43 @@ python scripts/calibrate_option_spreads.py --source ib-bars --short-dte --symbol
 - **Storage:** `data/historical.db` tables `option_spread_bar_samples` (raw) and
   `option_leg_spread_band_params` (fits). Both are research tables; the live bot never reads them.
 
+### Lifecycle capture (W82): one run a day, each contract downloaded about twice in its life
+
+The per-day collector above asks every contract in range for its last 7 days, every day, so a
+contract is downloaded 5-11 times and `INSERT OR IGNORE` throws the overlap away. IB serves 30 days
+of hourly BID/ASK bars for any LISTED option in one request, and what is perishable is the contract
+at its EXPIRY, not each day. `--lifecycle` therefore captures a contract's life:
+
+```bash
+python scripts/calibrate_option_spreads.py --source ib-bars --short-dte --lifecycle \
+    --symbols QQQ --client-id 91 --dry-run      # the plan: stage A / stage B and the minutes
+python scripts/calibrate_option_spreads.py --source ib-bars --short-dte --lifecycle \
+    --symbols QQQ --client-id 91
+```
+
+- **Stage A (perishable):** expiries today..today+`--expiring-days` (default 1, so one missed day is
+  recoverable). DTE 0 is requested first; run at 15:30 ET like the per-day collector.
+- **Stage B (coverage debt):** far-listed expiries at 15-21 DTE whose DTE 31-45 tail is not stored,
+  nearest first, capped by `--max-far-contracts` (default 120, about 43 minutes); the rest is
+  deferred to the next run. "Not stored" is read from the database (a logged stage-B capture, or
+  at least 5 stored sessions at DTE >= 31), so a missed day or a manual catch-up needs no state file.
+- **Strikes:** the union, over every `--thin-every`-th session of the underlying's path, of what a
+  condor would have sold that day (that day's spot, stored IV and DTE), instead of the strikes near
+  the CURRENT spot. `--thin-every 1` is every session (2-3x the contracts).
+- **Every request asks 30 D**, so a run also recovers the preceding month of sessions for contracts
+  still listed; a run any time within 30 days of a volatility spike retrieves the spike's mid/far-DTE
+  sessions. Only contracts that EXPIRE during a spike need the daily run.
+- **Bands:** 0-2, 3-6, 7-13, 14-29, 30-45 DTE are each fitted and gated on 15 sessions
+  (`backtest.friction_min_sessions_per_band`). Only 0-6 DTE is extrapolated (floored at the tick)
+  while unfitted; a 7+ band without a fit is answered by the all-DTE model as before.
+- **TWS or IB Gateway:** the script and the supervisor job accept either endpoint of the configured
+  account type (paper 7497 <-> 4002, live 7496 <-> 4001) and never probe across account types. The
+  log prints `[port] 7497 ... is not listening; using 4002 (IB Gateway (paper))` when it falls back.
+- **Capture log:** `option_capture_log` in `data/historical.db` (one row per requested expiry and
+  run); the status file adds `stage_a`, `stage_b` and `deferred_b`.
+- **Supervisor job:** set `data_collection.lifecycle: true` (with `short_dte_enabled: true`); the
+  per-day behaviour stays the default.
+
 ### Automatic collection (supervisor job, W76)
 
 Instead of running the command by hand every session, the supervisor (`run_orchestrator.py`) can

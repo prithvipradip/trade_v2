@@ -74,10 +74,13 @@ class TestBanded:
         return BandedFriction(LegSpreadModel("const_usd", a=0.006), bands or {}, floor)
 
     def test_band_labels_round_trip(self):
-        for dte, want in ((0, "0-2"), (2, "0-2"), (3, "3-6"), (6, "3-6"), (7, "7+"), (45, "7+")):
+        # W82: the edges are (2, 6, 13, 29, 45): 0-2, 3-6, 7-13, 14-29, 30-45 and an open 46+
+        for dte, want in ((0, "0-2"), (2, "0-2"), (3, "3-6"), (6, "3-6"), (7, "7-13"),
+                          (13, "7-13"), (14, "14-29"), (29, "14-29"), (30, "30-45"),
+                          (45, "30-45"), (46, "46+"), (200, "46+")):
             assert friction_band(dte) == want
         assert band_dte_range("0-2") == (0, 2) and band_dte_range("3-6") == (3, 6)
-        assert band_dte_range("7+")[0] == 7
+        assert band_dte_range("7-13") == (7, 13) and band_dte_range("46+")[0] == 46
         with pytest.raises(ValueError):
             band_dte_range("9-12")
 
@@ -353,13 +356,13 @@ class TestFit:
         await _run(FakeIB(half_usd=0.012), store)
         out = []
         saved = sc.fit_short_dte_bands("QQQ", store, min_sessions=15, out=out.append)
-        assert set(saved) == {"0-2", "3-6"}
+        assert {"0-2", "3-6"} <= set(saved)          # W82: the longer bands are fitted too
         for band, row in saved.items():
             assert row["a"] == pytest.approx(0.012, abs=1e-6) or row["b"] > 0   # const or pct fit
         text = "\n".join(out)
         assert "collecting:" in text and "more needed" in text      # below 15 sessions
         rows = store.load_leg_spread_band_models("QQQ")
-        assert set(rows) == {"0-2", "3-6"} and all(r["n_sessions"] < 15 for r in rows.values())
+        assert {"0-2", "3-6"} <= set(rows) and all(r["n_sessions"] < 15 for r in rows.values())
 
     @pytest.mark.asyncio
     async def test_a_band_with_enough_sessions_is_reported_active(self, store):

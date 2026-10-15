@@ -169,8 +169,29 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--short-dte-max", type=int, default=6, metavar="DAYS",
         help="--short-dte: furthest expiry to sample (default 6).")
     parser.add_argument(
-        "--short-dte-duration", default="7 D", metavar="DUR",
-        help="--short-dte: history requested per contract (default 7 D: its last week).")
+        "--short-dte-duration", default=None, metavar="DUR",
+        help="--short-dte: history requested per contract (default 7 D: its last week; 30 D "
+             "with --lifecycle, the most IB serves for hourly BID/ASK bars).")
+    parser.add_argument(
+        "--lifecycle", action="store_true",
+        help="--short-dte (W82): capture each contract's LIFE instead of 'every contract in "
+             "range, every day'. Stage A = contracts expiring today..+--expiring-days (the "
+             "perishable part); stage B = far-listed expiries at 15-21 DTE whose DTE 31-45 "
+             "tail is not stored (time-capped by --max-far-contracts). Strikes are the union "
+             "of what a condor would have sold on each (thinned) historical day. Each request "
+             "asks for 30 D, so a run also recovers the preceding month of sessions.")
+    parser.add_argument(
+        "--expiring-days", type=int, default=1, metavar="N",
+        help="--lifecycle: stage A covers expiries today..today+N (default 1: a missed day is "
+             "recoverable the day before).")
+    parser.add_argument(
+        "--thin-every", type=int, default=3, metavar="N",
+        help="--lifecycle: plan strikes from every Nth session of the underlying's path "
+             "(default 3; 1 = every session, 2-3x the contracts).")
+    parser.add_argument(
+        "--max-far-contracts", type=int, default=120, metavar="N",
+        help="--lifecycle: stage-B contract cap per run (default 120 = about 43 min); the rest "
+             "is deferred to the next run.")
     parser.add_argument(
         "--status-file", default=None, metavar="PATH",
         help="--short-dte: write a JSON progress/status file here when the run ends (counters, "
@@ -186,7 +207,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.port is None:
         args.port = _default_ibkr_port()
+    if args.short_dte_duration is None:
+        args.short_dte_duration = "30 D" if args.lifecycle else "7 D"
     return args
+
+
+def _resolve_port(port: int, host: str, probe=None) -> int:
+    """W82: TWS and IB Gateway listen on different ports. When the configured port is closed
+    and the OTHER endpoint of the same account type (paper 7497 <-> 4002, live 7496 <-> 4001)
+    is open, use it. Otherwise return the configured port (the connect error is reported)."""
+    from ait.data.ib_ports import endpoint_label, pick_listening_port, tcp_listening
+    probe = probe or (lambda p: tcp_listening(p, host))
+    chosen = pick_listening_port(port, probe)
+    if chosen is not None and chosen != port:
+        print(f"  [port] {port} ({endpoint_label(port)}) is not listening; "
+              f"using {chosen} ({endpoint_label(chosen)})")
+    return port if chosen is None else chosen
 
 
 def _default_ibkr_port() -> int:
@@ -797,6 +833,7 @@ async def _main(args: argparse.Namespace) -> int:
         ib = None
         if not args.fit_only:
             from ib_insync import IB
+            args.port = _resolve_port(args.port, args.host)
             ib = IB()
             print(f"Connecting to IBKR at {args.host}:{args.port} (clientId={args.client_id})...")
             try:
@@ -818,14 +855,24 @@ async def _main(args: argparse.Namespace) -> int:
             sym_status: dict[str, dict] = {}
             run_error: str | None = None
             for sym in args.symbols:
-                print(f"=== {sym} (short-DTE 0-{args.short_dte_max}) ===")
+                print(f"=== {sym} ("
+                      + ("lifecycle capture" if args.lifecycle
+                         else f"short-DTE 0-{args.short_dte_max}") + ") ===")
                 r = None
                 try:
-                    if ib is not None:
+                    if ib is not None and args.lifecycle:
+                        from ait.data.short_dte_collector import collect_lifecycle
+                        r = await collect_lifecycle(
+                            ib, sym, store, window, duration=args.short_dte_duration,
+                            pause_secs=args.bars_pause_secs, dry_run=args.dry_run,
+                            expiring_days=args.expiring_days, thin_every=args.thin_every,
+                            max_far_contracts=args.max_far_contracts)
+                    elif ib is not None:
                         r = await collect_short_dte(
                             ib, sym, store, window, max_dte=args.short_dte_max,
                             duration=args.short_dte_duration, pause_secs=args.bars_pause_secs,
                             dry_run=args.dry_run)
+                    if ib is not None:
                         if not args.dry_run:
                             print(f"  [{sym}] requested={r.requested} stored={r.stored} "
                                   f"unqualified={r.unqualified} errors={r.errors}"
@@ -833,9 +880,11 @@ async def _main(args: argparse.Namespace) -> int:
                                      if getattr(r, "skipped_partial", 0) else ""))
                     if not args.dry_run:
                         samples = store.load_spread_bar_samples(sym)
-                        cov = coverage(samples, args.short_dte_max)
+                        cov = coverage(samples, 45 if args.lifecycle else args.short_dte_max)
                         print(f"  [{sym}] stored coverage (all runs): DTE -> samples / sessions")
                         for d, c in cov.items():
+                            if args.lifecycle and d > 14 and d not in (21, 29, 30, 45):
+                                continue
                             print(f"      DTE {d}: {c['samples']:6d} samples, {c['sessions']:3d} sessions")
                         saved = fit_short_dte_bands(sym, store, min_sessions=args.min_sessions,
                                                     bands=SHORT_BANDS)

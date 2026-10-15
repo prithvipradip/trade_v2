@@ -626,6 +626,14 @@ sizing_probe:
 #   short_dte_time_et: "15:30"      # BEFORE the close: IB drops the expiring contract after it (DTE 0)
 #   short_dte_symbols: [QQQ]        # ~30-55 min each at IB's historical-data pacing
 #   short_dte_client_id: 91         # must not be IBKR_CLIENT_ID or its +100..+104 ladder
+#   lifecycle: false                # W82: capture each contract's LIFE (stage A at expiry + stage B
+#                                   # far tail) instead of every contract <= short_dte_max_dte daily:
+#                                   # ~20-35 min/day vs 72-108, and ~2 downloads per contract instead
+#                                   # of 5-11 (docs/RUNBOOK.md "Lifecycle capture"). Ignores short_dte_max_dte.
+#   lifecycle_duration: "30 D"      # what IB serves for hourly BID/ASK bars of a listed option
+#   lifecycle_expiring_days: 1      # stage A: expiries today..+N (1 = a missed day is recoverable)
+#   lifecycle_thin_every: 3         # strikes from every Nth session of the underlying's path
+#   lifecycle_max_far_contracts: 120 # stage-B cap per run (~43 min); the rest is deferred
 #   short_dte_max_dte: 6
 #   short_dte_duration: "7 D"
 #   short_dte_timeout_minutes: 150  # hard cap per run

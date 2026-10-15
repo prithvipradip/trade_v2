@@ -55,19 +55,30 @@ def reserved_client_ids(base: int) -> set[int]:
 
 
 def build_command(cfg: Any, *, python: str, script: Path, status_path: Path,
-                  min_sessions: int) -> list[str]:
-    """The collector's argv. The port is NOT passed: the script resolves it from IBKR_PORT
-    (.env), the same value the bot and the gateway probe below use."""
-    return [
+                  min_sessions: int, port: int | None = None) -> list[str]:
+    """The collector's argv. ``port`` (W82) is the endpoint the pre-flight found listening
+    (the configured IBKR_PORT or its TWS / IB Gateway twin); without it the script resolves
+    IBKR_PORT itself."""
+    lifecycle = bool(getattr(cfg, "lifecycle", False))
+    cmd = [
         python, "-u", str(script),
         "--source", "ib-bars", "--short-dte",
         "--symbols", *cfg.short_dte_symbols,
         "--client-id", str(cfg.short_dte_client_id),
         "--short-dte-max", str(cfg.short_dte_max_dte),
-        "--short-dte-duration", str(cfg.short_dte_duration),
+        "--short-dte-duration",
+        str(cfg.lifecycle_duration if lifecycle else cfg.short_dte_duration),
         "--min-sessions", str(int(min_sessions)),
         "--status-file", str(status_path),
     ]
+    if lifecycle:
+        cmd += ["--lifecycle",
+                "--expiring-days", str(int(cfg.lifecycle_expiring_days)),
+                "--thin-every", str(int(cfg.lifecycle_thin_every)),
+                "--max-far-contracts", str(int(cfg.lifecycle_max_far_contracts))]
+    if port is not None:
+        cmd += ["--port", str(int(port))]
+    return cmd
 
 
 def _tail(path: Path, n: int = 6) -> str:
@@ -131,9 +142,14 @@ def run_collection(
             f"short_dte_client_id={cid} collides with the bot's ids "
             f"{sorted(reserved_client_ids(base_client_id))}")
 
-    if not gateway_listening(int(ibkr_port)):
+    # W82: TWS and IB Gateway listen on different ports; accept either endpoint of the
+    # configured account type (paper 7497 <-> 4002, live 7496 <-> 4001), never the other type.
+    from ait.data.ib_ports import endpoint_label, pick_listening_port, port_candidates
+    port = pick_listening_port(int(ibkr_port), gateway_listening)
+    if port is None:
+        tried = ", ".join(f"{p} ({endpoint_label(p)})" for p in port_candidates(int(ibkr_port)))
         return JobOutcome("skipped_gateway_down",
-                          f"nothing is listening on the IB port {ibkr_port} (TWS/Gateway down)")
+                          f"nothing is listening on the IB port ({tried}): TWS / IB Gateway down")
 
     status_path = Path(data_dir) / STATUS_FILE_NAME
     try:  # a stale file from an earlier run must never be mistaken for this run's result
@@ -145,7 +161,7 @@ def run_collection(
     log_path = logs_dir / f"short_dte_collect_{today:%Y%m%d}.log"
     cmd = build_command(cfg, python=python or sys.executable,
                         script=Path(root) / "scripts" / "calibrate_option_spreads.py",
-                        status_path=status_path, min_sessions=min_sessions)
+                        status_path=status_path, min_sessions=min_sessions, port=port)
 
     started = clock()
     timeout_s = float(cfg.short_dte_timeout_minutes) * 60.0

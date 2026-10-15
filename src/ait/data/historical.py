@@ -105,6 +105,9 @@ class HistoricalDataStore:
         # above: that table's primary key is `symbol` alone, and rebuilding it would mean
         # dropping a table other (possibly running) processes read.
         self._leg_spread_band_table = f"{table_prefix}option_leg_spread_band_params"
+        # W82: which expiries the lifecycle collector has already captured, and at what DTE, so a
+        # run knows what is still owed without a state file (a row per capture, never updated).
+        self._capture_log_table = f"{table_prefix}option_capture_log"
         self._option_daily_bars_table = f"{table_prefix}option_daily_bars"
         self._risk_free_rates_table = f"{table_prefix}risk_free_rates"
         self._econ_events_table = f"{table_prefix}econ_events"
@@ -276,6 +279,18 @@ class HistoricalDataStore:
                     role              TEXT,            -- 'short' | 'wing' (delta bucket vs wing strike)
                     source            TEXT,
                     PRIMARY KEY (symbol, bar_time, right, strike, expiry)
+                )
+            """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._capture_log_table} (
+                    symbol          TEXT    NOT NULL,
+                    expiry          TEXT    NOT NULL,   -- ISO date of the captured expiry
+                    stage           TEXT    NOT NULL,   -- 'A' (at expiry) | 'B' (far coverage)
+                    captured_on     TEXT    NOT NULL,   -- ET date of the run
+                    dte_at_capture  INTEGER NOT NULL,
+                    lookback_days   INTEGER NOT NULL,
+                    contracts       INTEGER NOT NULL,   -- contracts requested for this expiry
+                    PRIMARY KEY (symbol, expiry, stage, captured_on)
                 )
             """)
             conn.execute(f"""
@@ -1083,6 +1098,28 @@ class HistoricalDataStore:
                  int(row["n"]), int(row["n_sessions"]), row.get("cv_mae"),
                  json.dumps(row.get("cv_mae_by_form") or {}), row.get("source"),
                  str(row["calibrated_on"])))
+
+    def record_captures(self, symbol: str, rows: list[dict]) -> int:
+        """W82: INSERT OR REPLACE one row per (expiry, stage, run date) the lifecycle collector
+        requested. Returns rows written."""
+        if not rows:
+            return 0
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                f"""INSERT OR REPLACE INTO {self._capture_log_table}
+                   (symbol, expiry, stage, captured_on, dte_at_capture, lookback_days, contracts)
+                   VALUES (?,?,?,?,?,?,?)""",
+                [(symbol, str(r["expiry"]), str(r["stage"]), str(r["captured_on"]),
+                  int(r["dte_at_capture"]), int(r["lookback_days"]), int(r["contracts"]))
+                 for r in rows])
+        return len(rows)
+
+    def load_capture_log(self, symbol: str) -> pd.DataFrame:
+        """W82: every recorded capture for ``symbol`` (empty frame when none)."""
+        with sqlite3.connect(self._db_path) as conn:
+            return pd.read_sql_query(
+                f"SELECT * FROM {self._capture_log_table} WHERE symbol = ? ORDER BY captured_on",
+                conn, params=(symbol,))
 
     def load_leg_spread_band_models(self, symbol: str) -> dict[str, dict]:
         """W76: {dte_band: row} of every stored band model for ``symbol`` (may be empty)."""
