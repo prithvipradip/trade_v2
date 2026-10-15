@@ -17244,3 +17244,63 @@ rate re-solve), D3, D4, D5, D6, D7, the range-gate mode, the window design, the 
 `scripts/gate_parity_ab.py` and run the credit-floor sensitivities before quoting any short-DTE number.
 
 ---
+
+
+## 2026-10-16 - DESIGN (not implemented): friction data collection by contract LIFECYCLE instead of "every contract, every day"; approved in principle, phases separately approvable
+
+No code change, nothing restarted or pushed. Research data tooling only. Recorded here because PLAN.md is the only programme document; the design was worked out in a plan-mode session on
+2026-10-15/16 after the operator asked whether sampling more DTE per day is better, whether the bot must stay down while collecting, and whether a mixed sampling design is sound.
+
+**STATE OF THE COLLECTION AT THIS ENTRY (operational, not in the repo).** The collector runs once per trading day at 15:30 ET from a detached waiter (QQQ, client id 91, TWS paper port
+7497). After the 2026-10-15 run: band 0-2 4/15 sessions, band 3-6 8/15. On 2026-10-15 17:51 ET the waiter was restarted with `--short-dte-max 14` for 2026-10-16..2026-10-30 (11 trading
+days; about 72 minutes per run). The supervisor job is still not enabled. Weekend runs were rejected by the operator: TWS is not assumed up outside Mon-Fri, and not even on every weekday.
+
+**FINDINGS (measured, read-only; they correct earlier estimates in this thread).**
+1. **Each contract is downloaded 5-11 times.** A run asks for `7 D` of hourly BID/ASK bars for every contract in range and `INSERT OR IGNORE` discards the overlap. Stored QQQ samples:
+   expiry 2026-10-15 was sampled on 11 distinct days, 2026-10-14 on 10, 2026-10-13 on 9.
+2. **IB serves 30 days of hourly BID/ASK bars for a listed option in one request**: the all-DTE sampler uses `--bars-duration 30 D`, and expiry 2026-10-30 holds 30 distinct sessions from
+   2026-08-27 (DTE 64) to 2026-10-08 (DTE 22). **What is perishable is the contract at its expiry** (not served after 16:00 ET, W76b), not each day.
+3. **Plan sizes by dry-run (2026-10-15, 10.8 s per request, 2 requests per contract):** 0-6 DTE 86 contracts / 31 min; 0-14 DTE 201 contracts (11 expiries) / 72 min; 0-45 DTE 300
+   contracts (16 expiries) / 108 min; the 15-45 tail alone is 5 Friday expiries / about 99 contracts / 36 min. **This corrects the earlier "1.5-2.5 h" estimate for 0-45.** Expiries
+   beyond 14 days are Fridays only, so Mon-Thu contracts live at most about 14 days.
+4. **Stored QQQ coverage by DTE (sessions):** 0-2 4, 3-6 8, 7-13 10, 14-29 6, 30-64 30. **All 35 stored sessions (2026-08-27..2026-10-15) had VIX 14.2-17.8** (median 15.4, 16.5 latest): the
+   calibration is a calm-regime calibration, and the live bot's DTE range (14-29) is the thinnest.
+5. **Mixed sampling designs.** The all-DTE sampler (one expiry per DTE target; 6 delta buckets, $2/$3/$5 wings) and the short-DTE collector (every listed expiry; 5 moneyness anchors, 3
+   delta buckets, $2/$5 wings) write to the same table with the same `source` string, so they cannot be told apart afterwards. The fit regresses half-spread on the option's own mid with
+   one relevance mask, so mixing is tolerable, but it weights strikes and expiries differently and is not auditable.
+6. **Bands exist only for 0-2 and 3-6 DTE** (`SHORT_BAND_EDGES = (2, 6)`); 7+ uses one pooled fit with no per-band session gate. `BandedFriction` floors every band without a fitted
+   model, so adding bands needs the floor restricted to 0-6 DTE or the 7-45 DTE studies would silently change.
+7. **Pacing.** The collector uses about 55 of IB's 60 historical requests per 10 minutes for the whole run. The live bot also uses `reqHistoricalDataAsync` (`data/market_data.py`).
+   Whether IB enforces the limit across API clients is UNVERIFIED. The bot is down today, so there is no conflict yet.
+
+**THE DESIGN (recommended; "lifecycle capture").**
+- **One run per trading day, Mon-Fri, 15:30 ET, no weekend job and no fixed weekly cadence.** Every request asks for 30 D of hourly BID/ASK bars.
+- **Stage A (perishable):** contracts expiring TODAY and TOMORROW (a missed day then costs at most one day's bars). DTE 0 requested first.
+- **Stage B (coverage debt, same run, after A, time-capped):** listed expiries <= 45 DTE whose stored data does not yet reach the deepest DTE their 30 D lookback can give (derived from
+  the DB on every run: self-healing, no state file), nearest expiry first. Any weekday run inside an expiry's 30-day window captures it.
+- **Strike rule, one rule evaluated per historical day (path-aware), thinned:** per (expiry, right), for every 3rd session of the underlying's hourly path already fetched with the same
+  lookback, apply the existing per-day rule (`plan_short_dte_strikes` for DTE <= 6, `plan_strikes` with the compact buckets above) with that day's spot, stored IV and DTE; the union of
+  listed strikes within +-12% of spot is requested. This removes the current bias (strikes planned at the spot of the END of a contract's life).
+- **Budget (offline estimate; the dry-run gives the exact figure):** stage A about 60-100 contracts = 20-35 min per day; stage B about 30-50 contracts = 10-18 min on a day with debt.
+  Each contract is downloaded about twice in its life; DTE 0-51 are observed; versus 72 min (0-14) or 108 min (0-45) daily today.
+- **Regime:** no trigger needed. Because every capture looks back 30 days, a run within 30 days of a spike retrieves its mid/far-DTE sessions retroactively; only contracts expiring
+  DURING the spike need the daily stage A. The 0-6 DTE bands still need about 11 more sessions (expired contracts cannot be recovered).
+- **Bands:** edges `(2, 6, 13, 29, 45)`; the extrapolation floor stays 0-6 DTE only; a 7-45 band keeps using the pooled model until it has 15 sessions.
+
+**RISKS.** (1) A contract that expires on a day nothing ran and was never captured earlier is lost (mitigated by stage A on E-1, stage B, and a status-file list of uncaptured expiries).
+(2) The 30 D lookback is proven only for far-dated contracts: the first stage-A run must show a DTE 0 contract returning more than 7 sessions, else fall back to "daily 0-14 + a same-planner
+far job". (3) Thinning (every 3rd session) is a budget knob, not a constant. (4) Calm-regime bias persists until a stress episode occurs; the design guarantees only that one is not
+missed. `friction_stress_multiplier` (1.0) remains the interim hedge. (5) Research tooling only: no live file, no order path.
+
+**PHASES (each separately approvable; none started).** 0: a one-off catch-up with the EXISTING script on a weekday evening after the 15:30 run (`--source ib-bars --short-dte
+--short-dte-max 45 --short-dte-duration "30 D"`, about 108 minutes; fills the 7-45 DTE bands for about 20 past sessions at once and tests the 30 D assumption). 1: collector
+(`plan_lifecycle`, stages, status file, tests, mutation check). 2: bands and the floor rule. 3: scheduling (the single daily slot; the supervisor job when the operator decides to run
+the supervisor).
+
+**DECISIONS LEFT FOR THE OPERATOR.** (1) Implement the design (the interim alternative is "0-45 daily": sound, no code, 108 min per day). (2) Phase 0 catch-up tonight/this week.
+(3) Stage A redundancy: today + tomorrow (recommended) vs today only. (4) Thinning: every 3rd session (recommended) vs every day (2-3x the contracts). (5) Band edges
+`(2, 6, 13, 29, 45)` (recommended) or coarser. (6) Keep the bot down during the 15 sessions, or run it and accept a shorter pacing overlap (stage A about 20-35 minutes).
+
+**NEXT.** Operator answers the list above; then Phase 0 (no code) and/or Phase 1. Until then the daily 0-14 waiter keeps running.
+
+---
