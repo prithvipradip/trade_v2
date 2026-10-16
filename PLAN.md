@@ -17767,3 +17767,72 @@ assignment history or a research early-assignment model (rule 3e twin); keep liv
 **NEXT.** W83a (the strike-aware range study: pass rule accepted with QQQ primary; the EDGAR contact is configured locally in `.env`); its live-eligible subset now uses this gate's `live` mode.
 
 ---
+
+
+## 2026-10-17 - W83a AS PLANNED + PRE-REGISTRATION AMENDMENT 4 (before any run): the strike-aware range study in two parts; weights from QQQ's own filings; every decision of the wave in one table
+
+Plan approved by the operator 2026-10-17. Written BEFORE any W83a code and before any result, so this amendment keeps the pre-registration clean. Research only; no live file; nothing restarted. The W83 entry
+and amendments 1-3 are not edited; where they differ, this entry governs.
+
+**FINDINGS FROM THE CODE READ AND SOURCE PROBES (2026-10-17).**
+- Data: `ResearchData.daily_frame()` (`backtesting/replay.py`) reads `research_daily_prices` read-only; IV is its `implied_vol` column, in decimals (SPY mean 0.152, QQQ 0.191, IWM 0.210); about 4,020 rows per
+  symbol, 2010-10..2026-10, 1-3 missing IV rows each. VIX / VIX3M / VIX9D exist only in the UNPREFIXED `daily_iv` table, 2018-08..2026-08, with a NULL source. `research_econ_events` starts 2024.
+- Code: no realized-variance or HAR estimator exists anywhere (src, scripts, deprecated). `features.py` fractal features use an EXPANDING window from row 0 (O(n^2) over 4,000 rows). The `iv_rank` feature is a
+  realized-vol range rank, not live's stored-IV percentile (`ait.data.iv_rank`). `range_spec.horizon_for(14)` = 9 (`EXPIRY_APPROACHING_DTE` 5). Installed: lightgbm 4.6, scikit-learn 1.8 (`QuantileRegressor`),
+  scipy, statsmodels, arch; `hypothesis` is not. Guards a new module must respect: W68 (nothing under `src/ait` may name the research config), the W71 / W84 AST guards (a module under `ml/` may not name the
+  research switches).
+- Sources (reachable with the configured SEC contact): the QQQ trust (CIK 1067839) files an N-30B-2 annual report every year 2009-2025 whose Schedule of Investments lists each holding's name, shares and dollar
+  value (e.g. 2015-09-30: Apple $4.85bn, Microsoft $2.73bn, Amazon $1.85bn, ...), and NPORT-P quarterly holdings 2019-11..2026-08 (28 filings); the Fed's per-year pages (`fomchistoricalYYYY.htm`,
+  `fomccalendars.htm`) list scheduled FOMC meetings; the BLS archives (`/bls/news-release/cpi.htm`, `empsit.htm`) link every past release as `..._MMDDYYYY.htm`, i.e. the release date is in the link; EDGAR
+  company submissions list 8-K Item 2.02 filings with acceptance timestamps.
+
+**AMENDMENT 4 (the target, the baselines, the folds, the metrics and the PASS RULE are unchanged).**
+1. **Mega-cap weights from QQQ's own filings** (operator decision 2026-10-17), replacing amendment 2 item 2 (XBRL shares outstanding x close): each annual (N-30B-2) or quarterly (NPORT-P) report gives top-10 weights
+   = holding value / total net assets, Alphabet's classes merged; a report's weights apply from its FILING date (no look-ahead) until the next filing. The company set is the union of the reports' top 10s, mapped
+   to CIKs in a checked-in table. It is QQQ's actual exposure, needs no company price history and has no stock-split error. Weights refresh yearly before 2020 and quarterly after.
+2. **Earnings timing:** EDGAR's `acceptanceDateTime` is taken as UTC and converted to ET; the assumption is verified on 3 known releases before use (accepted after 16:00 ET -> next session; before 09:30 -> same session).
+3. **Realized variance (baseline B):** Garman-Klass daily variance; HAR = OLS of log RV over the next h days on log RV over 1, 5 and 22 days, fitted on the training folds only, giving sigma_HAR.
+4. **Fractal features with a fixed lookback:** `multifractal_width` = `FeatureEngine._mfdfa_features` over the trailing 504 returns; `hurst_scale_spread` = `_multiscale_hurst` over the trailing 180. First
+   usable row about 2012-10 (training from about 2012-10 instead of 2011).
+5. **IV rank = live's definition** (`ait.data.iv_rank.iv_rank_series`).
+6. **Quantiles to probability (C, C-lin):** tau = 0.05, 0.10, ..., 0.95 (19) of log M, sorted to be monotone; F(z) interpolated linearly in log M and clipped to [0.025, 0.975] outside the tau range. CRPS
+   approximated by 2 x the mean pinball loss over the tau grid.
+7. **QQQ candidate (pooled vs QQQ-only fit):** inside each training window the last training year is a validation year; the fit with the better QQQ BSS there is the candidate.
+8. **Barrier baseline A:** P(no touch at z) = (4/pi) sum_k (-1)^k / (2k+1) exp(-(2k+1)^2 pi^2 / (8 z^2)) (two-sided Brownian no-exit; z is already in sigma_h units, so T = 1).
+9. **Live-eligible subset:** no ex-date in [D, listed_expiry(D, 14)] under `ex_div_blocks("live", ...)` (W84).
+
+**ALL DECISIONS OF THIS WAVE (consolidated; earlier entries hold the detail).**
+
+| # | Decision | Options faced | Chosen | When / by |
+|---|---|---|---|---|
+| 1 | What the range model predicts | fixed +-5% label; one classifier per delta; strike distance as an input with a monotone constraint; the excursion in implied-move units | the excursion ("Option A") | operator, 2026-10-16 |
+| 2 | Pass rule | accept; loosen; tighten; require QQQ | accepted; a verdict per symbol with QQQ primary; the pooled "2 of 3" condition retired (amendment 3) | operator, 2026-10-16 |
+| 3 | Changing the rule later | - | before results: a normal amendment; after results: a POST-HOC amendment, with the old verdict always reported beside the new one | operator, 2026-10-16 |
+| 4 | Event features | a 2024+ check only; a scheduled calendar from 2010 | FOMC / CPI / NFP from 2010, scheduled events only (amendment 1) | operator, 2026-10-16 |
+| 5 | Earnings data | yfinance (needs `lxml`, not installed); Finnhub (no history on the key); SEC EDGAR 8-K Item 2.02 | EDGAR (amendment 2) | 2026-10-16, from the probes |
+| 6 | Dividend data | yfinance | yfinance into `research_dividends` (built in W84) | 2026-10-16 |
+| 7 | Mega-cap weights | XBRL shares x price; QQQ's own filings | QQQ's own filings (amendment 4) | operator, 2026-10-17 |
+| 8 | SEC contact | a fake address (declined: SEC fair access asks for a real contact); a real alias | an alias, stored only in the local `.env` as `SEC_EDGAR_CONTACT` (never in the repo) | operator, 2026-10-16 |
+| 9 | Order | W83a first; F1 first | F1 first (W84, built 2026-10-16) | operator, 2026-10-16 |
+| 10 | Delivery | one wave; two parts | W83a-1 (event data, validated) then W83a-2 (the study) | operator, 2026-10-17 |
+| 11 | Live-eligible subset | none; via the ex-dividend rule | reported for every verdict, W84 `live` mode | amendment 2 + W84 |
+| 12 | Choices fixed before any result | - | amendment 4 items 2-8 | this entry |
+
+**W83a-1 (event data).** `ait.data.research_calendars` (pure parsers; no network; never imported by the live tree): FOMC pages, BLS archives, N-30B-2 schedules, NPORT-P XML, top-10 weights with the Alphabet
+merge, 8-K Item 2.02 rows, session timing, one release per fiscal quarter. `historical.py` tables `{prefix}econ_schedule`, `{prefix}qqq_holdings`, `{prefix}earnings_schedule` (provenance column each).
+`scripts/build_research_calendars.py --what econ|holdings|earnings|all --table-prefix research_ [--dry-run]` (SEC contact from `.env`, at most 10 requests/s; validations must pass before writing: FOMC 8 / CPI
+12 / NFP 12 a year with exceptions listed, every 2024-01..2026-10 date matched against `research_econ_events`, one annual report per year and 28 NPORT-P, top-10 weight sum 25-75%, about 4 releases per company
+per year, the UTC check). Tests on trimmed real fixtures; spot-check 5 dates per calendar by hand.
+
+**W83a-2 (the study).** `ait.ml.excursion` (pure): excursions, z(delta), the barrier series, Garman-Klass, HAR, quantile CDF, Brier / BSS / CRPS / calibration, the stationary bootstrap, yearly folds with purge
+and embargo. `scripts/excursion_range_study.py` (`use_research_config()` first; read-only; asserts every input loaded): A / A' / B / C / C-lin per fold, test years 2019..2026, the five deltas, verdicts QQQ first
+on all days and on the live-eligible subset, the registered sensitivities; PASS / FAIL / MIXED printed per symbol under the rule as registered.
+
+**PLAN.MD UPDATES.** This entry; a W83a-1 AS BUILT entry (data written, every validation result, gates); a W83a-2 AS BUILT + RESULT entry (full tables, verdicts, sensitivities, outcome). Deviations go under FELL
+SHORT / DIFFERED; anything touching the rule after results is a POST-HOC amendment.
+
+**OUT OF SCOPE.** W83b (wiring into the research gate), live changes, options-implied earnings moves, other event kinds.
+
+**NEXT.** W83a-1.
+
+---
