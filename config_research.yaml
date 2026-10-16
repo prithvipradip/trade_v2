@@ -90,6 +90,23 @@ backtest:
                                        #   live-only VIX halt (risk.credit_vix_halt) are the other two one-sided entry gates;
                                        #   both were also inert in that A/B (0 days gated; 0 trades on VIX >= 28 days).
 
+  # --- W84: live's ex-dividend ENTRY block, research twin (operator decisions 2026-10-16) ---
+  ex_div_entry_gate: live              # WHAT: refuse a new position that SELLS A CALL when an ex-dividend date falls in
+                                       #   [entry, expiry]: live's W51 block (orchestrator trade_blocked_ex_div), which
+                                       #   exists because a short call can be assigned early the day before an ex-date.
+                                       # WHY LIVE: parity. Live refuses 14-17% of sessions this way (SPY / QQQ / IWM,
+                                       #   2024-01..2026-10, entry DTE 14); before W84 research traded those days and
+                                       #   earned 22-39% of its reference P&L on them (PLAN.md 2026-10-16 finding).
+                                       # MODES: off | live (ONE projected ex-date, dividends.project_next_ex_div over the
+                                       #   ex-dates known before the entry day: exactly live's rule) | exact (any real
+                                       #   ex-date in the window) | last_k_days (a real ex-date within
+                                       #   backtest.ex_div_entry_k_days, default 5, of expiry: the F2 candidate).
+                                       # DATA: research_dividends (scripts/backfill_dividends.py); any mode but off raises
+                                       #   without it, so the gate can never be silently inert.
+                                       # MEASURED: scripts/ex_div_gate_ab.py, recorded in the W84 AS BUILT PLAN entry.
+                                       # TO CHANGE: a study may pass another mode; changing the default here needs a PLAN
+                                       #   entry. If live's rule changes (F2 / F3), change this mode with it.
+
   # --- W67: gate parity + graded objective ---
   gates_mode: enforce                  # 2026-10-10 operator decision: ML gates ON in RESEARCH (range floor + fractal veto
                                        # block) so the models being improved actually matter in studies. Live stays

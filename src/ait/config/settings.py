@@ -989,6 +989,25 @@ class BacktestConfig(_StrictModel):
                     "'trending_up' in the research engine (position entry_regime and the "
                     "meta-label regime features; it never vetoes). Was a bare 0.02. Research "
                     "only.")
+    ex_div_entry_gate: Literal["off", "live", "exact", "last_k_days"] = Field(default="off",
+        description="W84: the research TWIN of live's ex-dividend entry block (W51, orchestrator "
+                    "trade_blocked_ex_div): refuse a new position that SELLS A CALL when an "
+                    "ex-dividend date falls between the entry day and the position's expiry "
+                    "(early-assignment risk on the short call). 'live' = live's rule exactly: "
+                    "ONE projected ex-date (dividends.project_next_ex_div over the ex-dates "
+                    "known before the entry day). 'exact' = any real ex-date in [entry, "
+                    "expiry]. 'last_k_days' = only a real ex-date within ex_div_entry_k_days "
+                    "of expiry (where little extrinsic is left; the F2 candidate). 'off' = no "
+                    "block; a day it would have blocked is still flagged ex_div_in_window when "
+                    "the dividend table is loaded. Needs the {research_table_prefix}dividends "
+                    "table (scripts/backfill_dividends.py); any mode but 'off' raises without "
+                    "it. Schema default 'off' so a bare Backtester and every regression "
+                    "baseline are unchanged; the research overlay sets 'live' (parity; PLAN.md "
+                    "2026-10-16 ex-dividend finding: live refuses 14-17% of sessions).")
+    ex_div_entry_k_days: int = Field(default=5, ge=1, le=30,
+        description="W84: K for ex_div_entry_gate 'last_k_days': block only when a real "
+                    "ex-date is at most K calendar days before the position's expiry. Not "
+                    "searched by the optimizer. Ignored in the other modes.")
     min_edge_over_baseline: float = Field(default=0.05, ge=0.0, le=1.0,
         description="R20b: minimum weighted CV edge over the base rate for the "
                     "range predictor to activate as an entry gate (Exp 28 quality "

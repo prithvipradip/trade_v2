@@ -317,6 +317,7 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
     warnings.extend(one_sided_gate_warnings(_bt_cfg, settings))
     backtest["regime_veto_gate"] = bool(getattr(_bt_cfg, "regime_veto_gate", True))
     backtest["max_entry_vol_annual"] = getattr(_bt_cfg, "max_entry_vol_annual", None)
+    backtest["ex_div_entry_gate"] = getattr(_bt_cfg, "ex_div_entry_gate", None)   # W84
     backtest["live_only_gates_not_simulated"] = [g.reason for g in LIVE_ONLY_GATES]
 
     notes = [

@@ -113,6 +113,8 @@ class StrategyOptimizer:
         iv_rank_gate: bool | None = None,            # W68 IV-rank parity (None -> config)
         iv_rank_rise_gate: bool | None = None,       # W71c research-only rise veto on/off (None -> config)
         regime_veto_gate: bool | None = None,        # W81 research-only regime veto on/off (None -> config)
+        ex_div_entry_gate: str | None = None,        # W84 live's ex-div entry block twin (None -> config)
+        ex_div_entry_k_days: int | None = None,      # W84 K for last_k_days (None -> config); not searched
         iv_rank_series: dict | None = None,          # W68 {symbol: rank by date}, full history
         fractal_veto_spread: float | None = None,
         penalty_on_range_prob: float | None = None,
@@ -278,6 +280,10 @@ class StrategyOptimizer:
             iv_rank_rise_gate, "backtest", "iv_rank_rise_gate", _BTC2, self._settings))
         self._regime_veto_gate = bool(_rcv(
             regime_veto_gate, "backtest", "regime_veto_gate", _BTC2, self._settings))   # W81
+        self._ex_div_entry_gate = str(_rcv(
+            ex_div_entry_gate, "backtest", "ex_div_entry_gate", _BTC2, self._settings))     # W84
+        self._ex_div_entry_k_days = int(_rcv(
+            ex_div_entry_k_days, "backtest", "ex_div_entry_k_days", _BTC2, self._settings))  # W84
         # W70: were literals 5.0 / 0.0 / 0.80 (and trailing 0.25, breakeven 0.30, delta 0.20 /
         # 0.30 in _run_backtest's bt_kwargs); the wing floor moves 5.0 -> 2.0 (live parity).
         # W70: the SAME contract call live uses (AIT_IC_WING_FLOOR) — live AND research.
@@ -702,6 +708,8 @@ class StrategyOptimizer:
             "iv_rank_gate":          self._iv_rank_gate,
             "iv_rank_rise_gate":     self._iv_rank_rise_gate,    # W71c
             "regime_veto_gate":      self._regime_veto_gate,     # W81
+            "ex_div_entry_gate":     self._ex_div_entry_gate,    # W84
+            "ex_div_entry_k_days":   self._ex_div_entry_k_days,  # W84
             "fractal_veto_spread":   self._fractal_veto_spread,
             "penalty_on_range_prob": self._penalty_on_range_prob,
             "max_contracts_per_trade": self._max_contracts_per_trade,

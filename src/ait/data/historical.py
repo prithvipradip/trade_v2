@@ -40,6 +40,7 @@ SOURCE_IB_OPTION_IV = "IB_OPTION_IV"        # IB OPTION_IMPLIED_VOLATILITY daily
 SOURCE_UNRECORDED = "UNRECORDED"            # label used when READING NULL source rows
 SOURCE_INVESTING_CSV = "INVESTING_CSV"      # operator-compiled Investing.com economic calendar CSV
 SOURCE_IB_BID_ASK_BARS = "IB_BID_ASK_BARS"  # W66: IB hourly BID+ASK bars of listed options
+SOURCE_YAHOO_DIVIDENDS = "YAHOO_DIVIDENDS"  # W84: yfinance Ticker.dividends (ex-date, amount/share)
 
 # Historical risk-free-rate follow-up: the SOFR term structure's tenor
 # points in days-to-maturity, in the SAME order get_risk_free_rate's SELECT
@@ -111,6 +112,9 @@ class HistoricalDataStore:
         self._option_daily_bars_table = f"{table_prefix}option_daily_bars"
         self._risk_free_rates_table = f"{table_prefix}risk_free_rates"
         self._econ_events_table = f"{table_prefix}econ_events"
+        # W84: past ex-dividend dates per symbol, for the research ex-dividend entry gate
+        # (and W83a). The live bot never reads it: live fetches its own from yfinance.
+        self._dividends_table = f"{table_prefix}dividends"
         self._init_db()
 
     def _init_db(self) -> None:
@@ -279,6 +283,16 @@ class HistoricalDataStore:
                     role              TEXT,            -- 'short' | 'wing' (delta bucket vs wing strike)
                     source            TEXT,
                     PRIMARY KEY (symbol, bar_time, right, strike, expiry)
+                )
+            """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._dividends_table} (
+                    symbol      TEXT NOT NULL,
+                    ex_date     TEXT NOT NULL,   -- ISO date (ET calendar date of the ex-date)
+                    amount      REAL,            -- cash per share
+                    source      TEXT NOT NULL,   -- SOURCE_* provenance tag
+                    fetched_at  TEXT NOT NULL,   -- ISO timestamp of the fetch
+                    PRIMARY KEY (symbol, ex_date)
                 )
             """)
             conn.execute(f"""
@@ -534,6 +548,38 @@ class HistoricalDataStore:
             row = conn.execute(
                 f"SELECT MIN(event_date), MAX(event_date), COUNT(*) FROM {self._econ_events_table}"
             ).fetchone()
+        return None if not row or not row[2] else (row[0], row[1], int(row[2]))
+
+    def save_dividends(self, symbol: str, rows: "list[tuple[date, float | None]]", source: str,
+                       fetched_at: str) -> int:
+        """W84: upsert (ex_date, amount) rows for a symbol (see scripts/backfill_dividends.py)."""
+        if not rows:
+            return 0
+        payload = [(symbol, str(d), None if a is None or a != a else float(a), source, fetched_at)
+                   for d, a in rows]
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                f"""INSERT OR REPLACE INTO {self._dividends_table}
+                    (symbol, ex_date, amount, source, fetched_at) VALUES (?,?,?,?,?)""",
+                payload,
+            )
+        log.debug("dividends_saved", symbol=symbol, rows=len(payload), source=source)
+        return len(payload)
+
+    def load_dividends(self, symbol: str) -> "list[tuple[date, float | None]]":
+        """W84: a symbol's stored (ex_date, amount) rows, ascending by ex-date."""
+        with sqlite3.connect(self._db_path) as conn:
+            rows = conn.execute(
+                f"SELECT ex_date, amount FROM {self._dividends_table} WHERE symbol=? "
+                f"ORDER BY ex_date", (symbol,)).fetchall()
+        return [(date.fromisoformat(d), a) for d, a in rows]
+
+    def dividends_span(self, symbol: str) -> "tuple[str, str, int] | None":
+        """(first_ex_date, last_ex_date, rows) for a symbol, or None when it has none."""
+        with sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(
+                f"SELECT MIN(ex_date), MAX(ex_date), COUNT(*) FROM {self._dividends_table} "
+                f"WHERE symbol=?", (symbol,)).fetchone()
         return None if not row or not row[2] else (row[0], row[1], int(row[2]))
 
     def source_summary(self, symbol: str) -> dict[str, tuple[int, str, str]]:

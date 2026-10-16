@@ -50,6 +50,8 @@ ENGINE_REJECT_REASONS: dict[str, GateRow] = dict([
     _g("iv_rank_cap", TWIN, "risk manager VRP cap AIT_IV_RANK_CAP"),
     _g("macro_event", TWIN, "orchestrator pre-event blackout (risk.pre_event_blackout_days)"),
     _g("earnings", TWIN, "earnings proximity guard (W70 parity)"),
+    _g("ex_div_entry", TWIN, "W51 orchestrator trade_blocked_ex_div: a call-selling entry whose "
+       "[entry, expiry] spans the projected ex-date (W84 twin, backtest.ex_div_entry_gate)"),
     _g("max_concurrent", TWIN, "risk manager max open positions / credit cap"),
     _g("max_concurrent_intraday", TWIN, "risk manager max open positions / credit cap"),
     _g("direction_confidence", TWIN, "directional strategies only; condors are exempt (L5)"),
@@ -156,4 +158,19 @@ def one_sided_gate_warnings(bt_cfg: Any, live_settings: Any) -> list[str]:
             "(risk.credit_vix_halt) and caps open credit positions by VIX tier; the research "
             "engine has no twin, so it may trade days live cannot. Quantify with "
             "scripts/gate_parity_ab.py; see the W81 PLAN entry (P3 / decision D11).")
+    ex_div = getattr(bt_cfg, "ex_div_entry_gate", None)
+    if ex_div == "off":
+        out.append(
+            "ex_div_entry: OFF in research - live refuses a call-selling entry whose [entry, "
+            "expiry] spans the projected ex-dividend date (W51; 14-17% of sessions at entry DTE "
+            "14), so research trades days live cannot. Set backtest.ex_div_entry_gate: live for "
+            "parity; quantify with scripts/ex_div_gate_ab.py (PLAN.md W84).")
+    elif ex_div in ("exact", "last_k_days"):
+        k = getattr(bt_cfg, "ex_div_entry_k_days", None)
+        rule = ("any real ex-date in [entry, expiry]" if ex_div == "exact"
+                else f"a real ex-date within {k} days of expiry")
+        out.append(
+            f"ex_div_entry: research blocks on {rule} (mode {ex_div}); live blocks on ONE "
+            "PROJECTED ex-date in [entry, expiry] (mode live). A deliberate deviation for the "
+            "F2 / F3 study (PLAN.md W84), not parity.")
     return out

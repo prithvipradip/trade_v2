@@ -33,6 +33,7 @@ from ait.backtesting.pricing import (
 )
 from ait.backtesting import settlement  # W77: expiry settlement / assignment rules
 from ait.backtesting.result import BacktestResult
+from ait.backtesting.ex_div import ex_div_blocks, sells_a_call  # W84: live's ex-div entry block
 # R20 #5a: credit TP ladder / DTE close / macro-flatten windows come from the
 # shared exit-policy module (pure, import-light) instead of a hand copy of
 # live portfolio.py — a live tuning can no longer silently de-sync research.
@@ -235,6 +236,8 @@ class Backtester:
         regime_veto_gate: bool | None = None,           # W81: None -> backtest.regime_veto_gate
         regime_down_threshold: float | None = None,     # W81: None -> backtest.regime_down_threshold
         regime_up_threshold: float | None = None,       # W81: None -> backtest.regime_up_threshold
+        ex_div_entry_gate: str | None = None,           # W84: None -> backtest.ex_div_entry_gate
+        ex_div_entry_k_days: int | None = None,         # W84: None -> backtest.ex_div_entry_k_days
         risk_free_rate: float | None = None,            # W81: None -> options.risk_free_rate
         pct_from_60d_high_threshold: float | None = None,
         min_edge_over_baseline: float | None = None,
@@ -436,6 +439,9 @@ class Backtester:
         regime_veto_gate = bool(_bt(regime_veto_gate, "regime_veto_gate"))
         regime_down_threshold = float(_bt(regime_down_threshold, "regime_down_threshold"))
         regime_up_threshold = float(_bt(regime_up_threshold, "regime_up_threshold"))
+        ex_div_entry_gate = str(_bt(ex_div_entry_gate, "ex_div_entry_gate"))
+        ex_div_entry_k_days = int(_bt(ex_div_entry_k_days, "ex_div_entry_k_days"))
+        _research_prefix = str(_bt(None, "research_table_prefix"))
         # W81: the SAME key live's Greeks read (options_chain._risk_free_rate); was a bare
         # `r = 0.05` at three pricing sites below.
         risk_free_rate = float(_resolve_setting(
@@ -543,6 +549,12 @@ class Backtester:
         self._regime_veto_gate = regime_veto_gate       # W81: False = no veto; the class is still logged
         self._regime_down = regime_down_threshold       # W81: was a bare -0.05 at three sites
         self._regime_up = regime_up_threshold           # W81: was a bare 0.02 at three sites
+        from ait.backtesting.ex_div import MODES as _EX_DIV_MODES
+        if ex_div_entry_gate not in _EX_DIV_MODES:
+            raise ValueError(f"ex_div_entry_gate {ex_div_entry_gate!r} not in {_EX_DIV_MODES}")
+        self._ex_div_mode = ex_div_entry_gate           # W84: live's ex-div entry block, research twin
+        self._ex_div_k = ex_div_entry_k_days
+        self._research_table_prefix = _research_prefix
         self._risk_free_rate = risk_free_rate           # W81: was a bare 0.05 at three sites
         self._pct_from_60d_high_threshold = pct_from_60d_high_threshold
         self._min_edge_over_baseline = min_edge_over_baseline
@@ -563,6 +575,7 @@ class Backtester:
             self._load_leg_spread_model()
         self._earnings_dates: set[date] = self._load_earnings_dates(
             symbol, earnings_buffer_days_before, earnings_buffer_days_after)
+        self._ex_dates: list[date] | None = self._load_ex_dates()   # W84: after _symbol/_db_path
         self._intraday_store = intraday_store
         # R20: resolve LOADED settings once for every config-backed knob below
         # (extends the R16 #7 pre_event_blackout_days pattern).
@@ -1345,6 +1358,20 @@ class Backtester:
                 self._reject("builder_none")
                 continue
 
+            # W84: live's ex-dividend ENTRY block (W51, orchestrator trade_blocked_ex_div),
+            # checked where live checks it: on the BUILT position's real legs and expiry.
+            if self._ex_div_mode != "off" and self._ex_dates and sells_a_call(pos):
+                _exp_d = date.fromisoformat(str(pos["expiry_date"])[:10])
+                _blocked, _ex_d = ex_div_blocks(self._ex_div_mode, self._ex_dates, today_date,
+                                                _exp_d, self._ex_div_k)
+                if _blocked:
+                    _entry_decision["ex_div"] = {"mode": self._ex_div_mode, "ex_date": str(_ex_d),
+                                                 "expiry": str(_exp_d)}
+                    log.debug("ex_div_entry_block", date=str(today_date), ex_date=str(_ex_d),
+                              expiry=str(_exp_d), mode=self._ex_div_mode)
+                    self._reject("ex_div_entry")
+                    continue
+
             if entry_time_str:
                 pos["entry_time"] = entry_time_str
             if limit_price is not None:
@@ -1582,6 +1609,34 @@ class Backtester:
         except Exception as e:
             log.debug("ml_predictor_unavailable", reason=str(e))
         return None
+
+    def _load_ex_dates(self) -> "list[date] | None":
+        """W84: the symbol's stored ex-dividend dates, ascending, for the ex-dividend gate.
+
+        Loaded only when the gate is on, so ``off`` opens no store and changes nothing.
+        LOUD (W79a): a gate that is on without data would silently allow every entry and
+        read as "live parity", so a missing or empty table raises with the fix.
+        """
+        if self._ex_div_mode == "off":
+            return None
+        sym = (self._symbol or "").upper()
+        table = f"{self._research_table_prefix}dividends"
+        fix = (f"run: python scripts/backfill_dividends.py --symbols {sym or '<SYMBOL>'} "
+               f"--table-prefix {self._research_table_prefix}")
+        if not sym:
+            raise ValueError(f"ex_div_entry_gate={self._ex_div_mode!r} needs a symbol (the "
+                             f"ex-dividend calendar is per symbol)")
+        from ait.data.historical import HistoricalDataStore
+        store = (HistoricalDataStore(db_path=self._db_path, table_prefix=self._research_table_prefix)
+                 if self._db_path is not None
+                 else HistoricalDataStore(table_prefix=self._research_table_prefix))
+        dates = sorted(d for d, _amount in store.load_dividends(sym))
+        if not dates:
+            raise ValueError(f"ex_div_entry_gate={self._ex_div_mode!r} but {table} has no rows "
+                             f"for {sym}; {fix}")
+        log.info("ex_div_dates_loaded", symbol=sym, table=table, rows=len(dates),
+                 first=str(dates[0]), last=str(dates[-1]), mode=self._ex_div_mode)
+        return dates
 
     @staticmethod
     def _load_earnings_dates(symbol: str | None, before_days: int,
@@ -2045,6 +2100,11 @@ class Backtester:
     _regime_veto_gate: bool = True
     _regime_down: float = -0.05
     _regime_up: float = 0.02
+    # W84: a partial engine has no ex-dividend block (the schema default).
+    _ex_div_mode: str = "off"
+    _ex_div_k: int = 5
+    _ex_dates: list | None = None
+    _research_table_prefix: str = "research_"
     _risk_free_rate: float = 0.05
     _settlement_stats: dict | None = None
 

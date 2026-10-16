@@ -396,6 +396,29 @@ python scripts/parity_replay.py                 # reads data/replay/manual_trade
 - **Research `r`.** The engine now prices with `options.risk_free_rate` (the key live's Greeks read);
   it was a bare 0.05 at three sites. Same value today.
 
+### The ex-dividend entry block (W84; research twin of live's W51 block)
+
+- **What live does.** The bot refuses a new position that SELLS A CALL when the projected next
+  ex-dividend date falls between today and the chosen expiry (log event `trade_blocked_ex_div`): a
+  short call can be assigned early the day before an ex-date. The projection is
+  `ait.data.dividends.project_next_ex_div` (the last 4 ex-dates from yfinance, mean gap, stepped to
+  today). It blocks 14-17% of sessions at entry DTE 14.
+- **The research twin.** `backtest.ex_div_entry_gate`: `off` | `live` (live's rule exactly, from the
+  ex-dates known before the entry day) | `exact` (any real ex-date in [entry, expiry]) |
+  `last_k_days` (a real ex-date within `backtest.ex_div_entry_k_days`, default 5, of expiry). The
+  schema default is `off`; `config_research.yaml` sets `live`. The manifest warns whenever research
+  differs from live (`ex_div_entry:`); the registry row is a live twin.
+- **Data.** The gate reads `research_dividends` in `data/historical.db`; any mode but `off` raises
+  without it. Refresh it (yfinance; prints per-year counts and off-cycle gaps; writes
+  `reports/dividends_audit_<date>.json`; a non-empty prefix is required):
+  `python scripts/backfill_dividends.py --symbols QQQ SPY IWM --table-prefix research_ [--dry-run]`.
+  Re-run it before a study that ends after the last stored ex-date.
+- **Measure it:** `python scripts/ex_div_gate_ab.py --workers 3 [--entry-dte 14 7] [--k 3 5 7]`
+  (read-only; about 15 minutes for 36 runs). Real engine runs, so a blocked entry frees its slot.
+  The `live` arm answers the parity question; `exact` and `last_k_*` are the evidence for changing
+  live's rule (decisions F2 / F3, the operator's call). Research does NOT model early assignment, so
+  the A/B shows what the block costs, not what it protects against.
+
 ## Searching the entry DTE (W79a; research only)
 
 - **Switch:** `python run_backtest.py --optimize-per-window --search-dte [--dte-range 0 45]

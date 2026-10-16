@@ -160,6 +160,8 @@ class WalkForwardConfig:
     iv_rank_rise_threshold: float | None = None  # Exp 20: suppress IC entry when IV rank rose > this over last 10 days
     iv_rank_rise_gate: bool | None = None        # W71c: None -> backtest.iv_rank_rise_gate (research-only veto on/off)
     regime_veto_gate: bool | None = None         # W81: None -> backtest.regime_veto_gate (research-only veto on/off)
+    ex_div_entry_gate: str | None = None         # W84: None -> backtest.ex_div_entry_gate (live's ex-div block twin)
+    ex_div_entry_k_days: int | None = None       # W84: None -> backtest.ex_div_entry_k_days (last_k_days mode)
     pct_from_60d_high_threshold: float = -1.0 # Exp 27: suppress IC entry when price is this far below 60d rolling high (-1.0 = disabled)
     # R20b review follow-up: same defect class as iv_rank_rise_threshold above.
     min_edge_over_baseline: float | None = None  # Exp 28: min weighted CV edge for range predictor to activate (0.0 = always use, higher = stricter quality gate)
@@ -345,6 +347,10 @@ class WalkForwardConfig:
             self.iv_rank_rise_gate, "backtest", "iv_rank_rise_gate", BacktestConfig, _settings))
         self.regime_veto_gate = bool(resolve_config_value(      # W81
             self.regime_veto_gate, "backtest", "regime_veto_gate", BacktestConfig, _settings))
+        self.ex_div_entry_gate = str(resolve_config_value(      # W84
+            self.ex_div_entry_gate, "backtest", "ex_div_entry_gate", BacktestConfig, _settings))
+        self.ex_div_entry_k_days = int(resolve_config_value(    # W84
+            self.ex_div_entry_k_days, "backtest", "ex_div_entry_k_days", BacktestConfig, _settings))
         self.penalty_on_range_prob = float(resolve_config_value(
             self.penalty_on_range_prob, "backtest", "penalty_on_range_prob",
             BacktestConfig, _settings))
@@ -1718,6 +1724,8 @@ class WalkForwardBacktester:
                 iv_rank_gate=window_cfg.iv_rank_gate,
                 iv_rank_rise_gate=window_cfg.iv_rank_rise_gate,          # W71c
                 regime_veto_gate=window_cfg.regime_veto_gate,            # W81
+                ex_div_entry_gate=window_cfg.ex_div_entry_gate,          # W84
+                ex_div_entry_k_days=window_cfg.ex_div_entry_k_days,      # W84
                 iv_rank_series=self._iv_rank_series.get(symbol),
                 fractal_veto_spread=window_cfg.fractal_veto_spread,
                 penalty_on_range_prob=window_cfg.penalty_on_range_prob,
@@ -2092,6 +2100,8 @@ class WalkForwardBacktester:
                     iv_rank_gate=self._config.iv_rank_gate,
                     iv_rank_rise_gate=self._config.iv_rank_rise_gate,    # W71c
                     regime_veto_gate=self._config.regime_veto_gate,      # W81
+                    ex_div_entry_gate=self._config.ex_div_entry_gate,    # W84
+                    ex_div_entry_k_days=self._config.ex_div_entry_k_days,  # W84
                     iv_rank_series=self._iv_rank_series,
                     fractal_veto_spread=self._config.fractal_veto_spread,
                     penalty_on_range_prob=self._config.penalty_on_range_prob,
@@ -2995,6 +3005,8 @@ class WalkForwardBacktester:
                 iv_rank_gate=window_cfg.iv_rank_gate,
                 iv_rank_rise_gate=window_cfg.iv_rank_rise_gate,          # W71c
                 regime_veto_gate=window_cfg.regime_veto_gate,            # W81
+                ex_div_entry_gate=window_cfg.ex_div_entry_gate,          # W84
+                ex_div_entry_k_days=window_cfg.ex_div_entry_k_days,      # W84
                 iv_rank_series=self._iv_rank_series.get(symbol),
                 fractal_veto_spread=window_cfg.fractal_veto_spread,
                 penalty_on_range_prob=window_cfg.penalty_on_range_prob,
