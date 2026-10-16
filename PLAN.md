@@ -17304,3 +17304,63 @@ the supervisor).
 **NEXT.** Operator answers the list above; then Phase 0 (no code) and/or Phase 1. Until then the daily 0-14 waiter keeps running.
 
 ---
+
+
+## 2026-10-16 - W82: lifecycle capture of option bid/ask bars (Phases 0-3 of the 2026-10-16 design), 7-45 DTE friction bands, TWS / IB Gateway port fallback
+
+Research data tooling only; no live file touched, nothing restarted. The operator accepted the design and its recommended parameters (2026-10-15 evening: "yes on item 2 and the recommendation for the
+remaining item") and added one requirement: the scheduled collection must also work when TWS is not running but IB Gateway is (different ports).
+
+**STATUS OF THE DESIGN.** AS PLANNED: the 2026-10-16 design entry above. AS BUILT: Phase 0 (run), Phase 1 (collector), Phase 2 (bands), Phase 3 (scheduling and the port requirement); the supervisor
+job is extended but stays OFF (not enabled, as before). **FELL SHORT / DIFFERED:** (1) the planned budget of 20-35 minutes a day was MEASURED against the real QQQ chain and was too low for the
+first design: a 30-session path with every-3rd-session thinning is about 80 contracts per expiry (every session 140, every 5th 56, every 7th 50), so today + tomorrow was 165 contracts / 59
+minutes. Two changes bring it back: the default thinning is 5, and a SECOND capture of an expiry (the day before its last, or any later one) plans only its newest 3 sessions unthinned
+("incremental"), so after the first full capture a day costs about 87 contracts / 31 minutes. (2) IB's `30 D` for hourly bars returned 30 SESSIONS (2026-09-03..2026-10-15, 42 calendar days), not 30
+calendar days: better than designed. (3) The capture log is a small DB table (`option_capture_log`) in addition to the stored-samples inference: the samples alone cannot tell "never captured"
+from "nothing exists" for expiries that were not listed far out.
+
+**CHANGED.**
+1. `ait.data.ib_ports` (new, pure stdlib): TWS paper 7497 <-> IB Gateway paper 4002, TWS live 7496 <-> Gateway live 4001. `pick_listening_port(configured, probe)` tries the configured port, then
+   its twin of the SAME account type; a paper setup never probes a live port. Used by the script (`_resolve_port`, prints the fallback), the supervisor job's pre-flight (now passes `--port`) and the waiter.
+2. `short_dte_collector`: the per-day request/pair/store path is now ONE shared `_fetch_and_store` (the per-day collector's behaviour is unchanged, its 100+ tests pass); `collect_lifecycle`,
+   `plan_lifecycle`, `lifecycle_strikes` (union of the per-day rule over the underlying's path, thinned; 'short' sticky), `far_tail_done`, `prior_capture`, `session_path`, `duration_days`.
+   Stage A = expiries today..today+`--expiring-days` (default 1), DTE 0 first; stage B = far-listed expiries at 15-21 DTE whose DTE 31-45 tail is not stored (a logged stage-B capture, or >= 5 stored
+   sessions at DTE >= 31, e.g. from a manual catch-up), nearest first, capped by `--max-far-contracts` (120; the first expiry is always taken). Every request asks 30 D.
+3. `historical.py`: table `option_capture_log` (+ `record_captures`, `load_capture_log`); `CollectionResult` gains stage counters; the status file gains `stage_a`, `stage_b`, `deferred_b`.
+4. **Friction bands** `SHORT_BAND_EDGES = (2, 6, 13, 29, 45)` (0-2, 3-6, 7-13, 14-29, 30-45, 46+); `BandedFriction.floor_max_dte = 6`: only 0-6 DTE is floored and flagged extrapolated while
+   unfitted, so a 7+ band without a fit is answered by the all-DTE model exactly as before; `SHORT_BANDS` fits all five.
+5. CLI `--lifecycle --expiring-days --thin-every --incremental-sessions --max-far-contracts` (`--short-dte-duration` defaults to 30 D with `--lifecycle`); config `data_collection.lifecycle*`
+   (default OFF = the original behaviour); RUNBOOK section "Lifecycle capture"; commented block in `config.yaml`.
+
+**PHASE 0 (run 2026-10-15 18:35-20:23 ET, existing script, no code):** `--short-dte --short-dte-max 45 --short-dte-duration "30 D"`, QQQ, 300 contracts planned, 538 requests, **19,410 sample rows offered, 0
+errors, 31 unqualified** (the planner uses the union of strikes over all expiries, so about 10% of contracts do not exist for their expiry: registered), 6,466 s. **Bands after the refit
+(sessions / state):** 0-2 4/15, 3-6 8/15, 7-13 11/15, **14-29 21 sessions ACTIVE** (pct b=0.0053, n=3,778, cvMAE $0.0146), **30-45 30 sessions ACTIVE** (pct b=0.0053, n=5,521, cvMAE $0.0328). The
+pooled all-DTE fit of 2026-10-09 was pct b=0.00557, so the two new active bands are 5% lower; **effect on the realistic-engine reference** (QQQ, entry DTE 14, 2024-01..2026-10, 1 contract):
+132 trades, +$5,626 against +$5,643 before (-$17). The 0-6 DTE bands are unchanged because expired contracts cannot be recovered.
+
+**MEASURED (dry-run on the live listing, 2026-10-15 20:23 ET).** Default plan (thin 5, incremental 3) with today's expiry and tomorrow's both previously captured: 87 contracts, about 31 minutes.
+Contracts per expiry for a FIRST capture over a 30-session path: every1 142, every3 83, every5 56, every7 53 (QQQ; spot range 704.6-759.6 over the path, 524 listed strikes).
+
+**TESTS.** `tests/test_w82_lifecycle_capture.py` 75 (ports, CLI, bands, helpers, strike union, planner incl. the incremental second capture, collector against a fake broker, capture log, supervisor job); W76 tests updated for the new band labels and for the
+job passing `--port`. **Mutation-checked: 31 mutants, all caught (3 first-pass survivors were real test gaps, one was an equivalent branch that was removed); files restored byte-for-byte.**
+Collected-test reconciliation: 5836 -> 5911 selected = +75 exactly. Fast lane 5867 passed / 45 skipped / 0 failed (5911 selected; the W81 lane recorded 44 skipped: one more environmental skip, not traced). `compileall` OK; `typecheck.py` OK; `smoke_deploy.py` SMOKE PASS (13 checks).
+
+**OPERATIONAL (outside the repo).** The detached waiter (log `logs/short_dte_waiter.log`) now runs `--short-dte --lifecycle` at 15:30 ET Mon-Fri for 2026-10-16..2026-10-30, picks TWS or IB
+Gateway by port, and logs "NOT run" when neither answers. Nothing assumes a weekend run. The supervisor job is extended (`data_collection.lifecycle`) but still OFF.
+
+**REGISTERED, NOT FIXED.** (1) About 10% of planned contracts are unqualifiable because the strike set is the union across expiries (could be avoided with a per-expiry listing check or a
+cheaper qualify first). (2) Stage B's window (15-21 DTE) can occasionally include a Mon-Thu daily expiry listed at 15 DTE (about 55 contracts once); a Friday check would remove it. (3) The 7-13
+band is at 11 of 15 sessions; the 0-2 and 3-6 bands need 11 and 7 more sessions; all bands only reflect VIX 14-18 so far. (4) `friction_stress_multiplier` is still 1.0. (5) Whether IB enforces the
+60-per-10-minutes limit across API clients is still unverified; the stage-A window is now about 31 minutes instead of 72-108. (6) The `source` column still does not distinguish the sampling
+designs (the planner for new rows is uniform, so mixing is limited to history).
+
+**OPERATOR.** (1) Keep TWS or IB Gateway logged in until about 16:15 ET each trading day (the run now takes about 31 minutes from 15:30). (2) The decision list of the 2026-10-16 design entry is
+answered by the operator's acceptance of the recommendations. (3) Enabling the supervisor job (D-list: restart supervisor + bot) remains the operator's call.
+
+**DEPLOY / ROLLBACK.** Research tooling and tests only; the live bot never imports the collector. A clean `git revert` of the commit; the waiter can be switched back by passing
+`--short-dte-max 14` instead of `--lifecycle`.
+
+**NEXT.** Watch the first lifecycle runs (2026-10-16 15:30 ET): stage A should finish in about 31 minutes with 0 errors, the capture log should gain the expiries, and DTE 0 should show 4 sessions.
+Then the 15 sessions for the 0-6 DTE bands (about 2026-10-30), then W79b prerequisites as before.
+
+---
