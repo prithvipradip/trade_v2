@@ -17399,3 +17399,260 @@ a stress period; `friction_stress_multiplier` (1.0) is the hedge, and its calibr
 **NEXT.** Unchanged: the daily lifecycle collection continues; run `fill_vs_model_report.py` once the bot has been running long enough to have real fills to compare (a W80-adjacent check, operator's call to start the bot).
 
 ---
+
+
+## 2026-10-16 - PRE-REGISTERED STUDY + WAVE W83 (planned, not built): a strike-aware range model; the target is the excursion in implied-move units, so one model serves every short delta Optuna tries
+
+Design and pass rule only, written BEFORE any result exists. No code, no data written, nothing restarted. The operator chose "Option A" (2026-10-16): predict how far price travels, in units of the
+option-implied move, and read P(no touch) at whatever short strike a trial uses, instead of a fixed +-5% label at a fixed delta.
+
+**CORRECTION (registered first).** The range model's `cv_scores` are **balanced accuracy at a 0.5 cutoff**, not AUC (`range_predictor.py` `_train_xgb` / `_train_lgb`, `balanced_accuracy_score`). The entries
+that say "CV AUC ~0.545" (this file around the 2026-09-01 observe-mode entry, W67 clarification, W68 and its follow-up) quote balanced accuracy. The `predict()` skill gate (`edge = weighted cv - 0.50 <
+min_edge_over_baseline`) also runs on balanced accuracy. Today's artifacts (`models/range.pkl`, 2026-10-14, horizon 9, threshold 0.05), xgboost / lightgbm: SPY 0.670 / 0.730, QQQ 0.518 / 0.514, IWM 0.604 / 0.541;
+in-range base rates SPY 0.87, QQQ 0.75, IWM 0.82.
+
+**WHY THE CURRENT MODEL CANNOT ANSWER THE QUESTION.** (1) The label is a fixed +-5% band on CLOSES over 9 bars; the trade is a short strike at |delta| ~0.20 (a distance that moves with IV) closed by a
+touch stop on the underlying's price. (2) About 504 training days with 9-bar overlapping labels is roughly 55 independent outcomes per symbol against 101 features. (3) It has never been compared with
+what option prices already imply. (4) Its output is used as a probability and is not calibrated. (5) `delta_short` is about to become a searched dimension, and a fixed-delta label would need one model per delta.
+
+**WHAT "TOUCH" MEANS (verified by reading the code, 2026-10-16).** Live: `execution/portfolio.py` closes when spot <= the short put or >= the short call, no buffer, confirmed over
+`exit.touch_confirm_ticks` (2). Research: `engine.py` (R16) mirrors it with the daily High / Low. The study uses the research definition (daily High / Low against the strike), so the label is the event both
+engines already act on.
+
+### THE STUDY (W83a; read-only)
+
+**Data.** `historical.db` opened read-only: `research_daily_prices` and `research_daily_iv` (`source` IB_OPTION_IV), SPY / QQQ / IWM, 2010-10..2026-10-08, about 4,020 sessions each. VIX / VIX3M / VIX9D from `daily_iv`
+(2018-08 onward). `research_econ_events` covers only 2023-12 onward, so event features are EXCLUDED from the primary analysis (sensitivity on the 2024+ folds only).
+
+**Decision frame (W78).** Decide on information through session D-1. Reference spot S = close of D-1. IV = `iv_close` of D-1 (a 30-day ATM IV; using it over horizon h is an approximation, registered).
+Implied move over h sessions: `sigma_h = S * IV * sqrt(h / 252)`.
+
+**Target.** Over sessions D .. D+h-1: `up = (max High - S) / sigma_h`, `down = (S - min Low) / sigma_h`, `M = max(up, down)`.
+- Primary (symmetric condor): no touch at strike distance z <=> `M < z`.
+- Secondary (asymmetric): no touch <=> `up < z_call AND down < z_put`; joint from the two marginals plus an empirical dependence check, reported, not gated.
+- Strike distance per delta: `z(delta) = Phi^-1(1 - delta)` (flat-IV map; a skew-aware map from the W75 surface is a later refinement, registered). Grid: delta in {0.10, 0.15, 0.20, 0.25, 0.30}.
+- Measuring from the D-1 close puts the overnight gap into the excursion (conservative versus the realistic engine's 10:30 fill), registered.
+
+**Horizon.** Primary h = 9 (the live spec today: `range_spec.horizon_for` at entry DTE 14). Sensitivity: h = 5 and h = 14 (W78 buckets). The sqrt(h) normalization is expected to make one model serve
+nearby horizons; the study measures whether it does.
+
+**Predictors scored (same folds, same rows).**
+- A. Pure IV: P(no touch) from a driftless Brownian motion with volatility IV (two-sided barrier). Known to be pessimistic by the variance risk premium; it is the "prices already know" reference.
+- A'. IV climatology: the training window's empirical distribution of M (IV-normalized), no features. Absorbs the average variance risk premium.
+- B. HAR-RV: realized vol forecast from 1-, 5- and 22-day realized variance (daily OHLC estimator); the empirical distribution of the HAR-normalized excursion from the training window, rescaled.
+- C. The excursion model: LightGBM quantile regression of log M at tau = 0.05, 0.10, ..., 0.95 (monotone rearrangement), CDF by interpolation; P(no touch at z) = F(z).
+- C-lin. Linear quantile regression on the same features (overfitting control).
+- Reference only: today's range model probability scored against the new label at delta 0.20 (informational; different target).
+
+**Features for C (fixed before results; about 14).** IV rank, IV / RV(20), RV(5), RV(22), HAR components, VIX / VIX3M, VIX9D / VIX, the 1-day gap, 20-day return, ATR%, `multifractal_width`,
+`hurst_scale_spread`, day of week. VIX-family features are NaN before 2018-08 (LightGBM's native missing handling).
+
+**Protocol.** Expanding-window walk-forward, yearly refit; training from 2011; test years 2019..2026 (8 folds); purge AND embargo = h sessions between training and test. One row per (symbol, day).
+Pooled model across the three symbols with symbol as a categorical feature (allowed because the target is normalized), plus per-symbol fits as a sensitivity. Confidence intervals: stationary block bootstrap,
+block 20 sessions, 2,000 resamples. Per-leg friction is NOT involved (no trade is simulated).
+
+**Metrics.** Brier score of P(no touch) at each delta in the grid; Brier skill score `BSS = 1 - Brier_C / Brier_ref`, where ref = the better of A' and B (chosen per symbol on the TRAINING folds, not the test);
+CRPS of the M distribution; AUC per delta; calibration slope and intercept at delta 0.20; everything per symbol and pooled, QQQ always reported separately.
+
+**PASS RULE (pre-registered; the operator may amend it only BEFORE the first run).** C passes only if ALL hold:
+1. Pooled out-of-sample mean BSS over the five deltas >= 0.02, with the bootstrap 95% lower bound > 0.
+2. BSS > 0 on at least 2 of 3 symbols, and no symbol below -0.01.
+3. Calibration slope at delta 0.20 in [0.8, 1.2].
+4. C-lin within 0.01 BSS of C, or C better than C-lin with the bootstrap lower bound > 0 (otherwise prefer C-lin: simpler for the same skill).
+
+**Outcomes.** PASS: W83b may start. FAIL: the finding is "no skill beyond what option prices / realized vol already give"; the recommended next step is then to use A' or B (whichever wins) as the strike-aware
+range probability (honest, cheap, no ML), which W83b can still wire. MIXED (some symbols): report, no wiring; the operator decides per symbol.
+
+### WAVE W83 (scope)
+
+- **W83a, the study above.** `scripts/excursion_range_study.py` (read-only; `use_research_config()` first; DB opened `mode=ro`; artifacts to a temp directory; assert the IV series loaded and print row counts per
+  symbol, so a silent empty join cannot read as a result). Shared pieces in a new `ait.ml.excursion` (target, z(delta), the two-sided barrier baseline, HAR), pure functions with tests, so W83b imports
+  rather than re-implements. House rules: tests run the real path, a class guard that the touch definition is the engine's, mutation check, count reconciliation, fast lane, `typecheck.py`, `smoke_deploy.py`.
+  Commit pair `W83a: ...` + `PLAN.md: record W83a ...`, with the result reported against the rule above, unchanged.
+- **W83b, only after a PASS (or the FAIL fallback), research only.** The research range gate asks P(no touch) at the trial's ACTUAL short strikes (the strikes the builder picked, converted to z), so the
+  searched `delta_short` and the gate stay consistent; one excursion model per walk-forward window, trained before the trials (the per-window structure is unchanged); `RangeModelBank` horizon buckets
+  kept unless W83a shows the normalization makes them redundant. Then a realistic-engine A/B (gate on vs off, `gates_mode: enforce`) with its OWN pre-registered B1-style rule, written before it runs.
+- **Not in W83:** live wiring (W80-class; needs the operator's separate approval); the model choosing the strike per day (expected-value strike selection: a later wave); flipping `ml.entry_gates_enabled`.
+
+**DEPENDENCIES.** None on W79b: W83a needs no IB connection and no new data. W79b would gain from W83b (the DTE and delta search would run against a strike-aware gate); whether W79b waits for it is the
+operator's call.
+
+**RISKS.** (1) IV here is one 30-day ATM number; strikes really price off the skewed surface (z(delta) flat-IV map). (2) 2019-2026 has few stress regimes (2020, 2022, 2025-04); the bootstrap CI shows how
+much that matters. (3) The D-1 close reference includes the overnight gap. (4) The pooled model assumes normalization makes symbols comparable; the per-symbol sensitivity checks it.
+
+**DECISIONS FOR THE OPERATOR.** (1) Accept or amend the pass rule BEFORE W83a runs. (2) Order: W83a now (it does not wait on any data) versus after W79b.
+
+**NEXT.** W83a, once the operator accepts the pass rule. The daily lifecycle collection and the W79b prerequisites continue unchanged.
+
+---
+
+
+## 2026-10-16 - W83 PRE-REGISTRATION AMENDMENT (before any run): scheduled FOMC / CPI / NFP calendar back to 2010, event features move into the primary analysis
+
+Amends the W83 entry above, made before W83a has produced any result, so the pre-registration stays valid. That entry is not edited; where the two differ, this one governs. No code, no data written.
+
+**WHY.** `research_econ_events` starts 2023-12-31. With training from 2011 and test years 2019..2026, event features would be missing for almost all training rows and for the 2019-2023 tests, so the
+original entry left them out of the primary analysis and planned a 2024+ check instead. That check cannot work: a 2025 test fold would have about one year of event-labelled training (about 8 FOMC, 12 CPI, 12 NFP),
+far too few to estimate an effect. From 2010-10 there are about 125 FOMC meetings, 190 CPI releases and 190 NFP releases.
+
+**CHANGED IN W83a.**
+1. **A scheduled-event calendar, 2010-10..2026-12**, built once from the official published schedules: FOMC meeting dates (Federal Reserve), CPI and Employment Situation release dates (BLS). No IB needed.
+   - **Scheduled events only.** Unscheduled actions (e.g. the March 2020 emergency cuts) are excluded: a feature may use only dates that were public in advance, otherwise it leaks the future.
+   - **Stored as a new research table** (proposed name `research_econ_schedule`: date, event, source URL / document per row), insert-only. It is a `historical.db` write, so it is announced before it runs,
+     like W75 / W76; `research_econ_events` is not touched. The live bot reads neither.
+   - **Validated against the overlap:** for 2024-01..2026-10 every FOMC / CPI / NFP date must match `research_econ_events`; the match count is printed and any mismatch is explained before the study runs.
+2. **Event features join the primary feature list for C and C-lin** (about 14 -> 18): FOMC, CPI and NFP each "falls inside the holding window D..D+h-1" (0/1), plus sessions to the next of the three.
+   All are known at the decision time (D-1) because the schedule was published in advance.
+3. **The 2024+ event check is dropped.** Replacement sensitivity (reported, not part of the pass rule): C with versus without the event features, same folds, with the BSS difference and its bootstrap CI.
+4. **Out of scope, as before:** mega-cap earnings dates for QQQ (the history is patchy); a possible later study.
+
+**UNCHANGED.** The target, the baselines A / A' / B, the folds, the metrics and the PASS RULE (items 1-4) are exactly as registered above. The baselines use no features, so the amendment does not change what C has to beat.
+
+**NEXT.** As before: W83a once the operator accepts the pass rule; its first step is now the calendar build and the overlap check.
+
+---
+
+
+## 2026-10-16 - W83 PRE-REGISTRATION AMENDMENT 2 (before any run): mega-cap earnings dates (SEC EDGAR) and ETF ex-dividend dates join the study; LEAD: live's ex-dividend entry block has no research twin
+
+Amends the W83 entry and its first amendment, before W83a has produced any result. Neither earlier entry is edited; where they differ, this one governs. No code written; the probes below were read-only
+downloads and stored nothing.
+
+**SOURCES PROBED (2026-10-16).**
+- **Dividends: available.** yfinance `Ticker.dividends` (the source `ait.data.dividends` already uses live) returns ex-dates and amounts since 2010: QQQ 70, SPY 67, IWM 67 payments (2010-03..2026-09).
+- **Earnings, yfinance: not tested.** `get_earnings_dates` needs the optional `lxml` package, which this macOS env lacks; not installed (env change, operator's call). Not needed, see EDGAR.
+- **Earnings, Finnhub: no history** on the configured (free) key: `calendar/earnings` returned 0 rows for AAPL in 2011, 2016, 2021 and 2025; `stock/earnings` returns the last 4 quarters only.
+- **Earnings, SEC EDGAR: available, complete, free, official.** `data.sec.gov/submissions/CIK*.json` lists every 8-K with its item codes; Item 2.02 ("Results of Operations") is the earnings release. AAPL 94
+  filings 2004-10..2026-07, NVDA 94 filings 2004-10..2026-08. Each carries an acceptance timestamp, which decides whether the move lands the same session or the next.
+
+**CHANGED IN W83a.**
+1. **Earnings calendar from EDGAR** (new research table, proposed `research_earnings_schedule`: company, CIK, filing accession, acceptance timestamp, event session).
+   - Event session: accepted after 16:00 ET -> the next session; before 09:30 ET -> the same session; during RTH -> the same session. **The timezone of `acceptanceDateTime` is verified in W83a before use** (the probe
+     printed values like 00:30 that look like UTC, i.e. 20:30 ET after-close releases; not assumed).
+   - Item 2.02 is also used for preliminary results and restatements: keep one release per fiscal quarter (the first after quarter end); W83a prints filings per company per year (expect 4) and lists exceptions.
+   - SEC fair-access rules: at most 10 requests/s and a User-Agent naming a contact. **The operator supplies the contact string** (env var, not hardcoded, not taken from any account file).
+   - Look-ahead: actual release dates are used as if known at D-1. Mega-caps announce their dates 2-4 weeks ahead, so for a 9-session horizon this is almost always true; the residual is registered.
+2. **Which companies (point-in-time, no hindsight).** A candidate list FIXED BEFORE RESULTS: every company that was in the Nasdaq-100's top 10 by weight at any year-end 2010-2025, taken from a documented
+   holdings source (Invesco QQQ annual / semi-annual reports; the source is recorded per year). Market cap per day = shares outstanding (EDGAR XBRL `companyfacts`, `dei:EntityCommonStockSharesOutstanding`, last
+   value filed before D-1) x close. Alphabet's two classes count as one company. Using today's mega-caps for 2011 would be hindsight (NVDA was small then); the point-in-time ranking prevents it.
+3. **Earnings features** (applied to all three symbols; the mega-caps are a large share of SPY too, and the symbol feature lets the model learn that QQQ is most exposed): share of the candidate set's market cap
+   reporting inside D..D+h-1 (0-1); count of the top 5 reporting inside the window; sessions to the next top-5 release.
+4. **Dividend calendar** (new research table, proposed `research_dividends`: symbol, ex-date, amount, source). yfinance, cross-checked against a second published distribution history for QQQ (Invesco) with the
+   match count printed. **`research_daily_prices` is unadjusted** (`source` IB_TRADES_RTH; QQQ 2011-01-03 close 55.31), so the ex-dividend drop is already in the price path that the excursion label measures, and
+   the strikes are unadjusted too: the drop is a real move toward the put.
+5. **Dividend features:** ex-date inside the window (0/1); the expected payment / S, using the PREVIOUS payment's amount (the new amount is often declared only days before the ex-date: no look-ahead).
+6. **Sensitivities (reported, not part of the pass rule):** C with versus without the earnings features, and with versus without the dividend features, same folds, BSS difference with bootstrap CI.
+7. Feature count about 18 -> 24. Writes to `historical.db` (three research tables in total with amendment 1) are announced before they run; insert-only; the live bot reads none of them.
+
+**LEAD (not a finding; needs both lenses).** Live REFUSES any new entry that sells a call when the next ex-dividend date falls between today and the chosen expiry (W51, `orchestrator.py` `would_hold_through_ex_div`;
+log event `trade_blocked_ex_div`). With entries at 14-30 DTE and quarterly ex-dates, that window could cover a large share of sessions for SPY / QQQ / IWM. **The research engine has no twin** (no dividend logic in
+`engine.py`) and W81's `LIVE_ONLY_GATES` lists only `vix_halt`, `vix_tier_credit_cap` and `account_risk`. The earlier registered item is rule 3e (the pre-ex-div EXIT), not this ENTRY block. If confirmed,
+research is trading sessions live refuses, and every reference total so far includes them. Probe in W83a (read-only): (a) count `trade_blocked_ex_div` events in the live logs and the share of sessions the rule
+would block over 2024-2026; (b) a post-hoc filter of the W81 reference trade lists, removing entries whose expiry spans an ex-date. Then register it as a finding, or close it. Fixing it (a research twin or a
+`LIVE_ONLY_GATES` row) is a separate wave.
+
+**STUDY CONSEQUENCE.** Rows whose window spans an ex-date are kept in the primary analysis (the model learns the excursion distribution, whoever trades it). The study ALSO reports the pass-rule metrics on the
+"live-eligible" subset (no ex-date between D and the entry's expiry at DTE 14), so the result is readable for the trades live would actually take.
+
+**UNCHANGED.** The target, the baselines A / A' / B, the folds, the metrics and the PASS RULE (items 1-4). The baselines use no features, so the bar is the same.
+
+**DECISIONS FOR THE OPERATOR.** (1) The EDGAR User-Agent contact string. (2) Accept or amend the pass rule (still open). (3) Whether the ex-dividend lead is probed inside W83a (as written) or first, on its own,
+since it may move every research reference number.
+
+**NEXT.** W83a once the operator accepts the pass rule; order inside it: ex-dividend lead probe, then the calendars (econ, earnings, dividends) and their checks, then the study.
+
+---
+
+
+## 2026-10-16 - FINDING (W83 pre-probe, read-only): live's ex-dividend ENTRY block refuses 14-17% of sessions, has no research twin, and research earns 22-39% of its reference P&L on those days; live's projected ex-date is wrong on about 30% of QQQ / IWM blocked days
+
+The lead registered in W83 amendment 2, probed first at the operator's request. Both lenses conceded, so it is a FINDING. Register, don't fix: nothing changed in `src/`, `config*.yaml` or any data store;
+nothing restarted. The probe script and dump were scratch files (not in the repo).
+
+**CODE LENS.** `orchestrator.py` (W51, around line 3568): any signal that SELLS A CALL (`_signal_sells_a_call`, true for every iron condor) is refused when `DividendCalendar.would_hold_through_ex_div(symbol,
+today, expiry)` is true, i.e. `today <= next ex-date <= expiry`: the WHOLE holding window, no buffer. **There is no dividend buffer setting**: `DividendConfig` has only `refuse_entries_when_data_unavailable` and
+`lkg_max_age_hours`, on this branch, `origin/main`, `origin/feature/event-straddle` and in every commit (`git log -G`). The `buffer_days_before / after` keys belong to `earnings:` only. The only short window is
+EXIT rule 3e (`portfolio.py`: close a short call the day before the ex-date when extrinsic < the dividend). The next ex-date is PROJECTED (`_fetch_dividend`: last yfinance ex-date + the rounded average gap of the
+last 4), not read from a declared date. Chains keep the 3 nearest expiries in `dte_range` [14, 30]; if the nearest spans the ex-date the later ones do too, so a session is blocked iff the projected ex-date falls
+between today and the first listed expiry >= today + 14. The research engine has no dividend logic and `gate_parity.LIVE_ONLY_GATES` does not list this gate (W81's registry missed it).
+
+**EXECUTION LENS.** The REAL `DividendCalendar.would_hold_through_ex_div`, run per session with only the dividend history known before that day (yfinance history fed through a stub module) and the clock pinned
+(`now_et` patched); expiry from `expiry_calendar.listed_expiry(day, 14)`; 695 sessions 2024-01-02..2026-10-08.
+
+| symbol | sessions blocked by the live rule | blocked if the exact ex-dates were known | both |
+|---|---|---|---|
+| SPY | 116 (16.7%) | 119 (17.1%) | 110 |
+| QQQ | 114 (16.4%) | 118 (17.0%) | 83 |
+| IWM | 96 (13.8%) | 120 (17.3%) | 82 |
+
+Effect on the research reference (`scripts/gate_parity_ab.py --arms baseline --dump`, realistic engine, entry DTE 14, 1 contract, the W81 setup), trades whose entry day the live rule blocks, removed after the fact (no
+slot re-use, so an approximation):
+
+| symbol | trades | total $ | on live-blocked days | their $ | their win % | total $ without them |
+|---|---|---|---|---|---|---|
+| QQQ | 132 | +5,677 | 21 | +1,256 | 76% | +4,422 |
+| SPY | 134 | +6,068 | 21 | +1,518 | 81% | +4,550 |
+| IWM | 121 | +1,019 | 13 | +399 | 77% | +621 |
+
+The SPY and IWM baselines reproduce W81 exactly; QQQ is +5,677 versus W81's +5,643 and W82's +5,626 (most likely the friction refit from today's lifecycle collection; not traced, registered).
+
+**WHAT IT MEANS.**
+1. **Parity gap.** Every research reference number at entry DTE 14 includes trades live refuses: 16% of QQQ / SPY trades and 11% of IWM's, carrying 22% / 25% / 39% of the totals. A post-hoc removal frees slots that
+   research would have refilled, so the true gap is somewhat smaller; the sign is not in doubt. Shorter-DTE entries span fewer ex-dates, so the gap shrinks there (not measured).
+2. **The block is broad for its purpose.** It exists to avoid early assignment on the short call, which matters only when the call is in the money and its extrinsic is below the dividend; at |delta| ~0.20 at entry
+   that is rare, and rule 3e already closes such a position the day before the ex-date. The blocked trades won 76-81% of the time in research. Whether the entry block should narrow (e.g. only when the expiry is
+   within N days after the ex-date, or only when the short call is near the money) is a live-risk design question: **the operator's call** (CLAUDE.md critical area), not part of any wave yet.
+3. **The projection is wrong on many days.** On QQQ and IWM about 30% of the days live blocks are not days the exact dates would block, and as many are missed (QQQ 114 vs 118, 83 in common; IWM 96 vs 120, 82 in
+   common): the averaged gap drifts from the real calendar, so the gate both refuses safe days and lets through days it is meant to refuse. Fund-declared ex-dates (or the quarterly rule they follow) would fix
+   it; also a live change, also the operator's call.
+4. **Live evidence is thin, not contradictory.** The logs on this machine cover about 2026-09-28..10-14: 0 `trade_blocked_ex_div`, 3 `dividend_data_unavailable_entry_refused` (QQQ / SPY / IWM, 2026-09-28 11:29 ET).
+   One condor was entered after W51 (QQQ, 2026-09-28 -> 2026-10-23), and no ex-date fell in its window. The Windows box's logs were not read.
+
+**REGISTERED, NOT FIXED.** (F1) A research twin of the ex-dividend entry block behind a `backtest.*` switch (the W71c pattern), plus a `LIVE_ONLY_GATES` / `ENGINE_REJECT_REASONS` row, so the W81 class guard
+covers it. (F2) Live gate scope (narrow or keep). (F3) Live ex-date source (projection vs the declared date). (F4) The QQQ reference drift of +$34 / +$51.
+
+**W83 CONSEQUENCE.** As amendment 2 already says: the study reports the pass-rule metrics on all days AND on the live-eligible subset (no ex-date between D and the entry's expiry). The definition of
+"live-eligible" follows the live rule as it stands; if F2 / F3 change it, the subset is recomputed.
+
+**DECISIONS FOR THE OPERATOR.** (1) F1 before or after W83a (F1 changes every research reference number; recommended before W79b at the latest). (2) F2 and F3 (live). (3) As before: the W83 pass rule and the EDGAR
+contact string.
+
+**NEXT.** Operator decisions above; W83a once the pass rule is accepted.
+
+---
+
+
+## 2026-10-16 - OPERATOR DECISIONS: W83 pass rule accepted with QQQ as the primary verdict (amendment 3, before any run); F1 next, built with modes; the change policy for both
+
+Decisions only; no code, no data. Recorded from the operator's answers on 2026-10-16 ("I will go with your recommendations as long as we can modify / change and update them afterwards ... QQQ is the main ticker of interest").
+
+**D-W83-1, THE PASS RULE: ACCEPTED, AMENDED FOR QQQ (amendment 3, made before W83a has produced any result).** QQQ is the programme's main ticker, so the verdict is per symbol with QQQ primary, instead of one pooled verdict:
+- **QQQ verdict (primary; decides whether W83b wires the model for QQQ).** On QQQ's own out-of-sample rows: (1) mean BSS over the five deltas >= 0.02 with the bootstrap 95% lower bound > 0; (2) calibration slope at
+  delta 0.20 in [0.8, 1.2]; (3) the C-lin tie-break as registered (prefer C-lin when within 0.01 BSS). The pooled training (SPY + QQQ + IWM, symbol as a feature) stays allowed: it is a way to train the QQQ
+  model on more data, judged on QQQ rows only; a QQQ-only fit is reported beside it, and the better one on the TRAINING folds is the candidate.
+- **SPY and IWM verdicts (secondary).** The same three conditions on each symbol's own rows; each is wired in W83b only if it passes on its own. The pooled "2 of 3 symbols" condition is retired: a QQQ pass with
+  SPY / IWM failing wires QQQ only, and a SPY / IWM pass with QQQ failing is reported but does not by itself start W83b.
+- **The cost, stated:** QQQ alone has about a third of the test rows, so its bootstrap interval is wider than the pooled one; a small real QQQ edge can fail the lower-bound condition. Accepted as the price of
+  judging the ticker that matters on its own evidence.
+- The live-eligible subset (no ex-date between D and the entry's expiry) is reported for every verdict, QQQ first.
+- Unchanged: the target, the baselines, the folds, the metrics, the features of amendments 1 and 2.
+
+**D-W83-2, ORDER: F1 FIRST, THEN W83a.** F1 = a research twin of live's ex-dividend entry block (finding of 2026-10-16), built with modes so it also produces the F2 / F3 evidence:
+`off` | `live` (projected ex-date, today's live rule) | `exact` (declared ex-dates) | `last_k_days` (block only when the ex-date falls in the last K days before expiry; K a parameter). Schema default `off` (nothing
+moves, the W71c pattern); the research overlay sets `live` (parity). A `LIVE_ONLY_GATES` / `ENGINE_REJECT_REASONS` row so the W81 class guard covers it; the reference trades re-run per mode, **QQQ reported
+first**; tests, mutation check, count reconciliation, fast lane, `typecheck.py`, `smoke_deploy.py`; commit pair `F1 ...` + `PLAN.md: record ...`. Live is not touched; F2 / F3 stay the operator's call, decided on
+F1's numbers. (Wave label: F1 is built as **W84**, so the W-number sequence stays the only ledger key; W83 keeps its number for the range study.)
+
+**CHANGE POLICY (the operator's condition, made explicit).** Both decisions can be changed later. How depends on timing:
+- **Before W83a produces results:** any change to the pass rule is a normal amendment entry (like amendments 1-3), and the pre-registration stays clean.
+- **After results exist:** a change is recorded as a POST-HOC amendment, with its reason, and the verdict under the rule as it stood before the change is ALWAYS reported beside the new one. Nothing is overwritten;
+  the honest reading of the study depends on being able to see both.
+- F1's modes, K and the research default are configuration: they can change at any time, with a PLAN entry when a reference number moves.
+
+**PRIORITY NOTE (standing).** QQQ is the main ticker of interest: studies report QQQ first and judge it on its own evidence; SPY / IWM are context and extra training data unless the operator says otherwise.
+
+**OPEN.** The EDGAR contact string (needed by W83a, not by W84). F2 / F3 (live, after W84's numbers).
+
+**NEXT.** W84 (F1, the research ex-dividend entry block with modes), then W83a.
+
+---
