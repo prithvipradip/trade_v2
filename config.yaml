@@ -632,7 +632,8 @@ sizing_probe:
 #                                   # of 5-11 (docs/RUNBOOK.md "Lifecycle capture"). Ignores short_dte_max_dte.
 #   lifecycle_duration: "30 D"      # what IB serves for hourly BID/ASK bars of a listed option
 #   lifecycle_expiring_days: 1      # stage A: expiries today..+N (1 = a missed day is recoverable)
-#   lifecycle_thin_every: 3         # strikes from every Nth session of the underlying's path
+#   lifecycle_thin_every: 5         # strikes from every Nth session of the path (5 = ~55 contracts/expiry)
+#   lifecycle_incremental_sessions: 3 # an expiry captured before is planned over its newest N sessions
 #   lifecycle_max_far_contracts: 120 # stage-B cap per run (~43 min); the rest is deferred
 #   short_dte_max_dte: 6
 #   short_dte_duration: "7 D"

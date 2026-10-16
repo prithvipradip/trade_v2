@@ -1874,9 +1874,14 @@ class DataCollectionConfig(_StrictModel):
         description="Stage A covers expiries today..today+N. 1 (default) means every contract "
                     "is requested on its last day AND the day before, so one missed day costs "
                     "at most that day's bars.")
-    lifecycle_thin_every: int = Field(default=3, ge=1, le=10,
-        description="Plan strikes from every Nth session of the underlying's path. 3 keeps a "
-                    "contract set of about 30-50 per expiry; 1 (every session) is 2-3x larger.")
+    lifecycle_thin_every: int = Field(default=5, ge=1, le=10,
+        description="Plan strikes from every Nth session of the underlying's path. MEASURED "
+                    "2026-10-15 on the QQQ chain: 5 gives about 55 contracts per expiry, 3 about "
+                    "80, 1 about 140 (each costs ~22 s at IB's pacing).")
+    lifecycle_incremental_sessions: int = Field(default=3, ge=1, le=10,
+        description="An expiry captured before (typically the day before) is planned over its "
+                    "newest N sessions only, unthinned: its last day adds little else, so the "
+                    "second capture costs about a third of the first.")
     lifecycle_max_far_contracts: int = Field(default=120, ge=0, le=400,
         description="Stage-B contract cap per run (120 is about 43 minutes at IB's pacing); "
                     "the first owed expiry is always taken so a backlog drains, the rest is "

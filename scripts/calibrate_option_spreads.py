@@ -185,9 +185,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="--lifecycle: stage A covers expiries today..today+N (default 1: a missed day is "
              "recoverable the day before).")
     parser.add_argument(
-        "--thin-every", type=int, default=3, metavar="N",
+        "--thin-every", type=int, default=5, metavar="N",
         help="--lifecycle: plan strikes from every Nth session of the underlying's path "
-             "(default 3; 1 = every session, 2-3x the contracts).")
+             "(default 5, about 55 contracts per expiry on QQQ; 3 = about 80, 1 = about 140).")
+    parser.add_argument(
+        "--incremental-sessions", type=int, default=3, metavar="N",
+        help="--lifecycle: an expiry captured before (e.g. the day before) is planned over its "
+             "newest N sessions only, unthinned (default 3: about a third of a first capture).")
     parser.add_argument(
         "--max-far-contracts", type=int, default=120, metavar="N",
         help="--lifecycle: stage-B contract cap per run (default 120 = about 43 min); the rest "
@@ -866,7 +870,8 @@ async def _main(args: argparse.Namespace) -> int:
                             ib, sym, store, window, duration=args.short_dte_duration,
                             pause_secs=args.bars_pause_secs, dry_run=args.dry_run,
                             expiring_days=args.expiring_days, thin_every=args.thin_every,
-                            max_far_contracts=args.max_far_contracts)
+                            max_far_contracts=args.max_far_contracts,
+                            incremental_sessions=args.incremental_sessions)
                     elif ib is not None:
                         r = await collect_short_dte(
                             ib, sym, store, window, max_dte=args.short_dte_max,

@@ -75,6 +75,7 @@ def build_command(cfg: Any, *, python: str, script: Path, status_path: Path,
         cmd += ["--lifecycle",
                 "--expiring-days", str(int(cfg.lifecycle_expiring_days)),
                 "--thin-every", str(int(cfg.lifecycle_thin_every)),
+                "--incremental-sessions", str(int(cfg.lifecycle_incremental_sessions)),
                 "--max-far-contracts", str(int(cfg.lifecycle_max_far_contracts))]
     if port is not None:
         cmd += ["--port", str(int(port))]

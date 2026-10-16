@@ -248,6 +248,7 @@ LOOKBACK_DAYS = 30       # IB serves 30 D of hourly BID/ASK bars for a listed op
 FAR_WINDOW = (15, 21)    # stage B captures an expiry once, while it is this many DTE
 FAR_TAIL_MIN_DTE = 31    # samples at or beyond this DTE are the "far tail"
 FAR_TAIL_MIN_SESSIONS = 5
+PRIOR_CAPTURE_SESSIONS = 10   # stored sessions of an expiry that count as "captured before"
 STRIKE_WINDOW = 0.12     # only strikes within +-12% of that day's spot are ever requested
 
 
@@ -280,7 +281,7 @@ def session_path(uprice: dict[str, float], ivs: pd.Series | None = None,
 
 
 def lifecycle_strikes(expiry: date, right: str, path: list[tuple[date, float, float]],
-                      listed_strikes, *, today: date, thin_every: int = 3,
+                      listed_strikes, *, today: date, thin_every: int = 5,
                       ) -> list[tuple[float, str]]:
     """[(strike, role)] to request for one (expiry, right): the UNION over the underlying's
     path of the strikes a condor would have sold that day.
@@ -334,14 +335,32 @@ def far_tail_done(expiry: date, samples: pd.DataFrame | None, log: pd.DataFrame 
     return False
 
 
+def prior_capture(expiry: date, samples: pd.DataFrame | None, log: pd.DataFrame | None,
+                  min_sessions: int = PRIOR_CAPTURE_SESSIONS) -> bool:
+    """True when the expiry was captured before (a logged capture of any stage, or enough stored
+    sessions): a later capture only owes its newest sessions."""
+    iso = expiry.isoformat()
+    if log is not None and len(log) and bool((log["expiry"] == iso).any()):
+        return True
+    if samples is not None and len(samples):
+        e = samples[samples["expiry"] == iso]
+        if len(e) and int(e["bar_time"].map(session_of).nunique()) >= min_sessions:
+            return True
+    return False
+
+
 def plan_lifecycle(path: list[tuple[date, float, float]], today: date, expirations: list[str],
                    strikes: list[float], *, samples: pd.DataFrame | None = None,
-                   log: pd.DataFrame | None = None, expiring_days: int = 1, thin_every: int = 3,
-                   max_far_contracts: int = 120,
+                   log: pd.DataFrame | None = None, expiring_days: int = 1, thin_every: int = 5,
+                   max_far_contracts: int = 120, incremental_sessions: int = 3,
                    far_window: tuple[int, int] = FAR_WINDOW) -> LifecyclePlan:
     """Stage A (expiring today..today+``expiring_days``) first, DTE 0 first, then stage B
     (far-listed expiries inside ``far_window`` whose tail is not stored), nearest first, up to
-    ``max_far_contracts`` (the first expiry is always taken so a backlog drains)."""
+    ``max_far_contracts`` (the first expiry is always taken so a backlog drains).
+
+    The FIRST capture of an expiry plans strikes over the whole path (thinned); a later one
+    (the expiry's last day, after the day before) owes only its newest sessions, so it plans
+    over the last ``incremental_sessions`` sessions unthinned: about a third of the contracts."""
     plan = LifecyclePlan()
     exps: list[date] = []
     for e in expirations:
@@ -352,10 +371,14 @@ def plan_lifecycle(path: list[tuple[date, float, float]], today: date, expiratio
     exps = sorted(set(exps))
 
     def contracts_for(exp: date, stage: str) -> list[tuple[date, str, float, str, str]]:
+        if stage == STAGE_A and prior_capture(exp, samples, log):
+            use, thin = path[-max(1, int(incremental_sessions)):], 1
+        else:
+            use, thin = path, thin_every
         out = []
         for right in ("C", "P"):
-            for k, role in lifecycle_strikes(exp, right, path, strikes, today=today,
-                                             thin_every=thin_every):
+            for k, role in lifecycle_strikes(exp, right, use, strikes, today=today,
+                                             thin_every=thin):
                 out.append((exp, right, k, role, stage))
         return out
 
@@ -391,8 +414,8 @@ async def collect_lifecycle(
     ib: Any, symbol: str, store: Any, window, *, duration: str = f"{LOOKBACK_DAYS} D",
     pause_secs: float = 10.8, dry_run: bool = False, today: date | None = None,
     sleep: Callable[[float], Any] = asyncio.sleep, out: Callable[[str], None] = print,
-    now: datetime | None = None, expiring_days: int = 1, thin_every: int = 3,
-    max_far_contracts: int = 120,
+    now: datetime | None = None, expiring_days: int = 1, thin_every: int = 5,
+    max_far_contracts: int = 120, incremental_sessions: int = 3,
 ) -> CollectionResult:
     """One lifecycle run: stage A then stage B (see the section comment)."""
     res = CollectionResult(symbol=symbol, dry_run=dry_run)
@@ -416,7 +439,8 @@ async def collect_lifecycle(
         pass
     lp = plan_lifecycle(path, today, expirations, strikes, samples=samples, log=log,
                         expiring_days=expiring_days, thin_every=thin_every,
-                        max_far_contracts=max_far_contracts)
+                        max_far_contracts=max_far_contracts,
+                        incremental_sessions=incremental_sessions)
     plan = [(e, r, k, role) for e, r, k, role, _stage in lp.contracts]
     stage_of = {e: STAGE_A for e in lp.stage_a} | {e: STAGE_B for e in lp.stage_b}
     res.planned = len(plan)

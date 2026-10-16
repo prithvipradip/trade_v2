@@ -136,7 +136,8 @@ class TestCli:
         a = mod._parse_args(["--source", "ib-bars", "--short-dte", "--lifecycle",
                              "--short-dte-duration", "14 D"])
         assert a.short_dte_duration == "14 D"
-        assert (a.expiring_days, a.thin_every, a.max_far_contracts) == (1, 3, 120)
+        assert (a.expiring_days, a.thin_every, a.max_far_contracts,
+                a.incremental_sessions) == (1, 5, 120, 3)
 
 
 # --------------------------------------------------------------------------
@@ -353,6 +354,48 @@ class TestPlanLifecycle:
         assert len(keys) == len(set(keys))
         assert all(c[4] == sc.STAGE_A for c in lp.contracts if c[0] == EXP_B)
 
+    def _contracts_of(self, lp, exp):
+        return {(c[1], c[2]) for c in lp.contracts if c[0] == exp}
+
+    def test_a_first_capture_plans_the_whole_path_thinned(self):
+        path = _path(5, drift=-5.0)
+        lp = sc.plan_lifecycle(path, TODAY, self._exps(EXP_A), LISTED, expiring_days=0,
+                               thin_every=2)
+        want = {(r, k) for r in ("C", "P")
+                for k, _ in sc.lifecycle_strikes(EXP_A, r, path, LISTED, today=TODAY, thin_every=2)}
+        assert self._contracts_of(lp, EXP_A) == want
+
+    @pytest.mark.parametrize("how", ["log", "samples"])
+    def test_a_later_capture_owes_only_the_newest_sessions_unthinned(self, how):
+        path = _path(5, drift=-5.0)
+        log = pd.DataFrame([{"expiry": EXP_A.isoformat(), "stage": "A"}]) if how == "log" else None
+        samples = _samples(EXP_A, 10, dte=3) if how == "samples" else None
+        first = sc.plan_lifecycle(path, TODAY, self._exps(EXP_A), LISTED, expiring_days=0,
+                                  thin_every=1)
+        later = sc.plan_lifecycle(path, TODAY, self._exps(EXP_A), LISTED, expiring_days=0,
+                                  log=log, samples=samples, incremental_sessions=2, thin_every=1)
+        want = {(r, k) for r in ("C", "P")
+                for k, _ in sc.lifecycle_strikes(EXP_A, r, path[-2:], LISTED, today=TODAY,
+                                                 thin_every=1)}
+        assert self._contracts_of(later, EXP_A) == want
+        assert len(self._contracts_of(later, EXP_A)) < len(self._contracts_of(first, EXP_A))
+
+    def test_too_few_stored_sessions_is_not_a_prior_capture(self):
+        path = _path(5, drift=-5.0)
+        a = sc.plan_lifecycle(path, TODAY, self._exps(EXP_A), LISTED, expiring_days=0)
+        b = sc.plan_lifecycle(path, TODAY, self._exps(EXP_A), LISTED, expiring_days=0,
+                              samples=_samples(EXP_A, 9, dte=3))
+        assert self._contracts_of(a, EXP_A) == self._contracts_of(b, EXP_A)
+
+    def test_stage_b_is_always_planned_over_the_whole_path(self):
+        path = _path(5, drift=-5.0)
+        log = pd.DataFrame([{"expiry": EXP_B.isoformat(), "stage": "A"}])   # not a B capture
+        lp = sc.plan_lifecycle(path, TODAY, self._exps(EXP_B), LISTED, expiring_days=0, log=log,
+                               thin_every=2)
+        want = {(r, k) for r in ("C", "P")
+                for k, _ in sc.lifecycle_strikes(EXP_B, r, path, LISTED, today=TODAY, thin_every=2)}
+        assert lp.stage_b == [EXP_B] and self._contracts_of(lp, EXP_B) == want
+
     def test_unparseable_expiry_strings_are_ignored(self):
         lp = sc.plan_lifecycle(_path(5), TODAY, ["garbage", EXP_A.strftime("%Y%m%d")], LISTED)
         assert lp.stage_a == [EXP_A]
@@ -413,9 +456,9 @@ class TestCollectLifecycle:
     @pytest.mark.asyncio
     async def test_a_second_run_does_not_owe_stage_b_again(self, store):
         ib = _ib(EXP_A, EXP_B)
-        first, _, _ = await _lifecycle(ib, store)
+        first, _, _ = await _lifecycle(ib, store, thin_every=1)
         n1 = len(store.load_spread_bar_samples("QQQ"))
-        second, _, _ = await _lifecycle(_ib(EXP_A, EXP_B), store)
+        second, _, _ = await _lifecycle(_ib(EXP_A, EXP_B), store, thin_every=1)
         assert first.stage_b == 1 and second.stage_b == 0 and second.stage_a == 1
         assert second.planned < first.planned
         assert len(store.load_spread_bar_samples("QQQ")) == n1     # idempotent insert
@@ -499,7 +542,7 @@ class TestJob:
         c = DataCollectionConfig()
         assert c.lifecycle is False and c.lifecycle_duration == "30 D"
         assert (c.lifecycle_expiring_days, c.lifecycle_thin_every,
-                c.lifecycle_max_far_contracts) == (1, 3, 120)
+                c.lifecycle_max_far_contracts, c.lifecycle_incremental_sessions) == (1, 5, 120, 3)
 
     @pytest.mark.parametrize("bad", [dict(lifecycle_expiring_days=9), dict(lifecycle_thin_every=0),
                                      dict(lifecycle_max_far_contracts=999),
@@ -513,12 +556,14 @@ class TestJob:
         from ait.config.settings import DataCollectionConfig
         J = self._mod()
         cfg = DataCollectionConfig(lifecycle=True, lifecycle_expiring_days=2,
-                                   lifecycle_thin_every=4, lifecycle_max_far_contracts=60)
+                                   lifecycle_thin_every=4, lifecycle_max_far_contracts=60,
+                                   lifecycle_incremental_sessions=2)
         cmd = J.build_command(cfg, python="PY", script=Path("s.py"), status_path=Path("st.json"),
                               min_sessions=15, port=4002)
         flat = " ".join(cmd)
         assert "--lifecycle" in cmd and "--expiring-days 2" in flat and "--thin-every 4" in flat
         assert "--max-far-contracts 60" in flat and "--short-dte-duration 30 D" in flat
+        assert "--incremental-sessions 2" in flat
         assert cmd[cmd.index("--port") + 1] == "4002"
 
     def test_without_lifecycle_the_command_is_unchanged_apart_from_the_port(self):
