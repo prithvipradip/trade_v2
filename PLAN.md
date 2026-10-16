@@ -17695,3 +17695,75 @@ the A/B table (expect the `live` arm near the post-hoc probe, QQQ about +$4.4k; 
 **NEXT.** Build W84; then its AS BUILT entry; then W83a.
 
 ---
+
+
+## 2026-10-16 - W84 AS BUILT: research twin of live's ex-dividend entry block (F1); MEASURED: parity costs QQQ $879 at entry DTE 14, and the blocked trades never held the worst loss
+
+Code commit `a15de99`. Research only, plus one behaviour-identical refactor of a live file (`dividends.py`, decision 1 of the plan). Nothing restarted, nothing pushed. Plan: the W84 AS PLANNED entry above.
+
+**STATUS OF THE PLAN.** AS PLANNED: the W84 entry above (decisions 1-7). AS BUILT: all seven design parts, the backfill run and the A/B. **FELL SHORT / DIFFERED:**
+1. **No `ex_div_in_window` record while the mode is `off`.** Recording it would need the store opened (its `CREATE TABLE IF NOT EXISTS` side effect, also in tests) and a new key in every decision dict, which
+   breaks "off changes nothing". `off` is now fully inert; `scripts/ex_div_gate_ab.py` measures the would-block days instead.
+2. The pure rule lives in a new module `ait.backtesting.ex_div` (`ex_div_blocks`, `ex_dates_in_window`, `sells_a_call`); the plan named the helper, not the file.
+3. The projection equivalence test runs 2,000 seeded random ex-date histories against the pre-W84 body, plus live's real `_fetch_dividend` with a stubbed yfinance and a pinned clock; not the real 2024-2026 ex-date lists
+   (the 2026-10-16 finding's probe already replayed those). `hypothesis` is not installed in this macOS env, so the property test is a seeded loop.
+4. "Sells a call" is read from the built position (`short_call_strike`, or a vertical with `short_strike` and `option_type` call). The synthetic tape never selects a put-only structure, so the engine-level
+   test forces the classification's answer; the classification itself is tested per strategy.
+
+**CHANGED.** `dividends.project_next_ex_div` (pure; `_fetch_dividend` calls it); `historical.py` `{prefix}dividends` + `save_dividends` / `load_dividends` / `dividends_span` + `SOURCE_YAHOO_DIVIDENDS`;
+`BacktestConfig.ex_div_entry_gate` (off / live / exact / last_k_days, schema `off`) and `ex_div_entry_k_days` (5); the engine gate right after `_build_position` (reason `ex_div_entry`, decision record `ex_div`),
+`_load_ex_dates` (loud when on without data); WalkForwardConfig + OOS / window-optimizer / shadow forwarding + optimizer `bt_kwargs` (not searched); `gate_parity` TWIN row + `ex_div_entry:` manifest warning
+(mode off, exact or last_k_days); the manifest records the mode; `config_research.yaml` `ex_div_entry_gate: live` with its WHAT / WHY / MODES / DATA / TO CHANGE block; `scripts/backfill_dividends.py`;
+`scripts/ex_div_gate_ab.py`; RUNBOOK section "The ex-dividend entry block (W84)".
+
+**DATA WRITTEN (announced in the plan).** `research_dividends` in `data/historical.db`, source YAHOO_DIVIDENDS, since 2009-01-01: QQQ 74, SPY 71, IWM 71 rows (2009-03..2026-09); audit `reports/dividends_audit_20261016.json`
+(not committed). Flagged by the backfill, NOT corrected: QQQ has short gaps of 7, 9, 11 and 22 days (extra distributions around 2010-06, 2011-12, 2014-02, 2023-12) and a 182-day gap 2020-06-22 -> 2020-12-21
+(the September 2020 ex-date is probably missing in yfinance: UNVERIFIED); IWM's spacing is irregular (76-111 days), which is what throws off live's average-gap projection. Live reads the same source, so
+`live` mode is faithful either way; `exact` inherits the gaps.
+
+**MEASURED** (`scripts/ex_div_gate_ab.py`, realistic engine, `bs_legacy`, per-leg friction asserted loaded, 1 contract, condor_any_direction, rise veto off, 2024-01-02..2026-10-08; real engine runs, so a blocked entry
+frees its slot; "blocked" counts block events, i.e. entry attempts, not distinct days):
+
+| symbol | entry DTE | off: trades / total $ | live (parity) | exact (F3) | last_k 3 | last_k 5 (F2) | last_k 7 |
+|---|---|---|---|---|---|---|---|
+| QQQ | 14 | 132 / +5,676 | 113 / +4,797 (-879) | 115 / +4,185 (-1,491) | 131 / +4,958 (-718) | 126 / +5,268 (-408) | 126 / +4,994 (-682) |
+| QQQ | 7 | 266 / +6,348 | 242 / +4,979 (-1,369) | 238 / +5,210 (-1,138) | 251 / +5,915 (-434) | 244 / +5,122 (-1,227) | 238 / +5,210 (-1,138) |
+| SPY | 14 | 134 / +6,068 | 114 / +4,413 (-1,655) | 114 / +4,389 (-1,679) | 133 / +6,082 (+14) | 131 / +6,160 (+92) | 124 / +5,440 (-628) |
+| SPY | 7 | 277 / +5,106 | 251 / +4,068 (-1,038) | 254 / +4,137 (-969) | 273 / +5,121 (+15) | 265 / +4,708 (-398) | 254 / +4,137 (-969) |
+| IWM | 14 | 121 / +1,019 | 109 / +879 (-141) | 105 / +929 (-91) | 117 / +1,347 (+327) | 117 / +1,006 (-14) | 116 / +1,015 (-5) |
+| IWM | 7 | 256 / -932 | 241 / -1,147 (-215) | 230 / -1,004 (-72) | 242 / -972 (-40) | 239 / -974 (-43) | 230 / -1,004 (-72) |
+
+Reading:
+1. **Parity.** With the block, the QQQ entry-DTE-14 reference is 113 trades / +$4,797 (was 132 / +$5,676). The post-hoc probe of the finding said -$1,256; slot re-use recovers about a third of it on QQQ. SPY loses
+   more (-$1,655) than the post-hoc -$1,518 (path dependence). **Every research number produced through `use_research_config()` from now on includes the block**; earlier reference totals overstate live.
+2. **The worst trade is identical in every arm of every row.** In this sample the blocked trades never held the worst loss. The research engine does NOT model early assignment, so this A/B shows what the
+   block COSTS, not what it protects against.
+3. **F3 (declared dates instead of the projection) does not help at QQQ DTE 14** (-$1,491 vs live's -$879): the projection's errors are not costing money in this sample.
+4. **F2 (block only near expiry) keeps most of the P&L:** last_k 5 at DTE 14 is -$408 on QQQ, +$92 SPY, -$14 IWM. At DTE 7, last_k 7 equals exact (the whole holding window is within 7 days), a
+   built-in consistency check.
+5. Differences of a few hundred $ over 100-270 trades are inside the noise (W78: the SE of a total is about $1.5-2k). Nothing here is significant on its own; the parity row is the decision-relevant number.
+
+**EQUIVALENCE.** Gate off: the 6-variant reference (QQQ / SPY / IWM x realistic / legacy, entry DTE 14, every trade dict and the funnel) is byte-identical to the pre-W84 dump (`cmp`). The pre-W84 dump itself
+was reproduced twice, byte-identical.
+
+**TESTS.** `tests/test_w84_ex_div_gate.py` 56: projection equivalence and edge cases, the rule in all four modes (inclusive bounds, dates known before D, K boundary), sells-a-call per strategy, the engine
+(off inert and never reads dividends, live / exact refuse exactly the spanning entries, last_k blocks only near expiry, loud failures), forwarding at all sites, store and backfill (prefix required, dry run
+writes nothing, empty fetch fails), registry / manifest / overlay, and an AST guard that nothing in the live tree names the switch. **Mutation check: 33 mutants, all caught; 2 first-pass survivors were real
+test gaps (the engine passing a fixed K; live's fetch projecting from one date fewer) and are closed; files restored byte-for-byte (hash-checked).** Collected: 5911 -> 5967 selected = +56 exactly. Fast lane
+5922 passed / 46 skipped / 0 failed (the passed + skipped total is one above the selected count, as in W82). `compileall` OK; `typecheck.py` OK; `smoke_deploy.py` SMOKE PASS (13 checks).
+
+**LIVE TOUCH.** `dividends.py` only: the projection math moved into `project_next_ex_div`, identical behaviour (tested). It reaches the live bot only at its next restart, which is the operator's call. No other
+live file changed; the AST guard keeps the switch out of the live tree.
+
+**REGISTERED, NOT FIXED.** (1) The gate sits after `_build_position`, so friction / builder counters include positions built and then blocked (counters only, not trades). (2) The QQQ realistic reference read
++$5,677.25 and +$5,675.65 in two runs about 2 hours apart on 2026-10-16 (most likely friction data from that day's collection; not traced). (3) The yfinance ex-date quirks above. (4) Opening the store from a
+live process creates an empty unprefixed `dividends` table (harmless, like W82's `option_capture_log`). (5) No research model of early assignment (the rule 3e twin) exists, so the block's benefit is unmeasured.
+(6) `hypothesis` is missing from this macOS env (CI has it).
+
+**DECISIONS FOR THE OPERATOR (F2 / F3, live; nothing changes until decided).** On this evidence: F3 (declared dates) is not supported by the numbers; F2 (narrow the block to about the last 5 days before
+expiry) recovers most of the cost, but its benefit side (early-assignment losses avoided) is unmeasured. Recommended before deciding F2: measure assignment exposure, either from the account's real
+assignment history or a research early-assignment model (rule 3e twin); keep live as it is until then.
+
+**NEXT.** W83a (the strike-aware range study: pass rule accepted with QQQ primary; the EDGAR contact is configured locally in `.env`); its live-eligible subset now uses this gate's `live` mode.
+
+---
