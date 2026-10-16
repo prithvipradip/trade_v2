@@ -17364,3 +17364,38 @@ answered by the operator's acceptance of the recommendations. (3) Enabling the s
 Then the 15 sessions for the 0-6 DTE bands (about 2026-10-30), then W79b prerequisites as before.
 
 ---
+
+
+## 2026-10-16 - REFERENCE (no code change): what the friction model is for, and where the calibrated spread is used (research only; live never reads it)
+
+Recorded because the operator asked for it in plain words and PLAN.md is the only programme document. Verified by reading the code on 2026-10-16 (a search of `src/` for every reader of the spread tables and
+models). Nothing was changed, restarted or pushed by this entry.
+
+**WHAT THE FRICTION MODEL IS FOR.** The research engine prices every option at a MID, which nobody can trade at: a seller fills near the bid, a buyer near the ask, and a condor crosses the spread on four
+legs at entry and four at exit. Without a cost for that, research profit is overstated, most of all at short DTE where a leg is worth a few cents. The friction model is that cost: the HALF-SPREAD of each
+option leg, in dollars, as a function of the option's mid, MEASURED from real IB hourly bid/ask samples. The engine charges it on every leg at entry (it reduces the credit) and again at exit (it raises the
+cost to close). It exists to make research P&L resemble live P&L; it is one of the main parity levers, because it stands in for the one thing research cannot simulate directly, the actual fills.
+
+**WHAT "CALIBRATED SPREAD" IS (all in `data/historical.db`).**
+- `option_leg_spread_params`: the pooled all-DTE per-leg dollar model (friction v2: constant, affine or percent form, chosen by leave-one-session-out cross-validation).
+- `option_leg_spread_band_params`: one model per DTE band (0-2, 3-6, 7-13, 14-29, 30-45; W76/W82). A band is used only once it has `backtest.friction_min_sessions_per_band` (15) sessions; an unfitted 0-6 DTE band is
+  charged the pooled model floored at `friction_extrapolated_floor_usd` ($0.01 per leg) and counted as extrapolated; an unfitted 7+ band is answered by the pooled model unfloored.
+- `option_spread_params`: the legacy percentage model. `option_spread_bar_samples`: the raw samples all of these are fitted from.
+
+**WHERE IT IS USED: RESEARCH ONLY.**
+- The research `Backtester` (`engine.py`): `_load_leg_spread_model` when `friction_model` is `per_leg_usd`; `_load_friction_bands` when `friction_short_dte` is on; the cost is applied per leg at entry and exit by
+  `_leg_cost` / `banded_condor_leg_cost_usd`, scaled by `friction_entry_capture`, `friction_exit_capture` and `friction_stress_multiplier` (all 1.0 today).
+- Switches: `config_research.yaml` sets `friction_model: per_leg_usd` and `friction_short_dte: true` (D8); the live `config.yaml` has no friction setting. The schema default of `friction_model` is also `per_leg_usd`.
+- The parity replay (`replay.py` reads the pooled model) and the friction studies (`friction_sensitivity.py` and the others that assert the model loaded).
+
+**WHERE IT IS NOT USED: LIVE.** No module in `bot/`, `execution/`, `risk/`, `strategies/` or `broker/` reads any of these tables or models. Live pays REAL fills: the executor prices from the actual bid/ask and mid
+(NBBO), the reprice ladder, `exit.exit_mark_multiple` and `exit.exit_cross_amount`. The one shared touchpoint is the file: the bot and the supervisor open the same `historical.db` through `HistoricalDataStore` for
+daily bars and IV, and opening the store runs `CREATE TABLE IF NOT EXISTS` for every table (so a new table such as `option_capture_log` appears when either starts); nothing live reads the spread tables.
+
+**LIMITS, STATED PLAINLY.** (1) It is a calibrated AVERAGE cost, not the fill of any specific order. (2) Every collected session so far had a VIX of 14-18, so it is a calm-regime estimate and likely understates
+a stress period; `friction_stress_multiplier` (1.0) is the hedge, and its calibration from a stress subset is a later study. (3) **It has not been validated against real fills**: `scripts/fill_vs_model_report.py`
+(read-only; the only link back to live, comparing live fills to the model) has not been run. Until it is, treat the calibration as a measured estimate, not a verified one.
+
+**NEXT.** Unchanged: the daily lifecycle collection continues; run `fill_vs_model_report.py` once the bot has been running long enough to have real fills to compare (a W80-adjacent check, operator's call to start the bot).
+
+---
