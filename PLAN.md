@@ -17656,3 +17656,42 @@ F1's numbers. (Wave label: F1 is built as **W84**, so the W-number sequence stay
 **NEXT.** W84 (F1, the research ex-dividend entry block with modes), then W83a.
 
 ---
+
+
+## 2026-10-16 - W84 AS PLANNED: research twin of live's ex-dividend entry block (F1), with modes
+
+Plan approved by the operator 2026-10-16 (F1 of the ex-dividend finding above; ordered before W83a). Written BEFORE any code so the other box can continue from PLAN.md alone. Research only, except one
+behaviour-identical refactor of a live file (decision 1). Nothing restarted.
+
+**FINDINGS FROM THE CODE READ (2026-10-16).**
+- Live checks the BUILT signal: its real legs (`_signal_sells_a_call`: any SELL leg with right C) and its real chain expiry (the 3 nearest listed expiries in `dte_range` [14, 30]). The engine decides a
+  position's expiry only inside `_build_position` (`listed_expiry` in the realistic model, `today + entry_dte` in legacy), i.e. AFTER every entry gate.
+- The engine has no dividend logic and no twin of exit rule 3e. Its only runtime network call is the yfinance earnings fetch (`_load_earnings_dates`). Research tables follow
+  `backtest.research_table_prefix` (`research_`); the friction loaders read unprefixed tables. No dividend table exists anywhere.
+- Live's projection (`dividends._fetch_dividend`): last 4 ex-dates -> mean of their 3 gaps -> last + `round(mean)` (Python banker's rounding) -> stepped forward to today, at most 8 steps. It checks ONE projected
+  date; the 91-day fallback is unreachable (fewer than 2 dates returns early). Network, math and clock sit in one method, so it is not reusable as it stands.
+- Class guards a new gate must satisfy: W81 (every literal `_reject` reason has a registry row; the RESEARCH_ONLY reason set is pinned; the `one_sided_gate_warnings` lists are pinned, so new reads need
+  `getattr` defaults); W70 phantom-key guard (every BacktestConfig field needs a reader); W68 (an overlay key must differ from `config.yaml`).
+
+**OPTIONS FACED AND DECISIONS.**
+1. Projection source: extract a pure shared function `dividends.project_next_ex_div(ex_dates, as_of)` that live and research both call (**CHOSEN by the operator**; live behaviour byte-identical, proved by an
+   equivalence test against the old method body; the one live-file touch; it reaches live only at the operator's next bot restart) vs a research copy kept in step by a parity test.
+2. Gate placement: right after `_build_position`, using the position's real legs and expiry, as live does (**CHOSEN**) vs beside the earnings / macro date gates, where expiry would be recomputed.
+3. Registry kind: `ex_div_entry` as a TWIN row (live has the gate) plus an `ex_div_entry:` manifest warning whenever research differs from live (mode off, exact, last_k_days) (**CHOSEN**) vs RESEARCH_ONLY.
+4. Data: a `{prefix}dividends` table in `historical.db` filled by `scripts/backfill_dividends.py` (yfinance, provenance column, dry run, audit JSON), shared with W83a (**CHOSEN**) vs a yfinance call inside the
+   engine. The backfill is an announced `historical.db` write (W75 / W76 precedent).
+5. Missing data with the gate on: the engine raises, naming the backfill script (**CHOSEN**, the W79a loud-failure rule) vs silently allowing every entry.
+6. Modes and defaults: `backtest.ex_div_entry_gate` = `off` | `live` (projected date from ex-dates known before D) | `exact` (any real ex-date in [D, expiry]) | `last_k_days` (a real ex-date with
+   expiry - ex-date <= `ex_div_entry_k_days`, default 5); schema default `off` (no baseline moves), `config_research.yaml` sets `live` (parity); K not searched by Optuna.
+7. Out of scope: an exit twin of rule 3e; live changes F2 / F3 (the operator's call on W84's numbers); searching K.
+
+**DELIVERABLES.** `dividends.py` refactor; `historical.py` table + save / load / span + `SOURCE_YAHOO_DIVIDENDS`; BacktestConfig fields; engine gate + pure `ex_div_blocks`; WalkForwardConfig, OOS / optimizer /
+shadow forwarding and optimizer `bt_kwargs` (the `regime_veto_gate` sites); registry row + manifest warning; `scripts/backfill_dividends.py`; `scripts/ex_div_gate_ab.py` (real engine with slot re-use; arms
+off / live / exact / last_k 3, 5, 7; QQQ first; entry DTE 14 and 7); `tests/test_w84_ex_div_gate.py`; RUNBOOK sections.
+
+**VERIFICATION.** Fast lane + count reconciliation; mutation check; compileall, `typecheck.py`, `smoke_deploy.py`; byte-identical reference dumps with the gate off; the backfill (about 70 rows per symbol);
+the A/B table (expect the `live` arm near the post-hoc probe, QQQ about +$4.4k; slot re-use will move it).
+
+**NEXT.** Build W84; then its AS BUILT entry; then W83a.
+
+---
