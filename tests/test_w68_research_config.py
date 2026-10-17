@@ -143,7 +143,8 @@ class TestOverlayNeverReachesLive:
 
     @pytest.mark.parametrize("rel", ["run_backtest.py", "run_optimizer.py",
                                       "scripts/friction_sensitivity.py",
-                                      "scripts/gate_study.py"])
+                                      "scripts/gate_study.py",
+                                      "scripts/excursion_range_study.py"])   # W83a-2
     def test_every_research_entry_point_activates_it(self, rel):
         tree = ast.parse((ROOT / rel).read_text())
         called = {getattr(n.func, "id", getattr(n.func, "attr", ""))
