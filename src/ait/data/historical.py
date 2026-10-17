@@ -41,6 +41,11 @@ SOURCE_UNRECORDED = "UNRECORDED"            # label used when READING NULL sourc
 SOURCE_INVESTING_CSV = "INVESTING_CSV"      # operator-compiled Investing.com economic calendar CSV
 SOURCE_IB_BID_ASK_BARS = "IB_BID_ASK_BARS"  # W66: IB hourly BID+ASK bars of listed options
 SOURCE_YAHOO_DIVIDENDS = "YAHOO_DIVIDENDS"  # W84: yfinance Ticker.dividends (ex-date, amount/share)
+SOURCE_FED_FOMC = "FED_FOMC_PAGES"          # W83a: federalreserve.gov FOMC meeting pages
+SOURCE_BLS_ARCHIVE = "BLS_RELEASE_ARCHIVE"  # W83a: bls.gov news-release archive links
+SOURCE_EDGAR_N30B2 = "EDGAR_N30B2"          # W83a: QQQ trust annual Schedule of Investments
+SOURCE_EDGAR_NPORT = "EDGAR_NPORTP"         # W83a: QQQ trust NPORT-P quarterly holdings
+SOURCE_EDGAR_8K_202 = "EDGAR_8K_ITEM202"    # W83a: company 8-K Item 2.02 (results of operations)
 
 # Historical risk-free-rate follow-up: the SOFR term structure's tenor
 # points in days-to-maturity, in the SAME order get_risk_free_rate's SELECT
@@ -115,6 +120,12 @@ class HistoricalDataStore:
         # W84: past ex-dividend dates per symbol, for the research ex-dividend entry gate
         # (and W83a). The live bot never reads it: live fetches its own from yfinance.
         self._dividends_table = f"{table_prefix}dividends"
+        # W83a: the strike-aware range study's event calendars (research only; the live bot never
+        # reads them): scheduled FOMC / CPI / NFP dates, QQQ's reported top holdings, and mega-cap
+        # earnings releases.
+        self._econ_schedule_table = f"{table_prefix}econ_schedule"
+        self._qqq_holdings_table = f"{table_prefix}qqq_holdings"
+        self._earnings_schedule_table = f"{table_prefix}earnings_schedule"
         self._init_db()
 
     def _init_db(self) -> None:
@@ -293,6 +304,41 @@ class HistoricalDataStore:
                     source      TEXT NOT NULL,   -- SOURCE_* provenance tag
                     fetched_at  TEXT NOT NULL,   -- ISO timestamp of the fetch
                     PRIMARY KEY (symbol, ex_date)
+                )
+            """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._econ_schedule_table} (
+                    event_date  TEXT NOT NULL,   -- ISO date (FOMC: the decision day)
+                    event       TEXT NOT NULL,   -- FOMC | CPI | NFP
+                    source      TEXT NOT NULL,
+                    source_url  TEXT NOT NULL,
+                    PRIMARY KEY (event_date, event)
+                )
+            """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._qqq_holdings_table} (
+                    report_date  TEXT NOT NULL,  -- the holdings' as-of date
+                    filed_date   TEXT NOT NULL,  -- when the report became public (weights apply after)
+                    form         TEXT NOT NULL,  -- N-30B-2 | NPORT-P
+                    accession    TEXT NOT NULL,
+                    rank         INTEGER NOT NULL,
+                    company_key  TEXT,           -- research_calendars.COMPANIES key (NULL = unmapped)
+                    name         TEXT NOT NULL,
+                    value_usd    REAL NOT NULL,
+                    weight       REAL NOT NULL,  -- value / total value of all holdings
+                    source       TEXT NOT NULL,
+                    PRIMARY KEY (accession, rank)
+                )
+            """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._earnings_schedule_table} (
+                    accession      TEXT NOT NULL PRIMARY KEY,
+                    company_key    TEXT NOT NULL,
+                    cik            INTEGER NOT NULL,
+                    filing_date    TEXT NOT NULL,
+                    accepted_et    TEXT NOT NULL,   -- ISO datetime, America/New_York
+                    event_session  TEXT NOT NULL,   -- first session whose price can react
+                    source         TEXT NOT NULL
                 )
             """)
             conn.execute(f"""
@@ -581,6 +627,59 @@ class HistoricalDataStore:
                 f"SELECT MIN(ex_date), MAX(ex_date), COUNT(*) FROM {self._dividends_table} "
                 f"WHERE symbol=?", (symbol,)).fetchone()
         return None if not row or not row[2] else (row[0], row[1], int(row[2]))
+
+    def save_econ_schedule(self, rows: "list[tuple[date, str, str]]", source: str) -> int:
+        """W83a: upsert (event_date, event, source_url) rows."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                f"INSERT OR REPLACE INTO {self._econ_schedule_table} "
+                f"(event_date, event, source, source_url) VALUES (?,?,?,?)",
+                [(str(d), e, source, u) for d, e, u in rows])
+        return len(rows)
+
+    def load_econ_schedule(self, event: str | None = None) -> "list[tuple[date, str]]":
+        """W83a: stored (event_date, event) rows, ascending; one event type if given."""
+        q = f"SELECT event_date, event FROM {self._econ_schedule_table}"
+        params: tuple = ()
+        if event:
+            q += " WHERE event=?"
+            params = (event,)
+        with sqlite3.connect(self._db_path) as conn:
+            rows = conn.execute(q + " ORDER BY event_date, event", params).fetchall()
+        return [(date.fromisoformat(d), e) for d, e in rows]
+
+    def save_qqq_holdings(self, rows: "list[tuple]", source: str) -> int:
+        """W83a: upsert (report_date, filed_date, form, accession, rank, company_key, name,
+        value_usd, weight) rows."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                f"INSERT OR REPLACE INTO {self._qqq_holdings_table} (report_date, filed_date, form, "
+                f"accession, rank, company_key, name, value_usd, weight, source) "
+                f"VALUES (?,?,?,?,?,?,?,?,?,?)",
+                [(str(r[0]), str(r[1]), *r[2:], source) for r in rows])
+        return len(rows)
+
+    def load_qqq_holdings(self) -> pd.DataFrame:
+        """W83a: every stored top-holding row (one row per report and rank)."""
+        with sqlite3.connect(self._db_path) as conn:
+            return pd.read_sql_query(
+                f"SELECT * FROM {self._qqq_holdings_table} ORDER BY filed_date, rank", conn)
+
+    def save_earnings_schedule(self, rows: "list[tuple]", source: str) -> int:
+        """W83a: upsert (accession, company_key, cik, filing_date, accepted_et, event_session) rows."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                f"INSERT OR REPLACE INTO {self._earnings_schedule_table} (accession, company_key, cik, "
+                f"filing_date, accepted_et, event_session, source) VALUES (?,?,?,?,?,?,?)",
+                [(r[0], r[1], int(r[2]), str(r[3]), str(r[4]), str(r[5]), source) for r in rows])
+        return len(rows)
+
+    def load_earnings_schedule(self) -> pd.DataFrame:
+        """W83a: every stored earnings release, ascending by event session."""
+        with sqlite3.connect(self._db_path) as conn:
+            return pd.read_sql_query(
+                f"SELECT * FROM {self._earnings_schedule_table} ORDER BY event_session, company_key",
+                conn)
 
     def source_summary(self, symbol: str) -> dict[str, tuple[int, str, str]]:
         """W65: {source: (priced_rows, first_date, last_date)} for a symbol's daily
