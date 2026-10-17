@@ -18047,3 +18047,50 @@ dividend features did not make the result worse: neither group carried usable si
 **ALSO RECORDED.** The operator asked to push the branch: decision D7 (push the local commits) is answered for `W64-risk-retune` on 2026-10-17.
 
 ---
+
+
+## 2026-10-17 - IDEAS REGISTER (no code change, not yet pre-registered): what to do after the W83a-2 FAIL; parked for a later session with the operator
+
+Recorded at the operator's request so the options are not lost; to be discussed and decided in a future session. Nothing here is approved, built or pre-registered. Each idea that is taken up needs its OWN
+pre-registration entry (rule written before results) before any code runs.
+
+**THE QUESTION ASKED.** Given the negative results, abandon these approaches, or tweak them: more features (RSI, ATR, running slopes, ...), Kalman filtering, hidden Markov models, other pre- / post-processing?
+
+**WHAT THE W83a-2 RESULT ACTUALLY SAYS (the basis for the ranking below).**
+1. The models DO rank days, weakly: AUC 0.55-0.61 (QQQ 0.555 at delta 0.20, thin).
+2. Their probabilities are badly overconfident: calibration slopes 0.13-0.67, which alone is enough to lose to a constant like A'. That is a post-processing problem, not proof there is nothing to learn.
+3. The binding constraint is the effective sample: about 1,945 test days per symbol with overlapping 9-session windows is only about 200 independent outcomes; every extra input is another chance to fit noise.
+
+**MORE PRICE-BASED INDICATORS (RSI, slopes, more ATR variants): NOT RECOMMENDED.** They are transforms of the same daily price path the models already see (ATR, the 20-day return and realized vol at three windows are
+in). Evidence: the old range model used about 100 such indicators and scored a coin flip, and dropping whole feature groups (earnings, dividends) did not hurt, i.e. the models are already fitting noise. More of the
+same kind would most likely make the overconfidence worse.
+
+**KALMAN / HMM / OTHER STATE ESTIMATION.**
+- **HMM, worth testing in a small role:** fit a two-state regime model on IV and realized vol, then compute A' separately within each regime ("regime-conditional climatology"). It keeps the winning baseline
+  and adds very few parameters, which suits the sample.
+- Kalman smoothing of IV: low priority (IV is already a smoothed, forward-looking market estimate).
+- GARCH-type models: low priority (HAR-RV did the same job and lost to A'; the GARCH family was retired in R12-C).
+
+**THE CANDIDATES, MOST PROMISING FIRST.**
+1. **Recalibrate the existing models.** Rescale their probabilities on the validation year (isotonic or Platt scaling), or blend them with A' using a weight fitted on validation (e.g. 30% model / 70% A'). It targets
+   the failure mode directly, is cheap, and is the most likely route to a small positive BSS. A NEW pre-registered question, not a rescue of W83a-2 (decision 3: no post-hoc change of a registered rule).
+2. **Test the ranking for money, not probabilities.** An AUC around 0.6 can still help as a FILTER: skip the 10-20% of days the model rates riskiest, even if its probabilities are wrong. Measured in the realistic
+   engine (P&L, worst loss, gate on vs off) under a B1-style rule written in advance.
+3. **Genuinely new information, not new transforms of price.** Options data carries information ATM IV does not: the put-call skew, QQQ's own IV term structure, implied earnings moves for the mega-caps; plus
+   credit spreads or rates from FRED (free). Some of the option-bar data is already in `historical.db` (`option_daily_bars`, `intraday_iv`).
+4. **Pool more ETFs.** Measuring moves in IV units is what made pooling valid, and the pooled fit won in 22 of 24 symbol-years; adding DIA and sector ETFs grows the sample without new assumptions.
+5. Regime-conditional A' via the HMM (above), as a smaller variant of 1 / 3.
+Also open from W83a-2: a longer horizon (e.g. 21 sessions, for entries up to 30 DTE) and a skew-aware delta -> z map (W75 surface), each a new run.
+
+**A CAUTION ABOUT RUNNING MANY TESTS.** Each new attempt on the same 2019-2026 history makes an eventual "pass" less credible (enough tries find something by luck). Run a FEW tests, each pre-registered and in the
+order above, and treat the paper-trading record going forward as the only data no test has seen.
+
+**WHAT TO STOP / KEEP.** Stop: feeding more indicators into gradient boosting and asking for a calibrated touch probability (answered by W83a-2). Keep: the framework (moves in IV units, strike-aware probabilities),
+A' as the honest probability for now, and the targeted tests above.
+
+**OPEN QUESTION FOR THE NEXT SESSION.** Which first: candidate 1 (recalibration / blending, a probability question) or candidate 2 (the filter test for P&L in the engine)? Also still open from W83a-2: W83b on A',
+and the two-lens check of the "short strikes touched within 9 sessions on about two-thirds of days" observation.
+
+**NEXT.** Unchanged until the operator decides: the W83a-2 decisions list.
+
+---
