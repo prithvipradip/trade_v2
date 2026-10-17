@@ -17893,3 +17893,45 @@ JSON; whether it uses that field was not checked. (3) Foreign issuers in a top 1
 **NEXT.** W83a-2 (the study), as planned; amendment 5 applies to its earnings features.
 
 ---
+
+
+## 2026-10-17 - W83a-2 AS PLANNED + PRE-REGISTRATION AMENDMENT 6 (before any result): every choice the rule left open is pinned before the study is built or run
+
+Plan approved by the operator 2026-10-17. Written BEFORE any W83a-2 code; no result exists. Research only; nothing restarted. W83 and amendments 1-5 are not edited; where they differ, this entry governs.
+The target, the baselines' definitions, the folds, the metrics and the PASS RULE (W83 + amendment 3, QQQ primary) are unchanged.
+
+**FINDINGS (2026-10-17).** VIX / VIX3M / VIX9D exist only 2018-08-28..2026-08-25 (unprefixed `daily_iv`, `iv_close`). `FeatureEngine._mfdfa_features(returns)` needs >= 500 points and returns (width,
+asymmetry); `_multiscale_hurst(log_prices)` returns (h60, h180); `ait.data.iv_rank.iv_rank_series(iv)` is 0-100 with no look-ahead. Timing on 5,400 x 24 rows: one linear quantile fit
+(`QuantileRegressor`, highs) about 2 s, one LightGBM quantile fit about 0.15 s, so the study runs folds in parallel (about 1-2 h with the sensitivities).
+
+**AMENDMENT 6.**
+1. **Features (24, all known at the close of D-1).** IV block (6): IV (`implied_vol` of D-1), IV rank (live definition), vrp = log(IV / GK22), Garman-Klass log realized vol over 1, 5 and 22 days. VIX block
+   (3): VIX, VIX/VIX3M, VIX9D/VIX. Price (3): the 1-day gap, the 20-day return, ATR% (14). Fractal (2): `multifractal_width` over the trailing 504 returns, `hurst_scale_spread` = |h60 - h180| over the trailing
+   180. Day of week of D (1). Macro (4): FOMC / CPI / NFP each in the window D..D+h-1 (0/1), sessions to the next of the three. Earnings (3): the top-10 weight reporting in the window (weights FILED before D),
+   the count of the top 5 reporting, sessions to the next top-5 release. Dividends (2): an ex-date in the window (0/1), the previous payment / the D-1 close. The pooled fit adds the symbol (categorical).
+2. **C = LightGBM, fixed hyperparameters, no tuning:** quantile objective; 300 trees; learning_rate 0.03; num_leaves 15; min_child_samples 50; subsample 0.8 (bagging every iteration); colsample 0.8; seed 83;
+   deterministic; native missing-value handling.
+3. **C-lin = `QuantileRegressor(alpha=0, solver="highs")`** on features standardized with training statistics; a missing value -> the training median, plus a missing flag for the VIX block; the symbol one-hot
+   in the pooled fit.
+4. **A' and B per symbol, training rows only.** A': the empirical CDF of M. B: HAR = OLS of log RV over the next h sessions (sum of daily Garman-Klass variance) on the log GK over 1, 5 and 22 days, with Duan
+   smearing, giving sigma_HAR; the excursion in sigma_HAR units has its own empirical CDF; P_B(z) = F_HAR(z * sigma_IV / sigma_HAR).
+5. **Reference per symbol:** the better of A' and B by its training-fold Brier score averaged over the five deltas.
+6. **Candidate per symbol (QQQ, and by the same rule SPY and IWM):** pooled fit vs own-symbol fit, the better BSS on a validation year (the last training year; models refit without it). **The forwarded model
+   is C, unless C-lin is within 0.01 BSS of C, then C-lin** (the registered tie-break); pass conditions 1-2 are evaluated on the forwarded model.
+7. **Rows and folds:** test rows are the days D of the test years 2019-2026 whose window D..D+h-1 is fully observed; training = every row whose window ends at least h sessions before the test year starts
+   (the purge).
+8. **Calibration slope:** an unpenalized logistic regression of the outcome on logit(p), p clipped to [1e-4, 1 - 1e-4], at delta 0.20.
+9. **Bootstrap:** paired stationary bootstrap (mean block 20 sessions, 2,000 resamples, seed 83) over each symbol's out-of-sample days; the lower bound is the 2.5th percentile of the resampled mean-over-deltas BSS.
+10. **In the window:** an event whose session falls in D..D+h-1 (the FOMC decision day is its session; a release uses its `event_session`).
+11. **Live-eligible subset:** amendment 4 item 9 (W84 `live` mode, expiry `listed_expiry(D, 14)`).
+
+**THE CODE.** `ait.ml.excursion` (pure: excursions, implied move, z(delta), the barrier series, Garman-Klass, HAR with smearing, empirical CDF, CDF from quantiles, Brier / BSS / CRPS / calibration slope, the
+stationary bootstrap, yearly folds with the purge, the verdict). `scripts/excursion_range_study.py` (`use_research_config()` first; every DB read-only; asserts each input loaded; folds in parallel; verdicts
+QQQ first on all days and the live-eligible subset; the registered sensitivities: h = 5 and 14, without the earnings features, without the dividend features, pooled vs own forced). Tests incl. a look-ahead
+guard (changing data from D onward never changes D's features) and the verdict on synthetic tables.
+
+**DECISIONS.** As the W83a table, plus: amendment 6 (this entry). **THE STUDY IS RUN ONCE**; any change to the rule after that is a POST-HOC amendment with the original verdict reported beside it.
+
+**NEXT.** Build W83a-2, run it, record W83a-2 AS BUILT + RESULT.
+
+---
