@@ -442,6 +442,10 @@ def run_study(inputs: dict, symbols, h: int, features: list[str], workers: int) 
     tasks = [{"year": y, "h": h, "features": features, "symbols": list(symbols)} for y in TEST_YEARS]
     with ProcessPoolExecutor(max_workers=max(1, workers), initializer=_init, initargs=(table,)) as pool:
         folds = list(pool.map(run_fold, tasks))
+    # the fits are the expensive part: keep the raw fold predictions before scoring (W83a-2: the first
+    # run crashed in scoring and lost them)
+    CACHE.mkdir(parents=True, exist_ok=True)
+    (CACHE / f"folds_h{h}_{len(features)}f.pkl").write_bytes(pickle.dumps(folds))
     merged: dict = {}
     for f in folds:
         for s, rec in f["symbols"].items():

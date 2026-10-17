@@ -140,6 +140,10 @@ class TestScores:
         logit = np.log(p / (1 - p))
         over = 1 / (1 + np.exp(-2 * logit))                      # twice as confident as the truth
         assert ex.calibration_slope(over, y) == pytest.approx(0.5, abs=0.05)
+        # a constant predictor has no slope (and fails the verdict's slope check)
+        assert math.isnan(ex.calibration_slope(np.full(100, 0.8), y[:100]))
+        assert not ex.verdict({"C": {"bss": 0.05, "lo": 0.01, "slope": float("nan")},
+                               "C-lin": {"bss": 0.0, "lo": -0.1, "slope": 1.0}})["pass"]
 
     def test_stationary_bootstrap(self):
         idx = ex.stationary_bootstrap_indices(5000, mean_block=20, n_boot=40, seed=83)

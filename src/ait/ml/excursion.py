@@ -165,13 +165,20 @@ def calibration_slope(p: np.ndarray, y: np.ndarray, iters: int = 50) -> float:
     pc = np.clip(np.asarray(p, float), 1e-4, 1 - 1e-4)
     x = np.log(pc / (1 - pc))
     yy = np.asarray(y, float)
+    if np.std(x) < 1e-12:
+        # a constant predictor (baseline A gives one probability to every row) has no slope: the
+        # design is singular. NaN, which fails the slope check (W83a-2 first run crashed here)
+        return float("nan")
     A = np.column_stack([np.ones_like(x), x])
     b = np.array([0.0, 1.0])
     for _ in range(iters):
         mu = 1.0 / (1.0 + np.exp(-(A @ b)))
         w = mu * (1 - mu)
         H = A.T @ (A * w[:, None]) + 1e-12 * np.eye(2)
-        step = np.linalg.solve(H, A.T @ (yy - mu))
+        try:
+            step = np.linalg.solve(H, A.T @ (yy - mu))
+        except np.linalg.LinAlgError:
+            return float("nan")
         b = b + step
         if np.max(np.abs(step)) < 1e-10:
             break
