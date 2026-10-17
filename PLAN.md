@@ -17935,3 +17935,71 @@ guard (changing data from D onward never changes D's features) and the verdict o
 **NEXT.** Build W83a-2, run it, record W83a-2 AS BUILT + RESULT.
 
 ---
+
+
+## 2026-10-17 - W83a-2 AS BUILT + RESULT: the pre-registered strike-aware range study FAILS on all three symbols; IV climatology (A') beats every model and every other baseline; outcome = the registered FAIL branch
+
+Code commits `ba93167` (study) and `8ee83c1` (fix below). Research only; no live file touched; nothing restarted or pushed. Plan: the W83a-2 AS PLANNED entry (amendment 6) above. **The rule was applied exactly as
+registered; nothing below changes it.** Report JSON `reports/w83a_excursion_20261017_0352.json` (not committed); run log kept with the session.
+
+**STATUS OF THE PLAN.** AS PLANNED: `ait.ml.excursion`, `scripts/excursion_range_study.py`, tests, one run with the registered sensitivities. AS BUILT: all of it. **FELL SHORT / DIFFERED:**
+1. **The first run crashed in scoring before any metric existed** (the calibration slope of baseline A, a constant probability, is a singular fit). No number was computed or printed; the fix (`8ee83c1`:
+   the slope is NaN for a constant predictor, which also fails the slope check) and a re-run from the committed fix produced THE result. The fold predictions are now saved before scoring.
+2. C-lin missing values: amendment 6 says "the training median"; a feature with NO training value at all (the VIX block before 2018-08, in the earliest windows) has no median, so it is the constant 0 after
+   standardization (carries nothing in that window).
+3. `_in_window` handles an event type with no events (found by a synthetic end-to-end smoke run before the real run; real data always has all three).
+4. The fractal features are cached in `data/research_cache/w83a/` keyed by a hash of the closes (the plan said a per-run temp dir); a pure function of the stored prices, so the cache cannot change a result.
+
+**DATA.** 10,521 usable rows at h = 9 (2012-10-11..2026-09-28; SPY / QQQ / IWM); test years 2019-2026 give 1,945 out-of-sample days per symbol (1,620-1,728 live-eligible). Every input asserted loaded (IV 4,019-4,020
+rows per symbol, VIX 2,008, econ 579, holdings 450, earnings 1,778, dividends 71-74). Base rate of NO touch over 9 sessions (all days, QQQ): delta 0.10 68.1%, 0.15 50.1%, 0.20 32.7%, 0.25 15.9%, 0.30 4.4%.
+
+**RESULT (primary, h = 9, 24 features; BSS against the reference, mean over the five deltas; 95% paired stationary-bootstrap interval; calibration slope at delta 0.20).** The reference was A' (IV
+climatology) in EVERY fold for every symbol. The forwarded model follows the registered tie-break.
+
+| symbol | subset | forwarded | BSS | 95% CI | slope | other model | B (HAR) | A (pure IV) | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| **QQQ** | all days | C-lin | **-0.0426** | [-0.0912, -0.0002] | 0.23 | C -0.0422 | -0.0537 | -0.0333 | **FAIL** |
+| QQQ | live-eligible | C-lin | -0.0317 | [-0.0782, +0.0118] | 0.31 | C -0.0528 | -0.0480 | -0.0401 | FAIL |
+| SPY | all days | C-lin | -0.0100 | [-0.0547, +0.0314] | 0.43 | C -0.0023 | -0.0570 | -0.0427 | FAIL |
+| SPY | live-eligible | C-lin | -0.0013 | [-0.0473, +0.0418] | 0.48 | C -0.0049 | -0.0492 | -0.0496 | FAIL |
+| IWM | all days | C | -0.0360 | [-0.0637, -0.0092] | 0.27 | C-lin -0.0763 | -0.0860 | -0.0369 | FAIL |
+| IWM | live-eligible | C | -0.0325 | [-0.0595, -0.0041] | 0.28 | C-lin -0.0716 | -0.0790 | -0.0383 | FAIL |
+
+Per delta (QQQ, all days; C / C-lin): 0.10 -0.102 / -0.123, 0.15 -0.058 / -0.074, 0.20 -0.028 / -0.027, 0.25 -0.020 / -0.004, 0.30 -0.002 / +0.014. AUC of C at delta 0.20: QQQ 0.556, SPY 0.607, IWM 0.555 (A'
+0.46-0.48, a constant per fold). The pooled fit was chosen in 22 of 24 symbol-years.
+
+**SENSITIVITIES (reported only; every one FAILS on every symbol).** QQQ forwarded model, all days:
+- h = 5: C-lin **+0.0115** [-0.0197, +0.0404], slope 0.57 (SPY +0.0212 [-0.0027, +0.0458], slope 0.63; IWM -0.0272). The only horizon with a positive BSS, still inside the noise and badly calibrated.
+- h = 14: C-lin -0.0380 [-0.0830, -0.0004], slope 0.23 (SPY C -0.0596, IWM C -0.0630).
+- Without the earnings features: C-lin -0.0336 [-0.0785, +0.0060] (SPY -0.0077, IWM -0.0402). Without the dividend features: C -0.0287 [-0.0620, +0.0048] (SPY -0.0195, IWM -0.0402). Dropping either block does
+  not hurt, so neither block carries usable signal here.
+
+**WHAT IT MEANS.**
+1. **The registered answer is FAIL:** on QQQ (and SPY and IWM) no model of the excursion predicts "no touch" better than the plain historical distribution of the excursion in IV units. The ML adds noise, not skill.
+2. **The models rank a little but are far too confident** (AUC 0.54-0.61, calibration slope 0.13-0.67 against a band of 0.8-1.2): their probabilities are too extreme. Recalibrating them could be a NEW pre-registered
+   question; it is not a rescue of this one (decision 3: no post-hoc change of the rule).
+3. **Realized-vol forecasting (HAR) and the pure-IV barrier are both worse than IV climatology:** once the excursion is measured in IV units its distribution is stable enough that the average past
+   distribution is the best predictor of the five tried. A' already absorbs the average variance-risk premium (A, which ignores it, is worse).
+4. **OBSERVATION, not a finding (needs both lenses):** with the short strikes at delta 0.20 and touch measured on the daily High / Low, QQQ's short strikes were touched within 9 sessions on about two-thirds of
+   days (no touch 32.7%). Live closes a condor on a short-strike touch (W36 touch stop), so this bears on how often the touch stop fires versus the research engine's 67% win rate. The delta->z map is the flat-IV
+   approximation (registered); worth a two-lens check before anyone reads it as a statement about live.
+
+**OUTCOME (as registered in W83, "FAIL" branch).** The next step is the best baseline as the strike-aware range probability: **A' (IV climatology) wins on every symbol**: P(no touch at z) = the share of past
+holding windows (same symbol, training rows only) whose excursion in IV units stayed below z. Honest, cheap, no ML, strike-aware by construction. Wiring it into the research range gate is W83b's scope, now on A'
+instead of a model.
+
+**TESTS.** `tests/test_w83a_excursion.py` 31 (the target incl. the overnight gap and a high just past the window, the barrier series against a Monte Carlo, HAR recovering a known process, GK on a real bar, the
+quantile CDF incl. crossed quantiles, Brier / BSS / CRPS / calibration incl. a constant predictor, the bootstrap, the purge, every verdict condition and the tie-break, the QQQ-primary outcome, the look-ahead guard
+on the study's features, the fractal features using only the past, window boundaries, weights only after filing, the previous dividend, M's units, the live-eligible flag, the scoring wiring) + the W68
+entry-point case. **Mutation check: 29 mutants; 7 first-pass survivors: 6 real test gaps (closed) and 1 equivalent (a redundant count filter, removed); re-run: 28 / 28 applicable caught**, files restored
+byte-for-byte (hash-checked). Collected 6009 -> 6041 = +32 exactly. Fast lane 5996 passed / 46 skipped / 0 failed. `compileall` OK; `typecheck.py` OK; `smoke_deploy.py` SMOKE PASS.
+
+**REGISTERED, NOT FIXED.** (1) The two-thirds touch observation above (two lenses needed). (2) The delta->z map is flat-IV; a skew-aware map from the W75 surface is untested. (3) Weights refresh yearly before 2019.
+(4) Teva / RIM have no release dates (at most 2.4% weight).
+
+**DECISIONS FOR THE OPERATOR.** (1) W83b on A': wire the IV-climatology strike-aware probability into the research range gate (and measure it in the realistic engine with its own pre-registered B1-style rule), or
+stop here. (2) Whether to pre-register a NEW question on recalibrated models (the ranking signal exists; the calibration does not). (3) Whether to have the touch observation checked (two lenses).
+
+**NEXT.** The operator's decisions above. The live range model and `ml.entry_gates_enabled` are unchanged (observe).
+
+---
