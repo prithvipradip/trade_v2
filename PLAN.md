@@ -18003,3 +18003,47 @@ stop here. (2) Whether to pre-register a NEW question on recalibrated models (th
 **NEXT.** The operator's decisions above. The live range model and `ml.entry_gates_enabled` are unchanged (observe).
 
 ---
+
+
+## 2026-10-17 - REFERENCE (no code change): how the W83a-2 study is built, in plain words (why 9 sessions, what A' is, HAR's horizons, the model features)
+
+Recorded because the operator asked for these explanations after the W83a-2 result, and PLAN.md is the only programme document. Verified against `ait.ml.range_spec`, `ait.ml.excursion` and
+`scripts/excursion_range_study.py` at commit `8ee83c1`. Nothing changed.
+
+**WHY THE HORIZON IS 9 SESSIONS.** It is the holding window the existing live range model already uses (`range_spec.horizon_for(14)`): live enters condors at 14-30 DTE (`options.dte_range`), and the exit
+policy treats 5 DTE as "expiry approaching" (`EXPIRY_APPROACHING_DTE`) and gets the position out by then, so from the shortest entry the longest a position can be held is 14 - 5 = 9. It was kept so the study
+answers the question for the trade the live gate actually faces. Caveats: (1) the 9 comes from calendar days but is used as 9 trading sessions (a mismatch the `range_spec.py` docstring notes); (2) an entry at
+up to 30 DTE could be held about 17 sessions; (3) many trades end sooner (take-profit ladder, touch stop). The study therefore also ran h = 5 and h = 14 (both FAIL; h = 5 came closest). A longer horizon (e.g.
+21 sessions) would be a NEW pre-registered run.
+
+**HOW A' (IV CLIMATOLOGY) WORKS.** Per symbol, on training years only: (1) for every past day D, take the largest move up or down over the next 9 sessions, measured from the close of D-1 with the daily High /
+Low; (2) divide it by the move IV implied on D-1, IV x sqrt(9/252), giving M = "how many implied moves price actually travelled"; (3) keep all training values of M. For short strikes z implied moves away
+(z = 0.84 at delta 0.20), P(no touch) = the share of training days with M < z (QQQ about 33% at delta 0.20). It gives the SAME probability to every test day in a test year: the only daily information it uses is
+IV, through the IV units (a higher IV puts the strikes further away in dollars). So the W83a-2 result says the extra features could not tell good days from bad ones well enough to beat a constant. A' also
+absorbs the average variance risk premium, which is why it beats pure IV (A).
+
+**WHICH HORIZONS HAR-RV USES.** Inputs: the Garman-Klass daily variance (from each day's open / high / low / close), averaged over the last 1, 5 and 22 sessions ending at D-1 (the standard daily / weekly / monthly
+HAR terms). Target: the log of the summed daily variance over the SAME 9 sessions as the excursion (5 or 14 in the sensitivities). Fit: ordinary least squares per symbol on training rows, with a smearing
+correction for the conversion back from logs, giving a forecast volatility sigma_HAR for the next 9 sessions. Probability: measure each training excursion in sigma_HAR units, take their historical distribution,
+and evaluate it at z x sigma_IV / sigma_HAR (the strike placed at its IV-based distance, asked how often price travelled that many forecast-volatility units).
+
+**WHICH FEATURES THE MODELS USE.** LightGBM (C) and the linear model (C-lin) use the same 24 features, all known at the close of D-1 or published in advance (amendment 6):
+
+| Group | Features |
+|---|---|
+| IV (6) | IV; IV rank (live definition); variance risk premium log(IV / 22-day realized vol); Garman-Klass realized vol over 1, 5, 22 days |
+| VIX (3) | VIX; VIX / VIX3M; VIX9D / VIX (term structure) |
+| Price (3) | 1-day gap; 20-day return; ATR% (14-day) |
+| Fractal (2) | multifractal width (last 504 returns); Hurst scale spread (the gap between the 60- and 180-day Hurst estimates) |
+| Calendar (1) | day of week |
+| Macro (4) | FOMC / CPI / jobs report inside the 9-session window (0/1 each); sessions to the next of them |
+| Earnings (3) | QQQ top-10 weight reporting inside the window; count of the top-5 companies reporting; sessions to the next top-5 report |
+| Dividends (2) | an ex-dividend date inside the window (0/1); the previous payment / price |
+
+Both predict 19 quantiles of log M (5th to 95th percentile), which give P(no touch) at any z; the pooled fits (all three ETFs at once) also get the symbol. LightGBM uses fixed settings (no tuning) and handles
+missing values natively (VIX is blank before 2018-08); the linear model standardizes the features, fills missing values with the training median and adds a "VIX missing" flag. Dropping the earnings or the
+dividend features did not make the result worse: neither group carried usable signal.
+
+**ALSO RECORDED.** The operator asked to push the branch: decision D7 (push the local commits) is answered for `W64-risk-retune` on 2026-10-17.
+
+---
