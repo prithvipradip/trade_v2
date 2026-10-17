@@ -17836,3 +17836,60 @@ SHORT / DIFFERED; anything touching the rule after results is a POST-HOC amendme
 **NEXT.** W83a-1.
 
 ---
+
+
+## 2026-10-17 - W83a-1 AS BUILT: the study's event calendars (579 scheduled macro dates, 450 QQQ top-10 holding rows, 1,778 mega-cap releases), every validation passed; PRE-REGISTRATION AMENDMENT 5 (before any result)
+
+Code commit `84d9b29`. Research data and tooling only; no live file touched (the live tree never imports the new module: AST guard). Nothing restarted, nothing pushed. Plan: the W83a AS PLANNED entry above.
+
+**STATUS OF THE PLAN.** AS PLANNED: the W83a-1 block of the entry above. AS BUILT: the parser module, the three tables, the build script with its validations, the tests, the real build. **FELL SHORT / DIFFERED
+(all before any study result):**
+1. **Amendment 4 item 2 failed its own check, as designed.** The UTC assumption for EDGAR's `acceptanceDateTime` is wrong, and not in one consistent way: for some filings the JSON value is the ET
+   acceptance time plus TWICE the UTC offset (Apple 2024-08-01 16:30:26 ET -> "2024-08-02T00:30:26.000Z"; PepsiCo 2024-10-07 17:49:45 ET -> "2024-10-08T01:49:45.000Z"), for others plain UTC (Amgen
+   2020-07-28 16:05:21 ET -> 20:05:21Z), all labelled Z. A single conversion rule was tried first and the seeded index-page sample rejected it (5 of 12 mismatched). **AS BUILT: the acceptance time of every
+   release is read from its EDGAR filing index page ("Accepted", printed in ET)**, and each is cross-checked against the filing date (EDGAR dates anything accepted after 17:30 ET on the next business day).
+2. **AMENDMENT 5 (the release rule):** amendment 2 said "one release per fiscal quarter, the first after quarter end". Tesla files its quarterly DELIVERY reports under Item 2.02 about three weeks before its
+   results, so that rule would have kept the deliveries and dropped the results. Replaced by: every ORIGINAL 8-K with Item 2.02 is an event (8-K/A amendments excluded); a second filing within 3 days of a
+   kept one is merged into it. Tesla therefore has 8 events a year; the validation band is 3-8 per company-year.
+3. A company key can span several filers: Google Inc. (CIK 1288776) and Alphabet (1652044) are one key, as are Broadcom Ltd. (1649338) and Broadcom Inc. (1730168), so a key's weight keeps getting its releases
+   across a restructuring.
+4. The FOMC exclusion pattern (unscheduled / cancelled / notation vote / conference call) was dead code: those headings never parse as "<date> Meeting - YYYY" anyway (the mutation check showed it). Removed;
+   the exclusion is structural and documented, and tested on 2020.
+5. The overlap check against `research_econ_events` matches on the W65 engine tag OR the event name: the 2025-12-18 CPI release is in the Investing.com file but untagged (no "CPI MoM" headline row that
+   day; a W65 tagging gap, registered below).
+
+**DATA WRITTEN** (`data/historical.db`, prefix `research_`, insert-or-replace; raw downloads cached in `data/research_cache/w83a/`, git-ignored; audit `reports/research_calendars_audit_20261016.json`, not
+committed; 1,766 network requests on the first run, 0 on re-runs):
+- `research_econ_schedule` 579 rows (2009-2027): FOMC from the Fed (2009-2020 year pages, 2021-2027 calendar page), CPI and NFP from the BLS archives. Per year 2010-2025: FOMC 8 except **2020: 7** (the March
+  17-18 meeting was cancelled; the unscheduled March 3 / 15 cuts are excluded by design), CPI and NFP 12 except **2025: 11 each** (the 2025 shutdown). The BLS archive also lists two FUTURE NFP dates
+  (2026-11-06, 2026-12-04), kept (scheduled, public in advance).
+- `research_qqq_holdings` 450 rows: the top 10 of 17 annual reports (fiscal years 2009-2025, report date September 30, weights from the FILING date) and 28 NPORT-P quarterly reports (2019-09..2026-06).
+  Top-10 weight 46.5-60.8%. 29 company keys; the only foreign issuers that reached a top 10 are Teva and Research In Motion (2.4% at most each, no 8-K, so no releases for them).
+- `research_earnings_schedule` 1,778 events for the 27 domestic keys, with the ET acceptance time and the first session that can react (accepted at or after 16:00 ET -> the next session); 77.8% were
+  accepted after the close. 4 a year for nearly every company-year in a top 10; 5-6 in a few (Intel 2011, Netflix 2019, PayPal 2020, Celgene 2018-2019: extra Item 2.02 filings such as guidance updates);
+  Tesla 8.
+
+**VALIDATIONS (all passed before the write).** FOMC / CPI / NFP per-year counts within one of 8 / 12 / 12; the 2024-01..2026-10 overlap with `research_econ_events` complete (FOMC 22/22, CPI 33/33, NFP 33/33);
+one annual report per fiscal year 2009-2025 and 28 NPORT-P; every top-10 name mapped; every CIK's EDGAR entity name checked against the company; 3-8 events per company-year in its top-10 years; every
+acceptance time read from its index page and consistent with its filing date. **Spot checks against independent knowledge (5 per calendar, all correct):** FOMC 2015-12-16, 2020-04-29, 2022-03-16,
+2022-06-15, 2024-09-18; CPI 2020-05-12, 2022-06-10, 2022-09-13, 2022-11-10, 2023-01-12; NFP 2019-03-08, 2020-05-08, 2020-06-05, 2023-02-03, 2024-08-02; releases Apple 2024-08-01 16:30 -> 08-02, Nvidia
+2024-05-22 16:21 -> 05-23, Meta 2022-02-02 16:08 -> 02-03, Tesla 2020-07-22 16:54 -> 07-23, PepsiCo accepted 2024-10-07 17:49 -> 10-08; holdings Apple 19.8% (FY2010) and 10.8% (FY2023), Nvidia third in
+FY2024, Alphabet's two classes 6.2% combined in FY2023.
+
+**TESTS.** `tests/test_w83a_calendars.py` 42, on trimmed REAL fixtures (`tests/fixtures/w83a/`: three Fed year pages, the calendar page, the BLS CPI archive, two N-30B-2 schedules in both layouts, an NPORT-P
+file, Apple's 2024-H2 EDGAR submissions and one index page): every FOMC heading form, the exclusions, BLS dates, both schedule layouts stopping at the Total line, the table-of-contents trap, NPORT values,
+share-class merging, filing-date applicability, Item 2.02 originals only, ET from the index page, event sessions (after the close, 16:00 exactly, intraday, before the open, the evening before, weekends),
+release merging and its boundary, the store, the script (prefix required, missing contact refuses, offline without cache, failed validation writes nothing, dry run writes nothing), an AST guard that the
+live tree never imports the module, and that the module does no IO. **Mutation check: 21 mutants, all caught; 3 first-pass survivors: 2 real test gaps (a schedule row's value taken from the shares column;
+NPORT's percentage used as the value), closed; 1 equivalent (the dead exclusion pattern), removed.** Files restored byte-for-byte (hash-checked); the build re-run offline gives the same 579 / 450 / 1,778 rows.
+Collected 5967 -> 6009 = +42 exactly. Fast lane 5965 passed / 45 skipped / 0 failed (one above the selected count, as in W82 / W84). `compileall` OK; `typecheck.py` OK; `smoke_deploy.py` SMOKE PASS.
+
+**REGISTERED, NOT FIXED.** (1) W65's engine-event tagging misses the 2025-12-18 CPI release (no "CPI MoM" row that day); the live macro gate reads its own calendar, not this file, but research's
+`macro_event` gate built from `research_econ_events` would not block that day. (2) EDGAR's JSON `acceptanceDateTime` is unreliable (above): `ait.data.edgar_filings` (live, the EDGAR monitor) reads the same
+JSON; whether it uses that field was not checked. (3) Foreign issuers in a top 10 have no release dates (Teva, RIM; at most 2.4%). (4) Weights refresh only yearly before the 2019 NPORT-P series.
+
+**DECISION FOR THE OPERATOR.** Review the calendars (the audit JSON lists every count and exception) before W83a-2; or let W83a-2 proceed on them.
+
+**NEXT.** W83a-2 (the study), as planned; amendment 5 applies to its earnings features.
+
+---
