@@ -12,7 +12,10 @@ Supports:
 from __future__ import annotations
 
 import os
-from datetime import date, timedelta
+from collections import Counter
+from datetime import date, datetime, time, timedelta
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -21,19 +24,34 @@ import pandas as pd
 from ait.backtesting.pricing import (
     OptionType,
     black_scholes_price,
+    expected_move as _expected_move,  # W74: fractional-time expected move
     find_strike_by_delta,
+    ic_leg_marks,  # W72: single owner of condor leg pricing (engine + parity replay)
+    ic_leg_marks_from_ivs,  # W75: the same legs at explicit per-leg (surface) IVs
     realized_vol,
+    skewed_leg_iv,
 )
+from ait.backtesting import settlement  # W77: expiry settlement / assignment rules
 from ait.backtesting.result import BacktestResult
+from ait.backtesting.ex_div import ex_div_blocks, sells_a_call  # W84: live's ex-div entry block
 # R20 #5a: credit TP ladder / DTE close / macro-flatten windows come from the
 # shared exit-policy module (pure, import-light) instead of a hand copy of
 # live portfolio.py — a live tuning can no longer silently de-sync research.
 from ait.execution import exit_policy
+from ait.ml.regime_gate import apply_range_prob_delta, fractal_gate
 from ait.strategies.base import CREDIT_STRATEGIES, SignalDirection
 from ait.utils.logging import get_logger
+from ait.utils.time import ET, get_market_close, time_to_expiry_years  # W74: real session clock
+from ait.config.invariants import IC_BUDGET_CAPPED_MIN_WING  # W70: fixed, visible
 from ait.config.runtime_env import contract_flag, contract_float  # R19: ONE authority for env-contract defaults
 
 log = get_logger("backtesting.engine")
+
+
+@lru_cache(maxsize=4096)
+def _session_close(d: date) -> time:
+    """W74: the NYSE session close for ``d`` (13:00 ET on early-close days)."""
+    return get_market_close(d)
 
 # Strategies that collect premium (short theta).
 # R16: this module used to declare its OWN set under the same name with
@@ -42,6 +60,24 @@ log = get_logger("backtesting.engine")
 # so the two can never drift apart again. The imported name stays module-level
 # here, so existing `from ait.backtesting.engine import CREDIT_STRATEGIES`
 # callers keep working unchanged.
+def research_regime(vol_expanding: bool, px_vs_sma: float, down: float, up: float) -> str:
+    """W81: the research engine's four-way day class from two features.
+
+    ``vol_expanding`` is `vol_regime_expanding > 0.5` (5-day realized vol above 20-day) and
+    ``px_vs_sma`` is `price_vs_sma_20`. ONE definition for the trending-down veto, the
+    `entry_regime` stored on each position and the meta-label context (three sites that each
+    carried the same bare -0.05 / 0.02). Research only: live's regime comes from
+    `ait.ml.regime.RegimeDetector` with the `regime:` config block.
+    """
+    if not vol_expanding:
+        return "range_bound"
+    if px_vs_sma < down:
+        return "trending_down"
+    if px_vs_sma > up:
+        return "trending_up"
+    return "high_volatility"
+
+
 # Strategies that pay premium (long theta)
 DEBIT_STRATEGIES = {"long_call", "long_put", "bull_call_spread", "bear_put_spread", "long_straddle"}
 
@@ -94,68 +130,139 @@ class Backtester:
         # pinned 0.65 keeps its commission line and only gains the fees.
         commission_per_contract: float | None = None,
         regulatory_fees_per_contract: float | None = None,
-        slippage_pct: float = 0.01,
+        slippage_pct: float | None = None,   # W70: None -> backtest.slippage_pct
         position_size_pct: float = 0.05,
+        # W64 live-parity switches, OFF for a bare Backtester (R20b: the bare
+        # engine's sizing knobs stay explicit harness defaults; hundreds of engine
+        # tests pin them). The research ENTRY POINTS (WalkForwardConfig,
+        # StrategyOptimizer) resolve both from config and pass them explicitly.
+        # budget_aware_wings: cap the condor wing to the per-trade budget like
+        # live (IronCondor.affordable_width) and reject a structure whose max
+        # loss exceeds it. max_contracts_per_trade: live's hard cap
+        # (positions.max_contracts_per_trade, config 1); None = uncapped.
+        budget_aware_wings: bool = False,
+        max_contracts_per_trade: int | None = None,
+        # W65: research macro calendar (EconomicCalendar built from the operator's CSV).
+        # None = the hardcoded live calendar (legacy behaviour).
+        economic_calendar: Any = None,
+        # W66: live's IronCondor ignores market_direction entirely ("Iron condors work
+        # in ANY direction"), but this engine only selects it when the day's direction
+        # is NEUTRAL, which removed ~81% of days on the 2024-2026 research span. True =
+        # an IC-only strategy set is selected on ANY direction (live behavior). False
+        # (default) = the legacy NEUTRAL-only rule, so existing results do not move.
+        condor_any_direction: bool = False,
+        # W66 friction model v2. "legacy" = `half_spread_pct x leg_mid` per leg at entry and
+        # the same % on the NET value at exit (the engine's historical behaviour, kept as
+        # the bare default so engine-level tests/results do not move). "per_leg_usd" =
+        # the fitted per-leg DOLLAR half-spread (option_leg_spread_params, from IB BID/ASK
+        # bars) charged symmetrically on all four legs at entry AND exit; applies to the
+        # iron condor only, and falls back to legacy (with a WARNING) when the symbol has
+        # no fitted model. The research entry points resolve it from backtest.friction_*.
+        friction_model: str = "legacy",
+        friction_entry_capture: float | None = None,   # share of the quoted half-spread paid at entry (None -> backtest.*)
+        friction_exit_capture: float | None = None,    # ... and at exit (1.0 = full, conservative; None -> backtest.*)
+        friction_stress_multiplier: float | None = None,  # scales the model (calm-sample hedge/sweeps; None -> backtest.*)
+        # W67 gate parity. gates_mode "enforce" (bare default, the engine's historical
+        # behaviour) blocks entries on the range-model floor and the fractal hard veto;
+        # "observe" mirrors live today (ml.entry_gates_enabled=false): both are still
+        # COMPUTED and recorded (entry decision + `would_reject:*` funnel counters) but
+        # never block. The research entry points resolve it from backtest.gates_mode.
+        gates_mode: str = "enforce",
+        # W68 IV-rank parity. Live gates credit entries on IV RANK (0-100 percentile of today's
+        # IV in the last 252 stored daily IVs; ait.data.iv_rank): iron_condor refuses rank <
+        # AIT_IRON_CONDOR_IV_FLOOR (15) and the risk manager refuses rank > AIT_IV_RANK_CAP (85);
+        # an unmeasurable rank fails closed. False (bare default) = the engine's historical
+        # absolute-level floor only; the research entry points resolve backtest.iv_rank_gate.
+        iv_rank_gate: bool = False,
+        # Precomputed rank by date (ait.data.iv_rank.iv_rank_series over the symbol's FULL IV
+        # history), so a short test window still sees live's 252-observation lookback. None =
+        # derived from this engine's own `implied_vol` column.
+        iv_rank_series: pd.Series | None = None,
+        # Absolute fractal hard-veto cutoff (0 = off). None = derive from the legacy
+        # hurst_hard_veto_multiplier (max(threshold, 0.20) * multiplier) so explicit
+        # callers keep their exact behaviour. See ait.ml.regime_gate.
+        fractal_veto_spread: float | None = None,
+        # Share of the fractal penalty that ALSO lowers the range model's P(in range)
+        # before the range floor (0 = live parity: the range probability is untouched).
+        penalty_on_range_prob: float | None = None,   # W70: None -> backtest.penalty_on_range_prob
+        # W70 D (registered, NOT resolved): stop/target stay explicit harness defaults
+        # (0.50 / 1.00) although config.yaml's research baselines are 0.35 / 0.50 — a
+        # deliberate divergence the operator will revisit; see PLAN.md W70.
         stop_loss_pct: float = 0.50,
         profit_target_pct: float = 1.00,
-        max_hold_days: int = 30,
+        max_hold_days: int | None = None,      # W70: None -> backtest.max_hold_days
         # R20b (pre-registered PLAN 2026-08-21): was 0.55, silently shadowing
         # the config with a DIFFERENT value. None -> resolve from
         # load_settings().risk.min_confidence (yaml 0.50). See the resolution
         # block below for why risk.min_confidence is the documented home.
         min_confidence: float | None = None,
         trailing_stop_enabled: bool = False,
-        trailing_stop_pct: float = 0.25,
-        breakeven_trigger_pct: float = 0.30,
+        trailing_stop_pct: float | None = None,       # W70: None -> exit.trailing_stop_pct
+        breakeven_trigger_pct: float | None = None,   # W70: None -> exit.breakeven_trigger_pct
         predictor: Any = None,
         range_predictor: Any = None,
         # R20b: was 0.55 vs live's ml.range_min_confidence = 0.65 (config.yaml;
         # 0.65 beat 0.55 across every backtest metric) — the parity gap the
         # floor sweep exposed. None -> resolve from load_settings().ml.
         range_min_confidence: float | None = None,
-        context_bars: int = 0,
-        delta_short: float = 0.20,
-        delta_long: float = 0.30,
+        context_bars: int | None = None,      # W70: None -> backtest.context_bars
+        delta_short: float | None = None,     # W70: None -> backtest.delta_short
+        delta_long: float | None = None,      # W70: None -> backtest.delta_long
         # R20b: was 0.12 vs config.yaml backtest.iv_floor = 0.20 — a bare
         # engine priced systematically thinner credits than every configured
         # path. None -> resolve from load_settings().backtest.iv_floor.
         iv_floor: float | None = None,
         # R6 parity: live iron_condor._vol_scaled_width enforces min $2, not $5.
-        wing_floor_dollars: float = 2.0,
+        wing_floor_dollars: float | None = None,   # W70: None -> backtest.wing_floor_dollars (2.0)
         # R16 #8: None -> resolve env AIT_IC_WING_K (default 1.0), mirroring
         # live iron_condor.py:107 — same pattern as ic_min_credit_width below.
         wing_k: float | None = None,
-        delta_iv_scale: float = 0.0,
-        skew_factor: float = 1.0,
+        delta_iv_scale: float | None = None,   # W70: None -> backtest.delta_iv_scale
+        skew_factor: float | None = None,      # W70: None -> backtest.skew_factor
         # W5 finding model-vs-reality-skew-10x-flat: measured put-side skew is
         # 9-11x steeper than the hardcoded 0.10 slope in _get_leg_iv, so model
         # wings were near-free ($0.08 vs $0.71-0.92 real). None -> resolve
         # from load_settings().backtest.skew_slope_per_pct_otm; 0.0 restores
         # pre-W5 pricing exactly.
         skew_slope_per_pct_otm: float | None = None,
-        hurst_regime_threshold: float = 0.20,
-        hurst_regime_penalty: float = 0.10,
-        hurst_hard_veto_multiplier: float = 1.5,
-        multifractal_max_width: float = 0.50,
-        iv_rank_rise_threshold: float = 0.30,
-        pct_from_60d_high_threshold: float = -1.0,
-        min_edge_over_baseline: float = 0.05,
+        # W70: every knob in this block is None -> backtest.<same name> (the model
+        # defaults equal the former literals 0.20 / 0.10 / 1.5 / 0.50 / 0.30 / -1.0 / 0.05).
+        hurst_regime_threshold: float | None = None,
+        hurst_regime_penalty: float | None = None,
+        hurst_hard_veto_multiplier: float | None = None,
+        multifractal_max_width: float | None = None,
+        iv_rank_rise_threshold: float | None = None,
+        iv_rank_rise_gate: bool | None = None,          # W71c: None -> backtest.iv_rank_rise_gate
+        regime_veto_gate: bool | None = None,           # W81: None -> backtest.regime_veto_gate
+        regime_down_threshold: float | None = None,     # W81: None -> backtest.regime_down_threshold
+        regime_up_threshold: float | None = None,       # W81: None -> backtest.regime_up_threshold
+        ex_div_entry_gate: str | None = None,           # W84: None -> backtest.ex_div_entry_gate
+        ex_div_entry_k_days: int | None = None,         # W84: None -> backtest.ex_div_entry_k_days
+        risk_free_rate: float | None = None,            # W81: None -> options.risk_free_rate
+        pct_from_60d_high_threshold: float | None = None,
+        min_edge_over_baseline: float | None = None,
         features_cache: pd.DataFrame | None = None,
         # R20b: stays EXPLICIT (with initial_capital above) per the
         # pre-registration — harness sizing knob; 1 = the original
         # single-position semantics unit tests depend on.
         max_concurrent_positions: int = 1,
-        max_entry_vol_annual: float = 0.80,
-        # Options bid-ask spread model (per-leg, IV/DTE-aware)
-        spread_base: float = 0.03,
-        spread_iv_sensitivity: float = 0.10,
-        spread_dte_sensitivity: float = 0.005,
-        spread_cap: float = 0.15,
+        max_entry_vol_annual: float | None = None,   # W70: None -> backtest.max_entry_vol_annual
+        # Options bid-ask spread model (per-leg, IV/DTE-aware). W70: None -> backtest.spread_*
+        # (these four config keys were read by NOTHING before; the engine and the
+        # walk-forward each carried their own literals).
+        spread_base: float | None = None,
+        spread_iv_sensitivity: float | None = None,
+        spread_dte_sensitivity: float | None = None,
+        spread_cap: float | None = None,
         # Cross-asset market context forwarded from walk-forward engine (Gap Z3)
         market_context: dict | None = None,
         # Earnings-aware skip (Gap Z4): if symbol is given, skip entries near earnings dates
         symbol: str | None = None,
-        earnings_skip_days: int = 2,
+        # W70 (parity): the earnings danger window is live's, from earnings.buffer_days_before /
+        # buffer_days_after (None -> config). It replaces the private `earnings_skip_days=2`,
+        # which blocked [earnings-1, earnings+2]; live blocks [earnings-2, earnings+1].
+        earnings_buffer_days_before: int | None = None,
+        earnings_buffer_days_after: int | None = None,
         # Intraday engine (Fix 1): 5-min execution loop.
         # R20 #4/#5b: None -> resolve from load_settings().backtest (config.yaml
         # authority; BacktestConfig defaults when no config is reachable). The
@@ -244,6 +351,21 @@ class Backtester:
         # from load_settings() (config.yaml authority; falls back to
         # OptionsConfig's pydantic default when no config.yaml is reachable).
         entry_dte: int | None = None,
+        # W74 short-DTE parity programme. All four are None -> backtest.<same name>
+        # (schema defaults: 'legacy' / off / off / off), so a bare engine behaves as
+        # before. engine_model='realistic' turns on the W72 lead fixes L2-L6; the
+        # three exit knobs are independent of it. See BacktestConfig for the meaning.
+        engine_model: str | None = None,
+        pricing_source: str | None = None,     # W75: None -> backtest.pricing_source
+        friction_short_dte: bool | None = None,                  # W76: None -> backtest.*
+        friction_min_sessions_per_band: int | None = None,       # W76: None -> backtest.*
+        friction_extrapolated_floor_usd: float | None = None,    # W76: None -> backtest.*
+        expiry_guard_dte: int | None = None,
+        max_hold_fraction: float | None = None,
+        flatten_minutes_before_close: int | None = None,
+        pin_band_usd: float | None = None,                       # W77: None -> backtest.*
+        assignment_fee_per_share: float | None = None,           # W77: None -> backtest.*
+        stock_commission_per_share: float | None = None,         # W77: None -> backtest.*
         # Research-only (scripts/post_event_study.py): block CREDIT entries for
         # this many calendar days AFTER an event date (day 0 = the event day
         # itself, when the decision lands intraday). None = off, which is the
@@ -273,6 +395,76 @@ class Backtester:
         # ladder in exit_policy.CREDIT_TP_LADDER; live never sets this.
         credit_tp_ladder: Any = None,
     ) -> None:
+        # W70: load settings FIRST. Constructor knobs that have a config twin are None by
+        # default and resolve here with the project-wide precedence explicit arg > loaded
+        # settings.<section>.<field> > the config model's own default (resolve_config_value).
+        # The model defaults equal the literals these parameters used to carry, so a bare
+        # Backtester() is unchanged at today's config.yaml. Knobs deliberately kept explicit
+        # (initial_capital, position_size_pct, max_concurrent_positions, stop_loss_pct,
+        # profit_target_pct) are NOT here: see PLAN.md W70 "registered, not changed".
+        if settings is not None:
+            _settings = settings
+        else:
+            try:
+                from ait.config.settings import load_settings as _ls
+                _settings = _ls()
+            except Exception as _e:  # noqa: BLE001 — no config.yaml -> per-field defaults
+                _settings = None
+                # W52a: this used to be silent. A run from the wrong cwd is
+                # a different harness (every settings-backed knob at its
+                # model default) and must say so.
+                log.warning("engine_settings_unavailable_using_defaults",
+                            cwd=os.getcwd(), error=str(_e))
+        from ait.config.settings import (
+            BacktestConfig, EarningsConfig, ExitConfig, MLConfig, OptionsConfig, RiskConfig,
+        )
+        _bt = lambda v, f: _resolve_setting(v, "backtest", f, BacktestConfig, _settings)  # noqa: E731
+        slippage_pct = float(_bt(slippage_pct, "slippage_pct"))
+        friction_entry_capture = float(_bt(friction_entry_capture, "friction_entry_capture"))
+        friction_exit_capture = float(_bt(friction_exit_capture, "friction_exit_capture"))
+        friction_stress_multiplier = float(_bt(friction_stress_multiplier, "friction_stress_multiplier"))
+        penalty_on_range_prob = float(_bt(penalty_on_range_prob, "penalty_on_range_prob"))
+        max_hold_days = int(_bt(max_hold_days, "max_hold_days"))
+        trailing_stop_pct = float(_resolve_setting(
+            trailing_stop_pct, "exit", "trailing_stop_pct", ExitConfig, _settings))
+        breakeven_trigger_pct = float(_resolve_setting(
+            breakeven_trigger_pct, "exit", "breakeven_trigger_pct", ExitConfig, _settings))
+        context_bars = int(_bt(context_bars, "context_bars"))
+        delta_short = float(_bt(delta_short, "delta_short"))
+        delta_long = float(_bt(delta_long, "delta_long"))
+        # W70: the SAME contract call live uses (AIT_IC_WING_FLOOR, home
+        # backtest.wing_floor_dollars) — one key, one value, live and research.
+        wing_floor_dollars = (float(wing_floor_dollars) if wing_floor_dollars is not None
+                              else contract_float("AIT_IC_WING_FLOOR"))
+        delta_iv_scale = float(_bt(delta_iv_scale, "delta_iv_scale"))
+        skew_factor = float(_bt(skew_factor, "skew_factor"))
+        hurst_regime_threshold = float(_bt(hurst_regime_threshold, "hurst_regime_threshold"))
+        hurst_regime_penalty = float(_bt(hurst_regime_penalty, "hurst_regime_penalty"))
+        hurst_hard_veto_multiplier = float(_bt(hurst_hard_veto_multiplier, "hurst_hard_veto_multiplier"))
+        multifractal_max_width = float(_bt(multifractal_max_width, "multifractal_max_width"))
+        iv_rank_rise_threshold = float(_bt(iv_rank_rise_threshold, "iv_rank_rise_threshold"))
+        iv_rank_rise_gate = bool(_bt(iv_rank_rise_gate, "iv_rank_rise_gate"))
+        regime_veto_gate = bool(_bt(regime_veto_gate, "regime_veto_gate"))
+        regime_down_threshold = float(_bt(regime_down_threshold, "regime_down_threshold"))
+        regime_up_threshold = float(_bt(regime_up_threshold, "regime_up_threshold"))
+        ex_div_entry_gate = str(_bt(ex_div_entry_gate, "ex_div_entry_gate"))
+        ex_div_entry_k_days = int(_bt(ex_div_entry_k_days, "ex_div_entry_k_days"))
+        _research_prefix = str(_bt(None, "research_table_prefix"))
+        # W81: the SAME key live's Greeks read (options_chain._risk_free_rate); was a bare
+        # `r = 0.05` at three pricing sites below.
+        risk_free_rate = float(_resolve_setting(
+            risk_free_rate, "options", "risk_free_rate", OptionsConfig, _settings))
+        pct_from_60d_high_threshold = float(_bt(pct_from_60d_high_threshold, "pct_from_60d_high_threshold"))
+        min_edge_over_baseline = float(_bt(min_edge_over_baseline, "min_edge_over_baseline"))
+        max_entry_vol_annual = float(_bt(max_entry_vol_annual, "max_entry_vol_annual"))
+        spread_base = float(_bt(spread_base, "spread_base"))
+        spread_iv_sensitivity = float(_bt(spread_iv_sensitivity, "spread_iv_sensitivity"))
+        spread_dte_sensitivity = float(_bt(spread_dte_sensitivity, "spread_dte_sensitivity"))
+        spread_cap = float(_bt(spread_cap, "spread_cap"))
+        earnings_buffer_days_before = int(_resolve_setting(
+            earnings_buffer_days_before, "earnings", "buffer_days_before", EarningsConfig, _settings))
+        earnings_buffer_days_after = int(_resolve_setting(
+            earnings_buffer_days_after, "earnings", "buffer_days_after", EarningsConfig, _settings))
         self._data = self._prepare_data(data)
         self._strategies = strategies
         self._initial_capital = initial_capital
@@ -295,6 +487,26 @@ class Backtester:
         # restores the config formula for A/B runs.
         self._calibrated_spreads = None
         self._position_size_pct = position_size_pct
+        self._budget_aware_wings = bool(budget_aware_wings)
+        self._condor_any_direction = bool(condor_any_direction)
+        if friction_model not in ("legacy", "per_leg_usd"):
+            raise ValueError(f"friction_model must be 'legacy' or 'per_leg_usd', got {friction_model!r}")
+        self._friction_model = friction_model
+        self._friction_entry_capture = float(friction_entry_capture)
+        self._friction_exit_capture = float(friction_exit_capture)
+        self._friction_stress = float(friction_stress_multiplier)
+        # W76: friction by DTE band (0-6 DTE). Off = the single all-DTE model, as before.
+        self._friction_short_dte = bool(_bt(friction_short_dte, "friction_short_dte"))
+        self._friction_min_sessions = int(_bt(friction_min_sessions_per_band,
+                                              "friction_min_sessions_per_band"))
+        self._friction_floor_usd = float(_bt(friction_extrapolated_floor_usd,
+                                             "friction_extrapolated_floor_usd"))
+        self._friction_stats = {"fitted": 0, "default": 0, "extrapolated": 0}
+        self._leg_spread_model = None  # set by _load_leg_spread_model() when per_leg_usd
+        # W66: entry-funnel counters (see _reject / BacktestResult.entry_funnel)
+        self._funnel: Counter = Counter()
+        self._max_contracts_per_trade = (
+            int(max_contracts_per_trade) if max_contracts_per_trade else None)
         self._stop_loss_pct = stop_loss_pct
         self._profit_target_pct = profit_target_pct
         self._max_hold_days = max_hold_days
@@ -323,7 +535,35 @@ class Backtester:
         self._hurst_regime_penalty = hurst_regime_penalty
         self._hurst_hard_veto_multiplier = hurst_hard_veto_multiplier
         self._multifractal_max_width = multifractal_max_width
+        if gates_mode not in ("observe", "enforce"):
+            raise ValueError(f"gates_mode must be 'observe' or 'enforce', got {gates_mode!r}")
+        self._gates_mode = gates_mode
+        self._iv_rank_gate = bool(iv_rank_gate)
+        self._iv_rank_floor = contract_float("AIT_IRON_CONDOR_IV_FLOOR")
+        self._iv_rank_cap = contract_float("AIT_IV_RANK_CAP")
+        self._iv_rank_series_arg = iv_rank_series
+        self._iv_rank_arr = self._build_iv_rank_array()
+        # W67: the shared fractal gate (ait.ml.regime_gate) replaces the inline copy.
+        from ait.ml.regime_gate import SHAPE_PROPORTIONAL, FractalGateConfig, resolve_veto_spread
+        self._fractal_cfg = FractalGateConfig(
+            threshold=float(hurst_regime_threshold), penalty=float(hurst_regime_penalty),
+            multifractal_max_width=float(multifractal_max_width),
+            veto_spread=resolve_veto_spread(
+                hurst_regime_threshold, hurst_hard_veto_multiplier, fractal_veto_spread),
+            penalty_on_range_prob=float(penalty_on_range_prob),
+            shape=SHAPE_PROPORTIONAL)  # the engine's historical shape; live uses live_flat
         self._iv_rank_rise_threshold = iv_rank_rise_threshold
+        self._iv_rank_rise_gate = iv_rank_rise_gate     # W71c: False = no veto; the rise is still logged
+        self._regime_veto_gate = regime_veto_gate       # W81: False = no veto; the class is still logged
+        self._regime_down = regime_down_threshold       # W81: was a bare -0.05 at three sites
+        self._regime_up = regime_up_threshold           # W81: was a bare 0.02 at three sites
+        from ait.backtesting.ex_div import MODES as _EX_DIV_MODES
+        if ex_div_entry_gate not in _EX_DIV_MODES:
+            raise ValueError(f"ex_div_entry_gate {ex_div_entry_gate!r} not in {_EX_DIV_MODES}")
+        self._ex_div_mode = ex_div_entry_gate           # W84: live's ex-div entry block, research twin
+        self._ex_div_k = ex_div_entry_k_days
+        self._research_table_prefix = _research_prefix
+        self._risk_free_rate = risk_free_rate           # W81: was a bare 0.05 at three sites
         self._pct_from_60d_high_threshold = pct_from_60d_high_threshold
         self._min_edge_over_baseline = min_edge_over_baseline
         self._features_cache = features_cache
@@ -331,11 +571,19 @@ class Backtester:
         self._max_entry_vol_annual = max_entry_vol_annual
         self._market_context = market_context
         self._symbol = symbol or ""
-        self._db_path = db_path
+        # W76: coerce to Path. HistoricalDataStore does `db_path.parent`, so a plain str made
+        # the friction/spread loaders fail with a WARNING and the run silently fell back to
+        # the LEGACY % friction model (the W74/W75 reference studies were mislabelled for
+        # exactly this reason).
+        self._db_path = Path(db_path) if db_path is not None else None
         # R16: must run AFTER _symbol is set — the calibration is per-symbol.
         if os.environ.get("AIT_BT_CALIBRATED_SPREADS", "1") != "0":
             self._load_calibrated_spreads()
-        self._earnings_dates: set[date] = self._load_earnings_dates(symbol, earnings_skip_days)
+        if self._friction_model == "per_leg_usd":
+            self._load_leg_spread_model()
+        self._earnings_dates: set[date] = self._load_earnings_dates(
+            symbol, earnings_buffer_days_before, earnings_buffer_days_after)
+        self._ex_dates: list[date] | None = self._load_ex_dates()   # W84: after _symbol/_db_path
         self._intraday_store = intraday_store
         # R20: resolve LOADED settings once for every config-backed knob below
         # (extends the R16 #7 pre_event_blackout_days pattern).
@@ -343,19 +591,7 @@ class Backtester:
         # StrategyOptimizer loads it once and threads it through per Optuna
         # trial) instead of unconditionally re-reading + re-validating
         # config.yaml on every Backtester construction.
-        if settings is not None:
-            _settings = settings
-        else:
-            try:
-                from ait.config.settings import load_settings as _ls
-                _settings = _ls()
-            except Exception as _e:  # noqa: BLE001 — no config.yaml -> per-field defaults
-                _settings = None
-                # W52a: this used to be silent. A run from the wrong cwd is
-                # a different harness (every settings-backed knob at its
-                # model default) and must say so.
-                log.warning("engine_settings_unavailable_using_defaults",
-                            cwd=os.getcwd(), error=str(_e))
+        # W70: _settings is loaded at the top of __init__ (the constructor knobs resolve from it).
         # R20 #4/#5b + R20b (pre-registered PLAN 2026-08-21): every knob below
         # follows the same explicit > settings.<section>.<field> > config-model
         # default precedence (_resolve_setting); explicit constructor args
@@ -373,9 +609,6 @@ class Backtester:
         # exporter already maps "min_confidence" -> ("risk", "min_confidence")
         # (optimization/results.py). It is NOT ml.range_min_confidence (the
         # range-gate floor, a separate knob resolved below).
-        from ait.config.settings import (
-            BacktestConfig, ExitConfig, MLConfig, OptionsConfig, RiskConfig,
-        )
         # entry_dte: real time-to-expiration for BS pricing/decay, fixed near
         # live's actual chain selection (dte_range[0]) — see constructor
         # comment. Not itself Optuna-searched; max_hold_days (below) stays
@@ -390,6 +623,33 @@ class Backtester:
         self._contracts_cap = int(contracts_cap) if contracts_cap is not None else None
         self._entry_dte = int(entry_dte) if entry_dte is not None else int(
             _resolve_setting(None, "options", "dte_range", OptionsConfig, _settings)[0])
+        # W74: fidelity switch + the three short-DTE exit knobs (None = off = legacy).
+        self._engine_model = str(_bt(engine_model, "engine_model"))
+        if self._engine_model not in ("legacy", "realistic"):
+            raise ValueError(f"engine_model must be 'legacy' or 'realistic', got {self._engine_model!r}")
+        self._realistic = self._engine_model == "realistic"
+        # W75: leg IVs from the real-bar surface of each leg's own expiry (default
+        # off). A symbol/date without a smile falls back per leg and is counted.
+        self._pricing_source = str(_bt(pricing_source, "pricing_source"))
+        if self._pricing_source not in ("bs_legacy", "surface"):
+            raise ValueError(
+                f"pricing_source must be 'bs_legacy' or 'surface', got {self._pricing_source!r}")
+        self._surface_stats = {"hit": 0, "miss": 0}
+        self._surface = self._load_surface() if self._pricing_source == "surface" else None
+        _g = _bt(expiry_guard_dte, "expiry_guard_dte")
+        self._expiry_guard_dte = None if _g is None else int(_g)
+        _hf = _bt(max_hold_fraction, "max_hold_fraction")
+        self._max_hold_fraction = None if _hf is None else float(_hf)
+        if self._max_hold_fraction is not None and not 0.0 < self._max_hold_fraction <= 1.0:
+            raise ValueError(f"max_hold_fraction must be in (0, 1], got {self._max_hold_fraction}")
+        _fm = _bt(flatten_minutes_before_close, "flatten_minutes_before_close")
+        self._flatten_minutes = None if _fm is None else int(_fm)
+        # W77: expiry settlement knobs (realistic engine only; see ait.backtesting.settlement).
+        self._pin_band = float(_bt(pin_band_usd, "pin_band_usd"))
+        self._assignment_fee = float(_bt(assignment_fee_per_share, "assignment_fee_per_share"))
+        self._stock_commission = float(_bt(stock_commission_per_share, "stock_commission_per_share"))
+        self._settlement_stats = {"settled": 0, "pending": 0, "assigned_gap": 0,
+                                  "fallback": 0, "over_max_loss": 0}
         self._scan_interval_minutes = int(_resolve_setting(
             scan_interval_minutes, "backtest", "scan_interval_minutes", BacktestConfig, _settings))
         self._entry_window_start_et = str(_resolve_setting(
@@ -480,7 +740,8 @@ class Backtester:
         if macro_event_gate:
             try:
                 from ait.data.economic_calendar import EconomicCalendar
-                self._economic_cal = EconomicCalendar()
+                self._economic_cal = (economic_calendar if economic_calendar is not None
+                                      else EconomicCalendar())
             except Exception:  # noqa: BLE001 — gate is best-effort, never fatal
                 self._economic_cal = None
 
@@ -522,8 +783,43 @@ class Backtester:
     # Public API
     # ------------------------------------------------------------------
 
+    def _reject(self, reason: str) -> None:
+        """W66: record that an evaluated day ended in this entry rejection.
+
+        Most of the engine's entry gates used to be silent (the condor builder
+        returned None without a log), so an operator could not see WHY a run
+        produced 0-9 trades. Every `continue`/`return None` on the entry path now
+        counts here; `BacktestResult.entry_funnel` carries the totals."""
+        self._funnel[reason] += 1
+
+    def _build_iv_rank_array(self) -> np.ndarray | None:
+        """W68: IV rank aligned to `self._data` rows (NaN = unmeasurable), or None when the gate
+        is off. Uses only observations at or before each row (no look-ahead)."""
+        if not getattr(self, "_iv_rank_gate", False):
+            return None
+        from ait.data.iv_rank import iv_rank_series
+        ser = self._iv_rank_series_arg
+        if ser is None:
+            if "implied_vol" in self._data.columns:
+                ser = iv_rank_series(self._data["implied_vol"])
+            else:
+                log.warning("iv_rank_gate_no_iv_series",
+                            note="iv_rank_gate on but no implied_vol column: every credit "
+                                 "entry fails closed, as live does when the rank is unknown")
+                return np.full(len(self._data), np.nan)
+        return ser.reindex(self._data.index).to_numpy(dtype=float)
+
+    def _would_reject(self, reason: str) -> None:
+        """W67: observe mode -- the gate WOULD have rejected this day but did not.
+
+        Counted apart from `_reject` (prefix `would_reject:`) so the conservation
+        invariant `days_evaluated == entries_taken + sum(top-level rejections)` still
+        holds, and so the gate study can see exactly which days an enforced gate drops."""
+        self._funnel[f"would_reject:{reason}"] += 1
+
     def run(self) -> BacktestResult:
         """Execute the backtest and return results."""
+        self._funnel = Counter()
         capital = self._initial_capital
         trades: list[dict] = []
         open_positions: list[dict] = []
@@ -551,6 +847,7 @@ class Backtester:
             today_date = today.date() if hasattr(today, "date") else today
             hist = self._data.iloc[: i + 1]
             row = self._data.iloc[i]
+            self._funnel["days_evaluated"] += 1
 
             # --- 1. Check exits on open positions ---
             still_open = []
@@ -563,7 +860,19 @@ class Backtester:
                         symbol=_sym, start_date=today_date, end_date=today_date
                     )
 
+            closed_today: list[dict] = []   # W78: positions this session's exit step closed
             for pos in open_positions:
+                # W77: shares carried over the expiry bell are closed at THIS session's
+                # open, before any other check (the next row of the frame is the next
+                # session, so weekends and holidays are handled).
+                if pos.get("settlement") is not None:
+                    _o = row["Open"] if "Open" in row else row["Close"]
+                    pos.update(self._close_pending_settlement(pos, float(_o), today_date))
+                    capital += pos["pnl"]
+                    trades.append(pos)
+                    log.debug("trade_closed", strategy=pos["strategy"],
+                              pnl=f"{pos['pnl']:.2f}", reason=pos["exit_reason"])
+                    continue
                 # Thesis re-evaluation: exit early if ML direction strongly contradicts entry (Gap Z6).
                 thesis_exit = self._check_thesis_invalidation(pos, hist)
                 if thesis_exit is not None:
@@ -588,6 +897,7 @@ class Backtester:
                     pos.update(exit_info)
                     capital += pos["pnl"]
                     trades.append(pos)
+                    closed_today.append(pos)
                     log.debug(
                         "trade_closed",
                         strategy=pos["strategy"],
@@ -603,13 +913,22 @@ class Backtester:
 
             # --- 2. Generate new signal (skip if at position limit) ---
             if len(open_positions) >= self._max_concurrent_positions:
+                self._reject("max_concurrent")
                 continue
 
             # H2 val-split: skip new entries before eval_start_date (exits still processed above)
             if self._eval_start_date is not None and today_date < self._eval_start_date:
+                self._reject("before_eval_start")
                 continue
 
-            direction, confidence, features_df = self._get_direction(hist, market_context=self._market_context)
+            # W78: the DECISION FRAME. A realistic engine with intraday entries decides at the
+            # scan time (10:30 ET), so the gates and models may use history through the PREVIOUS
+            # session only (assumption A3). `hist` still carries day D's full bar for pricing
+            # and exits; every read below that is a decision input uses `hist_dec`
+            # (and `_dec_lag` for the IV-rank array). Legacy / daily-close entries are unchanged.
+            _dec_lag = 1 if (self._realistic and self._intraday_store is not None) else 0
+            hist_dec = hist.iloc[: len(hist) - _dec_lag]
+            direction, confidence, features_df = self._get_direction(hist_dec, market_context=self._market_context)
 
             # Decision-chain dict — populated as each gate is evaluated;
             # attached to the trade record so the dashboard can render the
@@ -628,40 +947,41 @@ class Backtester:
 
             # Apply fractal regime gate to confidence for credit strategies.
             # Features are already computed inside _get_direction — reuse them.
+            # W67: ONE implementation shared with the live orchestrator
+            # (ait.ml.regime_gate.fractal_gate); this site only applies the verdict.
+            _fractal_verdict = None
             if not features_df.empty:
                 last_f = features_df.iloc[-1]
                 spread = float(last_f.get("hurst_scale_spread", 0.0))
                 mf_w   = float(last_f.get("multifractal_width",  0.0))
-                _hurst_pass = spread <= self._hurst_regime_threshold or self._hurst_regime_threshold <= 0
+                _fractal_verdict = fractal_gate(spread, mf_w, self._fractal_cfg)
                 _entry_decision["fractal_gate"] = {
                     "hurst_spread": round(spread, 4),
+                    "multifractal_width": round(mf_w, 4),
                     "threshold": self._hurst_regime_threshold,
-                    "pass": _hurst_pass,
+                    "pass": not _fractal_verdict.over_spread,
                 }
-                if spread > self._hurst_regime_threshold and self._hurst_regime_threshold > 0:
-                    # Hard veto is optional: it only applies when multiplier > 0.
-                    # Exp 20 post-mortem showed QQQ hurst_spread rarely drops below
-                    # ~0.43 in normal conditions; overly tight thresholds can block all entries.
-                    _neutral_strat = bool(set(self._strategies) & set(NEUTRAL_CREDIT_GATED))
-                    _veto_base = max(self._hurst_regime_threshold, 0.20)
-                    _hard_veto_threshold = _veto_base * self._hurst_hard_veto_multiplier
-                    if _neutral_strat and self._hurst_hard_veto_multiplier > 0 and spread > _hard_veto_threshold:
-                        _entry_decision["fractal_gate"]["hard_veto"] = True
-                        log.debug(
-                            "hard_veto_fired",
-                            component="backtesting.engine",
-                            strategies=self._strategies,
-                            hurst_spread=round(spread, 4),
-                            hard_veto_threshold=round(_hard_veto_threshold, 4),
-                            hurst_regime_threshold=round(self._hurst_regime_threshold, 4),
-                        )
-                        continue
-                    penalty = self._hurst_regime_penalty * (
-                        spread / self._hurst_regime_threshold
+                # Hard veto is optional (veto_spread 0 = off) and only binds the
+                # neutral credit structures. Exp 20 post-mortem showed QQQ
+                # hurst_spread rarely drops below ~0.43 in normal conditions;
+                # overly tight thresholds can block all entries.
+                _neutral_strat = bool(set(self._strategies) & set(NEUTRAL_CREDIT_GATED))
+                if _fractal_verdict.veto and _neutral_strat:
+                    _entry_decision["fractal_gate"]["hard_veto"] = True
+                    log.debug(
+                        "hard_veto_fired",
+                        component="backtesting.engine",
+                        strategies=self._strategies,
+                        hurst_spread=round(spread, 4),
+                        hard_veto_threshold=round(self._fractal_cfg.veto_spread, 4),
+                        hurst_regime_threshold=round(self._hurst_regime_threshold, 4),
+                        gates_mode=self._gates_mode,
                     )
-                    confidence = max(0.0, confidence - penalty)
-                if mf_w > 0 and mf_w > self._multifractal_max_width:
-                    confidence = max(0.0, confidence - self._hurst_regime_penalty)
+                    if self._gates_mode == "enforce":
+                        self._reject("hurst_hard_veto")
+                        continue
+                    self._would_reject("hurst_hard_veto")
+                confidence = max(0.0, confidence - _fractal_verdict.directional_penalty)
 
             effective_min_conf = self._min_confidence
 
@@ -672,8 +992,10 @@ class Backtester:
             _neutral_only = bool(set(self._strategies) & set(NEUTRAL_CREDIT_GATED))
             if not _neutral_only:
                 if confidence < effective_min_conf:
+                    self._reject("direction_confidence")
                     continue
                 if direction == SignalDirection.BEARISH and confidence < effective_min_conf + 0.05:
+                    self._reject("direction_confidence_bearish")
                     continue
 
             # MetaLabeler gate (Gap Z1): applied during OOS evaluation when a trained
@@ -685,9 +1007,11 @@ class Backtester:
                     vol_exp = float(last_f.get("vol_regime_expanding", 0.0)) > 0.5
                     px_sma  = float(last_f.get("price_vs_sma_20", 0.0))
                     meta_ctx.update({
-                        "regime_trending_up":   1.0 if (vol_exp and px_sma > 0.02)               else 0.0,
-                        "regime_trending_down":  1.0 if (vol_exp and px_sma < -0.05)               else 0.0,
-                        "regime_high_vol":       1.0 if (vol_exp and -0.05 <= px_sma <= 0.02)      else 0.0,
+                        # W81: the class thresholds are backtest.regime_{down,up}_threshold
+                        # (were bare -0.05 / 0.02 here, in the veto and in entry_regime).
+                        "regime_trending_up":   1.0 if (vol_exp and px_sma > self._regime_up) else 0.0,
+                        "regime_trending_down":  1.0 if (vol_exp and px_sma < self._regime_down) else 0.0,
+                        "regime_high_vol":       1.0 if (vol_exp and self._regime_down <= px_sma <= self._regime_up) else 0.0,
                         "regime_range_bound":    0.0 if vol_exp else 1.0,
                         "vix":                   float(last_f.get("vix_level", 0.5)),
                         "iv_rank":               float(last_f.get("iv_rank", 0.5)),
@@ -714,17 +1038,34 @@ class Backtester:
                             "threshold": 0.5,
                         }
                         if not meta_signal.take_trade:
+                            self._reject("meta_label")
                             continue
                 except Exception:
                     pass  # meta-labeler errors are non-fatal
 
-            strategy = self._select_strategy(direction, hist, confidence, features_df)
+            strategy = self._select_strategy(direction, hist_dec, confidence, features_df)
             if strategy is None:
+                self._reject("no_strategy")
                 continue
+
+            # W68: live's two IV-rank gates (floor in iron_condor.py, cap in the risk manager).
+            if self._iv_rank_gate and strategy in CREDIT_STRATEGIES:
+                _ivr = float(self._iv_rank_arr[i - _dec_lag]) if self._iv_rank_arr is not None else float("nan")
+                if np.isnan(_ivr):
+                    self._reject("iv_rank_unknown")   # live fails closed on an unmeasurable rank
+                    continue
+                _entry_decision["iv_rank"] = round(_ivr, 1)
+                if strategy == "iron_condor" and _ivr < self._iv_rank_floor:
+                    self._reject("iv_rank_floor")
+                    continue
+                if _ivr > self._iv_rank_cap:
+                    self._reject("iv_rank_cap")
+                    continue
 
             # Earnings proximity skip (Gap Z4): matches live orchestrator behaviour.
             if today_date in self._earnings_dates:
                 log.debug("earnings_skip", date=str(today_date), strategy=strategy)
+                self._reject("earnings")
                 continue
 
             # Macro-event entry gate (live orchestrator credit-block parity).
@@ -752,6 +1093,7 @@ class Backtester:
                         strategy=strategy,
                         days_to_event=_d2e,
                     )
+                    self._reject("macro_event")
                     continue
 
             # Research-only post-event blackout (see __init__). Inert unless
@@ -764,6 +1106,7 @@ class Backtester:
                 log.debug("post_event_entry_skip", date=str(today_date),
                           strategy=strategy,
                           days_since_event=self._days_since_event(today_date))
+                self._reject("post_event")
                 continue
 
             # Regime gate: iron condors / short strangles fail in trending-down regimes.
@@ -778,14 +1121,15 @@ class Backtester:
                 _last_f        = features_df.iloc[-1]
                 _vol_exp_flag  = float(_last_f.get("vol_regime_expanding", 0.0)) > 0.5
                 _px_sma_val    = float(_last_f.get("price_vs_sma_20", 0.0))
-                _regime_class  = (
-                    "trending_down"   if (_vol_exp_flag and _px_sma_val < -0.05) else
-                    "trending_up"     if (_vol_exp_flag and _px_sma_val > 0.02)  else
-                    "high_volatility" if  _vol_exp_flag                          else
-                    "range_bound"
-                )
+                _regime_class  = research_regime(
+                    _vol_exp_flag, _px_sma_val, self._regime_down, self._regime_up)
                 _entry_decision["regime_class"] = _regime_class
-                if _regime_class == "trending_down":
+                # W81: backtest.regime_veto_gate=False skips the VETO only (research-only gate;
+                # live has none): the class is still recorded, and a day the veto WOULD have
+                # blocked is flagged so a study can evaluate it later (D10).
+                if _regime_class == "trending_down" and not self._regime_veto_gate:
+                    _entry_decision["regime_veto_suppressed"] = True
+                if _regime_class == "trending_down" and self._regime_veto_gate:
                     _entry_decision["regime_veto"] = True
                     log.debug(
                         "regime_veto_fired",
@@ -795,6 +1139,7 @@ class Backtester:
                         vol_regime_expanding=round(float(_last_f.get("vol_regime_expanding", 0.0)), 4),
                         price_vs_sma_20=round(_px_sma_val, 4),
                     )
+                    self._reject("regime_veto")
                     continue
 
             # Range model gate: for neutral credit structures, replace
@@ -820,31 +1165,50 @@ class Backtester:
                             date=str(today_date),
                             strategy=strategy,
                             threshold=self._range_min_confidence,
+                            gates_mode=self._gates_mode,
                         )
-                        continue
+                        if self._gates_mode == "enforce":
+                            self._reject("range_gate_no_predictor")
+                            continue
+                        self._would_reject("range_gate_no_predictor")
                 else:
                     try:
                         rp = self._range_predictor.predict(
-                            hist,
+                            hist_dec,
                             symbol=self._symbol,
                             market_context=self._market_context,
                             min_edge_override=self._min_edge_over_baseline,
                         )
-                        if rp is None or rp.probability_in_range < self._range_min_confidence:
-                            continue  # bad range setup → skip
-                        _entry_decision["range_gate"] = {
-                            "prob": round(float(rp.probability_in_range), 4),
-                            "threshold": self._range_min_confidence,
-                            "pass": True,
-                        }
-                        confidence = rp.probability_in_range
+                        # W67: the fractal penalty may also lower P(in range) (default 0
+                        # = off, live parity); the raw model output is recorded beside it.
+                        _p_range = (None if rp is None else float(rp.probability_in_range))
+                        if _p_range is not None and _fractal_verdict is not None:
+                            _p_range = apply_range_prob_delta(_p_range, _fractal_verdict)
+                        if _p_range is None or _p_range < self._range_min_confidence:
+                            if self._gates_mode == "enforce":
+                                self._reject("range_gate_below_threshold")
+                                continue  # bad range setup → skip
+                            self._would_reject("range_gate_below_threshold")
+                            _entry_decision["range_gate"] = {
+                                "prob": None if _p_range is None else round(_p_range, 4),
+                                "threshold": self._range_min_confidence, "pass": False}
+                        else:
+                            _entry_decision["range_gate"] = {
+                                "prob": round(_p_range, 4),
+                                "threshold": self._range_min_confidence,
+                                "pass": True,
+                            }
+                        if rp is not None:
+                            _entry_decision["range_gate"]["raw_prob"] = round(
+                                float(rp.probability_in_range), 4)
+                            confidence = _p_range
                     except Exception:
                         pass
 
             # Realized-vol entry gate: neutral credit structures cannot profit
             # during high-volatility regimes (e.g. tariff shocks, VIX > 40).
             if strategy in NEUTRAL_CREDIT_GATED:
-                recent_close = hist["Close"].iloc[-11:]
+                recent_close = hist_dec["Close"].iloc[-11:]
                 if len(recent_close) >= 11:
                     vol_10d = recent_close.pct_change().std() * (252 ** 0.5)
                     _entry_decision["vol_gate"] = {
@@ -859,6 +1223,7 @@ class Backtester:
                             vol_10d=f"{vol_10d:.2%}",
                             max_vol=f"{self._max_entry_vol_annual:.2%}",
                         )
+                        self._reject("vol_gate")
                         continue
 
             # R12-C: AEKF (OU-Kou-GARCH) direction veto removed — the GARCH
@@ -868,12 +1233,14 @@ class Backtester:
             # Rising IV rank filter: if IV rank has risen by more than iv_rank_rise_threshold
             # over the last 10 days, market is in directional stress — skip iron condor entry.
             # Rise value is always logged (not just on veto) for threshold tuning.
+            # W71c: backtest.iv_rank_rise_gate=False skips the VETO only (research-only gate; live
+            # has none): the rise is still computed and recorded so a study can evaluate it later.
             if strategy in NEUTRAL_CREDIT_GATED and not features_df.empty:
                 if "iv_rank" in features_df.columns and len(features_df) >= 11:
                     iv_rank_series = features_df["iv_rank"].iloc[-11:]
                     iv_rank_rise = float(iv_rank_series.iloc[-1]) - float(iv_rank_series.iloc[0])
                     _entry_decision["iv_rank_rise_10d"] = round(iv_rank_rise, 4)
-                    if iv_rank_rise > self._iv_rank_rise_threshold:
+                    if self._iv_rank_rise_gate and iv_rank_rise > self._iv_rank_rise_threshold:
                         _entry_decision["iv_rank_veto"] = {
                             "rise": round(iv_rank_rise, 4),
                             "threshold": self._iv_rank_rise_threshold,
@@ -885,6 +1252,7 @@ class Backtester:
                             iv_rank_rise=round(iv_rank_rise, 4),
                             threshold=self._iv_rank_rise_threshold,
                         )
+                        self._reject("iv_rank_rise")
                         continue
 
             # Drawdown-from-60d-high gate: block iron condor entry when the underlying is
@@ -897,7 +1265,7 @@ class Backtester:
             # iron_condor baseline a drawdown veto the butterfly/wide/broken/
             # jade/ccs arms silently skipped, biasing any promotion study.
             if strategy in NEUTRAL_CREDIT_GATED and self._pct_from_60d_high_threshold > -0.99:
-                _close_series = hist["Close"]
+                _close_series = hist_dec["Close"]
                 _rolling_high = _close_series.rolling(min(60, len(_close_series))).max().iloc[-1]
                 if _rolling_high and _rolling_high > 0:
                     _pct_from_high = (float(_close_series.iloc[-1]) - float(_rolling_high)) / float(_rolling_high)
@@ -914,6 +1282,7 @@ class Backtester:
                             pct_from_high=round(_pct_from_high, 4),
                             threshold=self._pct_from_60d_high_threshold,
                         )
+                        self._reject("pct_from_high")
                         continue
 
             # --- 3. Build the trade ---
@@ -922,6 +1291,7 @@ class Backtester:
             entry_time_str: str | None = None
             limit_price: float | None = None
             fill_time_str: str | None = None
+            _session_bars = None
             if self._intraday_store is not None:
                 from ait.data.historical import HistoricalDataStore
                 session_bars = self._intraday_store.load_intraday_range(
@@ -930,6 +1300,7 @@ class Backtester:
                     end_date=today_date,
                 )
                 if not session_bars.empty:
+                    _session_bars = session_bars
                     # Find first bar in the entry window
                     window_bars = session_bars[
                         session_bars.index.to_series().apply(
@@ -937,6 +1308,7 @@ class Backtester:
                         )
                     ]
                     if window_bars.empty:
+                        self._reject("no_bars_in_entry_window")
                         continue  # No bars in window today — skip entry
 
                     # Use VWAP of first scan bar as limit price (mid-market proxy)
@@ -959,7 +1331,21 @@ class Backtester:
                         limit_price, bars_after_scan, self._limit_order_timeout_bars
                     )
                     if not filled:
+                        self._reject("limit_not_filled")
                         continue  # Limit order expired without fill — skip entry
+
+            # W78 (realistic): the exit step above evaluated every held position over the WHOLE
+            # session, so a position that closes at 15:00 has already left `open_positions` by
+            # the time a 10:30 entry is considered. At the fill instant it was still alive:
+            # count it, or max_concurrent_positions is violated intraday (measured in W77: 20 of
+            # 179 entries at 3 DTE, 7 of 136 at 7 DTE).
+            if self._realistic and fill_time_str is not None and closed_today:
+                _fill_ts = datetime.fromisoformat(fill_time_str).astimezone(ET)
+                _alive = len(open_positions) + sum(
+                    1 for _p in closed_today if self._exit_instant(_p) >= _fill_ts)
+                if _alive >= self._max_concurrent_positions:
+                    self._reject("max_concurrent_intraday")
+                    continue
 
             # R20 #1: run() has had self._market_context all along (walkforward
             # passes the window-aligned VIX/SPY frames) but never forwarded it
@@ -967,12 +1353,35 @@ class Backtester:
             # vol calibration (VXN/VIX 1.228 QQQ, 1.33 IWM) were DEAD at
             # entry-pricing time — every study priced entries off the
             # priority-3 synthetic fallback realized_vol*1.15.
+            # W74 (realistic): what was knowable at the FILL — the limit price the
+            # order rested at, the fill time, and history through the previous
+            # session only (W72 lead L2).
+            fill_ctx = None
+            if self._realistic and fill_time_str is not None and limit_price is not None:
+                fill_ctx = {"spot": float(limit_price),
+                            "as_of": datetime.fromisoformat(fill_time_str).astimezone(ET),
+                            "iv_hist": hist.iloc[:-1]}
             pos = self._build_position(
                 strategy, direction, row, hist, today_date, capital,
-                market_context=self._market_context,
+                market_context=self._market_context, fill_ctx=fill_ctx,
             )
             if pos is None:
+                self._reject("builder_none")
                 continue
+
+            # W84: live's ex-dividend ENTRY block (W51, orchestrator trade_blocked_ex_div),
+            # checked where live checks it: on the BUILT position's real legs and expiry.
+            if self._ex_div_mode != "off" and self._ex_dates and sells_a_call(pos):
+                _exp_d = date.fromisoformat(str(pos["expiry_date"])[:10])
+                _blocked, _ex_d = ex_div_blocks(self._ex_div_mode, self._ex_dates, today_date,
+                                                _exp_d, self._ex_div_k)
+                if _blocked:
+                    _entry_decision["ex_div"] = {"mode": self._ex_div_mode, "ex_date": str(_ex_d),
+                                                 "expiry": str(_exp_d)}
+                    log.debug("ex_div_entry_block", date=str(today_date), ex_date=str(_ex_d),
+                              expiry=str(_exp_d), mode=self._ex_div_mode)
+                    self._reject("ex_div_entry")
+                    continue
 
             if entry_time_str:
                 pos["entry_time"] = entry_time_str
@@ -990,15 +1399,8 @@ class Backtester:
                 pos["entry_vix_level"] = round(float(last_f.get("vix_level", 0.0)), 4)
                 vol_expanding = float(last_f.get("vol_regime_expanding", 0.0)) > 0.5
                 px_vs_sma = float(last_f.get("price_vs_sma_20", 0.0))
-                if vol_expanding:
-                    if px_vs_sma > 0.02:
-                        pos["entry_regime"] = "trending_up"
-                    elif px_vs_sma < -0.05:
-                        pos["entry_regime"] = "trending_down"
-                    else:
-                        pos["entry_regime"] = "high_volatility"
-                else:
-                    pos["entry_regime"] = "range_bound"
+                pos["entry_regime"] = research_regime(
+                    vol_expanding, px_vs_sma, self._regime_down, self._regime_up)
                 # Features snapshot for dashboard decision drawer
                 pos["features_at_entry"] = {
                     "rsi_14":              round(float(last_f.get("rsi_14", 0.0)), 2),
@@ -1077,7 +1479,23 @@ class Backtester:
             entry_commission = self._cost_per_contract_leg * pos["contracts"] * n_legs
             pos["entry_commission"] = entry_commission
 
-            open_positions.append(pos)
+            self._funnel["entries_taken"] += 1
+            # W74 (realistic): a position opened at T is exit-checked on the bars
+            # AFTER T the same session. The legacy loop exits before it enters, so
+            # a same-day round trip (0-DTE, or a touch an hour after the fill)
+            # was impossible.
+            _same_day_exit = None
+            if self._realistic and fill_time_str is not None and _session_bars is not None:
+                _after = _session_bars[_session_bars.index > datetime.fromisoformat(fill_time_str)]
+                _same_day_exit = self._check_intraday_exit(pos, _after, today_date)
+            if _same_day_exit is not None:
+                pos.update(_same_day_exit)
+                capital += pos["pnl"]
+                trades.append(pos)
+                log.debug("trade_closed_same_session", strategy=pos["strategy"],
+                          pnl=f"{pos['pnl']:.2f}", reason=pos["exit_reason"])
+            else:
+                open_positions.append(pos)
 
         # --- Force-close remaining positions ---
         last_row = self._data.iloc[-1]
@@ -1094,6 +1512,7 @@ class Backtester:
             final_capital=round(capital, 2),
             start_date=dates[0].date() if hasattr(dates[0], "date") else dates[0],
             end_date=last_date,
+            entry_funnel=dict(self._funnel),
         )
 
         log.info(
@@ -1104,6 +1523,19 @@ class Backtester:
             max_dd=f"{result.max_drawdown:.2%}",
             win_rate=f"{result.win_rate:.2%}",
         )
+        if self._friction_bands is not None:
+            _fs = self._friction_stats
+            _tot = max(sum(_fs.values()), 1)
+            log.info("friction_summary", fitted=_fs["fitted"], default=_fs["default"],
+                     extrapolated=_fs["extrapolated"],
+                     extrapolated_share=round(_fs["extrapolated"] / _tot, 4))
+        if self._settlement_stats and (self._settlement_stats["settled"]
+                                       or self._settlement_stats["pending"]):
+            log.info("settlement_summary", **self._settlement_stats)
+        if self._surface is not None:
+            _h, _m = self._surface_stats["hit"], self._surface_stats["miss"]
+            log.info("surface_pricing_summary", legs_priced=_h + _m, from_surface=_h,
+                     fell_back=_m, coverage=round(_h / max(_h + _m, 1), 4))
         return result
 
     @classmethod
@@ -1189,15 +1621,50 @@ class Backtester:
             log.debug("ml_predictor_unavailable", reason=str(e))
         return None
 
+    def _load_ex_dates(self) -> "list[date] | None":
+        """W84: the symbol's stored ex-dividend dates, ascending, for the ex-dividend gate.
+
+        Loaded only when the gate is on, so ``off`` opens no store and changes nothing.
+        LOUD (W79a): a gate that is on without data would silently allow every entry and
+        read as "live parity", so a missing or empty table raises with the fix.
+        """
+        if self._ex_div_mode == "off":
+            return None
+        sym = (self._symbol or "").upper()
+        table = f"{self._research_table_prefix}dividends"
+        fix = (f"run: python scripts/backfill_dividends.py --symbols {sym or '<SYMBOL>'} "
+               f"--table-prefix {self._research_table_prefix}")
+        if not sym:
+            raise ValueError(f"ex_div_entry_gate={self._ex_div_mode!r} needs a symbol (the "
+                             f"ex-dividend calendar is per symbol)")
+        from ait.data.historical import HistoricalDataStore
+        store = (HistoricalDataStore(db_path=self._db_path, table_prefix=self._research_table_prefix)
+                 if self._db_path is not None
+                 else HistoricalDataStore(table_prefix=self._research_table_prefix))
+        dates = sorted(d for d, _amount in store.load_dividends(sym))
+        if not dates:
+            raise ValueError(f"ex_div_entry_gate={self._ex_div_mode!r} but {table} has no rows "
+                             f"for {sym}; {fix}")
+        log.info("ex_div_dates_loaded", symbol=sym, table=table, rows=len(dates),
+                 first=str(dates[0]), last=str(dates[-1]), mode=self._ex_div_mode)
+        return dates
+
     @staticmethod
-    def _load_earnings_dates(symbol: str | None, skip_days: int) -> set[date]:
+    def _load_earnings_dates(symbol: str | None, before_days: int,
+                             after_days: int) -> set[date]:
         """Pre-fetch historical earnings dates from yfinance (Gap Z4).
 
-        Returns the set of all calendar dates within skip_days of any earnings
-        announcement, so the main loop can do an O(1) membership test.
-        Returns an empty set if symbol is None or yfinance is unavailable.
+        Returns every calendar date inside the earnings danger window of any
+        announcement, so the main loop can do an O(1) membership test: the window
+        is live's — [earnings - before_days, earnings + after_days] — i.e. the
+        days on which live's EarningsCalendar refuses entries
+        (`-buffer_after <= days_until <= buffer_before`). W70: this used to build
+        `range(-1, skip_days + 1)` around each date, i.e. 1 day before to
+        `skip_days` AFTER — the mirror image of live's 2-before / 1-after.
+        Returns an empty set if symbol is None, both buffers are 0, or yfinance
+        is unavailable.
         """
-        if not symbol or skip_days <= 0:
+        if not symbol or (before_days <= 0 and after_days <= 0):
             return set()
         try:
             import yfinance as yf
@@ -1209,7 +1676,7 @@ class Backtester:
             danger_dates: set[date] = set()
             for idx_val in eds.index:
                 ed = idx_val.date() if hasattr(idx_val, "date") else idx_val
-                for delta in range(-1, skip_days + 1):  # 1 day after through skip_days before
+                for delta in range(-int(before_days), int(after_days) + 1):
                     danger_dates.add(ed + timedelta(days=delta))
             log.debug("earnings_dates_loaded", symbol=symbol, count=len(danger_dates))
             return danger_dates
@@ -1254,6 +1721,8 @@ class Backtester:
 
         Returns exit dict if triggered on any bar, else None.
         """
+        if self._realistic:
+            return self._check_intraday_exit_realistic(pos, session_bars, current_date)
         if session_bars is None or session_bars.empty:
             return None
 
@@ -1271,11 +1740,11 @@ class Backtester:
         for row in session_bars.itertuples(index=True):
             underlying = row.Close
             current_val = self._reprice_position(pos, underlying, days_held, None)
+            current_val = self._apply_exit_friction(
+                pos, current_val, underlying, days_held, None, exit_half_spread, trade_type)
             if trade_type == "credit":
-                current_val *= (1 + exit_half_spread)
                 pnl_pct = (entry_price - current_val) / entry_price if entry_price > 0 else 0.0
             else:
-                current_val *= (1 - exit_half_spread)
                 pnl_pct = (current_val - entry_price) / entry_price if entry_price > 0 else 0.0
 
             # Check stop / profit — routed per trade type (R6 exit parity)
@@ -1291,6 +1760,72 @@ class Backtester:
                 result["exit_time"] = bar_dt
                 return result
 
+        return None
+
+    def _check_intraday_exit_realistic(
+        self, pos: dict, session_bars: "pd.DataFrame", current_date: date
+    ) -> dict | None:
+        """Intraday exit scan at live fidelity (W72 leads L3, L4).
+
+        Differences from the legacy scan, each a measured defect:
+          * L3 — the take-profit DECISION uses the mid mark vs the credit
+            received (live's pnl_pct is the broker mark over cost basis); the
+            spread is paid on the booked exit price. The legacy scan decided on
+            the after-friction value, so the same price state exited on the
+            daily path and not intraday.
+          * L4 — each bar's OHLC is handed to the credit rules, so a short-strike
+            TOUCH is evaluated per bar (live polls spot every 30 s). The legacy
+            scan passed no row, so a take-profit bar later in the day beat an
+            earlier pierce.
+          * The decision instant is the bar END, which the expiry-day flatten and
+            the hold fraction need.
+        """
+        if session_bars is None or session_bars.empty:
+            return None
+        if pos.get("settlement") is not None:
+            return None   # W77: waiting for the next open
+        entry_price = pos["entry_price"]
+        trade_type = pos.get("trade_type", pos.get("position_type", "debit"))
+        expiry_str = pos.get("expiry_date") or pos.get("exit_date")
+        if not expiry_str:
+            return None
+        expiry = date.fromisoformat(str(expiry_str)[:10])
+        days_held = (current_date - date.fromisoformat(pos["entry_date"])).days
+        remaining_dte = max(0, (expiry - current_date).days)
+        exit_half_spread = self._options_half_spread(float(pos.get("entry_iv", 0.25)), remaining_dte)
+        bar_len = pd.Timedelta(minutes=5)
+
+        for row in session_bars.itertuples(index=True):
+            underlying = row.Close
+            bar_ts = row.Index
+            bar_end = (bar_ts + bar_len)
+            as_of = bar_end.to_pydatetime().astimezone(ET) if hasattr(bar_end, "to_pydatetime") else bar_end
+            mid_value = self._reprice_position(pos, underlying, days_held, None, as_of)
+            if trade_type == "credit":
+                pnl_pct = (entry_price - mid_value) / entry_price if entry_price > 0 else 0.0
+            else:
+                pnl_pct = (mid_value - entry_price) / entry_price if entry_price > 0 else 0.0
+            bar = pd.Series({"Open": float(row.Open), "High": float(row.High),
+                             "Low": float(row.Low), "Close": float(row.Close)})
+            result = self._dispatch_exit_check(pos, trade_type, pnl_pct, current_date, bar, as_of)
+            if result is None:
+                continue
+            if result.pop("_settle", False):
+                # W77: this bar ends at the bell. Nothing trades after it.
+                return self._settle_at_bell(
+                    pos, float(underlying), current_date,
+                    exit_time=bar_ts.isoformat() if hasattr(bar_ts, "isoformat") else str(bar_ts))
+            value, und = mid_value, underlying
+            if result.get("exit_reason") == "touch_stop":
+                value, und = self._touch_exit_mark(pos, result, days_held, None, trade_type, as_of)
+            value = self._apply_exit_friction(
+                pos, value, und, days_held, None, exit_half_spread, trade_type, as_of)
+            pnl = self._calc_pnl(pos, value)
+            result["pnl"] = round(pnl, 2)
+            result["exit_price"] = round(value, 4)
+            result["exit_underlying"] = round(float(und), 4)
+            result["exit_time"] = bar_ts.isoformat() if hasattr(bar_ts, "isoformat") else str(bar_ts)
+            return result
         return None
 
     def _try_limit_fill(
@@ -1433,6 +1968,11 @@ class Backtester:
         # requested strategy set for directional signals.
         if direction == SignalDirection.NEUTRAL:
             candidates = available & CREDIT_STRATEGIES
+        elif (self._condor_any_direction and available
+              and available <= set(NEUTRAL_CREDIT_GATED)):
+            # W66 live parity: a neutral-credit-only set (live's IC-only selector)
+            # trades on any direction.
+            candidates = available & CREDIT_STRATEGIES
         elif direction == SignalDirection.BULLISH:
             candidates = available & {"bull_call_spread", "long_call"}
         else:
@@ -1474,16 +2014,10 @@ class Backtester:
         the call-side slope at 0.064 / 0.112 / -0.089 — sign-unstable across
         symbols, so there is no measured slope to ship there.
         """
-        log_m = np.log(strike / underlying)
-        if option_type == OptionType.PUT:
-            otm = max(0.0, -log_m)
-            skew_adj = self._skew_factor * otm * 0.10
-            # W5: measured put-side steepening, relative to the vol level.
-            # otm * 100 = distance in PERCENTAGE POINTS OTM.
-            skew_adj += base_iv * self._skew_slope_per_pct_otm * (otm * 100.0)
-        else:
-            skew_adj = self._skew_factor * max(0.0, log_m) * 0.02
-        return max(base_iv + skew_adj, self._iv_floor)
+        # W72: the arithmetic lives in pricing.skewed_leg_iv (the parity replay
+        # calls the same function); this method only supplies the engine's knobs.
+        return skewed_leg_iv(base_iv, strike, underlying, option_type, self._skew_factor,
+                             self._skew_slope_per_pct_otm, self._iv_floor)
 
     def _options_half_spread(self, iv: float, dte: int) -> float:
         """Compute the per-leg half bid-ask spread for an OTM option.
@@ -1555,6 +2089,36 @@ class Backtester:
         rv = realized_vol(close_arr, window=20)
         return rv * 1.15
 
+    # W74: class-level defaults for the fidelity switch and the three short-DTE exit
+    # knobs. Tests (and any harness) build partial engines with ``Backtester.__new__``
+    # and set only what they need; those instances must stay on LEGACY semantics
+    # (the same idiom as the W70 executor durations). __init__ overwrites all four.
+    _engine_model: str = "legacy"
+    _friction_short_dte: bool = False       # W76
+    _friction_bands = None                  # W76: BandedFriction when friction_short_dte
+    _pricing_source: str = "bs_legacy"      # W75
+    _surface = None                         # W75: IVSurface when pricing_source == "surface"
+    _realistic: bool = False
+    _expiry_guard_dte: int | None = None
+    _max_hold_fraction: float | None = None
+    _flatten_minutes: int | None = None
+    # W77: settlement knobs; the stats dict is created on first use for partial engines.
+    _pin_band: float = 0.10
+    _assignment_fee: float = 0.015
+    _stock_commission: float = 0.01
+    # W81: the former bare literals, so a partial `Backtester.__new__` engine keeps the legacy
+    # behaviour; __init__ overwrites all four from config.
+    _regime_veto_gate: bool = True
+    _regime_down: float = -0.05
+    _regime_up: float = 0.02
+    # W84: a partial engine has no ex-dividend block (the schema default).
+    _ex_div_mode: str = "off"
+    _ex_div_k: int = 5
+    _ex_dates: list | None = None
+    _research_table_prefix: str = "research_"
+    _risk_free_rate: float = 0.05
+    _settlement_stats: dict | None = None
+
     # R16: VIX -> per-symbol implied-vol multipliers (see _get_iv). Unknown
     # symbols keep the historical 1.10 so nothing silently changes for
     # underlyings this calibration was never measured on.
@@ -1593,6 +2157,102 @@ class Backtester:
         except Exception as e:  # noqa: BLE001 — never block a run on this
             log.debug("calibrated_spreads_unavailable", symbol=sym, error=str(e))
 
+    def _load_leg_spread_model(self) -> None:
+        """W66: adopt the fitted per-leg dollar half-spread model for this symbol.
+
+        Absent model -> stay on the legacy % model and say so loudly: a silent fallback
+        would put a 7-8x overcharge back into a run the operator believes is v2."""
+        from ait.backtesting.friction import LegSpreadModel
+        sym = (self._symbol or "").upper()
+        row = None
+        if sym:
+            try:
+                from ait.data.historical import HistoricalDataStore
+                _store = (HistoricalDataStore(db_path=self._db_path)
+                          if self._db_path is not None else HistoricalDataStore())
+                row = _store.load_leg_spread_model(sym)
+            except Exception as e:  # noqa: BLE001 — reported below, never blocks a run
+                log.warning("friction_params_unreadable", symbol=sym, error=str(e))
+        if not row:
+            log.warning("friction_params_absent", symbol=sym,
+                        note="friction_model=per_leg_usd requested but no fitted model; "
+                             "using the LEGACY % model for this symbol")
+            return
+        self._leg_spread_model = LegSpreadModel.from_row(row)
+        log.info("friction_model_loaded", symbol=sym, form=row["form"],
+                 a=round(float(row["a"]), 5), b=round(float(row["b"]), 5), n=row.get("n"),
+                 calibrated_on=row.get("calibrated_on"))
+        if self._friction_short_dte:
+            self._load_friction_bands(sym, _store)
+
+    def _load_friction_bands(self, sym: str, store) -> None:
+        """W76: per-DTE-band models. Only a band with >= friction_min_sessions_per_band
+        collected sessions is used; every other short-DTE band is answered by the all-DTE
+        model floored at friction_extrapolated_floor_usd and COUNTED as extrapolated."""
+        from ait.backtesting.friction import BandedFriction, LegSpreadModel
+        try:
+            rows = store.load_leg_spread_band_models(sym)
+        except Exception as e:  # noqa: BLE001 - reported, never blocks a run
+            log.warning("friction_bands_unreadable", symbol=sym, error=str(e))
+            rows = {}
+        usable, short = {}, []
+        for band, r in rows.items():
+            if int(r.get("n_sessions") or 0) >= self._friction_min_sessions:
+                usable[band] = LegSpreadModel.from_row(r)
+            else:
+                short.append((band, int(r.get("n_sessions") or 0)))
+        self._friction_bands = BandedFriction(self._leg_spread_model, usable,
+                                              self._friction_floor_usd)
+        log.info("friction_bands_loaded", symbol=sym, fitted=sorted(usable),
+                 below_min_sessions=short, min_sessions=self._friction_min_sessions,
+                 floor_usd=self._friction_floor_usd,
+                 note="0-6 DTE bands not listed under fitted are charged the all-DTE model "
+                      "floored at the tick and reported as extrapolated")
+
+    def _leg_friction_usd(self, capture: float, leg_mids, dte: int | None = None) -> float:
+        """W66: dollars/share to cross the spread on every leg once (v2 model).
+
+        W76: with friction_short_dte on and the position's DTE known, the cost comes from
+        the DTE-band model (or the floored extrapolation) and the outcome is tallied."""
+        from ait.backtesting.friction import banded_condor_leg_cost_usd, condor_leg_cost_usd
+        if self._friction_bands is not None and dte is not None:
+            cost, ex = banded_condor_leg_cost_usd(self._friction_bands, leg_mids, int(dte),
+                                                  capture, self._friction_stress)
+            self._friction_stats["extrapolated" if ex else "fitted"] += 1
+            return cost
+        if self._friction_bands is not None:
+            self._friction_stats["default"] += 1
+        return condor_leg_cost_usd(self._leg_spread_model, leg_mids, capture,
+                                   self._friction_stress)
+
+    def _remaining_dte(self, pos: dict, days_held: int, as_of: datetime | None) -> int | None:
+        """Calendar days from the mark instant to this position's expiry (None if unknown)."""
+        try:
+            expiry = date.fromisoformat(str(pos["expiry_date"])[:10])
+            on = (as_of.date() if as_of is not None else
+                  date.fromisoformat(str(pos["entry_date"])[:10]) + timedelta(days=days_held))
+        except (KeyError, ValueError, TypeError):
+            return None
+        return max((expiry - on).days, 0)
+
+    def _apply_exit_friction(self, pos: dict, value: float, underlying: float,
+                             days_held: int, hist: pd.DataFrame | None,
+                             half_spread_pct: float, trade_type: str,
+                             as_of: datetime | None = None) -> float:
+        """Price the exit transaction cost onto a repriced value.
+
+        v2 iron condor: + capture x sum(leg half-spreads) at the legs' CURRENT mids (buying
+        back the shorts at the ask / selling the wings at the bid). Everything else (and
+        the legacy model): the original `% x net value` shortcut."""
+        if self._leg_spread_model is not None and pos.get("strategy") == "iron_condor":
+            sc, sp, lc, lp = self._reprice_ic_legs(pos, underlying, days_held, hist, as_of)
+            return value + self._leg_friction_usd(
+                self._friction_exit_capture, (sc, sp, lc, lp),
+                self._remaining_dte(pos, days_held, as_of) if self._friction_bands is not None
+                else None)
+        return value * (1 + half_spread_pct) if trade_type == "credit" \
+            else value * (1 - half_spread_pct)
+
     def _symbol_vol_multiplier(self) -> float:
         """Per-symbol VIX scaling, env-overridable for sensitivity runs."""
         sym = (self._symbol or "").upper()
@@ -1613,23 +2273,64 @@ class Backtester:
         today_date: date,
         capital: float,
         market_context: dict | None = None,
+        fill_ctx: dict | None = None,
     ) -> dict | None:
-        """Build a position dict with proper BS pricing for the strategy type."""
+        """Build a position dict with proper BS pricing for the strategy type.
+
+        ``fill_ctx`` (realistic engine model, intraday fill only) carries what was
+        knowable at the fill: ``spot`` (the limit price the order rested at),
+        ``as_of`` (tz-aware fill time) and ``iv_hist`` (history through the
+        PREVIOUS session). W72 lead L2: the legacy path priced a 10:30 fill at the
+        daily CLOSE with the same-day stored IV.
+        """
         underlying = row["Close"]
-        iv = self._get_iv(hist, market_context=market_context)
         dte = self._entry_dte
-        t = dte / 365.0
-        r = 0.05
+        expiry_override: date | None = None
+        t_override: float | None = None
+        iv_hist = hist
+        if self._realistic:
+            from ait.backtesting.expiry_calendar import listed_expiry
+            expiry_override = listed_expiry(today_date, self._entry_dte)
+            dte = (expiry_override - today_date).days
+            if fill_ctx is not None:
+                underlying = float(fill_ctx["spot"])
+                t_override = time_to_expiry_years(fill_ctx["as_of"], expiry_override,
+                                                  close=_session_close(expiry_override))
+                iv_hist = fill_ctx["iv_hist"]
+        iv = self._get_iv(iv_hist, market_context=market_context)
+        if self._surface is not None:
+            # W75: strike selection and the expected move use the TARGET EXPIRY's
+            # at-the-money IV (live reads the chain's ATM IV for that expiry), not
+            # the 30-day constant-maturity figure.
+            _exp_atm = (expiry_override if expiry_override is not None
+                        else today_date + timedelta(days=dte))
+            _atm = self._surface.iv(today_date - timedelta(days=1), _exp_atm,
+                                    float(underlying), float(underlying))
+            if _atm is not None:
+                iv = float(_atm)
+        t = dte / 365.0 if t_override is None else t_override
+        r = self._risk_free_rate     # W81: options.risk_free_rate (was a bare 0.05)
 
         # Entry gate for credit strategies: insufficient IV → premiums too small to
         # justify spread costs and risk. Honest no-trade rather than fake-pricing at floor.
         if strategy in CREDIT_STRATEGIES and iv < self._iv_floor:
+            self._reject("builder:iv_floor")  # detail of the loop's builder_none
             return None
 
         if strategy in CREDIT_STRATEGIES:
-            return self._build_credit_position(strategy, underlying, iv, t, r, dte, today_date, capital)
+            pos = self._build_credit_position(strategy, underlying, iv, t, r, dte, today_date, capital,
+                                              expiry=expiry_override)
         else:
-            return self._build_debit_position(strategy, direction, underlying, iv, t, r, dte, today_date, capital)
+            pos = self._build_debit_position(strategy, direction, underlying, iv, t, r, dte, today_date, capital)
+        # W64: live trades at most positions.max_contracts_per_trade contracts
+        # (sizer hard cap, config 1). The engine sized off capital x pct alone,
+        # so a larger account backtested 2-4 contracts/trade where live trades 1.
+        # All dollar fields (credit, max_loss, commission, pnl) are derived from
+        # `contracts` AFTER this point, so capping here is exact.
+        if (pos is not None and self._max_contracts_per_trade
+                and pos.get("contracts", 0) > self._max_contracts_per_trade):
+            pos["contracts"] = self._max_contracts_per_trade
+        return pos
 
     def _build_debit_position(
         self, strategy: str, direction: SignalDirection,
@@ -1772,7 +2473,7 @@ class Backtester:
     def _build_credit_position(
         self, strategy: str,
         S: float, iv: float, t: float, r: float, dte: int,
-        today_date: date, capital: float,
+        today_date: date, capital: float, expiry: date | None = None,
     ) -> dict | None:
         """Build a credit (short premium) position.
 
@@ -1785,7 +2486,12 @@ class Backtester:
 
             # Wings: vol-scaled by wing_k; wing_floor_dollars is the hard safety minimum.
             # wing_k=1.0 → 1-sigma expected move; wing_k=2.0 → 2-sigma (wider, safer).
-            expected_move = S * iv * (dte / 365.0) ** 0.5
+            if self._realistic:
+                # W74: fractional years, so a 0-DTE entry with hours left has a
+                # small positive move instead of em_unavailable.
+                expected_move = _expected_move(S, iv, t)
+            else:
+                expected_move = S * iv * (dte / 365.0) ** 0.5
             # W52a: the live EM sanity gate (iron_condor.py R12-B), same
             # rule and same contract keys: each short strike's distance from
             # spot must sit within [em_min, em_max] x expected move; reject
@@ -1793,6 +2499,7 @@ class Backtester:
             # __init__); the ratios are recorded on the position either way.
             if expected_move <= 0:
                 log.debug("condor_rejected_em_unavailable", date=str(today_date))
+                self._reject("builder:em_unavailable")  # detail of the loop's builder_none
                 return None
             em_ratio_call = (short_call_strike - S) / expected_move
             em_ratio_put = (S - short_put_strike) / expected_move
@@ -1803,11 +2510,25 @@ class Backtester:
                           em_ratio_call=round(em_ratio_call, 3),
                           em_ratio_put=round(em_ratio_put, 3),
                           em_min=self._ic_em_min, em_max=self._ic_em_max)
+                self._reject("builder:em_band")  # detail of the loop's builder_none
                 return None
             wing_width = max(self._wing_k * expected_move, self._wing_floor_dollars)
+            wing_capped = False
+            if self._budget_aware_wings:
+                # W64: live parity (iron_condor.py _vol_scaled_width). The per-trade
+                # budget is capital x position_size_pct; the widest wing it can
+                # carry is IronCondor.affordable_width(budget) (the ONE authority,
+                # W31), floor relaxed to $1 when budget-capped. Without this the
+                # engine built the full wing_k x EM wing (~$50 on SPY) at any
+                # account size and merely refused it, so a small account backtested
+                # ZERO trades where live builds a $2-wide condor.
+                from ait.strategies.iron_condor import IronCondor as _IC
+                _budget = float(capital) * self._position_size_pct
+                _afford = _IC.affordable_width(_budget)
+                if _afford < wing_width:
+                    wing_width = float(max(IC_BUDGET_CAPPED_MIN_WING, round(_afford)))
             # Research-only budget cap, mirroring live _vol_scaled_width:
             # width <= budget / (100 * max(0.5, 1 - credit/width floor)).
-            wing_capped = False
             if self._max_loss_cap is not None:
                 _affordable = self._max_loss_cap / (
                     100.0 * max(0.5, 1.0 - self._ic_min_credit_width))
@@ -1816,20 +2537,40 @@ class Backtester:
                     wing_capped = True
             long_call_strike = short_call_strike + wing_width
             long_put_strike = short_put_strike - wing_width
+            if self._realistic:
+                # W74 / W72 lead L6: price the strikes that are STORED and re-marked.
+                # The legacy build priced the unrounded long strikes, then stored
+                # them rounded, so a fresh condor re-marked away from its entry
+                # credit on day 0. The wing is now the WIDER of the two rounded
+                # wings (what live uses for credit/width and max loss).
+                long_call_strike = float(round(long_call_strike))
+                long_put_strike = float(round(long_put_strike))
+                _call_w = long_call_strike - short_call_strike
+                _put_w = short_put_strike - long_put_strike
+                if min(_call_w, _put_w) <= 0:
+                    self._reject("builder:wing_degenerate")  # detail of the loop's builder_none
+                    return None
+                wing_width = max(_call_w, _put_w)
 
-            # Price each leg with its own skewed IV
-            short_call_price = black_scholes_price(S, short_call_strike, t, r,
-                self._get_leg_iv(iv, short_call_strike, S, OptionType.CALL), OptionType.CALL)
-            short_put_price = black_scholes_price(S, short_put_strike, t, r,
-                self._get_leg_iv(iv, short_put_strike, S, OptionType.PUT), OptionType.PUT)
-            long_call_price = black_scholes_price(S, long_call_strike, t, r,
-                self._get_leg_iv(iv, long_call_strike, S, OptionType.CALL), OptionType.CALL)
-            long_put_price = black_scholes_price(S, long_put_strike, t, r,
-                self._get_leg_iv(iv, long_put_strike, S, OptionType.PUT), OptionType.PUT)
+            # Price each leg with its own skewed IV (W72: pricing.ic_leg_marks,
+            # the same call the daily re-mark and the parity replay use)
+            if self._surface is not None:
+                _exp = expiry if expiry is not None else today_date + timedelta(days=dte)
+                _ivs = self._surface_leg_ivs(
+                    _exp, (short_call_strike, short_put_strike, long_call_strike, long_put_strike),
+                    S, today_date, iv)
+                short_call_price, short_put_price, long_call_price, long_put_price = \
+                    ic_leg_marks_from_ivs(S, short_call_strike, short_put_strike,
+                                          long_call_strike, long_put_strike, t, r, *_ivs)
+            else:
+                short_call_price, short_put_price, long_call_price, long_put_price = ic_leg_marks(
+                    S, short_call_strike, short_put_strike, long_call_strike, long_put_strike,
+                    t, r, iv, self._skew_factor, self._skew_slope_per_pct_otm, self._iv_floor)
 
             # Net credit received at mid prices
             net_credit = (short_call_price + short_put_price) - (long_call_price + long_put_price)
             if net_credit <= 0:
+                self._reject("builder:net_credit_nonpositive")  # detail of the loop's builder_none
                 return None
 
             # R6 live-parity construction gates (src/ait/strategies/iron_condor.py
@@ -1838,19 +2579,34 @@ class Backtester:
             #    ($0.70 default): at a 50% TP the gross must clear ~3x the
             #    round-trip commission/crossing cost.
             if net_credit < self._ic_min_credit:
+                self._reject("builder:credit_floor")  # detail of the loop's builder_none
                 return None
             # 2. Credit-to-width gate — live rejects total_credit/max_width <
             #    AIT_IC_MIN_CREDIT_WIDTH (0.20 default). Engine wings are
             #    symmetric, so max_width == wing_width.
             if wing_width > 0 and (net_credit / wing_width) < self._ic_min_credit_width:
+                self._reject("builder:credit_width_ratio")  # detail of the loop's builder_none
                 return None
 
+            # W64: the MID credit, before friction. Live's budget gate
+            # (iron_condor.py max_loss > risk_budget) is evaluated on mid-price
+            # strikes' credit; the engine deducted half-spread friction first and
+            # then checked the budget against the inflated max loss, refusing
+            # trades live takes at small size. Kept for the budget-aware path.
+            _mid_credit = net_credit
             # Per-leg spread cost: 4 legs × half-spread (sell at bid, buy at ask)
             half_spread = self._options_half_spread(iv, dte)
             avg_leg_mid = (short_call_price + short_put_price + long_call_price + long_put_price) / 4
             spread_cost = 4 * half_spread * avg_leg_mid
+            if self._leg_spread_model is not None:
+                # W66 v2: the fitted DOLLAR half-spread on each of the four legs
+                spread_cost = self._leg_friction_usd(
+                    self._friction_entry_capture,
+                    (short_call_price, short_put_price, long_call_price, long_put_price),
+                    dte if self._friction_bands is not None else None)
             net_credit = max(0.0, net_credit - spread_cost)
             if net_credit <= 0:
+                self._reject("builder:credit_after_friction_nonpositive")  # detail of the loop's builder_none
                 return None
 
             # Max loss = wing width - net credit (per share)
@@ -1859,16 +2615,25 @@ class Backtester:
 
             # Position sizing based on max loss (margin requirement)
             import math
-            if (max_loss_per_contract <= 0 or math.isnan(max_loss_per_contract)
-                    or capital < max_loss_per_contract):
+            # W64: budget-aware runs gate affordability + size on the MID-credit
+            # max loss (live parity, see _mid_credit above). The recorded
+            # position (max_loss_per_share below, P&L) still carries the friction.
+            _gate_per_contract = (
+                (wing_width - _mid_credit) * 100
+                if self._budget_aware_wings else max_loss_per_contract)
+            if (_gate_per_contract <= 0 or math.isnan(_gate_per_contract)
+                    or capital < _gate_per_contract):
+                self._reject("builder:capital_below_max_loss")  # detail of the loop's builder_none
                 return None
             # Research-only: live rejects a built condor whose max loss still
             # exceeds the budget (iron_condor.py, max_loss > risk_budget).
             if self._max_loss_cap is not None and max_loss_per_contract > self._max_loss_cap:
+                self._reject("builder:research_max_loss_cap")  # detail of the loop's builder_none
                 return None
-            contracts = int(capital * self._position_size_pct / max_loss_per_contract)
+            contracts = int(capital * self._position_size_pct / _gate_per_contract)
             if contracts < 1:
-                self._log_unaffordable(strategy, max_loss_per_contract, capital)
+                self._log_unaffordable(strategy, _gate_per_contract, capital)
+                self._reject("builder:unaffordable_contracts")  # detail of the loop's builder_none
                 return None
             if self._contracts_cap is not None:
                 contracts = min(contracts, self._contracts_cap)
@@ -1880,6 +2645,8 @@ class Backtester:
                 "trade_type": "credit",
                 "entry_date": str(today_date),
                 "entry_price": round(net_credit, 4),  # Credit received per share
+                "mid_credit": round(_mid_credit, 4),  # W66: before friction
+                "entry_friction_usd": round(spread_cost, 4),  # W66: per share, whole condor
                 "contracts": contracts,
                 "n_legs": 4,
                 "short_call_strike": round(short_call_strike, 0),
@@ -1896,8 +2663,16 @@ class Backtester:
                 "max_loss_per_contract": round(max_loss_per_contract, 2),
                 "underlying_at_entry": round(S, 2),
                 "max_loss_per_share": round(max_loss_per_share, 4),
-                "expiry_date": str(today_date + timedelta(days=dte)),
+                # W65: the per-contract risk the BUDGET gate used (mid-credit when
+                # budget-aware, else the friction-inclusive max loss). The walk-forward
+                # pool allocator reuses it so its affordability/aggregate-risk gates
+                # agree with the engine's, instead of re-rejecting what the engine took.
+                "budget_gate_risk_per_contract": round(_gate_per_contract, 2),
+                "expiry_date": str(expiry if expiry is not None
+                                   else today_date + timedelta(days=dte)),
                 "high_water_mark": 0.0,
+                **({"engine_model": "realistic", "entry_dte_actual": int(dte)}
+                   if self._realistic else {}),
             }
 
         elif strategy in ("wide_wing_condor", "broken_wing_condor"):
@@ -2266,6 +3041,66 @@ class Backtester:
     # Exit logic — handles both debit and credit positions
     # ------------------------------------------------------------------
 
+    def _load_surface(self):
+        """Build/load the real-bar IV surface for this symbol, or None (with a WARNING)."""
+        sym = (self._symbol or "").upper()
+        if not sym:
+            log.warning("surface_pricing_unavailable", reason="engine has no symbol",
+                        fallback="bs_legacy")
+            return None
+        try:
+            from ait.backtesting.iv_surface import build_or_load
+            from ait.data.historical import DB_PATH
+            db = Path(self._db_path) if self._db_path is not None else DB_PATH
+            surf = build_or_load(db, sym, db.parent / "research_cache")
+        except Exception as exc:  # noqa: BLE001 - research must degrade loudly, not crash
+            log.warning("surface_pricing_unavailable", symbol=sym, error=str(exc),
+                        fallback="bs_legacy")
+            return None
+        if len(surf) == 0:
+            log.warning("surface_pricing_unavailable", symbol=sym, reason="no smiles in the bars",
+                        fallback="bs_legacy")
+            return None
+        log.info("surface_pricing_active", symbol=sym, smiles=len(surf),
+                 first=str(surf.dates()[0]), last=str(surf.dates()[-1]))
+        return surf
+
+    def _surface_leg_ivs(self, expiry: date, strikes: tuple, S: float, on: date,
+                         base_iv: float) -> tuple[float, float, float, float]:
+        """Per-leg IVs (short call, short put, long call, long put) from the surface as it
+        stood at the PREVIOUS session (assumption A3: nothing from ``on`` is used).
+
+        A leg the surface cannot price falls back to the legacy base IV + skew and is
+        counted in ``self._surface_stats`` (logged at the end of the run)."""
+        opts = (OptionType.CALL, OptionType.PUT, OptionType.CALL, OptionType.PUT)
+        surface_date = on - timedelta(days=1)
+        out = []
+        for K, opt in zip(strikes, opts):
+            iv = self._surface.iv(surface_date, expiry, float(K), float(S))
+            if iv is None:
+                self._surface_stats["miss"] += 1
+                iv = self._get_leg_iv(base_iv, float(K), float(S), opt)
+            else:
+                self._surface_stats["hit"] += 1
+                iv = max(float(iv), self._iv_floor)
+            out.append(iv)
+        return out[0], out[1], out[2], out[3]
+
+    def _position_dte(self, pos: dict) -> int:
+        """W74: calendar days from THIS position's entry to ITS expiry.
+
+        The re-mark used the engine-wide ``self._entry_dte``, which is only right
+        while every position is entered with the same DTE and a synthetic
+        ``entry + N`` expiry. Reading the position's own dates is identical in
+        that legacy case (proved by the W72 reference run) and correct as soon
+        as expiries differ (listed-session expiries, per-candidate DTE).
+        """
+        try:
+            return (date.fromisoformat(str(pos["expiry_date"])[:10])
+                    - date.fromisoformat(str(pos["entry_date"])[:10])).days
+        except (KeyError, ValueError, TypeError):
+            return self._entry_dte
+
     def _get_current_iv(self, pos: dict, hist: pd.DataFrame | None) -> float:
         """Mean-reverting IV: blends entry IV with current realized vol.
 
@@ -2279,8 +3114,62 @@ class Backtester:
         rv = realized_vol(hist["Close"].values, window=20) * 1.15
         return max(0.70 * entry_iv + 0.30 * rv, self._iv_floor)
 
+    def _eod(self, d: date) -> datetime:
+        """W74: the daily model's decision instant: the session close of ``d``."""
+        return datetime.combine(d, _session_close(d), tzinfo=ET)
+
+    def _remark_t(self, pos: dict, days_held: int, as_of: datetime | None) -> float:
+        """Time to expiry, in years, for a re-mark.
+
+        Legacy: whole calendar days, floored at 0.0001 y (~53 min) so a position
+        never reprices at t=0. Realistic with a decision instant: the real
+        fractional time to the expiry session's bell, so a 0-DTE position marked
+        an hour after its fill has 4.5 hours of life, not 53 minutes. (The
+        legacy form made a freshly-entered 0-DTE condor look instantly
+        profitable: priced with 5.5 h at the fill, marked with 0.9 h one bar
+        later.)
+        """
+        if self._realistic and as_of is not None:
+            try:
+                expiry = date.fromisoformat(str(pos["expiry_date"])[:10])
+            except (KeyError, ValueError, TypeError):
+                expiry = None
+            if expiry is not None:
+                return time_to_expiry_years(as_of, expiry, close=_session_close(expiry))
+        return max(max(self._position_dte(pos) - days_held, 0) / 365.0, 0.0001)
+
+    def _reprice_ic_legs(self, pos: dict, underlying: float, days_held: int,
+                         hist: pd.DataFrame | None = None,
+                         as_of: datetime | None = None) -> tuple[float, float, float, float]:
+        """The four condor leg mids (short call, short put, long call, long put) at this
+        underlying/age. Single source for `_reprice_position` (net value) and the W66
+        per-leg exit friction, so the two can never disagree on the leg prices."""
+        iv = self._get_current_iv(pos, hist)
+        t = self._remark_t(pos, days_held, as_of)
+        r = self._risk_free_rate     # W81: options.risk_free_rate (was a bare 0.05)
+        if self._surface is not None:
+            try:
+                _exp = date.fromisoformat(str(pos["expiry_date"])[:10])
+                _on = (as_of.date() if as_of is not None else
+                       date.fromisoformat(str(pos["entry_date"])[:10]) + timedelta(days=days_held))
+            except (KeyError, ValueError, TypeError):
+                _exp = None
+            if _exp is not None:
+                _ivs = self._surface_leg_ivs(
+                    _exp, (pos["short_call_strike"], pos["short_put_strike"],
+                           pos["long_call_strike"], pos["long_put_strike"]),
+                    underlying, _on, iv)
+                return ic_leg_marks_from_ivs(
+                    underlying, pos["short_call_strike"], pos["short_put_strike"],
+                    pos["long_call_strike"], pos["long_put_strike"], t, r, *_ivs)
+        return ic_leg_marks(
+            underlying, pos["short_call_strike"], pos["short_put_strike"],
+            pos["long_call_strike"], pos["long_put_strike"], t, r, iv,
+            self._skew_factor, self._skew_slope_per_pct_otm, self._iv_floor)
+
     def _reprice_position(self, pos: dict, underlying: float, days_held: int,
-                          hist: pd.DataFrame | None = None) -> float:
+                          hist: pd.DataFrame | None = None,
+                          as_of: datetime | None = None) -> float:
         """Reprice a position at the current underlying using Black-Scholes.
 
         Returns the current value per share:
@@ -2291,21 +3180,13 @@ class Backtester:
         # Decay to the REAL expiration (entry_dte), not the hold-cap —
         # max_hold_days now closes the position early via its own exit
         # check (_check_exit_*) rather than by fabricating a shorter option.
-        dte_remaining = max(self._entry_dte - days_held, 0)
-        t = max(dte_remaining / 365.0, 0.0001)
-        r = 0.05
+        t = self._remark_t(pos, days_held, as_of)
+        r = self._risk_free_rate     # W81: options.risk_free_rate (was a bare 0.05)
 
         strategy = pos["strategy"]
 
         if strategy in ("iron_condor", "iron_butterfly", "wide_wing_condor", "broken_wing_condor"):
-            sc = black_scholes_price(underlying, pos["short_call_strike"], t, r,
-                self._get_leg_iv(iv, pos["short_call_strike"], underlying, OptionType.CALL), OptionType.CALL)
-            sp = black_scholes_price(underlying, pos["short_put_strike"], t, r,
-                self._get_leg_iv(iv, pos["short_put_strike"], underlying, OptionType.PUT), OptionType.PUT)
-            lc = black_scholes_price(underlying, pos["long_call_strike"], t, r,
-                self._get_leg_iv(iv, pos["long_call_strike"], underlying, OptionType.CALL), OptionType.CALL)
-            lp = black_scholes_price(underlying, pos["long_put_strike"], t, r,
-                self._get_leg_iv(iv, pos["long_put_strike"], underlying, OptionType.PUT), OptionType.PUT)
+            sc, sp, lc, lp = self._reprice_ic_legs(pos, underlying, days_held, hist, as_of)
             return (sc + sp) - (lc + lp)
 
         elif strategy == "put_credit_spread":
@@ -2380,6 +3261,12 @@ class Backtester:
         """
         if self._predictor is None:
             return None
+        # W74 / W72 lead L5: live's _check_thesis_valid EXEMPTS defined-risk NEUTRAL
+        # structures entirely (R16, 2026-08-07: a condor profits in either
+        # direction, so a direction "flip" is meaningless). The legacy engine
+        # exited condors on a >= 0.80 directional call.
+        if self._realistic and pos.get("strategy") in ("iron_condor", "iron_butterfly"):
+            return None
         # Only re-evaluate after at least 2 days held (avoid same-bar noise)
         entry_date = date.fromisoformat(pos["entry_date"])
         if not hasattr(hist.index[-1], "date"):
@@ -2419,11 +3306,14 @@ class Backtester:
     def _check_exit(self, pos: dict, row: pd.Series, current_date: date,
                     hist: pd.DataFrame | None = None) -> dict | None:
         """Check if a position should be exited."""
+        if pos.get("settlement") is not None:
+            return None   # W77: waiting for the next open; run() closes it, never twice
         underlying = row["Close"]
         entry_date = date.fromisoformat(pos["entry_date"])
         days_held = (current_date - entry_date).days
 
-        current_value = self._reprice_position(pos, underlying, days_held, hist)
+        _eod_asof = self._eod(current_date) if self._realistic else None
+        current_value = self._reprice_position(pos, underlying, days_held, hist, _eod_asof)
 
         trade_type = pos.get("trade_type", "debit")
         entry_price = pos["entry_price"]
@@ -2448,12 +3338,16 @@ class Backtester:
         expiry = date.fromisoformat(pos["expiry_date"])
         remaining_dte = max(0, (expiry - current_date).days)
         exit_half_spread = self._options_half_spread(exit_iv, remaining_dte)
-        if trade_type == "credit":
-            current_value *= (1 + exit_half_spread)  # Buy back at ask
-        else:
-            current_value *= (1 - exit_half_spread)  # Sell at bid
+        # Buy back at the ask / sell at the bid (W66: per-leg dollars for v2 condors)
+        current_value = self._apply_exit_friction(
+            pos, current_value, underlying, days_held, hist, exit_half_spread, trade_type,
+            _eod_asof)
 
         result = self._dispatch_exit_check(pos, trade_type, pnl_pct, current_date, row)
+
+        if result is not None and result.pop("_settle", False):
+            # W77: the expiry bell. Settled (closed now) or left holding shares (None).
+            return self._settle_at_bell(pos, float(underlying), current_date)
 
         if result is not None:
             # R16 touch-stop: live transacts AT the touched strike intraday, not
@@ -2461,23 +3355,11 @@ class Backtester:
             # recovered by the bell is booked at what live would actually have
             # paid — the whole point of modelling the touch.
             if result.get("exit_reason") == "touch_stop":
-                _tu = float(result.pop("touch_underlying"))
-                current_value = self._reprice_position(pos, _tu, days_held, hist)
-                underlying = _tu
-                # W5 model-vs-reality-touch-gap-pricing: a day that OPENED
-                # beyond the short strike could never have been closed AT the
-                # strike. Reprice at the gapped open and book the worse of the
-                # two — conservative by construction, so a gap can only ever
-                # cost more than the strike-touch booking, never less.
-                _gap = result.pop("touch_gap_underlying", None)
-                if _gap is not None:
-                    _gv = self._reprice_position(pos, float(_gap), days_held, hist)
-                    _worse = (_gv > current_value if trade_type == "credit"
-                              else _gv < current_value)
-                    if _worse:
-                        current_value = _gv
-                        underlying = float(_gap)
-                current_value *= (1 + exit_half_spread)
+                current_value, underlying = self._touch_exit_mark(
+                    pos, result, days_held, hist, trade_type, _eod_asof)
+                current_value = self._apply_exit_friction(
+                    pos, current_value, underlying, days_held, hist, exit_half_spread,
+                    trade_type, _eod_asof)
 
             # Calculate actual P&L
             pnl = self._calc_pnl(pos, current_value)
@@ -2490,9 +3372,34 @@ class Backtester:
 
         return None
 
+    def _touch_exit_mark(self, pos: dict, result: dict, days_held: int,
+                         hist: pd.DataFrame | None, trade_type: str,
+                         as_of: datetime | None = None) -> tuple[float, float]:
+        """Mid value and underlying a short-strike TOUCH exit is booked at.
+
+        R16: live transacts AT the touched strike, so the structure is repriced
+        there. W5 model-vs-reality-touch-gap-pricing: a session that OPENED
+        beyond the short strike could never be closed AT the strike, so the
+        gapped open is repriced too and the WORSE of the two is booked —
+        conservative by construction. Pops the two bookkeeping keys off
+        ``result``. W74: extracted from ``_check_exit`` so the intraday scan
+        prices a touch with the very same code.
+        """
+        _tu = float(result.pop("touch_underlying"))
+        current_value = self._reprice_position(pos, _tu, days_held, hist, as_of)
+        underlying = _tu
+        _gap = result.pop("touch_gap_underlying", None)
+        if _gap is not None:
+            _gv = self._reprice_position(pos, float(_gap), days_held, hist, as_of)
+            _worse = (_gv > current_value if trade_type == "credit" else _gv < current_value)
+            if _worse:
+                current_value = _gv
+                underlying = float(_gap)
+        return current_value, underlying
+
     def _dispatch_exit_check(
         self, pos: dict, trade_type: str, pnl_pct: float, current_date: date,
-        row: pd.Series | None = None
+        row: pd.Series | None = None, as_of: datetime | None = None
     ) -> dict | None:
         """Route exit logic by trade type (R6 exit parity with live).
 
@@ -2503,7 +3410,7 @@ class Backtester:
         (trailing/breakeven when enabled, else fixed stop + profit target).
         """
         if trade_type == "credit":
-            return self._check_exit_credit(pos, pnl_pct, current_date, row)
+            return self._check_exit_credit(pos, pnl_pct, current_date, row, as_of)
         if self._trailing_stop_enabled:
             return self._check_exit_trailing(pos, pnl_pct, current_date)
         return self._check_exit_fixed(pos, pnl_pct, current_date)
@@ -2527,8 +3434,42 @@ class Backtester:
             dte, time_decay_scaling=time_decay_scaling, ladder=ladder
         )
 
+    def _entry_ts(self, pos: dict) -> datetime:
+        """W74: when this position was opened, tz-aware ET.
+
+        The intraday fill time when the entry was simulated on 5-minute bars, else
+        the daily-model convention: priced at the day's close.
+        """
+        for key in ("fill_time", "entry_time"):
+            v = pos.get(key)
+            if v:
+                try:
+                    ts = datetime.fromisoformat(str(v))
+                except ValueError:
+                    continue
+                return ts.astimezone(ET) if ts.tzinfo else ts.replace(tzinfo=ET)
+        d = date.fromisoformat(str(pos["entry_date"])[:10])
+        return datetime.combine(d, _session_close(d), tzinfo=ET)
+
+    def _exit_instant(self, pos: dict) -> datetime:
+        """W78: when a closed position's exit took effect, tz-aware ET.
+
+        An intraday exit carries its bar timestamp in ``exit_time``; a daily-path exit is
+        decided at the session close (the daily-model convention), so a date-only value
+        maps to that session's close."""
+        v = pos.get("exit_time") or pos.get("exit_date")
+        d = date.fromisoformat(str(pos.get("exit_date") or v)[:10])
+        if v and len(str(v)) > 10:
+            try:
+                ts = datetime.fromisoformat(str(v))
+                return ts.astimezone(ET) if ts.tzinfo else ts.replace(tzinfo=ET)
+            except ValueError:
+                pass
+        return datetime.combine(d, _session_close(d), tzinfo=ET)
+
     def _check_exit_credit(self, pos: dict, pnl_pct: float, current_date: date,
-                           row: pd.Series | None = None) -> dict | None:
+                           row: pd.Series | None = None,
+                           as_of: datetime | None = None) -> dict | None:
         """Credit-structure exits — R6 parity with live portfolio.py.
 
         pnl_pct is fraction of credit received (positive = value decayed).
@@ -2617,15 +3558,51 @@ class Backtester:
         # max_hold_days independently forces an earlier close, letting
         # Optuna explore shorter/longer synthetic hold horizons.
         held = (current_date - date.fromisoformat(pos["entry_date"])).days
-        if held >= self._max_hold_days:
+        # W74: decision instant. Intraday callers pass the bar's end; the daily path
+        # decides at the close (the daily-model convention).
+        _asof = as_of if as_of is not None else datetime.combine(
+            current_date, _session_close(current_date), tzinfo=ET)
+        _bell = datetime.combine(expiry, _session_close(expiry), tzinfo=ET)
+
+        # 2a. W74 expiry-day flatten: a hard backstop so no position reaches
+        # settlement/assignment mechanics. Off (None) = legacy.
+        if self._flatten_minutes is not None and exit_policy.expiry_day_flatten_due(
+                _asof, expiry, self._flatten_minutes, close_et=_session_close(expiry)):
+            return {"exit_date": str(current_date), "exit_reason": "expiry_day_flatten"}
+
+        # 2b. Hold cap. W74: a fraction of the position's own life REPLACES the
+        # day count when set, so "hold anywhere between 0 and DTE" is one
+        # dimension for every entry DTE.
+        if self._max_hold_fraction is not None:
+            if exit_policy.hold_limit_reached(self._entry_ts(pos), _asof, _bell,
+                                              self._max_hold_fraction):
+                return {"exit_date": str(current_date), "exit_reason": "max_hold_reached"}
+        elif held >= self._max_hold_days:
             return {"exit_date": str(current_date), "exit_reason": "max_hold_reached"}
 
         # 3. Expiry-approaching close — live closes any position at
         # DTE <= exit_policy.EXPIRY_APPROACHING_DTE (portfolio.py rule 3a;
-        # rule 3 assignment risk at DTE<=1 is subsumed).
-        if remaining_dte <= exit_policy.EXPIRY_APPROACHING_DTE:
+        # rule 3 assignment risk at DTE<=1 is subsumed). W74: only for positions
+        # ENTERED above expiry_guard_dte (None = every position, as before).
+        if remaining_dte <= exit_policy.EXPIRY_APPROACHING_DTE and \
+                exit_policy.expiry_guard_applies(self._position_dte(pos), self._expiry_guard_dte):
             reason = "expiry" if current_date >= expiry else "expiry_approaching"
             return {"exit_date": str(current_date), "exit_reason": reason}
+
+        # 3b. W74: nothing outlives its expiry SESSION. Time-aware on purpose: on
+        # the expiry date itself the position is alive until the bell, so the
+        # intraday scan must reach the flatten cutoff first; the daily path
+        # decides at the close, where this fires. Unreachable in legacy (rule 3
+        # fires first for every position); it closes guard-exempt entries.
+        if _asof >= _bell:
+            out = {"exit_date": str(current_date), "exit_reason": "expiry"}
+            # W77: a realistic engine settles at the bell (exercise / assignment /
+            # expiry, shares carried over a gap) instead of re-marking and paying exit
+            # friction on legs that do not trade. Only structures whose legs are known
+            # (_settle_legs_of); anything else keeps the re-mark.
+            if self._realistic and self._settle_legs_of(pos) is not None:
+                out["_settle"] = True
+            return out
 
         # 4. Macro-event flatten (portfolio.py rule 3d parity). PLAN
         # 2026-08-04: defined-risk EXEMPT — condors hold through events
@@ -2724,22 +3701,120 @@ class Backtester:
 
         return raw_pnl - total_commission
 
+    # W77: option legs by strategy, as (position key, right, side). A strategy absent here
+    # (or a position missing a key) keeps the re-mark close, so settlement can never
+    # silently drop a leg.
+    _SETTLE_LEG_KEYS: dict[str, tuple[tuple[str, str, str], ...]] = {
+        **{s: (("short_call_strike", "C", "short"), ("long_call_strike", "C", "long"),
+               ("short_put_strike", "P", "short"), ("long_put_strike", "P", "long"))
+           for s in ("iron_condor", "iron_butterfly", "wide_wing_condor", "broken_wing_condor")},
+        "put_credit_spread": (("short_put_strike", "P", "short"), ("long_put_strike", "P", "long")),
+        "call_credit_spread": (("short_call_strike", "C", "short"), ("long_call_strike", "C", "long")),
+        "short_strangle": (("short_call_strike", "C", "short"), ("short_put_strike", "P", "short")),
+        "jade_lizard": (("short_put_strike", "P", "short"), ("short_call_strike", "C", "short"),
+                        ("long_call_strike", "C", "long")),
+    }
+
+    def _settle_legs_of(self, pos: dict) -> "list[settlement.SettleLeg] | None":
+        """W77: the position's option legs for settlement, or None when unknown."""
+        keys = self._SETTLE_LEG_KEYS.get(pos.get("strategy"))
+        if keys is None:
+            return None
+        out = []
+        for key, right, side in keys:
+            k = pos.get(key)
+            if k is None:
+                return None
+            out.append(settlement.SettleLeg(float(k), right, side))
+        return out
+
+    def _bump_settle(self, key: str) -> None:
+        if self._settlement_stats is None:
+            self._settlement_stats = {"settled": 0, "pending": 0, "assigned_gap": 0,
+                                      "fallback": 0, "over_max_loss": 0}
+        self._settlement_stats[key] = self._settlement_stats.get(key, 0) + 1
+
+    def _settle_at_bell(self, pos: dict, S: float, current_date: date,
+                        exit_time: str | None = None) -> dict | None:
+        """W77: settle a credit structure at the expiry bell at underlying ``S``.
+
+        Nets to zero shares in every scenario -> closed now as ``expiry_settled`` at
+        intrinsic (no option exit friction, no option exit commission: expired, exercised
+        and assigned legs do not trade). Otherwise the position stays open holding the
+        delivered shares (``pos["settlement"]``) and ``run()`` closes it at the next
+        session's open; returns None in that case.
+        """
+        legs = self._settle_legs_of(pos)
+        if legs is None:   # defensive: the caller only sets _settle when legs are known
+            return None
+        if settlement.needs_overnight(legs, S, self._pin_band):
+            pos["settlement"] = {
+                "underlying": round(float(S), 4), "expiry": str(current_date),
+                "legs": [[l.strike, l.right, l.side] for l in legs]}
+            self._bump_settle("pending")
+            return None
+        res = settlement.worst_case(legs, S, self._pin_band, S,
+                                    self._assignment_fee, self._stock_commission)
+        self._bump_settle("settled")
+        return self._finish_settlement(pos, res, S, str(current_date),
+                                       exit_time or str(current_date), "expiry_settled")
+
+    def _close_pending_settlement(self, pos: dict, price: float, on_date: date,
+                                  reason: str = "assigned_gap",
+                                  exit_time: str | None = None) -> dict:
+        """W77: close a position that carried assigned/exercised shares past the bell,
+        marking them at ``price`` (the next session's open; the last close at the end of
+        a backtest). Pins are re-resolved at the original settlement price."""
+        sett = pos.pop("settlement")
+        legs = [settlement.SettleLeg(float(k), r, s) for k, r, s in sett["legs"]]
+        res = settlement.worst_case(legs, float(sett["underlying"]), self._pin_band,
+                                    float(price), self._assignment_fee, self._stock_commission)
+        if reason == "assigned_gap":
+            self._bump_settle("assigned_gap")
+        out = self._finish_settlement(
+            pos, res, float(price), str(on_date),
+            exit_time or datetime.combine(on_date, time(9, 30), tzinfo=ET).isoformat(), reason)
+        out["settlement_underlying"] = float(sett["underlying"])
+        return out
+
+    def _finish_settlement(self, pos: dict, res: "settlement.Resolution", underlying: float,
+                           exit_date: str, exit_time: str, reason: str) -> dict:
+        """Price a settled position: credit - cost, less the stock fees and the ENTRY
+        commission. No option exit commission: nothing was traded."""
+        contracts = pos["contracts"]
+        gross = (pos["entry_price"] - res.cost) * 100 * contracts
+        fees = res.fees * 100 * contracts
+        pnl = gross - fees - pos.get("entry_commission", 0)
+        max_loss = pos.get("max_loss")
+        if max_loss is not None and gross < -float(max_loss) - 1e-6:
+            self._bump_settle("over_max_loss")   # the loss exceeded the DEFINED maximum
+        return {
+            "exit_date": exit_date, "exit_time": exit_time, "exit_reason": reason,
+            "exit_price": round(res.cost, 4), "exit_underlying": round(float(underlying), 4),
+            "pnl": round(pnl, 2), "settlement_legs": list(res.statuses),
+            "net_shares": int(res.net_shares), "settlement_fees_usd": round(fees, 2),
+        }
+
     def _force_close(self, pos: dict, last_row: pd.Series, last_date: date,
                      hist: pd.DataFrame | None = None) -> dict:
         """Force-close a position at end of backtest."""
+        if pos.get("settlement") is not None:   # W77: shares still held; mark at the close
+            return self._close_pending_settlement(
+                pos, float(last_row["Close"]), last_date, reason="backtest_end",
+                exit_time=str(last_date))
         entry_date = date.fromisoformat(pos["entry_date"])
         days_held = (last_date - entry_date).days
-        current_value = self._reprice_position(pos, last_row["Close"], days_held, hist)
+        _eod_asof = self._eod(last_date) if self._realistic else None
+        current_value = self._reprice_position(pos, last_row["Close"], days_held, hist, _eod_asof)
 
         trade_type = pos.get("trade_type", "debit")
         exit_iv = float(pos.get("entry_iv", 0.25))
         expiry = date.fromisoformat(pos["expiry_date"])
         remaining_dte = max(0, (expiry - last_date).days)
         exit_half_spread = self._options_half_spread(exit_iv, remaining_dte)
-        if trade_type == "credit":
-            current_value *= (1 + exit_half_spread)
-        else:
-            current_value *= (1 - exit_half_spread)
+        current_value = self._apply_exit_friction(
+            pos, current_value, last_row["Close"], days_held, hist, exit_half_spread,
+            trade_type, _eod_asof)
 
         pnl = self._calc_pnl(pos, current_value)
         return {

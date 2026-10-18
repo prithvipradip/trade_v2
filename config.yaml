@@ -2,6 +2,25 @@
 # AIT v2 - Autonomous Intelligent Trading Configuration
 # ============================================================
 
+# ------------------------------------------------------------
+# FIXED LIMITS  (comment only: NOT keys, NOT configurable here)
+# Deliberately fixed in code, in one module: src/ait/config/invariants.py
+# (one-line reason for each: docs/RUNBOOK.md "Fixed limits"; logged at every start
+# as `fixed_limits_in_effect`). Editing this comment changes nothing; a test keeps
+# it equal to the module.
+#   ORDER_RATE_LIMIT_MAX = 8
+#   ORDER_RATE_LIMIT_WINDOW_S = 60
+#   NBBO_DISORDERLY_SPREAD_RATIO = 1.0
+#   NBBO_STALE_SIGNAL_DEVIATION = 0.35
+#   NBBO_MID_FLOOR = 0.05
+#   LIVE_MAX_SPREAD_PCT = 0.15
+#   LIVE_MIN_VOLUME = 10
+#   PDT_MAX_DAY_TRADES = 3
+#   PDT_WINDOW_DAYS = 5
+#   BROKER_SNAPSHOT_TTL_SECONDS = 5.0
+#   IC_BUDGET_CAPPED_MIN_WING = 1.0
+# ------------------------------------------------------------
+
 trading:
   mode: paper                          # paper | live
   # Universe pared down based on 4-year + 1-year backtests:
@@ -21,6 +40,14 @@ trading:
   max_daily_trades: 12                  # Raised for higher trade volume / faster learning
   trading_hours_only: true             # Only trade during RTH (9:30-16:00 ET)
   no_new_entries_minutes_before_close: 15   # W35: was a bare 900s in bot/scheduler.py
+  # W69: the intraday trade-budget windows and the first-hour confidence gate
+  # (were literals in bot/orchestrator.py). Cumulative caps, still bounded by
+  # max_daily_trades; the whole remaining budget is released after midday_end_et.
+  first_hour_end_et: "10:30"           # ET; before this: first_hour_trade_budget
+  first_hour_trade_budget: 2
+  midday_end_et: "14:00"               # ET; before this: midday_trade_budget
+  midday_trade_budget: 4
+  first_hour_min_confidence: 0.85      # DIRECTIONAL signals only; neutral/IC exempt
 
 account:
   pdt_protection: true                 # Enable Pattern Day Trader guard
@@ -29,6 +56,23 @@ account:
                                        # guard was able to VETO same-day stop-loss
                                        # exits ("riding unprotected"). RE-FLIP TO
                                        # true at go-live if the real account < $25k.
+  capital: 5000                        # W-capital: THE one capital number (operator decision
+                                       # 2026-10-08). Research starts every run with this much
+                                       # TOTAL equity as ONE shared pool across symbols; live
+                                       # simulates this NLV while simulate_live_capital is true.
+                                       # Change it here and nowhere else. Replaces .env
+                                       # AIT_SIMULATED_CAPITAL (10000) and backtest.initial_capital.
+                                       # NOTE at $5k: risk.max_position_risk_pct (1.33%) funds $66
+                                       # per trade and the 2% breaker is $100 -> the cap-grid
+                                       # coherence check fires and the bot emits no condors until
+                                       # the risk knobs are revisited (accepted by the operator).
+  simulate_live_capital: true          # false at go-live. Per-box override: .env
+                                       # AIT_SIMULATED_CAPITAL=<n> (or 0 = off) beats this.
+  # W69: capital-tier boundaries (were literals in risk/capital_tiers.py). The
+  # tier picks the universe filter; must ascend strictly.
+  capital_tier_small_min: 2000
+  capital_tier_medium_min: 5000
+  capital_tier_large_min: 25000
 
 positions:
   max_open_positions: 10               # R6 (user-approved): 423 of 500 logged entry
@@ -39,25 +83,86 @@ positions:
   max_contracts_per_trade: 1           # Learning mode: 1 contract/trade = min cost = max # of trades
   entry_ladder_start: 0.25             # W36: home for AIT_ENTRY_LADDER_START
   entry_order_timeout_seconds: 240     # W36: home for AIT_ENTRY_ORDER_TIMEOUT
+  # W70: the rest of the ENTRY order timeline (were literals in execution/executor.py).
+  # Every age below is checked on the 30s fast-monitor tick, so a value under 30 takes
+  # effect at the next tick. Each must stay below entry_order_timeout_seconds (startup
+  # refuses otherwise). Full timeline and the evidence behind the floors: docs/RUNBOOK.md.
+  #
+  # How often an unfilled entry's limit steps toward marketable (0.25 / 0.60 / 1.00 of the offset).
+  # Floor: 30s (the tick; below it steps are skipped, not honored) | Ceiling: 300s
+  # IMPACT: lower = chases the market faster, gives away more of the spread;
+  #         higher = more time sitting at the patient price.
+  entry_ladder_step_seconds: 45
+  # A PARTIALLY filled entry has its unfilled remainder cancelled after this long.
+  # Floor: 5s | Ceiling: 300s
+  # IMPACT: lower = orphaned remainders cleaned up sooner but a slow fill is cut short;
+  #         higher = the remainder rides at a stale price longer.
+  partial_fill_cancel_seconds: 30
+  # An entry ABSENT from the broker's trade list is treated as still pending while younger
+  # than this (a disconnect makes every working entry look cancelled for a moment).
+  # Floor: 10s | Ceiling: 120s
+  # IMPACT: too low = a connection blip can flip live entries to CANCELLED while they are
+  #         still working at IBKR; too high = a genuinely cancelled entry holds its slot longer.
+  absent_order_grace_seconds: 30
   max_portfolio_delta: 0.30            # Net delta limit (absolute)
   max_portfolio_risk_pct: 0.20         # Aggregate open capital-at-risk cap (now WIRED — was a
                                        # phantom 0.02 never read while manager hardcoded 0.20;
                                        # audit 2026-07-07 item 3.3. 0.20 = operating value since 06-30)
 
+# W69: the position sizer's multiplier curves (were literals in
+# risk/position_sizer.py). Values are the former literals — no behavior change.
+position_sizing:
+  confidence_size_floor: 0.30          # lowest confidence multiplier
+  iv_full_size_max: 0.20               # implied vol <= this -> full size
+  iv_floor_size_min: 0.60              # implied vol >= this -> iv_floor_size_factor
+  iv_floor_size_factor: 0.50
+  iv_rank_adj_min: 0.80                # IV-rank multiplier band (sell at rank 0 / buy at 100)
+  iv_rank_adj_max: 1.20
+  drawdown_tiers:                      # [consecutive_losing_days, size_factor], ascending
+    - [3, 0.50]
+    - [5, 0.25]
+  vix_size_tiers:                      # [vix_at_or_above, size_factor], ascending
+    - [25, 0.75]
+    - [30, 0.50]
+  strategy_risk:                       # fraction of the position budget per strategy
+    long_call: 1.0
+    long_put: 1.0
+    covered_call: 0.5
+    cash_secured_put: 0.5
+    bull_call_spread: 0.6
+    bear_put_spread: 0.6
+    iron_condor: 0.4
+    long_straddle: 1.2
+    short_strangle: 0.8
+    calendar_spread: 0.7
+    event_straddle: 0.7
+
 risk:
-  max_daily_loss_pct: 0.02             # 2% daily loss limit → circuit breaker
+  max_daily_loss_pct: 0.045            # W64 (2026-10-08): 0.02 -> 0.045 at the $5k account. Breaker =
+                                       # $225 vs the largest condor the live builder emits at the 5%
+                                       # budget (real IWM/SPY chains: $3-wide, max loss $201-212) =>
+                                       # >= 1.0x, inside breaker_to_max_loss_ratio. Trips on realised AND
+                                       # mark-to-market daily loss; blocks ENTRIES only.
+  breaker_to_max_loss_ratio: 1.0       # W64: startup coherence rule (alert-only), breaker >= ratio x the
+                                       # largest max loss the builder emits. Was a hardcoded 1.5; set 1.5
+                                       # to restore the strictest rule (then breaker needs ~6.4% at $5k).
   max_consecutive_losses: 3            # Pause after 3 consecutive losses
   pause_minutes_after_losses: 30       # Cool-down period
   max_api_failures: 5                  # Halt after 5 API failures in 10 min
   min_confidence: 0.50                 # At learning floor — capture more marginal signals to learn from (was 0.55)
-  max_position_risk_pct: 0.0133        # PLAN 2026-09-29: lowered 0.03->0.0133 (operator decision,
-                                       # closes W52a item 3, the two-knob unification). At 0.03,
-                                       # a single max-loss condor could alone exceed the daily
-                                       # circuit breaker (max_daily_loss_pct / 1.5 = 0.0133) before
-                                       # the breaker's own consecutive-loss logic ever got a second
-                                       # data point. Aligning this cap to the breaker's own trip
-                                       # threshold means no single trade can breach the daily
-                                       # breaker alone. Per-trade max_loss cap vs NLV.
+  max_position_risk_pct: 0.05          # W64 (2026-10-08): 0.0133 -> 0.05 at the $5k account (budget $250).
+                                       # MEASURED on live TWS chains (IWM/SPY, 22 DTE, delayed, the real
+                                       # builder): budget $66 and $150 build NOTHING at the $0.70 credit
+                                       # floor (a $2-wide condor credits only $0.62-0.68); $250 builds a
+                                       # $3-wide condor, credit $0.88-0.99, max loss $201-212. Wing width
+                                       # follows the budget (budget/90, snapped to the strike grid). The
+                                       # startup self-test's synthetic chain is more generous ($0.755 at
+                                       # $2-wide) and would have passed 3% while live placed no trades.
+                                       # History: 0.03 -> 0.0133 on 2026-09-29 (PLAN, closes W52a item 3)
+                                       # so one max-loss condor could not exceed the old 2% breaker; W64
+                                       # moves the breaker with the budget instead. Per-trade max_loss cap
+                                       # vs NLV, also the budget the builder is handed. Must stay <=
+                                       # positions.max_position_pct (Settings validates: 0.05 = equal OK).
   max_correlation: 0.75                # Correlation above which symbols count as the same bet
   max_correlated_positions: 2          # Positions per correlated cluster (was code default)
   post_stop_cluster_cooldown_minutes: 120  # W26: post-stop re-entry block for CLUSTER SIBLINGS
@@ -82,6 +187,11 @@ risk:
                                        # Condors are code-exempt from the flatten; this governs
                                        # entry gates + undefined-risk flattens.
   credit_vix_halt: 28                  # No NEW credit entries at/above this VIX (audit R2)
+  # W69: Friday weekend-gap rule (was literals in risk/manager.py, on a naive
+  # local clock; now ET). After the cutoff these strategies need the confidence.
+  weekend_gap_cutoff_et: "14:30"
+  weekend_gap_min_confidence: 0.90
+  weekend_gap_strategies: [short_strangle]
 
 options:
   delta_range: [0.20, 0.50]            # Target delta for long options
@@ -130,10 +240,22 @@ options:
     #                     accepts entry AFTER 8:30am releases, buying straight into IV crush.
 
 backtest:
-  initial_capital: 100000              # Starting capital for walk-forward / integration tests
   position_size_pct: 0.05             # 5% of capital risked per trade (max-loss basis)
                                        # Raise to 0.20 for accounts < $10k (increases concentration risk)
-  wing_floor_dollars: 5.0             # Hard minimum spread width in dollars (safety floor only)
+  # W70: THE minimum iron-condor wing, dollars — for LIVE ENTRIES AND RESEARCH alike.
+  # This key sits under `backtest:` but is also the config home of AIT_IC_WING_FLOOR,
+  # which the live builder (strategies/iron_condor.py) reads: editing it changes what the
+  # live bot TRADES, not only what a backtest simulates. Same precedence as wing_k:
+  # env/.env AIT_IC_WING_FLOOR > this key > 2.0.
+  # The wing is wing_k x price x IV x sqrt(DTE/365), never narrower than this. It binds
+  # only when the per-trade budget does not: a budget-capped wing may shrink below it
+  # (today's $5k account carries ~$2.78/wing), but never below $1 (a fixed limit, see
+  # FIXED LIMITS). Bounds: 1.0 - 10.0 (startup refuses outside).
+  # IMPACT: higher = wider minimum wing = more max loss per condor (the budget cap still
+  #         wins when it binds); lower = narrower, cheaper condors with less credit.
+  # History: was 5.0 (old backtest default; ~15 study scripts + run_optimizer read this
+  # key and moved from 5.0 -> 2.0 in W70); live's $2 was a literal in iron_condor.py.
+  wing_floor_dollars: 2.0
                                        # Wing sizing is now primarily driven by wing_k × expected_move
                                        # Lower to 0.5 for sub-$10 stocks (e.g. SOFI)
   # 2026-08-04 SHADOW R3 PROMOTION supersedes the 07-29 k=0.8 lock (that
@@ -209,6 +331,23 @@ backtest:
   skew_slope_per_pct_otm: 0.0736       # Relative put-side IV uplift per 1% OTM
                                        # (total slope 1.049 at atm_iv 0.1289 = the
                                        # sample-weighted measured value); 0 = pre-W5
+  # W70: research-engine knobs that were constructor literals in backtesting/engine.py.
+  # RESEARCH ONLY: none of these reaches the live bot (where one has a live twin, it is
+  # named). The engine and the walk-forward resolve them from here.
+  slippage_pct: 0.01                   # extra price slippage on DEBIT / long-option structures
+                                       # only; NOT applied to iron condors (friction model).
+  delta_short: 0.20                    # |delta| for short strikes in research. Live's IC short
+                                       # delta is a literal ~0.20 in strategies/iron_condor.py,
+                                       # NOT this key: changing this diverges research from live.
+  delta_long: 0.30                     # |delta| for long single options / debit legs (unused by IC).
+  hurst_hard_veto_multiplier: 1.5      # legacy veto = max(hurst_regime_threshold, 0.20) x this, used
+                                       # only when fractal_veto_spread is unset. WalkForwardConfig
+                                       # passes 0.0 (disabled); this governs a bare Backtester().
+  pct_from_60d_high_threshold: -1.0    # experimental entry gate; -1.0 = DISABLED. e.g. -0.05 =
+                                       # refuse neutral entries when spot is >5% below its 60d high.
+  skew_factor: 1.0                     # multiplier on the legacy flat IV-skew term (0 = flat IV);
+                                       # additive with skew_slope_per_pct_otm above.
+  context_bars: 0                      # extra intraday lookback bars (0 = the engine minimum of 20).
 
 ml:
   ensemble_weights:
@@ -226,6 +365,26 @@ ml:
   # the observe-mode record shows the gate would have improved PF.
   entry_gates_enabled: false
   observe_mode_neutral_confidence: 0.60  # direction-neutral structures skip the DIRECTIONAL min_confidence gate
+  # W69: were literals in bot/orchestrator.py and ml/drift.py.
+  regime_override_confidence: 0.80     # HIGH_VOLATILITY regime above this -> direction NEUTRAL
+  drift_window_size: 50                # resolved predictions the drift detector scores
+  drift_accuracy_threshold: 0.40       # rolling accuracy below this -> drift + retrain
+  drift_calibration_threshold: 0.25    # high-confidence calibration error above this -> drift
+  drift_high_confidence: 0.80          # calibration cohort cutoff / expected accuracy
+
+# W69: regime classification thresholds (were literals in ml/regime.py).
+regime:
+  high_vol_vix: 30
+  high_vol_realized: 0.40
+  iv_crush_iv_rank_max: 0.25
+  iv_crush_vol_max: 0.20
+  iv_crush_trend_max: 0.20
+  mean_revert_hurst_max: 0.40
+  mean_revert_trend_max: 0.25
+  low_vol_vix: 15
+  low_vol_realized: 0.12
+  low_vol_trend_breakout: 0.30
+  strong_trend: 0.35
 
 meta_label:
   enabled: false                       # Disabled: trained on corrupted data, rejects everything. See min_closes_to_enable below before re-enabling.
@@ -277,6 +436,8 @@ assignment_response:
   roll_target_dte_min: 14              # Matches options.dte_range's live floor
   roll_target_dte_max: 30              # Matches options.dte_range's live ceiling
   roll_min_credit: 0.20                # Provisional -- no roll has executed live to calibrate against
+  roll_short_delta_target: 0.20        # W69: new short strike |delta| (mirrors the IC entry delta)
+  roll_short_delta_tolerance: 0.07     # W69: refuse the roll if the nearest strike is farther
 
 condor_defense:
   # W56 (tastytrade-style tested/untested-side condor defense, decision
@@ -340,6 +501,40 @@ exit:
   time_decay_scaling: true            # Lower take-profit target as DTE decreases
   volatility_adjusted_stops: true     # Widen stops for high-vol underlyings (ATR-based)
   auto_hedge: false                   # Auto-execute delta hedges (enable after paper testing)
+  # W69: open-position thesis check (directional strategies only — iron condors
+  # are exempt from the whole check). Were literals in bot/orchestrator.py.
+  thesis_direction_flip_confidence: 0.70
+  thesis_regime_shift_confidence: 0.70
+  thesis_vix_spike_pct: 0.30           # exit if VIX is up more than +30% since entry
+  # W70: the rest of the EXIT order timeline (were literals in execution/executor.py).
+  # Together with exit_stop_pending_rest_seconds (120s) and exit_pending_rest_seconds
+  # (300s) above. Checked on the 30s fast-monitor tick. Full timeline and the evidence
+  # behind each floor: docs/RUNBOOK.md "Order lifecycle timeline".
+  #
+  # A freshly placed EXIT order is ignored by the fill checker for this long so it has
+  # time to appear in IBKR's trade list.
+  # Floor: 5s | Ceiling: 60s | Must be below exit_stop_pending_rest_seconds.
+  # NOTE the floor is a margin, not a measurement: the one acknowledgement we could time
+  # took under 1s (an entry, delayed-data paper); no exit has been timed yet. The
+  # order_ack_latency log event is collecting the real numbers.
+  # IMPACT: too low = a not-yet-visible order is misread as cancelled and the bot re-arms
+  #         a duplicate close; too high = a genuinely dead order is noticed later.
+  order_visibility_grace_seconds: 10
+  # An exit order that belongs to ANOTHER clientId cannot be cancelled from here; after
+  # this long the operator is paged instead.
+  # Floor: 60s | Ceiling: 3600s | Must be >= exit_pending_rest_seconds.
+  # IMPACT: lower = earlier, noisier pages; higher = a stuck cross-session close sits
+  #         unnoticed longer.
+  foreign_exit_escalation_seconds: 300
+  # Zombie cap: an exit still unresolved this long after placement is checked against
+  # the broker and, only if the broker answers and does not list it, the position is
+  # reverted CLOSING -> FILLED so a fresh exit can fire (else held CLOSING + paged).
+  # Floor: 2 x the longer rest time = 600s with today's rests (startup refuses lower)
+  # | Ceiling: 7200s
+  # IMPACT: too low = re-arms before the real outcome can show; a second close goes out
+  #         alongside the first, both fill, and the condor flips into an inverse structure.
+  #         too high = a dead order wedges the position in CLOSING for longer.
+  zombie_exit_revert_seconds: 900
 
 learning:
   enabled: true                          # Self-learning: adapt strategies from past trades
@@ -354,6 +549,22 @@ learning:
   min_insight_confidence: 0.60           # Only act on insights above 60% confidence
   min_confidence_floor: 0.50             # Never lower min_confidence below 50%
   min_confidence_ceiling: 0.90           # Never raise min_confidence above 90%
+  # W69: the four limits above are now actually read (they were ignored), and
+  # the closed-trade analyzer's insight cutoffs live here (were literals in
+  # learning/analyzer.py). Minimum-sample counts stay in code.
+  analyzer:
+    strategy_poor_win_rate: 0.35       # strategy (>=5 closes) -> disable_<strategy>
+    strategy_strong_win_rate: 0.65     # strategy (>=5 closes, +P&L) -> boost_<strategy>
+    confidence_band_poor_win_rate: 0.40
+    symbol_poor_win_rate: 0.30
+    regime_poor_win_rate: 0.35
+    hour_poor_win_rate: 0.30
+    exit_giveback_threshold: 0.30
+    exit_min_avg_peak: 0.20
+    direction_peak_threshold: 0.05
+    direction_good_accuracy: 0.60
+    direction_exit_problem_rate: 0.40
+    direction_poor_accuracy: 0.45
 
 sentiment:
   enabled: true
@@ -378,8 +589,10 @@ notifications:
     enabled: true
 
 dashboard:
-  enabled: true
-  port: 8501
+  enabled: true                        # W69: now read — false = supervisor does not launch Streamlit
+  port: 8501                           # W69: now read by orchestration/master.py (was hardcoded)
+  weblog_port: 8502                    # W69: web_logs.py log viewer
+  status_port: 8503                    # W69: status_server.py live status / scorecard
 
 logging:
   level: INFO
@@ -403,3 +616,26 @@ sizing_probe:
                                        #  builder emits zero (old check: problems=0)
   iv_rank: 55.0                        # must clear backtest.ic_iv_rank_floor, or
                                        #  the probe measures the floor, not the caps
+
+# W76: supervisor-run 0-6 DTE friction collection (research data only; never touches orders).
+# Everything below is the MODEL DEFAULT (collection OFF). To enable: uncomment the block, set
+# short_dte_enabled: true, and restart the SUPERVISOR (a process runs on the settings it started
+# with). First prove it manually: docs/RUNBOOK.md "Short-DTE friction collection".
+# data_collection:
+#   short_dte_enabled: false        # run the collector from the supervisor, Mon-Fri
+#   short_dte_time_et: "15:30"      # BEFORE the close: IB drops the expiring contract after it (DTE 0)
+#   short_dte_symbols: [QQQ]        # ~30-55 min each at IB's historical-data pacing
+#   short_dte_client_id: 91         # must not be IBKR_CLIENT_ID or its +100..+104 ladder
+#   lifecycle: false                # W82: capture each contract's LIFE (stage A at expiry + stage B
+#                                   # far tail) instead of every contract <= short_dte_max_dte daily:
+#                                   # ~20-35 min/day vs 72-108, and ~2 downloads per contract instead
+#                                   # of 5-11 (docs/RUNBOOK.md "Lifecycle capture"). Ignores short_dte_max_dte.
+#   lifecycle_duration: "30 D"      # what IB serves for hourly BID/ASK bars of a listed option
+#   lifecycle_expiring_days: 1      # stage A: expiries today..+N (1 = a missed day is recoverable)
+#   lifecycle_thin_every: 5         # strikes from every Nth session of the path (5 = ~55 contracts/expiry)
+#   lifecycle_incremental_sessions: 3 # an expiry captured before is planned over its newest N sessions
+#   lifecycle_max_far_contracts: 120 # stage-B cap per run (~43 min); the rest is deferred
+#   short_dte_max_dte: 6
+#   short_dte_duration: "7 D"
+#   short_dte_timeout_minutes: 150  # hard cap per run
+#   short_dte_idle_minutes: 20      # kill if silent this long

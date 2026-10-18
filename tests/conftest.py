@@ -42,7 +42,12 @@ def _neutralise_simulated_capital(monkeypatch):
     No test sets or depends on this var (verified), so unsetting it is safe. A
     test that ever WANTS it can monkeypatch it back inside its own body.
     """
-    monkeypatch.delenv("AIT_SIMULATED_CAPITAL", raising=False)
+    # W-capital: simulation is now ALSO driven by config.yaml account.capital
+    # (simulate_live_capital: true), so merely UNSETTING the var would let the
+    # yaml turn it back on and re-scale every balance. The env override's "0"
+    # means OFF in runtime_env.simulated_capital() -- same isolation, closed
+    # against the new source too.
+    monkeypatch.setenv("AIT_SIMULATED_CAPITAL", "0")
 
 
 from ait.config.settings import (

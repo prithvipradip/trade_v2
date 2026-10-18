@@ -25,7 +25,9 @@ import optuna
 import pandas as pd
 
 from ait.optimization.objectives import OBJECTIVES
-from ait.optimization.param_spaces import ML_SPACES, STRATEGY_SPACES
+from ait.optimization.param_spaces import (
+    DTE_SEARCH_REPLACES, FRACTAL_GATE_SPACE, ML_SPACES, STRATEGY_SPACES, dte_search_space,
+)
 from ait.optimization.results import OptimizationResult
 from ait.utils.logging import get_logger
 
@@ -68,6 +70,17 @@ class _EarlyStopCallback:
         return ""
 
 
+def _top_rejections(funnel: dict | None, n: int = 3) -> list[str]:
+    """W67: the n most frequent top-level entry rejections of a trial, "reason=days" strings,
+    stored on the trial so a starved study explains itself."""
+    if not funnel:
+        return []
+    top = sorted(((k, v) for k, v in funnel.items()
+                  if k not in ("days_evaluated", "entries_taken")
+                  and not k.startswith(("builder:", "would_reject:"))), key=lambda kv: -kv[1])
+    return [f"{k}={v}" for k, v in top[:n]]
+
+
 class StrategyOptimizer:
     """Bayesian strategy + ML hyperparameter optimizer."""
 
@@ -84,8 +97,33 @@ class StrategyOptimizer:
         initial_capital: float = 50_000.0,
         train_days: int = 365,
         features_cache: "pd.DataFrame | None" = None,
-        position_size_pct: float = 0.05,
-        wing_floor_dollars: float = 5.0,
+        # W64: None -> backtest.position_size_pct, else risk.max_position_risk_pct
+        # (live's per-trade budget). Was a 0.05 literal; live funded 0.0133-0.03.
+        position_size_pct: float | None = None,
+        # W64 live parity (see Backtester): None -> config.
+        budget_aware_wings: bool | None = None,
+        max_contracts_per_trade: int | None = None,
+        economic_calendar: Any = None,   # W65: research macro calendar (None = hardcoded)
+        condor_any_direction: bool | None = None,   # W66 (None -> config)
+        friction_model: str | None = None,           # W66 friction v2 (None -> config)
+        friction_entry_capture: float | None = None,
+        friction_exit_capture: float | None = None,
+        friction_stress_multiplier: float | None = None,
+        gates_mode: str | None = None,               # W67 gate parity (None -> config)
+        iv_rank_gate: bool | None = None,            # W68 IV-rank parity (None -> config)
+        iv_rank_rise_gate: bool | None = None,       # W71c research-only rise veto on/off (None -> config)
+        regime_veto_gate: bool | None = None,        # W81 research-only regime veto on/off (None -> config)
+        ex_div_entry_gate: str | None = None,        # W84 live's ex-div entry block twin (None -> config)
+        ex_div_entry_k_days: int | None = None,      # W84 K for last_k_days (None -> config); not searched
+        iv_rank_series: dict | None = None,          # W68 {symbol: rank by date}, full history
+        fractal_veto_spread: float | None = None,
+        penalty_on_range_prob: float | None = None,
+        hard_min_trades: int | None = None,          # W67 graded objective (None -> config)
+        below_floor_gradient: float | None = None,
+        table_prefix: str = "",         # W65: research table prefix for the standalone data fetch
+        db_path: Any = None,             # W65: store holding the research tables
+        history_start_date: Any = None,  # W65: trim the standalone fetch to this date
+        wing_floor_dollars: float | None = None,   # W70: None -> backtest.wing_floor_dollars (was 5.0)
         # R20b review follow-up: was a hardcoded 1.0 that shadowed the
         # promoted live/config value (1.6) for any direct optimizer caller
         # (run_optimizer.py never overrides it) -- same defect class as the
@@ -97,11 +135,11 @@ class StrategyOptimizer:
         # overrides it) -- same defect class as wing_k above. None resolves
         # from _bt_cfg.iv_floor once _bt_cfg exists.
         iv_floor: float | None = None,
-        delta_iv_scale: float = 0.0,
+        delta_iv_scale: float | None = None,       # W70: None -> backtest.delta_iv_scale
         patience: int = 0,
         min_trades: int = 10,
         max_concurrent_positions: int = 1,
-        max_entry_vol_annual: float = 0.80,
+        max_entry_vol_annual: float | None = None,   # W70: None -> backtest.max_entry_vol_annual
         # R20 #2: baseline values for the two iron_condor gate params Optuna
         # searches (param_spaces Exp 26/28). They were absent from bt_kwargs,
         # and the trial-override loop only applies params already present
@@ -132,6 +170,11 @@ class StrategyOptimizer:
         intraday_store: "Any | None" = None,
         symbol: str | None = None,
         range_predictor: "Any | None" = None,
+        # W78/W79a: optional per-trial hook ``(entry_dte, expiry_guard_dte, max_hold_fraction)
+        # -> predictor`` (each None = the study's base). When set, each trial's Backtester is
+        # gated by the range model for THAT trial's reachable horizon; None keeps the single
+        # model above for every trial, as before.
+        range_predictor_provider: "Any | None" = None,
         val_split: bool = False,
         # R20b review follow-up: walkforward builds vix_ctx for the training
         # window and threads it into features_cache above, but every trial's
@@ -147,6 +190,16 @@ class StrategyOptimizer:
         # of every construction re-reading + re-validating the file from
         # disk. None (default) preserves the original behavior — load it here.
         settings: "Any | None" = None,
+        # W79a: baselines for the DTE dimensions (None = the engine resolves them from
+        # settings.backtest, exactly as before) plus the opt-in search block. A searched value
+        # overrides its baseline through the same loop as every other param.
+        entry_dte: int | None = None,
+        expiry_guard_dte: int | None = None,
+        max_hold_fraction: float | None = None,
+        flatten_minutes_before_close: int | None = None,
+        delta_short: float | None = None,        # L1: the searched value must also be the OOS one
+        dte_search: "Any | None" = None,         # DteSearchConfig | None
+        multivariate: bool = False,
     ) -> None:
         if objective not in OBJECTIVES:
             raise ValueError(f"Unknown objective '{objective}'. Choose from: {list(OBJECTIVES)}")
@@ -162,14 +215,18 @@ class StrategyOptimizer:
         self._initial_capital = initial_capital
         self._train_days = train_days
         self._features_cache = features_cache
-        self._position_size_pct = position_size_pct
-        self._wing_floor_dollars = wing_floor_dollars
+        # self._wing_floor_dollars / _delta_iv_scale / _max_entry_vol_annual resolved below (W70)
+        self._economic_calendar = economic_calendar
+        self._table_prefix = table_prefix
+        self._db_path = db_path
+        self._history_start_date = history_start_date
+        # W65: params removed from the search because they cannot affect the result
+        # (see _maybe_drop_inert_params); filled in run() once data is known.
+        self._dropped_params: set[str] = set()
         # self._iv_floor resolved below once _bt_cfg exists (R20b review follow-up)
-        self._delta_iv_scale = delta_iv_scale
         self._patience = patience
         self._min_trades = min_trades
         self._max_concurrent_positions = max_concurrent_positions
-        self._max_entry_vol_annual = max_entry_vol_annual
         # R20b (pre-registered PLAN 2026-08-21): resolve the config-backed
         # trial BASELINES once, from the same loaded settings live reads
         # (mirrors Backtester's R20 None->load_settings pattern). These feed
@@ -195,6 +252,72 @@ class StrategyOptimizer:
             from ait.config.settings import BacktestConfig as _BTC
             _bt_cfg = _BTC()
         self._bt_baselines = _bt_cfg
+        # W64: per-trade budget + live-parity switches, resolved once the loaded
+        # settings exist (explicit arg > config > model default).
+        from ait.config.settings import (
+            BacktestConfig as _BTC2, resolve_config_value as _rcv,
+            resolve_max_contracts_per_trade as _rmc,
+            resolve_position_size_pct as _rps)
+        self._position_size_pct = _rps(position_size_pct, self._settings)
+        self._max_contracts_per_trade = _rmc(max_contracts_per_trade, self._settings)
+        self._budget_aware_wings = bool(_rcv(
+            budget_aware_wings, "backtest", "budget_aware_wings", _BTC2, self._settings))
+        self._condor_any_direction = bool(_rcv(
+            condor_any_direction, "backtest", "condor_any_direction", _BTC2, self._settings))
+        self._friction_model = str(_rcv(
+            friction_model, "backtest", "friction_model", _BTC2, self._settings))
+        self._friction_entry_capture = float(_rcv(
+            friction_entry_capture, "backtest", "friction_entry_capture", _BTC2, self._settings))
+        self._friction_exit_capture = float(_rcv(
+            friction_exit_capture, "backtest", "friction_exit_capture", _BTC2, self._settings))
+        self._friction_stress_multiplier = float(_rcv(
+            friction_stress_multiplier, "backtest", "friction_stress_multiplier", _BTC2,
+            self._settings))
+        self._gates_mode = str(_rcv(gates_mode, "backtest", "gates_mode", _BTC2, self._settings))
+        self._iv_rank_gate = bool(_rcv(
+            iv_rank_gate, "backtest", "iv_rank_gate", _BTC2, self._settings))
+        self._iv_rank_rise_gate = bool(_rcv(
+            iv_rank_rise_gate, "backtest", "iv_rank_rise_gate", _BTC2, self._settings))
+        self._regime_veto_gate = bool(_rcv(
+            regime_veto_gate, "backtest", "regime_veto_gate", _BTC2, self._settings))   # W81
+        self._ex_div_entry_gate = str(_rcv(
+            ex_div_entry_gate, "backtest", "ex_div_entry_gate", _BTC2, self._settings))     # W84
+        self._ex_div_entry_k_days = int(_rcv(
+            ex_div_entry_k_days, "backtest", "ex_div_entry_k_days", _BTC2, self._settings))  # W84
+        # W70: were literals 5.0 / 0.0 / 0.80 (and trailing 0.25, breakeven 0.30, delta 0.20 /
+        # 0.30 in _run_backtest's bt_kwargs); the wing floor moves 5.0 -> 2.0 (live parity).
+        # W70: the SAME contract call live uses (AIT_IC_WING_FLOOR) — live AND research.
+        from ait.config.runtime_env import contract_float as _cf
+        self._wing_floor_dollars = (float(wing_floor_dollars) if wing_floor_dollars is not None
+                                    else _cf("AIT_IC_WING_FLOOR"))
+        self._delta_iv_scale = float(_rcv(
+            delta_iv_scale, "backtest", "delta_iv_scale", _BTC2, self._settings))
+        self._max_entry_vol_annual = float(_rcv(
+            max_entry_vol_annual, "backtest", "max_entry_vol_annual", _BTC2, self._settings))
+        from ait.config.settings import ExitConfig as _EXC
+        self._trailing_stop_pct = float(_rcv(
+            None, "exit", "trailing_stop_pct", _EXC, self._settings))
+        self._breakeven_trigger_pct = float(_rcv(
+            None, "exit", "breakeven_trigger_pct", _EXC, self._settings))
+        self._delta_short = float(_rcv(delta_short, "backtest", "delta_short", _BTC2, self._settings))
+        self._entry_dte = None if entry_dte is None else int(entry_dte)
+        self._expiry_guard_dte = None if expiry_guard_dte is None else int(expiry_guard_dte)
+        self._max_hold_fraction = None if max_hold_fraction is None else float(max_hold_fraction)
+        self._flatten_minutes = (None if flatten_minutes_before_close is None
+                                 else int(flatten_minutes_before_close))
+        self._dte_search = dte_search
+        self._multivariate = bool(multivariate)
+        self._delta_long = float(_rcv(None, "backtest", "delta_long", _BTC2, self._settings))
+        self._iv_rank_series = iv_rank_series or {}
+        self._fractal_veto_spread = float(_rcv(
+            fractal_veto_spread, "backtest", "fractal_veto_spread", _BTC2, self._settings))
+        self._penalty_on_range_prob = float(_rcv(
+            penalty_on_range_prob, "backtest", "penalty_on_range_prob", _BTC2, self._settings))
+        self._hard_min_trades = int(_rcv(
+            hard_min_trades, "backtest", "optimize_hard_min_trades", _BTC2, self._settings))
+        self._below_floor_gradient = float(_rcv(
+            below_floor_gradient, "backtest", "optimize_below_floor_gradient", _BTC2,
+            self._settings))
         # R20b review follow-up: same None -> config-resolution pattern as
         # iv_rank_rise_threshold/min_edge_over_baseline below — a direct
         # caller that omits wing_k now gets the config/live value (1.6)
@@ -241,6 +364,7 @@ class StrategyOptimizer:
         self._intraday_store = intraday_store
         self._symbol = symbol
         self._range_predictor = range_predictor
+        self._range_predictor_provider = range_predictor_provider
         self._val_split = val_split
         self._market_context = market_context
         self._data: dict[str, pd.DataFrame] = {}
@@ -271,12 +395,17 @@ class StrategyOptimizer:
         if not self._data:
             raise RuntimeError("No market data fetched — check internet connection or symbol names.")
 
+        self._maybe_drop_inert_params()
+        if prior_params and self._dropped_params:
+            prior_params = {k: v for k, v in prior_params.items() if k not in self._dropped_params}
+
         study = optuna.create_study(
             direction="maximize",
             study_name=self._study_name,
             storage=self._storage,
             load_if_exists=True,
-            sampler=optuna.samplers.TPESampler(seed=self._seed),
+            sampler=optuna.samplers.TPESampler(
+                seed=self._seed, multivariate=self._multivariate, group=self._multivariate),
             pruner=optuna.pruners.MedianPruner(n_warmup_steps=1),
         )
 
@@ -318,6 +447,17 @@ class StrategyOptimizer:
                 stop_reason += f" {n_pruned} trial(s) pruned by MedianPruner."
 
         result = OptimizationResult(study)
+        best_n = study.best_trial.user_attrs.get("n_trades", 0)
+        result.best_n_trades = int(best_n)
+        result.usable = int(best_n) >= self._hard_min_trades
+        if not result.usable:
+            log.warning(
+                "optuna_no_usable_trial", study_name=self._study_name,
+                best_value=study.best_value, best_n_trades=int(best_n),
+                hard_min_trades=self._hard_min_trades, n_trials=len(study.trials),
+                top_rejections=study.best_trial.user_attrs.get("entry_funnel_top"),
+                note="no trial reached the trade floor: the reported best params are NOT an "
+                     "optimization result")
         result.stop_reason = stop_reason
         result.early_stopped = early_stopped
 
@@ -349,9 +489,15 @@ class StrategyOptimizer:
         # Tier 2: quadratic penalty between 3 and min_trades — (actual/min)^2 multiplier.
         #   Linear (×0.5 at 5 trades) leaves overfit trials competitive; quadratic (×0.25)
         #   pushes them below healthy 10-15 trade results.
-        _HARD_MIN_TRADES = 3
-        if result.total_trades < _HARD_MIN_TRADES:
-            return -100.0
+        # W67: the floor and the below-floor score are config knobs, and the score is
+        # GRADED (-100 at 0 trades rising by `below_floor_gradient` as trades approach the
+        # floor) instead of a flat -100 -- a flat plateau gave TPE nothing to climb, and 28
+        # of 30 W65 studies never left it.
+        trial.set_user_attr("n_trades", int(result.total_trades))
+        trial.set_user_attr("entry_funnel_top", _top_rejections(result.entry_funnel))
+        if result.total_trades < self._hard_min_trades:
+            return -100.0 + self._below_floor_gradient * (
+                result.total_trades / max(self._hard_min_trades, 1))
         if self._min_trades > 0 and result.total_trades < self._min_trades:
             _f = (result.total_trades / self._min_trades) ** 2
             # R5 audit: multiplying a NEGATIVE score by a <1 factor shrinks
@@ -372,15 +518,104 @@ class StrategyOptimizer:
 
         return value
 
+    def _maybe_drop_inert_params(self) -> None:
+        """W65: drop iron_condor__wing_k from the search when the W64 budget cap makes
+        it inert.
+
+        With budget_aware_wings the wing is min(wing_k x expected move, budget/90).
+        At a small account (the $5k / 5% budget -> a ~$3 wing) the cap binds for every
+        wing_k in the searched range, so Optuna would spend trials on a dimension that
+        cannot change any result (pure noise). Decided from the loaded data at the LOW
+        end of IV (smallest expected move), so it only drops when the cap certainly
+        binds; at a larger capital the cap stops binding and wing_k is searched again.
+        """
+        self._dropped_params = set()
+        # W67: with a condor-only strategy set the fractal gate's penalty cannot move any
+        # result (condors skip the directional-confidence gate) unless it also acts on the
+        # range probability, and the veto is an absolute cutoff, not derived from the
+        # threshold. Searching the three FRACTAL_GATE_SPACE dimensions is then pure noise.
+        from ait.backtesting.engine import NEUTRAL_CREDIT_GATED
+        if (self._strategies and set(self._strategies) <= set(NEUTRAL_CREDIT_GATED)
+                and self._penalty_on_range_prob == 0):
+            _fractal = {f"{st}__{name}" for st in self._strategies
+                        for name in FRACTAL_GATE_SPACE}
+            self._dropped_params |= _fractal
+            log.info("optimizer_dropped_inert_param", param="fractal_gate_space",
+                     dropped=sorted(_fractal),
+                     note="condor-only strategy set and penalty_on_range_prob=0: the fractal "
+                          "penalty cannot change any entry")
+        # W71c: with the research-only rise veto switched OFF the threshold cannot change a result,
+        # and a searched value would otherwise be applied through the override loop (the dimension
+        # is searched 0.25-0.60 whatever the baseline says). IRON_CONDOR_SPACE keeps the dimension
+        # for the day the gate is turned back on.
+        if not self._iv_rank_rise_gate:
+            _rise = {f"{st}__iv_rank_rise_threshold" for st in self._strategies
+                     if "iv_rank_rise_threshold" in STRATEGY_SPACES.get(st, {})}
+            if _rise:
+                self._dropped_params |= _rise
+                log.info("optimizer_dropped_inert_param", param="iv_rank_rise_threshold",
+                         dropped=sorted(_rise),
+                         note="backtest.iv_rank_rise_gate is false: the veto is off, so the "
+                              "threshold cannot change any entry")
+        if not self._budget_aware_wings or "iron_condor" not in self._strategies:
+            return
+        spec = STRATEGY_SPACES.get("iron_condor", {}).get("wing_k")
+        if not spec or not self._data:
+            return
+        import math
+        from ait.strategies.iron_condor import IronCondor
+        k_min = float(spec[1])
+        affordable = IronCondor.affordable_width(self._initial_capital * self._position_size_pct)
+        try:
+            dte = int(self._settings.options.dte_range[0]) if self._settings else 21
+        except Exception:  # noqa: BLE001
+            dte = 21
+        # W79a: the inertness test must hold at the SMALLEST DTE the study can pick, not the
+        # configured band's low end (the expected move, hence the wing target, shrinks with DTE).
+        if self._entry_dte is not None:
+            dte = self._entry_dte
+        if dte_search_space(self._dte_search):
+            dte = max(1, int(self._dte_search.entry_dte[0]))
+        smallest_target = None
+        for df in self._data.values():
+            if df is None or df.empty:
+                return
+            spot = float(df["Close"].iloc[-1])
+            iv = 0.15
+            if "implied_vol" in df.columns and df["implied_vol"].notna().any():
+                iv = float(df["implied_vol"].dropna().quantile(0.10))
+            target = k_min * spot * iv * math.sqrt(dte / 365.0)
+            smallest_target = target if smallest_target is None else min(smallest_target, target)
+        if smallest_target is not None and affordable < smallest_target:
+            self._dropped_params |= {"iron_condor__wing_k"}
+            log.info("optimizer_dropped_inert_param", param="iron_condor__wing_k",
+                     affordable_wing=round(affordable, 2),
+                     smallest_searched_wing=round(smallest_target, 2),
+                     note="the per-trade budget caps the wing below every searched "
+                          "wing_k, so the dimension cannot change any result")
+
     def _suggest_params(self, trial: optuna.Trial) -> dict[str, Any]:
         params: dict[str, Any] = {}
 
         # Strategy-level params — merge spaces for all requested strategies
         for strategy in self._strategies:
             space = STRATEGY_SPACES.get(strategy, {})
+            if strategy == "iron_condor":
+                _extra = dte_search_space(self._dte_search)
+                if _extra:    # W79a: the hold fraction replaces the day cap
+                    space = {k: v for k, v in space.items() if k not in DTE_SEARCH_REPLACES}
+                    space = {**space, **_extra}
             for name, spec in space.items():
                 key = f"{strategy}__{name}"
-                if key in params:
+                if key in params or key in self._dropped_params:
+                    continue
+                # W79a (flatness check): the expiry guard only exempts entries AT OR BELOW it, so
+                # for a trial whose entry DTE is above the searched range the dimension is flat
+                # (identical trades at every value). Do not sample it there: a define-by-run
+                # conditional, which TPE handles, instead of spending trials on a no-op.
+                if (strategy == "iron_condor" and name == "expiry_guard_dte"
+                        and f"{strategy}__entry_dte" in params
+                        and params[f"{strategy}__entry_dte"] > int(spec[2])):
                     continue
                 params[key] = self._suggest_one(trial, key, spec)
 
@@ -459,11 +694,30 @@ class StrategyOptimizer:
             "profit_target_pct":     self._profit_target_pct,
             "min_confidence":        self._min_confidence,
             "position_size_pct":     self._position_size_pct,
-            "trailing_stop_pct":     0.25,
-            "breakeven_trigger_pct": 0.30,
+            "budget_aware_wings":    self._budget_aware_wings,
+            "economic_calendar":     self._economic_calendar,
+            "condor_any_direction":  self._condor_any_direction,
+            "friction_model":        self._friction_model,
+            "friction_entry_capture": self._friction_entry_capture,
+            "friction_exit_capture": self._friction_exit_capture,
+            "friction_stress_multiplier": self._friction_stress_multiplier,
+            # W67: the SAME gate configuration the OOS evaluation uses. Before this the
+            # trial Backtester inherited the bare engine default (hurst veto at 1.5x), a
+            # gate the OOS run never applied -- Optuna optimized under the wrong rules.
+            "gates_mode":            self._gates_mode,
+            "iv_rank_gate":          self._iv_rank_gate,
+            "iv_rank_rise_gate":     self._iv_rank_rise_gate,    # W71c
+            "regime_veto_gate":      self._regime_veto_gate,     # W81
+            "ex_div_entry_gate":     self._ex_div_entry_gate,    # W84
+            "ex_div_entry_k_days":   self._ex_div_entry_k_days,  # W84
+            "fractal_veto_spread":   self._fractal_veto_spread,
+            "penalty_on_range_prob": self._penalty_on_range_prob,
+            "max_contracts_per_trade": self._max_contracts_per_trade,
+            "trailing_stop_pct":     self._trailing_stop_pct,
+            "breakeven_trigger_pct": self._breakeven_trigger_pct,
             "max_hold_days":         int(_bl.max_hold_days),
-            "delta_short":           0.20,
-            "delta_long":            0.30,
+            "delta_short":           self._delta_short,
+            "delta_long":            self._delta_long,
             "iv_floor":              self._iv_floor,
             "wing_floor_dollars":    self._wing_floor_dollars,
             "wing_k":                    self._wing_k,
@@ -475,6 +729,12 @@ class StrategyOptimizer:
             "multifractal_max_width":    float(_bl.multifractal_max_width),
             "iv_rank_rise_threshold":    self._iv_rank_rise_threshold,
             "min_edge_over_baseline":    self._min_edge_over_baseline,
+            # W79a: DTE dimensions. None = the engine resolves from settings.backtest (as
+            # before); a searched value replaces the baseline in the override loop below.
+            "entry_dte":                    self._entry_dte,
+            "expiry_guard_dte":             self._expiry_guard_dte,
+            "max_hold_fraction":            self._max_hold_fraction,
+            "flatten_minutes_before_close": self._flatten_minutes,
         }
         # Override with trial params that match Backtester signatures
         for key, val in params.items():
@@ -496,7 +756,16 @@ class StrategyOptimizer:
             strategies=self._strategies,
             features_cache=self._features_cache,
             symbol=self._symbol or symbol,
-            range_predictor=self._range_predictor,
+            # W66: the store this run was pointed at (W52a), so the trial engines read the
+            # same calibrated spreads / friction model v2 as the OOS engine instead of the
+            # cwd-default historical.db.
+            db_path=self._db_path,
+            iv_rank_series=self._iv_rank_series.get(self._symbol or symbol),
+            range_predictor=(
+                self._range_predictor_provider(
+                    bt_kwargs.get("entry_dte"), bt_kwargs.get("expiry_guard_dte"),
+                    bt_kwargs.get("max_hold_fraction"))
+                if self._range_predictor_provider is not None else self._range_predictor),
             intraday_store=self._intraday_store,
             eval_start_date=eval_start_date,
             # R16: Optuna trials must never score with the live future-trained
@@ -526,7 +795,10 @@ class StrategyOptimizer:
         )
         for symbol in self._symbols:
             try:
-                df = load_daily_ohlcv(symbol, days=fetch_days)
+                df = load_daily_ohlcv(
+                    symbol, days=fetch_days, db_path=self._db_path,
+                    table_prefix=self._table_prefix, start_date=self._history_start_date,
+                ) if self._table_prefix else load_daily_ohlcv(symbol, days=fetch_days)
                 if len(df) > 0:
                     df = df.tail(requested_days)
                     if len(df) >= _MIN_BACKTEST_ROWS:

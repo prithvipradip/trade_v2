@@ -6,10 +6,13 @@ Validation catches misconfigurations BEFORE the bot starts trading.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Literal
 
 import yaml
+from datetime import date
+
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
@@ -28,6 +31,21 @@ class _StrictModel(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+def _parse_hhmm(value: str, field: str = "time") -> tuple[int, int]:
+    """W69: validate an "HH:MM" (24h, ET) string and return (hour, minute).
+
+    One parser for every config clock value so a typo ("10.30", "25:00") is a
+    startup error, not a silently-wrong intraday gate.
+    """
+    parts = str(value).split(":")
+    if len(parts) != 2 or not all(p.isdigit() and len(p) == 2 for p in parts):
+        raise ValueError(f"{field} must be 'HH:MM' (24h ET), got {value!r}")
+    hour, minute = int(parts[0]), int(parts[1])
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"{field} must be a valid 24h time, got {value!r}")
+    return hour, minute
+
+
 class TradingConfig(_StrictModel):
     mode: Literal["paper", "live"] = "paper"
     universe: list[str] = ["SPY", "QQQ", "AAPL"]
@@ -39,11 +57,99 @@ class TradingConfig(_StrictModel):
                     "no new entries inside this many minutes of the session "
                     "close. Was `remaining < 900` in bot/scheduler.py — a "
                     "value that manages trading with no config home (R19c).")
+    first_hour_end_et: str = Field(default="10:30",
+        description="W69: end of the 'first hour' (ET). Before this time the "
+                    "intraday trade budget is first_hour_trade_budget and "
+                    "directional signals must clear first_hour_min_confidence. "
+                    "Was `hour_min < 10.5` in orchestrator._get_trade_budget "
+                    "and the first_hour_confidence_gate.")
+    midday_end_et: str = Field(default="14:00",
+        description="W69: end of the mid-day window (ET). From here to the "
+                    "close the whole remaining max_daily_trades is released. "
+                    "Was `hour_min < 14.0` in orchestrator._get_trade_budget.")
+    first_hour_trade_budget: int = Field(default=2, ge=1, le=50,
+        description="W69: cumulative trade ceiling while before "
+                    "first_hour_end_et (still capped by max_daily_trades). "
+                    "Was a literal 2 in orchestrator._get_trade_budget.")
+    midday_trade_budget: int = Field(default=4, ge=1, le=50,
+        description="W69: cumulative trade ceiling between first_hour_end_et "
+                    "and midday_end_et (still capped by max_daily_trades). "
+                    "Was a literal 4 in orchestrator._get_trade_budget.")
+    first_hour_min_confidence: float = Field(default=0.85, ge=0.50, le=0.99,
+        description="W69: confidence a DIRECTIONAL signal needs before "
+                    "first_hour_end_et (neutral/range-gated structures such as "
+                    "iron condors are exempt). Was a literal 0.85 in the "
+                    "orchestrator's first_hour_confidence_gate.")
+
+    @field_validator("first_hour_end_et", "midday_end_et")
+    @classmethod
+    def _validate_clock(cls, v: str, info) -> str:
+        _parse_hhmm(v, info.field_name)
+        return v
+
+    @model_validator(mode="after")
+    def _intraday_windows_are_ordered(self) -> "TradingConfig":
+        if self.first_hour_end_hour >= self.midday_end_hour:
+            raise ValueError(
+                f"trading.first_hour_end_et ({self.first_hour_end_et}) must be "
+                f"earlier than trading.midday_end_et ({self.midday_end_et})")
+        return self
+
+    @property
+    def first_hour_end_hour(self) -> float:
+        """first_hour_end_et as fractional ET hours (10:30 -> 10.5)."""
+        h, m = _parse_hhmm(self.first_hour_end_et, "first_hour_end_et")
+        return h + m / 60.0
+
+    @property
+    def midday_end_hour(self) -> float:
+        """midday_end_et as fractional ET hours (14:00 -> 14.0)."""
+        h, m = _parse_hhmm(self.midday_end_et, "midday_end_et")
+        return h + m / 60.0
 
 
 class AccountConfig(_StrictModel):
     pdt_protection: bool = True
     pdt_account_under_25k: bool = True
+    capital: float = Field(
+        default=5_000.0, ge=1_000.0, le=10_000_000.0,
+        description="THE one capital number. Research (run_backtest, run_optimizer, "
+                    "the weekly health backtest, walk-forward, ablations, dashboard) "
+                    "starts every run with exactly this much TOTAL equity, shared "
+                    "across all symbols as one pool. Live uses it as the simulated "
+                    "NLV target when simulate_live_capital is true. Replaces "
+                    "backtest.initial_capital and the six disagreeing copies "
+                    "(.env AIT_SIMULATED_CAPITAL, two --capital 50000 defaults, "
+                    "WalkForwardConfig 100k, dashboard 50k).")
+    simulate_live_capital: bool = Field(
+        default=True,
+        description="When true, broker/account.py scales every broker balance down "
+                    "to `capital` so the WHOLE live risk stack sizes as that small "
+                    "account while the real paper balance sits underneath. Set false "
+                    "at go-live (RUNBOOK checklist). The env var AIT_SIMULATED_CAPITAL "
+                    "still overrides per machine ('0' = off) because config.yaml is "
+                    "shared between boxes through git.")
+    capital_tier_small_min: float = Field(default=2_000.0, ge=0.0,
+        description="W69: NLV at/above which the SMALL capital tier starts "
+                    "(below it: MICRO). The tier selects the universe filter "
+                    "in risk/capital_tiers.py. Was a literal 2_000.")
+    capital_tier_medium_min: float = Field(default=5_000.0, ge=0.0,
+        description="W69: NLV at/above which the MEDIUM tier starts. Was a "
+                    "literal 5_000 in risk/capital_tiers.py.")
+    capital_tier_large_min: float = Field(default=25_000.0, ge=0.0,
+        description="W69: NLV at/above which the LARGE tier starts. Was a "
+                    "literal 25_000 in risk/capital_tiers.py.")
+
+    @model_validator(mode="after")
+    def _capital_tiers_ascend(self) -> "AccountConfig":
+        if not (self.capital_tier_small_min < self.capital_tier_medium_min
+                < self.capital_tier_large_min):
+            raise ValueError(
+                "account.capital_tier_small_min < capital_tier_medium_min < "
+                "capital_tier_large_min must hold strictly (got "
+                f"{self.capital_tier_small_min} / {self.capital_tier_medium_min} / "
+                f"{self.capital_tier_large_min})")
+        return self
 
 
 class PositionConfig(_StrictModel):
@@ -67,10 +173,168 @@ class PositionConfig(_StrictModel):
         description="Hard cap on contracts per trade. Low values (e.g. 1) keep "
                     "cost-per-trade minimal so the account can hold many more "
                     "concurrent positions — maximizes trade COUNT for learning.")
+    partial_fill_cancel_seconds: float = Field(default=30.0, ge=5.0, le=300.0,
+        description="W70: an entry order that is only PARTIALLY filled has its "
+                    "unfilled remainder cancelled once it has been working this long, "
+                    "so the position is not left with orphaned legs riding stale "
+                    "prices. Was a literal 30 in executor.check_fills. The check runs "
+                    "on the 30s fast-monitor tick, so values under 30 act at the next "
+                    "tick. Floor 5s: under that a normal leg-by-leg combo fill could be "
+                    "cancelled mid-burst (judgement, not measured). Must stay below "
+                    "entry_order_timeout_seconds, which would cancel it anyway. IMPACT: "
+                    "lower = orphaned remainders cleaned up sooner but a slow fill is "
+                    "cut short; higher = remainder rides at stale prices longer.")
+    absent_order_grace_seconds: float = Field(default=30.0, ge=10.0, le=120.0,
+        description="W70: an ENTRY order that is absent from the broker trade list is "
+                    "treated as still pending (not cancelled) while younger than this. "
+                    "Guards the deep-audit MP-F2b incident: a mid-cycle disconnect wipes "
+                    "ib_insync's caches, so every working entry briefly looks cancelled. "
+                    "Was a literal 30 in executor._determine_fill_status. Floor 10s "
+                    "(judgement: the one measured acknowledgement took under 1s, the "
+                    "monitor ticks every 30s, and the verdict is re-checked against the "
+                    "broker anyway). Must stay below entry_order_timeout_seconds. "
+                    "IMPACT: too low = a connection blip can flip live entries to "
+                    "CANCELLED while still working at IBKR; too high = a genuinely "
+                    "cancelled entry occupies its slot longer.")
+    entry_ladder_step_seconds: float = Field(default=45.0, ge=30.0, le=300.0,
+        description="W70: an unfilled entry combo's limit price steps toward marketable "
+                    "every this many seconds (steps at 0.25 / 0.60 / 1.00 of the "
+                    "offset). Was the class constant _LADDER_STEP_SECS = 45. Floor 30s "
+                    "= the fast-monitor tick: below it the steps are skipped, not "
+                    "honored (target_step = age // step). Observed: the first reprice "
+                    "of a real order fired at +49.4s because it is only seen on a tick. "
+                    "IMPACT: lower = chases the market faster and gives away more of "
+                    "the spread; higher = more time at the patient price.")
+
+    @model_validator(mode="after")
+    def _entry_durations_fit_the_timeout(self) -> "PositionConfig":
+        for name in ("partial_fill_cancel_seconds", "absent_order_grace_seconds",
+                     "entry_ladder_step_seconds"):
+            if getattr(self, name) >= self.entry_order_timeout_seconds:
+                raise ValueError(
+                    f"positions.{name} ({getattr(self, name)}) must be below "
+                    f"positions.entry_order_timeout_seconds "
+                    f"({self.entry_order_timeout_seconds}): the entry would be "
+                    "cancelled by the timeout before this could act. Lower it, or "
+                    "raise entry_order_timeout_seconds.")
+        return self
+
+
+class PositionSizingConfig(_StrictModel):
+    """W69: the position sizer's multiplier curves (risk/position_sizer.py).
+
+    Every default is the literal the sizer carried before this wave, so a
+    config.yaml that omits the section sizes exactly as before. The sizer
+    multiplies six adjustments (confidence, volatility, strategy, IV rank,
+    losing-day drawdown, VIX) into the position budget; this section is those
+    curves' breakpoints and factors. position_sizer.py still owns the formulas.
+    """
+
+    confidence_size_floor: float = Field(default=0.30, ge=0.05, le=1.0,
+        description="Lowest confidence multiplier (the confidence curve runs "
+                    "0.5 at risk.min_confidence to 1.0 at confidence 1.0 and "
+                    "is clamped to [this, 1.0]).")
+    iv_full_size_max: float = Field(default=0.20, ge=0.01, le=2.0,
+        description="Implied vol at/below which volatility_adjustment is 1.0.")
+    iv_floor_size_min: float = Field(default=0.60, ge=0.02, le=3.0,
+        description="Implied vol at/above which volatility_adjustment bottoms "
+                    "out at iv_floor_size_factor. Linear in between. Must "
+                    "exceed iv_full_size_max.")
+    iv_floor_size_factor: float = Field(default=0.50, ge=0.05, le=1.0,
+        description="The volatility multiplier at/above iv_floor_size_min.")
+    iv_rank_adj_min: float = Field(default=0.80, ge=0.1, le=1.0,
+        description="IV-rank multiplier floor: a SELLING strategy at IV rank 0 "
+                    "(or a BUYING one at rank 100) is sized at this factor.")
+    iv_rank_adj_max: float = Field(default=1.20, ge=1.0, le=3.0,
+        description="IV-rank multiplier ceiling: a SELLING strategy at IV rank "
+                    "100 (or a BUYING one at rank 0) is sized at this factor.")
+    drawdown_tiers: list[list[float]] = Field(
+        default=[[3, 0.50], [5, 0.25]],
+        description="[consecutive_losing_days, size_factor] pairs, ascending "
+                    "by days; the highest threshold met wins (0 losing days "
+                    "or below the first row = 1.0). Defensive throttle: halve "
+                    "after 3 losing days, quarter after 5.")
+    vix_size_tiers: list[list[float]] = Field(
+        default=[[25, 0.75], [30, 0.50]],
+        description="[vix_at_or_above, size_factor] pairs, ascending by VIX; "
+                    "the highest threshold met wins (below the first row = "
+                    "1.0). Shrinks positions where gamma risk is amplified: "
+                    "VIX>=25 elevated (75%), VIX>=30 crisis (half).")
+    strategy_risk: dict[str, float] = Field(
+        default={
+            "long_call": 1.0,        # Full premium at risk
+            "long_put": 1.0,
+            "covered_call": 0.5,     # Shares + short call
+            "cash_secured_put": 0.5,
+            "bull_call_spread": 0.6,  # Defined risk (max loss = net debit)
+            "bear_put_spread": 0.6,
+            "iron_condor": 0.4,      # Defined risk, both sides
+            "long_straddle": 1.2,    # Double premium
+            "short_strangle": 0.8,   # Undefined risk, margin required
+            "calendar_spread": 0.7,  # Defined risk (debit), 2 expiries
+            "event_straddle": 0.7,   # Defined risk (debit), capped at premium paid
+        },
+        description="Per-strategy fraction of the position budget. A strategy "
+                    "missing from this table is sized at 1.0 (the sizer's "
+                    "existing fallback).")
+
+    @field_validator("drawdown_tiers", "vix_size_tiers")
+    @classmethod
+    def _validate_tier_rows(cls, v: list[list[float]], info) -> list[list[float]]:
+        """Same discipline as RiskConfig.credit_cap_vix_tiers: the sizer
+        unpacks each row into (threshold, factor) and lets the last row whose
+        threshold is met win, so wrong arity, unsorted thresholds or a factor
+        outside (0, 1] would silently apply the wrong size."""
+        name = info.field_name
+        prev = float("-inf")
+        for row in v:
+            if len(row) != 2:
+                raise ValueError(f"{name} row {row!r} must be exactly [threshold, factor]")
+            threshold, factor = row
+            if not (0.0 < factor <= 1.0):
+                raise ValueError(f"{name} factor {factor!r} must be in (0, 1]")
+            if threshold <= prev:
+                raise ValueError(
+                    f"{name} thresholds must be strictly increasing "
+                    f"(row {row!r} does not exceed {prev!r})")
+            prev = threshold
+        return v
+
+    @field_validator("strategy_risk")
+    @classmethod
+    def _validate_strategy_risk(cls, v: dict[str, float]) -> dict[str, float]:
+        for name, mult in v.items():
+            if not (0.0 < mult <= 5.0):
+                raise ValueError(
+                    f"position_sizing.strategy_risk[{name!r}]={mult!r} must be in (0, 5]")
+        return v
+
+    @model_validator(mode="after")
+    def _iv_curve_is_ordered(self) -> "PositionSizingConfig":
+        if self.iv_floor_size_min <= self.iv_full_size_max:
+            raise ValueError(
+                f"position_sizing.iv_floor_size_min ({self.iv_floor_size_min}) must "
+                f"exceed iv_full_size_max ({self.iv_full_size_max})")
+        if self.iv_rank_adj_min > self.iv_rank_adj_max:
+            raise ValueError(
+                "position_sizing.iv_rank_adj_min must not exceed iv_rank_adj_max")
+        return self
 
 
 class RiskConfig(_StrictModel):
-    max_daily_loss_pct: float = Field(default=0.02, ge=0.005, le=0.10)
+    max_daily_loss_pct: float = Field(default=0.045, ge=0.005, le=0.10,
+        description="Daily loss breaker, fraction of NLV (realised AND mark-to-market "
+                    "trips; entries only, exits keep running). W64: 0.02 -> 0.045 at the "
+                    "$5k account (breaker $225 vs the $3-wide condor's $201-212 max "
+                    "loss on real chains); the startup self-test's rule is breaker >= "
+                    "breaker_to_max_loss_ratio x the largest max loss the builder emits.")
+    breaker_to_max_loss_ratio: float = Field(default=1.0, ge=0.5, le=3.0,
+        description="W64: the startup coherence check (orchestrator A2) alerts when the "
+                    "daily-loss breaker is below this multiple of the LARGEST single max "
+                    "loss the real condor builder emits. Was a hardcoded 1.5 (one stopped "
+                    "trade can't halt the day alone). 1.0 = one full max-loss condor "
+                    "exactly reaches the breaker; 1.5 = the original, most conservative "
+                    "rule. Alert-only: it never changes live sizing or the breaker.")
     max_consecutive_losses: int = Field(default=3, ge=1, le=10)
     pause_minutes_after_losses: int = Field(default=30, ge=5, le=120)
     max_api_failures: int = Field(default=5, ge=2, le=20)
@@ -81,12 +345,17 @@ class RiskConfig(_StrictModel):
                     "(user-approved) - the <=4 window blacked out ~half of all "
                     "trading days and refused the richest premium; every 14-30 "
                     "DTE hold spans events regardless, wings cap the surprise.")
-    max_position_risk_pct: float = Field(default=0.0133, ge=0.005, le=0.10,
+    max_position_risk_pct: float = Field(default=0.05, ge=0.005, le=0.10,
         description="Per-trade max_loss cap as a fraction of NLV (was "
-                    "hardcoded 0.03 in manager.py — audit item 3.3). PLAN "
-                    "2026-09-29: lowered 0.03->0.0133 to align with the daily "
-                    "circuit breaker's own trip threshold (max_daily_loss_pct "
-                    "/ 1.5) — closes W52a item 3, the two-knob unification.")
+                    "hardcoded 0.03 in manager.py — audit item 3.3), AND the budget the "
+                    "condor builder is handed (wing width = budget/90 snapped to the "
+                    "strike grid). History: 0.03 -> 0.0133 on 2026-09-29 to match the "
+                    "breaker (max_daily_loss_pct / 1.5); W64 (2026-10-08) -> 0.05 at the "
+                    "$5k account, MEASURED on live TWS chains: budgets $66/$150 build "
+                    "nothing at the $0.70 credit floor ($2-wide credits only $0.62-0.68); "
+                    "$250 builds a $3-wide condor (credit $0.88-0.99, max loss "
+                    "$201-212). Must stay <= positions.max_position_pct (the sizer's "
+                    "cap) — Settings validates it (W64).")
     max_correlation: float = Field(default=0.75, ge=0.30, le=0.99,
         description="Correlation above which two symbols count as the same bet.")
     max_correlated_positions: int = Field(default=2, ge=1, le=8,
@@ -139,6 +408,34 @@ class RiskConfig(_StrictModel):
     credit_vix_halt: float = Field(default=28.0, ge=15.0, le=60.0,
         description="No NEW credit entries when VIX is at/above this level — "
                     "cheap vol-regime brake for short-premium strategies.")
+    weekend_gap_cutoff_et: str = Field(default="14:30",
+        description="W69: from this ET time on a Friday, weekend_gap_strategies "
+                    "need weekend_gap_min_confidence to be entered (weekend gap "
+                    "risk for undefined-risk shorts). Was `now.hour == 14 and "
+                    "now.minute >= 30` in risk/manager.py, on a naive local "
+                    "clock (the W20/W21 bug class) — it now reads now_et().")
+    weekend_gap_min_confidence: float = Field(default=0.90, ge=0.50, le=0.99,
+        description="W69: confidence a weekend_gap_strategies entry needs after "
+                    "weekend_gap_cutoff_et on Friday. Was a literal 0.90 in "
+                    "risk/manager.py.")
+    weekend_gap_strategies: list[str] = Field(default=["short_strangle"],
+        description="W69: strategies subject to the Friday-afternoon "
+                    "confidence rule. Iron condors are defined-risk and long "
+                    "straddles benefit from weekend vol, so only the "
+                    "undefined-risk short is listed by default. Was the "
+                    "literal tuple ('short_strangle',) in risk/manager.py.")
+
+    @field_validator("weekend_gap_cutoff_et")
+    @classmethod
+    def _validate_weekend_cutoff(cls, v: str) -> str:
+        _parse_hhmm(v, "weekend_gap_cutoff_et")
+        return v
+
+    @property
+    def weekend_gap_cutoff_minutes(self) -> int:
+        """weekend_gap_cutoff_et as minutes since ET midnight (14:30 -> 870)."""
+        h, m = _parse_hhmm(self.weekend_gap_cutoff_et, "weekend_gap_cutoff_et")
+        return h * 60 + m
 
     @field_validator("credit_cap_vix_tiers")
     @classmethod
@@ -208,13 +505,163 @@ class OptionsConfig(_StrictModel):
         return v
 
 
+class DteSearchConfig(_StrictModel):
+    """W79a: the opt-in DTE dimensions of an Optuna study (research only).
+
+    Off by default and switched on per study (``run_backtest.py --search-dte``): the existing
+    ``IRON_CONDOR_SPACE`` is untouched, so every other study is unchanged. When enabled the
+    condor search ADDS entry DTE, the expiry guard and the hold fraction (the fraction REPLACES
+    ``max_hold_days`` for credit structures, so "hold between 0 and DTE" is one dimension for
+    every entry DTE). The credit floors (``ic_min_credit*``) are deliberately NOT searched: they
+    are live economics floors and a search would optimise against an unmeasured cost model.
+    """
+
+    enabled: bool = Field(default=False,
+        description="W79a: add the DTE dimensions to the iron-condor search. Per-study switch "
+                    "(CLI --search-dte); requires optimize_per_window.")
+    entry_dte: list[int] = Field(default=[0, 45],
+        description="W79a: inclusive range of the searched entry DTE (calendar days). The "
+                    "operator's stated research range is 0-45; the live dte_range validator "
+                    "still forbids 0 until W80.")
+    guard_dte: list[int] = Field(default=[0, 5],
+        description="W79a: inclusive range of the searched expiry_guard_dte: entries with at "
+                    "most this many DTE are exempt from live rules 3/3a (the close at DTE<=5). "
+                    "0-5 spans 'rules apply to everything' to 'every short entry is exempt'.")
+    hold_fraction: list[float] = Field(default=[0.05, 1.0],
+        description="W79a: range of the searched max_hold_fraction: close after this share of "
+                    "the position's own life. 1.0 = hold to expiry (or the flatten).")
+    search_flatten: bool = Field(default=False,
+        description="W79a: also search flatten_minutes_before_close. OFF because the W77 study "
+                    "and the W79a flatness check show it has NO effect while the take-profit "
+                    "ladder is on (positions never reach the bell): a flat dimension only "
+                    "wastes trials (the W65 inert-wing_k rule).")
+    flatten_minutes: list[int] = Field(default=[30, 120],
+        description="W79a: range of the searched flatten (minutes before the close) when "
+                    "search_flatten is on. A hard backstop, not a profit lever.")
+    multivariate: bool = Field(default=False,
+        description="W79a: TPESampler(multivariate=True, group=True). Off: the search space is "
+                    "conditional (the guard decides which of the other dimensions bind) and "
+                    "grouped TPE is an experimental sampler in optuna.")
+    strict: bool = Field(default=False,
+        description="W79a: a per-window optimisation that FAILS aborts the study instead of "
+                    "silently falling back to the base config (the W79 'searched nothing' "
+                    "failure). Recommended on for any study whose numbers will be quoted.")
+
+    @staticmethod
+    def _pair(v, lo, hi, name, floatish=False):
+        if len(v) != 2 or not (lo <= v[0] <= v[1] <= hi):
+            raise ValueError(f"{name} must be [low, high] with {lo} <= low <= high <= {hi}")
+        return v
+
+    @field_validator("entry_dte")
+    @classmethod
+    def _v_entry(cls, v: list[int]) -> list[int]:
+        return cls._pair(v, 0, 45, "dte_search.entry_dte")
+
+    @field_validator("guard_dte")
+    @classmethod
+    def _v_guard(cls, v: list[int]) -> list[int]:
+        return cls._pair(v, 0, 45, "dte_search.guard_dte")
+
+    @field_validator("hold_fraction")
+    @classmethod
+    def _v_frac(cls, v: list[float]) -> list[float]:
+        if len(v) != 2 or not (0.0 < v[0] <= v[1] <= 1.0):
+            raise ValueError("dte_search.hold_fraction must be [low, high] with 0 < low <= high <= 1")
+        return v
+
+    @field_validator("flatten_minutes")
+    @classmethod
+    def _v_flat(cls, v: list[int]) -> list[int]:
+        return cls._pair(v, 5, 390, "dte_search.flatten_minutes")
+
+
 class BacktestConfig(_StrictModel):
-    initial_capital: float = Field(default=100_000.0, ge=1_000.0, le=10_000_000.0)
-    position_size_pct: float = Field(default=0.05, ge=0.01, le=0.50,
-        description="Fraction of capital risked per trade (max-loss basis).")
-    wing_floor_dollars: float = Field(default=5.0, ge=0.50, le=50.0,
-        description="Hard minimum spread width in dollars (safety floor only). "
-                    "Wing sizing is now primarily driven by wing_k × expected_move.")
+    @field_validator("macro_event_types")
+    @classmethod
+    def _valid_macro_event_types(cls, v: list[str]) -> list[str]:
+        allowed = {"FOMC", "CPI", "NFP", "GDP", "PCE"}
+        bad = sorted(set(v) - allowed)
+        if bad or not v:
+            raise ValueError(
+                f"macro_event_types must be a non-empty subset of {sorted(allowed)}; got {v}")
+        return list(dict.fromkeys(v))
+
+    position_size_pct: float | None = Field(default=None, ge=0.01, le=0.50,
+        description="Fraction of capital risked per trade (max-loss basis). W64: None "
+                    "(the default) resolves to risk.max_position_risk_pct — the SAME "
+                    "per-trade budget live funds — so research and live cannot drift. "
+                    "Set a number only for a deliberate sizing study.")
+    history_start_date: date | None = Field(default=None,
+        description="W65: first date of the research history. When set it wins over "
+                    "history_days: the research loader trims frames to it and walk-forward "
+                    "windows start there. config.yaml pins 2024-01-01 = the first day of the "
+                    "operator's economic-calendar CSV, so the macro gate is ON in every window.")
+    history_days: int = Field(default=1826, ge=400, le=6000,
+        description="W65: calendar days of history a research run requests when no "
+                    "history_start_date is set (legacy fallback). The walk-forward used to "
+                    "fetch only train+test+100 days (528) = 2 windows.")
+    research_table_prefix: str = Field(default="research_", pattern=r"^([a-z][a-z0-9_]*_)?$",
+        description="W65: table prefix of the IB-sourced research history in historical.db "
+                    "(research_daily_prices, research_daily_iv, research_intraday_prices, "
+                    "research_econ_events). Empty = the live tables. Keeps research data in one "
+                    "consistent source and the live tables untouched.")
+    vlmc_min_coverage: float = Field(default=0.95, ge=0.5, le=1.0,
+        description="W65: minimum fraction of trading days that must have 5-min bars before the "
+                    "walk-forward trains with VLMC/intraday-fractal features. Below it the run "
+                    "falls back to daily-only features with a WARNING instead of mixing windows "
+                    "with and without VLMC inside one run.")
+    macro_event_types: list[str] = Field(default=["FOMC", "CPI", "NFP", "PCE", "GDP"],
+        description="W65: which release types the RESEARCH macro-event gate blocks around "
+                    "(default = the five the live gate uses). Subset of FOMC, CPI, NFP, GDP, PCE.")
+    condor_any_direction: bool = Field(default=False,
+        description="W66: research selects an iron-condor-only strategy set on ANY market "
+                    "direction, like live (live's IronCondor ignores market_direction; the "
+                    "engine only selected it on NEUTRAL days, ~81% of days removed on the "
+                    "2024-2026 span). False keeps the legacy NEUTRAL-only rule (default, so "
+                    "existing results do not move); a candidate for the operator to flip.")
+    friction_model: str = Field(default="per_leg_usd", pattern="^(legacy|per_leg_usd)$",
+        description="W66: research option-friction model for iron condors. per_leg_usd = the "
+                    "fitted per-leg DOLLAR half-spread (option_leg_spread_params, from IB BID/ASK "
+                    "bars) paid on all four legs at entry AND exit; legacy = half_spread_pct x "
+                    "leg mid at entry and the same % on the net value at exit, which overcharged "
+                    "a $0.95-credit QQQ condor $0.669 vs ~$0.085 measured (W65). A symbol with "
+                    "no fitted model falls back to legacy with a WARNING.")
+    friction_entry_capture: float = Field(default=1.0, ge=0.0, le=2.0,
+        description="W66: share of the quoted half-spread paid per leg at ENTRY (1.0 = cross "
+                    "the full half-spread, conservative; real limit fills at/inside the mid "
+                    "capture less). Tune downward only from the fill-vs-model report.")
+    friction_exit_capture: float = Field(default=1.0, ge=0.0, le=2.0,
+        description="W66: share of the quoted half-spread paid per leg at EXIT (same "
+                    "convention as friction_entry_capture).")
+    friction_stress_multiplier: float = Field(default=1.0, ge=0.0, le=5.0,
+        description="W66: multiplies the fitted model. The sample is calm-regime (IB serves "
+                    "no expired-option history); raise it to stress-test, or sweep it with "
+                    "scripts/friction_sensitivity.py.")
+    budget_aware_wings: bool = Field(default=True,
+        description="W64: the walk-forward/optimizer condor builder caps the wing to "
+                    "the per-trade budget exactly like live (IronCondor.affordable_"
+                    "width, $1 floor when capped) and rejects a structure whose max "
+                    "loss exceeds the budget. False restores the old uncapped "
+                    "wing_k x expected-move wing for before/after comparisons only.")
+    wing_floor_dollars: float = Field(default=2.0, ge=1.0, le=10.0,
+        description="W70: THE minimum iron-condor wing, in dollars, for LIVE ENTRIES AND "
+                    "RESEARCH alike. This key lives under `backtest:` but it is also the "
+                    "env-contract home of AIT_IC_WING_FLOOR, which the live builder "
+                    "(strategies/iron_condor.py _vol_scaled_width) reads — so editing it "
+                    "changes what the live bot trades, not only what a backtest simulates. "
+                    "The wing is wing_k x price x IV x sqrt(DTE/365), but never narrower "
+                    "than this. It binds only when the per-trade budget does not: a "
+                    "budget-capped wing may shrink below it (at today's $5k account the "
+                    "budget carries ~$2.78, so the floor matters only when the vol-scaled "
+                    "width comes out under $2), but never below $1 "
+                    "(invariants.IC_BUDGET_CAPPED_MIN_WING). Precedence for live: "
+                    "env/.env AIT_IC_WING_FLOOR > this key > 2.0. Bounds 1.0-10.0: under "
+                    "$1 contradicts the budget-capped minimum; over $10 is not sensible "
+                    "for this account. History: default was 5.0 (the old backtest "
+                    "default, still read by ~15 study scripts and run_optimizer); "
+                    "walk-forward, run_backtest and the engine already used 2.0 "
+                    "(R6 parity with the live literal this key replaces).")
     wing_k: float = Field(default=1.6, ge=0.1, le=3.0,
         description="Vol-scaled wing multiplier: wing_width = wing_k × price × IV × sqrt(DTE/365). "
                     "Optuna optimizes this per walk-forward window. "
@@ -289,6 +736,39 @@ class BacktestConfig(_StrictModel):
     optimize_min_trades: int = Field(default=10, ge=1, le=100,
         description="Min trade count for full objective score. "
                     "Trials below this are penalised quadratically; < 3 trades always scores −100.")
+    optimize_hard_min_trades: int = Field(default=3, ge=1, le=50,
+        description="W67: below this many trades a trial is scored on the graded floor "
+                    "(-100 + optimize_below_floor_gradient x n/hard_min), not the old flat -100 "
+                    "that left TPE nothing to climb (28 of 30 W65 studies never left it).")
+    optimize_below_floor_gradient: float = Field(default=20.0, ge=0.0, le=90.0,
+        description="W67: points the below-floor score rises from -100 (0 trades) toward "
+                    "-100 + this value (hard_min_trades - 1 trades), so trading beats not "
+                    "trading. 0 restores the flat -100.")
+    gates_mode: str = Field(default="observe", pattern="^(observe|enforce)$",
+        description="W67: research ML-gate mode. observe = live parity today "
+                    "(ml.entry_gates_enabled=false: the range-model floor and fractal veto are "
+                    "computed and recorded as would_reject:* but never block); enforce = the "
+                    "research engine's historical behaviour (they block). The gate study "
+                    "(scripts/gate_study.py) compares the two on the same days.")
+    iv_rank_gate: bool = Field(default=False,
+        description="W68: research applies live's two IV-RANK gates to credit entries -- iron_condor "
+                    "refuses rank < ic_iv_rank_floor (15) and the risk manager refuses rank > "
+                    "risk.iv_rank_cap (85); an unmeasurable rank fails closed. Rank = percentile of "
+                    "today's IV in the last 252 stored daily IVs (ait.data.iv_rank, shared with "
+                    "live). False = the engine's historical absolute-level floor (iv_floor) only. "
+                    "When True, lower iv_floor to its 0.05 minimum so it stays a pricing sanity "
+                    "floor and not a second entry gate live does not have.")
+    fractal_veto_spread: float = Field(default=0.0, ge=0.0, le=1.0,
+        description="W67: absolute hurst_scale_spread above which neutral credit structures "
+                    "are vetoed (0 = veto off, live parity). Replaces the research-only "
+                    "max(hurst_regime_threshold, 0.20) x multiplier that the OOS run, the "
+                    "optimizer trials and the meta-label shadow run applied inconsistently. "
+                    "Shared with the live orchestrator via ait.ml.regime_gate.")
+    penalty_on_range_prob: float = Field(default=0.0, ge=0.0, le=0.5,
+        description="W67: P(in range) is lowered by this x min(spread/threshold, 3) when the "
+                    "fractal regime is chaotic (0 = untouched, live parity). Condors are "
+                    "gated on the range probability, not on direction, so this is the "
+                    "penalty that can actually reach their entry statistic.")
     # Intraday execution params (Fix 1 / Gap H)
     scan_interval_minutes: int = Field(default=60, ge=5, le=240,
         description="How often (minutes) to scan for entry signals within a trading session.")
@@ -388,14 +868,191 @@ class BacktestConfig(_StrictModel):
     max_hold_days: int = Field(default=30, ge=1, le=120,
         description="R20b: baseline maximum holding period (calendar days) before a "
                     "trial/engine backtest force-closes a position.")
+    engine_model: Literal["legacy", "realistic"] = Field(default="legacy",
+        description="W74: which fidelity the research engine runs at. 'legacy' = the "
+                    "engine every prior study used (entry priced at the DAILY close with "
+                    "same-day IV, expiry = entry + N calendar days even on a weekend, "
+                    "whole-day time, no same-session exit check, intraday take-profit "
+                    "decided AFTER friction and blind to touches, condors invalidated on "
+                    "direction, long strikes priced unrounded then re-marked rounded). "
+                    "'realistic' fixes each (W72 leads L2-L6): fill-time spot, "
+                    "previous-session IV, listed session expiries, fractional time to the "
+                    "bell, same-session exit checks, mid-based intraday decisions, per-bar "
+                    "touch stops, live's condor thesis exemption, rounded strikes priced "
+                    "as stored. Flipping it changes every research baseline (assumption "
+                    "A10): record a before/after on the reference study first. "
+                    "Operator-owned; default 'legacy' so no study moves silently.")
+    friction_short_dte: bool = Field(default=False,
+        description="W76: charge 0-6 DTE legs from DTE-band friction instead of the single "
+                    "all-DTE per-leg model (friction_model='per_leg_usd' only). The fitted model "
+                    "has no sample below 11 DTE, so short-DTE legs were charged an extrapolated "
+                    "number. When True a band with fewer than friction_min_sessions_per_band "
+                    "collected sessions is charged the all-DTE model floored at "
+                    "friction_extrapolated_floor_usd per leg and the run reports how many legs "
+                    "were extrapolated; a band with enough sessions uses its own fit. Also "
+                    "applies to the EXIT of a long-dated position once its remaining DTE is "
+                    "below 7. Default False: no study moves silently.")
+    friction_min_sessions_per_band: int = Field(default=15, ge=1, le=250,
+        description="W76: sessions of real IB bid/ask bars a 0-6 DTE band needs before its own "
+                    "fit replaces the conservative extrapolation. 15 follows the W66 fit's "
+                    "grouped leave-one-session-out CV, which needs a few sessions per fold.")
+    friction_extrapolated_floor_usd: float = Field(default=0.01, ge=0.005, le=0.10,
+        description="W76: per-leg HALF-spread floor ($/share) used where a short-DTE band has no "
+                    "fitted model. $0.01 is one full option tick paid on each side, a "
+                    "conservative stand-in for QQQ/SPY/IWM at 0-6 DTE (quoted $0.01-0.03 wide). "
+                    "Operator-owned: raise it for a harsher study, lower it once real bars exist.")
+    pricing_source: Literal["bs_legacy", "surface"] = Field(default="bs_legacy",
+        description="W75: where the research engine gets each condor leg's implied vol. "
+                    "'bs_legacy' = one stored 30-day IV plus a skew with no DTE term (every "
+                    "prior study). 'surface' = the smile of the leg's OWN expiry from the "
+                    "real option bars (ait.backtesting.iv_surface), fit on the previous "
+                    "session so nothing from the decision day leaks. Out-of-sample, bar to "
+                    "bar, it cut median option-price error by 19% (1-2 DTE), 46% (3-7), 43% "
+                    "(8-14) and 49% (15-45) and removed the +1.4-1.9 vol-point richness "
+                    "'bs_legacy' carries at 3+ DTE. QQQ only (the bars exist for QQQ); a "
+                    "symbol or date without a smile falls back per leg and is counted. "
+                    "Operator-owned: default 'bs_legacy' so no study moves silently.")
+    expiry_guard_dte: int | None = Field(default=None, ge=0, le=45,
+        description="W74: positions ENTERED with at most this many days to expiry are "
+                    "exempt from the DTE-based closes (live rules 3/3a: DTE <= "
+                    "EXPIRY_APPROACHING_DTE) and are governed by max_hold_fraction and "
+                    "the expiry-day flatten instead. None = today's behaviour: the rule "
+                    "closes every position, which makes any 0-5 DTE entry exit on the "
+                    "next bar. Searched 0-5 by the DTE study (W79).")
+    max_hold_fraction: float | None = Field(default=None, gt=0.0, le=1.0,
+        description="W74: close a credit position after this share of its life (entry "
+                    "-> expiry close). None = the legacy day cap (max_hold_days). "
+                    "Replaces max_hold_days for credit structures when set, so 'hold "
+                    "anywhere between 0 and DTE' is one dimension for every entry DTE.")
+    flatten_minutes_before_close: int | None = Field(default=None, ge=5, le=390,
+        description="W74: on a position's expiry date, flatten this many minutes before "
+                    "the session close (13:00 ET on early-close days). None = off. A hard "
+                    "backstop so no position reaches settlement, assignment or an "
+                    "unhedged gap after a one-sided expiry (the exposure that cost two "
+                    "manual trades more than their defined maximum).")
+    dte_search: DteSearchConfig = Field(default_factory=DteSearchConfig,
+        description="W79a: opt-in DTE dimensions for an Optuna study (see DteSearchConfig). "
+                    "Research only; the live bot never reads it.")
+    pin_band_usd: float = Field(default=0.10, ge=0.0, le=1.0,
+        description="W77: a SHORT leg within this many dollars of its strike at the expiry "
+                    "bell is a pin: whether it is assigned cannot be known at the close, so "
+                    "the engine scores both outcomes and books the worse (assumption A5 of "
+                    "the short-DTE programme). Realistic engine only; a position only "
+                    "reaches the bell when it is exempt from the expiry guard and not "
+                    "flattened. Operator-owned: 0.10 is a judgement, not a measurement "
+                    "(none of the three real expiries on the 2026-08/10 statement was "
+                    "within it).")
+    assignment_fee_per_share: float = Field(default=0.015, ge=0.0, le=0.10,
+        description="W77: $/share charged on stock delivered by ASSIGNMENT at expiry. "
+                    "Measured on the operator's 2026-09/10 statement (0.0151-0.0155 on the "
+                    "three assignments); exercise-delivered shares carried no fee there, "
+                    "so none is charged on them. Realistic engine only.")
+    stock_commission_per_share: float = Field(default=0.01, ge=0.0, le=0.10,
+        description="W77: $/share to close shares left over after a one-sided expiry at "
+                    "the next session's open. Measured 0.0100 on the same statement. "
+                    "Realistic engine only.")
+    iv_rank_rise_gate: bool = Field(default=True,
+        description="W71c: apply the IV-rank RISE veto at all. RESEARCH-ONLY: live has no such "
+                    "veto (it gates on the stored-IV percentile LEVEL, condor floor 15 / credit "
+                    "cap 85). False skips the veto but the rise is still computed and recorded "
+                    "per entry (iv_rank_rise_10d), and the optimizer stops searching "
+                    "iv_rank_rise_threshold (a searched value would otherwise re-enable the "
+                    "gate per trial). Schema default True so a bare Backtester and every "
+                    "regression baseline are unchanged; the research overlay sets False "
+                    "(operator decision D9, PLAN.md W71) together with the bar for turning it "
+                    "back on.")
     iv_rank_rise_threshold: float = Field(default=0.30, ge=0.0, le=10.0,
         description="R20b: suppress iron-condor entry when IV rank rose more than "
                     "this over the last 10 days (Exp 20 veto). Values > 1 disable "
-                    "the veto (IV rank is 0-1).")
+                    "the veto (IV rank is 0-1). Ignored while iv_rank_rise_gate is false.")
+    regime_veto_gate: bool = Field(default=True,
+        description="W81: apply the trending-down REGIME veto at all. RESEARCH-ONLY: live has "
+                    "no such entry veto (it uses regime for the direction override, the "
+                    "meta-label features and roll defense only). The veto blocks a neutral "
+                    "credit entry when 5-day realized vol exceeds 20-day (vol_regime_expanding) "
+                    "and the close is more than regime_down_threshold below its 20-day SMA. "
+                    "False skips the VETO only: the regime class is still computed and "
+                    "recorded per entry (regime_class, regime_veto_suppressed). Schema default "
+                    "True so a bare Backtester and every regression baseline are unchanged; "
+                    "whether the research overlay turns it off is operator decision D10 "
+                    "(PLAN.md, 2026-10-13 programme entry), to be taken on the W81 A/B.")
+    regime_down_threshold: float = Field(default=-0.05, ge=-0.50, le=0.0,
+        description="W81: price_vs_sma_20 below this (with vol_regime_expanding) classes a day "
+                    "'trending_down' in the research engine: the regime veto, the "
+                    "entry_regime stored on each position and the meta-label regime features "
+                    "all read it. Was a bare -0.05 at three engine sites (Exp 22/23: -0.02 "
+                    "blocked profitable 2-4% corrections; -0.05 cleared the Yen-carry and "
+                    "tariff-shock episodes). Research only; live's RegimeDetector has its own "
+                    "thresholds (the regime: block).")
+    regime_up_threshold: float = Field(default=0.02, ge=0.0, le=0.50,
+        description="W81: price_vs_sma_20 above this (with vol_regime_expanding) classes a day "
+                    "'trending_up' in the research engine (position entry_regime and the "
+                    "meta-label regime features; it never vetoes). Was a bare 0.02. Research "
+                    "only.")
+    ex_div_entry_gate: Literal["off", "live", "exact", "last_k_days"] = Field(default="off",
+        description="W84: the research TWIN of live's ex-dividend entry block (W51, orchestrator "
+                    "trade_blocked_ex_div): refuse a new position that SELLS A CALL when an "
+                    "ex-dividend date falls between the entry day and the position's expiry "
+                    "(early-assignment risk on the short call). 'live' = live's rule exactly: "
+                    "ONE projected ex-date (dividends.project_next_ex_div over the ex-dates "
+                    "known before the entry day). 'exact' = any real ex-date in [entry, "
+                    "expiry]. 'last_k_days' = only a real ex-date within ex_div_entry_k_days "
+                    "of expiry (where little extrinsic is left; the F2 candidate). 'off' = no "
+                    "block; a day it would have blocked is still flagged ex_div_in_window when "
+                    "the dividend table is loaded. Needs the {research_table_prefix}dividends "
+                    "table (scripts/backfill_dividends.py); any mode but 'off' raises without "
+                    "it. Schema default 'off' so a bare Backtester and every regression "
+                    "baseline are unchanged; the research overlay sets 'live' (parity; PLAN.md "
+                    "2026-10-16 ex-dividend finding: live refuses 14-17% of sessions).")
+    ex_div_entry_k_days: int = Field(default=5, ge=1, le=30,
+        description="W84: K for ex_div_entry_gate 'last_k_days': block only when a real "
+                    "ex-date is at most K calendar days before the position's expiry. Not "
+                    "searched by the optimizer. Ignored in the other modes.")
     min_edge_over_baseline: float = Field(default=0.05, ge=0.0, le=1.0,
         description="R20b: minimum weighted CV edge over the base rate for the "
                     "range predictor to activate as an entry gate (Exp 28 quality "
                     "floor; 0.0 = always use the model).")
+    slippage_pct: float = Field(default=0.01, ge=0.0, le=0.10,
+        description="W70: fractional price slippage the research engine adds on top of "
+                    "the modeled spread for DEBIT / long-option structures (long call/put, "
+                    "straddles, debit spreads). Research only. NOT applied to iron "
+                    "condors (credit structures use the friction model) so it has no "
+                    "effect on the IC-only strategy set. Was the engine's "
+                    "slippage_pct=0.01 constructor default.")
+    delta_short: float = Field(default=0.20, ge=0.05, le=0.50,
+        description="W70: |delta| the research engine targets for the SHORT strikes of "
+                    "its structures. Research only: live's iron condor short delta is a "
+                    "literal ~0.20 inside strategies/iron_condor.py, NOT this key, so "
+                    "changing it moves research away from live. Was the engine's "
+                    "delta_short=0.20.")
+    delta_long: float = Field(default=0.30, ge=0.05, le=0.60,
+        description="W70: |delta| the research engine targets for LONG single options "
+                    "and long legs of debit structures. Research only; unused by the "
+                    "iron condor (its wings are set by wing_k, not delta). Was "
+                    "delta_long=0.30.")
+    hurst_hard_veto_multiplier: float = Field(default=1.5, ge=0.0, le=5.0,
+        description="W70: legacy derivation of the fractal HARD veto when "
+                    "fractal_veto_spread is unset: veto spread = max(hurst_regime_"
+                    "threshold, 0.20) x this. 0 = no derived veto. Research only. NOTE "
+                    "WalkForwardConfig deliberately passes 0.0 (disabled; Exp 20 "
+                    "post-mortem: any multiplier blocked all QQQ entries), so this "
+                    "default 1.5 only governs a bare Backtester(). Was the engine's "
+                    "hurst_hard_veto_multiplier=1.5.")
+    pct_from_60d_high_threshold: float = Field(default=-1.0, ge=-1.0, le=0.0,
+        description="W70: research-only experimental entry gate: refuse a neutral "
+                    "credit entry when spot is more than this fraction below its 60-day "
+                    "high (e.g. -0.05). -1.0 = DISABLED (the default; values <= -0.99 "
+                    "never gate). Not part of live. Was the engine's "
+                    "pct_from_60d_high_threshold=-1.0.")
+    skew_factor: float = Field(default=1.0, ge=0.0, le=5.0,
+        description="W70: multiplier on the engine's legacy flat IV-skew term (put "
+                    "0.10 / call 0.02 per unit log-moneyness). 0.0 = flat IV. Additive "
+                    "with skew_slope_per_pct_otm, the W5 measured steepening. Research "
+                    "only. Was the engine's skew_factor=1.0.")
+    context_bars: int = Field(default=0, ge=0, le=1000,
+        description="W70: extra intraday bars of lookback the research engine keeps as "
+                    "feature context (lookback = max(20, this)). 0 = the engine "
+                    "minimum. Research harness knob. Was context_bars=0.")
 
 
 class MLConfig(_StrictModel):
@@ -437,6 +1094,26 @@ class MLConfig(_StrictModel):
                     "risk.min_confidence or observe mode blocks itself; the "
                     "0.60 default sits above the shipped 0.50 with headroom. "
                     "Ignored entirely when gates are ON.")
+    regime_override_confidence: float = Field(default=0.80, ge=0.50, le=0.99,
+        description="W69: a regime classification above this confidence that "
+                    "is HIGH_VOLATILITY overrides the ML direction to NEUTRAL "
+                    "at entry. Was a literal 0.8 in orchestrator (the R5 "
+                    "classifier floors high-vol confidence at 0.80 so any "
+                    "VIX/vol trigger clears it — keep this at or below 0.80).")
+    drift_window_size: int = Field(default=50, ge=20, le=500,
+        description="W69: rolling window of resolved predictions the drift "
+                    "detector scores. Was DriftDetector's window_size=50.")
+    drift_accuracy_threshold: float = Field(default=0.40, ge=0.20, le=0.80,
+        description="W69: rolling accuracy below this flags drift and asks "
+                    "for a retrain. Was DriftDetector's accuracy_threshold.")
+    drift_calibration_threshold: float = Field(default=0.25, ge=0.05, le=0.60,
+        description="W69: high-confidence calibration error above this flags "
+                    "drift. Was DriftDetector's calibration_threshold.")
+    drift_high_confidence: float = Field(default=0.80, ge=0.60, le=0.99,
+        description="W69: predictions at/above this confidence form the "
+                    "calibration cohort, and are EXPECTED to be right this "
+                    "often (the shortfall is the calibration error). Was a "
+                    "literal 0.80 used for both in ml/drift.py.")
 
     @field_validator("ensemble_weights")
     @classmethod
@@ -445,6 +1122,55 @@ class MLConfig(_StrictModel):
         if abs(total - 1.0) > 0.01:
             raise ValueError(f"Ensemble weights must sum to 1.0, got {total}")
         return v
+
+
+class RegimeConfig(_StrictModel):
+    """W69: market-regime classification thresholds (ml/regime.py `_classify`).
+
+    Thresholds only. The confidence each classification returns is part of the
+    classifier's design (and the R5 audit fix that makes a high-vol trigger
+    clear the 0.70/0.80 consumer gates) and stays in code. Defaults are the
+    pre-W69 literals, so omitting the section changes nothing.
+    """
+
+    high_vol_vix: float = Field(default=30.0, ge=15.0, le=80.0,
+        description="VIX above this classifies HIGH_VOLATILITY.")
+    high_vol_realized: float = Field(default=0.40, ge=0.15, le=2.0,
+        description="Annualised realised vol above this classifies "
+                    "HIGH_VOLATILITY (either trigger is enough).")
+    iv_crush_iv_rank_max: float = Field(default=0.25, ge=0.0, le=1.0,
+        description="IV_CRUSH needs IV rank (0-1) below this ...")
+    iv_crush_vol_max: float = Field(default=0.20, ge=0.01, le=1.0,
+        description="... realised vol below this ...")
+    iv_crush_trend_max: float = Field(default=0.20, ge=0.0, le=1.0,
+        description="... and |trend strength| below this.")
+    mean_revert_hurst_max: float = Field(default=0.40, ge=0.0, le=0.5,
+        description="MEAN_REVERTING needs the Hurst exponent below this ...")
+    mean_revert_trend_max: float = Field(default=0.25, ge=0.0, le=1.0,
+        description="... and |trend strength| below this.")
+    low_vol_vix: float = Field(default=15.0, ge=5.0, le=30.0,
+        description="VIX below this (or realised vol below low_vol_realized) "
+                    "is the LOW_VOLATILITY branch.")
+    low_vol_realized: float = Field(default=0.12, ge=0.02, le=0.60,
+        description="Realised vol below this is the LOW_VOLATILITY branch.")
+    low_vol_trend_breakout: float = Field(default=0.30, ge=0.05, le=1.0,
+        description="Inside the low-vol branch, |trend| above this is "
+                    "TRENDING_UP/DOWN instead of LOW_VOLATILITY.")
+    strong_trend: float = Field(default=0.35, ge=0.05, le=1.0,
+        description="|trend strength| above this (outside the branches above) "
+                    "classifies TRENDING_UP/DOWN.")
+
+    @model_validator(mode="after")
+    def _vol_bands_are_ordered(self) -> "RegimeConfig":
+        if self.low_vol_realized >= self.high_vol_realized:
+            raise ValueError(
+                f"regime.low_vol_realized ({self.low_vol_realized}) must be below "
+                f"high_vol_realized ({self.high_vol_realized})")
+        if self.low_vol_vix >= self.high_vol_vix:
+            raise ValueError(
+                f"regime.low_vol_vix ({self.low_vol_vix}) must be below "
+                f"high_vol_vix ({self.high_vol_vix})")
+        return self
 
 
 class MetaLabelConfig(_StrictModel):
@@ -592,6 +1318,19 @@ class AssignmentResponseConfig(_StrictModel):
                     "2-leg roll, roughly double for this wave's 4-leg "
                     "vertical roll, so this floor needs real evidence before "
                     "it should be trusted at the cent.")
+    roll_short_delta_target: float = Field(default=0.20, ge=0.05, le=0.50,
+        description="W69: target |delta| of the NEW short strike when a roll "
+                    "re-establishes the at-risk vertical. Mirrors the iron "
+                    "condor entry short delta (~0.20): a rolled vertical looks "
+                    "like a fresh entry at the new expiry, not a replica of "
+                    "the decayed old strike. Was _ROLL_SHORT_DELTA_TARGET in "
+                    "execution/roll_selector.py.")
+    roll_short_delta_tolerance: float = Field(default=0.07, ge=0.01, le=0.25,
+        description="W69: how far the nearest liquid strike's |delta| may sit "
+                    "from roll_short_delta_target before the roll is refused "
+                    "(select_roll_target returns None). 0.07 matches "
+                    "Strategy._find_strike_by_delta's default tolerance. Was "
+                    "_ROLL_SHORT_DELTA_TOLERANCE in roll_selector.py.")
 
 
 class CondorDefenseConfig(_StrictModel):
@@ -805,15 +1544,147 @@ class ExitConfig(_StrictModel):
                     "above this marks the touch stop's input DEGRADED "
                     "(qual-01/04, R25). Was a data.quality.py code default, "
                     "never config-backed.")
+    thesis_direction_flip_confidence: float = Field(default=0.70, ge=0.50, le=0.99,
+        description="W69: the open-position thesis check exits when the ML "
+                    "direction has flipped against the entry direction with "
+                    "confidence above this. Was a literal 0.70 in "
+                    "orchestrator._check_thesis_valid "
+                    "(iron_condor/iron_butterfly are exempt from the check "
+                    "entirely, so this only steers directional strategies).")
+    thesis_regime_shift_confidence: float = Field(default=0.70, ge=0.50, le=0.99,
+        description="W69: the thesis check treats a regime shift (trending "
+                    "-> high volatility) as invalidating only when the "
+                    "regime classification confidence is above this. Was a "
+                    "literal 0.70 in orchestrator._check_thesis_valid "
+                    "(iron_condor/iron_butterfly are exempt from the check "
+                    "entirely, so this only steers directional strategies).")
+    thesis_vix_spike_pct: float = Field(default=0.30, ge=0.05, le=2.0,
+        description="W69: the thesis check exits when VIX has risen more than "
+                    "this fraction since entry (0.30 = +30%). Was a literal "
+                    "0.30 in orchestrator._check_thesis_valid "
+                    "(iron_condor/iron_butterfly are exempt from the check "
+                    "entirely, so this only steers directional strategies).")
+    order_visibility_grace_seconds: float = Field(default=10.0, ge=5.0, le=60.0,
+        description="W70: a freshly placed EXIT order is ignored by the fill checker "
+                    "while younger than this, so it has time to appear in IBKR's trade "
+                    "list (a brand-new order would otherwise read as cancelled). Was a "
+                    "literal 10 in executor.check_fills. Evaluated on the 30s tick. "
+                    "Floor 5s is an engineering margin, not a measurement: the one "
+                    "acknowledgement we could time took under 1s (2026-09-28, an entry, "
+                    "delayed-data paper); no exit order has been timed yet (see the "
+                    "order_ack_latency log event). Must stay below "
+                    "exit_stop_pending_rest_seconds. IMPACT: too low = a not-yet-visible "
+                    "order is misread as cancelled and the bot re-arms a duplicate "
+                    "close; too high = a genuinely dead order is noticed later.")
+    foreign_exit_escalation_seconds: float = Field(default=300.0, ge=60.0, le=3600.0,
+        description="W70: an exit order that belongs to ANOTHER clientId cannot be "
+                    "cancelled from this session, so once it has been working this long "
+                    "the executor pages the operator instead of looping on a cancel "
+                    "that cannot land. Was a literal 300 in executor.check_fills. "
+                    "Must stay >= exit_pending_rest_seconds: paging before a normal "
+                    "order would even have been cancelled just reports routine slowness. "
+                    "IMPACT: lower = earlier, noisier pages; higher = a stuck "
+                    "cross-session close sits unnoticed longer.")
+    zombie_exit_revert_seconds: float = Field(default=900.0, ge=120.0, le=7200.0,
+        description="W70: the zombie cap. An exit order that is still unresolved this "
+                    "long after placement is checked against the broker and, only if "
+                    "the broker answers and does not list it, the position is reverted "
+                    "CLOSING->FILLED so a fresh exit can fire (otherwise it is held "
+                    "CLOSING and the operator is paged). Was a literal 900 in "
+                    "executor.check_fills. It is evaluated only after the cancel was "
+                    "requested at exit_pending_rest_seconds, so the window between "
+                    "them is how long a cancel is given to resolve; startup requires "
+                    "that window to be at least as long as the longer rest "
+                    "(cap >= 2 x max(exit_pending_rest_seconds, "
+                    "exit_stop_pending_rest_seconds)). IMPACT: too low = re-arms before "
+                    "the real outcome can show (a second close alongside the first: "
+                    "both fill and the condor flips into an inverse structure); too "
+                    "high = a dead order wedges the position in CLOSING longer.")
+
+    @model_validator(mode="after")
+    def _exit_durations_are_ordered(self) -> "ExitConfig":
+        if self.exit_stop_pending_rest_seconds > self.exit_pending_rest_seconds:
+            raise ValueError(
+                f"exit.exit_stop_pending_rest_seconds ({self.exit_stop_pending_rest_seconds}) "
+                f"must not exceed exit.exit_pending_rest_seconds "
+                f"({self.exit_pending_rest_seconds}): a stop exit must be re-priced no "
+                "later than an ordinary one.")
+        if self.order_visibility_grace_seconds >= self.exit_stop_pending_rest_seconds:
+            raise ValueError(
+                f"exit.order_visibility_grace_seconds ({self.order_visibility_grace_seconds}) "
+                f"must be below exit.exit_stop_pending_rest_seconds "
+                f"({self.exit_stop_pending_rest_seconds}): the grace would swallow the rest.")
+        if self.foreign_exit_escalation_seconds < self.exit_pending_rest_seconds:
+            raise ValueError(
+                f"exit.foreign_exit_escalation_seconds ({self.foreign_exit_escalation_seconds}) "
+                f"must be >= exit.exit_pending_rest_seconds ({self.exit_pending_rest_seconds}): "
+                "paging before a normal order would have been cancelled is just noise.")
+        floor = 2 * max(self.exit_pending_rest_seconds, self.exit_stop_pending_rest_seconds)
+        if self.zombie_exit_revert_seconds < floor:
+            raise ValueError(
+                f"exit.zombie_exit_revert_seconds ({self.zombie_exit_revert_seconds}) must be "
+                f">= 2 x the longer rest time = {floor}: the cancel needs at least as long "
+                "to resolve as the order was given to fill, otherwise a fill that is "
+                "merely not yet visible is re-armed as a duplicate close. Raise it, or "
+                "lower exit_pending_rest_seconds / exit_stop_pending_rest_seconds.")
+        return self
+
+
+class LearningAnalyzerConfig(_StrictModel):
+    """W69: the closed-trade analyzer's insight cutoffs (learning/analyzer.py).
+
+    These decide when a pattern in recent closes becomes an insight the
+    adaptor may act on. Minimum-sample counts (3 / 5 trades) stay in code.
+    Defaults are the pre-W69 literals.
+    """
+
+    strategy_poor_win_rate: float = Field(default=0.35, ge=0.05, le=0.60,
+        description="A strategy (>=5 closes) below this win rate gets a "
+                    "disable_<strategy> insight.")
+    strategy_strong_win_rate: float = Field(default=0.65, ge=0.50, le=0.95,
+        description="A strategy (>=5 closes, positive P&L) above this win "
+                    "rate gets a boost_<strategy> insight.")
+    confidence_band_poor_win_rate: float = Field(default=0.40, ge=0.05, le=0.60,
+        description="A confidence band (>=3 closes, negative avg P&L) below "
+                    "this win rate suggests raising min_confidence.")
+    symbol_poor_win_rate: float = Field(default=0.30, ge=0.05, le=0.60,
+        description="A symbol (>=3 closes, negative P&L) below this win rate "
+                    "gets a remove_symbol_<sym> insight.")
+    regime_poor_win_rate: float = Field(default=0.35, ge=0.05, le=0.60,
+        description="A market regime (>=3 closes, negative P&L) below this "
+                    "win rate gets a reduce_trading_in_<regime> insight.")
+    hour_poor_win_rate: float = Field(default=0.30, ge=0.05, le=0.60,
+        description="An entry hour (>=5 closes, negative P&L) below this win "
+                    "rate gets a block_hour_<h> insight.")
+    exit_giveback_threshold: float = Field(default=0.30, ge=0.05, le=1.0,
+        description="Average peak-minus-exit above this (with exit_min_avg_peak) "
+                    "suggests a tighter trailing stop.")
+    exit_min_avg_peak: float = Field(default=0.20, ge=0.0, le=1.0,
+        description="Minimum average peak for the giveback insight to apply.")
+    direction_peak_threshold: float = Field(default=0.05, ge=0.0, le=1.0,
+        description="High-water mark at/above this counts a trade's direction "
+                    "as at least partially correct.")
+    direction_good_accuracy: float = Field(default=0.60, ge=0.50, le=0.95,
+        description="Direction accuracy above this (with "
+                    "direction_exit_problem_rate) blames exit management.")
+    direction_exit_problem_rate: float = Field(default=0.40, ge=0.05, le=0.95,
+        description="Share of correct-direction trades that still lost, above "
+                    "which exit management is flagged.")
+    direction_poor_accuracy: float = Field(default=0.45, ge=0.05, le=0.60,
+        description="Direction accuracy below this flags the model for retrain.")
 
 
 class LearningConfig(_StrictModel):
     enabled: bool = True
     lookback_days: int = Field(default=30, ge=7, le=180)
-    max_adaptations_per_cycle: int = Field(default=3, ge=1, le=10)
+    max_adaptations_per_cycle: int = Field(default=3, ge=1, le=10,
+        description="W69: now actually read — LearningEngine builds its "
+                    "AdaptationLimits from these four keys (they were "
+                    "silently ignored; the dataclass defaults ran instead).")
     min_insight_confidence: float = Field(default=0.60, ge=0.40, le=0.95)
     min_confidence_floor: float = Field(default=0.50, ge=0.40, le=0.80)
     min_confidence_ceiling: float = Field(default=0.90, ge=0.70, le=0.99)
+    analyzer: LearningAnalyzerConfig = LearningAnalyzerConfig()
     paper_trading_mode: bool = Field(
         default=False,
         description=(
@@ -850,8 +1721,31 @@ class NotificationsConfig(_StrictModel):
 
 
 class DashboardConfig(_StrictModel):
-    enabled: bool = True
-    port: int = Field(default=8501, ge=1024, le=65535)
+    enabled: bool = Field(default=True,
+        description="W69: now read by the supervisor — false skips launching "
+                    "the Streamlit analytics dashboard (and its health-check "
+                    "respawn). It did nothing before. The log viewer and "
+                    "status page are separate and unaffected.")
+    port: int = Field(default=8501, ge=1024, le=65535,
+        description="W69: the Streamlit analytics dashboard port, read by "
+                    "orchestration/master.py. It was hardcoded 8501 there and "
+                    "this key was silently ignored.")
+    weblog_port: int = Field(default=8502, ge=1024, le=65535,
+        description="W69: the web_logs.py log-viewer port (was a literal in "
+                    "web_logs.py and master.py).")
+    status_port: int = Field(default=8503, ge=1024, le=65535,
+        description="W69: the status_server.py live-status/scorecard port "
+                    "(was a literal in status_server.py and master.py).")
+
+    @model_validator(mode="after")
+    def _ports_are_distinct(self) -> "DashboardConfig":
+        ports = {"port": self.port, "weblog_port": self.weblog_port,
+                 "status_port": self.status_port}
+        if len(set(ports.values())) != len(ports):
+            raise ValueError(
+                f"dashboard ports must be distinct (three local servers share one "
+                f"host): {ports}")
+        return self
 
 
 class LoggingConfig(_StrictModel):
@@ -901,6 +1795,133 @@ class SizingProbeConfig(_StrictModel):
                     "floor instead of the cap grid.")
 
 
+class ParityConfig(_StrictModel):
+    """W72: tolerances for the research-vs-reality parity replay.
+
+    ``scripts/parity_replay.py`` runs known real trades (the operator's manual
+    trades plus the bot's own fills) through the research engine's pricing code
+    and compares modelled entry credit / exit value with what actually filled.
+    These numbers decide whether a DTE band's research is trustworthy enough to
+    run an Optuna study on, so they live in config (research overlay), not in
+    the script. A band that fails is reported FAIL; a band with fewer trades
+    than ``min_trades_per_band`` is reported INSUFFICIENT, never PASS.
+    """
+
+    credit_error_pct_max: float = Field(default=0.15, gt=0.0, le=1.0,
+        description="Median |modelled - actual| entry credit, as a fraction of "
+                    "the actual credit, above which a DTE band FAILS parity. "
+                    "Default 0.15: a condor credit that is 15% off is already "
+                    "the size of the edge at 1-2 DTE (credits there are 8-25% "
+                    "of wing width). Operator-owned; tighten it as the model "
+                    "improves.")
+    credit_bias_pct_max: float = Field(default=0.10, gt=0.0, le=1.0,
+        description="|median signed error| / actual credit above which a band "
+                    "FAILS. Separate from the spread check on purpose: a model "
+                    "that is consistently 8% rich passes the spread test and "
+                    "still manufactures a fake edge in every study.")
+    min_trades_per_band: int = Field(default=3, ge=1, le=1000,
+        description="A DTE band with fewer closed trades than this is reported "
+                    "INSUFFICIENT instead of PASS/FAIL. The replay set is small "
+                    "(tens of trades), so small bands are common and a verdict "
+                    "on two trades would be noise presented as a result.")
+    dte_band_upper_edges: list[int] = Field(default=[2, 7, 14, 45],
+        description="Inclusive upper edges (calendar DTE at entry) of the "
+                    "parity bands: [2, 7, 14, 45] gives 0-2, 3-7, 8-14, 15-45 "
+                    "and a trailing 46+ catch-all. Matches the DTE regimes "
+                    "whose pricing and friction assumptions differ most.")
+
+    @field_validator("dte_band_upper_edges")
+    @classmethod
+    def _edges_strictly_ascending(cls, v: list[int]) -> list[int]:
+        if not v or any(e < 0 for e in v) or any(b <= a for a, b in zip(v, v[1:])):
+            raise ValueError("dte_band_upper_edges must be non-empty, >= 0 and strictly ascending")
+        return v
+
+
+class DataCollectionConfig(_StrictModel):
+    """W76: scheduled data collection run by the SUPERVISOR (research data only).
+
+    The short-DTE friction collector (``scripts/calibrate_option_spreads.py --source ib-bars
+    --short-dte``) must run once per RTH session, after the close, and IB keeps nothing for an
+    expired contract, so a day nobody runs it is a day of data lost for good. With
+    ``short_dte_enabled`` the supervisor runs it itself on weekdays. It only requests
+    historical bid/ask bars: no orders, a separate client id, no interaction with the bot.
+    Default OFF: enable it after one successful manual ``--dry-run`` (docs/RUNBOOK.md).
+    """
+
+    short_dte_enabled: bool = Field(default=False,
+        description="Run the 0-6 DTE friction collector from the supervisor on weekdays. The "
+                    "supervisor and TWS/Gateway must be running at that time; a day the box is "
+                    "off is skipped (nothing is lost but the day). Takes effect at the next "
+                    "supervisor restart (a process runs on the settings it started with).")
+    short_dte_time_et: str = Field(default="15:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$",
+        description="ET wall-clock time of the daily run, HH:MM. MEASURED 2026-10-13: once the "
+                    "session ends IB no longer serves that day's expiring contracts, so a run "
+                    "after the close can never capture DTE 0 (a 16:10 run listed expiries from "
+                    "the NEXT day). 15:30 is late enough that the entry window's last bar "
+                    "(14:30-15:30) has ended, so one run holds the whole expiry day, and early "
+                    "enough that the DTE-0 contracts (requested first, ~6 minutes) are done "
+                    "~20 minutes before the close even if the start is delayed. Running later "
+                    "adds no bar (the 15:30 bar is outside the entry window).")
+    short_dte_symbols: list[str] = Field(default=["QQQ"], min_length=1, max_length=5,
+        description="Underlyings to collect. Each costs ~30-55 minutes at IB's historical-data "
+                    "pacing (60 requests per 10 minutes), run sequentially.")
+    short_dte_client_id: int = Field(default=91, ge=1, le=999_999,
+        description="IB API client id for the collector. Must differ from IBKR_CLIENT_ID and its "
+                    "fallback ladder (base+100..base+104); the job refuses to run otherwise.")
+    short_dte_max_dte: int = Field(default=6, ge=1, le=14,
+        description="Furthest expiry (days) to sample. 6 matches the friction bands (0-2, 3-6).")
+    short_dte_duration: str = Field(default="7 D", pattern=r"^\d{1,3} [DW]$",
+        description="History requested per contract. A contract's last week is all a 0-6 DTE "
+                    "sample can come from, so 7 D is enough; re-sampled bars are free "
+                    "(INSERT OR IGNORE).")
+    lifecycle: bool = Field(default=False,
+        description="W82: capture each contract's LIFE instead of 'every contract <= "
+                    "short_dte_max_dte, every day'. Stage A = expiring today..+"
+                    "lifecycle_expiring_days (the perishable part, DTE 0 first); stage B = "
+                    "far-listed expiries at 15-21 DTE whose DTE 31-45 tail is not stored, capped "
+                    "per run. Each request asks lifecycle_duration of hourly bars, so a run also "
+                    "recovers the preceding month. About 20-35 minutes a day versus 72-108 for "
+                    "0-14 / 0-45 DTE every day, and every contract is downloaded about twice in "
+                    "its life instead of 5-11 times (PLAN.md 2026-10-16 design). Default off: "
+                    "the original behaviour. short_dte_max_dte is ignored when on.")
+    lifecycle_duration: str = Field(default="30 D", pattern=r"^\d{1,3} [DW]$",
+        description="History requested per contract in lifecycle mode. 30 D is what IB serves "
+                    "for hourly BID/ASK bars of a listed option (the all-DTE sampler has used it "
+                    "since W66).")
+    lifecycle_expiring_days: int = Field(default=1, ge=0, le=5,
+        description="Stage A covers expiries today..today+N. 1 (default) means every contract "
+                    "is requested on its last day AND the day before, so one missed day costs "
+                    "at most that day's bars.")
+    lifecycle_thin_every: int = Field(default=5, ge=1, le=10,
+        description="Plan strikes from every Nth session of the underlying's path. MEASURED "
+                    "2026-10-15 on the QQQ chain: 5 gives about 55 contracts per expiry, 3 about "
+                    "80, 1 about 140 (each costs ~22 s at IB's pacing).")
+    lifecycle_incremental_sessions: int = Field(default=3, ge=1, le=10,
+        description="An expiry captured before (typically the day before) is planned over its "
+                    "newest N sessions only, unthinned: its last day adds little else, so the "
+                    "second capture costs about a third of the first.")
+    lifecycle_max_far_contracts: int = Field(default=120, ge=0, le=400,
+        description="Stage-B contract cap per run (120 is about 43 minutes at IB's pacing); "
+                    "the first owed expiry is always taken so a backlog drains, the rest is "
+                    "deferred to the next run.")
+    short_dte_timeout_minutes: int = Field(default=150, ge=10, le=600,
+        description="Hard wall-clock cap for one run; the job kills the process after this.")
+    short_dte_idle_minutes: int = Field(default=20, ge=2, le=120,
+        description="Kill the run if it prints nothing for this long (progress is printed every "
+                    "10 contracts, about 3.6 minutes apart, so silence means a hang).")
+
+    @field_validator("short_dte_symbols")
+    @classmethod
+    def _symbols_are_tickers(cls, v: list[str]) -> list[str]:
+        out = [x.strip().upper() for x in v]
+        if any(not re.fullmatch(r"[A-Z][A-Z0-9.]{0,5}", x) for x in out):
+            raise ValueError(f"short_dte_symbols must be tickers, got {v}")
+        if len(set(out)) != len(out):
+            raise ValueError("short_dte_symbols must not repeat a ticker")
+        return out
+
+
 class IBKREnvConfig(BaseSettings):
     """IBKR connection settings from environment variables."""
 
@@ -929,10 +1950,12 @@ class Settings(_StrictModel):
     trading: TradingConfig = TradingConfig()
     account: AccountConfig = AccountConfig()
     positions: PositionConfig = PositionConfig()
+    position_sizing: PositionSizingConfig = PositionSizingConfig()
     risk: RiskConfig = RiskConfig()
     options: OptionsConfig = OptionsConfig()
     backtest: BacktestConfig = BacktestConfig()
     ml: MLConfig = MLConfig()
+    regime: RegimeConfig = RegimeConfig()
     meta_label: MetaLabelConfig = MetaLabelConfig()
     earnings: EarningsConfig = EarningsConfig()
     dividends: DividendConfig = DividendConfig()
@@ -945,10 +1968,78 @@ class Settings(_StrictModel):
     dashboard: DashboardConfig = DashboardConfig()
     logging: LoggingConfig = LoggingConfig()
     sizing_probe: SizingProbeConfig = SizingProbeConfig()
+    parity: ParityConfig = ParityConfig()  # W72: research-vs-reality replay tolerances
+    data_collection: DataCollectionConfig = DataCollectionConfig()  # W76: supervisor-run collection
 
     # Loaded from environment
     ibkr: IBKREnvConfig = IBKREnvConfig()
     api_keys: APIKeysConfig = APIKeysConfig()
+
+    @model_validator(mode="after")
+    def _per_trade_knobs_are_linked(self) -> "Settings":
+        """W64: link the two live per-trade knobs (registered W25 ADDENDUM / W31 A3).
+
+        risk.max_position_risk_pct funds the condor builder and gate 6b;
+        positions.max_position_pct is the position sizer's hard cap. For a
+        defined-risk condor both bound the SAME number (one structure's max
+        loss), at different layers. If the gate cap exceeds the sizer cap, gate
+        6b passes a structure the sizer then refuses with 0 contracts, one
+        routine-looking verdict at a time, and entries brick silently. A startup
+        error is the same philosophy as extra="forbid"; the coherence check's A3
+        arm stays as the runtime guard.
+        """
+        if self.positions.max_position_pct < self.risk.max_position_risk_pct:
+            raise ValueError(
+                f"positions.max_position_pct ({self.positions.max_position_pct}) must be "
+                f">= risk.max_position_risk_pct ({self.risk.max_position_risk_pct}): the "
+                "sizer's cap would refuse structures the risk gate passes (W64 link)")
+        return self
+
+
+def resolve_position_size_pct(explicit, settings) -> float:
+    """W64: the per-trade budget fraction research uses.
+
+    explicit arg > backtest.position_size_pct (a deliberate sizing study) >
+    risk.max_position_risk_pct (what live funds the builder with) >
+    RiskConfig's own default. `settings` may be None or a partial test stub.
+    """
+    if explicit is not None:
+        return float(explicit)
+    bt = getattr(settings, "backtest", None)
+    if bt is not None and getattr(bt, "position_size_pct", None) is not None:
+        return float(bt.position_size_pct)
+    rk = getattr(settings, "risk", None)
+    if rk is not None and getattr(rk, "max_position_risk_pct", None) is not None:
+        return float(rk.max_position_risk_pct)
+    return float(RiskConfig().max_position_risk_pct)
+
+
+def resolve_max_contracts_per_trade(explicit, settings) -> int:
+    """W64: live's hard per-trade contract cap (positions.max_contracts_per_trade)."""
+    if explicit is not None:
+        return int(explicit)
+    pos = getattr(settings, "positions", None)
+    if pos is not None and getattr(pos, "max_contracts_per_trade", None) is not None:
+        return int(pos.max_contracts_per_trade)
+    return int(PositionConfig().max_contracts_per_trade)
+
+
+def resolve_dashboard_port(field: str, cli_port: int | None = None) -> int:
+    """W69: the port a dashboard child process (web_logs.py, status_server.py) binds.
+
+    explicit `--port` from the supervisor > config.yaml dashboard.<field> >
+    DashboardConfig's own default. The supervisor passes --port from ITS frozen
+    settings, so what it logs and health-checks is always what the child binds
+    even if config.yaml was edited after the supervisor started. Run standalone
+    (no --port) the script reads the file itself.
+    """
+    settings = None
+    if cli_port is None:
+        try:
+            settings = load_settings()
+        except Exception:  # noqa: BLE001 — a broken file must not stop a log viewer
+            settings = None
+    return int(resolve_config_value(cli_port, "dashboard", field, DashboardConfig, settings))
 
 
 def resolve_config_value(explicit, section: str, field: str, fallback_cls, settings):
@@ -1011,9 +2102,30 @@ def freeze_settings(settings: "Settings") -> None:
     _FROZEN = settings.model_copy(deep=True)
 
 
-def load_settings(config_path: str | Path = "config.yaml") -> Settings:
-    """Load settings from YAML file, with env var overrides for secrets."""
-    if _FROZEN is not None:
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """Overlay wins key by key; nested mappings merge, everything else (lists, scalars, an
+    explicit null) replaces. Returns a new dict."""
+    out = dict(base)
+    for k, v in overlay.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_settings(config_path: str | Path = "config.yaml",
+                  overlay_path: str | Path | None = None,
+                  *, ignore_frozen: bool = False) -> Settings:
+    """Load settings from YAML file, with env var overrides for secrets.
+
+    W68: `overlay_path` (research only, see ait/config/research.py) is deep-merged OVER the base file
+    before validation, so an overlay key the schema does not know is a startup error exactly like a
+    typo in config.yaml (extra="forbid"), and a later live change in the base flows into research.
+    `ignore_frozen` reads the file(s) even when a process-wide snapshot exists: the research parity
+    manifest uses it to show what the LIVE bot's config.yaml says next to the research overlay.
+    """
+    if _FROZEN is not None and not ignore_frozen:
         return _FROZEN.model_copy(deep=True)
     config_path = Path(config_path)
 
@@ -1028,6 +2140,19 @@ def load_settings(config_path: str | Path = "config.yaml") -> Settings:
         )
     with open(config_path) as f:
         yaml_data = yaml.safe_load(f) or {}
+    if overlay_path is not None:
+        overlay_path = Path(overlay_path)
+        if not overlay_path.exists():
+            raise FileNotFoundError(
+                f"Research overlay not found: {overlay_path.resolve()} -- refusing to run "
+                "research on the live config by accident.")
+        with open(overlay_path) as f:
+            overlay = yaml.safe_load(f) or {}
+        for forbidden in ("ibkr", "api_keys"):
+            if forbidden in overlay:
+                raise ValueError(f"the research overlay may not set {forbidden!r} (secrets "
+                                 "come from the environment only)")
+        yaml_data = _deep_merge(yaml_data, overlay)
 
     # IBKR and API keys come from environment only
     yaml_data["ibkr"] = IBKREnvConfig().model_dump()
@@ -1035,7 +2160,71 @@ def load_settings(config_path: str | Path = "config.yaml") -> Settings:
 
     settings = Settings.model_validate(yaml_data)
     _report_default_divergence(settings)
+    _report_fixed_limits()
+    _report_order_timeline(settings)
     return settings
+
+
+def _report_order_timeline(settings: "Settings") -> None:
+    """W70: log the EFFECTIVE order-lifecycle durations, tunable and fixed, in one event.
+
+    The timeline is spread across two config sections and a few fixed values; this
+    puts the whole picture in one log line so nobody has to reconstruct it. Never
+    blocks startup.
+    """
+    try:
+        from ait.config.invariants import BROKER_SNAPSHOT_TTL_SECONDS
+        from ait.utils.cadence import FAST_MONITOR_CADENCE_SECONDS
+        from ait.utils.logging import get_logger  # lazy: keep settings import-light
+        ex, po = settings.exit, settings.positions
+        get_logger("config.settings").info(
+            "order_timeline_in_effect",
+            fast_monitor_tick_seconds=FAST_MONITOR_CADENCE_SECONDS,
+            fixed={"broker_snapshot_ttl_seconds": BROKER_SNAPSHOT_TTL_SECONDS},
+            exit_order={
+                "order_visibility_grace_seconds": ex.order_visibility_grace_seconds,
+                "exit_stop_pending_rest_seconds": ex.exit_stop_pending_rest_seconds,
+                "exit_pending_rest_seconds": ex.exit_pending_rest_seconds,
+                "exit_band_ttl_seconds": ex.exit_band_ttl_seconds,
+                "foreign_exit_escalation_seconds": ex.foreign_exit_escalation_seconds,
+                "zombie_exit_revert_seconds": ex.zombie_exit_revert_seconds,
+            },
+            entry_order={
+                "entry_ladder_step_seconds": po.entry_ladder_step_seconds,
+                "partial_fill_cancel_seconds": po.partial_fill_cancel_seconds,
+                "absent_order_grace_seconds": po.absent_order_grace_seconds,
+                "entry_order_timeout_seconds": po.entry_order_timeout_seconds,
+            },
+            note="each age is evaluated on the fast-monitor tick, so a duration under "
+                 "the tick takes effect at the next tick. Meaning of each: docs/RUNBOOK.md "
+                 "'Order lifecycle timeline'.",
+        )
+    except Exception:  # noqa: BLE001 — diagnostics must never block startup
+        pass
+
+
+def _report_fixed_limits() -> None:
+    """W70: log the limits that are deliberately NOT configurable, once per load.
+
+    Sits beside `config_default_divergence` so a log reader sees both halves of
+    "what the system will do": the tunables that differ from code defaults, and
+    the fixed limits no config edit can change. Source of truth and the reason
+    each one is fixed: ait/config/invariants.py (and docs/RUNBOOK.md, which a drift
+    test keeps in step). Like its sibling it can never block startup.
+    """
+    try:
+        from ait.config.invariants import invariant_values
+        from ait.utils.logging import get_logger  # lazy: keep settings import-light
+        limits = invariant_values()
+        get_logger("config.settings").info(
+            "fixed_limits_in_effect",
+            count=len(limits),
+            limits=limits,
+            note="fixed in code on purpose (ait/config/invariants.py); not set by "
+                 "config.yaml or .env. Why each is fixed: docs/RUNBOOK.md 'Fixed limits'.",
+        )
+    except Exception:  # noqa: BLE001 — diagnostics must never block startup
+        pass
 
 
 # R19 (user audit): the SECOND shadowing layer, after the env contract.

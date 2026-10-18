@@ -92,8 +92,12 @@ class TestEveryCronTriggerHasATimezone:
         moving every call out of `main`, when the guard above stayed
         (vacuously) green on its own."""
         # 10 since 2026-09-29: + shared_logs_publish (16:45 ET, shared_logs.py).
+        # 11 since W70 follow-up: + shared_logs_fetch (16:50 ET, 5 min after the publish).
+        # 12 since W76: + short_dte_collection (CONDITIONAL on data_collection.short_dte_enabled,
+        #    default off, so the runtime job-id set below is unchanged by default; the call site
+        #    exists and carries timezone=ET, which this scan checks).
         count = len(self._crontrigger_calls())
-        assert count == 10, f"expected 10 CronTrigger(...) sites, found {count}"
+        assert count == 12, f"expected 12 CronTrigger(...) sites, found {count}"
 
     def test_the_scan_does_not_depend_on_which_function_holds_the_calls(self):
         """Anti-vacuity for the anti-vacuity fix itself. Not a source-string
@@ -186,6 +190,7 @@ class TestCronJobsActuallyResolveToET:
             "digest_am", "digest_pm", "daily_report", "weekly_backtest",
             "monthly_cleanup", "daily_log_rotation",
             "shared_logs_publish",   # 2026-09-29
+            "shared_logs_fetch",     # W70 follow-up: 16:50 ET, 5 min after the publish
         }
 
     def test_without_the_fix_it_would_have_used_the_host_zone(self):

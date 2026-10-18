@@ -12,6 +12,7 @@ from datetime import date, timedelta
 import numpy as np
 import pandas as pd
 
+from ait.config.settings import RiskConfig
 from ait.data.cache import TTLCache
 from ait.utils.logging import get_logger
 
@@ -62,10 +63,18 @@ class CorrelationGuard:
 
     def __init__(
         self,
-        max_correlation: float = 0.75,
+        max_correlation: float | None = None,
         lookback_days: int = 60,
-        max_correlated_positions: int = 2,
+        max_correlated_positions: int | None = None,
     ) -> None:
+        # W69: None -> RiskConfig's own defaults (0.75 / 2), the single source.
+        # This signature carried second copies of both numbers. The
+        # orchestrator passes the configured values explicitly.
+        _rc = RiskConfig()
+        if max_correlation is None:
+            max_correlation = _rc.max_correlation
+        if max_correlated_positions is None:
+            max_correlated_positions = _rc.max_correlated_positions
         self._max_corr = max_correlation
         self._lookback = lookback_days
         # Max positions correlated above the threshold allowed at once. Set to

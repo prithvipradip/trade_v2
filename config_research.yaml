@@ -1,0 +1,137 @@
+# AIT v2 — RESEARCH OVERLAY (W68, 2026-10-10).
+#
+# Deep-merged OVER config.yaml by RESEARCH entry points only (ait.config.research.use_research_config:
+# run_backtest.py, run_optimizer.py, scripts/friction_sensitivity.py, scripts/gate_study.py). The live
+# bot (ait.main) and the supervisor never load it. It holds ONLY the keys that differ from config.yaml,
+# so (a) this file IS the research-vs-live difference, and (b) a later live change in config.yaml flows
+# into research automatically. Unknown keys are a startup error (the schema is extra="forbid").
+#
+# Keep every research change on this branch HERE, with its provenance comment. config.yaml differs from
+# main only by the five operator-chosen live risk/capital lines (account.capital, simulate_live_capital,
+# risk.max_daily_loss_pct, risk.breaker_to_max_loss_ratio, risk.max_position_risk_pct) plus the removal of
+# backtest.initial_capital (the field no longer exists: capital lives at account.capital).
+
+backtest:
+  position_size_pct: null              # W64: null -> risk.max_position_risk_pct (what live funds the
+                                       # builder with), so research cannot drift from live. main has 0.05.
+  budget_aware_wings: true             # W64: research condor builder caps the wing to the budget like live
+                                       # (IronCondor.affordable_width, $1 floor when capped) and rejects a
+                                       # structure whose max loss exceeds the budget.
+
+  # --- W65: research history (IB-sourced research_* tables; live tables are never written) ---
+  history_start_date: 2024-01-01       # first day of the operator's economic-calendar CSV, so the research
+                                       # macro gate is ON in every window. Wins over history_days.
+  history_days: 1826                   # legacy fallback span (no start date)
+  research_table_prefix: research_
+  vlmc_min_coverage: 0.95              # 5-min day coverage required to train with VLMC/intraday-fractal features
+  macro_event_types: [FOMC, CPI, NFP, PCE, GDP]   # = live's five, for parity
+
+  # --- W66: selector + friction model v2 ---
+  condor_any_direction: false          # 2026-10-10 operator decision: keep OFF. Research keeps the NEUTRAL-only
+                                       # selector because the neutral/bearish/bullish direction models are what
+                                       # is being improved next; revisit once they are.
+  friction_model: per_leg_usd          # fitted $/leg half-spread, entry AND exit (legacy % overcharged a $0.95-credit
+                                       # QQQ condor $0.669 vs ~$0.085 measured). Missing fit -> legacy + WARNING.
+  friction_entry_capture: 1.0          # share of the quoted half-spread paid per leg at entry (1.0 = full, conservative)
+  friction_exit_capture: 1.0           # ... and at exit; lower only from the fill-vs-model report
+  friction_stress_multiplier: 1.0      # scales the fitted model (calm-regime sample hedge)
+
+  # --- W79a: operator decisions of 2026-10-12 (D1, D8) ---
+  engine_model: realistic              # D1: the research engine at live fidelity: fill-time spot, previous-session IV and
+                                       # DECISION FRAME (W78), listed session expiries, fractional time, same-session
+                                       # exits, touch stops, expiry settlement / assignment gap (W77), concurrency at the
+                                       # fill (W78). Evidence: PLAN W74, W77, W78. Default research numbers recorded before
+                                       # this date are superseded (assumption A10). The legacy engine stays byte-identical.
+  friction_short_dte: true             # D8: a 0-6 DTE leg is charged at least the $0.01 floor until its band has 15
+                                       # collected sessions (W76); a band with its own fit then switches to it. Before the
+                                       # flip the fitted all-DTE model was EXTRAPOLATED below 11 DTE.
+                                       # pricing_source stays bs_legacy: D2 waits for the option-bar backfill.
+
+  # --- W71c: the IV-rank RISE veto is OFF in research (operator decision D9, 2026-10-13) ---
+  iv_rank_rise_gate: false             # WHAT: research-only veto. Blocks a neutral credit entry when the FeatureEngine
+                                       #   iv_rank (a REALIZED-vol range rank, 0-1) rose by more than
+                                       #   backtest.iv_rank_rise_threshold (0.30) over 10 rows.
+                                       # WHY OFF: live has NO such veto (it gates on the stored-IV percentile LEVEL: condor
+                                       #   floor 15, credit cap 85, ait.data.iv_rank). The research series is a weak proxy of
+                                       #   that rank (Spearman 0.46-0.63; opposite side of live's floor/cap on 34-42% of
+                                       #   days); 45-58% of the days it blocks live already refuses; the rest (4.5-5.4% of
+                                       #   tradeable days) are days live WOULD trade. A/B on the realistic engine: it removes
+                                       #   3-6 trades per symbol and is slightly negative (inside the noise). PLAN.md W71.
+                                       # WHAT WAS KEPT: the code, the threshold (0.30) and its 0.25-0.60 search range, and the
+                                       #   per-entry record `iv_rank_rise_10d`. Only the veto is off; while it is off the
+                                       #   optimizer does not search the threshold (a searched value would re-enable it).
+                                       # RE-ENABLE BAR: only if a MULTI-WINDOW walk-forward with the gate ON vs OFF (the same
+                                       #   windows, engine, pricing and friction; scripts/iv_rank_parity_probe.py --ab is the
+                                       #   starting tool) shows an OUT-OF-SAMPLE gain, beyond the window-to-window noise, on
+                                       #   days live's level gates (floor 15 / cap 85) would have TRADED. A gain that appears
+                                       #   only on days live already refuses is not evidence for it.
+                                       # IF IT EARNS ITS PLACE: set true here AND port it to live (a W80-class change), so
+                                       #   research does not keep a gate the bot lacks. Until then: research-only, off.
+
+  # --- W81: the trending-down REGIME veto (research-only; switch built, operator decision D10 OPEN) ---
+  # regime_veto_gate: true             # NOT SET HERE ON PURPOSE: the schema default (true) applies, so nothing moves.
+                                       # WHAT: research-only veto. Blocks a neutral credit entry when 5-day realized vol
+                                       #   exceeds 20-day (vol_regime_expanding) AND price is more than 5% below its 20-day
+                                       #   SMA (backtest.regime_down_threshold). Live has NO such entry veto: its regime
+                                       #   class feeds only the direction override, the meta-label features and roll
+                                       #   defense. The comment that introduced it records "4 trending_down trades, 25% win
+                                       #   rate" (Exp 21), i.e. a 4-trade evidence base.
+                                       # MEASURED (W81, scripts/gate_parity_ab.py, realistic engine, 2024-01..2026-10, 1
+                                       #   contract): the veto REACHED the engine on 0 days for QQQ (entry DTE 1, 3, 7, 14)
+                                       #   and SPY (DTE 14) and on 3 days for IWM at every DTE tried: the position-slot and
+                                       #   IV-rank gates sit in front of it. It moves IWM by between -$79 and +$109 (DTE 7
+                                       #   vs 14; 3 trades) and nothing else. Inert, not shown useful.
+                                       # TO TURN IT OFF: set regime_veto_gate: false here (code, thresholds and the per-entry
+                                       #   class record are kept; a suppressed day is flagged regime_veto_suppressed). The bar
+                                       #   to KEEP it is the D9 bar: an out-of-sample gain on days live would have traded.
+                                       #   Re-run scripts/gate_parity_ab.py if the gate order, the IV-rank cap or the entry DTE
+                                       #   range changes (the gates only matter on days that reach them).
+                                       # SAME FILE, SAME QUESTION: max_entry_vol_annual (the realized-vol cap, 0.80) and the
+                                       #   live-only VIX halt (risk.credit_vix_halt) are the other two one-sided entry gates;
+                                       #   both were also inert in that A/B (0 days gated; 0 trades on VIX >= 28 days).
+
+  # --- W84: live's ex-dividend ENTRY block, research twin (operator decisions 2026-10-16) ---
+  ex_div_entry_gate: live              # WHAT: refuse a new position that SELLS A CALL when an ex-dividend date falls in
+                                       #   [entry, expiry]: live's W51 block (orchestrator trade_blocked_ex_div), which
+                                       #   exists because a short call can be assigned early the day before an ex-date.
+                                       # WHY LIVE: parity. Live refuses 14-17% of sessions this way (SPY / QQQ / IWM,
+                                       #   2024-01..2026-10, entry DTE 14); before W84 research traded those days and
+                                       #   earned 22-39% of its reference P&L on them (PLAN.md 2026-10-16 finding).
+                                       # MODES: off | live (ONE projected ex-date, dividends.project_next_ex_div over the
+                                       #   ex-dates known before the entry day: exactly live's rule) | exact (any real
+                                       #   ex-date in the window) | last_k_days (a real ex-date within
+                                       #   backtest.ex_div_entry_k_days, default 5, of expiry: the F2 candidate).
+                                       # DATA: research_dividends (scripts/backfill_dividends.py); any mode but off raises
+                                       #   without it, so the gate can never be silently inert.
+                                       # MEASURED: scripts/ex_div_gate_ab.py, recorded in the W84 AS BUILT PLAN entry.
+                                       # TO CHANGE: a study may pass another mode; changing the default here needs a PLAN
+                                       #   entry. If live's rule changes (F2 / F3), change this mode with it.
+
+  # --- W67: gate parity + graded objective ---
+  gates_mode: enforce                  # 2026-10-10 operator decision: ML gates ON in RESEARCH (range floor + fractal veto
+                                       # block) so the models being improved actually matter in studies. Live stays
+                                       # ml.entry_gates_enabled=false (observe) — a DELIBERATE research-vs-live deviation
+                                       # that the run_backtest parity manifest will show. `observe` reproduces live today.
+  fractal_veto_spread: 0.0             # absolute hurst spread veto for neutral structures (0 = off = live today)
+  penalty_on_range_prob: 0.0           # fractal penalty also lowers P(in range) (0 = off = live today)
+  optimize_hard_min_trades: 3          # below this a trial scores on the graded floor (not a flat -100)
+  optimize_below_floor_gradient: 20.0  # -100 (0 trades) rising toward -80; 0 restores the flat -100
+
+  # --- W68: IV-rank parity (research up to date with live) ---
+  iv_rank_gate: true                   # live's two IV-RANK gates on credit entries: condor refuses rank < ic_iv_rank_floor
+                                       # (15, backtest.ic_iv_rank_floor) and the risk manager refuses rank > risk.iv_rank_cap
+                                       # (85); unmeasurable rank fails closed. Shared definition: ait.data.iv_rank.
+  iv_floor: 0.05                       # the schema minimum. The absolute-level floor (main: 0.20) was research's ONLY IV gate
+                                       # and also floored leg IVs when pricing: left at 0.20 it would price a 12%-IV SPY
+                                       # day at 20% (fat fake credits) now that the rank gate lets such days trade. Demoted
+                                       # to a pricing sanity floor; live has no level gate.
+
+# --- W72: parity replay tolerances (scripts/parity_replay.py; schema: ParityConfig) ---
+# Research-only: decides whether a DTE band's research can be trusted before an Optuna study is run on it.
+# Values equal the schema defaults ON PURPOSE: this block is the operator-visible, editable home of the
+# thresholds (assumption A6 of the 2026-10-11 short-DTE programme). It does not shadow a live key.
+parity:
+  credit_error_pct_max: 0.15           # median |modelled - actual| entry credit / actual credit, per DTE band
+  credit_bias_pct_max: 0.10            # |median signed error| / actual credit, per DTE band
+  min_trades_per_band: 3               # fewer closed trades than this => INSUFFICIENT, never PASS
+  dte_band_upper_edges: [2, 7, 14, 45] # 0-2, 3-7, 8-14, 15-45, 46+

@@ -114,10 +114,10 @@ class TestMtmHaltClears:
 class TestSessionAccountResolution:
     def test_session_wins_over_config(self):
         assert IBKRClient._resolve_session_account(
-            ["U21959335"], "DUN603821") == "U21959335"
+            ["U0000002"], "DU0000001") == "U0000002"
 
     def test_config_only_when_session_empty(self):
-        assert IBKRClient._resolve_session_account([], "DUN603821") == "DUN603821"
+        assert IBKRClient._resolve_session_account([], "DU0000001") == "DU0000001"
 
     def test_unknown_when_nothing(self):
         assert IBKRClient._resolve_session_account([], None) == "unknown"
@@ -246,8 +246,10 @@ class TestCommissionTrueUp:
               "exit_price": 0.74}
         await orch._process_completed_exits([ex])
         state.update_trade_realized_pnl.assert_not_called()
-        state.set_state.assert_any_call("trueup_pending_T-Y",
-                                        date.today().isoformat())
+        # W71b: the marker carries the ET date (the host's is tomorrow from 18:00 ET on a
+        # CEST host); this assertion read the host date and began failing after midnight host time.
+        from ait.utils.time import today_et
+        state.set_state.assert_any_call("trueup_pending_T-Y", today_et().isoformat())
 
     def test_estimate_is_all_in_and_leg_proportional(self):
         """RENAMED from test_estimate_formula_unchanged (R24

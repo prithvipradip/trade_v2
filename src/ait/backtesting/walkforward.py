@@ -27,11 +27,13 @@ import pandas as pd
 
 from ait.backtesting.engine import Backtester
 from ait.backtesting.learner import BacktestLearner
+from ait.backtesting.range_bank import RangeModelBank
 from ait.backtesting.result import BacktestResult
 from ait.config.settings import MLConfig
 from ait.ml.ensemble import DirectionPredictor
 from ait.strategies.base import SignalDirection
 from ait.utils.logging import get_logger
+from ait.utils.time import today_et
 
 
 # R12-C: _range_model_worker (spawn-isolated GARCH/MS-GARCH/OU training) was
@@ -53,11 +55,43 @@ class WalkForwardConfig:
                                  # triple-counting trades in pooled metrics and
                                  # compounding overlapping windows in total_return)
     gap_days: int = 5            # Purge gap between train and test
-    initial_capital: float = 100_000.0
+    # W-capital: TOTAL starting equity, ONE shared pool across all symbols.
+    # None -> __post_init__ resolves config.yaml account.capital via
+    # runtime_env.research_capital() (was a 100_000 literal; BT-H3 gave every
+    # symbol its own full-capital sleeve, superseded by the pool allocator).
+    initial_capital: float | None = None
     commission_per_contract: float = 0.65
     slippage_pct: float = 0.03  # 3% realistic for multi-leg options
-    position_size_pct: float = 0.05
-    wing_floor_dollars: float = 2.0   # R6 parity: live iron_condor min wing is $2, not $5
+    # W64: None -> resolve_position_size_pct: backtest.position_size_pct if a
+    # sizing study set one, else risk.max_position_risk_pct (live's per-trade
+    # budget). Was a 0.05 literal while live funded 0.0133-0.03.
+    position_size_pct: float | None = None
+    # W64 live parity: cap the condor wing to the per-trade budget like live,
+    # and cap contracts per trade at positions.max_contracts_per_trade (live: 1).
+    # None -> config (backtest.budget_aware_wings / positions.max_contracts_per_trade).
+    budget_aware_wings: bool | None = None
+    max_contracts_per_trade: int | None = None
+    condor_any_direction: bool | None = None   # W66: None -> backtest.condor_any_direction
+    # W66 friction model v2: None -> backtest.friction_* (see BacktestConfig)
+    friction_model: str | None = None
+    friction_entry_capture: float | None = None
+    friction_exit_capture: float | None = None
+    friction_stress_multiplier: float | None = None
+    # W67 gate parity (None -> backtest.gates_mode / fractal_veto_spread / penalty_on_range_prob).
+    # fractal_veto_spread: an explicit legacy hurst_hard_veto_multiplier > 0 is honoured by
+    # translating it once with the original formula (see ait.ml.regime_gate.resolve_veto_spread).
+    gates_mode: str | None = None
+    iv_rank_gate: bool | None = None          # W68: None -> backtest.iv_rank_gate
+    fractal_veto_spread: float | None = None
+    penalty_on_range_prob: float | None = None
+    # W65 research-history knobs (None = legacy behaviour; the research entry points
+    # resolve them from config.yaml backtest.* and pass them explicitly).
+    history_start_date: "date | None" = None   # trim data + start windows here
+    history_days: int | None = None            # None -> legacy train+test+100
+    vlmc_min_coverage: float = 0.95            # 5-min day coverage needed for VLMC
+    macro_event_types: "tuple[str, ...] | None" = None  # None -> hardcoded live calendar
+    max_windows: int | None = None             # keep only the LAST N windows (timing/pilot runs)
+    wing_floor_dollars: float | None = None   # W70: None -> backtest.wing_floor_dollars (2.0; R6 parity: live iron_condor min wing is $2, not $5)
     # R20b (pre-registered PLAN 2026-08-21): was a hardcoded 1.0 — the frozen
     # 2026-07 default that shadowed the PROMOTED live value (contract 1.6 since
     # the 2026-08-04 wide-wing promotion). None -> __post_init__ resolves via
@@ -82,7 +116,7 @@ class WalkForwardConfig:
     # load_settings().backtest.iv_floor (BacktestConfig default when no
     # config.yaml is reachable). Explicit values always win.
     iv_floor: float | None = None
-    delta_iv_scale: float = 0.0
+    delta_iv_scale: float | None = None      # W70: None -> backtest.delta_iv_scale
     stop_loss_pct: float | None = None      # None -> __post_init__ resolves
     profit_target_pct: float | None = None  # settings.backtest baselines
     max_hold_days: int | None = None
@@ -100,14 +134,16 @@ class WalkForwardConfig:
     # reachable). Explicit values always win.
     range_min_confidence: float | None = None  # threshold for range model on iron condors
     trailing_stop_enabled: bool = True
-    trailing_stop_pct: float = 0.25
-    breakeven_trigger_pct: float = 0.30
+    trailing_stop_pct: float | None = None   # W70: None -> exit.trailing_stop_pct
+    breakeven_trigger_pct: float | None = None   # W70: None -> exit.breakeven_trigger_pct
     max_concurrent_positions: int = 1
-    max_entry_vol_annual: float = 0.80
+    max_entry_vol_annual: float | None = None    # W70: None -> backtest.max_entry_vol_annual
     optimize_per_window: bool = False
     optimize_n_trials: int = 50
     optimize_patience: int = 0       # 0 = disabled; N = stop after N non-improving trials
-    optimize_min_trades: int = 10    # Penalise trials with fewer trades than this floor
+    optimize_min_trades: int | None = None   # None -> backtest.optimize_min_trades (W67: was a 10 literal)
+    optimize_hard_min_trades: int | None = None          # W67: None -> backtest.*
+    optimize_below_floor_gradient: float | None = None   # W67: None -> backtest.*
     optimize_seed: int = 42          # TPESampler seed — fix for reproducibility
     range_threshold_pct: float = 0.05  # Target move % for range model; links to strategy profitability
     hurst_regime_threshold: float | None = None
@@ -122,6 +158,10 @@ class WalkForwardConfig:
     # frozen value straight into the OOS Backtester. None -> __post_init__
     # resolves load_settings().backtest.iv_rank_rise_threshold.
     iv_rank_rise_threshold: float | None = None  # Exp 20: suppress IC entry when IV rank rose > this over last 10 days
+    iv_rank_rise_gate: bool | None = None        # W71c: None -> backtest.iv_rank_rise_gate (research-only veto on/off)
+    regime_veto_gate: bool | None = None         # W81: None -> backtest.regime_veto_gate (research-only veto on/off)
+    ex_div_entry_gate: str | None = None         # W84: None -> backtest.ex_div_entry_gate (live's ex-div block twin)
+    ex_div_entry_k_days: int | None = None       # W84: None -> backtest.ex_div_entry_k_days (last_k_days mode)
     pct_from_60d_high_threshold: float = -1.0 # Exp 27: suppress IC entry when price is this far below 60d rolling high (-1.0 = disabled)
     # R20b review follow-up: same defect class as iv_rank_rise_threshold above.
     min_edge_over_baseline: float | None = None  # Exp 28: min weighted CV edge for range predictor to activate (0.0 = always use, higher = stricter quality gate)
@@ -138,10 +178,12 @@ class WalkForwardConfig:
     entry_window_end_et: str | None = None      # latest allowed entry time (ET)
     limit_order_timeout_bars: int | None = None # cancel limit order after N 5-min bars without fill
     # Options spread model params (Fix 5 / Gap E)
-    spread_base: float = 0.03             # base half-spread per leg ($)
-    spread_iv_sensitivity: float = 0.10   # additional spread per unit IV above 0.20
-    spread_dte_sensitivity: float = 0.005 # additional spread per DTE below 21
-    spread_cap: float = 0.15              # maximum half-spread per leg ($)
+    # W70: None -> backtest.spread_* (these four config keys were read by NOTHING; the
+    # walk-forward carried its own literals 0.03 / 0.10 / 0.005 / 0.15).
+    spread_base: float | None = None             # base half-spread per leg ($)
+    spread_iv_sensitivity: float | None = None   # additional spread per unit IV above 0.20
+    spread_dte_sensitivity: float | None = None  # additional spread per DTE below 21
+    spread_cap: float | None = None              # maximum half-spread per leg ($)
     # R6 exit/construction parity knobs (None -> engine resolves the SAME env
     # var + default the live bot reads; see Backtester.__init__):
     credit_loss_limit_mult: float | None = None   # env AIT_CREDIT_LOSS_LIMIT (live default 0
@@ -167,6 +209,20 @@ class WalkForwardConfig:
     # dte_range and measured a median 18 DTE (14-25) over its first 14
     # condors, so studies keyed to DTE (the take-profit ladder) set it.
     entry_dte: int | None = None
+    # W79a: the short-DTE exit knobs and the searched short delta, all research-only and None =
+    # the engine resolves from settings.backtest (so nothing moves unless a study sets them).
+    # Before W79a none of these reached a trial or the OOS run: a searched delta_short was
+    # applied to nothing (lead L1) and a study could not hold a fixed guard / fraction / flatten.
+    expiry_guard_dte: int | None = None
+    max_hold_fraction: float | None = None
+    flatten_minutes_before_close: int | None = None
+    delta_short: float | None = None
+    # W79a: search the entry DTE and its exit dimensions per window (DteSearchConfig supplies the
+    # ranges). None -> backtest.dte_search.enabled. Requires optimize_per_window.
+    dte_search: bool | None = None
+    dte_range: "tuple[int, int] | None" = None     # overrides dte_search.entry_dte (CLI --dte-range)
+    optimize_strict: bool | None = None            # None -> backtest.dte_search.strict
+    optimize_multivariate: bool | None = None      # None -> backtest.dte_search.multivariate
     # Research-only post-event blackout (scripts/post_event_study.py): block
     # credit entries for N calendar days after each date in post_event_dates
     # (ISO strings, so the config pickles into window workers). None = off.
@@ -217,8 +273,9 @@ class WalkForwardConfig:
             self.contracts_cap = int(self.contracts_cap)
             if self.contracts_cap < 1:
                 raise ValueError("contracts_cap must be >= 1")
-        _research_only = [name for name in ("credit_tp_ladder", "entry_dte",
-                                            "post_event_blackout_days",
+        # W79a: entry_dte (and the guard / fraction / flatten / delta_short baselines) now reach
+        # every trial Backtester through StrategyOptimizer, so they are no longer refused here.
+        _research_only = [name for name in ("credit_tp_ladder", "post_event_blackout_days",
                                             "max_loss_per_contract_dollars",
                                             "contracts_cap")
                           if getattr(self, name) is not None]
@@ -229,6 +286,32 @@ class WalkForwardConfig:
             raise ValueError(
                 f"{', '.join(_research_only)} not threaded into per-window "
                 "Optuna trials; run with optimize_per_window=False")
+        # W79a: DTE-search switches resolve from the loaded settings (research overlay).
+        if self.max_hold_fraction is not None and not 0.0 < float(self.max_hold_fraction) <= 1.0:
+            raise ValueError(f"max_hold_fraction must be in (0, 1], got {self.max_hold_fraction}")
+        if self.dte_range is not None:
+            _lo, _hi = (int(x) for x in self.dte_range)
+            if not 0 <= _lo <= _hi <= 45:
+                raise ValueError(f"dte_range must satisfy 0 <= low <= high <= 45, got {self.dte_range}")
+            self.dte_range = (_lo, _hi)
+        try:
+            from ait.config.settings import DteSearchConfig as _DSC, load_settings as _ls
+            _ds = _ls().backtest.dte_search
+        except Exception:  # noqa: BLE001 - no config.yaml -> the model defaults
+            from ait.config.settings import DteSearchConfig as _DSC
+            _ds = _DSC()
+        if self.dte_search is None:
+            self.dte_search = bool(_ds.enabled)
+        if self.optimize_strict is None:
+            self.optimize_strict = bool(_ds.strict)
+        if self.optimize_multivariate is None:
+            self.optimize_multivariate = bool(_ds.multivariate)
+        if self.dte_search and not self.optimize_per_window:
+            raise ValueError("dte_search requires optimize_per_window=True (the DTE is chosen "
+                             "per window by Optuna)")
+        if self.initial_capital is None:
+            from ait.config.runtime_env import research_capital
+            self.initial_capital = research_capital()
         if self.wing_k is None:
             from ait.config.runtime_env import contract_float
             self.wing_k = contract_float("AIT_IC_WING_K")
@@ -241,12 +324,70 @@ class WalkForwardConfig:
         # independently calling load_settings() (was up to 3 redundant reads
         # per WalkForwardConfig construction, now 1).
         from ait.config.settings import (
-            BacktestConfig, MLConfig, RiskConfig, load_settings, resolve_config_value,
+            BacktestConfig, ExitConfig, MLConfig, RiskConfig, load_settings,
+            resolve_config_value,
         )
         try:
             _settings = load_settings()
         except Exception:  # noqa: BLE001 — no config.yaml -> per-field model defaults
             _settings = None
+        from ait.config.settings import (
+            resolve_max_contracts_per_trade, resolve_position_size_pct)
+        self.position_size_pct = resolve_position_size_pct(
+            self.position_size_pct, _settings)
+        self.max_contracts_per_trade = resolve_max_contracts_per_trade(
+            self.max_contracts_per_trade, _settings)
+        self.budget_aware_wings = bool(resolve_config_value(
+            self.budget_aware_wings, "backtest", "budget_aware_wings",
+            BacktestConfig, _settings))
+        self.condor_any_direction = bool(resolve_config_value(
+            self.condor_any_direction, "backtest", "condor_any_direction",
+            BacktestConfig, _settings))
+        self.friction_model = str(resolve_config_value(
+            self.friction_model, "backtest", "friction_model", BacktestConfig, _settings))
+        self.friction_entry_capture = float(resolve_config_value(
+            self.friction_entry_capture, "backtest", "friction_entry_capture",
+            BacktestConfig, _settings))
+        self.friction_exit_capture = float(resolve_config_value(
+            self.friction_exit_capture, "backtest", "friction_exit_capture",
+            BacktestConfig, _settings))
+        self.friction_stress_multiplier = float(resolve_config_value(
+            self.friction_stress_multiplier, "backtest", "friction_stress_multiplier",
+            BacktestConfig, _settings))
+        self.gates_mode = str(resolve_config_value(
+            self.gates_mode, "backtest", "gates_mode", BacktestConfig, _settings))
+        self.iv_rank_gate = bool(resolve_config_value(
+            self.iv_rank_gate, "backtest", "iv_rank_gate", BacktestConfig, _settings))
+        self.iv_rank_rise_gate = bool(resolve_config_value(     # W71c
+            self.iv_rank_rise_gate, "backtest", "iv_rank_rise_gate", BacktestConfig, _settings))
+        self.regime_veto_gate = bool(resolve_config_value(      # W81
+            self.regime_veto_gate, "backtest", "regime_veto_gate", BacktestConfig, _settings))
+        self.ex_div_entry_gate = str(resolve_config_value(      # W84
+            self.ex_div_entry_gate, "backtest", "ex_div_entry_gate", BacktestConfig, _settings))
+        self.ex_div_entry_k_days = int(resolve_config_value(    # W84
+            self.ex_div_entry_k_days, "backtest", "ex_div_entry_k_days", BacktestConfig, _settings))
+        self.penalty_on_range_prob = float(resolve_config_value(
+            self.penalty_on_range_prob, "backtest", "penalty_on_range_prob",
+            BacktestConfig, _settings))
+        if self.fractal_veto_spread is None and self.hurst_hard_veto_multiplier > 0:
+            from ait.ml.regime_gate import resolve_veto_spread
+            _thr = float(resolve_config_value(
+                self.hurst_regime_threshold, "backtest", "hurst_regime_threshold",
+                BacktestConfig, _settings))
+            self.fractal_veto_spread = resolve_veto_spread(
+                _thr, self.hurst_hard_veto_multiplier, None)
+        self.fractal_veto_spread = float(resolve_config_value(
+            self.fractal_veto_spread, "backtest", "fractal_veto_spread",
+            BacktestConfig, _settings))
+        self.optimize_min_trades = int(resolve_config_value(
+            self.optimize_min_trades, "backtest", "optimize_min_trades",
+            BacktestConfig, _settings))
+        self.optimize_hard_min_trades = int(resolve_config_value(
+            self.optimize_hard_min_trades, "backtest", "optimize_hard_min_trades",
+            BacktestConfig, _settings))
+        self.optimize_below_floor_gradient = float(resolve_config_value(
+            self.optimize_below_floor_gradient, "backtest", "optimize_below_floor_gradient",
+            BacktestConfig, _settings))
         self.range_min_confidence = float(resolve_config_value(
             self.range_min_confidence, "ml", "range_min_confidence", MLConfig, _settings))
         self.iv_floor = float(resolve_config_value(
@@ -277,6 +418,25 @@ class WalkForwardConfig:
         self.min_edge_over_baseline = float(resolve_config_value(
             self.min_edge_over_baseline, "backtest", "min_edge_over_baseline",
             BacktestConfig, _settings))
+        # W70: the remaining literals, now config-resolved (values unchanged at today's
+        # config.yaml except wing_floor_dollars, which was already 2.0 here).
+        # W70: the SAME contract call live's iron_condor.py uses (AIT_IC_WING_FLOOR, home
+        # backtest.wing_floor_dollars) — one key, live AND research.
+        from ait.config.runtime_env import contract_float as _cf
+        self.wing_floor_dollars = (float(self.wing_floor_dollars)
+                                   if self.wing_floor_dollars is not None
+                                   else _cf("AIT_IC_WING_FLOOR"))
+        self.delta_iv_scale = float(resolve_config_value(
+            self.delta_iv_scale, "backtest", "delta_iv_scale", BacktestConfig, _settings))
+        self.max_entry_vol_annual = float(resolve_config_value(
+            self.max_entry_vol_annual, "backtest", "max_entry_vol_annual", BacktestConfig, _settings))
+        self.trailing_stop_pct = float(resolve_config_value(
+            self.trailing_stop_pct, "exit", "trailing_stop_pct", ExitConfig, _settings))
+        self.breakeven_trigger_pct = float(resolve_config_value(
+            self.breakeven_trigger_pct, "exit", "breakeven_trigger_pct", ExitConfig, _settings))
+        for _f in ("spread_base", "spread_iv_sensitivity", "spread_dte_sensitivity", "spread_cap"):
+            setattr(self, _f, float(resolve_config_value(
+                getattr(self, _f), "backtest", _f, BacktestConfig, _settings)))
 
 
 @dataclass
@@ -290,6 +450,9 @@ class WindowResult:
     test_end: date
     backtest_result: BacktestResult
     model_accuracy: float = 0.0
+    # W-capital: why candidate trades never reached the shared pool, by reason
+    # (unaffordable | portfolio_risk | max_open_positions | no_contracts).
+    pool_rejections: dict = field(default_factory=dict)
     # R16 #3: per-symbol range-model training status for this window
     # ("ok" | "disabled_by_config" | failure reasons — anything not
     # ok/disabled means OOS IC entries were BLOCKED for that symbol).
@@ -323,6 +486,16 @@ class WalkForwardResult:
     # labelled "gates only / ML-free" that ran WITH a trained meta gate is a
     # mislabeled study (the R16 #4 failure mode through the third model).
     meta_training_status: dict = field(default_factory=dict)
+    # W66: {symbol: {reason: days}} summed over every window (zero-trade windows included)
+    entry_funnel: dict = field(default_factory=dict)
+    # W67: {window_id: {symbol: {"usable", "best_value", "best_n_trades"}}} (empty = no Optuna)
+    optimization_status: dict = field(default_factory=dict)
+
+    @property
+    def optimization_failures(self) -> int:
+        """W79a: (window, symbol) optimisations that FAILED and fell back to the base config."""
+        return sum(1 for per_sym in self.optimization_status.values()
+                   for st in (per_sym or {}).values() if isinstance(st, dict) and st.get("failed"))
 
     @property
     def total_trades(self) -> int:
@@ -617,6 +790,38 @@ class WalkForwardResult:
                     f"trades={result.total_trades:3d} | sharpe={result.sharpe_ratio:.2f}"
                 )
 
+        if self.optimization_status:
+            studies = [(w, sym, st) for w, per in sorted(self.optimization_status.items())
+                       for sym, st in sorted(per.items())]
+            starved = [x for x in studies if not x[2]["usable"]]
+            lines.append(f"  OPTIMIZATION: {len(studies) - len(starved)} of {len(studies)} "
+                         f"per-window studies found a trading trial"
+                         + ("" if not starved else
+                            f"  --  {len(starved)} NEVER did (their 'best params' are not a "
+                            f"result): " + ", ".join(f"w{w}/{sym}" for w, sym, _ in starved[:12])
+                            + (" ..." if len(starved) > 12 else "")))
+        if self.entry_funnel:
+            lines.append("  ENTRY FUNNEL (days, summed over windows; why entries did not happen):")
+            for sym in sorted(self.entry_funnel):
+                f = self.entry_funnel[sym]
+                days, taken = f.get("days_evaluated", 0), f.get("entries_taken", 0)
+                top = sorted(((k, v) for k, v in f.items()
+                              if k not in ("days_evaluated", "entries_taken")
+                              and not k.startswith(("builder:", "would_reject:"))),
+                             key=lambda kv: -kv[1])
+                wr_ = sorted(((k[13:], v) for k, v in f.items() if k.startswith("would_reject:")),
+                             key=lambda kv: -kv[1])
+                det = sorted(((k[8:], v) for k, v in f.items() if k.startswith("builder:")),
+                             key=lambda kv: -kv[1])
+                lines.append(f"    {sym:6s} days={days} taken={taken} | " +
+                             ", ".join(f"{k}={v}" for k, v in top[:6]))
+                if wr_:
+                    lines.append("           gates in observe mode would also have rejected: " +
+                                 ", ".join(f"{k}={v}" for k, v in wr_[:5]))
+                if det:
+                    lines.append("           builder detail: " +
+                                 ", ".join(f"{k}={v}" for k, v in det[:5]))
+
         lines.append("=" * 60)
         return "\n".join(lines)
 
@@ -866,7 +1071,7 @@ def _window_task_mp(args: tuple) -> tuple:
     """
     (window_id, train_start, train_end, test_start, test_end,
      data, vix_full, spy_full, config, symbols, strategies, db_path, progress_dir,
-     pretrained_range) = args
+     pretrained_range, table_prefix, vlmc_enabled, research_calendar) = args
 
     bt = WalkForwardBacktester(
         symbols=symbols,
@@ -874,7 +1079,10 @@ def _window_task_mp(args: tuple) -> tuple:
         config=config,
         db_path=db_path,
         progress_dir=progress_dir,
+        table_prefix=table_prefix,   # W65: a worker used to lose the research prefix
     )
+    bt._vlmc_enabled = vlmc_enabled
+    bt._research_calendar = research_calendar
     wr, best_params, meta_status = bt._run_single_window(
         window_id=window_id,
         train_start=train_start,
@@ -889,7 +1097,9 @@ def _window_task_mp(args: tuple) -> tuple:
         prev_oos=None,
         pretrained_range=pretrained_range,
     )
-    return window_id, wr, best_params, meta_status
+    return (window_id, wr, best_params, meta_status,
+            bt._funnel_by_window.get(window_id, {}),
+            bt._opt_status_by_window.get(window_id, {}))
 
 
 class WalkForwardBacktester:
@@ -922,6 +1132,22 @@ class WalkForwardBacktester:
         self._config = config or WalkForwardConfig()
         self._db_path = db_path
         self._table_prefix = table_prefix
+        # W65: set by _check_vlmc_coverage() once the data span is known. True keeps
+        # the legacy behaviour (a db_path means "use the intraday store").
+        self._vlmc_enabled = True
+        # W66: {window_id: {symbol: entry_funnel}} — kept for EVERY window, including the
+        # zero-trade windows whose WindowResult is None (they are exactly where the
+        # funnel explains the emptiness).
+        self._funnel_by_window: dict[int, dict[str, dict[str, int]]] = {}
+        # W67: {window_id: {symbol: {"usable": bool, "best_value": float, "best_n_trades": int}}}
+        # for every per-window Optuna study, so a run whose studies never found a trading
+        # trial says so in its summary instead of looking like an optimized result.
+        self._opt_status_by_window: dict[int, dict[str, dict]] = {}
+        # W68: {symbol: IV-rank series by date} over each symbol's FULL history (live's 252-obs
+        # lookback), filled lazily by _ensure_iv_rank_series; empty when the gate is off.
+        self._iv_rank_series: dict[str, pd.Series] = {}
+        # W65: research macro calendar (built in run() when macro_event_types is set).
+        self._research_calendar = None
         self._progress_dir = Path(progress_dir) if progress_dir else None
         self._global_best_params: dict | None = None
         self._global_best_score: float = -1.0
@@ -981,8 +1207,10 @@ class WalkForwardBacktester:
         # SPY: cross-asset features (relative strength, momentum, correlation) for the ML model.
         from ait.data.market_data import load_daily_ohlcv as _load_ohlcv
         try:
+            _ctx_days = self._context_days()
             _vix_full: pd.DataFrame = _load_ohlcv(
-                "^VIX", days=self._config.train_days + 900, db_path=self._db_path
+                "^VIX", days=_ctx_days, db_path=self._db_path,
+                table_prefix=self._table_prefix,
             )
             # yfinance may return tz-aware index; normalize to tz-naive to match OHLCV data
             if not _vix_full.empty and _vix_full.index.tz is not None:
@@ -991,7 +1219,9 @@ class WalkForwardBacktester:
             _vix_full = pd.DataFrame()
         try:
             _spy_full: pd.DataFrame = _load_ohlcv(
-                "SPY", days=self._config.train_days + 900, db_path=self._db_path
+                "SPY", days=_ctx_days, db_path=self._db_path,
+                table_prefix=self._table_prefix,
+                start_date=self._config.history_start_date,
             )
             if not _spy_full.empty and _spy_full.index.tz is not None:
                 _spy_full.index = _spy_full.index.tz_localize(None)
@@ -999,7 +1229,19 @@ class WalkForwardBacktester:
             _spy_full = pd.DataFrame()
 
         # Generate walk-forward windows
+        data = self._apply_research_calendar(data)
         windows = self._generate_windows(data)
+        windows = self._limit_windows(windows)
+        self._check_vlmc_coverage(data)
+        if len(windows) < 3:
+            _spans = {k: (str(v.index[0].date()), str(v.index[-1].date()), len(v))
+                      for k, v in data.items() if not v.empty}
+            log.error("walk_forward_too_few_windows", windows=len(windows),
+                      minimum=3, spans=_spans,
+                      note="the common date range of all symbols is too short for "
+                           "train_days + gap + test_days; run the research backfill "
+                           "(scripts/backfill_historical_data.py --mode research) or "
+                           "lengthen history (backtest.history_start_date / history_days)")
         log.info("walk_forward_windows", count=len(windows))
 
         # Run each window — parallel or sequential depending on optimize_n_jobs
@@ -1035,13 +1277,16 @@ class WalkForwardBacktester:
                     self._symbols, self._strategies,
                     self._db_path, self._progress_dir,
                     pretrained_range_by_window[i],
+                    self._table_prefix, self._vlmc_enabled, self._research_calendar,
                 )
                 for i, (train_start, train_end, test_start, test_end) in enumerate(windows)
             ]
             with ProcessPoolExecutor(max_workers=self._config.optimize_n_jobs) as executor:
                 mp_results = list(executor.map(_window_task_mp, args_list))
 
-            for _wid, wr, curr_best_params, _meta_status in sorted(mp_results, key=lambda x: x[0]):
+            for _wid, wr, curr_best_params, _meta_status, _fun, _opt in sorted(mp_results, key=lambda x: x[0]):
+                self._funnel_by_window[_wid] = _fun
+                self._opt_status_by_window[_wid] = _opt
                 # R20b review follow-up: merge the per-symbol meta-labeler
                 # status independently of whether the window produced trades
                 # — a zero-trade parallel window (wr is None) is precisely
@@ -1118,6 +1363,8 @@ class WalkForwardBacktester:
             config=self._config,
             range_training_status=dict(self._range_status_by_window),
             meta_training_status=_meta_status_all,
+            entry_funnel=self._aggregate_funnel(),
+            optimization_status=self._opt_status_by_window,
         )
 
         # Compute per-symbol results
@@ -1188,6 +1435,7 @@ class WalkForwardBacktester:
             train=f"{train_start} to {train_end}",
             test=f"{test_start} to {test_end}",
         )
+        self._ensure_iv_rank_series(data)
 
         if learner is not None:
             learned_config = learner.get_config()
@@ -1209,8 +1457,12 @@ class WalkForwardBacktester:
         _model_weights: dict = {}  # initialised here so it's always bound even if loop is empty
         _range_status_local: dict[str, str] = {}  # R16 #3: symbol -> range training status
         _meta_status_local: dict[str, str] = {}   # R20 #3: symbol -> meta-labeler status
-        # Use full capital per symbol — splitting by symbol count makes iron condors
-        # impossible on stocks priced >$50 (max_loss_per_contract too large).
+        # W-capital: every symbol's engine run is seeded with the WHOLE pool so its
+        # own affordability gate sees the budget live sees (a percentage of the
+        # total NLV, not of a sleeve -- splitting by symbol count makes condors
+        # unaffordable). The pool itself is enforced AFTER the per-symbol runs by
+        # allocate_pool (backtesting/pool.py), which replays all symbols' trades
+        # chronologically against ONE equity. Supersedes the BT-H3 per-symbol sleeves.
         per_symbol_capital = self._config.initial_capital
 
         for symbol, df in data.items():
@@ -1260,6 +1512,19 @@ class WalkForwardBacktester:
             else:
                 range_predictor, _range_model_status, _range_threshold = _range_result
 
+            # W78: per-horizon range models for this (window, symbol). The model trained /
+            # pre-trained above is the BASE bucket (so the default configuration is
+            # unchanged); any other entry DTE (a trial, or a window config that differs) is
+            # trained lazily and cached here.
+            _base_bucket = self._range_bucket()
+            _range_bank = RangeModelBank(
+                train_fn=lambda _b, _tr=train_df, _sym=symbol, _wid=window_id:
+                    self._train_range_bucket(_tr, _sym, _wid, _b),
+                bucket_fn=self._range_bucket,
+            )
+            _range_bank.seed(_base_bucket,
+                             (range_predictor, _range_model_status, _range_threshold))
+
             # R16 #3: record status for the WindowResult and run summary
             # (instance dict is guarded — tests may call _run_single_window
             # directly, bypassing run()).
@@ -1289,11 +1554,18 @@ class WalkForwardBacktester:
                     prior_oos_result=prev_oos,
                     prior_best_params=prev_best_params,
                     range_predictor=range_predictor,
+                    range_bank=_range_bank,
                     vix_ctx=_vix_train_ctx_opt,
                 )
                 window_cfg = new_cfg or self._config
                 if best_params is not None:
                     curr_best_params = best_params
+            # W78: the OOS run is gated by the model for the window config's OWN entry DTE
+            # (None -> the base bucket, so today's behaviour).
+            _oos_bucket, _oos_range = self._pick_range_model(_range_bank, window_cfg)
+            if _oos_bucket != _base_bucket:
+                range_predictor, _range_model_status, _range_threshold = _oos_range
+                _range_status_local[symbol] = _range_model_status
             if predictor and predictor.is_trained:
                 model_accuracy = max(
                     model_accuracy,
@@ -1445,10 +1717,7 @@ class WalkForwardBacktester:
             # described engine-default drift, not configuration) and limit-fill
             # simulation, matching the live-trading execution model. Also
             # enables capture of limit_price and fill_time on every OOS trade.
-            _oos_intraday_store = None
-            if self._db_path is not None:
-                from ait.data.historical import HistoricalDataStore
-                _oos_intraday_store = HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
+            _oos_intraday_store = self._make_intraday_store()
 
             bt = Backtester(
                 data=test_with_context,
@@ -1459,6 +1728,23 @@ class WalkForwardBacktester:
                 commission_per_contract=window_cfg.commission_per_contract,
                 slippage_pct=window_cfg.slippage_pct,
                 position_size_pct=effective_position_size,
+                budget_aware_wings=window_cfg.budget_aware_wings,
+                max_contracts_per_trade=window_cfg.max_contracts_per_trade,
+                condor_any_direction=window_cfg.condor_any_direction,
+                friction_model=window_cfg.friction_model,
+                friction_entry_capture=window_cfg.friction_entry_capture,
+                friction_exit_capture=window_cfg.friction_exit_capture,
+                friction_stress_multiplier=window_cfg.friction_stress_multiplier,
+                gates_mode=window_cfg.gates_mode,
+                iv_rank_gate=window_cfg.iv_rank_gate,
+                iv_rank_rise_gate=window_cfg.iv_rank_rise_gate,          # W71c
+                regime_veto_gate=window_cfg.regime_veto_gate,            # W81
+                ex_div_entry_gate=window_cfg.ex_div_entry_gate,          # W84
+                ex_div_entry_k_days=window_cfg.ex_div_entry_k_days,      # W84
+                iv_rank_series=self._iv_rank_series.get(symbol),
+                fractal_veto_spread=window_cfg.fractal_veto_spread,
+                penalty_on_range_prob=window_cfg.penalty_on_range_prob,
+                economic_calendar=self._research_calendar,
                 stop_loss_pct=window_cfg.stop_loss_pct,
                 profit_target_pct=window_cfg.profit_target_pct,
                 max_hold_days=window_cfg.max_hold_days,
@@ -1488,6 +1774,11 @@ class WalkForwardBacktester:
                 pre_event_blackout_days=getattr(window_cfg, "pre_event_blackout_days", None),
                 credit_tp_ladder=getattr(window_cfg, "credit_tp_ladder", None),
                 entry_dte=getattr(window_cfg, "entry_dte", None),
+                # W79a: the short-DTE exit knobs and the (possibly searched) delta reach the run
+                expiry_guard_dte=getattr(window_cfg, "expiry_guard_dte", None),
+                max_hold_fraction=getattr(window_cfg, "max_hold_fraction", None),
+                flatten_minutes_before_close=getattr(window_cfg, "flatten_minutes_before_close", None),
+                delta_short=getattr(window_cfg, "delta_short", None),
                 db_path=self._db_path,  # W52a: the engine reads THIS store
                 post_event_blackout_days=getattr(window_cfg, "post_event_blackout_days", None),
                 post_event_dates=getattr(window_cfg, "post_event_dates", None),
@@ -1523,6 +1814,7 @@ class WalkForwardBacktester:
                 settings=self._settings,
             )
             result = bt.run()
+            self._funnel_by_window.setdefault(window_id, {})[symbol] = dict(result.entry_funnel)
 
             # Evaluate range predictor on OOS data — calibration bins + Brier/AUROC
             # per model (train/test generalisation gap visible in the dashboard).
@@ -1533,7 +1825,7 @@ class WalkForwardBacktester:
                     # PR#7 review 2026-08-25: OOS eval must score the same
                     # horizon the model was trained on (see
                     # _range_label_horizon) — was max_hold_days (30).
-                    horizon_days=self._range_label_horizon(),
+                    horizon_days=_oos_bucket,
                     precomputed_features=_oos_feat_cache,
                 )
                 if _oos_scores and "range_predictor" in _model_weights:
@@ -1552,6 +1844,10 @@ class WalkForwardBacktester:
 
             for t in result.trades:
                 t["symbol"] = symbol
+                # W-capital: allocate_pool sizes with the SAME effective fraction
+                # this symbol's engine used (learner multipliers included); the
+                # allocator strips this private key from its output.
+                t["_pool_size_pct"] = effective_position_size
             all_symbol_trades.extend(result.trades)
             # (sorted chronologically after the loop — BT-M9: drawdown was
             # computed on symbol-grouped, non-chronological order)
@@ -1573,19 +1869,32 @@ class WalkForwardBacktester:
         all_symbol_trades.sort(
             key=lambda t: str(t.get("entry_date") or t.get("entry_time") or ""))
         if all_symbol_trades:
+            # W-capital: ONE shared pool. Replay every symbol's candidate trades
+            # chronologically against a single equity, with live's per-trade
+            # budget, aggregate-risk and open-position gates (backtesting/pool.py).
+            # Supersedes Deep-audit BT-H3 (full-capital sleeve per symbol, window
+            # capital = capital x N) and R17 #14 (N = active symbols): the
+            # window's capital base is now exactly the configured pool, so the
+            # reported return is on the money the account actually has.
+            from ait.backtesting.pool import allocate_pool
+            _pos = getattr(self._settings, "positions", None)
+            _pool = allocate_pool(
+                all_symbol_trades,
+                pool_capital=self._config.initial_capital,
+                position_size_pct=self._config.position_size_pct,
+                max_portfolio_risk_pct=float(
+                    getattr(_pos, "max_portfolio_risk_pct", 0.20)),
+                max_open_positions=int(getattr(_pos, "max_open_positions", 10)),
+            )
+            log.info("window_pool_allocation", window=window_id,
+                     pool=self._config.initial_capital,
+                     candidates=len(all_symbol_trades),
+                     accepted=len(_pool.accepted),
+                     rejections=dict(_pool.rejections),
+                     peak_open_risk=round(_pool.peak_open_risk, 2))
+            all_symbol_trades = _pool.accepted
             total_pnl = sum(t.get("pnl", 0) for t in all_symbol_trades)
-            # Deep-audit BT-H3: each symbol is deliberately seeded with FULL
-            # capital (per-symbol sleeve — splitting made condors unaffordable),
-            # so the window's deployed capital is capital x N sleeves. Summing
-            # sleeve P&L onto a single full-capital account inflated returns
-            # ~N x (the mechanism behind the untrustworthy +311%).
-            # R17: N was len(data) (every symbol passed INTO the window),
-            # not active_symbols (the ones that actually passed the
-            # learner-allowed + min-row-count gates and deployed a sleeve of
-            # capital) -- once the self-learning feature drops a symbol
-            # mid-run, this understated the window's real capital base and
-            # hence its reported return.
-            window_capital = self._config.initial_capital * max(1, active_symbols)
+            window_capital = self._config.initial_capital
             window_result = WindowResult(
                 window_id=window_id,
                 train_start=train_start,
@@ -1600,6 +1909,7 @@ class WalkForwardBacktester:
                     end_date=test_end,
                 ),
                 model_accuracy=model_accuracy,
+                pool_rejections=dict(_pool.rejections),
                 range_model_status=dict(_range_status_local),
                 meta_labeler_status=dict(_meta_status_local),  # R20 #3
             )
@@ -1730,6 +2040,7 @@ class WalkForwardBacktester:
         prior_best_params: "dict | None" = None,
         range_predictor: "Any | None" = None,
         vix_ctx: "dict | None" = None,
+        range_bank: "RangeModelBank | None" = None,
     ) -> "tuple[WalkForwardConfig | None, dict | None, dict | None]":
         """Run Optuna on the training slice and return (updated_config, best_params, optuna_meta).
 
@@ -1746,10 +2057,7 @@ class WalkForwardBacktester:
             try:
                 # Pass intraday_store+symbol so VLMC features appear in features_cache,
                 # matching the training path used by _train_window_model (Gap B fix).
-                _intraday_store = None
-                if self._db_path is not None:
-                    from ait.data.historical import HistoricalDataStore
-                    _intraday_store = HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
+                _intraday_store = self._make_intraday_store()
                 features_cache = FeatureEngine().compute(
                     train_df, intraday_store=_intraday_store, symbol=symbol,
                     market_context=vix_ctx,
@@ -1799,6 +2107,25 @@ class WalkForwardBacktester:
                     initial_capital=self._config.initial_capital,
                     features_cache=features_cache,
                     position_size_pct=self._config.position_size_pct,
+                    budget_aware_wings=self._config.budget_aware_wings,
+                    max_contracts_per_trade=self._config.max_contracts_per_trade,
+                    condor_any_direction=self._config.condor_any_direction,
+                    friction_model=self._config.friction_model,
+                    friction_entry_capture=self._config.friction_entry_capture,
+                    friction_exit_capture=self._config.friction_exit_capture,
+                    friction_stress_multiplier=self._config.friction_stress_multiplier,
+                    gates_mode=self._config.gates_mode,
+                    iv_rank_gate=self._config.iv_rank_gate,
+                    iv_rank_rise_gate=self._config.iv_rank_rise_gate,    # W71c
+                    regime_veto_gate=self._config.regime_veto_gate,      # W81
+                    ex_div_entry_gate=self._config.ex_div_entry_gate,    # W84
+                    ex_div_entry_k_days=self._config.ex_div_entry_k_days,  # W84
+                    iv_rank_series=self._iv_rank_series,
+                    fractal_veto_spread=self._config.fractal_veto_spread,
+                    penalty_on_range_prob=self._config.penalty_on_range_prob,
+                    hard_min_trades=self._config.optimize_hard_min_trades,
+                    below_floor_gradient=self._config.optimize_below_floor_gradient,
+                    economic_calendar=self._research_calendar,
                     wing_floor_dollars=self._config.wing_floor_dollars,
                     wing_k=self._config.wing_k,
                     iv_floor=self._config.iv_floor,
@@ -1823,6 +2150,17 @@ class WalkForwardBacktester:
                     intraday_store=_intraday_store,
                     symbol=symbol,
                     range_predictor=range_predictor,
+                    # W78: per-trial horizon (None provider = the single model above).
+                    range_predictor_provider=(
+                        range_bank.predictor_for if range_bank is not None else None),
+                    # W79a: the DTE baselines and the opt-in search block (L1: delta_short too).
+                    entry_dte=self._config.entry_dte,
+                    expiry_guard_dte=self._config.expiry_guard_dte,
+                    max_hold_fraction=self._config.max_hold_fraction,
+                    flatten_minutes_before_close=self._config.flatten_minutes_before_close,
+                    delta_short=self._config.delta_short,
+                    dte_search=self._dte_search_block(),
+                    multivariate=bool(self._config.optimize_multivariate),
                     val_split=self._config.optimize_val_split,
                     # R20b review follow-up: trial objectives priced with the
                     # same training-window VIX/SPY context as features_cache
@@ -1835,6 +2173,9 @@ class WalkForwardBacktester:
                     settings=self._settings,
                 )
                 res = opt.run(data={symbol: train_df}, prior_params=warm)
+                self._opt_status_by_window.setdefault(window_id, {})[symbol] = {
+                    "usable": bool(res.usable), "best_value": float(res.best_value),
+                    "best_n_trades": res.best_n_trades}
                 all_best_params.update(res.best_params)
                 best_values[strategy] = res.best_value
                 # Collect trial data for dashboard (Layer 2b)
@@ -1848,6 +2189,19 @@ class WalkForwardBacktester:
                 n_trials_requested=self._config.optimize_n_trials,
                 patience=self._config.optimize_patience,
             )
+
+            # W79a: keep the compact DTE trials with the window's optimisation status, so the
+            # report works in sequential AND parallel mode (the status dict already travels
+            # back from the window workers). Only for a DTE study: other runs are unchanged.
+            if getattr(self._config, "dte_search", False):
+                _dte_names = ("entry_dte", "expiry_guard_dte", "max_hold_fraction",
+                              "flatten_minutes_before_close")
+                _st = self._opt_status_by_window.setdefault(window_id, {}).setdefault(symbol, {})
+                _st["trials"] = [
+                    {"params": {k.rpartition("__")[2]: v for k, v in t["params"].items()
+                                if k.rpartition("__")[2] in _dte_names},
+                     "value": t["value"], "n_trades": t["n_trades"], "state": t["state"]}
+                    for t in _optuna_meta["trials"]]
 
             # Build an updated config from merged best params, falling back to originals
             import dataclasses
@@ -1866,6 +2220,14 @@ class WalkForwardBacktester:
             return new_cfg, all_best_params, _optuna_meta
         except Exception as e:
             log.warning("window_optimization_failed", window=window_id, symbol=symbol, error=str(e))
+            # W79a: a failed optimisation used to vanish into a fall-back to the BASE config, so
+            # a study that searched nothing looked identical to one that did. It is now a
+            # counted status (travels through the parallel workers with the rest of
+            # optimization_status) and, under optimize_strict, an error.
+            self._opt_status_by_window.setdefault(window_id, {})[symbol] = {
+                "usable": False, "failed": True, "error": f"{type(e).__name__}: {e}"}
+            if getattr(self._config, "optimize_strict", False):
+                raise
             return None, None, None
 
     def _evaluate_range_model_oos(
@@ -2377,7 +2739,9 @@ class WalkForwardBacktester:
             results.append(per_symbol)
         return results
 
-    def _range_label_horizon(self) -> int:
+    def _range_label_horizon(self, entry_dte: "int | None" = None,
+                             guard_dte: "int | None" = None,
+                             hold_fraction: "float | None" = None) -> int:
         """Label/eval horizon for the range model: the REACHABLE trade horizon.
 
         PR#7 review 2026-08-25: both range-training paths passed
@@ -2391,15 +2755,81 @@ class WalkForwardBacktester:
         actually reach; max_hold_days remains a cap, never an extender.
         """
         from ait.config.settings import OptionsConfig
-        from ait.execution.exit_policy import EXPIRY_APPROACHING_DTE
+        from ait.ml.range_spec import horizon_for
+        if entry_dte is None:
+            entry_dte = getattr(self._config, "entry_dte", None)   # W78: a study's own DTE
+        if entry_dte is None:
+            try:
+                _opts = (self._settings.options if self._settings is not None
+                         else OptionsConfig())
+            except Exception:  # noqa: BLE001 — partial test stubs -> field defaults
+                _opts = OptionsConfig()
+            entry_dte = int(_opts.dte_range[0])
+        # W78: ONE definition shared with the live spec (ait.ml.range_spec.horizon_for).
+        # guard / hold-fraction fields arrive with W79; getattr keeps partial configs valid.
+        # W79a: a window / trial may carry its OWN guard and fraction (they are searched);
+        # None falls back to the study's base values.
+        return horizon_for(
+            int(entry_dte),
+            guard_dte=(guard_dte if guard_dte is not None
+                       else getattr(self._config, "expiry_guard_dte", None)),
+            hold_fraction=(hold_fraction if hold_fraction is not None
+                           else getattr(self._config, "max_hold_fraction", None)),
+            max_hold_days=int(self._config.max_hold_days),
+        )
+
+    def _range_bucket(self, entry_dte: "int | None" = None, guard_dte: "int | None" = None,
+                      hold_fraction: "float | None" = None) -> int:
+        """W78: the horizon whose range model serves ``entry_dte`` (None = the base config).
+
+        The base configuration keeps its EXACT horizon (what it has always trained at); any
+        other DTE whose reachable horizon differs is rounded UP to the next bucket so a study
+        that searches the DTE trains a handful of models per window, not one per DTE.
+        """
+        from ait.ml.range_spec import bucket_for
+        base = self._range_label_horizon()
+        if entry_dte is None and guard_dte is None and hold_fraction is None:
+            return base
+        h = self._range_label_horizon(
+            None if entry_dte is None else int(entry_dte), guard_dte, hold_fraction)
+        return base if h == base else bucket_for(h)
+
+    def _pick_range_model(self, bank: "RangeModelBank", window_cfg: "Any") -> "tuple[int, tuple]":
+        """W78: (bucket, (predictor, status, threshold)) that gates this window's OOS run: the
+        model for the window config's OWN entry DTE (None -> the base bucket)."""
+        bucket = self._range_bucket(
+            getattr(window_cfg, "entry_dte", None),
+            getattr(window_cfg, "expiry_guard_dte", None),
+            getattr(window_cfg, "max_hold_fraction", None))
+        return bucket, bank.get(bucket)
+
+    def _dte_search_block(self) -> "Any | None":
+        """W79a: the DteSearchConfig handed to each window's optimizer (None = not searching).
+
+        The ranges come from the loaded settings; the per-study switches on the walk-forward
+        config (enable, ``dte_range``) win."""
+        if not getattr(self._config, "dte_search", False):
+            return None
+        from ait.config.settings import DteSearchConfig
         try:
-            _opts = (self._settings.options if self._settings is not None
-                     else OptionsConfig())
-        except Exception:  # noqa: BLE001 — partial test stubs -> field defaults
-            _opts = OptionsConfig()
-        entry_dte = int(_opts.dte_range[0])
-        reachable = max(1, entry_dte - int(EXPIRY_APPROACHING_DTE))
-        return min(int(self._config.max_hold_days), reachable)
+            base = self._settings.backtest.dte_search
+        except Exception:  # noqa: BLE001 - partial stubs -> the model defaults
+            base = DteSearchConfig()
+        upd: dict = {"enabled": True}
+        if getattr(self._config, "dte_range", None) is not None:
+            upd["entry_dte"] = list(self._config.dte_range)
+        return base.model_copy(update=upd)
+
+    def _train_range_bucket(self, train_df: pd.DataFrame, symbol: str, window_id: int,
+                            bucket: int) -> "tuple[Any | None, str, float]":
+        """Train the range model for a non-base bucket (artifacts under models/research/h<N>)."""
+        if not self._config.train_window_models:
+            return None, "disabled_by_config", 0.05
+        res = self._train_window_range_model(
+            train_df, symbol, window_id, max_hold_days=int(bucket),
+            model_subdir=f"h{int(bucket)}",
+        )
+        return res
 
     def _train_window_range_model(
         self,
@@ -2407,6 +2837,7 @@ class WalkForwardBacktester:
         symbol: str,
         window_id: int,
         max_hold_days: int = 30,
+        model_subdir: "str | None" = None,
     ) -> "tuple[Any | None, str, float]":
         """Train range predictor on this window's training data.
 
@@ -2419,6 +2850,7 @@ class WalkForwardBacktester:
         threshold_pct = self._adaptive_range_threshold(train_df, horizon_days=max_hold_days)
         return self._train_window_range_model_inprocess(
             train_df, symbol, window_id, max_hold_days, threshold_pct,
+            model_subdir=model_subdir,
         )
 
     def _train_window_range_model_inprocess(
@@ -2428,6 +2860,7 @@ class WalkForwardBacktester:
         window_id: int,
         max_hold_days: int,
         threshold_pct: float,
+        model_subdir: "str | None" = None,
     ) -> "tuple[Any | None, str, float]":
         """Train the ML-only (XGB/LGBM) range model in-process.
 
@@ -2437,18 +2870,16 @@ class WalkForwardBacktester:
         """
         try:
             from ait.ml.range_predictor import RESEARCH_MODEL_DIR, RangePredictor
-            intraday_store = None
-            if self._db_path is not None:
-                from ait.data.historical import HistoricalDataStore
-                intraday_store = HistoricalDataStore(
-                    db_path=self._db_path, table_prefix=self._table_prefix
-                )
+            intraday_store = self._make_intraday_store()
             rp = RangePredictor(
                 threshold_pct=threshold_pct,
                 horizon_days=max_hold_days,
                 # R7/R10 artifact hygiene: research runs save under
                 # models/research/ — NEVER the live models/range.pkl.
-                model_dir=RESEARCH_MODEL_DIR,
+                # W78: a non-base horizon saves under its own subdirectory so two horizons
+                # never overwrite each other's range.pkl (base keeps today's path).
+                model_dir=(RESEARCH_MODEL_DIR / model_subdir if model_subdir
+                           else RESEARCH_MODEL_DIR),
             )
             accs = rp.train(train_df, symbol=symbol, intraday_store=intraday_store)
             if accs and rp.is_trained:
@@ -2487,10 +2918,7 @@ class WalkForwardBacktester:
         Each window gets a fresh model to prevent data leakage.
         """
         try:
-            intraday_store = None
-            if self._db_path is not None:
-                from ait.data.historical import HistoricalDataStore
-                intraday_store = HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
+            intraday_store = self._make_intraday_store()
 
             _train_ctx: dict = {}
             if vix_full is not None and not vix_full.empty:
@@ -2555,10 +2983,7 @@ class WalkForwardBacktester:
 
         try:
             # Build the feature matrix for the training window (same call as training path)
-            intraday_store = None
-            if self._db_path is not None:
-                from ait.data.historical import HistoricalDataStore
-                intraday_store = HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
+            intraday_store = self._make_intraday_store()
 
             features_df = FeatureEngine().compute(
                 train_df, intraday_store=intraday_store, symbol=symbol
@@ -2575,12 +3000,35 @@ class WalkForwardBacktester:
 
             shadow_bt = Backtester(
                 data=train_with_ctx,
+                # W66: the shadow labeller was built WITHOUT a symbol, so it silently priced
+                # trades with the config spread formula and a 1.10 vol multiplier while the
+                # OOS run used the symbol's calibrated spreads / friction model v2 / vol
+                # multiplier -- meta-labels learned from a different cost model than the
+                # one they gate. Same symbol as the OOS Backtester now.
+                symbol=symbol,
                 context_bars=0,
                 strategies=["iron_condor"],  # meta-labeler targets the primary strategy
                 initial_capital=window_cfg.initial_capital,
                 commission_per_contract=window_cfg.commission_per_contract,
                 slippage_pct=window_cfg.slippage_pct,
                 position_size_pct=window_cfg.position_size_pct,
+                budget_aware_wings=window_cfg.budget_aware_wings,
+                max_contracts_per_trade=window_cfg.max_contracts_per_trade,
+                condor_any_direction=window_cfg.condor_any_direction,
+                friction_model=window_cfg.friction_model,
+                friction_entry_capture=window_cfg.friction_entry_capture,
+                friction_exit_capture=window_cfg.friction_exit_capture,
+                friction_stress_multiplier=window_cfg.friction_stress_multiplier,
+                gates_mode=window_cfg.gates_mode,
+                iv_rank_gate=window_cfg.iv_rank_gate,
+                iv_rank_rise_gate=window_cfg.iv_rank_rise_gate,          # W71c
+                regime_veto_gate=window_cfg.regime_veto_gate,            # W81
+                ex_div_entry_gate=window_cfg.ex_div_entry_gate,          # W84
+                ex_div_entry_k_days=window_cfg.ex_div_entry_k_days,      # W84
+                iv_rank_series=self._iv_rank_series.get(symbol),
+                fractal_veto_spread=window_cfg.fractal_veto_spread,
+                penalty_on_range_prob=window_cfg.penalty_on_range_prob,
+                economic_calendar=self._research_calendar,
                 stop_loss_pct=window_cfg.stop_loss_pct,
                 profit_target_pct=window_cfg.profit_target_pct,
                 max_hold_days=window_cfg.max_hold_days,
@@ -2602,6 +3050,11 @@ class WalkForwardBacktester:
                 pre_event_blackout_days=getattr(window_cfg, "pre_event_blackout_days", None),
                 credit_tp_ladder=getattr(window_cfg, "credit_tp_ladder", None),
                 entry_dte=getattr(window_cfg, "entry_dte", None),
+                # W79a: the short-DTE exit knobs and the (possibly searched) delta reach the run
+                expiry_guard_dte=getattr(window_cfg, "expiry_guard_dte", None),
+                max_hold_fraction=getattr(window_cfg, "max_hold_fraction", None),
+                flatten_minutes_before_close=getattr(window_cfg, "flatten_minutes_before_close", None),
+                delta_short=getattr(window_cfg, "delta_short", None),
                 db_path=self._db_path,  # W52a: the engine reads THIS store
                 post_event_blackout_days=getattr(window_cfg, "post_event_blackout_days", None),
                 post_event_dates=getattr(window_cfg, "post_event_dates", None),
@@ -2689,6 +3142,118 @@ class WalkForwardBacktester:
         results["portfolio"] = float(np.mean(list(results.values()))) if results else 0.0
         return results
 
+    def _apply_research_calendar(self, data: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+        """W65: build the research macro calendar and keep the gate CONSISTENT.
+
+        When `macro_event_types` is set and `{prefix}econ_events` has rows, the macro
+        gate uses the operator's CSV calendar instead of the hardcoded 2026-27 list.
+        Windows before the calendar's first date would have no gate at all (a mix of
+        gated and ungated windows inside one run), so the data is trimmed to the
+        calendar's span with an ERROR rather than silently mixed. No table / no rows
+        -> WARNING and the legacy hardcoded calendar (pre-W65 behaviour)."""
+        cfg = self._config
+        if cfg.macro_event_types is None or self._db_path is None or not self._table_prefix:
+            return data
+        from ait.data.economic_calendar import build_research_calendar
+        from ait.data.historical import HistoricalDataStore
+        try:
+            cal = build_research_calendar(self._db_path, self._table_prefix, cfg.macro_event_types)
+            span = HistoricalDataStore(self._db_path, self._table_prefix).econ_events_span()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("research_calendar_unavailable", error=str(exc))
+            return data
+        if cal is None or span is None:
+            log.warning("research_calendar_empty", table_prefix=self._table_prefix,
+                        note="no econ_events rows; macro gate uses the hardcoded live "
+                             "calendar (2026+ only). Load the CSV with "
+                             "scripts/load_econ_calendar_csv.py")
+            return data
+        self._research_calendar = cal
+        first = pd.Timestamp(span[0])
+        trimmed = {}
+        for sym, df in data.items():
+            idx = df.index.tz_localize(None) if df.index.tz is not None else df.index
+            if len(df) and idx[0] < first:
+                log.error("macro_calendar_not_covering_span", symbol=sym,
+                          data_start=str(idx[0].date()), calendar_start=span[0],
+                          note="data trimmed to the calendar span so the macro gate is on "
+                               "in every window")
+                df = df[idx >= first]
+            trimmed[sym] = df
+        log.info("research_macro_calendar", event_types=list(cfg.macro_event_types),
+                 span=span[:2], rows=span[2])
+        return trimmed
+
+    def _ensure_iv_rank_series(self, data: "dict[str, pd.DataFrame]") -> None:
+        """W68: IV rank over each symbol's FULL history, once per instance (the parallel path
+        builds one instance per window, so this also runs inside each worker).
+
+        Ranking the full series, not the window slice, gives every day live's 252-observation
+        lookback (a slice would restart the warm-up each window); row t only ever uses
+        observations at or before t, so this introduces no look-ahead."""
+        if not self._config.iv_rank_gate or self._iv_rank_series:
+            return
+        from ait.data.iv_rank import iv_rank_series
+        for sym, df in data.items():
+            if df is not None and "implied_vol" in df.columns:
+                self._iv_rank_series[sym] = iv_rank_series(df["implied_vol"])
+
+    def _aggregate_funnel(self) -> dict[str, dict[str, int]]:
+        """W66: sum the per-window entry funnels into {symbol: {reason: days}}."""
+        total: dict[str, dict[str, int]] = {}
+        for per_symbol in self._funnel_by_window.values():
+            for sym, funnel in per_symbol.items():
+                acc = total.setdefault(sym, {})
+                for reason, n in funnel.items():
+                    acc[reason] = acc.get(reason, 0) + int(n)
+        return total
+
+    def _limit_windows(self, windows: list) -> list:
+        """W65: keep only the most recent `max_windows` windows (timing/pilot runs)."""
+        n = self._config.max_windows
+        if n and len(windows) > n:
+            log.info("walk_forward_windows_limited", total=len(windows), kept=n)
+            return windows[-n:]
+        return windows
+
+    def _make_intraday_store(self):
+        """W65: the (prefixed) intraday store, or None. One place for the five sites
+        that used to build it inline, so the VLMC coverage guard can switch ALL of
+        them off together (never VLMC in some windows and not in others)."""
+        if self._db_path is None or not self._vlmc_enabled:
+            return None
+        from ait.data.historical import HistoricalDataStore
+        return HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
+
+    def _check_vlmc_coverage(self, data: dict[str, pd.DataFrame]) -> None:
+        """W65: VLMC/intraday-fractal features must exist for EVERY window or none.
+
+        The features are left-joined per day from 5-min bars (NaN where a day has
+        none), so partial coverage would put a feature in some windows only — a
+        distribution shift inside one run. Below `vlmc_min_coverage` (per symbol, over
+        the whole data span) the run trains daily-only, loudly."""
+        if self._db_path is None:
+            return
+        from ait.data.historical import HistoricalDataStore
+        store = HistoricalDataStore(db_path=self._db_path, table_prefix=self._table_prefix)
+        per: dict[str, float] = {}
+        for sym, df in data.items():
+            if df.empty:
+                continue
+            first, last = df.index[0].date(), df.index[-1].date()
+            n = store.intraday_day_count(sym, first, last)
+            per[sym] = round(n / max(1, len(df)), 3)
+        threshold = self._config.vlmc_min_coverage
+        if per and min(per.values()) < threshold:
+            self._vlmc_enabled = False
+            log.warning("vlmc_disabled_low_intraday_coverage", coverage=per,
+                        threshold=threshold, table_prefix=self._table_prefix,
+                        note="daily-only features this run; backfill 5-min bars with "
+                             "scripts/backfill_historical_data.py --mode intraday "
+                             "--what-to-show TRADES --table-prefix " + self._table_prefix)
+        else:
+            log.info("vlmc_enabled", coverage=per, threshold=threshold)
+
     def _generate_windows(self, data: dict[str, pd.DataFrame]) -> list[tuple[date, date, date, date]]:
         """Generate walk-forward train/test date windows."""
         # Find common date range across all symbols
@@ -2715,22 +3280,48 @@ class WalkForwardBacktester:
 
         return windows
 
+    def _context_days(self) -> int:
+        """W65: days of VIX/SPY context to load — the legacy train+900, or the whole
+        research span plus feature warm-up when a history span is configured."""
+        cfg = self._config
+        if cfg.history_start_date is not None:
+            span = (today_et() - cfg.history_start_date).days
+        else:
+            span = cfg.history_days or 0
+        return max(cfg.train_days + 900, span + 400)
+
     async def _fetch_data(self) -> dict[str, pd.DataFrame]:
         """Load daily OHLCV from IB store (fallback: Yahoo Finance)."""
         from ait.data.market_data import load_daily_ohlcv
 
         data = {}
-        fetch_days = self._config.train_days + self._config.test_days + 100
+        cfg = self._config
+        fetch_days = cfg.train_days + cfg.test_days + 100
+        start = cfg.history_start_date
+        if start is not None:
+            fetch_days = max(fetch_days, (today_et() - start).days + 30)
+        elif cfg.history_days:
+            fetch_days = max(fetch_days, cfg.history_days)
 
         for symbol in self._symbols:
             try:
                 loop = asyncio.get_running_loop()
+                # W65: the research kwargs are passed ONLY when set, so a legacy run
+                # (no prefix, no start date) makes the exact pre-W65 call.
+                _kw: dict = {}
+                if self._table_prefix:
+                    _kw["table_prefix"] = self._table_prefix
+                if start is not None:
+                    _kw["start_date"] = start
                 df = await loop.run_in_executor(
                     None,
                     lambda s=symbol: load_daily_ohlcv(
-                        s, days=fetch_days, db_path=self._db_path
+                        s, days=fetch_days, db_path=self._db_path, **_kw
                     ),
                 )
+                if df is not None and start is not None and not df.empty:
+                    _idx = df.index.tz_localize(None) if df.index.tz is not None else df.index
+                    df = df[_idx >= pd.Timestamp(start)]
                 if df is not None and len(df) > 100:
                     # R16 #5: load_daily_ohlcv can return a tz-aware
                     # (America/New_York) index while run() normalizes VIX/SPY
@@ -2759,9 +3350,10 @@ class WalkForwardBacktester:
                 symbol_trades.setdefault(sym, []).append(t)
 
         results = {}
-        # BT-M7: each symbol trades a FULL-capital sleeve (see BT-H3), so its
-        # return denominator is full capital — dividing by capital/N showed
-        # a +8% symbol as +40% on a 5-symbol run.
+        # BT-M7 / W-capital: the denominator is the ONE shared pool. Each symbol's
+        # P&L is attributed against the account it was drawn from (the BT-H3
+        # sleeve model is superseded by allocate_pool), so per-symbol returns
+        # add up to the pooled return instead of each reading as its own account.
         per_symbol_capital = self._config.initial_capital
         for sym, trades in symbol_trades.items():
             total_pnl = sum(t.get("pnl", 0) for t in trades)

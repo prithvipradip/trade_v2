@@ -184,6 +184,74 @@ def summarize(events: list[dict]) -> dict:
     }
 
 
+# ---------------------------------------------------------------- fetching
+
+_OWNER_DAY_RE = re.compile(
+    r"^([a-z][a-z0-9_-]{1,30})_logs/(\d{4}-\d{2}-\d{2})\.jsonl\.gz$")
+
+
+@dataclass
+class FetchResult:
+    """Outcome of refreshing `origin/shared-logs` in the live checkout."""
+
+    ok: bool
+    advanced: bool = False
+    head: str | None = None
+    new_commits: int = 0
+    latest_by_owner: dict[str, str] = field(default_factory=dict)
+    error: str | None = None
+
+
+def _remote_head(repo: Path) -> str | None:
+    r = _git(["rev-parse", "--verify", "--quiet",
+              f"refs/remotes/origin/{SHARED_BRANCH}"], repo)
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+
+def fetch_shared_branch(repo: Path) -> FetchResult:
+    """Refresh `origin/shared-logs` so the OTHER box's published days are readable locally.
+
+    A FETCH ONLY: it updates the remote-tracking ref (and FETCH_HEAD) and nothing else —
+    no checkout, no merge, no change to HEAD, the index, the working tree or any local
+    branch (the same operation scripts/read_shared_logs.py runs on every invocation, and
+    proven by test not to touch the live tree). It does not need AIT_LOG_OWNER: reading a
+    peer's logs does not require publishing your own.
+
+    `latest_by_owner` is the newest published day per owner, so a box that has silently
+    stopped publishing is visible in the log without anyone looking (2026-10-01 was the
+    last day on the branch for one box when this was written).
+
+    GIT_TERMINAL_PROMPT=0: a headless supervisor must never block on a credential prompt.
+    Never raises.
+    """
+    try:
+        before = _remote_head(repo)
+        r = subprocess.run(
+            ["git", "fetch", "--quiet", "origin", SHARED_BRANCH], cwd=str(repo),
+            capture_output=True, text=True, timeout=GIT_TIMEOUT_S,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+        if r.returncode != 0:
+            msg = (r.stderr or r.stdout or "").strip()[-300:]
+            return FetchResult(ok=False, head=(before or "")[:12] or None,
+                               error=msg or f"git fetch exited {r.returncode}")
+        after = _remote_head(repo)
+        if not after:
+            return FetchResult(ok=False, error=f"origin/{SHARED_BRANCH} not present after fetch")
+        span = f"{before}..{after}" if before else after
+        c = _git(["rev-list", "--count", span], repo)
+        new = int(c.stdout.strip() or 0) if c.returncode == 0 and before != after else 0
+        latest: dict[str, str] = {}
+        t = _git(["ls-tree", "-r", "--name-only", after], repo)
+        for line in (t.stdout.splitlines() if t.returncode == 0 else []):
+            m = _OWNER_DAY_RE.match(line.strip())
+            if m and m.group(2) > latest.get(m.group(1), ""):
+                latest[m.group(1)] = m.group(2)
+        return FetchResult(ok=True, advanced=(before != after), head=after[:12],
+                           new_commits=new, latest_by_owner=latest)
+    except Exception as e:  # noqa: BLE001 — a fetch must never hurt the supervisor
+        return FetchResult(ok=False, error=f"{type(e).__name__}: {e}")
+
+
 # ---------------------------------------------------------------- publishing
 
 @dataclass

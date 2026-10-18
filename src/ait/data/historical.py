@@ -29,6 +29,24 @@ log = get_logger("data.historical")
 
 DB_PATH = Path("data/historical.db")
 
+# W65: provenance tags for the `source` / `iv_source` columns on the daily
+# tables, defined ONCE and imported everywhere (a typo'd literal at a writer is
+# an unreadable provenance column). Legacy rows (before W65) are NULL =
+# "unrecorded"; no provider is ever guessed for them. The intraday table keeps
+# its own pre-existing vocabulary (TRADES / MIDPOINT / YAHOO_ADJ).
+SOURCE_IB_TRADES_RTH = "IB_TRADES_RTH"      # IB daily TRADES bars, regular trading hours
+SOURCE_YAHOO_UNADJ = "YAHOO_UNADJ"          # Yahoo daily bars, auto_adjust=False
+SOURCE_IB_OPTION_IV = "IB_OPTION_IV"        # IB OPTION_IMPLIED_VOLATILITY daily close/OHLC
+SOURCE_UNRECORDED = "UNRECORDED"            # label used when READING NULL source rows
+SOURCE_INVESTING_CSV = "INVESTING_CSV"      # operator-compiled Investing.com economic calendar CSV
+SOURCE_IB_BID_ASK_BARS = "IB_BID_ASK_BARS"  # W66: IB hourly BID+ASK bars of listed options
+SOURCE_YAHOO_DIVIDENDS = "YAHOO_DIVIDENDS"  # W84: yfinance Ticker.dividends (ex-date, amount/share)
+SOURCE_FED_FOMC = "FED_FOMC_PAGES"          # W83a: federalreserve.gov FOMC meeting pages
+SOURCE_BLS_ARCHIVE = "BLS_RELEASE_ARCHIVE"  # W83a: bls.gov news-release archive links
+SOURCE_EDGAR_N30B2 = "EDGAR_N30B2"          # W83a: QQQ trust annual Schedule of Investments
+SOURCE_EDGAR_NPORT = "EDGAR_NPORTP"         # W83a: QQQ trust NPORT-P quarterly holdings
+SOURCE_EDGAR_8K_202 = "EDGAR_8K_ITEM202"    # W83a: company 8-K Item 2.02 (results of operations)
+
 # Historical risk-free-rate follow-up: the SOFR term structure's tenor
 # points in days-to-maturity, in the SAME order get_risk_free_rate's SELECT
 # reads its columns (sofr, sofr_30d_avg, sofr_90d_avg, sofr_180d_avg) --
@@ -83,8 +101,31 @@ class HistoricalDataStore:
         self._intraday_iv_table = f"{table_prefix}intraday_iv"
         self._spread_samples_table = f"{table_prefix}option_spread_samples"
         self._spread_params_table = f"{table_prefix}option_spread_params"
+        # W66: per-leg DOLLAR half-spread samples (hourly IB BID/ASK bars) and the fitted
+        # friction model v2. Separate tables, not columns on option_spread_samples: that
+        # table's PK (symbol, sample_date, right, strike, dte) holds ONE snapshot per day,
+        # an hourly sample would collide on it.
+        self._spread_bar_table = f"{table_prefix}option_spread_bar_samples"
+        self._leg_spread_params_table = f"{table_prefix}option_leg_spread_params"
+        # W76: per-DTE-band friction models. A separate table, not a column on the one
+        # above: that table's primary key is `symbol` alone, and rebuilding it would mean
+        # dropping a table other (possibly running) processes read.
+        self._leg_spread_band_table = f"{table_prefix}option_leg_spread_band_params"
+        # W82: which expiries the lifecycle collector has already captured, and at what DTE, so a
+        # run knows what is still owed without a state file (a row per capture, never updated).
+        self._capture_log_table = f"{table_prefix}option_capture_log"
         self._option_daily_bars_table = f"{table_prefix}option_daily_bars"
         self._risk_free_rates_table = f"{table_prefix}risk_free_rates"
+        self._econ_events_table = f"{table_prefix}econ_events"
+        # W84: past ex-dividend dates per symbol, for the research ex-dividend entry gate
+        # (and W83a). The live bot never reads it: live fetches its own from yfinance.
+        self._dividends_table = f"{table_prefix}dividends"
+        # W83a: the strike-aware range study's event calendars (research only; the live bot never
+        # reads them): scheduled FOMC / CPI / NFP dates, QQQ's reported top holdings, and mega-cap
+        # earnings releases.
+        self._econ_schedule_table = f"{table_prefix}econ_schedule"
+        self._qqq_holdings_table = f"{table_prefix}qqq_holdings"
+        self._earnings_schedule_table = f"{table_prefix}earnings_schedule"
         self._init_db()
 
     def _init_db(self) -> None:
@@ -109,6 +150,15 @@ class HistoricalDataStore:
                 )
             except sqlite3.OperationalError:
                 pass  # column already exists
+            # W65 provenance columns (additive, nullable): who supplied the OHLCV
+            # and who supplied implied_vol on each row. Legacy rows stay NULL.
+            for _col in ("source", "iv_source"):
+                try:
+                    conn.execute(
+                        f"ALTER TABLE {self._daily_table} ADD COLUMN {_col} TEXT"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # column already exists
             conn.execute(f"""
                 CREATE INDEX IF NOT EXISTS idx_{self._daily_table}_symbol
                 ON {self._daily_table}(symbol, date)
@@ -147,6 +197,40 @@ class HistoricalDataStore:
                     PRIMARY KEY (symbol, date)
                 )
             """)
+            # W65: economic-event calendar (operator CSV). Dates are ET release dates.
+            # '' (not NULL) in the key columns so the primary key de-duplicates.
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._econ_events_table} (
+                    event_date        TEXT NOT NULL,
+                    event_time_et     TEXT NOT NULL DEFAULT '',
+                    country           TEXT NOT NULL,
+                    currency          TEXT,
+                    importance        TEXT,
+                    event             TEXT NOT NULL,
+                    reference_period  TEXT NOT NULL DEFAULT '',
+                    type              TEXT,
+                    category          TEXT,
+                    actual            REAL,
+                    forecast          REAL,
+                    previous          REAL,
+                    unit              TEXT,
+                    engine_event_type TEXT,
+                    source            TEXT,
+                    source_file       TEXT,
+                    source_sha256     TEXT,
+                    PRIMARY KEY (event_date, event_time_et, country, event, reference_period)
+                )
+            """)
+            conn.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_{self._econ_events_table}_type
+                ON {self._econ_events_table}(engine_event_type, event_date)
+            """)
+            try:  # W65 provenance column on the daily IV-bar table
+                conn.execute(
+                    f"ALTER TABLE {self._daily_iv_table} ADD COLUMN source TEXT"
+                )
+            except sqlite3.OperationalError:
+                pass  # column already exists
             conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS {self._intraday_iv_table} (
                     symbol   TEXT NOT NULL,
@@ -190,6 +274,113 @@ class HistoricalDataStore:
                     spread_cap            REAL    NOT NULL,
                     sample_count          INTEGER NOT NULL,
                     rmse                  REAL
+                )
+            """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._spread_bar_table} (
+                    symbol            TEXT NOT NULL,
+                    bar_time          TEXT NOT NULL,   -- ET, ISO, start of the hourly bar
+                    right             TEXT NOT NULL,
+                    strike            REAL NOT NULL,
+                    expiry            TEXT NOT NULL,
+                    dte               INTEGER NOT NULL,
+                    bid               REAL NOT NULL,
+                    ask               REAL NOT NULL,
+                    mid               REAL NOT NULL,
+                    half_spread_usd   REAL NOT NULL,
+                    underlying_price  REAL,
+                    delta             REAL,
+                    iv                REAL,
+                    role              TEXT,            -- 'short' | 'wing' (delta bucket vs wing strike)
+                    source            TEXT,
+                    PRIMARY KEY (symbol, bar_time, right, strike, expiry)
+                )
+            """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._dividends_table} (
+                    symbol      TEXT NOT NULL,
+                    ex_date     TEXT NOT NULL,   -- ISO date (ET calendar date of the ex-date)
+                    amount      REAL,            -- cash per share
+                    source      TEXT NOT NULL,   -- SOURCE_* provenance tag
+                    fetched_at  TEXT NOT NULL,   -- ISO timestamp of the fetch
+                    PRIMARY KEY (symbol, ex_date)
+                )
+            """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._econ_schedule_table} (
+                    event_date  TEXT NOT NULL,   -- ISO date (FOMC: the decision day)
+                    event       TEXT NOT NULL,   -- FOMC | CPI | NFP
+                    source      TEXT NOT NULL,
+                    source_url  TEXT NOT NULL,
+                    PRIMARY KEY (event_date, event)
+                )
+            """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._qqq_holdings_table} (
+                    report_date  TEXT NOT NULL,  -- the holdings' as-of date
+                    filed_date   TEXT NOT NULL,  -- when the report became public (weights apply after)
+                    form         TEXT NOT NULL,  -- N-30B-2 | NPORT-P
+                    accession    TEXT NOT NULL,
+                    rank         INTEGER NOT NULL,
+                    company_key  TEXT,           -- research_calendars.COMPANIES key (NULL = unmapped)
+                    name         TEXT NOT NULL,
+                    value_usd    REAL NOT NULL,
+                    weight       REAL NOT NULL,  -- value / total value of all holdings
+                    source       TEXT NOT NULL,
+                    PRIMARY KEY (accession, rank)
+                )
+            """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._earnings_schedule_table} (
+                    accession      TEXT NOT NULL PRIMARY KEY,
+                    company_key    TEXT NOT NULL,
+                    cik            INTEGER NOT NULL,
+                    filing_date    TEXT NOT NULL,
+                    accepted_et    TEXT NOT NULL,   -- ISO datetime, America/New_York
+                    event_session  TEXT NOT NULL,   -- first session whose price can react
+                    source         TEXT NOT NULL
+                )
+            """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._capture_log_table} (
+                    symbol          TEXT    NOT NULL,
+                    expiry          TEXT    NOT NULL,   -- ISO date of the captured expiry
+                    stage           TEXT    NOT NULL,   -- 'A' (at expiry) | 'B' (far coverage)
+                    captured_on     TEXT    NOT NULL,   -- ET date of the run
+                    dte_at_capture  INTEGER NOT NULL,
+                    lookback_days   INTEGER NOT NULL,
+                    contracts       INTEGER NOT NULL,   -- contracts requested for this expiry
+                    PRIMARY KEY (symbol, expiry, stage, captured_on)
+                )
+            """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._leg_spread_params_table} (
+                    symbol        TEXT NOT NULL PRIMARY KEY,
+                    form          TEXT NOT NULL,
+                    a             REAL NOT NULL,
+                    b             REAL NOT NULL,
+                    n             INTEGER NOT NULL,
+                    n_sessions    INTEGER,
+                    cv_mae        REAL,
+                    cv_mae_json   TEXT,
+                    source        TEXT,
+                    calibrated_on TEXT NOT NULL
+                )
+            """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._leg_spread_band_table} (
+                    symbol        TEXT NOT NULL,
+                    dte_band      TEXT NOT NULL,
+                    form          TEXT NOT NULL,
+                    a             REAL NOT NULL,
+                    b             REAL NOT NULL,
+                    n             INTEGER NOT NULL,
+                    n_sessions    INTEGER NOT NULL,
+                    cv_mae        REAL,
+                    cv_mae_json   TEXT,
+                    source        TEXT,
+                    calibrated_on TEXT NOT NULL,
+                    PRIMARY KEY (symbol, dte_band)
                 )
             """)
             # W58: historical per-contract EOD option bars (Polygon/Massive
@@ -251,8 +442,13 @@ class HistoricalDataStore:
                 )
             """)
 
-    def save(self, symbol: str, df: pd.DataFrame) -> int:
-        """Save historical data for a symbol. Returns number of rows inserted."""
+    def save(self, symbol: str, df: pd.DataFrame, source: str | None = None) -> int:
+        """Save historical data for a symbol. Returns number of rows inserted.
+
+        W65: `source` tags the OHLCV provider (SOURCE_* constants). None leaves an
+        existing tag untouched (COALESCE below), so an untagged older caller can
+        never erase provenance.
+        """
         if df is None or df.empty:
             return 0
 
@@ -271,6 +467,7 @@ class HistoricalDataStore:
                 float(row.get("Low", 0)),
                 float(row.get("Close", 0)),
                 _safe_vol(row.get("Volume", 0)),  # int(NaN) aborted the whole batch (deep-audit DATA-L10)
+                source,
             ))
 
         with sqlite3.connect(self._db_path) as conn:
@@ -281,12 +478,13 @@ class HistoricalDataStore:
             # features. Upsert only the OHLCV columns instead.
             conn.executemany(
                 f"""INSERT INTO {self._daily_table}
-                   (symbol, date, open, high, low, close, volume)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   (symbol, date, open, high, low, close, volume, source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(symbol, date) DO UPDATE SET
                      open=excluded.open, high=excluded.high,
                      low=excluded.low, close=excluded.close,
-                     volume=excluded.volume""",
+                     volume=excluded.volume,
+                     source=COALESCE(excluded.source, source)""",
                 rows,
             )
 
@@ -335,6 +533,167 @@ class HistoricalDataStore:
             return datetime.strptime(result[0], "%Y-%m-%d").date()
         return None
 
+    def save_econ_events(self, df: pd.DataFrame, source: str, source_file: str,
+                         source_sha256: str) -> int:
+        """W65: upsert normalized economic-event rows (see scripts/load_econ_calendar_csv.py).
+
+        Required columns: event_date, event_time_et, country, event, reference_period;
+        optional: currency, importance, type, category, actual, forecast, previous, unit,
+        engine_event_type. Every row is stamped with source/file/hash."""
+        if df is None or df.empty:
+            return 0
+
+        def _f(v):
+            return None if v is None or v != v else float(v)
+
+        def _t(v):
+            return None if v is None or v != v else str(v)
+
+        rows = [(
+            str(r["event_date"]), str(r.get("event_time_et") or ""), str(r["country"]),
+            _t(r.get("currency")), _t(r.get("importance")), str(r["event"]),
+            str(r.get("reference_period") or ""), _t(r.get("type")), _t(r.get("category")),
+            _f(r.get("actual")), _f(r.get("forecast")), _f(r.get("previous")),
+            _t(r.get("unit")), _t(r.get("engine_event_type")),
+            source, source_file, source_sha256,
+        ) for _, r in df.iterrows()]
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                f"""INSERT OR REPLACE INTO {self._econ_events_table}
+                    (event_date, event_time_et, country, currency, importance, event,
+                     reference_period, type, category, actual, forecast, previous, unit,
+                     engine_event_type, source, source_file, source_sha256)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                rows,
+            )
+        log.debug("econ_events_saved", rows=len(rows), source=source)
+        return len(rows)
+
+    def load_econ_events(self, engine_event_types: "list[str] | None" = None,
+                         start: date | None = None, end: date | None = None) -> pd.DataFrame:
+        """W65: stored economic events (all rows, or only the mapped engine types)."""
+        q = f"SELECT * FROM {self._econ_events_table} WHERE 1=1"
+        params: list = []
+        if engine_event_types is not None:
+            q += " AND engine_event_type IN (" + ",".join("?" * len(engine_event_types)) + ")"
+            params += list(engine_event_types)
+        if start:
+            q += " AND event_date >= ?"
+            params.append(str(start))
+        if end:
+            q += " AND event_date <= ?"
+            params.append(str(end))
+        q += " ORDER BY event_date, event_time_et"
+        with sqlite3.connect(self._db_path) as conn:
+            df = pd.read_sql_query(q, conn, params=params)
+        return df
+
+    def econ_events_span(self) -> "tuple[str, str, int] | None":
+        """(first_date, last_date, rows) of the stored events, or None when empty."""
+        with sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(
+                f"SELECT MIN(event_date), MAX(event_date), COUNT(*) FROM {self._econ_events_table}"
+            ).fetchone()
+        return None if not row or not row[2] else (row[0], row[1], int(row[2]))
+
+    def save_dividends(self, symbol: str, rows: "list[tuple[date, float | None]]", source: str,
+                       fetched_at: str) -> int:
+        """W84: upsert (ex_date, amount) rows for a symbol (see scripts/backfill_dividends.py)."""
+        if not rows:
+            return 0
+        payload = [(symbol, str(d), None if a is None or a != a else float(a), source, fetched_at)
+                   for d, a in rows]
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                f"""INSERT OR REPLACE INTO {self._dividends_table}
+                    (symbol, ex_date, amount, source, fetched_at) VALUES (?,?,?,?,?)""",
+                payload,
+            )
+        log.debug("dividends_saved", symbol=symbol, rows=len(payload), source=source)
+        return len(payload)
+
+    def load_dividends(self, symbol: str) -> "list[tuple[date, float | None]]":
+        """W84: a symbol's stored (ex_date, amount) rows, ascending by ex-date."""
+        with sqlite3.connect(self._db_path) as conn:
+            rows = conn.execute(
+                f"SELECT ex_date, amount FROM {self._dividends_table} WHERE symbol=? "
+                f"ORDER BY ex_date", (symbol,)).fetchall()
+        return [(date.fromisoformat(d), a) for d, a in rows]
+
+    def dividends_span(self, symbol: str) -> "tuple[str, str, int] | None":
+        """(first_ex_date, last_ex_date, rows) for a symbol, or None when it has none."""
+        with sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(
+                f"SELECT MIN(ex_date), MAX(ex_date), COUNT(*) FROM {self._dividends_table} "
+                f"WHERE symbol=?", (symbol,)).fetchone()
+        return None if not row or not row[2] else (row[0], row[1], int(row[2]))
+
+    def save_econ_schedule(self, rows: "list[tuple[date, str, str]]", source: str) -> int:
+        """W83a: upsert (event_date, event, source_url) rows."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                f"INSERT OR REPLACE INTO {self._econ_schedule_table} "
+                f"(event_date, event, source, source_url) VALUES (?,?,?,?)",
+                [(str(d), e, source, u) for d, e, u in rows])
+        return len(rows)
+
+    def load_econ_schedule(self, event: str | None = None) -> "list[tuple[date, str]]":
+        """W83a: stored (event_date, event) rows, ascending; one event type if given."""
+        q = f"SELECT event_date, event FROM {self._econ_schedule_table}"
+        params: tuple = ()
+        if event:
+            q += " WHERE event=?"
+            params = (event,)
+        with sqlite3.connect(self._db_path) as conn:
+            rows = conn.execute(q + " ORDER BY event_date, event", params).fetchall()
+        return [(date.fromisoformat(d), e) for d, e in rows]
+
+    def save_qqq_holdings(self, rows: "list[tuple]", source: str) -> int:
+        """W83a: upsert (report_date, filed_date, form, accession, rank, company_key, name,
+        value_usd, weight) rows."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                f"INSERT OR REPLACE INTO {self._qqq_holdings_table} (report_date, filed_date, form, "
+                f"accession, rank, company_key, name, value_usd, weight, source) "
+                f"VALUES (?,?,?,?,?,?,?,?,?,?)",
+                [(str(r[0]), str(r[1]), *r[2:], source) for r in rows])
+        return len(rows)
+
+    def load_qqq_holdings(self) -> pd.DataFrame:
+        """W83a: every stored top-holding row (one row per report and rank)."""
+        with sqlite3.connect(self._db_path) as conn:
+            return pd.read_sql_query(
+                f"SELECT * FROM {self._qqq_holdings_table} ORDER BY filed_date, rank", conn)
+
+    def save_earnings_schedule(self, rows: "list[tuple]", source: str) -> int:
+        """W83a: upsert (accession, company_key, cik, filing_date, accepted_et, event_session) rows."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                f"INSERT OR REPLACE INTO {self._earnings_schedule_table} (accession, company_key, cik, "
+                f"filing_date, accepted_et, event_session, source) VALUES (?,?,?,?,?,?,?)",
+                [(r[0], r[1], int(r[2]), str(r[3]), str(r[4]), str(r[5]), source) for r in rows])
+        return len(rows)
+
+    def load_earnings_schedule(self) -> pd.DataFrame:
+        """W83a: every stored earnings release, ascending by event session."""
+        with sqlite3.connect(self._db_path) as conn:
+            return pd.read_sql_query(
+                f"SELECT * FROM {self._earnings_schedule_table} ORDER BY event_session, company_key",
+                conn)
+
+    def source_summary(self, symbol: str) -> dict[str, tuple[int, str, str]]:
+        """W65: {source: (priced_rows, first_date, last_date)} for a symbol's daily
+        OHLCV. Rows written before W65 report under SOURCE_UNRECORDED (NULL)."""
+        with sqlite3.connect(self._db_path) as conn:
+            rows = conn.execute(
+                f"""SELECT COALESCE(source, ?), COUNT(*), MIN(date), MAX(date)
+                    FROM {self._daily_table}
+                    WHERE symbol = ? AND close IS NOT NULL
+                    GROUP BY COALESCE(source, ?)""",
+                (SOURCE_UNRECORDED, symbol, SOURCE_UNRECORDED),
+            ).fetchall()
+        return {src: (int(n), str(a), str(b)) for src, n, a, b in rows}
+
     def symbols_stored(self) -> list[str]:
         """Get list of all symbols with stored data."""
         with sqlite3.connect(self._db_path) as conn:
@@ -343,7 +702,8 @@ class HistoricalDataStore:
             ).fetchall()
         return [r[0] for r in rows]
 
-    def save_daily_iv(self, symbol: str, iv_series: "pd.Series") -> int:
+    def save_daily_iv(self, symbol: str, iv_series: "pd.Series",
+                      source: str | None = None) -> int:
         """Upsert implied_vol into daily_prices for a symbol.
 
         iv_series must be a pandas Series with date or datetime index and
@@ -376,9 +736,10 @@ class HistoricalDataStore:
                 [(symbol, date_str) for symbol, date_str, _ in rows],
             )
             conn.executemany(
-                f"UPDATE {self._daily_table} SET implied_vol = ? "
+                f"UPDATE {self._daily_table} SET implied_vol = ?, "
+                "iv_source = COALESCE(?, iv_source) "
                 "WHERE symbol = ? AND date = ?",
-                [(iv, sym, date_str) for sym, date_str, iv in rows],
+                [(iv, source, sym, date_str) for sym, date_str, iv in rows],
             )
 
         log.debug("daily_iv_saved", symbol=symbol, rows=len(rows))
@@ -596,7 +957,8 @@ class HistoricalDataStore:
     # single-value self-healing store in daily_prices.implied_vol above).
     # ------------------------------------------------------------------
 
-    def save_daily_iv_bars(self, symbol: str, df: "pd.DataFrame") -> int:
+    def save_daily_iv_bars(self, symbol: str, df: "pd.DataFrame",
+                           source: str | None = None) -> int:
         """Upsert daily IV OHLC bars into the daily_iv table.
 
         df must have a date/DatetimeIndex and columns Open/High/Low/Close
@@ -612,16 +974,18 @@ class HistoricalDataStore:
                 symbol, str(dt),
                 float(row["Open"]), float(row["High"]),
                 float(row["Low"]), float(row["Close"]),
+                source,
             ))
 
         with sqlite3.connect(self._db_path) as conn:
             conn.executemany(
                 f"""INSERT INTO {self._daily_iv_table}
-                   (symbol, date, iv_open, iv_high, iv_low, iv_close)
-                   VALUES (?, ?, ?, ?, ?, ?)
+                   (symbol, date, iv_open, iv_high, iv_low, iv_close, source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(symbol, date) DO UPDATE SET
                        iv_open=excluded.iv_open, iv_high=excluded.iv_high,
-                       iv_low=excluded.iv_low, iv_close=excluded.iv_close""",
+                       iv_low=excluded.iv_low, iv_close=excluded.iv_close,
+                       source=COALESCE(excluded.source, source)""",
                 rows,
             )
 
@@ -755,6 +1119,22 @@ class HistoricalDataStore:
             )
         log.debug("intraday_cleanup_done", keep_days=keep_days)
 
+    def intraday_day_count(self, symbol: str, start: date, end: date,
+                           interval: str = "5m") -> int:
+        """W65: number of distinct session days with stored intraday bars in
+        [start, end]. Timestamps are stored UTC and an RTH session (13:30-21:00 UTC)
+        never crosses a UTC date, so the UTC date prefix IS the session date."""
+        from datetime import timedelta
+        with sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(
+                f"""SELECT COUNT(DISTINCT substr(datetime, 1, 10))
+                    FROM {self._intraday_table}
+                    WHERE symbol = ? AND interval = ?
+                      AND datetime >= ? AND datetime < ?""",
+                (symbol, interval, str(start), str(end + timedelta(days=1))),
+            ).fetchone()
+        return int(row[0] or 0)
+
     def row_count_intraday(self, symbol: str, interval: str = "5m") -> int:
         """Return the total number of stored intraday bars for a symbol."""
         with sqlite3.connect(self._db_path) as conn:
@@ -802,6 +1182,110 @@ class HistoricalDataStore:
 
         log.debug("spread_samples_saved", symbol=symbol, rows=len(rows))
         return len(rows)
+
+    def save_spread_bar_samples(self, symbol: str, df: pd.DataFrame,
+                                source: str | None = None) -> int:
+        """W66: INSERT OR IGNORE hourly per-leg spread samples (dollars).
+
+        Columns: bar_time, right, strike, expiry, dte, bid, ask, underlying_price,
+        delta, iv, role. ``half_spread_usd`` and ``mid`` are derived here so every
+        stored row is internally consistent. Returns rows offered."""
+        if df is None or df.empty:
+            return 0
+        rows = []
+        for r in df.to_dict("records"):
+            bid, ask = float(r["bid"]), float(r["ask"])
+            rows.append((
+                symbol, str(r["bar_time"]), str(r["right"]), float(r["strike"]),
+                str(r["expiry"]), int(r["dte"]), bid, ask, (bid + ask) / 2.0,
+                (ask - bid) / 2.0,
+                None if r.get("underlying_price") is None else float(r["underlying_price"]),
+                None if r.get("delta") is None else float(r["delta"]),
+                None if r.get("iv") is None else float(r["iv"]),
+                r.get("role"), source,
+            ))
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                f"""INSERT OR IGNORE INTO {self._spread_bar_table}
+                   (symbol, bar_time, right, strike, expiry, dte, bid, ask, mid,
+                    half_spread_usd, underlying_price, delta, iv, role, source)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
+        return len(rows)
+
+    def load_spread_bar_samples(self, symbol: str) -> pd.DataFrame:
+        with sqlite3.connect(self._db_path) as conn:
+            return pd.read_sql_query(
+                f"SELECT * FROM {self._spread_bar_table} WHERE symbol = ? ORDER BY bar_time",
+                conn, params=(symbol,))
+
+    def save_leg_spread_model(self, symbol: str, row: dict) -> None:
+        """INSERT OR REPLACE the fitted friction model v2 for a symbol."""
+        import json
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                f"""INSERT OR REPLACE INTO {self._leg_spread_params_table}
+                   (symbol, form, a, b, n, n_sessions, cv_mae, cv_mae_json, source,
+                    calibrated_on) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (symbol, str(row["form"]), float(row["a"]), float(row["b"]), int(row["n"]),
+                 row.get("n_sessions"), row.get("cv_mae"),
+                 json.dumps(row.get("cv_mae_by_form") or {}), row.get("source"),
+                 str(row["calibrated_on"])))
+
+    def save_leg_spread_band_model(self, symbol: str, band: str, row: dict) -> None:
+        """W76: INSERT OR REPLACE the fitted friction model of one DTE band."""
+        import json
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                f"""INSERT OR REPLACE INTO {self._leg_spread_band_table}
+                   (symbol, dte_band, form, a, b, n, n_sessions, cv_mae, cv_mae_json, source,
+                    calibrated_on) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (symbol, str(band), str(row["form"]), float(row["a"]), float(row["b"]),
+                 int(row["n"]), int(row["n_sessions"]), row.get("cv_mae"),
+                 json.dumps(row.get("cv_mae_by_form") or {}), row.get("source"),
+                 str(row["calibrated_on"])))
+
+    def record_captures(self, symbol: str, rows: list[dict]) -> int:
+        """W82: INSERT OR REPLACE one row per (expiry, stage, run date) the lifecycle collector
+        requested. Returns rows written."""
+        if not rows:
+            return 0
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                f"""INSERT OR REPLACE INTO {self._capture_log_table}
+                   (symbol, expiry, stage, captured_on, dte_at_capture, lookback_days, contracts)
+                   VALUES (?,?,?,?,?,?,?)""",
+                [(symbol, str(r["expiry"]), str(r["stage"]), str(r["captured_on"]),
+                  int(r["dte_at_capture"]), int(r["lookback_days"]), int(r["contracts"]))
+                 for r in rows])
+        return len(rows)
+
+    def load_capture_log(self, symbol: str) -> pd.DataFrame:
+        """W82: every recorded capture for ``symbol`` (empty frame when none)."""
+        with sqlite3.connect(self._db_path) as conn:
+            return pd.read_sql_query(
+                f"SELECT * FROM {self._capture_log_table} WHERE symbol = ? ORDER BY captured_on",
+                conn, params=(symbol,))
+
+    def load_leg_spread_band_models(self, symbol: str) -> dict[str, dict]:
+        """W76: {dte_band: row} of every stored band model for ``symbol`` (may be empty)."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"SELECT * FROM {self._leg_spread_band_table} WHERE symbol = ?",
+                (symbol,)).fetchall()
+        return {r["dte_band"]: dict(r) for r in rows}
+
+    def load_leg_spread_model(self, symbol: str) -> dict | None:
+        """Fitted friction model v2 for a symbol, or None if never calibrated."""
+        with sqlite3.connect(self._db_path) as conn:
+            r = conn.execute(
+                f"""SELECT form, a, b, n, n_sessions, cv_mae, source, calibrated_on
+                   FROM {self._leg_spread_params_table} WHERE symbol = ?""",
+                (symbol,)).fetchone()
+        if r is None:
+            return None
+        return {"form": r[0], "a": r[1], "b": r[2], "n": r[3], "n_sessions": r[4],
+                "cv_mae": r[5], "source": r[6], "calibrated_on": r[7]}
 
     def save_spread_params(self, symbol: str, params: dict) -> None:
         """INSERT OR REPLACE fitted spread model params for a symbol."""

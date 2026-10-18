@@ -181,3 +181,31 @@ def get_recent_trading_days(n: int) -> list[date]:
     schedule = _nyse.schedule(start_date=start, end_date=today)
     dates = [d.date() for d in schedule.index[-n:]]
     return dates
+
+
+def next_session_on_or_after(d: date, max_ahead: int = 10) -> date:
+    """W74: the first NYSE session on or after ``d`` (``d`` itself when it trades).
+
+    Listed expiries never fall on a weekend or holiday; an option "N days out"
+    that lands on one expires on the next session instead. ``max_ahead`` bounds
+    the lookup (the longest NYSE closure is far shorter) and a miss raises
+    rather than inventing a date.
+    """
+    sched = _nyse.schedule(start_date=d, end_date=d + timedelta(days=max_ahead))
+    if sched.empty:
+        raise ValueError(f"no NYSE session within {max_ahead} days of {d}")
+    return sched.index[0].date()
+
+
+def time_to_expiry_years(now: datetime, expiry: date, close: time | None = None) -> float:
+    """W74: fractional calendar years from ``now`` to the expiry's closing bell.
+
+    PM-settled ETF options stop trading at the session close, 13:00 ET on an
+    early-close day (``get_market_close``), so a 0-DTE option held at 10:30 has
+    ~5.5 hours of life, not zero and not a whole day. ``now`` must be tz-aware.
+    Floors at 0 once the bell has passed. ``close`` overrides the lookup (tests).
+    """
+    if now.tzinfo is None:
+        raise ValueError("time_to_expiry_years needs a timezone-aware 'now'")
+    bell = datetime.combine(expiry, close if close is not None else get_market_close(expiry), tzinfo=ET)
+    return max((bell - now.astimezone(ET)).total_seconds(), 0.0) / (365.0 * 86400.0)

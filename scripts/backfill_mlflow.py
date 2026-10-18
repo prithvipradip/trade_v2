@@ -29,7 +29,10 @@ def _read_initial_capital_from_snapshot(run_dir: Path) -> float | None:
         return None
     try:
         cfg = yaml.safe_load(snapshot.read_text()) or {}
-        return cfg.get("backtest", {}).get("initial_capital")
+        # W-capital: account.capital is the home now; older archived
+        # snapshots still carry backtest.initial_capital.
+        return ((cfg.get("account") or {}).get("capital")
+                or (cfg.get("backtest") or {}).get("initial_capital"))
     except Exception:
         return None
 

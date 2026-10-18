@@ -63,6 +63,14 @@ broker-position check — the bot would rebuild what you just closed, inverted
    `STATE DB BACKUP FAILED` alert this week means the mirror is suspect):
    `python -c "import sqlite3; print(sqlite3.connect(r'file:C:/Users/prith/Documents/ait_backups/ait_state.latest.db?mode=ro', uri=True).execute('SELECT MAX(exit_time) FROM trades').fetchone())"`
    — must show this week's latest close. (And that folder syncs to cloud.)
+4. Reading the OTHER box's logs: the supervisor fetches `origin/shared-logs` itself every
+   weekday at **16:50 ET** (5 min after this box's 16:45 publish; a fetch only, it never
+   touches the checkout, and it does not need `AIT_LOG_OWNER`). Its log line
+   `shared_logs_fetched` carries `latest_by_owner`: a stale date there means that box has
+   stopped publishing. Read a day with
+   `python scripts/read_shared_logs.py --owner <name> --date YYYY-MM-DD --no-fetch`
+   (drop `--no-fetch` to force a fresh fetch). Publishing your OWN days additionally needs
+   `AIT_LOG_OWNER=<name>` in this box's `.env` (the job is silent without it).
 
 ## Deploy checklist (EVERY deploy — the 2026-07-10 incident is why)
 A green test suite is not a safe deploy: on 07-10 unit tests passed and the
@@ -120,6 +128,319 @@ unmanaged), found a day later. Do all five steps, in order:
    `git tag -a deploy-YYYYMMDD -m "smoke pass + first-RTH liveness OK"` then
    `git push origin --tags`. Only tag AFTER step 4 passes.
 
+## Fixed limits (NOT configurable — visible on purpose)
+
+These values are deliberately fixed in code, in ONE module: `src/ait/config/invariants.py`.
+They are not in `config.yaml` or `.env` because each is either a **backstop that exists to
+catch the system (or its configuration) being wrong**, a **rule imposed from outside**, or
+the **line a config value is checked against**. Anything in `config.yaml` is tunable
+regardless of a comment — the file is shared between machines through git and edited by
+people and AI sessions — so putting these there would let one edit loosen both a gate and
+its check. They are logged at every start (`fixed_limits_in_effect`). To change one: edit
+the module, update this table (a test compares them), and record it in PLAN.md.
+
+| Name | Value | Why it is fixed (and where enforced) |
+|---|---|---|
+| `ORDER_RATE_LIMIT_MAX` | 8 | Max orders in the window below; the next is refused and logged CRITICAL. A backstop against a logic bug spamming placements — if config could raise it, the bug it exists to stop would not be stopped. `executor.py` (entry + roll placement share one bucket). |
+| `ORDER_RATE_LIMIT_WINDOW_S` | 60 | The rolling window for the limit above. |
+| `NBBO_DISORDERLY_SPREAD_RATIO` | 1.0 | A combo entry whose (ask − bid) is wider than its own mid is rejected. Backstop against a bad quote (delayed data, crossed/locked market). Distinct from the configurable per-contract `options.max_bid_ask_spread_pct`. `executor.py`. |
+| `NBBO_STALE_SIGNAL_DEVIATION` | 0.35 | A combo entry whose signal price differs from the live mid by more than 35% is rejected: the signal was priced on a market that has since moved. `executor.py`. |
+| `NBBO_MID_FLOOR` | 0.05 | The two tests above apply only when \|mid\| exceeds this; below it ratios blow up and mean nothing. `executor.py`. |
+| `LIVE_MAX_SPREAD_PCT` | 0.15 | Startup refuses a non-paper mode if `AIT_LIQ_MAX_SPREAD` or `options.max_bid_ask_spread_pct` exceeds it. It is the line config is checked AGAINST (paper is relaxed to 0.40), so it cannot live in the file it checks. `orchestrator.py` GOV-5. |
+| `LIVE_MIN_VOLUME` | 10 | Startup refuses a non-paper mode if `AIT_LIQ_MIN_VOLUME` is below it. Same reason. Documented in the go-live checklist below. |
+| `PDT_MAX_DAY_TRADES` | 3 | Day trades the bot allows itself per window. FINRA's pattern-day-trader rule flags margin accounts under $25,000 at 4 in 5 business days; this is the law, not a preference. The *switches* are config: `account.pdt_protection`, `account.pdt_account_under_25k`. `pdt_guard.py`. |
+| `PDT_WINDOW_DAYS` | 5 | The rolling window for the rule above. |
+| `BROKER_SNAPSHOT_TTL_SECONDS` | 5.0 | How long the all-clients open-order snapshot is re-used within and across fill checks. A cache lifetime that avoids repeated broker round trips — API-call pacing, not a trading preference. `executor.py`. |
+| `IC_BUDGET_CAPPED_MIN_WING` | 1.0 | Narrowest wing a budget-capped iron condor may shrink to, in dollars: $1 is the narrowest the listed-strike grid offers. The *configurable* minimum wing is `backtest.wing_floor_dollars` (`AIT_IC_WING_FLOOR`, default $2), which binds only when the per-trade budget does not. `iron_condor.py`, `engine.py`. |
+
+The 30 s fast-monitor tick is not repeated here: its single source is
+`ait/utils/cadence.py::FAST_MONITOR_CADENCE_SECONDS`.
+
+## Order lifecycle timeline (what happens to an order, and for how long)
+
+Every age below is evaluated on the **30 s fast-monitor tick** (measured 2026-09: median
+30.9 s between ticks, 98% under 35 s, worst 100 s), so a duration under 30 s takes effect at
+the next tick. Tunables live in `config.yaml` (each key carries Floor / Ceiling / IMPACT next
+to it); the startup log `order_timeline_in_effect` prints every effective value.
+
+**Exit order (position is CLOSING)**
+
+| Age | What happens | Key (default) | Floor and why |
+|---|---|---|---|
+| 0 – grace | Ignored by the fill checker so it can appear in IBKR's trade list; a brand-new order would otherwise read as cancelled. | `exit.order_visibility_grace_seconds` (10) | 5 s. A margin, not a measurement: the one acknowledgement we could time took < 1 s (an entry). Must be below the stop rest. |
+| rest | Still unfilled: a cancel is requested but the position stays CLOSING so the monitor can re-price. Stops rest less than ordinary exits. | `exit.exit_stop_pending_rest_seconds` (120) / `exit.exit_pending_rest_seconds` (300) | 15 s / 30 s. The stop rest may not exceed the ordinary rest. |
+| band TTL | A broker "price band" reject stops capping later attempts. | `exit.exit_band_ttl_seconds` (300) | 30 s. |
+| foreign | The order belongs to ANOTHER clientId and cannot be cancelled from here: the operator is paged instead. | `exit.foreign_exit_escalation_seconds` (300) | 60 s, and not below the ordinary rest (paging earlier is noise). |
+| zombie | Still unresolved: the broker is asked; only if it answers and does not list the order is CLOSING reverted to FILLED so a fresh exit can fire (otherwise held CLOSING and paged). | `exit.zombie_exit_revert_seconds` (900) | 120 s hard floor, and **>= 2 x the longer rest time** (600 s today): the cancel needs at least as long to resolve as the order was given to fill, or a fill that is merely not yet visible is re-armed as a duplicate close. Raising a rest therefore raises this and the foreign threshold too; startup names each. |
+
+**Entry order**
+
+| Age | What happens | Key (default) | Floor and why |
+|---|---|---|---|
+| every step | An unfilled entry combo's limit steps toward marketable (0.25 / 0.60 / 1.00 of the offset). | `positions.entry_ladder_step_seconds` (45) | 30 s = the tick; below it steps are skipped, not honored. Observed: the first reprice of a real order fired at +49 s because it is only seen on a tick. |
+| partial | A PARTIALLY filled entry has its remainder cancelled so legs are not orphaned. | `positions.partial_fill_cancel_seconds` (30) | 5 s; below the entry timeout. |
+| absent | An entry ABSENT from the trade list is treated as still pending while younger than this (a disconnect makes every working entry look cancelled for a moment). | `positions.absent_order_grace_seconds` (30) | 10 s; below the entry timeout. |
+| timeout | An unfilled entry is cancelled. | `positions.entry_order_timeout_seconds` (240) | 30 s. |
+
+**What the floors rest on, honestly.** One entry order (2026-09-28) was acknowledged by IBKR
+in under 1 s; two more (QQQ and SPY, Prithvi's box) filled in 11.4 s and 14.4 s; no exit
+order has been timed and no mid-session disconnect occurred in the retained logs. The floors
+are engineering margins. The `order_ack_latency` log event (entry and exit, sub-second, from
+ib_insync's own `Trade.log`) and `order_absent_judged` collect the real distribution and are
+published to the `shared-logs` branch; revisit the floors once a few dozen paper orders,
+including exits, exist.
+
+## Short-DTE friction collection (W76; research only, read-only against the broker)
+
+The research engine had no real bid/ask sample below 11 DTE, so every 0-6 DTE leg was charged an
+extrapolated half-spread. IB serves historical BID/ASK bars for currently LISTED contracts only
+(nothing for expired ones), so this data cannot be backfilled: it has to be collected forward,
+one RTH session at a time, while the 0-6 DTE contracts are still listed.
+
+**Each trading day** (paper Gateway/TWS is fine; it only requests historical data, never orders).
+The port defaults to `IBKR_PORT` from `.env` (7497 for TWS paper, 4002 for Gateway paper), the
+same value the bot uses; pass `--port` only to override. A "could not connect" error almost
+always means TWS/Gateway is not running on that port:
+
+```bash
+# 1) see the plan first (no data requested, nothing stored)
+python scripts/calibrate_option_spreads.py --source ib-bars --short-dte --symbols QQQ \
+    --client-id 91 --dry-run
+
+# 2) collect + fit (about 40-55 min per symbol: IB paces historical requests at 60 / 10 min)
+python scripts/calibrate_option_spreads.py --source ib-bars --short-dte --symbols QQQ \
+    --client-id 91
+```
+
+- **When: about 15:30 ET, BEFORE the close.** Measured 2026-10-13: after the session ends IB no
+  longer serves that day's expiring contracts, so an after-close run can never capture DTE 0 (its
+  expiry list starts at the next day). At 15:30 the entry window's last bar (14:30-15:30) has ended,
+  so one run holds the whole expiry day; the DTE-0 contracts are requested first. A run any later
+  adds no bar (the 15:30 bar is outside the entry window). Bars whose hour had not ended are never
+  stored (`in_progress_bars_skipped` in the summary).
+- **Client id:** use one that is not the bot's (the bot uses 326 and its fallback ladder); the example
+  uses 91, the repo's calibration convention. W66 verified this request type against the paper
+  Gateway (historical BID and ASK bars of listed options, market closed). If a run
+  returns no bars for every contract, that is an account/permission question for IB, not a bug here.
+- **Coverage:** the run prints samples and distinct sessions per DTE 0..6 and, per band
+  (`0-2`, `3-6`), `collecting: N/15 sessions (M more needed)` until `ACTIVE`.
+- **Target:** at least 15 sessions per band (`backtest.friction_min_sessions_per_band`). Weekends
+  and holidays do not count; missing a day only delays the date, nothing is lost.
+- **Failure:** a pacing violation backs off 60 s and continues; an unqualifiable contract is skipped.
+  Re-running the same day is safe (`INSERT OR IGNORE`).
+- **Using it:** set `backtest.friction_short_dte: true` in `config_research.yaml`. A band below the
+  minimum is charged the all-DTE model floored at `friction_extrapolated_floor_usd` ($0.01 per leg)
+  and the run logs `friction_summary` (fitted / extrapolated counts). Off by default.
+- **Storage:** `data/historical.db` tables `option_spread_bar_samples` (raw) and
+  `option_leg_spread_band_params` (fits). Both are research tables; the live bot never reads them.
+
+### Lifecycle capture (W82): one run a day, each contract downloaded about twice in its life
+
+The per-day collector above asks every contract in range for its last 7 days, every day, so a
+contract is downloaded 5-11 times and `INSERT OR IGNORE` throws the overlap away. IB serves 30 days
+of hourly BID/ASK bars for any LISTED option in one request, and what is perishable is the contract
+at its EXPIRY, not each day. `--lifecycle` therefore captures a contract's life:
+
+```bash
+python scripts/calibrate_option_spreads.py --source ib-bars --short-dte --lifecycle \
+    --symbols QQQ --client-id 91 --dry-run      # the plan: stage A / stage B and the minutes
+python scripts/calibrate_option_spreads.py --source ib-bars --short-dte --lifecycle \
+    --symbols QQQ --client-id 91
+```
+
+- **Stage A (perishable):** expiries today..today+`--expiring-days` (default 1, so one missed day is
+  recoverable). DTE 0 is requested first; run at 15:30 ET like the per-day collector.
+- **Stage B (coverage debt):** far-listed expiries at 15-21 DTE whose DTE 31-45 tail is not stored,
+  nearest first, capped by `--max-far-contracts` (default 120, about 43 minutes); the rest is
+  deferred to the next run. "Not stored" is read from the database (a logged stage-B capture, or
+  at least 5 stored sessions at DTE >= 31), so a missed day or a manual catch-up needs no state file.
+- **Strikes:** the union, over every `--thin-every`-th session of the underlying's path, of what a
+  condor would have sold that day (that day's spot, stored IV and DTE), instead of the strikes near
+  the CURRENT spot. `--thin-every 1` is every session (2-3x the contracts).
+- **Every request asks 30 D**, so a run also recovers the preceding month of sessions for contracts
+  still listed; a run any time within 30 days of a volatility spike retrieves the spike's mid/far-DTE
+  sessions. Only contracts that EXPIRE during a spike need the daily run.
+- **Bands:** 0-2, 3-6, 7-13, 14-29, 30-45 DTE are each fitted and gated on 15 sessions
+  (`backtest.friction_min_sessions_per_band`). Only 0-6 DTE is extrapolated (floored at the tick)
+  while unfitted; a 7+ band without a fit is answered by the all-DTE model as before.
+- **TWS or IB Gateway:** the script and the supervisor job accept either endpoint of the configured
+  account type (paper 7497 <-> 4002, live 7496 <-> 4001) and never probe across account types. The
+  log prints `[port] 7497 ... is not listening; using 4002 (IB Gateway (paper))` when it falls back.
+- **Capture log:** `option_capture_log` in `data/historical.db` (one row per requested expiry and
+  run); the status file adds `stage_a`, `stage_b` and `deferred_b`.
+- **Supervisor job:** set `data_collection.lifecycle: true` (with `short_dte_enabled: true`); the
+  per-day behaviour stays the default.
+
+### Automatic collection (supervisor job, W76)
+
+Instead of running the command by hand every session, the supervisor (`run_orchestrator.py`) can
+run it Mon-Fri after the close. It is OFF by default.
+
+1. Prove it manually once: the `--dry-run`, then one real run (above).
+2. In `config.yaml` uncomment the `data_collection:` block at the bottom and set
+   `short_dte_enabled: true` (time defaults to 15:30 ET, symbols `[QQQ]`, client id 91).
+3. **Restart the supervisor** (`run_orchestrator.py`): a process runs on the settings it started with.
+   It logs `short_dte_collection_scheduled | time_et=15:30 ...` at startup if it took effect.
+4. Keep the supervisor and TWS/Gateway running at that time. The box being off skips that day
+   (nothing else is lost); the supervisor gives a job an hour of grace if it was only just started.
+
+What it does at the scheduled time: skips non-trading days; refuses to run if the IB port
+(`IBKR_PORT`) is not listening or the client id collides with the bot's (`IBKR_CLIENT_ID` and
++100..+104); runs the same script with an idle timeout (20 min of silence) and a hard cap
+(150 min); never touches the bot or any order.
+
+How to see progress, without opening logs:
+
+- `data/short_dte_collection_status.json`: counters of the last run, stored samples per DTE and
+  sessions, and per band `sessions` vs `needed`, `active` once the band has a fit and 15 sessions.
+- `logs/short_dte_collect_YYYYMMDD.log`: the script's own output for that day.
+- `logs/orchestrator.log`: `short_dte_collection_ok | stored=... bands={...}`.
+
+You get a Telegram message (at most one per day) only when something is wrong: the IB port is
+closed, the client id is refused, the run failed or timed out, or it stored zero samples. A
+healthy day is silent.
+
+## Research-vs-reality parity replay (W72; research only, never touches live state)
+
+Runs known real trades through the RESEARCH engine's pricing and exit code and reports where
+research disagrees with what actually filled. Use it before trusting a DTE band in an Optuna
+study, and after any change to `backtesting/pricing.py`, `friction.py` or the engine's exit path.
+
+```bash
+python scripts/parity_replay.py                 # reads data/replay/manual_trades_*.json
+```
+
+- **Inputs (all read-only):** the replay file (`data/replay/`, git-ignored; never commit it),
+  `data/historical.db` research tables, and the bot's combo-fill context in `data/ait_state.db`.
+- **Outputs:** `data/replay/out/<YYYYMMDD>/` (`summary.md` = statistics only and safe to quote;
+  `trades.csv` / `legs.csv` carry per-trade prices and stay local). The CLI refuses any output
+  directory inside the repo outside `data/replay/`.
+- **Reading it:** error = model - actual, so positive means research is RICHER than reality.
+  `engine` = what the engine does today (daily close + same-day IV); `clean` = what was knowable at
+  the fill. A band with fewer trades than `parity.min_trades_per_band` is INSUFFICIENT, never PASS.
+- **Tolerances:** `parity:` in `config_research.yaml` (operator-owned).
+- **Expiry settlement (W77):** `summary.md` also carries an "Expiry settlement parity" section for
+  every structure that reached its expiry bell: how many leg outcomes (expired / exercised /
+  assigned) `ait.backtesting.settlement` reproduced from the statement's close codes, whether the
+  shares left over the gap match, and the P&L error. The model marks leftover shares at the NEXT
+  session's open; a trader who waited shows up as error and the section says how long they waited.
+  The assumptions (`backtest.pin_band_usd`, `assignment_fee_per_share`,
+  `stock_commission_per_share`) are operator-owned. In the research engine the settlement path is
+  only reached with `engine_model: realistic` AND a position the take-profit ladder / touch stop did
+  not already close, so it matters most for studies that disable those exits.
+- **Never paste** per-trade prices, P&L or any account identifier into PLAN.md: it is shared via
+  git with the other box. Report error statistics by DTE band only.
+
+## Per-horizon range models and the decision frame (W78; research only)
+
+- **Range models per horizon.** The walk-forward trains the range gate's model for the horizon the
+  study's entry DTE can actually reach (`ait.ml.range_spec.horizon_for`, shared with the live spec).
+  The configured band's own horizon is the base model (unchanged: 9 bars at `dte_range [14, ...]`);
+  any other DTE is rounded UP to a bucket in `RANGE_HORIZON_BUCKETS` and trained once per window, on
+  demand. Non-base buckets save under `models/research/h<N>/`; the live `models/range.pkl` is never
+  touched. `python scripts/range_horizon_study.py --symbol QQQ` measures out-of-sample skill, abstention
+  and reliability per horizon (read-only; artifacts go to a temp directory).
+- **Abstention is not a bug.** When no ensemble member has cross-validated edge over the base rate the
+  model returns no probability; the engine's range gate then rejects (enforce) or would-reject
+  (observe). The study reports how often that happens per horizon: read it before enforcing the gate.
+- **Decision frame.** With `engine_model: realistic` and intraday entries, the entry gates and models
+  see history through the PREVIOUS session (a 10:30 decision cannot know that day's close), and an
+  entry counts positions that were still alive at its fill time toward `max_concurrent_positions`.
+  Legacy and daily-close studies are unchanged.
+
+## The IV-rank rise veto is research-only (W71)
+
+- **What it is.** The research engine blocks a neutral credit entry when the FeatureEngine `iv_rank`
+  (a REALIZED-vol range rank, 0-1) rose by more than `backtest.iv_rank_rise_threshold` (0.30) over
+  10 rows. **Live has no such veto**: it gates on the LEVEL of the stored-IV percentile (condor floor
+  15, credit cap 85; `ait.data.iv_rank`). `tests/test_w71_iv_rank_parity.py` pins that nothing outside
+  the research modules reads the threshold.
+- **Measure it:** `python scripts/iv_rank_parity_probe.py [--ab --workers 6]` (read-only; seconds for
+  the series comparison, minutes for the engine A/B). It reports how the two ranks relate, how many of
+  the veto's days live would have refused anyway and how many are days live WOULD trade.
+- **It is OFF in research (W71c, decision D9):** `backtest.iv_rank_rise_gate: false` in
+  `config_research.yaml`. The code, the 0.30 threshold and its 0.25-0.60 search range are kept; while
+  the gate is off the rise is still recorded per entry (`iv_rank_rise_10d`) and the optimizer does not
+  search the threshold. The parity manifest prints a RESEARCH-ONLY warning only while it is ON.
+- **The bar for turning it back on** (also written next to the key): a MULTI-WINDOW walk-forward with
+  the gate ON vs OFF, same windows / engine / pricing / friction (`iv_rank_parity_probe.py --ab` is
+  the starting tool), showing an OUT-OF-SAMPLE gain beyond the window-to-window noise on days live's
+  level gates would have TRADED. If it earns its place, port it to live as well (W80-class).
+- The research IV series and live's stored series are the same IB historical IV except on the few days
+  live's own scan wrote (a median across expiries), so the level gates are at parity.
+
+## One-sided entry gates: what research blocks that live does not, and the reverse (W81)
+
+- **Why this section exists.** Research and live can disagree about whether a condor may open
+  without any parameter differing: a gate that exists on ONE side only. The 2026-10-13 audit found
+  three: the research realized-vol cap (`backtest.max_entry_vol_annual`, 0.80; Optuna searches it),
+  the research trending-down regime veto (`backtest.regime_veto_gate`), and live's VIX halt
+  (`risk.credit_vix_halt`, 28, plus the VIX-tiered credit caps), which research does not simulate.
+- **Where it is visible.** `python run_backtest.py` prints one warning per ACTIVE one-sided gate
+  (`vol_gate`, `regime_veto`, `vix_halt`, plus the existing rise-veto line) and records
+  `live_only_gates_not_simulated`. The registry is `ait.backtesting.gate_parity`: every reason the
+  engine can reject on is classified there as a live twin, a research-only gate (with its switch) or
+  mechanics, and `tests/test_w81_gate_parity.py` fails if the engine grows a reason without a row.
+- **The switch.** `backtest.regime_veto_gate` (schema default true, so nothing moves; the overlay does
+  not set it: decision D10). False skips the veto only; the day class is still recorded per entry
+  (`regime_class`; a day the veto would have blocked is flagged `regime_veto_suppressed`). Its
+  thresholds are `backtest.regime_down_threshold` (-0.05) and `regime_up_threshold` (0.02), which
+  were bare literals at three engine sites.
+- **Measure it:** `python scripts/gate_parity_ab.py --workers 3 [--entry-dte N]` (read-only; about 8
+  minutes at three symbols and four arms; the VIX closes come from Yahoo). Arms: baseline, regime
+  veto off, vol cap off, both off; then live's VIX halt is applied after the fact (no slot re-use).
+  **Re-run it whenever the gate order, the IV-rank cap or the entry-DTE range changes: these gates
+  only matter on the days that reach them.** First result (2026-10-13): at entry DTE 14 the veto
+  reached 0 / 0 / 3 days (QQQ / SPY / IWM), the vol cap 0, and no trade entered on a day whose
+  previous VIX close was >= 28 (18 such sessions); the same at DTE 1, 3 and 7 on QQQ and IWM.
+- **Research `r`.** The engine now prices with `options.risk_free_rate` (the key live's Greeks read);
+  it was a bare 0.05 at three sites. Same value today.
+
+### The ex-dividend entry block (W84; research twin of live's W51 block)
+
+- **What live does.** The bot refuses a new position that SELLS A CALL when the projected next
+  ex-dividend date falls between today and the chosen expiry (log event `trade_blocked_ex_div`): a
+  short call can be assigned early the day before an ex-date. The projection is
+  `ait.data.dividends.project_next_ex_div` (the last 4 ex-dates from yfinance, mean gap, stepped to
+  today). It blocks 14-17% of sessions at entry DTE 14.
+- **The research twin.** `backtest.ex_div_entry_gate`: `off` | `live` (live's rule exactly, from the
+  ex-dates known before the entry day) | `exact` (any real ex-date in [entry, expiry]) |
+  `last_k_days` (a real ex-date within `backtest.ex_div_entry_k_days`, default 5, of expiry). The
+  schema default is `off`; `config_research.yaml` sets `live`. The manifest warns whenever research
+  differs from live (`ex_div_entry:`); the registry row is a live twin.
+- **Data.** The gate reads `research_dividends` in `data/historical.db`; any mode but `off` raises
+  without it. Refresh it (yfinance; prints per-year counts and off-cycle gaps; writes
+  `reports/dividends_audit_<date>.json`; a non-empty prefix is required):
+  `python scripts/backfill_dividends.py --symbols QQQ SPY IWM --table-prefix research_ [--dry-run]`.
+  Re-run it before a study that ends after the last stored ex-date.
+- **Measure it:** `python scripts/ex_div_gate_ab.py --workers 3 [--entry-dte 14 7] [--k 3 5 7]`
+  (read-only; about 15 minutes for 36 runs). Real engine runs, so a blocked entry frees its slot.
+  The `live` arm answers the parity question; `exact` and `last_k_*` are the evidence for changing
+  live's rule (decisions F2 / F3, the operator's call). Research does NOT model early assignment, so
+  the A/B shows what the block costs, not what it protects against.
+
+## Searching the entry DTE (W79a; research only)
+
+- **Switch:** `python run_backtest.py --optimize-per-window --search-dte [--dte-range 0 45]
+  [--optimize-strict]`. Off by default; `backtest.dte_search` (schema defaults, overlay-overridable)
+  holds the ranges. The existing `IRON_CONDOR_SPACE` is untouched, so every other study is unchanged.
+- **What is searched:** entry DTE, the expiry guard (sampled only for entries it can exempt: at or
+  below the top of its range) and the hold fraction (which REPLACES `max_hold_days`). The flatten is
+  not searched: `scripts/dte_dimension_flatness.py` showed it moves nothing while the take-profit
+  ladder is on. The credit floors (`ic_min_credit*`) are never searched; run them as sensitivities.
+- **Always pass `--optimize-strict` for numbers you will quote.** Without it a window whose
+  optimisation fails runs the BASE config and the summary only reports a count
+  (`optimization_failures`); with it the study stops.
+- **Reading the report:** a band is a *candidate* only if it holds a top-decile trial in at least two
+  thirds of windows. Promotion also needs its parity band to PASS (`scripts/parity_replay.py`) and its
+  friction band to be ACTIVE (`data/short_dte_collection_status.json`). The report prints a reminder;
+  it does not check either.
+- **History limit:** the option-bar history is about two years (free tier), so a surface-priced study
+  has only a handful of out-of-sample quarters. Use shorter training windows and/or pool symbols, and
+  say so next to any number.
+- **Decisions D1 and D8** (realistic engine, short-DTE friction floor) are in `config_research.yaml`;
+  the live bot never loads it. `run_optimizer.py --apply` still writes only four named params.
+
 ## Quarterly drills (scheduled — first week of Jan / Apr / Jul / Oct)
 Run both, then record the date in the log table below. An untested kill
 switch or backup is a hope, not a control.
@@ -158,5 +479,5 @@ switch or backup is a hope, not a control.
 - [ ] Revert paper-relaxed liquidity gates: `AIT_LIQ_MAX_SPREAD` ≤ 0.15,
       `AIT_LIQ_MIN_VOLUME` ≥ 10, config `max_bid_ask_spread_pct` ≤ 0.15
       (startup asserts this in live mode and will refuse to run otherwise)
-- [ ] `AIT_SIMULATED_CAPITAL` removed; account funded $3k CAD
+- [ ] simulated capital OFF: `account.simulate_live_capital: false` in config.yaml (W63; was `AIT_SIMULATED_CAPITAL` in .env — also make sure no `AIT_SIMULATED_CAPITAL` override remains in .env); account funded $3k CAD
 - [ ] Fresh DB backup taken; PLAN.md gates re-read

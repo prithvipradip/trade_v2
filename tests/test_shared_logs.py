@@ -59,8 +59,8 @@ class TestScrub:
             assert secret not in out
 
     def test_account_ids_are_redacted(self):
-        out = sl.scrub('{"account": "DUN603821", "live": "U21959335", "paper": "DUO442667"}')
-        assert "DUN603821" not in out and "U21959335" not in out and "DUO442667" not in out
+        out = sl.scrub('{"account": "DU0000001", "live": "U0000002", "paper": "DUO000003"}')
+        assert "DU0000001" not in out and "U0000002" not in out and "DUO000003" not in out
         assert out.count("[ACCOUNT]") == 3
 
     def test_ordinary_trading_fields_survive(self):
@@ -105,9 +105,9 @@ class TestSelectDay:
         logs = tmp_path / "logs"
         _write_logs(logs, {"ait.log": [
             _ev("2026-09-28T14:00:00Z", "polygon_disabled_auth_failures",
-                detail="apiKey=SECRET9999 rejected", account="DUN603821")]})
+                detail="apiKey=SECRET9999 rejected", account="DU0000001")]})
         out = sl.select_day_events(logs, DAY)[0]
-        assert "SECRET9999" not in out and "DUN603821" not in out
+        assert "SECRET9999" not in out and "DU0000001" not in out
 
 
 class TestExportAndRead:
@@ -274,3 +274,164 @@ class TestSupervisorJob:
         m._register_recurring_jobs(_S(), bot=None, web=None)
         fn, trig = jobs["shared_logs_publish"]
         assert fn is m.publish_shared_logs and "hour='16'" in trig and "minute='45'" in trig
+
+
+# --------------------------------------------------------------------------- #
+# W70 follow-up: the scheduled fetch of origin/shared-logs (16:50 ET)
+# --------------------------------------------------------------------------- #
+
+DAY2 = date(2026, 9, 29)
+
+
+class TestFetchSharedBranch:
+    def _publish(self, tmp_path, origin, name, day, ts):
+        repo = _box(tmp_path, origin, name)
+        assert sl.publish(repo, name, [day], logs_dir=_logs_for(repo, ts)).ok
+        return repo
+
+    def test_refreshes_origin_and_reports_the_newest_day_per_owner(self, tmp_path, origin):
+        # ahmed is cloned BEFORE anyone publishes: his clone has no shared-logs ref yet
+        # (a clone made afterwards would already carry every branch).
+        ahmed = _box(tmp_path, origin, "ahmed")
+        prithvi = self._publish(tmp_path, origin, "prithvi", DAY, "2026-09-28T14:00:00Z")
+        res = sl.fetch_shared_branch(ahmed)
+        assert res.ok and res.advanced and res.new_commits >= 1, res
+        assert res.latest_by_owner == {"prithvi": "2026-09-28"}
+        assert res.head and len(res.head) == 12
+
+        again = sl.fetch_shared_branch(ahmed)        # nothing new
+        assert again.ok and not again.advanced and again.new_commits == 0
+        assert again.head == res.head
+
+        # the peer publishes the next day -> the next fetch sees it, per owner
+        assert sl.publish(prithvi, "prithvi", [DAY2],
+                          logs_dir=_logs_for(prithvi, "2026-09-29T14:00:00Z")).ok
+        nxt = sl.fetch_shared_branch(ahmed)
+        assert nxt.ok and nxt.advanced and nxt.new_commits >= 1
+        assert nxt.latest_by_owner == {"prithvi": "2026-09-29"}
+
+    def test_each_owner_reports_its_own_latest_day(self, tmp_path, origin):
+        self._publish(tmp_path, origin, "prithvi", DAY, "2026-09-28T14:00:00Z")
+        ahmed = _box(tmp_path, origin, "ahmed")
+        assert sl.publish(ahmed, "ahmed", [DAY2],
+                          logs_dir=_logs_for(ahmed, "2026-09-29T14:00:00Z")).ok
+        third = _box(tmp_path, origin, "third")
+        res = sl.fetch_shared_branch(third)
+        assert res.ok
+        assert res.latest_by_owner == {"prithvi": "2026-09-28", "ahmed": "2026-09-29"}
+
+    def test_the_live_tree_is_untouched(self, tmp_path, origin):
+        """A FETCH: no checkout, no merge, no worktree, no local branch."""
+        self._publish(tmp_path, origin, "prithvi", DAY, "2026-09-28T14:00:00Z")
+        ahmed = _box(tmp_path, origin, "ahmed")
+        head = _run(["git", "rev-parse", "HEAD"], ahmed)
+        branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], ahmed)
+        branches = _run(["git", "branch", "--list"], ahmed)
+        assert sl.fetch_shared_branch(ahmed).ok
+        assert _run(["git", "rev-parse", "HEAD"], ahmed) == head
+        assert _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], ahmed) == branch
+        assert _run(["git", "status", "--porcelain", "--untracked-files=no"], ahmed) == ""
+        assert _run(["git", "branch", "--list"], ahmed) == branches, "a local branch appeared"
+        assert not (ahmed.parent / f"{ahmed.name}_shared_logs").exists(), "a worktree appeared"
+        # the remote-tracking ref IS the one thing that changed
+        assert _run(["git", "rev-parse", "--verify", "origin/shared-logs"], ahmed).strip()
+
+    def test_no_branch_on_origin_yet_is_a_clean_failure(self, tmp_path, origin):
+        ahmed = _box(tmp_path, origin, "ahmed")      # nobody has published
+        res = sl.fetch_shared_branch(ahmed)
+        assert res.ok is False and res.error and not res.latest_by_owner
+
+    def test_no_remote_at_all_never_raises(self, tmp_path):
+        lone = tmp_path / "lone"
+        lone.mkdir()
+        _run(["git", "init", "-q"], lone)
+        res = sl.fetch_shared_branch(lone)
+        assert res.ok is False and res.error
+
+    def test_a_missing_git_or_a_timeout_never_raises(self, tmp_path, monkeypatch):
+        def _boom(*a, **k):
+            raise FileNotFoundError("git")
+        monkeypatch.setattr(sl.subprocess, "run", _boom)
+        assert sl.fetch_shared_branch(tmp_path).ok is False
+
+        def _timeout(*a, **k):
+            raise subprocess.TimeoutExpired("git", 120)
+        monkeypatch.setattr(sl.subprocess, "run", _timeout)
+        assert sl.fetch_shared_branch(tmp_path).ok is False
+
+    def test_it_runs_a_fetch_not_a_pull_and_never_prompts(self, tmp_path, monkeypatch):
+        seen = []
+
+        def _run_spy(args, **kw):
+            seen.append((list(args), kw))
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="no remote")
+        monkeypatch.setattr(sl.subprocess, "run", _run_spy)
+        sl.fetch_shared_branch(tmp_path)
+        fetches = [(a, kw) for a, kw in seen if a[:2] == ["git", "fetch"]]
+        assert fetches, seen
+        args, kw = fetches[0]
+        assert args[-2:] == ["origin", sl.SHARED_BRANCH]
+        assert kw["env"]["GIT_TERMINAL_PROMPT"] == "0"
+        assert kw["timeout"] == sl.GIT_TIMEOUT_S
+        assert not any("pull" in a or "merge" in a or "checkout" in a for a, _ in seen)
+
+
+class TestFetchSupervisorJob:
+    def _capture(self, monkeypatch, m):
+        logged = []
+        monkeypatch.setattr(m, "_log", lambda level, event, **kw: logged.append((level, event, kw)))
+        return logged
+
+    def test_it_runs_without_an_owner(self, monkeypatch):
+        """Reading a peer's logs does not require publishing your own."""
+        import ait.orchestration.master as m
+        monkeypatch.delenv("AIT_LOG_OWNER", raising=False)
+        called = []
+        monkeypatch.setattr(sl, "fetch_shared_branch", lambda repo: (called.append(repo) or sl.FetchResult(
+            ok=True, advanced=True, head="abc123def456", new_commits=2,
+            latest_by_owner={"prithvi": "2026-10-09"})))
+        logged = self._capture(monkeypatch, m)
+        m.fetch_shared_logs()
+        assert called == [m.ROOT]
+        assert logged == [("INFO", "shared_logs_fetched", {
+            "head": "abc123def456", "advanced": True, "new_commits": 2,
+            "latest_by_owner": {"prithvi": "2026-10-09"}})]
+
+    def test_a_failed_fetch_is_a_warning_not_an_exception(self, monkeypatch):
+        import ait.orchestration.master as m
+        monkeypatch.setattr(sl, "fetch_shared_branch",
+                            lambda repo: sl.FetchResult(ok=False, error="no route to host"))
+        logged = self._capture(monkeypatch, m)
+        m.fetch_shared_logs()
+        assert logged == [("WARNING", "shared_logs_fetch_failed", {"error": "no route to host"})]
+
+    def test_an_exception_inside_never_escapes(self, monkeypatch):
+        import ait.orchestration.master as m
+
+        def _boom(repo):
+            raise RuntimeError("kaboom")
+        monkeypatch.setattr(sl, "fetch_shared_branch", _boom)
+        logged = self._capture(monkeypatch, m)
+        m.fetch_shared_logs()      # must not raise
+        assert logged and logged[0][1] == "shared_logs_fetch_failed"
+
+    def test_it_is_scheduled_at_1650_et_five_minutes_after_the_publish(self):
+        import ait.orchestration.master as m
+        jobs = {}
+
+        class _S:
+            def add_job(self, fn, trigger=None, **kw):
+                jobs[kw.get("id")] = (fn, trigger)
+        m._register_recurring_jobs(_S(), bot=None, web=None)
+        fn, trig = jobs["shared_logs_fetch"]
+        assert fn is m.fetch_shared_logs
+        assert trig.timezone == m.ET, "the cron must be pinned to ET, not the host zone"
+        text = str(trig)
+        assert "day_of_week='mon-fri'" in text and "hour='16'" in text and "minute='50'" in text
+
+        # exactly 5 minutes after the publisher, same day
+        from datetime import datetime
+        start = datetime(2026, 10, 12, 0, 0, tzinfo=m.ET)        # a Monday
+        pub = jobs["shared_logs_publish"][1].get_next_fire_time(None, start)
+        fet = trig.get_next_fire_time(None, start)
+        assert (fet - pub).total_seconds() == 300

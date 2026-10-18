@@ -369,9 +369,9 @@ class TestLaunchSizeCoherenceCheck:
         from ait.strategies.iron_condor import IronCondor
 
         probe = IronCondor()
-        probe.risk_budget = 2100.0 * min(
-            settings.risk.max_position_risk_pct, settings.positions.max_position_pct
-        )
+        # W64: pin the 3% budget this test was written under. The live value
+        # moved to 5% ($105 here -> a $1.17 wing), which is a different premise.
+        probe.risk_budget = 2100.0 * min(0.03, settings.positions.max_position_pct)
         real_width = probe._vol_scaled_width(1.0, None, None, None)
 
         assert real_width == pytest.approx(1.00, abs=0.01), (
@@ -496,6 +496,10 @@ class TestLaunchSizeCoherenceCheck:
         if expected == "daily-loss breaker":
             s = settings.model_copy(deep=True)
             s.risk.max_position_risk_pct = 0.03
+            # W64: the live defaults moved (5% / 4.5% / ratio 1.0), so inject R26's WHOLE original
+            # incoherent setting (3% budget, 2% breaker, the 1.5x rule) to keep proving the arm fires.
+            s.risk.max_daily_loss_pct = 0.02
+            s.risk.breaker_to_max_loss_ratio = 1.5
         probe = _CoherenceProbe(s)
         await probe._launch_size_coherence_check(nlv)
 
@@ -524,6 +528,10 @@ class TestLaunchSizeCoherenceCheck:
         """
         s = settings.model_copy(deep=True)
         s.risk.max_position_risk_pct = 0.03
+        # W64: the live defaults moved (5% / 4.5% / ratio 1.0), so inject R26's WHOLE original
+        # incoherent setting (3% budget, 2% breaker, the 1.5x rule) to keep proving the arm fires.
+        s.risk.max_daily_loss_pct = 0.02
+        s.risk.breaker_to_max_loss_ratio = 1.5
         probe = _CoherenceProbe(s)
         await probe._launch_size_coherence_check(197_000.0)
 

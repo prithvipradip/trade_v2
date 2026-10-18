@@ -78,6 +78,7 @@ _NLV_QUERY = "SELECT value FROM bot_state WHERE key = 'last_net_liquidation' LIM
 # no import weight. If it is ever unreachable the module now fails LOUDLY at
 # import rather than rendering a plausible wrong number.
 from ait.config.runtime_env import capital_base as _capital_base  # noqa: E402
+from ait.config.runtime_env import research_capital as _research_capital  # noqa: E402
 from ait.utils.time import parse_trade_ts, today_et  # noqa: E402
 
 
@@ -1928,7 +1929,9 @@ def _tab_backtest() -> None:
         col1, col2 = st.columns(2)
         with col1:
             symbols = st.multiselect("Symbols", _UNIVERSE, default=["SPY", "QQQ", "AAPL", "MSFT", "NVDA"])
-            capital = st.number_input("Capital ($)", min_value=5000, max_value=500_000, value=50_000, step=5000)
+            capital = st.number_input(
+                "Capital ($)", min_value=5000, max_value=500_000,
+                value=int(max(5000, _research_capital())), step=5000)
         with col2:
             strategies = st.multiselect("Strategies", _STRATEGIES, default=["bull_call_spread", "iron_condor"])
             min_conf = st.slider("Min ML Confidence", 0.50, 0.90, 0.65, 0.05)

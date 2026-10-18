@@ -46,6 +46,14 @@ class TestContractIsTheSingleAuthority:
         # 0.10 -> "0.1"). Compare resolved SEMANTICS, not string formatting.
         for k in CONTRACT_DEFAULTS:
             monkeypatch.delenv(k, raising=False)
+        # W64: isolate from the operator's local .env. The applier loads .env
+        # BEFORE it seeds defaults (R17), so a box whose .env deliberately
+        # overrides a contract key (this one sets AIT_MARKET_DATA_TYPE=3, the
+        # contract default is "4") failed this test on every run since W16 even
+        # though applier and readers agree. The test is about the applier/reader
+        # TABLE, not about whose .env is on disk — same isolation class as W26.
+        import ait.config.runtime_env as _re
+        monkeypatch.setattr(_re, "_load_dotenv", lambda *_a, **_k: None)
         apply_runtime_env_defaults()
         import os
         for key, declared in CONTRACT_DEFAULTS.items():
@@ -260,6 +268,10 @@ class TestR20LiveRegisterMigrations:
                 max_credit_positions=6, credit_vix_halt=28.0,
                 credit_cap_vix_tiers=[[20.0, 6], [25.0, 4], [999.0, 2]],
                 max_symbol_concentration_pct=0.20,
+                # W69: the Friday weekend-gap gate reads these from config now.
+                weekend_gap_cutoff_minutes=14 * 60 + 30,
+                weekend_gap_min_confidence=0.90,
+                weekend_gap_strategies=["short_strangle"],
             )
             for k, v in risk_overrides.items():
                 setattr(risk_config, k, v)

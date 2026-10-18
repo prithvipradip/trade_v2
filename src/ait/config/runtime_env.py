@@ -76,6 +76,10 @@ CONTRACT_DEFAULTS: dict[str, str] = {
     "OMP_NUM_THREADS": "1",
     "AIT_MARKET_DATA_TYPE": "4",
     "AIT_IC_WING_K": "1.6",
+    # W70: minimum iron-condor wing, dollars. Was a literal 2.0 inside
+    # strategies/iron_condor.py while research read backtest.wing_floor_dollars; both
+    # now read this one key (config home below), live AND research.
+    "AIT_IC_WING_FLOOR": "2.0",
     "AIT_IC_MIN_CREDIT_WIDTH": "0.10",
     "AIT_IC_MIN_CREDIT": "0.70",
     # R6/R16 evidence: flat credit stops underperform touch-close, so live
@@ -130,8 +134,14 @@ CONTRACT_DEFAULTS: dict[str, str] = {
 #   AIT_ALLOW_UNDEFINED_RISK - INST-5 safety interlock; env-only ON PURPOSE so
 #                           re-enabling naked risk is an explicit deliberate
 #                           act, never a config edit that slips through review
+#   AIT_SIMULATED_CAPITAL - W-capital: resolved by simulated_capital() below
+#                           (env override > account.capital while
+#                           account.simulate_live_capital) and NOT a contract
+#                           key, because the applier setdefaults contract keys
+#                           into os.environ and that would shadow config.yaml
 CONFIG_BACKED: dict[str, tuple[str, str]] = {
     "AIT_IC_WING_K": ("backtest", "wing_k"),
+    "AIT_IC_WING_FLOOR": ("backtest", "wing_floor_dollars"),   # W70
     "AIT_IC_MIN_CREDIT_WIDTH": ("backtest", "ic_min_credit_width"),
     "AIT_IC_MIN_CREDIT": ("backtest", "ic_min_credit"),
     "AIT_CREDIT_LOSS_LIMIT": ("backtest", "credit_loss_limit"),
@@ -230,6 +240,54 @@ def capital_base_source(default: float = 196_000.0) -> str:
     happened in a LIVE (non-paper) context should check this.
     """
     return _capital_base_with_source(default)[1]
+
+
+def simulated_capital() -> float | None:
+    """W-capital: the NLV the LIVE risk stack should be scaled down to, or None.
+
+    Precedence (R19 order): env AIT_SIMULATED_CAPITAL (a per-box override --
+    config.yaml is shared between boxes through git; '0'/empty = OFF) >
+    config.yaml account.capital while account.simulate_live_capital is true >
+    None (no simulation). Deliberately NOT in CONTRACT_DEFAULTS: the applier
+    setdefaults every contract key into os.environ, which would shadow yaml.
+    """
+    raw = os.environ.get("AIT_SIMULATED_CAPITAL")
+    if raw is not None:
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return v if v > 0 else None
+    acct = _config_yaml().get("account") or {}
+    if acct.get("simulate_live_capital", True) and acct.get("capital"):
+        try:
+            v = float(acct["capital"])
+        except (TypeError, ValueError):
+            return None
+        return v if v > 0 else None
+    return None
+
+
+def simulated_capital_source() -> str:
+    """Which tier simulated_capital() resolved from: env | config | off."""
+    if os.environ.get("AIT_SIMULATED_CAPITAL") is not None:
+        return "env"
+    return "config" if simulated_capital() is not None else "off"
+
+
+def research_capital() -> float:
+    """W-capital: TOTAL starting equity for every research run (one shared pool).
+
+    config.yaml account.capital; 5000.0 only if the file is unreadable. Callers
+    that take an explicit --capital resolve `explicit arg > this`.
+    """
+    try:
+        v = float((_config_yaml().get("account") or {}).get("capital"))
+        if v > 0:
+            return v
+    except (TypeError, ValueError):
+        pass
+    return 5_000.0
 
 
 def _capital_base_with_source(default: float) -> tuple[float, str]:

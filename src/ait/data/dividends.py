@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
 
@@ -49,6 +50,33 @@ _DEFAULT_INTERVAL_DAYS = 91
 # stale that 8 projected intervals still land in the past means the data is
 # not trustworthy, not that the next date is 2+ years out.
 _MAX_PROJECTION_STEPS = 8
+
+
+def project_next_ex_div(ex_dates: Sequence[date], as_of: date) -> date | None:
+    """W84: the next ex-dividend date live EXPECTS, projected from past ex-dates.
+
+    The pure half of ``DividendCalendar._fetch_dividend``, extracted so the research
+    engine's ex-dividend entry gate (``backtest.ex_div_entry_gate: live``) answers with
+    exactly the date live would have used, without the network or the live clock.
+
+    ``ex_dates``: past ex-dates in ASCENDING order (yfinance's order; callers with another
+    source sort first). The last ``_HISTORY_WINDOW`` dates give ``_HISTORY_WINDOW - 1``
+    gaps; their mean, rounded with Python's ``round`` (banker's rounding, kept as live has
+    always had it), is added to the last date, then stepped forward until it is not before
+    ``as_of`` (at most ``_MAX_PROJECTION_STEPS`` steps, so a very stale history can still
+    answer a past date, as before). Fewer than 2 dates -> None ("no projectable history").
+    """
+    if len(ex_dates) < 2:
+        return None
+    dates = list(ex_dates[-_HISTORY_WINDOW:])
+    gaps = [(dates[i] - dates[i - 1]).days for i in range(1, len(dates))]
+    avg_interval = (sum(gaps) / len(gaps)) if gaps else _DEFAULT_INTERVAL_DAYS
+    projected = dates[-1] + timedelta(days=round(avg_interval))
+    steps = 0
+    while projected < as_of and steps < _MAX_PROJECTION_STEPS:
+        projected = projected + timedelta(days=round(avg_interval))
+        steps += 1
+    return projected
 
 
 @dataclass
@@ -253,22 +281,16 @@ class DividendCalendar:
 
             recent = history.tail(_HISTORY_WINDOW)
             dates = [d.date() if hasattr(d, "date") else d for d in recent.index]
-            gaps = [(dates[i] - dates[i - 1]).days for i in range(1, len(dates))]
-            avg_interval = (sum(gaps) / len(gaps)) if gaps else _DEFAULT_INTERVAL_DAYS
-
-            last_date = dates[-1]
             last_amount = float(recent.iloc[-1])
-            projected = last_date + timedelta(days=round(avg_interval))
 
             # A stale-relative-to-today projection isn't "no dividend" (the
             # W44 lesson from earnings.py, applied here) — keep stepping
             # forward by the same interval, bounded, rather than reporting a
-            # date already in the past.
-            today = now_et().date()
-            steps = 0
-            while projected < today and steps < _MAX_PROJECTION_STEPS:
-                projected = projected + timedelta(days=round(avg_interval))
-                steps += 1
+            # date already in the past. W84: the math lives in the pure
+            # project_next_ex_div so the research engine shares it (one owner);
+            # behaviour is unchanged (tests/test_w84_ex_div_gate.py replays the
+            # pre-W84 body against it).
+            projected = project_next_ex_div(dates, now_et().date())
 
             return DividendInfo(symbol=symbol, next_ex_div_date=projected,
                                 expected_amount=last_amount)

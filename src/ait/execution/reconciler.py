@@ -20,7 +20,7 @@ from ait.bot.state import StateManager, TradeStatus
 from ait.execution.roll_booking import parse_roll_order_ref
 from ait.strategies.base import CREDIT_STRATEGIES
 from ait.utils.logging import get_logger
-from ait.utils.time import now_et, parse_trade_ts
+from ait.utils.time import now_et, parse_trade_ts, today_et
 
 log = get_logger("execution.reconciler")
 
@@ -492,7 +492,14 @@ class PositionReconciler:
             expired = False
             if trade.expiry:
                 try:
-                    expired = datetime.fromisoformat(trade.expiry).date() <= datetime.now().date()
+                    # W73: the ET date, not the host's. `datetime.now().date()`
+                    # is tomorrow's date from 18:00 ET on a CEST host, so a
+                    # position that vanished the evening BEFORE its expiry was
+                    # booked "expired" at intrinsic (a fabricated P&L) instead
+                    # of flagged for review. Same class as W28; this site was
+                    # missed because that guard looks for `.today()`, not
+                    # `.now().date()`. Semantics (<=) are unchanged.
+                    expired = datetime.fromisoformat(trade.expiry).date() <= today_et()
                 except ValueError:
                     pass
 

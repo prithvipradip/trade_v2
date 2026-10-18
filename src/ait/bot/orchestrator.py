@@ -40,6 +40,8 @@ from ait.execution.roll_booking import cas_roll_closing_trade, roll_order_ref, s
 from ait.execution.roll_comparison import ev_should_roll, heuristic_should_roll
 from ait.execution.roll_executor import prepare_roll_combo
 from ait.execution.roll_selector import RollTarget, select_roll_target
+from ait.config.invariants import LIVE_MAX_SPREAD_PCT, LIVE_MIN_VOLUME
+from ait.learning.adaptor import AdaptationLimits
 from ait.learning.engine import LearningEngine
 from ait.ml.ensemble import DirectionPredictor
 from ait.ml.meta_label import MetaLabeler
@@ -182,6 +184,14 @@ RESTRICTED_UNREADABLE = None
 # own 15s sub-budget.
 SHUTDOWN_MARKS_SNAPSHOT_TIMEOUT_SECONDS = 10
 
+# W69: the live-profile liquidity floors the GOV-5 startup assertion enforces.
+# They are deliberately CODE, not config: they are the line the paper-relaxed
+# config values (spread 0.40, volume 0) are checked AGAINST, so making them
+# tunable would let the same edit that loosens a gate also loosen its check.
+# docs/RUNBOOK.md's go-live checklist documents both numbers.
+_LIVE_MAX_SPREAD_PCT = LIVE_MAX_SPREAD_PCT   # W70: values live in ait.config.invariants
+_LIVE_MIN_VOLUME = LIVE_MIN_VOLUME
+
 
 def read_restricted_symbols(path: str | None = None) -> set[str] | None:
     """Read the operator's hard-ban list (data/RESTRICTED.txt, one symbol/line).
@@ -255,10 +265,7 @@ class TradingOrchestrator:
 
         # Core services
         self._account = AccountManager(ibkr_client)
-        self._market_data = MarketDataService(
-            ibkr_client,
-            polygon_api_key=settings.api_keys.polygon_api_key,
-        )
+        self._market_data = MarketDataService(ibkr_client)
         self._options_chain = OptionsChainService(
             ibkr_client, self._market_data, settings.options,
         )
@@ -275,7 +282,8 @@ class TradingOrchestrator:
         # likely to accompany one.
         self._circuit_breaker = CircuitBreaker(settings.risk, state=self._state)
         self._pdt_guard = PDTGuard(settings.account, self._state)
-        self._position_sizer = PositionSizer(settings.positions, settings.risk)
+        self._position_sizer = PositionSizer(
+            settings.positions, settings.risk, settings.position_sizing)
         # Config-wired (audit item 3.3) — was CorrelationGuard() with code
         # defaults, untunable without a code edit.
         self._correlation_guard = CorrelationGuard(
@@ -292,7 +300,7 @@ class TradingOrchestrator:
 
         # ML
         self._predictor = DirectionPredictor(settings.ml)
-        self._regime_detector = RegimeDetector()
+        self._regime_detector = RegimeDetector(settings.regime)
 
         # Range predictor (Tier 1) — used for iron condor confidence.
         # units-scale-05 (R22): these were bare literals (0.05, 30) — the LIVE
@@ -382,15 +390,18 @@ class TradingOrchestrator:
         # Refuse to start in live mode with paper-relaxed gates.
         import os as _os_g5
         if str(getattr(settings.trading, "mode", "paper")).lower() != "paper":
-            _spread_env = float(_os_g5.environ.get("AIT_LIQ_MAX_SPREAD", "0.15"))
-            _vol_env = int(_os_g5.environ.get("AIT_LIQ_MIN_VOLUME", "10"))
-            _spread_cfg = float(getattr(settings.options, "max_bid_ask_spread_pct", 0.15) or 0.15)
+            _spread_env = float(_os_g5.environ.get(
+                "AIT_LIQ_MAX_SPREAD", str(_LIVE_MAX_SPREAD_PCT)))
+            _vol_env = int(_os_g5.environ.get("AIT_LIQ_MIN_VOLUME", str(_LIVE_MIN_VOLUME)))
+            _spread_cfg = float(getattr(settings.options, "max_bid_ask_spread_pct",
+                                        _LIVE_MAX_SPREAD_PCT) or _LIVE_MAX_SPREAD_PCT)
             # W42 (R26 policy-vs-impl-4): docs/RUNBOOK.md:153 documents this
             # gate as "AIT_LIQ_MIN_VOLUME >= 10" and claims the live-mode
             # startup assertion enforces it. It was `< 1`, so any value 1-9
             # passed — the volume half of the documented floor was never
             # actually asserted; only the spread half was.
-            if _spread_env > 0.15 or _vol_env < 10 or _spread_cfg > 0.15:
+            if (_spread_env > _LIVE_MAX_SPREAD_PCT or _vol_env < _LIVE_MIN_VOLUME
+                    or _spread_cfg > _LIVE_MAX_SPREAD_PCT):
                 raise RuntimeError(
                     "LIVE-PROFILE ASSERTION FAILED: liquidity gates are still "
                     f"paper-relaxed (AIT_LIQ_MAX_SPREAD={_spread_env}, "
@@ -441,6 +452,15 @@ class TradingOrchestrator:
             self._state,
             # R7: in paper mode the learning layer observes but never steers
             apply_adaptations=not self._settings.learning.paper_trading_mode,
+            # W69: learning.* limits and analyzer cutoffs were config keys that
+            # nothing read — the dataclass defaults ran instead.
+            limits=AdaptationLimits(
+                min_confidence_floor=settings.learning.min_confidence_floor,
+                min_confidence_ceiling=settings.learning.min_confidence_ceiling,
+                min_insight_confidence=settings.learning.min_insight_confidence,
+                max_adaptations_per_cycle=settings.learning.max_adaptations_per_cycle,
+            ),
+            analyzer_thresholds=settings.learning.analyzer,
         )
 
         # Data quality & market intelligence
@@ -506,7 +526,7 @@ class TradingOrchestrator:
         self._counterfactual = CounterfactualTracker()
 
         # Capital tier manager — auto-selects strategies based on account size
-        self._capital_tiers = CapitalTierManager()
+        self._capital_tiers = CapitalTierManager(settings.account)
 
         # Notification callback (set by main.py)
         self._notify = None
@@ -1761,7 +1781,8 @@ class TradingOrchestrator:
         if account_snapshot and current_capital > 0:
             try:
                 # W29 (R26 F5 #6): persist the UNSCALED NLV. current_capital is
-                # the snapshot's net_liquidation, which AIT_SIMULATED_CAPITAL
+                # the snapshot's net_liquidation, which account.capital
+                # (W-capital; env AIT_SIMULATED_CAPITAL overrides)
                 # scales on purpose so the RISK STACK sizes as a small account.
                 # This row is not risk input -- capital_base() resolves it as
                 # the PERFORMANCE DENOMINATOR ahead of the default, so writing
@@ -1840,8 +1861,8 @@ class TradingOrchestrator:
         # 9. Scan universe for new opportunities
         # R7-SOON: refresh the per-trade dollar budget once per cycle so
         # strategy construction fits the CURRENT account (paper $197k today,
-        # $2.1k at Phase 2 via AIT_SIMULATED_CAPITAL) — and run the launch-
-        # size coherence self-test whenever NLV moves >20%.
+        # $2.1k at Phase 2 via account.capital / AIT_SIMULATED_CAPITAL) — and run
+        # the launch-size coherence self-test whenever NLV moves >20%.
         try:
             _nlv = await self._account.get_net_liquidation()
             if _nlv and _nlv > 0:
@@ -2172,10 +2193,30 @@ class TradingOrchestrator:
         # from the pre-ML features_df (they are NOT intraday-only features).
         hurst_scale_spread = float(features_df.iloc[-1].get("hurst_scale_spread", 0.0)) if not features_df.empty else 0.0
         multifractal_width = float(features_df.iloc[-1].get("multifractal_width", 0.0)) if not features_df.empty else 0.0
+        # W67: the rule itself lives in ait.ml.regime_gate (ONE implementation shared
+        # with the research engine). Today's behaviour is unchanged: the flat penalty
+        # off the DIRECTIONAL confidence. The veto cutoff and the range-probability
+        # penalty default to 0 (off) and, like every ML gate here, only ACT when
+        # ml.entry_gates_enabled (see the range override and the veto filter below).
+        from ait.ml.regime_gate import (
+            SHAPE_LIVE_FLAT,
+            apply_range_prob_delta,
+            FractalGateConfig,
+            fractal_gate,
+            resolve_veto_spread,
+        )
         bc = self._settings.backtest
-        if (hurst_scale_spread > bc.hurst_regime_threshold
-                or multifractal_width > bc.multifractal_max_width):
-            penalty = bc.hurst_regime_penalty
+        _fractal_verdict = fractal_gate(
+            hurst_scale_spread, multifractal_width,
+            FractalGateConfig(
+                threshold=bc.hurst_regime_threshold, penalty=bc.hurst_regime_penalty,
+                multifractal_max_width=bc.multifractal_max_width,
+                veto_spread=resolve_veto_spread(
+                    bc.hurst_regime_threshold, None, bc.fractal_veto_spread),
+                penalty_on_range_prob=bc.penalty_on_range_prob,
+                shape=SHAPE_LIVE_FLAT))
+        if _fractal_verdict.triggered:
+            penalty = _fractal_verdict.directional_penalty
             final_confidence = max(0.0, final_confidence - penalty)
             log.debug(
                 "fractal_penalty_applied",
@@ -2190,7 +2231,7 @@ class TradingOrchestrator:
         direction = prediction.direction
 
         # Override direction if regime strongly disagrees
-        if regime.confidence > 0.8:
+        if regime.confidence > self._settings.ml.regime_override_confidence:  # W69: was 0.8
             from ait.ml.regime import MarketRegime
             if regime.regime == MarketRegime.HIGH_VOLATILITY:
                 direction = SignalDirection.NEUTRAL
@@ -2397,7 +2438,9 @@ class TradingOrchestrator:
                             # model_overridden from the SAME set. A drift here
                             # silently breaks that agreement.
                             if s.strategy_name in RANGE_GATED_STRATEGIES:
-                                s.confidence = range_pred.probability_in_range
+                                # W67: fractal penalty on P(in range); 0 by default.
+                                s.confidence = apply_range_prob_delta(
+                                    range_pred.probability_in_range, _fractal_verdict)
                                 model_overridden.add(s.strategy_name)
 
             # W10 (R24): stash the prediction — INCLUDING its absence — so
@@ -2414,6 +2457,20 @@ class TradingOrchestrator:
                 _rp[symbol] = range_pred
             except Exception:  # noqa: BLE001 — telemetry must never block a scan
                 pass
+
+            # W67: fractal hard veto for the range-gated (neutral) structures. Cutoff 0 =
+            # off (default), and like the range override above it only acts when the ML
+            # gates are enabled -- observe mode logs the verdict, never vetoes.
+            if _fractal_verdict.veto:
+                _vetoed = [s for s in signals if s.strategy_name in RANGE_GATED_STRATEGIES]
+                if _vetoed and self._settings.ml.entry_gates_enabled:
+                    signals = [s for s in signals
+                               if s.strategy_name not in RANGE_GATED_STRATEGIES]
+                log.info("fractal_veto_" + ("applied" if self._settings.ml.entry_gates_enabled
+                                            else "observed"),
+                         symbol=symbol, hurst_scale_spread=f"{hurst_scale_spread:.3f}",
+                         veto_spread=bc.fractal_veto_spread,
+                         would_block=sorted({s.strategy_name for s in _vetoed}))
 
             # fail-direction-02 (R22): ONE fail direction when the payoff-
             # matched gate has no evidence. Pre-fix, an unavailable range
@@ -2709,8 +2766,8 @@ class TradingOrchestrator:
         """W29 (R26 F5 #6): the NLV that belongs in the PERFORMANCE denominator.
 
         `snapshot.net_liquidation` is deliberately SCALED when
-        AIT_SIMULATED_CAPITAL is set, so the whole risk stack sizes as a small
-        account. That value must never reach `bot_state.last_net_liquidation`,
+        account.capital simulation is on (W-capital; was env-only), so the whole
+        risk stack sizes as a small account. That value must never reach `bot_state.last_net_liquidation`,
         because `capital_base()` resolves that row ahead of its default and every
         drawdown/return percentage divides by it. Persisting the scaled figure
         re-scores the entire track record: the same $863 drawdown reads 0.43%
@@ -2746,11 +2803,14 @@ class TradingOrchestrator:
         now = now_et()  # ET-pinned (A3): budget tiers were wall-clock local
         hour_min = now.hour + now.minute / 60.0
 
-        if hour_min < 10.5:      # 9:30-10:30 — first hour
-            budget = 2
-        elif hour_min < 14.0:    # 10:30-2:00 — mid-day
-            budget = 4
-        else:                    # 2:00-4:00 — power hour, release all
+        # W69: the window edges and per-window budgets are trading.* config
+        # (defaults 10:30 / 14:00 and 2 / 4 — the former literals).
+        _tc = self._settings.trading
+        if hour_min < _tc.first_hour_end_hour:      # open -> first_hour_end_et
+            budget = _tc.first_hour_trade_budget
+        elif hour_min < _tc.midday_end_hour:        # -> midday_end_et
+            budget = _tc.midday_trade_budget
+        else:                                       # power hour, release all
             budget = max_trades
 
         return min(budget, max_trades) - taken
@@ -2920,10 +2980,16 @@ class TradingOrchestrator:
             # closes a condor early, so the honest bound on one trade's loss is
             # the defined-risk max loss of the LARGEST structure — measured
             # here from the signal the builder actually produced.
-            if worst > 0 and breaker_usd < 1.5 * worst:
+            # W64: the multiple is risk.breaker_to_max_loss_ratio, not a literal
+            # 1.5. It was the one number in this arm with no config home, and it
+            # decided whether the alert fired (at $5k: $150 breaker vs 1.5 x $124.50
+            # = $187 fired against an otherwise coherent 3%/3% setup).
+            _ratio = self._settings.risk.breaker_to_max_loss_ratio
+            if worst > 0 and breaker_usd < _ratio * worst:
                 problems.append(
                     f"daily-loss breaker ${breaker_usd:.0f} "
-                    f"({self._settings.risk.max_daily_loss_pct:.1%} of NLV) < 1.5x "
+                    f"({self._settings.risk.max_daily_loss_pct:.1%} of NLV) < {_ratio:g}x "
+                    f"(risk.breaker_to_max_loss_ratio) "
                     f"the largest single max loss the builder emits here "
                     f"(${worst:.0f}, defined-risk: the credit stop is DISABLED, "
                     f"so nothing closes it early) — one stopped trade halts the "
@@ -3441,10 +3507,14 @@ class TradingOrchestrator:
         # only. (Also ET-pinned per BC-M3.)
         # W42 (R26 set-membership-6): third independent copy of the same set.
         _neutral = signal.strategy_name in RANGE_GATED_STRATEGIES
-        if hour_min < 10.5 and not _neutral and confidence < 0.85:
+        # W69: window end and confidence floor are trading.* config
+        # (first_hour_end_et / first_hour_min_confidence; were 10.5 / 0.85).
+        _fh_conf = self._settings.trading.first_hour_min_confidence
+        if (hour_min < self._settings.trading.first_hour_end_hour
+                and not _neutral and confidence < _fh_conf):
             log.info("first_hour_confidence_gate",
                      symbol=signal.symbol, confidence=f"{confidence:.2f}",
-                     required=0.85)
+                     required=_fh_conf)
             # R15 minor: per-signal reject, NOT symbol-handled. Neutral
             # candidates (IC/strangle) are EXEMPT from this gate and carry
             # their own model-overridden confidence — returning True here
@@ -4749,8 +4819,9 @@ class TradingOrchestrator:
                 except Exception:  # noqa: BLE001
                     pass
             elif trade:
+                # W71b: the ET date, not the host's (W20/W21/W23/W28 bug class).
                 self._state.set_state(f"trueup_pending_{trade_id}",
-                                      datetime.now().date().isoformat())
+                                      today_et().isoformat())
                 log.info("commission_trueup_deferred_partial_ledger",
                          trade_id=trade_id, executions=exec_n,
                          expected=2 * legs_n)
@@ -5647,7 +5718,9 @@ class TradingOrchestrator:
                 # that killed this entire thesis check (incl. regime/VIX branches
                 # below) on every call since it was written. Audit 2026-07-07 item 1.1.
                 prediction = self._predictor.predict(hist, symbol=pos.symbol, market_context=None)
-                if prediction and prediction.confidence > 0.70:
+                # W69: threshold is exit.thesis_direction_flip_confidence (was 0.70)
+                _flip_conf = self._settings.exit.thesis_direction_flip_confidence
+                if prediction and prediction.confidence > _flip_conf:
                     # Direction has flipped with high confidence
                     if entry_direction == "bullish" and prediction.direction == SignalDirection.BEARISH:
                         return True, f"direction_flipped_to_bearish (conf={prediction.confidence:.0%})"
@@ -5658,17 +5731,19 @@ class TradingOrchestrator:
             vix = await self._market_data.get_vix()
             if hist is not None and not hist.empty:
                 regime = self._regime_detector.analyze(hist, vix)
-                if regime and regime.confidence > 0.70:
+                # W69: threshold is exit.thesis_regime_shift_confidence (was 0.70)
+                _shift_conf = self._settings.exit.thesis_regime_shift_confidence
+                if regime and regime.confidence > _shift_conf:
                     from ait.ml.regime import MarketRegime
                     current_regime = regime.regime.value
                     # If entered during trending and now high volatility, thesis is suspect
                     if entry_regime in ("trending_up", "trending_down") and current_regime == "high_volatility":
                         return True, f"regime_shift ({entry_regime} → {current_regime})"
 
-            # 3. Check VIX spike (>30% increase since entry)
+            # 3. Check VIX spike (default >30% increase since entry; W69: exit.thesis_vix_spike_pct)
             if vix and entry_vix and entry_vix > 0:
                 vix_change = (vix - entry_vix) / entry_vix
-                if vix_change > 0.30:
+                if vix_change > self._settings.exit.thesis_vix_spike_pct:
                     return True, f"vix_spike ({entry_vix:.1f} → {vix:.1f}, +{vix_change:.0%})"
 
         except Exception as e:
@@ -5838,7 +5913,9 @@ class TradingOrchestrator:
         """R16: write today's chain ATM IV into the daily IV store (once per
         symbol per day) so iv_rank never runs on a frozen series again."""
         try:
-            today = datetime.now().date().isoformat()
+            # W71b: ET date (the host's is already tomorrow from 18:00 ET on a CEST host,
+            # so the once-a-day marker and the stored IV row would carry the wrong day).
+            today = today_et().isoformat()
             marker = f"iv_saved_{symbol}"
             if self._state.get_state(marker, "") == today:
                 return
@@ -5883,6 +5960,7 @@ class TradingOrchestrator:
         is now None; the caller fails closed for new entries and the journal
         records NULL instead of a fabricated rank.
         """
+        from ait.data.iv_rank import iv_rank_percentile
         try:
             import sqlite3 as _sq
             con = _sq.connect("file:data/historical.db?mode=ro", uri=True)
@@ -5897,7 +5975,8 @@ class TradingOrchestrator:
             # "cur" is not today's IV: fall through to the realized proxy
             # (tagged in logs) rather than serve a fictitious percentile.
             if pairs:
-                _age_days = (datetime.now().date()
+                # W71b: ET date, so the 5-day freshness gate cannot be off by one at night.
+                _age_days = (today_et()
                              - datetime.fromisoformat(pairs[0][0][:10]).date()).days
                 if _age_days > 5:
                     log.warning("iv_rank_store_stale", symbol=symbol,
@@ -5905,13 +5984,13 @@ class TradingOrchestrator:
                                 note="using realized-vol proxy; store should "
                                      "self-heal via daily_iv_persisted")
                     rows = []
-            if len(rows) >= 60:
-                cur = rows[0]
-                below = sum(1 for v in rows if v < cur)
-                rank = below / len(rows) * 100
+            # W68: the percentile itself lives in ait.data.iv_rank (ONE definition shared with
+            # the research engine); None below 60 observations, as before.
+            rank = iv_rank_percentile(rows)
+            if rank is not None:
                 log.debug("iv_rank_true_percentile", symbol=symbol,
                           rank=round(rank, 1), n=len(rows))
-                return max(0.0, min(100.0, rank))
+                return rank
         except Exception as _e:  # noqa: BLE001
             log.debug("iv_rank_store_read_failed", symbol=symbol, error=str(_e))
         log.debug("iv_rank_realized_proxy", symbol=symbol,

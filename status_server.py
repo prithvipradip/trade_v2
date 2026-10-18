@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 """Live AIT bot dashboard — a browser page that streams status in real time.
 
-Serves a single auto-refreshing page at http://localhost:8503 that polls the
+Serves a single auto-refreshing page at http://localhost:<dashboard.status_port>
+(8503 by default) that polls the
 bot's state every 3s and updates in place. Reads the same DB/log snapshot as
 status.py (no IBKR connection), so it's safe to run alongside the bot.
 
@@ -93,5 +94,12 @@ def api_status():
 
 
 if __name__ == "__main__":
-    print("AIT live dashboard -> http://localhost:8503")
-    app.run(host="127.0.0.1", port=8503, threaded=True)
+    import argparse
+    from ait.config.settings import resolve_dashboard_port
+    _ap = argparse.ArgumentParser(description="AIT live status dashboard")
+    # W69: the supervisor passes its configured dashboard.status_port; run
+    # standalone, the port comes from config.yaml (was a literal 8503).
+    _ap.add_argument("--port", type=int, default=None)
+    _port = resolve_dashboard_port("status_port", _ap.parse_args().port)
+    print(f"AIT live dashboard -> http://localhost:{_port}")
+    app.run(host="127.0.0.1", port=_port, threaded=True)

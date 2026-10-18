@@ -278,7 +278,7 @@ class IBKRClient:
         'paper'.
 
         R16: managedAccounts()[0] was equally blind in the other direction —
-        with ['DUN603821', 'U1234567'] the gate validated only the paper id
+        with ['DU0000001', 'U1234567'] the gate validated only the paper id
         and PASSED while a LIVE account was tradeable in the same session
         (reversing the list blocked instead: pure ordering luck). A
         multi-account session is resolved ONLY by an explicit selector that
@@ -829,7 +829,7 @@ class IBKRClient:
                 base_ccy = av.currency  # base currency has rate 1.0
 
         # Fallback base-currency detection: some accounts (e.g. this CAD-base
-        # paper account, DUN603821) send NO ExchangeRate rows at all, so the
+        # paper account, DU0000001) send NO ExchangeRate rows at all, so the
         # loop above leaves base_ccy=None. Without it, every core balance tag
         # (reported only in CAD) is dropped below and NetLiquidation resolves
         # to 0 — which silently zeroes the whole risk layer and blocks ALL

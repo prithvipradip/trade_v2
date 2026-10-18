@@ -15,14 +15,17 @@ from datetime import date
 from ait.utils.time import now_et, datetime
 
 from ait.bot.state import StateManager
+from ait.config.invariants import PDT_MAX_DAY_TRADES, PDT_WINDOW_DAYS
 from ait.config.settings import AccountConfig
 from ait.utils.logging import get_logger
 from ait.utils.time import get_recent_trading_days
 
 log = get_logger("risk.pdt")
 
-MAX_DAY_TRADES = 3
-WINDOW_DAYS = 5
+# W70: the values live in ait.config.invariants (a regulatory rule, not a preference);
+# these names stay because callers and tests import them from here.
+MAX_DAY_TRADES = PDT_MAX_DAY_TRADES
+WINDOW_DAYS = PDT_WINDOW_DAYS
 
 
 @dataclass

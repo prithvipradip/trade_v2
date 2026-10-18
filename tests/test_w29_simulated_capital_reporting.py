@@ -41,7 +41,9 @@ BROKER_VALUES = {
 async def _snapshot(monkeypatch, sim: str | None) -> AccountSnapshot:
     """A snapshot from the REAL AccountManager refresh path."""
     if sim is None:
-        monkeypatch.delenv("AIT_SIMULATED_CAPITAL", raising=False)
+        # W-capital: "no simulation" is now an explicit "0" -- merely unsetting
+        # the var lets config.yaml account.capital switch the simulation on.
+        monkeypatch.setenv("AIT_SIMULATED_CAPITAL", "0")
     else:
         monkeypatch.setenv("AIT_SIMULATED_CAPITAL", sim)
     client = MagicMock()

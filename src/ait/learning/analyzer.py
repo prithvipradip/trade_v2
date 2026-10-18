@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from ait.config.settings import LearningAnalyzerConfig
 from ait.utils.logging import get_logger
 from ait.utils.time import parse_trade_ts, today_et
 from ait.reporting.go_live import (
@@ -74,8 +75,12 @@ class TradeInsight:
 class TradeAnalyzer:
     """Analyzes historical trades to extract learnings."""
 
-    def __init__(self, db_path: Path = DB_PATH) -> None:
+    def __init__(self, db_path: Path = DB_PATH,
+                 thresholds: LearningAnalyzerConfig | None = None) -> None:
         self._db_path = db_path
+        # W69: insight cutoffs are learning.analyzer config; None -> the model
+        # defaults, which are the former literals.
+        self._t = thresholds or LearningAnalyzerConfig()
 
     def analyze_all(self, lookback_days: int = 30) -> list[TradeInsight]:
         """Run all analyses and return actionable insights."""
@@ -197,7 +202,7 @@ class TradeAnalyzer:
             avg_pnl = total_pnl / len(strades)
 
             # Strategy consistently losing
-            if win_rate < 0.35 and len(strades) >= 5:
+            if win_rate < self._t.strategy_poor_win_rate and len(strades) >= 5:
                 insights.append(TradeInsight(
                     category="strategy",
                     insight=f"{strategy} has {win_rate:.0%} win rate over {len(strades)} trades (avg P&L: ${avg_pnl:.0f})",
@@ -207,7 +212,8 @@ class TradeAnalyzer:
                 ))
 
             # Strategy consistently winning
-            elif win_rate > 0.65 and total_pnl > 0 and len(strades) >= 5:
+            elif (win_rate > self._t.strategy_strong_win_rate and total_pnl > 0
+                  and len(strades) >= 5):
                 insights.append(TradeInsight(
                     category="strategy",
                     insight=f"{strategy} has {win_rate:.0%} win rate, ${total_pnl:.0f} total P&L",
@@ -233,7 +239,7 @@ class TradeAnalyzer:
             win_rate = wins / len(band_trades)
             avg_pnl = sum(t["realized_pnl"] for t in band_trades) / len(band_trades)
 
-            if win_rate < 0.40 and avg_pnl < 0:
+            if win_rate < self._t.confidence_band_poor_win_rate and avg_pnl < 0:
                 insights.append(TradeInsight(
                     category="confidence",
                     insight=f"Trades at confidence {low:.0%}-{high:.0%} have {win_rate:.0%} win rate, avg P&L ${avg_pnl:.0f}",
@@ -260,7 +266,7 @@ class TradeAnalyzer:
             wins = sum(1 for t in strades if t["realized_pnl"] > 0)
             win_rate = wins / len(strades)
 
-            if win_rate < 0.30 and total_pnl < 0:
+            if win_rate < self._t.symbol_poor_win_rate and total_pnl < 0:
                 insights.append(TradeInsight(
                     category="symbol",
                     insight=f"{symbol}: {win_rate:.0%} win rate, ${total_pnl:.0f} total P&L over {len(strades)} trades",
@@ -289,7 +295,7 @@ class TradeAnalyzer:
             wins = sum(1 for t in strades if t["realized_pnl"] > 0)
             win_rate = wins / len(strades)
 
-            if win_rate < 0.35 and total_pnl < 0:
+            if win_rate < self._t.regime_poor_win_rate and total_pnl < 0:
                 insights.append(TradeInsight(
                     category="regime",
                     insight=f"Poor performance in {regime} regime: {win_rate:.0%} win rate",
@@ -405,7 +411,8 @@ class TradeAnalyzer:
             giveback = avg_peak - avg_exit
 
             # If we're giving back more than 30% of peak on average, suggest tighter trailing
-            if giveback > 0.30 and avg_peak > 0.20:
+            if (giveback > self._t.exit_giveback_threshold
+                    and avg_peak > self._t.exit_min_avg_peak):
                 optimal_trail = max(0.10, giveback * 0.5)  # Trail at half the giveback
                 insights.append(TradeInsight(
                     category="exit",
@@ -472,7 +479,8 @@ class TradeAnalyzer:
             win_rate = wins / len(strades)
             total_pnl = sum(t["realized_pnl"] for t in strades)
 
-            if win_rate < 0.30 and total_pnl < 0 and len(strades) >= 5:
+            if (win_rate < self._t.hour_poor_win_rate and total_pnl < 0
+                    and len(strades) >= 5):
                 insights.append(TradeInsight(
                     category="timing",
                     insight=(
@@ -521,7 +529,7 @@ class TradeAnalyzer:
                 # the trade had any positive unrealized at some point (HWM > 0)
                 hwm = self._get_trade_hwm(t["trade_id"])
 
-                if hwm > 0.05:  # Direction was at least partially correct (5%+ peak)
+                if hwm > self._t.direction_peak_threshold:  # at least partially correct (default 5%+ peak)
                     direction_correct += 1
                     if pnl <= 0:
                         correct_but_lost += 1
@@ -535,7 +543,8 @@ class TradeAnalyzer:
         accuracy = direction_correct / total
         exit_problem_rate = correct_but_lost / direction_correct if direction_correct > 0 else 0
 
-        if accuracy > 0.60 and exit_problem_rate > 0.40:
+        if (accuracy > self._t.direction_good_accuracy
+                and exit_problem_rate > self._t.direction_exit_problem_rate):
             insights.append(TradeInsight(
                 category="exit",
                 insight=(
@@ -550,7 +559,7 @@ class TradeAnalyzer:
                     "total_analyzed": total,
                 },
             ))
-        elif accuracy < 0.45:
+        elif accuracy < self._t.direction_poor_accuracy:
             insights.append(TradeInsight(
                 category="ml",
                 insight=(

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ait.config.settings import PositionConfig, RiskConfig
+from ait.config.settings import PositionConfig, PositionSizingConfig, RiskConfig
 from ait.utils.logging import get_logger
 
 log = get_logger("risk.sizer")
@@ -31,24 +31,38 @@ class PositionSize:
 class PositionSizer:
     """Calculate position sizes based on risk parameters."""
 
-    # Strategy risk multipliers — how much of the max position to use
-    STRATEGY_RISK = {
-        "long_call": 1.0,        # Full premium at risk
-        "long_put": 1.0,
-        "covered_call": 0.5,     # Shares + short call
-        "cash_secured_put": 0.5,
-        "bull_call_spread": 0.6, # Defined risk (max loss = net debit)
-        "bear_put_spread": 0.6,
-        "iron_condor": 0.4,      # Defined risk, both sides
-        "long_straddle": 1.2,    # Double premium
-        "short_strangle": 0.8,   # Undefined risk, margin required
-        "calendar_spread": 0.7,  # Defined risk (debit), 2 expiries
-        "event_straddle":  0.7,  # Defined risk (debit), capped at premium paid
-    }
+    # Strategy risk multipliers — how much of the max position to use.
+    # W69: the table's home is now config (position_sizing.strategy_risk); this
+    # class attribute is the DEFAULT view of it (tests and callers that ask the
+    # class, not an instance). An instance sizes from its own config.
+    STRATEGY_RISK = dict(PositionSizingConfig.model_fields["strategy_risk"].default)
 
-    def __init__(self, position_config: PositionConfig, risk_config: RiskConfig) -> None:
+    # W69: class-level default so an instance built without __init__ (tests
+    # use PositionSizer.__new__ + hand-set attributes) still sizes from the
+    # model defaults rather than raising AttributeError on a live path.
+    _sizing: PositionSizingConfig = PositionSizingConfig()
+
+    def __init__(
+        self,
+        position_config: PositionConfig,
+        risk_config: RiskConfig,
+        sizing_config: PositionSizingConfig | None = None,
+    ) -> None:
         self._pos_config = position_config
         self._risk_config = risk_config
+        # W69: None -> the model defaults (== the pre-W69 literals), so every
+        # existing two-argument construction sizes exactly as before.
+        self._sizing = sizing_config or PositionSizingConfig()
+
+    @staticmethod
+    def _tier_factor(value: float, tiers: list[list[float]]) -> float:
+        """1.0 below the first row; otherwise the factor of the highest row whose
+        threshold `value` has reached (rows are validated strictly ascending)."""
+        factor = 1.0
+        for threshold, row_factor in tiers:
+            if value >= threshold:
+                factor = row_factor
+        return factor
 
     # Strategies that benefit from high IV (selling premium)
     _SELLING_STRATEGIES = frozenset({
@@ -99,50 +113,47 @@ class PositionSizer:
         # At min_confidence, use 50% of max. At 1.0, use 100%.
         min_conf = self._risk_config.min_confidence
         conf_adj = 0.5 + 0.5 * ((confidence - min_conf) / (1.0 - min_conf))
-        conf_adj = max(0.3, min(1.0, conf_adj))
+        conf_adj = max(self._sizing.confidence_size_floor, min(1.0, conf_adj))
 
         # Volatility adjustment: smooth linear scale-down in high-vol environments
-        # IV <= 20% → full size (1.0), IV >= 60% → half size (0.5)
-        if implied_vol <= 0.20:
+        # IV <= iv_full_size_max (20%) -> full size (1.0), IV >= iv_floor_size_min
+        # (60%) -> iv_floor_size_factor (0.5). round(.., 12) keeps 0.60-0.20 the
+        # exact 0.40 literal this formula was written with (0.6-0.2 is 0.39999..).
+        sz = self._sizing
+        iv_span = round(sz.iv_floor_size_min - sz.iv_full_size_max, 12)
+        if implied_vol <= sz.iv_full_size_max:
             vol_adj = 1.0
-        elif implied_vol >= 0.60:
-            vol_adj = 0.5
+        elif implied_vol >= sz.iv_floor_size_min:
+            vol_adj = sz.iv_floor_size_factor
         else:
-            # Linear interpolation: 1.0 at 20% → 0.5 at 60%
-            vol_adj = 1.0 - 0.5 * ((implied_vol - 0.20) / 0.40)
+            # Linear interpolation: 1.0 at full_size_max -> factor at floor_min
+            vol_adj = 1.0 - (1.0 - sz.iv_floor_size_factor) * (
+                (implied_vol - sz.iv_full_size_max) / iv_span)
 
         # IV rank alignment: boost size when IV conditions favor the strategy
         # Selling strategies benefit from high IV rank (more premium to collect)
         # Buying strategies benefit from low IV rank (cheaper options)
+        iv_rank_span = round(sz.iv_rank_adj_max - sz.iv_rank_adj_min, 12)
         iv_rank_adj = 1.0
         if strategy in self._SELLING_STRATEGIES:
-            # High IV rank → boost up to 1.2x; Low IV rank → reduce to 0.8x
-            iv_rank_adj = 0.8 + 0.4 * (iv_rank / 100.0)
+            # High IV rank -> up to iv_rank_adj_max; low IV rank -> iv_rank_adj_min
+            iv_rank_adj = sz.iv_rank_adj_min + iv_rank_span * (iv_rank / 100.0)
         else:
-            # Low IV rank → boost up to 1.2x; High IV rank → reduce to 0.8x
-            iv_rank_adj = 1.2 - 0.4 * (iv_rank / 100.0)
-        iv_rank_adj = max(0.8, min(1.2, iv_rank_adj))
+            # Low IV rank -> up to iv_rank_adj_max; high IV rank -> iv_rank_adj_min
+            iv_rank_adj = sz.iv_rank_adj_max - iv_rank_span * (iv_rank / 100.0)
+        iv_rank_adj = max(sz.iv_rank_adj_min, min(sz.iv_rank_adj_max, iv_rank_adj))
 
         # Strategy adjustment
-        strategy_adj = self.STRATEGY_RISK.get(strategy, 1.0)
+        strategy_adj = sz.strategy_risk.get(strategy, 1.0)
 
-        # Drawdown throttle: halve size after 3+ consecutive losing days,
-        # quarter size after 5+ — defensive during rough patches
-        if recent_losing_days >= 5:
-            drawdown_adj = 0.25
-        elif recent_losing_days >= 3:
-            drawdown_adj = 0.50
-        else:
-            drawdown_adj = 1.0
+        # Drawdown throttle (defensive during rough patches): the default tiers
+        # halve size after 3+ consecutive losing days, quarter it after 5+.
+        drawdown_adj = self._tier_factor(recent_losing_days, sz.drawdown_tiers)
 
         # VIX regime adjustment: shrink positions in high-vol regimes where
-        # gamma risk is amplified. VIX>30 = crisis (half), VIX>25 = elevated (75%)
-        if vix >= 30:
-            vix_adj = 0.50
-        elif vix >= 25:
-            vix_adj = 0.75
-        else:
-            vix_adj = 1.0
+        # gamma risk is amplified. Default: VIX>=30 crisis (half), VIX>=25
+        # elevated (75%).
+        vix_adj = self._tier_factor(vix, sz.vix_size_tiers)
 
         # Calculate contracts
         adjusted_max = (max_position_value * conf_adj * vol_adj

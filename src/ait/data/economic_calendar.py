@@ -228,9 +228,17 @@ class EconomicCalendar:
     # calendar.
     STALENESS_ALARM_DAYS = 30
 
-    def __init__(self) -> None:
-        self._events = _ALL_EVENTS
-        self._event_dates = _EVENT_DATES
+    def __init__(self, events: "list[EconomicEvent] | None" = None) -> None:
+        # W65: `events=None` (live, the default) is the hardcoded 2026-27 calendar,
+        # unchanged. Research passes a calendar built from the operator's CSV
+        # (build_research_calendar) so past windows are gated on what actually
+        # happened, not only on 2026.
+        if events is None:
+            self._events = _ALL_EVENTS
+            self._event_dates = _EVENT_DATES
+        else:
+            self._events = sorted(events, key=lambda e: e.date)
+            self._event_dates = frozenset(e.date for e in self._events)
         self._last_event_date: date = (
             max(e.date for e in self._events) if self._events else date.min
         )
@@ -355,3 +363,66 @@ class EconomicCalendar:
     ) -> list[EconomicEvent]:
         """Get all events between start and end (inclusive)."""
         return [e for e in self._events if start <= e.date <= end]
+
+
+# ---------------------------------------------------------------------------
+# W65: research calendar from the operator's Investing.com CSV
+# ---------------------------------------------------------------------------
+# The ONE definition of which CSV rows are the five engine event types, shared by
+# scripts/load_econ_calendar_csv.py (ingest) and the tests. Names are the exact
+# Investing.com event strings of the US releases (country == "United States").
+ENGINE_EVENT_NAMES: dict[str, str] = {
+    "Fed Interest Rate Decision": "FOMC",
+    "U.S. Consumer Price Index (CPI) MoM": "CPI",
+    "U.S. Nonfarm Payrolls": "NFP",
+    "U.S. Core PCE Price Index MoM": "PCE",
+    "U.S. Gross Domestic Product (GDP) QoQ": "GDP",
+}
+_GDP_STAGE_GAP_DAYS = 60   # advance/second/third estimates of one quarter are ~30 days apart
+
+
+def derive_engine_event_types(df):
+    """Return a Series (aligned to df.index) of FOMC/CPI/NFP/PCE/GDP or None.
+
+    Combined releases (two reference periods on one date, e.g. Oct+Nov NFP after the
+    2025 shutdown) simply map to the same event date. For GDP only the ADVANCE
+    estimate counts (the engine's hardcoded list is "advance estimates only"): the
+    first release of each reference-period group, where a new group starts when a
+    release of that reference period comes > 60 days after the previous one."""
+    import pandas as pd
+
+    out = pd.Series([None] * len(df), index=df.index, dtype=object)
+    us = df["country"].eq("United States") & df["type"].eq("event")
+    for name, etype in ENGINE_EVENT_NAMES.items():
+        if etype == "GDP":
+            continue
+        out[us & df["event"].eq(name)] = etype
+    gdp = df[us & df["event"].eq("U.S. Gross Domestic Product (GDP) QoQ")].copy()
+    if not gdp.empty:
+        gdp["_d"] = pd.to_datetime(gdp["event_date"])
+        gdp = gdp.sort_values("_d")
+        for _, grp in gdp.groupby(gdp["reference_period"].fillna("")):
+            prev = None
+            for idx, d in zip(grp.index, grp["_d"]):
+                if prev is None or (d - prev).days > _GDP_STAGE_GAP_DAYS:
+                    out[idx] = "GDP"
+                prev = d
+    return out
+
+
+def build_research_calendar(db_path, table_prefix: str, event_types) -> "EconomicCalendar | None":
+    """EconomicCalendar from `{prefix}econ_events`, or None when the table is empty.
+
+    One EconomicEvent per (date, type): the engine gates on dates, so a combined
+    release is a single event."""
+    from ait.data.historical import HistoricalDataStore
+
+    store = HistoricalDataStore(db_path=db_path, table_prefix=table_prefix)
+    df = store.load_econ_events(engine_event_types=list(event_types))
+    if df.empty:
+        return None
+    events = []
+    for d, t in sorted({(date.fromisoformat(r.event_date), r.engine_event_type)
+                        for r in df.itertuples()}):
+        events.append(EconomicEvent(d, EventType[t], f"{t} (research calendar)"))
+    return EconomicCalendar(events=events)

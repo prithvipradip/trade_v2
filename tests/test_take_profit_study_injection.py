@@ -176,9 +176,15 @@ class TestEntryDteThreading:
             predictor=None, window_cfg=cfg)
         assert sink and sink[-1].get("entry_dte") == 18
 
-    def test_refused_with_per_window_optimization(self):
+    def test_entry_dte_is_allowed_with_per_window_optimization(self):
+        # W79a: trial Backtesters now receive entry_dte (StrategyOptimizer baseline + the
+        # searched dimension), so it is no longer refused. The ladder still is: it is not
+        # threaded into trials.
+        cfg = WalkForwardConfig(entry_dte=18, optimize_per_window=True)
+        assert cfg.entry_dte == 18 and cfg.optimize_per_window
         with pytest.raises(ValueError, match="optimize_per_window"):
-            WalkForwardConfig(entry_dte=18, optimize_per_window=True)
+            from ait.execution.exit_policy import CREDIT_TP_LADDER
+            WalkForwardConfig(credit_tp_ladder=CREDIT_TP_LADDER, optimize_per_window=True)
 
     def test_engine_prices_the_requested_dte(self, synth_df, synth_features):
         bt = Backtester(**_engine_kwargs(synth_df, synth_features, entry_dte=18))

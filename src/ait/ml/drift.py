@@ -16,6 +16,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from ait.config.settings import MLConfig
 from ait.utils.logging import get_logger
 
 log = get_logger("ml.drift")
@@ -54,11 +55,24 @@ class DriftDetector:
 
     def __init__(
         self,
-        window_size: int = 50,
-        accuracy_threshold: float = 0.40,
-        calibration_threshold: float = 0.25,
+        window_size: int | None = None,
+        accuracy_threshold: float | None = None,
+        calibration_threshold: float | None = None,
         check_interval: int = 10,
+        high_confidence: float | None = None,
     ) -> None:
+        # W69: the four drift thresholds are ml.drift_* config. None -> the
+        # MLConfig model defaults (50 / 0.40 / 0.25 / 0.80, the former
+        # literals), so a bare DriftDetector() is unchanged. The trainer
+        # passes the configured values explicitly.
+        _d = MLConfig()
+        window_size = _d.drift_window_size if window_size is None else window_size
+        accuracy_threshold = (_d.drift_accuracy_threshold
+                              if accuracy_threshold is None else accuracy_threshold)
+        calibration_threshold = (_d.drift_calibration_threshold
+                                 if calibration_threshold is None else calibration_threshold)
+        self._high_confidence = (_d.drift_high_confidence
+                                 if high_confidence is None else high_confidence)
         self._window_size = window_size
         self._accuracy_threshold = accuracy_threshold
         self._calibration_threshold = calibration_threshold
@@ -113,12 +127,13 @@ class DriftDetector:
         accuracy = correct / len(completed)
 
         # Calibration: high-confidence predictions should be right more often
-        high_conf = [p for p in completed if p.confidence >= 0.80]
+        high_conf = [p for p in completed if p.confidence >= self._high_confidence]
         cal_error = 0.0
         if len(high_conf) >= 5:
             high_conf_acc = sum(1 for p in high_conf if p.correct) / len(high_conf)
-            # Expected: high confidence should have ~80% accuracy
-            cal_error = max(0, 0.80 - high_conf_acc)
+            # Expected: high confidence should be right about as often as the
+            # cohort cutoff claims (default ~80%)
+            cal_error = max(0, self._high_confidence - high_conf_acc)
 
         # Determine if drifting
         is_drifting = False

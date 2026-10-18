@@ -512,10 +512,44 @@ def _scan_foreign_bot_pids() -> list[int] | None:
     return pids
 
 
-def _clear_dashboard_port(port: int = 8501) -> bool:
+def _dashboard_cfg():
+    """W69: the dashboard section of the supervisor's configuration.
+
+    The three web-service ports and `enabled` were literals here (8501 in
+    three places, 8502, 8503) while `dashboard.port` / `dashboard.enabled` in
+    config.yaml were read by nothing. load_settings() returns this process's
+    frozen settings (W35), so a config.yaml edited after start never changes
+    what the supervisor supervises. A settings failure falls back to the
+    DashboardConfig MODEL defaults — the same values — and never blocks the
+    supervisor (W35: "never block the supervisor on config").
+    """
+    from ait.config.settings import DashboardConfig, load_settings
+    try:
+        return load_settings().dashboard
+    except Exception as e:  # noqa: BLE001
+        _log("warning", "dashboard_config_unavailable", error=str(e))
+        return DashboardConfig()
+
+
+def _data_collection_cfg():
+    """W76: the supervisor-run data-collection section (default: everything OFF).
+
+    Same contract as `_dashboard_cfg`: this process's frozen settings, and a settings
+    failure falls back to the MODEL defaults (collection disabled) rather than blocking
+    the supervisor."""
+    from ait.config.settings import DataCollectionConfig, load_settings
+    try:
+        return load_settings().data_collection
+    except Exception as e:  # noqa: BLE001
+        _log("warning", "data_collection_config_unavailable", error=str(e))
+        return DataCollectionConfig()
+
+
+def _clear_dashboard_port(port: int) -> bool:
     """R16 #57: free the dashboard port before (re)launching Streamlit.
 
-    An orphaned Streamlit from an ungracefully-dead supervisor holds 8501, so
+    An orphaned Streamlit from an ungracefully-dead supervisor holds the port
+    (8501 by default; W69: dashboard.port, so the caller passes it), so
     every relaunch died within ~1s ('Port 8501 is not available') and the
     health loop blind-respawned a doomed child every 2 minutes (663 restarts
     on 08-04 alone). Kill the orphan first. This is the ONE sanctioned
@@ -1215,43 +1249,53 @@ class WebServiceManager:
         self._start_status()
 
     def _start_status(self):
-        """Lightweight live status dashboard (http://localhost:8503).
+        """Lightweight live status dashboard (dashboard.status_port, 8503 default).
 
         Reliable real-time view of bot health, positions, today's activity,
         and real-exit P&L — reads the DB/logs directly, no IBKR clientId
-        conflict. Separate from the heavy Streamlit app on 8501.
+        conflict. Separate from the heavy Streamlit app (dashboard.port).
         """
         if self._status_proc and self._status_proc.poll() is None:
             return
-        _log("info", "status_dashboard_starting", port=8503)
+        status_port = _dashboard_cfg().status_port
+        _log("info", "status_dashboard_starting", port=status_port)
         log_path = LOGS_DIR / "status_server.log"
         self._status_log = open(log_path, "a")
         self._status_proc = subprocess.Popen(
-            [sys.executable, str(ROOT / "status_server.py")],
+            # W69: --port hands the child THIS process's configured port.
+            [sys.executable, str(ROOT / "status_server.py"), "--port", str(status_port)],
             cwd=str(ROOT),
             stdout=self._status_log,
             stderr=subprocess.STDOUT,
             env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         )
         _log("info", "status_dashboard_started", pid=self._status_proc.pid,
-             url="http://localhost:8503")
+             url=f"http://localhost:{status_port}")
 
     def _start_dashboard(self):
         if self._dashboard_proc and self._dashboard_proc.poll() is None:
             return
+        cfg = _dashboard_cfg()
+        if not cfg.enabled:
+            # W69: dashboard.enabled was read by nothing. False now means the
+            # supervisor does not launch (or health-check-respawn) Streamlit.
+            _log("info", "dashboard_disabled_by_config", key="dashboard.enabled")
+            return
+        port = cfg.port
         # R16 #57: an orphaned Streamlit (from an ungracefully-dead previous
-        # supervisor) holding 8501 made every relaunch die in ~1s and the
-        # health loop respawned a doomed child every 2 min, forever, silently.
-        # Clear the port first; if a NON-streamlit process holds it, skip the
-        # spawn entirely (alert, gated) instead of crash-looping against it.
-        if not _clear_dashboard_port(8501):
-            _log("error", "dashboard_start_skipped_port_held", port=8501)
+        # supervisor) holding the dashboard port (8501 by default) made every
+        # relaunch die in ~1s and the health loop respawned a doomed child
+        # every 2 min, forever, silently. Clear the port first; if a
+        # NON-streamlit process holds it, skip the spawn entirely (alert,
+        # gated) instead of crash-looping against it.
+        if not _clear_dashboard_port(port):
+            _log("error", "dashboard_start_skipped_port_held", port=port)
             if _alert_gate("dashboard_port_held", 3600):
-                _alert("dashboard NOT started: port 8501 is held by a process "
+                _alert(f"dashboard NOT started: port {port} is held by a process "
                        "the supervisor won't kill — see orchestrator.log "
                        "(dashboard_port_held_foreign) for the holder.")
             return
-        _log("info", "dashboard_starting", port=8501)
+        _log("info", "dashboard_starting", port=port)
         log_path = LOGS_DIR / "dashboard.log"
         # R16: rotate BEFORE reopening — this is the one moment no child holds
         # the handle, mirroring BotManager._rotate_stdout_log at bot start.
@@ -1268,7 +1312,7 @@ class WebServiceManager:
         self._dashboard_proc = subprocess.Popen(
             [sys.executable, "-m", "streamlit", "run",
              str(ROOT / "src" / "ait" / "dashboard" / "app.py"),
-             "--server.port=8501", "--server.headless=true",
+             f"--server.port={port}", "--server.headless=true",
              # localhost ONLY (deep-audit S2): streamlit's default binds all
              # interfaces, LAN-exposing the P&L dashboard with no auth.
              "--server.address=127.0.0.1",
@@ -1282,12 +1326,14 @@ class WebServiceManager:
     def _start_weblog(self):
         if self._weblog_proc and self._weblog_proc.poll() is None:
             return
-        _log("info", "weblog_starting", port=8502)
+        weblog_port = _dashboard_cfg().weblog_port
+        _log("info", "weblog_starting", port=weblog_port)
         log_path = LOGS_DIR / "weblog.log"
         _rotate_if_oversized(log_path, _ROTATE_TARGETS["weblog.log"])  # R16
         self._weblog_log = open(log_path, "a")
         self._weblog_proc = subprocess.Popen(
-            [sys.executable, str(ROOT / "web_logs.py")],
+            # W69: --port hands the child THIS process's configured port.
+            [sys.executable, str(ROOT / "web_logs.py"), "--port", str(weblog_port)],
             cwd=str(ROOT),
             stdout=self._weblog_log,
             stderr=subprocess.STDOUT,
@@ -1351,7 +1397,13 @@ def run_backtest():
                 # locked by the pre-registered rules regardless of results.
                 "--symbols", "SPY", "QQQ", "IWM",
                 "--strategies", "iron_condor",
-                "--capital", "50000",
+                # W-capital: no --capital here -- run_backtest resolves
+                # config.yaml account.capital (was a hardcoded "50000").
+                # W65: run_backtest now defaults to the IB research history
+                # (2024-01-01 -> today, 10 windows, ~12 min measured) which would
+                # blow this job's 600 s timeout; the health signal only needs the
+                # recent windows (4 -> ~5 min). Drift TRACKING, not decision-making.
+                "--max-windows", "4",
             ],
             cwd=str(ROOT),
             capture_output=True,
@@ -1421,7 +1473,7 @@ from ait.ml.range_spec import live_range_spec
 _range_threshold, _range_horizon = live_range_spec(settings)
 range_pred = RangePredictor(threshold_pct=_range_threshold, horizon_days=_range_horizon)
 vol_mag_pred = VolMagnitudePredictor(threshold_pct=0.07, horizon_days=30)
-market_data = MarketDataService(None, polygon_api_key=settings.api_keys.polygon_api_key)
+market_data = MarketDataService(None)   # W65: no IB client here -> daily bars from Yahoo; no Polygon
 historical = HistoricalDataStore()
 trainer = ModelTrainer(
     settings.ml, predictor, market_data, historical,
@@ -1590,6 +1642,65 @@ def publish_shared_logs():
              rc=r.returncode, result=tail)
     except Exception as e:  # noqa: BLE001 — publishing must never hurt the supervisor
         _log("WARNING", "shared_logs_publish_failed", error=str(e))
+
+
+def fetch_shared_logs():
+    """W70 follow-up: refresh `origin/shared-logs` in this checkout, 5 minutes after the
+    16:45 publish, so the OTHER box's published days are readable locally without anyone
+    running read_shared_logs.py first.
+
+    A fetch only (no checkout/merge; see shared_logs.fetch_shared_branch). Deliberately NOT
+    gated on AIT_LOG_OWNER: reading a peer's logs does not require publishing your own.
+    Logs the newest published day per owner (a stalled box shows up as a stale date); no
+    alert — a quiet peer is information, not a page. Never raises."""
+    try:
+        from ait.orchestration.shared_logs import fetch_shared_branch
+        res = fetch_shared_branch(ROOT)
+        if res.ok:
+            _log("INFO", "shared_logs_fetched", head=res.head, advanced=res.advanced,
+                 new_commits=res.new_commits, latest_by_owner=res.latest_by_owner)
+        else:
+            _log("WARNING", "shared_logs_fetch_failed", error=res.error)
+    except Exception as e:  # noqa: BLE001 — must never hurt the supervisor
+        _log("WARNING", "shared_logs_fetch_failed", error=str(e))
+
+
+def collect_short_dte_friction():
+    """W76: run the 0-6 DTE friction collector, unattended, after the close.
+
+    A thin wrapper: the whole job (guards, command, idle/absolute timeout, outcome
+    classification) lives in ait.orchestration.short_dte_job and is tested without a
+    broker. Failure-only alerts, rate-limited to one per day; a healthy run is logged only
+    (progress is in data/short_dte_collection_status.json). Never raises: a collection
+    problem must never hurt the supervisor."""
+    try:
+        from ait.config.settings import IBKREnvConfig, load_settings
+        from ait.orchestration.short_dte_job import run_collection
+        from ait.utils.time import is_trading_day, today_et
+
+        cfg = _data_collection_cfg()
+        env = IBKREnvConfig()
+        port = int(os.environ.get("IBKR_PORT") or env.ibkr_port)
+        base_id = int(os.environ.get("IBKR_CLIENT_ID") or env.ibkr_client_id)
+        try:
+            min_sessions = int(load_settings().backtest.friction_min_sessions_per_band)
+        except Exception:  # noqa: BLE001
+            min_sessions = 15
+        _log("info", "short_dte_collection_starting", symbols=",".join(cfg.short_dte_symbols),
+             port=port, client_id=cfg.short_dte_client_id)
+        out = run_collection(
+            cfg, root=ROOT, data_dir=DATA_DIR, logs_dir=LOGS_DIR, min_sessions=min_sessions,
+            ibkr_port=port, base_client_id=base_id, is_trading_day=is_trading_day,
+            gateway_listening=_gateway_listening, today=today_et())
+        _log("INFO" if out.status in ("ok", "skipped_not_trading_day") else "WARNING",
+             f"short_dte_collection_{out.status}", detail=out.detail, stored=out.stored,
+             planned=out.planned, bands=out.bands, log=out.log_path)
+        if out.alert_worthy and _alert_gate("short_dte_collection", 20 * 3600):
+            _alert(f"Short-DTE friction collection {out.status}: {out.detail}. "
+                   f"Today's samples may be missing for good (IB keeps nothing for expired "
+                   f"contracts). Log: {out.log_path or 'n/a'}")
+    except Exception as e:  # noqa: BLE001 - must never hurt the supervisor
+        _log("WARNING", "short_dte_collection_failed", error=str(e))
 
 
 def backup_state_db():
@@ -2278,6 +2389,22 @@ def _register_recurring_jobs(scheduler, bot, web) -> None:
     scheduler.add_job(publish_shared_logs,
                       CronTrigger(day_of_week="mon-fri", hour=16, minute=45, timezone=ET),
                       id="shared_logs_publish")
+    # W70 follow-up: refresh origin/shared-logs 5 minutes after the publish (fetch only;
+    # not gated on AIT_LOG_OWNER). See fetch_shared_logs().
+    scheduler.add_job(fetch_shared_logs,
+                      CronTrigger(day_of_week="mon-fri", hour=16, minute=50, timezone=ET),
+                      id="shared_logs_fetch")
+    # W76: supervisor-run 0-6 DTE friction collection. Registered ONLY when
+    # data_collection.short_dte_enabled (default off); a process runs on the settings it
+    # started with, so toggling it takes a supervisor restart. See collect_short_dte_friction().
+    _dc = _data_collection_cfg()
+    if _dc.short_dte_enabled:
+        _dc_h, _dc_m = (int(x) for x in _dc.short_dte_time_et.split(":"))
+        scheduler.add_job(collect_short_dte_friction,
+                          CronTrigger(day_of_week="mon-fri", hour=_dc_h, minute=_dc_m, timezone=ET),
+                          id="short_dte_collection", max_instances=1)
+        _log("info", "short_dte_collection_scheduled", time_et=_dc.short_dte_time_et,
+             symbols=",".join(_dc.short_dte_symbols), client_id=_dc.short_dte_client_id)
 
     # Weekly deep backtest: Sunday 8 PM ET
     scheduler.add_job(run_backtest,

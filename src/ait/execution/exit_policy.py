@@ -71,6 +71,58 @@ MACRO_FLATTEN_WINDOW_DAYS: dict[str, int] = {
 }
 
 
+def expiry_guard_applies(entry_dte: int, guard_dte: int | None) -> bool:
+    """W74: do the DTE-based closes (live rules 3 and 3a: ``DTE <= EXPIRY_APPROACHING_DTE``
+    and credit ``DTE <= 1``) apply to a position ENTERED with ``entry_dte`` days to expiry?
+
+    They exist so a 14+ DTE entry leaves before gamma week. For an entry that
+    starts inside that week they would close the position on the next tick, so
+    short-DTE entries (``entry_dte <= guard_dte``) are governed by the hold
+    fraction and the expiry-day flatten instead. ``guard_dte=None`` is today's
+    behaviour: the rules apply to every position.
+    """
+    return guard_dte is None or entry_dte > guard_dte
+
+
+def hold_limit_reached(entry_ts, now_ts, expiry_close_ts, fraction: float | None) -> bool:
+    """W74: has the position been held for ``fraction`` of its life (entry -> expiry close)?
+
+    ``fraction`` in (0, 1]; ``None`` disables the rule (the legacy day-count cap
+    applies instead). Timestamps are tz-aware datetimes. A non-positive span
+    (entered at/after the bell) is reported as reached so it can never linger.
+    """
+    if fraction is None:
+        return False
+    if not 0.0 < float(fraction) <= 1.0:
+        raise ValueError(f"max hold fraction must be in (0, 1], got {fraction}")
+    span = (expiry_close_ts - entry_ts).total_seconds()
+    if span <= 0:
+        return True
+    return (now_ts - entry_ts).total_seconds() >= float(fraction) * span
+
+
+def expiry_day_flatten_due(now_et, expiry, minutes_before_close: int | None, close_et=None) -> bool:
+    """W74: is it time to flatten a position because its expiry session is ending?
+
+    True from ``minutes_before_close`` before that session's close, and for any
+    time after the expiry date. ``None`` disables it. ``close_et`` is the
+    session close as a ``datetime.time`` (13:00 on early-close days; default
+    16:00). Hard backstop: it exists so no position reaches the settlement and
+    assignment mechanics (pin risk, an unhedged gap after a one-sided expiry).
+    """
+    if minutes_before_close is None:
+        return False
+    from datetime import datetime as _dt, time as _time, timedelta as _td
+    d = now_et.date()
+    if d > expiry:
+        return True
+    if d < expiry:
+        return False
+    close = close_et if close_et is not None else _time(16, 0)
+    cutoff = _dt.combine(expiry, close, tzinfo=now_et.tzinfo) - _td(minutes=int(minutes_before_close))
+    return now_et >= cutoff
+
+
 def validate_ladder(ladder) -> Ladder:
     """Normalise a research ladder to tuples and refuse malformed ones.
 

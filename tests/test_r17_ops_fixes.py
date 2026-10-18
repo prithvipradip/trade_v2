@@ -146,8 +146,11 @@ class TestWalkforwardWindowCapitalUsesActiveSymbols:
             test_start=date(2023, 11, 2), test_end=date(2023, 12, 22),
             data=data, vix_full=pd.DataFrame(), learner=None,
         )
-        # Pre-fix: window_capital = 100_000 * len(data) = 200_000 (QQQ counted
-        # despite deploying no capital). Post-fix: 100_000 * active_symbols = 100_000.
+        # W-capital SUPERSEDES the R17 #14 / BT-H3 semantics this test used to
+        # pin (window capital = capital x active symbols). The pool is ONE
+        # account, so the window's capital base is the configured pool itself
+        # whatever the symbol count -- 100_000, never 200_000 (QQQ counted) and
+        # never N x sleeves.
         assert wr.backtest_result.initial_capital == pytest.approx(100_000.0)
 
 
