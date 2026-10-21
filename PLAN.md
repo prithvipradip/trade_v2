@@ -18303,3 +18303,52 @@ live's key) if the 2.4x change is not wanted for studies. (2) Any bot restart (t
 **NEXT.** The operator's decisions above; otherwise unchanged (W83a-2 decisions, the ideas register, W79b prerequisites).
 
 ---
+
+
+## 2026-10-22 - W87 AS PLANNED: research hygiene (W87a) and the study layer with run records (W87b); a CORRECTION to the 2026-10-22 hard-coded-values audit
+
+Plan approved by the operator 2026-10-22. Written BEFORE any W87 code. HEAD at planning: `2ec8420` on local `main` (unpushed); no live bot running. Research tooling plus refactors of three LIVE-SHARED
+files (`strategies/iron_condor.py`: one named constant; `ml/ensemble.py`, `ml/range_predictor.py`, `ml/vol_magnitude_predictor.py`: shared hyperparameters), each verified by equality tests; they reach the bot
+only at its next restart.
+
+**THE ASKS.** (1) After the hard-coded-values audit of `backtesting/`, `optimization/`, `ml/`, `strategies/`, `scripts/`: make research follow config and single-source the duplicated constants. (2) Make studies
+reproducible and comparable: a committed per-study file merged over `config.yaml` + `config_research.yaml`, search-space overrides, a run record (JSON in the run folder, MLflow when installed), and a two-tier rule
+(pre-registered studies get PLAN.md entries, exploratory ones do not).
+
+**CORRECTION.** The audit said the walk-forward OOS engines do not receive `stop_loss_pct` / `profit_target_pct`. That was wrong: `WalkForwardConfig` has both fields, resolves them from `backtest.stop_loss_pct` /
+`profit_target_pct` (0.35 / 0.50) in `__post_init__` and forwards them to the OOS engine, the shadow engine and the optimizer. Only a bare `Backtester()` and `run_backtest --compare-exits` use the engine's
+0.50 / 1.00, and condors never read them (`_check_exit_fixed` / `_check_exit_trailing` run for non-credit positions only). The item is dropped.
+
+**FINDINGS THAT SHAPE THE DESIGN (code reads, 2026-10-22).**
+- The env contract (`contract_float("AIT_IC_WING_K")` etc.) reads the RAW `config.yaml` and ignores BOTH the research overlay and any study layer, so a study setting for a contract-backed key would silently not apply.
+- `ProcessPoolExecutor` workers (spawn) rebuild settings from plain `config.yaml`, dropping the frozen overlay; only `WalkForwardConfig` crosses the pool. A study layer therefore refuses `optimize_n_jobs > 1`.
+- `tests/test_w68_research_config.py` forbids the strings `config_research` / `use_research_config` / `ait.config.research` anywhere under `src/ait` except `config/research.py`: the study loader lives there; the run-record module receives paths as arguments.
+- Nothing writes a run record any more: `reports/runs/` has no writer since June (`run_integration_test.py` is the only one and is stale), `run_backtest.py` writes nothing, and the parity manifest is only printed. MLflow
+  (3.12, `data/mlflow.db`, 43 runs, last 2026-06-09) is used only by that script and `backfill_mlflow.py`; `docs/MATURITY_R10.md` records "do not auto-log to MLflow from the bot; the file archive is the system of record".
+- `STRATEGY_SPACES` are read at three points in the optimizer (`_suggest_params`, the `wing_k` inert check, the DTE merge), `FRACTAL_GATE_SPACE` is copied into two spaces at import, and nothing hashes a space. An Optuna study
+  resumed from a `storage=` with a different range could silently mix distributions.
+- Model hyperparameters (200 trees, depth 5, rate 0.05, subsample / colsample 0.8, seed 42) are copied in `ensemble.py`, `range_predictor.py`, `vol_magnitude_predictor.py`; `meta_label.py` (100 / 3, no seed) and
+  `trainer._objective` (`n_jobs=1`, no class weights) differ on purpose. The IV proxy (x1.15, 0.70 / 0.30) is duplicated between `engine.py` and `replay.engine_current_iv` with no parity test.
+- The "W81 harness" block (credit floors 0.30 / 0.05, `iv_floor 0.05`, fractal veto off, `bs_legacy`, $100k) is pasted into four scripts and is LOOSER than live (0.70 / 0.10 / 0.20).
+- `trading.universe` is `[SPY, QQQ, IWM]` and has no research authority; `options.strategies` is `[iron_condor]` and does.
+
+**OPTIONS FACED AND DECISIONS.**
+1. Scope: one plan, two parts (**CHOSEN, operator**): W87a hygiene, W87b the study layer. Results-moving cleanup is separated and measured.
+2. MLflow: optional (**CHOSEN**): the JSON record is always written; MLflow logging is guarded and never fails a run. No backfill of W63-W84 (**CHOSEN**: their settings were not saved).
+3. Default research symbol: **QQQ** (**operator**: the symbol with historical option prices, so an IV surface can be built), as a new `BacktestConfig.default_symbols` (schema default `["QQQ"]`); default strategies follow
+   `options.strategies`. The supervisor job passes explicit arguments and is untouched.
+4. Study flag: `--study-file` (not `--study`, which sits beside the Optuna `--study-name`).
+5. Studies and PLAN.md (**CHOSEN, operator**): pre-registered studies get an AS PLANNED entry before and a result entry after; exploratory studies need only the study file and run record; a test checks that a study's
+   `rule:` is `exploratory` or names an existing PLAN.md heading.
+6. Not changed, registered: engine thesis rule 0.80 + 2-day wait (inert under IC-only realistic; live has no wait and different branches), cash-drag 0.05 (display only), bare-optimizer `initial_capital=50_000`
+   (production passes the capital; moving it breaks `test_optimizer` through the wing_k-inert rule), `WalkForwardResult.initial_capital`, `run_optimizer --config`, feature windows, dormant strategy constants.
+
+**PARTS.** W87a: items 1-8 behaviour-identical (manifest live column from authorities; `--iv-floor` from the contract; commission and window defaults from their authorities; shared hyperparameters; a shared IV-model
+module with a new engine-vs-replay parity test; a shared study-harness helper; `effective_space` + `space_hash` + the three optimizer integration points + a study-resume guard), then items 9-10 results-moving
+(`slippage_pct` 0.03 -> config 0.01, debit structures only; default symbols / strategies) with before/after numbers. W87b: study loader in `config/research.py`, `--study-file`, `run_record.py`, MLflow logging,
+the tier test, docs. Verification: the 6-variant reference dump (explicit `max_concurrent_positions=1`) must stay byte-identical for W87a items 1-8; per-script before/after for the harness helper; mutation check;
+exact count reconciliation; fast lane; typecheck; smoke.
+
+**NEXT.** W87a, then W87b, each with its own AS BUILT entry.
+
+---
