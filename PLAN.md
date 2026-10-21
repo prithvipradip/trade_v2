@@ -18242,3 +18242,64 @@ the operator's next restart (the bot is down; restarts are the operator's call).
 **NEXT.** W86a, then W86b, each with its own AS BUILT entry.
 
 ---
+
+
+## 2026-10-21 - W86 AS BUILT: risk-family ceilings raised and linked (W86a); research follows `backtest.max_concurrent_positions` and the divergence report has a class guard (W86b); MEASURED: default research runs now trade about 2.4x as many condors
+
+Code commits `afb07d5` (W86a) and `3089f5a` (W86b), on local `main`. Research tooling plus `settings.py` (a schema change for the live bot, loaded only at its next restart). Nothing restarted, nothing pushed. Plan: the W86 AS PLANNED entry above.
+
+**STATUS OF THE PLAN.** AS PLANNED: both parts as written. AS BUILT: all of it. **FELL SHORT / DIFFERED:**
+1. `backtest.position_size_pct`'s lowered ceiling (0.50 -> 0.25) bounds only the YAML value. An explicit constructor argument is returned unvalidated by `resolve_config_value`, so deliberate sizing studies
+   (`WalkForwardConfig(position_size_pct=0.50)`, several in `tests/test_walkforward.py`) keep working; a test pins this on purpose.
+2. The mutation check left one survivor in W86a, a reworded error message ("must" -> "should"): cosmetic, not behaviour. W86b: 15 of 15 caught.
+3. The 6-variant byte-identical reference script and the earlier scratch helpers had been cleaned from the scratchpad by the time work started; `ref_dump.py` was recreated and its PRE-change dump was taken at HEAD
+   `951223c` before the first edit (and re-run to prove it deterministic).
+4. The `max_open_positions` row of the registry is proven by an AST check (the walk-forward feeds `allocate_pool` from the loaded `positions` section) rather than by running a full walk-forward.
+
+**W86a (ceilings and links, `afb07d5`).** `risk.max_position_risk_pct` ceiling 0.10 -> 0.25; `risk.max_daily_loss_pct` 0.10 -> 0.20; `positions.max_position_pct` 0.25 -> 0.30; `backtest.position_size_pct` 0.50 -> 0.25.
+`Settings._per_trade_knobs_are_linked` now also requires `max_position_risk_pct <= positions.max_portfolio_risk_pct` (gate 6b-2) and `<= risk.max_symbol_concentration_pct` (gate 6c), each a startup `ValueError`
+naming the gate that would refuse every entry. **The shipped values (0.05 / 0.045 / 0.05, aggregate 0.20, concentration 0.20) are unchanged and pass; at the shipped config this wave changes no live behaviour.**
+The A2 breaker-vs-max-loss check stays alert-only. Comment-only fixes (config.yaml: parsed values verified identical; `risk/manager.py`; `tests/test_config.py`), RUNBOOK section "Risk-knob ceilings and the links
+between them" with a drift test against the schema. Tests `tests/test_w86_risk_ceilings.py` 17.
+
+**W86b (research reads the config, `3089f5a`).** `WalkForwardConfig.max_concurrent_positions` and `StrategyOptimizer` resolve `backtest.max_concurrent_positions` (3) from the loaded settings (explicit wins; schema
+default 1 only when no config loads); the bare `Backtester()` keeps its explicit harness default 1. The per-window trainer reads the loaded `ml` section (it built a bare `MLConfig()`; no effect today). The
+`config_default_divergence` report now also sees list-valued fields (`trading.universe`, `options.dte_range`, `options.strategies`), None-default fields (`backtest.position_size_pct`) and
+`account.pdt_account_under_25k` (hidden before by the secret-name filter): 18 fields instead of 13. `DIVERGENCE_CLASSES` classifies each as `live_only` (10), `research_reads_loaded` (6),
+`deliberate_research_difference` (1: `ml.entry_gates_enabled`) or `dead` (1: `sentiment.enabled`), with a reason; the startup line carries `by_class` and an `unclassified` list, and the note no longer claims bare
+models run the code default. A guard test fails on an unclassified divergence and proves each `research_reads_loaded` row on the real code path. The parity manifest shows `min_confidence`,
+`max_open_positions` and `max_concurrent_positions` (live vs the research view; equal today, so no warning). Tests `tests/test_w86_divergence_and_concurrency.py` 28; `test_walkforward.py`'s
+"default is 1" test now asserts the default follows the config.
+
+**EQUIVALENCE.** The 6-variant reference (QQQ / SPY / IWM x realistic / legacy, entry DTE 14, every trade dict and funnel; every variant passes `max_concurrent_positions=1` explicitly) is **byte-identical**
+before and after W86a + W86b (`cmp`). So `gate_parity_ab`, `ex_div_gate_ab`, `dte_dimension_flatness` and `iv_rank_parity_probe`, which pass 1 explicitly, keep their numbers.
+
+**MEASURED: what default-constructed research runs now do** (realistic engine, `bs_legacy`, per-leg friction, 1 contract, entry DTE 14, 2024-01-02..2026-10-08; engine only: no shared-pool risk caps, no VIX
+caps), `max_concurrent_positions` 1 -> 3:
+
+| symbol | trades | total $ | win % | worst trade $ | entries refused for concurrency |
+|---|---|---|---|---|---|
+| QQQ  1 -> 3 | 132 -> 321 | +5,674 -> +16,950 | 67.4 -> 71.0 | -706 -> -706 | 363 -> 125 |
+| SPY  1 -> 3 | 134 -> 340 | +6,068 -> +17,550 | 68.7 -> 71.2 | -360 -> -553 | 384 -> 124 |
+| IWM  1 -> 3 | 121 -> 312 | +1,019 -> +2,700 | 66.9 -> 68.9 | -267 -> -290 | 345 -> 112 |
+
+**Reading.** (1) Every default research run (`run_backtest.py`, `run_optimizer.py`, the walk-forward) now reports about 2.4x as many condors and about 3x the P&L of before; **every earlier default-run reference
+(W63-W84 totals) was at `max_concurrent_positions=1` and is not comparable to a run made from this commit**; a study that needs the old number passes 1. (2) The extra condors overlap on one underlying, so they are
+highly correlated: this is more exposure, not independent evidence, and the engine does not apply live's aggregate-risk or VIX-tier caps (the walk-forward's shared pool does apply the aggregate cap). The win rate
+rising 3-4 points is consistent with entering more of the same favourable days, not with a better edge. (3) The worst single trade is unchanged on QQQ and IWM and larger on SPY (-553 vs -360).
+
+**TESTS / GATES.** Collected 6063 -> 6108 = +45 exactly (17 + 28). Fast lane 6063 passed / 46 skipped / 0 failed (the passed + skipped total is one above the selected count, as in W82 / W84 / W83a). `compileall` OK;
+`typecheck.py` OK; `smoke_deploy.py` SMOKE PASS. Mutation check: W86a 13 mutants, 12 caught + 1 cosmetic survivor; W86b 15 / 15 caught; files restored byte-for-byte (hash-checked).
+
+**REGISTERED, NOT FIXED.** (1) `engine.py` builds `DirectionPredictor(MLConfig())` bare in the live-model fallback path. (2) `run_optimizer.py` calls `use_research_config()` without its `--config`, so the flag is
+ignored for the research settings. (3) The walk-forward learner multiplier (`position_size_pct * min(avg_mult, 2.0)`) can double the effective per-trade pct (0.25 -> 0.50). (4) Above about $4.5k of budget the vol-scaled wing
+width binds before the per-trade budget does. (5) The overlay-merged settings log 7 more divergences (`backtest.engine_model`, `ex_div_entry_gate`, `friction_short_dte`, `gates_mode`, `iv_floor`, `iv_rank_gate`,
+`iv_rank_rise_gate`); they are covered by the parity manifest and `gate_parity`, not by `DIVERGENCE_CLASSES`. (6) `options.dte_range` and `trading.universe` etc. are classified by reading code on 2026-10-21; a later
+reader change would not move a registry row by itself (only the AST / behavioural proofs for the six research rows would fail).
+
+**DECISIONS FOR THE OPERATOR.** (1) Whether the old explicit-1 behaviour should be restored as the research default (one line: `backtest.max_concurrent_positions: 1` in `config_research.yaml` would do it WITHOUT touching
+live's key) if the 2.4x change is not wanted for studies. (2) Any bot restart (the new ceilings and links load then; nothing in the shipped config changes). (3) Pushing: local `main` is ahead of `origin/main`.
+
+**NEXT.** The operator's decisions above; otherwise unchanged (W83a-2 decisions, the ideas register, W79b prerequisites).
+
+---
