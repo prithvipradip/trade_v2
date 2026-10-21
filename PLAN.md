@@ -18180,3 +18180,17 @@ Not launched. First refresh = the plain command (retries the 8 failed tickers); 
 "do the trick" on this box. Last QQQ capture 2026-10-16 (stage A, 44 contracts); bar samples 2026-08-27..10-16; sessions 10-19 and 10-20 not captured (their expiring-day DTE 0-2 data is lost; the 0-2 / 3-6 bands
 had 5 / 8 of 15 sessions and were inactive anyway; the 7-13 band 11/15; 14-29 and 30-45 active). Still-listed contracts recover the missed sessions via the 30 D request. Today's expiries (10-21, 10-22) are capturable
 until ~15:30 ET: `--lifecycle --dry-run` = 122 contracts, ~44 min.
+
+## 2026-10-21 - W85 CORRECTION (no code change): the plain full-window option-history run is NOT ~1 day; first refresh runs as `--since-last`; calibration retry; branch merged into local main
+
+**CORRECTION to the W85 entries above.** They say the first refresh should be the plain full-window command (to retry the 8 failed tickers). Measured: the plain run selected 153,490 contracts, of which ~27,700 have no stored rows
+(125,735 stored tickers) - mostly contracts that never traded, re-fetched on every plain run (the W58 "zero-bars retried" inefficiency). At 12.5s/call that is ~4 days, and they sort BEFORE the new contracts (ticker order).
+Stopped after 1,994 contracts (resume-safe) and switched to `--since-last` (6,446 contracts, ~22h). The 8 failed tickers were retried with a one-off script: `O:QQQ260817C00684000` 3 rows, `...685000` 10 rows;
+the six `O:QQQ251010C00360000..385000` returned no bars (deep ITM, most likely never traded). NEXT for the option history: weekly `--since-last`; the plain run is not worth running until the zero-bar skip is fixed (registered, not done).
+
+**Calibration.** The scheduled 15:30 ET run failed to connect ("clientId 91 already in use?" - cause unconfirmed, probably a stale Gateway session after the 13:47 ET run). Re-run with clientId 92 at 15:36 ET: 38 contracts, 2,158 samples stored,
+0 errors, ok. Bands: 0-2 / 3-6 / 7-13 at 8 / 10 / 11 of 15 sessions, 14-29 and 30-45 active (21 and 30). A concurrent writer also produced one "database is locked" on a read-only query in the same session (rollback-journal mode, 5s timeout).
+
+**Git.** `W64-risk-retune` merged into local `main` (`9a2e0d3`, clean; origin/main had 3 other commits). Fast lane on the merged tree: 6018 passed / 46 skipped / 153 deselected, 0 failed. Not pushed - the operator's call.
+
+---
