@@ -1411,6 +1411,22 @@ class HistoricalDataStore:
             ).fetchone()
         return row is not None
 
+    def get_latest_option_expiry(self, symbol: str) -> date | None:
+        """W85: the latest contract expiry stored for `symbol` (None if empty).
+
+        Lets backfill_option_history.py --since-last narrow its contract listing to
+        expiries it has not yet seen, instead of re-listing the whole 2-year window.
+        """
+        with sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(
+                f"SELECT MAX(expiry) FROM {self._option_daily_bars_table} "
+                f"WHERE underlying = ?",
+                (symbol,),
+            ).fetchone()
+        if row and row[0]:
+            return datetime.strptime(row[0], "%Y-%m-%d").date()
+        return None
+
     def update_option_bar_iv(
         self,
         option_ticker: str,

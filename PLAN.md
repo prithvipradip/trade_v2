@@ -18127,3 +18127,56 @@ and the two-lens check of the "short strikes touched within 9 sessions on about 
 **NEXT.** Unchanged until the operator decides: the W83a-2 decisions list.
 
 ---
+
+## 2026-10-21 - W85 AS PLANNED + AS BUILT: keep the QQQ option-history backfill current (expired-only refresh; underlying-close cap; `--since-last`)
+
+**TRIGGER.** The W58 backfill (`scripts/backfill_option_history.py`) finished its first full QQQ run (status file: complete, 151,282 contracts, 1,712,604 rows). The operator asked whether the script can keep the
+history up to date or needs changes.
+
+**FINDINGS (read-only against `data/historical.db`).**
+- Stored data ends where the run started: latest bar 2026-09-25, latest expiry 2026-09-28. The script lists only EXPIRED contracts (`expired=true`, `expiration_date.lte=end_date`) and fetches each contract's
+  whole life in ONE call; stored contracts are skipped locally (`option_ticker_has_data`). So a plain re-run with today's date already picks up what expired since.
+- Consequence of expired-only: a date's longer-dated tenors appear only after those contracts expire. Longest stored DTE by date: 2026-06-01 -> 109, 08-03 -> 46, 09-01 -> 24, 09-15 -> 13, 09-25 -> 3.
+  With live `dte_range: [14, 30]`, full coverage trails today by ~30 days.
+- THREE problems with a plain periodic re-run:
+  1. **Permanent silent bar loss when the underlying closes are stale.** `process_contract` drops any bar with no underlying close, and the coarse resume-skip then treats the contract as done forever.
+     QQQ/SPY/IWM `daily_prices` end at 2026-10-13 today, so contracts expiring 10-14..10-20 would have lost their tail bars permanently.
+  2. **Full-window re-enumeration** (~200 listing pages at 12.5s each) before any fetching, though almost everything is already stored.
+  3. **8 contracts failed on the network in the first run and were never retried** (6 x `O:QQQ251010C00360000..385000`, `O:QQQ260817C00684000`, `O:QQQ260817C00685000`). They have no stored rows,
+     so a full-window re-run retries them.
+
+**OPERATOR DECISION.** Keep the **expired-only** model; do NOT fetch live (unexpired) contracts. Rationale: one call per contract, ever; a live-contract pass is one call per live contract per run
+(~7k QQQ contracts at +/-30% and <=30 DTE, ~24h per refresh on the free tier). Accepted cost: ~30-day lag on full 14-30 DTE coverage. Revisit on a paid Polygon plan or a much narrower band.
+
+**AS BUILT.**
+- `scripts/backfill_option_history.py`: (a) the run is capped at the underlying's last stored close (`effective_end = min(requested_end, last close)`, logged `underlying_closes_cap`, written to the
+  status file and the dry-run print); contracts expiring past it are deferred to the next run, not truncated. (b) `--since-last`: contracts listing starts at `max(start_date, latest stored expiry)`
+  via a new `expired_from` parameter on `enumerate_contracts` (default unchanged); the bar fetch still starts at `start_date`. (c) default end date is `today_et()` (was `date.today()`).
+  (d) docstring section "KEEPING IT UP TO DATE".
+- `src/ait/data/historical.py`: `HistoricalDataStore.get_latest_option_expiry(symbol)` (no schema change).
+- Tests (`tests/test_backfill_option_history.py`, +8): cap, class guard on the listing bound, `--since-last` on/off, `expired_from` narrowing, `get_latest_option_expiry`.
+- Verification: backfill test file 20 passed; fast lane **6004 passed / 46 skipped / 153 deselected, 0 failed**; `compileall` OK. Dry run `--since-last` (cap bit at 2026-10-13): 4,532 contracts,
+  expiries 2026-09-28..2026-10-13, ~15.7h estimated.
+
+**FELL SHORT / CAVEATS.** `--since-last` does not retry older failed or zero-bar contracts (the zero-bars inefficiency from W58 is unchanged): run the plain command periodically. The tail of the
+cap depends on `daily_prices` being fresh (supervisor retrain writes it; not verified that it is running daily - the data ends 10-13). Not yet RUN for real: the actual refresh is the operator's.
+
+**NEXT.** (1) Refresh QQQ `daily_prices` so the cap moves forward. (2) First real refresh: plain command from the repo root with `nohup` (full window; retries the 8 failures). (3) Then weekly
+`--since-last` (~1,550 contracts, ~5.5h) plus an occasional full-window run. Afterwards a read-only check: the 8 tickers have rows, `MAX(expiry)` has advanced, and the 2026-09-25 longest DTE has grown past 3.
+
+---
+
+## 2026-10-21 - W85 FOLLOW-UP (data refresh + status check; no code change): QQQ daily prices refreshed, option-history refresh sized, spread-calibration collection found OFF
+
+**QQQ `daily_prices` REFRESHED** (IB Gateway paper on 4002, clientId 90): `backfill_historical_data.py --mode daily --allow-live-tables --years 1`. +5 rows (2026-10-14..10-20, source IB_TRADES_RTH); today's
+partial bar dropped by the script. A pre-run copy of `historical.db` was compared: the 245 overlapping rows are unchanged except volume +/-1..3 shares on 5 days (late prints); no `implied_vol` was nulled. The script's
+"3283 zero-volume days" validation flag is pre-existing (the 2011-08..2024-10 UNRECORDED rows; 3283 before and after). NOT refreshed: `daily_iv` / `daily_prices.implied_vol` end 2026-09-11 (`--mode iv`; feeds the
+live IV-rank path) - the operator's call. `.env` has IBKR_PORT=7497 (TWS) but only Gateway 4002 listens, so pass `--port 4002` to scripts that default to 4002/.env.
+
+**OPTION HISTORY is NOT up to date.** Stored bars end 2026-09-25 / expiries 2026-09-28. With the cap now at 2026-10-20, `--since-last --dry-run` selects 6,446 contracts (expiries 09-28..10-20), ~22.4h at 12.5s/call.
+Not launched. First refresh = the plain command (retries the 8 failed tickers); after it, weekly `--since-last` after refreshing QQQ `daily_prices` first (the cap follows it).
+
+**SPREAD CALIBRATION is not scheduled in this checkout.** `config.yaml` `data_collection` is commented out (`short_dte_enabled` defaults false) and no supervisor process is running here, so no scheduled run exists to
+"do the trick" on this box. Last QQQ capture 2026-10-16 (stage A, 44 contracts); bar samples 2026-08-27..10-16; sessions 10-19 and 10-20 not captured (their expiring-day DTE 0-2 data is lost; the 0-2 / 3-6 bands
+had 5 / 8 of 15 sessions and were inactive anyway; the 7-13 band 11/15; 14-29 and 30-45 active). Still-listed contracts recover the missed sessions via the 30 D request. Today's expiries (10-21, 10-22) are capturable
+until ~15:30 ET: `--lifecycle --dry-run` = 122 contracts, ~44 min.

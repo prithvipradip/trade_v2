@@ -43,6 +43,23 @@ fetches alike) -- not the polygon-api-client SDK's own pagination/retry
 instead, matching exactly what was manually verified against the live API
 before this script was written.
 
+KEEPING IT UP TO DATE (W85). Only contracts that have EXPIRED are downloaded --
+one call returns a contract's whole life -- so a re-run with today's date adds
+whatever expired since the last run, and already-stored contracts are skipped
+locally. A date's longer-dated tenors therefore only appear once those contracts
+expire: with live DTE 14-30, full coverage trails today by ~30 days and fills in
+on each re-run (live, unexpired contracts are deliberately not fetched: that is
+one call per live contract per run). Cadence: roughly 1,550 new QQQ contracts a
+week, ~5.5h at the default pause.
+  - First refresh: the plain command (full window) -- it also retries contracts
+    that failed or returned no bars last time.
+  - Later refreshes: `--since-last` lists only expiries from the latest stored one
+    onward (fast); run the plain command now and then to catch retries.
+  - The run is capped at the underlying's last stored close in daily_prices
+    (logged as underlying_closes_cap): contracts expiring after it are deferred to
+    the next run rather than stored with missing tail bars. daily_prices is
+    refreshed by the supervisor's daily retrain.
+
 RUNNING THE REAL, MULTI-DAY JOB (~140,000 contracts for QQQ's full 2-year
 window at the default +/-30% band -- see PLAN.md's W58 entry for the
 measured math). This deliberately does NOT run via launchd: a launchd-
@@ -120,6 +137,7 @@ from ait.data.options_chain import (  # noqa: E402
     solve_iv_from_price,
 )
 from ait.utils.logging import get_logger  # noqa: E402
+from ait.utils.time import today_et  # noqa: E402
 
 log = get_logger("scripts.backfill_option_history")
 
@@ -284,15 +302,19 @@ def enumerate_contracts(
     max_moneyness: float,
     underlying_closes: "pd.Series",
     max_contracts: int | None = None,
+    expired_from: date | None = None,
 ) -> list[dict]:
     """Return the filtered contract list: [{option_ticker, expiry, right,
-    strike}, ...], in-band per in_moneyness_band_over_life."""
+    strike}, ...], in-band per in_moneyness_band_over_life.
+
+    `start_date` is the window start for the moneyness band; `expired_from`
+    (W85, default `start_date`) only narrows which EXPIRIES are listed."""
     selected: list[dict] = []
     params = {
         "underlying_ticker": symbol,
         "expired": "true",
         "limit": 1000,
-        "expiration_date.gte": str(start_date),
+        "expiration_date.gte": str(expired_from or start_date),
         "expiration_date.lte": str(end_date),
         "sort": "ticker",
         "order": "asc",
@@ -406,6 +428,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-contracts", type=int, default=None, metavar="N",
                        help="Stop after N contracts pass the filter -- a "
                             "smoke-test escape hatch before the full run.")
+    parser.add_argument("--since-last", action="store_true",
+                       help="W85: list only expiries from the latest one already "
+                            "stored (inclusive) onward, instead of the whole window. "
+                            "Fast weekly refresh; does NOT retry older contracts that "
+                            "failed or returned no bars -- run without it periodically.")
     parser.add_argument("--dry-run", action="store_true",
                        help="Print the request plan without fetching or storing.")
     return parser.parse_args(argv)
@@ -431,14 +458,16 @@ def _run(argv: list[str] | None) -> int:
         log.error("no_polygon_api_key")
         return 1
 
-    end_date = date.fromisoformat(args.end_date) if args.end_date else date.today()
+    requested_end = (
+        date.fromisoformat(args.end_date) if args.end_date else today_et()
+    )
     start_date = (
         date.fromisoformat(args.start_date) if args.start_date
-        else end_date - timedelta(days=730)
+        else requested_end - timedelta(days=730)
     )
 
     store = HistoricalDataStore(db_path=Path(args.db_path), table_prefix=args.table_prefix)
-    underlying_df = store.load(args.symbol, start_date, end_date)
+    underlying_df = store.load(args.symbol, start_date, requested_end)
     if underlying_df.empty:
         log.error("no_underlying_price_history", symbol=args.symbol,
                  note="daily_prices has no rows for this symbol/window; "
@@ -446,15 +475,35 @@ def _run(argv: list[str] | None) -> int:
         return 1
     underlying_closes = underlying_df["Close"]
 
+    # W85: cap the run at the underlying's own last stored close. A bar with no
+    # underlying close is dropped (process_contract), and the coarse resume-skip
+    # (option_ticker_has_data) then treats the contract as done forever -- so a
+    # contract expiring past the last close would permanently lose its tail bars.
+    # Such contracts are deferred to the next run instead, not truncated.
+    underlying_last = underlying_closes.index.max().date()
+    end_date = min(requested_end, underlying_last)
+    if end_date < requested_end:
+        log.warning("underlying_closes_cap", symbol=args.symbol,
+                   requested_end=str(requested_end), effective_end=str(end_date),
+                   note="daily_prices is stale; contracts expiring after "
+                        "effective_end are deferred to the next run")
+
+    expired_from = None
+    if args.since_last:
+        latest = store.get_latest_option_expiry(args.symbol)
+        if latest is not None:
+            expired_from = max(start_date, latest)
+
     client = PolygonClient(api_key, args.pause_secs)
 
     log.info("enumerating_contracts", symbol=args.symbol,
              start=str(start_date), end=str(end_date),
+             expired_from=str(expired_from or start_date),
              max_moneyness=args.max_moneyness)
     try:
         contracts = enumerate_contracts(
             client, args.symbol, start_date, end_date, args.max_moneyness,
-            underlying_closes, args.max_contracts)
+            underlying_closes, args.max_contracts, expired_from=expired_from)
     except Exception as e:  # noqa: BLE001 -- a multi-page enumeration failing
         # (e.g. a network blip right after sleep/wake) must not crash the
         # whole run with a raw traceback -- log clearly, mark status, stop.
@@ -468,7 +517,8 @@ def _run(argv: list[str] | None) -> int:
         est_hours = len(contracts) * args.pause_secs / 3600
         print(
             f"[DRY RUN] {len(contracts)} contracts selected after the "
-            f"+/-{args.max_moneyness:.0%} moneyness-over-life filter. "
+            f"+/-{args.max_moneyness:.0%} moneyness-over-life filter "
+            f"(expiries {expired_from or start_date} .. {end_date}). "
             f"Estimated {len(contracts)} aggregate calls, "
             f"~{est_hours:.1f} hours at {args.pause_secs}s/call."
         )
@@ -476,6 +526,7 @@ def _run(argv: list[str] | None) -> int:
 
     started_at = datetime.now().isoformat()
     write_status(status="running", symbol=args.symbol, started_at=started_at,
+                effective_end=str(end_date),
                 contracts_total=len(contracts), contracts_done=0,
                 rows_written=0, current_ticker=None, last_error=None)
 
@@ -505,6 +556,7 @@ def _run(argv: list[str] | None) -> int:
     log.info("backfill_complete", symbol=args.symbol,
              contracts=len(contracts), rows=total_rows)
     write_status(status="complete", symbol=args.symbol, started_at=started_at,
+                effective_end=str(end_date),
                 contracts_total=len(contracts), contracts_done=len(contracts),
                 rows_written=total_rows, current_ticker=None, last_error=None)
     return 0
