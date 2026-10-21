@@ -138,7 +138,7 @@ class StrategyOptimizer:
         delta_iv_scale: float | None = None,       # W70: None -> backtest.delta_iv_scale
         patience: int = 0,
         min_trades: int = 10,
-        max_concurrent_positions: int = 1,
+        max_concurrent_positions: int | None = None,   # W86: None -> backtest.max_concurrent_positions
         max_entry_vol_annual: float | None = None,   # W70: None -> backtest.max_entry_vol_annual
         # R20 #2: baseline values for the two iron_condor gate params Optuna
         # searches (param_spaces Exp 26/28). They were absent from bt_kwargs,
@@ -226,7 +226,6 @@ class StrategyOptimizer:
         # self._iv_floor resolved below once _bt_cfg exists (R20b review follow-up)
         self._patience = patience
         self._min_trades = min_trades
-        self._max_concurrent_positions = max_concurrent_positions
         # R20b (pre-registered PLAN 2026-08-21): resolve the config-backed
         # trial BASELINES once, from the same loaded settings live reads
         # (mirrors Backtester's R20 None->load_settings pattern). These feed
@@ -280,6 +279,9 @@ class StrategyOptimizer:
             iv_rank_rise_gate, "backtest", "iv_rank_rise_gate", _BTC2, self._settings))
         self._regime_veto_gate = bool(_rcv(
             regime_veto_gate, "backtest", "regime_veto_gate", _BTC2, self._settings))   # W81
+        # W86 (operator, 2026-10-21): trials follow the config's concurrency (was a hard-coded 1).
+        self._max_concurrent_positions = int(_rcv(
+            max_concurrent_positions, "backtest", "max_concurrent_positions", _BTC2, self._settings))
         self._ex_div_entry_gate = str(_rcv(
             ex_div_entry_gate, "backtest", "ex_div_entry_gate", _BTC2, self._settings))     # W84
         self._ex_div_entry_k_days = int(_rcv(

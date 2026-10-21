@@ -69,9 +69,13 @@ class TestWalkForwardConfig:
         cfg = WalkForwardConfig()
         assert cfg.delta_iv_scale == pytest.approx(0.0)
 
-    def test_max_concurrent_positions_default_is_1(self) -> None:
+    def test_max_concurrent_positions_default_follows_the_config(self) -> None:
+        """W86 (operator, 2026-10-21): was a hard-coded 1 that config.yaml never reached; now it
+        resolves from backtest.max_concurrent_positions (config 3). An explicit value still wins."""
+        from ait.config.settings import load_settings
         cfg = WalkForwardConfig()
-        assert cfg.max_concurrent_positions == 1
+        assert cfg.max_concurrent_positions == load_settings().backtest.max_concurrent_positions == 3
+        assert WalkForwardConfig(max_concurrent_positions=1).max_concurrent_positions == 1
 
     def test_max_entry_vol_annual_default(self) -> None:
         cfg = WalkForwardConfig()

@@ -2283,7 +2283,15 @@ _SECRET_FIELD_HINTS: tuple[str, ...] = (
 _DIVERGENCE_EXEMPT: frozenset[str] = frozenset()
 
 
+# W86: names that contain a secret-looking token but are plain settings, so the divergence report
+# must not hide them ("account" matched account.pdt_account_under_25k, a boolean that changes
+# behaviour and was invisible in the report).
+_NOT_SECRET: frozenset[str] = frozenset({"account.pdt_account_under_25k"})
+
+
 def _is_secret(section_name: str, field_name: str) -> bool:
+    if f"{section_name}.{field_name}" in _NOT_SECRET:
+        return False
     if section_name in _SECRET_SECTIONS:
         return True
     lowered = field_name.lower()
@@ -2294,9 +2302,16 @@ def default_divergences(settings: "Settings") -> list[tuple[str, object, object]
     """Fields whose config.yaml value differs from the pydantic default.
 
     Returns (dotted_field, code_default, active_value). Used by the startup
-    report and by tests/test_r19_config_authority.py to pin that no NEW
-    divergence appears unnoticed.
+    report and by the W86 class guard (tests/test_w86_divergence_and_concurrency.py)
+    so no NEW divergence appears unclassified.
+
+    W86: also covers list / tuple fields (universe, dte_range, strategies) and fields
+    whose default is None but whose active value is set (backtest.position_size_pct).
+    Still skipped: nested models, and fields with no default at all.
     """
+    from pydantic import BaseModel as _BM
+    from pydantic_core import PydanticUndefined as _Undef
+
     out: list[tuple[str, object, object]] = []
     for section_name, section in settings:
         model_fields = getattr(type(section), "model_fields", None)
@@ -2308,12 +2323,72 @@ def default_divergences(settings: "Settings") -> list[tuple[str, object, object]
                 continue
             if _is_secret(section_name, field_name):
                 continue  # R19: names only for secrets — never values
-            default = field.default
-            if default is None or repr(default).startswith("PydanticUndefined"):
+            default = field.get_default(call_default_factory=True)
+            if default is _Undef or isinstance(default, _BM):
                 continue
             active = getattr(section, field_name, None)
-            if isinstance(default, (int, float, str, bool)) and active != default:
+            if isinstance(active, _BM):
+                continue
+            scalar = isinstance(default, (int, float, str, bool))
+            listy = isinstance(default, (list, tuple))
+            if default is None:
+                if active is not None and isinstance(active, (int, float, str, bool)):
+                    out.append((dotted, default, active))
+            elif (scalar or listy) and active != default:
                 out.append((dotted, default, active))
+    return out
+
+
+# W86: WHY each divergence exists and whether research is affected. The startup note used to say that
+# every module building a config model bare "runs the code_default instead", which is no longer true:
+# the research stack resolves its knobs from the LOADED settings (resolve_config_value; config.yaml,
+# or the research overlay once a research entry point froze it). This registry says, per divergent
+# field, which of four things it is, and tests/test_w86_divergence_and_concurrency.py fails when a
+# divergence appears that is not classified here (same pattern as backtesting/gate_parity.py).
+DIVERGENCE_LIVE_ONLY = "live_only"                  # only live code reads it; research is unaffected
+DIVERGENCE_RESEARCH_LOADED = "research_reads_loaded"  # research reads the loaded value (no skew)
+DIVERGENCE_DELIBERATE = "deliberate_research_difference"  # research differs on purpose; shown in the manifest
+DIVERGENCE_DEAD = "dead"                            # nothing reads it
+DIVERGENCE_CLASSES: dict[str, tuple[str, str]] = {
+    "trading.universe": (DIVERGENCE_LIVE_ONLY, "research takes its symbols from the CLI / study arguments"),
+    "trading.max_daily_trades": (DIVERGENCE_LIVE_ONLY, "live orchestrator cap; the engine has no daily-trade cap"),
+    "account.pdt_account_under_25k": (DIVERGENCE_LIVE_ONLY, "read only by risk/pdt_guard.py"),
+    "positions.max_open_positions": (DIVERGENCE_RESEARCH_LOADED,
+                                     "walk-forward pool cap reads the loaded value (allocate_pool)"),
+    "positions.max_contracts_per_trade": (DIVERGENCE_RESEARCH_LOADED,
+                                          "resolve_max_contracts_per_trade, shown in the parity manifest"),
+    "risk.min_confidence": (DIVERGENCE_RESEARCH_LOADED,
+                            "engine / walk-forward / optimizer resolve it from the loaded settings"),
+    "options.dte_range": (DIVERGENCE_RESEARCH_LOADED, "the engine's entry DTE is options.dte_range[0] (loaded)"),
+    "options.min_open_interest": (DIVERGENCE_LIVE_ONLY, "chain liquidity filter; research prices from the model"),
+    "options.min_volume": (DIVERGENCE_LIVE_ONLY, "chain liquidity filter; research prices from the model"),
+    "options.max_bid_ask_spread_pct": (DIVERGENCE_LIVE_ONLY,
+                                       "chain / executor spread filter; research charges the friction model"),
+    "options.strategies": (DIVERGENCE_LIVE_ONLY, "live selector list; research uses the CLI --strategies"),
+    "backtest.position_size_pct": (DIVERGENCE_RESEARCH_LOADED,
+                                   "resolve_position_size_pct: explicit > this > risk.max_position_risk_pct"),
+    "backtest.max_concurrent_positions": (DIVERGENCE_RESEARCH_LOADED,
+                                          "W86: WalkForwardConfig / StrategyOptimizer resolve it from the "
+                                          "loaded settings (was a hard-coded 1)"),
+    "ml.entry_gates_enabled": (DIVERGENCE_DELIBERATE,
+                               "research uses backtest.gates_mode (overlay: enforce); the manifest shows both"),
+    "learning.paper_trading_mode": (DIVERGENCE_LIVE_ONLY, "read only by the live orchestrator"),
+    "sentiment.enabled": (DIVERGENCE_DEAD, "retired subsystem; SentimentConfig is a tombstone"),
+    "logging.max_bytes": (DIVERGENCE_LIVE_ONLY, "setup_logging in the live process"),
+    "logging.backup_count": (DIVERGENCE_LIVE_ONLY, "setup_logging in the live process"),
+}
+DIVERGENCE_KINDS = frozenset({DIVERGENCE_LIVE_ONLY, DIVERGENCE_RESEARCH_LOADED, DIVERGENCE_DELIBERATE,
+                              DIVERGENCE_DEAD})
+
+
+def classify_divergences(diverged: list[tuple[str, object, object]]) -> dict[str, list[str]]:
+    """{class: [dotted fields]} for a default_divergences() result; unregistered ones under
+    "unclassified" (the guard test and the startup report both surface them)."""
+    out: dict[str, list[str]] = {k: [] for k in sorted(DIVERGENCE_KINDS)}
+    out["unclassified"] = []
+    for dotted, _code, _active in diverged:
+        kind = DIVERGENCE_CLASSES.get(dotted, ("unclassified", ""))[0]
+        out.setdefault(kind, []).append(dotted)
     return out
 
 
@@ -2327,9 +2402,13 @@ def _report_default_divergence(settings: "Settings") -> None:
                 "config_default_divergence",
                 count=len(diverged),
                 fields={d: {"code_default": c, "active": a} for d, c, a in diverged},
-                note="config.yaml overrides these; any module constructing a "
-                     "config model BARE (engine/walkforward/optimizer/trainer) "
-                     "runs the code_default instead — research vs live skew.",
+                by_class=classify_divergences(diverged),
+                note="config.yaml overrides these code defaults. W86: the research stack resolves "
+                     "its knobs from the LOADED settings, so a divergence only makes research differ "
+                     "from live when it is classed deliberate_research_difference (the parity manifest "
+                     "shows it) or is 'unclassified' (nobody has looked yet: add it to "
+                     "DIVERGENCE_CLASSES in config/settings.py). A module that builds a config model "
+                     "BARE would still run the code default.",
             )
     except Exception:  # noqa: BLE001 — diagnostics must never block startup
         pass

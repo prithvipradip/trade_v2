@@ -136,7 +136,8 @@ class WalkForwardConfig:
     trailing_stop_enabled: bool = True
     trailing_stop_pct: float | None = None   # W70: None -> exit.trailing_stop_pct
     breakeven_trigger_pct: float | None = None   # W70: None -> exit.breakeven_trigger_pct
-    max_concurrent_positions: int = 1
+    max_concurrent_positions: int | None = None  # W86: None -> backtest.max_concurrent_positions (config 3);
+                                                 # was a hard-coded 1 that config.yaml never reached
     max_entry_vol_annual: float | None = None    # W70: None -> backtest.max_entry_vol_annual
     optimize_per_window: bool = False
     optimize_n_trials: int = 50
@@ -356,6 +357,12 @@ class WalkForwardConfig:
             BacktestConfig, _settings))
         self.gates_mode = str(resolve_config_value(
             self.gates_mode, "backtest", "gates_mode", BacktestConfig, _settings))
+        # W86 (operator, 2026-10-21): research follows the config's concurrency instead of a hard-coded 1
+        # (R20b decision D, "the operator will revisit"). Scripts that pass 1 explicitly keep 1; the bare
+        # Backtester() keeps its explicit harness default. Default-constructed runs move: see PLAN.md W86.
+        self.max_concurrent_positions = int(resolve_config_value(
+            self.max_concurrent_positions, "backtest", "max_concurrent_positions",
+            BacktestConfig, _settings))
         self.iv_rank_gate = bool(resolve_config_value(
             self.iv_rank_gate, "backtest", "iv_rank_gate", BacktestConfig, _settings))
         self.iv_rank_rise_gate = bool(resolve_config_value(     # W71c
@@ -2931,7 +2938,9 @@ class WalkForwardBacktester:
                     _train_ctx["spy"] = _spy_t
             _market_ctx = _train_ctx if _train_ctx else None
 
-            ml_config = MLConfig()
+            # W86: the LOADED ml section (a bare MLConfig() ignored any ml.* edit in config.yaml);
+            # self._settings is None only when no config loaded, then the schema defaults apply.
+            ml_config = getattr(self._settings, "ml", None) or MLConfig()
             # R16 #2: window models are throwaway research artifacts — NEVER
             # persist them. DirectionPredictor.train() used to save
             # unconditionally to the CWD-relative models/ dir, clobbering the

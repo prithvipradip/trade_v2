@@ -195,6 +195,14 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
                                      # risk.pre_event_blackout_days of an event
         "macro_flatten_enabled": env.get("AIT_SKIP_MACRO_EVENTS", "0") == "1",
         "iv_rank_floor":     _live_contract("AIT_IRON_CONDOR_IV_FLOOR"),
+        # W86: the three divergent-from-code-default knobs research reads from the loaded config
+        # (settings.DIVERGENCE_CLASSES, research_reads_loaded); shown so an overlay that ever sets
+        # a different value appears as a warning instead of passing silently.
+        "min_confidence": float(settings.risk.min_confidence if settings else _RC().min_confidence),
+        "max_open_positions": int(settings.positions.max_open_positions
+                                  if settings else _PC().max_open_positions),
+        "max_concurrent_positions": int(settings.backtest.max_concurrent_positions
+                                        if settings else _BTC().max_concurrent_positions),
     }
 
     # Backtest TP ladder read from the engine mirror itself, so this manifest
@@ -241,6 +249,10 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
         "macro_gate_entry":  args.macro_gate,
         "macro_flatten_enabled": os.environ.get("AIT_SKIP_MACRO_EVENTS", "0") == "1",
         "iv_rank_floor":     args.iv_floor,
+        "min_confidence": float(_rcv(None, "risk", "min_confidence", _RC, rsettings)),
+        "max_open_positions": int(_rcv(None, "positions", "max_open_positions", _PC, rsettings)),
+        "max_concurrent_positions": int(_rcv(
+            None, "backtest", "max_concurrent_positions", _BTC, rsettings)),
     }
 
     warnings: list[str] = []
