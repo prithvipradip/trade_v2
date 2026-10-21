@@ -154,7 +154,13 @@ class AccountConfig(_StrictModel):
 
 class PositionConfig(_StrictModel):
     max_open_positions: int = Field(default=5, ge=1, le=20)
-    max_position_pct: float = Field(default=0.05, ge=0.01, le=0.25)
+    max_position_pct: float = Field(default=0.05, ge=0.01, le=0.30,
+        description="The position sizer's hard per-position cap, fraction of NLV (a defined-risk "
+                    "structure's max loss per contract must fit). Must stay >= risk.max_position_risk_pct "
+                    "(Settings validates, W64). W86 (2026-10-21, operator): ceiling 0.25 -> 0.30 so the "
+                    "sizer cap can sit above a raised per-trade budget (risk.max_position_risk_pct, ceiling "
+                    "0.25); the value in config.yaml is unchanged. The ceilings are in code on purpose: "
+                    "a limit in the same file as the value lets one edit loosen both.")
     max_portfolio_delta: float = Field(default=0.30, ge=0.05, le=1.0)
     max_portfolio_risk_pct: float = Field(default=0.20, ge=0.005, le=0.50,
         description="Aggregate capital-at-risk across ALL open positions as a "
@@ -322,12 +328,16 @@ class PositionSizingConfig(_StrictModel):
 
 
 class RiskConfig(_StrictModel):
-    max_daily_loss_pct: float = Field(default=0.045, ge=0.005, le=0.10,
+    max_daily_loss_pct: float = Field(default=0.045, ge=0.005, le=0.20,
         description="Daily loss breaker, fraction of NLV (realised AND mark-to-market "
                     "trips; entries only, exits keep running). W64: 0.02 -> 0.045 at the "
                     "$5k account (breaker $225 vs the $3-wide condor's $201-212 max "
                     "loss on real chains); the startup self-test's rule is breaker >= "
-                    "breaker_to_max_loss_ratio x the largest max loss the builder emits.")
+                    "breaker_to_max_loss_ratio x the largest max loss the builder emits. "
+                    "W86 (2026-10-21, operator): ceiling 0.10 -> 0.20 (it dated from the initial "
+                    "commit, no recorded reason); the value is unchanged. A breaker below one "
+                    "full max loss is reported by the startup check (alert-only) and, as always, "
+                    "only blocks ENTRIES after the loss.")
     breaker_to_max_loss_ratio: float = Field(default=1.0, ge=0.5, le=3.0,
         description="W64: the startup coherence check (orchestrator A2) alerts when the "
                     "daily-loss breaker is below this multiple of the LARGEST single max "
@@ -345,7 +355,7 @@ class RiskConfig(_StrictModel):
                     "(user-approved) - the <=4 window blacked out ~half of all "
                     "trading days and refused the richest premium; every 14-30 "
                     "DTE hold spans events regardless, wings cap the surprise.")
-    max_position_risk_pct: float = Field(default=0.05, ge=0.005, le=0.10,
+    max_position_risk_pct: float = Field(default=0.05, ge=0.005, le=0.25,
         description="Per-trade max_loss cap as a fraction of NLV (was "
                     "hardcoded 0.03 in manager.py — audit item 3.3), AND the budget the "
                     "condor builder is handed (wing width = budget/90 snapped to the "
@@ -355,7 +365,12 @@ class RiskConfig(_StrictModel):
                     "nothing at the $0.70 credit floor ($2-wide credits only $0.62-0.68); "
                     "$250 builds a $3-wide condor (credit $0.88-0.99, max loss "
                     "$201-212). Must stay <= positions.max_position_pct (the sizer's "
-                    "cap) — Settings validates it (W64).")
+                    "cap) — Settings validates it (W64). W86 (2026-10-21, operator): ceiling "
+                    "0.10 -> 0.25; the value is unchanged. A raise is only accepted while it also "
+                    "stays <= positions.max_portfolio_risk_pct and <= risk.max_symbol_concentration_pct "
+                    "(Settings validates): above either, gate 6b-2 / 6c would refuse EVERY entry, "
+                    "silently. Above about 4.5k of budget the vol-scaled wing width binds before the "
+                    "budget does (strategies/iron_condor.py).")
     max_correlation: float = Field(default=0.75, ge=0.30, le=0.99,
         description="Correlation above which two symbols count as the same bet.")
     max_correlated_positions: int = Field(default=2, ge=1, le=8,
@@ -587,11 +602,13 @@ class BacktestConfig(_StrictModel):
                 f"macro_event_types must be a non-empty subset of {sorted(allowed)}; got {v}")
         return list(dict.fromkeys(v))
 
-    position_size_pct: float | None = Field(default=None, ge=0.01, le=0.50,
+    position_size_pct: float | None = Field(default=None, ge=0.01, le=0.25,
         description="Fraction of capital risked per trade (max-loss basis). W64: None "
                     "(the default) resolves to risk.max_position_risk_pct — the SAME "
                     "per-trade budget live funds — so research and live cannot drift. "
-                    "Set a number only for a deliberate sizing study.")
+                    "Set a number only for a deliberate sizing study. W86: ceiling 0.50 -> 0.25 = "
+                    "risk.max_position_risk_pct's ceiling, so a YAML value cannot size what live's "
+                    "schema forbids (an explicit constructor argument is not bounded by this).")
     history_start_date: date | None = Field(default=None,
         description="W65: first date of the research history. When set it wins over "
                     "history_days: the research loader trims frames to it and walk-forward "
@@ -1977,7 +1994,7 @@ class Settings(_StrictModel):
 
     @model_validator(mode="after")
     def _per_trade_knobs_are_linked(self) -> "Settings":
-        """W64: link the two live per-trade knobs (registered W25 ADDENDUM / W31 A3).
+        """W64 + W86: link the live per-trade knobs (registered W25 ADDENDUM / W31 A3).
 
         risk.max_position_risk_pct funds the condor builder and gate 6b;
         positions.max_position_pct is the position sizer's hard cap. For a
@@ -1993,6 +2010,21 @@ class Settings(_StrictModel):
                 f"positions.max_position_pct ({self.positions.max_position_pct}) must be "
                 f">= risk.max_position_risk_pct ({self.risk.max_position_risk_pct}): the "
                 "sizer's cap would refuse structures the risk gate passes (W64 link)")
+        # W86: the other two caps one structure's max loss must also fit under. Gate 6b-2
+        # (positions.max_portfolio_risk_pct, open + new risk) and gate 6c
+        # (risk.max_symbol_concentration_pct) were never tied to the per-trade budget, so a
+        # raised budget could exceed either and every entry would be refused, one routine
+        # rejection at a time. Same philosophy as the sizer link: a startup error.
+        if self.positions.max_portfolio_risk_pct < self.risk.max_position_risk_pct:
+            raise ValueError(
+                f"positions.max_portfolio_risk_pct ({self.positions.max_portfolio_risk_pct}) must be "
+                f">= risk.max_position_risk_pct ({self.risk.max_position_risk_pct}): gate 6b-2 would "
+                "refuse every entry (W86 link)")
+        if self.risk.max_symbol_concentration_pct < self.risk.max_position_risk_pct:
+            raise ValueError(
+                f"risk.max_symbol_concentration_pct ({self.risk.max_symbol_concentration_pct}) must be "
+                f">= risk.max_position_risk_pct ({self.risk.max_position_risk_pct}): gate 6c would "
+                "refuse every entry (W86 link)")
         return self
 
 

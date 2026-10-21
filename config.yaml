@@ -62,10 +62,11 @@ account:
                                        # simulates this NLV while simulate_live_capital is true.
                                        # Change it here and nowhere else. Replaces .env
                                        # AIT_SIMULATED_CAPITAL (10000) and backtest.initial_capital.
-                                       # NOTE at $5k: risk.max_position_risk_pct (1.33%) funds $66
-                                       # per trade and the 2% breaker is $100 -> the cap-grid
-                                       # coherence check fires and the bot emits no condors until
-                                       # the risk knobs are revisited (accepted by the operator).
+                                       # NOTE at $5k (W64, 2026-10-08): risk.max_position_risk_pct 5% funds
+                                       # $250 per trade (a $3-wide condor) and the breaker is 4.5% = $225, which
+                                       # the startup cap-grid check accepts. (The earlier 1.33% / 2% pair
+                                       # funded $66 and built nothing.) Ceilings and the links between the
+                                       # per-trade knobs: settings.py (W86) and docs/RUNBOOK.md.
   simulate_live_capital: true          # false at go-live. Per-box override: .env
                                        # AIT_SIMULATED_CAPITAL=<n> (or 0 = off) beats this.
   # W69: capital-tier boundaries (were literals in risk/capital_tiers.py). The
@@ -241,7 +242,8 @@ options:
 
 backtest:
   position_size_pct: 0.05             # 5% of capital risked per trade (max-loss basis)
-                                       # Raise to 0.20 for accounts < $10k (increases concentration risk)
+                                       # Schema ceiling 0.25 (= risk.max_position_risk_pct's, W86). Normally left
+                                       # null in config_research.yaml so research sizes like live.
   # W70: THE minimum iron-condor wing, dollars — for LIVE ENTRIES AND RESEARCH alike.
   # This key sits under `backtest:` but is also the config home of AIT_IC_WING_FLOOR,
   # which the live builder (strategies/iron_condor.py) reads: editing it changes what the

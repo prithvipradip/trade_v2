@@ -49,13 +49,13 @@ class TestValidConfig:
         assert config.max_daily_loss_pct == 0.005
 
         config = RiskConfig(
-            max_daily_loss_pct=0.10,  # max
+            max_daily_loss_pct=0.20,  # max (W86: ceiling 0.10 -> 0.20)
             max_consecutive_losses=10,  # max
             pause_minutes_after_losses=120,  # max
             max_api_failures=20,  # max
             min_confidence=0.95,  # max
         )
-        assert config.max_daily_loss_pct == 0.10
+        assert config.max_daily_loss_pct == 0.20
 
 
 class TestDeltaRangeValidation:

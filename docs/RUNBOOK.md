@@ -156,6 +156,27 @@ the module, update this table (a test compares them), and record it in PLAN.md.
 The 30 s fast-monitor tick is not repeated here: its single source is
 `ait/utils/cadence.py::FAST_MONITOR_CADENCE_SECONDS`.
 
+## Risk-knob ceilings and the links between them (W86)
+
+Unlike the fixed limits above, these are **tunable** (they live in `config.yaml`), but the **range** each may take is part of the schema in `src/ait/config/settings.py`, so a typo or a bad edit fails
+at startup instead of trading. The ranges sit in code on purpose (a limit in the same file as the value lets one edit loosen both). To widen one: edit `settings.py`, update this table (a test compares it),
+and record the decision in PLAN.md. A change takes effect at the next bot restart, which is the operator's call.
+
+| Setting | Shipped value | Allowed range | What it bounds |
+|---|---|---|---|
+| `risk.max_position_risk_pct` | 0.05 | 0.005 - 0.25 | One structure's max loss, fraction of NLV (gate 6b), and the budget the condor builder is handed |
+| `risk.max_daily_loss_pct` | 0.045 | 0.005 - 0.20 | The daily-loss breaker; blocks new ENTRIES only, exits keep running |
+| `positions.max_position_pct` | 0.05 | 0.01 - 0.30 | The position sizer's hard per-position cap |
+| `positions.max_portfolio_risk_pct` | 0.20 | 0.005 - 0.50 | Aggregate open capital-at-risk (gate 6b-2) |
+| `risk.max_symbol_concentration_pct` | 0.20 | 0.05 - 0.50 | Exposure in one symbol (gate 6c) |
+| `backtest.position_size_pct` | null (= `risk.max_position_risk_pct`) | 0.01 - 0.25 | Research per-trade size, never looser than live's per-trade range |
+
+**Links enforced at startup** (a violation is a `ValueError`, because the runtime symptom is a silent total brick):
+`risk.max_position_risk_pct` must be <= `positions.max_position_pct` (the sizer would refuse what gate 6b passes), <= `positions.max_portfolio_risk_pct` (gate 6b-2 would refuse every entry) and
+<= `risk.max_symbol_concentration_pct` (gate 6c would refuse every entry). **Not** a startup error: the breaker below one full max loss. The launch coherence check (orchestrator A2) reports it by Telegram
+only, because it is a measurement of the real condor builder, and the breaker never closes a position (it blocks entries after the loss). Raising the per-trade budget also needs the aggregate and
+concentration caps raised with it, or the startup refuses.
+
 ## Order lifecycle timeline (what happens to an order, and for how long)
 
 Every age below is evaluated on the **30 s fast-monitor tick** (measured 2026-09: median
