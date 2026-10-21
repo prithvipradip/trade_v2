@@ -18194,3 +18194,51 @@ the six `O:QQQ251010C00360000..385000` returned no bars (deep ITM, most likely n
 **Git.** `W64-risk-retune` merged into local `main` (`9a2e0d3`, clean; origin/main had 3 other commits). Fast lane on the merged tree: 6018 passed / 46 skipped / 153 deselected, 0 failed. Not pushed - the operator's call.
 
 ---
+
+
+## 2026-10-21 - W86 AS PLANNED: risk-family ceilings made consistent and raised; research reads the loaded config (`max_concurrent_positions`); the "default divergence" report gets a class guard
+
+Plan approved by the operator 2026-10-21. Written BEFORE any W86 code. **Numbering:** this wave was planned as "W85", but another session used W85 for the option-history backfill refresh (entries above) and merged
+`W64-risk-retune` into local `main` while this was being planned, so it is **W86**. HEAD at planning: `951223c` on `main` (5 commits ahead of `origin/main`, unpushed). That merge also brought a research-only
+`wing_budget_study` (engine / `WalkForwardConfig` gained `max_loss_per_contract_dollars` and `contracts_cap`), so line numbers in the investigation below are re-grepped at edit time. No live bot is running.
+
+**THE ASKS (operator, 2026-10-21).** (1) Fix the inconsistent ceilings in the risk family and raise `risk.max_position_risk_pct` 0.10 -> 0.25, `risk.max_daily_loss_pct` 0.10 -> 0.20, `positions.max_position_pct`
+0.25 -> 0.30 (config VALUES stay 0.05 / 0.045 / 0.05). (2) Investigate the 13 `config_default_divergence` fields: do research, walk-forward, optimizer and trainer run code defaults, and should they read
+`config.yaml` / `config_research.yaml`?
+
+**FINDINGS (two read-only investigations + direct reads, 2026-10-21).**
+- *Ceilings.* No test pins any of the three as a rejection boundary (`test_config.py:52-58` builds `RiskConfig(max_daily_loss_pct=0.10)` with a now-stale "# max" comment). The ceilings date from the initial commit
+  (`max_daily_loss_pct`, `max_position_pct`) and the July audit (`max_position_risk_pct`); no commit gives a reason. The only cross-field rule is `Settings._per_trade_knobs_are_linked` (per-trade <= sizer cap).
+  **Nothing ties per-trade to `positions.max_portfolio_risk_pct` (0.20) or `risk.max_symbol_concentration_pct` (0.20)**: a per-trade budget above 0.20 is refused by gate 6b-2 / 6c on every entry, silently (the
+  same brick class W64 closed for the sizer cap). `backtest.position_size_pct` has a 0.50 ceiling against the live 0.10, so research could size what live cannot; the walk-forward learner multiplier can double the
+  effective pct. At the new maxima the breaker (0.20) is below the worst condor (0.25): the A2 startup check alerts (alert-only, correct), and above about $4.5k of budget the vol-scaled wing width binds before the budget.
+  **At the shipped values (0.05 / 0.045 / 0.05) raising the ceilings changes no behaviour.**
+- *Divergence.* The startup note ("bare models run the code default") is largely outdated. Of the 13: seven are live-only or dead (`trading.max_daily_trades`, the three `options.*`, `learning.paper_trading_mode`,
+  `sentiment.enabled`, `logging.*`); `positions.max_open_positions`, `positions.max_contracts_per_trade` and `risk.min_confidence` are read from LOADED settings in research (`resolve_config_value`; the code default
+  is used only when settings fail to load); `ml.entry_gates_enabled` differs on purpose (research reads `backtest.gates_mode`; the manifest shows it). **One is a real silent shadow:
+  `backtest.max_concurrent_positions` (yaml 3; `WalkForwardConfig`, `StrategyOptimizer` and the bare engine hard-code 1, R20b decision D "the operator will revisit").** The report also skips list-valued fields
+  (`trading.universe`, `options.dte_range`, `options.strategies`), `None`-default fields (`backtest.position_size_pct`) and hides `account.pdt_account_under_25k` (the secret-name filter matches "account"). Latent:
+  `walkforward.py` builds `MLConfig()` bare for the per-window trainer, so a future `ml.*` edit would not reach it (no effect today). `run_optimizer.py` calls `use_research_config()` without its `--config`
+  (registered only).
+
+**OPTIONS FACED AND DECISIONS.**
+1. New ceilings: as asked (0.25 / 0.20 / 0.30). Values unchanged. Descriptions record the date, the decision and the guards.
+2. The inconsistencies: (a) hard startup ValueError when per-trade > `max_portfolio_risk_pct` or > `max_symbol_concentration_pct` (the W64 philosophy; the shipped values pass) vs alert-only (**CHOSEN: hard
+   error**; the runtime failure is a silent total brick); (b) `backtest.position_size_pct` ceiling 0.50 -> 0.25, no looser than live's per-trade ceiling (**CHOSEN**); (c) the A2 breaker-vs-max-loss check stays
+   alert-only (a runtime measurement of the real builder).
+3. `max_concurrent_positions`: keep research at 1 and make it visible vs **wire research to the config value (CHOSEN by the operator)**. `WalkForwardConfig` and `StrategyOptimizer` resolve it from
+   `backtest.max_concurrent_positions`; the bare `Backtester()` keeps its explicit harness default 1 (R20b). **Consequence recorded up front: default-constructed research runs (run_backtest, run_optimizer) now
+   allow 3 concurrent positions per symbol, so their totals move; every earlier default-run reference was at 1.** Scripts that pass 1 explicitly (`gate_parity_ab`, `ex_div_gate_ab`, `dte_dimension_flatness`,
+   `iv_rank_parity_probe`) keep their numbers.
+4. Divergence fix scope: report + a registry class guard (**CHOSEN**) vs report fixes only vs record only. `DIVERGENCE_CLASSES` (live_only | research_reads_loaded | deliberate_research_difference | dead, one line
+   of reason each) beside `default_divergences`, in the `gate_parity` pattern; a test fails on an unclassified or stale row and proves each `research_reads_loaded` row on the real code path.
+5. Also in scope: the trainer's `MLConfig()` reads the loaded `settings.ml`; three manifest rows (`risk.min_confidence`, `positions.max_open_positions`, `backtest.max_concurrent_positions`).
+6. Out of scope (registered): `engine.py` live-model-fallback `MLConfig()`, `run_optimizer --config`, the learner x2 multiplier, wing-width saturation above about $4.5k, any change to the config VALUES.
+
+**PARTS.** W86a: ceilings + links (settings.py, tests, comment/RUNBOOK fixes). W86b: wiring + report + registry + manifest + the before/after measurement. Verification: the 6-variant reference dump (it passes
+`max_concurrent_positions=1` explicitly) must stay byte-identical against the pre-change dump taken at this HEAD; mutation check; exact count reconciliation; fast lane; typecheck; smoke. Settings changes load only at
+the operator's next restart (the bot is down; restarts are the operator's call). Nothing is pushed unless asked.
+
+**NEXT.** W86a, then W86b, each with its own AS BUILT entry.
+
+---
