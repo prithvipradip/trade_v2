@@ -18094,3 +18094,41 @@ and the two-lens check of the "short strikes touched within 9 sessions on about 
 **NEXT.** Unchanged until the operator decides: the W83a-2 decisions list.
 
 ---
+
+## 2026-10-21 - W85 AS PLANNED + AS BUILT: keep the QQQ option-history backfill current (expired-only refresh; underlying-close cap; `--since-last`)
+
+**TRIGGER.** The W58 backfill (`scripts/backfill_option_history.py`) finished its first full QQQ run (status file: complete, 151,282 contracts, 1,712,604 rows). The operator asked whether the script can keep the
+history up to date or needs changes.
+
+**FINDINGS (read-only against `data/historical.db`).**
+- Stored data ends where the run started: latest bar 2026-09-25, latest expiry 2026-09-28. The script lists only EXPIRED contracts (`expired=true`, `expiration_date.lte=end_date`) and fetches each contract's
+  whole life in ONE call; stored contracts are skipped locally (`option_ticker_has_data`). So a plain re-run with today's date already picks up what expired since.
+- Consequence of expired-only: a date's longer-dated tenors appear only after those contracts expire. Longest stored DTE by date: 2026-06-01 -> 109, 08-03 -> 46, 09-01 -> 24, 09-15 -> 13, 09-25 -> 3.
+  With live `dte_range: [14, 30]`, full coverage trails today by ~30 days.
+- THREE problems with a plain periodic re-run:
+  1. **Permanent silent bar loss when the underlying closes are stale.** `process_contract` drops any bar with no underlying close, and the coarse resume-skip then treats the contract as done forever.
+     QQQ/SPY/IWM `daily_prices` end at 2026-10-13 today, so contracts expiring 10-14..10-20 would have lost their tail bars permanently.
+  2. **Full-window re-enumeration** (~200 listing pages at 12.5s each) before any fetching, though almost everything is already stored.
+  3. **8 contracts failed on the network in the first run and were never retried** (6 x `O:QQQ251010C00360000..385000`, `O:QQQ260817C00684000`, `O:QQQ260817C00685000`). They have no stored rows,
+     so a full-window re-run retries them.
+
+**OPERATOR DECISION.** Keep the **expired-only** model; do NOT fetch live (unexpired) contracts. Rationale: one call per contract, ever; a live-contract pass is one call per live contract per run
+(~7k QQQ contracts at +/-30% and <=30 DTE, ~24h per refresh on the free tier). Accepted cost: ~30-day lag on full 14-30 DTE coverage. Revisit on a paid Polygon plan or a much narrower band.
+
+**AS BUILT.**
+- `scripts/backfill_option_history.py`: (a) the run is capped at the underlying's last stored close (`effective_end = min(requested_end, last close)`, logged `underlying_closes_cap`, written to the
+  status file and the dry-run print); contracts expiring past it are deferred to the next run, not truncated. (b) `--since-last`: contracts listing starts at `max(start_date, latest stored expiry)`
+  via a new `expired_from` parameter on `enumerate_contracts` (default unchanged); the bar fetch still starts at `start_date`. (c) default end date is `today_et()` (was `date.today()`).
+  (d) docstring section "KEEPING IT UP TO DATE".
+- `src/ait/data/historical.py`: `HistoricalDataStore.get_latest_option_expiry(symbol)` (no schema change).
+- Tests (`tests/test_backfill_option_history.py`, +8): cap, class guard on the listing bound, `--since-last` on/off, `expired_from` narrowing, `get_latest_option_expiry`.
+- Verification: backfill test file 20 passed; fast lane **6004 passed / 46 skipped / 153 deselected, 0 failed**; `compileall` OK. Dry run `--since-last` (cap bit at 2026-10-13): 4,532 contracts,
+  expiries 2026-09-28..2026-10-13, ~15.7h estimated.
+
+**FELL SHORT / CAVEATS.** `--since-last` does not retry older failed or zero-bar contracts (the zero-bars inefficiency from W58 is unchanged): run the plain command periodically. The tail of the
+cap depends on `daily_prices` being fresh (supervisor retrain writes it; not verified that it is running daily - the data ends 10-13). Not yet RUN for real: the actual refresh is the operator's.
+
+**NEXT.** (1) Refresh QQQ `daily_prices` so the cap moves forward. (2) First real refresh: plain command from the repo root with `nohup` (full window; retries the 8 failures). (3) Then weekly
+`--since-last` (~1,550 contracts, ~5.5h) plus an occasional full-window run. Afterwards a read-only check: the 8 tickers have rows, `MAX(expiry)` has advanced, and the 2026-09-25 longest DTE has grown past 3.
+
+---
