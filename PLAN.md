@@ -18594,3 +18594,10 @@ FALLBACK values (50.0, 0.20, 0.01 ...). (4) The 39 `registered_followup` census 
 **NEXT.** The operator's decisions above; otherwise unchanged. W88 is complete: a (plumbing and visibility), b (research-only tunables), c (hyperparameters), d (indicator windows), e (class guard).
 
 ---
+
+
+## 2026-10-22 - W88 parts d and e AS BUILT: CORRECTION (no code change)
+
+The entry above says 39 `registered_followup` entries in the literal allowlist (twice: item 6 and REGISTERED item 4). It is **38**: structural 43, registered follow-up 38, fixed feature group 10, epsilon 7, dormant path 3, display 3 = 104 functions, 295 literals (counted from `tests/data/literal_allowlist.json`). Nothing else changes.
+
+---
