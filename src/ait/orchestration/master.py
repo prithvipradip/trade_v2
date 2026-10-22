@@ -1473,20 +1473,45 @@ from ait.ml.range_spec import live_range_spec
 _range_threshold, _range_horizon = live_range_spec(settings)
 range_pred = RangePredictor(threshold_pct=_range_threshold, horizon_days=_range_horizon)
 vol_mag_pred = VolMagnitudePredictor(threshold_pct=0.07, horizon_days=30)
-market_data = MarketDataService(None)   # W65: no IB client here -> daily bars from Yahoo; no Polygon
+from ait.config.settings import IBKREnvConfig
+from ait.data.ib_ports import tcp_listening
+from ait.orchestration.retrain_ib import RetrainIBUnavailable, connect_from_settings
 historical = HistoricalDataStore()
-trainer = ModelTrainer(
-    settings.ml, predictor, market_data, historical,
-    range_predictor=range_pred,
-    vol_mag_predictor=vol_mag_pred,
-)
 
 async def train():
     symbols = list(settings.trading.universe)
-    print(f"[retrain] Training {len(symbols)} symbols...", flush=True)
-    results = await trainer.train_all_symbols(symbols)
-    for sym, acc in results.items():
-        print(f"Trained: {sym} -> {acc}", flush=True)
+    # W89: the retrain stores IB daily bars or nothing. It used to build MarketDataService(None), so every
+    # bar came from Yahoo and was stored over the IB rows (YAHOO_UNADJ, volume ~1.5x, a partial bar for
+    # today). Now: its own IB session (ml.retrain_ib_client_id), no Yahoo fallback, and every series is
+    # fetched BEFORE any model or daily_prices write -- exit 3 (master alerts "retrain FAILED") if any is
+    # missing. The fetches land in the service cache under the key the trainer reads, so nothing is
+    # requested twice.
+    try:
+        ibkr = await connect_from_settings(settings, IBKREnvConfig(), listening=tcp_listening)
+    except RetrainIBUnavailable as e:
+        print(f"[retrain] ABORTED before any write: {e}", flush=True)
+        sys.exit(3)
+    try:
+        market_data = MarketDataService(ibkr, daily_yahoo_fallback=False)
+        missing = []
+        for sym in ['^VIX', 'SPY', *symbols]:
+            df = await market_data.get_historical(sym, days=settings.ml.lookback_days)
+            if df is None or df.empty:
+                missing.append(sym)
+        if missing:
+            print(f"[retrain] ABORTED before any write: no IB daily history for {missing}", flush=True)
+            sys.exit(3)
+        trainer = ModelTrainer(
+            settings.ml, predictor, market_data, historical,
+            range_predictor=range_pred,
+            vol_mag_predictor=vol_mag_pred,
+        )
+        print(f"[retrain] Training {len(symbols)} symbols...", flush=True)
+        results = await trainer.train_all_symbols(symbols)
+        for sym, acc in results.items():
+            print(f"Trained: {sym} -> {acc}", flush=True)
+    finally:
+        await ibkr.disconnect()
 
 asyncio.run(train())
 """],

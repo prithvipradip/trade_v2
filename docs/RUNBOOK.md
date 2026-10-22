@@ -29,7 +29,7 @@ own; your job is responding to these messages. (Governance audit GOV-5.)
 | `MARKS MISSING x10 ticks` | No option marks → stop/TP protection NOT running | Check: is the live account logged in elsewhere (mobile/web steals the ONE data slot)? Log it out. Check Gateway data lines. |
 | `EOD RECON: N BREAK(S) ...` | Books vs broker mismatch | Compare :8503 positions vs TWS portfolio. Common cause: manual action at broker. Fix the DB via close/adopt or ask the assistant. |
 | `EOD RECON: CLEAN | ... gap stress: $X` | Daily all-clear | Glance at the −10% gap-stress number. If it approaches your pain threshold, reduce short-premium count. |
-| `model retrain FAILED/HUNG` | Models stale | Not urgent same-day. Re-run: `python run_orchestrator.py --retrain`. |
+| `model retrain FAILED/HUNG` | Models stale | Not urgent same-day. Re-run: `python run_orchestrator.py --retrain`. W89: the retrain takes its daily bars from IB only (own session, `ml.retrain_ib_client_id`, never Yahoo) and aborts with exit 3 **before any model or `daily_prices` write** when TWS/Gateway is down, the client id is refused, or IB returns no daily bars for `^VIX`/SPY/the universe (`retrain_*.log` says which). Bring TWS/Gateway up first, then re-run. |
 | `order_rate_limit_tripped` (log CRITICAL) | >8 orders/min — malfunction | Create `data/HALT`, inspect logs, contact assistant. Do NOT just restart. |
 | `STATE DB BACKUP FAILED` | Track record unprotected | Check disk space; run a manual copy of `data/ait_state.db`. |
 
@@ -127,6 +127,14 @@ unmanaged), found a day later. Do all five steps, in order:
    For this to exist: TAG every verified deploy going forward —
    `git tag -a deploy-YYYYMMDD -m "smoke pass + first-RTH liveness OK"` then
    `git push origin --tags`. Only tag AFTER step 4 passes.
+
+**W89 deploy note (daily retrain on IB).** `master.py`'s retrain script is part of the supervisor, so a
+change to it needs a **full supervisor restart** (not just a bot restart). From then on the 07:30 ET retrain
+needs TWS/Gateway up (see the retrain alert row above); with it down the retrain aborts and the models stay
+as they were. The first successful IB retrain re-tags the last ~504 `daily_prices` rows per symbol back to
+`IB_TRADES_RTH` (they had been overwritten with `YAHOO_UNADJ`); check with
+`sqlite3 "file:data/historical.db?mode=ro" "SELECT source, COUNT(*) FROM daily_prices WHERE symbol='QQQ' GROUP BY source"`.
+Mid-session, today's partial bar is never stored.
 
 ## Fixed limits (NOT configurable — visible on purpose)
 
@@ -311,8 +319,11 @@ python scripts/calibrate_option_spreads.py --source ib-bars --short-dte --symbol
   so one run holds the whole expiry day; the DTE-0 contracts are requested first. A run any later
   adds no bar (the 15:30 bar is outside the entry window). Bars whose hour had not ended are never
   stored (`in_progress_bars_skipped` in the summary).
-- **Client id:** use one that is not the bot's (the bot uses 326 and its fallback ladder); the example
-  uses 91, the repo's calibration convention. W66 verified this request type against the paper
+- **Client id:** use one that is not the bot's (`IBKR_CLIENT_ID`, currently 1, and its fallback ladder
+  base+100..+104). Convention: 90 = `backfill_historical_data.py`, 91 = this collection (script and
+  supervisor job), 94 = the daily retrain (`ml.retrain_ib_client_id`, W89); ad-hoc runs pick another free
+  id. Two sessions on one id make the second fail ("clientId already in use?"; seen 2026-10-21). The
+  example uses 91, the repo's calibration convention. W66 verified this request type against the paper
   Gateway (historical BID and ASK bars of listed options, market closed). If a run
   returns no bars for every contract, that is an account/permission question for IB, not a bug here.
 - **Coverage:** the run prints samples and distinct sessions per DTE 0..6 and, per band

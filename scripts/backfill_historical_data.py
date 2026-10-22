@@ -364,16 +364,10 @@ async def _backfill_iv_symbol(
 # ---------------------------------------------------------------------------
 
 def _drop_incomplete_today(df):
-    """Drop today's bar unless the regular session has closed (16:05 ET). A bar fetched
-    mid-session is partial (partial High/Low/Volume, mid-session Close) and would be
-    stored as if it were a finished day."""
-    import pandas as pd
-    from ait.utils.time import now_et
+    """W89: one owner for the rule (ait.utils.time.drop_incomplete_session)."""
+    from ait.utils.time import drop_incomplete_session
 
-    now = now_et()
-    if df.empty or (now.hour, now.minute) >= (16, 5):
-        return df
-    return df[df.index < pd.Timestamp(now.date())]
+    return drop_incomplete_session(df)
 
 
 def _ib_bars_to_daily_df(bars):

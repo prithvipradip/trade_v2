@@ -360,6 +360,7 @@ ml:
     lightgbm: 0.5
   retrain_interval_days: 7
   lookback_days: 504                   # 2 years of trading days
+  retrain_ib_client_id: 94             # W89: the daily retrain's own IB session (daily bars from IB, no Yahoo); not the bot's id/ladder, not 91 (short-DTE), 90 (backfill)
   min_training_samples: 100
   range_min_confidence: 0.65           # Floor for range/vol-mag model-overridden confidence (was hardcoded)
   # 2026-09-01 OBSERVE MODE (PLAN pre-registration). The retrained range model

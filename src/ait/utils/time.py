@@ -55,6 +55,27 @@ def now_et() -> datetime:
     return datetime.now(ET)
 
 
+# W89: a daily bar for today is final only after the close; 16:05 leaves the vendors' end-of-day
+# print time to settle (the same cut-off scripts/backfill_historical_data.py always used).
+DAILY_BAR_FINAL_AFTER = time(16, 5)
+
+
+def drop_incomplete_session(df, now: datetime | None = None):
+    """W89: drop the row dated today (ET) from a daily OHLCV frame unless the session is over.
+
+    A bar fetched mid-session is partial (partial High/Low/Volume, mid-session Close); stored, it
+    would look like a finished day and feed every IV solve and feature built on that date.
+    `df` is indexed by (naive) date; `now` defaults to the ET clock (read once by the caller).
+    """
+    import pandas as pd
+
+    now = now or now_et()
+    if (df is None or df.empty or not isinstance(df.index, pd.DatetimeIndex)
+            or now.timetz().replace(tzinfo=None) >= DAILY_BAR_FINAL_AFTER):
+        return df
+    return df[df.index < pd.Timestamp(now.date())]
+
+
 def today_et() -> date:
     """The current ET calendar date — this codebase's date convention.
 
