@@ -63,7 +63,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Symbols for backtesting during optimization. Default: config backtest.default_symbols (W87a).",
     )
-    p.add_argument("--n-trials", type=int, default=100, help="Number of Optuna trials")
+    p.add_argument("--n-trials", type=int, default=None,
+                   help="Number of Optuna trials. Default: backtest.walkforward_tuning.optimizer_n_trials")
     p.add_argument(
         "--objective",
         choices=["sharpe_ratio", "composite", "profit_factor", "win_rate"],
@@ -71,7 +72,8 @@ def parse_args() -> argparse.Namespace:
         help="Objective to maximise",
     )
     p.add_argument("--n-jobs", type=int, default=1, help="Parallel Optuna workers")
-    p.add_argument("--train-days", type=int, default=365, help="Days of historical data")
+    p.add_argument("--train-days", type=int, default=None,
+                   help="Days of historical data. Default: backtest.walkforward_tuning.train_days")
     p.add_argument("--capital", type=float, default=None,
                    help="Initial capital per backtest. Default: config.yaml "
                         "account.capital (W-capital: the single home).")
@@ -102,6 +104,15 @@ def parse_args() -> argparse.Namespace:
         help="Path to save results JSON",
     )
     return p.parse_args()
+
+
+def resolve_optimizer_args(args: argparse.Namespace, tuning) -> None:
+    """W90b: fill the trial count and history window the operator did not pass from ``backtest.walkforward_tuning``
+    of the research view (config_research.yaml / a study); an explicit flag wins."""
+    if args.n_trials is None:
+        args.n_trials = int(tuning.optimizer_n_trials)
+    if args.train_days is None:
+        args.train_days = int(tuning.train_days)
 
 
 def _write_run_record(args, study, settings, optimizer, result, prefix) -> None:
@@ -146,6 +157,7 @@ def main() -> None:
     if args.capital is None:
         # W90a: account.capital of the research view (overlay / study aware); was a raw read of config.yaml
         args.capital = float(_research_cfg.account.capital)
+    resolve_optimizer_args(args, _research_cfg.backtest.walkforward_tuning)   # W90b
 
     print("=" * 70)
     print("  AIT v2 — STRATEGY PARAMETER OPTIMIZER")

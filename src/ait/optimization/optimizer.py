@@ -88,14 +88,14 @@ class StrategyOptimizer:
         self,
         symbols: list[str],
         strategies: list[str],
-        n_trials: int = 100,
+        n_trials: int | None = None,      # W90b: None -> backtest.walkforward_tuning.optimizer_n_trials (was 100)
         n_jobs: int = 1,
         objective: str = "sharpe_ratio",
         study_name: str | None = None,
         storage: str | None = None,
         optimize_ml: bool = False,
         initial_capital: float | None = None,     # W90a: None -> account.capital (was a stale 50_000)
-        train_days: int = 365,
+        train_days: int | None = None,    # W90b: None -> backtest.walkforward_tuning.train_days (was 365)
         features_cache: "pd.DataFrame | None" = None,
         # W64: None -> backtest.position_size_pct, else risk.max_position_risk_pct
         # (live's per-trade budget). Was a 0.05 literal; live funded 0.0133-0.03.
@@ -222,14 +222,12 @@ class StrategyOptimizer:
         for _st, _over in self._space_overrides.items():          # W87b: a range that excludes the live value
             for _w in override_warnings(_st, _over, live_baselines(_st)):
                 log.warning("search_space_excludes_live_value", detail=_w)
-        self._n_trials = n_trials
         self._n_jobs = n_jobs
         self._objective_name = objective
         self._study_name = study_name or f"ait_{'_'.join(strategies[:2])}_{objective}"
         self._storage = storage
         self._optimize_ml = optimize_ml
         self._initial_capital_arg = initial_capital       # resolved below, once the settings are loaded
-        self._train_days = train_days
         self._features_cache = features_cache
         # self._wing_floor_dollars / _delta_iv_scale / _max_entry_vol_annual resolved below (W70)
         self._economic_calendar = economic_calendar
@@ -271,6 +269,8 @@ class StrategyOptimizer:
         # objective weights) come from backtest.*; a stub settings object degrades to the schema defaults.
         from ait.config.settings import ObjectivesConfig as _OC, WalkForwardTuningConfig as _WTC
         self._tuning = getattr(_bt_cfg, "walkforward_tuning", None) or _WTC()
+        self._n_trials = int(n_trials if n_trials is not None else self._tuning.optimizer_n_trials)      # W90b
+        self._train_days = int(train_days if train_days is not None else self._tuning.train_days)         # W90b
         from ait.config.settings import resolve_account_capital as _rac
         self._initial_capital = _rac(self._initial_capital_arg, self._settings)   # W90a: account.capital, not 50_000
         self._objectives_cfg = getattr(_bt_cfg, "objectives", None) or _OC()

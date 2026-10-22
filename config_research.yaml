@@ -212,6 +212,23 @@ backtest:
     inert_probe_iv_quantile: 0.10      # ... else this quantile of the data's IV (the narrowest wing the study needs)
     inert_probe_dte_fallback: 21       # ... and this entry DTE when no settings are loaded
     optimize_seed: 42                  # W90a: seed of the Optuna TPE sampler (walk-forward windows and a bare StrategyOptimizer)
+    # W90b: walk-forward geometry and evaluation constants (were dataclass / helper literals; values unchanged)
+    train_days: 365                    # calendar days of each training window (also StrategyOptimizer's history window); --train-days overrides
+    test_days: 63                      # calendar days of each out-of-sample test window
+    step_days: 63                      # slide per window; == test_days => NON-overlapping tests (BT-M5)
+    gap_days: 5                        # purge gap between training end and test start
+    optimize_n_trials: 50              # Optuna trials per window with --optimize-per-window; --optimize-n-trials overrides
+    optimizer_n_trials: 100            # trials of a standalone run_optimizer.py run; --n-trials overrides
+    min_train_rows: 50                 # a symbol with fewer training bars is skipped for the window
+    min_test_rows: 5                   # ... or fewer test bars
+    context_padding_days: 900          # VIX/SPY context loaded before the training window (feature warm-up)
+    context_span_padding_days: 400     # ... or, with a research history span configured, the span plus this
+    fetch_padding_days: 100            # margin added to train+test days when fetching price history
+    history_span_padding_days: 30      # margin added to the research-history span when sizing the fetch
+    oos_direction_return_threshold: 0.02  # forward return separating bull/neutral/bear in the OOS direction diagnostic
+    oos_calibration_bins: 8            # reliability-chart bins, direction model
+    prob_score_bins: 9                 # reliability-chart bins, range model
+    oos_min_extra_rows: 20             # bars beyond the label horizon the OOS direction evaluation needs
 
 # --- W72: parity replay tolerances (scripts/parity_replay.py; schema: ParityConfig) ---
 # Research-only: decides whether a DTE band's research can be trusted before an Optuna study is run on it.

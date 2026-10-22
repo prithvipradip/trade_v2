@@ -752,6 +752,47 @@ class WalkForwardTuningConfig(_StrictModel):
     optimize_seed: int = Field(default=42, ge=0, le=2**31 - 1,
         description="W90a: seed of the Optuna TPE sampler (the walk-forward's per-window studies and a bare StrategyOptimizer). "
                     "Was a literal 42 in WalkForwardConfig and StrategyOptimizer.")
+    # --- W90b: the walk-forward geometry and evaluation constants (were dataclass / helper literals) ---
+    train_days: int = Field(default=365, ge=60, le=3650,
+        description="W90b: calendar days of each walk-forward TRAINING window (also the StrategyOptimizer's history "
+                    "window). Was a literal in WalkForwardConfig, StrategyOptimizer and the run_backtest / run_optimizer "
+                    "--train-days defaults; --train-days still overrides it for one run.")
+    test_days: int = Field(default=63, ge=5, le=730,
+        description="W90b: calendar days of each out-of-sample TEST window (~3 months).")
+    step_days: int = Field(default=63, ge=1, le=730,
+        description="W90b: calendar days the window slides forward. Equal to test_days = NON-overlapping test windows "
+                    "(BT-M5: a 21-day step with a 63-day test simulated every date ~3x and triple-counted trades).")
+    gap_days: int = Field(default=5, ge=0, le=90,
+        description="W90b: purge gap between the end of training and the start of the test window.")
+    optimize_n_trials: int = Field(default=50, ge=1, le=5000,
+        description="W90b: Optuna trials per walk-forward window when --optimize-per-window is on. --optimize-n-trials "
+                    "overrides it for one run.")
+    optimizer_n_trials: int = Field(default=100, ge=1, le=5000,
+        description="W90b: Optuna trials of a standalone StrategyOptimizer / run_optimizer.py run (--n-trials overrides).")
+    min_train_rows: int = Field(default=50, ge=10, le=2000,
+        description="W90b: a symbol with fewer training-window bars than this is skipped for the window (no model can be "
+                    "trained on it).")
+    min_test_rows: int = Field(default=5, ge=1, le=500,
+        description="W90b: ...and one with fewer test-window bars than this is skipped.")
+    context_padding_days: int = Field(default=900, ge=0, le=5000,
+        description="W90b: extra calendar days of VIX / SPY context loaded before the training window so the slowest "
+                    "feature windows are warm (context = train_days + this).")
+    context_span_padding_days: int = Field(default=400, ge=0, le=5000,
+        description="W90b: ...or, when a research history span is configured, the whole span plus this.")
+    fetch_padding_days: int = Field(default=100, ge=0, le=1000,
+        description="W90b: calendar days added to train_days + test_days when fetching the price history (a margin for "
+                    "weekends, holidays and feature warm-up).")
+    history_span_padding_days: int = Field(default=30, ge=0, le=365,
+        description="W90b: calendar days added to the configured research-history span when sizing the price fetch.")
+    oos_direction_return_threshold: float = Field(default=0.02, gt=0.0, le=0.5,
+        description="W90b: the forward return that separates bullish / neutral / bearish when the out-of-sample "
+                    "DIRECTION model is scored (a diagnostic; it does not change any trade).")
+    oos_calibration_bins: int = Field(default=8, ge=2, le=50,
+        description="W90b: confidence bins of the out-of-sample direction-model reliability chart.")
+    prob_score_bins: int = Field(default=9, ge=2, le=50,
+        description="W90b: probability bins of the out-of-sample range-model reliability chart.")
+    oos_min_extra_rows: int = Field(default=20, ge=0, le=500,
+        description="W90b: the out-of-sample direction evaluation needs this many bars beyond its label horizon.")
 
     @model_validator(mode="after")
     def _clips(self) -> "WalkForwardTuningConfig":

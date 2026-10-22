@@ -17,13 +17,6 @@
    "category": "structural",
    "note": "probe DTEs that sample one rung of the take-profit ladder"
   },
-  "run_backtest.py::parse_args": {
-   "values": [
-    50
-   ],
-   "category": "registered_followup",
-   "note": "--optimize-n-trials default (50); a CLI default, also WalkForwardConfig.optimize_n_trials"
-  },
   "src/ait/backtesting/dte_report.py::<module>": {
    "values": [
     14,
@@ -231,13 +224,6 @@
    "category": "registered_followup",
    "note": "skew adjustment coefficients 0.10 / 0.02 of the leg-IV model"
   },
-  "src/ait/backtesting/range_bank.py::<module>": {
-   "values": [
-    0.05
-   ],
-   "category": "registered_followup",
-   "note": "fixed +/-5% band fallback; the same number as backtest.walkforward_tuning.range_threshold_fallback"
-  },
   "src/ait/backtesting/replay.py::<module>": {
    "values": [
     15,
@@ -337,63 +323,6 @@
    "category": "structural",
    "note": "named, documented study floors (W87a)"
   },
-  "src/ait/backtesting/walkforward.py::WalkForwardBacktester._context_days": {
-   "values": [
-    400,
-    900
-   ],
-   "category": "registered_followup",
-   "note": "context padding days (900 / 400) for feature warm-up"
-  },
-  "src/ait/backtesting/walkforward.py::WalkForwardBacktester._evaluate_direction_model_oos": {
-   "values": [
-    0.02,
-    8,
-    8,
-    20
-   ],
-   "category": "registered_followup",
-   "note": "OOS direction evaluation: 2% return threshold, calibration bins, minimum rows"
-  },
-  "src/ait/backtesting/walkforward.py::WalkForwardBacktester._evaluate_range_model_oos": {
-   "values": [
-    0.05
-   ],
-   "category": "registered_followup",
-   "note": "default range threshold 0.05 of an evaluation helper"
-  },
-  "src/ait/backtesting/walkforward.py::WalkForwardBacktester._pretrain_range_models": {
-   "values": [
-    50
-   ],
-   "category": "registered_followup",
-   "note": "minimum training rows (50)"
-  },
-  "src/ait/backtesting/walkforward.py::WalkForwardBacktester._prob_score_metrics": {
-   "values": [
-    9
-   ],
-   "category": "structural",
-   "note": "calibration bin count"
-  },
-  "src/ait/backtesting/walkforward.py::WalkForwardBacktester._run_single_window": {
-   "values": [
-    50
-   ],
-   "category": "registered_followup",
-   "note": "minimum train rows (50); the pool fallbacks moved to _pool_limits (W90a)"
-  },
-  "src/ait/backtesting/walkforward.py::WalkForwardConfig": {
-   "values": [
-    0.05,
-    0.95,
-    50,
-    63,
-    63
-   ],
-   "category": "registered_followup",
-   "note": "dataclass defaults (optimize_n_trials 50, range_threshold_pct 0.05, vlmc coverage 0.95, test/step days 63)"
-  },
   "src/ait/backtesting/walkforward.py::WalkForwardConfig.__post_init__": {
    "values": [
     45
@@ -417,13 +346,6 @@
    ],
    "category": "display",
    "note": "string slicing offsets of the funnel summary"
-  },
-  "src/ait/backtesting/walkforward.py::_build_optuna_window_data": {
-   "values": [
-    50
-   ],
-   "category": "registered_followup",
-   "note": "default n_trials_requested 50 of a reporting helper"
   },
   "src/ait/ml/drift.py::DriftDetector.check_drift": {
    "values": [

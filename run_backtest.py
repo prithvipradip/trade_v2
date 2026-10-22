@@ -20,12 +20,7 @@ import sys
 import time
 from pathlib import Path
 
-from dataclasses import fields as _dc_fields
-
 from ait.backtesting.walkforward import WalkForwardBacktester, WalkForwardConfig
-
-_WF_DEFAULTS = {f.name: f.default for f in _dc_fields(WalkForwardConfig)
-                if f.name in ("train_days", "test_days", "step_days", "gap_days")}
 
 # ---------------------------------------------------------------------------
 # Live-parity reference values (source of truth: the LIVE code paths)
@@ -407,12 +402,17 @@ def parse_args() -> argparse.Namespace:
         help="Strategies to test. Default: config options.strategies (the live selector list, "
              "currently iron_condor only; W87a -- was four hard-coded strategies).",
     )
-    # W87a: the window defaults ARE the WalkForwardConfig field defaults (they were four literals here)
-    p.add_argument("--train-days", type=int, default=_WF_DEFAULTS["train_days"],
-                   help="Training window days (calendar)")
-    p.add_argument("--test-days", type=int, default=_WF_DEFAULTS["test_days"], help="Test window days")
-    p.add_argument("--step-days", type=int, default=_WF_DEFAULTS["step_days"], help="Step between windows")
-    p.add_argument("--gap-days", type=int, default=_WF_DEFAULTS["gap_days"], help="Purge gap days")
+    # W90b: the window defaults are backtest.walkforward_tuning.{train,test,step,gap}_days of the research config
+    # (config_research.yaml; resolved in run_backtest() once the overlay/study is applied). W87a had copied the
+    # dataclass defaults here; the dataclass fields are now None sentinels over the same setting.
+    p.add_argument("--train-days", type=int, default=None,
+                   help="Training window days (calendar). Default: backtest.walkforward_tuning.train_days")
+    p.add_argument("--test-days", type=int, default=None,
+                   help="Test window days. Default: backtest.walkforward_tuning.test_days")
+    p.add_argument("--step-days", type=int, default=None,
+                   help="Step between windows. Default: backtest.walkforward_tuning.step_days")
+    p.add_argument("--gap-days", type=int, default=None,
+                   help="Purge gap days. Default: backtest.walkforward_tuning.gap_days")
     p.add_argument("--capital", type=float, default=None,
                    help="TOTAL starting equity, one shared pool across symbols. "
                         "Default: config.yaml account.capital (W-capital: the single "
@@ -478,8 +478,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--compare-exits", action="store_true", help="Compare fixed vs trailing stops")
     p.add_argument("--optimize-per-window", action="store_true", default=False,
                    help="Run Optuna optimization on each training window before testing")
-    p.add_argument("--optimize-n-trials", type=int, default=50,
-                   help="Number of Optuna trials per walk-forward window (requires --optimize-per-window)")
+    p.add_argument("--optimize-n-trials", type=int, default=None,
+                   help="Number of Optuna trials per walk-forward window (requires --optimize-per-window). "
+                        "Default: backtest.walkforward_tuning.optimize_n_trials")
     # W65 research-history flags. Defaults come from config.yaml backtest.*.
     p.add_argument("--history-days", type=int, default=None,
                    help="Calendar days of history to request. Overrides config "
@@ -542,6 +543,16 @@ def _write_run_record(args, study, settings, cfg, result, manifest) -> None:
         print(f"\n  ! run record not written ({type(exc).__name__}: {exc})")
 
 
+def resolve_walkforward_args(args: argparse.Namespace, tuning) -> None:
+    """W90b: fill the window lengths and the per-window trial count the operator did not pass from
+    ``backtest.walkforward_tuning`` of the research view (config_research.yaml / a study); an explicit flag wins."""
+    for name in ("train_days", "test_days", "step_days", "gap_days"):
+        if getattr(args, name) is None:
+            setattr(args, name, int(getattr(tuning, name)))
+    if args.optimize_n_trials is None:
+        args.optimize_n_trials = int(tuning.optimize_n_trials)
+
+
 async def run_backtest(args: argparse.Namespace) -> None:
     # W68: config.yaml + config_research.yaml is THIS process's configuration (research only;
     # the live bot never loads the overlay). Fails loudly if the overlay file is missing.
@@ -556,6 +567,7 @@ async def run_backtest(args: argparse.Namespace) -> None:
     if args.capital is None:
         # W90a: account.capital of the research view (overlay / study aware); was a raw read of config.yaml
         args.capital = float(_research_cfg.account.capital)
+    resolve_walkforward_args(args, _research_cfg.backtest.walkforward_tuning)   # W90b
     if args.wing_floor is None:  # W70: the CLI default was a literal 2.0
         from ait.config.runtime_env import contract_float
         # the SAME contract call live's iron_condor.py uses (home backtest.wing_floor_dollars)

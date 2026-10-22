@@ -163,7 +163,8 @@ class TestWalkForwardConfigDefaults:
         from ait.backtesting.walkforward import WalkForwardConfig
         monkeypatch.setattr(st, "load_settings", lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("no config")))
         import ait.backtesting.walkforward as wf
-        monkeypatch.setattr(wf, "WalkForwardTuningConfig", lambda: SimpleNamespace(optimize_seed=7))   # the schema default, made visible
+        real = wf.WalkForwardTuningConfig
+        monkeypatch.setattr(wf, "WalkForwardTuningConfig", lambda: real(optimize_seed=7))   # the schema default, made visible
         assert WalkForwardConfig(train_window_models=False, initial_capital=1.0).optimize_seed == 7
 
     def test_the_pool_limits_come_from_the_positions_section(self):

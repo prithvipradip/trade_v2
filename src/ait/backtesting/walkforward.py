@@ -53,17 +53,28 @@ from ait.utils.time import today_et
 log = get_logger("backtesting.walkforward")
 
 
+def _loaded_tuning() -> WalkForwardTuningConfig:
+    """``backtest.walkforward_tuning`` of the loaded settings (the frozen research view inside a research process),
+    else the schema defaults. W90b: one resolver for the window geometry, the row floors and the paddings."""
+    try:
+        from ait.config.settings import load_settings
+        return load_settings().backtest.walkforward_tuning
+    except Exception:  # noqa: BLE001 - no config.yaml -> the schema defaults
+        return WalkForwardTuningConfig()
+
+
 @dataclass
 class WalkForwardConfig:
     """Configuration for walk-forward backtest."""
 
-    train_days: int = 365        # ~1 year training window (calendar days)
-    test_days: int = 63          # ~3 months test window
-    step_days: int = 63          # == test_days: NON-overlapping by default (BT-M5:
-                                 # 21d step x 63d test simulated every date ~3x,
-                                 # triple-counting trades in pooled metrics and
-                                 # compounding overlapping windows in total_return)
-    gap_days: int = 5            # Purge gap between train and test
+    # W90b: the four window lengths are backtest.walkforward_tuning.{train,test,step,gap}_days (365 / 63 / 63 / 5:
+    # ~1 year training, ~3 months test, step == test = NON-overlapping tests (BT-M5: a 21d step with a 63d test
+    # simulated every date ~3x, triple-counting trades), 5-day purge). None -> __post_init__ resolves them from the
+    # LOADED settings, so the research overlay or a study reaches them; explicit values still win.
+    train_days: int | None = None
+    test_days: int | None = None
+    step_days: int | None = None
+    gap_days: int | None = None
     # W-capital: TOTAL starting equity, ONE shared pool across all symbols.
     # None -> __post_init__ resolves config.yaml account.capital via
     # runtime_env.research_capital() (was a 100_000 literal; BT-H3 gave every
@@ -103,7 +114,7 @@ class WalkForwardConfig:
     # resolve them from config.yaml backtest.* and pass them explicitly).
     history_start_date: "date | None" = None   # trim data + start windows here
     history_days: int | None = None            # None -> legacy train+test+100
-    vlmc_min_coverage: float = 0.95            # 5-min day coverage needed for VLMC
+    vlmc_min_coverage: float | None = None     # 5-min day coverage needed for VLMC; W90b: None -> backtest.vlmc_min_coverage
     macro_event_types: "tuple[str, ...] | None" = None  # None -> hardcoded live calendar
     max_windows: int | None = None             # keep only the LAST N windows (timing/pilot runs)
     wing_floor_dollars: float | None = None   # W70: None -> backtest.wing_floor_dollars (2.0; R6 parity: live iron_condor min wing is $2, not $5)
@@ -155,13 +166,14 @@ class WalkForwardConfig:
                                                  # was a hard-coded 1 that config.yaml never reached
     max_entry_vol_annual: float | None = None    # W70: None -> backtest.max_entry_vol_annual
     optimize_per_window: bool = False
-    optimize_n_trials: int = 50
+    optimize_n_trials: int | None = None   # W90b: None -> backtest.walkforward_tuning.optimize_n_trials (was 50)
     optimize_patience: int = 0       # 0 = disabled; N = stop after N non-improving trials
     optimize_min_trades: int | None = None   # None -> backtest.optimize_min_trades (W67: was a 10 literal)
     optimize_hard_min_trades: int | None = None          # W67: None -> backtest.*
     optimize_below_floor_gradient: float | None = None   # W67: None -> backtest.*
     optimize_seed: int | None = None   # TPESampler seed; None -> backtest.walkforward_tuning.optimize_seed (W90a: was 42)
-    range_threshold_pct: float = 0.05  # Target move % for range model; links to strategy profitability
+    # W90b: ``range_threshold_pct`` (0.05) was removed: nothing read it (the per-window range band is computed by
+    # _adaptive_range_threshold, whose fallback is backtest.walkforward_tuning.range_threshold_fallback).
     hurst_regime_threshold: float | None = None
     hurst_regime_penalty: float | None = None
     hurst_hard_veto_multiplier: float = 0.0   # 0=disabled; Exp 20 post-mortem: QQQ spread never < 0.43, any multiplier blocks all entries
@@ -332,12 +344,14 @@ class WalkForwardConfig:
             # W90a: account.capital of the LOADED settings (the frozen research view: an overlay or a study reaches it);
             # was research_capital(), a raw read of config.yaml that ignored both
             self.initial_capital = loaded_account_capital()
-        if self.optimize_seed is None:
-            try:
-                from ait.config.settings import load_settings as _ls_seed
-                self.optimize_seed = int(_ls_seed().backtest.walkforward_tuning.optimize_seed)
-            except Exception:  # noqa: BLE001 - no config.yaml -> the schema default
-                self.optimize_seed = int(WalkForwardTuningConfig().optimize_seed)
+        # W90a/W90b: the walk-forward geometry, trial count and seed come from backtest.walkforward_tuning of the
+        # LOADED settings (the frozen research view: an overlay or a study reaches them); schema defaults without one.
+        _wt = _loaded_tuning()
+        for _name in ("train_days", "test_days", "step_days", "gap_days", "optimize_seed"):
+            if getattr(self, _name) is None:
+                setattr(self, _name, int(getattr(_wt, _name)))
+        if self.optimize_n_trials is None:
+            self.optimize_n_trials = int(_wt.optimize_n_trials)
         if self.wing_k is None:
             from ait.config.runtime_env import contract_float
             self.wing_k = contract_float("AIT_IC_WING_K")
@@ -359,6 +373,8 @@ class WalkForwardConfig:
             _settings = None
         from ait.config.settings import (
             resolve_max_contracts_per_trade, resolve_position_size_pct)
+        self.vlmc_min_coverage = float(resolve_config_value(      # W90b: was a 0.95 literal beside the setting
+            self.vlmc_min_coverage, "backtest", "vlmc_min_coverage", BacktestConfig, _settings))
         self.position_size_pct = resolve_position_size_pct(
             self.position_size_pct, _settings)
         self.max_contracts_per_trade = resolve_max_contracts_per_trade(
@@ -902,14 +918,19 @@ def _build_optuna_window_data(
     strategies: list[str],
     window_id: int,
     symbol: str,
-    n_trials_requested: int = 50,
+    n_trials_requested: int | None = None,   # W90b: None -> backtest.walkforward_tuning.optimize_n_trials (was 50)
     patience: int = 0,
+    seed: int | None = None,                  # W90b: the sampler seed REPORTED (None -> walkforward_tuning.optimize_seed)
 ) -> dict:
     """Serialize Optuna trial data from one or more per-strategy OptimizationResult
     objects into a flat dict for the dashboard (Layer 2b).
 
     Returns ``{"trials": [...], "meta": {...}}``.
     """
+    if n_trials_requested is None:
+        n_trials_requested = _loaded_tuning().optimize_n_trials
+    if seed is None:
+        seed = _loaded_tuning().optimize_seed
     trials_out = []
     trial_offset = 0
     early_stopped = False
@@ -953,7 +974,7 @@ def _build_optuna_window_data(
         "n_trials_run":     len(trials_out),
         "status":           "early_stopped" if early_stopped else "completed",
         "stop_reason":      stop_reason,
-        "sampler":          "TPESampler(seed=42)",
+        "sampler":          f"TPESampler(seed={seed})",    # W90b: was a "seed=42" label that lied once the seed is a setting
         "pruner":           "MedianPruner(n_warmup_steps=1)",
         "patience":         patience,
     }
@@ -1532,8 +1553,8 @@ class WalkForwardBacktester:
             train_df = df[str(train_start):str(train_end)]
             test_df = df[str(test_start):str(test_end)]
 
-            if len(train_df) < 50 or len(test_df) < 5:
-                continue
+            if len(train_df) < self._tuning.min_train_rows or len(test_df) < self._tuning.min_test_rows:
+                continue   # W90b: the 50 / 5 row floors are backtest.walkforward_tuning.min_train_rows / min_test_rows
 
             active_symbols += 1
 
@@ -2244,6 +2265,7 @@ class WalkForwardBacktester:
                 _all_optuna_results, strategies, window_id, symbol,
                 n_trials_requested=self._config.optimize_n_trials,
                 patience=self._config.optimize_patience,
+                seed=self._config.optimize_seed,
             )
 
             # W79a: keep the compact DTE trials with the window's optimisation status, so the
@@ -2291,7 +2313,7 @@ class WalkForwardBacktester:
         range_predictor: "Any",
         test_df: pd.DataFrame,
         symbol: str,
-        threshold_pct: float = 0.05,
+        threshold_pct: float | None = None,     # W90b: None -> backtest.walkforward_tuning.range_threshold_fallback (was 0.05)
         horizon_days: int = 30,
         precomputed_features: "pd.DataFrame | None" = None,
     ) -> dict:
@@ -2308,6 +2330,8 @@ class WalkForwardBacktester:
         """
         import numpy as _np
 
+        if threshold_pct is None:
+            threshold_pct = self._tuning.range_threshold_fallback
         try:
             # ----------------------------------------------------------------
             # 1. Build OOS range labels and realized-vol series
@@ -2386,7 +2410,7 @@ class WalkForwardBacktester:
                                 try:
                                     proba = model.predict_proba(X_sc)[:, 1]
                                     ml_scores[name] = self._prob_score_metrics(
-                                        y_true_ml, proba, base_rate
+                                        y_true_ml, proba, base_rate, n_bins=self._tuning.prob_score_bins
                                     )
                                     w = weights.get(name, 0.5) / total_weight if total_weight > 0 else 0.5
                                     ensemble_proba += w * proba[:len(ensemble_proba)]
@@ -2398,7 +2422,7 @@ class WalkForwardBacktester:
             # Ensemble score over ML members
             if ml_scores:
                 ml_scores["ensemble_ml"] = self._prob_score_metrics(
-                    y_true, ensemble_proba, base_rate
+                    y_true, ensemble_proba, base_rate, n_bins=self._tuning.prob_score_bins
                 )
 
             # ----------------------------------------------------------------
@@ -2424,7 +2448,7 @@ class WalkForwardBacktester:
                 if combined_w > 0:
                     combined_proba /= combined_w
                     all_scores["ensemble"] = self._prob_score_metrics(
-                        y_true, combined_proba, base_rate
+                        y_true, combined_proba, base_rate, n_bins=self._tuning.prob_score_bins
                     )
 
             # Strip raw p_scores array; calibration_bins (pre-computed) are kept
@@ -2460,6 +2484,7 @@ class WalkForwardBacktester:
         base_rate: float,
         rvol_pred: "np.ndarray | None" = None,
         rvol_true: "np.ndarray | None" = None,
+        n_bins: int | None = None,        # W90b: None -> backtest.walkforward_tuning.prob_score_bins (was 9)
     ) -> dict:
         """Compute probability scoring metrics for one model's OOS predictions.
 
@@ -2522,7 +2547,7 @@ class WalkForwardBacktester:
         # Calibration bins: predicted probability vs empirical frequency.
         # Format: [{p, actual, n}, ...] — same shape the dashboard ReliabilityChart
         # expects so export.py can pass them through directly.
-        nbins = 9
+        nbins = int(n_bins if n_bins is not None else _loaded_tuning().prob_score_bins)
         bins = []
         for b in range(nbins):
             lo, hi = b / nbins, (b + 1) / nbins
@@ -2544,7 +2569,7 @@ class WalkForwardBacktester:
         test_df: "pd.DataFrame",
         symbol: str,
         horizon_days: int = 30,
-        return_threshold_pct: float = 0.02,
+        return_threshold_pct: float | None = None,   # W90b: None -> walkforward_tuning.oos_direction_return_threshold (0.02)
         precomputed_features: "pd.DataFrame | None" = None,
     ) -> dict:
         """Evaluate directional predictor calibration on OOS test data.
@@ -2561,6 +2586,9 @@ class WalkForwardBacktester:
         """
         import numpy as _np
 
+        if return_threshold_pct is None:
+            return_threshold_pct = self._tuning.oos_direction_return_threshold
+        _nbins = self._tuning.oos_calibration_bins
         try:
             sym_data = getattr(predictor, "_symbol_models", {}).get(symbol, {})
             models       = sym_data.get("models") or getattr(predictor, "_models", {})
@@ -2569,7 +2597,7 @@ class WalkForwardBacktester:
 
             if not models or scaler is None or not feature_names:
                 return {}
-            if len(test_df) < horizon_days + 20:
+            if len(test_df) < horizon_days + self._tuning.oos_min_extra_rows:   # W90b: was + 20
                 return {}
 
             if precomputed_features is not None and not precomputed_features.empty:
@@ -2622,7 +2650,7 @@ class WalkForwardBacktester:
                     correct = (pred == y_class_arr).astype(float)
 
                     # Confidence calibration bins
-                    nbins, calib = 8, []
+                    nbins, calib = _nbins, []
                     for b in range(nbins):
                         lo, hi = b / nbins, (b + 1) / nbins
                         mask = (conf >= lo) & (conf < hi)
@@ -2671,7 +2699,7 @@ class WalkForwardBacktester:
                 )
             ])
             ensemble_correct = (all_preds[0] == y_class_arr).astype(float)
-            nbins, ens_calib = 8, []
+            nbins, ens_calib = _nbins, []
             for b in range(nbins):
                 lo, hi = b / nbins, (b + 1) / nbins
                 mask = (ensemble_conf >= lo) & (ensemble_conf < hi)
@@ -2803,7 +2831,7 @@ class WalkForwardBacktester:
             per_symbol: dict[str, "tuple[Any | None, str, float]"] = {}
             for symbol, df in data.items():
                 train_df = df[str(train_start):str(train_end)]
-                if len(train_df) < 50:
+                if len(train_df) < self._tuning.min_train_rows:    # W90b: was a 50 literal
                     per_symbol[symbol] = (None, "insufficient_train_data", self._tuning.range_threshold_fallback)
                     continue
                 log.info(
@@ -3379,7 +3407,8 @@ class WalkForwardBacktester:
             span = (today_et() - cfg.history_start_date).days
         else:
             span = cfg.history_days or 0
-        return max(cfg.train_days + 900, span + 400)
+        return max(cfg.train_days + self._tuning.context_padding_days,       # W90b: was 900 / 400 literals
+                   span + self._tuning.context_span_padding_days)
 
     async def _fetch_data(self) -> dict[str, pd.DataFrame]:
         """Load daily OHLCV from IB store (fallback: Yahoo Finance)."""
@@ -3387,10 +3416,10 @@ class WalkForwardBacktester:
 
         data = {}
         cfg = self._config
-        fetch_days = cfg.train_days + cfg.test_days + 100
+        fetch_days = cfg.train_days + cfg.test_days + self._tuning.fetch_padding_days     # W90b: was + 100
         start = cfg.history_start_date
         if start is not None:
-            fetch_days = max(fetch_days, (today_et() - start).days + 30)
+            fetch_days = max(fetch_days, (today_et() - start).days + self._tuning.history_span_padding_days)
         elif cfg.history_days:
             fetch_days = max(fetch_days, cfg.history_days)
 

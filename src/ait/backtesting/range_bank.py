@@ -33,7 +33,17 @@ log = get_logger("backtesting.range_bank")
 
 # (predictor | None, status, threshold_pct): the tuple _train_window_range_model returns.
 RangeResult = tuple[Any, str, float]
-_FALLBACK_THRESHOLD = 0.05
+
+
+def _fallback_threshold() -> float:
+    """The +/- containment band of a horizon whose model could not be trained: ``backtest.walkforward_tuning
+    .range_threshold_fallback`` of the loaded settings (W90b: was a 0.05 literal repeating that setting's default)."""
+    try:
+        from ait.config.settings import load_settings
+        return float(load_settings().backtest.walkforward_tuning.range_threshold_fallback)
+    except Exception:  # noqa: BLE001 - no config.yaml -> the schema default
+        from ait.config.settings import WalkForwardTuningConfig
+        return float(WalkForwardTuningConfig().range_threshold_fallback)
 
 
 class RangeModelBank:
@@ -61,12 +71,12 @@ class RangeModelBank:
             res = self._train_fn(h)
         except Exception as exc:  # noqa: BLE001 - one bad horizon must not kill a study
             log.warning("range_bank_train_failed", horizon=h, error=str(exc))
-            res = (None, f"train_exception:{type(exc).__name__}", _FALLBACK_THRESHOLD)
+            res = (None, f"train_exception:{type(exc).__name__}", _fallback_threshold())
         finally:
             np.random.set_state(np_state)
             random.setstate(py_state)
         if res is None or not isinstance(res, tuple) or len(res) != 3:
-            res = (None, "skipped", _FALLBACK_THRESHOLD)
+            res = (None, "skipped", _fallback_threshold())
         self._cache[h] = res
         return res
 

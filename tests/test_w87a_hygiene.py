@@ -573,10 +573,15 @@ class TestIvFloorFollowsTheContract:
         assert seen["iv_floor"] == 15.0
 
     def test_the_cli_window_defaults_are_the_walk_forward_defaults(self, monkeypatch):
+        """W87a: one set of window defaults. W90b: both the CLI flags and WalkForwardConfig are None sentinels over
+        backtest.walkforward_tuning, so a bare run and a bare config resolve to the same numbers."""
         import run_backtest as rb
         from ait.backtesting.walkforward import WalkForwardConfig
+        from ait.config.settings import load_settings
         monkeypatch.setattr(sys, "argv", ["run_backtest.py"])
         a = rb.parse_args()
+        assert (a.train_days, a.test_days, a.step_days, a.gap_days) == (None,) * 4
+        rb.resolve_walkforward_args(a, load_settings().backtest.walkforward_tuning)
         d = WalkForwardConfig()
         assert (a.train_days, a.test_days, a.step_days, a.gap_days) == (
             d.train_days, d.test_days, d.step_days, d.gap_days)

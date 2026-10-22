@@ -94,7 +94,7 @@ or the command-line flag.
 | `learner` | Thresholds of the research learner |
 | `legacy_engine` | Constants of the engine's dormant paths |
 | `objectives` | Weights of the Optuna objectives |
-| `walkforward_tuning` | Warm start, adaptive range threshold, validation split, inert-parameter probe |
+| `walkforward_tuning` | Window lengths (`train_days` / `test_days` / `step_days` / `gap_days`), Optuna trial counts and seed, row floors, context and fetch paddings, out-of-sample diagnostic bins; also warm start, adaptive range threshold, validation split, inert-parameter probe. `--train-days`, `--test-days`, `--step-days`, `--gap-days`, `--optimize-n-trials` and `--n-trials` override them for one run (W90b) |
 
 Model hyperparameters (`ml.hyperparams`, `ml.meta_label_hyperparams`) are shared with live, so they are listed in
 `config.yaml`; research differs only if you override them. Details: RUNBOOK "Research tunables" and "Model hyperparameters".
