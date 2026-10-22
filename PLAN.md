@@ -18610,3 +18610,28 @@ by design, not an IB outage: `master.py` `retrain_models()` builds `MarketDataSe
 This sits against W65's "IB-first" intent for stored bars. NOT changed (master.py / trainer are the operator's call). Options: a source-preserving save (do not overwrite an IB row with Yahoo), or give the retrain an IB client.
 **Built.** `backfill_option_history.py`: `completed_sessions_only()` - the underlying closes used (moneyness band, IV solve, end cap) are strictly before today (ET); contracts expiring today wait for the next run.
 Residual: an earlier-dated row also written mid-session and never rewritten. Tests +2 (22 in file). Option data already stored (cap 10-20) is unaffected.
+
+
+## 2026-10-23 - W89 AS PLANNED: convert the 38 `registered_followup` literals; tighten the census so no research number lives in code unseen
+
+Plan approved by the operator 2026-10-23. Written BEFORE any W89 code. HEAD at planning: `3763ffa` on local `main` (unpushed); no live bot running. LIVE-SHARED steps (c, d) touch `ml/*`, `bot/orchestrator.py` (one literal and the snapshot defaults) and `config/settings.py`; values stay equal to today's, so the bot loads them at its next restart.
+
+**THE ASK.** After W88 the literal-census allowlist still held 38 `registered_followup` entries: research numbers executed in code that I parked instead of converting, and then called "low impact". The operator pointed out that this contradicts the goal agreed at the start of W88 (no hard-coded research numbers) and that several are already STALE duplicates:
+the capital defaults ($10,000 in `Backtester` / `BacktestResult` / `WalkForwardResult`, $50,000 in `StrategyOptimizer`, $100,000 in the replay harness) against `account.capital` ($5,000); `position_size_pct=0.05` against `risk.max_position_risk_pct`; `iv_rank_compare`'s 15 / 85 against the env contract; the meta-labeler's regime fallback (-0.02) against the engine's (-0.05); minimum training rows, context padding and the OOS evaluation settings.
+
+**DECISIONS.** (1) A number that duplicates an existing setting resolves from it; it never becomes a second copy (capital -> `account.capital`, position size -> `resolve_position_size_pct`, cash yield -> `options.risk_free_rate`, vlmc coverage -> `backtest.vlmc_min_coverage`, IV-rank 15 / 85 -> the env contract, the live range band -> one `ml` setting).
+(2) Research-only numbers -> schema fields listed in full in `config_research.yaml`; numbers shared with live -> schema fields listed in `config.yaml` (diff-only in the overlay). (3) Bare-constructor defaults become `None` sentinels resolved through the loaded settings, so a bare `Backtester()` runs at `account.capital`; tests that relied on the old bare default pass an explicit capital (D1).
+(4) The structural / fixed-feature-group / epsilon / dormant-path / display entries stay. (5) Target: zero `registered_followup`. Edge-case behaviour decisions, flagged for veto: **D2** the live orchestrator's snapshot defaults for a missing feature (0) are unified on the engine / meta-labeler neutral values; **D3** the meta-labeler's regime fallback uses the engine's regime thresholds;
+**D4** the walk-forward pool's no-config fallbacks resolve from `PositionsConfig` defaults.
+
+**STEPS.** W89a stale capital / sizing defaults and no-config fallbacks (13 entries). W89b walk-forward and evaluation settings (11): `backtest.walkforward_tuning` gains window sizes, trial count and seed, minimum rows, context padding, OOS evaluation settings; `WalkForwardConfig` fields become sentinels. W89c engine, pricing and meta-label numbers (8): skew coefficients, IV-rank-rise lookback, the neutral-values block, meta-label limits,
+regime fallback, `iv_rank_compare` via the env contract. W89d live-shared ML constants (10): range / vol-magnitude bands, direction label threshold, CV fold settings, label-balance guards, retrain trials and rollback margin, in `config.yaml ml:`. W89e tighten the census: the scanner ignores `{3, 4, 5, 7, 10, 30, 0.5, 0.25}` and similar, which hides real windows (`pct_change(5)`, `max(20, ...)`); step 1 is MEASURE ONLY and the count is reported
+to the operator before anything beyond the 38 is converted.
+
+**VERIFICATION (every step).** Reference dump, `gate_parity_ab`, `ex_div_gate_ab` and the walk-forward smoke byte-identical at defaults (bare-constructor changes excluded: production passes explicit values); a perturbation test per new field and per sentinel (follows the config, an overlay and a study); mutation check; node-id count reconciliation; fast lane; `compileall`; `typecheck.py`; `smoke_deploy.py`; the census guard green with the converted entries removed.
+
+**OUT OF SCOPE.** The 43 structural, 10 fixed-feature-group, 7 epsilon, 3 dormant-path and 3 display census entries; live-bot code other than the one vol-magnitude literal and the snapshot defaults in `bot/orchestrator.py`.
+
+**NEXT.** Build W89a, then b-e in order, recording AS BUILT per step or at the end.
+
+---
