@@ -99,6 +99,48 @@ or the command-line flag.
 Model hyperparameters (`ml.hyperparams`, `ml.meta_label_hyperparams`) are shared with live, so they are listed in
 `config.yaml`; research differs only if you override them. Details: RUNBOOK "Research tunables" and "Model hyperparameters".
 
+### Numbers that are not settings: the literal census
+
+**What is it?** `scripts/literal_census.py` walks the research code (`backtesting/`, `optimization/`, `ml/`, `run_backtest.py`,
+`run_optimizer.py`: 37 modules) and lists, per function, the numeric literals written inside it. `tests/data/literal_allowlist.json`
+is the accepted list, and `tests/test_w88_literal_census.py` fails when a number appears, changes or disappears without that list being
+updated, so a research number cannot be added or removed unseen. It ignores unit-like values (0, 1, 2, 10, 100, 252, 365, ... the
+`TRIVIAL` set in the script), booleans, `round()` digits, log / `print` arguments, and docstrings and comments. That ignore list is
+too generous (it also hides 3, 4, 5, 7, 30, 0.5 ...); W90e is revisiting it.
+
+**Categories.** Every function in the list has one:
+
+| Category | Meaning | Real example | Why it is not a setting |
+|---|---|---|---|
+| `structural` | a protocol or solver constant | `pricing.py::find_strike_by_delta`: bounds 0.8 / 1.2, 50 iterations | it brackets a root search; it does not change what the model says |
+| `fixed_feature_group` | a feature group W88d left fixed on purpose | `ml/features.py::FeatureEngine._mfdfa_features`: scales 8 to 128 | its windows are not in `ml.features`, so not in a model's feature-spec hash; it changes only with a code change and a retrain |
+| `epsilon` | a numerical tolerance | `engine.py::Backtester._remark_t`: 0.0001-year floor on time to expiry | it keeps Black-Scholes finite at expiry and has no economic meaning |
+| `dormant_path` | legacy code off the iron-condor path | `engine.py::Backtester._quick_rsi`: period 14, neutral 50 | nothing on the iron-condor path reads it (the tunable legacy numbers are in `backtest.legacy_engine`) |
+| `display` | formatting only | `run_record.py::flatten`: 400-character cut of an MLflow parameter | it changes how a run is recorded, never the result |
+| `registered_followup` | transitional: a research number still in code, to be converted | `ml/trainer.py::ModelTrainer._should_rollback`: rollback margin 0.05 | it should be a setting; W90d converts the last of these, after which the category is empty |
+
+**Reading an entry.**
+
+```json
+"src/ait/backtesting/pricing.py::find_strike_by_delta": {"values": [0.8, 1.2, 50], "category": "structural",
+                                                         "note": "bisection bounds and iterations of the strike search"}
+```
+
+The key is `file::function` (`Class.method`, or `<module>` for module-level code). `values` is the sorted list of that function's
+non-trivial literals, repeats included. Then the category and a one-line note saying what the numbers are.
+
+**You added a number to research code.** The census test fails and names the function. Then either:
+
+1. Make it a setting (preferred). A research-only value goes in the schema and is listed in full in `config_research.yaml`; a value shared
+   with live goes in the schema and `config.yaml`. Read it from the loaded settings, then run `python scripts/literal_census.py --update` to drop the entry.
+2. If it truly is not a tunable, run `python scripts/literal_census.py --update`, then give the new entry a real category and a note saying
+   why. `--update` guesses obvious cases (display helpers, `ml/features.py`) and otherwise adds the entry as `registered_followup` with a
+   generated placeholder note; the test rejects that placeholder, so replace both.
+
+**How a new setting is exposed.** Add the field to its block's model in `config/settings.py` and list it in the matching block of
+`config_research.yaml`, as in the research-only blocks table above; completeness tests fail if the file misses a field, and
+`scripts/show_research_config.py` shows the value and which layer set it.
+
 ---
 
 ## 5. The engine
