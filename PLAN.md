@@ -18463,3 +18463,54 @@ the pool). Not previously registered for the overlay (only for studies in W87). 
 **NEXT.** Build W88a-c in order, recording an AS BUILT entry per part or one at the end; d and e after the operator has seen a-c.
 
 ---
+
+
+## 2026-10-22 - W88 AS BUILT (parts a, b, c): research plumbing and visibility, research-only tunables in the schema and `config_research.yaml`, model hyperparameters as settings; d (indicator windows) and e (literal-census guard) NOT built
+
+Code commits `92c2d30` (W88a), `d0e1898` (W88b), `ab98134` (W88c), on local `main`. Research tooling plus LIVE-SHARED edits in `ml/ensemble.py`, `ml/range_predictor.py`, `ml/vol_magnitude_predictor.py`, `ml/meta_label.py`, `config/settings.py` and four value-neutral keys added to `config.yaml`
+(`ml.hyperparams`, `ml.meta_label_hyperparams`, equal to the old literals); all reach the bot at its next restart. Nothing restarted, nothing pushed. Plan: the W88 AS PLANNED entry above.
+
+**STATUS OF THE PLAN.** AS PLANNED: parts a-e. AS BUILT: a, b, c. **NOT BUILT: d (indicator windows with derived names + feature-spec hash) and e (class guard)**, as the plan recommended ("a-c first, then d, e"; d is the largest live-shared change). **FELL SHORT / DIFFERED:**
+1. **Module name.** The plan said `config/research_invariants.py`. The W68 guard matches the substring `ait.config.research`, which `ait.config.research_invariants` contains, so it is `config/invariants_research.py`. The W68 guard also forbids the text `config_research` anywhere under `src/ait` outside `config/research.py`; descriptions
+   in `settings.py` now say "the research overlay file".
+2. **`require_single_process` is gone.** The AS PLANNED wording kept it "for anything else that cannot carry the layers"; nothing else needs it: the optimizer's `--n-jobs` is Optuna threads (settings are process-global) and the walk-forward pool now gets the parent's settings through an initializer. The W87b tests that asserted the refusal were
+   replaced by positive tests, including a real spawned worker.
+3. **`backtest.composite_objective` became `backtest.objectives`** (it also holds `profit_factor_cap`). **`backtest.legacy_fallback` became `backtest.legacy_engine`.**
+4. **Hyperparameters are SHARED keys, so they are diff-only in `config_research.yaml`** (per decision 1): they are listed in `config.yaml` (with the old values) and shown in the effective-config view; the overlay lists them only if research differs. Research-only blocks (`learner`, `legacy_engine`, `objectives`, `walkforward_tuning`) are listed in full in the overlay with a
+   completeness test.
+5. **Loading a model under other hyperparameters never refuses** (AS PLANNED allowed "refuse on the research path"): a hyperparameter mismatch is not dangerous, so it logs `model_spec_mismatch`; a refusal is reserved for the FEATURE-spec mismatch in d, where the failure would be silent zeros.
+6. **Not exposed, on purpose (registered):** `n_jobs` / `verbosity`, each task's objective / metric, LightGBM `class_weight` / `deterministic`, `ml/trainer.py::_objective` and its rollback margin (live retrain logic), the feature fallback values in `engine.py` / `meta_label.py` (they move with the derived names in d), the two
+   `getattr(_pos, ..., literal)` pool fallbacks in the walk-forward (reachable only with no config.yaml; their fallbacks 0.20 / 10 differ from `PositionsConfig` defaults 0.20 / 5), `replay.PricingParams` defaults (`iv_floor`, `skew_slope_per_pct_otm`).
+7. **Fast lane needed two passes in b**: the first b run caught four real issues my targeted tests missed (settings stubs without `backtest`, the W68 string guard, an unread field, a partial `WalkForwardBacktester`); all fixed, the second run was green. A first W88a test also failed on a monkeypatch that stacked across calls (test-only).
+
+**W88a (`92c2d30`).** (1) Pool workers: `ProcessPoolExecutor(initializer=_init_worker_settings, initargs=(settings,))` freezes the parent's resolved settings in each spawned window worker, which used to rebuild plain `config.yaml` and silently drop the overlay and any study for every `load_settings()` read (a latent gap for
+`optimize_n_jobs > 1`, previously registered only for studies). (2) `config/invariants_research.py`: `RESEARCH_DELTA_MIN/MAX` 0.05 / 0.45, `IV_SCALE_MIN/MAX` 0.5 / 1.5, `SETTLEMENT_LOSS_TOLERANCE`, `PROB_CLIP_EPS`; named, documented, logged once per research process (`research_fixed_limits_in_effect`), stored in every run record,
+RUNBOOK table with a drift test; the engine, the walk-forward and `param_spaces.HARD_BOUNDS` read them. (3) `research.settings_origin` + `scripts/show_research_config.py` (`--section`, `--differs`, `--study-file`): every non-secret setting with the layer that decides it (study > overlay > config.yaml > default); stored in run records as `settings_origin`.
+(4) `config_research.yaml` header rewritten to the threefold purpose. Tests `tests/test_w88a_plumbing.py` 22; three W87b refusal tests replaced by three positive pool tests.
+
+**W88b (`d0e1898`).** New nested models under `backtest` (each field bounded and described): `learner` (24 fields: every threshold of the research `BacktestLearner`), `legacy_engine` (naked-margin fraction, the no-predictor fallback direction model, bearish confidence margin, thesis-invalidation confidence), `objectives` (composite weights, profit-factor cap),
+`walkforward_tuning` (warm-start rule, adaptive range threshold, validation split, inert-parameter probe fallbacks). All listed in full in `config_research.yaml` with comments; a completeness test fails if a field is missing. The seven `getattr(window_cfg, ..., literal)` fallbacks in the walk-forward became direct reads (every field exists, so the
+literal could never fire; `hurst_hard_veto_multiplier`'s 1.5 fallback was dead: the config field defaults to 0.0). One schema default for the risk-free rate (`DEFAULT_RISK_FREE_RATE`) now feeds pricing, replay, `iv_surface` and the engine's partial-engine default. **Learner golden record captured BEFORE the change** (`tests/data/w88b_learner_golden.json`, five seeded
+scenarios) and reproduced exactly. A perturbation test per field proves each is wired. Tests `tests/test_w88b_tunables.py` 77.
+
+**FINDINGS while exposing the literals (behaviour preserved, documented on the fields).** (i) With the shipped `reduce_min_change` 0.03 and `strategy_multiplier_min` 0.30, a reduced strategy's multiplier stalls at 0.3277, so the learner's "disable a strategy" branch is **unreachable by default**. (ii) `boost_min_trades` (6) and `reenable_min_trades` (10) are inert while
+`min_trades_to_learn` (15) gates the loop; they bite when set above it. (iii) The module constant `MIN_CONFIDENCE` was read by nothing and was dropped. (iv) `engine.py` computed a short-vs-long realized-vol "IV regime high" flag and never read it; removed rather than exposed. (v) The learner's "Min confidence adjusted" summary line compares against a literal 0.65 whatever base confidence
+was passed (display only; kept as a named constant).
+
+**W88c (`ab98134`).** `TreeHyperparamsConfig` as `ml.hyperparams` (direction ensemble, range, vol-magnitude; 200 / 5 / 0.05 / 0.8 / 0.8, seed 42) and `ml.meta_label_hyperparams` (its own 100 / 3 / 0.05 / 0.8 / 0.8, unseeded); `ml/hyperparams.py` builders take the config (`None` = the loaded settings, so a research overlay or study reaches every family, pool workers included).
+Every saved model records `spec` (the hyperparameters, plus a `feature_spec_hash` slot for d); loading logs `model_spec_mismatch` and never refuses; a pre-W88c artifact without a spec loads silently (the real `models/ensemble.pkl` is loaded in a test). The parity manifest gained `ml_hyperparams` and `ml_meta_label_hyperparams` rows (warning when research differs); the run record's ML seed follows the settings.
+Tests `tests/test_w88c_hyperparams.py` 36.
+
+**EQUIVALENCE (per part, at defaults).** The 6-variant reference dump (QQQ / SPY / IWM x realistic / legacy) is **byte-identical** to the pre-W87 dump after a, after b and after c; `gate_parity_ab --dump` and `ex_div_gate_ab` identical each time. A real walk-forward smoke (`run_backtest.py --max-windows 2 --optimize-per-window --optimize-n-trials 5`, which trains real models and runs the
+optimizer) is identical before and after b, and after c differs only by the two new manifest rows (2 trades, -1.33%, Sharpe -15.69; a small sample, so the equality of the learner is carried by its golden record).
+
+**TESTS / GATES.** Collected 6,261 (W87 end) -> 6,529: +139 (W87), +16 (a: 6,400 -> 6,416), +77 (b), +36 (c); each step verified by diffing node ids against a worktree at the previous commit, 0 removed. Fast lane after c: 6,331 passed / 46 skipped / 0 failed. `compileall` OK; `typecheck.py` OK; `smoke_deploy.py` SMOKE PASS (13 checks). Mutation check: a (56 W87 mutants re-used + the
+plumbing guarded by tests), b 52 / 52 caught after strengthening (the first run left 28 survivors because only some fields had a "changed value moves behaviour" test; one mutant targeted code that was then removed), c 40 / 40 caught (one survivor, the meta-label load warning, fixed by a test); files restored byte-for-byte (hash-checked).
+
+**REGISTERED, NOT FIXED.** (1) d and e. (2) Items under FELL SHORT 6. (3) The research learner's disable branch is unreachable by default (finding i): changing `reduce_min_change` or the floor is a research decision, not made here. (4) `ml.hyperparams` changes for LIVE take effect only at the next retrain and restart; a research study that changes them trains models that differ from the live artifact by design.
+
+**DECISIONS FOR THE OPERATOR.** (1) Go ahead with d (indicator windows, derived names, feature-spec hash) and e (literal census), or stop here. (2) Whether `learner.reduce_min_change` / the multiplier floor should be changed so the disable branch is reachable (a research behaviour change, not made). (3) Any bot restart (the shared hyperparameter plumbing loads then; values unchanged). (4) Pushing: local `main` is ahead of `origin/main`.
+
+**NEXT.** The operator's decisions above; d, then e, as planned.
+
+---
