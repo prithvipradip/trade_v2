@@ -29,6 +29,13 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
 from ait.ml.features import FeatureEngine
+from ait.ml.hyperparams import (  # W87a: one owner of the tree settings and the label guards
+    MIN_CLASS_SAMPLES,
+    POSITIVE_RATE_MAX,
+    POSITIVE_RATE_MIN,
+    lgbm_binary_kwargs,
+    xgb_binary_kwargs,
+)
 from ait.utils.logging import get_logger
 
 log = get_logger("ml.vol_magnitude")
@@ -167,18 +174,17 @@ class VolMagnitudePredictor:
         positive_rate = features["target"].mean()
         n_pos = int(features["target"].sum())
         n_neg = len(features) - n_pos
-        _MIN_CLASS_SAMPLES = 10
-        if n_pos < _MIN_CLASS_SAMPLES or n_neg < _MIN_CLASS_SAMPLES:
+        if n_pos < MIN_CLASS_SAMPLES or n_neg < MIN_CLASS_SAMPLES:
             log.warning(
                 "vol_mag_single_class", symbol=symbol,
                 big_move_pct=f"{positive_rate:.1%}",
                 n_big_move=n_pos, n_small_move=n_neg,
-                min_required=_MIN_CLASS_SAMPLES,
+                min_required=MIN_CLASS_SAMPLES,
                 hint=f"±{self._threshold:.0%} threshold produces too few minority-class "
                      f"examples to train reliably — cannot train binary classifier",
             )
             return {}
-        if positive_rate < 0.05 or positive_rate > 0.98:
+        if positive_rate < POSITIVE_RATE_MIN or positive_rate > POSITIVE_RATE_MAX:
             log.warning(
                 "vol_mag_imbalanced", symbol=symbol,
                 big_move_pct=f"{positive_rate:.1%}",
@@ -298,13 +304,7 @@ class VolMagnitudePredictor:
         try:
             from xgboost import XGBClassifier
             from sklearn.metrics import balanced_accuracy_score
-            model = XGBClassifier(
-                n_estimators=200, max_depth=5, learning_rate=0.05,
-                subsample=0.8, colsample_bytree=0.8,
-                objective="binary:logistic", eval_metric="logloss",
-                verbosity=0, n_jobs=-1, random_state=42,
-                scale_pos_weight=scale_pos_weight,
-            )
+            model = XGBClassifier(**xgb_binary_kwargs(scale_pos_weight))
             scores = []
             for tr_idx, val_idx in self._walk_forward_split(len(X)):
                 if len(np.unique(y[tr_idx])) < 2:
@@ -330,13 +330,7 @@ class VolMagnitudePredictor:
         try:
             from lightgbm import LGBMClassifier
             from sklearn.metrics import balanced_accuracy_score
-            model = LGBMClassifier(
-                n_estimators=200, max_depth=5, learning_rate=0.05,
-                subsample=0.8, colsample_bytree=0.8,
-                objective="binary", metric="binary_logloss",
-                verbose=-1, n_jobs=-1, class_weight="balanced",
-                random_state=42, deterministic=True,
-            )
+            model = LGBMClassifier(**lgbm_binary_kwargs())
             scores = []
             for tr_idx, val_idx in self._walk_forward_split(len(X)):
                 if len(np.unique(y[tr_idx])) < 2:

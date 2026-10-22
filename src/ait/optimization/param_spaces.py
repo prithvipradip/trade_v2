@@ -212,3 +212,99 @@ ML_SPACES: dict[str, dict[str, tuple]] = {
     "xgboost":  XGBOOST_SPACE,
     "lightgbm": LIGHTGBM_SPACE,
 }
+
+
+# ---------------------------------------------------------------------------
+# W87a: per-study OVERRIDES of the search ranges, validated, and a hash of the effective space
+# ---------------------------------------------------------------------------
+# The defaults above stay the code-owned, git-versioned, PLAN-recorded spaces. A study (see
+# ``studies/*.yaml``, ``search_space:``) may narrow or widen individual dimensions; this layer validates the
+# override and returns a NEW dict, so ``STRATEGY_SPACES`` is never mutated (``FRACTAL_GATE_SPACE`` is spread
+# into two spaces at import, so mutating it would not even propagate). The optimizer reads the effective
+# space at every point it used to read ``STRATEGY_SPACES``.
+
+# Hard limits an OVERRIDE must stay inside (the defaults are not checked against these). Where a limit is the
+# engine's own (the 0.05-0.45 delta clamp) the engine silently clamps anything outside, so a wider range
+# would search values the backtest cannot honour.
+HARD_BOUNDS: dict[str, tuple[float, float]] = {
+    "delta_short": (0.05, 0.45), "delta_long": (0.05, 0.45),
+    "wing_k": (0.1, 5.0), "max_hold_days": (1, 45), "max_hold_fraction": (0.0, 1.0),
+    "min_confidence": (0.0, 1.0), "stop_loss_pct": (0.01, 1.0), "profit_target_pct": (0.05, 5.0),
+    "trailing_stop_fraction": (0.0, 1.0), "iv_floor": (0.0, 1.0), "delta_iv_scale": (0.0, 1.0),
+    "max_entry_vol_annual": (0.05, 5.0), "iv_rank_rise_threshold": (0.0, 10.0),
+    "min_edge_over_baseline": (0.0, 1.0), "hurst_regime_threshold": (0.0, 1.0),
+    "hurst_regime_penalty": (0.0, 1.0), "multifractal_max_width": (0.0, 2.0),
+}
+_DTE_DIMENSIONS = ("entry_dte", "expiry_guard_dte", "max_hold_fraction", "flatten_minutes_before_close")
+
+
+def _is_number(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def effective_space(strategy: str, overrides: dict | None = None) -> dict[str, tuple]:
+    """``STRATEGY_SPACES[strategy]`` with ``overrides`` ({dimension: [low, high]}) applied, as a NEW dict.
+
+    Raises ``ValueError`` (naming the study key) for: an unknown strategy; a dimension that is not in the
+    strategy's space (the DTE dimensions belong to ``backtest.dte_search``); a value that is not two numbers;
+    a non-integral bound on an integer dimension; ``low >= high``; a bound outside ``HARD_BOUNDS``. The
+    dimension's type and keyword arguments (e.g. ``log=True``) are kept from the default."""
+    if strategy not in STRATEGY_SPACES:
+        raise ValueError(f"search_space.{strategy}: unknown strategy (known: {sorted(STRATEGY_SPACES)})")
+    base = STRATEGY_SPACES[strategy]
+    out = dict(base)
+    for name, new in (overrides or {}).items():
+        where = f"search_space.{strategy}.{name}"
+        if name not in base:
+            hint = (" (the DTE dimensions are set with settings.backtest.dte_search)"
+                    if name in _DTE_DIMENSIONS else "")
+            raise ValueError(f"{where}: not a dimension of {strategy} (known: {sorted(base)}){hint}")
+        if not (isinstance(new, (list, tuple)) and len(new) == 2 and all(_is_number(v) for v in new)):
+            raise ValueError(f"{where}: expected [low, high] numbers, got {new!r}")
+        lo, hi = new
+        kind = base[name][0]
+        if kind == "int":
+            if lo != int(lo) or hi != int(hi):
+                raise ValueError(f"{where}: integer dimension needs whole-number bounds, got {new!r}")
+            lo, hi = int(lo), int(hi)
+        else:
+            lo, hi = float(lo), float(hi)
+        if not lo < hi:
+            raise ValueError(f"{where}: low must be below high, got {new!r}")
+        limit = HARD_BOUNDS.get(name)
+        if limit is not None and not (limit[0] <= lo and hi <= limit[1]):
+            raise ValueError(f"{where}: {new!r} is outside the hard limits {list(limit)}")
+        out[name] = (kind, lo, hi, *base[name][3:])
+    return out
+
+
+def override_warnings(strategy: str, overrides: dict | None, baselines: dict[str, float]) -> list[str]:
+    """Overrides whose new range EXCLUDES the live / baseline value: the optimizer could then never choose
+    the setting live trades with. Warnings, not errors (excluding it can be the point of a study)."""
+    out = []
+    for name, new in (overrides or {}).items():
+        base = baselines.get(name)
+        if base is not None and not (float(new[0]) <= float(base) <= float(new[1])):
+            out.append(f"search_space.{strategy}.{name}: {list(new)} excludes the live value {base}")
+    return out
+
+
+def live_baselines(strategy: str = "iron_condor") -> dict[str, float]:
+    """The values LIVE trades a searched dimension at, for ``override_warnings`` and the guard test that
+    keeps them inside the default ranges. Only iron_condor has live baselines (the live selector is IC-only);
+    each comes from its owner, not a copy: ``AIT_IC_WING_K`` through the env contract, the short delta from
+    the constant ``iron_condor.py`` selects with."""
+    if strategy != "iron_condor":
+        return {}
+    from ait.config.runtime_env import contract_float
+    from ait.strategies.iron_condor import SHORT_DELTA_TARGET
+    return {"wing_k": contract_float("AIT_IC_WING_K"), "delta_short": SHORT_DELTA_TARGET}
+
+
+def space_hash(spaces: dict[str, dict]) -> str:
+    """A short, stable sha256 of an effective space ({strategy: {dimension: spec}}): the same space gives
+    the same hash across runs and machines; any change to a range, a type or a keyword changes it."""
+    import hashlib
+    import json
+    canon = {s: {n: list(spec) for n, spec in sorted(dims.items())} for s, dims in sorted(spaces.items())}
+    return hashlib.sha256(json.dumps(canon, sort_keys=True, default=str).encode()).hexdigest()[:16]

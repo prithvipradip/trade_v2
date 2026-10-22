@@ -27,6 +27,7 @@ import pandas as pd
 from ait.optimization.objectives import OBJECTIVES
 from ait.optimization.param_spaces import (
     DTE_SEARCH_REPLACES, FRACTAL_GATE_SPACE, ML_SPACES, STRATEGY_SPACES, dte_search_space,
+    effective_space, space_hash,
 )
 from ait.optimization.results import OptimizationResult
 from ait.utils.logging import get_logger
@@ -166,6 +167,10 @@ class StrategyOptimizer:
         stop_loss_pct: float | None = None,
         profit_target_pct: float | None = None,
         min_confidence: float | None = None,
+        # W87a: per-study overrides of single search ranges, ``{strategy: {dimension: [low, high]}}``
+        # (a study file's ``search_space:``). Validated here, at construction, by ``effective_space``.
+        # None = the code defaults, unchanged.
+        search_space_overrides: "dict | None" = None,
         seed: int = 42,
         intraday_store: "Any | None" = None,
         symbol: str | None = None,
@@ -206,6 +211,15 @@ class StrategyOptimizer:
 
         self._symbols = symbols
         self._strategies = strategies
+        # W87a: the EFFECTIVE per-strategy spaces (defaults + validated overrides), built once. STRATEGY_SPACES
+        # itself is never mutated. Every read of a strategy's space below goes through ``_space``.
+        self._space_overrides = dict(search_space_overrides or {})
+        _stray = sorted(set(self._space_overrides) - set(strategies))
+        if _stray:
+            raise ValueError(f"search_space overrides for {_stray}, which this study does not run "
+                             f"(strategies: {list(strategies)})")
+        self._spaces = {st: effective_space(st, self._space_overrides.get(st))
+                        for st in strategies if st in STRATEGY_SPACES}
         self._n_trials = n_trials
         self._n_jobs = n_jobs
         self._objective_name = objective
@@ -411,6 +425,17 @@ class StrategyOptimizer:
             pruner=optuna.pruners.MedianPruner(n_warmup_steps=1),
         )
 
+        # W87a: a stored study (``storage=`` + ``load_if_exists``) that was created over a DIFFERENT search
+        # space would silently mix two distributions (Optuna only rejects a changed TYPE). Refuse it; a
+        # study created before this guard has no hash and is adopted.
+        _space_hash = self.search_space_hash()
+        _stored = study.user_attrs.get("search_space_hash")
+        if _stored is not None and _stored != _space_hash:
+            raise ValueError(
+                f"study {self._study_name!r} was created over search space {_stored}, this run's space is "
+                f"{_space_hash}: use a new study name (or storage) for a changed search space")
+        study.set_user_attr("search_space_hash", _space_hash)
+
         if prior_params:
             study.enqueue_trial(prior_params)
 
@@ -552,7 +577,7 @@ class StrategyOptimizer:
         # for the day the gate is turned back on.
         if not self._iv_rank_rise_gate:
             _rise = {f"{st}__iv_rank_rise_threshold" for st in self._strategies
-                     if "iv_rank_rise_threshold" in STRATEGY_SPACES.get(st, {})}
+                     if "iv_rank_rise_threshold" in self._space(st)}
             if _rise:
                 self._dropped_params |= _rise
                 log.info("optimizer_dropped_inert_param", param="iv_rank_rise_threshold",
@@ -561,7 +586,7 @@ class StrategyOptimizer:
                               "threshold cannot change any entry")
         if not self._budget_aware_wings or "iron_condor" not in self._strategies:
             return
-        spec = STRATEGY_SPACES.get("iron_condor", {}).get("wing_k")
+        spec = self._space("iron_condor").get("wing_k")
         if not spec or not self._data:
             return
         import math
@@ -596,12 +621,39 @@ class StrategyOptimizer:
                      note="the per-trade budget caps the wing below every searched "
                           "wing_k, so the dimension cannot change any result")
 
+    def _space(self, strategy: str) -> dict[str, tuple]:
+        """The effective space of one strategy (defaults + this study's validated overrides)."""
+        return self._spaces.get(strategy, {})
+
+    def effective_search_space(self) -> dict[str, dict[str, tuple]]:
+        """Every dimension a trial would actually sample, ``{strategy: {name: spec}}``: the effective
+        spaces after the DTE merge and without the dimensions ``_maybe_drop_inert_params`` removed. This is
+        what ``search_space_hash`` hashes and what a run record stores."""
+        out: dict[str, dict[str, tuple]] = {}
+        for strategy in self._strategies:
+            space = self._space(strategy)
+            if strategy == "iron_condor":
+                _extra = dte_search_space(self._dte_search)
+                if _extra:
+                    space = {k: v for k, v in space.items() if k not in DTE_SEARCH_REPLACES}
+                    space = {**space, **_extra}
+            out[strategy] = {n: s for n, s in space.items()
+                             if f"{strategy}__{n}" not in self._dropped_params}
+        if self._optimize_ml:
+            for model, space in ML_SPACES.items():
+                out[f"ml:{model}"] = dict(space)
+        return out
+
+    def search_space_hash(self) -> str:
+        """Short stable hash of ``effective_search_space()`` (see ``param_spaces.space_hash``)."""
+        return space_hash(self.effective_search_space())
+
     def _suggest_params(self, trial: optuna.Trial) -> dict[str, Any]:
         params: dict[str, Any] = {}
 
         # Strategy-level params — merge spaces for all requested strategies
         for strategy in self._strategies:
-            space = STRATEGY_SPACES.get(strategy, {})
+            space = self._space(strategy)
             if strategy == "iron_condor":
                 _extra = dte_search_space(self._dte_search)
                 if _extra:    # W79a: the hold fraction replaces the day cap

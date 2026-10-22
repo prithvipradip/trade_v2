@@ -60,7 +60,9 @@ class WalkForwardConfig:
     # runtime_env.research_capital() (was a 100_000 literal; BT-H3 gave every
     # symbol its own full-capital sleeve, superseded by the pool allocator).
     initial_capital: float | None = None
-    commission_per_contract: float = 0.65
+    # W87a: None -> the Backtester resolves backtest.commission_per_contract (config 0.65, the IBKR base
+    # commission); was a 0.65 literal that shadowed a config change in every walk-forward window.
+    commission_per_contract: float | None = None
     slippage_pct: float = 0.03  # 3% realistic for multi-leg options
     # W64: None -> resolve_position_size_pct: backtest.position_size_pct if a
     # sizing study set one, else risk.max_position_risk_pct (live's per-trade
@@ -224,6 +226,9 @@ class WalkForwardConfig:
     dte_range: "tuple[int, int] | None" = None     # overrides dte_search.entry_dte (CLI --dte-range)
     optimize_strict: bool | None = None            # None -> backtest.dte_search.strict
     optimize_multivariate: bool | None = None      # None -> backtest.dte_search.multivariate
+    # W87b: {strategy: {dimension: [low, high]}} overrides of the Optuna search space (a study file's
+    # ``search_space:``); None -> the defaults in optimization/param_spaces.py. Validated by effective_space.
+    search_space_overrides: dict | None = None
     # Research-only post-event blackout (scripts/post_event_study.py): block
     # credit entries for N calendar days after each date in post_event_dates
     # (ISO strings, so the config pickles into window workers). None = off.
@@ -2168,6 +2173,7 @@ class WalkForwardBacktester:
                     delta_short=self._config.delta_short,
                     dte_search=self._dte_search_block(),
                     multivariate=bool(self._config.optimize_multivariate),
+                    search_space_overrides=self._config.search_space_overrides,   # W87b
                     val_split=self._config.optimize_val_split,
                     # R20b review follow-up: trial objectives priced with the
                     # same training-window VIX/SPY context as features_cache

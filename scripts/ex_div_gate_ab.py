@@ -35,7 +35,6 @@ from pathlib import Path  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 DB = ROOT / "data" / "historical.db"
-OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 
 
 def arms(k_values: list[int]) -> dict[str, tuple[str, int]]:
@@ -49,27 +48,15 @@ def run_arm(task: dict) -> dict:
     """One engine run. Module-level so a process pool can pickle it."""
     warnings.filterwarnings("ignore")
     from ait.backtesting.engine import Backtester
-    from ait.backtesting.replay import ResearchData
-    from ait.data.iv_rank import iv_rank_series
-    from ait.ml.features import FeatureEngine
+    from ait.backtesting.study_harness import assert_friction_loaded, study_engine_kwargs, study_inputs
 
-    rd = ResearchData(str(DB), task["symbol"])
-    frame = rd.daily_frame()
-    data = frame.loc[task["start"]:task["end"]].copy()
-    bt = Backtester(
-        data=data, strategies=["iron_condor"], initial_capital=100_000.0, macro_event_gate=False,
-        allow_live_model_fallback=False,
-        features_cache=FeatureEngine().compute(frame[OHLCV].loc["2023-01-01":]),
-        condor_any_direction=True, intraday_store=rd, symbol=task["symbol"],
-        friction_model="per_leg_usd", db_path=DB, gates_mode="observe", max_contracts_per_trade=1,
-        max_concurrent_positions=1, hurst_hard_veto_multiplier=0.0, hurst_regime_threshold=0.0,
-        iv_floor=0.05, ic_min_credit=0.30, ic_min_credit_width=0.05, entry_window_start_et="10:30",
-        entry_window_end_et="15:30", scan_interval_minutes=60, engine_model="realistic",
-        friction_short_dte=True, pricing_source="bs_legacy", entry_dte=int(task["entry_dte"]),
-        iv_rank_gate=True, iv_rank_series=iv_rank_series(frame["implied_vol"]),
-        iv_rank_rise_gate=False, ex_div_entry_gate=task["mode"], ex_div_entry_k_days=task["k"])
-    assert bt._leg_spread_model is not None and bt._friction_bands is not None, \
-        "per-leg friction model did NOT load"
+    rd, data, features, ivr = study_inputs(DB, task["symbol"], task["start"], task["end"])
+    # W87a: the study engine block is defined once (backtesting/study_harness.py)
+    bt = Backtester(**study_engine_kwargs(
+        data=data, symbol=task["symbol"], db_path=DB, intraday_store=rd, entry_dte=int(task["entry_dte"]),
+        features_cache=features, iv_rank_series=ivr,
+        ex_div_entry_gate=task["mode"], ex_div_entry_k_days=task["k"]))
+    assert_friction_loaded(bt)
     assert bt._ex_div_mode == task["mode"], "ex-div mode did not reach the engine"
     if task["mode"] != "off":
         assert bt._ex_dates, "the ex-dividend calendar did NOT load"

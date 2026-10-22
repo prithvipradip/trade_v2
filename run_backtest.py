@@ -1,11 +1,12 @@
 """Run walk-forward backtest with real historical data.
 
-Fetches 2 years of daily OHLCV from Yahoo Finance for configured symbols,
-then runs the walk-forward backtester with all enabled strategies.
+Loads the research history (config.yaml backtest.* : the IB research tables, or the legacy
+loader when --table-prefix '' is passed) for the configured symbols, then runs the
+walk-forward backtester with the requested strategies.
 
 Usage:
     python run_backtest.py
-    python run_backtest.py --symbols SPY QQQ AAPL --days 500
+    python run_backtest.py --symbols SPY QQQ AAPL --history-days 500
     python run_backtest.py --strategies long_call bull_call_spread iron_condor
 """
 
@@ -19,7 +20,12 @@ import sys
 import time
 from pathlib import Path
 
+from dataclasses import fields as _dc_fields
+
 from ait.backtesting.walkforward import WalkForwardBacktester, WalkForwardConfig
+
+_WF_DEFAULTS = {f.name: f.default for f in _dc_fields(WalkForwardConfig)
+                if f.name in ("train_days", "test_days", "step_days", "gap_days")}
 
 # ---------------------------------------------------------------------------
 # Live-parity reference values (source of truth: the LIVE code paths)
@@ -28,10 +34,10 @@ from ait.backtesting.walkforward import WalkForwardBacktester, WalkForwardConfig
 # - AIT_IC_MIN_CREDIT ($0.70):       src/ait/strategies/iron_condor.py generate_signals
 # - AIT_IC_MIN_CREDIT_WIDTH:         credit-to-width gate in iron_condor.py
 # - AIT_CREDIT_LOSS_LIMIT (0=off):   R16 parity - live default DISABLED (R6: touch-close beats flat stops)
-# - delta target 0.20:               hardcoded in iron_condor.generate_signals
+# - delta target:                    iron_condor.SHORT_DELTA_TARGET (W87a; was a literal 0.20)
 # - DTE band:                        config.yaml options.dte_range (loaded, NOT the code default)
-# - TP ladder:                       src/ait/execution/portfolio.py _get_take_profit_targets
-# - IV rank floor 15:                AIT_IRON_CONDOR_IV_FLOOR default in iron_condor.py
+# - TP ladder:                       src/ait/execution/exit_policy.py CREDIT_TP_LADDER (shared)
+# - IV rank floor 15:                AIT_IRON_CONDOR_IV_FLOOR (env contract; --iv-floor follows it)
 # - pre-event blackout:              config.yaml risk.pre_event_blackout_days
 #
 # R16: the "live" column used to be HARDCODED here (dte_band [14,45] while
@@ -42,7 +48,13 @@ from ait.backtesting.walkforward import WalkForwardBacktester, WalkForwardConfig
 # the manifest systematically UNDERSTATED live-vs-backtest divergence. Every
 # live value below is now resolved from the authorities: ait.config.runtime_env
 # (the env contract every bot entry point applies) and load_settings().
-_LIVE_TP_LADDER = {"dte>20": 0.50, "dte_11_20": 0.40, "dte_6_10": 0.30, "dte<=5": 0.20}
+# W87a: the take-profit ladder rows are SAMPLED at one DTE per rung from the shared authority
+# (``execution/exit_policy.CREDIT_TP_LADDER``) for BOTH columns; the live column used to be a hand copy.
+_TP_LADDER_PROBE_DTES = {"dte>20": 25, "dte_11_20": 15, "dte_6_10": 8, "dte<=5": 3}
+
+
+def _tp_ladder_by_rung(fn) -> dict:
+    return {rung: fn(dte) for rung, dte in _TP_LADDER_PROBE_DTES.items()}
 
 
 def _live_env() -> dict:
@@ -103,6 +115,8 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
     from ait.backtesting.engine import Backtester
     from ait.config.settings import MLConfig
     from ait.config.runtime_env import contract_float
+    from ait.execution import exit_policy
+    from ait.strategies.iron_condor import SHORT_DELTA_TARGET
 
     env = _live_env()
     settings = _live_settings()
@@ -187,9 +201,9 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
         "ic_min_credit_width": _live_contract("AIT_IC_MIN_CREDIT_WIDTH"),
         "credit_loss_limit": _live_contract("AIT_CREDIT_LOSS_LIMIT"),
         "pre_event_blackout_days": live_blackout,
-        "delta_target":      0.20,
+        "delta_target":      SHORT_DELTA_TARGET,   # W87a: the constant iron_condor.py selects with
         "dte_band":          live_dte,
-        "tp_ladder":         dict(_LIVE_TP_LADDER),
+        "tp_ladder":         _tp_ladder_by_rung(exit_policy.credit_take_profit_pct),
         "wing_floor":        _live_contract("AIT_IC_WING_FLOOR"),
         "macro_gate_entry":  True,   # orchestrator blocks credit entries within
                                      # risk.pre_event_blackout_days of an event
@@ -207,12 +221,7 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
 
     # Backtest TP ladder read from the engine mirror itself, so this manifest
     # catches any future drift in Backtester._credit_take_profit_pct.
-    bt_ladder = {
-        "dte>20":    Backtester._credit_take_profit_pct(25),
-        "dte_11_20": Backtester._credit_take_profit_pct(15),
-        "dte_6_10":  Backtester._credit_take_profit_pct(8),
-        "dte<=5":    Backtester._credit_take_profit_pct(3),
-    }
+    bt_ladder = _tp_ladder_by_rung(Backtester._credit_take_profit_pct)
     backtest = {
         "per_trade_budget_pct": bt_budget_pct,
         "budget_aware_wings": bt_wings,
@@ -234,7 +243,8 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
         # R16 #7: the walk-forward passes None, so the engine resolves the same
         # loaded settings value live uses — report the resolved number, not None.
         "pre_event_blackout_days": live_blackout,
-        "delta_target":      0.20,   # Backtester delta_short default (walk-forward does not override)
+        # W87a: the resolved backtest.delta_short (walk-forward does not override it); was a literal 0.20
+        "delta_target":      float(_rcv(None, "backtest", "delta_short", _BTC, rsettings)),
         # PR#7 review 2026-08-25: was a stale hardcoded [21, 21] with the note
         # "engine uses fixed DTE = max_hold_days" — the engine's 2026-08-24
         # decoupling resolves entry_dte from options.dte_range[0] instead, so
@@ -248,7 +258,9 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
                               else contract_float("AIT_IC_WING_FLOOR")),
         "macro_gate_entry":  args.macro_gate,
         "macro_flatten_enabled": os.environ.get("AIT_SKIP_MACRO_EVENTS", "0") == "1",
-        "iv_rank_floor":     args.iv_floor,
+        # W87a: --iv-floor defaults to None (resolved like the live contract); report the RESOLVED value
+        "iv_rank_floor":     (args.iv_floor if args.iv_floor is not None
+                              else contract_float("AIT_IRON_CONDOR_IV_FLOOR")),
         "min_confidence": float(_rcv(None, "risk", "min_confidence", _RC, rsettings)),
         "max_open_positions": int(_rcv(None, "positions", "max_open_positions", _PC, rsettings)),
         "max_concurrent_positions": int(_rcv(
@@ -391,10 +403,12 @@ def parse_args() -> argparse.Namespace:
         ],
         help="Strategies to test",
     )
-    p.add_argument("--train-days", type=int, default=365, help="Training window days (calendar)")
-    p.add_argument("--test-days", type=int, default=63, help="Test window days")
-    p.add_argument("--step-days", type=int, default=63, help="Step between windows")
-    p.add_argument("--gap-days", type=int, default=5, help="Purge gap days")
+    # W87a: the window defaults ARE the WalkForwardConfig field defaults (they were four literals here)
+    p.add_argument("--train-days", type=int, default=_WF_DEFAULTS["train_days"],
+                   help="Training window days (calendar)")
+    p.add_argument("--test-days", type=int, default=_WF_DEFAULTS["test_days"], help="Test window days")
+    p.add_argument("--step-days", type=int, default=_WF_DEFAULTS["step_days"], help="Step between windows")
+    p.add_argument("--gap-days", type=int, default=_WF_DEFAULTS["gap_days"], help="Purge gap days")
     p.add_argument("--capital", type=float, default=None,
                    help="TOTAL starting equity, one shared pool across symbols. "
                         "Default: config.yaml account.capital (W-capital: the single "
@@ -408,9 +422,10 @@ def parse_args() -> argparse.Namespace:
                    help="Min P(in_range) for iron condors (range model). "
                         "Default resolves from config.yaml ml.range_min_confidence "
                         "(currently 0.65) -- was a stale hardcoded 0.55 (R20b follow-up).")
-    p.add_argument("--iv-floor", type=float, default=15.0,
-                   help="Min IV rank for iron condors (aligned with live "
-                        "AIT_IRON_CONDOR_IV_FLOOR default of 15; was 30)")
+    p.add_argument("--iv-floor", type=float, default=None,
+                   help="Min IV rank for iron condors. Default resolves env "
+                        "AIT_IRON_CONDOR_IV_FLOOR > config.yaml backtest.ic_iv_rank_floor > 15 "
+                        "(contract_float; W87a: was a 15.0 literal).")
     # BooleanOptionalAction gives --trailing-stop / --no-trailing-stop.
     # (Old action="store_true" with default=True made it impossible to disable.)
     # Trailing applies to DEBIT trades only — credit trades always use the
@@ -446,8 +461,10 @@ def parse_args() -> argparse.Namespace:
                    help="Hard minimum wing width in $ (live enforces $2; old backtest "
                         "default was $5). Default: config backtest.wing_floor_dollars (W70).")
     p.add_argument("--macro-gate", action=argparse.BooleanOptionalAction, default=True,
-                   help="Block credit entries <=4 days before FOMC/CPI/NFP/GDP/PCE "
-                        "(2026-only hardcoded calendar; inactive for earlier windows)")
+                   help="Block credit entries within risk.pre_event_blackout_days (config, "
+                        "currently 1) of an FOMC/CPI/NFP/GDP/PCE event (research windows use the "
+                        "operator's economic calendar; the legacy 2026-only calendar is inactive "
+                        "for earlier windows)")
     p.add_argument("--compare-exits", action="store_true", help="Compare fixed vs trailing stops")
     p.add_argument("--optimize-per-window", action="store_true", default=False,
                    help="Run Optuna optimization on each training window before testing")
@@ -493,6 +510,9 @@ async def run_backtest(args: argparse.Namespace) -> None:
         from ait.config.runtime_env import contract_float
         # the SAME contract call live's iron_condor.py uses (home backtest.wing_floor_dollars)
         args.wing_floor = contract_float("AIT_IC_WING_FLOOR")
+    if args.iv_floor is None:  # W87a: resolved BEFORE the manifest and the env write below read it
+        from ait.config.runtime_env import contract_float
+        args.iv_floor = contract_float("AIT_IRON_CONDOR_IV_FLOOR")
     print("=" * 60)
     print("  AIT v2 — WALK-FORWARD BACKTEST")
     print("=" * 60)
@@ -511,7 +531,7 @@ async def run_backtest(args: argparse.Namespace) -> None:
     manifest = build_parity_manifest(args)
 
     # Set IV floor for iron condor strategy (read by iron_condor.py via env)
-    os.environ["AIT_IRON_CONDOR_IV_FLOOR"] = str(args.iv_floor)
+    os.environ["AIT_IRON_CONDOR_IV_FLOOR"] = str(args.iv_floor)  # resolved above (W87a)
     print("\n  PARAMETER-PARITY MANIFEST (live vs backtest):")
     print("  " + json.dumps(manifest, indent=2).replace("\n", "\n  "))
     if manifest["parity_warnings"]:

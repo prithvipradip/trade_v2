@@ -51,12 +51,12 @@ from typing import Any, Iterable, Sequence
 
 import pandas as pd
 
+from ait.backtesting import iv_model  # W87a: the IV proxy shared with the engine
 from ait.backtesting.friction import LegSpreadModel
 from ait.backtesting.pricing import (
     OptionType,
     black_scholes_price,
     ic_leg_marks,
-    realized_vol,
     skewed_leg_iv,
 )
 from ait.utils.time import ET
@@ -489,11 +489,9 @@ def _entry_variant(trade, S, iv, t_by_leg, p, friction, actual, *, spot_src, iv_
 
 def engine_current_iv(entry_iv: float, closes: Sequence[float], iv_floor: float) -> float:
     """The engine's re-mark IV: 70% entry IV + 30% (1.15 x rv20); entry IV when
-    fewer than 21 closes exist. Mirrors ``Backtester._get_current_iv``."""
-    if len(closes) < 21:
-        return entry_iv
-    rv = realized_vol(pd.Series(closes).values, window=20) * 1.15
-    return max(0.70 * entry_iv + 0.30 * rv, iv_floor)
+    fewer than 21 closes exist. W87a: the SAME function ``Backtester._get_current_iv`` calls
+    (``backtesting.iv_model.remark_iv``), so the two cannot drift."""
+    return iv_model.remark_iv(entry_iv, pd.Series(closes).values, iv_floor)
 
 
 def exit_replay(trade: ReplayTrade, data: ResearchData, p: PricingParams,

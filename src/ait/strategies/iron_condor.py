@@ -20,6 +20,10 @@ from ait.utils.time import today_et
 
 log = get_logger("strategies.iron_condor")
 
+# W87a: the live short-strike delta, named so the research parity manifest reads it from here instead of
+# printing a hand-copied 0.20 (the backtest side is ``backtest.delta_short``). Value unchanged.
+SHORT_DELTA_TARGET = 0.20
+
 
 class IronCondor(Strategy):
     """Iron condor — sell premium on both sides."""
@@ -234,7 +238,7 @@ class IronCondor(Strategy):
         # Put side (below price):
         # Sell put at delta ~0.20, buy put 1-2 strikes lower
         # (R12-B: _find_strike_by_delta now enforces target +/- 0.07)
-        short_put = self._find_strike_by_delta(liquid_puts, 0.20)
+        short_put = self._find_strike_by_delta(liquid_puts, SHORT_DELTA_TARGET)
         if not short_put:
             self._log_entry_quality(
                 symbol, "rejected", "short_put_outside_delta_tolerance", chain)
@@ -242,7 +246,7 @@ class IronCondor(Strategy):
 
         # Call side (above price):
         # Sell call at delta ~0.20, buy call 1-2 strikes higher
-        short_call = self._find_strike_by_delta(liquid_calls, 0.20)
+        short_call = self._find_strike_by_delta(liquid_calls, SHORT_DELTA_TARGET)
         if not short_call:
             self._log_entry_quality(
                 symbol, "rejected", "short_call_outside_delta_tolerance",

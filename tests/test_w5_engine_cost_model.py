@@ -151,15 +151,19 @@ class TestCommissionAndFees:
         assert legacy._cost_per_contract_leg * 4 * 2 == pytest.approx(5.20)
 
     def test_walkforward_pinned_commission_still_pays_fees(self, yaml_backtest):
-        # walkforward.py pins commission_per_contract=0.65 and passes it into
-        # every window. Explicit wins for the commission LINE, but the fees
-        # still resolve from config — a pinned research entry point can no
-        # longer opt out of the measured friction.
+        # W87a: walkforward.py no longer pins a 0.65 literal (the default is None and the engine resolves
+        # backtest.commission_per_contract). An EXPLICIT value still wins for the commission LINE, but the
+        # fees still resolve from config -- a pinned research entry point cannot opt out of the measured
+        # friction.
         from ait.backtesting.walkforward import WalkForwardConfig
 
-        pinned = float(WalkForwardConfig().commission_per_contract)
+        assert WalkForwardConfig().commission_per_contract is None
+        unpinned = _bt(commission_per_contract=WalkForwardConfig().commission_per_contract)
+        assert unpinned._commission == pytest.approx(yaml_backtest.commission_per_contract)
+
+        pinned = float(WalkForwardConfig(commission_per_contract=0.80).commission_per_contract)
         engine = _bt(commission_per_contract=pinned)
-        assert engine._commission == pytest.approx(pinned)
+        assert engine._commission == pytest.approx(0.80)
         assert engine._regulatory_fees == pytest.approx(
             yaml_backtest.regulatory_fees_per_contract)
         assert engine._cost_per_contract_leg == pytest.approx(

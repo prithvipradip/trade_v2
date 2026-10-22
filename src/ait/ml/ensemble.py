@@ -29,6 +29,7 @@ warnings.filterwarnings(
 
 from ait.config.settings import MLConfig
 from ait.ml.features import FeatureEngine
+from ait.ml.hyperparams import lgbm_multiclass_kwargs, xgb_multiclass_kwargs  # W87a
 from ait.strategies.base import SignalDirection
 from ait.utils.logging import get_logger
 
@@ -698,19 +699,7 @@ class DirectionPredictor:
         try:
             from xgboost import XGBClassifier
 
-            base_kwargs = dict(
-                n_estimators=200,
-                max_depth=5,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                objective="multi:softprob",
-                num_class=3,
-                eval_metric="mlogloss",
-                verbosity=0,
-                n_jobs=-1,
-                random_state=42,
-            )
+            base_kwargs = xgb_multiclass_kwargs()
             base_kwargs.update(self._xgb_kwargs)
             model = XGBClassifier(**base_kwargs)
 
@@ -757,21 +746,7 @@ class DirectionPredictor:
         try:
             from lightgbm import LGBMClassifier
 
-            base_kwargs = dict(
-                n_estimators=200,
-                max_depth=5,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                objective="multiclass",
-                num_class=3,
-                metric="multi_logloss",
-                verbose=-1,
-                n_jobs=-1,
-                class_weight="balanced",  # Auto-balance class weights
-                random_state=42,
-                deterministic=True,
-            )
+            base_kwargs = lgbm_multiclass_kwargs()  # balanced class weights, deterministic
             base_kwargs.update(self._lgbm_kwargs)
             model = LGBMClassifier(**base_kwargs)
 

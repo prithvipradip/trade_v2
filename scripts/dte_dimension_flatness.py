@@ -82,21 +82,16 @@ def _run_one(task: dict) -> dict:
 
     frame = ResearchData(str(DB), task["symbol"]).daily_frame()
     data = frame.loc[(frame.index >= task["start"]) & (frame.index <= task["end"])].copy()
-    kw = dict(
-        data=data, strategies=["iron_condor"], initial_capital=100_000.0, macro_event_gate=False,
-        allow_live_model_fallback=False, features_cache=None, condor_any_direction=True,
-        intraday_store=_ReadOnlyIntraday(DB, task["symbol"]), symbol=task["symbol"],
-        friction_model="per_leg_usd", db_path=DB, gates_mode="observe", max_contracts_per_trade=1,
-        max_concurrent_positions=1, hurst_hard_veto_multiplier=0.0, hurst_regime_threshold=0.0,
-        iv_rank_rise_gate=False, iv_floor=0.05, ic_min_credit=0.30, ic_min_credit_width=0.05,
-        entry_window_start_et="10:30", entry_window_end_et="15:30", scan_interval_minutes=60,
-        engine_model="realistic", friction_short_dte=True, pricing_source="bs_legacy",
-        entry_dte=task["dte"],
-    )
+    from ait.backtesting.study_harness import assert_friction_loaded, study_engine_kwargs
+
+    # W87a: the study engine block is defined once (backtesting/study_harness.py); this script passes no
+    # features_cache and no IV-rank series (the engine defaults), and a read-only intraday store.
+    kw = study_engine_kwargs(
+        data=data, symbol=task["symbol"], db_path=DB, intraday_store=_ReadOnlyIntraday(DB, task["symbol"]),
+        entry_dte=task["dte"], features_cache=None)
     kw.update(task["kwargs"])
     bt = Backtester(**kw)
-    assert bt._leg_spread_model is not None, "per-leg friction model did NOT load"
-    assert bt._friction_bands is not None, "short-DTE friction bands did NOT load"
+    assert_friction_loaded(bt)
     trades = bt.run().trades
     fp = hashlib.sha1(json.dumps(
         [(t.get("entry_date"), t.get("fill_time"), t.get("exit_date"), t.get("exit_time"),

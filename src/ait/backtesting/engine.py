@@ -31,6 +31,7 @@ from ait.backtesting.pricing import (
     realized_vol,
     skewed_leg_iv,
 )
+from ait.backtesting import iv_model  # W87a: the IV proxy constants, shared with the parity replay
 from ait.backtesting import settlement  # W77: expiry settlement / assignment rules
 from ait.backtesting.result import BacktestResult
 from ait.backtesting.ex_div import ex_div_blocks, sells_a_call  # W84: live's ex-div entry block
@@ -2028,8 +2029,8 @@ class Backtester:
 
         Returns the half-spread as a fraction of the option mid price.
         """
-        iv_term = self._spread_iv_sensitivity * max(0.0, iv - 0.20)
-        dte_term = self._spread_dte_sensitivity * max(0.0, 21 - dte)
+        iv_term = self._spread_iv_sensitivity * max(0.0, iv - iv_model.HALF_SPREAD_REF_IV)
+        dte_term = self._spread_dte_sensitivity * max(0.0, iv_model.HALF_SPREAD_REF_DTE - dte)
         return min(self._spread_cap, self._spread_base + iv_term + dte_term)
 
     def _get_iv(self, hist: pd.DataFrame, market_context: dict | None = None) -> float:
@@ -2084,10 +2085,8 @@ class Backtester:
                     if vix_val > 0:
                         return vix_val / 100.0 * mult
 
-        # Priority 3: synthetic fallback
-        close_arr = hist["Close"].values
-        rv = realized_vol(close_arr, window=20)
-        return rv * 1.15
+        # Priority 3: synthetic fallback (realized vol x the shared premium, W87a)
+        return iv_model.synthetic_iv(hist["Close"].values)
 
     # W74: class-level defaults for the fidelity switch and the three short-DTE exit
     # knobs. Tests (and any harness) build partial engines with ``Backtester.__new__``
@@ -2122,8 +2121,8 @@ class Backtester:
     # R16: VIX -> per-symbol implied-vol multipliers (see _get_iv). Unknown
     # symbols keep the historical 1.10 so nothing silently changes for
     # underlyings this calibration was never measured on.
-    _VOL_MULT_VS_VIX = {"SPY": 1.00, "QQQ": 1.228, "IWM": 1.33, "DIA": 0.98}
-    _VOL_MULT_DEFAULT = 1.10
+    _VOL_MULT_VS_VIX = iv_model.VOL_MULT_VS_VIX      # W87a: aliases of the shared definitions
+    _VOL_MULT_DEFAULT = iv_model.VOL_MULT_DEFAULT
 
     def _load_calibrated_spreads(self) -> None:
         """R16: adopt fitted per-symbol spread params when they exist.
@@ -3109,10 +3108,9 @@ class Backtester:
         without wild swings driven purely by realized vol noise.
         """
         entry_iv = pos.get("entry_iv") or pos.get("iv", self._iv_floor)
-        if hist is None or len(hist) < 21:
+        if hist is None:
             return entry_iv
-        rv = realized_vol(hist["Close"].values, window=20) * 1.15
-        return max(0.70 * entry_iv + 0.30 * rv, self._iv_floor)
+        return iv_model.remark_iv(entry_iv, hist["Close"].values, self._iv_floor)
 
     def _eod(self, d: date) -> datetime:
         """W74: the daily model's decision instant: the session close of ``d``."""
