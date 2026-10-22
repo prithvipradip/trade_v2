@@ -1281,7 +1281,136 @@ class TreeHyperparamsConfig(_StrictModel):
         description="Model seed. null = unseeded (the meta-labeler's historical behaviour).")
 
 
+def _ordered(label: str, **named: int) -> None:
+    """Raise unless the named windows are strictly increasing in the order given."""
+    vals = list(named.values())
+    if any(a >= b for a, b in zip(vals, vals[1:])):
+        raise ValueError(f"features.{label}: windows must be strictly increasing, got "
+                         + ", ".join(f"{k}={v}" for k, v in named.items()))
+
+
+class MomentumWindows(_StrictModel):
+    """W88d: windows of the momentum features (RSI, MACD, rate of change). A window that appears in a column NAME
+    (``rsi_14``, ``roc_5``) renames that column when changed (``rsi_10``)."""
+
+    rsi_long: int = Field(default=14, ge=2, le=200, description="Long RSI period (column rsi_<n>).")
+    rsi_short: int = Field(default=7, ge=2, le=200, description="Short RSI period (column rsi_<n>).")
+    macd_fast: int = Field(default=12, ge=2, le=200, description="MACD fast EMA span (also the raw ema_<n> column).")
+    macd_slow: int = Field(default=26, ge=3, le=400, description="MACD slow EMA span (also the raw ema_<n> column).")
+    macd_signal: int = Field(default=9, ge=2, le=200, description="MACD signal EMA span.")
+    roc_short: int = Field(default=5, ge=1, le=200, description="Shortest rate-of-change period (column roc_<n>).")
+    roc_mid: int = Field(default=10, ge=2, le=200, description="Middle rate-of-change period (column roc_<n>).")
+    roc_long: int = Field(default=20, ge=3, le=400, description="Longest rate-of-change period (column roc_<n>).")
+
+    @model_validator(mode="after")
+    def _check(self) -> "MomentumWindows":
+        _ordered("momentum.rsi", rsi_short=self.rsi_short, rsi_long=self.rsi_long)
+        _ordered("momentum.macd", macd_fast=self.macd_fast, macd_slow=self.macd_slow)
+        _ordered("momentum.roc", roc_short=self.roc_short, roc_mid=self.roc_mid, roc_long=self.roc_long)
+        return self
+
+
+class VolatilityWindows(_StrictModel):
+    """W88d: windows of the volatility features (ATR, Bollinger bands, realized volatility)."""
+
+    atr_window: int = Field(default=14, ge=2, le=200, description="ATR window (raw column atr_<n>; atr_pct divides it by price).")
+    bb_window: int = Field(default=20, ge=2, le=400, description="Bollinger band window.")
+    bb_std: float = Field(default=2.0, gt=0.0, le=5.0, description="Bollinger band width in standard deviations.")
+    rv_long: int = Field(default=20, ge=3, le=400, description="Long realized-volatility window (column realized_vol_<n>; also the vol-regime 'medium').")
+    rv_short: int = Field(default=10, ge=2, le=400, description="Short realized-volatility window (column realized_vol_<n>).")
+
+    @model_validator(mode="after")
+    def _check(self) -> "VolatilityWindows":
+        _ordered("volatility.rv", rv_short=self.rv_short, rv_long=self.rv_long)
+        return self
+
+
+class VolumeWindows(_StrictModel):
+    """W88d: windows of the volume features."""
+
+    volume_avg_window: int = Field(default=20, ge=2, le=400,
+        description="Average-volume window (column volume_sma_<n>_ratio; the slow side of volume_trend; the weekly "
+                    "volume-confirmation average).")
+    volume_fast_window: int = Field(default=5, ge=1, le=200, description="Fast average-volume window of volume_trend.")
+    obv_period: int = Field(default=5, ge=1, le=200, description="Period of the on-balance-volume change (obv_change).")
+
+    @model_validator(mode="after")
+    def _check(self) -> "VolumeWindows":
+        _ordered("volume", volume_fast_window=self.volume_fast_window, volume_avg_window=self.volume_avg_window)
+        return self
+
+
+class TrendWindows(_StrictModel):
+    """W88d: windows of the trend features (simple moving averages and their slopes)."""
+
+    sma_fast: int = Field(default=10, ge=2, le=400, description="Fast SMA (columns sma_<n>, sma_<n>_slope, sma_<n>_<m>_cross).")
+    sma_mid: int = Field(default=20, ge=3, le=400, description="Middle SMA (columns sma_<n>, price_vs_sma_<n>; the weekly daily-trend test).")
+    sma_slow: int = Field(default=50, ge=4, le=400, description="Slow SMA (columns sma_<n>, price_vs_sma_<n>).")
+    slope_period: int = Field(default=5, ge=1, le=100, description="Periods over which an SMA slope is measured.")
+
+    @model_validator(mode="after")
+    def _check(self) -> "TrendWindows":
+        _ordered("trend.sma", sma_fast=self.sma_fast, sma_mid=self.sma_mid, sma_slow=self.sma_slow)
+        return self
+
+
+class MultiTimeframeWindows(_StrictModel):
+    """W88d: windows of the simulated-weekly features."""
+
+    weekly_close_window: int = Field(default=5, ge=2, le=60, description="Daily bars averaged into a simulated weekly close.")
+    weekly_trend_window: int = Field(default=4, ge=2, le=60, description="Simulated weeks averaged for the weekly trend.")
+    weekly_trend_shift: int = Field(default=5, ge=1, le=60, description="Bars back the weekly trend is compared with.")
+    weekly_rsi_period: int = Field(default=14, ge=2, le=200, description="RSI period of weekly_rsi.")
+    weekly_momentum_period: int = Field(default=25, ge=2, le=200, description="Rate-of-change period of weekly_momentum.")
+
+
+class VolRegimeWindows(_StrictModel):
+    """W88d: windows of the realized-volatility regime ('IV proxy') features."""
+
+    fast: int = Field(default=5, ge=2, le=100, description="Fast realized-vol window of vol_regime_expanding.")
+    slow: int = Field(default=60, ge=5, le=400, description="Slow realized-vol window (vol_ratio, the mean-reversion signal).")
+    iv_rank_lookback: int = Field(default=252, ge=20, le=1000, description="Lookback of the iv_rank range (one trading year).")
+    iv_rank_min_periods: int = Field(default=20, ge=2, le=500, description="Minimum periods before iv_rank is defined.")
+    vol_trend_period: int = Field(default=5, ge=1, le=100, description="Periods of the vol_trend slope.")
+    vol_of_vol_window: int = Field(default=20, ge=2, le=400, description="Window of vol_of_vol.")
+
+    @model_validator(mode="after")
+    def _check(self) -> "VolRegimeWindows":
+        if self.iv_rank_min_periods > self.iv_rank_lookback:
+            raise ValueError("features.vol_regime: iv_rank_min_periods cannot exceed iv_rank_lookback")
+        return self
+
+
+class FeaturesConfig(_StrictModel):
+    """W88d: the indicator windows of the core feature groups (``ml/features.py``).
+
+    SHARED by live and research (like ``ml.hyperparams``): the defaults are the windows the code used as literals before
+    W88d, so ``config.yaml`` need not change anything; research may differ via the overlay or a study. Changing a window
+    changes the feature VALUES, and for the thirteen model columns whose name embeds a window it changes the NAME too
+    (``rsi_14`` -> ``rsi_10``). Every saved model records a hash of these windows and a model trained under other windows
+    is not served (it is retrained). Not here on purpose: the fractal / wavelet / Hurst group, the VLMC intraday
+    features, cross-asset, macro, seasonality and the market-structure group (fixed; registered), and the 252-day
+    annualisation constant."""
+
+    momentum: MomentumWindows = Field(default_factory=MomentumWindows)
+    volatility: VolatilityWindows = Field(default_factory=VolatilityWindows)
+    volume: VolumeWindows = Field(default_factory=VolumeWindows)
+    trend: TrendWindows = Field(default_factory=TrendWindows)
+    multi_timeframe: MultiTimeframeWindows = Field(default_factory=MultiTimeframeWindows)
+    vol_regime: VolRegimeWindows = Field(default_factory=VolRegimeWindows)
+
+    @model_validator(mode="after")
+    def _check(self) -> "FeaturesConfig":
+        _ordered("vol_regime vs volatility", fast=self.vol_regime.fast, rv_short=self.volatility.rv_short,
+                 rv_long=self.volatility.rv_long, slow=self.vol_regime.slow)
+        from ait.ml.feature_spec import derive_names, validate_names     # lazy: feature_spec imports this module
+        validate_names(derive_names(self))
+        return self
+
+
 class MLConfig(_StrictModel):
+    features: FeaturesConfig = Field(default_factory=FeaturesConfig,
+        description="W88d: indicator windows of the core feature groups (defaults = the pre-W88d literals).")
     hyperparams: TreeHyperparamsConfig = Field(default_factory=TreeHyperparamsConfig,
         description="W88c: tree hyperparameters of the direction ensemble, range model and vol-magnitude model "
                     "(defaults = the pre-W88c literals: 200 / 5 / 0.05 / 0.8 / 0.8, seed 42).")

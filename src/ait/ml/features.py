@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 import pywt
 
+from ait.ml.feature_spec import FeatureSpec, default_feature_spec
 from ait.utils.logging import get_logger
 
 log = get_logger("ml.features")
@@ -30,7 +31,22 @@ NEUTRAL_COLUMN_DEFAULTS: dict[str, float] = {"vix_level": 0.5}
 
 
 class FeatureEngine:
-    """Computes features from OHLCV data for ML models."""
+    """Computes features from OHLCV data for ML models.
+
+    W88d: the indicator windows of the core groups come from a ``FeatureSpec`` (``ml.features``; default = the loaded
+    settings), and the columns whose name embeds a window are named from it. At the default spec the output is
+    bit-identical to the pre-W88d engine (``tests/test_w88d_feature_windows.py``)."""
+
+    def __init__(self, spec: "FeatureSpec | None" = None) -> None:
+        self._spec = spec if spec is not None else default_feature_spec()
+
+    @property
+    def spec(self) -> FeatureSpec:
+        return self._spec
+
+    def spec_hash(self) -> str:
+        """Hash of the windows this engine computes with; recorded in every model trained on its features."""
+        return self._spec.spec_hash()
 
     def compute(
         self,
@@ -448,73 +464,30 @@ class FeatureEngine:
         Pass include_vlmc=True after calling compute() with an intraday_store
         to get the full 83-feature list used by the trained model (Gap A).
         """
-        base = [
-            # Momentum
-            "rsi_14", "rsi_7", "macd", "macd_signal", "macd_hist",
-            "roc_5", "roc_10", "roc_20",
-            # Volatility (all normalized — no raw price levels)
-            "atr_pct", "bb_width", "bb_position",
-            "bb_pct_above_upper", "bb_pct_below_lower",
-            "realized_vol_20", "realized_vol_10",
-            "high_low_range",
-            # Volume
-            "volume_sma_20_ratio", "obv_change", "volume_trend",
-            # Trend (slopes + ratios only — raw SMA/EMA price levels excluded)
-            "sma_10_slope", "sma_20_slope",
-            "price_vs_sma_20", "price_vs_sma_50",
-            "sma_10_20_cross",
-            "above_sma200", "distance_sma200",
-            # Price action
-            "daily_return", "gap", "body_size", "upper_wick", "lower_wick",
-            "consecutive_up", "consecutive_down",
-            # Multi-timeframe
-            "weekly_trend_aligned", "weekly_rsi",
-            "weekly_momentum", "volume_confirmation",
-            # IV & Volatility Regime
-            "iv_rank", "vol_ratio", "vol_trend", "vol_of_vol",
-            "vol_regime_expanding", "vol_mean_reversion_signal",
-            # Cross-Asset (VIX + relative strength)
-            "vix_level", "vix_change_5d", "vix_change_20d",
-            "vix_zscore", "vix_term_spread",
-            "rel_strength_5d", "rel_strength_20d", "rel_strength_60d",
-            "spy_momentum_10d", "spy_rsi_14", "correlation_spy_20d",
-            # Macro (yield curve + DXY from FRED)
-            "us_2y_yield_level", "us_10y_yield_level",
-            "yield_curve_spread", "yield_curve_inverted", "yield_curve_change_20d",
-            "dxy_level_norm", "dxy_change_5d", "dxy_change_20d",
-            "us_10y_change_20d",
-            # Seasonality
-            "day_of_week", "month_of_year",
-            # Fractal / multi-scale
-            "hurst_wavelet", "hurst_fit_r2",
-            "psd_beta", "psd_fit_r2", "hurst_psd_divergence",
-            "hurst_short", "hurst_long", "hurst_scale_spread",
-            "multifractal_width", "multifractal_asymmetry",
-        ]
-        if include_vlmc:
-            return base + self.VLMC_FEATURE_NAMES
-        return base
+        return self._spec.feature_names(self.VLMC_FEATURE_NAMES if include_vlmc else None)
 
     # --- Feature Groups ---
 
     def _add_momentum(self, df: pd.DataFrame) -> pd.DataFrame:
         close = df["Close"]
 
+        m, n = self._spec.cfg.momentum, self._spec.names      # W88d: windows and derived column names
+
         # RSI
-        df["rsi_14"] = self._rsi(close, 14)
-        df["rsi_7"] = self._rsi(close, 7)
+        df[n["rsi_long"]] = self._rsi(close, m.rsi_long)
+        df[n["rsi_short"]] = self._rsi(close, m.rsi_short)
 
         # MACD — normalized by price so it's stationary across time and price levels
-        ema12 = close.ewm(span=12, adjust=False).mean()
-        ema26 = close.ewm(span=26, adjust=False).mean()
+        ema12 = close.ewm(span=m.macd_fast, adjust=False).mean()
+        ema26 = close.ewm(span=m.macd_slow, adjust=False).mean()
         df["macd"] = (ema12 - ema26) / close
-        df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+        df["macd_signal"] = df["macd"].ewm(span=m.macd_signal, adjust=False).mean()
         df["macd_hist"] = df["macd"] - df["macd_signal"]
 
         # Rate of change
-        df["roc_5"] = close.pct_change(5)
-        df["roc_10"] = close.pct_change(10)
-        df["roc_20"] = close.pct_change(20)
+        df[n["roc_short"]] = close.pct_change(m.roc_short)
+        df[n["roc_mid"]] = close.pct_change(m.roc_mid)
+        df[n["roc_long"]] = close.pct_change(m.roc_long)
 
         return df
 
@@ -523,20 +496,22 @@ class FeatureEngine:
         high = df["High"]
         low = df["Low"]
 
+        v, n = self._spec.cfg.volatility, self._spec.names    # W88d: windows and derived column names
+
         # ATR
         tr = pd.concat([
             high - low,
             (high - close.shift(1)).abs(),
             (low - close.shift(1)).abs(),
         ], axis=1).max(axis=1)
-        df["atr_14"] = tr.rolling(14).mean()
-        df["atr_pct"] = df["atr_14"] / close  # ATR as % of price
+        df[n["atr_raw"]] = tr.rolling(v.atr_window).mean()
+        df["atr_pct"] = df[n["atr_raw"]] / close  # ATR as % of price
 
         # Bollinger Bands
-        sma20 = close.rolling(20).mean()
-        std20 = close.rolling(20).std()
-        df["bb_upper"] = sma20 + 2 * std20
-        df["bb_lower"] = sma20 - 2 * std20
+        sma20 = close.rolling(v.bb_window).mean()
+        std20 = close.rolling(v.bb_window).std()
+        df["bb_upper"] = sma20 + v.bb_std * std20
+        df["bb_lower"] = sma20 - v.bb_std * std20
         df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / sma20
         df["bb_position"] = (close - df["bb_lower"]) / (df["bb_upper"] - df["bb_lower"])
         # Breach signals: how far outside the bands is price? 0 when inside.
@@ -545,8 +520,8 @@ class FeatureEngine:
 
         # Realized volatility
         log_returns = np.log(close / close.shift(1))
-        df["realized_vol_20"] = log_returns.rolling(20).std() * np.sqrt(252)
-        df["realized_vol_10"] = log_returns.rolling(10).std() * np.sqrt(252)
+        df[n["rv_long"]] = log_returns.rolling(v.rv_long).std() * np.sqrt(252)
+        df[n["rv_short"]] = log_returns.rolling(v.rv_short).std() * np.sqrt(252)
 
         # High-low range
         df["high_low_range"] = (high - low) / close
@@ -556,6 +531,7 @@ class FeatureEngine:
     def _add_volume(self, df: pd.DataFrame) -> pd.DataFrame:
         volume = df["Volume"]
         close = df["Close"]
+        vo, n = self._spec.cfg.volume, self._spec.names       # W88d: windows and derived column names
 
         # Volume features must degrade gracefully when volume is zero/missing.
         # Delayed and free-tier feeds (Polygon/Yahoo/IBKR delayed) frequently
@@ -563,24 +539,24 @@ class FeatureEngine:
         # rows; the downstream dropna() then empties the whole feature matrix
         # and the bot silently stops predicting (observed live 2026-06-22).
         # Neutral fills keep the rows: ratio 1.0 = "normal" volume, change 0.0.
-        vol_sma20 = volume.rolling(20).mean()
-        df["volume_sma_20_ratio"] = (
+        vol_sma20 = volume.rolling(vo.volume_avg_window).mean()
+        df[n["volume_ratio"]] = (
             (volume / vol_sma20.replace(0, np.nan))
             .replace([np.inf, -np.inf], np.nan)
         )
 
         obv = (np.sign(close.diff()) * volume).cumsum()
-        df["obv_change"] = obv.pct_change(5).replace([np.inf, -np.inf], np.nan)
+        df["obv_change"] = obv.pct_change(vo.obv_period).replace([np.inf, -np.inf], np.nan)
 
         df["volume_trend"] = (
-            (volume.rolling(5).mean() / volume.rolling(20).mean())
+            (volume.rolling(vo.volume_fast_window).mean() / volume.rolling(vo.volume_avg_window).mean())
             .replace([np.inf, -np.inf], np.nan)
         )
 
         # Fill ONLY the volume columns with neutral values. Leading lookback
         # warmup rows stay NaN via the price features and are still dropped as
         # intended; this only rescues rows lost purely to a zero-volume feed.
-        df["volume_sma_20_ratio"] = df["volume_sma_20_ratio"].fillna(1.0)
+        df[n["volume_ratio"]] = df[n["volume_ratio"]].fillna(1.0)
         df["obv_change"] = df["obv_change"].fillna(0.0)
         df["volume_trend"] = df["volume_trend"].fillna(1.0)
 
@@ -588,24 +564,25 @@ class FeatureEngine:
 
     def _add_trend(self, df: pd.DataFrame) -> pd.DataFrame:
         close = df["Close"]
+        tr, m, n = self._spec.cfg.trend, self._spec.cfg.momentum, self._spec.names   # W88d
 
         # Moving averages
-        df["sma_10"] = close.rolling(10).mean()
-        df["sma_20"] = close.rolling(20).mean()
-        df["sma_50"] = close.rolling(50).mean()
-        df["ema_12"] = close.ewm(span=12, adjust=False).mean()
-        df["ema_26"] = close.ewm(span=26, adjust=False).mean()
+        df[n["sma_fast"]] = close.rolling(tr.sma_fast).mean()
+        df[n["sma_mid"]] = close.rolling(tr.sma_mid).mean()
+        df[n["sma_slow"]] = close.rolling(tr.sma_slow).mean()
+        df[n["ema_fast"]] = close.ewm(span=m.macd_fast, adjust=False).mean()
+        df[n["ema_slow"]] = close.ewm(span=m.macd_slow, adjust=False).mean()
 
         # MA slopes (rate of change of the average)
-        df["sma_10_slope"] = df["sma_10"].pct_change(5)
-        df["sma_20_slope"] = df["sma_20"].pct_change(5)
+        df[n["slope_fast"]] = df[n["sma_fast"]].pct_change(tr.slope_period)
+        df[n["slope_mid"]] = df[n["sma_mid"]].pct_change(tr.slope_period)
 
         # Price vs MAs
-        df["price_vs_sma_20"] = (close - df["sma_20"]) / df["sma_20"]
-        df["price_vs_sma_50"] = (close - df["sma_50"]) / df["sma_50"]
+        df[n["px_vs_mid"]] = (close - df[n["sma_mid"]]) / df[n["sma_mid"]]
+        df[n["px_vs_slow"]] = (close - df[n["sma_slow"]]) / df[n["sma_slow"]]
 
         # MA crossover signal
-        df["sma_10_20_cross"] = (df["sma_10"] > df["sma_20"]).astype(float)
+        df[n["cross"]] = (df[n["sma_fast"]] > df[n["sma_mid"]]).astype(float)
 
         return df
 
@@ -641,25 +618,27 @@ class FeatureEngine:
         """
         close = df["Close"]
         volume = df["Volume"]
+        w, tr, vo, n = (self._spec.cfg.multi_timeframe, self._spec.cfg.trend, self._spec.cfg.volume,
+                        self._spec.names)                      # W88d: windows and derived column names
 
         # Weekly SMA trend (resample daily to weekly-equivalent with 5-day rolling)
-        weekly_close = close.rolling(5).mean()  # Simulated weekly close
-        weekly_sma = weekly_close.rolling(4).mean()  # ~4-week trend (20-day)
-        weekly_sma_prev = weekly_sma.shift(5)
+        weekly_close = close.rolling(w.weekly_close_window).mean()  # Simulated weekly close
+        weekly_sma = weekly_close.rolling(w.weekly_trend_window).mean()  # ~4-week trend (20-day)
+        weekly_sma_prev = weekly_sma.shift(w.weekly_trend_shift)
 
         # Weekly trend alignment: 1 = weekly trend up and daily up, -1 = both down, 0 = mixed
-        daily_trend = (close > df.get("sma_20", close.rolling(20).mean())).astype(float)
+        daily_trend = (close > df.get(n["sma_mid"], close.rolling(tr.sma_mid).mean())).astype(float)
         weekly_trend = (weekly_sma > weekly_sma_prev).astype(float)
         df["weekly_trend_aligned"] = daily_trend * weekly_trend + (1 - daily_trend) * (1 - weekly_trend)
 
         # Weekly RSI (using 5-day smoothed close)
-        df["weekly_rsi"] = self._rsi(weekly_close, 14)
+        df["weekly_rsi"] = self._rsi(weekly_close, w.weekly_rsi_period)
 
         # Weekly momentum (5-week / 25-day rate of change)
-        df["weekly_momentum"] = close.pct_change(25)
+        df["weekly_momentum"] = close.pct_change(w.weekly_momentum_period)
 
         # Volume confirmation: above-average volume on trend-direction days
-        avg_volume = volume.rolling(20).mean()
+        avg_volume = volume.rolling(vo.volume_avg_window).mean()
         daily_return = close.pct_change()
         # Volume confirmation = 1 if volume is above average AND price moved in trend direction
         vol_above_avg = (volume > avg_volume).astype(float)
@@ -680,17 +659,18 @@ class FeatureEngine:
         """
         close = df["Close"]
         log_returns = np.log(close / close.shift(1))
+        vr, v = self._spec.cfg.vol_regime, self._spec.cfg.volatility   # W88d: windows
 
         # Rolling realized vol at multiple horizons
-        vol_5 = log_returns.rolling(5).std() * np.sqrt(252)
-        vol_10 = log_returns.rolling(10).std() * np.sqrt(252)
-        vol_20 = log_returns.rolling(20).std() * np.sqrt(252)
-        vol_60 = log_returns.rolling(60).std() * np.sqrt(252)
+        vol_5 = log_returns.rolling(vr.fast).std() * np.sqrt(252)
+        vol_10 = log_returns.rolling(v.rv_short).std() * np.sqrt(252)
+        vol_20 = log_returns.rolling(v.rv_long).std() * np.sqrt(252)
+        vol_60 = log_returns.rolling(vr.slow).std() * np.sqrt(252)
 
         # IV Rank proxy: where is current 20-day vol relative to rolling range?
         # min_periods=20 so feature is valid after just 40 total rows (20 for vol_20 + 20 more)
-        vol_252_min = vol_20.rolling(252, min_periods=20).min()
-        vol_252_max = vol_20.rolling(252, min_periods=20).max()
+        vol_252_min = vol_20.rolling(vr.iv_rank_lookback, min_periods=vr.iv_rank_min_periods).min()
+        vol_252_max = vol_20.rolling(vr.iv_rank_lookback, min_periods=vr.iv_rank_min_periods).max()
         vol_range = (vol_252_max - vol_252_min).replace(0, np.nan)
         df["iv_rank"] = ((vol_20 - vol_252_min) / vol_range).clip(0, 1)
 
@@ -698,10 +678,10 @@ class FeatureEngine:
         df["vol_ratio"] = (vol_10 / vol_60.replace(0, np.nan)).clip(0, 3)
 
         # Vol trend: is volatility rising or falling? (5-day slope of 20-day vol)
-        df["vol_trend"] = vol_20.pct_change(5).clip(-1, 1)
+        df["vol_trend"] = vol_20.pct_change(vr.vol_trend_period).clip(-1, 1)
 
         # Volatility of volatility: how unstable is vol itself?
-        df["vol_of_vol"] = vol_20.rolling(20).std().clip(0, 1)
+        df["vol_of_vol"] = vol_20.rolling(vr.vol_of_vol_window).std().clip(0, 1)
 
         # Vol regime: expanding (short-term > long-term) = 1, compressing = 0
         df["vol_regime_expanding"] = (vol_5 > vol_20).astype(float)
