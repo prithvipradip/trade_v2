@@ -801,6 +801,28 @@ class WalkForwardTuningConfig(_StrictModel):
         return self
 
 
+class EngineTuningConfig(_StrictModel):
+    """W90c: constants of the research engine's LIVE path (iron condors) that were literals in ``Backtester`` and
+    ``pricing``: the IV-skew coefficients of the leg-pricing model, the look-back windows of the realized-vol and
+    IV-rank-rise entry gates, and the minimum history before the first decision. RESEARCH ONLY. Defaults = the
+    pre-W90c literals."""
+
+    put_skew_coefficient: float = Field(default=0.10, ge=0.0, le=2.0,
+        description="Legacy (pre-W5) put-skew term of the leg-IV model: skew_factor x (log-moneyness OTM) x this. The "
+                    "W5 measured steepening (skew_slope_per_pct_otm) is added on top.")
+    call_skew_coefficient: float = Field(default=0.02, ge=0.0, le=2.0,
+        description="Call-skew term of the leg-IV model: skew_factor x max(0, ln(K/S)) x this. Mild on purpose: the "
+                    "measured call-side slope was sign-unstable across symbols (W5), so there is no measured value.")
+    iv_rank_rise_lookback_rows: int = Field(default=11, ge=2, le=252,
+        description="Rows of the feature IV rank the rise veto looks at: the veto compares the last value with the "
+                    "one this many rows back minus one (11 rows = a 10-day rise).")
+    vol_gate_lookback_rows: int = Field(default=11, ge=3, le=252,
+        description="Rows of closes the realized-vol entry gate measures (11 closes = 10 daily returns).")
+    min_history_bars: int = Field(default=20, ge=5, le=252,
+        description="The engine takes no decision before this many bars of history (the larger of this and "
+                    "backtest.context_bars is skipped at the start).")
+
+
 class BacktestConfig(_StrictModel):
     @field_validator("default_symbols")
     @classmethod
@@ -1178,6 +1200,9 @@ class BacktestConfig(_StrictModel):
         description="W88b: constants of the engine's legacy / dormant paths (listed in full in the research overlay file).")
     objectives: ObjectivesConfig = Field(default_factory=ObjectivesConfig,
         description="W88b: constants of the Optuna objectives (composite weights, profit-factor cap).")
+    engine_tuning: EngineTuningConfig = Field(default_factory=EngineTuningConfig,
+        description="W90c: IV-skew coefficients, gate look-backs and the minimum history of the research engine "
+                    "(listed in full in the research overlay file).")
     walkforward_tuning: WalkForwardTuningConfig = Field(default_factory=WalkForwardTuningConfig,
         description="W88b: walk-forward / optimizer constants (warm start, adaptive range threshold, validation "
                     "split, inert-parameter probe).")
@@ -1452,7 +1477,35 @@ class FeaturesConfig(_StrictModel):
         return self
 
 
+class MetaLabelNeutralsConfig(_StrictModel):
+    """W90c: the neutral value each meta-label input takes when the feature (or the trade's record of it) is missing.
+    SHARED by live and research: the engine's entry gate, both training-data builders and the live entry snapshot
+    used to carry their own copies (the live snapshot read 0 for a missing column where the others read these).
+    Defaults = the pre-W90c literals; a "neutral" is the middle of the feature's usual range."""
+
+    rsi: float = Field(default=50.0, ge=0.0, le=100.0, description="Both RSI windows.")
+    bb_position: float = Field(default=0.5, ge=0.0, le=1.0, description="Position inside the Bollinger bands.")
+    volume_ratio: float = Field(default=1.0, ge=0.0, le=10.0, description="Volume / its average.")
+    realized_vol: float = Field(default=0.20, ge=0.0, le=5.0, description="Annualized realized volatility.")
+    atr_pct: float = Field(default=0.01, ge=0.0, le=1.0, description="ATR as a fraction of price.")
+    weekly_trend_aligned: float = Field(default=0.5, ge=0.0, le=1.0, description="Weekly-trend agreement flag.")
+    volume_confirmation: float = Field(default=0.0, ge=0.0, le=1.0, description="Volume-confirmation flag.")
+    macd_hist: float = Field(default=0.0, ge=-100.0, le=100.0, description="MACD histogram.")
+    px_vs_mid: float = Field(default=0.0, ge=-1.0, le=1.0, description="Price vs its mid-window SMA.")
+    cross: float = Field(default=0.5, ge=0.0, le=1.0, description="Fast/slow SMA cross state.")
+    vix_level: float = Field(default=0.5, ge=0.0, le=1.0, description="Scaled VIX level.")
+    iv_rank: float = Field(default=0.5, ge=0.0, le=1.0, description="IV rank (0-1).")
+    sentiment_score: float = Field(default=0.0, ge=-1.0, le=1.0,
+        description="Sentiment (the feed was retired in R12-C, so this is the value every row has).")
+    primary_confidence: float = Field(default=0.60, ge=0.0, le=1.0,
+        description="Primary-model confidence for a trade record that carries none (backtest builder).")
+    hour_of_day: int = Field(default=10, ge=0, le=23,
+        description="Entry hour for rows that carry no timestamp (backtest entries are effectively at the open).")
+
+
 class MLConfig(_StrictModel):
+    meta_label_neutrals: MetaLabelNeutralsConfig = Field(default_factory=MetaLabelNeutralsConfig,
+        description="W90c: neutral values of missing meta-label inputs (shared by live and research).")
     features: FeaturesConfig = Field(default_factory=FeaturesConfig,
         description="W88d: indicator windows of the core feature groups (defaults = the pre-W88d literals).")
     hyperparams: TreeHyperparamsConfig = Field(default_factory=TreeHyperparamsConfig,
@@ -1587,6 +1640,13 @@ class MetaLabelConfig(_StrictModel):
     enabled: bool = False
     min_probability: float = Field(default=0.50, ge=0.30, le=0.80)
     retrain_with_primary: bool = True  # Retrain when primary model retrains
+    min_feature_coverage: int = Field(default=15, ge=1, le=20,
+        description="W90c: of the 20 meta-label inputs, at least this many must carry real (non-constant) data "
+                    "before a freshly trained model is armed (R16 arm guard: the 07-18 artifact was trained on 9 "
+                    "of 20 and rejected everything). Was MIN_FEATURE_COVERAGE = 15.")
+    max_artifact_age_days: int = Field(default=45, ge=1, le=3650,
+        description="W90c: a saved meta-label model older than this is stale and refused at load. Was "
+                    "MAX_ARTIFACT_AGE_DAYS = 45.")
     min_closes_to_enable: int = Field(default=100, ge=30, le=500,
         description="Real, verdict-eligible closed trades (the same population "
                     "reporting.go_live.real_close_count/the go-live scorecard grades) "
@@ -2464,6 +2524,23 @@ def loaded_cash_yield() -> float:
         return float(load_settings().options.risk_free_rate)
     except Exception:  # noqa: BLE001 - no config.yaml -> the schema default
         return float(DEFAULT_RISK_FREE_RATE)
+
+
+def loaded_engine_tuning() -> "EngineTuningConfig":
+    """W90c: ``backtest.engine_tuning`` of the loaded settings (the frozen research view inside a research process),
+    else the schema defaults."""
+    try:
+        return load_settings().backtest.engine_tuning
+    except Exception:  # noqa: BLE001 - no config.yaml -> the schema defaults
+        return EngineTuningConfig()
+
+
+def loaded_meta_label_neutrals() -> "MetaLabelNeutralsConfig":
+    """W90c: ``ml.meta_label_neutrals`` of the loaded settings, else the schema defaults."""
+    try:
+        return load_settings().ml.meta_label_neutrals
+    except Exception:  # noqa: BLE001 - no config.yaml -> the schema defaults
+        return MetaLabelNeutralsConfig()
 
 
 def resolve_max_contracts_per_trade(explicit, settings) -> int:

@@ -542,10 +542,10 @@ class TestMetaLabeler:
         # 2026-07-18; the coverage guard now refuses instead of silently
         # fitting a crippled model. Arming the meta-labeler therefore needs
         # entry_signals populated FIRST (see PLAN 2026-08-10).
-        from ait.ml.meta_label import MIN_FEATURE_COVERAGE
+        from ait.config.settings import MetaLabelConfig
         assert result == {}, (
             "training must REFUSE below the feature-coverage floor "
-            f"({MIN_FEATURE_COVERAGE}/20); got {result}")
+            f"({MetaLabelConfig().min_feature_coverage}/20); got {result}")
 
     def test_train_arms_once_feature_coverage_is_restored(self, tmp_path,
                                                           monkeypatch):
@@ -554,8 +554,9 @@ class TestMetaLabeler:
         Guards against the refusal becoming permanent-by-accident (the exact
         failure mode of the 07-18 quarantine itself)."""
         import ait.ml.meta_label as mlmod
-        monkeypatch.setattr(mlmod, "MIN_FEATURE_COVERAGE", 5)
-        ml = mlmod.MetaLabeler()
+        from ait.config.settings import MetaLabelConfig
+        # W90c: the coverage floor is meta_label.min_feature_coverage, not a module constant
+        ml = mlmod.MetaLabeler(meta_label_config=MetaLabelConfig(min_feature_coverage=5))
         import pandas as pd
         import numpy as np
         rng = np.random.default_rng(7)

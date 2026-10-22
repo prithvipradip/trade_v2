@@ -18,6 +18,7 @@ import yaml
 from ait.config.settings import (
     DEFAULT_RISK_FREE_RATE,
     BacktestConfig,
+    EngineTuningConfig,
     LearnerConfig,
     LegacyEngineConfig,
     ObjectivesConfig,
@@ -373,7 +374,7 @@ class TestRiskFreeRateSingleSource:
 
 class TestResearchYamlIsComplete:
     BLOCKS = {"learner": LearnerConfig, "legacy_engine": LegacyEngineConfig, "objectives": ObjectivesConfig,
-              "walkforward_tuning": WalkForwardTuningConfig}
+              "walkforward_tuning": WalkForwardTuningConfig, "engine_tuning": EngineTuningConfig}   # W90c: + engine_tuning
     raw = yaml.safe_load((ROOT / "config_research.yaml").read_text())
 
     @pytest.mark.parametrize("block", sorted(BLOCKS))
@@ -408,8 +409,8 @@ class TestResearchYamlIsComplete:
 
 def test_backtest_config_exposes_the_new_blocks():
     b = BacktestConfig()
-    assert (b.learner, b.legacy_engine, b.objectives, b.walkforward_tuning) == (
-        LearnerConfig(), LegacyEngineConfig(), ObjectivesConfig(), WalkForwardTuningConfig())
+    assert (b.learner, b.legacy_engine, b.objectives, b.walkforward_tuning, b.engine_tuning) == (
+        LearnerConfig(), LegacyEngineConfig(), ObjectivesConfig(), WalkForwardTuningConfig(), EngineTuningConfig())
 
 
 # --------------------------------------------------------------------------

@@ -55,7 +55,7 @@ class TestSharedPricing:
         iv = float(rng.uniform(0.08, 0.6)); sf = float(rng.uniform(0, 2))
         slope = float(rng.uniform(0, 0.15)); floor = float(rng.uniform(0.01, 0.25))
         for opt in (OptionType.CALL, OptionType.PUT):
-            assert skewed_leg_iv(iv, K, S, opt, sf, slope, floor) == _legacy_leg_iv(
+            assert skewed_leg_iv(iv, K, S, opt, sf, slope, floor, 0.10, 0.02) == _legacy_leg_iv(
                 iv, K, S, opt, sf, slope, floor)
 
     @pytest.mark.parametrize("seed", range(15))
@@ -64,7 +64,7 @@ class TestSharedPricing:
         S = float(rng.uniform(80, 700)); w = float(rng.uniform(1, 15))
         sc = S * 1.02; sp = S * 0.98
         t = float(rng.uniform(0.001, 0.2)); iv = float(rng.uniform(0.1, 0.5))
-        got = ic_leg_marks(S, sc, sp, sc + w, sp - w, t, 0.05, iv, 1.0, 0.0736, 0.05)
+        got = ic_leg_marks(S, sc, sp, sc + w, sp - w, t, 0.05, iv, 1.0, 0.0736, 0.05, 0.10, 0.02)
         ref = (
             black_scholes_price(S, sc, t, 0.05, _legacy_leg_iv(iv, sc, S, OptionType.CALL, 1.0, 0.0736, 0.05), OptionType.CALL),
             black_scholes_price(S, sp, t, 0.05, _legacy_leg_iv(iv, sp, S, OptionType.PUT, 1.0, 0.0736, 0.05), OptionType.PUT),
@@ -82,12 +82,12 @@ class TestSharedPricing:
                         macro_event_gate=False, allow_live_model_fallback=False,
                         skew_factor=1.3, skew_slope_per_pct_otm=0.09, iv_floor=0.07)
         assert bt._get_leg_iv(0.21, 97.0, 100.0, OptionType.PUT) == skewed_leg_iv(
-            0.21, 97.0, 100.0, OptionType.PUT, 1.3, 0.09, 0.07)
+            0.21, 97.0, 100.0, OptionType.PUT, 1.3, 0.09, 0.07, 0.10, 0.02)
         pos = {"short_call_strike": 104.0, "short_put_strike": 96.0,
                "long_call_strike": 107.0, "long_put_strike": 93.0, "entry_iv": 0.2}
         got = bt._reprice_ic_legs(pos, 100.0, 3, None)
         t = max(max(14 - 3, 0) / 365.0, 0.0001)
-        assert got == ic_leg_marks(100.0, 104.0, 96.0, 107.0, 93.0, t, 0.05, 0.2, 1.3, 0.09, 0.07)
+        assert got == ic_leg_marks(100.0, 104.0, 96.0, 107.0, 93.0, t, 0.05, 0.2, 1.3, 0.09, 0.07, 0.10, 0.02)
 
     def test_ast_guard_condor_pricing_has_one_owner(self):
         """No function in engine.py may price the four condor legs by hand again:

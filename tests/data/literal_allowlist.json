@@ -39,6 +39,13 @@
    "category": "structural",
    "note": "report threshold for a flat DTE dimension"
   },
+  "src/ait/backtesting/engine.py::<module>": {
+   "values": [
+    0.99
+   ],
+   "category": "structural",
+   "note": "_DRAWDOWN_GATE_OFF_FLOOR -0.99: the on/off representation of pct_from_60d_high_threshold = -1.0 (the threshold itself is a setting) (W90c)"
+  },
   "src/ait/backtesting/engine.py::Backtester": {
    "values": [
     0.01,
@@ -86,22 +93,6 @@
    ],
    "category": "dormant_path",
    "note": "legacy fallback direction: 5/20-day return lookbacks (weights are backtest.legacy_engine)"
-  },
-  "src/ait/backtesting/engine.py::Backtester.run": {
-   "values": [
-    0.01,
-    0.2,
-    0.99,
-    11,
-    11,
-    11,
-    11,
-    20,
-    50.0,
-    50.0
-   ],
-   "category": "registered_followup",
-   "note": "feature fallback values (50.0 RSI, 0.20 vol, 0.01 ATR), the iv-rank-rise 11-row lookback and the 0.99 pct-from-high sentinel; registered in W88 (fallbacks move with derived names in W88d)"
   },
   "src/ait/backtesting/engine.py::_session_close": {
    "values": [
@@ -160,21 +151,6 @@
    "category": "structural",
    "note": "named, documented constants of the research IV proxy (W87a)"
   },
-  "src/ait/backtesting/iv_rank_compare.py::<module>": {
-   "values": [
-    15.0,
-    85.0
-   ],
-   "category": "registered_followup",
-   "note": "live's iv-rank floor 15 / cap 85 repeated for a research comparison; should read the env contract"
-  },
-  "src/ait/backtesting/iv_rank_compare.py::veto_vs_live": {
-   "values": [
-    0.3
-   ],
-   "category": "structural",
-   "note": "comparison threshold for the research iv-rank-rise veto (0.30 = backtest.iv_rank_rise_threshold)"
-  },
   "src/ait/backtesting/iv_surface.py::<module>": {
    "values": [
     0.01,
@@ -215,14 +191,6 @@
    ],
    "category": "structural",
    "note": "default realized-vol window (callers pass the window)"
-  },
-  "src/ait/backtesting/pricing.py::skewed_leg_iv": {
-   "values": [
-    0.02,
-    0.1
-   ],
-   "category": "registered_followup",
-   "note": "skew adjustment coefficients 0.10 / 0.02 of the leg-IV model"
   },
   "src/ait/backtesting/replay.py::<module>": {
    "values": [
@@ -562,43 +530,6 @@
    ],
    "category": "registered_followup",
    "note": "positive-rate guards 0.05 / 0.98 (W87a shared; warning-only)"
-  },
-  "src/ait/ml/meta_label.py::<module>": {
-   "values": [
-    15,
-    45
-   ],
-   "category": "registered_followup",
-   "note": "MIN_FEATURE_COVERAGE 15 and MAX_ARTIFACT_AGE_DAYS 45 of the live meta-labeler"
-  },
-  "src/ait/ml/meta_label.py::MetaLabeler.build_training_data": {
-   "values": [
-    0.01,
-    0.2,
-    50.0,
-    50.0
-   ],
-   "category": "registered_followup",
-   "note": "feature fallback values for training rows"
-  },
-  "src/ait/ml/meta_label.py::MetaLabeler.build_training_data_from_backtest": {
-   "values": [
-    0.01,
-    0.2,
-    0.6,
-    50.0,
-    50.0
-   ],
-   "category": "registered_followup",
-   "note": "feature fallback values for training rows"
-  },
-  "src/ait/ml/meta_label.py::MetaLabeler.build_training_data_from_backtest._regime_flags": {
-   "values": [
-    0.02,
-    0.02
-   ],
-   "category": "registered_followup",
-   "note": "regime thresholds +/-2% used when a trade carries no regime"
   },
   "src/ait/ml/range_predictor.py::RangePredictor.__init__": {
    "values": [

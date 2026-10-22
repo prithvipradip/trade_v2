@@ -67,6 +67,7 @@ def main(argv: list[str] | None = None) -> int:
     use_research_config()
     bt = load_settings().backtest
     skew_f, skew_s, floor = float(bt.skew_factor), float(bt.skew_slope_per_pct_otm), float(bt.iv_floor)
+    put_c, call_c = float(bt.engine_tuning.put_skew_coefficient), float(bt.engine_tuning.call_skew_coefficient)   # W90c
 
     print("loading bars / building surface (cached) ...", flush=True)
     surf = build_or_load(args.db, args.underlying, args.cache)
@@ -106,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
             if s_iv is None:
                 continue
             cover[band][0] += 1
-            l_iv = skewed_leg_iv(base_iv, K, S, opt, skew_f, skew_s, floor)
+            l_iv = skewed_leg_iv(base_iv, K, S, opt, skew_f, skew_s, floor, put_c, call_c)
             actual_iv = float(r.iv)
             act_px = float(r.close)
             absm = abs(math.log(K / S))

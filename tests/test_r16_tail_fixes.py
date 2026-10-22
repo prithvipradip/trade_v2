@@ -668,7 +668,7 @@ class TestMetaLabelQuarantine:
         art = tmp_path / "meta_label.pkl"
         art.write_bytes(b"not-a-real-pickle")
         old = (datetime.now()
-               - timedelta(days=_ml.MAX_ARTIFACT_AGE_DAYS + 10)).timestamp()
+               - timedelta(days=_ml.MetaLabelConfig().max_artifact_age_days + 10)).timestamp()
         os.utime(art, (old, old))
         m = _ml.MetaLabeler()
         with structlog_events() as events:

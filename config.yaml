@@ -388,6 +388,9 @@ ml:
     subsample: 0.8
     colsample_bytree: 0.8
     random_state: 42
+  # W90c: the neutral value a missing meta-label input takes (SHARED by live and research; were literals in the engine's
+  # entry gate, both training-data builders and the live entry snapshot -- which used 0 for a missing column).
+  meta_label_neutrals: {rsi: 50.0, bb_position: 0.5, volume_ratio: 1.0, realized_vol: 0.20, atr_pct: 0.01, weekly_trend_aligned: 0.5, volume_confirmation: 0.0, macd_hist: 0.0, px_vs_mid: 0.0, cross: 0.5, vix_level: 0.5, iv_rank: 0.5, sentiment_score: 0.0, primary_confidence: 0.60, hour_of_day: 10}
   meta_label_hyperparams:              # the meta-labeler: shallower, unseeded, on purpose
     n_estimators: 100
     max_depth: 3
@@ -426,6 +429,8 @@ meta_label:
   enabled: false                       # Disabled: trained on corrupted data, rejects everything. See min_closes_to_enable below before re-enabling.
   min_probability: 0.50                # Min P(profitable) to take a trade (0.30-0.80)
   retrain_with_primary: true           # Retrain when primary model retrains
+  min_feature_coverage: 15             # of the 20 inputs, this many must carry real data before a new model is armed (W90c)
+  max_artifact_age_days: 45            # a saved model older than this is stale and refused at load (W90c)
   # W49 (policy-vs-impl-7): the ONE close-count policy number -- config.yaml
   # used to say 50 here, PLAN.md's tracking table said 100+, and neither was
   # ever enforced in code. Real live entries stay ungated by this model until

@@ -197,6 +197,14 @@ backtest:
     drawdown_penalty: 0.2
     profit_factor_cap: 10.0            # the profit_factor objective is min(PF, this)
 
+  # --- W90c: constants of the research engine's live (iron-condor) path ---
+  engine_tuning:
+    put_skew_coefficient: 0.10         # leg-IV model: skew_factor x ln-moneyness OTM x this (the W5 measured slope is added on top)
+    call_skew_coefficient: 0.02        # ... the call side (mild: the measured call slope is sign-unstable)
+    iv_rank_rise_lookback_rows: 11     # rows the IV-rank-rise veto looks at (11 = a 10-day rise)
+    vol_gate_lookback_rows: 11         # closes the realized-vol entry gate measures (11 = 10 returns)
+    min_history_bars: 20               # no decision before this many bars of history
+
   # --- walk-forward / optimizer constants ---
   walkforward_tuning:
     warm_start_min_win_rate: 0.75      # warm-start a window's study from the PRIOR window's best params only above this OOS win rate

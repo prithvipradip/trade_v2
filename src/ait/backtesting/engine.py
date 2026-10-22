@@ -97,6 +97,11 @@ DEBIT_STRATEGIES = {"long_call", "long_put", "bull_call_spread", "bear_put_sprea
 # previously missing from every tuple, which made those arms either
 # zero-trade (blocked by the directional-confidence gate that NEUTRAL@0.4
 # can never pass) or, when ML emitted NEUTRAL>=0.55, completely ungated.
+# The drawdown-from-60d-high gate is OFF at its documented -1.0 (never below it). The test is "above this floor", a hair
+# inside -1.0 so a threshold of exactly -1.0 (and float noise around it) reads as disabled. Not a tunable: it is the
+# on/off switch's representation, the threshold itself is backtest.pct_from_60d_high_threshold.
+_DRAWDOWN_GATE_OFF_FLOOR = -0.99
+
 NEUTRAL_CREDIT_GATED = (
     "iron_condor", "iron_butterfly", "wide_wing_condor", "broken_wing_condor",
     "short_strangle", "jade_lizard", "call_credit_spread",
@@ -111,7 +116,9 @@ NEUTRAL_CREDIT_GATED = (
 # `_resolve_setting(...)` call in this file needs no change.
 from ait.config.settings import (
     DEFAULT_RISK_FREE_RATE,
+    EngineTuningConfig,
     LegacyEngineConfig,
+    MetaLabelNeutralsConfig,
     resolve_account_capital,
     resolve_position_size_pct,
 )
@@ -582,6 +589,11 @@ class Backtester:
         # margin, thesis exit, vol-regime ratio) come from backtest.legacy_engine, not inline literals.
         self._legacy = (getattr(getattr(_settings, "backtest", None), "legacy_engine", None)
                         or LegacyEngineConfig())   # a stub settings object degrades to the schema defaults
+        # W90c: the skew coefficients, the gate look-backs and the minimum history (backtest.engine_tuning) and the
+        # neutral values of missing meta-label inputs (ml.meta_label_neutrals, shared with live)
+        self._eng = (getattr(getattr(_settings, "backtest", None), "engine_tuning", None) or EngineTuningConfig())
+        self._neutrals = (getattr(getattr(_settings, "ml", None), "meta_label_neutrals", None)
+                          or MetaLabelNeutralsConfig())
         # W88d: the feature column names the engine reads (price_vs_sma_20, rsi_14, ...) follow ml.features
         self._fspec = spec_from_config(getattr(getattr(_settings, "ml", None), "features", None))
         self._pct_from_60d_high_threshold = pct_from_60d_high_threshold
@@ -869,7 +881,7 @@ class Backtester:
             strategies=self._strategies,
         )
 
-        lookback = max(20, self._context_bars)
+        lookback = max(self._eng.min_history_bars, self._context_bars)     # W90c: was max(20, ...)
 
         for i in range(lookback, len(dates)):
             today = dates[i]
@@ -1034,8 +1046,9 @@ class Backtester:
                 if not features_df.empty:
                     last_f = features_df.iloc[-1]
                     fn = self._fspec.names           # W88d: window-bearing column names follow ml.features
+                    nz = self._fspec.meta_neutral_values(self._neutrals)   # W90c: ml.meta_label_neutrals, keyed by column
                     vol_exp = float(last_f.get("vol_regime_expanding", 0.0)) > 0.5
-                    px_sma  = float(last_f.get(fn["px_vs_mid"], 0.0))
+                    px_sma  = float(last_f.get(fn["px_vs_mid"], nz[fn["px_vs_mid"]]))
                     meta_ctx.update({
                         # W81: the class thresholds are backtest.regime_{down,up}_threshold
                         # (were bare -0.05 / 0.02 here, in the veto and in entry_regime).
@@ -1043,22 +1056,14 @@ class Backtester:
                         "regime_trending_down":  1.0 if (vol_exp and px_sma < self._regime_down) else 0.0,
                         "regime_high_vol":       1.0 if (vol_exp and self._regime_down <= px_sma <= self._regime_up) else 0.0,
                         "regime_range_bound":    0.0 if vol_exp else 1.0,
-                        "vix":                   float(last_f.get("vix_level", 0.5)),
-                        "iv_rank":               float(last_f.get("iv_rank", 0.5)),
-                        fn["rsi_long"]:          float(last_f.get(fn["rsi_long"], 50.0)),
-                        fn["rsi_short"]:         float(last_f.get(fn["rsi_short"],  50.0)),
-                        "bb_position":           float(last_f.get("bb_position", 0.5)),
-                        fn["volume_ratio"]:      float(last_f.get(fn["volume_ratio"], 1.0)),
-                        fn["rv_long"]:           float(last_f.get(fn["rv_long"], 0.20)),
-                        "atr_pct":               float(last_f.get("atr_pct", 0.01)),
-                        "weekly_trend_aligned":  float(last_f.get("weekly_trend_aligned", 0.5)),
-                        "volume_confirmation":   float(last_f.get("volume_confirmation", 0.0)),
-                        "macd_hist":             float(last_f.get("macd_hist", 0.0)),
+                        "vix":                   float(last_f.get("vix_level", self._neutrals.vix_level)),
+                        "iv_rank":               float(last_f.get("iv_rank", self._neutrals.iv_rank)),
+                        **{col: float(last_f.get(col, default)) for col, default in nz.items()
+                           if col != fn["px_vs_mid"]},
                         fn["px_vs_mid"]:         px_sma,
-                        fn["cross"]:             float(last_f.get(fn["cross"], 0.5)),
                     })
-                meta_ctx.setdefault("sentiment_score", 0.0)
-                meta_ctx.setdefault("hour_of_day", 10)
+                meta_ctx.setdefault("sentiment_score", self._neutrals.sentiment_score)
+                meta_ctx.setdefault("hour_of_day", self._neutrals.hour_of_day)
                 try:
                     meta_signal = self._meta_labeler.predict(meta_ctx)
                     if meta_signal is not None:
@@ -1238,8 +1243,9 @@ class Backtester:
             # Realized-vol entry gate: neutral credit structures cannot profit
             # during high-volatility regimes (e.g. tariff shocks, VIX > 40).
             if strategy in NEUTRAL_CREDIT_GATED:
-                recent_close = hist_dec["Close"].iloc[-11:]
-                if len(recent_close) >= 11:
+                _vg_rows = self._eng.vol_gate_lookback_rows      # W90c: was 11 (10 returns)
+                recent_close = hist_dec["Close"].iloc[-_vg_rows:]
+                if len(recent_close) >= _vg_rows:
                     vol_10d = recent_close.pct_change().std() * (252 ** 0.5)
                     _entry_decision["vol_gate"] = {
                         "vol_10d": round(float(vol_10d), 4),
@@ -1266,8 +1272,9 @@ class Backtester:
             # W71c: backtest.iv_rank_rise_gate=False skips the VETO only (research-only gate; live
             # has none): the rise is still computed and recorded so a study can evaluate it later.
             if strategy in NEUTRAL_CREDIT_GATED and not features_df.empty:
-                if "iv_rank" in features_df.columns and len(features_df) >= 11:
-                    iv_rank_series = features_df["iv_rank"].iloc[-11:]
+                _ir_rows = self._eng.iv_rank_rise_lookback_rows      # W90c: was 11 (a 10-day rise)
+                if "iv_rank" in features_df.columns and len(features_df) >= _ir_rows:
+                    iv_rank_series = features_df["iv_rank"].iloc[-_ir_rows:]
                     iv_rank_rise = float(iv_rank_series.iloc[-1]) - float(iv_rank_series.iloc[0])
                     _entry_decision["iv_rank_rise_10d"] = round(iv_rank_rise, 4)
                     if self._iv_rank_rise_gate and iv_rank_rise > self._iv_rank_rise_threshold:
@@ -1294,7 +1301,7 @@ class Backtester:
             # NEUTRAL_CREDIT_GATED, so an activated threshold gave the
             # iron_condor baseline a drawdown veto the butterfly/wide/broken/
             # jade/ccs arms silently skipped, biasing any promotion study.
-            if strategy in NEUTRAL_CREDIT_GATED and self._pct_from_60d_high_threshold > -0.99:
+            if strategy in NEUTRAL_CREDIT_GATED and self._pct_from_60d_high_threshold > _DRAWDOWN_GATE_OFF_FLOOR:
                 _close_series = hist_dec["Close"]
                 _rolling_high = _close_series.rolling(min(60, len(_close_series))).max().iloc[-1]
                 if _rolling_high and _rolling_high > 0:
@@ -2048,7 +2055,8 @@ class Backtester:
         # W72: the arithmetic lives in pricing.skewed_leg_iv (the parity replay
         # calls the same function); this method only supplies the engine's knobs.
         return skewed_leg_iv(base_iv, strike, underlying, option_type, self._skew_factor,
-                             self._skew_slope_per_pct_otm, self._iv_floor)
+                             self._skew_slope_per_pct_otm, self._iv_floor,
+                             self._eng.put_skew_coefficient, self._eng.call_skew_coefficient)
 
     def _options_half_spread(self, iv: float, dte: int) -> float:
         """Compute the per-leg half bid-ask spread for an OTM option.
@@ -2147,6 +2155,8 @@ class Backtester:
     _research_table_prefix: str = "research_"
     _risk_free_rate: float = DEFAULT_RISK_FREE_RATE
     _legacy: LegacyEngineConfig = LegacyEngineConfig()      # W88b: a partial engine keeps the schema defaults
+    _eng: EngineTuningConfig = EngineTuningConfig()         # W90c: ... and the engine-tuning defaults
+    _neutrals: MetaLabelNeutralsConfig = MetaLabelNeutralsConfig()
     _fspec: FeatureSpec = spec_from_config(None)            # W88d: feature windows / column names (schema defaults)
     _settlement_stats: dict | None = None
 
@@ -2596,7 +2606,8 @@ class Backtester:
             else:
                 short_call_price, short_put_price, long_call_price, long_put_price = ic_leg_marks(
                     S, short_call_strike, short_put_strike, long_call_strike, long_put_strike,
-                    t, r, iv, self._skew_factor, self._skew_slope_per_pct_otm, self._iv_floor)
+                    t, r, iv, self._skew_factor, self._skew_slope_per_pct_otm, self._iv_floor,
+                    self._eng.put_skew_coefficient, self._eng.call_skew_coefficient)
 
             # Net credit received at mid prices
             net_credit = (short_call_price + short_put_price) - (long_call_price + long_put_price)
@@ -3195,7 +3206,8 @@ class Backtester:
         return ic_leg_marks(
             underlying, pos["short_call_strike"], pos["short_put_strike"],
             pos["long_call_strike"], pos["long_put_strike"], t, r, iv,
-            self._skew_factor, self._skew_slope_per_pct_otm, self._iv_floor)
+            self._skew_factor, self._skew_slope_per_pct_otm, self._iv_floor,
+            self._eng.put_skew_coefficient, self._eng.call_skew_coefficient)
 
     def _reprice_position(self, pos: dict, underlying: float, days_held: int,
                           hist: pd.DataFrame | None = None,

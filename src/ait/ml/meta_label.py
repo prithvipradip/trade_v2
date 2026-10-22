@@ -31,6 +31,12 @@ from ait.ml.hyperparams import (  # W88c: the tree profile is a setting, recorde
     model_spec,
     warn_on_spec_mismatch,
 )
+from ait.config.settings import (
+    BacktestConfig,
+    MetaLabelConfig,
+    MetaLabelNeutralsConfig,
+    loaded_meta_label_neutrals,
+)
 from ait.ml.feature_spec import FeatureSpec, default_feature_spec, spec_from_config
 from ait.utils.logging import get_logger
 from ait.utils.time import parse_trade_ts
@@ -78,8 +84,30 @@ def _model_path() -> Path:
 #      go stale again, then delete meta_label.pkl.clobbered_20260718.
 # Alternative, equally acceptable: DELETE the meta-labeler. It is dead config
 # in an iron-condor-only book.
-MIN_FEATURE_COVERAGE = 15   # of the 20 META_FEATURES, else refuse to arm
-MAX_ARTIFACT_AGE_DAYS = 45  # loaded artifact older than this = stale, refuse
+# W90c: the two limits that were module constants here (MIN_FEATURE_COVERAGE = 15: of the 20 META_FEATURES, else refuse
+# to arm; MAX_ARTIFACT_AGE_DAYS = 45: an older loaded artifact is stale, refuse) are ``meta_label.min_feature_coverage``
+# and ``meta_label.max_artifact_age_days`` in config.yaml; a MetaLabeler resolves them once at construction.
+
+
+def _loaded_meta_label_config() -> MetaLabelConfig:
+    """``meta_label`` of the loaded settings, else the schema defaults."""
+    try:
+        from ait.config.settings import load_settings
+        return load_settings().meta_label
+    except Exception:  # noqa: BLE001 - no config.yaml -> the schema defaults
+        return MetaLabelConfig()
+
+
+def _loaded_regime_thresholds() -> tuple[float, float]:
+    """``(backtest.regime_down_threshold, backtest.regime_up_threshold)``: the engine's trending-down / trending-up
+    classes, which the meta-labeler's regime fallback must agree with (W90c, D3: it used its own +-0.02)."""
+    try:
+        from ait.config.settings import load_settings
+        b = load_settings().backtest
+        return float(b.regime_down_threshold), float(b.regime_up_threshold)
+    except Exception:  # noqa: BLE001 - no config.yaml -> the schema defaults
+        d = BacktestConfig.model_fields
+        return float(d["regime_down_threshold"].default), float(d["regime_up_threshold"].default)
 
 # Minimum trades needed before the meta-labeler has enough signal
 MIN_TRADES_FOR_TRAINING = 30
@@ -90,13 +118,20 @@ MIN_TRADES_FOR_TRAINING = 30
 META_FEATURES = spec_from_config(None).meta_feature_names()
 
 
-def live_technical_features(last_row, names: dict) -> dict:
+def live_technical_features(last_row, names: dict, neutrals: "MetaLabelNeutralsConfig | None" = None) -> dict:
     """The eleven technical meta-label inputs the LIVE orchestrator snapshots at entry, from the last feature row.
 
     W88d: the keys of the six window-bearing ones come from the feature spec's ``names`` (``rsi_14`` at the default
-    windows), so the snapshot, the meta-labeler's training columns and the trained model agree. Missing columns read 0."""
+    windows), so the snapshot, the meta-labeler's training columns and the trained model agree.
+
+    W90c (D2): a missing column reads its ``ml.meta_label_neutrals`` value (RSI 50, vol 0.20, ...), the same number the
+    engine's entry gate and the training-data builders use; it read 0 here, so a snapshot with an absent column
+    disagreed with how the model was trained."""
+    neutral = FeatureSpec(cfg=None, names=names).meta_neutral_values(
+        neutrals if neutrals is not None else loaded_meta_label_neutrals())
+
     def f(col: str) -> float:
-        return float(last_row.get(col, 0))
+        return float(last_row.get(col, neutral[col]))
     return {
         names["rsi_long"]: f(names["rsi_long"]),
         names["rsi_short"]: f(names["rsi_short"]),
@@ -129,8 +164,19 @@ class MetaLabeler:
     """
 
     def __init__(self, min_probability: float = 0.50, hyperparams=None,
-                 feature_spec: "FeatureSpec | None" = None) -> None:
+                 feature_spec: "FeatureSpec | None" = None,
+                 neutrals: "MetaLabelNeutralsConfig | None" = None,
+                 meta_label_config: "MetaLabelConfig | None" = None,
+                 regime_thresholds: "tuple[float, float] | None" = None) -> None:
         self._min_probability = min_probability
+        # W90c: neutral values of missing inputs (ml.meta_label_neutrals), the arm-guard coverage floor and the
+        # artifact-age limit (meta_label.*), and the regime fallback's thresholds (backtest.regime_*) are settings
+        self._neutrals = neutrals if neutrals is not None else loaded_meta_label_neutrals()
+        _ml_cfg = meta_label_config if meta_label_config is not None else _loaded_meta_label_config()
+        self._min_feature_coverage = int(_ml_cfg.min_feature_coverage)
+        self._max_artifact_age_days = int(_ml_cfg.max_artifact_age_days)
+        self._regime_down, self._regime_up = (regime_thresholds if regime_thresholds is not None
+                                              else _loaded_regime_thresholds())
         # W88d: the 20 inputs (and the window-bearing names among them) follow ml.features
         self._fspec = feature_spec if feature_spec is not None else default_feature_spec()
         self._meta_features = self._fspec.meta_feature_names()
@@ -228,13 +274,13 @@ class MetaLabeler:
             f for f in available
             if trades_df[f].notna().any() and trades_df[f].nunique(dropna=True) > 1
         ]
-        if len(live_cols) < MIN_FEATURE_COVERAGE:
+        if len(live_cols) < self._min_feature_coverage:
             log.error(
                 "meta_label_arm_refused",
                 reason="insufficient_feature_coverage",
                 informative_features=len(live_cols),
                 present_features=len(available),
-                required=MIN_FEATURE_COVERAGE,
+                required=self._min_feature_coverage,
                 expected=len(self._meta_features),
                 dead_or_constant=[f for f in available if f not in live_cols],
                 impact="NOT arming the meta-label gate — this is the "
@@ -362,6 +408,8 @@ class MetaLabeler:
         if not trades or features_df.empty:
             return pd.DataFrame()
         n = self._fspec.names               # W88d: window-bearing column names follow ml.features
+        nz = self._fspec.meta_neutral_values(self._neutrals)      # W90c: ml.meta_label_neutrals, keyed by column
+        zn = self._neutrals
 
         # Normalise features_df index to plain date objects for O(1) lookup
         try:
@@ -383,10 +431,11 @@ class MetaLabeler:
                 )
             if feat_row is not None:
                 vol_exp = float(feat_row.get("vol_regime_expanding", 0.0)) > 0.5
-                px_sma  = float(feat_row.get(n["px_vs_mid"], 0.0))
+                px_sma  = float(feat_row.get(n["px_vs_mid"], nz[n["px_vs_mid"]]))
                 if vol_exp:
-                    if px_sma > 0.02:  return (1.0, 0.0, 0.0, 0.0)
-                    if px_sma < -0.02: return (0.0, 1.0, 0.0, 0.0)
+                    # W90c (D3): the engine's trending classes (backtest.regime_{up,down}_threshold), not a private +-0.02
+                    if px_sma > self._regime_up:   return (1.0, 0.0, 0.0, 0.0)
+                    if px_sma < self._regime_down: return (0.0, 1.0, 0.0, 0.0)
                     return (0.0, 0.0, 1.0, 0.0)
                 return (0.0, 0.0, 0.0, 1.0)
             return (0.0, 0.0, 0.0, 1.0)  # default: range_bound
@@ -424,30 +473,21 @@ class MetaLabeler:
                 return default
 
             rows.append({
-                "primary_confidence":   trade.get("entry_confidence", 0.60),
+                "primary_confidence":   trade.get("entry_confidence", zn.primary_confidence),
                 "regime_trending_up":   reg_tu,
                 "regime_trending_down": reg_td,
                 "regime_high_vol":      reg_hv,
                 "regime_range_bound":   reg_rb,
-                "vix":                  trade.get("entry_vix_level", _fv("vix_level", 0.5)),
-                "iv_rank":              trade.get("entry_iv_rank",   _fv("iv_rank",   0.5)),
-                "sentiment_score":      0.0,  # not available in backtest
-                n["rsi_long"]:          _fv(n["rsi_long"],       50.0),
-                n["rsi_short"]:         _fv(n["rsi_short"],      50.0),
-                "bb_position":          _fv("bb_position",       0.5),
-                n["volume_ratio"]:      _fv(n["volume_ratio"],   1.0),
-                n["rv_long"]:           _fv(n["rv_long"],        0.20),
-                "atr_pct":              _fv("atr_pct",           0.01),
-                "weekly_trend_aligned": _fv("weekly_trend_aligned", 0.5),
-                "volume_confirmation":  _fv("volume_confirmation",  0.0),
-                "hour_of_day":          10,  # backtest entries are effectively at open
-                "macd_hist":            _fv("macd_hist",         0.0),
-                n["px_vs_mid"]:         _fv(n["px_vs_mid"],      0.0),
-                n["cross"]:             _fv(n["cross"],          0.5),
+                "vix":                  trade.get("entry_vix_level", _fv("vix_level", zn.vix_level)),
+                "iv_rank":              trade.get("entry_iv_rank",   _fv("iv_rank",   zn.iv_rank)),
+                "sentiment_score":      zn.sentiment_score,  # not available in backtest
+                **{col: _fv(col, default) for col, default in nz.items()},
+                "hour_of_day":          zn.hour_of_day,  # backtest entries are effectively at open
                 "profitable":           1 if pnl > 0 else 0,
             })
 
-        return pd.DataFrame(rows) if rows else pd.DataFrame()
+        # W90c: the neutral-value dict is spread into each row, so pin the column order (META_FEATURES, then the target)
+        return pd.DataFrame(rows, columns=[*self._meta_features, "profitable"]) if rows else pd.DataFrame()
 
     def build_training_data(self, state_manager) -> pd.DataFrame:
         """Build training DataFrame from trade history.
@@ -464,6 +504,7 @@ class MetaLabeler:
         import json as _json
         import sqlite3
         n = self._fspec.names               # W88d: the entry_signals snapshot keys follow ml.features
+        nz = self._fspec.meta_neutral_values(self._neutrals)      # W90c: ml.meta_label_neutrals, keyed by column
 
         # W3 string-contracts-1/-4: this query used to be a bare
         # "WHERE t.status = 'closed'" while all 8 sibling consumers filtered
@@ -517,7 +558,7 @@ class MetaLabeler:
             # entry_time becomes timezone-aware or the pre/post-move rows are
             # restated. Registered, not silently tolerated: the meta-labeler is
             # untrained and default-off, so the corpus is still small.
-            entry_hour = 10  # Default
+            entry_hour = self._neutrals.hour_of_day  # Default (W90c: ml.meta_label_neutrals.hour_of_day)
             try:
                 from datetime import datetime
                 entry_hour = parse_trade_ts(r["entry_time"]).hour
@@ -546,25 +587,15 @@ class MetaLabeler:
                 "vix": r.get("entry_vix", 0),
                 "iv_rank": r.get("entry_iv_rank", 0),
                 "sentiment_score": r.get("entry_sentiment_score", 0),
-                n["rsi_long"]:          _sig(sig, n["rsi_long"], 50.0),
-                n["rsi_short"]:         _sig(sig, n["rsi_short"], 50.0),
-                "bb_position":          _sig(sig, "bb_position", 0.5),
-                n["volume_ratio"]:      _sig(sig, n["volume_ratio"], 1.0),
-                n["rv_long"]:           _sig(sig, n["rv_long"], 0.20),
-                "atr_pct":              _sig(sig, "atr_pct", 0.01),
-                "weekly_trend_aligned": _sig(sig, "weekly_trend_aligned", 0.5),
-                "volume_confirmation":  _sig(sig, "volume_confirmation", 0.0),
+                **{col: _sig(sig, col, default) for col, default in nz.items()},
                 "hour_of_day": entry_hour,
-                "macd_hist":            _sig(sig, "macd_hist", 0.0),
-                n["px_vs_mid"]:         _sig(sig, n["px_vs_mid"], 0.0),
-                n["cross"]:             _sig(sig, n["cross"], 0.5),
                 "profitable": 1 if r["realized_pnl"] > 0 else 0,
             })
 
         if not rows:
             return pd.DataFrame()
 
-        return pd.DataFrame(rows)
+        return pd.DataFrame(rows, columns=[*self._meta_features, "profitable"])
 
     def load_model(self) -> bool:
         """Load previously trained meta-label model from disk.
@@ -592,12 +623,12 @@ class MetaLabeler:
             age_days = (
                 datetime.now() - datetime.fromtimestamp(model_file.stat().st_mtime)
             ).days
-            if age_days > MAX_ARTIFACT_AGE_DAYS:
+            if age_days > self._max_artifact_age_days:
                 log.error(
                     "meta_label_artifact_stale",
                     path=str(model_file),
                     age_days=age_days,
-                    max_age_days=MAX_ARTIFACT_AGE_DAYS,
+                    max_age_days=self._max_artifact_age_days,
                     impact="refusing to arm the meta-label gate on a stale "
                            "artifact — retrain it deliberately",
                 )

@@ -248,10 +248,12 @@ class TestPerPositionExpiry:
         pos = _pos(entry="2024-03-01", expiry="2024-03-06", entry_iv=0.20)   # THIS one is 5 DTE
         got = bt._reprice_position(pos, 100.0, 0, None)
         sc, sp, lc, lp = ic_leg_marks(100.0, 104.0, 96.0, 107.0, 93.0, 5 / 365.0, 0.05, 0.20,
-                                      bt._skew_factor, bt._skew_slope_per_pct_otm, bt._iv_floor)
+                                      bt._skew_factor, bt._skew_slope_per_pct_otm, bt._iv_floor,
+                                      bt._eng.put_skew_coefficient, bt._eng.call_skew_coefficient)
         assert got == pytest.approx((sc + sp) - (lc + lp), abs=1e-12)
         wrong = ic_leg_marks(100.0, 104.0, 96.0, 107.0, 93.0, 14 / 365.0, 0.05, 0.20,
-                             bt._skew_factor, bt._skew_slope_per_pct_otm, bt._iv_floor)
+                             bt._skew_factor, bt._skew_slope_per_pct_otm, bt._iv_floor,
+                             bt._eng.put_skew_coefficient, bt._eng.call_skew_coefficient)
         assert got != pytest.approx((wrong[0] + wrong[1]) - (wrong[2] + wrong[3]), abs=1e-6)
 
     def test_a_position_without_dates_falls_back_to_the_engine_dte(self):

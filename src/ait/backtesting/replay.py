@@ -60,7 +60,7 @@ from ait.backtesting.pricing import (
     skewed_leg_iv,
 )
 from ait.backtesting.study_harness import STUDY_INITIAL_CAPITAL
-from ait.config.settings import DEFAULT_RISK_FREE_RATE, BacktestConfig
+from ait.config.settings import DEFAULT_RISK_FREE_RATE, BacktestConfig, EngineTuningConfig
 from ait.utils.time import ET
 
 # engine.py used a bare r = 0.05 at entry and in the daily re-mark (W72 finding); since W81 it reads
@@ -322,15 +322,21 @@ class PricingParams:
     skew_factor: float = BacktestConfig.model_fields["skew_factor"].default
     skew_slope_per_pct_otm: float = BacktestConfig.model_fields["skew_slope_per_pct_otm"].default
     iv_floor: float = BacktestConfig.model_fields["iv_floor"].default
+    # W90c: the leg-IV model's skew coefficients (backtest.engine_tuning), also schema defaults when bare
+    put_skew_coefficient: float = EngineTuningConfig.model_fields["put_skew_coefficient"].default
+    call_skew_coefficient: float = EngineTuningConfig.model_fields["call_skew_coefficient"].default
 
     @classmethod
     def from_backtest_config(cls, bc: Any, risk_free_rate: float | None = None) -> PricingParams:
         # W81: the engine now reads options.risk_free_rate; the replay must price with the same r
         # (callers pass settings.options.risk_free_rate; None keeps the 0.05 default).
+        eng = getattr(bc, "engine_tuning", None) or EngineTuningConfig()     # a stub config degrades to the schema defaults
         return cls(r=float(risk_free_rate) if risk_free_rate is not None else ENGINE_RISK_FREE_RATE,
                    skew_factor=float(bc.skew_factor),
                    skew_slope_per_pct_otm=float(bc.skew_slope_per_pct_otm),
-                   iv_floor=float(bc.iv_floor))
+                   iv_floor=float(bc.iv_floor),
+                   put_skew_coefficient=float(eng.put_skew_coefficient),
+                   call_skew_coefficient=float(eng.call_skew_coefficient))
 
 
 def t_engine(expiry: date, as_of: date) -> float:
@@ -362,13 +368,15 @@ def model_leg_mids(trade: ReplayTrade, S: float, base_iv: float,
         sc, sp, lc, lp = ic_leg_marks(
             S, roles["short_call"].strike, roles["short_put"].strike,
             roles["long_call"].strike, roles["long_put"].strike,
-            t, p.r, base_iv, p.skew_factor, p.skew_slope_per_pct_otm, p.iv_floor)
+            t, p.r, base_iv, p.skew_factor, p.skew_slope_per_pct_otm, p.iv_floor,
+            p.put_skew_coefficient, p.call_skew_coefficient)
         by_role = {"short_call": sc, "short_put": sp, "long_call": lc, "long_put": lp}
         return [by_role[f"{l.side}_{'call' if l.right == 'C' else 'put'}"] for l in trade.legs]
     out = []
     for l, t in zip(trade.legs, t_by_leg):
         iv = skewed_leg_iv(base_iv, l.strike, S, l.option_type, p.skew_factor,
-                           p.skew_slope_per_pct_otm, p.iv_floor)
+                           p.skew_slope_per_pct_otm, p.iv_floor,
+                           p.put_skew_coefficient, p.call_skew_coefficient)
         out.append(black_scholes_price(S, l.strike, t, p.r, iv, l.option_type))
     return out
 
@@ -465,7 +473,8 @@ def _entry_variant(trade, S, iv, t_by_leg, p, friction, actual, *, spot_src, iv_
     # engine's single stored IV this is the term-structure/skew error, directly.
     model_leg_iv = (list(leg_ivs) if leg_ivs is not None else
                     [skewed_leg_iv(iv, l.strike, S, l.option_type, p.skew_factor,
-                                   p.skew_slope_per_pct_otm, p.iv_floor) for l in trade.legs])
+                                   p.skew_slope_per_pct_otm, p.iv_floor,
+                                   p.put_skew_coefficient, p.call_skew_coefficient) for l in trade.legs])
     actual_leg_iv = []
     for l, h, t in zip(trade.legs, hs, t_by_leg):
         mid_est = l.open_price + h if l.side == "short" else l.open_price - h

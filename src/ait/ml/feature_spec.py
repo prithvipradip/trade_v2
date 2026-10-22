@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover
-    from ait.config.settings import FeaturesConfig
+    from ait.config.settings import FeaturesConfig, MetaLabelNeutralsConfig
 
 from ait.config.feature_names import (  # noqa: F401 - re-exported: the names are part of this module's API
     _BASE_TEMPLATE,
@@ -59,6 +59,17 @@ class FeatureSpec:
 
     def meta_feature_names(self) -> list[str]:
         return [n.format_map(self.names) for n in _META_TEMPLATE]
+
+    def meta_neutral_values(self, nz: "MetaLabelNeutralsConfig") -> dict:
+        """W90c: the neutral value of each of the eleven TECHNICAL meta-label inputs, keyed by this spec's column names
+        (``rsi_14`` at the default windows) from ``ml.meta_label_neutrals`` ``nz``. The engine's entry gate, both
+        training-data builders and the live entry snapshot all fall back to these, so a missing column reads the
+        same number everywhere."""
+        n = self.names
+        return {n["rsi_long"]: nz.rsi, n["rsi_short"]: nz.rsi, "bb_position": nz.bb_position,
+                n["volume_ratio"]: nz.volume_ratio, n["rv_long"]: nz.realized_vol, "atr_pct": nz.atr_pct,
+                "weekly_trend_aligned": nz.weekly_trend_aligned, "volume_confirmation": nz.volume_confirmation,
+                "macd_hist": nz.macd_hist, n["px_vs_mid"]: nz.px_vs_mid, n["cross"]: nz.cross}
 
     def spec_hash(self) -> str:
         return _hash(self.cfg)

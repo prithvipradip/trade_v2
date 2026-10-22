@@ -64,8 +64,8 @@ def compare(symbols: list[str], db: Path, threshold: float, since: str) -> None:
 
     from ait.backtesting import iv_rank_compare as cmp
 
-    print(f"\n## 1. Research rise veto (feature rank rise > {threshold:g} over {cmp.RISE_ROWS} rows) "
-          f"vs live's level gates (floor {cmp.LIVE_FLOOR:g} / cap {cmp.LIVE_CAP:g}), research IV\n")
+    print(f"\n## 1. Research rise veto (feature rank rise > {threshold:g} over {cmp.rise_rows()} rows) "
+          f"vs live's level gates (floor {cmp.live_floor():g} / cap {cmp.live_cap():g}), research IV\n")
     print("| symbol | span | days | spearman(F, S) | opposite side | veto days | already blocked by live | "
           "EXTRA (live would trade) | rise on stored IV | both fire |")
     print("|---|---|---|---|---|---|---|---|---|---|")

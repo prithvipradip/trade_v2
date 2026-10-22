@@ -20,33 +20,55 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-RISE_ROWS = 10            # the engine's veto: features_df["iv_rank"].iloc[-11:] -> last minus first
-LIVE_FLOOR = 15.0         # AIT_IRON_CONDOR_IV_FLOOR
-LIVE_CAP = 85.0           # AIT_IV_RANK_CAP
+# W90c: the three numbers this module used to hold as constants are single-sourced (config/imports are done lazily so the
+# module stays import-light): the veto's row count is ``backtest.engine_tuning.iv_rank_rise_lookback_rows - 1`` (the
+# engine's ``features_df["iv_rank"].iloc[-rows:]`` -> last minus first), and live's floor / cap are the env contract
+# AIT_IRON_CONDOR_IV_FLOOR / AIT_IV_RANK_CAP (config ``backtest.ic_iv_rank_floor`` / ``risk.iv_rank_cap``).
 
 
-def rise(series: pd.Series, n: int = RISE_ROWS) -> pd.Series:
-    """Change over ``n`` rows (the engine's ``iloc[-1] - iloc[-(n+1)]``), NaN until defined."""
-    return series - series.shift(n)
+def rise_rows() -> int:
+    """Rows the engine's rise veto spans (its look-back window less one)."""
+    from ait.config.settings import loaded_engine_tuning
+    return int(loaded_engine_tuning().iv_rank_rise_lookback_rows) - 1
 
 
-def veto_days(series: pd.Series, threshold: float, n: int = RISE_ROWS) -> pd.Series:
+def live_floor() -> float:
+    """Live refuses a condor below this IV rank (percentile, 0-100)."""
+    from ait.config.runtime_env import contract_float
+    return float(contract_float("AIT_IRON_CONDOR_IV_FLOOR"))
+
+
+def live_cap() -> float:
+    """Live refuses any credit above this IV rank (percentile, 0-100)."""
+    from ait.config.runtime_env import contract_float
+    return float(contract_float("AIT_IV_RANK_CAP"))
+
+
+def rise(series: pd.Series, n: int | None = None) -> pd.Series:
+    """Change over ``n`` rows (the engine's ``iloc[-1] - iloc[-(n+1)]``), NaN until defined. ``n`` defaults to
+    ``rise_rows()``."""
+    return series - series.shift(rise_rows() if n is None else n)
+
+
+def veto_days(series: pd.Series, threshold: float, n: int | None = None) -> pd.Series:
     """Boolean per day: the rise exceeds ``threshold`` (False where the rise is undefined)."""
     r = rise(series, n)
     return (r > threshold).fillna(False)
 
 
-def live_level_blocks(rank_0_100: pd.Series, floor: float = LIVE_FLOOR,
-                      cap: float = LIVE_CAP) -> pd.Series:
+def live_level_blocks(rank_0_100: pd.Series, floor: float | None = None,
+                      cap: float | None = None) -> pd.Series:
     """Boolean per day: live would refuse the entry on the rank LEVEL (below the condor floor
     or above the credit cap). An unknown rank (NaN) fails closed, as live does, so it is
     reported as blocked."""
+    floor, cap = live_floor() if floor is None else floor, live_cap() if cap is None else cap
     r = rank_0_100.astype(float)
     return ((r < floor) | (r > cap) | r.isna())
 
 
-def side(rank_0_100: pd.Series, floor: float = LIVE_FLOOR, cap: float = LIVE_CAP) -> pd.Series:
+def side(rank_0_100: pd.Series, floor: float | None = None, cap: float | None = None) -> pd.Series:
     """'below' | 'in' | 'above' relative to the live floor / cap (NaN stays NaN)."""
+    floor, cap = live_floor() if floor is None else floor, live_cap() if cap is None else cap
     r = rank_0_100.astype(float)
     out = pd.Series(np.where(r < floor, "below", np.where(r > cap, "above", "in")), index=r.index)
     return out.where(r.notna())
@@ -73,12 +95,18 @@ def agreement(a: pd.Series, b: pd.Series) -> dict[str, int]:
 
 
 def veto_vs_live(feature_rank_0_1: pd.Series, live_rank_0_100: pd.Series,
-                 threshold: float = 0.30, floor: float = LIVE_FLOOR, cap: float = LIVE_CAP) -> dict:
+                 threshold: float | None = None, floor: float | None = None, cap: float | None = None) -> dict:
     """The W71 headline numbers on the dates where BOTH ranks are measurable.
 
     ``veto``: days the research rise veto fires. Of those, ``already_blocked_by_live`` are days
     live's level gates refuse anyway; ``extra`` are days live WOULD trade, i.e. the restriction
-    that exists only in research."""
+    that exists only in research.
+
+    ``threshold`` defaults to ``backtest.iv_rank_rise_threshold`` (was a 0.30 literal); ``floor`` / ``cap`` to live's."""
+    if threshold is None:
+        from ait.config.settings import load_settings
+        threshold = float(load_settings().backtest.iv_rank_rise_threshold)
+    floor, cap = live_floor() if floor is None else floor, live_cap() if cap is None else cap
     df = pd.concat([feature_rank_0_1, live_rank_0_100], axis=1, keys=["f", "s"]).dropna()
     f_veto = veto_days(feature_rank_0_1, threshold).reindex(df.index).fillna(False)
     s_veto = veto_days(live_rank_0_100 / 100.0, threshold).reindex(df.index).fillna(False)
