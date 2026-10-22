@@ -191,6 +191,17 @@ fallback for a bare construction (`Backtester()`, `BacktestLearner()` in a unit 
 Known, preserved behaviour worth knowing before tuning the learner: with the shipped `reduce_min_change` (0.03) and `strategy_multiplier_min` (0.30), a reduced strategy's multiplier stalls at 0.3277, so the "disable a
 strategy" branch is unreachable by default; `boost_min_trades` and `reenable_min_trades` are inert at any value at or below `min_trades_to_learn` (15). The module's old `MIN_CONFIDENCE` constant (0.55) was read by nothing and was dropped. Each is documented on the field.
 
+## Model hyperparameters (W88c; shared by live and research)
+
+The tree hyperparameters of the gradient-boosted models are settings, not code literals: `ml.hyperparams` (direction ensemble, range model, vol-magnitude model) and `ml.meta_label_hyperparams` (the meta-labeler's own, shallower
+profile), both `TreeHyperparamsConfig` (`n_estimators`, `max_depth`, `learning_rate`, `subsample`, `colsample_bytree`, `random_state`; `null` = unseeded). `config.yaml` lists them with the values the code used before, so listing them
+changed nothing. **Shared keys are diff-only in `config_research.yaml`**: research differs only if you put a different value there (or in a study); the parity manifest then warns (`ml_hyperparams`).
+Not settings, on purpose: `n_jobs` / `verbosity`, each task's objective and metric, LightGBM's `class_weight` / `deterministic`, and `ml/trainer.py::_objective` (a search-time proxy).
+
+Every saved model (`ensemble.pkl`, `range.pkl`, `vol_magnitude.pkl`, the meta-label artifact) records the hyperparameters it was trained with (`spec`). Loading **never refuses**: a model trained under other values than the current
+config is served and logs `model_spec_mismatch` with the differences; an artifact saved before W88c has no `spec` and loads silently. A change to the LIVE values takes effect for live at the next retrain (and bot restart), not by
+editing `config.yaml` alone. The run record stores the resolved settings and the ML seed.
+
 ## Risk-knob ceilings and the links between them (W86)
 
 Unlike the fixed limits above, these are **tunable** (they live in `config.yaml`), but the **range** each may take is part of the schema in `src/ait/config/settings.py`, so a typo or a bad edit fails

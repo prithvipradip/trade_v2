@@ -29,7 +29,13 @@ warnings.filterwarnings(
 
 from ait.config.settings import MLConfig
 from ait.ml.features import FeatureEngine
-from ait.ml.hyperparams import lgbm_multiclass_kwargs, xgb_multiclass_kwargs  # W87a
+from ait.ml.hyperparams import (  # W87a/W88c: hyperparameters are settings, recorded with every model
+    default_hyperparams,
+    lgbm_multiclass_kwargs,
+    model_spec,
+    warn_on_spec_mismatch,
+    xgb_multiclass_kwargs,
+)
 from ait.strategies.base import SignalDirection
 from ait.utils.logging import get_logger
 
@@ -431,6 +437,14 @@ class DirectionPredictor:
     def fitted_weights(self) -> "dict[str, float] | None":
         return getattr(self, "_fitted_weights", None)
 
+    def _hyperparams(self):
+        """``ml.hyperparams`` of THIS predictor's config (W88c); a stub config without the field degrades to the
+        loaded settings / schema defaults."""
+        return getattr(self._config, "hyperparams", None) or default_hyperparams()
+
+    def _spec(self) -> dict:
+        return model_spec(self._hyperparams())
+
     def load_models(self, version: str | None = None) -> bool:
         """Load previously trained models from disk.
 
@@ -455,6 +469,9 @@ class DirectionPredictor:
             self._cv_scores = data.get("cv_scores", {})
             self._symbol_models = data.get("symbol_models", {})
             self._trained = True
+            # W88c: a model trained under other hyperparameters than the current config is served, but says so
+            # (artifacts saved before W88c carry no spec and are accepted silently).
+            self._hp_spec_mismatch = warn_on_spec_mismatch("ensemble", data.get("spec"), self._spec())
             log.info("models_loaded", version=self._model_version,
                      models=list(self._models.keys()),
                      per_symbol=list(self._symbol_models.keys()))
@@ -478,6 +495,7 @@ class DirectionPredictor:
             "version": self._model_version,
             "cv_scores": self._cv_scores,
             "symbol_models": self._symbol_models,
+            "spec": self._spec(),                    # W88c: the hyperparameters this model was trained with
         }
 
         # Save as current (ensemble.pkl) — ATOMIC: write tmp then os.replace,
@@ -699,7 +717,7 @@ class DirectionPredictor:
         try:
             from xgboost import XGBClassifier
 
-            base_kwargs = xgb_multiclass_kwargs()
+            base_kwargs = xgb_multiclass_kwargs(self._hyperparams())
             base_kwargs.update(self._xgb_kwargs)
             model = XGBClassifier(**base_kwargs)
 
@@ -746,7 +764,7 @@ class DirectionPredictor:
         try:
             from lightgbm import LGBMClassifier
 
-            base_kwargs = lgbm_multiclass_kwargs()  # balanced class weights, deterministic
+            base_kwargs = lgbm_multiclass_kwargs(self._hyperparams())  # balanced class weights, deterministic
             base_kwargs.update(self._lgbm_kwargs)
             model = LGBMClassifier(**base_kwargs)
 

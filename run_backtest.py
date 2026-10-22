@@ -217,6 +217,9 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
                                   if settings else _PC().max_open_positions),
         "max_concurrent_positions": int(settings.backtest.max_concurrent_positions
                                         if settings else _BTC().max_concurrent_positions),
+        # W88c: the tree hyperparameters live trains with (research may differ via the overlay / a study)
+        "ml_hyperparams": (settings.ml if settings else MLConfig()).hyperparams.model_dump(),
+        "ml_meta_label_hyperparams": (settings.ml if settings else MLConfig()).meta_label_hyperparams.model_dump(),
     }
 
     # Backtest TP ladder read from the engine mirror itself, so this manifest
@@ -265,6 +268,8 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
         "max_open_positions": int(_rcv(None, "positions", "max_open_positions", _PC, rsettings)),
         "max_concurrent_positions": int(_rcv(
             None, "backtest", "max_concurrent_positions", _BTC, rsettings)),
+        "ml_hyperparams": (rsettings.ml if rsettings else MLConfig()).hyperparams.model_dump(),
+        "ml_meta_label_hyperparams": (rsettings.ml if rsettings else MLConfig()).meta_label_hyperparams.model_dump(),
     }
 
     warnings: list[str] = []

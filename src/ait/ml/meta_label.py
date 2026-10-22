@@ -24,6 +24,12 @@ import pandas as pd
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 
+from ait.ml.hyperparams import (  # W88c: the tree profile is a setting, recorded with the model
+    default_meta_label_hyperparams,
+    meta_label_xgb_kwargs,
+    model_spec,
+    warn_on_spec_mismatch,
+)
 from ait.utils.logging import get_logger
 from ait.utils.time import parse_trade_ts
 
@@ -117,8 +123,10 @@ class MetaLabeler:
     Uses market context features available at entry time.
     """
 
-    def __init__(self, min_probability: float = 0.50) -> None:
+    def __init__(self, min_probability: float = 0.50, hyperparams=None) -> None:
         self._min_probability = min_probability
+        # W88c: the meta-labeler's own tree profile is ml.meta_label_hyperparams (an explicit one wins)
+        self._hp = hyperparams if hyperparams is not None else default_meta_label_hyperparams()
         self._model = None
         self._scaler = StandardScaler()
         self._trained = False
@@ -256,18 +264,7 @@ class MetaLabeler:
         try:
             from xgboost import XGBClassifier
 
-            model = XGBClassifier(
-                n_estimators=100,
-                max_depth=3,  # Shallow — small dataset, avoid overfit
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                scale_pos_weight=n_negative / max(1, n_positive),
-                objective="binary:logistic",
-                eval_metric="logloss",
-                verbosity=0,
-                n_jobs=-1,
-            )
+            model = XGBClassifier(**meta_label_xgb_kwargs(n_negative / max(1, n_positive), self._hp))
 
             # Cross-validate — scaler fit PER FOLD on the train slice only.
             from sklearn.preprocessing import StandardScaler as _SS
@@ -608,6 +605,7 @@ class MetaLabeler:
             self._model_version = data.get("version", "unknown")
             self._training_stats = data.get("training_stats", {})
             self._trained = True
+            warn_on_spec_mismatch("meta_label", data.get("spec"), model_spec(self._hp))   # W88c: informational
             log.info("meta_label_loaded", version=self._model_version)
             return True
         except Exception as e:
@@ -622,6 +620,7 @@ class MetaLabeler:
             "feature_names": self._feature_names,
             "version": self._model_version,
             "training_stats": self._training_stats,
+            "spec": model_spec(self._hp),            # W88c: the hyperparameters this model was trained with
         }
         dest = Path(path)
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -640,6 +639,7 @@ class MetaLabeler:
             "feature_names": self._feature_names,
             "version": self._model_version,
             "training_stats": self._training_stats,
+            "spec": model_spec(self._hp),            # W88c: the hyperparameters this model was trained with
         }
 
         model_file = _model_path()

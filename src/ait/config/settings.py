@@ -1262,7 +1262,33 @@ class BacktestConfig(_StrictModel):
                     "minimum. Research harness knob. Was context_bars=0.")
 
 
+class TreeHyperparamsConfig(_StrictModel):
+    """W88c: the gradient-boosted-tree hyperparameters a model family trains with (XGBoost and LightGBM alike).
+
+    SHARED between live and research: ``ml.hyperparams`` drives the direction ensemble, the range model and the
+    vol-magnitude model; ``ml.meta_label_hyperparams`` drives the meta-labeler (a different, shallower profile on
+    purpose). The defaults are the values the code used as literals before W88c, so ``config.yaml`` need not
+    change anything; research may differ via the overlay or a study, and the parity manifest shows it. Every saved
+    model records the hyperparameters it was trained with. Not here on purpose: ``n_jobs`` / ``verbosity``
+    (speed and noise, no effect on the model) and the objective / metric of each task (they define the task)."""
+
+    n_estimators: int = Field(default=200, ge=10, le=5000, description="Number of boosted trees.")
+    max_depth: int = Field(default=5, ge=1, le=20, description="Maximum tree depth.")
+    learning_rate: float = Field(default=0.05, gt=0.0, le=1.0, description="Shrinkage per boosting step.")
+    subsample: float = Field(default=0.8, gt=0.0, le=1.0, description="Row subsample ratio per tree.")
+    colsample_bytree: float = Field(default=0.8, gt=0.0, le=1.0, description="Column subsample ratio per tree.")
+    random_state: int | None = Field(default=42, ge=0, le=2**31 - 1,
+        description="Model seed. null = unseeded (the meta-labeler's historical behaviour).")
+
+
 class MLConfig(_StrictModel):
+    hyperparams: TreeHyperparamsConfig = Field(default_factory=TreeHyperparamsConfig,
+        description="W88c: tree hyperparameters of the direction ensemble, range model and vol-magnitude model "
+                    "(defaults = the pre-W88c literals: 200 / 5 / 0.05 / 0.8 / 0.8, seed 42).")
+    meta_label_hyperparams: TreeHyperparamsConfig = Field(
+        default_factory=lambda: TreeHyperparamsConfig(n_estimators=100, max_depth=3, random_state=None),
+        description="W88c: the meta-labeler's own profile (100 trees, depth 3, unseeded: small dataset, shallow "
+                    "on purpose).")
     ensemble_weights: dict[str, float] = {"xgboost": 0.5, "lightgbm": 0.5}
     retrain_interval_days: int = Field(default=7, ge=1, le=30)
     lookback_days: int = Field(default=504, ge=60, le=2520)

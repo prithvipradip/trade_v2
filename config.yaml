@@ -376,6 +376,25 @@ ml:
   drift_accuracy_threshold: 0.40       # rolling accuracy below this -> drift + retrain
   drift_calibration_threshold: 0.25    # high-confidence calibration error above this -> drift
   drift_high_confidence: 0.80          # calibration cohort cutoff / expected accuracy
+  # W88c: tree hyperparameters (were literals in ml/ensemble.py, range_predictor.py, vol_magnitude_predictor.py and
+  # meta_label.py). SHARED by live and research: the values below are what the code used before, so listing them
+  # changes nothing; research may differ through config_research.yaml or a study (the parity manifest shows it).
+  # Every saved model records the values it was trained with; a model loaded under other values logs
+  # model_spec_mismatch (informational). Retraining is what makes a change take effect for live.
+  hyperparams:                         # direction ensemble, range model, vol-magnitude model
+    n_estimators: 200
+    max_depth: 5
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+    random_state: 42
+  meta_label_hyperparams:              # the meta-labeler: shallower, unseeded, on purpose
+    n_estimators: 100
+    max_depth: 3
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+    random_state: null
 
 # W69: regime classification thresholds (were literals in ml/regime.py).
 regime:

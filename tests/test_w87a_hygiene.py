@@ -110,11 +110,18 @@ class TestHyperparameters:
         assert first.pop("scale_pos_weight") > 0 and first == XGB_BINARY
         assert recorded["lgb"][0] == LGB_BINARY
 
-    def test_the_models_that_differ_on_purpose_keep_their_own_profile(self):
-        """meta_label (100 trees, depth 3, no seed) and the trainer's search objective must not be folded in."""
-        src = (ROOT / "src" / "ait" / "ml" / "meta_label.py").read_text()
-        assert "n_estimators=100" in src and "max_depth=3" in src and "random_state" not in src.split(
-            "def train")[1].split("def ")[0]
+    def test_the_models_that_differ_on_purpose_keep_their_own_profile(self, recorded):
+        """meta_label (100 trees, depth 3, UNSEEDED) must not be folded into the shared profile: build it for real."""
+        from ait.ml.meta_label import META_FEATURES, MetaLabeler
+        rng = np.random.default_rng(0)
+        df = pd.DataFrame({f: rng.normal(size=80) for f in META_FEATURES})
+        df["profitable"] = (rng.random(80) > 0.5).astype(int)
+        MetaLabeler().train(df)
+        first = dict(recorded["xgb"][0])
+        assert first.pop("scale_pos_weight") > 0
+        assert first == dict(n_estimators=100, max_depth=3, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8,
+                             objective="binary:logistic", eval_metric="logloss", verbosity=0, n_jobs=-1)
+        assert "random_state" not in first
 
     def test_the_binary_guards_are_shared(self):
         from ait.ml import hyperparams as hp

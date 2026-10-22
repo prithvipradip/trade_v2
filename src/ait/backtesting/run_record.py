@@ -129,11 +129,13 @@ def data_fingerprint(db_path: str | Path, table_prefix: str, symbols: list[str])
     return out
 
 
-def seed_inventory(extra: dict | None = None) -> dict:
-    """The seeds that decide a research result. The ML estimators' seed comes from the shared
-    hyperparameters; the Optuna seed is whatever the caller used (``extra``)."""
+def seed_inventory(extra: dict | None = None, settings=None) -> dict:
+    """The seeds that decide a research result. The ML estimators' seed is ``ml.hyperparams.random_state`` of the
+    settings the run used (W88c; the schema default without settings); the Optuna seed is whatever the caller
+    used (``extra``)."""
     from ait.ml.hyperparams import TREE_BASE
-    return {"ml_random_state": TREE_BASE["random_state"], **(extra or {})}
+    seed = getattr(getattr(getattr(settings, "ml", None), "hyperparams", None), "random_state", TREE_BASE["random_state"])
+    return {"ml_random_state": seed, **(extra or {})}
 
 
 def build_run_record(*, kind: str, name: str, settings, config_path: str | Path,
@@ -162,7 +164,7 @@ def build_run_record(*, kind: str, name: str, settings, config_path: str | Path,
         # W88a: {dotted.key: [value, layer]} -- which layer decides each value (study > overlay > config.yaml > default)
         "settings_origin": ({k: list(v) for k, v in settings_origin.items()} if settings_origin else None),
         "data": data_fingerprint(db_path, prefix, list(symbols or [])) if db_path else None,
-        "seeds": seed_inventory(seeds),
+        "seeds": seed_inventory(seeds, settings),
         "search_space": search_space, "search_space_hash": search_space_hash,
         "metrics": metrics or {},
     }

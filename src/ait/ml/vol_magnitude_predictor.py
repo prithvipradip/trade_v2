@@ -33,7 +33,10 @@ from ait.ml.hyperparams import (  # W87a: one owner of the tree settings and the
     MIN_CLASS_SAMPLES,
     POSITIVE_RATE_MAX,
     POSITIVE_RATE_MIN,
+    default_hyperparams,
     lgbm_binary_kwargs,
+    model_spec,
+    warn_on_spec_mismatch,
     xgb_binary_kwargs,
 )
 from ait.utils.logging import get_logger
@@ -86,6 +89,7 @@ class VolMagnitudePredictor:
         horizon_days: int = 30,
         ensemble_weights: dict[str, float] | None = None,
         model_dir: "Path | str | None" = None,
+        hyperparams=None,
     ) -> None:
         # R20b follow-up: was a bare MLConfig() (pydantic field default,
         # never reads config.yaml) despite the comment above claiming this
@@ -102,6 +106,8 @@ class VolMagnitudePredictor:
             min_training_samples = resolve_config_value(
                 None, "ml", "min_training_samples", MLConfig, _settings)
         self._min_training_samples = int(min_training_samples)
+        # W88c: tree hyperparameters are ml.hyperparams (an explicit TreeHyperparamsConfig wins)
+        self._hp = hyperparams if hyperparams is not None else default_hyperparams()
         self._threshold = threshold_pct
         self._horizon = horizon_days
         # Artifact directory — live default is models/. Research callers MUST
@@ -304,7 +310,7 @@ class VolMagnitudePredictor:
         try:
             from xgboost import XGBClassifier
             from sklearn.metrics import balanced_accuracy_score
-            model = XGBClassifier(**xgb_binary_kwargs(scale_pos_weight))
+            model = XGBClassifier(**xgb_binary_kwargs(scale_pos_weight, self._hp))
             scores = []
             for tr_idx, val_idx in self._walk_forward_split(len(X)):
                 if len(np.unique(y[tr_idx])) < 2:
@@ -330,7 +336,7 @@ class VolMagnitudePredictor:
         try:
             from lightgbm import LGBMClassifier
             from sklearn.metrics import balanced_accuracy_score
-            model = LGBMClassifier(**lgbm_binary_kwargs())
+            model = LGBMClassifier(**lgbm_binary_kwargs(self._hp))
             scores = []
             for tr_idx, val_idx in self._walk_forward_split(len(X)):
                 if len(np.unique(y[tr_idx])) < 2:
@@ -471,6 +477,7 @@ class VolMagnitudePredictor:
             # R9: persisted freshness so needs_training survives restarts
             "trained_at": self._trained_at or datetime.now().isoformat(),
             "trained_symbol": self._global_model_symbol,
+            "spec": model_spec(self._hp),            # W88c: the hyperparameters this model was trained with
         }
         import os as _os
         with open(tmp, "wb") as f:
@@ -526,6 +533,7 @@ class VolMagnitudePredictor:
             self._trained_at = data.get("trained_at")
             self._global_model_symbol = data.get("trained_symbol", "")
             self._trained = bool(self._models)
+            warn_on_spec_mismatch("vol_magnitude", data.get("spec"), model_spec(self._hp))   # W88c: informational
             log.info("vol_mag_models_loaded", version=self._model_version,
                      threshold=self._threshold, horizon=self._horizon,
                      trained_at=self._trained_at, path=str(path))
