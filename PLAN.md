@@ -18531,3 +18531,27 @@ The operator asked for a user document explaining what research mode contains an
 `tests/test_w88_research_guide.py` (9 tests) keeps it true: anchors and links resolve, named files and RUNBOOK sections exist, the learner table equals the schema defaults, the quoted walk-forward defaults and objective weights match, and the study example loads. README and the RUNBOOK "Studies and run records" section point to it. No code change; collected 6,529 -> 6,538.
 
 ---
+
+
+## 2026-10-22 - W88 parts d and e AS PLANNED: indicator windows with derived names and a feature-spec hash (d); the literal-census class guard (e)
+
+Plan approved by the operator 2026-10-22. Written BEFORE any d/e code. HEAD at planning: `5ada059` on local `main` (unpushed); no live bot running. d is the largest LIVE-SHARED change of W88 (`ml/features.py`, `ml/meta_label.py`, the live orchestrator's meta-context keys, `engine.py`, `ml/ensemble.py`, `range_predictor.py`,
+`vol_magnitude_predictor.py`); defaults reproduce today's values, so live is unchanged until the operator changes a window and restarts. Parts a-c: see the W88 AS BUILT entry.
+
+**DECISIONS.** (1) Core feature groups only (momentum, volatility, volume, trend, price action, multi-timeframe, IV/vol-regime); fractal/wavelet/Hurst, VLMC, cross-asset, macro, seasonality and `_add_market_structure` stay fixed. (2) Column names that embed a window DERIVE from it (`rsi_10` when the window is 10); names that do not embed one keep their name but their windows
+are tunable and covered by the spec hash. (3) Shared keys: `ml.features` is listed in `config.yaml` (equal to defaults) and diff-only in the overlay (the W88c pattern). (4) **NEW: a saved model whose recorded feature-spec hash differs from the current one is REFUSED on the live path too** (`load_models` returns False, so the existing needs-training flow retrains); a model with no recorded
+hash is assumed to carry the DEFAULT-spec hash (true by construction: windows were not configurable), so today's live artifacts keep loading. Hyperparameter mismatches stay informational (W88c).
+
+**FINDINGS THAT SHAPE d.** The names that embed a window are `rsi_14`, `rsi_7`, `roc_5/10/20`, `realized_vol_20/10`, `volume_sma_20_ratio`, `sma_10_slope`, `sma_20_slope`, `price_vs_sma_20/50`, `sma_10_20_cross` (plus the raw non-model columns `sma_10/20/50`, `ema_12/26`, `atr_14`). The meta-labeler's 20 `META_FEATURES` are model inputs AND dict keys built in four places (engine, live orchestrator, three
+`meta_label.py` builders), so the names are interface keys, not just columns. `ml/regime.py` and `data/multi_timeframe.py` compute their OWN windows and are not consumers. `ensemble.predict` zero-fills missing columns on purpose (VLMC), so the silent-zero hazard must be closed by a spec-hash check at load, not by making predict strict. `FeatureEngine()` is constructed argument-free at 23 sites
+(including per day in the legacy engine), so the default spec must be resolved from a cache keyed on the frozen-settings snapshot, never a YAML read per construction.
+
+**PARTS.** d1 golden captures of `FeatureEngine().compute()` (three seeded frames + QQQ), the name lists and the meta-context dicts BEFORE any edit. d2 `ml.features` schema (sub-models, validators: ordered pairs, distinct derived names, no collision with fixed names) + `ml/feature_spec.py` (derived names, meta feature names, `spec_hash`, `DEFAULT_SPEC_HASH`, cached default). d3 `FeatureEngine(spec=None)` reads the spec;
+golden bit-equality at defaults. d4 consumers resolve names through the spec (engine, meta-labeler, orchestrator, walk-forward, dashboard export). d5 artifacts record the hash; mismatch refused. d6 visibility (`config.yaml`, `show_research_config`, manifest row `ml_features`, run record, RUNBOOK, RESEARCH_GUIDE). d7 tests. e `scripts/literal_census.py` + `tests/data/literal_allowlist.json` (per function: the multiset of
+its literals, a category from a closed set, a note for registered follow-ups) + `tests/test_w88_literal_census.py` (fails on a new, changed or removed literal, a stale entry, a missing category, an unscanned module).
+
+**OUT OF SCOPE / REGISTERED.** The fixed feature groups; `regime.py` / `multi_timeframe.py` own windows; static dashboard JS data; the engine / meta-labeler fallback VALUES (50.0, 0.20, 0.01 ...) beyond name derivation.
+
+**NEXT.** Build d1-d7, record the AS BUILT, then e.
+
+---
