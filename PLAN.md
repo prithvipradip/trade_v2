@@ -18352,3 +18352,80 @@ exact count reconciliation; fast lane; typecheck; smoke.
 **NEXT.** W87a, then W87b, each with its own AS BUILT entry.
 
 ---
+
+
+## 2026-10-22 - W87 AS BUILT: research hygiene (W87a) and the study layer with run records (W87b); MEASURED: the bare `run_backtest.py` crashed before and runs QQQ / iron condor now; debit-structure slippage 3% -> 1%
+
+Code commits `38d4873` (W87a hygiene), `89be827` (walk-forward slippage), `fa55d09` (default symbols / strategies + W87b), on local `main`. Research tooling plus refactors of FOUR live-shared files (`strategies/iron_condor.py`: one named constant;
+`ml/ensemble.py`, `ml/range_predictor.py`, `ml/vol_magnitude_predictor.py`: shared hyperparameters) and two schema additions in `settings.py` (`backtest.default_symbols`; the study overlay argument). All reach the bot only at its
+next restart; nothing restarted, nothing pushed. Plan: the W87 AS PLANNED entry above.
+
+**STATUS OF THE PLAN.** AS PLANNED: W87a items 1-8 and the two results-moving items 9-10; W87b loader, `--study-file`, run record, MLflow, tiering. AS BUILT: all of it. **FELL SHORT / DIFFERED:**
+1. **Commit split.** The plan asked for the results-moving defaults (item 10) in their own commit. They share hunks with W87b in five files (`settings.py`, `research.py`, `run_backtest.py`, `run_optimizer.py`, the tests), so only
+   the walk-forward slippage (item 9) is isolated (`89be827`); the default symbols / strategies ride in `fa55d09` with W87b. The separation is in the MEASUREMENT and this entry, not in the commit boundary.
+2. **`--study-file` is on `run_backtest.py` and `run_optimizer.py` only.** The plan said "and, opt-in, the study scripts"; the four study scripts (`gate_parity_ab`, `ex_div_gate_ab`, `dte_dimension_flatness`,
+   `iv_rank_parity_probe`) now share the engine block (item 7) but do not take a study file or write a run record. Registered below.
+3. **The hyperparameter refactor is proven by recorded constructor keyword sets, not by training.** The 6-variant reference dump uses precomputed features and trains no model, so it cannot see this change. The equality
+   test records the kwargs of every `XGBClassifier` / `LGBMClassifier` the three predictors build and compares them key for key with the pre-change literals (and checks the tuned-`update()` order in the ensemble).
+4. **`dte_dimension_flatness` and `iv_rank_parity_probe` were checked by characterization tests (the Backtester kwargs each builds, with a fake engine), not re-run end to end.** `gate_parity_ab` and `ex_div_gate_ab` were
+   re-run on QQQ before and after and are identical.
+5. **MLflow logging is tested with a fake module only.** MLflow 3.12 is installed here (`data/mlflow.db`, 43 runs, last 2026-06-09) but a real logged run was not made.
+6. A stale premise was corrected in `tests/test_w5_engine_cost_model.py` (it asserted that walkforward "pins commission 0.65"; it now asserts the `None` sentinel resolves to the config value and an explicit value still wins and still pays fees).
+7. Three tests in `test_w19_greeks_provenance.py` / `test_w31_sizing_selftest.py` (they build chains with `date.today()`) failed once in a combined run and passed in isolation and in an identical re-run (4863 passed); not reproduced, not
+   caused by this wave (no source they read changed between the two runs). Noted, not fixed.
+
+**W87a hygiene (`38d4873`, no behaviour change).** (1) `run_backtest.py` manifest: the live TP ladder comes from `exit_policy.credit_take_profit_pct` (the hand copy `_LIVE_TP_LADDER` is gone); `delta_target` is
+`iron_condor.SHORT_DELTA_TARGET` (new named constant, value 0.20, used by the live builder) on the live side and the resolved `backtest.delta_short` on the research side. (2) `--iv-floor` defaults to `None` and resolves through
+`contract_float("AIT_IRON_CONDOR_IV_FLOOR")` in BOTH `run_backtest()` and the manifest (a bare `None` would have printed `backtest=None`, the W81 `wing_floor` defect). (3) `WalkForwardConfig.commission_per_contract`
+is a `None` sentinel resolved by the engine from `backtest.commission_per_contract`. (4) The CLI window defaults are the `WalkForwardConfig` field defaults. (5) `ml/hyperparams.py` owns the tree settings and the label
+guards (`POSITIVE_RATE_MIN/MAX`, `MIN_CLASS_SAMPLES`) for the ensemble, range and vol-magnitude predictors; `meta_label.py` and `trainer._objective` keep their own profiles on purpose. (6) `backtesting/iv_model.py` is the
+one IV proxy (`SYNTHETIC_IV_PREMIUM`, the 0.70 / 0.30 re-mark, `VOL_MULT_VS_VIX`, the half-spread reference); `engine.py` and `replay.engine_current_iv` use it, and a new test pins engine == replay on a grid (none existed).
+(7) `backtesting/study_harness.py` defines the W81 study `Backtester` block once, with the looser study floors as named constants (`ic_min_credit` 0.30 vs live 0.70, `ic_min_credit_width` 0.05 vs 0.10, `iv_floor` 0.05 vs
+config 0.20) and an explicit `max_concurrent_positions=1`. (8) `param_spaces.effective_space / space_hash / live_baselines`: overrides return a NEW dict (the defaults are never mutated), are validated (known dimension,
+number pair, whole-number bounds for int dimensions, `low < high`, `HARD_BOUNDS`), and the optimizer reads the effective space at its THREE read points (suggest, the inert `wing_k` check, the iv-rank-rise membership) and
+stores a hash of it on the Optuna study, refusing to resume a stored study over a different space; a range that excludes the live `wing_k` 1.6 / `delta_short` 0.20 logs `search_space_excludes_live_value`.
+
+**Results-moving, MEASURED.**
+(a) *Walk-forward slippage* (`89be827`): `WalkForwardConfig.slippage_pct` 0.03 -> config 0.01 (debit structures only). QQQ 2024-01-02..2026-10-08, legacy engine, `bs_legacy`, 1 contract:
+
+| structure | slippage 0.03 (before) | slippage 0.01 (now) |
+|---|---|---|
+| iron_condor | 56 trades, -5,395.04 | 56 trades, -5,395.04 (identical: condors never read it) |
+| bull_call_spread | 81 trades, -1,625.54 | 80 trades, -1,525.23 |
+| long_call | 91 trades, -8,391.93 | 91 trades, -8,258.73 |
+
+(b) *Default targets* (`fa55d09`): `--symbols` -> `backtest.default_symbols` (QQQ), `--strategies` -> `options.strategies`. **Before: a bare `python run_backtest.py` ran SPY, QQQ, AAPL, MSFT, NVDA, TSLA, AMD, AMZN, META, GOOGL with four strategies and
+CRASHED on the first symbol without dividend rows (`ValueError: ex_div_entry_gate='live' but research_dividends has no rows for AAPL`).** Now (capital $5,000 = account.capital, the research overlay, `max_concurrent_positions` 3): QQQ / iron_condor,
+3 walk-forward windows with trades, 19 trades, win 36.8%, total return -8.29%, Sharpe -1.91, max drawdown 8.51%, buy-and-hold +85.69%. **That number is a default-run smoke figure with an enforced fractal / range gate (the overlay) and a
+$5,000 pool; it is not evidence about the strategy and is not comparable to the W63-W84 engine-only totals.**
+
+**EQUIVALENCE.** The 6-variant reference dump (QQQ / SPY / IWM x realistic / legacy, every trade dict and funnel) is **byte-identical** to the pre-W87 dump after W87a, after the full wave and after the study layer (`cmp`;
+132 / +5,674.05, 130 / +8,395.48, 134 / +6,067.99, 140 / +10,324.88, 121 / +1,019.24, 119 / +2,537.92). `gate_parity_ab --symbols QQQ --arms baseline --dump` and `ex_div_gate_ab --symbols QQQ --entry-dte 14 --k 5` give
+byte-identical dump / identical tables before and after the study-script refactor.
+
+**W87b (`fa55d09`).** `studies/<name>.yaml` (keys `name, question, rule, settings, search_space`, all validated; `studies/_template.yaml` is the exploratory example) is merged over `config.yaml` + `config_research.yaml` by
+`use_research_config(study=...)` (`load_settings(extra_overlays=...)`; `ibkr` / `api_keys` refused). It REFUSES: settings the env contract reads (`CONFIG_BACKED`: the contract ignores both overlays, so the value would silently not apply),
+`--n-jobs > 1` / `optimize_n_jobs > 1` (spawned workers rebuild settings from plain `config.yaml`), a pre-registered `rule:` that names no PLAN.md heading (`assert_registered`; a test also runs it over every committed study), and
+`run_optimizer.py --apply` with a study. Flag name `--study-file` (not `--study`, next to Optuna's `--study-name`). `backtesting/run_record.py` writes `reports/runs/<run_id>/run_record.json` (+ the raw config / overlay / study text):
+resolved settings without secrets, sha256 of each raw file, the effective `AIT_*` contract values, git commit and dirty flag, per-table row counts and date spans and a close-series hash per symbol (read-only connection),
+seeds, CLI arguments, merged search space and its hash, the parity manifest and the run's metrics; and logs the same to MLflow when installed (experiment `research_<study|adhoc>`, idempotent on `tags.run_id`, errors swallowed).
+Both entry points write it unless `--no-run-record`. The W68 guard (only `config/research.py` names the overlay / loader under `src/ait`) still passes, and a new guard keeps `run_record` / `study_harness` out of the live tree.
+
+**TESTS / GATES.** Collected 6261 -> 6400 = +139 exactly (1 in `test_w86_divergence_and_concurrency.py` + 64 `test_w87a_hygiene.py` + 18 `test_w87a_results_moving.py` + 56 `test_w87b_study_layer.py`; verified by diffing collected node ids
+against a worktree at `f506478`: 0 removed). Fast lane 6202 passed / 45 skipped / 1 failed; the one failure was a hygiene test stubbing `use_research_config` to return `None` (test-only fix; the 4 W87 test files and `test_w86_*` then
+pass, 167). `compileall` OK; `typecheck.py` OK; `smoke_deploy.py` SMOKE PASS (13 checks). Mutation check: 54 mutants (effective_space validation x6, hash, the three optimizer read points, the stored-hash guard, the live-value warning, loader
+rejections x5, tier check, `require_single_process`, `resolve_universe` x2, overlay merge, run-record secrets / idempotence / dirty flag / seeds / extra, hyperparameter values and the binary `scale_pos_weight`, IV-model constants and both IV call
+sites, study-harness floors and concurrency, the builder's delta, manifest ladder / delta / iv-floor / window defaults, the `--study-file` gates in both entry points, the commission / slippage sentinels, `default_symbols`, the
+divergence class, the symbol normaliser): 54 / 54 caught (two mutants first reported "not found" because of a stale search string and were re-run); every file restored byte-for-byte (hash-checked).
+
+**REGISTERED, NOT FIXED.** (1) The four study scripts do not take `--study-file` or write run records. (2) `WalkForwardResult.initial_capital` default, the bare-optimizer `initial_capital=50_000` (switching it breaks `test_optimizer` through
+the wing_k-inert rule), `run_optimizer --config` being ignored for the research settings, the engine thesis rule 0.80 / 2-day wait (inert under IC-only realistic), cash-drag 0.05, feature windows and the dormant strategy constants stay as
+the AS PLANNED entry listed them. (3) `CLAUDE.md` is listed in `.gitignore` (`/CLAUDE.md`) although it describes itself as checked in; the two lines added to it for W87b are local only. (4) The study scripts' loose floors (0.30 / 0.05 / 0.05) are
+documented constants now but still differ from live on purpose; a study that quotes a number from them should say so. (5) A run record is written after the walk-forward, so a crashed run leaves none (the crash itself is the evidence).
+
+**DECISIONS FOR THE OPERATOR.** (1) Whether the next study should be pre-registered (an AS PLANNED entry, then `rule:` naming it) or exploratory. (2) Whether to give the four study scripts `--study-file` and run records (small, mechanical).
+(3) Any bot restart (the shared hyperparameters and `SHORT_DELTA_TARGET` load then; behaviour is unchanged by equality tests). (4) Pushing: local `main` is ahead of `origin/main`. (5) The W86 / W83a-2 decisions listed in the W86 AS BUILT entry are still open.
+
+**NEXT.** The operator's decisions above; otherwise unchanged (W83a-2 decisions, W83b on A', the recalibration study, the ideas register, W79b prerequisites).
+
+---
