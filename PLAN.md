@@ -18514,3 +18514,10 @@ plumbing guarded by tests), b 52 / 52 caught after strengthening (the first run 
 **NEXT.** The operator's decisions above; d, then e, as planned.
 
 ---
+
+
+## 2026-10-22 - W88 AS BUILT: CORRECTION (no code change)
+
+The W88 AS BUILT entry above says `tests/test_w88a_plumbing.py` has 22 tests. It has **16**, which is what the 6,400 -> 6,416 reconciliation already showed (the three W87b refusal tests replaced by three positive pool tests are net zero). Nothing else in that entry changes.
+
+---
