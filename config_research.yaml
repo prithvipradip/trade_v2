@@ -1,12 +1,22 @@
-# AIT v2 — RESEARCH OVERLAY (W68, 2026-10-10).
+# AIT v2 — RESEARCH CONFIGURATION (W68 overlay; W88 research tunables).
 #
-# Deep-merged OVER config.yaml by RESEARCH entry points only (ait.config.research.use_research_config:
-# run_backtest.py, run_optimizer.py, scripts/friction_sensitivity.py, scripts/gate_study.py). The live
-# bot (ait.main) and the supervisor never load it. It holds ONLY the keys that differ from config.yaml,
-# so (a) this file IS the research-vs-live difference, and (b) a later live change in config.yaml flows
-# into research automatically. Unknown keys are a startup error (the schema is extra="forbid").
-# A single study can merge a THIRD layer over this file (studies/<name>.yaml, --study-file; W87b); this file
-# stays the stable default for ordinary research runs, so do not edit it per study.
+# This file has THREE jobs:
+#   1. DIFF   Keys that also exist in config.yaml appear here ONLY when research deliberately differs from live.
+#             A copy of a shared key would stop following a later config.yaml change (and a test fails on it), so
+#             this part of the file IS the research-vs-live difference.
+#   2. OVERLAY It is deep-merged OVER config.yaml by RESEARCH entry points only (ait.config.research.
+#             use_research_config: run_backtest.py, run_optimizer.py, scripts/friction_sensitivity.py,
+#             scripts/gate_study.py). The live bot (ait.main) and the supervisor never load it. Unknown keys are a
+#             startup error (the schema is extra="forbid").
+#   3. TUNABLES (W88b) Keys that exist ONLY in research (learner thresholds, objective weights, engine knobs, ...)
+#             are listed here IN FULL with their documentation, so a researcher sees every value a study can vary
+#             without reading code. Their schema defaults in src/ait/config/settings.py are the fallback for bare
+#             constructions; a test fails if a research-only field is missing from this file.
+#
+# A single study can merge a THIRD layer over this file (studies/<name>.yaml, --study-file; W87b); this file stays
+# the stable default for ordinary research runs, so do not edit it per study. Values that are NOT tunable (clamps,
+# numerical tolerances) are fixed in src/ait/config/invariants_research.py and listed in docs/RUNBOOK.md
+# ("Research fixed limits"). `python scripts/show_research_config.py` prints every value with the layer that decides it.
 #
 # Keep every research change on this branch HERE, with its provenance comment. config.yaml differs from
 # main only by the five operator-chosen live risk/capital lines (account.capital, simulate_live_capital,

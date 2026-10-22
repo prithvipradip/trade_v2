@@ -32,6 +32,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ait.config.invariants_research import research_invariant_values   # leaf; names no overlay
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCHEMA = "ait.run_record/1"
 
@@ -140,6 +142,7 @@ def build_run_record(*, kind: str, name: str, settings, config_path: str | Path,
                      symbols: list[str] | None = None, db_path: str | Path | None = None,
                      search_space: dict | None = None, search_space_hash: str | None = None,
                      seeds: dict | None = None, metrics: dict | None = None,
+                     settings_origin: dict | None = None,
                      now: datetime | None = None) -> dict:
     """Assemble the record. ``settings`` is the RESOLVED settings object the run used."""
     now = now or datetime.now()
@@ -155,6 +158,9 @@ def build_run_record(*, kind: str, name: str, settings, config_path: str | Path,
         "files": {"config": file_entry(config_path), "overlay": file_entry(overlay_path),
                   "study": file_entry(study_path)},
         "env_contract": env_contract(),
+        "research_invariants": research_invariant_values(),     # W88a: fixed in code, not configurable
+        # W88a: {dotted.key: [value, layer]} -- which layer decides each value (study > overlay > config.yaml > default)
+        "settings_origin": ({k: list(v) for k, v in settings_origin.items()} if settings_origin else None),
         "data": data_fingerprint(db_path, prefix, list(symbols or [])) if db_path else None,
         "seeds": seed_inventory(seeds),
         "search_space": search_space, "search_space_hash": search_space_hash,

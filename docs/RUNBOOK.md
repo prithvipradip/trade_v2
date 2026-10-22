@@ -156,6 +156,21 @@ the module, update this table (a test compares them), and record it in PLAN.md.
 The 30 s fast-monitor tick is not repeated here: its single source is
 `ait/utils/cadence.py::FAST_MONITOR_CADENCE_SECONDS`.
 
+## Research fixed limits (W88a; NOT configurable — visible on purpose)
+
+The research counterpart of the table above, in ONE module: `src/ait/config/invariants_research.py`. Each value is a correctness constraint of the research engine's own arithmetic, not a modelling choice, so it is not
+in `config_research.yaml` or a study file (anything in those files is editable regardless of a comment). They are logged once per research process (`research_fixed_limits_in_effect`) and stored in every run record. To change
+one: edit the module, update this table (a test compares them), and record it in PLAN.md; a change moves research numbers.
+
+| Name | Value | Why it is fixed (and where enforced) |
+|---|---|---|
+| `RESEARCH_DELTA_MIN` | 0.05 | Lower end of the \|delta\| band a strike search may be asked for; below it a modelled quote is noise. Also the lower bound for `delta_short` / `delta_long` search-space overrides. `engine.py`, `param_spaces.HARD_BOUNDS`. |
+| `RESEARCH_DELTA_MAX` | 0.45 | Upper end of the same band; above it a leg is no longer out of the money. `engine.py`, `param_spaces.HARD_BOUNDS`. |
+| `IV_SCALE_MIN` | 0.5 | Lower clamp of the `iv_floor / iv` scaling a builder applies to its delta; one stale IV print cannot move a strike by more than a factor of two. `engine.py`. |
+| `IV_SCALE_MAX` | 1.5 | Upper clamp of the same scaling. `engine.py`. |
+| `SETTLEMENT_LOSS_TOLERANCE` | 0.000001 | Dollars by which a settled loss may exceed the defined max loss before it is counted as `over_max_loss`; a floating-point tolerance. `engine.py`. |
+| `PROB_CLIP_EPS` | 0.0000001 | Probabilities are clipped to [eps, 1 - eps] before log-loss; numerical safety. `walkforward.py`. |
+
 ## Risk-knob ceilings and the links between them (W86)
 
 Unlike the fixed limits above, these are **tunable** (they live in `config.yaml`), but the **range** each may take is part of the schema in `src/ait/config/settings.py`, so a typo or a bad edit fails
@@ -485,8 +500,8 @@ search_space:                # per-dimension overrides; defaults stay in optimiz
   `rule:` is not `exploratory` and names no PLAN.md heading is refused at start.
 * **Refused on purpose:** `ibkr` / `api_keys`; any setting the **env contract** reads (`backtest.wing_k`, `backtest.ic_*`, `risk.iv_rank_cap`, ...): the
   contract reads the raw `config.yaml` and ignores both overlays, so the value would be silently ignored (use the environment variable or the CLI
-  flag); and worker processes (`run_optimizer.py --n-jobs > 1`, walk-forward `optimize_n_jobs > 1`: spawned workers rebuild settings from plain
-  `config.yaml`). `run_optimizer.py --apply` is refused with a study: params found under a study's settings are not promotable to the live config.
+  flag). Walk-forward window workers (`optimize_n_jobs > 1`) receive the parent's resolved settings through a pool initializer (W88a), and the
+  optimizer's `--n-jobs` uses threads, so both see the overlay and the study. `run_optimizer.py --apply` is refused with a study: params found under a study's settings are not promotable to the live config.
 * **Search-space overrides** are validated (known dimension, same type, `low < high`, inside the hard limits in `param_spaces.HARD_BOUNDS`) and the run
   warns when a range excludes the live value (`wing_k` 1.6, `delta_short` 0.20). The optimizer stores a hash of the effective space on the Optuna study
   and refuses to resume a stored study created over a different space.

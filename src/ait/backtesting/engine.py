@@ -33,6 +33,13 @@ from ait.backtesting.pricing import (
 )
 from ait.backtesting import iv_model  # W87a: the IV proxy constants, shared with the parity replay
 from ait.backtesting import settlement  # W77: expiry settlement / assignment rules
+from ait.config.invariants_research import (  # W88a: fixed research limits, one visible home
+    IV_SCALE_MAX,
+    IV_SCALE_MIN,
+    RESEARCH_DELTA_MAX,
+    RESEARCH_DELTA_MIN,
+    SETTLEMENT_LOSS_TOLERANCE,
+)
 from ait.backtesting.result import BacktestResult
 from ait.backtesting.ex_div import ex_div_blocks, sells_a_call  # W84: live's ex-div entry block
 # R20 #5a: credit TP ladder / DTE close / macro-flatten windows come from the
@@ -2385,9 +2392,9 @@ class Backtester:
         elif strategy == "long_strangle":
             # Buy OTM call + buy OTM put — profit from large moves in either direction.
             # Delta is IV-scaled: high IV → go further OTM for cheaper entry on vol expansion.
-            iv_scale = max(0.5, min(1.5, self._iv_floor / iv))
+            iv_scale = max(IV_SCALE_MIN, min(IV_SCALE_MAX, self._iv_floor / iv))
             effective_delta = self._delta_long * (1.0 + self._delta_iv_scale * (iv_scale - 1.0))
-            effective_delta = max(0.05, min(0.45, effective_delta))
+            effective_delta = max(RESEARCH_DELTA_MIN, min(RESEARCH_DELTA_MAX, effective_delta))
             call_strike = find_strike_by_delta(S, t, iv, effective_delta, OptionType.CALL, r)
             put_strike  = find_strike_by_delta(S, t, iv, -effective_delta, OptionType.PUT, r)
 
@@ -2952,9 +2959,9 @@ class Backtester:
         elif strategy == "short_strangle":
             # Sell OTM call + sell OTM put — no wings (naked short premium).
             # Delta is IV-scaled: high IV → go further OTM for more breathing room.
-            iv_scale = max(0.5, min(1.5, self._iv_floor / iv))
+            iv_scale = max(IV_SCALE_MIN, min(IV_SCALE_MAX, self._iv_floor / iv))
             effective_delta = self._delta_short * (1.0 + self._delta_iv_scale * (iv_scale - 1.0))
-            effective_delta = max(0.05, min(0.45, effective_delta))
+            effective_delta = max(RESEARCH_DELTA_MIN, min(RESEARCH_DELTA_MAX, effective_delta))
             short_call = find_strike_by_delta(S, t, iv, effective_delta, OptionType.CALL, r)
             short_put  = find_strike_by_delta(S, t, iv, -effective_delta, OptionType.PUT, r)
 
@@ -3784,7 +3791,7 @@ class Backtester:
         fees = res.fees * 100 * contracts
         pnl = gross - fees - pos.get("entry_commission", 0)
         max_loss = pos.get("max_loss")
-        if max_loss is not None and gross < -float(max_loss) - 1e-6:
+        if max_loss is not None and gross < -float(max_loss) - SETTLEMENT_LOSS_TOLERANCE:
             self._bump_settle("over_max_loss")   # the loss exceeded the DEFINED maximum
         return {
             "exit_date": exit_date, "exit_time": exit_time, "exit_reason": reason,

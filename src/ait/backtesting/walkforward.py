@@ -29,6 +29,7 @@ from ait.backtesting.engine import Backtester
 from ait.backtesting.learner import BacktestLearner
 from ait.backtesting.range_bank import RangeModelBank
 from ait.backtesting.result import BacktestResult
+from ait.config.invariants_research import PROB_CLIP_EPS  # W88a
 from ait.config.settings import MLConfig
 from ait.ml.ensemble import DirectionPredictor
 from ait.strategies.base import SignalDirection
@@ -1074,6 +1075,18 @@ def _isnan(v: object) -> bool:
         return False
 
 
+def _init_worker_settings(settings) -> None:
+    """Pool initializer (W88a): make the PARENT's resolved settings this worker's configuration.
+
+    Spawned workers import fresh and ``load_settings()`` would read plain ``config.yaml``, silently dropping
+    the research overlay and any study layer for every value code reads that way (only ``WalkForwardConfig``
+    fields crossed the pool before). ``freeze_settings`` is the same mechanism the research entry points use in
+    the parent. ``None`` (no config loadable in the parent) leaves the worker on its own defaults."""
+    if settings is not None:
+        from ait.config.settings import freeze_settings
+        freeze_settings(settings)
+
+
 def _window_task_mp(args: tuple) -> tuple:
     """Worker for ProcessPoolExecutor window-level parallelism.
 
@@ -1297,7 +1310,9 @@ class WalkForwardBacktester:
                 )
                 for i, (train_start, train_end, test_start, test_end) in enumerate(windows)
             ]
-            with ProcessPoolExecutor(max_workers=self._config.optimize_n_jobs) as executor:
+            with ProcessPoolExecutor(max_workers=self._config.optimize_n_jobs,
+                                     initializer=_init_worker_settings,
+                                     initargs=(self._settings,)) as executor:
                 mp_results = list(executor.map(_window_task_mp, args_list))
 
             for _wid, wr, curr_best_params, _meta_status, _fun, _opt in sorted(mp_results, key=lambda x: x[0]):
@@ -2439,7 +2454,7 @@ class WalkForwardBacktester:
 
         p = _np.asarray(p_scores, dtype=float)
         y = _np.asarray(y_true,   dtype=float)
-        p = _np.clip(p, 1e-7, 1.0 - 1e-7)
+        p = _np.clip(p, PROB_CLIP_EPS, 1.0 - PROB_CLIP_EPS)
 
         n = len(y)
         result: dict = {"p_scores": p.tolist()}  # kept internally; stripped before JSON

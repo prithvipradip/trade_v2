@@ -9,6 +9,8 @@ These are consumed by StrategyOptimizer._suggest_params().
 
 from __future__ import annotations
 
+from ait.config.invariants_research import RESEARCH_DELTA_MAX, RESEARCH_DELTA_MIN  # W88a
+
 FRACTAL_GATE_SPACE: dict[str, tuple] = {
     "hurst_regime_threshold": ("float", 0.08, 0.30),
     "hurst_regime_penalty":   ("float", 0.0,  0.25),
@@ -227,7 +229,7 @@ ML_SPACES: dict[str, dict[str, tuple]] = {
 # engine's own (the 0.05-0.45 delta clamp) the engine silently clamps anything outside, so a wider range
 # would search values the backtest cannot honour.
 HARD_BOUNDS: dict[str, tuple[float, float]] = {
-    "delta_short": (0.05, 0.45), "delta_long": (0.05, 0.45),
+    "delta_short": (RESEARCH_DELTA_MIN, RESEARCH_DELTA_MAX), "delta_long": (RESEARCH_DELTA_MIN, RESEARCH_DELTA_MAX),
     "wing_k": (0.1, 5.0), "max_hold_days": (1, 45), "max_hold_fraction": (0.0, 1.0),
     "min_confidence": (0.0, 1.0), "stop_loss_pct": (0.01, 1.0), "profit_target_pct": (0.05, 5.0),
     "trailing_stop_fraction": (0.0, 1.0), "iv_floor": (0.0, 1.0), "delta_iv_scale": (0.0, 1.0),

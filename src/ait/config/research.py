@@ -121,14 +121,6 @@ def assert_registered(study: "Study", plan_path: "str | Path | None" = None) -> 
                          f"{path.name}; append the AS PLANNED entry first, or mark the study exploratory")
 
 
-def require_single_process(study: "Study | None", n_jobs: int | None) -> None:
-    """A study layer is applied to THIS process only: spawned pool workers rebuild settings from plain
-    ``config.yaml`` and would silently drop it. Refuse instead of running a different study."""
-    if study is not None and n_jobs and n_jobs > 1:
-        raise ValueError(f"study {study.name!r}: --n-jobs {n_jobs} would run in worker processes that do not "
-                         "see the study's settings; use a single process")
-
-
 def resolve_universe(symbols: "list[str] | None", strategies: "list[str] | None",
                      settings: Settings) -> tuple[list[str], list[str]]:
     """(symbols, strategies) a research entry point runs: the explicit CLI lists, else the config.
@@ -139,6 +131,43 @@ def resolve_universe(symbols: "list[str] | None", strategies: "list[str] | None"
     """
     return (list(symbols) if symbols else list(settings.backtest.default_symbols),
             list(strategies) if strategies else list(settings.options.strategies))
+
+
+def _leaves(d: dict, prefix: str = "") -> dict[str, object]:
+    """Nested mapping -> {"a.b.c": leaf}; lists and scalars are leaves."""
+    out: dict[str, object] = {}
+    for k, v in (d or {}).items():
+        key = f"{prefix}{k}"
+        if isinstance(v, dict) and v:
+            out.update(_leaves(v, key + "."))
+        else:
+            out[key] = v
+    return out
+
+
+def settings_origin(base_config: "str | Path" = "config.yaml",
+                    study: "Study | str | Path | None" = None) -> dict[str, tuple[object, str]]:
+    """{dotted.key: (value, origin)} for every non-secret setting of the research view (W88a).
+
+    ``origin`` is the LAYER that decides the value: ``study`` > ``overlay`` (config_research.yaml) >
+    ``config.yaml`` > ``default`` (the schema default). This is the one place a researcher can see every
+    tunable with where it comes from, without any value being copied into a second file."""
+    study_obj = None if study is None else (study if isinstance(study, Study) else load_study(study))
+    effective = load_research_settings(base_config, study_obj).model_dump(mode="json")
+    layers = (
+        ("study", _leaves(study_obj.settings) if study_obj else {}),
+        ("overlay", _leaves(yaml.safe_load(research_overlay_path(base_config).read_text()) or {})),
+        ("config.yaml", _leaves(yaml.safe_load(Path(base_config).read_text()) or {})),
+    )
+    from ait.config.settings import _SECRET_SECTIONS, _is_secret
+    out: dict[str, tuple[object, str]] = {}
+    for dotted, value in _leaves(effective).items():
+        section = dotted.split(".", 1)[0]
+        if section in _SECRET_SECTIONS or _is_secret(section, dotted.rsplit(".", 1)[-1]):
+            continue
+        origin = next((name for name, leaves in layers if dotted in leaves), "default")
+        out[dotted] = (value, origin)
+    return out
 
 
 def research_overlay_path(base_config: str | Path = "config.yaml") -> Path:
@@ -161,4 +190,6 @@ def use_research_config(base_config: str | Path = "config.yaml",
     """Make base+overlay(+study) this PROCESS's configuration (research entry points only)."""
     settings = load_research_settings(base_config, study)
     freeze_settings(settings)
+    from ait.config.invariants_research import log_research_invariants   # W88a: the fixed limits, once per process
+    log_research_invariants()
     return settings

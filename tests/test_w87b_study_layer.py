@@ -4,7 +4,7 @@
   * it is a THIRD layer: study > research overlay > base config, applied to this process only
   * the run record holds what decides a result and never a secret; MLflow is optional and never fails a run
   * every committed study's ``rule:`` is ``exploratory`` or an existing PLAN.md heading
-  * the entry points take ``--study-file`` and refuse it with worker processes
+  * the entry points take ``--study-file``; pool workers receive the parent's settings (W88a)
 """
 from __future__ import annotations
 
@@ -166,14 +166,6 @@ class TestThreeLayers:
         assert load_settings().backtest.max_concurrent_positions == 2        # the frozen view
         from ait.backtesting.walkforward import WalkForwardConfig
         assert WalkForwardConfig(train_window_models=False).max_concurrent_positions == 2
-
-    def test_a_worker_pool_is_refused(self):
-        s = rs.Study(name="a", question="q", rule="exploratory")
-        rs.require_single_process(s, 1)
-        rs.require_single_process(s, None)
-        rs.require_single_process(None, 8)
-        with pytest.raises(ValueError, match="worker processes"):
-            rs.require_single_process(s, 2)
 
 
 # --------------------------------------------------------------------------
@@ -453,19 +445,6 @@ class TestRunBacktestAppliesTheStudy:
         with pytest.raises(ValueError, match="neither 'exploratory' nor a heading"):
             self._run(monkeypatch, ["--study-file", str(p)])
 
-    def test_worker_windows_are_refused_with_a_study(self, monkeypatch, study_file):
-        from dataclasses import dataclass
-
-        import run_backtest as rb
-
-        @dataclass
-        class FourWorkers(rb.WalkForwardConfig):
-            optimize_n_jobs: int = 4
-
-        monkeypatch.setattr(rb, "WalkForwardConfig", FourWorkers)
-        with pytest.raises(ValueError, match="worker processes"):
-            self._run(monkeypatch, ["--study-file", str(study_file)])
-
 
 class TestRunOptimizerAppliesTheStudy:
     def _main(self, monkeypatch, argv):
@@ -497,8 +476,58 @@ class TestRunOptimizerAppliesTheStudy:
         with pytest.raises(SystemExit, match="REFUSING --apply"):
             ro.main()
 
-    def test_worker_processes_are_refused_with_a_study(self, monkeypatch, study_file):
-        import run_optimizer as ro
-        monkeypatch.setattr(sys, "argv", ["run_optimizer.py", "--study-file", str(study_file), "--n-jobs", "3"])
-        with pytest.raises(ValueError, match="worker processes"):
-            ro.main()
+
+class TestPoolWorkersKeepTheResearchLayers:
+    """W88a: spawned walk-forward workers used to rebuild settings from plain config.yaml."""
+
+    def test_the_initializer_makes_the_parents_settings_the_workers(self):
+        from ait.backtesting.walkforward import _init_worker_settings
+        s = load_settings()
+        moved = s.model_copy(update={"backtest": s.backtest.model_copy(update={"max_concurrent_positions": 7})})
+        _init_worker_settings(moved)
+        assert load_settings().backtest.max_concurrent_positions == 7
+        _init_worker_settings(None)                                    # nothing to freeze: a no-op
+        assert load_settings().backtest.max_concurrent_positions == 7
+
+    def test_a_real_spawned_worker_sees_an_overlay_only_value(self):
+        """The executed path: a spawn pool built the way the walk-forward builds it."""
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor
+
+        from ait.backtesting.walkforward import _init_worker_settings
+        s = load_settings()
+        moved = s.model_copy(update={"backtest": s.backtest.model_copy(update={"max_concurrent_positions": 7})})
+        with ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"),
+                                 initializer=_init_worker_settings, initargs=(moved,)) as ex:
+            got = ex.submit(load_settings).result(timeout=120)
+        assert got.backtest.max_concurrent_positions == 7
+        with ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn")) as ex:   # the old behaviour
+            assert ex.submit(load_settings).result(timeout=120).backtest.max_concurrent_positions != 7
+
+    def test_the_walk_forward_builds_its_pool_with_the_initializer(self, monkeypatch):
+        """Run the parallel branch with a recording pool class and check how it is built."""
+        import asyncio
+
+        import concurrent.futures as cf
+
+        from ait.backtesting import walkforward as wf
+        built = {}
+
+        class RecordingPool:
+            def __init__(self, *a, **kw):
+                built.update(kw)
+                raise RuntimeError("stop")
+
+        monkeypatch.setattr(cf, "ProcessPoolExecutor", RecordingPool)
+        monkeypatch.setattr(wf.WalkForwardBacktester, "_pretrain_range_models", lambda self, *a, **k: [{} for _ in range(99)])
+        import numpy as np
+        import pandas as pd
+        idx = pd.date_range("2022-01-03", periods=900, freq="B")
+        close = 400 * np.cumprod(1 + np.full(900, 0.0003))
+        df = pd.DataFrame({"Open": close, "High": close, "Low": close, "Close": close,
+                           "Volume": np.full(900, 5e6)}, index=idx)
+        cfg = wf.WalkForwardConfig(optimize_n_jobs=2, train_window_models=False, history_start_date=None)
+        bt = wf.WalkForwardBacktester(symbols=["QQQ"], strategies=["iron_condor"], config=cfg)
+        with pytest.raises(RuntimeError, match="stop"):
+            asyncio.run(bt.run(data={"QQQ": df}))
+        assert built["initializer"] is wf._init_worker_settings and built["initargs"] == (bt._settings,)

@@ -465,7 +465,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--study-file", default=None, metavar="PATH",
                    help="W87b: a studies/<name>.yaml merged over config.yaml + config_research.yaml for THIS run "
                         "(settings: overrides, search_space: overrides). A pre-registered study must name a "
-                        "PLAN.md heading in its rule:. Refused with --optimize-n-jobs > 1.")
+                        "PLAN.md heading in its rule:.")
     p.add_argument("--no-run-record", action="store_true", default=False,
                    help="W87b: do not write reports/runs/<run_id>/run_record.json (or log to MLflow).")
     p.add_argument("--compare-exits", action="store_true", help="Compare fixed vs trailing stops")
@@ -506,7 +506,7 @@ def _write_run_record(args, study, settings, cfg, result, manifest) -> None:
     Never fails the run."""
     try:
         from ait.backtesting.run_record import finish_run
-        from ait.config.research import research_overlay_path
+        from ait.config.research import research_overlay_path, settings_origin
         from ait.optimization.param_spaces import effective_space, space_hash
         spaces = {}
         if cfg.optimize_per_window:
@@ -523,6 +523,7 @@ def _write_run_record(args, study, settings, cfg, result, manifest) -> None:
             study_path=study.path if study else None,
             study=({"name": study.name, "question": study.question, "rule": study.rule,
                     "settings": study.settings, "search_space": study.search_space} if study else None),
+            settings_origin=settings_origin("config.yaml", study),
             cli_args={k: v for k, v in vars(args).items()}, symbols=args.symbols,
             db_path=args.db_path, search_space=spaces or None,
             search_space_hash=space_hash(spaces) if spaces else None,
@@ -538,7 +539,7 @@ async def run_backtest(args: argparse.Namespace) -> None:
     # W68: config.yaml + config_research.yaml is THIS process's configuration (research only;
     # the live bot never loads the overlay). Fails loudly if the overlay file is missing.
     from ait.config.research import (
-        assert_registered, load_study, require_single_process, resolve_universe, use_research_config)
+        assert_registered, load_study, resolve_universe, use_research_config)
     _study = load_study(args.study_file) if args.study_file else None     # W87b: the third config layer
     if _study is not None:
         assert_registered(_study)
@@ -636,7 +637,6 @@ async def run_backtest(args: argparse.Namespace) -> None:
         macro_event_gate=args.macro_gate,
         search_space_overrides=(_study.search_space or None) if _study is not None else None,   # W87b
     )
-    require_single_process(_study, cfg.optimize_n_jobs)    # W87b: window workers would drop the study layer
 
     bt = WalkForwardBacktester(
         symbols=args.symbols,

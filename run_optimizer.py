@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", type=str, default="config.yaml", help="Path to config.yaml")
     p.add_argument("--study-file", default=None, metavar="PATH",
                    help="W87b: a studies/<name>.yaml merged over config.yaml + config_research.yaml for THIS run "
-                        "(settings: and search_space: overrides). Needs --n-jobs 1; cannot be combined with "
+                        "(settings: and search_space: overrides). Cannot be combined with "
                         "--apply (params found under study settings must not be written to the live config).")
     p.add_argument("--no-run-record", action="store_true", default=False,
                    help="W87b: do not write reports/runs/<run_id>/run_record.json (or log to MLflow).")
@@ -109,7 +109,7 @@ def _write_run_record(args, study, settings, optimizer, result, prefix) -> None:
     with the merged search space and its hash. Never fails the run."""
     try:
         from ait.backtesting.run_record import finish_run
-        from ait.config.research import research_overlay_path
+        from ait.config.research import research_overlay_path, settings_origin
         metrics = {"best_value": result.best_value, "n_trials": args.n_trials,
                    "usable": 1.0 if result.usable else 0.0, "best_n_trades": result.best_n_trades}
         run_dir, mlflow_id = finish_run(
@@ -118,6 +118,7 @@ def _write_run_record(args, study, settings, optimizer, result, prefix) -> None:
             study_path=study.path if study else None,
             study=({"name": study.name, "question": study.question, "rule": study.rule,
                     "settings": study.settings, "search_space": study.search_space} if study else None),
+            settings_origin=settings_origin(args.config, study),
             cli_args=dict(vars(args)), symbols=args.symbols, db_path=args.db_path,
             search_space=optimizer.effective_search_space(), search_space_hash=optimizer.search_space_hash(),
             seeds={"optuna_seed": getattr(optimizer, "_seed", None)},
@@ -132,11 +133,10 @@ def main() -> None:
     args = parse_args()
 
     from ait.config.research import (
-        assert_registered, load_study, require_single_process, resolve_universe, use_research_config)
+        assert_registered, load_study, resolve_universe, use_research_config)
     _study = load_study(args.study_file) if args.study_file else None     # W87b: the third config layer
     if _study is not None:
         assert_registered(_study)
-        require_single_process(_study, args.n_jobs)
         if args.apply:
             sys.exit("REFUSING --apply with --study-file: params found under a study's settings / search space "
                      "are not promotable to the live config; promote through a registered wave.")
