@@ -429,3 +429,39 @@ class TestRunRefreshSafety:
         m.main(["--symbol", "QQQ", "--start-date", "2026-05-01",
                "--end-date", "2026-06-01"])
         assert captured["expired_from"] is None
+
+
+# ---------------------------------------------------------------------------
+# W85b: never use today's (possibly partial) underlying row
+# ---------------------------------------------------------------------------
+
+class TestCompletedSessionsOnly:
+    def test_drops_today_and_later_keeps_earlier(self):
+        closes = _closes({"2026-10-20": 717.6, "2026-10-21": 725.2, "2026-10-22": 711.2})
+        out = m.completed_sessions_only(closes, date(2026, 10, 22))
+        assert list(out.index.strftime("%Y-%m-%d")) == ["2026-10-20", "2026-10-21"]
+
+    def test_run_ignores_a_row_dated_today(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(m, "STATUS_FILE", tmp_path / "status.json")
+        monkeypatch.setenv("POLYGON_API_KEY", "fake-key-for-test")
+        store = _temp_store()
+        _seed_underlying(store)  # 2026-06-01
+        today = m.today_et()
+        store.save("QQQ", pd.DataFrame(
+            {"Open": [1.0], "High": [1.0], "Low": [1.0], "Close": [1.0], "Volume": [1]},
+            index=pd.to_datetime([str(today)])))  # a partial mid-session bar
+        monkeypatch.setattr(m, "HistoricalDataStore", lambda **kw: store)
+        captured = {}
+
+        def _enum(client, symbol, start, end, moneyness, closes, max_contracts=None,
+                  expired_from=None):
+            captured["end"] = end
+            captured["last_close_date"] = closes.index.max().date()
+            return []
+
+        monkeypatch.setattr(m, "enumerate_contracts", _enum)
+        rc = m.main(["--symbol", "QQQ", "--start-date", "2026-05-01",
+                    "--end-date", str(today)])
+        assert rc == 0
+        assert captured["end"] == date(2026, 6, 1)
+        assert captured["last_close_date"] == date(2026, 6, 1)

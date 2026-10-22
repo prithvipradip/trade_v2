@@ -18601,3 +18601,12 @@ FALLBACK values (50.0, 0.20, 0.01 ...). (4) The 39 `registered_followup` census 
 The entry above says 39 `registered_followup` entries in the literal allowlist (twice: item 6 and REGISTERED item 4). It is **38**: structural 43, registered follow-up 38, fixed feature group 10, epsilon 7, dormant path 3, display 3 = 104 functions, 295 literals (counted from `tests/data/literal_allowlist.json`). Nothing else changes.
 
 ---
+
+## 2026-10-22 - W85b (code + finding): option-history cap ignores today's row; WHY the daily retrain stores Yahoo bars
+
+**FINDING (code read + log).** The 10:25 ET retrain flipped QQQ `daily_prices` 2024-10-22..2026-10-22 from IB_TRADES_RTH to YAHOO_UNADJ (9 IB rows left), and stored a PARTIAL 10-22 bar (volume 10.4M, close 711.20). Cause is
+by design, not an IB outage: `master.py` `retrain_models()` builds `MarketDataService(None)` ("W65: no IB client here -> daily bars from Yahoo"), so every daily retrain falls to Yahoo (`daily_history_ib_miss`) and
+`HistoricalDataStore.save` upserts OHLCV + `source` (overwriting the IB tag; Yahoo volume ~1.5x IB). Earlier retrains had not run since ~10-13 (the supervisor was down), which is why IB rows survived until today.
+This sits against W65's "IB-first" intent for stored bars. NOT changed (master.py / trainer are the operator's call). Options: a source-preserving save (do not overwrite an IB row with Yahoo), or give the retrain an IB client.
+**Built.** `backfill_option_history.py`: `completed_sessions_only()` - the underlying closes used (moneyness band, IV solve, end cap) are strictly before today (ET); contracts expiring today wait for the next run.
+Residual: an earlier-dated row also written mid-session and never rewritten. Tests +2 (22 in file). Option data already stored (cap 10-20) is unaffected.

@@ -55,8 +55,9 @@ week, ~5.5h at the default pause.
     that failed or returned no bars last time.
   - Later refreshes: `--since-last` lists only expiries from the latest stored one
     onward (fast); run the plain command now and then to catch retries.
-  - The run is capped at the underlying's last stored close in daily_prices
-    (logged as underlying_closes_cap): contracts expiring after it are deferred to
+  - The run is capped at the underlying's last stored COMPLETED close in daily_prices
+    -- rows dated today (ET) are ignored, since the retrain can store a partial
+    mid-session bar (W85b) -- (logged as underlying_closes_cap): contracts expiring after it are deferred to
     the next run rather than stored with missing tail bars. daily_prices is
     refreshed by the supervisor's daily retrain.
 
@@ -176,6 +177,19 @@ def in_moneyness_band_over_life(
     lo = float(window.min()) * (1 - max_moneyness)
     hi = float(window.max()) * (1 + max_moneyness)
     return lo <= strike <= hi
+
+
+def completed_sessions_only(closes: "pd.Series", today: date) -> "pd.Series":
+    """W85b: the underlying's closes strictly BEFORE `today` (ET).
+
+    The daily retrain (a subprocess with no IB client, so Yahoo) upserts daily_prices
+    mid-session, so a row dated today can be a partial bar (e.g. 10:25 ET, 10.4M volume).
+    Using it would bake a mid-day price into the solved IV of every bar on that date,
+    permanently (the resume-skip never revisits a stored contract). Contracts expiring
+    today are simply deferred to the next run. Residual risk: a row for an earlier date
+    that was also written mid-session and never re-written; the retrain's next run fixes it.
+    """
+    return closes[closes.index < pd.Timestamp(today)]
 
 
 # ---------------------------------------------------------------------------
@@ -473,7 +487,10 @@ def _run(argv: list[str] | None) -> int:
                  note="daily_prices has no rows for this symbol/window; "
                       "the moneyness filter and IV solve both need it")
         return 1
-    underlying_closes = underlying_df["Close"]
+    underlying_closes = completed_sessions_only(underlying_df["Close"], today_et())
+    if underlying_closes.empty:
+        log.error("no_completed_underlying_sessions", symbol=args.symbol)
+        return 1
 
     # W85: cap the run at the underlying's own last stored close. A bar with no
     # underlying close is dropped (process_contract), and the coarse resume-skip
