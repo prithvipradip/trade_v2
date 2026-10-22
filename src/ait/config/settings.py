@@ -486,13 +486,18 @@ class RiskConfig(_StrictModel):
         return v
 
 
+# W88b: the ONE schema default of the Black-Scholes risk-free rate; the research pricing helpers (pricing.py,
+# replay.py, iv_surface.py, the engine's partial-engine class default) import it instead of repeating 0.05.
+DEFAULT_RISK_FREE_RATE = 0.05
+
+
 class OptionsConfig(_StrictModel):
     delta_range: list[float] = [0.20, 0.50]
     dte_range: list[int] = [14, 45]
     min_open_interest: int = Field(default=100, ge=0)
     min_volume: int = Field(default=50, ge=0)
     max_bid_ask_spread_pct: float = Field(default=0.10, ge=0.01, le=0.50)
-    risk_free_rate: float = Field(default=0.05, ge=0.0, le=0.25,
+    risk_free_rate: float = Field(default=DEFAULT_RISK_FREE_RATE, ge=0.0, le=0.25,
         description="W36: the Black-Scholes risk-free rate used to solve IVs "
                     "and backfill Greeks (was a bare `r = 0.05` in "
                     "options_chain._calculate_greeks). No dividend yield is "
@@ -590,6 +595,166 @@ class DteSearchConfig(_StrictModel):
     @classmethod
     def _v_flat(cls, v: list[int]) -> list[int]:
         return cls._pair(v, 5, 390, "dte_search.flatten_minutes")
+
+
+class LearnerConfig(_StrictModel):
+    """W88b: thresholds of the research ``BacktestLearner`` (backtesting/learner.py), which adapts strategy
+    multipliers, the confidence floor and symbol disabling between walk-forward windows. RESEARCH ONLY: it is a
+    separate mechanism from the live learning layer (``learning:``), so there is no parity link. Every default is
+    the literal the module used before W88; the research overlay file lists them all."""
+
+    windows_before_adapting: int = Field(default=2, ge=1, le=20,
+        description="Windows whose trades must be accumulated before any adaptation (the first window only "
+                    "accumulates).")
+    min_trades_to_learn: int = Field(default=15, ge=2, le=500,
+        description="A strategy / symbol / confidence band needs this many trades before it is judged.")
+    min_trades_to_disable: int = Field(default=25, ge=2, le=1000,
+        description="Trades needed before a strategy or symbol is disabled outright (more evidence than reducing).")
+    protected_strategies: list[str] = Field(default=["iron_condor"],
+        description="Strategies the learner may reduce but never disable (condors are regime-dependent).")
+    strategy_multiplier_min: float = Field(default=0.30, ge=0.0, le=1.0,
+        description="Floor of a strategy's sizing multiplier after reductions.")
+    strategy_multiplier_max: float = Field(default=2.0, ge=1.0, le=10.0,
+        description="Cap of a strategy's sizing multiplier after boosts.")
+    reduce_win_rate: float = Field(default=0.30, ge=0.0, le=1.0,
+        description="Win rate below which (with negative average P&L) a strategy is reduced / disabled.")
+    reduce_factor: float = Field(default=0.80, gt=0.0, lt=1.0,
+        description="Multiplier applied to a losing strategy's size multiplier per adaptation.")
+    reduce_min_change: float = Field(default=0.03, ge=0.0, le=0.5,
+        description="A reduction smaller than this (absolute multiplier change) is not applied.")
+    boost_win_rate: float = Field(default=0.58, ge=0.0, le=1.0,
+        description="Win rate above which (with positive average P&L) a strategy is boosted.")
+    boost_min_trades: int = Field(default=6, ge=1, le=500,
+        description="Trades needed to boost. NOTE: inert at any value <= min_trades_to_learn (the shipped 6 vs 15), "
+                    "because that already gates the strategy loop; it bites once set above it.")
+    boost_factor: float = Field(default=1.20, gt=1.0, le=3.0,
+        description="Multiplier applied to a winning strategy's size multiplier per adaptation.")
+    boost_min_change: float = Field(default=0.05, ge=0.0, le=0.5,
+        description="A boost smaller than this (absolute multiplier change) is not applied.")
+    reenable_win_rate: float = Field(default=0.50, ge=0.0, le=1.0,
+        description="Win rate above which a disabled strategy is re-enabled.")
+    reenable_min_trades: int = Field(default=10, ge=1, le=500,
+        description="Trades needed to re-enable. NOTE: inert at any value <= min_trades_to_learn (the shipped 10 "
+                    "vs 15); it bites once set above it.")
+    reenable_multiplier: float = Field(default=0.5, gt=0.0, le=1.0,
+        description="Size multiplier a re-enabled strategy restarts at.")
+    confidence_cap: float = Field(default=0.85, ge=0.5, le=1.0,
+        description="Highest minimum-confidence the learner may raise the entry floor to.")
+    confidence_low_band_upper: float = Field(default=0.65, ge=0.0, le=1.0,
+        description="Entry confidence below this is the 'low' band the learner watches.")
+    confidence_mid_band_upper: float = Field(default=0.75, ge=0.0, le=1.0,
+        description="Entry confidence below this (and not low) is the 'medium' band.")
+    confidence_raise_win_rate: float = Field(default=0.35, ge=0.0, le=1.0,
+        description="If the low band wins less often than this (with negative average P&L), the floor is raised.")
+    confidence_raise_step: float = Field(default=0.05, gt=0.0, le=0.5,
+        description="How much the minimum-confidence floor is raised per adaptation.")
+    confidence_raise_min_change: float = Field(default=0.01, ge=0.0, le=0.5,
+        description="A raise smaller than this is not applied (the cap was reached).")
+    symbol_disable_win_rate: float = Field(default=0.20, ge=0.0, le=1.0,
+        description="Win rate below which (with negative average P&L and min_trades_to_disable trades) a symbol "
+                    "is disabled for the following windows.")
+    default_entry_confidence: float = Field(default=0.65, ge=0.0, le=1.0,
+        description="Confidence assumed for a trade record that carries none.")
+
+    @model_validator(mode="after")
+    def _ordered(self) -> "LearnerConfig":
+        if not self.strategy_multiplier_min <= 1.0 <= self.strategy_multiplier_max:
+            raise ValueError("learner: strategy_multiplier_min <= 1 <= strategy_multiplier_max")
+        if not self.confidence_low_band_upper < self.confidence_mid_band_upper:
+            raise ValueError("learner: confidence_low_band_upper must be below confidence_mid_band_upper")
+        if self.min_trades_to_disable < self.min_trades_to_learn:
+            raise ValueError("learner: min_trades_to_disable must be >= min_trades_to_learn")
+        return self
+
+
+class LegacyEngineConfig(_StrictModel):
+    """W88b: constants of the research engine's LEGACY / dormant paths (the fallback direction model used when no
+    predictor is loaded, the naked-margin proxy of the strangle builders, the directional-entry margin and the
+    thesis-invalidation exit). None is on the iron-condor path under ``engine_model: realistic``, but each changes
+    results for the structures that do use it, so each is visible here. Defaults = the pre-W88 literals."""
+
+    naked_margin_fraction: float = Field(default=0.20, gt=0.0, le=1.0,
+        description="Margin proxy for NAKED short structures (short strangle): this fraction of spot x 100 per "
+                    "contract. Defined-risk condors size from max loss and never read it.")
+    fallback_weight_5d: float = Field(default=0.6, ge=0.0, le=1.0,
+        description="Weight of the 5-day return in the fallback direction score.")
+    fallback_weight_20d: float = Field(default=0.4, ge=0.0, le=1.0,
+        description="Weight of the 20-day return in the fallback direction score.")
+    fallback_threshold: float = Field(default=0.005, ge=0.0, le=0.1,
+        description="Score magnitude above which the fallback calls BULLISH / BEARISH rather than NEUTRAL.")
+    fallback_confidence_base: float = Field(default=0.5, ge=0.0, le=1.0,
+        description="Confidence of a directional fallback call at zero score magnitude.")
+    fallback_confidence_slope: float = Field(default=10.0, ge=0.0, le=100.0,
+        description="Confidence added per unit of score magnitude.")
+    fallback_confidence_cap: float = Field(default=0.95, ge=0.5, le=1.0,
+        description="Cap of a directional fallback confidence.")
+    fallback_neutral_confidence: float = Field(default=0.4, ge=0.0, le=1.0,
+        description="Confidence the fallback reports for a NEUTRAL call.")
+    bearish_confidence_margin: float = Field(default=0.05, ge=0.0, le=0.5,
+        description="A BEARISH directional entry needs this much more confidence than min_confidence.")
+    thesis_invalidation_confidence: float = Field(default=0.80, ge=0.5, le=1.0,
+        description="Legacy engine only: a prediction at/above this confidence AGAINST an open directional "
+                    "position closes it (inert under engine_model realistic, where condors skip the check).")
+
+    @model_validator(mode="after")
+    def _weights(self) -> "LegacyEngineConfig":
+        if self.fallback_weight_5d + self.fallback_weight_20d <= 0:
+            raise ValueError("legacy_engine: the fallback direction weights cannot both be zero")
+        return self
+
+
+class ObjectivesConfig(_StrictModel):
+    """W88b: constants of the Optuna objectives (optimization/objectives.py): the ``composite`` objective is
+    sharpe_weight x Sharpe + win_rate_weight x win rate - drawdown_penalty x |max drawdown|, and the
+    ``profit_factor`` objective is capped so an infinite profit factor stays comparable."""
+
+    sharpe_weight: float = Field(default=0.4, ge=0.0, le=10.0, description="Weight of the Sharpe ratio.")
+    win_rate_weight: float = Field(default=0.4, ge=0.0, le=10.0, description="Weight of the win rate.")
+    drawdown_penalty: float = Field(default=0.2, ge=0.0, le=10.0,
+        description="Weight of the absolute max drawdown, subtracted.")
+    profit_factor_cap: float = Field(default=10.0, gt=1.0, le=1000.0,
+        description="The profit_factor objective is min(profit factor, this): an infinite factor (no losing "
+                    "trade) must stay finite for Optuna's pruner.")
+
+
+class WalkForwardTuningConfig(_StrictModel):
+    """W88b: walk-forward / optimizer constants that used to be literals in walkforward.py, optimizer.py and
+    the range-threshold helper. RESEARCH ONLY. Defaults = the pre-W88 literals."""
+
+    warm_start_min_win_rate: float = Field(default=0.75, ge=0.0, le=1.0,
+        description="A window's Optuna study is warm-started from the PRIOR window's best parameters only if that "
+                    "window's out-of-sample win rate was at least this (else from the global best).")
+    warm_start_min_trades: int = Field(default=3, ge=0, le=100,
+        description="...and it had at least this many trades.")
+    range_threshold_multiplier: float = Field(default=1.25, gt=0.0, le=5.0,
+        description="Adaptive range threshold = realized vol x sqrt(horizon/252) x this (about 1.25 standard "
+                    "deviations).")
+    range_threshold_low_clip: float = Field(default=0.02, gt=0.0, le=0.5,
+        description="Lower clip of the adaptive range threshold.")
+    range_threshold_high_clip: float = Field(default=0.15, gt=0.0, le=0.9,
+        description="Upper clip of the adaptive range threshold.")
+    range_threshold_lookback_days: int = Field(default=60, ge=10, le=504,
+        description="Trailing days of training data the adaptive threshold's realized vol uses.")
+    range_threshold_min_observations: int = Field(default=10, ge=2, le=504,
+        description="Fewer return observations than this and the threshold falls back.")
+    range_threshold_fallback: float = Field(default=0.05, gt=0.0, le=0.5,
+        description="The fixed +/- containment band used when the adaptive threshold cannot be computed "
+                    "(= live's range-model band).")
+    optimize_val_split_ratio: float = Field(default=0.20, gt=0.0, lt=0.5,
+        description="Fraction of an Optuna training window held out as validation when the objective is "
+                    "scored on a validation slice (H2).")
+    inert_probe_iv_fallback: float = Field(default=0.15, gt=0.0, le=2.0,
+        description="IV assumed by the 'is wing_k inert' probe when the data carries no implied vol.")
+    inert_probe_iv_quantile: float = Field(default=0.10, ge=0.0, le=1.0,
+        description="Quantile of the data's IV the probe uses (the low end: the narrowest wing the study needs).")
+    inert_probe_dte_fallback: int = Field(default=21, ge=1, le=60,
+        description="Entry DTE the probe assumes when no settings are loaded.")
+
+    @model_validator(mode="after")
+    def _clips(self) -> "WalkForwardTuningConfig":
+        if not self.range_threshold_low_clip < self.range_threshold_high_clip:
+            raise ValueError("walkforward_tuning: range_threshold_low_clip must be below range_threshold_high_clip")
+        return self
 
 
 class BacktestConfig(_StrictModel):
@@ -963,6 +1128,15 @@ class BacktestConfig(_StrictModel):
                     "backstop so no position reaches settlement, assignment or an "
                     "unhedged gap after a one-sided expiry (the exposure that cost two "
                     "manual trades more than their defined maximum).")
+    learner: LearnerConfig = Field(default_factory=LearnerConfig,
+        description="W88b: thresholds of the research BacktestLearner (listed in full in the research overlay file).")
+    legacy_engine: LegacyEngineConfig = Field(default_factory=LegacyEngineConfig,
+        description="W88b: constants of the engine's legacy / dormant paths (listed in full in the research overlay file).")
+    objectives: ObjectivesConfig = Field(default_factory=ObjectivesConfig,
+        description="W88b: constants of the Optuna objectives (composite weights, profit-factor cap).")
+    walkforward_tuning: WalkForwardTuningConfig = Field(default_factory=WalkForwardTuningConfig,
+        description="W88b: walk-forward / optimizer constants (warm start, adaptive range threshold, validation "
+                    "split, inert-parameter probe).")
     dte_search: DteSearchConfig = Field(default_factory=DteSearchConfig,
         description="W79a: opt-in DTE dimensions for an Optuna study (see DteSearchConfig). "
                     "Research only; the live bot never reads it.")

@@ -14,6 +14,8 @@ from enum import Enum
 import numpy as np
 from scipy.stats import norm
 
+from ait.config.settings import DEFAULT_RISK_FREE_RATE  # W88b: one schema default for r
+
 
 class OptionType(Enum):
     CALL = "call"
@@ -69,7 +71,7 @@ def bs_delta(
 
 def find_strike_by_delta(
     S: float, t: float, sigma: float, target_delta: float,
-    option_type: OptionType, r: float = 0.05,
+    option_type: OptionType, r: float = DEFAULT_RISK_FREE_RATE,
 ) -> float:
     """Find the strike price for a target delta using bisection.
 

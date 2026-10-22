@@ -28,7 +28,6 @@ from ait.backtesting.pricing import (
     find_strike_by_delta,
     ic_leg_marks,  # W72: single owner of condor leg pricing (engine + parity replay)
     ic_leg_marks_from_ivs,  # W75: the same legs at explicit per-leg (surface) IVs
-    realized_vol,
     skewed_leg_iv,
 )
 from ait.backtesting import iv_model  # W87a: the IV proxy constants, shared with the parity replay
@@ -110,6 +109,7 @@ NEUTRAL_CREDIT_GATED = (
 # ait.config.settings as the ONE shared implementation (also reused by those
 # other call sites); re-imported under the original name so every existing
 # `_resolve_setting(...)` call in this file needs no change.
+from ait.config.settings import DEFAULT_RISK_FREE_RATE, LegacyEngineConfig
 from ait.config.settings import resolve_config_value as _resolve_setting
 
 
@@ -572,6 +572,10 @@ class Backtester:
         self._ex_div_k = ex_div_entry_k_days
         self._research_table_prefix = _research_prefix
         self._risk_free_rate = risk_free_rate           # W81: was a bare 0.05 at three sites
+        # W88b: the legacy / dormant-path constants (fallback direction model, naked-margin proxy, bearish
+        # margin, thesis exit, vol-regime ratio) come from backtest.legacy_engine, not inline literals.
+        self._legacy = (getattr(getattr(_settings, "backtest", None), "legacy_engine", None)
+                        or LegacyEngineConfig())   # a stub settings object degrades to the schema defaults
         self._pct_from_60d_high_threshold = pct_from_60d_high_threshold
         self._min_edge_over_baseline = min_edge_over_baseline
         self._features_cache = features_cache
@@ -1002,7 +1006,7 @@ class Backtester:
                 if confidence < effective_min_conf:
                     self._reject("direction_confidence")
                     continue
-                if direction == SignalDirection.BEARISH and confidence < effective_min_conf + 0.05:
+                if self._bearish_entry_blocked(direction, confidence, effective_min_conf):
                     self._reject("direction_confidence_bearish")
                     continue
 
@@ -1913,20 +1917,23 @@ class Backtester:
         rs = avg_gain / avg_loss
         return float(100.0 - (100.0 / (1.0 + rs)))
 
-    @staticmethod
-    def _simple_direction(hist: pd.DataFrame) -> tuple[SignalDirection, float]:
-        """Estimate direction from recent returns and trend."""
+    def _simple_direction(self, hist: pd.DataFrame) -> tuple[SignalDirection, float]:
+        """Estimate direction from recent returns and trend (the no-predictor fallback; constants in
+        ``backtest.legacy_engine``, W88b)."""
+        lg = self._legacy
         close = hist["Close"]
         ret_5 = close.iloc[-1] / close.iloc[-5] - 1 if len(close) >= 5 else 0.0
         ret_20 = close.iloc[-1] / close.iloc[-20] - 1 if len(close) >= 20 else 0.0
-        score = 0.6 * ret_5 + 0.4 * ret_20
+        score = lg.fallback_weight_5d * ret_5 + lg.fallback_weight_20d * ret_20
 
-        threshold = 0.005
+        threshold = lg.fallback_threshold
         if score > threshold:
-            return SignalDirection.BULLISH, min(0.5 + abs(score) * 10, 0.95)
+            return SignalDirection.BULLISH, min(
+                lg.fallback_confidence_base + abs(score) * lg.fallback_confidence_slope, lg.fallback_confidence_cap)
         elif score < -threshold:
-            return SignalDirection.BEARISH, min(0.5 + abs(score) * 10, 0.95)
-        return SignalDirection.NEUTRAL, 0.4
+            return SignalDirection.BEARISH, min(
+                lg.fallback_confidence_base + abs(score) * lg.fallback_confidence_slope, lg.fallback_confidence_cap)
+        return SignalDirection.NEUTRAL, lg.fallback_neutral_confidence
 
     # ------------------------------------------------------------------
     # Strategy selection — now IV-aware
@@ -1964,11 +1971,8 @@ class Backtester:
         # selection was VIX-aware. Removed rather than context-threaded: the
         # regime proxy below is realized-vol based.
 
-        # IV rank proxy: compare current IV to its range
-        close_arr = hist["Close"].values
-        rv_short = realized_vol(close_arr, window=10)
-        rv_long = realized_vol(close_arr, window=60) if len(close_arr) > 61 else rv_short
-        iv_regime_high = rv_short > rv_long * 1.1  # Short-term vol elevated
+        # W88b: a short-vs-long realized-vol "IV regime high" flag was computed here and never read (its 1.1
+        # ratio was a literal that moved nothing); removed rather than exposed as a knob that does nothing.
 
         # BT-M8: iron_condor used to be FORCED whenever present, silently
         # never trading the other requested strategies (and misleading every
@@ -2122,7 +2126,8 @@ class Backtester:
     _ex_div_k: int = 5
     _ex_dates: list | None = None
     _research_table_prefix: str = "research_"
-    _risk_free_rate: float = 0.05
+    _risk_free_rate: float = DEFAULT_RISK_FREE_RATE
+    _legacy: LegacyEngineConfig = LegacyEngineConfig()      # W88b: a partial engine keeps the schema defaults
     _settlement_stats: dict | None = None
 
     # R16: VIX -> per-symbol implied-vol multipliers (see _get_iv). Unknown
@@ -2933,7 +2938,7 @@ class Backtester:
             net_credit = max(0.0, net_credit - 3 * half_spread * avg_mid)
             if net_credit <= 0:
                 return None
-            margin_per_contract = S * 0.20 * 100
+            margin_per_contract = S * self._legacy.naked_margin_fraction * 100
             if capital < margin_per_contract:
                 return None
             contracts = int(capital * self._position_size_pct / margin_per_contract)
@@ -2982,7 +2987,7 @@ class Backtester:
                 return None
 
             # Margin approx: 20% of underlying per strangle (standard naked-option requirement)
-            margin_per_contract = S * 0.20 * 100
+            margin_per_contract = S * self._legacy.naked_margin_fraction * 100
             contracts = int(capital * self._position_size_pct / margin_per_contract)
             if contracts < 1:
                 return None
@@ -3252,6 +3257,13 @@ class Backtester:
             return black_scholes_price(underlying, pos["strike"], t, r,
                 self._get_leg_iv(iv, pos["strike"], underlying, opt_type), opt_type)
 
+    def _bearish_entry_blocked(self, direction: SignalDirection, confidence: float,
+                               effective_min_conf: float) -> bool:
+        """A BEARISH directional entry needs ``backtest.legacy_engine.bearish_confidence_margin`` more
+        confidence than ``min_confidence`` (W88b: the margin was a literal 0.05 inline in ``run``)."""
+        return (direction == SignalDirection.BEARISH
+                and confidence < effective_min_conf + self._legacy.bearish_confidence_margin)
+
     def _check_thesis_invalidation(
         self, pos: dict, hist: pd.DataFrame
     ) -> dict | None:
@@ -3284,7 +3296,7 @@ class Backtester:
             pred = self._predictor.predict(hist)
         except Exception:
             return None
-        if pred is None or pred.confidence < 0.80:
+        if pred is None or pred.confidence < self._legacy.thesis_invalidation_confidence:
             return None
 
         entry_dir = pos.get("direction", SignalDirection.NEUTRAL.value)

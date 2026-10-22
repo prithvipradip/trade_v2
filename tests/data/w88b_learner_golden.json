@@ -1,0 +1,995 @@
+{
+ "disable_then_reenable": {
+  "final": {
+   "disabled_strategies": [],
+   "disabled_symbols": [],
+   "min_confidence": 0.55,
+   "strategy_multipliers": {
+    "long_put": 1.6907568257433605
+   }
+  },
+  "mult": {
+   "bull_call_spread": 1.0,
+   "iron_condor": 1.0,
+   "long_call": 1.0
+  },
+  "steps": [
+   {},
+   {
+    "adaptations": [
+     {
+      "change": "reduced long_put mult: 1.00 -> 0.80",
+      "strategy": "long_put",
+      "type": "strategy_reduce"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.8
+     }
+    },
+    "window_id": 2
+   },
+   {
+    "adaptations": [
+     {
+      "change": "reduced long_put mult: 0.80 -> 0.64",
+      "strategy": "long_put",
+      "type": "strategy_reduce"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.6400000000000001
+     }
+    },
+    "window_id": 3
+   },
+   {
+    "adaptations": [
+     {
+      "change": "reduced long_put mult: 0.64 -> 0.51",
+      "strategy": "long_put",
+      "type": "strategy_reduce"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.5120000000000001
+     }
+    },
+    "window_id": 4
+   },
+   {
+    "adaptations": [
+     {
+      "change": "reduced long_put mult: 0.51 -> 0.41",
+      "strategy": "long_put",
+      "type": "strategy_reduce"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.40960000000000013
+     }
+    },
+    "window_id": 5
+   },
+   {
+    "adaptations": [
+     {
+      "change": "reduced long_put mult: 0.41 -> 0.33",
+      "strategy": "long_put",
+      "type": "strategy_reduce"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.32768000000000014
+     }
+    },
+    "window_id": 6
+   },
+   {
+    "adaptations": [],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.32768000000000014
+     }
+    },
+    "window_id": 7
+   },
+   {
+    "adaptations": [],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.32768000000000014
+     }
+    },
+    "window_id": 8
+   },
+   {
+    "adaptations": [],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.32768000000000014
+     }
+    },
+    "window_id": 9
+   },
+   {
+    "adaptations": [],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.32768000000000014
+     }
+    },
+    "window_id": 10
+   },
+   {
+    "adaptations": [],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.32768000000000014
+     }
+    },
+    "window_id": 11
+   },
+   {
+    "adaptations": [],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.32768000000000014
+     }
+    },
+    "window_id": 12
+   },
+   {
+    "adaptations": [],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.32768000000000014
+     }
+    },
+    "window_id": 13
+   },
+   {
+    "adaptations": [],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.32768000000000014
+     }
+    },
+    "window_id": 14
+   },
+   {
+    "adaptations": [],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.32768000000000014
+     }
+    },
+    "window_id": 15
+   },
+   {
+    "adaptations": [],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.32768000000000014
+     }
+    },
+    "window_id": 16
+   },
+   {
+    "adaptations": [],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.32768000000000014
+     }
+    },
+    "window_id": 17
+   },
+   {
+    "adaptations": [],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.32768000000000014
+     }
+    },
+    "window_id": 18
+   },
+   {
+    "adaptations": [],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.32768000000000014
+     }
+    },
+    "window_id": 19
+   },
+   {
+    "adaptations": [
+     {
+      "change": "boosted long_put mult: 0.33 -> 0.39",
+      "strategy": "long_put",
+      "type": "strategy_boost"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.3932160000000002
+     }
+    },
+    "window_id": 20
+   },
+   {
+    "adaptations": [
+     {
+      "change": "boosted long_put mult: 0.39 -> 0.47",
+      "strategy": "long_put",
+      "type": "strategy_boost"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.4718592000000002
+     }
+    },
+    "window_id": 21
+   },
+   {
+    "adaptations": [
+     {
+      "change": "boosted long_put mult: 0.47 -> 0.57",
+      "strategy": "long_put",
+      "type": "strategy_boost"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.5662310400000002
+     }
+    },
+    "window_id": 22
+   },
+   {
+    "adaptations": [
+     {
+      "change": "boosted long_put mult: 0.57 -> 0.68",
+      "strategy": "long_put",
+      "type": "strategy_boost"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.6794772480000003
+     }
+    },
+    "window_id": 23
+   },
+   {
+    "adaptations": [
+     {
+      "change": "boosted long_put mult: 0.68 -> 0.82",
+      "strategy": "long_put",
+      "type": "strategy_boost"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.8153726976000003
+     }
+    },
+    "window_id": 24
+   },
+   {
+    "adaptations": [
+     {
+      "change": "boosted long_put mult: 0.82 -> 0.98",
+      "strategy": "long_put",
+      "type": "strategy_boost"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 0.9784472371200004
+     }
+    },
+    "window_id": 25
+   },
+   {
+    "adaptations": [
+     {
+      "change": "boosted long_put mult: 0.98 -> 1.17",
+      "strategy": "long_put",
+      "type": "strategy_boost"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 1.1741366845440004
+     }
+    },
+    "window_id": 26
+   },
+   {
+    "adaptations": [
+     {
+      "change": "boosted long_put mult: 1.17 -> 1.41",
+      "strategy": "long_put",
+      "type": "strategy_boost"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 1.4089640214528005
+     }
+    },
+    "window_id": 27
+   },
+   {
+    "adaptations": [
+     {
+      "change": "boosted long_put mult: 1.41 -> 1.69",
+      "strategy": "long_put",
+      "type": "strategy_boost"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_put": 1.6907568257433605
+     }
+    },
+    "window_id": 28
+   }
+  ],
+  "summary": "  LEARNER STATE:\n    long_put                  | 392 trades | 71% WR | $6,420 | mult=1.69\n    Min confidence adjusted to: 0.55"
+ },
+ "losing_protected_condor": {
+  "final": {
+   "disabled_strategies": [],
+   "disabled_symbols": [
+    "QQQ"
+   ],
+   "min_confidence": 0.6500000000000001,
+   "strategy_multipliers": {
+    "iron_condor": 0.40960000000000013
+   }
+  },
+  "mult": {
+   "bull_call_spread": 1.0,
+   "iron_condor": 0.40960000000000013,
+   "long_call": 1.0
+  },
+  "steps": [
+   {},
+   {
+    "adaptations": [
+     {
+      "change": "reduced iron_condor mult: 1.00 -> 0.80",
+      "strategy": "iron_condor",
+      "type": "strategy_reduce"
+     },
+     {
+      "change": "disabled symbol QQQ (win_rate=18%, avg_pnl=$-63)",
+      "symbol": "QQQ",
+      "type": "symbol_disable"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [
+      "QQQ"
+     ],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "iron_condor": 0.8
+     }
+    },
+    "window_id": 2
+   },
+   {
+    "adaptations": [
+     {
+      "change": "reduced iron_condor mult: 0.80 -> 0.64",
+      "strategy": "iron_condor",
+      "type": "strategy_reduce"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [
+      "QQQ"
+     ],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "iron_condor": 0.6400000000000001
+     }
+    },
+    "window_id": 3
+   },
+   {
+    "adaptations": [
+     {
+      "change": "reduced iron_condor mult: 0.64 -> 0.51",
+      "strategy": "iron_condor",
+      "type": "strategy_reduce"
+     },
+     {
+      "change": "raised min_confidence: 0.55 -> 0.60 (low-conf WR=12%)",
+      "type": "confidence_raise"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [
+      "QQQ"
+     ],
+     "min_confidence": 0.6000000000000001,
+     "strategy_multipliers": {
+      "iron_condor": 0.5120000000000001
+     }
+    },
+    "window_id": 4
+   },
+   {
+    "adaptations": [
+     {
+      "change": "reduced iron_condor mult: 0.51 -> 0.41",
+      "strategy": "iron_condor",
+      "type": "strategy_reduce"
+     },
+     {
+      "change": "raised min_confidence: 0.60 -> 0.65 (low-conf WR=10%)",
+      "type": "confidence_raise"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [
+      "QQQ"
+     ],
+     "min_confidence": 0.6500000000000001,
+     "strategy_multipliers": {
+      "iron_condor": 0.40960000000000013
+     }
+    },
+    "window_id": 5
+   }
+  ],
+  "summary": "  LEARNER STATE:\n    iron_condor               |  70 trades | 20% WR | $-4,200 | mult=0.41\n    Min confidence adjusted to: 0.65\n    Disabled symbols: QQQ"
+ },
+ "losing_then_recovering_unprotected": {
+  "final": {
+   "disabled_strategies": [],
+   "disabled_symbols": [
+    "SPY"
+   ],
+   "min_confidence": 0.7500000000000002,
+   "strategy_multipliers": {
+    "long_call": 0.32768000000000014
+   }
+  },
+  "mult": {
+   "bull_call_spread": 1.0,
+   "iron_condor": 1.0,
+   "long_call": 0.32768000000000014
+  },
+  "steps": [
+   {},
+   {
+    "adaptations": [
+     {
+      "change": "reduced long_call mult: 1.00 -> 0.80",
+      "strategy": "long_call",
+      "type": "strategy_reduce"
+     },
+     {
+      "change": "disabled symbol SPY (win_rate=4%, avg_pnl=$-85)",
+      "symbol": "SPY",
+      "type": "symbol_disable"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [
+      "SPY"
+     ],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_call": 0.8
+     }
+    },
+    "window_id": 2
+   },
+   {
+    "adaptations": [
+     {
+      "change": "reduced long_call mult: 0.80 -> 0.64",
+      "strategy": "long_call",
+      "type": "strategy_reduce"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [
+      "SPY"
+     ],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_call": 0.6400000000000001
+     }
+    },
+    "window_id": 3
+   },
+   {
+    "adaptations": [
+     {
+      "change": "reduced long_call mult: 0.64 -> 0.51",
+      "strategy": "long_call",
+      "type": "strategy_reduce"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [
+      "SPY"
+     ],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "long_call": 0.5120000000000001
+     }
+    },
+    "window_id": 4
+   },
+   {
+    "adaptations": [
+     {
+      "change": "reduced long_call mult: 0.51 -> 0.41",
+      "strategy": "long_call",
+      "type": "strategy_reduce"
+     },
+     {
+      "change": "raised min_confidence: 0.55 -> 0.60 (low-conf WR=5%)",
+      "type": "confidence_raise"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [
+      "SPY"
+     ],
+     "min_confidence": 0.6000000000000001,
+     "strategy_multipliers": {
+      "long_call": 0.40960000000000013
+     }
+    },
+    "window_id": 5
+   },
+   {
+    "adaptations": [
+     {
+      "change": "reduced long_call mult: 0.41 -> 0.33",
+      "strategy": "long_call",
+      "type": "strategy_reduce"
+     },
+     {
+      "change": "raised min_confidence: 0.60 -> 0.65 (low-conf WR=5%)",
+      "type": "confidence_raise"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [
+      "SPY"
+     ],
+     "min_confidence": 0.6500000000000001,
+     "strategy_multipliers": {
+      "long_call": 0.32768000000000014
+     }
+    },
+    "window_id": 6
+   },
+   {
+    "adaptations": [
+     {
+      "change": "raised min_confidence: 0.65 -> 0.70 (low-conf WR=16%)",
+      "type": "confidence_raise"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [
+      "SPY"
+     ],
+     "min_confidence": 0.7000000000000002,
+     "strategy_multipliers": {
+      "long_call": 0.32768000000000014
+     }
+    },
+    "window_id": 7
+   },
+   {
+    "adaptations": [
+     {
+      "change": "raised min_confidence: 0.70 -> 0.75 (low-conf WR=22%)",
+      "type": "confidence_raise"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [
+      "SPY"
+     ],
+     "min_confidence": 0.7500000000000002,
+     "strategy_multipliers": {
+      "long_call": 0.32768000000000014
+     }
+    },
+    "window_id": 8
+   },
+   {
+    "adaptations": [],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [
+      "SPY"
+     ],
+     "min_confidence": 0.7500000000000002,
+     "strategy_multipliers": {
+      "long_call": 0.32768000000000014
+     }
+    },
+    "window_id": 9
+   },
+   {
+    "adaptations": [],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [
+      "SPY"
+     ],
+     "min_confidence": 0.7500000000000002,
+     "strategy_multipliers": {
+      "long_call": 0.32768000000000014
+     }
+    },
+    "window_id": 10
+   },
+   {
+    "adaptations": [],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [
+      "SPY"
+     ],
+     "min_confidence": 0.7500000000000002,
+     "strategy_multipliers": {
+      "long_call": 0.32768000000000014
+     }
+    },
+    "window_id": 11
+   },
+   {
+    "adaptations": [],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [
+      "SPY"
+     ],
+     "min_confidence": 0.7500000000000002,
+     "strategy_multipliers": {
+      "long_call": 0.32768000000000014
+     }
+    },
+    "window_id": 12
+   },
+   {
+    "adaptations": [],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [
+      "SPY"
+     ],
+     "min_confidence": 0.7500000000000002,
+     "strategy_multipliers": {
+      "long_call": 0.32768000000000014
+     }
+    },
+    "window_id": 13
+   },
+   {
+    "adaptations": [],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [
+      "SPY"
+     ],
+     "min_confidence": 0.7500000000000002,
+     "strategy_multipliers": {
+      "long_call": 0.32768000000000014
+     }
+    },
+    "window_id": 14
+   }
+  ],
+  "summary": "  LEARNER STATE:\n    long_call                 | 196 trades | 59% WR | $-240 | mult=0.33\n    Min confidence adjusted to: 0.75\n    Disabled symbols: SPY"
+ },
+ "low_confidence_band_and_bad_symbol": {
+  "final": {
+   "disabled_strategies": [],
+   "disabled_symbols": [
+    "IWM"
+   ],
+   "min_confidence": 0.8000000000000003,
+   "strategy_multipliers": {}
+  },
+  "mult": {
+   "bull_call_spread": 1.0,
+   "iron_condor": 1.0,
+   "long_call": 1.0
+  },
+  "steps": [
+   {},
+   {
+    "adaptations": [
+     {
+      "change": "raised min_confidence: 0.55 -> 0.60 (low-conf WR=0%)",
+      "type": "confidence_raise"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.6000000000000001,
+     "strategy_multipliers": {}
+    },
+    "window_id": 2
+   },
+   {
+    "adaptations": [
+     {
+      "change": "raised min_confidence: 0.60 -> 0.65 (low-conf WR=4%)",
+      "type": "confidence_raise"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.6500000000000001,
+     "strategy_multipliers": {}
+    },
+    "window_id": 3
+   },
+   {
+    "adaptations": [
+     {
+      "change": "raised min_confidence: 0.65 -> 0.70 (low-conf WR=3%)",
+      "type": "confidence_raise"
+     },
+     {
+      "change": "disabled symbol IWM (win_rate=3%, avg_pnl=$-85)",
+      "symbol": "IWM",
+      "type": "symbol_disable"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [
+      "IWM"
+     ],
+     "min_confidence": 0.7000000000000002,
+     "strategy_multipliers": {}
+    },
+    "window_id": 4
+   },
+   {
+    "adaptations": [
+     {
+      "change": "raised min_confidence: 0.70 -> 0.75 (low-conf WR=2%)",
+      "type": "confidence_raise"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [
+      "IWM"
+     ],
+     "min_confidence": 0.7500000000000002,
+     "strategy_multipliers": {}
+    },
+    "window_id": 5
+   },
+   {
+    "adaptations": [
+     {
+      "change": "raised min_confidence: 0.75 -> 0.80 (low-conf WR=4%)",
+      "type": "confidence_raise"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [
+      "IWM"
+     ],
+     "min_confidence": 0.8000000000000003,
+     "strategy_multipliers": {}
+    },
+    "window_id": 6
+   }
+  ],
+  "summary": "  LEARNER STATE:\n    iron_condor               |  96 trades | 43% WR | $-2,490 | mult=1.00\n    Min confidence adjusted to: 0.80\n    Disabled symbols: IWM"
+ },
+ "winning_spread": {
+  "final": {
+   "disabled_strategies": [],
+   "disabled_symbols": [],
+   "min_confidence": 0.55,
+   "strategy_multipliers": {
+    "bull_call_spread": 2.0
+   }
+  },
+  "mult": {
+   "bull_call_spread": 2.0,
+   "iron_condor": 1.0,
+   "long_call": 1.0
+  },
+  "steps": [
+   {},
+   {
+    "adaptations": [
+     {
+      "change": "boosted bull_call_spread mult: 1.00 -> 1.20",
+      "strategy": "bull_call_spread",
+      "type": "strategy_boost"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "bull_call_spread": 1.2
+     }
+    },
+    "window_id": 2
+   },
+   {
+    "adaptations": [
+     {
+      "change": "boosted bull_call_spread mult: 1.20 -> 1.44",
+      "strategy": "bull_call_spread",
+      "type": "strategy_boost"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "bull_call_spread": 1.44
+     }
+    },
+    "window_id": 3
+   },
+   {
+    "adaptations": [
+     {
+      "change": "boosted bull_call_spread mult: 1.44 -> 1.73",
+      "strategy": "bull_call_spread",
+      "type": "strategy_boost"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "bull_call_spread": 1.728
+     }
+    },
+    "window_id": 4
+   },
+   {
+    "adaptations": [
+     {
+      "change": "boosted bull_call_spread mult: 1.73 -> 2.00",
+      "strategy": "bull_call_spread",
+      "type": "strategy_boost"
+     }
+    ],
+    "current_config": {
+     "disabled_strategies": [],
+     "disabled_symbols": [],
+     "min_confidence": 0.55,
+     "strategy_multipliers": {
+      "bull_call_spread": 2.0
+     }
+    },
+    "window_id": 5
+   }
+  ],
+  "summary": "  LEARNER STATE:\n    bull_call_spread          |  70 trades | 80% WR | $2,100 | mult=2.00\n    Min confidence adjusted to: 0.55"
+ }
+}

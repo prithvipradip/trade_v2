@@ -138,6 +138,80 @@ backtest:
                                        # day at 20% (fat fake credits) now that the rank gate lets such days trade. Demoted
                                        # to a pricing sanity floor; live has no level gate.
 
+  # =====================================================================================================
+  # RESEARCH TUNABLES (W88b): research-only keys, listed IN FULL. Each value equals its schema default in
+  # src/ait/config/settings.py ON PURPOSE (like the `parity:` block below): this file is the visible, editable
+  # home; the schema default is only the fallback for a bare construction. They have no config.yaml
+  # counterpart, so listing them does not shadow a live key. A study (studies/<name>.yaml) may override any
+  # of them. The meaning, bounds and provenance of each are the `description=` in settings.py.
+  # A test fails if a field of these four blocks is missing here.
+  # =====================================================================================================
+
+  # --- the research BacktestLearner (backtesting/learner.py): adapts strategy multipliers, the confidence
+  #     floor and symbol disabling between walk-forward windows. NOT the live learning layer (`learning:`). ---
+  learner:
+    windows_before_adapting: 2         # the first window only accumulates
+    min_trades_to_learn: 15            # evidence before a strategy / symbol / confidence band is judged
+    min_trades_to_disable: 25          # evidence before a strategy or symbol is disabled outright
+    protected_strategies: [iron_condor]  # may be reduced, never disabled
+    strategy_multiplier_min: 0.30      # floor of a strategy's size multiplier
+    strategy_multiplier_max: 2.0       # cap of a strategy's size multiplier
+    reduce_win_rate: 0.30              # win rate below which (and negative avg P&L) a strategy is reduced
+    reduce_factor: 0.80                # multiplier x this per reduction
+    reduce_min_change: 0.03            # a reduction smaller than this is not applied (NOTE: with the 0.30 floor this
+                                       #   stalls a protected condor at 0.3277 and makes disabling unreachable)
+    boost_win_rate: 0.58               # win rate above which (and positive avg P&L) a strategy is boosted
+    boost_min_trades: 6                # inert at any value <= min_trades_to_learn (15), which already gates the loop
+    boost_factor: 1.20
+    boost_min_change: 0.05
+    reenable_win_rate: 0.50            # a disabled strategy returns above this win rate
+    reenable_min_trades: 10            # inert at any value <= min_trades_to_learn (15); bites once set above it
+    reenable_multiplier: 0.5           # ... at this size
+    confidence_cap: 0.85               # highest minimum-confidence the learner may raise the entry floor to
+    confidence_low_band_upper: 0.65    # entry confidence below this is the "low" band
+    confidence_mid_band_upper: 0.75    # below this (and not low) is "medium"
+    confidence_raise_win_rate: 0.35    # low band winning less often than this (and losing money) raises the floor
+    confidence_raise_step: 0.05
+    confidence_raise_min_change: 0.01
+    symbol_disable_win_rate: 0.20      # win rate below which (min_trades_to_disable trades) a symbol is disabled
+    default_entry_confidence: 0.65     # confidence assumed for a trade record that carries none
+
+  # --- legacy / dormant engine paths: none is on the iron-condor path under engine_model: realistic, but each
+  #     changes results for the structures that use it ---
+  legacy_engine:
+    naked_margin_fraction: 0.20        # margin proxy for NAKED short structures: this fraction of spot x 100
+    fallback_weight_5d: 0.6            # fallback direction score = w5 * ret_5d + w20 * ret_20d (no predictor loaded)
+    fallback_weight_20d: 0.4
+    fallback_threshold: 0.005          # |score| above this is directional, else NEUTRAL
+    fallback_confidence_base: 0.5      # directional confidence = base + |score| * slope, capped
+    fallback_confidence_slope: 10.0
+    fallback_confidence_cap: 0.95
+    fallback_neutral_confidence: 0.4
+    bearish_confidence_margin: 0.05    # a BEARISH directional entry needs min_confidence + this
+    thesis_invalidation_confidence: 0.80  # legacy engine: an opposing prediction this confident closes a directional position
+
+  # --- Optuna objectives (optimization/objectives.py) ---
+  objectives:
+    sharpe_weight: 0.4                 # composite = sharpe_weight * Sharpe + win_rate_weight * win rate
+    win_rate_weight: 0.4               #             - drawdown_penalty * |max drawdown|
+    drawdown_penalty: 0.2
+    profit_factor_cap: 10.0            # the profit_factor objective is min(PF, this)
+
+  # --- walk-forward / optimizer constants ---
+  walkforward_tuning:
+    warm_start_min_win_rate: 0.75      # warm-start a window's study from the PRIOR window's best params only above this OOS win rate
+    warm_start_min_trades: 3           # ... with at least this many trades (else the global best)
+    range_threshold_multiplier: 1.25   # adaptive range threshold = realized vol x sqrt(horizon/252) x this
+    range_threshold_low_clip: 0.02     # clipped to [low, high]
+    range_threshold_high_clip: 0.15
+    range_threshold_lookback_days: 60  # trailing days of training data the realized vol uses
+    range_threshold_min_observations: 10  # fewer return observations => the fallback band
+    range_threshold_fallback: 0.05     # fixed +/- containment band (live's range-model band) when the adaptive one cannot be computed
+    optimize_val_split_ratio: 0.20     # share of an Optuna training window held out as validation (when scored on a validation slice)
+    inert_probe_iv_fallback: 0.15      # the "is wing_k inert" probe: IV assumed when the data has none
+    inert_probe_iv_quantile: 0.10      # ... else this quantile of the data's IV (the narrowest wing the study needs)
+    inert_probe_dte_fallback: 21       # ... and this entry DTE when no settings are loaded
+
 # --- W72: parity replay tolerances (scripts/parity_replay.py; schema: ParityConfig) ---
 # Research-only: decides whether a DTE band's research can be trusted before an Optuna study is run on it.
 # Values equal the schema defaults ON PURPOSE: this block is the operator-visible, editable home of the

@@ -39,7 +39,6 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 _FETCH_WEEKEND_HOLIDAY_BUFFER_DAYS = 30
 _FETCH_MIN_PERIOD_DAYS = 90
 _MIN_BACKTEST_ROWS = 60
-_VAL_SPLIT_RATIO = 0.20   # fraction of training window reserved as validation holdout (H2)
 
 
 class _EarlyStopCallback:
@@ -268,6 +267,11 @@ class StrategyOptimizer:
             from ait.config.settings import BacktestConfig as _BTC
             _bt_cfg = _BTC()
         self._bt_baselines = _bt_cfg
+        # W88b: research constants that were module literals (validation split, inert-parameter probe,
+        # objective weights) come from backtest.*; a stub settings object degrades to the schema defaults.
+        from ait.config.settings import ObjectivesConfig as _OC, WalkForwardTuningConfig as _WTC
+        self._tuning = getattr(_bt_cfg, "walkforward_tuning", None) or _WTC()
+        self._objectives_cfg = getattr(_bt_cfg, "objectives", None) or _OC()
         # W64: per-trade budget + live-parity switches, resolved once the loaded
         # settings exist (explicit arg > config > model default).
         from ait.config.settings import (
@@ -512,7 +516,7 @@ class StrategyOptimizer:
             log.debug("trial_backtest_failed", trial=trial.number, error=str(e))
             raise optuna.TrialPruned()
 
-        value = OBJECTIVES[self._objective_name](result)
+        value = OBJECTIVES[self._objective_name](result, self._objectives_cfg)
 
         # Two-tier trade-count guard — prevents degenerate low-sample Sharpe inflation.
         # Tier 1: hard floor — fewer than 3 trades is always a loser regardless of score.
@@ -597,9 +601,9 @@ class StrategyOptimizer:
         k_min = float(spec[1])
         affordable = IronCondor.affordable_width(self._initial_capital * self._position_size_pct)
         try:
-            dte = int(self._settings.options.dte_range[0]) if self._settings else 21
+            dte = int(self._settings.options.dte_range[0]) if self._settings else self._tuning.inert_probe_dte_fallback
         except Exception:  # noqa: BLE001
-            dte = 21
+            dte = self._tuning.inert_probe_dte_fallback
         # W79a: the inertness test must hold at the SMALLEST DTE the study can pick, not the
         # configured band's low end (the expected move, hence the wing target, shrinks with DTE).
         if self._entry_dte is not None:
@@ -611,9 +615,9 @@ class StrategyOptimizer:
             if df is None or df.empty:
                 return
             spot = float(df["Close"].iloc[-1])
-            iv = 0.15
+            iv = self._tuning.inert_probe_iv_fallback
             if "implied_vol" in df.columns and df["implied_vol"].notna().any():
-                iv = float(df["implied_vol"].dropna().quantile(0.10))
+                iv = float(df["implied_vol"].dropna().quantile(self._tuning.inert_probe_iv_quantile))
             target = k_min * spot * iv * math.sqrt(dte / 365.0)
             smallest_target = target if smallest_target is None else min(smallest_target, target)
         if smallest_target is not None and affordable < smallest_target:
@@ -720,7 +724,7 @@ class StrategyOptimizer:
         if self._val_split and len(df) >= _MIN_BACKTEST_ROWS * 2:
             # H2: split 80/20. Full df is passed to Backtester for feature warmup;
             # eval_start_date restricts new entries to the val slice only.
-            split_idx = max(_MIN_BACKTEST_ROWS, int(len(df) * (1.0 - _VAL_SPLIT_RATIO)))
+            split_idx = max(_MIN_BACKTEST_ROWS, int(len(df) * (1.0 - self._tuning.optimize_val_split_ratio)))
             val_start = df.index[split_idx]
             eval_start_date = val_start.date() if hasattr(val_start, "date") else val_start
             if len(df) - split_idx < _MIN_BACKTEST_ROWS // 2:

@@ -19,19 +19,26 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from ait.config.settings import LearnerConfig
 from ait.utils.logging import get_logger
 
 log = get_logger("backtesting.learner")
 
-# Safety bounds
-MIN_CONFIDENCE = 0.55
-MAX_CONFIDENCE = 0.85
-MIN_STRATEGY_MULTIPLIER = 0.30
-MAX_STRATEGY_MULTIPLIER = 2.0
-MIN_TRADES_TO_LEARN = 15  # Need enough evidence before adapting
-MIN_TRADES_TO_DISABLE = 25  # Even more before disabling entirely
-# Iron condors are regime-dependent — never permanently disable them
-PROTECTED_STRATEGIES = {"iron_condor"}
+# W88b: every threshold the learner used to hold as a module constant or an inline literal (confidence floor /
+# cap, multiplier bounds, trades needed, win-rate cutoffs, step sizes, protected strategies) is now a field of
+# ``backtest.learner`` (settings.LearnerConfig), listed in full in the research overlay file. The values below are
+# only what a learner with NO state reports as its starting confidence.
+_STATE_DEFAULT_CONFIDENCE = 0.65
+
+
+def _default_config() -> LearnerConfig:
+    """``backtest.learner`` from the loaded settings (the frozen research view in a research process), else the
+    schema defaults."""
+    try:
+        from ait.config.settings import load_settings
+        return load_settings().backtest.learner
+    except Exception:  # noqa: BLE001 - no config.yaml -> the schema defaults
+        return LearnerConfig()
 
 
 @dataclass
@@ -52,7 +59,7 @@ class LearnerState:
     strategy_multipliers: dict[str, float] = field(default_factory=dict)
     disabled_strategies: set[str] = field(default_factory=set)
     disabled_symbols: set[str] = field(default_factory=set)
-    min_confidence_override: float = 0.65
+    min_confidence_override: float = _STATE_DEFAULT_CONFIDENCE
 
     # History of adaptations for transparency
     adaptation_log: list[dict] = field(default_factory=list)
@@ -74,7 +81,9 @@ class BacktestLearner:
             learner.process_window(trades)
     """
 
-    def __init__(self, base_confidence: float = 0.65) -> None:
+    def __init__(self, base_confidence: float = _STATE_DEFAULT_CONFIDENCE,
+                 config: LearnerConfig | None = None) -> None:
+        self._cfg = config if config is not None else _default_config()
         self._state = LearnerState(min_confidence_override=base_confidence)
 
     def process_window(self, trades: list[dict], window_id: int) -> dict:
@@ -89,7 +98,7 @@ class BacktestLearner:
         self._accumulate_stats(trades)
 
         # Only adapt after enough data
-        if self._state.windows_processed < 2:
+        if self._state.windows_processed < self._cfg.windows_before_adapting:
             log.info("learner_accumulating", windows=self._state.windows_processed)
             return {}
 
@@ -151,7 +160,7 @@ class BacktestLearner:
                 f"${stats['pnl']:,.0f} | mult={mult:.2f}{disabled}"
             )
 
-        if self._state.min_confidence_override != 0.65:
+        if self._state.min_confidence_override != _STATE_DEFAULT_CONFIDENCE:
             lines.append(f"    Min confidence adjusted to: {self._state.min_confidence_override:.2f}")
 
         if self._state.disabled_symbols:
@@ -169,7 +178,7 @@ class BacktestLearner:
             pnl = t.get("pnl", 0)
             strategy = t.get("strategy", "unknown")
             symbol = t.get("symbol", "unknown")
-            confidence = t.get("entry_confidence", 0.65)
+            confidence = t.get("entry_confidence", self._cfg.default_entry_confidence)
 
             # Strategy stats
             s = self._state.strategy_stats.setdefault(
@@ -208,10 +217,11 @@ class BacktestLearner:
     def _adapt_strategies(self) -> list[dict]:
         """Adjust strategy multipliers based on cumulative performance."""
         adaptations = []
+        c = self._cfg
 
         for strategy, stats in self._state.strategy_stats.items():
             total = stats["wins"] + stats["losses"]
-            if total < MIN_TRADES_TO_LEARN:
+            if total < c.min_trades_to_learn:
                 continue
 
             win_rate = stats["wins"] / total
@@ -220,9 +230,9 @@ class BacktestLearner:
 
             # Already disabled — check for recovery
             if strategy in self._state.disabled_strategies:
-                if win_rate > 0.50 and avg_pnl > 0 and total >= 10:
+                if win_rate > c.reenable_win_rate and avg_pnl > 0 and total >= c.reenable_min_trades:
                     self._state.disabled_strategies.discard(strategy)
-                    self._state.strategy_multipliers[strategy] = 0.5  # Re-enable at half size
+                    self._state.strategy_multipliers[strategy] = c.reenable_multiplier  # Re-enable at reduced size
                     adaptations.append({
                         "change": f"re-enabled {strategy} (win_rate={win_rate:.0%})",
                         "type": "strategy_reenable",
@@ -231,9 +241,10 @@ class BacktestLearner:
                 continue
 
             # Consistently losing → reduce or disable (protected strategies only reduce, never disable)
-            if win_rate < 0.30 and avg_pnl < 0 and total >= MIN_TRADES_TO_LEARN:
-                is_protected = strategy in PROTECTED_STRATEGIES
-                if current_mult <= MIN_STRATEGY_MULTIPLIER and not is_protected and total >= MIN_TRADES_TO_DISABLE:
+            if win_rate < c.reduce_win_rate and avg_pnl < 0 and total >= c.min_trades_to_learn:
+                is_protected = strategy in c.protected_strategies
+                if (current_mult <= c.strategy_multiplier_min and not is_protected
+                        and total >= c.min_trades_to_disable):
                     # Already at minimum and not protected: disable it
                     self._state.disabled_strategies.add(strategy)
                     self._state.strategy_multipliers.pop(strategy, None)
@@ -242,9 +253,9 @@ class BacktestLearner:
                         "type": "strategy_disable",
                         "strategy": strategy,
                     })
-                elif not (is_protected and current_mult <= MIN_STRATEGY_MULTIPLIER):
-                    new_mult = max(current_mult * 0.80, MIN_STRATEGY_MULTIPLIER)
-                    if abs(new_mult - current_mult) > 0.03:
+                elif not (is_protected and current_mult <= c.strategy_multiplier_min):
+                    new_mult = max(current_mult * c.reduce_factor, c.strategy_multiplier_min)
+                    if abs(new_mult - current_mult) > c.reduce_min_change:
                         self._state.strategy_multipliers[strategy] = new_mult
                         adaptations.append({
                             "change": f"reduced {strategy} mult: {current_mult:.2f} -> {new_mult:.2f}",
@@ -253,9 +264,9 @@ class BacktestLearner:
                         })
 
             # Consistently winning → boost
-            elif win_rate > 0.58 and avg_pnl > 0 and total >= 6:
-                new_mult = min(current_mult * 1.20, MAX_STRATEGY_MULTIPLIER)
-                if new_mult > current_mult + 0.05:
+            elif win_rate > c.boost_win_rate and avg_pnl > 0 and total >= c.boost_min_trades:
+                new_mult = min(current_mult * c.boost_factor, c.strategy_multiplier_max)
+                if new_mult > current_mult + c.boost_min_change:
                     self._state.strategy_multipliers[strategy] = new_mult
                     adaptations.append({
                         "change": f"boosted {strategy} mult: {current_mult:.2f} -> {new_mult:.2f}",
@@ -268,17 +279,18 @@ class BacktestLearner:
     def _adapt_confidence(self) -> list[dict]:
         """Raise min confidence if low-confidence trades consistently lose."""
         adaptations = []
+        c = self._cfg
 
         low_band = self._state.confidence_stats.get("low", {})
         total_low = low_band.get("trades", 0)
 
-        if total_low >= MIN_TRADES_TO_LEARN:
+        if total_low >= c.min_trades_to_learn:
             low_wr = low_band["wins"] / total_low
             low_avg_pnl = low_band["pnl"] / total_low
 
-            if low_wr < 0.35 and low_avg_pnl < 0:
-                new_conf = min(self._state.min_confidence_override + 0.05, MAX_CONFIDENCE)
-                if new_conf > self._state.min_confidence_override + 0.01:
+            if low_wr < c.confidence_raise_win_rate and low_avg_pnl < 0:
+                new_conf = min(self._state.min_confidence_override + c.confidence_raise_step, c.confidence_cap)
+                if new_conf > self._state.min_confidence_override + c.confidence_raise_min_change:
                     old = self._state.min_confidence_override
                     self._state.min_confidence_override = new_conf
                     adaptations.append({
@@ -291,19 +303,20 @@ class BacktestLearner:
     def _adapt_symbols(self) -> list[dict]:
         """Disable symbols that consistently lose."""
         adaptations = []
+        c = self._cfg
 
         for symbol, stats in self._state.symbol_stats.items():
             if symbol in self._state.disabled_symbols:
                 continue
 
             total = stats["wins"] + stats["losses"]
-            if total < MIN_TRADES_TO_LEARN:
+            if total < c.min_trades_to_learn:
                 continue
 
             win_rate = stats["wins"] / total
             avg_pnl = stats["pnl"] / total
 
-            if win_rate < 0.20 and avg_pnl < 0 and total >= MIN_TRADES_TO_DISABLE:
+            if win_rate < c.symbol_disable_win_rate and avg_pnl < 0 and total >= c.min_trades_to_disable:
                 self._state.disabled_symbols.add(symbol)
                 adaptations.append({
                     "change": f"disabled symbol {symbol} (win_rate={win_rate:.0%}, avg_pnl=${avg_pnl:.0f})",
@@ -313,10 +326,9 @@ class BacktestLearner:
 
         return adaptations
 
-    @staticmethod
-    def _confidence_band(confidence: float) -> str:
-        if confidence < 0.65:
+    def _confidence_band(self, confidence: float) -> str:
+        if confidence < self._cfg.confidence_low_band_upper:
             return "low"
-        elif confidence < 0.75:
+        elif confidence < self._cfg.confidence_mid_band_upper:
             return "medium"
         return "high"

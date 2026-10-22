@@ -171,6 +171,26 @@ one: edit the module, update this table (a test compares them), and record it in
 | `SETTLEMENT_LOSS_TOLERANCE` | 0.000001 | Dollars by which a settled loss may exceed the defined max loss before it is counted as `over_max_loss`; a floating-point tolerance. `engine.py`. |
 | `PROB_CLIP_EPS` | 0.0000001 | Probabilities are clipped to [eps, 1 - eps] before log-loss; numerical safety. `walkforward.py`. |
 
+## Research tunables (W88b; research only)
+
+`config_research.yaml` has three jobs (its header says so): the **diff** against `config.yaml` (shared keys appear only where research deliberately differs), the **overlay** applied by research entry points only, and, since W88b, the
+**full list of research-only tunables**. A research-only key has no `config.yaml` counterpart, so it is listed in the overlay IN FULL, with its default and a comment; the schema default in `src/ait/config/settings.py` is only the
+fallback for a bare construction (`Backtester()`, `BacktestLearner()` in a unit test). A test fails if a field of these blocks is missing from the file, and the file's values equal the schema defaults today on purpose
+(the same convention as the `parity:` block). A study (`studies/<name>.yaml`) may override any of them for one run.
+
+| Block (`backtest.`) | What it holds | Code that reads it |
+|---|---|---|
+| `learner` | Thresholds of the research `BacktestLearner`: trades needed to learn / disable, win-rate cutoffs, step sizes, multiplier and confidence bounds, protected strategies. Not the live learning layer. | `backtesting/learner.py` |
+| `legacy_engine` | Constants of the dormant paths: fallback direction model, naked-margin fraction, bearish margin, thesis-invalidation confidence, vol-regime ratio. None is on the iron-condor path under `engine_model: realistic`. | `backtesting/engine.py` |
+| `objectives` | Composite objective weights and the profit-factor cap. | `optimization/objectives.py` (the optimizer passes its own copy) |
+| `walkforward_tuning` | Warm-start thresholds, the adaptive range threshold (multiplier, clips, lookback, fallback band), the validation-split ratio, the inert-parameter probe fallbacks. | `backtesting/walkforward.py`, `optimization/optimizer.py` |
+
+`python scripts/show_research_config.py [--section backtest] [--differs]` prints every value with the layer that decides it (`study` > `overlay` > `config.yaml` > `default`); the same map is stored in every run record
+(`settings_origin`). Values that are **not** tunable (clamps, numerical tolerances) are in "Research fixed limits" above.
+
+Known, preserved behaviour worth knowing before tuning the learner: with the shipped `reduce_min_change` (0.03) and `strategy_multiplier_min` (0.30), a reduced strategy's multiplier stalls at 0.3277, so the "disable a
+strategy" branch is unreachable by default; `boost_min_trades` and `reenable_min_trades` are inert at any value at or below `min_trades_to_learn` (15). The module's old `MIN_CONFIDENCE` constant (0.55) was read by nothing and was dropped. Each is documented on the field.
+
 ## Risk-knob ceilings and the links between them (W86)
 
 Unlike the fixed limits above, these are **tunable** (they live in `config.yaml`), but the **range** each may take is part of the schema in `src/ait/config/settings.py`, so a typo or a bad edit fails

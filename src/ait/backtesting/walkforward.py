@@ -30,7 +30,7 @@ from ait.backtesting.learner import BacktestLearner
 from ait.backtesting.range_bank import RangeModelBank
 from ait.backtesting.result import BacktestResult
 from ait.config.invariants_research import PROB_CLIP_EPS  # W88a
-from ait.config.settings import MLConfig
+from ait.config.settings import MLConfig, WalkForwardTuningConfig
 from ait.ml.ensemble import DirectionPredictor
 from ait.strategies.base import SignalDirection
 from ait.utils.logging import get_logger
@@ -1146,6 +1146,7 @@ class WalkForwardBacktester:
     - Buy-and-hold benchmark comparison
     - Equity curve generation
     """
+    _tuning = WalkForwardTuningConfig()     # W88b: a partial (__new__) instance keeps the schema defaults
 
     def __init__(
         self,
@@ -1193,6 +1194,9 @@ class WalkForwardBacktester:
             self._settings = _ls3()
         except Exception:  # noqa: BLE001 — no config.yaml -> per-field defaults downstream
             self._settings = None
+        # W88b: the walk-forward constants that were literals (warm start, adaptive range threshold, fallback band)
+        self._tuning = (getattr(getattr(self._settings, "backtest", None), "walkforward_tuning", None)
+                        or WalkForwardTuningConfig())
         # R12-C: enable_msgarch/enable_oujump flags removed — the GARCH family
         # is retired to deprecated/research/; range models are ML-only.
 
@@ -1526,7 +1530,7 @@ class WalkForwardBacktester:
             # too (previously only the direction predictor honored the flag,
             # so a "gate_only" ablation arm could run WITH a range gate).
             if not self._config.train_window_models:
-                _range_result = (None, "disabled_by_config", 0.05)
+                _range_result = (None, "disabled_by_config", self._tuning.range_threshold_fallback)
             elif pretrained_range is not None and symbol in pretrained_range:
                 _range_result = pretrained_range[symbol]
             else:
@@ -1539,7 +1543,7 @@ class WalkForwardBacktester:
                 )
             # Guard: tests may monkeypatch _train_window_range_model to return None
             if _range_result is None or not isinstance(_range_result, tuple):
-                range_predictor, _range_model_status, _range_threshold = None, "skipped", 0.05
+                range_predictor, _range_model_status, _range_threshold = None, "skipped", self._tuning.range_threshold_fallback
             else:
                 range_predictor, _range_model_status, _range_threshold = _range_result
 
@@ -1786,13 +1790,13 @@ class WalkForwardBacktester:
                 predictor=predictor,
                 range_predictor=range_predictor,
                 range_min_confidence=_oos_range_min_conf,
-                hurst_regime_threshold=getattr(window_cfg, "hurst_regime_threshold", 0.20),
-                hurst_regime_penalty=getattr(window_cfg, "hurst_regime_penalty", 0.10),
-                hurst_hard_veto_multiplier=getattr(window_cfg, "hurst_hard_veto_multiplier", 1.5),
-                multifractal_max_width=getattr(window_cfg, "multifractal_max_width", 0.50),
-                iv_rank_rise_threshold=getattr(window_cfg, "iv_rank_rise_threshold", 0.30),
-                pct_from_60d_high_threshold=getattr(window_cfg, "pct_from_60d_high_threshold", -1.0),
-                min_edge_over_baseline=getattr(window_cfg, "min_edge_over_baseline", 0.05),
+                hurst_regime_threshold=window_cfg.hurst_regime_threshold,
+                hurst_regime_penalty=window_cfg.hurst_regime_penalty,
+                hurst_hard_veto_multiplier=window_cfg.hurst_hard_veto_multiplier,
+                multifractal_max_width=window_cfg.multifractal_max_width,
+                iv_rank_rise_threshold=window_cfg.iv_rank_rise_threshold,
+                pct_from_60d_high_threshold=window_cfg.pct_from_60d_high_threshold,
+                min_edge_over_baseline=window_cfg.min_edge_over_baseline,
                 iv_floor=window_cfg.iv_floor,
                 wing_floor_dollars=window_cfg.wing_floor_dollars,
                 wing_k=window_cfg.wing_k,
@@ -2107,8 +2111,7 @@ class WalkForwardBacktester:
                 source: str = "cold_start"
 
                 if prior_best_params and prior_oos_result is not None:
-                    if (prior_oos_result.win_rate >= 0.75
-                            and prior_oos_result.total_trades >= 3):
+                    if self._prior_window_is_trusted(prior_oos_result):
                         subset = {k: v for k, v in prior_best_params.items()
                                   if k.startswith(f"{strategy}__")}
                         warm = subset or None
@@ -2679,10 +2682,11 @@ class WalkForwardBacktester:
     def _adaptive_range_threshold(
         train_df: pd.DataFrame,
         horizon_days: int,
-        lookback_days: int = 60,
-        multiplier: float = 1.25,
-        low_clip: float = 0.02,
-        high_clip: float = 0.15,
+        lookback_days: "int | None" = None,
+        multiplier: "float | None" = None,
+        low_clip: "float | None" = None,
+        high_clip: "float | None" = None,
+        tuning: "WalkForwardTuningConfig | None" = None,
     ) -> float:
         """Derive a regime-adaptive range threshold from recent realized volatility.
 
@@ -2693,17 +2697,38 @@ class WalkForwardBacktester:
 
         Clipped to [low_clip, high_clip] to prevent degenerate extremes.
 
+        W88b: every argument left as None comes from ``backtest.walkforward_tuning`` (the loaded settings,
+        else the schema defaults), so the multiplier, the clips, the lookback and the fallback band are visible
+        in the research overlay file.
+
         Example outputs for QQQ:
           Quiet bull run (rvol≈15%): threshold ≈ 4.3% for 21d horizon
           Normal regime (rvol≈20%): threshold ≈ 5.7%
           High-vol spike (rvol≈35%): threshold ≈ 10.1%
         """
+        if tuning is None:
+            try:
+                from ait.config.settings import load_settings
+                tuning = load_settings().backtest.walkforward_tuning
+            except Exception:  # noqa: BLE001 - no config.yaml -> the schema defaults
+                tuning = WalkForwardTuningConfig()
+        lookback_days = tuning.range_threshold_lookback_days if lookback_days is None else lookback_days
+        multiplier = tuning.range_threshold_multiplier if multiplier is None else multiplier
+        low_clip = tuning.range_threshold_low_clip if low_clip is None else low_clip
+        high_clip = tuning.range_threshold_high_clip if high_clip is None else high_clip
         recent = train_df["Close"].pct_change().tail(lookback_days).dropna()
-        if len(recent) < 10:
-            return 0.05  # insufficient data — fall back to fixed default
+        if len(recent) < tuning.range_threshold_min_observations:
+            return tuning.range_threshold_fallback  # insufficient data — fall back to the fixed band
         rvol_annual = float(recent.std() * np.sqrt(252))
         raw = rvol_annual * np.sqrt(horizon_days / 252) * multiplier
         return float(np.clip(raw, low_clip, high_clip))
+
+    def _prior_window_is_trusted(self, prior_oos_result) -> bool:
+        """Warm-start a window's study from the PRIOR window's best parameters only if that window's
+        out-of-sample result was good enough (``backtest.walkforward_tuning.warm_start_*``; W88b: the 0.75 / 3
+        were inline literals)."""
+        return bool(prior_oos_result.win_rate >= self._tuning.warm_start_min_win_rate
+                    and prior_oos_result.total_trades >= self._tuning.warm_start_min_trades)
 
     def _pretrain_range_models(
         self,
@@ -2735,7 +2760,7 @@ class WalkForwardBacktester:
                 reason="train_window_models=False",
             )
             return [
-                {symbol: (None, "disabled_by_config", 0.05) for symbol in data}
+                {symbol: (None, "disabled_by_config", self._tuning.range_threshold_fallback) for symbol in data}
                 for _ in windows
             ]
 
@@ -2747,7 +2772,7 @@ class WalkForwardBacktester:
             for symbol, df in data.items():
                 train_df = df[str(train_start):str(train_end)]
                 if len(train_df) < 50:
-                    per_symbol[symbol] = (None, "insufficient_train_data", 0.05)
+                    per_symbol[symbol] = (None, "insufficient_train_data", self._tuning.range_threshold_fallback)
                     continue
                 log.info(
                     "pretraining_range_model",
@@ -2856,7 +2881,7 @@ class WalkForwardBacktester:
                             bucket: int) -> "tuple[Any | None, str, float]":
         """Train the range model for a non-base bucket (artifacts under models/research/h<N>)."""
         if not self._config.train_window_models:
-            return None, "disabled_by_config", 0.05
+            return None, "disabled_by_config", self._tuning.range_threshold_fallback
         res = self._train_window_range_model(
             train_df, symbol, window_id, max_hold_days=int(bucket),
             model_subdir=f"h{int(bucket)}",

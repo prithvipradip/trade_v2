@@ -37,6 +37,8 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from ait.config.settings import DEFAULT_RISK_FREE_RATE  # W88b: one schema default for r
+
 MIN_VOLUME = 10
 MIN_PRICE = 0.05
 MAX_ABS_M = 0.10
@@ -131,7 +133,7 @@ class IVSurface:
             if got is None:
                 continue
             a, b, c, rmse = got
-            r = float(g[rate_col].median()) if rate_col else 0.05
+            r = float(g[rate_col].median()) if rate_col else DEFAULT_RISK_FREE_RATE
             fits.append(SmileFit(_as_date(d), _as_date(e), a, b, c, int(len(g)),
                                  float(m.min()), float(m.max()), rmse, r))
         return cls(fits)

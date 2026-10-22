@@ -59,12 +59,13 @@ from ait.backtesting.pricing import (
     ic_leg_marks,
     skewed_leg_iv,
 )
+from ait.config.settings import DEFAULT_RISK_FREE_RATE
 from ait.utils.time import ET
 
 # engine.py used a bare r = 0.05 at entry and in the daily re-mark (W72 finding); since W81 it reads
 # options.risk_free_rate and PricingParams.from_backtest_config takes that value from the caller.
 # This constant is only the default when no setting is passed (it equals the config default).
-ENGINE_RISK_FREE_RATE = 0.05
+ENGINE_RISK_FREE_RATE = DEFAULT_RISK_FREE_RATE   # W88b: was a literal; still importable
 EXPIRY_CLOSE_ET = time(16, 0)          # PM-settled ETF options stop trading 16:00 ET
 BAR_MINUTES = 5                        # research_intraday_prices interval
 SCHEMA = "ait.replay.manual_trades/1"
