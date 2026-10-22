@@ -9,6 +9,9 @@ Usage examples:
     # Quick 20-trial search on iron_condor with SPY data
     python run_optimizer.py --strategies iron_condor --symbols SPY --n-trials 20
 
+    # No --symbols / --strategies: backtest.default_symbols (QQQ) and options.strategies (W87a)
+    python run_optimizer.py --n-trials 20
+
     # Multi-strategy composite objective, 4 parallel jobs
     python run_optimizer.py \\
         --strategies iron_condor bull_call_spread \\
@@ -51,14 +54,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--strategies",
         nargs="+",
-        default=["iron_condor"],
-        help="Strategy names to optimize",
+        default=None,
+        help="Strategy names to optimize. Default: config options.strategies (W87a).",
     )
     p.add_argument(
         "--symbols",
         nargs="+",
-        default=["SPY", "QQQ"],
-        help="Symbols for backtesting during optimization",
+        default=None,
+        help="Symbols for backtesting during optimization. Default: config backtest.default_symbols (W87a).",
     )
     p.add_argument("--n-trials", type=int, default=100, help="Number of Optuna trials")
     p.add_argument(
@@ -86,6 +89,12 @@ def parse_args() -> argparse.Namespace:
         help="Write best params back to config.yaml after optimization",
     )
     p.add_argument("--config", type=str, default="config.yaml", help="Path to config.yaml")
+    p.add_argument("--study-file", default=None, metavar="PATH",
+                   help="W87b: a studies/<name>.yaml merged over config.yaml + config_research.yaml for THIS run "
+                        "(settings: and search_space: overrides). Needs --n-jobs 1; cannot be combined with "
+                        "--apply (params found under study settings must not be written to the live config).")
+    p.add_argument("--no-run-record", action="store_true", default=False,
+                   help="W87b: do not write reports/runs/<run_id>/run_record.json (or log to MLflow).")
     p.add_argument(
         "--output",
         type=str,
@@ -95,11 +104,44 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _write_run_record(args, study, settings, optimizer, result, prefix) -> None:
+    """W87b: what produced this optimisation -- one JSON in reports/runs/<run_id>/ (+ MLflow when installed),
+    with the merged search space and its hash. Never fails the run."""
+    try:
+        from ait.backtesting.run_record import finish_run
+        from ait.config.research import research_overlay_path
+        metrics = {"best_value": result.best_value, "n_trials": args.n_trials,
+                   "usable": 1.0 if result.usable else 0.0, "best_n_trades": result.best_n_trades}
+        run_dir, mlflow_id = finish_run(
+            kind="optimize", name=f"{'-'.join(args.symbols).lower()}_{study.name if study else 'adhoc'}",
+            settings=settings, config_path=args.config, overlay_path=research_overlay_path(args.config),
+            study_path=study.path if study else None,
+            study=({"name": study.name, "question": study.question, "rule": study.rule,
+                    "settings": study.settings, "search_space": study.search_space} if study else None),
+            cli_args=dict(vars(args)), symbols=args.symbols, db_path=args.db_path,
+            search_space=optimizer.effective_search_space(), search_space_hash=optimizer.search_space_hash(),
+            seeds={"optuna_seed": getattr(optimizer, "_seed", None)},
+            metrics={k: v for k, v in metrics.items() if v is not None},
+            extra={"best_params": dict(result.best_params)})
+        print(f"Run record: {run_dir}" + (f"  (MLflow run {mlflow_id})" if mlflow_id else ""))
+    except Exception as exc:  # noqa: BLE001 - a record failure must never fail the research run
+        print(f"! run record not written ({type(exc).__name__}: {exc})")
+
+
 def main() -> None:
     args = parse_args()
 
-    from ait.config.research import use_research_config
-    use_research_config()   # W68: config.yaml + config_research.yaml (research only)
+    from ait.config.research import (
+        assert_registered, load_study, require_single_process, resolve_universe, use_research_config)
+    _study = load_study(args.study_file) if args.study_file else None     # W87b: the third config layer
+    if _study is not None:
+        assert_registered(_study)
+        require_single_process(_study, args.n_jobs)
+        if args.apply:
+            sys.exit("REFUSING --apply with --study-file: params found under a study's settings / search space "
+                     "are not promotable to the live config; promote through a registered wave.")
+    _research_cfg = use_research_config(study=_study)   # W68: config.yaml + config_research.yaml (research only)
+    args.symbols, args.strategies = resolve_universe(args.symbols, args.strategies, _research_cfg)
     from ait.optimization.optimizer import StrategyOptimizer
     if args.capital is None:
         from ait.config.runtime_env import research_capital
@@ -150,6 +192,7 @@ def main() -> None:
         optimize_ml=args.optimize_ml,
         initial_capital=args.capital,
         train_days=args.train_days,
+        search_space_overrides=(_study.search_space or None) if _study is not None else None,   # W87b
     )
 
     t0 = time.time()
@@ -167,6 +210,9 @@ def main() -> None:
     # Save JSON report
     result.save(args.output)
     print(f"\nResults saved to: {args.output}")
+
+    if not args.no_run_record:
+        _write_run_record(args, _study, _research_cfg, optimizer, result, _prefix)
 
     # Optionally apply to config.yaml
     if args.apply:

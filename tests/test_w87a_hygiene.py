@@ -556,7 +556,8 @@ class TestIvFloorFollowsTheContract:
             seen["iv_floor"] = args.iv_floor
             raise Stop
 
-        monkeypatch.setattr(research, "use_research_config", lambda *a, **k: None)
+        from ait.config.settings import load_settings
+        monkeypatch.setattr(research, "use_research_config", lambda *a, **k: load_settings())
         monkeypatch.setattr(rb, "build_parity_manifest", spy)
         monkeypatch.delenv("AIT_IRON_CONDOR_IV_FLOOR", raising=False)
         monkeypatch.setattr(sys, "argv", ["run_backtest.py"])
@@ -611,3 +612,21 @@ class TestLiveBaselinesLieInsideTheSearchRanges:
         monkeypatch.setattr(iron_condor, "SHORT_DELTA_TARGET", 0.18)
         assert live_baselines() == {"wing_k": 1.2, "delta_short": 0.18}
         assert live_baselines("put_credit_spread") == {}
+
+
+class TestExcludedLiveValueIsWarnedAboutByTheOptimizer:
+    def _opt(self, monkeypatch, over):
+        import ait.optimization.optimizer as om
+        seen = []
+        monkeypatch.setattr(om.log, "warning", lambda ev, **kw: seen.append((ev, kw)))
+        om.StrategyOptimizer(symbols=["QQQ"], strategies=["iron_condor"], n_trials=1,
+                             search_space_overrides=over)
+        return seen
+
+    def test_a_range_below_the_live_wing_k_warns(self, monkeypatch):
+        seen = self._opt(monkeypatch, {"iron_condor": {"wing_k": [0.5, 1.2]}})
+        assert [e for e, _ in seen] == ["search_space_excludes_live_value"]
+        assert "wing_k" in seen[0][1]["detail"] and "1.6" in seen[0][1]["detail"]
+
+    def test_a_range_that_keeps_the_live_values_is_silent(self, monkeypatch):
+        assert self._opt(monkeypatch, {"iron_condor": {"wing_k": [1.0, 2.0], "delta_short": [0.16, 0.24]}}) == []

@@ -27,7 +27,7 @@ import pandas as pd
 from ait.optimization.objectives import OBJECTIVES
 from ait.optimization.param_spaces import (
     DTE_SEARCH_REPLACES, FRACTAL_GATE_SPACE, ML_SPACES, STRATEGY_SPACES, dte_search_space,
-    effective_space, space_hash,
+    effective_space, live_baselines, override_warnings, space_hash,
 )
 from ait.optimization.results import OptimizationResult
 from ait.utils.logging import get_logger
@@ -220,6 +220,9 @@ class StrategyOptimizer:
                              f"(strategies: {list(strategies)})")
         self._spaces = {st: effective_space(st, self._space_overrides.get(st))
                         for st in strategies if st in STRATEGY_SPACES}
+        for _st, _over in self._space_overrides.items():          # W87b: a range that excludes the live value
+            for _w in override_warnings(_st, _over, live_baselines(_st)):
+                log.warning("search_space_excludes_live_value", detail=_w)
         self._n_trials = n_trials
         self._n_jobs = n_jobs
         self._objective_name = objective

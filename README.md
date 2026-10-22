@@ -344,8 +344,11 @@ python run_orchestrator.py --refresh-fundamentals
 # Fetch IB news + analyst recommendations → fundamentals.db
 python run_orchestrator.py --fetch-news
 
-# Run walk-forward backtest
+# Run walk-forward backtest (no --symbols: backtest.default_symbols = QQQ; no --strategies: options.strategies)
 python run_backtest.py --symbols SPY QQQ AAPL --capital 50000
+
+# Same, as a recorded study (studies/<name>.yaml; see docs/RUNBOOK.md "Studies and run records")
+python run_backtest.py --study-file studies/_template.yaml
 
 # Walk-forward backtest with per-window Optuna optimization
 python run_backtest.py --symbols SPY QQQ --optimize-per-window --optimize-n-trials 50

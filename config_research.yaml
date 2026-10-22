@@ -5,6 +5,8 @@
 # bot (ait.main) and the supervisor never load it. It holds ONLY the keys that differ from config.yaml,
 # so (a) this file IS the research-vs-live difference, and (b) a later live change in config.yaml flows
 # into research automatically. Unknown keys are a startup error (the schema is extra="forbid").
+# A single study can merge a THIRD layer over this file (studies/<name>.yaml, --study-file; W87b); this file
+# stays the stable default for ordinary research runs, so do not edit it per study.
 #
 # Keep every research change on this branch HERE, with its provenance comment. config.yaml differs from
 # main only by the five operator-chosen live risk/capital lines (account.capital, simulate_live_capital,

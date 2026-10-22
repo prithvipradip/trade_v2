@@ -1,0 +1,31 @@
+# A research STUDY: what this run changes relative to config.yaml + config_research.yaml.
+#
+#   python run_backtest.py  --study-file studies/<name>.yaml ...
+#   python run_optimizer.py --study-file studies/<name>.yaml ...
+#
+# Commit the file BEFORE running the study; do not edit it afterwards (a changed study is a new file).
+# Every run writes a run record (resolved settings, raw files, commit, data fingerprints, seeds, merged
+# search space and its hash) to its run folder and, if MLflow is installed, to MLflow.
+# See docs/RUNBOOK.md "Studies and run records".
+
+name: template_example          # lowercase letters, digits, underscores; names the run folder / MLflow experiment
+question: >
+  What does this study ask? One or two sentences.
+
+# `exploratory`: looking around; results may not be cited as evidence for a decision. Or the text of a PLAN.md
+# heading ("## <this text>") where the pass/fail rule was written BEFORE the run. A test fails if a study
+# names a heading that does not exist.
+rule: exploratory
+
+# Settings merged over config.yaml + config_research.yaml (same keys and validation as those files).
+# NOT allowed: ibkr / api_keys, and keys the env contract reads (backtest.wing_k, backtest.ic_*, ...):
+# those need the environment variable or the CLI flag, because the contract ignores overlays.
+settings: {}
+#  backtest:
+#    max_concurrent_positions: 1
+
+# Per-dimension overrides of the Optuna search ranges ({strategy: {dimension: [low, high]}}). Defaults live in
+# src/ait/optimization/param_spaces.py; an override is validated (known dimension, low < high, hard limits).
+search_space: {}
+#  iron_condor:
+#    wing_k: [1.0, 2.0]          # default [0.30, 2.00]

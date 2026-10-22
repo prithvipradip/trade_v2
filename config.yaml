@@ -244,6 +244,9 @@ backtest:
   position_size_pct: 0.05             # 5% of capital risked per trade (max-loss basis)
                                        # Schema ceiling 0.25 (= risk.max_position_risk_pct's, W86). Normally left
                                        # null in config_research.yaml so research sizes like live.
+  default_symbols: [QQQ]               # W87a: RESEARCH ONLY. Symbols run_backtest.py / run_optimizer.py use when
+                                       # --symbols is omitted. QQQ: the symbol with historical option prices (an IV
+                                       # surface can be built). Live's universe is trading.universe, never read by research.
   # W70: THE minimum iron-condor wing, dollars — for LIVE ENTRIES AND RESEARCH alike.
   # This key sits under `backtest:` but is also the config home of AIT_IC_WING_FLOOR,
   # which the live builder (strategies/iron_condor.py) reads: editing it changes what the
@@ -339,7 +342,7 @@ backtest:
   slippage_pct: 0.01                   # extra price slippage on DEBIT / long-option structures
                                        # only; NOT applied to iron condors (friction model).
   delta_short: 0.20                    # |delta| for short strikes in research. Live's IC short
-                                       # delta is a literal ~0.20 in strategies/iron_condor.py,
+                                       # delta is the constant iron_condor.SHORT_DELTA_TARGET (0.20),
                                        # NOT this key: changing this diverges research from live.
   delta_long: 0.30                     # |delta| for long single options / debit legs (unused by IC).
   hurst_hard_veto_multiplier: 1.5      # legacy veto = max(hurst_regime_threshold, 0.20) x this, used

@@ -389,19 +389,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--symbols",
         nargs="+",
-        default=["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA", "AMD", "AMZN", "META", "GOOGL"],
-        help="Symbols to backtest",
+        default=None,
+        help="Symbols to backtest. Default: config backtest.default_symbols (QQQ; W87a -- was a "
+             "hard-coded ten-name list that crashed on the first name without dividend rows).",
     )
     p.add_argument(
         "--strategies",
         nargs="+",
-        default=[
-            "put_credit_spread",
-            "bull_call_spread",
-            "bear_put_spread",
-            "iron_condor",
-        ],
-        help="Strategies to test",
+        default=None,
+        help="Strategies to test. Default: config options.strategies (the live selector list, "
+             "currently iron_condor only; W87a -- was four hard-coded strategies).",
     )
     # W87a: the window defaults ARE the WalkForwardConfig field defaults (they were four literals here)
     p.add_argument("--train-days", type=int, default=_WF_DEFAULTS["train_days"],
@@ -465,6 +462,12 @@ def parse_args() -> argparse.Namespace:
                         "currently 1) of an FOMC/CPI/NFP/GDP/PCE event (research windows use the "
                         "operator's economic calendar; the legacy 2026-only calendar is inactive "
                         "for earlier windows)")
+    p.add_argument("--study-file", default=None, metavar="PATH",
+                   help="W87b: a studies/<name>.yaml merged over config.yaml + config_research.yaml for THIS run "
+                        "(settings: overrides, search_space: overrides). A pre-registered study must name a "
+                        "PLAN.md heading in its rule:. Refused with --optimize-n-jobs > 1.")
+    p.add_argument("--no-run-record", action="store_true", default=False,
+                   help="W87b: do not write reports/runs/<run_id>/run_record.json (or log to MLflow).")
     p.add_argument("--compare-exits", action="store_true", help="Compare fixed vs trailing stops")
     p.add_argument("--optimize-per-window", action="store_true", default=False,
                    help="Run Optuna optimization on each training window before testing")
@@ -498,11 +501,49 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _write_run_record(args, study, settings, cfg, result, manifest) -> None:
+    """W87b: what produced this number -- one JSON in reports/runs/<run_id>/ (+ MLflow when installed).
+    Never fails the run."""
+    try:
+        from ait.backtesting.run_record import finish_run
+        from ait.config.research import research_overlay_path
+        from ait.optimization.param_spaces import effective_space, space_hash
+        spaces = {}
+        if cfg.optimize_per_window:
+            for strat in args.strategies:
+                try:
+                    spaces[strat] = effective_space(strat, ((study.search_space if study else {}) or {}).get(strat))
+                except ValueError:
+                    continue
+        metrics = {k: getattr(result, k, None) for k in
+                   ("total_return", "total_trades", "win_rate", "sharpe_ratio", "max_drawdown", "profit_factor")}
+        run_dir, mlflow_id = finish_run(
+            kind="backtest", name=f"{'-'.join(args.symbols).lower()}_{study.name if study else 'adhoc'}",
+            settings=settings, config_path="config.yaml", overlay_path=research_overlay_path("config.yaml"),
+            study_path=study.path if study else None,
+            study=({"name": study.name, "question": study.question, "rule": study.rule,
+                    "settings": study.settings, "search_space": study.search_space} if study else None),
+            cli_args={k: v for k, v in vars(args).items()}, symbols=args.symbols,
+            db_path=args.db_path, search_space=spaces or None,
+            search_space_hash=space_hash(spaces) if spaces else None,
+            seeds={"optimize_seed": getattr(cfg, "optimize_seed", None)},
+            metrics={k: v for k, v in metrics.items() if v is not None},
+            extra={"parity_manifest": manifest})
+        print(f"\n  Run record: {run_dir}" + (f"  (MLflow run {mlflow_id})" if mlflow_id else ""))
+    except Exception as exc:  # noqa: BLE001 - a record failure must never fail the research run
+        print(f"\n  ! run record not written ({type(exc).__name__}: {exc})")
+
+
 async def run_backtest(args: argparse.Namespace) -> None:
     # W68: config.yaml + config_research.yaml is THIS process's configuration (research only;
     # the live bot never loads the overlay). Fails loudly if the overlay file is missing.
-    from ait.config.research import use_research_config
-    use_research_config()
+    from ait.config.research import (
+        assert_registered, load_study, require_single_process, resolve_universe, use_research_config)
+    _study = load_study(args.study_file) if args.study_file else None     # W87b: the third config layer
+    if _study is not None:
+        assert_registered(_study)
+    _research_cfg = use_research_config(study=_study)
+    args.symbols, args.strategies = resolve_universe(args.symbols, args.strategies, _research_cfg)
     if args.capital is None:
         from ait.config.runtime_env import research_capital
         args.capital = research_capital()
@@ -593,7 +634,9 @@ async def run_backtest(args: argparse.Namespace) -> None:
         ic_min_credit=args.ic_min_credit,
         ic_min_credit_width=args.ic_min_credit_width,
         macro_event_gate=args.macro_gate,
+        search_space_overrides=(_study.search_space or None) if _study is not None else None,   # W87b
     )
+    require_single_process(_study, cfg.optimize_n_jobs)    # W87b: window workers would drop the study layer
 
     bt = WalkForwardBacktester(
         symbols=args.symbols,
@@ -695,6 +738,9 @@ async def run_backtest(args: argparse.Namespace) -> None:
     if not curve.empty:
         print(f"\n  Equity curve: {len(curve)} data points")
         print(f"  Start: ${args.capital:,.0f}  ->  End: ${curve['equity'].iloc[-1]:,.0f}")
+
+    if not args.no_run_record:
+        _write_run_record(args, _study, _research_cfg, cfg, result, manifest)
 
     # Compare exit modes if requested
     if args.compare_exits and data:

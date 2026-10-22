@@ -242,7 +242,14 @@ class TestResearchReadsLoadedRows:
         rows = {d for d, (k, _r) in DIVERGENCE_CLASSES.items() if k == "research_reads_loaded"}
         assert rows == {"positions.max_open_positions", "positions.max_contracts_per_trade",
                         "risk.min_confidence", "options.dte_range", "backtest.position_size_pct",
-                        "backtest.max_concurrent_positions"}
+                        "backtest.max_concurrent_positions", "options.strategies"}   # W87a added the last
+
+    def test_options_strategies(self, real):
+        """W87a: a bare research run trades the LOADED live selector list (explicit lists still win)."""
+        from ait.config.research import resolve_universe
+        assert resolve_universe(None, None, _with(real, options={"strategies": ["iron_condor", "long_call"]}))[1] \
+            == ["iron_condor", "long_call"]
+        assert resolve_universe(None, ["bull_call_spread"], real)[1] == ["bull_call_spread"]
 
     def test_max_contracts_per_trade(self, real):
         assert resolve_max_contracts_per_trade(None, _with(real, positions={"max_contracts_per_trade": 4})) == 4

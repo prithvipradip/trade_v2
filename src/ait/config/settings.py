@@ -7,6 +7,7 @@ Validation catches misconfigurations BEFORE the bot starts trading.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal
 
@@ -592,6 +593,14 @@ class DteSearchConfig(_StrictModel):
 
 
 class BacktestConfig(_StrictModel):
+    @field_validator("default_symbols")
+    @classmethod
+    def _valid_default_symbols(cls, v: list[str]) -> list[str]:
+        out = [str(s).strip().upper() for s in v]
+        if any(not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", s) for s in out):
+            raise ValueError(f"default_symbols must be ticker symbols, got {v}")
+        return list(dict.fromkeys(out))
+
     @field_validator("macro_event_types")
     @classmethod
     def _valid_macro_event_types(cls, v: list[str]) -> list[str]:
@@ -623,6 +632,13 @@ class BacktestConfig(_StrictModel):
                     "(research_daily_prices, research_daily_iv, research_intraday_prices, "
                     "research_econ_events). Empty = the live tables. Keeps research data in one "
                     "consistent source and the live tables untouched.")
+    default_symbols: list[str] = Field(default=["QQQ"], min_length=1, max_length=20,
+        description="W87a: the symbols a research entry point (run_backtest.py, run_optimizer.py) runs when "
+                    "--symbols is not given. QQQ because it is the one symbol with the historical option "
+                    "prices an IV surface can be built from, and the primary instrument of the programme "
+                    "(it was a hard-coded ten-name list in run_backtest.py that crashed on the first name "
+                    "without dividend rows). Research only: live's universe is trading.universe, which "
+                    "research never reads.")
     vlmc_min_coverage: float = Field(default=0.95, ge=0.5, le=1.0,
         description="W65: minimum fraction of trading days that must have 5-min bars before the "
                     "walk-forward trains with VLMC/intraday-fractal features. Below it the run "
@@ -1038,9 +1054,9 @@ class BacktestConfig(_StrictModel):
                     "slippage_pct=0.01 constructor default.")
     delta_short: float = Field(default=0.20, ge=0.05, le=0.50,
         description="W70: |delta| the research engine targets for the SHORT strikes of "
-                    "its structures. Research only: live's iron condor short delta is a "
-                    "literal ~0.20 inside strategies/iron_condor.py, NOT this key, so "
-                    "changing it moves research away from live. Was the engine's "
+                    "its structures. Research only: live's iron condor short delta is the "
+                    "constant iron_condor.SHORT_DELTA_TARGET (0.20), NOT this key, so "
+                    "changing it moves research away from live (the parity manifest shows both). Was the engine's "
                     "delta_short=0.20.")
     delta_long: float = Field(default=0.30, ge=0.05, le=0.60,
         description="W70: |delta| the research engine targets for LONG single options "
@@ -2148,7 +2164,8 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
 
 def load_settings(config_path: str | Path = "config.yaml",
                   overlay_path: str | Path | None = None,
-                  *, ignore_frozen: bool = False) -> Settings:
+                  *, ignore_frozen: bool = False,
+                  extra_overlays: "Sequence[dict] | None" = None) -> Settings:
     """Load settings from YAML file, with env var overrides for secrets.
 
     W68: `overlay_path` (research only, see ait/config/research.py) is deep-merged OVER the base file
@@ -2156,6 +2173,9 @@ def load_settings(config_path: str | Path = "config.yaml",
     typo in config.yaml (extra="forbid"), and a later live change in the base flows into research.
     `ignore_frozen` reads the file(s) even when a process-wide snapshot exists: the research parity
     manifest uses it to show what the LIVE bot's config.yaml says next to the research overlay.
+    W87b: `extra_overlays` are already-parsed dicts merged over the result in order (a study's
+    ``settings:`` block); like the file overlay they may not set the env-only sections, and an unknown
+    key is a validation error.
     """
     if _FROZEN is not None and not ignore_frozen:
         return _FROZEN.model_copy(deep=True)
@@ -2185,6 +2205,11 @@ def load_settings(config_path: str | Path = "config.yaml",
                 raise ValueError(f"the research overlay may not set {forbidden!r} (secrets "
                                  "come from the environment only)")
         yaml_data = _deep_merge(yaml_data, overlay)
+    for extra in extra_overlays or ():
+        for forbidden in ("ibkr", "api_keys"):
+            if forbidden in extra:
+                raise ValueError(f"a study may not set {forbidden!r} (secrets come from the environment only)")
+        yaml_data = _deep_merge(yaml_data, extra)
 
     # IBKR and API keys come from environment only
     yaml_data["ibkr"] = IBKREnvConfig().model_dump()
@@ -2350,7 +2375,7 @@ DIVERGENCE_RESEARCH_LOADED = "research_reads_loaded"  # research reads the loade
 DIVERGENCE_DELIBERATE = "deliberate_research_difference"  # research differs on purpose; shown in the manifest
 DIVERGENCE_DEAD = "dead"                            # nothing reads it
 DIVERGENCE_CLASSES: dict[str, tuple[str, str]] = {
-    "trading.universe": (DIVERGENCE_LIVE_ONLY, "research takes its symbols from the CLI / study arguments"),
+    "trading.universe": (DIVERGENCE_LIVE_ONLY, "research takes its symbols from the CLI / study arguments, else backtest.default_symbols"),
     "trading.max_daily_trades": (DIVERGENCE_LIVE_ONLY, "live orchestrator cap; the engine has no daily-trade cap"),
     "account.pdt_account_under_25k": (DIVERGENCE_LIVE_ONLY, "read only by risk/pdt_guard.py"),
     "positions.max_open_positions": (DIVERGENCE_RESEARCH_LOADED,
@@ -2364,7 +2389,9 @@ DIVERGENCE_CLASSES: dict[str, tuple[str, str]] = {
     "options.min_volume": (DIVERGENCE_LIVE_ONLY, "chain liquidity filter; research prices from the model"),
     "options.max_bid_ask_spread_pct": (DIVERGENCE_LIVE_ONLY,
                                        "chain / executor spread filter; research charges the friction model"),
-    "options.strategies": (DIVERGENCE_LIVE_ONLY, "live selector list; research uses the CLI --strategies"),
+    "options.strategies": (DIVERGENCE_RESEARCH_LOADED,
+                           "W87a: run_backtest.py / run_optimizer.py default --strategies to this list "
+                           "(config.resolve_universe); an explicit --strategies still wins"),
     "backtest.position_size_pct": (DIVERGENCE_RESEARCH_LOADED,
                                    "resolve_position_size_pct: explicit > this > risk.max_position_risk_pct"),
     "backtest.max_concurrent_positions": (DIVERGENCE_RESEARCH_LOADED,

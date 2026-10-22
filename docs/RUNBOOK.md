@@ -462,6 +462,48 @@ python scripts/parity_replay.py                 # reads data/replay/manual_trade
 - **Decisions D1 and D8** (realistic engine, short-DTE friction floor) are in `config_research.yaml`;
   the live bot never loads it. `run_optimizer.py --apply` still writes only four named params.
 
+## Studies and run records (W87; research only)
+
+A **study** is a committed file, `studies/<name>.yaml`, that says what one research run changes relative to `config.yaml` +
+`config_research.yaml`. `config_research.yaml` stays the stable default for ordinary research runs; editing it per study would silently
+change every later default run.
+
+```yaml
+name: w88_wing_k_wider
+question: Does a wider wing_k range change the wings Optuna picks, or the out-of-sample PF on QQQ?
+rule: exploratory            # or the text of a PLAN.md heading where the pass rule was written before the run
+settings:                    # merged over config.yaml + config_research.yaml; same validation
+  backtest:
+    max_concurrent_positions: 1
+search_space:                # per-dimension overrides; defaults stay in optimization/param_spaces.py
+  iron_condor:
+    wing_k: [1.0, 2.0]
+```
+
+* **Run it:** `python run_backtest.py --study-file studies/<name>.yaml ...` (also `run_optimizer.py`). `--study-file`, not `--study`: the optimizer
+  already has the Optuna `--study-name`. Commit the file before the run and never edit it afterwards (a changed study is a new file). A study whose
+  `rule:` is not `exploratory` and names no PLAN.md heading is refused at start.
+* **Refused on purpose:** `ibkr` / `api_keys`; any setting the **env contract** reads (`backtest.wing_k`, `backtest.ic_*`, `risk.iv_rank_cap`, ...): the
+  contract reads the raw `config.yaml` and ignores both overlays, so the value would be silently ignored (use the environment variable or the CLI
+  flag); and worker processes (`run_optimizer.py --n-jobs > 1`, walk-forward `optimize_n_jobs > 1`: spawned workers rebuild settings from plain
+  `config.yaml`). `run_optimizer.py --apply` is refused with a study: params found under a study's settings are not promotable to the live config.
+* **Search-space overrides** are validated (known dimension, same type, `low < high`, inside the hard limits in `param_spaces.HARD_BOUNDS`) and the run
+  warns when a range excludes the live value (`wing_k` 1.6, `delta_short` 0.20). The optimizer stores a hash of the effective space on the Optuna study
+  and refuses to resume a stored study created over a different space.
+* **The run record** (`run_record.json` in the run folder `reports/runs/<backtest|optimize>_<symbols>_<study|adhoc>_<timestamp>/`, gitignored; `--no-run-record` skips it) holds the resolved settings
+  (secrets excluded), the RAW `config.yaml` / overlay / study text with sha256, the effective `AIT_*` env-contract values, the git commit and a dirty flag,
+  data fingerprints (rows and date span per research table and a hash of each symbol's close series, read through a read-only connection), seeds, the
+  command line and the merged search space with its hash. **MLflow is optional:** when installed the record is also logged (experiment
+  `research_<study name or adhoc>`, tracking URI `MLFLOW_TRACKING_URI` or `sqlite:///data/mlflow.db`); a failure never fails a run.
+* **When does a study need a PLAN.md entry?** A **pre-registered** study (the result could change a gate, a live parameter or a go-live criterion) gets
+  an AS PLANNED entry BEFORE the run, with the pass rule and a pointer to the study file, and a result entry after; its `rule:` names that heading. An
+  **exploratory** study needs only the file and its record; its results may not be quoted as evidence, and a decision that leans on one cites it (file and
+  commit) in its own PLAN entry. `tests/test_w87b_study_layer.py` fails when a study names a PLAN heading that does not exist.
+* **Defaults for a bare run (W87):** `--symbols` is `backtest.default_symbols` (QQQ: the symbol with historical option prices, so an IV surface can be
+  built) and `--strategies` is `options.strategies` (iron condor); explicit lists win. Before W87 a bare `python run_backtest.py` ran ten symbols and four
+  strategies and crashed on the first name without dividend rows (AAPL). The supervisor job passes explicit arguments and is unaffected. The walk-forward
+  `slippage_pct` also follows `backtest.slippage_pct` (0.01; debit structures only) instead of a 0.03 literal.
+
 ## Quarterly drills (scheduled — first week of Jan / Apr / Jul / Oct)
 Run both, then record the date in the log table below. An untested kill
 switch or backup is a hope, not a control.
