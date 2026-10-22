@@ -18429,3 +18429,37 @@ documented constants now but still differ from live on purpose; a study that quo
 **NEXT.** The operator's decisions above; otherwise unchanged (W83a-2 decisions, W83b on A', the recalibration study, the ideas register, W79b prerequisites).
 
 ---
+
+
+## 2026-10-22 - W88 AS PLANNED: research tunables made visible (`config_research.yaml` lists every research tunable); fixed research limits get a logged module; hyperparameters and indicator windows become configurable
+
+Plan approved by the operator 2026-10-22. Written BEFORE any W88 code. HEAD at planning: `0ee35b3` on local `main` (unpushed); no live bot running. Research tooling plus refactors of LIVE-SHARED files (`ml/ensemble.py`, `ml/range_predictor.py`, `ml/vol_magnitude_predictor.py`,
+`ml/meta_label.py`, `ml/features.py`, `ml/regime.py`, `data/multi_timeframe.py`, `bot/orchestrator.py` name lookups); defaults reproduce every current value, so live behaviour is unchanged and the bot loads the changes at its next restart.
+
+**THE ASK.** The operator does not like literals and variables hard-coded in research / backtesting / walk-forward / optimization / ML code, invisible to the researcher running studies. `config_research.yaml` gets a threefold purpose: (1) the
+complete list of research tunables, documented; (2) override `config.yaml` for research entry points only (as now); (3) remain the research-vs-live diff (as now).
+
+**DECISIONS (operator, 2026-10-22).**
+1. Shared keys stay diff-only (a copy would stop following a later `config.yaml` change and trip the redundant-copy test); research-only keys (no `config.yaml` counterpart) are listed in full. Everything else is made visible by an *effective research config*
+   view with an origin tag per value, not by duplicating it.
+2. Model hyperparameters are tunable; research may differ from live and the parity manifest shows it. Saved models record the hyperparameters; a model trained under other values is detectable.
+3. Indicator windows are tunable; scope = core feature groups (momentum, volatility, volume, trend, price action, multi-timeframe, IV / vol-regime). Fractal / wavelet / Hurst, the 26 VLMC features, cross-asset, macro and seasonality stay fixed (registered).
+   **Feature column names DERIVE from the windows** (`rsi_10` when the window is 10), every consumer resolves names through the spec; the saved model records a feature-spec hash.
+4. True invariants (the 0.05-0.45 delta band, the IV-scale clamp, numerical epsilons) go in a logged leaf module `config/research_invariants.py`, not the YAML (visible is not tunable; same rule as `config/invariants.py`).
+5. A class guard (AST census of non-trivial numeric literals in the result-affecting research modules, with an allowlist that must not go stale) keeps new literals from creeping back.
+6. The earlier "YAML vs schema drift test" idea is dropped: the overlay is MEANT to differ from the schema default (the default is the fallback for bare constructions, as `gates_mode` already is). The guarantee is a COMPLETENESS test instead: every research-only schema field appears in `config_research.yaml`.
+
+**PARTS (each its own commit, each byte-identical on the 6-variant reference dump + `gate_parity_ab` + `ex_div_gate_ab` at defaults).** W88a plumbing and visibility (pool workers keep the overlay and study layers via a pool initializer; `research_invariants`; `settings_origin` + `scripts/show_research_config.py`;
+YAML header). W88b research-only tunables into the schema and the YAML (`backtest.learner`, engine knobs incl. the 0.20 credit margin, composite-objective weights, walk-forward literals, the `getattr(..., literal)` fallbacks, the risk-free rate single-sourced from `options.risk_free_rate`).
+W88c hyperparameters + the model artifact spec. W88d indicator windows with derived names + feature-spec hash (largest; golden-frame test first). W88e the literal-census class guard. Recommended build order a-c, then d, e.
+
+**FINDING THAT SHAPES a.** `ProcessPoolExecutor` window workers (`walkforward._window_task_mp`) rebuild settings from plain `config.yaml`, so any overlay or study value that code reads through `load_settings()` is silently dropped when `optimize_n_jobs > 1` (only `WalkForwardConfig` fields cross
+the pool). Not previously registered for the overlay (only for studies in W87). The fix is a pool initializer that freezes the resolved settings in each worker.
+
+**SILENT-ZERO HAZARD (d).** `ensemble.predict` does `features.reindex(columns=feature_names).fillna(0.0)`; a model trained under different windows would predict on zero columns without error. The feature-spec hash saved with the model and checked at load closes it (refuse on the research path, log on live; legacy artifacts without a spec are always accepted).
+
+**OUT OF SCOPE / REGISTERED.** Fractal / VLMC / cross-asset / macro / seasonality windows; the study scripts' own parameters; the live learning layer's thresholds (the research `BacktestLearner` is a separate mechanism); `param_spaces.py` ranges (already overridable per study).
+
+**NEXT.** Build W88a-c in order, recording an AS BUILT entry per part or one at the end; d and e after the operator has seen a-c.
+
+---
