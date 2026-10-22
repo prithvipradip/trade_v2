@@ -18635,3 +18635,13 @@ to the operator before anything beyond the 38 is converted.
 **NEXT.** Build W89a, then b-e in order, recording AS BUILT per step or at the end.
 
 ---
+
+
+## 2026-10-22 - W90 (was headed "W89") AS PLANNED: CORRECTION OF LABEL, DATE AND ONE FACT (no code change)
+
+1. **The wave is W90, not W89.** The entry headed "2026-10-23 - W89 AS PLANNED: convert the 38 `registered_followup` literals ..." (commit `bb6de89`) is the plan of **W90**. Another session was using the label W89 at the same time (the daily retrain's own IB client id, `ml.retrain_ib_client_id`); the two collided. PLAN.md is append-only, so the old heading stays and is superseded here; all later entries for that work say W90 (steps W90a-W90e).
+2. **The date in that heading is wrong**: it was written on 2026-10-22 (not 10-23).
+3. **A fact in the W88 and W90 entries is wrong**: they say "no live bot running". The live paper bot (`python -m ait.main --paper`) has been running since 16:22 on 2026-10-22. It loads code only at start, so the live-shared W88 / W90 changes still reach it only at its next restart, which remains the operator's call.
+4. **Process, as agreed with the operator:** a second Claude session works in this same working tree (uncommitted edits in `settings.py`, `config.yaml`, `trainer.py`, `RUNBOOK.md`, `master.py`, ... and a full test run in progress). W90 therefore works in an isolated git worktree on branch `w90` and merges into `main` only after the other session has committed; the two sessions never write the same tree.
+
+---
