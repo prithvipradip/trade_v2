@@ -13,14 +13,16 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
+from ait.config.settings import loaded_account_capital, loaded_cash_yield
+
 
 @dataclass
 class BacktestResult:
     """Complete backtest output with trades and performance metrics."""
 
     trades: list[dict] = field(default_factory=list)
-    initial_capital: float = 10_000.0
-    final_capital: float = 10_000.0
+    initial_capital: float = field(default_factory=loaded_account_capital)   # W90a: was a 10_000 literal
+    final_capital: float = field(default_factory=loaded_account_capital)
     start_date: date | None = None
     end_date: date | None = None
     exit_mode: str = "fixed"
@@ -213,7 +215,7 @@ class BacktestResult:
             return self.total_return
         years = max(0.01, (self.end_date - self.start_date).days / 365.25)
         idle_pct = max(0, 1 - self.capital_utilization)
-        cash_yield = 0.05 * idle_pct * years
+        cash_yield = loaded_cash_yield() * idle_pct * years      # W90a: options.risk_free_rate (was 0.05)
         return self.total_return + cash_yield
 
     @property

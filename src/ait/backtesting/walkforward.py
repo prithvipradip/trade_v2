@@ -31,7 +31,14 @@ from ait.backtesting.range_bank import RangeModelBank
 from ait.backtesting.result import BacktestResult
 from ait.config.invariants_research import PROB_CLIP_EPS  # W88a
 from ait.ml.feature_spec import FeatureSpec, spec_from_config  # W88d
-from ait.config.settings import MLConfig, WalkForwardTuningConfig
+from ait.config.settings import (
+    MLConfig,
+    PositionConfig,
+    WalkForwardTuningConfig,
+    loaded_account_capital,
+    loaded_cash_yield,
+    resolve_config_value,
+)
 from ait.ml.ensemble import DirectionPredictor
 from ait.strategies.base import SignalDirection
 from ait.utils.logging import get_logger
@@ -153,7 +160,7 @@ class WalkForwardConfig:
     optimize_min_trades: int | None = None   # None -> backtest.optimize_min_trades (W67: was a 10 literal)
     optimize_hard_min_trades: int | None = None          # W67: None -> backtest.*
     optimize_below_floor_gradient: float | None = None   # W67: None -> backtest.*
-    optimize_seed: int = 42          # TPESampler seed — fix for reproducibility
+    optimize_seed: int | None = None   # TPESampler seed; None -> backtest.walkforward_tuning.optimize_seed (W90a: was 42)
     range_threshold_pct: float = 0.05  # Target move % for range model; links to strategy profitability
     hurst_regime_threshold: float | None = None
     hurst_regime_penalty: float | None = None
@@ -322,8 +329,15 @@ class WalkForwardConfig:
             raise ValueError("dte_search requires optimize_per_window=True (the DTE is chosen "
                              "per window by Optuna)")
         if self.initial_capital is None:
-            from ait.config.runtime_env import research_capital
-            self.initial_capital = research_capital()
+            # W90a: account.capital of the LOADED settings (the frozen research view: an overlay or a study reaches it);
+            # was research_capital(), a raw read of config.yaml that ignored both
+            self.initial_capital = loaded_account_capital()
+        if self.optimize_seed is None:
+            try:
+                from ait.config.settings import load_settings as _ls_seed
+                self.optimize_seed = int(_ls_seed().backtest.walkforward_tuning.optimize_seed)
+            except Exception:  # noqa: BLE001 - no config.yaml -> the schema default
+                self.optimize_seed = int(WalkForwardTuningConfig().optimize_seed)
         if self.wing_k is None:
             from ait.config.runtime_env import contract_float
             self.wing_k = contract_float("AIT_IC_WING_K")
@@ -491,7 +505,7 @@ class WalkForwardResult:
     windows: list[WindowResult] = field(default_factory=list)
     symbol_results: dict[str, BacktestResult] = field(default_factory=dict)
     strategy_results: dict[str, dict] = field(default_factory=dict)
-    initial_capital: float = 10_000.0
+    initial_capital: float = field(default_factory=loaded_account_capital)   # W90a: was a 10_000 literal
     config: WalkForwardConfig | None = None
     # R16 #3: {window_id: {symbol: status}} for EVERY generated window
     # (including zero-trade ones) so the summary can surface how many
@@ -685,7 +699,7 @@ class WalkForwardResult:
         last_date = self.windows[-1].test_end
         years = max(0.01, (last_date - first_date).days / 365.25)
         idle_pct = max(0, 1 - self.capital_utilization)
-        return self.total_return + (0.05 * idle_pct * years)
+        return self.total_return + (loaded_cash_yield() * idle_pct * years)   # W90a: options.risk_free_rate (was 0.05)
 
     @property
     def raroc(self) -> float:
@@ -1922,14 +1936,11 @@ class WalkForwardBacktester:
             # window's capital base is now exactly the configured pool, so the
             # reported return is on the money the account actually has.
             from ait.backtesting.pool import allocate_pool
-            _pos = getattr(self._settings, "positions", None)
             _pool = allocate_pool(
                 all_symbol_trades,
                 pool_capital=self._config.initial_capital,
                 position_size_pct=self._config.position_size_pct,
-                max_portfolio_risk_pct=float(
-                    getattr(_pos, "max_portfolio_risk_pct", 0.20)),
-                max_open_positions=int(getattr(_pos, "max_open_positions", 10)),
+                **self._pool_limits(),
             )
             log.info("window_pool_allocation", window=window_id,
                      pool=self._config.initial_capital,
@@ -2732,6 +2743,17 @@ class WalkForwardBacktester:
         rvol_annual = float(recent.std() * np.sqrt(252))
         raw = rvol_annual * np.sqrt(horizon_days / 252) * multiplier
         return float(np.clip(raw, low_clip, high_clip))
+
+    def _pool_limits(self) -> dict:
+        """The shared-account limits the pool applies (live's aggregate-risk and open-position caps), from the LOADED
+        ``positions`` section; ``PositionConfig`` defaults when no settings loaded. W90a (D4): were ``getattr(_pos, ...,
+        0.20 / 10)`` literals that differed from the schema (0.20 / 5)."""
+        return {
+            "max_portfolio_risk_pct": float(resolve_config_value(
+                None, "positions", "max_portfolio_risk_pct", PositionConfig, self._settings)),
+            "max_open_positions": int(resolve_config_value(
+                None, "positions", "max_open_positions", PositionConfig, self._settings)),
+        }
 
     def _prior_window_is_trusted(self, prior_oos_result) -> bool:
         """Warm-start a window's study from the PRIOR window's best parameters only if that window's

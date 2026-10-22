@@ -749,6 +749,9 @@ class WalkForwardTuningConfig(_StrictModel):
         description="Quantile of the data's IV the probe uses (the low end: the narrowest wing the study needs).")
     inert_probe_dte_fallback: int = Field(default=21, ge=1, le=60,
         description="Entry DTE the probe assumes when no settings are loaded.")
+    optimize_seed: int = Field(default=42, ge=0, le=2**31 - 1,
+        description="W90a: seed of the Optuna TPE sampler (the walk-forward's per-window studies and a bare StrategyOptimizer). "
+                    "Was a literal 42 in WalkForwardConfig and StrategyOptimizer.")
 
     @model_validator(mode="after")
     def _clips(self) -> "WalkForwardTuningConfig":
@@ -2389,6 +2392,37 @@ def resolve_position_size_pct(explicit, settings) -> float:
     if rk is not None and getattr(rk, "max_position_risk_pct", None) is not None:
         return float(rk.max_position_risk_pct)
     return float(RiskConfig().max_position_risk_pct)
+
+
+def resolve_account_capital(explicit, settings) -> float:
+    """W90a: the total starting equity a research object uses.
+
+    explicit arg > the loaded ``account.capital`` (the frozen research view, so an overlay or a study reaches it) >
+    ``AccountConfig``'s own default. Replaces the stale $10,000 / $50,000 / $100,000 constructor defaults that duplicated
+    ``account.capital`` and drifted from it. ``settings`` may be None or a partial test stub."""
+    if explicit is not None:
+        return float(explicit)
+    acct = getattr(settings, "account", None)
+    if acct is not None and getattr(acct, "capital", None) is not None:
+        return float(acct.capital)
+    return float(AccountConfig().capital)
+
+
+def loaded_account_capital() -> float:
+    """``resolve_account_capital(None, <the loaded settings>)`` for dataclass ``default_factory``s, which have no settings handle."""
+    try:
+        return resolve_account_capital(None, load_settings())
+    except Exception:  # noqa: BLE001 - no config.yaml -> AccountConfig's default
+        return float(AccountConfig().capital)
+
+
+def loaded_cash_yield() -> float:
+    """W90a: the annual yield credited to idle cash in the DISPLAY-only cash-drag-adjusted return: ``options.risk_free_rate``
+    (a T-bill proxy). Was a literal 0.05 in two result classes."""
+    try:
+        return float(load_settings().options.risk_free_rate)
+    except Exception:  # noqa: BLE001 - no config.yaml -> the schema default
+        return float(DEFAULT_RISK_FREE_RATE)
 
 
 def resolve_max_contracts_per_trade(explicit, settings) -> int:

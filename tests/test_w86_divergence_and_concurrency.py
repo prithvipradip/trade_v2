@@ -273,9 +273,13 @@ class TestResearchReadsLoadedRows:
         calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
                  and getattr(n.func, "id", getattr(n.func, "attr", "")) == "allocate_pool"]
         assert calls, "allocate_pool is no longer called by the walk-forward"
-        kw = {k.arg: ast.dump(k.value) for k in calls[0].keywords}
-        assert "max_open_positions" in kw and "max_open_positions" in kw["max_open_positions"]
-        assert "_pos" in kw["max_open_positions"] or "_settings" in kw["max_open_positions"]
+        # W90a: the limits arrive as ``**self._pool_limits()`` (one resolver for the no-config fallbacks too);
+        # _pool_limits itself reads positions.max_open_positions from the loaded settings.
+        spread = [k.value for k in calls[0].keywords if k.arg is None]
+        assert any(isinstance(v, ast.Call) and getattr(v.func, "attr", "") == "_pool_limits" for v in spread)
+        assert not any(k.arg == "max_open_positions" for k in calls[0].keywords), "a literal would shadow the setting"
+        limits = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_pool_limits")
+        assert "max_open_positions" in ast.dump(limits) and "positions" in ast.dump(limits)
 
 
 # --------------------------------------------------------------------------

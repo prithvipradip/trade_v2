@@ -59,7 +59,8 @@ from ait.backtesting.pricing import (
     ic_leg_marks,
     skewed_leg_iv,
 )
-from ait.config.settings import DEFAULT_RISK_FREE_RATE
+from ait.backtesting.study_harness import STUDY_INITIAL_CAPITAL
+from ait.config.settings import DEFAULT_RISK_FREE_RATE, BacktestConfig
 from ait.utils.time import ET
 
 # engine.py used a bare r = 0.05 at entry and in the daily re-mark (W72 finding); since W81 it reads
@@ -316,10 +317,11 @@ class ResearchData:
 @dataclass(frozen=True)
 class PricingParams:
     """The engine's pricing knobs (resolve from the research-overlaid settings)."""
+    # W90a: a bare PricingParams() carries the BacktestConfig SCHEMA defaults (single home), not copies of them
     r: float = ENGINE_RISK_FREE_RATE
-    skew_factor: float = 1.0
-    skew_slope_per_pct_otm: float = 0.0736
-    iv_floor: float = 0.05
+    skew_factor: float = BacktestConfig.model_fields["skew_factor"].default
+    skew_slope_per_pct_otm: float = BacktestConfig.model_fields["skew_slope_per_pct_otm"].default
+    iv_floor: float = BacktestConfig.model_fields["iv_floor"].default
 
     @classmethod
     def from_backtest_config(cls, bc: Any, risk_free_rate: float | None = None) -> PricingParams:
@@ -567,7 +569,9 @@ def engine_exit_scan(trade: ReplayTrade, data: ResearchData, entry: dict[str, An
     prev = os.environ.get("AIT_BT_CALIBRATED_SPREADS")
     os.environ["AIT_BT_CALIBRATED_SPREADS"] = "0"
     try:
-        kw = dict(data=window, strategies=["iron_condor"], initial_capital=100_000.0,
+        # W90a: the replay needs capital never to bind (it re-prices ONE recorded trade), so it uses the named
+        # study-harness capital, single-sourced with the gate studies, not account.capital
+        kw = dict(data=window, strategies=["iron_condor"], initial_capital=STUDY_INITIAL_CAPITAL,
                   entry_dte=max(trade.entry_dte, 1), features_cache=None,
                   friction_model="legacy", macro_event_gate=False,
                   allow_live_model_fallback=False)

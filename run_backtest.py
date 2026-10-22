@@ -113,7 +113,7 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
     one that loudly diverges on purpose.
     """
     from ait.backtesting.engine import Backtester
-    from ait.config.settings import MLConfig
+    from ait.config.settings import BacktestConfig, DteSearchConfig, MLConfig, OptionsConfig
     from ait.config.runtime_env import contract_float
     from ait.execution import exit_policy
     from ait.strategies.iron_condor import SHORT_DELTA_TARGET
@@ -128,7 +128,7 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
         return float(env.get(key, _CD[key]))
 
     rsettings = _research_settings()   # backtest column: base + research overlay
-    live_dte = list(settings.options.dte_range) if settings else [14, 45]
+    live_dte = list(settings.options.dte_range) if settings else list(OptionsConfig().dte_range)   # W90a: schema default
     live_blackout = (settings.risk.pre_event_blackout_days
                      if settings else None)
 
@@ -320,7 +320,7 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
     backtest["dte_search"] = _searching
     if _searching:
         _rng = (list(getattr(args, "dte_range", None) or [])
-                or list(getattr(_dte_cfg, "entry_dte", [0, 45])))
+                or list(getattr(_dte_cfg, "entry_dte", DteSearchConfig().entry_dte)))
         warnings.append(
             f"dte_search: ON - entry DTE is CHOSEN per window in {_rng} (plus the expiry guard and "
             "hold fraction), while live's options.dte_range validator still refuses 0 and the live "
@@ -547,14 +547,15 @@ async def run_backtest(args: argparse.Namespace) -> None:
     # the live bot never loads the overlay). Fails loudly if the overlay file is missing.
     from ait.config.research import (
         assert_registered, load_study, resolve_universe, use_research_config)
+    from ait.config.settings import BacktestConfig
     _study = load_study(args.study_file) if args.study_file else None     # W87b: the third config layer
     if _study is not None:
         assert_registered(_study)
     _research_cfg = use_research_config(study=_study)
     args.symbols, args.strategies = resolve_universe(args.symbols, args.strategies, _research_cfg)
     if args.capital is None:
-        from ait.config.runtime_env import research_capital
-        args.capital = research_capital()
+        # W90a: account.capital of the research view (overlay / study aware); was a raw read of config.yaml
+        args.capital = float(_research_cfg.account.capital)
     if args.wing_floor is None:  # W70: the CLI default was a literal 2.0
         from ait.config.runtime_env import contract_float
         # the SAME contract call live's iron_condor.py uses (home backtest.wing_floor_dollars)
@@ -619,7 +620,7 @@ async def run_backtest(args: argparse.Namespace) -> None:
         max_windows=args.max_windows,
         history_start_date=_start,
         history_days=_hist_days,
-        vlmc_min_coverage=(_bcfg.vlmc_min_coverage if _bcfg else 0.95),
+        vlmc_min_coverage=(_bcfg.vlmc_min_coverage if _bcfg else BacktestConfig().vlmc_min_coverage),   # W90a: schema default
         macro_event_types=(tuple(_bcfg.macro_event_types) if (_bcfg and _research) else None),
         train_days=args.train_days,
         test_days=args.test_days,

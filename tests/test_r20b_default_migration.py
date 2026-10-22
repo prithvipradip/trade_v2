@@ -42,6 +42,7 @@ import ait.backtesting.engine as engine_mod
 import ait.backtesting.walkforward as wf_mod
 from ait.backtesting.engine import Backtester
 from ait.backtesting.result import BacktestResult
+from ait.config.settings import load_settings
 from ait.backtesting.walkforward import WalkForwardBacktester, WalkForwardConfig
 from ait.config.runtime_env import CONTRACT_DEFAULTS, contract_float
 from ait.optimization.optimizer import StrategyOptimizer
@@ -284,13 +285,14 @@ class TestEngineConfigResolution:
         assert bt._min_confidence == pytest.approx(RiskConfig().min_confidence)
 
     def test_harness_knobs_stay_explicit(self, synth_df):
-        # Pre-registration: initial_capital / max_concurrent_positions remain
-        # explicit constructor defaults (test-harness sizing knobs, documented
-        # in engine.py) — they must NOT silently start tracking config.yaml
+        # Pre-registration: max_concurrent_positions remains an explicit constructor default (a test-harness
+        # sizing knob, documented in engine.py) -- it must NOT silently start tracking config.yaml
         # (backtest.max_concurrent_positions is 3 there).
+        # W90a: initial_capital is NOT a harness knob any more. The old 10_000 literal was a stale second copy of
+        # account.capital (5_000); a bare engine now resolves it from the loaded settings.
         bt = Backtester(data=synth_df, strategies=["iron_condor"],
                         macro_event_gate=False, allow_live_model_fallback=False)
-        assert bt._initial_capital == pytest.approx(10_000.0)
+        assert bt._initial_capital == pytest.approx(load_settings().account.capital)
         assert bt._max_concurrent_positions == 1
 
 

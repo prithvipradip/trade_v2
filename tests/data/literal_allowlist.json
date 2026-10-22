@@ -17,28 +17,12 @@
    "category": "structural",
    "note": "probe DTEs that sample one rung of the take-profit ladder"
   },
-  "run_backtest.py::build_parity_manifest": {
-   "values": [
-    14,
-    45,
-    45
-   ],
-   "category": "registered_followup",
-   "note": "fallback dte band used only when no config loads; mirrors options.dte_range"
-  },
   "run_backtest.py::parse_args": {
    "values": [
     50
    ],
    "category": "registered_followup",
    "note": "--optimize-n-trials default (50); a CLI default, also WalkForwardConfig.optimize_n_trials"
-  },
-  "run_backtest.py::run_backtest": {
-   "values": [
-    0.95
-   ],
-   "category": "registered_followup",
-   "note": "fallback vlmc_min_coverage when no config loads; mirrors backtest.vlmc_min_coverage"
   },
   "src/ait/backtesting/dte_report.py::<module>": {
    "values": [
@@ -72,14 +56,6 @@
    ],
    "category": "structural",
    "note": "partial-engine class defaults mirroring BacktestConfig (settlement, regime) so a Backtester.__new__ test engine keeps the legacy behaviour"
-  },
-  "src/ait/backtesting/engine.py::Backtester.__init__": {
-   "values": [
-    0.05,
-    10000.0
-   ],
-   "category": "registered_followup",
-   "note": "bare-engine constructor defaults (position_size_pct 0.05, initial_capital 10_000); production passes the resolved values"
   },
   "src/ait/backtesting/engine.py::Backtester._close_pending_settlement": {
    "values": [
@@ -271,14 +247,6 @@
    "category": "structural",
    "note": "session-close and settle-bar times (ET)"
   },
-  "src/ait/backtesting/replay.py::PricingParams": {
-   "values": [
-    0.05,
-    0.0736
-   ],
-   "category": "registered_followup",
-   "note": "dataclass defaults for iv_floor and skew slope, set from BacktestConfig by from_backtest_config"
-  },
   "src/ait/backtesting/replay.py::ResearchData.load_intraday_range": {
    "values": [
     23,
@@ -293,13 +261,6 @@
     1e-09
    ],
    "category": "epsilon"
-  },
-  "src/ait/backtesting/replay.py::engine_exit_scan": {
-   "values": [
-    100000.0
-   ],
-   "category": "registered_followup",
-   "note": "$100k capital of the replay harness"
   },
   "src/ait/backtesting/replay.py::exit_replay": {
    "values": [
@@ -331,22 +292,13 @@
    "category": "structural",
    "note": "seconds per day"
   },
-  "src/ait/backtesting/result.py::BacktestResult": {
-   "values": [
-    10000.0,
-    10000.0
-   ],
-   "category": "registered_followup",
-   "note": "dataclass default capital 10_000"
-  },
   "src/ait/backtesting/result.py::BacktestResult.cash_drag_adjusted_return": {
    "values": [
     0.01,
-    0.05,
     365.25
    ],
-   "category": "registered_followup",
-   "note": "display-only 5% cash yield (registered in W87/W88)"
+   "category": "structural",
+   "note": "years floor 0.01 and 365.25 days/year; the cash yield is options.risk_free_rate (W90a)"
   },
   "src/ait/backtesting/result.py::annualization_factor._dt": {
    "values": [
@@ -426,23 +378,21 @@
   },
   "src/ait/backtesting/walkforward.py::WalkForwardBacktester._run_single_window": {
    "values": [
-    0.2,
     50
    ],
    "category": "registered_followup",
-   "note": "minimum train rows (50) and the 0.20 portfolio-risk fallback used only when no config loads"
+   "note": "minimum train rows (50); the pool fallbacks moved to _pool_limits (W90a)"
   },
   "src/ait/backtesting/walkforward.py::WalkForwardConfig": {
    "values": [
     0.05,
     0.95,
-    42,
     50,
     63,
     63
    ],
    "category": "registered_followup",
-   "note": "dataclass defaults (optimize_n_trials 50, seed 42, range_threshold_pct 0.05, vlmc coverage 0.95, test/step days 63)"
+   "note": "dataclass defaults (optimize_n_trials 50, range_threshold_pct 0.05, vlmc coverage 0.95, test/step days 63)"
   },
   "src/ait/backtesting/walkforward.py::WalkForwardConfig.__post_init__": {
    "values": [
@@ -451,21 +401,13 @@
    "category": "structural",
    "note": "DTE upper bound 45"
   },
-  "src/ait/backtesting/walkforward.py::WalkForwardResult": {
-   "values": [
-    10000.0
-   ],
-   "category": "registered_followup",
-   "note": "dataclass default capital 10_000"
-  },
   "src/ait/backtesting/walkforward.py::WalkForwardResult.cash_drag_adjusted_return": {
    "values": [
     0.01,
-    0.05,
     365.25
    ],
-   "category": "registered_followup",
-   "note": "display-only 5% cash yield (registered)"
+   "category": "structural",
+   "note": "years floor 0.01 and 365.25 days/year; the cash yield is options.risk_free_rate (W90a)"
   },
   "src/ait/backtesting/walkforward.py::WalkForwardResult.summary": {
    "values": [
@@ -889,14 +831,6 @@
    ],
    "category": "structural",
    "note": "minimum fetch period days"
-  },
-  "src/ait/optimization/optimizer.py::StrategyOptimizer.__init__": {
-   "values": [
-    42,
-    50000.0
-   ],
-   "category": "registered_followup",
-   "note": "bare-optimizer defaults: seed 42 and initial_capital 50_000 (production passes the capital)"
   }
  }
 }

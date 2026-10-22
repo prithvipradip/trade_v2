@@ -144,8 +144,8 @@ def main() -> None:
     args.symbols, args.strategies = resolve_universe(args.symbols, args.strategies, _research_cfg)
     from ait.optimization.optimizer import StrategyOptimizer
     if args.capital is None:
-        from ait.config.runtime_env import research_capital
-        args.capital = research_capital()
+        # W90a: account.capital of the research view (overlay / study aware); was a raw read of config.yaml
+        args.capital = float(_research_cfg.account.capital)
 
     print("=" * 70)
     print("  AIT v2 — STRATEGY PARAMETER OPTIMIZER")

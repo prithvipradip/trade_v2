@@ -109,7 +109,12 @@ NEUTRAL_CREDIT_GATED = (
 # ait.config.settings as the ONE shared implementation (also reused by those
 # other call sites); re-imported under the original name so every existing
 # `_resolve_setting(...)` call in this file needs no change.
-from ait.config.settings import DEFAULT_RISK_FREE_RATE, LegacyEngineConfig
+from ait.config.settings import (
+    DEFAULT_RISK_FREE_RATE,
+    LegacyEngineConfig,
+    resolve_account_capital,
+    resolve_position_size_pct,
+)
 from ait.ml.feature_spec import FeatureSpec, spec_from_config
 from ait.config.settings import resolve_config_value as _resolve_setting
 
@@ -121,13 +126,11 @@ class Backtester:
         self,
         data: pd.DataFrame,
         strategies: list[str],
-        # R20b: initial_capital (and max_concurrent_positions below) stay
-        # EXPLICIT constructor defaults per the pre-registration — they are
-        # test-harness sizing knobs, not strategy economics: every research
-        # entry point (walkforward, optimizer, run_backtest) passes its own
-        # capital, and a $10k bare-engine default cannot bias a comparison
-        # the way a divergent gate threshold can.
-        initial_capital: float = 10_000.0,
+        # R20b kept a $10,000 literal here as a "test-harness sizing knob". W90a: that literal duplicated
+        # account.capital ($5,000) and drifted from it, so it is now None -> account.capital (explicit wins);
+        # every research entry point still passes its own capital. max_concurrent_positions below stays an
+        # explicit harness default (1 = the original single-position semantics unit tests depend on).
+        initial_capital: float | None = None,
         # W5 finding model-vs-reality-commission-constant: was a bare 0.65
         # literal that stood for the WHOLE per-leg cost. IBKR charges ~$0.65
         # commission PLUS regulatory/exchange/clearing fees on every option
@@ -140,7 +143,7 @@ class Backtester:
         commission_per_contract: float | None = None,
         regulatory_fees_per_contract: float | None = None,
         slippage_pct: float | None = None,   # W70: None -> backtest.slippage_pct
-        position_size_pct: float = 0.05,
+        position_size_pct: float | None = None,   # W90a: None -> resolve_position_size_pct (backtest > risk)
         # W64 live-parity switches, OFF for a bare Backtester (R20b: the bare
         # engine's sizing knobs stay explicit harness defaults; hundreds of engine
         # tests pin them). The research ENTRY POINTS (WalkForwardConfig,
@@ -476,7 +479,8 @@ class Backtester:
             earnings_buffer_days_after, "earnings", "buffer_days_after", EarningsConfig, _settings))
         self._data = self._prepare_data(data)
         self._strategies = strategies
-        self._initial_capital = initial_capital
+        # W90a: None -> account.capital (the stale $10,000 default duplicated it); an explicit value still wins
+        self._initial_capital = resolve_account_capital(initial_capital, _settings)
         # W5: _commission / _regulatory_fees / _cost_per_contract_leg are
         # resolved in the loaded-settings block below (they need _settings),
         # same as _iv_floor.
@@ -495,7 +499,8 @@ class Backtester:
         # credit has been charged too much friction. AIT_BT_CALIBRATED_SPREADS=0
         # restores the config formula for A/B runs.
         self._calibrated_spreads = None
-        self._position_size_pct = position_size_pct
+        # W90a: None -> backtest.position_size_pct > risk.max_position_risk_pct (what live funds the builder with)
+        self._position_size_pct = resolve_position_size_pct(position_size_pct, _settings)
         self._budget_aware_wings = bool(budget_aware_wings)
         self._condor_any_direction = bool(condor_any_direction)
         if friction_model not in ("legacy", "per_leg_usd"):

@@ -94,7 +94,7 @@ class StrategyOptimizer:
         study_name: str | None = None,
         storage: str | None = None,
         optimize_ml: bool = False,
-        initial_capital: float = 50_000.0,
+        initial_capital: float | None = None,     # W90a: None -> account.capital (was a stale 50_000)
         train_days: int = 365,
         features_cache: "pd.DataFrame | None" = None,
         # W64: None -> backtest.position_size_pct, else risk.max_position_risk_pct
@@ -170,7 +170,7 @@ class StrategyOptimizer:
         # (a study file's ``search_space:``). Validated here, at construction, by ``effective_space``.
         # None = the code defaults, unchanged.
         search_space_overrides: "dict | None" = None,
-        seed: int = 42,
+        seed: int | None = None,                 # W90a: None -> backtest.walkforward_tuning.optimize_seed (was 42)
         intraday_store: "Any | None" = None,
         symbol: str | None = None,
         range_predictor: "Any | None" = None,
@@ -228,7 +228,7 @@ class StrategyOptimizer:
         self._study_name = study_name or f"ait_{'_'.join(strategies[:2])}_{objective}"
         self._storage = storage
         self._optimize_ml = optimize_ml
-        self._initial_capital = initial_capital
+        self._initial_capital_arg = initial_capital       # resolved below, once the settings are loaded
         self._train_days = train_days
         self._features_cache = features_cache
         # self._wing_floor_dollars / _delta_iv_scale / _max_entry_vol_annual resolved below (W70)
@@ -271,6 +271,8 @@ class StrategyOptimizer:
         # objective weights) come from backtest.*; a stub settings object degrades to the schema defaults.
         from ait.config.settings import ObjectivesConfig as _OC, WalkForwardTuningConfig as _WTC
         self._tuning = getattr(_bt_cfg, "walkforward_tuning", None) or _WTC()
+        from ait.config.settings import resolve_account_capital as _rac
+        self._initial_capital = _rac(self._initial_capital_arg, self._settings)   # W90a: account.capital, not 50_000
         self._objectives_cfg = getattr(_bt_cfg, "objectives", None) or _OC()
         # W64: per-trade budget + live-parity switches, resolved once the loaded
         # settings exist (explicit arg > config > model default).
@@ -383,7 +385,7 @@ class StrategyOptimizer:
             except Exception:  # noqa: BLE001 — no config.yaml -> field default
                 from ait.config.settings import RiskConfig as _RC
                 self._min_confidence = float(_RC().min_confidence)
-        self._seed = seed
+        self._seed = int(seed if seed is not None else self._tuning.optimize_seed)
         self._intraday_store = intraday_store
         self._symbol = symbol
         self._range_predictor = range_predictor
