@@ -344,6 +344,7 @@ python run_orchestrator.py --refresh-fundamentals
 # Fetch IB news + analyst recommendations → fundamentals.db
 python run_orchestrator.py --fetch-news
 
+# Research mode user guide: docs/RESEARCH_GUIDE.md
 # Run walk-forward backtest (no --symbols: backtest.default_symbols = QQQ; no --strategies: options.strategies)
 python run_backtest.py --symbols SPY QQQ AAPL --capital 50000
 

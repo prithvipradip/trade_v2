@@ -18521,3 +18521,13 @@ plumbing guarded by tests), b 52 / 52 caught after strengthening (the first run 
 The W88 AS BUILT entry above says `tests/test_w88a_plumbing.py` has 22 tests. It has **16**, which is what the 6,400 -> 6,416 reconciliation already showed (the three W87b refusal tests replaced by three positive pool tests are net zero). Nothing else in that entry changes.
 
 ---
+
+
+## 2026-10-22 - W88 ADDENDUM (documentation only): `docs/RESEARCH_GUIDE.md`, the research-mode user guide
+
+The operator asked for a user document explaining what research mode contains and how it works, written in the short question-and-answer style used in the learner explanation. Before this there was none: the research material was spread over RUNBOOK sections (operations notes) and
+`docs/WALKFORWARD_DASHBOARD.md` (reading the dashboard only; it links a `GUIDE.md` that does not exist). `docs/RESEARCH_GUIDE.md` covers: what research mode is and never touches; the pieces; what one run does; the three config layers and `show_research_config.py`; the engine and its entry funnel; the models;
+**the learner** (what it adapts, what the multipliers are and where they are used, `reduce_min_change`, `boost_min_trades` / `reenable_min_trades`, what "disable a strategy" is for and why it is unreachable today, a settings table); the optimizer; studies and run records; how to read results; research vs live; common commands; known limits.
+`tests/test_w88_research_guide.py` (9 tests) keeps it true: anchors and links resolve, named files and RUNBOOK sections exist, the learner table equals the schema defaults, the quoted walk-forward defaults and objective weights match, and the study example loads. README and the RUNBOOK "Studies and run records" section point to it. No code change; collected 6,529 -> 6,538.
+
+---

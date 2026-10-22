@@ -510,6 +510,8 @@ python scripts/parity_replay.py                 # reads data/replay/manual_trade
 
 ## Studies and run records (W87; research only)
 
+> New to research mode? Start with [RESEARCH_GUIDE.md](RESEARCH_GUIDE.md): what it contains, how a run works, the learner, studies and how to read results. This section is the operations reference.
+
 A **study** is a committed file, `studies/<name>.yaml`, that says what one research run changes relative to `config.yaml` +
 `config_research.yaml`. `config_research.yaml` stays the stable default for ordinary research runs; editing it per study would silently
 change every later default run.
