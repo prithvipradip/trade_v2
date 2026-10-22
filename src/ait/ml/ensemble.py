@@ -28,9 +28,11 @@ warnings.filterwarnings(
 )
 
 from ait.config.settings import MLConfig
+from ait.ml.feature_spec import spec_from_config
 from ait.ml.features import FeatureEngine
 from ait.ml.hyperparams import (  # W87a/W88c: hyperparameters are settings, recorded with every model
     default_hyperparams,
+    feature_spec_refused,
     lgbm_multiclass_kwargs,
     model_spec,
     warn_on_spec_mismatch,
@@ -86,7 +88,8 @@ class DirectionPredictor:
                 previously clobbered the LIVE models/ensemble.pkl).
         """
         self._config = config
-        self._feature_engine = FeatureEngine()
+        # W88d: the predictor computes features with the windows of ITS config (ml.features)
+        self._feature_engine = FeatureEngine(spec_from_config(getattr(config, "features", None)))
         self._model_dir: Path | None = Path(model_dir) if model_dir is not None else None
         self._persist_artifacts = bool(persist_artifacts)
 
@@ -443,7 +446,7 @@ class DirectionPredictor:
         return getattr(self._config, "hyperparams", None) or default_hyperparams()
 
     def _spec(self) -> dict:
-        return model_spec(self._hyperparams())
+        return model_spec(self._hyperparams(), self._feature_engine.spec_hash())
 
     def load_models(self, version: str | None = None) -> bool:
         """Load previously trained models from disk.
@@ -462,6 +465,8 @@ class DirectionPredictor:
         try:
             with open(model_file, "rb") as f:
                 data = pickle.load(f)
+            if feature_spec_refused("ensemble", data.get("spec"), self._feature_engine.spec_hash()):
+                return False                              # W88d: trained under other windows: retrain, never serve
             self._models = data["models"]
             self._scaler = data["scaler"]
             self._feature_names = data["feature_names"]

@@ -41,7 +41,7 @@ class TestLinks:
     def test_named_runbook_sections_exist(self):
         runbook = (ROOT / "docs" / "RUNBOOK.md").read_text()
         for title in ("Studies and run records", "Research tunables", "Research fixed limits", "Model hyperparameters",
-                      "One-sided entry gates", "Research-vs-reality parity replay", "Searching the entry DTE"):
+                      "One-sided entry gates", "Research-vs-reality parity replay", "Searching the entry DTE", "Feature windows"):
             assert re.search(rf"^## {re.escape(title)}", runbook, re.M), title
 
 

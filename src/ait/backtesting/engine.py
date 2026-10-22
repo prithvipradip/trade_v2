@@ -110,6 +110,7 @@ NEUTRAL_CREDIT_GATED = (
 # other call sites); re-imported under the original name so every existing
 # `_resolve_setting(...)` call in this file needs no change.
 from ait.config.settings import DEFAULT_RISK_FREE_RATE, LegacyEngineConfig
+from ait.ml.feature_spec import FeatureSpec, spec_from_config
 from ait.config.settings import resolve_config_value as _resolve_setting
 
 
@@ -576,6 +577,8 @@ class Backtester:
         # margin, thesis exit, vol-regime ratio) come from backtest.legacy_engine, not inline literals.
         self._legacy = (getattr(getattr(_settings, "backtest", None), "legacy_engine", None)
                         or LegacyEngineConfig())   # a stub settings object degrades to the schema defaults
+        # W88d: the feature column names the engine reads (price_vs_sma_20, rsi_14, ...) follow ml.features
+        self._fspec = spec_from_config(getattr(getattr(_settings, "ml", None), "features", None))
         self._pct_from_60d_high_threshold = pct_from_60d_high_threshold
         self._min_edge_over_baseline = min_edge_over_baseline
         self._features_cache = features_cache
@@ -790,6 +793,15 @@ class Backtester:
                 note="no window model and live-artifact fallback disabled — "
                      "direction comes from _simple_direction only",
             )
+        # W88d: a predictor that computes features with OTHER windows than this engine's feature frames would be
+        # fed columns it cannot find (predict zero-fills them). Drop it rather than predict on silent zeros.
+        _pfe = getattr(self._predictor, "_feature_engine", None)
+        if _pfe is not None and hasattr(_pfe, "spec_hash") and _pfe.spec_hash() != self._fspec.spec_hash():
+            log.critical("predictor_feature_spec_mismatch",
+                         predictor_hash=_pfe.spec_hash(), engine_hash=self._fspec.spec_hash(),
+                         action="predictor dropped: the engine runs ungated (_simple_direction) instead of "
+                                "predicting on columns computed under other feature windows")
+            self._predictor = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -1016,8 +1028,9 @@ class Backtester:
                 meta_ctx: dict = {"primary_confidence": float(confidence)}
                 if not features_df.empty:
                     last_f = features_df.iloc[-1]
+                    fn = self._fspec.names           # W88d: window-bearing column names follow ml.features
                     vol_exp = float(last_f.get("vol_regime_expanding", 0.0)) > 0.5
-                    px_sma  = float(last_f.get("price_vs_sma_20", 0.0))
+                    px_sma  = float(last_f.get(fn["px_vs_mid"], 0.0))
                     meta_ctx.update({
                         # W81: the class thresholds are backtest.regime_{down,up}_threshold
                         # (were bare -0.05 / 0.02 here, in the veto and in entry_regime).
@@ -1027,17 +1040,17 @@ class Backtester:
                         "regime_range_bound":    0.0 if vol_exp else 1.0,
                         "vix":                   float(last_f.get("vix_level", 0.5)),
                         "iv_rank":               float(last_f.get("iv_rank", 0.5)),
-                        "rsi_14":                float(last_f.get("rsi_14", 50.0)),
-                        "rsi_7":                 float(last_f.get("rsi_7",  50.0)),
+                        fn["rsi_long"]:          float(last_f.get(fn["rsi_long"], 50.0)),
+                        fn["rsi_short"]:         float(last_f.get(fn["rsi_short"],  50.0)),
                         "bb_position":           float(last_f.get("bb_position", 0.5)),
-                        "volume_sma_20_ratio":   float(last_f.get("volume_sma_20_ratio", 1.0)),
-                        "realized_vol_20":       float(last_f.get("realized_vol_20", 0.20)),
+                        fn["volume_ratio"]:      float(last_f.get(fn["volume_ratio"], 1.0)),
+                        fn["rv_long"]:           float(last_f.get(fn["rv_long"], 0.20)),
                         "atr_pct":               float(last_f.get("atr_pct", 0.01)),
                         "weekly_trend_aligned":  float(last_f.get("weekly_trend_aligned", 0.5)),
                         "volume_confirmation":   float(last_f.get("volume_confirmation", 0.0)),
                         "macd_hist":             float(last_f.get("macd_hist", 0.0)),
-                        "price_vs_sma_20":       px_sma,
-                        "sma_10_20_cross":       float(last_f.get("sma_10_20_cross", 0.5)),
+                        fn["px_vs_mid"]:         px_sma,
+                        fn["cross"]:             float(last_f.get(fn["cross"], 0.5)),
                     })
                 meta_ctx.setdefault("sentiment_score", 0.0)
                 meta_ctx.setdefault("hour_of_day", 10)
@@ -1132,7 +1145,7 @@ class Backtester:
             if strategy in NEUTRAL_CREDIT_GATED and not features_df.empty:
                 _last_f        = features_df.iloc[-1]
                 _vol_exp_flag  = float(_last_f.get("vol_regime_expanding", 0.0)) > 0.5
-                _px_sma_val    = float(_last_f.get("price_vs_sma_20", 0.0))
+                _px_sma_val    = float(_last_f.get(self._fspec.names["px_vs_mid"], 0.0))
                 _regime_class  = research_regime(
                     _vol_exp_flag, _px_sma_val, self._regime_down, self._regime_up)
                 _entry_decision["regime_class"] = _regime_class
@@ -1149,7 +1162,7 @@ class Backtester:
                         strategy=strategy,
                         regime=_regime_class,
                         vol_regime_expanding=round(float(_last_f.get("vol_regime_expanding", 0.0)), 4),
-                        price_vs_sma_20=round(_px_sma_val, 4),
+                        **{self._fspec.names["px_vs_mid"]: round(_px_sma_val, 4)},
                     )
                     self._reject("regime_veto")
                     continue
@@ -1410,16 +1423,17 @@ class Backtester:
                 pos["entry_iv_rank"] = round(float(last_f.get("iv_rank", 0.0)), 4)
                 pos["entry_vix_level"] = round(float(last_f.get("vix_level", 0.0)), 4)
                 vol_expanding = float(last_f.get("vol_regime_expanding", 0.0)) > 0.5
-                px_vs_sma = float(last_f.get("price_vs_sma_20", 0.0))
+                fn = self._fspec.names               # W88d
+                px_vs_sma = float(last_f.get(fn["px_vs_mid"], 0.0))
                 pos["entry_regime"] = research_regime(
                     vol_expanding, px_vs_sma, self._regime_down, self._regime_up)
                 # Features snapshot for dashboard decision drawer
                 pos["features_at_entry"] = {
-                    "rsi_14":              round(float(last_f.get("rsi_14", 0.0)), 2),
+                    fn["rsi_long"]:        round(float(last_f.get(fn["rsi_long"], 0.0)), 2),
                     "macd_hist":           round(float(last_f.get("macd_hist", 0.0)), 5),
                     "bb_position":         round(float(last_f.get("bb_position", 0.0)), 3),
                     "atr_pct":             round(float(last_f.get("atr_pct", 0.0)), 4),
-                    "realized_vol_20":     round(float(last_f.get("realized_vol_20", 0.0)), 4),
+                    fn["rv_long"]:         round(float(last_f.get(fn["rv_long"], 0.0)), 4),
                     "iv_rank":             round(float(last_f.get("iv_rank", 0.0)), 3),
                     "vix_level":           round(float(last_f.get("vix_level", 0.0)), 2),
                     "hurst_wavelet":       round(float(last_f.get("hurst_wavelet", 0.0)), 3),
@@ -1879,11 +1893,11 @@ class Backtester:
             mask = self._features_cache.index <= today
             features_df = self._features_cache[mask]
             if features_df.empty:
-                features_df = FeatureEngine().compute(hist)
+                features_df = FeatureEngine(self._fspec).compute(hist)
             else:
                 _cache_hit = True
         else:
-            features_df = FeatureEngine().compute(hist)
+            features_df = FeatureEngine(self._fspec).compute(hist)
 
         if self._predictor is not None:
             try:
@@ -2128,6 +2142,7 @@ class Backtester:
     _research_table_prefix: str = "research_"
     _risk_free_rate: float = DEFAULT_RISK_FREE_RATE
     _legacy: LegacyEngineConfig = LegacyEngineConfig()      # W88b: a partial engine keeps the schema defaults
+    _fspec: FeatureSpec = spec_from_config(None)            # W88d: feature windows / column names (schema defaults)
     _settlement_stats: dict | None = None
 
     # R16: VIX -> per-symbol implied-vol multipliers (see _get_iv). Unknown

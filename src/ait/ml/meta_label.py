@@ -26,10 +26,12 @@ from sklearn.preprocessing import StandardScaler
 
 from ait.ml.hyperparams import (  # W88c: the tree profile is a setting, recorded with the model
     default_meta_label_hyperparams,
+    feature_spec_refused,
     meta_label_xgb_kwargs,
     model_spec,
     warn_on_spec_mismatch,
 )
+from ait.ml.feature_spec import FeatureSpec, default_feature_spec, spec_from_config
 from ait.utils.logging import get_logger
 from ait.utils.time import parse_trade_ts
 
@@ -83,28 +85,31 @@ MAX_ARTIFACT_AGE_DAYS = 45  # loaded artifact older than this = stale, refuse
 MIN_TRADES_FOR_TRAINING = 30
 
 # Features the meta-labeler uses (all available at trade entry time)
-META_FEATURES = [
-    "primary_confidence",
-    "regime_trending_up",
-    "regime_trending_down",
-    "regime_high_vol",
-    "regime_range_bound",
-    "vix",
-    "iv_rank",
-    "sentiment_score",
-    "rsi_14",
-    "rsi_7",
-    "bb_position",
-    "volume_sma_20_ratio",
-    "realized_vol_20",
-    "atr_pct",
-    "weekly_trend_aligned",
-    "volume_confirmation",
-    "hour_of_day",
-    "macd_hist",
-    "price_vs_sma_20",
-    "sma_10_20_cross",
-]
+# W88d: the DEFAULT-window list (kept for importers and as documentation). The 20 inputs are derived from
+# ``ml.features`` per instance (``MetaLabeler._meta_features``): six of them carry a window in their name.
+META_FEATURES = spec_from_config(None).meta_feature_names()
+
+
+def live_technical_features(last_row, names: dict) -> dict:
+    """The eleven technical meta-label inputs the LIVE orchestrator snapshots at entry, from the last feature row.
+
+    W88d: the keys of the six window-bearing ones come from the feature spec's ``names`` (``rsi_14`` at the default
+    windows), so the snapshot, the meta-labeler's training columns and the trained model agree. Missing columns read 0."""
+    def f(col: str) -> float:
+        return float(last_row.get(col, 0))
+    return {
+        names["rsi_long"]: f(names["rsi_long"]),
+        names["rsi_short"]: f(names["rsi_short"]),
+        "bb_position": f("bb_position"),
+        names["volume_ratio"]: f(names["volume_ratio"]),
+        names["rv_long"]: f(names["rv_long"]),
+        "atr_pct": f("atr_pct"),
+        "weekly_trend_aligned": f("weekly_trend_aligned"),
+        "volume_confirmation": f("volume_confirmation"),
+        "macd_hist": f("macd_hist"),
+        names["px_vs_mid"]: f(names["px_vs_mid"]),
+        names["cross"]: f(names["cross"]),
+    }
 
 
 @dataclass
@@ -123,8 +128,12 @@ class MetaLabeler:
     Uses market context features available at entry time.
     """
 
-    def __init__(self, min_probability: float = 0.50, hyperparams=None) -> None:
+    def __init__(self, min_probability: float = 0.50, hyperparams=None,
+                 feature_spec: "FeatureSpec | None" = None) -> None:
         self._min_probability = min_probability
+        # W88d: the 20 inputs (and the window-bearing names among them) follow ml.features
+        self._fspec = feature_spec if feature_spec is not None else default_feature_spec()
+        self._meta_features = self._fspec.meta_feature_names()
         # W88c: the meta-labeler's own tree profile is ml.meta_label_hyperparams (an explicit one wins)
         self._hp = hyperparams if hyperparams is not None else default_meta_label_hyperparams()
         self._model = None
@@ -202,7 +211,7 @@ class MetaLabeler:
             return {}
 
         # Use only features that exist in the data
-        available = [f for f in META_FEATURES if f in trades_df.columns]
+        available = [f for f in self._meta_features if f in trades_df.columns]
         if not available:
             log.warning("no_meta_features_available")
             return {}
@@ -226,7 +235,7 @@ class MetaLabeler:
                 informative_features=len(live_cols),
                 present_features=len(available),
                 required=MIN_FEATURE_COVERAGE,
-                expected=len(META_FEATURES),
+                expected=len(self._meta_features),
                 dead_or_constant=[f for f in available if f not in live_cols],
                 impact="NOT arming the meta-label gate — this is the "
                        "corrupted-training condition meta_label.pkl was "
@@ -352,6 +361,7 @@ class MetaLabeler:
         """
         if not trades or features_df.empty:
             return pd.DataFrame()
+        n = self._fspec.names               # W88d: window-bearing column names follow ml.features
 
         # Normalise features_df index to plain date objects for O(1) lookup
         try:
@@ -373,7 +383,7 @@ class MetaLabeler:
                 )
             if feat_row is not None:
                 vol_exp = float(feat_row.get("vol_regime_expanding", 0.0)) > 0.5
-                px_sma  = float(feat_row.get("price_vs_sma_20", 0.0))
+                px_sma  = float(feat_row.get(n["px_vs_mid"], 0.0))
                 if vol_exp:
                     if px_sma > 0.02:  return (1.0, 0.0, 0.0, 0.0)
                     if px_sma < -0.02: return (0.0, 1.0, 0.0, 0.0)
@@ -422,18 +432,18 @@ class MetaLabeler:
                 "vix":                  trade.get("entry_vix_level", _fv("vix_level", 0.5)),
                 "iv_rank":              trade.get("entry_iv_rank",   _fv("iv_rank",   0.5)),
                 "sentiment_score":      0.0,  # not available in backtest
-                "rsi_14":               _fv("rsi_14",           50.0),
-                "rsi_7":                _fv("rsi_7",            50.0),
+                n["rsi_long"]:          _fv(n["rsi_long"],       50.0),
+                n["rsi_short"]:         _fv(n["rsi_short"],      50.0),
                 "bb_position":          _fv("bb_position",       0.5),
-                "volume_sma_20_ratio":  _fv("volume_sma_20_ratio", 1.0),
-                "realized_vol_20":      _fv("realized_vol_20",  0.20),
+                n["volume_ratio"]:      _fv(n["volume_ratio"],   1.0),
+                n["rv_long"]:           _fv(n["rv_long"],        0.20),
                 "atr_pct":              _fv("atr_pct",           0.01),
                 "weekly_trend_aligned": _fv("weekly_trend_aligned", 0.5),
                 "volume_confirmation":  _fv("volume_confirmation",  0.0),
                 "hour_of_day":          10,  # backtest entries are effectively at open
                 "macd_hist":            _fv("macd_hist",         0.0),
-                "price_vs_sma_20":      _fv("price_vs_sma_20",   0.0),
-                "sma_10_20_cross":      _fv("sma_10_20_cross",   0.5),
+                n["px_vs_mid"]:         _fv(n["px_vs_mid"],      0.0),
+                n["cross"]:             _fv(n["cross"],          0.5),
                 "profitable":           1 if pnl > 0 else 0,
             })
 
@@ -453,6 +463,7 @@ class MetaLabeler:
         """
         import json as _json
         import sqlite3
+        n = self._fspec.names               # W88d: the entry_signals snapshot keys follow ml.features
 
         # W3 string-contracts-1/-4: this query used to be a bare
         # "WHERE t.status = 'closed'" while all 8 sibling consumers filtered
@@ -535,18 +546,18 @@ class MetaLabeler:
                 "vix": r.get("entry_vix", 0),
                 "iv_rank": r.get("entry_iv_rank", 0),
                 "sentiment_score": r.get("entry_sentiment_score", 0),
-                "rsi_14":               _sig(sig, "rsi_14", 50.0),
-                "rsi_7":                _sig(sig, "rsi_7", 50.0),
+                n["rsi_long"]:          _sig(sig, n["rsi_long"], 50.0),
+                n["rsi_short"]:         _sig(sig, n["rsi_short"], 50.0),
                 "bb_position":          _sig(sig, "bb_position", 0.5),
-                "volume_sma_20_ratio":  _sig(sig, "volume_sma_20_ratio", 1.0),
-                "realized_vol_20":      _sig(sig, "realized_vol_20", 0.20),
+                n["volume_ratio"]:      _sig(sig, n["volume_ratio"], 1.0),
+                n["rv_long"]:           _sig(sig, n["rv_long"], 0.20),
                 "atr_pct":              _sig(sig, "atr_pct", 0.01),
                 "weekly_trend_aligned": _sig(sig, "weekly_trend_aligned", 0.5),
                 "volume_confirmation":  _sig(sig, "volume_confirmation", 0.0),
                 "hour_of_day": entry_hour,
                 "macd_hist":            _sig(sig, "macd_hist", 0.0),
-                "price_vs_sma_20":      _sig(sig, "price_vs_sma_20", 0.0),
-                "sma_10_20_cross":      _sig(sig, "sma_10_20_cross", 0.5),
+                n["px_vs_mid"]:         _sig(sig, n["px_vs_mid"], 0.0),
+                n["cross"]:             _sig(sig, n["cross"], 0.5),
                 "profitable": 1 if r["realized_pnl"] > 0 else 0,
             })
 
@@ -599,13 +610,15 @@ class MetaLabeler:
         try:
             with open(model_file, "rb") as f:
                 data = pickle.load(f)
+            if feature_spec_refused("meta_label", data.get("spec"), self._fspec.spec_hash()):
+                return False                              # W88d: trained under other windows: retrain, never arm
             self._model = data["model"]
             self._scaler = data["scaler"]
             self._feature_names = data["feature_names"]
             self._model_version = data.get("version", "unknown")
             self._training_stats = data.get("training_stats", {})
             self._trained = True
-            warn_on_spec_mismatch("meta_label", data.get("spec"), model_spec(self._hp))   # W88c: informational
+            warn_on_spec_mismatch("meta_label", data.get("spec"), model_spec(self._hp, self._fspec.spec_hash()))   # W88c: informational
             log.info("meta_label_loaded", version=self._model_version)
             return True
         except Exception as e:
@@ -620,7 +633,7 @@ class MetaLabeler:
             "feature_names": self._feature_names,
             "version": self._model_version,
             "training_stats": self._training_stats,
-            "spec": model_spec(self._hp),            # W88c: the hyperparameters this model was trained with
+            "spec": model_spec(self._hp, self._fspec.spec_hash()),            # W88c: the hyperparameters this model was trained with
         }
         dest = Path(path)
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -639,7 +652,7 @@ class MetaLabeler:
             "feature_names": self._feature_names,
             "version": self._model_version,
             "training_stats": self._training_stats,
-            "spec": model_spec(self._hp),            # W88c: the hyperparameters this model was trained with
+            "spec": model_spec(self._hp, self._fspec.spec_hash()),            # W88c: the hyperparameters this model was trained with
         }
 
         model_file = _model_path()

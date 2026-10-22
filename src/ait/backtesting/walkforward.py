@@ -30,6 +30,7 @@ from ait.backtesting.learner import BacktestLearner
 from ait.backtesting.range_bank import RangeModelBank
 from ait.backtesting.result import BacktestResult
 from ait.config.invariants_research import PROB_CLIP_EPS  # W88a
+from ait.ml.feature_spec import FeatureSpec, spec_from_config  # W88d
 from ait.config.settings import MLConfig, WalkForwardTuningConfig
 from ait.ml.ensemble import DirectionPredictor
 from ait.strategies.base import SignalDirection
@@ -945,6 +946,9 @@ def _build_optuna_window_data(
     return {"trials": trials_out, "meta": meta}
 
 
+# W88d: the dashboard series keep these STABLE keys; the four marked ones read the (window-derived) column of the
+# run's feature spec, so a changed window does not blank the chart.
+_TIMESERIES_ROLE = {"rsi_14": "rsi_long", "sma_20": "sma_mid", "sma_50": "sma_slow", "realized_vol_20": "rv_long"}
 _TIMESERIES_FEAT_KEYS = [
     "rsi_14", "macd", "macd_signal", "macd_hist",
     "sma_20", "sma_50", "bb_upper", "bb_lower", "bb_position",
@@ -982,10 +986,12 @@ def _save_window_timeseries(
 
         # Use pre-computed features if provided (shared from OOS Backtester setup),
         # otherwise compute once on full context+OOS. O(1) instead of O(N²).
+        _fe = FeatureEngine()
+        _names = _fe.spec.names
         if precomputed_features is not None and not precomputed_features.empty:
             feat_df = precomputed_features
         else:
-            feat_df = FeatureEngine().compute(full_context_df, market_context=vix_ctx)
+            feat_df = _fe.compute(full_context_df, market_context=vix_ctx)
         if feat_df.empty:
             return
 
@@ -1011,9 +1017,10 @@ def _save_window_timeseries(
             # Features for this bar (O(1) lookup — no date-string scan)
             if feat_row is not None and not feat_row.isna().all():
                 for k in _TIMESERIES_FEAT_KEYS:
-                    v = feat_row.get(k) if k in feat_row.index else None
+                    col = _names[_TIMESERIES_ROLE[k]] if k in _TIMESERIES_ROLE else k
+                    v = feat_row.get(col) if col in feat_row.index else None
                     bar[k] = round(float(v), 4) if v is not None and not _isnan(v) else None
-                vol20 = feat_row.get("volume_sma_20_ratio")
+                vol20 = feat_row.get(_names["volume_ratio"])
                 bar["volume_ratio"] = round(float(vol20), 4) if vol20 is not None and not _isnan(vol20) else None
 
             # ML predictions via predict_from_features — O(1), no FeatureEngine re-run
@@ -1147,6 +1154,7 @@ class WalkForwardBacktester:
     - Equity curve generation
     """
     _tuning = WalkForwardTuningConfig()     # W88b: a partial (__new__) instance keeps the schema defaults
+    _fspec: FeatureSpec = spec_from_config(None)    # W88d: ... and the schema-default feature windows
 
     def __init__(
         self,
@@ -1197,6 +1205,8 @@ class WalkForwardBacktester:
         # W88b: the walk-forward constants that were literals (warm start, adaptive range threshold, fallback band)
         self._tuning = (getattr(getattr(self._settings, "backtest", None), "walkforward_tuning", None)
                         or WalkForwardTuningConfig())
+        # W88d: the feature windows (ml.features) every FeatureEngine of this run computes with
+        self._fspec = spec_from_config(getattr(getattr(self._settings, "ml", None), "features", None))
         # R12-C: enable_msgarch/enable_oujump flags removed — the GARCH family
         # is retired to deprecated/research/; range models are ML-only.
 
@@ -2093,7 +2103,7 @@ class WalkForwardBacktester:
                 # Pass intraday_store+symbol so VLMC features appear in features_cache,
                 # matching the training path used by _train_window_model (Gap B fix).
                 _intraday_store = self._make_intraday_store()
-                features_cache = FeatureEngine().compute(
+                features_cache = FeatureEngine(self._fspec).compute(
                     train_df, intraday_store=_intraday_store, symbol=symbol,
                     market_context=vix_ctx,
                 )
@@ -3044,7 +3054,7 @@ class WalkForwardBacktester:
             # Build the feature matrix for the training window (same call as training path)
             intraday_store = self._make_intraday_store()
 
-            features_df = FeatureEngine().compute(
+            features_df = FeatureEngine(self._fspec).compute(
                 train_df, intraday_store=intraday_store, symbol=symbol
             )
 

@@ -107,14 +107,15 @@ def spec_differences(stored: dict | None, current: dict) -> list[str]:
     saved before W88c) is not a difference: legacy artifacts are always accepted."""
     if not stored:
         return []
+    from ait.ml.feature_spec import default_spec_hash
     out = []
     for key, now in current.get("hyperparams", {}).items():
         was = (stored.get("hyperparams") or {}).get(key)
         if was != now:
             out.append(f"{key}: model trained with {was!r}, config now {now!r}")
-    if stored.get("feature_spec_hash") != current.get("feature_spec_hash"):
-        out.append(f"feature_spec_hash: model {stored.get('feature_spec_hash')!r}, config now "
-                   f"{current.get('feature_spec_hash')!r}")
+    was_h, now_h = stored.get("feature_spec_hash") or default_spec_hash(), current.get("feature_spec_hash")
+    if now_h is not None and was_h != now_h:       # a recorded-hash-less model is assumed to carry the default hash
+        out.append(f"feature_spec_hash: model {was_h!r}, config now {now_h!r}")
     return out
 
 
@@ -127,3 +128,22 @@ def warn_on_spec_mismatch(artifact: str, stored: dict | None, current: dict) -> 
         from ait.utils.logging import get_logger
         get_logger("ml.hyperparams").warning("model_spec_mismatch", artifact=artifact, differences=diffs)
     return bool(diffs)
+
+
+def feature_spec_refused(artifact: str, stored: dict | None, current_hash: str) -> bool:
+    """True (after logging CRITICAL) when a saved model was trained under other FEATURE WINDOWS than the current ones.
+
+    Unlike a hyperparameter difference this is never served: the model's input columns are named after the windows
+    (``rsi_14``), and ``predict`` zero-fills columns it cannot find, so a stale model would predict on silent zeros.
+    Callers return False from their ``load_*`` (the normal needs-training path retrains). A model with no recorded
+    hash predates W88d and was trained under the DEFAULT windows, so it is compared as such."""
+    from ait.ml.feature_spec import default_spec_hash
+    was = (stored or {}).get("feature_spec_hash") or default_spec_hash()
+    if was == current_hash:
+        return False
+    from ait.utils.logging import get_logger
+    get_logger("ml.hyperparams").critical(
+        "model_feature_spec_mismatch", artifact=artifact, model_feature_spec_hash=was, current_feature_spec_hash=current_hash,
+        action="REFUSING to serve a model trained under other feature windows; it will be retrained under the "
+               "current ones (ml.features)")
+    return True

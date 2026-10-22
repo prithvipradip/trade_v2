@@ -69,7 +69,7 @@ def meta_training_frame(features: pd.DataFrame) -> pd.DataFrame:
     return MetaLabeler().build_training_data_from_backtest(fixed_trades(features), features)
 
 
-def engine_meta_contexts(max_contexts: int = 6) -> dict:
+def engine_meta_contexts(max_contexts: int = 6, settings=None, spec=None) -> dict:
     """Run the (legacy) research engine over a seeded frame with a recording meta-labeler and return the contexts it
     builds plus the ``features_at_entry`` snapshot keys of the trades it opens."""
     from ait.backtesting.engine import Backtester
@@ -85,9 +85,9 @@ def engine_meta_contexts(max_contexts: int = 6) -> dict:
 
     from ait.ml.features import FeatureEngine
     data = _frame(700, 5, 0.0004, 0.012)
-    cache = FeatureEngine().compute(data)                 # as the walk-forward hands it to the engine
+    cache = FeatureEngine(spec).compute(data)             # as the walk-forward hands it to the engine
     bt = Backtester(data=data, strategies=["iron_condor"], meta_labeler=Recorder(), allow_live_model_fallback=False,
-                    features_cache=cache, condor_any_direction=True, iv_floor=0.05, ic_min_credit=0.0, ic_min_credit_width=0.0,
+                    features_cache=cache, settings=settings, condor_any_direction=True, iv_floor=0.05, ic_min_credit=0.0, ic_min_credit_width=0.0,
                     min_confidence=0.0, initial_capital=1_000_000.0, hurst_hard_veto_multiplier=0.0,
                     hurst_regime_threshold=0.0, regime_veto_gate=False, iv_rank_rise_gate=False)
     res = bt.run()

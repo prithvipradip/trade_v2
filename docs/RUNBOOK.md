@@ -202,6 +202,26 @@ Every saved model (`ensemble.pkl`, `range.pkl`, `vol_magnitude.pkl`, the meta-la
 config is served and logs `model_spec_mismatch` with the differences; an artifact saved before W88c has no `spec` and loads silently. A change to the LIVE values takes effect for live at the next retrain (and bot restart), not by
 editing `config.yaml` alone. The run record stores the resolved settings and the ML seed.
 
+## Feature windows (W88d; shared by live and research)
+
+The indicator windows of the core feature groups are settings: `ml.features` (`momentum`, `volatility`, `volume`, `trend`, `multi_timeframe`, `vol_regime`), listed in `config.yaml` with the values the code used before, so listing them
+changed nothing. **Shared keys are diff-only in `config_research.yaml`**: research differs only if you put a different window there (or in a study); the parity manifest then warns (`ml_features`).
+In scope: RSI / MACD / ROC, ATR / Bollinger / realized vol, volume averages, SMAs and slopes, the simulated-weekly features, and the realized-vol regime ("IV proxy") features. Fixed (not settings): the fractal / wavelet / Hurst group, the 26 VLMC
+intraday features, cross-asset, macro, seasonality and the market-structure group (including `above_sma200` / `distance_sma200`).
+
+**What changes when you change a window.** (1) The feature VALUES. (2) For the thirteen model columns whose name embeds a window the NAME follows it: `rsi_long: 21` turns `rsi_14` into `rsi_21`; `sma_mid: 30` turns `price_vs_sma_20`,
+`sma_20_slope` and `sma_10_20_cross` into `price_vs_sma_30`, `sma_30_slope`, `sma_10_30_cross`. The meta-labeler's inputs, the engine's and the live orchestrator's meta-context keys, and the entry-signals snapshot follow; the dashboard series keep
+their stable keys (`rsi_14`, `sma_20`, ...). (3) A hash of the windows (`feature_spec_hash`) is recorded in every saved model and in every run record.
+
+**A model trained under other windows is never served.** Its columns would not exist in the new frames, and `predict` zero-fills missing columns, so it would predict on silent zeros. Loading a model whose recorded hash differs logs
+`model_feature_spec_mismatch` (CRITICAL) and returns False, so the normal needs-training path retrains under the new windows. A model with no recorded hash predates W88d and is treated as having the default windows, so today's artifacts keep loading
+while the windows are at their defaults. The research engine also drops a predictor whose windows differ from its own feature frames. After a LIVE change: restart, expect a retrain of the direction, range, vol-magnitude and meta-label models;
+old `entry_signals` snapshots keep the old names, so the meta-labeler's live training reads defaults for them until new trades accumulate.
+
+**Constraints enforced at load** (a violation is a startup error): ordered pairs (`rsi_short < rsi_long`, `macd_fast < macd_slow`, `roc_short < roc_mid < roc_long`, `rv_short < rv_long`, `sma_fast < sma_mid < sma_slow`, `volume_fast_window < volume_avg_window`)
+and `vol_regime.fast < rv_short < rv_long < vol_regime.slow`; derived names must be distinct and must not collide with a fixed column. Very short RSI periods make RSI undefined whenever a window has no down days, and those rows are dropped; `iv_rank_min_periods`
+only matters once it exceeds the warm-up that other windows already drop.
+
 ## Risk-knob ceilings and the links between them (W86)
 
 Unlike the fixed limits above, these are **tunable** (they live in `config.yaml`), but the **range** each may take is part of the schema in `src/ait/config/settings.py`, so a typo or a bad edit fails

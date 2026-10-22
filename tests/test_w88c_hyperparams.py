@@ -16,6 +16,7 @@ from pydantic import ValidationError
 
 from ait.config.settings import MLConfig, TreeHyperparamsConfig, load_settings
 from ait.ml import hyperparams as hp
+from ait.ml.feature_spec import default_spec_hash
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -209,7 +210,10 @@ class TestArtifactSpec:
         assert hp.spec_differences(a, a) == [] and hp.spec_differences(None, a) == [] and hp.spec_differences({}, a) == []
         diffs = hp.spec_differences(a, b)
         assert len(diffs) == 2 and any("max_depth" in d for d in diffs)
-        assert hp.spec_differences({**a, "feature_spec_hash": "abc"}, a) != []         # the W88d hook
+        from ait.ml.feature_spec import default_spec_hash
+        now = hp.model_spec(TreeHyperparamsConfig(), default_spec_hash())
+        assert hp.spec_differences({**a, "feature_spec_hash": "abc"}, now) != []         # W88d: other windows
+        assert hp.spec_differences(a, now) == []                      # no recorded hash == the default windows
 
     def test_warn_logs_only_on_a_real_difference(self, warnings_seen):
         a = hp.model_spec(TreeHyperparamsConfig())
@@ -222,7 +226,7 @@ class TestArtifactSpec:
         from ait.ml.ensemble import DirectionPredictor
         DirectionPredictor(MLConfig(), model_dir=tmp_path).train(_ohlcv(), symbol="QQQ")
         saved = pickle.loads((tmp_path / "ensemble.pkl").read_bytes())
-        assert saved["spec"] == hp.model_spec(TreeHyperparamsConfig())
+        assert saved["spec"] == hp.model_spec(TreeHyperparamsConfig(), default_spec_hash())
         same = DirectionPredictor(MLConfig(), model_dir=tmp_path)
         assert same.load_models() and same._hp_spec_mismatch is False and warnings_seen == []
         moved = DirectionPredictor(MLConfig(hyperparams=TreeHyperparamsConfig(max_depth=3)), model_dir=tmp_path)
@@ -255,7 +259,7 @@ class TestArtifactSpec:
         a = C(threshold_pct=thr, horizon_days=10, model_dir=tmp_path)
         a.train(_ohlcv(), symbol="QQQ")
         a._save_models(tmp_path)
-        assert pickle.loads((tmp_path / file).read_bytes())["spec"] == hp.model_spec(TreeHyperparamsConfig())
+        assert pickle.loads((tmp_path / file).read_bytes())["spec"] == hp.model_spec(TreeHyperparamsConfig(), default_spec_hash())
         assert C(threshold_pct=thr, horizon_days=10, model_dir=tmp_path).load_models() and warnings_seen == []
         moved = C(threshold_pct=thr, horizon_days=10, model_dir=tmp_path, hyperparams=TreeHyperparamsConfig(max_depth=3))
         assert moved.load_models() and warnings_seen and warnings_seen[0][0] == "model_spec_mismatch"

@@ -44,7 +44,7 @@ from ait.config.invariants import LIVE_MAX_SPREAD_PCT, LIVE_MIN_VOLUME
 from ait.learning.adaptor import AdaptationLimits
 from ait.learning.engine import LearningEngine
 from ait.ml.ensemble import DirectionPredictor
-from ait.ml.meta_label import MetaLabeler
+from ait.ml.meta_label import MetaLabeler, live_technical_features
 from ait.ml.regime import RegimeDetector
 from ait.ml.trainer import ModelTrainer
 from ait.monitoring.analytics import TradeAnalytics
@@ -2166,7 +2166,8 @@ class TradingOrchestrator:
 
         # Pre-compute daily features once — used for fractal penalty and meta-labeler below.
         from ait.ml.features import FeatureEngine
-        features_df = FeatureEngine().compute(hist)
+        _fe = FeatureEngine()                       # W88d: its spec names the window-bearing columns below
+        features_df = _fe.compute(hist)
 
         # R20: stash the entry-time feature row per symbol so _try_execute can
         # persist it into trade_context.entry_signals. That column has been
@@ -2268,19 +2269,7 @@ class TradingOrchestrator:
             last_features = {}
             if not features_df.empty:
                 last_row = features_df.iloc[-1]
-                last_features = {
-                    "rsi_14": float(last_row.get("rsi_14", 0)),
-                    "rsi_7": float(last_row.get("rsi_7", 0)),
-                    "bb_position": float(last_row.get("bb_position", 0)),
-                    "volume_sma_20_ratio": float(last_row.get("volume_sma_20_ratio", 0)),
-                    "realized_vol_20": float(last_row.get("realized_vol_20", 0)),
-                    "atr_pct": float(last_row.get("atr_pct", 0)),
-                    "weekly_trend_aligned": float(last_row.get("weekly_trend_aligned", 0)),
-                    "volume_confirmation": float(last_row.get("volume_confirmation", 0)),
-                    "macd_hist": float(last_row.get("macd_hist", 0)),
-                    "price_vs_sma_20": float(last_row.get("price_vs_sma_20", 0)),
-                    "sma_10_20_cross": float(last_row.get("sma_10_20_cross", 0)),
-                }
+                last_features = live_technical_features(last_row, _fe.spec.names)   # W88d: keys follow ml.features
 
             # W20a (R25 tz-01): hour_of_day is an ML FEATURE and was stamped
             # from the naive LOCAL clock. This host runs CEST = ET+6, so the
@@ -4503,9 +4492,9 @@ class TradingOrchestrator:
             row = (getattr(self, "_entry_feature_snap", None) or {}).get(symbol)
             if row is None:
                 return "{}"
-            from ait.ml.meta_label import META_FEATURES
+            from ait.ml.feature_spec import default_feature_spec   # W88d: the window-bearing names follow ml.features
             out: dict[str, float] = {}
-            for name in META_FEATURES:
+            for name in default_feature_spec().meta_feature_names():
                 if name == "hour_of_day":
                     # W20a (R25 tz-01): ET, not the host's local clock. This
                     # value is PERSISTED into trade_context.entry_signals and

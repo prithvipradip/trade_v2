@@ -49,10 +49,12 @@ _DASHBOARD_FEATURE_KEYS = [
     # archived timeseries JSONs that still carry them are simply not rendered).
 ]
 
-# Map from FeatureEngine column name → dashboard key (only where they differ)
-_FEATURE_RENAME = {
-    "volume_sma_20_ratio": "volume_ratio",
-}
+def _feature_rename(names: dict) -> dict:
+    """FeatureEngine column name -> dashboard key. W88d: the window-bearing columns (``rsi_<n>``, ``sma_<n>``,
+    ``realized_vol_<n>``, ``volume_sma_<n>_ratio``) are labelled with the dashboard's stable keys whatever window
+    the run used, so a changed window does not blank the chart series."""
+    return {names["volume_ratio"]: "volume_ratio", names["rsi_long"]: "rsi_14", names["sma_mid"]: "sma_20",
+            names["sma_slow"]: "sma_50", names["rv_long"]: "realized_vol_20"}
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +193,9 @@ def _compute_features(bars: list[dict]) -> list[dict]:
             "close": "Close", "volume": "Volume",
         })
 
-        feat_df = FeatureEngine().compute(df)
+        _fe = FeatureEngine()
+        feat_df = _fe.compute(df)
+        _names = _fe.spec.names
         if feat_df.empty:
             return []
 
@@ -207,12 +211,12 @@ def _compute_features(bars: list[dict]) -> list[dict]:
             feat_df = feat_df.reindex(all_dates).ffill()
             # Still drop the early warmup rows (start of series) where OHLCV
             # features haven't accumulated enough data — only forward-fill the tail.
-            core_cols = [c for c in ("rsi_14", "macd", "sma_20", "realized_vol_20") if c in feat_df.columns]
+            core_cols = [c for c in (_names["rsi_long"], "macd", _names["sma_mid"], _names["rv_long"]) if c in feat_df.columns]
             if core_cols:
                 feat_df = feat_df.dropna(subset=core_cols)
 
         # Rename columns to dashboard keys
-        feat_df = feat_df.rename(columns=_FEATURE_RENAME)
+        feat_df = feat_df.rename(columns=_feature_rename(_names))
 
         rows = []
         for ts, row in feat_df.iterrows():

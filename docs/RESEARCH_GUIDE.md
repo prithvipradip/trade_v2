@@ -148,6 +148,10 @@ the parity manifest shows it.
 **Can I change their hyperparameters?** Yes: `ml.hyperparams` (direction, range) and `ml.meta_label_hyperparams`. Every saved model
 records the values it was trained with, and loading a model trained under other values logs `model_spec_mismatch`.
 
+**Can I change the indicator windows?** Yes: `ml.features` (RSI, MACD, SMAs, realized vol, ...). The thirteen columns whose name embeds a window are renamed
+(`rsi_14` → `rsi_21`), every saved model records a hash of the windows, and a model trained under other windows is refused and retrained. RUNBOOK "Feature windows" lists what is in
+scope and what stays fixed.
+
 **Could a research run overwrite the live model?** No. Window models are throw-away (`persist_artifacts=False`) or go to `models/research/`.
 
 ---

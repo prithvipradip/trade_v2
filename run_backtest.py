@@ -220,6 +220,7 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
         # W88c: the tree hyperparameters live trains with (research may differ via the overlay / a study)
         "ml_hyperparams": (settings.ml if settings else MLConfig()).hyperparams.model_dump(),
         "ml_meta_label_hyperparams": (settings.ml if settings else MLConfig()).meta_label_hyperparams.model_dump(),
+        "ml_features": (settings.ml if settings else MLConfig()).features.model_dump(),   # W88d: indicator windows
     }
 
     # Backtest TP ladder read from the engine mirror itself, so this manifest
@@ -270,6 +271,7 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
             None, "backtest", "max_concurrent_positions", _BTC, rsettings)),
         "ml_hyperparams": (rsettings.ml if rsettings else MLConfig()).hyperparams.model_dump(),
         "ml_meta_label_hyperparams": (rsettings.ml if rsettings else MLConfig()).meta_label_hyperparams.model_dump(),
+        "ml_features": (rsettings.ml if rsettings else MLConfig()).features.model_dump(),
     }
 
     warnings: list[str] = []

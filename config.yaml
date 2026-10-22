@@ -395,6 +395,18 @@ ml:
     subsample: 0.8
     colsample_bytree: 0.8
     random_state: null
+  # W88d: indicator windows of the core feature groups (were literals in ml/features.py). SHARED by live and research,
+  # like the hyperparameters above; the values are what the code used before, so listing them changes nothing.
+  # Changing one changes the feature VALUES, and for the thirteen columns whose name embeds a window it changes the NAME
+  # too (rsi_14 -> rsi_10). Every saved model records a hash of these windows and a model trained under other windows
+  # is REFUSED (it is retrained): after a change, expect a retrain, and old entry_signals snapshots keep the old names.
+  features:
+    momentum: {rsi_long: 14, rsi_short: 7, macd_fast: 12, macd_slow: 26, macd_signal: 9, roc_short: 5, roc_mid: 10, roc_long: 20}
+    volatility: {atr_window: 14, bb_window: 20, bb_std: 2.0, rv_long: 20, rv_short: 10}
+    volume: {volume_avg_window: 20, volume_fast_window: 5, obv_period: 5}
+    trend: {sma_fast: 10, sma_mid: 20, sma_slow: 50, slope_period: 5}
+    multi_timeframe: {weekly_close_window: 5, weekly_trend_window: 4, weekly_trend_shift: 5, weekly_rsi_period: 14, weekly_momentum_period: 25}
+    vol_regime: {fast: 5, slow: 60, iv_rank_lookback: 252, iv_rank_min_periods: 20, vol_trend_period: 5, vol_of_vol_window: 20}
 
 # W69: regime classification thresholds (were literals in ml/regime.py).
 regime:

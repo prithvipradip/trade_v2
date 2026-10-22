@@ -29,6 +29,7 @@ from ait.ml.hyperparams import (  # W87a: one owner of the tree settings and the
     POSITIVE_RATE_MAX,
     POSITIVE_RATE_MIN,
     default_hyperparams,
+    feature_spec_refused,
     lgbm_binary_kwargs,
     model_spec,
     warn_on_spec_mismatch,
@@ -671,7 +672,7 @@ class RangePredictor:
             "trained_at": self._trained_at or datetime.now().isoformat(),
             # R7: which symbol the instance-level fallback models were fit on.
             "trained_symbol": self._global_model_symbol,
-            "spec": model_spec(self._hp),            # W88c: the hyperparameters this model was trained with
+            "spec": model_spec(self._hp, self._feature_engine.spec_hash()),            # W88c: the hyperparameters this model was trained with
         }
         # Atomic write — a concurrent reader (live bot) can never observe a
         # half-written pickle.
@@ -703,6 +704,8 @@ class RangePredictor:
             with open(path, "rb") as f:
                 data = pickle.load(f)
 
+            if feature_spec_refused("range", data.get("spec"), self._feature_engine.spec_hash()):
+                return False                              # W88d: trained under other windows: retrain, never serve
             loaded_threshold = float(data.get("threshold", 0.05))
             loaded_horizon = int(data.get("horizon", 30))
             if (abs(loaded_threshold - self._spec_threshold) > 1e-9
@@ -734,7 +737,7 @@ class RangePredictor:
             self._trained_at = data.get("trained_at")
             self._global_model_symbol = data.get("trained_symbol", "")
             self._trained = bool(self._models)
-            warn_on_spec_mismatch("range", data.get("spec"), model_spec(self._hp))     # W88c: informational
+            warn_on_spec_mismatch("range", data.get("spec"), model_spec(self._hp, self._feature_engine.spec_hash()))     # W88c: informational
             log.info("range_models_loaded", version=self._model_version,
                      threshold=self._threshold, horizon=self._horizon,
                      trained_at=self._trained_at, path=str(path))

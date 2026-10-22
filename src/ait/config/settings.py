@@ -1403,7 +1403,7 @@ class FeaturesConfig(_StrictModel):
     def _check(self) -> "FeaturesConfig":
         _ordered("vol_regime vs volatility", fast=self.vol_regime.fast, rv_short=self.volatility.rv_short,
                  rv_long=self.volatility.rv_long, slow=self.vol_regime.slow)
-        from ait.ml.feature_spec import derive_names, validate_names     # lazy: feature_spec imports this module
+        from ait.config.feature_names import derive_names, validate_names     # leaf: no ait.ml import at load time
         validate_names(derive_names(self))
         return self
 

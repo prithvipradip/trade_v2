@@ -129,6 +129,11 @@ def data_fingerprint(db_path: str | Path, table_prefix: str, symbols: list[str])
     return out
 
 
+def _feature_spec_hash(settings) -> str:
+    from ait.ml.feature_spec import spec_from_config
+    return spec_from_config(getattr(getattr(settings, "ml", None), "features", None)).spec_hash()
+
+
 def seed_inventory(extra: dict | None = None, settings=None) -> dict:
     """The seeds that decide a research result. The ML estimators' seed is ``ml.hyperparams.random_state`` of the
     settings the run used (W88c; the schema default without settings); the Optuna seed is whatever the caller
@@ -161,6 +166,8 @@ def build_run_record(*, kind: str, name: str, settings, config_path: str | Path,
                   "study": file_entry(study_path)},
         "env_contract": env_contract(),
         "research_invariants": research_invariant_values(),     # W88a: fixed in code, not configurable
+        # W88d: hash of the indicator windows this run computed features with (recorded in every model it trained)
+        "feature_spec_hash": _feature_spec_hash(settings),
         # W88a: {dotted.key: [value, layer]} -- which layer decides each value (study > overlay > config.yaml > default)
         "settings_origin": ({k: list(v) for k, v in settings_origin.items()} if settings_origin else None),
         "data": data_fingerprint(db_path, prefix, list(symbols or [])) if db_path else None,
