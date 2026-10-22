@@ -63,7 +63,11 @@ class WalkForwardConfig:
     # W87a: None -> the Backtester resolves backtest.commission_per_contract (config 0.65, the IBKR base
     # commission); was a 0.65 literal that shadowed a config change in every walk-forward window.
     commission_per_contract: float | None = None
-    slippage_pct: float = 0.03  # 3% realistic for multi-leg options
+    # W87a (results-moving, DEBIT structures only): None -> the Backtester resolves backtest.slippage_pct
+    # (config 0.01). Was a 0.03 literal: the walk-forward's OOS engines paid 3% on debit legs while the
+    # optimizer's trial engines (which never passed it) paid the config 1%, a train/OOS mismatch. Credit
+    # structures (iron condors) never read it, so an IC-only run is unaffected.
+    slippage_pct: float | None = None
     # W64: None -> resolve_position_size_pct: backtest.position_size_pct if a
     # sizing study set one, else risk.max_position_risk_pct (live's per-trade
     # budget). Was a 0.05 literal while live funded 0.0133-0.03.
