@@ -185,6 +185,12 @@ fallback for a bare construction (`Backtester()`, `BacktestLearner()` in a unit 
 | `objectives` | Composite objective weights and the profit-factor cap. | `optimization/objectives.py` (the optimizer passes its own copy) |
 | `walkforward_tuning` | Warm-start thresholds, the adaptive range threshold (multiplier, clips, lookback, fallback band), the validation-split ratio, the inert-parameter probe fallbacks. | `backtesting/walkforward.py`, `optimization/optimizer.py` |
 
+**A new research number goes in a setting, not in code (W88e).** `tests/test_w88_literal_census.py` compares the non-trivial numeric literals of the result-affecting research modules
+(`scripts/literal_census.py` lists them: `backtesting/`, `optimization/`, the ML modules, `run_backtest.py`, `run_optimizer.py`) with `tests/data/literal_allowlist.json`. A function whose literals differ from its entry
+fails the test: a NEW literal, a CHANGED one, a REMOVED one (converting a literal to a setting must also update the allowlist), or a stale entry. Either make it a schema field listed in `config_research.yaml` (or a fixed limit in
+`config/invariants_research.py`), or run `python scripts/literal_census.py --update` and give the new entry a category: `display`, `epsilon`, `fixed_feature_group`, `dormant_path`, `structural`, or `registered_followup` (a note
+saying what it is and where it should go). A new module in `backtesting/`, `optimization/` or `ml/` must be added to the census list (or excluded with a reason). `param_spaces.py` (the search-range registry) and `settings.py` (schema defaults) are the excluded registries.
+
 `python scripts/show_research_config.py [--section backtest] [--differs]` prints every value with the layer that decides it (`study` > `overlay` > `config.yaml` > `default`); the same map is stored in every run record
 (`settings_origin`). Values that are **not** tunable (clamps, numerical tolerances) are in "Research fixed limits" above.
 

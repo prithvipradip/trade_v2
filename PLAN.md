@@ -18555,3 +18555,42 @@ its literals, a category from a closed set, a note for registered follow-ups) + 
 **NEXT.** Build d1-d7, record the AS BUILT, then e.
 
 ---
+
+
+## 2026-10-22 - W88 AS BUILT (parts d and e): indicator windows with derived names and a feature-spec hash; the literal-census class guard
+
+Code commits `2235fa8` (d1 golden record), `61a39f6` (d2-3 schema, spec, engine), `fd7b35a` (d4-d7 consumers, artifacts, visibility, tests) and the e commit that follows this entry, on local `main`. LIVE-SHARED: `ml/features.py`, `ml/meta_label.py`, `ml/ensemble.py`, `ml/range_predictor.py`, `ml/vol_magnitude_predictor.py`,
+`bot/orchestrator.py` (meta-context keys), `backtesting/engine.py`, `config/settings.py`, and a new `ml.features` block in `config.yaml` (values equal to the old literals). All reach the bot at its next restart; at the default windows every value, column name and meta-context key is identical. Nothing restarted, nothing pushed. Plan: the "W88 parts d and e AS PLANNED" entry above.
+
+**STATUS OF THE PLAN.** AS PLANNED: d1-d7 and e. AS BUILT: all of it. **FELL SHORT / DIFFERED:**
+1. **Name derivation lives in `ait/config/feature_names.py`, not `ml/feature_spec.py`.** The first version had the `FeaturesConfig` validator import `ait.ml.feature_spec` lazily; `Settings` is BUILT at import time, so importing `ait.data` first created a cycle (`settings` -> `ait.ml` -> broker -> `settings`). The fast lane caught it (four unrelated-looking
+   failures); the derivation and validation moved to a leaf under `ait.config`, `feature_spec` re-exports it, and a class guard now imports each entry package FIRST in a fresh interpreter (8 cases; the guard fails if the original import is restored).
+2. **The refusal is also the predictor guard in the engine**: a predictor whose feature engine uses other windows than the engine's own feature frames is dropped (the engine runs ungated) with a CRITICAL log, because `predict_from_features` zero-fills missing columns and the live-artifact fallback builds a bare `MLConfig()` (registered in W86).
+3. **`live_technical_features`** (the orchestrator's eleven-key meta-context dict as a pure function in `meta_label.py`) was added so the live snapshot could be executed in a test; behaviour identical. The orchestrator's `_entry_signals_json` now reads `default_feature_spec().meta_feature_names()`.
+4. **Dashboard series keep their STABLE keys** (`rsi_14`, `sma_20`, `realized_vol_20`, `volume_ratio`) whatever window ran, reading the derived column; the static dashboard JS data is untouched (registered).
+5. **`vol_regime.iv_rank_min_periods` is inert at small values** (the warm-up rows are dropped by other windows anyway) and very short RSI periods drop rows (RSI is undefined when a window has no down days); both documented on the fields / in the RUNBOOK, not changed.
+6. **The census counts 295 literals in 104 functions, not the ~580 of the earlier scan** (that scan counted every literal incl. logging and display; the guard's rules are stricter and documented). 74 entries needed hand classification; the final split is structural 43, registered follow-up 39, fixed feature group 10, epsilon 7, dormant path 3, display 3.
+7. Timing: `tests/test_w88d_feature_windows.py` takes ~90 s (about 75 s of it the golden comparison, because the fractal group is ~95% of a `compute()`); every other test in it stubs the fixed fractal group.
+
+**d (indicator windows).** `ml.features` (`momentum`, `volatility`, `volume`, `trend`, `multi_timeframe`, `vol_regime`; 31 windows, each bounded and described) with ordered-pair validators and a name-collision check; `FeatureSpec` (derived names, ordered feature list, the meta-labeler's 20 inputs, `spec_hash`, `DEFAULT_SPEC_HASH`) with a cached default
+keyed on the frozen-settings snapshot; `FeatureEngine(spec=None)` computes with the spec and names the THIRTEEN window-bearing model columns from it (`rsi_14` -> `rsi_21`; the raw helper columns `sma_<n>`, `ema_<n>`, `atr_<n>` too). Consumers resolve names through the spec: engine meta-context and entry snapshot, `MetaLabeler` (inputs, both training builders, artifacts),
+the live orchestrator snapshot, the walk-forward, the dashboard export. Every saved model (ensemble, range, vol-magnitude, meta-label) records `feature_spec_hash`; loading under other windows logs `model_feature_spec_mismatch` and **returns False** (the needs-training path retrains); a model with no recorded hash is compared as the default windows, so today's artifacts keep loading (the real `models/*.pkl` are tested).
+Manifest row `ml_features`, run-record `feature_spec_hash`, `ml.features` listed in `config.yaml`, RUNBOOK "Feature windows", RESEARCH_GUIDE updated. Study files can change a window for one run (and a bad window is refused at load).
+
+**e (class guard).** `scripts/literal_census.py` (AST census of non-trivial numeric literals over 37 result-affecting modules; trivial values, logging, `round()` digits and string-repeat counts are not counted), `tests/data/literal_allowlist.json` (per function: its literals, a category from a closed set, a note for registered follow-ups), `tests/test_w88_literal_census.py` (15 tests): fails on a new, changed or removed literal, a stale entry, a bad category or a placeholder note, an unlisted module in
+`backtesting/`, `optimization/` or `ml/`. `param_spaces.py` and `settings.py` are the excluded registries. RUNBOOK "Research tunables" states the rule.
+
+**EQUIVALENCE (d).** `FeatureEngine().compute()` is **bit-identical** (`assert_frame_equal(check_exact=True)`) to the pre-change engine on four seeded frames (one with zero volume, one with cross-asset context) and on the real QQQ frame (784 x 93); the committed golden record (captured BEFORE the first edit) also pins the name lists, the meta training frame and the engine's meta contexts. The 6-variant reference dump, `gate_parity_ab` and
+`ex_div_gate_ab` are byte-identical to the pre-W87 baseline; the real walk-forward smoke (`--max-windows 2 --optimize-per-window --optimize-n-trials 5`) differs only by the new `ml_features` manifest rows.
+
+**TESTS / GATES.** Collected 6,538 -> 6,631 (d: +85 `test_w88d_feature_windows.py` and +8 import-order guards in it) -> 6,646 (e: +15); verified by diffing node ids, 0 removed. Fast lane after d: 6,433 passed / 46 skipped / 0 failed (a first d run had 4 failures from the import cycle). `compileall` OK; `typecheck.py` OK; `smoke_deploy.py` SMOKE PASS. Mutation check: d 66 mutants (every window read, every name derivation, hash, validators, every consumer, every refusal and hash-recording point, manifest, run record)
+66 / 66 caught after strengthening (the first run left 10 survivors: renamed columns were checked by name only, so each now has an independent oracle, and several consumer assertions now check values, not keys); e: added / changed literals in four real files and an unlisted module, all caught; files restored byte-for-byte (hash-checked).
+
+**REGISTERED, NOT FIXED.** (1) `entry_signals` snapshots persisted before a live window change keep the old names, so the meta-labeler's live training reads defaults for those rows until new trades accumulate. (2) The fixed feature groups (fractal / wavelet / Hurst, VLMC, cross-asset, macro, seasonality, market structure incl. `above_sma200` / `distance_sma200`); `regime.py` and `data/multi_timeframe.py` compute their own windows. (3) The engine / meta-labeler feature
+FALLBACK values (50.0, 0.20, 0.01 ...). (4) The 39 `registered_followup` census entries, each with a note, are the remaining research numbers still in code; converting one means updating its allowlist entry (the guard forces that). (5) Static dashboard JS data. (6) The two `getattr(_pos, ..., literal)` pool fallbacks in the walk-forward (reachable only with no config.yaml).
+
+**DECISIONS FOR THE OPERATOR.** (1) Whether to restart the bot: the live-shared ML, orchestrator and settings changes load then (values unchanged). (2) Whether to push local `main` (ahead of `origin/main`). (3) Whether to start converting the `registered_followup` entries (each conversion is a small measured wave), starting with the walk-forward `WalkForwardConfig` dataclass defaults and the feature fallback values. (4) The open W86 / W83a-2 decisions (unchanged).
+
+**NEXT.** The operator's decisions above; otherwise unchanged. W88 is complete: a (plumbing and visibility), b (research-only tunables), c (hyperparameters), d (indicator windows), e (class guard).
+
+---
